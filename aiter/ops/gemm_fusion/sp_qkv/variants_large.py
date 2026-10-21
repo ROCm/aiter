@@ -384,8 +384,9 @@ class SpQkvLarge(Plan):
         call_id=None,
     ):
         from .small_rt import stream_handle
-        from .variants import _require_zeroed
+        from .variants import _check_launch_gate, _require_zeroed
 
+        _check_launch_gate(res, self.owner)
         _require_zeroed(res, self.owner)
         c = self._context(res)
         if x.shape[0] != self.M:

@@ -6,6 +6,7 @@ uniqueness check (KEY gate). A fake backend / fake torch stand in for the device
 
 import logging
 import os
+import re
 import sys
 import types
 from types import SimpleNamespace as NS
@@ -741,7 +742,9 @@ def test_collective_reset_logs_the_decoded_error_then_zeroes_everything_and_forg
         ("barrier",),
         ("barrier",),
         ("allgather",),
-    ]  # sync -> barrier -> zero ALL windows (the arena, incl. the page) -> init -> sync -> barrier -> verify (all-gather of the ERR words)
+        ("barrier",),
+        ("allgather",),
+    ]  # ... + the FINAL barrier and the re-read after a clean first verification  # sync -> barrier -> zero ALL windows (the arena, incl. the page) -> init -> sync -> barrier -> verify (all-gather of the ERR words)
     assert (
         be.log[1][1] == r._arena.local and be.log[1][2] == r._arena.bytes
     )  # the page lives inside the arena: ERR and STEP return to 0 with it
@@ -802,37 +805,60 @@ def test_catalog_untouched_by_these_tests():
 
 
 # ----------------------------------------------------------------------------------------------------------------------- reset(): verified, multi-round
+GATHER_TAG = "gf_errpage"
+
+
 class _ResetRig:
-    """A FusionResources with a global page, a scriptable ERR word and a shared event log of the backend / dist calls. `late` = the ERR words that LAND after the zeroing of
-    successive rounds (a peer's propagation write still in flight): late[0] becomes visible at the next device sync after round 1's zero, and so on.
-    `peers` = what the other ranks' ERR words read after each round's barrier (list of {rank: word} per verification, the last one repeating).
+    """A FusionResources with a global page, a scriptable page (ERR / STEP / DIAG) and a shared event log of the backend / dist calls.
+    late       = ERR words that LAND after the zeroing of successive rounds (a peer's propagation write still in flight): late[0] becomes visible at the next device sync.
+    reread     = ERR words that land AFTER the first verification read (visible only to the re-read after the final barrier).
+    page_script= (ERR, STEP, DIAG4) this rank reads at successive verification reads, the last one repeating (default: all zero): stale STEP / DIAG after the zero.
+    peers      = what the other ranks report at successive gathers ({rank: ERR or (ERR, STEP, DIAG4)}), the last one repeating.
+    in_flight  = an ERR a kernel writes while the first device sync drains.
+    kernel     = zero with a device-side fill (events 'kernel_zero') instead of the H2D memcpy ('zero').
     """
 
     def __init__(
-        self, monkeypatch, late=(), peers=(), max_rounds=None, in_flight=0, page=True
+        self,
+        monkeypatch,
+        late=(),
+        peers=(),
+        reread=(),
+        page_script=(),
+        max_rounds=None,
+        in_flight=0,
+        page=True,
+        kernel=False,
     ):
         _fake_torch(monkeypatch)
-        self.events = []
-        self.err = in_flight  # a kernel still running when reset() starts: it writes this into the page while the first device sync drains
-        self.pending = None
+        monkeypatch.delenv("AITER_GEMM_FUSION_RESET_ZERO", raising=False)
+        self.events, self.err, self.pending = [], 0, None
         self.zero_rounds = 0
-        self.late = []  # armed AFTER the setup below (finalize() zeroes the arena once)
-        self._late_script = list(late)
-        self.peers = list(peers)
-        self.gathers = 0
+        self.late, self._late_script = [], list(late)
+        self.reread = list(reread)
+        self.page_script, self.peers, self.gathers, self.reads = (
+            list(page_script),
+            list(peers),
+            0,
+            0,
+        )
+        self.fills = []
         be = ArenaBackend()
         ev = self.events
         real_zero, real_sync = be.zero, be.device_sync
 
-        def zero(device, local, nbytes):
-            ev.append("zero")
-            real_zero(device, local, nbytes)
-            self.err = 0  # the page is inside the zeroed window
+        def cleared():
+            self.err = 0
             self.zero_rounds += 1
             if self.late:
                 self.pending = self.late.pop(
                     0
                 )  # lands AFTER the zero, before the barrier completes
+
+        def zero(device, local, nbytes):
+            ev.append("zero")
+            real_zero(device, local, nbytes)
+            cleared()
 
         def sync(device):
             ev.append("sync")
@@ -846,8 +872,8 @@ class _ResetRig:
         be.zero, be.device_sync = zero, sync
 
         def gather_hook(mine):
-            if not isinstance(
-                mine, int
+            if not (
+                isinstance(mine, tuple) and mine and mine[0] == GATHER_TAG
             ):  # the registration-agreement gathers of ensure(): every rank agrees
                 return [mine] * 4
             self.gathers += 1
@@ -856,42 +882,74 @@ class _ResetRig:
                 if self.peers
                 else {}
             )
-            return [mine if r == 0 else peer.get(r, 0) for r in range(4)]
+            out = []
+            for r in range(4):
+                if r == 0:
+                    out.append(mine)
+                else:
+                    v = peer.get(r, 0)
+                    out.append(
+                        (GATHER_TAG, v, 0, 0, 0, 0, 0)
+                        if isinstance(v, int)
+                        else (GATHER_TAG, v[0], v[1], *v[2])
+                    )
+            return out
 
         d = FakeDist(gather_hook=gather_hook)
         bar, gat = d.barrier, d.all_gather_object
+
+        def gather(out, obj, group=None):
+            ev.append("allgather")
+            gat(out, obj, group)
+            if (
+                self.reread
+                and isinstance(obj, tuple)
+                and obj[:1] == (GATHER_TAG,)
+                and not obj[1]
+            ):
+                self.err = self.reread.pop(
+                    0
+                )  # lands right AFTER this (clean) read: only the re-read after the final barrier can see it
+
         d.barrier = lambda group=None: (ev.append("barrier"), bar(group))[1]
-        d.all_gather_object = lambda out, obj, group=None: (
-            ev.append("allgather"),
-            gat(out, obj, group),
-        )[1]
+        d.all_gather_object = gather
+        self.dist = d
         self.r = make_res(dist=d, backend=be, profile=_budget_profile(), policy="arena")
         if page:
             self.r.ensure("o1", _page_reqs("o1"))
         else:
             self.r.ensure("o1", [WindowReq("o1/a", 1000, "p2p_window")])
         self.r.finalize()
-        self.reads = 0
 
         def reader():
             self.reads += 1
-            return self.err
+            if self.page_script:
+                w = self.page_script[min(self.reads - 1, len(self.page_script) - 1)]
+                return w[0] or self.err, w[1], w[2]
+            return self.err, 0, (0, 0, 0, 0)
 
-        self.r.err_reader = reader
+        self.r.page_reader = reader
+        if kernel:
+
+            def fill(device, local, nbytes):
+                ev.append("kernel_zero")
+                self.fills.append((device, local, nbytes))
+                cleared()
+
+            self.r.zero_fill = fill
+            self.r.zero_method = "kernel"
+        else:
+            self.r.zero_method = "h2d"
         self.inits = []
         self.r.set_init("o1", lambda: self.inits.append("init"))
         if max_rounds is not None:
             self.r.reset_max_rounds = max_rounds
         ev.clear()
         self.inits.clear()
-        self.zero_rounds = 0
-        self.late = (
-            self._late_script
-        )  # now the scripted late writes apply to reset()'s zeroings
-        # a kernel that is still inside its wait budget finishes during the drain and writes ERR (propagated) into the page
+        self.zero_rounds, self.reads = 0, 0
+        self.late = self._late_script
         self._drain_write = in_flight
         if in_flight:
-            self.err = 0
             first = {"done": False}
             sync_now = be.device_sync
 
@@ -899,7 +957,9 @@ class _ResetRig:
                 sync_now(device)
                 if not first["done"]:
                     first["done"] = True
-                    self.err = self._drain_write
+                    self.err = (
+                        self._drain_write
+                    )  # a kernel still waiting out its budget finishes during the drain and writes ERR
 
             be.device_sync = sync_with_kernel
 
@@ -926,17 +986,70 @@ class _Logs:
         self.lg.setLevel(self.old)
 
 
-def test_reset_clean_is_one_round_in_the_specified_order(monkeypatch):
+CLEAN_TAIL = [
+    "allgather",
+    "barrier",
+    "allgather",
+]  # verify: gather, the FINAL barrier, the re-read
+
+
+def test_reset_clean_is_one_round_in_the_specified_order_h2d(monkeypatch):
     rig = _ResetRig(monkeypatch)
     with _Logs() as lg:
         rig.r.reset()
-    # (1) drain: device sync; (2) barrier; (3) zero; (4) sync + barrier; (5) verify (all-gather)
-    assert rig.events == ["sync", "barrier", "zero", "sync", "barrier", "allgather"]
+    # (1) drain: device sync; (2) barrier; (3) zero; (4) sync + barrier; (5) verify: gather, final barrier, re-read
+    assert rig.events == ["sync", "barrier", "zero", "sync", "barrier", *CLEAN_TAIL]
     assert (
-        rig.zero_rounds == 1 and rig.r.last_reset_rounds == 1 and rig.inits == ["init"]
+        rig.zero_rounds == 1
+        and rig.r.last_reset_rounds == 1
+        and rig.inits == ["init"]
+        and rig.gathers == 2
     )
-    assert any("event=resources reset rank=0" in m and "rounds=1" in m for m in lg.msgs)
+    assert any(
+        "event=resources reset rank=0" in m and "rounds=1" in m and "zero=h2d" in m
+        for m in lg.msgs
+    )
     assert not any("reset_retry" in m for m in lg.msgs)
+
+
+def test_reset_with_the_device_side_zero_does_not_use_the_h2d_memcpy(monkeypatch):
+    rig = _ResetRig(monkeypatch, kernel=True)
+    rig.r.reset()
+    # the device fill, ONE device sync right after it, then the usual (4) sync + barrier and the verification
+    assert rig.events == [
+        "sync",
+        "barrier",
+        "kernel_zero",
+        "sync",
+        "sync",
+        "barrier",
+        *CLEAN_TAIL,
+    ]
+    assert "zero" not in rig.events
+    arena = rig.r._arena
+    assert rig.fills == [
+        (rig.r.device, arena.local, arena.bytes)
+    ]  # the whole arena (the page is inside it) in one fill
+    assert rig.inits == ["init"] and rig.r.last_reset_rounds == 1
+
+
+def test_zero_method_resolution_auto_env_override_and_bad_values(monkeypatch):
+    rig = _ResetRig(monkeypatch)
+    r = rig.r
+    r.zero_method, r.zero_fill = "auto", None
+    assert r._resolve_zero_method() == "h2d"  # no torch / no device: MORI's memcpy
+    r.zero_fill = lambda d, a, n: None
+    assert r._resolve_zero_method() == "kernel"  # a device fill is available
+    monkeypatch.setenv("AITER_GEMM_FUSION_RESET_ZERO", "h2d")
+    assert r._resolve_zero_method() == "h2d"  # the env override wins
+    monkeypatch.setenv("AITER_GEMM_FUSION_RESET_ZERO", "bogus")
+    with pytest.raises(ResourceError, match="not in"):
+        r._resolve_zero_method()
+    monkeypatch.delenv("AITER_GEMM_FUSION_RESET_ZERO")
+    r.zero_method, r.zero_fill = "kernel", None
+    assert (
+        r._resolve_zero_method() == "kernel"
+    )  # explicit: the torch fill is used (and fails loudly without torch)
 
 
 def test_a_late_propagated_write_after_the_zero_triggers_another_round_and_it_is_logged(
@@ -954,17 +1067,18 @@ def test_a_late_propagated_write_after_the_zero_triggers_another_round_and_it_is
         "zero",
         "sync",
         "barrier",
-        "allgather",  # round 1: the write lands between the zero and the barrier -> verify sees it
+        "allgather",  # round 1: the write lands between the zero and the barrier -> the FIRST read sees it (no re-read needed)
         "zero",
         "sync",
         "barrier",
-        "allgather",  # round 2: zeroed again, clean
+        *CLEAN_TAIL,  # round 2: zeroed again, clean, final barrier, re-read
     ]
-    assert rig.zero_rounds == 2 and rig.r.last_reset_rounds == 2 and rig.err == 0
-    assert rig.inits == [
-        "init",
-        "init",
-    ]  # the control blocks are re-initialised after EVERY zeroing
+    assert (
+        rig.zero_rounds == 2
+        and rig.r.last_reset_rounds == 2
+        and rig.err == 0
+        and rig.inits == ["init", "init"]
+    )
     retry = [m for m in lg.msgs if "reset_retry" in m]
     assert (
         len(retry) == 1
@@ -972,8 +1086,68 @@ def test_a_late_propagated_write_after_the_zero_triggers_another_round_and_it_is
         and "large:" in retry[0]
         and "origin_rank=1" in retry[0]
         and "propagated=1" in retry[0]
+        and "step=0" in retry[0]
     )
     assert any("event=resources reset rank=0" in m and "rounds=2" in m for m in lg.msgs)
+
+
+def test_a_write_landing_after_the_first_read_is_caught_by_the_reread_after_the_final_barrier(
+    monkeypatch,
+):
+    word = errpage.encode_err(
+        6, 3, 2, False
+    )  # 0xb06: the word that came back in Evidence's run
+    assert word == 0xB06
+    rig = _ResetRig(monkeypatch, reread=[word])
+    with _Logs() as lg:
+        rig.r.reset()
+    assert rig.events == [
+        "sync",
+        "barrier",
+        "zero",
+        "sync",
+        "barrier",
+        "allgather",
+        "barrier",
+        "allgather",  # round 1: the first read is clean, the RE-READ after the final barrier is not
+        "zero",
+        "sync",
+        "barrier",
+        *CLEAN_TAIL,  # round 2
+    ]
+    assert rig.r.last_reset_rounds == 2 and rig.err == 0
+    retry = [m for m in lg.msgs if "reset_retry" in m]
+    assert (
+        len(retry) == 1
+        and "origin_rank=3" in retry[0]
+        and "propagated=0" in retry[0]
+        and "large:POSTER_WAIT" in retry[0]
+    )
+
+
+def test_stale_step_or_diag_after_the_zero_is_unclean_even_with_err_zero(monkeypatch):
+    stale = (
+        0,
+        16,
+        (0x1_0000_0001, 0x222, 0, 0),
+    )  # ERR already 0 but the OLD page content (STEP 16, DIAG) is back: the zero did not stick
+    rig = _ResetRig(monkeypatch, page_script=[stale, (0, 0, (0, 0, 0, 0))])
+    with _Logs() as lg:
+        rig.r.reset()
+    assert rig.zero_rounds == 2 and rig.r.last_reset_rounds == 2
+    retry = [m for m in lg.msgs if "reset_retry" in m]
+    assert (
+        len(retry) == 1
+        and "step=16" in retry[0]
+        and "0x100000001" in retry[0]
+        and "0x222" in retry[0]
+    )
+    # DIAG alone (STEP and ERR zero) also counts, and only DIAG[0..3] are compared
+    rig2 = _ResetRig(
+        monkeypatch, page_script=[(0, 0, (0, 0, 0, 7)), (0, 0, (0, 0, 0, 0))]
+    )
+    rig2.r.reset()
+    assert rig2.r.last_reset_rounds == 2
 
 
 def test_a_peers_late_write_repeats_the_round_on_every_rank_the_decision_is_collective(
@@ -982,14 +1156,20 @@ def test_a_peers_late_write_repeats_the_round_on_every_rank_the_decision_is_coll
     word = errpage.encode_err(0x31, 2, 2, True)
     rig = _ResetRig(
         monkeypatch, peers=[{2: word}, {}]
-    )  # THIS rank's ERR is clean; rank 2's word is not after round 1
+    )  # THIS rank is clean; rank 2's word is not after round 1
     rig.r.reset()
-    assert rig.zero_rounds == 2 and rig.gathers == 2 and rig.r.last_reset_rounds == 2
+    assert (
+        rig.zero_rounds == 2 and rig.r.last_reset_rounds == 2 and rig.gathers == 3
+    )  # round 1: one gather (unclean), round 2: gather + re-read
+    rig_stale = _ResetRig(
+        monkeypatch, peers=[{1: (0, 9, (0, 0, 0, 0))}, {}]
+    )  # a peer's stale STEP is enough
+    rig_stale.r.reset()
+    assert rig_stale.r.last_reset_rounds == 2
     # every rank gets the SAME gathered dict (it is what makes the repeat decision uniform)
-    words = rig.r._gather_err_words()
-    assert words == {0: 0, 1: 0, 2: 0, 3: 0}
-    rig2 = _ResetRig(monkeypatch, peers=[{1: 5}])
-    assert rig2.r._gather_err_words() == {0: 0, 1: 5, 2: 0, 3: 0}
+    rig3 = _ResetRig(monkeypatch, peers=[{1: 5}])
+    assert rig3.r._gather_err_words() == {0: 0, 1: 5, 2: 0, 3: 0}
+    assert rig3.r._gather_page_words()[1] == (5, 0, (0, 0, 0, 0))
 
 
 def test_persistent_errors_fail_fatally_after_k_rounds_with_the_decoded_words(
@@ -997,16 +1177,23 @@ def test_persistent_errors_fail_fatally_after_k_rounds_with_the_decoded_words(
 ):
     w_small = errpage.encode_err(0x30, 1, 1, True)
     w_large = errpage.encode_err(6, 3, 2, True)
-    rig = _ResetRig(monkeypatch, late=[w_large] * 10, peers=[{1: w_small}])
+    rig = _ResetRig(
+        monkeypatch, late=[w_large] * 10, peers=[{1: (w_small, 4, (0x11, 0, 0, 0))}]
+    )
     with _Logs() as lg, pytest.raises(gf.ResetError) as ei:
         rig.r.reset()
     e = ei.value
     assert rig.zero_rounds == 3 and rig.r.last_reset_rounds == 3  # K = 3 by default
-    assert e.words[1] == w_small and e.words[0] == w_large
+    assert (
+        e.words[1] == w_small and e.words[0] == w_large
+    )  # ATOM's contract: {rank: ERR word}
+    assert e.details[1] == (w_small, 4, (0x11, 0, 0, 0)) and e.details[0][0] == w_large
     msg = str(e)
     assert (
         "after 3 zeroing round(s)" in msg
         and "rank 1: small:TAG_MISMATCH" in msg
+        and "step=4" in msg
+        and "0x11" in msg
         and "rank 0: large:" in msg
         and "origin_rank=3" in msg
     )
@@ -1017,7 +1204,6 @@ def test_persistent_errors_fail_fatally_after_k_rounds_with_the_decoded_words(
     assert not any(
         "event=resources reset rank=0" in m for m in lg.msgs
     )  # no success line
-    # K is configurable
     rig1 = _ResetRig(monkeypatch, late=[w_large] * 10, max_rounds=1)
     with pytest.raises(gf.ResetError, match="after 1 zeroing round"):
         rig1.r.reset()
@@ -1032,13 +1218,10 @@ def test_persistent_errors_fail_fatally_after_k_rounds_with_the_decoded_words(
 def test_a_kernel_still_running_at_the_start_is_drained_before_anyone_zeroes(
     monkeypatch,
 ):
-    """The bug Evidence found: a kernel inside its wait budget finishes (and propagates ERR) AFTER the zeroing. Now the drain + barrier come first: the late write of the
-    in-flight kernel lands during the first device sync, and the zero that follows the barrier clears it: ONE round suffices.
-    """
+    """A kernel inside its wait budget finishes (and propagates ERR) during the drain; the zero that follows the barrier clears it: ONE round suffices."""
     word = errpage.encode_err(6, 1, 2, True)
     rig = _ResetRig(monkeypatch, in_flight=word)
-    drained = []
-    rig.r.set_drain("o1", lambda: (drained.append(1), rig.events.append("drain")))
+    rig.r.set_drain("o1", lambda: rig.events.append("drain"))
     rig.events.clear()
     rig.r.reset()
     assert rig.events[:4] == ["sync", "drain", "sync", "barrier"] and rig.events.index(
@@ -1060,12 +1243,141 @@ def test_without_a_global_page_there_is_one_round_and_no_verification(monkeypatc
     assert rig.events == ["sync", "barrier", "zero", "sync", "barrier"]
 
 
-def test_an_unreadable_err_word_is_never_taken_for_zero(monkeypatch):
+def test_an_unreadable_page_is_never_taken_for_zero_and_words_are_masked(monkeypatch):
     rig = _ResetRig(monkeypatch)
-    rig.r.err_reader = lambda: (_ for _ in ()).throw(RuntimeError("device gone"))
+    rig.r.page_reader = lambda: (_ for _ in ()).throw(RuntimeError("device gone"))
     with pytest.raises(RuntimeError, match="device gone"):
         rig.r.reset()
-    # the ERR word is a 32-bit value: wider contributions are masked
+    assert rig.r.launch_gate is False  # the gate is released even when the reset raises
     rig2 = _ResetRig(monkeypatch)
-    rig2.r.err_reader = lambda: (1 << 40) | 0x20
-    assert rig2.r._gather_err_words()[0] == 0x20
+    rig2.r.page_reader = lambda: ((1 << 40) | 0x20, 1 << 3, (1, 2, 3, 4))
+    assert rig2.r._gather_page_words()[0] == (
+        0x20,
+        8,
+        (1, 2, 3, 4),
+    )  # ERR is a 32-bit value
+    # only an injected err_reader (fakes / old callers): ERR alone, STEP and DIAG taken as zero
+    rig3 = _ResetRig(monkeypatch)
+    rig3.r.page_reader, rig3.r.err_reader = None, (lambda: 0x40)
+    assert rig3.r._read_page_words() == (0x40, 0, (0, 0, 0, 0))
+
+
+def test_launch_gate_is_set_for_the_whole_reset_and_released_after_success_and_failure(
+    monkeypatch,
+):
+    rig = _ResetRig(monkeypatch)
+    seen = []
+    rig.r.set_drain("o1", lambda: seen.append(("drain", rig.r.launch_gate)))
+    rig.r.set_init(
+        "o1", lambda: seen.append(("init", rig.r.launch_gate))
+    )  # set_init runs the hook once NOW (gate off)
+    seen.clear()
+    assert rig.r.launch_gate is False
+    rig.r.reset()
+    assert seen == [("drain", True), ("init", True)] and rig.r.launch_gate is False
+    # the gate also covers the legacy name
+    seen.clear()
+    rig.r.quiesce_and_reset()
+    assert all(g for _n, g in seen) and rig.r.launch_gate is False
+    # a failed reset releases the gate too (the caller then fails the worker, but the flag must not stay stuck)
+    bad = _ResetRig(monkeypatch, late=[errpage.encode_err(6, 3, 2, True)] * 10)
+    with pytest.raises(gf.ResetError):
+        bad.r.reset()
+    assert bad.r.launch_gate is False
+
+
+def test_the_timing_line_has_timestamps_for_every_phase_also_when_the_reset_fails(
+    monkeypatch,
+):
+    rig = _ResetRig(monkeypatch)
+    t = {"now": 1_700_000_000.0}
+
+    def clock():
+        t["now"] += 0.002
+        return t["now"]
+
+    rig.r.reset_clock = clock
+    with _Logs() as lg:
+        rig.r.reset()
+    line = next(m for m in lg.msgs if "event=resources reset_timing" in m)
+    for token in (
+        "where=reset",
+        "zero=h2d",
+        "rounds=1",
+        "ok=1",
+        "start=22:13:20.",
+        "drain=[",
+        "barrier0=[",
+        "zero1=[",
+        "sync_barrier1=[",
+        "verify1=[",
+        "total=",
+    ):
+        assert token in line, (token, line)
+    assert re.search(
+        r"drain=\[\d\d:\d\d:\d\d\.\d{3}\.\.\d\d:\d\d:\d\d\.\d{3} \d+\.\d\dms\]", line
+    )
+    # on failure the line is logged BEFORE the exception leaves, with ok=0 and every round's phases
+    bad = _ResetRig(monkeypatch, late=[errpage.encode_err(6, 3, 2, True)] * 10)
+    with _Logs() as lg2, pytest.raises(gf.ResetError):
+        bad.r.reset()
+    fail = next(m for m in lg2.msgs if "event=resources reset_timing" in m)
+    assert (
+        "ok=0" in fail
+        and "rounds=3" in fail
+        and "zero3=[" in fail
+        and "verify3=[" in fail
+    )
+
+
+def test_devzero_fill_chunks_the_window_aligns_and_syncs(monkeypatch):
+    from aiter.gemm_fusion import devzero
+
+    log = []
+    tm = types.ModuleType("torch")
+
+    def as_tensor(obj, device=None):
+        cai = obj.__cuda_array_interface__
+        return NS(
+            addr=cai["data"][0],
+            n=cai["shape"][0],
+            typestr=cai["typestr"],
+            device=device,
+            zero_=lambda a=cai["data"][0], n=cai["shape"][0]: log.append(
+                ("zero_", a, n)
+            ),
+        )
+
+    tm.as_tensor = as_tensor
+    tm.cuda = NS(
+        synchronize=lambda dev: log.append(("sync", dev)), is_available=lambda: True
+    )
+    monkeypatch.setitem(sys.modules, "torch", tm)
+    assert devzero.torch_available() is True
+    base = 0x7F00_0000_0000
+    devzero.torch_fill_zero(
+        2, base, 2_500_000_000 // 4 * 4
+    )  # 2.5 GB: three chunks (1 GiB, 1 GiB, the rest)
+    chunk = devzero.CHUNK_BYTES
+    assert log[0] == ("zero_", base, chunk // 4) and log[1] == (
+        "zero_",
+        base + chunk,
+        chunk // 4,
+    )
+    assert (
+        log[2][0] == "zero_"
+        and log[2][1] == base + 2 * chunk
+        and log[-1] == ("sync", 2)
+        and len(log) == 4
+    )
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        devzero.torch_fill_zero(0, base + 2, 4096)
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        devzero.torch_fill_zero(0, base, 4094)
+    # no usable device / no torch: not available (the "auto" zero method falls back to the H2D memcpy)
+    tm.cuda = NS(is_available=lambda: False)
+    assert devzero.torch_available() is False
+    monkeypatch.setitem(
+        sys.modules, "torch", types.ModuleType("torch")
+    )  # a fake torch without .cuda
+    assert devzero.torch_available() is False

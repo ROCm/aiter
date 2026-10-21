@@ -26,11 +26,14 @@ quiesce_and_reset = device sync -> poison log -> drain -> barrier -> zero all wi
 from __future__ import annotations
 
 import ctypes as C
+import datetime
 import logging
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from . import devzero
 from .errpage import (
     SHARE_GLOBAL,
     ErrInfo,
@@ -78,13 +81,20 @@ class ResourceError(RuntimeError):
 
 
 class ResetError(ResourceError):
-    """The collective reset() could not reach an all-zero ERR state: some rank's ERR word was still non-zero after the last round (a peer kernel still inside its wait budget
-    or a remote propagation write that keeps landing). Fatal: the comm cannot be trusted; `words` = {rank: ERR word} of the last verification.
-    """
+    """The collective reset() could not reach an all-zero error state: some rank's ERR word (or STEP / DIAG) was still non-zero after the last round (a peer kernel still inside
+    its wait budget, a remote propagation write that keeps landing, or old page content resurfacing). Fatal: the comm cannot be trusted. `words` = {rank: ERR word} of the last
+    verification (ATOM's contract), `details` = {rank: (ERR, STEP, (DIAG0..DIAG3))}."""
 
-    def __init__(self, msg: str, words: dict[int, int]):
+    def __init__(self, msg: str, words: dict[int, int], details: dict | None = None):
         super().__init__(msg)
         self.words = dict(words)
+        self.details = dict(details or {})
+
+
+class LaunchGateError(ResourceError):
+    """A fused launch (Plan.run) was attempted while reset() is in progress (FusionResources.launch_gate is set). A launch during the collective reset can write ERR / STEP / the
+    control windows after the zeroing: the caller must not launch until reset() returned (a graph REPLAY runs no Python: the engine must check the gate itself).
+    """
 
 
 class _ArenaRefused(Exception):
@@ -400,6 +410,11 @@ class FusionResources:
         self.finalized = False
         self._released = False
         # R12 (design card r2): the per-comm ERR/STEP/DIAG page, the async readback ring and the diagnostics hooks read by reset()
+        self.launch_gate = False  # True for the duration of reset(): Plan.run raises LaunchGateError (a graph replay bypasses Python: the caller checks it)
+        self.zero_method = "auto"  # reset()'s zeroing: "kernel" (device-side fill), "h2d" (MORI's memcpy) or "auto" (kernel when torch + a device are available)
+        self.zero_fill = None  # (device, local, nbytes) -> None, a device-side zero; None = devzero.torch_fill_zero. Injectable for tests
+        self.page_reader = None  # () -> (ERR, STEP, (DIAG0..3)) of this rank; None = a D2H read of the global page (err_reader, if set, supplies ERR alone)
+        self.reset_clock = time.time  # wall clock of the reset timing log (injectable)
         self.reset_max_rounds = (
             RESET_MAX_ROUNDS  # reset(): max zero / verify rounds (>= 1)
         )
@@ -1204,7 +1219,12 @@ class FusionResources:
         (4) device sync + barrier;
         (5) verify: all-gather every rank's ERR word. If any is non-zero (a peer's propagated ERR, or its remote propagation write, landed AFTER the zeroing: the D-6(b) "ack =>
             performed" assumption does not hold in practice) repeat (3)-(5), at most `reset_max_rounds` rounds in all, then raise ResetError with the decoded words.
-        The number of rounds needed is logged (`rounds=`) and kept in `last_reset_rounds`. Without a global page (pre-R12 plans only) there is nothing to verify: one round.
+        The number of rounds needed is logged (`rounds=`) and kept in `last_reset_rounds`.
+        Hardening (Evidence: an ERR word resurfacing after the reset): (a) the zeroing is a DEVICE-side fill + sync (zero_method "kernel"/"auto"), not the DMA memcpy that writes
+        behind the L2; (b) the verification reads ERR, STEP and DIAG[0..3] of every rank and, when all are zero, barriers and re-reads once more before returning (a non-zero
+        value starts another round and is logged decoded); (c) `launch_gate` is True for the whole call: Plan.run raises LaunchGateError (a graph replay bypasses Python: the
+        engine must check the gate); (d) a `reset_timing` line logs wall-clock timestamps and durations of the drain / zero / verify phases.
+        Without a global page (pre-R12 plans only) there is nothing to verify: one round.
         """
         self._collective_reset("reset")
 
@@ -1218,18 +1238,82 @@ class FusionResources:
             return int(self.err_reader())
         return self.global_page().read_err()
 
-    def _gather_err_words(self) -> dict[int, int]:
-        """{rank: ERR word} of every rank (all-gather: the SAME dict on every rank, so every rank decides the same way)."""
-        mine = int(self._read_err_word()) & 0xFFFFFFFF
-        got = [None] * self.world
-        self.dist.all_gather_object(got, mine, group=self.group)
-        return {r: int(w) & 0xFFFFFFFF for r, w in enumerate(got)}
+    def _read_page_words(self) -> tuple[int, int, tuple[int, int, int, int]]:
+        """(ERR, STEP, (DIAG0..3)) of this rank for the verification. Injected `page_reader` first; else, when only `err_reader` is injected (fakes), ERR alone with STEP and
+        DIAG taken as zero; else a device read of the page."""
+        if self.page_reader is not None:
+            err, step, diag = self.page_reader()
+            return int(err) & 0xFFFFFFFF, int(step), tuple(int(v) for v in diag)
+        if self.err_reader is not None:
+            return int(self.err_reader()) & 0xFFFFFFFF, 0, (0, 0, 0, 0)
+        return self.global_page().read_words()
 
-    def _zero_everything(self):
-        self._zero_windows(
-            self._regs
-        )  # every registered window exactly once (a shared window / the arena is not zeroed once per owner)
+    def _gather_page_words(
+        self,
+    ) -> dict[int, tuple[int, int, tuple[int, int, int, int]]]:
+        """{rank: (ERR, STEP, DIAG0..3)} of every rank (all-gather: the SAME dict on every rank, so every rank decides the same way)."""
+        err, step, diag = self._read_page_words()
+        got = [None] * self.world
+        self.dist.all_gather_object(
+            got, ("gf_errpage", err, step, *diag), group=self.group
+        )
+        return {
+            r: (int(g[1]) & 0xFFFFFFFF, int(g[2]), tuple(int(v) for v in g[3:7]))
+            for r, g in enumerate(got)
+        }
+
+    def _gather_err_words(self) -> dict[int, int]:
+        """{rank: ERR word} of every rank (the ERR column of _gather_page_words)."""
+        return {r: w[0] for r, w in self._gather_page_words().items()}
+
+    @staticmethod
+    def _unclean(words: dict) -> dict:
+        """The ranks whose (ERR, STEP, DIAG0..3) are not all zero."""
+        return {r: w for r, w in words.items() if w[0] or w[1] or any(w[2])}
+
+    @staticmethod
+    def _describe_page(w) -> str:
+        err, step, diag = w
+        return (
+            f"{decode_err(err).describe()} step={step} diag={[f'{v:#x}' for v in diag]}"
+        )
+
+    def _verify_clean(self) -> dict:
+        """The verification of one round: gather every rank's ERR / STEP / DIAG[0..3]; if all are zero, barrier (the FINAL barrier) and re-read once more (an in-flight
+        write that landed after the first read, or a resurfaced stale line, shows up here). Returns the unclean {rank: words} (empty = the round passed).
+        """
+        first = self._gather_page_words()
+        bad = self._unclean(first)
+        if bad:
+            return bad
+        self._barrier()
+        return self._unclean(self._gather_page_words())
+
+    def _resolve_zero_method(self) -> str:
+        m = os.environ.get("AITER_GEMM_FUSION_RESET_ZERO") or self.zero_method
+        if m not in ("auto", "kernel", "h2d"):
+            raise ResourceError(f"zero method {m!r} not in (auto, kernel, h2d)")
+        if m == "auto":
+            m = (
+                "kernel"
+                if (self.zero_fill is not None or devzero.torch_available())
+                else "h2d"
+            )
+        return m
+
+    def _zero_for_reset(self, method: str):
+        """Zero every registered window (the arena once under the arena policy): a device-side fill (+ a device sync) or MORI's H2D memcpy."""
+        if method == "kernel":
+            fill = self.zero_fill or devzero.torch_fill_zero
+            for w in self._regs:
+                fill(self.device, w.local, w.bytes)
+            self.backend.device_sync(self.device)
+        else:
+            self._zero_windows(self._regs)
         self._unzeroed.clear()
+
+    def _zero_everything(self, method: str = "h2d"):
+        self._zero_for_reset(method)
         for hook in list(
             self._init_hooks.values()
         ):  # control-block images; one per owner, one for a shared set
@@ -1238,62 +1322,121 @@ class FusionResources:
             self._ring.reset()  # the old readings describe a state that no longer exists
 
     def _collective_reset(self, where: str):
-        """See reset(): drain -> barrier -> [zero -> sync -> barrier -> verify] x <= reset_max_rounds."""
+        """See reset(): drain -> barrier -> [zero -> sync -> barrier -> verify] x <= reset_max_rounds, with fused launches gated for the whole call and a timestamped timing
+        line (drain / zero / verify) logged at the end (also when it fails)."""
         max_rounds = max(1, int(self.reset_max_rounds))
-        # (1) drain
-        self.backend.device_sync(self.device)
-        self._log_error_page(
-            where
-        )  # the reason must be logged BEFORE the zeroing below clears it
-        self.log_poison(
-            where
-        )  # pre-R12 plans only: they registered per-plan poison hooks
-        for hook in self._drain_hooks.values():
-            hook()
-        if self._drain_hooks:
-            self.backend.device_sync(self.device)
-        # (2) every rank's kernels are finished before anyone zeroes
-        self._barrier()
-        verify = self._global is not None
-        rounds, words = 0, {}
-        while True:
-            rounds += 1
-            # (3) zero everything, (4) sync + barrier
-            self._zero_everything()
-            self.backend.device_sync(self.device)
-            self._barrier()
-            if not verify:
-                break
-            # (5) verify
-            words = self._gather_err_words()
-            bad = {r: w for r, w in words.items() if w}
-            if not bad:
-                break
-            log.warning(
-                "event=resources reset_retry rank=%d where=%s round=%d/%d nonzero=%s",
-                self.rank,
-                where,
-                rounds,
-                max_rounds,
-                {r: decode_err(w).describe() for r, w in bad.items()},
-            )
-            if rounds >= max_rounds:
-                self.last_reset_rounds = rounds
-                raise ResetError(
-                    f"{where}: ERR still non-zero after {rounds} zeroing round(s); "
-                    + ", ".join(
-                        f"rank {r}: {decode_err(w).describe()}"
-                        for r, w in sorted(bad.items())
-                    ),
-                    words,
+        clock = self.reset_clock
+        phases: list[tuple[str, float, float]] = []
+
+        class _Ph:
+            def __init__(self, name):
+                self.name = name
+
+            def __enter__(self):
+                self.t0 = clock()
+
+            def __exit__(self, *exc):
+                phases.append((self.name, self.t0, clock()))
+
+        t_start = clock()
+        self.launch_gate = True  # no fused launch while the windows / the page are being drained, zeroed and verified
+        rounds, ok = 0, False
+        try:
+            method = self._resolve_zero_method()
+            with _Ph("drain"):  # (1) drain
+                self.backend.device_sync(self.device)
+                self._log_error_page(
+                    where
+                )  # the reason must be logged BEFORE the zeroing below clears it
+                self.log_poison(
+                    where
+                )  # pre-R12 plans only: they registered per-plan poison hooks
+                for hook in self._drain_hooks.values():
+                    hook()
+                if self._drain_hooks:
+                    self.backend.device_sync(self.device)
+            with _Ph(
+                "barrier0"
+            ):  # (2) every rank's kernels are finished before anyone zeroes
+                self._barrier()
+            verify = self._global is not None
+            while True:
+                rounds += 1
+                with _Ph(f"zero{rounds}"):  # (3) zero everything
+                    self._zero_everything(method)
+                with _Ph(f"sync_barrier{rounds}"):  # (4) sync + barrier
+                    self.backend.device_sync(self.device)
+                    self._barrier()
+                if not verify:
+                    ok = True
+                    break
+                with _Ph(
+                    f"verify{rounds}"
+                ):  # (5) verify: ERR / STEP / DIAG[0..3] of every rank, a final barrier, a re-read
+                    bad = self._verify_clean()
+                if not bad:
+                    ok = True
+                    break
+                log.warning(
+                    "event=resources reset_retry rank=%d where=%s round=%d/%d nonzero=%s",
+                    self.rank,
+                    where,
+                    rounds,
+                    max_rounds,
+                    {r: self._describe_page(w) for r, w in bad.items()},
                 )
-        self.last_reset_rounds = rounds
+                if rounds >= max_rounds:
+                    self.last_reset_rounds = rounds
+                    raise ResetError(
+                        f"{where}: ERR / STEP / DIAG still non-zero after {rounds} zeroing round(s); "
+                        + ", ".join(
+                            f"rank {r}: {self._describe_page(w)}"
+                            for r, w in sorted(bad.items())
+                        ),
+                        {r: w[0] for r, w in bad.items()},
+                        bad,
+                    )
+            self.last_reset_rounds = rounds
+        finally:
+            self.launch_gate = False
+            self._log_reset_timing(
+                where,
+                method if "method" in locals() else "?",
+                rounds,
+                ok,
+                t_start,
+                clock(),
+                phases,
+            )
         log.info(
-            "event=resources %s rank=%d windows=%d rounds=%d",
+            "event=resources %s rank=%d windows=%d rounds=%d zero=%s",
             where,
             self.rank,
             len(self._regs),
             rounds,
+            method,
+        )
+
+    def _log_reset_timing(self, where, method, rounds, ok, t0, t1, phases):
+        def ts(t):
+            return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime(
+                "%H:%M:%S.%f"
+            )[:-3]
+
+        parts = " ".join(
+            f"{n}=[{ts(a)}..{ts(b)} {1000.0 * (b - a):.2f}ms]" for n, a, b in phases
+        )
+        log.info(
+            "event=resources reset_timing rank=%d where=%s zero=%s rounds=%d ok=%d start=%s end=%s total=%.2fms %s",
+            self.rank,
+            where,
+            method,
+            rounds,
+            int(ok),
+            ts(t0),
+            ts(t1),
+            1000.0 * (t1 - t0),
+            parts,
         )
 
     def release(self):

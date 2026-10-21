@@ -5538,3 +5538,48 @@ def test_large_src_sha_constants_are_the_manifest_hashes():
     for src in jit.LARGE_SRCS:
         manifest = os.path.join(jit.CSRC, "large", src, "SOURCE_SHA256.txt")
         assert hashlib.sha256(_slurp(manifest, "rb")).hexdigest() == sha[src], src
+
+
+# ======================================================================= launch gate: Plan.run refuses to launch while reset() is in progress
+def test_plan_run_raises_the_typed_gate_error_while_reset_is_in_progress_small_and_large(
+    monkeypatch,
+):
+    from aiter.gemm_fusion import LaunchGateError, ResourceError
+
+    plan, st, meta, outs, res, launches, binds = _small_ready(monkeypatch, src="r19")
+    pos = _NoRead((64,), (1,), "i64")
+    m2 = {**meta, "positions": pos, "slot_mapping": pos}
+    res.launch_gate = True
+    with pytest.raises(
+        LaunchGateError,
+        match=r"sp_qkv\.small/.*launch was attempted while reset\(\) is in progress",
+    ):
+        _run_small(plan, st, m2, outs, res, call_id=7)
+    assert (
+        launches == [] and binds == []
+    )  # refused BEFORE anything was bound, validated or launched
+    assert issubclass(LaunchGateError, ResourceError)
+    res.launch_gate = False
+    _run_small(plan, st, m2, outs, res, call_id=7)
+    assert len(launches) == 1  # the gate released: the same call launches
+    # a resources object without the attribute (an older FusionResources) is not gated
+    del res.launch_gate
+    _run_small(plan, st, m2, outs, res, call_id=7)
+    assert len(launches) == 2
+    # the abi-2 (r17/r18) small plans are gated too
+    plan2, st2, meta2, outs2, res2, launches2, _b = _small_ready(monkeypatch)
+    res2.launch_gate = True
+    with pytest.raises(LaunchGateError):
+        _run_small(plan2, st2, meta2, outs2, res2)
+    assert launches2 == []
+    # large
+    lplan, lst, lres, llaunches = _large_ready(monkeypatch)
+    lres.launch_gate = True
+    with pytest.raises(
+        LaunchGateError, match=r"sp_qkv\.large/.*while reset\(\) is in progress"
+    ):
+        _run_large(lplan, lst, lres)
+    assert llaunches == []
+    lres.launch_gate = False
+    _run_large(lplan, lst, lres)
+    assert len(llaunches) == 1

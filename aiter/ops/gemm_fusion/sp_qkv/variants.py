@@ -86,6 +86,16 @@ def decode_small_poison(word: int) -> str:
     return f"{kind} why={w & 0xFF:#x} word={w:#x}"
 
 
+def _check_launch_gate(res, owner: str) -> None:
+    """Refuse a launch while FusionResources.reset() is in progress (res.launch_gate): it could write ERR / STEP / the control windows after the zeroing."""
+    if getattr(res, "launch_gate", False):
+        from aiter.gemm_fusion.resources import LaunchGateError
+
+        raise LaunchGateError(
+            f"{owner}: a fused launch was attempted while reset() is in progress (launch_gate set); wait for reset() to return"
+        )
+
+
 def _require_zeroed(res, owner: str):
     """With the default zero mode (h2d_deferred) the windows are zeroed in FusionResources.finalize(); a launch before that would run on garbage control state."""
     if getattr(res, "pending_zero", 0):
@@ -465,6 +475,7 @@ class SpQkvSmall(Plan):
     ):
         import torch
 
+        _check_launch_gate(res, self.owner)
         _require_zeroed(res, self.owner)
         t_valid = self._check_inputs(
             x, x_scale, w_scale, outs, meta, w

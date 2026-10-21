@@ -9,6 +9,7 @@ from .profile import Profile, ProfileError, Rule, load_profile, parse_profile
 from .resources import (
     CcoBackend,
     FusionResources,
+    LaunchGateError,
     ResetError,
     ResourceError,
     Window,
@@ -35,6 +36,7 @@ __all__ = [
     "FusionSpec",
     "GemmSpec",
     "HeadNormRopeCache",
+    "LaunchGateError",
     "MatchCtx",
     "Plan",
     "Profile",
