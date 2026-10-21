@@ -506,36 +506,45 @@ CAPS = frozenset({"mori_cco", "sdma"})
 def test_shipped_profile_rules_are_signature_checked_and_match_the_generator():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
+    assert len(prof) == 24 + 87 and len(prof.rules()) == 12
+    large_rules = [r for r in prof.rules() if r.vid == "sp_qkv.large.v1"]
+    small_rules = [r for r in prof.rules() if r.vid == "sp_qkv.small.v1"]
     assert (
-        len(prof) == 6 + 87 and len(prof.rules()) == 9
-    )  # 6 small + 87 exact P1 large rows; the 9 fallback rules (3 layers x 3 modes)
+        len(large_rules) == 9 and len(small_rules) == 3
+    )  # 3 chunks-mod-4 layers x 3 modes; one MP64 (r20) rule per mode
     sigs = {
         specs.sp_qkv_spec(m).prefix(1).signature(): m for m in specs.MODES
     }  # large plans cover GEMM + SPExchange only
-    for r in prof.rules():
-        assert (
-            r.sig in sigs
-            and r.vid == "sp_qkv.large.v1"
-            and (r.arch, r.cu, r.world) == ("gfx950", 256, 4)
+    for r in large_rules:
+        assert r.sig in sigs and (r.arch, r.cu, r.world) == (
+            "gfx950",
+            256,
+            4,
         ), r.label()
         assert (
-            r.m_multiple % 256 == 0
+            r.m_multiple in (256, 512, 1024)
             and 1024 <= r.m_min <= r.m_max <= 8192
-            and r.name
             and "chunks_mod4" in r.name
         )
         assert (
             pb.row_mode(r) == sigs[r.sig]
         )  # the enumeration recovers the mode of a rule exactly as for a row
-    # the rows' own signature checks still hold, and a rule never shares a signature with a SMALL row (small cells have no rules)
+    sigs2 = {
+        specs.sp_qkv_spec(m).signature(): m for m in specs.MODES
+    }  # the small plans cover the whole 2-stage spec
+    for r in small_rules:
+        assert r.sig in sigs2 and (r.arch, r.cu, r.world) == ("gfx950", 256, 4)
+        assert (r.m_min, r.m_max, r.m_multiple) == (33, 64, 1) and "mp64" in r.name
+        assert dict(r.params) == specs.small_r20_params(sigs2[r.sig])
+        assert pb.row_mode(r) == sigs2[r.sig]
+    assert {r.sig for r in small_rules} == set(
+        sigs2
+    )  # one per mode; a large rule never shares a signature with a small row/rule
     small_sigs = {r.sig for r in prof.rows() if r.vid == "sp_qkv.small.v1"}
-    assert small_sigs.isdisjoint({r.sig for r in prof.rules()})
+    assert small_sigs.isdisjoint({r.sig for r in large_rules})
     # the file is exactly what the generator writes (rules included): regenerate with op_tests/gen_gemm_fusion_profile.py
     with open(profmod._resolve(PROFILE), encoding="utf-8") as f:
         assert json.load(f) == json.loads(json.dumps(gen_profile.build_profile()))
-    # every placeholder assignment is a valid plan at every m the rule covers (the generator asserts it; the match grid below constructs the plans)
-    for r in prof.rules():
-        assert r.m_multiple in (256, 512, 1024)
 
 
 def test_every_large_m_on_the_grid_is_an_exact_row_with_the_sweeps_best_params(
@@ -673,7 +682,7 @@ def test_the_shipped_rules_imply_no_extra_builds(jit_root):
         {"profile": "rows", "rows": [_row_doc(r) for r in prof.rows()]}
     )
     units_rows, _ = _units(rows_only)
-    assert skipped == [] and len(units) == 9 == len(
+    assert skipped == [] and len(units) == 12 == len(
         units_rows
     )  # builds are keyed by mode + build params (no_gridread), never by m, n or half_first
     assert {u.dirname for u in units} == {u.dirname for u in units_rows}
@@ -708,7 +717,7 @@ def test_a_rule_with_a_new_build_param_adds_exactly_the_units_it_implies(jit_roo
     )  # a different -DLG_NO_GRIDREAD: a different build
     doc = {"profile": "x", "rows": [_row_doc(r) for r in prof.rows()], "rules": [extra]}
     units, skipped = _units(parse_profile(doc))
-    assert skipped == [] and len(units) == 10
+    assert skipped == [] and len(units) == 13
     lg = [u for u in units if u.kind == "sp_qkv.large.v1"]
     assert len(lg) == 3 and {u.label.split()[0] for u in lg} == {"dense", "indexer"}
     # a profile made of rules ONLY still enumerates its builds (and the comm library)
@@ -719,12 +728,15 @@ def test_a_rule_with_a_new_build_param_adds_exactly_the_units_it_implies(jit_roo
         "gf_comm",
         "sp_qkv.large.v1",
         "sp_qkv.large.v1",
-    ]  # dense + indexer large builds (reuse shares dense), no small rows
+        "sp_qkv.small.v1",
+        "sp_qkv.small.v1",
+        "sp_qkv.small.v1",
+    ]  # dense + indexer large builds (reuse shares dense) + the 3 r20 (MP64) small builds of the small rules, no small rows
     # filters apply to rules like to rows
     assert (
         _units(only_rules, cu=304)[0] == []
         and _units(only_rules, arch="gfx942")[0] == []
-        and len(_units(only_rules, world=4)[0]) == 3
+        and len(_units(only_rules, world=4)[0]) == 6
     )
 
 
@@ -755,7 +767,7 @@ def test_87_exact_large_rows_still_collapse_into_the_same_few_build_units():
     (the small builds + the 2 large builds), and the rules (fallback layers) add none either.
     """
     units, skipped = _units(PROFILE)
-    assert skipped == [] and len(units) == 9
+    assert skipped == [] and len(units) == 12
     large = [u for u in units if u.kind == "sp_qkv.large.v1"]
     assert len(large) == 2 and {u.meta["src"] for u in large} == {
         "r12"
@@ -775,3 +787,187 @@ def test_87_exact_large_rows_still_collapse_into_the_same_few_build_units():
     assert s2 == [] and {(u.kind, u.key) for u in u2} == {
         (u.kind, u.key) for u in units
     }
+
+
+# ----------------------------------------------------------------------------------------------------------- small coverage: P2 rows, MP64 (r20), native ranges
+SMALL_CAPS = CAPS | {"gfx950_sc_bypass"}
+DEFAULT_CAPTURE_M = (
+    1,
+    2,
+    4,
+    8,
+    12,
+    16,
+    32,
+    64,
+    128,
+)  # ATOM's default SP4 capture list pads to T = 4, 8, 16, 32, 48, 64, 128, 256, 512 (local m = T / 4)
+
+
+def _small_at(mode, m, prof=PROFILE):
+    return match_prefix(
+        specs.sp_qkv_spec(mode), MatchCtx("gfx950", 256, 4, m, SMALL_CAPS), prof
+    )
+
+
+def test_every_default_capture_bucket_resolves_as_designed(sp_qkv_catalog):
+    """The buckets ATOM captures by default: P2 (m 1, 2, 4, 8, 12) and m16 / m32 on r19, m64 (T=256) on r20; m=128 (T=512) has no fused path."""
+    for mode in specs.MODES:
+        for m in (1, 2, 4, 8, 12, 16, 32, 64):
+            plan, n = _small_at(mode, m)
+            assert plan is not None and n == 2 and plan.vid == "sp_qkv.small.v1", (
+                mode,
+                m,
+            )
+            assert plan.profile_source == "row", (
+                mode,
+                m,
+            )  # every captured bucket is an EXACT row
+            assert plan.src == ("r20" if m == 64 else "r19") and plan.mp == (
+                64 if m == 64 else 32
+            ), (mode, m)
+        assert _small_at(mode, 128) == (None, 0)  # T=512: native (no MP128 variant)
+
+
+def test_p2_rows_copy_the_mode_m16_params_and_r20_rows_use_the_mp64_params(
+    sp_qkv_catalog,
+):
+    clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    for mode in specs.MODES:
+        sig = specs.sp_qkv_spec(mode).signature()
+        p16 = dict(prof.lookup(sig, "gfx950", 256, 4, 16).params)
+        assert p16["src"] == "r19"
+        for m in specs.SMALL_P2_M:
+            assert dict(prof.lookup(sig, "gfx950", 256, 4, m).params) == p16, (
+                mode,
+                m,
+            )  # R13 P2: a copy of the m=16 params
+        assert (
+            dict(prof.lookup(sig, "gfx950", 256, 4, 64).params)
+            == specs.small_r20_params(mode)
+            == {"src": "r20", "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
+        )
+        # nothing but the P2 / m16 / m32 / m64 rows exists for the small spec
+        assert sorted(r.m for r in prof.rows() if r.sig == sig) == [
+            1,
+            2,
+            4,
+            8,
+            12,
+            16,
+            32,
+            64,
+        ]
+
+
+def test_mp64_rule_covers_33_to_64_every_m_on_r20_and_the_exact_row_wins_at_64(
+    sp_qkv_catalog,
+):
+    for mode in specs.MODES:
+        for m in range(33, 65):
+            plan, n = _small_at(mode, m)
+            assert (
+                plan is not None
+                and n == 2
+                and plan.src == "r20"
+                and plan.mp == 64
+                and plan.ctx_m == m
+            ), (mode, m)
+            assert plan.profile_source == ("row" if m == 64 else "rule"), (mode, m)
+    with capture() as msgs:
+        _small_at("dense", 48)
+        _small_at("dense", 64)
+    disp = [m for m in msgs if "event=dispatch" in m and "n_stages=2" in m]
+    assert (
+        "source=rule rule=dense_mp64_m33-64" in disp[0]
+        and "m=48" in disp[0]
+        and "'src': 'r20'" in disp[0]
+    )
+    assert "source=row" in disp[1] and "rule=" not in disp[1]
+
+
+def test_everything_else_is_explicitly_native(sp_qkv_catalog):
+    """m 65..255 (T 260..1020, incl. the default bucket T=512) and 256..1023 have no fused path; so do the m <= 32 values no row covers (e.g. 20, 24, 28)."""
+    clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    ranges = prof.meta["native_m_ranges"]
+    assert [(r["m_min"], r["m_max"]) for r in ranges] == [
+        (65, 255)
+    ] and "T=512" in ranges[0]["note"]
+    for mode in specs.MODES:
+        for m in list(range(65, 256)) + [256, 512, 768, 1000, 1023, 1025, 8193]:
+            assert _small_at(mode, m) == (None, 0), (
+                mode,
+                m,
+            )  # the full spec: neither the 2-stage nor the 1-stage (large) prefix has an entry
+        for m in (3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 20, 24, 28, 31):
+            assert _small_at(mode, m) == (None, 0), (
+                mode,
+                m,
+            )  # no row: native (the default capture list never produces them)
+    # the documented native range is also free of rows AND rules
+    assert not any(65 <= r.m <= 255 for r in prof.rows())
+    assert all(not (r.m_min <= 255 and r.m_max >= 65) for r in prof.rules())
+
+
+def test_p2_rows_add_no_unit_and_the_r20_rows_and_rule_imply_three_small_units(
+    jit_root,
+):
+    clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    units, skipped = _units(prof)
+    smalls = [u for u in units if u.kind == "sp_qkv.small.v1"]
+    assert (
+        skipped == []
+        and len(smalls) == 9
+        and sorted(u.meta["src"] for u in smalls) == ["r19"] * 6 + ["r20"] * 3
+    )
+    p2 = set(specs.SMALL_P2_M)
+    no_p2 = parse_profile(
+        {
+            "profile": "x",
+            "rows": [
+                _row_doc(r)
+                for r in prof.rows()
+                if not (r.vid == "sp_qkv.small.v1" and r.m in p2)
+            ],
+            "rules": [
+                r_
+                for r_ in json.loads(
+                    Path(profmod._resolve(PROFILE)).read_text(encoding="utf-8")
+                )["rules"]
+            ],
+        }
+    )
+    u2, _ = _units(no_p2)
+    assert {(u.kind, u.key) for u in u2} == {
+        (u.kind, u.key) for u in units
+    }  # the P2 rows (copies of m16) add no unit
+    # the r20 units compile small/r20 with the bypass loads on, and carry the MP64 geometry through the unit's defs
+    r20 = [u for u in smalls if u.meta["src"] == "r20"]
+    for u in r20:
+        assert (
+            "-DSM_RX_BYPASS=1" in u.meta["dev"] and "-DSM_T1_B_HEADS=1" in u.meta["dev"]
+        )
+        cmd = [
+            a.replace("\\", "/")
+            for a in jit.device_cmd_one("r20", u.meta["dev"], TOOL, "/out", "sm_ran")
+        ]
+        assert any(a.endswith("small/r20/device/ran_kernel.cu") for a in cmd)
+    # without the r20 rule and rows (an r19-only profile) the r20 units disappear: they are implied by BOTH the m64 rows and the rule
+    only_r19 = parse_profile(
+        {
+            "profile": "x",
+            "rows": [
+                _row_doc(r) for r in prof.rows() if dict(r.params).get("src") != "r20"
+            ],
+            "rules": [],
+        }
+    )
+    assert (
+        sorted(
+            u.meta["src"] for u in _units(only_r19)[0] if u.kind == "sp_qkv.small.v1"
+        )
+        == ["r19"] * 6
+    )

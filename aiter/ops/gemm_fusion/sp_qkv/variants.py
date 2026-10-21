@@ -34,12 +34,13 @@ from . import (
     specs,
 )
 from . import small_rt as rt
-from .jit import build_small, small_defs, src_abi
+from .jit import build_small, small_defs, src_abi, src_mp
 
 SRC_SHA = {
     "r17": "3f597cdb6141c39dd4450a1ea635785ffe44867006434157478f7822357d8ee3",
     "r18": "0e48e3f01e917c9c5209c71efd90748e83eacf59d0e92cd10e5549955a450c29",
     "r19": "d421799342c158798c3924ccae0f2babd88ec34b6e188edba15e5f98ad9eaac5",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
+    "r20": "13874481c54a87ba789ae6d2d9d47074a6779c7a69063ae45139950270fac3d9",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
 }
 # analytic geometry (mirrors sm_abi_v2.h; cross-checked against sm_info_v1 after build)
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2560}
@@ -47,10 +48,20 @@ _NA = {"dense": 72, "indexer": 77, "reuse": 77}
 _MAX_BINDINGS = 64
 
 
-def small_window_bytes(mode: str) -> dict[str, int]:
-    rx = 2 * 4 * rt.SM_MP * _F[mode] * 2
+def small_window_bytes(mode: str, mp: int | None = None) -> dict[str, int]:
+    """Analytic window bytes of a small owner: Rx [2][4][MP][F] bf16 and the control window. mp = the source's SM_MP (32 for r17-r19, 64 for r20)."""
+    mp = rt.SM_MP if mp is None else mp
+    rx = 2 * 4 * mp * _F[mode] * 2
     ctl = 256 + 8 * 2 * 4 * _NA[mode]
     return {"rx": rx, "ctl": ctl}
+
+
+def small_p_bytes(mode: str, mp: int | None = None, sk: int = 3) -> int:
+    """Analytic bytes of the driver-owned split-K partial buffer P [SK][MP][N] fp32 (hipMalloc'd per context, NOT a comm window): dense 7,077,888 B and
+    indexer / reuse 7,569,408 B at MP64 / SK3. Reported so the HBM cost of an MP64 owner is visible next to its windows.
+    """
+    mp = rt.SM_MP if mp is None else mp
+    return sk * mp * _NA[mode] * 128 * 4
 
 
 def decode_small_poison(word: int) -> str:
@@ -113,7 +124,9 @@ def check_cache_page(k_cache, v_cache, page: int):
     + ";r18="
     + SRC_SHA["r18"]
     + ";r19="
-    + SRC_SHA["r19"],
+    + SRC_SHA["r19"]
+    + ";r20="
+    + SRC_SHA["r20"],
 )
 class SpQkvSmall(Plan):
     n_stages = 2
@@ -131,9 +144,12 @@ class SpQkvSmall(Plan):
             raise ContractError(
                 "sp_qkv.small.v1 rx_bypass=1 requires capability gfx950_sc_bypass (R2 is gfx950-only)"
             )
-        if not 1 <= ctx.m <= rt.SM_MP:
+        self.mp = src_mp(
+            self.src
+        )  # padded rows of this source: r17-r19 serve local m 1..32, r20 (MP64) 1..64
+        if not 1 <= ctx.m <= self.mp:
             raise ContractError(
-                f"sp_qkv.small.v1 supports local M 1..{rt.SM_MP}, got {ctx.m}"
+                f"sp_qkv.small.v1 (src {self.src}) supports local M 1..{self.mp}, got {ctx.m}"
             )
         if self.params.get("push8") and ctx.m > 16:
             raise ContractError("push8 build supports M<=16")
@@ -160,7 +176,7 @@ class SpQkvSmall(Plan):
         self._ctx = None
 
     def resources(self) -> list[WindowReq]:
-        b = small_window_bytes(self.mode)
+        b = small_window_bytes(self.mode, self.mp)
         cap = round_up(max(b["rx"], b["ctl"], 8192))
         reqs = [
             WindowReq(self.owner + "/rx", cap, "p2p_window"),
@@ -189,7 +205,7 @@ class SpQkvSmall(Plan):
             built = build_small(self.params, self.mode)
             lib = rt.load_driver(built.driver_so, abi=self.abi)
             geo = rt.info(lib)
-            exp = small_window_bytes(self.mode)
+            exp = small_window_bytes(self.mode, self.mp)
             if geo["rx_bytes"] != exp["rx"] or geo["ctl_bytes"] != exp["ctl"]:
                 raise RuntimeError(f"compiled geometry {geo} != analytic {exp}")
             import ctypes as C
@@ -391,9 +407,9 @@ class SpQkvSmall(Plan):
     def _check_inputs(self, x, x_scale, w_scale, outs, meta, w=None):
         """Reject, with ContractError, tensors the kernels cannot handle (see inputs.py) BEFORE any binding or launch. prepare() has no weight, run() passes it."""
         M = int(x.shape[0])
-        if not 1 <= M <= rt.SM_MP:
+        if not 1 <= M <= self.mp:
             raise ContractError(
-                f"{self.owner}: x has {M} rows, the small plans take local M 1..{rt.SM_MP}"
+                f"{self.owner}: x has {M} rows, a src {self.src} small plan takes local M 1..{self.mp}"
             )
         inputs.check_activation(self.owner, x, x_scale, M=M)
         inputs.check_weight_scale(self.owner, w_scale, N=_NA[self.mode] * 128)

@@ -24,24 +24,74 @@ LARGE_PROFILE_SRC = (
 )  # the large rows and rules run the R12 kernels (ERR page, call_id tags, NaN-fill node); "r11" to A/B
 
 
+SMALL_CAPS = frozenset({"mori_cco", "gfx950_sc_bypass"})
+
+
+def _small_plan_valid(mode, params, m):
+    """Would the small plan accept these params at local M = m? (the real constructor: M range of the source, push8 / b_rowsplit shape limits, rx_bypass capability, ...)"""
+    from aiter.gemm_fusion.match import ContractError, MatchCtx
+
+    from . import variants
+
+    ctx = MatchCtx(ARCH, CU, WORLD, m, SMALL_CAPS)
+    try:
+        variants.SpQkvSmall(specs.sp_qkv_spec(mode), dict(params), ctx)
+    except ContractError:
+        return False
+    return True
+
+
 def build_rows():
     rows = []
-    for (mode, T), (vid, params) in specs.SMALL_CELLS.items():
+    tuned = {(mode, T // WORLD) for (mode, T) in specs.SMALL_CELLS}
+    for mode, m, vid, params in specs.small_exact_cells():
+        assert _small_plan_valid(mode, params, m), (mode, m, params)
         sp = specs.sp_qkv_spec(mode)
-        rows.append(
+        row = {
+            "sig": sp.signature(),
+            "arch": ARCH,
+            "cu": CU,
+            "world": WORLD,
+            "m": m,
+            "vid": vid,
+            "params": dict(params),
+            "cell": f"{mode}_T{WORLD * m}",
+        }
+        if (mode, m) not in tuned:
+            row["note"] = (
+                "R13 MP64 (src r20)"
+                if params["src"] == specs.SMALL_R20_SRC
+                else "R13 P2: copy of the mode's m=16 params"
+            )
+        rows.append(row)
+    rows.extend(build_large_rows())
+    return rows
+
+
+def build_small_rules():
+    """The r20 (MP64) range rule per mode over local m 33..64 (every m): consulted only where no exact row exists (m=64 is exact). Every covered m is validated against the
+    real plan constructor."""
+    rules = []
+    for r in specs.small_range_rules():
+        mode = r["mode"]
+        for m in range(r["m_min"], r["m_max"] + 1, r["m_multiple"]):
+            assert _small_plan_valid(mode, r["params"], m), (mode, m, r["params"])
+        rules.append(
             {
-                "sig": sp.signature(),
+                "sig": specs.sp_qkv_spec(mode).signature(),
                 "arch": ARCH,
                 "cu": CU,
                 "world": WORLD,
-                "m": T // WORLD,
-                "vid": vid,
-                "params": {**params, "src": specs.SMALL_PROFILE_SRC},
-                "cell": f"{mode}_T{T}",
+                "m_min": r["m_min"],
+                "m_max": r["m_max"],
+                "m_multiple": r["m_multiple"],
+                "vid": r["vid"],
+                "params": dict(r["params"]),
+                "name": f"{mode}_mp64_m{r['m_min']}-{r['m_max']}",
+                "note": "R13 MP64 (src r20): local m 33..64, any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row",
             }
         )
-    rows.extend(build_large_rows())
-    return rows
+    return rules
 
 
 LARGE_VID = "sp_qkv.large.v1"
@@ -159,11 +209,15 @@ def window_budget():
     (`small_window_sizes`); the arena is their sum."""
     from aiter.gemm_fusion.resources import round_up
 
-    from . import variants, variants_large
+    from . import jit, variants, variants_large
 
     small = {}
-    for (mode, T), (vid, params) in specs.SMALL_CELLS.items():
-        b = variants.small_window_bytes(mode)
+    small_cells = [
+        (mode, params) for mode, _m, _vid, params in specs.small_exact_cells()
+    ]
+    small_cells += [(r["mode"], r["params"]) for r in specs.small_range_rules()]
+    for mode, params in small_cells:
+        b = variants.small_window_bytes(mode, jit.src_mp(params["src"]))
         small[(mode, tuple(sorted(params.items())))] = round_up(
             max(b["rx"], b["ctl"], 8192)
         )
@@ -210,8 +264,10 @@ def build_profile():
             "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
             "note": "m is local tokens per rank (T/4); exact rows plus P1 large range rules (placeholder params)",
         },
+        # local m with NO fused path, routed native by design (informational: the semantics is "no row and no rule for any prefix")
+        "native_m_ranges": [dict(r) for r in specs.NATIVE_M_RANGES],
         "rows": build_rows(),
-        "rules": build_large_rules(),
+        "rules": build_small_rules() + build_large_rules(),
     }
 
 

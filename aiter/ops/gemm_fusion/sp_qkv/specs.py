@@ -115,6 +115,76 @@ def small_cell_params(mode: str, T: int) -> dict:
     return {**SMALL_CELLS[(mode, T)][1], "src": SMALL_PROFILE_SRC}
 
 
+# ---- small-M coverage beyond the two tuned cells (T64 = m16, T128 = m32) -----------------------------------------------------------------------------------------------
+# R13 P2: the decode buckets below T=64 (ATOM's default capture list pads to T = 4, 8, 16, 32, 48 -> local m = 1, 2, 4, 8, 12) run on r19 with a COPY of their mode's m=16
+# params (same build, same owner / windows / context: no new unit, no new window). R13 MP64 (r20, SM_MP 64) serves local m 33..64: an exact row at m=64 (T=256, the default
+# captured bucket) and a range rule over 33..64 (any padded T = 4 m in 132..256, e.g. a custom capture list or an eager step). r20 has ONE push shape (the r15-r18 shape switches
+# do not exist), requires rx_bypass=1 in every mode and B_HEADS=1; reuse keeps reuse_no_idx=0 (untuned). Local m 65..255 (T 260..1020, including the default bucket T=512) has no fused
+# path: it is deliberately native (no row, no rule); local m 256..1023 likewise (the large path starts at m=1024).
+SMALL_P2_M = (1, 2, 4, 8, 12)
+SMALL_R20_ROW_M = (64,)
+SMALL_R20_RULE_M = (33, 64)  # (m_min, m_max), every m (m_multiple 1)
+SMALL_R20_SRC = "r20"
+NATIVE_M_RANGES = (
+    {
+        "m_min": 65,
+        "m_max": 255,
+        "note": "no fused path (T 260..1020, incl. the default capture bucket T=512): native by design; the small kernels end at m=64, the large path starts at m=1024",
+    },
+)
+
+
+def small_r20_params(mode: str) -> dict:
+    """Params of the MP64 build of a mode (same for every m of the r20 rows and rule: one owner per mode)."""
+    if mode not in MODES:
+        raise ValueError(mode)
+    return {
+        "src": SMALL_R20_SRC,
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1,
+    }
+
+
+def small_exact_cells() -> list[tuple[str, int, str, dict]]:
+    """Every EXACT small profile row as (mode, local m, vid, params), ordered by mode then m: the two tuned cells (m16, m32), the P2 copies of the m16 params
+    (m = 1, 2, 4, 8, 12) and the r20 row(s) at m=64."""
+    out = []
+    for mode in MODES:
+        vid16, p16 = SMALL_CELLS[(mode, 64)]
+        cells = {
+            T // 4: (vid, small_cell_params(mode, T))
+            for (md, T), (vid, _p) in SMALL_CELLS.items()
+            if md == mode
+        }
+        for m in SMALL_P2_M:
+            cells[m] = (vid16, {**p16, "src": SMALL_PROFILE_SRC})
+        for m in SMALL_R20_ROW_M:
+            cells[m] = (vid16, small_r20_params(mode))
+        for m in sorted(cells):
+            out.append((mode, m, cells[m][0], cells[m][1]))
+    return out
+
+
+def small_range_rules() -> list[dict]:
+    """The small range rules as dicts {mode, m_min, m_max, m_multiple, vid, params}: the r20 rule over local m 33..64 per mode."""
+    out = []
+    for mode in MODES:
+        vid, _p = SMALL_CELLS[(mode, 64)]
+        out.append(
+            {
+                "mode": mode,
+                "m_min": SMALL_R20_RULE_M[0],
+                "m_max": SMALL_R20_RULE_M[1],
+                "m_multiple": 1,
+                "vid": vid,
+                "params": small_r20_params(mode),
+            }
+        )
+    return out
+
+
 # Large cells: (mode, tokens T) -> (vid, params). local M = T/4 in {2048, 4096, 8192}. Ledger r152 + r154 (gcnasm 822c1d1, r11 recipe).
 # DEVIATION (recorded): all nine cells use the single LG-QSDMA-r11 code base (NO_GRIDREAD=1 default) with the per-cell plan below,
 # instead of the individual r6b/r6x4/r7/r8g candidates of ledger r152 (r11 plans reproduce them; gcnasm 822c1d1 README: all 2-12 us faster, same numerics).

@@ -35,15 +35,18 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 CSRC = os.path.abspath(
     os.path.join(_HERE, "..", "..", "..", "..", "csrc", "gemm_fusion", "sp_qkv")
 )
-SRCS = ("r17", "r18", "r19")
+SRCS = ("r17", "r18", "r19", "r20")
 LARGE_SRCS = ("r11", "r12")
 R18_FAMILY = (
     "r18",
     "r19",
-)  # r19 is derived from r18 (design card r2 D-1 path A): it accepts the r18-only flags
+    "r20",
+)  # r19 is derived from r18 (design card r2 D-1 path A), r20 from r19: they accept the r18-only flags (r20: see small_defs for what it refuses)
 # kernel ABI generation of a source: 2 = the shipped drivers (poison words, pointers baked in the device block); 3 = R12 (per-launch kernargs, per-comm ERR/STEP page,
 # call_id tags). Plans of abi 3 take `call_id` in run(), carry the global page request and register no per-plan poison hooks.
-SMALL_ABI = {"r17": 2, "r18": 2, "r19": 3}
+SMALL_ABI = {"r17": 2, "r18": 2, "r19": 3, "r20": 3}
+# padded rows per source (SM_MP): r17-r19 cover local m 1..32 (T <= 128); r20 (R13 MP64) covers m 1..64 (decode T up to 256: the profile uses it for m 33..64)
+SMALL_MP = {"r17": 32, "r18": 32, "r19": 32, "r20": 64}
 LARGE_ABI = {"r11": 2, "r12": 3}
 
 
@@ -53,6 +56,13 @@ def src_abi(kind: str, src: str) -> int:
     if src not in table:
         raise ValueError(f"{kind} src {src!r} not in {tuple(table)}")
     return table[src]
+
+
+def src_mp(src: str) -> int:
+    """Padded rows per source (SM_MP): the largest local m a small plan of this source accepts."""
+    if src not in SMALL_MP:
+        raise ValueError(f"small src {src!r} not in {tuple(SMALL_MP)}")
+    return SMALL_MP[src]
 
 
 def _source_sha(kind: str, src: str) -> str:
@@ -124,6 +134,24 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
     idx = 1 if mode == "indexer" else 0
     dense = 1 if mode == "dense" else 0
     nh = int(params.get("nh", 1))
+    if src in ("r19", "r20") and int(params.get("no_credit", 1)) != 1:
+        raise ValueError(
+            f"{src}: SM_NO_CREDIT must be 1 (the credit slow path used the retired poison word)"
+        )
+    if src == "r20":
+        # R13 MP64: ONE push shape, the B row split is intrinsic, B_HEADS = 1 (the 216 / 240 B WG counts assume it) and the bypass loads are REQUIRED in every mode
+        # (sm_abi_v3.h #errors on SM_PUSH8 / SM_PUSH_HALVES / SM_B_ROWSPLIT / !SM_RX_BYPASS): the flags that no longer exist are refused here, before a compile
+        gone = [k for k in ("push8", "push_halves", "b_rowsplit") if params.get(k)]
+        if gone:
+            raise ValueError(
+                f"r20 has no {gone} (one push shape, intrinsic B row split)"
+            )
+        if int(params.get("rx_bypass", 0)) != 1:
+            raise ValueError(
+                "r20 requires rx_bypass=1 in every mode (R13 card R2.4 D-10; gfx950 only)"
+            )
+        if int(params.get("nh", 1)) != 1:
+            raise ValueError("r20 requires nh=1 (B_HEADS=1)")
     abi = [
         f"-DSM_R5X_INDEXER={idx}",
         f"-DSM_DENSE={dense}",

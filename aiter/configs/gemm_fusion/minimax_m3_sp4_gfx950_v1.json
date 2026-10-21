@@ -2,10 +2,16 @@
   "profile": "minimax_m3_sp4_gfx950_v1",
   "window_budget": {
     "window_bytes": 171966464,
-    "max_windows": 40,
-    "small_owners": 6,
+    "max_windows": 46,
+    "small_owners": 9,
     "large_owners": 9,
     "small_window_sizes": [
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
       4194304,
       4194304,
       4194304,
@@ -32,7 +38,94 @@
     "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",
     "note": "m is local tokens per rank (T/4); exact rows plus P1 large range rules (placeholder params)"
   },
+  "native_m_ranges": [
+    {
+      "m_min": 65,
+      "m_max": 255,
+      "note": "no fused path (T 260..1020, incl. the default capture bucket T=512): native by design; the small kernels end at m=64, the large path starts at m=1024"
+    }
+  ],
   "rows": [
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T4",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T8",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T16",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T32",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 12,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1
+      },
+      "cell": "dense_T48",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
     {
       "sig": "50b7acf9943802c2",
       "arch": "gfx950",
@@ -66,6 +159,108 @@
       "cell": "dense_T128"
     },
     {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 64,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "cell": "dense_T256",
+      "note": "R13 MP64 (src r20)"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T4",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T8",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T16",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T32",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 12,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "push8": 1
+      },
+      "cell": "indexer_T48",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
       "sig": "9b114a3a8b31ec50",
       "arch": "gfx950",
       "cu": 256,
@@ -95,6 +290,108 @@
         "no_credit": 1
       },
       "cell": "indexer_T128"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 64,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "cell": "indexer_T256",
+      "note": "R13 MP64 (src r20)"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T4",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 2,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T8",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 4,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T16",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 8,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T32",
+      "note": "R13 P2: copy of the mode's m=16 params"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 12,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r19",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "reuse_no_idx": 1
+      },
+      "cell": "reuse_T48",
+      "note": "R13 P2: copy of the mode's m=16 params"
     },
     {
       "sig": "46e08c40c4ec4374",
@@ -127,6 +424,23 @@
         "push_halves": 1
       },
       "cell": "reuse_T128"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m": 64,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "cell": "reuse_T256",
+      "note": "R13 MP64 (src r20)"
     },
     {
       "sig": "15f0490f0df1d837",
@@ -1439,6 +1753,63 @@
     }
   ],
   "rules": [
+    {
+      "sig": "50b7acf9943802c2",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 33,
+      "m_max": 64,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "name": "dense_mp64_m33-64",
+      "note": "R13 MP64 (src r20): local m 33..64, any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "9b114a3a8b31ec50",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 33,
+      "m_max": 64,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "name": "indexer_mp64_m33-64",
+      "note": "R13 MP64 (src r20): local m 33..64, any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+    },
+    {
+      "sig": "46e08c40c4ec4374",
+      "arch": "gfx950",
+      "cu": 256,
+      "world": 4,
+      "m_min": 33,
+      "m_max": 64,
+      "m_multiple": 1,
+      "vid": "sp_qkv.small.v1",
+      "params": {
+        "src": "r20",
+        "sk": 3,
+        "nh": 1,
+        "no_credit": 1,
+        "rx_bypass": 1
+      },
+      "name": "reuse_mp64_m33-64",
+      "note": "R13 MP64 (src r20): local m 33..64, any padded T = 4 m in 132..256; m=64 (T=256, the default capture bucket) is an exact row"
+    },
     {
       "sig": "15f0490f0df1d837",
       "arch": "gfx950",

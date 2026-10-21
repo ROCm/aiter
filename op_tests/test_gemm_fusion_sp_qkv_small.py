@@ -74,7 +74,9 @@ def test_profile_rows_exact_and_distinct():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
-    assert len(small) == 6
+    assert (
+        len(small) == 24 == len(specs.small_exact_cells())
+    )  # 6 tuned + 15 P2 copies (m 1, 2, 4, 8, 12) + 3 r20 rows (m 64)
     for (mode, T), (vid, params) in specs.SMALL_CELLS.items():
         r = prof.lookup(specs.sp_qkv_spec(mode).signature(), "gfx950", 256, 4, T // 4)
         # the profile runs every small cell on r19 (R12); SMALL_CELLS keeps the per-cell r17/r18 sources of the pre-R12 build for the A/B
@@ -217,6 +219,10 @@ def test_resources_lifecycle_and_sizes():
     r.release()  # idempotent
 
 
+def ok_ctx_for(m):
+    return MatchCtx("gfx950", 256, 4, m, frozenset({"mori_cco", "gfx950_sc_bypass"}))
+
+
 def test_small_variant_registers_and_contract(monkeypatch):
     from aiter.gemm_fusion import catalog
 
@@ -252,22 +258,36 @@ def test_small_variant_registers_and_contract(monkeypatch):
         PROFILE,
     )
     assert n == 2 and plan.params["reuse_no_idx"] == 1
-    # not a validated cell -> native
-    assert match_prefix(
-        spec, MatchCtx("gfx950", 256, 4, 48, frozenset({"mori_cco"})), PROFILE
-    ) == (None, 0)
+    # not a validated cell -> native (m=48 is NOT: the r20 rule covers 33..64, see below; m=24 has no row and m 65..255 is native by design)
+    for m_native in (24, 65, 100, 128, 255):
+        assert match_prefix(
+            spec, MatchCtx("gfx950", 256, 4, m_native, frozenset({"mori_cco"})), PROFILE
+        ) == (None, 0), m_native
+    # the MP64 rule: m=48 resolves to the r20 plan, which needs the bypass capability (R2 is gfx950-only)
+    with pytest.raises(ContractError, match="gfx950_sc_bypass"):
+        match_prefix(
+            spec, MatchCtx("gfx950", 256, 4, 48, frozenset({"mori_cco"})), PROFILE
+        )
+    p48, n48 = match_prefix(spec, ok_ctx_for(48), PROFILE)
+    assert (
+        n48 == 2
+        and p48.src == "r20"
+        and p48.mp == 64
+        and p48.profile_source == "rule"
+        and p48.abi == 3
+    )
     # a spec with a different eps has a different signature -> native
     assert match_prefix(specs.sp_qkv_spec("dense", eps=1e-5), ok, PROFILE) == (None, 0)
 
 
 # ======================================================================= large-M (S2-2b-iii)
-def test_profile_has_93_rows_and_large_prefix_signatures():
-    """6 small rows + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep, src r12)."""
+def test_profile_has_111_rows_and_large_prefix_signatures():
+    """24 small rows (see test_small_profile_rows...) + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep, src r12)."""
     from aiter.ops.gemm_fusion.sp_qkv import p1_sweep
 
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 93
+    assert len(prof) == 111  # 24 small + 87 large
     assert (
         len(p1_sweep.P1_GRID) == 29
         and sum(len(v) for v in p1_sweep.P1_BEST.values()) == 87
@@ -906,11 +926,23 @@ def _plan_for(vid_mode, T, large):
             specs.large_cell_params(vid_mode, T),
             MatchCtx("gfx950", 256, 4, T // 4, caps),
         )
-    return v.SpQkvSmall(
+    cells = {(md, m): params for md, m, _vid, params in specs.small_exact_cells()}
+    return v.SpQkvSmall(  # the PROFILE's params of this cell (src r19 / r20), not the pre-R12 SMALL_CELLS ones
         sp,
-        specs.SMALL_CELLS[(vid_mode, T)][1],
+        cells[(vid_mode, T // 4)],
         MatchCtx("gfx950", 256, 4, T // 4, caps),
     )
+
+
+def _small_owner_cells():
+    """One (mode, T) per distinct small OWNER of the profile (mode + params): the P2 rows share their m=16 owner, r20 adds one owner per mode."""
+    seen, out = set(), []
+    for mode, m, _vid, params in specs.small_exact_cells():
+        key = (mode, tuple(sorted(params.items())))
+        if key not in seen:
+            seen.add(key)
+            out.append((mode, 4 * m))
+    return out
 
 
 def test_atom_cross_repo_api_audit(monkeypatch):
@@ -989,10 +1021,10 @@ def test_atom_cross_repo_api_audit(monkeypatch):
 
 
 def _all_plan_requests():
-    """Every (owner, [WindowReq]) the 15 profile cells register, via the real plans' resources()."""
+    """Every (owner, [WindowReq]) the profile's owners register (9 small + 9 large), via the real plans' resources()."""
 
     out = {}
-    for mode, T in specs.SMALL_CELLS:
+    for mode, T in _small_owner_cells():
         p = _plan_for(mode, T, False)
         out[p.build_key] = p.resources()
     for mode, T in specs.LARGE_CELLS:
@@ -1022,7 +1054,7 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
         )
         + 1  # every R12 plan requests the SAME per-comm global page: one window
     )
-    assert wb["max_windows"] == n_windows == 40
+    assert wb["max_windows"] == n_windows == 46
     assert wb["window_bytes"] % (4 << 20) == 0 and wb["window_bytes"] == max(
         r.bytes for v in reqs.values() for r in v
     )
@@ -1034,18 +1066,18 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
     r = make_res(
         dist=d, backend=be, profile=PROFILE, policy="uniform"
     )  # A-3: arena is the default; uniform stays selectable
-    assert r.window_bytes == wb["window_bytes"] and r.max_windows == 40
+    assert r.window_bytes == wb["window_bytes"] and r.max_windows == 46
     assert (
-        be.heap == heap_bytes_for(wb["window_bytes"], 40)
+        be.heap == heap_bytes_for(wb["window_bytes"], 46)
         and be.heap % (4 << 30) == 0
-        and be.heap >= 40 * wb["window_bytes"] + (256 << 20)
+        and be.heap >= 46 * wb["window_bytes"] + (256 << 20)
     )
     for (
         owner,
         rq,
     ) in reqs.items():  # register ALL 15 plans (the gate02 sequence), in any order
         r.ensure(owner, rq)
-    assert len(be.offsets) == 40 and set(be.sizes) == {
+    assert len(be.offsets) == 46 and set(be.sizes) == {
         wb["window_bytes"]
     }  # every window equal, 4 MiB multiple
     assert all(
@@ -1369,7 +1401,7 @@ def _w_ok(rows=9216, k=6144, shuffled=True):
     return w
 
 
-def _binding_rig(monkeypatch, mode="dense", T=64, src=None):
+def _binding_rig(monkeypatch, mode="dense", T=64, src=None, extra=None):
     """A dense small plan whose _context is a recording stub and whose torch is a counting fake."""
     import types as _t
     from types import SimpleNamespace as NS
@@ -1387,9 +1419,12 @@ def _binding_rig(monkeypatch, mode="dense", T=64, src=None):
     fake_torch.float32, fake_torch.float8_e4m3fn, fake_torch.int64 = "f32", "fp8", "i64"
     fake_torch.finfo = lambda dt: NS(max=448.0)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    cell_params = dict(specs.SMALL_CELLS[(mode, T)][1])
+    cell_params = dict(
+        specs.SMALL_CELLS[(mode, T if (mode, T) in specs.SMALL_CELLS else 64)][1]
+    )
     if src:  # e.g. "r19": the R12 (abi 3) build of the same cell
         cell_params["src"] = src
+    cell_params.update(extra or {})  # e.g. rx_bypass=1 for r20
     plan = v.SpQkvSmall(
         specs.sp_qkv_spec(mode),
         cell_params,
@@ -1723,7 +1758,7 @@ def test_fusion_resources_budget_from_explicit_profile_with_env_unset(monkeypatc
         d, be = FakeDist(), FirstFitBackend(0)
         r = make_res(dist=d, backend=be, profile=prof, policy="uniform")
         assert (
-            r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 40
+            r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 46
         )  # the shipped profile's own numbers
         assert r.profile is not None and r.profile.name == "minimax_m3_sp4_gfx950_v1"
         assert be.heap == heap_bytes_for(
@@ -1752,7 +1787,7 @@ def test_profile_name_resolves_without_env(monkeypatch):
     r = make_res(
         dist=FakeDist(), backend=FirstFitBackend(0), profile="minimax_m3_sp4_gfx950_v1"
     )  # a bare name -> configs/gemm_fusion/<name>.json
-    assert r.window_bytes == 171966464 and r.max_windows == 40
+    assert r.window_bytes == 171966464 and r.max_windows == 46
 
 
 def test_env_profile_is_never_read_by_fusion_resources(monkeypatch):
@@ -1848,7 +1883,7 @@ def _all_plans(monkeypatch):
 
     monkeypatch.setattr(catalog, "_CATALOG", {})
     out = []
-    for mode, T in specs.SMALL_CELLS:
+    for mode, T in _small_owner_cells():
         p = _plan_for(mode, T, False)
         out.append((p.build_key, p.resources()))
     for mode, T in specs.LARGE_CELLS:
@@ -2242,8 +2277,8 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     )  # ONE registration: the only size the comm ever sees
     A = r._arena
     assert (
-        A.bytes == 384 * MiB == r._arena_bytes and r.policy == "arena"
-    )  # 380 MiB of plan windows + the 4 MiB R12 global page
+        A.bytes == 408 * MiB == r._arena_bytes and r.policy == "arena"
+    )  # 336 MiB shared S/R/C + page, 72 MiB of small windows (9 owners x 2 x 4 MiB: 6 r19/r18-family + 3 r20 MP64)
     # views: inside the arena, 4 MiB aligned, pairwise disjoint (shared set once), local = arena.local + offset
     seen = {}
     for w in r._views:
@@ -2257,7 +2292,7 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     spans = sorted(seen.items())
     assert all(a + n <= b for (a, n), (b, _m) in pairwise(spans))  # disjoint
     assert (
-        sum(seen.values()) == 384 * MiB
+        sum(seen.values()) == 408 * MiB
     )  # 12 small + shared S/R/C + the global page fill the arena exactly: the budget is exact
     # every large owner got the SAME three views; the view struct reproduces arena + offset for local and peer addressing (stride/lsaRank unchanged)
     large = [o for o, _ in plans if o.startswith("sp_qkv.large/")]
@@ -2278,9 +2313,9 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     n_views = len(r._views)
     be.log.clear()
     r.release()
-    assert n_views == 16 and len(be.freed) == 17 == len(
+    assert n_views == 22 and len(be.freed) == 23 == len(
         set(be.freed)
-    )  # 16 plan views (12 small + shared S/R/C + the global page) + the 1 view-self-test view, each freed exactly once
+    )  # 22 plan views (18 small + shared S/R/C + the global page) + the 1 view-self-test view, each freed exactly once
     assert (
         len([x for x in be.log if x[0] == "dereg"]) == 1 and r._views == []
     )  # the arena is the ONLY deregistered window
@@ -2905,10 +2940,7 @@ def test_A1_view_readback_mismatch_refuses_arena_and_rebuilds_the_comm_as_unifor
             be.creates == 2
         )  # the comm was destroyed and recreated: NO second window size on the arena's comm
         assert (
-            r._arena is None
-            and r._views == []
-            and len(r._regs) == 15 + 24
-            or len(r._regs) == 40
+            r._arena is None and r._views == [] and len(r._regs) == 46
         )  # uniform: 40 equal windows (15 plans -> 39 windows + the global page)
         assert all(w.bytes == 171966464 for w in r._regs)
         assert any(
@@ -3192,7 +3224,7 @@ def test_init_images_written_before_finalize_survive_the_deferred_zeroing(monkey
     assert ev == ["init", "init", "init"]
 
 
-def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_384_mib_budget(
+def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_408_mib_budget(
     monkeypatch,
 ):
     for var in (
@@ -3211,10 +3243,10 @@ def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_384_mib_budg
     assert (
         pm
         and "selected=arena" in pm[0]
-        and "uniform=6560MiB" in pm[0]
-        and "arena=384MiB" in pm[0]
+        and "uniform=7544MiB" in pm[0]
+        and "arena=408MiB" in pm[0]
     )
-    assert r._arena_size_from_budget() == 384 * MiB and r._vmm == 4 << 30
+    assert r._arena_size_from_budget() == 408 * MiB and r._vmm == 4 << 30
 
 
 # ---- test_utils: the aliasing assertion (C-S4) as free functions over a FusionResources
@@ -3337,9 +3369,9 @@ def test_test_utils_arena_probe_registers_once_checks_views_and_uses_rank_as_dev
     assert B.devs == [(0, 0), (1, 1), (2, 2), (3, 3)]  # HIP device = rank, NOT 0
     out = capsys.readouterr().out
     assert (
-        out.count("registrations=1 views=16") == 4
+        out.count("registrations=1 views=22") == 4
         and "result=FAIL" not in out
-        and out.count("view_winBase_ok=1") == 64
+        and out.count("view_winBase_ok=1") == 88
     )
     B.devs.clear()
     tu.run_arena(4 << 30, 2, 4, FakeDist(), B(), "x", device=5)
@@ -3542,11 +3574,13 @@ def test_binding_checker_flags_a_missing_native_and_a_dead_binding_negative_cont
 
 
 # ======================================================================= task-264: plan.prepare/run input contract (inputs.py)
-def _small_ready(monkeypatch, mode="dense", T=64, src=None):
+def _small_ready(monkeypatch, mode="dense", T=64, src=None, extra=None):
     """The binding rig plus a recording launch stub: returns (plan, st, meta, outs, res, launches, binds)."""
     from types import SimpleNamespace as NS
 
-    plan, st, meta, outs, res, binds, _z = _binding_rig(monkeypatch, mode, T, src)
+    plan, st, meta, outs, res, binds, _z = _binding_rig(
+        monkeypatch, mode, T, src, extra
+    )
     launches = []
     plan._context = lambda r: NS(
         bind=lambda sb: binds.append(sb) or object(),
@@ -3766,7 +3800,8 @@ def test_inputs_small_rejects_rows_outside_1_to_32_and_checks_prepare_without_a_
 
     plan, st, meta, outs, res, _launches, binds = _small_ready(monkeypatch)
     with pytest.raises(
-        ContractError, match=r"x has 33 rows, the small plans take local M 1\.\.32"
+        ContractError,
+        match=r"x has 33 rows, a src r\d+ small plan takes local M 1\.\.32",
     ):
         _run_small(plan, st, meta, outs, res, x=_T((33, 6144), (6144, 1), "fp8"))
     # prepare(): no weight is passed, everything else is checked ONCE, outside capture, before the binding exists
@@ -4049,19 +4084,22 @@ def test_inputs_small_accepts_pad_rows_staged_as_T_long_arrays_and_never_reads_v
 
 # ======================================================================= A1: R12 plumbing (jit/ABI tables, runtimes, abi 3 plans, profile, prebuild)
 def test_jit_abi_tables_sources_and_missing_source_error():
-    assert jit.SRCS == ("r17", "r18", "r19") and jit.LARGE_SRCS == ("r11", "r12")
-    assert [jit.src_abi("small", s) for s in jit.SRCS] == [2, 2, 3] and [
+    assert jit.SRCS == ("r17", "r18", "r19", "r20") and jit.LARGE_SRCS == (
+        "r11",
+        "r12",
+    )
+    assert [jit.src_abi("small", s) for s in jit.SRCS] == [2, 2, 3, 3] and [
         jit.src_abi("large", s) for s in jit.LARGE_SRCS
     ] == [2, 3]
     with pytest.raises(ValueError, match="not in"):
-        jit.src_abi("small", "r20")
+        jit.src_abi("small", "r21")
     # r19 is derived from r18: it accepts the r18-only flags; r17 still rejects them
     _d, h = jit.small_defs({"src": "r19", "b_rowsplit": 1, "rx_bypass": 1}, "dense")
     assert "-DSM_B_ROWSPLIT=1" in h and "-DSM_RX_BYPASS=1" in h
     with pytest.raises(ValueError, match="require src=r18 or r19"):
         jit.small_defs({"src": "r17", "b_rowsplit": 1}, "dense")
     with pytest.raises(ValueError, match="src"):
-        jit.small_defs({"src": "r20"}, "dense")
+        jit.small_defs({"src": "r21"}, "dense")
     # large: src is a parameter (default r11 for old profiles) and is validated
     assert jit.large_defs({"src": "r12", "n": 2}, "dense") == jit.large_defs(
         {"src": "r11", "n": 2}, "dense"
@@ -4789,18 +4827,19 @@ def test_profile_selects_r12_for_large_rows_and_rules_and_budgets_the_page():
         "r12"
     }  # 87 exact rows + the 9 fallback rules
     small = [e for e in prof.rows() if e.vid == "sp_qkv.small.v1"]
-    assert len(small) == 6 and {dict(e.params)["src"] for e in small} == {
-        "r19"
-    }  # the small cells run r19 (R12); r17/r18 stay selectable per row
+    assert len(small) == 24 and {dict(e.params)["src"] for e in small} == {
+        "r19",
+        "r20",
+    }  # r19 for local m <= 32, r20 (MP64) at m=64; r17/r18 stay selectable per row
     wb = prof.meta["window_budget"]
-    assert wb["shared"]["gf.global"] == 4 << 20 and wb["max_windows"] == 40
+    assert wb["shared"]["gf.global"] == 4 << 20 and wb["max_windows"] == 46
     assert (
         specs.large_cell_params("dense", 8192)
         == {**specs.LARGE_CELLS[("dense", 8192)][1], "src": "r12"}
         and specs.LARGE_PROFILE_SRC == "r12"
     )
-    # the arena is the sum of the shared set and the small windows: 384 MiB (380 + the page)
-    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 384 << 20
+    # the arena is the sum of the shared set and the small windows: 384 MiB (336 shared + 72 small)
+    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 408 << 20
 
 
 def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
@@ -4844,7 +4883,9 @@ def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
         monkeypatch.setattr(_cat, "_CATALOG", {})
         _forget_sp_modules()  # a fresh import registers the variants (and their prebuild hooks) into this scratch catalog
         units, skipped = engine.plan_profile(PROFILE, recipe="aot1", tool=TOOL_SIM)
-        assert skipped == [] and len(units) == 9
+        assert (
+            skipped == [] and len(units) == 12
+        )  # 6 small (r19) + 3 small (r20) + 2 large (r12) + the comm
         assert {u.meta["src"] for u in units if u.kind == "sp_qkv.large.v1"} == {"r12"}
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -4960,7 +5001,7 @@ def test_profile_small_rows_run_r19_with_the_r18_family_flags_and_one_unit_each(
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
-    assert len(small) == 6
+    assert len(small) == 24
     for (mode, T), (_vid, legacy) in specs.SMALL_CELLS.items():
         row_params = dict(
             prof.lookup(
@@ -4985,11 +5026,12 @@ def test_profile_small_rows_run_r19_with_the_r18_family_flags_and_one_unit_each(
     smalls = [u for u in units if u.kind == "sp_qkv.small.v1"]
     assert (
         skipped == []
-        and len(smalls) == 6
-        and {u.meta["src"] for u in smalls} == {"r19"}
-        and len({u.key for u in smalls}) == 6
+        and len(smalls)
+        == 9  # 6 r19 owners (the P2 rows add none) + 3 r20 (MP64) owners
+        and {u.meta["src"] for u in smalls} == {"r19", "r20"}
+        and len({u.key for u in smalls}) == 9
     )
-    u = smalls[0]
+    u = next(x for x in smalls if x.meta["src"] == "r19")
     gemm_cmd = jit.device_cmd_one("r19", u.meta["dev"], tool, "/out", "sm_gemm")
     fwd = [a.replace("\\", "/") for a in gemm_cmd]
     assert any(a.endswith("small/r19/device/sk_gemm_fp8.cu") for a in fwd) and any(
@@ -5002,3 +5044,191 @@ def test_profile_small_rows_run_r19_with_the_r18_family_flags_and_one_unit_each(
     assert any(
         a.endswith(("-Ismall/r19/host", "small/r19/host")) for a in host
     ) and any(a.endswith("host/sm_fusion_driver.cpp") for a in host)
+
+
+# ======================================================================= small/r20 (R13 MP64): src r20 owner / variant, geometry, profile coverage
+R20_PARAMS = {"src": "r20", "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
+
+
+def test_r20_flag_validation_mp_table_and_the_removed_shapes():
+    assert jit.SMALL_MP == {"r17": 32, "r18": 32, "r19": 32, "r20": 64}
+    assert [jit.src_mp(s) for s in jit.SRCS] == [32, 32, 32, 64]
+    with pytest.raises(ValueError, match="not in"):
+        jit.src_mp("r21")
+    # r20 builds with the profile's params: the bypass loads are REQUIRED, B_HEADS=1, no credit slow path
+    dev, host = jit.small_defs(dict(R20_PARAMS), "dense")
+    assert (
+        "-DSM_RX_BYPASS=1" in dev
+        and "-DSM_T1_B_HEADS=1" in dev
+        and "-DSM_NO_CREDIT=1" in dev
+        and "-DSM_PUSH8=0" in dev
+    )
+    assert (
+        "-DSM_B_ROWSPLIT=0" in host and "-DSM_REUSE_NO_IDX=0" in host
+    )  # the removed shapes are passed as 0: the header only #errors when they are non-zero
+    for bad, match in (
+        ({"push8": 1}, r"r20 has no \['push8'\]"),
+        ({"push_halves": 1}, r"r20 has no \['push_halves'\]"),
+        ({"b_rowsplit": 1}, r"r20 has no \['b_rowsplit'\]"),
+        ({"rx_bypass": 0}, "requires rx_bypass=1"),
+        ({"nh": 2}, "requires nh=1"),
+        ({"no_credit": 0}, "SM_NO_CREDIT must be 1"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            jit.small_defs({**R20_PARAMS, **bad}, "dense")
+    no_bypass = {k: v for k, v in R20_PARAMS.items() if k != "rx_bypass"}
+    with pytest.raises(ValueError, match="requires rx_bypass=1"):
+        jit.small_defs(no_bypass, "reuse")  # every mode, not only dense
+    with pytest.raises(ValueError, match="SM_NO_CREDIT must be 1"):
+        jit.small_defs(
+            {"src": "r19", "no_credit": 0}, "dense"
+        )  # r19 refuses the credit slow path too
+    # reuse_no_idx stays legal for reuse (an r20 switch), the profile does not set it (untuned)
+    jit.small_defs({**R20_PARAMS, "reuse_no_idx": 1}, "reuse")
+
+
+def test_r20_window_and_p_geometry_match_the_r20_notes():
+    from aiter.ops.gemm_fusion.sp_qkv import variants as v
+
+    assert v.small_window_bytes("dense", 64)["rx"] == 2_359_296
+    assert (
+        v.small_window_bytes("indexer", 64)["rx"]
+        == v.small_window_bytes("reuse", 64)["rx"]
+        == 2_621_440
+    )
+    assert all(
+        v.small_window_bytes(m, 64)["rx"] <= 4 << 20 for m in specs.MODES
+    )  # the 4 MiB arena view
+    assert (
+        v.small_p_bytes("dense", 64) == 7_077_888
+        and v.small_p_bytes("indexer", 64) == v.small_p_bytes("reuse", 64) == 7_569_408
+    )
+    # MP32 (r17-r19) is what it was: Rx [2][4][32][F] bf16, P [3][32][N] fp32
+    assert (
+        v.small_window_bytes("dense")["rx"]
+        == v.small_window_bytes("dense", 32)["rx"]
+        == 1_179_648
+    )
+    assert v.small_p_bytes("dense", 32) == 3 * 32 * 9216 * 4
+    assert (
+        v.small_window_bytes("dense", 64)["ctl"]
+        == v.small_window_bytes("dense", 32)["ctl"]
+        == 256 + 8 * 2 * 4 * 72
+    )  # the control window does not grow with MP
+
+
+def test_r20_plan_m_range_owner_window_request_and_run_path(monkeypatch):
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, meta, outs, res, launches, _binds = _small_ready(
+        monkeypatch, "dense", 256, "r20", {"rx_bypass": 1}
+    )
+    assert (plan.src, plan.abi, plan.mp, plan.M if hasattr(plan, "M") else 64) == (
+        "r20",
+        3,
+        64,
+        64,
+    )
+    reqs = plan.resources()
+    assert [r.name.rsplit("/", 1)[-1] for r in reqs] == ["rx", "ctl", "gpage"] and reqs[
+        0
+    ].bytes == reqs[
+        1
+    ].bytes == 4 << 20  # 2.36 MiB Rx rounds up to ONE 4 MiB view
+    # M = 64 (T = 256, the default capture bucket) runs: the per-launch kernargs carry t_valid = T and the call_id
+    pos, slot = _NoRead((256,), (1,), "i64"), _NoRead((256,), (1,), "i64")
+    _run_small(
+        plan,
+        st,
+        {**meta, "positions": pos, "slot_mapping": slot},
+        outs,
+        res,
+        call_id=99,
+    )
+    tag, _blk, _a, _w, stride_a, _xs, _pos, _slot, t_valid, call_id, _stream = launches[
+        -1
+    ]
+    assert (tag, t_valid, call_id, stride_a) == ("v3", 256, 99, 6144)
+    # a short positions array is legal at M=64 as well (the kernel pads rows >= t_valid, dead passes included)
+    _run_small(
+        plan, st, {**meta, "positions": _T((140,), (1,), "i64")}, outs, res, call_id=99
+    )
+    assert launches[-1][8] == 140
+    # 65 rows: refused by the plan (a src r20 plan ends at M = 64); the constructor refuses it too
+    with pytest.raises(
+        ContractError,
+        match=r"x has 65 rows, a src r20 small plan takes local M 1\.\.64",
+    ):
+        _run_small(
+            plan, st, meta, outs, res, x=_T((65, 6144), (6144, 1), "fp8"), call_id=1
+        )
+    v = sys.modules["aiter.ops.gemm_fusion.sp_qkv.variants"]
+    mk = lambda src, m, extra=None: v.SpQkvSmall(
+        specs.sp_qkv_spec("dense"),
+        {**specs.SMALL_CELLS[("dense", 64)][1], "src": src, **(extra or {})},
+        MatchCtx("gfx950", 256, 4, m, frozenset({"mori_cco", "gfx950_sc_bypass"})),
+    )
+    assert (
+        mk("r20", 33, {"rx_bypass": 1}).mp == 64
+        and mk("r20", 64, {"rx_bypass": 1}).mp == 64
+    )
+    with pytest.raises(
+        ContractError, match=r"\(src r20\) supports local M 1\.\.64, got 65"
+    ):
+        mk("r20", 65, {"rx_bypass": 1})
+    with pytest.raises(
+        ContractError, match=r"\(src r19\) supports local M 1\.\.32, got 33"
+    ):
+        mk("r19", 33)
+    # r20 without the gfx950 bypass capability is refused (every mode needs it)
+    with pytest.raises(ContractError, match="gfx950_sc_bypass"):
+        v.SpQkvSmall(
+            specs.sp_qkv_spec("dense"),
+            dict(R20_PARAMS),
+            MatchCtx("gfx950", 256, 4, 40, frozenset({"mori_cco"})),
+        )
+
+
+def test_r20_owner_is_one_per_mode_and_the_p2_rows_share_the_m16_owner(monkeypatch):
+    from aiter.gemm_fusion import catalog
+
+    monkeypatch.setattr(catalog, "_CATALOG", {})
+    owners = {}
+    for mode, m, _vid, params in specs.small_exact_cells():
+        p = _plan_for(mode, 4 * m, False)
+        owners.setdefault(mode, {})[m] = p.build_key
+        assert (
+            p.src == params["src"]
+            and p.mp == (64 if params["src"] == "r20" else 32)
+            and p.abi == 3
+        )
+    for mode in specs.MODES:
+        o = owners[mode]
+        assert {o[m] for m in (1, 2, 4, 8, 12, 16)} == {
+            o[16]
+        }  # P2 = copies of the m16 params: ONE owner, the windows / context / epoch domain of m16
+        assert o[32] != o[16] and o[64] not in (
+            o[16],
+            o[32],
+        )  # the tuned m32 cell and the r20 owner are their own
+    assert (
+        len({k for o in owners.values() for k in o.values()}) == 9
+    )  # 3 modes x (m16 group, m32, r20)
+
+
+def test_window_budget_counts_the_nine_small_owners_and_the_mp64_geometry():
+    clear_profile_cache()
+    wb = profmod.load_profile(PROFILE).meta["window_budget"]
+    assert wb["small_owners"] == 9 and wb["large_owners"] == 9
+    assert (
+        wb["small_window_sizes"] == [4 << 20] * 18
+    )  # 9 owners x (rx + ctl), each a 4 MiB view (r20's 2.36 / 2.62 MB Rx fits)
+    assert wb["max_windows"] == 2 * 9 + 3 * 9 + 1 == 46
+    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 408 << 20
+    with open(profmod._resolve(PROFILE), encoding="utf-8") as f:
+        doc = json.load(f)
+    assert (
+        doc["native_m_ranges"] == [dict(r) for r in specs.NATIVE_M_RANGES]
+        and doc["native_m_ranges"][0]["m_min"] == 65
+        and doc["native_m_ranges"][0]["m_max"] == 255
+    )
