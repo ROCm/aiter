@@ -144,6 +144,14 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 - Inputs must be `fp16` or `bf16`.
 - Forward only (no backward / training).
 
+The internal Conv2D padding-preparation helper in `_launch.py` uses
+`torch.nn.functional.pad` for reflect, replicate, and circular padding, followed
+by a storage-layout conversion when needed. It leaves zero padding implicit and
+reuses the input when no materialization is needed. This helper does not require
+a custom padding kernel or padding-specific launch configurations. Wiring
+`padding_mode` into the public Conv2D entry points is a separate integration
+stage; the public constraints above still apply.
+
 ---
 
 ## Reproducing the tests and benchmarks
