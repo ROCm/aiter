@@ -34,7 +34,7 @@ def _make_cos_sin_cache(tokens: int, device: torch.device) -> torch.Tensor:
         :, None
     ] * torch.exp(
         -torch.arange(half, dtype=torch.float32, device=device)[None, :]
-        * (torch.log(torch.tensor(10000.0, device=device)) / half)
+        * (torch.log(torch.tensor(10000.0, dtype=torch.float32, device=device)) / half)
     )
     return torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
 
@@ -632,16 +632,18 @@ def test_fused_qk_norm_rope_gate_fp8_quant_rejects_cpu_inputs():
     # device. The device check is first; CUDA tensors would pass it and fail
     # a later check instead.
     cpu = torch.device("cpu")
-    q_gate = torch.empty(1, NUM_QUERY_HEADS * 2 * HEAD_DIM, device=cpu)
-    key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM, device=cpu)
+    q_gate = torch.empty(
+        1, NUM_QUERY_HEADS * 2 * HEAD_DIM, dtype=torch.float32, device=cpu
+    )
+    key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32, device=cpu)
     with pytest.raises(ValueError, match="requires a CUDA/HIP device"):
         fused_qk_norm_rope_gate_fp8_quant(
             q_gate,
             key,
             key,
-            torch.empty(HEAD_DIM, device=cpu),
-            torch.empty(HEAD_DIM, device=cpu),
-            torch.empty(1, ROTARY_DIM, device=cpu),
+            torch.empty(HEAD_DIM, dtype=torch.float32, device=cpu),
+            torch.empty(HEAD_DIM, dtype=torch.float32, device=cpu),
+            torch.empty(1, ROTARY_DIM, dtype=torch.float32, device=cpu),
             torch.zeros(1, dtype=torch.int64, device=cpu),
             torch.tensor([0, 1], dtype=torch.int32, device=cpu),
             num_actual_tokens=1,

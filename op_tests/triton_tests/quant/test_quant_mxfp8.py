@@ -214,8 +214,14 @@ def test_fp8_legacy_to_mxfp8_preallocated():
     torch.manual_seed(5)
 
     M, N = 16, 256
-    x_fnuz = (torch.randn((M, N), device="cuda") * 4).to(torch.float8_e4m3fnuz)
-    x_scale_fp32 = torch.rand((M, N // LEGACY_BLOCK_SIZE), device="cuda") * 0.5 + 0.25
+    x_fnuz = (torch.randn((M, N), dtype=torch.float32, device="cuda") * 4).to(
+        torch.float8_e4m3fnuz
+    )
+    x_scale_fp32 = (
+        torch.rand((M, N // LEGACY_BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        * 0.5
+        + 0.25
+    )
     y_pre = torch.empty((M, N), dtype=torch.float8_e4m3fn, device="cuda")
     s_pre = torch.empty((M, N // QUANT_BLOCK_SIZE), dtype=torch.uint8, device="cuda")
     y, s = fp8_legacy_to_mxfp8(x_fnuz, x_scale_fp32, y_fn=y_pre, y_scale=s_pre)

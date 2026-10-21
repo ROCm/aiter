@@ -189,7 +189,7 @@ def ref_masked_attention(
         attn *= q_descale
     if kv_descale is not None:
         attn *= kv_descale
-    empty_mask = torch.ones(query_len, kv_len, device=q.device)
+    empty_mask = torch.ones(query_len, kv_len, device=q.device, dtype=torch.float32)
     mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
     attn.masked_fill_(mask, float("-inf"))
     attn = torch.softmax(attn, dim=-1)
@@ -494,11 +494,19 @@ def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
         kv_buffer[0, 0, :, 0] = torch.finfo(e4m3_dtype).max
         kv_buffer[0, 0, :, 1] = torch.finfo(e4m3_dtype).min
     shuffled_kv_buffer = shuffle_kv_buffer(kv_buffer, 512)
-    q_descale = None if output_kind == "strided" else torch.tensor([0.3], device="cuda")
-    kv_descale = (
-        None if output_kind == "strided" else torch.tensor([0.4], device="cuda")
+    q_descale = (
+        None
+        if output_kind == "strided"
+        else torch.tensor([0.3], device="cuda", dtype=torch.float32)
     )
-    output_scale = torch.tensor([0.25 if output_kind == "fp8" else 0.7], device="cuda")
+    kv_descale = (
+        None
+        if output_kind == "strided"
+        else torch.tensor([0.4], device="cuda", dtype=torch.float32)
+    )
+    output_scale = torch.tensor(
+        [0.25 if output_kind == "fp8" else 0.7], device="cuda", dtype=torch.float32
+    )
     out_dtype = e4m3_dtype if output_kind == "fp8" else torch.bfloat16
     width = 513 if output_kind == "strided" else 520
     storage = torch.full(
@@ -840,7 +848,9 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
         (batch_size + extra_tokens, 128, 576), dtype=e4m3_dtype, device="meta"
     )
     kv_buffer = torch.empty((64, 1, 64, 576), dtype=e4m3_dtype, device="meta")
-    output = torch.empty((batch_size + extra_tokens, 128, 512), device="meta")
+    output = torch.empty(
+        (batch_size + extra_tokens, 128, 512), dtype=torch.float32, device="meta"
+    )
     block_tables = torch.empty((batch_size, 32), dtype=torch.int32, device="meta")
     if wide_view:
         tensors = {"query": query, "output": output, "block_tables": block_tables}

@@ -77,7 +77,8 @@ def test_dynamic_mxfp4_quant_blockscale_matches_reference(M: int, N: int, dtype)
 
 def test_dynamic_mxfp4_quant_blockscale_even_scale_tie():
     below_tie = torch.nextafter(
-        torch.tensor(1.75, device="cpu"), torch.tensor(0.0, device="cpu")
+        torch.tensor(1.75, dtype=torch.float32, device="cpu"),
+        torch.tensor(0.0, dtype=torch.float32, device="cpu"),
     ).item()
     x = torch.zeros((64, 32), dtype=torch.float32, device="cuda")
     x[0, 0] = below_tie

@@ -1057,8 +1057,8 @@ def test_route_and_run_dispatches_to_selected_wrapper(
     for name in wrapper_names:
         monkeypatch.setattr(conv3d_module, name, wrapper(name))
 
-    x = torch.empty((1, 4, 3, 5, 7))
-    w = torch.empty((6, 4, 3, 3, 3))
+    x = torch.empty((1, 4, 3, 5, 7), dtype=torch.float32)
+    w = torch.empty((6, 4, 3, 3, 3), dtype=torch.float32)
     result = conv3d_module._route_and_run(
         x,
         w,
@@ -1148,7 +1148,15 @@ def test_prepack_launcher_uses_complete_3d_key(monkeypatch):
     monkeypatch.setattr(conv_launch, "_ncx_to_cblocked_kernel", kernel)
 
     conv_launch._launch_ncdhw_to_cblocked(
-        torch.empty(1), torch.empty(1), 2, 65, 3, 5, 7, 128, 64
+        torch.empty(1, dtype=torch.float32),
+        torch.empty(1, dtype=torch.float32),
+        2,
+        65,
+        3,
+        5,
+        7,
+        128,
+        64,
     )
 
     expected = [
@@ -1174,10 +1182,10 @@ def test_general_launcher_uses_complete_3d_key_and_layout(monkeypatch):
     monkeypatch.setattr(conv_launch, "_conv3d_general_kernel", kernel)
 
     conv_launch._launch_general_3d(
-        torch.empty(1),
-        torch.empty(1),
+        torch.empty(1, dtype=torch.float32),
+        torch.empty(1, dtype=torch.float32),
         None,
-        torch.empty(1),
+        torch.empty(1, dtype=torch.float32),
         2,
         5,
         5,
@@ -1220,10 +1228,10 @@ def test_1x1x1_launcher_uses_complete_3d_key_and_layout(monkeypatch):
     monkeypatch.setattr(conv_launch, "_conv3d_1x1x1_kernel", kernel)
 
     conv_launch._launch_1x1x1_3d(
-        torch.empty(1),
-        torch.empty((7, 5, 1, 1, 1)),
+        torch.empty(1, dtype=torch.float32),
+        torch.empty((7, 5, 1, 1, 1), dtype=torch.float32),
         None,
-        torch.empty(1),
+        torch.empty(1, dtype=torch.float32),
         2,
         5,
         3,
@@ -1254,10 +1262,10 @@ def test_3x3x3_launchers_use_complete_3d_key(monkeypatch, layout):
     seen = []
     kernel = _KernelSpy()
     common = [
-        torch.empty(1),
-        torch.empty(1),
+        torch.empty(1, dtype=torch.float32),
+        torch.empty(1, dtype=torch.float32),
         None,
-        torch.empty(1),
+        torch.empty(1, dtype=torch.float32),
         2,
         65,
         4,
@@ -1338,9 +1346,9 @@ def test_winograd_launchers_use_complete_3d_key_and_axes(
 
     conv_launch._launch_winograd_hw_f4x3(
         x,
-        torch.empty(1),
+        torch.empty(1, dtype=torch.float32),
         None,
-        torch.empty(1),
+        torch.empty(1, dtype=torch.float32),
         2,
         65,
         4,

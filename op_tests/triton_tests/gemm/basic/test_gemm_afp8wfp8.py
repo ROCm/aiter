@@ -436,8 +436,8 @@ def _execution_config(packed=False, fused=False, splits=3, n_first=False):
 
 def _compact_scale_inputs(m, n, k, a_group, b_group):
     torch.manual_seed(m + n + k)
-    x = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
-    w = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    w = torch.randn(n, k, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
     xs = torch.randint(124, 131, (m, k // a_group), device="cuda", dtype=torch.uint8)
     ws = torch.randint(
         124,
@@ -617,8 +617,10 @@ def test_compact_scale_partial_k_tile(a_group, b_group, fused):
 
 def generate_group32_inputs(m, n, k, weight_group_rows=32):
     torch.manual_seed(m + n + k)
-    x = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
-    weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
     xs = torch.randint(122, 131, (m, k // 32), device="cuda", dtype=torch.uint8)
     ws = torch.randint(
         122,
