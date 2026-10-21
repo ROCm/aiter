@@ -105,6 +105,15 @@ SMALL_CELLS = {
     ),
 }
 
+# The kernel source the shipped PROFILE runs for every small cell: r19 (R12: per-launch kernargs, per-comm ERR/STEP page, call_id tags; derived from r18 so it carries
+# every r17/r18 shape switch). SMALL_CELLS keeps the per-cell r17/r18 sources of the pre-R12 build: they stay selectable per row (set "src" back) for the A/B.
+SMALL_PROFILE_SRC = "r19"
+
+
+def small_cell_params(mode: str, T: int) -> dict:
+    """The profile params of a small cell: the tuned plan params with the kernel source the profile selects."""
+    return {**SMALL_CELLS[(mode, T)][1], "src": SMALL_PROFILE_SRC}
+
 
 # Large cells: (mode, tokens T) -> (vid, params). local M = T/4 in {2048, 4096, 8192}. Ledger r152 + r154 (gcnasm 822c1d1, r11 recipe).
 # DEVIATION (recorded): all nine cells use the single LG-QSDMA-r11 code base (NO_GRIDREAD=1 default) with the per-cell plan below,

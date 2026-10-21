@@ -36,7 +36,7 @@ def build_rows():
                 "world": WORLD,
                 "m": T // WORLD,
                 "vid": vid,
-                "params": dict(params),
+                "params": {**params, "src": specs.SMALL_PROFILE_SRC},
                 "cell": f"{mode}_T{T}",
             }
         )

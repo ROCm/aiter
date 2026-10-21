@@ -77,7 +77,13 @@ def test_profile_rows_exact_and_distinct():
     assert len(small) == 6
     for (mode, T), (vid, params) in specs.SMALL_CELLS.items():
         r = prof.lookup(specs.sp_qkv_spec(mode).signature(), "gfx950", 256, 4, T // 4)
-        assert r is not None and dict(r.params) == params and r.vid == vid
+        # the profile runs every small cell on r19 (R12); SMALL_CELLS keeps the per-cell r17/r18 sources of the pre-R12 build for the A/B
+        assert (
+            r is not None
+            and dict(r.params) == specs.small_cell_params(mode, T)
+            and dict(r.params) == {**params, "src": "r19"}
+            and r.vid == vid
+        )
     # three modes -> three different signatures
     assert len({specs.sp_qkv_spec(m).signature() for m in specs.MODES}) == 3
     assert (
@@ -229,9 +235,10 @@ def test_small_variant_registers_and_contract(monkeypatch):
         and plan.params["rx_bypass"] == 1
     )
     reqs = plan.resources()
-    assert [r.kind for r in reqs] == ["p2p_window", "control"] and all(
+    assert [r.kind for r in reqs] == ["p2p_window", "control", "control"] and all(
         r.bytes % (4 << 20) == 0 for r in reqs
-    )
+    )  # rx, ctl and the R12 per-comm ERR/STEP page request (r19 = abi 3)
+    assert plan.abi == 3 and plan.src == "r19" and reqs[2].share == "gf.global"
     with pytest.raises(ContractError, match="missing"):
         match_prefix(spec, MatchCtx("gfx950", 256, 4, 32, frozenset()), PROFILE)
     with pytest.raises(ContractError, match="gfx950_sc_bypass"):
@@ -3430,21 +3437,10 @@ def test_every_ctypes_binding_exists_in_the_native_exports_and_none_is_dead():
     }  # the extraction really found them
     py, other = _runtime_sources()
     missing, dead = _check_bindings(py, exports)
-    # R12 entry points bound against the card ABI whose native side is not delivered yet (small/r19 + its driver wrapper). Bound ONLY for abi 3 sources, so the shipped
-    # abi 2 path never touches them. Drop each name from this list the moment its driver exports it: the assertion below fails if a pending name is already exported.
-    pending = {"sm_attach_v3", "sm_launch_blk_v3"}
-    exported = set().union(*exports.values())
-    assert not (
-        pending & exported
-    ), f"now exported, remove from the pending list: {sorted(pending & exported)}"
-    missing = {
-        f: [n for n in names if n not in pending] for f, names in missing.items()
-    }
     missing = {f: names for f, names in missing.items() if names}
     assert (
         not missing
     ), f"ctypes bindings with no native export (a fake backend would hide this: AttributeError undefined symbol at load): {missing}"
-    dead = [n for n in dead if n not in pending]
     # a bound name counts as used when ANY runtime module calls it (the attach/window_bytes entries are called from variants*.py)
     _b, called_elsewhere = _py_bound_and_called(other)
     dead = [n for n in dead if n not in called_elsewhere]
@@ -4755,9 +4751,9 @@ def test_profile_selects_r12_for_large_rows_and_rules_and_budgets_the_page():
     large = [e for e in prof.entries() if e.vid == "sp_qkv.large.v1"]
     assert len(large) == 9 + 12 and {dict(e.params)["src"] for e in large} == {"r12"}
     small = [e for e in prof.rows() if e.vid == "sp_qkv.small.v1"]
-    assert all(
-        dict(e.params)["src"] in ("r17", "r18") for e in small
-    )  # small stays on the shipped sources until r19 passes G0-eq
+    assert len(small) == 6 and {dict(e.params)["src"] for e in small} == {
+        "r19"
+    }  # the small cells run r19 (R12); r17/r18 stay selectable per row
     wb = prof.meta["window_budget"]
     assert wb["shared"]["gf.global"] == 4 << 20 and wb["max_windows"] == 40
     assert (
@@ -4814,3 +4810,157 @@ def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
         assert {u.meta["src"] for u in units if u.kind == "sp_qkv.large.v1"} == {"r12"}
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+# ======================================================================= small/r19 + large/r12 bound to the delivered host APIs
+def _c_signature(path, fn):
+    """Argument KINDS of the C definition `int32_t|void* <fn>(...) {` in a host source: 'u32' / 'u64' / 'i32' / 'ptr' (any pointer)."""
+    import re
+
+    text = _slurp(path, encoding="utf-8")
+    m = re.search(
+        rf"(?:int32_t|uint64_t|void\*)\s+{fn}\s*\(", text
+    )  # the DEFINITION, not a mention in a comment
+    assert m, f"{fn} not defined in {path}"
+    depth, i = 1, m.end()
+    while depth:
+        depth += {"(": 1, ")": -1}.get(text[i], 0)
+        i += 1
+    params = [
+        p.strip()
+        for p in text[m.end() : i - 1].replace("\n", " ").split(",")
+        if p.strip()
+    ]
+    kinds = []
+    for p in params:
+        if "*" in p:
+            kinds.append("ptr")
+        elif "uint32_t" in p:
+            kinds.append("u32")
+        elif "uint64_t" in p:
+            kinds.append("u64")
+        elif "int32_t" in p:
+            kinds.append("i32")
+        else:
+            raise AssertionError(f"unrecognised C parameter {p!r} of {fn}")
+    return kinds
+
+
+def _py_kinds(argtypes):
+    import ctypes as C
+
+    return [
+        {C.c_uint32: "u32", C.c_uint64: "u64", C.c_int32: "i32"}.get(t, "ptr")
+        for t in argtypes
+    ]
+
+
+def test_every_r12_binding_matches_the_c_declaration_it_binds(monkeypatch):
+    """The stub-vs-header drift guard: the argument kinds of each R12 entry point in small_rt / large_rt equal the C definition in the delivered host sources."""
+    from aiter.ops.gemm_fusion.sp_qkv import large_rt as lrt
+    from aiter.ops.gemm_fusion.sp_qkv import small_rt as srt
+
+    host = os.path.join(jit.CSRC, "host")
+    sm_src, lg_src = os.path.join(host, "sm_fusion_driver.cpp"), os.path.join(
+        host, "lg_fusion_driver.cpp"
+    )
+    fake_s, fake_l = _FakeCDLL(), _FakeCDLL()
+    monkeypatch.setattr(srt.C, "CDLL", lambda path: fake_s)
+    srt.load_driver("x", abi=3)
+    monkeypatch.setattr(lrt.C, "CDLL", lambda path: fake_l)
+    lrt.load_driver("x", abi=3)
+    for fn in (
+        "sm_attach_v3",
+        "sm_launch_blk_v3",
+        "sm_bind_new_v1",
+        "sm_blk_free_v1",
+        "sm_free_v1",
+        "sm_info_v1",
+    ):
+        assert _py_kinds(fake_s._fn[fn].argtypes) == _c_signature(sm_src, fn), fn
+    for fn in (
+        "lg_attach_v1",
+        "lg_gpage_attach_v1",
+        "lg_launch_v2",
+        "lg_abi_info_v1",
+        "lg_report_v1",
+        "lg_drain_v1",
+        "lg_init_control_v1",
+        "lg_free_v1",
+        "lg_info_v1",
+        "lg_window_bytes_v1",
+    ):
+        assert _py_kinds(fake_l._fn[fn].argtypes) == _c_signature(lg_src, fn), fn
+    # and the 64 B kernarg block the r19 header declares is the one small_rt mirrors
+    h = _slurp(
+        os.path.join(jit.CSRC, "small", "r19", "interface", "sm_abi_v3.h"),
+        encoding="utf-8",
+    )
+    import re
+
+    block = re.search(r"struct SmRanArgsV3\s*\{(.*?)\};", h, re.DOTALL).group(1)
+    names = re.findall(r"(\w+)\s*;", re.sub(r"//.*", "", block).replace(",", ";"))
+    from aiter.ops.gemm_fusion.sp_qkv import small_rt
+
+    assert [n for n, _t in small_rt.SmRanArgsV3._fields_] == [
+        n for n in names if n != "pad"
+    ], (names, small_rt.SmRanArgsV3._fields_)
+
+
+def test_src_sha_constants_are_the_manifest_hashes():
+    import hashlib
+
+    mod = sys.modules["aiter.ops.gemm_fusion.sp_qkv.variants"]
+    for src in jit.SRCS:
+        path = os.path.join(jit.CSRC, "small", src, "SOURCE_SHA256.txt")
+        assert hashlib.sha256(_slurp(path, "rb")).hexdigest() == mod.SRC_SHA[src], src
+
+
+def test_profile_small_rows_run_r19_with_the_r18_family_flags_and_one_unit_each():
+    from aiter.gemm_fusion import prebuild as engine
+
+    clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
+    assert len(small) == 6
+    for (mode, T), (_vid, legacy) in specs.SMALL_CELLS.items():
+        row_params = dict(
+            prof.lookup(
+                specs.sp_qkv_spec(mode).signature(), "gfx950", 256, 4, T // 4
+            ).params
+        )
+        d19, _h19 = jit.small_defs(row_params, mode)
+        d_old, _h_old = jit.small_defs(legacy, mode)
+        # r19 = r18 + R12: the r17 cells keep every flag they had; the only additions are the r18-family switches at their off values
+        extra = set(d19) - set(d_old)
+        assert set(d_old) <= set(d19) and extra <= {
+            "-DSM_B_ROWSPLIT=0",
+            "-DSM_RX_BYPASS=0",
+            "-DSM_REUSE_NO_IDX=0",
+        }, (mode, T, extra)
+        if legacy.get("src") == "r18":
+            assert (
+                extra == set() and d19 == d_old
+            )  # the r18 cells are byte-for-byte the same flag set
+    tool = dict(TOOL_SIM)
+    units, skipped = engine.plan_profile(PROFILE, recipe="aot1", tool=tool)
+    smalls = [u for u in units if u.kind == "sp_qkv.small.v1"]
+    assert (
+        skipped == []
+        and len(smalls) == 6
+        and {u.meta["src"] for u in smalls} == {"r19"}
+        and len({u.key for u in smalls}) == 6
+    )
+    u = smalls[0]
+    gemm_cmd = jit.device_cmd_one("r19", u.meta["dev"], tool, "/out", "sm_gemm")
+    fwd = [a.replace("\\", "/") for a in gemm_cmd]
+    assert any(a.endswith("small/r19/device/sk_gemm_fp8.cu") for a in fwd) and any(
+        "-I" in a and "small/r19/device" in a for a in fwd
+    )
+    host = [
+        a.replace("\\", "/")
+        for a in jit.host_compile_cmd("r19", u.meta["host"], tool, "/out")
+    ]
+    assert any(
+        a.endswith(("-Ismall/r19/host", "small/r19/host")) for a in host
+    ) and any(a.endswith("host/sm_fusion_driver.cpp") for a in host)

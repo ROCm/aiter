@@ -63,7 +63,7 @@ class SmBindingV1(C.Structure):
     ]
 
 
-# ---- R12 (design card r2 D2.3): STUB against the card ABI until small/r19 and its driver land --------------------------------------------------------------------
+# ---- R12 (design card r2 D2.3; small/r19, SM_ABI_VERSION 3) ----------------------------------------------------------------------------------------------------
 # SmRanArgsV3 is the RAN kernel's by-value kernarg block (one s_load_dwordx16): sizeof == 64 is pinned here and by the r19 header's static_assert. The host driver builds it
 # natively; this mirror exists to pin the layout and to unit-test the packing. err/step point into the per-comm global page.
 SM_RAN_ARGS_V3_BYTES = 64
@@ -89,9 +89,10 @@ assert C.sizeof(SmRanArgsV3) == SM_RAN_ARGS_V3_BYTES
 
 def load_driver(path: str, abi: int = 2):
     """Bind the small driver. abi 2 = the shipped v1 entry points; abi 3 = the R12 entry points (sm_attach_v3 / sm_launch_blk_v3; NO per-plan poison read). The abi 3
-    signatures are the card's (D2.6) and are CONFIRMED against the r19 driver when it lands: attach(rank, comm, rx_win, rx_local, ctl_win, ctl_local, gpage_local,
-    gpeers (NULL: the driver resolves the peers from gpage_local, ccoGetPeerPtr), gemm_hsaco, ran_hsaco, &ctx); launch(ctx, blk, A, W, strideA, Ascale, positions, slot,
-    t_valid, call_id, stream)."""
+    signatures are those of the r19 host entry points (sm_fusion_driver.cpp under SM_ABI_VERSION >= 3): attach(rank, comm, rx_win, rx_local, ctl_win, ctl_local,
+    gpage_local (64 B aligned), gpeers (a device-resident SmGfPeers* from the runtime, or NULL: the driver resolves the 3 peer ERR words with ccoGetPeerPtr),
+    gemm_hsaco, ran_hsaco, &ctx); launch(ctx, blk, A, W, strideA, Ascale, positions, slot_mapping, t_valid (<= T), call_id, stream). The per-launch tensors must hold at
+    least t_valid int64 (positions, slot_mapping) and M floats (Ascale)."""
     lib = C.CDLL(path)
     vp, u32, i32 = C.c_void_p, C.c_uint32, C.c_int32
     if abi == 3:

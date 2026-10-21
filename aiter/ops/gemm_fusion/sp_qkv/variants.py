@@ -39,6 +39,7 @@ from .jit import build_small, small_defs, src_abi
 SRC_SHA = {
     "r17": "3f597cdb6141c39dd4450a1ea635785ffe44867006434157478f7822357d8ee3",
     "r18": "0e48e3f01e917c9c5209c71efd90748e83eacf59d0e92cd10e5549955a450c29",
+    "r19": "d421799342c158798c3924ccae0f2babd88ec34b6e188edba15e5f98ad9eaac5",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
 }
 # analytic geometry (mirrors sm_abi_v2.h; cross-checked against sm_info_v1 after build)
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2560}
@@ -107,7 +108,12 @@ def check_cache_page(k_cache, v_cache, page: int):
         m_multiple=1,
         mutates=("k_cache", "v_cache", "k_scale", "v_scale", "index_cache"),
     ),
-    source_sha="r17=" + SRC_SHA["r17"] + ";r18=" + SRC_SHA["r18"],
+    source_sha="r17="
+    + SRC_SHA["r17"]
+    + ";r18="
+    + SRC_SHA["r18"]
+    + ";r19="
+    + SRC_SHA["r19"],
 )
 class SpQkvSmall(Plan):
     n_stages = 2
