@@ -14,8 +14,6 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --qk_rope_head_dim 0
 """
 
-import argparse
-
 import torch
 import triton
 from torch.autograd import DeviceType
@@ -28,6 +26,10 @@ from aiter.ops.triton.attention.sparse_mla import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -247,10 +249,7 @@ def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sparse MLA Benchmark",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="Sparse MLA Benchmark")
     parser.add_argument(
         "--num_seqs",
         type=int,
@@ -283,12 +282,8 @@ def main():
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "throughput", "bandwidth"],
-        default="time",
-        help="metric to plot",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     args = parser.parse_args()
     over = [t for t in args.num_tokens if t > args.context]
