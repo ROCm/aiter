@@ -35,10 +35,19 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
+    "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
     "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
+    "PreshuffledA16WFP4Weight": (
+        ".gemm_a16wfp4",
+        "PreshuffledA16WFP4Weight",
+    ),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
+    ),
+    "a16wfp4_shape_supported": (
+        ".gemm_a16wfp4",
+        "a16wfp4_shape_supported",
     ),
     "flydsl_conv_implicit": (".conv_kernels", "flydsl_conv_implicit"),
     "flydsl_flash_attn_fp8_func": (
@@ -62,6 +71,7 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
         "flydsl_fp8_paged_mqa_logits_gfx950",
     ),
+    "flydsl_gemm_a16wfp4": (".gemm_a16wfp4", "flydsl_gemm_a16wfp4"),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
@@ -118,6 +128,10 @@ _LAZY_IMPORTS = {
     ),
     "pa_decode": (".pa_decode", "pa_decode"),
     "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
+    "prepare_gemm_a16wfp4_weight": (
+        ".gemm_a16wfp4",
+        "prepare_gemm_a16wfp4_weight",
+    ),
     "gather_kv_b_proj_flydsl_fp8_supported": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
@@ -161,9 +175,12 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "DenseGemmConfig",
     "Fp4MqaPlan",
     "GateMode",
+    "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
+    "a16wfp4_shape_supported",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
@@ -172,6 +189,7 @@ __all__ = [
     "flydsl_fp8_mqa_logits",
     "flydsl_fp8_paged_mqa_logits",
     "flydsl_fp8_paged_mqa_logits_gfx950",
+    "flydsl_gemm_a16wfp4",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
@@ -199,6 +217,7 @@ __all__ = [
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
     "pa_decode",
+    "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
 ]
 
