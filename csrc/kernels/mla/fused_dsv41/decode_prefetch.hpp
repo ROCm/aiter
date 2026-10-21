@@ -91,10 +91,10 @@ struct PackedDecodeSource64
             opus::vector_t<bf16_t, 8> values{};
             if(raw.live)
             {
-                unsigned code = (raw.scales[int(j) / 4] >> ((int(j) % 4) * 8)) & 255u;
-                float scale   = code == 0     ? 0x1p-127f
-                                : code == 255 ? __builtin_nanf("")
-                                              : __uint_as_float(code << 23);
+                // The gfx950 scaled conversion consumes only scale exponent bits.
+                // Rotate the E8M0 byte into bits 23:30; sign/mantissa bits are ignored.
+                float scale = __uint_as_float(__builtin_rotateright32(
+                    raw.scales[int(j) / 4], (int(j) % 4) * 8 + 9));
                 opus::static_for<2>([&](auto half) {
                     // Materialize the scalar: clang 22 bit-casting a vector
                     // element lvalue directly repeated word 0 for word 1.
@@ -288,7 +288,10 @@ __device__ void packed_decode_accum64(
         std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
 
     auto other_kv = make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf) + T::smem_kv_tile_elems);
-    source.template load_tile<T>(0, s_kv.ptr, u_gkv, u_skv, warp_id, lane_id);
+    if constexpr(Source::is_packed)
+        source.commit(source.prefetch(0, warp_id, lane_id), s_kv.ptr, warp_id, lane_id);
+    else
+        source.template load_tile<T>(0, s_kv.ptr, u_gkv, u_skv, warp_id, lane_id);
     s_waitcnt_vmcnt(0_I);
     s_waitcnt_lgkmcnt(0_I);
     __builtin_amdgcn_s_barrier();
