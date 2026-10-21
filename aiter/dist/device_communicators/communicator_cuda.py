@@ -425,10 +425,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "per_group"/"mxfp4") from the public API.
-        if gemma_norm and quant_type not in ("per_token", "per_group"):
-            raise NotImplementedError(
-                "gemma_norm fused quant supports per-token and per-group FP8 only"
-            )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
                 input_,
@@ -449,6 +445,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 eps,
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
+                gemma_norm=gemma_norm,
             )
         # emit_bf16 additionally returns the pre-quantization bf16/fp16 normed
         # output alongside the per-token FP8 result. Used by v32 DSA models
@@ -664,6 +661,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
         """Fused AR+RMSNorm with an MXFP4 quantization epilogue when supported.
 
@@ -737,6 +735,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 eps,
                 use_1stage=can_1stage,
                 emit_bf16=emit_bf16,
+                gemma_norm=gemma_norm,
             )
             assert result is not None
             if emit_bf16:
@@ -745,7 +744,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 out_fp4, res_out, scale_out = result
         else:
             normed, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
+                input_, res_inp_, weight_, eps, prefill_support, gemma_norm=gemma_norm
             )
             from aiter.ops.triton.quant import dynamic_mxfp4_quant
 

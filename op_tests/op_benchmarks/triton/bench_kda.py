@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import argparse
 import sys
 
 import torch
@@ -10,6 +9,7 @@ import triton
 
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
 from aiter.ops.triton.utils._triton import arch_info
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 try:
@@ -320,7 +320,7 @@ def report_spread(spread, line_vals, line_names, args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark KDA decode", allow_abbrev=False)
+    parser = get_parser(kernel_name="KDA decode")
     parser.add_argument("--batch_sizes", type=int, nargs="+", default=[4, 16, 64, 256])
     parser.add_argument("--seq_lens", type=int, nargs="+", default=[1, 4, 8])
     parser.add_argument("--num_heads", type=int, nargs="+", default=K3_NUM_HEADS)
