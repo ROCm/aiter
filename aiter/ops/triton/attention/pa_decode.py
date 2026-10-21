@@ -8,6 +8,7 @@ import triton
 
 from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _get_dispatch_config,
+    _get_launch_config,
     _paged_attn_decode_v1_w_dot_kernel,
     _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
     _paged_attn_decode_v1_wo_dot_kernel,
@@ -93,6 +94,10 @@ def paged_attention_decode(
         dispatch = _get_dispatch_config(_KV_DTYPE_NAMES[key_cache.dtype])
     if dispatch is not None:
         use_v1 = max_num_partitions <= dispatch["v1_max_partitions"]
+        # With enough programs the split-free v1 fills the GPU and avoids the reduce.
+        busy_min = dispatch.get("v1_min_programs")
+        if busy_min is not None and num_seqs * num_kv_heads >= busy_min:
+            use_v1 = use_v1 or max_num_partitions <= dispatch["v1_busy_max_partitions"]
     else:
         use_v1 = max_seq_len <= 8192 and (
             max_num_partitions == 1 or num_seqs * num_q_heads > 512
@@ -236,6 +241,10 @@ def paged_attn_decode_v1(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
+        launch = _get_launch_config("v1_w_dot", kv_blk_sz) or {
+            "waves_per_eu": 3,
+            "num_stages": 1,
+        }
         _paged_attn_decode_v1_w_dot_kernel[grid](
             output,
             query,
@@ -264,8 +273,7 @@ def paged_attn_decode_v1(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
-            waves_per_eu=3 if query_grp_sz > 1 else 0,
-            num_stages=1,
+            **launch,
         )
 
 
@@ -390,6 +398,7 @@ def paged_attn_decode_v2(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
+        launch = _get_launch_config("v2_w_dot", kv_blk_sz) or {}
         _paged_attn_decode_v2_w_dot_kernel[grid](
             exp_sums,
             max_logits,
@@ -424,6 +433,7 @@ def paged_attn_decode_v2(
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            **launch,
         )
         grid = (num_seqs, num_kv_heads, 1)
         _paged_attn_decode_v2_w_dot_reduce_kernel[grid](

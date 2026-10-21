@@ -5,7 +5,11 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
@@ -17,6 +21,18 @@ def _get_dispatch_config(kv_dtype: str) -> dict | None:
     cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton")
     config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
     return config.get("dispatch", {}).get(kv_dtype)
+
+
+def _get_launch_config(kernel: str, kv_blk_sz: int) -> dict | None:
+    """Launch kwargs (num_warps, num_stages, waves_per_eu) of a GQA decode kernel
+    ("v1_w_dot" or "v2_w_dot") for this KV page size, or None when this arch has
+    no tuned entry for it."""
+    cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
+    table = config.get("launch", {}).get(kernel)
+    if table is None:
+        return None
+    return select_leq_config(table, kv_blk_sz, prefix="BLK_LEQ_")
 
 
 _paged_attn_decode_v1_wo_dot_repr = make_kernel_repr(
