@@ -6,6 +6,7 @@
 #   ./e2e.sh check             # preflight: images, vLLM all-reduce path, model
 #   ./e2e.sh run               # check, then the A/B benchmark, then the summary
 #   ./e2e.sh profile           # check, then one torch-profiled run per server
+#   ./e2e.sh smoke             # check, then only start each server, smoke-test it, stop it
 #   ./e2e.sh summary <dir>     # summary table of a finished run
 #   ./e2e.sh all               # build + run
 #
@@ -13,7 +14,7 @@
 #
 # For every (TP, image) "run" starts one server, checks that it answers,
 # records which all-reduce path vLLM took, runs the benchmark scenarios and
-# stops the server. The images alternate per TP so that slow drift does not
+# stops the server. "smoke" does the same without the benchmark scenarios. The images alternate per TP so that slow drift does not
 # favour one of them.
 set -euo pipefail
 
@@ -227,9 +228,13 @@ wait_ready() {
 
 smoke() {  # out_dir
     curl -sf "localhost:$PORT/v1/completions" -H 'Content-Type: application/json' \
-        -d "{\"model\": \"$MODEL\", \"prompt\": \"The capital of France is\", \"max_tokens\": 32, \"temperature\": 0}" \
+        -d "{\"model\": \"$MODEL\", \"prompt\": \"The capital of France is\", \"max_tokens\": 32, \"temperature\": 0, \"logprobs\": 5}" \
         >"$1/smoke.json" || return 1
     log "smoke: $(grep -o '"text": *"[^"]*"' "$1/smoke.json" | head -1)"
+    # Per-token greedy picks and how close each was to the runner-up.
+    run_py e2e_smoke.py "$1" >"$1/smoke_tokens.txt" 2>&1 \
+        && log "smoke $(tail -1 "$1/smoke_tokens.txt") (all tokens: $1/smoke_tokens.txt)" \
+        || log "smoke logprobs unavailable, see $1/smoke_tokens.txt"
 }
 
 record_ar_path() {  # out_dir
@@ -280,24 +285,28 @@ run_one() {  # image tag tp
     fi
     smoke "$out" || log "smoke request FAILED"
     record_ar_path "$out"
-    if [ "$MODE" = profile ]; then
-        bench 60000 100 4 "$out" --profile || log "profile run FAILED"
-    else
-        local s in outl concs c
-        for s in $SCENARIOS; do
-            IFS=: read -r in outl concs <<<"$s"
-            for c in ${concs//,/ }; do
-                log "bench ${in}x${outl} c=$c"
-                bench "$in" "$outl" "$c" "$out" || log "bench ${in}x${outl} c=$c FAILED, see bench.log"
-                if ! docker ps -q -f name="^$NAME$" | grep -q .; then
-                    log "server died, skipping the remaining scenarios, see server.log"
-                    break 2
-                fi
-            done
-        done
-    fi
+    case "$MODE" in
+        profile) bench 60000 100 4 "$out" --profile || log "profile run FAILED" ;;
+        bench) run_scenarios "$out" ;;
+        smoke) ;;
+    esac
     record_ar_path "$out"   # again: the fused engines may log after warmup
     stop_server
+}
+
+run_scenarios() {  # out_dir
+    local out=$1 s in outl concs c
+    for s in $SCENARIOS; do
+        IFS=: read -r in outl concs <<<"$s"
+        for c in ${concs//,/ }; do
+            log "bench ${in}x${outl} c=$c"
+            bench "$in" "$outl" "$c" "$out" || log "bench ${in}x${outl} c=$c FAILED, see bench.log"
+            if ! docker ps -q -f name="^$NAME$" | grep -q .; then
+                log "server died, skipping the remaining scenarios, see server.log"
+                return 0
+            fi
+        done
+    done
 }
 
 cmd_run() {
@@ -315,57 +324,29 @@ cmd_run() {
         fi
         i=$((i + 1))
     done
-    if [ "$MODE" = bench ]; then
-        cmd_summary "$RUN_DIR" | tee "$RUN_DIR/summary.md"
-    else
+    if [ "$MODE" = profile ]; then
         log "traces under $RUN_DIR/*/traces"
+    else
+        cmd_summary "$RUN_DIR" | tee "$RUN_DIR/summary.md"
     fi
 }
 
 # -------------------------------------------------------------- summary ----
 
-SUMMARY_PY='
-import json, re, sys
-from pathlib import Path
-
-METRICS = [("median_ttft_ms", "TTFT ms", -1),
-           ("median_tpot_ms", "TPOT ms", -1),
-           ("output_throughput", "out tok/s", 1)]
-
-rows = {}
-for f in Path(sys.argv[1]).glob("*_tp*/bench_*.json"):
-    tag, tp = re.match(r"(\w+)_tp(\d+)", f.parent.name).groups()
-    rows.setdefault((int(tp), f.stem[len("bench_"):]), {})[tag] = json.loads(f.read_text())
-
-def order(item):
-    (tp, scen), _ = item
-    shape, conc = scen.split("_c")
-    i, o = shape.split("x")
-    return (-tp, int(i), int(o), int(conc))
-
-head = ["TP", "scenario"]
-for _, name, _ in METRICS:
-    head += [name + " main", name + " ar", "delta"]
-print("| " + " | ".join(head) + " |")
-print("|" + "---|" * len(head))
-for (tp, scen), r in sorted(rows.items(), key=order):
-    cells = [str(tp), scen]
-    for m, _, sign in METRICS:
-        a, b = r.get("main", {}).get(m), r.get("ar", {}).get(m)
-        cells += ["%.1f" % a if a else "-", "%.1f" % b if b else "-"]
-        # Positive delta = ar is better.
-        cells.append("%+.1f%%" % (sign * (b - a) / a * 100) if a and b else "-")
-    print("| " + " | ".join(cells) + " |")
-'
+run_py() {  # script.py dir: run a helper next to this script on a result dir
+    local script=$1 dir
+    dir=$(cd "$2" && pwd)
+    if command -v python3 >/dev/null; then
+        python3 "$HERE/$script" "$dir"
+    else
+        # The server image has python3; the host may not.
+        docker run --rm --entrypoint "" -v "$HERE":/e2e:ro -v "$dir":/r \
+            "$IMAGE_A" python3 "/e2e/$script" /r
+    fi
+}
 
 cmd_summary() {  # run_dir
-    local dir
-    dir=$(cd "${1:?usage: ./e2e.sh summary <run dir>}" && pwd)
-    if command -v python3 >/dev/null; then
-        python3 -c "$SUMMARY_PY" "$dir"
-    else
-        docker run --rm --entrypoint "" -v "$dir":/r "$IMAGE_A" python3 -c "$SUMMARY_PY" /r
-    fi
+    run_py e2e_summary.py "${1:?usage: ./e2e.sh summary <run dir>}"
 }
 
 # ----------------------------------------------------------------- main ----
@@ -375,6 +356,7 @@ case "${1:-}" in
     check) cmd_check ;;
     run) MODE=bench; cmd_run ;;
     profile) MODE=profile; cmd_run ;;
+    smoke) MODE=smoke; cmd_run ;;
     summary) cmd_summary "${2:-}" ;;
     all) cmd_build; MODE=bench; cmd_run ;;
     *) sed -n '2,13p' "$0"; exit 1 ;;
