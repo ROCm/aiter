@@ -35,18 +35,19 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 CSRC = os.path.abspath(
     os.path.join(_HERE, "..", "..", "..", "..", "csrc", "gemm_fusion", "sp_qkv")
 )
-SRCS = ("r17", "r18", "r19", "r20")
+SRCS = ("r17", "r18", "r19", "r20", "r21")
 LARGE_SRCS = ("r11", "r12")
 R18_FAMILY = (
     "r18",
     "r19",
     "r20",
+    "r21",
 )  # r19 is derived from r18 (design card r2 D-1 path A), r20 from r19: they accept the r18-only flags (r20: see small_defs for what it refuses)
 # kernel ABI generation of a source: 2 = the shipped drivers (poison words, pointers baked in the device block); 3 = R12 (per-launch kernargs, per-comm ERR/STEP page,
 # call_id tags). Plans of abi 3 take `call_id` in run(), carry the global page request and register no per-plan poison hooks.
-SMALL_ABI = {"r17": 2, "r18": 2, "r19": 3, "r20": 3}
+SMALL_ABI = {"r17": 2, "r18": 2, "r19": 3, "r20": 3, "r21": 3}
 # padded rows per source (SM_MP): r17-r19 cover local m 1..32 (T <= 128); r20 (R13 MP64) covers m 1..64 (decode T up to 256: the profile uses it for m 33..64)
-SMALL_MP = {"r17": 32, "r18": 32, "r19": 32, "r20": 64}
+SMALL_MP = {"r17": 32, "r18": 32, "r19": 32, "r20": 64, "r21": 128}
 LARGE_ABI = {"r11": 2, "r12": 3}
 
 
@@ -134,24 +135,27 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
     idx = 1 if mode == "indexer" else 0
     dense = 1 if mode == "dense" else 0
     nh = int(params.get("nh", 1))
-    if src in ("r19", "r20") and int(params.get("no_credit", 1)) != 1:
+    if src in ("r19", "r20", "r21") and int(params.get("no_credit", 1)) != 1:
         raise ValueError(
             f"{src}: SM_NO_CREDIT must be 1 (the credit slow path used the retired poison word)"
         )
-    if src == "r20":
-        # R13 MP64: ONE push shape, the B row split is intrinsic, B_HEADS = 1 (the 216 / 240 B WG counts assume it) and the bypass loads are REQUIRED in every mode
+    if src in ("r20", "r21"):
+        # R13 MP64 / MP128: ONE push shape, the B row split is intrinsic, B_HEADS = 1 (the 216 / 240 B WG counts assume it) and the bypass loads are REQUIRED in every mode
         # (sm_abi_v3.h #errors on SM_PUSH8 / SM_PUSH_HALVES / SM_B_ROWSPLIT / !SM_RX_BYPASS): the flags that no longer exist are refused here, before a compile
         gone = [k for k in ("push8", "push_halves", "b_rowsplit") if params.get(k)]
         if gone:
             raise ValueError(
-                f"r20 has no {gone} (one push shape, intrinsic B row split)"
+                f"{src} has no {gone} (one push shape, intrinsic B row split)"
             )
         if int(params.get("rx_bypass", 0)) != 1:
             raise ValueError(
-                "r20 requires rx_bypass=1 in every mode (R13 card R2.4 D-10; gfx950 only)"
+                f"{src} requires rx_bypass=1 in every mode (R13 card R2.4 D-10; gfx950 only)"
             )
-        if int(params.get("nh", 1)) != 1:
-            raise ValueError("r20 requires nh=1 (B_HEADS=1)")
+        # B_HEADS: r20 supports NH1 only (its 216 / 240 B WG counts); r21 supports NH1 (default: 432 / 480 B WGs, grid 552 / 608) and NH2 (216 / 240 B WGs, grid 336 / 368:
+        # the A/B for the occupancy caveat of the 1024-slot launch)
+        allowed_nh = (1, 2) if src == "r21" else (1,)
+        if nh not in allowed_nh:
+            raise ValueError(f"{src} requires nh in {allowed_nh} (B_HEADS), got {nh}")
     abi = [
         f"-DSM_R5X_INDEXER={idx}",
         f"-DSM_DENSE={dense}",

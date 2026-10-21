@@ -41,6 +41,7 @@ SRC_SHA = {
     "r18": "0e48e3f01e917c9c5209c71efd90748e83eacf59d0e92cd10e5549955a450c29",
     "r19": "79bb051aac0b8ef048b40f69b9c39a30218aa300078a239063f092fcd2c83be9",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
     "r20": "11cd4ab3de2bbd44d8380821f579d8672f5303610c4b5c51cdad0723748f46db",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
+    "r21": "cf4ba089626f74390b6ef44df7a41b22d70962bf8875932d7b8f73a77e7e9190",  # R13 MP128 (abi 3, SM_MP 128, 8 MiB Rx view), derived from r20
 }
 # analytic geometry (mirrors sm_abi_v2.h; cross-checked against sm_info_v1 after build)
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2560}
@@ -54,6 +55,14 @@ def small_window_bytes(mode: str, mp: int | None = None) -> dict[str, int]:
     rx = 2 * 4 * mp * _F[mode] * 2
     ctl = 256 + 8 * 2 * 4 * _NA[mode]
     return {"rx": rx, "ctl": ctl}
+
+
+def small_window_caps(mode: str, mp: int | None = None) -> tuple[int, int]:
+    """(Rx, control) window capacities a small owner requests, each rounded up to the 4 MiB granule and sized SEPARATELY: 4 MiB each for MP <= 64 (Rx 1.1 / 2.4 / 2.6 MiB), but
+    MP128's Rx (4.5 MiB dense, 5.0 MiB indexer / reuse) needs an 8 MiB arena view while its control window stays one granule.
+    """
+    b = small_window_bytes(mode, mp)
+    return round_up(max(b["rx"], 8192)), round_up(max(b["ctl"], 8192))
 
 
 def small_p_bytes(mode: str, mp: int | None = None, sk: int = 3) -> int:
@@ -126,7 +135,9 @@ def check_cache_page(k_cache, v_cache, page: int):
     + ";r19="
     + SRC_SHA["r19"]
     + ";r20="
-    + SRC_SHA["r20"],
+    + SRC_SHA["r20"]
+    + ";r21="
+    + SRC_SHA["r21"],
 )
 class SpQkvSmall(Plan):
     n_stages = 2
@@ -176,11 +187,10 @@ class SpQkvSmall(Plan):
         self._ctx = None
 
     def resources(self) -> list[WindowReq]:
-        b = small_window_bytes(self.mode, self.mp)
-        cap = round_up(max(b["rx"], b["ctl"], 8192))
+        rx_cap, ctl_cap = small_window_caps(self.mode, self.mp)
         reqs = [
-            WindowReq(self.owner + "/rx", cap, "p2p_window"),
-            WindowReq(self.owner + "/ctl", cap, "control"),
+            WindowReq(self.owner + "/rx", rx_cap, "p2p_window"),
+            WindowReq(self.owner + "/ctl", ctl_cap, "control"),
         ]
         if (
             self.abi >= 3

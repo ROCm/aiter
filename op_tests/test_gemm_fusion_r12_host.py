@@ -408,18 +408,22 @@ def test_KEY_every_profile_key_of_the_shipped_profile_has_a_distinct_nonzero_cal
         64,
         128,
         256,
+        512,
         8192,
         16384,
         32768,
-    } <= tokens  # exact rows (m * world): P2 (m 1..12), m16, m32, r20 m64, large ...
+    } <= tokens  # exact rows (m * world): P2 (m 1..12), m16, m32, r20 m64, r21 m128, large ...
     assert {
         132,
         148,
         252,
-    } <= tokens  # ... the r20 (MP64) rule over local m 33..64 (tokens 4 m = 132..256) ...
+        260,
+        400,
+        508,
+    } <= tokens  # ... the r20 (MP64) rule over local m 33..64 (tokens 4 m = 132..256), the r21 (MP128) rule over 65..128 (260..512) ...
     assert not (
-        {260, 512, 1020} & tokens
-    )  # ... and nothing in the native range m 65..255
+        {516, 520, 1020} & tokens
+    )  # ... and nothing in the native range m 129..255 (T 516..1020)
     assert {
         4096,
         5120,
@@ -427,10 +431,11 @@ def test_KEY_every_profile_key_of_the_shipped_profile_has_a_distinct_nonzero_cal
         28672,
     } <= tokens  # ... and the m values the range rules add (m = 1024..8192 step 256, tokens = 4 m)
     n_entries = len({(k[2], k[1], k[3]) for k in keys})
-    # the key has no mode: dense and indexer at the same token count are the same key (a site is one mode). 64 small token counts (every local m 1..64: the exact rows plus
-    # the r19 rules over 1..16 / 17..32 and the MP64 rule over 33..64) + 29 large (m = 1024..8192 step 256)
+    # the key has no mode: dense and indexer at the same token count are the same key (a site is one mode). 128 small token counts (every local m 1..128: the exact rows plus
+    # the r19 rules over 1..16 / 17..32, the MP64 rule over 33..64 and the MP128 rule over 65..128) + 29 large (m = 1024..8192 step 256)
     assert (
-        len(keys) == n_entries * len(MODEL_SITES + DRAFT_SITES) and n_entries == 64 + 29
+        len(keys) == n_entries * len(MODEL_SITES + DRAFT_SITES)
+        and n_entries == 128 + 29
     )
     rep = callid.check_profile_call_ids(prof, MODEL_SITES + DRAFT_SITES, world=4)
     assert (

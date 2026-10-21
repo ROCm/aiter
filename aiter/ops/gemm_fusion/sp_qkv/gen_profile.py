@@ -58,18 +58,17 @@ def build_rows():
             "cell": f"{mode}_T{WORLD * m}",
         }
         if (mode, m) not in tuned:
-            row["note"] = (
-                "R13 MP64 (src r20)"
-                if params["src"] == specs.SMALL_R20_SRC
-                else "R13 P2: copy of the mode's m=16 params"
-            )
+            row["note"] = {
+                specs.SMALL_R20_SRC: "R13 MP64 (src r20)",
+                specs.SMALL_R21_SRC: "R13 MP128 (src r21, 8 MiB Rx view)",
+            }.get(params["src"], "R13 P2: copy of the mode's m=16 params")
         rows.append(row)
     rows.extend(build_large_rows())
     return rows
 
 
 def build_small_rules():
-    """The small range rules per mode (specs.small_range_rules: r19 over m 1..16 and 17..32, r20 over 33..64; every m): consulted only where no exact row exists. Every
+    """The small range rules per mode (specs.small_range_rules: r19 over m 1..16 and 17..32, r20 over 33..64, r21 over 65..128; every m): consulted only where no exact row exists. Every
     covered m is validated against the real plan constructor (push8 above 16, b_rowsplit at or below 16 and an r20 build without the bypass would be refused).
     """
     rules = []
@@ -212,24 +211,25 @@ def window_budget():
 
     from . import jit, variants, variants_large
 
-    small = {}
+    small = {}  # owner (mode + params) -> (Rx capacity, control capacity)
     small_cells = [
         (mode, params) for mode, _m, _vid, params in specs.small_exact_cells()
     ]
     small_cells += [(r["mode"], r["params"]) for r in specs.small_range_rules()]
     for mode, params in small_cells:
-        b = variants.small_window_bytes(mode, jit.src_mp(params["src"]))
-        small[(mode, tuple(sorted(params.items())))] = round_up(
-            max(b["rx"], b["ctl"], 8192)
+        small[(mode, tuple(sorted(params.items())))] = variants.small_window_caps(
+            mode, jit.src_mp(params["src"])
         )
     large = {
         (mode, T // WORLD): variants_large.large_window_bytes(mode, T // WORLD)
         for (mode, T) in specs.LARGE_CELLS
     }
-    wb = max(list(small.values()) + list(large.values()))
+    wb = max([c for caps in small.values() for c in caps] + list(large.values()))
     from . import variants_large as vl
 
-    small_sizes = sorted([s for s in small.values() for _ in range(2)], reverse=True)
+    small_sizes = sorted(
+        [c for caps in small.values() for c in caps], reverse=True
+    )  # each owner: its Rx and its control window (MP128: 8 MiB + 4 MiB)
     sr = max(large.values())
     shared = {
         vl.SHARE_S: sr,
