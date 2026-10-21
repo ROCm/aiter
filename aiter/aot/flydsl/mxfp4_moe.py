@@ -23,6 +23,10 @@ from contextlib import nullcontext
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
+from aiter.ops.flydsl.mxfp4_kname import (
+    atomic_stage2_opt_in,
+    deterministic_v2_gemm2_name,
+)
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
 # moe.py defers every ``flydsl_moe2_layout_`` name to this module, so a CSV the
@@ -41,6 +45,9 @@ if os.path.exists(_ACTIVE_FMOE_CSV) and _ACTIVE_FMOE_CSV not in DEFAULT_CSVS:
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
+# Mirror the runtime epilogue policy: atomic stage2 rows launch as their reduce
+# sibling, so the AOT cache has to be keyed on the kernel that actually runs.
+_ATOMIC_STAGE2 = atomic_stage2_opt_in()
 
 
 def _job_key(job: dict) -> tuple:
@@ -156,6 +163,11 @@ def parse_csv(csv_path):
 
             kn1 = (row.get("kernelName1") or "").strip()
             kn2 = (row.get("kernelName2") or "").strip()
+            if not _ATOMIC_STAGE2:
+                # Same policy get_2stage_cfgs applies at runtime: a tuned atomic
+                # layout-v2 row dispatches its reduce sibling, so precompile that
+                # name instead of the epilogue that will never run.
+                kn2 = deterministic_v2_gemm2_name(kn2) or kn2
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             if v2_g2 is not None:
                 v2_d_inter = inter_dim
@@ -475,7 +487,10 @@ def _compile_v2_stage2(job):
             job["topk"],
             job["N_OUT"],
             expert_mask=None,
-            topk_ids=None,
+            # The runtime always forwards topk_ids, which enables the
+            # dropped-route guard; a real int32 placeholder precompiles that
+            # same specialization instead of the unmasked one.
+            topk_ids=torch.zeros((job["BM"], job["topk"]), dtype=torch.int32),
             stream=0,
             is_fp8=is_fp8_route_out,
             topk_weights=d if is_fp8_route_out else None,
