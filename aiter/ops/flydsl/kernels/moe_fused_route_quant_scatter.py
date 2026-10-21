@@ -705,19 +705,17 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
 
     Loads are clustered before stores to overlap payload and scale latencies.
     Overshoot lanes are OOB-checked by the buffer resource ``num_records``.
+
+    With several ``c.dests`` the row is loaded once and stored to each; a dest
+    carrying a wave-uniform ``valid`` predicate is stored only where it holds.
     """
     i32 = c.i32
     c4 = fx.Int32(4)
     c16 = fx.Int32(16)
     lane = c.lane
-    dst = c.dests[0]
 
     payload_bytes_per_row = c.payload_bytes_per_row
-    dst_addr = c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
     src_addr = c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row
-    dst_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        dst_addr, num_records_bytes=payload_bytes_per_row
-    )
     src_rsrc = buffer_ops.create_buffer_resource_from_addr(
         src_addr, num_records_bytes=c.feat_bytes_per_row
     )
@@ -730,7 +728,6 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     n_scale_dwords = c.mx_blocks_per_row // 4
     c_stride = fx.Int32(c.wmma_rep * 16)
     c_n_scale_dwords = fx.Int32(n_scale_dwords)
-    scale_row_dword_base = dst.scale_row_dword_base
     scale_t_i32 = c.scale_t_i32
     n_sc_iter = (n_scale_dwords + 31) // 32
 
@@ -758,35 +755,52 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
         )
         scale_chunks.append((g, src_dword))
 
-    for chunk_idx, v in payload_chunks:
-        buffer_ops.buffer_store(
-            v,
-            dst_rsrc,
-            chunk_idx * c16,
-            offset_is_bytes=True,
-            cache_modifier=_PREQUANT_NT_STORE,
-        )
     # Row-major keeps each row's e8m0 dwords contiguous (row * 56 + g).
     # The interleaved store scatters them at stride wmma_rep*16, one dword per
     # cache line. GEMM's row_major_ascale path consumes the contiguous layout.
     row_major_scale = bool(getattr(c, "row_major_scale", False))
-    row_i32 = dst.payload_row_i32
-    for g, src_dword in scale_chunks:
-        if const_expr(row_major_scale):
-            dst_dword_idx = fx.Int32(row_i32) * c_n_scale_dwords + g
+
+    def _store_row(dst):
+        dst_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row,
+            num_records_bytes=payload_bytes_per_row,
+        )
+        for chunk_idx, v in payload_chunks:
+            buffer_ops.buffer_store(
+                v,
+                dst_rsrc,
+                chunk_idx * c16,
+                offset_is_bytes=True,
+                cache_modifier=_PREQUANT_NT_STORE,
+            )
+        for g, src_dword in scale_chunks:
+            if const_expr(row_major_scale):
+                dst_dword_idx = fx.Int32(dst.payload_row_i32) * c_n_scale_dwords + g
+            else:
+                dst_dword_idx = dst.scale_row_dword_base + g * c_stride
+
+            # Tail-lane guard: n_scale_dwords may not be a wave multiple.
+            def _store_scale_dword(dst_dword_idx=dst_dword_idx, src_dword=src_dword):
+                scale_t_i32[dst_dword_idx] = fx.Int32(src_dword)
+
+            @flyc.jit
+            def _dispatch_scale_dword(g=g, _store_scale_dword=_store_scale_dword):
+                if fx.Uint32(g) < fx.Uint32(c_n_scale_dwords):
+                    _store_scale_dword()
+
+            _dispatch_scale_dword()
+
+    for dst in c.dests:
+        if const_expr(getattr(dst, "valid", None) is None):
+            _store_row(dst)
         else:
-            dst_dword_idx = scale_row_dword_base + g * c_stride
 
-        # Tail-lane guard: n_scale_dwords may not be a wave multiple.
-        def _store_scale_dword(dst_dword_idx=dst_dword_idx, src_dword=src_dword):
-            scale_t_i32[dst_dword_idx] = fx.Int32(src_dword)
+            @flyc.jit
+            def _dispatch_row(dst=dst):
+                if dst.valid:
+                    _store_row(dst)
 
-        @flyc.jit
-        def _dispatch_scale_dword(g=g, _store_scale_dword=_store_scale_dword):
-            if fx.Uint32(g) < fx.Uint32(c_n_scale_dwords):
-                _store_scale_dword()
-
-        _dispatch_scale_dword()
+            _dispatch_row()
 
 
 def build_moe_fused_route_quant_scatter_module(
@@ -1582,6 +1596,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     src_scale_bytes_per_row: int = 0,
     fuse_ep_psum: bool = False,
     row_major_scale: bool = False,
+    multidest: bool = False,
 ):
     """Route-indexed grouped quant+preshuffle.
 
@@ -1599,11 +1614,20 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     the scale preshuffle and drops only the quant -- the preshuffle cannot move
     to the sender, because its destination is a function of the grouped row THIS
     rank assigns, which no sender knows.
+
+    ``multidest`` (prequantized, no K-split, ``source_topk`` > 0) launches one
+    warp per source token instead of one per route: the row is loaded once and
+    stored to every route of the token mapped to a local grouped row. ``numel``
+    stays the route count.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
         raise NotImplementedError(
             "route-indexed K-split is currently enabled only for gfx1250 pk8"
+        )
+    if multidest and not (prequantized and not ksplit and source_topk > 0):
+        raise ValueError(
+            "multidest needs the prequantized, non-K-split, source_topk path"
         )
 
     is_fp8 = L.is_fp8
@@ -1660,7 +1684,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{psum_tag}{ksplit_tag}"
-        f"{prequant_tag}{rm_tag}"
+        f"{prequant_tag}{rm_tag}{'_md' if multidest else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -1734,7 +1758,10 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             starts_lds = lds1
             m_p = ptr_buf_tensor(masked_m)
             p_p = ptr_buf_tensor(psum_out)
-            first_route = bid * fx.Uint32(warps_per_block)
+            # A multidest warp owns all source_topk routes of its token.
+            first_route = bid * fx.Uint32(
+                warps_per_block * (source_topk if multidest else 1)
+            )
             scan_block = (bid == fx.Uint32(0)) | (first_route < valid_route_count)
             if scan_block:
                 tile_v = fx.Uint32(tile_m)
@@ -1769,6 +1796,106 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                     if is_writer:
                         p_p[tid] = start + fx.Int32(m_p[tid])
                 gpu.barrier()
+
+        def _md_record(md_rows, md_ep, md_w, md_tis, route, row, cond):
+            """The per-route path's row-map and EP row-map writes, for one route."""
+            if cond:
+                md_rows[route] = row
+                if const_expr(fuse_ep_psum):
+                    md_wf = md_w[route].to(fx.Float32)
+                    md_topk = fx.Uint32(ep_topk)
+                    md_max_tok = fx.Uint32(max_tok)
+                    md_t = fx.Uint32(route) // md_topk
+                    md_k = fx.Uint32(route) - md_t * md_topk
+                    md_enc = fx.Uint32(md_tis[md_t])
+                    md_pe = md_enc // md_max_tok
+                    md_lid = md_enc - md_pe * md_max_tok
+                    md_ep[row * 2] = (
+                        md_pe * fx.Uint32(slot_stride) + md_lid * md_topk + md_k
+                    )
+                    md_ep[row * 2 + 1] = md_wf.bitcast(fx.Int32)
+
+        def _md_copy(qc, any_mapped):
+            if any_mapped:
+                _emit_prequant_copy_preshuffle(qc)
+
+        def token_body():
+            # One warp owns one source token and all of its routes: the row is
+            # loaded once and stored to each route mapped to a local grouped row.
+            warp_in_block = fx.Uint32(
+                rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave))
+            )
+            lane = tid - warp_in_block * c_wave
+            token = bid * fx.Uint32(warps_per_block) + warp_in_block
+            rows_t = ptr_buf_tensor(topids_to_rows)
+            md_ep = ptr_buf_tensor(ep_rowmap) if const_expr(fuse_ep_psum) else None
+            md_w = (
+                ptr_buf_tensor(gather_w, fx.BFloat16)
+                if const_expr(fuse_ep_psum)
+                else None
+            )
+            md_tis = ptr_buf_tensor(tis) if const_expr(fuse_ep_psum) else None
+            is_lane0 = lane == c0_i32
+            dests = []
+            any_mapped = fx.Uint32(token) != fx.Uint32(token)
+            for k in range_constexpr(source_topk):
+                route = fx.Uint32(token) * fx.Uint32(source_topk) + fx.Uint32(k)
+                in_range = route < fx.Uint32(valid_route_count)
+                safe_route = in_range.select(route, fx.Uint32(0))
+                row_raw = fx.Int32(buf_scalar_load(rows_t, safe_route))
+                # A dead-tail route or a DROPPED_ROUTE_ROW sentinel is not stored.
+                mapped = in_range & (row_raw >= fx.Int32(0))
+                row = mapped.select(fx.Uint32(row_raw), fx.Uint32(0))
+                if const_expr(fuse_ep_psum or remap_rows):
+                    m = fx.Uint32(route_max_m)
+                    expert = row // m
+                    slot = row - expert * m
+                    row = (
+                        fx.Uint32(starts_lds[expert])
+                        if const_expr(fuse_ep_psum)
+                        else fx.Uint32(
+                            buf_scalar_load(ptr_buf_tensor(row_starts), expert)
+                        )
+                    ) + slot
+                    _md_record(
+                        rows_t, md_ep, md_w, md_tis, route, row, mapped & is_lane0
+                    )
+                scale_tile = row // fx.Uint32(c_rows_per_tile)
+                row_in_tile = row - scale_tile * c_rows_per_tile
+                wmma_row = row_in_tile // fx.Uint32(c16_i32)
+                dests.append(
+                    SimpleNamespace(
+                        payload_row_i32=row,
+                        scale_row_dword_base=(
+                            scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                            + wmma_row * c16_i32
+                            + (row_in_tile - wmma_row * c16_i32)
+                        ),
+                        valid=mapped,
+                    )
+                )
+                any_mapped = any_mapped | mapped
+            qc = SimpleNamespace(
+                i32=i32,
+                lane=lane,
+                payload_base=fx.Int64(ptrtoint(grouped_payload)),
+                payload_bytes_per_row=payload_bytes_per_row,
+                hidden_base=fx.Int64(ptrtoint(grouped_in)),
+                feat_bytes_per_row=src_bytes_per_row,
+                feat_row_i32=token,
+                src_scale_base=fx.Int64(ptrtoint(src_scale)),
+                src_scale_bytes_per_row=src_scale_bytes_per_row,
+                mx_blocks_per_row=mx_blocks_per_row,
+                wmma_rep=wmma_rep,
+                scale_t_i32=ptr_buf_tensor(grouped_scale, fx.Int32),
+                row_major_scale=row_major_scale,
+                dests=dests,
+            )
+            _md_copy(qc, any_mapped)
+
+        if const_expr(multidest):
+            token_body()
+            return
 
         # One warp owns one route, so tid // wave is wave-invariant -- but the
         # backend cannot see that. readfirstlane says it, which keeps `route`
