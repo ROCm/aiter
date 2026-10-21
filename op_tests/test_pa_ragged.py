@@ -727,7 +727,7 @@ DUMP_OUTPUT = False  # whether to dump output
 @pytest.mark.parametrize("ctx_lens", [1, 26, 128, 4097])
 @pytest.mark.parametrize("num_seqs", [1, 3, 31, 128])
 @pytest.mark.parametrize("num_heads", [(8, 1), (4, 2), (32, 4)])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
 @pytest.mark.parametrize("use_alibi", [False, True])
 @pytest.mark.parametrize("block_size", [1, 16, 32])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -1089,6 +1089,15 @@ if __name__ == "__main__":
     e.g. -c 128""",
     )
     parser.add_argument(
+        "-d",
+        "--head_size",
+        type=int,
+        default=[128, 256],
+        nargs="*",
+        help="""Head size.
+    e.g. -d 128""",
+    )
+    parser.add_argument(
         "-p",
         "--pa_variant",
         type=str,
@@ -1127,22 +1136,25 @@ if __name__ == "__main__":
         None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
     ]
 
-    for ctx_len, pa_variant, quant_cache_dtype in itertools.product(
+    for ctx_len, head_size, pa_variant, quant_cache_dtype in itertools.product(
         args.ctx_len,
+        args.head_size,
         args.pa_variant,
         args.quant_cache_dtype,
     ):
 
         if pa_variant == PAVariant.Shomy and quant_cache_dtype is not None:
             continue
-        if pa_variant == PAVariant.Asm and quant_cache_dtype not in [None, dtypes.i8]:
+        if pa_variant == PAVariant.Asm and (
+            head_size != 128 or quant_cache_dtype not in [None, dtypes.i8]
+        ):
             continue
 
         test_paged_attention(
             ctx_len,
             128,
             (8, 1),
-            128,
+            head_size,
             False,
             16,
             dtypes.bf16,
