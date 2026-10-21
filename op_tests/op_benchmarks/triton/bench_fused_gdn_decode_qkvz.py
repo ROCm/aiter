@@ -22,7 +22,6 @@ Usage:
     python3 bench_fused_gdn_decode_qkvz.py --batch 1,32,256 --no-fp8
 """
 
-import argparse
 import sys
 
 import torch
@@ -31,6 +30,7 @@ from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
     fused_gdn_decode_qkvz,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # Peak theoretical HBM bandwidth, bytes/s.
 _PEAK_BW = {"gfx950": 8.0e12, "gfx942": 5.3e12}
@@ -124,7 +124,7 @@ def bench_one(batch, num_k_heads, head_dim, slots, quant_dtype, iters, warmup=25
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = get_parser(kernel_name="Fused GDN Decode QKVZ")
     ap.add_argument("--batch", default="1,2,4,8,16,32,64,128,256")
     ap.add_argument("--num-k-heads", type=int, default=4)
     ap.add_argument("--head-dim", type=int, default=_HEAD_DIM)
