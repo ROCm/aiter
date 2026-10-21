@@ -4,16 +4,16 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+# Shared Gluon device helpers. The import also installs the reinterpret compat
+# shim (common.utils aliases shared_memory_descriptor._reinterpret -> reinterpret
+# on the Triton 3.8 wheel that lacks the new name); the m256 schedule calls
+# .reinterpret, so without this the m256 tiles fail to compile on Triton 3.8.
+from aiter.ops.triton._gluon_kernels.common.utils import sigmoid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _CONV = gl.constexpr(gl.BlockedLayout([1, 1], [1, 64], [4, 2], [1, 0]))
 _OUTPUT = gl.constexpr(gl.BlockedLayout([1, 2], [1, 64], [8, 1], [1, 0]))
 _VECTOR = gl.constexpr(gl.BlockedLayout([2], [64], [8], [0]))
-
-
-@gluon.jit
-def _m1_sigmoid(x):
-    return 1.0 / (1.0 + gl.exp2(x * -1.4426950408889634))
 
 
 @gluon.jit
@@ -857,7 +857,7 @@ def _m256_convolve_head(
         + old2.to(gl.float32) * w2
         + x.to(gl.float32) * w3
     )
-    z = (z * _m1_sigmoid(z)).to(gl.bfloat16)
+    z = (z * sigmoid(z)).to(gl.bfloat16)
     changed0 = old0.to(gl.uint16, bitcast=True) != old1.to(gl.uint16, bitcast=True)
     changed1 = old1.to(gl.uint16, bitcast=True) != old2.to(gl.uint16, bitcast=True)
     changed2 = old2.to(gl.uint16, bitcast=True) != x.to(gl.uint16, bitcast=True)
@@ -1050,11 +1050,11 @@ def _m256_kda_decode(
         else:
             projected = projection.load(decay_layout).to(gl.float32)
         raw = projected + gl.load(DT + h * 128 + dk)
-        decay = gl.exp(lower * _m1_sigmoid(gl.exp(gl.load(A + h)) * raw))
+        decay = gl.exp(lower * sigmoid(gl.exp(gl.load(A + h)) * raw))
         decay = gl.convert_layout(decay, gl.SliceLayout(0, layout))
         q = q * gl.rsqrt(gl.sum(q * q, 0) + 1e-06) * 128 ** (-0.5)
         key = key * gl.rsqrt(gl.sum(key * key, 0) + 1e-06)
-        beta = _m1_sigmoid(gl.load(Beta + m * SB + h).to(gl.float32))
+        beta = sigmoid(gl.load(Beta + m * SB + h).to(gl.float32))
         norm_layout: gl.constexpr = gl.BlockedLayout([2], [64], [NW], [0])
         nv = gl.arange(0, 128, norm_layout)
         weight = gl.amd.cdna4.buffer_load(W, nv).to(gl.float32)
@@ -1197,10 +1197,7 @@ def _m256_kda_decode(
             auxiliary.slice(64, 64).store(pair1.to(gl.bfloat16))
         core = auxiliary.slice(0, 128).load(norm_layout).to(gl.float32)
         out = (
-            core
-            * gl.rsqrt(gl.sum(core * core, 0) / 128 + eps)
-            * weight
-            * _m1_sigmoid(gate)
+            core * gl.rsqrt(gl.sum(core * core, 0) / 128 + eps) * weight * sigmoid(gate)
         )
         gl.store(OUT + m * SO + h * 128 + nv, out)
 
@@ -1251,10 +1248,8 @@ def _m32_convolve(
         + x.to(gl.float32) * w3
     )
     z = gl.where(group[:, None] == 3, x.to(gl.float32), z)
-    sigmoid = _m1_sigmoid(z)
-    z = gl.where(
-        group[:, None] == 3, sigmoid, (z * sigmoid).to(gl.bfloat16).to(gl.float32)
-    )
+    sg = sigmoid(z)
+    z = gl.where(group[:, None] == 3, sg, (z * sg).to(gl.bfloat16).to(gl.float32))
     return z, (old1, old2, x, history, offset * SC2, valid)
 
 
@@ -1320,7 +1315,7 @@ def _m32_publish_decay(
                     )
                     pair = gl.convert_layout(joined, contiguous).to(gl.float32)
                     decay = gl.exp2(
-                        LOWER * _m1_sigmoid(rate * (pair + bias)) * 1.4426950408889634
+                        LOWER * sigmoid(rate * (pair + bias)) * 1.4426950408889634
                     )
                     shared.slice(4, 1).slice((tile - 1) * 32, 64, dim=1).store(
                         gl.reshape(decay, (1, 64))
@@ -1328,7 +1323,7 @@ def _m32_publish_decay(
             else:
                 panel = gl.convert_layout(f.to(gl.float32), contiguous)
                 decay = gl.exp2(
-                    LOWER * _m1_sigmoid(rate * (panel + bias)) * 1.4426950408889634
+                    LOWER * sigmoid(rate * (panel + bias)) * 1.4426950408889634
                 )
                 shared.slice(4, 1).slice(tile * 32, 32, dim=1).store(
                     gl.reshape(decay, (1, 32))
@@ -1343,7 +1338,7 @@ def _m32_publish_decay(
         channel = gl.arange(0, 128, vl)
         dt = gl.load(DT + h * 128 + channel)
         f = staging.load(vl).to(gl.float32)
-        decay = gl.exp2(LOWER * _m1_sigmoid(rate * (f + dt)) * 1.4426950408889634)
+        decay = gl.exp2(LOWER * sigmoid(rate * (f + dt)) * 1.4426950408889634)
         shared.slice(4, 1).store(gl.reshape(decay, (1, 128)))
 
 
@@ -1650,7 +1645,7 @@ def _m64_recurrent_head(
         prediction = _m1_contract(decayed, keys, (0, 2, 1, 3))
         q = gl.sum(shared.slice(0, 1).load(st), 0)
         queries = _m1_split_vector(q, st)
-        beta = _m1_sigmoid(gl.load(X + m * 6336 + 6272 + h).to(gl.float32))
+        beta = sigmoid(gl.load(X + m * 6336 + 6272 + h).to(gl.float32))
         delta = gl.fma(-prediction, knorm, value) * (beta * knorm)
         update_order: gl.constexpr = (3, 2, 1, 0)
         updates = ()

@@ -1,12 +1,8 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.common.utils import sigmoid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-
-@gluon.jit
-def _sigmoid(x):
-    return 1.0 / (1.0 + gl.exp(-x))
 
 
 @gluon.jit
@@ -133,11 +129,11 @@ def _project_decay(
     if BM == 64 and M <= 4096:
         rate = gl.exp(gl.load(A + tile_n // 2))
         raw = acc.to(gl.bfloat16).to(gl.float32) + dt[None, :]
-        decay = gl.exp(lower * _sigmoid(rate * raw))
+        decay = gl.exp(lower * sigmoid(rate * raw))
     else:
         rate = gl.exp(gl.load(A + ni // 128))
         raw = acc.to(gl.bfloat16).to(gl.float32) + dt[None, :]
-        decay = gl.exp(lower * _sigmoid(rate[None, :] * raw))
+        decay = gl.exp(lower * sigmoid(rate[None, :] * raw))
     gl.store(
         Decay + mi[:, None] * (H * 128) + ni[None, :],
         decay,
@@ -260,7 +256,7 @@ def _conv_prepare(
             w = gl.sum(gl.gather(weights, tap, 1), 1)
             w = gl.convert_layout(w, gl.SliceLayout(0, layout), assert_trivial=True)
             z = z + x * w[None, :]
-    z = (z * _sigmoid(z)).to(gl.bfloat16).to(gl.float32)
+    z = (z * sigmoid(z)).to(gl.bfloat16).to(gl.float32)
     if BT == 32 and (
         (M <= 4096 and NS > 1) or (M == 4096 and NS == 1) or (M == 8192 and NS == 8)
     ):
@@ -288,7 +284,7 @@ def _conv_prepare(
         gl.store(Prepared + t[:, None] * (3 * H * 128) + c[None, :], z, t[:, None] < M)
     if part == 2:
         beta_t = tile_start + gl.arange(0, BT, gl.BlockedLayout([1], [64], [4], [0]))
-        beta = _sigmoid(gl.load(Beta + beta_t * SB + h, beta_t < M, 0).to(gl.float32))
+        beta = sigmoid(gl.load(Beta + beta_t * SB + h, beta_t < M, 0).to(gl.float32))
         gl.store(Betas + beta_t * H + h, beta, beta_t < M)
 
 
@@ -1989,7 +1985,7 @@ def _output_panel(
         (valid if DIRECT else r[:, None] < end),
         0,
     ).to(gl.float32)
-    out = core * inv[:, None] * weight[None, :] * _sigmoid(gate)
+    out = core * inv[:, None] * weight[None, :] * sigmoid(gate)
     gl.amd.cdna4.buffer_store(
         out.to(Out.dtype.element_ty),
         Out + (start * H + h) * 128,
