@@ -9,8 +9,9 @@ use tiled BLOCK_N=32 BF16 MFMA scoring plus the stable decode radix for
 prefill and below 32768 columns, and streaming radix for wider decode rows.
 Batches averaging at least two query rows per request (prefill, mixed
 prefill and decode, MTP decode) score 16 rows by 64 columns per workgroup,
-and a prefill workgroup walks four column tiles. The indexer head count is
-4 or 8, each a separate compile.
+and a prefill workgroup walks four column tiles; MTP with 4 heads scores 4
+rows x 4 heads per MFMA instead. The indexer head count is 4 or 8, each a
+separate compile.
 
 ``qsa_sparse_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
 selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
@@ -191,16 +192,17 @@ def _scores_plan(
     )
 
 
-@functools.lru_cache(maxsize=8)
+@functools.lru_cache(maxsize=16)
 def _prefill_scores_plan(
     page_size: int,
     use_k32: bool,
     n_heads: int = _H,
     wide_cache: bool = False,
     k_strides: tuple[int, int, int] | None = None,
+    fold_heads: bool = False,
 ):
     return build_qsa_indexer_prefill_scores_module(
-        page_size, use_k32, n_heads, wide_cache, k_strides
+        page_size, use_k32, n_heads, wide_cache, k_strides, fold_heads=fold_heads
     )
 
 
@@ -240,17 +242,21 @@ _ROWS_SCORER_TILES_PER_WG = 4
 _ROWS_SCORER_MULTI_TILE_MIN_ROWS_PER_REQUEST = 16
 
 
-def _k1_rows_scorer_tiles_per_wg(n_requests: int, rows: int) -> int:
-    """Column tiles each 16-row scorer workgroup walks with one Q staging.
+def _k1_rows_scorer_layout(
+    n_requests: int, rows: int, n_heads: int
+) -> tuple[bool, int]:
+    """``(fold_heads, tiles_per_wg)`` for a 16-row scorer launch.
 
     A prefill tile almost always belongs to one request with long rows, so
-    four tiles reuse Q and the row setup with the grid still full. MTP rows
-    are short and a tile spans several requests: there one tile per
-    workgroup keeps enough workgroups to fill the machine.
+    each workgroup walks four column tiles, reusing Q and the row setup,
+    with the grid still full. MTP has few rows per request, so a 16-row
+    tile spans several requests: there 4 heads fold into the MFMA M axis,
+    a tile is 4 rows, and one column tile per workgroup keeps enough
+    workgroups to fill the machine.
     """
     if rows >= _ROWS_SCORER_MULTI_TILE_MIN_ROWS_PER_REQUEST * n_requests:
-        return _ROWS_SCORER_TILES_PER_WG
-    return 1
+        return False, _ROWS_SCORER_TILES_PER_WG
+    return n_heads == 4, 1
 
 
 @functools.lru_cache(maxsize=1)
@@ -367,9 +373,14 @@ def qsa_indexer_score_and_select(
     k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     if _k1_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
         col_tiles = (n_columns + _ROWS_BLOCK_N - 1) // _ROWS_BLOCK_N
-        tiles_per_wg = _k1_rows_scorer_tiles_per_wg(int(context_lens.shape[0]), m)
+        fold_heads, tiles_per_wg = _k1_rows_scorer_layout(
+            int(context_lens.shape[0]), m, n_heads
+        )
+        tile_rows = 16 // n_heads if fold_heads else 16
         _run_compiled(
-            _prefill_scores_plan(page_size, use_k32, n_heads, wide_cache, k_strides),
+            _prefill_scores_plan(
+                page_size, use_k32, n_heads, wide_cache, k_strides, fold_heads
+            ),
             q,
             k_cache,
             page_table,
@@ -383,7 +394,7 @@ def qsa_indexer_score_and_select(
             int(context_lens.shape[0]),
             float(score_scale),
             int(k_cache.shape[0]),
-            (m + 15) // 16,
+            (m + tile_rows - 1) // tile_rows,
             (col_tiles + tiles_per_wg - 1) // tiles_per_wg,
             tiles_per_wg,
             torch.cuda.current_stream(q.device),
