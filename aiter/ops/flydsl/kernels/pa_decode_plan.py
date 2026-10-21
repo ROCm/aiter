@@ -215,6 +215,9 @@ def plan_pa_decode(
     Larger batches require four LDS bytes per sequence plus scan storage and
     must fit the device's per-block shared-memory capacity.
 
+    ``workgroup_budget=None`` takes twice the CU count; pass
+    ``pa_decode_default_workgroup_budget`` for the shape-aware default.
+
     Lengths include MTP tokens. Positive windows include each query's position;
     0 and -1 disable them. Plans cover the MTP window union: match the window
     and query length when decoding or refreshing. Dense plans ignore query length.

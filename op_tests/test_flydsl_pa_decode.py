@@ -94,105 +94,45 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
 
 
-_NHD_SUPPORTED = {
-    "architecture": "gfx950",
+_NHD_CONFIG = {
     "kv_dtype": torch.float8_e4m3fn,
     "head_dim": 256,
     "block_size": 64,
-    "query_length": 4,
     "query_group_size": 8,
-    "sliding_window": 0,
 }
 
 
-@pytest.fixture
-def nhd_flydsl(monkeypatch):
-    """The installed FlyDSL must meet the NHD minimum; no GPU is needed."""
-    pytest.importorskip("flydsl")
-    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    if not pa.pa_decode_nhd_supported(**_NHD_SUPPORTED):
-        pytest.skip(f"NHD needs flydsl >= {pa.PA_DECODE_NHD_MIN_FLYDSL_VERSION}")
-    return pa
-
-
 @pytest.mark.parametrize(
-    "overrides",
+    "overrides,gfx950_max",
     [
-        {},
-        {"architecture": "gfx950:sramecc+:xnack-"},
-        {"query_length": 1},
-        {"query_length": 1, "query_group_size": 32},
-        {"sliding_window": 4096},
-        {"sliding_window": -1},
-    ],
-    ids=["base", "target-features", "mtp1", "max-rows", "window", "window-off"],
-)
-def test_pa_decode_nhd_supported(overrides, nhd_flydsl):
-    """Page 64, head 256, FP8 on gfx950 within the row budget is supported."""
-    assert nhd_flydsl.pa_decode_nhd_supported(**{**_NHD_SUPPORTED, **overrides})
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"block_size": 16},
-        {"block_size": 128},
-        {"head_dim": 128},
-        {"kv_dtype": torch.bfloat16},
-        {"kv_dtype": torch.float16},
-        {"kv_dtype": torch.float8_e4m3fnuz},
-        {"query_length": 5},
-        {"query_length": 1, "query_group_size": 33},
-        {"query_length": 0},
-        {"sliding_window": -2},
-        {"architecture": "gfx942", "kv_dtype": torch.float8_e4m3fnuz},
-        {"architecture": "gfx1250"},
+        ({}, 4),
+        ({"query_group_size": 16}, 2),
+        ({"query_group_size": 32}, 1),
+        ({"query_group_size": 33}, 0),
+        ({"block_size": 16}, 0),
+        ({"block_size": 128}, 0),
+        ({"head_dim": 128}, 0),
+        ({"kv_dtype": torch.bfloat16}, 0),
+        ({"kv_dtype": torch.float8_e4m3fnuz}, 0),
     ],
     ids=[
+        "gqa8",
+        "gqa16",
+        "gqa32",
+        "gqa33",
         "page16",
         "page128",
         "head128",
         "bf16",
-        "fp16",
-        "fnuz-on-gfx950",
-        "rows40",
-        "rows33",
-        "no-queries",
-        "bad-window",
-        "gfx942",
-        "gfx1250",
+        "fnuz",
     ],
 )
-def test_pa_decode_nhd_unsupported(overrides, nhd_flydsl):
-    """Shapes that ``pa_decode`` rejects with NotImplementedError are False."""
-    assert not nhd_flydsl.pa_decode_nhd_supported(**{**_NHD_SUPPORTED, **overrides})
-
-
-def test_pa_decode_nhd_capability_constants(nhd_flydsl):
-    """The row limit is exact, and the flydsl gate follows the minimum."""
-    rows = nhd_flydsl.PA_DECODE_NHD_MAX_QUERY_ROWS
-    assert rows == 32
-    at_limit = {**_NHD_SUPPORTED, "query_length": 1, "query_group_size": rows}
-    assert nhd_flydsl.pa_decode_nhd_supported(**at_limit)
-    assert not nhd_flydsl.pa_decode_nhd_supported(
-        **{**at_limit, "query_group_size": rows + 1}
-    )
-    flydsl_pkg = importlib.import_module("aiter.ops.flydsl")
-    for name in (
-        "pa_decode_nhd_supported",
-        "pa_decode_default_workgroup_budget",
-        "PA_DECODE_NHD_MAX_QUERY_ROWS",
-        "PA_DECODE_NHD_MIN_FLYDSL_VERSION",
-    ):
-        assert getattr(flydsl_pkg, name) is getattr(nhd_flydsl, name)
-
-
-@pytest.mark.parametrize(
-    "version,expected", [("0.3.9", False), ("0.4.0", True), ("0.4.1+local", True)]
-)
-def test_pa_decode_nhd_min_flydsl_version(version, expected, nhd_flydsl, monkeypatch):
-    monkeypatch.setattr(nhd_flydsl, "installed_flydsl_version", version)
-    assert nhd_flydsl.pa_decode_nhd_supported(**_NHD_SUPPORTED) is expected
+def test_pa_decode_nhd_max_query_length(overrides, gfx950_max, device):
+    """NHD runs gfx950 FP8 head 256 page 64 with at most 32 query rows."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    expected = gfx950_max if get_gfx_runtime() == "gfx950" else 0
+    config = {**_NHD_CONFIG, **overrides}
+    assert pa.pa_decode_nhd_max_query_length(device, **config) == expected
 
 
 @pytest.mark.parametrize(
@@ -205,16 +145,16 @@ def test_pa_decode_nhd_min_flydsl_version(version, expected, nhd_flydsl, monkeyp
         ({"head_dim": 128}, False),
         ({"query_group_size": 16}, False),
         ({"kv_dtype": torch.bfloat16}, False),
-        ({"architecture": "gfx942", "kv_dtype": torch.float8_e4m3fnuz}, False),
     ],
 )
-def test_pa_decode_default_workgroup_budget(overrides, one_cta_per_cu):
+def test_pa_decode_default_workgroup_budget(overrides, one_cta_per_cu, device):
     """Dense page-64 head-256 FP8 pipe shapes get one CTA per CU, else two."""
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    budget = pa.pa_decode_default_workgroup_budget(
-        num_compute_units=256, **{**_NHD_SUPPORTED, **overrides}
-    )
-    assert budget == (256 if one_cta_per_cu else 512)
+    config = {**_NHD_CONFIG, "query_length": 4, **overrides}
+    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    one_cta_per_cu = one_cta_per_cu and get_gfx_runtime() == "gfx950"
+    budget = pa.pa_decode_default_workgroup_budget(device, **config)
+    assert budget == (num_cu if one_cta_per_cu else 2 * num_cu)
 
 
 @pytest.mark.parametrize(
@@ -263,17 +203,6 @@ def test_prepare_pa_decode_plan_default_budget(shape, device, tmp_path, monkeypa
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
     one_cta_per_cu = arch == "gfx950" and shape in ("page64", "nhd")
     assert plan.capacity == (num_cu if one_cta_per_cu else 2 * num_cu)
-    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    assert plan.capacity == pa.pa_decode_default_workgroup_budget(
-        architecture=arch,
-        num_compute_units=num_cu,
-        kv_dtype=fp8,
-        head_dim=dim,
-        block_size=page,
-        query_length=query_length,
-        query_group_size=group,
-        sliding_window=window,
-    )
 
 
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
@@ -1021,14 +950,12 @@ def test_pa_decode(case, device, monkeypatch):
             if mode == "python":
                 key_scale, value_scale = 0.25, 2.0
     if nhd:
-        assert pa.pa_decode_nhd_supported(
-            architecture=arch,
+        assert query_length <= pa.pa_decode_nhd_max_query_length(
+            device,
             kv_dtype=compute_type,
             head_dim=dim,
             block_size=page,
-            query_length=query_length,
             query_group_size=group_size,
-            sliding_window=window,
         )
     logical_key = key.float() * (1.0 if key_scale is None else key_scale)
     logical_value = value.float() * (1.0 if value_scale is None else value_scale)
@@ -1167,13 +1094,8 @@ def test_pa_decode_nhd_rejected(variant, device, monkeypatch):
     table = torch.zeros((1, 1), dtype=torch.int32, device=device)
     scale = torch.ones(1, dtype=torch.float32, device=device)
     plan = pa.plan_pa_decode(context, 1, max_partitions=1, query_length=query_length)
-    assert not pa.pa_decode_nhd_supported(
-        architecture=arch,
-        kv_dtype=dtype,
-        head_dim=256,
-        block_size=page,
-        query_length=query_length,
-        query_group_size=8,
+    assert query_length > pa.pa_decode_nhd_max_query_length(
+        device, kv_dtype=dtype, head_dim=256, block_size=page, query_group_size=8
     )
     with pytest.raises(NotImplementedError, match="NHD"):
         pa.pa_decode(
