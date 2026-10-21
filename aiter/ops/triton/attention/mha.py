@@ -1087,9 +1087,11 @@ def flash_attn_func(
             raise ValueError(
                 "Block-scale FP8 attention is supported on the triton backend only."
             )
-        from aiter.ops.triton.attention.fp8_attention import flash_attn_block_scale
+        from aiter.ops.triton.attention.block_scale_fp8_attention import (
+            block_scale_fp8_attention,
+        )
 
-        return flash_attn_block_scale(
+        return block_scale_fp8_attention(
             q,
             k,
             v,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness tests for the FP8 Flash Attention v2 kernel.
+"""Correctness tests for the block-scale FP8 Flash Attention v2 kernel.
 
 Covers:
   * non-FP8 forward (USE_FP8=False) vs PyTorch
@@ -18,12 +18,13 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
-from aiter.ops.triton.attention.fp8_attention import (
+from aiter.ops.triton.attention.block_scale_fp8_attention import (
     _bwd_kernel_dkdv,
     _bwd_kernel_dq,
     _bwd_preprocess_use_o,
     attn_fwd,
     get_padded_headsize,
+    pad_scale_block_count,
 )
 from aiter.ops.triton.attention.mha import flash_attn_func
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -202,7 +203,7 @@ def _attn_fwd(
         stride_kdescale_z=stride_kdz,
         stride_kdescale_h=n_k_blocks if use_fp8 else 0,
         stride_kdescale_m=stride_kdm,
-        padded_kscale_block_num=padded_k,
+        padded_kscale_block_num=pad_scale_block_count(padded_k),
         cu_seqlens_q=None,
         cu_seqlens_k=None,
         dropout_p=0.0,
@@ -368,7 +369,7 @@ def _attn_bwd(
         stride_kscalem=stride_ksm,
         padded_doscale_block_num=padded_do,
         padded_qscale_block_num=padded_q,
-        padded_kscale_block_num=padded_k,
+        padded_kscale_block_num=pad_scale_block_count(padded_k),
         Z=b,
         HQ=hq,
         HK=hk,
@@ -410,7 +411,7 @@ def _attn_bwd(
 )
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_fp8_attn_fwd_nofp8(B, HQ, HK, S_q, S_k, D, causal, dtype):
+def test_block_scale_fp8_attn_fwd_nofp8(B, HQ, HK, S_q, S_k, D, causal, dtype):
     """attn_fwd with USE_FP8=False matches PyTorch reference."""
     if causal and S_q != S_k:
         pytest.skip("causal requires S_q == S_k")
@@ -437,10 +438,12 @@ def test_fp8_attn_fwd_nofp8(B, HQ, HK, S_q, S_k, D, causal, dtype):
     [
         (1, 4, 4, 64, 64),
         (1, 8, 2, 64, 128),  # GQA
+        (2, 4, 4, 128, 128),  # batch=2, two scale blocks
+        (1, 4, 4, 192, 64),  # three scale blocks
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
-def test_fp8_attn_fwd_fp8(B, HQ, HK, S, D, causal):
+def test_block_scale_fp8_attn_fwd_fp8(B, HQ, HK, S, D, causal):
     """attn_fwd with USE_FP8=True matches PyTorch on dequantized Q/K/V.
 
     Uses the arch-native FP8 dtype (e4m3fnuz on gfx942, e4m3fn on gfx950).
@@ -487,11 +490,13 @@ def test_fp8_attn_fwd_fp8(B, HQ, HK, S, D, causal):
     [
         (1, 4, 4, 64, 64),
         (1, 8, 2, 64, 64),  # GQA
+        (2, 4, 4, 128, 128),  # batch=2, two scale blocks
+        (1, 4, 4, 192, 64),  # three scale blocks
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("use_fp8", [False, True])
-def test_fp8_attn_bwd(B, HQ, HK, S, D, causal, use_fp8):
+def test_block_scale_fp8_attn_bwd(B, HQ, HK, S, D, causal, use_fp8):
     """Backward preprocess / dq / dkdv match autograd.
 
     use_fp8=True exercises the arch-native FP8 dtype path.
