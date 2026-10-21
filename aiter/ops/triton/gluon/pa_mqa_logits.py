@@ -97,6 +97,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     ARCH: gl.constexpr = "gfx942",
     PERSISTENT: gl.constexpr = False,
     PERSISTENT_NEXT_N: gl.constexpr = 1,
+    ContextLenStride: gl.constexpr = 1,
 ):
     IS_GFX1250: gl.constexpr = ARCH == "gfx1250"
     if PERSISTENT:
@@ -118,7 +119,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         pid_next_n, remain_pid = remain_pid % next_n, remain_pid // next_n
         pid_batch, pid_split_kv = remain_pid % batch_size, remain_pid // batch_size
 
-        context_length = gl.load(context_len_ptr + pid_batch)
+        context_length = gl.load(
+            context_len_ptr + pid_batch * ContextLenStride + ContextLenStride - 1
+        )
 
         context_chunk_num = tl.cdiv(context_length, ChunkK)
         split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
@@ -572,6 +575,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     ARCH: gl.constexpr = "gfx942",
     PERSISTENT: gl.constexpr = False,
     PERSISTENT_NEXT_N: gl.constexpr = 1,
+    ContextLenStride: gl.constexpr = 1,
 ):
     IS_GFX1250: gl.constexpr = ARCH == "gfx1250"
     if PERSISTENT:
@@ -662,7 +666,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         pid = tl.program_id(0)
         pid_batch, remain_pid = pid % batch_size, pid // batch_size
         pid_next_n, pid_split_kv = remain_pid % next_n, remain_pid // next_n
-        context_length = gl.load(context_len_ptr + pid_batch)
+        context_length = gl.load(
+            context_len_ptr + pid_batch * ContextLenStride + ContextLenStride - 1
+        )
 
         context_chunk_num = tl.cdiv(context_length, ChunkK)
         split_context_chunk_num = context_chunk_num // SplitKV
@@ -835,7 +841,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         pid_batch, remain_pid = pid % batch_size, pid // batch_size
         pid_next_n, pid_split_kv = remain_pid % next_n, remain_pid // next_n
         # ===---------------------------------------------------
-        context_length = gl.load(context_len_ptr + pid_batch)
+        context_length = gl.load(
+            context_len_ptr + pid_batch * ContextLenStride + ContextLenStride - 1
+        )
 
         context_chunk_num = tl.cdiv(context_length, ChunkK)
         split_context_chunk_num = context_chunk_num // SplitKV
@@ -1684,6 +1692,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     KVBlockSize: tl.constexpr = 16,
     CDNA_VERSION: gl.constexpr = 3,
     ARCH: gl.constexpr = "gfx942",
+    ContextLenStride: gl.constexpr = 1,
 ):
     # ===---------------------------------------------------
     # Gluon Layout
@@ -1755,7 +1764,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     safe_chunks_per_cta = gl.load(safe_chunks_per_cta_ptr)
 
     pid_batch = 0
-    context_length = gl.load(context_len_ptr + pid_batch)
+    context_length = gl.load(
+        context_len_ptr + pid_batch * ContextLenStride + ContextLenStride - 1
+    )
 
     cur_batch_chunk_num = tl.cdiv(context_length, ChunkK)
     cur_batch_cta_count = tl.cdiv(cur_batch_chunk_num, safe_chunks_per_cta)
@@ -1764,7 +1775,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         pid_split_kv -= cur_batch_cta_count * next_n
         pid_batch += 1
         context_length = gl.load(
-            context_len_ptr + pid_batch, mask=pid_batch < batch_size, other=0
+            context_len_ptr + pid_batch * ContextLenStride + ContextLenStride - 1,
+            mask=pid_batch < batch_size,
+            other=0,
         )
         cur_batch_chunk_num = tl.cdiv(context_length, ChunkK)
         cur_batch_cta_count = tl.cdiv(cur_batch_chunk_num, safe_chunks_per_cta)

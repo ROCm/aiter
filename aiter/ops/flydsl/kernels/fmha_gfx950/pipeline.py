@@ -190,8 +190,8 @@ def _scale_sub_score_pair(v_s, row_max_raw, scale, zero_f, fm_fast, bias=None):
         # exp2 lands on 2**bias * P instead of P, at no extra instruction: the
         # FMA's addend absorbs it.
         neg_scaled_max = neg_scaled_max + bias
-    scale_v = Vec.from_elements([scale], fx.Float32).broadcast_to(16)
-    nsm_v = Vec.from_elements([neg_scaled_max], fx.Float32).broadcast_to(16)
+    scale_v = fx.full(16, fx.Float32(scale), fx.Float32)
+    nsm_v = fx.full(16, fx.Float32(neg_scaled_max), fx.Float32)
     lo = fx.fma(Vec(s_lo), scale_v, nsm_v, fastmath=fm_fast)
     hi = fx.fma(Vec(s_hi), scale_v, nsm_v, fastmath=fm_fast)
     return as_mlir_value(lo), as_mlir_value(hi)
@@ -213,7 +213,7 @@ def _exp2_score_slice(v_s, start):
 
 
 def _scale_o_accs(v_o, scale_scalar, traits):
-    scale_vec = Vec.from_elements([scale_scalar], fx.Float32).broadcast_to(16)
+    scale_vec = fx.full(16, fx.Float32(scale_scalar), fx.Float32)
     for dc in range_constexpr(traits.D_CHUNKS):
         v_o[dc] = Vec(v_o[dc]) * scale_vec
 
@@ -262,7 +262,7 @@ def _cu_load(div, idx, cu_atom, cu_v1i32):
         [cu_v1i32], cu_atom, fx.slice(div, (None, fx.Int32(idx)))
     )
     return fx.Index(
-        rocdl.readfirstlane(T.i32, as_mlir_value(fx.Int32(Vec(v, (1,), fx.Int32)[0])))
+        rocdl.readfirstlane(T.i32, as_mlir_value(Vec(v, (1,), fx.Int32)[0]))
     )
 
 
@@ -343,7 +343,7 @@ def _buffer_store_128(
 @flyc.jit
 def _stagger_extra_barrier_if_one(stagger_i32):
     """Emit `sched_barrier(0); s_barrier;` only when stagger == 1."""
-    if fx.Int32(stagger_i32) != fx.Int32(0):
+    if fx.Int32(stagger_i32) != 0:
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
 
@@ -737,7 +737,7 @@ class DualwaveFp8KernelContext:
         self.c_neg_floor = fx.Float32(-3.0e38)
         self.c_zero_f = fx.Float32(0.0)
         self.c_rescale_thr_f = fx.Float32(traits.DUALWAVE_SWP_RESCALE_THRESHOLD)
-        self.c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
+        self.c_zero_v16f32 = fx.full(16, 0.0, fx.Float32)
 
     def init_runtime_indices(self):
         traits = self.traits
@@ -881,7 +881,7 @@ class DualwaveFp8KernelContext:
                 _atom,
                 fx.slice(_div, (None, fx.Int32(0))),
             )
-            return fx.Float32(Vec(_v, (1,), fx.Float32)[0])
+            return Vec(_v, (1,), fx.Float32)[0]
 
         c_log2e_f = fx.Float32(_LOG2E)
         c_sm_scale_log2e = self.softmax_scale * c_log2e_f
@@ -966,7 +966,7 @@ class DualwaveFp8KernelContext:
             self.ws_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
 
     def ws_store_f32(self, f32_val, elem_index):
-        pack = Vec.from_elements([fx.Float32(f32_val)], fx.Float32).bitcast(fx.Int32)
+        pack = Vec.from_elements([f32_val], fx.Float32).bitcast(fx.Int32)
         fx.memref_store_vec(pack, self.ws_store_reg_32)
         fx.copy(
             self.ws_store_atom_32,
@@ -975,7 +975,7 @@ class DualwaveFp8KernelContext:
         )
 
     def ws_store_quad_i32(self, dwords, elem_index):
-        pack = Vec.from_elements([fx.Int32(v) for v in dwords], fx.Int32)
+        pack = Vec.from_elements(dwords, fx.Int32)
         fx.memref_store_vec(pack, self.ws_store_reg_128)
         fx.copy(
             self.store_atom_128,
