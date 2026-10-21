@@ -721,8 +721,12 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
       2. validates that the auto (K-split) cache matches the pure-torch reference;
       3. validates the forced-legacy (NW=1) cache matches the reference too when
          that path is supported, so the two wave layouts are cross-checked
-         against a common oracle. gfx1250 natural FP4 intentionally requires
-         K-split and therefore skips only this legacy sub-check.
+         against a common oracle.
+
+    On gfx1250, quant_mode="fp4" always runs the one-wave FP4 kernel
+    (``_build_kernel_fp4``) and ignores ``k_split_num_waves``, so for
+    ``csa_indexer_fp4`` this test checks that kernel against the reference and
+    skips the legacy sub-check.
     """
     if get_gfx() == "gfx942":
         aiter.logger.info("gfx942 unsupported for fp8/fp4 indexer scatter")
@@ -819,8 +823,7 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
     )
 
     # (3) Forced-legacy (NW=1, single-wave) on fresh inputs vs the same ref.
-    # Natural FP4 on gfx1250 is K-split-only: its single-wave reduction is not
-    # a supported production path, so retain the oracle check without forcing it.
+    # gfx1250 FP4 has one kernel, so there is no second wave layout to check.
     if not (get_gfx() == "gfx1250" and quant_mode == "fp4"):
         leg_inp = dict(inp)
         leg_inp["kv_cache"] = torch.zeros_like(inp["kv_cache"])
