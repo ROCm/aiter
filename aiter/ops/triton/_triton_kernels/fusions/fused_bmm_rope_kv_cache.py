@@ -1038,6 +1038,21 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 )
 
 
+def _get_fp4_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    # Own config family: the fused BMM + RoPE grid prefers different tiles
+    # than the standalone batched_gemm_a16wfp4 kernel.
+    return get_gemm_config(
+        "FUSED-FP4-BMM-ROPE-CAT-AND-CACHE-MLA",
+        M,
+        N,
+        2 * K,
+    )
+
+
 def _get_fp8_config(
     M: int,
     N: int,

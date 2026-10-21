@@ -398,10 +398,7 @@ def build_topk_per_row_small_k_module(
             above = _ugt(key, cut)
             tied = key == cut
             tie_rank = Int32(
-                fx.math.ctpop(
-                    fly_rocdl.ballot(T.i64, tied)
-                    & ((Int64(1) << Int64(lane)) - Int64(1))
-                )
+                fx.math.ctpop(fly_rocdl.ballot(T.i64, tied) & ((1 << Int64(lane)) - 1))
             )
             quota = top_k - Int32(fx.math.ctpop(fly_rocdl.ballot(T.i64, above)))
             chosen = fly_rocdl.ballot(T.i64, above | (tied & (tie_rank < quota)))
@@ -415,10 +412,10 @@ def build_topk_per_row_small_k_module(
         # Both tests are needed: the chunk mask bounds the buffer, the cut keeps
         # the count near k so the ranking below stays short.
         cut = state[_ST_CUT]
-        mask = (Int64(state[_ST_MASK_HI]) << Int64(32)) | (
+        mask = (Int64(state[_ST_MASK_HI]) << 32) | (
             Int64(state[_ST_MASK_LO]) & Int64(0xFFFFFFFF)
         )
-        in_chosen = ((mask >> Int64(lane)) & Int64(1)) == Int64(1)
+        in_chosen = ((mask >> Int64(lane)) & 1) == 1
         for slot in range_constexpr(elems_per_thread):
             col = col_of(slot // _VEC, slot % _VEC)
             if in_chosen & _uge(ords[slot] ^ neg_inf, cut) & (col < row_len):

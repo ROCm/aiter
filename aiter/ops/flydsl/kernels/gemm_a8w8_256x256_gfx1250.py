@@ -377,7 +377,7 @@ def launch_gemm_a8w8_256x256(
                         + fx.Int32(local_y) * cluster_m
                         + cluster_plane
                     )
-                    mask = fx.Int32(1) << fx.Int32(rocdl.readfirstlane(T.i32, flat_wg))
+                    mask = 1 << fx.Int32(rocdl.readfirstlane(T.i32, flat_wg))
             inner_bound = mn_oob if const_expr(owner == 2 and not mx32) else None
             desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=tensor,
@@ -415,8 +415,8 @@ def launch_gemm_a8w8_256x256(
                 fx.Int32(global_step),
             )
 
-        dgroup0 = Vec.filled(4, 0, fx.Int32)
-        dgroup1 = Vec.filled(8, 0, fx.Int32)
+        dgroup0 = fx.full(4, 0, fx.Int32)
+        dgroup1 = fx.full(8, 0, fx.Int32)
         tdm_lds_step, tdm_global_step = fx.Int32(0), fx.Int32(0)
         if wave == 0:
             dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(0)
@@ -429,9 +429,9 @@ def launch_gemm_a8w8_256x256(
 
         tdm_desc = tdm_ops.TDMDescriptor2D(as_ir_value(dgroup0), as_ir_value(dgroup1))
         tdm_base_lds, tdm_base_lo, tdm_base_hi = (
-            fx.Int32(dgroup0[1]),
-            fx.Int32(dgroup0[2]),
-            fx.Int32(dgroup0[3]),
+            dgroup0[1],
+            dgroup0[2],
+            dgroup0[3],
         )
 
         def _prepare_tdm(slot, tile_delta, sa_panel=0, sa_refill=1):

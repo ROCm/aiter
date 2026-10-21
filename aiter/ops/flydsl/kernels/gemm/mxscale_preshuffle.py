@@ -46,7 +46,7 @@ _SC1 = 16
 def _load_partial(base_i64, dword_off):
     """Device-scope i32 load of a split-K partial at base + dword_off * 4: the
     last-arriving block may sit on another XCD than the block that wrote it."""
-    return load_i32_global_agent(fx.Int64(base_i64) + fx.Int64(dword_off) * fx.Int64(4))
+    return load_i32_global_agent(fx.Int64(base_i64) + fx.Int64(dword_off) * 4)
 
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
@@ -108,7 +108,7 @@ def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves, pair):
         T.i32, address_space=fx.AddressSpace.Global, alignment=16
     )
     off_i64 = fx.Int64(col_base)
-    base_iter = fx.inttoptr(i32_ptr_ty, arg_bq_addr + off_i64 * fx.Int64(4))
+    base_iter = fx.inttoptr(i32_ptr_ty, arg_bq_addr + off_i64 * 4)
     shape = (4, 16, k_tiles, k_halves, pair, 4)
     strides = (64, 4, k_halves * pair * 256, pair * 256, 256, 1)
     view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, strides)))
@@ -462,9 +462,7 @@ def _launch_gemm_impl(
             arg_b = arg_b + bz * fx.Int64(N * b_row_bytes)
             if const_expr(sca_batch_stride < 0):
                 sc_bstride = (
-                    fx.Int64((i32_m + 31) // 32)
-                    * fx.Int64(_scale_chunk_dw_a)
-                    * fx.Int64(4)
+                    fx.Int64((i32_m + 31) // 32) * fx.Int64(_scale_chunk_dw_a) * 4
                 )
                 arg_scale_a = arg_scale_a + bz * sc_bstride
             else:
@@ -651,11 +649,9 @@ def _launch_gemm_impl(
             a_sc_nrec = (
                 fx.Int64(_a_sc_chunks - 1) * fx.Int64(sca_rstride)
                 + fx.Int64(_scale_chunk_dw_a)
-            ) * fx.Int64(4)
+            ) * 4
         else:
-            a_sc_nrec = (
-                fx.Int64(_a_sc_chunks) * fx.Int64(_scale_chunk_dw_a) * fx.Int64(4)
-            )
+            a_sc_nrec = fx.Int64(_a_sc_chunks) * fx.Int64(_scale_chunk_dw_a) * 4
         b_sc_nrec = fx.Int64(_b_sc_rows * _scale_chunk_dw_b * 4)
         sa_flat = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(
@@ -737,7 +733,7 @@ def _launch_gemm_impl(
                 b_wave_n = wave * (BN // num_waves)
                 # v_perm pool = {hi:lo}; selector byte b+4 picks hi.byte(b), b picks
                 # lo.byte(b), 0x0C gives 0. Lane l reads 32-K group b = l // 16.
-                sc_sel = fx.Int32(0x0C0C0000) + lane_div_16 * 256 + lane_div_16 + 4
+                sc_sel = 0x0C0C0000 + lane_div_16 * 256 + lane_div_16 + 4
 
                 def dma_scale_slice(kt_c, j, buf):
                     """Slice j of the chunk starting at K-tile kt_c into buffer buf."""
@@ -951,7 +947,7 @@ def _launch_gemm_impl(
                     if const_expr(k_halves == 4):
                         v = Vec(frag.load()).bitcast(Int32)[0]
                     elif const_expr(k_halves == 2):
-                        v = fx.Int16(Vec(frag.load()).bitcast(Int16)[0]).to(Int32)
+                        v = Vec(frag.load()).bitcast(Int16)[0].to(Int32)
                     else:
                         v = fx.Uint8(Vec(frag.load())[0]).to(Int32)
                     words = []
@@ -990,8 +986,8 @@ def _launch_gemm_impl(
                         )
                         t = fx.make_rmem_tensor(B_NDW, Int32)
                         t.store(
-                            Vec(fx.memref_load_vec(lo)).shuffle(
-                                Vec(fx.memref_load_vec(hi)), list(range(B_NDW))
+                            fx.memref_load_vec(lo).shuffle(
+                                fx.memref_load_vec(hi), list(range(B_NDW))
                             )
                         )
                         ops.append(t)
@@ -1116,7 +1112,7 @@ def _launch_gemm_impl(
             rocdl.sched_barrier(0)
 
         accs_init = [
-            Vec.filled(4, 0.0, Float32).ir_value() for _ in range_constexpr(n_acc)
+            fx.full(4, 0.0, Float32).ir_value() for _ in range_constexpr(n_acc)
         ]
 
         # Double-buffered LDS-A: prefetch tile iv+1 into the other buffer while MFMAs compute
@@ -1208,7 +1204,7 @@ def _launch_gemm_impl(
             c_addr = arg_c
             if const_expr(batch > 1):
                 c_bstride = (
-                    fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
+                    fx.Int64(i32_m) * fx.Int64(N) * 2
                     if c_batch_stride < 0
                     else fx.Int64(c_batch_stride)
                 )
@@ -1258,14 +1254,14 @@ def _launch_gemm_impl(
             for ni in range_constexpr(num_acc_n):
                 col = col_w + ni * 16
                 acc_f32 = Vec(accs[ni])
-                if lane_div_16 == fx.Int32(0):
+                if lane_div_16 == 0:
                     peer_bits = rocdl.ds_bpermute(
                         T.i32,
-                        (lane ^ fx.Int32(1)) * fx.Int32(4),
+                        (lane ^ 1) * 4,
                         acc_f32[0].bitcast(fx.Int32),
                     )
                     peer = fx.Int32(peer_bits).bitcast(Float32)
-                    if lane_mod_16 % fx.Int32(2) == fx.Int32(0):
+                    if lane_mod_16 % 2 == 0:
                         cf = fx.make_rmem_tensor(2, store_elem)
                         cf.store(
                             Vec.from_elements([acc_f32[0], peer], Float32).to(
@@ -1301,18 +1297,18 @@ def _launch_gemm_impl(
             rocdl.s_waitcnt(0)
             gpu.barrier()
             arrival = fx.Int32(-1)
-            if tid == fx.Int32(0):
+            if tid == 0:
                 tile_idx = (bx_m // BM) * (i32_n // BN) + by_n // BN
                 arrival = fx.Int32(
                     atomic_add_agent(
-                        arg_semaphore + fx.Int64(tile_idx) * fx.Int64(4), fx.Int32(1)
+                        arg_semaphore + fx.Int64(tile_idx) * 4, fx.Int32(1)
                     )
                 )
             if const_expr(multi_row_tile or fused_f32):
                 # Reuse A LDS after the GEMM to broadcast the winning arrival
                 # to every wave.  All waves then share the M*BN reduction; a
                 # single wave becomes the bottleneck by M=8/16.
-                if tid == fx.Int32(0):
+                if tid == 0:
                     fx.ptr_store(arrival, sA0_i32)
                 gpu.barrier()
                 arrival = fx.Int32(fx.ptr_load(sA0_i32))
@@ -1337,7 +1333,7 @@ def _launch_gemm_impl(
                             )
                         ),
                         max_size=False,
-                        num_records_bytes=fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2),
+                        num_records_bytes=fx.Int64(i32_m) * fx.Int64(N) * 2,
                     ),
                     fx.make_layout(1, 1),
                 )
@@ -1376,7 +1372,7 @@ def _launch_gemm_impl(
 
                     mn = fx.Int64(i32_m) * fx.Int64(N)
                     part_q = _quads(arg_c, Float32, mn * fx.Int64(4 * k_batch))
-                    out_q = _quads(arg_out, BFloat16, mn * fx.Int64(2))
+                    out_q = _quads(arg_out, BFloat16, mn * 2)
                     part_copy = fx.make_copy_atom(
                         fx.rocdl.BufferCopy128b(_SC1), Float32
                     )
@@ -1391,7 +1387,7 @@ def _launch_gemm_impl(
                             + by_n // fx.Int32(quad)
                             + q_idx % fx.Int32(quads_per_row)
                         )
-                        reduced = Vec.filled(quad, 0.0, Float32)
+                        reduced = fx.full(quad, 0.0, Float32)
                         for sk in range_constexpr(k_batch):
                             frag = fx.make_rmem_tensor(quad_l, Float32)
                             fx.copy_atom_call(
@@ -1416,7 +1412,7 @@ def _launch_gemm_impl(
                             + by_n
                             + pair_in_row * fx.Int32(reduce_vec)
                         )
-                        reduced = fx.Vector.filled(reduce_vec, 0.0, Float32)
+                        reduced = fx.full(reduce_vec, 0.0, Float32)
                         for sk in range_constexpr(k_batch):
                             partial_dw = fx.Int32(
                                 _load_partial(
@@ -1434,7 +1430,7 @@ def _launch_gemm_impl(
                         fx.copy(reduce_copy, result, out_flat[None, out_off])
                 elif tid < fx.Int32(BN // reduce_vec):
                     out_off = by_n + tid * fx.Int32(reduce_vec)
-                    reduced = fx.Vector.filled(reduce_vec, 0.0, Float32)
+                    reduced = fx.full(reduce_vec, 0.0, Float32)
                     for sk in range_constexpr(k_batch):
                         partial_dw = fx.Int32(
                             _load_partial(
@@ -1450,7 +1446,7 @@ def _launch_gemm_impl(
                     fx.memref_store_vec(reduced.truncf(vec_bf16), result)
                     fx.copy(reduce_copy, result, out_flat[None, out_off])
 
-                if tid == fx.Int32(0):
+                if tid == 0:
                     tile_idx = (bx_m // BM) * (i32_n // BN) + by_n // BN
                     sem_ptr_ty = fx.PointerType.get(
                         Int32.ir_type,
@@ -1459,7 +1455,7 @@ def _launch_gemm_impl(
                     )
                     sem_ptr = fx.inttoptr(
                         sem_ptr_ty,
-                        arg_semaphore + fx.Int64(tile_idx) * fx.Int64(4),
+                        arg_semaphore + fx.Int64(tile_idx) * 4,
                     )
                     fx.ptr_store(fx.Int32(0), sem_ptr)
 
@@ -1771,15 +1767,13 @@ def launch_splitk_reduce(
             )
             return fx.logical_divide(buf, frag_layout)
 
-        in_t = _tiled(
-            tmp, Float32, fx.Int64(slab_dw_i) * fx.Int64(split_k) * fx.Int64(4)
-        )
-        out_t = _tiled(out, out_elem, fx.Int64(n_out_dw_i) * fx.Int64(4))
+        in_t = _tiled(tmp, Float32, fx.Int64(slab_dw_i) * fx.Int64(split_k) * 4)
+        out_t = _tiled(out, out_elem, fx.Int64(n_out_dw_i) * 4)
         in_copy = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), Float32)  # 2 x f32
         out_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), out_elem)  # 2 x 16b
 
         if vt < n_out_dw_i:
-            acc = Vec.filled(_REDUCE_VEC, 0.0, Float32)
+            acc = fx.full(_REDUCE_VEC, 0.0, Float32)
             for sk in range_constexpr(split_k):
                 frag = fx.make_rmem_tensor(frag_layout, Float32)
                 fx.copy_atom_call(

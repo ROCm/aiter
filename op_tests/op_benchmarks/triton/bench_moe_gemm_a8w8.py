@@ -1,7 +1,6 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-import argparse
 import csv
 import inspect
 import tempfile
@@ -23,6 +22,7 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -420,7 +420,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",
