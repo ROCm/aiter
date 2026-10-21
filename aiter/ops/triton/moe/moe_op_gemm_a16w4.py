@@ -101,9 +101,12 @@ def get_kernel_config_triton(m, n, k, routing_data):
 
     # Entries carry no BLOCK_SIZE_M: block_m is the dispatch key, not a
     # tunable, because routing fixes it for the layer.
-    tuned = get_moe_dispatch("A16W4", get_arch(), "triton").get(
-        f"bm{block_m}_n{n}_k{k}"
-    )
+    # Triton < 3.8 uses the previous bm128_n5120_k768 row.
+    arch = get_arch()
+    key = f"bm{block_m}_n{n}_k{k}"
+    if key == "bm128_n5120_k768" and Version(triton.__version__) < Version("3.8"):
+        key = f"{key}_lt38"
+    tuned = get_moe_dispatch("A16W4", arch, "triton").get(key)
     if tuned is not None:
         config = {
             "block_m": block_m,
@@ -119,19 +122,6 @@ def get_kernel_config_triton(m, n, k, routing_data):
             "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
             "kpack": tuned.get("kpack", 1),
         }
-        # Below 3.8, bm128_n5120_k768 stays on the #5667 row. nonkdim 16
-        # fails LLVM lowering on 3.6, and stages=1 / waves=0 / kpack=2
-        # is slower than that row on 3.6 and 3.7.
-        if (
-            block_m == 128
-            and n == 5120
-            and k == 768
-            and Version(triton.__version__) < Version("3.8")
-        ):
-            config["num_stages"] = 2
-            config["waves_per_eu"] = 2
-            config["matrix_instr_nonkdim"] = 32
-            config["kpack"] = 1
         return config
 
     num_stages = 1
@@ -177,7 +167,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "split_k": split_k,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 2 if block_m <= 32 else 1,
+        "kpack": 2 if arch == "gfx942" and block_m <= 32 else 1,
     }
     return ret
 
