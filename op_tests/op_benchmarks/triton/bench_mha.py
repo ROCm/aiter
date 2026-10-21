@@ -369,7 +369,7 @@ def model_benchmark_configs(
             if config["num_key_value_heads"] is None
             else config["num_key_value_heads"]
         )
-        HEAD_DIM = config["hidden_size"] // HQ
+        HEAD_DIM = config.get("head_dim", config["hidden_size"] // HQ)
         if args.sq:
             b = args.b if args.b else 1
             causal = args.causal if args.causal is not None else True
