@@ -5,9 +5,11 @@ from triton.experimental import gluon
 
 # Compat: AMD's Triton fork exports get_scaled_upcast_fp4_scale_layout at
 # gl.amd; upstream tri-main only exports it from gl.amd.cdna4.
-if not hasattr(gl.amd, "get_scaled_upcast_fp4_scale_layout"):
-    if hasattr(gl.amd.cdna4, "get_scaled_upcast_fp4_scale_layout"):
-        gl.amd.get_scaled_upcast_fp4_scale_layout = gl.amd.cdna4.get_scaled_upcast_fp4_scale_layout
+if (
+    not hasattr(gl.amd, "get_scaled_upcast_fp4_scale_layout")
+    and hasattr(gl.amd.cdna4, "get_scaled_upcast_fp4_scale_layout")
+):
+    gl.amd.get_scaled_upcast_fp4_scale_layout = gl.amd.cdna4.get_scaled_upcast_fp4_scale_layout
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
