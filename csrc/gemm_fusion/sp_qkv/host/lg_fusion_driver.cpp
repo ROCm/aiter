@@ -151,7 +151,8 @@ int32_t lg_abi_info_v2(uint64_t* out9) {
     if (lg_abi_info_v1(out9) != 0) return -1;
     out9[8] = LG_QR_WGS;
     return 0;
-}#endif
+}
+#endif
 int32_t lg_report_v1(void* h, uint64_t* out10) {
     auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
     gf::DeviceScope scope(lg_dev(c)); if (!scope.ok()) return -2;
