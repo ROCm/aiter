@@ -12,12 +12,18 @@ K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from packaging.version import Version
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
-from .kernels.pa_decode.traits import d256_page64_pipe
+from . import installed_flydsl_version
+from .kernels.pa_decode.traits import (
+    D256_PIPE_MAX_ROWS,
+    d256_page64_pipe,
+    require_nhd_pipe,
+)
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -27,6 +33,131 @@ from .kernels.pa_decode_reduce import (
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+
+# Minimum FlyDSL release validated for the NHD (4D K/V, ``trans_k=False``) path.
+PA_DECODE_NHD_MIN_FLYDSL_VERSION = "0.4.0"
+# Largest query_length * query_group_size the NHD pipe accepts.
+PA_DECODE_NHD_MAX_QUERY_ROWS = D256_PIPE_MAX_ROWS
+
+_FP8_KV_DTYPES = {
+    "gfx942": torch.float8_e4m3fnuz,
+    "gfx950": torch.float8_e4m3fn,
+    "gfx1250": torch.float8_e4m3fn,
+}
+
+
+def _kv_dtype_name(arch: str, dtype: torch.dtype) -> str | None:
+    """``"bf16"``, ``"fp8"`` (the arch's FP8 format) or None if unsupported."""
+    if dtype == torch.bfloat16:
+        return "bf16"
+    return "fp8" if dtype == _FP8_KV_DTYPES.get(arch) else None
+
+
+def _require_nhd(
+    arch, kv_dtype, head_dim, block_size, query_length, query_group_size
+) -> None:
+    """Raise ``NotImplementedError`` unless NHD can serve this shape.
+
+    ``kv_dtype`` is ``"fp8"`` or ``"bf16"``. Shared by ``pa_decode`` and
+    ``pa_decode_nhd_supported`` so the predicate cannot drift from the kernel.
+    """
+    minimum = Version(PA_DECODE_NHD_MIN_FLYDSL_VERSION)
+    if Version(installed_flydsl_version.split("+")[0]) < minimum:
+        raise NotImplementedError(
+            f"NHD pa_decode requires flydsl >= {minimum}, "
+            f"got {installed_flydsl_version}"
+        )
+    require_nhd_pipe(
+        arch, kv_dtype, head_dim, block_size, query_length, query_group_size
+    )
+
+
+def pa_decode_nhd_supported(
+    *,
+    architecture: str,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    block_size: int,
+    query_length: int,
+    query_group_size: int,
+    sliding_window: int = 0,
+) -> bool:
+    """Whether ``pa_decode`` can serve an NHD call with these parameters.
+
+    NHD means 4D K/V caches, ``[num_blocks, block_size, num_kv_heads,
+    head_dim]``, which ``pa_decode`` selects when ``key_cache.dim() == 4``
+    (``trans_k=False``). The answer comes from the validation ``pa_decode``
+    itself runs for NHD shapes, so it cannot drift from the kernel: it is False
+    exactly when ``pa_decode`` would raise ``NotImplementedError`` for these
+    parameters, and for values it rejects as invalid. Requires the installed
+    FlyDSL to be at least ``PA_DECODE_NHD_MIN_FLYDSL_VERSION``.
+
+    Args:
+        architecture: GPU architecture such as ``"gfx950"``; target features
+            after a colon are ignored.
+        kv_dtype: K/V cache dtype. FP8 means the architecture's native format
+            (``torch.float8_e4m3fn`` on gfx950).
+        head_dim: Q/K/V head dimension.
+        block_size: Tokens per KV page.
+        query_length: Uniform query tokens per sequence (MTP length).
+        query_group_size: Query heads per KV head.
+        sliding_window: -1 or 0 for full attention, else the window including
+            the query token. Any valid value is supported; it never narrows
+            NHD support.
+
+    Per-call properties (strides, alignment, scales) are not covered; see
+    ``pa_decode`` for those. ``PA_DECODE_NHD_MAX_QUERY_ROWS`` bounds
+    ``query_length * query_group_size``.
+    """
+    ints = (head_dim, block_size, query_length, query_group_size, sliding_window)
+    if any(isinstance(n, bool) or not isinstance(n, int) for n in ints):
+        raise TypeError("NHD shape parameters must be ints")
+    if min(head_dim, block_size, query_length, query_group_size) < 1:
+        return False
+    if sliding_window < -1:
+        return False
+    arch = architecture.split(":", 1)[0]
+    kv_name = _kv_dtype_name(arch, kv_dtype)
+    if kv_name is None:
+        return False
+    try:
+        _require_nhd(
+            arch, kv_name, head_dim, block_size, query_length, query_group_size
+        )
+    except NotImplementedError:
+        return False
+    return True
+
+
+def pa_decode_default_workgroup_budget(
+    *,
+    architecture: str,
+    num_compute_units: int,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    block_size: int,
+    query_length: int,
+    query_group_size: int,
+    sliding_window: int = 0,
+) -> int:
+    """Work budget ``prepare_pa_decode_plan`` uses on a tuning-cache miss.
+
+    One workgroup per CU for dense (no sliding window) page-64 shapes of the
+    gfx950 FP8 head-256 pipe, which includes every NHD shape without a window;
+    ``2 * num_compute_units`` for everything else, including windowed NHD.
+    Page 16 and sliding windows on that pipe are as fast or faster at 2xCU.
+    Pass the result as ``plan_pa_decode(workgroup_budget=...)``.
+    """
+    arch = architecture.split(":", 1)[0]
+    kv_name = _kv_dtype_name(arch, kv_dtype)
+    one_cta_per_cu = (
+        kv_name is not None
+        and sliding_window <= 0
+        and d256_page64_pipe(
+            arch, kv_name, head_dim, block_size, query_length, query_group_size
+        )
+    )
+    return num_compute_units if one_cta_per_cu else 2 * num_compute_units
 
 
 def _nhd_strides(view: torch.Tensor) -> tuple[int, int, int]:
@@ -231,6 +362,7 @@ def pa_decode(
     16-byte aligned with 16-byte multiple strides, its token rows must not
     overlap, and its strides and in-page span must fit int32; heads-outermost
     storage with several KV heads is thus limited to 2 GiB per head.
+    ``pa_decode_nhd_supported`` reports whether a shape qualifies.
 
     ``compute_type=None`` infers compute from the cache dtype. BF16 K/V requires
     no K/V scales and uses x=8; FP8 uses x=16. gfx942/gfx950 require BF16 queries
@@ -386,17 +518,14 @@ def pa_decode(
             f"pa_decode requires compute_type={expected_kv_dtype} for the KV cache "
             f"on {arch}, got {compute_type}"
         )
-    if nhd_layout and not d256_page64_pipe(
-        arch,
-        kv_dtype,
-        head_dim,
-        block_size,
-        query_length,
-        num_q_heads // num_kv_heads,
-    ):
-        raise NotImplementedError(
-            "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
-            "and a uniform query_length * query_group_size of at most 32 rows"
+    if nhd_layout:
+        _require_nhd(
+            arch,
+            kv_dtype,
+            head_dim,
+            block_size,
+            query_length,
+            num_q_heads // num_kv_heads,
         )
     vector_width = 8 if is_bf16_kv else 16
 

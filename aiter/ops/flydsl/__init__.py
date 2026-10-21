@@ -130,7 +130,17 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "PA_DECODE_NHD_MAX_QUERY_ROWS": (".pa_decode", "PA_DECODE_NHD_MAX_QUERY_ROWS"),
+    "PA_DECODE_NHD_MIN_FLYDSL_VERSION": (
+        ".pa_decode",
+        "PA_DECODE_NHD_MIN_FLYDSL_VERSION",
+    ),
     "pa_decode": (".pa_decode", "pa_decode"),
+    "pa_decode_default_workgroup_budget": (
+        ".pa_decode",
+        "pa_decode_default_workgroup_budget",
+    ),
+    "pa_decode_nhd_supported": (".pa_decode", "pa_decode_nhd_supported"),
     "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
     "prepare_gemm_a16wfp4_weight": (
         ".gemm_a16wfp4",
@@ -179,6 +189,8 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "PA_DECODE_NHD_MAX_QUERY_ROWS",
+    "PA_DECODE_NHD_MIN_FLYDSL_VERSION",
     "DenseGemmConfig",
     "Fp4MqaPlan",
     "GateMode",
@@ -222,6 +234,8 @@ __all__ = [
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
     "pa_decode",
+    "pa_decode_default_workgroup_budget",
+    "pa_decode_nhd_supported",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
 ]

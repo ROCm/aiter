@@ -19,13 +19,12 @@ from flydsl.autotune import Config, autotune
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.pa_decode import implementation_cache_tag
-from aiter.ops.flydsl.kernels.pa_decode.traits import d256_page64_pipe
 from aiter.ops.flydsl.kernels.pa_decode_plan import (
     DEFAULT_MAX_BATCH_SIZE,
     PADecodePlan,
     plan_pa_decode,
 )
-from aiter.ops.flydsl.pa_decode import pa_decode
+from aiter.ops.flydsl.pa_decode import pa_decode, pa_decode_default_workgroup_budget
 
 _PA_DECODE_CONFIGS_PATH = Path(__file__).parent / "configs" / "pa"
 
@@ -167,8 +166,8 @@ def _pa_decode_configs(*args, resources, num_cu, **kwargs):
     return list(capacities.values())
 
 
-def _default_workgroup_budget(
-    *,
+def _pa_decode_default(
+    *args,
     num_cu,
     head_dim,
     block_size,
@@ -176,25 +175,21 @@ def _default_workgroup_budget(
     query_length,
     query_group_size,
     sliding_window,
-    **_,
+    **kwargs,
 ):
-    """CU count for dense page-64 head-256 pipe shapes, otherwise 2*CU.
-
-    Page 16 and sliding windows on that pipe are as fast or faster at 2*CU.
-    """
-    one_cta_per_cu = sliding_window <= 0 and d256_page64_pipe(
-        get_gfx_runtime(),
-        "bf16" if kv_dtype == str(torch.bfloat16) else "fp8",
-        head_dim,
-        block_size,
-        query_length,
-        query_group_size,
+    # The autotune key holds the dtype as str(torch.dtype).
+    return Config(
+        workgroup_budget=pa_decode_default_workgroup_budget(
+            architecture=get_gfx_runtime(),
+            num_compute_units=num_cu,
+            kv_dtype=getattr(torch, kv_dtype.removeprefix("torch.")),
+            head_dim=head_dim,
+            block_size=block_size,
+            query_length=query_length,
+            query_group_size=query_group_size,
+            sliding_window=sliding_window,
+        )
     )
-    return num_cu if one_cta_per_cu else 2 * num_cu
-
-
-def _pa_decode_default(*args, **kwargs):
-    return Config(workgroup_budget=_default_workgroup_budget(**kwargs))
 
 
 @contextmanager
@@ -334,11 +329,12 @@ def prepare_pa_decode_plan(
         head_dim = query.shape[-1]
         query_group_size = query.shape[1] // num_kv_heads
         kv_dtype = str(key_cache.dtype)
-        default_budget = _default_workgroup_budget(
-            num_cu=num_cu,
+        default_budget = pa_decode_default_workgroup_budget(
+            architecture=get_gfx_runtime(),
+            num_compute_units=num_cu,
+            kv_dtype=key_cache.dtype,
             head_dim=head_dim,
             block_size=block_size,
-            kv_dtype=kv_dtype,
             query_length=query_length,
             query_group_size=query_group_size,
             sliding_window=sliding_window,
