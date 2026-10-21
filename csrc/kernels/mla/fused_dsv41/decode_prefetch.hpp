@@ -108,7 +108,6 @@ struct PackedDecodeSource64
             }
             *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<bf16_t, 8>*>(
                 lds + (int(j) * 4 + wave) * 528 + lane * 8) = values;
-            __builtin_amdgcn_sched_barrier(0);
         });
     }
     template <class T, class G, class S, class Pointer>
@@ -677,6 +676,12 @@ __device__ void packed_decode_accum128(
         v_k[1] = load<T::VEC_KV>(s_kv, u_rk + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
         compute_qk(v_s, v_q_slices, v_k);
+        if constexpr(!Source::is_packed)
+        {
+            if(tile_idx + 1 < num_kv_tiles)
+                source.template load_tile<T>(
+                    tile_idx + 1, other_kv.ptr, u_gkv, u_skv, warp_id, lane_id);
+        }
 
         D_ACC row_max = track_max<T>(v_s, temperature_scale, actual_max);
         bool below =
@@ -701,9 +706,6 @@ __device__ void packed_decode_accum128(
         {
             if constexpr(Source::is_packed)
                 source.commit(next_raw, other_kv.ptr, warp_id, lane_id);
-            else
-                source.template load_tile<T>(
-                    tile_idx + 1, other_kv.ptr, u_gkv, u_skv, warp_id, lane_id);
         }
 
         s_waitcnt_vmcnt(0_I);
