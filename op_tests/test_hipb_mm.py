@@ -131,16 +131,10 @@ def test_hipb_mm_single_scale(operand):
 
 
 @requires_fp8
+@requires_mxfp8
 @pytest.mark.parametrize(
     "mode_a, mode_b, scale_a_shape, scale_b_shape, scale_dtype",
     [
-        (
-            ScaleMode.SCALAR_32F,
-            ScaleMode.OUTER_VEC_32F,
-            (1, 1),
-            (1, 128),
-            torch.float32,
-        ),
         (ScaleMode.VEC32_UE8M0, ScaleMode.VEC32_UE8M0, (33, 8), (128, 8), torch.uint8),
         (
             ScaleMode.VEC32_UE8M0,
@@ -150,9 +144,9 @@ def test_hipb_mm_single_scale(operand):
             dtypes.fp8_e8m0,
         ),
     ],
-    ids=["mixed", "block", "block-e8m0"],
+    ids=["block", "block-e8m0"],
 )
-def test_hipb_mm_rejects_unrepresentable_tuning_modes(
+def test_hipb_mm_falls_back_for_unrepresentable_tuning_modes(
     monkeypatch, tmp_path, mode_a, mode_b, scale_a_shape, scale_b_shape, scale_dtype
 ):
     monkeypatch.chdir(tmp_path)
@@ -161,20 +155,17 @@ def test_hipb_mm_rejects_unrepresentable_tuning_modes(
     w = torch.zeros((128, 256), device="cuda", dtype=dtypes.fp8)
     scale_a = torch.ones(scale_a_shape, dtype=scale_dtype, device="cuda")
     scale_b = torch.ones(scale_b_shape, dtype=scale_dtype, device="cuda")
-    with pytest.raises(
-        RuntimeError,
-        match="HIP_ONLINE_TUNING only supports per-tensor or per-row scaling modes",
-    ):
-        aiter.hipb_mm(
-            x,
-            w.t(),
-            solution_index=-1,
-            out_dtype=dtypes.bf16,
-            scaleA=scale_a,
-            scaleB=scale_b,
-            scaleA_mode=mode_a,
-            scaleB_mode=mode_b,
-        )
+    aiter.hipb_mm(
+        x,
+        w.t(),
+        solution_index=-1,
+        out_dtype=dtypes.bf16,
+        scaleA=scale_a,
+        scaleB=scale_b,
+        scaleA_mode=mode_a,
+        scaleB_mode=mode_b,
+    )
+    assert not (tmp_path / "hip_online_tuning_res.csv").exists()
 
 
 @requires_fp8

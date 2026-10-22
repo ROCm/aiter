@@ -784,6 +784,10 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
 
     // Max value of N dimension for decode GEMM
     int decode_max_n = 512;
+    // The CSV's use_rowwise key cannot represent mixed or MXFP8 scale modes.
+    bool tuning_mode_supported = scaleA_mode == scaleB_mode &&
+        (scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F ||
+         scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F);
 
     // load tuning cache file and check if the gemm has been already tuned
     const char* env = std::getenv("HIP_ONLINE_TUNING");
@@ -798,7 +802,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
         }
     }
 
-    if (online_tuning && n <= decode_max_n) {
+    if (online_tuning && n <= decode_max_n && tuning_mode_supported) {
       solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
                                                   bpreshuffle,
                                                   op_A, op_B, m, n, k,
@@ -906,7 +910,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     if(solution_index < 0)
     {
       // if enable hipblaslt online tuning, check the cache file and tune the gemm
-      if (online_tuning && n <= decode_max_n) {
+      if (online_tuning && n <= decode_max_n && tuning_mode_supported) {
         std::cout << "Tuning hip GEMM (" << m << ", " << n << ", " << k << ")\n";
         
         // calculate for rotating buffer
