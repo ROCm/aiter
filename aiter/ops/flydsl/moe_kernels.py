@@ -2459,6 +2459,15 @@ def _get_compiled_topids_to_rows():
 
 
 @functools.cache
+def _get_compiled_topids_to_rows_lds():
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_lds_module,
+    )
+
+    return build_moe_topids_to_rows_lds_module()
+
+
+@functools.cache
 def _get_compiled_topids_to_rows_g2l(weight_dtype: str):
     from aiter.ops.flydsl.kernels.moe_route_maps import (
         build_moe_topids_to_rows_g2l_module,
@@ -2499,6 +2508,7 @@ def flydsl_moe_topids_to_rows(
     num_valid_routes: torch.Tensor | None = None,
     ep_rowmap: torch.Tensor | None = None,
     contiguous_expert_mask: bool = False,
+    use_lds_reduction: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
 
@@ -2636,16 +2646,30 @@ def flydsl_moe_topids_to_rows(
             stream=torch.cuda.current_stream(),
         )
     else:
-        topids_to_rows_kernel = _get_compiled_topids_to_rows()
-        topids_to_rows_kernel(
-            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
-            ptr_arg(counter),
-            ptr_arg(topids_to_rows),
-            numel,
-            int(max_m),
-            route_grid,
-            stream=torch.cuda.current_stream(),
-        )
+        # Reduction performed in LDS vs all in global
+        if use_lds_reduction:
+            topids_to_rows_kernel = _get_compiled_topids_to_rows_lds()
+            topids_to_rows_kernel(
+                ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+                ptr_arg(counter),
+                ptr_arg(topids_to_rows),
+                numel,
+                int(max_m),
+                int(E),
+                route_grid,
+                stream=torch.cuda.current_stream(),
+            )
+        else:
+            topids_to_rows_kernel = _get_compiled_topids_to_rows()
+            topids_to_rows_kernel(
+                ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+                ptr_arg(counter),
+                ptr_arg(topids_to_rows),
+                numel,
+                int(max_m),
+                route_grid,
+                stream=torch.cuda.current_stream(),
+            )
     return counter, topids_to_rows.view(token_num, topk)
 
 

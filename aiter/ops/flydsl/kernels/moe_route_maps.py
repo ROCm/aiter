@@ -201,6 +201,115 @@ def build_moe_topids_to_rows_module():
     return launch_topids_to_rows
 
 
+def build_moe_topids_to_rows_lds_module():
+    """Build topids_to_rows with block-local counting in LDS.
+    Performs fewer global atomics for performance increase.
+    """
+
+    @flyc.kernel(
+        name="moe_route_lds",
+        known_block_size=[BLOCK_THREADS, 1, 1],
+    )
+    def route_kernel(
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        numel: Int32,
+        max_m: Int32,
+        experts: Int32,
+    ):
+        i32 = T.i32
+        c1 = arith.constant(1, type=i32)
+        tid = fx.Uint32(fx.thread_idx.x)
+        route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + tid
+        in_range = route < fx.Uint32(numel)
+
+        # Build local counters
+        lds_cnt = fx.SharedAllocator().allocate(_RouteCntStorage).peek().cnt.ptr
+        cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
+        for b in range(tid, fx.Uint32(experts), BLOCK_THREADS):
+            lds_cnt[b] = fx.Int32(0)
+        gpu.barrier()
+
+        topk_p = ptr_buf_tensor(topk_ids)
+        out_p = ptr_buf_tensor(topids_to_rows)
+        e = fx.Uint32(0)
+        local_rank = fx.Uint32(0)
+
+        # Local counts
+        if in_range:
+            e = fx.Uint32(topk_p[route])
+            local_rank = fx.Uint32(
+                llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    _slot_ptr(
+                        cnt_base_i64,
+                        e,
+                        address_space=fx.AddressSpace.Shared,
+                    ),
+                    c1,
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="workgroup",
+                    alignment=4,
+                ).result
+            )
+        gpu.barrier()
+
+        # Global atomic per expert instead of per route
+        for b in range(tid, fx.Uint32(experts), BLOCK_THREADS):
+            count = lds_cnt[b]
+            base = fx.Int32(0)
+            if count != 0:
+                base = fx.Int32(
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add,
+                        _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), b),
+                        count.ir_value(),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    ).result
+                )
+            lds_cnt[b] = base
+        gpu.barrier()
+
+        if in_range:
+            base = fx.Uint32(lds_cnt[e])
+            out_p[route] = base + local_rank + e * fx.Uint32(max_m)
+
+    @flyc.jit
+    def launch_topids_to_rows_lds(
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        numel: fx.Int32,
+        max_m: fx.Int32,
+        experts: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        route_kernel(
+            topk_ids,
+            atomic_buffer,
+            topids_to_rows,
+            numel,
+            max_m,
+            experts,
+        ).launch(
+            grid=(fx.Int64(grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_topids_to_rows_lds.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_topids_to_rows_lds
+
+
 def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
     """topids_to_rows with a fused EP global->local expert remap.
 

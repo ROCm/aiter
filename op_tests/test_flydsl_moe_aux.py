@@ -833,6 +833,11 @@ def test_route_psum_fused(numel, E, tile_m):
     masked = torch.full((E,), -99, dtype=I32)
     starts = torch.full((E,), -99, dtype=I32)
     psum = torch.full((E,), -99, dtype=I32)
+    expert_tile_map = torch.full(
+        ((numel + E * tile_m + tile_m - 1) // tile_m,),
+        -99,
+        dtype=I32,
+    )
 
     def fn():
         launch(
@@ -841,9 +846,11 @@ def test_route_psum_fused(numel, E, tile_m):
             ptr_arg(masked),
             ptr_arg(starts),
             ptr_arg(psum),
+            ptr_arg(expert_tile_map),
             numel,
             E,
             max_m,
+            tile_m,
             tile_m,
             stream=torch.cuda.current_stream().cuda_stream,
         )
@@ -873,6 +880,10 @@ def test_route_psum_fused(numel, E, tile_m):
         assert bool(
             ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
         ), f"{name}: row outside its expert's contiguous band"
+        tile_experts = expert_tile_map.cpu().long()[r // tile_m]
+        assert bool((tile_experts == ids).all()), (
+            f"{name}: expert tile map disagrees with routed rows"
+        )
         assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
         ret[f"{name} us"] = us
         ret[f"{name} TB/s"] = nbytes / us / 1e6
