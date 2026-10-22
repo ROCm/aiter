@@ -3,7 +3,7 @@
 # import hip
 # hip.hip.hipInit(0)
 
-import random
+import functools
 
 import torch
 import triton
@@ -12,16 +12,97 @@ from aiter.ops.triton.attention.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
+from op_tests.triton_tests.attention.test_mla import input_helper, shuffle_kv_buffer
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+
+
+def _generate_inputs(
+    batch_size: int,
+    decode_qlen: int,
+    ctx_lens: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    varlen: bool,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    use_out_scale: bool,
+    shuffled_kv_cache: bool,
+):
+    (
+        cu_seqlens_q,
+        seq_lens_kv,
+        max_seqlen_kv,
+        block_tables,
+        kv_buffer,
+        query,
+        sm_scale,
+        _,
+    ) = input_helper(
+        batch_size,
+        ctx_lens,
+        decode_qlen,
+        num_query_heads,
+        num_kv_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_size,
+        None,  # tight, unique block allocation for realistic benchmark footprint
+        varlen,
+    )
+    total_num_query_tokens = cu_seqlens_q[-1].item()
+    kv_buffer = kv_buffer.to(kv_dtype)
+    query = query.to(q_dtype)
+
+    q_descale = None
+    kv_descale = None
+    if q_dtype != torch.bfloat16:
+        q_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
+
+    if kv_dtype != torch.bfloat16:
+        kv_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
+
+    out_scale = None
+    if use_out_scale:
+        out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
+
+    output = torch.empty(
+        (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
+    )
+
+    maybe_shuffled_kv_buffer = (
+        shuffle_kv_buffer(kv_buffer, kv_lora_rank) if shuffled_kv_cache else kv_buffer
+    )
+
+    return (
+        cu_seqlens_q,
+        seq_lens_kv,
+        max_seqlen_kv,
+        block_tables,
+        query,
+        kv_buffer,
+        maybe_shuffled_kv_buffer,
+        output,
+        sm_scale,
+        q_descale,
+        kv_descale,
+        out_scale,
+    )
 
 
 def benchmark(args):
@@ -42,6 +123,8 @@ def benchmark(args):
     use_out_scale = out_dtype != torch.bfloat16
     backend = args.backend
     skip_reduce = args.skip_reduce
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     if shuffled_kv_cache:
         assert BLOCK_SIZE >= 16, "Block size must be at least 16 for shuffled KV cache"
@@ -129,73 +212,55 @@ def benchmark(args):
         shuffled_kv_cache: bool,
         provider,
     ):
-        warmup = 25
-        rep = 100
-
-        cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
-        seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
-        seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device="cuda")
-        if varlen:
-            for i in range(batch_size):
-                seq_lens_kv[i] = max(
-                    random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens
-                )
-        else:
-            seq_lens_kv.fill_(ctx_lens)
-        if decode_qlen > 0:
-            seq_lens_qo.fill_(decode_qlen)
-        else:
-            if varlen:
-                for i in range(batch_size):
-                    seq_lens_qo[i] = max(
-                        min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
-                    )
-            else:
-                seq_lens_qo.fill_(ctx_lens)
-
-        cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
-        total_num_query_tokens = cu_seqlens_q[-1].item()
-
-        max_seqlen_kv = seq_lens_kv.max().item()
-        max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
-        num_blocks = batch_size * max_num_blocks_per_seq
-        block_tables = torch.randperm(
-            num_blocks, dtype=torch.int32, device="cuda"
-        ).reshape(batch_size, max_num_blocks_per_seq)
-        qk_head_dim = kv_lora_rank + qk_rope_head_dim
-        kv_buffer = torch.randn(
-            (num_blocks, block_size, num_kv_heads, qk_head_dim),
-            dtype=torch.bfloat16,
-            device="cuda",
-        ).to(kv_dtype)
-        query = torch.randn(
-            (total_num_query_tokens, num_query_heads, qk_head_dim),
-            dtype=torch.bfloat16,
-            device="cuda",
-        ).to(q_dtype)
-        sm_scale = 1.0 / (qk_head_dim**0.5)
-
-        q_descale = None
-        kv_descale = None
-        if q_dtype != torch.bfloat16:
-            q_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
-
-        if kv_dtype != torch.bfloat16:
-            kv_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
-
-        out_scale = None
-        if use_out_scale:
-            out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
-
-        output = torch.empty(
-            (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
+        _p_gen = functools.partial(
+            _generate_inputs,
+            batch_size,
+            decode_qlen,
+            ctx_lens,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            block_size,
+            num_query_heads,
+            num_kv_heads,
+            varlen,
+            q_dtype,
+            kv_dtype,
+            out_dtype,
+            use_out_scale,
+            shuffled_kv_cache,
+        )
+        _out_val_keys = [
+            "cu_seqlens_q",
+            "seq_lens_kv",
+            "max_seqlen_kv",
+            "block_tables",
+            "query",
+            "kv_buffer",
+            "maybe_shuffled_kv_buffer",
+            "output",
+            "sm_scale",
+            "q_descale",
+            "kv_descale",
+            "out_scale",
+        ]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
         )
 
-        maybe_shuffled_kv_buffer = (
-            shuffle_kv_buffer(kv_buffer, kv_lora_rank)
-            if shuffled_kv_cache
-            else kv_buffer
-        )
+        # Shapes/dtypes are identical across the pool, so any entry works for sizing.
+        sample = rot_bufs[0]
+        cu_seqlens_q = sample["cu_seqlens_q"]
+        seq_lens_kv = sample["seq_lens_kv"]
+        max_seqlen_kv = sample["max_seqlen_kv"]
+        block_tables = sample["block_tables"]
+        query = sample["query"]
+        kv_buffer = sample["kv_buffer"]
+        maybe_shuffled_kv_buffer = sample["maybe_shuffled_kv_buffer"]
+        output = sample["output"]
+        sm_scale = sample["sm_scale"]
+        q_descale = sample["q_descale"]
+        kv_descale = sample["kv_descale"]
+        out_scale = sample["out_scale"]
 
         if decode_qlen > 0:
             out = mla_decode_fwd(
@@ -258,7 +323,20 @@ def benchmark(args):
             mem_out = out.numel() * out.itemsize
         mem = (mem_in + mem_out) * 1e-12
 
-        def fn():
+        def _run(
+            cu_seqlens_q,
+            seq_lens_kv,
+            max_seqlen_kv,
+            block_tables,
+            query,
+            kv_buffer,
+            maybe_shuffled_kv_buffer,
+            output,
+            sm_scale,
+            q_descale,
+            kv_descale,
+            out_scale,
+        ):
             if decode_qlen > 0:
                 mla_decode_fwd(
                     query,
@@ -297,14 +375,13 @@ def benchmark(args):
                     shuffled_kv_cache=shuffled_kv_cache,
                 )
 
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
         if provider == "time":
             return ms
         else:  # BW TB/s
             return mem / ms * 1e3
 
     bench_mla.run(save_path="." if args.o else None, print_data=True, show_plots=False)
-    # return x_vals_list, x_names, line_vals
 
 
 def parse_args():
@@ -329,6 +406,7 @@ def parse_args():
     )
     parser.add_argument("--skip_reduce", type=bool, default=True)
     parser.add_argument("--device", default="cuda")
+
     parser.add_argument(
         "-o",
         action="store_true",
