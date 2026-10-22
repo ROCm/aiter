@@ -73,7 +73,7 @@ RDNA_CASES = [
 
 
 @benchmark()
-def test_fmha_rdna(dtype, causal, batch, seq_len, num_heads, head_dim):
+def bench_fmha_rdna(dtype, causal, batch, seq_len, num_heads, head_dim):
     from aiter.ops.flydsl import flydsl_flash_attn_func
 
     g = torch.Generator(device="cuda").manual_seed(0)
@@ -615,7 +615,7 @@ def compare(want, got, name):
 
 
 @benchmark()
-def test_fmha_fp8(name, causal):
+def bench_fmha_fp8(name, causal):
     from aiter.ops.flydsl.fmha_kernels import (
         flydsl_flash_attn_batch_func,
         flydsl_flash_attn_varlen_func,
@@ -2627,7 +2627,7 @@ def main():
     causals = [bool(c) for c in args.causal]
     if arch == "gfx1201":
         label = "gfx1201 bf16/f16"
-        rows = [test_fmha_rdna(*c) for c in RDNA_CASES if c[1] in causals]
+        rows = [bench_fmha_rdna(*c) for c in RDNA_CASES if c[1] in causals]
     else:
         from aiter.ops.flydsl.unified_attention_kernels import is_flydsl_available
 
@@ -2640,7 +2640,7 @@ def main():
         if unknown:
             parser.error(f"unknown cases: {unknown}")
         rows = [
-            test_fmha_fp8(n, c)
+            bench_fmha_fp8(n, c)
             for n, c in itertools.product(selected, causals)
             if c in FP8_CASES[n]["causal"]
         ]
