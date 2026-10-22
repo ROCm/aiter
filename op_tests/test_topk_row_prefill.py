@@ -489,12 +489,14 @@ def test_top_k_per_row_prefill(
             f"Fast Kernel comparison completed: {'Passed' if all_close_fast else 'Failed'}"
         )
 
-    # Calculate speedup
-    speedup = us_standard / us_fast if fast_supported and us_fast > 0 else None
-    # Calculate improvement percentage
+    # A zero (or missing) timing is not a measurement. speedup stays None,
+    # and every consumer below has to check fast_timed, not just
+    # fast_supported: the kernel can have run on gfx942 and still report 0 us.
+    fast_timed = fast_supported and us_fast is not None and us_fast > 0
+    speedup = us_standard / us_fast if fast_timed else None
     improvement_pct = (
         (us_standard - us_fast) / us_standard * 100
-        if fast_supported and us_standard > 0
+        if fast_timed and us_standard > 0
         else None
     )
 
@@ -503,14 +505,17 @@ def test_top_k_per_row_prefill(
     GREEN = "\033[92m"
     RESET = "\033[0m"
 
-    # Determine which version is faster
-    if fast_supported:
+    # Determine which version is faster. Colors that compare the two timings
+    # are only valid once both timings are real numbers.
+    if fast_timed:
         faster_is_standard = us_standard < us_fast
         standard_color = GREEN if faster_is_standard else RED
         fast_color = GREEN if not faster_is_standard else RED
         speedup_color = GREEN if speedup > 1.0 else RED
     else:
         standard_color = GREEN
+        fast_color = RESET
+        speedup_color = RESET
 
     # Print comparison
     print(f"\n{'='*80}")
@@ -524,8 +529,11 @@ def test_top_k_per_row_prefill(
         print(
             f"  Fast version:     {fast_color}{us_fast:.2f} us{RESET}, correct={all_close_fast}"
         )
-        print(f"  Speedup:          {speedup_color}{speedup:.3f}x{RESET}")
-        print(f"  Improvement:      {speedup_color}{improvement_pct:.2f}%{RESET}")
+        if fast_timed:
+            print(f"  Speedup:          {speedup_color}{speedup:.3f}x{RESET}")
+            print(f"  Improvement:      {speedup_color}{improvement_pct:.2f}%{RESET}")
+        else:
+            print("  Speedup:          n/a (fast kernel reported 0 us)")
     else:
         print(f"  Fast version:     not implemented for {get_gfx()}")
     print(f"{'='*80}\n")
