@@ -302,6 +302,33 @@ def get_cu_num():
     return cu_num
 
 
+_CDNA4_CUS_PER_XCD = 32
+_CDNA4_MAX_XCDS = 8
+
+
+def get_cdna4_num_xcds(cu_num: int | None = None) -> int:
+    """Return the number of CDNA4 XCDs represented by ``cu_num``.
+
+    gfx950 exposes 32 CUs per XCD: MI350P has 128 CUs / 4 XCDs, while
+    MI350X and MI355X have 256 CUs / 8 XCDs. ``CU_NUM`` and GPU partitioning
+    may expose a smaller power-of-two subset, so derive this from the active
+    CU count rather than hardcoding a product SKU.
+    """
+    cu_num = int(get_cu_num() if cu_num is None else cu_num)
+    if cu_num <= 0 or cu_num % _CDNA4_CUS_PER_XCD != 0:
+        raise ValueError(
+            "CDNA4 CU count must be a positive multiple of "
+            f"{_CDNA4_CUS_PER_XCD}, got {cu_num}"
+        )
+    num_xcds = cu_num // _CDNA4_CUS_PER_XCD
+    if num_xcds > _CDNA4_MAX_XCDS or num_xcds & (num_xcds - 1):
+        raise ValueError(
+            "CDNA4 XCD count must be a power of two no larger than "
+            f"{_CDNA4_MAX_XCDS}, got {num_xcds} from {cu_num} CUs"
+        )
+    return num_xcds
+
+
 def get_build_targets() -> list[tuple[str, int]]:
     """Return (gfx, cu_num) pairs to compile kernels for.
 
