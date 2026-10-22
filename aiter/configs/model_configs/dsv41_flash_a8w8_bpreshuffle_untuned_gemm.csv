@@ -5,3 +5,6 @@ M,N,K,q_dtype_w
 8192,1152,5120,torch.float8_e4m3fnuz
 8192,5120,576,torch.float8_e4m3fnuz
 8192,4096,1280,torch.float8_e4m3fnuz
+16384,1792,5120,torch.float8_e4m3fnuz
+16384,1152,5120,torch.float8_e4m3fnuz
+16384,4096,1280,torch.float8_e4m3fnuz
