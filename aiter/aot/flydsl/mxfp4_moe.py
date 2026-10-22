@@ -41,7 +41,6 @@ if os.path.exists(_ACTIVE_FMOE_CSV) and _ACTIVE_FMOE_CSV not in DEFAULT_CSVS:
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
-_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
 def _job_key(job: dict) -> tuple:
@@ -215,11 +214,7 @@ def parse_csv(csv_path):
 
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
-                out_dtype = (
-                    "fp8"
-                    if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
-                    else "bf16"
-                )
+                out_dtype = "bf16"
                 bias_supported = (
                     row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
                     and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
