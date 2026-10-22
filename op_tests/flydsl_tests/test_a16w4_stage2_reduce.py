@@ -12,19 +12,29 @@ fp4 is not native on gfx942, so this is asserted on gfx950 only.
 
 from __future__ import annotations
 
+from functools import partial
+
 import pytest
 import torch
 
 from aiter import dtypes
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import (
+    _flydsl_stage2_wrapper,
+    moe_sorting,
+    stage2_uses_route_reduce,
+)
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+from aiter.ops.flydsl.moe_kernels import (
+    flydsl_kernel_name,
+    flydsl_moe_stage2,
+    get_flydsl_kernel_params,
+)
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
 _PREFILL = 3.0
 
-pytestmark = pytest.mark.skipif(
+_SKIP_GFX950 = pytest.mark.skipif(
     get_gfx() != "gfx950",
     reason="fp4 stage2 reduce is asserted on gfx950; fp4 is not native on gfx942",
 )
@@ -144,6 +154,25 @@ def _run(data, tile_m, tile_k, mode, prefill):
     return output
 
 
+def _a16w4_stage2(mode: str):
+    name = flydsl_kernel_name(2, "bf16", "fp4", "bf16", 16, 128, 128, mode)
+    parsed = get_flydsl_kernel_params(name)
+    assert parsed is not None and parsed["mode"] == mode
+    return partial(_flydsl_stage2_wrapper, kernelName=name)
+
+
+def test_fp4_reduce_name_is_route_reduce():
+    """fused_moe must not zero the buffer for an fp4 *_reduce name.
+
+    stage2_uses_route_reduce is what moe_sorting consults. A reduce name writes
+    per-slot rows and then replaces the caller output, so sorting must not treat
+    it as an atomic accumulate.
+    """
+    assert stage2_uses_route_reduce(_a16w4_stage2("reduce"))
+    assert not stage2_uses_route_reduce(_a16w4_stage2("atomic"))
+
+
+@_SKIP_GFX950
 @pytest.mark.parametrize(
     ("tile_m", "tile_k"),
     [
@@ -157,7 +186,9 @@ def test_prefilled_output_atomic_keeps_reduce_replaces(tile_m, tile_k):
     atomic_prefill = _run(data, tile_m, tile_k, "atomic", _PREFILL)
     reduce_prefill = _run(data, tile_m, tile_k, "reduce", _PREFILL)
 
+    nonzero = (atomic_zero.abs() > 1e-3).float().mean().item()
     atomic_ratio = _mismatch_ratio(atomic_zero, atomic_prefill)
     reduce_ratio = _mismatch_ratio(atomic_zero, reduce_prefill)
+    assert nonzero > 0.5, nonzero
     assert atomic_ratio > 0.5, {"atomic": atomic_ratio, "reduce": reduce_ratio}
     assert reduce_ratio <= 0.01, {"atomic": atomic_ratio, "reduce": reduce_ratio}
