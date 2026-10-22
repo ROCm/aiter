@@ -759,14 +759,19 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 self._get_run_config_err_ratio_limit(row, args)
             )
             try:
-                is_asm = eval(q_dtype_w) == dtypes.i8
+                q_dtype = eval(q_dtype_w)
+                libtype = str(row.get("libtype", "")).strip()
+                # Legacy INT8 rows are ASM, but gfx950 also ships FlyDSL INT8
+                # rows. Route by the configured backend instead of treating
+                # every INT8 byte tensor as an ASM kernel request.
+                is_asm = q_dtype == dtypes.i8 and libtype in ("", "asm")
                 gd = generate_data(
                     M,
                     N,
                     K,
                     0,
                     dtypes.bf16,
-                    eval(q_dtype_w),
+                    q_dtype,
                     is_asm,
                 )
                 x = gd["x"]

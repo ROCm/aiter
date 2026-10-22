@@ -14,6 +14,7 @@ Supported kernel families:
   - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
   - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
+  - ``flydsl_bpreshuffle_4w_*``               gfx950 4-wave INT8 GEMM kernels
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
@@ -65,6 +66,10 @@ from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
 )
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
+)
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+    compile_4wave_gemm,
+    parse_4wave_kernel_name,
 )
 from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
     compile_8wave_gemm,
@@ -306,6 +311,11 @@ def parse_csv(csv_path: str):
                     params = dict(params)
                     params["kind"] = "mxscale_preshuffle"
                     params.update(dict(MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK[mxfp8_block]))
+            elif kernel_name.startswith("flydsl_bpreshuffle_4w_"):
+                params = parse_4wave_kernel_name(kernel_name)
+                if params is not None:
+                    params = dict(params)
+                    params["kind"] = "4wave"
             elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
                 params = parse_8wave_kernel_name(kernel_name)
                 if params is not None:
@@ -803,6 +813,54 @@ def _compile_mxscale_preshuffle_to_cache(
         )
 
 
+def _compile_4wave_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    q_dtype_a: str,
+    q_dtype_w: str,
+    dtype: str,
+    xcd_swizzle: int,
+    num_cu: int,
+    num_xcds: int,
+    **kwargs,
+):
+    """Compile one signed-INT8 4-wave specialization into the FlyDSL cache."""
+    del kwargs
+    if (block_m, block_n, block_k) != (256, 256, 128):
+        raise ValueError(
+            "4-wave INT8 AOT requires a 256x256x128 tile, got "
+            f"{block_m}x{block_n}x{block_k}"
+        )
+    if (q_dtype_a, q_dtype_w, dtype) != ("I8", "I8", "B16"):
+        raise ValueError(
+            "4-wave INT8 AOT requires I8_I8_B16, got "
+            f"{q_dtype_a}_{q_dtype_w}_{dtype}"
+        )
+
+    import torch
+
+    dev = torch.device("cpu")
+    a = torch.empty((m * k,), device=dev, dtype=torch.int8)
+    b = torch.empty((n * k,), device=dev, dtype=torch.int8)
+    out = torch.empty((m * n,), device=dev, dtype=torch.bfloat16)
+    scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
+    scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
+    executable = compile_4wave_gemm(
+        K=k,
+        xcd_swizzle=xcd_swizzle,
+        num_cu=num_cu,
+        num_xcds=num_xcds,
+    )
+    _compile_executable_to_cache(
+        executable, a, b, out, scale_a, scale_b, m, n, fx.Stream(0)
+    )
+
+
 def _compile_8wave_to_cache(
     *,
     m: int,
@@ -1142,6 +1200,8 @@ def compile_one_config(
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxscale_preshuffle":
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "4wave":
+                _compile_4wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxfp8_8wave":
