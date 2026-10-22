@@ -193,10 +193,9 @@ KERNEL_SPECS = {
     ),
     "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
     "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
-    # FMHA v3 per-tensor FP8, the quantized counterpart to the aiter_bf16 baseline. In --kernel
-    # all because accuracy is only reported there, and at d=256 it is the one non-MXFP4 row that
-    # runs at all.
-    "aiter_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, include_in_all=True),
+    # FMHA v3 per-tensor FP8, the quantized counterpart to the aiter_bf16 baseline. Select it
+    # explicitly; at d=256 it is the one non-MXFP4 row that runs at all.
+    "aiter_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True),
     "mha4_bf16": _mha_v4_spec(
         (2.0, 2.0, 2.0), quantized=False, supports_block_sparse=True
     ),
