@@ -163,14 +163,9 @@ class OpusGemmInstance:
     # a8w8_mxscale BMM wave1 only: register ring depth in K tiles, 0 for the
     # traits' VGPR-budget default. Maps to the wave1 traits' trailing `int RING_`.
     wave1_ring: int = 0
-    # a8w8_mxscale BMM blds, GROUP_K=32 scale-ring kids only: which scale buffers
-    # arrive in the x32k4 order of shuffle_scale_n32k4 -- [rows/32][K/128][32][4],
-    # so one K/128 step of 32 rows is a single 128-byte line -- instead of
-    # row-major [rows][K/32]. Bit 0 is A (x_scale [ceil(M/32), batch, K]), bit 1
-    # is B (w_scale [batch, N/32, K], GROUP_N == 1 only). Bit 2 changes no
-    # layout: A's plain scales are staged as a whole-split LDS panel while B
-    # stays on the ring. Emitted as GROUP's optional fourth element; see
-    # SF_LAYOUT in the flatmm traits.
+    # a8w8_mxscale BMM blds, GROUP_K=32 scale-ring kids only: 4 stages A's plain
+    # scales as a whole-split LDS panel while B stays on the ring. Emitted as
+    # GROUP's optional fourth element; see SF_LAYOUT in the flatmm traits.
     sf_layout: int = 0
     # Compact BMM: issue future B before current LDS reads, then issue A.
     early_b: bool = False
@@ -296,11 +291,6 @@ class OpusGemmInstance:
                 parts.append("sfpreload")
             if self.shuffle_scale:
                 parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
-            if self.sf_layout & 3:
-                parts.append(
-                    "sfx32" + ("a" if self.sf_layout & 1 else "")
-                    + ("b" if self.sf_layout & 2 else "")
-                )
             if self.sf_layout & 4:
                 parts.append("sfapanel")
         elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave8n4":
@@ -1047,13 +1037,10 @@ def _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg_per_cu, prefetch_scale=Fal
         "shuffle_scale"
     )
     inst.sf_shuf_in_lds = sf_shuf_in_lds
+    assert sf_layout in (0, 4), "sf_layout's only bit is 4, the A panel"
     assert sf_layout == 0 or (quant_block == 32 and not shuffle_scale), (
-        "x32k4 scales are read through the GROUP_K=32 scale ring only"
+        "the A panel is a GROUP_K=32 scale-ring kid's"
     )
-    assert not (sf_layout & 2) or group_n == 1, (
-        "the B x32k4 order is per N row; a 32-row scale group has one row per 32"
-    )
-    assert (sf_layout & 5) != 5, "A is either panel-staged or x32k4, not both"
     inst.sf_layout = sf_layout
     return inst
 
@@ -1402,46 +1389,21 @@ _bmm_bpre_blds_local.update(
                   _BMM_MXSCALE_BPRESHUFFLE_BLDS_1X32_TWIN_OF)
 )
 
-# 1x32 blds kids again, reading x32k4 scales: B only (sf_layout=2), which a
-# weight-load shuffle serves, and A+B (3), which needs the quantizer to emit A
-# that way too. The tiles are the ones whose time moved when the row-major
-# scales were made to hit one line (zero row stride), i.e. the ring kids.
-_BMM_MXSCALE_BPRESHUFFLE_BLDS_X32_TWIN_OF = {
-    #  new: (1x32 kid, sf_layout)
-    1728: (1714, 2), 1729: (1716, 2), 1730: (1718, 2),
-    1731: (1721, 2), 1732: (1722, 2), 1733: (1723, 2),
-    1734: (1714, 3), 1735: (1716, 3), 1736: (1718, 3),
-    1737: (1721, 3), 1738: (1722, 3), 1739: (1723, 3),
-    # The 1x32 decode tiles, so an x32k4 w_scale is not stuck with 32x64 at
-    # small grids: 32x32x256 preload and 16x32x256.
-    1757: (1724, 2), 1758: (1727, 2),
-}
-for _kid, (_src, _layout) in _BMM_MXSCALE_BPRESHUFFLE_BLDS_X32_TWIN_OF.items():
-    _s = _bmm_bpre_blds_local[_src]
-    assert _s.GROUP_N == 1 and _s.GROUP_K == 32 and not _s.shuffle_scale
-    _bmm_bpre_blds_local[_kid] = _a8w8_mxscale_bmm_bpreshuffle_blds(
-        _s.B_M, _s.B_N, _s.B_K, _s.WG_PER_CU,
-        prefetch_scale=_s.prefetch_scale, preload_sf=_s.preload_sf,
-        quant_block=32, group_n=1, sf_layout=_layout,
-    )
-
 # The same 1x32 blds tiles with A's plain scales in a whole-split LDS panel and
-# B on the ring: row-major (4), which needs nothing from the producers, or x32k4
-# (6), which a weight-load shuffle serves. The K=256 tiles (1716/1718/1723)
-# are absent: with the panel set aside their A/B staging no longer fits three
-# prefetch slots plus the B ring.
+# B on the ring (sf_layout 4). The K=256 tiles (1716/1718/1723) are absent: with
+# the panel set aside their A/B staging no longer fits three prefetch slots plus
+# the B ring.
 _BMM_MXSCALE_BPRESHUFFLE_BLDS_APANEL_TWIN_OF = {
-    #  new: (1x32 kid, sf_layout)
-    1746: (1714, 4), 1749: (1721, 4), 1750: (1722, 4),
-    1752: (1714, 6), 1755: (1721, 6), 1756: (1722, 6),
+    #  new: 1x32 kid
+    1746: 1714, 1749: 1721, 1750: 1722,
 }
-for _kid, (_src, _layout) in _BMM_MXSCALE_BPRESHUFFLE_BLDS_APANEL_TWIN_OF.items():
+for _kid, _src in _BMM_MXSCALE_BPRESHUFFLE_BLDS_APANEL_TWIN_OF.items():
     _s = _bmm_bpre_blds_local[_src]
     assert _s.GROUP_N == 1 and _s.GROUP_K == 32 and not _s.shuffle_scale
     _bmm_bpre_blds_local[_kid] = _a8w8_mxscale_bmm_bpreshuffle_blds(
         _s.B_M, _s.B_N, _s.B_K, _s.WG_PER_CU,
         prefetch_scale=_s.prefetch_scale, preload_sf=_s.preload_sf,
-        quant_block=32, group_n=1, sf_layout=_layout,
+        quant_block=32, group_n=1, sf_layout=4,
     )
 
 # 32x32 ring kids again with the whole-split scale panel. At GROUP_N=32 B adds

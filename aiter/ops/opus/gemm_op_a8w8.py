@@ -419,15 +419,8 @@ def _validate_a8w8_mxscale_bmm_tensors(
         raise ValueError(
             f"{entry}: Y must have shape {(M, batch, N)}, got {tuple(Y.shape)}"
         )
-    # x32k4 (shuffle_scale_n32k4's order): 32 rows per line-sized block, so the
-    # row axis shrinks by 32 and the K axis carries K bytes. See SF_LAYOUT.
-    sf_layout = inst.sf_layout
-    expected_x_scale = (
-        ((M + 31) // 32, batch, K) if sf_layout & 1 else (M, batch, K // group)
-    )
-    expected_w_scale = (
-        (batch, N // 32, K) if sf_layout & 2 else (batch, N // group_n, K // group)
-    )
+    expected_x_scale = (M, batch, K // group)
+    expected_w_scale = (batch, N // group_n, K // group)
     if tuple(x_scale.shape) != expected_x_scale:
         raise ValueError(
             f"{entry}: x_scale must have shape {expected_x_scale}, "
@@ -642,12 +635,9 @@ def bmm_a8w8_mxscale_opus_bpreshuffle(
     ``wo_a`` [G, N, K] must come from ``shuffle_weight(w, layout=(16, 16))``;
     this entry does not shuffle it. ``x`` is [M, G, K], ``x_scale`` is
     [M, G, K/group_size], and ``w_scale`` is
-    [G, N/group_n, K/group_size]. Scales keep their ordinary E8M0 layout,
-    except that a 1x32 ``w_scale`` may instead be
-    ``shuffle_scale_n32k4(w_scale)``, [G, N/32, K], which selects the kernels
-    reading it in that layout. ``group_n`` defaults to ``group_size``;
-    supported weight-scale blocks are 32x32, 128x128 and 1x32
-    (``group_n=1, group_size=32``).
+    [G, N/group_n, K/group_size]. Scales keep their ordinary E8M0 layout.
+    ``group_n`` defaults to ``group_size``; supported weight-scale blocks are
+    32x32, 128x128 and 1x32 (``group_n=1, group_size=32``).
 
     Returns ``out`` [M, G, N], allocating it with ``dtype`` when omitted.
     ``kernelId=None`` selects a compatible preshuffled kernel. An incompatible
@@ -660,7 +650,7 @@ def bmm_a8w8_mxscale_opus_bpreshuffle(
         mxscale_bmm_kid_block,
         mxscale_bmm_kid_runs_m,
         mxscale_bmm_kid_takes_b_layout,
-        mxscale_bmm_kid_takes_plain_x_scale,
+        mxscale_bmm_kid_takes_plain_scales,
     )
 
     group_n = group_size if group_n is None else group_n
@@ -669,36 +659,19 @@ def bmm_a8w8_mxscale_opus_bpreshuffle(
     m, g, k = map(int, x.shape)
     n = int(wo_a.shape[1])
     Y = out if out is not None else torch.empty((m, g, n), dtype=dtype, device=x.device)
-    # A 1x32 w_scale may also come relaid by shuffle_scale_n32k4, [G, N/32, K];
-    # no plain block keeps K whole, so the shape says which one this is.
-    w_scale_n32k4 = (
-        block == "1x32"
-        and int(w_scale.shape[-1]) == k
-        and int(w_scale.shape[-2]) * 32 == n
-    )
-    if w_scale_n32k4:
-        block = "1x32n32k4"
 
-    # The preshuffled entry accepts only matching B, a row-major x_scale and a
-    # w_scale in the kid's block layout. A padded-M tuned row can also require
-    # an alignment the real M lacks.
+    # The preshuffled entry accepts only matching B and ordinary scale layouts.
+    # A padded-M tuned row can also require an alignment the real M lacks.
     if kernelId is not None and not (
         mxscale_bmm_kid_takes_b_layout(int(kernelId), True)
-        and mxscale_bmm_kid_takes_plain_x_scale(int(kernelId))
+        and mxscale_bmm_kid_takes_plain_scales(int(kernelId))
         and mxscale_bmm_kid_block(int(kernelId)) == block
         and mxscale_bmm_kid_runs_m(int(kernelId), m)
     ):
         kernelId = splitK = None
     if kernelId is None:
         kernelId = _heuristic_mxscale_bmm_bpreshuffle_kid(
-            g,
-            m,
-            n,
-            k,
-            group_size=group_size,
-            group_n=group_n,
-            output_dtype=Y.dtype,
-            w_scale_n32k4=w_scale_n32k4,
+            g, m, n, k, group_size=group_size, group_n=group_n, output_dtype=Y.dtype
         )
         if kernelId is None:
             raise ValueError(

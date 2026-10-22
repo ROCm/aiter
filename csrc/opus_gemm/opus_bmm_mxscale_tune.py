@@ -24,7 +24,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.ops.opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
-from aiter.ops.shuffle import shuffle_scale_n32k4, shuffle_weight
+from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -77,9 +77,7 @@ def _kid_group(kid):
 
 
 def _kid_block(kid):
-    # Mirrors policy.mxscale_bmm_kid_block: an x32k4 w_scale is its own block.
-    inst = _KID_INSTANCE.get(kid) or _KID_INSTANCE[bmm_mxscale_global_kid(kid)]
-    return "{}x{}".format(*_kid_groups(kid)) + ("n32k4" if inst.sf_layout & 2 else "")
+    return "{}x{}".format(*_kid_groups(kid))
 
 
 from test_opus_a8w8_bmm import (
@@ -253,14 +251,10 @@ _TUNE_POLICY[399] = [1]
 
 # The default policy consumes ordinary scales. M-packed and shuffled-scale
 # kernels require a matching scale producer and are handled by separate pools.
-# An x32k4 w_scale alone is not one of these: it is relaid once at weight load,
-# so those kids are keyed as their own 1x32n32k4 block instead.
 _RELAYOUT_KIDS = sorted(
     kid
     for kid, inst in _CODEGEN_BMM.items()
-    if inst.needs_mpacked_sfa is not None
-    or inst.needs_shuffle_scale is not None
-    or inst.sf_layout & 1
+    if inst.needs_mpacked_sfa is not None or inst.needs_shuffle_scale is not None
 )
 assert not (set(_TUNE_POLICY) & set(_RELAYOUT_KIDS)), (
     f"kids {sorted(set(_TUNE_POLICY) & set(_RELAYOUT_KIDS))} need a producer-side "
@@ -374,7 +368,7 @@ _TUNE_POLICY.update(
         )
         for kid in _CODEGEN_BMM
         if kid >= BMM_MXSCALE_KID_OFFSET
-        and _kid_block(kid) in ("1x32", "1x32n32k4")
+        and _kid_block(kid) == "1x32"
         and kid not in _RELAYOUT_KIDS
     }
 )
@@ -699,8 +693,6 @@ def gen_bmm_mxscale_data(
     W_bf16 = _gen_varied((batch, n, k), k, device, group)
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16, group=group)
     W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16, group=group, group_n=group_n)
-    if _CODEGEN_BMM[kernel_id].sf_layout & 2:
-        ws_mx = shuffle_scale_n32k4(ws_mx)
     Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
 
     workspace_numel = _workspace_numel(kernel_id, split_k, batch, m, n)
@@ -761,12 +753,7 @@ def _bmm_ref_passthrough(ref):
 # ---------------------------------------------------------------------------
 BMM_BENCH_KEYS = (0, 1, 2, 3, 4, 5, 7)
 BMM_DATA_KIDS = {128: 8179, 32: 9179}
-BMM_BLOCK_DATA_KIDS = {
-    "128x128": 8179,
-    "32x32": 9179,
-    "1x32": 9704,
-    "1x32n32k4": 9731,
-}
+BMM_BLOCK_DATA_KIDS = {"128x128": 8179, "32x32": 9179, "1x32": 9704}
 
 
 def make_bmm_tuning_task(
@@ -906,7 +893,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
 
         def _blocklist(s):
             blocks = tuple(dict.fromkeys(part.strip().lower() for part in s.split(",")))
-            allowed = ("1x32", "1x32n32k4", "32x32", "128x128")
+            allowed = ("1x32", "32x32", "128x128")
             if any(block not in allowed for block in blocks):
                 raise argparse.ArgumentTypeError(
                     "expected comma-separated blocks from " + ", ".join(allowed)
@@ -945,7 +932,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             "--w_scale_block",
             type=_blocklist,
             default=None,
-            help="comma-separated weight-scale blocks (1x32,1x32n32k4,32x32,128x128); "
+            help="comma-separated weight-scale blocks (1x32,32x32,128x128); "
             "filter CSV rows or expand shape-only inputs",
         )
         self.parser.add_argument(
@@ -1010,14 +997,11 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             )
         df["w_scale_block"] = df["w_scale_block"].astype(str).str.strip().str.lower()
         if not df["w_scale_block"].isin(BMM_BLOCK_DATA_KIDS).all():
-            raise ValueError("w_scale_block must be 1x32, 1x32n32k4, 32x32 or 128x128")
-        n_align = df["w_scale_block"].map(
-            {"1x32": 16, "1x32n32k4": 32, "32x32": 128, "128x128": 128}
-        )
+            raise ValueError("w_scale_block must be 1x32, 32x32 or 128x128")
+        n_align = df["w_scale_block"].map({"1x32": 16, "32x32": 128, "128x128": 128})
         if ((df["n"] % n_align != 0) | (df["k"] % 128 != 0)).any():
             raise ValueError(
-                "MXFP8 BMM requires aligned N and K: N16/K128 for 1x32, "
-                "N32/K128 for 1x32n32k4, N128/K128 otherwise"
+                "MXFP8 BMM requires aligned N and K: N16/K128 for 1x32, N128/K128 otherwise"
             )
         if blocks is not None:
             df = df[df["w_scale_block"].isin(blocks)]
@@ -1072,10 +1056,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         self.untunedf = self._normalize_rows(
             df, default_blocks=("32x32", "128x128"), blocks=args.w_scale_block
         )
-        if (
-            not self._bpreshuffle
-            and self.untunedf["w_scale_block"].isin(("1x32", "1x32n32k4")).any()
-        ):
+        if not self._bpreshuffle and self.untunedf["w_scale_block"].eq("1x32").any():
             raise ValueError("1x32 tuning requires --bpreshuffle")
         self.untunedf = (
             self.untunedf[self.untunedf["gfx"] == gfx][self.keys]

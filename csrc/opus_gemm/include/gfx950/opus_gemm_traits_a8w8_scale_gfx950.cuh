@@ -415,22 +415,14 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static_assert(GROUP_M == 1);
     static_assert(GROUP_N == 128 || GROUP_N == 32 || (GROUP_N == 1 && GROUP_K == 32));
     static_assert(GROUP_K == 128 || GROUP_K == 32);
-    // Which scale buffers arrive x32k4-ordered rather than row-major [rows][K/32]:
-    // bit 0 A, bit 1 B. x32k4 is shuffle_scale_n32k4's [rows/32][K/128][32][4],
-    // so one K/128 step of 32 rows is a single 128-byte line. Row-major spends a
-    // line per row on the 8 bytes a K tile needs once K/32 reaches the line
-    // size, which at a per-row B (GROUP_N == 1) is B_N lines per tile.
-    // Bit 2 is a staging choice, not a layout: A's plain row-major scales go into
-    // a whole-split LDS panel (each row read once, as one contiguous run) while B
-    // stays on the ring. The combined panel puts B's rows in too, which at
-    // GROUP_N == 1 is B_N more rows than LDS has room for.
+    // Bit 2 is a staging choice: A's row-major scales go into a whole-split LDS
+    // panel (each row read once, as one contiguous run) while B stays on the
+    // ring. The combined panel puts B's rows in too, which at GROUP_N == 1 is
+    // B_N more rows than LDS has room for. Bits 0 and 1 are unused.
     static constexpr int SF_LAYOUT = opus_sf_layout_of<GROUP>();
-    static constexpr bool SFA_X32K4 = (SF_LAYOUT & 1) != 0;
-    static constexpr bool SFB_X32K4 = (SF_LAYOUT & 2) != 0;
     static constexpr bool SFA_PANEL = (SF_LAYOUT & 4) != 0;
-    static_assert(SF_LAYOUT == 0 || GROUP_K == 32, "x32k4 holds four 32-K scales per row");
-    static_assert(!SFB_X32K4 || GROUP_N == 1, "the B x32k4 order is per N row");
-    static_assert(!(SFA_PANEL && SFA_X32K4), "A is either panel-staged or x32k4, not both");
+    static_assert(SF_LAYOUT == 0 || SF_LAYOUT == 4, "the only scale layout bit is SFA_PANEL");
+    static_assert(SF_LAYOUT == 0 || GROUP_K == 32, "the A panel is a GROUP_K=32 ring kid's");
     static_assert(B_K % GROUP_K == 0,
                   "flatmm K tile must contain whole scale blocks");
     // GROUP_K=32 divides one MFMA's K extent into four scale groups.
@@ -498,14 +490,6 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // Distinct scales a K tile holds, which is what the global buffers and the
     // LDS panels are sized by -- SF_PER_MFMA_K times larger at GROUP_K=32.
     static constexpr int SCALES_PER_BK = B_K / GROUP_K;
-    // x32k4 geometry: a K tile is KD dwords of each row, and a tile narrower than
-    // 32 rows holds R of a 32-row block's rows. The ring slot keeps the global
-    // order, [block][kd][R rows][4], so its fill is one contiguous run per block.
-    static constexpr int SF_X32_KD = SCALES_PER_BK / 4;
-    static constexpr int SFA_X32_R = B_M < 32 ? B_M : 32;
-    static constexpr int SFB_X32_R = B_N < 32 ? B_N : 32;
-    static_assert(SF_LAYOUT == 0 || SCALES_PER_BK % 4 == 0,
-                  "an x32k4 K tile must be whole dwords of each row");
     // What one lane needs in registers: one byte per MFMA, whatever GROUP_K is,
     // because the lane owns one MX block of every MFMA it issues. The two
     // coincide at GROUP_K=128, which is why the pipeline sizes its scale vector
