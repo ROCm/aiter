@@ -107,6 +107,7 @@ def make_quick_allreduce_ring_kernel(
     hidden: int | None = None,
     block: int | None = None,
     h_pad: int | None = None,
+    mxfp4: bool = False,
 ):
     """Build the ring kernel for one *rank*.
 
@@ -126,7 +127,7 @@ def make_quick_allreduce_ring_kernel(
     the only way to reassemble one would be to pin ``super_tile`` at 1 -- which
     is where the ring's throughput goes to die.
     """
-    check_fusion_args(fusion, hidden, h_pad)
+    check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -169,7 +170,11 @@ def make_quick_allreduce_ring_kernel(
         epilogue = QuickReducePlainEpilogue(block=block, world_size=world_size)
     else:
         epilogue = RingRMSNormEpilogue(
-            hidden=hidden, h_pad=h_pad, block=block, world_size=world_size
+            hidden=hidden,
+            h_pad=h_pad,
+            block=block,
+            world_size=world_size,
+            mxfp4=mxfp4,
         )
     block = epilogue.block
     quads_per_block = block // QUAD_LANES
@@ -236,6 +241,9 @@ def make_quick_allreduce_ring_kernel(
         res_out_ptr: fx.Int64,
         w_ptr: fx.Int64,
         eps: fx.Float32,
+        w_bias: fx.Float32,
+        q_ptr: fx.Int64,
+        q_scale_ptr: fx.Int64,
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -278,6 +286,9 @@ def make_quick_allreduce_ring_kernel(
             res_out_ptr=res_out_ptr,
             w_ptr=w_ptr,
             eps=eps,
+            w_bias=w_bias,
+            q_ptr=q_ptr,
+            q_scale_ptr=q_scale_ptr,
             allocator=allocator,
         )
         # Bare names, not ``ep.<hook>(...)``: the rewriter takes a method call
@@ -651,6 +662,9 @@ def make_quick_allreduce_ring_kernel(
             fx.Int64(0),
             fx.Int64(0),
             fx.Float32(0.0),
+            fx.Float32(0.0),
+            fx.Int64(0),
+            fx.Int64(0),
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
@@ -672,6 +686,9 @@ def make_quick_allreduce_ring_kernel(
         res_out_ptr: fx.Int64,
         w_ptr: fx.Int64,
         eps: fx.Float32,
+        w_bias: fx.Float32,
+        q_ptr: fx.Int64,
+        q_scale_ptr: fx.Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         quick_allreduce_ring(
@@ -687,6 +704,9 @@ def make_quick_allreduce_ring_kernel(
             res_out_ptr,
             w_ptr,
             eps,
+            w_bias,
+            q_ptr,
+            q_scale_ptr,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),

@@ -386,3 +386,14 @@ def make_hbm_operand(*, padded, nbytes, hbm_i32_ptr, hbm_layout):
         return rocdl.make_buffer_tensor(view, max_size=False, num_records_bytes=n)
 
     return _operand
+
+
+def make_pack_norm_storage(n_i32: int, n_red_f32: int):
+    """``make_pack_storage`` plus *n_red_f32* fp32 words of norm partial sums."""
+
+    @fx.struct
+    class PackNormStorage:
+        pack: fx.Array[fx.Int32, n_i32, 16]
+        red: fx.Array[fx.Float32, n_red_f32, 16]
+
+    return PackNormStorage

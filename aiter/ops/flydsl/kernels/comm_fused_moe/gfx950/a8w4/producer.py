@@ -27,19 +27,13 @@ def compile_mark_written_routes(tokens: int, topk: int):
         valid = global_typed_ptr(fx.Int64(ptrtoint(validity)), T.i32)
         ids = global_typed_ptr(fx.Int64(ptrtoint(sorted_ids)), T.i32)
         count = global_typed_ptr(fx.Int64(ptrtoint(counts)), T.i32)[0]
-        index = fx.Int32(gpu.block_id("x")) * fx.Int32(256) + fx.Int32(
-            gpu.thread_id("x")
-        )
-        stride = fx.Int32(gpu.grid_dim.x) * fx.Int32(256)
+        index = fx.Int32(gpu.block_id("x")) * 256 + fx.Int32(gpu.thread_id("x"))
+        stride = fx.Int32(gpu.grid_dim.x) * 256
         for item in range(index, count, stride):
             packed = fx.Int32(ids[item])
-            token = packed & fx.Int32(0x00FFFFFF)
-            slot = packed >> fx.Int32(24)
-            if (
-                (token < fx.Int32(tokens))
-                & (slot >= fx.Int32(0))
-                & (slot < fx.Int32(topk))
-            ):
+            token = packed & 0x00FFFFFF
+            slot = packed >> 24
+            if (token < fx.Int32(tokens)) & (slot >= 0) & (slot < fx.Int32(topk)):
                 # Sorting emits each retained (token, slot) exactly once.
                 valid[token * fx.Int32(topk) + slot] = fx.Int32(1)
 
@@ -73,13 +67,11 @@ def compile_clear_missing_routes(rows: int, row_bytes: int, payload_bytes: int):
     def kernel(route: fx.Pointer, validity: fx.Pointer):
         output = global_typed_ptr(fx.Int64(ptrtoint(route)), T.i32)
         valid = global_typed_ptr(fx.Int64(ptrtoint(validity)), T.i32)
-        index = fx.Int32(gpu.block_id("x")) * fx.Int32(256) + fx.Int32(
-            gpu.thread_id("x")
-        )
-        stride = fx.Int32(gpu.grid_dim.x) * fx.Int32(256)
+        index = fx.Int32(gpu.block_id("x")) * 256 + fx.Int32(gpu.thread_id("x"))
+        stride = fx.Int32(gpu.grid_dim.x) * 256
         for item in range(index, fx.Int32(rows * words_per_row), stride):
             row = item // fx.Int32(words_per_row)
-            if fx.Int32(valid[row]) == fx.Int32(0):
+            if fx.Int32(valid[row]) == 0:
                 column = item % fx.Int32(words_per_row)
                 output[item] = (column < fx.Int32(payload_words)).select(
                     fx.Int32(0), fx.Int32(0x7F7F7F7F)
@@ -99,8 +91,8 @@ def compile_clear_missing_routes(rows: int, row_bytes: int, payload_bytes: int):
 @flyc.jit
 def resolve_route_input_row(packed, tokens, topk):
     packed = fx.Int32(packed)
-    token = packed & fx.Int32(0x00FFFFFF)
-    route_slot = packed >> fx.Int32(24)
+    token = packed & 0x00FFFFFF
+    route_slot = packed >> 24
     valid = (token < tokens) & (route_slot < fx.Int32(topk))
     return valid.select(
         token * fx.Int32(topk) + route_slot,

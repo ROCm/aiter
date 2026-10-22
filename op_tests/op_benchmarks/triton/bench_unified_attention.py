@@ -488,13 +488,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Sliding window size (default: disabled)",
     )
-    parser.add_argument(
-        "-backend",
-        type=str,
-        default=None,
-        choices=["triton", "gluon"],
-        help="Kernel backend",
-    )
+
     parser.add_argument(
         "--shuffled_kv_cache",
         "-shuffled_kv_cache",

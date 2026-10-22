@@ -400,8 +400,11 @@ def make_row_io(
 # -- fusion-agnostic: factory arguments ----------------------------------------
 
 
-def check_fusion_args(fusion: str, hidden: int | None, h_pad: int | None) -> None:
-    """Reject a ``fusion``/``hidden``/``h_pad`` combination no factory builds."""
+def check_fusion_args(
+    fusion: str, hidden: int | None, h_pad: int | None, *, mxfp4: bool = False
+) -> None:
+    """Reject a ``fusion``/``hidden``/``h_pad``/``mxfp4`` combination no factory
+    builds."""
     if fusion not in FUSIONS:
         raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
     if fusion != "none" and hidden is None:
@@ -410,6 +413,10 @@ def check_fusion_args(fusion: str, hidden: int | None, h_pad: int | None) -> Non
         raise ValueError("hidden is only meaningful for a fused build")
     if fusion == "none" and h_pad is not None:
         raise ValueError("h_pad is only meaningful for a fused build")
+    if mxfp4 and fusion != "rmsnorm":
+        raise ValueError("mxfp4 needs fusion='rmsnorm'")
+    if mxfp4 and h_pad is not None and h_pad != hidden:
+        raise ValueError("mxfp4 does not support a padded build")
 
 
 def resolve_h_pad(hidden: int, h_pad: int | None) -> int:
@@ -627,6 +634,15 @@ def block_reduce_add(values, *, tid, block: int, lds=None):
 # -- RMSNorm ------------------------------------------------------------------
 
 
+#: Elements one MXFP4 e8m0 scale covers.
+MXFP4_GROUP = 32
+
+
+def mxfp4_scale_shape(rows: int, hidden: int) -> tuple[int, int]:
+    """Shuffled e8m0 scale buffer of ``per_1x32_f4_quant_hip(shuffle=True)``."""
+    return (int(rows) + 255) // 256 * 256, (int(hidden) // MXFP4_GROUP + 7) // 8 * 8
+
+
 def residual_add(ar_f32, res_atoms):
     """``float(bf16(all_reduce)) + float(residual)``, per atom, in fp32.
 
@@ -772,10 +788,16 @@ def xchg_total(delta):
     return (poisoned == fx.Int64(0)).select(total, fx.Float32(float("nan")))
 
 
-def scale_by_weight(values, rstd, w_atoms):
-    """``bf16(x * rstd * weight)`` per atom, the RMSNorm output."""
+def scale_by_weight(values, rstd, w_atoms, w_bias=None):
+    """``bf16(x * rstd * (weight + w_bias))`` per atom, the RMSNorm output.
+
+    *w_bias* is a runtime fp32 scalar: 1.0 for Gemma's ``(1 + w)`` gain, 0.0 (or
+    None, which skips the add) for the usual one.
+    """
     out = []
     for atom in range_constexpr(len(values)):
         w = atom_bf16_to_f32(w_atoms[atom])
+        if w_bias is not None:
+            w = w + fx.full(ATOM_ELEMS, w_bias, fx.Float32)
         out.append(atom_f32_to_bf16(values[atom] * rstd * w))
     return out
