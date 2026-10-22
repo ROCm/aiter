@@ -138,3 +138,41 @@ def test_act_mul_and_mxfp4_quant(
 
     torch.testing.assert_close(triton_out, torch_out)
     torch.testing.assert_close(triton_scale, torch_scale)
+
+
+@pytest.mark.parametrize("M, N", [(1, 34816), (16, 34816), (33, 8192), (256, 1024)])
+@pytest.mark.parametrize("activation", ["silu", "gelu"])
+def test_act_mul_and_mxfp4_quant_ceil_matches_round_up(M: int, N: int, activation):
+    """scaling_mode="ceil" gives the RoundUp scale of per_1x32_f4_quant."""
+    from aiter.ops.quant import per_1x32_f4_quant
+    from aiter.utility.mx_types import MxScaleRoundModeInt
+
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(7)
+    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda") * 4
+    # Make the first 32-wide block of row 0 all zero after act(gate) * up.
+    x[0, :32] = 0
+    x[0, N // 2 : N // 2 + 32] = 0
+
+    out, scale = act_mul_and_mxfp4_quant(x, activation, scaling_mode="ceil")
+
+    gate, up = x.float().chunk(2, dim=-1)
+    y = (F.silu(gate) if activation == "silu" else F.gelu(gate)) * up
+    ref_out, ref_scale = per_1x32_f4_quant(
+        y, shuffle=False, round_mode=MxScaleRoundModeInt.RoundUp
+    )
+    ref_scale = ref_scale.view(torch.uint8)
+
+    torch.testing.assert_close(out, ref_out.view(torch.uint8), atol=0, rtol=0)
+    # The one documented difference: an all-zero block gets byte 1, not 0.
+    assert scale[0, 0].item() == 1 and ref_scale[0, 0].item() == 0
+    scale[0, 0] = 0
+    torch.testing.assert_close(scale, ref_scale, atol=0, rtol=0)
+
+
+def test_act_mul_and_mxfp4_quant_rejects_unknown_scaling_mode():
+    x = torch.zeros((1, 64), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="scaling_mode"):
+        act_mul_and_mxfp4_quant(x, "silu", scaling_mode="round_up")
