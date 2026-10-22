@@ -35,6 +35,7 @@ from aiter.aot.flydsl.common import (
     override_env,
     run_jobs_parallel,
 )
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 # The whole family is pinned to the gfx950 production config; attention has no
 # CSV cu_num column, so the target arch is hardcoded per job.
@@ -250,4 +251,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main(sys.argv[1:])
