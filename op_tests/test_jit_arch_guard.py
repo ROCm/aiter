@@ -55,6 +55,31 @@ def test_missing_file_is_empty():
     assert _so_offload_archs("/no/such/module.so") == set()
 
 
+def test_parse_offload_archs_keeps_full_target_ids():
+    """Target-id features, the strict suffix, and ROCm generic targets.
+
+    The parser stops at the ':' that starts a feature list, but it must keep
+    every hyphenated part of the processor name itself.  Truncating at the
+    first hyphen reported gfx1250-strict as gfx1250 (the bug this guard
+    exists to prevent) and gfx9-4-generic as gfx9, which never matches a
+    running arch and so rebuilt the module on every import.
+    """
+    cases = {
+        b"amdhsa--gfx90a:sramecc+:xnack-": "gfx90a",
+        b"amdhsa--gfx1250-strict": "gfx1250-strict",
+        b"amdhsa--gfx1250-strict:xnack-": "gfx1250-strict",
+        b"amdhsa--gfx9-4-generic": "gfx9-4-generic",
+    }
+    for blob, expected in cases.items():
+        with tempfile.NamedTemporaryFile(suffix=".so", delete=False) as f:
+            f.write(b"\x00ELF junk hipv4-amdgcn-amd-" + blob + b"\x00tail")
+            path = f.name
+        try:
+            assert _so_offload_archs(path) == {expected}, blob
+        finally:
+            os.remove(path)
+
+
 def test_validate_strict_build_target():
     old = os.environ.get("GPU_ARCHS")
     try:
