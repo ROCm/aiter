@@ -217,6 +217,8 @@ def main():
             speedup_pct=100 * (g / hip - 1),
             logical_kv_tbps=kv_bytes / hip / 1e6,
             logical_kv_qo_tbps=(kv_bytes + qo_bytes) / hip / 1e6,
+            gluon_logical_kv_tbps=kv_bytes / g / 1e6,
+            gluon_logical_kv_qo_tbps=(kv_bytes + qo_bytes) / g / 1e6,
         )
         if args.tilelang:
             t = statistics.median(medians[n]["TileLang"])

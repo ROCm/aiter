@@ -122,8 +122,8 @@ identity between Torch division and the hardware reciprocal instruction.
 The additional KV+Q/O payload rate uses
 `Q * (valid_K * 512 + 2 * 64 * 512 * 2) / backend_us / 1e6` TB/s; the second
 term counts the BF16 Q read and BF16 O write once. Both rates are available
-for HIP and, with `--tilelang`, TileLang. They exclude repeated head reads,
-index and intermediate traffic, including TileLang's separate FP8 Q cast.
+for HIP and Gluon and, with `--tilelang`, TileLang. They exclude repeated head
+reads, index and intermediate traffic, including TileLang's separate FP8 Q cast.
 Neither rate is measured HBM traffic. Operator timings do not establish
 serving throughput.
 
