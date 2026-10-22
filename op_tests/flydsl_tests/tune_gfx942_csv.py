@@ -25,18 +25,15 @@ Tuning a shape:
 Examples:
 
   # Seed the table with the fallback configs for a shape list.
-  HIP_VISIBLE_DEVICES=6 PYTHONPATH=$PWD flydsl_venv/bin/python \\
-    op_tests/flydsl_tests/tune_gfx942_csv.py --seed \\
+  python op_tests/flydsl_tests/tune_gfx942_csv.py --seed \\
     --shapes op_tests/flydsl_tests/gfx942_gemm_tuning_shapes.csv
 
   # Tune one shape (screen 80 candidates), updating the table if a config wins.
-  HIP_VISIBLE_DEVICES=6 PYTHONPATH=$PWD flydsl_venv/bin/python \\
-    op_tests/flydsl_tests/tune_gfx942_csv.py --M 1024 --N 336 --K 10240 \\
+  python op_tests/flydsl_tests/tune_gfx942_csv.py --M 1024 --N 336 --K 10240 \\
     --limit 80 --resume
 
   # Benchmark what gemm_a16w16 runs by default (table row, else fallback).
-  HIP_VISIBLE_DEVICES=6 PYTHONPATH=$PWD flydsl_venv/bin/python \\
-    op_tests/flydsl_tests/tune_gfx942_csv.py --current-only \\
+  python op_tests/flydsl_tests/tune_gfx942_csv.py --current-only \\
     --shapes op_tests/flydsl_tests/gfx942_gemm_tuning_shapes.csv --csv run.csv
 """
 

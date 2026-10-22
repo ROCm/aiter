@@ -4,11 +4,11 @@
 """Oracle-gated correctness tests for the native gfx942 (CDNA3) bf16 GEMM.
 
 Compares the kernel against an f32 matmul oracle (bf16 inputs upcast to f32)
-within bf16 tolerance, across every ticket regime -- HC down (large-K/narrow-N),
-HC up (short-K/wide-N), decode/GEMV (tiny M), square compute-bound -- plus
-non-divisible-M boundary shapes. Exercised both directly (``gemm_a16w16``) and
-through the public ``flydsl_hgemm`` dispatch (per-shape auto-config), with the
-fp32-output and explicit split-K paths spot-checked.
+within bf16 tolerance. Shapes cover down projections (large K, narrow N), up
+projections (short K, wide N), decode (tiny M), square compute-bound GEMMs and
+M/N boundary tiles, through both ``gemm_a16w16`` and the public
+``flydsl_hgemm`` dispatch (per-shape auto-config). Explicit configs cover every
+main-loop pipeline, split-K mode and output dtype.
 
 Skips unless running on real gfx942 hardware.
 """
@@ -54,19 +54,19 @@ def _guarded_out(m, n, dtype):
     return torch.full((m + 64, n), float("nan"), dtype=dtype, device="cuda")
 
 
-# ticket regimes: (M, N, K, regime)
+# (M, N, K, regime)
 SHAPES = [
-    (1, 384, 10240, "hc-down"),
-    (4, 384, 10240, "hc-down"),
-    (512, 384, 10240, "hc-down"),
-    (1024, 384, 10240, "hc-down-specialized"),
-    (2048, 384, 10240, "hc-down"),
-    (8192, 384, 10240, "hc-down"),
-    (1, 10240, 320, "hc-up"),
-    (4, 10240, 320, "hc-up"),
-    (512, 10240, 320, "hc-up"),
-    (2048, 10240, 320, "hc-up"),
-    (8192, 10240, 320, "hc-up"),
+    (1, 384, 10240, "down"),
+    (4, 384, 10240, "down"),
+    (512, 384, 10240, "down"),
+    (1024, 384, 10240, "down"),
+    (2048, 384, 10240, "down"),
+    (8192, 384, 10240, "down"),
+    (1, 10240, 320, "up"),
+    (4, 10240, 320, "up"),
+    (512, 10240, 320, "up"),
+    (2048, 10240, 320, "up"),
+    (8192, 10240, 320, "up"),
     (1, 4096, 4096, "decode"),
     (4096, 4096, 4096, "square"),
     (8192, 8192, 8192, "square"),
@@ -74,7 +74,7 @@ SHAPES = [
     (100, 384, 10240, "boundary-M"),
     (1000, 10240, 320, "boundary-M"),
     (4095, 4096, 4096, "boundary-M"),
-    # non-divisible-N: the real gated-residual down projection (N=336)
+    # non-divisible-N: N=336 and N=344 are not multiples of 64
     (1024, 336, 10240, "boundary-N"),
     (4096, 336, 10240, "boundary-N"),
     (1000, 336, 10240, "boundary-MN"),
@@ -281,7 +281,7 @@ def test_gemm_a16w16_gfx942_pingpong_edge_tiles(m, n, split_k, out_dtype):
 )
 @pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
 def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile, out_dtype):
-    """Streamed-operand pingpong: edge tiles, split-K, k_waves and K=2 tiles."""
+    """Streamed-operand pingpong: edge tiles, split-K, k_waves and two-K-tile shapes."""
     _require_gfx942()
     x, w, ref = _inputs(m, n, k)
     out = _guarded_out(m, n, out_dtype)

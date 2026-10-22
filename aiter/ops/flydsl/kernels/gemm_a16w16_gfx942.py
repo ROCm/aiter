@@ -7,7 +7,7 @@ C[M, N] = A[M, K] @ B[K, N], nn.Linear ``nt`` convention (A row-major [M,K],
 B column-major [K,N] i.e. the ``w.t()`` view of a [N,K] weight). Only ``nt`` is
 supported: the transposed-operand LDS reads need CDNA4's ``ds_read_tr``.
 
-This is a ground-up CDNA3 kernel, *not* a de-tuned fork of the gfx950 kernel:
+CDNA3 specifics:
 - bf16 ``16x16x16`` MFMA (gfx950 is ``16x16x32``); the tiled-MMA K layout uses
   ``ab_k_perm`` so a 128-bit LDS->reg read pairs with two MFMA K-groups.
 - 64 KB LDS budget.
@@ -69,11 +69,11 @@ from .kernels_common import run_cached
 
 WAVE_SIZE = GFX950_WAVE_SIZE  # 64 lanes on CDNA3
 SMEM_CAPACITY_GFX942 = 65536  # 64 KB LDS / CU
-GFX942_NUM_CUS = 304  # MI300X compute units (grid-fill threshold for stage picking)
+GFX942_NUM_CUS = 304  # MI300X CUs: workgroups per round in the cost model
 
 GEMM_A16W16_DTYPE_BF16 = 2
 GEMM_A16W16_DTYPE_FP32 = 1
-# gfx940 buffer cache policy: sc0 | sc1 (system coherent, bypasses the per-XCD L2).
+# CDNA3 buffer cache policy sc0 | sc1: system coherent, bypasses the per-XCD L2.
 CPOL_SC0_SC1 = 1 | 16
 
 
@@ -115,8 +115,8 @@ class GemmA16W16Gfx942Param:
     pingpong: fx.Constexpr[bool]
     split_k_reduce: fx.Constexpr[bool]
     stream_operands: fx.Constexpr[bool]
-    # derived
     async_load_bytes: fx.Constexpr[int]
+    # derived
     in_data_bytes: fx.Constexpr[int]
     out_data_bytes: fx.Constexpr[int]
     cshuffle_r2g_vec_size: fx.Constexpr[int]
@@ -162,7 +162,7 @@ def make_gemm_a16w16_gfx942_param(
 ) -> GemmA16W16Gfx942Param:
     if in_dtype_id != GEMM_A16W16_DTYPE_BF16:
         raise ValueError(
-            f"gfx942 kernel is bf16-only for now (got in_dtype_id={in_dtype_id})"
+            f"gfx942 kernel is bf16-only (got in_dtype_id={in_dtype_id})"
         )
     if out_dtype_id not in (in_dtype_id, GEMM_A16W16_DTYPE_FP32):
         raise ValueError(f"unsupported out_dtype_id={out_dtype_id}")
@@ -217,8 +217,9 @@ def make_gemm_a16w16_gfx942_param(
     out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
     block_threads = m_waves * n_waves * k_waves * WAVE_SIZE
 
-    # Register->global store vector width for the cshuffle epilogue. Atomic
-    # split-K caps it at 4 so the atomic-add granularity stays modest.
+    # LDS->global vector width of the cshuffle epilogue: 128 bits. Atomic
+    # split-K always outputs fp32 (gemm_a16w16 gives bf16 an fp32 scratch),
+    # so its vector is 4 wide.
     max_cshuffle_vec = 16 // out_dbytes
     atomic_split_k = split_k > 1 and not split_k_reduce
     cshuffle_r2g_vec_size = (
@@ -278,7 +279,8 @@ def make_gemm_a16w16_gfx942_param(
         raise ValueError("A tile not covered by whole-thread vector loads")
     if ldg_b_iters * block_threads * async_load_vec_size != block_n * block_k:
         raise ValueError("B tile not covered by whole-thread vector loads")
-    # vmcnt budget for in-flight async loads (stages-2 groups queued ahead).
+    # vmcnt tracks at most 63 outstanding loads; the async pipelines keep
+    # stages-2 tiles of loads in flight.
     if (stages - 2) * (ldg_a_iters + ldg_b_iters) >= 63:
         raise ValueError("too many in-flight async loads for the vmcnt budget")
 
@@ -353,10 +355,10 @@ def make_k_sliced_lds_layout(rows, block_k, k_waves):
     """Row-major ``(rows, block_k)`` LDS tile stored as ``k_waves`` K sub-tiles.
 
     Each ``(rows, block_k // k_waves)`` sub-tile is contiguous and carries the
-    same swizzle as ``make_lds_layout``, so a K wave addresses its slice through
-    a base-pointer offset and a static layout. The 3-bit swizzle never touches
-    the sub-tile index bits because every sub-tile spans a multiple of 512
-    elements.
+    swizzle of ``make_lds_layout`` (gemm_a16w16_gfx950_utils), so a K wave
+    addresses its slice through a base-pointer offset and a static layout. The
+    3-bit swizzle never touches the sub-tile index bits because every sub-tile
+    spans a multiple of 512 elements.
     """
     block_k_w = block_k // k_waves
     assert (rows * block_k_w) % 512 == 0
@@ -372,7 +374,7 @@ def make_k_sliced_lds_layout(rows, block_k, k_waves):
 def make_gfx942_load_context(
     elem_dtype, load_tid, ks_begin, param: GemmA16W16Gfx942Param
 ):
-    """Build the AB load context, selecting the async-to-LDS atom by DMA width."""
+    """Copy atoms and per-thread offsets of the A/B global->LDS loads."""
     uni_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
     buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
     if const_expr(param.buffered_load):
@@ -665,13 +667,11 @@ def _schedule_buffered_single_stage(s: _KernelState):
     n_mfma = m_rep * n_rep * (param.block_k // param.mma_k)
     n_dswr = param.ldg_a_iters + param.ldg_b_iters
     if s.fine_schedule:
-        # EM3EN4-style hot-loop schedule for buffered tiles. The operations are
-        # deliberately emitted in dependency order (next-tile VMEM,
-        # current-tile DSRD, next-tile DSWR, current-tile MFMA); these
-        # directives make LLVM interleave a small DSRD preload, paired
-        # DSRD/VMEM groups under MFMAs, any residual reads/loads, then DSWR
-        # under the MFMA tail. This mirrors the gfx942 Opus/Tensile EM3EN4
-        # schedule while deriving all counts from the selected tile.
+        # Ops are emitted in dependency order (next-tile buffer_load,
+        # current-tile ds_read, next-tile ds_write, current-tile MFMA). These
+        # directives interleave them as: two ds_reads up front, ds_read +
+        # buffer_load pairs under MFMAs, the leftover reads/loads, then the
+        # ds_writes under the MFMA tail.
         n_dsrd = s.copy_chunks * (m_rep + n_rep)
         dsrd_preload = 2
         paired_iters = min(n_dswr, (n_dsrd - dsrd_preload) // 2)
@@ -764,7 +764,10 @@ def _prime_async_stages(s: _KernelState):
 
 @flyc.jit
 def _main_loop_async(s: _KernelState):
-    """Async global->LDS DMA over ``stages`` buffers, reading the current tile inline."""
+    """Async global->LDS DMA over ``stages`` buffers, reading the current tile inline.
+
+    Needs k_tiles >= stages - 1 (checked on the host).
+    """
     # Method calls on a name inside a dynamic loop mark it loop-carried, so
     # every helper the loops call is bound to a local first.
     stages = s.param.stages
@@ -800,6 +803,7 @@ def _main_loop_async_reg_db(s: _KernelState):
     MFMAs, so the read stays in flight during the MFMAs and its lgkmcnt wait
     lands on the next iteration's work. stages >= 3 keeps the stage being read
     (k+1) apart from the one being async-written (k+stages-1).
+    Needs k_tiles >= stages - 1 (checked on the host).
     """
     stages = s.param.stages
     frag_A = s.frag_A
@@ -1053,10 +1057,10 @@ def _store_cshuffle(
         else:
             gpu.barrier()
 
-        # Row-major vectors are dealt round-robin over every thread. That is
-        # no TV layout when block_n // vec does not divide the thread count
-        # (block_n 48, 96, 112, 160, 192), and a tiled copy would idle threads
-        # and add a pass; the global write is shared with atomic split-K.
+        # Hand-indexed: row-major vectors go round-robin over all threads.
+        # No TV layout expresses that when block_n // vec does not divide the
+        # thread count (block_n 48, 96, 112, 160, 192); a tiled copy would
+        # idle threads and add a pass.
         for i in range_constexpr(cshuffle_iters):
             vector_idx = block_threads * i + tid
             if vector_idx < cshuffle_vectors:
@@ -1114,6 +1118,8 @@ def gemm_a16w16_gfx942_kernel(
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
     direct_store = param.direct_store
     c_chunks = param.c_chunks
+    # Tiles whose buffered stages=1 loop uses the hand-placed schedule in
+    # _schedule_buffered_single_stage.
     fine_schedule = const_expr(
         (block_m == 128 and block_n == 96 and block_k == 128 and param.n_waves == 2)
         or (block_m == 128 and block_n == 256 and block_k == 64)
@@ -1154,11 +1160,9 @@ def gemm_a16w16_gfx942_kernel(
         tid_mn = tid
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
-    # NUM_PIDS_THRESHOLD=0: only gate the XCD-aware swizzle on grid/XCD
-    # divisibility (required for the remap bijection), not on a block-count
-    # minimum. The old 256 floor silently disabled the swizzle for narrow-N
-    # "hc-down" grids (e.g. M2048: 32x6=192 blocks < 256), which left us L2-bound
-    # (44% hit vs hipBLASLt 81%). Swizzle only activates when group_m > 0.
+    # XCD-aware block remap, active when group_m > 0. NUM_PIDS_THRESHOLD=0
+    # applies it to grids of any size (the grid must still divide across the
+    # 8 XCDs): small narrow-N grids such as 32x6 blocks need it for L2 reuse.
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=0, GROUP_M=param.group_m
     )
@@ -1197,8 +1201,9 @@ def gemm_a16w16_gfx942_kernel(
 
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
-    # Direct stores are only range-checked by the descriptor: rows past M fall
-    # beyond the buffer end, which is why direct_store needs an exact N.
+    # Direct stores rely on the descriptor's range check: rows past M fall
+    # beyond the buffer end and are dropped, but columns past N would wrap
+    # into the next row, so direct_store needs N to be a block_n multiple.
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=not direct_store)
 
     if const_expr(is_split_k):
@@ -1275,10 +1280,8 @@ def gemm_a16w16_gfx942_kernel(
         frag_pf_A_ret = thr_copy_A.retile(frag_pf_A)
         frag_pf_B_ret = thr_copy_B.retile(frag_pf_B)
 
-    # Buffered-load tiled copies (128-bit buffer_load global->reg, then ds_write
-    # reg->LDS). gfx942 has no 128-bit async-to-LDS; staging through registers
-    # with a layout-aware r2s copy writes the *swizzled* LDS tile correctly at any
-    # vector width (the manual contiguous-DMA trick only matched at vec=2).
+    # Buffered-load tiled copies: 128-bit buffer_load global->reg, then a
+    # layout-aware reg->LDS copy into the swizzled LDS tile.
     load_ab_to_reg = commit_ab_to_lds = None
     if const_expr(param.buffered_load):
         vec_per_thread = param.async_load_bytes // param.in_data_bytes
@@ -1425,9 +1428,9 @@ def gemm_a16w16_gfx942_kernel(
         )
         for c in range_constexpr(c_begin, c_end):
             if const_expr(param.buffered_load and fine_schedule and stages == 1):
-                # Emit the first A/B pair together so the first MFMA waits on
-                # two LDS reads rather than A0/A1/B0. Remaining repeats are
-                # free to move under the MFMA cluster via the schedule below.
+                # Interleave A and B repeats so the first MFMA waits on two
+                # LDS reads (A0, B0) rather than every A repeat first.
+                # _schedule_buffered_single_stage places the rest under MFMAs.
                 m_repeat = const_expr(block_m // param.m_waves // param.mma_m)
                 n_repeat = const_expr(block_n // param.n_waves // param.mma_n)
                 for r in range_constexpr(max(m_repeat, n_repeat)):
@@ -1459,7 +1462,7 @@ def gemm_a16w16_gfx942_kernel(
             )
 
     def compute_stage(read_stage):
-        """Single-buffer compute: chunk-pipeline the ds_read vs the MFMAs."""
+        """Compute one LDS stage, issuing chunk c+1's ds_read before chunk c's MFMAs."""
         thr_sA = thr_copy_A.partition_S(
             fx.make_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
         )
@@ -1689,7 +1692,7 @@ def pingpong_fill_cost_us(
 ) -> float:
     """Modelled runtime of one round of single-CU pingpong workgroups.
 
-    Least-squares fit (14% rms) to ~1500 graph-timed pingpong configs on GPU6
+    Least-squares fit (14% rms) to ~1500 graph-timed pingpong configs on MI300X
     (N=256..2048, K=2048..10240): one bk128 tile costs 0.0205us per MFMA per
     SIMD plus 0.23us, and the split-K workspace reduction adds 2.86us plus
     54us per MB of fp32 partials. A tile is never faster than streaming its
@@ -1700,12 +1703,12 @@ def pingpong_fill_cost_us(
     t_tile = max(0.0205 * (bm * bn / 128) + 0.23, (bm + bn) * 256 / 35e3)
     per_split = -(-k_tiles // split_k)
     if k_waves > 1 and split_k > 1 and bm * bn <= 64 * 64:
-        # Small k_waves=2 tiles save ~7% per K tile against a fixed LDS
-        # reduction of ~1.7 tiles, so they win on long splits (kw2/kw1: 1.10
-        # at 10 tiles per split, 0.97 at 27; 1024x336x10240 sk3 36.0->32.4us).
+        # Small k_waves=2 tiles save ~7% per K tile but pay a fixed LDS
+        # reduction of ~1.7 tiles, so they win on long splits.
         cost = 1.8 + (0.93 * per_split + 1.7) * t_tile
     else:
         if k_waves > 1 and split_k > 1:
+            # Larger k_waves=2 tiles measured ~11% slower per K tile.
             t_tile *= 1.107
         cost = 1.8 + per_split * t_tile
     if split_k > 1:
@@ -1880,8 +1883,7 @@ _AUTO_ONLY_PIPELINE_KEYS = (
     "stream_operands",
 )
 
-# Config columns of the tuned table (aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv);
-# a row holds a complete config, so it never inherits heuristic flags.
+# Config columns of the tuned table (aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv).
 TUNED_CONFIG_COLUMNS = (
     "block_m",
     "block_n",
