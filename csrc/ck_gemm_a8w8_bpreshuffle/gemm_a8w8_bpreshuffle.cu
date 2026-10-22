@@ -16,7 +16,9 @@ using RowwiseKernelMap = GemmDispatchMap<RowwiseKernel>;
 template <typename DDataType, typename EDataType = DDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
-    if(K >= 1536)
+    // Most K >= 512 instances step K by 128; a K that is only a multiple of 64
+    // takes the KPerBlock 64 instances below.
+    if(K >= 1536 && K % 128 == 0)
     {
         if(M < 256 && K % 512 == 0)
         {
@@ -49,7 +51,7 @@ RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
             }
         }
     }
-    else if(K >= 512)
+    else if(K >= 512 && K % 128 == 0)
     {
         if(M < 64)
         {
