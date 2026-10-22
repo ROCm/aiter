@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Benchmark SonicMoE forward and training throughput."""
 
+import functools
+
 import torch
 import triton
 
@@ -10,10 +12,16 @@ from aiter.ops.triton.moe.sonicmoe import (
     moe_TC_softmax_topk_layer,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 # tokens, hidden, intermediate, experts, top-k, label
 _SHAPES = [
@@ -38,7 +46,12 @@ def _setup(tokens, hidden, intermediate, experts, top_k):
     return x, router, w1, w2, grad
 
 
+_SONICMOE_POOL_FIELDS = ["x", "router", "w1", "w2", "grad"]
+
+
 def benchmark(args):
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     unit = {"time": "ms", "throughput": "TFLOPS"}[args.metric]
     config = triton.testing.Benchmark(
         x_names=["tokens", "hidden", "intermediate", "experts", "top_k", "label"],
@@ -54,10 +67,15 @@ def benchmark(args):
 
     @triton.testing.perf_report([config])
     def _run(tokens, hidden, intermediate, experts, top_k, label, provider):
-        x, router, w1, w2, grad = _setup(tokens, hidden, intermediate, experts, top_k)
+        pool_gen = functools.partial(
+            _setup, tokens, hidden, intermediate, experts, top_k
+        )
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_SONICMOE_POOL_FIELDS], **kwargs_rot_bufs
+        )
 
-        def forward():
-            return moe_TC_softmax_topk_layer(
+        def kernel_fn(x, router, w1, w2, grad):
+            out = moe_TC_softmax_topk_layer(
                 x,
                 router,
                 w1,
@@ -68,19 +86,15 @@ def benchmark(args):
                 torch.cuda.current_stream().cuda_stream,
                 SonicMoEActivationType.SWIGLU,
             )[0]
-
-        if provider == "forward":
-            fn = forward
-            flops = 6 * tokens * top_k * hidden * intermediate
-        else:
-
-            def fn():
-                out = forward()
+            if provider == "forward_backward":
                 torch.autograd.grad(out, (x, w1, w2), grad)
 
+        if provider == "forward":
+            flops = 6 * tokens * top_k * hidden * intermediate
+        else:
             flops = 18 * tokens * top_k * hidden * intermediate
 
-        ms = triton.testing.do_bench(fn, warmup=10, rep=50)
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         if args.metric == "time":
             return ms
         return flops * 1e-12 / (ms * 1e-3)

@@ -2,8 +2,9 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 """Benchmark the mxfp4 x mxfp4 MoE MLP (two moe_gemm_a4w4 calls).
 
-Each batch size is measured three times with `triton.testing.do_bench_cudagraph`
-and reported as three rows, keyed by the `layer` column:
+Each batch size is measured with `do_bench_aiter_triton` (a rotating-buffer
+CUDA graph replay) and reported as up to three rows, keyed by the `layer`
+column:
 
   moe1   the gathered up projection alone   (N = dim2 / TP, K = dim1, + swiglu)
   moe2   the scattered down projection alone (N = dim1, K = dim2 / TP / 2)
@@ -59,6 +60,7 @@ preshuffle.
 
 import argparse
 import csv
+import functools
 import inspect
 import os
 from itertools import chain
@@ -85,7 +87,15 @@ from aiter.ops.triton.moe.moe_routing.routing import (
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+)
 
 # measurable layers, in report order; see the module docstring. "combine" only
 # exists under --multi-gpu, where there is a real mori combine to measure.
@@ -427,41 +437,6 @@ def mori_src_token_map(batch, world, dev):
     return torch.arange(batch, dtype=torch.int32, device=dev)
 
 
-def do_bench_cudagraph_synced(fn, rep, group):
-    import torch.distributed as dist
-
-    with torch.cuda.stream(torch.cuda.Stream()):
-        fn()  # warmup
-        start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-        start.record()
-        for _ in range(5):
-            fn()
-        end.record()
-        torch.cuda.synchronize()
-        estimate_ms = start.elapsed_time(end) / 5
-
-        agreed = torch.tensor([estimate_ms], dtype=torch.float64)
-        dist.all_reduce(agreed, op=dist.ReduceOp.MAX, group=group)
-        estimate_ms = float(agreed[0])
-        n_repeat = 1000 if estimate_ms == 0 else max(1, int(rep / estimate_ms))
-
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for _ in range(n_repeat):
-                fn()
-        torch.cuda.synchronize()
-
-        times = []
-        for _ in range(10):
-            start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-            start.record()
-            g.replay()
-            end.record()
-            torch.cuda.synchronize()
-            times.append(start.elapsed_time(end) / n_repeat)
-    return sum(times) / len(times)
-
-
 def backend_name(backend=None):
     """Backend moe_gemm_a4w4 runs, resolving None the way the op does."""
     if backend is not None:
@@ -477,7 +452,273 @@ def kernel_variant(block_m, backend=None):
     return "_moe_gemm_a4w4_decode" if block_m == 16 else "_moe_gemm_a4w4_prefill"
 
 
-def bench_mlp_single_weight_init(
+def _generate_mlp_pool_entry(
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    w_dtype,
+    TP,
+    preshuffle,
+    backend,
+    routed_experts,
+    batch,
+    balance,
+    fused_quant,
+    ep,
+    n_expts_local,
+    rank,
+    mori,
+):
+    """Build one full weight-init + routing + activation set.
+
+    This is pure setup, not measured -- it mirrors the build()/fn() split in
+    mi450-scripts/run_moe_a4w4.py. Each call is one rotating-buffer pool
+    entry: independent random weights and routing, so replaying through the
+    pool during timing defeats cache residency the same way
+    ``--num-weight-inits`` used to by re-running the whole benchmark.
+    """
+    dev = f"cuda:{torch.cuda.current_device()}"
+
+    # The router scores every GLOBAL expert (that is what picks the tile
+    # geometry), but the expert weights are only this rank's shard.
+    wg = torch.randn((dim1, n_expts_tot), device=dev)
+    w1 = torch.randn((n_expts_local, dim1, dim2 // TP), device=dev)
+    w2 = torch.randn((n_expts_local, dim2 // TP // 2, dim1), device=dev)
+    # biases
+    bg = torch.randn((n_expts_tot,), device=dev)
+    b1 = torch.randn((n_expts_local, dim2 // TP), device=dev)
+    b2 = torch.randn((n_expts_local, dim1), device=dev)
+
+    # -- numerics --
+    wg, _ = quantize(wg, "bf16")
+    w1, w1_scale = quantize(w1, w_dtype)
+    w2, w2_scale = quantize(w2, w_dtype)
+    w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
+    w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
+        w2_scale, dim1, dim2 // TP // 2
+    )
+    if preshuffle:
+        w1 = preshuffle_moe_weight(w1)
+        w2 = preshuffle_moe_weight(w2)
+
+    # -- routing + layer-1 activations: built once per entry, outside the
+    # timed region --
+    x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
+    logits = gemm_a16w16(x, wg.T, bg)
+    n_pinned = pool = None
+    if routed_experts is not None:
+        logits, n_pinned, pool = pin_routed_experts(
+            logits, routed_experts, n_expts_act, balance=balance
+        )
+    gate_valid = None
+    ep_scatter = None
+    if ep == 1:
+        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
+    else:
+        geometry = None
+        if mori is not None:
+            from aiter.ops.triton.moe.moe_routing.routing import EpScatterGeometry
+
+            geometry = EpScatterGeometry(
+                src_token_map=mori_src_token_map(batch, mori.world, dev),
+                max_tokens_per_rank=batch // mori.world,
+                peer_rows=mori.peer_rows,
+            )
+        rdata, gather_indx, scatter_indx, gate_valid, dst_row = ep_routing(
+            logits,
+            n_expts_act,
+            n_expts_local,
+            rank=rank,
+            ep_scatter_geometry=geometry,
+        )
+        if mori is not None:
+            from aiter.ops.triton.moe.reduce import EpCombineScatter
+
+            # GEMM2 stops reducing locally and places its un-reduced rows into
+            # the window instead -- straight from the epilogue (EP_SCATTER_1),
+            # which is what production compiles and what a local output buffer
+            # cannot show.
+            ep_scatter = EpCombineScatter(out=mori.view, dst_row=dst_row)
+    x1, x1_scale = mxfp4_quant(x)
+
+    y1 = moe_gemm_a4w4(
+        x1,
+        w1,
+        x1_scale,
+        w1_scale,
+        b1,
+        rdata,
+        gather_indx=gather_indx,
+        swizzle_mx_scale=swizzle_mx_scale1,
+        preshuffle_weights=preshuffle,
+        apply_swiglu=True,
+        out_mx_quant=fused_quant,
+        backend=backend,
+    )
+    if fused_quant:
+        x2, x2_scale = y1
+        y1_bytes_alloc = (
+            x2.numel() * x2.element_size() + x2_scale.numel() * x2_scale.element_size()
+        )
+    else:
+        y1_bytes_alloc = y1.numel() * y1.element_size()
+        x2, x2_scale = mxfp4_quant(y1)
+    del y1
+
+    y2 = moe_gemm_a4w4(
+        x2,
+        w2,
+        x2_scale,
+        w2_scale,
+        b2,
+        rdata,
+        scatter_indx=scatter_indx,
+        # under EP most gate slots belong to other ranks and no GEMM here
+        # ever writes them; None (every gate live) is right for --ep 1
+        gate_valid=gate_valid,
+        ep_scatter=ep_scatter,
+        swizzle_mx_scale=swizzle_mx_scale2,
+        preshuffle_weights=preshuffle,
+        backend=backend,
+    )
+
+    # -- analytic FLOPs / bytes, matching run_moe_a4w4.py and the proton metadata
+    # the kernel itself reports: 2*M*N*K per GEMM, and activations + routed-expert
+    # weights + matmul output for traffic. mx scales (~1/16 of the weight bytes)
+    # and the moe2 scatter reduction are not counted; the reduction's runtime is
+    # inside moe_gemm_a4w4 and so is inside the measurement.
+    n_gates = gather_indx.shape[0]  # every gate slot == batch * n_expts_act
+    # Rows this rank's GEMM really computes. Equal to n_gates at --ep 1; under EP
+    # the dead slots get no tile, so the activation buffers are sized for n_gates
+    # but only this fraction of them is ever touched.
+    n_rows = int(rdata.expt_data.hist.sum())
+    live_frac = n_rows / n_gates
+    routed = int((rdata.expt_data.hist > 0).sum())  # LOCAL experts with >= 1 row
+    if n_pinned is not None:
+        # under EP the pin is over the global set; only the local slice lands here
+        expected = n_pinned if ep == 1 else int((pool < n_expts_local).sum())
+        assert routed == expected, (
+            f"--routed-experts pinned {n_pinned} experts"
+            + (f", {expected} of them local," if ep > 1 else ",")
+            + f" routing used {routed}"
+        )
+
+    def w_bytes(w):
+        return (w.numel() * w.element_size() // n_expts_local) * routed
+
+    y1_bytes = int(y1_bytes_alloc * live_frac)
+    moe1_flops = 2 * n_rows * (dim2 // TP) * dim1  # N = dim2 // TP, K = dim1
+    moe1_bytes = x1.numel() * x1.element_size() + w_bytes(w1) + y1_bytes
+    moe2_flops = 2 * n_rows * dim1 * (dim2 // TP // 2)  # N = dim1, K = dim2/TP/2
+    # y2 is the scatter-compressed [batch, dim1] result; the GEMM writes the
+    # uncompressed [n_rows, dim1] rows the reduction then combines.
+    moe2_bytes = (
+        int(x2.numel() * x2.element_size() * live_frac)
+        + w_bytes(w2)
+        + n_rows * dim1 * y2.element_size()
+    )
+
+    meta = {
+        "swizzle_mx_scale1": swizzle_mx_scale1,
+        "swizzle_mx_scale2": swizzle_mx_scale2,
+        "moe1_flops": moe1_flops,
+        "moe1_bytes": moe1_bytes,
+        "moe2_flops": moe2_flops,
+        "moe2_bytes": moe2_bytes,
+        "routed": routed,
+        "kernel": kernel_variant(rdata.block_m, backend),
+        "block_m": rdata.block_m,
+    }
+    return (
+        x1,
+        x1_scale,
+        w1,
+        w1_scale,
+        b1,
+        x2,
+        x2_scale,
+        w2,
+        w2_scale,
+        b2,
+        rdata,
+        gather_indx,
+        scatter_indx,
+        gate_valid,
+        ep_scatter,
+        meta,
+    )
+
+
+_MLP_POOL_FIELDS = [
+    "x1",
+    "x1_scale",
+    "w1",
+    "w1_scale",
+    "b1",
+    "x2",
+    "x2_scale",
+    "w2",
+    "w2_scale",
+    "b2",
+    "rdata",
+    "gather_indx",
+    "scatter_indx",
+    "gate_valid",
+    "ep_scatter",
+    "meta",
+]
+
+
+def _make_moe_layer_fns(preshuffle, fused_quant, backend, swizzle1, swizzle2):
+    """Parameterized moe1/moe2/total kernel callables for do_bench_aiter_triton.
+
+    Argument names match a rotating-buffer pool entry's keys (``**_``
+    absorbs the ones a given layer does not need).
+    """
+
+    def layer1(x1, w1, x1_scale, w1_scale, b1, rdata, gather_indx, **_):
+        moe_gemm_a4w4(
+            x1,
+            w1,
+            x1_scale,
+            w1_scale,
+            b1,
+            rdata,
+            gather_indx=gather_indx,
+            swizzle_mx_scale=swizzle1,
+            preshuffle_weights=preshuffle,
+            apply_swiglu=True,
+            out_mx_quant=fused_quant,
+            backend=backend,
+        )
+
+    def layer2(
+        x2, w2, x2_scale, w2_scale, b2, rdata, scatter_indx, gate_valid, ep_scatter, **_
+    ):
+        moe_gemm_a4w4(
+            x2,
+            w2,
+            x2_scale,
+            w2_scale,
+            b2,
+            rdata,
+            scatter_indx=scatter_indx,
+            gate_valid=gate_valid,
+            ep_scatter=ep_scatter,
+            swizzle_mx_scale=swizzle2,
+            preshuffle_weights=preshuffle,
+            backend=backend,
+        )
+
+    def both(**kwargs):
+        layer1(**kwargs)
+        layer2(**kwargs)
+
+    return layer1, layer2, both
+
+
+def bench_mlp(
     batch,
     dim1,
     dim2,
@@ -491,11 +732,21 @@ def bench_mlp_single_weight_init(
     routed_experts,
     rep,
     layers=LAYERS,
+    num_weight_inits=1,
     balance=False,
     fused_quant=False,
     ep=1,
     mori=None,
+    kwargs_rot_bufs=None,
+    kwargs_do_bench_graph=None,
 ):
+    kwargs_rot_bufs = kwargs_rot_bufs or {}
+    kwargs_do_bench_graph = kwargs_do_bench_graph or {}
+    # rep is unused: do_bench_aiter_triton's replay count is a fixed constant,
+    # not an adaptive rep-ms target. Kept for compute_roofline's positional
+    # call and CLI compatibility.
+    del rep
+
     # mori is the --multi-gpu bundle from init_mori_combine (None = single rank)
     rank = 0 if mori is None else mori.rank
     dev = f"cuda:{torch.cuda.current_device()}"
@@ -551,120 +802,65 @@ def bench_mlp_single_weight_init(
     _known = MG_LAYERS if mori is not None else LAYERS
     assert set(layers) <= set(_known), f"unknown layer(s) in {layers=}"
 
-    # -- init data --
     if mori is not None:
         # Every rank must agree on which rank owns each gate, or the staging
         # window gets slots written twice and slots never written. Same seed ->
         # same logits -> same routing; the ranks then differ only in which
         # 1/ep slice of the experts they hold. See mori_src_token_map.
         torch.manual_seed(0)
-    # The router scores every GLOBAL expert (that is what picks the tile
-    # geometry), but the expert weights are only this rank's shard.
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
-    w1 = torch.randn((n_expts_local, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_local, dim2 // TP // 2, dim1), device=dev)
-    # biases
-    bg = torch.randn((n_expts_tot,), device=dev)
-    b1 = torch.randn((n_expts_local, dim2 // TP), device=dev)
-    b2 = torch.randn((n_expts_local, dim1), device=dev)
 
-    # -- numerics --
-    wg, _ = quantize(wg, "bf16")
-    w1, w1_scale = quantize(w1, w_dtype)
-    w2, w2_scale = quantize(w2, w_dtype)
-    w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
-    w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
-        w2_scale, dim1, dim2 // TP // 2
+    # -- rotating-buffer pool: each entry is one independent weight init +
+    # routing + activation set, i.e. what --num-weight-inits used to rebuild
+    # from scratch and separately re-benchmark. One do_bench_aiter_triton call
+    # now replays through all of them instead of capturing num_weight_inits
+    # separate graphs and averaging in Python.
+    pool_gen = functools.partial(
+        _generate_mlp_pool_entry,
+        dim1,
+        dim2,
+        n_expts_tot,
+        n_expts_act,
+        w_dtype,
+        TP,
+        preshuffle,
+        backend,
+        routed_experts,
+        batch,
+        balance,
+        fused_quant,
+        ep,
+        n_expts_local,
+        rank,
+        mori,
     )
-    if preshuffle:
-        w1 = preshuffle_moe_weight(w1)
-        w2 = preshuffle_moe_weight(w2)
+    rot_bufs = generate_rotating_buffers_pool(
+        [pool_gen],
+        [_MLP_POOL_FIELDS],
+        target_mb=kwargs_rot_bufs.get("target_mb", 256),
+        min_pool_len=num_weight_inits,
+        print_info=kwargs_rot_bufs.get("print_info", False),
+    )
 
-    # -- routing + layer-1 activations: built once, outside the timed region --
-    x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
-    logits = gemm_a16w16(x, wg.T, bg)
-    n_pinned = pool = None
-    if routed_experts is not None:
-        logits, n_pinned, pool = pin_routed_experts(
-            logits, routed_experts, n_expts_act, balance=balance
-        )
-    gate_valid = None
-    ep_scatter = None
-    if ep == 1:
-        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
-    else:
-        geometry = None
-        if mori is not None:
-            from aiter.ops.triton.moe.moe_routing.routing import EpScatterGeometry
+    metas = [entry["meta"] for entry in rot_bufs]
+    num_entries = len(metas)
 
-            geometry = EpScatterGeometry(
-                src_token_map=mori_src_token_map(batch, mori.world, dev),
-                max_tokens_per_rank=batch // mori.world,
-                peer_rows=mori.peer_rows,
-            )
-        rdata, gather_indx, scatter_indx, gate_valid, dst_row = ep_routing(
-            logits,
-            n_expts_act,
-            n_expts_local,
-            rank=rank,
-            ep_scatter_geometry=geometry,
-        )
-        if mori is not None:
-            from aiter.ops.triton.moe.reduce import EpCombineScatter
+    def avg(key):
+        return sum(m[key] for m in metas) / num_entries
 
-            # GEMM2 stops reducing locally and places its un-reduced rows into
-            # the window instead -- straight from the epilogue (EP_SCATTER_1),
-            # which is what production compiles and what a local output buffer
-            # cannot show.
-            ep_scatter = EpCombineScatter(out=mori.view, dst_row=dst_row)
-    x1, x1_scale = mxfp4_quant(x)
+    moe1_flops = avg("moe1_flops")
+    moe1_bytes = avg("moe1_bytes")
+    moe2_flops = avg("moe2_flops")
+    moe2_bytes = avg("moe2_bytes")
+    routed_experts_used = avg("routed")
+    # routing block_m and the dispatched kernel depend only on batch/topk/E
+    swizzle_mx_scale1 = metas[0]["swizzle_mx_scale1"]
+    swizzle_mx_scale2 = metas[0]["swizzle_mx_scale2"]
+    kernel = metas[0]["kernel"]
+    block_m = metas[0]["block_m"]
 
-    def layer1():
-        return moe_gemm_a4w4(
-            x1,
-            w1,
-            x1_scale,
-            w1_scale,
-            b1,
-            rdata,
-            gather_indx=gather_indx,
-            swizzle_mx_scale=swizzle_mx_scale1,
-            preshuffle_weights=preshuffle,
-            apply_swiglu=True,
-            out_mx_quant=fused_quant,
-            backend=backend,
-        )
-
-    y1 = layer1()
-    if fused_quant:
-        x2, x2_scale = y1
-        y1_bytes_alloc = (
-            x2.numel() * x2.element_size() + x2_scale.numel() * x2_scale.element_size()
-        )
-    else:
-        y1_bytes_alloc = y1.numel() * y1.element_size()
-        x2, x2_scale = mxfp4_quant(y1)
-    del y1
-
-    def layer2():
-        return moe_gemm_a4w4(
-            x2,
-            w2,
-            x2_scale,
-            w2_scale,
-            b2,
-            rdata,
-            scatter_indx=scatter_indx,
-            # under EP most gate slots belong to other ranks and no GEMM here
-            # ever writes them; None (every gate live) is right for --ep 1
-            gate_valid=gate_valid,
-            ep_scatter=ep_scatter,
-            swizzle_mx_scale=swizzle_mx_scale2,
-            preshuffle_weights=preshuffle,
-            backend=backend,
-        )
-
-    y2 = layer2()
+    layer1_fn, layer2_fn, both_fn = _make_moe_layer_fns(
+        preshuffle, fused_quant, backend, swizzle_mx_scale1, swizzle_mx_scale2
+    )
 
     if mori is None:
         combine = None
@@ -676,53 +872,11 @@ def bench_mlp_single_weight_init(
             reverse_source_view=mori_src_token_map(batch, mori.world, dev),
         )
 
-        def combine():
+        def combine(**_):
             return mori.mega._combine(mega_routing)
 
         combine()
     torch.cuda.synchronize()
-
-    def both():
-        layer1()
-        layer2()
-        if combine is not None:
-            combine()
-
-    # -- analytic FLOPs / bytes, matching run_moe_a4w4.py and the proton metadata
-    # the kernel itself reports: 2*M*N*K per GEMM, and activations + routed-expert
-    # weights + matmul output for traffic. mx scales (~1/16 of the weight bytes)
-    # and the moe2 scatter reduction are not counted; the reduction's runtime is
-    # inside moe_gemm_a4w4 and so is inside the measurement.
-    n_gates = gather_indx.shape[0]  # every gate slot == batch * n_expts_act
-    # Rows this rank's GEMM really computes. Equal to n_gates at --ep 1; under EP
-    # the dead slots get no tile, so the activation buffers are sized for n_gates
-    # but only this fraction of them is ever touched.
-    n_rows = int(rdata.expt_data.hist.sum())
-    live_frac = n_rows / n_gates
-    routed = int((rdata.expt_data.hist > 0).sum())  # LOCAL experts with >= 1 row
-    if n_pinned is not None:
-        # under EP the pin is over the global set; only the local slice lands here
-        expected = n_pinned if ep == 1 else int((pool < n_expts_local).sum())
-        assert routed == expected, (
-            f"--routed-experts pinned {n_pinned} experts"
-            + (f", {expected} of them local," if ep > 1 else ",")
-            + f" routing used {routed}"
-        )
-
-    def w_bytes(w):
-        return (w.numel() * w.element_size() // n_expts_local) * routed
-
-    y1_bytes = int(y1_bytes_alloc * live_frac)
-    moe1_flops = 2 * n_rows * (dim2 // TP) * dim1  # N = dim2 // TP, K = dim1
-    moe1_bytes = x1.numel() * x1.element_size() + w_bytes(w1) + y1_bytes
-    moe2_flops = 2 * n_rows * dim1 * (dim2 // TP // 2)  # N = dim1, K = dim2/TP/2
-    # y2 is the scatter-compressed [batch, dim1] result; the GEMM writes the
-    # uncompressed [n_rows, dim1] rows the reduction then combines.
-    moe2_bytes = (
-        int(x2.numel() * x2.element_size() * live_frac)
-        + w_bytes(w2)
-        + n_rows * dim1 * y2.element_size()
-    )
 
     # -- benchmark: each projection on its own, then the pair back to back,
     # keeping only what `layers` asked for (in LAYERS order, not argv order).
@@ -730,97 +884,53 @@ def bench_mlp_single_weight_init(
     # over and over, so its weights stay hotter than they are in the real layer.
     # insertion order is report order, so keep it in MG_LAYERS order
     to_bench = {
-        "moe1": (layer1, moe1_flops, moe1_bytes),
-        "moe2": (layer2, moe2_flops, moe2_bytes),
+        "moe1": (layer1_fn, rot_bufs, moe1_flops, moe1_bytes),
+        "moe2": (layer2_fn, rot_bufs, moe2_flops, moe2_bytes),
     }
     if combine is not None:
-        # no matmul in it; the traffic is topk staged slots in, one row out
+        # no matmul in it; the traffic is topk staged slots in, one row out.
+        # combine reads a real cross-rank staging window, not regenerable
+        # local tensors, so there is nothing meaningful to rotate -- a
+        # single-entry pool just replays the same call.
         mtpr = batch // mori.world
-        to_bench["combine"] = (combine, 0, mtpr * (n_expts_act + 1) * dim1 * 2)
-    to_bench["total"] = (both, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes)
+        to_bench["combine"] = (
+            combine,
+            [{}],
+            0,
+            mtpr * (n_expts_act + 1) * dim1 * 2,
+        )
+    to_bench["total"] = (
+        both_fn,
+        rot_bufs,
+        moe1_flops + moe2_flops,
+        moe1_bytes + moe2_bytes,
+    )
+
+    # Every rank captures/replays the same fixed kernels_per_graph, so unlike
+    # the old do_bench_cudagraph_synced there is no cross-rank latency
+    # estimate to agree on first -- dist_group only barriers the
+    # warmup/capture/replay phase boundaries so a slow-to-arrive rank cannot
+    # race a peer that is still capturing or replaying.
+    dist_group = mori.group if mori is not None else None
+    if mori is not None:
+        torch.cuda.synchronize()
+        mori.dist.barrier(group=mori.group)
 
     measured = {}
-    for name, (f, flops, byts) in to_bench.items():
+    for name, (f, bufs, flops, byts) in to_bench.items():
         if name not in layers:
             continue
-        if mori is None:
-            latency_ms = triton.testing.do_bench_cudagraph(f, rep=rep)
-        else:
-            # Line the ranks up first: anything holding a cross-device barrier
-            # otherwise charges its peers' skew to whoever arrives early, and
-            # that lands in the warmup estimate that sets the replay count.
-            torch.cuda.synchronize()
-            mori.dist.barrier(group=mori.group)
-            latency_ms = do_bench_cudagraph_synced(f, rep, mori.group)
+        latency_ms = do_bench_aiter_triton(
+            f, bufs, dist_group=dist_group, **kwargs_do_bench_graph
+        )
         measured[name] = {"latency_ms": latency_ms, "flops": flops, "bytes": byts}
 
     return {
         "layers": measured,
-        "kernel": kernel_variant(rdata.block_m, backend),
-        "block_m": rdata.block_m,
-        "routed_experts": routed,
+        "kernel": kernel,
+        "block_m": block_m,
+        "routed_experts": routed_experts_used,
     }
-
-
-def bench_mlp(
-    batch,
-    dim1,
-    dim2,
-    n_expts_tot,
-    n_expts_act,
-    x_dtype,
-    w_dtype,
-    TP,
-    preshuffle,
-    backend,
-    routed_experts,
-    rep,
-    layers=LAYERS,
-    num_weight_inits=1,
-    balance=False,
-    fused_quant=False,
-    ep=1,
-    mori=None,
-):
-    all_results = []
-    for i in range(num_weight_inits):
-        result = bench_mlp_single_weight_init(
-            batch,
-            dim1,
-            dim2,
-            n_expts_tot,
-            n_expts_act,
-            x_dtype,
-            w_dtype,
-            TP,
-            preshuffle,
-            backend,
-            routed_experts,
-            rep,
-            layers,
-            balance=balance,
-            fused_quant=fused_quant,
-            ep=ep,
-            mori=mori,
-        )
-        all_results.append(result)
-
-    num_runs = len(all_results)
-    aggregated = {
-        "layers": {
-            name: {
-                key: sum(r["layers"][name][key] for r in all_results) / num_runs
-                for key in ("latency_ms", "flops", "bytes")
-            }
-            for name in all_results[0]["layers"]
-        },
-        # routing block_m and the dispatched kernel depend only on batch/topk/E
-        "kernel": all_results[0]["kernel"],
-        "block_m": all_results[0]["block_m"],
-        "routed_experts": sum(r["routed_experts"] for r in all_results) / num_runs,
-    }
-
-    return aggregated
 
 
 def roofline_mlp(
@@ -843,6 +953,8 @@ def roofline_mlp(
     ep=1,
     mori=None,
     name="",
+    kwargs_rot_bufs=None,
+    kwargs_do_bench_graph=None,
 ):
     # Put all outputs under logs/<name>/ and write a CSV file (not a directory-as-stem).
     out_dir = Path("logs") / name
@@ -892,6 +1004,8 @@ def roofline_mlp(
         fused_quant=fused_quant,
         ep=ep,
         mori=mori,
+        kwargs_rot_bufs=kwargs_rot_bufs,
+        kwargs_do_bench_graph=kwargs_do_bench_graph,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -1018,14 +1132,18 @@ def parse_args(args: list[str] | None = None):
         "--rep",
         type=int,
         default=20,
-        help="do_bench_cudagraph measurement target per batch size, in ms (default: 20).",
+        help="Unused: do_bench_aiter_triton's replay count is a fixed constant, "
+        "not an adaptive rep-ms target. Kept for CLI compatibility (default: 20).",
     )
     parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
-        help="Number of different weight initializations to run for more stable results (default: 1). "
-        "Use higher values (e.g., 10) for more stable benchmarks.",
+        help="Minimum number of different weight initializations in the rotating "
+        "buffer pool for more stable results (default: 1). The pool can grow "
+        "larger than this to reach the cache-defeating size target; it never "
+        "shrinks below it. Use higher values (e.g., 10) for more stable "
+        "benchmarks.",
     )
     args = parser.parse_args(args=args)
     return args
@@ -1134,6 +1252,8 @@ def main(args: list[str] | None = None) -> None:
         layers=tuple(n for n in all_layers if n in layers),
         num_weight_inits=parsed_args.num_weight_inits,
         name="moe_gemm_a4w4",
+        kwargs_rot_bufs=get_rot_bufs_kwargs(parsed_args),
+        kwargs_do_bench_graph=get_do_bench_graph_kwargs(parsed_args),
     )
 
     if mori is not None:
