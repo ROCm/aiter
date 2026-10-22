@@ -21,12 +21,8 @@ from aiter.jit.utils.build_targets import (
 
 class TestBuildTargetArchitecture(unittest.TestCase):
     def test_gfx1250_strict_offline_build_target(self):
-        with mock.patch.dict(
-            os.environ, {"GPU_ARCHS": "gfx1250-strict"}, clear=True
-        ):
-            self.assertEqual(
-                get_build_targets_env(), [("gfx1250-strict", 256)]
-            )
+        with mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx1250-strict"}, clear=True):
+            self.assertEqual(get_build_targets_env(), [("gfx1250-strict", 256)])
 
     def test_rdna_offline_build_target_defaults(self):
         targets = {
@@ -97,9 +93,7 @@ class TestRuntimeArchitecture(unittest.TestCase):
                 "_gpu_info_output",
                 return_value="  Name: gfx1250-strict\n",
             ):
-                self.assertEqual(
-                    self.chip_info._detect_native(), ["gfx1250-strict"]
-                )
+                self.assertEqual(self.chip_info._detect_native(), ["gfx1250-strict"])
         finally:
             self.chip_info._detect_native.cache_clear()
 
@@ -132,9 +126,7 @@ asicRevision: 0
         with mock.patch.object(
             self.chip_info, "_detect_native", return_value=["gfx1250-strict"]
         ):
-            self.assertEqual(
-                self.chip_info.get_gfx_runtime(), "gfx1250-strict"
-            )
+            self.assertEqual(self.chip_info.get_gfx_runtime(), "gfx1250-strict")
 
     def test_hipinfo_architecture_takes_precedence(self):
         with (

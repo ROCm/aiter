@@ -21,6 +21,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from build_targets import _parse_gpu_archs_env
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -1021,9 +1022,7 @@ def _so_offload_archs(so_path):
         with open(so_path, "rb") as f, mmap.mmap(
             f.fileno(), 0, access=mmap.ACCESS_READ
         ) as mm:
-            for m in re.finditer(
-                rb"amdhsa--(gfx[0-9a-z]+(?:-[0-9a-z]+)*)", mm
-            ):
+            for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+(?:-[0-9a-z]+)*)", mm):
                 archs.add(m.group(1).decode())
     except (OSError, ValueError, OverflowError):
         pass
