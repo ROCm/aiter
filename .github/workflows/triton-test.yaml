@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Wait for Checks workflow
         run: ./.github/scripts/check_signal.sh
@@ -58,7 +58,7 @@ jobs:
       needs_mi300x: ${{ github.ref == 'refs/heads/main' || steps.select.outputs.needs_mi300x == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:triton-300x') }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Compare the event's merge commit with its base parent.
           fetch-depth: 2
@@ -89,7 +89,7 @@ jobs:
           echo "shards=[${shards}]" >> "$GITHUB_OUTPUT"
 
       - name: Upload test shard lists as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: triton_shards
           path: triton_shard_*.list
@@ -122,7 +122,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
           submodules: 'recursive'
@@ -162,7 +162,7 @@ jobs:
 
       - name: Download test shard lists
         id: download_triton_shards
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         timeout-minutes: 15
         with:
           name: triton_shards
@@ -174,7 +174,7 @@ jobs:
       - name: Restore Triton wheel cache
         id: restore_triton_wheel
         continue-on-error: true
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         env:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
         with:
@@ -184,7 +184,7 @@ jobs:
       - name: Download Triton wheel artifact
         if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
         id: download_triton_wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         timeout-minutes: 30
         continue-on-error: true
         with:
@@ -290,7 +290,7 @@ jobs:
           fi
 
       - name: Upload test logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         # Not success(): a shard that trips the autotuning gate is exactly the
         # run whose log is worth keeping, and success() skips the upload for
         # it -- so the evidence only ever existed in the live Actions log,
@@ -329,13 +329,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
           submodules: 'recursive'
 
       - name: Download test shard lists
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         timeout-minutes: 15
         with:
           name: triton_shards
@@ -347,7 +347,7 @@ jobs:
       - name: Restore Triton wheel cache
         id: restore_triton_wheel
         continue-on-error: true
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         env:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
         with:
@@ -357,7 +357,7 @@ jobs:
       - name: Download Triton wheel artifact
         if: steps.restore_triton_wheel.outputs.cache-hit != 'true'
         id: download_triton_wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         timeout-minutes: 30
         continue-on-error: true
         with:
@@ -445,7 +445,7 @@ jobs:
           fi
 
       - name: Upload test logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         # Not success(): a shard that trips the autotuning gate is exactly the
         # run whose log is worth keeping, and success() skips the upload for
         # it -- so the evidence only ever existed in the live Actions log,

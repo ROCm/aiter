@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Wait for Checks workflow
         run: ./.github/scripts/check_signal.sh
@@ -58,7 +58,7 @@ jobs:
       has_tests: ${{ steps.select.outputs.has_tests }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Select SGLang tests
         id: select
@@ -86,7 +86,7 @@ jobs:
 
     steps:
       - name: Checkout aiter repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Prepare sglang workspace
         run: |

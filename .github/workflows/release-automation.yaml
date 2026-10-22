@@ -57,7 +57,7 @@ jobs:
     steps:
       - name: Generate release GitHub App token
         id: release_app_token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
         with:
           app-id: ${{ secrets.AITER_CI_APP_ID }}
           private-key: ${{ secrets.AITER_CI_APP_PRIVATE_KEY }}
@@ -65,7 +65,7 @@ jobs:
           repositories: aiter
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           token: ${{ steps.release_app_token.outputs.token }}
           fetch-depth: 0
@@ -287,7 +287,7 @@ jobs:
       EXPECTED_WHEEL_COUNT: ${{ needs.prepare.outputs.expected_wheel_count }}
     steps:
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: aiter-whl-packages-py*
           path: release-wheels
