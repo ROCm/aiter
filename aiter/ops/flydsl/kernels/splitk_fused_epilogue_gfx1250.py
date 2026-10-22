@@ -128,13 +128,11 @@ def emit_fused_splitk_epilogue(
         ]
 
     def _local(batch, u):
-        return fx.Vector(
-            fx.ptr_load(
-                lds_partial
-                + (peer_m + row0 + (batch * unroll + u) * rows_per_iter) * c_lds_row
-                + col,
-                result_type=T.vec(vec, partial_elem.ir_type),
-            )
+        return fx.ptr_load(
+            lds_partial
+            + (peer_m + row0 + (batch * unroll + u) * rows_per_iter) * c_lds_row
+            + col,
+            result_type=T.vec(vec, partial_elem.ir_type),
         )
 
     for batch in range(reduce_m // (rows_per_iter * unroll)):
