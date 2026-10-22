@@ -11,8 +11,11 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     get_gemm_config,
 )
 
-# torch.finfo(torch.float16).max; this module stays torch-free.
+# The finite maxima of torch.float16, torch.bfloat16 and torch.float32; this
+# module stays torch-free.
 _FP16_MAX = tl.constexpr(65504.0)
+_BF16_MAX = tl.constexpr(3.3895313892515355e38)
+_FP32_MAX = tl.constexpr(3.4028234663852886e38)
 
 _gemm_a16w16_repr = make_kernel_repr(
     "_gemm_a16_w16_kernel",
@@ -169,17 +172,21 @@ def _gemm_a16_w16_kernel(
         if use_activation and NUM_KSPLIT == 1:
             # The cast to the 16-bit output type keeps the accumulator in packed
             # registers and removes the spills of the wide gfx1151 tiles.
-            # fp16 keeps the accumulator at or above -65504 first, because a
-            # cast of a lower value gives -inf, and gelu and silu make a NaN
-            # from -inf.
+            # The bound takes only a finite value below the lowest value of
+            # that type, so a real -inf keeps the NaN that an fp32 epilogue
+            # makes from it.
             if ROUND_BEFORE_ACT and (
                 c_ptr.type.element_ty == tl.float16
                 or c_ptr.type.element_ty == tl.bfloat16
             ):
-                if c_ptr.type.element_ty == tl.float16:
-                    accumulator = tl.where(
-                        accumulator < -_FP16_MAX, -_FP16_MAX, accumulator
-                    )
+                min_finite: tl.constexpr = (
+                    -_FP16_MAX if c_ptr.type.element_ty == tl.float16 else -_BF16_MAX
+                )
+                accumulator = tl.where(
+                    (accumulator < min_finite) & (accumulator >= -_FP32_MAX),
+                    min_finite,
+                    accumulator,
+                )
                 accumulator = accumulator.to(c_ptr.type.element_ty).to(tl.float32)
             accumulator = activation(accumulator)
 
