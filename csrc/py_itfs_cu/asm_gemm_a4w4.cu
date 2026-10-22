@@ -71,7 +71,7 @@ static_assert(offsetof(KernelArgs, log2_k_split) == 368 && sizeof(KernelArgs) ==
               "f4gemm kernarg layout");
 
 // What the ps=1 kernels take: B preshuffled and contiguous, K % 64 == 0, N % 16 == 0, scales padded to whole tiles,
-// A and B under 4 GiB and one C tile under 2 GiB (32-bit buffer offsets), no bias and no beta.
+// A and B under 4 GiB and one C tile under 2 GiB (32-bit buffer offsets), no bias term (bias with beta 0 adds nothing).
 static bool ps_supported(const f4gemmConfig& cfg,
                          aiter_tensor_t* A,
                          aiter_tensor_t* B,
@@ -85,7 +85,7 @@ static bool ps_supported(const f4gemmConfig& cfg,
     const int64_t M = A->size(0), N = B->size(0), K = A->size(1) * 2;
     const int64_t a_row = A->stride(0), b_row = B->stride(0); // bytes: fp4_x2 elements
     const int64_t lim = int64_t(1) << 32;
-    return bpreshuffle && bias == nullptr && beta == 0.f && K % 64 == 0 && N % 16 == 0 && a_row % 16 == 0 &&
+    return bpreshuffle && (bias == nullptr || beta == 0.f) && K % 64 == 0 && N % 16 == 0 && a_row % 16 == 0 &&
            b_row * 2 == K && A_scale->size(0) >= (M + cfg.tile_M - 1) / cfg.tile_M * cfg.tile_M &&
            B_scale->size(0) >= (N + cfg.tile_N - 1) / cfg.tile_N * cfg.tile_N && M * a_row < lim &&
            N * b_row < lim && int64_t(cfg.tile_M) * out->stride(0) * 2 < lim / 2;
@@ -295,7 +295,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
         if(cfg.ps)
         {
-            AITER_CHECK(bias == nullptr && beta == 0.f, __func__, " ", kname, ": bias/beta not supported");
+            AITER_CHECK(bias == nullptr || beta == 0.f, __func__, " ", kname, ": bias with beta != 0 not supported");
             AITER_CHECK(ps_supported(cfg, A, B, A_scale, B_scale, out, bias, beta, bpreshuffle),
                         __func__,
                         " ",

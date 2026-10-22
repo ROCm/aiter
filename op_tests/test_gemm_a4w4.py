@@ -89,7 +89,7 @@ PS_KERNEL = "_ZN5aiter45f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256_psE"
 
 
 def ps_supported(x, w, x_scales, w_scales, out, tile=256):
-    # mirrors ps_supported() in csrc/py_itfs_cu/asm_gemm_a4w4.cu (B preshuffled, no bias, beta 0)
+    # mirrors ps_supported() in csrc/py_itfs_cu/asm_gemm_a4w4.cu (B preshuffled, no bias term)
     M, N, K = x.shape[0], w.shape[0], x.shape[1] * 2
     return (
         K % 64 == 0
@@ -154,6 +154,14 @@ def test_gemm(dtype, M, N, K):
         err = checkAllclose(a, d[:M], msg="asm 256x256 ps", catastrophic_check=True)
         ret["us 256x256_ps"] = us
         ret["err 256x256_ps"] = err
+        # a bias with beta 0 adds nothing
+        bias = torch.randn(M, N, dtype=dtypes.fp32)
+        d, _ = run_gemm_asm(
+            x, wshuffle, x_scales_shuffle, w_scales_shuffle, out, PS_KERNEL, bias
+        )
+        ret["err 256x256_ps bias"] = checkAllclose(
+            a, d[:M], msg="asm 256x256 ps, bias, beta 0", catastrophic_check=True
+        )
 
     # kernelName = "" # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
     # log2_k_split = 1
