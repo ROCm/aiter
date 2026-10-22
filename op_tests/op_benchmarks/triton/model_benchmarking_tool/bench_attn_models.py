@@ -60,6 +60,14 @@ DEFAULT_SEQ_START: int = seq_k_to_token_count(DEFAULT_SEQ_START_K)
 DEFAULT_SEQ_INC: int = seq_k_to_token_count(DEFAULT_SEQ_INC_K)
 DEFAULT_SEQ_END: int = seq_k_to_token_count(DEFAULT_SEQ_END_K)
 
+# Shapes file model name -> bench_mla_decode.py --model value
+# (<family>-<size> from utils/model_configs.json). The MLA benchmark is skipped
+# for MLA models that aren't in this mapping.
+MLA_BENCH_MODELS: dict[str, str] = {
+    "DeepSeek-R1 (Decode)": "deepseek-V3",
+    "Kimi-K2 Thinking (Decode)": "kimik25-tp4",
+}
+
 
 class TritonCache:
     cache_dir: Path | None
@@ -418,7 +426,7 @@ class BenchArgs:
         assert self.kernel == "fwd", "MLA only support forward kernel."
 
         args_dict: dict[str, str] = {
-            "--model": "deepseek-V3",
+            "--model": MLA_BENCH_MODELS[self.tp_model.model.name],
             "--dtype": "bf16",
             "--tensor-parallelism": str(self.tp_model.tp),
             "-b": str(self.b),
@@ -621,7 +629,7 @@ def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> float | None:
             [
                 len(l2) == 10,
                 l2[0] == "0",
-                l2[1] == "deepseek-V3",
+                l2[1] == MLA_BENCH_MODELS[args.tp_model.model.name],
                 int(float(l2[2])) == args.b,
                 int(float(l2[3])) == args.tp_model.model.hq,
                 int(float(l2[4])) == args.s,
@@ -1019,8 +1027,9 @@ def get_bench_args(
         )
     # MLA kernel backend:
     # Only forward kernel, layout option doesn't make sense.
-    # bench_mla_decode.py only supports --model deepseek-V3. The shapes file
-    # records that config as DeepSeek-R1 (Decode).
+    # bench_mla_decode.py hardcodes the DeepSeek-V3 MLA dimensions and takes
+    # only the head count from model_configs.json. Run it only for models with
+    # a model_configs.json entry in MLA_BENCH_MODELS.
     if "fwd" in kernels:
         for tp_model, b, s in product(
             (tp_model for tp_model in tp_models if tp_model.model.use_mla),
@@ -1028,11 +1037,11 @@ def get_bench_args(
             seq_range.to_range(),
         ):
             model = tp_model.model
-            if model.name != "DeepSeek-R1 (Decode)":
+            if model.name not in MLA_BENCH_MODELS:
                 skipped_key = (model.name, "fwd")
                 if skipped_key not in skipped_model_kernels:
                     logger.info(
-                        "Skipping fwd for model '%s': bench_mla_decode.py only supports deepseek-V3.",
+                        "Skipping fwd for model '%s': bench_mla_decode.py has no config for this model.",
                         model.name,
                     )
                     skipped_model_kernels.add(skipped_key)
