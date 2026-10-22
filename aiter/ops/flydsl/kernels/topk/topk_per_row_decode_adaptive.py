@@ -248,7 +248,7 @@ Splitting G ways removes seq*(G-1)/G; below this, past 32 rows, the row runs alo
 """
 
 # The CU count the tables were fitted at. A default, not a device read: the
-# caller knows the device, so pass `decode_cu_count`.
+# caller passes `get_cu_num()`, as the gate does.
 FITTED_CU = 256
 
 

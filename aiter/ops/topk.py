@@ -990,28 +990,6 @@ def _decode_backend(
     return BACKEND_DEFAULT
 
 
-@functools.lru_cache(maxsize=8)
-def _decode_cu_count(device_index: int) -> int:
-    """This device's CU count, lowered by `CU_NUM` through `get_cu_num()`."""
-    # Callers pass a CUDA tensor's `device.index`, which torch always sets. Do not
-    # map `None` to the current device here: the cache would pin that device's
-    # count under the `None` key for every later device.
-    physical = torch.cuda.get_device_properties(device_index).multi_processor_count
-    # Without `CU_NUM`, `get_cu_num()` asserts every GPU on the node has one count.
-    if int(os.getenv("CU_NUM", "0")) <= 0:
-        return physical
-    return min(get_cu_num(), physical)
-
-
-@functools.lru_cache(maxsize=8)
-def _decode_arch(device_index: int) -> str:
-    """Arch of the device the logits live on, read like `_decode_cu_count`.
-
-    Not `get_gfx()` or `get_gfx_runtime()`, which read `GPU_ARCHS` or the first GPU.
-    """
-    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
-
-
 def decode_adaptive_width(width: int, max_row_len: int) -> int:
     """The row length the adaptive path should be gated and configured on.
 
@@ -1068,11 +1046,10 @@ def decode_backend_for_call(
     ):
         return BACKEND_DEFAULT
 
-    device_index = logits.device.index
     width = logits.shape[1] if width is None else width
     backend = _decode_backend(
-        _decode_arch(device_index),
-        _decode_cu_count(device_index),
+        get_gfx_runtime(),
+        get_cu_num(),
         stable,
         width,
         num_rows,

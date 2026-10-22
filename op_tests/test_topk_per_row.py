@@ -1,10 +1,6 @@
 import argparse
 import ctypes
 import itertools
-import os
-import subprocess
-import sys
-import tempfile
 from unittest import mock
 
 import numpy as np
@@ -12,8 +8,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.jit.utils.cpp_extension import executable_path
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops import topk
 from aiter.ops.asm.asm_utils import load_hip
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
@@ -744,38 +739,6 @@ def test_decode_bound_gate():
                     assert plain != topk.BACKEND_ADAPTIVE, cell
                     assert topk._decode_backend(arch, cu, *call, None) == plain, cell
     print(f"[decode_bound_gate] PASS: {len(table)} cards")
-
-
-def test_decode_cu_count_mixed_node():
-    """Without `CU_NUM`, the gate reads this device's CU count even when `rocminfo`
-    lists a GPU with another count, which `get_cu_num()` rejects."""
-    with tempfile.TemporaryDirectory() as bin_dir:
-        fake = os.path.join(bin_dir, "rocminfo")
-        with open(fake, "w") as f:
-            f.write(
-                f"#!/bin/sh\n{executable_path('rocminfo')} \"$@\"\n"
-                "printf 'Agent 99\\n  Name: gfx000\\n  Device Type: GPU\\n"
-                "  Compute Unit: 1\\n'\n"
-            )
-        os.chmod(fake, 0o755)
-        env = {k: v for k, v in os.environ.items() if k != "CU_NUM"}
-        env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
-        probe = (
-            "import torch\n"
-            "from aiter.ops import topk\n"
-            "d = torch.cuda.current_device()\n"
-            "cu = torch.cuda.get_device_properties(d).multi_processor_count\n"
-            "assert topk._decode_cu_count(d) == cu\n"
-        )
-        run = subprocess.run(
-            [sys.executable, "-c", probe],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    assert run.returncode == 0, run.stderr[-2000:]
-    print("[decode_cu_count_mixed_node] PASS")
 
 
 def test_decode_bound_entry_points(card):
@@ -1724,9 +1687,7 @@ def run_decode(args):
 
 def run_adaptive():
     test_decode_bound_gate()
-    test_decode_cu_count_mixed_node()
-    device = torch.cuda.current_device()
-    card = (topk._decode_arch(device), topk._decode_cu_count(device))
+    card = (get_gfx_runtime(), get_cu_num())
     if card not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
         aiter.logger.warning(
             "%s at %d CU carries no adaptive decode bands; bounded decode skipped",

@@ -12,7 +12,6 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.asm.asm_utils import load_hip
 from aiter.ops.topk import (
     BACKEND_ADAPTIVE,
-    _decode_cu_count,
     decode_adaptive_width,
     decode_backend_for_call,
 )
@@ -459,7 +458,7 @@ def _run_adaptive(
         cfg_width,
         k,
         ordered=stable,
-        cu_count=_decode_cu_count(logits.device.index),
+        cu_count=get_cu_num(),
     )
     packed = row_starts is not None
     launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(
