@@ -839,6 +839,28 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
     )
 
 
+# Kimi-K3 at TP8 with every expert split 8 ways: inter_dim 3072 / 8 = 384 is a
+# multiple of 128 but not of 256. 32 is a token bucket of
+# model_configs/kimik3tp8_tuned_grouped_fmoe.csv; 2048, 20000 (padded to 32768)
+# and 131072 have no row, so the dispatch takes its default tiles. Nothing
+# forces a config. JIT, not run-only: the grouped-MoE AOT builds only the
+# auxiliary kernels (the TDM GEMM has no AOT wiring yet), so run-only cannot
+# load the GEMM for any shape.
+@pytest.mark.parametrize("tokens", [32, 2048, 20000, 131072])
+def test_grouped_a4w4_situv2_kimi_k3_tp8_matches_torch_ref(tokens):
+    run_moe(
+        "a4w4",
+        experts=896,
+        tokens=tokens,
+        topk=16,
+        model_dim=3584,
+        inter_dim=384,
+        activation=ActivationType.Situv2,
+        use_bias=False,
+        check_aot_cache=False,
+    )
+
+
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)
