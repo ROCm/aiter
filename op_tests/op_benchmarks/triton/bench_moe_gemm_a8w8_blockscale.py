@@ -20,10 +20,6 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
 )
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.gemm_config_utils import (
-    compute_splitk_params,
-    get_gemm_config,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # Default group_m, group_n, group_k
@@ -218,18 +214,11 @@ def bench_mlp_single_weight_init(
         )
 
     fpath = Path(tempfile.mktemp())
-    M, K = xg.shape
-    K, N = wg.shape
-    config, _ = get_gemm_config("GEMM-A16W16", M, N, K)
-    compute_splitk_params(config, K)
-    config["BLOCK_SIZE_M"] = min(config["BLOCK_SIZE_M"], 128)
-    config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], 128)
-    config["BLOCK_SIZE_K"] = min(config["BLOCK_SIZE_K"], 128)
 
     with proton_visible_devices():
         proton.start(str(fpath), hook="triton")
     for _ in range(reps):
-        logits = gemm_a16w16(xg, wg.T, bg, config=config)
+        logits = gemm_a16w16(xg, wg.T, bg)
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
 
         if x_dtype_str == "fp8" and w_dtype_str == "fp8":
