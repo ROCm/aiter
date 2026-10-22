@@ -17,6 +17,7 @@ from aiter.jit.core import (
     AITER_CSRC_DIR,
     get_asm_dir,
 )
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
@@ -35,13 +36,18 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
     PIPELINES as FLYDSL_PIPELINES,
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+    ensure_int8_4wave_candidates,
     k_split_candidates,
+    kernel_name_for_quant_dtype,
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
     kernels_list as kernels_list_flydsl,
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
     kernels_list_8wave as kernels_list_flydsl_8wave,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+    kernels_list_int8_4wave as kernels_list_flydsl_int8_4wave,
 )
 
 
@@ -159,9 +165,26 @@ def run_gemm_flydsl_8wave(
     return out
 
 
+def run_gemm_flydsl_int8_4wave(
+    x, weight_shuffle, x_scale, w_scale, out, kernel_id, k_split=1
+):
+    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+        run_gemm_a8w8_bpreshuffle_4wave,
+    )
+
+    if k_split != 1:
+        raise ValueError("4-wave INT8 does not support split-K")
+    ensure_int8_4wave_candidates(get_cu_num(), x.shape[-1])
+    ki = kernels_list_flydsl_int8_4wave[kernel_id]
+    return run_gemm_a8w8_bpreshuffle_4wave(
+        x, weight_shuffle, x_scale, w_scale, out, ki.name
+    )
+
+
 _FLYDSL_PIPELINE_RUNNERS = {
     "preshuffle": run_gemm_flydsl,
     "8wave": run_gemm_flydsl_8wave,
+    "int8_4wave": run_gemm_flydsl_int8_4wave,
 }
 
 # The tuner speaks torch dtypes while Pipeline.q_dtypes_w uses short names.
@@ -508,7 +531,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        gfx, _cu_num, M, N, K, q_dtype_w = info_keys
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
 
         if gfx == "gfx1250":
             return self._get_flydsl_tune_task_gfx1250(info_keys, seed)
@@ -522,7 +545,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         gemm_flydsl_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
         ref_keys = ["x", "weight", "x_scale", "w_scale", "bias_f32"]
         tasks = []
-        # One pass per pipeline, in PIPELINES order (preshuffle, then 8wave).
+        if q_dtype_name == "int8":
+            ensure_int8_4wave_candidates(cu_num, K)
+
+        # One pass per pipeline, in PIPELINES order.
         # Sweeping them under one libtype is what lets a single
         # ``--libtype flydsl`` run compare them and pick one winner per shape;
         # only the candidate table, the predicate and the runner differ.
@@ -538,6 +564,8 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 continue
             for i in sorted(pipe.kernels_list.keys()):
                 ki = pipe.kernels_list[i]
+                if hasattr(ki, "cu_num") and ki.cu_num != cu_num:
+                    continue
                 if not pipe.fits(ki, M, N, K):
                     continue
                 for ks in [1] + (
@@ -545,7 +573,8 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     if useSplitK and pipe.name == "preshuffle"
                     else []
                 ):
-                    name = ki.name if ks == 1 else f"{ki.name}_ks{ks}"
+                    base_name = kernel_name_for_quant_dtype(ki, q_dtype_name)
+                    name = base_name if ks == 1 else f"{base_name}_ks{ks}"
                     tasks.append(
                         (
                             (info_keys, i, 0 if ks == 1 else ks, name, "flydsl"),

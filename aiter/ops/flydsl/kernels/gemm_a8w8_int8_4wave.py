@@ -25,13 +25,16 @@ layouts give each phase 16 distinct 16-byte bank groups.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
+
+# The LLVM dialect is used only for inline assembly at instructions FlyDSL 0.4
+# cannot represent through its stable surface: M0 ownership, signed-offset LDS
+# DMA, the scheduled scale loads, K64 INT8 MFMA, and the accumulator hazard
+# boundary.
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_cdna4_num_xcds
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     S2RLoader,
     StoreC,
@@ -70,6 +73,28 @@ def _a_chunk_swizzle(row):
     return ((1 ^ (quad % 2) ^ (quad // 2)) << 2) | ((quad // 2) << 1) | ((row % 4) // 2)
 
 
+def _a_lds_read_base(lane_id, wave_m, kk):
+    """LDS byte offset for A tile zero; tile ``i`` adds ``i*A_BLOCK_STRIDE``."""
+    row = lane_id % 16
+    k_group = lane_id // 16
+    return (
+        wave_m * (WAVE_ROWS // 16) * A_BLOCK_STRIDE
+        + row * BLOCK_K
+        + ((kk * K_GROUPS + k_group) ^ _a_chunk_swizzle(row)) * 16
+    )
+
+
+def _b_lds_read_base(lane_id, wave_n, kk):
+    """LDS byte offset for B tile zero; tile ``j`` adds ``j*16``."""
+    row = lane_id % 16
+    k_group = lane_id // 16
+    return (
+        (wave_n * (WAVE_ROWS // 16) + row // 2) * B_BLOCK_STRIDE
+        + (kk * K_GROUPS + k_group) * 256
+        + (row % 2) * 128
+    )
+
+
 def _lane_offset(lane_id, wave_id, K, preshuffled, block_row0, n_rows, step):
     """Per-lane global offset for LDS-DMA step ``step`` of one region.
 
@@ -83,6 +108,11 @@ def _lane_offset(lane_id, wave_id, K, preshuffled, block_row0, n_rows, step):
     ``block_row0``. Nothing bounds a global load, so rows at or past
     ``n_rows`` (whole 16-row strips for B) read the last valid one instead;
     they only reach C rows and columns that are not stored.
+
+    There is no stable layout object shared with the LDS read path because the
+    LDS destination is implicit in M0 plus the instruction's signed immediate.
+    The named strides and ``_a_chunk_swizzle`` are therefore the shared layout
+    contract used by this address calculation and the read-base helpers above.
     """
     row_block = wave_id * (LOADS_PER_REGION // 2) + step // 2
     if const_expr(preshuffled):
@@ -124,9 +154,11 @@ class G2SGlobal:
         # The VGPR offset is unsigned, so the SGPR base carries -CENTER.
         self.base = fx.Int64(fx.ptrtoint(fx.get_iter(tensor))) - self.CENTER
         wave_off = wave_id * (LOADS_PER_REGION // 2) * block_stride + self.CENTER
+        # M0 is written from an SGPR, so the wave-uniform LDS address is read
+        # from lane 0. FlyDSL 0.4 exports no stable readfirstlane.
         self.m0 = [
-            rocdl.readfirstlane(
-                ir.IntegerType.get_signless(32),
+            fx.rocdl.readfirstlane(
+                fx.Int32.ir_type,
                 (fx.Int32(fx.ptrtoint(region.ptr)) + wave_off).ir_value(),
             )
             for region in lds_pair
@@ -137,7 +169,11 @@ class G2SGlobal:
         return lane_offset - self.imm[step] + self.CENTER
 
     def set_m0(self, buf):
-        """Point M0 at LDS buffer ``buf`` for the ``ops`` that follow."""
+        """Point M0 at LDS buffer ``buf`` for the ``ops`` that follow.
+
+        FlyDSL 0.4 has no stable M0 setter. Remove this boundary when a setter
+        with an explicit post-write hazard is exported.
+        """
         _llvm.inline_asm(
             res=None,
             operands_=[fx.Int32(self.m0[buf]).ir_value()],
@@ -147,6 +183,9 @@ class G2SGlobal:
         )
 
     def _load(self, voffset, k_offset, step):
+        # FlyDSL 0.4 cannot encode this signed LDS memory-operand offset; its
+        # intrinsic path reaches an LLVM assertion. Keep the raw instruction
+        # until signed-offset global_load_lds is supported.
         _llvm.inline_asm(
             res=None,
             operands_=[
@@ -181,25 +220,31 @@ class StoreCInt8Rows(StoreC):
         super().__init__(A_scale, B_scale, C, c_rows, c_cols, *args)
         self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-        self.sa_rsrc = buffer_ops.create_buffer_resource(
-            A_scale, max_size=False, num_records_bytes=c_rows * 4
+        sa_tensor = fx.rocdl.make_buffer_tensor(
+            A_scale, num_records_bytes=fx.Int64(c_rows) * 4
         )
-        self.sb_rsrc = buffer_ops.create_buffer_resource(
-            B_scale, max_size=False, num_records_bytes=c_cols * 4
+        sb_tensor = fx.rocdl.make_buffer_tensor(
+            B_scale, num_records_bytes=fx.Int64(c_cols) * 4
         )
+        self.sa_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sa_tensor))
+        self.sb_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sb_tensor))
 
     @staticmethod
     def _load_f32x4(rsrc, byte_offset):
+        # A stable copy atom would enter LLVM's vmcnt accounting, but these
+        # loads must be ordered beside opaque LDS-DMA loads that LLVM cannot
+        # count. Retain the scheduled raw load until both operations share one
+        # stable dependency model.
         return _llvm.inline_asm(
-            res=ir.VectorType.get([4], ir.F32Type.get()),
+            res=fx.Vector.make_type(4, fx.Float32),
             operands_=[fx.Int32(byte_offset).ir_value(), rsrc],
             asm_string="buffer_load_dwordx4 $0, $1, $2, 0 offen",
             constraints="=v,v,s",
             has_side_effects=True,
         )
 
-    def scale_load_ops(self, row_base, col_base, scales):
-        """``SCALE_LOADS`` ops appending the scales for ``store_tiles``.
+    def scale_load_ops(self, row_base, col_base):
+        """Return scheduled scale-load operations for ``store_tiles``.
 
         The loads are asm, so LLVM leaves them out of its vmcnt waits: an LLVM
         wait for them would also wait for the LDS-DMA loads that follow them,
@@ -207,7 +252,7 @@ class StoreCInt8Rows(StoreC):
         """
 
         def op(rsrc, element):
-            return lambda: scales.append(self._load_f32x4(rsrc, element() * 4))
+            return lambda: self._load_f32x4(rsrc, element() * 4)
 
         def row(i):
             return row_base + (self.lane_id // 16) * 4 + i * TILE
@@ -255,10 +300,12 @@ def _mfma_i8(a, b, c):
     The accumulators are pinned to AGPRs like hipBLASLt's: with the LLVM
     intrinsic, the allocator keeps them in VGPRs and the operands in AGPRs,
     leaving too few VGPRs and adding accumulator copies inside the loop.
-    LLVM does not see this as an MFMA, so ``_mfma_drain`` must separate the
-    last one from any read of its result outside another MFMA.
+    FlyDSL 0.4 has no gfx950 K64 INT8 MMA atom. LLVM does not see this as an
+    MFMA, so ``_mfma_drain`` must separate the last one from any read of its
+    result outside another MFMA. Remove both boundaries together once a stable
+    K64 atom is available.
     """
-    res_t = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+    res_t = fx.Vector.make_type(4, fx.Int32)
     operands = [Vec(a).ir_value(), Vec(b).ir_value()]
     if c is None:
         asm, constraints = "v_mfma_i32_16x16x64_i8 $0, $1, $2, 0", "=a,v,v"
@@ -278,7 +325,8 @@ def _mfma_drain(accs):
     """Return ``accs`` readable after the XDL-write -> v_accvgpr_read wait states.
 
     LLVM copies an accumulator out of its AGPRs right at the defining asm, so
-    each one passes through an empty asm placed after the nops.
+    each one passes through an empty asm placed after the nops. This is paired
+    with the opaque K64 MFMA above and is removable only with that boundary.
     """
     _llvm.inline_asm(
         res=None,
@@ -321,13 +369,15 @@ def compile_int8_gemm_4w(
     if num_xcds is None:
         num_xcds = get_cdna4_num_xcds() if xcd_swizzle > 0 else 8
     num_xcds = int(num_xcds)
-    if num_xcds <= 0 or num_xcds > 8 or num_xcds & (num_xcds - 1):
-        raise ValueError(f"num_xcds must be a power of two in [1, 8], got {num_xcds}")
+    if num_xcds <= 0 or num_xcds > 8:
+        raise ValueError(f"num_xcds must be in [1, 8], got {num_xcds}")
     K_ITERS = K // BLOCK_K
     B_K_STEP = 16 * BLOCK_K  # bytes per K128 tile inside a preshuffled 16-row strip
     HALF = WAVE_TILES // 2
-    persistent = num_cu > 0 and K_ITERS % 2 == 0
-    assert not persistent or num_cu % num_xcds == 0
+    if num_cu > 0 and K_ITERS % 2:
+        raise ValueError(f"persistent mode requires an even K128 tile count, got K={K}")
+    persistent = num_cu > 0
+    assert not persistent or num_cu == num_xcds * 32
 
     # Quadrants of the wave's tile grid by (A half, B half).
     def quadrant(a_half, b_half):
@@ -430,14 +480,15 @@ def compile_int8_gemm_4w(
         b_g2s = G2SGlobal(B_T, wave_id, B_BLOCK_STRIDE, b_lds)
         s2r = S2RLoader(wave_m, WAVE_TILES)
 
-        def voffset_ops(coords, voffsets):
-            """Ops appending the block's A and B LDS-DMA offsets to ``voffsets``.
+        def voffset_ops():
+            """Return scheduled operations producing A/B LDS-DMA offsets.
 
-            ``coords`` holds (block_m, block_n) by the time the first op runs.
+            ``apply_scheduled_op`` passes the current (block_m, block_n)
+            explicitly when each operation runs.
             """
 
             def op(g2s, preshuffled, step):
-                def emit():
+                def emit(coords):
                     row0, n_rows = (
                         (coords[1] * BLOCK_N, c_n)
                         if preshuffled
@@ -446,9 +497,9 @@ def compile_int8_gemm_4w(
                     lane_offset = _lane_offset(
                         lane_id, wave_id, K, preshuffled, row0, n_rows, step
                     )
-                    voffsets[int(preshuffled)].append(g2s.voffset(step, lane_offset))
+                    return g2s.voffset(step, lane_offset)
 
-                return emit
+                return ("voffset", int(preshuffled), emit)
 
             return [op(a_g2s, False, s) for s in range(LOADS_PER_REGION)] + [
                 op(b_g2s, True, s) for s in range(LOADS_PER_REGION)
@@ -457,19 +508,11 @@ def compile_int8_gemm_4w(
         # Operand (tile, kk): lane l reads k16 chunk kk * K_GROUPS + l // 16 of
         # A row l % 16 of the tile, or of B row 8 * (l % 16) + tile of the wave.
         # It sits at base[kk] + tile * A_BLOCK_STRIDE (A) or + tile * 16 (B).
-        row_in_block = lane_id % 16
-        k_group = lane_id // 16
         a_lane_base = [
-            wave_m * (WAVE_ROWS // 16) * A_BLOCK_STRIDE
-            + row_in_block * BLOCK_K
-            + ((kk * K_GROUPS + k_group) ^ _a_chunk_swizzle(row_in_block)) * 16
-            for kk in range_constexpr(K_STEPS)
+            _a_lds_read_base(lane_id, wave_m, kk) for kk in range_constexpr(K_STEPS)
         ]
         b_lane_base = [
-            (wave_n * (WAVE_ROWS // 16) + row_in_block // 2) * B_BLOCK_STRIDE
-            + (kk * K_GROUPS + k_group) * 256
-            + (row_in_block % 2) * 128
-            for kk in range_constexpr(K_STEPS)
+            _b_lds_read_base(lane_id, wave_n, kk) for kk in range_constexpr(K_STEPS)
         ]
 
         # K tile t lives in LDS buffer t % 2; ``buf`` is that parity, static
@@ -487,46 +530,126 @@ def compile_int8_gemm_4w(
 
         def a_read(buf, i, kk):
             def emit():
-                a_ops[i][kk] = s2r.load_one(
-                    a_lds[buf], a_lane_base[kk] + i * A_BLOCK_STRIDE
-                )
+                return s2r.load_one(a_lds[buf], a_lane_base[kk] + i * A_BLOCK_STRIDE)
 
-            return emit
+            return ("a", i, kk, emit)
 
         def b_read(buf, j, kk):
             def emit():
-                b_ops[j][kk] = s2r.load_one(b_lds[buf], b_lane_base[kk] + j * 16)
+                return s2r.load_one(b_lds[buf], b_lane_base[kk] + j * 16)
 
-            return emit
+            return ("b", j, kk, emit)
 
         accs = [[None] * WAVE_TILES for _ in range(WAVE_TILES)]
 
-        def do_mfma(i, j, kk):
-            accs[i][j] = _mfma_i8(a_ops[i][kk], b_ops[j][kk], accs[i][j])
+        def apply_read(a_values, b_values, read):
+            operand, tile, kk, emit = read
+            value = emit()
+            if operand == "a":
+                a_values[tile][kk] = value
+            else:
+                b_values[tile][kk] = value
+            return a_values, b_values
+
+        def apply_scheduled_op(
+            a_values,
+            b_values,
+            scale_values,
+            next_coord_values,
+            next_offset_values,
+            op,
+        ):
+            if not isinstance(op, tuple):
+                op()
+                return (
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                )
+            kind = op[0]
+            if kind in ("a", "b"):
+                a_values, b_values = apply_read(a_values, b_values, op)
+            elif kind == "scale":
+                scale_values.append(op[1]())
+            elif kind == "coords":
+                next_coord_values = op[1]()
+            elif kind == "effect":
+                op[1]()
+            else:
+                _, operand, emit = op
+                next_offset_values[operand].append(emit(next_coord_values))
+            return (
+                a_values,
+                b_values,
+                scale_values,
+                next_coord_values,
+                next_offset_values,
+            )
+
+        def do_mfma(acc_values, a_values, b_values, i, j, kk):
+            acc_values[i][j] = _mfma_i8(
+                a_values[i][kk], b_values[j][kk], acc_values[i][j]
+            )
+            return acc_values
 
         def spread(ops, first, last):
             """Place ``ops`` evenly after MFMAs ``first`` .. ``last - 1``."""
             n = len(ops)
             return [(first + q * (last - first) // n, op) for q, op in enumerate(ops)]
 
-        def run_phase(mfmas, placed, wait=None):
+        def run_phase(
+            acc_values,
+            a_values,
+            b_values,
+            scale_values,
+            next_coord_values,
+            next_offset_values,
+            mfmas,
+            placed,
+            wait=None,
+        ):
             """Issue MFMAs with each memory op after its assigned MFMA.
 
             The four waves reach each phase together, so back-to-back LDS-DMA
             loads from all of them overrun the load path and are spread out.
             ``wait`` (vmcnt, lgkmcnt) goes before the last MFMA so the MFMA
             pipe stays busy while the following barrier resolves.
+            ``sched_barrier(0)`` keeps LLVM from moving any op off its slot;
+            FlyDSL 0.4 does not export it as a stable API.
             """
             for idx, (i, j, kk) in enumerate(mfmas):
                 if const_expr(wait is not None and idx == len(mfmas) - 1):
-                    rocdl.s_waitcnt(vmcnt=wait[0], lgkmcnt=wait[1])
-                    rocdl.sched_barrier(0)
-                do_mfma(i, j, kk)
-                rocdl.sched_barrier(0)
+                    fx.rocdl.s_waitcnt(vmcnt=wait[0], lgkmcnt=wait[1])
+                    fx.rocdl.sched_barrier(0)
+                acc_values = do_mfma(acc_values, a_values, b_values, i, j, kk)
+                fx.rocdl.sched_barrier(0)
                 for slot, op in placed:
                     if const_expr(slot == idx):
-                        op()
-                        rocdl.sched_barrier(0)
+                        (
+                            a_values,
+                            b_values,
+                            scale_values,
+                            next_coord_values,
+                            next_offset_values,
+                        ) = apply_scheduled_op(
+                            a_values,
+                            b_values,
+                            scale_values,
+                            next_coord_values,
+                            next_offset_values,
+                            op,
+                        )
+                        fx.rocdl.sched_barrier(0)
+            return (
+                acc_values,
+                a_values,
+                b_values,
+                scale_values,
+                next_coord_values,
+                next_offset_values,
+            )
 
         def interleave(loads, reads):
             ops, step = [], len(reads) // max(len(loads), 1)
@@ -542,7 +665,20 @@ def compile_int8_gemm_4w(
                 + [b_read(buf, j, kk) for kk in K_SECOND for j in range(HALF)]
             )
 
-        def k_tile(buf, refill, has_next, p3_vmcnt=P3_VMCNT, p1_ops=(), p3_ops=()):
+        def k_tile(
+            acc_values,
+            a_values,
+            b_values,
+            scale_values,
+            next_coord_values,
+            next_offset_values,
+            buf,
+            refill,
+            has_next,
+            p3_vmcnt=P3_VMCNT,
+            p1_ops=(),
+            p3_ops=(),
+        ):
             """One K128 tile.
 
             ``refill`` (voffsets, tile_k) loads the K tile two ahead into the
@@ -559,55 +695,184 @@ def compile_int8_gemm_4w(
             p1_m0, p3_m0 = [], []
             if const_expr(refill is not None):
                 p2_loads, p4_loads = tile_loads(*refill)
-                p1_m0 = [(len(PHASE_MFMAS[0]) - 2, lambda: a_g2s.set_m0(buf))]
-                p3_m0 = [(len(PHASE_MFMAS[2]) - 2, lambda: b_g2s.set_m0(buf))]
+                p2_loads = [("effect", op) for op in p2_loads]
+                p4_loads = [("effect", op) for op in p4_loads]
+                p1_m0 = [
+                    (
+                        len(PHASE_MFMAS[0]) - 2,
+                        ("effect", lambda: a_g2s.set_m0(buf)),
+                    )
+                ]
+                p3_m0 = [
+                    (
+                        len(PHASE_MFMAS[2]) - 2,
+                        ("effect", lambda: b_g2s.set_m0(buf)),
+                    )
+                ]
 
             p1_placed = spread(a_hi_reads, 0, P1_READS_END)
             p1_placed += spread(list(p1_ops), P1_READS_END, len(PHASE_MFMAS[0]) - 1)
-            run_phase(PHASE_MFMAS[0], p1_placed + p1_m0, wait=(None, 0))
-            rocdl.s_barrier()
+            (
+                acc_values,
+                a_values,
+                b_values,
+                scale_values,
+                next_coord_values,
+                next_offset_values,
+            ) = run_phase(
+                acc_values,
+                a_values,
+                b_values,
+                scale_values,
+                next_coord_values,
+                next_offset_values,
+                PHASE_MFMAS[0],
+                p1_placed + p1_m0,
+                wait=(None, 0),
+            )
+            # The stable fx.barrier is gpu.barrier, which also makes prior
+            # memory accesses visible and so would wait for the LDS-DMA loads
+            # this schedule keeps in flight across barriers. The bare
+            # s_barrier is not a stable FlyDSL 0.4 export.
+            fx.rocdl.s_barrier()
             p2_placed = spread(b_hi_reads, 0, P2_READS_END)
             p2_placed += spread(p2_loads, 1, len(PHASE_MFMAS[1]) - 1)
-            run_phase(PHASE_MFMAS[1], p2_placed, wait=(None, 0))
-            rocdl.s_barrier()
+            (
+                acc_values,
+                a_values,
+                b_values,
+                scale_values,
+                next_coord_values,
+                next_offset_values,
+            ) = run_phase(
+                acc_values,
+                a_values,
+                b_values,
+                scale_values,
+                next_coord_values,
+                next_offset_values,
+                PHASE_MFMAS[1],
+                p2_placed,
+                wait=(None, 0),
+            )
+            fx.rocdl.s_barrier()
             if const_expr(has_next):
                 p3_placed = spread(list(p3_ops), 0, len(PHASE_MFMAS[2]) - 2)
                 p3_wait = p3_vmcnt if refill is not None else 0
-                run_phase(PHASE_MFMAS[2], p3_placed + p3_m0, wait=(p3_wait, None))
-                rocdl.s_barrier()
+                (
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                ) = run_phase(
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                    PHASE_MFMAS[2],
+                    p3_placed + p3_m0,
+                    wait=(p3_wait, None),
+                )
+                fx.rocdl.s_barrier()
                 p4_ops = interleave(p4_loads, lo_reads(1 - buf))
-                run_phase(PHASE_MFMAS[3], spread(p4_ops, 0, len(PHASE_MFMAS[3]) - 2))
+                (
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                ) = run_phase(
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                    PHASE_MFMAS[3],
+                    spread(p4_ops, 0, len(PHASE_MFMAS[3]) - 2),
+                )
             else:
-                run_phase(PHASE_MFMAS[2], [])
-                run_phase(PHASE_MFMAS[3], [])
+                (
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                ) = run_phase(
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                    PHASE_MFMAS[2],
+                    [],
+                )
+                (
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                ) = run_phase(
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                    PHASE_MFMAS[3],
+                    [],
+                )
+            return (
+                acc_values,
+                a_values,
+                b_values,
+                scale_values,
+                next_coord_values,
+                next_offset_values,
+            )
 
-        def lo_state():
-            return [a_ops[i][kk] for i in range(HALF) for kk in ALL_K] + [
-                b_ops[j][kk] for j in range(HALF) for kk in ALL_K
+        def lo_state(a_values, b_values):
+            return [a_values[i][kk] for i in range(HALF) for kk in ALL_K] + [
+                b_values[j][kk] for j in range(HALF) for kk in ALL_K
             ]
 
-        def set_lo_state(values):
+        def unpack_lo_state(values, a_values, b_values):
+            values = list(values)
+            a_values = [list(row) for row in a_values]
+            b_values = [list(row) for row in b_values]
             for i in range_constexpr(HALF):
                 for kk in range_constexpr(K_STEPS):
-                    a_ops[i][kk] = values.pop(0)
+                    a_values[i][kk] = values.pop(0)
             for j in range_constexpr(HALF):
                 for kk in range_constexpr(K_STEPS):
-                    b_ops[j][kk] = values.pop(0)
+                    b_values[j][kk] = values.pop(0)
+            return a_values, b_values
 
         # Values live across a K tile boundary: the accumulators and the next
         # tile's lo operands.
-        def live_state():
+        def live_state(acc_values, a_values, b_values):
             accs_flat = [
-                accs[i][j] for i in range(WAVE_TILES) for j in range(WAVE_TILES)
+                acc_values[i][j] for i in range(WAVE_TILES) for j in range(WAVE_TILES)
             ]
-            return accs_flat + lo_state()
+            return accs_flat + lo_state(a_values, b_values)
 
-        def set_state(values):
+        def unpack_state(values, a_values, b_values):
             values = list(values)
+            acc_values = [[None] * WAVE_TILES for _ in range(WAVE_TILES)]
             for i in range_constexpr(WAVE_TILES):
                 for j in range_constexpr(WAVE_TILES):
-                    accs[i][j] = values.pop(0)
-            set_lo_state(values)
+                    acc_values[i][j] = values.pop(0)
+            a_values, b_values = unpack_lo_state(values, a_values, b_values)
+            return acc_values, a_values, b_values
 
         store_c = StoreCInt8Rows(
             A_scale, B_scale, C, c_m, c_n, None, WAVE_TILES, WAVE_TILES
@@ -620,32 +885,51 @@ def compile_int8_gemm_4w(
         block0 = fx.Int32(fx.block_idx.x)
         coords = list(block_coords(block0))
         voffsets = ([], [])
-        for op in voffset_ops(coords, voffsets):
-            op()
+        for _, operand, emit in voffset_ops():
+            voffsets[operand].append(emit(coords))
         for t in range_constexpr(2):
             a_loads, b_loads = tile_loads(voffsets, t)
             for g2s, loads in ((a_g2s, a_loads), (b_g2s, b_loads)):
                 g2s.set_m0(t)
                 for op in loads:
                     op()
-        rocdl.s_waitcnt(vmcnt=0 if persistent else 2 * LOADS_PER_REGION)
-        rocdl.s_barrier()
-        for op in lo_reads(0):
-            op()
+        fx.rocdl.s_waitcnt(vmcnt=0 if persistent else 2 * LOADS_PER_REGION)
+        fx.rocdl.s_barrier()
+        for read in lo_reads(0):
+            a_ops, b_ops = apply_read(a_ops, b_ops, read)
 
         # Values live across an output block boundary: its coordinates and
         # offsets, and the lo operands of its first K tile.
-        def block_state():
-            return coords + voffsets[0] + voffsets[1] + lo_state()
+        def block_state(coord_values, offset_values, a_values, b_values):
+            return (
+                coord_values
+                + offset_values[0]
+                + offset_values[1]
+                + lo_state(a_values, b_values)
+            )
 
-        def set_block_state(values):
+        def unpack_block_state(values, a_values, b_values):
             values = list(values)
-            coords[:] = [values.pop(0) for _ in range(2)]
-            for v in voffsets:
-                v[:] = [values.pop(0) for _ in range(LOADS_PER_REGION)]
-            set_lo_state(values)
+            coord_values = [values.pop(0) for _ in range(2)]
+            offset_values = (
+                [values.pop(0) for _ in range(LOADS_PER_REGION)],
+                [values.pop(0) for _ in range(LOADS_PER_REGION)],
+            )
+            a_values, b_values = unpack_lo_state(values, a_values, b_values)
+            return coord_values, offset_values, a_values, b_values
 
-        def static_tile(t, next_voffsets, next_ops, scale_ops):
+        def static_tile(
+            acc_values,
+            a_values,
+            b_values,
+            scale_values,
+            next_coord_values,
+            next_offset_values,
+            t,
+            next_voffsets,
+            next_ops,
+            scale_ops,
+        ):
             """K tile ``t`` of a block, outside the runtime K loop.
 
             The last two refill from the next block at ``next_voffsets``;
@@ -664,67 +948,188 @@ def compile_int8_gemm_4w(
                 p3_vmcnt += SCALE_LOADS
             has_next = t + 1 < K_ITERS or persistent
             p3_ops = next_ops if t == 0 else ()
-            k_tile(t % 2, refill, has_next, p3_vmcnt, p1_ops, p3_ops)
+            return k_tile(
+                acc_values,
+                a_values,
+                b_values,
+                scale_values,
+                next_coord_values,
+                next_offset_values,
+                t % 2,
+                refill,
+                has_next,
+                p3_vmcnt,
+                p1_ops,
+                p3_ops,
+            )
 
         n_pairs = max(0, (K_ITERS - 4) // 2)
         grid = fx.Int32(fx.grid_dim.x)
-        for block, bstate in range(block0, num_blocks, grid, init=block_state()):
-            set_block_state(bstate)
-            for i in range_constexpr(WAVE_TILES):
-                for j in range_constexpr(WAVE_TILES):
-                    accs[i][j] = None
+        for block, bstate in range(
+            block0,
+            num_blocks,
+            grid,
+            init=block_state(coords, voffsets, a_ops, b_ops),
+        ):
+            coords, voffsets, a_ops, b_ops = unpack_block_state(bstate, a_ops, b_ops)
+            accs = [[None] * WAVE_TILES for _ in range(WAVE_TILES)]
 
             # The next block's coordinates and offsets, computed during tile
             # 0's phase 3 unless tile 0 already loads that block. The last
             # block reloads itself; nothing reads those loads.
             next_coords, next_voffsets, next_ops = [], ([], []), []
+            scales = []
             if const_expr(persistent):
                 this_block = fx.Int32(block)
 
-                def next_coords_op(this_block=this_block, next_coords=next_coords):
+                def next_coords_op(this_block=this_block):
                     nxt = this_block + grid
                     nxt = (nxt < num_blocks).select(nxt, this_block)
-                    next_coords.extend(block_coords(nxt))
+                    return list(block_coords(nxt))
 
-                next_ops = [next_coords_op] + voffset_ops(next_coords, next_voffsets)
+                next_ops = [("coords", next_coords_op)] + voffset_ops()
                 if const_expr(K_ITERS == 2):
                     for op in next_ops:
-                        op()
+                        (
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                        ) = apply_scheduled_op(
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                            op,
+                        )
                     next_ops = []
 
             row_base = coords[0] * BLOCK_M + wave_m * WAVE_ROWS
             col_base = coords[1] * BLOCK_N + wave_n * WAVE_ROWS
-            scales = []
-            scale_ops = store_c.scale_load_ops(row_base, col_base, scales)
-            tile_args = (next_voffsets, next_ops, scale_ops)
-
+            scale_ops = [
+                ("scale", op) for op in store_c.scale_load_ops(row_base, col_base)
+            ]
             # Tiles 0 and 1 start the accumulators. A runtime loop then takes
             # the tiles that refill from this block, two per trip so the
             # buffer parity is static; a fully unrolled K loop overflows the
             # instruction cache.
-            static_tile(0, *tile_args)
-            static_tile(1, *tile_args)
+            (
+                accs,
+                a_ops,
+                b_ops,
+                scales,
+                next_coords,
+                next_voffsets,
+            ) = static_tile(
+                accs,
+                a_ops,
+                b_ops,
+                scales,
+                next_coords,
+                next_voffsets,
+                0,
+                next_voffsets,
+                next_ops,
+                scale_ops,
+            )
+            (
+                accs,
+                a_ops,
+                b_ops,
+                scales,
+                next_coords,
+                next_voffsets,
+            ) = static_tile(
+                accs,
+                a_ops,
+                b_ops,
+                scales,
+                next_coords,
+                next_voffsets,
+                1,
+                next_voffsets,
+                next_ops,
+                scale_ops,
+            )
             if const_expr(n_pairs > 0):
-                for pair, state in range(0, n_pairs, 1, init=live_state()):
-                    set_state(state)
+                for pair, state in range(
+                    0, n_pairs, 1, init=live_state(accs, a_ops, b_ops)
+                ):
+                    accs, a_ops, b_ops = unpack_state(state, a_ops, b_ops)
                     t0 = fx.Int32(pair) * 2 + 2
-                    k_tile(0, (voffsets, t0 + 2), True)
-                    k_tile(1, (voffsets, t0 + 3), True)
-                    results = yield live_state()
-                set_state(results)
+                    (
+                        accs,
+                        a_ops,
+                        b_ops,
+                        scales,
+                        next_coords,
+                        next_voffsets,
+                    ) = k_tile(
+                        accs,
+                        a_ops,
+                        b_ops,
+                        scales,
+                        next_coords,
+                        next_voffsets,
+                        0,
+                        (voffsets, t0 + 2),
+                        True,
+                    )
+                    (
+                        accs,
+                        a_ops,
+                        b_ops,
+                        scales,
+                        next_coords,
+                        next_voffsets,
+                    ) = k_tile(
+                        accs,
+                        a_ops,
+                        b_ops,
+                        scales,
+                        next_coords,
+                        next_voffsets,
+                        1,
+                        (voffsets, t0 + 3),
+                        True,
+                    )
+                    results = yield live_state(accs, a_ops, b_ops)
+                accs, a_ops, b_ops = unpack_state(results, a_ops, b_ops)
             for t in range_constexpr(2 + 2 * n_pairs, K_ITERS):
-                static_tile(t, *tile_args)
+                (
+                    accs,
+                    a_ops,
+                    b_ops,
+                    scales,
+                    next_coords,
+                    next_voffsets,
+                ) = static_tile(
+                    accs,
+                    a_ops,
+                    b_ops,
+                    scales,
+                    next_coords,
+                    next_voffsets,
+                    t,
+                    next_voffsets,
+                    next_ops,
+                    scale_ops,
+                )
 
             store_c.store_tiles(_mfma_drain(accs), row_base, col_base, scales)
             if const_expr(persistent):
-                coords[:] = next_coords
-                for v, nv in zip(voffsets, next_voffsets):
-                    v[:] = nv
-            _ = yield block_state()
+                coords = list(next_coords)
+                voffsets = (
+                    list(next_voffsets[0]),
+                    list(next_voffsets[1]),
+                )
+            _ = yield block_state(coords, voffsets, a_ops, b_ops)
 
         if const_expr(persistent):
             # LDS-DMA must not land in LDS that a later workgroup owns.
-            rocdl.s_waitcnt(vmcnt=0)
+            fx.rocdl.s_waitcnt(vmcnt=0)
 
     @flyc.jit
     def launch_gemm(

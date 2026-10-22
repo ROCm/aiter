@@ -644,20 +644,21 @@ def gemm_a8w8_ASM(
     n = WQ.shape[0]
     k = XQ.shape[-1]
     kernelName = ""
-    if (
-        x_scale.dtype == dtypes.fp32
-        and w_scale.dtype == dtypes.fp32
-        and (
-            asm_config := get_GEMM_config_with_quant_type(
-                m,
-                n,
-                k,
-                dtypes.i8,
-                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
-            )
+    asm_config = None
+    if x_scale.dtype == dtypes.fp32 and w_scale.dtype == dtypes.fp32:
+        candidate = get_GEMM_config_with_quant_type(
+            m,
+            n,
+            k,
+            dtypes.i8,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
         )
-        is not None
-    ):
+        if candidate is not None and str(candidate.get("libtype", "asm")).strip() in (
+            "",
+            "asm",
+        ):
+            asm_config = candidate
+    if asm_config is not None:
         assert (
             bias is not None
         ), "Use asm gemm must give bias, please give a bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
@@ -785,20 +786,10 @@ def _check_int8_bpreshuffle_contract(
     tensors = (XQ, WQ, x_scale, w_scale)
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("gemm_a8w8_bpreshuffle INT8 operands must share one device")
-    if bias is not None and (
-        bias.device != XQ.device
-        or bias.dtype != dtype
-        or tuple(bias.shape) not in {(N,), (1, N)}
-    ):
+    if bias is not None:
         raise ValueError(
-            "gemm_a8w8_bpreshuffle INT8 bias must be BF16 on the operand "
-            f"device with shape ({N},) or (1, {N}), got {bias.dtype} "
-            f"{tuple(bias.shape)} on {bias.device}"
+            "gemm_a8w8_bpreshuffle INT8 does not fuse bias; add it after the GEMM"
         )
-
-
-def _add_int8_bias(result: Tensor, bias: Tensor | None) -> Tensor:
-    return result if bias is None else result + bias.reshape(1, -1)
 
 
 @functools.cache
@@ -825,9 +816,19 @@ def gemm_a8w8_bpreshuffle(
     """Per-token/per-channel FP8 or signed-INT8 preshuffled GEMM.
 
     The gfx950 INT8 path uses the 4-wave FlyDSL kernel with INT32
-    accumulation, FP32 row/column scales, BF16 output, and an optional BF16
-    bias applied after the GEMM. Untuned supported shapes use the same kernel
-    through a conservative persistent/non-persistent fallback policy.
+    accumulation, FP32 row/column scales, and BF16 output. Bias is not fused;
+    callers add it after the GEMM. Untuned supported shapes use the same
+    kernel through a conservative persistent/non-persistent fallback policy.
+
+    INT8 requires contiguous ``XQ[M,K]`` and ``WQ[N,K_w]`` tensors, with WQ
+    produced by ``shuffle_weight(..., layout=(16, 16))``. K and K_w are
+    multiples of 128, K >= 256, N is a multiple of 16, and K_w may be greater
+    than K. In that padded-weight case XQ is zero-padded and dispatch resolves
+    against the effective launch K_w.
+
+    AOT packaging covers only specializations reachable from tuned CSV rows.
+    An untuned fallback whose K, CU/XCD topology, or persistence variant is not
+    packaged requires JIT compilation and therefore fails in run-only mode.
     """
     is_int8 = XQ.dtype == dtypes.i8 or WQ.dtype == dtypes.i8
     if is_int8:
@@ -862,14 +863,18 @@ def gemm_a8w8_bpreshuffle(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     q_dtype = dtypes.i8 if is_int8 else dtypes.fp8
+    # INT8 kernel names encode the physical K specialization, so padded
+    # weights must resolve against the effective launch K. Preserve the
+    # historical logical-first lookup for FP8.
+    lookup_k = w_k if is_int8 else k
     config = get_GEMM_config_with_quant_type(
         m,
         n,
-        k,
+        lookup_k,
         q_dtype,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     )
-    if config is None and w_k > k:
+    if not is_int8 and config is None and w_k > k:
         config = get_GEMM_config_with_quant_type(
             m,
             n,
@@ -877,6 +882,8 @@ def gemm_a8w8_bpreshuffle(
             q_dtype,
             AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
         )
+    if is_int8 and config is not None and str(config["libtype"]) != "flydsl":
+        config = None
     # A K-padded WQ is preshuffled in blocks laid out over K_w, and every
     # kernel takes a single K for both operands, so run all of them at K_w
     # with XQ zero-padded to match.
@@ -885,18 +892,12 @@ def gemm_a8w8_bpreshuffle(
     if config is not None:
         libtype = config["libtype"]
         splitK = int(config["splitK"])
-        if is_int8 and libtype != "flydsl":
-            raise RuntimeError(
-                "gfx950 INT8 bpreshuffle tuning rows must use FlyDSL, got "
-                f"{libtype!r} for M={m}, N={n}, K={w_k}"
-            )
         if libtype == "ck":
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl":
-            result = gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
-            return _add_int8_bias(result, bias) if is_int8 else result
+            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
     if is_int8:
         from .flydsl.gemm_a8w8_bpreshuffle_4wave import (
@@ -905,7 +906,7 @@ def gemm_a8w8_bpreshuffle(
 
         kernel_name = default_4wave_kernel_name(m, n, w_k)
         _warn_untuned_int8_fallback(get_gfx(), m, n, w_k, kernel_name)
-        result = gemm_a8w8_bpreshuffle_flydsl(
+        return gemm_a8w8_bpreshuffle_flydsl(
             XQ,
             WQ,
             x_scale,
@@ -913,7 +914,6 @@ def gemm_a8w8_bpreshuffle(
             Y,
             {"kernelName": kernel_name},
         )
-        return _add_int8_bias(result, bias)
 
     if get_gfx() == "gfx1250":
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (

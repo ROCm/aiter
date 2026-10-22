@@ -3,14 +3,15 @@
 
 """Tune spaces for every FlyDSL a8w8 (ptpc) bpreshuffle pipeline on CDNA.
 
-One operator, two pipelines, swept together under the same ``flydsl`` libtype so
+One operator, three pipelines, swept together under the same ``flydsl`` libtype so
 a single ``--libtype flydsl`` run picks one winner per shape:
 
 * ``preshuffle`` -- 4-wave MFMA, gfx942 + gfx950, fp8 or int8 weights.
 * ``8wave``      -- 8-wave CDNA4 ``MFMA_Scale``, gfx950 only, fp8 only.
+* ``int8_4wave`` -- fixed 256x256 CDNA4 INT8 kernel, gfx950 only.
 
 Each exposes the same pair -- a ``{kernelId: instance}`` table and a
-``fits(ki, M, N, K)`` predicate -- and both are listed in :data:`PIPELINES`, so
+``fits(ki, M, N, K)`` predicate -- and all are listed in :data:`PIPELINES`, so
 the tuner iterates instead of carrying one hand-written branch per pipeline.
 Runners stay on the tuner side: this module must remain importable without
 flydsl (the tuner reads it to name candidates on hosts that cannot compile).
@@ -20,11 +21,19 @@ The gfx1250 WMMA pipeline has its own file and is not part of PIPELINES yet.
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from typing import Any
 
-from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import (
+    get_cdna4_num_xcds,
+    get_gfx,
+    get_lds_capacity_bytes,
+)
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+    make_4wave_kernel_name,
+    supports_4wave_int8_shape,
+)
 
 _DTYPE_SHORT = {
     "fp8": "F8",
@@ -82,6 +91,13 @@ class kernelInstance:
             ]
             + ([f"ks{self.k_split}"] if self.k_split > 1 else [])
         )
+
+
+def kernel_name_for_quant_dtype(ki, q_dtype: str) -> str:
+    """Return a replayable name matching the tensors used by the tune task."""
+    if isinstance(ki, kernelInstance):
+        return replace(ki, q_dtype_a=q_dtype, q_dtype_w=q_dtype).name
+    return ki.name
 
 
 def _ki(
@@ -536,6 +552,89 @@ kernels_list_8wave: dict[int, EightWaveKernelInstance] = (
 
 
 # ===========================================================================
+# Pipeline 3: fixed-tile 4-wave signed INT8, gfx950 only
+# ===========================================================================
+
+KERNEL_ID_BASE_INT8_4WAVE = 1_000_040
+KERNEL_ID_DYNAMIC_INT8_4WAVE = 2_000_000
+
+
+@dataclass(frozen=True)
+class Int8FourWaveKernelInstance:
+    k: int
+    cu_num: int
+    num_xcds: int
+    persistent: bool
+    q_dtype_a: str = "int8"
+    q_dtype_w: str = "int8"
+    dtype: str = "bf16"
+
+    @property
+    def name(self) -> str:
+        return make_4wave_kernel_name(
+            K=self.k,
+            xcd_swizzle=8,
+            num_cu=self.cu_num if self.persistent else 0,
+            num_xcds=self.num_xcds,
+        )
+
+
+def kernel_fits_shape_int8_4wave(
+    ki: Int8FourWaveKernelInstance, M: int, N: int, K: int
+) -> bool:
+    if K != ki.k or not supports_4wave_int8_shape(M, N, K):
+        return False
+    grid = math.ceil(M / 256) * math.ceil(N / 256)
+    return not ki.persistent or grid > ki.cu_num
+
+
+_KNOWN_INT8_4WAVE_IDS = {
+    (128, 5120, False): KERNEL_ID_BASE_INT8_4WAVE,
+    (128, 5120, True): KERNEL_ID_BASE_INT8_4WAVE + 1,
+    (128, 13824, False): KERNEL_ID_BASE_INT8_4WAVE + 2,
+    (128, 13824, True): KERNEL_ID_BASE_INT8_4WAVE + 3,
+    (256, 5120, False): KERNEL_ID_BASE_INT8_4WAVE + 4,
+    (256, 5120, True): KERNEL_ID_BASE_INT8_4WAVE + 5,
+    (256, 13824, False): KERNEL_ID_BASE_INT8_4WAVE + 6,
+    (256, 13824, True): KERNEL_ID_BASE_INT8_4WAVE + 7,
+}
+
+
+def _int8_4wave_kernel_id(cu_num: int, k: int, persistent: bool) -> int:
+    known = _KNOWN_INT8_4WAVE_IDS.get((cu_num, k, persistent))
+    if known is not None:
+        return known
+    return (
+        KERNEL_ID_DYNAMIC_INT8_4WAVE
+        + cu_num * 100_000
+        + (k // 128) * 2
+        + int(persistent)
+    )
+
+
+kernels_list_int8_4wave: dict[int, Int8FourWaveKernelInstance] = {}
+
+
+def ensure_int8_4wave_candidates(cu_num: int, k: int) -> None:
+    """Register fixed-K candidates for the shape currently entering the tuner."""
+    if not get_gfx().startswith("gfx950") or k < 256 or k % 128:
+        return
+    num_xcds = get_cdna4_num_xcds(cu_num)
+    for persistent in (False, True):
+        if persistent and k % 256:
+            continue
+        kernel_id = _int8_4wave_kernel_id(cu_num, k, persistent)
+        kernels_list_int8_4wave[kernel_id] = Int8FourWaveKernelInstance(
+            k, cu_num, num_xcds, persistent
+        )
+
+
+for _cu_num in (128, 256):
+    for _k in (5120, 13824):
+        ensure_int8_4wave_candidates(_cu_num, _k)
+
+
+# ===========================================================================
 # The protocol the tuner iterates
 # ===========================================================================
 
@@ -561,4 +660,10 @@ class Pipeline:
 PIPELINES: tuple[Pipeline, ...] = (
     Pipeline("preshuffle", kernels_list, kernel_fits_shape, ("fp8", "int8")),
     Pipeline("8wave", kernels_list_8wave, kernel_fits_shape_8wave, ("fp8",)),
+    Pipeline(
+        "int8_4wave",
+        kernels_list_int8_4wave,
+        kernel_fits_shape_int8_4wave,
+        ("int8",),
+    ),
 )
