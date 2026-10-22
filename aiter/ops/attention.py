@@ -951,8 +951,13 @@ def mla_prefill_asm_fwd(
 def get_pa_metadata_info_v1(
     batch_size: int,
     num_head_k: int = 1,
+    fast_mode: bool = True,
+    max_split_per_batch: int = -1,
 ):
     """
+    Pass the same fast_mode and max_split_per_batch to get_pa_metadata_v1.
+    fast_mode=False reserves the prefix-budget planner's packed task capacity.
+
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
@@ -969,6 +974,23 @@ def get_pa_metadata_info_v1(
     tile_cnt = batch_size
     max_work = (tile_cnt + cu_num - 1) * num_head_k
     max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
+
+    if not fast_mode:
+        if not 1 <= batch_size <= 4096 or not 1 <= num_head_k <= cu_num:
+            raise ValueError(
+                "proportional PA planning requires 1 <= batch <= 4096 and 1 <= KV heads <= CUs"
+            )
+        if max_split_per_batch == 0 or max_split_per_batch < -1:
+            raise ValueError("max_split_per_batch must be -1 or positive")
+        max_partitions = (
+            cu_num if max_split_per_batch < 0 else min(cu_num, max_split_per_batch)
+        )
+        capacity = min(
+            batch_size * max_partitions,
+            batch_size + cu_num // num_head_k - 1,
+        )
+        max_work = capacity * num_head_k
+        max_split_tiles = capacity
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs
@@ -1015,9 +1037,26 @@ def get_pa_metadata_v1(
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
-            fast_mode: default=True. Whether user wants metadata become as fast as possible. Note that fast
-                       mode may lead to bad overall performance.
+            fast_mode: True keeps the existing PA v1_2 planner. False selects the PA v1_1
+                       prefix-budget planner, not MLA's cost-sorted v1_1. Allocate buffers with
+                       get_pa_metadata_info_v1 using the same fast_mode/max_split_per_batch.
+                       v1_1 supports dense batches up to 4096 with positive Q lengths and
+                       max_seqlen_qo * num_heads_per_head_k <= 128 (one Q tile). KV granularity
+                       must be a multiple of block_size. Inputs must provide consistent Q/page
+                       indptrs and valid context lengths. Empty contexts receive no work; callers
+                       remain responsible for their final output values.
+                       Each request builds its plan on the GPU, followed by a same-stream
+                       finalizer for work_indptr. No GPU-to-CPU length readback is needed.
+                       Work boundaries follow cumulative KV-tile * Q-length budgets. Adjacent
+                       tiles of one request on the same worker stay in one work. All KV heads
+                       use floor(CUs / KV heads) workers so they share the reduction layout.
+                       A restrictive max_split_per_batch may merge budget ranges and reduce
+                       load balance; KV granularity also limits how precisely work can be split.
+                       More partitions can increase attention/reduction overhead; benchmark the
+                       whole operation before selecting this mode.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
+            max_split_per_batch: v1_1 caps partitions per request; -1 uses the device CU count.
+                       v1_2 retains its existing global split-budget behavior.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.
