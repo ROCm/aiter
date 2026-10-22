@@ -4,7 +4,7 @@
 #include "rocm_ops.hpp"
 #include "../include/groupnorm.hpp"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     m.def("_groupnorm_run",

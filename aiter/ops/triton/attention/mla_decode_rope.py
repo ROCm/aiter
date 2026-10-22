@@ -23,6 +23,8 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
+import copy
+
 import torch
 import triton
 
@@ -194,11 +196,17 @@ def decode_attention_fwd_grouped_rope(
         torch.Tensor: Output tensor o with shape (batch, num_q_heads, v_head_dim).
     """
     _LOGGER.info(
-        f"DECODE_ATTENTION_FWD_GROUPED_ROPE:  q={tuple(q.shape)}  k_buffer={tuple(k_buffer.shape)}  v_buffer={tuple(v_buffer.shape)} "
-        + f"k_pe_tokens={tuple(k_pe_tokens.shape) if k_pe_tokens is not None else None} cos_sin_cache={tuple(cos_sin_cache.shape) if cos_sin_cache is not None else None}"
+        "DECODE_ATTENTION_FWD_GROUPED_ROPE:  q=%s  k_buffer=%s  v_buffer=%s k_pe_tokens=%s cos_sin_cache=%s",
+        tuple(q.shape),
+        tuple(k_buffer.shape),
+        tuple(v_buffer.shape),
+        tuple(k_pe_tokens.shape) if k_pe_tokens is not None else None,
+        tuple(cos_sin_cache.shape) if cos_sin_cache is not None else None,
     )
     if config is None:
-        config = _get_config()
+        # _get_config() returns the shared cached dict and the launch helpers
+        # below write derived fields into its sub-configs — work on a copy.
+        config = copy.deepcopy(_get_config())
 
     is_fp32: bool = any(
         float_tensor is not None and float_tensor.dtype == torch.float32

@@ -1,26 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""OPUS-based sparse paged prefill attention for DeepSeek-V4 on gfx950.
+"""OPUS-based sparse paged prefill attention for DeepSeek-V4.
 
 Two-region sparse scaled-dot-product attention over a paged prefix source
 (``unified_kv``) and a flat per-fwd extend source (``kv``), with a per-head
 softmax-denominator sink. The two regions share a single online-softmax
 accumulator, making the order region-invariant.
 
-The user-facing entry is :func:`pa_sparse_prefill_opus`; it forwards
-to the JIT-compiled HIP kernel via
-:func:`pa_sparse_prefill_opus_fwd`.
+The user-facing entry is :func:`pa_sparse_prefill_opus`, which dispatches on
+the running GPU. Both backends live in ``module_mla_v4_prefill_opus``:
 
-The kernel currently only compiles a single configuration:
+* ``gfx950`` -- :func:`pa_sparse_prefill_gfx950_opus_fwd`, kernel compiled
+  from source by the JIT.
+* ``gfx1250`` -- :func:`pa_sparse_prefill_gfx1250_opus_fwd`, kernel loaded
+  from the prebuilt code objects in ``hsa/gfx1250/mla_v4_opus/``.
+
+Constraints common to both:
 
 * Head dim ``D == 512``.
 * dtype ``bf16`` or ``fp16`` for Q/K/V/O; ``attn_sink`` is ``fp32``.
+  ``gfx1250`` builds only the ``bf16`` variant.
 * Every entry in ``kv_indices_prefix`` / ``kv_indices_extend`` must be a
   valid row index into ``unified_kv`` / ``kv`` respectively. Empty CSR rows
   (``kv_indptr[i] == kv_indptr[i+1]``) are allowed.
 
-See ``aiter/csrc/include/pa_sparse_prefill_opus.h`` for the C++ API.
+See ``csrc/include/mla_v4_prefill_opus.h`` for the C++ API.
 """
 
 import torch
@@ -29,11 +34,28 @@ from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 
-MD_NAME = "module_pa_sparse_prefill_opus"
+MD_NAME = "module_mla_v4_prefill_opus"
+
+SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 
 
-@compile_ops("module_pa_sparse_prefill_opus", develop=True)
-def pa_sparse_prefill_opus_fwd(
+def _dispatch(gfx: str, op_gfx950, op_gfx1250):
+    """Pick the backend for the running GPU.
+
+    gfx950 compiles the kernel from source. gfx1250 instead loads a prebuilt
+    code object (``hsa/gfx1250/mla_v4_opus/``), because its kernel needs
+    the CoExec scheduler from a custom LLVM build that release images do not
+    ship; see ``csrc/py_itfs_cu/mla_v4_prefill_opus_kernels.cu``.
+    """
+    if gfx == "gfx1250":
+        return op_gfx1250
+    if gfx == "gfx950":
+        return op_gfx950
+    raise RuntimeError(f"pa_sparse_prefill_opus supports {SUPPORTED_ARCHS}, got {gfx}")
+
+
+@compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_gfx950_opus_fwd(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
     kv_indices_prefix: torch.Tensor,
@@ -47,6 +69,56 @@ def pa_sparse_prefill_opus_fwd(
 ) -> None: ...
 
 
+@compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_gfx950_opus_split_fwd(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    partial_o: torch.Tensor,
+    partial_max: torch.Tensor,
+    partial_sum: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    num_splits: int,
+) -> None: ...
+
+
+@compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_gfx1250_opus_fwd(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+) -> None: ...
+
+
+# Split-K by the unsplit grid's blocks (a token per 16 heads): fewer than the
+# CUs leave them idle through each token's serial key loop. Measured on MI355X
+# (256 CUs; 640 keys a token, H=16, perftest): 4 splits are best up to 120
+# blocks, none beyond.
+_KV_SPLIT_STEPS = ((120, 4),)
+
+
+def _auto_kv_splits(gfx: str, n: int, h: int) -> int:
+    """The split count for ``n`` tokens of ``h`` heads: host scalars only, so
+    a captured graph's choice is its shape's."""
+    if gfx != "gfx950" or h > 32:
+        return 1
+    blocks = n * -(-h // 16)
+    return next((s for limit, s in _KV_SPLIT_STEPS if blocks <= limit), 1)
+
+
 def _pa_sparse_prefill_opus_fake(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -58,6 +130,7 @@ def _pa_sparse_prefill_opus_fake(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
 ) -> torch.Tensor:
     return out if out is not None else torch.empty_like(q)
 
@@ -74,6 +147,7 @@ def pa_sparse_prefill_opus(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources (paged ``unified_kv`` +
     flat per-fwd ``kv``), backed by the OPUS gfx950 HIP kernel.
@@ -97,16 +171,26 @@ def pa_sparse_prefill_opus(
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, D]`` output buffer; allocated if
         ``None``.
+      num_kv_splits:     split each token's keys (prefix, then extend) over
+        this many blocks (split 0 counting the sink), then fold them in a
+        second launch (pa_decode_ps_reduce): parallelism for few tokens.
+        1 (the unsplit kernel), or 2, 4, 8 on gfx950 with H <= 32. ``None``
+        picks it from the token count (``_auto_kv_splits``).
 
     Returns:
       ``out`` (``[T, H, D]`` same dtype as ``q``).
     """
     gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        raise RuntimeError(f"pa_sparse_prefill_opus requires gfx950, got {gfx}")
+    fwd = _dispatch(
+        gfx, pa_sparse_prefill_gfx950_opus_fwd, pa_sparse_prefill_gfx1250_opus_fwd
+    )
 
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_sparse_prefill_opus expects fp16/bf16 q, got {q.dtype}")
+    if gfx == "gfx1250" and q.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"the gfx1250 code object only provides the bf16 variant, got {q.dtype}"
+        )
     if unified_kv.dtype != q.dtype:
         raise RuntimeError(
             f"unified_kv dtype mismatch: unified_kv={unified_kv.dtype}, q={q.dtype}"
@@ -126,7 +210,44 @@ def pa_sparse_prefill_opus(
             f"expected shape={tuple(q.shape)} dtype={q.dtype}"
         )
 
-    pa_sparse_prefill_opus_fwd(
+    if num_kv_splits is None:
+        num_kv_splits = _auto_kv_splits(gfx, *q.shape[:2])
+    elif num_kv_splits not in (1, 2, 4, 8):
+        # here: past it the kernel's check aborts the process; and a
+        # ValueError, a caller's error, not a configuration this GPU lacks
+        # (RuntimeError, which callers take as their cue to fall back)
+        raise ValueError(f"num_kv_splits must be 1, 2, 4 or 8, got {num_kv_splits}")
+    if num_kv_splits > 1:
+        if gfx != "gfx950" or q.size(1) > 32:
+            raise RuntimeError(
+                f"num_kv_splits > 1 runs on gfx950 with H <= 32, got {gfx} H={q.size(1)}"
+            )
+        n, h, d = q.shape
+        partial_o = torch.empty(
+            n, num_kv_splits, h, d, dtype=torch.float32, device=q.device
+        )
+        partial_max = torch.empty(
+            n, num_kv_splits, h, dtype=torch.float32, device=q.device
+        )
+        partial_sum = torch.empty_like(partial_max)
+        pa_sparse_prefill_gfx950_opus_split_fwd(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            partial_o,
+            partial_max,
+            partial_sum,
+            out,
+            float(softmax_scale),
+            int(num_kv_splits),
+        )
+        return out
+    fwd(
         q,
         unified_kv,
         kv_indices_prefix,
@@ -141,8 +262,26 @@ def pa_sparse_prefill_opus(
     return out
 
 
-@compile_ops("module_pa_sparse_prefill_opus", develop=True)
-def pa_sparse_prefill_fp8_opus_fwd(
+@compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_fp8_gfx950_opus_fwd(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+) -> None: ...
+
+
+@compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_fp8_gfx1250_opus_fwd(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     unified_kv_nope: torch.Tensor,
@@ -224,8 +363,11 @@ def pa_sparse_prefill_fp8_opus(
       ``out`` (``[T, H, 512]`` bf16).
     """
     gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        raise RuntimeError(f"pa_sparse_prefill_fp8_opus requires gfx950, got {gfx}")
+    fwd = _dispatch(
+        gfx,
+        pa_sparse_prefill_fp8_gfx950_opus_fwd,
+        pa_sparse_prefill_fp8_gfx1250_opus_fwd,
+    )
 
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(
@@ -244,7 +386,7 @@ def pa_sparse_prefill_fp8_opus(
             f"expected shape={(t, h, 512)} dtype={torch.bfloat16}"
         )
 
-    pa_sparse_prefill_fp8_opus_fwd(
+    fwd(
         q_nope,
         q_rope,
         unified_kv_nope,
@@ -263,8 +405,11 @@ def pa_sparse_prefill_fp8_opus(
 
 
 __all__ = [
+    "pa_sparse_prefill_fp8_gfx950_opus_fwd",
+    "pa_sparse_prefill_fp8_gfx1250_opus_fwd",
     "pa_sparse_prefill_fp8_opus",
-    "pa_sparse_prefill_fp8_opus_fwd",
+    "pa_sparse_prefill_gfx950_opus_fwd",
+    "pa_sparse_prefill_gfx950_opus_split_fwd",
+    "pa_sparse_prefill_gfx1250_opus_fwd",
     "pa_sparse_prefill_opus",
-    "pa_sparse_prefill_opus_fwd",
 ]

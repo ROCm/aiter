@@ -12,6 +12,8 @@ bake into the graph correctly.
 
 import argparse
 import itertools
+import os
+import sys
 from collections import namedtuple
 
 import pandas as pd
@@ -19,7 +21,13 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
+from aiter.benchmark_reporting import print_json_table
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.ops.inverse_rope_group_quant import (
+    SCALE_LAYOUTS,
+    scale_shape,
+)
 from aiter.ops.inverse_rope_group_quant import (
     inverse_rope_group_quant as inverse_rope_group_quant_cpp,
 )
@@ -33,12 +41,15 @@ from aiter.test_common import (
 
 torch.set_default_device("cuda")
 
-# The HIP kernel widens its cross-lane amax reduction past a 16-lane DPP row with
-# __builtin_amdgcn_permlane16_swap / permlane32_swap, which are gfx950+. Those
-# instantiate whenever THREADS_PER_GROUP >= 32, i.e. the s <= 4 tier
-# (THREAD_DATA_SIZE=2 -> 64 lanes per group), so the module does not build on
-# gfx942 today.
-SUPPORTED_GFX = ["gfx950"]
+# The op needs no arch-specific instruction of its own. The amax reduction
+# reaches past a 16-lane DPP row through __shfl_xor, which the compiler lowers
+# per arch (row_bcast on gfx9, permlane on gfx10+), and the hardware scaled-FP8
+# converters are an opt-in fast path that falls back to the general chain
+# (kHwScaledFp8 / kNativeQuant). So this list is the set of verified targets
+# rather than a build constraint. gfx942 quantizes to E4M3_FNUZ rather than
+# E4M3 (kHwFp8E4m3 in the kernel); the reference tracks that through
+# dtypes.fp8, which is what _e8m0_round_up below takes its max_pos from.
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250", "gfx1201"]
 
 # Positions stay unique for every swept s, so cos/sin rows are not reused across
 # tokens -- reuse would inflate the L2 hit rate versus a real decode batch spread
@@ -52,9 +63,9 @@ AMAX_FLOOR = 1e-8
 
 # One row of the perf table: `once` is called for the correctness check, `bench`
 # is the timed call, `ref` is the (dq, scale_byte) reference it is checked
-# against, `scale_shuffle` is the layout `once`'s scale should have, and
+# against, `scale_layout` is the layout `once`'s scale should have, and
 # `tol` / `scale_tol` are its (rtol, atol) pairs.
-Cand = namedtuple("Cand", "once bench ref scale_shuffle tol scale_tol")
+Cand = namedtuple("Cand", "once bench ref scale_layout tol scale_tol")
 
 # The fused op is a bit-for-bit match against the torch reference, so its scale
 # bytes are compared exactly and its dequantized values only carry fp8 rounding.
@@ -95,68 +106,236 @@ def _scale_bytes(scale):
     return scale if scale.dtype == dtypes.u8 else scale.view(dtypes.u8)
 
 
-def _unshuffle_mfma_scale(scale_shuffled, S, G, Ks):
-    """Unshuffle mfma-layout scale [G, S_pad, Ks_pad] -> logical [S, G, Ks]."""
-    flat = _scale_bytes(scale_shuffled).flatten().cpu()
-    S_pad = scale_shuffled.shape[1]
-    Ks_pad = scale_shuffled.shape[2]
-    out = torch.zeros(S, G, Ks, dtype=dtypes.u8)
-    for s in range(S):
-        for g in range(G):
-            for k in range(Ks):
-                tile_m = s // 32
-                tile_k = k // 8
-                tile_base = (tile_m * (Ks_pad // 8) + tile_k) * 256
-                lane = (k % 4) * 16 + (s % 16)
-                it = ((s // 16) & 1) + (((k // 4) & 1) << 1)
-                idx = g * S_pad * Ks_pad + tile_base + lane * 4 + it
-                out[s, g, k] = flat[idx]
-    return out.to(scale_shuffled.device)
+def _unshuffle_mfma_scale(scale_shuffled, S, G, Ks, group_size):
+    """Unshuffle mfma-layout scale [G, S_pad, Ks_pad] -> logical [S, G, Ks].
 
-
-def _check_scale_layout(scale, s, scale_shuffle, name):
-    """Assert the scale buffer's shape match the requested layout."""
-    if scale_shuffle:
-        assert scale.is_contiguous(), f"{name}: shuffled scale must be contiguous"
+    Both chunk widths factorise into a single permute. The 256-byte [32_M, 8_K]
+    tile splits as (k%4, s%16, (k/4)&1, (s/16)&1) at strides (64, 4, 2, 1); the
+    64-byte [32_M, 2_K] chunk the kernel emits at group_size 128 splits as
+    (s%16, k%2, (s/16)&1) at strides (4, 2, 1).
+    """
+    S_pad, Ks_pad = scale_shuffled.shape[1], scale_shuffled.shape[2]
+    flat = _scale_bytes(scale_shuffled)
+    if group_size == 128:
+        chunks = flat.reshape(G, S_pad // 32, Ks_pad // 2, 16, 2, 2)
+        out = chunks.permute(1, 5, 3, 0, 2, 4).reshape(S_pad, G, Ks_pad)
     else:
+        tiles = flat.reshape(G, S_pad // 32, Ks_pad // 8, 4, 16, 2, 2)
+        # -> (tile_m, (s/16)&1, s%16, G, tile_k, (k/4)&1, k%4), i.e. s and k
+        # rebuilt most-significant first around the untouched G.
+        out = tiles.permute(1, 6, 4, 0, 2, 5, 3).reshape(S_pad, G, Ks_pad)
+    return out[:S, :, :Ks].contiguous()
+
+
+def _unshuffle_n32k4_scale(scale_n32k4, S, G, Ks):
+    """Unshuffle n32k4 scale [S_pad/32, G, Ks*32] -> logical [S, G, Ks].
+
+    The last dim splits as (k//4, s%32, k%4), which is exactly the transpose
+    ``aiter.ops.shuffle.shuffle_scale_n32k4`` applies to a weight scale -- so
+    this reads back through the same permutation the consumer relies on.
+    """
+    n_super = scale_n32k4.shape[0]
+    flat = _scale_bytes(scale_n32k4).view(n_super, G, Ks // 4, 32, 4)
+    out = flat.permute(0, 3, 1, 2, 4).reshape(n_super * 32, G, Ks)
+    return out[:S].contiguous()
+
+
+def _unshuffle_scale(scale, s, g, ks, scale_layout, group_size):
+    """Scale buffer in `scale_layout` -> logical [s, g, ks] uint8."""
+    if scale_layout == "mfma_tile":
+        return _unshuffle_mfma_scale(scale, s, g, ks, group_size)
+    if scale_layout == "n32k4":
+        return _unshuffle_n32k4_scale(scale, s, g, ks)
+    return _scale_bytes(scale)
+
+
+# --- cross-tree drift gate for the mfma_tile layout at group_size 128 ---------
+#
+# At group_size 128 the buffer this op emits *is* opus's `shuffle_scale_a(x, K,
+# OPUS_SF_SHUF_SUB)`: one dword pairs two M subtiles `sub` rows apart crossed
+# with two consecutive 128-blocks of K. `_unshuffle_mfma_scale` above is a
+# hand-written inverse of that layout rather than a call into opus, because
+# `shuffle_scale_a` does not exist in this tree -- so the two can drift silently
+# and the failure mode is plausible wrong numbers, not an exception.
+#
+# The gate closes that by round-tripping a plain scale through opus's own
+# forward and this file's inverse. It has to run opus in a **subprocess**: both
+# trees ship a package named `aiter`, so a path insert here would resolve
+# `aiter.ops.shuffle` out of whichever one is already in sys.modules -- this
+# one, which has no shuffle_scale_a.
+#
+# `sub` is read from the opus traits header via its own single-source-of-truth
+# accessor rather than hardcoded. Hardcoding it would make this gate a third
+# copy of the constant it exists to police, and it is exactly the constant that
+# moved once already (32 -> 16 when the producer's layout was made the shipped
+# one).
+_OPUS_REF_SNIPPET = r"""
+import json, sys, torch
+tree = sys.argv[1]
+sys.path.insert(0, tree)
+sys.path.insert(0, tree + "/csrc/opus_gemm")
+from aiter.ops.shuffle import shuffle_scale_a
+try:
+    from opus_gemm_common import _opus_sf_shuf_sub
+    sub = _opus_sf_shuf_sub()
+except Exception as exc:                                  # header moved or renamed
+    raise SystemExit(f"cannot read OPUS_SF_SHUF_SUB from {tree}: {exc}")
+cases, out = json.loads(sys.argv[2]), {}
+for g, s, ks in cases:
+    torch.manual_seed(g * 1000 + s * 10 + ks)
+    plain = torch.randint(0, 255, (g, s, ks), dtype=torch.uint8)
+    out[f"{g},{s},{ks}"] = (plain, shuffle_scale_a(plain, ks * 128, sub),
+                            shuffle_scale_a(plain, ks * 128, sub * 2))
+torch.save({"sub": sub, "cases": out}, sys.argv[3])
+"""
+
+
+def check_opus_layout_identity(opus_tree, verbose=True):
+    """mfma_tile @ group 128 == opus `shuffle_scale_a`; raises on drift.
+
+    Returns the `sub` the opus tree is built with, so the caller can log which
+    layout was actually checked.
+    """
+    import json
+    import math
+    import subprocess
+    import tempfile
+
+    # Ragged s on both sides of the 2*sub row block and an odd ks, because the
+    # padding is where a layout disagreement hides: s=17 and s=129 pad, s=8 is a
+    # whole block short, and ks=3 exercises the odd-K half-dword.
+    cases = [(1, 32, 2), (2, 64, 8), (4, 17, 2), (1, 96, 6), (3, 8, 32), (2, 129, 4)]
+
+    with tempfile.TemporaryDirectory() as td:
+        ref_path = f"{td}/ref.pt"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _OPUS_REF_SNIPPET,
+                opus_tree,
+                json.dumps(cases),
+                ref_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"opus reference subprocess failed (rc={proc.returncode}):\n"
+                f"{proc.stdout}\n{proc.stderr}"
+            )
+        blob = torch.load(ref_path, weights_only=False)
+
+    sub, ran, neg_fired, neg_comparable = blob["sub"], 0, 0, 0
+    for g, s, ks in cases:
+        plain, ref, ref_wrong_sub = blob["cases"][f"{g},{s},{ks}"]
+        s_pad, ks_pad = math.ceil(s / (2 * sub)) * (2 * sub), ((ks + 1) // 2) * 2
+        expect = scale_shape(s, g, ks, "mfma_tile", 128)
+        if (s_pad, ks_pad) != tuple(expect[1:]):
+            raise AssertionError(
+                f"g={g} s={s} ks={ks}: this tree pads to {tuple(expect[1:])}, "
+                f"opus's sub={sub} layout wants ({s_pad}, {ks_pad})"
+            )
+        back = _unshuffle_mfma_scale(ref.view(g, s_pad, ks_pad), s, g, ks, 128)
+        got = back.permute(1, 0, 2).contiguous()
+        if not torch.equal(got, plain.to(got.device)):
+            raise AssertionError(
+                f"mfma_tile layout has drifted from opus shuffle_scale_a "
+                f"(sub={sub}) at g={g} s={s} ks={ks}: "
+                f"{(got != plain.to(got.device)).sum().item()} of {plain.numel()} "
+                f"scales differ"
+            )
+        ran += 1
+
+        # Built-in negative control. A gate that cannot fail proves nothing, and
+        # this one is cheap: the same round trip against the *other* sub must
+        # disagree, else the inverse is ignoring the byte the layout turns on.
+        # Only the cases whose row count is a whole 2*(2*sub) block are
+        # comparable -- elsewhere the two subs pad to different sizes, which the
+        # s_pad assertion above already catches, so they are not controls.
+        if ref_wrong_sub.numel() == ref.numel():
+            neg_comparable += 1
+            bad = (
+                _unshuffle_mfma_scale(
+                    ref_wrong_sub.view(g, s_pad, ks_pad), s, g, ks, 128
+                )
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            neg_fired += not torch.equal(bad, plain.to(bad.device))
+
+    assert ran == len(cases), f"gate was vacuous: ran {ran} of {len(cases)}"
+    assert neg_fired == neg_comparable and neg_fired, (
+        f"negative control: {neg_comparable - neg_fired} of {neg_comparable} "
+        f"size-comparable cases failed to distinguish sub={sub} from "
+        f"sub={2 * sub}, so the inverse is not reading the M-pairing byte"
+    )
+    if verbose:
+        aiter.logger.info(
+            "mfma_tile @ group 128 == opus shuffle_scale_a(sub=%d): %d/%d cases; "
+            "negative control distinguished sub=%d in %d/%d size-comparable cases",
+            sub,
+            ran,
+            len(cases),
+            2 * sub,
+            neg_fired,
+            neg_comparable,
+        )
+    return sub
+
+
+def _check_scale_layout(scale, s, g, ks, scale_layout, group_size, name):
+    """Assert the scale buffer's shape matches the requested layout."""
+    if scale_layout == "row":
         assert (
             scale.stride(2) == 1
         ), f"{name}: expected row-major scale, got strides {scale.stride()}"
+        return
+    assert scale.is_contiguous(), f"{name}: {scale_layout} scale must be contiguous"
+    expect = scale_shape(s, g, ks, scale_layout, group_size)
+    assert (
+        tuple(scale.shape) == expect
+    ), f"{name}: {scale_layout} scale should be {expect}, got {tuple(scale.shape)}"
 
 
-def _make_inputs(s, h, head_dim, rd, dtype, seed=0):
+def _make_inputs(s, h, head_dim, rd, dtype, data_init="norm", seed=0, cos_dtype=None):
     """Build (o, positions, cos, sin) for one config.
 
-    cos/sin are the 2D [max_pos, rd//2] the op takes. A model holding the
+    cos/sin are the 2D [max_pos, rd//2] the op takes, in cos_dtype (default:
+    the dtype of o; fp32 is DeepSeek-V4.1's table). A model holding the
     singleton batch/head dims (atom deepseek_v4._build_cos_sin_cache does
     unsqueeze(-2) twice, landing on [max_pos, 1, 1, rd//2] -- aiter
     rope_cached_positions' layout, not [max_pos, rd//2, 1, 1]) reshapes at its
     own call site, the way run_inverse_rope_inplace does for the triton rope.
     Shared by the sweep and the graph check so the two cannot drift.
     """
-    torch.manual_seed(seed)
+    gen = make_generator(seed)
     positions = torch.arange(s, dtype=dtypes.i64) % MAX_POS
     # /10 keeps a group's amax away from fp8 saturation, like a real
     # post-softmax attention output.
-    o = torch.randn((s, h, head_dim), dtype=dtype) / 10
-    theta = torch.randn((MAX_POS, rd // 2), dtype=dtypes.fp32)
-    cos = torch.cos(theta).to(dtype).contiguous()
-    sin = torch.sin(theta).to(dtype).contiguous()
+    o = (
+        fill((s * h, head_dim), data_init, gen, dtype=dtype)
+        .view(s, h, head_dim)
+        .div_(10)
+    )
+    theta = fill((MAX_POS, rd // 2), data_init, gen, dtype=dtypes.fp32)
+    cos = torch.cos(theta).to(cos_dtype or dtype).contiguous()
+    sin = torch.sin(theta).to(cos_dtype or dtype).contiguous()
     return o, positions, cos, sin
 
 
-def _alloc_outputs(s, g, d, group_size, scale_shuffle=False):
+def _alloc_outputs(s, g, d, group_size, scale_layout="row"):
     """Pre-allocate (x_fp8, x_scale) the way the wrapper would."""
     from aiter.utility.dtypes import get_dtype_fp8
 
     x_fp8 = torch.empty((s, g, d), dtype=get_dtype_fp8())
-    ks = d // group_size
-    if scale_shuffle:
-        s_pad = ((s + 31) // 32) * 32
-        ks_pad = ((ks + 7) // 8) * 8
-        x_scale = torch.full((g, s_pad, ks_pad), 0x7F, dtype=dtypes.fp8_e8m0)
-    else:
-        x_scale = torch.empty((s, g, ks), dtype=dtypes.fp8_e8m0)
+    shape = scale_shape(s, g, d // group_size, scale_layout, group_size)
+    # Unfilled like the wrapper, so the padded layouts leave their padding
+    # undefined here too and any check that reads it shows up as flaky rather
+    # than agreeing with itself by accident.
+    x_scale = torch.empty(shape, dtype=dtypes.fp8_e8m0)
     return x_fp8, x_scale
 
 
@@ -271,13 +450,24 @@ def run_unfused(x, positions, cos, sin, num_groups, quant_group_size, rd, out):
 
 @benchmark()
 def test_inverse_rope_group_quant(
-    s, h, g, head_dim, rd, group_size, dtype, scale_layout
+    s,
+    h,
+    g,
+    head_dim,
+    rd,
+    group_size,
+    dtype,
+    scale_layout,
+    data_init="norm",
+    seed=0,
+    cos_dtype=None,
 ):
     d = h * head_dim // g
     scale_n = d // group_size
-    shuffle = scale_layout == "shuffle"
 
-    o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
+    o, positions, cos, sin = _make_inputs(
+        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed, cos_dtype=cos_dtype
+    )
 
     ref = run_torch(o, positions, cos, sin, g, group_size, rd)
     ref_rt = run_torch(o, positions, cos, sin, g, group_size, rd, roundtrip=True)
@@ -285,7 +475,7 @@ def test_inverse_rope_group_quant(
     kwargs = {
         "num_groups": g,
         "quant_group_size": group_size,
-        "scale_shuffle": shuffle,
+        "scale_layout": scale_layout,
     }
 
     def fused():
@@ -297,7 +487,7 @@ def test_inverse_rope_group_quant(
     # being norm-preserving, cannot push values out of range -- but it does leave
     # the buffer rotated n times, so correctness runs on a fresh copy instead.
     unfused_scratch = o.clone()
-    unfused_out = _alloc_outputs(s, g, d, group_size, scale_shuffle=False)
+    unfused_out = _alloc_outputs(s, g, d, group_size)
 
     def unfused_bench():
         return run_unfused(
@@ -313,15 +503,17 @@ def test_inverse_rope_group_quant(
             g,
             group_size,
             rd,
-            _alloc_outputs(s, g, d, group_size, scale_shuffle=False),
+            _alloc_outputs(s, g, d, group_size),
         )
 
     funcs = {
-        "cpp": Cand(fused, fused, ref, shuffle, FUSED_TOL, FUSED_SCALE_TOL),
-        "unfused": Cand(
-            unfused_once, unfused_bench, ref_rt, False, UNFUSED_TOL, UNFUSED_SCALE_TOL
-        ),
+        "cpp": Cand(fused, fused, ref, scale_layout, FUSED_TOL, FUSED_SCALE_TOL),
     }
+    # The triton rope baseline takes a table in o's dtype only.
+    if cos.dtype == o.dtype:
+        funcs["unfused"] = Cand(
+            unfused_once, unfused_bench, ref_rt, "row", UNFUSED_TOL, UNFUSED_SCALE_TOL
+        )
 
     # inverse RoPE: 2 mul + 1 add per rope-tail element.
     # group quant: one |x| compare for the group amax + one scale multiply, per element.
@@ -343,11 +535,10 @@ def test_inverse_rope_group_quant(
         ref_dq, ref_scale = cand.ref
         x_fp8, x_scale = cand.once()
         _, us = run_perftest(cand.bench)
-        _check_scale_layout(x_scale, s, cand.scale_shuffle, name)
-        if cand.scale_shuffle:
-            scale_u8 = _unshuffle_mfma_scale(x_scale, s, g, scale_n)
-        else:
-            scale_u8 = _scale_bytes(x_scale)
+        _check_scale_layout(x_scale, s, g, scale_n, cand.scale_layout, group_size, name)
+        scale_u8 = _unshuffle_scale(
+            x_scale, s, g, scale_n, cand.scale_layout, group_size
+        )
         dq = (
             x_fp8.to(dtypes.fp32).reshape(s, g, scale_n, group_size)
             * _e8m0_byte_to_scale(scale_u8)[..., None]
@@ -379,20 +570,68 @@ def test_inverse_rope_group_quant(
     return ret
 
 
-def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
+def check_layout_rejected(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
+    """A wrong-family scale layout must raise, not abort.
+
+    The kernel refuses it too, but through AITER_CHECK -- which calls
+    std::abort(), so the process dies with SIGABRT and no traceback and nothing
+    can catch it. The wrapper's guard has to fire first; this asserts it does.
+    Deliberately does not reach the op, since getting there is the failure.
+    """
+    o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
+    try:
+        inverse_rope_group_quant_cpp(
+            o,
+            positions,
+            cos,
+            sin,
+            num_groups=g,
+            quant_group_size=group_size,
+            scale_layout=scale_layout,
+        )
+    except ValueError as e:
+        assert scale_layout in str(e), f"unhelpful rejection message: {e}"
+        aiter.logger.info(
+            "inverse_rope_group_quant %s rejected on %s: %s",
+            scale_layout,
+            get_gfx(),
+            e,
+        )
+        return
+    raise AssertionError(
+        f"scale_layout={scale_layout!r} is not built for {get_gfx()} but the "
+        "wrapper let the call through -- the kernel's AITER_CHECK would have "
+        "aborted the process here"
+    )
+
+
+def check_graph(
+    s,
+    h,
+    g,
+    head_dim,
+    rd,
+    group_size,
+    dtype,
+    scale_layout,
+    data_init="norm",
+    seed=0,
+    cos_dtype=None,
+):
     """Capture the op in a HIP graph, replay on fresh data, compare against eager.
 
     Not part of the perf table: this is a pass/fail check that the host-side
     dispatch tier and the pre-allocated buffers survive capture/replay.
     """
-    shuffle = scale_layout == "shuffle"
     d = h * head_dim // g
-    o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
-    x_fp8, x_scale = _alloc_outputs(s, g, d, group_size, scale_shuffle=shuffle)
+    o, positions, cos, sin = _make_inputs(
+        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed, cos_dtype=cos_dtype
+    )
+    x_fp8, x_scale = _alloc_outputs(s, g, d, group_size, scale_layout=scale_layout)
     kwargs = {
         "num_groups": g,
         "quant_group_size": group_size,
-        "scale_shuffle": shuffle,
+        "scale_layout": scale_layout,
         "x_fp8": x_fp8,
         "x_scale": x_scale,
     }
@@ -409,14 +648,30 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
         inverse_rope_group_quant_cpp(o, positions, cos, sin, **kwargs)
 
     # Replay on new data, then compare against an eager run on the same data.
-    o2, positions2, cos2, sin2 = _make_inputs(s, h, head_dim, rd, dtype, seed=7)
+    o2, positions2, cos2, sin2 = _make_inputs(
+        s,
+        h,
+        head_dim,
+        rd,
+        dtype,
+        data_init=data_init,
+        seed=seed + 7,
+        cos_dtype=cos_dtype,
+    )
     o.copy_(o2)
     positions.copy_(positions2)
     cos.copy_(cos2)
     sin.copy_(sin2)
     graph.replay()
     torch.cuda.synchronize()
-    graph_fp8, graph_scale = x_fp8.clone(), _scale_bytes(x_scale).clone()
+    # Unshuffled, not raw bytes: the padded layouts round S up to 32 and the op
+    # leaves the tail slots untouched, so for n32k4 -- whose consumer cannot see
+    # them (md 20) -- the wrapper hands back an unfilled torch.empty and the two
+    # allocations disagree there. Comparing the [s, g, Ks] view compares exactly
+    # the bytes the op defines.
+    scale_n_chk = d // group_size
+    graph_fp8 = x_fp8.clone()
+    graph_scale = _unshuffle_scale(x_scale, s, g, scale_n_chk, scale_layout, group_size)
 
     eager_fp8, eager_scale = inverse_rope_group_quant_cpp(
         o,
@@ -425,14 +680,20 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
         sin,
         num_groups=g,
         quant_group_size=group_size,
-        scale_shuffle=shuffle,
+        scale_layout=scale_layout,
     )
     torch.cuda.synchronize()
 
     fp8_match = torch.equal(graph_fp8.view(dtypes.u8), eager_fp8.view(dtypes.u8))
-    scale_match = torch.equal(graph_scale, _scale_bytes(eager_scale))
+    scale_match = torch.equal(
+        graph_scale,
+        _unshuffle_scale(eager_scale, s, g, scale_n_chk, scale_layout, group_size),
+    )
     # Mirrors the host dispatch in csrc/kernels/inverse_rope_group_quant.cu.
     tds = 2 if s <= 4 else (4 if s <= 128 else 8)
+    wave_size = torch.cuda.get_device_properties(o.device).warp_size
+    while group_size // tds > wave_size:
+        tds *= 2
     kpb = 1 if s <= 128 else (2 if s <= 512 else 4)
     aiter.logger.info(
         "graph s=%-6d h=%d g=%d gs=%-3d %s tier(TDS=%d,KPB=%d)  "
@@ -451,6 +712,100 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
         f"graph replay diverged from eager at s={s} h={h} g={g} "
         f"group_size={group_size} scale_layout={scale_layout}"
     )
+
+
+def check_invalid_group(s, h, g, head_dim, rd, group_size, dtype, seed=0):
+    """A non-finite input invalidates its own quant group and no other.
+
+    The kernel folds every non-finite magnitude onto +Inf before the group
+    reduction, so the block scale lands on the 0xFF E8M0 NaN. On the hardware
+    scaled convert that also turns the whole group into FP8 NaNs.
+    slice_amax_native in csrc/kernels/inverse_rope_group_quant.cu has the
+    reasoning.
+
+    Inf reaches the 0xFF scale on both quantize paths, so that byte is
+    asserted outright. The payload NaNs only come from the hardware scaled
+    convert (kHwScaledFp8 / kNativeQuant: gfx950, gfx1250). gfx942 has
+    neither instruction, so it does ``inv_scale = 1/Inf = +0`` and
+    ``v_med3_f32`` drops NaN -- the group stores zeros, and the invalid
+    marker is the scale alone.
+
+    NaN only folds onto Inf on the native amax; the general f32 path reduces
+    with fmaxf, which drops a NaN operand, and folding it there costs far
+    more than the case is worth (the kernel comment carries the measurement).
+    Rather than restate the host's path choice here, NaN is held to whichever
+    of the two documented outcomes applies -- which still fails on any third
+    one.
+    """
+    # e4m3fnuz (gfx942) spells NaN 0x80; OCP e4m3fn uses 0xFF.
+    nan_byte = 0x80 if torch.finfo(dtypes.fp8).max == 240 else 0xFF
+    d = h * head_dim // g
+    ks = d // group_size
+
+    for name, poison in (("inf", float("inf")), ("nan", float("nan"))):
+        o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype, seed=seed)
+        # Group 0 of row 0, beside a finite value big enough that a scale
+        # computed from the survivors is clearly distinguishable from 0xFF.
+        o[0, 0, 0] = poison
+        o[0, 0, 1] = 3.0
+
+        fp8, scale = inverse_rope_group_quant_cpp(
+            o,
+            positions,
+            cos,
+            sin,
+            num_groups=g,
+            quant_group_size=group_size,
+            scale_layout="row",
+        )
+        bytes_ = _scale_bytes(scale).reshape(s, g, ks)
+        q = fp8.view(dtypes.u8).reshape(s, g, d)
+        hit_scale = int(bytes_[0, 0, 0])
+        hit_nans = int((q[0, 0, :group_size] == nan_byte).sum())
+        # The group next door shares the row and must be untouched either way.
+        nbr_scale = int(bytes_[0, 0, 1])
+        nbr_nans = int((q[0, 0, group_size : 2 * group_size] == nan_byte).sum())
+
+        # Mirrors kHwScaledFp8 / kNativeQuant in the kernel: only those
+        # instructions turn an Inf dq_scale into a group of FP8 NaNs.
+        hw_scaled_fp8 = get_gfx() in ("gfx950", "gfx1250")
+        invalidated = hit_scale == 0xFF and (
+            hit_nans == group_size if hw_scaled_fp8 else True
+        )
+        assert nbr_scale != 0xFF and nbr_nans == 0, (
+            f"{name} at s={s} h={h} g={g} gs={group_size} leaked into the next "
+            f"group: scale=0x{nbr_scale:02X} nan_elems={nbr_nans}"
+        )
+        if name == "inf":
+            assert invalidated, (
+                f"inf at s={s} h={h} g={g} gs={group_size} did not invalidate "
+                f"its group: scale=0x{hit_scale:02X} nan_elems={hit_nans}/"
+                f"{group_size}"
+            )
+        else:
+            # The general f32 path scales against the surviving lanes. The
+            # poisoned element itself is a NaN only if the convert preserves
+            # it; gfx942's v_med3_f32 clamp drops that NaN, so the count can
+            # be zero.
+            survived = hit_scale != 0xFF and hit_nans <= 1
+            assert invalidated or survived, (
+                f"nan at s={s} h={h} g={g} gs={group_size} matched neither "
+                f"documented outcome: scale=0x{hit_scale:02X} nan_elems="
+                f"{hit_nans}/{group_size}"
+            )
+        aiter.logger.info(
+            "invalid-group %-3s s=%-5d h=%-4d g=%-3d gs=%-3d  scale=0x%02X "
+            "nan_elems=%d/%d  (%s)",
+            name,
+            s,
+            h,
+            g,
+            group_size,
+            hit_scale,
+            hit_nans,
+            group_size,
+            "group invalidated" if invalidated else "scaled from survivors",
+        )
 
 
 def main():
@@ -502,9 +857,10 @@ def main():
         "--tokens",
         type=int,
         nargs="*",
-        # Spans all three dispatch tiers of the HIP kernel: s<=4 picks
-        # THREAD_DATA_SIZE=2, s<=128 picks 4, above that 8; K_PER_BLOCK steps
-        # 1 -> 2 -> 4 at s>128 and s>512.
+        # Spans all three dispatch tiers of the HIP kernel: s<=4 starts at
+        # THREAD_DATA_SIZE=2, s<=128 at 4, above that 8. Wave32 targets raise
+        # TDS as needed to keep a quant group within one hardware wave.
+        # K_PER_BLOCK steps 1 -> 2 -> 4 at s>128 and s>512.
         default=[1, 8, 32, 128, 512, 1024, 2048, 4096, 8192, 16384],
         help="""Number of tokens s.
         e.g.: -s 1 128 8192""",
@@ -532,21 +888,25 @@ def main():
         type=int,
         nargs="*",
         # The wo_a path uses 128; 32/64 exercise the kernel's other group tiers.
-        default=[128],
-        help="""Quant group size along d.
+        # 32 is in the default because n32k4 exists only there, so dropping it
+        # would silently leave that layout untested on a default run.
+        default=[32, 128],
+        help="""Quant group size along d. n32k4 is skipped unless 32 is swept.
         e.g.: --group-size 32 64 128""",
     )
     parser.add_argument(
         "-l",
         "--scale-layout",
         type=str,
-        choices=["row", "shuffle"],
+        choices=list(SCALE_LAYOUTS),
         nargs="*",
-        default=["row", "shuffle"],
+        default=list(SCALE_LAYOUTS),
         help="""e8m0 scale storage:
-        row = contiguous [s, g, ks],
-        shuffle = V_MFMA_SCALE_F32_16x16x128_F8 tile-shuffled [g, s_pad, ks_pad].
-        e.g.: -l shuffle""",
+        row = [s, g, ks],
+        mfma_tile = [g, s_pad, ks_pad] for gfx950 V_MFMA_SCALE,
+        n32k4 = [s_pad/32, g, ks*32] for gfx1250 WMMA scaleB
+                (needs group size 32).
+        e.g.: -l n32k4""",
     )
     parser.add_argument(
         "--graph",
@@ -556,28 +916,155 @@ def main():
         help="""Also run the HIP-graph capture/replay check over the same sweep.
         e.g.: --graph -s 1 4 32 128 300 512 700 2048""",
     )
+    parser.add_argument(
+        "--data-init",
+        nargs="+",
+        choices=list(DATA_DISTS),
+        default=["norm"],
+        help="DATA initialization distribution(s) (default: norm)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for o and the RoPE cache source (default: 0)",
+    )
+    parser.add_argument(
+        "--cos-fp32",
+        action="store_true",
+        help="""Hold cos/sin in fp32, as DeepSeek-V4.1 does. Only the row-major
+        layout reads an fp32 table, so the other layouts are skipped.
+        e.g.: --cos-fp32 -l row --group-size 32""",
+    )
+    parser.add_argument(
+        "--opus-tree",
+        default=os.environ.get("AITER_OPUS_TREE"),
+        help="""Path to the opus aiter checkout. Round-trips this op's
+        mfma_tile scale through opus's own shuffle_scale_a, which is the only
+        thing keeping _unshuffle_mfma_scale from drifting away from the consumer
+        (the two live in different trees). CPU only, ~2s. Also settable via
+        AITER_OPUS_TREE.""",
+    )
     args = parser.parse_args()
+
+    if args.opus_tree:
+        check_opus_layout_identity(args.opus_tree)
+
+    def run_case(h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df):
+        # n32k4 only exists at group 32: its four packed k groups are one
+        # WMMA-K=128 step, so 4 * group_size has to be 128. The op rejects
+        # anything else, so sweeping it here would only collect failures.
+        if scale_layout == "n32k4" and group_size != 32:
+            return
+        cos_dtype = dtypes.fp32 if args.cos_fp32 else None
+        if cos_dtype is not None and scale_layout != "row":
+            return
+        # mfma_tile (CDNA V_MFMA_SCALE) and n32k4 (RDNA WMMA scaleB) have
+        # disjoint consumers, so the module builds each only for the family
+        # that can launch it -- see AITER_INVERSE_ROPE_MFMA_TILE / _N32K4.
+        # Skipping the wrong-family layout here would leave the rejection
+        # itself untested, and the kernel's own AITER_CHECK aborts the
+        # process rather than raising, so assert the python-level guard
+        # instead: that is the only thing standing between a caller passing
+        # a legal-looking string and a core dump.
+        is_cdna = get_gfx_runtime().startswith("gfx9")
+        if (scale_layout == "mfma_tile" and not is_cdna) or (
+            scale_layout == "n32k4" and is_cdna
+        ):
+            check_layout_rejected(
+                s, h, g, head_dim, rd, group_size, dtype, scale_layout
+            )
+            return
+        ret = test_inverse_rope_group_quant(
+            s,
+            h,
+            g,
+            head_dim,
+            rd,
+            group_size,
+            dtype,
+            scale_layout,
+            data_init=data_init,
+            seed=args.seed,
+            cos_dtype=cos_dtype,
+        )
+        df.append(ret)
+        if args.graph:
+            check_graph(
+                s,
+                h,
+                g,
+                head_dim,
+                rd,
+                group_size,
+                dtype,
+                scale_layout,
+                data_init=data_init,
+                seed=args.seed,
+                cos_dtype=cos_dtype,
+            )
 
     for dtype in args.dtype:
         df = []
-        for (h, g), s, head_dim, rd, group_size, scale_layout in itertools.product(
+        for (
+            (h, g),
+            s,
+            head_dim,
+            rd,
+            group_size,
+            scale_layout,
+            data_init,
+        ) in itertools.product(
             args.hg,
             args.tokens,
             args.head_dim,
             args.rope_dim,
             args.group_size,
             args.scale_layout,
+            args.data_init,
         ):
-            ret = test_inverse_rope_group_quant(
-                s, h, g, head_dim, rd, group_size, dtype, scale_layout
+            run_case(
+                h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df
             )
-            df.append(ret)
-            if args.graph:
-                check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout)
-        df = pd.DataFrame(df)
+        # Rows whose Ks leaves the block a part wave, which is what sizes the
+        # TDM staging buffer: 9 heads (Ks=36 at GS=128) drives k_slots down to
+        # 4 against a wave's 8 slots, and 3 heads (Ks=12) lands on 12, one and
+        # a half waves. Every default shape above is a whole number of waves
+        # and so cannot reach either. Correctness gate, not a bandwidth case.
+        for (
+            (h, g),
+            s,
+            head_dim,
+            rd,
+            group_size,
+            scale_layout,
+            data_init,
+        ) in itertools.product(
+            [(18, 2), (36, 4), (48, 16)],
+            [1, 32, 512, 4096],
+            args.head_dim,
+            args.rope_dim,
+            args.group_size,
+            args.scale_layout,
+            args.data_init,
+        ):
+            run_case(
+                h, g, s, head_dim, rd, group_size, dtype, scale_layout, data_init, df
+            )
+        # Cheap enough to run unconditionally, and worth it: the invalid-group
+        # policy has changed twice under optimisation with nothing watching it,
+        # because none of the DATA_DISTS can produce a non-finite input. (64, 8)
+        # is a D=4096 row, which takes the native quantize path; (16, 2) is the
+        # untiered f32 one.
+        for h, g in ((64, 8), (16, 2)):
+            for group_size in args.group_size:
+                check_invalid_group(
+                    512, h, g, args.head_dim[0], args.rope_dim[0], group_size, dtype
+                )
+        print_json_table("inverse_rope_group_quant summary", df)
         aiter.logger.info(
             "inverse_rope_group_quant summary (markdown):\n%s",
-            df.to_markdown(index=False),
+            pd.DataFrame(df).to_markdown(index=False),
         )
         if args.graph:
             aiter.logger.info("all graph capture/replay checks passed")

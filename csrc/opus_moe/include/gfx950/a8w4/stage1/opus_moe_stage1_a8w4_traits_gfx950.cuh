@@ -2,6 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
+#include "aiter_enum.h"
 #include "opus_moe_common.cuh"
 
 #include "opus/opus.hpp"
@@ -39,7 +40,10 @@ struct OpusMoeStage1A8W4Kargs
     int inter_dim;
     int hidden_scale_cols;
     int k_steps;
+    ActivationType activation;
     float swiglu_limit;
+    float situ_beta;
+    float situ_linear_beta;
 
     // Byte extents per global tensor -> make_gmem, so the HW OOB bounds check stays active.
     unsigned int hidden_size_bytes;
@@ -60,12 +64,6 @@ constexpr int kMinBlocksPerCu = 2;
 constexpr int kGfx950LdsBytes = 163840;
 constexpr int kDedicatedEpilogueScratchLdsLimit = 48 * 1024;
 
-enum class Stage1Activation
-{
-    Silu,
-    Swiglu,
-};
-
 template<int BlockM,
          int BlockN,
          typename Policy>
@@ -81,6 +79,8 @@ struct OpusMoeStage1A8W4Shape
     static constexpr int K_WAVE = Policy::K_WAVE;
     static constexpr bool GATE_UP_GROUP_SPLIT = Policy::GATE_UP_GROUP_SPLIT;
     static constexpr bool WEIGHT_LOAD_STREAM = Policy::WEIGHT_LOAD_STREAM;
+    static constexpr bool WEIGHT_LOAD_REVERSE = Policy::WEIGHT_LOAD_REVERSE;
+    static constexpr bool SPARSE_EPILOGUE = Policy::SPARSE_EPILOGUE;
     static constexpr int K_LOOP_SWIZZLE_COLORS = Policy::K_LOOP_SWIZZLE_COLORS;
     static constexpr int ROUTE_AFFINITY_WINDOW = Policy::ROUTE_AFFINITY_WINDOW;
     static constexpr int ROUTE_AFFINITY_PHASE_PERIOD =
@@ -97,8 +97,6 @@ struct OpusMoeStage1A8W4Shape
         Policy::MIN_BLOCKS_PER_CU_OVERRIDE :
         K_WAVE == 1 ? kMinBlocksPerCu :
         1;
-    static constexpr Stage1Activation ACTIVATION = Policy::ACTIVATION;
-
     static constexpr int SCALE_GROUP_LOGICAL_K = kScaleGroupLogicalK;
     static constexpr int OUTPUT_SCALE_GROUPS_PER_TILE =
         GATE_UP_GROUP_SPLIT ? (B_N / 2) / SCALE_GROUP_LOGICAL_K : 1;
@@ -135,7 +133,7 @@ struct OpusMoeStage1A8W4Shape
             2 * SCALE_K_PACK * A_REG_LDS_STAGE_BYTES :
             KWAVE_REDUCE_BYTES;
     static constexpr bool DEDICATED_EPILOGUE_SCRATCH =
-        GATE_UP_GROUP_SPLIT &&
+        (GATE_UP_GROUP_SPLIT || K_WAVE > 1) &&
         MAINLOOP_SCRATCH_BYTES + EPILOGUE_SMEM_BYTES <=
             kDedicatedEpilogueScratchLdsLimit;
     static constexpr int EPILOGUE_SCRATCH_OFFSET =
@@ -166,15 +164,18 @@ struct OpusMoeStage1A8W4Shape
     static_assert(SHARED_SCRATCH_BYTES <= kGfx950LdsBytes);
     static_assert(GATE_UP_GROUP_SPLIT || M_MFMA_PER_WAVE <= 2);
     static_assert(ROUTE_AFFINITY_PHASE_PERIOD >= 1);
+    static_assert(!WEIGHT_LOAD_REVERSE || WEIGHT_LOAD_STREAM);
+    static_assert(!SPARSE_EPILOGUE || B_M <= WAVE_SIZE);
 };
 
 template<bool GateUpGroupSplit = false,
          int KWave = 1,
          int MinBlocksPerCuOverride = 0,
          int QuantGroupBlocks = 1,
-         Stage1Activation Activation = Stage1Activation::Silu,
          int BlockThreads = kDefaultCtaThreads,
          bool WeightLoadStream = false,
+         bool WeightLoadReverse = false,
+         bool SparseEpilogue = false,
          int KLoopSwizzleColors = 0,
          int RouteAffinityWindow = 0,
          int RouteAffinityPhasePeriod = 1,
@@ -186,9 +187,10 @@ struct OpusMoeStage1A8W4Policy
     static constexpr int K_WAVE = KWave;
     static constexpr int MIN_BLOCKS_PER_CU_OVERRIDE = MinBlocksPerCuOverride;
     static constexpr int QUANT_GROUP_BLOCKS = QuantGroupBlocks;
-    static constexpr Stage1Activation ACTIVATION = Activation;
     static constexpr int BLOCK_THREADS = BlockThreads;
     static constexpr bool WEIGHT_LOAD_STREAM = WeightLoadStream;
+    static constexpr bool WEIGHT_LOAD_REVERSE = WeightLoadReverse;
+    static constexpr bool SPARSE_EPILOGUE = SparseEpilogue;
     static constexpr int K_LOOP_SWIZZLE_COLORS = KLoopSwizzleColors;
     static constexpr int ROUTE_AFFINITY_WINDOW = RouteAffinityWindow;
     static constexpr int ROUTE_AFFINITY_PHASE_PERIOD =

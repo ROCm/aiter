@@ -67,7 +67,7 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data):
+def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -94,9 +94,19 @@ def get_kernel_config(m, n, k, routing_data):
         block_n = 256
         block_k = 256
         num_warps = 8
+        if swizzle_mx_scale is None:
+            # switch to block_k=128 as 256 exceeds LDS budget
+            block_k = 128
+            if block_m >= 128:
+                block_n = 128
+            elif block_m == 64:
+                num_warps = 4
     num_stages = pick_gemm_num_stages(
         arch, block_m, block_n, block_k, 8, 8, use_async_padding=True
     )
+    if swizzle_mx_scale is None and block_m == 64 and block_k == 128 and block_n == 256:
+        # Override the heuristic to use num_stages=1 for preserving occupancy
+        num_stages = 1
 
     ret = {
         "block_m": block_m,
@@ -141,12 +151,36 @@ def moe_gemm_a8w8(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
+    x_token_scale=None,
+    w_expt_scale=None,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
+
+    x_token_scale: optional fp32 per-token activation scale, one entry per row
+        of x; applied to the accumulator before bias / activation.
+    w_expt_scale: optional fp32 per-expert weight scale [n_expts].
     """
+    if x_token_scale is not None:
+        assert (
+            x_token_scale.dtype == torch.float32
+        ), f"Expected fp32 x_token_scale, got {x_token_scale.dtype}"
+        x_token_scale = x_token_scale.reshape(-1).contiguous()
+        assert x_token_scale.numel() == x.shape[-2], (
+            f"x_token_scale must have one entry per row of x "
+            f"({x.shape[-2]}), got {x_token_scale.numel()}"
+        )
+    if w_expt_scale is not None:
+        assert (
+            w_expt_scale.dtype == torch.float32
+        ), f"Expected fp32 w_expt_scale, got {w_expt_scale.dtype}"
+        w_expt_scale = w_expt_scale.reshape(-1).contiguous()
+        assert w_expt_scale.numel() == w.shape[0], (
+            f"w_expt_scale must have one entry per expert "
+            f"({w.shape[0]}), got {w_expt_scale.numel()}"
+        )
     w_has_mx = w_scales is not None
     if w_has_mx:
         assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
@@ -177,7 +211,7 @@ def moe_gemm_a8w8(
     if unpadded_K and block_m == 16:
         K = unpadded_K
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data)
+    config = get_kernel_config(M, N, K, routing_data, swizzle_mx_scale)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -240,6 +274,8 @@ def moe_gemm_a8w8(
         x_static_scale,
         w_static_scale,
         quant_static_scale,
+        x_token_scale,
+        w_expt_scale,
         bias,
         stride_bias,
         gammas,

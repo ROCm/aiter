@@ -397,6 +397,21 @@ void free_meta_buffer(int64_t ptr)
     HIP_CALL(hipFree((void*)ptr));
 }
 
+int64_t allocate_data_buffer(int64_t size)
+{
+    // Cached device allocation for the IPC input pool. Unlike the meta buffer
+    // (uncached sync flags), this holds bulk data and must be exportable via
+    // hipIpcGetMemHandle, so it uses a plain hipMalloc instead of PyTorch's
+    // caching allocator (whose expandable-segment pool pointers cannot be
+    // exported). Not zero-initialized: the pool is overwritten before use.
+    int device_index;
+    HIP_CALL(hipGetDevice(&device_index));
+    HipDeviceGuard device_guard(device_index);
+    void* buffer;
+    HIP_CALL(hipMalloc((void**)&buffer, size));
+    return (int64_t)buffer;
+}
+
 void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr)
 {
     HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)out_handle_ptr, (void*)inp_ptr));
@@ -656,7 +671,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t reg_ptr, int64_t reg_bytes,
                                              bool use_1stage,
                                              int64_t bf16_out_ptr,
-                                             bool transpose_scale)
+                                             bool transpose_scale,
+                                             bool gemma_norm)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -694,7 +710,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::bf16_t*>(bf16_out), transpose_scale);
+            reinterpret_cast<opus::bf16_t*>(bf16_out), transpose_scale, gemma_norm);
         break;
     }
 #endif
@@ -708,7 +724,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::fp16_t*>(bf16_out), transpose_scale);
+            reinterpret_cast<opus::fp16_t*>(bf16_out), transpose_scale, gemma_norm);
         break;
     }
     default:
@@ -727,7 +743,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          double eps,
                                          int64_t reg_ptr, int64_t reg_bytes,
                                          bool use_1stage,
-                                         int64_t bf16_out_ptr)
+                                         int64_t bf16_out_ptr,
+                                         bool gemma_norm)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -764,7 +781,7 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
             reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
             (float)eps, m, n, use_1stage,
-            reinterpret_cast<opus::bf16_t*>(bf16_out));
+            reinterpret_cast<opus::bf16_t*>(bf16_out), gemma_norm);
         break;
     }
 #endif
@@ -778,7 +795,7 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
             reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
             (float)eps, m, n, use_1stage,
-            reinterpret_cast<opus::fp16_t*>(bf16_out));
+            reinterpret_cast<opus::fp16_t*>(bf16_out), gemma_norm);
         break;
     }
     default:

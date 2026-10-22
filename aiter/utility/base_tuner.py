@@ -42,7 +42,13 @@ class TunerCommon:
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",  # for all results
-        "timeout": None,  # 100s timeout for per test
+        # Per-task watchdog (seconds). A worker killed by a GPU memory-access
+        # fault leaves its in-flight task unresolvable; with no timeout the whole
+        # run hangs. A generous default lets the existing reaping path drop the
+        # lost task and restart the pool, while staying comfortably above any
+        # legitimate shape-group tuning time so healthy tasks are never falsely
+        # reaped. Override with --timeout for tighter/looser bounds.
+        "timeout": 1800,
         "warmup": 5,  # 5 warmup iters for profiling
         "iters": 101,  # 101 run iters for profiling
         "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
@@ -194,7 +200,9 @@ class TunerCommon:
             "--timeout",
             type=int,
             default=defaults["timeout"],
-            help="timeout for task group",
+            help="per-task watchdog in seconds; a lost task (dead worker) is "
+            "reaped and the pool restarted after this many seconds. Defaults "
+            "generous so healthy shape groups are never falsely reaped.",
         )
         self.parser.add_argument(
             "--run_config",
@@ -205,6 +213,12 @@ class TunerCommon:
             help="Run production operator benchmark and exit (no tuning). "
             "If a tuned CSV path is given, read shapes and kernels from it; "
             "otherwise read shapes from -i and run with default kernels.",
+        )
+        self.parser.add_argument(
+            "--e2e_tune",
+            action="store_true",
+            required=False,
+            help="Run e2e tuning as an alternative to main tuning, using production-op benchmark as the indicator",
         )
         self.parser.add_argument(
             "--compare",
@@ -1608,6 +1622,7 @@ class GemmCommonTuner(TunerCommon):
 
     def result_to_df(self, results):
         resultdf = pd.DataFrame(columns=self.columns)
+        rows = []
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
@@ -1638,11 +1653,12 @@ class GemmCommonTuner(TunerCommon):
                     "bw": [bw],
                 }
             )
-            temp = pd.DataFrame(key_dict)
-            if resultdf.empty:
-                resultdf = temp
-            else:
-                resultdf = pd.concat([resultdf, temp], ignore_index=True)
+            rows.append(key_dict)
+        # Build the frame once. Concatenating per row is O(n^2) in both time and
+        # allocation: with -o2 (profile of every candidate) a 42-shape x ~600
+        # candidate run spends hours here AFTER all GPU work is done.
+        if rows:
+            resultdf = pd.concat([pd.DataFrame(r) for r in rows], ignore_index=True)
         return resultdf
 
     def result_to_csv(self, resultdf, file, concat=False):

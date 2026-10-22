@@ -52,8 +52,8 @@ print("Stride:", args.stride)
 with profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
     profile_memory=True,
-    with_stack=True,
-    with_modules=True,
+    with_stack=False,
+    with_modules=False,
     record_shapes=True,
 ) as prof:
     for j in range(100):
@@ -61,11 +61,15 @@ with profile(
         result = torch.sigmoid(tensor0)
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
+# Warm up outside the profiled region: the first call JIT-builds and dlopens the
+# aiter module, which would otherwise dominate the measured CPU time.
+aiter.sigmoid(tensor0)
+
 with profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
     profile_memory=True,
-    with_stack=True,
-    with_modules=True,
+    with_stack=False,
+    with_modules=False,
     record_shapes=True,
 ) as prof:
     for j in range(100):

@@ -1,7 +1,6 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-import argparse
 import csv
 import inspect
 import tempfile
@@ -11,15 +10,17 @@ from pathlib import Path
 import torch
 import triton.profiler as proton
 
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
-    _get_config,
-)
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # Default group_m, group_n, group_k
 group_shape = (128, 128, 128)
@@ -150,7 +151,7 @@ def bench_mlp_single_weight_init(
 
     group_shape_m, group_shape_n, group_shape_k = group_shape
 
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
+    wg = torch.randn((dim1, n_expts_tot), dtype=torch.bfloat16, device=dev)
     w1 = (
         torch.randn((n_expts_tot, dim1, dim2 // TP), dtype=torch.bfloat16, device=dev)
         / 10
@@ -179,7 +180,7 @@ def bench_mlp_single_weight_init(
     x = (torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev) / 10).to(
         torch.float8_e4m3fn
     )
-    xg = x.to(torch.float32)
+    xg = x.to(torch.bfloat16)
 
     def num_blocks(length, block):
         return (length + block - 1) // block
@@ -215,7 +216,8 @@ def bench_mlp_single_weight_init(
     fpath = Path(tempfile.mktemp())
     M, K = xg.shape
     K, N = wg.shape
-    config, _ = _get_config(M, N, K)
+    config, _ = get_gemm_config("GEMM-A16W16", M, N, K)
+    compute_splitk_params(config, K)
     config["BLOCK_SIZE_M"] = min(config["BLOCK_SIZE_M"], 128)
     config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], 128)
     config["BLOCK_SIZE_K"] = min(config["BLOCK_SIZE_K"], 128)
@@ -424,7 +426,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",
