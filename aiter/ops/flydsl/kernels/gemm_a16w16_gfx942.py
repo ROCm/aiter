@@ -36,7 +36,6 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
 
 from aiter.utility.graph_alloc import persistent_alloc
 
@@ -162,7 +161,9 @@ def make_gemm_a16w16_gfx942_param(
     stream_operands: bool = False,
 ) -> GemmA16W16Gfx942Param:
     if in_dtype_id != GEMM_A16W16_DTYPE_BF16:
-        raise ValueError(f"gfx942 kernel is bf16-only for now (got in_dtype_id={in_dtype_id})")
+        raise ValueError(
+            f"gfx942 kernel is bf16-only for now (got in_dtype_id={in_dtype_id})"
+        )
     if out_dtype_id not in (in_dtype_id, GEMM_A16W16_DTYPE_FP32):
         raise ValueError(f"unsupported out_dtype_id={out_dtype_id}")
     if (mma_m, mma_n, mma_k) != (16, 16, 16):
@@ -171,7 +172,9 @@ def make_gemm_a16w16_gfx942_param(
         raise ValueError("stages must be >= 2 for the staged LDS pipeline")
     if buffered_load:
         if async_load_bytes != 16:
-            raise ValueError("buffered_load requires async_load_bytes=16 (128-bit buffer_load)")
+            raise ValueError(
+                "buffered_load requires async_load_bytes=16 (128-bit buffer_load)"
+            )
         if stages not in (1, 2):
             raise ValueError("buffered_load supports stages=1 (single LDS buffer) or 2")
     if pingpong and not (buffered_load and stages == 1):
@@ -185,7 +188,9 @@ def make_gemm_a16w16_gfx942_param(
             raise ValueError("stream_operands requires pingpong with prefetch_depth=1")
         # Two equal halves of whole 128-bit (32-element) K chunks per K wave.
         if block_k % (k_waves * 64) != 0:
-            raise ValueError("stream_operands needs block_k // k_waves to be a multiple of 64")
+            raise ValueError(
+                "stream_operands needs block_k // k_waves to be a multiple of 64"
+            )
     if k_waves < 1:
         raise ValueError("k_waves must be positive")
     if k_waves > 1:
@@ -216,7 +221,9 @@ def make_gemm_a16w16_gfx942_param(
     # split-K caps it at 4 so the atomic-add granularity stays modest.
     max_cshuffle_vec = 16 // out_dbytes
     atomic_split_k = split_k > 1 and not split_k_reduce
-    cshuffle_r2g_vec_size = min(max_cshuffle_vec, 4) if atomic_split_k else max_cshuffle_vec
+    cshuffle_r2g_vec_size = (
+        min(max_cshuffle_vec, 4) if atomic_split_k else max_cshuffle_vec
+    )
     if block_n % cshuffle_r2g_vec_size != 0:
         raise ValueError("block_n must be divisible by the cshuffle store vector size")
 
@@ -233,6 +240,7 @@ def make_gemm_a16w16_gfx942_param(
             f"k_waves reduction buffer exceeds 64 KB: k_waves={k_waves}, "
             f"block_m={block_m}, block_n={block_n}"
         )
+
     def c_chunk_bytes(chunks):
         return block_m // chunks * block_n * in_dbytes
 
@@ -242,8 +250,11 @@ def make_gemm_a16w16_gfx942_param(
     c_chunks = 1
     if not direct_store and c_smem_bytes > SMEM_CAPACITY_GFX942:
         reps_m = block_m // (mma_m * m_waves)
-        fits = [d for d in range(2, reps_m + 1)
-                if reps_m % d == 0 and c_chunk_bytes(d) <= SMEM_CAPACITY_GFX942]
+        fits = [
+            d
+            for d in range(2, reps_m + 1)
+            if reps_m % d == 0 and c_chunk_bytes(d) <= SMEM_CAPACITY_GFX942
+        ]
         if not fits:
             raise ValueError(
                 f"cshuffle tile exceeds 64 KB: block_m={block_m}, block_n={block_n}, "
@@ -321,10 +332,22 @@ def make_gemm_a16w16_gfx942_param(
 def make_gemm_a16w16_gfx942_kernel_name(param: GemmA16W16Gfx942Param) -> str:
     out_suffix = "_fp32" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     sk = ("_ksr" if param.split_k_reduce else "_ksd") if param.is_split_k else "_ks1"
-    dma = f"buf{param.async_load_bytes}" if param.buffered_load else str(param.async_load_bytes)
-    store = "_r2g" if param.direct_store else (f"_c{param.c_chunks}" if param.c_chunks > 1 else "")
+    dma = (
+        f"buf{param.async_load_bytes}"
+        if param.buffered_load
+        else str(param.async_load_bytes)
+    )
+    store = (
+        "_r2g"
+        if param.direct_store
+        else (f"_c{param.c_chunks}" if param.c_chunks > 1 else "")
+    )
     if param.pingpong:
-        pipe = "_pps" if param.stream_operands else ("_pp2" if param.prefetch_depth == 2 else "_pp")
+        pipe = (
+            "_pps"
+            if param.stream_operands
+            else ("_pp2" if param.prefetch_depth == 2 else "_pp")
+        )
     else:
         pipe = ""
     return (
@@ -355,7 +378,9 @@ def make_k_sliced_lds_layout(rows, block_k, k_waves):
     )
 
 
-def make_gfx942_load_context(elem_dtype, load_tid, ks_begin, param: GemmA16W16Gfx942Param):
+def make_gfx942_load_context(
+    elem_dtype, load_tid, ks_begin, param: GemmA16W16Gfx942Param
+):
     """Build the AB load context, selecting the async-to-LDS atom by DMA width."""
     uni_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
     buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
@@ -373,13 +398,17 @@ def make_gfx942_load_context(elem_dtype, load_tid, ks_begin, param: GemmA16W16Gf
         )
 
     if const_expr(param.a_is_transposed):
-        a_s2r_copy_atom = fx.make_copy_atom(fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype)
+        a_s2r_copy_atom = fx.make_copy_atom(
+            fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
+        )
         a_tiled_copy_atom = a_s2r_copy_atom
     else:
         a_s2r_copy_atom = uni_copy_atom
         a_tiled_copy_atom = buffer_copy_atom
     if const_expr(not param.b_is_transposed):
-        b_s2r_copy_atom = fx.make_copy_atom(fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype)
+        b_s2r_copy_atom = fx.make_copy_atom(
+            fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
+        )
         b_tiled_copy_atom = b_s2r_copy_atom
     else:
         b_s2r_copy_atom = uni_copy_atom
@@ -459,12 +488,7 @@ def gemm_a16w16_gfx942_kernel(
         and param.n_waves == 4
     )
     fine_schedule = const_expr(
-        (
-            block_m == 128
-            and block_n == 96
-            and block_k == 128
-            and param.n_waves == 2
-        )
+        (block_m == 128 and block_n == 96 and block_k == 128 and param.n_waves == 2)
         or (block_m == 128 and block_n == 256 and block_k == 64)
         or narrow_down_schedule
     )
@@ -496,9 +520,7 @@ def gemm_a16w16_gfx942_kernel(
     if const_expr(k_waves > 1):
         tid_mn = tid % threads_per_k_slice
         k_wave_idx = fx.Int32(
-            rocdl.readfirstlane(
-                fx.Int32.ir_type, fx.Int32(tid // threads_per_k_slice)
-            )
+            rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(tid // threads_per_k_slice))
         )
     else:
         tid_mn = tid
@@ -509,7 +531,9 @@ def gemm_a16w16_gfx942_kernel(
     # minimum. The old 256 floor silently disabled the swizzle for narrow-N
     # "hc-down" grids (e.g. M2048: 32x6=192 blocks < 256), which left us L2-bound
     # (44% hit vs hipBLASLt 81%). Swizzle only activates when group_m > 0.
-    block_swizzle = BlockSwizzle(NUM_XCDS=8, NUM_PIDS_THRESHOLD=0, GROUP_M=param.group_m)
+    block_swizzle = BlockSwizzle(
+        NUM_XCDS=8, NUM_PIDS_THRESHOLD=0, GROUP_M=param.group_m
+    )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
     ks_begin = ks_idx * working_k
@@ -527,7 +551,9 @@ def gemm_a16w16_gfx942_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, 1 if direct_store else block_m // c_chunks * block_n, 16]
+        c: fx.Array[
+            elem_dtype, 1 if direct_store else block_m // c_chunks * block_n, 16
+        ]
         red: fx.Array[fx.Float32, max(1, (k_waves // 2) * block_m * block_n), 16]
         flag: fx.Array[fx.Int32, 4, 16]
 
@@ -561,7 +587,9 @@ def gemm_a16w16_gfx942_kernel(
             n,
         )
 
-    ctx = make_gfx942_load_context(elem_dtype, load_tid=tid, ks_begin=ks_begin, param=param)
+    ctx = make_gfx942_load_context(
+        elem_dtype, load_tid=tid, ks_begin=ks_begin, param=param
+    )
     a_s2r_copy_atom = ctx.a_s2r_copy_atom
     b_s2r_copy_atom = ctx.b_s2r_copy_atom
 
@@ -585,8 +613,12 @@ def gemm_a16w16_gfx942_kernel(
     c_lds_layout = fx.make_layout((block_m // c_chunks, block_n), (block_n, 1))
 
     thr_mma = tiled_mma.thr_slice(tid_mn)
-    thr_copy_A = fx.make_tiled_copy_A(ctx.a_tiled_copy_atom, tiled_mma).get_slice(tid_mn)
-    thr_copy_B = fx.make_tiled_copy_B(ctx.b_tiled_copy_atom, tiled_mma).get_slice(tid_mn)
+    thr_copy_A = fx.make_tiled_copy_A(ctx.a_tiled_copy_atom, tiled_mma).get_slice(
+        tid_mn
+    )
+    thr_copy_B = fx.make_tiled_copy_B(ctx.b_tiled_copy_atom, tiled_mma).get_slice(
+        tid_mn
+    )
 
     gC = fx.flat_divide(out_buf, (block_m, block_n))[None, None, bid_m, bid_n]
     sC_write = fx.make_view(smem_c, c_lds_layout)
@@ -603,7 +635,9 @@ def gemm_a16w16_gfx942_kernel(
             c_r2g_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         else:
             c_r2g_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), elem_dtype)
-        thr_copy_C_direct = fx.make_tiled_copy_C(c_r2g_atom, tiled_mma).get_slice(tid_mn)
+        thr_copy_C_direct = fx.make_tiled_copy_C(c_r2g_atom, tiled_mma).get_slice(
+            tid_mn
+        )
     # Register double-buffer (stages>=3): a second A/B fragment pair holds the
     # next K-tile's LDS->reg read while frag_A/frag_B feed the current MFMAs.
     if const_expr(stages >= 3 or param.pingpong):
@@ -635,7 +669,9 @@ def gemm_a16w16_gfx942_kernel(
         # A: tile (block_m, block_k), global row-block bid_m, all K-tiles.
         _a_tv, _a_thrs_r = _make_g2s_tv(block_m)
         _a_bounded = fx.rocdl.make_buffer_tensor(a, max_size=False)
-        _gA_all = fx.flat_divide(_a_bounded, (block_m, block_k))[None, None, bid_m, None]
+        _gA_all = fx.flat_divide(_a_bounded, (block_m, block_k))[
+            None, None, bid_m, None
+        ]
         _a_g2r = fx.make_tiled_copy(
             _buf_atom, _a_tv, fx.make_tile(_a_thrs_r, block_k)
         ).get_slice(tid)
@@ -649,9 +685,7 @@ def gemm_a16w16_gfx942_kernel(
         # B: logical (N, K) view of the [K, N] weight (strides (b_leading_stride, 1)),
         # tile (block_n, block_k), global row-block bid_n, all K-tiles.
         _b_nk_buf = fx.rocdl.make_buffer_tensor(
-            fx.make_view(
-                fx.get_iter(b), fx.make_layout((n, k), (b_leading_stride, 1))
-            ),
+            fx.make_view(fx.get_iter(b), fx.make_layout((n, k), (b_leading_stride, 1))),
             max_size=False,
         )
         _b_tv, _b_thrs_r = _make_g2s_tv(block_n)
@@ -763,9 +797,7 @@ def gemm_a16w16_gfx942_kernel(
             )
         )
         for c in range_constexpr(c_begin, c_end):
-            if const_expr(
-                param.buffered_load and fine_schedule and stages == 1
-            ):
+            if const_expr(param.buffered_load and fine_schedule and stages == 1):
                 # Emit the first A/B pair together so the first MFMA waits on
                 # two LDS reads rather than A0/A1/B0. Remaining repeats are
                 # free to move under the MFMA cluster via the schedule below.
@@ -896,7 +928,9 @@ def gemm_a16w16_gfx942_kernel(
                 if const_expr(rd < n_rd):
                     rocdl.sched_dsrd(1)
                     rd += 1
-                elif const_expr((ld < wr if reload_in_place else ld <= wr) and ld < n_ld):
+                elif const_expr(
+                    (ld < wr if reload_in_place else ld <= wr) and ld < n_ld
+                ):
                     rocdl.sched_vmem(1)
                     ld += 1
                 elif const_expr(wr < n_wr):
@@ -944,7 +978,7 @@ def gemm_a16w16_gfx942_kernel(
             rocdl.sched_barrier(0)
             rocdl.s_waitcnt(lgkmcnt=0)
             if const_expr(commit):
-                rocdl.s_barrier()           # tile k+2 visible before next read
+                rocdl.s_barrier()  # tile k+2 visible before next read
             rocdl.sched_barrier(0)
 
         def drain(p, k_tile):
@@ -995,7 +1029,7 @@ def gemm_a16w16_gfx942_kernel(
             rocdl.sched_barrier(0)
             if const_expr(commit):
                 rocdl.s_waitcnt(lgkmcnt=0)
-                rocdl.s_barrier()           # tile k+1 visible before reading it
+                rocdl.s_barrier()  # tile k+1 visible before reading it
                 read_tile_into(0, frag_A_ret, frag_B_ret, 0, half_c)
             mma_groups(0, p2_end, mma_k_iters)
             schedule_phase(
@@ -1123,9 +1157,7 @@ def gemm_a16w16_gfx942_kernel(
                         )
                     )
                     dsrd_preload = const_expr(2)
-                    paired_iters = const_expr(
-                        min(n_dswr, (n_dsrd - dsrd_preload) // 2)
-                    )
+                    paired_iters = const_expr(min(n_dswr, (n_dsrd - dsrd_preload) // 2))
                     rocdl.sched_dsrd(dsrd_preload)
                     for _ in range_constexpr(paired_iters):
                         rocdl.sched_dsrd(1)
@@ -1154,8 +1186,8 @@ def gemm_a16w16_gfx942_kernel(
                     for _ in range_constexpr(n_dswr):
                         rocdl.sched_dswr(1)
                         rocdl.sched_mfma(1)
-                rocdl.s_waitcnt(lgkmcnt=0)   # tile k+1 writes landed
-                rocdl.s_barrier()             # writes visible before next read
+                rocdl.s_waitcnt(lgkmcnt=0)  # tile k+1 writes landed
+                rocdl.s_barrier()  # writes visible before next read
             else:
                 mma_tile(frag_A, frag_B)
                 rocdl.s_waitcnt(vmcnt=0)
@@ -1254,8 +1286,10 @@ def gemm_a16w16_gfx942_kernel(
                         red_ptr(k_wave_idx - half, j),
                     )
             gpu.barrier()
-            peer = [fx.ptr_load(red_ptr(k_wave_idx % half, j), result_type=vec4_ty)
-                    for j in range_constexpr(n_vec4)]
+            peer = [
+                fx.ptr_load(red_ptr(k_wave_idx % half, j), result_type=vec4_ty)
+                for j in range_constexpr(n_vec4)
+            ]
             acc = acc + fx.Vector.from_elements(
                 [p[t] for p in peer for t in range(4)], fx.Float32
             ).reshape(acc.shape)
@@ -1379,7 +1413,8 @@ def gemm_a16w16_gfx942_kernel(
         for chunk in range_constexpr(c_chunks):
             gpu.barrier()
             chunk_elems = [
-                i for i in range(frag_size)
+                i
+                for i in range(frag_size)
                 if (i // mma_vals) % reps_m // chunk_reps == chunk
             ]
             if const_expr(gated_epilogue):
@@ -1409,13 +1444,17 @@ def gemm_a16w16_gfx942_kernel(
                 vector_idx = block_threads * i + tid
                 if vector_idx < cshuffle_vectors:
                     local_row = vector_idx // cshuffle_r2g_x_threads
-                    local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
+                    local_col = (
+                        vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
+                    )
                     global_row = block_m_offset + chunk * chunk_rows + local_row
                     global_col = block_n_offset + local_col
                     if (global_row < m) and (global_col < n) and is_last:
                         c_vec = fx.ptr_load(
                             smem_c + local_row * block_n + local_col,
-                            result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                            result_type=fx.Vector.make_type(
+                                cshuffle_r2g_vec_size, elem_dtype
+                            ),
                         )
                         global_offset = global_row * n + global_col
                         write_cshuffle_vec_to_global(
@@ -1451,7 +1490,9 @@ def gemm_a16w16_gfx942(
     b_leading_stride = fx.Int32(
         fx.get_scalar(b.stride[1] if const_expr(param.b_is_transposed) else b.stride[0])
     )
-    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, fx.BFloat16))
+    mma_atom = fx.make_mma_atom(
+        fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, fx.BFloat16)
+    )
     tiled_mma = fx.make_tiled_mma(
         mma_atom,
         fx.make_layout((param.m_waves, param.n_waves, 1), (param.n_waves, 1, 0)),
@@ -1464,7 +1505,9 @@ def gemm_a16w16_gfx942(
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
     gemm_a16w16_gfx942_kernel._known_block_size = [param.block_threads, 1, 1]
-    gemm_a16w16_gfx942_kernel._func.__name__ = make_gemm_a16w16_gfx942_kernel_name(param)
+    gemm_a16w16_gfx942_kernel._func.__name__ = make_gemm_a16w16_gfx942_kernel_name(
+        param
+    )
     gemm_a16w16_gfx942_kernel(
         out,
         a,
@@ -1489,7 +1532,9 @@ def gemm_a16w16_gfx942(
 
 
 def _dynamic_tensor_arg(tensor, leading_dim):
-    return flyc.from_dlpack(tensor.detach()).mark_layout_dynamic(leading_dim=leading_dim)
+    return flyc.from_dlpack(tensor.detach()).mark_layout_dynamic(
+        leading_dim=leading_dim
+    )
 
 
 _SPLIT_K_WORKSPACE: dict = {}
@@ -1526,7 +1571,9 @@ PINGPONG_FILL_TILES = (
 )
 
 
-def pingpong_fill_cost_us(bm: int, bn: int, k_waves: int, split_k: int, k_tiles: int) -> float:
+def pingpong_fill_cost_us(
+    bm: int, bn: int, k_waves: int, split_k: int, k_tiles: int
+) -> float:
     """Modelled runtime of one round of single-CU pingpong workgroups.
 
     Least-squares fit (14% rms) to ~1500 graph-timed pingpong configs on GPU6
@@ -1570,7 +1617,9 @@ def pingpong_fill_config(m: int, n: int, k: int, max_split_k: int = 8) -> dict |
         # Narrow-N long-K at small M is bound by re-reading A once per N tile,
         # which the cost model ignores; wider-N tiles win (N=336 K=10240:
         # M256 32x96 sk8 15.2us vs 32x64 16.3; M512 32x128 sk6 22.6 vs 23.8).
-        bm, bn, waves, sk = (32, 96, (2, 2, 1), 8) if m <= 384 else (32, 128, (1, 4, 1), 6)
+        bm, bn, waves, sk = (
+            (32, 96, (2, 2, 1), 8) if m <= 384 else (32, 128, (1, 4, 1), 6)
+        )
         tiles = (-(-m // bm)) * (-(-n // bn))
         sk = min(sk, GFX942_NUM_CUS // tiles)
         if k_tiles - (sk - 1) * -(-k_tiles // sk) >= 3:
@@ -1593,11 +1642,24 @@ def pingpong_fill_config(m: int, n: int, k: int, max_split_k: int = 8) -> dict |
     # Streamed operands halve the operand and staging registers, which stops
     # the 128x96 spill (4096x336x10240 96.9->86.8us, 8192x384x10240
     # 165.4->153.6us) and is neutral to better on the small tiles.
-    return dict(block_m=bm, block_n=bn, block_k=128, split_k=sk,
-                m_waves=mw, n_waves=nw, k_waves=kw, group_m=8,
-                direct_store=n % bn == 0, split_k_reduce=sk > 1,
-                stream_operands=True, prefetch_depth=1,
-                stages=1, buffered_load=True, async_load_bytes=16, pingpong=True)
+    return {
+        "block_m": bm,
+        "block_n": bn,
+        "block_k": 128,
+        "split_k": sk,
+        "m_waves": mw,
+        "n_waves": nw,
+        "k_waves": kw,
+        "group_m": 8,
+        "direct_store": n % bn == 0,
+        "split_k_reduce": sk > 1,
+        "stream_operands": True,
+        "prefetch_depth": 1,
+        "stages": 1,
+        "buffered_load": True,
+        "async_load_bytes": 16,
+        "pingpong": True,
+    }
 
 
 def gfx942_auto_config(m: int, n: int, k: int) -> dict:
@@ -1611,8 +1673,13 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
     """
     bk = 64
     # Two-phase single-LDS-buffer pipeline.
-    pingpong = dict(stages=1, buffered_load=True, async_load_bytes=16, pingpong=True,
-                    prefetch_depth=1)
+    pingpong = {
+        "stages": 1,
+        "buffered_load": True,
+        "async_load_bytes": 16,
+        "pingpong": True,
+        "prefetch_depth": 1,
+    }
 
     def stream_tile_config() -> dict | None:
         # 4-wave streamed-operand pingpong tile. Its runtime tracks the work
@@ -1645,12 +1712,26 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
         # (2048^3 48.0->45.2us); neutral at 2048x2048x4096 and 4096x1024x4096,
         # a loss at K=1024 and on the 128-tile 2048x1024x4096.
         bk_s = 64
-        if (bm, bn) == (128, 128) and k % 128 == 0 and k >= 2048 \
-                and 256 <= tiles <= GFX942_NUM_CUS:
+        if (
+            (bm, bn) == (128, 128)
+            and k % 128 == 0
+            and k >= 2048
+            and 256 <= tiles <= GFX942_NUM_CUS
+        ):
             bk_s = 128
-        return dict(block_m=bm, block_n=bn, block_k=bk_s, split_k=1,
-                    m_waves=2, n_waves=2, k_waves=1, group_m=group_m,
-                    stream_operands=True, direct_store=False, **pingpong)
+        return dict(
+            block_m=bm,
+            block_n=bn,
+            block_k=bk_s,
+            split_k=1,
+            m_waves=2,
+            n_waves=2,
+            k_waves=1,
+            group_m=group_m,
+            stream_operands=True,
+            direct_store=False,
+            **pingpong,
+        )
 
     def split_k_for(bm: int, bn: int, cap: int = 16) -> int:
         # one semaphore per output tile (independent of split_k)
@@ -1669,10 +1750,7 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
     short_k = k <= 1024
     large_rect_blocks = ((m + 255) // 256) * ((n + 127) // 128)
     use_large_rect_tile = (
-        k >= 1024
-        and m % 256 == 0
-        and n % 128 == 0
-        and large_rect_blocks >= 256
+        k >= 1024 and m % 256 == 0 and n % 128 == 0 and large_rect_blocks >= 256
     )
 
     # Small square problems are a grid-fill regime, not the long-K narrow-N
@@ -1682,28 +1760,67 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
     # per-tile efficiency (14.3us -> 10.7us on GPU6).
     if short_k and 256 <= m == n:
         if m <= 512:
-            return dict(block_m=32, block_n=32, block_k=bk, stages=2,
-                        split_k=1, m_waves=2, n_waves=2, group_m=0)
+            return {
+                "block_m": 32,
+                "block_n": 32,
+                "block_k": bk,
+                "stages": 2,
+                "split_k": 1,
+                "m_waves": 2,
+                "n_waves": 2,
+                "group_m": 0,
+            }
         if m <= 1024:
             if m % 64 == 0 and k % 128 == 0 and k >= 256:
                 # The streamed-operand pingpong runs the same 64x64 grid
                 # faster: 1024^3 11.4->9.5us (hipBLASLt 9.8us).
-                return dict(block_m=64, block_n=64, block_k=128, split_k=1,
-                            m_waves=2, n_waves=2, k_waves=1, group_m=0,
-                            stream_operands=True, direct_store=False, **pingpong)
-            return dict(block_m=64, block_n=64, block_k=bk, stages=4,
-                        split_k=1, m_waves=2, n_waves=2, group_m=0)
+                return dict(
+                    block_m=64,
+                    block_n=64,
+                    block_k=128,
+                    split_k=1,
+                    m_waves=2,
+                    n_waves=2,
+                    k_waves=1,
+                    group_m=0,
+                    stream_operands=True,
+                    direct_store=False,
+                    **pingpong,
+                )
+            return {
+                "block_m": 64,
+                "block_n": 64,
+                "block_k": bk,
+                "stages": 4,
+                "split_k": 1,
+                "m_waves": 2,
+                "n_waves": 2,
+                "group_m": 0,
+            }
 
     if m <= 8:  # decode / GEMV
         if narrow_n:  # long-K, narrow-N: split-K is decisive
             bm = 64 if m <= 2 else 16
             bn = 32
-            return dict(block_m=bm, block_n=bn, block_k=bk, stages=2,
-                        split_k=split_k_for(bm, bn),
-                        m_waves=2 if bm >= 32 else 1, n_waves=2)
+            return {
+                "block_m": bm,
+                "block_n": bn,
+                "block_k": bk,
+                "stages": 2,
+                "split_k": split_k_for(bm, bn),
+                "m_waves": 2 if bm >= 32 else 1,
+                "n_waves": 2,
+            }
         bm = 32 if m <= 2 else 16  # wide-N, short-K: no split-K
-        return dict(block_m=bm, block_n=64, block_k=bk, stages=2, split_k=1,
-                    m_waves=2 if bm >= 32 else 1, n_waves=2)
+        return {
+            "block_m": bm,
+            "block_n": 64,
+            "block_k": bk,
+            "stages": 2,
+            "split_k": 1,
+            "m_waves": 2 if bm >= 32 else 1,
+            "n_waves": 2,
+        }
 
     # Long-K: fill the CUs with pingpong tiles (+ workspace
     # split-K). N=1024 at M>=2048 keeps the 128x128 b40 rule below, which the
@@ -1726,9 +1843,18 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
             pp = stream_tile_config()
             if pp is not None:
                 return pp
-            return dict(block_m=128, block_n=128, block_k=128, stages=1,
-                        split_k=1, m_waves=4, n_waves=4, group_m=8,
-                        buffered_load=True, async_load_bytes=16)
+            return {
+                "block_m": 128,
+                "block_n": 128,
+                "block_k": 128,
+                "stages": 1,
+                "split_k": 1,
+                "m_waves": 4,
+                "n_waves": 4,
+                "group_m": 8,
+                "buffered_load": True,
+                "async_load_bytes": 16,
+            }
         if m <= 1024:
             # 32x32 fills the machine via split-K along the long K while the grid
             # underfills (<=304 tiles, M<=~680). Once the 32x32 grid already
@@ -1737,27 +1863,46 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
             # tile's ~3.3x VALU/MFMA addressing overhead (b34: M1024 61->53us,
             # 1.90x->1.62x of hipBLASLt).
             tiles32 = ((m + 31) // 32) * ((n + 31) // 32)
-            if (
-                m >= 256
-                and n <= 512
-                and 96 <= tiles32 <= 144
-                and k % (4 * 128) == 0
-            ):
+            if m >= 256 and n <= 512 and 96 <= tiles32 <= 144 and k % (4 * 128) == 0:
                 # A 128-bit buffered load with bk128 halves the K-loop/barrier
                 # count while split-K keeps this medium-small output grid full.
                 # Unlike the old async bk64 path, each split starts its buffered
                 # loads at its own K offset. GPU6 rocprof A/B: 256x384x10240
                 # 24.2->21.9us, 384x384x10240 29.5->27.9us, and
                 # 256x512x4096 18.8->13.4us; a 512x256x4096 control is neutral.
-                return dict(block_m=32, block_n=32, block_k=128, stages=1,
-                            split_k=4, m_waves=2, n_waves=2, group_m=8,
-                            buffered_load=True, async_load_bytes=16)
+                return {
+                    "block_m": 32,
+                    "block_n": 32,
+                    "block_k": 128,
+                    "stages": 1,
+                    "split_k": 4,
+                    "m_waves": 2,
+                    "n_waves": 2,
+                    "group_m": 8,
+                    "buffered_load": True,
+                    "async_load_bytes": 16,
+                }
             if tiles32 > GFX942_NUM_CUS:
-                return dict(block_m=32, block_n=64, block_k=128, stages=2,
-                            split_k=1, m_waves=2, n_waves=2, group_m=8)
-            return dict(block_m=32, block_n=32, block_k=bk, stages=2,
-                        split_k=split_k_for(32, 32, cap=4), m_waves=2, n_waves=2,
-                        group_m=8)
+                return {
+                    "block_m": 32,
+                    "block_n": 64,
+                    "block_k": 128,
+                    "stages": 2,
+                    "split_k": 1,
+                    "m_waves": 2,
+                    "n_waves": 2,
+                    "group_m": 8,
+                }
+            return {
+                "block_m": 32,
+                "block_n": 32,
+                "block_k": bk,
+                "stages": 2,
+                "split_k": split_k_for(32, 32, cap=4),
+                "m_waves": 2,
+                "n_waves": 2,
+                "group_m": 8,
+            }
         if m <= 4096:
             # 64x64 tile. stages picks on grid-fill: st4 fills the full 64 KB
             # LDS (2*(64+64)*64*2 per stage x4 = 64 KB) -> 1 workgroup/CU and
@@ -1770,8 +1915,16 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
             bm = bn = 64
             blocks = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
             stages = 2 if blocks > GFX942_NUM_CUS else 4
-            return dict(block_m=bm, block_n=bn, block_k=bk, stages=stages,
-                        split_k=1, m_waves=2, n_waves=2, group_m=8)
+            return {
+                "block_m": bm,
+                "block_n": bn,
+                "block_k": bk,
+                "stages": stages,
+                "split_k": 1,
+                "m_waves": 2,
+                "n_waves": 2,
+                "group_m": 8,
+            }
         # 128x128 tile at large M: raise to 4x4 waves (1024 threads = 16
         # wavefronts/block) to hide the long-K (K=10240) global-load latency.
         # The narrow-N grid launches few blocks (M8192: 64*3=192 on 304 CUs), so
@@ -1797,15 +1950,41 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
                 # Below a full 256-block grid, direct R2G also wins by removing
                 # the cshuffle barrier (M6144 175.8->169.7us under rocprof).
                 use_direct_store = m % 128 == 0 and m < 8192
-                return dict(block_m=128, block_n=96, block_k=128, stages=1,
-                            split_k=1, m_waves=4, n_waves=2, group_m=8,
-                            buffered_load=True, async_load_bytes=16,
-                            direct_store=use_direct_store)
-            return dict(block_m=128, block_n=128, block_k=128, stages=1,
-                        split_k=1, m_waves=4, n_waves=4, group_m=8,
-                        buffered_load=True, async_load_bytes=16)
-        return dict(block_m=128, block_n=128, block_k=bk, stages=2, split_k=1,
-                    m_waves=4, n_waves=4, group_m=8)
+                return {
+                    "block_m": 128,
+                    "block_n": 96,
+                    "block_k": 128,
+                    "stages": 1,
+                    "split_k": 1,
+                    "m_waves": 4,
+                    "n_waves": 2,
+                    "group_m": 8,
+                    "buffered_load": True,
+                    "async_load_bytes": 16,
+                    "direct_store": use_direct_store,
+                }
+            return {
+                "block_m": 128,
+                "block_n": 128,
+                "block_k": 128,
+                "stages": 1,
+                "split_k": 1,
+                "m_waves": 4,
+                "n_waves": 4,
+                "group_m": 8,
+                "buffered_load": True,
+                "async_load_bytes": 16,
+            }
+        return {
+            "block_m": 128,
+            "block_n": 128,
+            "block_k": bk,
+            "stages": 2,
+            "split_k": 1,
+            "m_waves": 4,
+            "n_waves": 4,
+            "group_m": 8,
+        }
 
     if short_k:  # wide-N "hc-up"
         # 128x128 + 4x4 waves (16 wavefronts/block, b33: hides the global-load
@@ -1818,12 +1997,27 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
         # 128x128 runs two workgroups per CU; past 608 tiles its last round is
         # nearly empty, so take hipBLASLt's one-round 256x160 tile instead
         # (1024x10240x320 26.2->24.8us). Its C tile goes through LDS in chunks.
-        if m % 256 == 0 and n % 160 == 0 and k % 64 == 0 and k >= 128 \
-                and (m // 128) * (n // 128) > 2 * GFX942_NUM_CUS \
-                and (m // 256) * (n // 160) <= GFX942_NUM_CUS:
-            return dict(block_m=256, block_n=160, block_k=64, split_k=1,
-                        m_waves=4, n_waves=1, k_waves=1, group_m=0,
-                        stream_operands=True, direct_store=False, **pingpong)
+        if (
+            m % 256 == 0
+            and n % 160 == 0
+            and k % 64 == 0
+            and k >= 128
+            and (m // 128) * (n // 128) > 2 * GFX942_NUM_CUS
+            and (m // 256) * (n // 160) <= GFX942_NUM_CUS
+        ):
+            return dict(
+                block_m=256,
+                block_n=160,
+                block_k=64,
+                split_k=1,
+                m_waves=4,
+                n_waves=1,
+                k_waves=1,
+                group_m=0,
+                stream_operands=True,
+                direct_store=False,
+                **pingpong,
+            )
         pp = stream_tile_config() if m >= 1024 else None
         if pp is not None:
             return pp
@@ -1833,17 +2027,34 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
             # retain the reuse win: 2048x4096x1024 57.1->50.7us and its
             # transpose 59.1->54.5us. group_m=4 lifts the L2 hit rate (63%
             # vs hipBLASLt's 79% without it): 4096x2048x1024 55.0->48.8us.
-            return dict(block_m=256, block_n=128, block_k=64, stages=1,
-                        split_k=1, m_waves=4, n_waves=2, group_m=4,
-                        buffered_load=True, async_load_bytes=16)
+            return {
+                "block_m": 256,
+                "block_n": 128,
+                "block_k": 64,
+                "stages": 1,
+                "split_k": 1,
+                "m_waves": 4,
+                "n_waves": 2,
+                "group_m": 4,
+                "buffered_load": True,
+                "async_load_bytes": 16,
+            }
         if m >= 1024 and k % 128 == 0 and m % 128 == 0 and n % 128 == 0:
             # With enough output tiles to fill the machine, bk128 halves the
             # K-loop barriers and b40's write-under-compute schedule hides the
             # single-buffer ds_writes.  Broad-shape sweep: 1024x4096x512
             # 17.4->16.3us; 4096x8192x512 113.9->107.8us.
-            return dict(block_m=128, block_n=128, block_k=128, stages=1,
-                        split_k=1, m_waves=4, n_waves=4,
-                        buffered_load=True, async_load_bytes=16)
+            return {
+                "block_m": 128,
+                "block_n": 128,
+                "block_k": 128,
+                "stages": 1,
+                "split_k": 1,
+                "m_waves": 4,
+                "n_waves": 4,
+                "buffered_load": True,
+                "async_load_bytes": 16,
+            }
         if k % bk == 0 and k >= 3 * bk:
             # Pingpong pipeline on 4-wave (or narrower) tiles. Up 128..2048 x
             # 10240 x 320: 7.8->6.5, 10.6->9.8, 29.8->28.1, 51.8->50.0us; it
@@ -1853,16 +2064,29 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
             # element, so stage through LDS for 128-bit stores from M1024
             # (M1024 28.5->26.7us, M2048 50.1->48.2us).
             if m <= 128:
-                tile = dict(block_m=32, block_n=64, m_waves=2, n_waves=2)
+                tile = {"block_m": 32, "block_n": 64, "m_waves": 2, "n_waves": 2}
             elif m <= 256:
-                tile = dict(block_m=64, block_n=64, m_waves=1, n_waves=2)
+                tile = {"block_m": 64, "block_n": 64, "m_waves": 1, "n_waves": 2}
             else:
-                tile = dict(block_m=64, block_n=128, m_waves=1, n_waves=4)
-            return dict(block_k=bk, split_k=1, group_m=0,
-                        direct_store=m < 1024 and n % tile["block_n"] == 0,
-                        stream_operands=True, **tile, **pingpong)
-        return dict(block_m=bm, block_n=128, block_k=bk, stages=2, split_k=1,
-                    m_waves=waves, n_waves=waves)
+                tile = {"block_m": 64, "block_n": 128, "m_waves": 1, "n_waves": 4}
+            return dict(
+                block_k=bk,
+                split_k=1,
+                group_m=0,
+                direct_store=m < 1024 and n % tile["block_n"] == 0,
+                stream_operands=True,
+                **tile,
+                **pingpong,
+            )
+        return {
+            "block_m": bm,
+            "block_n": 128,
+            "block_k": bk,
+            "stages": 2,
+            "split_k": 1,
+            "m_waves": waves,
+            "n_waves": waves,
+        }
 
     # square / general compute-bound
     if use_large_rect_tile:
@@ -1876,16 +2100,34 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
         # M/N tiles. group_m=4 keeps A/B row blocks L2-resident: 4096^3
         # 295.5->279.0us.
         if m == n and m >= 4096:
-            return dict(block_m=256, block_n=256, block_k=64, stages=1,
-                        split_k=1, m_waves=4, n_waves=4, group_m=4,
-                        buffered_load=True, async_load_bytes=16,
-                        direct_store=True)
+            return {
+                "block_m": 256,
+                "block_n": 256,
+                "block_k": 64,
+                "stages": 1,
+                "split_k": 1,
+                "m_waves": 4,
+                "n_waves": 4,
+                "group_m": 4,
+                "buffered_load": True,
+                "async_load_bytes": 16,
+                "direct_store": True,
+            }
         pp = stream_tile_config()
         if pp is not None:
             return pp
-        return dict(block_m=256, block_n=128, block_k=64, stages=1,
-                    split_k=1, m_waves=4, n_waves=2, group_m=4,
-                    buffered_load=True, async_load_bytes=16)
+        return {
+            "block_m": 256,
+            "block_n": 128,
+            "block_k": 64,
+            "stages": 1,
+            "split_k": 1,
+            "m_waves": 4,
+            "n_waves": 2,
+            "group_m": 4,
+            "buffered_load": True,
+            "async_load_bytes": 16,
+        }
     if k % 128 == 0 and m % 128 == 0 and n % 128 == 0:
         # Same barrier-halving/write-overlap win as large-M down, now that the
         # grid is naturally full.  It improves square 2048/4096 by 6/4% and
@@ -1894,27 +2136,60 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
         pp = stream_tile_config()
         if pp is not None:
             return pp
-        return dict(block_m=128, block_n=128, block_k=128, stages=1,
-                    split_k=1, m_waves=4, n_waves=4, group_m=4,
-                    buffered_load=True, async_load_bytes=16)
-    return dict(block_m=128, block_n=128, block_k=bk, stages=2, split_k=1,
-                m_waves=4, n_waves=4)
+        return {
+            "block_m": 128,
+            "block_n": 128,
+            "block_k": 128,
+            "stages": 1,
+            "split_k": 1,
+            "m_waves": 4,
+            "n_waves": 4,
+            "group_m": 4,
+            "buffered_load": True,
+            "async_load_bytes": 16,
+        }
+    return {
+        "block_m": 128,
+        "block_n": 128,
+        "block_k": bk,
+        "stages": 2,
+        "split_k": 1,
+        "m_waves": 4,
+        "n_waves": 4,
+    }
 
 
 _STRUCTURAL_KEYS = frozenset(
     ("block_m", "block_n", "block_k", "stages", "m_waves", "n_waves", "buffered_load")
 )
 _AUTO_ONLY_PIPELINE_KEYS = (
-    "pingpong", "k_waves", "split_k_reduce", "direct_store", "prefetch_depth",
+    "pingpong",
+    "k_waves",
+    "split_k_reduce",
+    "direct_store",
+    "prefetch_depth",
     "stream_operands",
 )
 
 # Config columns of the tuned table (aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv);
 # a row holds a complete config, so it never inherits heuristic flags.
 TUNED_CONFIG_COLUMNS = (
-    "block_m", "block_n", "block_k", "stages", "split_k", "m_waves", "n_waves",
-    "k_waves", "group_m", "async_load_bytes", "buffered_load", "direct_store",
-    "pingpong", "split_k_reduce", "prefetch_depth", "stream_operands",
+    "block_m",
+    "block_n",
+    "block_k",
+    "stages",
+    "split_k",
+    "m_waves",
+    "n_waves",
+    "k_waves",
+    "group_m",
+    "async_load_bytes",
+    "buffered_load",
+    "direct_store",
+    "pingpong",
+    "split_k_reduce",
+    "prefetch_depth",
+    "stream_operands",
 )
 TUNED_BOOL_COLUMNS = frozenset(
     ("buffered_load", "direct_store", "pingpong", "split_k_reduce", "stream_operands")
@@ -1932,24 +2207,32 @@ def parse_tuned_config(row: dict) -> dict:
     for name in TUNED_CONFIG_COLUMNS:
         value = (row.get(name) or "").strip()
         if value:
-            cfg[name] = value.lower() == "true" if name in TUNED_BOOL_COLUMNS else int(value)
+            cfg[name] = (
+                value.lower() == "true" if name in TUNED_BOOL_COLUMNS else int(value)
+            )
     return cfg
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _load_tuned_table(path: str) -> dict:
     table = {}
     if not os.path.exists(path):
         return table
     with open(path, newline="") as handle:
         for row in csv.DictReader(handle):
-            key = (row["gfx"], int(row["cu_num"]), int(row["M"]), int(row["N"]),
-                   int(row["K"]), row["out_dtype"])
+            key = (
+                row["gfx"],
+                int(row["cu_num"]),
+                int(row["M"]),
+                int(row["N"]),
+                int(row["K"]),
+                row["out_dtype"],
+            )
             table[key] = parse_tuned_config(row)
     return table
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def tuned_table_path() -> str:
     """Resolved table path (env override + model_configs merge), cached per process."""
     from aiter.jit.core import AITER_CONFIGS
@@ -1963,18 +2246,27 @@ def reload_tuned_table() -> None:
     _load_tuned_table.cache_clear()
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _device_key(device_index: int) -> tuple[str, int]:
     props = torch.cuda.get_device_properties(device_index)
     return props.gcnArchName.split(":")[0], props.multi_processor_count
 
 
-def gfx942_tuned_config(m: int, n: int, k: int, out_dtype: torch.dtype = torch.bfloat16,
-                        device: torch.device | None = None) -> dict | None:
+def gfx942_tuned_config(
+    m: int,
+    n: int,
+    k: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | None = None,
+) -> dict | None:
     """The tuned-table config for this exact shape and device, or None."""
     if os.getenv("AITER_FLYDSL_GEMM_GFX942_HEURISTIC", "0") == "1":
         return None
-    index = torch.cuda.current_device() if device is None or device.index is None else device.index
+    index = (
+        torch.cuda.current_device()
+        if device is None or device.index is None
+        else device.index
+    )
     gfx, cu_num = _device_key(index)
     cfg = _load_tuned_table(tuned_table_path()).get(
         (gfx, cu_num, m, n, k, tuned_out_dtype_name(out_dtype))
@@ -1982,8 +2274,13 @@ def gfx942_tuned_config(m: int, n: int, k: int, out_dtype: torch.dtype = torch.b
     return dict(cfg) if cfg is not None else None
 
 
-def gfx942_default_config(m: int, n: int, k: int, out_dtype: torch.dtype = torch.bfloat16,
-                          device: torch.device | None = None) -> dict:
+def gfx942_default_config(
+    m: int,
+    n: int,
+    k: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | None = None,
+) -> dict:
     """What ``gemm_a16w16`` runs without overrides: the tuned row, else the heuristic.
 
     ``AITER_FLYDSL_GEMM_GFX942_HEURISTIC=1`` skips the table.
@@ -2136,7 +2433,15 @@ def gemm_a16w16(
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(kernel_out, 1)
     dispatch_args = (
-        out_arg, a_arg, b_arg, semaphore, signal, workspace, split_k, param, stream
+        out_arg,
+        a_arg,
+        b_arg,
+        semaphore,
+        signal,
+        workspace,
+        split_k,
+        param,
+        stream,
     )
     run_cached(
         gemm_a16w16_gfx942,

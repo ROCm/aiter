@@ -40,9 +40,9 @@ def _inputs(m, n, k):
 def _assert_close(y, ref, msg):
     y = y.float()
     rel = (y - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
-    assert torch.allclose(y, ref, rtol=RTOL, atol=ATOL) or rel < 2e-2, (
-        f"{msg}: relerr={rel:.3e} exceeds bf16 tolerance"
-    )
+    assert (
+        torch.allclose(y, ref, rtol=RTOL, atol=ATOL) or rel < 2e-2
+    ), f"{msg}: relerr={rel:.3e} exceeds bf16 tolerance"
 
 
 # ticket regimes: (M, N, K, regime)
@@ -72,7 +72,9 @@ SHAPES = [
 ]
 
 
-@pytest.mark.parametrize("m,n,k,regime", SHAPES, ids=[f"{r}-M{m}" for m, n, k, r in SHAPES])
+@pytest.mark.parametrize(
+    "m,n,k,regime", SHAPES, ids=[f"{r}-M{m}" for m, n, k, r in SHAPES]
+)
 def test_gemm_a16w16_gfx942(m, n, k, regime):
     """Direct kernel call vs f32 oracle (kernel's own default config)."""
     _require_gfx942()
@@ -82,7 +84,9 @@ def test_gemm_a16w16_gfx942(m, n, k, regime):
     _assert_close(y, ref, f"{regime} M{m} N{n} K{k}")
 
 
-@pytest.mark.parametrize("m,n,k,regime", SHAPES, ids=[f"{r}-M{m}" for m, n, k, r in SHAPES])
+@pytest.mark.parametrize(
+    "m,n,k,regime", SHAPES, ids=[f"{r}-M{m}" for m, n, k, r in SHAPES]
+)
 def test_flydsl_hgemm_gfx942_autoconfig(m, n, k, regime):
     """Public dispatch with per-shape auto-config vs f32 oracle.
 
@@ -102,9 +106,19 @@ def test_gemm_a16w16_gfx942_split_k(out_dtype):
     m, n, k = 512, 384, 10240
     x, w, ref = _inputs(m, n, k)
     y = gemm_a16w16(
-        x, w.t(), layout="nt", out_dtype=out_dtype,
-        user_kwargs=dict(block_m=32, block_n=32, block_k=64, stages=2,
-                         split_k=4, m_waves=2, n_waves=2),
+        x,
+        w.t(),
+        layout="nt",
+        out_dtype=out_dtype,
+        user_kwargs={
+            "block_m": 32,
+            "block_n": 32,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 4,
+            "m_waves": 2,
+            "n_waves": 2,
+        },
     )
     torch.cuda.synchronize()
     _assert_close(y, ref, f"split-K out={out_dtype}")
@@ -117,10 +131,21 @@ def test_gemm_a16w16_gfx942_buffered_split_k(split_k):
     m, n, k = 128, 128, 1536
     x, w, ref = _inputs(m, n, k)
     y = gemm_a16w16(
-        x, w.t(), layout="nt", out_dtype=torch.bfloat16,
-        user_kwargs=dict(block_m=64, block_n=64, block_k=128, stages=1,
-                         split_k=split_k, m_waves=2, n_waves=2,
-                         buffered_load=True, async_load_bytes=16),
+        x,
+        w.t(),
+        layout="nt",
+        out_dtype=torch.bfloat16,
+        user_kwargs={
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "stages": 1,
+            "split_k": split_k,
+            "m_waves": 2,
+            "n_waves": 2,
+            "buffered_load": True,
+            "async_load_bytes": 16,
+        },
     )
     torch.cuda.synchronize()
     _assert_close(y, ref, f"buffered split-K={split_k}")
@@ -135,11 +160,24 @@ def test_gemm_a16w16_gfx942_pingpong_edge_tiles(m, n, split_k):
     x, w, ref = _inputs(m, n, k)
     out = torch.full((m + 64, n), float("nan"), dtype=torch.bfloat16, device="cuda")
     y = gemm_a16w16(
-        x, w.t(), out=out[:m], layout="nt",
-        user_kwargs=dict(block_m=64, block_n=64, block_k=128, stages=1,
-                         split_k=split_k, m_waves=2, n_waves=2,
-                         buffered_load=True, async_load_bytes=16, pingpong=True,
-                         split_k_reduce=split_k > 1, direct_store=n % 64 == 0),
+        x,
+        w.t(),
+        out=out[:m],
+        layout="nt",
+        user_kwargs={
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 128,
+            "stages": 1,
+            "split_k": split_k,
+            "m_waves": 2,
+            "n_waves": 2,
+            "buffered_load": True,
+            "async_load_bytes": 16,
+            "pingpong": True,
+            "split_k_reduce": split_k > 1,
+            "direct_store": n % 64 == 0,
+        },
     )
     torch.cuda.synchronize()
     _assert_close(y, ref, f"pingpong edge M{m} N{n} split_k={split_k}")
@@ -149,24 +187,85 @@ def test_gemm_a16w16_gfx942_pingpong_edge_tiles(m, n, split_k):
 @pytest.mark.parametrize(
     "m,n,k,tile",
     [
-        (1000, 336, 10240, dict(block_m=64, block_n=64, block_k=128, split_k=3)),
-        (960, 344, 4096, dict(block_m=128, block_n=96, block_k=128, split_k=2)),
-        (2048, 4096, 1024, dict(block_m=256, block_n=128, block_k=64)),
-        (1024, 768, 128, dict(block_m=128, block_n=192, block_k=64)),
-        (1000, 1024, 2048, dict(block_m=64, block_n=128, block_k=128, k_waves=2)),
-        (1000, 10240, 320, dict(block_m=128, block_n=128, block_k=64)),
-        (1000, 336, 10240, dict(block_m=128, block_n=112, block_k=128, m_waves=2,
-                                n_waves=1, k_waves=2, split_k=3, direct_store=True)),
-        (250, 384, 10240, dict(block_m=32, block_n=96, block_k=128, split_k=8)),
-        (500, 336, 10240, dict(block_m=32, block_n=128, block_k=128, m_waves=1,
-                               n_waves=4, split_k=6)),
-        (1000, 336, 10240, dict(block_m=64, block_n=64, block_k=128, m_waves=2,
-                                n_waves=1, k_waves=2, split_k=3)),
+        (
+            1000,
+            336,
+            10240,
+            {"block_m": 64, "block_n": 64, "block_k": 128, "split_k": 3},
+        ),
+        (960, 344, 4096, {"block_m": 128, "block_n": 96, "block_k": 128, "split_k": 2}),
+        (2048, 4096, 1024, {"block_m": 256, "block_n": 128, "block_k": 64}),
+        (1024, 768, 128, {"block_m": 128, "block_n": 192, "block_k": 64}),
+        (
+            1000,
+            1024,
+            2048,
+            {"block_m": 64, "block_n": 128, "block_k": 128, "k_waves": 2},
+        ),
+        (1000, 10240, 320, {"block_m": 128, "block_n": 128, "block_k": 64}),
+        (
+            1000,
+            336,
+            10240,
+            {
+                "block_m": 128,
+                "block_n": 112,
+                "block_k": 128,
+                "m_waves": 2,
+                "n_waves": 1,
+                "k_waves": 2,
+                "split_k": 3,
+                "direct_store": True,
+            },
+        ),
+        (250, 384, 10240, {"block_m": 32, "block_n": 96, "block_k": 128, "split_k": 8}),
+        (
+            500,
+            336,
+            10240,
+            {
+                "block_m": 32,
+                "block_n": 128,
+                "block_k": 128,
+                "m_waves": 1,
+                "n_waves": 4,
+                "split_k": 6,
+            },
+        ),
+        (
+            1000,
+            336,
+            10240,
+            {
+                "block_m": 64,
+                "block_n": 64,
+                "block_k": 128,
+                "m_waves": 2,
+                "n_waves": 1,
+                "k_waves": 2,
+                "split_k": 3,
+            },
+        ),
         # C tile over 64 KB: staged through LDS in row chunks.
-        (1000, 10240, 320, dict(block_m=256, block_n=160, block_k=64, m_waves=4,
-                                n_waves=1)),
-        (1000, 1000, 1024, dict(block_m=256, block_n=160, block_k=64, m_waves=4,
-                                n_waves=1, split_k=2)),
+        (
+            1000,
+            10240,
+            320,
+            {"block_m": 256, "block_n": 160, "block_k": 64, "m_waves": 4, "n_waves": 1},
+        ),
+        (
+            1000,
+            1000,
+            1024,
+            {
+                "block_m": 256,
+                "block_n": 160,
+                "block_k": 64,
+                "m_waves": 4,
+                "n_waves": 1,
+                "split_k": 2,
+            },
+        ),
     ],
 )
 def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile):
@@ -175,9 +274,17 @@ def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile):
     x, w, ref = _inputs(m, n, k)
     out = torch.full((m + 64, n), float("nan"), dtype=torch.bfloat16, device="cuda")
     split_k = tile.get("split_k", 1)
-    cfg = dict(stages=1, m_waves=2, n_waves=2, buffered_load=True,
-               async_load_bytes=16, pingpong=True, stream_operands=True,
-               split_k_reduce=split_k > 1, direct_store=False)
+    cfg = {
+        "stages": 1,
+        "m_waves": 2,
+        "n_waves": 2,
+        "buffered_load": True,
+        "async_load_bytes": 16,
+        "pingpong": True,
+        "stream_operands": True,
+        "split_k_reduce": split_k > 1,
+        "direct_store": False,
+    }
     cfg.update(tile)
     if cfg.get("k_waves", 1) > 1 and "m_waves" not in tile:
         cfg["m_waves"] = 1
@@ -194,13 +301,34 @@ def test_gemm_a16w16_gfx942_tuned_table(tmp_path, monkeypatch):
 
     m, n, k = 1000, 344, 4096
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    row = dict(gfx=props.gcnArchName.split(":")[0], cu_num=props.multi_processor_count,
-               M=m, N=n, K=k, out_dtype="bf16", block_m=64, block_n=64, block_k=128,
-               stages=1, split_k=2, m_waves=2, n_waves=1, k_waves=2, group_m=4,
-               async_load_bytes=16, buffered_load=True, direct_store=False,
-               pingpong=True, split_k_reduce=True, prefetch_depth=1, stream_operands=True)
+    row = {
+        "gfx": props.gcnArchName.split(":")[0],
+        "cu_num": props.multi_processor_count,
+        "M": m,
+        "N": n,
+        "K": k,
+        "out_dtype": "bf16",
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 128,
+        "stages": 1,
+        "split_k": 2,
+        "m_waves": 2,
+        "n_waves": 1,
+        "k_waves": 2,
+        "group_m": 4,
+        "async_load_bytes": 16,
+        "buffered_load": True,
+        "direct_store": False,
+        "pingpong": True,
+        "split_k_reduce": True,
+        "prefetch_depth": 1,
+        "stream_operands": True,
+    }
     table = tmp_path / "table.csv"
-    table.write_text(",".join(row) + "\n" + ",".join(str(v) for v in row.values()) + "\n")
+    table.write_text(
+        ",".join(row) + "\n" + ",".join(str(v) for v in row.values()) + "\n"
+    )
     monkeypatch.setenv("AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942", str(table))
     g.reload_tuned_table()
     try:

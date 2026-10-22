@@ -174,8 +174,14 @@ def flydsl_hgemm(
         # When the caller leaves tiling at the signature defaults, use the
         # tuned-table row (else the heuristic); explicit overrides win.
         untuned = (
-            block_m == 128 and block_n == 128 and block_k == 64 and stages == 2
-            and split_k == 1 and m_waves == 2 and n_waves == 2 and group_m == 0
+            block_m == 128
+            and block_n == 128
+            and block_k == 64
+            and stages == 2
+            and split_k == 1
+            and m_waves == 2
+            and n_waves == 2
+            and group_m == 0
         )
         if untuned:
             user_kwargs = gfx942_default_config(
