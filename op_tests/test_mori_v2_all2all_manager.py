@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import sys
-import threading
 from types import ModuleType
 from typing import ClassVar
 
@@ -152,7 +151,7 @@ def test_cco_communicator_is_created_collectively_and_reused(manager, monkeypatc
     assert manager.get_or_create_cco_communicator(2048) is comm
     assert FakeCcoCommunicator.unique_id_calls == 1
     assert FakeCcoCommunicator.init_calls == [(4, 0, "root-uid", 4096)]
-    assert broadcasts == [(["root-uid"], 17, "ep-cpu-group")]
+    assert broadcasts == [([("root-uid", None)], 17, "ep-cpu-group")]
     assert comm.events == ["barrier"]
 
 
@@ -160,10 +159,10 @@ def test_non_root_receives_the_broadcast_unique_id(manager, monkeypatch):
     manager.rank = 2
 
     def broadcast(objects, *, src, group):
-        assert objects == [None]
+        assert objects == [(None, None)]
         assert src == 17
         assert group == "ep-cpu-group"
-        objects[0] = "broadcast-uid"
+        objects[0] = ("broadcast-uid", None)
 
     monkeypatch.setattr(
         all2all.torch.distributed,
@@ -223,15 +222,14 @@ def test_cco_communicator_rejects_non_integer_capacity(manager, invalid):
         manager.get_or_create_cco_communicator(invalid)
 
 
-def test_unique_id_failure_is_propagated_before_broadcast(manager, monkeypatch):
+def test_unique_id_failure_is_broadcast_to_the_group(manager, monkeypatch):
     def fail_unique_id():
         raise RuntimeError("uid failed")
 
-    broadcast_called = False
+    broadcasts = []
 
-    def broadcast(*args, **kwargs):
-        nonlocal broadcast_called
-        broadcast_called = True
+    def broadcast(objects, *, src, group):
+        broadcasts.append((list(objects), src, group))
 
     monkeypatch.setattr(FakeCcoCommunicator, "get_unique_id", fail_unique_id)
     monkeypatch.setattr(
@@ -246,7 +244,7 @@ def test_unique_id_failure_is_propagated_before_broadcast(manager, monkeypatch):
     ):
         manager.get_or_create_cco_communicator(4096)
 
-    assert not broadcast_called
+    assert broadcasts == [([(None, "RuntimeError: uid failed")], 17, "ep-cpu-group")]
     assert FakeCcoCommunicator.init_calls == []
     assert manager._cco_communicator is None
 
@@ -270,49 +268,6 @@ def test_failed_collective_initialization_is_not_published(manager, monkeypatch)
     FakeCcoCommunicator.fail_barrier = False
     assert manager.get_or_create_cco_communicator(4096) is not failed
     assert len(FakeCcoCommunicator.init_calls) == 2
-
-
-def test_remote_initialization_failure_destroys_local_communicator(
-    manager, monkeypatch
-):
-    monkeypatch.setattr(
-        all2all.torch.distributed,
-        "broadcast_object_list",
-        lambda objects, **kwargs: None,
-    )
-
-    status_calls = 0
-
-    def all_gather_object(values, value, *, group):
-        nonlocal status_calls
-        assert group == "ep-cpu-group"
-        if isinstance(value, int):
-            values[:] = [value] * len(values)
-        else:
-            assert value is None
-            status_calls += 1
-            values[:] = (
-                [None] * len(values)
-                if status_calls == 1
-                else [None, "rank 1: RuntimeError: init failed", None, None]
-            )
-
-    monkeypatch.setattr(
-        all2all.torch.distributed,
-        "all_gather_object",
-        all_gather_object,
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match="CCO communicator initialization failed.*rank 1.*init failed",
-    ):
-        manager.get_or_create_cco_communicator(4096)
-
-    local_comm = FakeCcoCommunicator.instances[0]
-    assert local_comm.destroyed
-    assert manager._cco_communicator is None
-    assert manager._cco_per_rank_vmm == 0
 
 
 def test_get_handle_injects_group_geometry_and_caches_op(manager, monkeypatch):
@@ -366,105 +321,6 @@ def test_get_handle_rejects_group_geometry_mismatch(manager, name, value):
         manager.get_handle(args)
 
     assert manager._cco_communicator is None
-
-
-def test_handle_creation_failure_releases_communicator(manager, monkeypatch):
-    monkeypatch.setattr(
-        all2all.torch.distributed,
-        "broadcast_object_list",
-        lambda objects, **kwargs: None,
-    )
-
-    def fail_handle(comm, **kwargs):
-        raise RuntimeError("handle failed")
-
-    monkeypatch.setattr(manager, "_make_handle", fail_handle)
-
-    with pytest.raises(
-        RuntimeError,
-        match="handle creation failed.*handle failed",
-    ):
-        manager.get_handle(
-            {
-                "per_rank_vmm": 4096,
-                "hidden_dim": 7168,
-            }
-        )
-
-    assert FakeCcoCommunicator.instances[0].destroyed
-    assert manager._cco_communicator is None
-    assert manager._cco_per_rank_vmm == 0
-    assert not manager._destroyed
-
-
-def test_destroy_waits_for_inflight_handle_creation(manager, monkeypatch):
-    events = []
-    handle_started = threading.Event()
-    release_handle = threading.Event()
-    destroy_started = threading.Event()
-    destroy_finished = threading.Event()
-
-    class OrderedOp(FakeOp):
-        def close(self):
-            events.append("handle-close")
-
-    monkeypatch.setattr(manager, "_dispatch_op_cls", OrderedOp)
-    monkeypatch.setattr(
-        all2all.torch.distributed,
-        "broadcast_object_list",
-        lambda objects, **kwargs: None,
-    )
-    original_make_handle = manager._make_handle
-
-    def make_handle(comm, **kwargs):
-        handle_started.set()
-        assert release_handle.wait(timeout=5)
-        return original_make_handle(comm, **kwargs)
-
-    monkeypatch.setattr(manager, "_make_handle", make_handle)
-    result = {}
-
-    def create_handle():
-        result["handle"] = manager.get_handle(
-            {
-                "per_rank_vmm": 4096,
-                "hidden_dim": 7168,
-            }
-        )
-
-    def destroy_manager():
-        destroy_started.set()
-        manager.destroy()
-        destroy_finished.set()
-
-    create_thread = threading.Thread(target=create_handle)
-    create_thread.start()
-    assert handle_started.wait(timeout=5)
-
-    destroy_thread = threading.Thread(target=destroy_manager)
-    destroy_thread.start()
-    assert destroy_started.wait(timeout=5)
-    assert not destroy_finished.wait(timeout=0.1)
-
-    comm = FakeCcoCommunicator.instances[0]
-    original_destroy = comm.destroy
-
-    def destroy_comm():
-        events.append("comm-destroy")
-        original_destroy()
-
-    comm.destroy = destroy_comm
-    release_handle.set()
-    create_thread.join(timeout=5)
-    destroy_thread.join(timeout=5)
-
-    assert not create_thread.is_alive()
-    assert not destroy_thread.is_alive()
-    assert result["handle"] is not None
-    assert events == ["handle-close", "comm-destroy"]
-    assert manager._destroyed
-    assert manager._cco_communicator is None
-    assert manager._cco_per_rank_vmm == 0
 
 
 def test_destroy_closes_handles_before_communicator(manager, monkeypatch):

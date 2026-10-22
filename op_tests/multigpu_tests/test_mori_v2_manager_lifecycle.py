@@ -11,7 +11,6 @@ Run directly, as the multi-GPU CI harness does::
 import importlib.util
 import os
 import socket
-import threading
 
 import torch
 import torch.distributed as dist
@@ -24,14 +23,6 @@ from aiter.dist.device_communicators.base_device_communicator import (
 
 WORLD_SIZE = 2
 PER_RANK_VMM = 1 << 29
-
-
-class FakeHandle:
-    def __init__(self):
-        self.closed = False
-
-    def close(self):
-        self.closed = True
 
 
 def _free_port() -> int:
@@ -78,92 +69,14 @@ def _run_rank(rank: int, world_size: int, port: int):
             raise AssertionError("mismatched per_rank_vmm was accepted")
         assert manager._cco_communicator is None
 
-        # Inject a one-rank handle-construction failure after a real CCO
-        # communicator has been initialized. Every rank must observe the
-        # failure and release its local handle/communicator before retrying.
-        partial_handles = []
-
-        def partial_failure(comm, **kwargs):
-            if rank == 0:
-                raise RuntimeError("injected rank-0 handle failure")
-            handle = FakeHandle()
-            partial_handles.append(handle)
-            return handle
-
-        manager._make_handle = partial_failure
-        try:
-            manager.get_handle(
-                {
-                    "per_rank_vmm": PER_RANK_VMM,
-                    "hidden_dim": 1024,
-                }
-            )
-        except RuntimeError as exc:
-            assert "handle creation failed across the EP group" in str(exc)
-            assert "injected rank-0 handle failure" in str(exc)
-        else:
-            raise AssertionError("partial handle failure was not propagated")
-
-        assert manager._cco_communicator is None
-        assert manager._cco_per_rank_vmm == 0
-        assert all(handle.closed for handle in partial_handles)
-        assert not manager._destroyed
+        # Matching capacities create one real communicator per rank, and smaller
+        # subsequent requests reuse it without another collective initialization.
+        comm = manager.get_or_create_cco_communicator(PER_RANK_VMM)
+        assert comm.is_valid
+        assert manager.get_or_create_cco_communicator(PER_RANK_VMM // 2) is comm
         dist.barrier()
 
-        # Hold handle creation inside the lifecycle lock while destroy races on
-        # another thread. Destroy must wait, then close the registered handle
-        # before invalidating the real CCO communicator.
-        handle_started = threading.Event()
-        release_handle = threading.Event()
-        destroy_finished = threading.Event()
-        created_handles = []
-        create_errors = []
-
-        def blocking_handle(comm, **kwargs):
-            handle_started.set()
-            if not release_handle.wait(timeout=120):
-                raise RuntimeError("timed out waiting to finish handle creation")
-            handle = FakeHandle()
-            created_handles.append(handle)
-            return handle
-
-        manager._make_handle = blocking_handle
-
-        def create_handle():
-            try:
-                manager.get_handle(
-                    {
-                        "per_rank_vmm": PER_RANK_VMM,
-                        "hidden_dim": 1024,
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001
-                create_errors.append(exc)
-
-        def destroy_manager():
-            manager.destroy()
-            destroy_finished.set()
-
-        create_thread = threading.Thread(target=create_handle)
-        create_thread.start()
-        assert handle_started.wait(timeout=120)
-        dist.barrier()
-
-        comm = manager._cco_communicator
-        assert comm is not None and comm.is_valid
-        destroy_thread = threading.Thread(target=destroy_manager)
-        destroy_thread.start()
-        assert not destroy_finished.wait(timeout=0.2)
-        dist.barrier()
-
-        release_handle.set()
-        create_thread.join(timeout=120)
-        destroy_thread.join(timeout=120)
-        assert not create_thread.is_alive()
-        assert not destroy_thread.is_alive()
-        assert not create_errors
-        assert len(created_handles) == 1
-        assert created_handles[0].closed
+        manager.destroy()
         assert not comm.is_valid
         assert manager._destroyed
         assert manager._cco_communicator is None
