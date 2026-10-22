@@ -119,15 +119,23 @@ def _qsa_compile_device(arch: str, cu_num: int):
     The wrappers call ``get_gfx_runtime``. This substitutes the job arch for
     that call, and on gfx942 they also read the CU count. Fake tensors
     satisfy the CUDA checks. The fake ``gcnArchName`` covers helpers that
-    still read device properties. ``COMPILE_ONLY`` never launches, so the
-    stream is only a value the launcher records.
+    still read device properties. ``run_topk_launcher`` keys a per-GPU
+    launcher on ``torch._C._cuda_getDevice``; that returns 0, the one fake
+    device. ``COMPILE_ONLY`` never launches, so the stream is only a value
+    the launcher records.
 
     A replay process is already inside ``dry_run``, which installed the
     same stand-ins for this job's arch. Replacing them would drop the
-    dry run's patches when this context exits.
+    dry run's patches when this context exits. ``dry_run`` does not replace
+    ``_cuda_getDevice``, so that lookup is still substituted here.
     """
     if os.environ.get("AITER_AOT_REPLAY") == "1":
-        yield
+        saved_get_device = torch._C._cuda_getDevice
+        torch._C._cuda_getDevice = lambda: 0
+        try:
+            yield
+        finally:
+            torch._C._cuda_getDevice = saved_get_device
         return
     from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -141,6 +149,7 @@ def _qsa_compile_device(arch: str, cu_num: int):
         cuda_stream = 0
 
     saved_runtime = qsa_mod.get_gfx_runtime
+    saved_get_device = torch._C._cuda_getDevice
     saved = (
         torch.cuda.get_device_properties,
         torch.cuda.current_stream,
@@ -148,6 +157,7 @@ def _qsa_compile_device(arch: str, cu_num: int):
     )
     try:
         qsa_mod.get_gfx_runtime = lambda: arch
+        torch._C._cuda_getDevice = lambda: 0
         torch.cuda.get_device_properties = lambda device=None: _Props()
         torch.cuda.current_stream = lambda device=None: _Stream()
         torch.cuda.is_current_stream_capturing = lambda: False
@@ -164,6 +174,7 @@ def _qsa_compile_device(arch: str, cu_num: int):
                 get_cu_num.cache_clear()
     finally:
         qsa_mod.get_gfx_runtime = saved_runtime
+        torch._C._cuda_getDevice = saved_get_device
         (
             torch.cuda.get_device_properties,
             torch.cuda.current_stream,
