@@ -1251,7 +1251,7 @@ def _rows8_emit_tile(
         out = gl.convert_layout(_rows8_fold(scores, w, mfma_layout), output_layout)
         out *= ks[h][None, None, :]
         if MASKED:
-            mask = gl.broadcast_to(cols < relative_end - h * half, [4, 2, half])
+            mask = (cols < relative_end - h * half).broadcast_to([4, 2, half])
         else:
             mask = None
         _store_logits_block(
