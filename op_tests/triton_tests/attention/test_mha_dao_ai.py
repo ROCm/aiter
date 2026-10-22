@@ -22,8 +22,7 @@ from aiter.test_mha_common import (
 
 @contextlib.contextmanager
 def _with_default_device(device):
-    """Run the capture under an explicit torch default device, restored on exit.
-    """
+    """Run the capture under an explicit torch default device, restored on exit."""
     prev_device = torch.get_default_device()
     try:
         torch.set_default_device(device)
