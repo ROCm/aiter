@@ -213,7 +213,7 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 )
 
 # Per-shape configs of the FlyDSL gfx942 bf16 GEMM; shapes without a row use
-# gfx942_auto_config.
+# gfx942_fallback_config.
 AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942 = os.getenv(
     "AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942",
     f"{AITER_ROOT_DIR}/aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv",

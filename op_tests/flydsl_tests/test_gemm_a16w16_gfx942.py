@@ -295,7 +295,7 @@ def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile):
 
 
 def test_gemm_a16w16_gfx942_tuned_table(tmp_path, monkeypatch):
-    """A tuned-table row overrides the heuristic; misses and the env switch use it."""
+    """A tuned-table row overrides the fallback; misses and the env switch use it."""
     _require_gfx942()
     import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
 
@@ -322,7 +322,6 @@ def test_gemm_a16w16_gfx942_tuned_table(tmp_path, monkeypatch):
         "direct_store": False,
         "pingpong": True,
         "split_k_reduce": True,
-        "prefetch_depth": 1,
         "stream_operands": True,
     }
     table = tmp_path / "table.csv"
@@ -336,9 +335,9 @@ def test_gemm_a16w16_gfx942_tuned_table(tmp_path, monkeypatch):
         assert g.gfx942_default_config(m, n, k) == expected
         assert g.gfx942_tuned_config(m + 8, n, k) is None
         assert g.gfx942_tuned_config(m, n, k, torch.float32) is None
-        monkeypatch.setenv("AITER_FLYDSL_GEMM_GFX942_HEURISTIC", "1")
-        assert g.gfx942_default_config(m, n, k) == g.gfx942_auto_config(m, n, k)
-        monkeypatch.delenv("AITER_FLYDSL_GEMM_GFX942_HEURISTIC")
+        monkeypatch.setenv("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE", "1")
+        assert g.gfx942_default_config(m, n, k) == g.gfx942_fallback_config(m, n, k)
+        monkeypatch.delenv("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE")
         x, w, ref = _inputs(m, n, k)
         y = gemm_a16w16(x, w.t(), layout="nt")
         torch.cuda.synchronize()
@@ -356,6 +355,34 @@ def test_gemm_a16w16_gfx942_fp32_out():
     y = gemm_a16w16(x, w.t(), layout="nt", out_dtype=torch.float32)
     torch.cuda.synchronize()
     _assert_close(y, ref, f"fp32-out M{m} N{n} K{k}")
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 384, 320),
+        (300, 1024, 320),
+        (100, 7168, 1024),
+        (6000, 2560, 320),
+        (77, 200, 64),
+    ],
+)
+def test_gemm_a16w16_gfx942_fallback(m, n, k, monkeypatch):
+    """Cost-model fallback on untuned shapes, down to the K=64 async last resort."""
+    _require_gfx942()
+    monkeypatch.setenv("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE", "1")
+    x, w, ref = _inputs(m, n, k)
+    y = gemm_a16w16(x, w.t(), layout="nt")
+    torch.cuda.synchronize()
+    _assert_close(y, ref, f"fallback M{m} N{n} K{k}")
+
+
+@pytest.mark.parametrize("layout", ["nn", "tn", "tt"])
+def test_gemm_a16w16_gfx942_rejects_transposed_layouts(layout):
+    _require_gfx942()
+    x, w, _ = _inputs(32, 64, 128)
+    with pytest.raises(ValueError, match="'nt' layout only"):
+        gemm_a16w16(x, w.t(), layout=layout)
 
 
 if __name__ == "__main__":

@@ -5,26 +5,26 @@ Two files:
 * The tuned table (default: the file ``gemm_a16w16`` reads,
   ``aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv``) holds one complete
   config per (gfx, cu_num, M, N, K, out_dtype). Shapes without a row fall back
-  to the ``gfx942_auto_config`` heuristic.
+  to ``gfx942_fallback_config``, the cheapest candidate under the cost model.
 * The measurement log (``--csv``, default ``gfx942_gemm_tuning.csv``) records
   every attempted config, including compile and correctness failures.
   ``--resume`` reuses its screen timings instead of re-measuring.
 
 Tuning a shape:
 
-1. Screen: time the current config, the heuristic and up to ``--limit``
-   candidates once each. Candidates are streamed-operand pingpong configs,
-   ranked by the fitted pingpong cost model so a small budget covers the
-   likeliest winners first.
+1. Screen: time the current config and up to ``--limit`` candidates once
+   each. Candidates are the fallback's streamed-operand pingpong search space
+   (``stream_candidates``), ranked by the same cost model so a small budget
+   covers the likeliest winners first.
 2. Refine: re-screen the best few with other ``group_m`` / ``direct_store``.
 3. Promote: time the fastest ``--finalists`` plus the incumbent (the table row,
-   else the heuristic) over ``--rounds`` interleaved rounds and write the
+   else the fallback) over ``--rounds`` interleaved rounds and write the
    winner only if its median beats the incumbent's by ``--margin``. Single
    runs vary by ~4%, so a screen result alone never replaces a row.
 
 Examples:
 
-  # Seed the table with the heuristic configs for a shape list.
+  # Seed the table with the fallback configs for a shape list.
   HIP_VISIBLE_DEVICES=6 PYTHONPATH=$PWD flydsl_venv/bin/python \\
     op_tests/flydsl_tests/tune_gfx942_csv.py --seed \\
     --shapes op_tests/flydsl_tests/gfx942_gemm_tuning_shapes.csv
@@ -34,7 +34,7 @@ Examples:
     op_tests/flydsl_tests/tune_gfx942_csv.py --M 1024 --N 336 --K 10240 \\
     --limit 80 --resume
 
-  # Benchmark what gemm_a16w16 runs by default (table row, else heuristic).
+  # Benchmark what gemm_a16w16 runs by default (table row, else fallback).
   HIP_VISIBLE_DEVICES=6 PYTHONPATH=$PWD flydsl_venv/bin/python \\
     op_tests/flydsl_tests/tune_gfx942_csv.py --current-only \\
     --shapes op_tests/flydsl_tests/gfx942_gemm_tuning_shapes.csv --csv run.csv
@@ -55,15 +55,15 @@ from typing import Any
 import torch
 
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
-    GFX942_NUM_CUS,
     TUNED_BOOL_COLUMNS,
     TUNED_CONFIG_COLUMNS,
     gemm_a16w16,
-    gfx942_auto_config,
+    gfx942_fallback_config,
     make_gemm_a16w16_gfx942_param,
     parse_tuned_config,
-    pingpong_fill_cost_us,
     reload_tuned_table,
+    shape_error,
+    stream_candidates,
     tuned_table_path,
 )
 
@@ -124,22 +124,8 @@ CONFIG_DEFAULTS = {
     "direct_store": False,
     "pingpong": False,
     "split_k_reduce": False,
-    "prefetch_depth": 1,
     "stream_operands": False,
 }
-STREAM_PIPELINE = {
-    "stages": 1,
-    "buffered_load": True,
-    "async_load_bytes": 16,
-    "pingpong": True,
-    "prefetch_depth": 1,
-    "stream_operands": True,
-}
-
-SCREEN_TILES_M = (32, 64, 128, 256)
-SCREEN_TILES_N = (32, 48, 64, 96, 112, 128, 160, 192, 256)
-# Earlier layouts win model ties, so a limited screen tries them first.
-SCREEN_WAVES = ((2, 2, 1), (2, 1, 2), (1, 2, 2), (1, 4, 1), (4, 1, 1), (1, 1, 4))
 
 
 def normalized_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -289,7 +275,9 @@ def write_table(path: Path, rows: dict[tuple, dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=TABLE_COLUMNS, extrasaction="ignore")
+        writer = csv.DictWriter(
+            handle, fieldnames=TABLE_COLUMNS, extrasaction="ignore", lineterminator="\n"
+        )
         writer.writeheader()
         for key in sorted(rows):
             writer.writerow({name: rows[key].get(name, "") for name in TABLE_COLUMNS})
@@ -327,21 +315,9 @@ def device_metadata() -> tuple[str, str, int]:
 
 def valid_config(config: dict[str, Any], m: int, n: int, k: int) -> tuple[bool, str]:
     cfg = normalized_config(config)
-    if k % cfg["block_k"]:
-        return False, "K not divisible by block_k"
-    k_tiles = k // cfg["block_k"]
-    split_tiles = -(-k_tiles // cfg["split_k"])
-    last_split_tiles = k_tiles - (cfg["split_k"] - 1) * split_tiles
-    if last_split_tiles < 1:
-        return False, "split_k leaves an empty K partition"
-    if cfg["direct_store"] and n % cfg["block_n"]:
-        return False, "direct_store requires N to be a block_n multiple"
-    if cfg["stream_operands"]:
-        min_tiles = 2
-    else:
-        min_tiles = 4 if cfg["prefetch_depth"] == 2 else 3
-    if cfg["pingpong"] and last_split_tiles < min_tiles:
-        return False, f"pingpong needs at least {min_tiles} K tiles per split"
+    error = shape_error(m, n, k, cfg)
+    if error is not None:
+        return False, error
     try:
         make_gemm_a16w16_gfx942_param(**cfg)
     except (ValueError, AssertionError, NotImplementedError) as error:
@@ -349,67 +325,19 @@ def valid_config(config: dict[str, Any], m: int, n: int, k: int) -> tuple[bool, 
     return True, ""
 
 
-def model_cost(m: int, n: int, k: int, cfg: dict[str, Any]) -> float:
-    """Busiest-CU estimate: rounds of workgroups x the fitted per-round cost."""
-    tiles = -(-m // cfg["block_m"]) * -(-n // cfg["block_n"])
-    rounds = -(-(tiles * cfg["split_k"]) // GFX942_NUM_CUS)
-    return rounds * pingpong_fill_cost_us(
-        cfg["block_m"], cfg["block_n"], cfg["k_waves"], cfg["split_k"], max(k // 128, 1)
-    )
-
-
 def grid_configs(m: int, n: int, k: int) -> list[dict[str, Any]]:
-    """Valid streamed-operand pingpong configs, cheapest modelled first.
+    """Valid ``stream_candidates`` of a shape, cheapest modelled first.
 
     The model cannot tell block_k or wave layouts apart, so the list takes the
     best variant of every (tile, split_k) family before any second variant.
     """
-    block_ks = (128, 64, 256) if k >= 2048 else (64, 128, 256)
-    out = []
-    for order, (bm, bn, waves, bk, sk) in enumerate(
-        (bm, bn, w, bk, sk)
-        for bm in SCREEN_TILES_M
-        for bn in SCREEN_TILES_N
-        for w in SCREEN_WAVES
-        for bk in block_ks
-        for sk in range(1, 9)
-    ):
-        mw, nw, kw = waves
-        if bm % (mw * 16) or bn % (nw * 16) or k % bk or bk % (kw * 64):
-            continue
-        if bm > 2 * m or bn > 2 * n:
-            continue
-        tiles = -(-m // bm) * -(-n // bn)
-        # Split-K only to fill one round; never past it.
-        if sk > 1 and tiles * sk > GFX942_NUM_CUS:
-            continue
-        k_tiles = k // bk
-        per_split = -(-k_tiles // sk)
-        if k_tiles - (sk - 1) * per_split < 2:
-            continue
-        cfg = normalized_config(
-            dict(
-                block_m=bm,
-                block_n=bn,
-                block_k=bk,
-                split_k=sk,
-                m_waves=mw,
-                n_waves=nw,
-                k_waves=kw,
-                group_m=8 if tiles > GFX942_NUM_CUS else 4,
-                split_k_reduce=sk > 1,
-                direct_store=False,
-                **STREAM_PIPELINE,
-            )
-        )
-        if valid_config(cfg, m, n, k)[0]:
-            out.append((model_cost(m, n, k, cfg), order, cfg))
-    out.sort(key=lambda item: item[:2])
     families: dict[tuple, list[dict[str, Any]]] = {}
-    for _, _, cfg in out:
-        families.setdefault(
-            (cfg["block_m"], cfg["block_n"], cfg["split_k"]), []
-        ).append(cfg)
+    for _, cfg in stream_candidates(m, n, k):
+        cfg = normalized_config(cfg)
+        if valid_config(cfg, m, n, k)[0]:
+            families.setdefault(
+                (cfg["block_m"], cfg["block_n"], cfg["split_k"]), []
+            ).append(cfg)
     ranked = []
     for depth in range(max((len(f) for f in families.values()), default=0)):
         ranked += [f[depth] for f in families.values() if depth < len(f)]
@@ -542,12 +470,12 @@ def screen(
 # ---------------------------------------------------------------- modes
 
 
-def current_config(table: dict, key: tuple, m: int, n: int, k: int):
-    """(config, source) gemm_a16w16 would run: the table row, else the heuristic."""
+def current_config(table: dict, key: tuple, m: int, n: int, k: int, out_dtype):
+    """(config, source) gemm_a16w16 would run: the table row, else the fallback."""
     row = table.get(key)
     if row is not None:
         return parse_config_row(row), "table"
-    return normalized_config(gfx942_auto_config(m, n, k)), "heuristic"
+    return normalized_config(gfx942_fallback_config(m, n, k, out_dtype)), "fallback"
 
 
 def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
@@ -555,8 +483,8 @@ def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
     _, gfx, cu_num = device_metadata()
     key = table_key(gfx, cu_num, m, n, k, args.out_dtype)
     bench = ShapeBench(m, n, k, out_dtype, args)
-    incumbent, inc_source = current_config(table, key, m, n, k)
-    heuristic = normalized_config(gfx942_auto_config(m, n, k))
+    incumbent, inc_source = current_config(table, key, m, n, k, out_dtype)
+    fallback = normalized_config(gfx942_fallback_config(m, n, k, out_dtype))
     print(
         f"== {regime} {m}x{n}x{k} {args.out_dtype}: hipBLASLt {bench.hipb_us:.2f}us, "
         f"incumbent ({inc_source}) {describe(incumbent)}",
@@ -573,7 +501,7 @@ def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
             screened[ck] = (screen(args, regime, bench, source, cfg, logged), cfg)
 
     run("incumbent", incumbent)
-    run("heuristic", heuristic)
+    run("fallback", fallback)
     grid = grid_configs(m, n, k)
     budget = args.limit or len(grid)
     for cfg in grid[:budget]:
@@ -594,8 +522,8 @@ def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
             break
         if cfg not in finalists:
             finalists.append(cfg)
-    if heuristic not in finalists:
-        finalists.append(heuristic)
+    if fallback not in finalists:
+        finalists.append(fallback)
     medians, hipb_med = bench.interleaved(finalists, args.rounds)
     for cfg, med in sorted(zip(finalists, medians), key=lambda item: item[1]):
         tag = " (incumbent)" if cfg == incumbent else ""
@@ -614,7 +542,7 @@ def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
         )
     else:
         winner, win_med = incumbent, inc_med
-        source = table[key]["source"] if key in table else "heuristic"
+        source = table[key]["source"] if key in table else "fallback"
         print(f"    keep incumbent ({inc_med:.2f}us)", flush=True)
     if not args.dry_run:
         table[key] = table_row(key, winner, win_med, hipb_med, source)
@@ -628,11 +556,11 @@ def seed_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
     if key in table and not args.overwrite:
         print(f"  {regime} {m}x{n}x{k}: already in table, skipped", flush=True)
         return
-    cfg = normalized_config(gfx942_auto_config(m, n, k))
+    cfg = normalized_config(gfx942_fallback_config(m, n, k, out_dtype))
     bench = ShapeBench(m, n, k, out_dtype, args)
     status, _err, error = bench.check(cfg)
     if status != "ok":
-        print(f"  {regime} {m}x{n}x{k}: heuristic config {status}: {error}", flush=True)
+        print(f"  {regime} {m}x{n}x{k}: fallback config {status}: {error}", flush=True)
         return
     (fly_us,), hipb_us = bench.interleaved([cfg], args.rounds)
     print(
@@ -641,7 +569,7 @@ def seed_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
         flush=True,
     )
     if not args.dry_run:
-        table[key] = table_row(key, cfg, fly_us, hipb_us, "heuristic")
+        table[key] = table_row(key, cfg, fly_us, hipb_us, "fallback")
         write_table(args.table, table)
 
 
@@ -650,7 +578,7 @@ def benchmark_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> N
     out_dtype = torch.float32 if args.out_dtype == "fp32" else torch.bfloat16
     _, gfx, cu_num = device_metadata()
     cfg, source = current_config(
-        table, table_key(gfx, cu_num, m, n, k, args.out_dtype), m, n, k
+        table, table_key(gfx, cu_num, m, n, k, args.out_dtype), m, n, k, out_dtype
     )
     bench = ShapeBench(m, n, k, out_dtype, args)
     status, err, error = bench.check(cfg)
@@ -691,12 +619,12 @@ def main() -> None:
     mode.add_argument(
         "--seed",
         action="store_true",
-        help="write the heuristic config of each shape into the table",
+        help="write the fallback config of each shape into the table",
     )
     mode.add_argument(
         "--current-only",
         action="store_true",
-        help="benchmark the default config (table row, else heuristic)",
+        help="benchmark the default config (table row, else fallback)",
     )
     mode.add_argument(
         "--report-only", action="store_true", help="print the tuned table"

@@ -172,7 +172,7 @@ def flydsl_hgemm(
         if not b.is_contiguous():
             b = b.contiguous()
         # When the caller leaves tiling at the signature defaults, use the
-        # tuned-table row (else the heuristic); explicit overrides win.
+        # tuned-table row (else the cost-model fallback); explicit overrides win.
         untuned = (
             block_m == 128
             and block_n == 128
