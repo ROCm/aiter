@@ -528,6 +528,58 @@ def test_paged_addressing(shape, boundary_gib, layout):
     return ret
 
 
+def cache_with_token_stride(dense, token_stride):
+    """Same logical cache, with `token_stride` between tokens.
+
+    A 2 GiB poison prefix sits in front of the view. An i32 product that
+    sign-extends negative lands there (FNUZ NaN) instead of faulting.
+    """
+    blocks, page, heads, dim = dense.shape
+    guard = 1 << 31
+    stride = (token_stride, token_stride, dim, 1)
+    span = (blocks - 1) * stride[0] + (page - 1) * stride[1] + heads * dim
+    storage = torch.empty(guard + span, device=dense.device, dtype=dense.dtype)
+    storage.view(torch.uint8).fill_(0x80)
+    view = torch.as_strided(storage, dense.shape, stride, storage_offset=guard)
+    for token in range(page):
+        view[:, token].copy_(dense[:, token])
+    return view
+
+
+@benchmark()
+def test_token_stride_overflow(shape):
+    """Decode key 16 with token stride 2**27. The product is 2**31."""
+    token_stride = 1 << 27
+    assert 16 * token_stride == 1 << 31
+    query_lens, kv_lens = [1], [32]
+    case = make_case(query_lens, kv_lens, shape, page=32)
+    want = reference(case, query_lens, kv_lens)
+    dense_k, dense_v = case["k"], case["v"]
+    case["k"] = cache_with_token_stride(dense_k, token_stride)
+    case["v"] = cache_with_token_stride(dense_v, token_stride)
+    assert torch.equal(case["k"], dense_k) and torch.equal(case["v"], dense_v)
+    from aiter.ops.flydsl import unified_attention_kernels as adapter
+
+    assert adapter._strides_ok(
+        case["q"],
+        case["k"],
+        case["v"],
+        case["out"],
+        case["cu_seqlens_q"],
+        case["seqused_k"],
+        case["block_table"],
+    ), "stride 2**27 passes the alignment gate"
+    ret = measure(
+        {"token_stride": flydsl_candidate(case, kv_lens)},
+        case,
+        want,
+        query_lens,
+        kv_lens,
+    )
+    ret["token stride"] = token_stride
+    return ret
+
+
 @benchmark()
 def test_routing_backend_gate(config):
     import aiter.ops.flydsl.unified_attention_kernels as adapter
@@ -745,6 +797,11 @@ def main():
             "paged addressing",
             test_paged_addressing,
             itertools.product(args.shape, args.boundary_gib, args.layout),
+        ),
+        (
+            "token stride overflow",
+            test_token_stride_overflow,
+            itertools.product(args.shape),
         ),
         (
             "routing/backend gate",

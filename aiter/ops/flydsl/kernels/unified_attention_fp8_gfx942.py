@@ -752,6 +752,8 @@ def build_unified_attention_fp8_gfx942_module(
                 # beside the prefill tiles.
                 def d_load_k(block, page):
                     # Lane (c, g) holds keys c and 16 + c.
+                    # Widen before multiplying: a token stride that fits in i32
+                    # still overflows the product (token 16 * 2**27 == 2**31).
                     base = fx.Int64(page) * k_strides[0] + fx.Int64(kvh) * k_strides[2]
                     tok = (block * NK) & (page_size - 1)
                     return [
@@ -759,11 +761,8 @@ def build_unified_attention_fp8_gfx942_module(
                             _load(
                                 kp,
                                 base
-                                + fx.Int64(
-                                    (tok + half * 16 + c) * k_strides[1]
-                                    + j * 64
-                                    + g * 16
-                                ),
+                                + fx.Int64(tok + half * 16 + c) * fx.Int64(k_strides[1])
+                                + fx.Int64(j * 64 + g * 16),
                                 fx.Vector.make_type(4, fx.Int32),
                                 16,
                                 nontemporal=decode_only,
@@ -790,11 +789,9 @@ def build_unified_attention_fp8_gfx942_module(
                                         _load(
                                             vp,
                                             base
-                                            + fx.Int64(
-                                                (key & (page_size - 1)) * v_strides[1]
-                                                + m * 256
-                                                + c * 16
-                                            ),
+                                            + fx.Int64(key & (page_size - 1))
+                                            * fx.Int64(v_strides[1])
+                                            + fx.Int64(m * 256 + c * 16),
                                             fx.Vector.make_type(4, fx.Int32),
                                             16,
                                             nontemporal=decode_only,
