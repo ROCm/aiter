@@ -389,13 +389,22 @@ def _gemm_a16w16_bandwidth_bound_kernel(
         0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
     )
 
-    offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    # buffer_store offsets are 32-bit, so offsets from c_ptr itself drop every
+    # store past 2**31 bytes of C; rebase C to this block in int64 instead.
+    c_base = (
+        c_ptr
+        + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
+        + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
+    )
+    offs_c = stride_cm * (offs_cm[:, None] - pid_m * BLOCK_M) + stride_cn * (
+        offs_cn[None, :] - pid_n * BLOCK_N
+    )
 
     mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
     # Store
     gl.amd.gfx1250.buffer_store(
-        accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
+        accumulator.to(c_ptr.type.element_ty), c_base, offs_c, mask=mask_c
     )
 
 

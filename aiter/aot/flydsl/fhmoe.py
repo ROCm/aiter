@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aiter.aot.flydsl.common import cu_num_to_arch
-
 
 def _shared_weight(device, n_in: int, k_in: int):
     import torch
@@ -129,9 +127,11 @@ class _FHMoEAOTBackend:
     def compile_stage1(self, **kwargs):
         from aiter.ops.flydsl.fhmoe import compile_flydsl_fhmoe_stage1
 
+        clamp_shared = kwargs.pop("clamp_shared", True)
         return compile_flydsl_fhmoe_stage1(
             **kwargs,
             shared_expert_id=self.shared_expert_id,
+            clamp_shared=clamp_shared,
         )
 
     def compile_stage2(self, **kwargs):
@@ -145,42 +145,66 @@ class _FHMoEAOTBackend:
 
 def precompile_fhmoe_to_cache(
     *,
+    stage: int,
     experts: int,
     shared_expert_id: int,
     a_dtype: str = "fp8",
     b_dtype: str = "fp4",
     act: str = "silu",
     cu_num: int = 0,
+    gfx: str = "gfx950",
     enable_bias: bool = False,
     **kwargs,
 ):
     """Precompile one heterogeneous MoE job through the shared AOT harness."""
+    if stage not in (1, 2):
+        raise ValueError(f"FHMoE AOT stage must be 1 or 2, got {stage}")
     if shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE AOT expects the shared expert to be the final logical expert; "
             f"got {shared_expert_id=} for {experts=}"
         )
-    if a_dtype != "fp8" or b_dtype != "fp4":
+    if a_dtype != "fp8" or b_dtype not in ("fp4", "fp8"):
         raise ValueError(
-            "FHMoE AOT supports routed FP8 activations and MXFP4 weights; "
+            "FHMoE AOT supports routed FP8 activations with MXFP4 or MXFP8 weights; "
             f"got {a_dtype=} and {b_dtype=}"
+        )
+    gate_mode = kwargs.get("gate_mode", "separated")
+    if stage == 1 and b_dtype == "fp8" and gate_mode != "interleave":
+        raise ValueError(
+            "FHMoE AOT requires interleaved gate/up layout for MXFP8 routed "
+            f"weights, got {gate_mode=}"
+        )
+    if stage == 1 and not kwargs.get("clamp_shared", True) and b_dtype != "fp8":
+        raise ValueError(
+            "clamp_shared=False requires MXFP8 routed weights; "
+            "MXFP4/FP8 FHMoE keeps the shared expert clamped"
         )
     if enable_bias:
         raise ValueError("FHMoE AOT does not support expert bias")
     if act != "silu":
         raise ValueError(f"FHMoE AOT supports only SiLU, got {act=}")
-    if cu_num_to_arch(cu_num) != "gfx950":
-        raise ValueError(f"FHMoE AOT supports only gfx950, got {cu_num=}")
+    gfx = gfx or "gfx950"
+    if cu_num <= 0:
+        cu_num = 256
+    if gfx != "gfx950" or cu_num != 256:
+        raise ValueError(
+            "FHMoE AOT requires target gfx950 with 256 CUs, "
+            f"got {gfx=} and {cu_num=}"
+        )
 
+    from aiter.aot.flydsl.common import override_env
     from aiter.aot.flydsl.moe import _precompile_to_cache
 
-    return _precompile_to_cache(
-        experts=experts,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        act=act,
-        cu_num=cu_num,
-        enable_bias=enable_bias,
-        _aot_backend=_FHMoEAOTBackend(shared_expert_id),
-        **kwargs,
-    )
+    with override_env("FLYDSL_GPU_ARCH", gfx):
+        return _precompile_to_cache(
+            stage=stage,
+            experts=experts,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            act=act,
+            cu_num=cu_num,
+            enable_bias=enable_bias,
+            _aot_backend=_FHMoEAOTBackend(shared_expert_id),
+            **kwargs,
+        )
