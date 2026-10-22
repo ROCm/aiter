@@ -690,10 +690,8 @@ def run_benchmarks(
                 print(f"FP4 is not supported on this device. Skipping {kernel}.")
                 continue
 
-            if kernel == "moe_op_gemm_a8w8" and arch_info.get_arch() != "gfx950":
-                print(
-                    f"Float8 x MX is not supported on this device. Skipping {kernel}."
-                )
+            if kernel == "moe_op_gemm_a8w8" and not arch_info.is_fp8_avail():
+                print(f"FP8 is not supported on this device. Skipping {kernel}.")
                 continue
 
             # bench_mla_decode.py only supports DeepSeek-V3, the shapes are
