@@ -191,9 +191,73 @@ class MoriV2All2AllManager(All2AllManagerBase):
         self._cco_communicator: Any | None = None
         self._cco_per_rank_vmm = 0
         self._cco_lock = threading.RLock()
+        self._destroyed = False
+
+    def _check_not_destroyed(self):
+        if self._destroyed:
+            raise RuntimeError("MORI v2 all2all manager has been destroyed")
+
+    def _gather_group_values(self, value):
+        values = [None] * self.world_size
+        torch.distributed.all_gather_object(
+            values,
+            value,
+            group=self.cpu_group,
+        )
+        return values
+
+    def _collective_failure(self, phase: str, local_error: Exception | None):
+        local_failure = (
+            None
+            if local_error is None
+            else f"rank {self.rank}: {type(local_error).__name__}: {local_error}"
+        )
+        failures = [
+            failure
+            for failure in self._gather_group_values(local_failure)
+            if failure is not None
+        ]
+        if not failures:
+            return None
+        return RuntimeError(
+            f"MORI v2 {phase} failed across the EP group: " + "; ".join(failures)
+        )
+
+    @staticmethod
+    def _close_handle(handle):
+        close = getattr(handle, "close", None)
+        if close is not None:
+            close()
+
+    def _destroy_communicator_after_failure(self, comm, context: str):
+        if comm is None:
+            return
+        try:
+            comm.destroy()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to destroy a MORI v2 CCO communicator after %s",
+                context,
+            )
 
     def _create_cco_communicator(self, per_rank_vmm: int):
-        uid = self._cco_communicator_cls.get_unique_id() if self.rank == 0 else None
+        uid = None
+        uid_error = None
+        if self.rank == 0:
+            try:
+                uid = self._cco_communicator_cls.get_unique_id()
+            except Exception as exc:  # noqa: BLE001
+                uid_error = exc
+
+        collective_error = self._collective_failure(
+            "CCO unique ID creation",
+            uid_error,
+        )
+        if collective_error is not None:
+            if uid_error is not None:
+                raise collective_error from uid_error
+            raise collective_error
+
         objects = [uid]
         root_global_rank = torch.distributed.get_global_rank(self.cpu_group, 0)
         torch.distributed.broadcast_object_list(
@@ -202,23 +266,47 @@ class MoriV2All2AllManager(All2AllManagerBase):
             group=self.cpu_group,
         )
 
-        comm = self._cco_communicator_cls.init(
-            self.world_size,
-            self.rank,
-            objects[0],
-            per_rank_vmm=per_rank_vmm,
-        )
+        comm = None
+        init_error = None
+        try:
+            comm = self._cco_communicator_cls.init(
+                self.world_size,
+                self.rank,
+                objects[0],
+                per_rank_vmm=per_rank_vmm,
+            )
+        except Exception as exc:  # noqa: BLE001
+            init_error = exc
+
+        try:
+            collective_error = self._collective_failure(
+                "CCO communicator initialization",
+                init_error,
+            )
+        except Exception:
+            self._destroy_communicator_after_failure(
+                comm,
+                "initialization status synchronization failed",
+            )
+            raise
+        if collective_error is not None:
+            self._destroy_communicator_after_failure(
+                comm,
+                "collective initialization failed",
+            )
+            if init_error is not None:
+                raise collective_error from init_error
+            raise collective_error
+
+        assert comm is not None
         try:
             comm.barrier()
         except Exception:
             # Do not publish a communicator that failed its collective setup.
-            try:
-                comm.destroy()
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "Failed to destroy a MORI v2 CCO communicator after "
-                    "collective initialization failed"
-                )
+            self._destroy_communicator_after_failure(
+                comm,
+                "collective barrier failed",
+            )
             raise
         return comm
 
@@ -238,6 +326,7 @@ class MoriV2All2AllManager(All2AllManagerBase):
             raise ValueError(f"per_rank_vmm must be > 0, got {per_rank_vmm}")
 
         with self._cco_lock:
+            self._check_not_destroyed()
             comm = self._cco_communicator
             if comm is not None:
                 if per_rank_vmm > self._cco_per_rank_vmm:
@@ -248,6 +337,13 @@ class MoriV2All2AllManager(All2AllManagerBase):
                         "maximum capacity before creating any v2 handles"
                     )
                 return comm
+
+            per_rank_capacities = self._gather_group_values(per_rank_vmm)
+            if any(capacity != per_rank_vmm for capacity in per_rank_capacities):
+                raise RuntimeError(
+                    "MORI v2 per_rank_vmm must match across the EP group; "
+                    f"got {per_rank_capacities}"
+                )
 
             # Publish only after communicator creation and its barrier succeed.
             comm = self._create_cco_communicator(per_rank_vmm)
@@ -291,40 +387,71 @@ class MoriV2All2AllManager(All2AllManagerBase):
                 )
             op_kwargs[name] = expected
 
-        comm = self.get_or_create_cco_communicator(per_rank_vmm)
+        with self._cco_lock:
+            self._check_not_destroyed()
+            comm = self.get_or_create_cco_communicator(per_rank_vmm)
 
-        def create_handle(**config_kwargs):
-            return self._make_handle(comm, **config_kwargs)
+            def create_handle(**config_kwargs):
+                return self._make_handle(comm, **config_kwargs)
 
-        handle = self.handle_cache.get_or_create(
-            op_kwargs,
-            create_handle,
-            index=index,
-        )
-        self._live_handles.add(handle)
-        return handle
+            handle = None
+            handle_error = None
+            try:
+                handle = self.handle_cache.get_or_create(
+                    op_kwargs,
+                    create_handle,
+                    index=index,
+                )
+            except Exception as exc:  # noqa: BLE001
+                handle_error = exc
+
+            try:
+                collective_error = self._collective_failure(
+                    "handle creation",
+                    handle_error,
+                )
+            except Exception:
+                self._release_resources_locked(handle)
+                raise
+            if collective_error is not None:
+                self._release_resources_locked(handle)
+                if handle_error is not None:
+                    raise collective_error from handle_error
+                raise collective_error
+
+            assert handle is not None
+            self._live_handles.add(handle)
+            return handle
+
+    def _release_resources_locked(self, unregistered_handle=None):
+        handles = list(self._live_handles)
+        if (
+            unregistered_handle is not None
+            and unregistered_handle not in self._live_handles
+        ):
+            handles.append(unregistered_handle)
+
+        for handle in handles:
+            try:
+                self._close_handle(handle)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to close a MORI v2 all2all handle")
+        self._live_handles.clear()
+        self.handle_cache = Cache()
+
+        if self._cco_communicator is not None:
+            comm = self._cco_communicator
+            try:
+                comm.destroy()
+            finally:
+                self._cco_communicator = None
+                self._cco_per_rank_vmm = 0
 
     def destroy(self):
         """Close live v2 ops before releasing their shared CCO communicator."""
         with self._cco_lock:
-            for handle in list(self._live_handles):
-                close = getattr(handle, "close", None)
-                if close is None:
-                    continue
-                try:
-                    close()
-                except Exception:  # noqa: BLE001
-                    logger.exception("Failed to close a MORI v2 all2all handle")
-            self._live_handles.clear()
-            self.handle_cache = Cache()
-
-            if self._cco_communicator is not None:
-                comm = self._cco_communicator
-                try:
-                    comm.destroy()
-                finally:
-                    self._cco_communicator = None
-                    self._cco_per_rank_vmm = 0
+            self._destroyed = True
+            self._release_resources_locked()
 
 
 class FlyDSLAll2AllManager(All2AllManagerBase):
