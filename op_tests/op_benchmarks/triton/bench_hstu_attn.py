@@ -1,3 +1,5 @@
+import functools
+import itertools
 import sys
 
 import torch
@@ -6,9 +8,13 @@ import triton
 from aiter.ops.triton.attention.hstu_attention import _AttentionFunction
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -20,6 +26,162 @@ from op_tests.triton_tests.attention.test_hstu_attn import (
     sanity_check_attention,
     switch_to_contiguous_if_needed,
 )
+
+_TARGET_SIZE = 20
+_POOL_FIELDS = ["q", "k", "v", "seq_offsets", "num_targets", "o", "do"]
+
+
+def _generate_pool_entry(
+    batch_size,
+    max_seq_len,
+    sparsity,
+    heads,
+    attn_dim,
+    hidden_dim,
+    sl_alpha,
+    dtype,
+    provider,
+    mode,
+    alpha,
+    causal,
+    sort_by_length,
+):
+    lengths = generate_sparse_seq_len(
+        size=batch_size,
+        max_seq_len=max_seq_len,
+        sparsity=sparsity,
+        device=torch.device("cuda"),
+    )
+    lengths = apply_SL(lengths, sl_alpha, max_seq_len=max_seq_len)
+    num_targets = torch.randint(
+        1,
+        _TARGET_SIZE + 1,
+        (batch_size,),
+        device=lengths.device,
+        dtype=lengths.dtype,
+    )
+    num_targets = torch.where(num_targets > lengths, lengths, num_targets)
+    seq_offsets = torch.zeros(
+        (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
+    )
+    seq_offsets[1:] = torch.cumsum(lengths, dim=0)
+    L = int(seq_offsets[-1].item())
+    x = torch.empty(
+        (L, heads, attn_dim * 2 + hidden_dim),
+        dtype=dtype,
+        device=torch.device("cuda"),
+    ).uniform_(-0.01, 0.01)
+    q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
+
+    q = switch_to_contiguous_if_needed(q)
+    k = switch_to_contiguous_if_needed(k)
+    v = switch_to_contiguous_if_needed(v)
+
+    o = do = None
+    if mode == "bwd":
+        if provider == "aiter_triton":
+            q.requires_grad_(True)
+            k.requires_grad_(True)
+            v.requires_grad_(True)
+            o = _AttentionFunction.apply(
+                max_seq_len,
+                alpha,
+                q,
+                k,
+                v,
+                seq_offsets,
+                causal,
+                num_targets,
+                0,
+                0,
+                sort_by_length,
+            )
+            do = torch.randn_like(o)
+        else:  # flydsl
+            do = torch.randn_like(v)
+
+    return q, k, v, seq_offsets, num_targets, o, do
+
+
+def _make_kernel_fn(provider, mode, max_seq_len, alpha, causal, sort_by_length):
+    if provider == "flydsl":
+        from aiter.ops.flydsl.hstu_attention import (
+            flydsl_hstu_attention_bwd,
+            flydsl_hstu_attention_fwd,
+        )
+
+        if mode == "fwd":
+
+            def kernel_fn(q, k, v, seq_offsets, num_targets, **_):
+                return flydsl_hstu_attention_fwd(
+                    max_seq_len, alpha, q, k, v, seq_offsets, causal, num_targets, 0, 0
+                )
+
+        else:
+
+            def kernel_fn(q, k, v, seq_offsets, num_targets, do, **_):
+                return flydsl_hstu_attention_bwd(
+                    max_seq_len,
+                    alpha,
+                    q,
+                    k,
+                    v,
+                    do,
+                    seq_offsets,
+                    causal,
+                    num_targets,
+                    0,
+                    0,
+                    sort_by_length=sort_by_length,
+                )
+
+    else:  # aiter_triton
+        if mode == "fwd":
+
+            def kernel_fn(q, k, v, seq_offsets, num_targets, **_):
+                return _AttentionFunction.apply(
+                    max_seq_len,
+                    alpha,
+                    q,
+                    k,
+                    v,
+                    seq_offsets,
+                    causal,
+                    num_targets,
+                    0,
+                    0,
+                    sort_by_length,
+                )
+
+        else:
+            # torch.autograd.grad, not o.backward(): .backward() accumulates
+            # into q/k/v.grad on every call, which do_bench_aiter_triton's
+            # thousands of graph replays would grow unbounded. grad() returns
+            # fresh tensors each call instead.
+            def kernel_fn(q, k, v, o, do, **_):
+                return torch.autograd.grad(o, (q, k, v), do, retain_graph=True)
+
+    return kernel_fn
+
+
+def _rotating_call(fn, rot_bufs):
+    """Manual pool rotation for candidates that can't be CUDA-graph captured.
+
+    aiter_triton/bwd's autograd graph is built from ``o = _AttentionFunction
+    .apply(...)`` computed once per pool entry, outside any graph capture
+    region. Replaying ``torch.autograd.grad`` against it under
+    ``do_bench_aiter_triton``'s capture fails: the autograd node holds a
+    stale reference to the (non-capturing) stream it was built on. It still
+    benefits from rotating through independent input sets, just not via
+    CUDA graph replay.
+    """
+    pool_len = len(rot_bufs)
+    counter = itertools.count()
+
+    def run():
+        return fn(**rot_bufs[next(counter) % pool_len])
+
+    return run
 
 
 def get_x_values():
@@ -108,6 +270,9 @@ def run_benchmark(args):
             )
         )
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report(configs)
     def bench_hstu_attn(
         batch_size,
@@ -126,7 +291,6 @@ def run_benchmark(args):
             "bf16",
         ], "only fp16 or bf16 data types are supported!"
         dropout_pr = 0.0
-        target_size: int = 20
         # apply_SL clamps long sequences to ~N^(sl_alpha/2). sl_alpha=2.0 is
         # effectively no clamp; 1.7 matches the HSTU length distribution.
         sl_alpha: float = args.sl_alpha
@@ -135,46 +299,35 @@ def run_benchmark(args):
         invalid_attn_mask_type = "lower_triangular"
         causal = True
         alpha = 1.0 / attn_dim * 10000
+        provider = args.provider
 
-        # generate inputs
         torch.manual_seed(1001)  # for reproducibility
-        lengths = generate_sparse_seq_len(
-            size=batch_size,
-            max_seq_len=max_seq_len,
-            sparsity=sparsity,
-            device=torch.device("cuda"),
+        pool_gen = functools.partial(
+            _generate_pool_entry,
+            batch_size,
+            max_seq_len,
+            sparsity,
+            heads,
+            attn_dim,
+            hidden_dim,
+            sl_alpha,
+            dtype,
+            provider,
+            mode,
+            alpha,
+            causal,
+            args.sort_by_length,
         )
-        lengths = apply_SL(lengths, sl_alpha, max_seq_len=max_seq_len)
-        num_targets = torch.randint(
-            1,
-            target_size + 1,
-            (batch_size,),
-            device=lengths.device,
-            dtype=lengths.dtype,
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_POOL_FIELDS], **kwargs_rot_bufs
         )
-        num_targets = torch.where(num_targets > lengths, lengths, num_targets)
-        seq_offsets = torch.zeros(
-            (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
-        )
-        seq_offsets[1:] = torch.cumsum(lengths, dim=0)
-        L = int(seq_offsets[-1].item())
-        x = torch.empty(
-            (L, heads, attn_dim * 2 + hidden_dim),
-            dtype=dtype,
-            device=torch.device("cuda"),
-        ).uniform_(-0.01, 0.01)
-        q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
-
-        q = switch_to_contiguous_if_needed(q)
-        k = switch_to_contiguous_if_needed(k)
-        v = switch_to_contiguous_if_needed(v)
 
         sanity_check_attention(
             max_seq_len=max_seq_len,
-            q=q,
-            k=k,
-            v=v,
-            seq_offsets=seq_offsets,
+            q=rot_bufs[0]["q"],
+            k=rot_bufs[0]["k"],
+            v=rot_bufs[0]["v"],
+            seq_offsets=rot_bufs[0]["seq_offsets"],
             invalid_attn_mask_type=invalid_attn_mask_type,
             dropout_pr=dropout_pr,
             attn_bias=None,
@@ -182,106 +335,33 @@ def run_benchmark(args):
             contextual_seq_len=0,
         )
 
-        provider = args.provider
-
-        if provider == "flydsl":
-            # FlyDSL: fwd returns O; bwd is a self-contained op returning
-            # (dq, dk, dv) (recomputes S internally, launches dV/dK/dQ). No
-            # autograd wrapper needed. Same alpha / inputs / FLOPs formula as the
-            # aiter_triton path for an apples-to-apples comparison.
-            from aiter.ops.flydsl.hstu_attention import (
-                flydsl_hstu_attention_bwd,
-                flydsl_hstu_attention_fwd,
+        kernel_fn = _make_kernel_fn(
+            provider, mode, max_seq_len, alpha, causal, args.sort_by_length
+        )
+        if provider == "aiter_triton" and mode == "bwd":
+            ms = triton.testing.do_bench(
+                _rotating_call(kernel_fn, rot_bufs), warmup=5, rep=20
             )
-
-            if mode == "fwd":
-
-                def run_fwd():
-                    return flydsl_hstu_attention_fwd(
-                        max_seq_len,
-                        alpha,
-                        q,
-                        k,
-                        v,
-                        seq_offsets,
-                        causal,
-                        num_targets,
-                        0,
-                        0,
-                    )
-
-                ms = triton.testing.do_bench(run_fwd, warmup=25, rep=100)
-            else:
-                do = torch.randn_like(v)
-
-                def run_bwd():
-                    return flydsl_hstu_attention_bwd(
-                        max_seq_len,
-                        alpha,
-                        q,
-                        k,
-                        v,
-                        do,
-                        seq_offsets,
-                        causal,
-                        num_targets,
-                        0,
-                        0,
-                        sort_by_length=args.sort_by_length,
-                    )
-
-                ms = triton.testing.do_bench(run_bwd, warmup=25, rep=100)
-        else:  # aiter_triton
-
-            def attn_fwd():
-                return _AttentionFunction.apply(
-                    max_seq_len,
-                    alpha,
-                    q,
-                    k,
-                    v,
-                    seq_offsets,
-                    causal,
-                    num_targets,
-                    0,  # max_attn_len,
-                    0,  # contextual_seq_len
-                    args.sort_by_length,  # sort_by_length
-                )
-
-            if mode == "fwd":
-                ms = triton.testing.do_bench(
-                    attn_fwd,
-                    warmup=25,
-                    rep=100,
-                )
-            else:
-                q.requires_grad_(True)
-                k.requires_grad_(True)
-                v.requires_grad_(True)
-
-                o = attn_fwd()
-                do = torch.randn_like(o)
-
-                def attn_bwd():
-                    return o.backward(do, retain_graph=True)
-
-                ms = triton.testing.do_bench(
-                    attn_bwd,
-                    warmup=25,
-                    rep=100,
-                )
+        else:
+            ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
             return ms
         elif metric == "throughput":
-            flops = get_flops(seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim)
+            flops = get_flops(
+                rot_bufs[0]["seq_offsets"].cpu().numpy(), heads, attn_dim, hidden_dim
+            )
             tflops = flops / ms * 1e-9
             return tflops
         elif metric == "bandwidth":
-            elem_size = q.element_size()
+            elem_size = rot_bufs[0]["q"].element_size()
             bytes = get_bytes(
-                seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim, elem_size
+                rot_bufs[0]["seq_offsets"].cpu().numpy(),
+                heads,
+                attn_dim,
+                hidden_dim,
+                elem_size,
             )
             bandwidth = bytes / (ms * 1e-3) * 1e-9  # GB/s
             return bandwidth

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import functools
 import glob
 import logging
 import os
@@ -32,10 +33,14 @@ from op_tests.op_benchmarks.triton.bench_fav3_sage import (
     sparse_flops_from_lut,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -73,21 +78,143 @@ def primary_output(result):
     return result
 
 
-def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
-    """Main benchmarking logic for a single configuration."""
-    if args.layout == "bshd":
-        BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
-        _, N_CTX_K, HK, D_HEAD_V = v.shape
+def _generate_pool_entry(
+    BATCH,
+    HQ,
+    HK,
+    N_CTX_Q,
+    N_CTX_K,
+    D_HEAD,
+    D_HEAD_V,
+    dtype,
+    layout,
+    device,
+    block_sparsity,
+    block_m,
+    block_n,
+    include_quant_overhead,
+    R,
+    BLOCK_R,
+    qsmooth,
+    fixed_mask_lut=None,
+):
+    """Build one full q/k/v (+ block-sparse LUT, + mxfp4 quant) set.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random tensors, so replaying through the pool during timing
+    defeats cache residency the same way a repeat-and-average loop would.
+
+    ``fixed_mask_lut``, when given, is a caller-supplied
+    ``(block_attn_mask, kv_block_indices, lut_start, lut_count)`` that every
+    pool entry reuses as-is instead of drawing its own -- q/k/v still rotate
+    per entry for cache-defeat, but the sparsity pattern itself stays the
+    control variable a repetitions sweep is varying one draw at a time.
+    """
+    q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
+    k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
+    v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+
+    if fixed_mask_lut is not None:
+        block_attn_mask, kv_block_indices, lut_start, lut_count = fixed_mask_lut
+    elif block_sparsity is None:
+        block_attn_mask = kv_block_indices = lut_start = lut_count = None
     else:
-        BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
-        _, HK, N_CTX_K, D_HEAD_V = v.shape
+        num_q_blocks = (N_CTX_Q + block_m - 1) // block_m
+        num_kv_blocks = (N_CTX_K + block_n - 1) // block_n
+        block_attn_mask = (
+            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+            > block_sparsity
+        ).to(torch.bool)
+        kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
+            block_attn_mask
+        )
 
-    BLOCK_R = args.BLOCK_R
-    R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+    if include_quant_overhead:
+        return (
+            q,
+            k,
+            v,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            block_attn_mask,
+            kv_block_indices,
+            lut_start,
+            lut_count,
+        )
 
+    config = get_sage_fwd_configs_mxfp4()
+    FP8_TYPE = aiter.dtypes.fp8
+    FP8_MAX = torch.finfo(FP8_TYPE).max
+    (
+        q_quantized,
+        q_descale,
+        k_quantized,
+        k_descale,
+        v_quantized,
+        v_descale,
+        delta_s,
+    ) = sage_quant_mxfp4(
+        q,
+        k,
+        v,
+        FP8_TYPE,
+        FP8_MAX,
+        BLKQ=config["BLOCK_M"],
+        BLKK=64,
+        layout=layout,
+        R=R,
+        BLOCK_R=BLOCK_R,
+        q_smoothing=qsmooth,
+    )
+    return (
+        q,
+        k,
+        v,
+        q_quantized,
+        q_descale,
+        k_quantized,
+        k_descale,
+        v_quantized,
+        v_descale,
+        delta_s,
+        block_attn_mask,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+    )
+
+
+_POOL_FIELDS = [
+    "q",
+    "k",
+    "v",
+    "q_quantized",
+    "q_descale",
+    "k_quantized",
+    "k_descale",
+    "v_quantized",
+    "v_descale",
+    "delta_s",
+    "block_attn_mask",
+    "kv_block_indices",
+    "lut_start",
+    "lut_count",
+]
+
+
+def _make_kernel_fn(args, config, R):
     if args.include_quant_overhead:
 
-        def fn():
+        def kernel_fn(q, k, v, kv_block_indices, lut_start, lut_count, **_):
+            block_lut = None
+            if kv_block_indices is not None:
+                block_lut = (kv_block_indices, lut_start, lut_count)
             return fav3_sage_mxfp4_wrapper(
                 q,
                 k,
@@ -101,40 +228,20 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
             )
 
     else:
-        config = get_sage_fwd_configs_mxfp4()
 
-        FP8_TYPE = aiter.dtypes.fp8
-        FP8_MAX = torch.finfo(FP8_TYPE).max
-        (
+        def kernel_fn(
             q_quantized,
-            q_descale,
             k_quantized,
-            k_descale,
             v_quantized,
+            q_descale,
+            k_descale,
             v_descale,
             delta_s,
-        ) = sage_quant_mxfp4(
-            q,
-            k,
-            v,
-            FP8_TYPE,
-            FP8_MAX,
-            BLKQ=config["BLOCK_M"],
-            BLKK=64,
-            layout=args.layout,
-            R=R,
-            BLOCK_R=BLOCK_R,
-            q_smoothing=args.qsmooth,
-        )
-
-        if block_lut is not None:
-            kv_block_indices, lut_start_t, lut_count_t = block_lut
-            use_block_sparse = True
-        else:
-            kv_block_indices = lut_start_t = lut_count_t = None
-            use_block_sparse = False
-
-        def fn():
+            kv_block_indices,
+            lut_start,
+            lut_count,
+            **_,
+        ):
             return fav3_sage_mxfp4_func(
                 q=q_quantized,
                 k=k_quantized,
@@ -147,17 +254,69 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
                 layout=args.layout,
                 config=config,
                 kv_block_indices=kv_block_indices,
-                lut_start=lut_start_t,
-                lut_count=lut_count_t,
-                use_block_sparse=use_block_sparse,
+                lut_start=lut_start,
+                lut_count=lut_count,
+                use_block_sparse=kv_block_indices is not None,
             )
 
-    rep = getattr(args, "rep", 100)
-    warmup = getattr(args, "warmup", 25)
-    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    return kernel_fn
+
+
+def bench_kernel(
+    args,
+    provider,
+    kwargs_rot_bufs,
+    kwargs_do_bench_graph,
+    BATCH,
+    HQ,
+    HK,
+    N_CTX_Q,
+    N_CTX_K,
+    D_HEAD,
+    D_HEAD_V,
+    dtype,
+    layout,
+    device="cuda",
+    fixed_mask_lut=None,
+):
+    """Main benchmarking logic for a single configuration."""
+    BLOCK_R = args.BLOCK_R
+    R = create_hadamard_matrix(BLOCK_R, device=device, dtype=dtype) / (BLOCK_R**0.5)
+    config = get_sage_fwd_configs_mxfp4()
+    block_m, block_n = config["BLOCK_M"], config["BLOCK_N"]
+
+    pool_gen = functools.partial(
+        _generate_pool_entry,
+        BATCH,
+        HQ,
+        HK,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        dtype,
+        layout,
+        device,
+        getattr(args, "block_sparsity", None),
+        block_m,
+        block_n,
+        args.include_quant_overhead,
+        R,
+        BLOCK_R,
+        args.qsmooth,
+        fixed_mask_lut=fixed_mask_lut,
+    )
+    rot_bufs = generate_rotating_buffers_pool(
+        [pool_gen], [_POOL_FIELDS], **kwargs_rot_bufs
+    )
+    kernel_fn = _make_kernel_fn(args, config, R)
 
     if getattr(args, "compare_to_ref", False):
-        current_output = fn()
+        entry0 = rot_bufs[0]
+        q, k, v = entry0["q"], entry0["k"], entry0["v"]
+        block_attn_mask = entry0["block_attn_mask"]
+
+        current_output = kernel_fn(**entry0)
         assert current_output is not None
         current_primary = primary_output(current_output)
 
@@ -174,14 +333,13 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
             q_bshd, k_bshd, v_bshd = layout_preprocess(
                 q, k, v, layout=args.layout, target_layout="bshd"
             )
-            config = get_sage_fwd_configs_mxfp4()
             ref_out = attention_ref_block_sparse(
                 q_bshd,
                 k_bshd,
                 v_bshd,
                 block_attn_mask,
-                config["BLOCK_M"],
-                config["BLOCK_N"],
+                block_m,
+                block_n,
                 dropout_p=0.0,
                 dropout_mask=None,
                 upcast=True,
@@ -218,18 +376,26 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
         compare_accuracy(current_primary, reference_primary)
         check_attention_outputs(current_primary, reference_primary, fp8=False)
 
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+
     total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
 
-    if block_lut is not None:
+    entry0 = rot_bufs[0]
+    if entry0["kv_block_indices"] is not None:
+        block_lut = (
+            entry0["kv_block_indices"],
+            entry0["lut_start"],
+            entry0["lut_count"],
+        )
         sparse_flops, _ = sparse_flops_from_lut(
             block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V
         )
     else:
         sparse_flops = 0
 
-    q_element_size = q.element_size()
-    k_element_size = k.element_size()
-    v_element_size = v.element_size()
+    q_element_size = entry0["q"].element_size()
+    k_element_size = entry0["k"].element_size()
+    v_element_size = entry0["v"].element_size()
 
     total_num_tokens_q = BATCH * N_CTX_Q
     total_num_tokens_k = BATCH * N_CTX_K
@@ -320,6 +486,8 @@ def create_benchmark_configs(args):
 
 def run_benchmark(args):
     torch.manual_seed(20)
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     @triton.testing.perf_report(create_benchmark_configs(args))
     def bench_mha(
@@ -336,33 +504,21 @@ def run_benchmark(args):
         provider,
         device="cuda",
     ):
-        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
-
-        q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
-
-        block_lut = None
-        block_attn_mask = None
-        if getattr(args, "block_sparsity", None) is not None:
-            config = get_sage_fwd_configs_mxfp4()
-            BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
-            num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
-            num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
-            block_attn_mask = (
-                torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
-                > args.block_sparsity
-            ).to(torch.bool)
-            block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
-
         return bench_kernel(
-            q,
-            k,
-            v,
             args,
             provider,
-            block_lut=block_lut,
-            block_attn_mask=block_attn_mask,
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            BATCH,
+            HQ,
+            HK,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            layout,
+            device=device,
         )
 
     bench_mha.run(save_path="." if getattr(args, "o", False) else None, print_data=True)
@@ -381,28 +537,39 @@ def run_benchmark_block_sparse_repetitions(args):
     BATCH, HQ, N_CTX_Q, N_CTX_K = args.b, args.hq, args.sq, args.sk
     D_HEAD = args.d
     D_HEAD_V = args.dv
-
-    q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
-    k = torch.randn((BATCH, hk, N_CTX_K, D_HEAD), device=device, dtype=dtype)
-    v = torch.randn((BATCH, hk, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
-    q.requires_grad = False
-    k.requires_grad = False
-    v.requires_grad = False
-    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     config = get_sage_fwd_configs_mxfp4()
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
     num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
     num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
 
+    def _draw_mask_lut():
+        mask = (
+            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+            > args.block_sparsity
+        ).to(torch.bool)
+        kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(mask)
+        return mask, kv_block_indices, lut_start, lut_count
+
     # JIT warmup: compile kernel before timed runs so reported ms is not inflated.
-    _warmup_mask = (
-        torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
-        > args.block_sparsity
-    ).to(torch.bool)
-    _warmup_lut = block_attn_mask_to_ragged_lut(_warmup_mask)
     bench_kernel(
-        q, k, v, args, "time(ms)", block_lut=_warmup_lut, block_attn_mask=_warmup_mask
+        args,
+        "time(ms)",
+        kwargs_rot_bufs,
+        kwargs_do_bench_graph,
+        BATCH,
+        HQ,
+        hk,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        dtype,
+        layout,
+        device=device,
+        fixed_mask_lut=_draw_mask_lut(),
     )
 
     n_rep = args.n_repetitions
@@ -410,19 +577,24 @@ def run_benchmark_block_sparse_repetitions(args):
     latencies_ms = []
     effective_tflops_list = []
     for _ in range(n_rep):
-        block_attn_mask = (
-            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
-            > args.block_sparsity
-        ).to(torch.bool)
-        block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
+        mask_lut = _draw_mask_lut()
+        block_lut = mask_lut[1:]
         ms = bench_kernel(
-            q,
-            k,
-            v,
             args,
             "time(ms)",
-            block_lut=block_lut,
-            block_attn_mask=block_attn_mask,
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            BATCH,
+            HQ,
+            hk,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            layout,
+            device=device,
+            fixed_mask_lut=mask_lut,
         )
         sparse_flops, total_flops = sparse_flops_from_lut(
             block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V

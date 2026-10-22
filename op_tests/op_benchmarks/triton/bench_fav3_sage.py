@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import glob
 import json
 import logging
@@ -28,8 +29,14 @@ from aiter.test_mha_common import (
     attention_ref,
     attention_ref_block_sparse,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -747,23 +754,79 @@ def attn_forward_func(
     return fn
 
 
+def _generate_pool_entry(
+    qkv_mask_gen,
+    bench_func_name,
+    softmax_scale,
+    k_smooth,
+    layout,
+    dtype,
+    hadamard_rotation,
+    r,
+    block_r,
+    return_none_if_dense=False,
+):
+    """Build one full q/k/v (+ block-sparse mask) set and its kernel runner.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random tensors (and, when block-sparse, an independent mask),
+    so replaying through the pool during timing defeats cache residency the
+    same way a repeat-and-average loop would. ``qkv_mask_gen`` is a zero-arg
+    callable, supplied by the caller, that returns one ``(q, k, v,
+    block_attn_mask)`` draw -- random generation, a captured-input clone, or
+    a loaded mask, depending on which run_benchmark_* entry point is driving
+    this call.
+    """
+    q, k, v, block_attn_mask = qkv_mask_gen()
+    block_lut = (
+        block_attn_mask_to_ragged_lut(
+            block_attn_mask, return_none_if_dense=return_none_if_dense
+        )
+        if block_attn_mask is not None
+        else None
+    )
+    runner = attn_forward_func(
+        q,
+        k,
+        v,
+        func_name=bench_func_name,
+        softmax_scale=softmax_scale,
+        k_smooth=k_smooth,
+        layout=layout,
+        dtype=dtype,
+        block_lut=block_lut,
+        hadamard_rotation=hadamard_rotation,
+        R=r,
+        BLOCK_R=block_r,
+    )
+    return q, k, v, block_attn_mask, runner
+
+
+_POOL_FIELDS = ["q", "k", "v", "block_attn_mask", "runner"]
+
+
+def _kernel_fn(runner, **_):
+    return runner()
+
+
 def bench_kernel(
-    q,
-    k,
-    v,
+    qkv_mask_gen,
     args,
     provider,
-    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-    block_attn_mask: torch.Tensor | None = None,
+    kwargs_rot_bufs,
+    kwargs_do_bench_graph,
+    BATCH,
+    HQ,
+    HK,
+    N_CTX_Q,
+    N_CTX_K,
+    D_HEAD,
+    D_HEAD_V,
+    has_block_sparsity,
+    device="cuda",
+    return_none_if_dense=False,
 ):
-    # Default softmax scale
-    if args.layout == "bshd":
-        BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
-        _, N_CTX_K, HK, D_HEAD_V = v.shape
-    else:  # bhsd
-        BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
-        _, HK, N_CTX_K, D_HEAD_V = v.shape
-
+    dtype = arg_to_torch_dtype[args.dtype]
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = args.k_smooth
 
@@ -779,15 +842,10 @@ def bench_kernel(
             raise ValueError(
                 f"head dim ({D_HEAD}) must be divisible by BLOCK_R ({block_r})"
             )
-        r = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (
-            block_r**0.5
-        )
+        r = create_hadamard_matrix(block_r, device=device, dtype=dtype) / (block_r**0.5)
 
-    # FLOPS calculation variables (same OPS definition as plan)
-    total_flops = 0.0
-    total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-    bench_func_name = ""
-    if block_lut is not None:
+    total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+    if has_block_sparsity:
         bench_func_name = "fav3_sage"
     elif args.fav3_fp8:
         bench_func_name = "fav3_fp8"
@@ -798,26 +856,32 @@ def bench_kernel(
     else:
         bench_func_name = "fav3_sage"
 
-    fn = attn_forward_func(
-        q,
-        k,
-        v,
-        func_name=bench_func_name,
-        softmax_scale=softmax_scale,
-        k_smooth=k_smooth,
-        layout=args.layout,
-        dtype=arg_to_torch_dtype[args.dtype],
-        block_lut=block_lut,
-        hadamard_rotation=hadamard_rotation,
-        R=r,
-        BLOCK_R=block_r if hadamard_rotation else None,
+    pool_gen = functools.partial(
+        _generate_pool_entry,
+        qkv_mask_gen,
+        bench_func_name,
+        softmax_scale,
+        k_smooth,
+        args.layout,
+        dtype,
+        hadamard_rotation,
+        r,
+        block_r if hadamard_rotation else None,
+        return_none_if_dense=return_none_if_dense,
     )
-    rep = getattr(args, "rep", 100)
-    warmup = getattr(args, "warmup", 25)
-    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    rot_bufs = generate_rotating_buffers_pool(
+        [pool_gen], [_POOL_FIELDS], **kwargs_rot_bufs
+    )
+    entry0 = rot_bufs[0]
+    q, k, v, block_attn_mask = (
+        entry0["q"],
+        entry0["k"],
+        entry0["v"],
+        entry0["block_attn_mask"],
+    )
 
     if args.compare_to_ref:
-        current_output = fn()
+        current_output = entry0["runner"]()
         assert current_output is not None
         current_primary = primary_output(current_output)
 
@@ -859,7 +923,7 @@ def bench_kernel(
                     softmax_scale=softmax_scale,
                     k_smooth=k_smooth,
                     layout=args.layout,
-                    dtype=arg_to_torch_dtype[args.dtype],
+                    dtype=dtype,
                     block_lut=ref_block_lut,
                 )()
             )
@@ -871,6 +935,8 @@ def bench_kernel(
 
         compare_accuracy(current_primary, reference_primary)
         check_attention_outputs(current_primary, reference_primary, fp8=False)
+
+    ms = do_bench_aiter_triton(_kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
     q_element_size = 1 if args.fav3_fp8 or args.fav3_sage else q.element_size()
     k_element_size = 1 if args.fav3_fp8 or args.fav3_sage else k.element_size()
@@ -889,9 +955,10 @@ def bench_kernel(
     mem_write = o_size
     mem = mem_read + mem_write
 
-    # Sparsity-adjusted throughput when block_lut is present
+    # Sparsity-adjusted throughput when block-sparse
     sparse_flops = None
-    if block_lut is not None:
+    if block_attn_mask is not None:
+        block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
         sparse_flops, _ = sparse_flops_from_lut(
             block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V
         )
@@ -911,6 +978,18 @@ def bench_kernel(
     return ms
 
 
+def _captured_qkv_mask_gen(q_src, k_src, v_src, args, BATCH, N_CTX_Q, N_CTX_K, device):
+    # q_src/k_src/v_src are a single captured sample; clone per pool entry so
+    # each rotation targets an independent buffer (cache-defeating) even
+    # though the content itself is the same captured data every time.
+    return (
+        q_src.clone(),
+        k_src.clone(),
+        v_src.clone(),
+        make_block_attn_mask(args, BATCH, N_CTX_Q, N_CTX_K, device),
+    )
+
+
 def run_benchmark_captured(args):
     """
     Run benchmark using captured inputs from disk.
@@ -921,6 +1000,11 @@ def run_benchmark_captured(args):
     # Load captured inputs
     inputs = load_captured_inputs(args.captured_dir)
     # logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    has_block_sparsity = bool(
+        getattr(args, "block_sparsity", None) or getattr(args, "block_mask_file", None)
+    )
 
     @triton.testing.perf_report(create_benchmark_configs_from_captured(inputs, args))
     def bench_mha_captured(
@@ -942,26 +1026,26 @@ def run_benchmark_captured(args):
         k = inp["k"].to(device)
         v = inp["v"].to(device)
 
-        if args.layout == "bshd":
-            BATCH, N_CTX_Q, _, _ = q.shape
-            _, N_CTX_K, _, _ = v.shape
-        else:
-            BATCH, _, N_CTX_Q, _ = q.shape
-            _, _, N_CTX_K, _ = v.shape
-        block_attn_mask = make_block_attn_mask(args, BATCH, N_CTX_Q, N_CTX_K, device)
-        block_lut = (
-            block_attn_mask_to_ragged_lut(block_attn_mask)
-            if block_attn_mask is not None
-            else None
+        BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
+        _, HK, N_CTX_K, D_HEAD_V = v.shape
+        qkv_mask_gen = functools.partial(
+            _captured_qkv_mask_gen, q, k, v, args, BATCH, N_CTX_Q, N_CTX_K, device
         )
         return bench_kernel(
-            q,
-            k,
-            v,
+            qkv_mask_gen,
             args,
             provider,
-            block_lut=block_lut,
-            block_attn_mask=block_attn_mask,
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            BATCH,
+            HQ,
+            HK,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            has_block_sparsity,
+            device=device,
         )
 
     args.layout = "bhsd"  # captured inputs are in BHSD format
@@ -974,8 +1058,26 @@ def run_benchmark_captured(args):
 saved_output_keys = set()
 
 
+def _random_qkv_mask_gen(
+    BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, dtype, layout, device, args
+):
+    q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
+    k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
+    v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+    # permute to the BSHD layout which is expected by the bench_kernel
+    # permute does not move data so this doesnt affect the performance
+    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+    block_attn_mask = make_block_attn_mask(args, BATCH, N_CTX_Q, N_CTX_K, device)
+    return q, k, v, block_attn_mask
+
+
 def run_benchmark(args):
     torch.manual_seed(20)
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+    has_block_sparsity = bool(
+        getattr(args, "block_sparsity", None) or getattr(args, "block_mask_file", None)
+    )
 
     @triton.testing.perf_report(create_benchmark_configs(args))
     def bench_mha(
@@ -999,35 +1101,52 @@ def run_benchmark(args):
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         assert not causal, "Causal not supported in this benchmark."
 
-        # Generate base inputs in BHSD layout which is the layout used in wan model.
-        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
-        q.requires_grad = False
-        k.requires_grad = False
-        v.requires_grad = False
-
-        # permute to the BSHD layout which is expected by the bench_kernel
-        # permute does not move data so this doesnt affect the performance
-        q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
-
-        block_attn_mask = make_block_attn_mask(args, BATCH, N_CTX_Q, N_CTX_K, device)
-        block_lut = (
-            block_attn_mask_to_ragged_lut(block_attn_mask, return_none_if_dense=True)
-            if block_attn_mask is not None
-            else None
+        qkv_mask_gen = functools.partial(
+            _random_qkv_mask_gen,
+            BATCH,
+            HQ,
+            HK,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            layout,
+            device,
+            args,
         )
         return bench_kernel(
-            q,
-            k,
-            v,
+            qkv_mask_gen,
             args,
             provider,
-            block_lut=block_lut,
-            block_attn_mask=block_attn_mask,
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            BATCH,
+            HQ,
+            HK,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            has_block_sparsity,
+            device=device,
+            return_none_if_dense=True,
         )
 
     bench_mha.run(save_path="." if args.o else None, print_data=True)
+
+
+def _fixed_mask_qkv_mask_gen(
+    BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, dtype, layout, device, mask
+):
+    # q/k/v rotate per pool entry for cache-defeat; the caller-supplied mask
+    # is the controlled variable a repetitions sweep is drawing one per rep,
+    # so every entry in a single bench_kernel call shares it.
+    q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
+    k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
+    v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+    return q, k, v, mask
 
 
 def run_benchmark_block_sparse_repetitions(args):
@@ -1045,14 +1164,8 @@ def run_benchmark_block_sparse_repetitions(args):
         N_CTX_K = args.sq
     D_HEAD = 128 if not args.d else args.d
     D_HEAD_V = D_HEAD if not args.dv else args.dv
-
-    q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
-    k = torch.randn((BATCH, hk, N_CTX_K, D_HEAD), device=device, dtype=dtype)
-    v = torch.randn((BATCH, hk, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
-    q.requires_grad = False
-    k.requires_grad = False
-    v.requires_grad = False
-    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
     config = get_sage_fwd_configs()
@@ -1060,35 +1173,55 @@ def run_benchmark_block_sparse_repetitions(args):
     num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
     num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
 
+    def _draw_mask():
+        return (
+            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+            > args.block_sparsity
+        ).to(torch.bool)
+
+    def _run_one(mask):
+        qkv_mask_gen = functools.partial(
+            _fixed_mask_qkv_mask_gen,
+            BATCH,
+            HQ,
+            hk,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            layout,
+            device,
+            mask,
+        )
+        return bench_kernel(
+            qkv_mask_gen,
+            args,
+            "time(ms)",
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            BATCH,
+            HQ,
+            hk,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            True,
+            device=device,
+        )
+
     # JIT warmup: compile kernel before timed runs so reported ms is not inflated.
-    _warmup_mask = (
-        torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
-        > args.block_sparsity
-    ).to(torch.bool)
-    _warmup_lut = block_attn_mask_to_ragged_lut(_warmup_mask)
-    bench_kernel(
-        q, k, v, args, "time(ms)", block_lut=_warmup_lut, block_attn_mask=_warmup_mask
-    )
+    _run_one(_draw_mask())
 
     n_rep = args.n_repetitions
     throughputs_tflops = []
     latencies_ms = []
     effective_tflops_list = []
     for _ in range(n_rep):
-        block_attn_mask = (
-            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
-            > args.block_sparsity
-        ).to(torch.bool)
+        block_attn_mask = _draw_mask()
         block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
-        ms = bench_kernel(
-            q,
-            k,
-            v,
-            args,
-            "time(ms)",
-            block_lut=block_lut,
-            block_attn_mask=block_attn_mask,
-        )
+        ms = _run_one(block_attn_mask)
         latencies_ms.append(ms)
         ops_per_sec = total_flops / (ms * 1e-3)
         tflops = ops_per_sec / 1e12
@@ -1203,6 +1336,8 @@ def run_benchmark_masks_list(
     device = "cuda"
     config = get_sage_fwd_configs()
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     @triton.testing.perf_report(create_benchmark_configs_masks(args, masks_list))
     def bench_mha_masks(
@@ -1230,17 +1365,35 @@ def run_benchmark_masks_list(
         N_CTX_Q = num_q_blocks * BLOCK_M
         N_CTX_K = num_kv_blocks * BLOCK_N
 
-        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
-        q.requires_grad = False
-        k.requires_grad = False
-        v.requires_grad = False
-        q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
-
-        block_lut = block_attn_mask_to_ragged_lut(mask_tensor)
+        qkv_mask_gen = functools.partial(
+            _fixed_mask_qkv_mask_gen,
+            BATCH,
+            HQ,
+            HK,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            layout,
+            device,
+            mask_tensor,
+        )
         return bench_kernel(
-            q, k, v, args, provider, block_lut=block_lut, block_attn_mask=mask_tensor
+            qkv_mask_gen,
+            args,
+            provider,
+            kwargs_rot_bufs,
+            kwargs_do_bench_graph,
+            BATCH,
+            HQ,
+            HK,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            True,
+            device=device,
         )
 
     bench_mha_masks.run(save_path="." if args.o else None, print_data=True)

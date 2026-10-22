@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -7,10 +8,14 @@ from triton.experimental import gluon
 
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
 )
 
@@ -278,6 +283,70 @@ def simple_tdm_kernel(
     )
 
 
+def _generate_pool_entry(num_blocks, block_size, num_kv_heads, head_size):
+    key_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    key_cache_shuffled = key_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    key_cache_shuffled = key_cache_shuffled.view(
+        -1,
+        num_kv_heads,
+        block_size // 16,
+        16,
+        head_size // 16,
+        2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
+        8,
+    )
+    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
+    key_cache_shuffled = key_cache_shuffled.view(
+        -1, num_kv_heads, block_size // 16, head_size * 16
+    )
+    y = torch.empty(
+        num_kv_heads, head_size, block_size, dtype=torch.bfloat16, device="cuda"
+    )
+    return key_cache_shuffled, y
+
+
+_POOL_FIELDS = ["key_cache_shuffled", "y"]
+
+
+def _make_kernel_fn(
+    num_blocks,
+    num_kv_heads,
+    block_size,
+    head_size,
+    WMMA_LAYOUT,
+    num_warps,
+    waves_per_eu,
+    use_tdm,
+):
+    def kernel_fn(key_cache_shuffled, y, **_):
+        simple_tdm_kernel[(num_kv_heads,)](
+            key_cache_ptr=key_cache_shuffled,
+            y_ptr=y,
+            num_blocks=num_blocks,
+            NUM_KV_HEADS=num_kv_heads,
+            BLOCK_SIZE=block_size,
+            HEAD_SIZE=head_size,
+            key_cache_stride_1=key_cache_shuffled.stride(1),
+            y_stride_m=y.stride(0),
+            y_stride_d=y.stride(1),
+            WMMA_LAYOUT=WMMA_LAYOUT,
+            num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
+            use_tdm=use_tdm,
+        )
+
+    return kernel_fn
+
+
 def benchmark(args):
     num_blocks = args.num_blocks
     block_size = args.block_size
@@ -333,6 +402,9 @@ def benchmark(args):
         )
     )
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report(configs)
     def bench_cache_copy(
         num_blocks: int,
@@ -343,35 +415,6 @@ def benchmark(args):
         waves_per_eu: int,
         provider,
     ):
-        warmup = 25
-        rep = 100
-
-        key_cache = torch.randn(
-            num_blocks,
-            block_size,
-            num_kv_heads,
-            head_size,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        key_cache_shuffled = key_cache.view(
-            -1, block_size, num_kv_heads, head_size
-        ).permute(0, 2, 1, 3)
-        key_cache_shuffled = key_cache_shuffled.view(
-            -1,
-            num_kv_heads,
-            block_size // 16,
-            16,
-            head_size // 16,
-            2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
-            8,
-        )
-        key_cache_shuffled = key_cache_shuffled.permute(
-            0, 1, 2, 4, 5, 3, 6
-        ).contiguous()
-        key_cache_shuffled = key_cache_shuffled.view(
-            -1, num_kv_heads, block_size // 16, head_size * 16
-        )
         if num_warps == 1:
             warp_bases = []
         elif num_warps == 2:
@@ -398,35 +441,24 @@ def benchmark(args):
                 )
             )
 
-        y = torch.empty(
-            num_kv_heads, head_size, block_size, dtype=torch.bfloat16, device="cuda"
+        pool_gen = functools.partial(
+            _generate_pool_entry, num_blocks, block_size, num_kv_heads, head_size
+        )
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_POOL_FIELDS], **kwargs_rot_bufs
+        )
+        kernel_fn = _make_kernel_fn(
+            num_blocks,
+            num_kv_heads,
+            block_size,
+            head_size,
+            WMMA_LAYOUT,
+            num_warps,
+            waves_per_eu,
+            use_tdm,
         )
 
-        def fn():
-            simple_tdm_kernel[(num_kv_heads,)](
-                key_cache_ptr=key_cache_shuffled,
-                y_ptr=y,
-                num_blocks=num_blocks,
-                NUM_KV_HEADS=num_kv_heads,
-                BLOCK_SIZE=block_size,
-                HEAD_SIZE=head_size,
-                key_cache_stride_1=key_cache_shuffled.stride(1),
-                y_stride_m=y.stride(0),
-                y_stride_d=y.stride(1),
-                WMMA_LAYOUT=WMMA_LAYOUT,
-                num_warps=num_warps,
-                waves_per_eu=waves_per_eu,
-                use_tdm=use_tdm,
-            )
-            # try:
-            #     ref = key_cache.sum(dim=0).permute(1, 2, 0)
-            #     torch.testing.assert_close(y, ref)
-            #     print(f"Passed")
-            # except Exception as e:
-            #     print(f"Failed")
-            #     raise e
-
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         mem = (
             (num_blocks + 1)
             * num_kv_heads
