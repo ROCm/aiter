@@ -1148,11 +1148,18 @@ def test_qsa_arch_allowlist(monkeypatch):
     from aiter.aot.flydsl.qsa import _qsa_compile_device
     from aiter.ops.flydsl import qsa as qsa_mod
 
+    real_get_device = torch._C._cuda_getDevice
     for arch, cu_num in (("gfx942", 304), ("gfx950", 256)):
         with _qsa_compile_device(arch, cu_num):
             got = qsa_mod._qsa_arch()
+            if torch._C._cuda_getDevice() != 0:
+                raise AssertionError(
+                    f"compile context {arch!r} still probes the current device"
+                )
         if got != arch:
             raise AssertionError(f"compile context {arch!r} resolved to {got!r}")
+    if torch._C._cuda_getDevice is not real_get_device:
+        raise AssertionError("compile context left the device lookup replaced")
     for arch in ("gfx942", "gfx950"):
         monkeypatch.setattr(qsa_mod, "get_gfx_runtime", lambda arch=arch: arch)
         got = qsa_mod._qsa_arch()
