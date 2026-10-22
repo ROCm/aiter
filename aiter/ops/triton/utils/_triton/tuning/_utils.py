@@ -3,10 +3,11 @@
 """Small helpers shared by the tuning scripts. No torch/aiter imports: the driver imports this."""
 
 import glob
+import hashlib
 import json
 import os
 
-FINAL_STATUSES = ("ok", "error", "crashed", "hung")
+FINAL_STATUSES = ("ok", "error", "crashed", "hung", "skipped", "wrong")
 TOP_BUCKET_M = 8192  # --all-buckets sweeps the family's M_LEQ buckets up to here
 
 
@@ -37,6 +38,17 @@ def plan_path(runs_dir, arch, backend, kernel, shape):
     return os.path.join(
         runs_dir, f"plan-{arch}-{backend}-{kernel}-{shape_tag(shape)}.json"
     )
+
+
+def inputs_hash(paths):
+    """Hash of the files a plan is built from; a plan whose inputs did not change is reused."""
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.encode())
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                digest.update(f.read())
+    return digest.hexdigest()
 
 
 def final_results_path(out):
@@ -96,7 +108,7 @@ def read_records(path):
     the worker died on keeps status 'start'."""
     records = {}
     for record in iter_records(path):
-        if record["status"] == "ready":
+        if record["status"] in ("ready", "reference"):
             continue
         key = "baseline" if record.get("baseline") else config_key(record["config"])
         is_final = record["status"] != "start"

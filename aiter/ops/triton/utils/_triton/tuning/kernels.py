@@ -3,7 +3,7 @@
 """One function per tunable kernel, registered with @kernel(...), which only carries metadata.
 
 Every kernel function has the same layout: imports -> inputs -> call -> optional should_skip
--> return (call, inputs, should_skip).
+-> return (call, inputs, should_skip), plus check when the kernel has a torch reference.
 
   call(config, *inputs)  one launch of the public wrapper. config is a fresh deep copy per
                          launch (the wrappers mutate it), or None, which makes the wrapper use
@@ -15,6 +15,12 @@ Every kernel function has the same layout: imports -> inputs -> call -> optional
   should_skip(config)    True for a candidate the kernel would reject: its own asserts, or a
                          buffer count its wrapper clamps so the candidate only repeats another
                          one. None when the kernel has no rule of its own.
+  check(config)          optional 4th element: runs the candidate on fresh inputs in every
+                         layout the wrapper takes and returns None when each output matches a
+                         torch reference, else what went wrong. A config file serves every
+                         layout, but the sweep times one; the final round runs check on every
+                         candidate, so a config that is wrong or does not fit in another
+                         layout never wins.
 
 K is the logical element count everywhere, as the input generators take it: fp4 tensors hold
 K // 2 bytes and the config files of fp4 families are named by the logical K.
@@ -57,7 +63,7 @@ KERNELS = {}
 @dataclass(frozen=True)
 class KernelSpec:
     name: str
-    # the kernel function: (shape, backend) -> (call, inputs, should_skip)
+    # the kernel function: (shape, backend) -> (call, inputs, should_skip[, check])
     setup: Callable
     # the config family, exactly as the kernel's _get_config passes it
     config_name: str
@@ -179,6 +185,34 @@ def add_splitk_block_size(config, K):
     return config
 
 
+def a16w16_check(call, M, N, K, layouts):
+    """check(config) for the a16w16 wrappers: every layout, fresh inputs with a real bias."""
+    import copy
+
+    import torch
+
+    from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
+        generate_gemm_a16w16_inputs,
+    )
+
+    def check(config):
+        for layout in layouts:
+            x, w, _, _, y = generate_gemm_a16w16_inputs(
+                M, N, K, torch.bfloat16, layout=layout, output=True
+            )
+            # a real bias: the generator fills its bias with torch.empty
+            bias = torch.randn(N, dtype=torch.bfloat16, device=x.device)
+            expected = torch.nn.functional.linear(x, w, bias)
+            try:  # a wrong output, or a config that does not run in this layout
+                out = call(copy.deepcopy(config), x, w, bias, y)
+                torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+            except Exception as e:  # noqa: BLE001
+                return f"{layout}: {type(e).__name__}: {' '.join(str(e).split())[:240]}"
+        return None
+
+    return check
+
+
 @kernel(
     "BATCHED_GEMM-A16W16",
     dims=("B", "M", "N", "K"),
@@ -265,7 +299,8 @@ def gemm_a16w16(shape, backend):
             return num_buffers > k_tiles - 2  # the wrapper clamps it there anyway
         return num_buffers > k_tiles  # the wrapper clamps it there anyway
 
-    return call, (x, w, bias, y), should_skip
+    check = a16w16_check(call, M, N, K, ("TN", "NT", "TT", "NN"))
+    return call, (x, w, bias, y), should_skip, check
 
 
 @kernel(
@@ -310,7 +345,9 @@ def gemm_a16w16_persistent(shape, backend):
             return True  # the wrapper raises it to 2 anyway
         return num_buffers > k_tiles + 1  # the wrapper clamps it there anyway
 
-    return call, (x, w, bias, y), should_skip
+    # gluon persistent has no column-major A path
+    layouts = ("TN", "TT") if backend == "gluon" else ("TN", "NT", "TT", "NN")
+    return call, (x, w, bias, y), should_skip, a16w16_check(call, M, N, K, layouts)
 
 
 @kernel("GEMM-A16W16-ATOMIC", backend_kwarg=False)

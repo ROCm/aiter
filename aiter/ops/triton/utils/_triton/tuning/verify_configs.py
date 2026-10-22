@@ -47,14 +47,12 @@ def main(argv=None):
     print(f"backend {backend}, arch {arch}, shape {shape}, is_tuned {is_tuned}")
     print(f"config: {json.dumps(config)}")
 
-    call, inputs, _ = spec.setup(shape, backend)
+    call, inputs, *_ = spec.setup(shape, backend)
     copies = make_cold_copies(inputs, args.cold_mb)
-    median, low, high = time_with_cuda_graph(
-        call, None, copies, args.calls, args.replays
-    )
+    timing = time_with_cuda_graph(call, None, copies, args.calls, args.replays)
     print(
-        f"time: {median:.3f} us (min {low:.3f}, max {high:.3f}), {flops(shape) / median / 1e6:.1f} TFLOPS, "
-        f"{len(copies)} cold copies"
+        f"time: {timing.median:.3f} us (min {timing.low:.3f}, max {timing.high:.3f}), "
+        f"{flops(shape) / timing.median / 1e6:.1f} TFLOPS, {len(copies)} cold copies"
     )
     if args.expect_tuned and not is_tuned:
         print("expected a tuned config but the loader returned DEFAULT.json or 'any'")

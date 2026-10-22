@@ -26,10 +26,15 @@ here. Update this file in the same change as any behaviour change.
    `Unknown config key 'X' in <DEFAULT.json>: add it to SEARCH_SPACE in space.py first`. Never pin
    or skip it silently.
 3. The whole `SEARCH_SPACE` is swept. No CLI overrides, no caps, no sampling. Pruning is: the
-   shape filters, `should_skip_generic`, `exceeds_lds` and `exceeds_registers` (fp32 accumulator per
-   thread above `MAX_ACC_PER_THREAD`: 512 on gfx1250, 256 elsewhere) in `space.py`, then the kernel's own
-   `should_skip(config)`. Every rule returns True to reject; `build_space` reads as separate
-   `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
+   shape filters, `drop_repeated_load_policies` (a `cache_modifier` value that sets the same load
+   policy as another value on the arch, from `SAME_LOAD_POLICY`), `should_skip_generic`,
+   `exceeds_lds`, `exceeds_registers` (fp32 accumulator per thread above `MAX_ACC_PER_THREAD`:
+   512 on gfx1250, 256 elsewhere) and, for Triton only, `exceeds_operand_registers` (operands +
+   accumulator above twice that) in `space.py`, then the kernel's own `should_skip(config)`.
+   Every rule returns True to reject; `build_space` reads as separate `if ...: continue` checks.
+   The worker then compiles each candidate without a launch and records it as `skipped` (with
+   the `reason`) when the compiled kernels overflow LDS or spill registers
+   (`exceeds_compiled_resources`); the baseline is always timed. When the kernel rejects every tile that fits the shape, `build_space`
    allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
    gluon (gfx950 a8w8 blockscale `num_stages` is `NUM_STAGES`, at least 2).
 4. Results always install into `resolve_config_dir(op, config_name, backend)`. No export directory,
@@ -47,11 +52,13 @@ here. Update this file in the same change as any behaviour change.
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is
    restored. Bucket collisions are resolved before writing (largest M wins).
-6. Data contracts: a kernel function returns `(call, inputs, should_skip)`; a result
+6. Data contracts: a kernel function returns `(call, inputs, should_skip)` or, with a torch
+   reference, `(call, inputs, should_skip, check)`; a result
    record's fields are listed in the `harness.py` docstring; the plan JSON carries the family's
    `bounds`; the worker prints `ready` and one line per candidate for the driver's watchdog;
-   the plan is kept per (arch, backend, kernel, shape) in the runs dir and the installer only
-   lets its candidates win; resume requires the same `--calls`/`--replays`; `config` in a record is the raw
+   the plan is kept per (arch, backend, kernel, shape) in the runs dir, reused while its
+   `inputs_hash` (space.py, kernels.py, _utils.py, DEFAULT.json, the shape file) matches, and the
+   installer only lets its candidates win; resume requires the same `--calls`/`--replays`; `config` in a record is the raw
    candidate. Keys a wrapper derives or clamps (`SPLITK_BLOCK_SIZE`, clamped `NUM_BUFFERS`,
    `GROUP_K`, CTAS-scaled tiles) are never recorded or written. Wrappers mutate their config
    dict, so every launch gets a deep copy; the only framework code that mutates a config is a
@@ -63,7 +70,21 @@ here. Update this file in the same change as any behaviour change.
    the baseline and the ten fastest candidates of the current plan on the first GPU into
    `<results>.final.jsonl`, with the same crash/hang recovery as the sweep; when that file exists
    the installer uses only it, so a later run (even on one GPU) always refreshes it, and an M timed
-   on several GPUs without it is skipped. Never two drivers on one GPU.
+   on several GPUs without it is skipped. Never two drivers on one GPU. Each timing worker times
+   the installed config on its own GPU first (`reference`) and records `rel` = time / that
+   reference; screening and the final-round shortlist compare `rel`, so GPU-to-GPU differences
+   do not decide. `--screen X` stops a candidate after one replay when its `rel` is above X
+   times the lowest `rel` of its M so far (at most 1, the installed config) (`screened`); it
+   never applies to the baseline or the final round, and screened records stay in the
+   final-round shortlist. The final round also runs each candidate's `check` `--verify` times
+   (every layout the wrapper takes) and records a mismatch as `wrong`, which never wins; while
+   all ten are wrong it goes on with the next ten (at most 100). SIGTERM (driver or worker)
+   stops between two candidates, because a kill while kernels run can fault a gfx1250 GPU;
+   `terminate()` sends SIGTERM and kills only a worker that has not stopped after 30 s.
+   `--compile-procs` workers (`harness.py --precompile --claim`) only compile, never launch, and
+   run on `--compile-gpus`, which must not be timing GPUs because their input set-up runs
+   kernels; timing workers get `--pool` and time what the pool has compiled first, so they never
+   duplicate its compiles.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper
    cannot select (`KernelSpec.supports`).
@@ -79,7 +100,8 @@ element widths as they sit in LDS, scales not counted), `cta_split` when a key s
 and register checks and `should_skip` judge one CTA's share), `gluon_archs` / `gluon_default_archs` /
 `backend_kwarg` from the wrapper, `bounds` copied from the kernel's `_get_config` (the CLI K is the
 logical K, so no K transform is needed). The function builds the inputs once with the `op_tests`
-generator, preallocates the output, and returns `(call, inputs, should_skip)`;
+generator, preallocates the output, and returns `(call, inputs, should_skip)`, plus
+`check(config)` when a torch reference exists;
 `should_skip(config)` holds what the kernel asserts (block multiples, buffer clamps). Output
 resets and derived keys live in `call`. Keep everything about a kernel inside that one function;
 the `kernels.py` docstring has a complete example. Then run the checks below.

@@ -12,6 +12,12 @@ Per M:   plan            harness.py --plan: load defaults, generate combinations
          summarize
 Then:    install         write_best_configs.py: select winners, merge buckets, validate, write
 
+Every M is planned first, in parallel, and a kept plan is reused while the files it was built
+from are unchanged. With --compile-procs N, N compile-only workers (harness.py --precompile) on
+the --compile-gpus fill the Triton cache in sweep order while the timing workers run, so the
+timing GPUs spend their time timing. The timing workers still compile anything the pool has not
+reached; the results are the same with or without the pool.
+
 --all-buckets sweeps every M bucket of the family up to TOP_BUCKET_M (8192); the installer
 sets "any" to a copy of DEFAULT.json's "any". The driver never imports torch or aiter: every
 step is a subprocess that sees HIP_VISIBLE_DEVICES=<gpu>. It resumes from the records in --runs-dir.
@@ -36,11 +42,13 @@ from _utils import (
     append_record,
     config_key,
     final_results_path,
+    inputs_hash,
     iter_records,
     plan_path,
     read_records,
     results_path,
     shape_from_args,
+    shape_tag,
 )
 from kernels import get_spec
 
@@ -91,6 +99,46 @@ def parse_args(argv=None):
         default=600,
         help="seconds allowed for planning and for a worker to become ready",
     )
+    parser.add_argument(
+        "--plan-timeout",
+        type=int,
+        default=3600,
+        help="seconds allowed for planning one M (a Triton space walks millions of combinations)",
+    )
+    parser.add_argument(
+        "--compile-procs",
+        type=int,
+        default=0,
+        help="compile-only workers that fill the Triton cache ahead of the sweep (0: off)",
+    )
+    parser.add_argument(
+        "--compile-timeout",
+        type=int,
+        default=300,
+        help="seconds one compile-ahead compile may take; a longer one becomes an error record",
+    )
+    parser.add_argument(
+        "--compile-gpus",
+        type=int,
+        nargs="+",
+        default=[],
+        help="GPUs for the compile-only workers, not in --gpu (their input set-up runs kernels)",
+    )
+    parser.add_argument(
+        "--screen",
+        type=float,
+        default=0,
+        help="stop a candidate after one replay when its time relative to the installed "
+        "config on its GPU (rel) is above this x the lowest rel of its M (0: off); the final "
+        "round always times fully",
+    )
+    parser.add_argument(
+        "--verify",
+        type=int,
+        default=3,
+        help="final round: check each candidate's output against the kernel's reference "
+        "this many times; a wrong one cannot win (0: off)",
+    )
     parser.add_argument("--replays", type=int, default=25)
     parser.add_argument("--calls", type=int, default=24)
     parser.add_argument("--cold-mb", type=int, default=1024)
@@ -104,6 +152,10 @@ def parse_args(argv=None):
         parser.error("--gpu values must be distinct: one worker per GPU")
     if bool(args.M) == args.all_buckets:
         parser.error("give --M values or --all-buckets, not both")
+    if args.compile_procs and not args.compile_gpus:
+        parser.error("--compile-procs needs --compile-gpus")
+    if set(args.compile_gpus) & set(args.gpu):
+        parser.error("--compile-gpus must not be timing GPUs (--gpu)")
     return args
 
 
@@ -116,8 +168,25 @@ def worker_command(spec, shape, backend, extra):
     return command + extra
 
 
+def kept_plan(spec, shape, backend, runs_dir):
+    """The kept plan of this shape when the files it was built from have not changed, else None.
+
+    Planning a Triton space walks millions of combinations, so a resumed sweep reuses it.
+    """
+    pattern = f"plan-*-{backend or '*'}-{spec.name}-{shape_tag(shape)}.json"
+    for path in glob.glob(os.path.join(runs_dir, pattern)):
+        with open(path) as f:
+            plan_ = json.load(f)
+        if plan_.get("inputs") and plan_["inputs_hash"] == inputs_hash(plan_["inputs"]):
+            return plan_
+    return None
+
+
 def plan(spec, shape, backend, gpu, runs_dir, timeout):
     """Ask the worker for the space; keep the plan under a name unique to arch, backend, kernel and shape."""
+    kept = kept_plan(spec, shape, backend, runs_dir)
+    if kept is not None:
+        return kept
     fd, space_file = tempfile.mkstemp(prefix="plan-", suffix=".json", dir=runs_dir)
     os.close(fd)
     command = worker_command(
@@ -136,7 +205,7 @@ def plan(spec, shape, backend, gpu, runs_dir, timeout):
     except subprocess.TimeoutExpired:
         os.remove(space_file)
         sys.exit(
-            f"planning {shape} on gpu {gpu} took more than {timeout} s (--setup-timeout)"
+            f"planning {shape} on gpu {gpu} took more than {timeout} s (--plan-timeout)"
         )
     if result.returncode:
         os.remove(space_file)
@@ -207,18 +276,24 @@ def discard(out):
 
 
 def terminate(proc):
-    """The one place a worker is killed and reaped."""
-    os.killpg(proc.pid, signal.SIGKILL)
-    proc.wait()
+    """The one place a worker is stopped and reaped: SIGTERM lets it finish the candidate in
+    hand (killing a worker while its kernels run can fault the GPU on gfx1250); a worker that
+    does not stop within 30 s (a hung kernel or compile) is killed."""
+    os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
 
-def run_worker(command, env, log_path, stall, setup_timeout):
+def run_worker(command, env, log_path, stall, setup_timeout, stop=STOP):
     """Run one worker to its end, or kill it.
 
     The worker prints "ready" once it is set up and one line per finished candidate. Until
     "ready" the limit is setup_timeout (imports, inputs, first compile), afterwards stall seconds
     per candidate. Returns "finished", "failed" (died after it was ready), "setup_failed",
-    "timed_out" or "cancelled" (STOP was set).
+    "timed_out" or "cancelled" (stop was set).
     """
 
     def size():
@@ -246,7 +321,7 @@ def run_worker(command, env, log_path, stall, setup_timeout):
                 if size() != last:
                     last, t_last = size(), time.time()
                     ready = ready or became_ready()
-                if STOP.is_set():
+                if stop.is_set():
                     terminate(proc)
                     return "cancelled"
                 if time.time() - t_last > (stall if ready else setup_timeout):
@@ -260,8 +335,10 @@ def run_worker(command, env, log_path, stall, setup_timeout):
     return "failed" if ready or became_ready() else "setup_failed"
 
 
-def run_batch(spec, shape, backend, batch, out, gpu, args):
+def run_batch(spec, shape, backend, batch, out, gpu, args, screen, verify=0):
     """One worker process on one GPU for these candidates; marks the candidate it died on."""
+    # the M's compile-ahead list (a final round has none, so its workers compile on their own)
+    pool = ["--pool", f"{out}.pre.todo.json"] if args.compile_procs else []
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
     todo_file, log_path = f"{out}.gpu{gpu}.todo.json", f"{out}.gpu{gpu}.log"
     with open(todo_file, "w") as f:
@@ -277,6 +354,11 @@ def run_batch(spec, shape, backend, batch, out, gpu, args):
             str(args.calls),
             "--cold-mb",
             str(args.cold_mb),
+            "--screen",
+            str(screen),
+            "--verify",
+            str(verify),
+            *pool,
             "--configs",
             todo_file,
             "--out",
@@ -306,7 +388,7 @@ def run_batch(spec, shape, backend, batch, out, gpu, args):
             print(f"  gpu {gpu}: {status}: {json.dumps(candidate)}", flush=True)
 
 
-def sweep_shard(spec, shape, backend, candidates, out, gpu, args):
+def sweep_shard(spec, shape, backend, candidates, out, gpu, args, screen, verify=0):
     """Run every candidate of this shard that has no final record yet, in batches, on one GPU."""
     while not STOP.is_set():
         records = read_records(out)
@@ -322,7 +404,9 @@ def sweep_shard(spec, shape, backend, candidates, out, gpu, args):
             f"running {min(len(todo), args.batch)}",
             flush=True,
         )
-        run_batch(spec, shape, backend, todo[: args.batch], out, gpu, args)
+        run_batch(
+            spec, shape, backend, todo[: args.batch], out, gpu, args, screen, verify
+        )
 
 
 def sweep(spec, shape, backend, candidates, out, gpus, args):
@@ -330,7 +414,9 @@ def sweep(spec, shape, backend, candidates, out, gpus, args):
     shards = [candidates[i :: len(gpus)] for i in range(len(gpus))]
     with ThreadPoolExecutor(len(gpus)) as pool:
         futures = [
-            pool.submit(sweep_shard, spec, shape, backend, shard, out, gpu, args)
+            pool.submit(
+                sweep_shard, spec, shape, backend, shard, out, gpu, args, args.screen
+            )
             for shard, gpu in zip(shards, gpus)
         ]
         try:
@@ -345,23 +431,152 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
     """Re-time the baseline and the fastest current candidates on one GPU into the final-round file."""
     records = read_records(out)
     current = {config_key(c) for c in candidates}  # records of an older plan stay out
-    ok = sorted(
-        (
-            r
-            for key, r in records.items()
-            if key in current and r["status"] == "ok" and not r.get("baseline")
-        ),
-        key=lambda r: r["us"],
-    )
-    fastest = [r["config"] for r in ok[:FINAL_ROUND_SIZE]]
+    ok = [  # screened records too: one slow replay must not drop a near-tie
+        r
+        for key, r in records.items()
+        if key in current and r["status"] == "ok" and not r.get("baseline")
+    ]
+    # rel compares candidates timed on different GPUs; records without it fall back to us
+    by_rel = all("rel" in r for r in ok)
+    ok.sort(key=lambda r: r["rel"] if by_rel else r["us"])
     final_out = final_results_path(out)
     if os.path.exists(final_out):
         os.remove(final_out)
-    print(
-        f"  final round on gpu {gpu}: re-timing the baseline and the {len(fastest)} fastest",
-        flush=True,
+    # the next ten while every candidate so far computed wrong results (at most 100)
+    last = max(1, min(len(ok), 10 * FINAL_ROUND_SIZE))
+    for start in range(0, last, FINAL_ROUND_SIZE):
+        batch = [r["config"] for r in ok[start : start + FINAL_ROUND_SIZE]]
+        print(
+            f"  final round on gpu {gpu}: re-timing the baseline and the fastest "
+            f"{start + 1}-{start + len(batch)}",
+            flush=True,
+        )
+        lead = [None] if start == 0 else []
+        sweep_shard(
+            spec, shape, backend, lead + batch, final_out, gpu, args, 0, args.verify
+        )
+        final = read_records(final_out).values()
+        if any(r["status"] == "ok" and not r.get("baseline") for r in final):
+            return
+
+
+def record_compile_timeout(log_path, out, todo_file, timeout):
+    """The candidate a killed compile-only worker was compiling gets an error record."""
+    with open(log_path) as f:
+        compiling = [line for line in f if line.startswith("compiling ")]
+    if not compiling:
+        return
+    candidate = json.loads(compiling[-1][len("compiling ") :])
+    if candidate is None:
+        return  # the baseline is always left to the sweep
+    error = f"compile took over {timeout} s (compile-ahead)"
+    append_record(
+        out, {"status": "error", "baseline": False, "config": candidate, "error": error}
     )
-    sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args)
+    with open(f"{todo_file}.done", "a") as f:
+        f.write(config_key(candidate) + "\n")
+    print(f"  compile-ahead: {error}: {json.dumps(candidate)}", flush=True)
+
+
+def unclaimed(todo_file, size):
+    with open(f"{todo_file}.next") as f:
+        return int(f.read() or 0) < size
+
+
+def precompile_worker(
+    spec, shape, backend, todo_file, size, out, slot, gpu, args, stop
+):
+    """One compile-only slot: a worker claims the next candidate of todo_file until none is
+    left; a worker killed on a huge compile is replaced, so the pool keeps its size."""
+    log_path = f"{out}.pre{slot}.log"
+    command = worker_command(
+        spec,
+        shape,
+        backend,
+        ["--precompile", "--configs", todo_file, "--claim", f"{todo_file}.next"],
+    )
+    env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
+    # stagger the start: a burst of new GPU contexts strains the driver
+    stop.wait(0.2 * slot)
+    while not stop.is_set():
+        outcome = run_worker(
+            command + ["--out", out],
+            env,
+            log_path,
+            args.compile_timeout,  # the worker prints a line before every compile
+            args.setup_timeout,
+            stop,
+        )
+        if outcome == "finished":  # keep the log only when something went wrong
+            os.remove(log_path)
+            return
+        if outcome == "timed_out":
+            record_compile_timeout(log_path, out, todo_file, args.compile_timeout)
+        if outcome == "setup_failed" or not unclaimed(todo_file, size):
+            return
+
+
+def pool_files(spec, args, plans):
+    """Write every M's compile-ahead list up front, so the timing workers of an M the pool has
+    not reached yet help it instead of compiling on their own. Returns {M: (out, todo, file)}.
+    """
+    pools = {}
+    for M, plan_ in plans.items():
+        shape = shape_from_args(args, spec.dims, M)
+        out = results_path(
+            args.runs_dir, plan_["arch"], plan_["backend"], spec.name, shape
+        )
+        records = read_records(out)
+        todo = [
+            c
+            for c in [None] + plan_["configs"]
+            if records.get(config_key(c), {}).get("status") not in FINAL_STATUSES
+        ]
+        # one shared list, claimed in order: a slow compile holds up only its own candidate
+        todo_file = f"{out}.pre.todo.json"
+        with open(todo_file, "w") as f:
+            json.dump(todo, f)
+        for suffix, content in ((".next", "0"), (".done", "")):
+            with open(todo_file + suffix, "w") as f:
+                f.write(content)
+        pools[M] = (out, todo, todo_file)
+    return pools
+
+
+def remove_pool_files(todo_file):
+    for path in (todo_file + ".next", todo_file + ".done", todo_file):
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def precompile_ahead(spec, args, plans, pools, stop):
+    """Compile the unfinished candidates of every M, in sweep order, on the compile GPUs."""
+    for M, plan_ in plans.items():
+        out, todo, todo_file = pools[M]
+        if stop.is_set() or STOP.is_set():
+            remove_pool_files(todo_file)
+            continue
+        shape = shape_from_args(args, spec.dims, M)
+        slots = min(args.compile_procs, len(todo))
+        gpus = args.compile_gpus
+        with ThreadPoolExecutor(max(slots, 1)) as pool:
+            for slot in range(slots):
+                pool.submit(
+                    precompile_worker,
+                    spec,
+                    shape,
+                    plan_["backend"],
+                    todo_file,
+                    len(todo),
+                    out,
+                    slot,
+                    gpus[slot % len(gpus)],
+                    args,
+                    stop,
+                )
+        # the timing workers of this M now compile on their own
+        remove_pool_files(todo_file)
+        print(f"  compile-ahead: M={M} done", flush=True)
 
 
 def summarize(out, candidates):
@@ -370,6 +585,9 @@ def summarize(out, candidates):
     for candidate in candidates:
         status = records.get(config_key(candidate), {}).get("status", "missing")
         counts[status] = counts.get(status, 0) + 1
+    screened = sum(
+        1 for c in candidates if records.get(config_key(c), {}).get("screened")
+    )
     if os.path.exists(final_results_path(out)):
         records = read_records(final_results_path(out))
         print("  final round (same-device numbers the installer uses):")
@@ -384,10 +602,11 @@ def summarize(out, candidates):
         key=lambda r: r["us"],
     )
     for record in ok[:10]:
+        gain = f"{1 / record['rel'] - 1:+7.1%} vs installed" if "rel" in record else ""
         print(
-            f"  {record['us']:10.3f} us  {record['tflops']:8.1f} TFLOPS  {json.dumps(record['config'])}"
+            f"  {record['us']:10.3f} us  {gain}  {record['tflops']:8.1f} TFLOPS  {json.dumps(record['config'])}"
         )
-    print(f"  {counts}", flush=True)
+    print(f"  {counts}, screened: {screened}", flush=True)
 
 
 def install(spec, args, backend, gpu):
@@ -410,28 +629,65 @@ def install(spec, args, backend, gpu):
 
 def main(argv=None):
     args = parse_args(argv)
+    # SIGTERM stops the workers cleanly, between two candidates
+    signal.signal(signal.SIGTERM, lambda signum, frame: STOP.set())
     spec, gpus = args.kernel, args.gpu
     os.makedirs(args.runs_dir, exist_ok=True)
 
-    for M in args.M or all_bucket_ms(spec, args, gpus[0]):
+    ms = args.M or all_bucket_ms(spec, args, gpus[0])
+    with ThreadPoolExecutor(len(ms)) as pool:  # a Triton space takes minutes per M
+        planned = {
+            M: pool.submit(
+                plan,
+                spec,
+                shape_from_args(args, spec.dims, M),
+                args.backend,
+                gpus[0],
+                args.runs_dir,
+                args.plan_timeout,
+            )
+            for M in ms
+        }
+    plans = {}
+    for M in ms:
         shape = shape_from_args(args, spec.dims, M)
-        plan_ = plan(
-            spec, shape, args.backend, gpus[0], args.runs_dir, args.setup_timeout
+        plans[M] = planned[M].result()
+        out = results_path(
+            args.runs_dir, plans[M]["arch"], plans[M]["backend"], spec.name, shape
         )
-        backend = plan_["backend"]
-        print_plan(plan_, shape)
-
-        out = results_path(args.runs_dir, plan_["arch"], backend, spec.name, shape)
         if args.fresh:
             discard(out)
         check_settings(out, args)
-        print(f"  results: {out}", flush=True)
-        candidates = [None] + plan_["configs"]  # None is the installed baseline
-        sweep(spec, shape, backend, candidates, out, gpus, args)
-        # the installer prefers a final-round file, so an existing one is always refreshed
-        if len(gpus) > 1 or os.path.exists(final_results_path(out)):
-            final_round(spec, shape, backend, candidates, out, gpus[0], args)
-        summarize(out, candidates)
+
+    stop_precompile = threading.Event()
+    pools = pool_files(spec, args, plans) if args.compile_procs else {}
+    precompiler = threading.Thread(
+        target=precompile_ahead,
+        args=(spec, args, plans, pools, stop_precompile),
+        daemon=True,
+    )
+    if args.compile_procs:
+        precompiler.start()
+    try:
+        for M, plan_ in plans.items():
+            shape = shape_from_args(args, spec.dims, M)
+            backend = plan_["backend"]
+            print_plan(plan_, shape)
+            out = results_path(args.runs_dir, plan_["arch"], backend, spec.name, shape)
+            print(f"  results: {out}", flush=True)
+            candidates = [None] + plan_["configs"]  # None is the installed baseline
+            sweep(spec, shape, backend, candidates, out, gpus, args)
+            # the installer prefers a final-round file, so an existing one is always refreshed
+            refresh = True  # also with one GPU left (after GPU retirements): write the final round
+            if refresh and not STOP.is_set():
+                final_round(spec, shape, backend, candidates, out, gpus[0], args)
+            if STOP.is_set():
+                sys.exit("stopped by SIGTERM; rerun the same command to resume")
+            summarize(out, candidates)
+    finally:
+        stop_precompile.set()
+        if precompiler.is_alive():
+            precompiler.join()
 
     return install(spec, args, backend, gpus[0])
 
