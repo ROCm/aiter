@@ -18,8 +18,12 @@ from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx950 import (
+    GEMM_A16W16_DTYPE_BF16,
+    GEMM_A16W16_DTYPE_FP16,
+    GEMM_A16W16_DTYPE_FP32,
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
+    make_gemm_a16w16_param_and_validate,
 )
 from .kernels.tensor_shim import _run_compiled
 
@@ -27,6 +31,7 @@ __all__ = [
     "SPLIT_K_SEMAPHORE_MAX_LEN",
     "flydsl_hgemm",
     "flydsl_hgemm_kernel_name",
+    "flydsl_hgemm_supports_shape",
     "flydsl_preshuffle_gemm_a8",
     "get_flydsl_hgemm_kernel_params",
 ]
@@ -114,6 +119,41 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
         "out_dtype": out_dtype,
         "target_gfx": match.group("target_gfx"),
     }
+
+
+def flydsl_hgemm_supports_shape(m: int, n: int, k: int, params: dict) -> bool:
+    """Whether the gfx950 kernel described by ``params`` can run M x N x K.
+
+    Tuned rows are looked up by padded M, so a row can serve shapes far larger
+    than the one it was tuned on, e.g. past the kernel's 32-bit buffer limits.
+    """
+
+    if params["target_gfx"] != "gfx950":
+        return True
+    in_dtype_id = (
+        GEMM_A16W16_DTYPE_FP16 if params["dtype"] == "fp16" else GEMM_A16W16_DTYPE_BF16
+    )
+    out_dtype_id = (
+        GEMM_A16W16_DTYPE_FP32 if params["out_dtype"] == "fp32" else in_dtype_id
+    )
+    validation_config = {
+        "block_m": params["block_m"],
+        "block_n": params["block_n"],
+        "block_k": params["block_k"],
+        "stages": params["stages"],
+        "split_k": params["split_k"],
+        "m_waves": params["m_waves"],
+        "n_waves": params["n_waves"],
+        "k_waves": params["k_waves"],
+        "group_m": params["group_m"],
+        "use_half_tile_interleaved": params["use_half_tile_interleaved"],
+        "in_dtype_id": in_dtype_id,
+        "out_dtype_id": out_dtype_id,
+        "a_is_transposed": False,
+        "b_is_transposed": True,
+        "has_bias": params["has_bias"],
+    }
+    return make_gemm_a16w16_param_and_validate(m, n, k, validation_config) is not None
 
 
 def flydsl_hgemm(

@@ -25,6 +25,10 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_hgemm
+from aiter.ops.flydsl.gemm_kernels import (
+    flydsl_hgemm_supports_shape,
+    get_flydsl_hgemm_kernel_params,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -72,6 +76,9 @@ _TUNED = [
     (800, 384, 7168, 64, 96, 64, 4, 4, 2, 2, 1, 0, False),
     (32, 7168, 2048, 32, 32, 64, 8, 1, 2, 1, 1, 0, False),
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
+    # MiniMax-M3 ViT projection reached through the M=8192 tuned row: M * N is
+    # past 2^31, so C offsets must be int64.
+    (360448, 6144, 1280, 256, 256, 64, 2, 1, 2, 4, 1, 0, True),
 ]
 
 
@@ -209,6 +216,16 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     return ret
 
 
+def check_shape_limits():
+    # The MiniMax-M3 ViT row tuned at M=8192 must still serve the 768000-patch
+    # encoder profile, but not an M whose A no longer fits a buffer resource.
+    params = get_flydsl_hgemm_kernel_params(
+        "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias1_ktail0_gm0_pht_gfx950"
+    )
+    assert flydsl_hgemm_supports_shape(768000, 6144, 1280, params)
+    assert not flydsl_hgemm_supports_shape(2**20, 6144, 1280, params)
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -248,6 +265,7 @@ def main():
     )
     args = parser.parse_args()
     wanted = set(args.mnk)
+    check_shape_limits()
 
     for dtype in args.dtype:
         rows = []

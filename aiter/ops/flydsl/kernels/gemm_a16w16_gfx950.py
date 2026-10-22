@@ -14,6 +14,7 @@ from flydsl.runtime.device import get_rocm_arch
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx950_utils import (
+    GFX950_BUFFER_MAX_BYTES,
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
     SPLIT_K_SEMAPHORE_MAX_LEN,
@@ -837,7 +838,8 @@ def gemm_a16w16_gfx950_kernel(
                         ),
                     )
                     c_vec = c_vec + peer_c_vec
-                global_offset = global_row * n + global_col
+                # int64: M * N exceeds 2^31 for large-M GEMMs (e.g. ViT projections)
+                global_offset = fx.Int64(global_row) * n + global_col
                 write_cshuffle_vec_to_global(
                     out,
                     out_buf,
@@ -1106,7 +1108,11 @@ def gemm_a16w16_hti_gfx950_kernel(
                             cshuffle_r2g_vec_size, global_output_dtype
                         ),
                     )
-                    global_offset = global_row * n + global_col
+                    if const_expr(is_split_k):
+                        global_offset = global_row * n + global_col
+                    else:
+                        # int64: M * N exceeds 2^31 for large-M GEMMs
+                        global_offset = fx.Int64(global_row) * n + global_col
                     write_cshuffle_vec_to_global(
                         out,
                         out_buf,
@@ -1376,6 +1382,14 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     if not result.b_is_transposed and n % async_load_vec_size != 0:
         return None
     if result.b_is_transposed and k % async_load_vec_size != 0:
+        return None
+    # A and B are loaded through buffer resources. C goes through one only for
+    # split-K's atomics, which the semaphore length already caps far below 2 GiB;
+    # the plain epilogue stores C through a pointer with int64 offsets.
+    if (
+        m * k * result.in_data_bytes >= GFX950_BUFFER_MAX_BYTES
+        or n * k * result.in_data_bytes >= GFX950_BUFFER_MAX_BYTES
+    ):
         return None
     num_pid_m = (m + result.block_m - 1) // result.block_m
     num_pid_n = (n + result.block_n - 1) // result.block_n

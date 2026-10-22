@@ -120,8 +120,8 @@ def get_GEMM_A16W16_tuned_config(
 ):
     """Return the tuned config for this GEMM, or None if no usable row exists.
 
-    Rows naming a FlyDSL kernel missing from the catalog, or an OPUS candidate
-    that no longer resolves, are skipped as if absent.
+    Rows naming a FlyDSL kernel missing from the catalog or unable to run this
+    shape, or an OPUS candidate that no longer resolves, are skipped as if absent.
     """
     cfg = get_GEMM_A16W16_config_()
     cu_num = get_cu_num()
@@ -159,6 +159,17 @@ def get_GEMM_A16W16_tuned_config(
                     logger.warning(
                         f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
                         "recognized by the current catalog; falling back to next candidate."
+                    )
+                    config = None
+                # A padded-M row can be reached by a much larger M than it was
+                # tuned on; skip it when the kernel cannot address this shape.
+                elif not _get_flydsl_gemm_kernels().flydsl_hgemm_supports_shape(
+                    M, N, K, flydsl_config
+                ):
+                    logger.warning(
+                        f"FlyDSL kernel '{config['kernelName']}' tuned at M={padded_M} "
+                        f"does not support M:{M}, N:{N}, K:{K}; falling back to next "
+                        "candidate."
                     )
                     config = None
             if config is None:
