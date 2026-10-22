@@ -61,6 +61,7 @@ q_format,k_format,v_format,v_pack,o_format,q_scale_mode,k_scale_mode,v_scale_mod
 7,7,7,1,2,5,5,5,0,128,128,0,2,256,128,65536,1,1,1,1,1,_ZN5aiter36fmha_fwd_hd128_mxfp6_fp6p_sol_gfx950E,fwd_hd128_mxfp6_fp6p_sol_256x128.co
 3,3,7,1,2,1,1,5,0,128,128,0,2,256,128,7024,1,1,1,1,1,_ZN5aiter35fmha_fwd_hd128_f8f6_fp6p_sol_gfx950E,fwd_hd128_f8f6_fp6p_sol_256x128.co
 7,7,9,1,2,5,5,5,0,128,128,0,2,256,128,65536,1,1,1,1,1,_ZN5aiter35fmha_fwd_hd128_f6f4_fp6p_sol_gfx950E,fwd_hd128_f6f4_fp6p_sol_256x128.co
+7,7,3,0,2,5,5,4,0,128,128,0,2,256,128,65536,1,1,1,1,1,_ZN5aiter30fmha_fwd_hd128_f6f8_sol_gfx950E,fwd_hd128_f6f8_sol_256x128.co
 3,3,7,1,2,1,1,5,0,128,128,0,2,64,64,65536,1,1,1,1,1,_ZN5aiter41fmha_fwd_hd128_f8f6_fp6p_sol_64x64_gfx950E,fwd_hd128_f8f6_fp6p_sol_64x64.co
 7,7,7,1,2,5,5,5,0,128,128,0,2,64,64,65536,1,1,1,1,1,_ZN5aiter42fmha_fwd_hd128_mxfp6_fp6p_sol_64x64_gfx950E,fwd_hd128_mxfp6_fp6p_sol_64x64.co
 7,7,9,1,2,5,5,5,0,128,128,0,2,64,64,65536,1,1,1,1,1,_ZN5aiter41fmha_fwd_hd128_f6f4_fp6p_sol_64x64_gfx950E,fwd_hd128_f6f4_fp6p_sol_64x64.co

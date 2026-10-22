@@ -1599,12 +1599,8 @@ _SOL_ATTN_RECIPES = [
         oracle_floor=0.985,
         keep_or_drop_margin=0.05,
     ),
-]
-
-# Recipes whose only Sol-Attn row is the 64x64 one, so they have no default geometry to test at.
-# f6f8's MXFP6 Q/K pool like the mxfp6 row's; its V's per-channel FP8 descale does not vary along
-# the sequence, so pooled V reuses it the way a per-tensor one is reused.
-_SOL_ATTN_FINE_ONLY_RECIPES = [
+    # f6f8's MXFP6 Q/K pool like the mxfp6 row's; its V's per-channel FP8 descale does not vary
+    # along the sequence, so pooled V reuses it the way a per-tensor one is reused.
     _SolAttnRecipe(
         id="f6f8",
         qk_format=AttentionFormat.MXFP6,
@@ -1623,7 +1619,6 @@ def _sol_attn_geometry_params(ids=None):
     """(recipe, block_tile) params: each recipe at its default geometry (None), then at 64x64
     where it has a row there."""
     recipes = [r for r in _SOL_ATTN_RECIPES if ids is None or r.id in ids]
-    fine_only = [r for r in _SOL_ATTN_FINE_ONLY_RECIPES if ids is None or r.id in ids]
     return [pytest.param(r, None, id=r.id) for r in recipes] + [
         pytest.param(
             r,
@@ -1631,7 +1626,7 @@ def _sol_attn_geometry_params(ids=None):
             marks=_requires_sol_row(r, _MHA_V4_FINE_TILE),
             id=f"{r.id}-64x64",
         )
-        for r in recipes + fine_only
+        for r in recipes
     ]
 
 
@@ -2655,11 +2650,10 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id, block_tile):
                 ("f6f4_fp6p", 0.09),
             )
         ),
-        # Its only Sol-Attn row is 64x64.
         pytest.param(
             "f6f8",
             0.09,
-            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 64x64 rows"),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 f6f8 rows"),
         ),
     ],
 )
@@ -2675,11 +2669,8 @@ def test_mha_v4_sol_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
     from aiter.test_mha_common import sol_attn_ref
 
     torch.manual_seed(37)
-    fine_only = {r.id for r in _SOL_ATTN_FINE_ONLY_RECIPES}
-    recipe = next(
-        r for r in _SOL_ATTN_RECIPES + _SOL_ATTN_FINE_ONLY_RECIPES if r.id == recipe_id
-    )
-    block_tile = _MHA_V4_FINE_TILE if recipe_id in fine_only else None
+    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == recipe_id)
+    block_tile = None
     _skip_without_sol_row(recipe, block_tile)
     heads, sequence = 2, 1024
     q_tile, kv_tile = block_tile or recipe.block_tile()
