@@ -9,7 +9,7 @@ kernels, and ``bench`` compares them with aiter's HIP quick all-reduce.
 **verify** covers what production dispatch can run on this host, and each
 sweep ends in a markdown table:
 
-* ``test_quick_allreduce_int4`` -- the shipping configuration (codecs and
+* ``test_quick_allreduce`` -- the shipping configuration (codecs and
   super-tile left to the per-world defaults and ladders, as production dispatch
   constructs the engine), timed on a CUDA graph of ``GRAPH_INNER``
   back-to-back calls and checked again after every replay. The payloads come
@@ -18,9 +18,9 @@ sweep ends in a markdown table:
   plus the top of its window. A schedule the policy never selects on this
   host (the ring on xGMI) gets one row, for a user who moves the boundary with
   ``AITER_FLY_AR_MESH_MAX_BYTES``.
-* ``test_quick_allreduce_int4_coverage`` -- the kernels those rows ran include
+* ``test_quick_allreduce_coverage`` -- the kernels those rows ran include
   every kernel the engine's own ``cfgs_for`` says the window selects.
-* ``test_quick_allreduce_int4_edge_inputs`` -- payloads that land on the E4M3
+* ``test_quick_allreduce_edge_inputs`` -- payloads that land on the E4M3
   scale's edge cases, and degenerate groups that must stay finite.
 * ``test_quick_allreduce_transport`` -- the ``fp16`` wire format, a lossless
   passthrough, on an exactly representable input: the result must be
@@ -29,11 +29,11 @@ sweep ends in a markdown table:
   ladder on the shipping payloads, so it covers the geometry that ships.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
-shapes; ``test_quick_allreduce_int4`` again, as a second table, with ``block``
+shapes; ``test_quick_allreduce`` again, as a second table, with ``block``
 overridden on every rung of the shipping ladder (``KNOB_CASES``), including
 the narrow blocks where a VMEM store-data hazard once showed up; the fp16
 transport over a matrix of pinned ``super_tile``/``block``; and
-``test_quick_allreduce_int4_pinned_codec`` -- the ring with its wire formats
+``test_quick_allreduce_pinned_codec`` -- the ring with its wire formats
 pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
 
 Every row also checks that all ranks wrote bit-identical output: each rank
@@ -606,7 +606,7 @@ def _metrics(
         atol=CLOSE_ATOL,
         tol_err_ratio=CLOSE_ERR_RATIO,
         printLog=False,
-        msg=f"quick_allreduce_int4 rank {rank}",
+        msg=f"quick_allreduce rank {rank}",
     )
     return {
         "sqnr_db": _sqnr_db(got, ref),
@@ -1269,7 +1269,7 @@ def _transport_key(
 
 
 @benchmark()
-def test_quick_allreduce_int4(
+def test_quick_allreduce(
     tokens,
     hidden,
     dtype,
@@ -1316,7 +1316,7 @@ def _bench_key(tp: int, algorithms, grid_cap, block) -> tuple:
 
 
 @benchmark()
-def bench_quick_allreduce_int4(
+def bench_quick_allreduce(
     tokens,
     hidden,
     tp,
@@ -1361,7 +1361,7 @@ def bench_quick_allreduce_int4(
 
 
 @benchmark()
-def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
+def test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill):
     """Edge-case payloads on the shipping engine; correctness only."""
     rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
     label = f"tp={tp} {algorithm} {tokens}x{hidden} fill={fill}"
@@ -1391,7 +1391,7 @@ def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
 
 
 @benchmark()
-def test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs_codec, ag_codec):
+def test_quick_allreduce_pinned_codec(tokens, hidden, tp, rs_codec, ag_codec):
     """The ring with both laps' wire formats pinned; correctness only."""
     key = _key(tp, algorithm="ring", rs_codec=rs_codec, ag_codec=ag_codec)
     rows = _result(key, (tokens, hidden, "normal", False))
@@ -1471,7 +1471,7 @@ def test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm):
 
 
 @benchmark()
-def test_quick_allreduce_int4_coverage(tp, algorithm, window):
+def test_quick_allreduce_coverage(tp, algorithm, window):
     """Every kernel production dispatch can select on this host ran in the
     shipping sweep.
 
@@ -1635,9 +1635,9 @@ def _verify(args, tps, algos, dts, link) -> None:
             (tokens, hidden, "exact", False),
         )
 
-    def _int4_rows(cases):
+    def _rows(cases):
         return [
-            test_quick_allreduce_int4(
+            test_quick_allreduce(
                 tokens,
                 hidden,
                 dtype,
@@ -1650,16 +1650,16 @@ def _verify(args, tps, algos, dts, link) -> None:
         ]
 
     for dtype in dts:
-        rows = _int4_rows(ship)
-        _summarize("flydsl quick allreduce INT4", rows)
+        rows = _rows(ship)
+        _summarize("flydsl quick allreduce", rows)
         _summarize(
-            "flydsl quick allreduce INT4 production kernel coverage",
+            "flydsl quick allreduce production kernel coverage",
             [
-                test_quick_allreduce_int4_coverage(tp, algorithm, window)
+                test_quick_allreduce_coverage(tp, algorithm, window)
                 for tp, algorithm, window in coverage
             ],
         )
-        _summarize("flydsl quick allreduce INT4 block", _int4_rows(knobs))
+        _summarize("flydsl quick allreduce block", _rows(knobs))
         _write_json(args.out, rows)
     _summarize(
         "flydsl quick allreduce run-ahead",
@@ -1669,16 +1669,16 @@ def _verify(args, tps, algos, dts, link) -> None:
         ],
     )
     _summarize(
-        "flydsl quick allreduce INT4 edge inputs",
+        "flydsl quick allreduce edge inputs",
         [
-            test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill)
+            test_quick_allreduce_edge_inputs(tokens, hidden, tp, algorithm, fill)
             for tp, algorithm, tokens, hidden, fill in edge
         ],
     )
     _summarize(
-        "flydsl quick allreduce INT4 pinned codec",
+        "flydsl quick allreduce pinned codec",
         [
-            test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs, ag)
+            test_quick_allreduce_pinned_codec(tokens, hidden, tp, rs, ag)
             for tp, tokens, hidden, rs, ag in pinned
         ],
     )
@@ -1719,7 +1719,7 @@ def _bench(args, tps, algos, link) -> None:
             for shape in shapes:
                 _register(_bench_key(tp, algos, grid_cap, block), shape)
             rows += [
-                bench_quick_allreduce_int4(
+                bench_quick_allreduce(
                     tokens,
                     hidden,
                     tp,
@@ -1737,7 +1737,7 @@ def _bench(args, tps, algos, link) -> None:
         rows,
         candidates=(*algos, "hip"),
         drop=drop,
-        title="flydsl quick allreduce INT4 vs hip",
+        title="flydsl quick allreduce vs hip",
     )
     for title, df in tables:
         aiter.logger.info("%s (markdown):\n%s", title, fab.to_markdown(df))

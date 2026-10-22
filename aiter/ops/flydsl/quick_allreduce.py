@@ -889,7 +889,7 @@ class FlyQuickAllReduce:
         return int(nbytes) >= self.min_bytes
 
     def allreduce(self, inp, out, stream=None):
-        """Two-shot INT4 all-reduce into ``out``.
+        """Two-shot all-reduce into ``out``, in this engine's wire codecs.
 
         ``stream=None`` uses the current PyTorch stream on this device.
         """

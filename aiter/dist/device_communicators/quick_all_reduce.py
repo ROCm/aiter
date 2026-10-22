@@ -43,12 +43,12 @@ except Exception:  # noqa: BLE001
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
-    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduce as QuickAllReduceInt4
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduce
 
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
-    QuickAllReduceInt4 = None
+    FlyQuickAllReduce = None
     _FLY_IMPORT_OK = False
 
 
@@ -258,7 +258,7 @@ class QuickAllReduce:
         ok = True
         try:
             for alg in algorithms:
-                self._fly_engines[alg] = QuickAllReduceInt4(
+                self._fly_engines[alg] = FlyQuickAllReduce(
                     group=self.group,
                     device=self.device,
                     rank=self.rank,

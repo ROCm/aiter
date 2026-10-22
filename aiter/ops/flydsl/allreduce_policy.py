@@ -10,7 +10,8 @@ Kernels
 * **one-shot** (``OneShotAllReduce``) -- one round, no grid-wide barrier, wire
   volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding.
 * **mesh** (``FlyQuickAllReduce(algorithm="mesh")``) -- two-shot, fanout to all
-  ``N-1`` peers twice, wire volume ``2(N-1)/N*S``, INT4 on the wire.
+  ``N-1`` peers twice, wire volume ``2(N-1)/N*S``, INT4 on the wire by default
+  (INT5, INT6 or FP16 when pinned).
 * **ring** (``FlyQuickAllReduce(algorithm="ring")``) -- two-shot, ``2(N-1)``
   hops, same wire volume as the mesh, traded for per-destination locality.
 

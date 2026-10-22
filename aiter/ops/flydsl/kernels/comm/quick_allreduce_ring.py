@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4/INT6 **ring** all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} INT4/INT6/FP16 **ring** all-reduce.
 
 Topology of the lap: the ranks form a cycle and every step is a single
 contiguous run into exactly one peer's inbox:
