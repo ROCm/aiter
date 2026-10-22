@@ -44,6 +44,7 @@ from aiter.aot.flydsl.common import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.gdr_prefill import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 # Matches the MI355X device query; a device reporting another count JIT-compiles on first use.
 AOT_NUM_XCDS = 8
@@ -400,4 +401,5 @@ def main():
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()

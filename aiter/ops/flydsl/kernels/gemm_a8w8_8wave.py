@@ -189,7 +189,7 @@ class StoreC:
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def _store_bf16(self, value_bf16, c_index):
-        fx.memref_store_vec(Vec.filled(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
+        fx.memref_store_vec(fx.full(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
         fx.copy(
             self.out_atom_1,
             self.reg_bf16_1,
@@ -225,7 +225,7 @@ class Mfma16x16x128:
         self.atom = fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN)
         )
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.zero_value = fx.full(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
 

@@ -85,6 +85,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # measurable layers, in report order; see the module docstring. "combine" only
 # exists under --multi-gpu, where there is a real mori combine to measure.
@@ -899,7 +900,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",
@@ -947,13 +948,6 @@ def parse_args(args: list[str] | None = None):
         "expert count and the histogram from the LOCAL one, which no single "
         "routing() call can produce. DSV4 EP4 decode is '--M 2048 --experts 384 "
         "6 --ep 4 --routed-experts 384 --balance'. Default 1 (no sharding).",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["triton", "gluon"],
-        default=None,
-        help="Kernel backend for moe_gemm_a4w4. Default: unset, i.e. the arch "
-        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
     )
     parser.add_argument(
         "--preshuffle",
