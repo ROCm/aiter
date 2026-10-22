@@ -327,6 +327,41 @@ module enumeration, child-process plumbing, skip classification and
 `--update-md` folding are verified; `pass`/`fail` rows still require the
 strict-capable container.
 
+## ROCm 10.0.0 toolchain survey (checked 2026-10-22)
+
+`rocm/atom-dev:latest-rocm10.0` -- ROCm 10.0.0, AMD clang 23.0.0git
+(ROCm/llvm-project 8f497e0992fb), HIP 7.15.26333, torch 2.11.0+rocm10.0.0 --
+**does not provide the strict target**:
+
+| check | result |
+|-------|--------|
+| `hipcc --offload-arch=gfx942` / `=gfx1250` | compiles |
+| `hipcc --offload-arch=gfx1250-strict` | `error: unsupported HIP gpu architecture: gfx1250-strict` |
+| `llvm-mc -arch=amdgcn -mcpu=help` | `gfx1250`, `gfx1251`; no strict processor |
+| `amdclang++ -print-supported-cpus` | `gfx1250`, `gfx1251` |
+| `strings` of `libLLVM.so.23.0git`, `amdclang-23` | zero hits for `gfx1250-strict` and `__gfx1250_strict__` |
+| predefined macros for `gfx1250` | `__gfx1250__`, `__amdgcn_processor__ "gfx1250"`, `__amdgcn_target_id__ "gfx1250"` |
+
+The one A0/B0 notion in this toolchain is an AMDGPU **subtarget feature**,
+`gfx1250-b0-specific` ("Generate code for B0 flavor of gfx1250"), present in
+`libLLVM` only.  It is not reachable from the driver: it is not a processor,
+`gfx1250:gfx1250-b0-specific+` and `-` are rejected as invalid target IDs, and
+`-Xclang -target-feature -Xclang +gfx1250-b0-specific` is warned about and
+ignored.
+
+Two consequences for this series:
+
+1. The strict target still comes from a toolchain this image does not carry,
+   so the workstream 2 build matrix cannot be filled from the public ROCm 10
+   container.  The plan's toolchain dependency is unchanged, not satisfied.
+2. Worth settling with the compiler owner before the identity model is locked
+   in: if the shipping mechanism ends up being a subtarget feature on
+   `gfx1250` rather than a distinct processor name, then an A0 and a B0 code
+   object both carry the target id `gfx1250`.  `_so_offload_archs` reads
+   exactly that id, so it could not tell them apart and the guard would need a
+   different discriminator.  Nothing here settles which mechanism ships; the
+   question is which one AITER should key on.
+
 ## Container-phase runbook (strict-capable toolchain)
 
 1. Verify the toolchain accepts the strict target:
