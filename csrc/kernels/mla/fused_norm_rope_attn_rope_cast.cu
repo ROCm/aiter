@@ -604,7 +604,11 @@ __global__ __launch_bounds__(256, 2) void fused_norm_rope_attn_rope_cast_decode_
 #endif
 }
 
-template <bool RotateQ, int PageSize, bool PreparedQ = false, bool H64Schedule = false>
+template <bool RotateQ,
+          int PageSize,
+          bool PreparedQ   = false,
+          bool H64Schedule = false,
+          bool QNorm       = false>
 __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_decode_64(
     FusedNormRopeAttnRopeCastArgs a)
 {
@@ -613,9 +617,12 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_
     using namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1;
     const int tid = threadIdx.x, lane = tid % 64, wave = tid / 64, group = lane / 16;
     const int hl = wave * 16 + lane % 16, h = blockIdx.y * 64 + hl, t = blockIdx.x;
-    const int hload   = min(h, a.heads - 1);
-    const float q_inv = fused_q_norm::inv_rms<4, 16>(
-        a.q + (int64_t(t) * a.heads + hload) * 512, group, a.q_norm, a.norm_eps);
+    const int hload = min(h, a.heads - 1);
+    static_assert(!QNorm || (RotateQ && !PreparedQ));
+    float q_inv = 1.0f;
+    if constexpr(QNorm)
+        q_inv = fused_q_norm::inv_rms<4, 16>(
+            a.q + (int64_t(t) * a.heads + hload) * 512, group, true, a.norm_eps);
     __shared__ __align__(16) B kv_tile[T::smem_kv_tile_elems];
     const int64_t pos = a.positions64 ? static_cast<const int64_t*>(a.positions)[t]
                                       : static_cast<const int*>(a.positions)[t];
@@ -655,7 +662,7 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_
                 opus::static_for<2>([&](auto sub) {
                     B8 x = *reinterpret_cast<const B8*>(a.q + (int64_t(t) * a.heads + hload) * 512 +
                                                         d + int(sub) * 8);
-                    if(a.q_norm)
+                    if constexpr(QNorm)
                         fused_q_norm::apply(x, q_inv);
                     if constexpr(RotateQ && int(step) == 3 && int(part) == 1)
                         opus::static_for<4>([&](auto pair) {
@@ -937,6 +944,13 @@ launch_cache_mode(const FusedNormRopeAttnRopeCastArgs* a, int rotate_q, hipStrea
                 if(a->q_scale)
                     fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false, PageSize, true, true>
                         <<<grid, 256, 0, stream>>>(*a);
+                else if(a->q_norm)
+                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true,
+                                                                    PageSize,
+                                                                    false,
+                                                                    true,
+                                                                    true>
+                        <<<grid, 256, 0, stream>>>(*a);
                 else if(rotate_q)
                     fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true, PageSize, false, true>
                         <<<grid, 256, 0, stream>>>(*a);
@@ -948,6 +962,13 @@ launch_cache_mode(const FusedNormRopeAttnRopeCastArgs* a, int rotate_q, hipStrea
             {
                 if(a->q_scale)
                     fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false, PageSize, true>
+                        <<<grid, 256, 0, stream>>>(*a);
+                else if(a->q_norm)
+                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true,
+                                                                    PageSize,
+                                                                    false,
+                                                                    false,
+                                                                    true>
                         <<<grid, 256, 0, stream>>>(*a);
                 else if(rotate_q)
                     fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true, PageSize>
