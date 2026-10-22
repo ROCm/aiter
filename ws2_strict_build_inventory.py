@@ -143,13 +143,52 @@ def refresh_signals():
     print(f"refreshed {changed} signal cells in {MD}")
 
 
-def skip_reason(mod, cfg):
+def _ck_is_unavailable():
+    """True when 3rdparty/composable_kernel is absent or an empty submodule.
+
+    aiter's own CK-free auto-exclusion tests os.path.isdir, which is True for
+    an uninitialised submodule directory, so a checkout without `git submodule
+    update` still tries to build the CK modules and they fail on missing
+    sources.  Those are not strict-target failures and must not be recorded as
+    build results.
+    """
+    ck = os.path.join(REPO, "3rdparty/composable_kernel")
+    try:
+        return not os.listdir(ck)
+    except OSError:
+        return True
+
+
+def _ck_modules():
+    """CK-dependent module names, from aiter's own detector."""
+    child = (
+        f"import json,sys;sys.path.insert(0,{REPO!r});"
+        "from aiter.jit import core;"
+        "print(json.dumps(sorted(core._get_ck_exclude_modules())))"
+    )
+    p = subprocess.run(
+        [sys.executable, "-c", child],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        timeout=600,
+        check=False,
+    )
+    for line in reversed((p.stdout or "").splitlines()):
+        if line.startswith("["):
+            return set(json.loads(line))
+    return set()
+
+
+def skip_reason(mod, cfg, ck_excluded=frozenset()):
     """Modules get_args_of_build("all") never yields, with the reason.
 
     They are not build failures: *_tune is skipped by core.get_args_of_build,
     and experimental modules are gated behind AITER_ENABLE_EXPERIMENTAL.
     Recording them as "missing" would hide the distinction the inventory needs.
     """
+    if mod in ck_excluded:
+        return "skip-no-ck"
     if mod.endswith("tune"):
         return "skip-tune"
     if cfg.get(mod, {}).get("is_experimental") and not os.environ.get(
@@ -195,10 +234,17 @@ def main():
 
     with open(os.path.join(REPO, "aiter/jit/optCompilerConfig.json")) as f:
         cfg = json.load(f)
+    ck_excluded = _ck_modules() if _ck_is_unavailable() else frozenset()
+    if ck_excluded:
+        print(
+            f"3rdparty/composable_kernel is empty -> {len(ck_excluded)} CK modules "
+            "recorded as skip-no-ck, not built",
+            flush=True,
+        )
     mods = [only] if only else list_modules()
     for i, mod in enumerate(mods, 1):
         print(f"[{i}/{len(mods)}] {mod} ...", flush=True)
-        reason = skip_reason(mod, cfg)
+        reason = skip_reason(mod, cfg, ck_excluded)
         if reason:
             status, tail = reason, ""
         else:
