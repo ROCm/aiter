@@ -8,7 +8,7 @@ from functools import lru_cache
 
 import torch
 
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_cu_num_device, get_gfx_runtime
 from aiter.ops.asm.asm_utils import load_hip
 from aiter.ops.topk import (
     BACKEND_ADAPTIVE,
@@ -458,7 +458,7 @@ def _run_adaptive(
         cfg_width,
         k,
         ordered=stable,
-        cu_count=get_cu_num(),
+        cu_count=get_cu_num_device(logits.device.index),
     )
     packed = row_starts is not None
     launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(

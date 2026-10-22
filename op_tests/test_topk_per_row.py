@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num_device, get_gfx, get_gfx_runtime
 from aiter.ops import topk
 from aiter.ops.asm.asm_utils import load_hip
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
@@ -739,6 +739,39 @@ def test_decode_bound_gate():
                     assert plain != topk.BACKEND_ADAPTIVE, cell
                     assert topk._decode_backend(arch, cu, *call, None) == plain, cell
     print(f"[decode_bound_gate] PASS: {len(table)} cards")
+
+
+def test_decode_mixed_node():
+    """Decode runs when the node-wide `get_cu_num()` asserts, as beside an iGPU."""
+    rows, width, top_k = 4, 65536, 2048
+    torch.manual_seed(0)
+    logits = torch.randn(rows, width, device="cuda")
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    want = stable_reference(logits, top_k)
+    mixed = AssertionError("GPUs on this node differ in CU count")
+    with (
+        mock.patch.object(topk, "get_cu_num", side_effect=mixed),
+        mock.patch.object(flydsl_decode_host, "get_cu_num", side_effect=mixed),
+    ):
+        for backend in (None, topk.BACKEND_ADAPTIVE):
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+            flydsl_decode_host._decode_with_backend(
+                logits,
+                1,
+                seq_lens,
+                out,
+                rows,
+                width,
+                1,
+                top_k,
+                True,
+                None,
+                backend,
+                width,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(out.long(), want), backend
+    print("[decode_mixed_node] PASS")
 
 
 def test_decode_bound_entry_points(card):
@@ -1687,7 +1720,8 @@ def run_decode(args):
 
 def run_adaptive():
     test_decode_bound_gate()
-    card = (get_gfx_runtime(), get_cu_num())
+    test_decode_mixed_node()
+    card = (get_gfx_runtime(), get_cu_num_device(torch.cuda.current_device()))
     if card not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
         aiter.logger.warning(
             "%s at %d CU carries no adaptive decode bands; bounded decode skipped",

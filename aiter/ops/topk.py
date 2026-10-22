@@ -9,7 +9,12 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from ..jit.utils.chip_info import (
+    get_cu_num,
+    get_cu_num_device,
+    get_gfx,
+    get_gfx_runtime,
+)
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
 
@@ -1049,7 +1054,7 @@ def decode_backend_for_call(
     width = logits.shape[1] if width is None else width
     backend = _decode_backend(
         get_gfx_runtime(),
-        get_cu_num(),
+        get_cu_num_device(logits.device.index),
         stable,
         width,
         num_rows,
