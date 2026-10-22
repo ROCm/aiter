@@ -3796,26 +3796,26 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict.get(get_gfx(), {}):
             if q_type == QuantType.per_1x128:
+                xbf16 = (
+                    get_gfx() == "gfx950"
+                    and int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
+                )
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                # gfx942 asm kernels read past X/w2 for model_dim < 512, and need
-                # model_dim % 256 (per-kernel dim_align in hsa/gfx942/fmoe)
                 run_1stage = (
                     token > 32
                     and inter_dim % 128 == 0
-                    and (
-                        get_gfx() != "gfx942"
-                        or (model_dim >= 512 and model_dim % 256 == 0)
+                    and aiter.fmoe_fp8_blockscale_g1u1_has_kernel(
+                        activation.value, xbf16, BLOCK_SIZE_M, inter_dim, model_dim
                     )
+                    == 1
                 )
+                run_1stage_xbf16 = run_1stage and xbf16
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
                 run_1stage = token > 16 or inter_dim % 128 != 0
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
-
-            if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
-                run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
 
         block_m = (
             BLOCK_SIZE_M
