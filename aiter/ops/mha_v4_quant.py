@@ -145,8 +145,13 @@ def rotate_activation_mxfp4_quant_k(
     scale: Tensor,
     input: Tensor,
     mean: Tensor,
+    head_split: int = 1,
 ) -> None:
-    """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order."""
+    """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order.
+
+    `head_split` splits the head axis into (heads // head_split, head_split) and places the inner
+    index inside the tile axis; hd256 passes 2 to get its interleaved tile order directly.
+    """
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
@@ -154,6 +159,7 @@ def _quantize_v_mxfp4_hip(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    head_split: int = 1,
 ) -> None:
     """Pack V into the canonical column-major MXFP4 order."""
 
@@ -163,6 +169,7 @@ def _quantize_v_mxfp4_fp6_p_hip(
     out: Tensor,
     scale: Tensor,
     input: Tensor,
+    head_split: int = 1,
 ) -> None:
     """Pack MXFP4 V in the contraction order required by an FP6 P operand."""
 
@@ -783,19 +790,30 @@ def quantize_mxfp4_k_hd256(
     batch, sequence, heads, _ = _validate_bshd_hd256(
         input, "hd256 MXFP4 K quantization"
     )
+    half_heads = _hd256_half_heads(input)
     half_mean = (
         None if mean is None else mean.reshape(batch, heads * 2, MHA_V4_HD256 // 2)
     )
-    raw, scale = quantize_mxfp4_k(_hd256_half_heads(input), half_mean)
-    tiles = mxfp4_producer_tiles(sequence)
-    # hd256 tile T, chunk c, token t is hd128 head half c//4, tile T//2, chunk c%4, token
-    # (T%2)*64 + t.
-    hd256_raw = (
-        raw.reshape(batch, heads, 2, tiles, 4, 2, 64, 16)
-        .permute(0, 1, 3, 5, 2, 4, 6, 7)
-        .reshape(-1)
+    blocks = MHA_V4_HD256 // 32
+    raw = input.new_empty(
+        (mxfp4_k_raw_buffer_size(batch, sequence, heads * 2),), dtype=torch.uint8
     )
-    return hd256_raw, scale.reshape(batch, sequence, heads, MHA_V4_HD256 // 32)
+    # The scale image is head-major over the logical head, so hd128's is already hd256's: half h
+    # of head j is blocks [4h, 4h+4) of row j, which is what a (.., heads, 8) view reads.
+    scale = block_scale_storage(
+        input,
+        batch,
+        sequence,
+        heads,
+        blocks,
+        MHA_V4_KV_TILE_ROWS,
+        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    )
+    rotate_activation_mxfp4_quant_k(
+        raw, scale, half_heads, _or_empty(input, half_mean), 2
+    )
+    return raw, scale
 
 
 @quantize_mxfp4_k_hd256.register_fake
@@ -832,12 +850,8 @@ def _mxfp4_v_hd256_sizes(batch: int, sequence: int, heads: int) -> tuple[int, in
     tiles = mxfp4_producer_tiles(sequence)
     payload = batch * heads * 2 * tiles * MHA_V4_MXFP4_TILE_BYTES
     # mxfp4_v_view's last axis is the LOGICAL head dim over PACKED rows, so its final element
-    # reaches half a row past the payload. hd128's buffer carries a 64-byte version of this
-    # overhang; hd256's is twice as long. The hd128 packer's own buffer is the other lower bound.
-    allocation = max(
-        mxfp4_v_raw_buffer_size(batch, sequence, heads * 2),
-        payload + MHA_V4_HD256 // 2,
-    )
+    # reaches half a row past the payload.
+    allocation = payload + MHA_V4_HD256 // 2
     elements = batch * heads * 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
     return payload, allocation, elements
 
@@ -848,34 +862,16 @@ def quantize_v_mxfp4_fp6_p_hd256(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, _ = _validate_bshd_hd256(
         input, "hd256 MXFP4 V-for-FP6-P quantization"
     )
-    raw, scale = quantize_v_mxfp4_fp6_p(_hd256_half_heads(input))
     tiles = mxfp4_producer_tiles(sequence)
-    payload, allocation, _ = _mxfp4_v_hd256_sizes(batch, sequence, heads)
+    payload, allocation, elements = _mxfp4_v_hd256_sizes(batch, sequence, heads)
 
-    # hd256 PV unit u covers dv block u of 256; hd128 unit (u%4)*2 + (T%2) covers dv block u%4 of
-    # head half u//4 crossed with token half T%2, and every unit shares one in-unit byte map.
     hd256_raw = input.new_empty((allocation,), dtype=torch.uint8)
     hd256_raw[payload:].zero_()
-    hd256_raw[:payload].copy_(
-        raw[:payload]
-        .reshape(batch, heads, 2, tiles, 4, 2, MHA_V4_MXFP4_TILE_BYTES // 8)
-        .permute(0, 1, 3, 5, 2, 4, 6)
-        .reshape(-1)
-    )
-
-    # Both scale images are kblock*256 + X with the same X; hd128's kblock is the token half and
-    # hd256's is the head half, so the two 256-byte halves swap roles. The permute forces a copy,
-    # so re-reserve the zeroed slack the speculative tile gather reads past the end.
-    elements = batch * heads * 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
     storage = input.new_empty(
         (elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
     )
     storage[elements:].zero_()
-    storage[:elements].copy_(
-        scale.reshape(batch, heads, 2, tiles, 2, 256)
-        .permute(0, 1, 3, 4, 2, 5)
-        .reshape(-1)
-    )
+    _quantize_v_mxfp4_fp6_p_hip(hd256_raw, storage, _hd256_half_heads(input), 2)
     hd256_scale = storage[:elements].view(
         batch, heads, 2 * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
     )
