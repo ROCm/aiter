@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import socket
+import sys
 import time
 
 logger = logging.getLogger("aiter")
@@ -108,6 +109,38 @@ class FileBaton:
 
     @staticmethod
     def _pid_alive(pid):
+        if sys.platform == "win32":
+            # os.kill() on Windows calls TerminateProcess() for any signal
+            # other than CTRL_C/CTRL_BREAK_EVENT, so a `kill(pid, 0)` liveness
+            # probe would kill the very builder we are checking on.
+            import ctypes
+            from ctypes import wintypes
+
+            SYNCHRONIZE = 0x00100000
+            ERROR_ACCESS_DENIED = 5
+            WAIT_TIMEOUT = 0x102
+            # A private WinDLL, so the prototypes below do not leak into
+            # ctypes.windll, and so HANDLE is not truncated to the default c_int.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = (
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            )
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if not handle:
+                # Exists but owned by another user, like the PermissionError below.
+                return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+            try:
+                # Not GetExitCodeProcess: a process that exited with 259 is
+                # indistinguishable from STILL_ACTIVE there.
+                return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+            finally:
+                kernel32.CloseHandle(handle)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
