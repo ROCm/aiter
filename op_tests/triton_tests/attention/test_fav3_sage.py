@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+import aiter
 from aiter import logger
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
@@ -20,6 +21,7 @@ from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     rotation_smooth_qk,
+    sage_quant,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_mha_common import (
@@ -498,11 +500,18 @@ def _non_dense_qkv(kind, layout, batch, heads, seq, head_sz, dtype):
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 @pytest.mark.parametrize("smooth_k", [True, False])
 @pytest.mark.parametrize("q_smooth", [False, True])
-def test_sage_non_dense_inputs(kind, layout, smooth_k, q_smooth):
+@pytest.mark.parametrize("v_dtype", [None, torch.float16])
+def test_sage_non_dense_inputs(kind, layout, smooth_k, q_smooth, v_dtype):
     """Non-dense Q/K/V views must give the same result as contiguous copies."""
     q, k, v = _non_dense_qkv(kind, layout, 2, 4, 1020, 128, torch.bfloat16)
     assert not all(t.is_contiguous() for t in (q, k, v))
-    kwargs = {"layout": layout, "smooth_k": smooth_k, "q_smooth": q_smooth}
+    kwargs = {
+        "layout": layout,
+        "smooth_k": smooth_k,
+        "q_smooth": q_smooth,
+        "v_dtype": v_dtype,
+        "config": _sage_config(v_dtype),
+    }
     out = fav3_sage_wrapper_func(q, k, v, **kwargs)
     ref = fav3_sage_wrapper_func(
         q.contiguous(), k.contiguous(), v.contiguous(), **kwargs
@@ -512,6 +521,79 @@ def test_sage_non_dense_inputs(kind, layout, smooth_k, q_smooth):
     torch.testing.assert_close(
         _tensor_from_result(out), _tensor_from_result(ref), atol=tol, rtol=tol
     )
+
+
+def _sage_config(v_dtype):
+    """Launch config for a V type that may not be the arch default.
+
+    The gfx942/gfx950 tables (BLOCK_N=128) are sized for an FP8 V; with a
+    16-bit V they need more LDS than gfx942 has, so use BLOCK_N=64 there.
+    """
+    if v_dtype in (torch.float16, torch.bfloat16):
+        return get_sage_fwd_configs(block_n=64)
+    return None
+
+
+@pytest.mark.parametrize("v_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("v_in_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_quant_16bit_v_passthrough(v_dtype, v_in_dtype, layout):
+    """A 16-bit v_dtype passes V through unscaled; Q and K are unchanged."""
+    q, k, _ = input_helper(2, 8, 4, 200, 333, 128, 128, torch.bfloat16, layout)
+    v = torch.randn_like(k, dtype=v_in_dtype) * 100
+    fp8 = aiter.dtypes.fp8
+    ref = sage_quant(q, k, v, fp8, torch.finfo(fp8).max, layout=layout)
+    out = sage_quant(q, k, v, v_dtype, None, layout=layout)
+    for name, a, b in zip(("q", "q_scale", "k", "k_scale"), out[:4], ref[:4]):
+        torch.testing.assert_close(a, b, atol=0, rtol=0, msg=name)
+    v_out, v_scale = out[4], out[5]
+    assert v_out.dtype == v_dtype
+    if v_in_dtype == v_dtype:
+        assert v_out is v
+    torch.testing.assert_close(v_out, v.to(v_dtype), atol=0, rtol=0)
+    assert v_scale.shape == ref[5].shape and v_scale.dtype == torch.float32
+    assert torch.all(v_scale == 1)
+
+
+@pytest.mark.parametrize("v_dtype", [torch.float16, torch.bfloat16, "fp8"])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(1, 1), (128, 128), (200, 333)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(2, 1), (8, 8)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_v_dtype(v_dtype, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, layout):
+    """Each V type is tested on every arch, not only on the arch that defaults to it."""
+    if v_dtype == "fp8":
+        if not arch_info.is_fp8_avail():
+            pytest.skip("FP8 V requires an arch with FP8")
+        v_dtype = aiter.dtypes.fp8
+    HEAD_SZ = 128
+    q, k, v = input_helper(
+        2,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        torch.bfloat16,
+        layout,
+    )
+    triton_out = fav3_sage_wrapper_func(
+        q, k, v, layout=layout, config=_sage_config(v_dtype), v_dtype=v_dtype
+    )
+    if layout == "bhsd":
+        q, k, v = (t.transpose(1, 2).contiguous() for t in (q, k, v))
+    torch_out = attention_ref(q, k, v)[0]
+    if layout == "bhsd":
+        torch_out = torch_out.transpose(1, 2).contiguous()
+    check_attention_outputs(
+        triton_out, torch_out, fp8=True, atol=ATOL_fp8, rtol=RTOL_fp8
+    )
+
+
+def test_sage_v_dtype_rejects_other_types():
+    q, k, v = input_helper(1, 2, 2, 64, 64, 128, 128, torch.bfloat16, "bshd")
+    with pytest.raises(ValueError, match="v_dtype"):
+        fav3_sage_wrapper_func(q, k, v, v_dtype=torch.float32)
 
 
 @pytest.mark.parametrize("kind", ["seq_slice", "qkv_split"])

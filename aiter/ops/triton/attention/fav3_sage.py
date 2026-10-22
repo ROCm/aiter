@@ -105,7 +105,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
     the quantization internally, maintaining backward compatibility with
     high-precision training workflows.
 
-    Forward: BF16/FP32 -> Int8 (Q & K) + FP16 V -> sage_attn -> FP32 output
+    Forward: BF16/FP32 -> Int8 (Q & K) + FP8 or 16-bit V -> sage_attn -> FP32 output
     Backward: not supported yet
     """
 
@@ -131,6 +131,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         hadamard_rotation: bool = False,
         R: torch.Tensor | None = None,
         BLOCK_R: int | None = None,
+        v_dtype: torch.dtype | None = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -173,18 +174,23 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         # 3. Quantization
         # Note: softmax_scale is integrated into quantization descaling
         softmax_scale = softmax_scale or (head_dim**-0.5)
-        fp8_dtype = aiter.dtypes.fp8
-        fp8_max = torch.finfo(fp8_dtype).max
-        # Without FP8 matrix cores (RDNA3), Triton converts FP8 V to FP16 in
-        # software. Keep V in FP16 there: it is faster and more accurate.
-        v_dtype = fp8_dtype if arch_info.is_fp8_avail() else torch.float16
+        if v_dtype is None:
+            # Without FP8 matrix cores (RDNA3), Triton converts FP8 V to FP16
+            # in software. Keep V in FP16 there: it is faster and more accurate.
+            v_dtype = aiter.dtypes.fp8 if arch_info.is_fp8_avail() else torch.float16
+        if v_dtype in (torch.float16, torch.bfloat16):
+            v_dtype_max = None  # V is passed through, not scaled
+        elif v_dtype.is_floating_point and v_dtype.itemsize == 1:
+            v_dtype_max = torch.finfo(v_dtype).max
+        else:
+            raise ValueError(f"v_dtype must be FP8, FP16 or BF16, got {v_dtype}")
 
         sq_result = sage_quant(
             q,
             k,
             v,
             v_dtype,
-            fp8_max,
+            v_dtype_max,
             sm_scale=softmax_scale,
             BLKQ=BLKQ,
             BLKK=BLKK,
@@ -196,7 +202,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             R=R,
             BLOCK_R=BLOCK_R,
         )
-        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sq_result[:6]
+        q_int8, q_descale, k_int8, k_descale, v_out, v_descale = sq_result[:6]
         rest = sq_result[6:]
         delta_s = None
         sage_lse_delta = None
@@ -224,7 +230,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         out, softmax_lse = fav3_sage_func(
             q_int8,
             k_int8,
-            v_fp8,
+            v_out,
             q_descale,
             k_descale,
             v_descale,
@@ -277,6 +283,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # hadamard_rotation
             None,  # R
             None,  # BLOCK_R
+            None,  # v_dtype
         )
 
 
@@ -300,6 +307,7 @@ def fav3_sage_wrapper_func(
     hadamard_rotation: bool = False,
     R: torch.Tensor | None = None,
     BLOCK_R: int | None = None,
+    v_dtype: torch.dtype | None = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -335,6 +343,13 @@ def fav3_sage_wrapper_func(
         hadamard_rotation: Apply normalized Hadamard rotation to Q/K before INT8 quant
         R: Optional pre-built Hadamard matrix (BLOCK_R x BLOCK_R)
         BLOCK_R: Hadamard tile size when hadamard_rotation=True and R is None
+        v_dtype: Type of V in the P*V product. With FP8 (``aiter.dtypes.fp8``)
+                V is quantized with a per-channel scale. With FP16 or BF16, V
+                is passed through without scaling (cast if needed). Default
+                None: FP8 when the arch has FP8 (``arch_info.is_fp8_avail()``),
+                otherwise FP16. The gfx942 table is sized for FP8 V; a 16-bit
+                V there needs a smaller tile, e.g.
+                ``config=get_sage_fwd_configs(block_n=64)``.
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -386,6 +401,7 @@ def fav3_sage_wrapper_func(
         hadamard_rotation,
         R,
         BLOCK_R,
+        v_dtype,
     )
 
 
