@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -604,12 +605,26 @@ def read_json(json_path: str) -> ModelShapesData:
     return data
 
 
+def validate_result(value: float | str, handler: KernelHandler) -> float | str:
+    # Time, throughput, and bandwidth are always positive. Zero or negative is
+    # considered sentinel value.
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        print(f"Non-numeric result on {handler.to_str()}: {value!r}")
+        return "N/A"
+    if not math.isfinite(number) or number <= 0:
+        print(f"Invalid result on {handler.to_str()}: {value!r}")
+        return "N/A"
+    return value
+
+
 def call_function(
     bench_fn: Callable[[list[str]], None], handler: KernelHandler
-) -> str | None:
+) -> float | str:
     stdout = io.StringIO()
     stderr = io.StringIO()
-    raw_result: str | None = None
+    result: float | str = "N/A"
 
     try:
         with warnings.catch_warnings(record=True) as captured_warnings:
@@ -632,7 +647,7 @@ def call_function(
             # TODO: Replace this print statement with proper logging - error.
             print(f"Standard error stream isn't empty: [{stderr.getvalue()}]")
         else:
-            raw_result = stdout.getvalue()
+            result = validate_result(handler.parse_stdout(stdout.getvalue()), handler)
     except OutOfResources as e:
         # Parse the error message to extract required LDS and hardware limit.
         # Expected format: "out of resource: shared memory, Required: XXXX, Hardware limit: XXXX..."
@@ -655,7 +670,7 @@ def call_function(
 
     # Close matplotlib figures to silence errors and avoid memory leaks.
     plt.close("all")
-    return raw_result
+    return result
 
 
 def print_and_save_results(
@@ -749,11 +764,7 @@ def run_benchmarks(
                 for batch_size in batch_sizes:
                     for seq_len in seq_lens:
                         handler.set_iteration(shape, batch_size, seq_len)
-                        stdout = call_function(bench_fn, handler)
-                        if stdout is not None:
-                            bench_result = handler.parse_stdout(stdout)
-                        else:
-                            bench_result = "N/A"
+                        bench_result = call_function(bench_fn, handler)
                         results.append(handler.build_result_row(bench_result))
     return results
 
