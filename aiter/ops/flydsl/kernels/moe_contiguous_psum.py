@@ -352,17 +352,15 @@ def build_moe_contiguous_psum_remap_module(packed_expert_map: bool = False):
                 fine_tile = fx.Uint32(expert_tile_m)
                 map_start = fx.Uint32(starts_lds[e]) // fine_tile
                 map_count = aligned_rows // fine_tile
-                for local_tile in range(0, map_count):
+                for local_tile in range(map_count):
                     if const_expr(packed_expert_map):
                         expert_end = fx.Uint32(starts_lds[e]) + m_e
                         expert_bits = fx.Int64(e)
                         if local_tile > 0:
-                            # bit 31 is a flag for if this expert's weights are reusable. 
+                            # bit 31 is a flag for if this expert's weights are reusable.
                             # for reuse_resident_b policy
                             expert_bits = expert_bits | fx.Int64(1 << 31)
-                        packed = (
-                            fx.Int64(expert_end) << fx.Int64(32)
-                        ) | expert_bits
+                        packed = (fx.Int64(expert_end) << fx.Int64(32)) | expert_bits
                         expert_map_p[map_start + fx.Uint32(local_tile)] = packed
                     else:
                         expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(e)
@@ -724,8 +722,7 @@ def build_moe_route_psum_fused_module(emit_aux: bool = True):
             safe_lane = active.select(lane, fx.Int32(0))
             wave_total = active.select(lds0[safe_lane], fx.Int32(0))
             wave_offset = (
-                _warp_inclusive_prefix_i32(wave_total, lane, wave_size)
-                - wave_total
+                _warp_inclusive_prefix_i32(wave_total, lane, wave_size) - wave_total
             )
             if active:
                 lds0[lane] = wave_offset
@@ -741,13 +738,11 @@ def build_moe_route_psum_fused_module(emit_aux: bool = True):
             p_p[tid] = start + m_tid
             expert_map_is_set = fx.Int64(ptrtoint(expert_tile_map)) != 0
             if expert_map_is_set:
-                aligned_rows = (
-                    fx.Uint32(m_tid) + tile_minus_1
-                ) // tile_v * tile_v
+                aligned_rows = (fx.Uint32(m_tid) + tile_minus_1) // tile_v * tile_v
                 fine_tile = fx.Uint32(expert_tile_m)
                 map_start = fx.Uint32(start) // fine_tile
                 map_count = aligned_rows // fine_tile
-                for local_tile in range(0, map_count):
+                for local_tile in range(map_count):
                     expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(tid)
         gpu.barrier()
 

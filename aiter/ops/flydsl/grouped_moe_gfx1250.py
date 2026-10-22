@@ -603,7 +603,7 @@ def _grouped_a8w4_tdm_moe(
     defer_output_store_wait=0,
     defer_output_store_wait2=0,
     gather_fuse_token_iters=0,  # grid = tokens, less workgroups. compute bound perf
-    gather_setprio=0, # sparse grids get scheduled quicker
+    gather_setprio=0,  # sparse grids get scheduled quicker
     gather_batch_loads=0,  # batches helps prefill overlap bandwidth latency
     lds_n_partitions=1,
     lds_n_partitions2=1,
@@ -728,7 +728,7 @@ def _grouped_a8w4_tdm_moe(
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
-    # Alignment-gap suppression is useful in decode, with fewer activated experts. 
+    # Alignment-gap suppression is useful in decode, with fewer activated experts.
     # Heuristic to check for how dense the routing is to determine decode vs prefill.
     _routed_rows = int(token_num) * int(topk)
     _routing_density = (_routed_rows + int(E) - 1) // int(E)
@@ -738,18 +738,13 @@ def _grouped_a8w4_tdm_moe(
     # Handling for decode routing activating fewer experts than prefill.
     # Skips excess padding tiles to avoid computations treating padding as
     # computable rows and loading dead/unnecessary resources
-    _direct_expert_map = (
-        expert_mask is None
-        and not _compact
-    )
+    _direct_expert_map = expert_mask is None and not _compact
     # check policy conditions
     _packed_expert_map = _direct_expert_map and bool(packed_expert_map)
-    _stage2_contiguous_tasks = bool(
-        persistent_contiguous_tasks2
-    ) and not _sparse_routing
-    _stage2_reuse_resident_b = _stage2_contiguous_tasks and bool(
-        reuse_resident_b2
+    _stage2_contiguous_tasks = (
+        bool(persistent_contiguous_tasks2) and not _sparse_routing
     )
+    _stage2_reuse_resident_b = _stage2_contiguous_tasks and bool(reuse_resident_b2)
     _sparse_row_cap = min(int(E), _routed_rows) * _align_m
     _stage1_task_cap = (
         (_sparse_row_cap + int(tile_m) - 1)
@@ -910,9 +905,11 @@ def _grouped_a8w4_tdm_moe(
     else:
         _fuse_ep_route_quant = False
         if _fuse_local_route_psum_check:
-            emit_route_aux = os.environ.get(
-                "AITER_TDM_FUSED_ROUTE_EMIT_AUX", "0"
-            ) in ("1", "true", "True")
+            emit_route_aux = os.environ.get("AITER_TDM_FUSED_ROUTE_EMIT_AUX", "0") in (
+                "1",
+                "true",
+                "True",
+            )
             _masked_m, topids_to_rows, psum, _m_expert_tile_map = (
                 fused_route_psum_remap(
                     topk_ids,
@@ -993,9 +990,7 @@ def _grouped_a8w4_tdm_moe(
             E,
             max_m,
             _align_m,
-            expert_tile_m=(
-                min(tile_m, tile_m2) if _direct_expert_map else None
-            ),
+            expert_tile_m=(min(tile_m, tile_m2) if _direct_expert_map else None),
             packed_expert_map=_packed_expert_map,
             num_valid_routes=_ep_nvr,
             ep_scatter_params=ep_scatter_params,
@@ -1848,27 +1843,19 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["tdm_b_th2"] = _as_int(
                 cfg_row.get("tdm_b_th2"), _tdm_kw["tdm_b_th"]
             )
-            shared_lds_interleave = _as_int(
-                cfg_row.get("lds_soa_load_interleave"), 0
-            )
+            shared_lds_interleave = _as_int(cfg_row.get("lds_soa_load_interleave"), 0)
             _tdm_kw["lds_soa_load_interleave"] = _as_int(
                 cfg_row.get("lds_soa_load_interleave1"), shared_lds_interleave
             )
             _tdm_kw["lds_soa_load_interleave2"] = _as_int(
                 cfg_row.get("lds_soa_load_interleave2"), shared_lds_interleave
             )
-            _tdm_kw["force_mid_compute"] = _as_int(
-                cfg_row.get("force_mid_compute1"), 0
-            )
+            _tdm_kw["force_mid_compute"] = _as_int(cfg_row.get("force_mid_compute1"), 0)
             _tdm_kw["force_mid_compute2"] = _as_int(
                 cfg_row.get("force_mid_compute2"), 0
             )
-            _tdm_kw["linear_wg_map"] = _as_int(
-                cfg_row.get("linear_wg_map1"), 0
-            )
-            _tdm_kw["linear_wg_map2"] = _as_int(
-                cfg_row.get("linear_wg_map2"), 0
-            )
+            _tdm_kw["linear_wg_map"] = _as_int(cfg_row.get("linear_wg_map1"), 0)
+            _tdm_kw["linear_wg_map2"] = _as_int(cfg_row.get("linear_wg_map2"), 0)
             _tdm_kw["reuse_persistent_map_loads"] = _as_int(
                 cfg_row.get("reuse_persistent_map_loads1"), 0
             )
@@ -1891,18 +1878,10 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["gather_batch_loads"] = _as_int(
                 cfg_row.get("gather_batch_loads"), int(token_num >= 8192)
             )
-            _tdm_kw["lds_n_partitions"] = _as_int(
-                cfg_row.get("lds_n_partitions1"), 1
-            )
-            _tdm_kw["lds_n_partitions2"] = _as_int(
-                cfg_row.get("lds_n_partitions2"), 1
-            )
-            _tdm_kw["ds_first_n"] = _as_int(
-                cfg_row.get("ds_first_n1"), 0
-            )
-            _tdm_kw["ds_first_n2"] = _as_int(
-                cfg_row.get("ds_first_n2"), 0
-            )
+            _tdm_kw["lds_n_partitions"] = _as_int(cfg_row.get("lds_n_partitions1"), 1)
+            _tdm_kw["lds_n_partitions2"] = _as_int(cfg_row.get("lds_n_partitions2"), 1)
+            _tdm_kw["ds_first_n"] = _as_int(cfg_row.get("ds_first_n1"), 0)
+            _tdm_kw["ds_first_n2"] = _as_int(cfg_row.get("ds_first_n2"), 0)
             _tdm_kw["mma_prio"] = _as_int(cfg_row.get("mma_prio1"), 0)
             _tdm_kw["mma_prio2"] = _as_int(cfg_row.get("mma_prio2"), 0)
             _tdm_kw["route_lds_reduction"] = _as_int(
@@ -1911,12 +1890,8 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["persistent_contiguous_tasks2"] = _as_int(
                 cfg_row.get("persistent_contiguous_tasks2"), 0
             )
-            _tdm_kw["packed_expert_map"] = _as_int(
-                cfg_row.get("packed_expert_map"), 0
-            )
-            _tdm_kw["reuse_resident_b2"] = _as_int(
-                cfg_row.get("reuse_resident_b2"), 0
-            )
+            _tdm_kw["packed_expert_map"] = _as_int(cfg_row.get("packed_expert_map"), 0)
+            _tdm_kw["reuse_resident_b2"] = _as_int(cfg_row.get("reuse_resident_b2"), 0)
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
             # GEMM1 always has a local epilogue; stage2_scatter only changes
             # GEMM2, so it does not restrict GEMM1's persistent scheduler.
@@ -2145,21 +2120,12 @@ def fused_route_psum_remap(
             f"use flydsl_moe_topids_to_rows + contiguous_psum_remap instead"
         )
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
-    masked_m = torch.empty(
-        experts if emit_aux else 0, dtype=torch.int32, device=device
-    )
-    starts = torch.empty(
-        experts if emit_aux else 0, dtype=torch.int32, device=device
-    )
+    masked_m = torch.empty(experts if emit_aux else 0, dtype=torch.int32, device=device)
+    starts = torch.empty(experts if emit_aux else 0, dtype=torch.int32, device=device)
     psum = torch.empty(experts, dtype=torch.int32, device=device)
     expert_tile_map = (
         torch.empty(
-            (
-                numel
-                + experts * int(tile_m)
-                + int(expert_tile_m)
-                - 1
-            )
+            (numel + experts * int(tile_m) + int(expert_tile_m) - 1)
             // int(expert_tile_m),
             dtype=torch.int32,
             device=device,
@@ -2247,12 +2213,7 @@ def contiguous_psum_remap(
     topids_flat = topids_to_rows.reshape(-1)
     expert_tile_map = (
         torch.empty(
-            (
-                int(topids_flat.numel())
-                + experts * int(tile_m)
-                + int(expert_tile_m)
-                - 1
-            )
+            (int(topids_flat.numel()) + experts * int(tile_m) + int(expert_tile_m) - 1)
             // int(expert_tile_m),
             dtype=torch.int64 if packed_expert_map else torch.int32,
             device=device,

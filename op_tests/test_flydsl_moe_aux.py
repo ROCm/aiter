@@ -881,9 +881,9 @@ def test_route_psum_fused(numel, E, tile_m):
             ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
         ), f"{name}: row outside its expert's contiguous band"
         tile_experts = expert_tile_map.cpu().long()[r // tile_m]
-        assert bool((tile_experts == ids).all()), (
-            f"{name}: expert tile map disagrees with routed rows"
-        )
+        assert bool(
+            (tile_experts == ids).all()
+        ), f"{name}: expert tile map disagrees with routed rows"
         assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
         ret[f"{name} us"] = us
         ret[f"{name} TB/s"] = nbytes / us / 1e6

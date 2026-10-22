@@ -208,7 +208,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     ):
         raise ValueError("persistent and pipeline policies must be 0 or 1")
     if persistent_single_task and not persistent_workers:
-        persistent_single_task = 0 
+        persistent_single_task = 0
     if lds_n_partitions not in (1, 2, 4, 8):
         raise ValueError("lds_n_partitions must be 1, 2, 4, or 8")
     if persistent_workers:

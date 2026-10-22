@@ -186,14 +186,12 @@ def build_moe_gather_reduce_module(
                 if meta_lane < topk_i32:
                     map_off = map_base + meta_lane
                     row_on_lane = fx.Int32(rows_t[map_off])
-                    weight_on_lane = w_dt_fx(w_t[map_off]).to(
-                        fx.Float32
-                    ).bitcast(fx.Int32)
+                    weight_on_lane = (
+                        w_dt_fx(w_t[map_off]).to(fx.Float32).bitcast(fx.Int32)
+                    )
 
                 def _row_weight(k):
-                    row_i32 = fx.Int32(
-                        fx.rocdl.readlane(T.i32, row_on_lane, k)
-                    )
+                    row_i32 = fx.Int32(fx.rocdl.readlane(T.i32, row_on_lane, k))
                     w_f32 = fx.Int32(
                         fx.rocdl.readlane(T.i32, weight_on_lane, k)
                     ).bitcast(fx.Float32)
@@ -246,14 +244,14 @@ def build_moe_gather_reduce_module(
                 dw_base = thread_id * vec_i32 + iter_idx_i32 * DWORDS_PER_ITER
                 dw_valid = dw_base < out_dwords_i32
                 if dw_valid:
-                    full_valid = dw_base + vec_i32 <= out_dwords_i32  # four dwords are inside the model dim
+                    full_valid = (
+                        dw_base + vec_i32 <= out_dwords_i32
+                    )  # four dwords are inside the model dim
                     if full_valid:
                         # register fragment
                         acc = [fx.Float32(0.0) for _ in range(2 * VEC)]
                         vec_atom = buf_copy_atom(VEC * 4)
-                        out_vec_t = ptr_buf_tensor(
-                            out, unit_elems=VEC, unit_stride=1
-                        )
+                        out_vec_t = ptr_buf_tensor(out, unit_elems=VEC, unit_stride=1)
                         frag = fx.make_fragment_like(fx.slice(out_vec_t, (0, None)))
 
                         # batched route handling
@@ -274,9 +272,7 @@ def build_moe_gather_reduce_module(
                                     lo_f32, hi_f32 = _unpack_pair_to_f32(
                                         raw_dw, out_dtype
                                     )
-                                    acc[2 * lane] = (
-                                        acc[2 * lane] + weights[k] * lo_f32
-                                    )
+                                    acc[2 * lane] = acc[2 * lane] + weights[k] * lo_f32
                                     acc[2 * lane + 1] = (
                                         acc[2 * lane + 1] + weights[k] * hi_f32
                                     )
@@ -300,8 +296,7 @@ def build_moe_gather_reduce_module(
                                         acc[2 * lane] + w_f32 * red[2 * lane]
                                     )
                                     acc[2 * lane + 1] = (
-                                        acc[2 * lane + 1]
-                                        + w_f32 * red[2 * lane + 1]
+                                        acc[2 * lane + 1] + w_f32 * red[2 * lane + 1]
                                     )
                         packed = [
                             _pack_pair_from_f32(
@@ -340,9 +335,7 @@ def build_moe_gather_reduce_module(
                                         red_hi = red_hi + hi_f32
                                     acc_lo = acc_lo + w_f32 * red_lo
                                     acc_hi = acc_hi + w_f32 * red_hi
-                                out_t[
-                                    out_row_dw_base + dw_idx
-                                ] = _pack_pair_from_f32(
+                                out_t[out_row_dw_base + dw_idx] = _pack_pair_from_f32(
                                     acc_lo, acc_hi, out_dtype
                                 )
 
