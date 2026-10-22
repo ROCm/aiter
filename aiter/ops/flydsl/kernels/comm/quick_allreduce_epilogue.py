@@ -12,7 +12,8 @@ RMSNorm ones.
 At build time an epilogue fixes ``block`` and the HBM geometry (``spec()``,
 ``tag``, ``hbm_tile_bytes``, ``partial_floats`` -- per-wave LDS partials the
 kernel allocates for it). ``takes_operands`` picks the launcher: the plain one
-passes zeros for the residual, weight and eps arguments.
+passes zeros for the residual, weight, eps, Gemma bias and MXFP4 output
+arguments.
 
 In the kernel body ``bind`` returns an object with:
 

@@ -58,9 +58,9 @@ TIGHT_RTOL = 2e-2
 TIGHT_ATOL = 2e-2
 TIGHT_ERR_RATIO = 0.01
 # (tokens, hidden, gemma_norm, inplace_residual). tokens=1 at hidden=2048 is a
-# single partial tile; 37 rows leave a partial last tile at every hidden. Up to
-# 512 tiles (16 MiB) on a 256-CU part run the ST=1 latency build; 1536x8192 and
-# 3072x4096 (768 tiles) the occupancy-pinned ST=1 build; larger ones ST=8.
+# single partial tile; 37 rows leave a partial last tile at every hidden; 6144
+# is a width with a non-power-of-two block; the large ones reach the higher
+# super-tile rungs of the ladder.
 _VALIDITY_CASES = [
     (1, 2048, False, False),
     (37, 2048, False, False),

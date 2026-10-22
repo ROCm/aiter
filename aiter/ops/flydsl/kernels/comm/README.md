@@ -162,6 +162,17 @@ because the FlyDSL AST rewriter sees only the `@flyc.kernel` body and
 `@flyc.jit` functions. The one-shot's split-row exchange is a `@flyc.jit`
 helper for that reason.
 
+The quick-reduce RMSNorm epilogue has two extras, both used through
+`FlyQuickAllReduceRMSNorm` directly and not routed by the dispatcher:
+
+* `gemma_norm=True` scales by `1 + weight`. It is a runtime kernel operand
+  (`w_bias`), so it shares the engines of the usual build.
+* `allreduce_rmsnorm_mxfp4` also quantizes `out` to MXFP4 (gfx950, unpadded
+  hidden): packed fp4x2 values and shuffled e8m0 scales, bit for bit what
+  `per_1x32_f4_quant_hip(out, shuffle=True)` returns. It is a compile-time
+  variant (`mxfp4=True`) of the epilogue, so it gets its own engines, built on
+  first use or by `preload(hidden, mxfp4=True)`.
+
 A split row (one token row over several workgroups; opt-in with
 `AITER_FLY_AR_FUSED_SPLIT=1`) joins its sum of squares
 through an integer atomic in HBM, so that every rank decodes the same bits. The
@@ -207,7 +218,8 @@ read the same ladders, or the fused path declines.
 The fused path declines a call if:
 
 * a tensor is not bf16, not contiguous, or not 16-byte aligned,
-* the caller asks for gemma norm or a padded output,
+* the caller asks for gemma norm or a padded output (the quick-reduce
+  classes themselves accept `gemma_norm`; the dispatcher does not route it),
 * no build exists for the hidden size. One workgroup covers one row, so only
   some widths are supported, some of them with padding.
 

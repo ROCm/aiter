@@ -10,6 +10,11 @@ holding ``rows_per_tile`` whole rows, and every chunk the ring completes is
 ``rows_per_chunk`` whole rows, so the norm runs inside the op that receives it
 rather than waiting for the tile to be reassembled.
 
+``mxfp4=True`` additionally quantizes each finished ``out`` atom to MXFP4 in
+place (:meth:`_BoundQuickReduceRMSNorm._store_mxfp4`), so the schedules need no
+hook for it. A 32-element scale group is four lanes of one atom, which is why
+it stays inside the row the epilogue already owns.
+
 The fused operands -- input, residual, weight and the final output -- are read
 as raw bf16 atoms through ``quick_allreduce_fusions.RowIO`` rather than the
 plain path's ``_payload_io``. At ``h_pad != hidden`` the wire tile is wider than
