@@ -2253,7 +2253,6 @@ def compile_ops(
                     return None
 
                 def check_args():
-                    get_asm_dir()
                     import inspect
                     import re
 
