@@ -201,6 +201,11 @@ def skip_reason(mod, cfg, ck_excluded=frozenset()):
 def run_one(mod):
     env = dict(os.environ)
     env.setdefault("GPU_ARCHS", "gfx1250-strict")
+    # torch's cpp_extension takes --offload-arch from PYTORCH_ROCM_ARCH, not
+    # from GPU_ARCHS. Without this the modules compile for torch's own default
+    # arch list (gfx90a..gfx1151) and the matrix says nothing about the target
+    # being validated -- every row would be a result for the wrong arches.
+    env.setdefault("PYTORCH_ROCM_ARCH", env["GPU_ARCHS"])
     p = subprocess.run(
         [sys.executable, "-c", CHILD.format(repo=REPO), mod],
         capture_output=True,
@@ -213,6 +218,11 @@ def run_one(mod):
     if "BUILD_OK" in out:
         return "pass", ""
     tail = "\n".join(out.strip().splitlines()[-15:])
+    # ninja echoes the whole compile command on failure, which pushes the
+    # actual diagnostic out of a plain tail. Keep the error lines too.
+    errors = [ln for ln in out.splitlines() if "error:" in ln.lower()][:5]
+    if errors:
+        tail = "ERRORS:\n" + "\n".join(errors) + "\n--- tail ---\n" + tail
     if "NO_SUCH_MODULE" in out:
         return "missing", tail
     return "fail", tail
