@@ -23,7 +23,6 @@ import aiter.ops.unified_attention as ua
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.quant import per_tensor_quant
-from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 PAGE, H, HKV, D = 64, 64, 4, 128
@@ -122,7 +121,7 @@ def shuffle_kv_cache(
     """
     dtype = key_cache.dtype
     assert value_cache.dtype == dtype
-    assert dtype in (torch.bfloat16, e4m3_dtype)
+    assert dtype in (torch.bfloat16, dtypes.fp8)
 
     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
     num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
