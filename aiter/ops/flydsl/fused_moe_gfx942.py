@@ -366,11 +366,14 @@ def _run_prefill(
         problem.model_dim
         + config.down_output_padding_bytes // hidden_states.element_size()
     )
+    # Sorting merges repeated expert IDs of a token; skipped slots read this zero row.
+    zero_row = sorted_expert_ids.shape[0] * config.BLOCK_M
     gemm2_out = torch.empty(
-        [sorted_expert_ids.shape[0] * config.BLOCK_M, output_row_size],
+        [zero_row + 1, output_row_size],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
+    gemm2_out[zero_row].zero_()
     down_kernel = _get_compiled_kernel(
         N=problem.model_dim,
         K=problem.inter_dim,
@@ -422,8 +425,9 @@ def _run_prefill(
     else:
         _launch(down_kernel, *down_args)
 
-    loc_ids = torch.empty(
+    loc_ids = torch.full(
         [problem.batch, problem.topk],
+        zero_row,
         dtype=torch.int32,
         device=hidden_states.device,
     )
