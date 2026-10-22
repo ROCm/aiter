@@ -666,11 +666,13 @@ class TestTunePipeline(unittest.TestCase):
                 self.assertIn("kernelName2", df.columns)
                 self.assertTrue(df["kernelName1"].fillna("").str.strip().ne("").all())
                 self.assertTrue(df["kernelName2"].fillna("").str.strip().ne("").all())
-            for _, row in df.iterrows():
-                us = float(row.get("us", -1))
-                self.assertNotEqual(
-                    us, 0, f"{name} ({mp_label}): us == 0 for {dict(row)}"
-                )
+            # fhmoe tuned rows carry no `us` column; only check families that do.
+            if "us" in df.columns:
+                for _, row in df.iterrows():
+                    us = float(row["us"])
+                    self.assertNotEqual(
+                        us, 0, f"{name} ({mp_label}): us == 0 for {dict(row)}"
+                    )
 
     def test_a8w8_mp1(self):
         self._run_one("a8w8", mp=1)
