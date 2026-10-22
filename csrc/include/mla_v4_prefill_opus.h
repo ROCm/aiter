@@ -2159,7 +2159,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
 
     int lane_id = thread_id_x() % T::WARP_SIZE;
     if constexpr (!T::SPLIT) {
-        asm volatile("" : "+v"(lane_id));  // break CSE
+        asm volatile("" : "+v"(lane_id));  // Intended to block CSE with the thread-index expression.
     }
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
