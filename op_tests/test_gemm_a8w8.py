@@ -20,6 +20,7 @@ from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.test_common import assertAllclose, benchmark, checkAllclose, perftest
+from aiter.utility.fp4_utils import e8m0_to_f32
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -77,8 +78,8 @@ def run_torch(
 ):
     # MXFP8 reference scales are unswizzled E8M0, one per 32 elements along K.
     if quant_mode in ("mxfp8-unswizzled", "mxfp8-swizzled"):
-        x_scale = x_scale.float().repeat_interleave(32, dim=1)
-        w_scale = w_scale.float().repeat_interleave(32, dim=1)
+        x_scale = e8m0_to_f32(x_scale).repeat_interleave(32, dim=1)
+        w_scale = e8m0_to_f32(w_scale).repeat_interleave(32, dim=1)
     x = x.to(dtypes.fp32) * x_scale
     weight = weight.to(dtypes.fp32) * w_scale
     out = F.linear(x, weight)
