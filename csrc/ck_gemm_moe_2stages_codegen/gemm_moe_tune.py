@@ -7285,6 +7285,12 @@ class FhmoeTuner(FmoeTuner):
         in_datas = []
         for _, row in untunedf.iterrows():
             shape = self._parse_fhmoe_row(row)
+            padded = self._lookup_token(shape["token"])
+            if padded != shape["token"]:
+                raise ValueError(
+                    f"FHMoE token {shape['token']} is not a serving bucket "
+                    f"(get_padded_M -> {padded}); use power-of-two tokens"
+                )
             info = tuple(shape[k] for k in self.keys)
             pairs = self._kernel_pairs(shape)
             print(
