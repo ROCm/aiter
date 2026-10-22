@@ -164,7 +164,7 @@ def build_topk_per_row_decode_module(
                 fx.get_iter(logits_row), packed_start + row_start
             )
             seg_len = row_end - row_start
-            part_offset_bytes = fx.Int64(part * fx.Int32(k)) * fx.Int64(4)
+            part_offset_bytes = fx.Int64(part * fx.Int32(k)) * 4
             index_addr = direct_row.select(
                 fx.Int64(ptrtoint(fx.get_iter(final_indices))),
                 fx.Int64(ptrtoint(fx.get_iter(part_indices))) + part_offset_bytes,
@@ -208,9 +208,9 @@ def build_topk_per_row_decode_module(
             gpu.barrier()
             if tid == 0:
                 fence_agent_release()
-                counter_addr = fx.Int64(ptrtoint(fx.get_iter(counters))) + fx.Int64(
-                    row
-                ) * fx.Int64(4)
+                counter_addr = (
+                    fx.Int64(ptrtoint(fx.get_iter(counters))) + fx.Int64(row) * 4
+                )
                 arrived = fx.Int32(atomic_add_agent(counter_addr, one))
                 is_last = arrived == active_parts - one
                 if is_last:
@@ -225,7 +225,7 @@ def build_topk_per_row_decode_module(
                 fx.make_view(
                     fx.get_iter(part_indices), fx.make_layout(_MAX_ROW_ELEMENTS, 1)
                 ),
-                num_records_bytes=fx.Int64(merge_len) * fx.Int64(4),
+                num_records_bytes=fx.Int64(merge_len) * 4,
             )
             run_one_block_body(
                 storage,
