@@ -43,3 +43,7 @@ H64 keeps its previous kernels. Small changes there are measurement variation. O
 | 320 / 8192 / 256 | 53.51 | 53.50 | 53.73 | 53.61 |
 | 1024 / 8192 / 1152 | 432.39 | 433.55 | 429.84 | 428.81 |
 | 512 / 32768 / 1152 | 221.69 | 221.96 | 220.51 | 220.71 |
+
+## Implementation diagram
+
+[Legacy / paged addressing and fused pipeline](fused_dsv41_pr_v41_implementation.md) includes a source-linked SVG and an offline interactive HTML example.

@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1630" viewBox="0 0 1440 1630" role="img" aria-labelledby="title desc">
+<title id="title">DSV4.1 fused attention：legacy / paged 寻址与 N64 实现细节</title>
+<desc id="desc">两种 KV 寻址汇合到同一 attention 流水线。展示 Q 准备、索引检查、QK 和 PV 的 wave 分工、softmax、输出融合及 LDS 大小。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#64748b"/></marker></defs>
+<style>text{font-family:Inter,'Segoe UI','Microsoft YaHei',sans-serif;fill:#172b46}.hero{font-size:30px;font-weight:700}.section{font-size:21px;font-weight:700}.label{font-size:18px;font-weight:650}.body{font-size:16px}.small{font-size:14px;fill:#52647a}.mono{font:16px Consolas,monospace}.badge{font-size:14px;fill:#156d67;font-weight:650}.dim{opacity:.25}a:hover text{fill:#146ac1;text-decoration:underline}</style>
+<rect width="1440" height="1630" fill="#f3f6fb"/>
+<text x="40" y="53" class="hero">DSV4.1 · Fused attention 实现图</text>
+<text x="40" y="84" class="body">PR v41 16mx4 / 64nx1 主体 · H128 · D512 · 一次 launch 融合 Q 准备与输出量化</text>
+<text x="1040" y="53" class="small">源码：1daf14d246 · 2026-10-22</text>
+<text x="40" y="130" class="section">01  KV 缓存：相同数值，不同索引与布局</text>
+<g id="legacy-path">
+<rect x="40" y="148" width="670" height="238" rx="14" fill="#eef6ff" stroke="#cfdae7"/>
+<text x="60" y="179" class="label">Legacy · cache_page_size = 0</text>
+<text x="60" y="209" class="body">索引：int64 tagged byte offset</text>
+<text x="60" y="234" class="body">offset = uint64(encoded_id) &gt;&gt; 1</text>
+<text x="60" y="259" class="body">data = pool + offset；scale = pool + offset + 512</text>
+<text x="60" y="284" class="body">合法：id ≥ 0、(id &amp; 7) = 1、完整 528 B 落在 pool 内</text>
+<rect x="60" y="310" width="433" height="35" rx="5" fill="#bedbff" stroke="#a2c5ec"/>
+<rect x="493" y="310" width="190" height="35" rx="5" fill="#fce6b5" stroke="#e4cd9a"/>
+<text x="77" y="334" class="body">一条记录：FP8 KV · 512 B</text>
+<text x="508" y="334" class="body">E8M0 scale · 16 B</text>
+<text x="60" y="371" class="small">支持任意合法的 4 B 对齐偏移；记录间距不必固定为 528 B。</text>
+</g><g id="paged-path">
+<rect x="730" y="148" width="670" height="238" rx="14" fill="#edf9f6" stroke="#cfdae7"/>
+<text x="750" y="179" class="label">Paged · 当前新路径专门支持 B128</text>
+<text x="750" y="209" class="body">索引：int32 物理 row ID；page = row / 128，slot = row % 128</text>
+<text x="750" y="234" class="body">data = pool + page × data_stride + slot × 512</text>
+<text x="750" y="259" class="body">scale = scales + page × scale_stride + slot × 16</text>
+<text x="750" y="284" class="body">合法：0 ≤ row &lt; cache_rows（由 data / scale 实际长度共同约束）</text>
+<rect x="750" y="310" width="368" height="35" rx="5" fill="#b4e6dc" stroke="#97cabc"/>
+<rect x="1128" y="310" width="250" height="35" rx="5" fill="#fce6b5" stroke="#e4cd9a"/>
+<text x="767" y="334" class="body">data 页：128 × 512 B</text>
+<text x="1144" y="334" class="body">scale 页：128 × 16 B</text>
+<text x="750" y="371" class="small">两个 base / 两个 byte stride；本内核没有 block-table 查询。</text>
+</g>
+<path d="M375 386 L375 418" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M1065 386 L1065 418" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="40" y="418" width="1360" height="103" rx="14" fill="#fff" stroke="#cfdae7"/>
+<text x="60" y="449" class="label">02  CTA 入口 · grid = (T, 2)；256 threads = 4 × wave64；每 CTA 处理 1 query × 64 heads</text>
+<text x="60" y="478" class="body">先 clamp CSR 范围，再协作扫描该 query 的索引；每个 CTA 各检查一次。</text>
+<g id="valid-path">
+<text x="60" y="506" class="badge">全部合法 → CHECKED=false，tile 循环仅保留尾块 mask</text>
+</g>
+<g id="checked-path">
+<text x="715" y="506" class="badge">含非法索引 → CHECKED=true，安全零记录 + score = −∞</text>
+</g>
+<path d="M720 521 L720 551" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="40" y="582" class="section">03  Q 准备与 N64 attention（两种缓存共用）</text>
+<g id="raw-q">
+<rect x="40" y="601" width="670" height="104" rx="14" fill="#f1edff" stroke="#cfdae7"/>
+<text x="60" y="632" class="label">Raw Q · 在 CTA 内完成</text>
+<text x="60" y="662" class="body">BF16 Q → 可选 RoPE（末 64 维）→ BF16 舍入</text>
+<text x="60" y="687" class="body">group32 E8M0 scale / E4M3 FP8 quant → Q LDS → Q AGPR</text>
+</g><g id="prepared-q">
+<rect x="730" y="601" width="670" height="104" rx="14" fill="#f1edff" stroke="#cfdae7"/>
+<text x="750" y="632" class="label">Prepared Q · 直接加载</text>
+<text x="750" y="662" class="body">读取已有 FP8 Q + E8M0 scale → Q AGPR</text>
+<text x="750" y="687" class="body">Q 在 KV tile 循环中驻留；Q staging 复用已有 LDS 区域</text>
+</g>
+<path d="M375 705 L375 733" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M1065 705 L1065 733" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="40" y="733" width="1360" height="245" rx="14" fill="#fff" stroke="#a6bbd3"/>
+<text x="60" y="765" class="label">每次处理 64 条 KV：双缓冲加载 → QK → online softmax → PV → 更新 O</text>
+<rect x="60" y="786" width="285" height="150" rx="14" fill="#eef6ff" stroke="#cfdae7"/>
+<text x="80" y="817" class="label">Global → LDS</text>
+<text x="80" y="847" class="body">FP8 KV + E8M0 scale</text>
+<text x="80" y="872" class="body">两套 K / scale staging</text>
+<text x="80" y="897" class="body">V 反量化为 BF16</text>
+<rect x="371" y="786" width="285" height="150" rx="14" fill="#edf9f6" stroke="#cfdae7"/>
+<text x="391" y="817" class="label">QK · FP8 scaled MFMA</text>
+<text x="391" y="847" class="body">Q × Kᵀ → FP32 scores</text>
+<text x="391" y="872" class="body">每 wave：16 heads × N64</text>
+<text x="391" y="897" class="body">沿完整 D512 归约</text>
+<rect x="682" y="786" width="335" height="150" rx="14" fill="#fff5e4" stroke="#cfdae7"/>
+<text x="702" y="817" class="label">Online softmax</text>
+<text x="702" y="847" class="body">true_max 与 FP32 exp-sum</text>
+<text x="702" y="872" class="body">P 转 BF16，经 LDS 跨 wave 交换</text>
+<text x="702" y="897" class="body">m_row 保留延迟 rescale 策略</text>
+<rect x="1043" y="786" width="337" height="150" rx="14" fill="#f1edff" stroke="#cfdae7"/>
+<text x="1063" y="817" class="label">PV · BF16 MFMA</text>
+<text x="1063" y="847" class="body">P × V → FP32 O 累加</text>
+<text x="1063" y="872" class="body">每 wave：64 heads × D128</text>
+<text x="1063" y="897" class="body">V 复用于 4 组 head</text>
+<path d="M345 856 L371 856" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M656 856 L682 856" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M1017 856 L1043 856" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="60" y="962" class="small">Q / K / V / 交换后的 P 使用 AGPR；scores / O 使用 VGPR；每线程 O 累加器为 128 个 FP32。</text>
+<path d="M720 978 L720 1006" fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="40" y="1006" width="925" height="123" rx="14" fill="#eef6ff" stroke="#cfdae7"/>
+<text x="60" y="1037" class="label">04  输出融合 · 直接写回 FP8 + E8M0 scales</text>
+<text x="60" y="1067" class="body">FP32 O → sink 归一化 → 寄存器内 BF16 舍入</text>
+<text x="60" y="1092" class="body">→ inverse RoPE（D448–511）→ group32 quant → Global</text>
+<text x="60" y="1117" class="body">无需中间 BF16 输出张量；仅可选 debug store</text>
+<rect x="985" y="1006" width="415" height="123" rx="14" fill="#fff5e4" stroke="#cfdae7"/>
+<text x="1005" y="1037" class="label">辅助输出 · FP32 max / LSE</text>
+<text x="1005" y="1067" class="body">max / LSE 不包含 sink</text>
+<text x="1005" y="1092" class="body">全无效：O = 0，max = −∞，LSE = +∞</text>
+<text x="1005" y="1117" class="body">sink 仅进入最终 attention 分母</text>
+<text x="40" y="1174" class="section">05  四个 wave 的工作分配</text>
+<rect x="40" y="1190" width="650" height="158" rx="14" fill="#fff" stroke="#cfdae7"/>
+<text x="60" y="1218" class="small">wave</text>
+<text x="143" y="1218" class="small">QK：按 head 分工</text>
+<text x="398" y="1218" class="small">PV：按输出 D 分工</text>
+<text x="67" y="1244" class="mono">w0</text>
+<text x="143" y="1244" class="mono">head 0–15 × N64</text>
+<text x="398" y="1244" class="mono">head 0–63 × D0–127</text>
+<text x="67" y="1271" class="mono">w1</text>
+<text x="143" y="1271" class="mono">head 16–31 × N64</text>
+<text x="398" y="1271" class="mono">head 0–63 × D128–255</text>
+<text x="67" y="1298" class="mono">w2</text>
+<text x="143" y="1298" class="mono">head 32–47 × N64</text>
+<text x="398" y="1298" class="mono">head 0–63 × D256–383</text>
+<text x="67" y="1325" class="mono">w3</text>
+<text x="143" y="1325" class="mono">head 48–63 × N64</text>
+<text x="398" y="1325" class="mono">head 0–63 × D384–511</text>
+<text x="60" y="1372" class="small">图中 head 为 CTA 内编号；第二个 CTA 的全局 head 加 64。</text>
+<text x="730" y="1174" class="section">06  稳态 stage i：指令交错示意</text>
+<rect x="730" y="1190" width="670" height="158" rx="14" fill="#fff" stroke="#cfdae7"/>
+<text x="750" y="1221" class="label">QK(i) 与 PV(i−1) 分段执行</text>
+<text x="750" y="1251" class="body">QK(i) 交错：DMA(i+1)、V dequant(i−1)、softmax 尾段(i−1)</text>
+<text x="750" y="1276" class="body">barrier / 数据准备</text>
+<text x="750" y="1301" class="body">PV(i−1) 交错：softmax 前段(i)、load K(i+1)、dequant 预取(i)</text>
+<text x="750" y="1326" class="body">起步填充流水线；结束排空最后一块 softmax / PV</text>
+<text x="750" y="1372" class="small">表示代码内调度关系，不是实测耗时比例或多 CTA 并行时间线。</text>
+<text x="40" y="1420" class="section">07  LDS · 每 CTA 共 148,528 B</text>
+<rect x="40" y="1437" width="1360" height="102" rx="14" fill="#fff" stroke="#cfdae7"/>
+<text x="60" y="1466" class="body">K：2 × 33,792 B     scale：2 × 2,176 B     BF16 V：67,584 B     BF16 P 交换：8,192 B</text>
+<text x="60" y="1496" class="body">rescale：256 B     checked tile flags：544 B     入口验证：16 B；尺寸包含 LDS 布局 padding。</text>
+<text x="60" y="1522" class="small">全合法与含非法索引的模板共用同一个 launch / LDS 分配；尾 tile 始终正确屏蔽。</text>
+<a href="https://github.com/yzhou103/aiter/blob/1daf14d24698d9736960cc80443724aa1e853e60/csrc/kernels/mla/fused_dsv41/pr_v41/mla_v41_prefill_fused.hpp#L1142" target="_blank">
+<text x="40" y="1576" class="body">源码：make_dma · prepare_q · attention_segment · fused_epilogue（点击打开固定版本）</text>
+</a>
+<text x="40" y="1605" class="small">新路径选择：FP8 QK，H128，1 ≤ T ≤ 320，prefix_capacity ≥ 1024T，无 BF16 extend，legacy / B128。</text>
+</svg>
