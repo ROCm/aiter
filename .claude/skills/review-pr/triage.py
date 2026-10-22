@@ -1058,9 +1058,16 @@ def derive(files, title="", raw_diff=""):
                      or "/docs/" in p for p in paths):
         return [("infra-only", "NONE")]
     # Pure submodule / version-pointer bump: subproject commit lines and nothing else
+    _has_submodule_repin = any(
+        p.startswith("3rdparty/") and any("Subproject commit" in ln for ln in f["add"])
+        for p, f in files.items())
     if add and all(re.match(r"^(Subproject commit|[0-9a-f]{40}$|.*version.*=)", l.strip())
                    for l in add.splitlines() if l.strip()):
+        if _has_submodule_repin:
+            return [("version-bump", "HK20")]
         return [("version-bump", "NONE")]
+    if _has_submodule_repin:
+        hit("submodule-repin", "HK20")
 
     if any(f["new"] and (p.startswith("csrc/kernels/") or "/triton/" in p or "_gluon_kernels/" in p)
            for p, f in files.items()):
@@ -1070,9 +1077,9 @@ def derive(files, title="", raw_diff=""):
         return p.endswith((".cu", ".cuh", ".hip", ".h", ".hpp")) or \
                (p.endswith(".py") and any(k in p for k in KERNEL_PY))
     if any(not f["new"] and is_kernel(p) and (f["add"] or f["del"]) for p, f in files.items()):
-        hit("modified-kernel", "A1 B2 D1 D8 P6")   # D9 is scanner-backed, not read as prose
+        hit("modified-kernel", "A1 A4 B2 D1 D8 P6")   # D9 is scanner-backed, not read as prose
     if re.search(r"tl\.constexpr", add) or re.search(r"['\"]gfx\d+['\"]", add):
-        hit("new-routing-value", "B4 C4")
+        hit("new-routing-value", "A4 B4 C4")
     if any(p.endswith((".csv", ".yaml", ".yml")) or
            (p.endswith(".json") and ("config" in p or "tuned" in p)) for p in paths):
         hit("tuning-config", "D3 HK4")
