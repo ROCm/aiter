@@ -6,7 +6,7 @@ root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.pat
 def rd(p): return open(os.path.join(root, p), encoding='utf-8').read()
 def strip(t): return re.sub(r'//[^\n]*', '', t)
 k = rd('device/ran_kernel.cu'); abi = rd('interface/sm_abi_v3.h'); g = rd('device/sk_gemm_fp8.cu'); tr = rd('device/layout/sk_traits.hpp'); lay = rd('device/layout/ran_layouts.hpp'); rl = rd('device/layout/t1_roles.hpp')
-ks = strip(k); body = ks[ks.index('ran_body('):]
+ks = strip(k); body = ks[ks.index('void sm_ran_v3('):]
 fails = []
 def need(c, m):
     print(('PASS ' if c else 'FAIL ') + m)
@@ -17,7 +17,7 @@ helper = strip(k[k.index('SM_INL void release_tagged'):k.index('// Entry reads (
 need(len(re.findall(r'SM_T1_FLAG\(rank\)', ks)) == len(re.findall(r'SM_T1_FLAG\(rank\)', helper)), 'every flag release lives inside release_tagged')
 need(body.count('const uint32_t pz = ld_rlx32(ka.err);') == 4, 'ERR read in the entry round of IK, push, self, B: %d' % body.count('const uint32_t pz = ld_rlx32(ka.err);'))
 need(body.count('SM_ERRR_TAG_MISMATCH') == 2 and 'x[kk][pass][i] = qnan();' in body, 'tag compare + NaN fill in both B paths')
-need('void sm_ran_v3(SmRanArgsV3 ka)' in k and 'static_assert(sizeof(SmRanArgsV3) == 64' in abi, 'kernarg v3 kept (sm_ran_v3, 64 B)')
+need('void sm_ran_v3(const SmDev* __restrict__ blk, SmRanArgsV3 ka)' in k and 'ran_body' not in k and 'static_assert(sizeof(SmRanArgsV3) == 64' in abi and 'ka.blk' not in k.replace('// ','//'), 'X1: kernarg = restrict blk (8 B) + SmRanArgsV3 (64 B) = 72 B')
 need('SM_C_POISON' not in re.sub(r'#error[^\n]*', '', ks) and not re.search(r'[^k]a\.(Ascale|positions|slot_mapping|index_slot_mapping)\b', ks), 'no SM_C_POISON / per-launch SmDev reads')
 # MP64 role generalisation
 need(len(re.findall(r'16u \* pass', body)) == 0 and len(re.findall(r'16u \* \(pbase \+ pass\)', body)) >= 14, 'every row-pass expression uses the global pass pbase + pass: %d sites, 0 raw' % len(re.findall(r'16u \* \(pbase \+ pass\)', body)))

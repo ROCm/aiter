@@ -178,9 +178,10 @@ hipError_t enqueue_v3(Ctx* c, hipStream_t s, const float* Ascale, const int64_t*
     ka.blk = c->dblk; ka.Ascale = Ascale; ka.positions = positions; ka.slot_mapping = slot_mapping;
     ka.err = reinterpret_cast<const uint32_t*>(c->gpage); ka.step = reinterpret_cast<const uint64_t*>(c->gpage + 8);
     ka.M = c->b.M; ka.rank = static_cast<uint32_t>(c->rank); ka.t_valid = t_valid; ka.call_id = call_id;
-    static_assert(sizeof(SmRanArgsV3) == 64, "RAN kernarg v3 = 64 B");
+    static_assert(sizeof(SmRanArgsV3) == 64 && sizeof(const SmDev*) + sizeof(SmRanArgsV3) == SM_RAN_KERNARG_BYTES, "RAN kernarg = const SmDev* (8 B) + SmRanArgsV3 (64 B) = 72 B");
     void* ga[] = {&g};
-    void* ra[] = {&ka};
+    const SmDev* ran_blk = c->dblk;                       // X1: the block pointer is its OWN kernel parameter (const __restrict__ -> invariant s_loads); ka.blk is kept for layout compatibility and NOT read by the kernel
+    void* ra[] = {&ran_blk, &ka};                          // one kernelParams pointer per kernel parameter (like the GEMM single by-value struct, and r7's three-parameter fix)
     hipError_t e = hipModuleLaunchKernel(c->fg, SM_GEMM_NTILES, SM_SK, 1, 256, 1, 1, 0, s, ga, nullptr);
     if (e != hipSuccess) return e;
     return hipModuleLaunchKernel(c->fr, RAN_GRID, 1, 1, SM_RAN_THREADS, 1, 1, 0, s, ra, nullptr);          // r15: 256 (default) or 512 (PUSH8 / PUSH_HALVES)

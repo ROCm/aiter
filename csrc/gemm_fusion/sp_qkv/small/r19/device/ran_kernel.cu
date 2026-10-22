@@ -776,8 +776,10 @@ SM_INL uint32_t decide(const SmDev& a, uint32_t M, uint32_t G, uint64_t e, uint3
 }
 } // namespace sm
 
-// r19: the former kernel body; `blk` stays a restrict const pointer so the SmDev loads remain invariant scalar loads after inlining into sm_ran_v3.
-__device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const SmRanArgsV3& ka) {
+// X1 (R12-overhead-r3): the block pointer is a KERNEL ARGUMENT (const __restrict__) again, exactly like r18's sm_ran_v1: the SmDev reads compile to invariant s_loads. As a field of the by-value struct (r19 first form) it lost the
+// noalias/read-only kernel-argument status: 138 invariant s_loads became ~139 vector global_loads + readfirstlane, re-loaded after stores and serialised on vmcnt. Kernarg = 8 B (blk) + 64 B (SmRanArgsV3 by value) = 72 B.
+extern "C" __global__ __launch_bounds__(SM_RAN_THREADS)
+void sm_ran_v3(const SmDev* __restrict__ blk, SmRanArgsV3 ka) {
 #if defined(__gfx950__)
     using namespace sm;
     const uint32_t M = ka.M, rank = ka.rank;
@@ -1330,9 +1332,6 @@ __device__ __forceinline__ void ran_body(const SmDev* __restrict__ blk, const Sm
 }
 #endif // __HIP_DEVICE_COMPILE__
 
-#ifdef __HIP_DEVICE_COMPILE__
-extern "C" __global__ __launch_bounds__(SM_RAN_THREADS)
-void sm_ran_v3(SmRanArgsV3 ka) { ran_body(ka.blk, ka); }
-#else
-extern "C" __global__ void sm_ran_v3(SmRanArgsV3) {}
+#ifndef __HIP_DEVICE_COMPILE__
+extern "C" __global__ void sm_ran_v3(const SmDev*, SmRanArgsV3) {}
 #endif

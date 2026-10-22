@@ -275,13 +275,15 @@ static_assert(sizeof(SmDev) == 384 && alignof(SmDev) == 8, "SmDev must be 6 x 64
 static_assert(offsetof(SmDev, rwin_pr3) + sizeof(uint8_t*) == 64, "push set (P,Wscale,Ascale,cwin_loc,rwin_pr0..3) must be exactly group 0");
 static_assert(offsetof(SmDev, qw) == 128 && offsetof(SmDev, v_out) == 192 && offsetof(SmDev, kc_sx) == 256 && offsetof(SmDev, block_size) == 320, "group boundaries");
 // (r7 history) the v1 kernarg was three scalars; r19 replaces it by SmRanArgsV3 above.
-// RAN kernarg v3: one by-value 64 B block (one s_load_dwordx16). Ascale / positions / slot_mapping are PER-LAUNCH inputs (r19): SmDev::Ascale / positions / slot_mapping / index_slot_mapping are written as nullptr by the host and NEVER read by the v3 kernel.
+// RAN kernarg v3 (X1): TWO kernel parameters: `const SmDev* __restrict__ blk` (8 B) + `SmRanArgsV3 ka` by value (64 B = one s_load_dwordx16) = SM_RAN_KERNARG_BYTES 72. The block pointer is a SEPARATE restrict kernel argument so the SmDev reads are invariant s_loads (as a field
+// of the by-value struct it lost that status: R12-overhead-r3). `SmRanArgsV3::blk` is kept for layout compatibility with the aiter stub (small_rt.py SmRanArgsV3, sizeof 64) and filled by the host, but the kernel does NOT read it. Ascale / positions / slot_mapping are PER-LAUNCH inputs (r19): SmDev::Ascale / positions / slot_mapping / index_slot_mapping are written as nullptr by the host and NEVER read by the v3 kernel.
 // err / step point into the per-comm global page (u32 ERR at +0, u64 STEP at +8; DIAG u64[8] at +64). Rows t >= t_valid are padded in-kernel (position 0, slot -1: no cache writes).
 struct SmRanArgsV3 {
     const SmDev* blk; const float* Ascale; const int64_t* positions; const int64_t* slot_mapping; const uint32_t* err; const uint64_t* step;
     uint32_t M; uint32_t rank; uint32_t t_valid; uint32_t call_id;
 };
-static_assert(sizeof(SmRanArgsV3) == 64 && alignof(SmRanArgsV3) == 8, "kernarg v3 = 64 B");
+static_assert(sizeof(SmRanArgsV3) == 64 && alignof(SmRanArgsV3) == 8, "kernarg struct v3 = 64 B");
+#define SM_RAN_KERNARG_BYTES 72u   // sizeof(const SmDev*) + sizeof(SmRanArgsV3)
 static_assert((SM_F * 2u) % 16u == 0u, "Rx row stride must keep 16 B alignment for the 16 B SC0|SC1 push stores");
 static_assert(SM_N == SM_NA * 128u, "N = units * 128");
 static_assert(SM_DENSE ? (SM_F == 2304u && SM_NA == 72u) : (SM_F == 2560u && SM_NA == 77u), "F geometry per mode");

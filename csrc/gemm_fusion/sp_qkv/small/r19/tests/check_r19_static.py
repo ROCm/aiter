@@ -20,7 +20,7 @@ sites = len(re.findall(r'\brelease_tagged\(a,', ks))
 need(sites == 6, 'release_tagged call sites == 6 (IK parallel, IK serial (=0), push8 first, push8 second tid 256, legacy push, test-only ADD_BEFORE_RETIRE): %d' % sites)
 need('SM_INL void tag_store' in k and "__hip_atomic_store(reinterpret_cast<uint64_t*>(cwin_peer(a, d, SM_C_TAG(par, rank))), E, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)" in k and len(re.findall(r'tag_store\(a, d, rank, par, E\)', helper_body)) == 2, 'tag store is ONE system-scope helper (tag_store), used by both non-early variants of release_tagged')
 need('#define SM_TAG_EARLY 1' in k and '#define SM_POLL_BATCH 1' in k and 'SM_TEST_TAG_AFTER_RELEASE needs SM_TAG_EARLY=0' in k, 'SM_TAG_EARLY / SM_POLL_BATCH default 1; the G10b seam requires TAG_EARLY=0')
-body = ks[ks.index('ran_body('):]
+body = ks[ks.index('void sm_ran_v3('):]
 early = re.findall(r'(if \(tid == (?:0|256)\) \{[^\n]*?tag_store\(a,)', body)
 need(len(re.findall(r'tag_store\(a,', body)) == 5 and len(early) == 4, 'F1: early tag stores are issued by the releasing thread itself (tid 0 / tid 256 / IK owner tid 0) in the data-store blocks: %d sites' % len(early))
 need(len(re.findall(r'SM_STAMP\(rec, 36\)', body)) == 4 and "SM_STAMP(rec, 39)" in body and "SM_STAMP(rec, 38)" in body, 'new stamps 36 (release begin), 38 (early tag issue), 39 (B poll start)')
@@ -39,7 +39,7 @@ need(re.search(r'SM_ERR_CODE\(reason, rank\)', abi) is not None and 'SM_ERR_KIND
 # kernarg v3
 need('static_assert(sizeof(SmRanArgsV3) == 64' in abi, 'SmRanArgsV3 sizeof == 64 asserted')
 need(re.search(r'struct SmRanArgsV3 \{\s*const SmDev\* blk; const float\* Ascale; const int64_t\* positions; const int64_t\* slot_mapping; const uint32_t\* err; const uint64_t\* step;\s*uint32_t M; uint32_t rank; uint32_t t_valid; uint32_t call_id;', abi) is not None, 'field order matches the aiter stub SmRanArgsV3')
-need('void sm_ran_v3(SmRanArgsV3 ka)' in k, 'kernel signature sm_ran_v3(SmRanArgsV3) by value')
+need('void sm_ran_v3(const SmDev* __restrict__ blk, SmRanArgsV3 ka)' in k and 'ran_body' not in k, 'X1: kernel signature sm_ran_v3(const SmDev* __restrict__ blk, SmRanArgsV3 ka): the block pointer is a restrict KERNEL ARGUMENT (the body is the kernel, no wrapper)')
 need('static_assert(sizeof(SmDev) == 384' in abi, 'SmDev stays 384 B')
 # pad mask + NaN mode + tag check
 need('const bool v = t < tv;' in k and 'p.slot = v ? slot[t] : -1;' in k, 'pre_a pads rows >= t_valid in-kernel (pos 0 / slot -1)')
@@ -48,7 +48,7 @@ need(k.count('x[kk][pass][i] = qnan();') == 2 and 'vv[pass][i] = qnan(); }' in k
 need(k.count('SM_ERRR_TAG_MISMATCH') == 2, 'tag compare in both B paths')
 need('#if !SM_NO_CREDIT\n#error' in k, 'r19 requires SM_NO_CREDIT=1')
 # driver
-need('"sm_ran_v3"' in drv and 'SmRanArgsV3 ka{}' in drv and 'void* ra[] = {&ka};' in drv, 'driver passes ONE kernelParams pointer for the 64 B kernarg')
+need('"sm_ran_v3"' in drv and 'SmRanArgsV3 ka{}' in drv and 'void* ra[] = {&ran_blk, &ka};' in drv and 'SM_RAN_KERNARG_BYTES' in drv and '#define SM_RAN_KERNARG_BYTES 72u' in abi, 'X1: driver passes {&ran_blk, &ka} (one kernelParams pointer per kernel parameter)')
 sf = open(os.path.join(root, '..', '..', 'host', 'sm_fusion_driver.cpp'), encoding='utf-8').read()
 for fn in ('sm_attach_v3', 'sm_launch_blk_v3', 'sm_bind_new_v1', 'sm_blk_free_v1', 'sm_free_v1', 'sm_info_v1'):
     need(('int32_t %s(' % fn) in sf, 'fusion driver exports ' + fn)
