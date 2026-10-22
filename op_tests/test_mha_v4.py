@@ -1541,6 +1541,69 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
     assert torch.equal(gqa, mha)
 
 
+# hd256 runs a 64-token KV tile where hd128 runs 128, so the aligned/partial split moves.
+_HD256_SHAPES = [
+    pytest.param(1, 256, 256, 1, id="aligned"),
+    pytest.param(2, 512, 512, 2, id="batched"),
+    pytest.param(1, 768, 576, 2, id="partial_kv"),
+]
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+@pytest.mark.parametrize(("batch", "sequence_q", "sequence_k", "heads"), _HD256_SHAPES)
+def test_mha_v4_mxfp4_hd256_matches_attention(batch, sequence_q, sequence_k, heads):
+    torch.manual_seed(43)
+    q = torch.randn(
+        (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+
+    actual = mha_v4(
+        q, k, v, AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4
+    )
+    torch.cuda.synchronize()
+
+    assert actual.shape == (batch, sequence_q, heads, 256)
+    assert torch.isfinite(actual).all()
+    assert _cosine_against_attention(actual, q, k, v) > _MX_UNALIGNED_COSINE
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 hd256 GQA validation")
+def test_mha_v4_mxfp4_hd256_gqa_matches_repeated_kv():
+    torch.manual_seed(44)
+    q = torch.randn((1, 257, 16, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 320, 4, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    gqa = mha_v4(
+        q, k, v, AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4
+    )
+    mha = mha_v4(
+        q,
+        k.repeat_interleave(4, dim=2),
+        v.repeat_interleave(4, dim=2),
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP4,
+        AttentionFormat.MXFP4,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(gqa, mha)
+
+
+@pytest.mark.parametrize(
+    "qk_format",
+    [AttentionFormat.BF16, native_fp8_format(), AttentionFormat.MXFP6],
+)
+def test_mha_v4_rejects_non_mxfp4_head_dim_256(qk_format):
+    q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="MXFP4-only"):
+        mha_v4(q, q, q, qk_format, qk_format, qk_format)
+
+
 @pytest.mark.skipif(
     get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 I8FP8 validation"
 )
@@ -1828,14 +1891,13 @@ def run_torch_mha_v4(q, k, v, softmax_scale):
 
 
 @benchmark()
-def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
+def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype):
     """Benchmark every dense MHA v4 recipe against one Torch reference.
 
     All recipes are timed side by side because they differ only in how Q/K/V are quantized, so
     the interesting number is what each costs at the same shape and what it costs in accuracy.
     The quantized rows time their quantizers too, since that is what mha_v4 runs per call.
     """
-    head_dim = 128
     softmax_scale = head_dim**-0.5
     torch.manual_seed(batch + sequence_q + sequence_k + heads)
     q = torch.randn((batch, sequence_q, heads, head_dim), device="cuda", dtype=dtype)
@@ -1855,6 +1917,9 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
         "f6f4": (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4),
         "mxfp4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
     }
+    if head_dim != 128:
+        # Only MXFP4 has a kernel past hd128; the rest would raise rather than return a number.
+        recipes = {"mxfp4": recipes["mxfp4"]}
     candidates = {
         name: (
             lambda q_format=q_format, v_format=v_format: mha_v4(
@@ -1907,19 +1972,27 @@ def main():
     parser.add_argument("--sequence-q", type=int, nargs="*", default=[1024])
     parser.add_argument("--sequence-k", type=int, nargs="*", default=[1024, 4096])
     parser.add_argument("--heads", type=int, nargs="*", default=[8])
+    parser.add_argument("--head-dim", type=int, nargs="*", default=[128])
     parser.add_argument(
         "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
     )
     args = parser.parse_args()
 
     rows = []
-    for batch, sequence_q, sequence_k, heads, dtype in itertools.product(
-        args.batch, args.sequence_q, args.sequence_k, args.heads, args.dtype
+    for batch, sequence_q, sequence_k, heads, head_dim, dtype in itertools.product(
+        args.batch,
+        args.sequence_q,
+        args.sequence_k,
+        args.heads,
+        args.head_dim,
+        args.dtype,
     ):
         if dtype != dtypes.bf16:
             aiter.logger.warning("MHA v4 dense benchmark skips dtype %s", dtype)
             continue
-        rows.append(benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype))
+        rows.append(
+            benchmark_mha_v4(batch, sequence_q, sequence_k, heads, head_dim, dtype)
+        )
     if rows:
         frame = pd.DataFrame(rows)
         aiter.logger.info(
