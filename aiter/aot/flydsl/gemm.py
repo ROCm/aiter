@@ -119,9 +119,10 @@ def _a8w8_bpreshuffle(job: dict) -> None:
     from aiter.utility import dtypes
 
     m, n, k = job["m"], job["n"], job["k"]
+    q_dtype = dtypes.i8 if job["q_dtype_w"] == "torch.int8" else dtypes.fp8
     gemm_a8w8_bpreshuffle(
-        _empty(m, k, dtype=dtypes.fp8),
-        _empty(n, k, dtype=dtypes.fp8),
+        _empty(m, k, dtype=q_dtype),
+        _empty(n, k, dtype=q_dtype),
         _empty(m, 1, dtype=dtypes.fp32),
         _empty(n, 1, dtype=dtypes.fp32),
         dtype=_out_dtype(job["kernel_name"]),
