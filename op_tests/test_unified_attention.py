@@ -23,12 +23,141 @@ import aiter.ops.unified_attention as ua
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.quant import per_tensor_quant
+from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from op_tests.triton_tests.utils.paged_attn_ref import ref_paged_attn
-from op_tests.triton_tests.utils.shuffle_kv_cache import shuffle_kv_cache
 
 PAGE, H, HKV, D = 64, 64, 4, 128
 FP8_REL_ERR = {dtypes.bf16: 7.7e-2, dtypes.fp16: 7.7e-2}
+
+
+def ref_paged_attn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    query_lens: list[int],
+    kv_lens: list[int],
+    block_tables: torch.Tensor,
+    scale: float,
+    out_dtype: torch.dtype = torch.float32,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    sinks: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
+    causal: int = 1,
+) -> torch.Tensor:
+    num_seqs = len(query_lens)
+    block_tables = block_tables.cpu().numpy()
+    _, block_size, num_kv_heads, head_size = key_cache.shape
+    v_head_size = value_cache.shape[-1]
+    outputs: list[torch.Tensor] = []
+    start_idx = 0
+    query = query.to(torch.float32)
+    key_cache = key_cache.to(torch.float32)
+    value_cache = value_cache.to(torch.float32)
+    if q_descale is not None:
+        query = query * q_descale
+    if k_descale is not None:
+        key_cache = key_cache * k_descale
+    if v_descale is not None:
+        value_cache = value_cache * v_descale
+    for i in range(num_seqs):
+        query_len = query_lens[i]
+        kv_len = kv_lens[i]
+        q = query[start_idx : start_idx + query_len]
+        q = q * scale
+        num_kv_blocks = (kv_len + block_size - 1) // block_size
+        block_indices = block_tables[i, :num_kv_blocks]
+        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
+        v = value_cache[block_indices].view(-1, num_kv_heads, v_head_size)[:kv_len]
+        if q.shape[1] != k.shape[1]:
+            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
+            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+        attn = torch.einsum("qhd,khd->hqk", q, k).float()
+        empty_mask = torch.ones(query_len, kv_len, device=q.device)
+        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+        if sliding_window is not None:
+            sliding_window_mask = (
+                torch.triu(
+                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
+                )
+                .bool()
+                .logical_not()
+            )
+            mask |= sliding_window_mask
+        if soft_cap is not None and soft_cap > 0:
+            attn = soft_cap * torch.tanh(attn / soft_cap)
+        if causal:
+            attn.masked_fill_(mask, float("-inf"))
+        if sinks is not None:
+            s_aux = sinks[:, None, None].repeat_interleave(attn.shape[-2], dim=-2)
+            attn = torch.cat((attn, s_aux), dim=-1)
+        attn = torch.softmax(attn, dim=-1).to(v.dtype)
+        if sinks is not None:
+            attn = attn[..., :-1]
+        outputs.append(torch.einsum("hqk,khd->qhd", attn, v))
+        start_idx += query_len
+    out = torch.cat(outputs, dim=0)
+    if output_scale is not None:
+        out = out / output_scale
+    return out.to(out_dtype)
+
+
+def shuffle_kv_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+):
+    """
+    Shuffle key and value cache layout for optimized memory access.
+
+        layout: (num_lanes, num_elements_per_thread)
+            gfx1250: (16, 8) for BF16 and FP8.
+            gfx950: (16, 8) for BF16 and (16, 16) for FP8.
+
+        WMMA/MFMA instruction shape:
+            BF16: 16x16x32
+            FP8: 16x16x64
+    """
+    dtype = key_cache.dtype
+    assert value_cache.dtype == dtype
+    assert dtype in (torch.bfloat16, e4m3_dtype)
+
+    num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
+    num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
+    assert block_size >= 16
+    assert num_blocks == num_blocks_v
+    assert num_kv_heads == num_kv_heads_v
+    assert head_size == head_size_v
+    assert block_size == block_size_v
+
+    k_width = 16 // key_cache.element_size()
+    key_cache_shuffled = key_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 3, 1)
+    key_cache_shuffled = key_cache_shuffled.view(
+        -1,
+        num_kv_heads,
+        head_size // k_width,
+        k_width,
+        block_size,
+    )
+    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 3).contiguous()
+
+    value_cache_shuffled = value_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    value_cache_shuffled = value_cache_shuffled.view(
+        -1,
+        num_kv_heads,
+        block_size // k_width,
+        k_width,
+        head_size,
+    )
+    value_cache_shuffled = value_cache_shuffled.permute(0, 1, 2, 4, 3).contiguous()
+
+    return key_cache_shuffled, value_cache_shuffled
 
 
 def q8(x):
