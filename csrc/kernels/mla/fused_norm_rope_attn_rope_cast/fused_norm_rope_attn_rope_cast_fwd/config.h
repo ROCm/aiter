@@ -98,7 +98,7 @@ struct FusedNormRopeAttnRopeCastTraits
 template <int CacheMode, bool RawQ>
 struct FusedNormRopeAttnRopeCastConfig : FusedNormRopeAttnRopeCastTraits<>
 {
-    static_assert(CacheMode == 1 || CacheMode == 2);
+    static_assert(CacheMode >= 0 && CacheMode <= 2);
     static constexpr int CACHE_MODE = CacheMode;
     static constexpr bool RAW_Q     = RawQ;
 };

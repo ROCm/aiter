@@ -923,10 +923,7 @@ __device__ inline void compute_pv(char* smem,
     s_waitcnt_lgkmcnt(number<P_READS<T> + V_TR_PER_TILE<T>>{});
     __builtin_amdgcn_sched_barrier(0);
 
-    bool rescale = false;
-    static_for<PV_GROUPS<T>>([&](auto g) { rescale |= fac[g.value] != D_ACC(1.0f); });
-    if(__builtin_expect(__builtin_amdgcn_ballot_w64(rescale) != 0, 0))
-        scale_o<T>(v_o, fac, warp_id);
+    scale_o<T>(v_o, fac, warp_id);
 
     static_for<PV_STEPS<T>>([&](auto st) {
         constexpr int step    = st.value;
@@ -1288,7 +1285,7 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
 
 // ------------------------------------------------------------------------------------ driver
 
-template <class T, bool CHECKED, class QI, class QR>
+template <class T, bool CHECKED, bool Extend, class QI, class QR>
 __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
                                   const void* kv_ptr,
                                   const void* kv_scale_ptr,
@@ -1311,7 +1308,7 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
 
     if(!kv_indptr)
         return;
-    const int cap            = kargs.prefix_capacity;
+    const int cap = Extend ? kargs.extend_capacity : kargs.prefix_capacity;
     const int page_idx_begin = min(cap, max(0, kv_indptr[q_token_idx]));
     const int valid_kv_len =
         max(page_idx_begin, min(cap, kv_indptr[q_token_idx + 1])) - page_idx_begin;
@@ -1417,10 +1414,10 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
             }
             else
             {
-                data_off  = id * kargs.stride_kv_page;
-                scale_off = id * kargs.stride_kv_scale_page;
+                data_off = id * (Extend ? kargs.stride_kv_extend : kargs.stride_kv_page);
+                scale_off = id * (Extend ? kargs.stride_kv_scale_extend : kargs.stride_kv_scale_page);
                 if constexpr(CHECKED)
-                    live = id >= 0 && id < kargs.total_pages;
+                    live = id >= 0 && id < (Extend ? kargs.total_tokens : kargs.total_pages);
             }
             const auto* dp = live ? p_kv + data_off : reinterpret_cast<const D_ATTN*>(safe_kv.data);
             const auto* sp = live ? (T::CACHE_MODE == 1 ? p_kv + scale_off : p_scale + scale_off)
@@ -1683,7 +1680,7 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     D_ACC l_row    = D_ACC(0.0f);
     D_ACC true_max = -numeric_limits<D_ACC>::infinity();
 
-    attention_segment<T, CHECKED>(kargs,
+    attention_segment<T, CHECKED, false>(kargs,
                                   kargs.unified_kv_ptr,
                                   kargs.unified_kv_scale_ptr,
                                   kargs.kv_indptr_prefix,
@@ -1700,7 +1697,7 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
                                   temperature_scale,
                                   true_max);
     __builtin_amdgcn_s_barrier();
-    attention_segment<T, CHECKED>(kargs,
+    attention_segment<T, CHECKED, true>(kargs,
                                   kargs.kv_ptr,
                                   kargs.kv_scale_ptr,
                                   kargs.kv_indptr_extend,
@@ -1770,8 +1767,9 @@ __device__ __forceinline__ bool indices_valid(const FusedNormRopeAttnRopeCastPar
         const auto* ids = segment ? a.kv_indices_extend : a.kv_indices_prefix;
         if(!ptr)
             continue;
-        const int begin = min(a.prefix_capacity, max(0, ptr[t]));
-        const int end   = max(begin, min(a.prefix_capacity, ptr[t + 1]));
+        const int cap = segment ? a.extend_capacity : a.prefix_capacity;
+        const int begin = min(cap, max(0, ptr[t]));
+        const int end = max(begin, min(cap, ptr[t + 1]));
         for(int i = begin + threadIdx.x; i < end; i += 256)
         {
             if constexpr(T::CACHE_MODE == 1)
@@ -1783,7 +1781,10 @@ __device__ __forceinline__ bool indices_valid(const FusedNormRopeAttnRopeCastPar
             else
             {
                 const int id = ids[i];
-                valid        = valid && id >= 0 && id < a.cache_rows;
+                const int rows = T::CACHE_MODE == 0
+                                     ? (segment ? a.total_tokens : a.total_pages)
+                                     : a.cache_rows;
+                valid = valid && id >= 0 && id < rows;
             }
         }
     }

@@ -10,8 +10,18 @@ import argparse
 import pytest
 import torch
 
-from aiter import fused_norm_rope_attn_rope_cast, fused_norm_rope_attn_rope_cast_bf16
-from aiter.ops.fused_norm_rope_attn_rope_cast import fused_norm_rope_attn_rope_cast_fwd
+from aiter import (
+    fused_norm_rope_attn_rope_cast as fused_v41,
+)
+from aiter import (
+    fused_norm_rope_attn_rope_cast_bf16,
+)
+from aiter import (
+    fused_norm_rope_attn_rope_cast_legacy as fused_norm_rope_attn_rope_cast,
+)
+from aiter.ops.fused_norm_rope_attn_rope_cast import (
+    fused_norm_rope_attn_rope_cast_legacy_fwd as fused_norm_rope_attn_rope_cast_fwd,
+)
 from aiter.test_common import perftest
 
 pytestmark = pytest.mark.skipif(
@@ -1294,23 +1304,430 @@ def test_norm_recomputed_on_graph_replay(page):
     torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
 
 
+# Two-source FP8 views and independent CSR ranges.
+
+
+def two_source_inputs(
+    heads=64, layout="interleaved", mode="raw", wide=False, with_sink=True
+):
+    torch.manual_seed(9821 + heads)
+    tokens = 6
+    decoded = []
+    views = []
+    for source, count in enumerate((37, 79)):
+        original = torch.randn(count, 512, device="cuda", dtype=torch.bfloat16) * 0.25
+        values, scales = quantize_fp8(original)
+        if layout == "interleaved":
+            cache = pack_rows(values, scales)
+            data, sf = cache[:, :512].view(torch.float8_e4m3fn), cache[:, 512:]
+        elif layout == "separate":
+            data, sf = values, scales
+        else:
+            data_storage = torch.full(
+                (count, 548 + source * 16), 255, device="cuda", dtype=torch.uint8
+            )
+            scale_storage = torch.full(
+                (count, 36 + source * 8), 255, device="cuda", dtype=torch.uint8
+            )
+            data = data_storage[:, 4:516].view(torch.float8_e4m3fn)
+            sf = scale_storage[:, 4:20]
+            data.copy_(values)
+            sf.copy_(scales)
+        decoded.append(
+            (
+                values.float()
+                * torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
+            ).bfloat16()
+        )
+        views.append((data, sf.view(torch.float8_e8m0fnu)))
+    counts = (
+        ([0, 1, 31, 33, 65, 513], [0, 2, 33, 65, 97, 640])
+        if wide
+        else ([0, 1, 7, 31, 32, 65], [0, 0, 3, 9, 33, 47])
+    )
+    source_rows, indices, pointers = [], [], []
+    for source, sizes in enumerate(counts):
+        rows = []
+        for n in sizes:
+            ids = torch.randint(
+                len(decoded[source]), (n,), device="cuda", dtype=torch.int32
+            )
+            ids[::11] = -1
+            ids[1::17] = len(decoded[source]) + 101
+            rows.append(ids)
+        ids, ptr = csr(rows, torch.int32, 2**31 - 1)
+        if wide and source == 0:
+            padded = torch.full(
+                (tokens * 1200,), 2**31 - 1, device="cuda", dtype=torch.int32
+            )
+            padded[: ids.numel()] = ids
+            ids = padded
+        source_rows.append(rows)
+        indices.append(ids)
+        pointers.append(ptr)
+    q = torch.randn(tokens, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.125
+    angles = torch.randn(tokens, 32, device="cuda")
+    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+    pos = torch.arange(tokens, device="cuda", dtype=torch.int64)
+    sink = torch.linspace(-3, 3, heads, device="cuda")
+    sink[::11] = -torch.inf
+    if not with_sink:
+        sink.fill_(-torch.inf)
+    reference_q = q
+    if mode == "norm":
+        reference_q = (
+            q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + 0.125)
+        ).bfloat16()
+    q_scale = None
+    if mode == "rotated":
+        q = rotate(q, cos, sin, pos).bfloat16()
+        reference_q = q
+    elif mode == "prepared":
+        q8, qs = quantize_fp8(rotate(q, cos, sin, pos).bfloat16())
+        q, q_scale = q8.reshape_as(q), qs.reshape(tokens, heads, 16).view(
+            torch.float8_e8m0fnu
+        )
+    rows = []
+    for t in range(tokens):
+        prefix = source_rows[0][t]
+        extend = source_rows[1][t]
+        rows.append(
+            torch.cat(
+                (
+                    prefix[(prefix >= 0) & (prefix < 37)],
+                    extend[(extend >= 0) & (extend < 79)] + 37,
+                )
+            )
+        )
+    kwargs = {
+        "q": q,
+        "q_scale": q_scale,
+        "unified_kv": views[0][0],
+        "unified_kv_scale": views[0][1],
+        "kv_indices_prefix": indices[0],
+        "kv_indptr_prefix": pointers[0],
+        "kv": views[1][0],
+        "kv_scale": views[1][1],
+        "kv_indices_extend": indices[1],
+        "kv_indptr_extend": pointers[1],
+        "cos": cos,
+        "sin": sin,
+        "positions": pos,
+        "attn_sink": sink if with_sink else None,
+        "q_is_rotated": mode in ("prepared", "rotated"),
+        "q_norm": mode == "norm",
+        "norm_eps": 0.125,
+    }
+    expected = dense_fp8_qk_reference(
+        reference_q, torch.cat(decoded), rows, cos, sin, pos, sink, mode != "rotated"
+    )
+    return kwargs, expected
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("layout", ["interleaved", "separate", "padded"])
+@pytest.mark.parametrize("mode", ["raw", "rotated", "prepared", "norm"])
+@pytest.mark.parametrize("wide", [False, True])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_two_source_dense(heads, layout, mode, wide, with_sink):
+    kwargs, (expected, mx, lse) = two_source_inputs(
+        heads, layout, mode, wide, with_sink
+    )
+    debug = torch.empty_like(kwargs["q"], dtype=torch.float32)
+    out = fused_v41(
+        **kwargs,
+        debug_out=debug,
+        max_logits=torch.empty_like(mx),
+        lse=torch.empty_like(lse),
+    )
+    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
+    assert float((debug - expected).norm() / expected.norm()) < 0.005
+    assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
+    assert torch.count_nonzero(debug[0]) == 0
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("empty", ["prefix", "extend", "both", "omitted", "tokens"])
+def test_two_source_empty_and_bounds(heads, empty):
+    tokens = 0 if empty == "tokens" else 3
+    q = torch.zeros(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
+    counts = (
+        0 if empty in ("prefix", "both") else 2,
+        0 if empty in ("extend", "both") else 7,
+    )
+    sources = []
+    for rows, value in zip(counts, (2.0, 1.0)):
+        sources.append(
+            quantize_fp8(
+                torch.full((rows, 512), value, device="cuda", dtype=torch.bfloat16)
+            )
+        )
+    # A valid last extend row lies outside the prefix's row count. Negative and
+    # oversized ids must be masked independently for both sources.
+    prefix = torch.tensor([1, -1, 100] * tokens, device="cuda", dtype=torch.int32)
+    extend = torch.tensor([6, -1, 100] * tokens, device="cuda", dtype=torch.int32)
+    ptr = torch.arange(tokens + 1, device="cuda", dtype=torch.int32) * 3
+    if heads == 128:
+        prefix = torch.cat(
+            (
+                prefix,
+                torch.full(
+                    (max(tokens, 1) * 1200,),
+                    2**31 - 1,
+                    device="cuda",
+                    dtype=torch.int32,
+                ),
+            )
+        )
+    kwargs = {
+        "q": q,
+        "q_scale": None,
+        "unified_kv": sources[0][0],
+        "unified_kv_scale": sources[0][1],
+        "kv_indices_prefix": prefix,
+        "kv_indptr_prefix": ptr,
+        "cos": torch.ones(1, 32, device="cuda", dtype=torch.bfloat16),
+        "sin": torch.zeros(1, 32, device="cuda", dtype=torch.bfloat16),
+        "positions": torch.zeros(tokens, device="cuda", dtype=torch.int32),
+    }
+    if empty != "omitted":
+        kwargs.update(
+            kv=sources[1][0],
+            kv_scale=sources[1][1],
+            kv_indices_extend=extend,
+            kv_indptr_extend=ptr,
+        )
+    debug = torch.empty_like(q, dtype=torch.float32)
+    out = fused_v41(
+        **kwargs, debug_out=debug, lse=torch.empty(tokens, heads, device="cuda")
+    )
+    live = int(counts[0] > 0) + int(counts[1] > 0 and empty != "omitted")
+    expected = (
+        2 * int(counts[0] > 0) + int(counts[1] > 0 and empty != "omitted")
+    ) / max(live, 1)
+    torch.testing.assert_close(debug, torch.full_like(debug, expected), rtol=0, atol=0)
+    if live:
+        torch.testing.assert_close(
+            out[3],
+            torch.full_like(out[3], float(torch.log(torch.tensor(float(live))))),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+    else:
+        assert torch.isposinf(out[3]).all()
+    assert out[2] is None
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+def test_two_source_rescale(heads):
+    kwargs, _ = two_source_inputs(heads, "padded", "prepared", wide=True)
+    kwargs["q_scale"].view(torch.uint8).fill_(127)
+    query = kwargs["q"].float()
+    debug = torch.empty_like(query)
+    stats = torch.empty(query.shape[:2], device="cuda")
+    out = fused_v41(
+        **kwargs, debug_out=debug, max_logits=torch.empty_like(stats), lse=stats
+    )
+    for t in range(len(query)):
+        selected = []
+        for data, scale, ids, ptr in [
+            (
+                kwargs["unified_kv"],
+                kwargs["unified_kv_scale"],
+                kwargs["kv_indices_prefix"],
+                kwargs["kv_indptr_prefix"],
+            ),
+            (
+                kwargs["kv"],
+                kwargs["kv_scale"],
+                kwargs["kv_indices_extend"],
+                kwargs["kv_indptr_extend"],
+            ),
+        ]:
+            rows = ids[int(ptr[t]) : int(ptr[t + 1])].long()
+            rows = rows[(rows >= 0) & (rows < len(data))]
+            decoded = data.float() * torch.exp2(
+                scale.view(torch.uint8).float() - 127
+            ).repeat_interleave(32, -1)
+            selected.append(decoded[rows])
+        values = torch.cat(selected)
+        if not len(values):
+            assert torch.count_nonzero(debug[t]) == 0
+            continue
+        logits = query[t] @ values.T * 512**-0.5
+        probs = torch.cat((logits, kwargs["attn_sink"][:, None]), -1).softmax(-1)[
+            :, : len(values)
+        ]
+        expected = rotate(
+            (probs @ values).bfloat16()[None],
+            kwargs["cos"],
+            kwargs["sin"],
+            kwargs["positions"][t : t + 1],
+            inverse=True,
+        )[0]
+        torch.testing.assert_close(
+            out[2][t], logits.max(-1).values, rtol=1e-4, atol=3e-5
+        )
+        torch.testing.assert_close(
+            out[3][t], logits.logsumexp(-1), rtol=1e-4, atol=3e-5
+        )
+        assert float((debug[t] - expected).norm() / expected.norm()) < 0.005
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("mode", ["raw", "prepared", "norm"])
+def test_two_source_graph_replay(heads, mode):
+    kwargs, _ = two_source_inputs(heads, "padded", mode, wide=True)
+    out = fused_v41(**kwargs)
+    assert out[2:] == (None, None)
+    buffers = {"out": out[0], "out_scale": out[1]}
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            fused_v41(**kwargs, **buffers)
+        # Change the second source after capture, including its scales and CSR.
+        kwargs["kv"].view(torch.uint8).zero_()
+        kwargs["kv_scale"].view(torch.uint8).fill_(127)
+        kwargs["kv_indices_extend"].fill_(-1)
+        if mode == "prepared":
+            kwargs["q_scale"].view(torch.uint8).fill_(127)
+        else:
+            kwargs["q"].mul_(0.5)
+        expected = fused_v41(**kwargs)
+        for _ in range(3):
+            out[0].view(torch.uint8).fill_(255)
+            out[1].view(torch.uint8).fill_(255)
+            graph.replay()
+            for actual, reference in zip(out[:2], expected[:2]):
+                torch.testing.assert_close(
+                    actual.view(torch.uint8),
+                    reference.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "prefix_dtype",
+        "scale_dtype",
+        "prefix_rows",
+        "extend_rows",
+        "prefix_indices",
+        "extend_indices",
+        "prefix_ptr",
+        "missing_scale",
+        "missing_ptr",
+        "channel_stride",
+        "row_stride",
+        "unaligned",
+        "q_scale_dtype",
+        "prepared_rotation",
+        "prepared_norm",
+        "out_alias",
+        "stat_alias",
+        "norm_eps",
+        "backend",
+    ],
+)
+def test_two_source_contract(bad):
+    kwargs, _ = two_source_inputs(mode="prepared")
+    if bad == "prefix_dtype":
+        kwargs["unified_kv"] = kwargs["unified_kv"].bfloat16()
+    elif bad == "scale_dtype":
+        kwargs["kv_scale"] = kwargs["kv_scale"].float()
+    elif bad == "prefix_rows":
+        kwargs["unified_kv_scale"] = kwargs["unified_kv_scale"][:-1]
+    elif bad == "extend_rows":
+        kwargs["kv_scale"] = kwargs["kv_scale"][:-1]
+    elif bad == "prefix_indices":
+        kwargs["kv_indices_prefix"] = kwargs["kv_indices_prefix"].long()
+    elif bad == "extend_indices":
+        kwargs["kv_indices_extend"] = kwargs["kv_indices_extend"].long()
+    elif bad == "prefix_ptr":
+        kwargs["kv_indptr_prefix"] = kwargs["kv_indptr_prefix"].long()
+    elif bad == "missing_scale":
+        kwargs["kv_scale"] = None
+    elif bad == "missing_ptr":
+        kwargs["kv_indptr_extend"] = None
+    elif bad == "channel_stride":
+        kwargs["unified_kv"] = torch.empty(
+            37, 1024, device="cuda", dtype=torch.float8_e4m3fn
+        )[:, ::2]
+    elif bad == "row_stride":
+        kwargs["unified_kv"] = torch.empty(
+            37, 529, device="cuda", dtype=torch.float8_e4m3fn
+        )[:, :512]
+    elif bad == "unaligned":
+        kwargs["unified_kv"] = torch.empty(
+            37, 516, device="cuda", dtype=torch.float8_e4m3fn
+        )[:, 1:513]
+    elif bad == "q_scale_dtype":
+        kwargs["q_scale"] = kwargs["q_scale"].float()
+    elif bad == "prepared_rotation":
+        kwargs["q_is_rotated"] = False
+    elif bad == "prepared_norm":
+        kwargs["q_norm"] = True
+    elif bad == "out_alias":
+        kwargs["out"] = kwargs["q"].view(6, 8, 4096)
+    elif bad == "stat_alias":
+        stats = torch.empty(6, 64, device="cuda")
+        kwargs.update(lse=stats, max_logits=stats)
+    elif bad == "norm_eps":
+        kwargs["norm_eps"] = 0
+    elif bad == "backend":
+        kwargs["backend"] = "invalid"
+    with pytest.raises((ValueError, RuntimeError)):
+        fused_v41(**kwargs)
+
+
 @perftest()
 def run_benchmark(args, buffers):
-    return fused_norm_rope_attn_rope_cast(*args, **buffers)
+    return fused_v41(**args, **buffers)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--tokens", type=int, default=560)
-    parser.add_argument("--heads", type=int, choices=[8, 16, 32, 64, 128], default=64)
-    parser.add_argument("--kv", type=int, default=640)
+    parser.add_argument("--heads", type=int, choices=[64, 128], default=64)
+    parser.add_argument("--kv", type=int, default=512, help="prefix rows per query")
+    parser.add_argument(
+        "--extend-kv", type=int, default=128, help="extend rows per query"
+    )
     options, pytest_args = parser.parse_known_args()
     if options.benchmark:
-        args = simple_inputs(options.tokens, options.heads)
-        args[2] = args[2].repeat_interleave(options.kv)
-        args[3] *= options.kv
-        out = fused_norm_rope_attn_rope_cast(*args)
+        if options.tokens <= 0 or min(options.kv, options.extend_kv) < 0:
+            parser.error("tokens must be positive and KV counts nonnegative")
+        q, pool, _, ptr, cos, sin, pos = simple_inputs(options.tokens, options.heads)
+        cache = pool.view(1, 528)
+        args = {
+            "q": q,
+            "q_scale": None,
+            "unified_kv": cache[:, :512].view(torch.float8_e4m3fn),
+            "unified_kv_scale": cache[:, 512:],
+            "kv_indices_prefix": torch.zeros(
+                options.tokens * options.kv, device="cuda", dtype=torch.int32
+            ),
+            "kv_indptr_prefix": ptr * options.kv,
+            "kv": cache[:, :512].view(torch.float8_e4m3fn),
+            "kv_scale": cache[:, 512:],
+            "kv_indices_extend": torch.zeros(
+                options.tokens * options.extend_kv, device="cuda", dtype=torch.int32
+            ),
+            "kv_indptr_extend": ptr * options.extend_kv,
+            "cos": cos,
+            "sin": sin,
+            "positions": pos,
+            "q_is_rotated": False,
+        }
+        out = fused_v41(**args)
         buffers = {
             "out": out[0],
             "out_scale": out[1],
@@ -1318,7 +1735,9 @@ if __name__ == "__main__":
             "lse": out[3],
         }
         _, us = run_benchmark(args, buffers)
-        print(f"T={options.tokens} H={options.heads} K={options.kv}: {us:.3f} us")
+        print(
+            f"T={options.tokens} H={options.heads} K={options.kv}+{options.extend_kv}: {us:.3f} us"
+        )
         print(
             "Synthetic repeated-row fixture; producer and layout preparation excluded."
         )

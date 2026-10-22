@@ -12,9 +12,11 @@ inline bool launch_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRop
                                                       hipStream_t stream)
 {
     // Measured crossover: short KV lists lose; T512 wide-cache gains are marginal.
+    const bool strided = a.cache.page_size == -3;
     if(!a.fp8_qk || a.heads != 128 || a.tokens == 0 || a.tokens > 320 ||
-       a.prefix_capacity < int64_t(a.tokens) * 1024 || a.extend_indptr ||
-       (a.cache.page_size != 0 && a.cache.page_size != 128))
+       int64_t(a.prefix_capacity) + (strided ? a.extend_capacity : 0) < int64_t(a.tokens) * 1024 ||
+       (!strided && a.extend_indptr) ||
+       (!strided && a.cache.page_size != 0 && a.cache.page_size != 128))
         return false;
     FusedNormRopeAttnRopeCastParams k{};
     k.q_ptr                = a.q;
@@ -47,7 +49,7 @@ inline bool launch_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRop
     k.q_is_rotated         = !rotate_q;
     k.q_norm               = a.q_norm;
     k.norm_eps             = a.norm_eps;
-    k.cache_mode           = a.cache.page_size ? 2 : 1;
+    k.cache_mode           = strided ? 0 : a.cache.page_size ? 2 : 1;
     k.page_size            = a.cache.page_size;
     // num_rows was bounded by BOTH actual byte views by the public wrapper.
     k.cache_rows        = a.cache.num_rows;
@@ -55,6 +57,20 @@ inline bool launch_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRop
     k.pool_bytes        = a.pool_bytes;
     k.data_page_stride  = a.cache.data_page_stride;
     k.scale_page_stride = a.cache.scale_page_stride;
+    if(strided)
+    {
+        k.total_pages            = a.cache.num_rows;
+        k.total_tokens           = a.extend_rows;
+        k.stride_kv_page         = a.cache.data_page_stride;
+        k.stride_kv_scale_page   = a.cache.scale_page_stride;
+        k.kv_ptr                 = a.extend_kv;
+        k.kv_scale_ptr           = a.extend_cache.scales;
+        k.kv_indptr_extend       = a.extend_indptr;
+        k.kv_indices_extend      = a.extend;
+        k.extend_capacity        = a.extend_capacity;
+        k.stride_kv_extend       = a.extend_cache.data_page_stride;
+        k.stride_kv_scale_extend = a.extend_cache.scale_page_stride;
+    }
     HIP_CALL(run_fused_norm_rope_attn_rope_cast_fwd(k, a.q_scale == nullptr, stream));
     return true;
 }

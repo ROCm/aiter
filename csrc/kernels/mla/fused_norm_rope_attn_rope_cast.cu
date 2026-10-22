@@ -720,6 +720,35 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_
                                               l,
                                               a.softmax_scale * log2e);
     }
+    // Both sources contribute to one online softmax; normalize only after the second.
+    if constexpr(PageSize == -3)
+    {
+        if(a.extend_indptr)
+        {
+            begin = max(0, min(a.extend_capacity, a.extend_indptr[t]));
+            end   = max(begin, min(a.extend_capacity, a.extend_indptr[t + 1]));
+            if(end > begin)
+            {
+                Fp8QkSource64<-3> src{{reinterpret_cast<const uint8_t*>(a.extend_kv),
+                                       a.extend + begin,
+                                       end - begin,
+                                       a.extend_rows,
+                                       a.extend_cache}};
+                fp8_qk_decode_accum64<T, H64Schedule>(src,
+                                                      end - begin,
+                                                      (end - begin + 31) / 32,
+                                                      reinterpret_cast<char*>(kv_tile),
+                                                      q,
+                                                      q_scales,
+                                                      raw_k,
+                                                      o,
+                                                      actual_max,
+                                                      m,
+                                                      l,
+                                                      a.softmax_scale * log2e);
+            }
+        }
+    }
     __syncthreads();
     auto* staging = reinterpret_cast<uint8_t*>(kv_tile);
     if(h < a.heads)
@@ -731,8 +760,10 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_
         const float inv     = denom > 0 ? rescale / denom : 0;
         if(group == 0)
         {
-            a.lse[int64_t(t) * a.heads + h]        = l > 0 ? m / log2e + logf(l) : INFINITY;
-            a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
+            if(a.lse)
+                a.lse[int64_t(t) * a.heads + h] = l > 0 ? m / log2e + logf(l) : INFINITY;
+            if(a.max_logits)
+                a.max_logits[int64_t(t) * a.heads + h] = actual_max / log2e;
         }
         opus::static_for<16>([&](auto chunk) {
             F4 x[2] = {opus::slice(o[int(chunk)], opus::number<0>{}, opus::number<4>{}),
@@ -1067,6 +1098,7 @@ hipError_t launch_fused_norm_rope_attn_rope_cast(const FusedNormRopeAttnRopeCast
 {
     switch(a->cache.page_size)
     {
+    case -3: return launch_cache_mode<-3>(a, rotate_q, stream); // Two strided FP8 sources.
     case -2: return launch_cache_mode<-2>(a, rotate_q, stream); // Contiguous BF16 rows.
     case 0: return launch_cache_mode<0>(a, rotate_q, stream);
     case 32: return launch_cache_mode<32>(a, rotate_q, stream);

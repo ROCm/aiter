@@ -5,7 +5,8 @@
 #include <hip/hip_runtime.h>
 
 // page_size == 0 preserves the legacy tagged byte-address format.
-// PageSize: 0 = legacy, -1 = runtime page size, positive = specialized page size.
+// PageSize: -3 = strided FP8 rows, 0 = legacy, -1 = runtime page size.
+// Positive values specialize an FP8 page size.
 // Paged mode consumes int32 slots. The two bases may alias one allocation.
 struct Fp8CacheLayout
 {
@@ -32,6 +33,8 @@ struct Fp8CacheLayout
     template <int PageSize>
     __device__ __forceinline__ const uint8_t* data(const void* base, int64_t r) const
     {
+        if constexpr(PageSize == -3)
+            return static_cast<const uint8_t*>(base) + r * data_page_stride;
         const int block = PageSize > 0 ? PageSize : page_size;
         const int64_t offset =
             PageSize ? (int(r) / block) * data_page_stride + int64_t(int(r) % block) * 512 : r >> 1;
@@ -42,6 +45,8 @@ struct Fp8CacheLayout
     {
         if constexpr(!PageSize)
             return static_cast<const uint8_t*>(base) + (r >> 1) + 512;
+        if constexpr(PageSize == -3)
+            return scales + r * scale_page_stride;
         const int block = PageSize > 0 ? PageSize : page_size;
         return scales + (int(r) / block) * scale_page_stride + int64_t(int(r) % block) * 16;
     }

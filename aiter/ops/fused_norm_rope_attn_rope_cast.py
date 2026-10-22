@@ -15,11 +15,13 @@ __all__ = [
     "fused_norm_rope_attn_rope_cast",
     "fused_norm_rope_attn_rope_cast_bf16",
     "fused_norm_rope_attn_rope_cast_fwd",
+    "fused_norm_rope_attn_rope_cast_legacy",
+    "fused_norm_rope_attn_rope_cast_legacy_fwd",
 ]
 
 
 @compile_ops("module_fused_norm_rope_attn_rope_cast", develop=True)
-def fused_norm_rope_attn_rope_cast_fwd(
+def fused_norm_rope_attn_rope_cast_legacy_fwd(
     q: torch.Tensor,
     pool: torch.Tensor,
     prefix: torch.Tensor,
@@ -48,10 +50,10 @@ def fused_norm_rope_attn_rope_cast_fwd(
     q_norm: bool = False,
     norm_eps: float = 1e-6,
 ) -> None:
-    """Write caller-allocated outputs; see :func:`fused_norm_rope_attn_rope_cast`."""
+    """Write caller-allocated outputs; see :func:`fused_norm_rope_attn_rope_cast_legacy`."""
 
 
-def fused_norm_rope_attn_rope_cast(
+def fused_norm_rope_attn_rope_cast_legacy(
     q: torch.Tensor,
     pool: torch.Tensor,
     prefix: torch.Tensor,
@@ -154,7 +156,7 @@ def fused_norm_rope_attn_rope_cast(
     if h not in (8, 16, 32, 64, 128) or d != 512:
         raise ValueError("Supported H=8/16/32/64/128 and D=512")
     if not torch.cuda.get_device_properties(q.device).gcnArchName.startswith("gfx950"):
-        raise ValueError("fused_norm_rope_attn_rope_cast requires gfx950")
+        raise ValueError("fused_norm_rope_attn_rope_cast_legacy requires gfx950")
     norm_eps = float(norm_eps)
     if (
         not math.isfinite(norm_eps)
@@ -181,7 +183,7 @@ def fused_norm_rope_attn_rope_cast(
     max_logits = buffer(max_logits, torch.float32, (t, h))
     lse = buffer(lse, torch.float32, (t, h))
     with torch.cuda.device(q.device):
-        fused_norm_rope_attn_rope_cast_fwd(
+        fused_norm_rope_attn_rope_cast_legacy_fwd(
             q,
             pool,
             prefix,
@@ -230,7 +232,7 @@ def fused_norm_rope_attn_rope_cast_bf16(
     and out-of-range indices are masked. The singleton-head view is zero-copy.
     This follows the BF16 workspace input strategy used by mega prefill;
     Q, RoPE, outputs, optional buffers and numerical semantics are those of
-    :func:`fused_norm_rope_attn_rope_cast`, not the full FlashMLA tensor ABI. In particular,
+    :func:`fused_norm_rope_attn_rope_cast_legacy`, not the full FlashMLA tensor ABI. In particular,
     Q remains head-major and RoPE tables are BF16. No gather/dequant or
     index conversion is performed in this function.
     """
@@ -240,6 +242,149 @@ def fused_norm_rope_attn_rope_cast_bf16(
         kv = kv.view(kv.shape[0], 512)
     if kv.ndim != 2 or kv.shape[1] != 512:
         raise ValueError("kv must be BF16 [S,512] or [S,1,512]")
-    return fused_norm_rope_attn_rope_cast(
+    return fused_norm_rope_attn_rope_cast_legacy(
         q, kv, indices, indptr, cos, sin, positions, **kwargs
     )
+
+
+@compile_ops("module_fused_norm_rope_attn_rope_cast", develop=True)
+def fused_norm_rope_attn_rope_cast_fwd(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    unified_kv: torch.Tensor,
+    unified_kv_scale: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor | None,
+    kv_scale: torch.Tensor | None,
+    kv_indices_extend: torch.Tensor | None,
+    kv_indptr_extend: torch.Tensor | None,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    out_scale: torch.Tensor,
+    max_logits: torch.Tensor | None,
+    lse: torch.Tensor | None,
+    debug_out: torch.Tensor | None,
+    q_is_rotated: bool,
+    q_norm: bool,
+    norm_eps: float,
+) -> None:
+    """Write outputs for the two-source FP8 interface."""
+
+
+def fused_norm_rope_attn_rope_cast(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    unified_kv: torch.Tensor,
+    unified_kv_scale: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor | None = None,
+    kv_scale: torch.Tensor | None = None,
+    kv_indices_extend: torch.Tensor | None = None,
+    kv_indptr_extend: torch.Tensor | None = None,
+    attn_sink: torch.Tensor | None = None,
+    softmax_scale: float = 512**-0.5,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+    backend: str | None = None,
+    *,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    out_scale: torch.Tensor | None = None,
+    max_logits: torch.Tensor | None = None,
+    debug_out: torch.Tensor | None = None,
+    q_is_rotated: bool = True,
+    q_norm: bool = False,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Fuse Q preparation, two-source FP8 attention and output RoPE/quantization.
+
+    The Q/KV argument names and CSR semantics follow ``mla_sparse_prefill_v41``.
+    Both KV sources contain already rotated FP8 E4M3FN ``[S,512]`` values and
+    E8M0 ``[S,16]`` group32 scales. Scales may have E8M0 or uint8 dtype. Each
+    source has its own int32 indices and int32 ``[T+1]`` CSR pointers; indices
+    address rows of that source. Invalid indices are masked. CSR pointers must
+    be monotonic and within their index-buffer capacity. Padding outside the
+    live CSR ranges is not read. Both sources contribute to one softmax.
+
+    Values and scales need unit channel stride and a positive, 4-byte-aligned
+    row stride covering their width. Row strides may differ between all four
+    views. In particular, ``cache[:, :512]`` and ``cache[:, 512:]`` from a
+    contiguous ``[S,528]`` byte cache are consumed directly, without copies,
+    index concatenation or a dequantized KV workspace. Empty sources are valid;
+    omit all four extend arguments together to use the prefix alone.
+
+    ``q`` is contiguous ``[T,H,512]``, H64/H128, in head-major layout. Prepared
+    FP8 Q requires contiguous E8M0/uint8 ``q_scale[T,H,16]`` and
+    ``q_is_rotated=True``. Alternatively pass BF16 Q and ``q_scale=None``;
+    group32 Q quantization is fused. Set ``q_is_rotated=False`` for forward
+    RoPE, and optionally ``q_norm=True`` for unweighted per-head RMSNorm.
+    Norm uses FP32 reduction with ``norm_eps``, rounds to BF16 before RoPE,
+    and requires raw BF16 Q. It never normalizes KV.
+
+    ``cos``/``sin`` are contiguous BF16 ``[P,32]`` tables for adjacent-pair
+    RoPE of the final 64 channels. ``positions`` is contiguous int32/int64
+    ``[T]``, with values in [0,P). ``attn_sink[H]`` is FP32 or None; it enters
+    only the softmax denominator. Selected values/scales must be finite, and
+    sink may also be -inf. ``backend`` accepts None or "opus" on gfx950.
+
+    Returns ``(out, out_scale, max_logits, lse)``. Unlike the attention-only
+    entry, out is E4M3FN ``[T,H/8,4096]`` after BF16 attention rounding,
+    inverse RoPE and group32 quantization; scales are row-layout E8M0
+    ``[T,H/8,128]``. Provide ``out``/``out_scale`` to reuse buffers. Optional
+    ``max_logits``/``lse`` are caller-allocated FP32 ``[T,H]``; omitted buffers
+    remain None and are not allocated or written. Their values exclude sink;
+    empty rows produce zero out, -inf max and +inf LSE. ``debug_out`` is an
+    optional FP32 ``[T,H,512]`` buffer after inverse RoPE, before quantization.
+
+    All tensors must be on q.device. Output buffers must be contiguous and
+    disjoint from inputs and each other. Warm up before graph capture.
+    The previous pool/tagged-address interface is available explicitly as
+    :func:`fused_norm_rope_attn_rope_cast_legacy`.
+    """
+    if backend not in (None, "opus"):
+        raise ValueError("backend must be None or 'opus'")
+    if not isinstance(q, torch.Tensor) or q.ndim != 3 or q.device.type != "cuda":
+        raise ValueError("q must be a GPU tensor [T,H,512]")
+    t, h, d = q.shape
+    if h not in (64, 128) or d != 512:
+        raise ValueError("two-source FP8 attention requires H64/H128 and D512")
+    if out is None:
+        out = torch.empty((t, h // 8, 4096), device=q.device, dtype=torch.float8_e4m3fn)
+    if out_scale is None:
+        out_scale = torch.empty(
+            (t, h // 8, 128), device=q.device, dtype=torch.float8_e8m0fnu
+        )
+    with torch.cuda.device(q.device):
+        fused_norm_rope_attn_rope_cast_fwd(
+            q,
+            q_scale,
+            unified_kv,
+            unified_kv_scale,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_scale,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            float(softmax_scale),
+            cos,
+            sin,
+            positions,
+            out,
+            out_scale,
+            max_logits,
+            lse,
+            debug_out,
+            q_is_rotated,
+            q_norm,
+            float(norm_eps),
+        )
+    return out, out_scale, max_logits, lse
