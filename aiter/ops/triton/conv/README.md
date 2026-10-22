@@ -61,8 +61,48 @@ y = conv2d(
     stride=(1, 1), padding=(1, 1), dilation=(1, 1),
     activation="relu",          # "none" | "relu" | "relu6" | "gelu"
     layout="nchw",              # "nchw" or "nhwc"
+    padding_mode="zeros",
 )
 ```
+
+### Conv2D padding modes
+
+The routed APIs `conv2d`, `conv2d_nchw`, and `conv2d_nhwc` accept the
+keyword-only argument `padding_mode`, defaulting to `"zeros"`. Existing
+positional arguments are unchanged. Padding is symmetric on opposing sides
+and accepts an integer or `(pad_height, pad_width)`.
+
+| Mode | Border behavior | Padding limits per spatial axis |
+|---|---|---|
+| `zeros` | Implicit zero padding in convolution | Nonnegative |
+| `reflect` | Mirror without repeating the edge | Less than the input size |
+| `replicate` | Repeat the nearest edge | Nonnegative; no dimension-based maximum |
+| `circular` | Wrap to the opposite edge | At most the input size |
+
+Input spatial dimensions must be positive, and padding must be nonnegative.
+Invalid modes are rejected even when padding is zero.
+
+For nonzero modes with positive padding, `torch.nn.functional.pad` prepares
+the input before route selection and activation packing. The result is
+converted to the requested storage layout when needed. Existing Triton
+convolution kernels receive the padded dimensions and effective padding
+`(0, 0)`. Routing may select a different kernel for the enlarged input.
+Materialization adds a temporary input tensor, with another copy possible
+for layout conversion. No padding-specific Triton configurations are used.
+
+The `zeros` path and valid modes with padding `(0, 0)` skip padding
+materialization. Input layout conversion may still be required.
+
+Input, weight, and bias must be on the same CUDA/ROCm device. Routed APIs
+select the input device for preparation, configuration lookup, activation
+packing, and convolution, then restore the caller's current device. Existing
+architecture and configuration caches are process-wide; multi-GPU use
+requires the same GPU architecture throughout the process. Mixed-architecture
+device support is outside this change.
+
+Direct specialized entry points such as `conv2d_1x1`, `conv2d_general`, and
+the direct, channel-blocked, and Winograd wrappers still accept only implicit
+zero padding. Extending their public signatures is a separate stage.
 
 ### Inference tensors
 
@@ -138,9 +178,10 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 - Only `groups=1` is implemented; callers must send depthwise or grouped
   convolutions to another backend.
-- Only zero padding is implemented. Per-axis pad amounts may differ, for
-  example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D, but callers must send
-  `"reflect"`, `"replicate"`, and `"circular"` padding modes to PyTorch/MIOpen.
+- Routed Conv2D supports `zeros`, `reflect`, `replicate`, and `circular`
+  padding as described above. Direct specialized Conv2D APIs and Conv3D
+  still support only zero padding. Per-axis pad amounts may differ, for
+  example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D.
 - Inputs must be `fp16` or `bf16`.
 - Forward only (no backward / training).
 

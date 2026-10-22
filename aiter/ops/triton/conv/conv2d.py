@@ -13,6 +13,7 @@ from aiter.ops.triton.conv._launch import (
     _launch_3x3_nhwc,
     _launch_general,
     _launch_winograd_f4x3,
+    _prepare_conv2d_padding,
 )
 from aiter.ops.triton.conv._prepack import (
     get_or_make_weight_pack,
@@ -175,6 +176,8 @@ def conv2d(
     dilation=(1, 1),
     activation="none",
     layout="nchw",
+    *,
+    padding_mode="zeros",
 ):
     """Forward 2-D conv on AMD ROCm via Triton. Drop-in for the forward of
     ``torch.nn.functional.conv2d`` (no backward).
@@ -182,8 +185,8 @@ def conv2d(
     A shape-driven router picks among six kernel families (1x1, direct NCHW
     3x3, cblocked 3x3, NHWC 3x3, Winograd F(4x4,3x3), general) per call.
 
-    Inputs must be fp16 or bf16. ``layout="nhwc"`` runs an NHWC-native kernel
-    with no internal layout conversion.
+    Inputs must be fp16 or bf16. ``layout="nhwc"`` returns channels-last
+    output and converts the input storage layout when needed.
 
     Output dtype always matches the input dtype, matching
     ``torch.nn.Conv2d`` semantics.
@@ -191,7 +194,9 @@ def conv2d(
     Notes
     -----
     - Only ``groups=1`` (depthwise/grouped raises ``AssertionError``).
-    - Only ``padding_mode="zeros"`` (no reflect/replicate/circular).
+    - ``padding_mode`` supports zeros, reflect, replicate, and circular.
+      Nonzero modes explicitly pad once before routing; convolution receives
+      the padded input and effective padding ``(0, 0)``.
     - ``bias=None`` skips the with-bias kernel path; passing a zero tensor
       instead routes through the with-bias kernel and times differently.
     """
@@ -203,12 +208,13 @@ def conv2d(
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
 
     _LOGGER.get_logger().info(
-        "CONV2D: x=%s w=%s stride=%s padding=%s dilation=%s "
+        "CONV2D: x=%s w=%s stride=%s padding=%s padding_mode=%s dilation=%s "
         "layout=%s dtype=%s bias=%s act=%s",
         tuple(x.shape),
         tuple(w_oihw.shape),
         stride,
         padding,
+        padding_mode,
         dilation,
         layout,
         x.dtype,
@@ -217,9 +223,27 @@ def conv2d(
     )
 
     if layout == "nhwc":
-        return conv2d_nhwc(x, w_oihw, bias, stride, padding, dilation, activation)
+        return conv2d_nhwc(
+            x,
+            w_oihw,
+            bias,
+            stride,
+            padding,
+            dilation,
+            activation,
+            padding_mode=padding_mode,
+        )
     else:
-        return conv2d_nchw(x, w_oihw, bias, stride, padding, dilation, activation)
+        return conv2d_nchw(
+            x,
+            w_oihw,
+            bias,
+            stride,
+            padding,
+            dilation,
+            activation,
+            padding_mode=padding_mode,
+        )
 
 
 def conv2d_winograd_f4x3(
@@ -438,9 +462,23 @@ def conv2d_nhwc_3x3(
 
 
 def _route_and_run(
-    x, w_oihw, bias, stride, padding, dilation, activation, block_k, layout
+    x,
+    w_oihw,
+    bias,
+    stride,
+    padding,
+    dilation,
+    activation,
+    block_k,
+    layout,
+    *,
+    padding_mode="zeros",
 ):
     """Resolve and execute one route, including required input preparation."""
+    if w_oihw.device != x.device or (bias is not None and bias.device != x.device):
+        raise ValueError("conv2d input, weight, and bias must be on the same device")
+    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout=layout)
+    x = _ensure_layout(x, layout)
     N, C, H, W_in = x.shape
     K_out, _, R, S = w_oihw.shape
     route = _resolve_route(
@@ -537,22 +575,29 @@ def conv2d_nchw(
     dilation=(1, 1),
     activation="none",
     block_k=BLOCK_K,
+    *,
+    padding_mode="zeros",
 ):
-    """Hybrid NCHW conv2d: routes to specialized 1x1, 3x3, or general kernel."""
+    """Route NCHW conv2d with zeros, reflect, replicate, or circular padding.
+
+    Nonzero modes pre-pad once before routing and activation packing.
+    Preparation and convolution run on the input tensor's device.
+    """
     assert x.is_cuda and w_oihw.is_cuda
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
-    x = _ensure_layout(x, "nchw")
-    return _route_and_run(
-        x,
-        w_oihw,
-        bias,
-        stride,
-        padding,
-        dilation,
-        activation,
-        block_k,
-        layout="nchw",
-    )
+    with torch.cuda.device(x.device):
+        return _route_and_run(
+            x,
+            w_oihw,
+            bias,
+            stride,
+            padding,
+            dilation,
+            activation,
+            block_k,
+            layout="nchw",
+            padding_mode=padding_mode,
+        )
 
 
 def conv2d_nhwc(
@@ -564,27 +609,33 @@ def conv2d_nhwc(
     dilation=(1, 1),
     activation="none",
     block_k=BLOCK_K,
+    *,
+    padding_mode="zeros",
 ):
     """Conv2d with NHWC (channels-last) input and output.
 
     Input x can be NCHW or NHWC — it will be converted to channels_last.
     Output y is allocated as channels_last (NHWC-contiguous) and returned
     in logical NCHW shape with channels_last strides.
+    Supports zeros, reflect, replicate, and circular padding; nonzero modes
+    pre-pad once before routing and activation packing. Preparation and
+    convolution run on the input tensor's device.
     """
     assert x.is_cuda and w_oihw.is_cuda
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
-    x = _ensure_layout(x, "nhwc")
-    return _route_and_run(
-        x,
-        w_oihw,
-        bias,
-        stride,
-        padding,
-        dilation,
-        activation,
-        block_k,
-        layout="nhwc",
-    )
+    with torch.cuda.device(x.device):
+        return _route_and_run(
+            x,
+            w_oihw,
+            bias,
+            stride,
+            padding,
+            dilation,
+            activation,
+            block_k,
+            layout="nhwc",
+            padding_mode=padding_mode,
+        )
 
 
 def conv2d_nchw_3x3_direct(
