@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import sys
-import threading
 import time
 import traceback
 import types
@@ -40,8 +39,6 @@ ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 AITER_DISABLE_KERNARG_PRELOAD = (
     int(os.environ.get("AITER_DISABLE_KERNARG_PRELOAD", "0")) != 0
 )
-_MAX_JOBS_LOCK = threading.Lock()
-_LAST_AUTO_MAX_JOBS = None
 
 
 def is_experimental_enabled() -> bool:
@@ -250,6 +247,18 @@ AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
 )
 
+# MegaMoE TP (aiter/ops/flydsl/mega_moe_tp.py): the small-batch engine's launch configs and
+# the big-M kernel's chunk plans
+AITER_CONFIG_MEGA_MOE_TP = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
+)
+
+AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -414,6 +423,20 @@ class AITER_CONFIG:
             "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
             AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
             "tuned_dispatch_combine_intranode",
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP", AITER_CONFIG_MEGA_MOE_TP, "mega_moe_tp_tuned"
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+            AITER_CONFIG_MEGA_MOE_TP_BIGM,
+            "mega_moe_tp_bigm_tuned",
         )
 
     @property
@@ -898,36 +921,6 @@ def check_LLVM_MAIN_REVISION():
         except OSError:
             pass
     return 554785 - 1
-
-
-def check_and_set_ninja_worker():
-    global _LAST_AUTO_MAX_JOBS
-
-    with _MAX_JOBS_LOCK:
-        max_jobs_env = os.environ.get("MAX_JOBS")
-        if max_jobs_env is not None:
-            try:
-                max_jobs = int(max_jobs_env)
-                if max_jobs > 0 and max_jobs_env != _LAST_AUTO_MAX_JOBS:
-                    os.environ["MAX_JOBS"] = str(max_jobs)
-                    _LAST_AUTO_MAX_JOBS = None
-                    return
-            except ValueError:
-                pass
-
-        max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
-        import psutil
-
-        # calculate the maximum allowed NUM_JOBS based on free memory
-        free_memory_gb = psutil.virtual_memory().available / (
-            1024**3
-        )  # free memory in GB
-        max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
-
-        # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-        max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
-        _LAST_AUTO_MAX_JOBS = str(max_jobs)
-        os.environ["MAX_JOBS"] = _LAST_AUTO_MAX_JOBS
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
@@ -1426,8 +1419,6 @@ def build_module(
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
-        check_and_set_ninja_worker()
-
         blob_dir = f"{op_dir}/blob"
         staged_blob_dir = None
         staged_token = None
@@ -2262,7 +2253,6 @@ def compile_ops(
                     return None
 
                 def check_args():
-                    get_asm_dir()
                     import inspect
                     import re
 

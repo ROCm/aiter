@@ -128,6 +128,7 @@ from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
     MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK,
 )
 from aiter.ops.gemm_op_common import find_padded_m_row
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -1348,4 +1349,5 @@ def main():
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()
