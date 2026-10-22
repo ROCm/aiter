@@ -139,6 +139,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     m_alignment=0,
     m_expert_tile_map=None,
     expert_tile_m=0,
+    reuse_persistent_map_loads=0,
+    defer_persistent_output_fence=0,
+    lds_n_partitions=1,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -182,13 +185,24 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_single_task = int(persistent_single_task)
     force_mid_compute = int(force_mid_compute)
     linear_wg_map = int(linear_wg_map)
+    reuse_persistent_map_loads = int(reuse_persistent_map_loads)
+    defer_persistent_output_fence = int(defer_persistent_output_fence)
+    lds_n_partitions = int(lds_n_partitions)
     if any(
         value not in (0, 1)
-        for value in (persistent_single_task, force_mid_compute, linear_wg_map)
+        for value in (
+            persistent_single_task,
+            force_mid_compute,
+            linear_wg_map,
+            reuse_persistent_map_loads,
+            defer_persistent_output_fence,
+        )
     ):
         raise ValueError("persistent and pipeline policies must be 0 or 1")
     if persistent_single_task and not persistent_workers:
         raise ValueError("persistent single-task mode requires persistent workers")
+    if lds_n_partitions not in (1, 2, 4, 8):
+        raise ValueError("lds_n_partitions must be 1, 2, 4, or 8")
     if persistent_workers:
         if cluster_m != 1:
             raise ValueError("persistent workers require cluster_m=1")
@@ -289,5 +303,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_single_task=persistent_single_task,
         force_mid_compute=force_mid_compute,
         linear_wg_map=linear_wg_map,
+        reuse_persistent_map_loads=reuse_persistent_map_loads,
+        defer_persistent_output_fence=defer_persistent_output_fence,
+        lds_n_partitions=lds_n_partitions,
     )
     return out

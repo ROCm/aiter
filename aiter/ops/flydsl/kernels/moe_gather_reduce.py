@@ -105,6 +105,7 @@ def build_moe_gather_reduce_module(
     vec_dwords: int = 2,
     w_dtype: str = "f32",
     block_threads: int = BLOCK_THREADS,
+    fuse_token_iters: bool = False,
 ):
     assert model_dim % 2 == 0
     assert out_dtype in ("bf16", "f16")
@@ -124,6 +125,7 @@ def build_moe_gather_reduce_module(
         f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
         f"_w{w_dtype}_frlds"
         f"{f'_bt{block_threads}' if block_threads != BLOCK_THREADS else ''}"
+        f"{'_fusediters' if fuse_token_iters else ''}"
     )
 
     @flyc.kernel(name=module_name)
@@ -183,13 +185,10 @@ def build_moe_gather_reduce_module(
                 # the multiply by the route's (zero) weight.
                 row_i32 = fx.Int32(rows_t[map_off])
                 _lds_si32(rows_lds, row_i32, tid)
-                # .to(Float32) is a no-op when the route weights are already f32.
+                # .to(Float32) is a no-op when route weights are already f32.
                 w_f32 = w_dt_fx(w_t[map_off]).to(fx.Float32)
                 _lds_si32(wbits_lds, w_f32.bitcast(fx.Int32), tid)
             gpu.barrier()
-
-            thread_id = fx.Uint32(tid)
-            iter_idx_i32 = fx.Uint32(fx.block_idx.y)
 
             row_bytes_i32 = fx.Int32(out_dwords * 4)
 
@@ -220,69 +219,91 @@ def build_moe_gather_reduce_module(
                     _row_rsrc(row_i32, sk), dw_off, vec_width=vec_width, dtype=i32
                 )
 
-            dw_base = thread_id * vec_i32 + iter_idx_i32 * DWORDS_PER_ITER
-            dw_valid = dw_base < out_dwords_i32
-            if dw_valid:
-                full_valid = dw_base + vec_i32 <= out_dwords_i32
-                if full_valid:
-                    acc = [fx.Float32(0.0) for _ in range(2 * VEC)]
-                    vec_atom = buf_copy_atom(VEC * 4)
-                    out_vec_t = ptr_buf_tensor(out, unit_elems=VEC, unit_stride=1)
-                    frag = fx.make_fragment_like(fx.slice(out_vec_t, (0, None)))
+            thread_id = fx.Uint32(tid)
 
-                    for k in range_constexpr(topk):
-                        row_i32, w_f32 = _row_weight(k)
-                        red = [fx.Float32(0.0) for _ in range(2 * VEC)]
-                        for sk in range_constexpr(split_k):
-                            raw_vec = fx.Vector(load_flat(row_i32, sk, dw_base, VEC))
-                            for lane in range_constexpr(VEC):
-                                raw_dw = fx.Uint32(raw_vec[lane])
-                                lo_f32, hi_f32 = _unpack_pair_to_f32(raw_dw, out_dtype)
-                                red[2 * lane] = red[2 * lane] + lo_f32
-                                red[2 * lane + 1] = red[2 * lane + 1] + hi_f32
-                        for lane in range_constexpr(VEC):
-                            acc[2 * lane] = acc[2 * lane] + w_f32 * red[2 * lane]
-                            acc[2 * lane + 1] = (
-                                acc[2 * lane + 1] + w_f32 * red[2 * lane + 1]
-                            )
-                    packed = [
-                        _pack_pair_from_f32(acc[2 * lane], acc[2 * lane + 1], out_dtype)
-                        for lane in range(VEC)
-                    ]
-                    fx.memref_store_vec(
-                        fx.Vector.from_elements(packed, fx.Uint32), frag
-                    )
-                    fx.copy(
-                        vec_atom,
-                        frag,
-                        fx.slice(out_vec_t, (out_row_dw_base + dw_base, None)),
-                    )
-                else:
-                    out_t = ptr_buf_tensor(out)
-                    for lane in range_constexpr(VEC):
-                        dw_idx = dw_base + lane
-                        lane_valid = dw_idx < out_dwords_i32
-                        if lane_valid:
-                            acc_lo = fx.Float32(0.0)
-                            acc_hi = fx.Float32(0.0)
-                            for k in range_constexpr(topk):
-                                row_i32, w_f32 = _row_weight(k)
-                                red_lo = fx.Float32(0.0)
-                                red_hi = fx.Float32(0.0)
-                                for sk in range_constexpr(split_k):
-                                    raw_dw = fx.Uint32(
-                                        load_flat(row_i32, sk, dw_idx, 1)
-                                    )
+            def process_iter(iter_idx_i32):
+                dw_base = thread_id * vec_i32 + iter_idx_i32 * DWORDS_PER_ITER
+                dw_valid = dw_base < out_dwords_i32
+                if dw_valid:
+                    full_valid = dw_base + vec_i32 <= out_dwords_i32
+                    if full_valid:
+                        acc = [fx.Float32(0.0) for _ in range(2 * VEC)]
+                        vec_atom = buf_copy_atom(VEC * 4)
+                        out_vec_t = ptr_buf_tensor(
+                            out, unit_elems=VEC, unit_stride=1
+                        )
+                        frag = fx.make_fragment_like(fx.slice(out_vec_t, (0, None)))
+
+                        for k in range_constexpr(topk):
+                            row_i32, w_f32 = _row_weight(k)
+                            red = [fx.Float32(0.0) for _ in range(2 * VEC)]
+                            for sk in range_constexpr(split_k):
+                                raw_vec = fx.Vector(
+                                    load_flat(row_i32, sk, dw_base, VEC)
+                                )
+                                for lane in range_constexpr(VEC):
+                                    raw_dw = fx.Uint32(raw_vec[lane])
                                     lo_f32, hi_f32 = _unpack_pair_to_f32(
                                         raw_dw, out_dtype
                                     )
-                                    red_lo = red_lo + lo_f32
-                                    red_hi = red_hi + hi_f32
-                                acc_lo = acc_lo + w_f32 * red_lo
-                                acc_hi = acc_hi + w_f32 * red_hi
-                            out_t[out_row_dw_base + dw_idx] = _pack_pair_from_f32(
-                                acc_lo, acc_hi, out_dtype
+                                    red[2 * lane] = red[2 * lane] + lo_f32
+                                    red[2 * lane + 1] = red[2 * lane + 1] + hi_f32
+                            for lane in range_constexpr(VEC):
+                                acc[2 * lane] = (
+                                    acc[2 * lane] + w_f32 * red[2 * lane]
+                                )
+                                acc[2 * lane + 1] = (
+                                    acc[2 * lane + 1]
+                                    + w_f32 * red[2 * lane + 1]
+                                )
+                        packed = [
+                            _pack_pair_from_f32(
+                                acc[2 * lane], acc[2 * lane + 1], out_dtype
                             )
+                            for lane in range(VEC)
+                        ]
+                        fx.memref_store_vec(
+                            fx.Vector.from_elements(packed, fx.Uint32), frag
+                        )
+                        fx.copy(
+                            vec_atom,
+                            frag,
+                            fx.slice(out_vec_t, (out_row_dw_base + dw_base, None)),
+                        )
+                    else:
+                        out_t = ptr_buf_tensor(out)
+                        for lane in range_constexpr(VEC):
+                            dw_idx = dw_base + lane
+                            lane_valid = dw_idx < out_dwords_i32
+                            if lane_valid:
+                                acc_lo = fx.Float32(0.0)
+                                acc_hi = fx.Float32(0.0)
+                                for k in range_constexpr(topk):
+                                    row_i32, w_f32 = _row_weight(k)
+                                    red_lo = fx.Float32(0.0)
+                                    red_hi = fx.Float32(0.0)
+                                    for sk in range_constexpr(split_k):
+                                        raw_dw = fx.Uint32(
+                                            load_flat(row_i32, sk, dw_idx, 1)
+                                        )
+                                        lo_f32, hi_f32 = _unpack_pair_to_f32(
+                                            raw_dw, out_dtype
+                                        )
+                                        red_lo = red_lo + lo_f32
+                                        red_hi = red_hi + hi_f32
+                                    acc_lo = acc_lo + w_f32 * red_lo
+                                    acc_hi = acc_hi + w_f32 * red_hi
+                                out_t[
+                                    out_row_dw_base + dw_idx
+                                ] = _pack_pair_from_f32(
+                                    acc_lo, acc_hi, out_dtype
+                                )
+
+            if fuse_token_iters:
+                for iter_idx in range_constexpr(n_iters):
+                    process_iter(fx.Uint32(iter_idx))
+            else:
+                process_iter(fx.Uint32(fx.block_idx.y))
 
     @flyc.jit
     def launch_moe_gather_reduce(
@@ -305,7 +326,7 @@ def build_moe_gather_reduce_module(
             num_valid_tokens,
         )
         launcher.launch(
-            grid=(fx.Int64(num_tokens), n_iters, 1),
+            grid=(fx.Int64(num_tokens), 1 if fuse_token_iters else n_iters, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )

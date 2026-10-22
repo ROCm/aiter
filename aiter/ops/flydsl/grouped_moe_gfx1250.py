@@ -597,6 +597,13 @@ def _grouped_a8w4_tdm_moe(
     force_mid_compute2=0,
     linear_wg_map=0,
     linear_wg_map2=0,
+    reuse_persistent_map_loads=0,
+    reuse_persistent_map_loads2=0,
+    defer_persistent_output_fence=0,
+    defer_persistent_output_fence2=0,
+    gather_fuse_token_iters=0,
+    lds_n_partitions=1,
+    lds_n_partitions2=1,
     rolled_drain=0,
     persistent_workers=0,
     persistent_workers2=0,
@@ -664,9 +671,21 @@ def _grouped_a8w4_tdm_moe(
             force_mid_compute2,
             linear_wg_map,
             linear_wg_map2,
+            reuse_persistent_map_loads,
+            reuse_persistent_map_loads2,
+            defer_persistent_output_fence,
+            defer_persistent_output_fence2,
+            gather_fuse_token_iters,
         )
     ):
         raise ValueError("stage-specific pipeline and task-map values must be 0 or 1")
+    if lds_n_partitions not in (1, 2, 4, 8) or lds_n_partitions2 not in (
+        1,
+        2,
+        4,
+        8,
+    ):
+        raise ValueError("stage-specific LDS N partitions must be 1, 2, 4, or 8")
     if _compact:
         # The plan padded every expert's row count up to this alignment, and its
         # psum is what the GEMM binary-searches as its m-tile map. A tile wider
@@ -1151,6 +1170,9 @@ def _grouped_a8w4_tdm_moe(
             num_buffers=num_buffers,
             force_mid_compute=force_mid_compute,
             linear_wg_map=linear_wg_map,
+            reuse_persistent_map_loads=reuse_persistent_map_loads,
+            defer_persistent_output_fence=defer_persistent_output_fence,
+            lds_n_partitions=lds_n_partitions,
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
@@ -1199,6 +1221,9 @@ def _grouped_a8w4_tdm_moe(
             num_buffers=num_buffers,
             force_mid_compute=force_mid_compute,
             linear_wg_map=linear_wg_map,
+            reuse_persistent_map_loads=reuse_persistent_map_loads,
+            defer_persistent_output_fence=defer_persistent_output_fence,
+            lds_n_partitions=lds_n_partitions,
             persistent_workers=persistent_workers,
             persistent_single_task=int(_stage1_single_task),
             m_alignment=_stage1_m_alignment,
@@ -1255,6 +1280,9 @@ def _grouped_a8w4_tdm_moe(
         persistent_single_task=int(_stage2_single_task),
         force_mid_compute=force_mid_compute2,
         linear_wg_map=linear_wg_map2,
+        reuse_persistent_map_loads=reuse_persistent_map_loads2,
+        defer_persistent_output_fence=defer_persistent_output_fence2,
+        lds_n_partitions=lds_n_partitions2,
         m_alignment=_stage2_m_alignment,
         m_expert_tile_map=_m_expert_tile_map,
         expert_tile_m=min(tile_m, tile_m2),
@@ -1338,6 +1366,9 @@ def _grouped_a8w4_tdm_moe(
                         num_buffers=num_buffers,
                         force_mid_compute=force_mid_compute,
                         linear_wg_map=linear_wg_map,
+                        reuse_persistent_map_loads=reuse_persistent_map_loads,
+                        defer_persistent_output_fence=defer_persistent_output_fence,
+                        lds_n_partitions=lds_n_partitions,
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
@@ -1388,6 +1419,9 @@ def _grouped_a8w4_tdm_moe(
                         num_buffers=num_buffers,
                         force_mid_compute=force_mid_compute,
                         linear_wg_map=linear_wg_map,
+                        reuse_persistent_map_loads=reuse_persistent_map_loads,
+                        defer_persistent_output_fence=defer_persistent_output_fence,
+                        lds_n_partitions=lds_n_partitions,
                         persistent_workers=persistent_workers,
                         persistent_single_task=int(_stage1_single_task),
                         m_alignment=_stage1_m_alignment,
@@ -1435,6 +1469,9 @@ def _grouped_a8w4_tdm_moe(
                     persistent_single_task=int(_stage2_single_task),
                     force_mid_compute=force_mid_compute2,
                     linear_wg_map=linear_wg_map2,
+                    reuse_persistent_map_loads=reuse_persistent_map_loads2,
+                    defer_persistent_output_fence=defer_persistent_output_fence2,
+                    lds_n_partitions=lds_n_partitions2,
                     m_alignment=_stage2_m_alignment,
                     m_expert_tile_map=_m_expert_tile_map,
                     expert_tile_m=min(tile_m, tile_m2),
@@ -1475,6 +1512,7 @@ def _grouped_a8w4_tdm_moe(
         gather_w,
         out=moe_out,
         num_valid_tokens=(_ep_nvt if _is_ep else None),
+        fuse_token_iters=bool(gather_fuse_token_iters),
     )
     return moe_out
 
@@ -1743,6 +1781,27 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["linear_wg_map2"] = _as_int(
                 cfg_row.get("linear_wg_map2"), 0
             )
+            _tdm_kw["reuse_persistent_map_loads"] = _as_int(
+                cfg_row.get("reuse_persistent_map_loads1"), 0
+            )
+            _tdm_kw["reuse_persistent_map_loads2"] = _as_int(
+                cfg_row.get("reuse_persistent_map_loads2"), 0
+            )
+            _tdm_kw["defer_persistent_output_fence"] = _as_int(
+                cfg_row.get("defer_persistent_output_fence1"), 0
+            )
+            _tdm_kw["defer_persistent_output_fence2"] = _as_int(
+                cfg_row.get("defer_persistent_output_fence2"), 0
+            )
+            _tdm_kw["gather_fuse_token_iters"] = _as_int(
+                cfg_row.get("gather_fuse_token_iters"), 0
+            )
+            _tdm_kw["lds_n_partitions"] = _as_int(
+                cfg_row.get("lds_n_partitions1"), 1
+            )
+            _tdm_kw["lds_n_partitions2"] = _as_int(
+                cfg_row.get("lds_n_partitions2"), 1
+            )
             _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
             # GEMM1 always has a local epilogue; stage2_scatter only changes
             # GEMM2, so it does not restrict GEMM1's persistent scheduler.
@@ -1858,6 +1917,7 @@ def _get_compiled_gather_reduce(
     vec_dwords: int = 2,
     w_dtype: str = "f32",
     block_threads: int = 256,
+    fuse_token_iters: bool = False,
 ):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -1872,6 +1932,7 @@ def _get_compiled_gather_reduce(
         vec_dwords,
         w_dtype,
         block_threads,
+        fuse_token_iters,
     )
 
 
@@ -2141,6 +2202,7 @@ def flydsl_moe_gather_reduce(
     num_valid_tokens: (
         torch.Tensor | None
     ) = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
+    fuse_token_iters: bool = False,
 ) -> torch.Tensor:
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
 
@@ -2194,6 +2256,7 @@ def flydsl_moe_gather_reduce(
         gather_vec,
         w_dtype,
         gather_threads,
+        bool(fuse_token_iters),
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
