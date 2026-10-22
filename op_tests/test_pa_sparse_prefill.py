@@ -711,6 +711,46 @@ def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
     )
 
 
+# Force both paths to cover CSR transitions, tails and partial head tiles.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("h", [16, 24, 32], ids=lambda h: f"h{h}")
+@pytest.mark.parametrize("num_kv_splits", [1, 4], ids=["unsplit", "split4"])
+@pytest.mark.parametrize(
+    "total_pages,total_tokens,topk",
+    [
+        pytest.param(0, 0, 64, id="empty"),
+        pytest.param(0, 129, 65, id="extend-only"),
+        pytest.param(129, 0, 65, id="prefix-only"),
+        pytest.param(129, 129, 63, id="both-tail63"),
+        pytest.param(129, 129, 64, id="both-full64"),
+        pytest.param(129, 129, 65, id="both-tail65"),
+        pytest.param(257, 257, 129, id="both-tail129"),
+    ],
+)
+def test_opus_csr_boundaries(dtype, h, num_kv_splits, total_pages, total_tokens, topk):
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the source-compiled OPUS paths require gfx950")
+    inputs = _make_inputs(
+        n=65,
+        h=h,
+        d=512,
+        total_pages=total_pages,
+        total_tokens=total_tokens,
+        dtype=dtype,
+        topk=topk,
+        seed=42,
+    )
+    softmax_scale = 1.0 / math.sqrt(512)
+    expected = _ref_pa_sparse_prefill_opus(**inputs, softmax_scale=softmax_scale)
+    actual = pa_sparse_prefill_opus(
+        **inputs, softmax_scale=softmax_scale, num_kv_splits=num_kv_splits
+    )
+    err = checkAllclose(
+        actual, expected, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+    )
+    assert err <= _ERR_TOL
+
+
 # ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
 # ---------------------------------------------------------------------------
