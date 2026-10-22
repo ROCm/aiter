@@ -39,7 +39,6 @@ from typing import Any
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
 from aiter.utility.graph_alloc import persistent_alloc
@@ -933,25 +932,21 @@ def _reduce_split_k(
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     if tid == 0:
-        # Scoped atomics have no stable FlyDSL API before 0.4 (fx.llvm.atomic_add
-        # / generic_store); the arrival counter needs agent scope across XCDs.
-        sem_ptr = fx.to_llvm_ptr(fx.add_offset(fx.get_iter(semaphore), tile_id))
-        arrived = llvm.AtomicRMWOp(
-            llvm.AtomicBinOp.add,
+        # Agent scope: the arrival counter is shared across XCDs.
+        sem_ptr = fx.add_offset(fx.get_iter(semaphore), tile_id)
+        arrived = fx.llvm.atomic_add(
             sem_ptr,
-            fx.Int32(1).ir_value(),
-            llvm.AtomicOrdering.monotonic,
-            syncscope="agent",
-            alignment=4,
-        ).result
-        fx.ptr_store(fx.Int32(arrived), smem_flag)
-        if fx.Int32(arrived) == split_k - 1:
-            llvm.StoreOp(
-                fx.Int32(0).ir_value(),
+            fx.Int32(1),
+            syncscope=fx.rocdl.SyncScope.Agent,
+            ordering=fx.AtomicOrdering.Monotonic,
+        )
+        fx.ptr_store(arrived, smem_flag)
+        if arrived == split_k - 1:
+            fx.llvm.generic_store(
                 sem_ptr,
-                alignment=4,
-                ordering=llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
+                fx.Int32(0),
+                memory_order=fx.AtomicOrdering.Monotonic,
+                syncscope=fx.rocdl.SyncScope.Agent,
             )
     gpu.barrier()
     is_last = fx.Int32(fx.ptr_load(smem_flag)) == split_k - 1
