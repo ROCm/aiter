@@ -108,12 +108,8 @@ def _launcher(
     class MXSharedTiles:
         a: fx.Array[fx.BFloat16, lds_stages * block_m * lds_k, 16]
         # One int32 contains the eight FP4 values consumed by one MFMA lane.
-        b: fx.Array[
-            fx.Int32, lds_stages * halves * block_n * (lds_k // 8), 16
-        ]
-        scale: fx.Array[
-            fx.Int8, lds_stages * halves * block_n * (lds_k // 32), 16
-        ]
+        b: fx.Array[fx.Int32, lds_stages * halves * block_n * (lds_k // 8), 16]
+        scale: fx.Array[fx.Int8, lds_stages * halves * block_n * (lds_k // 32), 16]
 
     def e8m0_to_f32(exponent):
         """E8M0 biased exponent (in the low byte of an i32) -> f32 multiplier.
@@ -194,9 +190,7 @@ def _launcher(
                     )
                 )
             )
-        return _to_raw(
-            fx.Vector.from_elements(gathered, fx.Int32).bitcast(fx.BFloat16)
-        )
+        return _to_raw(fx.Vector.from_elements(gathered, fx.Int32).bitcast(fx.BFloat16))
 
     def schedule_bf16_lds_loop():
         # Keep the next tile's VMEM/DS writes in flight while the current tile
@@ -265,7 +259,7 @@ def _launcher(
                 e_r, m_block, vec_width=1, dtype=T.i32, is_scalar=True
             )
         )
-        if m_block * block_m < post:
+        if m_block * block_m < post:  # noqa: SIM102 -- two traced runtime guards
             if expert >= 0:
                 # Expert base is 64-bit, so a multi-GB expert stack never wraps
                 # the hardware's 32-bit buffer offset.
@@ -492,9 +486,7 @@ def _launcher(
                                 lds_stages * halves * block_n * lds_k // 2, 1
                             ),
                         )
-                        b_lds_tiles = fx.logical_divide(
-                            b_lds_i32, fx.make_layout(4, 1)
-                        )
+                        b_lds_tiles = fx.logical_divide(b_lds_i32, fx.make_layout(4, 1))
 
                     def fill_lds(tile_k, stage):
                         tid = fx.thread_idx.x
@@ -627,7 +619,9 @@ def _launcher(
                             n_scales = n_repeat * halves
                             raw_words = list(state[acc_count : acc_count + n_words])
                             raw_scales = list(
-                                state[acc_count + n_words : acc_count + n_words + n_scales]
+                                state[
+                                    acc_count + n_words : acc_count + n_words + n_scales
+                                ]
                             )
                             step = local_tile_i + 1
                             next_tile = (step < split_tiles).select(
@@ -734,9 +728,7 @@ def _launcher(
                                         + fx.Int64(stage)
                                         * (halves * block_n * (lds_k // 8))
                                         + fx.Int64(
-                                            local * (lds_k // 8)
-                                            + ku * 4
-                                            + lane // 16
+                                            local * (lds_k // 8) + ku * 4 + lane // 16
                                         ),
                                         result_type=fx.Int32,
                                     )
@@ -761,9 +753,7 @@ def _launcher(
                                     )
                                 elif fx.const_expr(use_bf16_reg_transpose):
                                     local_col = (
-                                        wave_n * (n_repeat * 16)
-                                        + nr * 16
-                                        + lane // 4
+                                        wave_n * (n_repeat * 16) + nr * 16 + lane // 4
                                     )
                                     col = half * N + n_block * block_n + local_col
                                     loaded_b = buffer_ops.buffer_load(
