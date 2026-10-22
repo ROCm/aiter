@@ -333,7 +333,7 @@ def test_nvfp4_quant(
         pytest.skip("NVFP4 quantization is only supported on GFX1250")
 
     torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda"
     x_og = torch.randn(M, N, device=device, dtype=dtype) / 20
     x_q_triton, x_s_triton = dynamic_nvfp4_quant(x_og)
     x_q_torch, x_s_torch = torch_dynamic_mxfp4_quant(x_og, is_nvfp4=True)
@@ -601,7 +601,9 @@ def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
     )
     # Rounding ties, -0.0 and an all-zero block.
     x[0, :8] = torch.tensor(
-        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.0], device="cuda"
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.0],
+        dtype=torch.float32,
+        device="cuda",
     )
     x[1, :32] = 0.0
     outs = []

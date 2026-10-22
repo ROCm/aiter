@@ -99,7 +99,7 @@ def test_fused_qk_norm_rope_group_quant(num_tokens):
     # The scale rounding modes differ only when amax / 448 is a power of two or
     # amax is 0. Random data does not have these cases. Add them to two Q rows.
     # Token 0, head 0: the RMS is 8, so in group 0 amax / 448 = 14 / 8 / 448 = 2^-8.
-    row = torch.full((HEAD_DIM,), 8.0, device="cuda")
+    row = torch.full((HEAD_DIM,), 8.0, device="cuda", dtype=torch.float32)
     row[0], row[1], row[2:5] = 14.0, 4.0, 6.0  # 14**2 + 4**2 + 3 * 6**2 = 5 * 8**2
     inputs["q"][0, 0] = row
     # Token 1, head 0: group 1 is all zeros.

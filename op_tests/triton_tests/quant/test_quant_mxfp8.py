@@ -1365,7 +1365,9 @@ def test_compress_norm_rope_store_matches_reference(
         0, a.state_cache.shape[0], a.block_table.shape, dtype=torch.int32, device=dev
     )
     grp = torch.arange(hd, device=dev) // _GROUP
-    gain = torch.where(grp < _NUM_TILES, torch.exp2(3.0 * (grp - 3)), 1.0)
+    gain = torch.where(
+        grp < _NUM_TILES, torch.exp2(3.0 * (grp - 3).to(torch.float32)), 1.0
+    )
     a.rms_norm_weight = (
         (torch.rand(hd, device=dev, dtype=torch.float32) * 0.5 + 0.75) * gain
     ).to(torch.bfloat16)

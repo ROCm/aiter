@@ -43,8 +43,10 @@ def make_inputs(B, T, H, device):
         "v": dense(),
         "g": dense(),
         "beta": in_proj[..., 4 * H * D + D : 4 * H * D + D + H],
-        "A_log": torch.log(torch.empty(H, device=device).uniform_(1, 16)),
-        "dt_bias": torch.randn(H * D, device=device),
+        "A_log": torch.log(
+            torch.empty(H, dtype=torch.float32, device=device).uniform_(1, 16)
+        ),
+        "dt_bias": torch.randn(H * D, dtype=torch.float32, device=device),
         "cu_seqlens": torch.arange(0, total + 1, T, dtype=torch.int32, device=device),
     }
 
@@ -133,7 +135,9 @@ def benchmark(args):
     def bench_chunk_kda(H, B, T, provider):
         torch.manual_seed(0)
         inp = make_inputs(B, T, H, args.device)
-        state = torch.randn(B, H, K3_HEAD_DIM, K3_HEAD_DIM, device=args.device)
+        state = torch.randn(
+            B, H, K3_HEAD_DIM, K3_HEAD_DIM, dtype=torch.float32, device=args.device
+        )
         idx = torch.arange(B, dtype=torch.int32, device=args.device)
         has_init = torch.ones(B, dtype=torch.bool, device=args.device)
         paged = {

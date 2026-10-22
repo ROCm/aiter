@@ -1107,7 +1107,9 @@ def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
     k.requires_grad = True
     v.requires_grad = True
     cu_seqlens = torch.tensor(
-        [0, *torch.tensor(seqlens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+        [0, *torch.tensor(seqlens, device="cuda").cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
     )
 
     if bwd_mode is None:

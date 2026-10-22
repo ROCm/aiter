@@ -289,11 +289,17 @@ def test_causal_conv1d_varlen(
     padded_batch_size = batch_size + padding
     nsplits = padded_batch_size - 1
 
-    eos_pos = torch.randperm(seqlen - 1)[:nsplits].sort().values
+    eos_pos = torch.randperm(seqlen - 1, device=device)[:nsplits].sort().values
 
     seqlens.append(
         torch.diff(
-            torch.cat([torch.tensor([-1]), eos_pos, torch.tensor([seqlen - 1])])
+            torch.cat(
+                [
+                    torch.tensor([-1], device=device),
+                    eos_pos,
+                    torch.tensor([seqlen - 1], device=device),
+                ]
+            )
         ).tolist()
     )
     assert sum(seqlens[-1]) == seqlen

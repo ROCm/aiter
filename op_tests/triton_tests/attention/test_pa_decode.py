@@ -93,7 +93,9 @@ def input_helper(
         query = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
 
     if kv_cache_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        x = min(D, 16 // torch.tensor([], dtype=torch.float16).element_size())
+        x = min(
+            D, 16 // torch.tensor([], dtype=torch.float16, device="cuda").element_size()
+        )
         key_cache = torch.randn(
             num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=torch.float16, device="cuda"
         )
@@ -111,7 +113,10 @@ def input_helper(
         key_cache = key_cache.to(dtype=kv_cache_dtype)
         value_cache = value_cache.to(dtype=kv_cache_dtype)
     else:
-        x = min(D, 16 // torch.tensor([], dtype=kv_cache_dtype).element_size())
+        x = min(
+            D,
+            16 // torch.tensor([], dtype=kv_cache_dtype, device="cuda").element_size(),
+        )
         key_cache = torch.randn(
             num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=kv_cache_dtype, device="cuda"
         )
@@ -235,8 +240,8 @@ def test_paged_attn(
         attn_scale,
         max_context_len,
         compute_type,
-        k_scale=torch.tensor([1.0], dtype=torch.float32),
-        v_scale=torch.tensor([1.0], dtype=torch.float32),
+        k_scale=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+        v_scale=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
         num_seq_partitions=0,
         alibi_slopes=None,
     )
@@ -338,8 +343,8 @@ def test_paged_attn_multi_partition_dispatch(B, H_Q, H_KV, SEQ_LEN, dtype, monke
         1.0 / head_size**0.5,
         int(max_context_len),
         compute_type,
-        k_scale=torch.tensor([1.0], dtype=torch.float32),
-        v_scale=torch.tensor([1.0], dtype=torch.float32),
+        k_scale=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+        v_scale=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
     )
 
     num_partitions = -(-SEQ_LEN // pa_decode_mod._SEQ_PARTITION_SIZE)

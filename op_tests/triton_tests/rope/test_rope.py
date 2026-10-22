@@ -1177,7 +1177,7 @@ def test_rope_fwd_3d(
     dtype: torch.dtype,
 ):
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
     sp_size = 8
     max_seq_len = 1024
 

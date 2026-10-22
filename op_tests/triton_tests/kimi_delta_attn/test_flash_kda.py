@@ -219,7 +219,9 @@ def test_tail_chunk(T):
 def test_varlen_matches_reference(lens):
     total = sum(lens)
     cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
     args = make_inputs(1, total, 4)
     o_ref, _ = run_reference(*args, cu_seqlens=cu_seqlens)
@@ -267,7 +269,9 @@ def test_varlen_initial_state(state_v_first):
     """
     lens = [128, 100, 64]
     cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
     args = make_inputs(1, sum(lens), 4)
     h0 = (
@@ -352,7 +356,9 @@ def test_segmented_varlen_uneven():
     """Sequences whose last segment is short, and one shorter than a segment."""
     lens = [500, 33, 257, 64]
     cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
     args = make_inputs(1, sum(lens), 4)
     h0 = torch.randn(len(lens), 4, K_DIM, K_DIM, device=device, dtype=torch.float32)
@@ -437,7 +443,9 @@ def test_published_k2_schedules_can_split_their_tile():
 
 def _varlen(lens):
     return torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
 
 
@@ -643,7 +651,9 @@ def test_final_state_matches_fp32_recurrence(lower_bound):
     """
     lens = [200, 100, 156]
     cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
     args = make_inputs(1, sum(lens), 4)
     kw = {

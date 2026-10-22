@@ -136,7 +136,7 @@ def dynamic_nvfp4_quant_kv_cache(
     return key_cache_quant_and_shuffled, value_cache_quant_and_shuffled
 
 
-def uniform_random(shape, start=0, end=1, dtype=None, device=None):
+def uniform_random(shape, start=0, end=1, dtype=torch.float32, device="cuda"):
     return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
 
 
@@ -155,7 +155,7 @@ def generate_data(
     use_q_descale=None,
     use_kv_descale=None,
     use_out_scale=False,
-    device="cpu",
+    device="cuda",
 ):
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
@@ -313,7 +313,6 @@ def ref_paged_attn(
     causal: int = 1,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
-    block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
     v_head_size = value_cache.shape[-1]
     outputs: list[torch.Tensor] = []

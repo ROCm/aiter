@@ -267,7 +267,7 @@ def test_flash_attn_kvcache(
     seqlen_new = (
         seqlen_q
         if seqlen_new_eq_seqlen_q
-        else torch.randint(1, seqlen_q + 1, (1,)).item()
+        else torch.randint(1, seqlen_q + 1, (1,), device=device).item()
     )
     if new_kv:
         k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)

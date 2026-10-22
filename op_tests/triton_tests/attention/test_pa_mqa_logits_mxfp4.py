@@ -1163,7 +1163,9 @@ def test_varlen(shape, num_heads, page_size, plan_n, dyn):
     q4s = q4s.reshape(total, num_heads, hs // SCALE_GROUP)
     w = torch.randn(total, num_heads, device="cuda", dtype=torch.float32)
     cu = torch.tensor(
-        [0] + list(torch.tensor(rows).cumsum(0)), dtype=torch.int32, device="cuda"
+        [0] + list(torch.tensor(rows, device="cuda").cumsum(0)),
+        dtype=torch.int32,
+        device="cuda",
     )
     args = (st["cache"], st["cl"], st["block_table"], st["mml"])
 

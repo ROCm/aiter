@@ -172,7 +172,7 @@ def _make_inputs(
     positions = torch.arange(total_tokens, dtype=torch.int64, device=device)
     cos_sin_cache = _make_cos_sin_cache(total_tokens, device)
     cu_seqlens = torch.tensor(
-        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        [0, *torch.tensor(lengths, device=device).cumsum(0).tolist()],
         dtype=torch.int32,
         device=device,
     )

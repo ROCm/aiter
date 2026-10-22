@@ -106,14 +106,14 @@ def make_inputs(
     }
 
 
-def traffic_bytes(B, T, H, D, dtype, paged, csu=False, BV=32, fused=False, W=4):
+def traffic_bytes(B, T, H, D, dtype, device, paged, csu=False, BV=32, fused=False, W=4):
     slab = H * D * D * 4
     if csu:
         record = H * (D // BV) * (2 * D + BV) * 4
         writes = B * (slab + (T - 1) * record)
     else:
         writes = B * T * slab if paged else B * slab
-    e = torch.tensor([], dtype=dtype).element_size()
+    e = torch.tensor([], dtype=dtype, device=device).element_size()
     per_tok = 3 * H * D * e + H * D * 4 + H * 4 + H * D * e
     if fused:
         per_tok += 3 * H * D * (W - 1) * e * 2 + H * D * e
@@ -254,7 +254,16 @@ def benchmark(args):
                 int(x) for x in provider.split(":")[1].split(",")
             )
             mem = traffic_bytes(
-                B, T, H, D, dtype, args.paged, csu=bool(csu), BV=bv, fused=args.fused
+                B,
+                T,
+                H,
+                D,
+                dtype,
+                args.device,
+                args.paged,
+                csu=bool(csu),
+                BV=bv,
+                fused=args.fused,
             )
 
             def fn():
@@ -273,7 +282,7 @@ def benchmark(args):
                 )
 
         else:
-            mem = traffic_bytes(B, T, H, D, dtype, args.paged)
+            mem = traffic_bytes(B, T, H, D, dtype, args.device, args.paged)
 
             def fn():
                 fla_kda(**shared)

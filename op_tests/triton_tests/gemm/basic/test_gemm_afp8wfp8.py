@@ -705,8 +705,10 @@ def test_tuned_variants_use_production_config(m, packed, dtype):
 )
 @pytest.mark.usefixtures("_require_gfx950")
 def test_group32_projection_extreme_scale_codes(a_code, b_code):
-    x = torch.ones(3, 1280, device="cuda").to(torch.float8_e4m3fn)
-    weight = torch.ones(2048, 1280, device="cuda").to(torch.float8_e4m3fn)
+    x = torch.ones(3, 1280, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    weight = torch.ones(2048, 1280, device="cuda", dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
     xs = torch.full((3, 40), a_code, device="cuda", dtype=torch.uint8).view(
         torch.float8_e8m0fnu
     )

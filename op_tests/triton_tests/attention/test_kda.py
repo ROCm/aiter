@@ -400,7 +400,9 @@ def test_fused_recurrent_gate_in_kernel(B, T, H, HV, D, has_dt_bias, safe_gate):
 def test_fused_recurrent_varlen(lens):
     H, D = 4, 128
     N, total_T = len(lens), sum(lens)
-    cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), device=DEVICE).long()
+    cu = torch.tensor(
+        [0] + torch.tensor(lens, device=DEVICE).cumsum(0).tolist(), device=DEVICE
+    ).long()
 
     q, k, v = make_qkv(1, total_T, H, H, D, torch.float32)
     q, k = F.normalize(q, p=2, dim=-1), F.normalize(k, p=2, dim=-1)
@@ -717,7 +719,9 @@ def test_cache_state_updates_varlen():
     """Unequal sequence lengths: per-sequence record counts and acceptance."""
     lens, H, D = [3, 1, 4], 4, 128
     N, total_T, maxlen = len(lens), sum(lens), max(lens)
-    cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), device=DEVICE).long()
+    cu = torch.tensor(
+        [0] + torch.tensor(lens, device=DEVICE).cumsum(0).tolist(), device=DEVICE
+    ).long()
 
     torch.manual_seed(11)
     max_slots = N * maxlen * 3
