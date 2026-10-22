@@ -228,7 +228,7 @@ def build_topk_per_row_argmax_module(
                 else:
                     # Whole vectors per workgroup, rounded up, so the last slice
                     # is the short one and the bounds-check covers its tail.
-                    slice_vecs = (vectors + splits - Int32(1)) // splits
+                    slice_vecs = (vectors + splits - 1) // splits
                     first = part * slice_vecs
                     last = fx.min(first + slice_vecs, vectors)
 

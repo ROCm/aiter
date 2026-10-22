@@ -904,7 +904,10 @@ def fused_reduce_rms_fp8_group_quant(
     if max_BN <= 512:
         num_warps = 1
     elif max_BN <= 2048:
-        num_warps = 4
+        if M >= 1024:
+            num_warps = 1
+        else:
+            num_warps = 4
     elif max_BN <= 4096:
         num_warps = 8
     else:
