@@ -153,7 +153,9 @@ def _test_gemm_gfx1250(dtype, M, N, K):
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = M * N * K * 2 / us / 1e6
-        ret[f"{name} TB/s"] = (xq.nbytes + wq.nbytes) / us / 1e6
+        ret[f"{name} TB/s"] = (
+            (xq.nbytes + wq.nbytes + xs.nbytes + ws.nbytes + out.nbytes) / us / 1e6
+        )
         ret[f"{name} err"] = err
     return ret
 
