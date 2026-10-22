@@ -1,23 +1,70 @@
-import sys,re
-r=sys.argv[1]
+import re
+import sys
+
+r = sys.argv[1]
+
+
 def rd(p):
-    t=open(p,encoding='utf-8',newline='').read(); nl='\r\n' if '\r\n' in t else '\n'; return t.replace('\r\n','\n'),nl
-def wr(p,t,nl): open(p,'w',encoding='utf-8',newline='').write(t.replace('\n',nl))
-def rep(t,old,new,cnt=1):
-    assert t.count(old)==cnt,('count %d != %d: '%(t.count(old),cnt))+old[:110]
-    return t.replace(old,new)
+    with open(p, encoding="utf-8", newline="") as _f:
+        t = _f.read()
+    nl = "\r\n" if "\r\n" in t else "\n"
+    return t.replace("\r\n", "\n"), nl
+
+
+def wr(p, t, nl):
+    with open(p, "w", encoding="utf-8", newline="") as _f:
+        _f.write(t.replace("\n", nl))
+
+
+def rep(t, old, new, cnt=1):
+    assert t.count(old) == cnt, (f"count {t.count(old):d} != {cnt:d}: ") + old[:110]
+    return t.replace(old, new)
+
+
 # ---------- ABI ----------
-p=r+'/interface/sm_abi_v3.h'; t,nl=rd(p)
-t=re.sub(r'#define SM_MP        64u[^\n]*','#define SM_MP        128u           // r21 (R13 card MP128): padded rows per source (live rows M <= 128: local m 65..128, decode T = 260..512); P / Rx / stamps are sized by it',t,count=1)
-t=re.sub(r'#define SM_NPASS     \(SM_MP / 16u\)[^\n]*','#define SM_NPASS     (SM_MP / 16u)  // 16-row passes per source (8); push halves / IK owners / self WGs own 2 of them, B WGs own 1; the push role has NPASS/4 row groups of 24 unit WGs',t,count=1)
-t=rep(t,'#define SM_DBG_RAN_MAXWG   512u    // r20: grid <= 304 WGs (R2.5: MAXWG >= 512 BEFORE any stamps run)','#define SM_DBG_RAN_MAXWG   1024u   // r21: grid <= 608 WGs (dense 552 / reuse 552 / indexer 608)')
-t=rep(t,'#define SM_T1_PUSH_WGS      24u','#define SM_T1_PUSH_WGS      (24u * (SM_NPASS / 4u))   // r21: 24 unit WGs x (NPASS/4) row groups = 48 (6 per XCC); WG w: unit WG w % 24, row group w / 24 owns passes {4g .. 4g+3} (two 256-thread halves x 2 passes)')
-t=rep(t,'#define SM_SELF_SPLIT 2u               // r20: a self WG = one head x TWO 16-row passes (row-split in 2 groups)','#define SM_SELF_SPLIT (SM_NPASS / 2u)  // a self WG = one head x TWO 16-row passes (row-split in NPASS/2 = 4 groups)')
-t=rep(t,'#define SM_T1_IK_WGS        2u    // r20: TWO IK owner WGs per source rank (row-split: owner o owns passes {2o, 2o+1}); every (src,dst) flag counts 8 unit pushers + 2','#define SM_T1_IK_WGS        (SM_NPASS / 2u)    // r21: FOUR IK owner WGs per source rank (owner o owns passes {2o, 2o+1}); every (src,dst) flag counts 16 unit pushers + 4')
-t=rep(t,'#define SM_T1_GRID          (SM_T1_B0 + SM_T1_B_WGS)   // r20 NH1: dense/reuse 24 + 36 + 216 = 276; indexer 24 + 2 + 38 + 240 = 304','#define SM_T1_GRID          (SM_T1_B0 + SM_T1_B_WGS)   // r21 NH1: dense/reuse 48 + 72 + 432 = 552; indexer 48 + 4 + 76 + 480 = 608 (> 256 CUs: see NOTES, WGs beyond residency start as earlier ones retire)')
-wr(p,t,nl)
+p = r + "/interface/sm_abi_v3.h"
+t, nl = rd(p)
+t = re.sub(
+    r"#define SM_MP        64u[^\n]*",
+    "#define SM_MP        128u           // r21 (R13 card MP128): padded rows per source (live rows M <= 128: local m 65..128, decode T = 260..512); P / Rx / stamps are sized by it",
+    t,
+    count=1,
+)
+t = re.sub(
+    r"#define SM_NPASS     \(SM_MP / 16u\)[^\n]*",
+    "#define SM_NPASS     (SM_MP / 16u)  // 16-row passes per source (8); push halves / IK owners / self WGs own 2 of them, B WGs own 1; the push role has NPASS/4 row groups of 24 unit WGs",
+    t,
+    count=1,
+)
+t = rep(
+    t,
+    "#define SM_DBG_RAN_MAXWG   512u    // r20: grid <= 304 WGs (R2.5: MAXWG >= 512 BEFORE any stamps run)",
+    "#define SM_DBG_RAN_MAXWG   1024u   // r21: grid <= 608 WGs (dense 552 / reuse 552 / indexer 608)",
+)
+t = rep(
+    t,
+    "#define SM_T1_PUSH_WGS      24u",
+    "#define SM_T1_PUSH_WGS      (24u * (SM_NPASS / 4u))   // r21: 24 unit WGs x (NPASS/4) row groups = 48 (6 per XCC); WG w: unit WG w % 24, row group w / 24 owns passes {4g .. 4g+3} (two 256-thread halves x 2 passes)",
+)
+t = rep(
+    t,
+    "#define SM_SELF_SPLIT 2u               // r20: a self WG = one head x TWO 16-row passes (row-split in 2 groups)",
+    "#define SM_SELF_SPLIT (SM_NPASS / 2u)  // a self WG = one head x TWO 16-row passes (row-split in NPASS/2 = 4 groups)",
+)
+t = rep(
+    t,
+    "#define SM_T1_IK_WGS        2u    // r20: TWO IK owner WGs per source rank (row-split: owner o owns passes {2o, 2o+1}); every (src,dst) flag counts 8 unit pushers + 2",
+    "#define SM_T1_IK_WGS        (SM_NPASS / 2u)    // r21: FOUR IK owner WGs per source rank (owner o owns passes {2o, 2o+1}); every (src,dst) flag counts 16 unit pushers + 4",
+)
+t = rep(
+    t,
+    "#define SM_T1_GRID          (SM_T1_B0 + SM_T1_B_WGS)   // r20 NH1: dense/reuse 24 + 36 + 216 = 276; indexer 24 + 2 + 38 + 240 = 304",
+    "#define SM_T1_GRID          (SM_T1_B0 + SM_T1_B_WGS)   // r21 NH1: dense/reuse 48 + 72 + 432 = 552; indexer 48 + 4 + 76 + 480 = 608 (> 256 CUs: see NOTES, WGs beyond residency start as earlier ones retire)",
+)
+wr(p, t, nl)
 # ---------- roles (rewritten) ----------
-open(r+'/device/layout/t1_roles.hpp','w',encoding='utf-8',newline='').write('''// SPDX-License-Identifier: MIT
+with open(r + "/device/layout/t1_roles.hpp", "w", encoding="utf-8", newline="") as _f:
+    _f.write("""// SPDX-License-Identifier: MIT
 // SM-T1 static role table, r21 (MP128). Single source of truth for sender and receiver counts. Host-pass safe (constexpr only).
 // Remote units per destination: UPD = 19 (indexer: Q16,K,V,IQ) or 18 (dense/reuse: Q16,K,V). UNIT_WGS = 24 unit WGs cover 3*UPD units (2..3 units of ONE destination each); the push role has ROWGROUPS = NPASS/4 row groups of them
 // (WG w = unit WG w % 24, row group w / 24), so every (src,dst) pair is pushed by 8 * ROWGROUPS unit pushers. The indexer adds IK_WGS = NPASS/2 IK owners that each push their rows of the IK head to all 3 destinations:
@@ -62,23 +109,49 @@ static_assert(SM_R5X_INDEXER ? (IK_WGS == 4u && kcount(0) == 20u && kcount(1) ==
 static_assert(SM_T1_GRID <= SM_DBG_RAN_MAXWG, "grid fits the stamp records");
 static_assert(SM_T1_GRID == (SM_R5X_INDEXER ? 608u : 552u) || SM_T1_B_HEADS != 1u, "NH1 grids: dense/reuse 552, indexer 608");
 } // namespace t1r
-''')
+""")
 # ---------- layouts ----------
-p=r+'/device/layout/ran_layouts.hpp'; t,nl=rd(p)
-t=rep(t,'static_assert(SM_MP == 64u, "r20 layouts are written for MP == 64");','static_assert(SM_MP == 128u, "r21 layouts are written for MP == 128");')
-t=rep(t,'static_assert(SM_RX_BYTES <= 4ull * 1024ull * 1024ull, "R13: the Rx window must fit the 4 MiB arena view (dense 2,359,296 B, indexer 2,621,440 B at MP = 64)");','static_assert(SM_RX_BYTES > 4ull * 1024ull * 1024ull && SM_RX_BYTES <= 8ull * 1024ull * 1024ull, "R13 MP128: the Rx window (dense 4,718,592 B = 4.5 MiB, indexer/reuse 5,242,880 B = 5.0 MiB) needs the 8 MiB arena view (the 4 MiB view of MP64 is too small)");')
-t=rep(t,'static_assert(SM_DENSE ? (SM_RX_BYTES == 2359296ull) : (SM_RX_BYTES == 2621440ull), "R2.4 X-5 recomputed for MP = 64");','static_assert(SM_DENSE ? (SM_RX_BYTES == 4718592ull) : (SM_RX_BYTES == 5242880ull), "X-5 recomputed for MP = 128");')
-wr(p,t,nl)
+p = r + "/device/layout/ran_layouts.hpp"
+t, nl = rd(p)
+t = rep(
+    t,
+    'static_assert(SM_MP == 64u, "r20 layouts are written for MP == 64");',
+    'static_assert(SM_MP == 128u, "r21 layouts are written for MP == 128");',
+)
+t = rep(
+    t,
+    'static_assert(SM_RX_BYTES <= 4ull * 1024ull * 1024ull, "R13: the Rx window must fit the 4 MiB arena view (dense 2,359,296 B, indexer 2,621,440 B at MP = 64)");',
+    'static_assert(SM_RX_BYTES > 4ull * 1024ull * 1024ull && SM_RX_BYTES <= 8ull * 1024ull * 1024ull, "R13 MP128: the Rx window (dense 4,718,592 B = 4.5 MiB, indexer/reuse 5,242,880 B = 5.0 MiB) needs the 8 MiB arena view (the 4 MiB view of MP64 is too small)");',
+)
+t = rep(
+    t,
+    'static_assert(SM_DENSE ? (SM_RX_BYTES == 2359296ull) : (SM_RX_BYTES == 2621440ull), "R2.4 X-5 recomputed for MP = 64");',
+    'static_assert(SM_DENSE ? (SM_RX_BYTES == 4718592ull) : (SM_RX_BYTES == 5242880ull), "X-5 recomputed for MP = 128");',
+)
+wr(p, t, nl)
 # ---------- traits ----------
-p=r+'/device/layout/sk_traits.hpp'; t,nl=rd(p)
-t=rep(t,'constexpr int PFK = 4;','constexpr int PFK = 3;')
-t=rep(t,'// r20 ring depth (R13 card: PFK4 = 64 KiB; PFK5 = 80 KiB is exactly at the 2 WG/CU limit, A/B only); PFK-1 = 3 K-blocks in flight per WG','// r21 ring depth for BM128 (stage = A 16384 + B 8192 = 24 KiB; PFK3 = 72 KiB, 2 WG/CU = 144 KiB <= 160 KiB; PFK4 = 96 KiB would leave 1 WG/CU); PFK-1 = 2 K-blocks in flight per WG')
-t=rep(t,'// 65536; x WG_PER_CU=2 = 131072 <= 163840','// 73728; x WG_PER_CU=2 = 147456 <= 163840')
-wr(p,t,nl)
+p = r + "/device/layout/sk_traits.hpp"
+t, nl = rd(p)
+t = rep(t, "constexpr int PFK = 4;", "constexpr int PFK = 3;")
+t = rep(
+    t,
+    "// r20 ring depth (R13 card: PFK4 = 64 KiB; PFK5 = 80 KiB is exactly at the 2 WG/CU limit, A/B only); PFK-1 = 3 K-blocks in flight per WG",
+    "// r21 ring depth for BM128 (stage = A 16384 + B 8192 = 24 KiB; PFK3 = 72 KiB, 2 WG/CU = 144 KiB <= 160 KiB; PFK4 = 96 KiB would leave 1 WG/CU); PFK-1 = 2 K-blocks in flight per WG",
+)
+t = rep(
+    t,
+    "// 65536; x WG_PER_CU=2 = 131072 <= 163840",
+    "// 73728; x WG_PER_CU=2 = 147456 <= 163840",
+)
+wr(p, t, nl)
 # ---------- GEMM dispatch ----------
-p=r+'/device/sk_gemm_fp8.cu'; t,nl=rd(p)
-i=t.index('    switch ((args.M + 15u) / 16u) {'); j=t.index('    }',i)+len('    }')
-t=t[:i]+'''    switch ((args.M + 15u) / 16u) {                                                       // WG-uniform: AQ = ceil(M/16) in 1..8 (M <= SM_MP = 128)
+p = r + "/device/sk_gemm_fp8.cu"
+t, nl = rd(p)
+i = t.index("    switch ((args.M + 15u) / 16u) {")
+j = t.index("    }", i) + len("    }")
+t = (
+    t[:i]
+    + """    switch ((args.M + 15u) / 16u) {                                                       // WG-uniform: AQ = ceil(M/16) in 1..8 (M <= SM_MP = 128)
         case 1u: smg::gemm_body<1>(args, stage); break;
         case 2u: smg::gemm_body<2>(args, stage); break;
         case 3u: smg::gemm_body<3>(args, stage); break;
@@ -87,11 +160,22 @@ t=t[:i]+'''    switch ((args.M + 15u) / 16u) {                                  
         case 6u: smg::gemm_body<6>(args, stage); break;
         case 7u: smg::gemm_body<7>(args, stage); break;
         default: smg::gemm_body<8>(args, stage); break;
-    }'''+t[j:]
-wr(p,t,nl)
+    }"""
+    + t[j:]
+)
+wr(p, t, nl)
 # ---------- kernel: push = 48 WGs (unit WG w % 24, row group w / 24) ----------
-p=r+'/device/ran_kernel.cu'; t,nl=rd(p)
-t=rep(t,'const uint32_t pbase = 2u * (static_cast<uint32_t>(tid) >> 8);                // r20: half hf owns passes {2hf, 2hf+1} (rows 32hf .. 32hf+31)','const uint32_t pbase = 4u * (wgid / t1r::UNIT_WGS) + 2u * (static_cast<uint32_t>(tid) >> 8);   // r21: row group w / 24 owns passes {4g..4g+3}; half hf owns {4g + 2hf, 4g + 2hf + 1}')
-t=rep(t,'const uint32_t g0 = t1r::g0(wgid), g1 = t1r::g0(wgid + 1u), nu = g1 - g0;','const uint32_t wu_ = wgid % t1r::UNIT_WGS;                                       // unit WG of this push WG\n        const uint32_t g0 = t1r::u0(wu_), g1 = t1r::u0(wu_ + 1u), nu = g1 - g0;')
-wr(p,t,nl)
-print('r21 derive ok')
+p = r + "/device/ran_kernel.cu"
+t, nl = rd(p)
+t = rep(
+    t,
+    "const uint32_t pbase = 2u * (static_cast<uint32_t>(tid) >> 8);                // r20: half hf owns passes {2hf, 2hf+1} (rows 32hf .. 32hf+31)",
+    "const uint32_t pbase = 4u * (wgid / t1r::UNIT_WGS) + 2u * (static_cast<uint32_t>(tid) >> 8);   // r21: row group w / 24 owns passes {4g..4g+3}; half hf owns {4g + 2hf, 4g + 2hf + 1}",
+)
+t = rep(
+    t,
+    "const uint32_t g0 = t1r::g0(wgid), g1 = t1r::g0(wgid + 1u), nu = g1 - g0;",
+    "const uint32_t wu_ = wgid % t1r::UNIT_WGS;                                       // unit WG of this push WG\n        const uint32_t g0 = t1r::u0(wu_), g1 = t1r::u0(wu_ + 1u), nu = g1 - g0;",
+)
+wr(p, t, nl)
+print("r21 derive ok")

@@ -39,9 +39,9 @@ from .jit import build_small, small_defs, src_abi, src_mp
 SRC_SHA = {
     "r17": "3f597cdb6141c39dd4450a1ea635785ffe44867006434157478f7822357d8ee3",
     "r18": "0e48e3f01e917c9c5209c71efd90748e83eacf59d0e92cd10e5549955a450c29",
-    "r19": "7a5398c7ed2dda522060977d1b368780dd410a5c9ff1cd32c098809f25c72173",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
-    "r20": "070e916d24e4f191f80e0df962c497c6262bdfa8e2f48395961b511f96273bd1",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
-    "r21": "759082679e2cbcd1e9c95cb0b9bc693fd62aaad4d90027cd858fd3549b9afabc",  # R13 MP128 (abi 3, SM_MP 128, 8 MiB Rx view), derived from r20
+    "r19": "33e0d60c5d9e4d37bd27aee2f9ae2d0351ecdac92d942c72b27966fbfe326b6e",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
+    "r20": "0b00603865eaee674190de2e76c4dc5dd6985db0f36c57b70b6156a4bb1e39b3",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
+    "r21": "c9cc70d9c5e3c9c52dc8bcf21ebf4cb82ff719f526de3fe5074f0b464151474b",  # R13 MP128 (abi 3, SM_MP 128, 8 MiB Rx view), derived from r20
 }
 # analytic geometry (mirrors sm_abi_v2.h; cross-checked against sm_info_v1 after build)
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2560}

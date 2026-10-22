@@ -1,28 +1,53 @@
-import sys,re
-root=sys.argv[1]
+import sys
+
+root = sys.argv[1]
+
+
 def rd(p):
-    t=open(p,encoding='utf-8',newline='').read(); nl='\r\n' if '\r\n' in t else '\n'; return t.replace('\r\n','\n'),nl
-def wr(p,t,nl): open(p,'w',encoding='utf-8',newline='').write(t.replace('\n',nl))
-def rep(t,old,new,cnt=1):
-    assert t.count(old)==cnt,('count %d != %d: '%(t.count(old),cnt))+old[:110]
-    return t.replace(old,new)
-p=root+'/small/r19/host/driver_sm.cpp'; t,nl=rd(p)
-t=rep(t,'h.Ascale = nullptr; h.cwin_loc            // r19: Ascale/positions/slot_mapping/index_slot_mapping are per-launch kernargs, never read from the block\n    ;h.cwin_loc = static_cast<uint8_t*>(c->clocal);','h.Ascale = nullptr;          // r19: Ascale/positions/slot_mapping/index_slot_mapping are per-launch kernargs, never read from the block\n    h.cwin_loc = static_cast<uint8_t*>(c->clocal);')
-wr(p,t,nl)
+    with open(p, encoding="utf-8", newline="") as _f:
+        t = _f.read()
+    nl = "\r\n" if "\r\n" in t else "\n"
+    return t.replace("\r\n", "\n"), nl
+
+
+def wr(p, t, nl):
+    with open(p, "w", encoding="utf-8", newline="") as _f:
+        _f.write(t.replace("\n", nl))
+
+
+def rep(t, old, new, cnt=1):
+    assert t.count(old) == cnt, (f"count {t.count(old):d} != {cnt:d}: ") + old[:110]
+    return t.replace(old, new)
+
+
+p = root + "/small/r19/host/driver_sm.cpp"
+t, nl = rd(p)
+t = rep(
+    t,
+    "h.Ascale = nullptr; h.cwin_loc            // r19: Ascale/positions/slot_mapping/index_slot_mapping are per-launch kernargs, never read from the block\n    ;h.cwin_loc = static_cast<uint8_t*>(c->clocal);",
+    "h.Ascale = nullptr;          // r19: Ascale/positions/slot_mapping/index_slot_mapping are per-launch kernargs, never read from the block\n    h.cwin_loc = static_cast<uint8_t*>(c->clocal);",
+)
+wr(p, t, nl)
 # ===================== shared host/sm_fusion_driver.cpp: ABI-3 entry points (r17/r18 builds, SM_ABI_VERSION 2, keep the v1 set) =====================
-p=root+'/host/sm_fusion_driver.cpp'; t,nl=rd(p)
-t=rep(t,'extern "C" {\nint32_t sm_attach_v1(','#if SM_ABI_VERSION < 3\nextern "C" {\nint32_t sm_attach_v1(')
+p = root + "/host/sm_fusion_driver.cpp"
+t, nl = rd(p)
+t = rep(
+    t,
+    'extern "C" {\nint32_t sm_attach_v1(',
+    '#if SM_ABI_VERSION < 3\nextern "C" {\nint32_t sm_attach_v1(',
+)
 # close the v1-only section before sm_bind_new_v1? keep bind/free/info shared: split at the v1 attach end and at launch/poison
-a=t.index('// Create a binding (device-resident SmDev block).')
-t=t[:a]+'}\n#endif\nextern "C" {\n'+t[a:]
-b=t.index('// Enqueue sm_gemm then RAN on `stream` for this binding'); c=t.index('int32_t sm_blk_free_v1(void* blk_)')
-v1launch=t[b:c]
-t=t[:b]+'#if SM_ABI_VERSION < 3\n'+v1launch+'#endif\n'+t[c:]
+a = t.index("// Create a binding (device-resident SmDev block).")
+t = t[:a] + '}\n#endif\nextern "C" {\n' + t[a:]
+b = t.index("// Enqueue sm_gemm then RAN on `stream` for this binding")
+c = t.index("int32_t sm_blk_free_v1(void* blk_)")
+v1launch = t[b:c]
+t = t[:b] + "#if SM_ABI_VERSION < 3\n" + v1launch + "#endif\n" + t[c:]
 # v3 additions: attach + launch + free of dgpeers + (no poison_fast)
-d=t.index('// Poison word (u32 at SM_C_POISON of the control window)')
-poison_part=t[d:]
-assert poison_part.rstrip().endswith('}')
-v3='''#if SM_ABI_VERSION >= 3
+d = t.index("// Poison word (u32 at SM_C_POISON of the control window)")
+poison_part = t[d:]
+assert poison_part.rstrip().endswith("}")
+v3 = """#if SM_ABI_VERSION >= 3
 // ---- R12 (card r2 D2.3/D2.6): ABI-3 entry points. Signatures match the aiter stub (small_rt.py load_driver(abi=3)).
 // attach(rank, comm, rx_win, rx_local, ctl_win, ctl_local, gpage_local, gpeers, gemm_hsaco, ran_hsaco, &ctx): like sm_attach_v1 plus the runtime-owned per-comm ERR/STEP/DIAG page.
 //   gpage_local = local address of the page in a registered window/arena (u32 ERR at +0, u64 STEP at +8, DIAG u64[8] at +64); gpeers == NULL: the driver resolves the 3 peer ERR words with ccoGetPeerPtr(comm, gpage_local, p)
@@ -85,23 +110,32 @@ int32_t sm_launch_blk_v3(void* ctx, void* blk_, const void* A, const void* W, ui
     return OK;
 }
 #endif
-'''
+"""
 # insert v3 block after the v1 launch block (before sm_blk_free_v1) and make poison_fast v1-only
-c2=t.index('int32_t sm_blk_free_v1(void* blk_)')
-t=t[:c2]+v3+t[c2:]
-d=t.index('// Poison word (u32 at SM_C_POISON of the control window)')
-tail=t[d:]
-t=t[:d]+'#if SM_ABI_VERSION < 3\n'+tail.rstrip()[:-1].rstrip()+'\n#endif\n}\n'
+c2 = t.index("int32_t sm_blk_free_v1(void* blk_)")
+t = t[:c2] + v3 + t[c2:]
+d = t.index("// Poison word (u32 at SM_C_POISON of the control window)")
+tail = t[d:]
+t = t[:d] + "#if SM_ABI_VERSION < 3\n" + tail.rstrip()[:-1].rstrip() + "\n#endif\n}\n"
 # sm_free_v1: free the owned peer table and the page only if we own it
-t=rep(t,'    if (c->dblk) hipFree(c->dblk);\n    if (c->dbg) hipFree(c->dbg);','''    if (c->dblk) hipFree(c->dblk);
+t = rep(
+    t,
+    "    if (c->dblk) hipFree(c->dblk);\n    if (c->dbg) hipFree(c->dbg);",
+    """    if (c->dblk) hipFree(c->dblk);
 #if SM_ABI_VERSION >= 3
     if (c->dgpeers && c->dgpeers_owned) hipFree(c->dgpeers);
     if (c->gpage && c->gpage_owned) hipFree(c->gpage);
 #endif
-    if (c->dbg) hipFree(c->dbg);''')
-wr(p,t,nl)
+    if (c->dbg) hipFree(c->dbg);""",
+)
+wr(p, t, nl)
 # Ctx needs dgpeers_owned
-p=root+'/small/r19/host/driver_sm.cpp'; t,nl=rd(p)
-t=rep(t,'bool gpage_owned = false; SmGfPeers* dgpeers = nullptr;','bool gpage_owned = false, dgpeers_owned = false; SmGfPeers* dgpeers = nullptr;')
-wr(p,t,nl)
-print('fusion driver ok')
+p = root + "/small/r19/host/driver_sm.cpp"
+t, nl = rd(p)
+t = rep(
+    t,
+    "bool gpage_owned = false; SmGfPeers* dgpeers = nullptr;",
+    "bool gpage_owned = false, dgpeers_owned = false; SmGfPeers* dgpeers = nullptr;",
+)
+wr(p, t, nl)
+print("fusion driver ok")
