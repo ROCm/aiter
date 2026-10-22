@@ -56,7 +56,6 @@ from .gemm_a16w16_gfx950_utils import (
     get_llvm_ptr,
     get_wave_lds_offset,
 )
-from .gr_combine_and_mix.mfma_config import ab_k_perm
 from .kernels_common import run_cached
 
 WAVE_SIZE = GFX950_WAVE_SIZE  # 64 lanes on CDNA3
@@ -67,6 +66,23 @@ GEMM_A16W16_DTYPE_BF16 = 2
 GEMM_A16W16_DTYPE_FP32 = 1
 # gfx940 buffer cache policy: sc0 | sc1 (system coherent, bypasses the per-XCD L2).
 CPOL_SC0_SC1 = 1 | 16
+
+
+def ab_k_perm(mma_k: int, *, dtype_width: int = 16, copy_bits: int = 128):
+    """K-axis permutation pairing a ``copy_bits`` A/B load with the MFMA K fragment.
+
+    One MFMA consumes ``k_group = mma_k // 4`` elements per lane. With bf16
+    ``mma_k=16`` a 128-bit load spans ``num_frgv = 2`` K-groups; the extra axis
+    interleaves them so the tiled-copy partition derived from the tiled MMA
+    matches the wide load. Collapses to ``(k_group, 4):(1, k_group)`` when a load
+    is a single K-group.
+    """
+    k_group = mma_k // 4
+    num_frgv = copy_bits // (k_group * dtype_width)
+    if num_frgv <= 1:
+        return fx.make_layout((k_group, 4), (1, k_group))
+    num_elems = copy_bits // dtype_width
+    return fx.make_layout((k_group, 4, num_frgv), (1, num_elems, k_group))
 
 
 @fx.struct
