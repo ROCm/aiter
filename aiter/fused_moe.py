@@ -104,7 +104,6 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
 
 
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
-_SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
 
@@ -140,7 +139,11 @@ def fmoe_runtime_policy(
     q_dtype_w,
     activation=ActivationType.Silu,
 ) -> FmoeRuntimePolicy:
-    """Return the runtime knobs for the (quant_type, dtypes, activation) config."""
+    """Return the runtime knobs for the (quant_type, dtypes, activation) config.
+
+    Mirrors resolve_activation_dtype() on gfx950; other archs pick the
+    activation dtype by arch rather than by these knobs.
+    """
     activation = ActivationType(activation)
     gate_mode = GateMode.SEPARATED.value
     w1_gate_up = False
@@ -161,11 +164,11 @@ def fmoe_runtime_policy(
 
             if activation == ActivationType.Situv2:
                 # SiTUv2 is tested ahead of the gate-mode branches and defaults to
-                # a bf16 activation; the fp8 / fp4 variants are opt-in.
-                if q_dtype_a == dtypes.fp8:
-                    env["AITER_SITUV2_A8W4"] = "1"
-                elif q_dtype_a == dtypes.fp4x2:
-                    env["AITER_SITUV2_A4W4"] = "1"
+                # a bf16 activation; the fp8 / fp4 variants are opt-in. Write both
+                # flags: A8W4 wins over A4W4, so an inherited A8W4=1 would
+                # otherwise reroute a4w4 / a16w4 rows to fp8.
+                env["AITER_SITUV2_A8W4"] = "1" if q_dtype_a == dtypes.fp8 else "0"
+                env["AITER_SITUV2_A4W4"] = "1" if q_dtype_a == dtypes.fp4x2 else "0"
                 # beta / linear_beta are runtime scalars rather than compile keys,
                 # so the kernel default depends on which stage1 wrapper wins (1.0
                 # for FlyDSL, 4.0/25.0 for Opus). Pin them instead of inheriting
@@ -177,6 +180,15 @@ def fmoe_runtime_policy(
                 # token >= AITER_BF16_FP8_MOE_BOUND (256 by default), so small-token
                 # rows would otherwise never reach the tuned a8w4 kernel.
                 env["AITER_BF16_FP8_MOE_BOUND"] = "0"
+            elif activation == ActivationType.Swiglu:
+                # Under SEPARATED, Swiglu picks bf16 below
+                # GPTOSS_SWIGLU_MXFP4_BF16_BOUND tokens and fp4 at or above it,
+                # so with the default bound a4w4 rows under 256 tokens and a16w4
+                # rows from 256 up would look up a config of the other dtype.
+                if q_dtype_a == dtypes.fp4x2:
+                    env["GPTOSS_SWIGLU_MXFP4_BF16_BOUND"] = "0"
+                elif q_dtype_a in (dtypes.bf16, dtypes.fp16):
+                    env["GPTOSS_SWIGLU_MXFP4_BF16_BOUND"] = str(1 << 31)
 
     return FmoeRuntimePolicy(
         gate_mode=gate_mode,
@@ -680,7 +692,7 @@ def _flydsl_moe_sorting(
     # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
-    # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
+    # buffer entirely -- the caller owns the [M, topk, model_dim] intermediate.
     # As in _moe_sorting_impl, a caller buffer can stand in.
     if (expert_mask is not None) or accumulate:
         moe_buf = (
@@ -877,6 +889,9 @@ def resolve_activation_dtype(
     ):
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    swiglu_mxfp4_bf16_bound = int(
+        os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256")
+    )
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
@@ -899,7 +914,7 @@ def resolve_activation_dtype(
                 q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = _bound_split(
-                M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
+                M, swiglu_mxfp4_bf16_bound, dtypes.bf16, dtypes.fp4x2
             )
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if gfx != "gfx950":

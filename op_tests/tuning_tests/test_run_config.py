@@ -569,6 +569,68 @@ class TestRunConfig(unittest.TestCase):
         self._test_family("gdn_k5_opt")
 
 
+class TestFmoeRuntimePolicy(unittest.TestCase):
+    """Every per_1x32 tuned fmoe row must be reachable under its runtime policy.
+
+    run_config dispatches each row through fmoe_runtime_policy; a row whose
+    policy resolves to a different activation dtype than the CSV declares
+    silently benchmarks an untuned fallback kernel instead.
+    """
+
+    def test_policy_reaches_csv_activation_dtype(self):
+        try:
+            import pandas as pd
+            import torch
+
+            from aiter import ActivationType, QuantType, dtypes
+            from aiter.fused_moe import (
+                fmoe_runtime_env,
+                fmoe_runtime_policy,
+                resolve_activation_dtype,
+            )
+        except ImportError as e:
+            self.skipTest(f"aiter not importable: {e}")
+
+        names = {
+            "torch": torch,
+            "dtypes": dtypes,
+            "QuantType": QuantType,
+            "ActivationType": ActivationType,
+        }
+        cfg = TUNER_FAMILIES["fmoe"]
+        unreachable = []
+        for path in _find_tuned_csvs(cfg["csv_pattern"]):
+            if any(ex in os.path.basename(path) for ex in cfg["exclude_patterns"]):
+                continue
+            for _, row in pd.read_csv(path).iterrows():
+                q_type = eval(row["q_type"], names)
+                if q_type != QuantType.per_1x32:
+                    continue
+                q_dtype_a = eval(row["q_dtype_a"], names)
+                q_dtype_w = eval(row["q_dtype_w"], names)
+                act_type = eval(row["act_type"], names)
+                policy = fmoe_runtime_policy(q_type, q_dtype_a, q_dtype_w, act_type)
+                with fmoe_runtime_env(policy):
+                    runtime_a = resolve_activation_dtype(
+                        q_type,
+                        q_dtype_w,
+                        activation=act_type,
+                        gate_mode=policy.gate_mode,
+                        M=int(row["token"]),
+                        gfx="gfx950",
+                    )
+                if runtime_a != q_dtype_a:
+                    unreachable.append(
+                        f"{os.path.basename(path)}: token={row['token']} "
+                        f"{row['act_type']} {row['q_dtype_a']} -> {runtime_a}"
+                    )
+        self.assertEqual(
+            unreachable,
+            [],
+            f"{len(unreachable)} rows unreachable:\n" + "\n".join(unreachable[:20]),
+        )
+
+
 @unittest.skipUnless(_gpu_available(), "No GPU available")
 @unittest.skipUnless(
     TUNE_TEST_FAMILY,
