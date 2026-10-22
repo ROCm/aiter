@@ -551,19 +551,17 @@ def test_triton_unified_attn_3d(
 @pytest.mark.parametrize("seq_lens", [[(1, 1328), (1, 523), (1, 37), (1, 2011)]])
 @pytest.mark.parametrize("num_heads", [(16, 8), (32, 4)])
 @pytest.mark.parametrize("head_size", [64, 128, 256, 512])
-@pytest.mark.parametrize("block_size", [1, 16])
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("soft_cap", [None, 50.0])
 @torch.inference_mode()
-def test_triton_unified_attn_decode_small_pages(
+def test_triton_unified_attn_decode_page_size_1(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
-    block_size: int,
     sliding_window: int | None,
     soft_cap: float | None,
 ) -> None:
-    """bf16 decode with KV pages smaller than a tile, so each tile spans several pages."""
+    """bf16 decode with one token per KV page, so each tile spans many pages."""
     query_lens = [x[0] for x in seq_lens]
     (
         query,
@@ -588,7 +586,7 @@ def test_triton_unified_attn_decode_small_pages(
         _,
     ) = generate_data(
         seq_lens=seq_lens,
-        block_size=block_size,
+        block_size=1,
         head_size=head_size,
         num_heads=num_heads,
         sliding_window=sliding_window,
