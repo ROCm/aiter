@@ -6,8 +6,9 @@
 from functools import lru_cache
 
 import torch
+from flydsl.runtime.device import get_rocm_arch
 
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
@@ -304,7 +305,7 @@ def _is_flydsl_radix_topk_one_block_supported(
         k,
         None if values is None else _tensor_signature(values),
         is_decode,
-        get_gfx_runtime(),
+        get_rocm_arch(),
     )
 
 
@@ -369,7 +370,10 @@ def flydsl_top_k_per_row_decode(
     if rows == 0:
         return
     # The bare arch name: the selector keys its radix layout and LDS on it.
-    arch = get_gfx_runtime()
+    # FlyDSL's resolver, not aiter's: it honours FLYDSL_GPU_ARCH, which is the
+    # arch this kernel is actually built for under AOT with no GPU, and falls
+    # back to live hardware otherwise.
+    arch = get_rocm_arch()
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     packed = row_starts is not None
@@ -469,7 +473,7 @@ def flydsl_radix_topk_one_block(
     if num_rows == 0:
         return
 
-    arch = get_gfx_runtime()
+    arch = get_rocm_arch()
     width = logits.shape[1] if plane_width is None else plane_width
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
