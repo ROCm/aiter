@@ -2,6 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_stream.h"
 #include "fused_dsv41/kernel_args.hpp"
+#include "fused_dsv41/pr_v41_dispatch.hpp"
 #include "fused_dsv41_mxfp8.h"
 #include <algorithm>
 #include <climits>
@@ -210,5 +211,6 @@ void fused_dsv41_mxfp8_fwd(const aiter_tensor_t& q,
     a.fp8_qk = fp8_qk;
     a.q_scale = q_scale ? static_cast<const uint8_t*>(q_scale->data_ptr()) : nullptr;
     a.softmax_scale   = softmax_scale;
+    if(!launch_fused_dsv41_pr_v41(a, !q_is_rotated, aiter::getCurrentHIPStream()))
     HIP_CALL(launch_fused_dsv41_mxfp8(&a, !q_is_rotated, aiter::getCurrentHIPStream()));
 }

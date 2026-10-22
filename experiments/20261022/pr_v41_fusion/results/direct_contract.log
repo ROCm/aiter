@@ -1,0 +1,37 @@
+PASS 0 False False mixed
+PASS 0 False False all_invalid
+PASS 0 False False truncated
+PASS 0 False False csr_clamp
+PASS 0 False True mixed
+PASS 0 False True all_invalid
+PASS 0 False True truncated
+PASS 0 False True csr_clamp
+PASS 0 True False mixed
+PASS 0 True False all_invalid
+PASS 0 True False truncated
+PASS 0 True False csr_clamp
+PASS 0 True True mixed
+PASS 0 True True all_invalid
+PASS 0 True True truncated
+PASS 0 True True csr_clamp
+PASS 128 False False mixed
+PASS 128 False False all_invalid
+PASS 128 False False truncated
+PASS 128 False False csr_clamp
+PASS 128 False True mixed
+PASS 128 False True all_invalid
+PASS 128 False True truncated
+PASS 128 False True csr_clamp
+PASS 128 True False mixed
+PASS 128 True False all_invalid
+PASS 128 True False truncated
+PASS 128 True False csr_clamp
+PASS 128 True True mixed
+PASS 128 True True all_invalid
+PASS 128 True True truncated
+PASS 128 True True csr_clamp
+32 CONTRACT CASES PASSED
+[aiter] [pid=1224468 pname=MainProcess] start build [module_aiter_core] under /home/jun_chen2_qle/yzhou_aiter/aiter-dsv41-pr-fusion-20261022/aiter/jit/build/module_aiter_core
+[aiter] Current hipcc not support: -mllvm -amdgpu-coerce-illegal-types=1, skip it.
+[aiter] [pid=1224468 pname=MainProcess] [32mfinish build [module_aiter_core], cost 10.9s [0m
+[aiter] import [module_aiter_core] under /home/jun_chen2_qle/yzhou_aiter/aiter-dsv41-pr-fusion-20261022/aiter/jit/module_aiter_core.so
