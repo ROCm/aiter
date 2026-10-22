@@ -20,6 +20,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     mxfp4_to_f32,
 )
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from op_tests.triton_tests.utils.types import with_default_dtype
 
 
 def rmsnorm(input, weight, eps=1e-6):
@@ -433,6 +434,28 @@ def test_fused_reduce_act_mul_mxfp4_group_quant(
 
     torch.testing.assert_close(y_q_triton, y_q_torch)
     torch.testing.assert_close(y_s_triton, y_s_torch)
+
+
+def test_fused_reduce_act_mul_mxfp4_group_quant_dtype_none():
+    """With dtype=None, y2 has the dtype of x2, not the default dtype."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
+    x, x2 = generate_fused_reduce_act_mul_mxfp4_group_quant(32, 256, SPK=4, N2=256)
+    _, y2_torch = run_torch_reduce_act_mul_mxfp4_group_quant(
+        x, x2, "silu", dtype=x2.dtype, shuffle=False
+    )
+
+    # x2 is float32, the usual default dtype. A float64 default makes the test
+    # fail if y2 takes the default dtype.
+    with with_default_dtype(torch.float64):
+        _, y2_triton = fused_reduce_act_mul_and_mxfp4_quant(
+            x, activation="silu", x2=x2, dtype=None
+        )
+
+    assert y2_triton.dtype == x2.dtype
+    torch.testing.assert_close(y2_triton, y2_torch)
 
 
 def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat16):

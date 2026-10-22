@@ -298,7 +298,8 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
   `torch.set_default_tensor_type` in tests and benchmarks. These calls change
   the defaults for all later tests in the same pytest process. Do not flag a
   context manager that sets a default and restores the previous one on exit,
-  such as `_with_default_device` in `attention/test_mha_dao_ai.py`. It tests
+  such as `_with_default_device` in `attention/test_mha_dao_ai.py` or
+  `with_default_dtype` in `op_tests/triton_tests/utils/types.py`. It tests
   that library code does not depend on the default.
 - Flag `torch.load` without `map_location`.
 - Do not flag `device="cpu"` in a test that checks that the wrapper rejects

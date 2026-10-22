@@ -30,7 +30,8 @@ and to the multi-GPU tests in `op_tests/multigpu_tests/triton_test/`.
    tests that run after them in the same pytest process. The only exception
    is a context manager that sets a default and restores the previous one on
    exit. Use it only to test that library code does not depend on the default
-   (`_with_default_device` in `attention/test_mha_dao_ai.py`).
+   (`_with_default_device` in `attention/test_mha_dao_ai.py`,
+   `with_default_dtype` in `op_tests/triton_tests/utils/types.py`).
 4. Give `torch.load` an explicit `map_location`.
 5. Use a CPU tensor only when the test needs one, for example to check that
    the wrapper rejects CPU inputs. Write `device="cpu"`.
