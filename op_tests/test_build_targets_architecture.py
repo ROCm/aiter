@@ -72,6 +72,63 @@ class TestBuildTargetArchitecture(unittest.TestCase):
         self.assertEqual(torch_processor_count_to_cu("gfx942", 304), 304)
 
 
+class TestClusterLaunchBuildArchs(unittest.TestCase):
+    """build_module's -DAITER_ENABLE_CLUSTER_LAUNCH arch test (aiter.jit.core)."""
+
+    def setUp(self):
+        from aiter.jit import core
+
+        self.core = core
+        self.detect = lambda: "gfx942"
+
+    def test_blank_gpu_archs_falls_back_to_detection(self):
+        # A Dockerfile's `ENV GPU_ARCHS=` leaves the variable set but empty.
+        # That must behave like "native", not raise out of every JIT build.
+        for value in ("", " ", ";", " ; ", "native", "NATIVE", "gfx942;native"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"GPU_ARCHS": value}, clear=True),
+            ):
+                self.assertEqual(
+                    self.core._build_archs_from_env(self.detect), ["gfx942"]
+                )
+                self.assertFalse(self.core._cluster_launch_target(self.detect))
+
+    def test_unset_gpu_archs_falls_back_to_detection(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.core._build_archs_from_env(self.detect), ["gfx942"])
+
+    def test_explicit_archs_win_over_detection(self):
+        with mock.patch.dict(
+            os.environ, {"GPU_ARCHS": " gfx1250 ; gfx942 "}, clear=True
+        ):
+            self.assertEqual(
+                self.core._build_archs_from_env(self.detect), ["gfx1250", "gfx942"]
+            )
+
+    def test_cluster_launch_follows_any_targeted_arch(self):
+        cases = {
+            "gfx1250": True,
+            "gfx1250-strict": True,
+            "gfx1250;gfx942": True,
+            "gfx942;gfx1250-strict": True,
+            "gfx942": False,
+            "gfx950": False,
+        }
+        for value, expected in cases.items():
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"GPU_ARCHS": value}, clear=True),
+            ):
+                self.assertEqual(
+                    self.core._cluster_launch_target(self.detect), expected
+                )
+
+    def test_detected_strict_device_enables_cluster_launch(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(self.core._cluster_launch_target(lambda: "gfx1250-strict"))
+
+
 class TestRuntimeArchitecture(unittest.TestCase):
     def setUp(self):
         import torch
