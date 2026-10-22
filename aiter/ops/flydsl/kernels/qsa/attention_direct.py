@@ -32,10 +32,10 @@ from flydsl.expr import rocdl
 
 from . import attention_direct_packed as packed
 from .attention_common import (
+    _MAX_FLOOR,
     _buffer,
     _buffer_words,
     _exp,
-    _MAX_FLOOR,
     _maximum,
     _mfma,
     _min,

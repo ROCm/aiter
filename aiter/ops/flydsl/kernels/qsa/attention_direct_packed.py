@@ -15,12 +15,12 @@ from flydsl._mlir import ir
 from flydsl.expr import rocdl
 
 from .attention_common import (
+    _MAX_FLOOR,
     _buffer,
     _buffer_store_words,
     _buffer_words,
     _exp,
     _load_lds,
-    _MAX_FLOOR,
     _maximum,
     _mfma,
     _min,

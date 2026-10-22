@@ -15,6 +15,7 @@ from flydsl._mlir import ir
 from flydsl.expr import rocdl
 
 from .attention_common import (
+    _MAX_FLOOR,
     _buffer,
     _buffer_words,
     _center,
@@ -30,7 +31,6 @@ from .attention_common import (
     _LdsQueue,
     _load_lds,
     _max,
-    _MAX_FLOOR,
     _maximum,
     _min,
     _pack_bf16,
