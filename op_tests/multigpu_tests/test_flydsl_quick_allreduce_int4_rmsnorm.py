@@ -186,6 +186,11 @@ def _run_rank(rank, tp, init_method, cases, time_it):
         latency=None if latency is None else latency == "1",
         # The low-latency build is for the 256-thread block.
         block=256 if latency == "1" else None,
+        grid_cap=(
+            int(os.environ["FLYDSL_QR_GRID_CAP"])
+            if "FLYDSL_QR_GRID_CAP" in os.environ
+            else None
+        ),
     )
     rows = []
     # preload must cover every fused build the cases pick: a case that adds one
@@ -399,6 +404,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tp", type=int, default=WORLD)
     parser.add_argument(
+        "--bench-only", action="store_true", help="skip the validity sweep"
+    )
+    parser.add_argument(
         "--bench",
         type=str,
         nargs="*",
@@ -415,11 +423,12 @@ def main():
         # The 256-thread block is a legal fused build only where a row's atoms
         # divide a rank's share of a tile.
         cases = [c for c in cases if _latency_hidden_ok(c[1], args.tp)]
-    ranks = _spawn(args.tp, cases, time_it=False)
-    _assert_valid(ranks, cases)
-    aiter.logger.info(
-        "validity (rank 0):\n%s", pd.DataFrame(ranks[0]).to_markdown(index=False)
-    )
+    if not args.bench_only:
+        ranks = _spawn(args.tp, cases, time_it=False)
+        _assert_valid(ranks, cases)
+        aiter.logger.info(
+            "validity (rank 0):\n%s", pd.DataFrame(ranks[0]).to_markdown(index=False)
+        )
 
     bench = []
     for pair in args.bench:

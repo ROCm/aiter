@@ -177,8 +177,10 @@ The mesh also has a low-latency build (`latency=true` on a ladder rung, or the
 `latency=` argument of `FlyQuickAllReduceRMSNorm`): the epilogue loads the
 residual ahead of the exchanges (`prefetch`) and two workgroups per CU stay
 resident. It needs `super_tile=1` and the 256-thread block, which at 8 ranks
-only hidden 2048 has. It is correct, but on gfx950 at TP8, hidden 2048 it ran
-2-3x slower than the default build, so no shipped rung selects it.
+only hidden 2048 has. It comes from #6369, which targeted gfx950 on xGMI. On
+gfx950 over PCIe at TP8, hidden 2048 it ran 2-3x slower than the default
+build, so the ladder loader rejects a `latency` rung on any link but xGMI. No
+shipped rung selects it; whether one should on xGMI is still to be measured.
 
 A split row (one token row over several workgroups; opt-in with
 `AITER_FLY_AR_FUSED_SPLIT=1`) joins its sum of squares

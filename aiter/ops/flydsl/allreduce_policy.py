@@ -1261,6 +1261,12 @@ def load_fused_ladders(path: str) -> FusedLadders:
             for hidden, entry, ew in entries:
                 _check_keys(entry, ew, ("rungs",), ("atoms_per_row",) if qr else ())
                 rungs = _parse_rungs(entry["rungs"], cls, check, ew)
+                if link != "xgmi" and any(getattr(r, "latency", False) for r in rungs):
+                    raise ValueError(
+                        f"{ew}: a low-latency rung is only for xgmi: the build "
+                        "has not been measured on other links, where it ran "
+                        "slower than the default"
+                    )
                 if family == "oneshot" and hidden is None:
                     splits = sorted({r.split for r in rungs} - {1})
                     if splits:
