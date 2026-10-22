@@ -37,6 +37,7 @@ from ..gemm_op_common import (
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
     _A8W8_MXSCALE_BMM_PREFETCH_TAGS,
+    A8W8_MXSCALE_BMM_WAVE8_TAGS,
     A16W16LaunchPlan,
     _get_cached_a8w8_mxscale_bmm_plan,
     _get_cached_a16w16_launch_plan,
@@ -845,9 +846,9 @@ _BPRESHUFFLE_FALLBACK_BANDS = (
 # prefetch-validates -- the bdirect and blds tiles above -- it already checks K
 # against a8w8_mxscale_flatmm_prefetch_k_iter of that exact instance, which is both
 # authoritative and tighter than any bound here: 338 needs 3 tiles of 128, not the
-# 4 a blanket bound demands. The wave8n4 (175, 348) and wavetm1 (205) tiles are
-# not in that set and run their own kernels, so the helper's flatmm traits say
-# nothing about them; they keep the conservative 4-tile bound.
+# 4 a blanket bound demands. The wave8n4 (175, 348) and wavetm1 (205) tiles run
+# their own traits, and the plan checks them against
+# a8w8_mxscale_wave8_prefetch_k_iter, a mirror of those.
 #
 # Compact needs no screen at all, and shows why the helper cannot simply be
 # extended by tag: it reports a depth of 9 for 483, yet test_compact_mxscale_bmm
@@ -863,6 +864,7 @@ def _bpreshuffle_fallback_k_tiles_ok(inst, k: int) -> bool:
     """False when nothing else will screen this candidate's K-tile count."""
     if (
         inst.kernel_tag in _A8W8_MXSCALE_BMM_PREFETCH_TAGS
+        or inst.kernel_tag in A8W8_MXSCALE_BMM_WAVE8_TAGS
         or inst.kernel_tag in _BPRESHUFFLE_NO_K_TILE_FLOOR
     ):
         return True

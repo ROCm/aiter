@@ -561,6 +561,30 @@ def a8w8_mxscale_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     ) or 1
 
 
+A8W8_MXSCALE_BMM_WAVE8_TAGS = frozenset(
+    {
+        "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+    }
+)
+
+
+def a8w8_mxscale_wave8_prefetch_k_iter(instance: OpusGemmInstance) -> int:
+    """Mirror gfx950 ``opus_gemm_a8w8_mxscale_bpreshuffle_wave8_traits::prefetch_k_iter``.
+
+    Every split must run at least this many K tiles.
+    """
+    b_lds = instance.kernel_tag.endswith("_blds")
+    # A load groups of T_M*16 rows hold T_M*2 slots of (1024 + 32) bytes, so the
+    # per-tile A footprint is B_M/8 slots per 128-deep K group whatever T_M is.
+    per_iter = (instance.B_M // 8) * (instance.B_K // 128) * (1024 + 32)
+    if b_lds:
+        per_iter += instance.B_N * instance.B_K
+    budget = (163840 // max(instance.WG_PER_CU, 1)) // per_iter
+    return min(budget, 4 if b_lds else 3)
+
+
 def _a8w8_mxscale_flatmm_per_iter_lds(
     instance: OpusGemmInstance, b_staged: bool = True
 ) -> int:
