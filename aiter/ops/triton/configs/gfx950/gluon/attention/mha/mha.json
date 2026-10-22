@@ -30,6 +30,7 @@
       "waves_per_eu": 2,
       "num_warps": 8
     },
+    "causal_wide_min_seqlen_k": 4096,
     "causal_short": {
       "BLOCK_M": 128,
       "BLOCK_N": 64,

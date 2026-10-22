@@ -998,10 +998,12 @@ def _attn_fwd_inner(
     offs_m=None,
     IS_CAUSAL: gl.constexpr = False,
     MASK_STEPS: gl.constexpr = False,
+    IS_FP8: gl.constexpr = False,
 ):
     """Generic one-tile-at-a-time loop over key blocks `[block_min, block_max)`.
 
-    `q_pe` / `acc2` as in `_attn_fwd_pipelined`.
+    `q_pe` / `acc2` as in `_attn_fwd_pipelined`.  `IS_FP8` takes the e4m3 QK^T and
+    `_attn_softmax_pv_fp8` (no PE, no split head; `acc2` passes through).
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
     HAS_PE_DOT: gl.constexpr = HAS_PE or D_HI_QK > 0
@@ -1093,9 +1095,10 @@ def _attn_fwd_inner(
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             HAS_PE=HAS_PE_DOT,  # PE, or a split head's upper slice
-            IS_FP8=False,
+            IS_FP8=IS_FP8,
             WINDOW_MASK=WINDOW_MASK,
-            SCALE_ON_Q=SCALE_ON_Q,
+            # fp8 leaves qk unscaled: its softmax folds qk_scale into the exp2 FMA.
+            SCALE_ON_Q=SCALE_ON_Q or IS_FP8,
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
             block_max=block_max,
@@ -1104,25 +1107,44 @@ def _attn_fwd_inner(
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=MASK_STEPS,
         )
-        acc, acc2, l_i, m_i = _attn_softmax_pv(
-            acc,
-            acc2,
-            l_i,
-            m_i,
-            qk,
-            v,
-            v_hi,
-            sd_base,
-            sd_offsets,
-            sd_q_mask,
-            offs_n,
-            start_n,
-            seqlen_k,
-            stride_sd_n,
-            dotP,
-            RETURN_SCORES,
-            D_HI_PV,
-        )
+        if IS_FP8:
+            acc, l_i, m_i = _attn_softmax_pv_fp8(
+                acc,
+                l_i,
+                m_i,
+                qk,
+                v,
+                qk_scale,
+                sd_base,
+                sd_offsets,
+                sd_q_mask,
+                offs_n,
+                start_n,
+                seqlen_k,
+                stride_sd_n,
+                dotP,
+                RETURN_SCORES,
+            )
+        else:
+            acc, acc2, l_i, m_i = _attn_softmax_pv(
+                acc,
+                acc2,
+                l_i,
+                m_i,
+                qk,
+                v,
+                v_hi,
+                sd_base,
+                sd_offsets,
+                sd_q_mask,
+                offs_n,
+                start_n,
+                seqlen_k,
+                stride_sd_n,
+                dotP,
+                RETURN_SCORES,
+                D_HI_PV,
+            )
 
         # WAR: this tile's LDS reads against the copy that will overwrite the
         # same slot two iterations from now.
@@ -2349,166 +2371,6 @@ def _attn_softmax_pv_fp8(
     return acc, l_i, m_ij
 
 
-@gluon.jit
-def _attn_fwd_inner_fp8(
-    acc,
-    l_i,
-    m_i,
-    q,
-    k_base,
-    v_base,
-    smemK,
-    smemV,
-    kt_off,
-    v_off,
-    kt_off_n,
-    kt_off_d,
-    v_off_n,
-    v_off_d,
-    stride_kn,
-    stride_vn,
-    seqlen_k,
-    block_min,
-    block_max,
-    window_min,
-    qk_scale,
-    sd_base,
-    sd_offsets,
-    sd_q_mask,
-    stride_sd_n,
-    mfmaLayout: gl.constexpr,
-    dotK: gl.constexpr,
-    dotP: gl.constexpr,
-    dotV: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr,
-    BLOCK_DMODEL_POW2: gl.constexpr,
-    WINDOW_MASK: gl.constexpr,
-    RETURN_SCORES: gl.constexpr,
-    BUF_DEPTH: gl.constexpr,
-    seqlen_q=None,
-    n_extra_tokens=None,
-    offs_m=None,
-    IS_CAUSAL: gl.constexpr = False,
-    MASK_STEPS: gl.constexpr = False,
-):
-    """`_attn_fwd_inner` for fp8: same staging, the fp8 softmax and P@V."""
-    PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
-    if MASK_STEPS or IS_CAUSAL or WINDOW_MASK or RETURN_SCORES:
-        offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
-    else:
-        offs_n = None
-
-    n_iter = (block_max - block_min) // BLOCK_N
-    ASYNC_GROUPS: gl.constexpr = 2
-
-    _async_copy_kv_tile(
-        smemK,
-        None,
-        smemV,
-        0,
-        k_base,
-        v_base,
-        kt_off,
-        None,
-        v_off,
-        kt_off_n,
-        kt_off_d,
-        None,
-        v_off_n,
-        v_off_d,
-        block_min,
-        seqlen_k,
-        BLOCK_DMODEL,
-        0,
-        MASK_STEPS,
-        PADDED_HEAD,
-        False,
-    )
-
-    for i in range(n_iter):
-        start_n = block_min + i * BLOCK_N
-
-        cur = i % BUF_DEPTH
-        nxt = BUF_DEPTH - 1 - cur
-        nxt_i = min(i + 1, n_iter - 1)
-        _async_copy_kv_tile(
-            smemK,
-            None,
-            smemV,
-            nxt,
-            k_base + nxt_i * BLOCK_N * stride_kn,
-            v_base + nxt_i * BLOCK_N * stride_vn,
-            kt_off,
-            None,
-            v_off,
-            kt_off_n,
-            kt_off_d,
-            None,
-            v_off_n,
-            v_off_d,
-            block_min + nxt_i * BLOCK_N,
-            seqlen_k,
-            BLOCK_DMODEL,
-            0,
-            MASK_STEPS,
-            PADDED_HEAD,
-            False,
-        )
-        cdna4_async.wait_group(ASYNC_GROUPS)
-        k = cdna4_async.load_shared_relaxed(smemK.index(cur), dotK)
-        v = cdna4_async.load_shared_relaxed(smemV.index(cur), dotV)
-        qk = _attn_qk(
-            q,
-            k,
-            None,
-            None,
-            start_n,
-            offs_n,
-            window_min,
-            qk_scale,
-            mfmaLayout=mfmaLayout,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            HAS_PE=False,
-            IS_FP8=True,
-            WINDOW_MASK=WINDOW_MASK,
-            # Leave qk unscaled: the softmax folds qk_scale into its exp2 FMA.
-            SCALE_ON_Q=True,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            block_max=block_max,
-            n_extra_tokens=n_extra_tokens,
-            offs_m=offs_m,
-            IS_CAUSAL=IS_CAUSAL,
-            MASK_STEPS=MASK_STEPS,
-        )
-        acc, l_i, m_i = _attn_softmax_pv_fp8(
-            acc,
-            l_i,
-            m_i,
-            qk,
-            v,
-            qk_scale,
-            sd_base,
-            sd_offsets,
-            sd_q_mask,
-            offs_n,
-            start_n,
-            seqlen_k,
-            stride_sd_n,
-            dotP,
-            RETURN_SCORES,
-        )
-
-        gl.barrier()
-
-    cdna4_async.wait_group(0)
-
-    return acc, l_i, m_i
-
-
 _attn_fwd_fp8_repr = make_kernel_repr(
     "_attn_fwd_gluon_fp8",
     [
@@ -2736,6 +2598,8 @@ def _attn_fwd_fp8(
     # q stays e4m3: re-rounding q * scale into fp8 would lose more than the
     # per-tile multiply costs, so the scale (with both descales) rides the softmax.
     qk_scale = sm_scale * RCP_LN2 * descale_q * descale_k
+    # Keep the scale positive so masked -inf * scale stays -inf, not NaN.
+    qk_scale = gl.maximum(qk_scale, 1.0e-30)
 
     q_base = (
         q_ptr
@@ -2913,19 +2777,24 @@ def _attn_fwd_fp8(
         k_base += skipped_blocks * BLOCK_N * stride_kn
         v_base += skipped_blocks * BLOCK_N * stride_vn
         if window_blocks > 0:
-            acc, l_i, m_i = _attn_fwd_inner_fp8(
+            acc, _, l_i, m_i = _attn_fwd_inner(
+                acc,
                 acc,
                 l_i,
                 m_i,
                 q,
+                None,
                 k_base,
                 v_base,
                 smemK,
+                None,
                 smemV,
                 kt_off,
+                None,
                 v_off,
                 kt_off_n,
                 kt_off_d,
+                None,
                 v_off_n,
                 v_off_d,
                 stride_kn,
@@ -2947,9 +2816,16 @@ def _attn_fwd_fp8(
                 BLOCK_N=BLOCK_N,
                 BLOCK_DMODEL=BLOCK_DMODEL,
                 BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+                BLOCK_DMODEL_PE=0,
+                HAS_PE=False,
                 WINDOW_MASK=True,
                 RETURN_SCORES=RETURN_SCORES,
+                SCALE_ON_Q=False,
                 BUF_DEPTH=BUF_DEPTH,
+                D_LO=BLOCK_DMODEL_POW2,
+                D_HI_QK=0,
+                D_HI_PV=0,
+                IS_FP8=True,
             )
             k_base += window_blocks * BLOCK_N * stride_kn
             v_base += window_blocks * BLOCK_N * stride_vn
@@ -3003,19 +2879,24 @@ def _attn_fwd_fp8(
 
     if (not pipelined) and n_full_blocks > 0:
         block_max = block_min + n_full_blocks * BLOCK_N
-        acc, l_i, m_i = _attn_fwd_inner_fp8(
+        acc, _, l_i, m_i = _attn_fwd_inner(
+            acc,
             acc,
             l_i,
             m_i,
             q,
+            None,
             k_base,
             v_base,
             smemK,
+            None,
             smemV,
             kt_off,
+            None,
             v_off,
             kt_off_n,
             kt_off_d,
+            None,
             v_off_n,
             v_off_d,
             stride_kn,
@@ -3037,9 +2918,16 @@ def _attn_fwd_fp8(
             BLOCK_N=BLOCK_N,
             BLOCK_DMODEL=BLOCK_DMODEL,
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE=0,
+            HAS_PE=False,
             WINDOW_MASK=False,
             RETURN_SCORES=RETURN_SCORES,
+            SCALE_ON_Q=False,
             BUF_DEPTH=BUF_DEPTH,
+            D_LO=BLOCK_DMODEL_POW2,
+            D_HI_QK=0,
+            D_HI_PV=0,
+            IS_FP8=True,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -3047,19 +2935,24 @@ def _attn_fwd_fp8(
     if masked_blocks > 0:
         k_base += n_full_blocks * BLOCK_N * stride_kn
         v_base += n_full_blocks * BLOCK_N * stride_vn
-        acc, l_i, m_i = _attn_fwd_inner_fp8(
+        acc, _, l_i, m_i = _attn_fwd_inner(
+            acc,
             acc,
             l_i,
             m_i,
             q,
+            None,
             k_base,
             v_base,
             smemK,
+            None,
             smemV,
             kt_off,
+            None,
             v_off,
             kt_off_n,
             kt_off_d,
+            None,
             v_off_n,
             v_off_d,
             stride_kn,
@@ -3081,14 +2974,21 @@ def _attn_fwd_fp8(
             BLOCK_N=BLOCK_N,
             BLOCK_DMODEL=BLOCK_DMODEL,
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE=0,
+            HAS_PE=False,
             WINDOW_MASK=SLIDING_WINDOW > 0,
             RETURN_SCORES=RETURN_SCORES,
+            SCALE_ON_Q=False,
             BUF_DEPTH=BUF_DEPTH,
+            D_LO=BLOCK_DMODEL_POW2,
+            D_HI_QK=0,
+            D_HI_PV=0,
             seqlen_q=seqlen_q,
             n_extra_tokens=n_extra_tokens,
             offs_m=offs_m,
             IS_CAUSAL=IS_CAUSAL,
             MASK_STEPS=True,
+            IS_FP8=True,
         )
 
     # Epilogue: the lift cancels in acc / l; descale_v is applied here, once.
@@ -3127,10 +3027,6 @@ def _attn_fwd_fp8(
     )
 
 
-# Causal K length from which the wide (256-row, 8-wave) tile pays; see _get_config.
-_CAUSAL_WIDE_MIN_SEQLEN_K = 4096
-
-
 def _get_config(
     is_fp8: bool,
     has_pe: bool = False,
@@ -3141,57 +3037,35 @@ def _get_config(
 ):
     """Tile / wave configuration for one masking + dtype mode.
 
-    The MFMA tiling fixes `BLOCK_M = 32 * num_warps`, so the two knobs move
-    together.  Both masking modes take the wide tile (256 / 8 waves): it amortises
-    the per-tile softmax over twice the rows and puts two waves on every SIMD, which
-    is what lets a wave's vector work issue in the other wave's MFMA shadow.  The
-    narrow tile (128 / 4 waves) wastes less of a causal diagonal block, but it gives
-    one wave per SIMD, which leaves the pipeline nothing to overlap against.
-
-    That holds only while the pipeline gets the work.  A causal workgroup enters it
-    with at least `_MIN_PIPE_BLOCKS` unmasked key blocks, and short sequences
-    rarely have them: at 256 keys the wide tile is one block lying entirely on the
-    diagonal, issuing the whole 256x256 square for half of it useful.  Below
-    `_CAUSAL_WIDE_MIN_SEQLEN_K` keys the narrow tile therefore wins (1.37x at
-    256, 1.08-1.19x at 1024, still 1.02-1.06x at 3072 across D=56/64/128); past it
-    the two are within 5% either way.
-
-    A causal sliding window inverts that again.  Every workgroup then walks only
-    `BLOCK_M + window` keys, and the window's diagonal edge and the causal one each
-    cost a band of `BLOCK_M` masked rows -- a fixed overhead per row that halving
-    `BLOCK_M` halves, which outweighs the lost wave.
+    `BLOCK_M = 32 * num_warps`.  The wide tile (256 / 8 waves) is the default: two
+    waves per SIMD overlap softmax with MFMA.  Causal attention below
+    `causal_wide_min_seqlen_k` keys, and a causal sliding window, take the narrow
+    tile (128 / 4 waves), which wastes less on the masked diagonal.
     """
     arch = arch_info.get_arch()
     fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
     fwd_cfg = load_config_json(fpath)["fwd"]
     if is_fp8:
-        # A 64-wide head leaves the fp8 tile short of MFMA work per key block;
-        # doubling BLOCK_N amortises the per-block softmax over twice the keys.
-        # Only for a real 64: fp8 pads every head to at least 64, and on a padded
-        # one (56, 32) the head-masked copies -- 32-bit ones at 56, whose 56-byte
-        # rows miss 128-bit alignment -- push the 128-wide tile into spills whose
-        # reloads drain the async copies (`s_waitcnt vmcnt(0)`).  Measured there,
-        # 128x64 is 1.2-1.9x faster.
+        # A 64-wide head doubles BLOCK_N to amortise the softmax.  Only an exact
+        # 64: padded heads (56, 32) spill at that tile.
         if v_head_dim == 64 and "fp8_small_head" in fwd_cfg:
             return fwd_cfg["fp8_small_head"]
         return fwd_cfg["fp8"]
     elif has_pe:
-        # The PE tile is bounded by the accumulator, which is [BLOCK_M, v_head_dim]
-        # fp32 -- v_head_dim/2 VGPRs per lane once BLOCK_M cancels against the wave
-        # count.  A 64-wide V head leaves room for the wide tile and the two waves
-        # per SIMD that go with it; a 128-wide one does not, and forcing it there
-        # spills.
+        # The wide tile fits only a V head <= 64; a wider one spills.
         if v_head_dim and v_head_dim <= 64 and "pe_narrow_v" in fwd_cfg:
             return fwd_cfg["pe_narrow_v"]
         return fwd_cfg["pe"]
     elif v_head_dim > 128 and "wide_head" in fwd_cfg:
-        # Past 128 the K/V staging tiles are 256 wide, and the default tile's double
-        # buffers no longer fit beside two workgroups; its accumulator alone is half
-        # the register file, and the default tile spills.
+        # Past 128 the default tile spills.
         return fwd_cfg["wide_head"]
     elif causal and sliding_window > 0 and "causal_window" in fwd_cfg:
         return fwd_cfg["causal_window"]
-    elif causal and seqlen_k < _CAUSAL_WIDE_MIN_SEQLEN_K and "causal_short" in fwd_cfg:
+    elif (
+        causal
+        and "causal_short" in fwd_cfg
+        and seqlen_k < fwd_cfg["causal_wide_min_seqlen_k"]
+    ):
         return fwd_cfg["causal_short"]
     elif causal and "causal" in fwd_cfg:
         return fwd_cfg["causal"]

@@ -311,6 +311,9 @@ def _gluon_flash_attn_forward(
         assert (
             descale_q is not None and descale_k is not None and descale_v is not None
         ), "FP8 Gluon MHA requires descale_q/descale_k/descale_v"
+        # The fp8 kernel scales qk after the mask and takes the row max of the
+        # unscaled scores, both of which need a nonnegative scale.
+        assert sm_scale >= 0, f"FP8 Gluon MHA requires sm_scale >= 0 (got {sm_scale})"
         assert (
             q.dtype == types.e4m3_dtype
             and k.dtype == types.e4m3_dtype
@@ -551,8 +554,9 @@ def _gluon_flash_attn_forward(
         HEAD_STRIDE_ALIGN=head_stride_align,
         KV_STRIDE_ALIGN=kv_stride_align,
         # fp8 keeps the per-tile scale: q is already fp8, so re-rounding q*scale back
-        # into fp8 would throw away far more than the multiply costs.
-        SCALE_ON_Q=not IS_FP8,
+        # into fp8 would throw away far more than the multiply costs.  So does fp16:
+        # q*scale can overflow it where the fp32 scores would not.
+        SCALE_ON_Q=not IS_FP8 and q.dtype != torch.float16,
         **config,
         enable_fp_fusion=True,
     )
