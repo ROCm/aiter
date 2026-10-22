@@ -348,10 +348,23 @@ def _is_mxfp8_out(dtype: torch.dtype) -> bool:
     return dtype == dtypes.fp8
 
 
-def _alloc_f4gemm_out(M: int, N: int, dtype: torch.dtype, device) -> Tensor:
-    """Allocate the F4GEMM output. bf16 output is a plain ``[M, N]``; mxfp8 output
+def _alloc_f4gemm_out(
+    M: int, N: int, dtype: torch.dtype, device, y: Tensor | None = None
+) -> Tensor:
+    """Allocate or reuse the F4GEMM output. bf16 output is a plain ``[M, N]``; mxfp8 output
     is a plain ``[M, N]`` fp8 (its E8M0 scale is a separate tensor, see
     :func:`_alloc_f4gemm_out_scale`)."""
+    if y is not None:
+        if (
+            y.shape != (M, N)
+            or y.dtype != dtype
+            or y.device != device
+            or not y.is_contiguous()
+        ):
+            raise ValueError(
+                f"y must be contiguous with shape {(M, N)}, dtype {dtype}, device {device}"
+            )
+        return y
     return torch.empty((M, N), dtype=dtype, device=device)
 
 
@@ -389,17 +402,23 @@ def gemm_mxfp4_asm(
     dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
+    *,
+    y: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """MXFP4 GEMM (preload SGPR mode). D = A * B with e8m0 scales. ``dtype``:
     bf16 ``[M,N]`` or mxfp8 (``dtypes.fp8``) returning
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
-    :func:`unpack_mxfp8_out_scale`."""
+    :func:`unpack_mxfp8_out_scale`. Optional ``y`` supplies a contiguous
+    ``[M,N]`` output with the requested dtype on A's device, as in Gluon.
+    An empty batch returns empty output buffers without launching a kernel."""
     require_gfx1250_asm("gemm_mxfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
-    out = _alloc_f4gemm_out(M, N, dtype, A.device)
+    out = _alloc_f4gemm_out(M, N, dtype, A.device, y)
     out_scale = _alloc_f4gemm_out_scale(M, N, dtype, A.device)
+    if M == 0:
+        return (out, out_scale) if out_scale is not None else out
     _mxfp4_gemm_asm(
         A,
         B,
@@ -423,17 +442,23 @@ def gemm_nvfp4_asm(
     dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
+    *,
+    y: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """NVFP4 GEMM (preload SGPR mode). D = A * B with e4m3 scales + global alphas.
     ``dtype``: bf16 ``[M,N]`` or mxfp8 (``dtypes.fp8``) returning
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
-    :func:`unpack_mxfp8_out_scale`."""
+    :func:`unpack_mxfp8_out_scale`. Optional ``y`` supplies a contiguous
+    ``[M,N]`` output with the requested dtype on A's device.
+    An empty batch returns empty output buffers without launching a kernel."""
     require_gfx1250_asm("gemm_nvfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
-    out = _alloc_f4gemm_out(M, N, dtype, A.device)
+    out = _alloc_f4gemm_out(M, N, dtype, A.device, y)
     out_scale = _alloc_f4gemm_out_scale(M, N, dtype, A.device)
+    if M == 0:
+        return (out, out_scale) if out_scale is not None else out
     _nvfp4_gemm_asm(
         A,
         B,

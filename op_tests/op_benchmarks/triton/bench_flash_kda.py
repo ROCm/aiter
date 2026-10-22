@@ -25,7 +25,6 @@ python bench_flash_kda.py --seg-sweep
 python bench_flash_kda.py -o
 """
 
-import argparse
 import math
 import os
 import sys
@@ -46,6 +45,7 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 # (B, T, H, K, V) – H=12 is the Kimi K3 shape this path was built for; the rest
@@ -192,10 +192,7 @@ def run_benchmark(args):
 
 
 def parse_args(args=None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark FlashKDA forward",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="FlashKDA forward")
     parser.add_argument(
         "--shape",
         type=int,

@@ -10,7 +10,6 @@ One provider per kernel:
   segment_m  -> quant_fp8_blockwise_segment_m_kernel
 """
 
-import argparse
 import math
 
 import torch
@@ -22,6 +21,10 @@ from aiter.ops.triton.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise_for_weight,
     quant_fp8_blockwise_segment_m,
     requant_fp8_row_to_col,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
@@ -100,15 +103,9 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark FP8 blockwise quant", allow_abbrev=False
-    )
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
+    parser = get_parser(kernel_name="FP8 blockwise quant")
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()
