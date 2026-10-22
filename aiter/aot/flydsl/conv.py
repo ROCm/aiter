@@ -23,14 +23,14 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import re
 import sys
 import time
 
 from aiter.aot.flydsl.common import (
-    collect_aot_jobs,
+    collect_cli_jobs,
     compile_only_env,
     cu_num_to_arch,
+    get_gfx_list_env,
     job_identity,
     override_env,
     run_jobs_parallel,
@@ -164,19 +164,12 @@ def _row_npq_per_sample(shape) -> int:
     )
 
 
-def _requested_archs():
-    """ARCH / GPU_ARCHS as a set, or None. Applied in parse_csv so setup.py's run_aot sees it."""
-    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
-    if not arch:
-        return None
-    return {a.strip() for a in re.split(r"[;,]", arch) if a.strip()} or None
-
-
 def parse_csv(csv_path: str):
     """Parse the tuned conv CSV into unique conv and transpose compile jobs."""
     jobs = []
     seen = set()
-    keep_archs = _requested_archs()
+    # Applied here so setup.py's run_aot sees it too.
+    keep_archs = get_gfx_list_env()
 
     with open(csv_path, newline="") as f:
         for raw in csv.DictReader(f):
@@ -493,7 +486,7 @@ def main():
     )
     arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
 
-    all_jobs = collect_aot_jobs(csv_paths, parse_csv)
+    all_jobs = collect_cli_jobs(csv_paths, parse_csv)
     if arch:
         print(f"[aiter] ARCH={arch}: {len(all_jobs)} jobs match")
 

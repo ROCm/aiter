@@ -102,7 +102,7 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
+| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `gfx`, with legacy `cu_num` fallback). `conv.py` and `gemm.py` apply `GPU_ARCHS` inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `ARCH` is read only by `python -m`, where it replaces `GPU_ARCHS`, since build images export it as a machine type such as `x86_64`. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is taken from the CSV's `gfx` column, with `cu_num_to_arch(...)` retained

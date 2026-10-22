@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
+from aiter.jit.utils.build_targets import _parse_gpu_archs_env
 from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_for
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
@@ -62,6 +63,19 @@ def cu_num_to_arch(cu_num: int, default: str = "gfx950") -> str:
     return _CU_NUM_TO_ARCH.get(cu_num, default)
 
 
+def get_gfx_list_env() -> list[str] | None:
+    """Archs named by an explicit GPU_ARCHS, or None to keep every arch.
+
+    The list may be ';'- or ','-separated. ARCH is not read: build images export
+    it as a machine type such as x86_64, which would drop every job from a wheel
+    build.
+    """
+    gpu_archs = os.environ.get("GPU_ARCHS", "").strip()
+    if not gpu_archs or gpu_archs.lower() == "native":
+        return None
+    return _parse_gpu_archs_env(gpu_archs.replace(",", ";"))
+
+
 def job_identity(job: dict[str, Any]) -> tuple:
     return tuple(sorted(job.items()))
 
@@ -90,6 +104,16 @@ def collect_aot_jobs(
         elif on_missing_csv is not None:
             on_missing_csv(csv_path)
     return dedupe_jobs(jobs)
+
+
+def collect_cli_jobs(
+    csv_paths: list[str],
+    parse_csv: Callable[[str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """collect_aot_jobs for a python -m entry point, where ARCH replaces GPU_ARCHS."""
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
+    with override_env("GPU_ARCHS", arch):
+        return collect_aot_jobs(csv_paths, parse_csv)
 
 
 @contextmanager

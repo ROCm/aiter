@@ -32,7 +32,9 @@ Usage:
 
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
-    GPU_ARCHS / ARCH          Target GPU architecture information for logging.
+    GPU_ARCHS                 Keeps only the jobs for the listed archs, here and in
+                              setup.py's run_aot.
+    ARCH                      Replaces GPU_ARCHS, for this entry point only.
 """
 
 from __future__ import annotations
@@ -50,9 +52,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
-    collect_aot_jobs,
+    collect_cli_jobs,
     compile_only_env,
     cu_num_to_arch,
+    get_gfx_list_env,
     job_identity,
     override_env,
     run_jobs_parallel,
@@ -234,7 +237,10 @@ def _bmm_mfma_job(
 
 
 def parse_csv(csv_path: str):
-    """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
+    """Parse a GEMM tuned CSV and return its unique FlyDSL compile jobs.
+
+    Keeps only the GPU_ARCHS jobs, so setup.py's run_aot filters like main().
+    """
     jobs = []
     seen = set()
     batched_skipped = set()
@@ -381,6 +387,12 @@ def parse_csv(csv_path: str):
             f"  [WARN] {len(batched_skipped)} batched FlyDSL kernel(s) in {csv_path} "
             "have no AOT wiring, skipping"
         )
+
+    keep_archs = get_gfx_list_env()
+    if keep_archs is not None:
+        jobs = [
+            j for j in jobs if job_arch(j["cu_num"], j.get("gfx", "")) in keep_archs
+        ]
     return jobs
 
 
@@ -1194,15 +1206,9 @@ def main():
     )
     arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
 
-    all_jobs = collect_aot_jobs(csv_paths, parse_csv)
+    all_jobs = collect_cli_jobs(csv_paths, parse_csv)
     if arch:
-        # GPU_ARCHS may be a ';'- or ','-separated list (e.g. "gfx942;gfx950").
-        arch_set = {a.strip() for a in re.split(r"[;,]", arch) if a.strip()}
-        n_before = len(all_jobs)
-        all_jobs = [
-            j for j in all_jobs if job_arch(j["cu_num"], j.get("gfx", "")) in arch_set
-        ]
-        print(f"[aiter] ARCH={arch}: {len(all_jobs)}/{n_before} jobs match")
+        print(f"[aiter] ARCH={arch}: {len(all_jobs)} jobs match")
 
     print("=" * 72)
     print("FlyDSL GEMM AOT Pre-compilation")
