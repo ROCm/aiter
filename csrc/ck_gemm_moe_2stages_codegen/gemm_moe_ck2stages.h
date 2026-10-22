@@ -70,13 +70,21 @@ struct dtype_checker
 // All ck2stages instances are built with GemmSpecialization::Default, and
 // DeviceMoeGemm::IsSupportedArgument() rejects `N % NPerBlock != 0` /
 // `K % KPerBlock != 0` *outside* of the GemmSpec check, i.e. padding
-// specializations do not relax it. A heuristic therefore must never hand a
-// problem size to a tile it cannot divide, otherwise the only feedback the
-// user gets is CK's opaque "device_gemm with the specified compilation
-// parameters does not support this GEMM problem".
+// specializations do not relax it. The A16W16 and A8W8 default heuristics
+// must never hand such a problem to CK, otherwise the only feedback is CK's
+// opaque "device_gemm with the specified compilation parameters does not
+// support this GEMM problem".
 //
-// Typical offender: TP-sharded inter_dim such as 320 or 448, which is 64- but
-// not 128-aligned, so the wider (and usually faster) tile is unusable.
+// Two dimensions show up:
+//   * stage1 N and stage2 K are inter_dim. A TP shard such as 320 or 448 is
+//     64- but not 128-aligned, so the wider tile is unusable and the
+//     heuristic falls back to N64/K64 (gfx950 fp8 stage2 has no K64 instance
+//     and reports the alignment instead).
+//   * stage2 N is model_dim (w2.size(1)). The same heuristics take an N64
+//     tile when one exists, and otherwise reject model_dim that the only
+//     available N128 tile cannot divide.
+// A4W4, A8W4, and blockscale heuristics are out of scope: they still return a
+// fixed tile and do not consult model_dim.
 static inline bool moe_tile_fits(int dim, int per_block) { return dim % per_block == 0; }
 
 // Same constraint, but for heuristics that have no narrower instance to fall

@@ -10,9 +10,16 @@ import torch.nn.functional as F
 from aiter.fused_moe import fused_moe, get_2stage_cfgs
 from aiter.ops.shuffle import shuffle_weight
 
+def _ck_default_arch() -> bool:
+    if not torch.cuda.is_available() or not torch.version.hip:
+        return False
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    return arch in ("gfx942", "gfx950")
+
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not torch.version.hip,
-    reason="Exercises the A16W16 CK default dispatch",
+    not _ck_default_arch(),
+    reason="A16W16 CK default heuristics are generated for gfx942 and gfx950",
 )
 
 
@@ -67,3 +74,7 @@ def test_a16w16_ck_default_alignment(inter_dim, block_m, dtype):
 def test_qwen_mtp_tp2_ep1_default_dispatch(tokens):
     # Qwen3.8-Flash-Next MTP TP=2/EP=1 shape, without a block-size override.
     _check_moe(tokens, 2560, 320, 512, 10, None, torch.bfloat16)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
