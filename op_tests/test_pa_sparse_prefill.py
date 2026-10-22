@@ -53,6 +53,7 @@ from aiter.test_common import (
     benchmark,
     checkAllclose,
     perftest,
+    run_perftest,
 )
 
 try:
@@ -501,6 +502,24 @@ def _profile_func(target_func, *, backend: str):
     return target_func()
 
 
+def _profile_opus_rotating(inputs, softmax_scale, num_kv_splits):
+    # Pass tensors directly: deepcopy of a closure keeps its captured inputs.
+    return run_perftest(
+        pa_sparse_prefill_opus,
+        inputs["q"],
+        inputs["unified_kv"],
+        inputs["kv_indices_prefix"],
+        inputs["kv_indptr_prefix"],
+        inputs["kv"],
+        inputs["kv_indices_extend"],
+        inputs["kv_indptr_extend"],
+        inputs["attn_sink"],
+        softmax_scale,
+        num_kv_splits=num_kv_splits,
+        num_rotate_args=101,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tolerances
 # ---------------------------------------------------------------------------
@@ -532,6 +551,7 @@ def run_pa_sparse_prefill(
     seed: int = 0,
     data_init: str = "norm",
     num_kv_splits: int | None = None,
+    rotate_inputs: bool = False,
     verify: bool = True,
     bench: bool = True,
 ) -> dict | None:
@@ -652,7 +672,25 @@ def run_pa_sparse_prefill(
             )
 
         if bench:
-            _, lat_us = _profile_func(invoke, backend=name)
+            if rotate_inputs:
+                if prec != "bf16" or name != "opus":
+                    raise ValueError(
+                        "--rotate-inputs requires --prec bf16 --backend opus"
+                    )
+                result, lat_us = _profile_opus_rotating(
+                    kernel_inputs, softmax_scale, num_kv_splits
+                )
+                if not math.isfinite(float(lat_us)) or lat_us <= 0:
+                    raise RuntimeError("timer did not return a finite positive latency")
+                if verify:
+                    final_err = checkAllclose(
+                        result, ref, rtol=_RTOL, atol=_ATOL, tol_err_ratio=_ERR_TOL
+                    )
+                    assert final_err <= _ERR_TOL
+                    row[f"{name} final err"] = float(final_err)
+                row["input_instances"] = 101
+            else:
+                _, lat_us = _profile_func(invoke, backend=name)
             flops = 4.0 * h * total_nnz * d
             tflops = flops / max(lat_us * 1e-6, 1e-12) / 1e12
             row[f"{name} us"] = round(float(lat_us), 2)
@@ -728,10 +766,30 @@ def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
     ],
 )
 def test_opus_csr_boundaries(dtype, h, num_kv_splits, total_pages, total_tokens, topk):
+    _check_opus_csr_case(65, h, total_pages, total_tokens, topk, dtype, num_kv_splits)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize(
+    "n,h,total_pages,total_tokens,topk",
+    [
+        pytest.param(120, 15, 129, 129, 65, id="h15-at-split-limit"),
+        pytest.param(121, 15, 129, 129, 65, id="h15-above-split-limit"),
+        pytest.param(60, 17, 129, 129, 65, id="h17-at-split-limit"),
+        pytest.param(61, 17, 129, 129, 65, id="h17-above-split-limit"),
+        pytest.param(16, 15, 4096, 4096, 4096, id="long-split"),
+        pytest.param(256, 17, 4096, 4096, 4096, id="long-unsplit"),
+    ],
+)
+def test_opus_auto_dispatch_csr(dtype, n, h, total_pages, total_tokens, topk):
+    _check_opus_csr_case(n, h, total_pages, total_tokens, topk, dtype, None)
+
+
+def _check_opus_csr_case(n, h, total_pages, total_tokens, topk, dtype, num_kv_splits):
     if _get_gpu_arch() != "gfx950":
         pytest.skip("the source-compiled OPUS paths require gfx950")
     inputs = _make_inputs(
-        n=65,
+        n=n,
         h=h,
         d=512,
         total_pages=total_pages,
@@ -830,6 +888,12 @@ parser.add_argument(
     help="backend(s) to run, intersected with the precision and arch (all)",
 )
 parser.add_argument(
+    "--rotate-inputs",
+    action="store_true",
+    help="rotate 101 tensor input sets for BF16 OPUS timing; reports profiled GPU "
+    "dispatch time, not host-inclusive latency",
+)
+parser.add_argument(
     "--no-verify",
     action="store_true",
     help="skip the PyTorch correctness check (benchmark-only mode)",
@@ -889,6 +953,7 @@ if __name__ == "__main__":
             seed=args.seed,
             data_init=data_init,
             num_kv_splits=splits,
+            rotate_inputs=args.rotate_inputs,
             verify=not args.no_verify,
             bench=not args.no_bench,
         )
