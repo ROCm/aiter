@@ -13,13 +13,29 @@ and reported as three rows, keyed by the `layer` column:
 over and over, so its weights stay cache-resident in a way the real layer does
 not. Compare like with like.
 
---multi-gpu adds a fourth, `combine`, and changes where moe2's rows go: into
-mori's real combine staging window on the peer ranks, through the fused
-EP_SCATTER epilogue production compiles, instead of a local output buffer. It
-needs --ep > 1, that many GPUs, one --M, and torchrun --nproc-per-node=--ep.
-The DISPATCH is not simulated -- each rank keeps its own rows and fabricates the
-recv layout a dispatch would have produced -- so what it adds over plain --ep is
-the peer-memory write traffic and the cross-device barrier, not the all-to-all.
+--multi-gpu changes where moe2's rows go: into mori's real combine staging
+window on the peer ranks, through the fused EP_SCATTER epilogue production
+compiles, instead of a local output buffer. It needs --ep > 1, that many GPUs,
+one --M, and torchrun --nproc-per-node=--ep. The DISPATCH is not simulated --
+each rank keeps its own rows and fabricates the recv layout a dispatch would
+have produced -- so what it adds over plain --ep is the peer-memory write
+traffic and the cross-device barrier, not the all-to-all. It adds two rows:
+
+  sync     mori's 1-block cross-device barrier (mega._combine_sync) alone
+  combine  that barrier plus the reduce that drains the window, i.e. all of
+           mega._combine -- NOT part of total, and it overlaps `sync`
+
+and `total` becomes moe1 -> moe2 -> sync, so it carries the rank skew a real
+step pays at the rendezvous.
+
+--no-ep-scatter (with --multi-gpu) takes the other road out of moe2: the GEMM
+writes its un-reduced rows to a local buffer, a separate reduce_grouped launch
+sums each token's local gates, and then the mori sync. The rows are
+
+  moe1, moe2 (GEMM only), reduce, sync, total = moe1 -> moe2 -> reduce -> sync
+
+so its total lines up against the fused-scatter total. Nothing reaches the
+peers on this road, which is why there is no `combine` row for it.
 
 --layers picks which of those are measured, e.g. `--layers moe1 moe2` to skip
 the back-to-back run, or `--layers moe1` for one projection on its own. The
@@ -83,14 +99,25 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
-# measurable layers, in report order; see the module docstring. "combine" only
-# exists under --multi-gpu, where there is a real mori combine to measure.
+# measurable layers, in report order; see the module docstring. "sync" and
+# "combine" only exist under --multi-gpu, where there is a real mori to measure;
+# "reduce" only under --no-ep-scatter, where moe2 no longer reduces itself.
 LAYERS = ("moe1", "moe2", "total")
-MG_LAYERS = ("moe1", "moe2", "combine", "total")
+MG_LAYERS = ("moe1", "moe2", "sync", "combine", "total")
+MG_NO_SCATTER_LAYERS = ("moe1", "moe2", "reduce", "sync", "total")
+ALL_LAYERS = ("moe1", "moe2", "reduce", "sync", "combine", "total")
+
+
+def default_layers(multi_gpu, ep_scatter=True):
+    """Every layer a mode can measure, in report order."""
+    if not multi_gpu:
+        return LAYERS
+    return MG_LAYERS if ep_scatter else MG_NO_SCATTER_LAYERS
 
 
 def compute_roofline(
@@ -498,6 +525,8 @@ def bench_mlp_single_weight_init(
 ):
     # mori is the --multi-gpu bundle from init_mori_combine (None = single rank)
     rank = 0 if mori is None else mori.rank
+    # whether GEMM2 delivers into the staging window (False = --no-ep-scatter)
+    ep_scatter_on = mori is not None and mori.ep_scatter
     dev = f"cuda:{torch.cuda.current_device()}"
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
@@ -548,7 +577,7 @@ def bench_mlp_single_weight_init(
             "undoes; unset AITER_TRITON_USE_HERD"
         )
     assert layers, "at least one layer must be selected"
-    _known = MG_LAYERS if mori is not None else LAYERS
+    _known = default_layers(mori is not None, ep_scatter_on)
     assert set(layers) <= set(_known), f"unknown layer(s) in {layers=}"
 
     # -- init data --
@@ -594,7 +623,7 @@ def bench_mlp_single_weight_init(
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
     else:
         geometry = None
-        if mori is not None:
+        if ep_scatter_on:
             from aiter.ops.triton.moe.moe_routing.routing import EpScatterGeometry
 
             geometry = EpScatterGeometry(
@@ -609,7 +638,7 @@ def bench_mlp_single_weight_init(
             rank=rank,
             ep_scatter_geometry=geometry,
         )
-        if mori is not None:
+        if ep_scatter_on:
             from aiter.ops.triton.moe.reduce import EpCombineScatter
 
             # GEMM2 stops reducing locally and places its un-reduced rows into
@@ -646,6 +675,12 @@ def bench_mlp_single_weight_init(
         x2, x2_scale = mxfp4_quant(y1)
     del y1
 
+    # --no-ep-scatter splits moe2 in two: the GEMM alone (no scatter_indx, so
+    # moe_gemm_a4w4 returns the un-reduced [n_gates, dim1] rows and launches no
+    # reduce), then the same reduce_grouped call it would have made, as its own
+    # launch. Everywhere else moe2 is the one moe_gemm_a4w4 call, as before.
+    split_reduce = mori is not None and not ep_scatter_on
+
     def layer2():
         return moe_gemm_a4w4(
             x2,
@@ -654,10 +689,10 @@ def bench_mlp_single_weight_init(
             w2_scale,
             b2,
             rdata,
-            scatter_indx=scatter_indx,
+            scatter_indx=None if split_reduce else scatter_indx,
             # under EP most gate slots belong to other ranks and no GEMM here
             # ever writes them; None (every gate live) is right for --ep 1
-            gate_valid=gate_valid,
+            gate_valid=None if split_reduce else gate_valid,
             ep_scatter=ep_scatter,
             swizzle_mx_scale=swizzle_mx_scale2,
             preshuffle_weights=preshuffle,
@@ -666,33 +701,70 @@ def bench_mlp_single_weight_init(
 
     y2 = layer2()
 
-    if mori is None:
-        combine = None
-    else:
-        from aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe import Routing
+    reduce = None
+    if split_reduce:
+        y2_out = torch.empty((batch, dim1), dtype=y2.dtype, device=dev)
+        group_indx = scatter_indx.view(-1, n_expts_act)
+        group_valid = gate_valid.view(-1, n_expts_act)
 
-        mega_routing = Routing(
-            token_count=batch // mori.world,
-            reverse_source_view=mori_src_token_map(batch, mori.world, dev),
-        )
+        # standalone, it re-reduces the rows from the warm-up call above
+        def reduce(rows=y2):
+            # reduce_grouped takes [split_k, M, N]; moe_gemm_a4w4 hands back
+            # 2-D once nothing is left to reduce
+            if rows.ndim == 2:
+                rows = rows.unsqueeze(0)
+            return reduce_grouped(rows, group_indx, y2_out, indx_valid=group_valid)
 
-        def combine():
-            return mori.mega._combine(mega_routing)
+        reduce()
 
-        combine()
+    sync = combine = None
+    if mori is not None:
+        import flydsl.expr as fx
+
+        mega = mori.mega
+
+        # The 1-block cross-device barrier mega._combine opens with, on its
+        # own. A rendezvous, so its time is mostly waiting for the slowest
+        # rank. Every rank must call it equally often, which the lockstep
+        # bench loop guarantees.
+        def sync():
+            mega._combine_sync(
+                mega._arena.handle,
+                mega._cross_device_flag.data_ptr(),
+                mega._config.rank,
+                fx.Stream(torch.cuda.current_stream()),
+            )
+
+        sync()
+
+        if ep_scatter_on:
+            from aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe import Routing
+
+            mega_routing = Routing(
+                token_count=batch // mori.world,
+                reverse_source_view=mori_src_token_map(batch, mori.world, dev),
+            )
+
+            def combine():
+                return mega._combine(mega_routing)
+
+            combine()
     torch.cuda.synchronize()
 
     def both():
         layer1()
-        layer2()
-        if combine is not None:
-            combine()
+        y = layer2()
+        if reduce is not None:
+            reduce(y)
+        if sync is not None:
+            sync()
 
     # -- analytic FLOPs / bytes, matching run_moe_a4w4.py and the proton metadata
     # the kernel itself reports: 2*M*N*K per GEMM, and activations + routed-expert
     # weights + matmul output for traffic. mx scales (~1/16 of the weight bytes)
     # and the moe2 scatter reduction are not counted; the reduction's runtime is
-    # inside moe_gemm_a4w4 and so is inside the measurement.
+    # inside moe_gemm_a4w4 and so is inside the measurement -- except under
+    # --no-ep-scatter, where it is the separate `reduce` row.
     n_gates = gather_indx.shape[0]  # every gate slot == batch * n_expts_act
     # Rows this rank's GEMM really computes. Equal to n_gates at --ep 1; under EP
     # the dead slots get no tile, so the activation buffers are sized for n_gates
@@ -728,16 +800,28 @@ def bench_mlp_single_weight_init(
     # keeping only what `layers` asked for (in LAYERS order, not argv order).
     # `total` is NOT moe1 + moe2 -- an isolated projection replays one kernel
     # over and over, so its weights stay hotter than they are in the real layer.
-    # insertion order is report order, so keep it in MG_LAYERS order
+    # insertion order is report order, so keep it in default_layers() order
     to_bench = {
         "moe1": (layer1, moe1_flops, moe1_bytes),
         "moe2": (layer2, moe2_flops, moe2_bytes),
     }
+    total_flops = moe1_flops + moe2_flops
+    total_bytes = moe1_bytes + moe2_bytes
+    if reduce is not None:
+        # no matmul; the live un-reduced rows in, one row per token out
+        reduce_bytes = (n_rows + batch) * dim1 * y2.element_size()
+        to_bench["reduce"] = (reduce, 0, reduce_bytes)
+        total_bytes += reduce_bytes
+    if sync is not None:
+        # a flag per peer, nothing worth counting
+        to_bench["sync"] = (sync, 0, 0)
     if combine is not None:
-        # no matmul in it; the traffic is topk staged slots in, one row out
+        # no matmul in it; the traffic is topk staged slots in, one row out.
+        # Not in total: it overlaps `sync`, and --no-ep-scatter has no
+        # counterpart, so leaving it out keeps the two totals comparable.
         mtpr = batch // mori.world
         to_bench["combine"] = (combine, 0, mtpr * (n_expts_act + 1) * dim1 * 2)
-    to_bench["total"] = (both, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes)
+    to_bench["total"] = (both, total_flops, total_bytes)
 
     measured = {}
     for name, (f, flops, byts) in to_bench.items():
@@ -866,10 +950,14 @@ def roofline_mlp(
         # one file per rank: the ranks share a filesystem and their numbers
         # differ (barrier skew is real signal, not noise to average away)
         stem += f"-mori-rank{mori.rank}of{mori.world}"
+        if not mori.ep_scatter:
+            stem += "-noepscatter"
     stem += f"-{backend_name(backend)}"
     if preshuffle:
         stem += "-preshuffled"
-    if tuple(layers) != (MG_LAYERS if mori is not None else LAYERS):
+    if tuple(layers) != default_layers(
+        mori is not None, mori is None or mori.ep_scatter
+    ):
         # a partial run holds a subset of the rows, so give it its own file
         stem += "-layers=" + "+".join(layers)
     out_csv = out_dir / f"{stem}.csv"
@@ -1002,17 +1090,33 @@ def parse_args(args: list[str] | None = None):
         "the combine change; moe1 is untouched. The dispatch is NOT simulated: "
         "each rank keeps its own rows and fabricates the recv layout a dispatch "
         "would have produced, so what this adds over plain --ep is the peer-"
-        "memory write traffic and the cross-device barrier, not the all-to-all.",
+        "memory write traffic and the cross-device barrier, not the all-to-all. "
+        "Adds a 'sync' row (mori's cross-device barrier alone) and makes "
+        "'total' moe1 -> moe2 -> sync.",
+    )
+    parser.add_argument(
+        "--no-ep-scatter",
+        action="store_true",
+        default=False,
+        help="With --multi-gpu: GEMM2 does NOT scatter rows into the combine "
+        "window from its epilogue. It writes them to a local buffer, a "
+        "separate reduce_grouped launch reduces them per token, then the mori "
+        "sync runs. Measures moe1, moe2 (GEMM only), reduce, sync and total = "
+        "moe1 -> moe2 -> reduce -> sync. No 'combine' row: nothing reaches the "
+        "window on this path.",
     )
     parser.add_argument(
         "--layers",
         nargs="+",
-        choices=MG_LAYERS,
+        choices=ALL_LAYERS,
         default=None,
         help="Which layers to measure: moe1 (up projection), moe2 (down "
-        "projection), total (both back to back). E.g. '--layers moe1 moe2' to "
-        "skip the back-to-back run, or '--layers moe1' for one projection "
-        "alone. combine needs --multi-gpu. Default: all of them.",
+        "projection), reduce (moe2's reduce as its own launch), sync (mori's "
+        "cross-device barrier), combine (sync + the window reduce), total (the "
+        "chain back to back). E.g. '--layers moe1 moe2' to skip the "
+        "back-to-back run, or '--layers moe1' for one projection alone. sync "
+        "and combine need --multi-gpu, reduce needs --no-ep-scatter, and "
+        "combine is unavailable with it. Default: all the mode offers.",
     )
     parser.add_argument(
         "--rep",
@@ -1051,10 +1155,17 @@ def main(args: list[str] | None = None) -> None:
         batch_sizes_moe = parsed_args.M
     quantized_dtypes = ["mx4", "mx4"]
 
-    all_layers = MG_LAYERS if parsed_args.multi_gpu else LAYERS
+    assert parsed_args.multi_gpu or not parsed_args.no_ep_scatter, (
+        "--no-ep-scatter needs --multi-gpu: without it GEMM2 never scatters, "
+        "and the mori sync it adds needs every EP rank running"
+    )
+    all_layers = default_layers(parsed_args.multi_gpu, not parsed_args.no_ep_scatter)
     layers = parsed_args.layers if parsed_args.layers is not None else list(all_layers)
     bad = set(layers) - set(all_layers)
-    assert not bad, f"{sorted(bad)} needs --multi-gpu"
+    assert not bad, (
+        f"{sorted(bad)} not measurable here: sync/combine need --multi-gpu, "
+        "reduce needs --no-ep-scatter, combine is unavailable with it"
+    )
 
     mori = None
     if parsed_args.multi_gpu:
@@ -1105,6 +1216,7 @@ def main(args: list[str] | None = None) -> None:
             group=group,
             batch=batch,
             dist=dist,
+            ep_scatter=not parsed_args.no_ep_scatter,
         )
 
     roofline_mlp(
