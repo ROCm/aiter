@@ -89,14 +89,16 @@ _DECODE_WARP_SHAPE = {
 # the single shape `_kda_tiling` accepts: 12 key and value heads, 128 wide, bf16
 # activations over an f32 state. Only these exact batch sizes are tuned; every
 # other batch size uses `_decode_tiling`. A row splits the value dimension to
-# fill one part's CUs, and the arch does not fix those: MI308X and MI300X are
-# both gfx942, at 80 CUs and 304. An unlisted part falls through to
+# fill one part's CUs, and the arch does not fix those: MI300X and MI308X are
+# both gfx942, at 304, 80, or 64 CUs. An unlisted part falls through to
 # `_decode_tiling`; so sweep it and add its own row.
 _KDA_DECODE_BY_PART = {
     # MI300X
     ("gfx942", 304): {1: (8, 4, 32), 4: (32, 1, 32), 64: (8, 1, 16), 256: (2, 4, 32)},
     # MI308X
     ("gfx942", 80): {1: (32, 1, 32), 4: (2, 4, 16), 64: (1, 4, 16), 256: (4, 1, 16)},
+    # MI308X, 64 CUs
+    ("gfx942", 64): {1: (16, 2, 32), 4: (2, 4, 16), 64: (1, 4, 16), 256: (1, 4, 16)},
     # MI355X
     ("gfx950", 256): {1: (8, 8, 32), 4: (4, 8, 32), 64: (4, 4, 16), 256: (16, 1, 16)},
 }

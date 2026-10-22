@@ -20,6 +20,7 @@ from pathlib import Path
 import torch
 import triton
 from flydsl.runtime.device import get_rocm_arch
+from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.flydsl.kernels.gdr_decode import create_vk_gdr_decode_kernel
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, get_dtype_str
@@ -48,6 +49,8 @@ WARP_THREADS_K_CHOICES = (1, 2, 4, 8, 16, 32)
 # the top TOP_N are re-timed over TRIALS and ranked on the median.
 TOP_N = 5
 TRIALS = 5
+SWEEP_ITERS = 20
+CONFIRM_ITERS = 100
 
 # What `_KDA_DECODE_BY_PART` holds, so the sweep emits a pasteable entry.
 TABLE_NAME = "_KDA_DECODE_BY_PART"
@@ -225,10 +228,26 @@ def check(inp, out, state_after, pool_before):
     return ok, max(o_abs, s_abs)
 
 
-def kernel_us(fn):
-    """Time the *kernel*: device time for one call, CUDA events, L2 flushed.
-    The events sit on the device timeline, so host cost is not in the number."""
-    return triton.testing.do_bench(fn, warmup=25, rep=100) * 1e3
+def kernel_us(fn, iters):
+    """Time only the GPU kernel, with the same profiler method as the A/B bench."""
+    driver = triton.runtime.driver.active
+    cache = driver.get_empty_cache_for_benchmark()
+    for _ in range(10):
+        fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            driver.clear_cache(cache)
+            fn()
+        torch.cuda.synchronize()
+    total = count = 0
+    for event in prof.key_averages():
+        if "gdr_decode" in event.key:
+            total += event.device_time_total
+            count += event.count
+    if count != iters:
+        raise RuntimeError(f"profiled {count} gdr_decode launches, expected {iters}")
+    return total / count
 
 
 def confirm(B, candidates):
@@ -253,7 +272,7 @@ def confirm(B, candidates):
             if t == 0:
                 _, err = check(inp, out, inp["pool"], pool0)
             inp["pool"].copy_(pool0)
-            times.append(kernel_us(run))
+            times.append(kernel_us(run, CONFIRM_ITERS))
         rows.append((statistics.median(times), min(times), max(times), cfg, err))
 
     baseline = next(r[0] for r in rows if r[3] == baseline_config)
@@ -300,7 +319,7 @@ def sweep(args):
 
             inp["pool"].copy_(baseline_pool)
             run, _ = flydsl_runner(inp, cfg)
-            us = kernel_us(run)
+            us = kernel_us(run, SWEEP_ITERS)
             results.append((us, cfg, err))
 
         results.sort()
