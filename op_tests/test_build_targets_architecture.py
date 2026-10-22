@@ -72,6 +72,45 @@ class TestBuildTargetArchitecture(unittest.TestCase):
         self.assertEqual(torch_processor_count_to_cu("gfx942", 304), 304)
 
 
+class TestArchTablesStayInSync(unittest.TestCase):
+    """The arch tables in build_targets.py and core.py must not drift apart.
+
+    Adding a target means editing GFX_MAP, GFX_CU_NUM_MAP and core.py's
+    allowed_archs, and nothing ties the three together -- allowed_archs
+    carried a duplicate "gfx1250" entry before gfx1250-strict was added,
+    which is what that drift looks like.
+    """
+
+    def setUp(self):
+        from aiter.jit import core
+        from aiter.jit.utils import chip_info
+
+        self.core = core
+        self.chip_info = chip_info
+        self.addCleanup(chip_info.get_gfx_custom_op_core.cache_clear)
+
+    def _resolves_everywhere(self, gfx):
+        from aiter.jit.utils.build_targets import GFX_MAP
+
+        with mock.patch.dict(os.environ, {"GPU_ARCHS": gfx}, clear=True):
+            # core.py accepts it as a build target and passes it through
+            # unchanged, which is what reaches hipcc as --offload-arch.
+            self.assertEqual(self.core.validate_and_update_archs(), [gfx])
+            # and chip_info can map it back through GFX_MAP.
+            self.chip_info.get_gfx_custom_op_core.cache_clear()
+            self.assertEqual(GFX_MAP[self.chip_info.get_gfx_custom_op_core()], gfx)
+
+    def test_every_offline_target_resolves_through_all_three_tables(self):
+        from aiter.jit.utils.build_targets import GFX_CU_NUM_MAP
+
+        for gfx in GFX_CU_NUM_MAP:
+            with self.subTest(gfx=gfx):
+                self._resolves_everywhere(gfx)
+
+    def test_strict_resolves_through_all_three_tables(self):
+        self._resolves_everywhere("gfx1250-strict")
+
+
 class TestClusterLaunchBuildArchs(unittest.TestCase):
     """build_module's -DAITER_ENABLE_CLUSTER_LAUNCH arch test (aiter.jit.core)."""
 
