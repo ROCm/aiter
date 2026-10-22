@@ -1336,16 +1336,34 @@ class _SolAttnRecipe(NamedTuple):
         k_variance=False,
     ):
         """Route and pool. K's scale goes in only when pooling cannot preserve it."""
+        operands, kwargs = self.prepare_args(
+            q,
+            k,
+            v,
+            block_tile=block_tile,
+            force_block_mask=force_block_mask,
+            k_variance=k_variance,
+        )
+        return sol_prepare(*operands, beta=beta, num_heads=heads, **kwargs)
+
+    def prepare_args(
+        self, q, k, v, block_tile=None, force_block_mask=None, k_variance=False
+    ):
+        """sol_prepare()'s operands and recipe-specific keywords, resolved on the host.
+
+        Split out of prepare() so a compiled caller can resolve them before tracing: Dynamo
+        cannot evaluate a property of a NamedTuple, so it cannot read this recipe's.
+        """
         packed = self.packed_format
         tile_m, tile_n = self.block_tile() if block_tile is None else block_tile
-        return sol_prepare(
+        operands = (
             # Routing scores Q, and a packed Q is not element addressable either, so a packed
             # recipe routes on its source. Scale invariance is what makes that equivalent.
             q.source if packed is not None else q.quantized,
             k.quantized,
             v.quantized,
-            beta=beta,
-            num_heads=heads,
+        )
+        return operands, dict(
             # sol_prepare defaults BLOCK_N to the gfx950 tile. Pooling has to match the row
             # the launcher will pick or the pooled tensors are the wrong height outright, so take
             # it from the manifest the way mha_v4_sol() does.
@@ -2095,24 +2113,61 @@ def test_mha_v4_sol_raw_matches_quantizing_and_routing_by_hand(beta, recipe):
 
 
 @pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
-@pytest.mark.parametrize("recipe", _SOL_ATTN_RAW_RECIPES, ids=lambda r: r.id)
-def test_mha_v4_sol_raw_compile_parity(recipe):
+@pytest.mark.parametrize(
+    ("recipe", "block_tile"),
+    _sol_attn_geometry_params(ids={r.id for r in _SOL_ATTN_RAW_RECIPES}),
+)
+def test_mha_v4_sol_raw_compile_parity(recipe, block_tile):
     """The raw entry point picks its quantizers off the format enums, which Dynamo has to fold away.
 
     Those are host-side branches on Python values, so they specialize rather than break the graph --
     but only as long as nothing in them reads a tensor, which is exactly what would regress if a
     future recipe needed device-side routing to choose.
     """
-    _skip_without_sol_row(recipe)
+    _skip_without_sol_row(recipe, block_tile)
     heads, batch = 2, 1
-    kv_tile = recipe.kv_tile()
+    kv_tile = recipe.kv_tile() if block_tile is None else block_tile[1]
     q, k, v = _sol_attn_raw_inputs(
         sequence_k=4 * kv_tile, heads=heads, batch=batch, seed=5
     )
     formats = (recipe.qk_format, recipe.qk_format, recipe.v_format)
 
-    eager = mha_v4_sol(q, k, v, *formats, beta=0.4)
-    compiled = torch.compile(mha_v4_sol, fullgraph=True)(q, k, v, *formats, beta=0.4)
+    def routed(q, k, v):
+        return mha_v4_sol(q, k, v, *formats, beta=0.4, block_tile=block_tile)
+
+    eager = routed(q, k, v)
+    compiled = torch.compile(routed, fullgraph=True)(q, k, v)
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager, compiled)
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@pytest.mark.parametrize("jensen", [False, True], ids=["mean", "jensen"])
+@pytest.mark.parametrize(("recipe", "block_tile"), _sol_attn_geometry_params())
+def test_mha_v4_sol_packed_compile_parity(recipe, block_tile, jensen):
+    """sol_prepare() plus mha_v4_packed() traces as one graph for every row, at every geometry.
+
+    The 64x64 MXFP8, MXFP4 and f6f8 rows relayout K's E8M0 scales head-major before launching, and
+    that relayout has to keep the slack the launcher demands behind MXFP4 K scales under Inductor
+    too, so this compares bitwise against eager rather than only checking for graph breaks.
+    """
+    _skip_without_sol_row(recipe, block_tile)
+    heads = 2
+    kv_tile = recipe.kv_tile() if block_tile is None else block_tile[1]
+    q, k, v = recipe.operands(sequence_k=8 * kv_tile, heads=heads)
+    operands, kwargs = recipe.prepare_args(
+        q, k, v, block_tile=block_tile, k_variance=jensen
+    )
+
+    def call():
+        plan = sol_prepare(*operands, beta=0.4, num_heads=heads, **kwargs)
+        return _sol_attn_launch(
+            q, k, v, plan, recipe=recipe, block_tile=block_tile, jensen=jensen
+        )
+
+    eager = call()
+    compiled = torch.compile(call, fullgraph=True)()
     torch.cuda.synchronize()
 
     assert torch.equal(eager, compiled)
