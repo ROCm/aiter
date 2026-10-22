@@ -514,6 +514,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                     sig[i] = gating[i]; // pre-bias sigmoid = routing weight
                     tmp2_f32[i] = static_cast<float>(tmp2[i]);
                     gating[i] += tmp2_f32[i];
+                    sig[i] = (::isnan(sig[i]) || ::isinf(sig[i])) ? 0.0f : sig[i];
                 }
             }
             scores_vec[e] = gating;
