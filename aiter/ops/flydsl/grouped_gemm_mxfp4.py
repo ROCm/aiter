@@ -12,7 +12,8 @@ import torch
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from .kernels.tensor_shim import ptr_arg
 
-_SUPPORTED_CLUSTER_N = (4, 3, 2)
+_SUPPORTED_CLUSTER_M = (1, 2, 4)
+_SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
 
 
 def _select_bool_env(name: str, csv_value: int) -> int:
@@ -50,6 +51,31 @@ def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     if requested_cluster_n not in _SUPPORTED_CLUSTER_N:
         return 1
     return requested_cluster_n if n_tiles % requested_cluster_n == 0 else 1
+
+
+def _select_cluster_m(csv_cluster_m: int, cluster_n: int, stage1_act: int) -> int:
+    """Selects the M cluster degree, preserving the legacy automatic policy."""
+    env_cluster_m = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_M")
+    try:
+        requested_cluster_m = (
+            int(env_cluster_m) if env_cluster_m is not None else int(csv_cluster_m)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AITER_FLYDSL_MXFP4_CLUSTER_M must be an integer") from exc
+
+    if requested_cluster_m < 1:
+        requested_cluster_m = 4 if stage1_act and cluster_n == 4 else 1
+    if requested_cluster_m not in _SUPPORTED_CLUSTER_M:
+        raise ValueError(
+            f"cluster_m must be one of {_SUPPORTED_CLUSTER_M}, got "
+            f"{requested_cluster_m}"
+        )
+    if requested_cluster_m * cluster_n > 16:
+        raise ValueError(
+            "cluster_m * cluster_n must not exceed 16 workgroups, got "
+            f"{requested_cluster_m}x{cluster_n}"
+        )
+    return requested_cluster_m
 
 
 def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
@@ -98,11 +124,13 @@ def flydsl_grouped_gemm_a8w4_masked(
     stage1_quant_out=0,
     quant_scale=None,
     quant_wmma_rep=1,
+    cluster_m=-1,
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
     tdm_b_th=0,
+    lds_soa_load_interleave=0,
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
@@ -111,8 +139,14 @@ def flydsl_grouped_gemm_a8w4_masked(
     row_major_ascale=0,
     a_row_stride_bytes=0,
     a_scale_row_stride_bytes=0,
+    persistent_workers=0,
+    rolled_drain=0,
 ):
-    """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
+    """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
+
+    A positive persistent_workers bounds the grid independently of the routing
+    buffer capacity. Workers traverse the live device-side tile range.
+    """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
     if stream is None:
@@ -128,13 +162,48 @@ def flydsl_grouped_gemm_a8w4_masked(
     quant_scale_tensor = out if quant_scale is None else quant_scale.view(torch.uint8)
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
+    cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
+    stage = 1 if stage1_act else 2
+    persistent_workers = int(
+        os.environ.get(
+            f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
+            os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
+        )
+    )
+    if persistent_workers < 0:
+        raise ValueError("persistent_workers must be nonnegative")
+    if persistent_workers:
+        if cluster_m != 1:
+            raise ValueError("persistent workers require cluster_m=1")
+        if stage2_scatter is not None and stage2_scatter.combine_quant_bits:
+            raise ValueError(
+                "persistent EP scatter requires an unquantized combine wire"
+            )
+        persistent_workers = (
+            (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
+        )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    rolled_drain = int(rolled_drain)
+    if rolled_drain not in (0, 1):
+        raise ValueError("rolled_drain must be 0 or 1")
     if cluster_n > 1 and n_tiles % cluster_n:
         raise ValueError(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
     enable_ep_scatter = stage2_scatter is not None
+    if enable_ep_scatter and stage2_scatter.combine_quant_bits:
+        # N is the payload plane's length and so the scale plane's base, which
+        # has to land on a cache line; fp4 packs two elements to the byte and
+        # needs twice the element alignment fp8 does. Checked here because N is
+        # traced inside @flyc.jit, same as the cluster_n constraint above.
+        n_align = 128 * (8 // stage2_scatter.combine_quant_bits)
+        if N % n_align:
+            raise ValueError(
+                f"[grouped-moe tdm] combine_quant_bits="
+                f"{stage2_scatter.combine_quant_bits} needs N % {n_align} == 0 to "
+                f"keep the scale plane cache-line aligned, got N={N}"
+            )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
     launch_gemm_a8w4_tdm(
         out,
@@ -164,6 +233,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_wmma_rep,
         quant_scale_tensor,
         cluster_n,
+        cluster_m,
         _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
         waves_per_tensor_tdm,
         _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue),
@@ -178,11 +248,17 @@ def flydsl_grouped_gemm_a8w4_masked(
         ),
         ep_destination_stride=int(ep_destination_stride),
         ep_world_size=int(stage2_scatter.world_size) if enable_ep_scatter else 0,
+        ep_quant_bits=(
+            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+        ),
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
         row_major_ascale=int(row_major_ascale),
         a_row_stride_bytes=int(a_row_stride_bytes),
         a_scale_row_stride_bytes=int(a_scale_row_stride_bytes),
+        lds_soa_load_interleave=int(lds_soa_load_interleave),
+        persistent_workers=persistent_workers,
+        rolled_drain=rolled_drain,
     )
     return out
