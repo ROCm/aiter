@@ -30,6 +30,7 @@ from .attention_common import (
     _LdsQueue,
     _load_lds,
     _max,
+    _MAX_FLOOR,
     _maximum,
     _min,
     _pack_bf16,
@@ -387,7 +388,7 @@ def _body(
         row_max = _max(s_0)
         row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
         row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
-        row_max = _maximum(row_max * scale, fx.Float32(-1.0e30)) + 1.0
+        row_max = _maximum(row_max * scale, fx.Float32(_MAX_FLOOR)) + 1.0
         s_0 = _center(s_0, scale, row_max)
         row_sum = fx.Float32(0.0)
         _stage_end()

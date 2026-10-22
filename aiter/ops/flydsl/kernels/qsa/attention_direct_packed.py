@@ -20,6 +20,7 @@ from .attention_common import (
     _buffer_words,
     _exp,
     _load_lds,
+    _MAX_FLOOR,
     _maximum,
     _mfma,
     _min,
@@ -404,7 +405,7 @@ def _body(
     )
     row = _min(first + wave, fx.Int32(NQ - 1))
     blocks = rocdl.make_buffer_tensor(BLOCKS)
-    maximum, total = fx.Float32(-1e30), fx.Float32(0.0)
+    maximum, total = fx.Float32(_MAX_FLOOR), fx.Float32(0.0)
     o0, o1 = _pin(fx.Vector.filled(32, 0.0, fx.Float32)), _pin(
         fx.Vector.filled(32, 0.0, fx.Float32)
     )
@@ -449,7 +450,7 @@ def _body(
         scores0, scores1 = _qk(q, kval0, kval1)
         scaled0, scaled1 = _scale_scores(scores0, scores1, count, t, lane, scale)
         scores = [scaled0[i] for i in range(4)] + [scaled1[i] for i in range(4)]
-        candidate = fx.Float32(-1e30)
+        candidate = fx.Float32(_MAX_FLOOR)
         for score in scores:
             candidate = _maximum(candidate, score)
         candidate = _reduce(candidate, True)

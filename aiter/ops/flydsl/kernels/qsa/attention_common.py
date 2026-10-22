@@ -195,6 +195,10 @@ def _maximum(a, b):
     return fx.Float32(fx.maxnumf(fx.Float32(a), fx.Float32(b), fastmath="nnan"))
 
 
+# Lowest finite float32: floors an empty row's -inf max without clipping any finite logit.
+_MAX_FLOOR = -3.4028234663852886e38
+
+
 def _pack_bf16(values):
     # gfx942 has no native packed FP32 -> BF16 instruction; software RNE.
     bits = fx.Vector(values).bitcast(fx.Uint32)
