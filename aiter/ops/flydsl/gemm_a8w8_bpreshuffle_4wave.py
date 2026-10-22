@@ -105,15 +105,19 @@ def _validate_compile_config(
             f"[FlyDSL INT8 4wave] xcd_swizzle must be non-negative, got "
             f"{xcd_swizzle}"
         )
-    if num_xcds <= 0 or num_xcds > 8 or num_xcds & (num_xcds - 1):
+    if num_xcds <= 0 or num_xcds > 8:
         raise ValueError(
-            "[FlyDSL INT8 4wave] num_xcds must be a power of two in [1, 8], "
-            f"got {num_xcds}"
+            f"[FlyDSL INT8 4wave] num_xcds must be in [1, 8], got {num_xcds}"
         )
-    if num_cu < 0 or (num_cu and num_cu % num_xcds):
+    if num_cu < 0 or (num_cu and num_cu != num_xcds * 32):
         raise ValueError(
-            "[FlyDSL INT8 4wave] persistent num_cu must be zero or divisible "
-            f"by num_xcds, got num_cu={num_cu}, num_xcds={num_xcds}"
+            "[FlyDSL INT8 4wave] persistent num_cu must be zero or 32 per XCD, "
+            f"got num_cu={num_cu}, num_xcds={num_xcds}"
+        )
+    if num_cu and (K // BLOCK_K) % 2:
+        raise ValueError(
+            "[FlyDSL INT8 4wave] persistent mode requires an even number of "
+            f"K128 tiles, got K={K}"
         )
 
 
@@ -166,6 +170,20 @@ def default_4wave_kernel_name(
         xcd_swizzle=DEFAULT_XCD_SWIZZLE,
         num_cu=persistent_cu,
         num_xcds=num_xcds,
+    )
+
+
+def supports_4wave_int8_shape(M: int, N: int, K: int) -> bool:
+    """Whether a logical shape satisfies the public 4-wave INT8 contract."""
+    return (
+        M >= 0
+        and N > 0
+        and N % 16 == 0
+        and K >= MIN_K
+        and K % BLOCK_K == 0
+        and M * N * 2 < _I32_MAX
+        and M * K < _I32_MAX
+        and N * K < _I32_MAX
     )
 
 
@@ -316,4 +334,5 @@ __all__ = [
     "make_4wave_kernel_name",
     "parse_4wave_kernel_name",
     "run_gemm_a8w8_bpreshuffle_4wave",
+    "supports_4wave_int8_shape",
 ]

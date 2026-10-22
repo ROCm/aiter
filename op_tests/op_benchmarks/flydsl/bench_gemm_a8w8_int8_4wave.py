@@ -20,6 +20,7 @@ from aiter.jit.utils.chip_info import (
     get_gfx_runtime,
 )
 from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_4wave import (
+    default_4wave_kernel_name,
     make_4wave_kernel_name,
     run_gemm_a8w8_bpreshuffle_4wave,
 )
@@ -35,12 +36,21 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
 )
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
 
-DEFAULT_SHAPES = (
-    (9450, 5120, 5120),
-    (9450, 13824, 5120),
-    (9450, 5120, 13824),
-)
-REPRESENTATIVE_M_VALUES = (512, 9450, 9472, 18900, 37800, 75600)
+try:
+    from op_tests.int8_4wave_test_utils import (
+        DEFAULT_INT8_4WAVE_SHAPES,
+        REPRESENTATIVE_INT8_4WAVE_M_VALUES,
+        int8_4wave_reference,
+        make_int8_4wave_case,
+    )
+except ModuleNotFoundError:
+    from int8_4wave_test_utils import (
+        DEFAULT_INT8_4WAVE_SHAPES,
+        REPRESENTATIVE_INT8_4WAVE_M_VALUES,
+        int8_4wave_reference,
+        make_int8_4wave_case,
+    )
+
 DEFAULT_BACKENDS = ("4wave", "4wave_nonpersistent", "gluon")
 ASM_KERNEL_TILES = (16, 32, 48, 64, 80, 96, 128, 160)
 ASM_KERNEL_TEMPLATE = "_ZN5aiter{length}I8gemm_bf16_perTokenI8_BpreShuffle_{tile}x128E"
@@ -64,39 +74,6 @@ def _event_time_us(launch, iterations: int) -> float:
     return float(begin.elapsed_time(end) * 1000.0 / iterations)
 
 
-def _make_inputs(shape: tuple[int, int, int], seed: int):
-    m, n, k = shape
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    # This bounded range keeps the integer dot product exactly representable in
-    # FP32 even at K=13824, so backend output comparisons can be bit-exact.
-    x = torch.randint(
-        -31, 32, (m, k), dtype=torch.int8, device="cuda", generator=generator
-    )
-    weight = torch.randint(
-        -31, 32, (n, k), dtype=torch.int8, device="cuda", generator=generator
-    )
-    x_scale = (
-        torch.rand((m, 1), dtype=torch.float32, device="cuda", generator=generator)
-        * 1e-3
-        + 1e-4
-    )
-    w_scale = (
-        torch.rand((1, n), dtype=torch.float32, device="cuda", generator=generator)
-        * 1e-3
-        + 1e-4
-    )
-    weight_shuffled_native = shuffle_weight(weight, layout=(16, 16)).contiguous()
-    weight_shuffled_gluon = weight_shuffled_native.reshape(n // 16, k * 16)
-    return (
-        x,
-        weight,
-        weight_shuffled_native,
-        weight_shuffled_gluon,
-        x_scale,
-        w_scale,
-    )
-
-
 @torch.no_grad()
 def _benchmark_shape(
     shape: tuple[int, int, int],
@@ -109,20 +86,16 @@ def _benchmark_shape(
     use_cuda_graph: bool,
 ) -> list[dict[str, object]]:
     m, n, k = shape
-    (
-        x,
-        weight,
-        weight_shuffled_native,
-        weight_shuffled_gluon,
-        x_scale,
-        w_scale,
-    ) = _make_inputs(shape, seed)
+    case = make_int8_4wave_case(shape, seed)
+    x = case["x"]
+    weight = case["weight"]
+    weight_shuffled_native = case["weight_shuffled"]
+    weight_shuffled_gluon = weight_shuffled_native.reshape(n // 16, k * 16)
+    x_scale = case["x_scale"]
+    w_scale = case["w_scale"]
+    reference = int8_4wave_reference(case)
     cu_num = get_cu_num()
     num_xcds = get_cdna4_num_xcds(cu_num)
-    grid = (m + 255) // 256 * ((n + 255) // 256)
-    persistent_cu = cu_num if k == 5120 and grid > cu_num else 0
-    if "asm_best" in backends and "4wave" not in backends:
-        raise ValueError("asm_best selection requires the 4wave correctness reference")
 
     outputs = {
         name: torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
@@ -133,13 +106,7 @@ def _benchmark_shape(
     asm_kernel = {"name": "", "weight": None}
     asm_bias = torch.zeros((1, n), dtype=torch.float32, device="cuda")
 
-    def add_4wave(name: str, num_cu: int) -> None:
-        kernel_name = make_4wave_kernel_name(
-            K=k,
-            xcd_swizzle=8,
-            num_cu=num_cu,
-            num_xcds=num_xcds,
-        )
+    def add_4wave(name: str, kernel_name: str) -> None:
         kernel_names[name] = kernel_name
         launches[name] = lambda: run_gemm_a8w8_bpreshuffle_4wave(
             x,
@@ -151,11 +118,22 @@ def _benchmark_shape(
         )
 
     if "4wave" in backends:
-        add_4wave("4wave", persistent_cu)
+        add_4wave(
+            "4wave",
+            default_4wave_kernel_name(m, n, k, cu_num=cu_num, num_xcds=num_xcds),
+        )
     if "4wave_nonpersistent" in backends:
-        add_4wave("4wave_nonpersistent", 0)
+        add_4wave(
+            "4wave_nonpersistent",
+            make_4wave_kernel_name(K=k, xcd_swizzle=8, num_cu=0, num_xcds=num_xcds),
+        )
     if "4wave_persistent" in backends:
-        add_4wave("4wave_persistent", cu_num)
+        add_4wave(
+            "4wave_persistent",
+            make_4wave_kernel_name(
+                K=k, xcd_swizzle=8, num_cu=cu_num, num_xcds=num_xcds
+            ),
+        )
 
     if "gluon" in backends:
         launches["gluon"] = lambda: gluon_gemm_a8w8(
@@ -197,6 +175,7 @@ def _benchmark_shape(
             split_k,
         )
     if "flydsl_generic" in backends:
+        # Representative generic family configuration for explicit comparisons.
         launches["flydsl_generic"] = lambda: flydsl_preshuffle_gemm_a8(
             x,
             weight_shuffled_native,
@@ -214,8 +193,6 @@ def _benchmark_shape(
             split_k=1,
         )
     if "asm_best" in backends:
-        launches["4wave"]()
-        torch.cuda.synchronize()
 
         def run_asm():
             return gemm_a8w8_asm(
@@ -244,7 +221,7 @@ def _benchmark_shape(
                     torch.cuda.synchronize()
                     torch.testing.assert_close(
                         outputs["asm_best"],
-                        outputs["4wave"],
+                        reference,
                         atol=0.02,
                         rtol=1e-2,
                     )
@@ -269,15 +246,13 @@ def _benchmark_shape(
     for launch in launches.values():
         launch()
     torch.cuda.synchronize()
-    reference_name = "4wave" if "4wave" in outputs else next(iter(outputs))
-    reference = outputs[reference_name]
     for name, output in outputs.items():
-        if name in {"ck", "asm_best"}:
+        if name in {"ck", "asm_best", "flydsl_generic"}:
             torch.testing.assert_close(reference, output, atol=0.02, rtol=1e-2)
         elif not torch.equal(reference, output):
             mismatch = int(torch.count_nonzero(reference != output).item())
             raise RuntimeError(
-                f"{shape}: {name} differs from {reference_name}: "
+                f"{shape}: {name} differs from the torch reference: "
                 f"{mismatch} BF16 elements"
             )
 
@@ -377,9 +352,9 @@ def main() -> None:
             f"expected {args.expected_cu} CUs, active device has {get_cu_num()}"
         )
 
-    shapes = list(args.shape or DEFAULT_SHAPES)
+    shapes = list(args.shape or DEFAULT_INT8_4WAVE_SHAPES)
     if args.shape_matrix:
-        shapes.extend((m, 5120, 5120) for m in REPRESENTATIVE_M_VALUES)
+        shapes.extend((m, 5120, 5120) for m in REPRESENTATIVE_INT8_4WAVE_M_VALUES)
     shapes = list(dict.fromkeys(shapes))
 
     rows = []
