@@ -278,7 +278,7 @@ def gemm_a8w8_preshuffle(
         if backend == "gluon":
             config, _ = get_gemm_config("GEMM-A8W8", M, N, K, backend="gluon")
         else:
-            config, _ = _get_config(M, N, K)
+            config, _ = _get_config(M, N, K, shuffle=True)
 
     if y is None and (config.get("NUM_KSPLIT", 1) == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
