@@ -186,6 +186,10 @@ def _mla_num_splits(
     return max(1, min(cta_cap, tiles, 8))
 
 
+# Output rows per CU above which SOFTMAX_FIX and PV_ORDER pay.
+_LOOP_BOUND_ROWS_PER_CU = 64
+
+
 def _async_launch_config(
     fp8_dots: bool,
     has_invalid: bool,
@@ -197,8 +201,10 @@ def _async_launch_config(
     uni_tile: bool = True,
     has_extra: bool = False,
     block_k: int = 64,
-) -> tuple[bool, int, int]:
-    """-> (ASYNC_LDS, BLOCK_K, waves_per_eu) for this launch.
+    tiles_per_program: float = 1e9,
+    num_heads: int = 0,
+) -> tuple[bool, int, int, bool]:
+    """-> (ASYNC_LDS, BLOCK_K, waves_per_eu, ASYNC_DBUF) for this launch.
 
     BLOCK_K follows what the grid supplies, not the token count: given enough
     workgroups to fill four waves/SIMD (prefill) the small tile takes that
@@ -212,18 +218,33 @@ def _async_launch_config(
         and fp8_dots
         and uni_tile
         and not has_invalid
-        and not has_extra
         # The async tiles below are sized for gfx950's LDS.
         and arch_info.get_arch() != "gfx942"
     )
     workgroups = num_queries * heads_blocks * max(1, num_splits)
     num_sms = get_num_sms()
-    if enabled and workgroups >= 4 * num_sms:
-        return True, 64, 4
+    # Under a few tiles the launch, the q load and the epilogue dominate.
+    if enabled and tiles_per_program < 4:
+        enabled = False
+    # This walk has no prefetch, so on a cold decode cache the staged walk's
+    # register prefetch wins. 128 heads is the exception: there the stock
+    # launch already runs narrow head blocks that re-gather the same keys.
+    if enabled and num_queries < _PREFILL_MIN_ROWS and num_heads < 128:
+        enabled = False
+    # 16-head programs re-read every key num_heads / 16 times, which L2 only
+    # absorbs while the top-k list keeps the pool cache-resident.
+    if enabled and num_heads == 64 and avg_topk > 1024:
+        enabled = False
+    if enabled:
+        # Enough workgroups for four waves/SIMD: single buffer. Otherwise the
+        # LDS is free, so double-buffer and prefetch a tile ahead.
+        if workgroups >= 4 * num_sms:
+            return True, 64, 4, False
+        return True, 64, 2, True
     waves_per_eu = 2
     if use_buffer_load and workgroups <= num_sms:
         waves_per_eu = 1
-    return enabled, (128 if enabled else block_k), waves_per_eu
+    return enabled, block_k, waves_per_eu, False
 
 
 def _resolve_dot_precision(dot_precision: str, fmt: str, arch: str) -> bool:
@@ -797,7 +818,7 @@ def sparse_mla_fwd(
     col_reps = kv_lora_rank // 512
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, block_k // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
-    async_lds_on, block_k, waves_per_eu = _async_launch_config(
+    async_lds_on, block_k, waves_per_eu, async_dbuf = _async_launch_config(
         fp8_dots,
         has_invalid,
         num_queries,
@@ -808,6 +829,11 @@ def sparse_mla_fwd(
         uni_tile=True,
         has_extra=has_extra,
         block_k=block_k,
+        tiles_per_program=(
+            avg_main / max(1, main_splits) + avg_extra / max(1, num_splits)
+        )
+        / block_k,
+        num_heads=num_heads,
     )
     # bf16-staged tiles only; fp8 dots stage raw fp8 in their own layout, and
     # gfx950's rope-free walk (16x16x32, STAGED_K32) pads its own tile.
@@ -828,6 +854,22 @@ def sparse_mla_fwd(
             num_warps = 8
             head_aligned = num_heads % block_m == 0
             heads_blocks = (num_heads + block_m - 1) // block_m
+
+    if async_lds_on:
+        # acc is [BLOCK_M, kv_lora_rank] f32, so only 16-head programs leave
+        # room for the four waves/SIMD this walk needs to pay off.
+        block_m, num_warps = 16, 4
+        head_aligned = num_heads % block_m == 0
+        heads_blocks = (num_heads + block_m - 1) // block_m
+        grid_splits = num_splits if skip_reduce else _launch_splits(num_splits)
+
+    # Both only pay with enough rows in flight to cover what they move. The
+    # split is on rows, not prefill vs decode and not workgroups: the launcher
+    # holds the decode grid near one workgroup per CU by trading split-K
+    # against head blocks, so speculative decode clears the bar purely by
+    # multiplying the row count.
+    rows_per_cu = num_queries * num_heads / max(1, get_num_sms())
+    softmax_fix = pv_order = rows_per_cu >= _LOOP_BOUND_ROWS_PER_CU
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
@@ -901,6 +943,9 @@ def sparse_mla_fwd(
         HAS_INVALID=has_invalid,
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
+        ASYNC_DBUF=async_dbuf,
+        SOFTMAX_FIX=softmax_fix,
+        PV_ORDER=pv_order,
         GATHER_CACHE="",
         KV_LDS_PAD=kv_lds_pad,
         q_scl_ptr=q_scale,
