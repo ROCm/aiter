@@ -1604,10 +1604,10 @@ def test_pa_decode(case, device, monkeypatch):
     if overrides:
         build_tile = pa.compile_pa_decode_tile
 
-        def compile_tile(**kwargs):
+        def override_tile(**kwargs):
             return build_tile(**{**kwargs, **overrides})
 
-        monkeypatch.setattr(pa, "compile_pa_decode_tile", compile_tile)
+        monkeypatch.setattr(pa, "compile_pa_decode_tile", override_tile)
 
     def launch():
         _launch(
