@@ -682,7 +682,7 @@ def test_flash_attn_kvcache_torch_compile(
         out_eager = out_eager[0]
     torch.cuda.synchronize()
 
-    compiled_fn = torch.compile(fn)
+    compiled_fn = torch.compile(fn, dynamic=False)
     k_cache_compiled = k_cache.clone()
     v_cache_compiled = v_cache.clone()
     out_compiled = compiled_fn(

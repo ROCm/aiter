@@ -201,7 +201,6 @@ def test_paged_attn(
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.set_printoptions(threshold=100000)
 
     num_blocks = NUM_BLK
 
@@ -400,7 +399,6 @@ def test_paged_attn_per_token_quant(
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.set_printoptions(precision=5, threshold=10000)
 
     num_blocks = NUM_BLK
 

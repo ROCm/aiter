@@ -106,6 +106,8 @@ def test_matches_ordinary_path_varlen():
 
 
 def test_a_second_shape_does_not_reuse_the_first_entry():
+    for w in _wrapped():
+        w.clear()
     small, large = make_inputs(1, 512, 12), make_inputs(1, 1024, 12)
     run(small)  # whatever either shape needs is compiled and cached by now
     run(large)

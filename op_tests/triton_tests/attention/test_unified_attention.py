@@ -933,3 +933,81 @@ def test_triton_unified_attn_asym_head_guards(case: str) -> None:
             shuffled_kv_cache=shuffled,
             backend="triton",
         )
+
+
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
+    # vLLM passes k and v as strided views of one cache that packs k and v in
+    # the last dim. Each view has fewer than 2 GiB of elements, but the view
+    # spans more than 2 GiB, so blocks at the end need 64-bit offsets.
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    torch.manual_seed(0)
+    num_blocks, block_size, num_kv_heads, head_size = 40000, 16, 8, 128
+    num_query_heads = 64
+    dtype = torch.bfloat16
+    kv_cache = torch.empty(
+        num_blocks, num_kv_heads, block_size, 2 * head_size, dtype=dtype, device="cuda"
+    )
+    kv_cache.uniform_(-1, 1)
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    assert key_cache.nelement() * key_cache.element_size() < 2**31
+    assert key_cache[-1].data_ptr() - kv_cache.data_ptr() >= 2**31
+
+    seq_lens = [(1, 1328), (4, 2011), (1, 37), (16, 523)]
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    max_blocks = max((kv + block_size - 1) // block_size for kv in kv_lens_list)
+    # The blocks past 2 GiB, at the end of the cache.
+    block_tables = torch.arange(
+        num_blocks - len(seq_lens) * max_blocks,
+        num_blocks,
+        dtype=torch.int32,
+        device="cuda",
+    ).view(len(seq_lens), max_blocks)
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+    )
+    output = torch.empty_like(query)
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
+    scale = head_size**-0.5
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens_list),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        backend=backend,
+    )
+
+    # Give the reference only the blocks in use.
+    used = block_tables.flatten().long()
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache[used].contiguous(),
+        value_cache=value_cache[used].contiguous(),
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=torch.arange(used.numel(), device=block_tables.device).view(
+            block_tables.shape
+        ),
+        scale=scale,
+        out_dtype=dtype,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
