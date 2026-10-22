@@ -574,5 +574,102 @@ class TestUpdateConfigFiles(unittest.TestCase):
                 os.unlink(merged_path)
 
 
+SHAPE = {"M": 16, "N": 128, "K": 256}
+WINNER = {"kernelId": 1, "splitK": 0, "us": 10.0, "kernelName": "k1"}
+WINNER.update(tflops=0, bw=0, errRatio=0)
+IDENTITY = {"gfx": "gfx950", "cu_num": 256}
+
+
+class TestRunPersistence(unittest.TestCase):
+    """End-to-end run(): legacy tuned files are updated and unsaved results fail."""
+
+    @staticmethod
+    def _tuner(pre_process=None):
+        from aiter.utility.base_tuner import GemmCommonTuner
+
+        class Stub(GemmCommonTuner):
+            def _setup_specific_arguments(self):
+                pass
+
+            def getKernelName(self, kid):
+                return f"k{kid}"
+
+            def get_cu_num(self):
+                return 256
+
+            def get_gfx(self):
+                return "gfx950"
+
+            def tune(self, untunedf, tunedf, args):
+                return [
+                    ((tuple(row[k] for k in self.keys), 7, 0, ""), 5.0, 0.0)
+                    for _, row in untunedf.iterrows()
+                ]
+
+        if pre_process is not None:
+            Stub.pre_process = pre_process
+        return Stub("stub")
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.legacy = os.path.join(self.tmpdir, "legacy.csv")
+        # Predates the gfx and cu_num key columns.
+        pd.DataFrame([{**SHAPE, **WINNER}]).to_csv(self.legacy, index=False)
+        self.untuned = os.path.join(self.tmpdir, "untuned.csv")
+        pd.DataFrame([SHAPE]).to_csv(self.untuned, index=False)
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _run(self, tuner, *argv):
+        tuner.run(tuner.parser.parse_args([*argv, "--mp", "1"]))
+
+    def _assert_legacy_retuned(self):
+        csv = pd.read_csv(self.legacy)
+        self.assertEqual(
+            csv[["cu_num", "kernelName", "us"]].values.tolist(), [[256, "k7", 5.0]]
+        )
+
+    def test_all_updates_legacy_first_file_of_merged_output(self):
+        modern = os.path.join(self.tmpdir, "modern.csv")
+        row = {**IDENTITY, **SHAPE, **WINNER, "M": 32}
+        pd.DataFrame([row]).to_csv(modern, index=False)
+        tuner = self._tuner()
+        self._run(tuner, "-i", self.untuned, "-o", f"{self.legacy}:{modern}", "--all")
+        self._assert_legacy_retuned()
+
+    def test_single_shape_all_updates_legacy_output(self):
+        shape = {**IDENTITY, **SHAPE}
+
+        def pre_process(tuner, args):
+            tuner.untunedf = pd.DataFrame([shape])
+            tuner.tunedf = tuner.get_tuned_gemm_list(args.tune_file)
+
+        tuner = self._tuner(pre_process)
+        self._run(tuner, "-o", self.legacy, "--all")
+        self._assert_legacy_retuned()
+
+    def test_unsaved_results_exit_nonzero(self):
+        from unittest import mock
+
+        output = os.path.join(self.tmpdir, "tuned.csv")
+        to_csv = pd.DataFrame.to_csv
+
+        def failing_to_csv(df, path=None, *args, **kwargs):
+            if path == output:
+                raise OSError("No space left on device")
+            return to_csv(df, path, *args, **kwargs)
+
+        tuner = self._tuner()
+        with (
+            mock.patch.object(pd.DataFrame, "to_csv", failing_to_csv),
+            self.assertRaises(SystemExit) as status,
+        ):
+            self._run(tuner, "-i", self.untuned, "-o", output)
+        self.assertEqual(status.exception.code, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

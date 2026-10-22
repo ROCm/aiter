@@ -152,6 +152,17 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.MXFP4_MOE:
         from .mxfp4_moe import DEFAULT_CSVS, parse_csv
+
+        # The default corpus holds Situv2 rows, which reject a custom limit, so a
+        # tuning limit left in the shell would abort the batch (and PREBUILD).
+        if os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT"):
+            print(
+                "[aiter] FlyDSL AOT: ignoring AITER_MXFP4_TUNE_SWIGLU_LIMIT for "
+                "the default MXFP4 corpus; compile a custom-limit CSV with "
+                "`python -m aiter.aot.flydsl.mxfp4_moe --csv ... --swiglu-limit`"
+            )
+        with override_env("AITER_MXFP4_TUNE_SWIGLU_LIMIT", None):
+            return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
     elif kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CONV:

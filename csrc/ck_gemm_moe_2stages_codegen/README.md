@@ -40,8 +40,10 @@ Above `M_est = 32`, BM32 keeps only 4-wave, `k_wave=1`, non-NT candidates.
 Above `M_est = 64`, BM64 keeps only non-NT candidates. All legal BN,
 `xcd_swizzle`, and BM16 `prefetch_hidden` choices remain available.
 
-`--mxfp4-search-mode {prune,full}` selects the GEMM1 search mode. It defaults
-to `prune`; `full` enumerates every statically supported GEMM1 candidate:
+`--mxfp4-search-mode {prune,full,staged}` selects the GEMM1 search mode. It
+defaults to `prune`; `full` enumerates every statically supported GEMM1
+candidate; `staged` screens the pruned candidates stage by stage before
+end-to-end validation (see [Staged search](#staged-search)):
 
 ```bash
 python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
@@ -49,13 +51,16 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 
 python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
   -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode full
+
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode staged
 ```
 
 Switching the mode alone does not re-tune shapes already written to the output
-CSV: `pre_process` skips them by shape key, and the search mode does not change
-that dedup rule. To re-check tuned shapes with full search, either add `--all`
-to re-tune and overwrite them, or point `-o` at a new file to keep the pruned
-results for comparison:
+CSV: `pre_process` skips shapes that already have a configured row (one naming
+a kernel), and the search mode does not change that rule. To re-check tuned
+shapes with full search, either add `--all` to re-tune and overwrite them, or
+point `-o` at a new file to keep the pruned results for comparison:
 
 ```bash
 python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
@@ -84,6 +89,78 @@ it.
 See [the pruning method and tuner changes](../../docs/a4w4_mxmoe_gemm1_pruning.md)
 for a worked example and static validation results.
 
+##### Staged search
+
+`staged` starts from the same pruned pairs as `prune` and screens each stage
+before end-to-end validation:
+
+- Shapes with `M_est < 4` skip screening and validate every pruned pair end to
+  end, so they save no validations compared with `prune`.
+- Otherwise, for each BM the tuner first finds a reference GEMM2 consumer
+  (atomic) and a reference GEMM1 producer that pass the correctness check.
+  It then times GEMM1 candidates in isolation per BM, and GEMM2 candidates per
+  (BM, accumulation mode) on the reference producer's output, keeping the
+  fastest `--mxfp4-screen-topk` (default 2) of each group.
+- Each (BM, accumulation mode) group validates only pairs whose GEMM1 and
+  GEMM2 were both shortlisted; the fastest valid pair wins.
+- A group falls back to validating all of its pairs when it has no shortlisted
+  pair (no usable reference or screening result; logged as
+  `exhaustive fallback`) or when every shortlisted pair fails validation
+  (not logged separately). A failed shortlisted pair is not replaced by the
+  next-ranked candidate.
+- If no pair validates, the row is reported as failed with
+  `FAILED: no valid staged pair`; per-pair reasons appear only in the console.
+- Every shape runs in its own spawned process, also with `--mp 1`. Staged
+  search does not use the parallel precompile, so cold-cache JIT time counts
+  against `--timeout`.
+- `--mxfp4-screen-topk` requires an explicit `--mxfp4-search-mode staged`;
+  `staged` cannot be combined with `--fast-scan`.
+
+Isolated stage times do not always rank pipelines the same way, so `staged`
+can select a slower winner than `prune`. Use `prune` or `full` to check
+shapes where the selected kernel matters.
+
+##### MXFP4 output and exit status
+
+The winner CSV writes the validated end-to-end kernel-duration sum to both
+`us1` and `us`, with `us2=0`. Ordinary fMoE retains its stage timings and
+profiling outputs.
+
+Without `--fast-scan`, timing rotates through copies of the timed function's
+arguments. `run_perftest` makes ceil(budget / input size) copies, where the
+budget is min(L2 size x 8192, about 32 GiB on gfx950; 90% of free device
+memory), capped at `--iters`. With the default `--iters 101`, input sets above
+about 328 MiB are reused within one measurement. `--fast-scan` times a single
+input set. The two modes use different input-reuse policies, so their `us`
+values are not directly comparable. How either compares with production cache
+behavior (MoE reads only routed experts) has not been measured.
+
+MXFP4 input rows may contain `gate_mode`; it is retained for support validation
+and removed from the winner CSV. An unsupported requested row is reported even
+if its shape key is already tuned. Later supported rows continue, valid old
+shared-CSV rows survive failed retuning, and any failed or unfinished requested
+row yields a nonzero command exit; a winner counts as tuned only once the CSV
+write succeeds. The tuner validates every
+scheduled runtime GPU before shape work and writes each result's assigned
+gfx/CU identity. Prune/full single-slot execution retains the caller's current
+GPU; multi-slot execution and staged search use the first selected visible
+logical GPUs. Build-time `GPU_ARCHS` and unused visible devices do not define
+the supported runtime set.
+
+When rewriting a shared tuned CSV, the tuner keeps `_tag` and other columns,
+drops only rows the runtime can never load (`_tag=flydsl_fallback`, and a
+later MXFP4 or CK 2-stage row whose key already has an earlier configured
+row), keeps configured rows without a timing, and drops kernel-less input rows
+only when `-i` and `-o` name the same file. A retuned winner replaces the
+first row of its key, the one the runtime loads.
+
+`AITER_MXFP4_TUNE_SWIGLU_LIMIT`, `AITER_FLYDSL_STAGE2_FP8` and
+`AITER_MXFP4_INTERMEDIATE` are captured once per invocation and are not part
+of the shape key. Results tuned under different settings collide on the same
+key: they are skipped without `--all` and overwritten with `--all`. Write each
+configuration to its own `-o` file, and run AOT and production with the same
+settings; see [the AOT notes](../../aiter/aot/flydsl/README.md).
+
 #### `--last`
 - **Type**: Flag (boolean)
 - **Default**: `False`
@@ -100,6 +177,9 @@ for a worked example and static validation results.
 - **Type**: String
 - **Default**: `""` (empty string)
 - **Description**: Optional output file to store **all** tuning results (not just the best ones). Useful for profiling and analyzing all kernel candidates.
+
+The dedicated `--mxfp4-flydsl` tuner does not write profile artifacts through
+this option; see [MXFP4 output and exit status](#mxfp4-output-and-exit-status).
 
 **Example**:
 ```bash
@@ -296,8 +376,14 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 
 #### `--timeout`
 - **Type**: Integer
-- **Default**: `None`
-- **Description**: Timeout in seconds for each task group.
+- **Default**: `1800`
+- **Description**: Ordinary tuners use it as a per-task watchdog: a lost task
+  (dead worker) is reaped and the pool restarted after this many seconds.
+  With `--mxfp4-flydsl` it is a best-effort SIGALRM timeout per operation:
+  per candidate in `prune`/`full`, and per reference check, screening run or
+  validation in `staged`. It fires only when control returns to Python; there
+  is no shape-level hard deadline, so a permanent GPU hang may wait
+  indefinitely.
 
 **Example**:
 ```bash
@@ -322,4 +408,3 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 - Only G1U1 (gate-up fused) MoE configurations are currently supported for tuning
 - Supported quantization types include: per_Token, per_1x128 (blockscale), per_1x32 (MXFP4, gfx950 only)
 - If you use flag `PREBUILD_KERNELS=1` when you install aiter, it will build moe kernels in tuned csv by default. If you want to use the new result of moe tuning, please remove `build` and `*.so` in `aiter/jit` first, then re-install aiter after finishing tune. This can take a lot of time and is not recommended.
-
