@@ -1,5 +1,5 @@
 {
-  "_comment": "SonicMoE grouped GEMM kernels on gfx1101 (Radeon RX 7800 XT), BF16. Values as gfx942; a gfx1101 search did not beat them.",
+  "_comment": "SonicMoE grouped GEMM kernels on gfx1101, BF16. Values as gfx942; a gfx1101 search did not beat them.",
   "_grouped_gemm_kernel": {
     "_bounds": {
       "small": [256, 256, 8],

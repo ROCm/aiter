@@ -1,5 +1,5 @@
 {
-  "_comment": "SonicMoE grouped GEMM kernels on gfx1150 (Radeon 890M), BF16. Values as gfx942; a gfx1150 search did not beat them.",
+  "_comment": "SonicMoE grouped GEMM kernels on gfx1150, BF16. Values as gfx942; a gfx1150 search did not beat them.",
   "_grouped_gemm_kernel": {
     "_bounds": {
       "small": [256, 256, 8],
