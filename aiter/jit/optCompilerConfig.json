@@ -1956,15 +1956,47 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
-    "module_mega_mhc_stream": {
+    "module_mega_mhc_stream_h5120": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-gline-tables-only'",
-            "f'-DMHC_ARCH_GFX950={int(get_gfx() == \"gfx950\")}'"
+            "'-DMHC_HIDDEN=5120'",
+            "'-gline-tables-only'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mega_mhc_stream_h7168": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DMHC_HIDDEN=7168'",
+            "'-gline-tables-only'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mega_mhc_stream_generic": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DMHC_HIDDEN=0'",
+            "'-gline-tables-only'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

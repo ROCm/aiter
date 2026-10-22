@@ -30,7 +30,7 @@ MODES = ("post", "no_post", "identity_pre", "no_post_identity")
 BACKENDS = ("hip", "flydsl", "triton")
 OUT_DTYPES = ("bf16", "mxfp8")
 # M covers decode through prefill; use --hidden to test other model widths.
-TOKEN_COUNTS = (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+TOKEN_COUNTS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 4160, 8192, 16384)
 HIDDEN_SIZES = (5120,)
 
 

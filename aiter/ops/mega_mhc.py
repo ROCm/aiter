@@ -16,7 +16,7 @@ from ..jit.utils.chip_info import get_gfx_runtime
 __all__ = ["MegaMHCWorkspace", "mega_mhc", "mega_mhc_shuffle_fn", "prepare_mega_mhc"]
 
 
-_STREAM_HIDDEN_SIZES = (4096, 5120, 6144, 7168)
+_STREAM_HIDDEN_SIZES = (5120, 7168)
 
 _STREAM_VARIANTS = (
     "decode4",
@@ -103,12 +103,9 @@ def mega_mhc_shuffle_fn(fn):
 
 
 @cache
-def _native_launcher(hidden=5120, arch="gfx950"):
-    # Compile all token/output specializations once for this H and architecture.
-    if not 0 < hidden <= 65536 or hidden % 32:
-        raise ValueError(f"unsupported Mega-MHC hidden size: {hidden}")
-    if arch not in ("gfx950", "gfx942"):
-        raise ValueError(f"unsupported Mega-MHC architecture: {arch}")
+def _native_launcher(hidden):
+    # Fixed names share the same JSON recipes between JIT and wheel prebuilds.
+    suffix = f"h{hidden}" if hidden else "generic"
 
     def launch(
         residual_out: Tensor,
@@ -142,26 +139,11 @@ def _native_launcher(hidden=5120, arch="gfx950"):
         mxfp8: bool,
     ) -> None: ...
 
-    base_module = "module_mega_mhc_stream"
-    module = f"{base_module}_h{hidden}_{arch}"
-    launch.__name__ = "_" + module.removeprefix("module_")
+    launch.__name__ = f"_mega_mhc_stream_{suffix}"
     launch.__qualname__ = launch.__name__
-
-    def build_args(*args, **kwargs):
-        flags = [
-            "-gline-tables-only",
-            f"-DMHC_HIDDEN={hidden}",
-            f"-DMHC_ARCH_GFX950={int(arch == 'gfx950')}",
-        ]
-        return {
-            "md_name": module,
-            "flags_extra_hip": flags,
-        }
-
     return compile_ops(
-        base_module,
+        f"module_mega_mhc_stream_{suffix}",
         fc_name="mega_mhc_bf16",
-        gen_func=build_args,
         develop=True,
     )(launch)
 
@@ -245,7 +227,7 @@ def prepare_mega_mhc(
 ):
     """Prepare private scratch from dimensions on the current stream of device.
 
-    H=4096/5120/6144/7168 on gfx950 uses the tuned stream kernels. Explicit split_k,
+    H=5120/7168 on gfx950 uses the tuned stream kernels. Explicit split_k,
     other H and gfx942 select the portable generic kernel with the same weight
     layout. The workspace also supports non-default Sinkhorn repeats via the
     generic path. It never receives or stores weights. Prepare before graph
@@ -394,7 +376,7 @@ def mega_mhc(
     pack can be shared across streams after the loading stream has finished.
     Pass an explicit workspace to own private scratch instead. Raw FP32 fn is
     not accepted; w_preshuffle_bf16 must be True, with or without a workspace.
-    H=4096/5120/6144/7168 on gfx950 uses stream dispatch for Sinkhorn=20; other
+    H=5120/7168 on gfx950 uses stream dispatch for Sinkhorn=20; other
     positive repeat counts use the generic stream kernel with the same pack.
 
     out_dtype="mxfp8" (gfx950 only) returns (norm, q, e8m0) in place of norm:
@@ -487,7 +469,7 @@ def mega_mhc(
                 scratch.generic_partials,
                 scratch.generic_counters,
             )
-        launch = _native_launcher(h, get_gfx_runtime())
+        launch = _native_launcher(h if h in _STREAM_HIDDEN_SIZES else 0)
         launch(
             residual_out,
             post_out,

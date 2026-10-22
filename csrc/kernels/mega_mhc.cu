@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-// Tuned gfx950 kernels and the portable gfx950/gfx942 fallback. See docs/mega_mhc.md.
+// Tuned gfx950 kernels and the portable gfx950/gfx942 fallback.
+// API, scratch ownership, and capture requirements: aiter/ops/mega_mhc.py.
 #define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
@@ -11,20 +12,16 @@
 #include <cstdlib>
 #include <limits>
 
-// Compile-time configuration shared by the kernel instantiations below.
-#ifndef MHC_ARCH_GFX950
-#error "Build with the Mega-MHC target architecture selected by mega_mhc.py"
-#endif
-
 #ifndef MHC_HIDDEN
-#define MHC_HIDDEN 5120
+#error "MHC_HIDDEN must be set by the Mega-MHC module build recipe"
 #endif
 
 namespace aiter::mega_mhc_stream {
 
-static_assert(MHC_HIDDEN > 0 && MHC_HIDDEN <= 65536 && MHC_HIDDEN % 32 == 0);
-inline constexpr bool tuned_hidden =
-    MHC_HIDDEN >= 4096 && MHC_HIDDEN <= 7168 && MHC_HIDDEN % 1024 == 0;
+// H=0 is the runtime-width generic fallback; tuned widths stay compile-time constants.
+template <int H>
+inline constexpr bool tuned_hidden = H >= 4096 && H <= 7168 && H % 1024 == 0;
+static_assert(MHC_HIDDEN == 0 || tuned_hidden<MHC_HIDDEN>);
 
 struct Options
 {
@@ -52,37 +49,38 @@ inline constexpr Options options[] = {
     {0, 2, 1, 2, 0, 0, 4, false},     // 13 generic (runtime K)
 };
 
-template <int ID, bool POST = false>
+template <int H, int ID, bool POST = false>
 struct Tuning
 {
     static_assert(ID >= 0 && ID < 14);
-    static_assert(ID == 13 || tuned_hidden);
+    static_assert(H >= 0 && H <= 65536 && H % 32 == 0);
+    static_assert(ID == 13 || tuned_hidden<H>);
     static constexpr Options base_options()
     {
         Options result = options[ID];
-        if constexpr(MHC_HIDDEN != 5120)
+        if constexpr(H != 5120)
         {
             if constexpr(ID <= 5)
             {
-                result.chunks     = MHC_HIDDEN / 1024;
+                result.chunks     = H / 1024;
                 result.lds_chunks = (result.chunks + 1) / 2 * 2;
             }
             if constexpr(ID == 6)
             {
-                result.chunks     = MHC_HIDDEN / 1024;
+                result.chunks     = H / 1024;
                 result.lds_chunks = (result.chunks + 1) / 2 * 2;
-                if constexpr(MHC_HIDDEN == 7168)
+                if constexpr(H == 7168)
                     result.groups = 1;
             }
             if constexpr(ID == 7)
             {
                 result.split = 8;
-                if constexpr(MHC_HIDDEN == 7168)
+                if constexpr(H == 7168)
                     result.chunks = result.lds_chunks = 2;
             }
             // At split=2, a full collapse tile already takes 96/112 KiB.
             // Four waves keep post exchange plus reduction below 160 KiB.
-            if constexpr(ID == 10 && MHC_HIDDEN > 5120)
+            if constexpr(ID == 10 && H > 5120)
             {
                 result.groups  = 1;
                 result.segment = true;
@@ -94,13 +92,13 @@ struct Tuning
     // smaller prefix. Explicit split_k requests select generic instead.
     static constexpr Options selected =
         POST && ID >= 3 && ID <= 5
-            ? Options{MHC_HIDDEN == 5120 ? 20 : 16, 2, MHC_HIDDEN == 7168 ? 1 : 2, 2, 0, 0, 5, true}
-        : POST && ID == 10 && MHC_HIDDEN <= 5120 ? Options{2, 2, 2, 2, 0, 0, 5, true}
-                                                 : base_options();
+            ? Options{H == 5120 ? 20 : 16, 2, H == 7168 ? 1 : 2, 2, 0, 0, 5, true}
+        : POST && ID == 10 && H <= 5120 ? Options{2, 2, 2, 2, 0, 0, 5, true}
+                                        : base_options();
     // Keep all four post streams in registers for the 1025..2048-token
     // range. Eight waves cover independent column stripes without a
     // workgroup barrier for every post/collapse step.
-    static constexpr int streams_per_wave = POST && ID == 10 && MHC_HIDDEN <= 5120 ? 4 : 1;
+    static constexpr int streams_per_wave = POST && ID == 10 && H <= 5120 ? 4 : 1;
     static constexpr int split            = selected.split;
     static constexpr int chunks           = selected.chunks;
     static constexpr int groups           = selected.groups;
@@ -111,11 +109,10 @@ struct Tuning
     static constexpr int prefetch         = selected.prefetch;
     static constexpr bool segment         = selected.segment;
     static constexpr bool distributed     = ID <= 10;
-    static_assert(!distributed || MHC_HIDDEN % (split * groups * 32) == 0);
+    static_assert(!distributed || H % (split * groups * 32) == 0);
     // The distributed staging loop is tuned for complete K tiles. Keep that
     // invariant when choosing hidden-specific chunks and wave groups.
-    static_assert(!distributed ||
-                  MHC_HIDDEN % (split * groups * streams_per_wave * chunks * 32) == 0);
+    static_assert(!distributed || H % (split * groups * streams_per_wave * chunks * 32) == 0);
 };
 
 } // namespace aiter::mega_mhc_stream
@@ -194,11 +191,11 @@ struct MegaMHCQuantOutput
 };
 
 namespace {
-template <int VARIANT, bool POST>
-using KernelTuning = mega_mhc_stream::Tuning<VARIANT, POST>;
-template <int VARIANT, bool POST, int STREAMS>
+template <int H, int VARIANT, bool POST>
+using KernelTuning = mega_mhc_stream::Tuning<H, VARIANT, POST>;
+template <int H, int VARIANT, bool POST, int STREAMS>
 constexpr int launch_threads =
-    VARIANT == 11 && POST && STREAMS == 4 ? 512 : KernelTuning<VARIANT, POST>::threads;
+    VARIANT == 11 && POST && STREAMS == 4 ? 512 : KernelTuning<H, VARIANT, POST>::threads;
 constexpr int BM    = 16;
 constexpr int BK    = 32;
 constexpr int SLOTS = 32; // 24 projection outputs, residual sqsum, collapse sqsum
@@ -275,7 +272,8 @@ __device__ __forceinline__ float sum_element_lanes(float x)
     return x;
 }
 
-template <int VARIANT,
+template <int H,
+          int VARIANT,
           bool MXFP8,
           int SPLIT,
           int TILE_M     = BM,
@@ -306,9 +304,10 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                                                   float post_mult,
                                                   float norm_eps,
                                                   int sinkhorn_repeat,
+                                                  int hidden_arg,
                                                   bf16* staged = nullptr)
 {
-    constexpr int hidden = MHC_HIDDEN;
+    const int hidden     = H ? H : hidden_arg;
     const int split_k    = SPLIT ? SPLIT : split_arg;
     const int tid        = threadIdx.x;
     const int nblocks    = (tokens + TILE_M - 1) / TILE_M;
@@ -622,7 +621,7 @@ __device__ __forceinline__ f32x2 fma_float_pair(f32x2 x, float a, f32x2 y)
     return y;
 }
 
-template <int VARIANT, bool MXFP8, class C, bool HAS_POST, bool IDENTITY_PRE>
+template <int H, int VARIANT, bool MXFP8, class C, bool HAS_POST, bool IDENTITY_PRE>
 __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                                                   const bf16* sublayer,
                                                   const float* post_mix,
@@ -652,7 +651,7 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                                                   int sinkhorn_repeat_arg)
 {
 #if defined(__gfx950__)
-    constexpr int hidden = MHC_HIDDEN, split_k = C::split, sinkhorn_repeat = 20;
+    constexpr int hidden = H, split_k = C::split, sinkhorn_repeat = 20;
     constexpr int THREADS = C::threads;
     const int tokens      = C::fixed_tokens ? C::fixed_tokens : tokens_arg;
     const int token_block_arg =
@@ -1331,7 +1330,8 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
 
 #endif
 }
-template <int VARIANT,
+template <int H,
+          int VARIANT,
           bool MXFP8,
           int TILE_M,
           int STAGED,
@@ -1368,10 +1368,9 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
 {
 #if defined(__gfx950__)
     static_assert(TILE_M == 16 || TILE_M == 32);
-    static_assert(STAGED >= 0 && STAGED < MHC_HIDDEN && STAGED % 512 == 0);
+    static_assert(STAGED >= 0 && STAGED < H && STAGED % 512 == 0);
     constexpr bool EIGHT_WAVE_POST = HAS_POST && POST_STREAMS == 4 && VARIANT == 11;
-    constexpr int THREADS = EIGHT_WAVE_POST ? 512 : 256, hidden = MHC_HIDDEN, BM = TILE_M,
-                  MT = BM / 16;
+    constexpr int THREADS = EIGHT_WAVE_POST ? 512 : 256, hidden = H, BM = TILE_M, MT = BM / 16;
     // Eight-wave post tiles split H into H/8-column stripes. A 32-column
     // transpose reuses LDS for the two MFMA chunks, retaining 3584 collapse
     // columns without spilling registers. Other large tiles keep four waves.
@@ -1767,35 +1766,36 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                 v += local_reduction[w][i / SLOTS][i % SLOTS];
         total[i / SLOTS][i % SLOTS] = v;
     }
-    finish_last_split<VARIANT, MXFP8, 1, BM, STAGED, GROUPS, THREADS>(total,
-                                                                      reduction,
-                                                                      last,
-                                                                      1,
-                                                                      tokens,
-                                                                      token_block,
-                                                                      tile_rows,
-                                                                      partials,
-                                                                      counters,
-                                                                      layer_input,
-                                                                      quant_out,
-                                                                      quant_scale,
-                                                                      norm_weight,
-                                                                      hc_scale,
-                                                                      hc_base,
-                                                                      next_pre,
-                                                                      post_out,
-                                                                      comb_out,
-                                                                      rms_eps,
-                                                                      pre_eps,
-                                                                      sinkhorn_eps,
-                                                                      post_mult,
-                                                                      norm_eps,
-                                                                      20,
-                                                                      &collapse_lds[0][0]);
+    finish_last_split<H, VARIANT, MXFP8, 1, BM, STAGED, GROUPS, THREADS>(total,
+                                                                         reduction,
+                                                                         last,
+                                                                         1,
+                                                                         tokens,
+                                                                         token_block,
+                                                                         tile_rows,
+                                                                         partials,
+                                                                         counters,
+                                                                         layer_input,
+                                                                         quant_out,
+                                                                         quant_scale,
+                                                                         norm_weight,
+                                                                         hc_scale,
+                                                                         hc_base,
+                                                                         next_pre,
+                                                                         post_out,
+                                                                         comb_out,
+                                                                         rms_eps,
+                                                                         pre_eps,
+                                                                         sinkhorn_eps,
+                                                                         post_mult,
+                                                                         norm_eps,
+                                                                         20,
+                                                                         hidden_arg,
+                                                                         &collapse_lds[0][0]);
 #endif
 }
 
-template <int VARIANT, bool MXFP8, int FIXED_SPLIT, bool HAS_POST, bool IDENTITY_PRE>
+template <int H, int VARIANT, bool MXFP8, int FIXED_SPLIT, bool HAS_POST, bool IDENTITY_PRE>
 __device__ __forceinline__ void generic_tiles(bf16* residual_out,
                                               float* post_out,
                                               float* comb_out,
@@ -1825,7 +1825,8 @@ __device__ __forceinline__ void generic_tiles(bf16* residual_out,
                                               int sinkhorn_repeat)
 {
 #if defined(__gfx950__) || defined(__gfx942__)
-    constexpr int hidden = MHC_HIDDEN, THREADS = 256;
+    constexpr int THREADS = 256;
+    const int hidden      = H ? H : hidden_arg;
     const int split_k     = FIXED_SPLIT ? FIXED_SPLIT : split_arg;
     const int bid         = VARIANT == 12 && HAS_POST ? blockIdx.x - 256 : blockIdx.x;
     const int token_block = split_k > 1 ? (bid / 8 / split_k) * 8 + bid % 8 : bid;
@@ -2067,40 +2068,42 @@ __device__ __forceinline__ void generic_tiles(bf16* residual_out,
         if(split_k > 1)
             partials[((static_cast<int64_t>(split) * nblocks + token_block) * BM * SLOTS) + i] = v;
     }
-    finish_last_split<VARIANT, MXFP8, FIXED_SPLIT>(total,
-                                                   reduction,
-                                                   last,
-                                                   split_k,
-                                                   tokens,
-                                                   token_block,
-                                                   tile_rows,
-                                                   partials,
-                                                   counters,
-                                                   layer_input,
-                                                   quant_out,
-                                                   quant_scale,
-                                                   norm_weight,
-                                                   hc_scale,
-                                                   hc_base,
-                                                   next_pre,
-                                                   post_out,
-                                                   comb_out,
-                                                   rms_eps,
-                                                   pre_eps,
-                                                   sinkhorn_eps,
-                                                   post_mult,
-                                                   norm_eps,
-                                                   sinkhorn_repeat);
+    finish_last_split<H, VARIANT, MXFP8, FIXED_SPLIT>(total,
+                                                      reduction,
+                                                      last,
+                                                      split_k,
+                                                      tokens,
+                                                      token_block,
+                                                      tile_rows,
+                                                      partials,
+                                                      counters,
+                                                      layer_input,
+                                                      quant_out,
+                                                      quant_scale,
+                                                      norm_weight,
+                                                      hc_scale,
+                                                      hc_base,
+                                                      next_pre,
+                                                      post_out,
+                                                      comb_out,
+                                                      rms_eps,
+                                                      pre_eps,
+                                                      sinkhorn_eps,
+                                                      post_mult,
+                                                      norm_eps,
+                                                      sinkhorn_repeat,
+                                                      hidden_arg);
 #endif
 }
-template <int VARIANT,
+template <int H,
+          int VARIANT,
           bool MXFP8,
           bool HAS_POST,
           bool IDENTITY_PRE,
           int LARGE_M      = BM,
           int LARGE_STAGE  = 0,
           int POST_STREAMS = 2>
-__global__ __launch_bounds__((launch_threads<VARIANT, HAS_POST, POST_STREAMS>),
+__global__ __launch_bounds__((launch_threads<H, VARIANT, HAS_POST, POST_STREAMS>),
                              1) void mega_mhc_kernel(const bf16* residual,
                                                      const bf16* sublayer,
                                                      const float* post_mix,
@@ -2130,71 +2133,75 @@ __global__ __launch_bounds__((launch_threads<VARIANT, HAS_POST, POST_STREAMS>),
                                                      int sinkhorn_repeat_arg)
 {
 #if defined(__gfx950__) || defined(__gfx942__)
-    using StreamTuning = mega_mhc_stream::Tuning<VARIANT>;
+    using StreamTuning = mega_mhc_stream::Tuning<H, VARIANT>;
     if constexpr(StreamTuning::distributed)
     {
-        distributed_tiles<VARIANT, MXFP8, KernelTuning<VARIANT, HAS_POST>, HAS_POST, IDENTITY_PRE>(
-            residual,
-            sublayer,
-            post_mix,
-            comb_mix,
-            pre_mix,
-            fn_packed,
-            tokens,
-            split_arg,
-            residual_out,
-            post_out,
-            comb_out,
-            layer_input,
-            quant_out,
-            quant_scale,
-            next_pre,
-            hc_scale,
-            hc_base,
-            norm_weight,
-            partials,
-            counters,
-            hidden_arg,
-            rms_eps,
-            pre_eps,
-            sinkhorn_eps,
-            post_mult,
-            norm_eps,
-            sinkhorn_repeat_arg);
+        distributed_tiles<H,
+                          VARIANT,
+                          MXFP8,
+                          KernelTuning<H, VARIANT, HAS_POST>,
+                          HAS_POST,
+                          IDENTITY_PRE>(residual,
+                                        sublayer,
+                                        post_mix,
+                                        comb_mix,
+                                        pre_mix,
+                                        fn_packed,
+                                        tokens,
+                                        split_arg,
+                                        residual_out,
+                                        post_out,
+                                        comb_out,
+                                        layer_input,
+                                        quant_out,
+                                        quant_scale,
+                                        next_pre,
+                                        hc_scale,
+                                        hc_base,
+                                        norm_weight,
+                                        partials,
+                                        counters,
+                                        hidden_arg,
+                                        rms_eps,
+                                        pre_eps,
+                                        sinkhorn_eps,
+                                        post_mult,
+                                        norm_eps,
+                                        sinkhorn_repeat_arg);
     }
     else if constexpr(VARIANT == 13)
     {
-        generic_tiles<VARIANT, MXFP8, 0, HAS_POST, IDENTITY_PRE>(residual_out,
-                                                                 post_out,
-                                                                 comb_out,
-                                                                 layer_input,
-                                                                 quant_out,
-                                                                 quant_scale,
-                                                                 next_pre,
-                                                                 residual,
-                                                                 fn_packed,
-                                                                 hc_scale,
-                                                                 hc_base,
-                                                                 pre_mix,
-                                                                 sublayer,
-                                                                 post_mix,
-                                                                 comb_mix,
-                                                                 norm_weight,
-                                                                 partials,
-                                                                 counters,
-                                                                 tokens,
-                                                                 hidden_arg,
-                                                                 split_arg,
-                                                                 rms_eps,
-                                                                 pre_eps,
-                                                                 sinkhorn_eps,
-                                                                 post_mult,
-                                                                 norm_eps,
-                                                                 sinkhorn_repeat_arg);
+        generic_tiles<H, VARIANT, MXFP8, 0, HAS_POST, IDENTITY_PRE>(residual_out,
+                                                                    post_out,
+                                                                    comb_out,
+                                                                    layer_input,
+                                                                    quant_out,
+                                                                    quant_scale,
+                                                                    next_pre,
+                                                                    residual,
+                                                                    fn_packed,
+                                                                    hc_scale,
+                                                                    hc_base,
+                                                                    pre_mix,
+                                                                    sublayer,
+                                                                    post_mix,
+                                                                    comb_mix,
+                                                                    norm_weight,
+                                                                    partials,
+                                                                    counters,
+                                                                    tokens,
+                                                                    hidden_arg,
+                                                                    split_arg,
+                                                                    rms_eps,
+                                                                    pre_eps,
+                                                                    sinkhorn_eps,
+                                                                    post_mult,
+                                                                    norm_eps,
+                                                                    sinkhorn_repeat_arg);
     }
     else if constexpr(VARIANT == 11)
     {
-        large_tiles<VARIANT, MXFP8, LARGE_M, LARGE_STAGE, HAS_POST, IDENTITY_PRE, POST_STREAMS>(
+        large_tiles<H, VARIANT, MXFP8, LARGE_M, LARGE_STAGE, HAS_POST, IDENTITY_PRE, POST_STREAMS>(
             residual,
             sublayer,
             post_mix,
@@ -2231,57 +2238,57 @@ __global__ __launch_bounds__((launch_threads<VARIANT, HAS_POST, POST_STREAMS>),
             // tail as CUs become available. All blocks still use one launch.
             if(blockIdx.x < 256)
             {
-                large_tiles<VARIANT, MXFP8, 16, 2560, HAS_POST, IDENTITY_PRE, 4>(residual,
-                                                                                 sublayer,
-                                                                                 post_mix,
-                                                                                 comb_mix,
-                                                                                 pre_mix,
-                                                                                 fn_packed,
-                                                                                 4096,
-                                                                                 1,
-                                                                                 residual_out,
-                                                                                 post_out,
-                                                                                 comb_out,
-                                                                                 layer_input,
-                                                                                 quant_out,
-                                                                                 quant_scale,
-                                                                                 next_pre,
-                                                                                 hc_scale,
-                                                                                 hc_base,
-                                                                                 norm_weight,
-                                                                                 partials,
-                                                                                 counters,
-                                                                                 MHC_HIDDEN,
-                                                                                 rms_eps,
-                                                                                 pre_eps,
-                                                                                 sinkhorn_eps,
-                                                                                 post_mult,
-                                                                                 norm_eps,
-                                                                                 20);
+                large_tiles<H, VARIANT, MXFP8, 16, 2560, HAS_POST, IDENTITY_PRE, 4>(residual,
+                                                                                    sublayer,
+                                                                                    post_mix,
+                                                                                    comb_mix,
+                                                                                    pre_mix,
+                                                                                    fn_packed,
+                                                                                    4096,
+                                                                                    1,
+                                                                                    residual_out,
+                                                                                    post_out,
+                                                                                    comb_out,
+                                                                                    layer_input,
+                                                                                    quant_out,
+                                                                                    quant_scale,
+                                                                                    next_pre,
+                                                                                    hc_scale,
+                                                                                    hc_base,
+                                                                                    norm_weight,
+                                                                                    partials,
+                                                                                    counters,
+                                                                                    H,
+                                                                                    rms_eps,
+                                                                                    pre_eps,
+                                                                                    sinkhorn_eps,
+                                                                                    post_mult,
+                                                                                    norm_eps,
+                                                                                    20);
             }
             else
             {
-                generic_tiles<VARIANT, MXFP8, 32, HAS_POST, IDENTITY_PRE>(
-                    residual_out + 4096LL * 4 * MHC_HIDDEN,
+                generic_tiles<H, VARIANT, MXFP8, 32, HAS_POST, IDENTITY_PRE>(
+                    residual_out + 4096LL * 4 * H,
                     post_out + 4096LL * 4,
                     comb_out + 4096LL * 16,
-                    layer_input + 4096LL * MHC_HIDDEN,
-                    quant_out + (MXFP8 ? 4096LL * MHC_HIDDEN : 0),
-                    quant_scale + (MXFP8 ? 4096LL * (MHC_HIDDEN / 32) : 0),
+                    layer_input + 4096LL * H,
+                    quant_out + (MXFP8 ? 4096LL * H : 0),
+                    quant_scale + (MXFP8 ? 4096LL * (H / 32) : 0),
                     next_pre + 4096LL * 4,
-                    residual + 4096LL * 4 * MHC_HIDDEN,
+                    residual + 4096LL * 4 * H,
                     fn_packed,
                     hc_scale,
                     hc_base,
                     IDENTITY_PRE ? pre_mix : pre_mix + 4096LL * 4,
-                    HAS_POST ? sublayer + 4096LL * MHC_HIDDEN : sublayer,
+                    HAS_POST ? sublayer + 4096LL * H : sublayer,
                     HAS_POST ? post_mix + 4096LL * 4 : post_mix,
                     HAS_POST ? comb_mix + 4096LL * 16 : comb_mix,
                     norm_weight,
                     partials,
                     counters,
                     64,
-                    MHC_HIDDEN,
+                    H,
                     32,
                     rms_eps,
                     pre_eps,
@@ -2293,55 +2300,55 @@ __global__ __launch_bounds__((launch_threads<VARIANT, HAS_POST, POST_STREAMS>),
         }
         else
         {
-            large_tiles<VARIANT, MXFP8, 16, 0, HAS_POST, IDENTITY_PRE>(residual,
-                                                                       sublayer,
-                                                                       post_mix,
-                                                                       comb_mix,
-                                                                       pre_mix,
-                                                                       fn_packed,
-                                                                       4096,
-                                                                       1,
-                                                                       residual_out,
-                                                                       post_out,
-                                                                       comb_out,
-                                                                       layer_input,
-                                                                       quant_out,
-                                                                       quant_scale,
-                                                                       next_pre,
-                                                                       hc_scale,
-                                                                       hc_base,
-                                                                       norm_weight,
-                                                                       partials,
-                                                                       counters,
-                                                                       MHC_HIDDEN,
-                                                                       rms_eps,
-                                                                       pre_eps,
-                                                                       sinkhorn_eps,
-                                                                       post_mult,
-                                                                       norm_eps,
-                                                                       20);
+            large_tiles<H, VARIANT, MXFP8, 16, 0, HAS_POST, IDENTITY_PRE>(residual,
+                                                                          sublayer,
+                                                                          post_mix,
+                                                                          comb_mix,
+                                                                          pre_mix,
+                                                                          fn_packed,
+                                                                          4096,
+                                                                          1,
+                                                                          residual_out,
+                                                                          post_out,
+                                                                          comb_out,
+                                                                          layer_input,
+                                                                          quant_out,
+                                                                          quant_scale,
+                                                                          next_pre,
+                                                                          hc_scale,
+                                                                          hc_base,
+                                                                          norm_weight,
+                                                                          partials,
+                                                                          counters,
+                                                                          H,
+                                                                          rms_eps,
+                                                                          pre_eps,
+                                                                          sinkhorn_eps,
+                                                                          post_mult,
+                                                                          norm_eps,
+                                                                          20);
             __syncthreads();
-            generic_tiles<VARIANT, MXFP8, 32, HAS_POST, IDENTITY_PRE>(
-                residual_out + 4096LL * 4 * MHC_HIDDEN,
+            generic_tiles<H, VARIANT, MXFP8, 32, HAS_POST, IDENTITY_PRE>(
+                residual_out + 4096LL * 4 * H,
                 post_out + 4096LL * 4,
                 comb_out + 4096LL * 16,
-                layer_input + 4096LL * MHC_HIDDEN,
-                quant_out + (MXFP8 ? 4096LL * MHC_HIDDEN : 0),
-                quant_scale + (MXFP8 ? 4096LL * (MHC_HIDDEN / 32) : 0),
+                layer_input + 4096LL * H,
+                quant_out + (MXFP8 ? 4096LL * H : 0),
+                quant_scale + (MXFP8 ? 4096LL * (H / 32) : 0),
                 next_pre + 4096LL * 4,
-                residual + 4096LL * 4 * MHC_HIDDEN,
+                residual + 4096LL * 4 * H,
                 fn_packed,
                 hc_scale,
                 hc_base,
                 IDENTITY_PRE ? pre_mix : pre_mix + 4096LL * 4,
-                HAS_POST ? sublayer + 4096LL * MHC_HIDDEN : sublayer,
+                HAS_POST ? sublayer + 4096LL * H : sublayer,
                 HAS_POST ? post_mix + 4096LL * 4 : post_mix,
                 HAS_POST ? comb_mix + 4096LL * 16 : comb_mix,
                 norm_weight,
                 partials,
                 counters,
                 64,
-                MHC_HIDDEN,
+                H,
                 32,
                 rms_eps,
                 pre_eps,
@@ -2368,7 +2375,7 @@ void check_tensor(const aiter_tensor_t& t,
                 name,
                 " must be 16-byte aligned");
 }
-template <int VARIANT, bool MXFP8>
+template <int H, int VARIANT, bool MXFP8>
 void launch_mega_mhc(aiter_tensor_t& residual_out,
                      aiter_tensor_t& post_out,
                      aiter_tensor_t& comb_out,
@@ -2397,13 +2404,13 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
                      bool has_post,
                      bool identity_pre)
 {
-    using StreamTuning = mega_mhc_stream::Tuning<VARIANT>;
+    using StreamTuning = mega_mhc_stream::Tuning<H, VARIANT>;
     AITER_CHECK(residual.is_gpu() && residual.dim() == 3 && residual.size(1) == 4,
                 "residual must be a GPU tensor of shape (T, 4, H)");
     const int64_t t = residual.size(0), h = residual.size(2);
     AITER_CHECK(t <= std::numeric_limits<int>::max() / 32 && h > 0 && h <= 65536,
                 "invalid T or H (H must be <= 65536)");
-    AITER_CHECK(h == MHC_HIDDEN, "hidden size does not match the compiled stream kernel");
+    AITER_CHECK(H == 0 || h == H, "hidden size does not match the compiled stream kernel");
     if constexpr(VARIANT == 13)
     {
         AITER_CHECK(split_k > 0 && split_k <= 32 && h % (BK * split_k) == 0,
@@ -2456,8 +2463,6 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
     check_tensor(counters, residual, AITER_DTYPE_i32, blocks * 32, "counters");
     const HipDeviceGuard guard(residual.device_id);
     const auto arch = get_gpu_arch();
-    AITER_CHECK(arch == (MHC_ARCH_GFX950 ? "gfx950" : "gfx942"),
-                "Mega-MHC module does not match the device architecture");
     if constexpr(MXFP8)
         AITER_CHECK(arch == "gfx950", "Mega-MHC mxfp8 requires gfx950");
     if constexpr(VARIANT == 13)
@@ -2484,13 +2489,13 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
     const hipStream_t stream = getCurrentHIPStream();
 // Automatic post tuning uses a prefix of the workspace split capacity.
 #define KERNEL_SPLIT(POST) \
-    (KernelTuning<VARIANT, POST>::distributed ? KernelTuning<VARIANT, POST>::split : split_k)
+    (KernelTuning<H, VARIANT, POST>::distributed ? KernelTuning<H, VARIANT, POST>::split : split_k)
 #define LAUNCH(POST, IDENTITY, ROWS, STAGE, STREAMS)                                   \
-    mega_mhc_kernel<VARIANT, MXFP8, POST, IDENTITY, ROWS, STAGE, STREAMS>              \
+    mega_mhc_kernel<H, VARIANT, MXFP8, POST, IDENTITY, ROWS, STAGE, STREAMS>           \
         <<<dim3(VARIANT == 12            ? (POST ? 512 : 256)                          \
                 : KERNEL_SPLIT(POST) > 1 ? ((blocks + 7) / 8) * 8 * KERNEL_SPLIT(POST) \
                                          : (t + ROWS - 1) / ROWS),                     \
-           (launch_threads<VARIANT, POST, STREAMS>),                                   \
+           (launch_threads<H, VARIANT, POST, STREAMS>),                                \
            0,                                                                          \
            stream>>>(static_cast<const bf16*>(residual.data_ptr()),                    \
                      static_cast<const bf16*>(sublayer_out.data_ptr()),                \
@@ -2526,7 +2531,7 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
         const int tail = workgroups % 256;
         return tail == 0 || tail >= 240;
     };
-    constexpr int no_post_stage = MHC_HIDDEN == 4096 ? 3072 : 4096;
+    constexpr int no_post_stage = H == 4096 ? 3072 : 4096;
     const bool stage_large      = blocks <= 256 || full_round(blocks);
     const bool use_m32          = t >= 8192 && full_round((t + 31) / 32);
 #define DISPATCH(POST, IDENTITY)                              \
@@ -2587,7 +2592,7 @@ void launch_mega_mhc(aiter_tensor_t& residual_out,
 
 } // namespace
 
-// One module per H/architecture contains all supported template instantiations.
+// Each module instantiates one tuned width or the runtime-width generic fallback.
 // The workspace supplies its variant; dtype and token selection stay on the host.
 void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    aiter_tensor_t& post_out,
@@ -2619,40 +2624,40 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    int variant,
                    bool mxfp8)
 {
-    auto launch = [&]<int VARIANT, bool MXFP8>() {
-        launch_mega_mhc<VARIANT, MXFP8>(residual_out,
-                                        post_out,
-                                        comb_out,
-                                        layer_input,
-                                        quant_out,
-                                        quant_scale,
-                                        next_pre,
-                                        residual,
-                                        fn_packed,
-                                        hc_scale,
-                                        hc_base,
-                                        pre_mix,
-                                        sublayer_out,
-                                        post_mix,
-                                        comb_mix,
-                                        norm_weight,
-                                        partials,
-                                        counters,
-                                        rms_eps,
-                                        hc_pre_eps,
-                                        hc_sinkhorn_eps,
-                                        hc_post_mult,
-                                        norm_eps,
-                                        sinkhorn_repeat,
-                                        split_k,
-                                        has_post,
-                                        identity_pre);
+    auto launch = [&]<int H, int VARIANT, bool MXFP8>() {
+        launch_mega_mhc<H, VARIANT, MXFP8>(residual_out,
+                                           post_out,
+                                           comb_out,
+                                           layer_input,
+                                           quant_out,
+                                           quant_scale,
+                                           next_pre,
+                                           residual,
+                                           fn_packed,
+                                           hc_scale,
+                                           hc_base,
+                                           pre_mix,
+                                           sublayer_out,
+                                           post_mix,
+                                           comb_mix,
+                                           norm_weight,
+                                           partials,
+                                           counters,
+                                           rms_eps,
+                                           hc_pre_eps,
+                                           hc_sinkhorn_eps,
+                                           hc_post_mult,
+                                           norm_eps,
+                                           sinkhorn_repeat,
+                                           split_k,
+                                           has_post,
+                                           identity_pre);
     };
-    auto select_variant = [&]<bool MXFP8>() {
-        if constexpr(MHC_ARCH_GFX950 && mega_mhc_stream::tuned_hidden)
+    auto select_variant = [&]<int H, bool MXFP8>() {
+        if constexpr(mega_mhc_stream::tuned_hidden<H>)
         {
 #define VARIANT_CASE(ID) \
-    case ID: launch.template operator()<ID, MXFP8>(); return
+    case ID: launch.template operator()<H, ID, MXFP8>(); return
             switch(variant)
             {
                 VARIANT_CASE(0);
@@ -2672,17 +2677,11 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
 #undef VARIANT_CASE
         }
         AITER_CHECK(variant == 13, "this Mega-MHC module requires the generic variant");
-        launch.template operator()<13, MXFP8>();
+        launch.template operator()<H, 13, MXFP8>();
     };
     if(mxfp8)
-    {
-#if MHC_ARCH_GFX950
-        select_variant.template operator()<true>();
-#else
-        AITER_CHECK(false, "Mega-MHC mxfp8 requires gfx950");
-#endif
-    }
+        select_variant.template operator()<MHC_HIDDEN, true>();
     else
-        select_variant.template operator()<false>();
+        select_variant.template operator()<MHC_HIDDEN, false>();
 }
 } // namespace aiter
