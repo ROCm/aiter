@@ -4,11 +4,11 @@ tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_ma
 256,256,256,0,0,mxfp6_c0c1_256_padk2,65536,16384,6144,0,0,0,f6gemm_dmabig_grp16_kernel_func,gemm_mxfp6_dmabig_grp16.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,262144,16384,6144,0,0,0,f6gemm_dmabig_grp64_kernel_func,gemm_mxfp6_dmabig_grp64.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,16384,0,0,0,f6gemm_dmabig_allk_kernel_func,gemm_mxfp6_dmabig_allk.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,6144,0,0,0,f6gemm_dmabig_ds_kernel_func,gemm_mxfp6_dmabig_ds.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,0,0,0,f6gemm_dmabig_ds_swz0_kernel_func,gemm_mxfp6_dmabig_ds_swz0.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,65536,16384,6144,0,0,0,f6gemm_dmabig_ds_grp16_kernel_func,gemm_mxfp6_dmabig_ds_grp16.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,262144,16384,6144,0,0,0,f6gemm_dmabig_ds_grp64_kernel_func,gemm_mxfp6_dmabig_ds_grp64.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,16384,0,0,0,f6gemm_dmabig_ds_allk_kernel_func,gemm_mxfp6_dmabig_ds_allk.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,6144,0,0,0,_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g32_dscaleE,f6gemm_bf16_per1x32Fp6_dmabig_m82_g32_dscale.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,0,0,0,_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscaleE,f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscale.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,65536,16384,6144,0,0,0,_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g16_dscaleE,f6gemm_bf16_per1x32Fp6_dmabig_m82_g16_dscale.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,262144,16384,6144,0,0,0,_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g64_dscaleE,f6gemm_bf16_per1x32Fp6_dmabig_m82_g64_dscale.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,16384,0,0,0,_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_all_dscaleE,f6gemm_bf16_per1x32Fp6_dmabig_m82_all_dscale.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,9472,5120,5120,_ZN5aiter44f6gemm_bf16_per1x32Fp6_m9472_n5120_k5120_m82E,f6gemm_bf16_per1x32Fp6_m9472_n5120_k5120_m82.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,9472,13824,5120,_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n13824_k5120_m82E,f6gemm_bf16_per1x32Fp6_m9472_n13824_k5120_m82.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,9472,5120,13824,_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n5120_k13824_m82E,f6gemm_bf16_per1x32Fp6_m9472_n5120_k13824_m82.co

@@ -46,8 +46,8 @@ SPECIALIZED_CASES = (
     ),
 )
 SPECIALIZED_SQUARE_KERNEL = SPECIALIZED_CASES[0][1]
-DMABIG_DS_KERNEL = "f6gemm_dmabig_ds_kernel_func"
-DMABIG_DS_SWZ0_KERNEL = "f6gemm_dmabig_ds_swz0_kernel_func"
+DMABIG_DS_KERNEL = "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_g32_dscaleE"
+DMABIG_DS_SWZ0_KERNEL = "_ZN5aiter44f6gemm_bf16_per1x32Fp6_dmabig_m82_nat_dscaleE"
 
 
 @perftest(num_iters=5)
