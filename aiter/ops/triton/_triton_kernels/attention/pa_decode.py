@@ -15,21 +15,19 @@ from aiter.ops.triton.utils.config_utils import (
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 
 
-def _get_dispatch_config(kv_dtype: str) -> dict | None:
-    """v1/v2 dispatch rule for a KV-cache dtype ("bf16", "fp16", ...), or None
-    when this arch has no PA-DECODE config for it."""
+def _load_config() -> dict:
     cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton")
-    config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
-    return config.get("dispatch", {}).get(kv_dtype)
+    return load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
+
+
+def _get_dispatch_config(kv_dtype: str) -> dict | None:
+    """v1/v2 dispatch rule for a KV-cache dtype, or None if this arch has none."""
+    return _load_config().get("dispatch", {}).get(kv_dtype)
 
 
 def _get_launch_config(kernel: str, kv_blk_sz: int) -> dict | None:
-    """Launch kwargs (num_warps, num_stages, waves_per_eu) of a GQA decode kernel
-    ("v1_w_dot" or "v2_w_dot") for this KV page size, or None when this arch has
-    no tuned entry for it."""
-    cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton")
-    config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
-    table = config.get("launch", {}).get(kernel)
+    """Launch options of a GQA decode kernel for this page size, or None if not tuned."""
+    table = _load_config().get("launch", {}).get(kernel)
     if table is None:
         return None
     return select_leq_config(table, kv_blk_sz, prefix="BLK_LEQ_")

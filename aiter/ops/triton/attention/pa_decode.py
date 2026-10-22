@@ -37,37 +37,32 @@ _KV_DTYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 def _select_seq_partition_size(
     num_programs: int, max_seq_len: int, kv_blk_sz: int, dispatch: dict
 ) -> int:
-    """Sequence partition size for the split-K (v2) GQA kernel.
+    """Pick the sequence partition size of the split-K GQA kernel from the config.
 
-    Picks the largest size that gives at least ``split_target_programs`` programs
-    (``num_programs`` x partitions) without exceeding ``split_max_partitions``. When
-    nothing reaches the target it takes the smallest size within the cap. Grids with
-    at least ``split_max_programs`` programs are already busy and are not split, and
-    neither are sequences shorter than ``split_short_seq`` on grids with at least
-    ``split_short_min_programs`` programs, where the extra reduce costs more than it
-    gains. Returning ``_SEQ_PARTITION_SIZE`` keeps the default v1/v2 choice.
+    A return value of `_SEQ_PARTITION_SIZE` means: keep the default v1/v2 choice.
     """
     target = dispatch.get("split_target_programs")
-    if target is None or num_programs >= dispatch.get("split_max_programs", 1 << 62):
-        return _SEQ_PARTITION_SIZE
-    if max_seq_len < dispatch.get(
+    busy = num_programs >= dispatch.get("split_max_programs", 1 << 62)
+    short = max_seq_len < dispatch.get(
         "split_short_seq", 0
-    ) and num_programs >= dispatch.get("split_short_min_programs", 1 << 62):
+    ) and num_programs >= dispatch.get("split_short_min_programs", 1 << 62)
+    if target is None or busy or short:
         return _SEQ_PARTITION_SIZE
-    max_parts = dispatch["split_max_partitions"]
     sizes = [
         p
         for p in sorted(dispatch["split_sizes"], reverse=True)
         if p % kv_blk_sz == 0 and (p == _SEQ_PARTITION_SIZE or p <= max_seq_len)
     ]
-    parts = lambda p: (max_seq_len + p - 1) // p
-    for p in sizes:
-        if num_programs * parts(p) >= target and parts(p) <= max_parts:
+    # Largest size that reaches the target; else the smallest size within the cap.
+    allowed = [
+        (p, triton.cdiv(max_seq_len, p))
+        for p in sizes
+        if triton.cdiv(max_seq_len, p) <= dispatch["split_max_partitions"]
+    ]
+    for p, num_parts in allowed:
+        if num_programs * num_parts >= target:
             return p
-    within = [p for p in sizes if parts(p) <= max_parts]
-    if within:
-        return min(within)
-    return _SEQ_PARTITION_SIZE
+    return allowed[-1][0] if allowed else _SEQ_PARTITION_SIZE
 
 
 def paged_attention_decode(
@@ -145,9 +140,7 @@ def paged_attention_decode(
         )
         if seq_partition_size != _SEQ_PARTITION_SIZE:
             use_v1 = False
-            max_num_partitions = (max_seq_len + seq_partition_size - 1) // (
-                seq_partition_size
-            )
+            max_num_partitions = triton.cdiv(max_seq_len, seq_partition_size)
     if k_scale.numel() > 1:
         if use_v1:
             paged_attn_decode_v1_per_token_quant(
@@ -288,10 +281,7 @@ def paged_attn_decode_v1(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        launch = _get_launch_config("v1_w_dot", kv_blk_sz) or {
-            "waves_per_eu": 3,
-            "num_stages": 1,
-        }
+        launch = _get_launch_config("v1_w_dot", kv_blk_sz) or {}
         _paged_attn_decode_v1_w_dot_kernel[grid](
             output,
             query,

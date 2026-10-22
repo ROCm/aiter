@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import itertools
 import random
 
 import pytest
 import torch
+import triton
 import triton.language as tl
 
 import aiter.ops.triton.attention.pa_decode as pa_decode_mod
 from aiter import logger, pertoken_quant
+from aiter.ops.triton._triton_kernels.attention import pa_decode as pa_kernels
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 
 def paged_attention_decode_ref(
@@ -499,3 +503,159 @@ def test_paged_attn_per_token_quant(
     logger.debug("torch_output=%s", torch_output)
 
     torch.testing.assert_close(triton_output, torch_output, rtol=2.5e-1, atol=2.5e-1)
+
+
+# Archs that have a PA-DECODE config file. Add an arch here when it gets one.
+_ARCHS = ("gfx942", "gfx950", "gfx1250")
+_PAGES = (16, 64, 128)
+_MAX_NUM_STAGES = 2  # 3 or more hangs the GPU on gfx1250
+
+
+def _config(arch):
+    cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton", arch=arch)
+    return load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
+
+
+_SPLIT_RULES = [
+    pytest.param(rule, id=f"{arch}-{dtype}")
+    for arch in _ARCHS
+    for dtype, rule in _config(arch).get("dispatch", {}).items()
+    if "split_target_programs" in rule
+]
+
+
+@pytest.mark.parametrize("arch", _ARCHS)
+def test_pa_decode_config_is_valid(arch):
+    config = _config(arch)
+    assert config, f"no PA-DECODE config for {arch}"
+    for rule in config.get("dispatch", {}).values():
+        if "split_target_programs" in rule:
+            assert {"split_max_partitions", "split_sizes"} <= set(rule)
+            # The default size means "do not split".
+            assert pa_decode_mod._SEQ_PARTITION_SIZE in rule["split_sizes"]
+    # The wrapper has no built-in launch options, so every arch needs this entry.
+    assert "v1_w_dot" in config["launch"]
+    for table in config["launch"].values():
+        assert "any" in table
+        for key, entry in table.items():
+            assert key == "any" or key.startswith("BLK_LEQ_")
+            assert entry.get("num_stages", 1) <= _MAX_NUM_STAGES
+
+
+def test_missing_config_gives_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(pa_kernels, "resolve_config_dir", lambda *a, **k: str(tmp_path))
+    load_config_json.cache_clear()
+    try:
+        assert pa_kernels._get_dispatch_config("fp16") is None
+        assert pa_kernels._get_launch_config("v1_w_dot", _PAGES[0]) is None
+    finally:
+        load_config_json.cache_clear()
+
+
+@pytest.mark.parametrize("rule", _SPLIT_RULES)
+def test_split_size_follows_rule(rule):
+    default = pa_decode_mod._SEQ_PARTITION_SIZE
+    busy = rule.get("split_max_programs", 1 << 20)
+    short_seq = rule.get("split_short_seq", 0)
+    short_programs = rule.get("split_short_min_programs", 1 << 20)
+    programs = [1, busy - 1, busy, 2 * busy]
+    seqs = [max(short_seq // 2, 1), max(short_seq, 1), 4 * default]
+    for n, seq, page in itertools.product(programs, seqs, _PAGES):
+        size = pa_decode_mod._select_seq_partition_size(n, seq, page, rule)
+        info = f"programs={n} seq={seq} page={page} size={size}"
+        assert size in rule["split_sizes"] and size % page == 0, info
+        if n >= busy or (seq < short_seq and n >= short_programs):
+            assert size == default, info
+        if size == default:
+            continue
+        assert triton.cdiv(seq, size) <= rule["split_max_partitions"], info
+        # No larger size that is allowed would also reach the target.
+        for larger in (s for s in rule["split_sizes"] if size < s <= seq):
+            reaches = n * triton.cdiv(seq, larger) >= rule["split_target_programs"]
+            assert not (reaches and larger % page == 0), info
+    # The short-sequence rule stops below its limit. At the limit it does not apply.
+    no_short = {k: v for k, v in rule.items() if not k.startswith("split_short")}
+    for n, page in itertools.product(programs, _PAGES):
+        at_limit = pa_decode_mod._select_seq_partition_size(n, short_seq, page, rule)
+        expected = pa_decode_mod._select_seq_partition_size(
+            n, short_seq, page, no_short
+        )
+        assert at_limit == expected, f"programs={n} seq={short_seq} page={page}"
+
+
+@pytest.mark.parametrize("group_size", [4, 1], ids=["gqa", "mha"])
+@pytest.mark.parametrize("rule", _SPLIT_RULES)
+def test_dispatch_passes_partition_size(rule, group_size, monkeypatch):
+    seq, page, kv_heads = 4 * pa_decode_mod._SEQ_PARTITION_SIZE, _PAGES[-1], 1
+    called = []
+    monkeypatch.setattr(pa_decode_mod, "_get_dispatch_config", lambda dtype: rule)
+    for name in ("v1", "v2"):
+        monkeypatch.setattr(
+            pa_decode_mod,
+            f"paged_attn_decode_{name}",
+            lambda *a, _name=name, **k: called.append((_name, a, k)),
+        )
+    paged_attention_decode(
+        output=None,
+        query=torch.empty(1, group_size * kv_heads, 1, dtype=torch.float16),
+        key_cache=torch.empty(1, kv_heads, page, 1, dtype=torch.float16),
+        value_cache=torch.empty(1, kv_heads, page, 1, dtype=torch.float16),
+        seq_lens=None,
+        block_tables=None,
+        attn_scale=1.0,
+        max_seq_len=seq,
+        compute_type=None,
+        k_scale=torch.ones(1),
+        v_scale=torch.ones(1),
+    )
+    # Only the GQA kernels use the selected size.
+    expected = pa_decode_mod._SEQ_PARTITION_SIZE
+    if group_size > 1:
+        expected = pa_decode_mod._select_seq_partition_size(kv_heads, seq, page, rule)
+    ((_, args, kwargs),) = called
+    assert kwargs["seq_partition_size"] == expected
+    assert args[-1] == triton.cdiv(seq, expected)
+
+
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("KV_BLK_SZ", [_PAGES[0], _PAGES[-1]])
+@pytest.mark.parametrize("SEQ_LEN", [512, 4096])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_attn_gqa_split_output(B, KV_BLK_SZ, SEQ_LEN, dtype):
+    """Check GQA decode output when the sequences have different lengths."""
+    H_Q, H_KV, head_size = 32, 8, 128
+    compute_type = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}[dtype]
+    num_blocks = B * triton.cdiv(SEQ_LEN, KV_BLK_SZ)
+    (
+        query,
+        triton_output,
+        key_cache,
+        value_cache,
+        key_cache_tri,
+        value_cache_tri,
+        _,
+        block_tables,
+        _,
+    ) = input_helper(
+        B, H_Q, H_KV, head_size, KV_BLK_SZ, SEQ_LEN, dtype, dtype, dtype, num_blocks
+    )
+    context_lens = torch.randint(1, SEQ_LEN + 1, (B,), device="cuda")
+    context_lens[0] = SEQ_LEN
+    paged_attention_decode(
+        triton_output,
+        query,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        1.0 / head_size**0.5,
+        SEQ_LEN,
+        compute_type,
+        k_scale=torch.tensor([1.0]),
+        v_scale=torch.tensor([1.0]),
+    )
+    torch_output = torch.zeros(B, H_Q, head_size, dtype=dtype, device="cuda")
+    paged_attention_decode_ref(
+        torch_output, query, key_cache, value_cache, block_tables, context_lens
+    )
+    torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
