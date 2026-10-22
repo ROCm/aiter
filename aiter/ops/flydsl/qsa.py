@@ -434,6 +434,7 @@ def qsa_indexer_score_and_select(
             scored.stride(1),
             k=_K,
             stable=True,
+            arch=get_gfx_runtime(),
         )
     else:
         # Import here so loading this module does not pull aiter.ops.enum.

@@ -347,6 +347,7 @@ def flydsl_top_k_per_row_decode(
     *,
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
+    arch: str | None = None,
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
@@ -356,6 +357,9 @@ def flydsl_top_k_per_row_decode(
     ``seq_lens=None`` makes every row ``plane_width`` (default: the logits
     width) long; the kernels then read no length tensor, so there is nothing
     for a captured graph to hold an address of.
+    ``arch`` is the GPU this kernel is built for. Callers that already know it
+    pass it: the QSA wheel build has no device to probe. Omitted, it is the
+    live GPU.
     Before CUDAGraph capture, warm the split path on the capture stream so its
     stream-local arrival counter is allocated and initialized.
     """
@@ -369,7 +373,7 @@ def flydsl_top_k_per_row_decode(
     if rows == 0:
         return
     # The bare arch name: the selector keys its radix layout and LDS on it.
-    arch = get_gfx_runtime()
+    arch = arch or get_gfx_runtime()
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     packed = row_starts is not None
