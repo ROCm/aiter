@@ -75,7 +75,8 @@ class _Arena:
                 user.release()
 
 
-_arenas = {}
+# Weak values: an arena lives while a cached or captured workspace uses it.
+_arenas = weakref.WeakValueDictionary()
 
 
 class _Workspace:
@@ -238,8 +239,10 @@ def qsa_sparse_attention_flydsl(
     if isinstance(softmax_scale, (torch.Tensor, bool)):
         raise TypeError("softmax_scale must be a host scalar or None")
     scale = 0.0625 if softmax_scale is None else float(softmax_scale)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("softmax_scale must be finite and positive")
+    # The kernels multiply masked -inf scores by it: an FP32 zero would give NaN.
+    scaled = scale * math.log2(math.e)
+    if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
+        raise ValueError("softmax_scale * log2(e) must be finite and positive in FP32")
     query_lens = (q.shape[0],) if query_lens is None else tuple(query_lens)
     if prefix_lens is None:
         if len(query_lens) == 1:

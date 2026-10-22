@@ -655,6 +655,7 @@ def test_qsa_graph_replay(case, heads):
     }
     indices, out = first.clone(), torch.empty_like(q)
     stream, graph = torch.cuda.Stream(), torch.cuda.CUDAGraph()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         qsa_sparse_attention_flydsl(q, k, v, indices, out=out, **kwargs)
         with torch.cuda.graph(graph, stream=stream):
