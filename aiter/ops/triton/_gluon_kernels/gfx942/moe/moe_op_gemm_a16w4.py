@@ -17,7 +17,7 @@ This kernel dequantises with ``v_perm_b32`` byte lookups instead:
 * the e8m0 scale is applied as an exponent-field integer subtract (exact: bf16(fp4 * 2^e)
   needs no rounding), 2 elements per op.
 
-Per 8 weight elements: 24 VALU ops, all 32-bit, versus ~44 for the compiler-generated chain.
+Per 8 weight elements: ~18.5 VALU ops, all 32-bit, versus ~44 for the compiler-generated chain.
 
 Scale range: the bias C = 0x3000 keeps the lookup values below the sign bit and makes the
 subtract saturate +-0 to -0.0 for every scale 3 <= e8m0 <= 222 (weights 2^-124 .. 2^95).
@@ -42,17 +42,21 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
 # Constant byte tables ($9..$12, VGPRs hoisted out of the loop): bf16 bit patterns T'[m] of
 # the fp4 magnitudes m = 0..7 plus the bias C, split into low bytes (tlo0: m 0..3, tlo1: m 4..7)
 # and high bytes (thi0, thi1).  T'[0] = 0x8000 so that +-0 end up as -0.0 after the subtract.
-# $13 = the e8m0 scale of this (32-K group, n), zero-extended and replicated in both 16-bit halves.
-# D = (C + 127<<7) - (e8m0 << 7) is formed inside the asm (packed 16-bit ops) so the compiler cannot
-# narrow it: with a Triton-side uint16 expression LLVM emitted (word >> 1) without masking the low byte.
+# $13 = D = (C + 127<<7) - (e8m0 << 7) for this (32-K group, n), replicated in both 16-bit halves; it
+# is formed once per group by _ASM_SUBTRAHEND (packed 16-bit ops in asm so the compiler cannot narrow
+# it: with a Triton-side uint16 expression LLVM emitted (word >> 1) without masking the low byte) and
+# then register-broadcast to the group's 4 dwords.
+# Sign merge: v_and_or_b32 D = (S0 & S1) | S2 ORs the sign bits (bit 7 of each byte of the shifted
+# raw dword) into the LUT high bytes in one op; OR (not insert) keeps T'[0] = 0x8000 for +-0.
 # Outputs: $0 = (e0,e4), $1 = (e1,e5), $4 = (e2,e6), $3 = (e3,e7) as bf16x2 (low, high half);
 # $2 is scratch; $5..$7 are SGPR scratch for selectors/constants (VOP3/VOP3P take no literals on gfx9).
+# Per 8 weight elements: 18 VALU ops (+ 0.5 for the shared subtrahend).
 # v_perm_b32 D, S0, S1, SEL: SEL bytes 0-3 select bytes of S1, 4-7 select bytes of S0.
 _ASM_DEQUANT = tl.constexpr(
     """
 s_mov_b32 $5, 0x06020400
 s_mov_b32 $6, 0x07030501
-s_mov_b32 $7, 0x00070007
+s_mov_b32 $7, 0x80808080
 v_and_b32 $4, 0x07070707, $8
 v_lshrrev_b32 $2, 4, $8
 v_and_b32 $2, 0x07070707, $2
@@ -61,24 +65,29 @@ v_perm_b32 $1, $12, $11, $4
 v_perm_b32 $3, $12, $11, $2
 v_perm_b32 $2, $10, $9, $2
 v_lshlrev_b32 $4, 4, $8
-v_and_b32 $4, 0x80808080, $4
-v_or_b32 $1, $4, $1
-v_and_b32 $4, 0x80808080, $8
-v_or_b32 $3, $4, $3
+v_and_or_b32 $1, $4, $7, $1
+v_and_or_b32 $3, $8, $7, $3
 v_perm_b32 $4, $1, $0, $6
 v_perm_b32 $0, $1, $0, $5
 v_perm_b32 $1, $3, $2, $5
 v_perm_b32 $3, $3, $2, $6
-v_pk_lshlrev_b16 $2, $7, $13
-s_mov_b32 $5, 0x6f806f80
-v_pk_sub_u16 $2, $5, $2
-v_pk_sub_i16 $0, $0, $2 clamp
-v_pk_sub_i16 $1, $1, $2 clamp
-v_pk_sub_i16 $3, $3, $2 clamp
-v_pk_sub_i16 $4, $4, $2 clamp
+v_pk_sub_i16 $0, $0, $13 clamp
+v_pk_sub_i16 $1, $1, $13 clamp
+v_pk_sub_i16 $3, $3, $13 clamp
+v_pk_sub_i16 $4, $4, $13 clamp
 """
 )
 _ASM_CONSTRAINTS = tl.constexpr("=&v,=&v,=&v,=&v,=&v,=&s,=&s,=&s,v,v,v,v,v,v")
+# Subtrahend D for one (group, n): $3 = e8m0 zero-extended in both halves -> $0 = 0x6f806f80 - (e8m0 << 7).
+_ASM_SUBTRAHEND = tl.constexpr(
+    """
+s_mov_b32 $1, 0x00070007
+s_mov_b32 $2, 0x6f806f80
+v_pk_lshlrev_b16 $0, $1, $3
+v_pk_sub_u16 $0, $2, $0
+"""
+)
+_ASM_SUBTRAHEND_CONSTRAINTS = tl.constexpr("=&v,=&s,=&s,v")
 
 LUT_BIAS = tl.constexpr(0x3000)
 # T'[m] = bf16(fp4 magnitude m) + C: 0x8000, 0x6F00, 0x6F80, 0x6FC0, 0x7000, 0x7040, 0x7080, 0x70C0
@@ -186,8 +195,8 @@ def _relabel_w(wq, KG: gl.constexpr, BLOCK_N: gl.constexpr, DOT_W16: gl.constexp
 def _dequant_tile(
     wu, sc16, tlo0, tlo1, thi0, thi1, BLOCK_K: gl.constexpr, BLOCK_N: gl.constexpr, DOT_W: gl.constexpr
 ):
-    """wu: (BLOCK_K//4, BLOCK_N) uint16 packed fp4 in the k_width=2 operand layout; sc16: the e8m0
-    scale of each element's (group, n), as uint16 in the same layout.  Returns the bf16 (BLOCK_K, BLOCK_N) B operand
+    """wu: (BLOCK_K//4, BLOCK_N) uint16 packed fp4 in the k_width=2 operand layout; sc16: the exponent
+    subtrahend D of each element's (group, n) (see _ASM_SUBTRAHEND), as uint16 pairs in the same layout.  Returns the bf16 (BLOCK_K, BLOCK_N) B operand
     with semantic K = 8d + 2s + h <-> fp4 element s + 4h of dword d."""
     o0, o1, _junk, o3, o2, _s1, _s2, _s3 = gl.inline_asm_elementwise(
         _ASM_DEQUANT,
@@ -436,11 +445,15 @@ def _moe_gemm_a16w4_gfx942(
         # weights: relabel into the k_width=2 operand layout, spread the scales, dequantise
         wu = _relabel_w(wq, KG, BLOCK_N, DOT_W16)
         sc16 = sc.to(gl.uint16)  # (KGL, 1, 4, BLOCK_N)
-        sc16 = gl.reshape(sc16.broadcast_to((KGL, 4, 4, BLOCK_N)), (KG, 4, BLOCK_N))  # dword kt = 4*j + r -> group j
-        sc16 = gl.join(sc16, sc16)  # both 16-bit halves of each dword
+        sc16 = gl.join(sc16, sc16)  # both 16-bit halves of one dword per (group, n)
+        # exponent subtrahend once per 32-K group (not per dword): (KGL, 1, 4, BLOCK_N, 2) uint16
+        d16, _ds1, _ds2 = gl.inline_asm_elementwise(
+            _ASM_SUBTRAHEND, _ASM_SUBTRAHEND_CONSTRAINTS, [sc16], dtype=(gl.uint16, gl.uint16, gl.uint16), is_pure=True, pack=2
+        )
+        d16 = gl.reshape(d16.broadcast_to((KGL, 4, 4, BLOCK_N, 2)), (KG, 4, BLOCK_N, 2))  # dword kt = 4*j + r -> group j
         # register-local broadcast + relabel into the k_width=2 operand layout (no cross-lane movement)
-        sc16 = gl.convert_layout(gl.reshape(gl.permute(sc16, (0, 1, 3, 2)), (PK2, BLOCK_N)), DOT_W16)
-        wb = _dequant_tile(wu, sc16, tlo0, tlo1, thi0, thi1, BLOCK_K, BLOCK_N, DOT_W)
+        d16 = gl.convert_layout(gl.reshape(gl.permute(d16, (0, 1, 3, 2)), (PK2, BLOCK_N)), DOT_W16)
+        wb = _dequant_tile(wu, d16, tlo0, tlo1, thi0, thi1, BLOCK_K, BLOCK_N, DOT_W)
 
         # activations: stage through LDS in the semantic K order of the W operand
         x_smem.store(_relabel_x(x, BLOCK_M, BLOCK_K))
