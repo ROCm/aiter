@@ -154,6 +154,7 @@ def _fused_dual_rmsnorm_mxfp8_quant_kernel(
     BLOCK_SIZE_KK: tl.constexpr,  # power-of-2 covering full KK
     QUANT_BLOCK_SIZE: tl.constexpr,  # =32 (MXFP8 group size)
     NUM_PRGMS,  # row-loop stride; runtime, see `_fused_rms_mxfp8_kernel`
+    AMAX_FLOOR: tl.constexpr = 0.0,  # Q groups' amax floor (none by default)
 ):
     """One program per row: do Q-side RMSNorm+MXFP8 quant AND K-side RMSNorm
     (bf16 out) in one launch. Mirrors the CK `fused_qk_rmsnorm_group_quant`
@@ -181,7 +182,9 @@ def _fused_dual_rmsnorm_mxfp8_quant_kernel(
         y_q_fp32 = x_q * norm_q * g_q
 
         y_q_2d = tl.reshape(y_q_fp32, (n_q_groups, QUANT_BLOCK_SIZE))
-        scale_q_e8m0, quant_scale_q = _mxfp8_quant_op(y_q_2d, QUANT_AXIS=1)
+        scale_q_e8m0, quant_scale_q = _mxfp8_quant_op(
+            y_q_2d, QUANT_AXIS=1, AMAX_FLOOR=AMAX_FLOOR
+        )
 
         qx_q_2d = y_q_2d * quant_scale_q
         qx_q = tl.reshape(qx_q_2d, (BLOCK_SIZE_KQ,))

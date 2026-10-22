@@ -85,6 +85,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
     yq: torch.Tensor | None = None,
     sq: torch.Tensor | None = None,
     yk: torch.Tensor | None = None,
+    amax_floor: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused dual RMSNorm in a single Triton launch.
 
@@ -103,6 +104,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
         eps_q: Q RMSNorm epsilon.
         eps_k: K RMSNorm epsilon; defaults to eps_q.
         yq, sq, yk: optional pre-allocated outputs.
+        amax_floor: floor of each Q group's amax (0: none).
 
     Returns:
         yq (M, KQ) fp8 e4m3fn, sq (M, KQ // 32) uint8 e8m0, yk (M, KK) bf16.
@@ -161,6 +163,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
         BLOCK_SIZE_KK=BLOCK_SIZE_KK,
         QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
         NUM_PRGMS=NUM_PRGMS,
+        AMAX_FLOOR=amax_floor,
     )
     return yq, sq, yk
 
