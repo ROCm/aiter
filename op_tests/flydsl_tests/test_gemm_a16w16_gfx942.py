@@ -45,6 +45,15 @@ def _assert_close(y, ref, msg):
     ), f"{msg}: relerr={rel:.3e} exceeds bf16 tolerance"
 
 
+OUT_DTYPES = [torch.bfloat16, torch.float32]
+OUT_DTYPE_IDS = ["bf16", "fp32"]
+
+
+def _guarded_out(m, n, dtype):
+    """Output with NaN guard rows past M; the caller passes ``out[:m]``."""
+    return torch.full((m + 64, n), float("nan"), dtype=dtype, device="cuda")
+
+
 # ticket regimes: (M, N, K, regime)
 SHAPES = [
     (1, 384, 10240, "hc-down"),
@@ -101,7 +110,7 @@ def test_flydsl_hgemm_gfx942_autoconfig(m, n, k, regime):
 
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
 def test_gemm_a16w16_gfx942_split_k(out_dtype):
-    """Explicit split-K: fp32 output uses native atomics; bf16 goes via f32 accum."""
+    """Explicit async split-K: fp32 output uses native atomics; bf16 goes via f32 accum."""
     _require_gfx942()
     m, n, k = 512, 384, 10240
     x, w, ref = _inputs(m, n, k)
@@ -124,8 +133,9 @@ def test_gemm_a16w16_gfx942_split_k(out_dtype):
     _assert_close(y, ref, f"split-K out={out_dtype}")
 
 
+@pytest.mark.parametrize("stages", [1, 2])
 @pytest.mark.parametrize("split_k", [2, 3, 4])
-def test_gemm_a16w16_gfx942_buffered_split_k(split_k):
+def test_gemm_a16w16_gfx942_buffered_split_k(split_k, stages):
     """The 128-bit global-to-register load path honors each split's K offset."""
     _require_gfx942()
     m, n, k = 128, 128, 1536
@@ -139,7 +149,7 @@ def test_gemm_a16w16_gfx942_buffered_split_k(split_k):
             "block_m": 64,
             "block_n": 64,
             "block_k": 128,
-            "stages": 1,
+            "stages": stages,
             "split_k": split_k,
             "m_waves": 2,
             "n_waves": 2,
@@ -148,17 +158,18 @@ def test_gemm_a16w16_gfx942_buffered_split_k(split_k):
         },
     )
     torch.cuda.synchronize()
-    _assert_close(y, ref, f"buffered split-K={split_k}")
+    _assert_close(y, ref, f"buffered stages={stages} split-K={split_k}")
 
 
+@pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
 @pytest.mark.parametrize("split_k", [1, 3])
 @pytest.mark.parametrize("m,n", [(1000, 384), (1000, 336), (960, 344)])
-def test_gemm_a16w16_gfx942_pingpong_edge_tiles(m, n, split_k):
+def test_gemm_a16w16_gfx942_pingpong_edge_tiles(m, n, split_k, out_dtype):
     """Pingpong edge tiles: bounded buffered loads, and direct stores past M."""
     _require_gfx942()
     k = 4096
     x, w, ref = _inputs(m, n, k)
-    out = torch.full((m + 64, n), float("nan"), dtype=torch.bfloat16, device="cuda")
+    out = _guarded_out(m, n, out_dtype)
     y = gemm_a16w16(
         x,
         w.t(),
@@ -180,7 +191,7 @@ def test_gemm_a16w16_gfx942_pingpong_edge_tiles(m, n, split_k):
         },
     )
     torch.cuda.synchronize()
-    _assert_close(y, ref, f"pingpong edge M{m} N{n} split_k={split_k}")
+    _assert_close(y, ref, f"pingpong edge M{m} N{n} split_k={split_k} {out_dtype}")
     assert torch.isnan(out[m:]).all(), "stores past M overwrote the guard rows"
 
 
@@ -268,11 +279,12 @@ def test_gemm_a16w16_gfx942_pingpong_edge_tiles(m, n, split_k):
         ),
     ],
 )
-def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile):
+@pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
+def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile, out_dtype):
     """Streamed-operand pingpong: edge tiles, split-K, k_waves and K=2 tiles."""
     _require_gfx942()
     x, w, ref = _inputs(m, n, k)
-    out = torch.full((m + 64, n), float("nan"), dtype=torch.bfloat16, device="cuda")
+    out = _guarded_out(m, n, out_dtype)
     split_k = tile.get("split_k", 1)
     cfg = {
         "stages": 1,
@@ -290,7 +302,47 @@ def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile):
         cfg["m_waves"] = 1
     y = gemm_a16w16(x, w.t(), out=out[:m], layout="nt", user_kwargs=cfg)
     torch.cuda.synchronize()
-    _assert_close(y, ref, f"stream M{m} N{n} K{k} {tile}")
+    _assert_close(y, ref, f"stream M{m} N{n} K{k} {tile} {out_dtype}")
+    assert torch.isnan(out[m:]).all(), "stores past M overwrote the guard rows"
+
+
+@pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
+@pytest.mark.parametrize("stages", [2, 3, 4])
+@pytest.mark.parametrize(
+    "m,n,k,split_k,split_k_reduce",
+    [
+        (768, 768, 128, 1, False),  # fewer K tiles than stages
+        (768, 768, 192, 1, False),
+        (1000, 336, 1024, 1, False),  # M and N edge tiles
+        (500, 384, 2048, 2, False),  # atomic split-K
+        (1000, 336, 4096, 3, True),  # workspace split-K
+    ],
+)
+def test_gemm_a16w16_gfx942_async_stages(
+    m, n, k, split_k, split_k_reduce, stages, out_dtype
+):
+    """Async DMA pipeline; stages >= 3 adds the register double buffer."""
+    _require_gfx942()
+    x, w, ref = _inputs(m, n, k)
+    out = _guarded_out(m, n, out_dtype)
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": stages,
+        "split_k": split_k,
+        "split_k_reduce": split_k_reduce,
+        "m_waves": 2,
+        "n_waves": 2,
+        "async_load_bytes": 4,
+    }
+    if k // 64 // split_k < stages - 1:
+        with pytest.raises(ValueError, match="needs at least"):
+            gemm_a16w16(x, w.t(), out=out[:m], layout="nt", user_kwargs=cfg)
+        return
+    y = gemm_a16w16(x, w.t(), out=out[:m], layout="nt", user_kwargs=cfg)
+    torch.cuda.synchronize()
+    _assert_close(y, ref, f"async stages={stages} M{m} N{n} K{k} split_k={split_k}")
     assert torch.isnan(out[m:]).all(), "stores past M overwrote the guard rows"
 
 

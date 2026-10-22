@@ -199,6 +199,9 @@ def flydsl_hgemm(
                 "k_waves": k_waves,
                 "group_m": group_m,
             }
+            if stages == 1:
+                # A single LDS buffer is only supported by the buffered pipeline.
+                user_kwargs.update(buffered_load=True, async_load_bytes=16)
         return gemm_a16w16_gfx942(
             a,
             b.t(),

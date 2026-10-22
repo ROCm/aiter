@@ -1751,6 +1751,13 @@ def shape_error(m: int, n: int, k: int, cfg: dict) -> str | None:
                 f"pingpong needs at least {min_tiles} K tiles per split "
                 f"(K={k}, split_k={split_k}, block_k={block_k})"
             )
+    elif not cfg.get("buffered_load", False):
+        stages = cfg.get("stages", 2)
+        if last_split_tiles < stages - 1:
+            return (
+                f"async stages={stages} needs at least {stages - 1} K tiles per "
+                f"split (K={k}, split_k={split_k}, block_k={block_k})"
+            )
     return None
 
 
@@ -1863,6 +1870,9 @@ _STRUCTURAL_KEYS = frozenset(
     ("block_m", "block_n", "block_k", "stages", "m_waves", "n_waves", "buffered_load")
 )
 _AUTO_ONLY_PIPELINE_KEYS = (
+    "stages",
+    "buffered_load",
+    "async_load_bytes",
     "pingpong",
     "k_waves",
     "split_k_reduce",
