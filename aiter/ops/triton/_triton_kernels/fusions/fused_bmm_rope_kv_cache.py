@@ -641,8 +641,10 @@ def _fused_fp4_bmm_reduce_kernel(
 def _fp8_load_pin(x):
     # Keep group quantization after the preceding loads.
 
-    return tl.inline_asm_elementwise("; fp8 load pin", "=v,0", [x], dtype=x.dtype,
-                                     is_pure=False, pack=2)
+    return tl.inline_asm_elementwise(
+        "; fp8 load pin", "=v,0", [x], dtype=x.dtype, is_pure=False, pack=2
+    )
+
 
 @triton.jit
 def _fp8_quant_group(x, DTYPE_MAX: tl.constexpr, b_ptr):
@@ -653,10 +655,22 @@ def _fp8_quant_group(x, DTYPE_MAX: tl.constexpr, b_ptr):
     xq = tl.clamp(x * r, -DTYPE_MAX, DTYPE_MAX).to(b_ptr.dtype.element_ty)
     return xq, s
 
+
 @triton.jit
-def _fp8_mma_store(a0q, s0, a1q, s1, b0, b1, b_scale, c_ptrs, c_mask,
-                   BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                   PERM_N: tl.constexpr):
+def _fp8_mma_store(
+    a0q,
+    s0,
+    a1q,
+    s1,
+    b0,
+    b1,
+    b_scale,
+    c_ptrs,
+    c_mask,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    PERM_N: tl.constexpr,
+):
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     acc = tl.fma(tl.dot(a0q, b0), s0, acc)
     acc = tl.fma(tl.dot(a1q, b1), s1, acc)
@@ -678,8 +692,10 @@ def _fp8_mma_store(a0q, s0, a1q, s1, b0, b1, b_scale, c_ptrs, c_mask,
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
-@triton.jit(repr=_fused_fp8_bmm_rope_cat_and_cache_mla_repr,
-            do_not_specialize=["gmn_magic", "gmn_shift"])
+@triton.jit(
+    repr=_fused_fp8_bmm_rope_cat_and_cache_mla_repr,
+    do_not_specialize=["gmn_magic", "gmn_shift"],
+)
 def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
     a_ptr,
     b_ptr,
@@ -806,8 +822,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
         elif pid < prefill_start:
             r = pid - T * IL_U
             nb_left = bmm_programs - NBu * IL_U
-            pid = tl.where(r < nb_left, NBu * IL_U + r,
-                           rope_start + NRi * IL_U + (r - nb_left))
+            pid = tl.where(
+                r < nb_left, NBu * IL_U + r, rope_start + NRi * IL_U + (r - nb_left)
+            )
     elif IL_R > 0:
         nr = prefill_start - rope_start
         ng = tl.minimum(bmm_programs // (IL_R * IL_U), nr // IL_U)
@@ -817,13 +834,17 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
             gr = pid % GP
             gj = gr // IL_U
             gl = gr % IL_U
-            pid = tl.where(gj == IL_R, rope_start + gi * IL_U + gl,
-                           (gi * IL_R + gj) * IL_U + gl)
+            pid = tl.where(
+                gj == IL_R, rope_start + gi * IL_U + gl, (gi * IL_R + gj) * IL_U + gl
+            )
         elif pid < prefill_start:
             r = pid - ng * GP
             nb_left = bmm_programs - ng * IL_R * IL_U
-            pid = tl.where(r < nb_left, ng * IL_R * IL_U + r,
-                           rope_start + ng * IL_U + (r - nb_left))
+            pid = tl.where(
+                r < nb_left,
+                ng * IL_R * IL_U + r,
+                rope_start + ng * IL_U + (r - nb_left),
+            )
     # Group the heads and rotary tiles that write the same query rows.
     if XCD_COLOC:
         if pid < bmm_programs:
@@ -870,9 +891,13 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
             pid_tile = pid % GRID_MN
         else:
 
-            pid_head = (tl.umulhi(pid.to(tl.uint32, bitcast=True) * 2,
-                                  gmn_magic.to(tl.uint32, bitcast=True))
-                        >> gmn_shift).to(tl.int32, bitcast=True)
+            pid_head = (
+                tl.umulhi(
+                    pid.to(tl.uint32, bitcast=True) * 2,
+                    gmn_magic.to(tl.uint32, bitcast=True),
+                )
+                >> gmn_shift
+            ).to(tl.int32, bitcast=True)
             pid_tile = pid - pid_head * grid_mn
 
         pid_head_i64 = tl.cast(pid_head, tl.int64)
@@ -937,11 +962,16 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     + pid_head_i64 * stride_ab_i64
                     + tl.cast(m_start, tl.int64) * stride_am_i64
                 )
-                x0 = tl.load(a_base + (am[:, None] * stride_am + offs_k[None, :] * stride_ak),
-                             cache_modifier='.cg')
-                x1 = tl.load(a_base + BLOCK_SIZE_K * stride_ak_i64
-                             + (am[:, None] * stride_am + offs_kt[None, :] * stride_ak),
-                             cache_modifier='.cg')
+                x0 = tl.load(
+                    a_base + (am[:, None] * stride_am + offs_k[None, :] * stride_ak),
+                    cache_modifier=".cg",
+                )
+                x1 = tl.load(
+                    a_base
+                    + BLOCK_SIZE_K * stride_ak_i64
+                    + (am[:, None] * stride_am + offs_kt[None, :] * stride_ak),
+                    cache_modifier=".cg",
+                )
                 b_scale = tl.load(b_scale_ptr)
                 q0, s0 = _fp8_quant_group(x0, DTYPE_MAX, b_ptr)
                 q1, s1 = _fp8_quant_group(x1, DTYPE_MAX, b_ptr)
@@ -950,9 +980,12 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     + pid_head_i64 * stride_bb_i64
                     + tl.cast(n_start, tl.int64) * stride_bn_i64
                 )
-                b0_ptrs = b_head + (offs_k[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn)
+                b0_ptrs = b_head + (
+                    offs_k[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn
+                )
                 b1_ptrs = (b_head + BLOCK_SIZE_K * stride_bk_i64) + (
-                    offs_kt[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn)
+                    offs_kt[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn
+                )
                 BSTEP = BLOCK_SIZE_N * stride_bn_i64
                 offs_cm_loc = tl.arange(0, ROWS)
                 offs_cn_loc = tl.arange(0, BLOCK_SIZE_N)
@@ -961,14 +994,28 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     + pid_head_i64 * stride_cb_i64
                     + tl.cast(m_start, tl.int64) * stride_cm_i64
                     + tl.cast(n_start, tl.int64) * stride_cn_i64
-                ) + (offs_cm_loc[:, None] * stride_cm + offs_cn_loc[None, :] * stride_cn)
+                ) + (
+                    offs_cm_loc[:, None] * stride_cm + offs_cn_loc[None, :] * stride_cn
+                )
                 cmask = offs_cm_loc[:, None] < M - m_start
                 CNSTEP = BLOCK_SIZE_N * stride_cn_i64
                 for n_i in range(N_INNER):
                     b0 = tl.load(b0_ptrs + n_i * BSTEP, cache_modifier=cache_modifier)
                     b1 = tl.load(b1_ptrs + n_i * BSTEP)
-                    _fp8_mma_store(q0, s0, q1, s1, b0, b1, b_scale, c_ptrs + n_i * CNSTEP, cmask,
-                                   ROWS, BLOCK_SIZE_N, PERM_N)
+                    _fp8_mma_store(
+                        q0,
+                        s0,
+                        q1,
+                        s1,
+                        b0,
+                        b1,
+                        b_scale,
+                        c_ptrs + n_i * CNSTEP,
+                        cmask,
+                        ROWS,
+                        BLOCK_SIZE_N,
+                        PERM_N,
+                    )
             elif N_INNER > 1 and B_PF > 0 and K_TAIL > 0:
 
                 one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
@@ -989,19 +1036,23 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                         bq0_1 = tl.load(b_ptrs + BSTEP, cache_modifier=cache_modifier)
                         bq1_1 = tl.load(b1_ptrs + BSTEP)
                     if N_INNER > 2:
-                        bq0_2 = tl.load(b_ptrs + 2 * BSTEP, cache_modifier=cache_modifier)
+                        bq0_2 = tl.load(
+                            b_ptrs + 2 * BSTEP, cache_modifier=cache_modifier
+                        )
                         bq1_2 = tl.load(b1_ptrs + 2 * BSTEP)
                     if N_INNER > 3:
-                        bq0_3 = tl.load(b_ptrs + 3 * BSTEP, cache_modifier=cache_modifier)
+                        bq0_3 = tl.load(
+                            b_ptrs + 3 * BSTEP, cache_modifier=cache_modifier
+                        )
                         bq1_3 = tl.load(b1_ptrs + 3 * BSTEP)
-                a0 = tl.load(a_ptrs, cache_modifier='.cg')
+                a0 = tl.load(a_ptrs, cache_modifier=".cg")
                 a1 = tl.load(
                     a_ptr
                     + pid_head_i64 * stride_ab_i64
                     + tl.cast(m_start, tl.int64) * stride_am_i64
                     + BLOCK_SIZE_K * stride_ak_i64
                     + (offs_am_loc[:, None] * stride_am + offs_kt[None, :] * stride_ak),
-                    cache_modifier='.cg',
+                    cache_modifier=".cg",
                 )
                 b_scale = tl.load(b_scale_ptr)
                 if LPIN > 0:
@@ -1014,11 +1065,15 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 m0 = tl.maximum(tl.max(tl.abs(a0), axis=-1), 1e-10)[:, None]
                 s0 = m0.to(tl.float32) * one_over_DTYPE_MAX
                 r0 = 1.0 / s0
-                a0q = tl.clamp(a0 * r0, -DTYPE_MAX, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+                a0q = tl.clamp(a0 * r0, -DTYPE_MAX, DTYPE_MAX).to(
+                    b_ptr.dtype.element_ty
+                )
                 m1 = tl.maximum(tl.max(tl.abs(a1), axis=-1), 1e-10)[:, None]
                 s1 = m1.to(tl.float32) * one_over_DTYPE_MAX
                 r1 = 1.0 / s1
-                a1q = tl.clamp(a1 * r1, -DTYPE_MAX, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+                a1q = tl.clamp(a1 * r1, -DTYPE_MAX, DTYPE_MAX).to(
+                    b_ptr.dtype.element_ty
+                )
 
                 offs_cm_loc = tl.arange(0, BLOCK_SIZE_M)
                 offs_cn_loc = tl.arange(0, BLOCK_SIZE_N)
@@ -1027,7 +1082,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     + pid_head_i64 * stride_cb_i64
                     + tl.cast(m_start, tl.int64) * stride_cm_i64
                     + tl.cast(n_start, tl.int64) * stride_cn_i64
-                ) + (offs_cm_loc[:, None] * stride_cm + offs_cn_loc[None, :] * stride_cn)
+                ) + (
+                    offs_cm_loc[:, None] * stride_cm + offs_cn_loc[None, :] * stride_cn
+                )
                 c_mask = offs_cm_loc[:, None] < M - m_start
 
                 for n_i in tl.static_range(N_INNER):
@@ -1060,7 +1117,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     if PERM_N:
                         c_val = tl.reshape(
                             tl.permute(
-                                tl.reshape(c_val, (BLOCK_SIZE_M, BLOCK_SIZE_N // 64, 4, 4, 4)),
+                                tl.reshape(
+                                    c_val, (BLOCK_SIZE_M, BLOCK_SIZE_N // 64, 4, 4, 4)
+                                ),
                                 (0, 1, 3, 2, 4),
                             ),
                             (BLOCK_SIZE_M, BLOCK_SIZE_N),
@@ -1072,7 +1131,7 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
                 b_scale = tl.load(b_scale_ptr)
 
-                a0 = tl.load(a_ptrs, cache_modifier='.cg')
+                a0 = tl.load(a_ptrs, cache_modifier=".cg")
                 if AQH > 0 and K_TAIL > 0:
 
                     a1 = tl.load(
@@ -1080,15 +1139,19 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                         + pid_head_i64 * stride_ab_i64
                         + tl.cast(m_start, tl.int64) * stride_am_i64
                         + BLOCK_SIZE_K * stride_ak_i64
-                        + (offs_am_loc[:, None] * stride_am
-                           + tl.arange(0, K_TAIL)[None, :] * stride_ak),
-                        cache_modifier='.cg',
+                        + (
+                            offs_am_loc[:, None] * stride_am
+                            + tl.arange(0, K_TAIL)[None, :] * stride_ak
+                        ),
+                        cache_modifier=".cg",
                     )
                     a0 = _fp8_load_pin(a0)
                 m0 = tl.maximum(tl.max(tl.abs(a0), axis=-1), 1e-10)[:, None]
                 s0 = m0.to(tl.float32) * one_over_DTYPE_MAX
                 r0 = 1.0 / s0
-                a0q = tl.clamp(a0 * r0, -DTYPE_MAX, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+                a0q = tl.clamp(a0 * r0, -DTYPE_MAX, DTYPE_MAX).to(
+                    b_ptr.dtype.element_ty
+                )
 
                 if K_TAIL > 0:
 
@@ -1099,15 +1162,20 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                             + pid_head_i64 * stride_ab_i64
                             + tl.cast(m_start, tl.int64) * stride_am_i64
                             + BLOCK_SIZE_K * stride_ak_i64
-                            + (offs_am_loc[:, None] * stride_am + offs_kt[None, :] * stride_ak),
-                            cache_modifier='.cg',
+                            + (
+                                offs_am_loc[:, None] * stride_am
+                                + offs_kt[None, :] * stride_ak
+                            ),
+                            cache_modifier=".cg",
                         )
                     b1_ptrs = (
                         b_ptr
                         + pid_head_i64 * stride_bb_i64
                         + tl.cast(n_start, tl.int64) * stride_bn_i64
                         + BLOCK_SIZE_K * stride_bk_i64
-                    ) + (offs_kt[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn)
+                    ) + (
+                        offs_kt[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn
+                    )
                 else:
                     a1 = tl.load(
                         a_ptrs + BLOCK_SIZE_K * stride_ak_i64,
@@ -1117,7 +1185,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 m1 = tl.maximum(tl.max(tl.abs(a1), axis=-1), 1e-10)[:, None]
                 s1 = m1.to(tl.float32) * one_over_DTYPE_MAX
                 r1 = 1.0 / s1
-                a1q = tl.clamp(a1 * r1, -DTYPE_MAX, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+                a1q = tl.clamp(a1 * r1, -DTYPE_MAX, DTYPE_MAX).to(
+                    b_ptr.dtype.element_ty
+                )
 
                 offs_cm_loc = tl.arange(0, BLOCK_SIZE_M)
                 offs_cn_loc = tl.arange(0, BLOCK_SIZE_N)
@@ -1126,7 +1196,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     + pid_head_i64 * stride_cb_i64
                     + tl.cast(m_start, tl.int64) * stride_cm_i64
                     + tl.cast(n_start, tl.int64) * stride_cn_i64
-                ) + (offs_cm_loc[:, None] * stride_cm + offs_cn_loc[None, :] * stride_cn)
+                ) + (
+                    offs_cm_loc[:, None] * stride_cm + offs_cn_loc[None, :] * stride_cn
+                )
                 c_mask = offs_cm_loc[:, None] < M - m_start
 
                 for n_i in range(N_INNER):
@@ -1149,7 +1221,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
 
                         c_val = tl.reshape(
                             tl.permute(
-                                tl.reshape(c_val, (BLOCK_SIZE_M, BLOCK_SIZE_N // 64, 4, 4, 4)),
+                                tl.reshape(
+                                    c_val, (BLOCK_SIZE_M, BLOCK_SIZE_N // 64, 4, 4, 4)
+                                ),
                                 (0, 1, 3, 2, 4),
                             ),
                             (BLOCK_SIZE_M, BLOCK_SIZE_N),
@@ -1184,10 +1258,14 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     b = tl.load(b_ptrs, cache_modifier=cache_modifier)
                 else:
                     a = tl.load(
-                        a_ptrs, mask=offs_k[None, :] < K - k_idx * BLOCK_SIZE_K, other=0.0
+                        a_ptrs,
+                        mask=offs_k[None, :] < K - k_idx * BLOCK_SIZE_K,
+                        other=0.0,
                     )
                     b = tl.load(
-                        b_ptrs, mask=offs_k[:, None] < K - k_idx * BLOCK_SIZE_K, other=0.0
+                        b_ptrs,
+                        mask=offs_k[:, None] < K - k_idx * BLOCK_SIZE_K,
+                        other=0.0,
                     )
 
                 m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
@@ -1264,7 +1342,10 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
         )
         q_mask = t_mask[:, None, None]
         x = tl.load(
-            q_base + d_pe_offs[None, None, :] * q_pe_stride_d, mask=q_mask, other=0.0, cache_modifier='.cg'
+            q_base + d_pe_offs[None, None, :] * q_pe_stride_d,
+            mask=q_mask,
+            other=0.0,
+            cache_modifier=".cg",
         )
         if BLOCK_QH == QH_PER_KH:
             kx0 = tl.load(
@@ -1272,22 +1353,28 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 + offs_t64[:, None] * k_pe_stride_b
                 + d_pe_offs[None, :] * k_pe_stride_d,
                 mask=t_mask[:, None],
-                other=0.0, cache_modifier='.cg',
+                other=0.0,
+                cache_modifier=".cg",
             )
             k_nope0 = tl.load(
                 k_nope_ptr
                 + offs_t64[:, None] * k_nope_stride_b
                 + dk_nope_offs[None, :] * k_nope_stride_d,
                 mask=t_mask[:, None],
-                other=0.0, cache_modifier='.cg',
+                other=0.0,
+                cache_modifier=".cg",
             )
         if HAVE_K_SCALE:
             k_scale = tl.load(k_scale_ptr)
         else:
             k_scale = 1
         cos_offs = pos[:, None] * cos_stride_b + d_cos_offs[None, :] * cos_stride_d
-        cos = tl.load(cos_ptr + cos_offs, mask=t_mask[:, None], other=0.0, cache_modifier='.cg')
-        sin = tl.load(sin_ptr + cos_offs, mask=t_mask[:, None], other=0.0, cache_modifier='.cg')
+        cos = tl.load(
+            cos_ptr + cos_offs, mask=t_mask[:, None], other=0.0, cache_modifier=".cg"
+        )
+        sin = tl.load(
+            sin_ptr + cos_offs, mask=t_mask[:, None], other=0.0, cache_modifier=".cg"
+        )
 
         if IS_NEOX:
 
@@ -1299,7 +1386,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
             x_rot = tl.where(neg_mask[None, None, :], -x_sw, x_sw)
         else:
 
-            xe, xo = tl.split(tl.reshape(x, (ROPE_BLOCK_T, BLOCK_QH, BLOCK_D_HALF_pe, 2)))
+            xe, xo = tl.split(
+                tl.reshape(x, (ROPE_BLOCK_T, BLOCK_QH, BLOCK_D_HALF_pe, 2))
+            )
             x_rot = tl.reshape(tl.join(-xo, xe), (ROPE_BLOCK_T, BLOCK_QH, BLOCK_D_pe))
         q_pe = x * cos[:, None, :] + x_rot * sin[:, None, :]
 
@@ -1396,12 +1485,14 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
             tl.store(
                 kv_base + dk_nope_offs[None, :] * kv_cache_stride_d,
                 k_nope_scaled,
-                mask=kv_mask, cache_modifier='.cs',
+                mask=kv_mask,
+                cache_modifier=".cs",
             )
             tl.store(
                 kv_base + (d_pe_offs[None, :] + BLOCK_DK_nope) * kv_cache_stride_d,
                 k_pe_scaled,
-                mask=kv_mask, cache_modifier='.cs',
+                mask=kv_mask,
+                cache_modifier=".cs",
             )
 
     elif pid < prefill_start:
@@ -1632,7 +1723,6 @@ def _get_fp8_config(
         N,
         K,
     )
-
 
 
 def _get_fp8_prefill_config(M: int, N: int, K: int):

@@ -542,7 +542,8 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
             and w_k.dtype == torch.float8_e4m3fn
             and all(x.dtype == torch.bfloat16 for x in (q_nope, q_pe, k_nope, k_rope))
             and w_k.is_contiguous()
-            and q_nope.stride() in (
+            and q_nope.stride()
+            in (
                 (M * K, K, 1),
                 (K, qh * K, 1),
                 (K + d_pe, qh * (K + d_pe), 1),
@@ -572,9 +573,20 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         extra = {
             key: config[key]
             for key in (
-                "ROPE_BLOCK_T", "N_INNER", "M_PER_CTA", "PERM_N", "K_TAIL",
-                "B_PF", "AQH", "LPIN", "IL_R", "IL_U", "ILB_NUM", "ILB_DEN",
-                "XCD_COLOC", "LDB",
+                "ROPE_BLOCK_T",
+                "N_INNER",
+                "M_PER_CTA",
+                "PERM_N",
+                "K_TAIL",
+                "B_PF",
+                "AQH",
+                "LPIN",
+                "IL_R",
+                "IL_U",
+                "ILB_NUM",
+                "ILB_DEN",
+                "XCD_COLOC",
+                "LDB",
             )
         }
         extra["BLOCK_QH"] = qh
