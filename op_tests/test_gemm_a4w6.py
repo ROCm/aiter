@@ -297,7 +297,7 @@ def test_a4w6_long_k_path_matches_swizzle0_bitwise():
 @requires_gfx950
 def test_a4w6_dispatch_uses_specialized_kernels_and_respects_default_bounds():
     assert _select_gemm_a4w6_kernel(512, 5120, 5120, None) == MFMA32_SMALL_KERNEL
-    assert _select_gemm_a4w6_kernel(9450, 5120, 5120, None) == DMABIG_SWZ0_KERNEL
+    assert _select_gemm_a4w6_kernel(9450, 5120, 5120, None) == MFMA32_SWZ0_KERNEL
     assert (
         a4w6_ops._default_gemm_a4w6_kernel(9450, 13824, 5120) == MFMA32_GROUPED_KERNEL
     )

@@ -92,9 +92,7 @@ def test_mixed_mxfp_manifest_objects(
     )
     assert actual_exact_count == exact_count
     assert len(rows) - actual_exact_count == generic_count
-    assert {
-        row["knl_name"] for row in rows if "dmabig_m82" in row["knl_name"]
-    } == {
+    assert {row["knl_name"] for row in rows if "dmabig_m82" in row["knl_name"]} == {
         f"_ZN5aiter44{module}_bf16_per1x32"
         f"{'Fp6Fp4' if module == 'f6f4gemm' else 'Fp4Fp6'}"
         f"_dmabig_m82_s{swizzle}_ntE"
