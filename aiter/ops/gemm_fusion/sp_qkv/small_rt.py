@@ -64,9 +64,14 @@ class SmBindingV1(C.Structure):
 
 
 # ---- R12 (design card r2 D2.3; small/r19, SM_ABI_VERSION 3) ----------------------------------------------------------------------------------------------------
-# SmRanArgsV3 is the RAN kernel's by-value kernarg block (one s_load_dwordx16): sizeof == 64 is pinned here and by the r19 header's static_assert. The host driver builds it
-# natively; this mirror exists to pin the layout and to unit-test the packing. err/step point into the per-comm global page.
+# RAN kernel signature (X1, r19-r21): sm_ran_v3(const SmDev* __restrict__ blk, SmRanArgsV3 ka): TWO kernel parameters, the block pointer (8 B) and the by-value struct (64 B,
+# one s_load_dwordx16) = SM_RAN_KERNARG_BYTES 72. The host driver builds both natively ({&ran_blk, &ka}); Python NEVER builds RAN kernargs: this mirror exists only to pin the
+# struct layout (sizeof == 64, field order = the header's) against the headers. `SmRanArgsV3::blk` is kept for layout compatibility and is UNUSED by the kernel (the block
+# pointer is the separate first parameter). err/step point into the per-comm global page.
 SM_RAN_ARGS_V3_BYTES = 64
+SM_RAN_KERNARG_BYTES = (
+    72  # sizeof(const SmDev*) + sizeof(SmRanArgsV3), the header's SM_RAN_KERNARG_BYTES
+)
 
 
 class SmRanArgsV3(C.Structure):
@@ -85,6 +90,7 @@ class SmRanArgsV3(C.Structure):
 
 
 assert C.sizeof(SmRanArgsV3) == SM_RAN_ARGS_V3_BYTES
+assert C.sizeof(C.c_void_p) + C.sizeof(SmRanArgsV3) == SM_RAN_KERNARG_BYTES
 
 
 def load_driver(path: str, abi: int = 2):

@@ -5583,3 +5583,83 @@ def test_plan_run_raises_the_typed_gate_error_while_reset_is_in_progress_small_a
     lres.launch_gate = False
     _run_large(lplan, lst, lres)
     assert len(llaunches) == 1
+
+
+# ======================================================================= X1: sm_ran_v3(const SmDev* __restrict__ blk, SmRanArgsV3 ka) = 72 B kernarg (r19, r20, r21)
+def test_ran_kernarg_x1_signature_header_host_launch_and_the_python_mirror_agree_for_every_small_source():
+    import re
+
+    from aiter.ops.gemm_fusion.sp_qkv import small_rt
+
+    assert (
+        small_rt.SM_RAN_ARGS_V3_BYTES == 64
+        and small_rt.SM_RAN_KERNARG_BYTES == 72 == 8 + small_rt.SM_RAN_ARGS_V3_BYTES
+    )
+    mirror = [n for n, _t in small_rt.SmRanArgsV3._fields_]
+    assert mirror[0] == "blk"  # kept for layout compatibility (the kernel ignores it)
+    for src in ("r19", "r20", "r21"):
+        base = os.path.join(jit.CSRC, "small", src)
+        header = _slurp(
+            os.path.join(base, "interface", "sm_abi_v3.h"), encoding="utf-8"
+        )
+        kernel = _slurp(os.path.join(base, "device", "ran_kernel.cu"), encoding="utf-8")
+        host = _slurp(os.path.join(base, "host", "driver_sm.cpp"), encoding="utf-8")
+        # the struct: 64 B, 8-aligned, the fields of the Python mirror in the same order
+        assert re.search(
+            r"static_assert\(sizeof\(SmRanArgsV3\) == 64 && alignof\(SmRanArgsV3\) == 8",
+            header,
+        ), src
+        assert (
+            int(re.search(r"#define SM_RAN_KERNARG_BYTES (\d+)u", header).group(1))
+            == small_rt.SM_RAN_KERNARG_BYTES
+        ), src
+        block = re.search(r"struct SmRanArgsV3\s*\{(.*?)\};", header, re.DOTALL).group(
+            1
+        )
+        names = re.findall(r"(\w+)\s*;", re.sub(r"//.*", "", block).replace(",", ";"))
+        assert [n for n in names if n != "pad"] == mirror, (src, names)
+        # the kernel: TWO parameters, the block pointer restrict-qualified, then the struct by value (the host-side stub has the same two)
+        assert (
+            len(
+                re.findall(
+                    r"void sm_ran_v3\(const SmDev\* __restrict__ blk, SmRanArgsV3 ka\)",
+                    kernel,
+                )
+            )
+            == 1
+        ), src
+        assert (
+            'extern "C" __global__ void sm_ran_v3(const SmDev*, SmRanArgsV3) {}'
+            in kernel
+        ), src  # the host-only stub keeps the signature
+        # the host launch: one kernelParams pointer per kernel parameter, sizes asserted at compile time
+        assert (
+            "void* ra[] = {&ran_blk, &ka};" in host
+            and "const SmDev* ran_blk = c->dblk;" in host
+        ), src
+        assert re.search(
+            r"sizeof\(SmRanArgsV3\) == 64 && sizeof\(const SmDev\*\) \+ sizeof\(SmRanArgsV3\) == SM_RAN_KERNARG_BYTES",
+            host,
+        ), src
+
+
+def test_no_python_module_builds_ran_kernargs():
+    """The RAN kernarg is built natively by the driver: no Python source constructs a SmRanArgsV3 or launches the kernel itself (the mirror is a layout pin only)."""
+    import glob
+    import re
+
+    root = os.path.dirname(jit.__file__)
+    users = []
+    for path in sorted(glob.glob(os.path.join(root, "*.py"))) + sorted(
+        glob.glob(
+            os.path.join(os.path.dirname(root), "..", "..", "gemm_fusion", "*.py")
+        )
+    ):
+        text = _slurp(path, encoding="utf-8")
+        if (
+            re.search(r"(?<!class )\bSmRanArgsV3\s*\(", text)
+            or "hipModuleLaunchKernel" in text
+            or "sm_ran_v3" in re.sub(r"#.*", "", text)
+        ):
+            users.append(os.path.basename(path))
+    assert users == [], users
