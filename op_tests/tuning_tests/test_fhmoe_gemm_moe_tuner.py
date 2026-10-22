@@ -80,7 +80,7 @@ def _shape(token=1):
 
 
 def _tune_args(**overrides):
-    args = dict(warmup=1, iters=1, profile_file="", errRatio=0.05)
+    args = {"warmup": 1, "iters": 1, "profile_file": "", "errRatio": 0.05}
     args.update(overrides)
     return SimpleNamespace(**args)
 
