@@ -28,6 +28,13 @@ from op_tests.triton_tests.attention.mha_test_utils import (
 )
 
 
+@pytest.fixture(params=[False, True])
+def FUSED(request):
+    mha_set_use_fused_bwd_kernel(request.param)
+    yield request.param
+    mha_set_use_fused_bwd_kernel(False)
+
+
 def _test_mha_impl(
     BATCH: int,
     SEQLEN_Q: int,
@@ -468,7 +475,6 @@ def _test_mha_varlen_impl(
 ):
     skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
-    torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -721,7 +727,6 @@ def test_mha_varlen_return_lse_softmax(
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward(
     BATCH: int,
     SEQLEN_Q: int,
@@ -743,7 +748,6 @@ def test_mha_backward(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -884,7 +888,6 @@ def test_mha_dao_ai_backward_head_size(
 @pytest.mark.parametrize("NUM_K_HEADS", [8])
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [False])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward_sbhd_do(
     BATCH: int,
     SEQLEN_Q: int,
@@ -908,7 +911,6 @@ def test_mha_backward_sbhd_do(
 
     torch.cuda.empty_cache()
     torch.manual_seed(42)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -954,7 +956,6 @@ def test_mha_backward_sbhd_do(
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward_varlen(
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -976,7 +977,6 @@ def test_mha_backward_varlen(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
