@@ -229,6 +229,16 @@ def test_loader_binds_to_the_already_loaded_runtime(fresh_loader, monkeypatch):
     )
 
 
+def test_loader_binds_to_a_runtime_named_by_torch_hip_version(
+    fresh_loader, monkeypatch
+):
+    monkeypatch.setattr(hip_runtime.sys, "platform", "linux")
+    torch = SimpleNamespace(version=SimpleNamespace(hip="123.45.67"))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(hip_runtime.ctypes, "CDLL", _fake_cdll({"libamdhip64.so.123"}))
+    assert hip_runtime.load_hip_runtime() == "loaded:libamdhip64.so.123"
+
+
 def test_loader_opens_by_name_when_nothing_is_loaded(fresh_loader, monkeypatch):
     monkeypatch.setattr(hip_runtime.sys, "platform", "linux")
     monkeypatch.setattr(hip_runtime.ctypes, "CDLL", _fake_cdll(set()))

@@ -17,7 +17,13 @@ def _library_names() -> tuple[str, ...]:
         # The unversioned symlink ships in the -devel package, which need not be
         # on LD_LIBRARY_PATH at runtime; split rocm-sdk pip layouts carry only the
         # versioned soname.
-        return ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6")
+        names = ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6")
+        torch_hip = _torch_hip_version()
+        if torch_hip:
+            torch_soname = f"libamdhip64.so.{torch_hip.split('.')[0]}"
+            if torch_soname not in names:
+                names += (torch_soname,)
+        return names
 
     # Windows ROCm ships a version-suffixed DLL, e.g. `amdhip64_7.dll`.
     from cpp_extension import _find_rocm_home
@@ -28,6 +34,16 @@ def _library_names() -> tuple[str, ...]:
 
     dlls = sorted(glob.glob(os.path.join(rocm_home, "bin", "amdhip64*.dll")))
     return (*dlls, "amdhip64.dll")
+
+
+def _torch_hip_version() -> str | None:
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    version = getattr(torch, "version", None)
+    if version is None:
+        return None
+    return getattr(version, "hip", None)
 
 
 def _loaded_hip_runtime() -> ctypes.CDLL | None:
