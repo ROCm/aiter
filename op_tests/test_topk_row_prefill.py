@@ -531,7 +531,14 @@ def test_top_k_per_row_prefill(
         )
         if fast_timed:
             print(f"  Speedup:          {speedup_color}{speedup:.3f}x{RESET}")
-            print(f"  Improvement:      {speedup_color}{improvement_pct:.2f}%{RESET}")
+            # improvement divides by us_standard, so a zero standard timing
+            # leaves it None even though fast_timed is true.
+            if improvement_pct is None:
+                print("  Improvement:      n/a (standard kernel reported 0 us)")
+            else:
+                print(
+                    f"  Improvement:      {speedup_color}{improvement_pct:.2f}%{RESET}"
+                )
         else:
             print("  Speedup:          n/a (fast kernel reported 0 us)")
     else:
