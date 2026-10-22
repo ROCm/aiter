@@ -1260,7 +1260,6 @@ public:
             for(int j = 0; j < world_size_; j++)
                 rd.ptrs[j] = (j != rank_) ? (void*)ptrs_per_rank[j][num_input_buffers + i]
                                           : self_ptr;
-            output_buffers_[self_ptr] = d_rank_data_base_ + num_input_buffers + i;
         }
         HIP_CALL(hipMemcpy(d_rank_data_base_,
                            rank_data.data(),
