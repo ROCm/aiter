@@ -171,6 +171,10 @@ def fp8_mqa_logits(
         config = dict(load_config_json(f"{config_dir}/DEFAULT.json")["rows8"])
         min_seq_len_kv = config.pop("min_seq_len_kv")
         if seq_len_kv >= min_seq_len_kv:
+            # Normalize non-unit inner strides before FP8 async copies.
+            if stride_kv_d != 1:
+                KV = KV.contiguous()
+                stride_kv_s, stride_kv_d = KV.stride()
             block_m = config["BLOCK_M"]
             block_kv = config["BLOCK_KV"]
             num_warps = config["NUM_WARPS"]
