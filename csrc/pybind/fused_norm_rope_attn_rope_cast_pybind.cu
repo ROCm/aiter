@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_stream.h"
+#include "fused_norm_rope_attn_rope_cast.h"
+#include "rocm_ops.hpp"
+
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
+{
+    AITER_SET_STREAM_PYBIND
+    m.def("fused_norm_rope_attn_rope_cast_fwd",
+          &fused_norm_rope_attn_rope_cast_fwd,
+          py::arg("q"),
+          py::arg("pool"),
+          py::arg("prefix"),
+          py::arg("prefix_indptr"),
+          py::arg("cos"),
+          py::arg("sin"),
+          py::arg("positions"),
+          py::arg("out"),
+          py::arg("out_scale"),
+          py::arg("max_logits"),
+          py::arg("lse"),
+          py::arg("extend_kv"),
+          py::arg("extend"),
+          py::arg("extend_indptr"),
+          py::arg("attn_sink"),
+          py::arg("debug_out"),
+          py::arg("softmax_scale"),
+          py::arg("q_is_rotated"),
+          py::arg("cache_scales")            = py::none(),
+          py::arg("cache_page_size")         = 0,
+          py::arg("cache_num_rows")          = 0,
+          py::arg("cache_data_page_stride")  = 0,
+          py::arg("cache_scale_page_stride") = 0,
+          py::arg("fp8_qk")                  = false,
+          py::arg("q_scale")                 = py::none(),
+          py::arg("q_norm")                  = false,
+          py::arg("norm_eps")                = 1e-6f);
+}

@@ -1,8 +1,0 @@
-{
-  "candidate": "dequant16_qkds_storeflip_h64late",
-  "baseline_commit": "06ca613d93b1d19d7edb411f5dd79c26b6239c23",
-  "source_sha256": {
-    "csrc/kernels/mla/fused_dsv41/decode_fp8_qk.hpp": "44cefe5e2ab182eda25e2d07228879344c900b66d94667ef22112a0c4128f571",
-    "csrc/kernels/mla/fused_dsv41_mxfp8.cu": "875f76d9468cd9e2db9e09eb9210e19b7a9ead3864b47b1116219cfedc093d80"
-  }
-}
