@@ -8,6 +8,7 @@ import triton
 
 from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _get_dispatch_config,
+    _get_launch_config,
     _paged_attn_decode_v1_w_dot_kernel,
     _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
     _paged_attn_decode_v1_wo_dot_kernel,
@@ -31,6 +32,37 @@ _LOGGER = AiterTritonLogger()
 _SEQ_PARTITION_SIZE = 1024  # HIP
 
 _KV_DTYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
+
+
+def _select_seq_partition_size(
+    num_programs: int, max_seq_len: int, kv_blk_sz: int, dispatch: dict
+) -> int:
+    """Pick the sequence partition size of the split-K GQA kernel from the config.
+
+    A return value of `_SEQ_PARTITION_SIZE` means: keep the default v1/v2 choice.
+    """
+    target = dispatch.get("split_target_programs")
+    busy = num_programs >= dispatch.get("split_max_programs", 1 << 62)
+    short = max_seq_len < dispatch.get(
+        "split_short_seq", 0
+    ) and num_programs >= dispatch.get("split_short_min_programs", 1 << 62)
+    if target is None or busy or short:
+        return _SEQ_PARTITION_SIZE
+    sizes = [
+        p
+        for p in sorted(dispatch["split_sizes"], reverse=True)
+        if p % kv_blk_sz == 0 and (p == _SEQ_PARTITION_SIZE or p <= max_seq_len)
+    ]
+    # Largest size that reaches the target; else the smallest size within the cap.
+    allowed = [
+        (p, triton.cdiv(max_seq_len, p))
+        for p in sizes
+        if triton.cdiv(max_seq_len, p) <= dispatch["split_max_partitions"]
+    ]
+    for p, num_parts in allowed:
+        if num_programs * num_parts >= target:
+            return p
+    return allowed[-1][0] if allowed else _SEQ_PARTITION_SIZE
 
 
 def paged_attention_decode(
@@ -93,10 +125,22 @@ def paged_attention_decode(
         dispatch = _get_dispatch_config(_KV_DTYPE_NAMES[key_cache.dtype])
     if dispatch is not None:
         use_v1 = max_num_partitions <= dispatch["v1_max_partitions"]
+        # With enough programs the split-free v1 fills the GPU and avoids the reduce.
+        busy_min = dispatch.get("v1_min_programs")
+        if busy_min is not None and num_seqs * num_kv_heads >= busy_min:
+            use_v1 = use_v1 or max_num_partitions <= dispatch["v1_busy_max_partitions"]
     else:
         use_v1 = max_seq_len <= 8192 and (
             max_num_partitions == 1 or num_seqs * num_q_heads > 512
         )
+    seq_partition_size = _SEQ_PARTITION_SIZE
+    if dispatch is not None and num_q_heads != num_kv_heads:  # GQA only
+        seq_partition_size = _select_seq_partition_size(
+            num_seqs * num_kv_heads, max_seq_len, key_cache.shape[2], dispatch
+        )
+        if seq_partition_size != _SEQ_PARTITION_SIZE:
+            use_v1 = False
+            max_num_partitions = triton.cdiv(max_seq_len, seq_partition_size)
     if k_scale.numel() > 1:
         if use_v1:
             paged_attn_decode_v1_per_token_quant(
@@ -164,6 +208,7 @@ def paged_attention_decode(
                 k_scale.item(),
                 v_scale.item(),
                 max_num_partitions,
+                seq_partition_size=seq_partition_size,
             )
 
 
@@ -236,6 +281,7 @@ def paged_attn_decode_v1(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
+        launch = _get_launch_config("v1_w_dot", kv_blk_sz) or {}
         _paged_attn_decode_v1_w_dot_kernel[grid](
             output,
             query,
@@ -264,8 +310,7 @@ def paged_attn_decode_v1(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
-            waves_per_eu=3 if query_grp_sz > 1 else 0,
-            num_stages=1,
+            **launch,
         )
 
 
@@ -289,6 +334,7 @@ def paged_attn_decode_v2(
     blocksparse_vert_stride: int = 0,
     blocksparse_block_size: int = 64,
     blocksparse_head_sliding_step: int = 0,
+    seq_partition_size: int = _SEQ_PARTITION_SIZE,  # GQA only
 ):
     """
     #TODO: Add Doc
@@ -390,6 +436,7 @@ def paged_attn_decode_v2(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
+        launch = _get_launch_config("v2_w_dot", kv_blk_sz) or {}
         _paged_attn_decode_v2_w_dot_kernel[grid](
             exp_sums,
             max_logits,
@@ -423,7 +470,8 @@ def paged_attn_decode_v2(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-            SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            SEQ_PARTITION_SZ=seq_partition_size,
+            **launch,
         )
         grid = (num_seqs, num_kv_heads, 1)
         _paged_attn_decode_v2_w_dot_reduce_kernel[grid](
@@ -445,7 +493,7 @@ def paged_attn_decode_v2(
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-            SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            SEQ_PARTITION_SZ=seq_partition_size,
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
         )
 

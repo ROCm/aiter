@@ -1,8 +1,8 @@
-import random
 import sys
 
 import torch
 import triton
+from triton.testing import runtime
 
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
@@ -77,7 +77,7 @@ def input_helper(
     value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous().cuda()
 
     context_lens = torch.full((B,), SEQ_LEN, device="cuda")
-    max_context_len = int(max(context_lens))
+    max_context_len = int(context_lens.max())
     max_num_blks_per_seq = (max_context_len + KV_BLK_SZ - 1) // KV_BLK_SZ
 
     if num_blocks >= B * max_num_blks_per_seq:
@@ -86,13 +86,10 @@ def input_helper(
             : B * max_num_blks_per_seq
         ].view(B, max_num_blks_per_seq)
     else:
-        block_tables = []
-        for i in range(B):
-            block_table = [
-                random.randint(0, num_blocks - 1) for _ in range(max_num_blks_per_seq)
-            ]
-            block_tables.append(block_table)
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
+        # Built on the GPU: a host-to-device copy of this table faults on gfx1250.
+        block_tables = torch.randint(
+            0, num_blocks, (B, max_num_blks_per_seq), dtype=torch.int32, device="cuda"
+        )
 
     output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
 
@@ -216,6 +213,22 @@ def paged_attn_decode(
     )
 
 
+def triton_max_blocks(HK, KV_BLK_SZ, HEAD_DIM):
+    """Most pages a cache can hold with Triton's signed int32 cache offsets."""
+    return (1 << 31) // (HK * KV_BLK_SZ * HEAD_DIM)
+
+
+def bench_ms(fn, flush_cache=True):
+    """Time of one fn call in ms, with the caches flushed before each call by default."""
+    if not flush_cache:
+        return triton.testing.do_bench_cudagraph(fn, rep=100)
+    cache = runtime.driver.active.get_empty_cache_for_benchmark()
+    flush = cache.zero_
+    # Graph replays run back to back, so time flush + fn and subtract the flush.
+    with_flush = triton.testing.do_bench_cudagraph(lambda: (flush(), fn()), rep=100)
+    return with_flush - triton.testing.do_bench_cudagraph(flush, rep=100)
+
+
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
     kv_cache_dtype = arg_to_torch_dtype[args.kv_cache_dtype]
@@ -226,6 +239,18 @@ def run_benchmark(args):
 
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "BS", "HQ", "HK", "SEQ_LEN", "HEAD_DIM"]
+    # TODO tune this
+    KV_BLK_SZ = 16 if args.backend == "gluon" else 128
+
+    # Check every row before the sweep, so a bad -num_blocks cannot lose earlier rows.
+    if args.backend == "triton" and args.num_blocks:
+        for model, _, _, HK, _, HEAD_DIM in x_vals_list:
+            max_blocks = triton_max_blocks(HK, KV_BLK_SZ, HEAD_DIM)
+            if args.num_blocks > max_blocks:
+                raise ValueError(
+                    f"-num_blocks must be <= {max_blocks} for {model} "
+                    "to keep Triton cache offsets within signed int32."
+                )
 
     line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
@@ -244,25 +269,24 @@ def run_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_paged_attn_decode(BS, HQ, HK, SEQ_LEN, HEAD_DIM, metric, model=None):
-        # TODO tune this
-        KV_BLK_SZ = 16 if args.backend == "gluon" else 128
         kv_bytes = get_dtype_bytes(kv_cache_dtype)
+        pages_needed = BS * triton.cdiv(SEQ_LEN, KV_BLK_SZ)
         if args.num_blocks:
             num_blocks = args.num_blocks
         else:
-            # One page per (sequence, block slot), capped so each cache tensor stays at or under 4 GB.
+            # One page per (sequence, block slot), capped at 4 GB per cache tensor.
+            # input_helper holds four cache tensors at once, so also cap each at a
+            # fifth of the free memory.
             page_bytes = HK * KV_BLK_SZ * HEAD_DIM * kv_bytes
-            num_blocks = min(
-                BS * triton.cdiv(SEQ_LEN, KV_BLK_SZ), (4 << 30) // page_bytes
-            )
+            free_bytes, _ = torch.cuda.mem_get_info()
+            num_blocks = min(pages_needed, min(4 << 30, free_bytes // 5) // page_bytes)
         if args.backend == "triton":
-            max_blocks = (1 << 31) // (HK * KV_BLK_SZ * HEAD_DIM)
-            if args.num_blocks and num_blocks > max_blocks:
-                raise ValueError(
-                    f"-num_blocks must be <= {max_blocks} for this shape "
-                    "to keep Triton cache offsets within signed int32."
-                )
-            num_blocks = min(num_blocks, max_blocks)
+            num_blocks = min(num_blocks, triton_max_blocks(HK, KV_BLK_SZ, HEAD_DIM))
+        if num_blocks < pages_needed and metric == "time":  # once per row
+            print(
+                f"{model}: KV pool is {num_blocks} pages for {pages_needed} needed, "
+                f"so pages are reused {pages_needed / num_blocks:.1f}x"
+            )
         fn = paged_attn_decode(
             BS,
             HQ,
@@ -280,7 +304,7 @@ def run_benchmark(args):
 
         fn()
         torch.cuda.synchronize()
-        ms = triton.testing.do_bench_cudagraph(fn, rep=100)
+        ms = bench_ms(fn, flush_cache=not args.no_flush_cache)
 
         # query and output
         mem = (BS * HQ * HEAD_DIM) * (
@@ -328,14 +352,19 @@ def parse_args():
         "-num_blocks",
         type=int,
         default=0,
-        help="Physical KV pages. 0 = one page per sequence block slot (capped at 4 GB per cache tensor).",
+        help="Physical KV pages. 0 = one page per sequence block slot (capped at 4 GB per cache tensor and a fifth of free memory).",
     )
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
-    override_parser_action(parser, "backend", default="triton")
+    override_parser_action(parser, "--backend", default="triton")
 
+    parser.add_argument(
+        "-no_flush_cache",
+        action="store_true",
+        help="Do not flush the caches before each call (flushing is the default).",
+    )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )

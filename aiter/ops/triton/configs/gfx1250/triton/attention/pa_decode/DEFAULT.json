@@ -1,0 +1,36 @@
+{
+    "dispatch": {
+        "bf16": {
+            "v1_max_partitions": 1,
+            "v1_min_programs": 2048,
+            "v1_busy_max_partitions": 8,
+            "split_target_programs": 2048,
+            "split_max_programs": 1024,
+            "split_short_seq": 1024,
+            "split_short_min_programs": 128,
+            "split_max_partitions": 64,
+            "split_sizes": [1024, 512, 256, 128]
+        },
+        "fp16": {
+            "v1_max_partitions": 1,
+            "v1_min_programs": 2048,
+            "v1_busy_max_partitions": 8,
+            "split_target_programs": 2048,
+            "split_max_programs": 1024,
+            "split_short_seq": 1024,
+            "split_short_min_programs": 128,
+            "split_max_partitions": 64,
+            "split_sizes": [1024, 512, 256, 128]
+        }
+    },
+    "launch": {
+        "v1_w_dot": {
+            "BLK_LEQ_16": {"num_warps": 4, "num_stages": 2, "waves_per_eu": 3},
+            "any": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 3}
+        },
+        "v2_w_dot": {
+            "BLK_LEQ_16": {"num_warps": 4, "num_stages": 2, "waves_per_eu": 0},
+            "any": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 2}
+        }
+    }
+}

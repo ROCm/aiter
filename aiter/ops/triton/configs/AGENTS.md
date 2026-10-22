@@ -205,6 +205,28 @@ in lowercase (`mhc_fused_sinkhorn`).
 
 `get_mhc_post_config(M, C)` reads `mhc_post/DEFAULT.json`.
 
+## PA decode
+
+`_get_dispatch_config(kv_dtype)` and `_get_launch_config(kernel, kv_blk_sz)`
+read `<arch>/triton/attention/pa_decode/DEFAULT.json`. Both return `None` when
+the arch has no file or no entry. `launch` has no built-in values in Python:
+an arch that runs the GQA decode kernel needs the `v1_w_dot` entry.
+
+| Table | Key | Meaning |
+| ----- | --- | ------- |
+| `dispatch.<bf16 or fp16>` | `v1_max_partitions` | Use the v1 kernel up to this number of 1024-token partitions. |
+| | `v1_min_programs`, `v1_busy_max_partitions` | With this many programs (batch x KV heads), v1 is also allowed up to the second value. |
+| | `split_target_programs` | Aim for this many programs when the GQA kernel splits a sequence. |
+| | `split_sizes` | Partition sizes to try, in tokens. A size must be a multiple of the page size. 1024 means do not split. |
+| | `split_max_partitions` | Largest number of partitions for one sequence. |
+| | `split_max_programs` | A grid with this many programs or more is not split. |
+| | `split_short_seq`, `split_short_min_programs` | A sequence shorter than the first value on a grid with at least the second value is not split. |
+| `launch.<v1_w_dot or v2_w_dot>` | `BLK_LEQ_<x>`, `any` | `num_warps`, `num_stages` and `waves_per_eu` for page sizes up to `<x>`, else `any`. |
+
+- A `split_*` key is optional. Without `split_target_programs` the kernel does
+  not split.
+- Do not set `num_stages` to 3 or more on gfx1250. It can hang the GPU.
+
 ## Autotune
 
 - Give every `@triton.autotune` its list through
