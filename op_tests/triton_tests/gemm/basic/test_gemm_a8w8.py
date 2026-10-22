@@ -159,6 +159,7 @@ def get_fewer_x_vals():
         "triton",
         "gluon",
         "gluon_shuffle",
+        "triton_shuffle",
     ],
 )
 def test_gemm_fp8(in_dtype, m, n, k, impl: str):
@@ -170,7 +171,7 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
             "Gluon implementation is not supported on this device (requires gfx950)."
         )
 
-    if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
+    if "_shuffle" in impl and (n % 16 != 0 or k % 32 != 0):
         pytest.skip(
             "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
         )
@@ -193,8 +194,10 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
         impl = triton_gemm_a8w8
     elif impl == "gluon":
         impl = functools.partial(triton_gemm_a8w8, backend="gluon")
-    elif impl == "gluon_shuffle":
+    elif impl == "triton_shuffle":
         impl = gemm_a8w8_preshuffle
+    elif impl == "gluon_shuffle":
+        impl = functools.partial(gemm_a8w8_preshuffle, backend="gluon")
     else:
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
@@ -218,6 +221,7 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
         "triton",
         "gluon",
         "gluon_shuffle",
+        "triton_shuffle",
     ],
 )
 def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
@@ -231,7 +235,7 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
             "Gluon implementation is not supported on this device (requires gfx950)."
         )
 
-    if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
+    if "_shuffle" in impl and (n % 16 != 0 or k % 32 != 0):
         pytest.skip(
             "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
         )
@@ -254,8 +258,10 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
         impl = triton_gemm_a8w8
     elif impl == "gluon":
         impl = functools.partial(triton_gemm_a8w8, backend="gluon")
-    elif impl == "gluon_shuffle":
+    elif impl == "triton_shuffle":
         impl = gemm_a8w8_preshuffle
+    elif impl == "gluon_shuffle":
+        impl = functools.partial(gemm_a8w8_preshuffle, backend="gluon")
     else:
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
