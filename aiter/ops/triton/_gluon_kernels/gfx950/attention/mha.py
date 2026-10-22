@@ -26,12 +26,12 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.mha_kernel_utils import (
+from aiter.ops.triton._triton_kernels.common.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
 )
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.config_utils import (
     AITER_TRITON_CONFIGS_PATH,
     load_config_json,

@@ -47,6 +47,7 @@ SHAPES = [
     (128, 3072, 3072, 4),  # GPT-OSS TP=1
     (129, 6144, 512, 5),  # MiniMax-M3 (INTER 384 pads to 512)
     (129, 6144, 768, 5),  # MiniMax-M3
+    (129, 6144, 1536, 5),  # MiniMax-M3 TP=2
     (256, 3072, 256, 8),  # MiniMax-M2.5 TP=6
     (256, 3072, 512, 8),  # MiniMax-M2.5 (INTER 384 pads to 512)
     (256, 7168, 256, 8),  # DSV3/Kimi-K2 E256
@@ -54,6 +55,12 @@ SHAPES = [
     (384, 7168, 256, 8),  # Kimi-K2 TP=8
     (512, 4096, 512, 10),  # Qwen3.5 TP=1
     (513, 4096, 512, 11),  # Qwen3.5 shared-expert variant
+    (513, 8192, 256, 11),  # Qwen3.8 TP=8 (shared-expert variant)
+    (512, 2048, 512, 10),  # Qwen3-Coder-Next TP=1
+    (256, 6144, 2048, 8),  # GLM-5.3 TP=1
+    (256, 6144, 3072, 6),  # Inkling TP=1
+    (384, 6144, 2048, 8),  # MiMo-V2.5-Pro TP=1
+    (288, 4096, 2048, 8),  # GLM-5.3-Flash / Step-3.5-Flash TP=1 aux key
 ]
 
 
@@ -369,6 +376,10 @@ class mxfp4_moe_aux_codegen:
     def gen_instances(self, instances):
         inst_dir = self.working_path / "instances"
         inst_dir.mkdir(exist_ok=True)
+        expected_sources = {f"{inst.name}.cu" for inst in instances}
+        for old_source in inst_dir.glob("*.cu"):
+            if old_source.name not in expected_sources:
+                old_source.unlink()
         for inst in instances:
             text = AUX_INSTANCE_HEADER.format(
                 kernel_include=inst.include,

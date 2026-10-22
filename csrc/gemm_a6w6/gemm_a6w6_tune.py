@@ -31,6 +31,9 @@ _MANIFEST_COLUMNS = frozenset(
         "swizzle_max_M",
         "swizzle_max_N",
         "swizzle_max_K",
+        "exact_M",
+        "exact_N",
+        "exact_K",
         "knl_name",
         "co_name",
     }
@@ -45,6 +48,9 @@ class F6GemmCandidate(TypedDict):
     swizzle_max_m: int
     swizzle_max_n: int
     swizzle_max_k: int
+    exact_m: int
+    exact_n: int
+    exact_k: int
 
 
 def _disable_core_dumps() -> None:
@@ -100,6 +106,13 @@ def load_f6gemm_candidates() -> list[F6GemmCandidate]:
             swizzle_max_k > 0 and (swizzle_max_m <= 0 or swizzle_max_n <= 0)
         ):
             raise ValueError(f"{kernel_name} has invalid swizzle bounds")
+        exact_m = int(row["exact_M"])
+        exact_n = int(row["exact_N"])
+        exact_k = int(row["exact_K"])
+        if (exact_m, exact_n, exact_k) != (0, 0, 0) and min(
+            exact_m, exact_n, exact_k
+        ) <= 0:
+            raise ValueError(f"{kernel_name} has an incomplete exact shape")
         candidates.append(
             {
                 "kernel_id": int(kernel_id),
@@ -109,6 +122,9 @@ def load_f6gemm_candidates() -> list[F6GemmCandidate]:
                 "swizzle_max_m": swizzle_max_m,
                 "swizzle_max_n": swizzle_max_n,
                 "swizzle_max_k": swizzle_max_k,
+                "exact_m": exact_m,
+                "exact_n": exact_n,
+                "exact_k": exact_k,
             }
         )
     if not candidates:
@@ -119,8 +135,14 @@ def load_f6gemm_candidates() -> list[F6GemmCandidate]:
 def candidate_supports_shape(
     candidate: F6GemmCandidate, M: int, N: int, K: int
 ) -> bool:
-    """Return whether a kernel's compile-time swizzle bounds cover the launch."""
+    """Return whether a kernel's exact-shape and swizzle contracts cover the launch."""
     padM, padN, padK = _ceil(M, 256), _ceil(N, 256), _ceil(K, 128)
+    if candidate["exact_k"] > 0:
+        return (padM, padN, padK) == (
+            candidate["exact_m"],
+            candidate["exact_n"],
+            candidate["exact_k"],
+        )
     max_k = candidate["swizzle_max_k"]
     if max_k <= 0 or padK > max_k:
         return True
