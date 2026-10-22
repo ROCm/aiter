@@ -14,9 +14,9 @@ import aiter as ops
 
 from ..parallel_state import in_the_same_node_as
 from .flydsl_backends import (
+    FLY_QUANTIZATIONS,
     FlyDSLAllReduceRMSNorm,
-    all_ranks_agree,
-    preload_fly_engines,
+    FlyDSLQuickAllReduce,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,27 +41,6 @@ try:
 except Exception:  # noqa: BLE001
     # For CPUs and CUDA
     quick_ar = False
-
-
-# Importing these pulls in flydsl, an optional dependency whose version is
-# checked at import time.
-try:
-    from aiter.ops.flydsl import allreduce_policy as fly_policy
-    from aiter.ops.flydsl.quick_allreduce import (
-        FlyQuickAllReduce as QuickAllReduceInt4,
-    )
-
-    _FLY_IMPORT_OK = True
-except Exception:  # noqa: BLE001
-    fly_policy = None
-    QuickAllReduceInt4 = None
-    _FLY_IMPORT_OK = False
-
-
-# Quantization regimes the FlyDSL backend can serve, mapped to the wire formats
-# to pin on the ring's two laps. ``None`` means "use the schedule's own per-world
-# default".
-_FLY_REGIMES = {QuickReduceRegime.INT4: (None, None)}
 
 
 def _qr_rocm_arch() -> str:
@@ -140,8 +119,7 @@ class QuickAllReduce:
         unsupported.
         """
         self.disabled = True
-        self._fly_policy = None
-        self._fly_engines: dict[str, Any] = {}
+        self._fly_ar = None
         self._fly_rms = None
         self._ptr = 0
         self.uses_pull_q4 = False
@@ -225,11 +203,16 @@ class QuickAllReduce:
         self._init_fly_backend()
         self._init_fly_rms_backend()
 
+    def _fly_quantization(self) -> str | None:
+        """The quantization the FlyDSL backends serve, or None if they cannot."""
+        level = getattr(self, "qr_quant_level", None)
+        return (
+            None if level is None or level.name not in FLY_QUANTIZATIONS else level.name
+        )
+
     def _init_fly_rms_backend(self):
         """Build the quantized FlyDSL fused all-reduce+RMSNorm engines."""
-        if not _FLY_IMPORT_OK or not fly_policy.enabled():
-            return
-        if getattr(self, "qr_quant_level", None) not in _FLY_REGIMES:
+        if self._fly_quantization() is None:
             return
         try:
             rms = FlyDSLAllReduceRMSNorm(
@@ -250,115 +233,16 @@ class QuickAllReduce:
         """Build the FlyDSL mesh/ring engines that will serve plain all-reduce,
         and compile the binaries the policy routes to them before any graph
         capture begins."""
-
-        if not _FLY_IMPORT_OK or not fly_policy.enabled():
+        quantization = self._fly_quantization()
+        if quantization is None:
             return
-        if getattr(self, "qr_quant_level", None) not in _FLY_REGIMES:
-            return
-
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        arch = get_gfx_runtime()
-        if arch not in fly_policy.SUPPORTED_ARCHS:
-            logger.debug(
-                "FlyDSL quick-reduce backend disabled: unsupported arch %s.", arch
-            )
-            return
-
-        rs_codec, ag_codec = _FLY_REGIMES[self.qr_quant_level]
-        # The link and the policy are identical on every rank, so all ranks
-        # decline together.
-        try:
-            link = fly_policy.detect_link()
-            policy = fly_policy.resolve_family_policy(
-                world_size=self.world_size, arch=arch, link=link
-            )
-        except fly_policy.NoPolicyError as e:
-            logger.debug("FlyDSL quick-reduce backend disabled: %s", e)
-            return
-        except ValueError as e:
-            logger.warning("FlyDSL quick-reduce backend disabled: %s", e)
-            return
-        algorithms = [
-            alg
-            for alg in policy.algorithms(quantized=True)
-            if alg != fly_policy.AllReduceAlgorithm.OneShot
-        ]
-        ok = True
-        try:
-            for alg in algorithms:
-                self._fly_engines[alg] = QuickAllReduceInt4(
-                    group=self.group,
-                    device=self.device,
-                    rank=self.rank,
-                    world_size=self.world_size,
-                    algorithm=alg.value,
-                    rs_codec=rs_codec,
-                    ag_codec=ag_codec,
-                    min_bytes=0,
-                    link=link,
-                )
-        except Exception:
-            logger.warning(
-                "FlyDSL quick-reduce backend disabled: engine construction failed.",
-                exc_info=True,
-            )
-            ok = False
-
-        if not all_ranks_agree(ok, self.group):
-            if ok:
-                logger.warning(
-                    "FlyDSL quick-reduce backend disabled: a peer rank failed to "
-                    "build its engines."
-                )
-            self._close_fly_engines()
-            return
-
-        ok = True
-        try:
-            preload_fly_engines(
-                (engine, policy.window(alg, quantized=True).inclusive_range())
-                for alg, engine in self._fly_engines.items()
-            )
-        except Exception:
-            logger.warning(
-                "FlyDSL quick-reduce backend disabled: warmup failed.", exc_info=True
-            )
-            ok = False
-
-        if not all_ranks_agree(ok, self.group):
-            if ok:
-                logger.warning(
-                    "FlyDSL quick-reduce backend disabled: a peer rank failed to "
-                    "warm up."
-                )
-            self._close_fly_engines()
-            return
-
-        if not self._fly_engines:
-            logger.debug("FlyDSL quick-reduce backend disabled by the policy.")
-            return
-        self._fly_policy = policy
-        logger.info(
-            "Quick-reduce slot: FlyDSL serves plain all-reduce (TP%d on %s: %s, "
-            "%.1f MiB of IPC inbox).",
-            self.world_size,
-            link,
-            ", ".join(
-                f"{alg.value} {policy.window(alg, quantized=True)}"
-                for alg in self._fly_engines
-            ),
-            sum(e.inbox_bytes for e in self._fly_engines.values()) / 2**20,
+        fly_ar = FlyDSLQuickAllReduce(
+            self.group, self.device, quantization=quantization
         )
-
-    def _close_fly_engines(self):
-        for eng in getattr(self, "_fly_engines", {}).values():
-            try:
-                eng.close()
-            except (AttributeError, RuntimeError):
-                pass
-        self._fly_engines = {}
-        self._fly_policy = None
+        if fly_ar.disabled:
+            fly_ar.close()
+            return
+        self._fly_ar = fly_ar
 
     def init_quick_all_reduce(self):
         # On RocM, bfloat16 kernels are slower than fp16
@@ -461,20 +345,7 @@ class QuickAllReduce:
 
     def _should_fly(self, inp: torch.Tensor) -> bool:
         """Whether the FlyDSL backend can and should serve *inp*. Never raises."""
-
-        if self._fly_policy is None:
-            return False
-        if inp.dtype is not torch.bfloat16:
-            return False
-        if not inp.is_contiguous():
-            return False
-        if inp.data_ptr() % 16:
-            return False
-        nbytes = inp.numel() * inp.element_size()
-        if nbytes % 16 or nbytes > fly_policy.MAX_PAYLOAD_BYTES:
-            return False
-        alg = self._fly_policy.select(nbytes, quantized=True)
-        return alg in self._fly_engines
+        return self._fly_ar is not None and self._fly_ar.should_fly_ar(inp)
 
     def should_quick_allreduce(self, inp: torch.Tensor):
         """
@@ -534,10 +405,7 @@ class QuickAllReduce:
         if out is None:
             out = torch.empty_like(inp)
         if self._should_fly(inp):
-            nbytes = inp.numel() * inp.element_size()
-            alg = self._fly_policy.select(nbytes, quantized=True)
-            self._fly_engines[alg].allreduce(inp, out)
-            return out
+            return self._fly_ar.fly_ar(inp, out=out)
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
@@ -617,13 +485,14 @@ class QuickAllReduce:
         # Both backends, and not gated on self.disabled: the FlyDSL engines hold
         # IPC inboxes opened against every peer, which have to be released
         # before the process group goes away even if the slot is disabled.
-        self._close_fly_engines()
-        if getattr(self, "_fly_rms", None) is not None:
-            try:
-                self._fly_rms.close()
-            except (AttributeError, RuntimeError):
-                pass
-            self._fly_rms = None
+        for attr in ("_fly_ar", "_fly_rms"):
+            fly = getattr(self, attr, None)
+            if fly is not None:
+                try:
+                    fly.close()
+                except (AttributeError, RuntimeError):
+                    pass
+                setattr(self, attr, None)
         if getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)

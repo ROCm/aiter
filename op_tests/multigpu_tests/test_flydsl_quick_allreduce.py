@@ -1023,8 +1023,8 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     ``AITER_QUICK_REDUCE_QUANTIZATION=INT4``, then drives payloads across each
     schedule's dispatch window through the top-level ``CudaCommunicator.all_reduce``,
     which tries quick reduce before custom all-reduce. ``_init_fly_backend`` builds
-    the engines; ``_should_fly`` is the gate ``quick_all_reduce`` applies to route a
-    payload to one.
+    the ``FlyDSLQuickAllReduce`` backend; its ``should_fly_ar`` is the gate
+    ``quick_all_reduce`` applies to route a payload to one of its engines.
 
     Per probe it records which schedule the policy selects, which engine actually
     ran (a wrapper on each engine's ``allreduce`` records it), and the accuracy of
@@ -1048,13 +1048,14 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     group = tp_group.device_group
     comm = tp_group.device_communicator
     qr = comm.qr_comm
-    built = qr is not None and qr._fly_policy is not None
+    fly = None if qr is None else qr._fly_ar
+    built = fly is not None
 
     probes = []
     try:
         if built:
             ran = []
-            for alg, eng in qr._fly_engines.items():
+            for alg, eng in fly.engines.items():
 
                 def allreduce(*args, _run=eng.allreduce, _alg=alg, **kw):
                     ran.append(_alg)
@@ -1065,8 +1066,8 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
             # below the smallest (expected to route to HIP or the fallback).
             sizes = set()
             lows = []
-            for alg in qr._fly_engines:
-                lo, hi = qr._fly_policy.window(alg, quantized=True).inclusive_range()
+            for alg in fly.engines:
+                lo, hi = fly.policy.window(alg, quantized=True).inclusive_range()
                 rlo = -(-lo // _ROW_BYTES) * _ROW_BYTES
                 rhi = min(hi, TOP_PAYLOAD_BYTES) // _ROW_BYTES * _ROW_BYTES
                 if rlo <= rhi:
@@ -1084,12 +1085,12 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
                 ran.clear()
                 out = comm.all_reduce(inp)
                 torch.cuda.synchronize()
-                alg = qr._fly_policy.select(nbytes, quantized=True)
+                alg = fly.policy.select(nbytes, quantized=True)
                 probes.append(
                     {
                         "nbytes": nbytes,
                         "algorithm": None if alg is None else alg.value,
-                        "expect_served": alg in qr._fly_engines,
+                        "expect_served": alg in fly.engines,
                         "served": bool(ran),
                         "ran": [a.value for a in ran],
                         "sqnr_db": _sqnr_db(out.float(), ref),
