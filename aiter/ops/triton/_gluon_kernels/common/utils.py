@@ -5,6 +5,7 @@ import math
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.language.core import PropagateNan
 from triton.language.extra.hip import libdevice
 
 from aiter.ops.triton._triton_kernels.rope.rope import _get_gptj_rotated_x
@@ -14,6 +15,18 @@ from aiter.ops.triton._triton_kernels.rope.rope import _get_gptj_rotated_x
 # only _reinterpret. Kernels call reinterpret; give older Tritons that name too.
 if not hasattr(gl.shared_memory_descriptor, "reinterpret"):
     gl.shared_memory_descriptor.reinterpret = gl.shared_memory_descriptor._reinterpret
+
+_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
+
+
+@gluon.jit
+def elementwise_max_prop_nan(a, b):
+    return gl.maximum(a, b, propagate_nan=_MAX_PROPAGATE_NAN_ALL)
+
+
+@gluon.jit
+def reduce_max_prop_nan(input, axis=None, keep_dims=False):
+    return gl.reduce(input, axis, elementwise_max_prop_nan, keep_dims=keep_dims)
 
 
 @gluon.jit

@@ -42,7 +42,13 @@ def _test_mha_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        head_dim=HEAD_SZ,
+        v_head_dim=HEAD_SZ,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     torch.manual_seed(20)
     torch.cuda.empty_cache()
@@ -173,11 +179,27 @@ def _fp8_assert_close(actual, expected, atol=1.0, cos_sim_threshold=0.94):
         ), f"Cosine similarity {cos_sim:.6f} < {cos_sim_threshold}"
 
 
+def _with_layout(x, layout):
+    """The bshd tensor x with the same values, stored in the given layout."""
+    if layout == "bshd":
+        return x
+    if layout == "bhsd":
+        return x.transpose(1, 2).contiguous().transpose(1, 2)
+    if layout == "strided_d":
+        wide = torch.empty(
+            x.shape[:-1] + (2 * x.shape[-1],), dtype=x.dtype, device=x.device
+        )
+        wide[..., ::2] = x
+        return wide[..., ::2]
+    raise ValueError(f"unknown layout {layout!r}")
+
+
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (512, 2048)])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize("LAYOUT", ["bshd", "bhsd", "strided_d"])
 def test_mha_fp8_gluon(
     BATCH: int,
     SEQLEN_Q: int,
@@ -186,6 +208,7 @@ def test_mha_fp8_gluon(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    LAYOUT: str,
     dtype=torch.bfloat16,
 ):
     skip_if_gluon_unsupported("gluon")
@@ -202,9 +225,9 @@ def test_mha_fp8_gluon(
     v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype)
 
     gluon_out = flash_attn_func(
-        q_fp8,
-        k_fp8,
-        v_fp8,
+        _with_layout(q_fp8, LAYOUT),
+        _with_layout(k_fp8, LAYOUT),
+        _with_layout(v_fp8, LAYOUT),
         causal=CAUSAL,
         backend="gluon",
         q_descale=q_descale,
@@ -466,7 +489,13 @@ def _test_mha_varlen_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        head_dim=HEAD_SZ,
+        v_head_dim=HEAD_SZ,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
