@@ -238,7 +238,7 @@ def build_radix_topk_one_block_body(
         # Input and output views
         input_row = fx.rocdl.make_buffer_tensor(
             fx.make_view(input_row_iter, fx.make_layout(_MAX_ROW_ELEMENTS, 1)),
-            num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
+            num_records_bytes=fx.Int64(row_len) * 4,
         )
         input_vector_tiles = fx.logical_divide(input_row, fx.make_layout(_VEC, 1))
         row_index_tiles = fx.logical_divide(
@@ -1309,7 +1309,7 @@ def build_radix_topk_one_block_body(
                                 fx.Vector.from_elements(index_values, dtype=fx.Int32)
                             )
                         else:
-                            fragment.store(fx.Vector.filled(_VEC, -1, fx.Int32))
+                            fragment.store(fx.full(_VEC, -1, fx.Int32))
                     fx.copy(
                         index_store_atom,
                         fragment,
@@ -1341,7 +1341,7 @@ def build_radix_topk_one_block_body(
                                 )
                             else:
                                 value_fragment.store(
-                                    fx.Vector.filled(_VEC, float("-inf"), fx.Float32)
+                                    fx.full(_VEC, float("-inf"), fx.Float32)
                                 )
                         fx.copy(
                             value_store_atom,

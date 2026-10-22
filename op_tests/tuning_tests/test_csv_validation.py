@@ -114,9 +114,10 @@ class TestCSVValidation(unittest.TestCase):
         self._check_no_duplicates("a8w8_blockscale_bpreshuffle", extra_keys=["libtype"])
 
     def test_a8w8_blockscale_mxscale_bpreshuffle_no_duplicates(self):
+        # One row per shape and block: kernelId names the backend (bmm or mxfp8
+        # on gfx950), not a second contract.
         self._check_no_duplicates(
-            "a8w8_blockscale_mxscale_bpreshuffle",
-            extra_keys=["w_scale_block", "kernelId", "libtype"],
+            "a8w8_blockscale_mxscale_bpreshuffle", extra_keys=["w_scale_block"]
         )
 
     def test_a4w4_blockscale_no_duplicates(self):

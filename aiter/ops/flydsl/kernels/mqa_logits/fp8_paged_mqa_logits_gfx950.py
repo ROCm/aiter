@@ -398,7 +398,7 @@ def _build_kernel():
                 _guarded(compute_pred, _compute)
 
                 helper_tid = tid - COMPUTE_WAVES * 64
-                next_page = page_i + fx.Int32(1)
+                next_page = page_i + 1
 
                 def _prefetch(
                     _bank_base=next_bank_base,
