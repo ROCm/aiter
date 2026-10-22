@@ -196,6 +196,9 @@ def compile_preshuffle_gemm(
     gpu_arch = get_rocm_arch()
     is_gfx942 = str(gpu_arch).startswith("gfx942")
     is_gfx950 = str(gpu_arch).startswith("gfx950")
+    if use_async_copy and is_gfx942:
+        # LLVM aborts the process on the 128b buffer_load_lds for gfx942
+        raise ValueError("use_async_copy is not supported on gfx942")
     use_mfma_scale_128 = is_fp8 and is_gfx950 and (tile_k % 128 == 0)
     use_mfma_k32 = is_f16_or_bf16 and is_gfx950
 
@@ -558,7 +561,12 @@ def compile_preshuffle_gemm(
                     pA_s2r_stages[a_stage][None, None, ki],
                     frag_A_retile[None, None, ki],
                 )
-                k_coord = ki if (use_mfma_scale_128 or use_mfma_k32) else (None, ki)
+                if const_expr(use_mfma_scale_128 or use_mfma_k32):
+                    k_coord = ki
+                elif const_expr(k_iters == 1):
+                    k_coord = None  # a size-1 rest mode is dropped from the fragment
+                else:
+                    k_coord = (None, ki)
                 fx.gemm(
                     tiled_mma,
                     frag_C,

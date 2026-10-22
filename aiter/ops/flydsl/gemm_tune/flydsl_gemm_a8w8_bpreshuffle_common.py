@@ -369,13 +369,15 @@ def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[in
     return [d for d in range(2, max_split + 1) if n_tiles % d == 0]
 
 
-def _build_kernels_list(tiles, total_vgpr=512, start_idx=0):
+def _build_kernels_list(
+    tiles, total_vgpr=512, start_idx=0, async_copy_vals=_ASYNC_COPY_VALS
+):
     kl = {}
     idx = start_idx
 
     for lds in _LDS_STAGES:
         for wpe in _WAVES_PER_EU:
-            for acp in _ASYNC_COPY_VALS:
+            for acp in async_copy_vals:
                 for xcd in _XCD_SWIZZLE_VALS:
                     for tm, tn, tk in tiles:
                         if wpe > 0 and wpe > _estimate_max_wpe(
@@ -389,7 +391,9 @@ def _build_kernels_list(tiles, total_vgpr=512, start_idx=0):
 
 kernels_list_942 = _build_kernels_list(
     _base_tiles_common + _base_tiles_942_extra,
-    total_vgpr=_vgpr_per_simd("gfx942"))
+    total_vgpr=_vgpr_per_simd("gfx942"),
+    async_copy_vals=(0,),  # the kernel rejects async copy on gfx942
+)
 kernels_list_950 = _build_kernels_list(
     _base_tiles_common + _base_tiles_950_extra,
     total_vgpr=_vgpr_per_simd("gfx950"))
