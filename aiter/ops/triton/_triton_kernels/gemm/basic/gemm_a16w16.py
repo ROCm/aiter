@@ -11,6 +11,9 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     get_gemm_config,
 )
 
+# torch.finfo(torch.float16).max; this module stays torch-free.
+_FP16_MAX = tl.constexpr(65504.0)
+
 _gemm_a16w16_repr = make_kernel_repr(
     "_gemm_a16_w16_kernel",
     [
@@ -164,13 +167,19 @@ def _gemm_a16_w16_kernel(
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
         if use_activation and NUM_KSPLIT == 1:
-            # Round to the 16-bit output type first, as an unfused GEMM does.
-            # The wrapper sets ROUND_BEFORE_ACT on gfx1151, where this made the
-            # GELU epilogues faster.
+            # The cast to the 16-bit output type keeps the accumulator in packed
+            # registers and removes the spills of the wide gfx1151 tiles.
+            # fp16 keeps the accumulator at or above -65504 first, because a
+            # cast of a lower value gives -inf, and gelu and silu make a NaN
+            # from -inf.
             if ROUND_BEFORE_ACT and (
                 c_ptr.type.element_ty == tl.float16
                 or c_ptr.type.element_ty == tl.bfloat16
             ):
+                if c_ptr.type.element_ty == tl.float16:
+                    accumulator = tl.where(
+                        accumulator < -_FP16_MAX, -_FP16_MAX, accumulator
+                    )
                 accumulator = accumulator.to(c_ptr.type.element_ty).to(tl.float32)
             accumulator = activation(accumulator)
 
