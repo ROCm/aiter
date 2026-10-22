@@ -48,18 +48,26 @@ def gen_hipb_mm_fake_tensor(
     scaleOut: torch.Tensor | None = None,
     bpreshuffle: bool | None = None,
     use_gelu: bool | None = None,
+    out: torch.Tensor | None = None,
     scaleA_mode: int | None = None,
     scaleB_mode: int | None = None,
 ):
-    mat1_sizes = mat1.size()
-    mat2_sizes = mat2.size()
-    in_dtype = mat1.dtype
-    out_dtype = out_dtype if out_dtype is not None else in_dtype
-    result = torch.empty(
-        (mat1_sizes[0], mat2_sizes[1]), dtype=out_dtype, device=mat1.device
+    return torch.empty(
+        (mat1.size(0), mat2.size(1)),
+        dtype=_hipb_mm_out_dtype(mat1, out_dtype, out),
+        device=mat1.device,
     )
 
-    return result
+
+def _hipb_mm_out_dtype(
+    mat1: torch.Tensor, out_dtype: torch.dtype | None, out: torch.Tensor | None
+) -> torch.dtype:
+    """The result dtype: ``out``'s when given, else ``out_dtype``, else the input's."""
+    if out is None:
+        return out_dtype if out_dtype is not None else mat1.dtype
+    if out_dtype is not None and out_dtype != out.dtype:
+        raise ValueError(f"hipb_mm: out_dtype={out_dtype} but out is {out.dtype}")
+    return out.dtype
 
 
 # torch-free kernel entry: writes into caller-allocated `result` (the de-torched C++
@@ -92,12 +100,16 @@ def hipb_mm(
     scaleOut: torch.Tensor | None = None,
     bpreshuffle: bool | None = None,
     use_gelu: bool | None = None,
+    out: torch.Tensor | None = None,
     scaleA_mode: int | None = None,
     scaleB_mode: int | None = None,
 ) -> torch.Tensor:
-    out_dtype = out_dtype if out_dtype is not None else mat1.dtype
-    result = torch.empty(
-        (mat1.size(0), mat2.size(1)), dtype=out_dtype, device=mat1.device
+    """``out``: the [M, N] tensor to write instead of allocating; returned."""
+    dtype = _hipb_mm_out_dtype(mat1, out_dtype, out)
+    result = (
+        torch.empty((mat1.size(0), mat2.size(1)), dtype=dtype, device=mat1.device)
+        if out is None
+        else out
     )
     _hipb_mm(
         mat1,
@@ -119,7 +131,7 @@ def hipb_mm(
 direct_register_custom_op(
     "hipb_mm",
     hipb_mm,
-    [],
+    ["out"],
     fake_impl=gen_hipb_mm_fake_tensor,
 )
 

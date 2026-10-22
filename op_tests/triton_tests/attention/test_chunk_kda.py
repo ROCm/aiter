@@ -237,14 +237,18 @@ def workspace_ref(inp, scale):
 
 @pytest.mark.parametrize(
     "seqlens",
-    [[64], [1], [63], [65], [300], [1, 64, 130, 7], [1000], [5, 0, 70]],
+    [[64], [1], [63], [65], [300], [1, 64, 130, 7], [1000], [4096], [5, 0, 70]],
 )
-def test_chunk_kda(seqlens):
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_chunk_kda(seqlens, state_dtype):
     H = 4
+    if state_dtype == torch.bfloat16 and ARCH != "gfx950":
+        pytest.skip("bf16 state requires gfx950")
     inp = make_inputs(seqlens, H)
-    h0 = torch.randn(len(seqlens), H, D, D, device=DEVICE)
+    h0 = torch.randn(len(seqlens), H, D, D, device=DEVICE).to(state_dtype)
     o_ref, s_ref = run_ref(inp, h0)
     o, s = run_kernel(inp, initial_state=h0, output_final_state=True)
+    assert s.dtype == state_dtype
     assert_close("o", o_ref, o)
     assert_close("final_state", s_ref, s)
 
@@ -262,18 +266,21 @@ def test_chunk_kda_workspace(seqlens):
 
 
 @pytest.mark.parametrize("padded", [False, True])
-def test_chunk_kda_paged(padded):
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_chunk_kda_paged(padded, state_dtype):
     """State cache in place, out aliasing v; ``padded`` gives a hybrid-page slot stride."""
     seqlens, H = [130, 1, 64, 257], 24
+    if state_dtype == torch.bfloat16 and ARCH != "gfx950":
+        pytest.skip("bf16 state requires gfx950")
     inp = make_inputs(seqlens, H, seed=1)
     N = len(seqlens)
     lead, tail = (3 * 2 * H * D, 1000) if padded else (0, 0)
     page = lead + H * D * D + tail
-    raw = torch.full((3 * N, page), POISON, device=DEVICE)
+    raw = torch.full((3 * N, page), POISON, device=DEVICE, dtype=state_dtype)
     cache = raw.as_strided((3 * N, H, D, D), (page, D * D, D, 1), storage_offset=lead)
     slots = torch.randperm(3 * N, device=DEVICE)[:N].int()
     has_init = torch.tensor([True, False, True, False], device=DEVICE)
-    cache[slots.long()] = torch.randn(N, H, D, D, device=DEVICE)
+    cache[slots.long()] = torch.randn(N, H, D, D, device=DEVICE, dtype=state_dtype)
     h0 = torch.where(has_init[:, None, None, None], cache[slots.long()], 0.0)
     o_ref, s_ref = run_ref(inp, h0)
     written = torch.zeros_like(raw, dtype=torch.bool)

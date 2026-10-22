@@ -238,7 +238,7 @@ def build_radix_topk_one_block_body(
         # Input and output views
         input_row = fx.rocdl.make_buffer_tensor(
             fx.make_view(input_row_iter, fx.make_layout(_MAX_ROW_ELEMENTS, 1)),
-            num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
+            num_records_bytes=fx.Int64(row_len) * 4,
         )
         input_vector_tiles = fx.logical_divide(input_row, fx.make_layout(_VEC, 1))
         row_index_tiles = fx.logical_divide(
@@ -1309,7 +1309,7 @@ def build_radix_topk_one_block_body(
                                 fx.Vector.from_elements(index_values, dtype=fx.Int32)
                             )
                         else:
-                            fragment.store(fx.Vector.filled(_VEC, -1, fx.Int32))
+                            fragment.store(fx.full(_VEC, -1, fx.Int32))
                     fx.copy(
                         index_store_atom,
                         fragment,
@@ -1341,7 +1341,7 @@ def build_radix_topk_one_block_body(
                                 )
                             else:
                                 value_fragment.store(
-                                    fx.Vector.filled(_VEC, float("-inf"), fx.Float32)
+                                    fx.full(_VEC, float("-inf"), fx.Float32)
                                 )
                         fx.copy(
                             value_store_atom,
@@ -1403,14 +1403,19 @@ def build_radix_topk_one_block_module(
     wave_size: int,
     arch: str = "",
     packed_rows: bool = False,
+    full_rows: bool = False,
 ):
     """Build a prefill/decode kernel specialized for the row-length bounds.
 
     packed_rows (decode only): row r is read from element row_starts[r] of
     the input's first row, while reported indices stay relative to that start.
 
+    full_rows (decode only): every row is `width` long and row_ends is not read.
+
     See build_radix_topk_one_block_body for the selector parameters.
     """
+    if full_rows and not is_decode:
+        raise ValueError("full_rows is a decode-mode build; prefill reads both ends")
     shared_storage, run_one_block_body = build_radix_topk_one_block_body(
         k,
         block_threads,
@@ -1428,6 +1433,7 @@ def build_radix_topk_one_block_module(
             f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
             f"_v{int(write_values)}_s{int(stable)}"
             f"{'_packed' if packed_rows else ''}"
+            f"{'_full' if full_rows else ''}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -1443,7 +1449,7 @@ def build_radix_topk_one_block_module(
         row = fx.Int32(fx.block_idx.x)
         if const_expr(is_decode):
             row_start = fx.Int32(0)
-            row_end = _row_length(row, row_ends, width, next_n)
+            row_end = _row_length(row, row_ends, width, next_n, full_rows)
         else:
             row_start = row_starts[row]
             row_end = row_ends[row]

@@ -64,15 +64,34 @@
                 "unsupported world_size " + std::to_string(ws)); \
     }
 
+// Allgather (and the sync-only kernels) only move data, so they scale past the
+// all-reduce limit; multi-node symm_mem groups reach 64 ranks.
+#define DISPATCH_AG_NGPUS_1250(ws, CALL) \
+    switch(ws) {                         \
+        case 2:  CALL(2);  break;        \
+        case 4:  CALL(4);  break;        \
+        case 6:  CALL(6);  break;        \
+        case 8:  CALL(8);  break;        \
+        case 16: CALL(16); break;        \
+        case 32: CALL(32); break;        \
+        case 64: CALL(64); break;        \
+        default:                         \
+            throw std::runtime_error(    \
+                "unsupported world_size " + std::to_string(ws)); \
+    }
+
 namespace aiter {
 
 // ---------------------------------------------------------------------------
 // Constants & data structures
 // ---------------------------------------------------------------------------
-constexpr int kMaxBlocks = 512;
-// Matches DISPATCH_NGPUS_1250. Sizes Signal/RankData/RankSignals; the last two
-// are passed by value on every launch, so widening this costs all world sizes.
-constexpr int kMaxNgpus = 8;
+constexpr int kMaxBlocks  = 512;
+// kMaxNgpusAr matches DISPATCH_NGPUS_1250, kMaxNgpusAg DISPATCH_AG_NGPUS_1250.
+// kMaxNgpus sizes Signal/RankData/RankSignals; the last two are passed by value
+// on every launch, so widening it costs all world sizes.
+constexpr int kMaxNgpusAr = 8;
+constexpr int kMaxNgpusAg = 64;
+constexpr int kMaxNgpus   = kMaxNgpusAg;
 
 struct Signal
 {
@@ -91,15 +110,18 @@ struct __align__(16) RankSignals
     Signal* signals[kMaxNgpus];
 };
 
-// Construction-time counterpart to DISPATCH_NGPUS_1250, so an unsupported
+// Construction-time counterpart to DISPATCH_AG_NGPUS_1250, so an unsupported
 // world size fails at init instead of from a dispatch default arm on the first
 // collective. init_custom_ar* are public bindings called directly downstream.
+// World sizes above kMaxNgpusAr are allgather-only.
 inline void check_ngpus(int world_size)
 {
-    if(world_size < 2 || world_size > kMaxNgpus || world_size % 2 != 0)
+    bool ok = (world_size >= 2 && world_size <= kMaxNgpusAr && world_size % 2 == 0) ||
+              world_size == 16 || world_size == 32 || world_size == 64;
+    if(!ok)
         throw std::invalid_argument(
             "gfx1250 custom allreduce: unsupported world size " +
-            std::to_string(world_size) + " (supported: 2, 4, 6, 8)");
+            std::to_string(world_size) + " (supported: 2, 4, 6, 8, 16, 32, 64)");
 }
 
 // ---------------------------------------------------------------------------
@@ -132,7 +154,7 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 // shared Signal meta buffer (offset kLLScratchOffset), so no extra cross-rank
 // exchange is needed — peer scratch base = (char*)sg_.signals[i] + off.
 
-constexpr int    kLLMaxRanks       = kMaxNgpus;
+constexpr int    kLLMaxRanks       = kMaxNgpusAr;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
 constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
 // Hard per-message payload cap (one slot). Comfortably above the routing
@@ -605,44 +627,6 @@ __global__ void __launch_bounds__(512, 1) ag_gfx1250_lastdim(RankData* _dp,
           int write_idx = (ngpus * y + rank_idx) * last_dim_size + x;
           *(reinterpret_cast<P*>(result) + write_idx) = ptrs[rank_idx][read_idx];
         }
-      }
-    }
-    end_sync<ngpus, true>(sg, self_sg, rank);
-}
-
-
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(256, 2) ag_gfx1250_warpsplit_unroll4(
-    RankData* _input_dp,
-    RankSignals sg,
-    Signal* self_sg,
-    T* __restrict__ result,
-    int rank,
-    int size)
-{
-    constexpr int pack_size = 16 / sizeof(T);
-    constexpr int unroll    = 4;
-    constexpr int tnum_gpu = 256 / ngpus;
-    static_assert(256 % ngpus == 0, "tail threads would index ptrs[ngpus]");
-    using P                 = typename opus::vector_t<T, pack_size>;
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
-    int index    = blockIdx.x * tnum_gpu * unroll + lane_id;
-    int stride  = blockDim.x * tnum_gpu * unroll;
-    const P* ptrs[ngpus];
-#pragma unroll
-    for(int i = 0; i < ngpus; i++)
-    {
-        ptrs[i] = (const P*)_input_dp->ptrs[i];
-    }
-    start_sync<ngpus>(sg, self_sg, rank);
-    for (int idx = index; idx + tnum_gpu * (unroll - 1) < size; idx += stride)
-    {
-#pragma unroll
-      for (int i = 0; i < unroll; ++i)
-      {
-        P* rslt_addr = reinterpret_cast<P*>(result) + warp_id * size + idx + tnum_gpu * i;
-        *rslt_addr = ptrs[warp_id][idx + i * tnum_gpu];
       }
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
@@ -1301,7 +1285,7 @@ public:
 #define LAUNCH_AG_SCALAR(NG) \
         ag_gfx1250_scalar<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_SCALAR);
+        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_SCALAR);
 #undef LAUNCH_AG_SCALAR
     }
 
@@ -1325,7 +1309,7 @@ public:
 #define LAUNCH_AG_VEC(NG) \
         ag_gfx1250_naive_vec<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_VEC);
+        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_VEC);
 #undef LAUNCH_AG_VEC
     }
 
@@ -1349,32 +1333,8 @@ public:
 #define LAUNCH_AG_NAIVE(NG) \
         ag_gfx1250_naive_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_NAIVE);
+        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_NAIVE);
 #undef LAUNCH_AG_NAIVE
-    }
-
-    template <typename T>
-    void allgather_warpsplit(hipStream_t stream,
-                             T* input,
-                             T* output,
-                             int size)
-    {
-        auto d = 16 / sizeof(T);
-        if(size % d != 0)
-            throw std::runtime_error(
-                "allgather requires input length to be multiple of " + std::to_string(d));
-
-        RankData* input_ptrs = get_buffer_RD(stream, input);
-        size /= d;
-
-        constexpr int threads = 256;
-        int blocks = std::min(kMaxBlocks,
-                              (size + threads * 4 - 1) / (threads * 4));
-#define LAUNCH_AG_WARP(NG) \
-        ag_gfx1250_warpsplit_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
-            input_ptrs, sg_, self_sg_, output, rank_, size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_WARP);
-#undef LAUNCH_AG_WARP
     }
 
     template <typename T>
@@ -1400,7 +1360,7 @@ public:
 #define LAUNCH_AG_LAST(NG) \
         ag_gfx1250_lastdim<T, NG><<<blocks, threads, 0, stream>>>( \
             input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size)
-        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LAST);
+        DISPATCH_AG_NGPUS_1250(world_size_, LAUNCH_AG_LAST);
 #undef LAUNCH_AG_LAST
     }
 
