@@ -5,7 +5,7 @@ import torch
 import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
@@ -21,6 +21,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.gemm_config_utils import (
+    clamp_num_buffers,
     compute_splitk_params,
     get_gemm_config,
 )
@@ -189,9 +190,9 @@ def gemm_a16w16_(
 
             w = w.T
 
-            # Clamp the pipeline depth (per-partition k tiles)
+            # Clamp the pipeline depth to the K tiles of a split; at least 2 buffers
             num_k_tiles = triton.cdiv(SPLITK_BLOCK_SIZE, BLOCK_K)
-            NUM_BUFFERS = max(2, min(NUM_BUFFERS, num_k_tiles + 1))
+            NUM_BUFFERS = max(2, clamp_num_buffers(NUM_BUFFERS, num_k_tiles))
 
             if y is None:
                 y = torch.empty((M, N), dtype=dtype, device=x.device)

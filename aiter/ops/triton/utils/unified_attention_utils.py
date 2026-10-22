@@ -12,6 +12,7 @@ only the axes that matter, joined by '.':
       "attn_2d": {
         "D_LEQ_128.Q_LEQ_1.SW": {...},   # head_size <= 128, decode, sliding window
         "D_LEQ_128.Q_LEQ_1":    {...},   # head_size <= 128, decode
+        "D_EQ_192":             {...},   # head_size == 192 and nothing else
         "D_GEQ_512":            {...},   # head_size >= 512, any query length
         "DT_fp8_fp8":           {...},   # fp8 query and KV cache
         "any":                  {...}
@@ -21,8 +22,9 @@ only the axes that matter, joined by '.':
     }
 
 Lookup walks the axes in the order "schema" lists them and takes the first key
-that exists: LEQ bounds ascending, then GEQ descending, then "any". So the
-leftmost axis wins: D before Q is what makes head_size outrank max_seqlen_q.
+that exists: an exact EQ first, then LEQ bounds ascending, then GEQ
+descending, then "any". So the leftmost axis wins: D before Q is what makes
+head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 
 A section with no axes, like reduce above, is just a config.
@@ -54,7 +56,6 @@ _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
 _ARCH_ALIAS = {
     "gfx1101": "gfx1100",
     "gfx1102": "gfx1100",
-    "gfx1150": "gfx1151",
 }
 
 _SEP = "."
@@ -121,12 +122,14 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
         q, kv = value
         return [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
 
+    eq = sorted(c for c in parts if c.startswith(f"{axis}_EQ_"))
     leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound)
     geq = sorted(
         (c for c in parts if c.startswith(f"{axis}_GEQ_")), key=_bound, reverse=True
     )
     return (
-        [c for c in leq if value <= _bound(c)]
+        [c for c in eq if value == _bound(c)]
+        + [c for c in leq if value <= _bound(c)]
         + [c for c in geq if value >= _bound(c)]
         + ["any"]
     )
@@ -307,7 +310,8 @@ def get_unified_attention_config(
     """
     config = _get_unified_attention_config_cached(
         op,
-        params.head_size,
+        # no asymmetric-head configs yet, pick by the wider of the two heads
+        max(params.head_size, params.head_size_v),
         params.max_seqlen_q,
         params.max_seqlen_k,
         params.sliding_window,
@@ -327,7 +331,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
     """Report which entry a lookup lands on, and the config it yields."""
     table, axes, cfg_dir = _load(op, backend, arch)
     values = _axis_values(
-        params.head_size,
+        max(params.head_size, params.head_size_v),
         params.max_seqlen_q,
         params.max_seqlen_k,
         params.sliding_window,

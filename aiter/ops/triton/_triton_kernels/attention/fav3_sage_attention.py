@@ -215,6 +215,10 @@ def _sage_fwd_no_mask(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
+        # P is in [0, 1]. FNUZ's maximum is 240, so 128 is the largest
+        # safe power-of-two scale. Undo it in the output normalization.
+        if v.type.element_ty == tl.float8e4b8:
+            p = p * 128.0
         acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
 
     return acc, l_i, m_i
@@ -389,6 +393,8 @@ def _sage_fwd_blocksparse_nomask(
                 v = tl.load(v_ptrs)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
+        if v.type.element_ty == tl.float8e4b8:
+            p = p * 128.0
         acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
     return acc, l_i, m_i
 
@@ -565,6 +571,8 @@ def _sage_fwd_blocksparse_mask(
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
+        if v.type.element_ty == tl.float8e4b8:
+            p = p * 128.0
         acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
     return acc, l_i, m_i
 
@@ -925,6 +933,8 @@ def _sage_fwd_mask(
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
+        if v.type.element_ty == tl.float8e4b8:
+            p = p * 128.0
         acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
 
     return acc, l_i, m_i
@@ -1845,6 +1855,9 @@ def sage_fwd(
     l_i_safe = tl.where(invalid_mask, 1.0, l_i)
     l_i_safe = tl.maximum(l_i_safe, 1e-7)
     l_recip = 1 / l_i_safe[:, None]
+    # Undo the probability scaling without changing the softmax denominator.
+    if V.type.element_ty == tl.float8e4b8:
+        l_recip = l_recip * (1.0 / 128.0)
 
     v_descale = tl.load(
         v_descale_ptr,
