@@ -127,7 +127,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
     MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK,
 )
-from aiter.ops.gemm_op_common import find_padded_m_row
+from aiter.ops.gemm_op_common import find_padded_m_row, padded_m_py
 from aiter_worker_limits import adopt_legacy_max_jobs
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -248,11 +248,14 @@ def _decode_served_ms(row_keys, gfx, cu_num, m, n, k):
 
     Mirrors get_GEMM_config (aiter/ops/gemm_op_a4w4.py): try M itself, then M
     padded at getPaddedM granularity 0 and 1, first present row wins. The
-    padding comes from the same compiled helper the runtime calls."""
+    padding comes from the pure-Python mirror of getPaddedM, so the wheel
+    build needs no GPU."""
     served = []
     for actual in range(1, DECODE_MAX_M + 1):
+        # Pure-Python getPaddedM: the wheel build runs without a GPU, and the
+        # compiled get_padded_m is a CUDA custom op (torch_compile_guard allocates).
         hit, padded = find_padded_m_row(
-            row_keys, lambda pm: (gfx, cu_num, pm, n, k), actual, n, k
+            row_keys, lambda pm: (gfx, cu_num, pm, n, k), actual, n, k, pad=padded_m_py
         )
         if hit is not None and padded == m:
             served.append(actual)

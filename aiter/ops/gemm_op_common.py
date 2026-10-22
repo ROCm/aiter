@@ -10,13 +10,39 @@ from ..jit.core import compile_ops
 def get_padded_m(M: int, N: int, K: int, gl: int) -> int: ...
 
 
-def find_padded_m_row(tuned: dict, key, m: int, n: int, k: int):
+def padded_m_py(M: int, N: int, K: int, gl: int) -> int:
+    """Mirrors getPaddedM in csrc/py_itfs_cu/gemm_common.cu for GPU-free callers
+    (AOT wheel build); keep in sync, parity is checked by
+    op_tests/tuning_tests/test_padded_m_parity.py. Valid for M >= 0."""
+
+    def next_pow2(num: int) -> int:
+        return 1 if num <= 1 else 1 << (num - 1).bit_length()
+
+    if gl == 0:
+        # below one 16-row step the next power of two is the finer bucket
+        if 0 < M < 16:
+            return next_pow2(M)
+        if M <= 256:
+            return (M + 15) // 16 * 16
+        if M <= 1024:
+            return (M + 31) // 32 * 32
+        if M <= 4096:
+            return (M + 63) // 64 * 64
+        return (M + 127) // 128 * 128
+    if gl == 1:
+        return 8192 if M > 8192 and N > 4096 else next_pow2(M)
+    return M
+
+
+def find_padded_m_row(tuned: dict, key, m: int, n: int, k: int, pad=None):
     """(row, M it was tuned at): the row for M itself, else for M padded at the
     two getPaddedM granularities, the walk the CK / asm lookups make. ``key``
-    maps an M to the table key; row is None when no level hits."""
+    maps an M to the table key; row is None when no level hits. ``pad`` replaces
+    get_padded_m for callers without a GPU (see padded_m_py)."""
+    pad = pad or get_padded_m
     padded_m = m
     for gl in (None, 0, 1):
-        padded_m = m if gl is None else get_padded_m(m, n, k, gl)
+        padded_m = m if gl is None else pad(m, n, k, gl)
         row = tuned.get(key(padded_m))
         if row is not None:
             return row, padded_m
