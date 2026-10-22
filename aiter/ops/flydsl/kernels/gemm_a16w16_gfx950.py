@@ -14,7 +14,7 @@ from flydsl.runtime.device import get_rocm_arch
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx950_utils import (
-    GFX950_BUFFER_MAX_BYTES,
+    GFX950_BUFFER_MAX_ELEMENTS,
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
     SPLIT_K_SEMAPHORE_MAX_LEN,
@@ -1384,12 +1384,9 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     if result.b_is_transposed and k % async_load_vec_size != 0:
         return None
     # A and B are loaded through buffer resources. C goes through one only for
-    # split-K's atomics, which the semaphore length already caps far below 2 GiB;
+    # split-K's atomics, which the semaphore length already caps far below that;
     # the plain epilogue stores C through a pointer with int64 offsets.
-    if (
-        m * k * result.in_data_bytes >= GFX950_BUFFER_MAX_BYTES
-        or n * k * result.in_data_bytes >= GFX950_BUFFER_MAX_BYTES
-    ):
+    if m * k >= GFX950_BUFFER_MAX_ELEMENTS or n * k >= GFX950_BUFFER_MAX_ELEMENTS:
         return None
     num_pid_m = (m + result.block_m - 1) // result.block_m
     num_pid_n = (n + result.block_n - 1) // result.block_n
