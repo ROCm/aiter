@@ -30,17 +30,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from op_tests.test_flydsl_gdr_decode import kda_gate, l2norm, naive_recurrent_kda
+from op_tests.test_flydsl_linear_attention import Args, ref_func
 
-# K3 @ TP8: 12 heads 1:1, 128-wide, bf16 activations over an f32 paged state.
+# 12 key and value heads, 128 wide, bf16 activations over an f32 paged state.
 H, K, V = 12, 128, 128
 DTYPE = torch.bfloat16
 STATE_DTYPE = torch.float32
-G_MIN = -5.0
 BATCHES = (1, 4, 64, 256)
 
-# Wider than the original space (NUM_BLOCKS_PER_V_DIM<=8, NUM_WARPS<=4, sized for
-# GQA's 32-64 value heads). K3 has 12, so only splitting V harder fills the grid.
+# Wider than the GQA tuning space (NUM_BLOCKS_PER_V_DIM<=8, NUM_WARPS<=4, sized
+# for 32-64 value heads). With 12 value heads only a harder V split fills the grid.
 NUM_BLOCKS_PER_V_DIM_CHOICES = (1, 2, 4, 8, 16, 32, 64)
 NUM_WARPS_CHOICES = (1, 2, 4, 8, 16)
 WARP_THREADS_K_CHOICES = (1, 2, 4, 8, 16, 32)
@@ -78,8 +77,8 @@ def valid_configs():
     return out
 
 
-def main_tiling(B):
-    """The config current main chooses when there is no KDA-tuned row."""
+def untuned_tiling(B):
+    """The `_decode_tiling` config, which the wrapper uses when the table has no row."""
     config = _decode_tiling(B, H, K, V, str(STATE_DTYPE))
     return (
         config["NUM_BLOCKS_PER_V_DIM"],
@@ -110,12 +109,8 @@ def make_inputs(B, device="cuda", seed=0):
         "v": v,
         "a": torch.randn(B, 1, H, K, dtype=DTYPE, device=device),
         "b": torch.randn(B, 1, H, dtype=DTYPE, device=device),
-        "A_log": (
-            torch.randn(H, dtype=torch.float32, device=device) * 0.5
-        ).contiguous(),
-        "dt_bias": (
-            torch.randn(H, K, dtype=torch.float32, device=device) * 0.1
-        ).contiguous(),
+        "A_log": torch.randn(H, dtype=torch.float32, device=device) * 0.5,
+        "dt_bias": torch.randn(H, K, dtype=torch.float32, device=device) * 0.1,
         "pool": pool,
         "indices": indices,
         "B": B,
@@ -185,17 +180,31 @@ def torch_reference(inp, pool_before):
     """``pool_before`` must be the state from *before* the kernel ran: both
     kernels decay the pool in place, so ``inp["pool"]`` would feed the reference
     already-decayed state and compare two different problems."""
-    initial_state = pool_before[inp["indices"].long()].clone().transpose(-1, -2)
-    return naive_recurrent_kda(
-        l2norm(inp["q"]),
-        l2norm(inp["k"]),
-        inp["v"],
-        kda_gate(inp["a"], inp["A_log"], inp["dt_bias"], g_min=G_MIN),
-        inp["b"].float().sigmoid(),
-        scale=K**-0.5,
-        initial_state=initial_state,
-        output_final_state=True,
+    args = Args(
+        dtype=DTYPE,
+        b=inp["B"],
+        sq=1,
+        num_k_heads=H,
+        num_v_heads=H,
+        head_k_dim=K,
+        head_v_dim=V,
     )
+    state = pool_before.transpose(-1, -2).clone()
+    out = torch.zeros(inp["B"], 1, H, V, dtype=DTYPE, device=state.device)
+    ref_func(
+        args,
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["a"],
+        inp["b"],
+        inp["dt_bias"],
+        inp["A_log"],
+        inp["indices"],
+        state,
+        out,
+    )
+    return out, state[inp["indices"].long()]
 
 
 def rmse_ratio(ref, got):
@@ -231,7 +240,7 @@ def confirm(B, candidates):
     gfx942 and gfx950.
     """
     print(f"    re-timing the top {len(candidates)} over {TRIALS} trials:")
-    baseline_config = main_tiling(B)
+    baseline_config = untuned_tiling(B)
     rows = []
     for cfg in dict.fromkeys((*candidates, baseline_config)):
         times, err = [], math.nan

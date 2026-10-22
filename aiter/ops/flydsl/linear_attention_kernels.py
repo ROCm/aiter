@@ -87,10 +87,11 @@ _DECODE_WARP_SHAPE = {
 
 # Measured (NUM_BLOCKS_PER_V_DIM, NUM_WARPS, WARP_THREADS_K) per batch size, for
 # the single shape `_kda_tiling` accepts: 12 key and value heads, 128 wide, bf16
-# activations over an f32 state. A row splits the value dimension to fill one
-# part's CUs, and the arch does not fix those: MI308X and MI300X are both gfx942,
-# at 80 CUs and 304. An unlisted part falls through to `_decode_tiling`; so sweep
-# it and add its own row.
+# activations over an f32 state. Only these exact batch sizes are tuned; every
+# other batch size uses `_decode_tiling`. A row splits the value dimension to
+# fill one part's CUs, and the arch does not fix those: MI308X and MI300X are
+# both gfx942, at 80 CUs and 304. An unlisted part falls through to
+# `_decode_tiling`; so sweep it and add its own row.
 _KDA_DECODE_BY_PART = {
     # MI300X
     ("gfx942", 304): {1: (8, 4, 32), 4: (32, 1, 32), 64: (8, 1, 16), 256: (2, 4, 32)},
@@ -165,7 +166,8 @@ def _kda_tiling(
     head_k_dim,
     head_v_dim,
 ):
-    """The measured K3 tiling, or None so the caller can use `_decode_tiling`.
+    """The measured tiling for 12 key/value heads, 128 wide, bf16 over an f32
+    state, or None so the caller can use `_decode_tiling`.
 
     Callers run this inside ``torch.cuda.device(...)``, so ``get_num_sms()``
     reads the launch device.
@@ -202,10 +204,10 @@ def get_default_kwargs(
     head_v_dim,
     gate_mode="gdr",
 ):
-    """The KDA-tuned config for this launch, else the tiling rule.
+    """The decode tiling for this launch.
 
-    Main's scalar GDR path uses ``_decode_tiling``. KDA uses
-    ``_kda_tiling`` for the measured K3 shapes, else the same heuristic.
+    KDA uses the measured table when it has a row for this launch, and
+    otherwise ``_decode_tiling``, as every GDR launch does.
     """
     if gate_mode == "kda":
         config = _kda_tiling(
@@ -504,12 +506,12 @@ def flydsl_gdr_decode(
                 f"query {qk} and value {v}; got {tuple(tensor.shape)}."
             )
 
-    if gate_mode == "kda":
-        # `a` keeps its strides and is vector-loaded along D_k, so that axis
-        # must be dense. dt_bias is copied contiguous below, so it is free.
-        assert (
-            a.stride(-1) == 1
-        ), f"`a` must be dense along D_k, got stride {a.stride(-1)}"
+    if gate_mode == "kda" and a.stride(-1) != 1:
+        # dt_bias is copied contiguous below, so only `a` needs this.
+        raise ValueError(
+            "`a` must have a contiguous last dimension for vectorized loads; "
+            f"got stride {a.stride()}."
+        )
 
     # Staging copies share `stream` with the launch, so it is ordered against
     # them. Inputs produced elsewhere are the caller's to order.
