@@ -26,6 +26,8 @@ from aiter.fused_moe import (
     get_2stage_cfgs,
     get_padded_M,
     resolve_activation_dtype,
+    swiglu,
+    torch_moe_act,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -114,6 +116,7 @@ def test_fmoe(
     disable_stage2_bias=False,
     ref_dtype="bf16",
     gate_up_layout: bool | None = None,
+    expected_kernel1: str | None = None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -376,6 +379,53 @@ def test_fmoe(
 
     # # ######################## stage 1 start ###########
     stage1_ref_dtype = dtype
+    # a16w4 Swiglu tuned onto an asm FLAT 1-stage kernel (SwiGLU OAI, gfx950):
+    # the kernel quantizes X and the fp32 SwiGLU output to MXFP4 in-kernel, so
+    # the reference must quantize both too.
+    asm_flat_mxfp4 = False
+    if (
+        actType == aiter.ActivationType.Swiglu
+        and (qType, AQDType, WQDType) == _PER1X32_BF16_FP4
+        and GateMode(gateMode) == GateMode.SEPARATED
+        and _runtime_swiglu_mxfp4_q_dtype_a(
+            token, actType, gateMode, qType, AQDType, WQDType
+        )
+        == dtypes.bf16
+    ):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            dtypes.bf16,
+            WQDType,
+            qType,
+            use_g1u1,
+            actType,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            getattr(w1_qt_aiter, "is_shuffled", False)
+            or getattr(w2_qt_aiter, "is_shuffled", False),
+            gateMode,
+            has_stage1_bias=exp_bias1_aiter is not None,
+            has_stage2_bias=exp_bias2_aiter is not None,
+            swiglu_limit=swiglu_limit,
+            opus_weights_shuffled=getattr(w1_qt_aiter, "is_shuffled", False)
+            and getattr(w2_qt_aiter, "is_shuffled", False),
+            gate_up_interleave=getattr(w1_qt_aiter, "gate_up_interleave", None),
+        )
+        asm_flat_mxfp4 = bool(metadata.run_1stage and metadata.flat)
+        if asm_flat_mxfp4:
+            a1_qt, a1_scale = torch_quant(input, quant_dtype=dtypes.fp4x2)
+            stage1_ref_dtype = dtypes.fp32
+        if expected_kernel1 is not None:
+            got = metadata.stage1.keywords.get("kernelName") if asm_flat_mxfp4 else None
+            assert (
+                got == expected_kernel1
+            ), f"{token=}: expected {expected_kernel1}, dispatched {got or 'non-asm'}"
     if (
         actType == aiter.ActivationType.Swiglu
         and qType == aiter.QuantType.per_1x32
@@ -441,6 +491,8 @@ def test_fmoe(
             out1_ref.view(token, -1, 128), quant_dtype=AQDType
         )
         a2_scale = a2_scale.view(token, topk, -1)
+    elif asm_flat_mxfp4:
+        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=dtypes.fp4x2)
     elif (
         qType == aiter.QuantType.per_1x32
         and reference_aq_dtype == dtypes.fp8
@@ -562,6 +614,11 @@ def test_fmoe(
         out2_ref,
         out2_ck,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        # MXFP4 intermediates quantized from fp32 sums accumulated in another
+        # order land one fp4 step apart near rounding boundaries; that moves
+        # 10-35% of outputs by > 0.01 with the result unchanged (logits_diff
+        # ~1e-4). Accuracy for that path is gated on logits_diff below.
+        tol_err_ratio=1.0 if asm_flat_mxfp4 else 0.05,
     )
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -580,6 +637,10 @@ def test_fmoe(
         assert not (
             err != 0 and logits_diff > 0.01
         ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+        # asm FLAT SwiGLU OAI measures ~3e-5..1e-4; a wrong activation is >= 1e-2.
+        assert (
+            not asm_flat_mxfp4 or logits_diff < 2e-3
+        ), f"accuracy check failed (asm FLAT MXFP4): logits_diff={logits_diff}"
     elif has_nan:
         logger.warning("accuracy check failed (non-strict): output contains NaN")
     elif err != 0 and logits_diff > 0.01:
@@ -867,7 +928,7 @@ def _row_to_kwargs(row):
 
 
 def _iter_csv_cases():
-    """Yield FlyDSL/Opus cases from every selected model CSV."""
+    """Yield FlyDSL/Opus and SwiGLU OAI asm FLAT cases from every selected model CSV."""
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     df_csv = pd.read_csv(merged_csv)
@@ -878,10 +939,12 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
+        is_swiglu_oai_asm = _SWIGLU_OAI_ASM_TAG in kernel_name1
         if (
             "flydsl_" not in kernel_name1
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
+            and not is_swiglu_oai_asm
         ):
             continue
         if args.csv_filter:
@@ -946,6 +1009,13 @@ def _iter_csv_cases():
             args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
         )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
+        if is_swiglu_oai_asm:
+            # The asm FLAT kernels take no per-expert bias; with one, fused_moe
+            # discards the row. Run bias-free and require the row's kernel.
+            kwargs["disable_stage1_bias"] = True
+            kwargs["disable_stage2_bias"] = True
+            kwargs["check_aot_cache"] = False
+            kwargs["expected_kernel1"] = kernel_name1
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
@@ -956,6 +1026,13 @@ _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
 _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
+
+# gfx950 SwiGLU OAI MXFP4 FLAT 1-stage asm kernels (hsa/gfx950/fmoe/swiglu_oai).
+_SWIGLU_OAI_ASM_TAG = "swiglu_oai"
+_SWIGLU_OAI_16X32 = "_ZN5aiter53fmoe_bf16_pertokenMXfp4_g1u1_flat_vs_swiglu_oai_16x32E"
+_SWIGLU_OAI_16X128 = (
+    "_ZN5aiter56fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_swiglu_oai_16x128E"
+)
 
 # SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8 activation
 # (a4w4 fp4 act, a8w4 fp8 act). Any other quant would silently fall off the
@@ -1702,6 +1779,75 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
     )
 
 
+def test_swiglu_oai_flat_dispatch():
+    """MiniMax-M3 TP4 a16w4 decode (6144/768/129/top-5): tokens 1/2/4 -> asm
+    16x32, 8 -> asm 16x128 (SwiGLU OAI FLAT), 16 -> FlyDSL 2-stage. The asm
+    kernels hard-code alpha=1.702 / limit=7.0, take no bias and read GGUU
+    weights, so calls they cannot honour must fall back. Accuracy of these rows
+    runs through the tuned-CSV cases (test_fmoe, MXFP4-quantized reference)."""
+    # torch_moe reference helpers: OAI SwiGLU, not silu(gate) * up.
+    from aiter import fused_moe_dp_shared_expert as dp_moe
+
+    x = torch.randn((8, 128), device="cpu") * 4
+    gate, up = x.split([64, 64], dim=-1)
+    for act_fn in (torch_moe_act, dp_moe.torch_moe_act):
+        out = act_fn(x, None, 64, activation=aiter.ActivationType.Swiglu)
+        torch.testing.assert_close(out, swiglu(gate, up))
+
+    if get_gfx() != "gfx950" or get_cu_num() != 256:
+        aiter.logger.info(
+            "skip SwiGLU OAI FLAT dispatch test on %s/%d CUs", get_gfx(), get_cu_num()
+        )
+        return
+    expected = {
+        1: _SWIGLU_OAI_16X32,
+        2: _SWIGLU_OAI_16X32,
+        4: _SWIGLU_OAI_16X32,
+        8: _SWIGLU_OAI_16X128,
+        16: None,
+    }
+
+    def dispatched_kernel(token, gate_mode=GateMode.SEPARATED.value, **kw):
+        kw = {"gate_up_interleave": False, **kw}
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            6144,
+            768,
+            129,
+            5,
+            torch.bfloat16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Swiglu,
+            False,
+            0,
+            0,
+            True,
+            gate_mode,
+            opus_weights_shuffled=True,
+            **kw,
+        )
+        if not (metadata.run_1stage and metadata.flat):
+            return None
+        return metadata.stage1.keywords.get("kernelName")
+
+    for token, kernel in expected.items():
+        got = dispatched_kernel(token)
+        assert got == kernel, f"{token=}: expected {kernel}, dispatched {got}"
+    for fallback in (
+        {"has_stage1_bias": True},
+        {"has_stage2_bias": True},
+        {"swiglu_limit": 5.0},
+        {"gate_mode": GateMode.INTERLEAVE.value},
+        {"gate_up_interleave": True},
+    ):
+        got = dispatched_kernel(1, **fallback)
+        assert got is None, f"{fallback}: asm row must be discarded, got {got}"
+    aiter.logger.info("moe_2stage: SwiGLU OAI FLAT dispatch regression test passed")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1721,6 +1867,7 @@ else:
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
+    test_swiglu_oai_flat_dispatch()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
