@@ -122,6 +122,7 @@ def _build_mesh(
     hidden=None,
     h_pad=None,
     mxfp4=False,
+    latency=False,
 ):
     if rs_codec != ag_codec:
         raise ValueError(
@@ -140,6 +141,7 @@ def _build_mesh(
         hidden=hidden,
         h_pad=h_pad,
         mxfp4=mxfp4,
+        latency=latency,
     )
 
 
@@ -627,6 +629,12 @@ class FlyQuickAllReduceRMSNorm:
     #: same block count.
     WGS_PER_CU = 1
 
+    #: The low-latency build trades that margin for parallelism: it is compiled
+    #: for two resident workgroups per CU (``_compile_hints``), which the same
+    #: argument covers -- HIP fails the launch if they do not fit -- so its grid
+    #: may reach twice the CU count.
+    LATENCY_WGS_PER_CU = 2
+
     def __init__(
         self,
         *,
@@ -647,6 +655,7 @@ class FlyQuickAllReduceRMSNorm:
         atoms_per_row: int | None = None,
         hiddens: tuple[int, ...] = (),
         link: str | None = None,
+        latency: bool | None = None,
     ):
         check_world_size(world_size)
         link = resolve_link(link)
@@ -725,11 +734,21 @@ class FlyQuickAllReduceRMSNorm:
             for name, value in (("super_tile", super_tile), ("grid_cap", grid_cap))
             if value is not None
         }
-        # hidden -> (that width's ladder, its grid cap per super-tile).
-        self._ladders: dict[int, tuple[tuple, dict[int, int]]] = {}
+        # ``latency`` pins the low-latency build (True) or the occupancy-pinned
+        # one (False) on every rung; None keeps the ladder's own choice.
+        if latency is not None:
+            if latency and (algorithm != "mesh" or super_tile not in (None, 1)):
+                raise ValueError(
+                    "the low-latency build is a mesh build with super_tile=1"
+                )
+            self._pins["latency"] = bool(latency)
+            if latency:
+                self._pins["super_tile"] = 1
+        # hidden -> (that width's ladder, its grid cap per (super-tile, latency)).
+        self._ladders: dict[int, tuple[tuple, dict[tuple[int, bool], int]]] = {}
 
-        # (hidden, super_tile, mxfp4) -> (engine, spec). The MXFP4 builds are
-        # separate engines, made on first use.
+        # (hidden, super_tile, mxfp4, latency) -> (engine, spec). The MXFP4 and
+        # low-latency builds are separate engines, made on first use.
         self._by_cfg: dict[tuple, tuple] = {}
         try:
             for h in sorted({int(x) for x in hiddens}):
@@ -835,7 +854,9 @@ class FlyQuickAllReduceRMSNorm:
         """``h_pad`` this width runs at, or hidden dim when it needs no padding."""
         return self._geom_for(int(hidden))[2]
 
-    def _grid_for(self, super_tile: int, rung_cap: int, block: int) -> int:
+    def _grid_for(
+        self, super_tile: int, rung_cap: int, block: int, latency: bool = False
+    ) -> int:
         """Persistent grid for one rung: the minimum of every bound we have.
 
         One workgroup per CU is the bound that does not rest on a model; see
@@ -852,7 +873,10 @@ class FlyQuickAllReduceRMSNorm:
             cu_count=self._cu_count,
             block=block,
         )
-        grid = min(grid, self.WGS_PER_CU * self._cu_count)
+        grid = min(
+            grid,
+            (self.LATENCY_WGS_PER_CU if latency else self.WGS_PER_CU) * self._cu_count,
+        )
         shared = torch.tensor(grid, dtype=torch.int64)
         dist.all_reduce(shared, op=dist.ReduceOp.MIN, group=self.group)
         return max(1, int(shared.item()))
@@ -878,8 +902,8 @@ class FlyQuickAllReduceRMSNorm:
             )
             by_cap = {}
             for r in rungs:
-                by_cap.setdefault(r.super_tile, r.grid_cap)
-            by_cap.setdefault(1, min(by_cap.values()))
+                by_cap.setdefault((r.super_tile, r.latency), r.grid_cap)
+            by_cap.setdefault((1, False), min(by_cap.values()))
             got = self._ladders[hidden] = (rungs, dict(sorted(by_cap.items())))
         return got
 
@@ -896,15 +920,15 @@ class FlyQuickAllReduceRMSNorm:
             quick_reduce_row_block_at(hidden, self.world_size, self.block)
         block, _atoms_per_row, h_pad = self._geom_for(hidden)
         _rungs, by_cap = self._ladder(hidden)
-        for st, rung_cap in by_cap.items():
-            key = (hidden, st, bool(mxfp4))
+        for (st, latency), rung_cap in by_cap.items():
+            key = (hidden, st, bool(mxfp4), latency)
             if key in self._by_cfg:
                 continue
             spec = self._algo.build(
                 world_size=self.world_size,
                 rank=self.rank,
                 super_tile=st,
-                grid=self._grid_for(st, rung_cap, block),
+                grid=self._grid_for(st, rung_cap, block, latency),
                 inbox_memory=self.inbox_memory,
                 rs_codec=self.rs_codec,
                 ag_codec=self.ag_codec,
@@ -913,12 +937,14 @@ class FlyQuickAllReduceRMSNorm:
                 block=block,
                 h_pad=h_pad,
                 mxfp4=bool(mxfp4),
+                **({"latency": True} if latency else {}),
             )
-            if spec["lds_bytes"] > self._lds_capacity:
+            if spec["lds_bytes"] * (2 if latency else 1) > self._lds_capacity:
                 raise ValueError(
                     f"fused {self._algo.name} at hidden={hidden} needs "
-                    f"{spec['lds_bytes']} B of LDS, over {self.arch}'s "
-                    f"{self._lds_capacity} B per workgroup: use a narrower "
+                    f"{spec['lds_bytes']} B of LDS"
+                    f"{' per workgroup, two of which share a CU,' if latency else ''}"
+                    f" over {self.arch}'s {self._lds_capacity} B: use a narrower "
                     "hidden, a narrower codec, or the ring schedule"
                 )
             with torch.cuda.device(self._device_index):
@@ -954,7 +980,12 @@ class FlyQuickAllReduceRMSNorm:
         is the footprint a tile *count* has to divide. They are equal whenever
         the build is not padded.
         """
-        key = (int(hidden), 1, False)  # ST=1 is always built; see the constructor
+        key = (
+            int(hidden),
+            1,
+            False,
+            False,
+        )  # ST=1 is always built; see the constructor
         if key not in self._by_cfg:
             self._build_hidden(int(hidden))
         return self._by_cfg[key][1]["hbm_tile_bytes"]
@@ -963,16 +994,17 @@ class FlyQuickAllReduceRMSNorm:
         self, hidden: int, live_bytes: int, num_tiles: int, mxfp4: bool = False
     ) -> tuple:
         rungs, by_cap = self._ladder(hidden)
-        want = select_rung(rungs, live_bytes).super_tile
+        rung = select_rung(rungs, live_bytes)
+        want, latency = rung.super_tile, rung.latency
         if want != 1:
             if self._batch_publishes:
                 want = want if num_tiles >= want else 1
             else:
-                key = (int(hidden), want, bool(mxfp4))
+                key = (int(hidden), want, bool(mxfp4), False)
                 built = self._by_cfg.get(key)
-                grid = built[0].grid if built else by_cap[want]
+                grid = built[0].grid if built else by_cap[(want, False)]
                 want = want if num_tiles > grid else 1
-        key = (int(hidden), want, bool(mxfp4))
+        key = (int(hidden), want, bool(mxfp4), bool(latency))
         if key not in self._by_cfg:
             self._build_hidden(int(hidden), mxfp4)
         return key
@@ -1056,6 +1088,9 @@ class FlyQuickAllReduceRMSNorm:
         under exactly this context too, or the first launch compiles again.
         """
         waves_per_eu = -(-(spec["block"] // WAVE) // 4)
+        if spec.get("latency"):
+            # Two workgroups per CU: half the registers each.
+            waves_per_eu *= FlyQuickAllReduceRMSNorm.LATENCY_WGS_PER_CU
         return CompilationContext.compile_hints({"waves_per_eu": waves_per_eu})
 
     def _launch_eng(self, eng, spec, args) -> None:

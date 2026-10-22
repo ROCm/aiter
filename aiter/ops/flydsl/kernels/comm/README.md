@@ -173,6 +173,13 @@ The quick-reduce RMSNorm epilogue has two extras, both used through
   variant (`mxfp4=True`) of the epilogue, so it gets its own engines, built on
   first use or by `preload(hidden, mxfp4=True)`.
 
+The mesh also has a low-latency build (`latency=true` on a ladder rung, or the
+`latency=` argument of `FlyQuickAllReduceRMSNorm`): the epilogue loads the
+residual ahead of the exchanges (`prefetch`) and two workgroups per CU stay
+resident. It needs `super_tile=1` and the 256-thread block, which at 8 ranks
+only hidden 2048 has. It is correct, but on gfx950 at TP8, hidden 2048 it ran
+2-3x slower than the default build, so no shipped rung selects it.
+
 A split row (one token row over several workgroups; opt-in with
 `AITER_FLY_AR_FUSED_SPLIT=1`) joins its sum of squares
 through an integer atomic in HBM, so that every rank decodes the same bits. The

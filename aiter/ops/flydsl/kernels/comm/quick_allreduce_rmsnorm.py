@@ -42,7 +42,7 @@ from .quick_allreduce_fusions import (
     rms_rstd,
     scale_by_weight,
 )
-from .transport import ATOMS, WAVE
+from .transport import ATOMS, BLOCK, WAVE
 
 
 def _atom_f16_to_f32(atom):
@@ -302,7 +302,31 @@ class _BoundQuickReduceRMSNorm:
 
 class MeshRMSNormEpilogue(_QuickReduceRMSNorm):
     """The mesh ends a tile holding every atom of it: ``rows_per_tile``
-    independent rows, each reduced inside this block."""
+    independent rows, each reduced inside this block.
+
+    ``latency`` hoists the residual loads of a tile ahead of its reduce-scatter
+    (``prefetch``), so the HBM reads retire during the two exchanges instead of
+    after them. It holds ``ATOMS`` more atoms of registers across both waits, so
+    it is built for the 256-thread block, whose workgroup is small enough for
+    the host to keep two per CU resident (see ``FlyQuickAllReduceRMSNorm``), and
+    for ``super_tile=1``, the only loop that carries a tile through its waits.
+    """
+
+    def __init__(self, *, latency: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.latency = bool(latency)
+        if self.latency and self.block != BLOCK:
+            raise ValueError(
+                f"the latency build needs block={BLOCK}, hidden={self.hidden} "
+                f"gives block={self.block}"
+            )
+
+    @property
+    def tag(self) -> str:
+        return super().tag + ("_lat" if self.latency else "")
+
+    def spec(self) -> dict:
+        return {**super().spec(), "latency": self.latency}
 
     def _rows_per_norm(self):
         return self.rows_per_tile
@@ -322,13 +346,24 @@ class _BoundMeshRMSNorm(_BoundQuickReduceRMSNorm):
     def unstash_own(self, tile, atom):
         return self.io.load(self.out_buf, tile, atom)
 
-    def finish_tile(self, tile, gathered):
+    def prefetch(self, tile):
+        """The tile's residual atoms, issued before its reduce-scatter. Plain HBM
+        with no dependence on a peer, so the loads retire during the exchanges."""
+        if not self.epi.latency:
+            return None
+        return [self.io.load(self.res_in_buf, tile, j) for j in range_constexpr(ATOMS)]
+
+    def finish_tile(self, tile, gathered, pre=None):
         self._norm_rows(
             tile,
             0,
             self.epi.rows_per_tile,
             gathered,
-            lambda j: self.io.load(self.res_in_buf, tile, j),
+            (
+                (lambda j: self.io.load(self.res_in_buf, tile, j))
+                if pre is None
+                else (lambda j: pre[j])
+            ),
         )
 
 

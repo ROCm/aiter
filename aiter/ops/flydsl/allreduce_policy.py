@@ -291,11 +291,19 @@ class FusedOneShotRung:
 class FusedTwoShotRung:
     """The fused mesh or ring configuration for payloads of at least
     ``min_bytes``. Without ``block``: a fused build sizes
-    its workgroup to the token row (``FUSED_QR_ROW_ATOMS``)."""
+    its workgroup to the token row (``FUSED_QR_ROW_ATOMS``).
+
+    ``latency`` picks the mesh's low-latency build: the residual is loaded
+    ahead of the exchanges, and two workgroups per CU stay resident instead of
+    one, so ``grid_cap`` may go up to twice the CU count. It needs
+    ``super_tile=1`` and a width whose block is ``BLOCK``; the ring has no such
+    build.
+    """
 
     min_bytes: int
     super_tile: int
     grid_cap: int
+    latency: bool = False
 
 
 def select_rung(ladder, nbytes: int):
@@ -1122,10 +1130,17 @@ def _check_oneshot_rung(rung: FusedOneShotRung, where: str) -> None:
         )
 
 
-def _two_shot_check(super_tiles):
+def _two_shot_check(super_tiles, *, latency: bool):
     def check(rung: FusedTwoShotRung, where: str) -> None:
         _check_in(rung.super_tile, super_tiles, f"{where}.super_tile")
         _check_grid_cap(rung, where)
+        if not isinstance(rung.latency, bool):
+            raise ValueError(f"{where}.latency: must be true or false")  # noqa: TRY004
+        if rung.latency and not (latency and rung.super_tile == 1):
+            raise ValueError(
+                f"{where}.latency: only a mesh rung with super_tile=1 can be a "
+                "low-latency build"
+            )
 
     return check
 
@@ -1133,20 +1148,23 @@ def _two_shot_check(super_tiles):
 # The rung record and the rung check of each family in the file.
 _FUSED_FAMILIES = {
     "oneshot": (FusedOneShotRung, _check_oneshot_rung),
-    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES)),
-    "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES)),
+    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES, latency=True)),
+    "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES, latency=False)),
 }
 
 
 def _parse_rungs(raw, cls, check, where: str) -> tuple:
     if not isinstance(raw, list) or not raw:
         raise ValueError(f"{where}.rungs: expected a non-empty list")
-    names = [f.name for f in dataclasses.fields(cls)]
+    all_fields = dataclasses.fields(cls)
+    names = [f.name for f in all_fields if f.default is dataclasses.MISSING]
+    optional = {f.name: f.default for f in all_fields if f.name not in names}
     rungs = []
     for i, fields in enumerate(raw):
         rw = f"{where}.rungs[{i}]"
-        _check_keys(fields, rw, names)
+        _check_keys(fields, rw, names, optional)
         values = {name: fields[name] for name in names}
+        values.update({k: fields.get(k, v) for k, v in optional.items()})
         values["min_bytes"] = _parse_bytes(values["min_bytes"], f"{rw}.min_bytes")
         rung = cls(**values)
         check(rung, rw)

@@ -76,6 +76,12 @@ _VALIDITY_CASES = [
 ]
 
 
+def _latency_hidden_ok(hidden: int, tp: int) -> bool:
+    """Whether *hidden* has a native 256-thread fused build at *tp* ranks."""
+    atoms_per_row, rem = divmod(hidden, 2048)
+    return rem == 0 and (8 // tp) % atoms_per_row == 0
+
+
 def _sqnr_db(got: torch.Tensor, ref: torch.Tensor) -> float:
     mse = ((got - ref) ** 2).mean()
     pow_ = (ref * ref).mean()
@@ -171,7 +177,16 @@ def _run_rank(rank, tp, init_method, cases, time_it):
         "algorithm": os.environ.get("FLYDSL_QR_ALGORITHM", "mesh"),
     }
     plain = FlyQuickAllReduce(**common, min_bytes=0)
-    fly = FlyQuickAllReduceRMSNorm(**common, min_bytes=0)
+    # FLYDSL_QR_LATENCY=1 pins the low-latency build on every rung, 0 the
+    # occupancy-pinned one; unset keeps the ladder's own choice.
+    latency = os.environ.get("FLYDSL_QR_LATENCY")
+    fly = FlyQuickAllReduceRMSNorm(
+        **common,
+        min_bytes=0,
+        latency=None if latency is None else latency == "1",
+        # The low-latency build is for the 256-thread block.
+        block=256 if latency == "1" else None,
+    )
     rows = []
     # preload must cover every fused build the cases pick: a case that adds one
     # to the cache built it on its first call. Gemma is a runtime operand, so
@@ -395,8 +410,13 @@ def main():
         aiter.logger.warning("need %s GPUs; skipping", args.tp)
         return
 
-    ranks = _spawn(args.tp, _VALIDITY_CASES, time_it=False)
-    _assert_valid(ranks, _VALIDITY_CASES)
+    cases = _VALIDITY_CASES
+    if os.environ.get("FLYDSL_QR_LATENCY") == "1":
+        # The 256-thread block is a legal fused build only where a row's atoms
+        # divide a rank's share of a tile.
+        cases = [c for c in cases if _latency_hidden_ok(c[1], args.tp)]
+    ranks = _spawn(args.tp, cases, time_it=False)
+    _assert_valid(ranks, cases)
     aiter.logger.info(
         "validity (rank 0):\n%s", pd.DataFrame(ranks[0]).to_markdown(index=False)
     )

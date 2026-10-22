@@ -182,9 +182,12 @@ def make_quick_allreduce_mesh_kernel(
     block: int | None = None,
     h_pad: int | None = None,
     mxfp4: bool = False,
+    latency: bool = False,
     rank: int,
 ):
     check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
+    if latency and (fusion == "none" or super_tile != 1):
+        raise ValueError("latency needs a fused build with super_tile=1")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -207,6 +210,7 @@ def make_quick_allreduce_mesh_kernel(
             block=block,
             world_size=world_size,
             mxfp4=mxfp4,
+            latency=latency,
         )
     block = epilogue.block
     tile_i32 = block * ATOMS * 4
@@ -377,6 +381,7 @@ def make_quick_allreduce_mesh_kernel(
         _load_atom = ep.load_atom
         _stash_own = ep.stash_own
         _unstash_own = ep.unstash_own
+        _prefetch = ep.prefetch
         _finish_tile = ep.finish_tile
         _load_color, _store_color = _color_io(colors_ptr, bid)
 
@@ -655,6 +660,7 @@ def make_quick_allreduce_mesh_kernel(
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
                 tile = bid + i * n_blocks
                 atoms = _load_tile_atoms(tile)
+                pre = _prefetch(tile)
                 _pack_reduce_scatter(atoms)
                 gpu.barrier()
                 _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
@@ -672,7 +678,7 @@ def make_quick_allreduce_mesh_kernel(
 
                 _wait_release(PHASE_ALL_GATHER, color)
                 gathered = _recv_all_gather(fx.Int32(0), own_ag)
-                _finish_tile(tile, gathered)
+                _finish_tile(tile, gathered, pre)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
@@ -728,7 +734,7 @@ def make_quick_allreduce_mesh_kernel(
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks
                     gathered = _recv_all_gather(s, _unstash_own_chunk(tile))
-                    _finish_tile(tile, gathered)
+                    _finish_tile(tile, gathered, None)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
