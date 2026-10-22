@@ -36,7 +36,10 @@ def ref_fused_rearrange_sigmoid_gdr(
     initial_state: torch.Tensor | None,
     use_qk_l2norm_in_kernel: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Float reference for decode path (B=1, one sequence), including GQA (HV >= H)."""
+    """Float reference for decode path (B=1, one sequence), including GQA (HV >= H).
+
+    For KDA, pass ``a`` as [T, HV, K] and ``dt_bias`` as [HV, K].
+    """
     T = qkv.shape[0]
     H = key_dim // head_k_dim
     HV = value_dim // head_v_dim
@@ -213,3 +216,56 @@ def test_fused_rearrange_sigmoid_gdr_sweep(
         assert torch.isfinite(h_tr.float()).all(), "non-finite Triton final_state"
     torch.testing.assert_close(o_tr.float(), o_ref, rtol=rtol, atol=atol)
     torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=rtol, atol=atol)
+
+
+@cuda_ok
+def test_fused_rearrange_sigmoid_gdr_kda():
+    # KDA has one gate logit per (token, value head, key channel). T >= 2 so the
+    # tokens after the first read their own gate row.
+    T, H, HV, D, dtype = 4, 2, 4, 64, torch.bfloat16
+    device = "cuda"
+    K = V = D
+    scale = K**-0.5
+    torch.manual_seed(0)
+    qkv = torch.randn(T, 2 * H * K + HV * V, device=device, dtype=dtype)
+    A_log = torch.randn(HV, device=device, dtype=torch.float32) * 0.5
+    a = torch.randn(T, HV, K, device=device, dtype=dtype)
+    b_gate = torch.randn(T, HV, device=device, dtype=dtype)
+    dt_bias = torch.randn(HV, K, device=device, dtype=dtype) * 0.5
+    initial = torch.randn(1, HV, V, K, device=device, dtype=dtype)
+
+    o_ref, h_ref = ref_fused_rearrange_sigmoid_gdr(
+        A_log,
+        a,
+        b_gate,
+        dt_bias,
+        qkv,
+        H * K,
+        HV * V,
+        K,
+        V,
+        1.0,
+        20.0,
+        scale,
+        initial,
+        True,
+    )
+    o_tr, h_tr = fused_rearrange_sigmoid_gated_delta_rule(
+        A_log,
+        a.view(T, HV * K),
+        b_gate,
+        dt_bias,
+        qkv,
+        H * K,
+        HV * V,
+        K,
+        V,
+        scale=scale,
+        initial_state=initial,
+        inplace_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        is_kda=True,
+    )
+
+    torch.testing.assert_close(o_tr.float(), o_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=1e-2, atol=1e-2)
