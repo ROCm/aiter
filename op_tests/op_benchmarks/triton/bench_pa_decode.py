@@ -2,6 +2,7 @@ import sys
 
 import torch
 import triton
+from triton.testing import runtime
 
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
@@ -217,16 +218,13 @@ def triton_max_blocks(HK, KV_BLK_SZ, HEAD_DIM):
     return (1 << 31) // (HK * KV_BLK_SZ * HEAD_DIM)
 
 
-FLUSH_BYTES = 512 << 20
-
-
 def bench_ms(fn, flush_cache=True):
-    """Per-call time in ms of fn, optionally with the caches flushed before each call."""
+    """Time of one fn call in ms, with the caches flushed before each call by default."""
     if not flush_cache:
         return triton.testing.do_bench_cudagraph(fn, rep=100)
-    buf = torch.empty(FLUSH_BYTES, dtype=torch.uint8, device="cuda")
-    flush = lambda: buf.fill_(1)
-    # Graph replays run back to back, so time flush+fn and take the flush alone off.
+    cache = runtime.driver.active.get_empty_cache_for_benchmark()
+    flush = cache.zero_
+    # Graph replays run back to back, so time flush + fn and subtract the flush.
     with_flush = triton.testing.do_bench_cudagraph(lambda: (flush(), fn()), rep=100)
     return with_flush - triton.testing.do_bench_cudagraph(flush, rep=100)
 
