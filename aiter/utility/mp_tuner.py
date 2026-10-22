@@ -10,6 +10,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
+from aiter_worker_limits import configure_worker_subprocesses
 
 _TASK_START_TIMES = None
 _TASK_PIDS = None
@@ -25,6 +26,7 @@ def _is_accelerator_error(exc: BaseException) -> bool:
 
 def _init_task_start_times(task_start_times, task_pids=None):
     global _TASK_START_TIMES, _TASK_PIDS
+    configure_worker_subprocesses()
     _TASK_START_TIMES = task_start_times
     _TASK_PIDS = task_pids
 
