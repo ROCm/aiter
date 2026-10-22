@@ -54,16 +54,23 @@ def benchmark_prologue(tokens, metric, args, **_):
     def run():
         fused_attention_qk_norm_rope(packed, q_norm, k_norm, positions, cos_sin_cache)
 
+    # Capture a CUDA graph and time replay only. This matches the
+    # graph-captured integration and keeps the output allocation and launch
+    # setup out of the measured latency.
     run()
     torch.cuda.synchronize()
-    time_ms = triton.testing.do_bench(run, warmup=25, rep=100)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+    time_ms = triton.testing.do_bench(graph.replay, warmup=25, rep=100)
     if metric == "time":
         return time_ms
     if metric == "bandwidth":
-        # One packed read plus the normed Q/K and passthrough gate/value writes.
-        read_bytes = packed.numel() * packed.element_size()
-        write_bytes = tokens * (2 * QUERY_HEADS + 2) * HEAD_DIM * 2
-        return (read_bytes + write_bytes) / time_ms * 1.0e-6
+        # The op reads Q, gate and K and writes their normed and passthrough
+        # copies. V is returned as a view, so it is neither read nor written.
+        moved = tokens * (2 * QUERY_HEADS + 1) * HEAD_DIM
+        return 2 * moved * 2 / time_ms * 1.0e-6
     raise ValueError(f"Unsupported metric: {metric}")
 
 

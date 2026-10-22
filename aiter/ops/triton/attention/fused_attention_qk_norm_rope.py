@@ -128,6 +128,10 @@ def fused_attention_qk_norm_rope_supported(
     device = projected_qkv_gate.device
     if projected_qkv_gate.dtype != torch.bfloat16:
         return False, "projected_qkv_gate must be bf16"
+    # The kernels index the packed matrix at a fixed row stride, so it must be
+    # row-major contiguous.
+    if not projected_qkv_gate.is_contiguous():
+        return False, "projected_qkv_gate must be contiguous"
 
     for name, t, shape in (
         ("q_norm_weight", q_norm_weight, (_HEAD_DIM,)),
@@ -137,21 +141,42 @@ def fused_attention_qk_norm_rope_supported(
             return False, f"{name} must be a CUDA tensor on {device}"
         if tuple(t.shape) != shape:
             return False, f"{name} must be {shape}, got {tuple(t.shape)}"
+        if not t.is_contiguous():
+            return False, f"{name} must be contiguous"
 
-    if cos_sin_cache.device != device or cos_sin_cache.shape[-1] < _ROTARY_DIM:
+    # The kernels read the table at a fixed stride of 64 (32 cos then 32 sin
+    # per position), so it must be contiguous with exactly rotary_dim columns.
+    if (
+        not isinstance(cos_sin_cache, torch.Tensor)
+        or cos_sin_cache.device != device
+        or cos_sin_cache.shape[-1] != _ROTARY_DIM
+        or not cos_sin_cache.is_contiguous()
+    ):
         return (
             False,
-            f"cos_sin_cache must be on {device} with last dim >= {_ROTARY_DIM}",
+            (
+                f"cos_sin_cache must be a contiguous table on {device} with "
+                f"exactly {_ROTARY_DIM} columns"
+            ),
         )
     if (
         not isinstance(positions, torch.Tensor)
         or positions.device != device
+        or positions.ndim != 1
         or positions.shape[0] < rows
+        or positions.dtype not in (torch.int32, torch.int64)
     ):
         return (
             False,
-            f"positions must be a CUDA tensor on {device} covering {rows} rows",
+            (
+                f"positions must be a 1-D int32/int64 CUDA tensor on {device} "
+                f"covering {rows} rows"
+            ),
         )
+    # The m128_m256 Gluon tile reads positions at unit stride; the decode and
+    # prefill tiles pass the stride, so they accept a strided view.
+    if schedule == "m128_m256" and positions.stride(0) != 1:
+        return False, "positions must be contiguous for the m128_m256 schedule"
     return True, ""
 
 
@@ -322,6 +347,7 @@ class _PrefillConfig(NamedTuple):
     k_aux_stage: int
     output_layout: int
     output_gap: int
+    waves_per_eu: int
 
 
 def _small_span(tensor: torch.Tensor) -> bool:
@@ -334,43 +360,33 @@ def _small_span(tensor: torch.Tensor) -> bool:
     )
 
 
-def _prefill_config(rows):
+_PREFILL_FIELDS = _PrefillConfig._fields
+
+
+@functools.lru_cache(maxsize=1)
+def _prefill_table() -> dict:
+    """Load and cache the tuned gfx950 prefill launch table."""
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+
+    cfg_dir = resolve_config_dir(
+        "attention", "FUSED-ATTENTION-QK-NORM-ROPE", backend="gluon"
+    )
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")
+
+
+def _prefill_config(rows) -> _PrefillConfig:
     """Shape-only launch policy; Q blocks count heads, K blocks count tokens.
 
-    The I/O policy bit field and per-bucket values come straight from the
-    measured gfx950 schedule; see the kernel module for the bit meanings.
+    The tuned per-bucket values and the I/O policy bit field come from the
+    measured gfx950 JSON; see the kernel module for the bit meanings.
     """
-    if rows <= 1024:
-        return _PrefillConfig(
-            8, 2, 2, 2, 2, 16, 64, 128, 4, False, 0x2039C, ".wt", 1, 1, 1, 0, 1, 256
-        )
-    if rows <= 2048:
-        return _PrefillConfig(
-            8, 2, 1, 8, 2, 8, 32, 64, 8, True, 0x13400, ".cs", 1, 3, 2, 0, 0, 4096
-        )
-    if rows <= 4096:
-        return _PrefillConfig(
-            4, 2, 1, 8, 2, 16, 32, 128, 8, False, 0x1400, ".cs", 0, 12, 1, 0, 0, 512
-        )
-    if rows <= 8192:
-        return _PrefillConfig(
-            8, 8, 4, 2, 8, 32, 32, 1024, 8, True, 0x41FFF, ".wt", 16, 10, 2, 2, 0, 0
-        )
-    if rows <= 12288:
-        return _PrefillConfig(
-            8, 8, 4, 2, 2, 32, 64, 1024, 8, True, 0x3F3C, ".wt", 3, 0, 2, 0, 1, 128
-        )
-    if rows <= 16384:
-        return _PrefillConfig(
-            2, 1, 1, 2, 4, 32, 64, 4096, 8, True, 0x3FF, ".cs", 16, 15, 0, 0, 1, 0
-        )
-    if rows <= 24576:
-        return _PrefillConfig(
-            2, 1, 1, 2, 2, 32, 64, 1024, 8, True, 0, ".cs", 0, 0, 0, 2, 0, 0
-        )
-    return _PrefillConfig(
-        2, 1, 1, 2, 4, 32, 64, 8192, 8, True, 0x6000, ".cs", 1, 15, 0, 0, 1, 0
-    )
+    from aiter.ops.triton.utils.config_utils import select_leq_config
+
+    entry = select_leq_config(_prefill_table(), rows, prefix="M_LEQ_")
+    return _PrefillConfig(*(entry[field] for field in _PREFILL_FIELDS))
 
 
 def _allocate_prefill_outputs(packed, output_layout, gap):
@@ -432,6 +448,7 @@ def _launch_prefill(
         ke,
         _output_layout,
         _gap,
+        waves_per_eu,
     ) = config
     packed_small = _small_span(projected_qkv_gate)
     output_small = all(_small_span(t) for t in (query, gate, key))
@@ -448,14 +465,6 @@ def _launch_prefill(
         io_policy = (io_policy & ~0x42) | (1 << 19)
     if not table_small:
         io_policy = (io_policy & ~0x84) | (1 << 21)
-    if rows <= 1024:
-        waves_per_eu = 8
-    elif rows <= 2048:
-        waves_per_eu = 4
-    elif 12288 < rows <= 16384 or rows > 24576:
-        waves_per_eu = 6
-    else:
-        waves_per_eu = 0
     programs = triton.cdiv(rows, group) * (group * heads // qb + group // kb)
     _fused_asymmetric[(programs,)](
         projected_qkv_gate,
