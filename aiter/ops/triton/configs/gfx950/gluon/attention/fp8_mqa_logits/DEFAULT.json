@@ -1,0 +1,10 @@
+{
+  "rows8": {
+    "min_seq_len_kv": 4096,
+    "BLOCK_M": 8,
+    "BLOCK_KV": 64,
+    "NUM_WARPS": 4,
+    "NUM_BUFFERS": 2,
+    "WAVES_PER_EU": 2
+  }
+}
