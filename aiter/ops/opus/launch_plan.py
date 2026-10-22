@@ -19,6 +19,7 @@ from csrc.opus_gemm.opus_gemm_common import (
     SPLITK_KIDS,
     OpusGemmInstance,
     a8w8_mxscale_flatmm_prefetch_k_iter,
+    a8w8_mxscale_sf_panel_k_tiles,
     a16w16_flatmm_prefetch_k_iter,
     get_kernel_instance,
 )
@@ -730,6 +731,16 @@ def _build_a8w8_mxscale_bmm_plan(
             raise ValueError(
                 f"OPUS BMM kid {resolved_kid} requires at least "
                 f"{prefetch_k_iter} K-tiles; K={K} gives {total_iters}"
+            )
+        # The launcher raises past this bound too, but only once a heuristic or
+        # tuned row has already settled on the kid.
+        panel_k_tiles = a8w8_mxscale_sf_panel_k_tiles(instance)
+        split_iters = (total_iters + abi_split_k - 1) // abi_split_k
+        if panel_k_tiles is not None and split_iters > panel_k_tiles:
+            raise ValueError(
+                f"OPUS BMM kid {resolved_kid} holds at most {panel_k_tiles} "
+                f"K-tiles per split in its LDS scale panel; K={K}, "
+                f"split_k={abi_split_k} gives {split_iters}"
             )
 
     workspace_numel = 0

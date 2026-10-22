@@ -24,7 +24,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.ops.opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_scale_n32k4, shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -46,6 +46,7 @@ from opus_gemm_common import (
     MX32_KID_STRIDE,
     _opus_sf_shuf_sub,
     a8w8_mxscale_bmm_kernel_lists,
+    a8w8_mxscale_sf_panel_k_tiles,
     bmm_mxscale_global_kid,
 )
 
@@ -76,7 +77,9 @@ def _kid_group(kid):
 
 
 def _kid_block(kid):
-    return "{}x{}".format(*_kid_groups(kid))
+    # Mirrors policy.mxscale_bmm_kid_block: an x32k4 w_scale is its own block.
+    inst = _KID_INSTANCE.get(kid) or _KID_INSTANCE[bmm_mxscale_global_kid(kid)]
+    return "{}x{}".format(*_kid_groups(kid)) + ("n32k4" if inst.sf_layout & 2 else "")
 
 
 from test_opus_a8w8_bmm import (
@@ -250,10 +253,14 @@ _TUNE_POLICY[399] = [1]
 
 # The default policy consumes ordinary scales. M-packed and shuffled-scale
 # kernels require a matching scale producer and are handled by separate pools.
+# An x32k4 w_scale alone is not one of these: it is relaid once at weight load,
+# so those kids are keyed as their own 1x32n32k4 block instead.
 _RELAYOUT_KIDS = sorted(
     kid
     for kid, inst in _CODEGEN_BMM.items()
-    if inst.needs_mpacked_sfa is not None or inst.needs_shuffle_scale is not None
+    if inst.needs_mpacked_sfa is not None
+    or inst.needs_shuffle_scale is not None
+    or inst.sf_layout & 1
 )
 assert not (set(_TUNE_POLICY) & set(_RELAYOUT_KIDS)), (
     f"kids {sorted(set(_TUNE_POLICY) & set(_RELAYOUT_KIDS))} need a producer-side "
@@ -326,8 +333,50 @@ _TUNE_POLICY.update(
     }
 )
 _TUNE_POLICY = _globalise_policy(_TUNE_POLICY)
+
+# Families whose launcher honors splitK>1: they write fp32 partials to the
+# caller-owned workspace and carry the fused reduce tail (per-tile counter,
+# last arrival sums in split order). Everything else is splitK==1 only, so a
+# policy entry sweeping splitK>1 on another family is a bug -- fail at import
+# rather than silently benchmark a wrong result.
+#
+# This has to agree with _A8W8_MXSCALE_BMM_WORKSPACE_TAGS in
+# aiter/ops/opus/launch_plan.py, which is what actually hands out the workspace;
+# it is spelled out rather than imported because that module pulls in torch.
+# bdirect and blds belong here -- they run the same flatmm split-K kernel and
+# launcher as flatmm_splitk, which is why the plan grants them the partials
+# workspace -- and were missing only because no policy entry had ever asked
+# them for a split. bdirect_tilen and allwave are deliberately absent: the plan
+# has no workspace for them, so a split there fails the launcher's own check.
+_SPLITK_FAMILIES = frozenset(
+    {
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_fused",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
+    }
+)
+
+# 1x32 used to be wave1's alone, so a blanket split-K sweep here was implicitly
+# a statement about that one family. It now spans blds and bdirect as well, and
+# while those are split-K capable (see _SPLITK_FAMILIES) not every family that
+# could carry a 1x32 tile is -- bdirect_tilen and allwave are not in the launch
+# plan's workspace tags. So the sweep asks the family rather than assuming it;
+# the assert below would otherwise fail at import for a tile added in good faith.
 _TUNE_POLICY.update(
-    {kid: [1, 2, 4, 8] for kid in _CODEGEN_BMM if _kid_block(kid) == "1x32"}
+    {
+        kid: (
+            [1, 2, 4, 8]
+            if _CODEGEN_BMM[kid].kernel_tag in _SPLITK_FAMILIES
+            and not _CODEGEN_BMM[kid].direct_only
+            else [1]
+        )
+        for kid in _CODEGEN_BMM
+        if kid >= BMM_MXSCALE_KID_OFFSET
+        and _kid_block(kid) in ("1x32", "1x32n32k4")
+        and kid not in _RELAYOUT_KIDS
+    }
 )
 _SHUF_POLICY = _globalise_policy(_SHUF_POLICY)
 _CANDIDATE_KIDS = tuple(_TUNE_POLICY) + tuple(_SHUF_POLICY)
@@ -347,18 +396,6 @@ def _shuf_arm(inst):
 # and kid192 sat here that way. Fail at import instead.
 _dead = sorted(set(_TUNE_POLICY) - set(_CODEGEN_BMM))
 assert not _dead, f"_TUNE_POLICY lists kids the codegen does not emit: {_dead}"
-
-# Families whose launcher honors splitK>1: they write fp32 partials to the
-# caller-owned workspace and carry the fused reduce tail (per-tile counter,
-# last arrival sums in split order). Everything else is splitK==1 only, so a
-# policy entry sweeping splitK>1 on another family is a bug -- fail at import
-# rather than silently benchmark a wrong result.
-_SPLITK_FAMILIES = frozenset(
-    {
-        "a8w8_mxscale_bmm_flatmm_splitk",
-        "a8w8_mxscale_bmm_bpreshuffle_wave1",
-    }
-)
 
 for _kid, _sks in _TUNE_POLICY.items():
     if any(s > 1 for s in _sks):
@@ -556,10 +593,13 @@ def _applicable(kid, g, m, n, k, pool="all", *, split_ks=None):
         return []
     if k_inst.GROUP_N == 1:
         tiles = k // k_inst.B_K
+        panel = a8w8_mxscale_sf_panel_k_tiles(k_inst)
         return [
             s
             for s in (split_ks if split_ks is not None else _TUNE_POLICY[kid])
-            if s >= 1 and tiles - (s - 1) * ((tiles + s - 1) // s) >= 1
+            if s >= 1
+            and tiles - (s - 1) * ((tiles + s - 1) // s) >= 1
+            and (panel is None or (tiles + s - 1) // s <= panel)
         ]
     if k_inst.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
         if not (
@@ -659,6 +699,8 @@ def gen_bmm_mxscale_data(
     W_bf16 = _gen_varied((batch, n, k), k, device, group)
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16, group=group)
     W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16, group=group, group_n=group_n)
+    if _CODEGEN_BMM[kernel_id].sf_layout & 2:
+        ws_mx = shuffle_scale_n32k4(ws_mx)
     Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
 
     workspace_numel = _workspace_numel(kernel_id, split_k, batch, m, n)
@@ -719,7 +761,12 @@ def _bmm_ref_passthrough(ref):
 # ---------------------------------------------------------------------------
 BMM_BENCH_KEYS = (0, 1, 2, 3, 4, 5, 7)
 BMM_DATA_KIDS = {128: 8179, 32: 9179}
-BMM_BLOCK_DATA_KIDS = {"128x128": 8179, "32x32": 9179, "1x32": 9704}
+BMM_BLOCK_DATA_KIDS = {
+    "128x128": 8179,
+    "32x32": 9179,
+    "1x32": 9704,
+    "1x32n32k4": 9731,
+}
 
 
 def make_bmm_tuning_task(
@@ -859,7 +906,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
 
         def _blocklist(s):
             blocks = tuple(dict.fromkeys(part.strip().lower() for part in s.split(",")))
-            allowed = ("1x32", "32x32", "128x128")
+            allowed = ("1x32", "1x32n32k4", "32x32", "128x128")
             if any(block not in allowed for block in blocks):
                 raise argparse.ArgumentTypeError(
                     "expected comma-separated blocks from " + ", ".join(allowed)
@@ -898,7 +945,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             "--w_scale_block",
             type=_blocklist,
             default=None,
-            help="comma-separated weight-scale blocks (1x32,32x32,128x128); "
+            help="comma-separated weight-scale blocks (1x32,1x32n32k4,32x32,128x128); "
             "filter CSV rows or expand shape-only inputs",
         )
         self.parser.add_argument(
@@ -963,11 +1010,14 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             )
         df["w_scale_block"] = df["w_scale_block"].astype(str).str.strip().str.lower()
         if not df["w_scale_block"].isin(BMM_BLOCK_DATA_KIDS).all():
-            raise ValueError("w_scale_block must be 1x32, 32x32 or 128x128")
-        n_align = df["w_scale_block"].map({"1x32": 16, "32x32": 128, "128x128": 128})
+            raise ValueError("w_scale_block must be 1x32, 1x32n32k4, 32x32 or 128x128")
+        n_align = df["w_scale_block"].map(
+            {"1x32": 16, "1x32n32k4": 32, "32x32": 128, "128x128": 128}
+        )
         if ((df["n"] % n_align != 0) | (df["k"] % 128 != 0)).any():
             raise ValueError(
-                "MXFP8 BMM requires aligned N and K: N16/K128 for 1x32, N128/K128 otherwise"
+                "MXFP8 BMM requires aligned N and K: N16/K128 for 1x32, "
+                "N32/K128 for 1x32n32k4, N128/K128 otherwise"
             )
         if blocks is not None:
             df = df[df["w_scale_block"].isin(blocks)]
@@ -1022,7 +1072,10 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         self.untunedf = self._normalize_rows(
             df, default_blocks=("32x32", "128x128"), blocks=args.w_scale_block
         )
-        if not self._bpreshuffle and self.untunedf["w_scale_block"].eq("1x32").any():
+        if (
+            not self._bpreshuffle
+            and self.untunedf["w_scale_block"].isin(("1x32", "1x32n32k4")).any()
+        ):
             raise ValueError("1x32 tuning requires --bpreshuffle")
         self.untunedf = (
             self.untunedf[self.untunedf["gfx"] == gfx][self.keys]

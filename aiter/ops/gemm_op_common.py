@@ -27,6 +27,9 @@ def find_padded_m_row(tuned: dict, key, m: int, n: int, k: int):
 # on it, so kernels that read the same weight layout with different scale blocks
 # never share a row.
 MXSCALE_W_SCALE_BLOCKS = ("32x32", "128x128", "1x32", "1x128")
+# 1x32n32k4 is a 1x32 scale in the shuffle_scale_n32k4 layout ([.., N/32, K]),
+# which only the BMM entries recognise; mxscale_w_scale_block never returns it.
+MXSCALE_BMM_W_SCALE_BLOCKS = (*MXSCALE_W_SCALE_BLOCKS, "1x32n32k4")
 
 
 def mxscale_w_scale_block(w_scale_shape: tuple[int, ...], n: int, k: int) -> str:
@@ -41,10 +44,13 @@ def mxscale_w_scale_block(w_scale_shape: tuple[int, ...], n: int, k: int) -> str
     return block
 
 
-def with_mxscale_w_scale_block(df, path: str, default: str = "128x128"):
+def with_mxscale_w_scale_block(
+    df, path: str, default: str = "128x128", blocks=MXSCALE_W_SCALE_BLOCKS
+):
     """A tuned mxscale table with a checked w_scale_block column; a table from
     before the column holds only ``default`` rows, and so do the blank cells a
-    merge of such a table with a newer one leaves."""
+    merge of such a table with a newer one leaves. ``blocks`` is what the
+    table's entry can dispatch."""
     if "w_scale_block" not in df.columns:
         logger.warning(
             "%s has no 'w_scale_block' column; reading its rows as %s. "
@@ -58,9 +64,7 @@ def with_mxscale_w_scale_block(df, path: str, default: str = "128x128"):
             "%s has rows without a w_scale_block; reading them as %s.", path, default
         )
         df = df.assign(w_scale_block=df["w_scale_block"].fillna(default))
-    unknown = set(df["w_scale_block"]) - set(MXSCALE_W_SCALE_BLOCKS)
+    unknown = set(df["w_scale_block"]) - set(blocks)
     if unknown:
-        raise ValueError(
-            f"{path}: w_scale_block {sorted(unknown)} not in {MXSCALE_W_SCALE_BLOCKS}"
-        )
+        raise ValueError(f"{path}: w_scale_block {sorted(unknown)} not in {blocks}")
     return df

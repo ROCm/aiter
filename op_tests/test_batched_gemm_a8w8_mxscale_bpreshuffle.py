@@ -160,8 +160,8 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
     kid_plain = KID_PLAIN + (1000 if group == 32 else 0)
     for kid in KIDS_BPRESHUFFLE:
         # Split the whole block, not just GROUP_K: GROUP_N picks which weight.
-        group_n, group_k = (
-            int(v) for v in policy.mxscale_bmm_kid_block(kid).split("x")
+        group_n, group_k = policy.mxscale_bmm_groups_of_block(
+            policy.mxscale_bmm_kid_block(kid)
         )
         if group_k != group:
             continue
@@ -344,8 +344,19 @@ def _check_tables():
             for k in kids
             if not policy.mxscale_bmm_kid_takes_b_layout(k, b_preshuffled)
         )
+        # An x32k4 w_scale has its own block, so a row is consistent when its
+        # kid reads x_scale row-major and w_scale in the row's block layout.
         bad_sf = sorted(
-            k for k in kids if not policy.mxscale_bmm_kid_takes_plain_scales(k)
+            {
+                int(row["kernelId"])
+                for key, row in rows.items()
+                if key[0] == gfx
+                and row.get("libtype") == "opus"
+                and not (
+                    policy.mxscale_bmm_kid_takes_plain_x_scale(int(row["kernelId"]))
+                    and policy.mxscale_bmm_kid_block(int(row["kernelId"])) == key[5]
+                )
+            }
         )
         bad = bool(bad_b or bad_sf or bad_g)
         ok &= not bad

@@ -163,6 +163,15 @@ class OpusGemmInstance:
     # a8w8_mxscale BMM wave1 only: register ring depth in K tiles, 0 for the
     # traits' VGPR-budget default. Maps to the wave1 traits' trailing `int RING_`.
     wave1_ring: int = 0
+    # a8w8_mxscale BMM blds, GROUP_K=32 scale-ring kids only: which scale buffers
+    # arrive in the x32k4 order of shuffle_scale_n32k4 -- [rows/32][K/128][32][4],
+    # so one K/128 step of 32 rows is a single 128-byte line -- instead of
+    # row-major [rows][K/32]. Bit 0 is A (x_scale [ceil(M/32), batch, K]), bit 1
+    # is B (w_scale [batch, N/32, K], GROUP_N == 1 only). Bit 2 changes no
+    # layout: A's plain scales are staged as a whole-split LDS panel while B
+    # stays on the ring. Emitted as GROUP's optional fourth element; see
+    # SF_LAYOUT in the flatmm traits.
+    sf_layout: int = 0
     # Compact BMM: issue future B before current LDS reads, then issue A.
     early_b: bool = False
     # a8w8_mxscale BMM specialized-pipeline axis (minterleave / mouter /
@@ -287,6 +296,13 @@ class OpusGemmInstance:
                 parts.append("sfpreload")
             if self.shuffle_scale:
                 parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
+            if self.sf_layout & 3:
+                parts.append(
+                    "sfx32" + ("a" if self.sf_layout & 1 else "")
+                    + ("b" if self.sf_layout & 2 else "")
+                )
+            if self.sf_layout & 4:
+                parts.append("sfapanel")
         elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave8n4":
             # opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_<geom>_wgpcu{N}_sfpreload
             #     [_xcd{N}][_sfgmpack][_sfshuf]
@@ -538,6 +554,20 @@ def a8w8_mxscale_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     """Mirror gfx950 MXFP8 flatmm ``Traits::prefetch_k_iter``."""
     if instance.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave1":
         return 1  # the wave1 traits' per-split floor: its ring pads past the end
+    if getattr(instance, "sf_layout", 0) & 4:
+        return _a8w8_mxscale_sfa_panel_geometry(instance)[0]
+    return (163840 // max(instance.WG_PER_CU, 1)) // max(
+        _a8w8_mxscale_flatmm_per_iter_lds(instance), 1
+    ) or 1
+
+
+def _a8w8_mxscale_flatmm_per_iter_lds(
+    instance: OpusGemmInstance, b_staged: bool = True
+) -> int:
+    """Mirror gfx950 MXFP8 flatmm ``Traits::per_block_iter_lds_size``.
+
+    ``b_staged=False`` is the B_DIRECT_REG form, which stages only A.
+    """
     sizeof_da = 1  # FP8
     is_tile_n = instance.B_M == 16
     load_group_m = 16 if is_tile_n else 32
@@ -551,12 +581,106 @@ def a8w8_mxscale_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     slots = load_group_m // smem_sub
     padding = 2 * 16 // sizeof_da
     per_group_load = slots * (smem_linear + padding) * sizeof_da
-    per_iter = (num_m + num_n) * num_k * per_group_load
-    lds_total = 163840
-    return max(
-        1,
-        (lds_total // max(instance.WG_PER_CU, 1)) // max(per_iter, 1),
+    return (num_m + (num_n if b_staged else 0)) * num_k * per_group_load
+
+
+def _a8w8_mxscale_sfa_panel_geometry(instance: OpusGemmInstance) -> tuple[int, int]:
+    """(prefetch_k_iter, SF_PRELOAD_K_MAX / B_K) of an sf_layout-bit-2 kid.
+
+    Mirrors the SFA_PANEL budget in the flatmm traits: the A panel's 4096-K
+    floor is set aside, the A/B stages and the B scale ring are sized from the
+    rest, and the panel then reaches as far as what is left over.
+    """
+    lds = 163840 // max(instance.WG_PER_CU, 1)
+    per_iter = _a8w8_mxscale_flatmm_per_iter_lds(instance)
+    a_rows = instance.B_M // instance.GROUP_M
+    pad = 16
+    budget = lds - (a_rows * (4096 // instance.GROUP_K + pad) + 256)
+    # GROUP_K=32: one dword per producer lane, 256 bytes a chunk, padded to the
+    # producer pair; the A side has no ring chunks.
+    b_groups = instance.B_N // instance.GROUP_N
+    b_chunks = (b_groups * (instance.B_K // instance.GROUP_K) + 255) // 256
+    slot = (b_chunks + 1) // 2 * 2 * 256
+    prefetch = (budget - slot) // (per_iter + slot)
+    ring = (prefetch + 1) * slot
+    k_fit = (
+        ((lds - prefetch * per_iter - ring - 256) // a_rows - pad)
+        * instance.GROUP_K
+        // instance.B_K
+        * instance.B_K
     )
+    return prefetch, min(k_fit, 8192) // instance.B_K
+
+
+_FLATMM_SF_PANEL_TAGS = frozenset(
+    {
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+    }
+)
+
+
+def _a8w8_mxscale_sf_preload_k_tiles(instance: OpusGemmInstance) -> int:
+    """SF_PRELOAD_K_MAX / B_K of a plain-scale preload_sf flatmm kid.
+
+    Mirrors the flatmm traits. The panel's reach is what the A/B staging
+    leaves, and the staging depth is the scale ring's even when the panel is
+    what the kid uses, so the ring has to be sized to get it.
+    """
+    bdirect = instance.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_bdirect"
+    lds = 163840 // max(instance.WG_PER_CU, 1)
+    per_iter = _a8w8_mxscale_flatmm_per_iter_lds(instance, b_staged=not bdirect)
+    scales_per_bk = instance.B_K // instance.GROUP_K
+    per_mfma_k = instance.W_K // instance.GROUP_K
+    n_groups = -(-instance.B_N // instance.GROUP_N)
+    vec = 4 if per_mfma_k > 1 else 1
+    chunk = 64 * vec
+    a_chunks = -(-(instance.B_M // instance.GROUP_M) * scales_per_bk // chunk)
+    b_chunks = -(-n_groups * scales_per_bk // chunk)
+    slot = (a_chunks + b_chunks + 1) // 2 * 2 * chunk * (4 // vec)
+
+    def cap(depth):
+        return 3 if bdirect and depth > 3 else depth
+
+    ring_depth = cap((lds - slot) // (per_iter + slot))
+    if per_mfma_k > 1:
+        use_ring = scales_per_bk % vec == 0 and ring_depth >= 3
+    else:
+        use_ring = ring_depth >= 3 and ring_depth == cap(lds // per_iter)
+    prefetch = cap((lds - slot) // (per_iter + slot) if use_ring else lds // per_iter)
+    rows = instance.B_M // instance.GROUP_M + n_groups
+    k_fit = (
+        ((lds - prefetch * per_iter - 256) // rows - 16)
+        * instance.GROUP_K
+        // instance.B_K
+        * instance.B_K
+    )
+    fits = (
+        per_mfma_k > 1
+        and k_fit >= 4096
+        and not (
+            instance.B_M == 128 and instance.B_N == 128 and instance.B_K == 128 and not bdirect
+        )
+    )
+    return (min(k_fit, 8192) if fits else 8192) // instance.B_K
+
+
+def a8w8_mxscale_sf_panel_k_tiles(instance: OpusGemmInstance) -> int | None:
+    """Most K tiles one split of a kid with a whole-split LDS scale panel takes.
+
+    None when the kid has no such panel, or its family's bound is not mirrored
+    here (the launcher still checks it).
+    """
+    if getattr(instance, "sf_layout", 0) & 4:
+        return _a8w8_mxscale_sfa_panel_geometry(instance)[1]
+    if (
+        instance.kernel_tag in _FLATMM_SF_PANEL_TAGS
+        and instance.preload_sf
+        and not instance.shuffle_scale
+    ):
+        return _a8w8_mxscale_sf_preload_k_tiles(instance)
+    return None
 
 
 _BMM_M_ALIGN_TILES = {
@@ -772,7 +896,7 @@ _bmm_flatmm_local.update({
 def _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg_per_cu, prefetch_scale=False,
                                           preload_sf=False, shuffle_scale=False,
                                           tilen=False, sf_shuf_in_lds=False,
-                                          quant_block=128):
+                                          quant_block=128, group_n=None):
     """Preshuffled B bypassing LDS, on the flatmm producer/consumer split.
 
     Same kernel, launcher and tile geometry as the plain flatmm split-K family
@@ -795,8 +919,9 @@ def _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg_per_cu, prefetch_scale=
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
         # GROUP_M=1 (per-token); GROUP_N=GROUP_K=quant_block, DSv4's 128 or MX's
         # 32. The traits this family derives from carry the 32 path, so the only
-        # thing that made these 128-only was the literal.
-        1, quant_block, quant_block,
+        # thing that made these 128-only was the literal. group_n=1 overrides N
+        # alone, for OCP MX's per-row weight scale (see the 1x32 twins below).
+        1, quant_block if group_n is None else group_n, quant_block,
         ("a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen" if tilen
          else "a8w8_mxscale_bmm_bpreshuffle_bdirect"),
         ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
@@ -862,7 +987,8 @@ _bmm_bpre_bdirect_local.update({
 
 def _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg_per_cu, prefetch_scale=False,
                                        preload_sf=False, shuffle_scale=False,
-                                       sf_shuf_in_lds=False, quant_block=128):
+                                       sf_shuf_in_lds=False, quant_block=128,
+                                       group_n=None, sf_layout=0):
     """Preshuffled B staged through LDS by producer waves.
 
     Consumers read their MFMA fragments from LDS. The tile geometry matches
@@ -876,7 +1002,8 @@ def _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg_per_cu, prefetch_scale=Fal
         16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
         # GROUP_M=1 (per-token); GROUP_N=GROUP_K=quant_block, 128 or MX's 32.
-        1, quant_block, quant_block,
+        # group_n=1 overrides N alone; see the 1x32 twins below.
+        1, quant_block if group_n is None else group_n, quant_block,
         "a8w8_mxscale_bmm_bpreshuffle_blds",
         ["fp32_t"],
         wg_per_cu,
@@ -896,6 +1023,14 @@ def _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg_per_cu, prefetch_scale=Fal
         "shuffle_scale"
     )
     inst.sf_shuf_in_lds = sf_shuf_in_lds
+    assert sf_layout == 0 or (quant_block == 32 and not shuffle_scale), (
+        "x32k4 scales are read through the GROUP_K=32 scale ring only"
+    )
+    assert not (sf_layout & 2) or group_n == 1, (
+        "the B x32k4 order is per N row; a 32-row scale group has one row per 32"
+    )
+    assert (sf_layout & 5) != 5, "A is either panel-staged or x32k4, not both"
+    inst.sf_layout = sf_layout
     return inst
 
 
@@ -1166,6 +1301,155 @@ _bmm_bpre_bdirect_tilen_local.update(
 )
 
 
+# Derive GROUP_N=1 variants -- OCP MX's per-row weight scale, one e8m0 per N row
+# per 32 K -- from the plain GROUP_K=32 instances above.
+#
+# Until now 1x32 reached only the wave1 decode kids at 9700-9713, whose widest
+# tile is 64x64 and which always launch at split_k=1. These carry it to 128x128
+# and, because the family launches through gen_bmm_mxscale_flatmm_splitk_instance,
+# to split_k > 1 as well.
+#
+# The finer scale costs no extra scale group and no extra register: a group names
+# one N subtile and the lane names its row inside it, which is free because the
+# swap_ab MFMA already takes B's N row from lane % W_N. See sfb_panel_row in
+# opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh.
+#
+# What does change is the B scale panel, which now holds one row per N column
+# rather than one per 32 of them: N_SCALE_GROUPS becomes B_N, so a preload kid
+# falls off the whole-split LDS panel onto the bounded scale ring. That is the
+# fallback the ring was built for -- SF_RING_B_CHUNKS is already sized by
+# N_SCALE_GROUPS and the ring fill is a flat (row, K byte) copy, so neither had
+# to change -- and the pipeline's "a GROUP_K=32 preload kid needs the panel or
+# the ring, and neither fits" static_assert is what catches a tile where the
+# ring does not fit either, at compile time rather than at runtime.
+#
+# Shuffled-scale tiles get no twin: that layout packs one wave-uniform word per
+# N scale group, which a per-row scale has no equivalent of. mma_mxscale_tiled
+# static_asserts the same thing, so a future table edit cannot reintroduce it.
+#
+# No codegen registration: these reuse their mirrors' kernel tags, so the emit
+# functions already registered for blds and bdirect pick them up unchanged.
+#
+# IDs continue the 97xx band wave1's 1x32 kids started, and stay below the
+# gfx942 band at 10000.
+def _mx1x32_twins(local, ctor, twin_of, **ctor_kwargs):
+    """{new kid: the mirror's tile at GROUP_N=1, GROUP_K=32}."""
+    twins = {}
+    for kid, mirror in twin_of.items():
+        inst = local[mirror]
+        assert inst.GROUP_N == 32 and inst.GROUP_K == 32, (
+            f"kid{kid}'s mirror {mirror} must be a plain 32x32 tile, not "
+            f"{inst.GROUP_N}x{inst.GROUP_K}: the twin copies its geometry and "
+            "changes GROUP_N alone"
+        )
+        assert not (inst.shuffle_scale or getattr(inst, "sf_shuf_in_lds", False)), (
+            f"kid{kid}'s mirror {mirror} carries a shuffled scale, which has no "
+            "per-row form"
+        )
+        twins[kid] = ctor(
+            inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
+            prefetch_scale=inst.prefetch_scale,
+            preload_sf=inst.preload_sf,
+            quant_block=32,
+            group_n=1,
+            **ctor_kwargs,
+        )
+    return twins
+
+
+# The widest tiles first; the tail keeps a decode-sized spread so the heuristic
+# has something to fall to at small m.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_1X32_TWIN_OF = {
+    #  new: mirror        the mirror's geometry
+    1714: 1229,         # 128x128x128 wg1 preload -- the widest tile in the family
+    1716: 1230,         # 128x64x256  wg1 preload
+    1717: 1234,         # 128x64x256  wg1
+    1718: 1247,         # 64x128x256  wg1 preload
+    1719: 1233,         # 64x128x256  wg1
+    1720: 1252,         # 64x128x128  wg2
+    1721: 1250,         # 64x64x128   wg2 -- wave1's widest tile, for comparison
+    1722: 1251,         # 32x128x128  wg2
+    1723: 1248,         # 32x64x256   wg2
+    1724: 1398,         # 32x32x256   wg2 preload
+    1727: 1240,         # 16x32x256   wg2
+}
+_bmm_bpre_blds_local.update(
+    _mx1x32_twins(_bmm_bpre_blds_local, _a8w8_mxscale_bmm_bpreshuffle_blds,
+                  _BMM_MXSCALE_BPRESHUFFLE_BLDS_1X32_TWIN_OF)
+)
+
+# 1x32 blds kids again, reading x32k4 scales: B only (sf_layout=2), which a
+# weight-load shuffle serves, and A+B (3), which needs the quantizer to emit A
+# that way too. The tiles are the ones whose time moved when the row-major
+# scales were made to hit one line (zero row stride), i.e. the ring kids.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_X32_TWIN_OF = {
+    #  new: (1x32 kid, sf_layout)
+    1728: (1714, 2), 1729: (1716, 2), 1730: (1718, 2),
+    1731: (1721, 2), 1732: (1722, 2), 1733: (1723, 2),
+    1734: (1714, 3), 1735: (1716, 3), 1736: (1718, 3),
+    1737: (1721, 3), 1738: (1722, 3), 1739: (1723, 3),
+    # The 1x32 decode tiles, so an x32k4 w_scale is not stuck with 32x64 at
+    # small grids: 32x32x256 preload and 16x32x256.
+    1757: (1724, 2), 1758: (1727, 2),
+}
+for _kid, (_src, _layout) in _BMM_MXSCALE_BPRESHUFFLE_BLDS_X32_TWIN_OF.items():
+    _s = _bmm_bpre_blds_local[_src]
+    assert _s.GROUP_N == 1 and _s.GROUP_K == 32 and not _s.shuffle_scale
+    _bmm_bpre_blds_local[_kid] = _a8w8_mxscale_bmm_bpreshuffle_blds(
+        _s.B_M, _s.B_N, _s.B_K, _s.WG_PER_CU,
+        prefetch_scale=_s.prefetch_scale, preload_sf=_s.preload_sf,
+        quant_block=32, group_n=1, sf_layout=_layout,
+    )
+
+# The same 1x32 blds tiles with A's plain scales in a whole-split LDS panel and
+# B on the ring: row-major (4), which needs nothing from the producers, or x32k4
+# (6), which a weight-load shuffle serves. The K=256 tiles (1716/1718/1723)
+# are absent: with the panel set aside their A/B staging no longer fits three
+# prefetch slots plus the B ring.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_APANEL_TWIN_OF = {
+    #  new: (1x32 kid, sf_layout)
+    1746: (1714, 4), 1749: (1721, 4), 1750: (1722, 4),
+    1752: (1714, 6), 1755: (1721, 6), 1756: (1722, 6),
+}
+for _kid, (_src, _layout) in _BMM_MXSCALE_BPRESHUFFLE_BLDS_APANEL_TWIN_OF.items():
+    _s = _bmm_bpre_blds_local[_src]
+    assert _s.GROUP_N == 1 and _s.GROUP_K == 32 and not _s.shuffle_scale
+    _bmm_bpre_blds_local[_kid] = _a8w8_mxscale_bmm_bpreshuffle_blds(
+        _s.B_M, _s.B_N, _s.B_K, _s.WG_PER_CU,
+        prefetch_scale=_s.prefetch_scale, preload_sf=_s.preload_sf,
+        quant_block=32, group_n=1, sf_layout=_layout,
+    )
+
+# 32x32 ring kids again with the whole-split scale panel. At GROUP_N=32 B adds
+# B_N/32 panel rows, so the panel is in effect A's: every A row is read once as
+# one contiguous run instead of SCALES_PER_BK bytes per K tile.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_32X32_PANEL_TWIN_OF = {
+    #  new: ring kid
+    1740: 1250,     # 64x64x128   wg2
+    1741: 1251,     # 32x128x128  wg2
+    1742: 1248,     # 32x64x256   wg2
+    1743: 1252,     # 64x128x128  wg2
+    1745: 1249,     # 32x64x256   wg1
+}
+for _kid, _src in _BMM_MXSCALE_BPRESHUFFLE_BLDS_32X32_PANEL_TWIN_OF.items():
+    _s = _bmm_bpre_blds_local[_src]
+    assert _s.GROUP_N == 32 and _s.GROUP_K == 32 and not _s.preload_sf
+    _bmm_bpre_blds_local[_kid] = _a8w8_mxscale_bmm_bpreshuffle_blds(
+        _s.B_M, _s.B_N, _s.B_K, _s.WG_PER_CU, preload_sf=True, quant_block=32,
+    )
+
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_1X32_TWIN_OF = {
+    #  new: mirror        the mirror's geometry
+    1715: 1184,         # 128x128x128 wg1 preload
+    1725: 1171,         # 64x32x256   wg2
+    1726: 1173,         # 16x32x256   wg2
+}
+_bmm_bpre_bdirect_local.update(
+    _mx1x32_twins(_bmm_bpre_bdirect_local, _a8w8_mxscale_bmm_bpreshuffle_bdirect,
+                  _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_1X32_TWIN_OF)
+)
+
+
 def _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg_per_cu, xcd_wgm=0,
                                           mpack_sfa=False, shuffle_scale=False,
                                           sf_shuf_in_lds=False, quant_block=128):
@@ -1278,18 +1562,19 @@ _bmm_bpre_wave8n4_local.update({
 def _a8w8_mxscale_bmm_bpreshuffle_wavetm1(block_size, bm, bn, bk, wg_per_cu,
                                           xcd_wgm=0, mpack_sfa=False,
                                           shuffle_scale=False, sf_shuf_in_lds=False,
-                                          quant_block=128, blds=False):
+                                          quant_block=128, blds=False, group_n=None):
     """T_M=1 tiles with A fragments retained in registers at B_M=128.
 
     BLOCK_SIZE selects a 1x8 or 1x4 grid. The blds variant stages B through
-    the LDS ring; the direct-B variant loads it into registers."""
+    the LDS ring; the direct-B variant loads it into registers. group_n=1
+    overrides N alone (the 1x32 twins below)."""
     inst = OpusGemmInstance(
         block_size,     # BLOCK_SIZE (512 -> 8 waves / 1x8, 256 -> 4 waves / 1x4)
         bm, bn, bk,     # BLOCK tile
         1, block_size // 64,  # T_M, T_N (name only; traits derive the real grid)
         16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
-        1, quant_block, quant_block,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K
+        1, quant_block if group_n is None else group_n, quant_block,
         "a8w8_mxscale_bmm_bpreshuffle_wavetm1" + ("_blds" if blds else ""),
         ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
         wg_per_cu,
@@ -1459,6 +1744,28 @@ _bmm_bpre_wavetm1_local.update(
     _mx32_wave8_twins(_bmm_bpre_wavetm1_local, _a8w8_mxscale_bmm_bpreshuffle_wavetm1,
                       "BLOCK_SIZE", skip=frozenset({407, 411, 453}))
 )
+
+# 1x32 (GROUP_N=1) wavetm1 tiles: the large-M tiles 1x32 lacked, which the
+# 32x32 table runs at 1203/1205. The B panel holds a row per N column, so the
+# kid takes its CU alone (see SF_PANEL_RESIDENT_WGS) to keep a whole split in
+# the panel.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X32_TWIN_OF = {
+    #  new: 32x32 mirror   the mirror's geometry
+    1760: 1203,         # 128x256x128 1x4
+    1761: 1205,         # 128x256x128 1x4 xcd4
+    1762: 1202,         # 128x256x128 1x8
+    1763: 1404,         # 128x256x128 1x8 xcd4
+    1764: 1406,         # 128x128x128 1x4 xcd4
+    1765: 1410,         # 128x128x256 1x4 xcd4
+    1766: 1405,         # 64x128x256  1x4 xcd4
+}
+for _kid, _src in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X32_TWIN_OF.items():
+    _s = _bmm_bpre_wavetm1_local[_src]
+    assert _s.GROUP_N == 32 and _s.GROUP_K == 32 and not _s.shuffle_scale
+    _bmm_bpre_wavetm1_local[_kid] = _a8w8_mxscale_bmm_bpreshuffle_wavetm1(
+        _s.BLOCK_SIZE, _s.B_M, _s.B_N, _s.B_K, _s.WG_PER_CU,
+        xcd_wgm=_s.xcd_wgm, quant_block=32, group_n=1,
+    )
 _bmm_bpre_wavetm1_blds_local.update(
     # GROUP_K=32 counterparts of the wave8n4 tiles.
     _mx32_wave8_twins(_bmm_bpre_wavetm1_blds_local,

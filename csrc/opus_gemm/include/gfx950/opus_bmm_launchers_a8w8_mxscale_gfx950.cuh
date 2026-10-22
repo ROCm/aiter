@@ -25,7 +25,8 @@ static void opus_bmm_a8w8_common_checks(aiter_tensor_t &O, aiter_tensor_t &wo_a,
                                         aiter_tensor_t &x_scale,
                                         aiter_tensor_t &w_scale,
                                         const char *who,
-                                        int group_n, int group_k)
+                                        int group_n, int group_k,
+                                        int sf_layout = 0)
 {
   aiter_detail::g_aiter_can_throw = true;
   AITER_CHECK(O.dim() == 3 && wo_a.dim() == 3 && Y.dim() == 3 &&
@@ -61,13 +62,33 @@ static void opus_bmm_a8w8_common_checks(aiter_tensor_t &O, aiter_tensor_t &wo_a,
               who, ": wo_a must have shape [batch,N,K]");
   AITER_CHECK(Y.size(0) == M && Y.size(1) == batch && Y.size(2) == N,
               who, ": Y must have shape [M,batch,N]");
-  AITER_CHECK(x_scale.size(0) == M && x_scale.size(1) == batch &&
-                  x_scale.size(2) == K / group_k,
-              who, ": x_scale must have shape [M,batch,K/", group_k, "]");
-  AITER_CHECK(w_scale.size(0) == batch && w_scale.size(1) == N / group_n &&
-                  w_scale.size(2) == K / group_k,
-              who, ": w_scale must have shape [batch,N/", group_n, ",K/",
-              group_k, "]");
+  // x32k4 (sf_layout bit 0 for A, bit 1 for B): shuffle_scale_n32k4's order,
+  // 32 rows x 4 K-scales per 128-byte line, so the row axis shrinks by 32 and
+  // the K axis carries K/32 * 32 = K bytes. Same strides otherwise, which is
+  // what lets the launcher fill kargs from them unchanged.
+  if (sf_layout & 1) {
+    AITER_CHECK(group_k == 32 && K % 128 == 0, who,
+                ": an x32k4 x_scale needs GROUP_K=32 and K % 128 == 0");
+    AITER_CHECK(x_scale.size(0) == (M + 31) / 32 && x_scale.size(1) == batch &&
+                    x_scale.size(2) == K,
+                who, ": x32k4 x_scale must have shape [ceil(M/32),batch,K]");
+  } else {
+    AITER_CHECK(x_scale.size(0) == M && x_scale.size(1) == batch &&
+                    x_scale.size(2) == K / group_k,
+                who, ": x_scale must have shape [M,batch,K/", group_k, "]");
+  }
+  if (sf_layout & 2) {
+    AITER_CHECK(group_n == 1 && group_k == 32 && N % 32 == 0 && K % 128 == 0, who,
+                ": an x32k4 w_scale needs a 1x32 block, N % 32 == 0 and K % 128 == 0");
+    AITER_CHECK(w_scale.size(0) == batch && w_scale.size(1) == N / 32 &&
+                    w_scale.size(2) == K,
+                who, ": x32k4 w_scale must have shape [batch,N/32,K]");
+  } else {
+    AITER_CHECK(w_scale.size(0) == batch && w_scale.size(1) == N / group_n &&
+                    w_scale.size(2) == K / group_k,
+                who, ": w_scale must have shape [batch,N/", group_n, ",K/",
+                group_k, "]");
+  }
 
   AITER_CHECK(O.device_id == wo_a.device_id && O.device_id == Y.device_id &&
                   O.device_id == x_scale.device_id &&

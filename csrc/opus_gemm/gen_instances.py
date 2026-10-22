@@ -820,11 +820,11 @@ class opus_gemm_codegen:
         # the table below travels with the dispatch table rather than the check
         # hardcoding 128, which is what rejected the first GROUP_K=32 launch.
         group_entry = """\
-    {{ {kid}, {{ {group_n}, {group_k} }} }},  \\
+    {{ {kid}, {{ {group_n}, {group_k}, {sf_layout} }} }},  \\
 """
 
         rows = sorted(
-            (kid, instance.name, instance.GROUP_N, instance.GROUP_K)
+            (kid, instance.name, instance.GROUP_N, instance.GROUP_K, instance.sf_layout)
             for family in a8w8_mxscale_bmm_kernel_lists
             for kid, instance in family.items()
             if "fp32_t" in instance.output_dtypes
@@ -854,7 +854,12 @@ class opus_gemm_codegen:
                 f,
                 "GENERATE_BMM_MXSCALE_KID_GROUPS",
                 group_entry,
-                lambda r: {"kid": r[0], "group_n": r[2], "group_k": r[3]},
+                lambda r: {
+                    "kid": r[0],
+                    "group_n": r[2],
+                    "group_k": r[3],
+                    "sf_layout": r[4],
+                },
             )
 
     def gen_manifest_head(self, kernels_dict):

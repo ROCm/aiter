@@ -216,6 +216,10 @@ def lookup_mxscale_bmm_config(
 
 @functools.lru_cache(maxsize=64)
 def _w_scale_block_of(w_scale_shape: tuple, n: int, k: int) -> str:
+    # [.., N/32, K] is a 1x32 scale in shuffle_scale_n32k4's layout; no plain
+    # block keeps K whole, so the shape alone tells the two apart.
+    if w_scale_shape[-1] == k and w_scale_shape[-2] * 32 == n:
+        return "1x32n32k4"
     return mxscale_w_scale_block(w_scale_shape, n, k)
 
 
@@ -332,7 +336,11 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     libtype = (
         cfg["libtype"]
         if cfg is not None
-        else ("opus" if w_scale_block == "1x32" and get_gfx() == "gfx950" else "flydsl")
+        else (
+            "opus"
+            if w_scale_block in ("1x32", "1x32n32k4") and get_gfx() == "gfx950"
+            else "flydsl"
+        )
     )
 
     if libtype == "opus":
@@ -406,12 +414,16 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
     * ``x_scale`` : [M, G, K/block] uint8 e8m0, row-major, i.e.
                     ``inverse_rope_group_quant(..., scale_layout="row")``; every
                     backend reads it that way.
-    * ``w_scale`` : [G, N/group_n, K/group_k] uint8 e8m0.
+    * ``w_scale`` : [G, N/group_n, K/group_k] uint8 e8m0, or for 1x32 also
+                    ``shuffle_scale_n32k4(w_scale)``, [G, N/32, K].
 
     The arch and the w_scale block select the kernels:
 
     * gfx950, 1x32: OPUS, with weight scales [G,N,K/32] and activation
       scales [M,G,K/32]. Requires N divisible by 16 and K divisible by 128.
+      The n32k4 weight scale, relaid once at load, selects kernels that read
+      it in that layout (N divisible by 64); they are faster once G*M is a
+      few hundred rows, slower in decode.
     * gfx950, 32x32 or 128x128: the tuned row's libtype, opus or flydsl,
       whichever was faster at that shape; flydsl's heuristic off the table.
       DeepSeek-V4.1's original wo_a weight (32x32) and V4's (128x128) both run

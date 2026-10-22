@@ -28,7 +28,12 @@ from csrc.opus_gemm.opus_gemm_common import (
 
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
-from ..gemm_op_common import get_padded_m, with_mxscale_w_scale_block
+from ..gemm_op_common import (
+    MXSCALE_BMM_W_SCALE_BLOCKS,
+    MXSCALE_W_SCALE_BLOCKS,
+    get_padded_m,
+    with_mxscale_w_scale_block,
+)
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
     _A8W8_MXSCALE_BMM_PREFETCH_TAGS,
@@ -631,7 +636,22 @@ def _load_mxscale_bmm_tuned(
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
-    df = with_mxscale_w_scale_block(df, path)
+    df = with_mxscale_w_scale_block(
+        df,
+        path,
+        blocks=MXSCALE_BMM_W_SCALE_BLOCKS if bpreshuffle else MXSCALE_W_SCALE_BLOCKS,
+    )
+    # Only opus kids read an x32k4 w_scale; any other backend would take the
+    # shuffled bytes for plain ones.
+    if "libtype" in df.columns:
+        foreign = df["w_scale_block"].eq("1x32n32k4") & df["libtype"].ne("opus")
+        if foreign.any():
+            logger.warning(
+                "%s: dropping %d 1x32n32k4 row(s) whose libtype is not opus",
+                path,
+                int(foreign.sum()),
+            )
+            df = df[~foreign]
 
     if libtype is not None and "libtype" in df.columns:
         df = df[df["libtype"] == libtype].copy()
@@ -769,7 +789,12 @@ def mxscale_bmm_group_of_block(w_scale_block: str) -> int:
 
 
 def mxscale_bmm_groups_of_block(w_scale_block: str) -> tuple[int, int]:
-    groups = {"1x32": (1, 32), "32x32": (32, 32), "128x128": (128, 128)}
+    groups = {
+        "1x32": (1, 32),
+        "1x32n32k4": (1, 32),
+        "32x32": (32, 32),
+        "128x128": (128, 128),
+    }
     if w_scale_block not in groups:
         raise ValueError(f"unsupported OPUS MXFP8 BMM scale block {w_scale_block!r}")
     return groups[w_scale_block]
@@ -853,10 +878,13 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
     group_size: int = 128,
     group_n: int | None = None,
     output_dtype="bf16",
+    w_scale_n32k4: bool = False,
 ) -> int | None:
     """A preshuffled-B kid that runs this shape, for a shape the table lacks.
 
     Per-row K32 scales prefer larger tiles for sufficiently large output grids.
+    ``w_scale_n32k4`` selects among the kids that read a 1x32 w_scale in the
+    x32k4 (``shuffle_scale_n32k4``) layout.
     Every candidate is checked for admissibility; None when no candidate runs.
     """
     from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernels_list
@@ -866,14 +894,79 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
     block = f"{group_n}x{group_size}"
     mxscale_bmm_groups_of_block(block)
     if block == "1x32":
-        # The 64x64 tile amortizes operand/scale loads once there are enough
-        # output tiles. Smaller grids retain the decode tiles; tuned rows can
-        # additionally choose split-K. Keep K128/N16 alignment fallbacks.
-        wide_tiles = g * ((m + 63) // 64) * (n // 64)
-        preferred = (9713,) if m >= 64 and wide_tiles >= 256 else ()
-        if m >= 256:
-            preferred += (9703,)
-        for kid in (*preferred, 9700, 9704, 9708, 9710):
+        # Fitted to an sk1 sweep of every 1x32 kid over G 1-16, M 1-4096,
+        # N 512-4096, K 1024-7168: within ~2% of the per-shape best on
+        # geomean. What decides the tile is how many 64x64 output tiles the
+        # grid has against the 256 CUs; M only matters where a tile's rows
+        # would sit empty. The first pick may not run the shape (9724 holds
+        # at most 25 K-tiles, the 128-wide tiles need N%128), so each is
+        # followed by kids with looser bounds.
+        tiles_64 = g * ((m + 63) // 64) * (n // 64)
+        if w_scale_n32k4:
+            if tiles_64 <= 128 or (m <= 16 and tiles_64 <= 256):
+                # 9757 holds at most 25 K-tiles; past that 9758 while its
+                # 16x32 grid is small, 9733 once it is not.
+                tiles_16x32 = g * ((m + 15) // 16) * (n // 32)
+                preferred = (
+                    (9757, 9758, 9733) if tiles_16x32 <= 512 else (9757, 9733, 9758)
+                )
+            elif tiles_64 <= 256 or m <= 64:
+                preferred = (9731, 9755)
+            elif tiles_64 <= 512:
+                preferred = (9729, 9755)
+            else:
+                preferred = (9728, 9752)
+            fallback = (
+                9731, 9755, 9733, 9732, 9756, 9728, 9752, 9729, 9730, 9757, 9758
+            )
+        else:
+            t = tiles_64
+            if m <= 16:
+                preferred = (
+                    (9709,) if t <= 64 else (9705,) if t <= 128
+                    else (9701,) if t <= 512 else (9706,)
+                )
+            elif m <= 32:
+                preferred = (
+                    (9709,) if t <= 32 else (9705,) if t <= 64
+                    else (9724, 9703) if t <= 128 else (9724, 9721)
+                )
+            else:
+                # Past 128 tiles the wavetm1 per-row kids (9760-9766) win, up to
+                # 1.9x over 9715 at 2048+; 1.008x of the per-shape best on
+                # geomean over the M>32 half of the sweep, at most 1.15x.
+                preferred = (
+                    (9708,) if t <= 16 else (9700,) if t <= 32
+                    else (9724, 9703) if t <= 64 else (9725,) if t <= 128
+                    else (9766, 9721) if t <= 256
+                    else (9766, 9716 if m >= 128 else 9719) if t <= 512
+                    else (9765, 9764, 9715) if t <= 1024
+                    else (9761, 9763, 9715) if t <= 2048
+                    else (9761, 9760, 9715)
+                )
+            fallback = (9714, 9721, 9725, 9700, 9704, 9708, 9710)
+
+        # The tile count above is in 64-row units, so it cannot see a pick
+        # whose rows sit mostly empty (M=192 on a 128-row tile pads by a
+        # third). Below 80% row use the next smaller tile goes first.
+        def rows_used(rows):
+            return m / (-(-m // rows) * rows) >= 0.8
+
+        rows = a8w8_mxscale_bmm_kernels_list[preferred[0]].B_M
+        if m > 32 and not rows_used(rows):
+            if w_scale_n32k4:
+                if rows == 128:
+                    preferred = (9755, 9731, *preferred)
+            elif rows == 128:
+                smaller = (9766, 9721) if rows_used(64) else (9724, 9725, 9721)
+                preferred = (*smaller, *preferred)
+            elif rows == 64:
+                preferred = (9724, 9725, *preferred)
+        for kid in (*preferred, *fallback):
+            if not _bpreshuffle_fallback_k_tiles_ok(
+                a8w8_mxscale_bmm_kernels_list[kid], k
+            ):
+                continue
             try:
                 _get_cached_a8w8_mxscale_bmm_plan(
                     get_gfx(), kid, output_dtype, m, g, n, k, 1
@@ -925,17 +1018,20 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
 
 
 @cache
-def _mxscale_bmm_kid_table() -> dict[int, tuple[int, bool, bool, int, int]]:
-    """kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales, GROUP_K)."""
+def _mxscale_bmm_kid_table() -> dict[int, tuple[int, bool, bool, int, int, bool, bool]]:
+    """kid -> (m_align, needs_preshuffled_b, needs_host_rearranged_scales,
+    GROUP_K, GROUP_N, x32k4 w_scale, host-rearranged x_scale)."""
     from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
 
     return {
         int(kid): (
             int(inst.m_align),
             bool(inst.needs_preshuffled_b),
-            bool(inst.needs_mpacked_sfa or inst.needs_shuffle_scale),
+            bool(inst.needs_mpacked_sfa or inst.needs_shuffle_scale or inst.sf_layout & 3),
             int(inst.GROUP_K),
             int(inst.GROUP_N),
+            bool(inst.sf_layout & 2),
+            bool(inst.needs_mpacked_sfa or inst.needs_shuffle_scale or inst.sf_layout & 1),
         )
         for fam in a8w8_mxscale_bmm_kernel_lists
         for kid, inst in fam.items()
@@ -967,9 +1063,21 @@ def mxscale_bmm_kid_group(kid: int) -> int | None:
 
 
 def mxscale_bmm_kid_block(kid: int) -> str | None:
-    """Complete weight-scale block, including independent N grouping."""
+    """Complete weight-scale block, including independent N grouping.
+
+    A kid reading its w_scale in the x32k4 layout reports the block with an
+    ``n32k4`` suffix, which is also what the tuned table keys its rows on.
+    """
     entry = _mxscale_bmm_kid_table().get(int(kid))
-    return None if entry is None else f"{entry[4]}x{entry[3]}"
+    if entry is None:
+        return None
+    return f"{entry[4]}x{entry[3]}" + ("n32k4" if entry[5] else "")
+
+
+def mxscale_bmm_kid_takes_plain_x_scale(kid: int) -> bool:
+    """True iff kid reads x_scale as the public entry passes it, row-major."""
+    entry = _mxscale_bmm_kid_table().get(int(kid))
+    return entry is not None and not entry[6]
 
 
 def resolve_a8w8_mxscale_bmm_plan(
@@ -982,7 +1090,7 @@ def resolve_a8w8_mxscale_bmm_plan(
 ) -> tuple[int, int]:
     """Resolve one final global kid/split pair for the caller's scale blocks."""
     group_size = mxscale_bmm_group_of_block(w_scale_block)
-    if w_scale_block == "1x32":
+    if w_scale_block in ("1x32", "1x32n32k4"):
         raise ValueError("1x32 OPUS BMM requires the preshuffled-weight entry")
     config = lookup_mxscale_bmm_config(g, m, n, k, w_scale_block=w_scale_block)
     libtype = config.get("libtype", "opus") if config is not None else "opus"
@@ -1043,6 +1151,7 @@ __all__ = [
     "mxscale_bmm_kid_group",
     "mxscale_bmm_kid_runs_m",
     "mxscale_bmm_kid_takes_b_layout",
+    "mxscale_bmm_kid_takes_plain_x_scale",
     "mxscale_bmm_kid_takes_plain_scales",
     "resolve_a8w8_mxscale_bmm_plan",
     "resolve_a16w16_caller_candidate",

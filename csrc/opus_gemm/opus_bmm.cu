@@ -21,6 +21,7 @@
 #include "aiter_stream.h"
 #include "gfx950/opus_bmm_launchers_a8w8_mxscale_gfx950.cuh"
 
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -61,12 +62,13 @@ opus_bmm_a8w8_mxscale_exact_dispatch(int kid)
 }
 #endif  // OPUS_BUILD_HAS_GFX950
 
-// (GROUP_N, GROUP_K) for a kid: 128 for the DSv4 block, 32 for the MX one.
+// (GROUP_N, GROUP_K, scale layout) for a kid: 128 for the DSv4 block, 32 for
+// the MX one; the layout bits say which scale buffers arrive x32k4-ordered.
 // Built from the same generated table as the dispatch, so a kid cannot be
 // dispatched with a scale shape nobody checked against its own blocks.
-static std::pair<int, int> opus_bmm_mxscale_kid_groups(int kid)
+static std::tuple<int, int, int> opus_bmm_mxscale_kid_groups(int kid)
 {
-  static const std::unordered_map<int, std::pair<int, int>> kGroups = {
+  static const std::unordered_map<int, std::tuple<int, int, int>> kGroups = {
       GENERATE_BMM_MXSCALE_KID_GROUPS
   };
   auto it = kGroups.find(kid);
@@ -94,7 +96,8 @@ void opus_gemm_a8w8_mxscale_bmm_launch(
   const auto groups = opus_bmm_mxscale_kid_groups(kid);
   opus_bmm_a8w8_common_checks(O, wo_a, Y, x_scale, w_scale,
                               "opus_gemm_a8w8_mxscale_bmm_launch",
-                              groups.first, groups.second);
+                              std::get<0>(groups), std::get<1>(groups),
+                              std::get<2>(groups));
 #ifndef OPUS_BUILD_HAS_GFX950
   AITER_CHECK(false,
               "opus_gemm_a8w8_mxscale_bmm_launch requires "
