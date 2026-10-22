@@ -20,6 +20,23 @@ constexpr int32_t kHeadDim             = 128;
 constexpr int32_t kMxfp4KTileBytes     = 8192;
 constexpr int32_t kMxfp4VScaleBytes    = 512;
 constexpr int32_t kMxfp4VBufferSlack   = 64;
+
+// Index of the (batch, head, tile) group an invocation writes. `head_split` splits the head axis
+// into (heads / head_split, head_split); the inner index is placed inside the tile axis, so the
+// group covers head_split consecutive tiles. head_split == 1 is the plain hd128 tile order.
+//
+// hd256 runs as 2h half-heads and passes 2. Its group is NOT a plain (tile, half) nesting: inside
+// the 2-tile group the order is (token_half, half, channel), i.e. the token half sits OUTSIDE the
+// head half, so each kernel rebuilds its own within-group offset rather than scaling this value.
+__device__ __forceinline__ int64_t mxfp4_tile_group(const int64_t batch,
+                                                    const int32_t head,
+                                                    const int32_t heads,
+                                                    const int32_t tile,
+                                                    const int32_t tiles,
+                                                    const int32_t head_split)
+{
+    return (batch * (heads / head_split) + head / head_split) * tiles + tile;
+}
 constexpr int32_t kMxfp6KTileBytes     = 17408;
 constexpr int32_t kMxfp6C1Offset       = 8192;
 constexpr int32_t kMxfp6ScaleTailA     = 16384;
@@ -481,7 +498,8 @@ __global__ void hadamard_rotate_activation_mxfp4_quant_kernel(
     const int32_t sequence = 0,
     const int32_t heads    = 0,
     const int32_t tiles    = 0,
-    float const* __restrict__ mean = nullptr)
+    float const* __restrict__ mean = nullptr,
+    const int32_t head_split       = 1)
 {
     constexpr int dim         = 128;
     constexpr int warp_size   = opus::get_warp_size();
@@ -567,9 +585,14 @@ __global__ void hadamard_rotate_activation_mxfp4_quant_kernel(
             const int32_t tile_token = token % 128;
             const int32_t chunk      = lane / 2;
             const int32_t chunk_byte = (lane % 2) * 8;
-            const int64_t head_tile  = (static_cast<int64_t>(batch) * heads + head) * tiles + tile;
+            const int64_t group =
+                mxfp4_tile_group(batch, head, heads, tile, tiles, head_split);
             const int64_t offset =
-                head_tile * kMxfp4KTileBytes + chunk * 2048 + tile_token * 16 + chunk_byte;
+                head_split == 1
+                    ? group * kMxfp4KTileBytes + chunk * 2048 + tile_token * 16 + chunk_byte
+                    : group * 2 * kMxfp4KTileBytes + (tile_token / 64) * kMxfp4KTileBytes +
+                          (head % 2) * (kMxfp4KTileBytes / 2) + chunk * 1024 +
+                          (tile_token % 64) * 16 + chunk_byte;
             *reinterpret_cast<packed_t*>(out + offset) = packed;
         }
         else
@@ -607,7 +630,8 @@ __global__ __launch_bounds__(64) void quantize_v_mxfp4_kernel(
     DTYPE_I const* __restrict__ input,
     const int32_t sequence,
     const int32_t heads,
-    const int32_t tiles)
+    const int32_t tiles,
+    const int32_t head_split)
 {
     const int32_t pair        = threadIdx.x / 4;
     const int32_t token_slice = threadIdx.x % 4;
@@ -669,10 +693,14 @@ __global__ __launch_bounds__(64) void quantize_v_mxfp4_kernel(
     const uint8_t scale_hi = get_scale(abs_max_hi);
     const float reciprocal_lo = __builtin_bit_cast(float, (254u - scale_lo) << 23);
     const float reciprocal_hi = __builtin_bit_cast(float, (254u - scale_hi) << 23);
-    const int64_t head_tile = batch_head * tiles + tile;
+    const int64_t group = mxfp4_tile_group(batch, head, heads, tile, tiles, head_split);
+    const int32_t inner = head % head_split;
     const int32_t payload_unit = 2 * channel_block + token_half;
     const int64_t out_base =
-        head_tile * kMxfp4KTileBytes + payload_unit * 1024 + token_block * 512;
+        head_split == 1
+            ? group * kMxfp4KTileBytes + payload_unit * 1024 + token_block * 512
+            : group * 2 * kMxfp4KTileBytes + token_half * kMxfp4KTileBytes +
+                  inner * (kMxfp4KTileBytes / 2) + channel_block * 1024 + token_block * 512;
 
 #pragma unroll
     for(int32_t i = 0; i < 8; ++i)
@@ -698,8 +726,12 @@ __global__ __launch_bounds__(64) void quantize_v_mxfp4_kernel(
         out[out_base + column_in_block * 16 + pair] = static_cast<uint8_t>(packed);
     }
 
-    const int64_t scale_base = head_tile * kMxfp4VScaleBytes + token_half * 256 +
-                               token_block * 128 + pair * 8 + channel_block;
+    const int32_t scale_in_unit = token_block * 128 + pair * 8 + channel_block;
+    const int64_t scale_base =
+        head_split == 1
+            ? group * kMxfp4VScaleBytes + token_half * 256 + scale_in_unit
+            : group * 2 * kMxfp4VScaleBytes + token_half * kMxfp4VScaleBytes +
+                  inner * (kMxfp4VScaleBytes / 2) + scale_in_unit;
     if(token_slice == 0)
     {
         scale[scale_base] = scale_lo;
@@ -1087,7 +1119,8 @@ void rotate_activation_mxfp4_quant(aiter_tensor_t& out,
 void rotate_activation_mxfp4_quant_k(aiter_tensor_t& out,
                                      aiter_tensor_t& scale,
                                      const aiter_tensor_t& input,
-                                     const aiter_tensor_t& mean)
+                                     const aiter_tensor_t& mean,
+                                     int64_t head_split)
 {
     constexpr int64_t tile = kHeadDim;
     AITER_CHECK(input.dim() == 4, "input must be BSHD");
@@ -1095,7 +1128,9 @@ void rotate_activation_mxfp4_quant_k(aiter_tensor_t& out,
     const int64_t sequence = input.size(1);
     const int64_t heads    = input.size(2);
     const int64_t tiles    = (sequence + tile - 1) / tile;
-    AITER_CHECK(out.numel() == batch * heads * tiles * kMxfp4KTileBytes,
+    AITER_CHECK((head_split == 1 || head_split == 2) && heads % head_split == 0,
+                "head_split must be 1 or 2 and divide the head count");
+    AITER_CHECK(out.numel() >= batch * heads * tiles * kMxfp4KTileBytes,
                 "out must have one padded 8192-byte tile per batch and head");
     // aiter_tensor_t has no as_strided; pass the logical (unpadded) out numel.
     check_inputs<64>(out, scale, input, static_cast<int64_t>(input.numel()) / 2);
@@ -1120,14 +1155,16 @@ void rotate_activation_mxfp4_quant_k(aiter_tensor_t& out,
                                                     sequence,
                                                     heads,
                                                     tiles,
-                                                    mean_ptr);
+                                                    mean_ptr,
+                                                    static_cast<int32_t>(head_split));
     });
 }
 
 template <bool FP6_P>
 void quantize_v_mxfp4_impl(aiter_tensor_t& out,
                            aiter_tensor_t& scale,
-                           const aiter_tensor_t& input)
+                           const aiter_tensor_t& input,
+                           int64_t head_split)
 {
     AITER_CHECK(get_gpu_arch() == "gfx950", "MXFP4 V quantization requires gfx950");
     AITER_CHECK(input.is_gpu(), "input must be on a GPU");
@@ -1149,9 +1186,12 @@ void quantize_v_mxfp4_impl(aiter_tensor_t& out,
     const int64_t tiles    = (sequence + kHeadDim - 1) / kHeadDim;
     const int64_t blocks   = batch * heads * tiles * 16;
     AITER_CHECK(sequence > 0, "sequence must be positive");
-    AITER_CHECK(out.numel() == batch * heads * tiles * kMxfp4KTileBytes + kMxfp4VBufferSlack,
+    AITER_CHECK((head_split == 1 || head_split == 2) && heads % head_split == 0,
+                "head_split must be 1 or 2 and divide the head count");
+    // >= rather than ==: hd256 owns a longer buffer with its own gather slack.
+    AITER_CHECK(out.numel() >= batch * heads * tiles * kMxfp4KTileBytes + kMxfp4VBufferSlack,
                 "out must have one 8192-byte tile per batch and head plus 64-byte slack");
-    AITER_CHECK(scale.numel() == batch * heads * tiles * kMxfp4VScaleBytes,
+    AITER_CHECK(scale.numel() >= batch * heads * tiles * kMxfp4VScaleBytes,
                 "scale must have 512 bytes per tile");
 
     HipDeviceGuard device_guard(input.device_id);
@@ -1164,20 +1204,25 @@ void quantize_v_mxfp4_impl(aiter_tensor_t& out,
             reinterpret_cast<DTYPE_I const*>(input.data_ptr()),
             sequence,
             heads,
-            tiles);
+            tiles,
+            static_cast<int32_t>(head_split));
     });
 }
 
 void quantize_v_mxfp4_fp6_p(aiter_tensor_t& out,
                             aiter_tensor_t& scale,
-                            const aiter_tensor_t& input)
+                            const aiter_tensor_t& input,
+                            int64_t head_split)
 {
-    quantize_v_mxfp4_impl<true>(out, scale, input);
+    quantize_v_mxfp4_impl<true>(out, scale, input, head_split);
 }
 
-void quantize_v_mxfp4(aiter_tensor_t& out, aiter_tensor_t& scale, const aiter_tensor_t& input)
+void quantize_v_mxfp4(aiter_tensor_t& out,
+                      aiter_tensor_t& scale,
+                      const aiter_tensor_t& input,
+                      int64_t head_split)
 {
-    quantize_v_mxfp4_impl<false>(out, scale, input);
+    quantize_v_mxfp4_impl<false>(out, scale, input, head_split);
 }
 
 } // namespace torch_itfs
