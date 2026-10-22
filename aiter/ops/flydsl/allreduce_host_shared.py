@@ -11,13 +11,13 @@ import torch
 import torch.distributed as dist
 
 from .allreduce_policy import resolve_link
+from .ipc_heap import UncachedIpcHeap
 from .kernels.comm.allreduce_shared import (
     MAX_PAYLOAD_BYTES,
     PAYLOAD_ALIGN_BYTES,
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
 )
-from .quick_allreduce_ipc import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
 
