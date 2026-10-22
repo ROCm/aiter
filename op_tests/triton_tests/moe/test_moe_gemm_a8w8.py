@@ -216,6 +216,8 @@ class Case:
             Case(300, 400, 416, "mxfloat8_e4m3fnuz", "float8_e4m3fnuz", 8, 2),
             Case(300, 400, 416, "float8_e4m3fnuz", "mxfloat8_e4m3fnuz", 8, 2),
             Case(300, 400, 416, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 8, 2),
+            # K=448 has no table entry and takes the BLOCK_K=64 (two-slice) path.
+            Case(300, 400, 448, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 8, 2),
             Case(1, 512, 6144, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 256, 8),
             Case(16, 6144, 256, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 256, 8),
             Case(1024, 512, 6144, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 256, 8),
