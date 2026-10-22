@@ -6718,6 +6718,34 @@ class FhmoeTuner(FmoeTuner):
         if hasattr(fmoe_module, "cfg_2stages_by_file"):
             fmoe_module.cfg_2stages_by_file.clear()
 
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        df = super().get_untuned_gemm_list(untuned_gemm_file)
+        # A tuned file read back for an in-place retune holds the rows of every
+        # GPU and is rewritten whole, so its other targets must survive.
+        if "kernelName1" in df.columns:
+            return df
+        live = {"gfx": self.get_gfx(), "cu_num": self.get_cu_num()}
+        foreign = pd.Series(False, index=df.index)
+        for col, value in live.items():
+            if col not in df.columns:
+                continue
+            if col == "cu_num":
+                declared = pd.to_numeric(df[col], errors="coerce")
+            else:
+                declared = df[col].astype(str).str.strip()
+            foreign |= df[col].notna() & (declared != value)
+        if foreign.any():
+            print(
+                f"[fhmoe] skipping {int(foreign.sum())} rows pinned to another "
+                f"target (live GPU is {live['gfx']} with {live['cu_num']} CUs)",
+                flush=True,
+            )
+        df = df[~foreign].reset_index(drop=True)
+        for col, value in live.items():
+            if col in df.columns:
+                df[col] = value
+        return df
+
     # _kernel_pairs only builds MXFP4-weight pairs; tuned_fhmoe.csv also holds
     # HY4 FP8-weight rows owned by op_tests/tuners/tune_fhmoe.py.
     _OWNED_Q_DTYPE_W = "torch.float4_e2m1fn_x2"
