@@ -94,6 +94,30 @@ def pertoken_quant(
     return y, y_scale
 
 
+def mxfp8_to_per_row_fp8(weight, weight_scale, quant_dtype=dtypes.fp8, block_size=32):
+    """Requantize an MXFP8 weight to one fp32 scale per output row, for per-token GEMMs.
+
+    weight is [N, K] float8_e4m3fn and weight_scale its E8M0 block scales, one per
+    row and K block: [N, K/block_size] uint8 or float8_e8m0fnu. Each row's scale
+    is a power of two, its largest block scale, so blocks are shifted by whole
+    exponents and only values pushed into the subnormals round. Returns the
+    [N, K] quant_dtype weight and its [N, 1] fp32 scale.
+    """
+    n, k = weight.shape
+    assert weight.dtype == torch.float8_e4m3fn and weight_scale.shape == (
+        n,
+        k // block_size,
+    ), f"expected e4m3fn [N, K] and [N, K/{block_size}] scales"
+    # e4m3fnuz tops out at 240, below e4m3fn's 448: give it one exponent of headroom
+    headroom = 1.0 if get_dtype_max(quant_dtype) >= 448 else 2.0
+    exp = weight_scale.view(torch.uint8).to(torch.int32)
+    row_exp = exp.amax(dim=1, keepdim=True)
+    shift = torch.exp2((exp - row_exp).float()).repeat_interleave(block_size, dim=1)
+    y = (weight.float() * shift / headroom).to(quant_dtype)
+    y_scale = torch.exp2((row_exp - 127).float()) * headroom
+    return y, y_scale
+
+
 def per_1x32_f4_quant(
     x,
     scale=None,
