@@ -1,12 +1,15 @@
 import inspect
 import json
+import math
 import os
 import re
 import sys
 import tempfile
 import time
 import warnings
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import torch
@@ -378,3 +381,130 @@ def get_dtype_bytes(dtype):
 def get_caller_name_no_ext():
     caller_file = inspect.stack()[1].filename  # full path of caller
     return Path(caller_file).stem  # filename without extension
+
+
+def run_input_generator(
+    gen: Callable[[], tuple], fields: Sequence[str]
+) -> dict[str, Any]:
+    values = gen()
+    if len(values) != len(fields):
+        raise ValueError(
+            f"{gen.func.__name__} returned {len(values)} values, "
+            f"expected {len(fields)}: {fields}"
+        )
+    return {name: val for name, val in zip(fields, values) if name != "_"}
+
+
+def generate_rotating_buffers_pool(
+    gens: Sequence[Callable],
+    out_vals_keys: Sequence[Sequence[str]],
+    target_mb: int,
+    min_pool_len: int,
+    print_info: bool = False,
+):
+    per_set_bytes = 0
+    for gen, fields in zip(gens, out_vals_keys):
+        kwargs = run_input_generator(gen, fields)
+        per_set_bytes += sum(
+            v.numel() * v.element_size()
+            for v in kwargs.values()
+            if isinstance(v, torch.Tensor)
+        )
+
+    pool_len = max(min_pool_len, math.ceil(target_mb * 1024 * 1024 / per_set_bytes))
+    pool = []
+    for _ in range(pool_len):
+        entry = {}
+        for gen, fields in zip(gens, out_vals_keys):
+            entry.update(run_input_generator(gen, fields))
+        pool.append(entry)
+
+    if print_info:
+        print(
+            f"Rotating Buffers, per_set_sz(MB):{round(per_set_bytes/(1024*1024),2)}"
+            + f" target_sz(MB):{target_mb} pool_len:{pool_len}"
+        )
+    return pool
+
+
+def do_bench_aiter_triton(
+    fn: Callable,
+    rot_bufs: list[dict[str, torch.Tensor]],
+    warmup_iters: int,
+    kernels_per_graph: int,
+    num_replays: int,
+    warmup_replays: int,
+    dist_group=None,
+) -> float:
+    """Rotating-buffer CUDA graph benchmark.
+
+    ``dist_group``: a ``torch.distributed`` process group. Pass it when
+    ``fn`` performs real cross-rank communication (e.g. a combine/all-to-all
+    step) so every rank's capture and replay phases line up. It is only a
+    barrier at each phase boundary (warmup, capture, replay) -- unlike the
+    old ``do_bench_cudagraph_synced``, no cross-rank latency estimate needs
+    to be agreed on, because ``kernels_per_graph`` is a fixed constant and is
+    therefore already identical on every rank. The returned latency is the
+    local rank's own measurement; callers that want one number across ranks
+    must reduce it themselves (e.g. ``dist.all_reduce(..., op=MAX)``).
+    """
+
+    def _barrier():
+        if dist_group is not None:
+            import torch.distributed as dist
+
+            dist.barrier(group=dist_group)
+
+    # warmup
+    _barrier()
+    for _ in range(warmup_iters):
+        fn(**(rot_bufs[0]))
+    torch.cuda.synchronize()
+
+    # Build per-dispatch callables that rotate through buffer pool
+    pool_len = len(rot_bufs)
+
+    def _make_fn(idx):
+        return lambda: fn(**(rot_bufs[idx % pool_len]))
+
+    fns = [_make_fn(i) for i in range(kernels_per_graph)]
+
+    # capture graph
+    _barrier()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for f in fns[: min(3, len(fns))]:
+            f()
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=stream):
+            for f in fns:
+                f()
+    torch.cuda.synchronize()
+
+    # warmup replays
+    _barrier()
+    for _ in range(warmup_replays):
+        g.replay()
+    torch.cuda.synchronize()
+
+    # Timed replays
+    start_events = []
+    end_events = []
+    for _ in range(num_replays):
+        se = torch.cuda.Event(enable_timing=True)
+        ee = torch.cuda.Event(enable_timing=True)
+        se.record()
+        g.replay()
+        ee.record()
+        start_events.append(se)
+        end_events.append(ee)
+    torch.cuda.synchronize()
+
+    times_ms = [se.elapsed_time(ee) for se, ee in zip(start_events, end_events)]
+    per_kernel_ms = [t / kernels_per_graph for t in times_ms]
+
+    ms = sum(per_kernel_ms) / len(per_kernel_ms)
+
+    return ms
