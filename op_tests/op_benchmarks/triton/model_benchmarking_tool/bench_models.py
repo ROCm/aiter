@@ -101,6 +101,14 @@ ROPE_METRIC_NOTE = (
 
 MLA_METRIC_NOTE = "Note: MLA benchmark only reports time (ms)."
 
+# model_shapes.json model name -> bench_mla_decode.py --model value
+# (<family>-<size> from utils/model_configs.json). The MLA benchmark is skipped
+# for models that aren't in this mapping.
+MLA_BENCH_MODELS: dict[str, str] = {
+    "DeepSeek-R1": "deepseek-V3",
+    "Kimi-K2 Thinking": "kimik25-tp4",
+}
+
 
 class KernelHandler(ABC):
     """Base class for kernel-specific benchmark logic and result building."""
@@ -471,7 +479,8 @@ class MlaKernelHandler(KernelHandler):
 
     def build_args(self) -> str:
         return (
-            f"--model deepseek-V3 --dtype bf16 --tensor-parallelism {self._tp} "
+            f"--model {MLA_BENCH_MODELS[self._model]} --dtype bf16 "
+            f"--tensor-parallelism {self._tp} "
             f"-b {self._batch_size} --seqlen {self._seq_len} -equal_seqlens -causal"
         )
 
@@ -486,6 +495,14 @@ class MlaKernelHandler(KernelHandler):
         data = lines[2]
         if len(data) < 10:
             raise ValueError(f"Unexpected MLA bench data line: {data!r}")
+        # Columns: row_idx, model, B, H, S, kv_lora_rank, qk_rope_head_dim,
+        #          rotary_dim, num_kv_splits, <time>.
+        # The benchmark takes the head count from model_configs.json, so check
+        # it against the head count from model_shapes.json.
+        if int(float(data[3])) != self._shape["hq"]:
+            raise ValueError(
+                f"MLA bench head count H={data[3]} doesn't match hq={self._shape['hq']}"
+            )
         return float(data[9])
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
@@ -710,15 +727,13 @@ def run_benchmarks(
                 print(f"FP8 is not supported on this device. Skipping {kernel}.")
                 continue
 
-            # bench_mla_decode.py only supports DeepSeek-V3, the shapes are
-            # hardcoded. The shapes file records that config as DeepSeek-R1.
-            # Other MLA models (Kimi-K2 for instance) would still run DeepSeek's
-            # head count while the CSV row reports the model's own hq/hkv.
-            # > Skip until bench_mla_decode is extended.
-            if kernel == "mla" and model != "DeepSeek-R1":
+            # bench_mla_decode.py hardcodes the DeepSeek-V3 MLA dimensions and
+            # takes only the head count from model_configs.json. Run it only for
+            # models with a model_configs.json entry in MLA_BENCH_MODELS.
+            if kernel == "mla" and model not in MLA_BENCH_MODELS:
                 print(
                     f"Skipping mla for model '{model}': "
-                    "bench_mla_decode.py only supports deepseek-V3."
+                    "bench_mla_decode.py has no config for this model."
                 )
                 continue
 
