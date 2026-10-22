@@ -386,6 +386,8 @@ def run_gemm_a4w4_mxscale_bpreshuffle_gfx1250(
     cluster_m = a4w4_fit_cluster_m(cfg, M)
     if A.stride(1) != 1 or Out.stride(1) != 1:
         raise RuntimeError("[FlyDSL gfx1250 a4w4] A and Out rows must be contiguous")
+    if not B.is_contiguous():  # the kernels take no B stride, only K
+        raise RuntimeError("[FlyDSL gfx1250 a4w4] B must be contiguous")
     if split_k > 1 and Out.stride(0) != N and (Out.stride(0) & 7 or N & 7):
         raise RuntimeError(
             "[FlyDSL gfx1250 a4w4] split_k > 1 with padded Out rows needs N and "

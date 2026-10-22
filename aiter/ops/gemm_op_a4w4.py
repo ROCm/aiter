@@ -121,13 +121,13 @@ def flydsl_a4w4_fallback_kernel(M: int, N: int, K: int, cu_num: int) -> str | No
         ki
         for ki in kernels_list.values()
         if not ki.compute_bound
-        and kernel_fits_shape(ki, M, N, K)
         and min(64, pow2_m) <= ki.tile_m <= min(256, max(16, pow2_m))
         and ki.tile_n >= 64
         and ki.cluster_m == cdiv(M, ki.tile_m)
         and wgs(ki) <= cu_num
         and K // (ki.split_k * ki.tile_k) >= 2
         and ki.cluster_n <= 4
+        and kernel_fits_shape(ki, M, N, K)  # the costly check, last
     ]
 
     def rank(ki):
@@ -289,9 +289,9 @@ def gemm_a4w4(
     k = A.shape[-1] * 2
     gfx_arch = get_gfx()
     if gfx_arch in ["gfx1250"]:
-        # FlyDSL serves plain MXFP4 with row-major A and a bf16/fp16 output; the rest is asm.
+        # FlyDSL serves plain MXFP4 with row-major A and a bf16 output; the rest is asm.
         plain_mxfp4 = (
-            dtype in (dtypes.bf16, dtypes.fp16)
+            dtype == dtypes.bf16
             and not apreshuffle
             and global_A_scale is None
             and global_B_scale is None

@@ -23,7 +23,7 @@ Supported kernel families:
   - ``flydsl_mxfp8_8w_*``                     gfx950 8-wave mxfp8 (1x32 row scales) GEMM
   - ``flydsl_bmm_mxfp8_mfma_*``               gfx950 mxscale batched GEMM kernels
   - ``flydsl_a4w4_bpreshuffle_{,compute_}wmma_*`` gfx1250 MXFP4 GEMM kernels (every
-    cluster_m fallback, bounded-M variant and bf16/fp16 output, plus the untuned-M fallback)
+    cluster_m fallback and bounded-M variant, plus the untuned-M fallback)
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -60,6 +60,12 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+    COMPUTE_NAME_PREFIX as A4W4_COMPUTE_PREFIX,
+)
+from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+    GENERAL_NAME_PREFIX as A4W4_GENERAL_PREFIX,
+)
 from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
     BMM_MFMA_NAME_PREFIX,
     compile_bmm_a8w8_mxfp8_gfx950,
@@ -239,8 +245,8 @@ def _bmm_mfma_job(
 def _a4w4_jobs(rows: list[dict]) -> list[dict]:
     """Every specialization an a4w4_mxscale_bpreshuffle table can launch: each FlyDSL
     kernel it names or falls back to below a shape's smallest tuned M, at every cluster_m
-    the runtime may fit (an M of cluster_m whole tiles picks it), both bounded-M variants
-    of the compute kernel, and both output dtypes."""
+    the runtime may fit (an M of cluster_m whole tiles picks it), and both bounded-M
+    variants of the compute kernel."""
     from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
         parse_a4w4_kernel_name,
     )
@@ -269,28 +275,30 @@ def _a4w4_jobs(rows: list[dict]) -> list[dict]:
             if compute and cm * cfg["cluster_n"] < 2:
                 continue
             for bounded_m in (False, True) if compute else (None,):
-                for out_dtype in ("bf16", "f16"):
-                    jobs.append(
-                        {
-                            "kernel_name": name,
-                            "kind": "a4w4_wmma",
-                            "m": cfg["tile_m"] * cm,
-                            "n": n,
-                            "k": k,
-                            "cu_num": cu_num,
-                            "gfx": gfx,
-                            "bounded_m": bounded_m,
-                            "out_dtype": out_dtype,
-                        }
-                    )
+                jobs.append(
+                    {
+                        "kernel_name": name,
+                        "kind": "a4w4_wmma",
+                        "m": cfg["tile_m"] * cm,
+                        "n": n,
+                        "k": k,
+                        "cu_num": cu_num,
+                        "gfx": gfx,
+                        "bounded_m": bounded_m,
+                        "out_dtype": "bf16",
+                    }
+                )
     return jobs
 
 
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
-    if "a4w4_mxscale_bpreshuffle" in os.path.basename(csv_path):
-        with open(csv_path, newline="") as f:
-            return _a4w4_jobs(list(csv.DictReader(f)))
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    # The a4w4 table is known by its kernels: a renamed copy keeps no family name.
+    a4w4_prefixes = (A4W4_GENERAL_PREFIX, A4W4_COMPUTE_PREFIX)
+    if any(r.get("kernelName", "").strip().startswith(a4w4_prefixes) for r in rows):
+        return _a4w4_jobs(rows)
     jobs = []
     seen = set()
     batched_skipped = set()

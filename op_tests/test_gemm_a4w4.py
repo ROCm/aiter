@@ -14,13 +14,29 @@ from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import gemm_a4w4
 from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.test_common import (
+    assertAllclose,
+    benchmark,
+    checkAllclose,
+    perftest,
+    run_perftest,
+)
 from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 SCALE_GROUP_SIZE = 32
 SUPPORTED_GFX = ["gfx950", "gfx1250"]
+# gfx1250 M the tuned table lacks, with whether the kernel each must reach is the compute
+# one (every tuned compute row fills whole M tiles). 1 is below the smallest row; 17 and 257
+# leave a partial M tile of a general kernel, 2049 one of the compute kernel. Together they
+# reach the masked-M stores and partial-tile cluster reduction of both kernel families.
+OFF_GRID_SHAPES = {
+    (1, 7168, 16384): False,
+    (17, 7168, 16384): False,
+    (257, 7168, 16384): False,
+    (2049, 7168, 16384): True,
+}
 pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 pd.set_option("display.max_colwidth", 30)
@@ -95,6 +111,9 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     """gemm_a4w4 as ATOM calls it on gfx1250: the weight and the activation scale in the
     32x4 layout, the activation quantized straight into it. ``tuned`` is the public op, so
     it runs the backend the tuned CSV (or the FlyDSL fallback) picks for this shape."""
+    from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+        parse_a4w4_kernel_name,
+    )
     from aiter.ops.gemm_op_a4w4 import _a4w4_mxscale_config, gemm_mxfp4_asm
 
     quant = aiter.get_hip_quant(aiter.QuantType.per_1x32)
@@ -115,13 +134,21 @@ def _test_gemm_gfx1250(dtype, M, N, K):
         "asm": lambda: gemm_mxfp4_asm(xq, wq, xs, ws, dtype=dtype, a_preshuffle=False),
     }
     config = _a4w4_mxscale_config(M, N, K) or ("asm", "")
+    # An asm pick, or the other kernel family, would hide the coverage an off-grid M is for.
+    want_compute = OFF_GRID_SHAPES.get((M, N, K))
+    if want_compute is not None:
+        kernel = parse_a4w4_kernel_name(config[1]) if config[0] == "flydsl" else None
+        assert kernel and kernel["compute_bound"] == want_compute, (
+            f"M={M} N={N} K={K}: expected a FlyDSL "
+            f"{'compute' if want_compute else 'general'} kernel, got {config[1] or 'asm'}"
+        )
     ret = {
         "gfx": get_gfx(),
         "tuned kernel": config[1] if config[0] == "flydsl" else "asm",
     }
     for name, fn in candidates.items():
         out, us = run_perftest(fn)
-        err = checkAllclose(
+        err = assertAllclose(
             ref, out, msg=f"{name}: a4w4 M={M} N={N} K={K}", catastrophic_check=True
         )
         ret[f"{name} us"] = us
@@ -321,7 +348,8 @@ def main():
         type=str,
         default=None,
         help="""CSV file containing M, N, K columns (one shape per row); overrides -mnk.
-    On gfx1250, with neither -mnk nor --csv, every shape of the tuned CSV runs.
+    On gfx1250, with neither -mnk nor --csv, every shape of the tuned CSV runs, plus the
+    off-grid M it lacks.
     e.g.: --csv aiter/configs/model_configs/dsr1_a4w4_mxscale_bpreshuffle_tuned_gemm.csv""",
     )
     args = parser.parse_args()
@@ -345,6 +373,7 @@ def main():
                 get_cu_num(),
             )
             return
+        shapes.extend(OFF_GRID_SHAPES)
     else:
         shapes = args.shape
     df = []
