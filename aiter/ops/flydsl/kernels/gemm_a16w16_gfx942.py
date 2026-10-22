@@ -11,7 +11,7 @@ This is a ground-up CDNA3 kernel, *not* a de-tuned fork of the gfx950 kernel:
 - bf16 ``16x16x16`` MFMA (gfx950 is ``16x16x32``); the tiled-MMA K layout uses
   ``ab_k_perm`` so a 128-bit LDS->reg read pairs with two MFMA K-groups.
 - 64 KB LDS budget.
-- Global->LDS movement is either async DMA (``async_load_bytes`` 4 or 16) or
+- Global->LDS movement is either 32-bit async DMA (``async_load_bytes=4``) or
   ``buffered_load``: a 128-bit ``buffer_load`` to registers then ``ds_write``.
 
 Main-loop pipelines (selected by the param, one per compiled kernel):
@@ -39,13 +39,11 @@ from typing import Any
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
 from aiter.utility.graph_alloc import persistent_alloc
 
-from . import buffer_ops
 from .gemm_a16w16_gfx950 import (
     AsyncLoadTile,
     async_load_to_lds,
@@ -58,10 +56,17 @@ from .gemm_a16w16_gfx950_utils import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     BlockSwizzle,
     SplitKProtocol,
-    get_llvm_ptr,
     get_wave_lds_offset,
 )
 from .kernels_common import run_cached
+
+# Unstable rocdl calls kept on purpose (no stable equivalent in FlyDSL 0.4):
+# - rocdl.s_barrier: gpu.barrier adds workgroup fences, which drain the
+#   in-flight global loads the pipelines overlap with the barrier.
+# - rocdl.sched_barrier(0): pins the hand-scheduled MFMA/DS/VMEM interleave;
+#   the stable sched_* helpers only emit sched_group_barrier.
+# - rocdl.readfirstlane: makes k_wave_idx wave-uniform (SGPR), so the
+#   per-K-wave LDS offsets and branches stay scalar.
 
 WAVE_SIZE = GFX950_WAVE_SIZE  # 64 lanes on CDNA3
 SMEM_CAPACITY_GFX942 = 65536  # 64 KB LDS / CU
@@ -164,8 +169,14 @@ def make_gemm_a16w16_gfx942_param(
         raise ValueError(f"unsupported out_dtype_id={out_dtype_id}")
     if (mma_m, mma_n, mma_k) != (16, 16, 16):
         raise ValueError("gfx942 bf16 MFMA is 16x16x16")
-    if stages < 2 and not buffered_load:
-        raise ValueError("stages must be >= 2 for the staged LDS pipeline")
+    if not buffered_load:
+        if stages < 2:
+            raise ValueError("stages must be >= 2 for the staged LDS pipeline")
+        if async_load_bytes != 4:
+            raise ValueError(
+                "gfx942 async global->LDS loads are 32-bit only (async_load_bytes=4); "
+                "128-bit loads need buffered_load"
+            )
     if buffered_load:
         if async_load_bytes != 16:
             raise ValueError(
@@ -252,9 +263,7 @@ def make_gemm_a16w16_gfx942_param(
             )
         c_chunks = next((d for d in fits if c_chunk_bytes(d) <= smem_bytes), fits[0])
 
-    # Async global->LDS DMA: async_load_bytes per lane (4 => 32-bit, 16 => 128-bit).
-    if async_load_bytes not in (4, 16):
-        raise ValueError("async_load_bytes must be 4 (32-bit) or 16 (128-bit)")
+    # Global->LDS bytes per lane: 4 for async DMA, 16 for buffered_load.
     async_load_vec_size = async_load_bytes // in_dbytes
     ldg_x_threads = block_k // async_load_vec_size
     if ldg_x_threads * async_load_vec_size != block_k:
@@ -371,11 +380,11 @@ def make_gfx942_load_context(
         # gfx942 has no 128-bit async-to-LDS; the buffered path stages the
         # 128-bit load through registers (buffer_load) then ds_write to LDS.
         async_g2s_copy_atom = None
-    elif const_expr(param.async_load_bytes >= 16):
-        async_g2s_copy_atom = fx.make_copy_atom(
-            fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128
-        )
     else:
+        # The 32-bit form is CDNA3's buffer_load_dword ... lds. Its async atom
+        # lives under cdna4 but runs on gfx942; the synchronous
+        # fx.rocdl.BufferCopyLDS32b would make the compiler wait on vmcnt
+        # before every LDS read and serialize the asyncmark-tracked stages.
         async_g2s_copy_atom = fx.make_copy_atom(
             fx.rocdl.cdna4.BufferLoadAsyncLDS32b(), 32
         )
@@ -850,32 +859,29 @@ def _reduce_k_waves(frag_C, k_waves, k_wave_idx, tid_mn, threads_per_k_slice, sm
     128-bit lane-interleaved chunks (ds_write_b128 / ds_read_b128). Waves that
     are already folded keep adding a peer slot; their sums are never read again.
     """
-    acc = frag_C.load()
-    n_vec4 = const_expr(acc.numel // 4)
-    vec4_ty = fx.Vector.make_type(4, fx.Float32)
-
-    def red_ptr(slot, j):
-        return smem_red + ((slot * n_vec4 + j) * threads_per_k_slice + tid_mn) * 4
+    n_vec4 = const_expr(fx.size(frag_C.shape).unpack() // 4)
+    red = fx.make_view(
+        smem_red,
+        fx.make_layout(
+            (4, threads_per_k_slice, n_vec4, k_waves // 2),
+            (1, 4, 4 * threads_per_k_slice, 4 * threads_per_k_slice * n_vec4),
+        ),
+    )
+    lds_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
+    frag_chunks = fx.make_layout((4, n_vec4), (1, 4))
+    acc_chunks = fx.make_view(fx.get_iter(frag_C), frag_chunks)
+    peer = fx.make_fragment_like(frag_C)
+    peer_chunks = fx.make_view(fx.get_iter(peer), frag_chunks)
 
     for level in range_constexpr(k_waves.bit_length() - 1):
         active = const_expr(k_waves >> level)
         half = const_expr(active // 2)
         gpu.barrier()
         if (k_wave_idx >= half) & (k_wave_idx < active):
-            for j in range_constexpr(n_vec4):
-                fx.ptr_store(
-                    acc.shuffle(acc, [4 * j + t for t in range(4)]),
-                    red_ptr(k_wave_idx - half, j),
-                )
+            fx.copy(lds_atom, acc_chunks, red[None, tid_mn, None, k_wave_idx - half])
         gpu.barrier()
-        peer = [
-            fx.ptr_load(red_ptr(k_wave_idx % half, j), result_type=vec4_ty)
-            for j in range_constexpr(n_vec4)
-        ]
-        acc = acc + fx.Vector.from_elements(
-            [p[t] for p in peer for t in range(4)], fx.Float32
-        ).reshape(acc.shape)
-    frag_C.store(acc)
+        fx.copy(lds_atom, red[None, tid_mn, None, k_wave_idx % half], peer_chunks)
+        frag_C.store(frag_C.load() + peer.load())
 
 
 @flyc.jit
@@ -887,6 +893,7 @@ def _reduce_split_k(
     threads_per_k_slice,
     ks_idx,
     split_k,
+    num_tiles,
     semaphore,
     workspace,
     smem_flag,
@@ -900,29 +907,35 @@ def _reduce_split_k(
     lower to a full L2 writeback/invalidate that would evict every workgroup's
     A/B reuse. Returns (owns_tile, is_last) for the epilogue.
     """
-    part = frag_C.load()
-    n_vec4 = const_expr(part.numel // 4)
+    n_vec4 = const_expr(fx.size(frag_C.shape).unpack() // 4)
     tile_id = fx.block_idx.x
-    ptr1_ty = ir.Type.parse("!llvm.ptr<1>")
-    ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
-
-    def ws_offset(split, j):
-        return (
-            ((tile_id * split_k + split) * n_vec4 + j) * threads_per_k_slice + tid_mn
-        ) * 4
+    # (4, lane, chunk, split, tile): each lane's fragment as 128-bit chunks,
+    # lane-interleaved so a chunk index is one coalesced store per wave.
+    ws_stride = 4 * threads_per_k_slice * n_vec4
+    ws = fx.make_view(
+        fx.get_iter(fx.rocdl.make_buffer_tensor(workspace, max_size=True)),
+        fx.make_layout(
+            (4, threads_per_k_slice, n_vec4, split_k, num_tiles),
+            (1, 4, 4 * threads_per_k_slice, ws_stride, ws_stride * split_k),
+        ),
+    )
+    ws_atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy128b(cache_modifier=CPOL_SC0_SC1), fx.Float32
+    )
+    frag_chunks = fx.make_layout((4, n_vec4), (1, 4))
 
     if owns_tile:
-        for j in range_constexpr(n_vec4):
-            buffer_ops.buffer_store(
-                part.shuffle(part, [4 * j + t for t in range(4)]).ir_value(),
-                ws_rsrc,
-                ws_offset(ks_idx, j),
-                cache_modifier=CPOL_SC0_SC1,
-            )
+        fx.copy(
+            ws_atom,
+            fx.make_view(fx.get_iter(frag_C), frag_chunks),
+            ws[None, tid_mn, None, ks_idx, tile_id],
+        )
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     if tid == 0:
-        sem_ptr = get_llvm_ptr(semaphore, tile_id, 4, ptr1_ty)
+        # Scoped atomics have no stable FlyDSL API before 0.4 (fx.llvm.atomic_add
+        # / generic_store); the arrival counter needs agent scope across XCDs.
+        sem_ptr = fx.to_llvm_ptr(fx.add_offset(fx.get_iter(semaphore), tile_id))
         arrived = llvm.AtomicRMWOp(
             llvm.AtomicBinOp.add,
             sem_ptr,
@@ -944,25 +957,12 @@ def _reduce_split_k(
     is_last = fx.Int32(fx.ptr_load(smem_flag)) == split_k - 1
     owns_tile = owns_tile & is_last
     if is_last:
+        peer = fx.make_fragment_like(frag_C)
+        peer_chunks = fx.make_view(fx.get_iter(peer), frag_chunks)
         frag_C.fill(0.0)
         for split in range(0, split_k, 1):
-            peer = [
-                fx.Vector(
-                    buffer_ops.buffer_load(
-                        ws_rsrc,
-                        ws_offset(split, j),
-                        vec_width=4,
-                        cache_modifier=CPOL_SC0_SC1,
-                    )
-                )
-                for j in range_constexpr(n_vec4)
-            ]
-            frag_C.store(
-                frag_C.load()
-                + fx.Vector.from_elements(
-                    [p[t] for p in peer for t in range(4)], fx.Float32
-                ).reshape(part.shape)
-            )
+            fx.copy(ws_atom, ws[None, tid_mn, None, split, tile_id], peer_chunks)
+            frag_C.store(frag_C.load() + peer.load())
     return owns_tile, is_last
 
 
@@ -995,8 +995,7 @@ def _store_direct(frag_C, gC, thr_copy_C, c_r2g_atom, owns_tile, gated, is_fp32_
 def _store_cshuffle(
     param: GemmA16W16Gfx942Param,
     frag_C,
-    thr_mma_cRow,
-    thr_mma_cCol,
+    thr_copy_C_lds,
     sC_write,
     smem_c,
     out,
@@ -1025,46 +1024,44 @@ def _store_cshuffle(
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
     frag_C_out = fx.make_fragment_like(frag_C, fx.BFloat16)
     frag_C_out.store(frag_C.load().to(fx.BFloat16))
-    # Fragment element i sits in MMA M repeat (i // mma_vals) % reps_m, so
-    # chunk c owns the contiguous rows [c * chunk_rows, (c + 1) * chunk_rows).
-    mma_vals = param.mma_m * param.mma_n // WAVE_SIZE
-    reps_m = block_m // (param.mma_m * param.m_waves)
-    chunk_reps = reps_m // c_chunks
+    # The (value, M repeat, N repeat) partitions put chunk c's rows
+    # [c * chunk_rows, (c + 1) * chunk_rows) in M repeats
+    # [c * chunk_reps, (c + 1) * chunk_reps).
+    chunk_reps = block_m // (param.mma_m * param.m_waves) // c_chunks
     chunk_rows = block_m // c_chunks
-    frag_size = fx.size(frag_C_out.shape).unpack()
+    c_s_atom = fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16)
+    frag_src = thr_copy_C_lds.retile(frag_C_out)
+    sC_dst = thr_copy_C_lds.partition_D(sC_write)
     cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
     cshuffle_vectors = chunk_rows * block_n // cshuffle_r2g_vec_size
     cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
     for chunk in range_constexpr(c_chunks):
         gpu.barrier()
-        chunk_elems = [
-            i
-            for i in range(frag_size)
-            if (i // mma_vals) % reps_m // chunk_reps == chunk
-        ]
         if const_expr(gated):
             if owns_tile:
-                for i in range_constexpr(len(chunk_elems)):
-                    e = chunk_elems[i]
-                    row = fx.get_scalar(thr_mma_cRow[e])
-                    if const_expr(chunk > 0):
-                        row = row - chunk * chunk_rows
-                    col = fx.get_scalar(thr_mma_cCol[e])
-                    sC_write[row, col] = frag_C_out[e]
+                for j in range_constexpr(chunk_reps):
+                    fx.copy(
+                        c_s_atom,
+                        frag_src[None, chunk * chunk_reps + j, None],
+                        sC_dst[None, j, None],
+                    )
         else:
-            for i in range_constexpr(len(chunk_elems)):
-                e = chunk_elems[i]
-                row = fx.get_scalar(thr_mma_cRow[e])
-                if const_expr(chunk > 0):
-                    row = row - chunk * chunk_rows
-                col = fx.get_scalar(thr_mma_cCol[e])
-                sC_write[row, col] = frag_C_out[e]
+            for j in range_constexpr(chunk_reps):
+                fx.copy(
+                    c_s_atom,
+                    frag_src[None, chunk * chunk_reps + j, None],
+                    sC_dst[None, j, None],
+                )
 
         if const_expr(is_split_k and chunk == 0):
             splitk_protocol.wait_until_initialized()
         else:
             gpu.barrier()
 
+        # Row-major vectors are dealt round-robin over every thread. That is
+        # no TV layout when block_n // vec does not divide the thread count
+        # (block_n 48, 96, 112, 160, 192), and a tiled copy would idle threads
+        # and add a pass; the global write is shared with atomic split-K.
         for i in range_constexpr(cshuffle_iters):
             vector_idx = block_threads * i + tid
             if vector_idx < cshuffle_vectors:
@@ -1194,6 +1191,9 @@ def gemm_a16w16_gfx942_kernel(
         flag: fx.Array[fx.Int32, 4, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
+    # LDS stages are selected by offsetting these base pointers by
+    # stage * tile size: the swizzled LDS layouts must stay static, so the
+    # stage cannot be a dynamic layout mode.
     smem_a = storage.ab.a.peek().ptr
     smem_b = storage.ab.b.peek().ptr
     smem_c = storage.c.peek().ptr
@@ -1365,10 +1365,9 @@ def gemm_a16w16_gfx942_kernel(
             fx.copy(uni_atom, a_src, sA_w)
             fx.copy(uni_atom, b_src, sB_w)
 
-    row_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
-    col_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
-    thr_mma_cRow = thr_mma.partition_C(row_coords)
-    thr_mma_cCol = thr_mma.partition_C(col_coords)
+    thr_copy_C_lds = fx.make_tiled_copy_C(
+        fx.make_copy_atom(fx.UniversalCopy16b(), elem_dtype), tiled_mma
+    ).get_slice(tid_mn)
 
     def async_load_a_to_lds(k_tile, stage):
         async_load_to_lds(
@@ -1555,6 +1554,7 @@ def gemm_a16w16_gfx942_kernel(
             threads_per_k_slice,
             ks_idx,
             split_k,
+            num_pid_m * num_pid_n,
             semaphore,
             workspace,
             smem_flag,
@@ -1574,8 +1574,7 @@ def gemm_a16w16_gfx942_kernel(
         _store_cshuffle(
             param,
             frag_C,
-            thr_mma_cRow,
-            thr_mma_cCol,
+            thr_copy_C_lds,
             sC_write,
             smem_c,
             out,
