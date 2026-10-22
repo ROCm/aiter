@@ -157,6 +157,29 @@ def _apply_cache_layout(cache: torch.Tensor, layout: str) -> torch.Tensor:
     return _widen_cache(cache)
 
 
+def test_k1_rows_scorer_layout_keeps_small_grids_parallel():
+    """Column reuse must not collapse short row-scorer launches."""
+    layout = qsa_k1_host._k1_rows_scorer_layout
+    cases = (
+        # n_req, rows, heads, live columns, captured padded decode, expected
+        (4, 16, 4, 2048, False, (True, 1)),
+        (1, 16, 4, 2048, False, (False, 1)),
+        (1, 64, 4, 15000, False, (False, 2)),
+        (1, 128, 4, 2048, False, (False, 2)),
+        (1, 256, 4, 513, False, (False, 1)),
+        (1, 512, 4, 2048, False, (False, 4)),
+        (1, 64, 4, 65856, True, (False, 1)),
+        (1, 8192, 4, 2048, False, (False, 4)),
+    )
+    for n_req, rows, heads, columns, row_bounded, expected in cases:
+        got = layout(n_req, rows, heads, columns, row_bounded=row_bounded)
+        if got != expected:
+            raise AssertionError(
+                f"layout({n_req}, {rows}, {heads}, {columns}, "
+                f"row_bounded={row_bounded}) = {got}, expected {expected}"
+            )
+
+
 def _span_gib(cache: torch.Tensor) -> float:
     return span_bytes(cache) / (1 << 30)
 
