@@ -1996,6 +1996,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DMHC_HIDDEN=5120'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'",
             "'-gline-tables-only'"
         ],
         "extra_ldflags": "None",
@@ -2012,6 +2013,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DMHC_HIDDEN=7168'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'",
             "'-gline-tables-only'"
         ],
         "extra_ldflags": "None",
@@ -2028,6 +2030,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DMHC_HIDDEN=0'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'",
             "'-gline-tables-only'"
         ],
         "extra_ldflags": "None",
