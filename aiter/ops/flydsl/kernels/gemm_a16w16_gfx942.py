@@ -24,6 +24,9 @@ param builder, load-context / async-atom selection, kernel body, default configs
 and torch API are written natively for gfx942.
 """
 
+import csv
+import functools
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -1890,6 +1893,88 @@ _AUTO_ONLY_PIPELINE_KEYS = (
     "stream_operands",
 )
 
+# Config columns of the tuned table (aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv);
+# a row holds a complete config, so it never inherits heuristic flags.
+TUNED_CONFIG_COLUMNS = (
+    "block_m", "block_n", "block_k", "stages", "split_k", "m_waves", "n_waves",
+    "k_waves", "group_m", "async_load_bytes", "buffered_load", "direct_store",
+    "pingpong", "split_k_reduce", "prefetch_depth", "stream_operands",
+)
+TUNED_BOOL_COLUMNS = frozenset(
+    ("buffered_load", "direct_store", "pingpong", "split_k_reduce", "stream_operands")
+)
+TUNED_KEY_COLUMNS = ("gfx", "cu_num", "M", "N", "K", "out_dtype")
+
+
+def tuned_out_dtype_name(out_dtype: torch.dtype) -> str:
+    return "fp32" if out_dtype == torch.float32 else "bf16"
+
+
+def parse_tuned_config(row: dict) -> dict:
+    """Config dict of a tuned-table row; blank cells keep the kernel default."""
+    cfg = {}
+    for name in TUNED_CONFIG_COLUMNS:
+        value = (row.get(name) or "").strip()
+        if value:
+            cfg[name] = value.lower() == "true" if name in TUNED_BOOL_COLUMNS else int(value)
+    return cfg
+
+
+@functools.lru_cache(maxsize=None)
+def _load_tuned_table(path: str) -> dict:
+    table = {}
+    if not os.path.exists(path):
+        return table
+    with open(path, newline="") as handle:
+        for row in csv.DictReader(handle):
+            key = (row["gfx"], int(row["cu_num"]), int(row["M"]), int(row["N"]),
+                   int(row["K"]), row["out_dtype"])
+            table[key] = parse_tuned_config(row)
+    return table
+
+
+@functools.lru_cache(maxsize=None)
+def tuned_table_path() -> str:
+    """Resolved table path (env override + model_configs merge), cached per process."""
+    from aiter.jit.core import AITER_CONFIGS
+
+    return AITER_CONFIGS.AITER_CONFIG_FLYDSL_GEMM_A16W16_GFX942_FILE
+
+
+def reload_tuned_table() -> None:
+    """Re-read the table, e.g. after the tuner rewrote it or the env var changed."""
+    tuned_table_path.cache_clear()
+    _load_tuned_table.cache_clear()
+
+
+@functools.lru_cache(maxsize=None)
+def _device_key(device_index: int) -> tuple[str, int]:
+    props = torch.cuda.get_device_properties(device_index)
+    return props.gcnArchName.split(":")[0], props.multi_processor_count
+
+
+def gfx942_tuned_config(m: int, n: int, k: int, out_dtype: torch.dtype = torch.bfloat16,
+                        device: torch.device | None = None) -> dict | None:
+    """The tuned-table config for this exact shape and device, or None."""
+    if os.getenv("AITER_FLYDSL_GEMM_GFX942_HEURISTIC", "0") == "1":
+        return None
+    index = torch.cuda.current_device() if device is None or device.index is None else device.index
+    gfx, cu_num = _device_key(index)
+    cfg = _load_tuned_table(tuned_table_path()).get(
+        (gfx, cu_num, m, n, k, tuned_out_dtype_name(out_dtype))
+    )
+    return dict(cfg) if cfg is not None else None
+
+
+def gfx942_default_config(m: int, n: int, k: int, out_dtype: torch.dtype = torch.bfloat16,
+                          device: torch.device | None = None) -> dict:
+    """What ``gemm_a16w16`` runs without overrides: the tuned row, else the heuristic.
+
+    ``AITER_FLYDSL_GEMM_GFX942_HEURISTIC=1`` skips the table.
+    """
+    cfg = gfx942_tuned_config(m, n, k, out_dtype, device)
+    return cfg if cfg is not None else gfx942_auto_config(m, n, k)
+
 
 def gemm_a16w16(
     a: torch.Tensor,
@@ -1935,11 +2020,8 @@ def gemm_a16w16(
     out = out.view(-1, n)
     assert out.shape[0] == m
 
-    # Base defaults, overlaid by the per-shape tuned auto-config (Phase-3
-    # rocprofv3 tuning: tile/wave/split-K + XCD swizzle group_m), then by any
-    # caller overrides. Without the auto-config the narrow-N "hc-down" grids run
-    # the generic 128x128 no-swizzle default (~4x hipBLASLt at M2048); the
-    # auto-config picks block_m=64/stages=4/group_m and closes most of that gap.
+    # Base defaults, overlaid by the shape's tuned-table row (else the
+    # gfx942_auto_config heuristic), then by any caller overrides.
     kwargs = {
         "block_m": 128,
         "block_n": 128,
@@ -1952,7 +2034,7 @@ def gemm_a16w16(
         "group_m": 0,
         "async_load_bytes": 4,
     }
-    auto = gfx942_auto_config(m, n, k)
+    auto = gfx942_default_config(m, n, k, out_dtype, a.device)
     user_kwargs = dict(user_kwargs or {})
     if _STRUCTURAL_KEYS & user_kwargs.keys():
         # A caller-chosen tile/pipeline must not inherit flags that were only
