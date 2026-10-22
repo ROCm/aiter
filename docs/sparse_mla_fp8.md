@@ -116,3 +116,34 @@ identity between Torch division and the hardware reciprocal instruction.
 `Q * valid_K * 512 / HIP_us / 1e6` TB/s: one selected FP8 KV payload per query.
 It excludes repeated head reads, Q/O and intermediate/index traffic, so it is
 not measured HBM traffic. Operator timings do not establish serving throughput.
+
+## AgentX end-to-end serving
+
+The opt-in SGLang integration was measured on GLM-5.3-Flash with four MI355X
+GPUs, TP4/attention-DP4, global chunk 16384 (4096 per rank), BF16 Q/O, FP8
+KV, and a variable-length 393-trace AgentX pool (seed 42). For each backend
+and concurrency, requests were issued for 3600 seconds, then all issued
+requests were allowed to complete. Each of the 21 points below is one accepted
+run; the completed request sets and prefix-cache histories are not identical.
+
+Output throughput is successful output tokens divided by the span from first
+request start to last response end, then by four GPUs. Interactivity in the
+figure is `1000 / median(full-response inter-token latency in ms)` over valid
+requests; TTFT is excluded. Higher is better on both axes.
+
+| Concurrent sessions | TileLang output tok/s/GPU | Gluon output tok/s/GPU | HIP output tok/s/GPU | HIP vs Gluon |
+|---:|---:|---:|---:|---:|
+| 1 | 16.935 | 17.035 | 17.126 | +0.53% |
+| 2 | 21.119 | 21.450 | 20.408 | -4.86% |
+| 4 | 32.055 | 32.008 | 32.207 | +0.62% |
+| 8 | 61.207 | 61.168 | 61.019 | -0.24% |
+| 16 | 106.320 | 104.006 | 104.150 | +0.14% |
+| 32 | 183.376 | 182.625 | 185.739 | +1.71% |
+| 64 | 195.796 | 205.013 | 202.603 | -1.18% |
+
+![AgentX interactivity versus output throughput](images/sparse_mla_fp8_agentx16k.png)
+
+The Gluon and HIP paths were verified on all four workers without a fallback.
+These model-level numbers do not give the sparse-MLA kernel's share of total GPU
+time. The small differences between one-run points should not be interpreted as
+a stable ranking of the kernels.
