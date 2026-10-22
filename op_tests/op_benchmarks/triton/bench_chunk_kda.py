@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import argparse
 import json
 import sys
 
@@ -17,6 +16,10 @@ from aiter.ops.triton.attention.chunk_kda import (
 )
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 from aiter.ops.triton.utils._triton import arch_info
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 K3_HEAD_DIM = 128
@@ -211,8 +214,9 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark chunked KDA prefill", allow_abbrev=False
+    parser = get_parser(kernel_name="chunked KDA prefill")
+    override_parser_action(
+        parser, action="--metric", choices=["time", "throughput"], default="time"
     )
     parser.add_argument("--batch_sizes", type=int, nargs="+", default=[1, 3, 8])
     parser.add_argument("--seq_lens", type=int, nargs="+", default=[1024, 4096])
@@ -230,7 +234,6 @@ def parse_args():
         default={},
         help="json overrides of the tuned walk config",
     )
-    parser.add_argument("--metric", choices=["time", "throughput"], default="time")
     parser.add_argument(
         "--timing", choices=["cudagraph", "do_bench"], default="do_bench"
     )
