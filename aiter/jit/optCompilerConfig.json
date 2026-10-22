@@ -55,6 +55,18 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m pa --output_dir {{}}'"
     },
+    "module_attention_ps_reduce_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_attention_ps_reduce.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m reduce --output_dir {{}}'"
+    },
     "module_pa_metadata": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/pa_metadata_pybind.cu'",
@@ -133,7 +145,9 @@
             "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -726,6 +740,24 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py --working_path {{}}'"
+    },
+    "module_iq2r_moe": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/iq2r/iq2r_gemm_gfx950.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/iq2r/iq2r_moe_aux_gfx950.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/iq2r_pybind.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [
+            "'-DENABLE_CK=0'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
     },
     "module_fmha_fwd_bf16_opus": {
         "srcs": [
@@ -2118,7 +2150,8 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_decode_fwd.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_mxfp8_16mx8_32nx1.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fp8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_a8w8_16mx1_32nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_kargs.h'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_traits.h'"
         ],
