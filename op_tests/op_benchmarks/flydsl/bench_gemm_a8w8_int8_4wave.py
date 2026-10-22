@@ -35,12 +35,12 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
 )
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
 
-WAN_SHAPES = (
+DEFAULT_SHAPES = (
     (9450, 5120, 5120),
     (9450, 13824, 5120),
     (9450, 5120, 13824),
 )
-WAN_M_VALUES = (512, 9450, 9472, 18900, 37800, 75600)
+REPRESENTATIVE_M_VALUES = (512, 9450, 9472, 18900, 37800, 75600)
 DEFAULT_BACKENDS = ("4wave", "4wave_nonpersistent", "gluon")
 ASM_KERNEL_TILES = (16, 32, 48, 64, 80, 96, 128, 160)
 ASM_KERNEL_TEMPLATE = "_ZN5aiter{length}I8gemm_bf16_perTokenI8_BpreShuffle_{tile}x128E"
@@ -339,9 +339,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", type=_shape, action="append")
     parser.add_argument(
-        "--wan-matrix",
+        "--shape-matrix",
         action="store_true",
-        help="benchmark N=K=5120 at representative Wan/SP M values",
+        help="benchmark N=K=5120 at representative M values",
     )
     parser.add_argument(
         "--backends",
@@ -377,9 +377,9 @@ def main() -> None:
             f"expected {args.expected_cu} CUs, active device has {get_cu_num()}"
         )
 
-    shapes = list(args.shape or WAN_SHAPES)
-    if args.wan_matrix:
-        shapes.extend((m, 5120, 5120) for m in WAN_M_VALUES)
+    shapes = list(args.shape or DEFAULT_SHAPES)
+    if args.shape_matrix:
+        shapes.extend((m, 5120, 5120) for m in REPRESENTATIVE_M_VALUES)
     shapes = list(dict.fromkeys(shapes))
 
     rows = []
