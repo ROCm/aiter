@@ -18,7 +18,6 @@ from .attention_common import (
     _MAX_FLOOR,
     _buffer,
     _buffer_words,
-    _center,
     _copy_coordinates,
     _cross,
     _exps,
@@ -42,6 +41,7 @@ from .attention_common import (
     _read_s2r,
     _rescale,
     _schedule,
+    _schedule_exps,
     _stage_end,
     _sum,
     _uniform,
@@ -384,12 +384,11 @@ def _body(
         _stage_end()
         # Compute: QK S(0) keys 32-63 and mask(0); softmax m and S'(0).
         s_hi = qk(k_hi)
-        s_0 = _apply_mask(_join(s_lo, s_hi), mask_0)
+        s_0 = _apply_mask(_join(s_lo, s_hi), mask_0) * scale
         row_max = _max(s_0)
         row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
         row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
-        row_max = _maximum(row_max * scale, fx.Float32(_MAX_FLOOR)) + 1.0
-        s_0 = _center(s_0, scale, row_max)
+        row_max = _maximum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
         row_sum = fx.Float32(0.0)
         _stage_end()
         # Memory: K(1) g2s; no compute.
@@ -406,10 +405,11 @@ def _body(
 
         rows_prev, rows_cur and rows_next are the DMA rows of tiles t - 1, t and t + 1.
         k_lds holds K(t) up to step 1 and K(t + 1) from step 2; v_lds holds V(t - 1).
+        S' = S * scale; m tracks the row max of S' lazily (S' - m <= 7).
 
         step  memory stage                              compute stage
         0     g2r mask(t), ids(t+2); g2s V(t-1) with    QK: S(t) keys 0-31
-              s2r K(t) keys 0-31 between its packets    softmax: P(t-1) = exp2(S'(t-1))
+              s2r K(t) keys 0-31 between its packets    softmax: P(t-1) = exp2(S' - m)
         1     s2r K(t) keys 32-63; V(t-1) lands         QK: S(t) keys 32-63, mask(t)
                                                         softmax: row sum of P(t-1), P to BF16
         2     exchange row sums; g2s K(t+1) with        PV: O dims 0-127 += P(t-1) V(t-1)
@@ -436,8 +436,8 @@ def _body(
         # Step 0 compute.
         lgkm.wait()
         s_lo = qk(k_lo)
-        p_prev = _exps(s_prev)
-        _schedule(32, 1, 1, True)
+        p_prev = _exps(s_prev, row_max)
+        _schedule_exps(16, 1)
         _stage_end()
 
         # Step 1 memory.
@@ -495,11 +495,11 @@ def _body(
 
     def epilogue(state):
         """V(last) g2s, keys past the list read 0; exp, row sum and PV of the last tile."""
-        s_last, _, row_sum, o_lo, o_hi, rows_last, _, _ = state
+        s_last, row_max, row_sum, o_lo, o_hi, rows_last, _, _ = state
         lgkm = _LdsQueue()
         # Memory: V(last) g2s, with P(last) and l computed while it lands.
         read_v_g2s(fx.Vector(rows_last), tail_tile=last_tile)
-        p_last = _exps(fx.Vector(s_last))
+        p_last = _exps(fx.Vector(s_last), fx.Float32(row_max))
         sum_last = _sum(p_last)
         sum_last = sum_last + sum_last.shuffle_xor(16, 64)
         sum_last = sum_last + sum_last.shuffle_xor(32, 64)

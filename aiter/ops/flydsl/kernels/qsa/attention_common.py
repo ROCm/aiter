@@ -225,6 +225,13 @@ def _schedule(pairs, count, group, exp=False):
         rocdl.sched_group_barrier(0x400 if exp else 0x002, count, group)
 
 
+def _schedule_exps(count, group):
+    # Per value: subtraction, MFMA, exp, MFMA (the fastest order measured).
+    for _ in range(count):
+        for mask in (0x002, rocdl.mask_mfma, 0x400, rocdl.mask_mfma):
+            rocdl.sched_group_barrier(mask, 1, group)
+
+
 class _LdsQueue:
     """Issue-order ledger of LDS reads and ds_bpermute, which retire in order."""
 
@@ -359,18 +366,11 @@ def _cross(value, addresses, queue):
     return result
 
 
-def _center_one(value, scale, maximum):
-    return fx.Float32(fx.fma(fx.Float32(value), scale, -fx.Float32(maximum)))
-
-
-def _center(values, scale, maximum):
+def _exps(values, maximum):
+    # values are the rounded S * scale the max came from: an FMA overshoots by ulp / 2.
     return fx.Vector.from_elements(
-        [_center_one(values[i], scale, maximum) for i in range(16)], fx.Float32
+        [_exp(values[i] - maximum) for i in range(16)], fx.Float32
     )
-
-
-def _exps(values):
-    return fx.Vector.from_elements([_exp(values[i]) for i in range(16)], fx.Float32)
 
 
 def _k_phase(token):
@@ -476,7 +476,7 @@ def _pv(
     """O += P V over one V half; center and sum_max fold softmax VALU work into its MFMAs.
 
     sum_max = (S, lane sum, other sums, l) also returns l + row sum and the lane max of S;
-    center = (S, lane max, other maxima, scale, m) returns S * scale - m', m' and the ballot.
+    center = (S, lane max, other maxima, scale, m) returns S * scale, m' and the ballot.
     """
     p = fx.Vector(probabilities)
     acc = [
@@ -489,7 +489,7 @@ def _pv(
         if prepared is None
         else fx.Vector.from_elements([prepared[i] for i in range(16)], fx.Int32)
     )
-    centered = []
+    scaled = []
     rocdl.sched_barrier(0)
     for step in range(steps):
         if step + 1 < prepared_steps:
@@ -519,7 +519,7 @@ def _pv(
                 ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, predicate))
                 new_max = predicate.select(candidate + 1.0, maximum)
             for i in range(step * 4, step * 4 + 4):
-                centered.append(_center_one(current[i], scale, new_max))
+                scaled.append(fx.Float32(current[i]) * scale)
         if sum_max is not None and step == 3:
             current, total, sums, row_sum = sum_max
             row_sum = row_sum + ((total + sums[0]) + (sums[1] + sums[2]))
@@ -534,9 +534,9 @@ def _pv(
         [acc[n][i] for n in range(8) for i in range(4)], fx.Float32
     )
     if center is not None:
-        # Pinned: unpinned, LLVM moves these FMAs out of the stage (0.4-1.3% slower).
-        centered = _pin(fx.Vector.from_elements(centered, fx.Float32))
-        return result, centered, new_max, ballot
+        # Pinned: unpinned, LLVM sinks the scaling into the next memory stage.
+        scaled = _pin(fx.Vector.from_elements(scaled, fx.Float32))
+        return result, scaled, new_max, ballot
     if sum_max is not None:
         return result, row_sum, candidate
     return result

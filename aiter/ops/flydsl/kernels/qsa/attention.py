@@ -211,13 +211,16 @@ def qsa_sparse_attention_flydsl(
 ):
     """Return QSA sparse attention for BF16 Q[M,H,256] and K/V[N,HK,256].
 
-    indices is contiguous int32[M,4T+3]: up to T complete four-token blocks (T =
-    256, 512, 768 or 1024, set by the width), followed by the query's 0..3 causal
-    tail tokens, then -1 padding. Block IDs are request-local, unique, and may be
-    unordered. The selected set is exact. K/V must be finite: rows of a request share
-    union tiles, so a non-finite value can also reach rows that did not select it.
-    The layout is not validated: a selection that breaks it gives wrong results,
-    also in later calls on the same stream.
+    indices is contiguous int32[M,4T+3] (T = 256, 512, 768 or 1024, set by the width).
+    For a row whose causal window holds v tokens (request-local 0 .. v - 1, the last
+    being its own), columns [0, 4 * min(v // 4, T)) hold exactly min(v // 4, T)
+    distinct complete blocks j < v // 4, each as its tokens 4j .. 4j + 3, in any
+    order; the next v % 4 columns hold the tail tokens 4 * (v // 4) .. v - 1 and the
+    rest are -1. The kernels derive both counts from v, so fewer blocks or a missing
+    tail give wrong results. K/V must be finite: rows of a request share union tiles,
+    so a non-finite value can also reach rows that did not select it. The layout is
+    not validated: a selection that breaks it gives wrong results, also in later
+    calls on the same stream.
 
     Host query_lens/prefix_lens describe packed requests. For one request they
     default to (M,) and (N-M,). Plans are built and cached per layout. Hot calls

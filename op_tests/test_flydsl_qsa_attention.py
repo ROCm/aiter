@@ -7,25 +7,28 @@ Row ``t`` of request ``r`` attends only to its selected tokens::
 
     out[t, h] = softmax(scale * q[t, h] @ K_r[sel_t].T) @ V_r[sel_t]
 
-``sel_t`` is the indexer's selection: up to T complete four-token blocks of the
-row's causal window, then its 0..3 causal tail tokens, then -1 padding, in an
-int32 [rows, 4T + 3] tensor (T = 512 unless the case name starts with
-``topk``). Q is BF16 [rows, H, 256] and K/V are the requests' packed BF16
-[prefix + new tokens, HK, 256].
+``sel_t`` is the indexer's selection: exactly min(v // 4, T) complete four-token
+blocks of the row's v-token causal window, then its v % 4 causal tail tokens,
+then -1 padding, in an int32 [rows, 4T + 3] tensor (T = 512 unless the case name
+starts with ``topk``). Q is BF16 [rows, H, 256] and K/V are the requests' packed
+BF16 [prefix + new tokens, HK, 256].
 
 Groups (Q heads per KV head) follow Qwen3.8-Flash-Next per TP rank (12/6/3 for
 TP2/4/8, where HK = 1 and H = group); HK = 2/16 cases repeat those groups over
 more KV heads. Functional cases cover one row, a short extend and chunked
 prefill against long cached contexts (one whose packed KV exceeds the direct
-kernel's 64 MiB budget), ragged batches with an empty request, HK > 1 and
-T = 256/768/1024 selections. Performance cases are single-request full
-prefills of 1k-32k tokens plus the 12000-token serving prompt (T = 512); they
-are checked as well and are the only cases using the full-prefill BQ21/BQ42
-union tiles. ``shared`` selections let 32-row windows share block priorities;
-``random`` rows choose independently; ``correlated`` (performance cases)
-simulates the real indexer's selection distribution, captured Qwen3.8 layers
-whose neighbouring rows share about half of their blocks (see
-correlated_prefill).
+kernel's 64 MiB budget), ragged batches with an empty request, HK > 1,
+T = 256/768/1024 selections and constant Q/K whose logits sit near +1e11 on the
+union path (``large_logits``). The graph case captures a union layout on its own
+stream, replays it after rewriting its indices in place, then again after another
+layout grows the stream's scratch arena, which must keep the captured scratch
+allocated. Performance cases are single-request full prefills of 1k-32k tokens
+plus the 12000-token serving prompt (T = 512); they are checked as well and are
+the only cases using the full-prefill BQ21/BQ42 union tiles. ``shared`` selections
+let 32-row windows share block priorities; ``random`` rows choose independently;
+``correlated`` (performance cases) simulates the real indexer's selection
+distribution, captured Qwen3.8 layers whose neighbouring rows share about half
+of their blocks (see correlated_prefill).
 
 ``triton`` is SGLang's native QSA extend path, copied below and called as its
 backend does: sparse_gqa_fwd_interface_triton when no request has a prefix,
@@ -50,6 +53,7 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.qsa import attention as qsa_attention
 from aiter.ops.flydsl.kernels.qsa.attention import qsa_sparse_attention_flydsl
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -74,12 +78,23 @@ FUNCTIONAL_CASES = {
     "topk768_ragged_4": ((300, 129, 1001, 63), (0, 517, 4093, 12345), 1, "shared", 768),
     "topk1024_chunk_1024_ctx_132096": ((1024,), (131072,), 1, "shared", 1024),
 }
+# name -> (shape as above, (Q, K)): constant Q/K and V = 1, so O = 1. Logits near
+# +1e11 check union centering, which an FMA against the rounded row max overflowed.
+CONSTANT_CASES = {
+    "large_logits_prefill_768": (((768,), (0,), 1, "shared", 512), (65536.0, 66048.0)),
+}
 # Performance: one full prefill of 1k-32k tokens, plus the 12000-token serving prompt.
 PERF_CASES = {
     f"prefill_{tokens}": ((tokens,), (0,), 1, "correlated", 512)
     for tokens in (1024, 2048, 4096, 8192, 12000, 16384, 32768)
 }
-CASES = {**FUNCTIONAL_CASES, **PERF_CASES}
+CASES = {
+    **FUNCTIONAL_CASES,
+    **PERF_CASES,
+    **{name: shape for name, (shape, _) in CONSTANT_CASES.items()},
+}
+# name -> (captured union layout, layout whose first call then grows the scratch arena)
+GRAPH_CASES = {"graph_ragged_4": ("ragged_4", "chunk_1024_ctx_132096")}
 
 # Sharing levels of real Qwen3.8 indexer selections at layers 3 and 47.
 CORRELATED_PROFILES = (
@@ -541,12 +556,9 @@ def sglang_triton(q, k, v, indices, query_lens, prefix_lens):
     return sparse_gqa_fwd_interface_triton_ck, args
 
 
-@benchmark()
-def test_qsa_sparse_attention(case, heads):
+def make_inputs(case, heads, generator):
+    """Q/K/V and indices of a case: random BF16, or the CONSTANT_CASES fills."""
     query_lens, prefix_lens, kv_heads, selection, topk = CASES[case]
-    generator = torch.Generator(device="cuda").manual_seed(
-        list(CASES).index(case) * 16 + heads
-    )
     rows, kv_tokens = sum(query_lens), sum(query_lens) + sum(prefix_lens)
     q = torch.randn(rows, heads, HEAD_DIM, generator=generator, dtype=dtypes.bf16)
     k = torch.randn(
@@ -555,7 +567,23 @@ def test_qsa_sparse_attention(case, heads):
     v = torch.randn(
         kv_tokens, kv_heads, HEAD_DIM, generator=generator, dtype=dtypes.bf16
     )
+    if case in CONSTANT_CASES:
+        q_value, k_value = CONSTANT_CASES[case][1]
+        q.fill_(q_value)
+        k.fill_(k_value)
+        v.fill_(1.0)
     indices = make_indices(query_lens, prefix_lens, selection, generator, topk)
+    return q, k, v, indices
+
+
+@benchmark()
+def test_qsa_sparse_attention(case, heads):
+    query_lens, prefix_lens, kv_heads, _, topk = CASES[case]
+    generator = torch.Generator(device="cuda").manual_seed(
+        list(CASES).index(case) * 16 + heads
+    )
+    q, k, v, indices = make_inputs(case, heads, generator)
+    rows, kv_tokens = q.shape[0], k.shape[0]
 
     # Both run as the SGLang QSA backend calls them; each allocates its output.
     candidates = {
@@ -600,6 +628,77 @@ def test_qsa_sparse_attention(case, heads):
     return ret
 
 
+def released(pointer):
+    """Whether the caching allocator holds device address pointer in a free block."""
+    for segment in torch.cuda.memory_snapshot():
+        address = segment["address"]
+        for block in segment["blocks"]:
+            if address <= pointer < address + block["size"]:
+                return block["state"] != "active_allocated"
+            address += block["size"]
+    return False
+
+
+@benchmark()
+def test_qsa_graph_replay(case, heads):
+    """A graph-captured union layout replayed with indices rewritten in place, before
+    and after another layout's first call grows the stream's scratch arena."""
+    captured, growth = GRAPH_CASES[case]
+    query_lens, prefix_lens, _, selection, topk = CASES[captured]
+    generator = torch.Generator(device="cuda").manual_seed(heads)
+    q, k, v, first = make_inputs(captured, heads, generator)
+    second = make_indices(query_lens, prefix_lens, selection, generator, topk)
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+    indices, out = first.clone(), torch.empty_like(q)
+    stream, graph = torch.cuda.Stream(), torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        qsa_sparse_attention_flydsl(q, k, v, indices, out=out, **kwargs)
+        with torch.cuda.graph(graph, stream=stream):
+            qsa_sparse_attention_flydsl(q, k, v, indices, out=out, **kwargs)
+
+    def replay(selected, label):
+        with torch.cuda.stream(stream):
+            indices.copy_(selected)
+            out.fill_(float("nan"))
+            graph.replay()
+        stream.synchronize()
+        return checkAllclose(
+            run_torch(q, k, v, selected, query_lens, prefix_lens, SCALE),
+            out.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{case} H{heads} {label}: out",
+        )
+
+    errors = [replay(second, "replay")]
+    arena = qsa_attention._arenas[(q.device, stream.cuda_stream)]
+    generation, scratch = arena.generation, [b.data_ptr() for b in arena.buffers]
+    growth_lens, growth_prefix = CASES[growth][:2]
+    with torch.cuda.stream(stream):
+        qsa_sparse_attention_flydsl(
+            *make_inputs(growth, heads, generator),
+            query_lens=growth_lens,
+            prefix_lens=growth_prefix,
+            softmax_scale=SCALE,
+        )
+    stream.synchronize()
+    assert arena.generation > generation, f"{growth} did not grow the {case} arena"
+    # A freed buffer may still hold the right bytes, so check the allocator directly.
+    assert not any(map(released, scratch)), f"{growth} freed the captured scratch"
+    errors.append(replay(first, "replay after arena growth"))
+    assert max(errors) == 0, f"{case} H{heads}: mismatch {errors}"
+    return {
+        "gfx": get_gfx(),
+        "rows": q.shape[0],
+        "growth": growth,
+        "flydsl graph err": max(errors),
+    }
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -616,9 +715,9 @@ def main():
         "--case",
         type=str,
         nargs="*",
-        choices=list(CASES),
-        default=list(CASES),
-        help="input layouts to run (functional coverage and performance cases)",
+        choices=[*CASES, *GRAPH_CASES],
+        default=[*CASES, *GRAPH_CASES],
+        help="input layouts to run (functional, graph and performance cases)",
     )
     parser.add_argument(
         "-g",
@@ -630,12 +729,16 @@ def main():
     )
     args = parser.parse_args()
 
-    for suite, cases in (("functional", FUNCTIONAL_CASES), ("performance", PERF_CASES)):
+    for suite, cases, test in (
+        ("functional", [*FUNCTIONAL_CASES, *CONSTANT_CASES], test_qsa_sparse_attention),
+        ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
+        ("performance", list(PERF_CASES), test_qsa_sparse_attention),
+    ):
         selected = [case for case in args.case if case in cases]
         if not selected:
             continue
         df = [
-            test_qsa_sparse_attention(case, group * CASES[case][2])
+            test(case, group * CASES[GRAPH_CASES.get(case, (case,))[0]][2])
             for case, group in itertools.product(selected, args.group)
         ]
         aiter.logger.info(
