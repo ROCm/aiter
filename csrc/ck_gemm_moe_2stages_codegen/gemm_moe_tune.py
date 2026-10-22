@@ -7060,12 +7060,12 @@ class FhmoeTuner(FmoeTuner):
         w2 = _cuda(data["w2"])
         w1.is_shuffled = True
         w2.is_shuffled = True
-        cfg_fd, cfg_path = tempfile.mkstemp(suffix="_fhmoe_tune.csv")
-        os.close(cfg_fd)
-        FhmoeTuner._write_candidate_csv(cfg_path, shape, block_m, kn1, kn2)
         import aiter.fused_moe as fmoe_mod
 
+        cfg_fd, cfg_path = tempfile.mkstemp(suffix="_fhmoe_tune.csv")
+        os.close(cfg_fd)
         try:
+            FhmoeTuner._write_candidate_csv(cfg_path, shape, block_m, kn1, kn2)
             return _fused_moe_impl(
                 hidden_states=_cuda(data["hidden"]),
                 w1=w1,
