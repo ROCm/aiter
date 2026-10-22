@@ -23,16 +23,6 @@ from aiter.test_mha_common import (
 @contextlib.contextmanager
 def _with_default_device(device):
     """Run the capture under an explicit torch default device, restored on exit.
-
-    Graph-capture safety is relative to global state: a sibling test that leaks
-    ``torch.set_default_device("cuda")`` (some set it at module scope and never
-    reset it) makes any tensor constructor in the op that omits ``device=``
-    allocate on CUDA, an illegal H2D during capture. Parametrizing the graph
-    tests over the default device makes both regimes deterministic and
-    ordering-independent: the "cpu" case checks capture correctness; the "cuda"
-    case reproduces the leaked-global-state regime that surfaces device-implicit
-    allocations. (Host<->device syncs inside a captured region are already
-    illegal under torch.cuda.graph, so capture catches those too.)
     """
     prev_device = torch.get_default_device()
     try:
