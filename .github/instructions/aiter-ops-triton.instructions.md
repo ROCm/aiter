@@ -241,7 +241,9 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
   launch code. Allocate on the device of the input:
   `torch.empty(shape, dtype=x.dtype, device=x.device)`. Docstring examples,
   tests, benchmarks and the tuning scripts can use `"cuda"`.
-- Flag an allocation without an explicit `dtype` in library code. Flag
+- Flag a floating-point allocation without an explicit `dtype` in library
+  code. Do not flag integer constructors without a `dtype`: `arange`,
+  `randint`, `randperm` and lists of Python ints infer `int64`. Flag
   `torch.set_default_device` and `torch.set_default_dtype` in library code.
   The default device and dtype are global state.
 - Flag a new public wrapper without a docstring. The docstring tells what the
@@ -284,14 +286,20 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
 - Flag configs in tests: dicts with `BLOCK_SIZE_*`, `num_warps` or
   `waves_per_eu`, or a literal `config=` argument. Tests use the config that
   the wrapper loads.
-- Flag a tensor that a test or benchmark makes without `device="cuda"` or
-  without an explicit `dtype`. A multi-GPU test uses the CUDA device of its
-  rank. A benchmark with a `--device` option uses that option.
+- Flag a tensor that a test or benchmark makes without `device="cuda"`. A
+  multi-GPU test uses the CUDA device of its rank. A benchmark with a
+  `--device` option uses that option.
+- Flag a floating-point tensor that a test or benchmark makes without an
+  explicit `dtype`. Do not flag integer constructors without a `dtype`:
+  `arange`, `randint`, `randperm` and lists of Python ints infer `int64`.
 - Flag `.cuda()`, `.to("cuda")` and `.to(device)` on a tensor that the test
   made on the CPU. Make the tensor directly on the GPU.
 - Flag `torch.set_default_device`, `torch.set_default_dtype` and
   `torch.set_default_tensor_type` in tests and benchmarks. These calls change
-  the defaults for all later tests in the same pytest process.
+  the defaults for all later tests in the same pytest process. Do not flag a
+  context manager that sets a default and restores the previous one on exit,
+  such as `_with_default_device` in `attention/test_mha_dao_ai.py`. It tests
+  that library code does not depend on the default.
 - Flag `torch.load` without `map_location`.
 - Do not flag `device="cpu"` in a test that checks that the wrapper rejects
   CPU inputs.

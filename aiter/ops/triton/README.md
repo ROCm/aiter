@@ -28,9 +28,10 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
    `@triton.jit` device helpers go in `_triton_kernels/common/`.
 7. Use architecture names (`gfx942`, `gfx950`, `gfx1250`) in code and folder
    names. Do not use product names such as MI300 or MI355.
-8. Allocate tensors on the device of the inputs (`device=x.device`), with an
-   explicit `dtype`. Do not use `device="cuda"` in library code. Do not call
-   `torch.set_default_device` or `torch.set_default_dtype`.
+8. Allocate tensors on the device of the inputs (`device=x.device`). Give
+   floating-point allocations an explicit `dtype`. Do not use
+   `device="cuda"` in library code. Do not call `torch.set_default_device` or
+   `torch.set_default_dtype`.
 9. Use absolute imports from the category path, for example
    `from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16`. Do not
    use relative imports or the old flat paths.

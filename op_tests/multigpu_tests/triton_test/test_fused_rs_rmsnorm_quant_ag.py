@@ -60,18 +60,22 @@ def run_fused_kernel(
         torch.cuda.set_device(device)
         aiter.init_dist_env(tp_size, gpuID)
 
+        # Move data to GPU
+        input_tensor_host = input_data.to(device)
+        gamma = gamma.to(device)
+
         torch.cuda.synchronize()
         dist.barrier()
 
         # Use Iris context for communication
         with IrisCommContext(heap_size=heap_size) as ctx:
             # Allocate input in Iris shared memory (required for reduce-scatter)
-            input_tensor = ctx.iris_ctx.empty((M, N), dtype=input_data.dtype)
-            input_tensor.copy_(input_data)
+            input_tensor = ctx.iris_ctx.empty((M, N), dtype=input_tensor_host.dtype)
+            input_tensor.copy_(input_tensor_host)
 
             # Pre-allocate buffers for reuse across iterations
             M_shard = M // tp_size
-            dtype = input_data.dtype
+            dtype = input_tensor_host.dtype
             rs_buffer = ctx.iris_ctx.zeros((M_shard, N), dtype=dtype)
             norm_buffer = torch.empty((M_shard, N), dtype=torch.float32, device=device)
 
@@ -193,20 +197,20 @@ def test_fused_without_quant(
     os.environ["MASTER_PORT"] = "49374"
     ensure_spawn_method()
 
-    # Create input data
+    # Create input data on the CPU. The pool sends it to the workers, and each
+    # worker moves it to its own GPU.
     torch.manual_seed(42)
-    gammas = [torch.ones(N, dtype=dtype, device=f"cuda:{i}") for i in range(tp_size)]
+    gamma = torch.ones(N, dtype=dtype, device="cpu")
     inputs = []
     for i in range(tp_size):
         torch.manual_seed(42 + i)
-        x = torch.randn(M, N, dtype=dtype, device=f"cuda:{i}") * (i + 1)
+        x = torch.randn(M, N, dtype=dtype, device="cpu") * (i + 1)
         inputs.append(x)
 
     # Compute reference
     epsilon = 1e-6
-    # The workers return CPU tensors, so the reference runs on CPU copies.
     ref_normed_shards = reference_reduce_scatter_rmsnorm(
-        [x.cpu() for x in inputs], gammas[0].cpu(), epsilon, M_shard
+        inputs, gamma, epsilon, M_shard
     )
 
     # Run fused kernel on each GPU
@@ -220,7 +224,7 @@ def test_fused_without_quant(
                     tp_size,
                     i,
                     inputs[i],
-                    gammas[i],
+                    gamma,
                     M,
                     N,
                     heap_size,
@@ -288,13 +292,14 @@ def test_fused_with_fp8_quant(tp_size, M, N, dtype, heap_size=1 << 30):
     os.environ["MASTER_PORT"] = "49375"
     ensure_spawn_method()
 
-    # Create input data
+    # Create input data on the CPU. The pool sends it to the workers, and each
+    # worker moves it to its own GPU.
     torch.manual_seed(42)
-    gammas = [torch.ones(N, dtype=dtype, device=f"cuda:{i}") for i in range(tp_size)]
+    gamma = torch.ones(N, dtype=dtype, device="cpu")
     inputs = []
     for i in range(tp_size):
         torch.manual_seed(42 + i)
-        x = torch.randn(M, N, dtype=dtype, device=f"cuda:{i}") * (i + 1)
+        x = torch.randn(M, N, dtype=dtype, device="cpu") * (i + 1)
         inputs.append(x)
 
     # Run fused kernel on each GPU
@@ -308,7 +313,7 @@ def test_fused_with_fp8_quant(tp_size, M, N, dtype, heap_size=1 << 30):
                     tp_size,
                     i,
                     inputs[i],
-                    gammas[i],
+                    gamma,
                     M,
                     N,
                     heap_size,

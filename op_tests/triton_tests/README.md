@@ -20,12 +20,17 @@ and to the multi-GPU tests in `op_tests/multigpu_tests/triton_test/`.
    tensor on the CPU and then move it with `.cuda()`, `.to("cuda")` or
    `.to(device)`. A multi-GPU test uses the CUDA device of its rank. A
    benchmark with a `--device` option uses that option.
-2. Give each tensor an explicit `dtype`, also random tensors:
+2. Give each floating-point tensor an explicit `dtype`, also random tensors:
    `torch.randn((M, K), dtype=torch.float32, device="cuda")`. Do not use the
-   default dtype.
+   default dtype. Integer constructors such as `arange`, `randint`,
+   `randperm` and `torch.tensor` of Python ints infer `int64`. They do not
+   need a `dtype`.
 3. Do not call `torch.set_default_device`, `torch.set_default_dtype` or
    `torch.set_default_tensor_type`. These calls change the defaults for all
-   tests that run after them in the same pytest process.
+   tests that run after them in the same pytest process. The only exception
+   is a context manager that sets a default and restores the previous one on
+   exit. Use it only to test that library code does not depend on the default
+   (`_with_default_device` in `attention/test_mha_dao_ai.py`).
 4. Give `torch.load` an explicit `map_location`.
 5. Use a CPU tensor only when the test needs one, for example to check that
    the wrapper rejects CPU inputs. Write `device="cpu"`.
