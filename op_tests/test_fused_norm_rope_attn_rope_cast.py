@@ -1308,10 +1308,15 @@ def test_norm_recomputed_on_graph_replay(page):
 
 
 def two_source_inputs(
-    heads=64, layout="interleaved", mode="raw", wide=False, with_sink=True
+    heads=64,
+    layout="interleaved",
+    mode="raw",
+    wide=False,
+    with_sink=True,
+    valid_indices=False,
 ):
     torch.manual_seed(9821 + heads)
-    tokens = 6
+    tokens = 8 if valid_indices and wide else 6
     decoded = []
     views = []
     for source, count in enumerate((37, 79)):
@@ -1345,6 +1350,13 @@ def two_source_inputs(
         if wide
         else ([0, 1, 7, 31, 32, 65], [0, 0, 3, 9, 33, 47])
     )
+    if valid_indices:
+        # Exercise empty sources and exact/partial tile boundaries with valid CSR rows.
+        counts = (
+            ([0, 1, 0, 31, 64, 65, 513, 128], [0, 2, 2, 33, 64, 97, 640, 0])
+            if wide
+            else ([0, 1, 31, 64, 128, 129], [1, 0, 33, 64, 128, 65])
+        )
     source_rows, indices, pointers = [], [], []
     for source, sizes in enumerate(counts):
         rows = []
@@ -1352,8 +1364,9 @@ def two_source_inputs(
             ids = torch.randint(
                 len(decoded[source]), (n,), device="cuda", dtype=torch.int32
             )
-            ids[::11] = -1
-            ids[1::17] = len(decoded[source]) + 101
+            if not valid_indices:
+                ids[::11] = -1
+                ids[1::17] = len(decoded[source]) + 101
             rows.append(ids)
         ids, ptr = csr(rows, torch.int32, 2**31 - 1)
         if wide and source == 0:
@@ -1429,9 +1442,10 @@ def two_source_inputs(
 @pytest.mark.parametrize("mode", ["raw", "rotated", "prepared", "norm"])
 @pytest.mark.parametrize("wide", [False, True])
 @pytest.mark.parametrize("with_sink", [False, True])
-def test_two_source_dense(heads, layout, mode, wide, with_sink):
+@pytest.mark.parametrize("valid_indices", [False, True])
+def test_two_source_dense(heads, layout, mode, wide, with_sink, valid_indices):
     kwargs, (expected, mx, lse) = two_source_inputs(
-        heads, layout, mode, wide, with_sink
+        heads, layout, mode, wide, with_sink, valid_indices
     )
     debug = torch.empty_like(kwargs["q"], dtype=torch.float32)
     out = fused_v41(
@@ -1445,7 +1459,8 @@ def test_two_source_dense(heads, layout, mode, wide, with_sink):
     torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
     assert float((debug - expected).norm() / expected.norm()) < 0.005
     assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
-    assert torch.count_nonzero(debug[0]) == 0
+    if not valid_indices or wide:
+        assert torch.count_nonzero(debug[0]) == 0
 
 
 @pytest.mark.parametrize("heads", [64, 128])
@@ -1585,9 +1600,12 @@ def test_two_source_rescale(heads, mixed_scales):
 
 @pytest.mark.parametrize("heads", [64, 128])
 @pytest.mark.parametrize("mode", ["raw", "prepared", "prepared_mixed", "norm"])
-def test_two_source_graph_replay(heads, mode):
+@pytest.mark.parametrize("valid_indices", [False, True])
+def test_two_source_graph_replay(heads, mode, valid_indices):
     input_mode = "prepared" if mode.startswith("prepared") else mode
-    kwargs, _ = two_source_inputs(heads, "padded", input_mode, wide=True)
+    kwargs, _ = two_source_inputs(
+        heads, "padded", input_mode, wide=True, valid_indices=valid_indices
+    )
     out = fused_v41(**kwargs)
     assert out[2:] == (None, None)
     buffers = {"out": out[0], "out_scale": out[1]}

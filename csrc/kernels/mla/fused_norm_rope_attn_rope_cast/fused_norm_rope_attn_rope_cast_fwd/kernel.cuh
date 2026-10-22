@@ -862,7 +862,15 @@ __device__ inline void write_fac(char* smem, typename T::D_ACC fac, int warp_id,
         smem + fac_base<T>)[(lane_id % T::W_M) * PV_GROUPS<T> + warp_id] = fac;
 }
 
-template <class T, class UV, class VP, class VO, class VV, class SH, class AH, class TH>
+template <class T,
+          bool KEEP_P,
+          class UV,
+          class VP,
+          class VO,
+          class VV,
+          class SH,
+          class AH,
+          class TH>
 __device__ inline void compute_pv(char* smem,
                                   const UV& u_rv,
                                   int v_lane_off,
@@ -978,6 +986,22 @@ __device__ inline void compute_pv(char* smem,
         }
         __builtin_amdgcn_sched_barrier(0);
     });
+    if constexpr(KEEP_P)
+    {
+        // Inline MFMA does not expose operand-read latency to the compiler. Keep every P
+        // chunk live through the interleaved softmax, then wait before its registers can
+        // be reused by the next QK stage.
+        static_assert(PV_GROUPS<T> == 4 && T::GEMM1_E_K == 2);
+        asm volatile("s_nop 7"
+                     :
+                     : "v"(v_p),
+                       "v"(p_oth[0][0]),
+                       "v"(p_oth[0][1]),
+                       "v"(p_oth[1][0]),
+                       "v"(p_oth[1][1]),
+                       "v"(p_oth[2][0]),
+                       "v"(p_oth[2][1]));
+    }
 }
 
 // ----------------------------------------------------------------------------------- softmax
@@ -1281,23 +1305,23 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
 
 // ------------------------------------------------------------------------------------ driver
 
-template <class T, bool CHECKED, bool Extend, class QI, class QR>
-__device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
-                                  const void* kv_ptr,
-                                  const void* kv_scale_ptr,
-                                  const int* kv_indptr,
-                                  const int* kv_indices,
-                                  int q_token_idx,
-                                  char* smem,
-                                  const QI& issue_q,
-                                  const QR& read_q,
-                                  const v_q_t<T>& v_q,
-                                  int scale_q,
-                                  v_o_t<T>& v_o,
-                                  typename T::D_ACC& m_row,
-                                  typename T::D_ACC& l_row,
-                                  typename T::D_ACC temperature_scale,
-                                  typename T::D_ACC& true_max)
+template <class T, bool CHECKED, bool Extend, bool CONTINUOUS, class QI, class QR>
+__device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
+                                                  const void* kv_ptr,
+                                                  const void* kv_scale_ptr,
+                                                  const int* kv_indptr,
+                                                  const int* kv_indices,
+                                                  int q_token_idx,
+                                                  char* smem,
+                                                  const QI& issue_q,
+                                                  const QR& read_q,
+                                                  const v_q_t<T>& v_q,
+                                                  int scale_q,
+                                                  v_o_t<T>& v_o,
+                                                  typename T::D_ACC& m_row,
+                                                  typename T::D_ACC& l_row,
+                                                  typename T::D_ACC temperature_scale,
+                                                  typename T::D_ACC& true_max)
 {
     using namespace opus;
     using D_ATTN = typename T::D_ATTN;
@@ -1308,7 +1332,22 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
     const int page_idx_begin = min(cap, max(0, kv_indptr[q_token_idx]));
     const int valid_kv_len =
         max(page_idx_begin, min(cap, kv_indptr[q_token_idx + 1])) - page_idx_begin;
-    const int num_kv_tiles = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+    // The validated strided path can carry the pipeline across the source boundary.
+    // The checked and legacy paths retain their independent segment traversal.
+    constexpr bool merge_sources = CONTINUOUS && T::CACHE_MODE == 0 && !CHECKED && !Extend;
+    int extend_begin = 0, extend_len = 0;
+    if constexpr(merge_sources)
+    {
+        if(kargs.kv_indptr_extend)
+        {
+            extend_begin = min(kargs.extend_capacity, max(0, kargs.kv_indptr_extend[q_token_idx]));
+            extend_len   = max(extend_begin,
+                             min(kargs.extend_capacity, kargs.kv_indptr_extend[q_token_idx + 1])) -
+                         extend_begin;
+        }
+    }
+    const int prefix_tiles = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+    const int num_kv_tiles = prefix_tiles + ceil_div(extend_len, T::KV_TILE_SIZE);
     if(num_kv_tiles <= 0)
         return;
 
@@ -1347,14 +1386,45 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
 
     const auto kv_rows = layout_to_offsets<1>(u_kv_indices);
     vector_t<int64_t, T::smem_n_sub_tile_rpt> kv_pages;
-    auto load_pages = [&](int tile_idx) {
-        static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
-            const int off = min(kv_rows[ig.value] + tile_idx * T::KV_TILE_SIZE, valid_kv_len - 1);
-            kv_pages[ig.value] =
-                T::CACHE_MODE == 1
-                    ? reinterpret_cast<const int64_t*>(kv_indices)[page_idx_begin + off]
-                    : int64_t(load<1>(g_kv_indices, off)[0]);
-        });
+    const auto* current_data   = p_kv;
+    const auto* current_scale  = p_scale;
+    const int* current_indices = kv_indices + page_idx_begin;
+    int current_length         = valid_kv_len;
+    int current_tile_begin     = 0;
+    int current_stride         = Extend ? kargs.stride_kv_extend : kargs.stride_kv_page;
+    int current_scale_stride   = Extend ? kargs.stride_kv_scale_extend : kargs.stride_kv_scale_page;
+    auto load_pages            = [&](int tile_idx) {
+        if constexpr(merge_sources)
+        {
+            // Prefetch visits tiles in order; switch these bases once per query.
+            if(extend_len > 0 && tile_idx == prefix_tiles)
+            {
+                current_data         = reinterpret_cast<const D_ATTN*>(kargs.kv_ptr);
+                current_scale        = reinterpret_cast<const D_ATTN*>(kargs.kv_scale_ptr);
+                current_indices      = kargs.kv_indices_extend + extend_begin;
+                current_length       = extend_len;
+                current_tile_begin   = prefix_tiles;
+                current_stride       = kargs.stride_kv_extend;
+                current_scale_stride = kargs.stride_kv_scale_extend;
+            }
+            static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
+                const int off =
+                    min(kv_rows[ig.value] + (tile_idx - current_tile_begin) * T::KV_TILE_SIZE,
+                        current_length - 1);
+                kv_pages[ig.value] = int64_t(current_indices[off]);
+            });
+        }
+        else
+        {
+            static_for<T::smem_n_sub_tile_rpt>([&](auto ig) {
+                const int off =
+                    min(kv_rows[ig.value] + tile_idx * T::KV_TILE_SIZE, valid_kv_len - 1);
+                kv_pages[ig.value] =
+                    T::CACHE_MODE == 1
+                                   ? reinterpret_cast<const int64_t*>(kv_indices)[page_idx_begin + off]
+                                   : int64_t(load<1>(g_kv_indices, off)[0]);
+            });
+        }
     };
 
     softmax_state<T> st;
@@ -1384,7 +1454,9 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
         constexpr int SLOT = decltype(slot)::value;
         auto kv_lds        = kv_lds_base<T, SLOT>(smem, u_skv);
 
-        auto scl_lds = scale_lds_bases<T, SLOT>(smem, u_sk_scale);
+        auto scl_lds           = scale_lds_bases<T, SLOT>(smem, u_sk_scale);
+        const auto* data_base  = merge_sources ? current_data : p_kv;
+        const auto* scale_base = merge_sources ? current_scale : p_scale;
         opus::array<const D_ATTN*, T::smem_n_sub_tile_rpt> kv_gmem, scl_gmem;
         auto* flags   = reinterpret_cast<int*>(smem + T::smem_bytes()) + SLOT * 68;
         bool all_live = true;
@@ -1410,15 +1482,20 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
             }
             else
             {
-                data_off = id * (Extend ? kargs.stride_kv_extend : kargs.stride_kv_page);
-                scale_off =
-                    id * (Extend ? kargs.stride_kv_scale_extend : kargs.stride_kv_scale_page);
+                data_off =
+                    id * (merge_sources ? current_stride
+                                        : (Extend ? kargs.stride_kv_extend : kargs.stride_kv_page));
+                scale_off = id * (merge_sources ? current_scale_stride
+                                                : (Extend ? kargs.stride_kv_scale_extend
+                                                          : kargs.stride_kv_scale_page));
                 if constexpr(CHECKED)
                     live = id >= 0 && id < (Extend ? kargs.total_tokens : kargs.total_pages);
             }
-            const auto* dp = live ? p_kv + data_off : reinterpret_cast<const D_ATTN*>(safe_kv.data);
-            const auto* sp = live ? (T::CACHE_MODE == 1 ? p_kv + scale_off : p_scale + scale_off)
-                                  : reinterpret_cast<const D_ATTN*>(safe_kv.scales);
+            const auto* dp =
+                live ? data_base + data_off : reinterpret_cast<const D_ATTN*>(safe_kv.data);
+            const auto* sp =
+                live ? (T::CACHE_MODE == 1 ? data_base + scale_off : scale_base + scale_off)
+                     : reinterpret_cast<const D_ATTN*>(safe_kv.scales);
             kv_gmem[ig.value]  = dp + (lane_id % 8) * 16;
             scl_gmem[ig.value] = sp + (lane_id % 4) * 4;
             if(CHECKED && !(lane_id % 8))
@@ -1464,7 +1541,9 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
                     smem, u_sv_dequant, deq_src, deq_scale, scale_rot);
         };
 
-        const int valid_rows = valid_kv_len - tile_idx * T::KV_TILE_SIZE;
+        const int valid_rows = merge_sources && tile_idx >= prefix_tiles
+                                   ? extend_len - (tile_idx - prefix_tiles) * T::KV_TILE_SIZE
+                                   : valid_kv_len - tile_idx * T::KV_TILE_SIZE;
         clear(v_s[CUR]);
         compute_qk<T, CUR>(smem,
                            u_rk,
@@ -1509,7 +1588,7 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
                 if constexpr(t == PV_TAIL_STEPS - 1)
                     deq_prefetch(number<CUR>{});
             };
-            compute_pv<T>(
+            compute_pv<T, merge_sources>(
                 smem,
                 u_rv,
                 v_lane_off,
@@ -1555,7 +1634,7 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
         write_fac<T>(smem, softmax_finish<T>(st, m_row, l_row), warp_id, lane_id);
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
-        compute_pv<T>(
+        compute_pv<T, merge_sources>(
             smem,
             u_rv,
             v_lane_off,
@@ -1602,8 +1681,8 @@ __device__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
 } // namespace fused_norm_rope_attn_rope_cast_fwd
 
 // Shared device implementation for the source-compiled kernel specializations.
-template <class Traits, bool CHECKED>
-__device__ inline void
+template <class Traits, bool CHECKED, bool CONTINUOUS = false>
+__device__ __forceinline__ void
 fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, char* smem)
 {
     using namespace opus;
@@ -1677,39 +1756,43 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     D_ACC l_row    = D_ACC(0.0f);
     D_ACC true_max = -numeric_limits<D_ACC>::infinity();
 
-    attention_segment<T, CHECKED, false>(kargs,
-                                         kargs.unified_kv_ptr,
-                                         kargs.unified_kv_scale_ptr,
-                                         kargs.kv_indptr_prefix,
-                                         kargs.kv_indices_prefix,
-                                         q_token_idx,
-                                         smem,
-                                         issue_q,
-                                         read_q,
-                                         v_q,
-                                         scale_q,
-                                         v_o,
-                                         m_row,
-                                         l_row,
-                                         temperature_scale,
-                                         true_max);
-    __builtin_amdgcn_s_barrier();
-    attention_segment<T, CHECKED, true>(kargs,
-                                        kargs.kv_ptr,
-                                        kargs.kv_scale_ptr,
-                                        kargs.kv_indptr_extend,
-                                        kargs.kv_indices_extend,
-                                        q_token_idx,
-                                        smem,
-                                        issue_q,
-                                        read_q,
-                                        v_q,
-                                        scale_q,
-                                        v_o,
-                                        m_row,
-                                        l_row,
-                                        temperature_scale,
-                                        true_max);
+    attention_segment<T, CHECKED, false, CONTINUOUS>(kargs,
+                                                     kargs.unified_kv_ptr,
+                                                     kargs.unified_kv_scale_ptr,
+                                                     kargs.kv_indptr_prefix,
+                                                     kargs.kv_indices_prefix,
+                                                     q_token_idx,
+                                                     smem,
+                                                     issue_q,
+                                                     read_q,
+                                                     v_q,
+                                                     scale_q,
+                                                     v_o,
+                                                     m_row,
+                                                     l_row,
+                                                     temperature_scale,
+                                                     true_max);
+    // The validated strided path has already consumed both sources in one pipeline.
+    if constexpr(!CONTINUOUS || T::CACHE_MODE != 0 || CHECKED)
+    {
+        __builtin_amdgcn_s_barrier();
+        attention_segment<T, CHECKED, true, CONTINUOUS>(kargs,
+                                                        kargs.kv_ptr,
+                                                        kargs.kv_scale_ptr,
+                                                        kargs.kv_indptr_extend,
+                                                        kargs.kv_indices_extend,
+                                                        q_token_idx,
+                                                        smem,
+                                                        issue_q,
+                                                        read_q,
+                                                        v_q,
+                                                        scale_q,
+                                                        v_o,
+                                                        m_row,
+                                                        l_row,
+                                                        temperature_scale,
+                                                        true_max);
+    }
 
     // Recomputed so that it is not live across the main loop.
     int lane = lane_id;
