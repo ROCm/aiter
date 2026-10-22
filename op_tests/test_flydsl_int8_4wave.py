@@ -36,7 +36,7 @@ def _is_gfx950() -> bool:
 
 requires_gfx950 = pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
 
-WAN_TUNED_ROWS = (
+TUNED_SHAPES = (
     (9450, 5120, 5120),
     (9450, 13824, 5120),
     (9450, 5120, 13824),
@@ -366,22 +366,24 @@ def spy_4wave(monkeypatch):
 
 
 @requires_gfx950
-@pytest.mark.parametrize("wan_m,wan_n,wan_k", WAN_TUNED_ROWS)
+@pytest.mark.parametrize("tuned_m,tuned_n,tuned_k", TUNED_SHAPES)
 @torch.no_grad()
-def test_public_wan_rows_select_4wave_and_match_gluon(spy_4wave, wan_m, wan_n, wan_k):
+def test_public_tuned_rows_select_4wave_and_match_gluon(
+    spy_4wave, tuned_m, tuned_n, tuned_k
+):
     config = get_GEMM_config_with_quant_type(
-        wan_m,
-        wan_n,
-        wan_k,
+        tuned_m,
+        tuned_n,
+        tuned_k,
         torch.int8,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     )
     assert config is not None
-    expected_kernel = default_4wave_kernel_name(wan_m, wan_n, wan_k)
+    expected_kernel = default_4wave_kernel_name(tuned_m, tuned_n, tuned_k)
     assert config["libtype"] == "flydsl"
     assert config["kernelName"] == expected_kernel
 
-    case = _make_case(wan_m, wan_n, wan_k)
+    case = _make_case(tuned_m, tuned_n, tuned_k)
     actual = _public(case)
     assert spy_4wave == [expected_kernel]
     assert torch.equal(actual, _gluon(case))
@@ -391,7 +393,7 @@ def test_public_wan_rows_select_4wave_and_match_gluon(spy_4wave, wan_m, wan_n, w
 @requires_gfx950
 @pytest.mark.parametrize("m", [512, 9472])
 @torch.no_grad()
-def test_public_untuned_wan_shapes_use_correct_fallback(spy_4wave, m):
+def test_public_untuned_shapes_use_correct_fallback(spy_4wave, m):
     n = k = 5120
     config = get_GEMM_config_with_quant_type(
         m,
@@ -637,7 +639,7 @@ def main() -> int:
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=list(WAN_TUNED_ROWS),
+        default=list(TUNED_SHAPES),
         help="M,N,K shapes, for example -s 9450,5120,5120",
     )
     args = parser.parse_args()
