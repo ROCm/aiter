@@ -8,6 +8,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -219,8 +220,17 @@ def run_one(mod):
         return "pass", ""
     tail = "\n".join(out.strip().splitlines()[-15:])
     # ninja echoes the whole compile command on failure, which pushes the
-    # actual diagnostic out of a plain tail. Keep the error lines too.
-    errors = [ln for ln in out.splitlines() if "error:" in ln.lower()][:5]
+    # actual diagnostic out of a plain tail. Lead with the compiler errors,
+    # preferring real "file:line:col: error:" diagnostics over the Python
+    # RuntimeError/CalledProcessError wrapper lines that also match "error:".
+    diag = re.compile(r"\.[a-z]+:\d+:\d+: error:", re.IGNORECASE)
+    lines = out.splitlines()
+    errors = [ln.strip() for ln in lines if diag.search(ln)]
+    if not errors:
+        errors = [ln.strip() for ln in lines if "error:" in ln.lower()]
+    # de-dup (clang repeats each diagnostic per offload arch) while keeping order
+    seen = set()
+    errors = [e for e in errors if not (e in seen or seen.add(e))][:5]
     if errors:
         tail = "ERRORS:\n" + "\n".join(errors) + "\n--- tail ---\n" + tail
     if "NO_SUCH_MODULE" in out:
