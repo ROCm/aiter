@@ -91,8 +91,10 @@ before Graph capture. Run correctness and replay checks with:
 GPU_ARCHS=gfx950 python -m pytest -q op_tests/test_sparse_mla_fp8.py
 ```
 
-The benchmark accepts BF16 Q for both HIP and Gluon, includes conversion inside
-attention, and ends with BF16 O ready. It uses a random 5,608,046,592-byte FP8 KV
+The benchmark accepts BF16 Q for HIP and Gluon, and optionally SGLang TileLang
+with `--tilelang`. Each path includes its Q conversion and ends with BF16 O ready.
+The TileLang option requires SGLang and TileLang on `PYTHONPATH`; it records the
+TileLang source hash in `config.json`. It uses a random 5,608,046,592-byte FP8 KV
 pool, 2051 valid slots per query, capacity 2112, and `-1` padding. The default
 queries are every power of two from 1 through 16384; `--all-small` additionally
 covers Q1–64 individually and Q65.
@@ -101,6 +103,9 @@ covers Q1–64 individually and Q65.
 GPU_ARCHS=gfx950 python op_tests/op_benchmarks/bench_sparse_mla_fp8.py \
   --all-small --output /tmp/sparse-mla-fp8-results
 ```
+
+With a pinned SGLang checkout installed, add `--tilelang` to measure its
+`tilelang_sparse_fwd` path on the same input tensors and in the same phases.
 
 Each of two fresh Q seeds is measured in forward and reverse order. Each phase
 uses 30 timing samples, with 20 calls captured per HIP Graph. The reported time
@@ -114,8 +119,13 @@ identity between Torch division and the hardware reciprocal instruction.
 
 `speedup = Gluon_us / HIP_us - 1`. Logical KV bandwidth is
 `Q * valid_K * 512 / HIP_us / 1e6` TB/s: one selected FP8 KV payload per query.
-It excludes repeated head reads, Q/O and intermediate/index traffic, so it is
-not measured HBM traffic. Operator timings do not establish serving throughput.
+The additional KV+Q/O payload rate uses
+`Q * (valid_K * 512 + 2 * 64 * 512 * 2) / backend_us / 1e6` TB/s; the second
+term counts the BF16 Q read and BF16 O write once. Both rates are available
+for HIP and, with `--tilelang`, TileLang. They exclude repeated head reads,
+index and intermediate traffic, including TileLang's separate FP8 Q cast.
+Neither rate is measured HBM traffic. Operator timings do not establish
+serving throughput.
 
 ## AgentX end-to-end serving
 
@@ -131,19 +141,25 @@ request start to last response end, then by four GPUs. Interactivity in the
 figure is `1000 / median(full-response inter-token latency in ms)` over valid
 requests; TTFT is excluded. Higher is better on both axes.
 
-| Concurrent sessions | TileLang output tok/s/GPU | Gluon output tok/s/GPU | HIP output tok/s/GPU | HIP vs Gluon |
-|---:|---:|---:|---:|---:|
-| 1 | 16.935 | 17.035 | 17.126 | +0.53% |
-| 2 | 21.119 | 21.450 | 20.408 | -4.86% |
-| 4 | 32.055 | 32.008 | 32.207 | +0.62% |
-| 8 | 61.207 | 61.168 | 61.019 | -0.24% |
-| 16 | 106.320 | 104.006 | 104.150 | +0.14% |
-| 32 | 183.376 | 182.625 | 185.739 | +1.71% |
-| 64 | 195.796 | 205.013 | 202.603 | -1.18% |
+| Concurrent sessions | TileLang output tok/s/GPU | Gluon output tok/s/GPU | HIP output tok/s/GPU | HIP vs Gluon | HIP vs TileLang |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 16.935 | 17.035 | 17.126 | +0.53% | +1.13% |
+| 2 | 21.119 | 21.450 | 20.408 | -4.86% | -3.37% |
+| 4 | 32.055 | 32.008 | 32.207 | +0.62% | +0.47% |
+| 8 | 61.207 | 61.168 | 61.019 | -0.24% | -0.31% |
+| 16 | 106.320 | 104.006 | 104.150 | +0.14% | -2.04% |
+| 32 | 183.376 | 182.625 | 185.739 | +1.71% | +1.29% |
+| 64 | 195.796 | 205.013 | 202.603 | -1.18% | +3.48% |
 
 ![AgentX interactivity versus output throughput](images/sparse_mla_fp8_agentx16k.png)
 
 The Gluon and HIP paths were verified on all four workers without a fallback.
-These model-level numbers do not give the sparse-MLA kernel's share of total GPU
-time. The small differences between one-run points should not be interpreted as
-a stable ranking of the kernels.
+GLM-5.3-Flash uses sparse MLA in 11 of its 45 text layers; other attention,
+MoE, indexer, and scheduler work is unchanged. Prefix-cache hit rates at
+C1–32 were 94–97%, so a smaller whole-model effect is plausible, but the
+sparse-MLA share of GPU time was not measured. At C64 cache hits fell to
+85–86%, and TileLang's output rate was 4.50% below Gluon's.
+Each point is one closed-loop run with a different set of completed requests
+and cache history. Small gaps and reversals such as HIP versus Gluon at C2
+(-4.86%), C32 (+1.71%), and C64 (-1.18%) cannot be attributed to the kernel
+alone.

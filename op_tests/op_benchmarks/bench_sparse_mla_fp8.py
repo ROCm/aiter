@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""BF16 Q -> BF16 O, FP8 KV: HIP and Gluon on identical random slot IDs."""
+"""BF16 Q -> BF16 O, FP8 KV: HIP, Gluon, and optional TileLang on the same IDs."""
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -85,8 +86,15 @@ def main():
     parser.add_argument("--capacity", type=int, default=2112)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--graph-repetitions", type=int, default=20)
+    parser.add_argument(
+        "--tilelang", action="store_true", help="include SGLang's TileLang DSA path"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.tilelang:
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
     if args.all_small:
         args.queries = list(range(1, 65)) + [
             65,
@@ -104,9 +112,12 @@ def main():
     assert args.samples > 0 and args.graph_repetitions > 0
     assert all(1 <= n <= 16384 for n in args.queries)
     args.output.mkdir(parents=True, exist_ok=False)
-    (args.output / "config.json").write_text(
-        json.dumps(vars(args), default=str, indent=2)
-    )
+    config = vars(args).copy()
+    if args.tilelang:
+        source = Path(tilelang_sparse_fwd.__code__.co_filename)
+        config["tilelang_source"] = str(source)
+        config["tilelang_source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    (args.output / "config.json").write_text(json.dumps(config, default=str, indent=2))
     slots = args.pool_bytes // 512
     kv = torch.empty((slots, 512), device="cuda", dtype=torch.float8_e4m3fn)
     # Bound temporary storage while initializing the complete random pool.
@@ -118,7 +129,8 @@ def main():
             ).to(kv.dtype)
         )
     one = torch.ones((1,), device="cuda", dtype=torch.float32)
-    medians = {n: {"HIP": [], "Gluon": []} for n in args.queries}
+    names = ["HIP", "Gluon"] + (["TileLang"] if args.tilelang else [])
+    medians = {n: {name: [] for name in names} for n in args.queries}
     with (args.output / "phases.jsonl").open("w") as log:
         for phase in range(4):
             order = args.queries[:: 1 if phase % 2 == 0 else -1]
@@ -153,6 +165,10 @@ def main():
                     "HIP": lambda: sparse_mla_fp8_fwd(q, kv, ids, 1 / 16)[0],
                     "Gluon": run_gluon,
                 }
+                if args.tilelang:
+                    calls["TileLang"] = lambda: tilelang_sparse_fwd(
+                        q, kv.view(slots, 1, 512), ids.unsqueeze(1), 1 / 16
+                    ).squeeze(0)
                 hip_out = calls["HIP"]()
                 namespace = gluon.__globals__
                 original = namespace["_sparse_mla_gfx950"]
@@ -166,6 +182,10 @@ def main():
                     "HIP": assert_reference(hip_out, None, q, kv, ids),
                     "Gluon": check_gluon(gluon_out, q, kv, ids, tap.block_m),
                 }
+                if args.tilelang:
+                    errors["TileLang"] = assert_reference(
+                        calls["TileLang"](), None, q, kv, ids
+                    )
                 if phase % 2:
                     calls = dict(reversed(list(calls.items())))
                 samples = measure(calls, args.graph_repetitions, args.samples)
@@ -188,15 +208,25 @@ def main():
     rows = []
     for n in args.queries:
         hip, g = (statistics.median(medians[n][k]) for k in ["HIP", "Gluon"])
-        rows.append(
-            dict(
-                q=n,
-                hip_us=hip,
-                gluon_us=g,
-                speedup_pct=100 * (g / hip - 1),
-                logical_kv_tbps=n * args.valid_k * 512 / hip / 1e6,
-            )
+        kv_bytes = n * args.valid_k * 512
+        qo_bytes = n * 2 * 64 * 512 * 2  # BF16 Q and BF16 O.
+        row = dict(
+            q=n,
+            hip_us=hip,
+            gluon_us=g,
+            speedup_pct=100 * (g / hip - 1),
+            logical_kv_tbps=kv_bytes / hip / 1e6,
+            logical_kv_qo_tbps=(kv_bytes + qo_bytes) / hip / 1e6,
         )
+        if args.tilelang:
+            t = statistics.median(medians[n]["TileLang"])
+            row.update(
+                tilelang_us=t,
+                speedup_vs_tilelang_pct=100 * (t / hip - 1),
+                tilelang_logical_kv_tbps=kv_bytes / t / 1e6,
+                tilelang_logical_kv_qo_tbps=(kv_bytes + qo_bytes) / t / 1e6,
+            )
+        rows.append(row)
     result = dict(
         rows=rows,
         minimum_speedup_pct=min(r["speedup_pct"] for r in rows),
@@ -212,6 +242,21 @@ def main():
         kv_dtype="E4M3FN",
         logical_bandwidth_is_hbm_traffic=False,
     )
+    if args.tilelang:
+        result.update(
+            minimum_speedup_vs_tilelang_pct=min(
+                r["speedup_vs_tilelang_pct"] for r in rows
+            ),
+            geometric_mean_speedup_vs_tilelang_pct=100
+            * (
+                math.exp(
+                    statistics.mean(
+                        math.log(r["tilelang_us"] / r["hip_us"]) for r in rows
+                    )
+                )
+                - 1
+            ),
+        )
     (args.output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
 
