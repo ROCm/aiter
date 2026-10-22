@@ -1,3 +1,4 @@
+import functools
 import random
 import sys
 
@@ -8,8 +9,14 @@ from utils.benchmark_utils import get_model_configs
 from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
@@ -206,32 +213,30 @@ def model_benchmark_configs(args):
     return fa_configs
 
 
-def paged_attn_decode(
-    OP,
-    BS,
+def _generate_pa_decode_pool_inputs(
+    B,
     H_Q,
     H_KV,
     D,
     KV_BLK_SZ,
     SEQ_LEN,
-    num_blocks,
     dtype,
     kv_cache_dtype,
-    compute_type,
     output_type,
+    num_blocks,
 ):
     (
         query,
-        triton_output,
-        _,
-        _,
+        output,
+        _key_cache,
+        _value_cache,
         key_cache_tri,
         value_cache_tri,
         context_lens,
         block_tables,
-        max_context_len,
+        _max_context_len,
     ) = input_helper(
-        BS,
+        B,
         H_Q,
         H_KV,
         D,
@@ -242,6 +247,31 @@ def paged_attn_decode(
         output_type,
         num_blocks,
     )
+    # max_context_len is a GPU scalar and is always == SEQ_LEN here (context_lens
+    # is uniformly filled); callers use the plain SEQ_LEN int instead so nothing
+    # forces a device sync inside the captured region.
+    return (
+        query,
+        output,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+    )
+
+
+def _generate_la_paged_pool_inputs(
+    B,
+    H_Q,
+    H_KV,
+    D,
+    KV_BLK_SZ,
+    SEQ_LEN,
+    dtype,
+    kv_cache_dtype,
+    output_type,
+    num_blocks,
+):
     (
         q,
         k,
@@ -256,7 +286,7 @@ def paged_attn_decode(
         BLOCK_M,
         BLOCK_N,
     ) = input_la_helper(
-        BS,
+        B,
         H_Q,
         H_KV,
         D,
@@ -267,49 +297,20 @@ def paged_attn_decode(
         output_type,
         num_blocks,
     )
-    attn_scale = 1.0 / (D**0.5)
-    k_scale = torch.tensor([1.0])
-    v_scale = torch.tensor([1.0])
-
-    fn = None
-    if OP == "PagedAttention":
-        fn = lambda: paged_attention_decode(
-            output=triton_output,
-            query=query,
-            key_cache=key_cache_tri,
-            value_cache=value_cache_tri,
-            seq_lens=context_lens,
-            block_tables=block_tables,
-            attn_scale=attn_scale,
-            max_seq_len=max_context_len,
-            compute_type=compute_type,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-    elif OP == "LeanAttentionPaged":
-        fn = lambda: persistent_lean_attention_paged(
-            q=q,
-            k=k,
-            v=v,
-            kv_block_tables=kv_block_tables,
-            Mp=Mp,
-            Lp=Lp,
-            Op=Op,
-            locks=locks,
-            batch_num_block_n=batch_num_block_n,
-            total_programs=total_programs,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            # d: int,
-            batch_size=BS,
-            sm_scale=0.5,
-            num_warps=4,
-            waves_per_eu=2,
-        )
-    else:
-        print(f"Unknown op {OP}")
-
-    return fn
+    return (
+        q,
+        k,
+        v,
+        kv_block_tables,
+        Mp,
+        Lp,
+        Op,
+        total_programs,
+        locks,
+        batch_num_block_n,
+        BLOCK_M,
+        BLOCK_N,
+    )
 
 
 def run_benchmark(args):
@@ -317,6 +318,8 @@ def run_benchmark(args):
     kv_cache_dtype = arg_to_torch_dtype[args.kv_cache_dtype]
     compute_type = torch_to_triton_dtype[arg_to_torch_dtype[args.compute_type]]
     output_type = arg_to_torch_dtype[args.output_type]
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     BS = args.b if args.b else 1
 
@@ -357,22 +360,128 @@ def run_benchmark(args):
     def bench_paged_attn_decode(OP, BS, HQ, HK, SEQ_LEN, HEAD_DIM, metric):
         KV_BLK_SZ = 16
         num_blocks = 64
-        fn = paged_attn_decode(
-            OP,
-            BS,
-            HQ,
-            HK,
-            HEAD_DIM,
-            KV_BLK_SZ,
-            SEQ_LEN,
-            num_blocks,
-            dtype,
-            kv_cache_dtype,
-            compute_type,
-            output_type,
-        )
+        attn_scale = 1.0 / (HEAD_DIM**0.5)
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        if OP == "PagedAttention":
+            _p_gen = functools.partial(
+                _generate_pa_decode_pool_inputs,
+                BS,
+                HQ,
+                HK,
+                HEAD_DIM,
+                KV_BLK_SZ,
+                SEQ_LEN,
+                dtype,
+                kv_cache_dtype,
+                output_type,
+                num_blocks,
+            )
+            _out_val_keys = [
+                "query",
+                "output",
+                "key_cache_tri",
+                "value_cache_tri",
+                "context_lens",
+                "block_tables",
+            ]
+            rot_bufs = generate_rotating_buffers_pool(
+                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+            )
+
+            k_scale = torch.tensor([1.0])
+            v_scale = torch.tensor([1.0])
+
+            def _run(
+                query,
+                output,
+                key_cache_tri,
+                value_cache_tri,
+                context_lens,
+                block_tables,
+            ):
+                paged_attention_decode(
+                    output=output,
+                    query=query,
+                    key_cache=key_cache_tri,
+                    value_cache=value_cache_tri,
+                    seq_lens=context_lens,
+                    block_tables=block_tables,
+                    attn_scale=attn_scale,
+                    max_seq_len=SEQ_LEN,
+                    compute_type=compute_type,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+
+        elif OP == "LeanAttentionPaged":
+            _p_gen = functools.partial(
+                _generate_la_paged_pool_inputs,
+                BS,
+                HQ,
+                HK,
+                HEAD_DIM,
+                KV_BLK_SZ,
+                SEQ_LEN,
+                dtype,
+                kv_cache_dtype,
+                output_type,
+                num_blocks,
+            )
+            _out_val_keys = [
+                "q",
+                "k",
+                "v",
+                "kv_block_tables",
+                "Mp",
+                "Lp",
+                "Op",
+                "total_programs",
+                "locks",
+                "batch_num_block_n",
+                "BLOCK_M",
+                "BLOCK_N",
+            ]
+            rot_bufs = generate_rotating_buffers_pool(
+                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+            )
+
+            def _run(
+                q,
+                k,
+                v,
+                kv_block_tables,
+                Mp,
+                Lp,
+                Op,
+                total_programs,
+                locks,
+                batch_num_block_n,
+                BLOCK_M,
+                BLOCK_N,
+            ):
+                persistent_lean_attention_paged(
+                    q=q,
+                    k=k,
+                    v=v,
+                    kv_block_tables=kv_block_tables,
+                    Mp=Mp,
+                    Lp=Lp,
+                    Op=Op,
+                    locks=locks,
+                    batch_num_block_n=batch_num_block_n,
+                    total_programs=total_programs,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                    batch_size=BS,
+                    sm_scale=0.5,
+                    num_warps=4,
+                    waves_per_eu=2,
+                )
+
+        else:
+            raise ValueError(f"Unknown op {OP}")
+
+        ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
