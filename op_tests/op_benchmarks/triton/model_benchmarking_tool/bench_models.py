@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from typing import TypeAlias
+import warnings
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -594,9 +595,24 @@ def call_function(
     raw_result: str | None = None
 
     try:
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            bench_fn(shlex.split(handler.build_args()))
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                bench_fn(shlex.split(handler.build_args()))
+        warning_output = "".join(
+            warnings.formatwarning(
+                message=w.message,
+                category=w.category,
+                filename=w.filename,
+                lineno=w.lineno,
+                line=w.line,
+            )
+            for w in captured_warnings
+        )
+        if warning_output:
+            # TODO: Replace this print statement with proper logging - warning.
+            print(f"Warnings stream isn't empty: [{warning_output}]")
         if stderr.getvalue():
+            # TODO: Replace this print statement with proper logging - error.
             print(f"Standard error stream isn't empty: [{stderr.getvalue()}]")
         else:
             raw_result = stdout.getvalue()
