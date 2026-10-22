@@ -353,6 +353,8 @@ TUNER_FAMILIES = {
         "config_property": "AITER_CONFIG_FHMOE_FILE",
         # gemm_moe_tune.py --fhmoe SystemExits in __main__ off gfx950.
         "required_gfx": "gfx950",
+        # run_config exits 0 with no rows when none match this gfx/cu_num.
+        "min_ok": 1,
         # 12 DSV4 rows, distinct FlyDSL pairs. 600s died after token=512 OK.
         "timeout": 1800,
     },
@@ -439,6 +441,12 @@ class TestRunConfig(unittest.TestCase):
             f"{name} run_config: {ok_count} OK, {skip_count} SKIP, "
             f"{len(error_shapes)} ERROR, {len(mismatch_shapes)} MISMATCH\n"
             + "\n".join(failures),
+        )
+        min_ok = cfg.get("min_ok", 0)
+        self.assertGreaterEqual(
+            ok_count,
+            min_ok,
+            f"{name} run_config verified {ok_count} shapes; expected >= {min_ok}",
         )
 
     def test_a8w8(self):
