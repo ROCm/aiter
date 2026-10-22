@@ -106,8 +106,9 @@ def unswizzle_mx_scale_cdna4(
 
 
 @triton.jit
-def _split_k(x, w, a_sc, b_sc):
-    # Halve K: x [M, K], w [K, N], a_sc [M, S], b_sc [S, N].
+def _halve_k(x, w, a_sc, b_sc):
+    # Split one tile into its two K halves (not split-K across programs):
+    # x [M, K], w [K, N], a_sc [M, S], b_sc [S, N].
     M: tl.constexpr = x.shape[0]
     K: tl.constexpr = x.shape[1]
     N: tl.constexpr = w.shape[1]
@@ -128,14 +129,14 @@ def _fnuz_mx_dot(acc, x, w, x_scales, w_scales, MX_SCALE_BLOCK_K: tl.constexpr):
     if MX_SCALE_BLOCK_K == 1:
         acc += tl.dot(x, w, input_precision="ieee") * a_sc * b_sc
     elif MX_SCALE_BLOCK_K == 2:
-        x0, x1, w0, w1, a0, a1, b0, b1 = _split_k(x, w, a_sc, b_sc)
+        x0, x1, w0, w1, a0, a1, b0, b1 = _halve_k(x, w, a_sc, b_sc)
         acc += tl.dot(x0, w0, input_precision="ieee") * a0 * b0
         acc += tl.dot(x1, w1, input_precision="ieee") * a1 * b1
     else:
         tl.static_assert(MX_SCALE_BLOCK_K == 4, "fnuz MXFP8 needs BLOCK_K <= 128")
-        xa, xb, wa, wb, aa, ab, ba, bb = _split_k(x, w, a_sc, b_sc)
-        x0, x1, w0, w1, a0, a1, b0, b1 = _split_k(xa, wa, aa, ba)
-        x2, x3, w2, w3, a2, a3, b2, b3 = _split_k(xb, wb, ab, bb)
+        xa, xb, wa, wb, aa, ab, ba, bb = _halve_k(x, w, a_sc, b_sc)
+        x0, x1, w0, w1, a0, a1, b0, b1 = _halve_k(xa, wa, aa, ba)
+        x2, x3, w2, w3, a2, a3, b2, b3 = _halve_k(xb, wb, ab, bb)
         acc += tl.dot(x0, w0, input_precision="ieee") * a0 * b0
         acc += tl.dot(x1, w1, input_precision="ieee") * a1 * b1
         acc += tl.dot(x2, w2, input_precision="ieee") * a2 * b2

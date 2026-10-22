@@ -130,8 +130,13 @@ def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None, fnuz_mx=Fals
             elif block_m == 64:
                 num_warps = 4
     if fnuz_mx:
-        # One E8M0 scale per K step keeps the gfx942 dot in FP8.
-        block_k = 32
+        # gfx942 MXFP8 runs one FP8 dot per 32-wide scale slice, for BLOCK_K up
+        # to 128. Use the widest tile that divides K. Short K stays at 32: there
+        # are too few K steps to hide the extra per-slice dots.
+        if k <= 256:
+            block_k = 32
+        else:
+            block_k = next(b for b in (128, 64, 32) if k % b == 0)
     num_stages = pick_gemm_num_stages(
         arch, block_m, block_n, block_k, 8, 8, use_async_padding=True
     )
