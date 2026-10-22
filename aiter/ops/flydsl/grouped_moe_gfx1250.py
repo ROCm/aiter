@@ -56,7 +56,7 @@ def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _fit_tile_k(tile_k: int, k: int) -> int:
     """The widest k-tile, no wider than ``tile_k``, that the TDM GEMM can run for K = ``k``.
 
