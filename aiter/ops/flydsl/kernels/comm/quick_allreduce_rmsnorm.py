@@ -304,7 +304,7 @@ class MeshRMSNormEpilogue(_QuickReduceRMSNorm):
     """The mesh ends a tile holding every atom of it: ``rows_per_tile``
     independent rows, each reduced inside this block.
 
-    ``latency`` hoists the residual loads of a tile ahead of its reduce-scatter
+    ``low_latency`` hoists the residual loads of a tile ahead of its reduce-scatter
     (``prefetch``), so the HBM reads retire during the two exchanges instead of
     after them. It holds ``ATOMS`` more atoms of registers across both waits, so
     it is built for the 256-thread block, whose workgroup is small enough for
@@ -312,21 +312,21 @@ class MeshRMSNormEpilogue(_QuickReduceRMSNorm):
     for ``super_tile=1``, the only loop that carries a tile through its waits.
     """
 
-    def __init__(self, *, latency: bool = False, **kwargs):
+    def __init__(self, *, low_latency: bool = False, **kwargs):
         super().__init__(**kwargs)
-        self.latency = bool(latency)
-        if self.latency and self.block != BLOCK:
+        self.low_latency = bool(low_latency)
+        if self.low_latency and self.block != BLOCK:
             raise ValueError(
-                f"the latency build needs block={BLOCK}, hidden={self.hidden} "
+                f"the low-latency build needs block={BLOCK}, hidden={self.hidden} "
                 f"gives block={self.block}"
             )
 
     @property
     def tag(self) -> str:
-        return super().tag + ("_lat" if self.latency else "")
+        return super().tag + ("_low_lat" if self.low_latency else "")
 
     def spec(self) -> dict:
-        return {**super().spec(), "latency": self.latency}
+        return {**super().spec(), "low_latency": self.low_latency}
 
     def _rows_per_norm(self):
         return self.rows_per_tile
@@ -349,7 +349,7 @@ class _BoundMeshRMSNorm(_BoundQuickReduceRMSNorm):
     def prefetch(self, tile):
         """The tile's residual atoms, issued before its reduce-scatter. Plain HBM
         with no dependence on a peer, so the loads retire during the exchanges."""
-        if not self.epi.latency:
+        if not self.epi.low_latency:
             return None
         return [self.io.load(self.res_in_buf, tile, j) for j in range_constexpr(ATOMS)]
 

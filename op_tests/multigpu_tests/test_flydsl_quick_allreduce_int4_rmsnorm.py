@@ -177,15 +177,15 @@ def _run_rank(rank, tp, init_method, cases, time_it):
         "algorithm": os.environ.get("FLYDSL_QR_ALGORITHM", "mesh"),
     }
     plain = FlyQuickAllReduce(**common, min_bytes=0)
-    # FLYDSL_QR_LATENCY=1 pins the low-latency build on every rung, 0 the
+    # FLYDSL_QR_LOW_LATENCY=1 pins the low-latency build on every rung, 0 the
     # occupancy-pinned one; unset keeps the ladder's own choice.
-    latency = os.environ.get("FLYDSL_QR_LATENCY")
+    low_latency = os.environ.get("FLYDSL_QR_LOW_LATENCY")
     fly = FlyQuickAllReduceRMSNorm(
         **common,
         min_bytes=0,
-        latency=None if latency is None else latency == "1",
+        low_latency=None if low_latency is None else low_latency == "1",
         # The low-latency build is for the 256-thread block.
-        block=256 if latency == "1" else None,
+        block=256 if low_latency == "1" else None,
         grid_cap=(
             int(os.environ["FLYDSL_QR_GRID_CAP"])
             if "FLYDSL_QR_GRID_CAP" in os.environ
@@ -419,7 +419,7 @@ def main():
         return
 
     cases = _VALIDITY_CASES
-    if os.environ.get("FLYDSL_QR_LATENCY") == "1":
+    if os.environ.get("FLYDSL_QR_LOW_LATENCY") == "1":
         # The 256-thread block is a legal fused build only where a row's atoms
         # divide a rank's share of a tile.
         cases = [c for c in cases if _latency_hidden_ok(c[1], args.tp)]

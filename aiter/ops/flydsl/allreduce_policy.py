@@ -293,17 +293,16 @@ class FusedTwoShotRung:
     ``min_bytes``. Without ``block``: a fused build sizes
     its workgroup to the token row (``FUSED_QR_ROW_ATOMS``).
 
-    ``latency`` picks the mesh's low-latency build: the residual is loaded
+    ``low_latency`` picks the mesh's low-latency build: the residual is loaded
     ahead of the exchanges, and two workgroups per CU stay resident instead of
     one, so ``grid_cap`` may go up to twice the CU count. It needs
-    ``super_tile=1`` and a width whose block is ``BLOCK``; the ring has no such
-    build.
+    ``super_tile=1`` and a width whose block is ``BLOCK``.
     """
 
     min_bytes: int
     super_tile: int
     grid_cap: int
-    latency: bool = False
+    low_latency: bool = False
 
 
 def select_rung(ladder, nbytes: int):
@@ -1130,15 +1129,16 @@ def _check_oneshot_rung(rung: FusedOneShotRung, where: str) -> None:
         )
 
 
-def _two_shot_check(super_tiles, *, latency: bool):
+def _two_shot_check(super_tiles, *, low_latency: bool):
     def check(rung: FusedTwoShotRung, where: str) -> None:
         _check_in(rung.super_tile, super_tiles, f"{where}.super_tile")
         _check_grid_cap(rung, where)
-        if not isinstance(rung.latency, bool):
-            raise ValueError(f"{where}.latency: must be true or false")  # noqa: TRY004
-        if rung.latency and not (latency and rung.super_tile == 1):
+        if not isinstance(rung.low_latency, bool):
+            msg = f"{where}.low_latency: must be true or false"
+            raise ValueError(msg)  # noqa: TRY004
+        if rung.low_latency and not (low_latency and rung.super_tile == 1):
             raise ValueError(
-                f"{where}.latency: only a mesh rung with super_tile=1 can be a "
+                f"{where}.low_latency: only a mesh rung with super_tile=1 can be a "
                 "low-latency build"
             )
 
@@ -1148,8 +1148,8 @@ def _two_shot_check(super_tiles, *, latency: bool):
 # The rung record and the rung check of each family in the file.
 _FUSED_FAMILIES = {
     "oneshot": (FusedOneShotRung, _check_oneshot_rung),
-    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES, latency=True)),
-    "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES, latency=False)),
+    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES, low_latency=True)),
+    "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES, low_latency=False)),
 }
 
 
@@ -1261,7 +1261,9 @@ def load_fused_ladders(path: str) -> FusedLadders:
             for hidden, entry, ew in entries:
                 _check_keys(entry, ew, ("rungs",), ("atoms_per_row",) if qr else ())
                 rungs = _parse_rungs(entry["rungs"], cls, check, ew)
-                if link != "xgmi" and any(getattr(r, "latency", False) for r in rungs):
+                if link != "xgmi" and any(
+                    getattr(r, "low_latency", False) for r in rungs
+                ):
                     raise ValueError(
                         f"{ew}: a low-latency rung is only for xgmi: the build "
                         "has not been measured on other links, where it ran "

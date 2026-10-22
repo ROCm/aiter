@@ -182,12 +182,12 @@ def make_quick_allreduce_mesh_kernel(
     block: int | None = None,
     h_pad: int | None = None,
     mxfp4: bool = False,
-    latency: bool = False,
+    low_latency: bool = False,
     rank: int,
 ):
     check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
-    if latency and (fusion == "none" or super_tile != 1):
-        raise ValueError("latency needs a fused build with super_tile=1")
+    if low_latency and (fusion == "none" or super_tile != 1):
+        raise ValueError("low_latency needs a fused build with super_tile=1")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -210,7 +210,7 @@ def make_quick_allreduce_mesh_kernel(
             block=block,
             world_size=world_size,
             mxfp4=mxfp4,
-            latency=latency,
+            low_latency=low_latency,
         )
     block = epilogue.block
     tile_i32 = block * ATOMS * 4
