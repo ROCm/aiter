@@ -1,3 +1,5 @@
+import functools
+
 import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
@@ -22,6 +24,19 @@ def cluster_shape(num_ctas, BLOCK_M, BLOCK_N):
 
 
 def get_gemm_afp4wfp4_preshuffle_layouts(
+    num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
+):
+    # Building the layouts costs ~1 ms of Python per call and depends only on
+    # these ints: build once per config, return a copy (callers may mutate it).
+    return dict(
+        _build_gemm_afp4wfp4_preshuffle_layouts(
+            num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
+        )
+    )
+
+
+@functools.cache
+def _build_gemm_afp4wfp4_preshuffle_layouts(
     num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
 ):
     # each CTA computes BLOCK_M // CTAS_M x BLOCK_N // CTAS_N of it.
