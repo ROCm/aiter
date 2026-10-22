@@ -117,8 +117,8 @@ def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
+def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, bias, dtype)
 
 
 @perftest()
@@ -193,15 +193,15 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
             err_b = checkAllclose(
                 a, b, msg="ck: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
             )
-    if quantDtype != dtypes.i8:
-        c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
-        # c = c + bias
-        err_c = checkAllclose(
-            a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
-        )
-    else:
-        avg_c = None
-        err_c = None
+    c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, bias, dtype)
+    err_c = checkAllclose(
+        a,
+        c,
+        msg="bpreshuffle: ",
+        rtol=1e-2,
+        atol=1e-2,
+        catastrophic_check=True,
+    )
 
     avg_d = None
     err_d = None
