@@ -327,6 +327,40 @@ module enumeration, child-process plumbing, skip classification and
 `--update-md` folding are verified; `pass`/`fail` rows still require the
 strict-capable container.
 
+## gfx1250 build results on ROCm 10.0.0 (baseline, not strict)
+
+Measured 2026-10-22 in `rocm/atom-dev:latest-rocm10.0` with `GPU_ARCHS=gfx1250 PYTORCH_ROCM_ARCH=gfx1250`.  gfx1250-strict itself does not compile in this toolchain (see the survey above), so this is the gfx1250 baseline: anything that fails to build for gfx1250 here cannot build for strict either, since strict is gfx1250 plus an A0 code-object identity.
+
+- **102 pass**, **21 fail**, **10 skip-tune**, **2 skip-experimental** (135 total)
+
+Every failure was rebuilt for **gfx942** as a control.  18 of the 21 build cleanly on gfx942 and fail only on gfx1250, so they are genuine gfx1250 porting gaps, not a ROCm-10/clang-23 regression.  The three FMHA-bwd modules timed out on gfx942 (too large to finish in 20 min) while compiling without error; `module_mha_bwd` from the same family did finish and pass, so its gfx1250 'header not found' is itself a gfx1250 gap — the fmha-v3-bwd asm configs are not generated for gfx1250.  **No failure reproduced on gfx942; none is environmental.**
+
+| module | gfx942 control | gfx1250 failure cause |
+|--------|----------------|-----------------------|
+| module_activation | builds | CK ck_tile TDM path (gated by CK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0) |
+| module_chunk_gdr_fwd_h | builds | wavefrontsize64 rejected — gfx1250 is wave32 only |
+| module_deepgemm | builds | CK ck_tile TDM path (gated by CK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0) |
+| module_gemm_a4w4_blockscale | builds | CK ck/ older-API path (Tuple operator[]) |
+| module_gemm_a8w8_blockscale_bpreshuffle_cktile | builds | CK ck_tile TDM path (gated by CK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0) |
+| module_gemm_a8w8_blockscale_cktile | builds | CK ck_tile TDM path (gated by CK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0) |
+| module_gemm_a8w8_bpreshuffle_cktile | builds | CK ck_tile TDM path (gated by CK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0) |
+| module_iq2r_moe | builds | MFMA intrinsic needs gfx90a — GFX12 has WMMA, not MFMA |
+| module_mha_batch_prefill | builds | CK ck_tile container header |
+| module_mha_bwd | builds | fmha-v3-bwd asm configs header not generated for gfx1250 |
+| module_mha_fwd_native_splitkv | builds | MFMA intrinsic needs gfx90a — GFX12 has WMMA, not MFMA |
+| module_moe_ck2stages | builds | CK ck/ older-API path (Tuple operator[]) |
+| module_moe_mxfp4_aux | builds | DPP broadcast — GFX12 removed the row/bcast dpp_ctrl modes CDNA has |
+| module_moe_opus | builds | gfx950-only Opus traits static assert compiled for gfx1250 |
+| module_moe_sorting_opus | builds | DPP broadcast — GFX12 removed the row/bcast dpp_ctrl modes CDNA has |
+| module_sample | builds | CK ck_tile TDM path (gated by CK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0) |
+| module_topk_plain | builds | warp-size static assert (32 >= 2*get_warp_size) |
+| module_vsa_sparse_attention | builds | CK ck_tile container header |
+| libmha_bwd | timeout (heavy, was clean) | fmha-v3-bwd asm configs header not generated for gfx1250 |
+| libmha_fwd | timeout (heavy, was clean) | CK ck_tile container header |
+| module_mha_varlen_bwd | timeout (heavy, was clean) | fmha-v3-bwd asm configs header not generated for gfx1250 |
+
+These are the workstream-2 porting gaps for gfx1250 (and therefore for strict): DPP-broadcast and MFMA/buffer-load-LDS intrinsics that GFX12 lacks, a wave64 request on a wave32 part, warp-size and gfx950-trait assertions, and the CK ck_tile TDM path.  Each needs an owner decision: port the kernel to GFX12 equivalents, gate it off for gfx1250, or dispatch to a fallback.
+
 ## ROCm 10.0.0 toolchain survey (checked 2026-10-22)
 
 `rocm/atom-dev:latest-rocm10.0` -- ROCm 10.0.0, AMD clang 23.0.0git
