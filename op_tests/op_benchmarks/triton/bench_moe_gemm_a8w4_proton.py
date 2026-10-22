@@ -18,6 +18,7 @@ from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -465,7 +466,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",
@@ -511,13 +512,6 @@ def parse_args(args: list[str] | None = None):
         "routed rows cannot reach more experts than there are rows, so a batch "
         "that small pins fewer. Default: unset, i.e. random routing over all "
         "experts.",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["triton", "gluon"],
-        default=None,
-        help="Kernel backend for moe_gemm_a8w4. Default: unset, i.e. the arch "
-        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
     )
     parser.add_argument(
         "--num-weight-inits",

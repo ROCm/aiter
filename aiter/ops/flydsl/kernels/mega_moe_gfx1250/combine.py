@@ -95,9 +95,7 @@ def _make_combine_fused_sync(
         phase = fx.Int64(buffer_load(rsrc_xdb_flag, 0, vec_width=1, dtype=T.i64))
         # push this call's phase to every peer's shared xdb slot [rank]
         if tid < npes:
-            xdb_remote = fx.Int64(window.lsa_ptr(tid, off_xdb_mem)) + fx.Int64(
-                rank
-            ) * fx.Int64(8)
+            xdb_remote = fx.Int64(window.lsa_ptr(tid, off_xdb_mem)) + fx.Int64(rank) * 8
             comm_ops.store_i64_global_system(xdb_remote, phase)
         # advance the counter for the next call (single writer, no atomic)
         if tid == 0:
@@ -105,9 +103,9 @@ def _make_combine_fused_sync(
         # `>=` not `==`: a faster peer can lap us and overwrite its monotonic push
         # with a higher call count before we read it.
         if tid < npes:
-            xdb_peer_slot = fx.Int64(
-                window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(tid) * fx.Int64(8)
+            xdb_peer_slot = (
+                fx.Int64(window.lsa_ptr(my_lsa_rank, off_xdb_mem)) + fx.Int64(tid) * 8
+            )
             comm_ops.spin_until_ge_i64(xdb_peer_slot, phase)
 
     @flyc.jit
@@ -338,8 +336,8 @@ def _make_combine_fused_reduce(
             address_space=fx.AddressSpace.Global,
             alignment=16,
         )
-        inp_iter = fx.inttoptr(i8_global, fx.Int64(addr_comb_inp))
-        out_iter = fx.inttoptr(i16_global, fx.Int64(addr_out))
+        inp_iter = fx.inttoptr(i8_global, addr_comb_inp)
+        out_iter = fx.inttoptr(i16_global, addr_out)
 
         def global_view(base, off, shape, stride):
             return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
@@ -451,7 +449,7 @@ def _make_combine_fused_reduce(
             for r in range_constexpr(ROUNDS):
                 t_off = lane_tok[r] * (topk * P_ROW_BYTES)
                 chunk_off = t_off + lane_chunk[r] * IN_CHUNK_BYTES
-                accs = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
+                accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
 
                 if quant_bits:
                     base_in = chunk_off + (
