@@ -284,19 +284,24 @@ class Mfma16x16x128:
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
 
 
-def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm):
-    """XCD-aware tile remap that works for any workgroup count. This function is used to swizzle the tile indices to improve the L2 reuse."""
-    NUM_XCDS = 8
+def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm, wgid=None, num_xcds=8):
+    """XCD-aware tile remap that works for any workgroup count.
 
-    wgid = fx.block_idx.x
+    ``wgid`` defaults to the workgroup index; a persistent kernel passes its
+    tile index, which must lie on XCD ``wgid % num_xcds``.
+    """
+    assert num_xcds > 0 and num_xcds & (num_xcds - 1) == 0
+
+    if wgid is None:
+        wgid = fx.block_idx.x
     num_wg = num_pid_m * num_pid_n
 
-    # Hardware dispatches workgroup i to XCD (i % NUM_XCDS). Invert that so
+    # Hardware dispatches workgroup i to XCD (i % num_xcds). Invert that so
     # logically adjacent tiles share an XCD, and thus its L2.
-    xcd = wgid % NUM_XCDS
-    intra_xcd = wgid // NUM_XCDS
-    base = num_wg // NUM_XCDS
-    extra = num_wg % NUM_XCDS
+    xcd = wgid % num_xcds
+    intra_xcd = wgid // num_xcds
+    base = num_wg // num_xcds
+    extra = num_wg % num_xcds
     wgid_remap = xcd * base + fx.min(xcd, extra) + intra_xcd
 
     # Group-of-WGM row swizzle for L2 reuse within one XCD.
