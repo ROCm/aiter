@@ -43,6 +43,7 @@ Output: the attention kernel without SPLIT_K, else _sparse_mla_reduce. Either st
 can apply the inverse RoPE + MXFP8 epilogue (_epilogue_store).
 """
 
+
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
@@ -335,6 +336,10 @@ class Cfg:
     # stages dequantized values, which pass through registers by definition.
     # Single-buffered, the launcher decides when it is on.
     ASYNC_LDS: gl.constexpr
+    ASYNC_DBUF: gl.constexpr  # two tile buffers, two commit groups in flight
+    PV_ORDER: gl.constexpr  # read V after the p-operand exchange, not before
+    SUMDEFER: gl.constexpr  # row sum kept as a per-thread partial, reduced once
+    LDSRED: gl.constexpr  # row max through red_smem, not gl.reduce
     RELAXED_LOAD: gl.constexpr  # read LDS with the syncedViaAsyncWait hint
     ROPE_VEC: gl.constexpr  # bytes per lane in the rope buffer's copy
     SLOT_U32: gl.constexpr  # pitches < 16 MB; -1 sentinels are clamped before the split
@@ -378,6 +383,9 @@ class Cfg:
         GATHER_CACHE=".cg",
         IDX_CACHE="",
         ASYNC_LDS=False,
+        ASYNC_DBUF=False,
+        SOFTMAX_FIX=False,
+        PV_ORDER=False,
         RELAXED_LOAD=True,
         PAD_INTERVAL=1024,
         SLOT_U32=False,
@@ -413,6 +421,10 @@ class Cfg:
         self.GATHER_CACHE = gl.constexpr(GATHER_CACHE)
         self.IDX_CACHE = gl.constexpr(IDX_CACHE)
         self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
+        self.ASYNC_DBUF = gl.constexpr(ASYNC_DBUF)
+        self.PV_ORDER = gl.constexpr(PV_ORDER)
+        self.SUMDEFER = gl.constexpr(SOFTMAX_FIX)
+        self.LDSRED = gl.constexpr(SOFTMAX_FIX)
         self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
         self.SLOT_U32 = gl.constexpr(SLOT_U32)
         self.UNPEEL = gl.constexpr(UNPEEL)
@@ -730,7 +742,9 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
         else:
             kv_smem.slice(off, x_u8.shape[0], dim=0).store(val)
     else:
-        if fmt.DEQ == "upcast":
+        if False:
+            val = x_u8.to(gl.uint16).to(gl.bfloat16, bitcast=True)
+        elif fmt.DEQ == "upcast":
             # Upstream fused fp8 x E8M0 -> bf16 upcast; the driver only asks for
             # it when cdna4.scaled_upcast exists, else DEQ="asm" (_scaled_upcast_asm).
             # sc is the raw E8M0 byte, already in x_u8's shape and layout.
@@ -989,6 +1003,26 @@ def _copy_tile(cfg, seg, kv_smem, rope_smem, row_l, row_r, offs_l, offs_r):
 
 
 @gluon.jit
+def _async_copy_at(cfg, seg, kv_smem, rope_smem, k_start, hi, rng_l, rng_r, offs_l, offs_r):
+    """One tile's direct-to-LDS copy at k_start, as its own commit group."""
+    if cfg.ASYNC_DBUF:
+        # Required: the membar pass does not put a WAR barrier before the copy
+        # into the buffer this warp just finished reading, so without this the
+        # copy can land while another warp is still reading it.
+        gl.barrier()
+    _copy_tile(
+        cfg,
+        seg,
+        kv_smem,
+        rope_smem,
+        _tile_rows(cfg, seg, k_start, hi, rng_l, False),
+        _tile_rows(cfg, seg, k_start, hi, rng_r, True),
+        offs_l,
+        offs_r,
+    )
+
+
+@gluon.jit
 def _async_segment(
     cfg,
     seg,
@@ -1004,6 +1038,9 @@ def _async_segment(
     v_scale,
     kv_smem,
     rope_smem,
+    kv_smem2=None,
+    rope_smem2=None,
+    red_smem=None,
 ):
     """Direct-to-LDS tile walk, one LDS buffer.
 
@@ -1011,6 +1048,11 @@ def _async_segment(
     plain load outstanding past the newest copy group would drag wait_group into
     waiting for that copy too. The body has no masked variant: the slot read is
     clamped and the partial tail falls out of the score mask (UNI_TILE).
+
+    ASYNC_DBUF: two buffers and two commit groups in flight. The loop runs
+    tiles in pairs so the buffer parity stays compile-time, and it rounds the
+    tile count up: an over-run tile scores all -inf under UNI_TILE, so it
+    leaves m, l and acc unchanged, and its clamped slot read stays in range.
     """
     BK: gl.constexpr = cfg.BLOCK_K
     offs_l = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.async_l))
@@ -1018,6 +1060,28 @@ def _async_segment(
     rng_l = gl.arange(0, BK, layout=cfg.slot_a_l)
     rng_r = gl.arange(0, BK, layout=cfg.slot_rope_a_l)
     n_full = (hi - lo + BK - 1) // BK
+    if cfg.ASYNC_DBUF:
+        _async_copy_at(cfg, seg, kv_smem, rope_smem, lo, hi, rng_l, rng_r, offs_l, offs_r)
+        for j in range((n_full + 1) // 2):
+            k0 = lo + 2 * j * BK
+            _async_copy_at(
+                cfg, seg, kv_smem2, rope_smem2, k0 + BK, hi, rng_l, rng_r, offs_l, offs_r
+            )
+            gl.amd.cdna4.async_copy.wait_group(1)
+            m_i, l_i, acc = _qkpv_lds(
+                cfg, seg, None, q_dot, q_rope_dot, m_i, l_i, acc, head_mask,
+                qk_scale, v_scale, kv_smem, rope_smem, k0, hi, red_smem,
+            )
+            _async_copy_at(
+                cfg, seg, kv_smem, rope_smem, k0 + 2 * BK, hi, rng_l, rng_r, offs_l, offs_r
+            )
+            gl.amd.cdna4.async_copy.wait_group(1)
+            m_i, l_i, acc = _qkpv_lds(
+                cfg, seg, None, q_dot, q_rope_dot, m_i, l_i, acc, head_mask,
+                qk_scale, v_scale, kv_smem2, rope_smem2, k0 + BK, hi, red_smem,
+            )
+        gl.amd.cdna4.async_copy.wait_group(0)
+        return m_i, l_i, acc
     for i in range(n_full):
         _copy_tile(
             cfg,
@@ -1046,6 +1110,7 @@ def _async_segment(
             rope_smem,
             lo + i * BK,
             hi,
+            red_smem,
         )
     return m_i, l_i, acc
 
@@ -1234,6 +1299,7 @@ def _qkpv(
     rope_smem,
     k_start=0,
     seg_hi=0,
+    red_smem=None,
 ):
     """Stage a prefetched fp8 tile into LDS, then QK -> softmax -> PV."""
     _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem)
@@ -1253,7 +1319,20 @@ def _qkpv(
         rope_smem,
         k_start,
         seg_hi,
+        red_smem,
     )
+
+
+@gluon.jit
+def _load_v(cfg, kv_smem):
+    """The PV dot's V operand, read out of the tile buffer."""
+    if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
+        v = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_smem, cfg.v_layout)
+    else:
+        v = kv_smem.load(cfg.v_layout)
+    if cfg.ASYNC_LDS:
+        v = v.to(gl.float8e4nv, bitcast=True)
+    return v
 
 
 @gluon.jit
@@ -1324,26 +1403,28 @@ def _qkpv_lds(
     m_new = gl.where(m_new > neg_inf, m_new, 0.0)
     p = gl.exp2(S * qk_scale - m_new[:, None])
     alpha = gl.exp2(m_i - m_new)
-    if red_smem is not None:
+    if cfg.SUMDEFER:
+        l_new = l_i * alpha[:, None] + p
+    elif red_smem is not None:
         l_new = l_i * alpha + _row_reduce_lds(
             cfg, p, red_smem.slice(cfg.BLOCK_M, cfg.BLOCK_M), False
         )
     else:
         l_new = l_i * alpha + gl.sum(p, axis=1)
-    if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
-        v = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_smem, cfg.v_layout)
-    else:
-        v = kv_smem.load(cfg.v_layout)
-    if cfg.ASYNC_LDS:
-        v = v.to(gl.float8e4nv, bitcast=True)
     # "fp8_scalar": V was staged as raw fp8 code points; apply the per-tensor scale
     # on the small side (p) and leave l scale-free: out = sum(p*s*V)/l exactly.
     if seg.fmt.KIND == "fp8_scalar" and not cfg.FP8_MFMA:
         p = p * v_scale
+    # The p-operand exchange is a cross-warp LDS round trip, so the barrier
+    # before it waits on lgkmcnt(0) and throws away any V read issued earlier.
+    if not cfg.PV_ORDER:
+        v = _load_v(cfg, kv_smem)
     if cfg.FP8_MFMA:
         p_dot = gl.convert_layout(p.to(gl.float8e4nv), cfg.p_layout)
     else:
         p_dot = gl.convert_layout(p.to(gl.bfloat16), cfg.p_layout)
+    if cfg.PV_ORDER:
+        v = _load_v(cfg, kv_smem)
     alpha_pv = gl.convert_layout(alpha, gl.SliceLayout(1, cfg.pv_layout))
     acc = acc * alpha_pv[:, None]
     acc = gl.amd.cdna4.mfma(p_dot, v, acc)
@@ -1518,7 +1599,10 @@ def _decode_tile(
     m_new = gl.where(m_new > neg_inf, m_new, 0.0)  # guard all-masked rows
     p = gl.exp2(S - m_new[:, None])
     alpha = gl.exp2(m_i - m_new)
-    l_new = l_i * alpha + gl.sum(p, axis=1)
+    if cfg.SUMDEFER:
+        l_new = l_i * alpha[:, None] + p
+    else:
+        l_new = l_i * alpha + gl.sum(p, axis=1)
 
     v = kv_smem.load(cfg.v_layout)  # [BLOCK_K, KV_DIM]
     if seg.fmt.KIND == "fp8_scalar":
@@ -1546,6 +1630,9 @@ def _staged_segment(
     v_scale,
     kv_smem,
     rope_smem,
+    kv_smem2,
+    rope_smem2,
+    red_smem=None,
 ):
     offs_full = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.gather_l))
     offs_rope = gl.arange(0, cfg.ROPE_L, layout=gl.SliceLayout(0, cfg.gather_rope_l))
@@ -1598,6 +1685,7 @@ def _staged_segment(
                     k_rng_slot,
                     k_rng_rope,
                 )
+                cur_kv, cur_rope = kv_smem, rope_smem
                 m_i, l_i, acc = _qkpv(
                     cfg,
                     seg,
@@ -1613,13 +1701,15 @@ def _staged_segment(
                     head_mask,
                     qk_scale,
                     v_scale,
-                    kv_smem,
-                    rope_smem,
+                    cur_kv,
+                    cur_rope,
                     lo + (i - 1) * cfg.BLOCK_K,
                     hi,
+                    red_smem,
                 )
                 kn, ks, kr, vld = kn2, ks2, kr2, vld2
             if not cfg.UNPEEL:
+                cur_kv, cur_rope = kv_smem, rope_smem
                 m_i, l_i, acc = _qkpv(
                     cfg,
                     seg,
@@ -1635,10 +1725,11 @@ def _staged_segment(
                     head_mask,
                     qk_scale,
                     v_scale,
-                    kv_smem,
-                    rope_smem,
+                    cur_kv,
+                    cur_rope,
                     lo + (n_full - 1) * cfg.BLOCK_K,
                     hi,
+                    red_smem,
                 )
     else:
         for k_start in range(lo, hi_full, cfg.BLOCK_K):
@@ -1974,10 +2065,14 @@ def _segment(
     v_scale,
     kv_smem,
     rope_smem,
+    kv_smem2,
+    rope_smem2,
     red_smem,
     DSV4_PREFETCH: gl.constexpr,
 ):
-    """Walk keys [lo, hi) of one segment with its format's walk."""
+    """Walk keys [lo, hi) of one segment with its format's walk. kv_smem2 /
+    rope_smem2 are the direct-to-LDS walk's second tile buffer pair (==
+    kv_smem / rope_smem when it is single-buffered)."""
     if seg.fmt.KIND == "fp8_dsv4_mla":
         m_i, l_i, acc = _dsv4_segment(
             cfg,
@@ -2013,6 +2108,9 @@ def _segment(
             v_scale,
             kv_smem,
             rope_smem,
+            kv_smem2,
+            rope_smem2,
+            red_smem if cfg.LDSRED else None,
         )
     else:
         m_i, l_i, acc = _staged_segment(
@@ -2030,6 +2128,9 @@ def _segment(
             v_scale,
             kv_smem,
             rope_smem,
+            kv_smem2,
+            rope_smem2,
+            red_smem if cfg.LDSRED else None,
         )
     return m_i, l_i, acc
 
@@ -2254,6 +2355,11 @@ def _sparse_mla(
     GATHER_CACHE: gl.constexpr = _CG,
     IDX_CACHE: gl.constexpr = _NO_CACHE,
     ASYNC_LDS: gl.constexpr = False,
+    ASYNC_DBUF: gl.constexpr = False,
+    # SOFTMAX_FIX defers the row sum and reduces rows through LDS; both it and
+    # PV_ORDER only pay with enough rows in flight, so the launcher picks them.
+    SOFTMAX_FIX: gl.constexpr = False,
+    PV_ORDER: gl.constexpr = False,
     RELAXED_LOAD: gl.constexpr = True,
     PAD_INTERVAL: gl.constexpr = 1024,
     SLOT_U32: gl.constexpr = False,
@@ -2345,8 +2451,8 @@ def _sparse_mla(
     # TODO(has_invalid): the sentinel restriction is conservative, not fundamental.
     gl.static_assert(
         (not ASYNC_LDS)
-        or (FP8_MFMA and UNI_TILE and not HAS_INVALID and not HAS_EXTRA),
-        "ASYNC_LDS requires FP8_MFMA + UNI_TILE, no -1 sentinels, one segment",
+        or (FP8_MFMA and UNI_TILE and not HAS_INVALID),
+        "ASYNC_LDS requires FP8_MFMA + UNI_TILE and no -1 sentinels",
     )
     gl.static_assert(
         (not UNPEEL) or UNI_TILE,
@@ -2393,6 +2499,9 @@ def _sparse_mla(
         GATHER_CACHE,
         IDX_CACHE,
         ASYNC_LDS,
+        ASYNC_DBUF,
+        SOFTMAX_FIX,
+        PV_ORDER,
         RELAXED_LOAD,
         PAD_INTERVAL,
         SLOT_U32,
@@ -2537,7 +2646,10 @@ def _sparse_mla(
     m_i = gl.full(
         [BLOCK_M], float("-inf"), gl.float32, layout=gl.SliceLayout(1, cfg.qk_layout)
     )
-    l_i = gl.zeros([BLOCK_M], gl.float32, layout=gl.SliceLayout(1, cfg.qk_layout))
+    if cfg.SUMDEFER:
+        l_i = gl.zeros([BLOCK_M, BLOCK_K], gl.float32, layout=cfg.qk_layout)
+    else:
+        l_i = gl.zeros([BLOCK_M], gl.float32, layout=gl.SliceLayout(1, cfg.qk_layout))
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], gl.float32, layout=cfg.pv_layout)
 
     # An fp8 buffer is half the bytes of the bf16 staging it replaces.
@@ -2552,8 +2664,20 @@ def _sparse_mla(
         )
     else:
         rope_smem = kv_smem  # never read as the rope buffer in this geometry
+    # Second tile buffer, ping-ponged by trip parity. Costs no LDS when off.
+    if ASYNC_DBUF:
+        kv_smem2 = gl.allocate_shared_memory(BUF_DT, [BLOCK_K, HEAD_SIZE], cfg.kv_shared)
+        if ROPE_SEPARATE:
+            rope_smem2 = gl.allocate_shared_memory(
+                BUF_DT, [BLOCK_K, ROPE_DIM], cfg.rope_shared
+            )
+        else:
+            rope_smem2 = kv_smem2
+    else:
+        kv_smem2 = kv_smem
+        rope_smem2 = rope_smem
     # _dsv4_segment's row max / sum exchange.
-    if DSV4_WALK:
+    if DSV4_WALK or cfg.LDSRED:
         red_smem = gl.allocate_shared_memory(
             gl.float32,
             [2 * BLOCK_M, cfg.N_WARPS],
@@ -2634,6 +2758,8 @@ def _sparse_mla(
         main_v_scale,
         kv_smem,
         rope_smem,
+        kv_smem2,
+        rope_smem2,
         red_smem,
         DSV4_PREFETCH,
     )
@@ -2672,6 +2798,8 @@ def _sparse_mla(
             extra_v_scale,
             kv_smem,
             rope_smem,
+            kv_smem2,
+            rope_smem2,
             red_smem,
             DSV4_PREFETCH,
         )
@@ -2682,6 +2810,8 @@ def _sparse_mla(
         # out = acc*s/l is what the bf16 path computes.
         acc = acc * (extra_v_scale if HAS_EXTRA else main_v_scale)
 
+    if cfg.SUMDEFER:
+        l_i = gl.sum(l_i, axis=1)
     # Move the row reductions into pv-slice space for output/partials.
     m_pv = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.pv_layout))
     l_pv = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.pv_layout))
