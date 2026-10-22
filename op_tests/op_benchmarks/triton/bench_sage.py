@@ -698,7 +698,8 @@ def generate_test_tensors(
         )
         # Independent, not opposing: opposing rows cancel the tied reference output to ~0.
         v_axis = torch.nn.functional.normalize(
-            torch.randn((2 * pairs, hk, d_head_v), device=device, dtype=torch.float32), dim=-1
+            torch.randn((2 * pairs, hk, d_head_v), device=device, dtype=torch.float32),
+            dim=-1,
         )
         # q.k = amp^2 and the kernel scales by d^-0.5, so this lands the winners at the target.
         amp = (_TIEBREAK_PEAK_LOGIT * d_head**0.5) ** 0.5
