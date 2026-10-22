@@ -47,6 +47,44 @@ _STREAM_SELECT_MIN_COLUMNS = 32768
 _DECODE_MAX_ROWS = 64
 # Columns per workgroup of the 16-row scorer.
 _ROWS_BLOCK_N = 64
+# gfx9 LDS is 64 banks of 4 bytes. A row of 128 bf16 is 256 bytes, one
+# full pass of the banks, so the 16 lanes that reload one MFMA column
+# (lane_m 0..15, the same d) all hit one bank. Eight bf16 of padding is
+# 16 bytes: the bank advances by 4, those lanes take distinct banks, and
+# each row stays 16-byte aligned for the 8-wide stores.
+_LDS_ROW_PAD = 8
+# One-row partial scores. A lane stride of 4 fp32 puts lanes 16 apart in
+# the same bank, so the 64-lane store conflicts 4 ways. Stride 5 is
+# coprime with 64, so that store uses every bank once. The 4 accumulators
+# stay contiguous. The 16-row scorer sums heads in registers and has no
+# such buffer.
+_LDS_C_LANE_STRIDE = 5
+
+
+def _layout_elems(shape: tuple[int, ...], stride: tuple[int, ...]) -> int:
+    """Elements a layout addresses, including the padding in its strides."""
+    return 1 + sum((n - 1) * s for n, s in zip(shape, stride))
+
+
+def _q_lds_layout(
+    block_m: int, n_heads: int, fold_heads: bool
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """``(shape, stride)`` for the 16-row scorer's Q tile.
+
+    Non-fold reads 16 rows of one head, so only the row stride has to move
+    the bank. Fold reads every (row, head) pair on the 16-wide M axis, so
+    each head is padded and the row stride is that many heads: 4 rows by 4
+    heads then land on 16 distinct banks.
+    """
+    if fold_heads:
+        head_stride = _D + _LDS_ROW_PAD
+        row_stride = n_heads * head_stride
+    else:
+        head_stride = _D
+        row_stride = n_heads * _D + _LDS_ROW_PAD
+    return (block_m, n_heads, _D), (row_stride, head_stride, 1)
+
+
 _SCORE_HEADS = (4, 8)
 _SCORE_SCALE = _D**-0.5
 
@@ -202,13 +240,24 @@ def build_qsa_indexer_decode_scores_module(
     q_chunks_per_thread = vec_chunks // (block_threads // head_pad)
     chunks_per_thread = vec_chunks // (block_threads // block_n)
     num_waves = block_threads // 64
+    q_shape = (head_pad, _D)
+    q_stride = (_D + _LDS_ROW_PAD, 1)
+    k_shape = (block_n, _D)
+    k_stride = (_D + _LDS_ROW_PAD, 1)
+    c_shape = (n_subtiles, num_waves, 64, 4)
+    c_stride = (
+        num_waves * 64 * _LDS_C_LANE_STRIDE,
+        64 * _LDS_C_LANE_STRIDE,
+        _LDS_C_LANE_STRIDE,
+        1,
+    )
 
     @fx.struct
     class SharedStorage:
-        q: fx.Array[BFloat16, head_pad * _D, 16]
-        k: fx.Array[BFloat16, block_n * _D, 16]
+        q: fx.Array[BFloat16, _layout_elems(q_shape, q_stride), 16]
+        k: fx.Array[BFloat16, _layout_elems(k_shape, k_stride), 16]
         live: fx.Array[Int32, block_n, 16]
-        c: fx.Array[Float32, n_subtiles * num_waves * 64 * 4, 16]
+        c: fx.Array[Float32, _layout_elems(c_shape, c_stride), 16]
 
     @flyc.kernel(
         name="qsa_indexer_scores_"
@@ -277,15 +326,10 @@ def build_qsa_indexer_decode_scores_module(
             k_buf = fx.rocdl.make_buffer_tensor(k_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        q_lds = storage.q.view(fx.make_layout((head_pad, _D), (_D, 1)))
-        k_lds = storage.k.view(fx.make_layout((block_n, _D), (_D, 1)))
+        q_lds = storage.q.view(fx.make_layout(q_shape, q_stride))
+        k_lds = storage.k.view(fx.make_layout(k_shape, k_stride))
         live_lds = storage.live.view(fx.make_layout(block_n, 1))
-        c_lds = storage.c.view(
-            fx.make_layout(
-                (n_subtiles, num_waves, 64, 4),
-                (num_waves * 64 * 4, 64 * 4, 4, 1),
-            )
-        )
+        c_lds = storage.c.view(fx.make_layout(c_shape, c_stride))
         qk_mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, qk_k, BFloat16))
         qk_a = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
         qk_b = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
@@ -504,11 +548,14 @@ def build_qsa_indexer_prefill_scores_module(
         raise ValueError("prefill Q/K vector counts must divide block threads")
     q_vectors_per_thread = q_vectors // block_threads
     k_vectors_per_thread = k_vectors // block_threads
+    q_shape, q_stride = _q_lds_layout(block_m, n_heads, fold_heads)
+    k_shape = (block_n, _D)
+    k_stride = (_D + _LDS_ROW_PAD, 1)
 
     @fx.struct
     class SharedStorage:
-        q: fx.Array[BFloat16, block_m * n_heads * _D, 16]
-        k: fx.Array[BFloat16, block_n * _D, 16]
+        q: fx.Array[BFloat16, _layout_elems(q_shape, q_stride), 16]
+        k: fx.Array[BFloat16, _layout_elems(k_shape, k_stride), 16]
         visible: fx.Array[Int32, block_m, 16]
         req: fx.Array[Int32, block_m, 16]
         live: fx.Array[Int32, block_n, 16]
@@ -591,10 +638,8 @@ def build_qsa_indexer_prefill_scores_module(
             k_buf = fx.rocdl.make_buffer_tensor(k_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        q_lds = storage.q.view(
-            fx.make_layout((block_m, n_heads, _D), (n_heads * _D, _D, 1))
-        )
-        k_lds = storage.k.view(fx.make_layout((block_n, _D), (_D, 1)))
+        q_lds = storage.q.view(fx.make_layout(q_shape, q_stride))
+        k_lds = storage.k.view(fx.make_layout(k_shape, k_stride))
         visible_lds = storage.visible.view(fx.make_layout(block_m, 1))
         req_lds = storage.req.view(fx.make_layout(block_m, 1))
         live_lds = storage.live.view(fx.make_layout(block_n, 1))
