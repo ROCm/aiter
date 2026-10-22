@@ -54,13 +54,20 @@ def make_weights(E):
     return w13, s13, w2, s2
 
 
-def make_routing(T, E):
+def make_routing(T, E, topk=None):
     gen = make_generator(T)
     x = torch.randn(T, HIDDEN, dtype=torch.bfloat16, device="cuda", generator=gen)
+    shared = topk is None and E == 289
+    routed_experts, routed_topk = E - int(shared), topk or 8
     tw, ids = torch.topk(
-        torch.randn(T, 288, device="cuda", generator=gen).softmax(-1), 8, dim=-1
+        torch.randn(
+            T, max(routed_experts, routed_topk), device="cuda", generator=gen
+        ).softmax(-1),
+        routed_topk,
+        dim=-1,
     )
-    if E == 289:  # the fused shared expert, selected by every token
-        ids = torch.cat([ids, torch.full_like(ids[:, :1], 288)], dim=1)
+    ids %= routed_experts  # Exercise repeated selections when E < top-k.
+    if shared:
+        ids = torch.cat([ids, torch.full_like(ids[:, :1], E - 1)], dim=1)
         tw = torch.cat([tw, torch.ones_like(tw[:, :1])], dim=1)
     return x, ids.to(torch.int32), tw

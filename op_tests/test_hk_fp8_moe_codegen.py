@@ -1,21 +1,51 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Audit FP8 MoE assembly using the compile command from an existing AITER JIT build.
+"""Audit FP8 MoE assembly using the AITER JIT compile command.
 
 Compiler instructions must avoid v128-v255 and all AGPRs: these registers hold
 HipKittens ART tiles. Inline assembly implementing those tiles is exempt. This
 check supplements runtime correctness tests; zero spills alone do not prove that
-the compiler avoids pinned registers. No PyTorch import or GPU is required.
+the compiler avoids pinned registers. With no arguments, build and audit on
+gfx950; --build-dir and --assembly need neither a PyTorch import nor a GPU.
 """
 
 import argparse
+import inspect
 import json
 import re
 import shlex
 import subprocess
 import tempfile
 from pathlib import Path
+
+
+def build_for_audit():
+    import torch
+
+    if (
+        not torch.version.hip
+        or not torch.cuda.is_available()
+        or torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).gcnArchName.split(":")[0]
+        != "gfx950"
+    ):
+        print("Skipping test_hk_fp8_moe_codegen.py: requires gfx950")
+        return None
+    from aiter.jit.core import bd_dir, build_module, get_args_of_build
+
+    module = "module_hk_fp8_moe"
+    args = get_args_of_build(module)
+    args["md_name"] = module
+    build_module(
+        **{
+            k: v
+            for k, v in args.items()
+            if k in inspect.signature(build_module).parameters
+        }
+    )
+    return Path(bd_dir) / module / "build"
 
 
 def emit_assembly(build_dir: Path, output: Path) -> None:
@@ -103,26 +133,27 @@ def check_assembly(path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--build-dir", type=Path, help="JIT directory containing build.ninja"
     )
     mode.add_argument("--assembly", type=Path, help="check an existing assembly file")
-    parser.add_argument(
-        "--output", type=Path, help="retain emitted assembly (--build-dir only)"
-    )
+    parser.add_argument("--output", type=Path, help="retain emitted assembly")
     args = parser.parse_args()
-    if args.output and not args.build_dir:
-        parser.error("--output requires --build-dir")
+    if args.output and args.assembly:
+        parser.error("--output cannot be used with --assembly")
     try:
         if args.assembly:
             check_assembly(args.assembly)
         else:
+            build_dir = args.build_dir or build_for_audit()
+            if build_dir is None:
+                return
             with tempfile.TemporaryDirectory(prefix="hk-moe-codegen-") as temp:
                 output = args.output or Path(temp) / "hk_moe.s"
-                emit_assembly(args.build_dir.resolve(), output)
+                emit_assembly(build_dir.resolve(), output)
                 check_assembly(output)
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"FAIL: {error}\n")
 
 

@@ -54,7 +54,7 @@ def test_case(T, E, limit, weights):
     return ok
 
 
-def test_routing_replay(weights):
+def test_routing_replay(weights, topk=None):
     """Replay changed routing through the same graph, including collisions and tails."""
     w13, s13, w2, s2 = weights
     E = w13.shape[0]
@@ -62,9 +62,9 @@ def test_routing_replay(weights):
     W13, W2 = dequant(w13, s13), dequant(w2, s2)
     ok = True
     # Straddle 4096 selections, with a partial wave and a partial routing block.
-    topk = 9 if E == 289 else 8
-    for T in (65, 4096 // topk, 4096 // topk + 1):
-        x, ids, tw = make_routing(T, E)
+    selections = topk or (9 if E == 289 else 8)
+    for T in (65, 4096 // selections, 4096 // selections + 1):
+        x, ids, tw = make_routing(T, E, topk)
         original_ids = ids.clone()
         args = (x, ids, tw, packed[0], s13, packed[1], s2)
         stream = torch.cuda.Stream()
@@ -114,7 +114,7 @@ def test_routing_replay(weights):
             )
             ok = ok and passed
             aiter.logger.info(
-                f"hk_fp8_moe routing replay T={T} E={E} {routing}: "
+                f"hk_fp8_moe routing replay T={T} E={E} topk={selections} {routing}: "
                 f"rel err {err:.4f} {'ok' if passed else 'FAIL'}"
             )
     return ok
@@ -134,11 +134,13 @@ def test_rejects(weights):
         bad_args.append(bad)
     for index, tensor in (
         (0, x[:, :2048]),
+        (0, x[:1].expand(524288, -1)),
         (1, ids[:, :4]),
         (1, ids[0, 0]),
         (1, ids.float()),
         (3, w13[0, 0, 0]),
         (3, w13[:0]),
+        (3, w13[:1].expand(1025, -1, -1)),
     ):
         bad = args.copy()
         bad[index] = tensor
@@ -211,5 +213,11 @@ if __name__ == "__main__":
         results.append(test_routing_replay(weights))
         results.append(test_rejects(weights))
         results.append(test_int64_ids_and_empty(weights))
+        del weights
+    # Expert-count limits and the striped-LDS/global-atomic routing boundary.
+    for E in (1, 304, 305, 1024):
+        weights = make_weights(E)
+        for topk in (8, 9):
+            results.append(test_routing_replay(weights, topk))
         del weights
     sys.exit(0 if all(results) else 1)

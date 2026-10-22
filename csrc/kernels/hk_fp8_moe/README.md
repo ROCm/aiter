@@ -54,13 +54,15 @@ Run from the repository root on gfx950:
 ```bash
 python3 op_tests/test_hk_fp8_moe.py
 python3 op_tests/test_hk_fp8_moe.py --routing-only
+python3 op_tests/test_hk_fp8_moe_codegen.py
 ```
 
 The default suite checks an FP32 reference and reports timings for 1 to 16384 tokens, top-k 8 and 9,
 and SwiGLU with and without clamping. Top-k 9 includes a shared expert selected by every token.
 Graph replay checks change inputs and exercise random, concentrated, bank-aliasing, partially invalid,
-and all-invalid routing around block boundaries. Use `--tokens` to select token counts for the main
-sweep; `--routing-only` runs routing replay and unsupported-shape checks.
+and all-invalid routing around block boundaries. Both top-k values also cover 1, 304, 305, and 1024
+experts, including the routing implementation boundary. Use `--tokens` to select token counts for the
+main sweep; `--routing-only` runs routing replay and unsupported-shape checks.
 
 ## Pinned registers
 
@@ -80,7 +82,9 @@ python3 op_tests/test_hk_fp8_moe_codegen.py \
     --output /tmp/hk_moe.s
 ```
 
-The code-generation test obtains the `hk_moe.cu` compile command from `ninja -t compdb`, preserving
+With no arguments, the code-generation test builds and audits on gfx950, skipping other devices.
+Explicit `--build-dir` or `--assembly` checks also work without a GPU. The test obtains the
+`hk_moe.cu` compile command from `ninja -t compdb`, preserving
 the JIT flags and changing only the output to device assembly. All four grouped GEMM variants must
 avoid compiler instructions that touch pinned registers, and all VGPR spill counts must be zero.
 Inline assembly implementing HipKittens tiles is excluded from the register check.
