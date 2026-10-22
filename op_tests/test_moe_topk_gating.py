@@ -12,8 +12,7 @@ Usage:
   python test_moe_topk_gating.py --section ties,eplb
   python test_moe_topk_gating.py --section biased-sigmoid --num-experts 896 \
       --num-tokens 1,8,32,128 --topk 16 --dtype bf16
-  python test_moe_topk_gating.py --section biased-nan --num-experts 6,8,16 \
-      --topk 3,4
+  python test_moe_topk_gating.py --section biased-nan
 """
 
 import argparse
