@@ -42,11 +42,14 @@ from .kernels.qsa.indexer_select import (
     _H,
     _K,
     _KV_HEADS,
+    _LDS_ROW_PAD,
     _R,
     _ROWS_BLOCK_N,
     _SCORE_HEADS,
     _SCORE_SCALE,
     _STREAM_SELECT_MIN_COLUMNS,
+    _layout_elems,
+    _q_lds_layout,
     build_qsa_indexer_active_columns_module,
     build_qsa_indexer_decode_scores_module,
     build_qsa_indexer_emit_module,
@@ -209,13 +212,17 @@ def _prefill_scores_plan(
 def _k1_prefill_lds_bytes(n_heads: int) -> int:
     """Bytes in the 16-row scorer's LDS tile.
 
-    Q is ``16.H.128`` bf16, K is ``BLOCK_N.128`` bf16, and the visibility,
-    request and column-live vectors are int32. Each field is already a
-    multiple of its 16-byte alignment, so nothing is inserted between them.
+    Q is 16 rows of ``n_heads`` with the row padded by ``_LDS_ROW_PAD`` bf16
+    so the MFMA reload misses LDS bank conflicts. K is ``BLOCK_N`` columns
+    padded the same way. The visibility, request and column-live vectors are
+    int32. Each field stays 16-byte aligned.
     """
     block_m = 16
-    q_bytes = block_m * n_heads * _D * 2
-    k_bytes = _ROWS_BLOCK_N * _D * 2
+    q_shape, q_stride = _q_lds_layout(block_m, n_heads, False)
+    k_shape = (_ROWS_BLOCK_N, _D)
+    k_stride = (_D + _LDS_ROW_PAD, 1)
+    q_bytes = _layout_elems(q_shape, q_stride) * 2
+    k_bytes = _layout_elems(k_shape, k_stride) * 2
     vector_bytes = (2 * block_m + _ROWS_BLOCK_N) * 4
     return q_bytes + k_bytes + vector_bytes
 
@@ -240,23 +247,55 @@ def _k1_uses_prefill_scorer(
 
 _ROWS_SCORER_TILES_PER_WG = 4
 _ROWS_SCORER_MULTI_TILE_MIN_ROWS_PER_REQUEST = 16
+_ROWS_SCORER_MIN_WORKGROUPS = 128
+_ROWS_SCORER_TWO_TILE_MIN_ROWS = 128
+_ROWS_SCORER_FOUR_TILE_MIN_ROWS = 512
+_ROWS_SCORER_MULTI_TILE_MIN_WORK = 512
 
 
 def _k1_rows_scorer_layout(
-    n_requests: int, rows: int, n_heads: int
+    n_requests: int,
+    rows: int,
+    n_heads: int,
+    live_columns: int,
+    row_bounded: bool = False,
 ) -> tuple[bool, int]:
-    """``(fold_heads, tiles_per_wg)`` for a 16-row scorer launch.
+    """``(fold_heads, tiles_per_wg)`` for a row-scorer launch.
 
-    A prefill tile almost always belongs to one request with long rows, so
-    each workgroup walks four column tiles, reusing Q and the row setup,
-    with the grid still full. MTP has few rows per request, so a 16-row
-    tile spans several requests: there 4 heads fold into the MFMA M axis,
-    a tile is 4 rows, and one column tile per workgroup keeps enough
-    workgroups to fill the machine.
+    Long prefill walks four column tiles per workgroup to reuse Q and the row
+    setup. Smaller batches give that reuse up to keep enough independent
+    workgroups on the GPU. A captured padded decode has no host-visible live
+    width, so it conservatively keeps one tile per workgroup.
+
+    MTP instead folds four heads into the MFMA M axis: a tile is four rows,
+    and one column tile per workgroup keeps the machine full.
     """
-    if rows >= _ROWS_SCORER_MULTI_TILE_MIN_ROWS_PER_REQUEST * n_requests:
-        return False, _ROWS_SCORER_TILES_PER_WG
-    return n_heads == 4, 1
+    if rows < _ROWS_SCORER_MULTI_TILE_MIN_ROWS_PER_REQUEST * n_requests:
+        return n_heads == 4, 1
+    if row_bounded:
+        return False, 1
+
+    row_tiles = (rows + 15) // 16
+    col_tiles = (live_columns + _ROWS_BLOCK_N - 1) // _ROWS_BLOCK_N
+    tile_work = row_tiles * col_tiles
+    tiles_per_wg = 1
+    if (
+        rows >= _ROWS_SCORER_TWO_TILE_MIN_ROWS
+        or tile_work >= _ROWS_SCORER_MULTI_TILE_MIN_WORK
+    ):
+        tiles_per_wg = 2
+    if (
+        rows >= _ROWS_SCORER_FOUR_TILE_MIN_ROWS
+        and tile_work >= _ROWS_SCORER_MULTI_TILE_MIN_WORK
+    ):
+        tiles_per_wg = _ROWS_SCORER_TILES_PER_WG
+    while (
+        tiles_per_wg > 1
+        and row_tiles * ((col_tiles + tiles_per_wg - 1) // tiles_per_wg)
+        < _ROWS_SCORER_MIN_WORKGROUPS
+    ):
+        tiles_per_wg //= 2
+    return False, tiles_per_wg
 
 
 @functools.lru_cache(maxsize=1)
@@ -372,10 +411,15 @@ def qsa_indexer_score_and_select(
     wide_cache = span_bytes(k_cache) > (1 << 32)
     k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     if _k1_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
-        col_tiles = (n_columns + _ROWS_BLOCK_N - 1) // _ROWS_BLOCK_N
+        layout_columns = n_columns if live_columns is None else int(live_columns)
         fold_heads, tiles_per_wg = _k1_rows_scorer_layout(
-            int(context_lens.shape[0]), m, n_heads
+            int(context_lens.shape[0]),
+            m,
+            n_heads,
+            layout_columns,
+            row_bounded=row_bounded,
         )
+        col_tiles = (n_columns + _ROWS_BLOCK_N - 1) // _ROWS_BLOCK_N
         tile_rows = 16 // n_heads if fold_heads else 16
         _run_compiled(
             _prefill_scores_plan(
