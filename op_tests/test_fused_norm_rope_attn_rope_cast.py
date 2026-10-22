@@ -1521,10 +1521,17 @@ def test_two_source_empty_and_bounds(heads, empty):
 
 
 @pytest.mark.parametrize("heads", [64, 128])
-def test_two_source_rescale(heads):
+@pytest.mark.parametrize("mixed_scales", [False, True])
+def test_two_source_rescale(heads, mixed_scales):
     kwargs, _ = two_source_inputs(heads, "padded", "prepared", wide=True)
-    kwargs["q_scale"].view(torch.uint8).fill_(127)
-    query = kwargs["q"].float()
+    scales = kwargs["q_scale"].view(torch.uint8)
+    if mixed_scales:
+        scales.random_(118, 131)
+    else:
+        scales.fill_(127)
+    query = kwargs["q"].float() * torch.exp2(scales.float() - 127).repeat_interleave(
+        32, -1
+    )
     debug = torch.empty_like(query)
     stats = torch.empty(query.shape[:2], device="cuda")
     out = fused_v41(
@@ -1577,9 +1584,10 @@ def test_two_source_rescale(heads):
 
 
 @pytest.mark.parametrize("heads", [64, 128])
-@pytest.mark.parametrize("mode", ["raw", "prepared", "norm"])
+@pytest.mark.parametrize("mode", ["raw", "prepared", "prepared_mixed", "norm"])
 def test_two_source_graph_replay(heads, mode):
-    kwargs, _ = two_source_inputs(heads, "padded", mode, wide=True)
+    input_mode = "prepared" if mode.startswith("prepared") else mode
+    kwargs, _ = two_source_inputs(heads, "padded", input_mode, wide=True)
     out = fused_v41(**kwargs)
     assert out[2:] == (None, None)
     buffers = {"out": out[0], "out_scale": out[1]}
@@ -1595,6 +1603,8 @@ def test_two_source_graph_replay(heads, mode):
         kwargs["kv_indices_extend"].fill_(-1)
         if mode == "prepared":
             kwargs["q_scale"].view(torch.uint8).fill_(127)
+        elif mode == "prepared_mixed":
+            kwargs["q_scale"].view(torch.uint8).random_(118, 131)
         else:
             kwargs["q"].mul_(0.5)
         expected = fused_v41(**kwargs)
