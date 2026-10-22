@@ -111,7 +111,7 @@ class Divisor:
         vi = fx.Int64(v)
         if const_expr(self.is_static):
             return vi // fx.Int64(self.value), vi % fx.Int64(self.value)
-        q = (vi * fx.Int64(self._magic)).shrui(fx.Int64(32) + fx.Int64(self._shift))
+        q = (vi * fx.Int64(self._magic)).shrui(32 + fx.Int64(self._shift))
         return q, vi - q * fx.Int64(self.value)
 
     def div(self, v):
@@ -412,7 +412,7 @@ class LdsStager:
             fx.Int64(self._tid) + fx.Int64(i * self._cfg.block_threads)
         ) * fx.Int64(LDG_VEC)
         base_bytes = off_elems * fx.Int64(BF16_BYTES)
-        addr = fx.Int64(fx.ptrtoint(lds_array.ptr)) + fx.Int64(base_bytes)
+        addr = fx.Int64(fx.ptrtoint(lds_array.ptr)) + base_bytes
         if const_expr(park is not None):
             live, park_array = park
             addr = live.select(addr, fx.Int64(fx.ptrtoint(park_array.ptr)))
@@ -1288,7 +1288,7 @@ class OutputScatter:
                                 self._big_store(fx.Int64(off_nk), cval)
                             else:
                                 fx.memref_store_vec(
-                                    fx.Vector.filled(1, cval, elem_ty), self._y_reg_1
+                                    fx.full(1, cval, elem_ty), self._y_reg_1
                                 )
                                 fx.copy(
                                     self._y_atom_1,

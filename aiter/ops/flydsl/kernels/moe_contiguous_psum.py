@@ -132,7 +132,7 @@ def build_moe_contiguous_psum_module():
         p_p = ptr_buf_tensor(psum)
         c_p = ptr_buf_tensor(contiguous_m)
 
-        is_lane0 = tid == fx.Uint32(0)
+        is_lane0 = tid == 0
         if is_lane0:
             carry[0] = fx.Int32(0)
         gpu.barrier()
@@ -254,7 +254,7 @@ def build_moe_contiguous_psum_remap_module():
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
         gtid = bid * MAX_EXPERTS_PER_BLOCK + tid
-        is_blk0 = bid == fx.Uint32(0)
+        is_blk0 = bid == 0
         tile_v = fx.Uint32(tile_m)
         tile_minus_1 = tile_v - 1
 
@@ -270,7 +270,7 @@ def build_moe_contiguous_psum_remap_module():
         p_p = ptr_buf_tensor(psum)
         c_p = ptr_buf_tensor(contiguous_m)
 
-        is_lane0 = tid == fx.Uint32(0)
+        is_lane0 = tid == 0
         if is_lane0:
             carry[0] = fx.Int32(0)
         gpu.barrier()
@@ -344,7 +344,7 @@ def build_moe_contiguous_psum_remap_module():
             # DROPPED_ROUTE_ROW sentinel: the row math would turn it into a wild
             # expert index, and downstream consumers check for the sentinel, so
             # leave the slot untouched.
-            row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+            row_is_mapped = fx.Int32(row_raw) >= 0
             if row_is_mapped:
                 row = fx.Uint32(row_raw)
                 m = fx.Uint32(route_max_m)
@@ -470,7 +470,7 @@ def build_moe_contiguous_psum_remap_ep_module():
 
         bid = fx.Uint32(fx.block_idx.x)
         gtid = bid * MAX_EXPERTS_PER_BLOCK + tid
-        is_blk0 = bid == fx.Uint32(0)
+        is_blk0 = bid == 0
         # Multi-block: every block keeps its exclusive per-expert starts in LDS so the
         # grid-strided scatter reads starts from LDS (never global -> no cross-block
         # barrier). Only block 0 writes the global starts/psum/contiguous_m outputs.
@@ -505,7 +505,7 @@ def build_moe_contiguous_psum_remap_ep_module():
             # masked->contiguous math would turn it into a wild expert index (OOB
             # LDS read of starts) and there is nothing to scatter. The route
             # kernel gives exactly the gather_w == 0 routes this sentinel.
-            row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+            row_is_mapped = fx.Int32(row_raw) >= 0
             if row_is_mapped:
                 row = fx.Uint32(row_raw)
                 m = fx.Uint32(route_max_m)
