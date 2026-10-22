@@ -10,6 +10,7 @@ from functools import cache, lru_cache
 import torch
 
 from csrc.opus_gemm.opus_gemm_common import (
+    A8W8_MXSCALE_BMM_WAVE8_TAGS,
     BIAS_AWARE_KIDS,
     GFX942_BF16WS_EXACT_N,
     GFX942_EVEN_LOOP_SPLITK_TAGS,
@@ -17,11 +18,10 @@ from csrc.opus_gemm.opus_gemm_common import (
     GFX942_MIN_ITERS_PER_SPLIT,
     OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
     SPLITK_KIDS,
-    A8W8_MXSCALE_BMM_WAVE8_TAGS,
     OpusGemmInstance,
     a8w8_mxscale_flatmm_prefetch_k_iter,
-    a8w8_mxscale_wave8_prefetch_k_iter,
     a8w8_mxscale_sf_panel_k_tiles,
+    a8w8_mxscale_wave8_prefetch_k_iter,
     a16w16_flatmm_prefetch_k_iter,
     get_kernel_instance,
 )

@@ -876,29 +876,32 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
         # at most 25 K-tiles, the 128-wide tiles need N%128), so each is
         # followed by kids with looser bounds.
         t = g * ((m + 63) // 64) * (n // 64)
+        # (largest tile count, candidates); None closes each band list.
         if m <= 16:
-            preferred = (
-                (9709,) if t <= 64 else (9705,) if t <= 128
-                else (9701,) if t <= 512 else (9706,)
-            )
+            bands = ((64, (9709,)), (128, (9705,)), (512, (9701,)), (None, (9706,)))
         elif m <= 32:
-            preferred = (
-                (9709,) if t <= 32 else (9705,) if t <= 64
-                else (9724, 9703) if t <= 128 else (9724, 9721)
+            bands = (
+                (32, (9709,)),
+                (64, (9705,)),
+                (128, (9724, 9703)),
+                (None, (9724, 9721)),
             )
         else:
             # Past 128 tiles the wavetm1 per-row kids (9760-9766) win, up to
             # 1.9x over 9715 at 2048+; 1.008x of the per-shape best on
             # geomean over the M>32 half of the sweep, at most 1.15x.
-            preferred = (
-                (9708,) if t <= 16 else (9700,) if t <= 32
-                else (9724, 9703) if t <= 64 else (9725,) if t <= 128
-                else (9766, 9721) if t <= 256
-                else (9766, 9716 if m >= 128 else 9719) if t <= 512
-                else (9765, 9764, 9715) if t <= 1024
-                else (9761, 9763, 9715) if t <= 2048
-                else (9761, 9760, 9715)
+            bands = (
+                (16, (9708,)),
+                (32, (9700,)),
+                (64, (9724, 9703)),
+                (128, (9725,)),
+                (256, (9766, 9721)),
+                (512, (9766, 9716 if m >= 128 else 9719)),
+                (1024, (9765, 9764, 9715)),
+                (2048, (9761, 9763, 9715)),
+                (None, (9761, 9760, 9715)),
             )
+        preferred = next(c for bound, c in bands if bound is None or t <= bound)
         fallback = (9714, 9721, 9725, 9700, 9704, 9708, 9710)
 
         # The tile count above is in 64-row units, so it cannot see a pick

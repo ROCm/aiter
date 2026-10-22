@@ -674,7 +674,10 @@ def _a8w8_mxscale_sf_preload_k_tiles(instance: OpusGemmInstance) -> int:
         per_mfma_k > 1
         and k_fit >= 4096
         and not (
-            instance.B_M == 128 and instance.B_N == 128 and instance.B_K == 128 and not bdirect
+            instance.B_M == 128
+            and instance.B_N == 128
+            and instance.B_K == 128
+            and not bdirect
         )
     )
     return (min(k_fit, 8192) if fits else 8192) // instance.B_K
