@@ -291,6 +291,20 @@ class TestCSVValidation(unittest.TestCase):
                 path = os.path.join(CONFIGS_DIR, f)
                 self.assertTrue(os.path.exists(path), f"Missing: {f}")
 
+    def test_fhmoe_untuned_tokens_are_serving_buckets(self):
+        # FhmoeTuner times a row at its raw token but publishes it under
+        # get_padded_M(token): below 32768 that is the next power of two.
+        path = os.path.join(CONFIGS_DIR, "untuned_fhmoe.csv")
+        if not os.path.exists(path):
+            self.skipTest("untuned_fhmoe.csv not found")
+        tokens = pd.read_csv(path)["token"].astype(int)
+        bad = tokens[(tokens < 1) | (tokens >= 32768) | (tokens & (tokens - 1) != 0)]
+        self.assertEqual(
+            len(bad),
+            0,
+            f"untuned_fhmoe.csv tokens must be powers of two below 32768: {bad.tolist()}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
