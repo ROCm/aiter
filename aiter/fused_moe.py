@@ -260,7 +260,6 @@ def _fused_decode_sort_quant(
     )
 
 
-
 @dataclass(frozen=True)
 class FmoeRuntimePolicy:
     """Runtime knobs that make fused_moe dispatch to a given tuned config.
