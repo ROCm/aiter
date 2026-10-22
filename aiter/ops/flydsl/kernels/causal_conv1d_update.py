@@ -288,7 +288,7 @@ def build_causal_conv1d_update_module(
             qe = fx.Int32(
                 buffer_ops.buffer_load(
                     qsl_r,
-                    idx_seq + fx.Int32(1),
+                    idx_seq + 1,
                     vec_width=1,
                     dtype=fx.Int32,
                     is_scalar=True,
@@ -298,9 +298,9 @@ def build_causal_conv1d_update_module(
             # An empty slot stores nothing but still issues its loads, so aim
             # them at the start of the tensor: its own qs can sit one past the
             # last token when it trails the batch.
-            nonempty = s_len > fx.Int32(0)
+            nonempty = s_len > 0
             qs_eff = nonempty.select(qs, fx.Int32(0))
-            tok_hi = nonempty.select(s_len - fx.Int32(1), fx.Int32(0))
+            tok_hi = nonempty.select(s_len - 1, fx.Int32(0))
             x_seq_idx, x_seq_stride = qs_eff, sx_tok
             o_seq_idx, o_seq_stride = qs_eff, so_tok
         else:
@@ -319,13 +319,13 @@ def build_causal_conv1d_update_module(
             nacc = fx.Int32(
                 buffer_ops.buffer_load(nacc_r, idx_seq, vec_width=1, dtype=fx.Int32)
             )
-            offset_dyn = nacc - fx.Int32(1)
+            offset_dyn = nacc - 1
             if fx.const_expr(IS_VARLEN):
                 # Nothing constrains an empty slot's accept count: upstream
                 # returns before reading it. Loads here are unconditional and
                 # only the stores are guarded, so pin the offset rather than
                 # address conv_state with whatever the padding holds.
-                offset_dyn = (s_len > fx.Int32(0)).select(offset_dyn, fx.Int32(0))
+                offset_dyn = (s_len > 0).select(offset_dyn, fx.Int32(0))
         else:
             offset_dyn = fx.Int32(0)
 
@@ -339,7 +339,7 @@ def build_causal_conv1d_update_module(
             if fx.const_expr(IS_VARLEN):
                 # An empty slot in the packed batch is skipped whole, as upstream
                 # returns before it writes anything.
-                active = active & (s_len > fx.Int32(0))
+                active = active & (s_len > 0)
 
             # Both cache coordinates already sit in their descriptor bases, so
             # what is left is the per-channel term, shared by read and write.
@@ -948,7 +948,7 @@ def build_causal_conv1d_update_sglang_module(
 
         # The fused parent map is channel-independent; one lane writes it.
         if fx.const_expr(TREE):
-            lane0 = (tid == fx.Int32(0)) & (pid_y == fx.Int32(0))
+            lane0 = (tid == 0) & (pid_y == 0)
             if lane0 & seq_ok:
                 rpt_base = idx_seq * srpt_seq
                 for k in fx.range_constexpr(S):
