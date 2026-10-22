@@ -934,3 +934,142 @@ def test_triton_unified_attn_asym_head_guards(case: str) -> None:
             shuffled_kv_cache=shuffled,
             backend="triton",
         )
+
+
+def poison_kv_tail(cache, block_tables, kv_lens, block_size):
+    """Write NaN into the cache slots that no query may attend to.
+
+    The slots are the ones past kv_len in the last used block and all blocks
+    of the table after the used blocks. generate_data gives each block to
+    one sequence only, so this changes no valid key or value.
+    """
+    int_dtype = {1: torch.uint8, 2: torch.int16, 4: torch.int32}[cache.element_size()]
+    raw = cache.view(int_dtype)
+    nan = torch.full((), float("nan"), device=cache.device).to(cache.dtype)
+    nan = nan.view(int_dtype)
+    for i, kv_len in enumerate(kv_lens.tolist()):
+        num_used = (kv_len + block_size - 1) // block_size
+        raw[block_tables[i, num_used:].long()] = nan
+        if kv_len % block_size:
+            raw[int(block_tables[i, num_used - 1]), kv_len % block_size :] = nan
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 15), (8, 141), (4, 70), (1, 133), (34, 345), (12, 87), (1, 2049)],
+        [(1, 15), (1, 141), (1, 70), (1, 133), (1, 345), (1, 87), (1, 2049)],
+        [(256, 300), (256, 700), (1, 15), (8, 141)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(8, 1), (16, 2)])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@torch.inference_mode()
+def test_gluon_unified_attn_ignores_kv_tail(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    dtype: torch.dtype,
+) -> None:
+    """Stale data in unused cache slots must not change the gfx950 Gluon output."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip(f"gfx950 Gluon kernel only, not {DEVICE_ARCH}")
+    # The Gluon kernel needs the same Q and KV dtype, else the call goes to Triton.
+    assert is_2d_gluon_available(
+        SimpleNamespace(
+            q_dtype=dtype,
+            kv_cache_dtype=dtype,
+            softcap=0,
+            use_qq_bias=False,
+            use_alibi_slopes=False,
+            head_size=head_size,
+            head_size_v=head_size,
+            shuffled_kv_cache=False,
+            block_size=block_size,
+            k_width=16 // dtype.itemsize,
+        ),
+        "gluon",
+    )
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=4096,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        device="cuda",
+    )
+    poison_kv_tail(key_cache, block_tables, kv_lens, block_size)
+    poison_kv_tail(value_cache, block_tables, kv_lens, block_size)
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+        backend="gluon",
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=output.dtype,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+    )
+
+    output = output.to(torch.float32)
+    ref_output = ref_output.to(torch.float32)
+    bad_rows = (~torch.isfinite(output)).flatten(1).any(1).nonzero().flatten()
+    assert bad_rows.numel() == 0, f"non-finite output rows: {bad_rows.tolist()[:16]}"
+    if dtype.itemsize == 1:
+        # Same FP8 limit as test_triton_unified_attn for the Gluon kernel.
+        atol, rtol = 1.5e-1, 1.5e-1
+        mismatch = torch.abs(output - ref_output) > atol + rtol * torch.abs(ref_output)
+        assert mismatch.float().mean().item() < 0.005
+    else:
+        torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
