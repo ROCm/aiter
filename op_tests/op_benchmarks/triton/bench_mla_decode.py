@@ -23,16 +23,28 @@ def ref_preprocess(kv_cache, kv_lora_rank):
     return k_input, v_input
 
 
+# Model families in model_configs.json that this benchmark supports.
+# The benchmark reads only "num_attention_heads" from the model config. It
+# hardcodes the MLA dimensions (kv_lora_rank=512, qk_rope_head_dim=64,
+# rotary_dim=64), which are the DeepSeek-V3 dimensions. Only add a family
+# whose model uses these MLA dimensions:
+# - deepseek: DeepSeek-V3, DeepSeek-R1 (deepseek-V3 config).
+# - kimik25: Kimi-K2 family. kimik25-tp4 has the full head count (64), and
+#   --tensor-parallelism divides it, so this config works with any TP degree.
+#   The tp4 suffix doesn't apply to MLA.
+# A long term solution would be to add "kv_lora_rank", "qk_rope_head_dim" and
+# "rotary_dim" to the model config file or make this benchmark model agnostic,
+# i.e. accept only shapes instead of models.
+MLA_MODEL_FAMILIES = ("deepseek", "kimik25")
+
+
 def model_benchmark_configs(args):
+    assert any(family in args.model for family in MLA_MODEL_FAMILIES), (
+        f"Only these model families are supported for this benchmark: "
+        f"{', '.join(MLA_MODEL_FAMILIES)}."
+    )
     config_file = args.model_configs
-    # Only deepseek models are supported for this benchmark.
-    if args.model == "all":
-        configs = get_model_configs(config_path=config_file, models="deepseek")
-    else:
-        assert (
-            "deepseek" in args.model
-        ), "Only deepseek models are supported for this benchmark."
-        configs = get_model_configs(config_path=config_file, models=args.model)
+    configs = get_model_configs(config_path=config_file, models=args.model)
 
     batch_size = args.b if args.b else 1
 
@@ -52,6 +64,7 @@ def model_benchmark_configs(args):
     for model_name, config in configs.items():
         H = config["num_attention_heads"] // args.tensor_parallelism
         S = args.seqlen
+        # MLA dimensions are hardcoded, see MLA_MODEL_FAMILIES.
         # TODO: Evaluate other `num_kv_splits` values, according to TP degree.
         # attn_impl = args.attn_impl if args.attn_impl else "non-absorb"
         x_vals_list.append((model_name, batch_size, H, S, 512, 64, 64, 32))
