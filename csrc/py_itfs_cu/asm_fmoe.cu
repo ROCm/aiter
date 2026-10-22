@@ -285,6 +285,14 @@ static int get_vskip()
     return (vs_env_value != nullptr && std::string(vs_env_value) == "0") ? 0 : 1;
 }
 
+// launch_kernel rounds total_tgs down to a multiple of lcm(ps_deno, tgs_align).
+static bool ps_grid_fits(const CFG::mapped_type& cfg, int inter_dim)
+{
+    const int ps_deno = (inter_dim + cfg.subGU_n - 1) / cfg.subGU_n;
+    return cfg.ps == 0 || std::lcm(ps_deno, std::max(cfg.tgs_align, 1)) <=
+                              cfg.tg_num_perCU * static_cast<int>(get_num_cu_func());
+}
+
 // model_dim must be a multiple of the kernel's dim_align and at least its dim_min
 // (0 = unconstrained).
 static bool kernel_fits(
@@ -292,7 +300,7 @@ static bool kernel_fits(
 {
     return cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m && cfg.flat == 0 &&
            inter_dim % cfg.subGU_n == 0 && model_dim % std::max(cfg.dim_align, 1) == 0 &&
-           model_dim >= cfg.dim_min;
+           model_dim >= cfg.dim_min && ps_grid_fits(cfg, inter_dim);
 }
 
 FMoeKernel* get_heuristic_kernel(int inter_dim,
@@ -370,6 +378,14 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
                     cfg.dim_min,
                     "; got model_dim=",
                     model_dim);
+        AITER_CHECK(ps_grid_fits(cfg, inter_dim),
+                    __func__,
+                    ": ",
+                    selectedKl,
+                    " has too few persistent workgroups on ",
+                    num_cu,
+                    " CUs for inter_dim=",
+                    inter_dim);
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         if(cfg.ps == 1)
