@@ -185,6 +185,15 @@ def gemm_a8w8_bpreshuffle_flydsl(
             XQ, WQ, x_scale, w_scale, Out, kernel_name
         )
 
+    if kernel_name.startswith("flydsl_bpreshuffle_4w_"):
+        from .flydsl.gemm_a8w8_bpreshuffle_4wave import (
+            run_gemm_a8w8_bpreshuffle_4wave,
+        )
+
+        return run_gemm_a8w8_bpreshuffle_4wave(
+            XQ, WQ, x_scale, w_scale, Out, kernel_name
+        )
+
     if kernel_name.startswith("flydsl_bpreshuffle_8w_"):
         from .flydsl.gemm_a8w8_bpreshuffle_8wave import run_gemm_a8w8_bpreshuffle_8wave
 
@@ -710,6 +719,99 @@ def gemm_a8w8_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
+def _check_int8_bpreshuffle_contract(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Tensor | None,
+    dtype: torch.dtype,
+) -> None:
+    """Reject unsupported signed-INT8 calls before config lookup or launch."""
+    if get_gfx() != "gfx950":
+        raise NotImplementedError(
+            f"gemm_a8w8_bpreshuffle INT8 is supported only on gfx950, got "
+            f"{get_gfx()}"
+        )
+    if dtype != dtypes.bf16:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 supports only BF16 output, got " f"{dtype}"
+        )
+    if XQ.ndim != 2 or WQ.ndim != 2:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires 2-D XQ (M, K) and WQ "
+            f"(N, K), got {tuple(XQ.shape)} and {tuple(WQ.shape)}"
+        )
+    if XQ.dtype != dtypes.i8 or WQ.dtype != dtypes.i8:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires matching torch.int8 inputs, "
+            f"got {XQ.dtype} and {WQ.dtype}"
+        )
+    if not XQ.is_cuda or not WQ.is_cuda:
+        raise ValueError("gemm_a8w8_bpreshuffle INT8 requires GPU tensors")
+    if not XQ.is_contiguous() or not WQ.is_contiguous():
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires contiguous XQ and contiguous "
+            "(16, 16)-preshuffled WQ"
+        )
+    M, K = XQ.shape
+    N, weight_k = WQ.shape
+    if M < 0 or N <= 0 or N % 16:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires M >= 0 and positive N % 16 "
+            f"== 0, got M={M}, N={N}"
+        )
+    if weight_k < K:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires WQ K >= XQ K, got "
+            f"WQ K={weight_k}, XQ K={K}"
+        )
+    if K < 256 or K % 128 or weight_k % 128:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires K >= 256 and both logical "
+            f"and preshuffled K divisible by 128, got {K} and {weight_k}"
+        )
+    if x_scale.dtype != torch.float32 or w_scale.dtype != torch.float32:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires FP32 x_scale/w_scale, got "
+            f"{x_scale.dtype} and {w_scale.dtype}"
+        )
+    if x_scale.numel() != M or w_scale.numel() != N:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires per-row x_scale and "
+            f"per-column w_scale; got {x_scale.numel()} for M={M} and "
+            f"{w_scale.numel()} for N={N}"
+        )
+    tensors = (XQ, WQ, x_scale, w_scale)
+    if len({tensor.device for tensor in tensors}) != 1:
+        raise ValueError("gemm_a8w8_bpreshuffle INT8 operands must share one device")
+    if bias is not None and (
+        bias.device != XQ.device
+        or bias.dtype != dtype
+        or tuple(bias.shape) not in {(N,), (1, N)}
+    ):
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 bias must be BF16 on the operand "
+            f"device with shape ({N},) or (1, {N}), got {bias.dtype} "
+            f"{tuple(bias.shape)} on {bias.device}"
+        )
+
+
+def _add_int8_bias(result: Tensor, bias: Tensor | None) -> Tensor:
+    return result if bias is None else result + bias.reshape(1, -1)
+
+
+@functools.cache
+def _warn_untuned_int8_fallback(
+    gfx: str, m: int, n: int, k: int, kernel_name: str
+) -> None:
+    logger.warning(
+        f"[{gfx}] gemm_a8w8_bpreshuffle INT8 untuned M={m}, N={n}, K={k}; "
+        f"falling back to '{kernel_name}' (correct, not tuned). "
+        "(logged once per shape)"
+    )
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
 def gemm_a8w8_bpreshuffle(
     XQ: Tensor,
@@ -720,10 +822,25 @@ def gemm_a8w8_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
-    assert dtype in [
-        torch.bfloat16,
-        torch.float16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    """Per-token/per-channel FP8 or signed-INT8 preshuffled GEMM.
+
+    The gfx950 INT8 path uses the 4-wave FlyDSL kernel with INT32
+    accumulation, FP32 row/column scales, BF16 output, and an optional BF16
+    bias applied after the GEMM. Untuned supported shapes use the same kernel
+    through a conservative persistent/non-persistent fallback policy.
+    """
+    is_int8 = XQ.dtype == dtypes.i8 or WQ.dtype == dtypes.i8
+    if is_int8:
+        _check_int8_bpreshuffle_contract(XQ, WQ, x_scale, w_scale, bias, dtype)
+    else:
+        assert dtype in [
+            torch.bfloat16,
+            torch.float16,
+        ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+        assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only supports fp8"
+        assert XQ.dtype == WQ.dtype, "activation and weight dtypes must match"
+        assert bias is None, "gemm_a8w8_bpreshuffle does not support FP8 bias"
+
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
@@ -742,16 +859,14 @@ def gemm_a8w8_bpreshuffle(
     #     res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype, check=check)
     #     if res is not None:
     #         return res
-    assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
-    assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
-    # CKTile only supports bf16 dtype
+    q_dtype = dtypes.i8 if is_int8 else dtypes.fp8
     config = get_GEMM_config_with_quant_type(
         m,
         n,
         k,
-        dtypes.fp8,
+        q_dtype,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     )
     if config is None and w_k > k:
@@ -759,7 +874,7 @@ def gemm_a8w8_bpreshuffle(
             m,
             n,
             w_k,
-            dtypes.fp8,
+            q_dtype,
             AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
         )
     # A K-padded WQ is preshuffled in blocks laid out over K_w, and every
@@ -770,12 +885,35 @@ def gemm_a8w8_bpreshuffle(
     if config is not None:
         libtype = config["libtype"]
         splitK = int(config["splitK"])
+        if is_int8 and libtype != "flydsl":
+            raise RuntimeError(
+                "gfx950 INT8 bpreshuffle tuning rows must use FlyDSL, got "
+                f"{libtype!r} for M={m}, N={n}, K={w_k}"
+            )
         if libtype == "ck":
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl":
-            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+            result = gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+            return _add_int8_bias(result, bias) if is_int8 else result
+
+    if is_int8:
+        from .flydsl.gemm_a8w8_bpreshuffle_4wave import (
+            default_4wave_kernel_name,
+        )
+
+        kernel_name = default_4wave_kernel_name(m, n, w_k)
+        _warn_untuned_int8_fallback(get_gfx(), m, n, w_k, kernel_name)
+        result = gemm_a8w8_bpreshuffle_flydsl(
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            Y,
+            {"kernelName": kernel_name},
+        )
+        return _add_int8_bias(result, bias)
 
     if get_gfx() == "gfx1250":
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
