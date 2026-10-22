@@ -652,8 +652,10 @@ def test_fused_gdn_decode_supported_rejects_cpu_optional_operands():
         )
     ]
     vh, vd = ops["num_v_heads"], ops["head_v_dim"]
-    qsl = torch.arange(batch + 1, dtype=torch.int32)
-    out = torch.empty(batch, vh, vd, dtype=torch.bfloat16)
+    # CPU by name: test_mla sets the default device to cuda at import, and a
+    # shard that also collects it would otherwise build these on the GPU.
+    qsl = torch.arange(batch + 1, dtype=torch.int32, device="cpu")
+    out = torch.empty(batch, vh, vd, dtype=torch.bfloat16, device="cpu")
 
     assert fused_gdn_decode_qkvz_supported(
         *args, qkvz_layout="flat", query_start_loc=qsl.to(device), out=out.to(device)
