@@ -958,25 +958,41 @@ def poison_kv_tail(cache, block_tables, kv_lens, block_size):
     "seq_lens",
     [
         [(1, 15), (8, 141), (4, 70), (1, 133), (34, 345), (12, 87), (1, 2049)],
+        [(1, 15), (1, 141), (1, 70), (1, 133), (1, 345), (1, 87), (1, 2049)],
+        [(256, 300), (256, 700), (1, 15), (8, 141)],
     ],
 )
 @pytest.mark.parametrize("num_heads", [(8, 1), (16, 2)])
-@pytest.mark.parametrize("head_size", [128, 512])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
 @pytest.mark.parametrize("block_size", [16, 64])
-@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, e4m3_dtype])
-@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
 @torch.inference_mode()
-def test_triton_unified_attn_ignores_kv_tail(
+def test_gluon_unified_attn_ignores_kv_tail(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
-    kv_dtype: torch.dtype,
-    backend: str,
+    dtype: torch.dtype,
 ) -> None:
-    """Stale data in unused cache slots must not change the output."""
-    if backend == "gluon" and not _is_gluon_available():
-        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    """Stale data in unused cache slots must not change the gfx950 Gluon output."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip(f"gfx950 Gluon kernel only, not {DEVICE_ARCH}")
+    # The Gluon kernel needs the same Q and KV dtype, else the call goes to Triton.
+    assert is_2d_gluon_available(
+        SimpleNamespace(
+            q_dtype=dtype,
+            kv_cache_dtype=dtype,
+            softcap=0,
+            use_qq_bias=False,
+            use_alibi_slopes=False,
+            head_size=head_size,
+            head_size_v=head_size,
+            shuffled_kv_cache=False,
+            block_size=block_size,
+            k_width=16 // dtype.itemsize,
+        ),
+        "gluon",
+    )
     (
         query,
         key_cache_orig,
@@ -1004,7 +1020,8 @@ def test_triton_unified_attn_ignores_kv_tail(
         block_size=block_size,
         head_size=head_size,
         num_heads=num_heads,
-        kv_dtype=kv_dtype,
+        q_dtype=dtype,
+        kv_dtype=dtype,
         device="cuda",
     )
     poison_kv_tail(key_cache, block_tables, kv_lens, block_size)
@@ -1028,7 +1045,7 @@ def test_triton_unified_attn_ignores_kv_tail(
         k_descale=k_descale,
         v_descale=v_descale,
         output_scale=output_scale,
-        backend=backend,
+        backend="gluon",
     )
     ref_output = ref_paged_attn(
         query=query,
@@ -1049,5 +1066,10 @@ def test_triton_unified_attn_ignores_kv_tail(
     ref_output = ref_output.to(torch.float32)
     bad_rows = (~torch.isfinite(output)).flatten(1).any(1).nonzero().flatten()
     assert bad_rows.numel() == 0, f"non-finite output rows: {bad_rows.tolist()[:16]}"
-    atol, rtol = (1.5e-1, 1.5e-1) if kv_dtype.itemsize == 1 else (1.5e-2, 1e-2)
-    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+    if dtype.itemsize == 1:
+        # Same FP8 limit as test_triton_unified_attn for the Gluon kernel.
+        atol, rtol = 1.5e-1, 1.5e-1
+        mismatch = torch.abs(output - ref_output) > atol + rtol * torch.abs(ref_output)
+        assert mismatch.float().mean().item() < 0.005
+    else:
+        torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)

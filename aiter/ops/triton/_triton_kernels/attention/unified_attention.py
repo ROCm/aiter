@@ -375,14 +375,11 @@ def kernel_unified_attention_2d(
 
     for j in range(masked_tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
-        # V is masked also when TILE_SIZE == BLOCK_SIZE: slots past the sequence can
-        # hold stale NaN/Inf, and 0 * NaN in the PV dot is NaN. K needs no mask then,
-        # because the score mask removes those keys.
-        v_tile_mask = seq_offset < max_seq_prefix_len
+        # to reduce the masking effect when not needed
         if TILE_SIZE == BLOCK_SIZE:
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
         else:
-            tile_mask = v_tile_mask
+            tile_mask = seq_offset < max_seq_prefix_len
 
         k_mask = None
         v_mask = None
@@ -413,7 +410,7 @@ def kernel_unified_attention_2d(
                 + offs_vd[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            v_mask = v_dim_mask[None, :] & v_tile_mask[:, None]
+            v_mask = v_dim_mask[None, :] & tile_mask[:, None]
 
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
@@ -793,14 +790,10 @@ def kernel_unified_attention_3d(
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
     ):
         seq_offset = j * TILE_SIZE + offs_t
-        # V is masked also when TILE_SIZE == BLOCK_SIZE: slots past the sequence can
-        # hold stale NaN/Inf, and 0 * NaN in the PV dot is NaN. K needs no mask then,
-        # because the score mask removes those keys.
-        v_tile_mask = seq_offset < max_seq_prefix_len
         if TILE_SIZE == BLOCK_SIZE:
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
         else:
-            tile_mask = v_tile_mask
+            tile_mask = seq_offset < max_seq_prefix_len
 
         k_mask = None
         v_mask = None
@@ -831,7 +824,7 @@ def kernel_unified_attention_3d(
                 + offs_vd[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            v_mask = v_dim_mask[None, :] & v_tile_mask[:, None]
+            v_mask = v_dim_mask[None, :] & tile_mask[:, None]
 
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
