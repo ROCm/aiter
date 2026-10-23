@@ -139,7 +139,7 @@ def test_sampled_layout_contract():
 def test_sampled_nan_order():
     """topk_select ranks a NaN of either sign above +inf and returns the input's
     own bits; top_k_per_row_prefill keeps the sign order its radix paths use."""
-    rows, k = 256, 128
+    rows, k = T._SAMPLED_PREFILL_MAX_ROWS, 512
     if not aiter.topk_sampled_supports(rows, N, k):
         print("[sampled_nan] SKIP: `sampled` does not serve this shape here")
         return
@@ -268,13 +268,10 @@ def test_select_decisions_follow_device_arch():
         return
     assert "stream" in S._available(N, K, 64, False, True, False, "gfx950")
     assert "stream" not in S._available(N, K, 64, False, True, False, "gfx942")
-    real_arch = S._device_arch
-    S._device_arch = lambda d: "gfx942" if d == 1 else real_arch(d)
-    try:
-        assert S._whole_row_takes("stream", 4096, K, K, False, False, 0)
-        assert not S._whole_row_takes("stream", 4096, K, K, False, False, 1)
-    finally:
-        S._device_arch = real_arch
+    assert "whole_row" in S._available(K, K, 64, False, True, False, "gfx950")
+    assert "whole_row" not in S._available(K, K, 64, False, True, False, "gfx942")
+    args = (4096, K, K, K, 64, False, None, False, True, 0, True)
+    assert S._choose.__wrapped__(*args) == "whole_row"
     print("[select_arch_per_device] PASS")
 
 
