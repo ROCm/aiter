@@ -11,10 +11,19 @@ separate from `gfx1250` (MI450 B0). AITER must never silently truncate the
 strict name, share an incompatible JIT artifact, or load a B0-only prebuilt
 kernel on A0.
 
-The compiler intentionally defines both `__gfx1250_strict__` and
-`__gfx1250__` for the strict target. Existing source-level `__gfx1250__` guards
-therefore continue to compile, but runtime dispatch, caches, tuned configs, and
-prebuilt binaries still need an explicit compatibility decision.
+The strict compiler defines `__gfx1250_strict__` and does **not** define
+`__gfx1250__` (ROCm/rocm-systems#12068; confirmed by ROCm 10.1 HIP tests). A
+source-level `#if defined(__gfx1250__)` device guard therefore compiles **away**
+on a strict agent, leaving an empty kernel — the silent failure mode behind the
+upstream `TDM_Basic_load_2d` case (empty kernel vs. a zero-filled output, no
+runtime error). Every `__gfx1250__` device guard that must also cover A0 has to
+become `defined(__gfx1250__) || defined(__gfx1250_strict__)`.
+
+This change must stay backward-compatible with the shipping ROCm (7.x), whose
+compiler knows only `__gfx1250__` and has no strict target at all: the
+`|| defined(__gfx1250_strict__)` arm is simply never taken there, so the old
+build is unaffected. On top of the guards, runtime dispatch, caches, tuned
+configs, and prebuilt binaries still need an explicit compatibility decision.
 
 ## Workstreams
 
