@@ -35,9 +35,9 @@ def _segment_indptrs(M, nseg, device):
     """Equal-length segments over M rows -> (seg_indptr, scales_seg_indptr)."""
     base = M // nseg
     lens = [base] * (nseg - 1) + [M - base * (nseg - 1)]
-    seg = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), device=device).int()
+    seg = torch.tensor([0] + lens, device=device).cumsum(0).int()
     blocks = [math.ceil(length / _BS) for length in lens]
-    sseg = torch.tensor([0] + list(torch.tensor(blocks).cumsum(0)), device=device).int()
+    sseg = torch.tensor([0] + blocks, device=device).cumsum(0).int()
     return seg, sseg
 
 
