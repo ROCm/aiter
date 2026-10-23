@@ -65,7 +65,6 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr.typing import ReductionOp
-from flydsl.extension.coop.warp import warp_inclusive_scan
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     buf_base_i64,
@@ -572,7 +571,6 @@ def create_topk_per_row_decode_adaptive_kernel(
         c_block_i32 = fx.Int32(block_threads)
         c_block_idx = fx.Index(block_threads)
         c_bins_i32 = fx.Int32(num_buckets)
-        c_bins_idx = fx.Index(num_buckets)
         c_sign_bit = fx.Int32(-2147483648)
         c_nan_turn = fx.Int32(0x7FFFFF)  # keys from -inf past the -NaNs
         c_row_ws = fx.Int32(CONTROL_ROW_SLOTS)
@@ -762,12 +760,12 @@ def create_topk_per_row_decode_adaptive_kernel(
             return buf_copy_load(row_vecs, col_base_i32, fx.Float32, LOAD_VEC)
 
         def clear_local_histogram(hist):
-            for hist_idx in range(tid_idx, c_bins_idx, c_block_idx):
-                hist[fx.Int32(hist_idx)] = c_zero
+            for hist_idx in range(tid, c_bins_i32, c_block_i32):
+                hist[hist_idx] = c_zero
             gpu.barrier()
 
         def wave_inclusive_scan_i32(value):
-            return warp_inclusive_scan(fx.Int32(value), ReductionOp.ADD)
+            return fx.coop.warp_inclusive_scan(fx.Int32(value), ReductionOp.ADD)
 
         # Not fx.coop.BlockScan: it folds the wave totals linearly in every thread,
         # where here wave 0 scans them once.
@@ -809,19 +807,15 @@ def create_topk_per_row_decode_adaptive_kernel(
         def choose_bucket_prefix(hist, meta, target_k):
             # Multi-block ascending block scan over the LDS histogram; each thread owns a bin pair.
             first_bin = tid * fx.Int32(2)
-            bin0_valid = first_bin < c_bins_i32
             bin1 = first_bin + c_one
-            bin1_valid = bin1 < c_bins_i32
-            safe0 = bin0_valid.select(first_bin, c_zero)
-            safe1 = bin1_valid.select(bin1, c_zero)
-            c0 = bin0_valid.select(hist[safe0], c_zero)
-            c1 = bin1_valid.select(hist[safe1], c_zero)
+            c0 = hist[first_bin]
+            c1 = hist[bin1]
 
             # The scan already carries the histogram's grand total, so the
             # certificate's test costs a store here and a compare there, not a
             # second pass over the bins.
             def store_certificate_total(meta, total):
-                meta[fx.Int32(SMEM_META_TOTAL)] = total
+                meta[SMEM_META_TOTAL] = total
 
             excl0 = block_exclusive_scan_i32(
                 s_scan,
@@ -836,10 +830,10 @@ def create_topk_per_row_decode_adaptive_kernel(
             def emit_find(meta, bucket, excl, incl, count):
                 crosses = (excl < target_k) & (incl >= target_k)
                 if crosses:
-                    meta[fx.Int32(SMEM_META_K)] = target_k - excl
-                    meta[fx.Int32(SMEM_META_LEN)] = count
-                    meta[fx.Int32(SMEM_META_THRESHOLD)] = bucket
-                    meta[fx.Int32(SMEM_META_ABOVE)] = excl
+                    meta[SMEM_META_K] = target_k - excl
+                    meta[SMEM_META_LEN] = count
+                    meta[SMEM_META_THRESHOLD] = bucket
+                    meta[SMEM_META_ABOVE] = excl
 
             emit_find(meta, first_bin, excl0, incl0, c0)
             emit_find(meta, bin1, incl0, incl1, c1)
@@ -859,7 +853,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             load_global_histogram(s_hist, pass_id, coherent=True)
             choose_bucket_prefix(s_hist, s_meta, target_k)
             spins = c_zero
-            while (s_meta[fx.Int32(SMEM_META_TOTAL)] != expected_total) & (
+            while (s_meta[SMEM_META_TOTAL] != expected_total) & (
                 spins < fx.Int32(CERTIFICATE_MAX_SPINS)
             ):
                 rocdl.s_sleep(SPIN_SLEEP)
@@ -868,8 +862,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 spins = spins + c_one
 
         def flush_local_histogram(pass_id: int):
-            for hist_idx in range(tid_idx, c_bins_idx, c_block_idx):
-                hist_i32 = fx.Int32(hist_idx)
+            for hist_i32 in range(tid, c_bins_i32, c_block_i32):
                 count = s_hist[hist_i32]
                 if count != c_zero:
                     fx.atomic_add(
@@ -889,7 +882,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             # certificate's re-read needs and nothing else does: a barrier has
             # already made the histogram visible everywhere it is read after one.
             n_vec = num_buckets // LOAD_VEC
-            c_nvec_idx = fx.Index(n_vec)
+            c_nvec = fx.Int32(n_vec)
             load_atom = fx.make_copy_atom(
                 fx.rocdl.BufferCopy(
                     LOAD_VEC * 32, CACHE_BYPASS_L1_L2 if coherent else 0
@@ -900,8 +893,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                 fx.slice(histograms_buf, (pass_id, None)),
                 fx.make_layout(LOAD_VEC, 1),
             )
-            for grp in range(tid_idx, c_nvec_idx, c_block_idx):
-                base_bin = fx.Int32(grp) * c_vec
+            for grp in range(tid, c_nvec, c_block_i32):
+                base_bin = grp * c_vec
                 frag = fx.make_rmem_tensor(LOAD_VEC, fx.Int32)
                 fx.copy(load_atom, fx.slice(pass_vecs, (None, grp)), frag)
                 vec = frag.load()
@@ -993,13 +986,13 @@ def create_topk_per_row_decode_adaptive_kernel(
                     keeps.append((col_i32, key, keep))
                     n_keep = n_keep + keep
 
-            carried = s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)]
+            carried = s_run[SMEM_RUN_COMPACT_COUNT]
 
             def publish_next_carry(run, tile_total):
                 total = carried + tile_total
-                run[fx.Int32(SMEM_RUN_COMPACT_COUNT)] = total
+                run[SMEM_RUN_COMPACT_COUNT] = total
                 if total > part_slice_cap:
-                    run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] = c_one
+                    run[SMEM_RUN_COMPACT_SPILLED] = c_one
 
             my_excl = block_exclusive_scan_i32(
                 s_scan, n_keep, wave0_last=(publish_next_carry, s_run)
@@ -1068,18 +1061,16 @@ def create_topk_per_row_decode_adaptive_kernel(
                 )
                 if tid == c_zero:
                     carried = (
-                        c_zero
-                        if const_expr(pass_id == 0)
-                        else run[fx.Int32(SMEM_RUN_SELECTED)]
+                        c_zero if const_expr(pass_id == 0) else run[SMEM_RUN_SELECTED]
                     )
-                    run[fx.Int32(SMEM_RUN_SELECTED)] = carried + run_total
+                    run[SMEM_RUN_SELECTED] = carried + run_total
                     # The early stop emits after the pass before the last, taking
                     # that pass's whole bucket as the ties.
                     if const_expr(
                         pass_id == num_passes - 1
                         or (ordered_early_stop and pass_id == num_passes - 2)
                     ):
-                        run[fx.Int32(SMEM_RUN_TIED)] = s_own_hist[chosen_bucket]
+                        run[SMEM_RUN_TIED] = s_own_hist[chosen_bucket]
                 gpu.barrier()
 
         def ordered_classify(col_base, vec, col_hi, kth_bits, key_mask=None):
@@ -1134,12 +1125,12 @@ def create_topk_per_row_decode_adaptive_kernel(
                 # A part that overflowed its slice has no usable buffer, so it falls
                 # back to its row and the buffer loop is skipped; a part that fits
                 # skips the row.
-                spilled = s_run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] == c_one
+                spilled = s_run[SMEM_RUN_COMPACT_SPILLED] == c_one
                 steps_idx = spilled.select(fx.Int32(row_steps_all), c_zero)
                 steps_idx = fx.Index(steps_idx)
             col_hi = run_col_hi
-            run_selected = s_run[fx.Int32(SMEM_RUN_SELECTED)]
-            run_tied = s_run[fx.Int32(SMEM_RUN_TIED)]
+            run_selected = s_run[SMEM_RUN_SELECTED]
+            run_tied = s_run[SMEM_RUN_TIED]
 
             stages = ORDERED_STAGES
             c_stage_idx = fx.Index(stages)
@@ -1191,7 +1182,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     place_tile(col_base, load_row_vec(col_base))
                     place_results = yield [place_state[0]]
 
-                count = s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)]
+                count = s_run[SMEM_RUN_COMPACT_COUNT]
                 count_hi = part_slice_base + count
                 c_tile = c_block_i32 * c_vec
                 buf_steps = spilled.select(c_zero, (count + c_tile - c_one) // c_tile)
@@ -1216,18 +1207,18 @@ def create_topk_per_row_decode_adaptive_kernel(
             ctrs[COUNTER_ORDERED_EQUAL, part] = tied
 
         def store_part_bases(run, selected_base, tied_base):
-            run[fx.Int32(SMEM_RUN_PART_SELECTED)] = selected_base
-            run[fx.Int32(SMEM_RUN_PART_TIED)] = tied_base
+            run[SMEM_RUN_PART_SELECTED] = selected_base
+            run[SMEM_RUN_PART_TIED] = tied_base
 
         def ordered_emit_bases(run, run_selected, run_tied, barrier_token):
             """Exclusive scan of selected/tied counts over the parts before this one."""
             # Single-workgroup rows skip the cross-part exchange; bases stay zero.
             if tid == c_zero:
-                run[fx.Int32(SMEM_RUN_TILE_SELECTED)] = c_zero
-                run[fx.Int32(SMEM_RUN_TILE_TIED)] = c_zero
+                run[SMEM_RUN_TILE_SELECTED] = c_zero
+                run[SMEM_RUN_TILE_TIED] = c_zero
                 if single_part_active:
-                    run[fx.Int32(SMEM_RUN_PART_SELECTED)] = c_zero
-                    run[fx.Int32(SMEM_RUN_PART_TIED)] = c_zero
+                    run[SMEM_RUN_PART_SELECTED] = c_zero
+                    run[SMEM_RUN_PART_TIED] = c_zero
 
             exchange = ~single_part_active
 
@@ -1252,8 +1243,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                         )
             gpu.barrier()
             return (
-                run[fx.Int32(SMEM_RUN_PART_SELECTED)],
-                run[fx.Int32(SMEM_RUN_PART_TIED)],
+                run[SMEM_RUN_PART_SELECTED],
+                run[SMEM_RUN_PART_TIED],
             )
 
         def ordered_place(
@@ -1266,8 +1257,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                 leading_barrier=True,
                 with_total=True,
             )
-            carried_selected = run[fx.Int32(SMEM_RUN_TILE_SELECTED)]
-            carried_tied = run[fx.Int32(SMEM_RUN_TILE_TIED)]
+            carried_selected = run[SMEM_RUN_TILE_SELECTED]
+            carried_tied = run[SMEM_RUN_TILE_TIED]
             gpu.barrier()
 
             my_selected = (
@@ -1284,10 +1275,10 @@ def create_topk_per_row_decode_adaptive_kernel(
                 my_tied = my_tied + tied
 
             if tid == c_zero:
-                run[fx.Int32(SMEM_RUN_TILE_SELECTED)] = (
-                    carried_selected + packed_total.shrui(fx.Int32(16))
+                run[SMEM_RUN_TILE_SELECTED] = carried_selected + packed_total.shrui(
+                    fx.Int32(16)
                 )
-                run[fx.Int32(SMEM_RUN_TILE_TIED)] = carried_tied + (
+                run[SMEM_RUN_TILE_TIED] = carried_tied + (
                     packed_total & fx.Int32(0xFFFF)
                 )
             gpu.barrier()
@@ -1311,23 +1302,19 @@ def create_topk_per_row_decode_adaptive_kernel(
                 with_total=True,
             )
             if tid == c_zero:
-                run[fx.Int32(SMEM_RUN_TILE_SELECTED)] = fx.atomic_add(
+                run[SMEM_RUN_TILE_SELECTED] = fx.atomic_add(
                     counter_ptr(COUNTER_OUT_FRONT),
                     packed_total.shrui(fx.Int32(16)),
                     syncscope=_AGENT,
                 )
-                run[fx.Int32(SMEM_RUN_TILE_TIED)] = fx.atomic_add(
+                run[SMEM_RUN_TILE_TIED] = fx.atomic_add(
                     counter_ptr(COUNTER_OUT_BACK),
                     packed_total & fx.Int32(0xFFFF),
                     syncscope=_AGENT,
                 )
             gpu.barrier()
-            my_selected = run[fx.Int32(SMEM_RUN_TILE_SELECTED)] + packed_excl.shrui(
-                fx.Int32(16)
-            )
-            my_tied = run[fx.Int32(SMEM_RUN_TILE_TIED)] + (
-                packed_excl & fx.Int32(0xFFFF)
-            )
+            my_selected = run[SMEM_RUN_TILE_SELECTED] + packed_excl.shrui(fx.Int32(16))
+            my_tied = run[SMEM_RUN_TILE_TIED] + (packed_excl & fx.Int32(0xFFFF))
             for col_i32, selected, tied in cols:
                 if (selected == c_one) & (my_selected < c_top_k):
                     store_index(row_indices, my_selected, col_i32)
@@ -1450,8 +1437,8 @@ def create_topk_per_row_decode_adaptive_kernel(
         def compact_fill(run, start_bit: int, previous_start_bit: int, current_bits):
             """Scan the row once more, this time also writing the candidates out."""
             if tid == c_zero:
-                run[fx.Int32(SMEM_RUN_COMPACT_COUNT)] = c_zero
-                run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] = c_zero
+                run[SMEM_RUN_COMPACT_COUNT] = c_zero
+                run[SMEM_RUN_COMPACT_SPILLED] = c_zero
             gpu.barrier()
 
             steps_idx = compact_steps_idx()
@@ -1480,8 +1467,8 @@ def create_topk_per_row_decode_adaptive_kernel(
 
         def mark_compact_spilled(run):
             if tid == c_zero:
-                run[fx.Int32(SMEM_RUN_COMPACT_COUNT)] = c_zero
-                run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] = c_one
+                run[SMEM_RUN_COMPACT_COUNT] = c_zero
+                run[SMEM_RUN_COMPACT_SPILLED] = c_one
 
         def compact_rescan(
             pass_id: int, start_bit: int, previous_start_bit: int, current_bits
@@ -1492,8 +1479,8 @@ def create_topk_per_row_decode_adaptive_kernel(
             that a part which spilled and a part which did not stay in lockstep at
             the barrier that follows.
             """
-            spilled = s_run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] == c_one
-            count = spilled.select(c_zero, s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)])
+            spilled = s_run[SMEM_RUN_COMPACT_SPILLED] == c_one
+            count = spilled.select(c_zero, s_run[SMEM_RUN_COMPACT_COUNT])
             for entry, rescan_state in range(
                 fx.Index(part_slice_base + tid),
                 fx.Index(part_slice_base + count),
@@ -1536,8 +1523,8 @@ def create_topk_per_row_decode_adaptive_kernel(
             row-uniform within a part, which is what keeps the two trip counts
             block-uniform even when one is zero.
             """
-            spilled = s_run[fx.Int32(SMEM_RUN_COMPACT_SPILLED)] == c_one
-            count = spilled.select(c_zero, s_run[fx.Int32(SMEM_RUN_COMPACT_COUNT)])
+            spilled = s_run[SMEM_RUN_COMPACT_SPILLED] == c_one
+            count = spilled.select(c_zero, s_run[SMEM_RUN_COMPACT_COUNT])
             count_hi = part_slice_base + count
             c_tile = c_block_i32 * c_vec
             buf_steps = spilled.select(c_zero, (count + c_tile - c_one) // c_tile)
@@ -1726,11 +1713,11 @@ def create_topk_per_row_decode_adaptive_kernel(
                     load_global_histogram(s_hist, pass_id)
                     choose_bucket_prefix(s_hist, s_meta, current_k)
 
-            chosen_bucket = s_meta[fx.Int32(SMEM_META_THRESHOLD)]
+            chosen_bucket = s_meta[SMEM_META_THRESHOLD]
             if const_expr(ordered):
                 accumulate_run_counts(s_run, pass_id, chosen_bucket)
-            next_k = s_meta[fx.Int32(SMEM_META_K)]
-            next_len = s_meta[fx.Int32(SMEM_META_LEN)]
+            next_k = s_meta[SMEM_META_K]
+            next_len = s_meta[SMEM_META_LEN]
             next_bits = current_bits | fx.Int32(chosen_bucket << start_bit)
             if const_expr(pass_id == num_passes - 1):
                 if const_expr(ordered_early_stop):
@@ -1776,8 +1763,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                 return ordered_key(val).shrui(shift) & mask
 
             def clear_hist(hist):
-                for h in range(tid_idx, c_bins_idx, c_block_idx):
-                    hist[fx.Int32(h)] = c_zero
+                for h in range(tid, c_bins_i32, c_block_i32):
+                    hist[h] = c_zero
                 gpu.barrier()
 
             def choose_threshold(
@@ -1881,12 +1868,8 @@ def create_topk_per_row_decode_adaptive_kernel(
             # This keeps the short tier's VGPR footprint low while sharing the
             # same per-chunk logic across radix passes and final scatter.
             def reread_pass(chunk_fn):
-                for vblk in range(
-                    tid_idx,
-                    vec_blocks_idx,
-                    c_block_idx,
-                ):
-                    col_base = fx.Int32(vblk) * c_vec
+                for vblk in range(tid, vec_blocks_i32, c_block_i32):
+                    col_base = vblk * c_vec
                     chunk_fn(col_base, load_row_vec(col_base))
 
             # Pass 1: high 11 bits over the whole valid row.
@@ -1897,11 +1880,11 @@ def create_topk_per_row_decode_adaptive_kernel(
                 s_hist,
                 s_meta,
                 c_top_k,
-                fx.Int32(SMEM_META_SHORT_FIRST_ABOVE),
-                fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD),
-                fx.Int32(SMEM_META_SHORT_FIRST_LEN) if short_early_stop else None,
+                SMEM_META_SHORT_FIRST_ABOVE,
+                SMEM_META_SHORT_FIRST_THRESHOLD,
+                SMEM_META_SHORT_FIRST_LEN if short_early_stop else None,
             )
-            first_threshold = s_meta[fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD)]
+            first_threshold = s_meta[SMEM_META_SHORT_FIRST_THRESHOLD]
             # A boundary bucket holding exactly the count still needed ends the
             # selection: every key from the bucket's first one up is top k and none
             # ties, so the scatter takes the key below it and no boundary slots.
@@ -1913,12 +1896,8 @@ def create_topk_per_row_decode_adaptive_kernel(
             kth_signed = c_zero
             num_needed = c_zero
             if const_expr(short_early_stop):
-                need_after_first = (
-                    c_top_k - s_meta[fx.Int32(SMEM_META_SHORT_FIRST_ABOVE)]
-                )
-                first_settled = (
-                    s_meta[fx.Int32(SMEM_META_SHORT_FIRST_LEN)] == need_after_first
-                )
+                need_after_first = c_top_k - s_meta[SMEM_META_SHORT_FIRST_ABOVE]
+                first_settled = s_meta[SMEM_META_SHORT_FIRST_LEN] == need_after_first
                 kth_signed = ((first_threshold << c_shift) ^ c_sign_bit) - c_one
             if ~first_settled:
                 # Pass 2: mid 11 bits within the high boundary bucket.
@@ -1926,30 +1905,26 @@ def create_topk_per_row_decode_adaptive_kernel(
                 reread_pass(lambda cb, v: hist_pass2_chunk(cb, v, first_threshold))
                 gpu.barrier()
                 if const_expr(not short_early_stop):
-                    need_after_first = (
-                        c_top_k - s_meta[fx.Int32(SMEM_META_SHORT_FIRST_ABOVE)]
-                    )
+                    need_after_first = c_top_k - s_meta[SMEM_META_SHORT_FIRST_ABOVE]
                 choose_threshold(
                     s_hist,
                     s_meta,
                     need_after_first,
-                    fx.Int32(SMEM_META_SHORT_SECOND_ABOVE),
-                    fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD),
-                    fx.Int32(SMEM_META_SHORT_SECOND_LEN) if short_early_stop else None,
+                    SMEM_META_SHORT_SECOND_ABOVE,
+                    SMEM_META_SHORT_SECOND_THRESHOLD,
+                    SMEM_META_SHORT_SECOND_LEN if short_early_stop else None,
                 )
-                second_threshold = s_meta[fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD)]
+                second_threshold = s_meta[SMEM_META_SHORT_SECOND_THRESHOLD]
                 # Bits 10..31 of the key that pass 3 must match, assembled once so
                 # the scan compares one field instead of two digits.
                 high_mid_prefix = (first_threshold << c_bin_bits) | second_threshold
                 second_settled = never
                 if const_expr(short_early_stop):
                     need_after_second = (
-                        need_after_first
-                        - s_meta[fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)]
+                        need_after_first - s_meta[SMEM_META_SHORT_SECOND_ABOVE]
                     )
                     second_settled = (
-                        s_meta[fx.Int32(SMEM_META_SHORT_SECOND_LEN)]
-                        == need_after_second
+                        s_meta[SMEM_META_SHORT_SECOND_LEN] == need_after_second
                     )
                     kth_signed = ((high_mid_prefix << c_low_bits) ^ c_sign_bit) - c_one
                 if ~second_settled:
@@ -1959,18 +1934,17 @@ def create_topk_per_row_decode_adaptive_kernel(
                     gpu.barrier()
                     if const_expr(not short_early_stop):
                         need_after_second = (
-                            need_after_first
-                            - s_meta[fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)]
+                            need_after_first - s_meta[SMEM_META_SHORT_SECOND_ABOVE]
                         )
                     choose_threshold(
                         s_hist,
                         s_meta,
                         need_after_second,
-                        fx.Int32(SMEM_META_SHORT_THIRD_ABOVE),
-                        fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD),
+                        SMEM_META_SHORT_THIRD_ABOVE,
+                        SMEM_META_SHORT_THIRD_THRESHOLD,
                     )
-                    third_threshold = s_meta[fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD)]
-                    third_above = s_meta[fx.Int32(SMEM_META_SHORT_THIRD_ABOVE)]
+                    third_threshold = s_meta[SMEM_META_SHORT_THIRD_THRESHOLD]
+                    third_above = s_meta[SMEM_META_SHORT_THIRD_ABOVE]
                     num_needed = need_after_second - third_above
                     # The three settled digits are the three fields of one key.
                     # Biasing it the way `signed_key` biases an element turns the
@@ -1987,9 +1961,8 @@ def create_topk_per_row_decode_adaptive_kernel(
         # Direct-fill: rows with row_len <= top_k (part 0 only) emit identity indices + -1.
         direct_fill = row_len <= c_top_k
         direct_fill_active = (part == c_zero) & direct_fill
-        direct_fill_iters = direct_fill_active.select(fx.Index(top_k), fx.Index(0))
-        for out_col in range(tid_idx, direct_fill_iters, c_block_idx):
-            out_col_i32 = fx.Int32(out_col)
+        direct_fill_iters = direct_fill_active.select(c_top_k, c_zero)
+        for out_col_i32 in range(tid, direct_fill_iters, c_block_i32):
             valid = out_col_i32 < row_len
             out_val = valid.select(out_col_i32, fx.Int32(-1))
             store_index(row_indices, out_col_i32, out_val)
@@ -2075,10 +2048,8 @@ def create_topk_per_row_decode_adaptive_kernel(
                     ctrs[counter, 0] = c_zero
 
             def clear_row_control(ctrl):
-                for ctrl_idx in range(
-                    tid_idx, fx.Index(CONTROL_ROW_SLOTS), c_block_idx
-                ):
-                    ctrl[fx.Int32(ctrl_idx)] = c_zero
+                for ctrl_idx in range(tid, fx.Int32(CONTROL_ROW_SLOTS), c_block_i32):
+                    ctrl[ctrl_idx] = c_zero
 
             gpu.barrier()
             if single_part_active:
@@ -2092,9 +2063,9 @@ def create_topk_per_row_decode_adaptive_kernel(
                         syncscope=_AGENT,
                         ordering=fx.AtomicOrdering.Monotonic,
                     )
-                    s_meta[fx.Int32(SMEM_META_EXIT)] = arrived
+                    s_meta[SMEM_META_EXIT] = arrived
                 gpu.barrier()
-                if s_meta[fx.Int32(SMEM_META_EXIT)] == active_parts - c_one:
+                if s_meta[SMEM_META_EXIT] == active_parts - c_one:
                     if tid == c_zero:
                         ws_poll(counter_ptr(COUNTER_EXIT), fx.AtomicOrdering.Acquire)
                     gpu.barrier()
