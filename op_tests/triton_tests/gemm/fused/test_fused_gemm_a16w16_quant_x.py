@@ -69,16 +69,38 @@ def _assert_quant_close(triton_x_quant, triton_x_scales, x):
     )
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
-def test_fused_gemm_a16w16_quant_x(M: int, N: int, K: int):
+@pytest.mark.parametrize(
+    "M, N, K, dtype, layout",
+    [(M, N, K, torch.bfloat16, "TN") for M, N, K in get_x_vals()]
+    + [
+        (M, 2048, 2048, dtype, layout)
+        for M, layout in (
+            (1, "TN"),
+            (4, "TN"),
+            (8, "TN"),
+            (33, "TN"),
+            (64, "TN"),
+            (65, "TN"),
+            (128, "TN"),
+            (33, "TT"),
+            (65, "TT"),
+        )
+        for dtype in (torch.float16, torch.bfloat16)
+    ],
+)
+def test_fused_gemm_a16w16_quant_x(
+    M: int, N: int, K: int, dtype: torch.dtype, layout: str
+):
     torch.cuda.empty_cache()
     x, w, _, _, _ = generate_gemm_a16w16_inputs(
-        M, N, K, dtype=torch.bfloat16, output=False
+        M, N, K, dtype=dtype, layout=layout, output=False
     )
 
     torch_y = F.linear(x, w, bias=None)
 
-    triton_y, triton_x_quant, triton_x_scales = fused_gemm_a16w16_quant_x(x, w)
+    triton_y, triton_x_quant, triton_x_scales = fused_gemm_a16w16_quant_x(
+        x, w, dtype=dtype
+    )
 
     torch.testing.assert_close(triton_y, torch_y, atol=1e-1, rtol=1e-2)
     _assert_quant_close(triton_x_quant, triton_x_scales, x)

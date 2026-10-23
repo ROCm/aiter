@@ -33,7 +33,7 @@ K_DIM = 128
 LOWER_BOUND = -5.0
 
 
-def make_inputs(B, T, H, seed=0, bias=False, state=False, varlen=False):
+def make_inputs(B, T, H, seed=0, bias=False, state=False, varlen=False, device=device):
     g = torch.Generator(device=device).manual_seed(seed)
 
     def rnd(*shape, dt=dtype):
@@ -106,6 +106,8 @@ def test_matches_ordinary_path_varlen():
 
 
 def test_a_second_shape_does_not_reuse_the_first_entry():
+    for w in _wrapped():
+        w.clear()
     small, large = make_inputs(1, 512, 12), make_inputs(1, 1024, 12)
     run(small)  # whatever either shape needs is compiled and cached by now
     run(large)
@@ -202,12 +204,8 @@ def test_a_second_device_does_not_reuse_the_first_entry():
     first = make_inputs(B, T, H)
     run(first)  # the entry for this shape is now held against device 0
 
-    torch.cuda.set_device(1)
-    try:
-        second = {
-            k: (v.to("cuda:1") if isinstance(v, torch.Tensor) else v)
-            for k, v in first.items()
-        }
+    with torch.cuda.device(1):
+        second = make_inputs(B, T, H, device="cuda:1")
         with fast_launch.recording() as misses:
             got_o, got_s = run(second)
         assert misses, "a second device has to miss, not reuse device 0's module"
@@ -215,8 +213,6 @@ def test_a_second_device_does_not_reuse_the_first_entry():
             want_o, want_s = run(second)
         assert torch.equal(got_o, want_o)
         assert torch.equal(got_s, want_s)
-    finally:
-        torch.cuda.set_device(0)
 
 
 def test_alignment_is_part_of_the_key():

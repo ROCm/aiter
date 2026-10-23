@@ -22,6 +22,7 @@ import triton
 
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_fwd as _chunk_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import fast_launch as _fast_launch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as _flash_kda
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
@@ -227,7 +228,9 @@ def test_tail_chunk(T):
 def test_varlen_matches_reference(lens):
     total = sum(lens)
     cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
     args = make_inputs(1, total, 4)
     o_ref, _ = run_reference(*args, cu_seqlens=cu_seqlens)
@@ -275,7 +278,9 @@ def test_varlen_initial_state(state_v_first):
     """
     lens = [128, 100, 64]
     cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
     args = make_inputs(1, sum(lens), 4)
     h0 = (
@@ -360,7 +365,9 @@ def test_segmented_varlen_uneven():
     """Sequences whose last segment is short, and one shorter than a segment."""
     lens = [500, 33, 257, 64]
     cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
     args = make_inputs(1, sum(lens), 4)
     h0 = torch.randn(len(lens), 4, K_DIM, K_DIM, device=device, dtype=torch.float32)
@@ -398,11 +405,14 @@ def test_tuner_keeps_the_two_schedules_apart():
     # An incoming state is what makes the two output passes otherwise identical:
     # without it the unsegmented one passes h_in=None and the key picks up the
     # difference through the dtypes it appends, hiding the collision.
-    kw = {"initial_state": torch.zeros(1, 4, K_DIM, K_DIM, device=device)}
+    kw = {
+        "initial_state": torch.zeros(
+            1, 4, K_DIM, K_DIM, device=device, dtype=torch.float32
+        )
+    }
     # This is about the Triton kernel's autotuner, which never runs -- and whose
     # cache therefore stays empty -- when K2 is routed to Gluon.
-    with _k2_tuner_search_space() as kern, _route(k2=False):
-        kern.cache.clear()
+    with _k2_tuner_search_space() as kern, _route(k2=False), _fast_launch.bypassed():
         run_flash(*args, chunks_per_seg=4, **kw)
         segmented_keys = set(kern.cache)
         run_flash(*args, chunks_per_seg=0, **kw)
@@ -465,7 +475,9 @@ def test_k1_schedule_comes_from_the_config(monkeypatch):
 
 def _varlen(lens):
     return torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
 
 
@@ -694,7 +706,9 @@ def test_final_state_matches_fp32_recurrence(lower_bound):
     """
     lens = [200, 100, 156]
     cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+        [0] + list(torch.tensor(lens, device=device).cumsum(0)),
+        device=device,
+        dtype=torch.long,
     )
     args = make_inputs(1, sum(lens), 4)
     kw = {
@@ -1002,9 +1016,11 @@ def test_paged_cache_rejects_overlapping_slots(outer):
     v = args[2]
     plane = H * K_DIM * K_DIM
     if outer == "expanded":
-        cache = torch.zeros(1, H, K_DIM, K_DIM, device=device).expand(3, -1, -1, -1)
+        cache = torch.zeros(
+            1, H, K_DIM, K_DIM, device=device, dtype=torch.float32
+        ).expand(3, -1, -1, -1)
     else:
-        storage = torch.zeros(3 * plane, device=device)
+        storage = torch.zeros(3 * plane, device=device, dtype=torch.float32)
         cache = torch.as_strided(
             storage,
             size=(3, H, K_DIM, K_DIM),
