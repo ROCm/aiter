@@ -14,7 +14,6 @@ def tdm_load_k(
     desc,
     buffer,
     write_idx,
-    sub_idx: gl.constexpr,
     BLOCK_N,
     HEAD_DIM_POW2,
     PRESHUFFLE_FACTOR,
@@ -22,8 +21,7 @@ def tdm_load_k(
     gl.amd.cdna5.tdm.async_load(
         desc,
         [
-            write_idx * BLOCK_N // PRESHUFFLE_FACTOR
-            + sub_idx * (BLOCK_N // 2 // PRESHUFFLE_FACTOR),
+            write_idx * BLOCK_N // PRESHUFFLE_FACTOR,
             0,
         ],
         buffer.index(write_idx % 2),
@@ -36,7 +34,6 @@ def tdm_load_v(
     desc,
     buffer,
     write_idx,
-    sub_idx: gl.constexpr,
     BLOCK_N,
     HEAD_DIM_POW2,
     PRESHUFFLE_FACTOR,
@@ -45,7 +42,7 @@ def tdm_load_v(
         desc,
         [
             write_idx * (BLOCK_N // PRESHUFFLE_FACTOR),
-            sub_idx * (HEAD_DIM_POW2 // 2 * PRESHUFFLE_FACTOR),
+            0,
         ],
         buffer.index(write_idx % 2),
     )
@@ -53,10 +50,13 @@ def tdm_load_v(
 
 
 @gluon.jit
-def local_load_k(buffer, read_idx, BLOCK_N, HEAD_DIM_POW2, layout):
+def local_load_k(
+    buffer, read_idx, sub_idx: gl.constexpr, BLOCK_N, HEAD_DIM_POW2, layout
+):
     k = (
         buffer.index(read_idx % 2)
-        .reshape((BLOCK_N // 2, HEAD_DIM_POW2))
+        .reshape((BLOCK_N, HEAD_DIM_POW2))
+        .slice(sub_idx * (BLOCK_N // 2), BLOCK_N // 2, dim=0)
         .permute((1, 0))
         .load(layout=layout)
     )
@@ -64,10 +64,12 @@ def local_load_k(buffer, read_idx, BLOCK_N, HEAD_DIM_POW2, layout):
 
 
 @gluon.jit
-def local_load_v(buffer, read_idx, BLOCK_N, HEAD_DIM_POW2, layout):
+def local_load_v(
+    buffer, read_idx, sub_idx: gl.constexpr, BLOCK_N, HEAD_DIM_POW2, layout
+):
     v = (
         buffer.index(read_idx % 2)
-        .reshape((BLOCK_N, HEAD_DIM_POW2 // 2))
+        .slice(sub_idx * (HEAD_DIM_POW2 // 2), HEAD_DIM_POW2 // 2, dim=1)
         .load(layout=layout)
     )
     return v
@@ -183,12 +185,12 @@ def _mha_fwd_subtiled(
     )
     SHARED_LAYOUT_K: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[256, 16]],
-        [BLOCK_N // 2 // PRESHUFFLE_FACTOR_K, HEAD_DIM_POW2 * PRESHUFFLE_FACTOR_K],
+        [BLOCK_N // PRESHUFFLE_FACTOR_K, HEAD_DIM_POW2 * PRESHUFFLE_FACTOR_K],
         [1, 0],
     )
     SHARED_LAYOUT_V: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[256, 16]],
-        [BLOCK_N // PRESHUFFLE_FACTOR_V, HEAD_DIM_POW2 // 2 * PRESHUFFLE_FACTOR_V],
+        [BLOCK_N // PRESHUFFLE_FACTOR_V, HEAD_DIM_POW2 * PRESHUFFLE_FACTOR_V],
         [1, 0],
     )
     SHARED_LAYOUT_O: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -227,7 +229,7 @@ def _mha_fwd_subtiled(
         shape=(SEQLEN_K // PRESHUFFLE_FACTOR_K, HEAD_DIM * PRESHUFFLE_FACTOR_K),
         strides=(stride_k_n, stride_k_d),
         block_shape=(
-            BLOCK_N // 2 // PRESHUFFLE_FACTOR_K,
+            BLOCK_N // PRESHUFFLE_FACTOR_K,
             HEAD_DIM_POW2 * PRESHUFFLE_FACTOR_K,
         ),
         layout=SHARED_LAYOUT_K,
@@ -238,7 +240,7 @@ def _mha_fwd_subtiled(
         strides=(stride_v_n, stride_v_d),
         block_shape=(
             BLOCK_N // PRESHUFFLE_FACTOR_V,
-            HEAD_DIM_POW2 // 2 * PRESHUFFLE_FACTOR_V,
+            HEAD_DIM_POW2 * PRESHUFFLE_FACTOR_V,
         ),
         layout=SHARED_LAYOUT_V,
     )
@@ -246,16 +248,10 @@ def _mha_fwd_subtiled(
     q_buffer = gl.allocate_shared_memory(
         q_desc.dtype, shape=q_desc.block_shape, layout=q_desc.layout
     )
-    k0_buffer = gl.allocate_shared_memory(
+    k_buffer = gl.allocate_shared_memory(
         k_desc.dtype, shape=[NUM_BUFFERS] + k_desc.block_shape, layout=k_desc.layout
     )
-    k1_buffer = gl.allocate_shared_memory(
-        k_desc.dtype, shape=[NUM_BUFFERS] + k_desc.block_shape, layout=k_desc.layout
-    )
-    v0_buffer = gl.allocate_shared_memory(
-        v_desc.dtype, shape=[NUM_BUFFERS] + v_desc.block_shape, layout=v_desc.layout
-    )
-    v1_buffer = gl.allocate_shared_memory(
+    v_buffer = gl.allocate_shared_memory(
         v_desc.dtype, shape=[NUM_BUFFERS] + v_desc.block_shape, layout=v_desc.layout
     )
     o_buffer = gl.allocate_shared_memory(
@@ -298,47 +294,35 @@ def _mha_fwd_subtiled(
 
     # k tdm load iter 0
     k_desc = tdm_load_k(
-        k_desc, k0_buffer, write_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_K
-    )
-    k_desc = tdm_load_k(
-        k_desc, k1_buffer, write_idx_k, 1, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_K
+        k_desc, k_buffer, write_idx_k, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_K
     )
     write_idx_k += 1
 
     # k tdm load iter 1
     k_desc = tdm_load_k(
-        k_desc, k0_buffer, write_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_K
-    )
-    k_desc = tdm_load_k(
-        k_desc, k1_buffer, write_idx_k, 1, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_K
+        k_desc, k_buffer, write_idx_k, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_K
     )
     write_idx_k += 1
 
     # v tdm load iter 0
     v_desc = tdm_load_v(
-        v_desc, v0_buffer, write_idx_v, 0, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_V
-    )
-    v_desc = tdm_load_v(
-        v_desc, v1_buffer, write_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_V
+        v_desc, v_buffer, write_idx_v, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_V
     )
     write_idx_v += 1
 
-    gl.amd.gfx1250.tdm.async_wait(4)
+    gl.amd.gfx1250.tdm.async_wait(2)
     q = q_buffer.load(layout=DOT_LAYOUT_Q)
     k0 = local_load_k(
-        k0_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
+        k_buffer, read_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
     )
     k1 = local_load_k(
-        k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
+        k_buffer, read_idx_k, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
     )
     read_idx_k += 1
 
     # k tdm load iter 2
     k_desc = tdm_load_k(
-        k_desc, k0_buffer, write_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_K
-    )
-    k_desc = tdm_load_k(
-        k_desc, k1_buffer, write_idx_k, 1, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_K
+        k_desc, k_buffer, write_idx_k, BLOCK_N, HEAD_DIM_POW2, PRESHUFFLE_FACTOR_K
     )
     write_idx_k += 1
 
@@ -347,7 +331,7 @@ def _mha_fwd_subtiled(
     else:
         num_n_iter = gl.cdiv(SEQLEN_K, BLOCK_N)
 
-    gl.amd.gfx1250.tdm.async_wait(5)
+    gl.amd.gfx1250.tdm.async_wait(2)
     qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
     qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
     if (CAUSAL or not EVEN_N) and num_n_iter <= 2:
@@ -385,16 +369,16 @@ def _mha_fwd_subtiled(
     qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
     p0 = gl.exp2(qk0_shifted)
     k0 = local_load_k(
-        k0_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
+        k_buffer, read_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
     )
 
     for _ in range(num_n_iter - 3):
 
-        gl.amd.gfx1250.tdm.async_wait(4)
+        gl.barrier()
         with gl.amd.warp_pipeline_stage("stage0"):
             qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
             k1 = local_load_k(
-                k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
+                k_buffer, read_idx_k, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
             )
             read_idx_k += 1
             p1 = gl.exp2(qk1_shifted)
@@ -404,19 +388,19 @@ def _mha_fwd_subtiled(
             acc1 = acc1 * alpha[:, None]
             v_desc = tdm_load_v(
                 v_desc,
-                v0_buffer,
+                v_buffer,
                 write_idx_v,
-                0,
                 BLOCK_N,
                 HEAD_DIM_POW2,
                 PRESHUFFLE_FACTOR_V,
             )
+            write_idx_v += 1
 
-        gl.amd.gfx1250.tdm.async_wait(4)
+        gl.amd.gfx1250.tdm.async_wait(2)
         with gl.amd.warp_pipeline_stage("stage1"):
             qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
             v0 = local_load_v(
-                v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+                v_buffer, read_idx_v, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
             )
             p = concat_subtile(p0, p1)
             l_ij = gl.sum(p, 1)
@@ -425,60 +409,40 @@ def _mha_fwd_subtiled(
             p_quant = gl.convert_layout(
                 p_quant, layout=DOT_LAYOUT_P, assert_trivial=True
             )
-            v_desc = tdm_load_v(
-                v_desc,
-                v1_buffer,
-                write_idx_v,
-                1,
-                BLOCK_N,
-                HEAD_DIM_POW2,
-                PRESHUFFLE_FACTOR_V,
-            )
-            write_idx_v += 1
 
-        gl.amd.gfx1250.tdm.async_wait(4)
+        gl.barrier()
         with gl.amd.warp_pipeline_stage("stage2"):
             acc0 = gl.amd.cdna5.wmma(p_quant, v0, acc0)
             v1 = local_load_v(
-                v1_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+                v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
             )
             read_idx_v += 1
             qk = concat_subtile(qk0, qk1)
             m_ij = gl.reduce(qk, 1, fast_maximum) * qk_scale
             k_desc = tdm_load_k(
                 k_desc,
-                k0_buffer,
+                k_buffer,
                 write_idx_k,
-                0,
-                BLOCK_N,
-                HEAD_DIM_POW2,
-                PRESHUFFLE_FACTOR_K,
-            )
-
-        gl.amd.gfx1250.tdm.async_wait(4)
-        with gl.amd.warp_pipeline_stage("stage3"):
-            acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1)
-            k0 = local_load_k(
-                k0_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
-            )
-            m_ij = fast_maximum(m_i, m_ij)
-            qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
-            qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
-            p0 = gl.exp2(qk0_shifted)
-            k_desc = tdm_load_k(
-                k_desc,
-                k1_buffer,
-                write_idx_k,
-                1,
                 BLOCK_N,
                 HEAD_DIM_POW2,
                 PRESHUFFLE_FACTOR_K,
             )
             write_idx_k += 1
 
+        gl.amd.gfx1250.tdm.async_wait(2)
+        with gl.amd.warp_pipeline_stage("stage3"):
+            acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1)
+            k0 = local_load_k(
+                k_buffer, read_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
+            )
+            m_ij = fast_maximum(m_i, m_ij)
+            qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
+            qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
+            p0 = gl.exp2(qk0_shifted)
+
     # iter last - 2
 
-    gl.amd.gfx1250.tdm.async_wait(4)
+    gl.barrier()
     with gl.amd.warp_pipeline_stage("ep0_0"):
         qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
@@ -498,7 +462,7 @@ def _mha_fwd_subtiled(
                 EVEN_N,
             )
         k1 = local_load_k(
-            k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
+            k_buffer, read_idx_k, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
         )
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
@@ -508,15 +472,15 @@ def _mha_fwd_subtiled(
         acc1 = acc1 * alpha[:, None]
         v_desc = tdm_load_v(
             v_desc,
-            v0_buffer,
+            v_buffer,
             write_idx_v,
-            0,
             BLOCK_N,
             HEAD_DIM_POW2,
             PRESHUFFLE_FACTOR_V,
         )
+        write_idx_v += 1
 
-    gl.amd.gfx1250.tdm.async_wait(4)
+    gl.amd.gfx1250.tdm.async_wait(2)
     with gl.amd.warp_pipeline_stage("ep0_1"):
         qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
@@ -535,57 +499,37 @@ def _mha_fwd_subtiled(
                 EVEN_N,
             )
         v0 = local_load_v(
-            v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+            v_buffer, read_idx_v, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
         )
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
         l_i = gl.fma(l_i, alpha, l_ij)
         p_quant = p.to(gl.float8e4nv)
         p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P, assert_trivial=True)
-        v_desc = tdm_load_v(
-            v_desc,
-            v1_buffer,
-            write_idx_v,
-            1,
-            BLOCK_N,
-            HEAD_DIM_POW2,
-            PRESHUFFLE_FACTOR_V,
-        )
-        write_idx_v += 1
 
-    gl.amd.gfx1250.tdm.async_wait(4)
+    gl.barrier()
     with gl.amd.warp_pipeline_stage("ep0_2"):
         acc0 = gl.amd.cdna5.wmma(p_quant, v0, acc0)
         v1 = local_load_v(
-            v1_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+            v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
         )
         read_idx_v += 1
         qk = concat_subtile(qk0, qk1)
         m_ij = fast_maximum(m_i, gl.reduce(qk, 1, fast_maximum) * qk_scale)
-        v_desc = tdm_load_v(
-            v_desc,
-            v0_buffer,
-            write_idx_v,
-            0,
-            BLOCK_N,
-            HEAD_DIM_POW2,
-            PRESHUFFLE_FACTOR_V,
-        )
 
-    gl.amd.gfx1250.tdm.async_wait(4)
+    gl.amd.gfx1250.tdm.async_wait(1)
     with gl.amd.warp_pipeline_stage("ep0_3"):
         acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1)
         k0 = local_load_k(
-            k0_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
+            k_buffer, read_idx_k, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
         )
         qk0_shifted = gl.fma(qk0, qk_scale, -m_ij[:, None])
         qk1_shifted = gl.fma(qk1, qk_scale, -m_ij[:, None])
         p0 = gl.exp2(qk0_shifted)
         v_desc = tdm_load_v(
             v_desc,
-            v1_buffer,
+            v_buffer,
             write_idx_v,
-            1,
             BLOCK_N,
             HEAD_DIM_POW2,
             PRESHUFFLE_FACTOR_V,
@@ -594,7 +538,7 @@ def _mha_fwd_subtiled(
 
     # iter last - 1
 
-    gl.amd.gfx1250.tdm.async_wait(4)
+    gl.barrier()
     with gl.amd.warp_pipeline_stage("ep1_0"):
         qk0 = gl.amd.cdna5.wmma(q, k0, qk_zeros)
         if CAUSAL or not EVEN_N:
@@ -613,7 +557,7 @@ def _mha_fwd_subtiled(
                 EVEN_N,
             )
         k1 = local_load_k(
-            k1_buffer, read_idx_k, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
+            k_buffer, read_idx_k, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_K
         )
         read_idx_k += 1
         p1 = gl.exp2(qk1_shifted)
@@ -622,7 +566,7 @@ def _mha_fwd_subtiled(
         acc0 = acc0 * alpha[:, None]
         acc1 = acc1 * alpha[:, None]
 
-    gl.amd.gfx1250.tdm.async_wait(3)
+    gl.amd.gfx1250.tdm.async_wait(1)
     with gl.amd.warp_pipeline_stage("ep1_1"):
         qk1 = gl.amd.cdna5.wmma(q, k1, qk_zeros)
         if CAUSAL or not EVEN_N:
@@ -641,7 +585,7 @@ def _mha_fwd_subtiled(
                 EVEN_N,
             )
         v0 = local_load_v(
-            v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+            v_buffer, read_idx_v, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
         )
         p = concat_subtile(p0, p1)
         l_ij = gl.sum(p, 1)
@@ -649,11 +593,11 @@ def _mha_fwd_subtiled(
         p_quant = p.to(gl.float8e4nv)
         p_quant = gl.convert_layout(p_quant, layout=DOT_LAYOUT_P)
 
-    gl.amd.gfx1250.tdm.async_wait(2)
+    gl.barrier()
     with gl.amd.warp_pipeline_stage("ep1_2"):
         acc0 = gl.amd.cdna5.wmma(p_quant, v0, acc0)
         v1 = local_load_v(
-            v1_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+            v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
         )
         read_idx_v += 1
         qk = concat_subtile(qk0, qk1)
@@ -674,7 +618,7 @@ def _mha_fwd_subtiled(
     acc1 = acc1 * alpha[:, None]
 
     v0 = local_load_v(
-        v0_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+        v_buffer, read_idx_v, 0, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
     )
     p = concat_subtile(p0, p1)
     l_ij = gl.sum(p, 1)
@@ -688,7 +632,7 @@ def _mha_fwd_subtiled(
     acc0 = acc0 * ep_norm
     acc0 = acc0.to(gl.bfloat16)
     v1 = local_load_v(
-        v1_buffer, read_idx_v, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
+        v_buffer, read_idx_v, 1, BLOCK_N, HEAD_DIM_POW2, layout=DOT_LAYOUT_V
     )
     acc1 = gl.amd.cdna5.wmma(p_quant, v1, acc1)
     acc1 = acc1 * ep_norm
