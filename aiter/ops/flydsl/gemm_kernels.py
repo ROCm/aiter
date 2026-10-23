@@ -286,34 +286,32 @@ def _check_preshuffle_split_capacity(
         )
 
 
-def flydsl_preshuffle_gemm_a8(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    Out: Tensor,
+@functools.lru_cache(maxsize=128)
+def _empty_arg(device: torch.device, dtype: torch.dtype) -> Tensor:
+    """An empty tensor for kernel argument slots the launch does not use."""
+    with persistent_alloc(device):
+        return torch.empty(0, dtype=dtype, device=device)
+
+
+@functools.lru_cache(maxsize=1024)
+def _preshuffle_launcher(
+    n: int,
+    k: int,
+    in_torch_dtype: torch.dtype,
+    out_torch_dtype: torch.dtype,
     tile_m: int,
     tile_n: int,
     tile_k: int,
-    use_async_copy: int = 0,
-    waves_per_eu: int = 0,
-    xcd_swizzle: int = 0,
-    lds_stage: int = 2,
-    enable_scheduler: bool = True,
-    split_k: int = 1,
-) -> Tensor:
-    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
-    compile_fn = _get_compile_fn()
+    use_async_copy: int,
+    waves_per_eu: int,
+    xcd_swizzle: int,
+    lds_stage: int,
+    enable_scheduler: bool,
+    split_k: int,
+):
+    """Validate the M-independent arguments once and return the compiled launcher."""
     from aiter.utility import dtypes
 
-    m, k = XQ.shape[0], XQ.shape[-1]
-    n = WQ.shape[0]
-
-    if m > PRESHUFFLE_M_MAX:
-        raise RuntimeError(
-            f"[FlyDSL] M ({m}) exceeds {PRESHUFFLE_M_MAX}; the preshuffle kernel "
-            f"views A and C through a layout bounded by that many rows."
-        )
     if n % 16 != 0:
         raise RuntimeError(
             f"[FlyDSL] N ({n}) must be a multiple of 16 for preshuffled B."
@@ -333,24 +331,80 @@ def flydsl_preshuffle_gemm_a8(
             f"Arguments not supported! Skipping gemm!"
         )
 
-    if XQ.dtype == dtypes.fp8:
+    if in_torch_dtype == dtypes.fp8:
         in_dtype = "fp8"
-    elif XQ.dtype == torch.int8:
+    elif in_torch_dtype == torch.int8:
         in_dtype = "int8"
     else:
-        raise ValueError(f"[FlyDSL] unsupported input dtype {XQ.dtype}")
+        raise ValueError(f"[FlyDSL] unsupported input dtype {in_torch_dtype}")
 
-    wpe = None if waves_per_eu <= 0 else waves_per_eu
-
-    if Out.dtype == torch.bfloat16:
+    if out_torch_dtype == torch.bfloat16:
         out_dtype = "bf16"
-    elif Out.dtype == torch.float16:
+    elif out_torch_dtype == torch.float16:
         out_dtype = "fp16"
     else:
         raise ValueError(
-            f"[FlyDSL] unsupported output dtype {Out.dtype}; "
+            f"[FlyDSL] unsupported output dtype {out_torch_dtype}; "
             "expected torch.bfloat16 or torch.float16"
         )
+
+    return _get_compile_fn()(
+        N=n,
+        K=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        use_async_copy=bool(use_async_copy),
+        waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
+        enable_scheduler=bool(enable_scheduler),
+        xcd_swizzle=int(xcd_swizzle),
+        lds_stage=int(lds_stage),
+        split_k=int(split_k),
+    )
+
+
+def flydsl_preshuffle_gemm_a8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    use_async_copy: int = 0,
+    waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
+    lds_stage: int = 2,
+    enable_scheduler: bool = True,
+    split_k: int = 1,
+) -> Tensor:
+    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
+    m, k = XQ.shape[0], XQ.shape[-1]
+    n = WQ.shape[0]
+
+    if m > PRESHUFFLE_M_MAX:
+        raise RuntimeError(
+            f"[FlyDSL] M ({m}) exceeds {PRESHUFFLE_M_MAX}; the preshuffle kernel "
+            f"views A and C through a layout bounded by that many rows."
+        )
+    exe = _preshuffle_launcher(
+        n,
+        k,
+        XQ.dtype,
+        Out.dtype,
+        tile_m,
+        tile_n,
+        tile_k,
+        use_async_copy,
+        waves_per_eu,
+        xcd_swizzle,
+        lds_stage,
+        enable_scheduler,
+        split_k,
+    )
     _check_preshuffle_flat_buffer_capacity(
         m,
         n,
@@ -360,30 +414,16 @@ def flydsl_preshuffle_gemm_a8(
         Out.element_size(),
     )
 
-    exe = compile_fn(
-        N=n,
-        K=k,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        in_dtype=in_dtype,
-        out_dtype=out_dtype,
-        use_async_copy=bool(use_async_copy),
-        waves_per_eu=wpe,
-        enable_scheduler=bool(enable_scheduler),
-        xcd_swizzle=int(xcd_swizzle),
-        lds_stage=int(lds_stage),
-        split_k=int(split_k),
-    )
-
     def _as_i8(t):
-        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+        return (
+            t.view(torch.int8) if t.element_size() == 1 and t.is_floating_point() else t
+        )
 
     out_contig = Out.contiguous()
     # FlyDSL's preshuffle kernel requires an arg_bias slot (used only when
     # epilogue != "none"). Pass an empty tensor as a placeholder for the
     # default epilogue="none" path.
-    dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
+    dummy_bias = _empty_arg(Out.device, Out.dtype)
     if split_k > 1:
         _check_preshuffle_split_capacity(m, n, tile_m, tile_n, split_k)
         workspace, semaphore = _get_preshuffle_split_buffers(
@@ -393,7 +433,7 @@ def flydsl_preshuffle_gemm_a8(
         workspace = out_contig
         # dtype is part of the executable's cache signature, so this must match
         # what the AOT pre-compile passes or every non-split-K kernel misses it.
-        semaphore = torch.empty(0, dtype=torch.int32, device=Out.device)
+        semaphore = _empty_arg(Out.device, torch.int32)
     # The layout-API launcher takes fx.Tensor args, so pass flat tensors
     # directly rather than raw pointers.
     _run_compiled(
