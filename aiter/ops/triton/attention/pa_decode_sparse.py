@@ -520,9 +520,8 @@ def _staged_block_m(num_heads, num_queries, num_splits, row_tiles):
     num_sms = get_num_sms()
     if num_heads % 64 == 0 and num_splits == 1:
         # At 64 heads the wide tile is one block per row and re-reads no keys,
-        # so a half-full round already pays. Above that each row splits into
-        # blocks that re-read its keys, and it has to fill the CUs to win: at
-        # 128 heads a half-full grid loses to 32 heads per program.
+        # so a half-full round pays. Above that each row splits into blocks that
+        # re-read its keys, so it has to fill the CUs first.
         programs = num_queries * (num_heads // 64)
         if programs >= (num_sms // 2 + 1 if num_heads == 64 else num_sms):
             return 64

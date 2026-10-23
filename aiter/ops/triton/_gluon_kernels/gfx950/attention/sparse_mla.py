@@ -563,8 +563,7 @@ class Cfg:
         self.slot_a_l = gl.constexpr(gl.SliceLayout(1, self.async_l.value))
         self.slot_rope_a_l = gl.constexpr(gl.SliceLayout(1, self.async_rope_l.value))
         if ASYNC_LDS:
-            # The interval has to be a multiple of this buffer's warp run,
-            # 64 * AVEC; the 1024 default is that run for a 1-byte tile.
+            # Must be a multiple of the warp run, 64 * AVEC.
             KV_INTERVAL: gl.constexpr = PAD_INTERVAL if FP8_MFMA else 64 * AVEC
             self.kv_shared = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
@@ -2450,11 +2449,10 @@ def _sparse_mla(
         or (MAIN_FMT == "fp8_scalar" and (not HAS_EXTRA or EXTRA_FMT == "fp8_scalar")),
         "FP8_MFMA requires the per-tensor fp8 format on every segment",
     )
-    # The copy lands cache bytes in LDS untouched, so the dot operand has to be the
-    # cache's own type: fp8 dots over an fp8 cache, or a bf16 cache. An fp8 cache
-    # with bf16 dots dequantizes, which goes through registers by definition. The
-    # walk also needs the clamped (branch-free) tail and carries no per-tile
-    # validity vector.
+    # The copy lands cache bytes in LDS untouched, so the dot operand has to be
+    # the cache's own type. An fp8 cache read with bf16 dots dequantizes, which
+    # goes through registers by definition. The walk also needs the clamped
+    # (branch-free) tail and carries no per-tile validity vector.
     # TODO(has_invalid): the sentinel restriction is conservative, not fundamental.
     RAW_LDS: gl.constexpr = FP8_MFMA or (
         MAIN_FMT == "bf16" and ((not HAS_EXTRA) or EXTRA_FMT == "bf16")
@@ -2664,9 +2662,9 @@ def _sparse_mla(
 
     # An fp8 buffer is half the bytes of the bf16 staging it replaces.
     SMEM_DT: gl.constexpr = gl.float8e4nv if FP8_MFMA else gl.bfloat16
-    # The LDS-DMA converts nothing, so an fp8 async buffer holds the cache's own
-    # u8 and the dot operands bitcast on read (free, layout-preserving). A bf16
-    # cache is already the operand type, so its buffer needs no bitcast.
+    # The LDS-DMA converts nothing: an fp8 buffer holds the cache's own u8 and
+    # the dot operands bitcast on read (free, layout-preserving); a bf16 cache is
+    # already the operand type.
     BUF_DT: gl.constexpr = gl.uint8 if (ASYNC_LDS and FP8_MFMA) else SMEM_DT
     kv_smem = gl.allocate_shared_memory(BUF_DT, [BLOCK_K, HEAD_SIZE], cfg.kv_shared)
     if ROPE_SEPARATE:
