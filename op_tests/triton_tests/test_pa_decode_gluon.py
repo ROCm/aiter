@@ -1265,6 +1265,93 @@ def test_ps_recommended_splits_match_reference(kv_heads, lengths):
         torch.testing.assert_close(output[i].float(), reference, atol=2e-2, rtol=2e-2)
 
 
+def _output_gate_inputs(query_length, kv_heads):
+    torch.manual_seed(0)
+    group, head_size, page, x = 6, 256, 64, 8
+    lengths = [1000, 37, 4096]
+    batch = len(lengths)
+    tokens, heads = batch * query_length, kv_heads * group
+    pages_per_seq = [triton.cdiv(n, page) for n in lengths]
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    query = torch.randn(tokens, heads, head_size, **kwargs)
+    key_cache = torch.randn(
+        sum(pages_per_seq), kv_heads, head_size // x, page, x, **kwargs
+    )
+    value_cache = torch.randn(
+        sum(pages_per_seq), kv_heads, page // x, head_size, x, **kwargs
+    )
+    context_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    block_tables = torch.zeros(
+        batch, max(pages_per_seq), dtype=torch.int32, device="cuda"
+    )
+    first_page = 0
+    for i, n in enumerate(pages_per_seq):
+        block_tables[i, :n] = torch.arange(
+            first_page, first_page + n, dtype=torch.int32, device="cuda"
+        )
+        first_page += n
+    # The gate is the second half of each head of a fused [T, H, 2 * D] projection.
+    gate = torch.randn(tokens, heads, 2 * head_size, **kwargs)[..., head_size:]
+    return query, key_cache, value_cache, context_lengths, block_tables, gate
+
+
+def _run_output_gate(inputs, query_length, splits, ps, output_gate):
+    query, key_cache, value_cache, context_lengths, block_tables, _ = inputs
+    head_size = query.shape[-1]
+    output = torch.empty_like(query)
+    pa_decode_gluon(
+        output=output,
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        context_lengths=context_lengths,
+        block_tables=block_tables,
+        softmax_scale=head_size**-0.5,
+        query_length=query_length,
+        max_context_partition_num=splits,
+        context_partition_size=256,
+        compute_type=query.dtype,
+        ps=ps,
+        output_gate=output_gate,
+    )
+    return output
+
+
+@pytest.mark.parametrize("query_length", [1, 2])
+@pytest.mark.parametrize(
+    "kv_heads, splits",
+    [
+        pytest.param(4, 2, id="ps-reduce"),
+        pytest.param(4, 4, id="ps-reduce-4"),
+        pytest.param(1, 2, id="ps-reduce-head-1"),
+    ],
+)
+def test_pa_decode_output_gate(query_length, kv_heads, splits):
+    """output_gate gives out * sigmoid(gate) in the PS reduce, with a strided gate as in Qwen3-Next."""
+    inputs = _output_gate_inputs(query_length, kv_heads)
+    gate = inputs[-1]
+    reference = _run_output_gate(inputs, query_length, splits, True, None).float()
+    reference = reference * torch.sigmoid(gate.float())
+    gated = _run_output_gate(inputs, query_length, splits, True, gate)
+    torch.testing.assert_close(gated.float(), reference, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "kv_heads, splits, ps",
+    [
+        pytest.param(4, 1, True, id="one-shot"),
+        pytest.param(1, 1, True, id="one-shot-head-1"),
+        # Non-PS mode needs one partition per 256 tokens of the longest context.
+        pytest.param(4, 16, False, id="v2-reduce"),
+    ],
+)
+def test_pa_decode_output_gate_rejects_unfused_paths(kv_heads, splits, ps):
+    """Paths without the PS reduce reject output_gate instead of gating after the kernels."""
+    inputs = _output_gate_inputs(1, kv_heads)
+    with pytest.raises(AssertionError, match="output_gate is applied"):
+        _run_output_gate(inputs, 1, splits, ps, inputs[-1])
+
+
 @pytest.mark.parametrize(
     "case_set_name",
     [
