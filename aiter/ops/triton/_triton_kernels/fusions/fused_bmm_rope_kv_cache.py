@@ -61,10 +61,27 @@ _fused_fp8_bmm_rope_cat_and_cache_mla_repr = make_kernel_repr(
         "BLOCK_DK_nope",
         "BLOCK_D_pe",
         "BLOCK_D_HALF_pe",
-        "TRANSPOSE_BM",
         "OUTPUT_Q_NOPE_ZEROS",
         "HAVE_K_SCALE",
         "EVEN_K",
+        "cache_modifier",
+        "ROPE_BLOCK_T",
+        "BLOCK_QH",
+        "N_INNER",
+        "PERM_N",
+        "IL_R",
+        "IL_U",
+        "K_TAIL",
+        "XCD_COLOC",
+        "B_PF",
+        "ILB_NUM",
+        "ILB_DEN",
+        "M_PER_CTA",
+        "AQH",
+        "LPIN",
+        "GRID_MN",
+        "LDB",
+        "DTYPE_MAX",
     ],
 )
 
@@ -620,14 +637,65 @@ def _fused_fp4_bmm_reduce_kernel(
     tl.store(c_out_ptrs, c, mask=c_mask)
 
 
+@triton.jit
+def _fp8_load_pin(x):
+    # Keep group quantization after the preceding loads.
+
+    return tl.inline_asm_elementwise(
+        "; fp8 load pin", "=v,0", [x], dtype=x.dtype, is_pure=False, pack=2
+    )
+
+
+@triton.jit
+def _fp8_quant_group(x, DTYPE_MAX: tl.constexpr, b_ptr):
+    one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
+    m = tl.maximum(tl.max(tl.abs(x), axis=-1), 1e-10)[:, None]
+    s = m.to(tl.float32) * one_over_DTYPE_MAX
+    r = 1.0 / s
+    xq = tl.clamp(x * r, -DTYPE_MAX, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+    return xq, s
+
+
+@triton.jit
+def _fp8_mma_store(
+    a0q,
+    s0,
+    a1q,
+    s1,
+    b0,
+    b1,
+    b_scale,
+    c_ptrs,
+    c_mask,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    PERM_N: tl.constexpr,
+):
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc = tl.fma(tl.dot(a0q, b0), s0, acc)
+    acc = tl.fma(tl.dot(a1q, b1), s1, acc)
+    acc = acc * b_scale
+    c_val = acc.to(c_ptrs.dtype.element_ty)
+    if PERM_N:
+        c_val = tl.reshape(
+            tl.permute(
+                tl.reshape(c_val, (BLOCK_SIZE_M, BLOCK_SIZE_N // 64, 4, 4, 4)),
+                (0, 1, 3, 2, 4),
+            ),
+            (BLOCK_SIZE_M, BLOCK_SIZE_N),
+        )
+    tl.store(c_ptrs, c_val, mask=c_mask)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit(repr=_fused_fp8_bmm_rope_cat_and_cache_mla_repr)
+@triton.jit(
+    repr=_fused_fp8_bmm_rope_cat_and_cache_mla_repr,
+    do_not_specialize=["gmn_magic", "gmn_shift"],
+)
 def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
     a_ptr,
     b_ptr,
@@ -693,6 +761,8 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
     kv_cache_stride_h,
     kv_cache_stride_d,
     k_scale_ptr,
+    gmn_magic,
+    gmn_shift,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -708,29 +778,91 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
     HAVE_K_SCALE: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr = ".ca",
+    ROPE_BLOCK_T: tl.constexpr = 0,
+    BLOCK_QH: tl.constexpr = 0,
+    N_INNER: tl.constexpr = 1,
+    PERM_N: tl.constexpr = 0,
+    IL_R: tl.constexpr = 0,
+    IL_U: tl.constexpr = 1,
+    K_TAIL: tl.constexpr = 0,
+    XCD_COLOC: tl.constexpr = 0,
+    B_PF: tl.constexpr = 0,
+    ILB_NUM: tl.constexpr = 0,
+    ILB_DEN: tl.constexpr = 1,
+    M_PER_CTA: tl.constexpr = 1,
+    AQH: tl.constexpr = 0,
+    LPIN: tl.constexpr = 0,
+    GRID_MN: tl.constexpr = 0,
+    LDB: tl.constexpr = 0,
 ):
-    """
-    Fused kernel for FP8 BMM + RoPE + KV cache write.
-
-    These are INDEPENDENT operations fused to reduce kernel launch overhead:
-    - BMM writes to q_out[:, :, :kv_lora_rank]
-    - RoPE writes to q_out[:, :, kv_lora_rank:] and handles KV cache
-
-    Note: FP8 does not support split-K.
-
-    Grid structure:
-    - Phase 1: pid < bmm_programs → BMM (tiled over heads, M, N)
-    - Phase 2: pid in [bmm_programs, bmm_programs + B*QH) → RoPE + KV cache for decode
-    - Phase 3: pid >= bmm_programs + B*QH → KV cache only for prefill tokens
-    """
+    """Compute the projection, rotary outputs and KV writes in one launch."""
 
     pid = tl.program_id(0)
     tl.assume(pid >= 0)
 
     rope_start = bmm_programs
-    prefill_start = bmm_programs + B * QH
+    if ROPE_BLOCK_T > 0:
+        prefill_start = bmm_programs + tl.cdiv(B, ROPE_BLOCK_T)
+    else:
+        prefill_start = bmm_programs + B * QH
+
+    # Interleave projection and rotary work while preserving each group of IDs.
+    if ILB_NUM > 0:
+        nr = prefill_start - rope_start
+        NBu = bmm_programs // IL_U
+        NRi = tl.minimum(nr // IL_U, (NBu * ILB_NUM) // ILB_DEN)
+        T = NBu + NRi
+        if pid < T * IL_U:
+            u = pid // IL_U
+            gl = pid % IL_U
+            a = (u * NRi) // T
+            b = ((u + 1) * NRi) // T
+            pid = tl.where(b > a, rope_start + a * IL_U + gl, (u - a) * IL_U + gl)
+        elif pid < prefill_start:
+            r = pid - T * IL_U
+            nb_left = bmm_programs - NBu * IL_U
+            pid = tl.where(
+                r < nb_left, NBu * IL_U + r, rope_start + NRi * IL_U + (r - nb_left)
+            )
+    elif IL_R > 0:
+        nr = prefill_start - rope_start
+        ng = tl.minimum(bmm_programs // (IL_R * IL_U), nr // IL_U)
+        GP: tl.constexpr = (IL_R + 1) * IL_U
+        if pid < ng * GP:
+            gi = pid // GP
+            gr = pid % GP
+            gj = gr // IL_U
+            gl = gr % IL_U
+            pid = tl.where(
+                gj == IL_R, rope_start + gi * IL_U + gl, (gi * IL_R + gj) * IL_U + gl
+            )
+        elif pid < prefill_start:
+            r = pid - ng * GP
+            nb_left = bmm_programs - ng * IL_R * IL_U
+            pid = tl.where(
+                r < nb_left,
+                ng * IL_R * IL_U + r,
+                rope_start + ng * IL_U + (r - nb_left),
+            )
+    # Group the heads and rotary tiles that write the same query rows.
+    if XCD_COLOC:
+        if pid < bmm_programs:
+            g8 = (grid_mn // IL_U) * IL_U
+            if pid < QH * g8:
+                xu = pid // IL_U
+                pid = (xu % QH) * grid_mn + (xu // QH) * IL_U + pid % IL_U
+            else:
+                xv = pid - QH * g8
+                xrem = grid_mn - g8
+                pid = (xv // xrem) * grid_mn + g8 + xv % xrem
+        elif pid < prefill_start:
+            RPM: tl.constexpr = (BLOCK_SIZE_M * M_PER_CTA) // ROPE_BLOCK_T
+            rho = pid - rope_start
+            if rho < (nr // (IL_U * RPM)) * (IL_U * RPM):
+                xs = rho // IL_U
+                rho = ((xs // RPM) * IL_U + rho % IL_U) * RPM + xs % RPM
+            pid = rope_start + rho
 
     if pid < bmm_programs:
         stride_ab_i64 = tl.cast(stride_ab, tl.int64)
@@ -753,8 +885,20 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
         tl.assume(stride_cm_i64 > 0)
         tl.assume(stride_cn_i64 > 0)
 
-        pid_head = pid // GRID_MN
-        pid_tile = pid % GRID_MN
+        if GRID_MN > 0:
+
+            pid_head = pid // GRID_MN
+            pid_tile = pid % GRID_MN
+        else:
+
+            pid_head = (
+                tl.umulhi(
+                    pid.to(tl.uint32, bitcast=True) * 2,
+                    gmn_magic.to(tl.uint32, bitcast=True),
+                )
+                >> gmn_shift
+            ).to(tl.int32, bitcast=True)
+            pid_tile = pid - pid_head * grid_mn
 
         pid_head_i64 = tl.cast(pid_head, tl.int64)
 
@@ -776,67 +920,580 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
         tl.assume(pid_n_i64 >= 0)
         tl.assume(pid_head_i64 >= 0)
 
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        # Reuse two quantized K groups across several output column chunks.
+        if N_INNER > 1:
+            offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-        a_ptrs = a_ptr + (
-            pid_head_i64 * stride_ab_i64
-            + offs_am[:, None] * stride_am_i64
-            + offs_k[None, :] * stride_ak_i64
-        )
-        b_ptrs = b_ptr + (
-            pid_head_i64 * stride_bb_i64
-            + offs_k[:, None] * stride_bk_i64
-            + offs_bn[None, :] * stride_bn_i64
-        )
+            m_start = pid_m * (BLOCK_SIZE_M * M_PER_CTA)
+            n_start = pid_n * (BLOCK_SIZE_N * N_INNER)
+            offs_am_loc = tl.minimum(tl.arange(0, BLOCK_SIZE_M), M - 1 - m_start)
+            if N_INNER > 1:
 
-        one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
-        b_scale = tl.load(b_scale_ptr)
+                offs_bn_loc = tl.arange(0, BLOCK_SIZE_N)
+                if PERM_N:
 
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-        for k_idx in range(tl.cdiv(K, BLOCK_SIZE_K)):
-            if EVEN_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                    ph = tl.arange(0, BLOCK_SIZE_N // 64)[:, None, None, None] * 64
+                    pj = tl.arange(0, 4)[None, :, None, None] * 4
+                    pg = tl.arange(0, 4)[None, None, :, None] * 16
+                    pe = tl.arange(0, 4)[None, None, None, :]
+                    offs_bn_loc = tl.reshape(ph + pj + pg + pe, (BLOCK_SIZE_N,))
             else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k_idx * BLOCK_SIZE_K, other=0.0
+                offs_bn_loc = tl.minimum(tl.arange(0, BLOCK_SIZE_N), N - 1 - n_start)
+
+            a_ptrs = (
+                a_ptr
+                + pid_head_i64 * stride_ab_i64
+                + tl.cast(m_start, tl.int64) * stride_am_i64
+            ) + (offs_am_loc[:, None] * stride_am + offs_k[None, :] * stride_ak)
+            b_ptrs = (
+                b_ptr
+                + pid_head_i64 * stride_bb_i64
+                + tl.cast(n_start, tl.int64) * stride_bn_i64
+            ) + (offs_k[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn)
+
+            # Use a larger row tile with a short accumulation chain.
+            if LDB > 0 and N_INNER > 1 and K_TAIL > 0:
+
+                ROWS: tl.constexpr = BLOCK_SIZE_M * M_PER_CTA
+                offs_kt = tl.arange(0, K_TAIL)
+                am = tl.minimum(tl.arange(0, ROWS), M - 1 - m_start)
+                a_base = (
+                    a_ptr
+                    + pid_head_i64 * stride_ab_i64
+                    + tl.cast(m_start, tl.int64) * stride_am_i64
                 )
-                b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k_idx * BLOCK_SIZE_K, other=0.0
+                x0 = tl.load(
+                    a_base + (am[:, None] * stride_am + offs_k[None, :] * stride_ak),
+                    cache_modifier=".cg",
+                )
+                x1 = tl.load(
+                    a_base
+                    + BLOCK_SIZE_K * stride_ak_i64
+                    + (am[:, None] * stride_am + offs_kt[None, :] * stride_ak),
+                    cache_modifier=".cg",
+                )
+                b_scale = tl.load(b_scale_ptr)
+                q0, s0 = _fp8_quant_group(x0, DTYPE_MAX, b_ptr)
+                q1, s1 = _fp8_quant_group(x1, DTYPE_MAX, b_ptr)
+                b_head = (
+                    b_ptr
+                    + pid_head_i64 * stride_bb_i64
+                    + tl.cast(n_start, tl.int64) * stride_bn_i64
+                )
+                b0_ptrs = b_head + (
+                    offs_k[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn
+                )
+                b1_ptrs = (b_head + BLOCK_SIZE_K * stride_bk_i64) + (
+                    offs_kt[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn
+                )
+                BSTEP = BLOCK_SIZE_N * stride_bn_i64
+                offs_cm_loc = tl.arange(0, ROWS)
+                offs_cn_loc = tl.arange(0, BLOCK_SIZE_N)
+                c_ptrs = (
+                    c_ptr
+                    + pid_head_i64 * stride_cb_i64
+                    + tl.cast(m_start, tl.int64) * stride_cm_i64
+                    + tl.cast(n_start, tl.int64) * stride_cn_i64
+                ) + (
+                    offs_cm_loc[:, None] * stride_cm + offs_cn_loc[None, :] * stride_cn
+                )
+                cmask = offs_cm_loc[:, None] < M - m_start
+                CNSTEP = BLOCK_SIZE_N * stride_cn_i64
+                for n_i in range(N_INNER):
+                    b0 = tl.load(b0_ptrs + n_i * BSTEP, cache_modifier=cache_modifier)
+                    b1 = tl.load(b1_ptrs + n_i * BSTEP)
+                    _fp8_mma_store(
+                        q0,
+                        s0,
+                        q1,
+                        s1,
+                        b0,
+                        b1,
+                        b_scale,
+                        c_ptrs + n_i * CNSTEP,
+                        cmask,
+                        ROWS,
+                        BLOCK_SIZE_N,
+                        PERM_N,
+                    )
+            elif N_INNER > 1 and B_PF > 0 and K_TAIL > 0:
+
+                one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
+                offs_kt = tl.arange(0, K_TAIL)
+                b1_ptrs = (
+                    b_ptr
+                    + pid_head_i64 * stride_bb_i64
+                    + tl.cast(n_start, tl.int64) * stride_bn_i64
+                    + BLOCK_SIZE_K * stride_bk_i64
+                ) + (offs_kt[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn)
+                BSTEP = BLOCK_SIZE_N * stride_bn_i64
+                b0n = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                b1n = tl.load(b1_ptrs)
+                if B_PF >= 3:
+
+                    tl.static_assert(N_INNER <= 4)
+                    if N_INNER > 1:
+                        bq0_1 = tl.load(b_ptrs + BSTEP, cache_modifier=cache_modifier)
+                        bq1_1 = tl.load(b1_ptrs + BSTEP)
+                    if N_INNER > 2:
+                        bq0_2 = tl.load(
+                            b_ptrs + 2 * BSTEP, cache_modifier=cache_modifier
+                        )
+                        bq1_2 = tl.load(b1_ptrs + 2 * BSTEP)
+                    if N_INNER > 3:
+                        bq0_3 = tl.load(
+                            b_ptrs + 3 * BSTEP, cache_modifier=cache_modifier
+                        )
+                        bq1_3 = tl.load(b1_ptrs + 3 * BSTEP)
+                a0 = tl.load(a_ptrs, cache_modifier=".cg")
+                a1 = tl.load(
+                    a_ptr
+                    + pid_head_i64 * stride_ab_i64
+                    + tl.cast(m_start, tl.int64) * stride_am_i64
+                    + BLOCK_SIZE_K * stride_ak_i64
+                    + (offs_am_loc[:, None] * stride_am + offs_kt[None, :] * stride_ak),
+                    cache_modifier=".cg",
+                )
+                b_scale = tl.load(b_scale_ptr)
+                if LPIN > 0:
+
+                    a0 = _fp8_load_pin(a0)
+                    a1 = _fp8_load_pin(a1)
+                if B_PF >= 2:
+
+                    tl.debug_barrier()
+                m0 = tl.maximum(tl.max(tl.abs(a0), axis=-1), 1e-10)[:, None]
+                s0 = m0.to(tl.float32) * one_over_DTYPE_MAX
+                r0 = 1.0 / s0
+                a0q = tl.clamp(a0 * r0, -DTYPE_MAX, DTYPE_MAX).to(
+                    b_ptr.dtype.element_ty
+                )
+                m1 = tl.maximum(tl.max(tl.abs(a1), axis=-1), 1e-10)[:, None]
+                s1 = m1.to(tl.float32) * one_over_DTYPE_MAX
+                r1 = 1.0 / s1
+                a1q = tl.clamp(a1 * r1, -DTYPE_MAX, DTYPE_MAX).to(
+                    b_ptr.dtype.element_ty
                 )
 
-            # Per-token group quantization
-            m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
-            a_scale = m.to(tl.float32) * one_over_DTYPE_MAX
-            a_scale_recip = 1.0 / a_scale
-            a = tl.clamp(a * a_scale_recip, -DTYPE_MAX, DTYPE_MAX).to(
-                b_ptr.dtype.element_ty
+                offs_cm_loc = tl.arange(0, BLOCK_SIZE_M)
+                offs_cn_loc = tl.arange(0, BLOCK_SIZE_N)
+                c_ptrs = (
+                    c_ptr
+                    + pid_head_i64 * stride_cb_i64
+                    + tl.cast(m_start, tl.int64) * stride_cm_i64
+                    + tl.cast(n_start, tl.int64) * stride_cn_i64
+                ) + (
+                    offs_cm_loc[:, None] * stride_cm + offs_cn_loc[None, :] * stride_cn
+                )
+                c_mask = offs_cm_loc[:, None] < M - m_start
+
+                for n_i in tl.static_range(N_INNER):
+                    if B_PF >= 3:
+                        if n_i == 0:
+                            b0 = b0n
+                            b1 = b1n
+                        elif n_i == 1:
+                            b0 = bq0_1
+                            b1 = bq1_1
+                        elif n_i == 2:
+                            b0 = bq0_2
+                            b1 = bq1_2
+                        else:
+                            b0 = bq0_3
+                            b1 = bq1_3
+                    else:
+                        b0 = b0n
+                        b1 = b1n
+                        if n_i + 1 < N_INNER:
+                            b_ptrs += BSTEP
+                            b1_ptrs += BSTEP
+                            b0n = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                            b1n = tl.load(b1_ptrs)
+                    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+                    acc = tl.fma(tl.dot(a0q, b0), s0, acc)
+                    acc = tl.fma(tl.dot(a1q, b1), s1, acc)
+                    acc = acc * b_scale
+                    c_val = acc.to(c_ptr.type.element_ty)
+                    if PERM_N:
+                        c_val = tl.reshape(
+                            tl.permute(
+                                tl.reshape(
+                                    c_val, (BLOCK_SIZE_M, BLOCK_SIZE_N // 64, 4, 4, 4)
+                                ),
+                                (0, 1, 3, 2, 4),
+                            ),
+                            (BLOCK_SIZE_M, BLOCK_SIZE_N),
+                        )
+                    tl.store(c_ptrs, c_val, mask=c_mask)
+                    c_ptrs += BLOCK_SIZE_N * stride_cn_i64
+            elif N_INNER > 1:
+
+                one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
+                b_scale = tl.load(b_scale_ptr)
+
+                a0 = tl.load(a_ptrs, cache_modifier=".cg")
+                if AQH > 0 and K_TAIL > 0:
+
+                    a1 = tl.load(
+                        a_ptr
+                        + pid_head_i64 * stride_ab_i64
+                        + tl.cast(m_start, tl.int64) * stride_am_i64
+                        + BLOCK_SIZE_K * stride_ak_i64
+                        + (
+                            offs_am_loc[:, None] * stride_am
+                            + tl.arange(0, K_TAIL)[None, :] * stride_ak
+                        ),
+                        cache_modifier=".cg",
+                    )
+                    a0 = _fp8_load_pin(a0)
+                m0 = tl.maximum(tl.max(tl.abs(a0), axis=-1), 1e-10)[:, None]
+                s0 = m0.to(tl.float32) * one_over_DTYPE_MAX
+                r0 = 1.0 / s0
+                a0q = tl.clamp(a0 * r0, -DTYPE_MAX, DTYPE_MAX).to(
+                    b_ptr.dtype.element_ty
+                )
+
+                if K_TAIL > 0:
+
+                    offs_kt = tl.arange(0, K_TAIL)
+                    if AQH == 0:
+                        a1 = tl.load(
+                            a_ptr
+                            + pid_head_i64 * stride_ab_i64
+                            + tl.cast(m_start, tl.int64) * stride_am_i64
+                            + BLOCK_SIZE_K * stride_ak_i64
+                            + (
+                                offs_am_loc[:, None] * stride_am
+                                + offs_kt[None, :] * stride_ak
+                            ),
+                            cache_modifier=".cg",
+                        )
+                    b1_ptrs = (
+                        b_ptr
+                        + pid_head_i64 * stride_bb_i64
+                        + tl.cast(n_start, tl.int64) * stride_bn_i64
+                        + BLOCK_SIZE_K * stride_bk_i64
+                    ) + (
+                        offs_kt[:, None] * stride_bk + offs_bn_loc[None, :] * stride_bn
+                    )
+                else:
+                    a1 = tl.load(
+                        a_ptrs + BLOCK_SIZE_K * stride_ak_i64,
+                        mask=offs_k[None, :] < K - BLOCK_SIZE_K,
+                        other=0.0,
+                    )
+                m1 = tl.maximum(tl.max(tl.abs(a1), axis=-1), 1e-10)[:, None]
+                s1 = m1.to(tl.float32) * one_over_DTYPE_MAX
+                r1 = 1.0 / s1
+                a1q = tl.clamp(a1 * r1, -DTYPE_MAX, DTYPE_MAX).to(
+                    b_ptr.dtype.element_ty
+                )
+
+                offs_cm_loc = tl.arange(0, BLOCK_SIZE_M)
+                offs_cn_loc = tl.arange(0, BLOCK_SIZE_N)
+                c_ptrs = (
+                    c_ptr
+                    + pid_head_i64 * stride_cb_i64
+                    + tl.cast(m_start, tl.int64) * stride_cm_i64
+                    + tl.cast(n_start, tl.int64) * stride_cn_i64
+                ) + (
+                    offs_cm_loc[:, None] * stride_cm + offs_cn_loc[None, :] * stride_cn
+                )
+                c_mask = offs_cm_loc[:, None] < M - m_start
+
+                for n_i in range(N_INNER):
+                    b0 = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                    if K_TAIL > 0:
+                        b1 = tl.load(b1_ptrs)
+                        b1_ptrs += BLOCK_SIZE_N * stride_bn_i64
+                    else:
+                        b1 = tl.load(
+                            b_ptrs + BLOCK_SIZE_K * stride_bk_i64,
+                            mask=offs_k[:, None] < K - BLOCK_SIZE_K,
+                            other=0.0,
+                        )
+                    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+                    acc = tl.fma(tl.dot(a0q, b0), s0, acc)
+                    acc = tl.fma(tl.dot(a1q, b1), s1, acc)
+                    acc = acc * b_scale
+                    c_val = acc.to(c_ptr.type.element_ty)
+                    if PERM_N:
+
+                        c_val = tl.reshape(
+                            tl.permute(
+                                tl.reshape(
+                                    c_val, (BLOCK_SIZE_M, BLOCK_SIZE_N // 64, 4, 4, 4)
+                                ),
+                                (0, 1, 3, 2, 4),
+                            ),
+                            (BLOCK_SIZE_M, BLOCK_SIZE_N),
+                        )
+                    tl.store(c_ptrs, c_val, mask=c_mask)
+                    b_ptrs += BLOCK_SIZE_N * stride_bn_i64
+                    c_ptrs += BLOCK_SIZE_N * stride_cn_i64
+        else:
+            offs_k = tl.arange(0, BLOCK_SIZE_K)
+            offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+            a_ptrs = a_ptr + (
+                pid_head_i64 * stride_ab_i64
+                + offs_am[:, None] * stride_am_i64
+                + offs_k[None, :] * stride_ak_i64
+            )
+            b_ptrs = b_ptr + (
+                pid_head_i64 * stride_bb_i64
+                + offs_k[:, None] * stride_bk_i64
+                + offs_bn[None, :] * stride_bn_i64
             )
 
-            accumulator += tl.dot(a, b) * a_scale
+            one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
+            b_scale = tl.load(b_scale_ptr)
 
-            a_ptrs += BLOCK_SIZE_K * stride_ak_i64
-            b_ptrs += BLOCK_SIZE_K * stride_bk_i64
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        accumulator *= b_scale
+            for k_idx in range(tl.cdiv(K, BLOCK_SIZE_K)):
+                if EVEN_K:
+                    a = tl.load(a_ptrs)
+                    b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                else:
+                    a = tl.load(
+                        a_ptrs,
+                        mask=offs_k[None, :] < K - k_idx * BLOCK_SIZE_K,
+                        other=0.0,
+                    )
+                    b = tl.load(
+                        b_ptrs,
+                        mask=offs_k[:, None] < K - k_idx * BLOCK_SIZE_K,
+                        other=0.0,
+                    )
 
-        c = accumulator.to(c_ptr.type.element_ty)
+                m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
+                a_scale = m.to(tl.float32) * one_over_DTYPE_MAX
+                a_scale_recip = 1.0 / a_scale
+                a = tl.clamp(a * a_scale_recip, -DTYPE_MAX, DTYPE_MAX).to(
+                    b_ptr.dtype.element_ty
+                )
 
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                accumulator += tl.dot(a, b) * a_scale
 
-        c_ptrs = (
-            c_ptr
-            + pid_head_i64 * stride_cb_i64
-            + offs_cm[:, None] * stride_cm_i64
-            + offs_cn[None, :] * stride_cn_i64
+                a_ptrs += BLOCK_SIZE_K * stride_ak_i64
+                b_ptrs += BLOCK_SIZE_K * stride_bk_i64
+
+            accumulator *= b_scale
+
+            c = accumulator.to(c_ptr.type.element_ty)
+
+            offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+            c_ptrs = (
+                c_ptr
+                + pid_head_i64 * stride_cb_i64
+                + offs_cm[:, None] * stride_cm_i64
+                + offs_cn[None, :] * stride_cn_i64
+            )
+
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.store(c_ptrs, c, mask=c_mask)
+
+    # Process all query heads in a block of tokens.
+    elif ROPE_BLOCK_T > 0 and pid < prefill_start:
+
+        pid_adjusted = pid - rope_start
+        offs_t = pid_adjusted * ROPE_BLOCK_T + tl.arange(0, ROPE_BLOCK_T)
+        t_mask = offs_t < B
+        offs_t64 = offs_t.to(tl.int64)
+        offs_h = tl.arange(0, BLOCK_QH).to(tl.int64)
+        d_pe_offs = tl.arange(0, BLOCK_D_pe).to(tl.int64)
+        dk_nope_offs = tl.arange(0, BLOCK_DK_nope).to(tl.int64)
+
+        if REUSE_FREQS_FRONT_PART:
+            if IS_NEOX:
+                d_cos_offs = tl.where(
+                    (d_pe_offs >= BLOCK_D_HALF_pe) & (d_pe_offs < BLOCK_D_pe),
+                    d_pe_offs - BLOCK_D_HALF_pe,
+                    d_pe_offs,
+                ).to(d_pe_offs.dtype)
+            else:
+                d_cos_offs = d_pe_offs // 2
+        else:
+            d_cos_offs = d_pe_offs
+
+        if IS_NEOX:
+            d_swap_offs = tl.where(
+                d_pe_offs < BLOCK_D_HALF_pe,
+                d_pe_offs + BLOCK_D_HALF_pe,
+                d_pe_offs - BLOCK_D_HALF_pe,
+            ).to(d_pe_offs.dtype)
+            neg_mask = d_pe_offs < BLOCK_D_HALF_pe
+        else:
+            d_swap_offs = d_pe_offs ^ 1
+            neg_mask = d_pe_offs % 2 == 0
+
+        pos = tl.load(pos_ptr + offs_t64 * pos_stride_b, mask=t_mask, other=0)
+        pid_slot = tl.load(slot_mapping_ptr + offs_t64, mask=t_mask, other=-1).to(
+            tl.int64
+        )
+        q_base = (
+            q_pe_ptr
+            + offs_t64[:, None, None] * q_pe_stride_b
+            + offs_h[None, :, None] * q_pe_stride_h
+        )
+        q_mask = t_mask[:, None, None]
+        x = tl.load(
+            q_base + d_pe_offs[None, None, :] * q_pe_stride_d,
+            mask=q_mask,
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        if BLOCK_QH == QH_PER_KH:
+            kx0 = tl.load(
+                k_pe_ptr
+                + offs_t64[:, None] * k_pe_stride_b
+                + d_pe_offs[None, :] * k_pe_stride_d,
+                mask=t_mask[:, None],
+                other=0.0,
+                cache_modifier=".cg",
+            )
+            k_nope0 = tl.load(
+                k_nope_ptr
+                + offs_t64[:, None] * k_nope_stride_b
+                + dk_nope_offs[None, :] * k_nope_stride_d,
+                mask=t_mask[:, None],
+                other=0.0,
+                cache_modifier=".cg",
+            )
+        if HAVE_K_SCALE:
+            k_scale = tl.load(k_scale_ptr)
+        else:
+            k_scale = 1
+        cos_offs = pos[:, None] * cos_stride_b + d_cos_offs[None, :] * cos_stride_d
+        cos = tl.load(
+            cos_ptr + cos_offs, mask=t_mask[:, None], other=0.0, cache_modifier=".cg"
+        )
+        sin = tl.load(
+            sin_ptr + cos_offs, mask=t_mask[:, None], other=0.0, cache_modifier=".cg"
         )
 
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
+        if IS_NEOX:
+
+            x_sw = tl.load(
+                q_base + d_swap_offs[None, None, :] * q_pe_stride_d,
+                mask=q_mask,
+                other=0.0,
+            )
+            x_rot = tl.where(neg_mask[None, None, :], -x_sw, x_sw)
+        else:
+
+            xe, xo = tl.split(
+                tl.reshape(x, (ROPE_BLOCK_T, BLOCK_QH, BLOCK_D_HALF_pe, 2))
+            )
+            x_rot = tl.reshape(tl.join(-xo, xe), (ROPE_BLOCK_T, BLOCK_QH, BLOCK_D_pe))
+        q_pe = x * cos[:, None, :] + x_rot * sin[:, None, :]
+
+        q_out_ptrs = (
+            c_ptr
+            + offs_t64[:, None, None] * q_out_stride_b
+            + offs_h[None, :, None] * q_out_stride_h
+            + (d_pe_offs[None, None, :] + BLOCK_D_nope) * q_out_stride_d
+        )
+        tl.store(q_out_ptrs, q_pe.to(c_ptr.dtype.element_ty), mask=q_mask)
+
+        if pid_adjusted * ROPE_BLOCK_T < num_decode_toks_for_zeros:
+            z_mask = (offs_t < num_decode_toks_for_zeros)[:, None, None]
+            tl.store(
+                decode_q_pe_out_ptr
+                + offs_t64[:, None, None] * decode_q_pe_out_stride_b
+                + offs_h[None, :, None] * decode_q_pe_out_stride_h
+                + d_pe_offs[None, None, :] * decode_q_pe_out_stride_d,
+                q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
+                mask=z_mask,
+            )
+            if OUTPUT_Q_NOPE_ZEROS:
+                z = tl.zeros(
+                    (ROPE_BLOCK_T, BLOCK_QH, BLOCK_DK_nope),
+                    dtype=q_nope_zeros_out_ptr.dtype.element_ty,
+                )
+                tl.store(
+                    q_nope_zeros_out_ptr
+                    + offs_t64[:, None, None] * q_nope_zeros_out_stride_b
+                    + offs_h[None, :, None] * q_nope_zeros_out_stride_h
+                    + dk_nope_offs[None, None, :] * q_nope_zeros_out_stride_d,
+                    z,
+                    mask=z_mask,
+                )
+
+        kv_mask = (t_mask & (pid_slot >= 0))[:, None]
+        k_scale_rcprl = (1 / k_scale).to(tl.float32)
+        for pid_hk in range(0, QH // QH_PER_KH):
+            k_pe_base = (
+                k_pe_ptr + offs_t64[:, None] * k_pe_stride_b + pid_hk * k_pe_stride_h
+            )
+            if BLOCK_QH == QH_PER_KH:
+                kx = kx0
+            else:
+                kx = tl.load(
+                    k_pe_base + d_pe_offs[None, :] * k_pe_stride_d,
+                    mask=kv_mask,
+                    other=0.0,
+                )
+            if IS_NEOX:
+                kx_sw = tl.load(
+                    k_pe_base + d_swap_offs[None, :] * k_pe_stride_d,
+                    mask=kv_mask,
+                    other=0.0,
+                )
+                kx_rot = tl.where(neg_mask[None, :], -kx_sw, kx_sw)
+            else:
+                ke, ko = tl.split(tl.reshape(kx, (ROPE_BLOCK_T, BLOCK_D_HALF_pe, 2)))
+                kx_rot = tl.reshape(tl.join(-ko, ke), (ROPE_BLOCK_T, BLOCK_D_pe))
+            k_pe = kx * cos + kx_rot * sin
+
+            if BLOCK_QH == QH_PER_KH:
+                k_nope = k_nope0
+            else:
+                k_nope = tl.load(
+                    k_nope_ptr
+                    + offs_t64[:, None] * k_nope_stride_b
+                    + pid_hk * k_nope_stride_h
+                    + dk_nope_offs[None, :] * k_nope_stride_d,
+                    mask=kv_mask,
+                    other=0.0,
+                )
+
+            tl.store(
+                k_pe_out_ptr
+                + offs_t64[:, None] * k_pe_out_stride_b
+                + pid_hk * k_pe_out_stride_h
+                + d_pe_offs[None, :] * k_pe_out_stride_d,
+                k_pe.to(k_pe_out_ptr.dtype.element_ty),
+                mask=kv_mask,
+            )
+
+            k_nope_scaled = (k_nope.to(tl.float32) * k_scale_rcprl).to(
+                kv_cache_ptr.dtype.element_ty
+            )
+            k_pe_scaled = (k_pe.to(tl.float32) * k_scale_rcprl).to(
+                kv_cache_ptr.dtype.element_ty
+            )
+            kv_base = (
+                kv_cache_ptr
+                + pid_slot[:, None] * kv_cache_stride_b
+                + pid_hk * kv_cache_stride_h
+            )
+            tl.store(
+                kv_base + dk_nope_offs[None, :] * kv_cache_stride_d,
+                k_nope_scaled,
+                mask=kv_mask,
+                cache_modifier=".cs",
+            )
+            tl.store(
+                kv_base + (d_pe_offs[None, :] + BLOCK_DK_nope) * kv_cache_stride_d,
+                k_pe_scaled,
+                mask=kv_mask,
+                cache_modifier=".cs",
+            )
 
     elif pid < prefill_start:
         pid_adjusted = pid - rope_start
@@ -1066,3 +1723,7 @@ def _get_fp8_config(
         N,
         K,
     )
+
+
+def _get_fp8_prefill_config(M: int, N: int, K: int):
+    return get_gemm_config("FUSED-FP8-BMM-ROPE-PREFILL", M, N, K)

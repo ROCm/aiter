@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
     _fused_fp8_bmm_rope_cat_and_cache_mla_kernel,
     _get_fp4_config,
     _get_fp8_config,
+    _get_fp8_prefill_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
 from aiter.ops.triton.utils._triton import arch_info
@@ -443,7 +444,12 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         - q_out: Concatenated query output, shape (B, QH, kv_lora_rank + d_pe)
         - decode_q_pe_out: Decoded query PE output, shape (num_decode_toks_for_zeros, QH, d_pe)
         - k_pe_out: Key PE output, shape (B_slot, KH, qk_rope_head_dim)
-        - kv_cache: Updated KV cache (modified in-place)
+        - q_nope_zeros_out: Zero output, shape (num_decode_toks_for_zeros, QH, kv_lora_rank).
+
+    The function also updates kv_cache in-place. The gfx950 FP8 prefill route uses
+    QH=8, KH=1, K=192, N=512 and RoPE dim=64. Other shapes use the generic route.
+    This route requires contiguous weights and a dense query layout. Query rows
+    can also be interleaved by head, with an optional trailing RoPE part.
     """
     _LOGGER.info(
         "FUSED_FP8_BMM_ROPE_CAT_AND_CACHE_MLA: q_nope=%s w_k=%s w_k_scale=%s q_pe=%s k_nope=%s k_rope=%s positions=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s transpose_bm=%s group_size=%d is_neox=%s",
@@ -518,18 +524,79 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     N = kv_lora_rank
     K = k
 
+    prefill_config = None
     if config is None:
-        config, _ = _get_fp8_config(M, N, K)
+        # These prefill configs require FP8 outputs and bounded local strides.
+        use_prefill = (
+            arch_info.get_arch() == "gfx950"
+            and 32 < M <= 32768
+            and qh == 8
+            and kh == 1
+            and N == 512
+            and K == 192
+            and group_size == 128
+            and d_pe == qk_rope_head_dim == 64
+            and b_slot == b == bk
+            and transpose_bm
+            and q_out_dtype == torch.float8_e4m3fn
+            and w_k.dtype == torch.float8_e4m3fn
+            and all(x.dtype == torch.bfloat16 for x in (q_nope, q_pe, k_nope, k_rope))
+            and w_k.is_contiguous()
+            and q_nope.stride()
+            in (
+                (M * K, K, 1),
+                (K, qh * K, 1),
+                (K + d_pe, qh * (K + d_pe), 1),
+            )
+        )
+        if use_prefill:
+            prefill_config, _ = _get_fp8_prefill_config(M, N, K)
+            config = prefill_config
+        else:
+            config, _ = _get_fp8_config(M, N, K)
+    else:
+        config = dict(config)
 
     config["BLOCK_SIZE_K"] = group_size
-
-    num_pid_m = triton.cdiv(M, config["BLOCK_SIZE_M"])
-    num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
+    n_inner = config["N_INNER"] if prefill_config is not None else 1
+    m_per_cta = config["M_PER_CTA"] if prefill_config is not None else 1
+    num_pid_m = triton.cdiv(M, config["BLOCK_SIZE_M"] * m_per_cta)
+    num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"] * n_inner)
     grid_mn = num_pid_m * num_pid_n
-
     bmm_programs = qh * grid_mn
 
+    extra = {}
     rope_programs = b * qh
+    grid_mn_const = grid_mn
+    gmn_magic = gmn_shift = 0
+    if prefill_config is not None:
+        extra = {
+            key: config[key]
+            for key in (
+                "ROPE_BLOCK_T",
+                "N_INNER",
+                "M_PER_CTA",
+                "PERM_N",
+                "K_TAIL",
+                "B_PF",
+                "AQH",
+                "LPIN",
+                "IL_R",
+                "IL_U",
+                "ILB_NUM",
+                "ILB_DEN",
+                "XCD_COLOC",
+                "LDB",
+            )
+        }
+        extra["BLOCK_QH"] = qh
+        if config["ROPE_BLOCK_T"]:
+            rope_programs = triton.cdiv(b, config["ROPE_BLOCK_T"])
+        if not config["CONST_GRID_MN"]:
+            grid_mn_const = 0
+            # Divide runtime IDs by grid_mn with an exact unsigned multiply.
+            gmn_shift = (grid_mn - 1).bit_length()
+            gmn_magic = -((-1 << (31 + gmn_shift)) // grid_mn) - (1 << 32)
 
     prefill_programs = (b_slot - b) * kh
 
@@ -639,6 +706,9 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         kv_cache.stride(1),
         kv_cache.stride(2),
         k_scale_ptr=k_scale,
+        gmn_magic=gmn_magic,
+        gmn_shift=gmn_shift,
+        GRID_MN=grid_mn_const,
         BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
@@ -658,6 +728,7 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         cache_modifier=config["cache_modifier"],
+        **extra,
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out

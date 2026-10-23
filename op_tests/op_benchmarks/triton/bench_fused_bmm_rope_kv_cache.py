@@ -44,6 +44,8 @@ def bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args):
     nope_dim = args.qk_nope_dim or test_k
     rope_dim = args.rope_dim
     cache_dtype = str_to_torch_dtype[args.cache_dtype]
+    q_out_dtype = str_to_torch_dtype[args.q_out_dtype]
+    num_decode = T if args.num_decode_toks is None else args.num_decode_toks
     torch.manual_seed(0)
 
     # Same input construction as the unit test, per BMM dtype.
@@ -108,7 +110,8 @@ def bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args):
                 sin,
                 k_scale=k_scale,
                 is_neox=args.neox,
-                num_decode_toks_for_zeros=T,
+                q_out_dtype=q_out_dtype,
+                num_decode_toks_for_zeros=num_decode,
             )
 
     else:
@@ -129,14 +132,17 @@ def bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args):
                 group_size=128,
                 k_scale=k_scale,
                 is_neox=args.neox,
-                q_out_dtype=dtype,
-                num_decode_toks_for_zeros=T,
+                q_out_dtype=q_out_dtype,
+                num_decode_toks_for_zeros=num_decode,
             )
 
     # do_bench_cudagraph runs fn on a new stream that does not wait for the inputs above,
     # so without this the kernel can index with a slot_mapping/positions not yet written.
     torch.cuda.synchronize()
-    ms = triton.testing.do_bench_cudagraph(fn, rep=args.rep)
+    if args.timing == "graph":
+        ms = triton.testing.do_bench_cudagraph(fn, rep=args.rep)
+    else:
+        ms = triton.testing.do_bench(fn, warmup=25, rep=args.rep, return_mode="mean")
     if metric == "time":
         return ms
     if metric == "throughput":
@@ -151,7 +157,10 @@ def bench_fused_bmm_rope_kv_cache_fn(T, QH, KH, metric, args):
     else:
         w_bytes = QH * kv_lora_rank * nope_dim
     q_bytes = T * QH * (nope_dim + rope_dim) * elem
-    q_out_bytes = T * QH * (kv_lora_rank + rope_dim + rope_dim + kv_lora_rank) * elem
+    q_out_bytes = (
+        T * QH * (kv_lora_rank + rope_dim) * (torch.finfo(q_out_dtype).bits // 8)
+        + num_decode * QH * (rope_dim + kv_lora_rank) * elem
+    )
     k_bytes = T * KH * (kv_lora_rank + 2 * rope_dim) * elem
     cache_bytes = T * KH * (kv_lora_rank + rope_dim) * kv_cache.element_size()
     mem = w_bytes + q_bytes + q_out_bytes + k_bytes + cache_bytes
@@ -167,7 +176,11 @@ def run_benchmark(args):
         line_vals=[args.metric],
         line_names=[args.metric],
         ylabel=units[args.metric],
-        plot_name=f"{get_caller_name_no_ext()}_{args.bmm}",
+        plot_name=(
+            f"{get_caller_name_no_ext()}_{args.bmm}_{args.q_out_dtype}"
+            f"_decode-{args.num_decode_toks if args.num_decode_toks is not None else 'T'}"
+            f"_{args.timing}"
+        ),
         args={},
     )
 
@@ -236,6 +249,25 @@ def parse_args(args: list[str] | None = None):
         help="KV cache dtype",
     )
     parser.add_argument(
+        "--q-out-dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp8e4m3"],
+        help="Concatenated query output dtype",
+    )
+    parser.add_argument(
+        "--num-decode-toks",
+        type=int,
+        default=None,
+        help="Number of decode outputs; unset: T, 0: no decode outputs",
+    )
+    parser.add_argument(
+        "--timing",
+        choices=["graph", "eager"],
+        default="graph",
+        help="GPU event timing of graph replay or eager public-wrapper calls",
+    )
+    parser.add_argument(
         "--neox", action="store_true", default=False, help="NeoX-style RoPE"
     )
     parser.add_argument(
@@ -248,7 +280,7 @@ def parse_args(args: list[str] | None = None):
         "--rep",
         type=positive_int,
         default=20,
-        help="do_bench_cudagraph measurement budget in ms",
+        help="Measurement budget in ms",
     )
     parser.add_argument(
         "-print_vgpr",
@@ -263,6 +295,10 @@ def parse_args(args: list[str] | None = None):
         help="Write performance results to CSV file",
     )
     parsed_args = parser.parse_args(args=args)
+    if parsed_args.num_decode_toks is not None and not (
+        0 <= parsed_args.num_decode_toks <= min(parsed_args.T)
+    ):
+        parser.error("--num-decode-toks must be between 0 and each T")
     for name in ("rope_dim", "kv_lora_rank"):
         if (getattr(parsed_args, name) or 2) < 2:
             parser.error(f"--{name.replace('_', '-')} must be >= 2")
