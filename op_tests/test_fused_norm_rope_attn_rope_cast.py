@@ -1803,6 +1803,45 @@ def test_two_source_h64_causal_prefill(topk, mode):
     )
 
 
+@pytest.mark.parametrize("rotated", [False, True])
+@pytest.mark.parametrize("valid_indices", [False, True])
+@pytest.mark.parametrize("extend", [False, True])
+def test_two_source_h64_q_scale_groups(rotated, valid_indices, extend):
+    # Different powers of two expose scale-byte and Q-fragment permutations
+    # that nearly uniform random magnitudes can hide.
+    kwargs, _ = two_source_inputs(wide=True, valid_indices=valid_indices)
+    q = kwargs["q"]
+    groups = torch.arange(16, device=q.device)
+    heads = torch.arange(64, device=q.device)
+    factors = torch.exp2(((groups[None, :] * 3 + heads[:, None]) % 13 - 6).float())
+    q.mul_(factors.repeat_interleave(32, -1).bfloat16())
+    prepared_q = rotate(q, kwargs["cos"], kwargs["sin"], kwargs["positions"]).bfloat16()
+    if rotated:
+        kwargs.update(q=prepared_q, q_is_rotated=True)
+    if not extend:
+        kwargs.update(
+            kv=None, kv_scale=None, kv_indices_extend=None, kv_indptr_extend=None
+        )
+    kwargs.update(
+        max_logits=torch.empty(q.shape[:2], device=q.device),
+        lse=torch.empty(q.shape[:2], device=q.device),
+    )
+    actual = fused_v41(**kwargs)
+    q8, scales = quantize_fp8(prepared_q)
+    kwargs.update(
+        q=q8.reshape_as(q),
+        q_scale=scales.reshape(*q.shape[:2], 16).view(torch.float8_e8m0fnu),
+        q_is_rotated=True,
+        max_logits=torch.empty_like(actual[2]),
+        lse=torch.empty_like(actual[3]),
+    )
+    expected = fused_v41(**kwargs)
+    for x, y in zip(actual, expected):
+        torch.testing.assert_close(
+            x.view(torch.uint8), y.view(torch.uint8), rtol=0, atol=0
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", action="store_true")

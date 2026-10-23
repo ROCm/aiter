@@ -3,11 +3,11 @@
 #include "kernel.cuh"
 #include "kernel.h"
 
-template <int CacheMode, bool RawQ, bool Continuous = false>
+template <int CacheMode, bool RawQ, bool Continuous = false, bool DirectQ = false>
 __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fwd_kernel(
     FusedNormRopeAttnRopeCastParams args)
 {
-    using Config = FusedNormRopeAttnRopeCastConfig<CacheMode, RawQ>;
+    using Config = FusedNormRopeAttnRopeCastConfig<CacheMode, RawQ, DirectQ>;
     __shared__ __align__(16) char smem[Config::smem_bytes() + 2 * 68 * sizeof(int)];
     if(indices_valid<Config>(args))
         fused_norm_rope_attn_rope_cast_fwd_impl<Config, false, Continuous>(args, smem);
@@ -26,13 +26,19 @@ hipError_t run_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRopeCas
         // the original kernel without a device-side dispatch or extra scan.
         if(args.prefix_capacity > 0 && args.extend_capacity > 0)
         {
-            if(raw_q)
+            if(raw_q && args.H == 64)
+                fused_norm_rope_attn_rope_cast_fwd_kernel<0, true, true, true>
+                    <<<grid, 256, 0, stream>>>(args);
+            else if(raw_q)
                 fused_norm_rope_attn_rope_cast_fwd_kernel<0, true, true>
                     <<<grid, 256, 0, stream>>>(args);
             else
                 fused_norm_rope_attn_rope_cast_fwd_kernel<0, false, true>
                     <<<grid, 256, 0, stream>>>(args);
         }
+        else if(raw_q && args.H == 64)
+            fused_norm_rope_attn_rope_cast_fwd_kernel<0, true, false, true>
+                <<<grid, 256, 0, stream>>>(args);
         else if(raw_q)
             fused_norm_rope_attn_rope_cast_fwd_kernel<0, true><<<grid, 256, 0, stream>>>(args);
         else

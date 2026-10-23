@@ -1239,6 +1239,73 @@ prepare_q(const FusedNormRopeAttnRopeCastParams& a, char* smem, int warp, int la
     __builtin_amdgcn_s_barrier();
     return *reinterpret_cast<const int*>(sd + (warp * 16 + lane % 16) * 16 + lane / 16 * 4);
 }
+// Quantize directly into the scaled-MFMA fragments. Four lanes own one head;
+// only maxima and scale bytes cross lanes, with no Q staging in LDS.
+template <class T>
+__device__ __forceinline__ int prepare_q_direct(
+    const FusedNormRopeAttnRopeCastParams& a, v_q_t<T>& v_q, int warp, int lane, int t, int hs)
+{
+    using namespace opus;
+    const int group = lane / 16;
+    const int head  = hs + warp * 16 + lane % 16;
+    const auto* qsrc =
+        reinterpret_cast<const bf16_t*>(a.raw_q_ptr) + (int64_t(t) * a.H + head) * 512;
+    const float q_inv   = fused_q_norm::inv_rms<4, 16>(qsrc, group, a.q_norm, a.norm_eps);
+    const int64_t pos   = a.positions64 ? reinterpret_cast<const int64_t*>(a.positions_ptr)[t]
+                                        : reinterpret_cast<const int*>(a.positions_ptr)[t];
+    const auto* cs      = reinterpret_cast<const bf16_t*>(a.cos_ptr) + pos * 32;
+    const auto* sn      = reinterpret_cast<const bf16_t*>(a.sin_ptr) + pos * 32;
+    unsigned step_codes = 0;
+    static_for<4>([&](auto step) {
+        unsigned codes[2];
+        static_for<2>([&](auto part) {
+            // Match load_q: each step advances 32 columns within four
+            // 128-column blocks; the two fragments are 256 columns apart.
+            const int d = part.value * 256 + (group / 2) * 128 + step.value * 32 + (group % 2) * 16;
+            auto x      = *reinterpret_cast<const vector_t<bf16_t, 16>*>(qsrc + d);
+            if(a.q_norm)
+                fused_q_norm::apply(x, q_inv);
+            if constexpr(step.value >= 2 && part.value == 1)
+            {
+                if(!a.q_is_rotated && group >= 2)
+                    static_for<8>([&](auto i) {
+                        constexpr int j = i.value * 2;
+                        const int ri    = (d + j - 448) / 2;
+                        const float x0 = bf32(x[j]), x1 = bf32(x[j + 1]);
+                        const float co = bf32(cs[ri]), si = bf32(sn[ri]);
+                        x[j] =
+                            static_cast<bf16_t>(add_exact(mul_exact(x0, co), -mul_exact(x1, si)));
+                        x[j + 1] =
+                            static_cast<bf16_t>(add_exact(mul_exact(x0, si), mul_exact(x1, co)));
+                    });
+            }
+            vector_t<float, 16> f;
+            float am = 1e-30f;
+            static_for<16>([&](auto i) {
+                f[i.value] = bf32(x[i.value]);
+                am         = fmaxf(am, fabsf(f[i.value]));
+            });
+            const unsigned other =
+                __builtin_amdgcn_ds_bpermute((lane ^ 16) * 4, std::bit_cast<unsigned>(am));
+            am                  = fmaxf(am, std::bit_cast<float>(other));
+            const unsigned bits = std::bit_cast<unsigned>(am / 448.0f);
+            const int e         = int((bits - 1) >> 23) + 1 - 127;
+            const auto q = cast<opus::fp8_t>(f * std::bit_cast<float>(uint32_t(127 - e) << 23));
+            set_slice(v_q[step.value],
+                      __builtin_bit_cast(vector_t<typename T::D_ATTN, 16>, q),
+                      number<part.value * 16>{},
+                      number<(part.value + 1) * 16>{});
+            codes[part.value] = e + 127;
+        });
+        const unsigned code = (group & 1) ? codes[1] : codes[0];
+        const int src       = lane % 16 + ((group % 2) * 2 + group / 2) * 16;
+        step_codes |= __builtin_amdgcn_ds_bpermute(src * 4, code) << (step.value * 8);
+    });
+    // The lane-group exchange above matches the four contiguous scale
+    // bytes selected by MFMA's per-step scale selector.
+    return static_cast<int>(step_codes);
+}
+
 template <class T, class VO>
 __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastParams& a,
                                                const VO& v_o,
@@ -1710,8 +1777,13 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     auto g_q_scale =
         make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_scale_ptr) + q_scale_gmem_offset,
                   (kargs.H - h_block_start) * kargs.stride_q_scale_h * sizeof(D_ATTN));
+    v_q_t<T> v_q;
     const int scale_q = [&] {
-        if constexpr(T::RAW_Q)
+        if constexpr(T::DIRECT_Q)
+        {
+            return prepare_q_direct<T>(kargs, v_q, warp_id, lane_id, q_token_idx, h_block_start);
+        }
+        else if constexpr(T::RAW_Q)
         {
             return prepare_q<T>(kargs, smem, warp_id, lane_id, q_token_idx, h_block_start);
         }
@@ -1725,8 +1797,7 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
 
     // Q is loaded by the first non-empty segment, behind its first page-index load: vmcnt
     // retires in order, so an earlier Q would stall that wait.
-    v_q_t<T> v_q;
-    bool q_pending = true;
+    bool q_pending = !T::DIRECT_Q;
     auto issue_q   = [&] {
         if constexpr(T::RAW_Q)
             return;
