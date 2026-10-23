@@ -92,9 +92,19 @@ _GLUON_BOTH: bool = _GLUON_SEL in ("1", "true", "yes", "on", "all")
 AITER_FDA_USE_GLUON_K1: bool = _GLUON_BOTH or _GLUON_SEL == "k1"
 AITER_FDA_USE_GLUON_K2: bool = _GLUON_BOTH or _GLUON_SEL == "k2"
 
+# Pass B as _flash_kda_seg_scan_prefetch_kernel, on the arch it was measured on;
+# elsewhere _flash_kda_seg_scan_kernel keeps its tuning. Off to A/B the two.
+AITER_FDA_SCAN_PREFETCH: bool = os.getenv("AITER_FDA_SCAN_PREFETCH", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 DEVICE_ARCH = arch_info.get_arch()
 _GLUON_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250")
 _GLUON_K2C_ARCH_OK: bool = DEVICE_ARCH == "gfx1250"
+_SCAN_PREFETCH: bool = AITER_FDA_SCAN_PREFETCH and DEVICE_ARCH == "gfx1250"
 
 _LOGGED_ROUTES: set = set()
 
@@ -720,6 +730,110 @@ def _flash_kda_seg_scan_kernel(
         )
 
 
+@triton.jit
+def _seg_scan_load_b(
+    b_seg, s, hb, m_v, H: tl.constexpr, K: tl.constexpr, V: tl.constexpr
+):
+    return tl.load(b_seg + s * H * K * V + hb, mask=m_v[None, :], other=0.0)
+
+
+@triton.jit
+def _seg_scan_clamp(s, s0, s_end):
+    """``s`` moved into the updates ``[s0, s_end)``, or ``s0`` if there are none."""
+    return tl.maximum(tl.minimum(s, s_end - 1), s0)
+
+
+@triton.heuristics(
+    {
+        "HAS_H0": lambda args: (
+            args["h0"] is not None or args["state_cache"] is not None
+        ),
+        "PAGED_CACHE": lambda args: args["state_cache"] is not None,
+    }
+)
+@triton.jit
+def _flash_kda_seg_scan_prefetch_kernel(
+    A_seg,
+    b_seg,
+    h_in,
+    h0,
+    seq_seg_off,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    HAS_H0: tl.constexpr,
+    state_cache=None,
+    state_indices=None,
+    has_initial_state=None,
+    cache_stride=0,
+    PAGED_CACHE: tl.constexpr = False,
+):
+    """``_flash_kda_seg_scan_kernel`` with each load issued ahead of the update
+    that needs it.
+
+    The scan is a chain of dependent updates, so every wait is paid in full:
+    that kernel loads b_seg in the update that adds it, two memory round trips
+    per update. Here a trip does two updates and loads the next trip's b_seg,
+    two to three updates ahead; A_seg, a dot operand, is what the software
+    pipeliner prefetches (it leaves other loads alone). The last segment's
+    update, which nothing reads, is not done.
+    """
+    i_v = tl.program_id(0).to(tl.int64)
+    i_nh = tl.program_id(1).to(tl.int64)
+    i_n, i_h = i_nh // H, i_nh % H
+
+    s0 = tl.load(seq_seg_off + i_n).to(tl.int64)
+    # Update s takes h_in[s] to h_in[s + 1].
+    s_end = tl.load(seq_seg_off + i_n + 1).to(tl.int64) - 1
+
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_v = o_v < V
+    hb = i_h * K * V + o_k[:, None] * V + o_v[None, :]
+    ab = i_h * K * K + o_k[:, None] * K + o_k[None, :]
+
+    if HAS_H0:
+        if PAGED_CACHE:
+            slot = tl.load(state_indices + i_n).to(tl.int64)
+            take = tl.load(has_initial_state + i_n).to(tl.int1)
+            f_off = slot * cache_stride + i_h * V * K + o_v[None, :] * K
+            b_h = tl.load(
+                state_cache + f_off + o_k[:, None], mask=m_v[None, :] & take, other=0.0
+            ).to(tl.float32)
+        else:
+            b_h = tl.load(h0 + i_n * H * K * V + hb, mask=m_v[None, :], other=0.0).to(
+                tl.float32
+            )
+    else:
+        b_h = tl.zeros([K, BV], dtype=tl.float32)
+    tl.store(h_in + s0 * H * K * V + hb, b_h, mask=m_v[None, :])
+
+    # Segment indices are clamped into the updates, which keeps every load in
+    # bounds: the loads past the last update re-read its segment, and an odd
+    # count's last trip computes a second update from it and drops it.
+    b_n0 = _seg_scan_load_b(b_seg, s0, hb, m_v, H, K, V)
+    b_n1 = _seg_scan_load_b(b_seg, _seg_scan_clamp(s0 + 1, s0, s_end), hb, m_v, H, K, V)
+    for s in range(s0, s_end, 2):
+        s_b = _seg_scan_clamp(s + 1, s0, s_end)
+        b_c0 = b_n0
+        b_c1 = b_n1
+        b_n0 = _seg_scan_load_b(
+            b_seg, _seg_scan_clamp(s + 2, s0, s_end), hb, m_v, H, K, V
+        )
+        b_n1 = _seg_scan_load_b(
+            b_seg, _seg_scan_clamp(s + 3, s0, s_end), hb, m_v, H, K, V
+        )
+        b_A0 = tl.load(A_seg + s * H * K * K + ab)
+        b_A1 = tl.load(A_seg + s_b * H * K * K + ab)
+
+        b_h = tl.dot(b_A0, b_h.to(tl.bfloat16)) + b_c0
+        tl.store(h_in + (s + 1) * H * K * V + hb, b_h, mask=m_v[None, :])
+        has2 = s + 1 < s_end
+        b_h = tl.where(has2, tl.dot(b_A1, b_h.to(tl.bfloat16)) + b_c1, b_h)
+        tl.store(h_in + (s + 2) * H * K * V + hb, b_h, mask=m_v[None, :] & has2)
+
+
 def flash_kda_supported(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -853,6 +967,18 @@ def _scan_bv(n_seqs: int, H: int, V: int) -> tuple[int, int]:
     return _SCAN_BV_NARROW, 4
 
 
+def _scan_schedule(n_seqs: int, H: int, V: int) -> tuple[int, int]:
+    """``(BV, num_warps)`` for pass B."""
+    if not _SCAN_PREFETCH:
+        return _scan_bv(n_seqs, H, V)
+    # The prefetching scan keeps BV=16 past one block per CU as well: ahead of 32
+    # on every H=12 grid measured (to 480 blocks), ~20% behind where the blocks
+    # that have to share a CU run deep scans too (H=24 N=2, H=48 N=1). A third
+    # stage (213 KB of LDS) is no faster on its own, and in the forward it slows
+    # the passes around it.
+    return _SCAN_BV_NARROW, 4
+
+
 def _choose_chunks_per_seg(n_chunks_max: int, n_seqs: int, H: int, V: int) -> int:
     """Segment length in chunks, or ``n_chunks_max`` to disable segmentation.
 
@@ -950,6 +1076,7 @@ def _build_segments(
 _prepare_fast = fast_launch(_flash_kda_prepare_kernel)
 _segment_fast = fast_launch(_flash_kda_segment_kernel)
 _seg_scan_fast = fast_launch(_flash_kda_seg_scan_kernel)
+_seg_scan_prefetch_fast = fast_launch(_flash_kda_seg_scan_prefetch_kernel)
 
 
 def _check_paged_state_cache(
@@ -1393,8 +1520,9 @@ def flash_kda_fwd(
 
         # Pass B: propagate across segments. Depth is the segment count.
         h_in = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
-        BV_SCAN, SCAN_WARPS = _scan_bv(N, H, V)
-        _seg_scan_fast[(triton.cdiv(V, BV_SCAN), N * H)](
+        BV_SCAN, SCAN_WARPS = _scan_schedule(N, H, V)
+        scan = _seg_scan_prefetch_fast if _SCAN_PREFETCH else _seg_scan_fast
+        scan[(triton.cdiv(V, BV_SCAN), N * H)](
             A_seg=A_seg,
             b_seg=b_seg,
             h_in=h_in,

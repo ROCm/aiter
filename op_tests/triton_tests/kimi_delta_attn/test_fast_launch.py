@@ -126,7 +126,12 @@ def _wrapped():
     """Every fast_launch-wrapped kernel the pipeline can reach."""
     from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as fk
 
-    candidates = [fk._prepare_fast, fk._segment_fast, fk._seg_scan_fast]
+    candidates = [
+        fk._prepare_fast,
+        fk._segment_fast,
+        fk._seg_scan_fast,
+        fk._seg_scan_prefetch_fast,
+    ]
     if fk._GLUON_ARCH_OK:
         pkg = f"aiter.ops.triton._gluon_kernels.{fk.DEVICE_ARCH}.kimi_delta_attn"
         k1 = importlib.import_module(f"{pkg}.flash_kda_k1")
