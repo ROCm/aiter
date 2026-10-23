@@ -15,12 +15,11 @@ Skips unless running on real gfx942 hardware.
 
 import pytest
 import torch
+from gfx942_gemm_oracle import error_ratio
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import gemm_a16w16
-
-ACCUM_TOL = 1e-5
 
 
 def _require_gfx942():
@@ -38,21 +37,7 @@ def _inputs(m, n, k):
 
 
 def _assert_close(y, ref, msg):
-    """Every element within one bf16 ulp of the f32 oracle (fp32 output: none),
-    plus f32 summation-order noise of ``ACCUM_TOL`` times the largest output.
-
-    A correctly rounded bf16 result is within half an ulp; the other half lets
-    a different summation order flip the rounding.
-    """
-    err = (y.float() - ref).abs()
-    noise = ACCUM_TOL * ref.abs().max()
-    if y.dtype == torch.bfloat16:
-        # bf16 keeps 8 significant bits: one ulp is 2^-7 of the leading power of two.
-        exponent = torch.floor(torch.log2(ref.abs().clamp_min(1e-30)))
-        tol = torch.exp2(exponent - 7) + noise
-    else:
-        tol = noise
-    worst = (err / tol).max().item()
+    worst = error_ratio(y, ref)
     assert worst <= 1.0, f"{msg}: error is {worst:.2f}x the {y.dtype} tolerance"
 
 
@@ -550,6 +535,66 @@ def test_gemm_a16w16_gfx942_rejects_unsupported(cfg, match):
     tile = {"block_m": 32, "block_n": 32, "block_k": 64, "m_waves": 1, "n_waves": 1}
     with pytest.raises(ValueError, match=match):
         gemm_a16w16(x, w.t(), layout="nt", user_kwargs={**tile, **cfg})
+
+
+def _invalid_inputs(case):
+    x, w, _ = _inputs(64, 128, 256)
+    b = w.t()
+    if case == "3d-a":
+        return {"a": x[None], "b": b}
+    if case == "fp16":
+        return {"a": x.half(), "b": b.half()}
+    if case == "k-mismatch":
+        return {"a": x[:, :128], "b": b}
+    if case == "col-major-a":
+        return {"a": x.t().contiguous().t(), "b": b}
+    if case == "row-major-b":
+        return {"a": x, "b": b.contiguous()}
+    if case == "out-dtype":
+        return {"a": x, "b": b, "out": torch.empty(64, 128, device="cuda")}
+    bf16_out = {"dtype": torch.bfloat16, "device": "cuda"}
+    if case == "out-shape":
+        return {"a": x, "b": b, "out": torch.empty(64, 64, **bf16_out)}
+    return {"a": x, "b": b, "out": torch.empty(128, 64, **bf16_out).t()}
+
+
+@pytest.mark.parametrize(
+    "case,error",
+    [
+        ("3d-a", ValueError),
+        ("fp16", TypeError),
+        ("k-mismatch", ValueError),
+        ("col-major-a", ValueError),
+        ("row-major-b", ValueError),
+        ("out-dtype", TypeError),
+        ("out-shape", ValueError),
+        ("out-strided", ValueError),
+    ],
+)
+def test_gemm_a16w16_gfx942_rejects_invalid_inputs(case, error):
+    """Inputs are validated with exceptions, which ``python -O`` keeps."""
+    _require_gfx942()
+    with pytest.raises(error):
+        gemm_a16w16(layout="nt", out_dtype=torch.bfloat16, **_invalid_inputs(case))
+
+
+def test_gemm_a16w16_gfx942_other_device():
+    """Operands on a device that is not the current one, on its current stream
+    or on an explicit one."""
+    _require_gfx942()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two GPUs")
+    with torch.cuda.device(1):
+        x, w, ref = _inputs(256, 256, 1024)
+    assert torch.cuda.current_device() == 0
+    _assert_close(gemm_a16w16(x, w.t()), ref, "operands on cuda:1")
+    side = torch.cuda.Stream(device=1)
+    side.wait_stream(torch.cuda.current_stream(1))
+    y = gemm_a16w16(x, w.t(), stream=side)
+    side.synchronize()
+    _assert_close(y, ref, "operands and stream on cuda:1")
+    with pytest.raises(ValueError, match="stream is on"):
+        gemm_a16w16(x, w.t(), stream=torch.cuda.current_stream(0))
 
 
 @pytest.mark.parametrize("layout", ["nn", "tn", "tt"])

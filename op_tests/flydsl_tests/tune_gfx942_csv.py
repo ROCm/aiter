@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from gfx942_gemm_oracle import error_ratio
 
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
     CONFIG_DEFAULTS,
@@ -163,11 +164,6 @@ def graph_time_us(fn, iters: int, warmup: int, batch: int) -> float:
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) * 1e3 / (iters * batch)
-
-
-def rel_err(output: torch.Tensor, reference: torch.Tensor) -> float:
-    diff = (output.float() - reference).abs().max().item()
-    return diff / (reference.abs().max().item() + 1e-9)
 
 
 # ---------------------------------------------------------------- files
@@ -402,6 +398,8 @@ class ShapeBench:
         ok, why = valid_config(cfg, self.m, self.n, self.k)
         if not ok:
             return "invalid", 0.0, why
+        # NaN, so an element the config skips cannot pass with an earlier config's value.
+        self.out.fill_(float("nan"))
         try:
             self.runner(cfg)()
             torch.cuda.synchronize()
@@ -411,8 +409,8 @@ class ShapeBench:
                 0.0,
                 f"{type(error).__name__}: {error}".replace("\n", " ")[:500],
             )
-        err = rel_err(self.out, self.reference)
-        return ("ok" if err < 2e-2 else "incorrect"), err, ""
+        err = error_ratio(self.out, self.reference)
+        return ("ok" if err <= 1.0 else "incorrect"), err, ""
 
     def interleaved(
         self, cfgs: list[dict[str, Any]], rounds: int

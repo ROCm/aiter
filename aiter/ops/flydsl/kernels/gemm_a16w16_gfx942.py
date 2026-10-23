@@ -1880,35 +1880,58 @@ def gemm_a16w16(
     """
     if bias is not None:
         raise NotImplementedError("gfx942 GEMM bias fusion is not implemented yet")
-    current = torch.cuda.current_stream()
-    if stream is None:
-        stream = current
     if layout.lower() != "nt":
         raise ValueError(
             f"gfx942 GEMM supports the 'nt' layout only (got {layout!r}); "
             "transposed operands need CDNA4 ds_read_tr"
         )
 
-    assert a.ndim == 2 and b.ndim == 2
-    assert a.device == b.device
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"a and b must be 2-D (got {a.ndim}-D and {b.ndim}-D)")
+    device = a.device
+    if device.type != "cuda" or b.device != device:
+        raise ValueError(f"a and b must be on one GPU (got {device} and {b.device})")
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
+        raise TypeError(f"gfx942 kernel is bf16-only (got {a.dtype} and {b.dtype})")
     m, k = a.shape
-    assert b.shape[0] == k
+    if b.shape[0] != k:
+        raise ValueError(
+            f"a is [M, K] = {list(a.shape)}, b is [K, N] = {list(b.shape)}"
+        )
     n = b.shape[1]
-    assert a.dtype == b.dtype == torch.bfloat16, "gfx942 kernel is bf16-only"
+    if a.stride(1) != 1 or b.stride(0) != 1:
+        raise ValueError(
+            "the nt layout needs a row-major (a.stride(1) == 1) and b column-major "
+            f"(b.stride(0) == 1); got strides {a.stride()} and {b.stride()}"
+        )
+
+    current = torch.cuda.current_stream()
+    if stream is None:
+        stream = (
+            current if current.device == device else torch.cuda.current_stream(device)
+        )
+    elif stream.device != device:
+        raise ValueError(f"stream is on {stream.device}, the operands on {device}")
 
     if out_dtype is None:
         out_dtype = a.dtype if out is None else out.dtype
     if out_dtype not in (a.dtype, torch.float32):
         raise ValueError(f"unsupported output dtype {out_dtype}")
     if out is not None:
-        assert out.dtype == out_dtype and out.device == a.device
-        assert out.is_contiguous()
-        assert out.numel() == m * n
+        if out.dtype != out_dtype:
+            raise TypeError(f"out is {out.dtype}, out_dtype is {out_dtype}")
+        if out.device != device:
+            raise ValueError(f"out is on {out.device}, the operands on {device}")
+        if not out.is_contiguous() or out.numel() != m * n:
+            raise ValueError(
+                f"out must be contiguous with M * N = {m * n} elements "
+                f"(got shape {list(out.shape)}, strides {out.stride()})"
+            )
 
     # Param defaults, overlaid by the shape's tuned-table row (else the
     # cost-model fallback), then by any caller overrides.
     kwargs = dict(CONFIG_DEFAULTS)
-    auto = gfx942_default_config(m, n, k, out_dtype, a.device)
+    auto = gfx942_default_config(m, n, k, out_dtype, device)
     user_kwargs = dict(user_kwargs or {})
     if _STRUCTURAL_KEYS & user_kwargs.keys():
         # A caller-chosen tile/pipeline must not inherit flags that were only
@@ -1949,15 +1972,13 @@ def gemm_a16w16(
     )
     with on_stream:
         if out is None:
-            out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+            out = torch.empty((m, n), dtype=out_dtype, device=device)
         out = out.view(m, n)
         if f32_accum_for_bf16:
-            kernel_out = torch.empty((m, n), dtype=torch.float32, device=a.device)
+            kernel_out = torch.empty((m, n), dtype=torch.float32, device=device)
         else:
             kernel_out = out
-        semaphore, signal = get_split_k_buffers(
-            stream, a.device, split_k, split_k_reduce
-        )
+        semaphore, signal = get_split_k_buffers(stream, device, split_k, split_k_reduce)
         if split_k_reduce:
             # Partial tiles of every split; the last split of a tile reduces them.
             num_tiles = ((m + param.block_m - 1) // param.block_m) * (
@@ -1966,7 +1987,7 @@ def gemm_a16w16(
             workspace = torch.empty(
                 (num_tiles * split_k * param.block_m * param.block_n,),
                 dtype=torch.float32,
-                device=a.device,
+                device=device,
             )
         else:
             workspace = signal
