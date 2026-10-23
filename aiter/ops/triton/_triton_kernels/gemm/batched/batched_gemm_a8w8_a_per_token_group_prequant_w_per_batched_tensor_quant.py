@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
@@ -132,16 +133,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
     split_k_start = pid_k * SPLITK_BLOCK_SIZE
     k_span = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K) - split_k_start
@@ -297,7 +289,7 @@ def _batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel(
     """
     Note: this is Triton jited function and not meant to be called directly. Call
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant function with
-    y_scale
+    y_scale_out
 
     Sums the split-K partials of each row and quantizes the row to FP8 with one scale.
     A row wider than BLOCK_SIZE_N is done in tiles: a first pass finds the row amax and a

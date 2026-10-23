@@ -64,8 +64,8 @@ def bench_gemm_fn(
     gens = [_p_gen]
     out_vals_keys = [["X", "WQ", "w_scale", "bias", "YQ"]]
     if y_per_token_quant:
-        # The y_scale path writes an FP8 YQ and a per-token y_scale, not a bf16 YQ.
-        out_vals_keys = [["X", "WQ", "w_scale", "bias", "_"], ["YQ", "y_scale"]]
+        # The y_scale_out path writes an FP8 YQ and a per-token scale, not a bf16 YQ.
+        out_vals_keys = [["X", "WQ", "w_scale", "bias", "_"], ["YQ", "y_scale_out"]]
         gens.append(
             lambda: (
                 torch.empty((M, batch, N), dtype=get_fp8_dtypes()[1], device="cuda"),
@@ -100,7 +100,8 @@ def bench_gemm_fn(
     mem_write = (batch * M * N) * rot_bufs[0]["YQ"].element_size()
     if y_per_token_quant:
         mem_write += (
-            rot_bufs[0]["y_scale"].numel() * rot_bufs[0]["y_scale"].element_size()
+            rot_bufs[0]["y_scale_out"].numel()
+            * rot_bufs[0]["y_scale_out"].element_size()
         )
     mem = mem_read + mem_write
 
