@@ -14,6 +14,23 @@
 using opus::operator""_I;
 
 namespace fused_norm_rope_attn_rope_cast_fwd {
+
+template <int Heads>
+__device__ __forceinline__ void specialize_heads(FusedNormRopeAttnRopeCastParams& a)
+{
+    static_assert(Heads == 64 || Heads == 128);
+    // Q and outputs are contiguous by the public contract. KV data and scale
+    // strides remain independent runtime values for both CSR sources.
+    a.H                = Heads;
+    a.stride_q_n       = Heads * 512;
+    a.stride_q_h       = 512;
+    a.stride_q_scale_n = Heads * 16;
+    a.stride_q_scale_h = 16;
+    a.stride_o_n       = Heads * 512;
+    a.stride_o_h       = 512;
+    a.stride_lse_n     = Heads;
+}
+
 struct SafeKvRecord
 {
     unsigned char data[512];
@@ -45,9 +62,9 @@ constexpr int ACC_PER_TILE = T::W_M * T::W_N / T::WARP_SIZE;
 template <class T>
 constexpr int S_ELEMS = T::GEMM0_E_N * ACC_PER_TILE<T>;
 template <class T>
-constexpr int O_ELEMS = T::Q_TILE_SIZE * T::D_HEAD_SIZE / T::WARP_SIZE;
+constexpr int O_ELEMS = T::HEAD_TILE * T::D_HEAD_SIZE / T::BLOCK_SIZE;
 template <class T>
-constexpr int PV_GROUPS = T::NUM_WARPS;
+constexpr int PV_GROUPS = T::HEAD_TILE / T::Q_TILE_SIZE;
 template <class T>
 constexpr int PV_DV = T::D_HEAD_SIZE / T::NUM_WARPS;
 template <class T>
@@ -846,6 +863,11 @@ template <class T, class VP>
 __device__ inline void write_p(char* smem, const VP& v_p, int warp_id, int lane_id)
 {
     using namespace opus;
+    // A 32-head tile has two logical QK groups. Four waves still own
+    // disjoint V columns; only the first two publish probabilities.
+    if constexpr(PV_GROUPS<T> < T::NUM_WARPS)
+        if(warp_id >= PV_GROUPS<T>)
+            return;
     constexpr int CHUNK = T::W_N * T::W_K_PV / T::WARP_SIZE;
     auto s_p            = make_smem(reinterpret_cast<typename T::D_PV*>(smem + p_base<T>));
     static_for<T::GEMM1_E_K>([&](auto ks) {
@@ -858,8 +880,9 @@ __device__ inline void write_p(char* smem, const VP& v_p, int warp_id, int lane_
 template <class T>
 __device__ inline void write_fac(char* smem, typename T::D_ACC fac, int warp_id, int lane_id)
 {
-    reinterpret_cast<typename T::D_ACC*>(
-        smem + fac_base<T>)[(lane_id % T::W_M) * PV_GROUPS<T> + warp_id] = fac;
+    if(PV_GROUPS<T> == T::NUM_WARPS || warp_id < PV_GROUPS<T>)
+        reinterpret_cast<typename T::D_ACC*>(
+            smem + fac_base<T>)[(lane_id % T::W_M) * PV_GROUPS<T> + warp_id] = fac;
 }
 
 template <class T,
@@ -909,9 +932,8 @@ __device__ inline void compute_pv(char* smem,
     constexpr int B2_STEP       = PV_STEPS<T> - 1 - PV_TAIL_STEPS;
     constexpr int P_CHUNK_BYTES = T::WARP_SIZE * T::dwordx4_size;
     constexpr int SM_SLOTS      = (B2_STEP + 1) * (PV_GROUPS<T> - 1);
-    static_assert(SM_PV_OPS<T> <= SM_SLOTS);
 
-    const auto fac = __builtin_bit_cast(vector_t<D_ACC, PV_GROUPS<T>>, lds_read_b128_v(xchg.fac));
+    const auto fac = __builtin_bit_cast(vector_t<D_ACC, T::NUM_WARPS>, lds_read_b128_v(xchg.fac));
     load_v_tile<T, 0>(smem, u_rv, v_lane_off, v_v);
     p_chunk_t p_oth[PV_GROUPS<T> - 1][T::GEMM1_E_K];
     static_for<PV_GROUPS<T> - 1>([&](auto r) {
@@ -976,7 +998,7 @@ __device__ inline void compute_pv(char* smem,
                 if constexpr(op < next)
                 {
                     __builtin_amdgcn_sched_barrier(0);
-                    sm_hook(number<op>{});
+                    static_for<next - op>([&](auto k) { sm_hook(number<op + k.value>{}); });
                     __builtin_amdgcn_sched_barrier(0);
                 }
             }
@@ -1002,16 +1024,22 @@ __device__ inline void compute_pv(char* smem,
         // Inline MFMA does not expose operand-read latency to the compiler. Keep every P
         // chunk live through the interleaved softmax, then wait before its registers can
         // be reused by the next QK stage.
-        static_assert(PV_GROUPS<T> == 4 && T::GEMM1_E_K == 2);
-        asm volatile("s_nop 7"
-                     :
-                     : "v"(v_p),
-                       "v"(p_oth[0][0]),
-                       "v"(p_oth[0][1]),
-                       "v"(p_oth[1][0]),
-                       "v"(p_oth[1][1]),
-                       "v"(p_oth[2][0]),
-                       "v"(p_oth[2][1]));
+        static_assert(T::GEMM1_E_K == 2);
+        if constexpr(PV_GROUPS<T> == 2)
+            asm volatile("s_nop 7" : : "v"(v_p), "v"(p_oth[0][0]), "v"(p_oth[0][1]));
+        else
+        {
+            static_assert(PV_GROUPS<T> == 4 && T::GEMM1_E_K == 2);
+            asm volatile("s_nop 7"
+                         :
+                         : "v"(v_p),
+                           "v"(p_oth[0][0]),
+                           "v"(p_oth[0][1]),
+                           "v"(p_oth[1][0]),
+                           "v"(p_oth[1][1]),
+                           "v"(p_oth[2][0]),
+                           "v"(p_oth[2][1]));
+        }
     }
 }
 
@@ -1330,7 +1358,7 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
     using namespace opus;
     constexpr int VEC = VEC_O2<T>;
     constexpr int NC  = O_ELEMS<T> / VEC / PV_GROUPS<T>;
-    static_assert(NC == 4 && PV_GROUPS<T> == 4 && T::W_M == 16);
+    static_assert(NC == 4 && (PV_GROUPS<T> == 2 || PV_GROUPS<T> == 4) && T::W_M == 16);
     vector_t<uint32_t, PV_GROUPS<T>> scale_words{};
     const int64_t pos = a.positions64 ? reinterpret_cast<const int64_t*>(a.positions_ptr)[token]
                                       : reinterpret_cast<const int*>(a.positions_ptr)[token];
@@ -1851,7 +1879,7 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     using D_OUT  = typename T::D_OUT;
 
     const int q_token_idx   = block_id_x();
-    const int h_block_start = block_id_y() * T::T_M * T::Q_TILE_SIZE;
+    const int h_block_start = T::NUM_HEADS == T::HEAD_TILE ? 0 : block_id_y() * T::HEAD_TILE;
 
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));
@@ -1872,7 +1900,13 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     const int scale_q = [&] {
         if constexpr(T::DIRECT_Q)
         {
-            return prepare_q_direct<T>(kargs, v_q, warp_id, lane_id, q_token_idx, h_block_start);
+            return prepare_q_direct<T>(
+                kargs,
+                v_q,
+                (PV_GROUPS<T> == T::NUM_WARPS ? warp_id : warp_id % PV_GROUPS<T>),
+                lane_id,
+                q_token_idx,
+                h_block_start);
         }
         else if constexpr(T::RAW_Q)
         {
@@ -1881,7 +1915,11 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
         else
         {
             auto v_q_scale = load<T::VEC_SCALE>(
-                g_q_scale, make_layout_q_scale<T>(warp_id, lane_id, kargs.stride_q_scale_h));
+                g_q_scale,
+                make_layout_q_scale<T>(
+                    (PV_GROUPS<T> == T::NUM_WARPS ? warp_id : warp_id % PV_GROUPS<T>),
+                    lane_id,
+                    kargs.stride_q_scale_h));
             return __builtin_bit_cast(int, v_q_scale);
         }
     }();
@@ -1903,7 +1941,9 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     auto read_q = [&] {
         if(!q_pending)
             return;
-        v_q = load_q<T>(smem, make_layout_rk<T>(lane_id), warp_id);
+        v_q = load_q<T>(smem,
+                        make_layout_rk<T>(lane_id),
+                        (PV_GROUPS<T> == T::NUM_WARPS ? warp_id : warp_id % PV_GROUPS<T>));
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
         q_pending = false;
@@ -1959,9 +1999,13 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     // Recomputed so that it is not live across the main loop.
     int lane = lane_id;
     asm volatile("" : "+v"(lane));
-    const int head = h_block_start + warp_id * T::Q_TILE_SIZE + lane % T::W_M;
+    const int head =
+        h_block_start +
+        ((PV_GROUPS<T> == T::NUM_WARPS ? warp_id : warp_id % PV_GROUPS<T>)) * T::Q_TILE_SIZE +
+        lane % T::W_M;
     if constexpr(Split)
     {
+        static_assert(T::HEAD_TILE == 64);
         // Store FP32 O as coalesced vectors: [register chunk][thread][4].
         // The last four floats per head hold m, l, true max and padding.
         float* partial =
@@ -1979,7 +2023,8 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
         return;
     }
     // lse: natural log, without the sink, +inf for a token without rows.
-    if(kargs.lse_ptr != nullptr && lane_id < T::W_M && head < kargs.H)
+    if((PV_GROUPS<T> == T::NUM_WARPS || warp_id < PV_GROUPS<T>) && kargs.lse_ptr != nullptr &&
+       lane_id < T::W_M && head < kargs.H)
     {
         constexpr D_ACC LN_2 = 0.69314718056f;
         reinterpret_cast<D_ACC*>(
@@ -1988,7 +2033,8 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
                                 : numeric_limits<D_ACC>::infinity();
     }
 
-    if(kargs.max_ptr && lane_id < 16 && head < kargs.H)
+    if((PV_GROUPS<T> == T::NUM_WARPS || warp_id < PV_GROUPS<T>) && kargs.max_ptr && lane_id < 16 &&
+       head < kargs.H)
         kargs.max_ptr[int64_t(q_token_idx) * kargs.H + head] = true_max * 0.69314718056f;
     const bool has_sink = kargs.attn_sink_ptr != nullptr;
     auto g_attn_sink    = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr),
@@ -2001,7 +2047,7 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     write_fac<T>(smem, (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f), warp_id, lane_id);
     s_waitcnt_lgkmcnt(0_I);
     __builtin_amdgcn_s_barrier();
-    const auto fac = __builtin_bit_cast(vector_t<D_ACC, PV_GROUPS<T>>,
+    const auto fac = __builtin_bit_cast(vector_t<D_ACC, T::NUM_WARPS>,
                                         lds_read_b128_v(fac_addr<T>(smem, lane_id)));
     s_waitcnt_lgkmcnt(0_I);
     __builtin_amdgcn_sched_barrier(0);

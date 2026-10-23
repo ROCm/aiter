@@ -28,7 +28,9 @@ inline bool launch_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRop
                       (a.tokens <= 1024 && capacity >= int64_t(a.tokens) * 1536) ||
                       (two_sources && ((a.tokens <= 768 && capacity >= int64_t(a.tokens) * 768) ||
                                        (a.tokens <= 1024 && capacity >= int64_t(a.tokens) * 896))));
-    if(!h64 && !h128 && !(strided && a.num_splits > 1))
+    const bool head32 = strided && two_sources && a.tokens * (a.heads / 64) == 128 &&
+                        capacity < int64_t(a.tokens) * 768;
+    if(!h64 && !h128 && !head32 && !(strided && a.num_splits > 1))
         return false;
     FusedNormRopeAttnRopeCastParams k{};
     k.partial_ptr          = a.partial;

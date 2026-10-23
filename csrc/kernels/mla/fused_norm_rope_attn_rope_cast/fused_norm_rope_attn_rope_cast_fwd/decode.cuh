@@ -4,11 +4,14 @@
 #include "kernel.cuh"
 #include "kernel.h"
 
-template <bool RawQ, bool DirectQ = false, int FixedSplits = 0>
+template <int Heads, bool RawQ, bool DirectQ = false, int FixedSplits = 0>
 __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_kernel(
     FusedNormRopeAttnRopeCastParams args)
 {
-    using T = FusedNormRopeAttnRopeCastConfig<0, RawQ, DirectQ, FixedSplits>;
+    fused_norm_rope_attn_rope_cast_fwd::specialize_heads<Heads>(args);
+    if constexpr(FixedSplits)
+        args.num_splits = FixedSplits;
+    using T = FusedNormRopeAttnRopeCastConfig<0, RawQ, DirectQ, FixedSplits, Heads>;
     __shared__ __align__(16) char smem[T::smem_bytes() + 2 * 68 * sizeof(int)];
     if(indices_valid<T, true>(args))
         fused_norm_rope_attn_rope_cast_fwd_impl<T, false, true, true>(args, smem);
@@ -18,12 +21,15 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_
 
 // Each reduction CTA owns sixteen heads. This exposes four independent CTAs
 // per attention tile and keeps only 32 output accumulators in each thread.
-template <int FixedSplits = 0>
+template <int Heads, int FixedSplits = 0>
 __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_reduce_kernel(
     FusedNormRopeAttnRopeCastParams a)
 {
     using namespace opus;
     using namespace fused_norm_rope_attn_rope_cast_fwd;
+    specialize_heads<Heads>(a);
+    if constexpr(FixedSplits)
+        a.num_splits = FixedSplits;
     const int splits = FixedSplits ? FixedSplits : a.num_splits;
     using T          = FusedNormRopeAttnRopeCastConfig<0, false>;
     const int token = blockIdx.x, h_start = blockIdx.y * 16;
@@ -36,7 +42,8 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_
     constexpr int per_group = O_ELEMS<T> / PV_GROUPS<T>;
     vector_t<float, per_group> output{};
     const auto* base =
-        a.partial_ptr + (int64_t(token) * a.num_splits * a.H + h_start / 64 * 64) * 516;
+        a.partial_ptr +
+        (int64_t(token) * a.num_splits * a.H + (Heads == 64 ? 0 : h_start / 64 * 64)) * 516;
     const int64_t split_stride = int64_t(a.H) * 516;
     float maximum = -__FLT_MAX__, true_max = -__builtin_inff();
     for(int s = 0; s < splits; ++s)

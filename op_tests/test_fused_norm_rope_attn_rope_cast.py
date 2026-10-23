@@ -2201,18 +2201,25 @@ def test_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices):
 
 
 @pytest.mark.parametrize("heads", [64, 128])
-@pytest.mark.parametrize("mode", ["raw", "prepared", "norm"])
+@pytest.mark.parametrize("mode", ["raw", "rotated", "prepared", "norm"])
 @pytest.mark.parametrize("valid_indices", [False, True])
-def test_fp8_decode_large_grid_replay(heads, mode, valid_indices):
+@pytest.mark.parametrize("layout", ["interleaved", "separate", "padded"])
+@pytest.mark.parametrize("splits", [1, 2])
+def test_fp8_decode_large_grid_replay(heads, mode, valid_indices, layout, splits):
     kwargs, (expected, mx, lse) = two_source_inputs(
-        heads, "padded", mode, True, True, valid_indices
+        heads, layout, mode, True, True, valid_indices
     )
-    repeats = 22
+    # The single path must exercise the 32-head tile at both H64 and H128.
+    original_tokens = kwargs["q"].shape[0]
+    target_tokens = 128 // (heads // 64) if splits == 1 else original_tokens * 22
+    repeats = (target_tokens + original_tokens - 1) // original_tokens
     for key in ("q", "q_scale"):
         if kwargs[key] is not None:
             x = kwargs[key]
-            kwargs[key] = x.view(torch.uint8).repeat(repeats, 1, 1).view(x.dtype)
-    kwargs["positions"] = kwargs["positions"].repeat(repeats)
+            kwargs[key] = (
+                x.view(torch.uint8).repeat(repeats, 1, 1)[:target_tokens].view(x.dtype)
+            )
+    kwargs["positions"] = kwargs["positions"].repeat(repeats)[:target_tokens]
     for source in ("prefix", "extend"):
         pk, ik = "kv_indptr_" + source, "kv_indices_" + source
         ptr, ids = kwargs[pk], kwargs[ik]
@@ -2221,22 +2228,29 @@ def test_fp8_decode_large_grid_replay(heads, mode, valid_indices):
         kwargs[pk] = torch.cat(
             [ptr[:-1] + i * count for i in range(repeats)] + [ptr[-1:] * repeats]
         )
+        kwargs[pk] = kwargs[pk][: target_tokens + 1].contiguous()
+        kwargs[ik] = kwargs[ik][: int(kwargs[pk][-1])].contiguous()
+    expected = expected.repeat(repeats, 1, 1)[:target_tokens]
+    mx = mx.repeat(repeats, 1)[:target_tokens]
+    lse = lse.repeat(repeats, 1)[:target_tokens]
     t = kwargs["q"].shape[0]
     kwargs.update(
         is_decode=True,
-        num_splits=2,
-        workspace=torch.full((t, 2, heads, 516), torch.nan, device="cuda"),
-        debug_out=torch.empty_like(expected.repeat(repeats, 1, 1)),
-        max_logits=torch.empty_like(mx.repeat(repeats, 1)),
-        lse=torch.empty_like(lse.repeat(repeats, 1)),
+        num_splits=splits,
+        workspace=(
+            torch.full((t, splits, heads, 516), torch.nan, device="cuda")
+            if splits > 1
+            else None
+        ),
+        debug_out=torch.empty_like(expected),
+        max_logits=torch.empty_like(mx),
+        lse=torch.empty_like(lse),
     )
     out = fused_v41(**kwargs)
     kwargs["out"], kwargs["out_scale"] = out[:2]
-    torch.testing.assert_close(
-        kwargs["debug_out"], expected.repeat(repeats, 1, 1), rtol=0.02, atol=0.008
-    )
-    torch.testing.assert_close(out[2], mx.repeat(repeats, 1), rtol=1e-4, atol=3e-5)
-    torch.testing.assert_close(out[3], lse.repeat(repeats, 1), rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(kwargs["debug_out"], expected, rtol=0.02, atol=0.008)
+    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         fused_v41(**kwargs)
@@ -2247,9 +2261,13 @@ def test_fp8_decode_large_grid_replay(heads, mode, valid_indices):
         elif torch.all(kwargs["kv_indices_prefix"] == -1):
             kwargs["kv_indices_prefix"].fill_(4)
             kwargs["kv_indices_extend"].fill_(8)
+        if empty:
+            kwargs["kv_indptr_prefix"][1:-1].zero_()
+            kwargs["kv_indptr_extend"][1:-1].zero_()
         refs = tuple(x.clone() for x in fused_v41(**kwargs))
         for _ in range(4):
-            kwargs["workspace"].fill_(torch.nan)
+            if kwargs["workspace"] is not None:
+                kwargs["workspace"].fill_(torch.nan)
             graph.replay()
             for actual, ref in zip(out, refs):
                 torch.testing.assert_close(

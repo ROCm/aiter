@@ -95,7 +95,12 @@ struct FusedNormRopeAttnRopeCastTraits
     }
 };
 
-template <int CacheMode, bool RawQ, bool DirectQ = false, int FixedSplits = 0>
+template <int CacheMode,
+          bool RawQ,
+          bool DirectQ    = false,
+          int FixedSplits = 0,
+          int Heads       = 0,
+          int HeadTile    = 64>
 struct FusedNormRopeAttnRopeCastConfig : FusedNormRopeAttnRopeCastTraits<>
 {
     static_assert(CacheMode >= 0 && CacheMode <= 2);
@@ -103,5 +108,14 @@ struct FusedNormRopeAttnRopeCastConfig : FusedNormRopeAttnRopeCastTraits<>
     static constexpr bool RAW_Q     = RawQ;
     static constexpr bool DIRECT_Q  = DirectQ;
     static constexpr int NUM_SPLITS = FixedSplits;
+    static constexpr int NUM_HEADS  = Heads;
+    static constexpr int HEAD_TILE  = HeadTile;
+    static_assert(HeadTile == 32 || HeadTile == 64);
+    static constexpr int smem_p_bytes = HeadTile * KV_TILE_SIZE * sizeof(D_PV);
+    static constexpr int smem_bytes()
+    {
+        return 2 * smem_kv_bytes + 2 * smem_scale_bytes + smem_v_bytes + smem_p_bytes +
+               smem_fac_bytes;
+    }
     static_assert(!DirectQ || RawQ);
 };

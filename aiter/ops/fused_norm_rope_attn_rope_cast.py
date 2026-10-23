@@ -388,9 +388,19 @@ def fused_norm_rope_attn_rope_cast(
             limit = min(
                 32, max(1, 256 // (t * (h // 64))), max(1, capacity // (t * 256))
             )
-            # H64 large grids favor a single CTA for short lists. H128 still
-            # benefits from the shared-V split pipeline at this list length.
+            # Avoid partial-output traffic on H64 grids that already have
+            # enough independent requests for these short lists.
             if h == 64 and t >= 128 and capacity < t * 1024:
+                limit = 1
+            # The 32-head single path fills a 256-CTA grid for short lists
+            # without partial-output traffic or a separate reduction launch.
+            if (
+                t * (h // 64) == 128
+                and capacity < t * 768
+                and kv_indices_prefix.numel() > 0
+                and kv_indices_extend is not None
+                and kv_indices_extend.numel() > 0
+            ):
                 limit = 1
             while num_splits * 2 <= limit:
                 num_splits *= 2
