@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DeepSeek V4 end-to-end A/B on the MI350P box: aiter main vs main + PR 5670.
+# DeepSeek V4 end-to-end A/B on the MI350P box: aiter main vs main + FlyDSL comm branch.
 # Run on the host.
 #
 #   ./e2e.sh build             # build both images from ./Dockerfile
@@ -28,18 +28,20 @@ MODEL=${MODEL:-deepseek-ai/DeepSeek-V4-Pro-0813}
 HF_HUB=${HF_HUB:-${HF_HOME:-$HOME/.cache/huggingface}/hub}
 CACHE_ROOT=${CACHE_ROOT:-$HOME/.cache/vllm-e2e}
 IMAGE_A=${IMAGE_A:-vllm-aiter-main}   # baseline: aiter main
-IMAGE_B=${IMAGE_B:-vllm-aiter-ar}     # aiter main + PR 5670
+IMAGE_B=${IMAGE_B:-vllm-aiter-ar}     # aiter main + FlyDSL comm branch
 IMAGE_FORK=${IMAGE_FORK:-vllm-aiter-ar-prefill}   # IMAGE_B + the vLLM fork
 # The arms to compare: "tag,image[,VAR=value...]" separated by spaces. Each arm
 # gets its own server; VAR=value overrides the image's environment for that arm.
 # The first arm is the reference the summary's deltas are against. Tags are \w+.
-# Default: the A/B of aiter main vs main + PR 5670. For the 3-way prefill
+# Default: the A/B of aiter main vs main + the FlyDSL comm branch. For the 3-way prefill
 # comparison use ./e2e.sh run3 (see ARMS3).
 ARMS=${ARMS:-"main,$IMAGE_A ar,$IMAGE_B"}
-# Stock vLLM | fork with the stock HIP QuickReduce INT4 kernel | fork with FlyDSL
-# QuickReduce INT4. INT4 is set explicitly on the fork arm so that it is visible
-# here: it is the same quantization in both, only the kernel differs.
-ARMS3=${ARMS3:-"base,$IMAGE_A fork,$IMAGE_FORK,AITER_FLY_AR=0,VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=0,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4,AITER_QUICK_REDUCE_QUANTIZATION=INT4 flyar,$IMAGE_FORK"}
+# base: stock vLLM, no FlyDSL. fork: the vLLM fork with aiter's FlyDSL one-shot and
+# fused AR+RMSNorm but not the FlyDSL QuickReduce. flyqr: fork + FlyDSL QuickReduce
+# INT4. fork and flyqr differ only by VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL. There is
+# no stock-QuickReduce arm: vLLM's HIP QuickReduce is disabled on PCIe-only GPUs
+# above TP2 (it needs xGMI), as on this box.
+ARMS3=${ARMS3:-"base,$IMAGE_A fork,$IMAGE_FORK,VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=0 flyqr,$IMAGE_FORK"}
 # V4-Pro (~830 GiB) fits on 144 GiB GPUs only at TP=8; preflight rejects
 # TPs whose per-GPU weight share does not fit.
 TPS=${TPS:-8}
@@ -80,7 +82,7 @@ stop_server() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 # ---------------------------------------------------------------- build ----
 
 cmd_build() {
-    log "building $IMAGE_B (main + PR 5670)"
+    log "building $IMAGE_B (main + FlyDSL comm branch)"
     docker build -t "$IMAGE_B" -f "$HERE/Dockerfile" "$HERE"
     log "building $IMAGE_A (main only)"
     docker build -t "$IMAGE_A" --build-arg WITH_ALLREDUCE=0 -f "$HERE/Dockerfile" "$HERE"
