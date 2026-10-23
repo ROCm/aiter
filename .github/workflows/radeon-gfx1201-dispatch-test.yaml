@@ -1,0 +1,17 @@
+name: Radeon gfx1201 dispatch test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  gfx1201:
+    runs-on: [self-hosted, linux, devlab-dispatch, gfx1201]
+    steps:
+      - name: Check gfx1201 runner
+        run: |
+          set +e
+          echo "runner=${RUNNER_NAME}"
+          uname -a
+          command -v rocm-smi && rocm-smi
+          command -v rocminfo && rocminfo | grep -m1 gfx
+          ls -l /dev/kfd /dev/dri/render* 2>/dev/null
