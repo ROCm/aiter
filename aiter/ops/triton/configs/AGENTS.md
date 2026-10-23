@@ -27,6 +27,9 @@ rename or tune a config file.
    support it. On RDNA (gfx11xx, gfx120x), it has no effect.
 8. Do not add `.gitkeep` files. Make a `<d_type>/` folder only when you add
    files to it.
+9. Put only config values in the JSON files. Do not add comments or notes,
+   for example `"_comment"` or `"_note"` keys. Put the explanation in the code
+   that reads the config, or in the PR description.
 
 ## Layout
 
@@ -59,7 +62,7 @@ Two config names must not give the same `<d_type>`: `GEMM-FOO-BAR` and
 | Module | Functions |
 | ------ | --------- |
 | `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `select_leq_config` |
-| `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
+| `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `clamp_num_buffers`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` |
 | `utils/conv_config_utils.py` | `get_conv_config` and the shape-key helpers |
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` and the other MHC loaders |

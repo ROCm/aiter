@@ -864,8 +864,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     out_t = mhc_post(None, layer_input, residual, post_mix, comb_mix)
 
     out_h = torch.empty(M, n, C, dtype=dtype, device=layer_input.device)
-    with torch.device(layer_input.device):
-        _aiter.mhc_post(out_h, layer_input, residual, post_mix, comb_mix)
+    _aiter.mhc_post(out_h, layer_input, residual, post_mix, comb_mix)
 
     cfg = f"(M={M}, n={n}, C={C}, dtype={dtype})"
     msg = f"mhc_post Triton vs aiter.mhc_post mismatch at {cfg}"
