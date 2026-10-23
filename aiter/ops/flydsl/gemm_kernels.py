@@ -154,7 +154,8 @@ def flydsl_hgemm(
     Tile arguments left as None are not overridden. On gfx942 they come from
     the shape's tuned-table row (else the cost-model fallback), and the set
     ones are passed as ``user_kwargs`` to its ``gemm_a16w16``. Elsewhere they
-    take ``_HGEMM_DEFAULT_TILE``.
+    take ``_HGEMM_DEFAULT_TILE``. gfx942 has no main-loop unroll variant, so it
+    validates ``policy`` but ignores it.
     """
 
     if policy not in ("ft", "ht", "hti"):

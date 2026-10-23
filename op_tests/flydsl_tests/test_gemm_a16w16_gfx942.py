@@ -514,6 +514,22 @@ def test_gemm_a16w16_gfx942_rejects_transposed_layouts(layout):
         gemm_a16w16(x, w.t(), layout=layout)
 
 
+def test_gemm_a16w16_gfx942_split_k_launch_sequence():
+    """Atomic and workspace split-K launches with one split_k, interleaved on a
+    stream: each keeps its own semaphores, so no launch sees a stale tag."""
+    _require_gfx942()
+    m, n, k = 256, 256, 2048
+    x, w, ref = _inputs(m, n, k)
+    base = {"block_m": 64, "block_n": 64, "block_k": 64, "stages": 2, "split_k": 4}
+    for i in range(3):
+        for reduce in (False, True):
+            y = gemm_a16w16(
+                x, w.t(), layout="nt", user_kwargs={**base, "split_k_reduce": reduce}
+            )
+            torch.cuda.synchronize()
+            _assert_close(y, ref, f"launch {i} split_k_reduce={reduce}")
+
+
 def test_gemm_a16w16_gfx942_split_k_workspace_growth(monkeypatch):
     """Exact first size, at least doubling growth, outgrown buffers kept alive."""
     _require_gfx942()

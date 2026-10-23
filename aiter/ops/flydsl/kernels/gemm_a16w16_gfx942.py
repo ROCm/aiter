@@ -878,6 +878,7 @@ def _store_cshuffle(
     is_split_k,
     is_fp32_output,
     splitk_protocol,
+    expected_signal,
 ):
     """Stage the C tile through LDS for coalesced, boundary-masked stores.
 
@@ -928,7 +929,7 @@ def _store_cshuffle(
                 )
 
         if const_expr(is_split_k and chunk == 0):
-            splitk_protocol.wait_until_initialized()
+            splitk_protocol.wait_until_initialized(expected_signal)
         else:
             gpu.barrier()
 
@@ -1344,8 +1345,11 @@ def gemm_a16w16_gfx942_kernel(
     )
 
     frag_C.fill(0.0)
+    expected_signal = None
     if const_expr(is_split_k):
         splitk_protocol.zero_c()
+        expected_signal = splitk_protocol.take_ticket(split_k)
+        splitk_protocol.publish(expected_signal)
 
     if const_expr(param.pingpong):
         _main_loop_pingpong(state)
@@ -1414,9 +1418,8 @@ def gemm_a16w16_gfx942_kernel(
             is_split_k,
             is_fp32_output,
             splitk_protocol,
+            expected_signal,
         )
-        if const_expr(is_split_k):
-            splitk_protocol.finish_split(split_k)
 
 
 @flyc.jit
@@ -1450,7 +1453,6 @@ def gemm_a16w16_gfx942(
     working_k = (working_k + split_alignment - 1) // split_alignment * split_alignment
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
-    gemm_a16w16_gfx942_kernel._known_block_size = [param.block_threads, 1, 1]
     gemm_a16w16_gfx942_kernel._func.__name__ = make_gemm_a16w16_gfx942_kernel_name(
         param
     )
@@ -1484,14 +1486,17 @@ def _dynamic_tensor_arg(tensor, leading_dim):
 
 
 @functools.lru_cache(maxsize=128)
-def get_split_k_buffers(stream, device):
+def get_split_k_buffers(stream, device, split_k, split_k_reduce):
     """Per-stream split-K tile semaphores and signals, zeroed once.
 
-    Safe to reuse: launches on a stream are ordered and every split-K launch
-    hands its slots back zeroed.
+    Atomic split-K (``SplitKProtocol``) never resets its 64-bit tickets: each
+    launch advances them by split_k, which is how a split derives the launch
+    index, so they are keyed by split_k. The split_k_reduce arrival counters
+    are 32-bit and reset by the last split; they get their own buffers.
     """
+    sem_dtype = torch.int32 if split_k_reduce else torch.int64
     with persistent_alloc(torch.device(device)):
-        semaphore = torch.zeros((SPLIT_K_MAX_TILES,), dtype=torch.int32, device=device)
+        semaphore = torch.zeros((SPLIT_K_MAX_TILES,), dtype=sem_dtype, device=device)
         signal = torch.zeros((SPLIT_K_MAX_TILES,), dtype=torch.int32, device=device)
     return semaphore, signal
 
@@ -1917,7 +1922,7 @@ def gemm_a16w16(
         raise ValueError(error)
     param = make_gemm_a16w16_gfx942_param(**kwargs)
 
-    semaphore, signal = get_split_k_buffers(stream, a.device)
+    semaphore, signal = get_split_k_buffers(stream, a.device, split_k, split_k_reduce)
     if split_k_reduce:
         num_tiles = ((m + param.block_m - 1) // param.block_m) * (
             (n + param.block_n - 1) // param.block_n
