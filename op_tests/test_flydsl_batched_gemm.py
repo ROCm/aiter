@@ -20,8 +20,8 @@ block the arch runs: 1x32 / 32x32 and 1x128 / 128x128 on gfx950, 1x128 /
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
-in the cosine gate. Each a8w8 candidate gets its own weight and reference,
-whose magnitudes change every row for 1x32.
+in the cosine gate. 1x32 gets its own weight and reference, whose magnitudes
+change every row; the other candidates share one.
 
 Shape mapping (V4-Pro, ``config.json``):
   b = n_local_groups = o_groups // tp  (swept via ``-b``)
@@ -208,11 +208,18 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         y_phys = torch.empty(b, m, n, dtype=dtype)
         y_out = y_phys
 
-    candidates, nbytes, refs = {}, {}, {}
+    candidates, nbytes, refs, weights = {}, {}, {}, {}
+
+    def weight(rows):
+        """The weight whose magnitudes change every ``rows`` rows, and its
+        reference."""
+        if rows not in weights:
+            w = blockwise_randn(b, n, k, dtype=dtype, rows=rows)
+            weights[rows] = w, run_torch_wo_a(o_mbn, w, dtype)
+        return weights[rows]
 
     if get_gfx() in A8W4_GFX:
-        w_bnk = blockwise_randn(b, n, k, dtype=dtype)
-        refs["a8w4"] = run_torch_wo_a(o_mbn, w_bnk, dtype)
+        w_bnk, refs["a8w4"] = weight(32)
         # Offline weight prep (not in the hot path); act quant mirrors every forward.
         w_codes, w_scales = preshuffle_a8w4_weight_mbn(w_bnk)
         a_fp8, a_scales = quant_act_mxfp8_mbn(o_mbn)
@@ -243,8 +250,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
     for rows, block in a8w8_blocks:
         name = f"a8w8_{rows}x{block}"
-        w_blk = blockwise_randn(b, n, k, dtype=dtype, rows=min(rows, 32))
-        refs[name] = run_torch_wo_a(o_mbn, w_blk, dtype)
+        w_blk, refs[name] = weight(min(rows, 32))
         x8, xs8 = quant_act_e8m0(o_mbn, block)
         w8, ws8 = quant_weight_e8m0(w_blk, rows, block)
         run = _a8w8_flydsl if rows == 1 else _a8w8

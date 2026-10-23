@@ -36,11 +36,11 @@ from aiter.utility.graph_alloc import persistent_alloc
 
 from .kernels.bmm_a8w8_mxscale_gfx950 import (
     SCALE_BLOCKS,
-    SCALE_GROUP,
     W_SCALE_ROWS,
+    bmm_config_name,
     check_bmm_config,
-    check_xcd_swizzle,
     launch_bmm_a8w8_mxscale,
+    xcd_swizzle_runs,
 )
 from .kernels.kernels_common import ceildiv
 from .kernels.tensor_shim import _compile_and_run, check_e8m0, ptr_arg
@@ -52,14 +52,16 @@ _BMM_KERNEL_NAME_RE = re.compile(
     r"_t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)"
     r"_w(?P<m_warp>\d+)x(?P<n_warp>\d+)_nb(?P<num_buffers>\d+)_sk(?P<splits>\d+)"
     r"(?:_bd(?P<b_ahead>\d+))?(?P<b_nt>_nt)?"
-    r"(?P<xcd_order>_xcd(?P<xcd_swizzle>[2-9]|[1-9]\d+)?)?"
+    r"(?P<xcd_order>_xcd(?P<xcd_swizzle>[1-9]\d*)?)?"
     r"(?P<per_stage>_sps)?$"
 )
 
 
 @functools.cache
 def _launch_config(name: str) -> MappingProxyType | None:
-    """Launch arguments of a kernelName, parsed once per name (read-only)."""
+    """Launch arguments of a kernelName, parsed once per name (read-only), or
+    None if the name breaks a rule of its own (xcd_swizzle_runs). Whether they
+    run at a shape is check_bmm_config's call."""
     match = _BMM_KERNEL_NAME_RE.fullmatch(name)
     if match is None:
         return None
@@ -76,10 +78,7 @@ def _launch_config(name: str) -> MappingProxyType | None:
     cfg["xcd_order"] = xcd_order is not None
     cfg["xcd_swizzle"] = int(xcd_swizzle or 0)
     cfg["scale_preload"] = per_stage is None
-    # Split K ignores the swizzle, so bmm_kernel_name never builds _sk<n>_xcd<g>.
-    try:
-        check_xcd_swizzle(cfg["xcd_swizzle"], cfg["xcd_order"], cfg["splits"])
-    except ValueError:
+    if not xcd_swizzle_runs(cfg["xcd_swizzle"], cfg["xcd_order"], cfg["splits"]):
         return None
     return MappingProxyType(cfg)
 
@@ -91,33 +90,10 @@ def parse_bmm_kernel_name(name: str) -> dict | None:
     return None if cfg is None else dict(cfg)
 
 
-def bmm_kernel_name(
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    m_warp: int,
-    n_warp: int,
-    num_buffers: int,
-    splits: int = 1,
-    b_direct: bool = False,
-    xcd_order: bool = False,
-    b_ahead: int = 1,
-    scale_preload: bool = True,
-    b_nt: bool = False,
-    xcd_swizzle: int = 0,
-) -> str:
-    """Canonical tuned-CSV name of a config. ``_bd<n>`` marks B read straight
-    into registers ``n`` K tiles ahead, ``_nt`` B loaded non-temporal,
-    ``_xcd<g>`` the XCD tile order with an xcd_swizzle of ``g``,
-    ``_sps`` scales loaded per stage instead of preloaded."""
-    check_xcd_swizzle(xcd_swizzle, xcd_order, splits)
-    return (
-        f"{BMM_MFMA_NAME_PREFIX}_t{tile_m}x{tile_n}x{tile_k}"
-        f"_w{m_warp}x{n_warp}_nb{num_buffers}_sk{splits}"
-        f"{f'_bd{b_ahead}' if b_direct else ''}{'_nt' if b_nt else ''}"
-        f"{'_xcd' if xcd_order else ''}{xcd_swizzle or ''}"
-        f"{'' if scale_preload else '_sps'}"
-    )
+def bmm_kernel_name(**cfg) -> str:
+    """Canonical tuned-CSV name of a config's launch arguments (see
+    bmm_config_name)."""
+    return BMM_MFMA_NAME_PREFIX + bmm_config_name(**cfg)
 
 
 # Shapes without a tuned row, by the largest M a tier serves: small M streams
@@ -133,6 +109,7 @@ _FALLBACK = [
     (2048, (128, 128, 128, 2, 2, 2), False),
     (float("inf"), (256, 256, 128, 1, 4, 2), True),
 ]
+_SPLITS = (1, 2, 4, 8, 16)
 
 
 def _runs(b: int, n: int, k: int, scale_args: dict, cfg: dict) -> bool:
@@ -170,9 +147,7 @@ def _max_split(cfg: dict, tiles: int, runs) -> int:
     flight and that cfg runs at, or 0. More splits only shrink a preloaded
     scale panel, so a config too big for LDS whole may fit split."""
     splits = (
-        [1]
-        if cfg["b_direct"]
-        else [s for s in (1, 2, 4, 8, 16) if s == 1 or tiles * s <= 256]
+        [1] if cfg["b_direct"] else [s for s in _SPLITS if s == 1 or tiles * s <= 256]
     )
     return max((s for s in splits if runs({**cfg, "splits": s})), default=0)
 
@@ -217,6 +192,32 @@ def pick_bmm_kernel_name(
         xcd["xcd_swizzle"] = 4
     xcd = xcd if cfg["b_direct"] and runs({**cfg, **xcd}) else {}
     return bmm_kernel_name(**cfg, splits=splits, **xcd)
+
+
+def bmm_candidate_names(
+    b: int, m: int, n: int, k: int, seeds=(), **scale_args
+) -> list[str]:
+    """kernelNames a tuner times for a shape: ``seeds`` (tuned names of nearby
+    M), the heuristic pick, and their K splits from half to double that run
+    it. ``scale_args`` are check_bmm_config's. Split K keeps its own tile
+    order, so a split variant drops the seed's xcd_order and xcd_swizzle (a
+    split ``_xcd`` name runs the same kernel as the plain one)."""
+    runs = functools.partial(_runs, b, n, k, scale_args)
+    names = set(seeds)
+    try:
+        names.add(pick_bmm_kernel_name(b, m, n, k, **scale_args))
+    except ValueError:
+        pass
+    out = set()
+    for cfg in filter(None, map(parse_bmm_kernel_name, names)):
+        base = cfg["splits"]
+        for splits in {base, *(s for s in _SPLITS if base / 2 <= s <= base * 2)}:
+            variant = {**cfg, "splits": splits}
+            if splits > 1:
+                variant.update(xcd_order=False, xcd_swizzle=0)
+            if runs(variant):
+                out.add(bmm_kernel_name(**variant))
+    return sorted(out)
 
 
 def _x_scale_column_major(m: int, x_scale_transposed: bool) -> bool:
@@ -302,25 +303,18 @@ def compile_bmm_a8w8_mxfp8_gfx950(
     b: int,
     n: int,
     k: int,
-    scale_block: int,
+    x_scale_k: int,
+    w_scale_n: int,
+    w_scale_k: int,
     x_scale_transposed: bool = False,
-    w_scale_n: int | None = None,
 ) -> None:
-    """Compile ``kernel_name`` for ``[B, N, K]`` with ``scale_block``-wide
-    e8m0 blocks: 1 x block for x_scale (column-major if x_scale_transposed),
-    w_scale_n x block for w_scale (square unless w_scale_n is given, 1 for a
-    scale per B row), as run_bmm_a8w8_mxfp8_gfx950 would launch it. M is a
+    """Compile ``kernel_name`` for ``[B, N, K]`` with 1 x x_scale_k x_scale
+    blocks (column-major if x_scale_transposed) and w_scale_n x w_scale_k
+    w_scale blocks, as run_bmm_a8w8_mxfp8_gfx950 would launch it. M is a
     runtime argument, so this serves every M. Call it under
     ``aiter.aot.flydsl.common.compile_only_env``."""
     constexprs = _constexprs(
-        kernel_name,
-        n,
-        k,
-        b,
-        scale_block,
-        w_scale_n or scale_block,
-        scale_block,
-        x_scale_transposed,
+        kernel_name, n, k, b, x_scale_k, w_scale_n, w_scale_k, x_scale_transposed
     )
     placeholder = torch.empty(0, dtype=torch.uint8)
     _launch((placeholder,) * 7, 1, fx.Stream(0), constexprs)
@@ -383,11 +377,6 @@ def run_bmm_a8w8_mxfp8_gfx950(
         _scale_block(k, w_scale.shape[2], "w_scale K"),
         _x_scale_column_major(m, x_scale_transposed),
     )
-    if scale_args[1] == 1 and scale_args[2] != SCALE_GROUP:
-        raise RuntimeError(
-            f"[FlyDSL gfx950 bmm] a 1-row w_scale must be 1x{SCALE_GROUP} blocks, "
-            f"got 1x{scale_args[2]}"
-        )
     if m == 0:
         return Out
 
@@ -414,6 +403,7 @@ def run_bmm_a8w8_mxfp8_gfx950(
 
 
 __all__ = [
+    "bmm_candidate_names",
     "bmm_kernel_name",
     "compile_bmm_a8w8_mxfp8_gfx950",
     "parse_bmm_kernel_name",

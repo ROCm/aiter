@@ -78,6 +78,7 @@ def _lds_layout(
     num_buffers,
     threads,
     K,
+    k_span,
     splits,
     b_direct,
     x_scale_k,
@@ -86,15 +87,15 @@ def _lds_layout(
     scale_preload,
     x_scale_transposed,
 ):
-    """Stages, then the scale panels of one split's K range when preloaded;
-    per-stage panels (one K tile of scales) follow each stage's B instead. The
-    epilogue reuses the arena for C, c_rows rows at a time; with split K, the
-    flag takes 16 bytes at flag_off, past both."""
+    """Stages, then the scale panels of one split's K range (k_span) when
+    preloaded; per-stage panels (one K tile of scales) follow each stage's B
+    instead. The epilogue reuses the arena for C, c_rows rows at a time; with
+    split K, the flag takes 16 bytes at flag_off, past both."""
     panel_a, panel_b = _scale_panels(
         tile_m,
         tile_n,
         K,
-        _padded_k(K) // splits if scale_preload else tile_k,
+        k_span if scale_preload else tile_k,
         threads,
         x_scale_k,
         w_scale_n,
@@ -136,14 +137,39 @@ def _padded_k(K):
     return ceildiv(K, MFMA_K) * MFMA_K
 
 
-def check_xcd_swizzle(xcd_swizzle, xcd_order, splits=1):
-    """Raise ValueError unless xcd_swizzle is 0 or groups 2+ M tiles of the
-    xcd_order run. Split K keeps its own tile order and would ignore it."""
-    if xcd_swizzle and (xcd_swizzle < 2 or not xcd_order or splits > 1):
-        raise ValueError(
-            f"[FlyDSL gfx950] xcd_swizzle={xcd_swizzle} needs xcd_order, no "
-            f"split K and a group of 2+ M tiles"
-        )
+def bmm_config_name(
+    tile_m,
+    tile_n,
+    tile_k,
+    m_warp,
+    n_warp,
+    num_buffers,
+    splits=1,
+    b_direct=False,
+    xcd_order=False,
+    b_ahead=1,
+    scale_preload=True,
+    b_nt=False,
+    xcd_swizzle=0,
+):
+    """The tile, waves, stages and K split of a config, then its options:
+    ``_bd<n>`` B read straight into registers ``n`` K tiles ahead, ``_nt`` B
+    loaded non-temporal, ``_xcd<g>`` the XCD tile order with an xcd_swizzle of
+    ``g``, ``_sps`` scales loaded per stage instead of preloaded."""
+    xcd = f"_xcd{xcd_swizzle or ''}" if xcd_order else ""
+    return (
+        f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}_nb{num_buffers}"
+        f"_sk{splits}{f'_bd{b_ahead}' if b_direct else ''}{'_nt' if b_nt else ''}"
+        f"{xcd}{'' if scale_preload else '_sps'}"
+    )
+
+
+def xcd_swizzle_runs(xcd_swizzle, xcd_order, splits):
+    """Whether an xcd_swizzle runs: none, or a group of 2+ M tiles of the
+    xcd_order run without split K, which keeps its own tile order (a tuner
+    moving a config to split K drops the swizzle, see bmm_candidate_names).
+    It depends on the name alone, so the name parser rejects it too."""
+    return not xcd_swizzle or (xcd_swizzle >= 2 and xcd_order and splits == 1)
 
 
 def check_bmm_config(
@@ -169,8 +195,9 @@ def check_bmm_config(
     xcd_swizzle=0,
 ):
     """Raise ValueError unless launch_bmm_a8w8_mxscale can run this config on
-    an [*, N, K] x batch problem. Tuners and heuristics call it to rule configs
-    out up front; the launcher calls it before building the kernel."""
+    an [*, N, K] x batch problem, else return its LDS layout. Tuners and
+    heuristics call it to rule configs out up front; the launcher calls it
+    before building the kernel."""
     k_span = _padded_k(K) // splits
     threads = m_warp * n_warp * WAVE
     layout = _lds_layout(
@@ -180,6 +207,7 @@ def check_bmm_config(
         num_buffers,
         threads,
         K,
+        k_span,
         splits,
         b_direct,
         x_scale_k,
@@ -232,13 +260,18 @@ def check_bmm_config(
         raise ValueError(
             "[FlyDSL gfx950] a column-major x_scale is 1x128 blocks at batch 1"
         )
-    check_xcd_swizzle(xcd_swizzle, xcd_order, splits)
+    if not xcd_swizzle_runs(xcd_swizzle, xcd_order, splits):
+        raise ValueError(
+            f"[FlyDSL gfx950] xcd_swizzle={xcd_swizzle} needs xcd_order, no "
+            f"split K and a group of 2+ M tiles"
+        )
     if b_direct and not 1 <= b_ahead <= num_buffers - 1:
         raise ValueError("[FlyDSL gfx950] b_ahead must be in [1, num_buffers - 1]")
     if layout.stage_a % (threads * 16) or layout.stage_b % (threads * 16):
         raise ValueError("[FlyDSL gfx950] A/B stages must split evenly over threads")
     if layout.arena > _LDS_BYTES:
         raise ValueError(f"[FlyDSL gfx950] LDS overflow: {layout.arena} > {_LDS_BYTES}")
+    return layout
 
 
 def _byte_slots(row_bytes, cols):
@@ -346,43 +379,28 @@ def launch_bmm_a8w8_mxscale(
     n_rep = warp_tile_n // MFMA_N
     threads = m_warp * n_warp * WAVE
     scale_span = k_span if scale_preload else tile_k  # the K a scale panel covers
-    check_bmm_config(
-        N,
-        K,
-        batch,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        num_buffers,
-        splits,
-        b_direct,
-        xcd_order,
-        b_ahead,
-        x_scale_k,
-        w_scale_n,
-        w_scale_k,
-        scale_preload,
-        b_nt,
-        x_scale_transposed,
-        xcd_swizzle,
-    )
     stage_a, stage_b, pitch, panel_a, panel_b, off_pa, c_rows, flag_off, arena = (
-        _lds_layout(
+        check_bmm_config(
+            N,
+            K,
+            batch,
             tile_m,
             tile_n,
             tile_k,
+            m_warp,
+            n_warp,
             num_buffers,
-            threads,
-            K,
             splits,
             b_direct,
+            xcd_order,
+            b_ahead,
             x_scale_k,
             w_scale_n,
             w_scale_k,
             scale_preload,
+            b_nt,
             x_scale_transposed,
+            xcd_swizzle,
         )
     )
     x_cols = scale_span // x_scale_k  # A scales per panel row
@@ -404,13 +422,23 @@ def launch_bmm_a8w8_mxscale(
     lda_scale = batch * K // x_scale_k
     ldc = batch * N
 
+    config = bmm_config_name(
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        num_buffers,
+        splits,
+        b_direct,
+        xcd_order,
+        b_ahead,
+        scale_preload,
+        b_nt,
+        xcd_swizzle,
+    )
     kernel_name = format_kernel_name(
-        f"bmm_a8w8_mxscale_t{tile_m}x{tile_n}x{tile_k}"
-        f"_w{m_warp}x{n_warp}_nb{num_buffers}_sk{splits}_b{batch}"
-        f"_s{x_scale_k}_{w_scale_n}x{w_scale_k}"
-        f"{f'_bd{b_ahead}' if b_direct else ''}{'_nt' if b_nt else ''}"
-        f"{'_xcd' if xcd_order else ''}{xcd_swizzle or ''}"
-        f"{'' if scale_preload else '_sps'}"
+        f"bmm_a8w8_mxscale{config}_b{batch}_s{x_scale_k}_{w_scale_n}x{w_scale_k}"
         f"{'_xt' if x_scale_transposed else ''}"
     )
 
@@ -922,37 +950,28 @@ def launch_bmm_a8w8_mxscale(
                             )
                             for mi in range_constexpr(m_rep)
                         ]
-                    if const_expr(w_scale_n == 1):
-                        # A panel row per B row, read like A's: lane16 is the
-                        # MFMA's N column.
-                        sb = [
-                            load_scale(
-                                scale_base + off_pb,
-                                wnb + lane16,
-                                w_cols,
-                                w_slots,
-                                w_col,
-                                ni * MFMA_N,
-                            )
-                            for ni in range_constexpr(n_rep)
-                        ]
-                    else:
-                        # A tile narrower than a scale block sits inside one
-                        # panel row.
-                        sb = [
-                            load_scale(
-                                scale_base + off_pb,
-                                (
+                    # A 1-row w_scale has a panel row per B row, read like A's:
+                    # lane16 is the MFMA's N column. Otherwise a tile narrower
+                    # than a scale block sits inside one panel row.
+                    sb = [
+                        load_scale(
+                            scale_base + off_pb,
+                            (
+                                wnb + lane16
+                                if w_scale_n == 1
+                                else (
                                     (wnb + ni * MFMA_N) // w_scale_n
                                     if tile_n >= w_scale_n
                                     else 0
-                                ),
-                                w_cols,
-                                w_slots,
-                                w_col,
-                            )
-                            for ni in range_constexpr(n_rep)
-                        ]
+                                )
+                            ),
+                            w_cols,
+                            w_slots,
+                            w_col,
+                            ni * MFMA_N if w_scale_n == 1 else 0,
+                        )
+                        for ni in range_constexpr(n_rep)
+                    ]
                     # Prefetched A scales: a column-major x_scale's last column.
                     if const_expr(last and tail_sa is not None):
                         sa = (
