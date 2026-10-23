@@ -6,7 +6,6 @@ import triton
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
-    _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_splitk_kernel,
     _batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel,
     _get_config,
 )
@@ -198,12 +197,14 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             * triton.cdiv(M, config["BLOCK_SIZE_M"])
             * triton.cdiv(N, config["BLOCK_SIZE_N"]),
         )
-        _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_splitk_kernel[
+        _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel[
             grid_splitk
         ](
             X,
             WQ,
             y_pp,
+            w_scale,
+            bias,
             M,
             N,
             K,
@@ -213,10 +214,12 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             WQ.stride(0),
             WQ.stride(1),
             WQ.stride(2),
-            y_pp.stride(0),
             y_pp.stride(2),
             y_pp.stride(1),
             y_pp.stride(3),
+            y_pp.stride(0),
+            0,
+            has_bias,
             DTYPE_MAX=DTYPE_MAX,
             DTYPE_MIN=-DTYPE_MAX,
             BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
@@ -238,7 +241,6 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             y_pp,
             YQ,
             y_scale,
-            w_scale,
             M,
             B * N,
             y_pp.stride(0),
@@ -250,7 +252,9 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             DTYPE_MAX=Y_DTYPE_MAX,
             DTYPE_MIN=-Y_DTYPE_MAX,
             BLOCK_SIZE_M=config["REDUCE_BLOCK_SIZE_M"],
-            BLOCK_SIZE_N=triton.next_power_of_2(B * N),
+            BLOCK_SIZE_N=min(
+                triton.next_power_of_2(B * N), config["REDUCE_BLOCK_SIZE_N"]
+            ),
             NUM_KSPLIT=num_ksplit,
             num_warps=config["REDUCE_num_warps"],
         )
@@ -277,10 +281,13 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         YQ.stride(0) if not transpose_bm else YQ.stride(1),
         YQ.stride(1) if not transpose_bm else YQ.stride(0),
         YQ.stride(2),
+        0,
         bias.stride(0) if has_bias else 0,
         has_bias,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
+        NUM_KSPLIT=1,
+        SPLITK_BLOCK_SIZE=triton.cdiv(K, group_size) * group_size,
         **config,
     )
 
