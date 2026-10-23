@@ -5,6 +5,7 @@ import contextlib
 
 import pytest
 import torch
+import triton
 
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
@@ -456,3 +457,38 @@ def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
     assert not torch.isnan(out_graph).any(), "Graph replay produced NaN"
     diff = (out_eager - out_graph).abs().max().item()
     assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
+
+
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_dao_ai_varlen_max_seqlen_no_recompile(dao_ai_impl, monkeypatch, CAUSAL):
+    """A new max sequence length in a varlen batch must not compile a new kernel."""
+    compiled = []
+    monkeypatch.setattr(
+        triton.knobs.runtime,
+        "jit_post_compile_hook",
+        lambda *, fn, **kwargs: compiled.append(fn.name),
+    )
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads, d = 4, 64
+    torch.manual_seed(0)
+    new_compiles = []
+    # The total lengths are not multiples of 16. Thus only the max length changes
+    # between the batches, not the divisibility specialization of the strides.
+    for seqlens in ([96, 200], [300, 130], [57, 515], [1024, 33]):
+        cu_seqlens = torch.tensor(
+            [0, seqlens[0], sum(seqlens)], device=device, dtype=torch.int32
+        )
+        q, k, v = (
+            torch.randn(sum(seqlens), nheads, d, device=device, dtype=dtype)
+            for _ in range(3)
+        )
+        compiled.clear()
+        flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens), causal=CAUSAL
+        )
+        torch.cuda.synchronize()
+        new_compiles.append(compiled.count("attn_fwd"))
+    assert not any(
+        new_compiles[1:]
+    ), f"attn_fwd compiled for new max_seqlen values: {new_compiles}"
