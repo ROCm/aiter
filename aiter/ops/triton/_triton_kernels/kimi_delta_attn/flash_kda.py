@@ -789,18 +789,35 @@ def _log_route(k1_gluon: bool, k2_gluon: bool, C: int, K: int, V: int) -> None:
     )
 
 
+# The gfx1250 K1's layouts are built for four warps. waves_per_eu=0 leaves the
+# occupancy to the compiler.
+_K1_GLUON_FALLBACK = triton.Config({"waves_per_eu": 0}, num_warps=4)
+
+
+@functools.cache
+def _k1_gluon_schedule() -> tuple[int, int]:
+    """``(num_warps, waves_per_eu)`` for the gfx1250 Gluon K1."""
+    cfg = chunk_delta_attn_tuned_config(
+        "k1_prepare_gluon", _K1_GLUON_FALLBACK, backend="gluon"
+    )
+    return cfg.num_warps, cfg.kwargs["waves_per_eu"]
+
+
 # BW=64 at four warps is the narrowest tile that the gfx950 and gfx1250 kernels
-# both accept. With a zero floor, a device with no published table takes this
-# schedule in the wide branch.
-_K2_GLUON_FALLBACK = triton.Config({"BW": 64, "MIN_BLOCKS_PER_CU": 0}, num_warps=4)
+# both accept; only the gfx1250 kernels read CPL. With a zero floor, a device
+# with no published table takes this schedule in the wide branch.
+_K2_GLUON_FALLBACK = triton.Config(
+    {"BW": 64, "CPL": 2, "MIN_BLOCKS_PER_CU": 0}, num_warps=4
+)
 
 
 @functools.cache
 def _k2_gluon_schedule(
     W: int, num_segs: int, H: int, kernel: str = "k2_ab_fused_gluon"
-) -> tuple[int, int]:
-    """``(BW, num_warps)`` for the Gluon K2 pass ``kernel``, which does not
-    autotune. The wide tile is taken while the grid stays above the published
+) -> triton.Config:
+    """The schedule of the Gluon K2 pass ``kernel``, which does not autotune:
+    ``BW``, ``num_warps`` and, on gfx1250, ``CPL``, the chunks per TDM load.
+    The wide tile is taken while the grid stays above the published
     blocks-per-CU floor."""
     wide = chunk_delta_attn_tuned_config(
         f"{kernel}_wide", _K2_GLUON_FALLBACK, backend="gluon"
@@ -808,11 +825,10 @@ def _k2_gluon_schedule(
     bw = wide.kwargs["BW"]
     blocks = (W // bw) * num_segs * H
     if W % bw == 0 and blocks >= wide.kwargs["MIN_BLOCKS_PER_CU"] * _num_cus():
-        return bw, wide.num_warps
-    narrow = chunk_delta_attn_tuned_config(
+        return wide
+    return chunk_delta_attn_tuned_config(
         f"{kernel}_narrow", _K2_GLUON_FALLBACK, backend="gluon"
     )
-    return narrow.kwargs["BW"], narrow.num_warps
 
 
 @functools.cache
@@ -1144,17 +1160,20 @@ def flash_kda_fwd(
                 gluon_k1_prepare,
             )
 
-            k1_strides = {
+            k1_warps, k1_waves = _k1_gluon_schedule()
+            k1_args = {
                 "stride_q": stride_q,
                 "stride_k": stride_k,
                 "stride_g": stride_g,
+                "num_warps": k1_warps,
+                "waves_per_eu": k1_waves,
             }
         else:
             from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.flash_kda_k1 import (
                 gluon_k1_prepare,
             )
 
-            k1_strides = {}
+            k1_args = {}
 
         gluon_k1_prepare(
             q=q,
@@ -1182,7 +1201,7 @@ def flash_kda_fwd(
             B=B,
             CM_WS=CM_STORE,
             CM_LOAD=CM_LOAD,
-            **k1_strides,
+            **k1_args,
         )
     else:
         _prepare_fast[(total_tiles if cu_seqlens is not None else NT, B * H)](
@@ -1302,7 +1321,7 @@ def flash_kda_fwd(
         b_seg = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
         A_seg = torch.empty(num_segs, H, K, K, dtype=torch.bfloat16, device=dev)
         if use_gluon_k2a and DEVICE_ARCH == "gfx1250":
-            bw, nw = _k2_gluon_schedule(V, num_segs, H)
+            sched = _k2_gluon_schedule(V, num_segs, H)
             _g2.gluon_k2_ab_fused(
                 ws_kd=ws_kd,
                 ws_kr=ws_kr,
@@ -1323,11 +1342,13 @@ def flash_kda_fwd(
                 V=V,
                 C=C,
                 num_segs=num_segs,
-                BW=bw,
-                num_warps=nw,
+                BW=sched.kwargs["BW"],
+                CPL=sched.kwargs["CPL"],
+                num_warps=sched.num_warps,
             )
         elif use_gluon_k2a:
-            bw, nw = _k2_gluon_schedule(V, num_segs, H)
+            sched = _k2_gluon_schedule(V, num_segs, H)
+            bw, nw = sched.kwargs["BW"], sched.num_warps
             _g2.k2_ab_fused_fast[(triton.cdiv(V, bw), num_segs * H)](
                 ws_kd=ws_kd,
                 ws_kr=ws_kr,
@@ -1391,7 +1412,7 @@ def flash_kda_fwd(
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
     if use_gluon_k2c:
-        bw, nw = _k2_gluon_schedule(V, num_segs, H, "k2_c_gluon")
+        sched = _k2_gluon_schedule(V, num_segs, H, "k2_c_gluon")
         _g2.gluon_k2_c(
             ws_kd=ws_kd,
             ws_qd=ws_qd,
@@ -1417,8 +1438,9 @@ def flash_kda_fwd(
             V=V,
             C=C,
             num_segs=num_segs,
-            BW=bw,
-            num_warps=nw,
+            BW=sched.kwargs["BW"],
+            CPL=sched.kwargs["CPL"],
+            num_warps=sched.num_warps,
             STORE_FINAL=store_final,
             STATE_V_FIRST=state_v_first,
             CM_OUT=CM_OUT_STORE,

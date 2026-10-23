@@ -433,7 +433,8 @@ def test_published_k2_schedules_can_split_their_tile():
         for W in (64, 128, 256):
             for num_segs in (1, 2, 8, 64, 512):
                 for H in (1, 4, 12, 64):
-                    reached.add(_flash_kda._k2_gluon_schedule(W, num_segs, H, kernel))
+                    sched = _flash_kda._k2_gluon_schedule(W, num_segs, H, kernel)
+                    reached.add((sched.kwargs["BW"], sched.num_warps))
         assert len(reached) > 1, f"{kernel}: only one schedule reachable: {reached}"
         for bw, nw in sorted(reached):
             assert bw % 16 == 0, f"{kernel}: BW={bw} is not a whole number of tiles"

@@ -6,15 +6,12 @@ import functools
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.common.utils import fast_sigmoid
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
-# Chunks per TDM load.
-_CPL = 2
-
-_LOG2E = gl.constexpr(1.4426950408889634)
 _SH_1D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
 
 
@@ -34,13 +31,6 @@ def build_layouts(num_warps):
             instr_shape=[16, 16, 32],
         ),
     }
-
-
-@gluon.jit
-def _sigmoid(x):
-    return gl.extra.libdevice.fast_dividef(
-        1.0, 1.0 + gl.exp2(x.to(gl.float32) * -_LOG2E)
-    )
 
 
 @gluon.jit
@@ -128,7 +118,7 @@ def _load_beta(p_beta, j0, n_tok, H: gl.constexpr, C: gl.constexpr, CPL: gl.cons
 def _store_beta(s_beta, beta, j0, n_tok, C: gl.constexpr, CPL: gl.constexpr):
     """sigmoid(beta) of chunks j0 .. j0 + CPL - 1, and 0 past the end."""
     _, m = _beta_mask(j0, n_tok, C, CPL)
-    s_beta.store(gl.where(m, _sigmoid(beta), 0.0))
+    s_beta.store(gl.where(m, fast_sigmoid(beta), 0.0))
 
 
 @gluon.jit
@@ -312,7 +302,8 @@ def k2_ab_fused_gluon(
     NUM_XCDS: gl.constexpr,
 ):
     """Pass A: b_seg [K, V] and A_seg [K, K], K-first, for one segment, head
-    and BW-column block. The state is kept transposed, as h^T [BW, K]."""
+    and BW-column block. The state is kept transposed, as h^T [BW, K]. CPL is
+    the number of chunks in one TDM load."""
     NW: gl.constexpr = gl.num_warps()
     gl.static_assert(NW == 4 or NW == 8)
     gl.static_assert(C == 32 and K == 128 and V == K)
@@ -486,7 +477,8 @@ def k2_c_gluon(
     NUM_XCDS: gl.constexpr,
     CM_OUT: gl.constexpr = "",
 ):
-    """Pass C: the output of one segment, head and BW-column block."""
+    """Pass C: the output of one segment, head and BW-column block. CPL is the
+    number of chunks in one TDM load."""
     NW: gl.constexpr = gl.num_warps()
     gl.static_assert(NW == 4 or NW == 8)
     gl.static_assert(C == 32 and K == 128 and V == K)
@@ -665,6 +657,7 @@ def gluon_k2_ab_fused(
     C,
     num_segs,
     BW,
+    CPL,
     num_warps,
 ):
     return k2_ab_fused_fast[(V // BW, num_segs * H)](
@@ -687,7 +680,7 @@ def gluon_k2_ab_fused(
         V=V,
         C=C,
         BW=BW,
-        CPL=_CPL,
+        CPL=CPL,
         MMA=build_layouts(num_warps)["MMA"],
         NUM_XCDS=get_num_xcds(),
         num_warps=num_warps,
@@ -723,6 +716,7 @@ def gluon_k2_c(
     C,
     num_segs,
     BW,
+    CPL,
     num_warps,
     STORE_FINAL,
     STATE_V_FIRST,
@@ -757,7 +751,7 @@ def gluon_k2_c(
         V=V,
         C=C,
         BW=BW,
-        CPL=_CPL,
+        CPL=CPL,
         HAS_H_IN=h_in is not None,
         STORE_FINAL=STORE_FINAL,
         STATE_V_FIRST=STATE_V_FIRST,

@@ -4,11 +4,14 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.common.utils import (
+    fast_sigmoid,
+    l2norm,
+    sigmoid_log2,
+    sum_combine,
+)
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-_NUM_WARPS = 4
-_WAVES_PER_EU = 5
 
 # [C, K] tiles: warps split the rows, so the l2norm row sums stay within a warp.
 _BLK_CK: gl.constexpr = gl.BlockedLayout([1, 8], [2, 16], [4, 1], [1, 0])
@@ -40,33 +43,6 @@ _SH_ROWS: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
 _SH_VEC: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
 
 _LOG2E = gl.constexpr(1.4426950408889634)
-
-
-@gluon.jit
-def _add(a, b):
-    return a + b
-
-
-@gluon.jit
-def _exp2(x):
-    return gl.exp2(x.to(gl.float32))
-
-
-@gluon.jit
-def _sigmoid_log2(z):
-    """sigmoid(x) given ``z = -x * log2(e)``."""
-    return gl.extra.libdevice.fast_dividef(1.0, 1.0 + gl.exp2(z))
-
-
-@gluon.jit
-def _sigmoid(x):
-    return _sigmoid_log2(x.to(gl.float32) * -_LOG2E)
-
-
-@gluon.jit
-def _l2norm(x):
-    f = x.to(gl.float32)
-    return f * gl.rsqrt(gl.sum(f * f, axis=1) + 1e-6)[:, None]
 
 
 @gluon.jit
@@ -176,7 +152,7 @@ def k1_prepare_gluon(
         )
     o_i_r = gl.arange(0, C, layout=gl.SliceLayout(1, _MMA_B16))
     o_i_c = gl.arange(0, C, layout=gl.SliceLayout(0, _MMA_B16))
-    b_beta = _sigmoid(
+    b_beta = fast_sigmoid(
         gl.amd.gfx1250.buffer_load(
             ptr=beta_raw + tok * H + i_h,
             offsets=o_i_r * H,
@@ -198,10 +174,10 @@ def k1_prepare_gluon(
     # the last valid row. Rows C - 1 and C / 2 give the last and pivot values.
     b_gate = gl.where(
         o_c_col[:, None] < actual_len,
-        (lower_bound * _LOG2E) * _sigmoid_log2(b_z),
+        (lower_bound * _LOG2E) * sigmoid_log2(b_z),
         0.0,
     )
-    b_gcum_col = gl.associative_scan(b_gate, 0, _add)
+    b_gcum_col = gl.associative_scan(b_gate, 0, sum_combine)
     b_g_last_col = gl.sum(gl.where(o_c_col[:, None] == C - 1, b_gcum_col, 0.0), axis=0)
     b_gp_col = gl.sum(gl.where(o_c_col[:, None] == C // 2, b_gcum_col, 0.0), axis=0)
     s_gcum = gl.allocate_shared_memory(gl.float32, [C, K], _SH_ROWS, b_gcum_col)
@@ -210,13 +186,13 @@ def k1_prepare_gluon(
     b_gcum = s_gcum.load(_BLK_CK)
     b_g_last = s_g_last.load(gl.SliceLayout(0, _BLK_CK))
     b_gp = s_gp.load(gl.SliceLayout(0, _BLK_CK))
-    b_g_total = _exp2(b_g_last_col)
-    b_exp_g = _exp2(b_gcum)
+    b_g_total = gl.exp2(b_g_last_col)
+    b_exp_g = gl.exp2(b_gcum)
 
     # Tail rows of q and k load as 0 and all factors below are finite, so the
     # tail rows store as 0 without a mask.
-    b_q = _l2norm(b_q_raw)
-    b_k = _l2norm(b_k_raw)
+    b_q = l2norm(b_q_raw)
+    b_k = l2norm(b_k_raw)
 
     ws_idx = i_h * TOTAL_TILES + g_tile
     # The tile start goes in the 64-bit base: buffer offsets are 32-bit.
@@ -232,7 +208,7 @@ def k1_prepare_gluon(
         cache=CM_WS,
     )
     gl.amd.gfx1250.buffer_store(
-        (b_k * _exp2(b_g_last[None, :] - b_gcum)).to(ws_kr.dtype.element_ty),
+        (b_k * gl.exp2(b_g_last[None, :] - b_gcum)).to(ws_kr.dtype.element_ty),
         ws_kr + ws_ck,
         ck_off,
         cache=CM_WS,
@@ -245,8 +221,8 @@ def k1_prepare_gluon(
     )
 
     b_gm = b_gcum - b_gp[None, :]
-    b_dec = _exp2(b_gm)
-    b_inc = _exp2(-b_gm)
+    b_dec = gl.exp2(b_gm)
+    b_inc = gl.exp2(-b_gm)
     # All three operands go to LDS before any is read back: one barrier for all.
     s_kinv = gl.allocate_shared_memory(
         gl.bfloat16, [C, K], _SH_CK, (b_k * b_inc).to(gl.bfloat16)
@@ -371,6 +347,8 @@ def gluon_k1_prepare(
     C,
     BC,
     B,
+    num_warps,
+    waves_per_eu,
     CM_WS="",
     CM_LOAD="",
 ):
@@ -404,6 +382,6 @@ def gluon_k1_prepare(
         HAS_BIAS=dt_bias is not None,
         CM_WS=CM_WS,
         CM_LOAD=CM_LOAD,
-        num_warps=_NUM_WARPS,
-        waves_per_eu=_WAVES_PER_EU,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )
