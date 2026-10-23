@@ -630,6 +630,54 @@ def check_long_k_kids():
     return checked
 
 
+# --- compact tiles with a row-major B ---------------------------------------
+# Both A layouts a tuned row has to serve: token-major, as the tuner and the
+# DSV4 call hand it over, and the batch-major memory of a transposed [G, M, *]
+# view with a batch-major output. M=300 leaves a tail on every tile; K=4352
+# runs one full 4096 segment and a partial one.
+_COMPACT_ROW_B_KIDS = tuple(range(8461, 8470))
+_COMPACT_ROW_B_SHAPES = ((2, 300, 1024, 4096), (1, 64, 256, 4352))
+
+
+def check_compact_row_b_kids():
+    """Check the row-major compact twins against a dequantized reference."""
+    failures = []
+    checked = 0
+    for g, m, n, k in _COMPACT_ROW_B_SHAPES:
+        O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
+        W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
+        ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
+        layouts = {
+            "token-major": (
+                O_mx.transpose(0, 1).contiguous(),
+                xs_mx.transpose(0, 1).contiguous(),
+                lambda: torch.full((m, g, n), float("nan"), dtype=dtypes.bf16),
+            ),
+            "batch-major": (
+                O_mx.transpose(0, 1),
+                xs_mx.transpose(0, 1),
+                lambda: torch.full(
+                    (g, m, n), float("nan"), dtype=dtypes.bf16
+                ).transpose(0, 1),
+            ),
+        }
+        for kid in _COMPACT_ROW_B_KIDS:
+            for layout, (A, A_scale, make_out) in layouts.items():
+                out = make_out()
+                _run_opus(A, W_mx, out, A_scale, ws_mx, kid)
+                torch.cuda.synchronize()
+                delta = (out.to(dtypes.fp32) - ref).abs()
+                rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
+                err = rows.max().item()
+                if not (err <= _MX32_ERR_TOL):
+                    failures.append(
+                        f"kid {kid} {(g, m, n, k)} {layout}: worst row rel err {err:.4f}"
+                    )
+                checked += 1
+    assert not failures, "row-major compact kids:\n  " + "\n  ".join(failures)
+    return checked
+
+
 # --- wave1 bpreshuffle, GROUP_N == GROUP_K == 128 -------------------------
 # The wave1 tiles are the only single-wave bpreshuffle pipeline in the family,
 # so nothing else instantiates their B-fragment addressing. M=17 is deliberate:
@@ -933,6 +981,8 @@ def main():
     )
     n_long_k = check_long_k_kids()
     aiter.logger.info("long-K pipeline kids passed for %d kid/shape pairs", n_long_k)
+    n_compact = check_compact_row_b_kids()
+    aiter.logger.info("row-major compact kids passed for %d kid/shape pairs", n_compact)
 
     if args.check_m_align:
         try:

@@ -217,6 +217,7 @@ def _kernel_func_for(k):
 
 INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_compact": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_compact": ("fp8_t", "fp8_t"),
     "a8w8_scale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_flatmm_splitk": ("fp8_t", "fp8_t"),
@@ -355,6 +356,7 @@ def _kargs_template_vars(kernel_tag, kargs_name):
     if kernel_tag in (
         "a8w8_mxscale_bmm_wave8n2",
         "a8w8_mxscale_bmm_bpreshuffle_compact",
+        "a8w8_mxscale_bmm_compact",
     ):
         return "", ", typename D_OUT", kargs_name
     if kernel_tag == "a8w8_mxscale_bmm_wave4m2_selfload":

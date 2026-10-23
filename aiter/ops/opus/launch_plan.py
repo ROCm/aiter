@@ -674,7 +674,7 @@ def _build_a8w8_mxscale_bmm_plan(
             f"got {requested_split_k}"
         )
     abi_split_k = max(1, requested_split_k)
-    if tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+    if tag in ("a8w8_mxscale_bmm_bpreshuffle_compact", "a8w8_mxscale_bmm_compact"):
         if not (
             0 < M < 2048
             and 0 < batch <= 16

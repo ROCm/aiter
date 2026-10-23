@@ -18,6 +18,7 @@ from codegen.common import (
 
 PIPELINE_HEADER_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_pipeline_mxscale_compact_gfx950.cuh",
+    "a8w8_mxscale_bmm_compact": "gfx950/opus_bmm_pipeline_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
@@ -56,6 +57,7 @@ PIPELINE_HEADER_MAP_4G_SAFE = {
 
 TRAITS_HEADER_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_traits_mxscale_compact_gfx950.cuh",
+    "a8w8_mxscale_bmm_compact": "gfx950/opus_bmm_traits_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
@@ -85,6 +87,7 @@ TRAITS_HEADER_MAP = {
 
 KERNEL_FUNC_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_kernel",
+    "a8w8_mxscale_bmm_compact": "opus_bmm_mxscale_compact_kernel",
     "a8w8_scale": "gemm_a8w8_scale_kernel",
     "a8w8_mxscale": "gemm_a8w8_scale_kernel",
     "a8w8": "gemm_a8w8_noscale_kernel",
@@ -121,6 +124,7 @@ KERNEL_FUNC_MAP_4G_SAFE = {
 
 TRAITS_NAME_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_traits_gfx950",
+    "a8w8_mxscale_bmm_compact": "opus_bmm_mxscale_compact_traits_gfx950",
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8_mxscale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
@@ -150,6 +154,7 @@ TRAITS_NAME_MAP = {
 
 KARGS_NAME_MAP = {
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_compact_kargs_gfx950",
+    "a8w8_mxscale_bmm_compact": "opus_bmm_compact_kargs_gfx950",
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
     "a8w8_mxscale": "opus_gemm_scale_kargs_gfx950",
     "a8w8": "opus_gemm_noscale_kargs_gfx950",
@@ -2331,11 +2336,12 @@ def _emit_bmm_specialized(
     specializations already emitted by the mouter family -- emitting them again
     under a different alias name would be a duplicate-symbol ODR violation).
     """
-    if k.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+    if k.kernel_tag in ("a8w8_mxscale_bmm_bpreshuffle_compact", "a8w8_mxscale_bmm_compact"):
         traits_aliases = (
             f"using {k.name}_Traits = {traits_name}<"
             f"{k.B_M}, {k.B_N}, {k.B_K}, {k.T_M}, {k.T_N}, {k.num_slots}, "
-            f"{str(k.cachectl_b == 2).lower()}, {str(k.early_b).lower()}>;"
+            f"{str(k.cachectl_b == 2).lower()}, {str(k.early_b).lower()}, "
+            f"{str(k.kernel_tag == 'a8w8_mxscale_bmm_compact').lower()}>;"
         )
     else:
         traits_aliases = _bmm_specialized_traits_alias(k, traits_name, da, db)
@@ -2432,14 +2438,24 @@ _BMM_COMPACT_LAUNCHER_BODY = (
               M*batch*N*output_bytes <= 2147483647,
               "@@NAME@@ requires A, each B batch, and Y byte spans to fit signed int32");
   const int64_t scale_k = K / 128;
-  // Size-one dimensions do not contribute to addresses; contiguous PyTorch
-  // views may retain arbitrary strides on those axes after transpose/clone.
-  AITER_CHECK((M == 1 || O.stride(0) == batch*K) && (batch == 1 || O.stride(1) == K) &&
+  // A, x_scale and Y may sit token-major or batch-major ([G, M, *] memory under
+  // an [M, G, *] view). Size-one axes do not contribute to addresses and may
+  // carry any stride after a transpose/clone, so theirs are taken as zero.
+  const int64_t sam = M == 1 ? 0 : O.stride(0), sab = batch == 1 ? 0 : O.stride(1);
+  const int64_t ssm = M == 1 ? 0 : x_scale.stride(0), ssb = batch == 1 ? 0 : x_scale.stride(1);
+  const int64_t sym = M == 1 ? 0 : Y.stride(0), syb = batch == 1 ? 0 : Y.stride(1);
+  AITER_CHECK(O.stride(2) == 1 && x_scale.stride(2) == 1 && Y.stride(2) == 1 &&
+              sam >= 0 && sab >= 0 && ssm >= 0 && ssb >= 0 && sym >= 0 && syb >= 0 &&
               (batch == 1 || wo_a.stride(0) == N*K) && wo_a.stride(1) == K &&
-              (M == 1 || Y.stride(0) == batch*N) && (batch == 1 || Y.stride(1) == N) &&
-              (M == 1 || x_scale.stride(0) == batch*scale_k) && (batch == 1 || x_scale.stride(1) == scale_k) &&
               (batch == 1 || w_scale.stride(0) == (N/128)*scale_k) && w_scale.stride(1) == scale_k,
-              "@@NAME@@ requires contiguous token-major A/scales/Y and contiguous preshuffled B");
+              "@@NAME@@ requires unit-stride K/N axes, non-negative strides and contiguous B");
+  AITER_CHECK(sam % 16 == 0 && sab % 16 == 0 &&
+              (sym * output_bytes) % 16 == 0 && (syb * output_bytes) % 16 == 0,
+              "@@NAME@@ requires 16-byte A and Y row and batch strides");
+  AITER_CHECK((M - 1)*sam + (batch - 1)*sab + K <= 2147483647 &&
+              (M - 1)*ssm + (batch - 1)*ssb + scale_k <= 2147483647 &&
+              ((M - 1)*sym + (batch - 1)*syb + N)*output_bytes <= 2147483647,
+              "@@NAME@@ requires A, scale and Y extents to fit signed int32");
   AITER_CHECK(reinterpret_cast<uintptr_t>(O.data_ptr()) % 16 == 0 &&
               reinterpret_cast<uintptr_t>(wo_a.data_ptr()) % 16 == 0 &&
               reinterpret_cast<uintptr_t>(Y.data_ptr()) % 16 == 0 &&
@@ -2455,6 +2471,8 @@ _BMM_COMPACT_LAUNCHER_BODY = (
   kargs.ptr_c = Y.data_ptr();
   kargs.ptr_sfa = x_scale.data_ptr(); kargs.ptr_sfb = w_scale.data_ptr();
   kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+  kargs.sam = sam; kargs.sab = sab; kargs.ssm = ssm; kargs.ssb = ssb;
+  kargs.sym = sym; kargs.syb = syb;
 """
     + r"""
   const int tiles = (M + Traits::B_M - 1) / Traits::B_M * (N / Traits::B_N);
@@ -3304,3 +3322,4 @@ _register_bmm_emit(
 _register_bmm_emit(
     "a8w8_mxscale_bmm_bpreshuffle_compact", gen_bmm_mxscale_compact_instance, 0
 )
+_register_bmm_emit("a8w8_mxscale_bmm_compact", gen_bmm_mxscale_compact_instance, 0)

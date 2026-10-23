@@ -326,8 +326,10 @@ class OpusGemmInstance:
                 parts.append("sfgmpack")
             if self.shuffle_scale:
                 parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
-        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
-            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_compact")
+        elif self.kernel_tag in _BMM_COMPACT_TAGS:
+            parts.insert(
+                tag_at, self.kernel_tag.replace("a8w8_mxscale_bmm_", "a8w8_mxscale_")
+            )
             parts.append(f"buf{self.num_slots}")
             if self.early_b:
                 parts.append("earlyb")
@@ -569,6 +571,11 @@ def a8w8_mxscale_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     )
 
 
+_BMM_COMPACT_TAGS = (
+    "a8w8_mxscale_bmm_bpreshuffle_compact",
+    "a8w8_mxscale_bmm_compact",
+)
+
 _BMM_M_ALIGN_TILES = {
     "a8w8_mxscale_bmm_flatmm_splitk": 0,
     "a8w8_mxscale_bmm_bpreshuffle_bdirect": 0,
@@ -580,6 +587,7 @@ _BMM_M_ALIGN_TILES = {
     "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": 0,
     "a8w8_mxscale_bmm_bpreshuffle_wave1": 0,
     "a8w8_mxscale_bmm_bpreshuffle_compact": 0,
+    "a8w8_mxscale_bmm_compact": 0,
     "a8w8_mxscale_bmm_pipeline": 0,
     "a8w8_mxscale_bmm_pipeline_bpreshuffle": 0,
     "a8w8_mxscale_bmm_fused": 0,
@@ -1803,7 +1811,9 @@ a8w8_mxscale_bmm_wave4m2_selfload_kernels_list = _globalize_bmm_kids(
 )
 
 
-def _a8w8_mxscale_bmm_bpreshuffle_compact(bm, bn, bk, wm, wn, nb, nt, early_b):
+def _a8w8_mxscale_bmm_bpreshuffle_compact(
+    bm, bn, bk, wm, wn, nb, nt, early_b, row_b=False
+):
     return OpusGemmInstance(
         wm * wn * 64,
         bm,
@@ -1820,7 +1830,7 @@ def _a8w8_mxscale_bmm_bpreshuffle_compact(bm, bn, bk, wm, wn, nb, nt, early_b):
         1,
         128,
         128,
-        "a8w8_mxscale_bmm_bpreshuffle_compact",
+        "a8w8_mxscale_bmm_compact" if row_b else "a8w8_mxscale_bmm_bpreshuffle_compact",
         ["fp32_t"],
         WG_PER_CU=1,
         cachectl_a=0,
@@ -1834,33 +1844,50 @@ def _a8w8_mxscale_bmm_bpreshuffle_compact(bm, bn, bk, wm, wn, nb, nt, early_b):
 
 # Explicit local ids keep existing tuned CSVs stable when adding configurations.
 # Arguments: BM, BN, BK, WM, WN, LDS slots, non-temporal B, early B prefetch.
+_BMM_COMPACT_ARGS = {
+    470: (64, 64, 256, 2, 2, 4, True, False),
+    471: (96, 64, 256, 2, 2, 3, False, False),
+    472: (64, 64, 256, 4, 2, 4, True, False),
+    473: (192, 128, 128, 2, 4, 3, False, False),
+    474: (256, 128, 128, 4, 2, 3, True, False),
+    475: (192, 128, 128, 2, 4, 3, False, True),
+    476: (256, 128, 128, 4, 2, 3, True, True),
+    477: (16, 32, 512, 1, 2, 3, False, False),
+    478: (32, 32, 512, 2, 2, 2, False, False),
+    479: (16, 64, 512, 1, 4, 2, False, False),
+    480: (16, 64, 256, 1, 4, 3, False, False),
+    481: (32, 64, 256, 2, 2, 3, False, False),
+    482: (64, 32, 256, 2, 2, 3, False, False),
+    483: (64, 64, 128, 2, 2, 3, False, False),
+    484: (128, 128, 128, 2, 2, 2, False, False),
+}
 a8w8_mxscale_bmm_bpreshuffle_compact_kernels_list = _globalize_bmm_kids(
     {
-        470: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 256, 2, 2, 4, True, False),
-        471: _a8w8_mxscale_bmm_bpreshuffle_compact(96, 64, 256, 2, 2, 3, False, False),
-        472: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 256, 4, 2, 4, True, False),
-        473: _a8w8_mxscale_bmm_bpreshuffle_compact(
-            192, 128, 128, 2, 4, 3, False, False
-        ),
-        474: _a8w8_mxscale_bmm_bpreshuffle_compact(256, 128, 128, 4, 2, 3, True, False),
-        475: _a8w8_mxscale_bmm_bpreshuffle_compact(192, 128, 128, 2, 4, 3, False, True),
-        476: _a8w8_mxscale_bmm_bpreshuffle_compact(256, 128, 128, 4, 2, 3, True, True),
-        477: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 32, 512, 1, 2, 3, False, False),
-        478: _a8w8_mxscale_bmm_bpreshuffle_compact(32, 32, 512, 2, 2, 2, False, False),
-        479: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 64, 512, 1, 4, 2, False, False),
-        480: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 64, 256, 1, 4, 3, False, False),
-        481: _a8w8_mxscale_bmm_bpreshuffle_compact(32, 64, 256, 2, 2, 3, False, False),
-        482: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 32, 256, 2, 2, 3, False, False),
-        483: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 128, 2, 2, 3, False, False),
-        484: _a8w8_mxscale_bmm_bpreshuffle_compact(
-            128, 128, 128, 2, 2, 2, False, False
-        ),
+        kid: _a8w8_mxscale_bmm_bpreshuffle_compact(*args)
+        for kid, args in _BMM_COMPACT_ARGS.items()
+    }
+)
+
+
+# Row-major B twins of the compact tiles: same schedule, B staged through LDS
+# like A. Local ids 461-469 mirror 470-476, 483, 484.
+_BMM_COMPACT_ROW_B_TWINS = {
+    461: 470, 462: 471, 463: 472, 464: 473, 465: 474,
+    466: 475, 467: 476, 468: 483, 469: 484,
+}
+a8w8_mxscale_bmm_compact_kernels_list = _globalize_bmm_kids(
+    {
+        local: _a8w8_mxscale_bmm_bpreshuffle_compact(
+            *_BMM_COMPACT_ARGS[mirror], row_b=True
+        )
+        for local, mirror in _BMM_COMPACT_ROW_B_TWINS.items()
     }
 )
 
 
 a8w8_mxscale_bmm_kernel_lists = (
     a8w8_mxscale_bmm_bpreshuffle_compact_kernels_list,
+    a8w8_mxscale_bmm_compact_kernels_list,
     a8w8_mxscale_bmm_flatmm_splitk_kernels_list,
     a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list,
     a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen_kernels_list,
@@ -3237,6 +3264,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a8w8_mxscale_bmm_bpreshuffle_wave1",
                 "a8w8_mxscale_bmm_bpreshuffle_compact",
                 "a8w8_mxscale_bmm_pipeline_bpreshuffle",
+                "a8w8_mxscale_bmm_compact",
             }
         ),
         "a8w8_blockscale_bpreshuffle": frozenset(),

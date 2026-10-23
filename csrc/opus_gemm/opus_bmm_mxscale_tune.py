@@ -322,7 +322,8 @@ _TUNE_POLICY.update(
         kid: [1]
         for kid, inst in _CODEGEN_BMM.items()
         if kid >= BMM_MXSCALE_KID_OFFSET
-        and inst.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact"
+        and inst.kernel_tag
+        in ("a8w8_mxscale_bmm_bpreshuffle_compact", "a8w8_mxscale_bmm_compact")
     }
 )
 _TUNE_POLICY = _globalise_policy(_TUNE_POLICY)
@@ -570,7 +571,10 @@ def _applicable(kid, g, m, n, k, pool="all", *, split_ks=None):
             for s in (split_ks if split_ks is not None else _TUNE_POLICY[kid])
             if s >= 1 and tiles - (s - 1) * ((tiles + s - 1) // s) >= 1
         ]
-    if k_inst.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+    if k_inst.kernel_tag in (
+        "a8w8_mxscale_bmm_bpreshuffle_compact",
+        "a8w8_mxscale_bmm_compact",
+    ):
         if not (
             0 < m < 2048
             and 0 < g <= 16
