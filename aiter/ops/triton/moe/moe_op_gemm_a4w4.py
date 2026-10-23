@@ -378,6 +378,17 @@ def moe_gemm_a4w4(
         config = get_kernel_config_triton(M, N, K, routing_data)
         split_k = config["split_k"]
 
+    # The Gluon gather index layout does not produce BLOCK_M unique values
+    # for BLOCK_M >= 128 (only 32 unique values repeat), causing wrong gather.
+    # Pre-gather at the wrapper level to avoid the bug.
+    if use_gluon and gather_indx is not None and config["block_m"] >= 128:
+        rows = gather_indx.to(torch.int64).clamp(0, num_tokens * routing_data.n_expts_act - 1)
+        rows = rows // routing_data.n_expts_act
+        x = x[rows]
+        x_scales = x_scales[rows]
+        num_tokens = gather_indx.shape[0]
+        gather_indx = None
+
     x_scales_tdm = False
     if use_gluon:
         mx_scale_block_k = config["block_k"] // MXFP4_QUANT_BLOCK_SIZE
