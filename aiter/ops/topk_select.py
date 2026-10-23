@@ -453,6 +453,7 @@ def topk_select(
     abort_when_nan_found: bool = False,
     tie: str | None = None,
     deterministic: bool = False,
+    max_row_len: int | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Per-row top-k, dispatched across aiter's five selectors.
 
@@ -534,6 +535,9 @@ def topk_select(
             Weaker than ``tie`` and cheaper than it: it only excludes ``plain``,
             keeping the small-k selector that ``tie='low'`` has to give up. Costs
             up to 1.9x where ``plain`` would have won.
+        max_row_len: an upper bound on every entry of ``end``. It opts the call
+            into the adaptive decode kernel and changes only its speed, never
+            the result (see ``top_k_per_row_decode``). ``None`` declines it.
 
     Returns:
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.
@@ -579,7 +583,7 @@ def topk_select(
         deterministic,
         input.dtype is torch.float32,
     )
-    _dispatch(backend, input, end, idx, topk, rows, tie, deterministic)
+    _dispatch(backend, input, end, idx, topk, rows, tie, deterministic, max_row_len)
 
     values = None
     if return_value or sorted:
@@ -617,7 +621,17 @@ def topk_select(
     return values, idx
 
 
-def _dispatch(backend, input, row_lens, idx, topk, rows, tie=None, deterministic=False):
+def _dispatch(
+    backend,
+    input,
+    row_lens,
+    idx,
+    topk,
+    rows,
+    tie=None,
+    deterministic=False,
+    max_row_len=None,
+):
     # Every backend puts rows on a grid dimension, and HIP rejects a zero-sized
     # launch. An empty batch has nothing to select, so `idx` stays [0, topk].
     if rows == 0:
@@ -668,6 +682,7 @@ def _dispatch(backend, input, row_lens, idx, topk, rows, tie=None, deterministic
             1,
             topk,
             stable=tie == "low" or deterministic,
+            max_row_len=max_row_len,
         )
     elif backend == "stream":
         topk_per_row_radix_stream(input, row_lens, idx, topk)

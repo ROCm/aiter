@@ -3,21 +3,32 @@
 
 """FlyDSL decode TopK interface."""
 
+import ctypes
 from functools import lru_cache
 
 import torch
 
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_cu_num_device, get_gfx_runtime
+from aiter.ops.asm.asm_utils import load_hip
+from aiter.ops.topk import (
+    BACKEND_ADAPTIVE,
+    decode_adaptive_width,
+    decode_backend_for_call,
+)
+from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, persistent_alloc
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
+from ..kernels.topk import topk_per_row_decode_adaptive as _adaptive
 from ..kernels.topk.radix_topk_one_block import (
     _COMPACT_CAPACITY,
     _MAX_ROW_ELEMENTS,
     build_radix_topk_one_block_module,
 )
 from ..kernels.topk.topk_per_row_decode import (
-    clear_topk_per_row_decode_workspace_cache,  # noqa: F401 -- public re-export
+    clear_topk_per_row_decode_workspace_cache as _clear_split_workspace_cache,
+)
+from ..kernels.topk.topk_per_row_decode import (
     launch_topk_per_row_decode,
 )
 from ..kernels.topk.topk_per_row_decode_persistent import (
@@ -29,6 +40,89 @@ from .row_lens import row_len_slot
 # Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
+
+
+# One adaptive control buffer per (device, stream). Every launch leaves it zero, so
+# only its first launch needs it zeroed. A buffer a larger one replaced stays alive,
+# since a captured graph may still replay over it.
+_adaptive_control: dict[tuple[torch.device, int], torch.Tensor] = {}
+_retired_adaptive_control: list[torch.Tensor] = []
+# Buffers whose zeroing exists only as a node in captured graphs, mapped to the
+# capture that recorded it last. Until one of those replays the buffer is garbage,
+# so every other capture records its own zeroing and an eager launch zeroes it.
+_unzeroed_adaptive_control: dict[tuple[torch.device, int], int] = {}
+_hip_stream_get_capture_info = None
+
+
+def _capture_id(stream_id: int) -> int | None:
+    """Id of the graph capture `stream_id` is recording, or None."""
+    global _hip_stream_get_capture_info
+    if _hip_stream_get_capture_info is None:
+        fn = load_hip().hipStreamGetCaptureInfo
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulonglong),
+        ]
+        _hip_stream_get_capture_info = fn
+    status, capture = ctypes.c_int(), ctypes.c_ulonglong()
+    err = _hip_stream_get_capture_info(
+        ctypes.c_void_p(stream_id), ctypes.byref(status), ctypes.byref(capture)
+    )
+    if err != 0:
+        raise RuntimeError(f"hipStreamGetCaptureInfo failed with error {err}")
+    return capture.value if status.value != 0 else None
+
+
+def _get_adaptive_control(
+    device: torch.device, stream_id: int, rows: int
+) -> torch.Tensor:
+    """The control buffer for `rows` rows, zero when the launch runs.
+
+    Grown in powers of two: per device and stream, live and retired buffers stay
+    under four times `decode_control_slots(rows)` for the largest `rows` seen,
+    until `clear_topk_per_row_decode_workspace_cache()`.
+    """
+    need = _adaptive.decode_control_slots(rows)
+    key = (device, stream_id)
+    buf = _adaptive_control.get(key)
+    if (
+        buf is not None
+        and buf.numel() >= need
+        and key not in _unzeroed_adaptive_control
+    ):
+        return buf
+    capture = _capture_id(stream_id)
+    if capture is not None and not ROUTES_INSIDE_CAPTURE:
+        # This torch serves a capture from the graph's pool, where a cached buffer
+        # could share an address with an intermediate; keep it graph-private.
+        return torch.zeros(need, device=device, dtype=torch.int32)
+    if buf is None or buf.numel() < need:
+        if buf is not None:
+            _retired_adaptive_control.append(buf)
+        with persistent_alloc(device):
+            buf = torch.zeros(
+                _adaptive.decode_control_slots(1 << (rows - 1).bit_length()),
+                device=device,
+                dtype=torch.int32,
+            )
+        _adaptive_control[key] = buf
+    elif capture is None or _unzeroed_adaptive_control[key] != capture:
+        buf.zero_()
+    if capture is None:
+        _unzeroed_adaptive_control.pop(key, None)
+    else:
+        _unzeroed_adaptive_control[key] = capture
+    return buf
+
+
+def clear_topk_per_row_decode_workspace_cache() -> None:
+    """Free the cached workspaces; no graph captured over them may replay after."""
+    _clear_split_workspace_cache()
+    _adaptive_control.clear()
+    _retired_adaptive_control.clear()
+    _unzeroed_adaptive_control.clear()
 
 
 @lru_cache(maxsize=128)
@@ -333,6 +427,77 @@ def is_flydsl_top_k_per_row_decode_supported(
     )
 
 
+def _run_adaptive(
+    logits,
+    next_n,
+    seq_lens,
+    indices,
+    rows,
+    width,
+    stride0,
+    stride1,
+    k,
+    stable,
+    stream,
+    cfg_width=None,
+    row_starts=None,
+):
+    """Launch the adaptive kernel for a shape the gate has already chosen it for.
+
+    `cfg_width` is the longest row this launch can contain and `width` is how
+    wide the buffer holding it is; they differ when a caller passed a
+    `max_row_len`. The config takes the former, because every quantity it picks
+    -- the tier, the blocks per row, the parts and the compact path -- is sized
+    for the work, and the padding is not
+    work. The kernel still folds each row onto as many of the launch's
+    workgroups as that row's own `seq_lens` entry needs.
+
+    `cfg_width` defaults to `width` for a caller that states no bound.
+    `row_starts` makes the rows packed, `width` then being the plane's.
+    """
+    if cfg_width is None:
+        cfg_width = width
+    # The gate's own count, so the band it admitted and the grid built here
+    # describe the same card.
+    cfg = _adaptive.decode_adaptive_config(
+        rows,
+        cfg_width,
+        k,
+        ordered=stable,
+        cu_count=get_cu_num_device(logits.device.index),
+    )
+    packed = row_starts is not None
+    launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(
+        top_k=k, packed_rows=packed, **cfg.kw
+    )
+    control = _get_adaptive_control(logits.device, stream.cuda_stream, rows)
+    scratch = (
+        torch.empty(cfg.scratch_slots, device=logits.device, dtype=torch.int32)
+        if cfg.scratch_slots
+        else control  # unread without compact
+    )
+    _run_compiled(
+        launcher,
+        logits,
+        next_n,
+        seq_lens,
+        # unread unless packed; seq_lens keeps the launch's signature
+        row_starts if packed else seq_lens,
+        indices,
+        control,
+        scratch,
+        rows,
+        width,
+        stride0,
+        stride1,
+        cfg.grid,
+        cfg.parts,
+        cfg.parts_magic,
+        cfg.short_max,
+        stream,
+    )
+
+
 def flydsl_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -344,22 +509,65 @@ def flydsl_top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    max_row_len: int | None = None,
     *,
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
-    ``row_starts`` enables packed rows: row r starts at row_starts[r] in the
-    input's first row, while output indices remain relative to that start.
-    ``plane_width`` bounds every row and selects the launch geometry.
-    ``seq_lens=None`` makes every row ``plane_width`` (default: the logits
-    width) long; the kernels then read no length tensor, so there is nothing
-    for a captured graph to hold an address of.
-    Before CUDAGraph capture, warm the split path on the capture stream so its
-    stream-local arrival counter is allocated and initialized.
-    """
+    `aiter.ops.topk.top_k_per_row_decode` holds the `max_row_len` contract.
+    `seq_lens=None` makes every row `plane_width` long; the kernels then read no
+    length tensor, so a captured graph holds no address for one.
+    Before CUDAGraph capture, warm up on the capture stream so the split and
+    adaptive paths find their stream-local counters already allocated and zeroed.
 
+    `row_starts` [rows] i32: row r's scores start at element row_starts[r]
+    of `logits`' first row (a packed buffer viewed with stride0 0), the
+    indices still relative to that start. `plane_width` (default the
+    logits' width) bounds every row and picks the kernel, as that plane's
+    width would.
+    """
+    _decode_with_backend(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        values,
+        None,
+        max_row_len,
+        row_starts=row_starts,
+        plane_width=plane_width,
+    )
+
+
+def _decode_with_backend(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor | None,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    stable: bool,
+    values: torch.Tensor | None,
+    backend: str | None,
+    max_row_len: int | None,
+    *,
+    row_starts: torch.Tensor | None = None,
+    plane_width: int | None = None,
+) -> None:
+    """Run the decode on `backend`, which must be the gate's answer or None to ask it.
+
+    A `default` answer still runs the single-launch kernel here, because this entry
+    point has no one-block dispatch below it.
+    """
     _validate_flydsl_topk_call(
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
     )
@@ -376,6 +584,46 @@ def flydsl_top_k_per_row_decode(
     full_rows = seq_lens is None
     len_slot = row_len_slot(seq_lens, logits.device)
     starts = row_starts if packed else len_slot
+
+    if backend is None:
+        backend = decode_backend_for_call(
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            rows,
+            stride0,
+            stride1,
+            k,
+            stable,
+            values,
+            max_row_len=max_row_len,
+            width=plane_width,
+        )
+
+    if backend == BACKEND_ADAPTIVE:
+        # Only the adaptive path takes a host-side config, and it is reached only
+        # when the gate admitted the call, which needs `max_row_len`. So the
+        # width is computed here, not before the gate: `decode_adaptive_width`
+        # requires a bound and a `None` reaching it is a bug, not a fallback.
+        cfg_width = decode_adaptive_width(width, max_row_len)
+        _run_adaptive(
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            rows,
+            width,
+            stride0,
+            stride1,
+            k,
+            stable,
+            stream,
+            cfg_width=cfg_width,
+            row_starts=row_starts,
+        )
+        return
+
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
             k,
