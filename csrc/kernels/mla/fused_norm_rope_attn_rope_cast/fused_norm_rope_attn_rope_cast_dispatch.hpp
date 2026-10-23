@@ -11,12 +11,21 @@ inline bool launch_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRop
                                                       bool rotate_q,
                                                       hipStream_t stream)
 {
-    // Measured crossover: short KV lists lose; T512 wide-cache gains are marginal.
     const bool strided = a.cache.page_size == -3;
-    if(!a.fp8_qk || a.heads != 128 || a.tokens == 0 || a.tokens > 320 ||
-       int64_t(a.prefix_capacity) + (strided ? a.extend_capacity : 0) < int64_t(a.tokens) * 1024 ||
-       (!strided && a.extend_indptr) ||
+    if(!a.fp8_qk || a.tokens == 0 || (!strided && a.extend_indptr) ||
        (!strided && a.cache.page_size != 0 && a.cache.page_size != 128))
+        return false;
+
+    // Host capacities estimate rows/query without synchronizing the device CSR.
+    const int64_t capacity = int64_t(a.prefix_capacity) + (strided ? a.extend_capacity : 0);
+    const bool h128 = a.heads == 128 && a.tokens <= 320 && capacity >= int64_t(a.tokens) * 1024;
+    // The 64-row pipeline shares V across four head groups and loads KV directly
+    // into LDS. Small grids benefit at K512; larger grids need K1536 to amortize
+    // its LDS footprint. Keep the 32-row kernel for shorter lists and larger grids.
+    const bool h64 = a.heads == 64 && strided &&
+                     ((a.tokens <= 256 && capacity >= int64_t(a.tokens) * 512) ||
+                      (a.tokens <= 1024 && capacity >= int64_t(a.tokens) * 1536));
+    if(!h64 && !h128)
         return false;
     FusedNormRopeAttnRopeCastParams k{};
     k.q_ptr                = a.q;

@@ -19,7 +19,7 @@ hipError_t run_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRopeCas
                                                   bool raw_q,
                                                   hipStream_t stream)
 {
-    const dim3 grid(args.N, 2);
+    const dim3 grid(args.N, args.H / 64);
     if(args.cache_mode == 0)
     {
         // Buffer capacities are known on the host; a single-source request keeps

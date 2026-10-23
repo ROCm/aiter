@@ -1720,6 +1720,89 @@ def run_benchmark(args, buffers):
     return fused_v41(**args, **buffers)
 
 
+@pytest.mark.parametrize("topk", [512, 1024])
+@pytest.mark.parametrize("mode", ["raw", "prepared", "norm"])
+def test_two_source_h64_causal_prefill(topk, mode):
+    # Long causal CSR rows exercise the 64-row pipeline, including its source
+    # switch and final partial tile. Check all heads against a dense oracle.
+    torch.manual_seed(23917 + topk)
+    tokens, heads, prefix_rows = 1024, 64, 65536
+    values, scales = quantize_fp8(
+        torch.randn(prefix_rows + tokens, 512, device="cuda", dtype=torch.bfloat16)
+        * 0.25
+    )
+    packed = pack_rows(values, scales)
+    prefix, extend = packed[:prefix_rows], packed[prefix_rows:]
+    pids = torch.randint(prefix_rows, (tokens, topk), device="cuda", dtype=torch.int32)
+    pp = torch.arange(tokens + 1, device="cuda", dtype=torch.int32) * topk
+    lengths = torch.arange(1, tokens + 1, device="cuda", dtype=torch.int32).clamp_max(
+        topk
+    )
+    ep = torch.cat(
+        (torch.zeros(1, device="cuda", dtype=torch.int32), lengths.cumsum(0).int())
+    )
+    columns = torch.arange(topk, device="cuda", dtype=torch.int32).expand(tokens, -1)
+    eids = columns[columns < lengths[:, None]]
+    q = torch.randn(tokens, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.125
+    angles = torch.randn(tokens, 32, device="cuda")
+    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+    pos = torch.arange(tokens, device="cuda", dtype=torch.int32)
+    sink = torch.linspace(-3, 3, heads, device="cuda")
+    sink[::11] = -torch.inf
+    reference_q = q
+    if mode == "norm":
+        reference_q = (
+            q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + 0.125)
+        ).bfloat16()
+    query, qscale = q, None
+    if mode == "prepared":
+        query, qscale = quantize_fp8(rotate(q, cos, sin, pos).bfloat16())
+        query = query.reshape_as(q)
+        qscale = qscale.reshape(tokens, heads, 16).view(torch.float8_e8m0fnu)
+    debug = torch.empty_like(q, dtype=torch.float32)
+    out = fused_v41(
+        q=query,
+        q_scale=qscale,
+        unified_kv=prefix[:, :512].view(torch.float8_e4m3fn),
+        unified_kv_scale=prefix[:, 512:].view(torch.float8_e8m0fnu),
+        kv_indices_prefix=pids.flatten(),
+        kv_indptr_prefix=pp,
+        kv=extend[:, :512].view(torch.float8_e4m3fn),
+        kv_scale=extend[:, 512:].view(torch.float8_e8m0fnu),
+        kv_indices_extend=eids,
+        kv_indptr_extend=ep,
+        cos=cos,
+        sin=sin,
+        positions=pos,
+        attn_sink=sink,
+        q_is_rotated=mode == "prepared",
+        q_norm=mode == "norm",
+        norm_eps=0.125,
+        debug_out=debug,
+        max_logits=torch.empty(tokens, heads, device="cuda"),
+        lse=torch.empty(tokens, heads, device="cuda"),
+    )
+    probes = [0, 511, 512, 1023]
+    rows = [
+        torch.cat((pids[t], eids[int(ep[t]) : int(ep[t + 1])] + prefix_rows))
+        for t in probes
+    ]
+    decoded = (
+        values.float() * torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
+    ).bfloat16()
+    expected, mx, lse = dense_fp8_qk_reference(
+        reference_q[probes], decoded, rows, cos, sin, pos[probes], sink, True
+    )
+    torch.testing.assert_close(out[2][probes], mx, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(out[3][probes], lse, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(debug[probes], expected, rtol=0.02, atol=0.008)
+    assert float((debug[probes] - expected).norm() / expected.norm()) < 0.005
+    assert (
+        float((dequantize(*out[:2])[probes] - expected).norm() / expected.norm())
+        < 0.035
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", action="store_true")
