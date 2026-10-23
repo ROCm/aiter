@@ -1912,8 +1912,13 @@ namespace py = pybind11;
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
           py::arg("world_size"),                                                           \
-          py::arg("qr_max_size") = std::nullopt);                                          \
+          py::arg("qr_max_size") = std::nullopt,                                           \
+          py::arg("quant_level") = std::nullopt);                                          \
     m.def("qr_destroy", &aiter::qr_destroy, "qr_destroy(int fa) -> ()", py::arg("fa"));    \
+    m.def("qr_uses_pull_q4",                                                               \
+          &aiter::qr_uses_pull_q4,                                                         \
+          "qr_uses_pull_q4(int fa) -> bool",                                               \
+          py::arg("fa"));                                                                  \
     m.def("qr_all_reduce",                                                                 \
           &aiter::qr_all_reduce,                                                           \
           "qr_all_reduce(int fa, Tensor inp, Tensor out,"                                  \

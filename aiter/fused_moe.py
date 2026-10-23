@@ -4737,6 +4737,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                num_rows=num_local_tokens,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
@@ -4956,6 +4957,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                num_rows=num_local_tokens,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
