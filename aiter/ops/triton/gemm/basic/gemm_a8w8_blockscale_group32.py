@@ -60,7 +60,10 @@ def gemm_a8w8_blockscale_group32(
         assert y.is_contiguous(), "Output must be contiguous"
     if M == 0:
         return y
-    assert get_gfx_runtime() == "gfx950", "Group32 FP8 GEMM requires gfx950"
+    assert get_gfx_runtime() in (
+        "gfx950",
+        "gfx1250",
+    ), "Group32 FP8 GEMM requires gfx950 or gfx1250"
 
     return gemm_afp8wfp8(
         x,
