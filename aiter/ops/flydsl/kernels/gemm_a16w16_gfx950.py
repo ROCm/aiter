@@ -1460,7 +1460,10 @@ def get_split_k_buffers(stream, device, split_k):
 
 
 def _dynamic_tensor_arg(tensor, leading_dim):
-    return flyc.from_dlpack(tensor.detach()).mark_layout_dynamic(
+    # Not from_dlpack: FlyDSL 0.4.0's layout-dynamic DLPack fill parks each
+    # launch's adaptor in a thread-local it never clears, so every argument keeps
+    # its last call's tensor alive (10.6 GiB after a 768000-row ViT GEMM).
+    return flyc.from_torch_tensor(tensor.detach()).mark_layout_dynamic(
         leading_dim=leading_dim
     )
 
