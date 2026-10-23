@@ -214,8 +214,9 @@ The fused path has its own policy tables in `allreduce_policy.py`:
 `FUSED_MESH_ST_LADDER`, `FUSED_RING_ST_LADDER` and `FUSED_QR_ROW_ATOMS` for the
 configurations. Above the one-shot window, the exact path declines.
 
-The configuration ladders are read from `fused_allreduce_ladders.json`, next to
-`allreduce_policy.py`, when it is imported. `AITER_FLY_AR_FUSED_LADDERS=<file>`
+The configuration ladders are read from
+`aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json` when
+`allreduce_policy.py` is imported. `AITER_FLY_AR_FUSED_LADDERS=<file>`
 names another file. Each platform has a default ladder per family and may have
 a ladder of its own for a hidden size. A width without its own ladder runs the
 default, and the default one-shot ladder never splits a row. Every rank must

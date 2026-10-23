@@ -61,7 +61,7 @@ plus ``FUSED_QR_ROW_ATOMS``. All three fused families live in one slot
 rungs run unsplit unless ``AITER_FLY_AR_FUSED_SPLIT=1``.
 
 The fused ladders are also keyed by the hidden size, and are read from
-``fused_allreduce_ladders.json`` (or the file ``AITER_FLY_AR_FUSED_LADDERS``
+``configs/comm/fused_allreduce_ladders.json`` (or the file ``AITER_FLY_AR_FUSED_LADDERS``
 names).
 """
 
@@ -1065,7 +1065,10 @@ _FUSED_POLICY_BY_KEY = _index(FUSED_FAMILY_POLICIES)
 # The environment variable that names another ladder file.
 FUSED_LADDERS_ENV = "AITER_FLY_AR_FUSED_LADDERS"
 FUSED_LADDERS_JSON = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "fused_allreduce_ladders.json"
+    os.path.dirname(os.path.abspath(__file__)),
+    "configs",
+    "comm",
+    "fused_allreduce_ladders.json",
 )
 FUSED_LADDERS_SCHEMA_VERSION = 1
 
