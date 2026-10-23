@@ -710,7 +710,7 @@ def generate_test_tensors(
             v[:, :, 2 * i, :] = row_norm * v_axis[2 * i]
             v[:, :, 2 * i + 1, :] = row_norm * v_axis[2 * i + 1]
         # Each query row points at one pair, so the shards of the output ride on different ties.
-        kv_of_q = torch.arange(hq, device=device) % hk
+        kv_of_q = torch.arange(hq, device=device) // (hq // hk)
         pair_of_row = torch.arange(sq, device=device) % pairs
         q[:] = amp * direction[pair_of_row][:, kv_of_q].permute(1, 0, 2)
         return q.to(dtype), k.to(dtype), v.to(dtype)
