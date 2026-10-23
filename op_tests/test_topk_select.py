@@ -922,6 +922,11 @@ _NAN_ROUTES = (
     ("argmax", 8, 4096, 1, False),
     ("small_k", 8, 4096, 16, False),
     ("stream", 64, 32768, 512, False),
+    # The small-reject stream: gfx950 k=2048, a few columns past k, one per
+    # row band of `_stream_small_reject`.
+    ("stream", 8, 2050, 2048, False),
+    ("stream", 1024, 2055, 2048, False),
+    ("stream", 4096, 2056, 2048, False),
     ("decode", 4, 32768, 2048, False),
     ("sampled", 64, 32768, 2048, False),
     ("sampled", 64, 32768, 2048, True),
