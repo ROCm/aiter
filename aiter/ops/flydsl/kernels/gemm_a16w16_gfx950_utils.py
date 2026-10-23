@@ -16,8 +16,6 @@ from .tensor_shim import buf_base_i64
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
-# A flat AMD buffer descriptor and its 32-bit offsets address fewer than 4 GiB;
-# the same bound as the A8W8 preshuffle GEMM's flat-buffer capacity check.
 GFX950_FLAT_BUFFER_LIMIT_BYTES = 1 << 32
 
 

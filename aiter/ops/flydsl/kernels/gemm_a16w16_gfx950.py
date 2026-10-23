@@ -838,7 +838,7 @@ def gemm_a16w16_gfx950_kernel(
                         ),
                     )
                     c_vec = c_vec + peer_c_vec
-                # int64: M * N exceeds 2^31 for large-M GEMMs (e.g. ViT projections)
+                # M * N can exceed 2^31.
                 global_offset = fx.Int64(global_row) * n + global_col
                 write_cshuffle_vec_to_global(
                     out,
@@ -1111,7 +1111,7 @@ def gemm_a16w16_hti_gfx950_kernel(
                     if const_expr(is_split_k):
                         global_offset = global_row * n + global_col
                     else:
-                        # int64: M * N exceeds 2^31 for large-M GEMMs
+                        # M * N can exceed 2^31.
                         global_offset = fx.Int64(global_row) * n + global_col
                     write_cshuffle_vec_to_global(
                         out,
@@ -1383,11 +1383,7 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
         return None
     if result.b_is_transposed and k % async_load_vec_size != 0:
         return None
-    # A and B are read through one flat buffer descriptor each, whose 32-bit
-    # offsets address fewer than 4 GiB (as in the A8W8 preshuffle GEMM's capacity
-    # check), so larger operands are unsupported and dispatch falls back. C needs
-    # no bound: the plain epilogue stores through a pointer with int64 offsets,
-    # and split-K's buffer atomics stay far below it (SPLIT_K_SEMAPHORE_MAX_LEN).
+    # Keep the flat A/B buffer descriptors and their i32 offsets below 4 GiB.
     in_bytes = result.in_data_bytes
     if max(m, n) * k * in_bytes >= GFX950_FLAT_BUFFER_LIMIT_BYTES:
         return None
@@ -1463,9 +1459,6 @@ def get_split_k_buffers(stream, device, split_k):
 
 
 def _dynamic_tensor_arg(tensor, leading_dim):
-    # Not from_dlpack: FlyDSL 0.4.0's layout-dynamic DLPack fill parks each
-    # launch's adaptor in a thread-local it never clears, so every argument keeps
-    # its last call's tensor alive (10.6 GiB after a 768000-row ViT GEMM).
     return flyc.from_torch_tensor(tensor.detach()).mark_layout_dynamic(
         leading_dim=leading_dim
     )

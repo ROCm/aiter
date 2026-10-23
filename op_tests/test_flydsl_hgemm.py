@@ -76,8 +76,7 @@ _TUNED = [
     (800, 384, 7168, 64, 96, 64, 4, 4, 2, 2, 1, 0, False),
     (32, 7168, 2048, 32, 32, 64, 8, 1, 2, 1, 1, 0, False),
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
-    # MiniMax-M3 ViT projection reached through the M=8192 tuned row: M * N is
-    # past 2^31, so C offsets must be int64.
+    # M * N > 2^31
     (360448, 6144, 1280, 256, 256, 64, 2, 1, 2, 4, 1, 0, True),
 ]
 
@@ -217,18 +216,12 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
 
 
 def check_shape_limits():
-    # The MiniMax-M3 ViT row tuned at M=8192 must still serve the 768000-patch
-    # encoder profile, but not an M whose A reaches the 4 GiB flat-buffer limit.
     params = get_flydsl_hgemm_kernel_params(
         "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias1_ktail0_gm0_pht_gfx950"
     )
-    assert flydsl_hgemm_supports_shape(768000, 6144, 1280, params)
-    assert not flydsl_hgemm_supports_shape(2**21, 6144, 1280, params)
-    # Tuned Kimi-K3 row whose A is 2.19 GiB: below 4 GiB, still supported.
-    kimi_params = get_flydsl_hgemm_kernel_params(
-        "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pht_gfx950"
-    )
-    assert flydsl_hgemm_supports_shape(32768, 7168, 35840, kimi_params)
+    # A must stay below the 4 GiB flat-buffer limit: 1677721 * 1280 * 2 < 2^32.
+    assert flydsl_hgemm_supports_shape(1677721, 6144, 1280, params)
+    assert not flydsl_hgemm_supports_shape(1677722, 6144, 1280, params)
 
 
 def summarize(title, rows):

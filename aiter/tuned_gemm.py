@@ -161,8 +161,7 @@ def get_GEMM_A16W16_tuned_config(
                         "recognized by the current catalog; falling back to next candidate."
                     )
                     config = None
-                # A padded-M row can be reached by a much larger M than it was
-                # tuned on; skip it when the kernel cannot address this shape.
+                # A padded-M row can serve a much larger M than it was tuned on.
                 elif not _get_flydsl_gemm_kernels().flydsl_hgemm_supports_shape(
                     M, N, K, flydsl_config
                 ):
