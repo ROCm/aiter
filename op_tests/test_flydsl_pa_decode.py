@@ -1062,3 +1062,66 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp8", "bf16"])
+def test_asymmetric_autotune_plan(kv_dtype, device, tmp_path):
+    """Tuned and cached plans must decode with the physical V/output width."""
+    if get_gfx() != "gfx950":
+        pytest.skip("asymmetric Q/K and V widths require gfx950")
+    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    torch.manual_seed(0)
+    # B32/NP8 lets native tuning compare different work-plan capacities.
+    query, key, value, table, context = _make_inputs(
+        8, 1, 16, 192, 128, 64, torch.bfloat16, "random", device, (1027,) * 32
+    )
+    key_scale = value_scale = None
+    vector = 8
+    if kv_dtype == "fp8":
+        key, key_scale = per_tensor_quant(key, quant_dtype=torch.float8_e4m3fn)
+        value, value_scale = per_tensor_quant(value, quant_dtype=torch.float8_e4m3fn)
+        vector = 16
+    reference = _reference(
+        query,
+        key.float() * (1.0 if key_scale is None else key_scale),
+        value.float() * (1.0 if value_scale is None else value_scale),
+        table,
+        context,
+        8,
+        128,
+        None,
+    )
+    pages = key.shape[0]
+    key_cache = (
+        key.reshape(pages, 1, 64, 192 // vector, vector)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.reshape(pages, 1, 64 // vector, vector, 128)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    arguments = (query, key_cache, value_cache, context, table, 192**-0.5, 8)
+    options = {
+        "key_scale": key_scale,
+        "value_scale": value_scale,
+        "sliding_window": 128,
+        "max_context_length": 1027,
+    }
+    plan = tuning.prepare_pa_decode_plan(
+        *arguments, **options, max_partitions=8, tune=True, config_dir=tmp_path
+    )
+    assert (tmp_path / "gfx950" / "_pa_decode_autotuner.json").is_file()
+    tuning._get_pa_decode_autotuner.cache_clear()
+    assert tuning._get_pa_decode_autotuner("gfx950", tmp_path).cache
+    cached_plan = tuning.prepare_pa_decode_plan(
+        *arguments, **options, max_partitions=8, config_dir=tmp_path
+    )
+    assert cached_plan.capacity == plan.capacity
+    output = torch.empty((*query.shape[:-1], 128), dtype=query.dtype, device=device)
+    for selected_plan in (plan, cached_plan):
+        output.fill_(float("nan"))
+        pa.pa_decode(output, *arguments, **options, work_plan=selected_plan)
+        _check_output(output, reference, 1e-2 if kv_dtype == "fp8" else 5e-3)
