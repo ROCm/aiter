@@ -188,6 +188,12 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     stride_kv_t,
     stride_kv_h,
     stride_kv_d,
+    stride_gate_t,
+    stride_gate_h,
+    stride_gate_d,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
     key_cache_stride_t,
     key_cache_stride_h,
     key_cache_stride_d,
@@ -365,9 +371,9 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         )
         gate = tl.load(qkv_ptr + gate_in_offs, mask=x_gate_mask)
         gate_out_offs = (
-            t_offs[:, None] * stride_q_t
-            + d_gate_offs[None, :] * stride_q_d
-            + hq * stride_q_h
+            t_offs[:, None] * stride_gate_t
+            + d_gate_offs[None, :] * stride_gate_d
+            + hq * stride_gate_h
         )
         tl.store(gate_ptr + gate_out_offs, gate, mask=x_gate_mask)
 
@@ -482,15 +488,19 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
 
         k = k * cos + k_rotated * sin
 
-        # Store to contiguous K/V buffers
-        kv_out_offs = (
+        k_out_offs = (
             t_offs[:, None] * stride_kv_t
             + d_offs[None, :] * stride_kv_d
             + hq * stride_kv_h
         )
-        tl.store(k_ptr + kv_out_offs, k.to(k_ptr.dtype.element_ty), mask=x_mask)
+        tl.store(k_ptr + k_out_offs, k.to(k_ptr.dtype.element_ty), mask=x_mask)
         if WRITE_V:
-            tl.store(v_ptr + kv_out_offs, v.to(v_ptr.dtype.element_ty), mask=x_mask)
+            v_out_offs = (
+                t_offs[:, None] * stride_v_t
+                + d_offs[None, :] * stride_v_d
+                + hq * stride_v_h
+            )
+            tl.store(v_ptr + v_out_offs, v.to(v_ptr.dtype.element_ty), mask=x_mask)
 
         # KV Caching Logic: skip cache writes for padding (slot < 0) or out-of-range
         # slots. Bounds use total_num_kv_cache_tokens (= num_blocks * block_size)
