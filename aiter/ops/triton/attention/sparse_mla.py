@@ -215,8 +215,7 @@ def _async_launch_config(
     """
     ASYNC_LDS_DEFAULT = True
     # The copy needs the cache bytes to be the dot operand: an fp8 cache with
-    # fp8 dots, or a bf16 cache. The bf16 tile is twice the bytes, but the
-    # staged walk it replaces buffers the same tile, so occupancy is unchanged.
+    # fp8 dots, or a bf16 cache.
     enabled = (
         ASYNC_LDS_DEFAULT
         and (fp8_dots or native_bf16)
@@ -232,16 +231,24 @@ def _async_launch_config(
         enabled = False
     # This walk has no prefetch, so on a cold decode cache the staged walk's
     # register prefetch wins. 128 heads is the exception: there the stock
-    # launch already runs narrow head blocks that re-gather the same keys.
-    if enabled and num_queries < _PREFILL_MIN_ROWS and num_heads < 128:
+    # launch already runs narrow head blocks that re-gather the same keys; a
+    # bf16 launch takes the 64-head program, which re-gathers nothing.
+    decode_heads = 64 if (native_bf16 and not fp8_dots) else 128
+    if enabled and num_queries < _PREFILL_MIN_ROWS and num_heads < decode_heads:
         enabled = False
     # 16-head programs re-read every key num_heads / 16 times, which L2 only
-    # absorbs while the top-k list keeps the pool cache-resident.
-    if enabled and num_heads == 64 and avg_topk > 1024:
+    # absorbs while the top-k list keeps the pool cache-resident. Only the fp8
+    # walk is pinned to 16 heads.
+    if enabled and fp8_dots and num_heads == 64 and avg_topk > 1024:
         enabled = False
     if enabled:
         # Enough workgroups for four waves/SIMD: single buffer. Otherwise the
         # LDS is free, so double-buffer and prefetch a tile ahead.
+        if native_bf16 and not fp8_dots and num_queries < _PREFILL_MIN_ROWS:
+            # Decode cannot fill the SIMDs anyway, and clamping the allocator to
+            # four waves spills a bf16 tile's working set. Prefill keeps the hint:
+            # its grid is large enough that waves beat registers.
+            return True, 64, 0, workgroups < 4 * num_sms
         if workgroups >= 4 * num_sms:
             return True, 64, 4, False
         return True, 64, 2, True
@@ -824,17 +831,16 @@ def sparse_mla_fwd(
     nope_chunk = max(1, block_k // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
     native_bf16 = fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
     if native_bf16:
-        # The bf16 copy only pays at 32 heads per program. 16 leaves too little
-        # work to cover it, and the 64-head program's 512 threads hold the whole
-        # tile, so too few workgroups remain to hide a copy this walk does not
-        # prefetch.
+        # 16 heads per program leaves too little work to cover the copy. The
+        # 64-head one only pays on decode, where the hint comes off below and
+        # the allocator can hold the wider tile.
         native_bf16 = (
             arch == "gfx950"
             and num_heads >= 32
             and _staged_block_m(
                 num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
             )
-            == 32
+            in ((32, 64) if num_queries < _PREFILL_MIN_ROWS else (32,))
         )
     async_lds_on, block_k, waves_per_eu, async_dbuf = _async_launch_config(
         fp8_dots,
@@ -864,8 +870,8 @@ def sparse_mla_fwd(
 
     # The wide head programs and the decode XCD remap below are tuned on gfx950.
     staged = fmt == "fp8_scalar" or fmt == "bf16"
-    # The fp8 copy keeps the narrow tile below; the bf16 one does not stage a
-    # tile in registers either, so it can afford the wide head program.
+    # The fp8 copy keeps the narrow tile below; the bf16 one stages no tile in
+    # registers, so it can afford the wide head program.
     wide_ok = (not async_lds_on) or not fp8_dots
     if arch == "gfx950" and staged and num_heads >= 32 and wide_ok:
         # 32- or 64-head programs (_staged_block_m).
