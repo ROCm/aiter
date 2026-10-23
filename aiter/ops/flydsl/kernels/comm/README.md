@@ -9,9 +9,9 @@ node.
 | File | Contents |
 |---|---|
 | `one_shot_allreduce.py` | The exact one-shot kernel. |
-| `quick_allreduce_int4.py` | The quantized two-shot **mesh** kernel. |
-| `quick_allreduce_int4_ring.py` | The quantized two-shot **ring** kernel. |
-| `quick_allreduce_codec.py` | The INT4, INT6 and FP16 wire codecs. The mesh and the ring use them. |
+| `quick_allreduce_mesh.py` | The quantized two-shot **mesh** kernel. |
+| `quick_allreduce_ring.py` | The quantized two-shot **ring** kernel. |
+| `quick_allreduce_codec.py` | The INT4, INT5, INT6 and FP16 wire codecs. The mesh and the ring use them. |
 | `allreduce_shared.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
 
 The host classes are in `aiter/ops/flydsl/`:
@@ -19,8 +19,8 @@ The host classes are in `aiter/ops/flydsl/`:
 | File | Contents |
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce`, the host class for the one-shot kernel. |
-| `quick_allreduce_int4.py` | `QuickAllReduceInt4`, the host class for the mesh and the ring. |
-| `allreduce_policy.py` | The payload-size boundaries between the three kernels, and the tuning ladders. |
+| `quick_allreduce.py` | `FlyQuickAllReduce`, the host class for the mesh and the ring. |
+| `allreduce_policy.py` | The limits, the payload-size boundaries between the three kernels, and the tuning ladders. |
 | `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
 ## Kernels
@@ -30,8 +30,8 @@ The host classes are in `aiter/ops/flydsl/`:
 | Kernel | Hops | Wire bytes for each rank | Accuracy | Use |
 |---|---|---|---|---|
 | One-shot | 1 | `(N-1)*S` | Exact: fp32 accumulate, one bf16 rounding | Small payloads (decode) |
-| Mesh | 2 | `2(N-1)/N*S` | INT4 on the wire | Medium and large payloads |
-| Ring | `2(N-1)` | `2(N-1)/N*S` | INT4 or INT6 on the wire | Large payloads, mostly on PCIe |
+| Mesh | 2 | `2(N-1)/N*S` | INT4, INT5, INT6 or FP16 on the wire | Medium and large payloads |
+| Ring | `2(N-1)` | `2(N-1)/N*S` | INT4, INT6 or FP16 on the wire, per lap | Large payloads, mostly on PCIe |
 
 ### One-shot
 
@@ -43,9 +43,10 @@ sentinel until the data of a peer arrives. The reader polls its slot until no
 ### Mesh
 
 The mesh is a two-shot all-reduce: a reduce-scatter lap, then an all-gather
-lap. In each lap, each rank pushes to all `N-1` peers. The wire format is INT4
-with one E4M3 scale for each group of 16 values. FP16 is also available for
-tests.
+lap. In each lap, each rank pushes to all `N-1` peers. Both laps use the same
+wire format. The default is INT4 with one E4M3 scale for each group of 16
+values. INT5 and INT6 use the same scale and add more bits for each value. FP16
+sends the values without quantization and is used in testing.
 
 ### Ring
 
@@ -143,8 +144,8 @@ The code reads `AITER_FLY_AR` when it creates `CustomAllreduce` and
 
 `AITER_FLY_AR=1` does not enable a kernel on an unsupported system. The
 kernels need gfx942 or gfx950, a world size of 2, 4 or 8, and the `flydsl`
-package. These limits, and the other shared constants of the kernels, are in
-the "Limits" section of `aiter/ops/flydsl/kernels/comm/allreduce_shared.py`.
+package. These limits are in the "Limits" section of
+`aiter/ops/flydsl/allreduce_policy.py`.
 
 ### Set the interconnect type
 
@@ -225,7 +226,7 @@ what a test does:
 | Test | FlyDSL kernels | Stock kernels in `bench` |
 |---|---|---|
 | `op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py` | One-shot | `cdr` and `cdr_naive`, the `CustomAllreduce` kernels with `use_new` on and off, and `rccl` |
-| `op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
+| `op_tests/multigpu_tests/test_flydsl_quick_allreduce.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
 
 A test fails if the arch is not supported, or if a world size that you name
 with `--tp` needs more GPUs than the node has. The default sweep skips the world
@@ -240,8 +241,8 @@ the in-window payloads to FlyDSL, and that the result is correct.
 
 ```bash
 python3 op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py --scenario bench --tp 4
-python3 op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py --scenario bench \
-    --tp 4 --report /tmp/int4.md
+python3 op_tests/multigpu_tests/test_flydsl_quick_allreduce.py --scenario bench \
+    --tp 4 --report /tmp/quick_allreduce.md
 ```
 
 The one-shot bench has two comparisons:
@@ -251,8 +252,9 @@ The one-shot bench has two comparisons:
 - `flydsl vs best` compares with the fastest stock kernel.
 
 The `variant` columns show which kernel each candidate ran. For `cdr` this is
-`ll`, `ll128_<block>`, `1stage` or `2stage`. The INT4 bench compares each
-schedule with `hip`. A ratio above 1.0 means that the FlyDSL kernel is faster.
+`ll`, `ll128_<block>`, `1stage` or `2stage`. The quick all-reduce bench
+compares each schedule with `hip`. A ratio above 1.0 means that the FlyDSL
+kernel is faster.
 
 All candidates are timed with the same method, on the same input, in the same
 process. Each candidate is a CUDA graph of 10 back-to-back calls. The test

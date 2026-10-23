@@ -10,14 +10,14 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from .allreduce_policy import resolve_link
-from .kernels.comm.allreduce_shared import (
+from .allreduce_policy import (
     MAX_PAYLOAD_BYTES,
     PAYLOAD_ALIGN_BYTES,
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
+    resolve_link,
 )
-from .quick_allreduce_int4_ipc import UncachedIpcHeap
+from .ipc_heap import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
 
@@ -329,13 +329,15 @@ def kernel_symbol(launch) -> str:
 
 
 def payload_probes(floors, lo: int, hi: int) -> tuple[int, ...]:
-    """Sample payload sizes that select all the configs a ladder can use for a
-    payload of ``lo..hi`` bytes (inclusive).
+    """Payload sizes in ``lo..hi`` bytes (inclusive) that together select every
+    rung a ladder can use in that range.
 
-    *floors* are the ``min_bytes`` values of the ladder rungs. The function
-    returns ``()`` if no payload size in the range is valid.
+    *floors* are the rungs' ``min_bytes``. The result is both ends of the range
+    plus the valid sizes on either side of each floor inside it, all multiples
+    of ``PAYLOAD_ALIGN_BYTES``, sorted. It is ``()`` if the range holds no valid
+    size.
     """
-    step = 16
+    step = PAYLOAD_ALIGN_BYTES
     lo = max(step, -(-int(lo) // step) * step)
     hi = int(hi) // step * step
     if lo > hi:

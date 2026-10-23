@@ -15,7 +15,7 @@ import torch.distributed as dist
 
 from aiter.jit.core import AITER_CONFIGS
 
-from ...quick_allreduce_int4_ipc import UncachedIpcHeap as _Ipc
+from ...ipc_heap import UncachedIpcHeap as _Ipc
 from ..kernels_common import ceildiv
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .common import device_key, nearest, tuned_rows
@@ -79,7 +79,7 @@ class LaunchCfg:
     q: int = 0  # LB GEMM2 output split (0: the engine's lb_q)
 
 
-# --- intra-node symmetric memory (hipIpc, via quick_allreduce_int4_ipc) ---------------
+# --- intra-node symmetric memory (hipIpc, via ipc_heap) --------------------------
 
 _ALIGN = 256
 # a peer allocation maps once per process (arenas can share one): handle -> [ptr, refs]

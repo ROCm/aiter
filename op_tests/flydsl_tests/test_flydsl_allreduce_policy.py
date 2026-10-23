@@ -23,19 +23,17 @@ from aiter.dist.device_communicators.custom_all_reduce import (
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.allreduce_policy import (
-    mesh_st_ladder,
-    oneshot_ladder,
-    ring_st_ladder,
-)
-from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     SUPPORTED_BLOCKS,
     AllReduceAlgorithm,
     FamilyPolicy,
     Window,
+    mesh_st_ladder,
+    oneshot_ladder,
+    ring_st_ladder,
 )
 from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_ATOMS
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import SUPER_TILES
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4_ring import RING_SUPER_TILES
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import SUPER_TILES
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_ring import RING_SUPER_TILES
 from aiter.ops.flydsl.one_shot_allreduce import resolve_oneshot_max_bytes
 
 WORLDS = P.SUPPORTED_WORLDS
