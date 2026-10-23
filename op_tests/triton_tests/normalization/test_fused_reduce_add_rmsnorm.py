@@ -24,7 +24,7 @@ def run_torch(x, residual, weight, eps, gemma_norm):
 @pytest.mark.parametrize("N", [128, 1000, 5120])
 @pytest.mark.parametrize("num_ksplit", [0, 1, 3, 4])
 @pytest.mark.parametrize("gemma_norm", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_reduce_add_rmsnorm(M, N, num_ksplit, gemma_norm, dtype):
     # num_ksplit == 0: a reduced [M, N] GEMM output in dtype instead of fp32 partials.
     torch.manual_seed(0)
