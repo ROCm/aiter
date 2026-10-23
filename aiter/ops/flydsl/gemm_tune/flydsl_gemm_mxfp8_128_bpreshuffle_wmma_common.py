@@ -20,6 +20,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     _fused_splitk_ok,
     cluster_m_grid_ok,
     compute_kernel_k_pair,
+    n_is_bounded,
 )
 
 WMMA = 16  # WMMA M/N tile granularity
@@ -56,6 +57,9 @@ _COMPUTE_PROFILES = (
 _COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4))
 _COMPUTE_MIN_K_PER_SPLIT = 512
 _PERSISTENT_N_TILES = (2, 4, 8)
+# A padded N tile (partial last tile, or a spare one filling a cluster / persistent group)
+# still runs the whole loop: candidates may pad at most this fraction of the real tiles.
+_N_TAIL_MAX_PAD = 0.5
 
 _CLUSTER_MIN_DIM = 8192
 _CLUSTER_MIN_TILES = 32
@@ -242,11 +246,15 @@ def kernel_fits_shape(
     *,
     scale_block: int = _BLOCK_K,
     b_scale_32x32: bool = False,
+    allow_n_tail: bool = False,
 ) -> bool:
     """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``.
 
     ``scale_block`` sets the required K-scale alignment. A partial final K tile
     is supported for a single split; split-K chunks remain tile-aligned.
+    ``allow_n_tail`` admits a compute kernel whose N is not a whole number of
+    ``cluster_n * persistent_n_tiles`` tiles (it runs with ``bounded_n``, single split
+    only); the untuned fallback and the batched GEMM leave it off.
     """
 
     if b_scale_32x32 and scale_block != 32:
@@ -285,18 +293,17 @@ def kernel_fits_shape(
         # decode M). A 1x1 launch has no cluster barrier.
         if M < ki.tile_m and uses_cluster(ki):
             return False
-        if N % (ki.tile_n * ki.cluster_n) != 0:
+        if ki.persistent_n_tiles > 1 and ki.split_k != 1:
             return False
+        if n_is_bounded(N, ki.tile_n, ki.cluster_n, ki.persistent_n_tiles, True):
+            n_align = 32 if b_scale_32x32 else _BLOCK_N
+            if not allow_n_tail or ki.split_k != 1 or N % n_align:
+                return False
+            n_tiles = _ceil_div(N, ki.tile_n)
+            if _padded_n_tiles(ki, N) - n_tiles > _N_TAIL_MAX_PAD * n_tiles:
+                return False
         if not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
             return False
-        if ki.persistent_n_tiles > 1:
-            if ki.split_k != 1:
-                return False
-            n_tiles = N // ki.tile_n
-            if n_tiles % ki.persistent_n_tiles:
-                return False
-            if (n_tiles // ki.persistent_n_tiles) % ki.cluster_n:
-                return False
         if K % ki.split_k != 0:
             return False
         k_per_split = K // ki.split_k
@@ -349,10 +356,15 @@ def kernel_fits_shape(
     return True
 
 
+def _padded_n_tiles(ki: WmmaKernelInstance, N: int) -> int:
+    """N tiles of the launch: the real ones, filled up to whole cluster / persistent groups."""
+    group = ki.cluster_n * ki.persistent_n_tiles
+    return _ceil_div(_ceil_div(N, ki.tile_n), group) * group
+
+
 def compute_grid_ctas(ki: WmmaKernelInstance, M: int, N: int) -> int:
     gx = _ceil_div(M, ki.tile_m)
-    gy = N // ki.tile_n
-    return gx * (gy // ki.persistent_n_tiles) * ki.split_k
+    return gx * (_padded_n_tiles(ki, N) // ki.persistent_n_tiles) * ki.split_k
 
 
 def is_compute_kernel(kernel: WmmaKernelInstance) -> bool:
@@ -454,7 +466,13 @@ def tuning_kernels(
         ki
         for ki in _tuning_candidates(N)
         if kernel_fits_shape(
-            ki, M, N, K, scale_block=scale_block, b_scale_32x32=b_scale_32x32
+            ki,
+            M,
+            N,
+            K,
+            scale_block=scale_block,
+            b_scale_32x32=b_scale_32x32,
+            allow_n_tail=True,
         )
         and not (uses_cluster(ki) and M < 2 * ki.tile_m)
     ]

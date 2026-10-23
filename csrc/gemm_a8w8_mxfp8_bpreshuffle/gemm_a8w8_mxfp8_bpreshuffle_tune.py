@@ -202,7 +202,7 @@ def gfx1250_candidates(m, n, k, w_scale_block):
         kernels = (
             (kid, ki)
             for kid, ki in kernels_list.items()
-            if kernel_fits_shape(ki, m, n, k)
+            if kernel_fits_shape(ki, m, n, k, allow_n_tail=True)
         )
     return [
         (kid, ki.split_k, mxfp8_32_kernel_name(ki.name, True) if w32 else ki.name)
