@@ -340,6 +340,15 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
                 f"and ChunkK % KVBlockSize == 0 (ChunkK = N*KVBlockSize); got "
                 f"KVBlockSize={KVBlockSize}, ChunkK={ChunkK}."
             )
+            # Splits start on ChunkK boundaries and each walks whole tiles of
+            # max(KVBlockSize, 16) rows, so a ChunkK that is not a multiple of
+            # the tile would let two splits write the same columns.
+            tile_rows = max(KVBlockSize, 16)
+            assert ChunkK % tile_rows == 0, (
+                f"gfx1250 preshuffle requires ChunkK % {tile_rows} == 0 (the "
+                f"tile is max(KVBlockSize, 16) rows); got ChunkK={ChunkK}, "
+                f"KVBlockSize={KVBlockSize}."
+            )
         else:
             assert KVBlockSize == 1, (
                 f"gfx1250 base kernel requires KVBlockSize==1; got "
@@ -747,9 +756,6 @@ def deepgemm_fp8_paged_mqa_logits(
             "Preshuffle needs the KV page to be a multiple of the 16-token MFMA "
             f"tile, or to be 8. Got KVBlockSize={KVBlockSize}."
         )
-        assert not (
-            KVBlockSize < 16 and get_gfx() == "gfx1250"
-        ), f"gfx1250 preshuffle (TDM block-load) needs KVBlockSize>=16; got {KVBlockSize}."
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
     num_block = kv_cache.shape[0]

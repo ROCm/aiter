@@ -270,12 +270,14 @@ def test_paged_mqa_logits_non_preshuffle(
 
 
 @pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
-    reason="Requires the CDNA Gluon JIT paged MQA kernel",
+    get_gfx() not in ("gfx942", "gfx950", "gfx1250")
+    or not enable_jit_gluon_pa_mqa_logits_kernel,
+    reason="Requires the Gluon JIT paged MQA kernel",
 )
 # Page 8 is half the 16-token MFMA tile, 16 is exactly one, and 32 through 128
 # are several row groups per page. 256 exceeds ChunkK // 2 and so takes the
-# one-page-per-stage branch instead.
+# one-page-per-stage branch instead. On gfx1250 a page below 16 is assembled
+# into a WMMA tile from 16 // block_size TDM loads.
 @pytest.mark.parametrize("block_size", [8, 16, 32, 64, 128, 256])
 # The two ChunkK the callers ask for: the bench runs preshuffle at 128, the
 # indexer at 256.
@@ -304,6 +306,8 @@ def test_paged_mqa_logits_preshuffle(
     how the tile is assembled: below 16 it spans several pages, at 16 it is one
     group, and above 16 the kernel walks row groups inside a single page.
     """
+    if get_gfx() == "gfx1250" and chunk_k % block_size:
+        pytest.skip("gfx1250 preshuffle needs ChunkK to be a multiple of the page")
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(5614)
     fp8_dtype = dtypes.fp8
@@ -398,6 +402,41 @@ def test_paged_mqa_logits_preshuffle(
     torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
     assert torch.all(storage[:, :guard] == sentinel)
     assert torch.all(storage[:, -guard:] == sentinel)
+
+
+@pytest.mark.skipif(
+    get_gfx() != "gfx1250" or not enable_jit_gluon_pa_mqa_logits_kernel,
+    reason="gfx1250 preshuffle tile-alignment check",
+)
+@torch.inference_mode()
+def test_paged_mqa_logits_preshuffle_rejects_chunk_k_below_tile() -> None:
+    """An 8-token page makes a 16-row tile, so ChunkK=8 would let split 1 start
+    mid-tile and write columns 8-15 that split 0 also writes."""
+    device = "cuda"
+    block_size, hidden_dim, heads, context = 8, 128, 32, 16
+    q = torch.zeros(1, 1, heads, hidden_dim, device=device).to(dtypes.fp8)
+    cache = torch.zeros(
+        4, block_size, 1, hidden_dim + 4, dtype=torch.uint8, device=device
+    )
+    weights = torch.zeros(1, heads, device=device)
+    out = torch.empty(1, context, device=device)
+    context_lens = torch.tensor([context], dtype=torch.int32, device=device)
+    block_tables = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+    with pytest.raises(AssertionError, match="ChunkK % 16 == 0"):
+        deepgemm_fp8_paged_mqa_logits(
+            q,
+            cache,
+            weights,
+            out,
+            context_lens,
+            block_tables,
+            context,
+            Preshuffle=True,
+            KVBlockSize=block_size,
+            ChunkK=8,
+            TotalCuCount=1,
+            WavePerEU=2,
+        )
 
 
 @pytest.mark.skipif(
