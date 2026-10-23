@@ -90,6 +90,9 @@ NONE_WRAPPED_OP = [
     "fused_allreduce_rmsnorm",
     "fused_allreduce_rmsnorm_quant",
     "fused_qknorm_allreduce",
+    "get_mla_decode_head_plan_v1",
+    "mla_metadata_cluster_multiplier_v1",
+    "mla_reduce_v1_supports",
 ]
 
 
@@ -125,6 +128,8 @@ def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
                 type_str = "Tensor?"
         elif param_type in (torch.SymInt, int):
             type_str = "SymInt"
+        elif param_type == (int | None):
+            type_str = "SymInt?"
         elif param_type in (float, bool, str):
             type_str = param_type.__name__
         elif param_type == (torch.Generator | None):

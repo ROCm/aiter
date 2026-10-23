@@ -27,6 +27,9 @@ rename or tune a config file.
    support it. On RDNA (gfx11xx, gfx120x), it has no effect.
 8. Do not add `.gitkeep` files. Make a `<d_type>/` folder only when you add
    files to it.
+9. Put only config values in the JSON files. Do not add comments or notes,
+   for example `"_comment"` or `"_note"` keys. Put the explanation in the code
+   that reads the config, or in the PR description.
 
 ## Layout
 
