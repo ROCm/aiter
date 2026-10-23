@@ -9,7 +9,8 @@ Two coverage modes:
 * CI smoke (default, ~2 min): runs ``CI_SHAPES`` (one shape per dispatch
   path -- 1-stage, 2-stage, fallback) at ``stage=auto`` /
   ``emit_bf16=False``, sweeping ``tp_size in [2, 4, 8]`` so every
-  production TP is covered. Every case runs with and without ``gemma_norm``. Picked up automatically by
+  production TP is covered. Every case runs with and without ``gemma_norm``,
+  and once more with ``hadamard_rotate`` (Gemma weights, bf16 side output on). Picked up automatically by
   ``.github/scripts/aiter_test.sh`` which executes every multi-GPU test
   with no flags. Pass ``-t N`` to restrict to a single TP for debugging.
 * Local full sweep (~50 min across TP=2/4/8): ``--full`` runs
@@ -126,6 +127,7 @@ def _run_mxfp4_case(
     emit_bf16: bool,
     stage_override: str | None,
     gemma_norm: bool,
+    hadamard_rotate: bool,
 ):
     """Run one fused AR+RMSNorm+MXFP4 case on an initialized rank.
 
@@ -137,6 +139,7 @@ def _run_mxfp4_case(
     from aiter.dist.communication_op import (
         tensor_model_parallel_fused_allreduce_rmsnorm_quant,
     )
+    from aiter.ops.quant import per_1x32_f4_quant_hip
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
     gen = torch.Generator(device="cuda").manual_seed(case_idx)
@@ -151,7 +154,10 @@ def _run_mxfp4_case(
         ).to(dtype)
     else:
         ref = F.rms_norm(ref_residual, (shape[-1],), weight=weight, eps=eps)
-    ref_fp4, ref_scale = dynamic_mxfp4_quant(ref)
+    if hadamard_rotate:
+        ref_fp4, ref_scale = per_1x32_f4_quant_hip(ref, hadamard_rotate=True)
+    else:
+        ref_fp4, ref_scale = dynamic_mxfp4_quant(ref)
     ref_dequant = _dequant_mxfp4(ref_fp4, ref_scale)
 
     start = torch.cuda.Event(enable_timing=True)
@@ -165,6 +171,7 @@ def _run_mxfp4_case(
         quant_type="mxfp4",
         emit_bf16=emit_bf16,
         gemma_norm=gemma_norm,
+        hadamard_rotate=hadamard_rotate,
     )
     end.record()
     torch.cuda.synchronize()
@@ -204,6 +211,14 @@ def _run_mxfp4_case(
         atol=1e-2,
         rtol=1e-2,
     )
+    # The rotated epilogue must quantize the kernel's own normed output exactly as
+    # the standalone rotated quant does.
+    rotated_exact = None
+    if hadamard_rotate and bf16_out is not None:
+        want_fp4, want_scale = per_1x32_f4_quant_hip(bf16_out, hadamard_rotate=True)
+        rotated_exact = torch.equal(
+            out_fp4.view(torch.uint8), want_fp4.view(torch.uint8)
+        ) and torch.equal(scale.view(torch.uint8), want_scale.view(torch.uint8))
     bf16_err = 0.0
     if bf16_out is not None:
         bf16_err = checkAllclose(
@@ -223,6 +238,7 @@ def _run_mxfp4_case(
         "dequant_rel_l1": dequant_rel_l1,
         "residual_err": residual_err,
         "bf16_err": bf16_err,
+        "rotated_exact": rotated_exact,
     }
 
 
@@ -271,6 +287,7 @@ def _mxfp4_sweep(
             case["emit_bf16"],
             stage_override,
             case["gemma_norm"],
+            case["hadamard_rotate"],
         )
         for case_idx, case in enumerate(cases)
     ]
@@ -361,6 +378,7 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
     for i, case in enumerate(cases):
         shape, emit_bf16 = case["shape"], case["emit_bf16"]
         gemma_norm = case["gemma_norm"]
+        hadamard_rotate = case["hadamard_rotate"]
         results = [rank_results[i] for rank_results in per_rank]
         for r in results:
             out_shape, ref_shape = r["fp4_shape"]
@@ -373,6 +391,11 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
             )
             if emit_bf16:
                 assert r["has_bf16_out"]
+            if hadamard_rotate:
+                assert r["rotated_exact"], (
+                    f"rotated MXFP4 differs from per_1x32_f4_quant_hip "
+                    f"{shape=} {stage_override=}"
+                )
         expected_path = _expected_path(
             shape, tp_size, element_size, stage_override, emit_bf16
         )
@@ -383,6 +406,7 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
                 "dtype": str(dtype).replace("torch.", ""),
                 "emit_bf16": emit_bf16,
                 "gemma_norm": gemma_norm,
+                "hadamard_rotate": hadamard_rotate,
                 "stage_override": stage_override or "auto",
                 "expected_path": expected_path,
                 "min_us": min(r["us"] for r in results),
@@ -516,15 +540,34 @@ def main():
     rows = []
     for tp_size, stage_override in itertools.product(tp_sizes, stage_overrides):
         cases = [
-            {"shape": shape, "emit_bf16": emit_bf16, "gemma_norm": gemma_norm}
+            {
+                "shape": shape,
+                "emit_bf16": emit_bf16,
+                "gemma_norm": gemma_norm,
+                "hadamard_rotate": False,
+            }
             for shape, emit_bf16, gemma_norm in itertools.product(
                 shapes, emit_bf16_values, gemma_norm_values
             )
-            # When forcing a specific kernel, only exercise shapes that the
-            # kernel actually supports. Fallbacks under override would just
-            # silently re-test the unfused reference path.
+        ] + [
+            {
+                "shape": shape,
+                "emit_bf16": True,
+                "gemma_norm": True,
+                "hadamard_rotate": True,
+            }
+            for shape in shapes
+        ]
+        # When forcing a specific kernel, only exercise shapes that the
+        # kernel actually supports. Fallbacks under override would just
+        # silently re-test the unfused reference path.
+        cases = [
+            case
+            for case in cases
             if stage_override is None
-            or _expected_path(shape, tp_size, element_size, stage_override, emit_bf16)
+            or _expected_path(
+                case["shape"], tp_size, element_size, stage_override, case["emit_bf16"]
+            )
             != "fallback"
         ]
         if cases:
