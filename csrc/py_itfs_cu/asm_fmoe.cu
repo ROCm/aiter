@@ -233,7 +233,7 @@ class FMoeKernel
         {
 
             bdx = 256;
-            gdx = this->num_persistent_tgs;
+            gdx = args.total_tgs;
             gdy = 1;
             gdz = 1;
         }
@@ -272,8 +272,29 @@ class FMoeKernel
     };
 };
 
-FMoeKernel* get_heuristic_kernel(
-    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "", int block_size_M = 32)
+static int get_vskip()
+{
+    const char* vs_env_value = std::getenv("AITER_ENABLE_VSKIP");
+    return (vs_env_value != nullptr && std::string(vs_env_value) == "0") ? 0 : 1;
+}
+
+// model_dim must be a multiple of the kernel's dim_align and at least its dim_min
+// (0 = unconstrained).
+static bool kernel_fits(
+    const CFG::mapped_type& cfg, int vskip, int smf, int block_size_M, int inter_dim, int model_dim)
+{
+    return cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m && cfg.flat == 0 &&
+           inter_dim % cfg.subGU_n == 0 && model_dim % std::max(cfg.dim_align, 1) == 0 &&
+           model_dim >= cfg.dim_min;
+}
+
+FMoeKernel* get_heuristic_kernel(int inter_dim,
+                                 int sub_X_cnt,
+                                 CFG* cfgs,
+                                 int smf                 = 0,
+                                 std::string kernel_name = "",
+                                 int block_size_M        = 32,
+                                 int model_dim           = 0)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -283,12 +304,9 @@ FMoeKernel* get_heuristic_kernel(
     uint32_t round              = 0xffffffff;
     std::string arch_id         = get_gpu_arch();
     std::string selectedKl      = kernel_name.empty() ? "" : arch_id + kernel_name;
-    int vskip                   = 1;
+    int vskip                   = get_vskip();
     static SynchronizedCache<std::string_view, FMoeKernel> impl_ptr_map;
 
-    const char* vs_env_value = std::getenv("AITER_ENABLE_VSKIP");
-    if(vs_env_value != nullptr && std::string(vs_env_value) == "0")
-        vskip = 0;
     if(selectedKl.empty())
     {
         for(const auto& el : *cfgs)
@@ -296,28 +314,24 @@ FMoeKernel* get_heuristic_kernel(
             if(el.first.find(arch_id) != 0)
                 continue;
             const auto& cfg = el.second;
-            if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m &&
-               cfg.flat == 0)
+            if(kernel_fits(cfg, vskip, smf, block_size_M, inter_dim, model_dim))
             {
-                if((inter_dim % cfg.subGU_n) == 0)
+                tg_num = inter_dim / cfg.subGU_n *
+                         sub_X_cnt; // how many thread_groups are needed to handle inter_dim
+                uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
+                if(local_round < round || // fewer round is better
+                   (local_round == round &&
+                    (empty_cu > (local_round * num_cu - tg_num) || // fewer empty_cu is better
+                     (empty_cu == (local_round * num_cu - tg_num) &&
+                      cfg.ps == 1)))) // prefer PS kernel
                 {
-                    tg_num = inter_dim / cfg.subGU_n *
-                             sub_X_cnt; // how many thread_groups are needed to handle inter_dim
-                    uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
-                    if(local_round < round || // fewer round is better
-                       (local_round == round &&
-                        (empty_cu > (local_round * num_cu - tg_num) || // fewer empty_cu is better
-                         (empty_cu == (local_round * num_cu - tg_num) &&
-                          cfg.ps == 1)))) // prefer PS kernel
-                    {
-                        round      = local_round;
-                        empty_cu   = local_round * num_cu - tg_num;
-                        selectedKl = el.first;
-                        if(cfg.ps == 1)
-                            num_persistent_tgs = cfg.tg_num_perCU * num_cu;
-                        else
-                            num_persistent_tgs = 0;
-                    }
+                    round      = local_round;
+                    empty_cu   = local_round * num_cu - tg_num;
+                    selectedKl = el.first;
+                    if(cfg.ps == 1)
+                        num_persistent_tgs = cfg.tg_num_perCU * num_cu;
+                    else
+                        num_persistent_tgs = 0;
                 }
             }
         }
@@ -331,12 +345,24 @@ FMoeKernel* get_heuristic_kernel(
                     ", smf: ",
                     smf,
                     ", vskip: ",
-                    vskip);
+                    vskip,
+                    ", model_dim: ",
+                    model_dim);
     }
     auto it = cfgs->find(selectedKl);
     if(it != cfgs->end())
     {
         const auto& cfg     = it->second;
+        AITER_CHECK(model_dim % std::max(cfg.dim_align, 1) == 0 && model_dim >= cfg.dim_min,
+                    __func__,
+                    ": ",
+                    selectedKl,
+                    " requires model_dim % ",
+                    cfg.dim_align,
+                    " == 0 and model_dim >= ",
+                    cfg.dim_min,
+                    "; got model_dim=",
+                    model_dim);
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         if(cfg.ps == 1)
@@ -941,6 +967,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                         stream);
 }
 
+static CFG* get_blockscale_cfgs(ActivationType act, bool xquant)
+{
+    if(act == ActivationType::Silu)
+        return xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu
+                      : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
+    if(act == ActivationType::Gelu)
+        return xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu
+                      : &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
+    return nullptr;
+}
+
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe_fp8_blockscale_g1u1,
     (
@@ -977,17 +1014,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if(out->dtype() == AITER_DTYPE_bf16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
     {
-        bool xquant = (input->dtype() == AITER_DTYPE_bf16);
-        if(act == ActivationType::Silu)
-            config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
-        else if(act == ActivationType::Gelu)
-            config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
-        else
-            AITER_CHECK(
-                false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
+        config_map = get_blockscale_cfgs(act, input->dtype() == AITER_DTYPE_bf16);
+        AITER_CHECK(config_map != nullptr,
+                    __func__,
+                    "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
-        impl_ptr =
-            get_heuristic_kernel(inter_dim, sorted_expert_ids->size(0), config_map, 0, kernel_name_str, block_size_M);
+        impl_ptr = get_heuristic_kernel(inter_dim,
+                                        sorted_expert_ids->size(0),
+                                        config_map,
+                                        0,
+                                        kernel_name_str,
+                                        block_size_M,
+                                        down->size(1));
         impl_ptr->launch_kernel<1, 2, false>(out,
                                              input,
                                              gate,
@@ -1006,4 +1044,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     }
     else
         AITER_CHECK(false, __func__, "Unsupported the type for fmoe_fp8_blockscale_g1u1");
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT(fmoe_fp8_blockscale_g1u1_has_kernel,
+                               (int activation,
+                                int xquant,
+                                int block_size_M,
+                                int inter_dim,
+                                int model_dim,
+                                hipStream_t stream),
+                               (activation, xquant, block_size_M, inter_dim, model_dim, stream))
+{
+    CFG* config_map = get_blockscale_cfgs(static_cast<ActivationType>(activation), xquant != 0);
+    if(config_map == nullptr || inter_dim % 128 != 0)
+        return 0;
+    std::string arch_id = get_gpu_arch();
+    int vskip           = get_vskip();
+    for(const auto& el : *config_map)
+        if(el.first.find(arch_id) == 0 &&
+           kernel_fits(el.second, vskip, 0, block_size_M, inter_dim, model_dim))
+            return 1;
+    return 0;
 }

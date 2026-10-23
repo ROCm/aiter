@@ -217,13 +217,14 @@ def get_asic_revision() -> int:
 
 # Backfill map for legacy tuned configs that predate the `gfx` column.
 # These cu_num values were only ever tuned on a single arch historically:
-#   256 -> gfx950, 80/304 -> gfx942.
+#   256 -> gfx950, 80/228/304 -> gfx942.
 # Newer archs that happen to share a cu_num (e.g. gfx1250 also reports 256)
 # are always written with their real arch by the tuner, so they never rely on
 # this backfill.
 _LEGACY_CU_NUM_TO_GFX = {
     256: "gfx950",
     80: "gfx942",
+    228: "gfx942",
     304: "gfx942",
 }
 
@@ -581,7 +582,12 @@ def _get_pci_chip_id(device_id=None):
 
     # ROCm 7.1 inserted MaxAvailableVgprsPerThread ahead of PciChipId, shifting it.
     version = get_hip_runtime_version()
-    if version is not None and version[:2] < (7, 1):
+    if version is None:
+        raise RuntimeError(
+            "Could not read the HIP runtime version, so the PciChipId attribute "
+            f"of device {device_id} cannot be located."
+        )
+    if version[:2] < (7, 1):
         hipDeviceAttributePciChipId = 10019
     else:
         hipDeviceAttributePciChipId = 10020
@@ -604,18 +610,36 @@ MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
 def get_device_name():
     """Name of the device this thread is bound to.
 
-    Needs a live GPU: the arch comes from the device rather than from GPU_ARCHS.
+    Needs a live GPU: the arch, PCI id and XCD count all come from that device.
     """
-    gfx = get_gfx_runtime()
+    device_id = get_current_hip_device()
+    if device_id is None:
+        raise RuntimeError(
+            "hipGetDevice failed, so there is no current device to name."
+        )
+    return _get_device_name(device_id)
+
+
+def _get_device_name(device_id: int) -> str:
+    import torch
+
+    gfx = torch.cuda.get_device_properties(device_id).gcnArchName
+    gfx = gfx.split(":", 1)[0].lower()
 
     if gfx == "gfx942":
-        chip_id = _get_pci_chip_id()
+        chip_id = _get_pci_chip_id(device_id)
         if chip_id in MI308_CHIP_IDS:
             return "MI308"
         return "MI300"
     elif gfx == "gfx950":
+        num_xcds = _num_xcds_for_device(device_id)
+        if num_xcds is None:
+            raise RuntimeError(
+                "HIP runtime predates hipDeviceAttributeNumberOfXccs, so the XCD "
+                f"count of device {device_id} cannot be determined."
+            )
         # MI350P is a half-size gfx950: 4 XCDs against 8 on MI350X and MI355X.
-        if get_num_xcds() == 4:
+        if num_xcds == 4:
             return "MI350P"
         return "MI350"
     elif gfx == "gfx1250":
@@ -624,7 +648,7 @@ def get_device_name():
         raise RuntimeError("Unsupported gfx")
 
 
-def _query_num_xccs(device_id: int, default: int) -> int:
+def _query_num_xccs(device_id: int) -> int:
     """Ask HIP how many XCCs the given device has."""
     import ctypes
 
@@ -638,16 +662,10 @@ def _query_num_xccs(device_id: int, default: int) -> int:
         device_id,
     )
     if err != 0:
-        # An attribute this runtime cannot answer is treated the same as a
-        # runtime too old to have it, so it takes the same default.
-        logger.warning(
-            "hipDeviceGetAttribute(NumberOfXccs) failed with error %d for "
-            "device %d; assuming %d XCDs.",
-            err,
-            device_id,
-            default,
+        raise RuntimeError(
+            f"hipDeviceGetAttribute(NumberOfXccs) failed with error {err} "
+            f"for device {device_id}"
         )
-        return default
 
     # A shifted ordinal resolves to an unrelated attribute, whose value lands well
     # outside this range. Loose because MI300A has 6 dies and partitions vary.
@@ -661,45 +679,60 @@ def _query_num_xccs(device_id: int, default: int) -> int:
 
 
 @functools.cache
-def _num_xcds_for_device(device_id: int) -> int:
-    """XCD count for one device ordinal, warning once per device on fallback."""
-    default_xcd_count = 8
-
+def _num_xcds_for_device(device_id: int) -> int | None:
+    """XCD count of a device, or None for a HIP runtime that lacks the attribute."""
     version = get_hip_runtime_version()
     if version is None:
-        logger.warning(
-            "Could not read the HIP runtime version for device %d; assuming %d XCDs.",
-            device_id,
-            default_xcd_count,
+        raise RuntimeError(
+            f"Could not read the HIP runtime version for device {device_id}, "
+            "so the XCD count cannot be determined."
         )
-        return default_xcd_count
 
     # Below ROCm 7.0 the ordinal names a different attribute and returns a
     # plausible integer, so this gate has to precede the query.
     if version[:2] < (7, 0):
         logger.warning(
-            "HIP %d.%d predates hipDeviceAttributeNumberOfXccs; assuming %d "
-            "XCDs for device %d.",
-            version[0],
-            version[1],
-            default_xcd_count,
-            device_id,
+            "HIP %d.%d predates hipDeviceAttributeNumberOfXccs.", *version[:2]
         )
-        return default_xcd_count
+        return None
 
-    return _query_num_xccs(device_id, default_xcd_count)
+    return _query_num_xccs(device_id)
 
 
-def get_num_xcds() -> int:
+@functools.cache
+def _warn_xcd_fallback(reason: str, default: int) -> None:
+    logger.warning(
+        "%s; assuming %d XCDs until a later query succeeds.", reason, default
+    )
+
+
+def get_num_xcds(default: int | None = 8) -> int:
     """XCD (accelerator die) count of the device this thread is bound to.
 
-    Raises when there is no current device to ask, or when the count comes back
-    outside a plausible range.
+    Only the first successful lookup per device id is cached; a failed one is
+    retried on the next call. On failure, the default is returned and the
+    failure logged once; pass default=None to raise instead, as any caller whose
+    correctness or identity depends on the count must. A HIP runtime that lacks
+    the attribute (before 7.0) also returns the default, or raises without one.
     """
-    device_id = get_current_hip_device()
-    if device_id is None:
-        raise RuntimeError(
-            "hipGetDevice failed, so there is no current device to read the "
-            "XCD count from."
-        )
-    return _num_xcds_for_device(device_id)
+    try:
+        device_id = get_current_hip_device()
+        if device_id is None:
+            raise RuntimeError(
+                "hipGetDevice failed, so there is no current device to read the "
+                "XCD count from."
+            )
+        xcds = _num_xcds_for_device(device_id)
+    except (RuntimeError, OSError) as e:
+        if default is None:
+            raise
+        _warn_xcd_fallback(str(e), default)
+        return default
+    if xcds is None:
+        if default is None:
+            raise RuntimeError(
+                "HIP runtime predates hipDeviceAttributeNumberOfXccs, so the XCD "
+                f"count of device {device_id} cannot be determined."
+            )
+        return default
+    return xcds
