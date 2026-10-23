@@ -9,6 +9,8 @@ MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
 K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 """
 
+import math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -345,7 +347,8 @@ def pa_decode(
     splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
     into separate query CTAs. Q/K and V/output
     head dimensions must match.
-    ALiBi and externally quantized queries are unsupported.
+    ALiBi and externally quantized queries are unsupported. ``softmax_scale``
+    must be finite and positive.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -395,6 +398,12 @@ def pa_decode(
         )
     if alibi_slopes is not None:
         raise NotImplementedError("pa_decode does not support ALiBi")
+    # Masked scores are scaled after masking on some paths, so a negative or
+    # zero scale would give masked tokens weight.
+    if not (math.isfinite(softmax_scale) and softmax_scale > 0):
+        raise ValueError(
+            f"softmax_scale must be finite and positive, got {softmax_scale}"
+        )
     if not isinstance(sliding_window, int):
         raise TypeError("sliding_window must be an int")
     sliding_window = max(sliding_window, 0)

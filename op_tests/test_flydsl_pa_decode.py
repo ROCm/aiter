@@ -1112,3 +1112,36 @@ def test_pa_decode_nhd_rejected(variant, device, monkeypatch):
             value_scale=None if variant == "bf16" else scale,
             work_plan=plan,
         )
+
+
+@pytest.mark.parametrize(
+    "softmax_scale", [-(256**-0.5), 0.0, float("nan"), float("inf")]
+)
+def test_pa_decode_softmax_scale_rejected(softmax_scale, device, monkeypatch):
+    """Masked scores can be scaled after masking, so the scale must be positive."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+
+    def unexpected_compile(**_):
+        pytest.fail("a rejected softmax_scale reached kernel compilation")
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
+    query = torch.zeros((1, 8, 256), dtype=torch.bfloat16, device=device)
+    cache = torch.zeros((2, 64, 1, 256), dtype=dtypes.fp8, device=device)
+    context = torch.tensor([64], dtype=torch.int32, device=device)
+    table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    scale = torch.ones(1, dtype=torch.float32, device=device)
+    plan = pa.plan_pa_decode(context, 1, max_partitions=1)
+    with pytest.raises(ValueError, match="softmax_scale"):
+        pa.pa_decode(
+            torch.empty_like(query),
+            query,
+            cache,
+            cache,
+            context,
+            table,
+            softmax_scale,
+            1,
+            key_scale=scale,
+            value_scale=scale,
+            work_plan=plan,
+        )
