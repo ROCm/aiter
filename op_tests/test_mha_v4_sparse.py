@@ -2136,6 +2136,79 @@ def test_mha_v4_sol_raw_compile_parity(recipe, block_tile):
     assert torch.equal(eager, compiled)
 
 
+_SOL_ATTN_SMOOTHED_RECIPES = [
+    r for r in _SOL_ATTN_RAW_RECIPES if r.qk_format != AttentionFormat.BF16
+]
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@pytest.mark.parametrize("recipe", _SOL_ATTN_SMOOTHED_RECIPES, ids=lambda r: r.id)
+def test_mha_v4_sol_tolerates_k_common_mode(recipe, monkeypatch):
+    """A direction shared by every key must cost neither accuracy nor the LSE, as in mha_v4.
+
+    The shift cancels in the exact and pooled columns alike and leaves the routing threshold where
+    it was, so only the quantizers see it. Scored against sol_attn_ref on the unshifted operands
+    and the mask the call routed, whose LSE carries q @ k_mean: that one reference catches dropping
+    the mean subtraction, pooling a packed K without its shift, and leaving the LSE unrestored.
+    """
+    _skip_without_sol_row(recipe)
+    from aiter.test_mha_common import sol_attn_ref
+
+    plans = []
+
+    def recording_prepare(*args, **kwargs):
+        plans.append(sol_prepare(*args, **kwargs))
+        return plans[-1]
+
+    monkeypatch.setattr("aiter.ops.mha_v4.sol_prepare", recording_prepare)
+
+    heads = 2
+    q_tile, kv_tile = recipe.block_tile()
+    q, base_k, v = _sol_attn_raw_inputs(
+        sequence_k=16 * kv_tile, heads=heads, sequence_q=512, seed=17
+    )
+    direction = torch.randn((1, 1, heads, 128), device="cuda", dtype=torch.bfloat16)
+
+    errors, lse_errors = [], []
+    for common in (0.0, 16.0):
+        k = base_k + common * direction
+        out, lse = mha_v4_sol(
+            q,
+            k,
+            v,
+            recipe.qk_format,
+            recipe.qk_format,
+            recipe.v_format,
+            beta=0.4,
+            return_lse=True,
+        )
+        reference, reference_lse = sol_attn_ref(
+            q,
+            k,
+            v,
+            plans[-1]["block_attn_mask"],
+            _sol_attn_block_mean(k.float(), kv_tile),
+            _sol_attn_block_mean(v.float(), kv_tile),
+            BLOCK_M=q_tile,
+            BLOCK_N=kv_tile,
+            softmax_scale=_SOL_ATTN_SOFTMAX_SCALE,
+        )
+        errors.append(
+            ((out.float() - reference.float()).norm() / reference.float().norm()).item()
+        )
+        lse_errors.append((lse - reference_lse.float()).abs().max().item())
+
+    assert errors[1] < 1.5 * errors[0], (
+        f"{recipe.id} degrades under a shared K direction: "
+        f"{errors[0]:.4f} -> {errors[1]:.4f}; is K smoothing still applied?"
+    )
+    # The bound mha_v4's own LSE test allows; q @ k_mean is ~16 nats here, so a lost restore fails.
+    assert lse_errors[1] < lse_errors[0] + 0.5, (
+        f"{recipe.id} LSE degrades under a shared K direction: "
+        f"{lse_errors[0]:.4f} -> {lse_errors[1]:.4f} nats; is q @ k_mean added back?"
+    )
+
+
 @pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
 @pytest.mark.parametrize("jensen", [False, True], ids=["mean", "jensen"])
 @pytest.mark.parametrize(("recipe", "block_tile"), _sol_attn_geometry_params())
@@ -2422,6 +2495,32 @@ def test_sol_prepare_pools_scales_only_for_the_operands_that_need_them():
     per_tensor = sol_prepare(q, k_data, v_data, 0.5, num_heads=2)
     assert per_tensor["mean_k_scale"] is None
     assert per_tensor["mean_v_scale"] is None
+
+
+def test_sol_prepare_k_shift_needs_a_packed_k_of_its_shape():
+    """An addressable K pools its stored codes, which already carry the shift, so applying it again
+    would subtract it twice."""
+    q = torch.randn(1, 512, 2, 128, device="cuda", dtype=torch.bfloat16)
+    k_data = torch.randn(1, 512, 2, 128, device="cuda").to(dtypes.fp8)
+    v_data = torch.randn(1, 512, 2, 128, device="cuda").to(dtypes.fp8)
+    shift = torch.zeros(1, 2, 128, device="cuda")
+
+    with pytest.raises(ValueError, match="k_shift goes with k_packed_format"):
+        sol_prepare(q, k_data, v_data, 0.5, num_heads=2, k_shift=shift)
+
+    k_raw, k_scale = quantize_mxfp6_k(q)
+    k_quantized, _ = mxfp6_k_view(k_raw, k_scale, 1, 512, 2)
+    with pytest.raises(ValueError, match=r"k_shift must be \(batch, nheads_kv, d\)"):
+        sol_prepare(
+            q,
+            k_quantized,
+            v_data,
+            0.5,
+            num_heads=2,
+            k_source=q,
+            k_packed_format="mxfp6",
+            k_shift=shift[:, :1],
+        )
 
 
 def test_sol_prepare_with_pooled_scales_compiles_without_graph_breaks():

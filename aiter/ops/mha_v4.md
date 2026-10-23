@@ -175,9 +175,12 @@ passes share one online-softmax state, and `return_lse` reports that one softmax
 Raw API: `mha_v4_sol(..., beta=0.4)`. It takes no selection, because routing has to see the
 quantized K the kernel will read; `beta` sets the per-query-tile threshold at
 `mean_j(proxy) + beta * std_j(proxy)`, so it selects a block density rather than a block count.
-It always uses the canonical scale modes and does not apply `mha_v4`'s K-mean smoothing. It
-serves every recipe with a mode-2 row except MXFP8, whose formats are FP8's; MXFP8 runs through
-the packed API.
+It always uses the canonical scale modes, and applies `mha_v4`'s K-mean smoothing: the shared
+component is a constant shift of every score in a query row, pooled columns included, and of every
+block's routing proxy for a query tile, so neither the output nor the selection sees it, and the
+exported LSE is corrected for it as in `mha_v4`. A packed K pools from its unshifted source, so
+`sol_prepare(k_shift=...)` takes the shift its quantizer removed. It serves every recipe with a
+mode-2 row except MXFP8, whose formats are FP8's; MXFP8 runs through the packed API.
 
 Packed API: the LUT triple plus `mean_k`, `mean_v`, and `block_bitmap`, all set or all omitted, and
 rejected without a LUT triple. `aiter.ops.triton.attention.utils.sol_prepare()` produces all

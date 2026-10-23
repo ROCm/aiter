@@ -2138,6 +2138,10 @@ def mha_v4_sol(
     per-channel descale survives pooling. MXFP8 shares FP8's formats and so is not reachable here;
     it runs through mha_v4_packed.
 
+    K is smoothed as in mha_v4(): a component shared by every key is removed before quantization
+    when it dominates K. That shift cancels in the exact and pooled columns alike and does not move
+    the routing threshold; only the LSE carries it, and it is added back there.
+
     ``block_tile`` sets the routing and dispatch geometry, defaulting to the geometry this call's
     own operands dispatch at. A finer tile raises beta's resolution -- the threshold is per query
     tile, so a smaller block has less mass to hide behind -- at the cost of more work per token.
@@ -2218,20 +2222,32 @@ def mha_v4_sol(
         else block_tile
     )
 
+    # K smoothing as in mha_v4(). The shift moves every score of a query row by the same q @ k_mean,
+    # pooled columns included, since a block mean of k - k_mean is the block mean minus k_mean; and
+    # it moves every block's routing proxy for a query tile by one constant, which leaves the
+    # mean + beta * std threshold selecting the same blocks. Only the LSE keeps it.
+    k_mean = _k_mean(k, recipe.kind)
     if is_mx_recipe:
-        return _mha_v4_sol_mx(
-            q,
-            k,
-            v,
-            q_format,
-            v_format,
-            beta,
-            softmax_scale,
-            out,
+        return _with_k_mean_in_lse(
+            _mha_v4_sol_mx(
+                q,
+                k,
+                v,
+                q_format,
+                v_format,
+                beta,
+                softmax_scale,
+                out,
+                return_lse,
+                (tile_m, tile_n),
+                kv_range_tokens,
+                sorted_dispatch,
+                k_mean,
+            ),
             return_lse,
-            (tile_m, tile_n),
-            kv_range_tokens,
-            sorted_dispatch,
+            q,
+            k_mean,
+            softmax_scale,
         )
     if is_bf16_qk_recipe:
         # Nothing to quantize on the Q/K side, so the descales are placeholders the NONE scale
@@ -2239,11 +2255,14 @@ def mha_v4_sol(
         q_quantized, q_descale = q, q
         k_quantized, k_descale = k, k
     elif is_i8fp8_recipe:
+        # INT8's quantizer takes no mean, so the subtraction is materialised, as in mha_v4().
         q_quantized, q_descale = quantize_int8(q)
-        k_quantized, k_descale = quantize_int8(k)
+        k_quantized, k_descale = quantize_int8(
+            (k.float() - k_mean.unsqueeze(1)).to(k.dtype)
+        )
     else:
         q_quantized, q_descale = quantize_fp8_rotated(q)
-        k_quantized, k_descale = quantize_fp8_rotated(k)
+        k_quantized, k_descale = quantize_fp8_rotated(k, k_mean)
     v_quantized, v_descale = quantize_fp8(v) if _is_fp8_format(v_format) else (v, v)
 
     # Routed from the quantized K/V, not the BF16 inputs: the proxy scores have to be the ones the
@@ -2259,7 +2278,7 @@ def mha_v4_sol(
         num_heads=q.shape[2],
     )
 
-    return mha_v4_packed(
+    result = mha_v4_packed(
         q_quantized,
         k_quantized,
         v_quantized,
@@ -2285,6 +2304,20 @@ def mha_v4_sol(
         kv_range_tokens=kv_range_tokens,
         sorted_dispatch=sorted_dispatch,
     )
+    return _with_k_mean_in_lse(result, return_lse, q, k_mean, softmax_scale)
+
+
+def _with_k_mean_in_lse(
+    result: Union[Tensor, tuple[Tensor, Tensor]],  # noqa: UP007
+    return_lse: bool,
+    q: Tensor,
+    k_mean: Optional[Tensor],  # noqa: UP045
+    softmax_scale: Optional[float],  # noqa: UP045
+) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
+    if not return_lse:
+        return result
+    out, lse = result
+    return out, _restore_k_mean_in_lse(lse, q, k_mean, softmax_scale)
 
 
 def _mha_v4_sol_mx(
@@ -2300,31 +2333,36 @@ def _mha_v4_sol_mx(
     block_tile: tuple[int, int],
     kv_range_tokens: int,
     sorted_dispatch: Optional[bool],  # noqa: UP045
+    k_mean: Optional[Tensor],  # noqa: UP045
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
     """mha_v4_sol for a recipe with an MX operand: the FP6-P rows, and f6f8.
 
     A packed MX Q/K routes on the BF16 Q and pools K from its source; an FP8 Q/K is addressable,
     so it routes and pools on the stored codes as the per-tensor recipes do. An MX V is packed
     FP6-P and pools from its source; f6f8's FP8 V is addressable and pools on its codes.
+
+    k_mean is the K smoothing shift, which every K quantizer here subtracts. Stored codes carry it
+    already; a packed K pools from its unshifted source, so sol_prepare takes it as k_shift. The
+    returned LSE still holds the shift, for the caller to restore.
     """
     if softmax_scale is None:
         softmax_scale = 128**-0.5
     multiplier = mha_v4_q_multiplier(softmax_scale)
     if qk_format == AttentionFormat.MXFP4:
         q_quantized, q_descale = quantize_mxfp4_q(q, multiplier)
-        k_raw, k_descale = quantize_mxfp4_k(k)
+        k_raw, k_descale = quantize_mxfp4_k(k, k_mean)
         k_quantized = mxfp4_k_view(k_raw, k_descale)
         q_routing, k_source, k_packed_format = q, k, "mxfp4"
     elif qk_format == AttentionFormat.MXFP6:
         q_quantized, q_descale = quantize_mxfp6_q(q, multiplier)
-        k_raw, k_descale_raw = quantize_mxfp6_k(k)
+        k_raw, k_descale_raw = quantize_mxfp6_k(k, k_mean)
         k_quantized, k_descale = mxfp6_k_view(
             k_raw, k_descale_raw, k.shape[0], k.shape[1], k.shape[2]
         )
         q_routing, k_source, k_packed_format = q, k, "mxfp6"
     else:
         q_quantized, q_descale = quantize_fp8_rotated(q)
-        k_quantized, k_descale = quantize_fp8_rotated(k)
+        k_quantized, k_descale = quantize_fp8_rotated(k, k_mean)
         q_routing, k_source, k_packed_format = q_quantized, None, None
     v_pack = AttentionPack.V_FOR_FP6_P
     if v_format == AttentionFormat.MXFP4:
@@ -2350,6 +2388,7 @@ def _mha_v4_sol_mx(
         v_source=v if v_packed_format is not None else None,
         k_packed_format=k_packed_format,
         v_packed_format=v_packed_format,
+        k_shift=k_mean if k_packed_format is not None else None,
     )
     return mha_v4_packed(
         q_quantized,
