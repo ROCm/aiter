@@ -109,12 +109,15 @@ def _profiles(s: str, w: int, r: int) -> list[str]:
     if s == "A1":
         return ["full"]
     if s == "A2":
-        return [f"u{n}" for n in (4096, 16384, 49152, w // 8, w // 4, w // 2)]
-    if s == "A3":
-        return [_mixed(r, w, p) for p in (25, 50, 80)]
-    if s == "A4":
+        ps = [f"u{n}" for n in (4096, 16384, 49152, w // 8, w // 4, w // 2)]
+    elif s == "A3":
+        ps = [_mixed(r, w, p) for p in (25, 50, 80)]
+    elif s == "A4":
         return ["spread"]
-    raise ValueError(f"unknown slice {s!r}")
+    else:
+        raise ValueError(f"unknown slice {s!r}")
+    # W/8 can equal a fixed length, and few rows round two shares to one count.
+    return list(dict.fromkeys(ps))
 
 
 def cells(slices, rows=ROWS, ks=KS, stables=(0, 1), widths=None):
@@ -394,8 +397,9 @@ def main(argv=None):
     ap.add_argument("--arms", nargs="+", default=list(ARMS), choices=ARMS)
     ap.add_argument("--timers", nargs="+", default=["t1", "t2"], choices=("t1", "t2"))
     ap.add_argument("--rounds", type=int, default=1)
-    # main's stable kernels run up to 2x slower on some draws, so one seed is not enough.
-    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    # main's stable kernels run up to 2x slower on some draws; with 3 seeds two slow
+    # draws already move the median.
+    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     ap.add_argument("--out", default=None, help="jsonl; stdout if omitted")
     ap.add_argument("--list", action="store_true", help="count the cells and exit")
     args = ap.parse_args(argv)
