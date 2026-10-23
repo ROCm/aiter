@@ -264,8 +264,8 @@ struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits
 
 // Compile-time tile/MFMA configuration for the 16mx1_16nx4 variant (T_M=1,
 // T_N=NUM_WARPS). Used when H <= 32. KV_TILE=64, NUM_WARPS=4, BLOCK_SIZE=256.
-// SPLIT: the split-K kernel (`opus_mla_v4_prefill_split_kargs`); without it
-// the kernel is the unsplit one, its arguments and code untouched.
+// SPLIT selects the split-K kernel (`opus_mla_v4_prefill_split_kargs`).
+// The unsplit kernel joins both CSR segments in one pipelined tile stream.
 template <int Q_TILE_SIZE_  = 16,
           int KV_TILE_SIZE_ = 64,
           int D_TILE_SIZE_  = 512,
@@ -327,12 +327,12 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 
-    // Kernel uses three static buffers (KV tile, m/l, P).
+    // The unsplit path exchanges P in fp32; split-K retains D_ATTN.
     static constexpr size_t smem_size_bytes()
     {
         return smem_kv_tile_elems * sizeof(D_ATTN)
              + 2 * T_N * W_M * sizeof(D_ACC)
-             + T_N * W_M * W_N * sizeof(D_ATTN);
+             + T_N * W_M * W_N * (SPLIT ? sizeof(D_ATTN) : sizeof(D_ACC));
     }
 };
 
@@ -2157,14 +2157,18 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     const int q_token_idx = block_id_x();
     const int h_block_idx = block_id_y();
 
-    const int lane_id = thread_id_x() % T::WARP_SIZE;
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    if constexpr (!T::SPLIT) {
+        asm volatile("" : "+v"(lane_id));  // Intended to block CSE with the thread-index expression.
+    }
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
     const int64_t qo_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_qo_n + static_cast<int64_t>(h_block_start) * kargs.stride_qo_h;
 
     __shared__ char smem_kv[T::smem_kv_tile_elems * sizeof(D_ATTN)]; // for KV tiles
     __shared__ char smem_ml[2 * T::T_N * T::W_M * sizeof(D_ACC)];  // for inter-warp reduction
-    __shared__ char smem_p[T::T_N * T::W_M * T::W_N * sizeof(D_ATTN)]; // for combining P across warps before PV compute
+    using D_PROB = std::conditional_t<T::SPLIT, D_ATTN, D_ACC>;
+    __shared__ char smem_p[T::T_N * T::W_M * T::W_N * sizeof(D_PROB)];
 
     // Load Q once (shared across both segments)
     auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
@@ -2176,54 +2180,207 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     constexpr D_ACC LOG2_E = 1.44269504089f;
     const D_ACC temperature_scale = kargs.softmax_scale * LOG2_E;
 
-    v_q = load<T::VEC_Q>(g_q, u_q);
+    if constexpr (T::SPLIT) {
+        v_q = load<T::VEC_Q>(g_q, u_q);
+    }
 
     // Initialize shared attention state
     clear(v_o);
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
-    // Split-K: this split's share of the token's keys -- prefix, then extend
-    // -- in whole tiles.
-    [[maybe_unused]] int split_lo = 0, split_hi = 0, prefix_len = 0;
-    if constexpr (T::SPLIT) {
-        prefix_len = kargs.kv_indptr_prefix[q_token_idx + 1] - kargs.kv_indptr_prefix[q_token_idx];
-        const int extend_len = kargs.kv_indptr_extend[q_token_idx + 1] - kargs.kv_indptr_extend[q_token_idx];
-        const int chunk = ceil_div(ceil_div(prefix_len + extend_len, args.num_splits), T::KV_TILE_SIZE) * T::KV_TILE_SIZE;
-        split_lo = block_id_z() * chunk;
-        split_hi = split_lo + chunk;
-    }
+    if constexpr (!T::SPLIT) {
+        const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+        auto s_kv = make_smem(reinterpret_cast<D_ATTN*>(smem_kv));
+        auto s_m  = make_smem(reinterpret_cast<D_ACC*>(smem_ml));
+        auto s_l  = make_smem(reinterpret_cast<D_ACC*>(smem_ml) + T::T_N * T::W_M);
+        auto s_p  = make_smem(reinterpret_cast<D_ACC*>(smem_p));
 
-    // ──── Prefix segment ────
-    {
-        int page_idx_begin       = kargs.kv_indptr_prefix[q_token_idx];
-        const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
-        int valid_kv_len         = page_idx_end - page_idx_begin;
-        if constexpr (T::SPLIT) {
-            const int begin = min(split_lo, valid_kv_len);
-            valid_kv_len    = max(min(split_hi, valid_kv_len) - begin, 0);
-            page_idx_begin += begin;
+        auto mma0 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
+            seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_E_K>{},
+            seq<T::T_M, T::T_N, T::T_K>{},
+            seq<T::W_M, T::W_N, T::W_K>{},
+            mfma_adaptor_swap_ab{});
+        auto mma1 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
+            seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
+            seq<T::T_M, T::T_N, T::T_K>{},
+            seq<T::W_M, T::W_N, T::W_K>{},
+            mfma_adaptor_swap_ab{});
+
+        auto u_gkv        = make_layout_gkv<T>(lane_id);
+        auto u_skv        = make_layout_skv<T>(warp_id);
+        auto u_rk         = make_layout_rk<T>(warp_id, lane_id);
+        auto u_rv         = make_layout_rv<T>(warp_id, lane_id);
+        auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
+
+        constexpr index_t s_len = vector_traits<typename decltype(mma0)::vtype_c>::size();
+        constexpr int SKV_HALF = T::NUM_WARPS * T::smem_d_rpt * (T::smem_linear_wave + T::smem_padding_32B);
+
+        // Join the CSR tile streams and issue the next gather before each tile's
+        // compute. Load the Q tile after the first gather to allow overlap.
+        const int pfx_begin = kargs.kv_indptr_prefix[q_token_idx];
+        const int pfx_len   = kargs.kv_indptr_prefix[q_token_idx + 1] - pfx_begin;
+        const int ext_begin = kargs.kv_indptr_extend[q_token_idx];
+        const int ext_len   = kargs.kv_indptr_extend[q_token_idx + 1] - ext_begin;
+        const int pfx_tiles = ceil_div(pfx_len, T::KV_TILE_SIZE);
+        const int ext_tiles = ceil_div(ext_len, T::KV_TILE_SIZE);
+        const int num_tiles = pfx_tiles + ext_tiles;
+
+        auto g_idx_pfx = make_gmem(kargs.kv_indices_prefix + pfx_begin, pfx_len * sizeof(int));
+        auto g_idx_ext = make_gmem(kargs.kv_indices_extend + ext_begin, ext_len * sizeof(int));
+        auto p_kv_pfx = reinterpret_cast<const D_ATTN*>(kargs.unified_kv_ptr);
+        auto p_kv_ext = reinterpret_cast<const D_ATTN*>(kargs.kv_ptr);
+
+        auto idx_load = [&](int t) {
+            if (t < pfx_tiles) return load(g_idx_pfx, u_kv_indices, t * T::KV_TILE_SIZE);
+            return load(g_idx_ext, u_kv_indices, (t - pfx_tiles) * T::KV_TILE_SIZE);
+        };
+
+        typename decltype(mma0)::vtype_b v_k;
+        typename decltype(mma0)::vtype_c v_s;
+        typename decltype(mma1)::vtype_a v_p;
+        typename decltype(mma1)::vtype_b v_v;
+        auto v_p_warps = reinterpret_cast<vector_t<D_ATTN, s_len>*>(&v_p);
+        decltype(idx_load(0)) kv_page;
+
+        if (num_tiles > 0) {
+            kv_page = idx_load(0);
+            s_waitcnt_vmcnt(0_I);
+            auto p_kv0 = (pfx_tiles > 0) ? p_kv_pfx : p_kv_ext;
+            global_load<T::VEC_KV>(p_kv0 + static_cast<int64_t>(kv_page[0]) * kargs.stride_kv_page, s_kv.ptr, u_gkv, u_skv);
+            global_load<T::VEC_KV>(p_kv0 + static_cast<int64_t>(kv_page[1]) * kargs.stride_kv_page, s_kv.ptr, u_gkv, u_skv + SKV_HALF);
+            kv_page = idx_load(1);
         }
-        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
-    }
+        v_q = load<T::VEC_Q>(g_q, u_q);
 
-    __builtin_amdgcn_s_barrier();
+        for (int t = 0; t < num_tiles; ++t) {
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
 
-    // ──── Extend segment ────
-    {
-        int page_idx_begin       = kargs.kv_indptr_extend[q_token_idx];
-        const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
-        int valid_kv_len         = page_idx_end - page_idx_begin;
-        if constexpr (T::SPLIT) {
-            const int begin = min(max(split_lo - prefix_len, 0), valid_kv_len);
-            valid_kv_len    = min(max(split_hi - prefix_len, 0), valid_kv_len) - begin;
-            page_idx_begin += begin;
+            v_k = load<T::VEC_KV>(s_kv, u_rk);
+            v_v = tr_load<T::VEC_TR_V>(s_kv, u_rv);
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+
+            if (t + 1 < num_tiles) {
+                auto p_kv_n = ((t + 1) < pfx_tiles) ? p_kv_pfx : p_kv_ext;
+                global_load<T::VEC_KV>(p_kv_n + static_cast<int64_t>(kv_page[0]) * kargs.stride_kv_page, s_kv.ptr, u_gkv, u_skv);
+                global_load<T::VEC_KV>(p_kv_n + static_cast<int64_t>(kv_page[1]) * kargs.stride_kv_page, s_kv.ptr, u_gkv, u_skv + SKV_HALF);
+                kv_page = idx_load(t + 2);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+
+            const int seg_len = (t < pfx_tiles) ? pfx_len : ext_len;
+            const int seg_tile = (t < pfx_tiles) ? t : (t - pfx_tiles);
+
+            v_s = mma0(v_q, v_k);
+            attn_mask_oob_score<T>(v_s, seg_len, seg_tile, warp_id, lane_id);
+
+            // Compute P with each warp's maximum, then exchange both together.
+            // Rescale the gathered P values after reducing the warp maxima.
+            D_ACC w_max = -1e30f;
+            static_for<s_len>([&](auto i) { w_max = max(w_max, v_s[i.value]); });
+            {
+                vector_t<u32_t, 2> wm32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<u32_t>(w_max), std::bit_cast<u32_t>(w_max), false, true);
+                w_max = max(std::bit_cast<float>(wm32.x), std::bit_cast<float>(wm32.y));
+                vector_t<u32_t, 2> wm16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<u32_t>(w_max), std::bit_cast<u32_t>(w_max), false, true);
+                w_max = max(std::bit_cast<float>(wm16.x), std::bit_cast<float>(wm16.y));
+            }
+            w_max *= temperature_scale;
+            attn_row_scale_sub<T>(v_s, temperature_scale, w_max);
+            attn_exp2_slice<T, 0, s_len>(v_s);
+            attn_mask_oob_value<T>(v_v, seg_len, seg_tile, lane_id);
+
+            const int row_idx = lane_id % T::W_M;
+            store(s_m, w_max, row_idx * T::T_N + (warp_id % T::T_N));
+            store<s_len>(s_p, v_s, warp_id * T::W_M * T::W_N + lane_id * s_len);
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+            auto max_warps = load<T::T_N>(s_m, row_idx * T::T_N);
+            vector_t<D_ACC, s_len> p_warps[T::NUM_WARPS];
+            static_for<T::NUM_WARPS>([&](auto i) {
+                p_warps[i.value] = load<s_len>(s_p, i.value * T::W_M * T::W_N + lane_id * s_len);
+            });
+            s_waitcnt_lgkmcnt(0_I);
+
+            D_ACC row_max = m_row;
+            static_for<T::T_N>([&](auto i) { row_max = max(row_max, max_warps[i.value]); });
+            D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            m_row = row_max;
+            l_row *= rescale_m;
+            scale_output_tile<T>(v_o, rescale_m);
+
+            // Keep lane-local denominator sums across tiles. The P exchange
+            // covers every warp, so the final sum needs only lane exchanges.
+            D_ACC row_sum = 0.0f;
+            vector_t<D_ACC, s_len> p_scaled;
+            static_for<T::NUM_WARPS>([&](auto i) {
+                const D_ACC wsc = __builtin_amdgcn_exp2f(max_warps[i.value] - row_max);
+                static_for<s_len>([&](auto j) {
+                    const D_ACC x = p_warps[i.value][j.value] * wsc;
+                    p_scaled[j.value] = x;
+                    row_sum += x;
+                });
+                v_p_warps[i.value] = cast<D_ATTN>(p_scaled);
+            });
+            l_row += row_sum;
+
+            v_o = mma1(v_p, v_v, v_o);
         }
-        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
+        // Reduce the lane-local denominator sums after the last tile.
+        {
+            vector_t<u32_t, 2> rs32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<u32_t>(l_row), std::bit_cast<u32_t>(l_row), false, true);
+            l_row = std::bit_cast<float>(rs32.x) + std::bit_cast<float>(rs32.y);
+            vector_t<u32_t, 2> rs16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<u32_t>(l_row), std::bit_cast<u32_t>(l_row), false, true);
+            l_row = std::bit_cast<float>(rs16.x) + std::bit_cast<float>(rs16.y);
+        }
+        (void)s_l;
+    } else {
+        // Split-K: this split's share of the token's keys -- prefix, then extend
+        // -- in whole tiles.
+        [[maybe_unused]] int split_lo = 0, split_hi = 0, prefix_len = 0;
+        if constexpr (T::SPLIT) {
+            prefix_len = kargs.kv_indptr_prefix[q_token_idx + 1] - kargs.kv_indptr_prefix[q_token_idx];
+            const int extend_len = kargs.kv_indptr_extend[q_token_idx + 1] - kargs.kv_indptr_extend[q_token_idx];
+            const int chunk = ceil_div(ceil_div(prefix_len + extend_len, args.num_splits), T::KV_TILE_SIZE) * T::KV_TILE_SIZE;
+            split_lo = block_id_z() * chunk;
+            split_hi = split_lo + chunk;
+        }
+
+        // ──── Prefix segment ────
+        {
+            int page_idx_begin       = kargs.kv_indptr_prefix[q_token_idx];
+            const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
+            int valid_kv_len         = page_idx_end - page_idx_begin;
+            if constexpr (T::SPLIT) {
+                const int begin = min(split_lo, valid_kv_len);
+                valid_kv_len    = max(min(split_hi, valid_kv_len) - begin, 0);
+                page_idx_begin += begin;
+            }
+            const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+
+            mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
+        }
+
+        __builtin_amdgcn_s_barrier();
+
+        // ──── Extend segment ────
+        {
+            int page_idx_begin       = kargs.kv_indptr_extend[q_token_idx];
+            const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
+            int valid_kv_len         = page_idx_end - page_idx_begin;
+            if constexpr (T::SPLIT) {
+                const int begin = min(max(split_lo - prefix_len, 0), valid_kv_len);
+                valid_kv_len    = min(max(split_hi - prefix_len, 0), valid_kv_len) - begin;
+                page_idx_begin += begin;
+            }
+            const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+
+            mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
+        }
+
     }
 
     if constexpr (T::SPLIT) {
