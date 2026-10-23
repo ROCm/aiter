@@ -98,7 +98,41 @@ unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 # The dry run is on a CPU-only node, so aiter's rocminfo arch probe finds no GPU and `import
 # aiter` dies. GPU_ARCHS lets aiter import/codegen for a named arch without a live GPU
 # (aiter/jit/utils/chip_info.py). Match the real target (gfx950); override with DRY_GPU_ARCHS.
-[[ $DRY_RUN == 1 ]] && export GPU_ARCHS=${DRY_GPU_ARCHS:-gfx950}
+if [[ $DRY_RUN == 1 ]]; then
+  # CPU-only rehearsal node. GPU_ARCHS lets aiter import/codegen for a named arch with no GPU,
+  # but a few import-time constants (e.g. aiter/utility/dtypes.py) call get_gfx_runtime(), which
+  # ALWAYS shells out to rocminfo and ignores GPU_ARCHS -> "No gfx arch found" with no GPU. Shim a
+  # fake rocminfo on PATH reporting the target arch so the GPU-less import finishes. The dry run
+  # never launches a kernel, so the spoofed arch/CU only feed dtype/CU constants. Override arch
+  # with DRY_GPU_ARCHS, CU count with DRY_CU_NUM.
+  export GPU_ARCHS=${DRY_GPU_ARCHS:-gfx950}
+  export CU_NUM=${DRY_CU_NUM:-256}
+  arch=${GPU_ARCHS%%;*}
+  mkdir -p /work/home/fakebin
+  { printf '#!/bin/sh\n'
+    printf 'echo "  Name:                    %s"\n' "$arch"
+    printf 'echo "  Marketing Name:          AMD Instinct (dry-run stub)"\n'
+    printf 'echo "  Device Type:             GPU"\n'
+    printf 'echo "  ASIC Revision:           0"\n'
+    printf 'echo "  Compute Unit:            %s"\n' "$CU_NUM"
+  } > /work/home/fakebin/rocminfo
+  chmod +x /work/home/fakebin/rocminfo
+  export PATH=/work/home/fakebin:$PATH
+fi
+# ROCm pip/venv image shim (applies to the dry AND the real run -- same image). This rocm/pytorch
+# build ships ROCm as pip packages with no /opt/rocm. hipcc (ROCM_HOME=<venv>) COMPILES fine --
+# it finds its device-library bitcode relative to itself -- but aiter then LINKS with
+# `-L<venv>/lib -lamdhip64`, while the hip runtime actually lives in the _rocm_sdk_core package as
+# libamdhip64.so.7 with no unversioned soname -> "cannot find -lamdhip64". Fix: drop an unversioned
+# libamdhip64.so into <venv>/lib where aiter's linker looks. Deliberately do NOT set ROCM_PATH to
+# _rocm_sdk_core -- that moves hipcc off the layout where it locates the device libraries and the
+# compile fails instead of the link.
+hipcc_bin=$(command -v hipcc || true)
+if [[ -n $hipcc_bin ]]; then
+  venv=$(dirname "$(dirname "$hipcc_bin")")
+  hip_real=$(ls "$venv"/lib/python*/site-packages/_rocm_sdk_core/lib/libamdhip64.so.* 2>/dev/null | head -1)
+  [[ -n ${hip_real:-} && ! -e $venv/lib/libamdhip64.so ]] && ln -s "$hip_real" "$venv/lib/libamdhip64.so" 2>/dev/null || true
+fi
 cd /work/aiter
 python -m pip install -r requirements.txt pyzmq tabulate
 cd "$TUNE_REL"
