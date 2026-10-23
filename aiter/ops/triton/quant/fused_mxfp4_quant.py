@@ -350,7 +350,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     scaling_mode: str = "even",
     shuffle: bool = False,
     scale_shuffle_padding: bool = False,
-    dtype: float | None = torch.bfloat16,
+    dtype: torch.dtype | None = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply reduction along the first dimension and apply the activation function + per-token group quantization to MX FP4 format.
@@ -379,6 +379,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
             - etc.
         shuffle: Indicates whether to enable preshuffling of scales.
             - When enabled, scale dimensions (X, Y) are adjusted to be multiples of 8 and 256, respectively.
+        dtype: dtype of y2. If None, y2 has the dtype of x2.
     Returns:
         tuple: (y, y_scale), y2
             if shuffle or scale_shuffle_padding:
@@ -419,7 +420,9 @@ def fused_reduce_act_mul_and_mxfp4_quant(
             x_num_splitk > 1
         ), "x.shape[0] should be larger then 1 in x.dim() == 3 cases"
         X_HAS_SPLITK = True
-        y2 = torch.empty((M, N2), dtype=dtype, device=x2.device)
+        y2 = torch.empty(
+            (M, N2), dtype=dtype if dtype is not None else x2.dtype, device=x2.device
+        )
     else:
         M, N1 = x.shape
     # Activation (N/2) and storing results in uint8 (N/2) results in a feature dimension of N/4
@@ -999,7 +1002,7 @@ def fused_quant_fp8_sort(
         DTYPE_MAX = 448.0
         DTYPE_MIN = -448.0
 
-    x_fp8 = torch.empty_like(input, dtype=quant_dtype, device="cuda")
+    x_fp8 = torch.empty_like(input, dtype=quant_dtype, device=input.device)
     M_o, N_o = sorted_ids.shape[0], N_blocks
 
     # [M_sorted_blocks/2, N_blocks/2, BLOCK_SIZE_N_u32, BLOCK_SIZE_M_u32]

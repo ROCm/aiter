@@ -22,8 +22,6 @@ from aiter.ops.qsa import qsa_select_paged_tokens
 from aiter.ops.triton.attention.qsa import qsa_sparse_paged_gqa
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
-torch.set_default_device("cuda")
-
 # Qwen3.8-Flash-Next-120B model config
 BLOCK_SIZE = 64
 RATIO = 4
@@ -48,30 +46,45 @@ def _make_scenario(batch, tokens_per_seq, context_len):
     pages_per_req = (context_len + BLOCK_SIZE - 1) // BLOCK_SIZE
     total_pages = batch * pages_per_req
 
-    positions = torch.arange(rows, dtype=torch.int32)
+    positions = torch.arange(rows, dtype=torch.int32, device="cuda")
     for b in range(batch):
         start = b * tokens_per_seq
         positions[start : start + tokens_per_seq] = torch.arange(
             context_len - tokens_per_seq,
             context_len,
             dtype=torch.int32,
+            device="cuda",
         )
 
-    tables = torch.randint(0, total_pages, (batch, pages_per_req), dtype=torch.int32)
-    requests = torch.arange(batch, dtype=torch.int32).repeat_interleave(tokens_per_seq)
-    lengths = torch.full((batch,), context_len, dtype=torch.int32)
+    tables = torch.randint(
+        0, total_pages, (batch, pages_per_req), dtype=torch.int32, device="cuda"
+    )
+    requests = torch.arange(batch, dtype=torch.int32, device="cuda").repeat_interleave(
+        tokens_per_seq
+    )
+    lengths = torch.full((batch,), context_len, dtype=torch.int32, device="cuda")
 
-    index_q = torch.randn(rows, INDEX_HEADS, INDEX_DIM, dtype=torch.bfloat16)
+    index_q = torch.randn(
+        rows, INDEX_HEADS, INDEX_DIM, dtype=torch.bfloat16, device="cuda"
+    )
     compressed = torch.randn(
         total_pages,
         COMPRESSED_PAGE_SIZE,
         1,
         INDEX_DIM,
         dtype=torch.bfloat16,
+        device="cuda",
     )
-    query = torch.randn(rows, QUERY_HEADS, QUERY_DIM, dtype=torch.bfloat16)
+    query = torch.randn(
+        rows, QUERY_HEADS, QUERY_DIM, dtype=torch.bfloat16, device="cuda"
+    )
     keys = torch.randn(
-        total_pages, BLOCK_SIZE, KV_HEADS, QUERY_DIM, dtype=torch.bfloat16
+        total_pages,
+        BLOCK_SIZE,
+        KV_HEADS,
+        QUERY_DIM,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     values = torch.randn_like(keys)
     return {

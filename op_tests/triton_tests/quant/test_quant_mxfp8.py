@@ -220,8 +220,14 @@ def test_fp8_legacy_to_mxfp8_preallocated():
     torch.manual_seed(5)
 
     M, N = 16, 256
-    x_fnuz = (torch.randn((M, N), device="cuda") * 4).to(torch.float8_e4m3fnuz)
-    x_scale_fp32 = torch.rand((M, N // LEGACY_BLOCK_SIZE), device="cuda") * 0.5 + 0.25
+    x_fnuz = (torch.randn((M, N), dtype=torch.float32, device="cuda") * 4).to(
+        torch.float8_e4m3fnuz
+    )
+    x_scale_fp32 = (
+        torch.rand((M, N // LEGACY_BLOCK_SIZE), dtype=torch.float32, device="cuda")
+        * 0.5
+        + 0.25
+    )
     y_pre = torch.empty((M, N), dtype=torch.float8_e4m3fn, device="cuda")
     s_pre = torch.empty((M, N // QUANT_BLOCK_SIZE), dtype=torch.uint8, device="cuda")
     y, s = fp8_legacy_to_mxfp8(x_fnuz, x_scale_fp32, y_fn=y_pre, y_scale=s_pre)
@@ -573,8 +579,10 @@ def torch_kv_record_ref(kv, positions, cos_sin):
 def _make_inputs(T, H, padded_heads, nb, block, seed=0):
     torch.manual_seed(seed)
     dev = "cuda"
-    q = (torch.randn(T, H, _QK, device=dev) * 0.125).to(torch.bfloat16)
-    kv = (torch.randn(T, _QK, device=dev) * 0.4).to(torch.bfloat16)
+    q = (torch.randn(T, H, _QK, device=dev, dtype=torch.float32) * 0.125).to(
+        torch.bfloat16
+    )
+    kv = (torch.randn(T, _QK, device=dev, dtype=torch.float32) * 0.4).to(torch.bfloat16)
     # 0xCD, not zero: a record the kernel fails to write shows up as garbage
     # rather than silently matching a zeroed reference.
     cache = torch.full((nb, block, _REC), 0xCD, dtype=torch.uint8, device=dev)
@@ -601,7 +609,9 @@ def test_fused_deepseek_v4_mxfp8_quant_q_pack(T, H, mag):
     """
     _skip_without_fp8()
     torch.manual_seed(0)
-    q = (torch.randn(T, H, _QK, device="cuda") * mag).to(torch.bfloat16)
+    q = (torch.randn(T, H, _QK, device="cuda", dtype=torch.float32) * mag).to(
+        torch.bfloat16
+    )
     got_p, got_r = fused_deepseek_v4_mxfp8_quant_q_pack(q)
     exp_p, exp_r = torch_pack_q_ref(q)
 
@@ -1044,7 +1054,13 @@ def test_fused_deepseek_v4_kv_writers_agree(use_fnuz):
     q, kv, cache, slot, pos, _ = _make_inputs(8, 16, 16, nb=2, block=64)
     kv[0, 0] = 230.0
     half = _ROPE // 2
-    cs = torch.cat([torch.ones(256, half), torch.zeros(256, half)], dim=-1).to("cuda")
+    cs = torch.cat(
+        [
+            torch.ones(256, half, device="cuda", dtype=torch.float32),
+            torch.zeros(256, half, device="cuda", dtype=torch.float32),
+        ],
+        dim=-1,
+    )
 
     a, b = cache.clone(), cache.clone()
     fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
@@ -1108,7 +1124,9 @@ def _compressor_inputs(tokens, cfg, seed=0):
     kv_cache = kv_backing[:, : cfg["kv_page"], :]
 
     # a real rotation, not the identity the benchmark uses
-    ang = torch.randn(cfg["cos_sin_rows"], cfg["rope_dim"] // 2, device=dev)
+    ang = torch.randn(
+        cfg["cos_sin_rows"], cfg["rope_dim"] // 2, device=dev, dtype=torch.float32
+    )
     cos_sin_cache = torch.cat([ang.cos(), ang.sin()], dim=-1).to(torch.float32)
 
     # distinct records: slot s lands in block s // kv_page, row s % kv_page,
@@ -1347,10 +1365,12 @@ def test_compress_norm_rope_store_matches_reference(
         0, a.state_cache.shape[0], a.block_table.shape, dtype=torch.int32, device=dev
     )
     grp = torch.arange(hd, device=dev) // _GROUP
-    gain = torch.where(grp < _NUM_TILES, torch.exp2(3.0 * (grp - 3)), 1.0)
-    a.rms_norm_weight = ((torch.rand(hd, device=dev) * 0.5 + 0.75) * gain).to(
-        torch.bfloat16
+    gain = torch.where(
+        grp < _NUM_TILES, torch.exp2(3.0 * (grp - 3).to(torch.float32)), 1.0
     )
+    a.rms_norm_weight = (
+        (torch.rand(hd, device=dev, dtype=torch.float32) * 0.5 + 0.75) * gain
+    ).to(torch.bfloat16)
     # -1 on each map separately: they are checked at different points
     a.slot_mapping = a.slot_mapping.clone()
     a.slot_mapping[1] = -1

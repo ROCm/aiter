@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from enum import IntEnum
+
 import torch
 
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
@@ -28,6 +30,13 @@ def hipb_destroy_extension() -> None:
     """
 
 
+class HipblasLtMatmulScaleMode(IntEnum):
+    SCALAR_32F = 0
+    VEC32_UE8M0 = 2
+    OUTER_VEC_32F = 3
+    BLK32_UE8M0_32_8_EXT = 1001
+
+
 def gen_hipb_mm_fake_tensor(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
@@ -40,6 +49,8 @@ def gen_hipb_mm_fake_tensor(
     bpreshuffle: bool | None = None,
     use_gelu: bool | None = None,
     out: torch.Tensor | None = None,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ):
     return torch.empty(
         (mat1.size(0), mat2.size(1)),
@@ -73,6 +84,8 @@ def _hipb_mm(
     scaleOut: torch.Tensor | None = None,
     bpreshuffle: bool | None = None,
     use_gelu: bool | None = None,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ) -> None: ...
 
 
@@ -88,6 +101,8 @@ def hipb_mm(
     bpreshuffle: bool | None = None,
     use_gelu: bool | None = None,
     out: torch.Tensor | None = None,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ) -> torch.Tensor:
     """``out``: the [M, N] tensor to write instead of allocating; returned."""
     dtype = _hipb_mm_out_dtype(mat1, out_dtype, out)
@@ -107,6 +122,8 @@ def hipb_mm(
         scaleOut,
         bpreshuffle,
         use_gelu,
+        scaleA_mode,
+        scaleB_mode,
     )
     return result
 
@@ -130,6 +147,8 @@ def _hipb_findallsols(
     scaleC: torch.Tensor | None = None,
     bpreshuffle: bool = False,
     use_gelu: bool = False,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ) -> list[int]: ...
 
 
@@ -143,13 +162,25 @@ def hipb_findallsols(
     scaleC: torch.Tensor | None = None,
     bpreshuffle: bool = False,
     use_gelu: bool = False,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ) -> list[int]:
     out_dtype = out_dtype if out_dtype is not None else mat1.dtype
     result = torch.empty(
         (mat1.size(0), mat2.size(1)), dtype=out_dtype, device=mat1.device
     )
     return _hipb_findallsols(
-        mat1, mat2, result, bias, scaleA, scaleB, scaleC, bpreshuffle, use_gelu
+        mat1,
+        mat2,
+        result,
+        bias,
+        scaleA,
+        scaleB,
+        scaleC,
+        bpreshuffle,
+        use_gelu,
+        scaleA_mode,
+        scaleB_mode,
     )
 
 
