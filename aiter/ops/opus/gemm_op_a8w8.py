@@ -11,6 +11,10 @@
 import torch
 from torch import Tensor
 
+from csrc.opus_gemm.opus_gemm_common import (
+    a8w8_mxscale_bmm_kernels_list,
+)
+
 from ...jit.core import compile_ops
 from ._arch import _device_arch
 from .launch_plan import (
@@ -368,6 +372,7 @@ def _validate_a8w8_mxscale_bmm_tensors(
     Y: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
+    kid: int,
 ) -> None:
     entry = "opus_gemm_a8w8_mxscale_bmm_launch"
     tensors = (XQ, WQ, Y, x_scale, w_scale)
@@ -395,8 +400,17 @@ def _validate_a8w8_mxscale_bmm_tensors(
     w_batch, N, w_K = map(int, WQ.shape)
     if min(M, batch, N, K) <= 0:
         raise ValueError(f"{entry}: M, batch, N and K must be positive")
-    if N % 128 or K % 128:
-        raise ValueError(f"{entry}: N and K must be multiples of 128; got N={N}, K={K}")
+    # The kid's own quantisation block, read off the same instance table the
+    # generated kid->group table in C++ is built from. It used to be a literal
+    # 128 here and in opus_bmm_a8w8_common_checks, and fixing only the C++ copy
+    # left this one rejecting every correct GROUP_K=32 launch that reached it --
+    # the same rule living in two places and drifting.
+    inst = a8w8_mxscale_bmm_kernels_list[int(kid)]
+    group_n, group = inst.GROUP_N, inst.GROUP_K
+    if N % group_n or K % group:
+        raise ValueError(
+            f"{entry}: N and K must be multiples of {group_n} and {group}; got N={N}, K={K}"
+        )
     if (w_batch, w_K) != (batch, K):
         raise ValueError(
             f"{entry}: WQ must have shape [{batch},N,{K}], got {tuple(WQ.shape)}"
@@ -405,8 +419,8 @@ def _validate_a8w8_mxscale_bmm_tensors(
         raise ValueError(
             f"{entry}: Y must have shape {(M, batch, N)}, got {tuple(Y.shape)}"
         )
-    expected_x_scale = (M, batch, K // 128)
-    expected_w_scale = (batch, N // 128, K // 128)
+    expected_x_scale = (M, batch, K // group)
+    expected_w_scale = (batch, N // group_n, K // group)
     if tuple(x_scale.shape) != expected_x_scale:
         raise ValueError(
             f"{entry}: x_scale must have shape {expected_x_scale}, "
@@ -493,6 +507,7 @@ def _launch_a8w8_mxscale_bmm(
             launch_y,
             launch_x_scale,
             w_scale,
+            int(kid),
         )
         required_numel = workspace_spec.shape[0]
         if launch_workspace is None:
@@ -545,4 +560,176 @@ def _launch_a8w8_mxscale_bmm(
     return Y
 
 
-__all__ = ["opus_gemm_a8w8_blockscale_bpreshuffle_tune"]
+def bmm_a8w8_mxscale_opus(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    *,
+    group_size: int = 128,
+) -> Tensor:
+    """Run OPUS MXFP8 BMM with a row-major weight.
+
+    ``x`` is [M, G, K], ``wo_a`` is [G, N, K], ``x_scale`` is
+    [M, G, K/group_size], and ``w_scale`` is
+    [G, N/group_size, K/group_size]. Scales are ordinary E8M0 blocks;
+    ``group_size`` is 32 or 128. Returns ``out`` [M, G, N], allocating it
+    with ``dtype`` when omitted.
+
+    ``kernelId=None`` selects the shape heuristic. An incompatible tuned id
+    falls back to a compatible kernel and drops its splitK. ``splitK=None``,
+    0 and 1 all mean no split. Use :func:`bmm_a8w8_mxscale_opus_bpreshuffle`
+    for a weight already in the (16, 16) MFMA-fragment layout.
+    """
+    from .policy import (
+        _heuristic_mxscale_bmm_kid,
+        _validate_mxscale_bmm_group_size,
+        mxscale_bmm_kid_block,
+        mxscale_bmm_kid_runs_m,
+        mxscale_bmm_kid_takes_b_layout,
+        mxscale_bmm_kid_takes_plain_scales,
+    )
+
+    _validate_mxscale_bmm_group_size(group_size)
+    block = f"{group_size}x{group_size}"
+    m, g, k = map(int, x.shape)
+    n = int(wo_a.shape[1])
+    Y = out if out is not None else torch.empty((m, g, n), dtype=dtype, device=x.device)
+
+    # A stale tuned row may name a different layout, scale block or M alignment.
+    # Discard its splitK along with the id before choosing a row-major fallback.
+    if kernelId is not None and not (
+        mxscale_bmm_kid_takes_b_layout(int(kernelId), False)
+        and mxscale_bmm_kid_takes_plain_scales(int(kernelId))
+        and mxscale_bmm_kid_block(int(kernelId)) == block
+        and mxscale_bmm_kid_runs_m(int(kernelId), m)
+    ):
+        kernelId = splitK = None
+    if kernelId is None:
+        kernelId = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
+
+    return _launch_bmm_a8w8_mxscale_opus(
+        x, wo_a, x_scale, w_scale, Y, kid=int(kernelId), split_k=splitK
+    )
+
+
+def bmm_a8w8_mxscale_opus_bpreshuffle(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    *,
+    group_size: int = 128,
+    group_n: int | None = None,
+) -> Tensor:
+    """Run OPUS MXFP8 BMM with an already preshuffled weight.
+
+    ``wo_a`` [G, N, K] must come from ``shuffle_weight(w, layout=(16, 16))``;
+    this entry does not shuffle it. ``x`` is [M, G, K], ``x_scale`` is
+    [M, G, K/group_size], and ``w_scale`` is
+    [G, N/group_n, K/group_size]. Scales keep their ordinary E8M0 layout.
+    ``group_n`` defaults to ``group_size``; supported weight-scale blocks are
+    32x32, 128x128 and 1x32 (``group_n=1, group_size=32``).
+
+    Returns ``out`` [M, G, N], allocating it with ``dtype`` when omitted.
+    ``kernelId=None`` selects a compatible preshuffled kernel. An incompatible
+    tuned id falls back to one and drops its splitK. ``splitK=None``, 0 and 1
+    all mean no split.
+    """
+    from .policy import (
+        _heuristic_mxscale_bmm_bpreshuffle_kid,
+        mxscale_bmm_groups_of_block,
+        mxscale_bmm_kid_block,
+        mxscale_bmm_kid_runs_m,
+        mxscale_bmm_kid_takes_b_layout,
+        mxscale_bmm_kid_takes_plain_scales,
+    )
+
+    group_n = group_size if group_n is None else group_n
+    block = f"{group_n}x{group_size}"
+    mxscale_bmm_groups_of_block(block)
+    m, g, k = map(int, x.shape)
+    n = int(wo_a.shape[1])
+    Y = out if out is not None else torch.empty((m, g, n), dtype=dtype, device=x.device)
+
+    # The preshuffled entry accepts only matching B and ordinary scale layouts.
+    # A padded-M tuned row can also require an alignment the real M lacks.
+    if kernelId is not None and not (
+        mxscale_bmm_kid_takes_b_layout(int(kernelId), True)
+        and mxscale_bmm_kid_takes_plain_scales(int(kernelId))
+        and mxscale_bmm_kid_block(int(kernelId)) == block
+        and mxscale_bmm_kid_runs_m(int(kernelId), m)
+    ):
+        kernelId = splitK = None
+    if kernelId is None:
+        kernelId = _heuristic_mxscale_bmm_bpreshuffle_kid(
+            g, m, n, k, group_size=group_size, group_n=group_n, output_dtype=Y.dtype
+        )
+        if kernelId is None:
+            raise ValueError(
+                f"no preshuffled-B kid runs (g={g}, m={m}, n={n}, k={k}, "
+                f"group_size={group_size}): the tuned row is absent or "
+                f"unusable and no fallback tile divides this N and K "
+                f"for weight scale block {block}."
+            )
+
+    return _launch_bmm_a8w8_mxscale_opus(
+        x, wo_a, x_scale, w_scale, Y, kid=int(kernelId), split_k=splitK
+    )
+
+
+def _launch_bmm_a8w8_mxscale_opus(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    split_k: int | None,
+) -> Tensor:
+    """Allocate split-K workspace and launch the entry's already selected kid."""
+    split_k = int(split_k if split_k is not None else 1)
+    if split_k == 0:  # Public no-split convention; launchers require one.
+        split_k = 1
+    _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+        x,
+        wo_a,
+        Y,
+        x_scale,
+        w_scale,
+        workspace=_mxscale_bmm_workspace(x, wo_a, Y, kid, split_k),
+        kid=kid,
+        split_k=split_k,
+    )
+    return Y
+
+
+def _mxscale_bmm_workspace(
+    x: Tensor, wo_a: Tensor, Y: Tensor, kid: int, split_k: int
+) -> Tensor | None:
+    """The FP32 split-K workspace kid needs on mmajor ``x`` [M, G, K], or None."""
+    if split_k <= 1:
+        return None
+    m, g, k = map(int, x.shape)
+    spec = _get_cached_a8w8_mxscale_bmm_plan(
+        _device_arch(x.device), kid, Y.dtype, m, g, int(wo_a.shape[1]), k, split_k
+    ).workspace_spec
+    if spec is None:
+        return None
+    return torch.empty(spec.shape, dtype=spec.dtype, device=x.device)
+
+
+__all__ = [
+    "bmm_a8w8_mxscale_opus",
+    "bmm_a8w8_mxscale_opus_bpreshuffle",
+    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
+]
