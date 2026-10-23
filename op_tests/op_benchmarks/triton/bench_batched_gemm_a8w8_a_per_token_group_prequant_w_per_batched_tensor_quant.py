@@ -7,6 +7,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_dtypes
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
     get_ff_args,
@@ -35,6 +36,7 @@ def bench_gemm_fn(
     has_bias: bool,
     transpose_bm: bool,
     backend: str | None = None,
+    y_per_token_quant: bool = False,
 ):
     c_dtype = torch.bfloat16
     x, weight, w_scale, bias, y = generate_batched_gemm_a8w8_per_token_group_inputs(
@@ -48,6 +50,10 @@ def bench_gemm_fn(
         layout=layout,
         transpose_bm=transpose_bm,
     )
+    y_scale = None
+    if y_per_token_quant:
+        y = torch.empty((M, batch, N), dtype=get_fp8_dtypes()[1], device=x.device)
+        y_scale = torch.empty((M, 1), dtype=torch.float32, device=x.device)
     # flops
     flops = 2.0 * batch * M * N * K
     # memory transfer
@@ -57,7 +63,9 @@ def bench_gemm_fn(
         + w_scale.numel() * w_scale.element_size()
         + (bias.numel() * bias.element_size() if bias is not None else 0)
     )
-    mem_write = y.numel() * y.element_size()
+    mem_write = y.numel() * y.element_size() + (
+        y_scale.numel() * y_scale.element_size() if y_scale is not None else 0
+    )
     mem = mem_read + mem_write
 
     def fn():
@@ -71,6 +79,7 @@ def bench_gemm_fn(
             YQ=y,
             transpose_bm=transpose_bm,
             backend=backend,
+            y_scale_out=y_scale,
         )
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
@@ -123,6 +132,7 @@ def run_model_benchmark(args):
             not args.no_bias,
             args.transpose_bm,
             args.backend,
+            args.y_per_token_quant,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -150,6 +160,7 @@ def run_shape_benchmark(args):
             not args.no_bias,
             args.transpose_bm,
             args.backend,
+            args.y_per_token_quant,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -190,6 +201,14 @@ def parse_args(args: list[str] | None = None):
         dest="transpose_bm",
         help="Transpose batch and M dimensions in the output tensor.",
     )
+    parser.add_argument(
+        "--y-per-token-quant",
+        action="store_true",
+        default=False,
+        dest="y_per_token_quant",
+        help="Time the split-K path that writes an FP8 YQ with a per-token y_scale "
+        "(needs --transpose-bm; needs --no-bias).",
+    )
     return get_ff_args(parser, args=args)
 
 
@@ -200,6 +219,12 @@ def main(args: list[str] | None = None) -> None:
             f"--backend gluon is gfx1250-only (running on {arch_info.get_arch()}); "
             "nothing to benchmark."
         )
+        return
+    if parsed_args.y_per_token_quant and not parsed_args.no_bias:
+        print("--y-per-token-quant needs --no-bias; nothing to benchmark.")
+        return
+    if parsed_args.y_per_token_quant and not parsed_args.transpose_bm:
+        print("--y-per-token-quant needs --transpose-bm; nothing to benchmark.")
         return
     if parsed_args.print_vgpr:
         print_vgpr(lambda: run_benchmark(parsed_args, defaults))
