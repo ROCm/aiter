@@ -1910,12 +1910,31 @@ def _unified_attention_gluon_kernel(
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
         # past this block's causal edge, but reduce_segments still reads it
         if pgm.tile_start * TILE_SIZE < seq_len:
-            empty = gl.zeros(
+            empty_m = gl.zeros(
                 [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
             )
+            empty_l = empty_m
+            if USE_SINKS:
+                offs_m_pv = gl.arange(
+                    0, BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)
+                )
+                query_offset_1_pv = (
+                    kv_head_idx * cfg.NUM_QUERIES_PER_KV
+                    + offs_m_pv % cfg.NUM_QUERIES_PER_KV
+                )
+                empty_m = (
+                    gl.amd.cdna4.buffer_load(
+                        ptr=sink_ptr,
+                        offsets=query_offset_1_pv,
+                        mask=(query_offset_1_pv < NUM_QUERY_HEADS) & (split_idx == 0),
+                        other=float("-inf"),
+                    ).to(dtype=gl.float32)
+                    * cfg.RCP_LN2
+                )
+                empty_l = gl.where(empty_m > float("-inf"), 1.0, 0.0)
             pgm.store_partial(
-                empty,
-                empty,
+                empty_m,
+                empty_l,
                 gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout),
                 partial_m_ptr,
                 partial_l_ptr,
