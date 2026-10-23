@@ -13,13 +13,35 @@ and reported as three rows, keyed by the `layer` column:
 over and over, so its weights stay cache-resident in a way the real layer does
 not. Compare like with like.
 
---multi-gpu adds a fourth, `combine`, and changes where moe2's rows go: into
-mori's real combine staging window on the peer ranks, through the fused
-EP_SCATTER epilogue production compiles, instead of a local output buffer. It
-needs --ep > 1, that many GPUs, one --M, and torchrun --nproc-per-node=--ep.
-The DISPATCH is not simulated -- each rank keeps its own rows and fabricates the
-recv layout a dispatch would have produced -- so what it adds over plain --ep is
-the peer-memory write traffic and the cross-device barrier, not the all-to-all.
+--multi-gpu runs the real EP combine after moe2, one process per rank. It needs
+--ep > 1, that many GPUs, one --M, and torchrun --nproc-per-node=--ep. There
+are two transports, matching ATOM's ATOM_MEGA_STAGE2_FUSED=1 / =0:
+
+mega (the default; FUSED=1). moe2's rows go into MegaMoE's combine staging
+window on the peer ranks, through the fused EP_SCATTER epilogue production
+compiles, instead of a local output buffer. The DISPATCH is not simulated --
+each rank keeps its own rows and fabricates the recv layout a dispatch would
+have produced -- so what it adds over plain --ep is the peer-memory write
+traffic and the cross-device barrier, not the all-to-all. Rows:
+
+  sync     mega's 1-block cross-device barrier (ep_combine_fused_sync) alone
+  combine  that barrier plus the reduce that drains the window, i.e. all of
+           mega._combine (ep_combine_fused_sync + ep_combine_fused)
+  total    moe1 -> moe2 -> combine
+
+--no-mega (FUSED=0). No MegaMoE at all: mori's own v2 op-layer in gather mode,
+the transport ATOM falls back to. One real mori dispatch runs at setup (each
+rank sends its batch/ep tokens), so the GEMMs see the received rows exactly as
+the server does. moe2 is the GEMM alone, writing its un-reduced rows locally;
+reduce_grouped sums each received token's local gates; then mori's combine
+(the mori_ep_combine kernel) stages those rows into its symmetric buffer,
+barriers, and gathers + sums each of this rank's tokens from the peers. Rows:
+
+  moe1, moe2 (GEMM only), reduce, combine (mori gather combine),
+  total    moe1 -> moe2 -> reduce -> combine
+
+Both totals end at the same point -- every rank holding its own tokens' final
+MoE output -- so they compare directly.
 
 --layers picks which of those are measured, e.g. `--layers moe1 moe2` to skip
 the back-to-back run, or `--layers moe1` for one projection on its own. The
@@ -83,14 +105,26 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # measurable layers, in report order; see the module docstring. "combine" only
-# exists under --multi-gpu, where there is a real mori combine to measure.
+# exists under --multi-gpu, where there is a real transport to measure; "sync"
+# only with mega, whose barrier is its own kernel; "reduce" only under
+# --no-mega, where moe2 no longer reduces itself.
 LAYERS = ("moe1", "moe2", "total")
-MG_LAYERS = ("moe1", "moe2", "combine", "total")
+MG_LAYERS = ("moe1", "moe2", "sync", "combine", "total")
+MG_NO_MEGA_LAYERS = ("moe1", "moe2", "reduce", "combine", "total")
+ALL_LAYERS = ("moe1", "moe2", "reduce", "sync", "combine", "total")
+
+
+def default_layers(multi_gpu, mega=True):
+    """Every layer a mode can measure, in report order."""
+    if not multi_gpu:
+        return LAYERS
+    return MG_LAYERS if mega else MG_NO_MEGA_LAYERS
 
 
 def compute_roofline(
@@ -308,14 +342,47 @@ def ep_routing(logits, n_expts_act, n_expts_local, rank=0, ep_scatter_geometry=N
     Routing for ONE rank of an expert-parallel layer, from GLOBAL logits.
     """
     batch, n_expts_tot = logits.shape
-    dev = logits.device
-    n_gates = batch * n_expts_act
+    dispatch_weights, dispatch_ids = global_topk(logits, n_expts_act)
+    # No mori staging buffer here, so every row is real -- but still a device
+    # tensor, which is the form ep_sort_routing's row mask expects.
+    num_local_tokens = torch.tensor([batch], dtype=torch.int32, device=logits.device)
+    return ep_sort(
+        dispatch_weights,
+        dispatch_ids,
+        n_expts_tot,
+        n_expts_local,
+        num_local_tokens,
+        rank=rank,
+        ep_scatter_geometry=ep_scatter_geometry,
+    )
 
-    # Global top-k. The weights only scale moe2's reduction and nothing here is
-    # timed, so a softmax over the selected scores is close enough.
+
+def global_topk(logits, n_expts_act):
+    """Every token's top-k experts and gate weights, as int32 ids / fp32."""
+    # The weights only scale moe2's reduction and nothing here is timed, so a
+    # softmax over the selected scores is close enough.
     vals, dispatch_ids = torch.topk(logits, n_expts_act, dim=-1)
-    dispatch_weights = torch.softmax(vals.float(), dim=-1)
-    dispatch_ids = dispatch_ids.to(torch.int32)
+    return torch.softmax(vals.float(), dim=-1), dispatch_ids.to(torch.int32)
+
+
+def ep_sort(
+    dispatch_weights,
+    dispatch_ids,
+    n_expts_tot,
+    n_expts_local,
+    num_local_tokens,
+    rank=0,
+    ep_scatter_geometry=None,
+):
+    """
+    Sort one rank's rows into its local experts' tiles -- ATOM's
+    routing_from_dispatched. The rows carry every token's full top-k; slots
+    owned by another rank are masked, and rows past `num_local_tokens` (a
+    device tensor) are ignored.
+    """
+    batch, n_expts_act = dispatch_ids.shape
+    dev = dispatch_ids.device
+    n_gates = batch * n_expts_act
 
     # global id -> local id, -1 for an expert another rank owns. One entry
     # longer than the global count: ep_sort_routing clamps ids into the map and
@@ -332,10 +399,6 @@ def ep_routing(logits, n_expts_act, n_expts_local, rank=0, ep_scatter_geometry=N
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
     expt_data_bufs = _compute_expt_data_internal(n_expts_local, n_gates, block_m, dev)
     token_offs_raw, token_offs_pad, block_pid_map = expt_data_bufs[:3]
-
-    # No mori staging buffer here, so every row is real -- but still a device
-    # tensor, which is the form ep_sort_routing's row mask expects.
-    num_local_tokens = torch.tensor([batch], dtype=torch.int32, device=dev)
 
     hist_full, topk_indx, gate_indx, gate_scal, gate_valid, dst_row = ep_sort_routing(
         dispatch_weights,
@@ -357,19 +420,13 @@ def ep_routing(logits, n_expts_act, n_expts_local, rank=0, ep_scatter_geometry=N
 
 
 # ---------------------------------------------------------------------------
-# --multi-gpu: GEMM2 delivering into mori's real combine staging window
+# --multi-gpu: the two EP transports -- MegaMoE (GEMM2 scatters into its
+# combine staging window) and, under --no-mega, mori's gather op-layer
 # ---------------------------------------------------------------------------
-def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
-    """
-    The least mori that gives GEMM2 a real place to scatter to.
-    """
+def init_cco_comm(rank, world, group, hidden, mtpr):
+    """Collective: every EP rank joins one mori cco fabric."""
     import torch.distributed as dist
     from mori.cco import Communicator
-
-    from aiter import ActivationType, QuantType
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
-    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import _from_gpu_ptr
-    from aiter.ops.flydsl.moe_common import GateMode
 
     # ATOM's _cco_per_rank_vmm: every rank could send all its tokens to one peer
     # (world * mtpr recv slots), times 2x headroom for tokens + combine buffers.
@@ -377,12 +434,53 @@ def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
     win_bytes = world * tok_bytes * 2 + (1 << 24)
     per_rank_vmm = 2 * win_bytes + (1 << 28)
 
-    # collective: rank 0 mints the id, everyone joins the same cco fabric
+    # rank 0 mints the id, everyone joins with it
     uid = Communicator.get_unique_id() if rank == 0 else None
     objs = [uid]
     dist.broadcast_object_list(objs, src=0, group=group)
     comm = Communicator.init(world, rank, objs[0], per_rank_vmm=per_rank_vmm)
     comm.barrier()
+    return comm
+
+
+def init_mori_gather(rank, world, group, hidden, mtpr, experts, topk):
+    """
+    --no-mega: mori's own v2 dispatch/combine op in gather mode, configured the
+    way ATOM's init_mori_v2_op builds it for ATOM_MEGA_STAGE2_FUSED=0. The
+    kernel backend is mori's default for the device (HIP on gfx1250), which is
+    what the server runs.
+    """
+    from mori.ops.dispatch_combine_v2 import (
+        EpDispatchCombineConfig,
+        EpDispatchCombineOp,
+    )
+
+    comm = init_cco_comm(rank, world, group, hidden, mtpr)
+    cfg = EpDispatchCombineConfig(
+        rank=rank,
+        world_size=world,
+        hidden_dim=hidden,
+        max_num_inp_token_per_rank=mtpr,
+        num_experts_per_rank=experts // world,
+        num_experts_per_token=topk,
+        data_type=torch.bfloat16,
+        combine_mode="gather",
+    )
+    op = EpDispatchCombineOp(cfg, comm)
+    comm.barrier()
+    return op
+
+
+def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
+    """
+    The least mori that gives GEMM2 a real place to scatter to.
+    """
+    from aiter import ActivationType, QuantType
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import _from_gpu_ptr
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    comm = init_cco_comm(rank, world, group, hidden, mtpr)
 
     mega = MegaMoEGfx1250(
         communicator=comm,
@@ -497,8 +595,12 @@ def bench_mlp_single_weight_init(
     ep=1,
     mori=None,
 ):
-    # mori is the --multi-gpu bundle from init_mori_combine (None = single rank)
+    # mori is the --multi-gpu bundle built in main() (None = single rank)
     rank = 0 if mori is None else mori.rank
+    # mega: GEMM2 delivers into MegaMoE's staging window. no_mega (--no-mega):
+    # mori's gather op-layer after a real dispatch.
+    ep_scatter_on = mori is not None and mori.mega is not None
+    no_mega = mori is not None and mori.mega is None
     dev = f"cuda:{torch.cuda.current_device()}"
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
@@ -549,7 +651,7 @@ def bench_mlp_single_weight_init(
             "undoes; unset AITER_TRITON_USE_HERD"
         )
     assert layers, "at least one layer must be selected"
-    _known = MG_LAYERS if mori is not None else LAYERS
+    _known = default_layers(mori is not None, not no_mega)
     assert set(layers) <= set(_known), f"unknown layer(s) in {layers=}"
 
     # -- init data --
@@ -597,7 +699,7 @@ def bench_mlp_single_weight_init(
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
     else:
         geometry = None
-        if mori is not None:
+        if ep_scatter_on:
             from aiter.ops.triton.moe.moe_routing.routing import EpScatterGeometry
 
             geometry = EpScatterGeometry(
@@ -605,14 +707,52 @@ def bench_mlp_single_weight_init(
                 max_tokens_per_rank=batch // mori.world,
                 peer_rows=mori.peer_rows,
             )
-        rdata, gather_indx, scatter_indx, gate_valid, dst_row = ep_routing(
-            logits,
-            n_expts_act,
-            n_expts_local,
-            rank=rank,
-            ep_scatter_geometry=geometry,
-        )
-        if mori is not None:
+        if no_mega:
+            # One real mori dispatch, ATOM's prepare(): rank r sends its own
+            # batch/ep tokens with their global top-k, and the GEMMs then run on
+            # what arrived. Built once; combine replays its routing handle.
+            mtpr = batch // mori.world
+            weights, ids = global_topk(logits, n_expts_act)
+            mine = slice(rank * mtpr, (rank + 1) * mtpr)
+            recv_x, recv_w, _, recv_idx, total_recv, mori_routing = mori.op.dispatch(
+                x[mine].contiguous(),
+                weights[mine].contiguous(),
+                None,
+                ids[mine].contiguous(),
+                return_routing=True,
+            )
+            torch.cuda.synchronize()
+            mori.dist.barrier(group=mori.group)
+            # combine zeroes total_recv once it has staged the rows; see combine()
+            total_recv_saved = total_recv.clone()
+            n_recv = int(total_recv_saved.item())
+            # P2P rows combine gathers back: one per (own token, owning rank)
+            n_fanout = int(
+                torch.zeros((mtpr, mori.world), device=dev)
+                .scatter_(1, (ids[mine] // n_expts_local).long(), 1.0)
+                .sum()
+            )
+            # ATOM trims the receive arena to what the group sent (_recv_bound),
+            # which at a uniform step is batch rows; rows past total_recv are
+            # garbage the sort masks off.
+            x = recv_x[:batch]
+            rdata, gather_indx, scatter_indx, gate_valid, dst_row = ep_sort(
+                recv_w[:batch],
+                recv_idx[:batch],
+                n_expts_tot,
+                n_expts_local,
+                total_recv,
+                rank=rank,
+            )
+        else:
+            rdata, gather_indx, scatter_indx, gate_valid, dst_row = ep_routing(
+                logits,
+                n_expts_act,
+                n_expts_local,
+                rank=rank,
+                ep_scatter_geometry=geometry,
+            )
+        if ep_scatter_on:
             from aiter.ops.triton.moe.reduce import EpCombineScatter
 
             # GEMM2 stops reducing locally and places its un-reduced rows into
@@ -649,6 +789,12 @@ def bench_mlp_single_weight_init(
         x2, x2_scale = mxfp4_quant(y1)
     del y1
 
+    # --no-mega splits moe2 in two: the GEMM alone (no scatter_indx, so
+    # moe_gemm_a4w4 returns the un-reduced [n_gates, dim1] rows and launches no
+    # reduce), then the same reduce_grouped call it would have made, as its own
+    # launch. Everywhere else moe2 is the one moe_gemm_a4w4 call, as before.
+    split_reduce = no_mega
+
     def layer2():
         return moe_gemm_a4w4(
             x2,
@@ -657,10 +803,10 @@ def bench_mlp_single_weight_init(
             w2_scale,
             b2,
             rdata,
-            scatter_indx=scatter_indx,
+            scatter_indx=None if split_reduce else scatter_indx,
             # under EP most gate slots belong to other ranks and no GEMM here
             # ever writes them; None (every gate live) is right for --ep 1
-            gate_valid=gate_valid,
+            gate_valid=None if split_reduce else gate_valid,
             ep_scatter=ep_scatter,
             swizzle_mx_scale=swizzle_mx_scale2,
             preshuffle_weights=preshuffle,
@@ -669,10 +815,43 @@ def bench_mlp_single_weight_init(
 
     y2 = layer2()
 
-    if mori is None:
-        combine = None
-    else:
+    reduce = None
+    if split_reduce:
+        y2_out = torch.empty((batch, dim1), dtype=y2.dtype, device=dev)
+        group_indx = scatter_indx.view(-1, n_expts_act)
+        group_valid = gate_valid.view(-1, n_expts_act)
+
+        # standalone, it re-reduces the rows from the warm-up call above
+        def reduce(rows=y2):
+            # reduce_grouped takes [split_k, M, N]; moe_gemm_a4w4 hands back
+            # 2-D once nothing is left to reduce
+            if rows.ndim == 2:
+                rows = rows.unsqueeze(0)
+            return reduce_grouped(rows, group_indx, y2_out, indx_valid=group_valid)
+
+        reduce()
+
+    # Both transports' combines are rendezvous: every rank must call them
+    # equally often, which the lockstep bench loop guarantees.
+    sync = combine = None
+    if ep_scatter_on:
+        import flydsl.expr as fx
+
         from aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe import Routing
+
+        mega = mori.mega
+
+        # The 1-block cross-device barrier mega._combine opens with, on its
+        # own. Its time is mostly waiting for the slowest rank.
+        def sync():
+            mega._combine_sync(
+                mega._arena.handle,
+                mega._cross_device_flag.data_ptr(),
+                mega._config.rank,
+                fx.Stream(torch.cuda.current_stream()),
+            )
+
+        sync()
 
         mega_routing = Routing(
             token_count=batch // mori.world,
@@ -680,14 +859,29 @@ def bench_mlp_single_weight_init(
         )
 
         def combine():
-            return mori.mega._combine(mega_routing)
+            return mega._combine(mega_routing)
+
+        combine()
+    elif no_mega:
+
+        # mori's gather combine (mori_ep_combine): stage the reduced rows into
+        # the symmetric buffer, cross-device barrier, then gather + sum this
+        # rank's own tokens from every peer. The kernel zeroes total_recv
+        # after staging, for the next dispatch; with no dispatch between
+        # bench iterations every call after the first would skip the staging
+        # copy, so put the count back first -- one extra 4-byte copy.
+        def combine():
+            mori_routing.total_recv_token_num.copy_(total_recv_saved)
+            return mori.op.combine(y2_out, routing=mori_routing)
 
         combine()
     torch.cuda.synchronize()
 
     def both():
         layer1()
-        layer2()
+        y = layer2()
+        if reduce is not None:
+            reduce(y)  # into y2_out, which combine reads
         if combine is not None:
             combine()
 
@@ -695,7 +889,8 @@ def bench_mlp_single_weight_init(
     # the kernel itself reports: 2*M*N*K per GEMM, and activations + routed-expert
     # weights + matmul output for traffic. mx scales (~1/16 of the weight bytes)
     # and the moe2 scatter reduction are not counted; the reduction's runtime is
-    # inside moe_gemm_a4w4 and so is inside the measurement.
+    # inside moe_gemm_a4w4 and so is inside the measurement -- except under
+    # --no-mega, where it is the separate `reduce` row.
     n_gates = gather_indx.shape[0]  # every gate slot == batch * n_expts_act
     # Rows this rank's GEMM really computes. Equal to n_gates at --ep 1; under EP
     # the dead slots get no tile, so the activation buffers are sized for n_gates
@@ -704,8 +899,14 @@ def bench_mlp_single_weight_init(
     live_frac = n_rows / n_gates
     routed = int((rdata.expt_data.hist > 0).sum())  # LOCAL experts with >= 1 row
     if n_pinned is not None:
-        # under EP the pin is over the global set; only the local slice lands here
-        expected = n_pinned if ep == 1 else int((pool < n_expts_local).sum())
+        # under EP the pin is over the global set; only this rank's slice
+        # [rank * local, (rank + 1) * local) lands here
+        lo = rank * n_expts_local
+        expected = (
+            n_pinned
+            if ep == 1
+            else int(((pool >= lo) & (pool < lo + n_expts_local)).sum())
+        )
         assert routed == expected, (
             f"--routed-experts pinned {n_pinned} experts"
             + (f", {expected} of them local," if ep > 1 else ",")
@@ -731,16 +932,35 @@ def bench_mlp_single_weight_init(
     # keeping only what `layers` asked for (in LAYERS order, not argv order).
     # `total` is NOT moe1 + moe2 -- an isolated projection replays one kernel
     # over and over, so its weights stay hotter than they are in the real layer.
-    # insertion order is report order, so keep it in MG_LAYERS order
+    # insertion order is report order, so keep it in default_layers() order
     to_bench = {
         "moe1": (layer1, moe1_flops, moe1_bytes),
         "moe2": (layer2, moe2_flops, moe2_bytes),
     }
+    total_flops = moe1_flops + moe2_flops
+    total_bytes = moe1_bytes + moe2_bytes
+    if reduce is not None:
+        # no matmul; the live un-reduced rows in, one row per token out
+        reduce_bytes = (n_rows + batch) * dim1 * y2.element_size()
+        to_bench["reduce"] = (reduce, 0, reduce_bytes)
+        total_bytes += reduce_bytes
+    if sync is not None:
+        # a flag per peer, nothing worth counting; part of `combine`, so not
+        # added to total on its own
+        to_bench["sync"] = (sync, 0, 0)
     if combine is not None:
-        # no matmul in it; the traffic is topk staged slots in, one row out
+        # no matmul in either; bf16 rows throughout
         mtpr = batch // mori.world
-        to_bench["combine"] = (combine, 0, mtpr * (n_expts_act + 1) * dim1 * 2)
-    to_bench["total"] = (both, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes)
+        if no_mega:
+            # received rows staged (read + write), one P2P row per (own token,
+            # owning rank) gathered, one row per own token out
+            combine_bytes = (2 * n_recv + n_fanout + mtpr) * dim1 * 2
+        else:
+            # topk staged slots in, one row out
+            combine_bytes = mtpr * (n_expts_act + 1) * dim1 * 2
+        to_bench["combine"] = (combine, 0, combine_bytes)
+        total_bytes += combine_bytes
+    to_bench["total"] = (both, total_flops, total_bytes)
 
     measured = {}
     for name, (f, flops, byts) in to_bench.items():
@@ -869,10 +1089,14 @@ def roofline_mlp(
         # one file per rank: the ranks share a filesystem and their numbers
         # differ (barrier skew is real signal, not noise to average away)
         stem += f"-mori-rank{mori.rank}of{mori.world}"
+        if mori.mega is None:
+            stem += "-nomega"
     stem += f"-{backend_name(backend)}"
     if preshuffle:
         stem += "-preshuffled"
-    if tuple(layers) != (MG_LAYERS if mori is not None else LAYERS):
+    if tuple(layers) != default_layers(
+        mori is not None, mori is None or mori.mega is not None
+    ):
         # a partial run holds a subset of the rows, so give it its own file
         stem += "-layers=" + "+".join(layers)
     out_csv = out_dir / f"{stem}.csv"
@@ -996,26 +1220,41 @@ def parse_args(args: list[str] | None = None):
         "--multi-gpu",
         action="store_true",
         default=False,
-        help="Have GEMM2 deliver its rows into mori's real combine staging "
-        "window -- PEER memory on the other EP ranks, through the fused "
-        "EP_SCATTER epilogue production compiles -- instead of a local output "
-        "buffer, and measure the mori combine that drains it as an extra "
-        "'combine' row. Needs --ep > 1, at least --ep visible GPUs, exactly one "
-        "--M, and torchrun with --nproc-per-node equal to --ep. Only GEMM2 and "
-        "the combine change; moe1 is untouched. The dispatch is NOT simulated: "
-        "each rank keeps its own rows and fabricates the recv layout a dispatch "
-        "would have produced, so what this adds over plain --ep is the peer-"
-        "memory write traffic and the cross-device barrier, not the all-to-all.",
+        help="Run the real EP combine after moe2, one process per rank. By "
+        "default through MegaMoE (ATOM_MEGA_STAGE2_FUSED=1): GEMM2 delivers its "
+        "rows into the combine staging window -- PEER memory on the other EP "
+        "ranks, through the fused EP_SCATTER epilogue -- and mega's combine "
+        "drains it. Adds 'sync' (mega's cross-device barrier alone) and "
+        "'combine' (that barrier + the window reduce) rows; total = moe1 -> "
+        "moe2 -> combine. The dispatch is NOT simulated on this path: each rank "
+        "keeps its own rows and fabricates the recv layout a dispatch would "
+        "have produced. Needs --ep > 1, at least --ep visible GPUs, exactly one "
+        "--M, and torchrun with --nproc-per-node equal to --ep.",
+    )
+    parser.add_argument(
+        "--no-mega",
+        action="store_true",
+        default=False,
+        help="With --multi-gpu: no MegaMoE; use mori's own v2 gather op-layer, "
+        "the ATOM_MEGA_STAGE2_FUSED=0 transport. One real mori dispatch at "
+        "setup gives the GEMMs the received rows; GEMM2 writes un-reduced rows "
+        "locally, a separate reduce_grouped launch reduces them per received "
+        "token, and mori's combine (the mori_ep_combine kernel) gathers them "
+        "back. Measures moe1, moe2 (GEMM only), reduce, combine and total = "
+        "moe1 -> moe2 -> reduce -> combine.",
     )
     parser.add_argument(
         "--layers",
         nargs="+",
-        choices=MG_LAYERS,
+        choices=ALL_LAYERS,
         default=None,
         help="Which layers to measure: moe1 (up projection), moe2 (down "
-        "projection), total (both back to back). E.g. '--layers moe1 moe2' to "
-        "skip the back-to-back run, or '--layers moe1' for one projection "
-        "alone. combine needs --multi-gpu. Default: all of them.",
+        "projection), reduce (moe2's reduce as its own launch), sync (mega's "
+        "cross-device barrier), combine (the transport's combine), total (the "
+        "chain back to back). E.g. '--layers moe1 moe2' to skip the "
+        "back-to-back run, or '--layers moe1' for one projection alone. "
+        "combine needs --multi-gpu, sync needs it without --no-mega, and reduce "
+        "needs --no-mega. Default: all the mode offers.",
     )
     parser.add_argument(
         "--rep",
@@ -1054,10 +1293,17 @@ def main(args: list[str] | None = None) -> None:
         batch_sizes_moe = parsed_args.M
     quantized_dtypes = ["mx4", "mx4"]
 
-    all_layers = MG_LAYERS if parsed_args.multi_gpu else LAYERS
+    assert parsed_args.multi_gpu or not parsed_args.no_mega, (
+        "--no-mega needs --multi-gpu: it picks which EP transport runs, and "
+        "there is none without every EP rank running"
+    )
+    all_layers = default_layers(parsed_args.multi_gpu, not parsed_args.no_mega)
     layers = parsed_args.layers if parsed_args.layers is not None else list(all_layers)
     bad = set(layers) - set(all_layers)
-    assert not bad, f"{sorted(bad)} needs --multi-gpu"
+    assert not bad, (
+        f"{sorted(bad)} not measurable here: combine needs --multi-gpu, sync "
+        "needs it without --no-mega, reduce needs --no-mega"
+    )
 
     mori = None
     if parsed_args.multi_gpu:
@@ -1089,20 +1335,33 @@ def main(args: list[str] | None = None) -> None:
             backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world
         )
         group = dist.new_group(backend="gloo")
-        mega, view, peer_rows = init_mori_combine(
-            rank,
-            world,
-            group,
-            hidden=dim1,
-            mtpr=batch // world,
-            inter=dim2 // 2,
-            experts=total_experts,
-            topk=active_experts,
-        )
+        mega = view = peer_rows = op = None
+        if parsed_args.no_mega:
+            op = init_mori_gather(
+                rank,
+                world,
+                group,
+                hidden=dim1,
+                mtpr=batch // world,
+                experts=total_experts,
+                topk=active_experts,
+            )
+        else:
+            mega, view, peer_rows = init_mori_combine(
+                rank,
+                world,
+                group,
+                hidden=dim1,
+                mtpr=batch // world,
+                inter=dim2 // 2,
+                experts=total_experts,
+                topk=active_experts,
+            )
         mori = SimpleNamespace(
             mega=mega,
             view=view,
             peer_rows=peer_rows,
+            op=op,
             rank=rank,
             world=world,
             group=group,
@@ -1141,7 +1400,7 @@ def main(args: list[str] | None = None) -> None:
 
     if mori is not None:
         mori.dist.barrier(group=mori.group)
-        mega.close()
+        (mori.op if mori.mega is None else mori.mega).close()
         mori.dist.destroy_process_group()
 
 
