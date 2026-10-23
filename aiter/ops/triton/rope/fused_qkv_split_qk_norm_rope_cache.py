@@ -294,6 +294,13 @@ def fused_qkv_split_qk_norm_rope_cache(
         stride_kv_t=k.stride(0),
         stride_kv_h=k.stride(1),
         stride_kv_d=k.stride(2),
+        # The gate and V outputs are allocated here, so their strides need not match q_out / k_out.
+        stride_gate_t=gate.stride(0) if gate is not None else 0,
+        stride_gate_h=gate.stride(1) if gate is not None else 0,
+        stride_gate_d=gate.stride(2) if gate is not None else 0,
+        stride_v_t=v.stride(0) if v is not None else 0,
+        stride_v_h=v.stride(1) if v is not None else 0,
+        stride_v_d=v.stride(2) if v is not None else 0,
         key_cache_stride_t=key_cache_stride_t,
         key_cache_stride_h=key_cache_stride_h,
         key_cache_stride_d=key_cache_stride_d,
