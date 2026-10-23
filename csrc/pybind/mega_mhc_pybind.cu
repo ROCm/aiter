@@ -37,5 +37,6 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("has_post"),
           py::arg("identity_pre"),
           py::arg("variant"),
-          py::arg("mxfp8"));
+          py::arg("mxfp8"),
+          py::arg("res_preshuffle"));
 }

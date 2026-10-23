@@ -166,6 +166,7 @@ def _native_launcher(hidden):
         identity_pre: bool,
         variant: int,
         mxfp8: bool,
+        res_preshuffle: bool,
     ) -> None: ...
 
     launch.__name__ = f"_mega_mhc_stream_{suffix}"
@@ -400,6 +401,7 @@ def mega_mhc(
     workspace: MegaMHCWorkspace | None = None,
     w_preshuffle_bf16: bool = False,
     out_dtype: str = "bf16",
+    res_preshuffle: bool = False,
 ):
     """Delayed post/pre/RMSNorm seam, returning (R, post, comb, norm, next_pre).
 
@@ -425,6 +427,11 @@ def mega_mhc(
     ceil_pow2(max(amax, 1e-10) / 448), matching FlyDSL Mega-MHC. Reinterpret
     scale bytes with .view(torch.float8_e8m0fnu) for consumers requiring E8M0.
     The same workspace supports both output modes, including graph replay.
+
+    res_preshuffle=True (gfx1250 only): residual and the returned residual are
+    in the aiter.ops.mhc.mhc_res_shuffle layout with ks=32, that is
+    resS[k // 32][stream][token][k % 32] in the same (T, 4, H) shape.
+    sublayer_out and the layer input stay plain.
     """
     assert w_preshuffle_bf16, "mega_mhc requires w_preshuffle_bf16=True"
     if not residual.is_cuda or residual.ndim != 3 or residual.shape[1] != 4:
@@ -479,6 +486,8 @@ def mega_mhc(
     with torch.cuda.device(device):
         if out_dtype == "mxfp8" and get_gfx_runtime() != "gfx950":
             raise RuntimeError("Mega-MHC mxfp8 requires gfx950")
+        if res_preshuffle and get_gfx_runtime() != "gfx1250":
+            raise RuntimeError("Mega-MHC res_preshuffle requires gfx1250")
         if workspace is None:
             scratch = _prepare_scratch(device, t, h)
         else:
@@ -540,5 +549,6 @@ def mega_mhc(
             pre_mix is None,
             _STREAM_VARIANTS.index(variant),
             out_dtype == "mxfp8",
+            res_preshuffle,
         )
     return residual_out, post_out, comb_out, layer_input, next_pre

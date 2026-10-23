@@ -2623,7 +2623,8 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    bool has_post,
                    bool identity_pre,
                    int variant,
-                   bool mxfp8)
+                   bool mxfp8,
+                   bool res_preshuffle)
 {
     {
         const HipDeviceGuard guard(residual.device_id);
@@ -2655,10 +2656,12 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                              split_k,
                              has_post,
                              identity_pre,
-                             variant);
+                             variant,
+                             res_preshuffle);
             return;
         }
     }
+    AITER_CHECK(!res_preshuffle, "Mega-MHC res_preshuffle requires gfx1250");
     auto launch = [&]<int H, int VARIANT, bool MXFP8>() {
         launch_mega_mhc<H, VARIANT, MXFP8>(residual_out,
                                            post_out,

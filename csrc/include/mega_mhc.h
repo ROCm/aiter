@@ -15,6 +15,8 @@ namespace aiter {
 // MXFP8 instantiations also write quant_out (E4M3) and quant_scale (uint8 E8M0
 // bytes); BF16 instantiations ignore them. The rounded BF16 layer_input is kept.
 // variant indexes the tuning table; mxfp8 selects the output instantiation.
+// res_preshuffle (gfx1250 only): residual and residual_out use the
+// mhc_res_shuffle layout with ks=32.
 void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    aiter_tensor_t& post_out,
                    aiter_tensor_t& comb_out,
@@ -43,7 +45,8 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    bool has_post,
                    bool identity_pre,
                    int variant,
-                   bool mxfp8);
+                   bool mxfp8,
+                   bool res_preshuffle);
 
 // gfx1250 kernels (mega_mhc_gfx1250.cu), reached through mega_mhc_bf16. BF16 output only.
 void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
@@ -71,5 +74,6 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
                       int split_k,
                       bool has_post,
                       bool identity_pre,
-                      int variant);
+                      int variant,
+                      bool res_preshuffle);
 } // namespace aiter

@@ -126,6 +126,18 @@ def case(t, h, mode, seed=0):
     return args, kw, reference_for(args, kw)
 
 
+def shuffle_residual(x, ks=32):
+    """(T, 4, H) -> resS[k // ks][stream][token][k % ks], same shape."""
+    t, n, h = x.shape
+    return x.view(t, n, h // ks, ks).permute(2, 1, 0, 3).contiguous().view(t, n, h)
+
+
+def unshuffle_residual(x, ks=32):
+    """Inverse of shuffle_residual."""
+    t, n, h = x.shape
+    return x.view(h // ks, n, t, ks).permute(2, 1, 0, 3).contiguous().view(t, n, h)
+
+
 def ref_mxfp8(norm):
     """Group32 E4M3 with ceil-power-of-two scaling on the rounded BF16 norm."""
     t, h = norm.shape
@@ -198,8 +210,11 @@ def benchmark_bytes(m, hidden_size, mode, out_dtype="bf16"):
 class _BenchmarkBackend:
     """Call one backend with its native weights and shared scratch."""
 
-    def __init__(self, name, scalar_args, out_dtype="bf16", workspace=None):
+    def __init__(
+        self, name, scalar_args, out_dtype="bf16", workspace=None, res_preshuffle=False
+    ):
         self.name = name
+        self.res_preshuffle = res_preshuffle
         self.backend = backend_function(name)
         self.scalar_args = scalar_args
         self.out_dtype = out_dtype
@@ -221,6 +236,8 @@ class _BenchmarkBackend:
         if self.name == "hip":
             kw["workspace"] = self.workspace
             kw["w_preshuffle_bf16"] = True
+            if self.res_preshuffle:
+                kw["res_preshuffle"] = True
         if self.name != "triton":
             kw["out_dtype"] = self.out_dtype
         return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
@@ -265,8 +282,13 @@ def benchmark_mega_mhc(
     num_iters=101,
     out_dtype="bf16",
     check_only=False,
+    res_preshuffle=False,
 ):
-    """Check one M/H/mode/dtype combination and return its backend results."""
+    """Check one M/H/mode/dtype combination and return its backend results.
+
+    res_preshuffle passes HIP a shuffled residual (gfx1250); the residual it
+    returns is unshuffled outside the timed calls before the checks.
+    """
     args, kw, reference = case(m, hidden_size, mode, seed)
     result = {"status": "PASS"}
     num_bytes = benchmark_bytes(m, hidden_size, mode, out_dtype)
@@ -295,14 +317,22 @@ def benchmark_mega_mhc(
                 continue
         backend_tensors = tensors
         workspace = None
+        shuffled = name == "hip" and res_preshuffle
         if name == "hip":
             # Rotate already-packed weights; deepcopy preserves their layout.
             fn_packed = mega_mhc_shuffle_fn(args[1])
-            backend_tensors = (tensors[0], fn_packed, *tensors[2:])
+            residual = shuffle_residual(tensors[0]) if shuffled else tensors[0]
+            backend_tensors = (residual, fn_packed, *tensors[2:])
             workspace = prepare_mega_mhc(args[0].device, m, hidden_size)
-        caller = _BenchmarkBackend(name, args[4:], out_dtype, workspace)
+        caller = _BenchmarkBackend(name, args[4:], out_dtype, workspace, shuffled)
+
+        def check_backend(out, shuffled=shuffled):
+            if shuffled:
+                out = (unshuffle_residual(out[0]), *out[1:])
+            check(out, reference)
+
         out = caller(*backend_tensors)
-        check(out, reference)
+        check_backend(out)
         result[name] = "PASS"
         if not check_only:
             us = float("nan")  # Empty tensors have no kernel to time.
@@ -310,7 +340,7 @@ def benchmark_mega_mhc(
                 out, us = _run_rotating_perftest(caller, backend_tensors, num_iters)
                 if not math.isfinite(us) or us <= 0:
                     raise RuntimeError(f"{name} returned an invalid GPU timing: {us}")
-                check(out, reference)
+                check_backend(out)
             result[f"{name}_us"] = us
             result[f"{name}_TB/s"] = num_bytes / us / 1e6
         if caller.workspace is not None:
@@ -368,6 +398,11 @@ def main():
         help="default: HIP/FlyDSL/Triton on gfx950; HIP/Triton on gfx942/gfx1250; "
         "Triton is omitted for MXFP8",
     )
+    parser.add_argument(
+        "--res-preshuffle",
+        action="store_true",
+        help="HIP reads and returns the ks=32 shuffled residual (gfx1250)",
+    )
     parser.add_argument("--seed", type=int, default=0, help="shared input seed")
     parser.add_argument(
         "--iters",
@@ -394,6 +429,8 @@ def main():
         parser.error("Mega-MHC requires gfx950, gfx942 or gfx1250")
     if "mxfp8" in args.out_dtype and arch != "gfx950":
         parser.error("Mega-MHC mxfp8 requires gfx950")
+    if args.res_preshuffle and arch != "gfx1250":
+        parser.error("Mega-MHC res_preshuffle requires gfx1250")
     backends = tuple(
         dict.fromkeys(
             args.backends or (BACKENDS if arch == "gfx950" else ("hip", "triton"))
@@ -445,6 +482,7 @@ def main():
                 args.iters,
                 dtype,
                 args.check_only,
+                args.res_preshuffle,
             )
         )
     columns = ["m", "hidden_size", "mode", "out_dtype"]
