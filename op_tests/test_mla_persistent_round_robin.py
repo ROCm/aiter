@@ -91,6 +91,7 @@ def ref_masked_attention(
         attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
         attn_bias.to(query.dtype)
         attn_weights += attn_bias
+        attn_mask = temp_mask
 
     lse = attn_weights.logsumexp(dim=-1)
     m = attn_weights.max(-1).values
@@ -107,7 +108,8 @@ def ref_masked_attention(
 
     if attn_mask is not None:
         # Query rows with no visible key (whole row masked) produce NaN above;
-        # define them as out=0, lse=-inf (an empty CP shard for that token).
+        # define them as out=0, lse=-inf (an empty CP shard for that token, or a
+        # causal query before the first key when s_k < s_q).
         invalid = attn_mask.any(dim=-1).logical_not()  # [s_q]
         if bool(invalid.any()):
             out = out.clone()
