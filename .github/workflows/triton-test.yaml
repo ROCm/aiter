@@ -7,11 +7,14 @@ name: Triton Test
 #     selection existed. DRY_RUN: 'false' applies the selection; setting it
 #     back to 'true' is the revert for every PR.
 #   - PR label ci:triton-355: that PR runs the full suite.
-# Pushes to main always run the full suite, on MI35X and MI300X.
+# Main runs the full suite once a night, on MI35X and MI300X. Pushes to main
+# do not run this workflow.
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    # 06:17 UTC. Not on the hour: GitHub delays scheduled runs at the start of
+    # each hour.
+    - cron: '17 6 * * *'
   pull_request:
     # Selection skips unrelated changes; the result check is reported for every PR.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
@@ -40,6 +43,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Wait for Checks workflow
+        # Only PRs wait for the pre-checks. The nightly tests main as it is.
+        if: ${{ github.event_name == 'pull_request' }}
         run: ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
