@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import contextlib
+from functools import partial
 
 import pytest
 import torch
@@ -120,6 +121,10 @@ def test_mha_dao_ai(
     dtype=torch.bfloat16,
 ):
     """Test dao_ai impl dispatch for fwd/bwd x varlen against PyTorch reference."""
+    dense = partial(flash_attn_func, implementation="dao_ai")
+    varlen = partial(flash_attn_varlen_func, implementation="dao_ai")
+    # Per-call selection must win over the process default, including in backward.
+    mha_set_impl("default")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -178,7 +183,7 @@ def test_mha_dao_ai(
         v_unpad.requires_grad_(BWD)
 
         with torch.set_grad_enabled(BWD):
-            triton_out = flash_attn_varlen_func(
+            triton_out = varlen(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -193,9 +198,7 @@ def test_mha_dao_ai(
         query_padding_mask = None
         key_padding_mask = None
         with torch.set_grad_enabled(BWD):
-            triton_out = flash_attn_func(
-                q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE
-            )
+            triton_out = dense(q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE)
 
     # Reference + tolerances. For backward, attention_ref_with_tol derives each
     # tensor's atol from the fp32-vs-bf16 reference gap (upstream FA pattern, as in
