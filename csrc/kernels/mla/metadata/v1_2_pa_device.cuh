@@ -33,8 +33,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t* p_lds_pages_kv   = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : params.num_batches);
     int32_t* p_lds_partial_info = p_lds_pages_kv + (Traits::kLdsBatchInfo ? params.num_batches : 0);
 
-    QoState qo_state(
-        params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+    QoState qo_state(params.uni_seqlen_qo,
+                     params.ori_seqlen_qo,
+                     p_lds_seqlens_qo,
+                     params.p_seqlens_qo_indptr,
+                     params.qk_batch_ratio);
 
     const int32_t lane_idx = opus::lane_id();
 
