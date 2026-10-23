@@ -162,8 +162,10 @@ def get_GEMM_A16W16_tuned_config(
                     )
                     config = None
                 # A padded-M row can serve a much larger M than it was tuned on.
-                elif not _get_flydsl_gemm_kernels().flydsl_hgemm_supports_shape(
-                    M, N, K, flydsl_config
+                elif gfx == "gfx950" and not (
+                    _get_flydsl_gemm_kernels().flydsl_hgemm_supports_shape(
+                        M, N, K, flydsl_config
+                    )
                 ):
                     logger.warning(
                         f"FlyDSL kernel '{config['kernelName']}' tuned at M={padded_M} "

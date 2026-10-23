@@ -122,9 +122,7 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
 
 
 def flydsl_hgemm_supports_shape(m: int, n: int, k: int, params: dict) -> bool:
-    """Whether the gfx950 kernel can run M x N x K; other targets are not checked."""
-    if params["target_gfx"] != "gfx950":
-        return True
+    """Whether the gfx950 kernel can run M x N x K."""
     in_dtype_id = (
         GEMM_A16W16_DTYPE_FP16 if params["dtype"] == "fp16" else GEMM_A16W16_DTYPE_BF16
     )
