@@ -84,14 +84,30 @@ def get_occupancy():
     return 2
 
 
-def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
+def get_recommended_splits(
+    num_sequences,
+    num_kv_heads,
+    split_kv_blocks=1,
+    *,
+    query_length=1,
+    max_context_length=None,
+):
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count * get_occupancy()
-    max_context_partition_num = triton.cdiv(
-        num_sm, num_sequences * num_kv_heads * split_kv_blocks
-    )
-    max_context_partition_num *= split_kv_blocks
-    return min(max_context_partition_num, 8)
+    programs = num_sequences * num_kv_heads * split_kv_blocks
+    max_context_partition_num = triton.cdiv(num_sm, programs) * split_kv_blocks
+    legacy = min(max_context_partition_num, 8)
+    # Small grids leave CUs idle; ps=True with query_length > 1 is inexact when split.
+    if (
+        max_context_length is None
+        or query_length != 1
+        or split_kv_blocks != 1
+        or programs * 32 > num_sm
+    ):
+        return legacy
+    context_tiles = triton.cdiv(max_context_length, 256)
+    # The C++ ps reduce is wrong above 32 partitions (cross-half ds_swizzle).
+    return max(legacy, min(max_context_partition_num, context_tiles, 32))
 
 
 DS_WRITE = gl.constexpr(0x200)

@@ -18,7 +18,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import traceback
 import types
@@ -30,7 +29,6 @@ from unittest import mock
 JIT_CACHE_PATH = (
     Path(__file__).resolve().parents[1] / "aiter" / "jit" / "utils" / "jit_cache.py"
 )
-CORE_PATH = JIT_CACHE_PATH.parents[1] / "core.py"
 
 
 def _load_module(path, name):
@@ -935,7 +933,6 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "check_LLVM_MAIN_REVISION": lambda: 0,
             "validate_and_update_archs": lambda: ["gfx942"],
             "hip_flag_checker": lambda _flag: True,
-            "check_and_set_ninja_worker": lambda: None,
             "stage_blob_sources": jit_cache.stage_blob_sources,
             "publish_blob_sources": jit_cache.publish_blob_sources,
             "publish_compiled_kids": jit_cache.publish_compiled_kids,
@@ -1560,30 +1557,32 @@ class TestCppExtensionControl(unittest.TestCase):
             },
         )
 
-    def test_explicit_ninja_worker_count_is_preserved(self):
+    def test_ninja_worker_count_follows_the_shared_worker_budget(self):
+        # The worker count is owned by aiter_worker_limits; a single-worker
+        # ceiling is the one value that is deterministic on any host, and it
+        # proves a legacy MAX_JOBS is read as a ceiling instead of being
+        # handed to Ninja verbatim.
         with (
-            mock.patch.dict(os.environ, {"MAX_JOBS": "32"}),
+            mock.patch.dict(os.environ, {"AITER_MAX_JOBS": "1"}, clear=True),
             mock.patch.object(os, "cpu_count", return_value=32),
         ):
-            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 32)
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 1)
 
         with (
-            mock.patch.dict(os.environ, {"MAX_JOBS": "0"}),
+            mock.patch.dict(os.environ, {"MAX_JOBS": "1"}, clear=True),
             mock.patch.object(os, "cpu_count", return_value=32),
         ):
-            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 0)
+            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 1)
 
+        # A larger legacy MAX_JOBS stays bounded by the live CPU and memory
+        # budget instead of pinning the count, and never drops below one.
         with (
-            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.dict(os.environ, {"MAX_JOBS": "32"}, clear=True),
             mock.patch.object(os, "cpu_count", return_value=32),
         ):
-            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 25)
-
-        with (
-            mock.patch.dict(os.environ, {"MAX_JOBS": "invalid"}),
-            mock.patch.object(os, "cpu_count", return_value=32),
-        ):
-            self.assertEqual(self.namespace["_get_num_workers"](verbose=False), 25)
+            workers = self.namespace["_get_num_workers"](verbose=False)
+        self.assertGreaterEqual(workers, 1)
+        self.assertLessEqual(workers, 32)
 
     def compile(self, **options):
         self.namespace["_jit_compile"](
@@ -1673,98 +1672,6 @@ class TestCppExtensionControl(unittest.TestCase):
         self.compile(use_versioner=False)
         self.assertNotIn("no work to do", outputs[-1])
         self.assertNotEqual(os.stat(artifact).st_mtime_ns, unchanged_mtime)
-
-
-class TestNinjaWorkerLimit(unittest.TestCase):
-    def setUp(self):
-        self.namespace = _load_functions(
-            CORE_PATH,
-            ["check_and_set_ninja_worker"],
-            {
-                "os": os,
-                "_MAX_JOBS_LOCK": threading.Lock(),
-                "_LAST_AUTO_MAX_JOBS": None,
-            },
-        )
-        self.memory = types.SimpleNamespace(available=4 * 1024**3)
-        self.psutil = types.SimpleNamespace(virtual_memory=lambda: self.memory)
-
-    def test_core_preserves_explicit_positive_override_and_bounds_defaults(self):
-        for value in ("32", "+32", " 32 "):
-            with (
-                self.subTest(value=value),
-                mock.patch.dict(os.environ, {"MAX_JOBS": value}),
-                mock.patch.dict(sys.modules, {"psutil": self.psutil}),
-                mock.patch.object(os, "cpu_count", return_value=32) as cpu_count,
-            ):
-                self.namespace["_LAST_AUTO_MAX_JOBS"] = None
-                self.namespace["check_and_set_ninja_worker"]()
-                self.assertEqual(os.environ["MAX_JOBS"], "32")
-                cpu_count.assert_not_called()
-
-        for initial in (None, "invalid", "0", "-1", "-32"):
-            with self.subTest(initial=initial):
-                env = {} if initial is None else {"MAX_JOBS": initial}
-                with (
-                    mock.patch.dict(os.environ, env, clear=True),
-                    mock.patch.dict(sys.modules, {"psutil": self.psutil}),
-                    mock.patch.object(os, "cpu_count", return_value=32),
-                ):
-                    self.namespace["_LAST_AUTO_MAX_JOBS"] = None
-                    self.namespace["check_and_set_ninja_worker"]()
-                    self.assertEqual(os.environ["MAX_JOBS"], "8")
-
-    def test_recalculates_its_default_when_available_memory_drops(self):
-        self.memory.available = 32 * 1024**3
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.dict(sys.modules, {"psutil": self.psutil}),
-            mock.patch.object(os, "cpu_count", return_value=32),
-        ):
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "25")
-
-            self.memory.available = 1 * 1024**3
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "2")
-
-    def test_changed_explicit_override_is_preserved_across_resource_changes(self):
-        self.memory.available = 32 * 1024**3
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.dict(sys.modules, {"psutil": self.psutil}),
-            mock.patch.object(os, "cpu_count", return_value=32),
-        ):
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "25")
-
-            os.environ["MAX_JOBS"] = "+32"
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "32")
-
-            self.memory.available = 1 * 1024**3
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "32")
-
-    def test_removal_and_invalid_values_recompute_defaults(self):
-        self.memory.available = 32 * 1024**3
-        with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.dict(sys.modules, {"psutil": self.psutil}),
-            mock.patch.object(os, "cpu_count", return_value=32),
-        ):
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "25")
-
-            self.memory.available = 1 * 1024**3
-            os.environ.pop("MAX_JOBS")
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "2")
-
-            os.environ["MAX_JOBS"] = "not-a-number"
-            self.memory.available = 4 * 1024**3
-            self.namespace["check_and_set_ninja_worker"]()
-            self.assertEqual(os.environ["MAX_JOBS"], "8")
 
 
 @unittest.skipUnless(importlib.util.find_spec("pandas"), "Opus codegen requires pandas")
