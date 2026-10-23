@@ -128,6 +128,8 @@ def flydsl_hgemm_supports_shape(m: int, n: int, k: int, params: dict) -> bool:
     than the one it was tuned on, e.g. past the kernel's 32-bit buffer limits.
     """
 
+    # Only the gfx950 kernel is modeled here; other targets (gfx1250) run a
+    # different kernel with its own limits and keep their previous behavior.
     if params["target_gfx"] != "gfx950":
         return True
     in_dtype_id = (

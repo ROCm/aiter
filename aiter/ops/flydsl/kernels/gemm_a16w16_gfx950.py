@@ -14,8 +14,8 @@ from flydsl.runtime.device import get_rocm_arch
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx950_utils import (
-    GFX950_BUFFER_MAX_ELEMENTS,
     GFX950_DMA_BYTES,
+    GFX950_FLAT_BUFFER_LIMIT_BYTES,
     GFX950_WAVE_SIZE,
     SPLIT_K_SEMAPHORE_MAX_LEN,
     BlockSwizzle,
@@ -1383,10 +1383,13 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
         return None
     if result.b_is_transposed and k % async_load_vec_size != 0:
         return None
-    # A and B are loaded through buffer resources. C goes through one only for
-    # split-K's atomics, which the semaphore length already caps far below that;
-    # the plain epilogue stores C through a pointer with int64 offsets.
-    if m * k >= GFX950_BUFFER_MAX_ELEMENTS or n * k >= GFX950_BUFFER_MAX_ELEMENTS:
+    # A and B are read through one flat buffer descriptor each, whose 32-bit
+    # offsets address fewer than 4 GiB (as in the A8W8 preshuffle GEMM's capacity
+    # check), so larger operands are unsupported and dispatch falls back. C needs
+    # no bound: the plain epilogue stores through a pointer with int64 offsets,
+    # and split-K's buffer atomics stay far below it (SPLIT_K_SEMAPHORE_MAX_LEN).
+    in_bytes = result.in_data_bytes
+    if max(m, n) * k * in_bytes >= GFX950_FLAT_BUFFER_LIMIT_BYTES:
         return None
     num_pid_m = (m + result.block_m - 1) // result.block_m
     num_pid_n = (n + result.block_n - 1) // result.block_n

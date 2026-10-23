@@ -218,13 +218,13 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
 
 def check_shape_limits():
     # The MiniMax-M3 ViT row tuned at M=8192 must still serve the 768000-patch
-    # encoder profile, but not an M whose A reaches 2^31 elements.
+    # encoder profile, but not an M whose A reaches the 4 GiB flat-buffer limit.
     params = get_flydsl_hgemm_kernel_params(
         "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias1_ktail0_gm0_pht_gfx950"
     )
     assert flydsl_hgemm_supports_shape(768000, 6144, 1280, params)
     assert not flydsl_hgemm_supports_shape(2**21, 6144, 1280, params)
-    # Tuned Kimi-K3 row whose A is 2.19 GiB: past 2^31 bytes, still supported.
+    # Tuned Kimi-K3 row whose A is 2.19 GiB: below 4 GiB, still supported.
     kimi_params = get_flydsl_hgemm_kernel_params(
         "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pht_gfx950"
     )
