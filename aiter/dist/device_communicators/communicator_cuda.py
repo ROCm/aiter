@@ -304,7 +304,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_1stage_override is not None
             else (total_bytes <= total_bytes_limit)
         )
+
         qr_comm = self.qr_comm
+
+        # FlyDSL fused first when enabled. Try first the quantized kernels,
+        # then exact one-shot.
+        if (
+            not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and not gemma_norm
+        ):
+            for comm in (qr_comm, ca_comm):
+                if (
+                    comm is not None
+                    and not comm.disabled
+                    and comm.should_fly_allreduce_rmsnorm(input_, res_inp_, weight_)
+                ):
+                    return comm.fly_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
+
         if (
             not use_1stage
             and not use_general_path

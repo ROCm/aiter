@@ -3,10 +3,13 @@
 
 """Shared timing and reporting for the FlyDSL all-reduce tests' ``bench`` scenario.
 
-``test_flydsl_one_shot_allreduce.py`` and ``test_flydsl_quick_allreduce_int4.py``
+``test_flydsl_one_shot_allreduce.py`` and ``test_flydsl_quick_allreduce.py``
 each compare a FlyDSL kernel with the stock kernels production runs on the same
-payloads. This module is how both of them time and report that comparison, so
-the two tests cannot drift apart on method.
+payloads, for the plain all-reduce (``--operation ar``) and for all-reduce +
+residual add + RMSNorm (``--operation ar_rmsnorm``). This module is how both of
+them time and report that comparison, so the two tests cannot drift apart on
+method. It also reads the candidate files (``load_candidates``) through which
+the tuning suite pins FlyDSL configurations.
 
 The comparison is meant to be unbiased between the candidates. Every rule
 below removes a difference that is in the harness, not in the kernel:
@@ -63,6 +66,7 @@ import os
 import re
 import statistics
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -146,9 +150,10 @@ def capture(thunk, inner: int = GRAPH_INNER) -> torch.cuda.CUDAGraph:
     return g
 
 
-def graded_replay(g, out: torch.Tensor, group) -> torch.Tensor:
+def graded_replay(g, out, group):
     """Fill *out* with NaN, replay *g* once and return *out*.
 
+    *out* is a tensor or a tuple of them, for a kernel with several outputs.
     The barriers on both sides of the fill keep a peer that is still
     replaying from racing it.
     """
@@ -156,7 +161,8 @@ def graded_replay(g, out: torch.Tensor, group) -> torch.Tensor:
 
     torch.cuda.synchronize()
     dist.barrier(group=group)
-    out.fill_(float("nan"))
+    for t in out if isinstance(out, tuple) else (out,):
+        t.fill_(float("nan"))
     torch.cuda.synchronize()
     dist.barrier(group=group)
     g.replay()
@@ -316,6 +322,21 @@ def add_bench_args(parser) -> None:
         default=None,
         help="bench: also write every row and column to PATH as CSV.",
     )
+    parser.add_argument(
+        "--candidates",
+        metavar="PATH",
+        default=None,
+        help="bench: also time the pinned FlyDSL configurations in this\n"
+        "candidate file (see load_candidates in flydsl_allreduce_bench.py),\n"
+        "next to the shipping engine, as columns named after each row.",
+    )
+    parser.add_argument(
+        "--candidate-set",
+        metavar="NAME",
+        default=None,
+        help="bench: only the --candidates rows tagged NAME in their sets\n"
+        "column. Default every row.",
+    )
 
 
 def check_bench_args(parser, args) -> None:
@@ -326,9 +347,13 @@ def check_bench_args(parser, args) -> None:
             ("--shape-csv", args.shape_csv),
             ("--report", args.report),
             ("--csv", args.csv),
+            ("--candidates", args.candidates),
+            ("--candidate-set", args.candidate_set),
         ):
             if val is not None:
                 parser.error(f"{flag} needs --scenario bench")
+    if args.candidate_set is not None and args.candidates is None:
+        parser.error("--candidate-set needs --candidates")
     if args.shape_csv is not None:
         if args.mnk is not None:
             parser.error("--shape-csv and -s/--mnk are mutually exclusive")
@@ -353,6 +378,220 @@ def load_shapes_csv(path: str) -> list[tuple[int, int]]:
             )
         shapes.append((m, k))
     return list(dict.fromkeys(shapes))
+
+
+# The operations a bench run times: the plain all-reduce, or all-reduce +
+# residual add + RMSNorm.
+OPERATIONS = ("ar", "ar_rmsnorm")
+
+# The RMSNorm epsilon every ``ar_rmsnorm`` candidate is run with.
+RMS_EPS = 1e-6
+
+# Knobs a candidate row may pin, per algorithm and operation. An empty cell is
+# the engine's own value.
+CANDIDATE_KNOBS = {
+    ("oneshot", "ar"): ("atoms", "grid_cap", "fanout", "block"),
+    ("oneshot", "ar_rmsnorm"): ("atoms", "grid_cap", "fanout", "block", "split"),
+    ("mesh", "ar"): ("super_tile", "grid_cap", "block"),
+    ("ring", "ar"): ("super_tile", "grid_cap", "block"),
+    ("mesh", "ar_rmsnorm"): (
+        "super_tile",
+        "grid_cap",
+        "block",
+        "atoms_per_row",
+        "low_latency",
+    ),
+    ("ring", "ar_rmsnorm"): ("super_tile", "grid_cap", "atoms_per_row"),
+}
+_CANDIDATE_COLUMNS = (
+    "name",
+    "operation",
+    "algorithm",
+    "atoms",
+    "grid_cap",
+    "fanout",
+    "block",
+    "split",
+    "super_tile",
+    "atoms_per_row",
+    "low_latency",
+    "sets",
+)
+# Columns a candidate file may leave out; a missing one is empty on every row.
+_OPTIONAL_CANDIDATE_COLUMNS = ("low_latency",)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One pinned FlyDSL configuration from a candidate file."""
+
+    name: str
+    operation: str
+    algorithm: str
+    knobs: dict
+    sets: tuple[str, ...]
+
+
+def load_candidates(
+    path: str,
+    *,
+    operation: str,
+    algorithms: tuple[str, ...],
+    candidate_set: str | None = None,
+) -> list[Candidate]:
+    """The rows of the candidate file *path* for *operation* and *algorithms*.
+
+    A candidate file is a CSV with the columns ``name, operation, algorithm``,
+    one column per knob (``atoms, grid_cap, fanout, block, split, super_tile,
+    atoms_per_row``, and the optional ``low_latency``, 0 or 1) and ``sets``. ``operation`` is ``ar`` or ``ar_rmsnorm``,
+    ``algorithm`` is ``oneshot``, ``mesh`` or ``ring``. A knob cell is empty
+    when the row leaves it to the engine, and a row may only pin the knobs of
+    its algorithm and operation (``CANDIDATE_KNOBS``). ``sets`` is a list of
+    tags separated by ``;`` that ``--candidate-set`` selects on. Names are
+    unique: each is a column prefix in the bench tables.
+    """
+    df = pd.read_csv(path, dtype=str, keep_default_na=False, comment="#")
+    for col in _OPTIONAL_CANDIDATE_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    missing = set(_CANDIDATE_COLUMNS) - set(df.columns)
+    if missing:
+        raise ValueError(f"{path}: missing column(s) {sorted(missing)}")
+    names = list(df["name"])
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise ValueError(f"{path}: duplicate candidate name(s) {dup}")
+    out = []
+    for i, row in df.iterrows():
+        key = (row["algorithm"], row["operation"])
+        if key not in CANDIDATE_KNOBS:
+            raise ValueError(f"{path} row {i}: unknown algorithm/operation {key}")
+        allowed = CANDIDATE_KNOBS[key]
+        knobs = {}
+        for col in _CANDIDATE_COLUMNS[3:-1]:
+            cell = row[col].strip()
+            if not cell:
+                continue
+            if col not in allowed:
+                raise ValueError(
+                    f"{path} row {i} ({row['name']}): {col} is not a knob of "
+                    f"{key[0]} {key[1]}"
+                )
+            if col == "fanout":
+                knobs[col] = cell
+            elif col == "low_latency":
+                if cell not in ("0", "1"):
+                    raise ValueError(
+                        f"{path} row {i} ({row['name']}): low_latency must be "
+                        f"0 or 1, got {cell!r}"
+                    )
+                knobs[col] = cell == "1"
+            else:
+                knobs[col] = int(cell)
+        sets = tuple(t for t in row["sets"].replace(" ", "").split(";") if t)
+        cand = Candidate(row["name"], row["operation"], row["algorithm"], knobs, sets)
+        if (
+            cand.operation == operation
+            and cand.algorithm in algorithms
+            and (candidate_set is None or candidate_set in cand.sets)
+        ):
+            out.append(cand)
+    return out
+
+
+def fused_reference(total: torch.Tensor, residual, weight, eps: float = RMS_EPS):
+    """``(out, residual_out)`` of all-reduce + residual add + RMSNorm in fp32,
+    from the fp32 all-reduced *total*.
+
+    The sum is rounded to bf16 before the residual add, as every fused kernel
+    and the unfused path do.
+    """
+    acc = total.to(torch.bfloat16).float() + residual.float()
+    res_out = acc.to(torch.bfloat16)
+    rstd = torch.rsqrt(acc.pow(2).mean(-1, keepdim=True) + eps)
+    out = (acc * rstd * weight.float()).to(torch.bfloat16)
+    return out, res_out
+
+
+# ``ar_rmsnorm``: the exact stock fused paths, in the order each spawn captures
+# them. ``cdr_fused_*`` is ``CustomAllreduce``'s fused kernel at both stage
+# counts; ``<ar>+norm`` is that all-reduce and then ``rmsnorm2d_fwd_with_add``.
+EXACT_FUSED_STOCK = ("cdr_fused_1stage", "cdr_fused_2stage", "cdr+norm", "rccl+norm")
+# ``ar_rmsnorm``: the accuracy floor of an exact candidate, on ``out`` and on
+# ``residual_out``. ``out`` goes through an approximate rsqrt, so it sits well
+# below the plain all-reduce's floor.
+EXACT_FUSED_SQNR_FLOOR_DB = 30.0
+
+
+def exact_fused_thunks(ca, nccl, outs, x, residual, weight, ar_buf, eps) -> dict:
+    """The ``EXACT_FUSED_STOCK`` thunks that can run on *x*, by name.
+
+    *ca* is the group's ``CustomAllreduce`` and *nccl* its PyNccl, either None
+    when absent. Each candidate is gated as ``CudaCommunicator`` gates it, and
+    writes into its preallocated ``outs[name]``: ``fused_ar_rms`` allocates
+    whatever it is not given, and an allocation inside a capture is at best a
+    surprise.
+    """
+    from aiter import rmsnorm2d_fwd_with_add
+
+    thunks = {}
+    reg = ca is not None and ca.enable_register_for_capturing
+
+    def _registered():
+        # As CustomAllreduce: in place under capture, through its pool otherwise.
+        return reg and torch.cuda.is_current_stream_capturing()
+
+    custom = ca is not None and ca.should_custom_ar(x)
+    if custom and x.shape[-1] <= 16384:
+        for name, one in (("cdr_fused_1stage", True), ("cdr_fused_2stage", False)):
+
+            def _cdr_fused(o=outs[name], one=one):
+                ca.fused_ar_rms(
+                    x,
+                    residual,
+                    res_out=o[1],
+                    out=o[0],
+                    w=weight,
+                    eps=eps,
+                    registered=_registered(),
+                    use_1stage=one,
+                )
+
+            thunks[name] = _cdr_fused
+    if custom:
+
+        def _cdr_norm(o=outs["cdr+norm"]):
+            ca.all_reduce(x, out=ar_buf, registered_input=_registered())
+            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
+
+        thunks["cdr+norm"] = _cdr_norm
+    if nccl is not None:
+
+        def _rccl_norm(o=outs["rccl+norm"]):
+            # What CudaCommunicator.all_reduce falls back to, then the norm.
+            nccl.all_reduce(x, ar_buf)
+            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
+
+        thunks["rccl+norm"] = _rccl_norm
+    return thunks
+
+
+def mark_staged(res: dict, ca) -> None:
+    """Name the ``cdr`` candidates of *res* ``staged`` where production copies
+    the input into the IPC pool instead of registering it under capture."""
+    if ca is None or ca.enable_register_for_capturing:
+        return
+    for name in ("cdr_fused_1stage", "cdr_fused_2stage", "cdr+norm"):
+        if name in res:
+            res[name]["variant"] = "staged"
+
+
+def best_candidate(got: dict, names, floor_db: float):
+    """``(name, us)`` of the fastest of *names* in *got* that clears
+    *floor_db*, or ``(None, None)``. *got* maps a name to its ``collapse``."""
+    passing = [n for n in names if n in got and got[n]["SQNR dB"] >= floor_db]
+    best = min(passing, key=lambda n: got[n]["us"], default=None)
+    return best, (got[best]["us"] if best else None)
 
 
 def _gpu_numa_map() -> str:
@@ -399,18 +638,56 @@ def provenance(args, link: str, extra: list[str] = ()) -> list[str]:
     ]
 
 
-def bench_tables(rows: list[dict], *, candidates, drop=(), title: str) -> list:
+def geomean_table(df: pd.DataFrame, speedups, by=("tp",)) -> pd.DataFrame | None:
+    """Per group of *by*, the geometric mean, minimum and count of each
+    ``X vs Y`` column of *speedups*, over the rows where it is defined."""
+    by = [c for c in by if c in df]
+    speedups = [c for c in speedups if c in df]
+    if not by or not speedups:
+        return None
+    out = []
+    for key, g in df.groupby(by, sort=True):
+        row = dict(zip(by, key if isinstance(key, tuple) else (key,)))
+        row["rows"] = len(g)
+        for col in speedups:
+            v = pd.to_numeric(g[col], errors="coerce").dropna()
+            v = v[v > 0]
+            row[f"{col} geomean"] = (
+                float(statistics.geometric_mean(v)) if len(v) else None
+            )
+            row[f"{col} min"] = float(v.min()) if len(v) else None
+            row[f"{col} n"] = len(v)
+        out.append(row)
+    return pd.DataFrame(out)
+
+
+def bench_tables(
+    rows: list[dict],
+    *,
+    candidates,
+    drop=(),
+    title: str,
+    times=None,
+    sections=(),
+    geomean=(),
+    geomean_by=("tp",),
+) -> list:
     """The ``(title, DataFrame)`` tables of a bench run.
 
     The first table has the comparisons: every column that does not belong to
-    one candidate. The second has each candidate's ``us``, ``spread us``,
-    ``SQNR dB`` and ``variant``. The two share the columns that identify the
-    row.
+    one candidate or to a section, and the ``us`` of *times* (default every
+    candidate). Each ``(name, columns)`` of *sections* is a table of its own.
+    *geomean* adds a table of those ``X vs Y`` columns' geometric means per
+    *geomean_by* group. The last table has each candidate's ``us``,
+    ``spread us``, ``SQNR dB`` and ``variant``. Every table but the geomean one
+    leads with the columns that identify the row.
     """
     if not rows:
         return []
     df = pd.DataFrame(rows).drop(columns=list(drop), errors="ignore")
     ids = [c for c in ("gfx", "tp", "tokens", "hidden", "KiB") if c in df]
+    # Every row of a table has the same operation; the CSV keeps the column.
+    df = df.drop(columns=["operation"], errors="ignore")
     per_cand = [
         f"{n} {field}"
         for n in candidates
@@ -418,17 +695,35 @@ def bench_tables(rows: list[dict], *, candidates, drop=(), title: str) -> list:
         if f"{n} {field}" in df
     ]
     # The comparisons need each candidate's time, but not the rest.
-    times = [f"{n} us" for n in candidates if f"{n} us" in df]
-    summary = [c for c in df.columns if c not in per_cand and c not in ids]
-    return [
-        (title, df[ids + times + summary]),
-        (f"{title}: per candidate", df[ids + per_cand]),
+    shown = candidates if times is None else times
+    time_cols = [f"{n} us" for n in shown if f"{n} us" in df]
+    in_section = {c for _name, cols in sections for c in cols}
+    summary = [
+        c
+        for c in df.columns
+        if c not in per_cand and c not in ids and c not in in_section
     ]
+    tables = [(title, df[ids + time_cols + summary])]
+    for name, cols in sections:
+        cols = [c for c in cols if c in df]
+        if cols:
+            tables.append((f"{title}: {name}", df[ids + cols]))
+    gm = geomean_table(df, geomean, by=geomean_by)
+    if gm is not None:
+        tables.append((f"{title}: geomean speedup", gm))
+    tables.append((f"{title}: per candidate", df[ids + per_cand]))
+    return tables
 
 
 def to_markdown(df: pd.DataFrame) -> str:
     # Payload sizes in full; ".4g" would print 32768 KiB as 3.277e+04.
     fmt = tuple(".10g" if c == "KiB" else ".4g" for c in df.columns)
+    # A missing value is NaN once pandas has a float column, and tabulate only
+    # writes ``missingval`` for None.
+    # A bit-exact result has no noise: its SQNR is inf, or float32's maximum
+    # where the SQNR is computed in float32.
+    df = df.map(lambda v: "inf" if isinstance(v, float) and abs(v) >= 1e30 else v)
+    df = df.astype(object).where(df.notna(), None)
     return df.to_markdown(index=False, floatfmt=fmt, missingval="n/a")
 
 
