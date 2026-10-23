@@ -75,6 +75,17 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 
+@pytest.fixture(autouse=True)
+def _reset_kv_tile_cache():
+    """monkeypatch restores get_gfx, but not the mha_v4_kv_tile cache it may have warmed.
+
+    A stale tile is silently wrong mask geometry rather than an error, and it would leak into
+    every later test in the process, including the sparse file.
+    """
+    yield
+    mha_v4_module.mha_v4_kv_tile.cache_clear()
+
+
 def _e2m1_code_ties_low(value):
     magnitude = value.abs()
     code = sum(
