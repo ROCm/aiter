@@ -11,7 +11,6 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
 from flydsl.expr import rocdl
 
 from .attention_common import (
@@ -44,6 +43,7 @@ from .attention_common import (
     _schedule_exps,
     _stage_end,
     _sum,
+    _target_features,
     _uniform,
     _v_lds_address,
     _v_operands,
@@ -250,10 +250,10 @@ def _body(
     mask_resource = rocdl.get_buffer_rsrc(_buffer(masks, (CAP // 16) * BQ * 8))
     tid = fx.thread_idx.x
     wave, lane = _uniform(tid >> 6), tid & 63
-    ids_offset = _pin_i32(((wave & 3) * 4 + (lane & 3)) * 4)
+    ids_offset = ((wave & 3) * 4 + (lane & 3)) * 4
     row = row_offset + wave * 16 + (lane & 15)
     query, head = row // GP, row % GP
-    mask_offset = _pin_i32(_min(query, fx.Int32(BQ - 1)) * 8 + (lane >> 4) * 2)
+    mask_offset = _min(query, fx.Int32(BQ - 1)) * 8 + (lane >> 4) * 2
     valid_row = (query < qvalid) & (query < BQ) & (head < (H // HK))
     # Byte offsets are unsigned 32-bit: Q and each request's K/V may span up to 4 GiB.
     qextent = fx.Uint32(NQ - q0) * H * D * 2 - hkv * (H // HK) * D * 2
@@ -292,12 +292,12 @@ def _body(
     last_tile = key_tiles - 1
     key_row = (lane & 3) + ((lane & 12) << 1)
     k_s2r_base = tuple(
-        _pin_i32(_k_lds_address(key_row + n * 4, (lane >> 4) * 8 + parity * 32))
+        _k_lds_address(key_row + n * 4, (lane >> 4) * 8 + parity * 32)
         for n in range(2)
         for parity in range(2)
     )
-    v_s2r_base = _pin_i32(_v_lds_address((lane >> 4) * 8, (lane & 15) * 8))
-    cross_addresses = tuple(_pin_i32((lane ^ offset) * 4) for offset in (16, 32, 48))
+    v_s2r_base = _v_lds_address((lane >> 4) * 8, (lane & 15) * 8)
+    cross_addresses = tuple((lane ^ offset) * 4 for offset in (16, 32, 48))
 
     # g = global, s = LDS, r = registers; reads only issue, the stages place the waits.
     def read_ids_g2r(tile):
@@ -542,7 +542,8 @@ def _body(
         ),
         num_records_bytes=qextent,
     )
-    pinned_tid = _pin_i32(tid)
+    # Pin keeps output addressing inside the task loop; the mask restores tid's range.
+    pinned_tid = _pin_i32(tid) & (THREADS - 1)
     o_parts = _shuffle_o_r2s2r(o_lo, o_hi, inv, (k_lds, v_lds), pinned_tid)
     _store_o_r2g(
         o_parts, out, pinned_tid, H, H // HK, GP, BQ, qvalid, qextent, row_offset
@@ -683,9 +684,7 @@ def _launch(
             SCALE,
             value_attrs={
                 "rocdl.waves_per_eu": 2,
-                "llvm.target_features": ir.Attribute.parse(
-                    '#llvm.target_features<["-packed-fp32-ops"]>'
-                ),
+                "llvm.target_features": _target_features(),
             },
         ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
 

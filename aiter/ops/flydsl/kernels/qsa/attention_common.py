@@ -21,6 +21,8 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+
+# for inline asm and target features
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
@@ -165,6 +167,11 @@ def _keep_vgpr(words, chunk=4):
         llvm.inline_asm(None, [part.ir_value()], "", "v", has_side_effects=True)
 
 
+def _target_features():
+    # Packed FP32 VALU makes the union phase loop about 8% slower.
+    return ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')
+
+
 def _join(a, b):
     a, b = fx.Vector(a), fx.Vector(b)
     return fx.Vector.from_elements(
@@ -279,12 +286,11 @@ def _buffer_store_words(words, buffer, offset):
 
 def _load_lds(storage, offset, immediate=0):
     # Volatile keeps the hand-written order; the LDS variable's GEP gives it an alias scope.
-    ptr = fx.to_llvm_ptr(fx.get_iter(storage) + (fx.Int32(offset) + immediate))
-    return fx.Vector(
-        llvm.load(
-            ir.VectorType.get([4], fx.Int32.ir_type), ptr, alignment=16, volatile_=True
-        )
+    ptr = fx.get_iter(storage) + (fx.Int32(offset) + immediate)
+    ptr = fx.recast_iter(
+        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16), ptr
     )
+    return fx.Vector(fx.generic_load(ptr, count=4, volatile=True))
 
 
 def _write_address(address, words):

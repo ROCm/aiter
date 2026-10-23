@@ -11,7 +11,6 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl.expr import rocdl
 
 from .attention_common import (
@@ -27,6 +26,7 @@ from .attention_common import (
     _pack_bf16,
     _pin,
     _stage_end,
+    _target_features,
     _uniform,
     _write_address,
 )
@@ -637,11 +637,7 @@ def _launch(
             GATED,
             SCALE,
             TOPK,
-            value_attrs={
-                "llvm.target_features": ir.Attribute.parse(
-                    '#llvm.target_features<["-packed-fp32-ops"]>'
-                )
-            },
+            value_attrs={"llvm.target_features": _target_features()},
         )
         if fx.const_expr(GATED):
             kernel.launch(grid=(BQ * HK, TILES, 1), block=(64, 1, 1), stream=stream)
