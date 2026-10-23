@@ -62,10 +62,17 @@ whether production would run it on the payload.
 ``--operation ar_rmsnorm`` runs the fused epilogue instead
 (``FlyQuickAllReduceRMSNorm``: all-reduce + residual add + RMSNorm), and verify
 runs both unless one is named. Its ``test_quick_allreduce_rmsnorm_*`` sweeps
-end in one table each: SQNR against an fp32 oracle, bit-exactness of
-``residual_out`` on the lossless wire (native, padded-width and
-pinned-super-tile geometries), padded widths on the INT4 wire (SQNR), mesh
+end in one table each: SQNR against an fp32 oracle, the fused kernel against
+the unfused ``FlyQuickAllReduce`` + add + RMSNorm on the same block,
+bit-exactness of ``residual_out`` on the lossless wire (native, padded-width
+and pinned-super-tile geometries), padded widths on the INT4 wire (SQNR), mesh
 rank agreement, and ``test_quick_allreduce_host_checks``.
+``test_quick_allreduce_rmsnorm_options`` covers the epilogue options: Gemma's
+``1 + weight`` gain, an in-place ``residual_out``, and on gfx950 the MXFP4
+output of ``allreduce_rmsnorm_mxfp4``, bit for bit against
+``per_1x32_f4_quant_hip``. ``--extended`` adds
+``test_quick_allreduce_rmsnorm_low_latency``, the mesh with the low-latency
+build pinned on every rung.
 
 With ``--operation ar_rmsnorm``, bench times each fused schedule
 (``FlyQuickAllReduceRMSNorm`` as production builds it) against two sets of
@@ -77,9 +84,13 @@ stages where it accepts the payload, and ``cdr+norm`` and ``rccl+norm``.
 ``route`` is the family the fused policy picks with
 ``AITER_QUICK_REDUCE_QUANTIZATION=INT4``, and ``flydsl`` that family's kernel --
 the one-shot (``OneShotAllReduceRMSNorm``, timed only on those rows) at decode
-sizes. Each row compares ``flydsl`` with the fastest quantized and the fastest
-exact stock path that clear their accuracy floors, and a geomean table sums
-that up per TP and route. Its default shapes are ``FUSED_BENCH_SHAPES``.
+sizes. Each schedule is also timed unfused, as ``<schedule>+norm``
+(``FlyQuickAllReduce`` then ``rmsnorm2d_fwd_with_add``), and ``--mxfp4`` adds
+its MXFP4-quantizing kernel against the unfused path followed by
+``per_1x32_f4_quant_hip`` (gfx950). Each row compares ``flydsl`` with the
+fastest quantized and the fastest exact stock path that clear their accuracy
+floors, and a geomean table sums that up per TP and route. Its default shapes
+are ``FUSED_BENCH_SHAPES``.
 
 ``flydsl_allreduce_bench.py`` describes how the comparison is kept unbiased.
 The default payloads are the verify sweep's shipping payloads of both
@@ -150,6 +161,7 @@ from aiter.ops.flydsl.allreduce_policy import (
     SUPPORTED_ARCHS,
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
+    TwoShotRung,
     mesh_st_ladder,
     ring_st_ladder,
 )
@@ -1172,6 +1184,7 @@ def _result(key: tuple, case: tuple) -> list[dict]:
         kw = dict(key[1])
         if "algorithms" in kw:
             op = kw.pop("op")
+            fused_kw = {} if op == "ar" else {"mxfp4": kw.pop("mxfp4", False)}
             ranks = _spawn(
                 _bench_rank if op == "ar" else _bench_fused_rank,
                 key[0],
@@ -1180,6 +1193,7 @@ def _result(key: tuple, case: tuple) -> list[dict]:
                 engine_kw=kw,
                 cases=cases,
                 timing=_TIMING,
+                **fused_kw,
             )
         else:
             ranks = _spawn(
@@ -1351,11 +1365,15 @@ def test_quick_allreduce_int4(
     return ret
 
 
-def _bench_key(tp: int, algorithms, grid_cap, block, extra=(), op="ar") -> tuple:
+def _bench_key(
+    tp: int, algorithms, grid_cap, block, extra=(), op="ar", mxfp4=False
+) -> tuple:
     kw = {"algorithms": tuple(algorithms), "extra": tuple(extra), "op": op}
     for name, val in (("grid_cap", grid_cap), ("block", block)):
         if val is not None:
             kw[name] = val
+    if mxfp4:
+        kw["mxfp4"] = True
     return _key(tp, **kw)
 
 
@@ -1618,6 +1636,47 @@ FUSED_SELF_SQNR_MIN_DB = 40.0
 _GUARD_ROWS = 8
 _GUARD_BITS = 0x7FC1
 
+# The fused kernel against the unfused one -- ``FlyQuickAllReduce.allreduce``
+# then an fp32 add + RMSNorm -- on the same schedule and block. Both quantize
+# the same tiles the same way, so the only difference is the bf16 rounding of
+# the reduced sum that the fused kernel skips: a tight tolerance, not an SQNR.
+UNFUSED_RTOL = 2e-2
+UNFUSED_ATOL = 2e-2
+UNFUSED_ERR_RATIO = 0.01
+
+
+def _live_scale_idx(rows: int, hidden: int, device) -> torch.Tensor:
+    """Flat indices of the real rows in the shuffled e8m0 scale buffer of
+    ``mxfp4_scale_shape(rows, hidden)``, whose padding rows hold garbage."""
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
+        mxfp4_scale_shape,
+    )
+
+    scale_n = mxfp4_scale_shape(rows, hidden)[1]
+    x = torch.arange(rows, device=device)[:, None]
+    y = torch.arange(hidden // 32, device=device)[None, :]
+    idx = (
+        (x // 32) * scale_n * 32
+        + (y // 8) * 256
+        + (y % 4) * 64
+        + (x % 16) * 4
+        + (y % 8) // 4 * 2
+        + (x % 32) // 16
+    )
+    return idx.flatten()
+
+
+def _mxfp4_buffers(rows: int, hidden: int, device) -> tuple[torch.Tensor, ...]:
+    """Packed fp4x2 values and shuffled e8m0 scales of an MXFP4 call."""
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
+        mxfp4_scale_shape,
+    )
+
+    return (
+        torch.empty((rows, hidden // 2), dtype=torch.uint8, device=device),
+        torch.empty(mxfp4_scale_shape(rows, hidden), dtype=torch.uint8, device=device),
+    )
+
 
 def _fused_inputs(tokens, hidden, rank, device):
     """Per-rank input, and the residual and gain every rank shares.
@@ -1648,12 +1707,14 @@ def _run_rank_fused(
     rank: int,
     tp: int,
     init_method: str,
-    cases: list[tuple[int, int]],
+    cases: list[tuple],
     algorithm: str,
     codecs: tuple[str | None, str | None],
     solo: bool,
     engine_kw: dict | None = None,
     eps: float = 1e-6,
+    unfused: bool = False,
+    mxfp4: bool = False,
 ) -> list[dict]:
     """One rank of a fused run, over every case in one spawn.
 
@@ -1664,16 +1725,33 @@ def _run_rank_fused(
     to allocate. ``FlyQuickAllReduceRMSNorm`` builds per-hidden engines on
     demand, so one object covers every width here.
 
+    A case is ``(tokens, hidden)`` or ``(tokens, hidden, gemma_norm, inplace)``:
+    ``gemma_norm`` scales by ``1 + weight``, and ``inplace`` passes the same
+    tensor as ``residual_in`` and ``residual_out``.
+
     ``solo`` zeroes every rank but 0, which -- paired with the ``fp16``
     passthrough wire -- makes the all-reduce exact. That is the only
     configuration in which ``residual_out`` can be checked for bit-equality,
     and it is the cheapest detector for a dropped bf16 round-trip: SQNR on a
     quantized wire is far too loose to notice one, and the error it hides
     compounds per layer.
+
+    ``unfused`` also runs ``FlyQuickAllReduce`` on the same schedule, codecs and
+    block, and grades the fused outputs against its all-reduce followed by an
+    fp32 add + RMSNorm (see ``UNFUSED_RTOL``). Only where the plain kernel has
+    the fused block and the row is not padded; elsewhere the columns are None.
+
+    ``mxfp4`` also runs ``allreduce_rmsnorm_mxfp4`` where the engine supports
+    it (gfx950): its ``out`` and ``residual_out`` must equal the bf16 call's
+    bit for bit, and its packed values and live scales must equal
+    ``per_1x32_f4_quant_hip(out, shuffle=True)``.
     """
     import torch.distributed as dist
 
-    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
+    from aiter.ops.flydsl.quick_allreduce import (
+        FlyQuickAllReduce,
+        FlyQuickAllReduceRMSNorm,
+    )
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -1687,6 +1765,7 @@ def _run_rank_fused(
     gloo = dist.new_group(backend="gloo")
     rs_codec, ag_codec = codecs
 
+    engines = []
     eng = FlyQuickAllReduceRMSNorm(
         group=gloo,
         device=device,
@@ -1697,19 +1776,56 @@ def _run_rank_fused(
         ag_codec=ag_codec,
         **(engine_kw or {}),
     )
+    engines.append(eng)
     # The cases here are deliberately small; the floor is a speed policy, not a
     # correctness limit, so it must not decide what this test covers.
     eng.min_bytes = 0
+
+    # The unfused all-reduce per fused block, pinned to it: the plain ladder
+    # picks its own block by payload, and a different block quantizes different
+    # tiles. Built on first use, which every rank reaches in the same order.
+    plains = {}
+
+    def _plain(block: int):
+        if block not in plains:
+            plains[block] = FlyQuickAllReduce(
+                group=gloo,
+                device=device,
+                rank=rank,
+                world_size=tp,
+                algorithm=algorithm,
+                rs_codec=rs_codec,
+                ag_codec=ag_codec,
+                min_bytes=0,
+                ladder=(
+                    TwoShotRung(min_bytes=0, super_tile=1, grid_cap=64, block=block),
+                ),
+            )
+            engines.append(plains[block])
+            plains[block].preload()
+        return plains[block]
+
+    mxfp4 = mxfp4 and eng.supports_mxfp4
     rows = []
     try:
-        for tokens, hidden in cases:
+        for case in cases:
+            tokens, hidden = case[:2]
+            gemma_norm, inplace = case[2:] or (False, False)
             inp, residual, weight = _fused_inputs(tokens, hidden, rank, device)
+            if gemma_norm:
+                # The same gain as the other cases, as Gemma stores it.
+                weight = (weight.to(torch.float32) - 1.0).to(dtypes.bf16)
+            gain = weight.to(torch.float32) + (1.0 if gemma_norm else 0.0)
             if solo and rank != 0:
                 inp.zero_()
 
             # Build and JIT this width up front, so the checked call below is
-            # never the one that compiles.
+            # never the one that compiles. It must cover every build the calls
+            # below pick.
             eng.preload(hidden)
+            if mxfp4:
+                eng.preload(hidden, mxfp4=True)
+            preloaded = set(eng._by_cfg)
 
             # Both outputs are the head of a buffer with a sentinel tail of
             # _GUARD_ROWS rows, so a store past row M -- a dead row of a partial
@@ -1720,8 +1836,19 @@ def _run_rank_fused(
             ).to(device)
             out = guard[0, :tokens].view(dtypes.bf16)
             res_out = guard[1, :tokens].view(dtypes.bf16)
+            res_in = residual
+            if inplace:
+                # Overwritten by the call; the tail keeps the sentinel.
+                res_out.copy_(residual)
+                res_in = res_out
             eng.allreduce_rmsnorm(
-                inp, residual, weight, eps, out=out, residual_out=res_out
+                inp,
+                res_in,
+                weight,
+                eps,
+                out=out,
+                residual_out=res_out,
+                gemma_norm=gemma_norm,
             )
             torch.cuda.synchronize()
             dist.barrier()
@@ -1733,49 +1860,123 @@ def _run_rank_fused(
             x = ar.to(dtypes.bf16).to(torch.float32) + residual.to(torch.float32)
             res_ref = x.to(dtypes.bf16)
             rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-            out_ref = (x * rstd * weight.to(torch.float32)).to(dtypes.bf16)
+            out_ref = (x * rstd * gain).to(dtypes.bf16)
 
             # The epilogue judged on its own, with the codec noise factored
             # out: re-norm the kernel's residual_out and compare to its out.
             xr = res_out.to(torch.float32)
             out_self = (
-                xr
-                * torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + eps)
-                * weight.to(torch.float32)
+                xr * torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + eps) * gain
             ).to(dtypes.bf16)
 
-            rows.append(
-                {
-                    "rank": rank,
-                    "tokens": tokens,
-                    "hidden": hidden,
-                    "variant": eng.variant(hidden, int(inp.numel()) * 2),
-                    "out_sqnr_db": _sqnr_db(
-                        out.to(torch.float32), out_ref.to(torch.float32)
-                    ),
-                    "res_sqnr_db": _sqnr_db(
-                        res_out.to(torch.float32), res_ref.to(torch.float32)
-                    ),
-                    "self_sqnr_db": _sqnr_db(
-                        out.to(torch.float32), out_self.to(torch.float32)
-                    ),
-                    "res_exact": bool(torch.equal(res_out, res_ref)),
-                    "tail_intact": tail_intact,
-                    "finite": bool(torch.isfinite(out.to(torch.float32)).all()),
-                    # Cheap cross-rank fingerprints; see the mesh identity test.
-                    "out_bits": int(
-                        out.view(torch.int16).to(torch.int64).abs().sum().item()
-                    ),
-                    "res_bits": int(
-                        res_out.view(torch.int16).to(torch.int64).abs().sum().item()
-                    ),
-                }
-            )
-            del inp, residual, weight, out, res_out, ar, x, res_ref, out_ref, xr
-            del out_self, guard
+            nbytes = int(inp.numel()) * 2
+            num_tiles = max(1, -(-nbytes // eng._tile_bytes(hidden)))
+            cfg = eng._pick_cfg(hidden, nbytes, num_tiles)
+            block = eng._by_cfg[cfg][1]["block"]
+            row = {
+                "rank": rank,
+                "tokens": tokens,
+                "hidden": hidden,
+                "gemma": gemma_norm,
+                "inplace": inplace,
+                "variant": eng.variant(hidden, nbytes),
+                "block": block,
+                "low_latency": cfg[3],
+                "out_sqnr_db": _sqnr_db(
+                    out.to(torch.float32), out_ref.to(torch.float32)
+                ),
+                "res_sqnr_db": _sqnr_db(
+                    res_out.to(torch.float32), res_ref.to(torch.float32)
+                ),
+                "self_sqnr_db": _sqnr_db(
+                    out.to(torch.float32), out_self.to(torch.float32)
+                ),
+                "res_exact": bool(torch.equal(res_out, res_ref)),
+                "tail_intact": tail_intact,
+                "finite": bool(torch.isfinite(out.to(torch.float32)).all()),
+                # Cheap cross-rank fingerprints; see the mesh identity test.
+                "out_bits": int(
+                    out.view(torch.int16).to(torch.int64).abs().sum().item()
+                ),
+                "res_bits": int(
+                    res_out.view(torch.int16).to(torch.int64).abs().sum().item()
+                ),
+                # None where not run; see ``unfused`` and ``mxfp4`` above.
+                "unfused_out_err": None,
+                "unfused_res_err": None,
+                "mxfp4_equal": None,
+            }
+
+            # Only where the plain kernel can run the fused block on the same
+            # tiles: not on a block it does not build, nor on a padded row.
+            if (
+                unfused
+                and block in SUPPORTED_BLOCKS
+                and eng.pads_hidden(hidden) == hidden
+            ):
+                ar_q = torch.empty_like(inp)
+                _plain(block).allreduce(inp, ar_q)
+                xq = ar_q.to(torch.float32) + residual.to(torch.float32)
+                rstd_q = torch.rsqrt(xq.pow(2).mean(-1, keepdim=True) + eps)
+                tag = f"rank {rank} {tokens}x{hidden}"
+                for key, got, want in (
+                    ("unfused_out_err", out, xq * rstd_q * gain),
+                    ("unfused_res_err", res_out, xq),
+                ):
+                    row[key] = float(
+                        checkAllclose(
+                            want.to(dtypes.bf16).to(torch.float32),
+                            got.to(torch.float32),
+                            rtol=UNFUSED_RTOL,
+                            atol=UNFUSED_ATOL,
+                            tol_err_ratio=UNFUSED_ERR_RATIO,
+                            printLog=False,
+                            msg=f"{tag} {key}",
+                        )
+                    )
+                del ar_q, xq, rstd_q
+
+            if mxfp4:
+                out_q = torch.empty_like(out)
+                res_out_q = torch.empty_like(res_out)
+                res_in_q = residual
+                if inplace:
+                    res_out_q.copy_(residual)
+                    res_in_q = res_out_q
+                q, q_s = _mxfp4_buffers(tokens, hidden, device)
+                eng.allreduce_rmsnorm_mxfp4(
+                    inp,
+                    res_in_q,
+                    weight,
+                    eps,
+                    q,
+                    q_s,
+                    out=out_q,
+                    residual_out=res_out_q,
+                    gemma_norm=gemma_norm,
+                )
+                torch.cuda.synchronize()
+                ref_q, ref_s = aiter.per_1x32_f4_quant_hip(out_q, shuffle=True)
+                live = _live_scale_idx(tokens, hidden, device)
+                row["mxfp4_equal"] = (
+                    torch.equal(out_q, out)
+                    and torch.equal(res_out_q, res_out)
+                    and torch.equal(q, ref_q.view(torch.uint8))
+                    and torch.equal(
+                        q_s.flatten()[live], ref_s.view(torch.uint8).flatten()[live]
+                    )
+                )
+                dist.barrier()
+                del out_q, res_out_q, res_in_q, q, q_s, ref_q, ref_s, live
+
+            row["preloaded"] = set(eng._by_cfg) == preloaded
+            rows.append(row)
+            del inp, residual, res_in, weight, gain, out, res_out, ar, x, res_ref
+            del out_ref, xr, out_self, guard
             torch.cuda.empty_cache()
     finally:
-        eng.close()
+        for e in engines:
+            e.close()
         dist.destroy_process_group()
     return rows
 
@@ -1816,13 +2017,15 @@ def _spawn_ranks(worker, world_size: int, **kwds):
 
 def _spawn_fused(
     world_size: int,
-    cases: list[tuple[int, int]],
+    cases: list[tuple],
     *,
     algorithm: str = "ring",
     codecs: tuple[str | None, str | None] = (None, None),
     solo: bool = False,
     engine_kw: dict | None = None,
     eps: float = RMS_EPS,
+    unfused: bool = False,
+    mxfp4: bool = False,
 ) -> list[list[dict]]:
     return _spawn_ranks(
         _run_rank_fused,
@@ -1833,14 +2036,16 @@ def _spawn_fused(
         solo=solo,
         engine_kw=engine_kw,
         eps=eps,
+        unfused=unfused,
+        mxfp4=mxfp4,
     )
 
 
-_FUSED_BATCH_CACHE: dict[tuple, dict[tuple[int, int], list[dict]]] = {}
+_FUSED_BATCH_CACHE: dict[tuple, dict[tuple, list[dict]]] = {}
 
 
-def _fused_batch(key: tuple, cases: list[tuple[int, int]], **spawn_kwargs) -> dict:
-    """One ``_spawn_fused`` per *key*, memoized, indexed by shape.
+def _fused_batch(key: tuple, cases: list[tuple], **spawn_kwargs) -> dict:
+    """One ``_spawn_fused`` per *key*, memoized, indexed by case.
 
     Same bargain as ``_result`` above and for a sharper reason: a fused
     engine's IPC inboxes are large, and a pool per test leaves the previous
@@ -1921,8 +2126,54 @@ _FUSED_REJECTED_HIDDENS = (2560, 640, 12288)
 FUSED_EXACT_OUT_SQNR_MIN_DB = 60.0
 
 
+#: (tokens, hidden, gemma_norm, inplace) of the epilogue-option sweep, run at
+#: every world size on each schedule, with the MXFP4 output on gfx950 and the
+#: unfused comparison. A single token at 2048 is one partial tile; 37 rows leave
+#: a partial last tile at every width; 6144 is a block that is not a power of
+#: two; the large ones reach the higher super-tile rungs.
+_FUSED_OPTION_CASES = (
+    (1, 2048, False, False),
+    (37, 4096, True, False),
+    (37, 8192, False, True),
+    (37, 6144, True, True),
+    (1536, 8192, False, True),
+    (3072, 4096, True, False),
+    (4096, 8192, True, True),
+)
+
+#: Cases of the pinned low-latency build (``--extended``), kept at the widths
+#: that have one at a world size (``_low_latency_hidden_ok``).
+_FUSED_LOW_LATENCY_CASES = (
+    (1, 2048, False, False),
+    (256, 2048, True, False),
+    (37, 4096, False, True),
+    (512, 4096, True, True),
+    (1536, 8192, False, False),
+    (4096, 8192, True, False),
+)
+
+#: The low-latency build is a mesh build at this block.
+_LOW_LATENCY_BLOCK = 256
+
+
+def _low_latency_hidden_ok(hidden: int, tp: int) -> bool:
+    """Whether *hidden* has a native ``_LOW_LATENCY_BLOCK``-thread fused build
+    at *tp* ranks: a row's 2048-element atoms divide a rank's share of a tile."""
+    atoms_per_row, rem = divmod(hidden, 2048)
+    return rem == 0 and (ATOMS // tp) % atoms_per_row == 0
+
+
 def _pinned_st_kw(super_tile: int) -> dict:
     return {"super_tile": super_tile}
+
+
+def _sqnr_batch(tp: int, algorithm: str, cases: list[tuple]) -> dict:
+    """The shipping-engine batch of ``_FUSED_CASES``, with the unfused
+    comparison. The SQNR, rank-agreement, production-geometry and unfused
+    tables all read it."""
+    return _fused_batch(
+        (tp, "sqnr", algorithm), cases, algorithm=algorithm, unfused=True
+    )
 
 
 def _fused_sqnr_fails(rows: list[dict]) -> list[str]:
@@ -1949,7 +2200,28 @@ def _fused_sqnr_fails(rows: list[dict]) -> list[str]:
                 f"{row['self_sqnr_db']:.2f} dB < {FUSED_SELF_SQNR_MIN_DB} -- the "
                 "epilogue disagrees with its own residual"
             )
+        if not row["preloaded"]:
+            fails.append(f"rank {row['rank']}: a call built an engine preload missed")
     return fails
+
+
+def _fused_unfused_fails(rows: list[dict]) -> list[str]:
+    """The fused outputs against the unfused all-reduce + add + RMSNorm."""
+    return [
+        f"rank {r['rank']}: {key} {r[key]:.4f} >= {UNFUSED_ERR_RATIO}"
+        for r in rows
+        for key in ("unfused_out_err", "unfused_res_err")
+        if r[key] is not None and r[key] >= UNFUSED_ERR_RATIO
+    ]
+
+
+def _fused_mxfp4_fails(rows: list[dict]) -> list[str]:
+    return [
+        f"rank {r['rank']}: the MXFP4 call differs from the bf16 call + "
+        "per_1x32_f4_quant_hip"
+        for r in rows
+        if r["mxfp4_equal"] is False
+    ]
 
 
 def _fused_tail_fails(rows: list[dict], why: str) -> list[str]:
@@ -1995,6 +2267,24 @@ def _fused_summary(rows: list[dict]) -> dict:
     }
 
 
+def _worst_err(rows: list[dict], key: str) -> float | None:
+    errs = [r[key] for r in rows if r[key] is not None]
+    return max(errs) if errs else None
+
+
+def _option_summary(rows: list[dict]) -> dict:
+    """``_fused_summary`` plus the unfused comparison and the MXFP4 check;
+    ``None`` where a column was not run."""
+    mxfp4 = [r["mxfp4_equal"] for r in rows if r["mxfp4_equal"] is not None]
+    return {
+        **_fused_summary(rows),
+        "low_latency": rows[0]["low_latency"],
+        "unfused_out_err": _worst_err(rows, "unfused_out_err"),
+        "unfused_res_err": _worst_err(rows, "unfused_res_err"),
+        "mxfp4_equal": all(mxfp4) if mxfp4 else None,
+    }
+
+
 @benchmark()
 def test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm):
     """The fused epilogue against an fp32 oracle, plus its own self-consistency.
@@ -2007,10 +2297,91 @@ def test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm):
     Every case sharing (tp, algorithm) rides one spawn; see ``_fused_batch``.
     """
     cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
-    batch = _fused_batch((tp, "sqnr", algorithm), cases, algorithm=algorithm)
-    rows = batch[(tokens, hidden)]
+    rows = _sqnr_batch(tp, algorithm, cases)[(tokens, hidden)]
     _check(f"{label}/{algorithm}", _fused_sqnr_fails(rows))
     return _fused_summary(rows)
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_matches_unfused(tp, tokens, hidden, label, algorithm):
+    """The fused kernel against ``FlyQuickAllReduce`` + an fp32 add + RMSNorm.
+
+    Tight where both run the same block: the codec noise is the same, so this
+    sees an epilogue error far below what the SQNR floor can. Where the blocks
+    differ (``unfused_out_err`` is None) only the oracle applies.
+    """
+    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
+    rows = _sqnr_batch(tp, algorithm, cases)[(tokens, hidden)]
+    _check(f"{label}/{algorithm}", _fused_unfused_fails(rows))
+    return _option_summary(rows)
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_options(
+    tp, tokens, hidden, gemma_norm, inplace, algorithm
+):
+    """The epilogue options: Gemma's ``1 + weight`` gain, ``residual_out``
+    written in place over ``residual_in``, and, on gfx950, the MXFP4 output.
+
+    Each case is graded like ``test_quick_allreduce_rmsnorm_sqnr``, plus rank
+    agreement, the unfused comparison, and the MXFP4 call against the bf16 call
+    followed by ``per_1x32_f4_quant_hip``.
+    """
+    batch = _fused_batch(
+        (tp, "options", algorithm),
+        list(_FUSED_OPTION_CASES),
+        algorithm=algorithm,
+        unfused=True,
+        mxfp4=True,
+    )
+    rows = batch[(tokens, hidden, gemma_norm, inplace)]
+    fails = (
+        _fused_sqnr_fails(rows)
+        + _fused_disagree_fails(rows)
+        + _fused_unfused_fails(rows)
+        + _fused_mxfp4_fails(rows)
+    )
+    _check(
+        f"tp{tp} {tokens}x{hidden} gemma={gemma_norm} inplace={inplace} {algorithm}",
+        fails,
+    )
+    return _option_summary(rows)
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_low_latency(tp, tokens, hidden, gemma_norm, inplace):
+    """The mesh with the low-latency build pinned on every rung, graded like
+    ``test_quick_allreduce_rmsnorm_options``.
+
+    Production takes it only where a ladder says so, and none does on some
+    links, so this is the one place it is checked everywhere.
+    """
+    cases = [c for c in _FUSED_LOW_LATENCY_CASES if _low_latency_hidden_ok(c[1], tp)]
+    batch = _fused_batch(
+        (tp, "low-latency", "mesh"),
+        cases,
+        algorithm="mesh",
+        engine_kw={"low_latency": True, "block": _LOW_LATENCY_BLOCK},
+        unfused=True,
+        mxfp4=True,
+    )
+    rows = batch[(tokens, hidden, gemma_norm, inplace)]
+    fails = (
+        _fused_sqnr_fails(rows)
+        + _fused_disagree_fails(rows)
+        + _fused_unfused_fails(rows)
+        + _fused_mxfp4_fails(rows)
+    )
+    fails += [
+        f"rank {r['rank']} ran {r['variant']}, not the low-latency build"
+        for r in rows
+        if not r["low_latency"]
+    ]
+    _check(
+        f"tp{tp} {tokens}x{hidden} gemma={gemma_norm} inplace={inplace} low-latency",
+        fails,
+    )
+    return _option_summary(rows)
 
 
 @benchmark()
@@ -2095,9 +2466,7 @@ def test_quick_allreduce_rmsnorm_ranks_agree(tp, tokens, hidden, algorithm):
     still a pure function of what went over the wire. A rank that used its
     unquantized accumulator instead would disagree, and this is what catches it.
     """
-    rows = _fused_batch(
-        (tp, "sqnr", algorithm), [(tokens, hidden)], algorithm=algorithm
-    )[(tokens, hidden)]
+    rows = _sqnr_batch(tp, algorithm, [(tokens, hidden)])[(tokens, hidden)]
     _check(f"tp{tp} {tokens}x{hidden} {algorithm}", _fused_disagree_fails(rows))
     return _fused_summary(rows)
 
@@ -2144,9 +2513,9 @@ def test_quick_allreduce_rmsnorm_production_geometry(
     )
     if apr is None:
         return {"gfx": ARCH, "skipped": True}
+    # The shipping engine is the production one: the SQNR table's batch.
     cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
-    batch = _fused_batch((tp, "production", algorithm), cases, algorithm=algorithm)
-    rows = batch[(tokens, hidden)]
+    rows = _sqnr_batch(tp, algorithm, cases)[(tokens, hidden)]
     fails = _fused_sqnr_fails(rows) + _fused_disagree_fails(rows)
     _check(f"{label}/{algorithm}/atoms_per_row={apr}", fails)
     return _fused_summary(rows)
@@ -2812,7 +3181,7 @@ def _verify(args, tps, algos, dts, link) -> None:
     )
 
 
-def _verify_fused(tps, algos) -> None:
+def _verify_fused(tps, algos, extended: bool) -> None:
     """The fused (all-reduce + residual add + RMSNorm) verify sweeps. The
     mesh-only rows need the mesh among the requested schedules."""
     fused = [c for c in _FUSED_CASES if c[0] in tps]
@@ -2824,6 +3193,26 @@ def _verify_fused(tps, algos) -> None:
             test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm)
             for (tp, tokens, hidden, label), algorithm in itertools.product(
                 fused, algos
+            )
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm vs unfused",
+        [
+            test_quick_allreduce_rmsnorm_matches_unfused(
+                tp, tokens, hidden, label, algorithm
+            )
+            for (tp, tokens, hidden, label), algorithm in itertools.product(
+                fused, algos
+            )
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm epilogue options (gemma, in-place, MXFP4)",
+        [
+            test_quick_allreduce_rmsnorm_options(tp, *case, algorithm)
+            for tp, algorithm, case in itertools.product(
+                sorted({c[0] for c in fused}), algos, _FUSED_OPTION_CASES
             )
         ],
     )
@@ -2929,6 +3318,16 @@ def _verify_fused(tps, algos) -> None:
                 [c for c in _FUSED_MESH_ST_EXACT_CASES if c[0] in tps and mesh],
                 _FUSED_MESH_STS,
             )
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm mesh pinned low-latency build",
+        [
+            test_quick_allreduce_rmsnorm_low_latency(tp, *case)
+            for tp in sorted({c[0] for c in fused})
+            if extended and mesh
+            for case in _FUSED_LOW_LATENCY_CASES
+            if _low_latency_hidden_ok(case[1], tp)
         ],
     )
     _summarize(
@@ -3046,6 +3445,7 @@ def _bench_fused_rank(
     cases: list[tuple],
     timing: tuple[int, int],
     extra: tuple = (),
+    mxfp4: bool = False,
 ) -> list[dict]:
     """One rank of one ``ar_rmsnorm`` bench spawn: every candidate on every case.
 
@@ -3053,15 +3453,24 @@ def _bench_fused_rank(
     as production builds it, the *extra* engines from ``--candidates``,
     ``FUSED_STOCK`` and ``EXACT_STOCK``. Where the fused policy routes a case
     to the one-shot, ``OneShotAllReduceRMSNorm`` as ``oneshot`` too, so every
-    row has the FlyDSL kernel production would run. A case is
-    ``(tokens, hidden)``. Returns, per case, whether production would run the
-    HIP fused kernel on it and each candidate's per-rank result.
+    row has the FlyDSL kernel production would run. Each schedule also runs
+    unfused, as ``<schedule>+norm`` (see ``_unfused_bench_thunks``), and with
+    *mxfp4* (gfx950) quantizing, as ``<schedule>_mxfp4`` and
+    ``<schedule>+norm+mxfp4``. A case is ``(tokens, hidden)``. Returns, per
+    case, whether production would run the HIP fused kernel on it and each
+    candidate's per-rank result.
     """
     import torch.distributed as dist
 
     from aiter.dist.device_communicators.quick_all_reduce import QuickReduceRegime
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
+        mxfp4_scale_shape,
+    )
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
-    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
+    from aiter.ops.flydsl.quick_allreduce import (
+        FlyQuickAllReduce,
+        FlyQuickAllReduceRMSNorm,
+    )
 
     del engine_kw  # the knobs come per candidate
     device = torch.device(f"cuda:{rank}")
@@ -3097,6 +3506,21 @@ def _bench_fused_rank(
             min_bytes=0,
             **knobs,
         )
+    # The all-reduce each schedule's fused kernel replaces, as production
+    # builds it.
+    plains = {}
+    for algorithm in algorithms:
+        plains[algorithm] = FlyQuickAllReduce(
+            group=gloo,
+            device=device,
+            rank=rank,
+            world_size=tp,
+            algorithm=algorithm,
+            link=link,
+            min_bytes=0,
+        )
+        plains[algorithm].preload()
+    mxfp4 = mxfp4 and all(engines[a].supports_mxfp4 for a in algorithms)
     # The payload ceiling is a speed policy, so it is lifted, as in the
     # one-shot's own bench; the policy below decides where it is timed.
     oneshot = OneShotAllReduceRMSNorm(
@@ -3109,7 +3533,13 @@ def _bench_fused_rank(
 
     # The inputs and every candidate's outputs, for the whole spawn. Refer to
     # flydsl_allreduce_bench for why the addresses must not change.
-    names = (*engines, "oneshot", *FUSED_STOCK, *EXACT_STOCK)
+    names = (
+        *engines,
+        "oneshot",
+        *_unfused_names(algorithms, mxfp4),
+        *FUSED_STOCK,
+        *EXACT_STOCK,
+    )
     max_bytes = max(m * hidden * 2 for m, hidden in cases)
     bufs = {
         name: torch.empty(max_bytes, dtype=torch.uint8, device=device)
@@ -3120,6 +3550,13 @@ def _bench_fused_rank(
             *(f"{n}:{o}" for n in names for o in ("out", "res")),
         )
     }
+    if mxfp4:
+        bufs["q"] = torch.empty(max_bytes // 4, dtype=torch.uint8, device=device)
+        bufs["q_s"] = torch.empty(
+            max(math.prod(mxfp4_scale_shape(m, hidden)) for m, hidden in cases),
+            dtype=torch.uint8,
+            device=device,
+        )
 
     def _view(name, m, hidden):
         return bufs[name][: m * hidden * 2].view(torch.bfloat16).view(m, hidden)
@@ -3176,6 +3613,30 @@ def _bench_fused_rank(
                     eps,
                 )
             )
+            # MXFP4 needs an unpadded row.
+            quant = {
+                a: (
+                    bufs["q"][: nbytes // 4],
+                    bufs["q_s"][: math.prod(mxfp4_scale_shape(m, hidden))],
+                )
+                for a in algorithms
+                if mxfp4 and engines[a].pads_hidden(hidden) == hidden
+            }
+            for a in quant:
+                engines[a].preload(hidden, mxfp4=True)
+            thunks.update(
+                _unfused_bench_thunks(
+                    engines,
+                    plains,
+                    quant,
+                    outs,
+                    x,
+                    residual,
+                    weight,
+                    _view("ar", m, hidden),
+                    eps,
+                )
+            )
             hip_prod = False
             if "hip_fused" in thunks:
                 qr.qr_quant_level = level
@@ -3196,6 +3657,13 @@ def _bench_fused_rank(
                 res[name]["us"] = us
             for name, eng in live.items():
                 res[name]["variant"] = eng.variant(hidden, nbytes)
+            for a, plain in plains.items():
+                res[f"{a}+norm"]["variant"] = plain.variant(nbytes)
+            for a in quant:
+                res[f"{a}_mxfp4"]["variant"] = engines[a].variant(
+                    hidden, nbytes, mxfp4=True
+                )
+                res[f"{a}+norm+mxfp4"]["variant"] = plains[a].variant(nbytes)
             wire = "fp16" if qr is not None and qr.use_fp16_kernels else "bf16"
             for name in FUSED_STOCK:
                 if name in res:
@@ -3204,8 +3672,51 @@ def _bench_fused_rank(
             rows.append({"hip prod": hip_prod, "candidates": res})
             del graphs
     finally:
-        _teardown([*engines.values(), oneshot], gloo)
+        _teardown([*engines.values(), *plains.values(), oneshot], gloo)
     return rows
+
+
+def _unfused_names(algorithms, mxfp4: bool) -> tuple[str, ...]:
+    """The unfused and MXFP4 bench candidates of each schedule."""
+    names = tuple(f"{a}+norm" for a in algorithms)
+    if mxfp4:
+        names += tuple(n for a in algorithms for n in (f"{a}_mxfp4", f"{a}+norm+mxfp4"))
+    return names
+
+
+def _unfused_bench_thunks(
+    engines, plains, quant, outs, x, residual, weight, ar_buf, eps
+) -> dict:
+    """``<schedule>+norm``: ``FlyQuickAllReduce`` then ``rmsnorm2d_fwd_with_add``,
+    the unfused path a fused schedule replaces. For each schedule in *quant*,
+    which maps it to the MXFP4 outputs, also ``<schedule>_mxfp4`` (the fused
+    MXFP4 kernel) and ``<schedule>+norm+mxfp4`` (the unfused path, then
+    ``per_1x32_f4_quant_hip``)."""
+    from aiter import per_1x32_f4_quant_hip, rmsnorm2d_fwd_with_add
+
+    thunks = {}
+    for a, plain in plains.items():
+
+        def _unfused(p=plain, o=outs[f"{a}+norm"]):
+            p.allreduce(x, ar_buf)
+            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
+
+        thunks[f"{a}+norm"] = _unfused
+    for a, (q, q_s) in quant.items():
+
+        def _fused_mxfp4(e=engines[a], o=outs[f"{a}_mxfp4"], q=q, q_s=q_s):
+            e.allreduce_rmsnorm_mxfp4(
+                x, residual, weight, eps, q, q_s, out=o[0], residual_out=o[1]
+            )
+
+        def _unfused_mxfp4(p=plains[a], o=outs[f"{a}+norm+mxfp4"]):
+            p.allreduce(x, ar_buf)
+            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
+            per_1x32_f4_quant_hip(o[0], shuffle=True)
+
+        thunks[f"{a}_mxfp4"] = _fused_mxfp4
+        thunks[f"{a}+norm+mxfp4"] = _unfused_mxfp4
+    return thunks
 
 
 def _fused_route(policy, nbytes: int) -> str:
@@ -3216,20 +3727,31 @@ def _fused_route(policy, nbytes: int) -> str:
 
 
 @benchmark()
-def bench_quick_allreduce_rmsnorm(tokens, hidden, tp, algorithms, route, extra=()):
+def bench_quick_allreduce_rmsnorm(
+    tokens, hidden, tp, algorithms, route, extra=(), mxfp4=False
+):
     """The fused FlyDSL path production routes the payload to against the best
     quantized and the best exact stock fused path, plus each schedule on its
-    own.
+    own and against its unfused path (``<schedule> vs unfused``).
 
     *route* is the family the fused policy picks for the payload. *extra* are
-    the ``--candidates`` engines, timed in the same spawn.
+    the ``--candidates`` engines, timed in the same spawn. *mxfp4* adds each
+    schedule's MXFP4-quantizing kernel against its unfused path
+    (``<schedule> mxfp4 vs unfused``).
     """
-    key = _bench_key(tp, algorithms, None, None, extra, "ar_rmsnorm")
+    key = _bench_key(tp, algorithms, None, None, extra, "ar_rmsnorm", mxfp4)
     rows = _result(key, (tokens, hidden))
     pinned = tuple(name for name, _alg, _knobs in extra)
     names = [
         n
-        for n in (*algorithms, "oneshot", *pinned, *FUSED_STOCK, *EXACT_STOCK)
+        for n in (
+            *algorithms,
+            "oneshot",
+            *pinned,
+            *_unfused_names(algorithms, mxfp4),
+            *FUSED_STOCK,
+            *EXACT_STOCK,
+        )
         if n in rows[0]["candidates"]
     ]
     got = {n: fab.collapse([r["candidates"][n] for r in rows]) for n in names}
@@ -3271,6 +3793,16 @@ def bench_quick_allreduce_rmsnorm(tokens, hidden, tp, algorithms, route, extra=(
     }
     for algorithm in algorithms:
         ret[f"{algorithm} vs quantized"] = fab.speedup(quant_us, got[algorithm]["us"])
+        ret[f"{algorithm} vs unfused"] = fab.speedup(
+            got[f"{algorithm}+norm"]["us"], got[algorithm]["us"]
+        )
+        if mxfp4:
+            fused, unfused = got.get(f"{algorithm}_mxfp4"), got.get(
+                f"{algorithm}+norm+mxfp4"
+            )
+            ret[f"{algorithm} mxfp4 vs unfused"] = (
+                fab.speedup(unfused["us"], fused["us"]) if fused and unfused else None
+            )
     for name, c in got.items():
         ret.update({f"{name} {field}": v for field, v in c.items()})
     return ret
@@ -3278,6 +3810,10 @@ def bench_quick_allreduce_rmsnorm(tokens, hidden, tp, algorithms, route, extra=(
 
 def _bench_fused(args, tps, algos, link) -> None:
     extra = _candidates(args, "ar_rmsnorm", algos)
+    mxfp4 = args.mxfp4
+    if mxfp4 and ARCH != "gfx950":
+        aiter.logger.warning("--mxfp4 needs gfx950, not %s; ignoring it", ARCH)
+        mxfp4 = False
     shapes = (
         FUSED_BENCH_SHAPES
         if args.mnk is None
@@ -3286,7 +3822,7 @@ def _bench_fused(args, tps, algos, link) -> None:
     rows = []
     for tp in tps:
         policy = fly_policy.resolve_fused_policy(world_size=tp, link=link)
-        key = _bench_key(tp, algos, None, None, extra, "ar_rmsnorm")
+        key = _bench_key(tp, algos, None, None, extra, "ar_rmsnorm", mxfp4)
         for shape in shapes:
             _register(key, shape)
         rows += [
@@ -3297,21 +3833,25 @@ def _bench_fused(args, tps, algos, link) -> None:
                 algos,
                 route=_fused_route(policy, tokens * hidden * 2),
                 extra=extra,
+                mxfp4=mxfp4,
             )
             for tokens, hidden in shapes
         ]
-    rows = [{k: v for k, v in r.items() if k != "extra"} for r in rows]
+    rows = [{k: v for k, v in r.items() if k not in ("extra", "mxfp4")} for r in rows]
 
     candidates = (
         *algos,
         "oneshot",
         *(name for name, _a, _k in extra),
+        *_unfused_names(algos, mxfp4),
         *FUSED_STOCK,
         *EXACT_STOCK,
     )
     schedules = [
         *(f"{n} us" for n in candidates),
         *(f"{a} vs quantized" for a in algos),
+        *(f"{a} vs unfused" for a in algos),
+        *(f"{a} mxfp4 vs unfused" for a in algos if mxfp4),
         "hip_fused in prod",
     ]
     tables = fab.bench_tables(
@@ -3352,6 +3892,17 @@ def _bench_fused(args, tps, algos, link) -> None:
                 "CustomAllreduce accepts the payload"
             ),
             "- `flydsl vs X` is `X us / flydsl us`: above 1.0 FlyDSL is faster",
+            (
+                "- `<schedule> vs unfused` is `<schedule>+norm us / <schedule> us`; "
+                "`<schedule>+norm` is FlyQuickAllReduce, then "
+                "rmsnorm2d_fwd_with_add"
+                + (
+                    "; `+mxfp4` adds per_1x32_f4_quant_hip after it, against "
+                    "the fused `<schedule>_mxfp4`"
+                    if mxfp4
+                    else ""
+                )
+            ),
             "- `n/a`: the candidate cannot run that payload, or is not timed there",
         ],
     )
@@ -3548,6 +4099,12 @@ def main():
         "RMSNorm. verify runs both unless one is named; bench runs ar unless\n"
         "ar_rmsnorm is named.",
     )
+    parser.add_argument(
+        "--mxfp4",
+        action="store_true",
+        help="bench, ar_rmsnorm on gfx950: also time each schedule's\n"
+        "MXFP4-quantizing fused kernel against its unfused path.",
+    )
     fab.add_bench_args(parser)
     args = parser.parse_args()
     fab.check_bench_args(parser, args)
@@ -3586,7 +4143,7 @@ def main():
         if args.operation in (None, "ar"):
             _verify(args, tps, algos, dts, link)
         if args.operation in (None, "ar_rmsnorm"):
-            _verify_fused(tps, algos)
+            _verify_fused(tps, algos, args.extended)
 
     if _FAILURES:
         raise SystemExit(
