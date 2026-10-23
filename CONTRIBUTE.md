@@ -319,27 +319,21 @@ When integrating CK tiles:
 
 ### Triton Kernel Development
 
-For Triton kernels:
+Triton and Gluon kernels follow the rules in
+[aiter/ops/triton/README.md](aiter/ops/triton/README.md#rules). The most
+important rules:
 
-1. **Use Appropriate Block Sizes**:
-   ```python
-   @triton.jit
-   def kernel(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
-       # Use BLOCK_SIZE between 128-1024 for AMD GPUs
-       pass
-   ```
-
-2. **Enable Software Pipelining**:
-   ```python
-   for blk_idx in tl.range(0, n_blocks, num_stages=2):  # Enable pipelining
-       data = tl.load(ptr + blk_idx * BLOCK_SIZE)
-   ```
-
-3. **Use Cache Modifiers**:
-   ```python
-   # For data that will be reused
-   x = tl.load(input_ptr, cache_modifier=".cg")  # Cache globally
-   ```
+1. Before you add a kernel, find kernels with the same or almost the same
+   function. Do not add a duplicate.
+2. Each kernel has a public wrapper, a unit test and a benchmark.
+3. Each launchable kernel has `repr=make_kernel_repr(...)`.
+4. Each kernel is in the correct folder, and its tuning values are in JSON
+   files in `aiter/ops/triton/configs/`, not in Python.
+5. Common code, such as activations, shuffles and config loading, comes from
+   the shared modules. Do not write local copies.
+6. Comments are short: one or two sentences.
+7. Docs, comments and PR descriptions use
+   [ASD-STE100](https://www.asd-ste100.org/) (Simplified Technical English).
 
 ---
 
@@ -398,6 +392,22 @@ Ensure your PR:
 * [ ] Updates documentation if needed
 * [ ] Includes performance benchmarks (for kernel changes)
 * [ ] Has a clear, descriptive title
+* [ ] Changes one kernel backend (see below)
+
+### One Backend Per PR
+
+A PR changes kernels of one backend only: Triton/Gluon, HIP, ASM, CK, OPUS or
+FlyDSL. Triton and Gluon count as one backend. Each backend has its own owners,
+tests and CI jobs, and a PR that mixes two waits on both. If the title
+automation puts two backend tags on your PR, split it.
+
+Work that spans backends becomes one PR per backend. When one part cannot
+merge without the other -- a kernel in one backend and the dispatch change in
+another, say -- open them as
+[stacked pull requests](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs):
+the second PR's branch starts from the first one's and targets it instead of
+`main`, so each is reviewed on its own and they merge in order. `gh stack`
+does the bookkeeping; from a fork, set the base branch by hand.
 
 ### PR Title Format
 

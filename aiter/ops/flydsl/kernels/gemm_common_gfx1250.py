@@ -3,7 +3,6 @@
 from collections import namedtuple
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import as_ir_value, gpu, rocdl
 from flydsl.expr.rocdl import cluster, tdm_ops
@@ -56,7 +55,7 @@ def make_sgpr_opaque(val_i32):
     Emits no instruction.
     """
     op = llvm_dialect.InlineAsmOp(
-        res=ir.IntegerType.get_signless(32),
+        res=T.i32,
         operands_=[as_ir_value(val_i32)],
         asm_string="",
         constraints="=s,s",
@@ -66,31 +65,30 @@ def make_sgpr_opaque(val_i32):
     return op.res
 
 
-def _raw_lds_ptr(lds_base_idx, byte_offset):
-    """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
-    lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
-    total_byte = fx.Index(lds_base_idx) + fx.Index(byte_offset)
-    return llvm_dialect.inttoptr(lds_ptr_ty, fx.Int32(total_byte).ir_value())
+def _lds_ptr(lds_base_idx, byte_offset, element_type, alignment):
+    """Materialize an aligned LDS pointer from a pre-extracted byte base."""
+    lds_ptr_ty = fx.PointerType.get(element_type, fx.AddressSpace.Shared, alignment)
+    total_byte = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
+    return fx.inttoptr(lds_ptr_ty, total_byte)
 
 
 def lds_load_b128_raw(lds_base_idx, byte_offset):
-    """Load 16 bytes from LDS using a pre-extracted base index (raw LLVM)."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(
-        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val
-    )
+    """Load 16 bytes from LDS using a pre-extracted byte base."""
+    vec_type = fx.Vector.make_type(4, fx.Int32)
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 16)
+    return as_ir_value(fx.ptr_load(ptr_val, result_type=vec_type))
 
 
 def lds_load_b32_raw(lds_base_idx, byte_offset):
     """Load 4 bytes from LDS as ``i32`` using a pre-extracted base index."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 4)
+    return as_ir_value(fx.ptr_load(ptr_val))
 
 
 def lds_store_b128_raw(lds_base_idx, byte_offset, data):
-    """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM)."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    llvm_dialect.store(as_ir_value(data), ptr_val)
+    """Store 16 bytes to LDS using a pre-extracted byte base."""
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 16)
+    fx.ptr_store(as_ir_value(data), ptr_val)
 
 
 def workgroup_barrier(use_cluster=False):
@@ -135,9 +133,7 @@ def pipeline_fence_wait(use_cluster=False):
 
 def fmin_f32(a, b):
     """Scalar f32 min (maps to v_min_num_f32)."""
-    from flydsl.expr import arith
-
-    return fx.Float32(arith.minnumf(as_ir_value(a), as_ir_value(b)))
+    return fx.minnumf(fx.Float32(a), fx.Float32(b))
 
 
 def fclamp_f32(x, lo, hi):
@@ -145,6 +141,11 @@ def fclamp_f32(x, lo, hi):
     return fx.Float32(
         rocdl.fmed3(T.f32, as_ir_value(x), as_ir_value(lo), as_ir_value(hi))
     )
+
+
+def _fma_f32(a, b, c):
+    """Evaluate ``a * b + c`` as one fused f32 operation."""
+    return fx.Float32(fx.fma(fx.Float32(a), fx.Float32(b), fx.Float32(c)))
 
 
 def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
@@ -157,14 +158,12 @@ def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
     _half = fx.Float32(0.5)
     g = fmin_f32(g, limit_f32)
     u = fclamp_f32(u, neg_limit_f32, limit_f32)
+    half_gate = g * _half
     if swiglu:
-        _half_beta = fx.Float32(1.702 * 0.5)
-        th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(g * _half_beta)))
-        sig = _half * (_one + th)
-        return g * sig * (u + _one)
-    th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(g * _half)))
-    sig = _half * (_one + th)
-    return g * sig * u
+        th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(half_gate * fx.Float32(1.702))))
+        return _fma_f32(half_gate, th, half_gate) * (u + _one)
+    th = fx.Float32(rocdl.tanh(T.f32, as_ir_value(half_gate)))
+    return _fma_f32(half_gate, th, half_gate) * u
 
 
 def _tanh_f32(x, tanh_mul):

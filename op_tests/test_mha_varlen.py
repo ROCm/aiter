@@ -579,12 +579,25 @@ def test_flash_attn_varlen_func(
         reorder_ops=True,
     )
 
-    out_diff = (out - out_ref).abs().max().item()
+    abs_diff = (out - out_ref).abs()
+    out_diff = abs_diff.max().item()
     ref_diff = (out_pt - out_ref).abs().max().item()
+    max_val = max(out.abs().max().item(), out_ref.abs().max().item(), 1e-7)
+    nrms = (abs_diff / max_val).pow(2).mean().sqrt().item()
     print(f"Output max diff: {out_diff}")
+    print(f"Output mean diff: {abs_diff.mean().item()}")
+    print(f"Output NRMS: {nrms}")
     print(f"Output Pytorch max diff: {ref_diff}")
     out_tol = max(4 * ref_diff, 0.01)
     assert out_diff <= out_tol, f"forward diff {out_diff} exceeds tolerance {out_tol}"
+    # A max bound cannot see bf16 truncation (it lands exactly on 2x); the mean
+    # error can: truncating stays above the torch reference, rounding below it.
+    if dtype == dtypes.bf16:
+        mean_diff = abs_diff.float().mean().item()
+        ref_mean_diff = (out_pt - out_ref).abs().float().mean().item()
+        assert (
+            mean_diff <= ref_mean_diff
+        ), f"forward mean diff {mean_diff} exceeds the torch bf16 reference {ref_mean_diff}"
 
     # TODO: Support varlen bwd for bias
     if bias_type == "bias":
@@ -830,6 +843,10 @@ def test_varlen_flash_attn_seq_padding(
         f"\nGroup Mode Test (bs={batch_size}, {gqa_ratio}, {padding_scenario}, {dtype}, local={local}) | Max diff: {out_diff} | Ref diff: {ref_diff} | Tol: {out_tol}"
     )
     assert out_diff <= out_tol
+    if dtype == dtypes.bf16:
+        mean_diff = (out_ck_masked - out_ref_masked).abs().float().mean().item()
+        ref_mean_diff = (out_pt_masked - out_ref_masked).abs().float().mean().item()
+        assert mean_diff <= ref_mean_diff
 
     def _mask_grad(tensor, lens):
         masked = tensor.clone()
@@ -1027,7 +1044,7 @@ if __name__ == "__main__":
         "-i",
         "--input_layout",
         type=str,
-        choices=["BSHD", "KVPACKED"],
+        choices=["BSHD", "KVPACKED", "QKVPACKED"],
         default="BSHD",
         help="""input_layout.
         e.g.: -i BSHD""",
