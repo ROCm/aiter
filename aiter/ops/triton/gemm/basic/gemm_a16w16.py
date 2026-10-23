@@ -24,6 +24,7 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     clamp_num_buffers,
     compute_splitk_params,
     get_gemm_config,
+    pick_gemm_tile,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -86,6 +87,10 @@ def gemm_a16w16_(
 
     Uses the gluon backend automatically on supported architectures (gfx1250)
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
+    On gfx950, ``backend="gluon"`` with ``kernel_type="compute_bound"`` runs the
+    gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
+    runs the tile its gluon config picks for the shape (sides 256, 128 or 64),
+    handles ragged M, N and K (N and K multiples of 8, K at least 256).
 
     Args:
         x (torch.Tensor): Input matrix with shape (M, K).
@@ -128,6 +133,41 @@ def gemm_a16w16_(
         torch.float16,
         torch.bfloat16,
     ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
+
+    if backend == "gluon" and not persistent and "gfx950" in get_arch():
+        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
+            _KERNEL_MAP as _GFX950_KERNEL_MAP,
+        )
+
+        assert kernel_type in _GFX950_KERNEL_MAP, (
+            f"gfx950 gluon a16w16 supports kernel_type in {list(_GFX950_KERNEL_MAP)}, "
+            f"got '{kernel_type}'"
+        )
+        assert not skip_reduce, "gfx950 gluon a16w16 has no split-K (skip_reduce)"
+        if activation:
+            raise ValueError("gfx950 gluon a16w16: no activation support yet")
+        M, K = x.shape
+        N, _ = w.shape
+        if y is None:
+            y = torch.empty((M, N), dtype=dtype, device=x.device)
+        # The tile comes from the config: a tuned one names BLOCK_M/BLOCK_N, the
+        # default one carries the candidates and the rule (see pick_gemm_tile).
+        if config is None or "BLOCK_M" not in config:
+            config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
+        tile = pick_gemm_tile(
+            config,
+            M,
+            N,
+            torch.cuda.get_device_properties(x.device).multi_processor_count,
+        )
+        _LOGGER.info(
+            "GEMM_A16W16 [gluon/gfx950]: x=%s w=%s kernel=%s tile=%s",
+            x.shape,
+            w.shape,
+            kernel_type,
+            tile,
+        )
+        return _GFX950_KERNEL_MAP[kernel_type](x, w, y, bias, tile=tile)
 
     if persistent:
         assert not skip_reduce, (
@@ -586,6 +626,10 @@ def gemm_a16w16(
 
     Uses the gluon backend automatically on supported architectures (gfx1250)
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
+    On gfx950, ``backend="gluon"`` with ``kernel_type="compute_bound"`` runs the
+    gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
+    runs the tile its gluon config picks for the shape (sides 256, 128 or 64),
+    handles ragged M, N and K (N and K multiples of 8, K at least 256).
     See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
     here and is serialized before dispatch so the op is torch.compile-traceable.
     """

@@ -15,6 +15,32 @@ def is_gluon_supported():
     return _is_gluon_available()
 
 
+def _skip_unsupported_gluon(
+    backend, kernel_type, M, N, K, layout="TN", activation=None
+):
+    """Skip gluon cases that no gluon kernel on this architecture covers."""
+    if backend != "gluon":
+        return
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if "gfx950" in (get_arch() or ""):
+        # gfx950 has one gluon a16w16 kernel: compute_bound, TN layout.
+        if kernel_type != "compute_bound":
+            pytest.skip("gfx950 gluon a16w16 has only the compute_bound kernel")
+        if layout != "TN":
+            pytest.skip("gfx950 gluon a16w16 supports the TN layout only")
+        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
+            unsupported_reason,
+        )
+
+        reason = unsupported_reason(M, N, K, activation=activation)
+        if reason:
+            pytest.skip(f"gfx950 gluon a16w16: {reason}")
+        return
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+
+
 def _skip_if_triton_on_gfx1250(backend):
     """gfx1250 only ships gluon-format a16w16 configs, so the triton backend has
     no usable config there; skip the triton backend on gfx1250."""
@@ -78,8 +104,7 @@ def get_x_vals():
 def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
     if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to the gluon backend")
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
+    _skip_unsupported_gluon(backend, kernel_type, M, N, K)
     _skip_if_triton_on_gfx1250(backend)
 
     x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
@@ -143,8 +168,7 @@ def test_gemm_a16_w16_activation(
 ):
     if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to the gluon backend")
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
+    _skip_unsupported_gluon(backend, kernel_type, M, N, K, activation=activation)
     _skip_if_triton_on_gfx1250(backend)
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -184,8 +208,7 @@ def test_gemm_a16_w16_activation(
 def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_type):
     if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to the gluon backend")
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
+    _skip_unsupported_gluon(backend, kernel_type, M, N, K, layout=layout)
     _skip_if_triton_on_gfx1250(backend)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
@@ -285,3 +308,176 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, b
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+# The gfx950 gluon compute_bound kernel (scheduled by Triton's MFMA scheduler) at compute-bound shapes,
+# both dtypes, with and without a pre-allocated output.
+@pytest.mark.parametrize(
+    "M, N, K",
+    [(4096, 4096, 8192), (8192, 8192, 8192), (4096, 8192, 4096), (256, 1024, 1024)],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_compute_bound(M: int, N: int, K: int, dtype, output, bias):
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    b = torch.randn((N,), dtype=dtype, device="cuda") if bias else None
+    torch_out = F.linear(x, w, bias=b)
+    out = gemm_a16w16(
+        x, w, b, out_dtype, y, backend="gluon", kernel_type="compute_bound"
+    )
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1000, 2048, 512),  # ragged M
+        (512, 1016, 512),  # ragged N (a multiple of 8, not of any tile)
+        (256, 256, 1032),  # ragged K, one tail chunk
+        (256, 256, 1000),  # ragged K, two tail chunks, K not a multiple of 16
+        (475, 1016, 1000),  # all three ragged
+        (100, 72, 264),  # smaller than every tile
+        (57, 19360, 4096),  # a production shape with a ragged M
+    ],
+)
+@pytest.mark.parametrize("tile", [None, (256, 256), (64, 64)])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_compute_bound_ragged(M, N, K, tile, bias):
+    """Ragged M and N (clamped loads, masked stores) and ragged K (the tail
+    consumed first) give the right result, with the config's tile and forced
+    ones; the output is pre-filled with NaN so an unwritten element shows."""
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    b = torch.randn((N,), dtype=torch.bfloat16, device="cuda") if bias else None
+    y = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    torch_out = F.linear(x, w, bias=b)
+    config = None if tile is None else {"BLOCK_M": tile[0], "BLOCK_N": tile[1]}
+    out = gemm_a16w16(
+        x,
+        w,
+        b,
+        out_dtype,
+        y,
+        backend="gluon",
+        kernel_type="compute_bound",
+        config=config,
+    )
+    assert not torch.isnan(out).any()
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "tile",
+    [
+        (256, 256),
+        (256, 128),
+        (128, 256),
+        (128, 128),
+        (256, 64),
+        (64, 256),
+        (128, 64),
+        (64, 128),
+        (64, 64),
+    ],
+)
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_compute_bound_tiles(tile, bias):
+    """Every tile gives the right result, and the compiled kernels carry the MFMA
+    scheduler's sched.barriers: a Triton that accepted schedule_hint but ignored
+    it would still pass the numerical check, about 15% slower."""
+    M, N, K = 1024, 1024, 512
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
+        _gemm_a16w16_compute_bound_kernel,
+    )
+
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    b = torch.randn((N,), dtype=torch.bfloat16, device="cuda") if bias else None
+    torch_out = F.linear(x, w, bias=b)
+    _gemm_a16w16_compute_bound_kernel.device_caches.clear()  # inspect this compile only
+    out = gemm_a16w16(
+        x,
+        w,
+        b,
+        out_dtype,
+        None,
+        backend="gluon",
+        kernel_type="compute_bound",
+        config={"BLOCK_M": tile[0], "BLOCK_N": tile[1]},
+    )
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+    # device_caches[device] = (kernel_cache, key_cache, target, backend, binder)
+    compiled = [
+        kernel
+        for entry in _gemm_a16w16_compute_bound_kernel.device_caches.values()
+        for kernel in entry[0].values()
+    ]
+    assert compiled, "the gluon kernel was not compiled"
+    for kernel in compiled:
+        assert "llvm.amdgcn.sched.barrier" in kernel.asm["llir"]
+        assert "sched_barrier" in kernel.asm["amdgcn"]
+
+
+def test_gemm_a16_w16_gluon_pick_gemm_tile():
+    """The default gluon config picks by the wave cost model (workgroup waves over
+    per-tile throughput); a tuned config names its tile."""
+    from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_tile
+
+    tiles = [
+        [256, 256],
+        [256, 128],
+        [128, 256],
+        [128, 128],
+        [256, 64],
+        [64, 256],
+        [128, 64],
+        [64, 128],
+        [64, 64],
+    ]
+    default = {
+        "TILES": tiles,
+        "TILE_TFLOPS": [1583, 1386, 1388, 1162, 1040, 1009, 877, 871, 603],
+        "TAIL_WAVE_COST": 0.5,
+    }
+    # Exactly one wave of the largest tile.
+    assert pick_gemm_tile(default, 4096, 4096, 256) == (256, 256)
+    # Half a wave of 256x256 loses to one full wave of 256x128.
+    assert pick_gemm_tile(default, 4096, 2048, 256) == (256, 128)
+    assert pick_gemm_tile(default, 2048, 2048, 256) == (128, 128)
+    assert pick_gemm_tile(default, 1024, 1024, 256) == (64, 64)
+    # 91% of a wave of 256x256 beats two waves of 256x128 (ragged M).
+    assert pick_gemm_tile(default, 7226, 2048, 256) == (256, 256)
+    # A tiny M: the tile that pads M least, not the one that fills the GPU.
+    assert pick_gemm_tile(default, 57, 19360, 256) == (64, 128)
+    assert pick_gemm_tile(default, 100, 4096, 256) == (64, 64)
+    # Without throughputs: the largest tile that fills the GPU once.
+    legacy = {"TILES": tiles, "WORKGROUPS_PER_CU": 1}
+    assert pick_gemm_tile(legacy, 4096, 2048, 256) == (256, 128)
+    assert pick_gemm_tile(legacy, 256, 256, 256) == (64, 64)
+    assert pick_gemm_tile({"BLOCK_M": 128, "BLOCK_N": 256}, 4096, 4096, 256) == (
+        128,
+        256,
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel_name", ["gluon_compute_bound_256x256", "gluon_compute_bound_128x64", None]
+)
+def test_gemm_a16_w16_gluon_tuned_gemm(kernel_name):
+    """tuned_gemm's gluon libtype runs the tile named by the tuned row, or the
+    config's pick when the row has no name."""
+    M, N, K = 1024, 2048, 512
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    from aiter.tuned_gemm import gluon_gemm
+
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    out = gluon_gemm(x, w, 0, None, out_dtype, config={"kernelName": kernel_name})
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
