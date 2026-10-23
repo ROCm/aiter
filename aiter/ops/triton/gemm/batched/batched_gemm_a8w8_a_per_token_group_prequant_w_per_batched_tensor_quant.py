@@ -190,6 +190,11 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         splitk_block_size = triton.cdiv(num_k_groups, config["NUM_KSPLIT"]) * group_size
         num_ksplit = triton.cdiv(K, splitk_block_size)
         y_pp = torch.empty((num_ksplit, M, B, N), dtype=torch.float32, device=X.device)
+        gemm_config = {
+            k: v
+            for k, v in config.items()
+            if k != "NUM_KSPLIT" and not k.startswith("REDUCE_")
+        }
 
         grid_splitk = (
             B,
@@ -222,17 +227,9 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             has_bias,
             DTYPE_MAX=DTYPE_MAX,
             DTYPE_MIN=-DTYPE_MAX,
-            BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
-            BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
-            BLOCK_SIZE_K=group_size,
-            GROUP_SIZE_M=config["GROUP_SIZE_M"],
             NUM_KSPLIT=num_ksplit,
             SPLITK_BLOCK_SIZE=splitk_block_size,
-            cache_modifier=config["cache_modifier"],
-            num_warps=config["num_warps"],
-            num_stages=config["num_stages"],
-            waves_per_eu=config["waves_per_eu"],
-            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            **gemm_config,
         )
 
         Y_DTYPE_MAX = torch.finfo(YQ.dtype).max
