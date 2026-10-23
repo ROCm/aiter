@@ -42,8 +42,12 @@ _REC = 640  # the producer writes the aligned record only
 
 def build(tokens, heads, padded, nb, block, device="cuda"):
     torch.manual_seed(0)
-    q = (torch.randn(tokens, heads, _QK, device=device) * 0.125).to(torch.bfloat16)
-    kv = (torch.randn(tokens, _QK, device=device) * 0.4).to(torch.bfloat16)
+    q = (
+        torch.randn(tokens, heads, _QK, device=device, dtype=torch.float32) * 0.125
+    ).to(torch.bfloat16)
+    kv = (torch.randn(tokens, _QK, device=device, dtype=torch.float32) * 0.4).to(
+        torch.bfloat16
+    )
     cache = torch.zeros(nb, block, _REC, dtype=torch.uint8, device=device)
     slot = torch.randperm(nb * block, device=device, dtype=torch.int32)[:tokens]
     pos = torch.randint(0, 128, (tokens,), device=device, dtype=torch.int64)
