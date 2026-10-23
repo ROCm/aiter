@@ -3,7 +3,8 @@
 #
 #   mkdir -p ~/flydsl_tuning && cd ~/flydsl_tuning     # the Slurm log lands in the submit dir
 #   sbatch /path/to/slurm_tune.sbatch                  # the real run (whole node, 8 GPUs)
-#   DRY_RUN=1 bash /path/to/slurm_tune.sbatch          # GPU-free rehearsal, see below
+#   DRY_RUN=1 bash /path/to/slurm_tune.sbatch          # GPU-free rehearsal, submitted as a CPU-only
+#                                                      # Slurm job (log: slurm-<id>.out in the cwd)
 #
 # Everything lands in $RESULTS/<run name>/ (default ~/flydsl_tuning/job-<id>/):
 #   aiter/      the clone, pinned to the commit checked out at the first start
@@ -17,18 +18,40 @@
 # DRY_RUN=1 does everything except touch a GPU: pulls the image, clones, starts the
 # container WITHOUT /dev/kfd, installs the Python deps, and runs `tune.sh --dry-run all`
 # (environment checks, every chunk's command and input files, the fit scripts loading).
-# Run it on any host with docker (a login node, or `srun -p <cpu-partition> --pty bash`).
+# Invoked with DRY_RUN=1 outside Slurm it submits itself via sbatch without GPUs, exclusive
+# node or requeue (add a partition with DRY_SBATCH_ARGS='-p <cpu-partition>'). Inside a job
+# (or a plain `srun ... bash`) it just runs.
 #
-# Environment overrides: IMAGE, REPO_URL, REF, RESULTS, RUN_NAME, DRY_RUN,
+# Environment overrides: IMAGE, REPO_URL, REF, RESULTS, RUN_NAME, DRY_RUN, DRY_SBATCH_ARGS,
+#   DRY_GPU_ARCHS (arch aiter imports for on the GPU-less dry run; default gfx950),
 #   TUNE_ARGS (extra tune.sh options for the real run, e.g. TUNE_ARGS='--tp "8 4"').
-#SBATCH --job-name=flydsl-ar-tune
+#SBATCH --job-name=flydsl-ar-tunesplinter-ctr-bj78-02
 #SBATCH --nodes=1
 #SBATCH --exclusive
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:gfx950-mi35:8
 #SBATCH --time=24:00:00
 #SBATCH --requeue
 
 set -euo pipefail
+
+# DRY_RUN=1 from a login shell: submit this script as a GPU-free Slurm job. The #SBATCH
+# directives above can't be made conditional, so the GPU/exclusive/requeue ones are stripped
+# from a copy that is piped to sbatch. Extra sbatch options: DRY_SBATCH_ARGS='-p <cpu-partition>'.
+if [[ ${DRY_RUN:-0} == 1 && -z ${SLURM_JOB_ID:-} ]]; then
+  command -v sbatch >/dev/null || { echo "sbatch not found; run on the Slurm head node"; exit 1; }
+  # The 8-GPU MI355 node is scarce, so rehearse on a CPU-only node (far better availability).
+  # Default to an idle alola 'compile' node (no GPUs, Docker present); override with DRY_SBATCH_ARGS.
+  dry_args=${DRY_SBATCH_ARGS:-}
+  if [[ -z $dry_args ]]; then
+    node=$(sinfo -h -p defq -t idle -N -o '%N' 2>/dev/null | grep -m1 -E 'alola-compile') || true
+    dry_args="--partition=defq${node:+ --nodelist=$node}"
+    echo "dry run -> ${node:-defq (no idle alola-compile node found; may land on a GPU node)}"
+  fi
+  # Strip the real-run-only directives so the rehearsal needs no GPUs / exclusive node / requeue.
+  sed -E '/^#SBATCH --(exclusive|gres|requeue|time|partition|constraint)/d' "$0" |
+    sbatch --job-name=flydsl-ar-tune-dry --nodes=1 --time=02:00:00 --export=ALL,DRY_RUN=1 $dry_args
+  exit $?
+fi
 
 IMAGE=${IMAGE:-rocm/pytorch:rocm10.0_ubuntu26.04_py3.14_pytorch_release_2.13.0}
 REPO_URL=${REPO_URL:-git@github.com:ROCm/aiter.git}
@@ -72,6 +95,10 @@ export HOME=/work/home PIP_CACHE_DIR=/work/home/.cache/pip PIP_BREAK_SYSTEM_PACK
 git config --global --add safe.directory '*'
 # Slurm/the submit shell may carry a GPU pin (e.g. HIP_VISIBLE_DEVICES=7) that would hide GPUs.
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+# The dry run is on a CPU-only node, so aiter's rocminfo arch probe finds no GPU and `import
+# aiter` dies. GPU_ARCHS lets aiter import/codegen for a named arch without a live GPU
+# (aiter/jit/utils/chip_info.py). Match the real target (gfx950); override with DRY_GPU_ARCHS.
+[[ $DRY_RUN == 1 ]] && export GPU_ARCHS=${DRY_GPU_ARCHS:-gfx950}
 cd /work/aiter
 python -m pip install -r requirements.txt pyzmq tabulate
 cd "$TUNE_REL"
@@ -96,5 +123,6 @@ fi
 log "starting container (gpu flags: ${GPU_FLAGS[*]:-none})"
 docker run --rm ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} -v "$RUN_DIR:/work" \
   -e DRY_RUN="$DRY_RUN" -e TUNE_ARGS="$TUNE_ARGS" -e TUNE_REL="$TUNE_REL" \
+  -e DRY_GPU_ARCHS="${DRY_GPU_ARCHS:-}" \
   "$IMAGE" bash /work/inner.sh
 log "finished; results in $RUN_DIR/out"
