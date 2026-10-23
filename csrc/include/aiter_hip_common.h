@@ -714,3 +714,28 @@ static size_t get_smem_size_func()
         return prop.sharedMemPerBlock;
     });
 }
+
+// Dies a dispatch's workgroups are dealt over, round-robin, each behind its own
+// L2. Mirrors NON_DEFAULT_NUM_XCDS in aiter/jit/utils/build_targets.py: the SKUs
+// below differ from the eight-die default, and are told apart by CU count since
+// they share a target with the full-size part.
+static uint32_t get_num_xcds_func()
+{
+    static SynchronizedCache<int, uint32_t> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, [device]() {
+        hipDeviceProp_t prop{};
+        HIP_CALL(hipGetDeviceProperties(&prop, device));
+        const std::string arch = std::string(prop.gcnArchName).substr(
+            0, std::string(prop.gcnArchName).find(':'));
+        const int cu = prop.multiProcessorCount;
+        if(arch == "gfx950" && cu == 128)
+            return uint32_t{4}; // MI350P
+        if(arch == "gfx942" && cu == 80)
+            return uint32_t{4}; // MI308X
+        if(arch == "gfx942" && cu == 228)
+            return uint32_t{6}; // MI300A
+        return uint32_t{8};
+    });
+}
