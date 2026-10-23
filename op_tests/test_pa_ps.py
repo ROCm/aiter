@@ -792,7 +792,18 @@ def test_pa_metadata_v1_1():
             buffers.append(backing[:size].view(shape))
             guards.append(backing[size:])
 
-        def generate():
+        def generate(
+            *,
+            qo=qo,
+            kv=kv,
+            context=context,
+            heads=heads,
+            buffers=buffers,
+            granularity=granularity,
+            page_size=page_size,
+            qo_lengths=qo_lengths,
+            cap=cap,
+        ):
             aiter.get_pa_metadata_v1(
                 qo,
                 kv,
@@ -809,7 +820,20 @@ def test_pa_metadata_v1_1():
                 max_split_per_batch=cap,
             )
 
-        def verify(current_lengths):
+        def verify(
+            current_lengths,
+            *,
+            granularity=granularity,
+            page_size=page_size,
+            qo_lengths=qo_lengths,
+            buffers=buffers,
+            heads=heads,
+            cap=cap,
+            qo_offsets=qo_offsets,
+            page_offsets=page_offsets,
+            batch=batch,
+            guards=guards,
+        ):
             tiles = [
                 (length + granularity - 1) // granularity for length in current_lengths
             ]
@@ -861,8 +885,14 @@ def test_pa_metadata_v1_1():
                         ]
                     )
                     sequence_workers.append(
-                        min(((cost_before + begin * qo_length + 1) * workers_per_head - 1)
-                            // total_cost, workers_per_head - 1)
+                        min(
+                            (
+                                (cost_before + begin * qo_length + 1) * workers_per_head
+                                - 1
+                            )
+                            // total_cost,
+                            workers_per_head - 1,
+                        )
                     )
                     if parts > 1:
                         partial_map.append(partial)
@@ -885,14 +915,28 @@ def test_pa_metadata_v1_1():
                 for boundary in range(workers + 1)
             ]
             actual_works = buffers[2][: len(expected_works)].cpu().tolist()
-            if batch == 32 and heads == 8 and workers == 256 and max(current_lengths) == 257:
-                assert int(buffers[1][-1].item()) == 256, "uniform workload must not be oversplit"
-                assert buffers[3][-1].item() == 0, "uniform workload should write output directly"
-            if batch == 32 and heads == 8 and workers == 256 and max(current_lengths) == 70612:
+            if (
+                batch == 32
+                and heads == 8
+                and workers == 256
+                and max(current_lengths) == 257
+            ):
+                assert (
+                    int(buffers[1][-1].item()) == 256
+                ), "uniform workload must not be oversplit"
+                assert (
+                    buffers[3][-1].item() == 0
+                ), "uniform workload should write output directly"
+            if (
+                batch == 32
+                and heads == 8
+                and workers == 256
+                and max(current_lengths) == 70612
+            ):
                 actual_offsets = buffers[1].cpu().tolist()
                 worker_pages = [
                     sum(work[5] - work[4] for work in actual_works[begin:end])
-                    for begin, end in zip(actual_offsets, actual_offsets[1:])
+                    for begin, end in itertools.pairwise(actual_offsets)
                 ]
                 assert max(worker_pages) <= 4, "long-tail worker exceeds its KV budget"
             assert actual_works == expected_works, (batch, heads, cap, "works")
@@ -909,7 +953,7 @@ def test_pa_metadata_v1_1():
                 "reduce",
             )
             assert buffers[4].cpu().tolist() == list(
-                map(list, zip(qo_offsets[:-1], qo_offsets[1:]))
+                map(list, itertools.pairwise(qo_offsets))
             )
             assert buffers[5][: len(partial_map)].cpu().tolist() == partial_map
             assert buffers[0].cpu().tolist() == [
@@ -948,7 +992,7 @@ def benchmark_pa_metadata(args):
         "op_tests/test_pa_ps.py",
     ]
     report = {
-        "gpu": torch.cuda.get_device_properties(device).gcnArchName,
+        "gpu": get_gfx(),
         "torch": torch.__version__,
         "rounds": args.benchmark_rounds,
         "replays": args.benchmark_replays,
@@ -969,9 +1013,21 @@ def benchmark_pa_metadata(args):
         args.benchmark_scenarios,
         args.quant_type,
     )
-    for batch, qlen, heads, page_size, max_context, scenario, quant_name in configurations:
+    for (
+        batch,
+        qlen,
+        heads,
+        page_size,
+        max_context,
+        scenario,
+        quant_name,
+    ) in configurations:
+        if page_size == 16 and get_gfx() != "gfx950":
+            continue
         quant_type = getattr(QuantType, quant_name)
-        use_asm_reduce = page_size == 16 and args.head_dim == 128 and get_gfx() == "gfx950"
+        use_asm_reduce = (
+            page_size == 16 and args.head_dim == 128 and get_gfx() == "gfx950"
+        )
         reduce_fn = _attention_ps_reduce_asm if use_asm_reduce else aiter.pa_reduce_v1
         query_heads, kv_heads = heads
         if query_heads % kv_heads or qlen * (query_heads // kv_heads) > 128:
@@ -1067,7 +1123,7 @@ def benchmark_pa_metadata(args):
             }
             for mode in modes
         }
-        for mode in samples:
+        for mode, mode_samples in samples.items():
             fast_mode = mode == "v1_2"
             buffers = [
                 torch.empty(shape, dtype=dtype, device=device)
@@ -1090,7 +1146,18 @@ def benchmark_pa_metadata(args):
                 (batch * qlen, query_heads), dtype=torch.float32, device=device
             )
 
-            def generate():
+            def generate(
+                *,
+                qo=qo,
+                kv=kv,
+                context=context,
+                query_heads=query_heads,
+                kv_heads=kv_heads,
+                buffers=buffers,
+                page_size=page_size,
+                qlen=qlen,
+                fast_mode=fast_mode,
+            ):
                 aiter.get_pa_metadata_v1(
                     qo,
                     kv,
@@ -1106,7 +1173,25 @@ def benchmark_pa_metadata(args):
                     fast_mode=fast_mode,
                 )
 
-            def attention():
+            def attention(
+                *,
+                query=query,
+                key=key,
+                value=value,
+                kv=kv,
+                indices=indices,
+                context=context,
+                scale=scale,
+                qlen=qlen,
+                key_scale=key_scale,
+                value_scale=value_scale,
+                output=output,
+                qo=qo,
+                buffers=buffers,
+                partial=partial,
+                partial_lse=partial_lse,
+                quant_type=quant_type,
+            ):
                 aiter.pa_ps_fwd_asm(
                     query,
                     key,
@@ -1128,7 +1213,16 @@ def benchmark_pa_metadata(args):
                     quant_type=quant_type,
                 )
 
-            def reduce():
+            def reduce(
+                *,
+                reduce_fn=reduce_fn,
+                partial=partial,
+                partial_lse=partial_lse,
+                buffers=buffers,
+                qlen=qlen,
+                output=output,
+                final_lse=final_lse,
+            ):
                 reduce_fn(
                     partial,
                     partial_lse,
@@ -1196,10 +1290,10 @@ def benchmark_pa_metadata(args):
             work_offsets = buffers[1].cpu().tolist()
             worker_pages = [
                 sum(work[5] - work[4] for work in work_records[begin:end])
-                for begin, end in zip(work_offsets, work_offsets[1:])
+                for begin, end in itertools.pairwise(work_offsets)
             ]
             worker_works = [
-                end - begin for begin, end in zip(work_offsets, work_offsets[1:])
+                end - begin for begin, end in itertools.pairwise(work_offsets)
             ]
             split_pages = [work[5] - work[4] for work in work_records if work[1] >= 0]
             states[mode] = {
@@ -1233,7 +1327,7 @@ def benchmark_pa_metadata(args):
                 "attention": attention,
                 "reduce": reduce,
             }
-            for metric in samples[mode]:
+            for metric in mode_samples:
                 function = functions[metric]
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
@@ -1375,8 +1469,9 @@ parser.add_argument(
     "--ctx_len",
     type=int,
     nargs="*",
-    default=[7, 109, 256, 282, 1024, 2580, 4097, 8192, 10240],
+    default=None,
     help="""Context length.
+    Defaults to the correctness grid, or 8192 in benchmark mode.
     e.g. -c 128""",
 )
 parser.add_argument(
@@ -1474,6 +1569,12 @@ parser.add_argument("--benchmark-rounds", type=int, default=9)
 parser.add_argument("--benchmark-replays", type=int, default=8)
 parser.add_argument("--benchmark-output", default="pa_metadata_performance.json")
 args = parser.parse_args()
+if args.ctx_len is None:
+    args.ctx_len = (
+        [8192]
+        if args.benchmark_metadata
+        else [7, 109, 256, 282, 1024, 2580, 4097, 8192, 10240]
+    )
 if args.benchmark_metadata:
     benchmark_pa_metadata(args)
     raise SystemExit(0)
