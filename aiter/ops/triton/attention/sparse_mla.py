@@ -843,9 +843,9 @@ def sparse_mla_fwd(
     )
     _check_lds_budget(arch, block_k, kv_lora_rank, qk_rope_head_dim, kv_lds_pad)
 
-    # The 32/64-head programs and the decode XCD remap below are tuned on gfx950.
-    staged = fmt == "fp8_scalar" or (fmt == "bf16" and qk_rope_head_dim == 0)
-    if arch == "gfx950" and staged and num_heads in (32, 64) and not async_lds_on:
+    # The wide head programs and the decode XCD remap below are tuned on gfx950.
+    staged = fmt == "fp8_scalar" or fmt == "bf16"
+    if arch == "gfx950" and staged and num_heads >= 32 and not async_lds_on:
         # 32- or 64-head programs (_staged_block_m).
         block_m = _staged_block_m(
             num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k

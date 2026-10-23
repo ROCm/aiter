@@ -514,12 +514,18 @@ def _dsv4_block_m(num_heads, num_queries, num_splits, row_tiles, has_extra):
 
 
 def _staged_block_m(num_heads, num_queries, num_splits, row_tiles):
-    """Heads per program (16, 32 or 64) at 32 or 64 heads for the staged walks
-    (per-tensor fp8; bf16 with the rope inside): 64 without split-K once
-    2 x rows > CUs; else 32 from two tiles per program."""
+    """Heads per program (16, 32 or 64) from 32 heads up, for the staged walks
+    (per-tensor fp8; bf16): 64 without split-K once the 64-head grid is big
+    enough; else 32 from two tiles per program."""
     num_sms = get_num_sms()
-    if num_heads == 64 and num_splits == 1 and 2 * num_queries > num_sms:
-        return 64
+    if num_heads % 64 == 0 and num_splits == 1:
+        # At 64 heads the wide tile is one block per row and re-reads no keys,
+        # so a half-full round already pays. Above that each row splits into
+        # blocks that re-read its keys, and it has to fill the CUs to win: at
+        # 128 heads a half-full grid loses to 32 heads per program.
+        programs = num_queries * (num_heads // 64)
+        if programs >= (num_sms // 2 + 1 if num_heads == 64 else num_sms):
+            return 64
     tiles = row_tiles / num_splits
     if tiles >= 2 and _rounds_suit_32(num_heads, num_queries, num_splits, tiles):
         return 32
