@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import importlib.util
 
 import pandas as pd
 import torch
@@ -16,6 +17,8 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
+
+_FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
 
 
 @functools.lru_cache(maxsize=1024)
@@ -152,6 +155,8 @@ def flydsl_a4w4_fallback_kernel(M: int, N: int, K: int, cu_num: int) -> str | No
 def _a4w4_mxscale_config(M: int, N: int, K: int) -> tuple[str, str] | None:
     """(libtype, kernelName) for a gfx1250 shape: the tuned row at M or a padded M (a FlyDSL
     row that cannot launch for the real M is skipped), else the FlyDSL fallback."""
+    if not _FLYDSL_AVAILABLE:  # optional dependency: asm serves all
+        return None
     from .flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import a4w4_kernel_launchable
 
     gfx, cu_num = get_gfx(), get_cu_num()

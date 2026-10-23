@@ -291,16 +291,25 @@ def _a4w4_jobs(rows: list[dict]) -> list[dict]:
     return jobs
 
 
+def _is_a4w4_row(row: dict) -> bool:
+    name = row.get("kernelName", "").strip()
+    return name.startswith((A4W4_GENERAL_PREFIX, A4W4_COMPUTE_PREFIX)) or (
+        row.get("libtype", "").strip() == "asm"
+        and "f4gemm_bf16_mxfp4_BpreShuffle_" in name
+    )
+
+
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
-    # The a4w4 table is known by its kernels: a renamed copy keeps no family name.
-    a4w4_prefixes = (A4W4_GENERAL_PREFIX, A4W4_COMPUTE_PREFIX)
-    if any(r.get("kernelName", "").strip().startswith(a4w4_prefixes) for r in rows):
-        return _a4w4_jobs(rows)
-    jobs = []
-    seen = set()
+    # A mixed CSV may contain several families. Only a4w4 rows may contribute
+    # to its tuned kernels and fallback shapes; route the rest independently.
+    a4w4_rows, other_rows = [], []
+    for row in rows:
+        (a4w4_rows if _is_a4w4_row(row) else other_rows).append(row)
+    jobs = _a4w4_jobs(a4w4_rows) if a4w4_rows else []
+    seen = {job_identity(job) for job in jobs}
     batched_skipped = set()
     # The mxfp8 table's gfx950 rows, and the e8m0 blockscale table's kernelId
     # "mxfp8" rows, name mxpsh / 8-wave kernels that read the raw (unshuffled)
@@ -308,137 +317,131 @@ def parse_csv(csv_path: str):
     # mxpsh rows any other table may still hold.
     mxfp8_table = "a8w8_mxfp8_bpreshuffle" in os.path.basename(csv_path)
 
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            kernel_name = row.get("kernelName", "").strip()
-            libtype = row.get("libtype", "").strip()
-            if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
-                continue
+    for row in other_rows:
+        kernel_name = row.get("kernelName", "").strip()
+        libtype = row.get("libtype", "").strip()
+        if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
+            continue
 
-            if "b" in row:  # a batched table
-                job = None
-                if kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
-                    job = _bmm_mfma_job(
-                        row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
-                    )
-                if job is None:
-                    batched_skipped.add(kernel_name)
-                elif job_identity(job) not in seen:
+        if row.get("b", "").strip():  # a batched row (may be in a mixed table)
+            job = None
+            if kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
+                job = _bmm_mfma_job(
+                    row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
+                )
+            if job is None:
+                batched_skipped.add(kernel_name)
+            elif job_identity(job) not in seen:
+                seen.add(job_identity(job))
+                jobs.append(job)
+            continue
+
+        m = int(row["M"])
+        n = int(row["N"])
+        k = int(row["K"])
+        cu_num = int(row.get("cu_num", "0"))
+        gfx = row.get("gfx", "").strip()
+        # Their kernels read the row's raw w_scale block: the mxfp8 table is
+        # 1x32 (a row from before the column is one), the blockscale table's
+        # "mxfp8" rows 32x32 / 128x128 too.
+        raw_scales = mxfp8_table or row.get("kernelId", "").strip() == "mxfp8"
+        mxfp8_block = (row.get("w_scale_block") or "1x32").strip()
+        if raw_scales and (
+            mxfp8_block not in MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK
+            or (mxfp8_table and mxfp8_block != "1x32")
+        ):
+            continue
+
+        if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
+            # A 128-wide GEMM x_scale is column-major (blockscale), read by
+            # the transposed kernel, except at M = 1 where both coincide.
+            layouts = (
+                (False, True)
+                if row.get("w_scale_block", "128x128").strip() == "128x128"
+                else (False,)
+            )
+            for transposed in layouts:
+                job = _bmm_mfma_job(row, kernel_name, 1, n, k, transposed)
+                if job is not None and job_identity(job) not in seen:
                     seen.add(job_identity(job))
                     jobs.append(job)
-                continue
+            continue
 
-            m = int(row["M"])
-            n = int(row["N"])
-            k = int(row["K"])
-            cu_num = int(row.get("cu_num", "0"))
-            gfx = row.get("gfx", "").strip()
-            # Their kernels read the row's raw w_scale block: the mxfp8 table is
-            # 1x32 (a row from before the column is one), the blockscale table's
-            # "mxfp8" rows 32x32 / 128x128 too.
-            raw_scales = mxfp8_table or row.get("kernelId", "").strip() == "mxfp8"
-            mxfp8_block = (row.get("w_scale_block") or "1x32").strip()
-            if raw_scales and (
-                mxfp8_block not in MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK
-                or (mxfp8_table and mxfp8_block != "1x32")
-            ):
-                continue
-
-            if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
-                # A 128-wide GEMM x_scale is column-major (blockscale), read by
-                # the transposed kernel, except at M = 1 where both coincide.
-                layouts = (
-                    (False, True)
-                    if row.get("w_scale_block", "128x128").strip() == "128x128"
-                    else (False,)
+        if kernel_name.startswith("flydsl_bpreshuflle_"):
+            params = _parse_preshuffle_kernel_name(kernel_name)
+        elif kernel_name.startswith("flydsl_mxpsh_"):
+            if not raw_scales:
+                continue  # a shuffled-scale row: nothing reads it
+            params = parse_mxscale_preshuffle_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "mxscale_preshuffle"
+                params.update(dict(MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK[mxfp8_block]))
+        elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
+            params = parse_8wave_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "8wave"
+        elif kernel_name.startswith(f"{MXFP8_8WAVE_PREFIX}_"):
+            params = parse_mxfp8_8wave_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "mxfp8_8wave"
+                params["w_scale_block"] = mxfp8_block if raw_scales else "1x32"
+        elif kernel_name.startswith(
+            (
+                f"{MXFP8_128_WMMA_PREFIX}_",
+                f"{MXFP8_128_COMPUTE_WMMA_PREFIX}_",
+            )
+        ):
+            params = parse_mxfp8_128_wmma_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "mxfp8_wmma"
+                params["scale_block"] = SCALE_BLOCK_SIZE
+        elif kernel_name.startswith(
+            (f"{MX32_WMMA_NAME_PREFIX}_", f"{MX32_COMPUTE_WMMA_NAME_PREFIX}_")
+        ):
+            params = parse_mxfp8_32_wmma_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "mxfp8_wmma"
+                params["scale_block"] = MX32_BLOCK_K
+        elif kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
+            params = parse_ptpc_wmma_kernel_name(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = "ptpc_wmma"
+        elif kernel_name.startswith("flydsl_hgemm"):
+            params = get_flydsl_hgemm_kernel_params(kernel_name)
+            if params is not None:
+                params = dict(params)
+                params["kind"] = (
+                    "a16w16_gfx1250" if params["target_gfx"] == "gfx1250" else "hgemm"
                 )
-                for transposed in layouts:
-                    job = _bmm_mfma_job(row, kernel_name, 1, n, k, transposed)
-                    if job is not None and job_identity(job) not in seen:
-                        seen.add(job_identity(job))
-                        jobs.append(job)
-                continue
+        else:
+            params = None
 
-            if kernel_name.startswith("flydsl_bpreshuflle_"):
-                params = _parse_preshuffle_kernel_name(kernel_name)
-            elif kernel_name.startswith("flydsl_mxpsh_"):
-                if not raw_scales:
-                    continue  # a shuffled-scale row: nothing reads it
-                params = parse_mxscale_preshuffle_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "mxscale_preshuffle"
-                    params.update(dict(MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK[mxfp8_block]))
-            elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
-                params = parse_8wave_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "8wave"
-            elif kernel_name.startswith(f"{MXFP8_8WAVE_PREFIX}_"):
-                params = parse_mxfp8_8wave_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "mxfp8_8wave"
-                    params["w_scale_block"] = mxfp8_block if raw_scales else "1x32"
-            elif kernel_name.startswith(
-                (
-                    f"{MXFP8_128_WMMA_PREFIX}_",
-                    f"{MXFP8_128_COMPUTE_WMMA_PREFIX}_",
-                )
-            ):
-                params = parse_mxfp8_128_wmma_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "mxfp8_wmma"
-                    params["scale_block"] = SCALE_BLOCK_SIZE
-            elif kernel_name.startswith(
-                (f"{MX32_WMMA_NAME_PREFIX}_", f"{MX32_COMPUTE_WMMA_NAME_PREFIX}_")
-            ):
-                params = parse_mxfp8_32_wmma_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "mxfp8_wmma"
-                    params["scale_block"] = MX32_BLOCK_K
-            elif kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
-                params = parse_ptpc_wmma_kernel_name(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = "ptpc_wmma"
-            elif kernel_name.startswith("flydsl_hgemm"):
-                params = get_flydsl_hgemm_kernel_params(kernel_name)
-                if params is not None:
-                    params = dict(params)
-                    params["kind"] = (
-                        "a16w16_gfx1250"
-                        if params["target_gfx"] == "gfx1250"
-                        else "hgemm"
-                    )
-            else:
-                params = None
+        if params is None:
+            print(f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping")
+            continue
 
-            if params is None:
-                print(
-                    f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
-                )
-                continue
+        job = {
+            "kernel_name": kernel_name,
+            "m": m,
+            "n": n,
+            "k": k,
+            "cu_num": cu_num,
+            "gfx": gfx,
+            "has_bias": _parse_bool(row.get("bias")),
+            **params,
+        }
+        key = job_identity(job)
+        if key in seen:
+            continue
+        seen.add(key)
 
-            job = {
-                "kernel_name": kernel_name,
-                "m": m,
-                "n": n,
-                "k": k,
-                "cu_num": cu_num,
-                "gfx": gfx,
-                "has_bias": _parse_bool(row.get("bias")),
-                **params,
-            }
-            key = job_identity(job)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            jobs.append(job)
+        jobs.append(job)
 
     if batched_skipped:
         print(
