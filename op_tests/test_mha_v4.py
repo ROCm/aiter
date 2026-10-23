@@ -990,9 +990,8 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
     the output and every numeric test passes either way; the symptom is a fault at an unrelated
     later synchronization, and only when the over-read crosses an unmapped page.
 
-    Driven off the manifest rather than the directory because fwd_hd128_f4f4*.co still ship
-    unguarded and are commented out there. Re-enabling a row without rebuilding it should fail
-    here.
+    Driven off the manifest rather than the directory so that a row commented out there, whose
+    object may predate the promotion, cannot be re-enabled without being rebuilt first.
     """
     asm_dir = os.environ.get(
         "AITER_ASM_DIR", os.path.join(mha_v4_module.AITER_ROOT_DIR, "hsa")
@@ -1865,7 +1864,7 @@ _MX_V_RECIPES = [
     pytest.param(native_fp8_format(), AttentionFormat.MXFP6, id="f8f6"),
     pytest.param(AttentionFormat.MXFP6, AttentionFormat.MXFP6, id="mxfp6"),
     pytest.param(AttentionFormat.MXFP6, AttentionFormat.MXFP4, id="f6f4"),
-    pytest.param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, id="f4f4"),
+    pytest.param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, id="mxfp4"),
 ]
 
 

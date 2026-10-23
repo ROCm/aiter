@@ -569,8 +569,8 @@ def test_mha_v4_sparse_lse_under_gqa(q_format, v_format, gqa_ratio):
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-def test_mha_v4_f4f4_sparse_all_true_mask_matches_dense():
-    """Retained FP8-P sparse F4F4 remains close to dense FP6-P on an all-true mask."""
+def test_mha_v4_mxfp4_sparse_all_true_mask_matches_dense():
+    """Sparse MXFP4 stays close to dense on an all-true mask at a ragged query length."""
     torch.manual_seed(41)
     q = torch.randn((1, 511, 5, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
