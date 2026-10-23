@@ -9,6 +9,7 @@ import re
 
 import torch
 
+from aiter.jit.utils.chip_info import get_num_xcds
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled as _dispatch_compiled,
 )
@@ -671,6 +672,7 @@ def compile_flydsl_moe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     k_wave: int = 1,
     v2_output_layout: bool = False,
 ):
@@ -697,6 +699,7 @@ def compile_flydsl_moe_stage1(
             act=act,
             b_cache_mod=b_nt,
             xcd_swizzle=xcd_swizzle,
+            num_xcds=num_xcds,
             waves_per_eu=waves_per_eu,
             w_dtype=b_dtype,
             w_layout="standard",
@@ -732,6 +735,7 @@ def compile_flydsl_moe_stage1(
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
+            num_xcds=num_xcds,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
         )
@@ -763,6 +767,7 @@ def compile_flydsl_moe_stage2(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     enable_bias: bool = False,
     mode: str = "atomic",
     use_global_a: bool = True,
@@ -784,6 +789,7 @@ def compile_flydsl_moe_stage2(
             TILE_N=tile_n,
             TILE_K=tile_k,
             xcd_swizzle=xcd_swizzle,
+            num_xcds=num_xcds,
             b_cache_mod=b_nt,
             waves_per_eu=waves_per_eu,
             w_dtype=b_dtype,
@@ -822,6 +828,7 @@ def compile_flydsl_moe_stage2(
             # per-dtype special cases.
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
+            num_xcds=num_xcds,
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
@@ -1764,6 +1771,7 @@ def _flydsl_moe_stage1_impl(
         "enable_bias": kernel_bias is not None,
         "a_scale_one": a_scale_one,
         "xcd_swizzle": xcd_swizzle,
+        "num_xcds": get_num_xcds(),
         "k_wave": k_wave,
     }
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
@@ -2287,6 +2295,7 @@ def _flydsl_moe_stage2_impl(
         )
 
     exe = _compile_kernel(
+        num_xcds=get_num_xcds(),
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,

@@ -50,12 +50,14 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
+    DEFAULT_NUM_XCDS,
     collect_aot_jobs,
     compile_only_env,
     cu_num_to_arch,
     job_identity,
     override_env,
     run_jobs_parallel,
+    target_num_xcds,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
@@ -426,6 +428,7 @@ def _compile_hgemm_to_cache(
     n_waves: int,
     k_waves: int,
     group_m: int,
+    num_xcds: int,
     use_half_tile_interleaved: bool,
     has_bias: bool,
     target_gfx: str,
@@ -466,6 +469,7 @@ def _compile_hgemm_to_cache(
         "n_waves": n_waves,
         "k_waves": k_waves,
         "group_m": group_m,
+        "num_xcds": num_xcds,
         "use_half_tile_interleaved": use_half_tile_interleaved,
         "a_is_transposed": False,
         "b_is_transposed": True,
@@ -632,6 +636,7 @@ def _compile_preshuffle_to_cache(
     use_async_copy: int,
     waves_per_eu: int,
     xcd_swizzle: int = 0,
+    num_xcds: int = DEFAULT_NUM_XCDS,
     lds_stage: int = 2,
     scheduler: str = "Default",
     k_split: int = 1,
@@ -683,6 +688,7 @@ def _compile_preshuffle_to_cache(
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         enable_scheduler=enable_scheduler,
         xcd_swizzle=xcd_swizzle,
+        num_xcds=num_xcds,
         lds_stage=lds_stage,
         split_k=k_split,
     )
@@ -812,6 +818,7 @@ def _compile_8wave_to_cache(
     block_n: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    num_xcds: int = DEFAULT_NUM_XCDS,
     **kwargs,
 ):
     del kwargs
@@ -831,6 +838,7 @@ def _compile_8wave_to_cache(
         block_n=block_n,
         waves_per_eu=waves_per_eu,
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
     )
     # NOTE: the 8-wave launcher takes (A, B, C, ...), not the preshuffle
     # launcher's (C, A, B, ...).
@@ -844,6 +852,7 @@ def _compile_mxfp8_8wave_to_cache(
     k: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    num_xcds: int = DEFAULT_NUM_XCDS,
     w_scale_block: str = "1x32",
     **kwargs,
 ):
@@ -867,6 +876,7 @@ def _compile_mxfp8_8wave_to_cache(
         K=k,
         waves_per_eu=waves_per_eu,
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
         scale_preshuffled=False,
         w_scale_block=w_scale_block,
     )
@@ -1112,6 +1122,7 @@ def compile_one_config(
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     aot_arch = job_arch(cu_num, gfx)
+    num_xcds = target_num_xcds(aot_arch, cu_num)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
@@ -1133,19 +1144,23 @@ def compile_one_config(
             if kind == "hgemm":
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
-                _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
+                _compile_hgemm_to_cache(
+                    m=m, n=n, k=k, num_xcds=num_xcds, **hgemm_kwargs
+                )
             elif kind == "a16w16_gfx1250":
                 a16w16_kwargs = dict(kwargs)
                 a16w16_kwargs["target_gfx"] = aot_arch
                 _compile_a16w16_gfx1250_to_cache(m=m, n=n, k=k, **a16w16_kwargs)
             elif kind == "preshuffle":
-                _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+                _compile_preshuffle_to_cache(m=m, n=n, k=k, num_xcds=num_xcds, **kwargs)
             elif kind == "mxscale_preshuffle":
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
-                _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
+                _compile_8wave_to_cache(m=m, n=n, k=k, num_xcds=num_xcds, **kwargs)
             elif kind == "mxfp8_8wave":
-                _compile_mxfp8_8wave_to_cache(m=m, n=n, k=k, **kwargs)
+                _compile_mxfp8_8wave_to_cache(
+                    m=m, n=n, k=k, num_xcds=num_xcds, **kwargs
+                )
             elif kind == "mxfp8_wmma":
                 _compile_mxfp8_wmma_to_cache(
                     kernel_name=kernel_name,

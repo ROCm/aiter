@@ -11,7 +11,7 @@ import re
 import torch
 from torch import Tensor
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes, get_num_xcds
 
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile.
 BLOCK_K = 128
@@ -113,6 +113,7 @@ def compile_8wave_gemm(
     block_n: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    num_xcds: int,
     b_preshuffled: bool = True,
 ):
     """Compile (and memoize) an 8-wave launcher."""
@@ -125,6 +126,7 @@ def compile_8wave_gemm(
         b_preshuffled=bool(b_preshuffled),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
     )
 
 
@@ -216,6 +218,7 @@ def flydsl_8wave_gemm_a8(
         block_n=int(block_n),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=get_num_xcds(),
     )
 
     out_contig = Out.contiguous()
