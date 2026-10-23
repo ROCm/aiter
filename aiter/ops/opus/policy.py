@@ -841,12 +841,7 @@ def _heuristic_mxscale_bmm_plans(g: int, m: int, n: int, k: int, offset: int):
         big_log2 = 23 + (2 if k <= 1024 else 1 if k < 4096 else 0)
         if n % 256 == 0 and k % 256 == 0 and e >= 1 << big_log2:
             yield offset + (8158 if k <= 8192 else 8157), 1
-        if (
-            m > 64
-            and k >= 2048
-            and n % 128 == 0
-            and e >= 1 << (20 if k > 8192 else 21)
-        ):
+        if m > 64 and k >= 2048 and n % 128 == 0 and e >= 1 << (20 if k > 8192 else 21):
             kid = 8137
         elif e <= 1 << 16 and k % 512 == 0:
             kid = 8314

@@ -440,13 +440,46 @@ def test_mxscale_pipeline_plan_rejects_odd_k_tiles(kid):
     from aiter.ops.opus.launch_plan import _build_a8w8_mxscale_bmm_plan
 
     _build_a8w8_mxscale_bmm_plan(
-        arch="gfx950", kid=kid, output_dtype=torch.bfloat16,
-        M=256, batch=1, N=256, K=4096, split_k=1,
+        arch="gfx950",
+        kid=kid,
+        output_dtype=torch.bfloat16,
+        M=256,
+        batch=1,
+        N=256,
+        K=4096,
+        split_k=1,
     )
     with pytest.raises(ValueError, match="even K"):
         _build_a8w8_mxscale_bmm_plan(
-            arch="gfx950", kid=kid, output_dtype=torch.bfloat16,
-            M=256, batch=1, N=256, K=4224, split_k=1,
+            arch="gfx950",
+            kid=kid,
+            output_dtype=torch.bfloat16,
+            M=256,
+            batch=1,
+            N=256,
+            K=4224,
+            split_k=1,
+        )
+
+
+def test_mxscale_direct_only_kid_with_workspace_rejects_split_k(monkeypatch):
+    def unexpected_launch(*args, **kwargs):
+        raise AssertionError("direct-only split-K reached the backend")
+
+    monkeypatch.setattr(opus_a8w8, "_launch_a8w8_backend", unexpected_launch)
+    M, batch, N, K = 64, 1, 128, 512
+    with pytest.raises(ValueError, match="requires split_k <= 1"):
+        opus_a8w8._launch_a8w8_mxscale_bmm(
+            torch.empty((batch, M, K), dtype=dtypes.fp8),
+            torch.empty((batch, N, K), dtype=dtypes.fp8),
+            torch.empty((batch, M, N), dtype=torch.bfloat16),
+            torch.empty((batch, M, K // 32), dtype=torch.uint8),
+            torch.empty((batch, N // 32, K // 32), dtype=torch.uint8),
+            kid=9646,
+            split_k=2,
+            workspace=torch.empty(M * N * 2),
+            route_arch="gfx950",
+            instance=SimpleNamespace(direct_only=True),
         )
 
 

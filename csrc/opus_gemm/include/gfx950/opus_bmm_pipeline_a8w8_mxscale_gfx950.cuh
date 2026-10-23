@@ -671,9 +671,14 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
 #pragma unroll 1
             for (int it = 0; it < PASSES; ++it) {
                 const int idx = tid * VEC + it * (T::BLOCK_SIZE * VEC);
+                // buffer_load_lds supplies lane_id * VEC itself. Keep the LDS
+                // pointer explicitly wave-uniform instead of relying on the
+                // intrinsic to readfirstlane a pointer containing `tid`.
+                const int dst = wave_id * get_warp_size() * VEC
+                              + it * (T::BLOCK_SIZE * VEC);
                 const int m   = idx / SFA_SCALES_MAX;
                 const int kt  = idx - m * SFA_SCALES_MAX;
-                g_sfa.template async_load<VEC>(s_sfa_ptr + idx,
+                g_sfa.template async_load<VEC>(s_sfa_ptr + dst,
                                                m * kargs.stride_sfa + col0 + kt);
             }
             // Here and not in the slide: buffer_load_lds retires on vmcnt, so
@@ -963,6 +968,9 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // A panel's first read after a slide sits behind another barrier anyway;
     // the B window's is the very next instruction, so it takes a third.
     auto sfa_slide = [&](int first) {
+        // The outgoing panel's ds_reads must retire before any wave starts
+        // overwriting it. A workgroup barrier alone does not drain lgkmcnt.
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_barrier();
         sfa_base_tile = first;
         sfa_fill_window(first * SFA_SPK, opus::bool_constant<true>{});

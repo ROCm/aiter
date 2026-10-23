@@ -2336,7 +2336,10 @@ def _emit_bmm_specialized(
     specializations already emitted by the mouter family -- emitting them again
     under a different alias name would be a duplicate-symbol ODR violation).
     """
-    if k.kernel_tag in ("a8w8_mxscale_bmm_bpreshuffle_compact", "a8w8_mxscale_bmm_compact"):
+    if k.kernel_tag in (
+        "a8w8_mxscale_bmm_bpreshuffle_compact",
+        "a8w8_mxscale_bmm_compact",
+    ):
         traits_aliases = (
             f"using {k.name}_Traits = {traits_name}<"
             f"{k.B_M}, {k.B_N}, {k.B_K}, {k.T_M}, {k.T_N}, {k.num_slots}, "

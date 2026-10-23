@@ -1071,8 +1071,13 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                          + b_gmem_tile_base_mxsk<T>(col, k_start, kargs.stride_b));
     const bool direct_store = DIRECT_ONLY || (!std::is_void_v<D_OUT> && kargs.split_k == 1);
     const int stride_c_main = direct_store ? kargs.stride_c : kargs.stride_ws;
+    const int scale_k = kargs.k / T::GROUP_K;
+    // The descriptor starts at sf_start, so its last row has only
+    // scale_k - sf_start live elements left. Keeping the old full-row bound
+    // extended the descriptor sf_start elements past the allocation.
     const unsigned int sfa_bytes =
-        (unsigned int)rows_avail * (unsigned int)kargs.stride_sfa * sizeof(D_SF);
+        ((unsigned int)(rows_avail - 1) * (unsigned int)kargs.stride_sfa
+         + (unsigned int)(scale_k - sf_start)) * sizeof(D_SF);
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
                            + (size_t)batch_id * kargs.stride_sfa_batch
                            + (size_t)row * kargs.stride_sfa + sf_start,

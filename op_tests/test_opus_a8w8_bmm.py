@@ -596,12 +596,16 @@ def check_long_k_kids():
             if group_n == 1:
                 row_amp = torch.exp2(torch.randint(-4, 4, (n, 1)).float())
                 W_bf16 = (W_bf16.float() * row_amp).to(dtypes.bf16)
-            W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16, group=group, group_n=group_n)
+            W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(
+                W_bf16, group=group, group_n=group_n
+            )
             ref = run_torch(
                 O_mx, W_mx, xs_fp32, ws_fp32, group=group, group_n=group_n
             ).transpose(0, 1)
             out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
-            _run_opus(O_mx.transpose(0, 1), W_mx, out, xs_mx.transpose(0, 1), ws_mx, kid)
+            _run_opus(
+                O_mx.transpose(0, 1), W_mx, out, xs_mx.transpose(0, 1), ws_mx, kid
+            )
             torch.cuda.synchronize()
             delta = (out.to(dtypes.fp32) - ref).abs()
             rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
@@ -620,7 +624,9 @@ def check_long_k_kids():
         )
         out = torch.empty((256, 1, 256), dtype=dtypes.bf16)
         try:
-            _run_opus(O_mx.transpose(0, 1), W_mx, out, xs_mx.transpose(0, 1), ws_mx, kid)
+            _run_opus(
+                O_mx.transpose(0, 1), W_mx, out, xs_mx.transpose(0, 1), ws_mx, kid
+            )
             torch.cuda.synchronize()
             failures.append(f"kid {kid}: accepted an odd K-tile count (K={k})")
         except RuntimeError as exc:
@@ -651,19 +657,17 @@ def check_compact_row_b_kids():
             "token-major": (
                 O_mx.transpose(0, 1).contiguous(),
                 xs_mx.transpose(0, 1).contiguous(),
-                lambda: torch.full((m, g, n), float("nan"), dtype=dtypes.bf16),
+                False,
             ),
-            "batch-major": (
-                O_mx.transpose(0, 1),
-                xs_mx.transpose(0, 1),
-                lambda: torch.full(
-                    (g, m, n), float("nan"), dtype=dtypes.bf16
-                ).transpose(0, 1),
-            ),
+            "batch-major": (O_mx.transpose(0, 1), xs_mx.transpose(0, 1), True),
         }
         for kid in _COMPACT_ROW_B_KIDS:
-            for layout, (A, A_scale, make_out) in layouts.items():
-                out = make_out()
+            for layout, (A, A_scale, batch_major) in layouts.items():
+                if batch_major:
+                    out = torch.full((g, m, n), float("nan"), dtype=dtypes.bf16)
+                    out = out.transpose(0, 1)
+                else:
+                    out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
                 _run_opus(A, W_mx, out, A_scale, ws_mx, kid)
                 torch.cuda.synchronize()
                 delta = (out.to(dtypes.fp32) - ref).abs()

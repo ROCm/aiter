@@ -464,7 +464,9 @@ def _launch_a8w8_mxscale_bmm(
     launch_y = Y.transpose(0, 1)
     launch_x_scale = x_scale.transpose(0, 1)
 
-    if instance is not None and (workspace is not None or split_k <= 1):
+    if instance is not None and (
+        split_k <= 1 or (workspace is not None and not instance.direct_only)
+    ):
         # The checked C++ entry validates tensors and caller-owned workspace,
         # including device, dtype, layout, capacity and alignment, and the
         # kid's M/N/K tile alignment, which no plan is built here to check.
