@@ -26,4 +26,6 @@ def error_ratio(y: torch.Tensor, ref: torch.Tensor) -> float:
         tol = torch.exp2(exponent - 7) + noise
     else:
         tol = noise
+    # Floored, so an all-zero reference with an exact output gives 0, not 0/0.
+    tol = torch.clamp_min(tol, torch.finfo(torch.float32).tiny)
     return (err / tol).max().item()

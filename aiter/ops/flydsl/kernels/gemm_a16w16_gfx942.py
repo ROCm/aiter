@@ -1525,12 +1525,15 @@ def _dynamic_tensor_arg(tensor, leading_dim):
 
 
 @functools.cache
-def get_split_k_buffers(stream, device, split_k, split_k_reduce):
+def get_split_k_buffers(stream_handle: int, device, split_k, split_k_reduce):
     """Split-K tile semaphores and signals, one set per split_k and split_k_reduce.
 
-    Also one per stream, since launches on two streams may overlap. Sets
-    (8-12 KB each) live for the process: a captured CUDA graph keeps using them,
-    so they are never evicted.
+    Also one per stream, since launches on two streams may overlap. Keyed by
+    the raw stream handle (``cuda_stream``), so no stream object is kept alive.
+    PyTorch recycles a fixed pool of handles per device, which bounds the sets
+    of its streams; a stream reusing a destroyed stream's handle inherits its
+    idle set. Sets (8-12 KB each) are never evicted: a captured CUDA graph
+    keeps using their addresses.
 
     Zeroed once, never reset by the host. Atomic split-K (``SplitKProtocol``)
     never resets its 64-bit tickets: each launch advances them by split_k,
@@ -1978,7 +1981,9 @@ def gemm_a16w16(
             kernel_out = torch.empty((m, n), dtype=torch.float32, device=device)
         else:
             kernel_out = out
-        semaphore, signal = get_split_k_buffers(stream, device, split_k, split_k_reduce)
+        semaphore, signal = get_split_k_buffers(
+            stream.cuda_stream, device, split_k, split_k_reduce
+        )
         if split_k_reduce:
             # Partial tiles of every split; the last split of a tile reduces them.
             num_tiles = ((m + param.block_m - 1) // param.block_m) * (

@@ -555,6 +555,40 @@ def test_flydsl_hgemm_gfx942_explicit_stream_non_contiguous():
     _assert_close(y, ref, "flydsl_hgemm non-contiguous on a side stream")
 
 
+def test_gemm_a16w16_gfx942_split_k_buffers_do_not_retain_streams():
+    """Split-K semaphores are cached by stream handle: a transient stream is
+    freed after its launch, and a stream on the same handle reuses the set."""
+    _require_gfx942()
+    import gc
+    import weakref
+
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    x, w, ref = _inputs(256, 256, 2048)
+    cfg = {"block_m": 64, "block_n": 64, "block_k": 64, "stages": 2, "split_k": 4}
+    stream = torch.cuda.Stream()
+    y = gemm_a16w16(x, w.t(), layout="nt", user_kwargs=cfg, stream=stream)
+    stream.synchronize()
+    _assert_close(y, ref, "split-K on a transient stream")
+    handle, alive = stream.cuda_stream, weakref.ref(stream)
+    del stream
+    gc.collect()
+    assert alive() is None, "the split-K buffer cache kept the stream alive"
+    same_handle = torch.cuda.ExternalStream(handle)
+    device = torch.device("cuda", torch.cuda.current_device())
+    assert g.get_split_k_buffers(
+        same_handle.cuda_stream, device, 4, False
+    ) is g.get_split_k_buffers(handle, device, 4, False)
+
+
+@pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
+def test_error_ratio_zero_reference(out_dtype):
+    """An exact output of an all-zero reference is correct, a wrong one is not."""
+    ref = torch.zeros(4, 4)
+    assert error_ratio(torch.zeros(4, 4, dtype=out_dtype), ref) == 0.0
+    assert error_ratio(torch.full((4, 4), 1e-3, dtype=out_dtype), ref) > 1.0
+
+
 def _invalid_inputs(case):
     x, w, _ = _inputs(64, 128, 256)
     b = w.t()
