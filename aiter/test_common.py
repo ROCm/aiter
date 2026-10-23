@@ -21,6 +21,12 @@ pd.set_option("display.max_rows", 200)
 # pd.set_option("display.expand_frame_repr", False)
 
 
+def _use_cuda_event_timing(requested):
+    return requested or bool(
+        int(os.environ.get("AITER_PERFTEST_USE_CUDA_EVENT", "0"))
+    )
+
+
 def ensure_spawn_method():
     """
     Ensure multiprocessing uses 'spawn' start method.
@@ -55,6 +61,8 @@ def perftest(
     use_cuda_event=False,
     profile_warm_iters=1,
 ):
+    use_cuda_event = _use_cuda_event_timing(use_cuda_event)
+
     def decorator(func):
         def wrapper(*args, **kwargs):
             num = num_rotate_args
