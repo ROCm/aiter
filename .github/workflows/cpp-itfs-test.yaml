@@ -12,6 +12,7 @@ on:
       - 'csrc/cpp_itfs/**'
       - 'csrc/include/**'
       - '.github/workflows/cpp-itfs-test.yaml'
+      - '.github/workflows/ci-config.yaml'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
@@ -19,6 +20,7 @@ on:
       - 'csrc/cpp_itfs/**'
       - 'csrc/include/**'
       - '.github/workflows/cpp-itfs-test.yaml'
+      - '.github/workflows/ci-config.yaml'
 
   workflow_dispatch:
 
@@ -26,22 +28,26 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-env:
-  DOCKER_IMAGE: "rocm/pytorch:latest"
-
 jobs:
+  ci_config:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    uses: ./.github/workflows/ci-config.yaml
+
   cpp-itfs:
     if: >-
       (!github.event.pull_request || github.event.pull_request.draft == false) &&
       github.event.action != 'labeled'
     name: C++ Interface Tests (${{ matrix.label }})
+    needs: [ci_config]
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: linux-aiter-mi35x-1
             label: MI35X
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
     runs-on: ${{ matrix.runner }}
 
@@ -55,10 +61,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -96,7 +103,7 @@ jobs:
         run: |
           set -ex
           docker exec -w /workspace aiter_cpp_itfs_test \
-            bash -lc "hipcc --version | head -3 && ls /opt/rocm/.info/version"
+            bash -lc "hipcc --version | head -3"
 
       - name: Install build dependencies
         run: |
@@ -129,3 +136,8 @@ jobs:
           path: cpp_itfs_test.log
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_cpp_itfs_test || true
