@@ -5,6 +5,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -16,6 +17,8 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
 )
 
 from .utils import (
+    _gep,
+    _global_base_ptr1,
     _global_i32_at,
     _mma_bf16,
     _raw,
@@ -78,13 +81,16 @@ def _atomic_bf16_epilog(
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
     # gfx950+ has buffer_atomic_pk_add_bf16. gfx942 only has the global packed
     # form; emitting the buffer op there is LLVM "Cannot select BUFFER_ATOMIC_FADD
-    # v2bf16" (same fork as moe_gemm_2stage / mxfp4_gemm2).
+    # v2bf16" (same fork as moe_gemm_2stage / mxfp4_gemm2). FlyDSL 0.3.2 has no
+    # fx.atomic_add. A host ``hasattr`` fork cannot live inside this @flyc.jit
+    # body -- the rewriter traces both branches -- so gfx942 always uses
+    # llvm.AtomicRMWOp, the same pattern as mxfp4_gemm2 (works on 0.3.2 and 0.4.0).
     if const_expr(not is_gfx942):
         atomic_bf16x2 = fx.make_copy_atom(
             fx.rocdl.BufferAtomicPkAdd(fx.BFloat16), fx.BFloat16
         )
     else:
-        out_elems = global_typed_ptr(arg_out, T.bf16, align=4)
+        out_base = _global_base_ptr1(arg_out)
 
     def load_scalar(atom, src, index, elem_ty):
         frag = fx.make_rmem_tensor(1, elem_ty)
@@ -132,10 +138,13 @@ def _atomic_bf16_epilog(
                 ).to(fx.BFloat16)
                 out_off = row_base_addr + fx.Int32(s * 64)
                 if const_expr(is_gfx942):
-                    fx.atomic_add(
-                        fx.recast_iter(out_elems.type, out_elems + out_off),
-                        pk,
-                        syncscope=fx.rocdl.SyncScope.Agent,
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.fadd,
+                        _gep(out_base, out_off * fx.Int32(2)),
+                        _raw(pk),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
                     )
                 else:
                     out_frag = fx.make_rmem_tensor(2, fx.BFloat16)
