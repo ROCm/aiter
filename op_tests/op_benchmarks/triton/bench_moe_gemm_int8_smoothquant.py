@@ -10,10 +10,6 @@ from pathlib import Path
 import torch
 import triton.profiler as proton
 
-from op_tests.op_benchmarks.triton.proton_visible_devices import (
-    proton_visible_devices,
-)
-
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
@@ -23,6 +19,9 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import (
     quantize_weights_int8,
     smoothquant_quantize,
+)
+from op_tests.op_benchmarks.triton.proton_visible_devices import (
+    proton_visible_devices,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
