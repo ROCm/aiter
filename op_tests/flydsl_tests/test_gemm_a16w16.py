@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm, flydsl_hgemm_supports_shape
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -227,6 +227,27 @@ def test_gemm_a16w16_config(
     return ret
 
 
+def gfx950_supports_config(dtype, otype, m, n, k, *tile):
+    block_m, block_n, block_k, m_waves, n_waves, stages, split_k, unroll = tile
+    in_name = "fp16" if dtype == dtypes.fp16 else "bf16"
+    params = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "stages": stages,
+        "split_k": split_k,
+        "m_waves": m_waves,
+        "n_waves": n_waves,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": bool(unroll),
+        "has_bias": False,
+        "dtype": in_name,
+        "out_dtype": "fp32" if otype == dtypes.fp32 else in_name,
+    }
+    return flydsl_hgemm_supports_shape(m, n, k, params)
+
+
 def summarize(name, rows):
     aiter.logger.info(
         "%s summary (markdown):\n%s", name, pd.DataFrame(rows).to_markdown(index=False)
@@ -340,13 +361,23 @@ def main():
                 "%s: skipping fused-epilogue table (activation fusion is gfx1250-only)",
                 gfx,
             )
+        configs = []
+        for otype, config in itertools.product(args.otype, args.config):
+            # e.g. a 256x256 fp32 C tile does not fit in gfx950 LDS.
+            if gfx == "gfx950" and not gfx950_supports_config(dtype, otype, *config):
+                aiter.logger.warning(
+                    "%s: skipping unsupported config %s with %s output",
+                    gfx,
+                    config,
+                    otype,
+                )
+                continue
+            configs.append((otype, config))
         summarize(
             "gemm_a16w16 kernel config",
             [
                 test_gemm_a16w16_config(m, n, k, dtype, otype, *tile)
-                for otype, (m, n, k, *tile) in itertools.product(
-                    args.otype, args.config
-                )
+                for otype, (m, n, k, *tile) in configs
             ],
         )
 

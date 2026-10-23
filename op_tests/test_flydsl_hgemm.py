@@ -224,6 +224,51 @@ def check_shape_limits():
     assert not flydsl_hgemm_supports_shape(1677722, 6144, 1280, params)
 
 
+def check_strided_out():
+    # A row-strided `out` (a view into a larger buffer) is written in place.
+    for row in _TUNED:
+        m, n, k, policy, split_k, tile = _unpack(row)
+        if (m, n, k, policy, split_k) not in (
+            (32, 14336, 4096, "ft", 1),
+            (4096, 4096, 4096, "hti", 1),
+            (16, 5120, 2880, "ft", 3),
+        ):
+            continue
+        torch.manual_seed(SEED)
+        a = torch.empty((m, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        parent = torch.full(
+            (m + tile["block_m"], n + tile["block_n"]), 4096.0, dtype=dtypes.bf16
+        )
+        out = parent[:m, :n]
+        y = flydsl_hgemm(
+            a,
+            w,
+            out=out,
+            block_m=tile["block_m"],
+            block_n=tile["block_n"],
+            block_k=tile["block_k"],
+            stages=tile["stages"],
+            split_k=tile["split_k"],
+            m_waves=tile["m_waves"],
+            n_waves=tile["n_waves"],
+            k_waves=tile["k_waves"],
+            group_m=tile["group_m"],
+            policy=policy,
+        )
+        assert y is out
+        assert torch.all(parent[m:] == 4096) and torch.all(parent[:, n:] == 4096)
+        atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtypes.bf16)
+        err = checkAllclose(
+            run_torch(a, w, dtypes.bf16).to(dtypes.fp32),
+            y.to(dtypes.fp32),
+            rtol=rtol,
+            atol=atol,
+            msg=f"strided out {m}x{n}x{k} {policy} ks{split_k}",
+        )
+        assert err == 0
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -264,6 +309,7 @@ def main():
     args = parser.parse_args()
     wanted = set(args.mnk)
     check_shape_limits()
+    check_strided_out()
 
     for dtype in args.dtype:
         rows = []
