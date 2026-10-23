@@ -738,6 +738,149 @@ def test_triton_unified_attn(
 
 
 @pytest.mark.parametrize(
+    "seq_lens, num_heads, block_size, sliding_window, grids",
+    [
+        ([(4, 3000), (8, 40000), (1, 9000)], (16, 2), 16, 2048, ["2d", 32]),
+        ([(8, 8704)], (16, 2), 128, 2048, ["2d", 64]),
+        ([(8, 582), (1, 582)], (16, 2), 64, 512, [16, 16]),
+        ([(1, 8704)] * 4, (16, 2), 16, 2048, [1, 1]),
+        ([(128, 1100)], (32, 32), 64, 1024, ["2d", "2d"]),
+        ([(17, 1100)], (32, 32), 64, 1024, ["2d", "2d"]),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_sw_verify_split(
+    seq_lens, num_heads, block_size, sliding_window, grids, monkeypatch
+):
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon split dispatch")
+    import aiter.ops.triton.attention.unified_attention as ua
+
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    max_q = max(query_lens)
+    q, k, v, _, _, sinks, out, cu_q, kv_lens_t, _, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            num_heads=num_heads,
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    sinks = sinks + 8.0
+    ref = ref_paged_attn(
+        q,
+        k,
+        v,
+        query_lens,
+        kv_lens,
+        table,
+        scale,
+        torch.bfloat16,
+        sliding_window,
+        sinks=sinks,
+    ).float()
+
+    first = [max(0, kv - ql - sliding_window + 1) // block_size for ql, kv in seq_lens]
+    width = (sliding_window + max_q + block_size - 2) // block_size + 1
+    index = torch.tensor(first, device="cuda")[:, None] + torch.arange(
+        width, device="cuda"
+    )
+    trimmed_lens = [kv - fb * block_size for kv, fb in zip(kv_lens, first)]
+    assert max(trimmed_lens) <= sliding_window + max_q + block_size - 2
+
+    calls = []
+    run_2d, run_3d = ua._unified_attention_2d_gfx950, ua._unified_attention_3d_gfx950
+    monkeypatch.setattr(
+        ua, "_unified_attention_2d_gfx950", lambda p: calls.append("2d") or run_2d(p)
+    )
+    monkeypatch.setattr(
+        ua,
+        "_unified_attention_3d_gfx950",
+        lambda p, o, m, s, n, *a: calls.append(n) or run_3d(p, o, m, s, n, *a),
+    )
+    for block_table, lens, max_seqlen_k in [
+        (table, kv_lens_t, max_k),
+        (
+            table.gather(1, index.clamp(max=table.shape[1] - 1)),
+            torch.tensor(trimmed_lens, dtype=torch.int32, device="cuda"),
+            max(trimmed_lens),
+        ),
+    ]:
+        out = torch.empty_like(out)
+        unified_attention(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max_q,
+            seqused_k=lens,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window,
+            block_table=block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=sinks,
+        )
+        torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+    assert calls == grids, calls
+
+
+@pytest.mark.parametrize(
+    "sliding_window, max_seqlen_q, max_seqlen_k, num_seqs, block_size, segments",
+    [
+        (2048, 8, 2070, 1, 16, 64),
+        (2048, 8, 2070, 12, 16, 4),
+        (2048, 8, 2070, 32, 16, 2),
+        (2048, 8, 2070, 36, 16, 1),
+        (2048, 8, 2071, 1, 16, 1),
+        (2048, 8, 200000, 1, 16, 1),
+        (2048, 1, 2063, 1, 16, 1),
+        (128, 4, 258, 1, 128, 1),
+        (256, 8, 278, 7, 16, 8),
+        (256, 8, 278, 8, 16, 1),
+        (2048, 8, 300, 4, 16, 8),
+    ],
+)
+def test_unified_attn_sw_kv_split_config(
+    sliding_window, max_seqlen_q, max_seqlen_k, num_seqs, block_size, segments
+):
+    from aiter.ops.triton.utils.unified_attention_utils import (
+        get_unified_attention_config,
+    )
+
+    block_m = max(64, 1 << (max_seqlen_q * 8 - 1).bit_length())
+    q_blocks = num_seqs
+    if max_seqlen_q > 1:
+        q_blocks += num_seqs * max_seqlen_q // (block_m // 8)
+    params = SimpleNamespace(
+        head_size=64,
+        head_size_v=64,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        sliding_window=sliding_window,
+        shuffled_kv_cache=False,
+        q_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        block_size=block_size,
+        num_sms=256,
+        num_seqs=num_seqs,
+        num_queries_per_kv=8,
+        num_2d_prgms=q_blocks * 2,
+    )
+    config = get_unified_attention_config(
+        "kv_split", params, backend="gluon", arch="gfx950"
+    )
+    assert config["NUM_SEGMENTS"] == segments, config
+
+
+@pytest.mark.parametrize(
     "seq_lens",
     [
         [(1, 1328)],

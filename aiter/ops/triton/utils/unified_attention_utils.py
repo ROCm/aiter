@@ -65,6 +65,7 @@ _AXIS_KIND = {
     "Q": "num",  # max_seqlen_q; Q_LEQ_1 is decode
     "BS": "num",  # block_size, the KV page size
     "SW": "bool",  # sliding_window > 0
+    "SWB": "bool",
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
     "DT": "enum",  # (q dtype tag, kv dtype tag)
@@ -181,11 +182,18 @@ def compute_segment_params(config: dict, params) -> dict:
     mfma_dim = config.pop("MFMA_DIM", None)
     min_tiles = config.pop("SPLIT_MIN_TILES", 0)
     min_share = config.pop("SPLIT_MIN_SHARE", 0)
+    fit_budget = config.pop("SPLIT_FIT_BUDGET", False)
+    kv_window = config.pop("SPLIT_KV_WINDOW", False)
+    seqs_per_tile = config.pop("SPLIT_SEQS_PER_TILE", 0)
 
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
-    limit = triton.cdiv(params.max_seqlen_k, tile)
+    kv_len = params.max_seqlen_k
+    if kv_window and params.sliding_window > 0:
+        kv_len = min(kv_len, params.sliding_window + params.max_seqlen_q - 1)
+    limit = triton.cdiv(kv_len, tile)
+    too_many_seqs = seqs_per_tile and params.num_seqs > seqs_per_tile * limit
     if cap is not None:
         limit = min(cap, limit)
 
@@ -198,7 +206,9 @@ def compute_segment_params(config: dict, params) -> dict:
         )
         budget //= num_waves
     share = triton.cdiv(budget, prgms)
-    if limit <= min_tiles or share < min_share:
+    if fit_budget:
+        share = 1 << ((budget // prgms).bit_length() - 1) if budget >= prgms else 0
+    if limit <= min_tiles or share < min_share or too_many_seqs:
         segments = 1
     else:
         claim = max(min(lo, limit), min(limit, max(1, share)))
@@ -209,6 +219,16 @@ def compute_segment_params(config: dict, params) -> dict:
         # the split landed on its floor: too few segments to be worth 2 warps
         config["num_warps"] = 1
     return config
+
+
+def sliding_window_bounds_kv(
+    max_seqlen_q: int, max_seqlen_k: int, sliding_window: int, block_size: int
+) -> bool:
+    return (
+        sliding_window > 0
+        and max_seqlen_q > 1
+        and max_seqlen_k <= sliding_window + max_seqlen_q + block_size - 2
+    )
 
 
 def _axis_values(
@@ -226,6 +246,9 @@ def _axis_values(
         "Q": max_seqlen_q,
         "BS": block_size,
         "SW": sliding_window > 0,
+        "SWB": sliding_window_bounds_kv(
+            max_seqlen_q, max_seqlen_k, sliding_window, block_size
+        ),
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype)),
