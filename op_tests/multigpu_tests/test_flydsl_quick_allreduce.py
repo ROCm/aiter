@@ -3363,8 +3363,7 @@ def _fused_applies(algorithm: str, knobs: dict, tp: int, hidden: int) -> bool:
     cap = knobs.get("grid_cap")
     if (
         cap is not None
-        and cap
-        > wgs_per_cu * torch.cuda.get_device_properties(0).multi_processor_count
+        and cap > wgs_per_cu * torch.cuda.get_device_properties(0).multi_processor_count
     ):
         return False
     apr = knobs.get("atoms_per_row")

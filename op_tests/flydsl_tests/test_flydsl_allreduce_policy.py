@@ -23,8 +23,8 @@ from aiter.dist.device_communicators.custom_all_reduce import (
     is_weak_contiguous,
 )
 from aiter.dist.device_communicators.flydsl_backends import (
-    FlyDSLQuickAllReduce,
     FlyDSLAllReduceRMSNorm,
+    FlyDSLQuickAllReduce,
 )
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.allreduce_policy import (
