@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-OPS = Path(__file__).resolve().parents[1] / "aiter" / "ops"
+OPS = Path(__file__).resolve().parents[3] / "aiter" / "ops"
 ENTRYPOINTS = ("flash_attn_func", "flash_attn_varlen_func")
 
 
