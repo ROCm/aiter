@@ -365,7 +365,7 @@ def main():
         "--backends",
         choices=BACKENDS,
         nargs="+",
-        help="default: HIP/FlyDSL/Triton on gfx950; HIP/Triton on gfx942; "
+        help="default: HIP/FlyDSL/Triton on gfx950; HIP/Triton on gfx942/gfx1250; "
         "Triton is omitted for MXFP8",
     )
     parser.add_argument("--seed", type=int, default=0, help="shared input seed")
@@ -390,8 +390,8 @@ def main():
     if not torch.cuda.is_available():
         parser.error("Mega-MHC requires a GPU")
     arch = get_gfx_runtime()
-    if arch not in ("gfx950", "gfx942"):
-        parser.error("Mega-MHC requires gfx950 or gfx942")
+    if arch not in ("gfx950", "gfx942", "gfx1250"):
+        parser.error("Mega-MHC requires gfx950, gfx942 or gfx1250")
     if "mxfp8" in args.out_dtype and arch != "gfx950":
         parser.error("Mega-MHC mxfp8 requires gfx950")
     backends = tuple(

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-// Tuned gfx950 kernels and the portable gfx950/gfx942 fallback.
+// Tuned gfx950 kernels and the portable gfx950/gfx942 fallback. gfx1250
+// dispatches to mega_mhc_gfx1250.cu.
 // API, scratch ownership, and capture requirements: aiter/ops/mega_mhc.py.
 #define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
@@ -2624,6 +2625,40 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    int variant,
                    bool mxfp8)
 {
+    {
+        const HipDeviceGuard guard(residual.device_id);
+        if(get_gpu_arch() == "gfx1250")
+        {
+            AITER_CHECK(!mxfp8, "Mega-MHC mxfp8 requires gfx950");
+            mega_mhc_gfx1250(residual_out,
+                             post_out,
+                             comb_out,
+                             layer_input,
+                             next_pre,
+                             residual,
+                             fn_packed,
+                             hc_scale,
+                             hc_base,
+                             pre_mix,
+                             sublayer_out,
+                             post_mix,
+                             comb_mix,
+                             norm_weight,
+                             partials,
+                             counters,
+                             rms_eps,
+                             hc_pre_eps,
+                             hc_sinkhorn_eps,
+                             hc_post_mult,
+                             norm_eps,
+                             sinkhorn_repeat,
+                             split_k,
+                             has_post,
+                             identity_pre,
+                             variant);
+            return;
+        }
+    }
     auto launch = [&]<int H, int VARIANT, bool MXFP8>() {
         launch_mega_mhc<H, VARIANT, MXFP8>(residual_out,
                                            post_out,

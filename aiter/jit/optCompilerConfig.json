@@ -1991,7 +1991,8 @@
     "module_mega_mhc_stream_h5120": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -2008,7 +2009,8 @@
     "module_mega_mhc_stream_h7168": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -2025,7 +2027,8 @@
     "module_mega_mhc_stream_generic": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_gfx1250.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

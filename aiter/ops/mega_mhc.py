@@ -33,6 +33,13 @@ _STREAM_VARIANTS = (
     "large",
     "tail",
     "generic",
+    # gfx1250: IDs 14.. select the kernels in csrc/kernels/mega_mhc_gfx1250.cu.
+    "gfx1250_split32",
+    "gfx1250_split16",
+    "gfx1250_split8",
+    "gfx1250_split4",
+    "gfx1250_split2",
+    "gfx1250_large",
 )
 
 _DISTRIBUTED_VARIANTS = frozenset(
@@ -48,8 +55,20 @@ _DISTRIBUTED_VARIANTS = frozenset(
         "mid512",
         "mid1024",
         "mid2048",
+        "gfx1250_split32",
+        "gfx1250_split16",
+        "gfx1250_split8",
+        "gfx1250_split4",
+        "gfx1250_split2",
     )
 )
+
+# Counters carry generation tags and partials are compact [split, T, 32].
+# gfx1250_large uses them for the split tiles of a partial final CU round.
+_TAGGED_VARIANTS = _DISTRIBUTED_VARIANTS | {"gfx1250_large"}
+
+# Largest split first; each token tile and split gets its own CU.
+_GFX1250_SPLITS = (32, 16, 8, 4, 2)
 
 
 def _select_stream_variant(tokens, hidden=5120):
@@ -75,6 +94,16 @@ def _select_stream_variant(tokens, hidden=5120):
     if tokens == 4160:
         return "tail", 1
     return "large", 1
+
+
+def _select_gfx1250_variant(tokens, cu):
+    if tokens == 0:
+        return "generic", 1
+    blocks = (tokens + 15) // 16
+    for split in _GFX1250_SPLITS:
+        if blocks * split <= cu:
+            return f"gfx1250_split{split}", split
+    return "gfx1250_large", 1
 
 
 def mega_mhc_shuffle_fn(fn):
@@ -227,11 +256,12 @@ def prepare_mega_mhc(
 ):
     """Prepare private scratch from dimensions on the current stream of device.
 
-    H=5120/7168 on gfx950 uses the tuned stream kernels. Explicit split_k,
-    other H and gfx942 select the portable generic kernel with the same weight
-    layout. The workspace also supports non-default Sinkhorn repeats via the
-    generic path. It never receives or stores weights. Prepare before graph
-    capture; pass the packed weight separately to each mega_mhc call.
+    H=5120/7168 on gfx950 and gfx1250 uses the tuned stream kernels.
+    Explicit split_k, other H and gfx942 select the portable generic kernel
+    with the same weight layout. The workspace also supports non-default
+    Sinkhorn repeats via the generic path. It never receives or stores
+    weights. Prepare before graph capture; pass the packed weight separately
+    to each mega_mhc call.
     """
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
@@ -251,12 +281,16 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
         raise ValueError("unsupported T or H")
     with torch.cuda.device(device):
         arch = get_gfx_runtime()
-        if arch not in ("gfx950", "gfx942"):
-            raise RuntimeError(f"mega_mhc requires gfx950 or gfx942, got {arch}")
+        if arch not in ("gfx950", "gfx942", "gfx1250"):
+            raise RuntimeError(
+                f"mega_mhc requires gfx950, gfx942 or gfx1250, got {arch}"
+            )
         blocks = (tokens + 15) // 16
         cu = torch.cuda.get_device_properties(device).multi_processor_count
         if arch == "gfx950" and hidden in _STREAM_HIDDEN_SIZES:
             variant, selected_split = _select_stream_variant(tokens, hidden)
+        elif arch == "gfx1250" and hidden in _STREAM_HIDDEN_SIZES:
+            variant, selected_split = _select_gfx1250_variant(tokens, cu)
         else:
             variant = "generic"
             selected_split = max(
@@ -271,8 +305,9 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             os.environ.get(name) is not None
             for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
         )
-        if distributed and (cu < 256 or masked):
+        if distributed and (masked or (arch != "gfx1250" and cu < 256)):
             variant, selected_split, distributed = "generic", 1, False
+        tagged = variant in _TAGGED_VARIANTS
         split_k = selected_split
         if (
             not isinstance(split_k, int)
@@ -282,29 +317,33 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             raise ValueError("split_k must be 1..32 and H divisible by 32*split_k")
         # The distributed kernels have a bounded wait and handoff path;
         # still keep the tuned grid at no more than one WG per CU.
-        if distributed and ((blocks + 7) // 8) * split_k > 32:
+        if distributed and (
+            blocks * split_k > cu
+            if arch == "gfx1250"
+            else ((blocks + 7) // 8) * split_k > 32
+        ):
             raise ValueError("distributed split grid exceeds one workgroup per CU")
         if reuse_scratch:
             storage, generic_counters, distributed_counters = _SCRATCH.get(
                 device, split_k * blocks * 16 * 32, blocks * 32
             )
             generic_partials = storage.view(split_k, blocks, 16, 32)
-            counters = distributed_counters if distributed else generic_counters
+            counters = distributed_counters if tagged else generic_counters
         else:
             generic_partials = torch.empty(
                 (split_k, blocks, 16, 32), device=device, dtype=torch.float32
             )
             # Initialize both protocols in one operation for a private workspace.
             counter_storage = torch.zeros(
-                (2 if distributed else 1, blocks * 32),
+                (2 if tagged else 1, blocks * 32),
                 device=device,
                 dtype=torch.int32,
             )
             counters = counter_storage[0]
-            generic_counters = counter_storage[1] if distributed else counters
+            generic_counters = counter_storage[1] if tagged else counters
         partials = (
             generic_partials.view(-1)[: split_k * tokens * 32]
-            if distributed
+            if tagged
             else generic_partials
         )
         return MegaMHCWorkspace(
@@ -323,7 +362,7 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
 def _counter_state_ok(workspace):
     """Synchronizing diagnostic for tests; never call during graph capture."""
     counters = workspace.counters
-    if workspace.variant in _DISTRIBUTED_VARIANTS:
+    if workspace.variant in _TAGGED_VARIANTS:
         counters = counters.view(-1, 32)
         generation = (counters[:, 0].to(torch.int64) & 0xFFFFFFFF) >> 8
         idle = (
@@ -376,8 +415,9 @@ def mega_mhc(
     pack can be shared across streams after the loading stream has finished.
     Pass an explicit workspace to own private scratch instead. Raw FP32 fn is
     not accepted; w_preshuffle_bf16 must be True, with or without a workspace.
-    H=5120/7168 on gfx950 uses stream dispatch for Sinkhorn=20; other
-    positive repeat counts use the generic stream kernel with the same pack.
+    H=5120/7168 on gfx950 and gfx1250 uses stream dispatch for Sinkhorn=20;
+    other positive repeat counts use the generic stream kernel with the same
+    pack.
 
     out_dtype="mxfp8" (gfx950 only) returns (norm, q, e8m0) in place of norm:
     BF16 norm (T, H), float8_e4m3fn q (T, H), and uint8 exponent bytes (T, H/32).
