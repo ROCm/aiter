@@ -1363,29 +1363,29 @@ class _SolAttnRecipe(NamedTuple):
             k.quantized,
             v.quantized,
         )
-        return operands, dict(
+        return operands, {
             # sol_prepare defaults BLOCK_N to the gfx950 tile. Pooling has to match the row
             # the launcher will pick or the pooled tensors are the wrong height outright, so take
             # it from the manifest the way mha_v4_sol() does.
-            BLOCK_M=tile_m,
-            BLOCK_N=tile_n,
+            "BLOCK_M": tile_m,
+            "BLOCK_N": tile_n,
             # A packed operand pools from its source and is quantized again, so it has no stored
             # scale to pool and passing one is an error.
-            k_scale=(
+            "k_scale": (
                 k.descale if self.k_carries_pooled_scale and packed is None else None
             ),
-            v_scale=(
+            "v_scale": (
                 v.descale
                 if self.v_carries_pooled_scale and self.v_packed is None
                 else None
             ),
-            k_source=k.source,
-            v_source=v.source,
-            k_packed_format=packed,
-            v_packed_format=self.v_packed,
-            force_block_mask=force_block_mask,
-            k_variance=k_variance,
-        )
+            "k_source": k.source,
+            "v_source": v.source,
+            "k_packed_format": packed,
+            "v_packed_format": self.v_packed,
+            "force_block_mask": force_block_mask,
+            "k_variance": k_variance,
+        }
 
     @staticmethod
     def dequantize(quantized, descale):
@@ -1630,12 +1630,11 @@ def _sol_attn_geometry_params(ids=None):
     ]
 
 
-# mha_v4_sol() quantizes for you, and knows the per-tensor recipes and the FP6-P MX ones; the
-# other MX rows go through mha_v4_packed with operands the caller quantized.
+# mha_v4_sol() quantizes for you and picks the recipe off the formats alone, so it serves every
+# recipe but MXFP8, whose formats are FP8's. MXFP8 goes through mha_v4_packed with operands the
+# caller quantized.
 _SOL_ATTN_RAW_RECIPES = [
-    r
-    for r in _SOL_ATTN_RECIPES
-    if not r.k_carries_pooled_scale or r.v_pack == AttentionPack.V_FOR_FP6_P
+    r for r in _SOL_ATTN_RECIPES if not r.k_carries_pooled_scale or r.packed_format
 ]
 
 
@@ -2304,13 +2303,13 @@ def test_mha_v4_sol_pooled_scales_must_match_the_scale_modes(recipe):
 
 def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
     dummy = torch.empty((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="f8f6 and f6f4 recipes only"):
+    with pytest.raises(NotImplementedError, match="f6f4 and f6f8 recipes only"):
         mha_v4_sol(
             dummy,
             dummy,
             dummy,
-            AttentionFormat.MXFP6,
-            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
             native_fp8_format(),
         )
 

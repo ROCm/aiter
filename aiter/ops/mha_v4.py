@@ -2134,7 +2134,9 @@ def mha_v4_sol(
     f6f4) runs the FP6-P rows. An MX operand's codes are not element addressable, so it is pooled
     from its BF16 input and quantized again with pooled scales of its own, and an MX Q/K routes on
     those BF16 means, which the packers' shared Q/K rotation leaves unchanged. f8f6's FP8 Q/K
-    routes and pools on its codes, as the per-tensor recipes do.
+    routes and pools on its codes, as the per-tensor recipes do, and so does f6f8's FP8 V, whose
+    per-channel descale survives pooling. MXFP8 shares FP8's formats and so is not reachable here;
+    it runs through mha_v4_packed.
 
     ``block_tile`` sets the routing and dispatch geometry, defaulting to the geometry this call's
     own operands dispatch at. A finer tile raises beta's resolution -- the threshold is per query
@@ -2174,17 +2176,21 @@ def mha_v4_sol(
         and _is_fp8_format(v_format)
     )
     is_bf16_qk_recipe = q_format == AttentionFormat.BF16 and k_format == q_format
-    # The FP6-P rows: MXFP4, MXFP6, f8f6 and f6f4.
-    is_mx_recipe = k_format == q_format and (q_format, v_format) in (
-        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
-        (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
-        (AttentionFormat.FP8, AttentionFormat.MXFP6),
-        (AttentionFormat.MXFP6, AttentionFormat.MXFP4),
+    # The rows with an MX operand: the FP6-P ones (MXFP4, MXFP6, f8f6 and f6f4) and f6f8.
+    is_mx_recipe = k_format == q_format and (
+        (q_format, v_format)
+        in (
+            (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+            (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+            (AttentionFormat.FP8, AttentionFormat.MXFP6),
+            (AttentionFormat.MXFP6, AttentionFormat.MXFP4),
+        )
+        or (q_format == AttentionFormat.MXFP6 and _is_fp8_format(v_format))
     )
     if not (is_fp8_recipe or is_i8fp8_recipe or is_bf16_qk_recipe or is_mx_recipe):
         raise NotImplementedError(
             "Sol-Attn MHA v4 currently has manifest rows for the per-tensor FP8, i8fp8, bf16, "
-            "bf16fp8, MXFP4, MXFP6, f8f6 and f6f4 recipes only; got "
+            "bf16fp8, MXFP4, MXFP6, f8f6, f6f4 and f6f8 recipes only; got "
             f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
         )
     if return_lse:
@@ -2295,10 +2301,11 @@ def _mha_v4_sol_mx(
     kv_range_tokens: int,
     sorted_dispatch: Optional[bool],  # noqa: UP045
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
-    """mha_v4_sol for a recipe with an MX V, on its FP6-P rows.
+    """mha_v4_sol for a recipe with an MX operand: the FP6-P rows, and f6f8.
 
     A packed MX Q/K routes on the BF16 Q and pools K from its source; an FP8 Q/K is addressable,
-    so it routes and pools on the stored codes as the per-tensor recipes do. V is always packed.
+    so it routes and pools on the stored codes as the per-tensor recipes do. An MX V is packed
+    FP6-P and pools from its source; f6f8's FP8 V is addressable and pools on its codes.
     """
     if softmax_scale is None:
         softmax_scale = 128**-0.5
@@ -2319,10 +2326,14 @@ def _mha_v4_sol_mx(
         q_quantized, q_descale = quantize_fp8_rotated(q)
         k_quantized, k_descale = quantize_fp8_rotated(k)
         q_routing, k_source, k_packed_format = q_quantized, None, None
+    v_pack = AttentionPack.V_FOR_FP6_P
     if v_format == AttentionFormat.MXFP4:
         v_raw, v_descale = quantize_v_mxfp4_fp6_p(v)
         v_quantized = mxfp4_v_view(v_raw, v_descale, k.shape[1])
         v_packed_format = "mxfp4_fp6_p"
+    elif _is_fp8_format(v_format):
+        v_quantized, v_descale = quantize_v_fp8(v)
+        v_packed_format, v_pack = None, AttentionPack.DEFAULT
     else:
         v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
         v_packed_format = "mxfp6_fp6_p"
@@ -2336,7 +2347,7 @@ def _mha_v4_sol_mx(
         BLOCK_N=tile_n,
         num_heads=q.shape[2],
         k_source=k_source,
-        v_source=v,
+        v_source=v if v_packed_format is not None else None,
         k_packed_format=k_packed_format,
         v_packed_format=v_packed_format,
     )
@@ -2365,5 +2376,5 @@ def _mha_v4_sol_mx(
         block_tile=block_tile,
         kv_range_tokens=kv_range_tokens,
         sorted_dispatch=sorted_dispatch,
-        v_pack=AttentionPack.V_FOR_FP6_P,
+        v_pack=v_pack,
     )
