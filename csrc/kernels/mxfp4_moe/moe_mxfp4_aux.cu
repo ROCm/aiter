@@ -289,6 +289,7 @@ void mxfp4_moe_scatter_reduce_kernel(
     HipDeviceGuard guard(flat_out.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(out.size(0));
+    const int max_sorted = static_cast<int>(flat_out.size(0));
 
     // nt_hints on only at BM=128: large M is DRAM-bound, smaller M fits L2.
     const int nt = (MB >= 128) ? 1 : 0;
@@ -296,7 +297,7 @@ void mxfp4_moe_scatter_reduce_kernel(
     const std::string key = "aux_scatter_H" + std::to_string(D_HIDDEN)
         + "_TOPK" + std::to_string(TOPK) + "_NT" + std::to_string(nt);
     aux_find(scatter_reduce_lookup(), key, "mxfp4_moe_scatter_reduce")(
-        stream, M,
+        stream, M, max_sorted,
         flat_out.data_ptr(),
         static_cast<int32_t*>(reverse_sorted.data_ptr()),
         static_cast<float*>(sorted_weights.data_ptr()),
@@ -320,13 +321,14 @@ void mxfp4_moe_scatter_reduce_q_kernel(
     HipDeviceGuard guard(flat_out_q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     const int M = static_cast<int>(out.size(0));
+    const int max_sorted = static_cast<int>(flat_out_q.size(0));
 
     const int nt = (MB >= 128) ? 1 : 0;
 
     const std::string key = "aux_scatterq_H" + std::to_string(D_HIDDEN)
         + "_TOPK" + std::to_string(TOPK) + "_NT" + std::to_string(nt);
     aux_find(scatter_reduce_q_lookup(), key, "mxfp4_moe_scatter_reduce_q")(
-        stream, M,
+        stream, M, max_sorted,
         flat_out_q.data_ptr(), flat_out_scale.data_ptr(),
         static_cast<int32_t*>(reverse_sorted.data_ptr()),
         static_cast<float*>(sorted_weights.data_ptr()),
