@@ -864,6 +864,7 @@ __device__ inline void write_fac(char* smem, typename T::D_ACC fac, int warp_id,
 
 template <class T,
           bool KEEP_P,
+          bool CompilerMFMA,
           class UV,
           class VP,
           class VO,
@@ -954,7 +955,11 @@ __device__ inline void compute_pv(char* smem,
                 else
                     return p_oth[r.value - 1][ks];
             }();
-            o_tiles[ot] = (pv_vgpr(p_op, v_op, o_tiles[ot]));
+            // Expose MFMA dependencies to LLVM for checked split segments.
+            if constexpr(CompilerMFMA)
+                o_tiles[ot] = mfma_pv(p_op, v_op, o_tiles[ot]);
+            else
+                o_tiles[ot] = pv_vgpr(p_op, v_op, o_tiles[ot]);
             if constexpr(REFILL && r.value == 0)
                 load_v_tile<T, step + V_DEPTH, 1>(smem, u_rv, v_lane_off, v_v);
             if constexpr(REFILL && r.value > 0)
@@ -1308,7 +1313,7 @@ __device__ __forceinline__ int prepare_q_direct(
     return static_cast<int>(step_codes);
 }
 
-template <class T, class VO>
+template <class T, class VO, bool OneGroup = false>
 __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastParams& a,
                                                const VO& v_o,
                                                int warp,
@@ -1347,8 +1352,8 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
                 });
             }
         }
-        static_for<PV_GROUPS<T>>([&](auto r) {
-            const int head_off   = (warp + r.value) % PV_GROUPS<T> * 16 * 512;
+        static_for<OneGroup ? 1 : PV_GROUPS<T>>([&](auto r) {
+            const int head_off   = OneGroup ? 0 : (warp + r.value) % PV_GROUPS<T> * 16 * 512;
             constexpr int base   = (r.value * NC + c.value) * VEC;
             auto buf             = cast<bf16_t>(slice(v_o, number<base>{}, number<base + VEC>{}));
             auto* p              = reinterpret_cast<u32_t*>(&buf);
@@ -1396,8 +1401,8 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
     if(lane < T::W_M)
     {
         const int64_t head_base = int64_t(token) * a.H + h_start + lane;
-        static_for<PV_GROUPS<T>>([&](auto r) {
-            const int head_group = (warp + r.value) % PV_GROUPS<T> * T::W_M;
+        static_for<OneGroup ? 1 : PV_GROUPS<T>>([&](auto r) {
+            const int head_group = OneGroup ? 0 : (warp + r.value) % PV_GROUPS<T> * T::W_M;
             auto* dst            = a.output_s_ptr + (head_base + head_group) * 16 + warp * NC;
             if((reinterpret_cast<uintptr_t>(a.output_s_ptr) & 3) == 0)
                 *reinterpret_cast<uint32_t*>(dst) = scale_words[r.value];
@@ -1410,7 +1415,46 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
 
 // ------------------------------------------------------------------------------------ driver
 
-template <class T, bool CHECKED, bool Extend, bool CONTINUOUS, class QI, class QR>
+// A split partitions the concatenated prefix/extend tile lists. Derive ranges
+// from live device CSR on every launch, including graph replay. Each physical
+// row and its independent data/scale strides retain their original meaning.
+struct CsrRange
+{
+    int begin, end;
+};
+template <class T, bool Split>
+__device__ __forceinline__ CsrRange csr_range(const FusedNormRopeAttnRopeCastParams& a,
+                                              bool extend,
+                                              int token)
+{
+    auto read = [&](bool e) {
+        const int* ptr = e ? a.kv_indptr_extend : a.kv_indptr_prefix;
+        const int cap  = e ? a.extend_capacity : a.prefix_capacity;
+        if(!ptr)
+            return CsrRange{0, 0};
+        const int begin = min(cap, max(0, ptr[token]));
+        return CsrRange{begin, max(begin, min(cap, ptr[token + 1]))};
+    };
+    if constexpr(!Split)
+        return read(extend);
+    else
+    {
+        const auto p = read(false), e = read(true);
+        const int64_t pt    = (int64_t(p.end) - p.begin + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
+        const int64_t et    = (int64_t(e.end) - e.begin + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
+        const int64_t first = (pt + et) * blockIdx.z / a.num_splits;
+        const int64_t last  = (pt + et) * (blockIdx.z + 1) / a.num_splits;
+        const auto range    = extend ? e : p;
+        const int64_t shift = extend ? pt : 0;
+        const int64_t size  = int64_t(range.end) - range.begin;
+        const auto clamp    = [&](int64_t tile) {
+            return int(range.begin + min(size, max(int64_t(0), tile - shift) * T::KV_TILE_SIZE));
+        };
+        return {clamp(first), clamp(last)};
+    }
+}
+
+template <class T, bool CHECKED, bool Extend, bool CONTINUOUS, bool Split, class QI, class QR>
 __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCastParams& kargs,
                                                   const void* kv_ptr,
                                                   const void* kv_scale_ptr,
@@ -1433,10 +1477,9 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
 
     if(!kv_indptr)
         return;
-    const int cap            = Extend ? kargs.extend_capacity : kargs.prefix_capacity;
-    const int page_idx_begin = min(cap, max(0, kv_indptr[q_token_idx]));
-    const int valid_kv_len =
-        max(page_idx_begin, min(cap, kv_indptr[q_token_idx + 1])) - page_idx_begin;
+    const auto range         = csr_range<T, Split>(kargs, Extend, q_token_idx);
+    const int page_idx_begin = range.begin;
+    const int valid_kv_len   = range.end - range.begin;
     // The validated strided path can carry the pipeline across the source boundary.
     // The checked and legacy paths retain their independent segment traversal.
     constexpr bool merge_sources = CONTINUOUS && T::CACHE_MODE == 0 && !CHECKED && !Extend;
@@ -1445,10 +1488,9 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
     {
         if(kargs.kv_indptr_extend)
         {
-            extend_begin = min(kargs.extend_capacity, max(0, kargs.kv_indptr_extend[q_token_idx]));
-            extend_len   = max(extend_begin,
-                             min(kargs.extend_capacity, kargs.kv_indptr_extend[q_token_idx + 1])) -
-                         extend_begin;
+            const auto erange = csr_range<T, Split>(kargs, true, q_token_idx);
+            extend_begin      = erange.begin;
+            extend_len        = erange.end - erange.begin;
         }
     }
     const int prefix_tiles = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
@@ -1693,7 +1735,7 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
                 if constexpr(t == PV_TAIL_STEPS - 1)
                     deq_prefetch(number<CUR>{});
             };
-            compute_pv<T, merge_sources>(
+            compute_pv<T, merge_sources, Split && CHECKED>(
                 smem,
                 u_rv,
                 v_lane_off,
@@ -1739,7 +1781,7 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
         write_fac<T>(smem, softmax_finish<T>(st, m_row, l_row), warp_id, lane_id);
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
-        compute_pv<T, merge_sources>(
+        compute_pv<T, merge_sources, Split && CHECKED>(
             smem,
             u_rv,
             v_lane_off,
@@ -1786,7 +1828,7 @@ __device__ __forceinline__ void attention_segment(const FusedNormRopeAttnRopeCas
 } // namespace fused_norm_rope_attn_rope_cast_fwd
 
 // Shared device implementation for the source-compiled kernel specializations.
-template <class Traits, bool CHECKED, bool CONTINUOUS = false>
+template <class Traits, bool CHECKED, bool CONTINUOUS = false, bool Split = false>
 __device__ __forceinline__ void
 fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, char* smem)
 {
@@ -1865,48 +1907,66 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     D_ACC l_row    = D_ACC(0.0f);
     D_ACC true_max = -numeric_limits<D_ACC>::infinity();
 
-    attention_segment<T, CHECKED, false, CONTINUOUS>(kargs,
-                                                     kargs.unified_kv_ptr,
-                                                     kargs.unified_kv_scale_ptr,
-                                                     kargs.kv_indptr_prefix,
-                                                     kargs.kv_indices_prefix,
-                                                     q_token_idx,
-                                                     smem,
-                                                     issue_q,
-                                                     read_q,
-                                                     v_q,
-                                                     scale_q,
-                                                     v_o,
-                                                     m_row,
-                                                     l_row,
-                                                     temperature_scale,
-                                                     true_max);
+    attention_segment<T, CHECKED, false, CONTINUOUS, Split>(kargs,
+                                                            kargs.unified_kv_ptr,
+                                                            kargs.unified_kv_scale_ptr,
+                                                            kargs.kv_indptr_prefix,
+                                                            kargs.kv_indices_prefix,
+                                                            q_token_idx,
+                                                            smem,
+                                                            issue_q,
+                                                            read_q,
+                                                            v_q,
+                                                            scale_q,
+                                                            v_o,
+                                                            m_row,
+                                                            l_row,
+                                                            temperature_scale,
+                                                            true_max);
     // The validated strided path has already consumed both sources in one pipeline.
     if constexpr(!CONTINUOUS || T::CACHE_MODE != 0 || CHECKED)
     {
         __builtin_amdgcn_s_barrier();
-        attention_segment<T, CHECKED, true, CONTINUOUS>(kargs,
-                                                        kargs.kv_ptr,
-                                                        kargs.kv_scale_ptr,
-                                                        kargs.kv_indptr_extend,
-                                                        kargs.kv_indices_extend,
-                                                        q_token_idx,
-                                                        smem,
-                                                        issue_q,
-                                                        read_q,
-                                                        v_q,
-                                                        scale_q,
-                                                        v_o,
-                                                        m_row,
-                                                        l_row,
-                                                        temperature_scale,
-                                                        true_max);
+        attention_segment<T, CHECKED, true, CONTINUOUS, Split>(kargs,
+                                                               kargs.kv_ptr,
+                                                               kargs.kv_scale_ptr,
+                                                               kargs.kv_indptr_extend,
+                                                               kargs.kv_indices_extend,
+                                                               q_token_idx,
+                                                               smem,
+                                                               issue_q,
+                                                               read_q,
+                                                               v_q,
+                                                               scale_q,
+                                                               v_o,
+                                                               m_row,
+                                                               l_row,
+                                                               temperature_scale,
+                                                               true_max);
     }
 
     // Recomputed so that it is not live across the main loop.
     int lane = lane_id;
     asm volatile("" : "+v"(lane));
     const int head = h_block_start + warp_id * T::Q_TILE_SIZE + lane % T::W_M;
+    if constexpr(Split)
+    {
+        // Store FP32 O as coalesced vectors: [register chunk][thread][4].
+        // The last four floats per head hold m, l, true max and padding.
+        float* partial =
+            kargs.partial_ptr +
+            ((int64_t(q_token_idx) * kargs.num_splits + blockIdx.z) * kargs.H + h_block_start) *
+                516;
+        static_for<O_ELEMS<T> / 4>([&](auto i) {
+            *reinterpret_cast<vector_t<float, 4>*>(partial + i.value * 256 * 4 + threadIdx.x * 4) =
+                slice(v_o, number<i.value * 4>{}, number<i.value * 4 + 4>{});
+        });
+        if(lane_id < T::W_M)
+            *reinterpret_cast<vector_t<float, 4>*>(partial + 64 * 512 +
+                                                   (head - h_block_start) * 4) =
+                vector_t<float, 4>{m_row, l_row, true_max, 0.0f};
+        return;
+    }
     // lse: natural log, without the sink, +inf for a token without rows.
     if(kargs.lse_ptr != nullptr && lane_id < T::W_M && head < kargs.H)
     {
@@ -1944,7 +2004,7 @@ fused_norm_rope_attn_rope_cast_fwd_impl(FusedNormRopeAttnRopeCastParams kargs, c
     fused_epilogue<T>(kargs, v_o, warp_id, lane_id, q_token_idx, h_block_start);
 }
 
-template <class T>
+template <class T, bool Split = false>
 __device__ __forceinline__ bool indices_valid(const FusedNormRopeAttnRopeCastParams& a)
 {
     __shared__ int invalid_wave[4];
@@ -1954,11 +2014,12 @@ __device__ __forceinline__ bool indices_valid(const FusedNormRopeAttnRopeCastPar
     {
         // Validate the independent row spaces before either tile loop can use them.
         // Read four contiguous indices per lane when the CSR range is aligned.
-        auto validate = [&](const int* ptr, const int* ids, int cap, int rows) {
+        auto validate = [&](const int* ptr, const int* ids, int cap, int rows, bool extend) {
             if(!ptr)
                 return;
-            const int begin = min(cap, max(0, ptr[t]));
-            const int end   = max(begin, min(cap, ptr[t + 1]));
+            const auto range =
+                fused_norm_rope_attn_rope_cast_fwd::csr_range<T, Split>(a, extend, t);
+            const int begin = range.begin, end = range.end;
             if(begin == end)
                 return;
             if((reinterpret_cast<uintptr_t>(ids + begin) & 15) == 0)
@@ -1981,8 +2042,8 @@ __device__ __forceinline__ bool indices_valid(const FusedNormRopeAttnRopeCastPar
                 for(uint32_t i = uint32_t(begin) + threadIdx.x; i < uint32_t(end); i += 256)
                     valid &= uint32_t(ids[i]) < uint32_t(rows);
         };
-        validate(a.kv_indptr_prefix, a.kv_indices_prefix, a.prefix_capacity, a.total_pages);
-        validate(a.kv_indptr_extend, a.kv_indices_extend, a.extend_capacity, a.total_tokens);
+        validate(a.kv_indptr_prefix, a.kv_indices_prefix, a.prefix_capacity, a.total_pages, false);
+        validate(a.kv_indptr_extend, a.kv_indices_extend, a.extend_capacity, a.total_tokens, true);
     }
     else
     {

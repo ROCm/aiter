@@ -284,7 +284,9 @@ void fused_norm_rope_attn_rope_cast_fwd(const aiter_tensor_t& q,
                                         const std::optional<aiter_tensor_t>& debug_out,
                                         bool q_is_rotated,
                                         bool q_norm,
-                                        float norm_eps)
+                                        float norm_eps,
+                                        int num_splits,
+                                        const std::optional<aiter_tensor_t>& workspace)
 {
     aiter_detail::AiterThrowGuard errors;
     AITER_CHECK(q.is_gpu() && q.dim() == 3 && q.size(0) <= INT_MAX,
@@ -350,26 +352,33 @@ void fused_norm_rope_attn_rope_cast_fwd(const aiter_tensor_t& q,
         check_tensor(*attn_sink, "attn_sink", AITER_DTYPE_fp32, {h}, device, 4);
     if(debug_out)
         check_tensor(*debug_out, "debug_out", AITER_DTYPE_fp32, {t, h, 512}, device, 16);
-    const aiter_tensor_t* outputs[] = {&out,
+    AITER_CHECK(num_splits >= 1 && num_splits <= 32, "num_splits must be in [1,32]");
+    AITER_CHECK(bool(workspace) == (num_splits > 1),
+                "split decode requires workspace, single split must omit it");
+    if(workspace)
+        check_tensor(
+            *workspace, "workspace", AITER_DTYPE_fp32, {t, num_splits, h, 516}, device, 16);
+    const aiter_tensor_t* outputs[] = {workspace ? &*workspace : nullptr,
+                                       &out,
                                        &out_scale,
                                        max_logits ? &*max_logits : nullptr,
                                        lse ? &*lse : nullptr,
                                        debug_out ? &*debug_out : nullptr};
-    const aiter_tensor_t* inputs[]  = {&q,
+    const aiter_tensor_t* inputs[] = {&q,
                                       q_scale ? &*q_scale : nullptr,
-                                       &unified_kv,
-                                       &unified_kv_scale,
-                                       &kv_indices_prefix,
-                                       &kv_indptr_prefix,
+                                      &unified_kv,
+                                      &unified_kv_scale,
+                                      &kv_indices_prefix,
+                                      &kv_indptr_prefix,
                                       kv ? &*kv : nullptr,
                                       kv_scale ? &*kv_scale : nullptr,
                                       kv_indices_extend ? &*kv_indices_extend : nullptr,
                                       kv_indptr_extend ? &*kv_indptr_extend : nullptr,
-                                       &cos,
-                                       &sin,
-                                       &positions,
+                                      &cos,
+                                      &sin,
+                                      &positions,
                                       attn_sink ? &*attn_sink : nullptr};
-    for(size_t i = 0; i < 5; ++i)
+    for(size_t i = 0; i < 6; ++i)
     {
         for(const auto* input : inputs)
             AITER_CHECK(!overlaps(outputs[i], input), "outputs must not overlap inputs");
@@ -424,6 +433,8 @@ void fused_norm_rope_attn_rope_cast_fwd(const aiter_tensor_t& q,
     a.softmax_scale = softmax_scale;
     a.q_norm        = q_norm;
     a.norm_eps      = norm_eps;
+    a.num_splits    = num_splits;
+    a.partial       = workspace ? static_cast<float*>(workspace->data_ptr()) : nullptr;
     if(!launch_fused_norm_rope_attn_rope_cast_fwd(a, !q_is_rotated, aiter::getCurrentHIPStream()))
         HIP_CALL(
             launch_fused_norm_rope_attn_rope_cast(&a, !q_is_rotated, aiter::getCurrentHIPStream()));

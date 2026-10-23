@@ -31,7 +31,9 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("debug_out"),
           py::arg("q_is_rotated"),
           py::arg("q_norm"),
-          py::arg("norm_eps"));
+          py::arg("norm_eps"),
+          py::arg("num_splits") = 1,
+          py::arg("workspace")  = py::none());
     m.def("fused_norm_rope_attn_rope_cast_legacy_fwd",
           &fused_norm_rope_attn_rope_cast_legacy_fwd,
           py::arg("q"),

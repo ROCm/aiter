@@ -54,4 +54,6 @@ void fused_norm_rope_attn_rope_cast_fwd(const aiter_tensor_t& q,
                                         const std::optional<aiter_tensor_t>& debug_out,
                                         bool q_is_rotated,
                                         bool q_norm,
-                                        float norm_eps);
+                                        float norm_eps,
+                                        int num_splits,
+                                        const std::optional<aiter_tensor_t>& workspace);

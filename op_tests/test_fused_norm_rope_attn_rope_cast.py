@@ -1985,3 +1985,216 @@ def test_two_source_index_storage_offset(heads, mode, offset, valid_indices):
         torch.testing.assert_close(
             out.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("layout", ["interleaved", "separate", "padded"])
+@pytest.mark.parametrize("mode", ["raw", "rotated", "prepared", "norm"])
+@pytest.mark.parametrize("splits", [2, 7])
+@pytest.mark.parametrize("valid_indices", [False, True])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_fp8_decode_dense(heads, layout, mode, splits, valid_indices, with_sink):
+    kwargs, (expected, mx, lse) = two_source_inputs(
+        heads, layout, mode, True, with_sink, valid_indices
+    )
+    debug = torch.empty_like(kwargs["q"], dtype=torch.float32)
+    out = fused_v41(
+        **kwargs,
+        is_decode=True,
+        num_splits=splits,
+        debug_out=debug,
+        max_logits=torch.empty_like(mx),
+        lse=torch.empty_like(lse),
+    )
+    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
+    assert float((debug - expected).norm() / expected.norm()) < 0.005
+    assert float((dequantize(*out[:2]) - expected).norm() / expected.norm()) < 0.035
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("splits", [1, 3, 32])
+@pytest.mark.parametrize("sources", ["both", "prefix", "extend", "empty"])
+def test_fp8_decode_ring_view(heads, splits, sources):
+    q = torch.zeros(1, heads, 512, device="cuda", dtype=torch.float8_e4m3fn)
+    qs = torch.full((1, heads, 16), 127, device="cuda", dtype=torch.uint8)
+    pv, ps = quantize_fp8(torch.full((97, 512), 2.0, device="cuda"))
+    pool = pack_rows(pv, ps)
+    ring_values = (1 + torch.arange(71, device="cuda") % 8).float()
+    ev, es = quantize_fp8(ring_values[:, None].expand(71, 512))
+    ring = pack_rows(ev, es)[7:]
+    pi = torch.tensor([2, 90], device="cuda", dtype=torch.int32)
+    ei = torch.arange(59, 99, device="cuda", dtype=torch.int32) % 64
+    pn = pi.numel() if sources in ("both", "prefix") else 0
+    en = ei.numel() if sources in ("both", "extend") else 0
+    pp = torch.tensor([0, pn], device="cuda", dtype=torch.int32)
+    ep = torch.tensor([0, en], device="cuda", dtype=torch.int32)
+    debug = torch.empty(1, heads, 512, device="cuda")
+    mx, lse = torch.empty(1, heads, device="cuda"), torch.empty(1, heads, device="cuda")
+    kwargs = {
+        "q": q,
+        "q_scale": qs,
+        "unified_kv": pool[:, :512].view(torch.float8_e4m3fn),
+        "unified_kv_scale": pool[:, 512:],
+        "kv_indices_prefix": pi,
+        "kv_indptr_prefix": pp,
+        "kv": ring[:, :512].view(torch.float8_e4m3fn),
+        "kv_scale": ring[:, 512:],
+        "kv_indices_extend": ei,
+        "kv_indptr_extend": ep,
+        "cos": torch.ones(1, 32, device="cuda", dtype=torch.bfloat16),
+        "sin": torch.zeros(1, 32, device="cuda", dtype=torch.bfloat16),
+        "positions": torch.zeros(1, device="cuda", dtype=torch.int32),
+        "is_decode": True,
+        "num_splits": splits,
+        "debug_out": debug,
+        "max_logits": mx,
+        "lse": lse,
+    }
+    fused_v41(**kwargs)
+    expected = (2 * pn + ring_values[7:][ei[:en].long()].sum()) / max(1, pn + en)
+    torch.testing.assert_close(
+        debug, torch.full_like(debug, expected.bfloat16().float()), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        mx, torch.full_like(mx, 0 if pn + en else -torch.inf), rtol=0, atol=0
+    )
+    expected_lse = (
+        torch.log(torch.tensor(float(pn + en), device="cuda")) if pn + en else torch.inf
+    )
+    torch.testing.assert_close(
+        lse, torch.full_like(lse, expected_lse), rtol=1e-4, atol=3e-5
+    )
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("mode", ["raw", "prepared", "norm"])
+def test_fp8_decode_graph_replay(heads, mode):
+    kwargs, (_, mx, lse) = two_source_inputs(heads, "padded", mode, True, True, True)
+    t = kwargs["q"].shape[0]
+    kwargs.update(
+        is_decode=True,
+        num_splits=4,
+        workspace=torch.empty(t, 4, heads, 516, device="cuda"),
+        out=torch.empty(t, heads // 8, 4096, device="cuda", dtype=torch.float8_e4m3fn),
+        out_scale=torch.empty(
+            t, heads // 8, 128, device="cuda", dtype=torch.float8_e8m0fnu
+        ),
+        max_logits=torch.empty_like(mx),
+        lse=torch.empty_like(lse),
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fused_v41(**kwargs)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            fused_v41(**kwargs)
+        for empty in [False, True, False]:
+            kwargs["kv_indices_prefix"].fill_(-1 if empty else 4)
+            kwargs["kv_indices_extend"].fill_(-1 if empty else 8)
+            kwargs["kv_indptr_prefix"][1:-1].zero_()
+            kwargs["kv_indptr_extend"][1:-1].zero_()
+            expected = tuple(x.clone() for x in fused_v41(**kwargs))
+            kwargs["workspace"].fill_(torch.nan)
+            graph.replay()
+            for actual, ref in zip(
+                (
+                    kwargs["out"],
+                    kwargs["out_scale"],
+                    kwargs["max_logits"],
+                    kwargs["lse"],
+                ),
+                expected,
+            ):
+                torch.testing.assert_close(
+                    actual.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
+                )
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "phase",
+        "count",
+        "fraction",
+        "workspace_shape",
+        "workspace_dtype",
+        "workspace_overlap",
+        "single_workspace",
+    ],
+)
+def test_fp8_decode_contract(bad):
+    kwargs, _ = two_source_inputs(mode="prepared")
+    t, h, _ = kwargs["q"].shape
+    kwargs.update(is_decode=True, num_splits=2)
+    if bad == "phase":
+        kwargs["is_decode"] = False
+    elif bad == "count":
+        kwargs["num_splits"] = 33
+    elif bad == "fraction":
+        kwargs["num_splits"] = 1.5
+    elif bad == "workspace_shape":
+        kwargs["workspace"] = torch.empty(t, 2, h, 512, device="cuda")
+    elif bad == "workspace_dtype":
+        kwargs["workspace"] = torch.empty(
+            t, 2, h, 516, device="cuda", dtype=torch.bfloat16
+        )
+    elif bad == "workspace_overlap":
+        kwargs["workspace"] = torch.empty(t, 2, h, 516, device="cuda")
+        kwargs["debug_out"] = (
+            kwargs["workspace"].flatten()[: t * h * 512].view(t, h, 512)
+        )
+    else:
+        kwargs["num_splits"] = 1
+        kwargs["workspace"] = torch.empty(t, 1, h, 516, device="cuda")
+    with pytest.raises((ValueError, RuntimeError)):
+        fused_v41(**kwargs)
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("mode", ["raw", "prepared", "norm"])
+@pytest.mark.parametrize("valid_indices", [False, True])
+def test_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices):
+    kwargs, (expected, mx, lse) = two_source_inputs(
+        heads, "padded", mode, True, False, valid_indices
+    )
+    debug = torch.empty_like(expected)
+    # Automatic dispatch must handle spare index-buffer capacity and ragged rows.
+    out = fused_v41(
+        **kwargs,
+        is_decode=True,
+        debug_out=debug,
+        max_logits=torch.empty_like(mx),
+        lse=torch.empty_like(lse),
+    )
+    torch.testing.assert_close(debug, expected, rtol=0.02, atol=0.008)
+    torch.testing.assert_close(out[2], mx, rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(out[3], lse, rtol=1e-4, atol=3e-5)
+    # More splits than live tiles must overwrite every partial, including empties.
+    t = kwargs["q"].shape[0]
+    workspace = torch.full((t, 32, heads, 516), torch.nan, device="cuda")
+    for ids in (kwargs["kv_indices_prefix"], kwargs["kv_indices_extend"]):
+        ids.fill_(-1)
+    for sink in (
+        None,
+        torch.full((heads,), -torch.inf, device="cuda"),
+        torch.full((heads,), 100.0, device="cuda"),
+    ):
+        kwargs["attn_sink"] = sink
+        workspace.fill_(torch.nan)
+        out = fused_v41(
+            **kwargs,
+            is_decode=True,
+            num_splits=32,
+            workspace=workspace,
+            debug_out=debug,
+            max_logits=torch.empty_like(mx),
+            lse=torch.empty_like(lse),
+        )
+        assert torch.count_nonzero(debug) == 0
+        assert torch.count_nonzero(dequantize(*out[:2])) == 0
+        assert torch.isneginf(out[2]).all()
+        assert torch.isposinf(out[3]).all()

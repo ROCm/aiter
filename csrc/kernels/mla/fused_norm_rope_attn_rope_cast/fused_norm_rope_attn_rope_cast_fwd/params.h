@@ -60,9 +60,11 @@ struct FusedNormRopeAttnRopeCastParams
     int extend_capacity;
     int stride_kv_extend;       // independent extend data row stride in bytes
     int stride_kv_scale_extend; // independent extend scale row stride in bytes
+    float* partial_ptr;
+    int num_splits;
 };
 
-static_assert(sizeof(FusedNormRopeAttnRopeCastParams) == 304);
+static_assert(sizeof(FusedNormRopeAttnRopeCastParams) == 320);
 static_assert(offsetof(FusedNormRopeAttnRopeCastParams, lse_ptr) == 64);
 static_assert(offsetof(FusedNormRopeAttnRopeCastParams, kv_indices_extend) == 96);
 static_assert(offsetof(FusedNormRopeAttnRopeCastParams, N) == 104);

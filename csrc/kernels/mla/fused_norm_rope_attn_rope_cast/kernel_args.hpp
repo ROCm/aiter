@@ -27,6 +27,8 @@ struct FusedNormRopeAttnRopeCastArgs
     float norm_eps;
     Fp8CacheLayout cache;
     Fp8CacheLayout extend_cache;
+    int num_splits;
+    float* partial;
     template <int PageSize>
     __device__ __forceinline__ const void* prefix_at(int begin) const
     {

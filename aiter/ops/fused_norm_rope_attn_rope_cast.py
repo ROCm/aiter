@@ -272,8 +272,10 @@ def fused_norm_rope_attn_rope_cast_fwd(
     q_is_rotated: bool,
     q_norm: bool,
     norm_eps: float,
+    num_splits: int = 1,
+    workspace: torch.Tensor | None = None,
 ) -> None:
-    """Write outputs for the two-source FP8 interface."""
+    """Write outputs for the two-source FP8 interface, optionally with split-KV."""
 
 
 def fused_norm_rope_attn_rope_cast(
@@ -302,6 +304,9 @@ def fused_norm_rope_attn_rope_cast(
     q_is_rotated: bool = True,
     q_norm: bool = False,
     norm_eps: float = 1e-6,
+    is_decode: bool = False,
+    num_splits: int = 0,
+    workspace: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fuse Q preparation, two-source FP8 attention and output RoPE/quantization.
 
@@ -343,6 +348,19 @@ def fused_norm_rope_attn_rope_cast(
     empty rows produce zero out, -inf max and +inf LSE. ``debug_out`` is an
     optional FP32 ``[T,H,512]`` buffer after inverse RoPE, before quantization.
 
+    Set ``is_decode=True`` for decode dispatch. ``num_splits=0`` chooses a
+    split count from host-visible batch and index capacities, without reading
+    device CSR pointers. Explicit counts 1..32 support tuning. Counts above
+    one launch FP8 partial attention followed by FP32 reduction and the fused
+    output transform. Q preparation remains fused into each partial kernel.
+    Split attention changes FP32 summation order. Sink is applied once during
+    reduction; max/LSE still exclude it. Prefill keeps the existing dispatch.
+
+    Optional ``workspace`` is disjoint, contiguous FP32 ``[T,num_splits,H,516]``
+    scratch with opaque contents. It holds partial accumulators, not KV.
+    When omitted it is allocated for split decode; reuse it and a fixed split
+    count for allocation-free calls. No workspace is used with one split.
+
     All tensors must be on q.device. Output buffers must be contiguous and
     disjoint from inputs and each other. Warm up before graph capture.
     The previous pool/tagged-address interface is available explicitly as
@@ -355,6 +373,33 @@ def fused_norm_rope_attn_rope_cast(
     t, h, d = q.shape
     if h not in (64, 128) or d != 512:
         raise ValueError("two-source FP8 attention requires H64/H128 and D512")
+    if type(is_decode) is not bool:
+        raise ValueError("is_decode must be bool")
+    if type(num_splits) is not int or not 0 <= num_splits <= 32:
+        raise ValueError("num_splits must be an integer in [0,32]")
+    if not is_decode and (num_splits not in (0, 1) or workspace is not None):
+        raise ValueError("split workspace and num_splits > 1 require is_decode=True")
+    if num_splits == 0:
+        num_splits = 1
+        if is_decode and t:
+            capacity = kv_indices_prefix.numel()
+            if kv_indices_extend is not None:
+                capacity += kv_indices_extend.numel()
+            limit = min(
+                32, max(1, 256 // (t * (h // 64))), max(1, capacity // (t * 256))
+            )
+            # Large grids already expose enough parallelism for short lists;
+            # partial-output traffic then costs more than the saved KV loop.
+            if t * (h // 64) >= 128 and capacity < t * 1024:
+                limit = 1
+            while num_splits * 2 <= limit:
+                num_splits *= 2
+    if num_splits > 1 and workspace is None:
+        workspace = torch.empty(
+            (t, num_splits, h, 516), device=q.device, dtype=torch.float32
+        )
+    if num_splits == 1 and workspace is not None:
+        raise ValueError("workspace requires num_splits > 1")
     if out is None:
         out = torch.empty((t, h // 8, 4096), device=q.device, dtype=torch.float8_e4m3fn)
     if out_scale is None:
@@ -386,5 +431,7 @@ def fused_norm_rope_attn_rope_cast(
             q_is_rotated,
             q_norm,
             float(norm_eps),
+            num_splits,
+            workspace,
         )
     return out, out_scale, max_logits, lse
