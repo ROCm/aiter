@@ -185,6 +185,9 @@ def fused_qkv_split_qk_norm_rope_cache(
             f"SHUFFLE layout needs block_size ({block_size}) and head_dim "
             f"({head_dim}) divisible by x={shuffle_x}."
         )
+    assert not shuffle or (
+        key_cache[0].is_contiguous() and value_cache[0].is_contiguous()
+    ), "SHUFFLE layout needs each cache block dense ([block_size, kvh, D] contiguous)"
 
     assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
     if q_out is None:
