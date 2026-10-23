@@ -12,8 +12,8 @@ import pytest
 import torch
 
 import aiter
-import aiter.ops.mha as mha
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops import mha
 
 
 def _ref_varlen(q, k, v, cu_q, cu_k, causal, sink, scale):
