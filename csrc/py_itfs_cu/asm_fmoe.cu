@@ -6,6 +6,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <memory>
+#include <numeric>
 #include <tuple>
 
 struct __attribute__((packed)) KernelArgs
@@ -75,6 +76,7 @@ class FMoeKernel
     uint32_t sub_GU             = 512;
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
+    uint32_t tgs_align          = 1;
     const char* name            = nullptr;
     // flat_mode: 0 = host-sorted, 1 = flat one-token-per-TG grid, 2 = emsort persistent grid
     int flat_mode = 0;
@@ -84,10 +86,12 @@ class FMoeKernel
                const char* hsaco,
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0,
-               int flat_mode               = 0) : kernel(name, hsaco)
+               int flat_mode               = 0,
+               uint32_t tgs_align          = 1) : kernel(name, hsaco)
     {
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
+        this->tgs_align          = std::max(tgs_align, 1u);
         this->name               = name;
         this->flat_mode          = flat_mode;
     };
@@ -181,14 +185,19 @@ class FMoeKernel
         args.eSMQs     = stride_expert_SMTDQN;
         args.topk      = topk;
         args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
-        args.total_tgs = this->num_persistent_tgs / args.ps_deno * args.ps_deno;
+        // Kernels that remap workgroups across XCDs need total_tgs to also be a
+        // multiple of tgs_align (the XCD count), or the remap skips work.
+        const uint32_t tgs_unit = std::lcm(args.ps_deno, this->tgs_align);
+        args.total_tgs          = this->num_persistent_tgs / tgs_unit * tgs_unit;
 
         int bdx;
         int gdx;
         int gdy;
         int gdz;
         // flat_mode==1: one-TG-per-(token,topk) grid; no host moe_sort.
-        // flat_mode==2: emsort persistent grid; no host moe_sort, same grid as ps.
+        // flat_mode==2: EMSORT consumes raw topk and uses the configured persistent
+        // TG pool as a 2D grid: hidden slices on X, expert owners on Y. The shader
+        // derives expert ownership from tgy and loops over its compacted queue.
         if(this->flat_mode == 1)
         {
             bdx = 256;
@@ -196,12 +205,42 @@ class FMoeKernel
             gdy = static_cast<int>(topk);
             gdz = static_cast<int>(token_cnt);
         }
+        else if(this->flat_mode == 2)
+        {
+            AITER_CHECK(static_cast<uint64_t>(token_cnt) * topk <= 512,
+                        __func__,
+                        ": EMSORT supports token_cnt*topk <= 512; got ",
+                        static_cast<uint64_t>(token_cnt) * topk);
+            AITER_CHECK(eprt <= 1024,
+                        __func__,
+                        ": EMSORT supports at most 1024 experts; got ",
+                        eprt);
+            AITER_CHECK(inter_dim % sub_GU == 0,
+                        __func__,
+                        ": EMSORT requires inter_dim divisible by sub_GU; got inter_dim=",
+                        inter_dim,
+                        ", sub_GU=",
+                        sub_GU);
+            gdx = inter_dim / sub_GU;
+            const int emsort_tgs = args.total_tgs > 0
+                                       ? static_cast<int>(args.total_tgs)
+                                       : 256;
+            AITER_CHECK(gdx > 0 && (emsort_tgs % gdx) == 0,
+                        __func__,
+                        ": EMSORT requires total_tgs divisible by inter_dim/sub_GU; got total_tgs=",
+                        emsort_tgs,
+                        ", slices=",
+                        gdx);
+            bdx = 256;
+            gdy = emsort_tgs / gdx;
+            gdz = 1;
+        }
         else if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
                 (args.total_tgs % args.ps_deno) == 0) // ps
         {
 
             bdx = 256;
-            gdx = this->num_persistent_tgs;
+            gdx = args.total_tgs;
             gdy = 1;
             gdz = 1;
         }
@@ -240,8 +279,37 @@ class FMoeKernel
     };
 };
 
-FMoeKernel* get_heuristic_kernel(
-    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "", int block_size_M = 32)
+static int get_vskip()
+{
+    const char* vs_env_value = std::getenv("AITER_ENABLE_VSKIP");
+    return (vs_env_value != nullptr && std::string(vs_env_value) == "0") ? 0 : 1;
+}
+
+// launch_kernel rounds total_tgs down to a multiple of lcm(ps_deno, tgs_align).
+static bool ps_grid_fits(const CFG::mapped_type& cfg, int inter_dim)
+{
+    const int ps_deno = (inter_dim + cfg.subGU_n - 1) / cfg.subGU_n;
+    return cfg.ps == 0 || std::lcm(ps_deno, std::max(cfg.tgs_align, 1)) <=
+                              cfg.tg_num_perCU * static_cast<int>(get_num_cu_func());
+}
+
+// model_dim must be a multiple of the kernel's dim_align and at least its dim_min
+// (0 = unconstrained).
+static bool kernel_fits(
+    const CFG::mapped_type& cfg, int vskip, int smf, int block_size_M, int inter_dim, int model_dim)
+{
+    return cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m && cfg.flat == 0 &&
+           inter_dim % cfg.subGU_n == 0 && model_dim % std::max(cfg.dim_align, 1) == 0 &&
+           model_dim >= cfg.dim_min && ps_grid_fits(cfg, inter_dim);
+}
+
+FMoeKernel* get_heuristic_kernel(int inter_dim,
+                                 int sub_X_cnt,
+                                 CFG* cfgs,
+                                 int smf                 = 0,
+                                 std::string kernel_name = "",
+                                 int block_size_M        = 32,
+                                 int model_dim           = 0)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -251,12 +319,9 @@ FMoeKernel* get_heuristic_kernel(
     uint32_t round              = 0xffffffff;
     std::string arch_id         = get_gpu_arch();
     std::string selectedKl      = kernel_name.empty() ? "" : arch_id + kernel_name;
-    int vskip                   = 1;
+    int vskip                   = get_vskip();
     static SynchronizedCache<std::string_view, FMoeKernel> impl_ptr_map;
 
-    const char* vs_env_value = std::getenv("AITER_ENABLE_VSKIP");
-    if(vs_env_value != nullptr && std::string(vs_env_value) == "0")
-        vskip = 0;
     if(selectedKl.empty())
     {
         for(const auto& el : *cfgs)
@@ -264,28 +329,24 @@ FMoeKernel* get_heuristic_kernel(
             if(el.first.find(arch_id) != 0)
                 continue;
             const auto& cfg = el.second;
-            if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m &&
-               cfg.flat == 0)
+            if(kernel_fits(cfg, vskip, smf, block_size_M, inter_dim, model_dim))
             {
-                if((inter_dim % cfg.subGU_n) == 0)
+                tg_num = inter_dim / cfg.subGU_n *
+                         sub_X_cnt; // how many thread_groups are needed to handle inter_dim
+                uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
+                if(local_round < round || // fewer round is better
+                   (local_round == round &&
+                    (empty_cu > (local_round * num_cu - tg_num) || // fewer empty_cu is better
+                     (empty_cu == (local_round * num_cu - tg_num) &&
+                      cfg.ps == 1)))) // prefer PS kernel
                 {
-                    tg_num = inter_dim / cfg.subGU_n *
-                             sub_X_cnt; // how many thread_groups are needed to handle inter_dim
-                    uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
-                    if(local_round < round || // fewer round is better
-                       (local_round == round &&
-                        (empty_cu > (local_round * num_cu - tg_num) || // fewer empty_cu is better
-                         (empty_cu == (local_round * num_cu - tg_num) &&
-                          cfg.ps == 1)))) // prefer PS kernel
-                    {
-                        round      = local_round;
-                        empty_cu   = local_round * num_cu - tg_num;
-                        selectedKl = el.first;
-                        if(cfg.ps == 1)
-                            num_persistent_tgs = cfg.tg_num_perCU * num_cu;
-                        else
-                            num_persistent_tgs = 0;
-                    }
+                    round      = local_round;
+                    empty_cu   = local_round * num_cu - tg_num;
+                    selectedKl = el.first;
+                    if(cfg.ps == 1)
+                        num_persistent_tgs = cfg.tg_num_perCU * num_cu;
+                    else
+                        num_persistent_tgs = 0;
                 }
             }
         }
@@ -299,12 +360,32 @@ FMoeKernel* get_heuristic_kernel(
                     ", smf: ",
                     smf,
                     ", vskip: ",
-                    vskip);
+                    vskip,
+                    ", model_dim: ",
+                    model_dim);
     }
     auto it = cfgs->find(selectedKl);
     if(it != cfgs->end())
     {
         const auto& cfg     = it->second;
+        AITER_CHECK(model_dim % std::max(cfg.dim_align, 1) == 0 && model_dim >= cfg.dim_min,
+                    __func__,
+                    ": ",
+                    selectedKl,
+                    " requires model_dim % ",
+                    cfg.dim_align,
+                    " == 0 and model_dim >= ",
+                    cfg.dim_min,
+                    "; got model_dim=",
+                    model_dim);
+        AITER_CHECK(ps_grid_fits(cfg, inter_dim),
+                    __func__,
+                    ": ",
+                    selectedKl,
+                    " has too few persistent workgroups on ",
+                    num_cu,
+                    " CUs for inter_dim=",
+                    inter_dim);
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         if(cfg.ps == 1)
@@ -313,7 +394,8 @@ FMoeKernel* get_heuristic_kernel(
             num_persistent_tgs = 0;
 
         impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
-            return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat);
+            return FMoeKernel(
+                name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat, cfg.tgs_align);
         });
     }
     else
@@ -606,6 +688,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
@@ -626,6 +710,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
@@ -669,19 +755,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         AITER_CHECK(false, __func__, ": unsupport current input type:", AiterDtype_to_str(input->dtype()));
     }
 
-    // The small-tile asm MXFP4 kernels drain O through a tile schedule derived
-    // from model_dim/1024, with no handling for a short trailing tile. Below
-    // 1024 no tiles are produced at all and the output buffer is left
-    // untouched; a non-multiple leaves the remainder columns unwritten. Both
-    // return a silently wrong result instead of failing, so require an exact
-    // multiple. A multiple of 256 is not enough: model_dim=2304 drops 256
-    // columns. Larger tiles use a different epilogue and are not constrained.
-    if(is_mxfp4 && impl_ptr->get_sub_GU() <= 128)
+    // The asm MXFP4 O-flush walks full 1024-dim blocks, then waves 0/1 drain a
+    // 512-dim tail when dim bit 9 is set. That covers every multiple of 512
+    // (dim=512 is tail-only). A 256 remainder is unwritten, so reject it.
+    if(is_mxfp4)
     {
-        AITER_CHECK(model_dim >= 1024 && (model_dim % 1024) == 0,
+        AITER_CHECK(model_dim >= 512 && (model_dim % 512) == 0,
                     __func__,
-                    " asm MXFP4 kernels with sub_GU <= 128 require model_dim to be a positive "
-                    "multiple of 1024; got model_dim=" +
+                    " asm MXFP4 kernels require model_dim to be a positive "
+                    "multiple of 512; got model_dim=" +
                         std::to_string(model_dim));
     }
 
@@ -909,6 +991,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                         stream);
 }
 
+static CFG* get_blockscale_cfgs(ActivationType act, bool xquant)
+{
+    if(act == ActivationType::Silu)
+        return xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu
+                      : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
+    if(act == ActivationType::Gelu)
+        return xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu
+                      : &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
+    return nullptr;
+}
+
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe_fp8_blockscale_g1u1,
     (
@@ -945,17 +1038,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if(out->dtype() == AITER_DTYPE_bf16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
     {
-        bool xquant = (input->dtype() == AITER_DTYPE_bf16);
-        if(act == ActivationType::Silu)
-            config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
-        else if(act == ActivationType::Gelu)
-            config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
-        else
-            AITER_CHECK(
-                false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
+        config_map = get_blockscale_cfgs(act, input->dtype() == AITER_DTYPE_bf16);
+        AITER_CHECK(config_map != nullptr,
+                    __func__,
+                    "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
-        impl_ptr =
-            get_heuristic_kernel(inter_dim, sorted_expert_ids->size(0), config_map, 0, kernel_name_str, block_size_M);
+        impl_ptr = get_heuristic_kernel(inter_dim,
+                                        sorted_expert_ids->size(0),
+                                        config_map,
+                                        0,
+                                        kernel_name_str,
+                                        block_size_M,
+                                        down->size(1));
         impl_ptr->launch_kernel<1, 2, false>(out,
                                              input,
                                              gate,
@@ -974,4 +1068,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     }
     else
         AITER_CHECK(false, __func__, "Unsupported the type for fmoe_fp8_blockscale_g1u1");
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT(fmoe_fp8_blockscale_g1u1_has_kernel,
+                               (int activation,
+                                int xquant,
+                                int block_size_M,
+                                int inter_dim,
+                                int model_dim,
+                                hipStream_t stream),
+                               (activation, xquant, block_size_M, inter_dim, model_dim, stream))
+{
+    CFG* config_map = get_blockscale_cfgs(static_cast<ActivationType>(activation), xquant != 0);
+    if(config_map == nullptr || inter_dim % 128 != 0)
+        return 0;
+    std::string arch_id = get_gpu_arch();
+    int vskip           = get_vskip();
+    for(const auto& el : *config_map)
+        if(el.first.find(arch_id) == 0 &&
+           kernel_fits(el.second, vskip, 0, block_size_M, inter_dim, model_dim))
+            return 1;
+    return 0;
 }

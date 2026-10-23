@@ -25,6 +25,7 @@ from multiprocessing import Pool, freeze_support, set_start_method
 
 import torch
 
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import checkAllclose
 
 logger = logging.getLogger("aiter")
@@ -32,7 +33,7 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 
-def _worker(tp_size, rankID, mode, shape):
+def _worker(tp_size, rankID, mode, shape, distributed_init_method):
     # Must precede CUDA init in this process: the allocator reads the setting
     # once, when the context comes up.
     if mode == "expandable":
@@ -50,7 +51,12 @@ def _worker(tp_size, rankID, mode, shape):
     # The regression: under expandable segments this call used to die either
     # exporting the signal tensor (hipIpcGetMemHandle, "invalid argument") or
     # raising "Uncached IPCBuffer has no backing tensor" on the input pool.
-    init_dist_env(tp_size, rankID, local_rank=rankID)
+    init_dist_env(
+        tp_size,
+        rankID,
+        distributed_init_method=distributed_init_method,
+        local_rank=rankID,
+    )
 
     ca_comm = get_tp_group().device_communicator.ca_comm
     pool_mode = "none"
@@ -69,11 +75,13 @@ def _worker(tp_size, rankID, mode, shape):
 
 
 def test_init_dist_env(tp_size, shape, run_mode):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "49374"
+    # A fresh port per run: a fixed env:// port fails with EADDRINUSE whenever
+    # anything else on the host holds it, and the peers then wait out the full
+    # TCPStore connect timeout.
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
     pool = Pool(processes=tp_size)
     rets = [
-        pool.apply_async(_worker, args=(tp_size, i, run_mode, shape))
+        pool.apply_async(_worker, args=(tp_size, i, run_mode, shape, init_method))
         for i in range(tp_size)
     ]
     pool.close()

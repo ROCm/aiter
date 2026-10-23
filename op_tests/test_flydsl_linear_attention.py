@@ -22,7 +22,13 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+from aiter.ops.flydsl.kernels.gdn_decode_verify import (
+    create_gdn_decode_verify_kernel,
+)
+from aiter.ops.flydsl.linear_attention_kernels import (
+    flydsl_gdn_decode_varlen,
+    flydsl_gdr_decode,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -32,6 +38,13 @@ pytestmark = pytest.mark.skipif(
     get_gfx() not in SUPPORTED_GFX,
     reason="FlyDSL GDR decode requires gfx942 or gfx950",
 )
+# The packed decode/verify kernel is tuned and validated on gfx950 only.
+GDN_VARLEN_GFX = ["gfx950"]
+_gdn_varlen_only = pytest.mark.skipif(
+    get_gfx() not in GDN_VARLEN_GFX,
+    reason="FlyDSL GDN packed decode/verify is validated on gfx950 only",
+)
+GDN_HEAD_K_DIM = 128
 _PERF_ROTATION_BUDGET = 1024**3
 _MAX_PERF_ROTATIONS = 101
 # ``checkAllclose`` returns the fraction of mismatching elements. The kernel
@@ -503,6 +516,302 @@ def test_flydsl_gdr_decode_invalid_indices_zero_output_without_state_write():
     )
 
 
+def make_gdn_varlen_inputs(
+    batch, tps, num_k_heads, num_v_heads, head_v_dim, gate_dtype, seed=0
+):
+    """Packed decode/verify inputs laid out as the SGLang GDN layer passes them.
+
+    q/k/v are strided views of one fused ``[1, T, ...]`` projection, the state
+    is a slot pool, and slots are interleaved and reversed so a slot index
+    never equals its sequence index.
+    """
+    torch.manual_seed(seed)
+    tokens = batch * tps
+    k_width = num_k_heads * GDN_HEAD_K_DIM
+    mixed = torch.randn(
+        1, tokens, 2 * k_width + num_v_heads * head_v_dim, dtype=torch.bfloat16
+    )
+    q = mixed[..., :k_width].view(1, tokens, num_k_heads, GDN_HEAD_K_DIM)
+    k = mixed[..., k_width : 2 * k_width].view(1, tokens, num_k_heads, GDN_HEAD_K_DIM)
+    v = mixed[..., 2 * k_width :].view(1, tokens, num_v_heads, head_v_dim)
+    state = torch.randn(2 * batch + 1, num_v_heads, head_v_dim, GDN_HEAD_K_DIM)
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "a": torch.randn(tokens, num_v_heads, dtype=gate_dtype),
+        "b": torch.randn(tokens, num_v_heads, dtype=gate_dtype),
+        # Qwen3-Next initializes A_log as log(uniform(1, 16)).
+        "A_log": torch.empty(num_v_heads).uniform_(1, 16).log(),
+        "dt_bias": torch.rand(num_v_heads, dtype=gate_dtype),
+        "state": (state * 0.1).to(torch.bfloat16),
+        "state_indices": torch.arange(2 * batch, 0, -2, dtype=torch.int32),
+        "cu_seqlens": torch.arange(0, tokens + 1, tps, dtype=torch.int32),
+    }
+
+
+def ref_gdn_decode_varlen(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    state,
+    state_indices,
+    cu_seqlens,
+    disable_state_update=False,
+    intermediate_states=None,
+    intermediate_state_indices=None,
+):
+    """fp32 reference for ``flydsl_gdn_decode_varlen``.
+
+    Returns the fp32 output and updates ``state`` / ``intermediate_states`` in
+    place. A negative slot starts from a zero state and is never written back.
+    """
+    _, tokens, num_k_heads, head_k_dim = k.shape
+    num_v_heads, head_v_dim = v.shape[-2:]
+    group = num_v_heads // num_k_heads
+    qf = q[0].float()
+    kf = k[0].float()
+    qf = qf * torch.rsqrt((qf * qf).sum(-1, keepdim=True) + 1e-6) * head_k_dim**-0.5
+    kf = kf * torch.rsqrt((kf * kf).sum(-1, keepdim=True) + 1e-6)
+    qf = qf.repeat_interleave(group, dim=1)
+    kf = kf.repeat_interleave(group, dim=1)
+    vf = v[0].float()
+    gate = a.reshape(tokens, num_v_heads).float() + dt_bias.float()
+    decay = torch.exp(
+        -torch.exp(A_log.float()) * F.softplus(gate, beta=1.0, threshold=20.0)
+    )
+    beta = torch.sigmoid(b.reshape(tokens, num_v_heads).float())
+
+    out = torch.empty(tokens, num_v_heads, head_v_dim)
+    offsets = cu_seqlens.tolist()
+    for seq in range(len(offsets) - 1):
+        slot = int(state_indices[seq])
+        if slot >= 0:
+            h = state[slot].float()
+        else:
+            h = torch.zeros(num_v_heads, head_v_dim, head_k_dim)
+        for step, tok in enumerate(range(offsets[seq], offsets[seq + 1])):
+            h = h * decay[tok, :, None, None]
+            residual = vf[tok] - (h * kf[tok, :, None, :]).sum(-1)
+            h = h + (residual * beta[tok, :, None])[:, :, None] * kf[tok, :, None, :]
+            out[tok] = (h * qf[tok, :, None, :]).sum(-1)
+            if intermediate_states is not None:
+                cslot = int(intermediate_state_indices[seq])
+                if cslot >= 0:
+                    intermediate_states[cslot, step] = h.to(intermediate_states.dtype)
+        if slot >= 0 and not disable_state_update:
+            state[slot] = h.to(state.dtype)
+    return out[None]
+
+
+@benchmark()
+def test_flydsl_gdn_decode_varlen(
+    batch,
+    tps,
+    num_k_heads,
+    num_v_heads,
+    head_v_dim,
+    gate_dtype,
+    cache_states,
+    update_state,
+):
+    """tps=1 is decode with write-back; tps>1 is target verify with snapshots."""
+    inputs = make_gdn_varlen_inputs(
+        batch, tps, num_k_heads, num_v_heads, head_v_dim, gate_dtype
+    )
+    initial_state = inputs.pop("state")
+    initial_inter = None
+    inter_indices = None
+    if cache_states:
+        # One spare snapshot slot that no sequence maps to; it must stay zero.
+        initial_inter = torch.zeros(
+            batch + 1,
+            tps,
+            num_v_heads,
+            head_v_dim,
+            GDN_HEAD_K_DIM,
+            dtype=torch.bfloat16,
+        )
+        inter_indices = torch.arange(batch, 0, -1, dtype=torch.int32)
+
+    reference_state = initial_state.clone()
+    reference_inter = initial_inter.clone() if cache_states else None
+    reference_out = ref_gdn_decode_varlen(
+        **inputs,
+        state=reference_state,
+        disable_state_update=not update_state,
+        intermediate_states=reference_inter,
+        intermediate_state_indices=inter_indices,
+    )
+
+    def run_flydsl(state, inter):
+        return flydsl_gdn_decode_varlen(
+            **inputs,
+            state=state,
+            disable_state_update=not update_state,
+            intermediate_states=inter,
+            intermediate_state_indices=inter_indices,
+        )
+
+    candidates = {"flydsl": run_flydsl}
+
+    tokens = batch * tps
+    k_dim = GDN_HEAD_K_DIM
+    flops = tokens * num_v_heads * (7 * k_dim * head_v_dim + 2 * head_v_dim)
+    flops += tokens * num_k_heads * 6 * k_dim
+    # Q/K/V and gates in, output out, one state read per sequence, plus the
+    # final write-back and per-token snapshots when enabled.
+    state_bytes = batch * num_v_heads * head_v_dim * k_dim * 2
+    nbytes = (
+        tokens * (2 * num_k_heads * k_dim + 2 * num_v_heads * head_v_dim) * 2
+        + 2 * tokens * num_v_heads * inputs["a"].element_size()
+        + state_bytes * (1 + int(update_state) + (tps if cache_states else 0))
+    )
+
+    ret = {"gfx": get_gfx()}
+    for name, candidate in candidates.items():
+        perf_state = initial_state.clone()
+        perf_inter = initial_inter.clone() if cache_states else None
+        _, us = run_perftest(
+            lambda state, candidate=candidate, inter=perf_inter: candidate(
+                state, inter
+            ),
+            perf_state,
+            num_rotate_args=_perf_rotation_count(perf_state, reference_out),
+        )
+
+        candidate_state = initial_state.clone()
+        candidate_inter = initial_inter.clone() if cache_states else None
+        candidate_out = candidate(candidate_state, candidate_inter)
+        errs = [
+            checkAllclose(
+                reference_out,
+                candidate_out.to(dtypes.fp32),
+                rtol=1e-2,
+                atol=1e-2,
+                msg=f"{name}: GDN varlen output ",
+            ),
+            checkAllclose(
+                reference_state.to(dtypes.fp32),
+                candidate_state.to(dtypes.fp32),
+                rtol=1e-2,
+                atol=1e-2,
+                msg=f"{name}: GDN varlen state pool ",
+            ),
+        ]
+        if cache_states:
+            errs.append(
+                checkAllclose(
+                    reference_inter.to(dtypes.fp32),
+                    candidate_inter.to(dtypes.fp32),
+                    rtol=1e-2,
+                    atol=1e-2,
+                    msg=f"{name}: GDN varlen snapshots ",
+                )
+            )
+        assert (
+            max(errs) <= _TOL_ERR_RATIO
+        ), f"{name}: mismatch ratio exceeds {_TOL_ERR_RATIO:g}: {errs}"
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = max(errs)
+    return ret
+
+
+# Driven by main(); pytest collects the fixed cases below.
+test_flydsl_gdn_decode_varlen.__test__ = False
+
+
+@_gdn_varlen_only
+@pytest.mark.parametrize("batch,tps", [(1, 1), (5, 1), (3, 2), (2, 4), (4, 5)])
+@pytest.mark.parametrize(
+    "cache_states,update_state", [(False, True), (True, False), (True, True)]
+)
+def test_flydsl_gdn_decode_varlen_matches_reference(
+    batch, tps, cache_states, update_state
+):
+    result = test_flydsl_gdn_decode_varlen(
+        batch, tps, 16, 48, 128, torch.bfloat16, cache_states, update_state
+    )
+    assert result["flydsl err"] <= _TOL_ERR_RATIO
+
+
+@_gdn_varlen_only
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(4, 8), (16, 32)])
+def test_flydsl_gdn_decode_varlen_fp32_gates(num_k_heads, num_v_heads):
+    result = test_flydsl_gdn_decode_varlen(
+        3, 2, num_k_heads, num_v_heads, 128, torch.float32, True, True
+    )
+    assert result["flydsl err"] <= _TOL_ERR_RATIO
+
+
+@_gdn_varlen_only
+def test_flydsl_gdn_decode_varlen_padding_slot():
+    """A negative slot computes from a zero state and leaves the pool alone."""
+    inputs = make_gdn_varlen_inputs(3, 2, 16, 48, 128, torch.bfloat16)
+    inputs["state_indices"][1] = -1
+    reference_state = inputs["state"].clone()
+    reference_out = ref_gdn_decode_varlen(**{**inputs, "state": reference_state})
+    out = flydsl_gdn_decode_varlen(**inputs)
+    for label, ref, got in (
+        ("output", reference_out, out),
+        ("state pool", reference_state, inputs["state"]),
+    ):
+        err = checkAllclose(
+            ref.float(), got.float(), rtol=1e-2, atol=1e-2, msg=f"padding {label} "
+        )
+        assert err <= _TOL_ERR_RATIO
+
+
+@_gdn_varlen_only
+def test_flydsl_gdn_decode_varlen_reuses_kernel_across_batch_sizes():
+    """The output size is a launch argument, so a new batch size must neither
+    build a new kernel nor reuse a stale bound.
+
+    Starts at two tokens: torch reports a size-1 token axis with its own
+    stride, so a single-token batch builds its own kernel once.
+    """
+    misses = None
+    for batch in (2, 3, 7):
+        inputs = make_gdn_varlen_inputs(batch, 1, 16, 48, 128, torch.bfloat16)
+        reference_state = inputs["state"].clone()
+        reference_out = ref_gdn_decode_varlen(**{**inputs, "state": reference_state})
+        out = flydsl_gdn_decode_varlen(**inputs, viter=1)
+        err = checkAllclose(
+            reference_out, out.float(), rtol=1e-2, atol=1e-2, msg=f"{batch=} "
+        )
+        assert err <= _TOL_ERR_RATIO
+        info = create_gdn_decode_verify_kernel.cache_info()
+        if misses is None:
+            misses = info.misses
+        assert info.misses == misses, f"batch {batch} built a new kernel"
+
+
+@_gdn_varlen_only
+def test_flydsl_gdn_decode_varlen_rejects_short_snapshot_buffer():
+    inputs = make_gdn_varlen_inputs(2, 4, 16, 48, 128, torch.bfloat16)
+    inter = torch.zeros(4, 3, 48, 128, GDN_HEAD_K_DIM, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="steps per slot"):
+        flydsl_gdn_decode_varlen(
+            **inputs,
+            intermediate_states=inter,
+            intermediate_state_indices=torch.tensor([0, 2], dtype=torch.int32),
+        )
+
+
+@_gdn_varlen_only
+def test_flydsl_gdn_decode_varlen_validate_data_rejects_ragged_offsets():
+    inputs = make_gdn_varlen_inputs(2, 2, 16, 48, 128, torch.bfloat16)
+    inputs["cu_seqlens"] = torch.tensor([0, 1, 4], dtype=torch.int32)
+    with pytest.raises(ValueError, match="every sequence"):
+        flydsl_gdn_decode_varlen(**inputs, validate_data=True)
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("FlyDSL GDR decode unsupported on %s; skipping", get_gfx())
@@ -553,6 +862,23 @@ def main():
         default=[0, 1],
         help="Whether to normalize Q/K in-kernel (0 or 1).",
     )
+    parser.add_argument(
+        "--tps",
+        type=int,
+        nargs="*",
+        default=[1, 2, 4],
+        help="Tokens per sequence for the packed GDN sweep: 1 is decode with "
+        "state write-back, >1 is target verify with per-token snapshots.",
+    )
+    parser.add_argument(
+        "--gdn-heads",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(16, 48, 128)],
+        metavar="NKH,NVH,V",
+        help="Packed GDN head configs as num_k_heads,num_v_heads,head_v_dim "
+        "(head_k_dim is fixed at 128). Default: Qwen3.8 at TP1.",
+    )
     args = parser.parse_args()
 
     rows = []
@@ -598,6 +924,36 @@ def main():
     df = pd.DataFrame(rows)
     aiter.logger.info(
         "FlyDSL GDR decode summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+
+    if get_gfx() not in GDN_VARLEN_GFX:
+        aiter.logger.warning(
+            "%s: skipping the packed GDN decode/verify sweep (gfx950 only)", get_gfx()
+        )
+        return
+    # The packed kernel takes bf16 q/k/v and state only; other -d entries are
+    # covered by the GDR sweep above.
+    gdn_dtypes = [dtype for dtype in args.dtype if dtype == dtypes.bf16]
+    if len(gdn_dtypes) != len(args.dtype):
+        aiter.logger.warning(
+            "packed GDN decode/verify is bf16-only; skipping %s",
+            [d for d in args.dtype if d != dtypes.bf16],
+        )
+    rows = []
+    for dtype, batch, tps, heads in itertools.product(
+        gdn_dtypes, args.batch, args.tps, args.gdn_heads
+    ):
+        if len(heads) != 3:
+            parser.error("--gdn-heads entries must be num_k_heads,num_v_heads,V")
+        # a/b/dt_bias arrive in the model dtype, as in SGLang's Qwen3.5 layer.
+        # Decode writes the state back; target verify snapshots every token and
+        # leaves the commit to the caller, as the SGLang GDN backend does.
+        rows.append(
+            test_flydsl_gdn_decode_varlen(batch, tps, *heads, dtype, tps > 1, tps == 1)
+        )
+    aiter.logger.info(
+        "FlyDSL GDN packed decode/verify summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
     )
 
 
