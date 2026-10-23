@@ -60,6 +60,10 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
 
+# The longest KV length the config lookup sees in deterministic mode, in place of
+# the batch's: the long-context configs.
+_DETERMINISTIC_MAX_SEQLEN_K = 2048
+
 
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
@@ -123,6 +127,7 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+    deterministic: bool = False  # batch-invariant decode, see unified_attention
 
 
 def _gfx950_gluon_supported(params: _UAParams):
@@ -229,8 +234,26 @@ def unified_attention(
     skip_reduce: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
+    deterministic: bool = False,
 ):
+    """Paged attention over a ragged batch.
+
+    With deterministic=True, decode is batch-invariant: a sequence's output does
+    not depend on which other sequences share the batch. The kernel, its tiles
+    and the KV split are then chosen from the model's shapes and dtypes only,
+    never from the batch (sequence count, longest KV length, CU occupancy), and
+    the KV range is not split. Only decode (max_seqlen_q == 1) is supported.
+    """
     assert causal, "Only causal attention is supported"
+    if deterministic:
+        if int(max_seqlen_q) != 1:
+            raise NotImplementedError(
+                "unified_attention(deterministic=True) supports decode only "
+                f"(max_seqlen_q == 1), got max_seqlen_q={max_seqlen_q}"
+            )
+        # Only the heuristics read max_seqlen_k; pin it so that a config keyed
+        # on it cannot follow the batch.
+        max_seqlen_k = _DETERMINISTIC_MAX_SEQLEN_K
 
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
@@ -375,10 +398,20 @@ def unified_attention(
         v_descale=v_descale,
         output_scale=output_scale,
         skip_reduce=skip_reduce,
+        deterministic=deterministic,
     )
 
+    if deterministic:
+        # The gfx950 gluon kernel's decode grid, else the 2d kernel: chosen by
+        # arch, shapes and dtypes only, and neither splits the KV range.
+        use_2d = not (
+            DEVICE_ARCH == "gfx950" and is_3d_gluon_available(params, backend)
+        )
+    else:
+        use_2d = use_2d_kernel(params, backend)
+
     # if batch contains a prefill
-    if use_2d_kernel(params, backend):
+    if use_2d:
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
         use_gluon_2d = is_2d_gluon_available(params, backend)
@@ -399,7 +432,9 @@ def unified_attention(
         config = get_unified_attention_config(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
-        NUM_SEGMENTS = config["NUM_SEGMENTS"]
+        # The split count follows the batch (sequence count, longest KV length),
+        # and a sequence's split boundaries follow the split count.
+        NUM_SEGMENTS = 1 if deterministic else config["NUM_SEGMENTS"]
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -1168,7 +1203,12 @@ def _unified_attention_3d_gfx950(
         BLOCK_M = max(BLOCK_M, q_rows)
     # An unsplit launch that already leaves CUs idle can afford a wider query
     # block, which buys back the warps the missing split axis would have used.
-    if NUM_SEGMENTS == 1 and params.num_2d_prgms <= 2 * params.num_sms:
+    # Not in deterministic mode: whether CUs are idle depends on the batch.
+    if (
+        NUM_SEGMENTS == 1
+        and not params.deterministic
+        and params.num_2d_prgms <= 2 * params.num_sms
+    ):
         BLOCK_M = max(config.get("WIDE_BLOCK_M_MULT", 1) * MFMA_DIM, BLOCK_M)
 
     split = NUM_SEGMENTS > 1

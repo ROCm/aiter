@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -1011,3 +1012,156 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
         out_dtype=dtype,
     )
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def _decode_batch(
+    reqs, key_cache, value_cache, window_size, sinks, kv_descale, backend, deterministic
+):
+    """Decode one query token per request; each request owns its block-table row."""
+    device = key_cache.device
+    num_seqs = len(reqs)
+    kv_lens = [r["kv_len"] for r in reqs]
+    max_blocks = max(r["blocks"].numel() for r in reqs)
+    block_tables = torch.zeros(num_seqs, max_blocks, dtype=torch.int32, device=device)
+    for i, r in enumerate(reqs):
+        block_tables[i, : r["blocks"].numel()] = r["blocks"]
+    query = torch.stack([r["q"] for r in reqs])
+    output = torch.empty(query.shape, dtype=torch.bfloat16, device=device)
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=torch.arange(num_seqs + 1, dtype=torch.int32, device=device),
+        seqused_k=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+        max_seqlen_q=1,
+        max_seqlen_k=max(kv_lens),
+        softmax_scale=query.shape[-1] ** -0.5,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=kv_descale,
+        k_descale=kv_descale,
+        v_descale=kv_descale,
+        sinks=sinks,
+        backend=backend,
+        deterministic=deterministic,
+    )
+    return output
+
+
+@pytest.mark.parametrize(
+    "num_heads,head_size,sliding_window,use_sinks",
+    [
+        ((32, 8), 128, None, False),
+        ((64, 8), 64, None, True),
+        ((64, 8), 64, 128, True),
+        ((8, 1), 256, None, False),
+    ],
+)
+@pytest.mark.parametrize("block_size", [1, 16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, e4m3_dtype])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_triton_unified_attn_deterministic_decode(
+    num_heads, head_size, sliding_window, use_sinks, block_size, dtype, backend
+) -> None:
+    """With deterministic=True a request decodes to the same bits in any batch.
+
+    The request is decoded alone, then at a random position among batchmates
+    of other KV lengths, at batch sizes that move the default heuristics
+    (KV split count, 2d vs 3d grid, query-block width).
+    """
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    rng = random.Random(0)
+    torch.manual_seed(0)
+    device = "cuda"
+    num_query_heads, num_kv_heads = num_heads
+    max_kv_len = 16384
+    num_blocks = 160 * max_kv_len // block_size
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, device=device
+    ).to(dtype)
+    value_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, device=device
+    ).to(dtype)
+    kv_descale = (
+        None
+        if dtype == torch.bfloat16
+        else torch.tensor([0.5], dtype=torch.float32, device=device)
+    )
+    sinks = (
+        torch.randn(num_query_heads, dtype=torch.float32, device=device)
+        if use_sinks
+        else None
+    )
+    window_size = (sliding_window - 1, 0) if sliding_window else (-1, -1)
+    free_blocks = torch.randperm(num_blocks, device=device).to(torch.int32)
+    next_block = 0
+
+    def request(kv_len):
+        nonlocal next_block
+        n = (kv_len + block_size - 1) // block_size
+        blocks = free_blocks[next_block : next_block + n]
+        next_block += n
+        q = torch.randn(num_query_heads, head_size, device=device).to(dtype)
+        return {"kv_len": kv_len, "blocks": blocks, "q": q}
+
+    def decode(reqs, deterministic=True):
+        return _decode_batch(
+            reqs,
+            key_cache,
+            value_cache,
+            window_size,
+            sinks,
+            kv_descale,
+            backend,
+            deterministic,
+        )
+
+    for target_len in (1, 63, 64, 65, 2047, 2048, 12000):
+        target = request(target_len)
+        alone = decode([target])[0]
+        for bs in (2, 8, 33, 128):
+            next_block_before = next_block
+            mates = [request(rng.randrange(1, max_kv_len)) for _ in range(bs - 1)]
+            pos = rng.randrange(bs)
+            reqs = mates[:pos] + [target] + mates[pos:]
+            out = decode(reqs)
+            assert torch.equal(out[pos], alone), (
+                f"a {target_len}-token request decoded at position {pos} of {bs} "
+                "differs from the same request alone"
+            )
+            if bs == 8:
+                # Same attention as the default path, up to rounding.
+                torch.testing.assert_close(
+                    out, decode(reqs, deterministic=False), atol=2e-2, rtol=2e-2
+                )
+            next_block = next_block_before
+
+
+def test_triton_unified_attn_deterministic_rejects_extend() -> None:
+    q = torch.empty(4, 8, 64, dtype=torch.bfloat16, device="cuda")
+    kv = torch.empty(4, 16, 8, 64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(NotImplementedError, match="decode only"):
+        unified_attention(
+            q=q,
+            k=kv,
+            v=kv,
+            out=torch.empty_like(q),
+            cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
+            max_seqlen_q=4,
+            seqused_k=torch.tensor([4], dtype=torch.int32, device="cuda"),
+            max_seqlen_k=4,
+            softmax_scale=0.125,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            deterministic=True,
+        )
