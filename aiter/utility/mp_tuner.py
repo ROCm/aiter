@@ -623,10 +623,14 @@ def mp_tuner(
                 error_type = type(e).__name__
                 is_mapping_error = _is_mapping_error(e)
                 is_accelerator_error = _is_accelerator_error(e)
-                # not restart as this is not root use
                 if is_mapping_error:
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
-                    dummy_failed_tasks.append((k, "mapping error"))
+                    print(
+                        f"{error_msg}; restarting the pool and retrying the task",
+                        flush=True,
+                    )
+                    pool_restart_needed = True
+                    break
                 elif is_accelerator_error:
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
                     # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept

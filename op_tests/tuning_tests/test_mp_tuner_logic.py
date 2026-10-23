@@ -6,7 +6,7 @@ Unit tests for mp_tuner polling loop logic.
 Simulates async_result behavior without GPU/multiprocessing to verify:
 1. consecutive_timeouts tracks correctly and resets on success
 2. half-GPU threshold triggers break at the right time
-3. KeyError tasks stay in remaining_tasks and get retried after root-cause restart
+3. KeyError tasks trigger a pool restart and are retried without being discarded
 
 Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 """
@@ -92,7 +92,9 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
             is_mapping_error = error_type == "KeyError"
 
             if is_mapping_error:
-                dummy_failed_tasks.append((k, "mapping error"))
+                pool_restart_needed = True
+                broke_early = True
+                break
             elif error_type == "AcceleratorError":
                 completed_this_round.append((k, async_result))
                 pool_restart_needed = True
@@ -212,8 +214,8 @@ class TestConsecutiveTimeouts(unittest.TestCase):
 
 class TestKeyErrorHandling(unittest.TestCase):
 
-    def test_keyerror_stays_in_remaining(self):
-        """KeyError tasks should NOT be in completed_this_round."""
+    def test_keyerror_restarts_pool_and_stays_in_remaining(self):
+        """KeyError tasks should be retried after rebuilding the PID map."""
         mp_num = 4
         timeout = 0.0
         now = time.time()
@@ -228,52 +230,11 @@ class TestKeyErrorHandling(unittest.TestCase):
         )
         completed_ids = {k for k, _ in completed}
         self.assertNotIn(0, completed_ids, "KeyError task should NOT be completed")
-        self.assertIn(1, completed_ids, "OK task should be completed")
-        self.assertEqual(len(dummy), 1, "KeyError task should be in dummy_failed")
-        self.assertFalse(restart, "KeyError alone should NOT trigger restart")
-
-    def test_keyerror_with_timeout_gets_resubmitted(self):
-        """KeyError tasks wait for root-cause timeout to trigger restart."""
-        mp_num = 2
-        timeout = 0.0
-        now = time.time()
-        remaining = [
-            (0, FakeAsyncResult("keyerror")),
-            (1, FakeAsyncResult("timeout_expired")),
-        ]
-        start_times = {k: now - 10 for k, _ in remaining}
-
-        completed, _dummy, restart, _broke = simulate_poll_round(
-            remaining, start_times, mp_num, timeout
-        )
-        completed_ids = {k for k, _ in completed}
-        self.assertNotIn(0, completed_ids, "KeyError task stays for resubmit")
-        self.assertIn(1, completed_ids, "Root-cause timeout is completed")
-        self.assertTrue(restart, "Timeout should trigger restart")
-
-        new_remaining = [(k, ar) for k, ar in remaining if k not in completed_ids]
-        self.assertEqual(len(new_remaining), 1)
-        self.assertEqual(
-            new_remaining[0][0], 0, "Only KeyError task remains for resubmit"
-        )
-
-    def test_keyerror_no_restart_without_root_cause(self):
-        """If only KeyError tasks remain, no restart, they keep polling."""
-        mp_num = 4
-        timeout = 100.0
-        now = time.time()
-        remaining = [
-            (0, FakeAsyncResult("keyerror")),
-            (1, FakeAsyncResult("keyerror")),
-        ]
-        start_times = {k: now for k, _ in remaining}
-
-        completed, dummy, restart, _broke = simulate_poll_round(
-            remaining, start_times, mp_num, timeout
-        )
-        self.assertFalse(restart, "No restart without root cause")
+        self.assertNotIn(1, completed_ids, "Polling stops before the next task")
+        self.assertEqual(dummy, [], "Mapping errors must not discard candidates")
+        self.assertTrue(restart, "KeyError must rebuild the stale PID map")
+        self.assertTrue(_broke, "Polling must stop before restarting the pool")
         self.assertEqual(len(completed), 0, "Nothing completed")
-        self.assertEqual(len(dummy), 2, "Both are mapping errors")
 
 
 class TestAcceleratorError(unittest.TestCase):
