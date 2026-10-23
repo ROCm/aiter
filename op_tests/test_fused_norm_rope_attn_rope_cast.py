@@ -1956,3 +1956,32 @@ def test_two_source_scale_output_storage_offset(heads, mode, offset):
         torch.testing.assert_close(
             out.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("mode", ["raw", "prepared"])
+@pytest.mark.parametrize("offset", [1, 3])
+@pytest.mark.parametrize("valid_indices", [False, True])
+def test_two_source_index_storage_offset(heads, mode, offset, valid_indices):
+    kwargs, (_, mx, lse) = two_source_inputs(
+        heads, "padded", mode, True, True, valid_indices
+    )
+    reference = fused_v41(
+        **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
+    )
+    for name in ("kv_indices_prefix", "kv_indices_extend"):
+        original = kwargs[name]
+        storage = torch.empty(
+            original.numel() + offset, device=original.device, dtype=original.dtype
+        )
+        view = storage[offset:].view_as(original)
+        view.copy_(original)
+        assert view.is_contiguous() and view.data_ptr() % 16 != 0
+        kwargs[name] = view
+    actual = fused_v41(
+        **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
+    )
+    for out, expected in zip(actual, reference):
+        torch.testing.assert_close(
+            out.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+        )

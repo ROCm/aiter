@@ -1950,17 +1950,36 @@ __device__ __forceinline__ bool indices_valid(const FusedNormRopeAttnRopeCastPar
     __shared__ int invalid_wave[4];
     const int t = blockIdx.x, lane = threadIdx.x % 64, warp = threadIdx.x / 64;
     bool valid = true;
-    if constexpr(T::CACHE_MODE == 0 && T::RAW_Q)
+    if constexpr(T::CACHE_MODE == 0)
     {
-        // Validate the two independent row spaces without a dynamic source loop.
-        // A single unsigned comparison also rejects negative row indices.
+        // Validate the independent row spaces before either tile loop can use them.
+        // Read four contiguous indices per lane when the CSR range is aligned.
         auto validate = [&](const int* ptr, const int* ids, int cap, int rows) {
             if(!ptr)
                 return;
             const int begin = min(cap, max(0, ptr[t]));
             const int end   = max(begin, min(cap, ptr[t + 1]));
-            for(int i = begin + threadIdx.x; i < end; i += 256)
-                valid &= uint32_t(ids[i]) < uint32_t(rows);
+            if(begin == end)
+                return;
+            if((reinterpret_cast<uintptr_t>(ids + begin) & 15) == 0)
+            {
+                for(uint32_t i = uint32_t(begin) + threadIdx.x * 4; i < uint32_t(end); i += 1024)
+                {
+                    if(end - i >= 4)
+                    {
+                        const auto values =
+                            *reinterpret_cast<const opus::vector_t<int, 4>*>(ids + i);
+                        opus::static_for<4>(
+                            [&](auto j) { valid &= uint32_t(values[j.value]) < uint32_t(rows); });
+                    }
+                    else
+                        for(uint32_t j = i; j < uint32_t(end); ++j)
+                            valid &= uint32_t(ids[j]) < uint32_t(rows);
+                }
+            }
+            else
+                for(uint32_t i = uint32_t(begin) + threadIdx.x; i < uint32_t(end); i += 256)
+                    valid &= uint32_t(ids[i]) < uint32_t(rows);
         };
         validate(a.kv_indptr_prefix, a.kv_indices_prefix, a.prefix_capacity, a.total_pages);
         validate(a.kv_indptr_extend, a.kv_indices_extend, a.extend_capacity, a.total_tokens);
