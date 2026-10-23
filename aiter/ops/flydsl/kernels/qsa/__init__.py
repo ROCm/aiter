@@ -13,6 +13,6 @@
   ``sparse_gqa.py``            one CTA per (row, kv head, split) over paged K/V
 
 The public entry point for gfx950 sparse decode is ``aiter.ops.flydsl.qsa_sparse_decode``.
-Host dispatch for the indexer and sparse GQA lives in ``aiter.ops.flydsl.qsa``.
+Host dispatch for the indexer and sparse GQA lives in ``aiter.ops.flydsl.qsa_paged``.
 The fp32 reference lives in ``op_tests/qsa_ref.py``.
 """

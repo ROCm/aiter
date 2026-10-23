@@ -13,7 +13,7 @@ and a prefill workgroup walks four column tiles; MTP with 4 heads scores 4
 rows x 4 heads per MFMA instead. The indexer head count is 4 or 8, each a
 separate compile.
 
-``qsa_sparse_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
+``flydsl_qsa_paged_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
 selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
 an LSE merge; prefill runs BLOCK_N=32 two waves and writes output directly
 once the grid alone fills the machine. Softmax is online in log2 space and the
@@ -23,10 +23,11 @@ partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 The fp32 reference, the paged-cache fixtures, and the concrete shapes
 live in ``op_tests/qsa_ref.py``.
 
-``qsa_layer`` is the ``qwen4_exp`` opt-in. It runs the indexer, the vendored
-expand+tail, and sparse GQA. A rank-3 query pair missing from the measured
-table logs once. A query that is not rank 3 is not a table miss; the indexer
-or sparse GQA reports it. Sigmoid and partial RoPE stay outside the layer.
+``qsa_layer`` is the ``qwen4_exp`` opt-in. It runs the indexer,
+``qsa_expand_block_indices``, and sparse GQA. A rank-3 query pair missing
+from the measured table logs once. A query that is not rank 3 is not a
+table miss; the indexer or sparse GQA reports it. Sigmoid and partial
+RoPE stay outside the layer.
 """
 
 import functools
@@ -56,8 +57,8 @@ from .kernels.qsa.indexer_select import (
     build_qsa_indexer_prefill_scores_module,
 )
 from .kernels.qsa.sparse_gqa import (
-    _k2_coverage_reason,
     _launch_config,
+    _paged_gqa_coverage_reason,
     build_qsa_sparse_gqa_module,
 )
 from .kernels.tensor_shim import _run_compiled
@@ -97,9 +98,9 @@ _FLYDSL_DISPATCH_TABLE = {
 }
 
 __all__ = [
+    "flydsl_qsa_paged_gqa",
     "qsa_indexer_block_ids",
     "qsa_layer",
-    "qsa_sparse_gqa",
     "span_bytes",
 ]
 
@@ -161,15 +162,15 @@ def _expand_block_ids(
     token_topk: int,
     indices: torch.Tensor | None,
 ) -> torch.Tensor:
-    # Expand is the vendored Triton kernel. It is not fused into the indexer
-    # or sparse GQA.
-    from aiter.ops.triton.attention.qsa_expand import expand_qsa_block_indices
+    # In-tree expand. It is not fused into the indexer or sparse GQA, and it
+    # loads these three vectors without a stride.
+    from aiter.ops.qsa import qsa_expand_block_indices
 
-    return expand_qsa_block_indices(
+    return qsa_expand_block_indices(
         block_ids,
-        query_positions,
-        context_lens,
-        token_to_req,
+        query_positions.contiguous(),
+        context_lens.contiguous(),
+        token_to_req.contiguous(),
         compress_ratio,
         token_topk,
         out=indices,
@@ -209,7 +210,7 @@ def _prefill_scores_plan(
     )
 
 
-def _k1_prefill_lds_bytes(n_heads: int) -> int:
+def _indexer_prefill_lds_bytes(n_heads: int) -> int:
     """Bytes in the 16-row scorer's LDS tile.
 
     Q is 16 rows of ``n_heads`` with the row padded by ``_LDS_ROW_PAD`` bf16
@@ -230,7 +231,7 @@ def _k1_prefill_lds_bytes(n_heads: int) -> int:
 _ROWS_SCORER_MIN_ROWS_PER_REQUEST = 2
 
 
-def _k1_uses_prefill_scorer(
+def _indexer_uses_prefill_scorer(
     n_requests: int, rows: int, n_heads: int, arch: str
 ) -> bool:
     """Whether this launch uses the 16-row scorer.
@@ -253,7 +254,7 @@ _ROWS_SCORER_FOUR_TILE_MIN_ROWS = 512
 _ROWS_SCORER_MULTI_TILE_MIN_WORK = 512
 
 
-def _k1_rows_scorer_layout(
+def _indexer_rows_scorer_layout(
     n_requests: int,
     rows: int,
     n_heads: int,
@@ -303,7 +304,7 @@ def _active_columns_plan():
     return build_qsa_indexer_active_columns_module()
 
 
-def _k1_max_visible_columns(
+def _indexer_max_visible_columns(
     token_to_req: torch.Tensor,
     query_positions: torch.Tensor,
     context_lens: torch.Tensor,
@@ -336,7 +337,9 @@ def _k1_max_visible_columns(
     return int(scratch.item())
 
 
-def _check_k1_score_workspace(scores: torch.Tensor, rows: int, n_columns: int) -> None:
+def _check_indexer_score_workspace(
+    scores: torch.Tensor, rows: int, n_columns: int
+) -> None:
     """Reject a score buffer that is not fp32 ``[rows, n_columns]``.
 
     The column stride stays 1 so a narrowed prefix is contiguous in each
@@ -395,7 +398,7 @@ def qsa_indexer_score_and_select(
     m = int(q.shape[0])
     n_columns = int(n_columns)
     if scores is not None:
-        _check_k1_score_workspace(scores, m, n_columns)
+        _check_indexer_score_workspace(scores, m, n_columns)
         if scores.device != q.device:
             raise ValueError("scores must be on the same device as q")
     arch = _qsa_arch()
@@ -410,9 +413,9 @@ def qsa_indexer_score_and_select(
     # so the bytes the descriptor has to cover are the span.
     wide_cache = span_bytes(k_cache) > (1 << 32)
     k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
-    if _k1_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
+    if _indexer_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
         layout_columns = n_columns if live_columns is None else int(live_columns)
-        fold_heads, tiles_per_wg = _k1_rows_scorer_layout(
+        fold_heads, tiles_per_wg = _indexer_rows_scorer_layout(
             int(context_lens.shape[0]),
             m,
             n_heads,
@@ -578,16 +581,16 @@ def qsa_indexer_supported(
 
 
 def qsa_indexer_selection_supported(token_topk: int, compress_ratio: int) -> str | None:
-    """Why this token budget is outside the baked K1 contract, or None.
+    """Why this token budget is outside the baked indexer contract, or None.
 
-    K1 writes ``[_K]`` block ids and divides positions by ``_R``. Expand
+    The indexer writes ``[_K]`` block ids and divides positions by ``_R``. Expand
     then expects ``token_topk // compress_ratio`` columns, so a budget of
     1024 tokens at ratio 4 is rejected there, while 4096 tokens at ratio 8
     still has 512 columns and would be attended at the wrong positions.
     """
     if compress_ratio != _R or token_topk != _K * _R:
         return (
-            f"FlyDSL K1 selects {_K} blocks at compress ratio {_R} "
+            f"FlyDSL indexer selects {_K} blocks at compress ratio {_R} "
             f"(token_topk={_K * _R}), got token_topk={token_topk} "
             f"compress_ratio={compress_ratio}"
         )
@@ -647,7 +650,7 @@ def qsa_indexer_block_ids(
     elif not out.is_contiguous():
         raise ValueError("out must be contiguous")
     if scores is not None:
-        _check_k1_score_workspace(
+        _check_indexer_score_workspace(
             scores, m, int(page_table.shape[1]) * int(k_cache.shape[1])
         )
     tensors = (q, k_cache, page_table, token_to_req, query_positions, context_lens, out)
@@ -693,7 +696,7 @@ def qsa_indexer_block_ids(
     padded_decode = n_columns > _ONE_WORKGROUP_MAX_ROW_WIDTH and m <= _DECODE_MAX_ROWS
     row_bounded = padded_decode and torch.cuda.is_current_stream_capturing()
     if padded_decode and not row_bounded:
-        live_columns = _k1_max_visible_columns(
+        live_columns = _indexer_max_visible_columns(
             token_to_req, query_positions, context_lens, n_columns
         )
     if live_columns <= _K:
@@ -754,7 +757,7 @@ def _plan(
     )
 
 
-def qsa_sparse_gqa_supported(
+def flydsl_qsa_paged_gqa_supported(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -812,10 +815,10 @@ def qsa_sparse_gqa_supported(
     block_n, block_threads, _ = _launch_config(
         int(q.shape[0]), int(indices.shape[1]), n_kv_heads, head_dim
     )
-    return _k2_coverage_reason(head_dim, block_n, block_threads)
+    return _paged_gqa_coverage_reason(head_dim, block_n, block_threads)
 
 
-def _take_k2_workspace(workspace, n_splits, rows, n_q_heads, head_dim, device):
+def _take_paged_gqa_workspace(workspace, n_splits, rows, n_q_heads, head_dim, device):
     """Return the caller pair, or raise if it cannot hold this split."""
     if not isinstance(workspace, tuple) or len(workspace) != 2:
         raise ValueError("workspace must be (partial_out, partial_lse)")
@@ -845,7 +848,7 @@ def _take_k2_workspace(workspace, n_splits, rows, n_q_heads, head_dim, device):
     return partial_out, partial_lse
 
 
-def qsa_sparse_gqa(
+def flydsl_qsa_paged_gqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -862,9 +865,9 @@ def qsa_sparse_gqa(
     ``None`` allocates that pair. A one-split launch writes ``out``
     directly and does not read ``workspace``.
     """
-    reason = qsa_sparse_gqa_supported(q, k_cache, v_cache, indices, page_table)
+    reason = flydsl_qsa_paged_gqa_supported(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
-        raise ValueError(f"[FlyDSL qsa_sparse_gqa] {reason}")
+        raise ValueError(f"[flydsl_qsa_paged_gqa] {reason}")
     rows = q.shape[0]
     n_q_heads = int(q.shape[1])
     head_dim = int(q.shape[2])
@@ -920,7 +923,7 @@ def qsa_sparse_gqa(
             (n_splits, rows, n_q_heads), dtype=torch.float32, device=q.device
         )
     else:
-        partial_out, partial_lse = _take_k2_workspace(
+        partial_out, partial_lse = _take_paged_gqa_workspace(
             workspace, n_splits, rows, n_q_heads, head_dim, q.device
         )
 
@@ -984,12 +987,13 @@ def qsa_layer(
     Returns the bf16 GQA tensor ``[M, Hq, D]``. A caller-provided ``out``
     is that tensor.
 
-    The layer is K1, the vendored expand, and K2. It raises on a token
+    The layer is the indexer, ``qsa_expand_block_indices``, and
+    ``flydsl_qsa_paged_gqa``. It raises on a token
     budget other than 512 blocks at compress ratio 4. The live GPU must
     be gfx942 or gfx950. ``get_gfx_runtime`` decides that, and any other
     architecture raises. A rank-3 pair missing from the measured table
     logs once and still runs. A query that is not rank 3 does not log;
-    K1 or K2 reports it. Indexer scores are multiplied by ``score_scale``
+    the indexer or paged GQA reports it. Indexer scores are multiplied by ``score_scale``
     and QK by ``softmax_scale``. ``None`` is ``head_dim**-0.5`` for that
     tensor.
 
@@ -1004,7 +1008,7 @@ def qsa_layer(
             each other in shape and stride, with a unit D stride and the
             same 8-element stride rule. ``Hq`` divides across ``Hkv`` in
             a group of at most 16. ``D`` is a multiple of 32 and fills
-            the K2 gather, K LDS map, and PV tile.
+            the paged GQA gather, K LDS map, and PV tile.
         kv_page_table: int32 ``[n_req, n_pages]``.
         token_to_req, query_positions: int32 ``[M]``.
         context_lens: 1-D int32, with no more rows than ``index_page_table``.
@@ -1031,7 +1035,7 @@ def qsa_layer(
 
     A span past 4 GiB on a cache selects the wide gather compile. An empty
     query, cache, or page table writes ``-1`` block ids and a zero ``out``
-    and does not launch. K2 gathers the token ids it is given and does not
+    and does not launch. Paged GQA gathers the token ids it is given and does not
     check that they are causal. It allocates its own split partials on a
     multi-split launch. The block ids are the selection for this call.
     Sigmoid and partial RoPE stay outside this call.
@@ -1071,7 +1075,7 @@ def qsa_layer(
         token_topk,
         indices,
     )
-    return qsa_sparse_gqa(
+    return flydsl_qsa_paged_gqa(
         q_gqa,
         k_cache,
         v_cache,

@@ -100,7 +100,7 @@ def _qsa_aot_targets() -> list[tuple[str, int]]:
         return [(arch, GFX_CU_NUM_MAP[arch]) for arch in archs]
     if torch.cuda.is_available():
         from aiter.jit.utils.chip_info import get_cu_num
-        from aiter.ops.flydsl.qsa import _qsa_arch
+        from aiter.ops.flydsl.qsa_paged import _qsa_arch
 
         return [(_qsa_arch(), int(get_cu_num()))]
     return [(arch, GFX_CU_NUM_MAP[arch]) for arch in _QSA_ARCHS]
@@ -118,7 +118,7 @@ def _qsa_compile_device(arch: str, cu_num: int):
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    import aiter.ops.flydsl.qsa as qsa_mod
+    import aiter.ops.flydsl.qsa_paged as qsa_mod
     from aiter.jit.utils.chip_info import get_cu_num
 
     class _Props:
@@ -159,7 +159,7 @@ def _qsa_compile_device(arch: str, cu_num: int):
 
 
 def _compile_indexer(job):
-    from aiter.ops.flydsl.qsa import qsa_indexer_block_ids
+    from aiter.ops.flydsl.qsa_paged import qsa_indexer_block_ids
 
     bf16, i32 = torch.bfloat16, torch.int32
     device = torch.device("cuda")
@@ -191,7 +191,7 @@ def _compile_indexer(job):
 
 
 def _compile_sparse_gqa(job):
-    from aiter.ops.flydsl.qsa import qsa_sparse_gqa
+    from aiter.ops.flydsl.qsa_paged import flydsl_qsa_paged_gqa
 
     bf16, i32 = torch.bfloat16, torch.int32
     device = torch.device("cuda")
@@ -212,7 +212,7 @@ def _compile_sparse_gqa(job):
             indices = torch.zeros(rows, width, dtype=i32, device=device)
             indices[:, -1] = -1
             token_to_req = torch.zeros(rows, dtype=i32, device=device)
-            qsa_sparse_gqa(q, k_cache, v_cache, indices, table, token_to_req)
+            flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, table, token_to_req)
 
 
 def compile_one_config(**job) -> dict:
