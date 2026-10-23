@@ -227,6 +227,18 @@ def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
     return max(int(window_size[0]), 0)
 
 
+def _normalize_causal_window_size(
+    causal: bool, window_size: tuple[int, int]
+) -> tuple[int, int]:
+    # With causal masking, a right window >= 0 never masks anything the causal
+    # mask doesn't already mask, so drop it. This lets causal sliding-window
+    # callers that pass e.g. (left, 0) or (left, left) use the kernels that only
+    # support a left window.
+    if causal and int(window_size[1]) >= 0:
+        return (int(window_size[0]), -1)
+    return window_size
+
+
 def gluon_forward_unsupported_reason(
     *,
     dropout_p: float = 0.0,
@@ -1412,6 +1424,7 @@ def flash_attn_func(
     if backend == "gluon" and implementation is not None:
         raise ValueError("implementation is only supported by the Triton backend")
     implementation = _resolve_implementation(implementation)
+    window_size = _normalize_causal_window_size(causal, window_size)
     _LOGGER.info(
         "FLASH_ATTN [%s]:  q=%s  k=%s  v=%s",
         backend,
@@ -1730,6 +1743,7 @@ def flash_attn_varlen_func(
         and (block_table is not None or out is not None)
     ):
         raise NotImplementedError("dao_ai varlen does not support block_table or out")
+    window_size = _normalize_causal_window_size(causal, window_size)
     _LOGGER.info(
         "FLASH_ATTN_VARLEN [%s]:  q=%s  k=%s  v=%s",
         backend,
