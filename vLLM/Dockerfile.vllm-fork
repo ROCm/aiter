@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+#
+# vllm-aiter-ar + the vLLM fork's prefill-size QuickReduce dispatch.
+#
+#   docker build -t vllm-aiter-ar-prefill -f Dockerfile.vllm-fork .
+#
+# Build ./Dockerfile first (image vllm-aiter-ar): this file only layers a few
+# Python files on it, so the aiter AOT build is not repeated (it stays cached).
+# The fork has no csrc changes, so no vLLM rebuild is needed.
+
+ARG BASE=vllm-aiter-ar
+FROM ${BASE}
+
+# Fork branch rocm/flydsl-quickreduce-pcie-nightly1016: the QuickReduce commit
+# cherry-picked onto the nightly's own vLLM commit, so the overlaid files differ
+# from the nightly's only by that commit. Pin a SHA, not the branch name.
+ARG VLLM_FORK=https://github.com/vpietila-amd/vllm.git
+ARG VLLM_FORK_REF=f9b565af17
+ARG VLLM_FORK_BASE=49cb2bbf71cf
+# vLLM commit the BASE image must have been built from (see ./Dockerfile).
+ARG VLLM_NIGHTLY_SHA=49cb2bbf71cfd36ee5aa33d1e184b1cddff55294
+
+# Refuse to overlay onto a different vLLM than the one the fork was checked against.
+RUN python3 -c "import vllm; print('vllm', vllm.__version__)" \
+    && python3 -c "import sys, vllm; sys.exit(0 if '${VLLM_NIGHTLY_SHA}'[:9] in vllm.__version__ else 1)" \
+    || { echo "BASE vLLM is not nightly ${VLLM_NIGHTLY_SHA}; rebuild ./Dockerfile with the pinned BASE"; exit 1; }
+
+# Overlay exactly the vllm/ files the branch changes. Everything else, incl. the
+# compiled extensions, stays as the nightly shipped it.
+# Locate the installed vllm from / first: inside the clone, "import vllm" finds the clone.
+RUN set -eux; \
+    cd /; \
+    site=$(python3 -c "import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))"); \
+    test "$site" != /tmp/vllm-fork; \
+    git clone --filter=blob:none --no-checkout "${VLLM_FORK}" /tmp/vllm-fork; \
+    cd /tmp/vllm-fork; \
+    git checkout -q "${VLLM_FORK_REF}"; \
+    git merge-base --is-ancestor "${VLLM_FORK_BASE}" HEAD; \
+    files=$(git diff --name-only "${VLLM_FORK_BASE}" HEAD -- vllm); \
+    test -n "$files"; \
+    git diff --name-only "${VLLM_FORK_BASE}" HEAD -- csrc CMakeLists.txt | (! grep .) ; \
+    for f in $files; do echo "overlay $f"; cp "$f" "$site/$f"; done; \
+    echo "${VLLM_FORK_REF}" > /opt/vllm-fork-ref; \
+    rm -rf /tmp/vllm-fork
+
+# Serve QuickReduce through aiter's FlyDSL schedules (needs AITER_FLY_AR=1, set in
+# the base image). The fork's dispatch is off without these.
+ENV VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=1 \
+    VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+
+# Smoke: the modules import and the fork's env vars are registered.
+RUN AITER_AOT_IMPORT=1 python3 -c "\
+import vllm.envs as e, vllm._aiter_ops, vllm.distributed.device_communicators.quick_all_reduce as q; \
+print('fork overlay ok:', open('/opt/vllm-fork-ref').read().strip()); \
+assert e.VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL is True"
+
+LABEL vllm.fork.ref="${VLLM_FORK_REF}" vllm.nightly.sha="${VLLM_NIGHTLY_SHA}"

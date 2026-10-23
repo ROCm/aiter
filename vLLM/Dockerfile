@@ -6,7 +6,9 @@
 #   docker build -t vllm-aiter-ar   .                         # main + PR 5670
 #   docker build -t vllm-aiter-main --build-arg WITH_ALLREDUCE=0 .   # plain main
 
-ARG BASE=vllm/vllm-openai-rocm:nightly
+# Pinned: nightly of vLLM 49cb2bbf71 (2026-10-16), the vLLM the existing images
+# were built on. Dockerfile.vllm-fork overlays a fork branch cut from this commit.
+ARG BASE=vllm/vllm-openai-rocm:nightly-49cb2bbf71cfd36ee5aa33d1e184b1cddff55294
 FROM ${BASE}
 
 # main as of 2026-10-16.

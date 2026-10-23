@@ -3,8 +3,10 @@
 # Run on the host.
 #
 #   ./e2e.sh build             # build both images from ./Dockerfile
+#   ./e2e.sh build-fork        # build IMAGE_FORK: IMAGE_B + the vLLM fork's prefill dispatch
 #   ./e2e.sh check             # preflight: images, vLLM all-reduce path, model
 #   ./e2e.sh run               # check, then the A/B benchmark, then the summary
+#   ./e2e.sh run3              # the same for the 3 arms in ARMS3 (needs build-fork)
 #   ./e2e.sh profile           # check, then one torch-profiled run per server
 #   ./e2e.sh smoke             # check, then only start each server, smoke-test it, stop it
 #   ./e2e.sh summary <dir>     # summary table of a finished run
@@ -27,6 +29,17 @@ HF_HUB=${HF_HUB:-${HF_HOME:-$HOME/.cache/huggingface}/hub}
 CACHE_ROOT=${CACHE_ROOT:-$HOME/.cache/vllm-e2e}
 IMAGE_A=${IMAGE_A:-vllm-aiter-main}   # baseline: aiter main
 IMAGE_B=${IMAGE_B:-vllm-aiter-ar}     # aiter main + PR 5670
+IMAGE_FORK=${IMAGE_FORK:-vllm-aiter-ar-prefill}   # IMAGE_B + the vLLM fork
+# The arms to compare: "tag,image[,VAR=value...]" separated by spaces. Each arm
+# gets its own server; VAR=value overrides the image's environment for that arm.
+# The first arm is the reference the summary's deltas are against. Tags are \w+.
+# Default: the A/B of aiter main vs main + PR 5670. For the 3-way prefill
+# comparison use ./e2e.sh run3 (see ARMS3).
+ARMS=${ARMS:-"main,$IMAGE_A ar,$IMAGE_B"}
+# Stock vLLM | fork with the stock HIP QuickReduce INT4 kernel | fork with FlyDSL
+# QuickReduce INT4. INT4 is set explicitly on the fork arm so that it is visible
+# here: it is the same quantization in both, only the kernel differs.
+ARMS3=${ARMS3:-"base,$IMAGE_A fork,$IMAGE_FORK,AITER_FLY_AR=0,VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL=0,VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4,AITER_QUICK_REDUCE_QUANTIZATION=INT4 flyar,$IMAGE_FORK"}
 # V4-Pro (~830 GiB) fits on 144 GiB GPUs only at TP=8; preflight rejects
 # TPs whose per-GPU weight share does not fit.
 TPS=${TPS:-8}
@@ -73,6 +86,12 @@ cmd_build() {
     docker build -t "$IMAGE_A" --build-arg WITH_ALLREDUCE=0 -f "$HERE/Dockerfile" "$HERE"
 }
 
+cmd_build_fork() {
+    docker image inspect vllm-aiter-ar >/dev/null 2>&1 || die "vllm-aiter-ar missing: ./e2e.sh build"
+    log "building $IMAGE_FORK (vllm-aiter-ar + vLLM fork)"
+    docker build -t "$IMAGE_FORK" -f "$HERE/Dockerfile.vllm-fork" "$HERE"
+}
+
 # ---------------------------------------------------------------- check ----
 
 in_image() {  # image cmd...
@@ -84,24 +103,37 @@ in_image() {  # image cmd...
 cmd_check() {
     command -v docker >/dev/null || die "docker not found: run this on the host"
     local ok=1 image
-    for image in "$IMAGE_A" "$IMAGE_B"; do
+    local arm tag env v fly
+    for arm in $ARMS; do
+        IFS=, read -r tag image env <<<"$arm"
         docker image inspect "$image" >/dev/null 2>&1 \
-            || die "image $image missing: ./e2e.sh build"
-        log "$image: $(in_image "$image" sh -c \
-            'echo "aiter $(git -C /opt/aiter log -1 --format=%h), AITER_FLY_AR=$AITER_FLY_AR, vllm $(python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null)"')"
+            || die "image $image missing: ./e2e.sh build / build-fork"
+        log "$tag = $image: $(in_image "$image" sh -c \
+            'echo "aiter $(git -C /opt/aiter log -1 --format=%h), AITER_FLY_AR=$AITER_FLY_AR, vllm $(python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null), fork $(cat /opt/vllm-fork-ref 2>/dev/null || echo none)"')${env:+, overrides: $env}"
         # vLLM reaches aiter's CustomAllreduce (and through it the FlyDSL
         # one-shot and fused AR+RMSNorm) only if it has this switch.
         if ! in_image "$image" python3 -c \
             "import vllm.envs as e, sys; sys.exit(0 if e.VLLM_ROCM_USE_AITER_CUSTOM_AR else 1)" 2>/dev/null; then
-            log "WARNING $image: vLLM has no VLLM_ROCM_USE_AITER_CUSTOM_AR (or it is off);" \
-                "it will not call aiter's all-reduce, so the A/B measures nothing"
+            log "WARNING $tag: vLLM has no VLLM_ROCM_USE_AITER_CUSTOM_AR (or it is off);" \
+                "it will not call aiter's all-reduce, so the comparison measures nothing"
             ok=0
         fi
+        # An override the image's vLLM does not know is silently ignored.
+        for v in ${env//,/ }; do
+            case "$v" in VLLM_*=*)
+                in_image "$image" python3 -c \
+                    "import vllm.envs as e, sys; sys.exit(0 if '${v%%=*}' in e.environment_variables else 1)" 2>/dev/null \
+                    || { log "WARNING $tag: vLLM in $image has no ${v%%=*}"; ok=0; } ;;
+            esac
+        done
+        # Effective AITER_FLY_AR: the override, else the image's.
+        fly=$(in_image "$image" sh -c 'echo $AITER_FLY_AR')
+        for v in ${env//,/ }; do case "$v" in AITER_FLY_AR=*) fly=${v#*=} ;; esac; done
+        if [ "$fly" = 1 ]; then
+            in_image "$image" sh -c 'AITER_AOT_IMPORT=1 python3 -c "from aiter.ops.flydsl import allreduce_policy"' \
+                || die "$tag: FlyDSL all-reduce does not import in $image"
+        fi
     done
-    in_image "$IMAGE_B" sh -c 'AITER_AOT_IMPORT=1 python3 -c "from aiter.ops.flydsl import allreduce_policy"' \
-        || die "$IMAGE_B: FlyDSL all-reduce does not import"
-    [ "$(in_image "$IMAGE_A" sh -c 'echo $AITER_FLY_AR')" = 0 ] || die "$IMAGE_A should have AITER_FLY_AR=0"
-    [ "$(in_image "$IMAGE_B" sh -c 'echo $AITER_FLY_AR')" = 1 ] || die "$IMAGE_B should have AITER_FLY_AR=1"
 
     mkdir -p "$CACHE_ROOT" 2>/dev/null && [ -w "$CACHE_ROOT" ] \
         || die "$CACHE_ROOT is not writable: set CACHE_ROOT to a writable directory"
@@ -153,8 +185,11 @@ cmd_check() {
 
 # ------------------------------------------------------------------ run ----
 
-start_server() {  # image tag tp out_dir
+start_server() {  # image tag tp out_dir [VAR=value...]
     local image=$1 tag=$2 tp=$3 out=$4
+    shift 4
+    local extra_env=() v
+    for v in "$@"; do extra_env+=(-e "$v"); done
     local gpus=${GPUS:-$(seq -s, 0 $((tp - 1)))}
     local profile_args=()
     if [ "$MODE" = profile ]; then
@@ -179,6 +214,7 @@ start_server() {  # image tag tp out_dir
         -e VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS="$FUSE_SHARED_EXPERTS" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e HF_HUB_OFFLINE="$HF_OFFLINE" \
+        "${extra_env[@]}" \
         --network host --ipc host \
         -v "$CACHE_ROOT/$tag":/root/.cache \
         -v "$HF_HUB":/root/.cache/huggingface/hub \
@@ -272,13 +308,14 @@ bench() {  # in out conc out_dir [extra args]
     mv "$dir/traces/$file" "$dir/"
 }
 
-run_one() {  # image tag tp
+run_one() {  # image tag tp [VAR=value...]
     local image=$1 tag=$2 tp=$3
+    shift 3
     local out="$RUN_DIR/${tag}_tp${tp}"
     mkdir -p "$out"
-    log "=== $tag TP=$tp ($image $(docker image inspect -f '{{.Id}}' "$image" | cut -c8-19))"
+    log "=== $tag TP=$tp${*:+ [$*]} ($image $(docker image inspect -f '{{.Id}}' "$image" | cut -c8-19))"
     stop_server
-    start_server "$image" "$tag" "$tp" "$out"
+    start_server "$image" "$tag" "$tp" "$out" "$@"
     if ! wait_ready; then
         stop_server
         return 0
@@ -315,13 +352,16 @@ cmd_run() {
     trap stop_server EXIT
     cmd_check
     log "run dir $RUN_DIR, mode $MODE, TPs $TPS"
-    local i=0 tp
+    local arms=($ARMS) i=0 tp k arm tag image env
+    : >"$RUN_DIR/arms.txt"
+    for arm in "${arms[@]}"; do echo "${arm%%,*}" >>"$RUN_DIR/arms.txt"; done
     for tp in $TPS; do
-        if [ $((i % 2)) -eq 0 ]; then
-            run_one "$IMAGE_A" main "$tp"; run_one "$IMAGE_B" ar "$tp"
-        else
-            run_one "$IMAGE_B" ar "$tp"; run_one "$IMAGE_A" main "$tp"
-        fi
+        # Rotate the order per TP so that slow drift does not favour one arm.
+        for ((k = 0; k < ${#arms[@]}; k++)); do
+            arm=${arms[$(((k + i) % ${#arms[@]}))]}
+            IFS=, read -r tag image env <<<"$arm"
+            run_one "$image" "$tag" "$tp" ${env//,/ }
+        done
         i=$((i + 1))
     done
     if [ "$MODE" = profile ]; then
@@ -353,8 +393,10 @@ cmd_summary() {  # run_dir
 
 case "${1:-}" in
     build) cmd_build ;;
+    build-fork) cmd_build_fork ;;
     check) cmd_check ;;
     run) MODE=bench; cmd_run ;;
+    run3) MODE=bench; ARMS=$ARMS3; cmd_run ;;
     profile) MODE=profile; cmd_run ;;
     smoke) MODE=smoke; cmd_run ;;
     summary) cmd_summary "${2:-}" ;;
