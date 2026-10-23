@@ -22,8 +22,8 @@ last k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
-in the cosine gate. Each a8w8 candidate gets its own weight and reference,
-whose magnitudes change every row for 1x32.
+in the cosine gate. 1x32 gets its own weight and reference, whose magnitudes
+change every row; the other candidates share one.
 
 Shape mapping (V4-Pro, ``config.json``):
   b = n_local_groups = o_groups // tp  (swept via ``-b``)
@@ -226,15 +226,22 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         y_phys = torch.empty(b, m, n, dtype=dtype)
         y_out = y_phys
 
-    candidates, nbytes, refs = {}, {}, {}
+    candidates, nbytes, refs, weights = {}, {}, {}, {}
+
+    def weight(rows):
+        """The weight whose magnitudes change every ``rows`` rows, and its
+        reference."""
+        if rows not in weights:
+            w = blockwise_randn(b, n, k, dtype=dtype, rows=rows)
+            weights[rows] = w, run_torch_wo_a(o_mbn, w, dtype)
+        return weights[rows]
 
     # A ragged K (not a multiple of 128) has no whole n32k4 scale group, so
     # a8w4, a8w8_128 and the n32k4 1x32 scale do not run it; 32x32 does, on the
     # archs in RAGGED_K_GFX.
     ragged_k = k % 128 != 0
     if get_gfx() in A8W4_GFX and not ragged_k:
-        w_bnk = blockwise_randn(b, n, k, dtype=dtype)
-        refs["a8w4"] = run_torch_wo_a(o_mbn, w_bnk, dtype)
+        w_bnk, refs["a8w4"] = weight(32)
         # Offline weight prep (not in the hot path); act quant mirrors every forward.
         w_codes, w_scales = preshuffle_a8w4_weight_mbn(w_bnk)
         a_fp8, a_scales = quant_act_mxfp8_mbn(o_mbn)
@@ -267,8 +274,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         if ragged_k and (rows != 32 or block != 32 or get_gfx() not in RAGGED_K_GFX):
             continue
         name = f"a8w8_{rows}x{block}"
-        w_blk = blockwise_randn(b, n, k, dtype=dtype, rows=min(rows, 32))
-        refs[name] = run_torch_wo_a(o_mbn, w_blk, dtype)
+        w_blk, refs[name] = weight(min(rows, 32))
         x8, xs8 = quant_act_e8m0(o_mbn, block)
         w8, ws8 = quant_weight_e8m0(w_blk, rows, block)
         run = _a8w8_flydsl if rows == 1 else _a8w8

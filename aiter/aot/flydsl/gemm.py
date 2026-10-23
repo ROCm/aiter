@@ -235,8 +235,9 @@ def _bmm_mfma_job(
         "cu_num": 0,  # the gfx column names the arch
         "gfx": row.get("gfx", "").strip(),
         "b": b,
-        # A table from before the column holds only 128x128 rows (as at runtime).
-        "w_scale_block": row.get("w_scale_block", "128x128").strip(),
+        # A table from before the column, or a blank cell, holds 128x128 rows
+        # (as the runtime loaders read it).
+        "w_scale_block": (row.get("w_scale_block") or "128x128").strip(),
         "x_scale_transposed": x_scale_transposed,
         **params,
     }
@@ -353,11 +354,12 @@ def parse_csv(csv_path: str):
             continue
 
         if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
-            # A 128-wide GEMM x_scale is column-major (blockscale), read by
-            # the transposed kernel, except at M = 1 where both coincide.
+            # Dispatch runs the row with the x_scale block that goes with its
+            # w_scale's: 1x128 with 128x128 (column-major, blockscale, read
+            # by the transposed kernel except at M = 1), else 1x32.
             layouts = (
                 (False, True)
-                if row.get("w_scale_block", "128x128").strip() == "128x128"
+                if (row.get("w_scale_block") or "128x128").strip() == "128x128"
                 else (False,)
             )
             for transposed in layouts:
@@ -954,12 +956,13 @@ def _compile_bmm_mfma_to_cache(
     """Compile a gfx950 mxscale BMM through the runtime's own launch path, so
     run_bmm_a8w8_mxfp8_gfx950 hits this cache entry."""
     del kwargs
-    rows, cols = (int(v) for v in w_scale_block.split("x"))
-    if rows != cols and w_scale_block != "1x32":
-        raise ValueError(f"{kernel_name}: no AOT wiring for a {w_scale_block} w_scale")
+    from aiter.ops.opus.policy import mxscale_bmm_groups_of_block
+
+    rows, cols = mxscale_bmm_groups_of_block(w_scale_block)
+    # Rows run with 1 x cols x_scale blocks (column-major only for 1x128).
     with compile_only_env():
         compile_bmm_a8w8_mxfp8_gfx950(
-            kernel_name, b, n, k, cols, x_scale_transposed, w_scale_n=rows
+            kernel_name, b, n, k, cols, rows, cols, x_scale_transposed
         )
 
 

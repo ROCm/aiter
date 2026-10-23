@@ -177,11 +177,13 @@ export AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE=/tmp/bmm_tu
 
 This selects that CSV for `aiter.batched_gemm_a8w8_mxscale_bpreshuffle` calls.
 The same environment override can select the pre-tune baseline for `--compare`.
-When a config lookup misses, the existing FlyDSL fallback remains in effect.
+When a config lookup misses, the FlyDSL heuristic runs the shape; on gfx950,
+`1x32` runs OPUS's heuristic kid, or FlyDSL's when no OPUS kid runs the shape.
 A 2-D `gemm_a8w8_blockscale_bpreshuffle` call with E8M0 scales runs the `b=1`
 FlyDSL kernel but reads the `kernelId=bmm` rows of
-`a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv`, not this CSV; to use a
-`b=1` FlyDSL result there, add it as such a row.
+`a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv`, not this CSV;
+`csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py
+--mxscale_table` tunes those rows.
 
 ## Other useful options
 

@@ -13,7 +13,7 @@ See README.md for CSV templates and the shared GEMM tuning workflow.
 A 2-D gemm_a8w8_blockscale_bpreshuffle call with e8m0 scales runs the b = 1
 FlyDSL kernel on gfx950, but reads its kernelName from the kernelId=bmm
 rows of a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv, not this table;
-to use a b = 1 flydsl result there, add it as such a row.
+gemm_a8w8_mxfp8_bpreshuffle_tune.py --mxscale_table tunes those rows.
 """
 
 import csv
@@ -29,17 +29,19 @@ import opus_bmm_mxscale_tune as opus_tune
 from aiter import dtypes
 
 FLYDSL_KERNEL_ID = -1
-_SPLITS = (1, 2, 4, 8, 16)
 # The preshuffled kids each w_scale block's flydsl operands are generated
 # with. Any plain-scale preshuffled kid of the block gives the same tensors;
 # these are just ones every build has.
 _DATA_KID = opus_tune.BMM_BLOCK_DATA_KIDS
 
 
-def _scale_blocks(block):
-    """(x_scale_k, w_scale_n, w_scale_k) of a w_scale block such as 1x32."""
-    rows, cols = (int(v) for v in block.split("x"))
-    return cols, rows, cols
+def _scale_args(block):
+    """check_bmm_config's scale arguments for a w_scale block, with the
+    row-major x_scale of the block's width the operands are generated with."""
+    from aiter.ops.opus.policy import mxscale_bmm_groups_of_block
+
+    rows, cols = mxscale_bmm_groups_of_block(block)
+    return {"x_scale_k": cols, "w_scale_n": rows, "w_scale_k": cols}
 
 
 # --- mp_tuner hooks (module level so the spawned workers import them) -------
@@ -61,17 +63,8 @@ def run_flydsl_bmm_bench(x, w, x_scale, w_scale, y, kernel_name):
 def _runs(b, n, k, block, cfg):
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import check_bmm_config
 
-    x_scale_k, w_scale_n, w_scale_k = _scale_blocks(block)
     try:
-        check_bmm_config(
-            n,
-            k,
-            b,
-            **cfg,
-            x_scale_k=x_scale_k,
-            w_scale_n=w_scale_n,
-            w_scale_k=w_scale_k,
-        )
+        check_bmm_config(n, k, b, **cfg, **_scale_args(block))
     except ValueError:
         return False
     return True
@@ -141,29 +134,11 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
             }
 
     def _flydsl_names(self, b, m, n, k, block, how):
-        from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
-            bmm_kernel_name,
-            parse_bmm_kernel_name,
-            pick_bmm_kernel_name,
-        )
+        from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import bmm_candidate_names
 
         seed = self.fly_seed.get((b, block), [])
-        names = {r for mm, r in seed if how == "all" or m / 2 <= mm <= m * 2}
-        try:
-            names.add(pick_bmm_kernel_name(b, m, n, k, *_scale_blocks(block)))
-        except ValueError:
-            pass
-        out = set()
-        for name in names:
-            cfg = parse_bmm_kernel_name(name)
-            base = cfg["splits"]
-            for sp in _SPLITS:
-                if sp != base and not (base / 2 <= sp <= base * 2):
-                    continue
-                c = {**cfg, "splits": sp}
-                if _runs(b, n, k, block, c):
-                    out.add(bmm_kernel_name(**c))
-        return sorted(out)
+        names = [r for mm, r in seed if how == "all" or m / 2 <= mm <= m * 2]
+        return bmm_candidate_names(b, m, n, k, names, **_scale_args(block))
 
     def result_to_df(self, results):
         df = super().result_to_df(results)
