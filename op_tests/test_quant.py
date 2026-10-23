@@ -10,7 +10,10 @@ import torch
 import aiter
 from aiter import dtypes, get_hip_quant, get_torch_quant, get_triton_quant
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.quant import dynamic_per_group_scaled_quant
+from aiter.ops.quant import (
+    dynamic_per_group_scaled_quant,
+    fused_dynamic_mx_quant_moe_sort,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -441,6 +444,34 @@ def test_mxfp8_large_finite(group_size, shuffle, amax_bits):
     assert torch.all(scale == int(exponent.item()) + 127).item(), amax_bits
 
 
+def test_mx_quant_moe_sort_threshold(m, n, h_dtype, q_dtype, pattern=None):
+    """fused_dynamic_mx_quant_moe_sort takes the fused kernel up to M = 2048 / topk at
+    stage 1 and the split path above it; both must follow _mx_reference."""
+    G, topk, block_m = 32, 8, 32
+    fp4 = q_dtype == dtypes.fp4x2
+    x = torch.randn((m, n), dtype=h_dtype)
+    if pattern == "snan":
+        x.view(torch.int16)[m - 1, 5] = 0x7F81 if h_dtype == dtypes.bf16 else 0x7C01
+    elif pattern is not None:
+        _plant_nonfinite(x, G, pattern)
+    rows_pad = (m + block_m - 1) // block_m * block_m
+    sorted_ids = torch.full((rows_pad,), m, dtype=torch.int32)
+    sorted_ids[:m] = torch.arange(m, dtype=torch.int32)
+    num_valid_ids = torch.tensor([rows_pad, m], dtype=torch.int32)
+    out, scale = fused_dynamic_mx_quant_moe_sort(
+        x, sorted_ids, num_valid_ids, m, topk, block_m, quant_dtype=q_dtype
+    )
+
+    ref_out, ref_scale = _mx_reference(x, G, q_dtype)
+    got_scale = scale.view(torch.uint8).flatten()[_mx32_indices(m, n // G)]
+    got_out = out.view(torch.uint8) if fp4 else _fp8_bytes(out)
+    scale_err = int((got_scale != ref_scale).sum())
+    out_err = int((got_out != ref_out).sum())
+    assert (
+        scale_err == 0 and out_err == 0
+    ), f"{m=} {n=} {h_dtype=} {q_dtype=} {pattern=} {scale_err=} {out_err=}"
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -620,4 +651,15 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx942", "gfx950", "gfx12
             test_mxfp8_nonfinite(gs, shuffle, h_dtype, pattern)
         for amax_bits in [0x7F60, 0x7F61, 0x7F69, 0x7F7F]:
             test_mxfp8_large_finite(gs, shuffle, amax_bits)
+    # Stage-1 MoE quant + sort at topk 8: M = 256 is the last fused size, 288 splits.
+    for m, h_dtype, pattern in itertools.product(
+        (256, 288),
+        [dtypes.bf16, dtypes.fp16],
+        [None, "nan", "posinf", "neginf", "mixed", "snan"],
+    ):
+        if pattern == "snan" and h_dtype == dtypes.bf16 and get_gfx() != "gfx1250":
+            continue
+        test_mx_quant_moe_sort_threshold(m, 7168, h_dtype, dtypes.fp8, pattern)
+        if pattern is None and get_gfx() != "gfx942":
+            test_mx_quant_moe_sort_threshold(m, 7168, h_dtype, dtypes.fp4x2)
     aiter.logger.info("fp8_mx_nonfinite passed")

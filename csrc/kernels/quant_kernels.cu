@@ -2810,6 +2810,46 @@ __device__ void store_zero_mx_quant_moe_sort_row(
     }
 }
 
+// MXFP8 convert + store under the contract of the split path (dynamic_per_group_scaled_quant):
+// `row_scale` is already capped by mxfp8_cap_scale, and the convert does not clamp, so NaN stays
+// NaN and an Inf group's Inf turns into NaN. gfx1250 divides by the scale in hardware.
+template <typename DTYPE_I, int vec_size>
+__device__ void store_mxfp8_row_chunk(opus::fp8_t* __restrict__ out,
+                                      opus::vector_t<DTYPE_I, vec_size> data,
+                                      const float row_scale,
+                                      const int cols,
+                                      const int64_t out_offset)
+{
+#if defined(__gfx1250__)
+    static constexpr bool kHwConvertDiv = opus::is_any_of_v<DTYPE_I, opus::bf16_t, opus::fp16_t>;
+#else
+    static constexpr bool kHwConvertDiv = false;
+#endif
+    static constexpr bool kScaleMayClip =
+        aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::RoundDown ||
+        aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even;
+    if constexpr(kScaleMayClip)
+    {
+        const float hi = kMxFp8Max * row_scale;
+        for(int j = 0; j < vec_size; ++j)
+        {
+            const float v = static_cast<float>(data[j]);
+            if(v > hi)
+                data[j] = static_cast<DTYPE_I>(hi);
+            if(v < -hi)
+                data[j] = static_cast<DTYPE_I>(-hi);
+        }
+    }
+    opus::vector_t<opus::fp8_t, vec_size> q;
+    if constexpr(kHwConvertDiv)
+        q = scaled_cast_div<opus::fp8_t>(data, row_scale);
+    else
+        q = scaled_cast_fp8_noclamp(data, 1.0f / row_scale);
+    auto buffer_o = opus::make_gmem<opus::fp8_t>(out + out_offset, (cols + 3) / 4 * 4);
+    if(threadIdx.x < (cols + vec_size - 1) / vec_size)
+        store_vector<opus::fp8_t, opus::fp8_t, vec_size, RT>(buffer_o, q, threadIdx.x * vec_size);
+}
+
 template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
 __global__ void fused_mx_quant_moe_sort_kernel(
     DTYPE_O* __restrict__ out,
@@ -2936,8 +2976,9 @@ __global__ void fused_mx_quant_moe_sort_kernel(
             }
             else if constexpr (std::is_same_v<DTYPE_O, opus::fp8_t>)
             {
-                row_scale = aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode,
-                                                       kHwFp8Dtype>(absMax);
+                row_scale = mxfp8_cap_scale(
+                    aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kHwFp8Dtype>(
+                        absMax));
             }
             else
             {
@@ -2953,8 +2994,12 @@ __global__ void fused_mx_quant_moe_sort_kernel(
 
             if(topk_id < topk || topk == 1)
             {
-                scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(
-                    out, input_f_ptr, &row_scale, cols, offset_base * cols);
+                if constexpr(std::is_same_v<DTYPE_O, opus::fp8_t>)
+                    store_mxfp8_row_chunk<DTYPE_I, vec_size_i>(
+                        out, vec_input, row_scale, cols, offset_base * cols);
+                else
+                    scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(
+                        out, input_f_ptr, &row_scale, cols, offset_base * cols);
             }
         }
     }
