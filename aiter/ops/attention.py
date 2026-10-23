@@ -987,7 +987,7 @@ def get_pa_metadata_info_v1(
         )
         capacity = min(
             batch_size * max_partitions,
-            batch_size + cu_num // num_head_k - 1,
+            max(batch_size, (2 * cu_num + num_head_k - 1) // num_head_k),
         )
         max_work = capacity * num_head_k
         max_split_tiles = capacity
@@ -1042,16 +1042,18 @@ def get_pa_metadata_v1(
                        get_pa_metadata_info_v1 using the same fast_mode/max_split_per_batch.
                        v1_1 supports dense batches up to 4096 with positive Q lengths and
                        max_seqlen_qo * num_heads_per_head_k <= 128 (one Q tile). KV granularity
-                       must be a multiple of block_size. Inputs must provide consistent Q/page
+                       is at least 256 tokens and must be a multiple of block_size. Inputs must provide consistent Q/page
                        indptrs and valid context lengths. Empty contexts receive no work; callers
                        remain responsible for their final output values.
                        Each request builds its plan on the GPU, followed by a same-stream
                        finalizer for work_indptr. No GPU-to-CPU length readback is needed.
-                       Work boundaries follow cumulative KV-tile * Q-length budgets. Adjacent
-                       tiles of one request on the same worker stay in one work. All KV heads
-                       use floor(CUs / KV heads) workers so they share the reduction layout.
-                       A restrictive max_split_per_batch may merge budget ranges and reduce
-                       load balance; KV granularity also limits how precisely work can be split.
+                       Each nonempty request gets one partition, then integer prefix quotas
+                       distribute the remaining 2*CUs task budget across KV heads by KV tile count.
+                       Each request is split into equal contiguous tile ranges, matching the
+                       FlyDSL PA plan's 256-token partition rule when kv_granularity <= 256.
+                       All KV heads share the partition and reduction layout; persistent workers
+                       may process multiple works. A restrictive max_split_per_batch limits
+                       partitions and can reduce load balance.
                        More partitions can increase attention/reduction overhead; benchmark the
                        whole operation before selecting this mode.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
