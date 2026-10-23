@@ -132,7 +132,7 @@ from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_BLOCK,
     DEFAULT_FANOUT,
-    DEFAULT_GRID_CAP,
+    ONESHOT_DEFAULT_GRID_CAP,
 )
 
 try:
@@ -379,7 +379,7 @@ def _test_ladder(atoms=None, grid_cap=None, fanout=None, block=None) -> tuple:
         OneShotRung(
             min_bytes=0,
             atoms=DEFAULT_ATOMS if atoms is None else atoms,
-            grid_cap=DEFAULT_GRID_CAP if grid_cap is None else grid_cap,
+            grid_cap=ONESHOT_DEFAULT_GRID_CAP if grid_cap is None else grid_cap,
             fanout=DEFAULT_FANOUT if fanout is None else fanout,
             block=DEFAULT_BLOCK if block is None else block,
         ),

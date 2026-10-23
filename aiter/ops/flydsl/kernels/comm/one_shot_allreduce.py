@@ -31,6 +31,7 @@ from .allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
+    _RECV_POLICY,
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
     _buffer_load,
@@ -61,12 +62,7 @@ DEFAULT_ATOMS = 1
 # for a given payload, at the cost of coarser load balance on the last partial
 # tile.
 SUPPORTED_ATOMS = (1, 2, 4)
-DEFAULT_GRID_CAP = 64
-
-# Read our own inbox with the caches bypassed: a peer wrote these lines
-# microseconds ago and an L1 hit here is a stale hit. Same reasoning as the
-# ring kernel's ``_RECV_POLICY``.
-_RECV_POLICY = _CM_SC0 | _CM_SC1
+ONESHOT_DEFAULT_GRID_CAP = 64
 
 # Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
 #

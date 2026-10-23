@@ -34,8 +34,6 @@ SUPPORTED_BLOCKS = (64, 128, 256, 512)
 PAYLOAD_ALIGN_BYTES = 16
 # Largest payload, in bytes: the window of a buffer descriptor.
 MAX_PAYLOAD_BYTES = 0xFFFFFFFF
-# Smallest payload a quantized schedule accepts when it is used on its own.
-QUANT_MIN_PAYLOAD_BYTES = 128 << 10
 
 WORLD = 8  # Default value for world size
 BLOCK = 256
@@ -281,6 +279,12 @@ _CM_SC0 = 1
 _CM_NT = 2
 _CM_SC1 = 16
 
+# Cache policy for the ring and one-shot loads from our own inbox, on every
+# inbox memory type. A peer wrote these lines microseconds ago, so a cache hit
+# is a stale hit. ``nt`` (the fine-grained ``recv`` entry below) is only a
+# reuse hint; ``sc0 sc1`` sends the load to memory.
+_RECV_POLICY = _CM_SC0 | _CM_SC1
+
 # Cache policy for each inbox memory type
 # =======================================
 #
@@ -299,10 +303,10 @@ _CM_SC1 = 16
 #   recv     The ``_CM_*`` cache-modifier bits on the payload loads of the
 #            reader.
 #
-# The table is the policy of the flag-based mesh. The ring uses its own
+# The table is the policy of the flag-based mesh. The ring uses
 # ``_RECV_POLICY`` instead of ``recv``. The one-shot has no flag and no
 # acquire: it polls the payload itself for a sentinel, and so it loads every
-# payload with ``_CM_SC0 | _CM_SC1`` on both memory types, and it does not use
+# payload with ``_RECV_POLICY`` on both memory types, and it does not use
 # the ``acquire`` or ``recv`` entries.
 #
 # On gfx942/gfx950, the stores lower as follows:

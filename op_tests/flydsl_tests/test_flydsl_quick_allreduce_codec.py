@@ -412,11 +412,11 @@ def test_extremum_past_e4m3_ceiling_saturates_monotonically(codec_name):
     """Past the ceiling the codec clips; it never wraps to a smaller value.
 
     Saturating the exponent field alone is not enough: with the mantissa left
-    at whatever the input produced, 512 used to encode as 256, so an outlier
-    decoded *smaller* than the ceiling it passed and the whole group's scale
-    collapsed with it. The encoder pins the mantissa to its maximum on
-    overflow too, so every extremum at or above the ceiling lands on the same
-    value.
+    at whatever the input produced, 512 would encode as 256, so an outlier
+    would decode *smaller* than the ceiling it passed and the whole group's
+    scale would collapse with it. The encoder pins the mantissa to its maximum
+    on overflow too, so every extremum at or above the ceiling lands on the
+    same value.
     """
     at_ceiling = float(codec_roundtrip(_spike_group(480.0), codec_name)[0])
     assert at_ceiling == pytest.approx(E4M3_MAX, abs=1.0)
@@ -433,10 +433,10 @@ def test_extremum_below_e4m3_floor_survives_instead_of_zeroing(codec_name):
     """A sub-floor extremum rounds coarsely; it does not lose the whole group.
 
     ``0x00`` is the byte reserved for exact zero. A positive extremum small
-    enough to encode there used to collide with that sentinel, so the decoder
-    read a scale of 0 and every value in the group came back as 0 -- at 1e-3,
-    which is nowhere near the edge of either bf16 or fp16. The encoder now
-    bumps such a value to ``0x01``, the smallest non-zero magnitude.
+    enough to encode there would collide with that sentinel: the decoder would
+    read a scale of 0 and return every value in the group as 0, at 1e-3, which
+    is nowhere near the edge of either bf16 or fp16. The encoder bumps such a
+    value to ``0x01``, the smallest non-zero magnitude.
 
     Far enough below the floor it does still underflow to zero, but that is
     the format running out of exponent rather than a sentinel collision.

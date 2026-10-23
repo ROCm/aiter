@@ -33,9 +33,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from .allreduce_shared import (
-    _CM_SC0,
-    _CM_SC1,
     _INBOX_POLICY,
+    _RECV_POLICY,
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
@@ -87,13 +86,6 @@ RING_SUPER_TILES = (1, 8, 16, 32)
 # the all-gather lap forwards the bytes it received without touching them.
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
-
-# Cache policy for the loads of a rank-tile from our own inbox. The ring uses
-# this policy for all inbox types. It does not use the ``recv`` entry of
-# ``_INBOX_POLICY``, which is ``nt`` on a fine-grained inbox. ``nt`` is only a
-# reuse hint, and the ring needs a cache bypass. With ``sc0 sc1``, the load
-# goes to memory.
-_RECV_POLICY = _CM_SC0 | _CM_SC1
 
 
 def _load_i32_at(ptr, elem_off, cache_modifier):

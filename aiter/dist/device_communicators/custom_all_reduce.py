@@ -1794,7 +1794,7 @@ class CustomAllreduce:
             return False
         if not inp.is_contiguous():
             return False
-        if inp.data_ptr() % 16:
+        if inp.data_ptr() % fly_policy.PAYLOAD_ALIGN_BYTES:
             return False
         if inp.device.index != self.device.index:
             return False

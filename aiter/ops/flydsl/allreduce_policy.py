@@ -62,6 +62,7 @@ from .kernels.comm.allreduce_shared import (
     BLOCK,
     LINKS,
     MAX_PAYLOAD_BYTES,  # noqa: F401  -- re-exported for the dispatchers
+    PAYLOAD_ALIGN_BYTES,  # noqa: F401  -- re-exported for the dispatchers
     SUPPORTED_ARCHS,  # noqa: F401  -- re-exported for the dispatchers
     SUPPORTED_WORLDS,
     AllReduceAlgorithm,
@@ -390,6 +391,12 @@ MIN_BATCH_BLOCKS = 32
 # the running partial at every hop, and the partial's extremum grows with the
 # contributions folded in, so unlike the mesh its error grows with N.
 RS_INT6_MIN_WORLD = 8
+
+# Default ``min_bytes`` of a ``FlyQuickAllReduce`` built directly, outside the
+# dispatchers: the payload below which its ``allreduce`` refuses to run. The
+# dispatchers pass ``min_bytes=0`` and route by the ``FAMILY_POLICIES`` windows,
+# so this value never applies to them.
+QUANT_MIN_PAYLOAD_BYTES = 128 * KiB
 
 
 # Host and environment

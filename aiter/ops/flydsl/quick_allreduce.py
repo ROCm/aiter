@@ -44,6 +44,7 @@ from .allreduce_host_shared import (
 )
 from .allreduce_policy import (
     MIN_BATCH_BLOCKS,
+    QUANT_MIN_PAYLOAD_BYTES,
     RS_INT6_MIN_WORLD,
     mesh_st_ladder,
     resolve_link,
@@ -52,7 +53,7 @@ from .allreduce_policy import (
 from .kernels.comm.allreduce_shared import (
     ATOMS,
     BLOCK,
-    QUANT_MIN_PAYLOAD_BYTES,
+    PAYLOAD_ALIGN_BYTES,
     SUPPORTED_BLOCKS,
     WORLD,
     TwoShotRung,
@@ -795,8 +796,11 @@ class FlyQuickAllReduce:
                 raise ValueError(f"{name} must be a bf16 tensor")
             if not t.is_cuda or t.device.index != self._device_index:
                 raise ValueError(f"{name} must be on cuda:{self._device_index}")
-            if not t.is_contiguous() or int(t.data_ptr()) % 16 != 0:
-                raise ValueError(f"{name} must be contiguous and 16-byte aligned")
+            if not t.is_contiguous() or int(t.data_ptr()) % PAYLOAD_ALIGN_BYTES:
+                raise ValueError(
+                    f"{name} must be contiguous and "
+                    f"{PAYLOAD_ALIGN_BYTES}-byte aligned"
+                )
         if residual.numel() != inp.numel() or residual_out.numel() != inp.numel():
             raise ValueError("residual/residual_out must match inp numel")
 

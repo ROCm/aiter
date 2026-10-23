@@ -439,10 +439,13 @@ class QuickAllReduce:
             return False
         if not inp.is_contiguous():
             return False
-        if inp.data_ptr() % 16:
+        if inp.data_ptr() % fly_policy.PAYLOAD_ALIGN_BYTES:
             return False
         nbytes = inp.numel() * inp.element_size()
-        if nbytes % 16 or nbytes > fly_policy.MAX_PAYLOAD_BYTES:
+        if (
+            nbytes % fly_policy.PAYLOAD_ALIGN_BYTES
+            or nbytes > fly_policy.MAX_PAYLOAD_BYTES
+        ):
             return False
         alg = self._fly_policy.select(nbytes, quantized=True)
         return alg in self._fly_engines
