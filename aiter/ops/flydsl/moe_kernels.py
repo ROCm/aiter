@@ -2080,7 +2080,9 @@ def _flydsl_moe_stage2_impl(
         )
         _epilog = "atomic"
         gemm2_out = out
-        if b_dtype == "int4" and mode == "reduce":
+        if return_per_slot:
+            _epilog = "reduce"
+        elif b_dtype == "int4" and mode == "reduce":
             _epilog = "reduce"
             gemm2_out = torch.empty(
                 (M_logical * int(topk), model_dim),
@@ -2117,7 +2119,7 @@ def _flydsl_moe_stage2_impl(
             w_dtype=b_dtype,
             epilog=_epilog,
         )
-        if _epilog == "reduce":
+        if _epilog == "reduce" and not return_per_slot:
             _run_moe_reduction(
                 gemm2_out,
                 out,
