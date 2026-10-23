@@ -2949,12 +2949,14 @@ def gen_bmm_mxscale_pipeline_instance(
 ):
     if k.preload_sf_lds:
         real_kernel = "gemm_a8w8_scale_preload_sf_kernel"
+    elif k.preload_sfa_lds:
+        real_kernel = "gemm_a8w8_scale_preload_sfa_kernel"
     else:
         real_kernel = "gemm_a8w8_scale_kernel"
 
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
     preload_check = ""
-    if k.preload_sf_lds:
+    if k.preload_sf_lds or k.preload_sfa_lds:
         # The kernel returns without writing Y when K exceeds the LDS scale
         # panel, which a caller reads as a GEMM that produced zeros. Check the
         # traits bound here so it raises instead.

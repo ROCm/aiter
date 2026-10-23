@@ -232,7 +232,13 @@ struct opus_gemm_a8w8_scale_traits_gfx950 {
     static_assert(HALF_B_N % GROUP_N == 0 || GROUP_N % HALF_B_N == 0,
                   "B tile halves must nest with the 128-column B scale blocks");
     static constexpr int SFB_HALF_STRIDE     = HALF_B_N / GROUP_N;
-    static constexpr int SFB_GROUPS_PER_HALF = SFB_HALF_STRIDE > 0 ? SFB_HALF_STRIDE : 1;
+    // At GROUP_N=1 the B scale is per output column, like the A scale is per
+    // row: a lane holds the rows of its own E_N subtiles, not every group of
+    // the half, so the per-lane count is E_N and the row depends on the lane.
+    static constexpr bool SFB_PER_LANE_ROW = GROUP_N == 1;
+    static_assert(!SFB_PER_LANE_ROW || GROUP_K == 32, "GROUP_N=1 is the 1x32 MX layout");
+    static constexpr int SFB_GROUPS_PER_HALF =
+        SFB_PER_LANE_ROW ? E_N : (SFB_HALF_STRIDE > 0 ? SFB_HALF_STRIDE : 1);
     static constexpr int SFB_TILE_GROUPS     = SFB_HALF_STRIDE > 0 ? 2 * SFB_HALF_STRIDE : 1;
 
     // Counted per lane, not per tile: at GROUP_K=32 the tile's extra K blocks are
@@ -428,9 +434,10 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int GROUP_M = opus::get<0>(GROUP{});
     static constexpr int GROUP_N = opus::get<1>(GROUP{});
     static constexpr int GROUP_K = opus::get<2>(GROUP{});
-    // A uses per-row K groups; B uses N/K blocks of 32 or 128.
+    // A uses per-row K groups; B uses N/K blocks of 32 or 128, or per-row
+    // K32 scales (GROUP_N=1, the MX layout with no N blocking).
     static_assert(GROUP_M == 1);
-    static_assert(GROUP_N == 128 || GROUP_N == 32);
+    static_assert(GROUP_N == 128 || GROUP_N == 32 || (GROUP_N == 1 && GROUP_K == 32));
     static_assert(GROUP_K == 128 || GROUP_K == 32);
     static_assert(B_K % GROUP_K == 0,
                   "flatmm K tile must contain whole scale blocks");
@@ -522,8 +529,15 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // stride and count differ when a wave is narrower than GROUP_N: stride is
     // zero but count remains one. T_N partitions subtiles across waves and
     // does not change the scale groups spanned by one subtile.
-    static_assert(GROUP_N % W_N == 0, "a B scale group must be whole subtiles");
-    static constexpr int SFB_REP_N = GROUP_N / W_N;
+    //
+    // GROUP_N=1 has a scale row per column, finer than a subtile. There each
+    // subtile is one group and the lane adds its own column, lane_id % W_N, to
+    // the group's first row (see sfb_row in the pipeline): SFB_LANE_ROWS is the
+    // row count a group spans, 1 for every blocked layout.
+    static_assert(GROUP_N == 1 || GROUP_N % W_N == 0,
+                  "a B scale group must be whole subtiles");
+    static constexpr int SFB_LANE_ROWS = GROUP_N == 1 ? W_N : 1;
+    static constexpr int SFB_REP_N = GROUP_N == 1 ? 1 : GROUP_N / W_N;
     static_assert(COM_REP_N % SFB_REP_N == 0 || SFB_REP_N % COM_REP_N == 0,
                   "an N-wave must not straddle a partial B scale group");
     // Each N-wave loads only its own B scale groups. Scale indices within
@@ -531,7 +545,7 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // Keep stride and count separate: several waves can share one scale group,
     // giving a group stride of zero while the group count remains one.
     static constexpr bool SFB_PER_WAVE = true;
-    static constexpr int SFB_GROUP_STRIDE = COM_REP_N * W_N / GROUP_N;
+    static constexpr int SFB_GROUP_STRIDE = COM_REP_N * W_N / (GROUP_N * SFB_LANE_ROWS);
     static constexpr int SFB_GROUPS_PER_WAVE =
         COM_REP_N >= SFB_REP_N ? COM_REP_N / SFB_REP_N : 1;
     static_assert(SFB_GROUPS_PER_WAVE

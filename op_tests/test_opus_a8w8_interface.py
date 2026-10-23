@@ -276,7 +276,7 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
         rows = policy._load_mxscale_bmm_tuned(None, False)
         assert rows[("gfx950", 3, 1, 1024, 4096, "128x128")]["kernelId"] == 42
         assert policy.resolve_a8w8_mxscale_bmm_plan(2, 1, 1024, 4096) == (
-            8640,
+            8319,
             1,
         )
         assert len(warnings) == 1
@@ -356,7 +356,7 @@ def test_mxscale_wrong_group_kid_is_skipped(mxscale_csv, caplog):
     assert policy.resolve_a8w8_mxscale_bmm_plan(
         2, 128, 1024, 4096, w_scale_block="32x32"
     ) == (
-        9653,
+        9321,
         1,
     )
     assert "Skipping 1 invalid OPUS row" in caplog.text
@@ -365,8 +365,10 @@ def test_mxscale_wrong_group_kid_is_skipped(mxscale_csv, caplog):
 @pytest.mark.parametrize(
     "shape,gs128_kid",
     [
-        ((2, 2048, 1024, 4096), 8158),
-        ((2, 2048, 1024, 1024), 8150),
+        ((2, 2048, 1024, 4096), 8137),
+        ((2, 2048, 1024, 1024), 8653),
+        ((16, 1024, 4096, 4096), 8158),
+        ((16, 1024, 4096, 16384), 8150),
         ((2, 1, 64, 256), 8640),
         ((2, 1, 64, 128), 8653),
         ((2, 128, 32, 256), 8320),
@@ -384,6 +386,72 @@ def test_mxscale_untuned_group_fallback(mxscale_csv, shape, gs128_kid, group_siz
     assert (kid, split_k) == (gs128_kid + (1000 if group_size == 32 else 0), 1)
     instance = policy.get_kernel_instance("gfx950", "a8w8_mxscale_bmm", kid)
     assert (instance.GROUP_N, instance.GROUP_K) == (group_size, group_size)
+
+
+@pytest.mark.parametrize(
+    "shape,plan",
+    [
+        ((4, 64, 512, 16384), (8653, 8)),
+        ((16, 256, 512, 16384), (8137, 2)),
+        ((4, 64, 512, 4096), (8321, 1)),
+        ((1, 1, 1024, 16384), (8319, 8)),
+        ((4, 32, 1024, 4096), (8321, 1)),
+        ((4, 48, 4096, 4096), (8653, 1)),
+    ],
+)
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_mxscale_untuned_split_k_fills_cus(
+    mxscale_csv, monkeypatch, shape, plan, group_size
+):
+    _, policy = mxscale_csv
+    monkeypatch.setattr(policy, "get_cu_num", lambda: 256)
+    kid, split_k = policy.resolve_a8w8_mxscale_bmm_plan(
+        *shape, w_scale_block=f"{group_size}x{group_size}"
+    )
+    assert (kid, split_k) == (plan[0] + (1000 if group_size == 32 else 0), plan[1])
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (2, 1, 1024, 4096),
+        (2, 128, 512, 1024),
+        (8, 300, 1024, 4096),
+        (2, 2048, 1024, 4096),
+        (16, 4096, 1024, 4096),
+    ],
+)
+def test_mxscale_untuned_1x32_takes_the_32x32_twin(mxscale_csv, shape):
+    _, policy = mxscale_csv
+    kid, _ = policy.resolve_a8w8_mxscale_bmm_plan(*shape, w_scale_block="1x32")
+    instance = policy.get_kernel_instance("gfx950", "a8w8_mxscale_bmm", kid)
+    assert (instance.GROUP_N, instance.GROUP_K) == (1, 32)
+    assert not instance.needs_preshuffled_b
+    kid32, _ = policy.resolve_a8w8_mxscale_bmm_plan(*shape, w_scale_block="32x32")
+    assert kid == policy._mx1x32_twin(kid32, *shape)
+
+
+def test_mxscale_untuned_1x32_raises_where_no_tile_runs(mxscale_csv):
+    _, policy = mxscale_csv
+    with pytest.raises(ValueError, match="no row-major 1x32"):
+        policy.resolve_a8w8_mxscale_bmm_plan(2, 8, 16, 4096, w_scale_block="1x32")
+
+
+def test_mxscale_1x32_tuned_row_must_be_1x32(mxscale_csv, caplog):
+    path, policy = mxscale_csv
+    path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+        "gfx950,2,128,1024,4096,1x32,opus,9325,1\n"
+        "gfx950,4,128,1024,4096,1x32,opus,9825,1\n"
+    )
+    kid, _ = policy.resolve_a8w8_mxscale_bmm_plan(
+        2, 128, 1024, 4096, w_scale_block="1x32"
+    )
+    assert kid != 9325
+    assert policy.mxscale_bmm_kid_block(kid) == "1x32"
+    assert policy.resolve_a8w8_mxscale_bmm_plan(
+        4, 128, 1024, 4096, w_scale_block="1x32"
+    ) == (9825, 1)
 
 
 @pytest.mark.parametrize("w_scale_block", ["0x0", "64x64", "256x256", "1x128", "128"])

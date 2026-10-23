@@ -519,6 +519,60 @@ def check_mx32_kids():
     return len(_MX32_KIDS)
 
 
+# --- GROUP_N == 1, GROUP_K == 32 on a row-major weight ----------------------
+# Each lane reads its own column's scale row, so the weight's amplitude is also
+# varied per row: with one magnitude per K block every row of a 16-column
+# subtile would share a scale, and a lane reading the subtile's first row
+# instead of its own would pass.
+_MX1X32_KIDS = tuple(
+    sorted(
+        kid
+        for kid, inst in a8w8_mxscale_bmm_kernels_list.items()
+        if inst.GROUP_N == 1 and not inst.needs_preshuffled_b
+    )
+)
+
+
+def check_mx1x32_kids():
+    """Check the row-major GROUP_N=1, GROUP_K=32 kids against a 1x32 reference."""
+    g, m, n, k = _MX32_SHAPE
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(
+        _block_varied((g, m, k), k), group=_MX32_GROUP
+    )
+    row_amp = torch.exp2(torch.randint(-4, 4, (n, 1)).float())
+    W_bf16 = (_block_varied((g, n, k), k).float() * row_amp).to(dtypes.bf16)
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16, group=_MX32_GROUP, group_n=1)
+    O_in = O_mx.transpose(0, 1)
+    ref = run_torch(
+        O_mx, W_mx, xs_fp32, ws_fp32, group=_MX32_GROUP, group_n=1
+    ).transpose(0, 1)
+    failures = []
+    for kid in _MX1X32_KIDS:
+        inst = a8w8_mxscale_bmm_kernels_list[kid]
+        splitk_ok = (
+            inst.kernel_tag == "a8w8_mxscale_bmm_flatmm_splitk" and not inst.direct_only
+        )
+        for split_k in (1, 2) if splitk_ok else (1,):
+            out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
+            try:
+                _run_opus(O_in, W_mx, out, xs_mx.transpose(0, 1), ws_mx, kid, split_k)
+                torch.cuda.synchronize()
+            except RuntimeError as exc:
+                failures.append(
+                    f"kid {kid} sk{split_k}: launch refused: {str(exc).strip()[-120:]}"
+                )
+                continue
+            delta = (out.to(dtypes.fp32) - ref).abs()
+            rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
+            err = rows.max().item()
+            if not (err <= _MX32_ERR_TOL):
+                failures.append(
+                    f"kid {kid} sk{split_k}: worst row rel err {err:.4f} > {_MX32_ERR_TOL}"
+                )
+    assert not failures, "1x32 row-major kids:\n  " + "\n  ".join(failures)
+    return len(_MX1X32_KIDS)
+
+
 # --- wave1 bpreshuffle, GROUP_N == GROUP_K == 128 -------------------------
 # The wave1 tiles are the only single-wave bpreshuffle pipeline in the family,
 # so nothing else instantiates their B-fragment addressing. M=17 is deliberate:
@@ -812,6 +866,10 @@ def main():
     )
     n_mx32_kids = check_mx32_kids()
     aiter.logger.info("GROUP_K=32 MX quantisation passed for %d kids", n_mx32_kids)
+    n_mx1x32_kids = check_mx1x32_kids()
+    aiter.logger.info(
+        "1x32 row-major MX quantisation passed for %d kids", n_mx1x32_kids
+    )
     n_wave1 = check_wave1_group128()
     aiter.logger.info(
         "wave1 bpreshuffle group128 passed for %d kid/split pairs", n_wave1

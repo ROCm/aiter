@@ -626,6 +626,19 @@ __attribute__((always_inline)) OPUS_D int sfb_group_base(int wave_id_n) {
     }
 }
 
+// The B scale row this lane reads for scale group `group`. A group is one row
+// for every blocked layout; at GROUP_N=1 it is one subtile, W_N rows, and the
+// lane owns column lane_id % W_N of the 16x16x128 B fragment.
+template<typename T>
+__attribute__((always_inline)) OPUS_D int sfb_row(int group, int lane_id) {
+    if constexpr (T::SFB_LANE_ROWS == 1) {
+        (void)lane_id;
+        return group;
+    } else {
+        return group * T::SFB_LANE_ROWS + lane_id % T::W_N;
+    }
+}
+
 template<typename T, typename S>
 __attribute__((always_inline)) OPUS_D int sf_scale_word(S scale) {
     if constexpr (T::SF_PER_MFMA_K == 1) {
@@ -1146,6 +1159,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     static_assert(!SHUFFLE_SCALE || SFG::KD * 2 >= T::COM_REP_K,
                   "the shuffle_scale register file must cover every K block the tile "
                   "owns: KD dwords hold 2*KD blocks");
+    static_assert(!(SHUFFLE_SCALE || SF_SHUF_IN_LDS) || T::SFB_LANE_ROWS == 1,
+                  "the shuffled B scale layout is one word per N block, not per row");
     static_assert(!SHUFFLE_SCALE || !PRELOAD_SF_LDS,
                   "the shuffle_scale layout replaces the LDS scale panel rather than filling it");
     // The shuffled layout's own LDS panel. PRELOAD_SF_LDS stages the *plain*
@@ -1387,7 +1402,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
             opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+                load_sfb_lane<T, ng>(g_sfb, sfb_row<T>(sfb_group_base<T>(wave_id_n_cons) + ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                     sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             s_waitcnt_vmcnt(0_I);
@@ -2026,7 +2041,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(
                         slot + T::SF_RING_A_BYTES
-                        + (sfb_group_base<T>(wave_id_n_cons) + ng) * T::SCALES_PER_BK
+                        + sfb_row<T>(sfb_group_base<T>(wave_id_n_cons) + ng, lane_id) * T::SCALES_PER_BK
                               * T::SF_RING_ESTRIDE);
                     load_sfb_lane<T, ng, T::SF_RING_ESTRIDE>(
                         sm_b, 0, sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
@@ -2052,7 +2067,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(s_sfb_ptr
-                                          + (sfb_group_base<T>(wave_id_n_cons) + ng) * sf_pitch + scale_base);
+                                          + sfb_row<T>(sfb_group_base<T>(wave_id_n_cons) + ng, lane_id) * sf_pitch + scale_base);
                     load_sfb_lane<T, ng>(sm_b, 0,
                                          sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
@@ -2070,7 +2085,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(s_sfb_ptr
-                                          + (sfb_group_base<T>(wave_id_n_cons) + ng) * sf_pitch + scale_base);
+                                          + sfb_row<T>(sfb_group_base<T>(wave_id_n_cons) + ng, lane_id) * sf_pitch + scale_base);
                     load_sfb_lane<T, ng>(sm_b, 0,
                                          sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
@@ -2083,7 +2098,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                     constexpr int ng = decltype(ng_c)::value;
                     load_sfb_lane<T, ng>(
                         g_sfb,
-                        (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb
+                        sfb_row<T>(sfb_group_base<T>(wave_id_n_cons) + ng, lane_id) * kargs.stride_sfb
                             + sfb_base + scale_base,
                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
@@ -2798,7 +2813,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
                 vtype_sfb v_sfb;
                 opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
-                    load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+                    load_sfb_lane<T, ng>(g_sfb, sfb_row<T>(sfb_group_base<T>(wave_id_n_cons) + ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
                 if constexpr (!SKIP_SCALE_WAIT) {
@@ -3108,7 +3123,7 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
             vtype_sfb v_sfb;
             opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+                load_sfb_lane<T, ng>(g_sfb, sfb_row<T>(sfb_group_base<T>(wave_id_n_cons) + ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                     sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             opus::static_for<MI>([&](auto mi_c) {
@@ -3300,7 +3315,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
             // N-wave offset to apply. Asserted rather than assumed: a T_N > 1
             // instantiation would read wave 0's scale groups from every wave.
             static_assert(T::T_N == 1, "no N-wave split here, so no scale group base");
-            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+            load_sfb_lane<T, ng>(g_sfb, sfb_row<T>(sfb_group_base<T>(0) + ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                 sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         s_waitcnt_vmcnt(0_I);
@@ -3465,7 +3480,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
             // N-wave offset to apply. Asserted rather than assumed: a T_N > 1
             // instantiation would read wave 0's scale groups from every wave.
             static_assert(T::T_N == 1, "no N-wave split here, so no scale group base");
-            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+            load_sfb_lane<T, ng>(g_sfb, sfb_row<T>(sfb_group_base<T>(0) + ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                 sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         if constexpr (!SKIP_SCALE_WAIT) {

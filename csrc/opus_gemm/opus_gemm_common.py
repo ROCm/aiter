@@ -179,6 +179,9 @@ class OpusGemmInstance:
     skip_scale_wait: bool = False
     pack_scale_on_demand: bool = False
     preload_sf_lds: bool = False
+    # The A scale panel alone (pipeline family). For GROUP_N=1, whose B panel
+    # is B_N rows and does not fit beside the A panel.
+    preload_sfa_lds: bool = False
     name_root: str = "opus_gemm"
 
     # gfx1250 fused single-kernel split-K. SplitK and the N-direction cluster
@@ -343,6 +346,8 @@ class OpusGemmInstance:
             parts.insert(tag_at, "a8w8_mxscale_pipeline")
             if self.preload_sf_lds:
                 parts.append("preload_sf")
+            elif self.preload_sfa_lds:
+                parts.append("preload_sfa")
         elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline_bpreshuffle":
             # opus_bmm_a8w8_mxscale_pipeline_bpreshuffle_<geom>[_preload_sf].
             # Without this branch the tag fell through to the bare default, so
@@ -698,13 +703,18 @@ def _a8w8_mxscale_bmm_flatmm_splitk(
     bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False,
     shuffle_scale=False,
     quant_block=128,
+    group_n=None,
 ):
     # quant_block is GROUP_N and GROUP_K together: A and B quantise on the same
     # block, either DSv4's 128 or MX's 32. GROUP_M stays 1 (per token) for both.
+    # group_n=1 overrides GROUP_N for per-row K32 weight scales.
     t_m, t_n = (1, 2) if bm == 16 else (2, 1)
+    group_n = quant_block if group_n is None else group_n
+    assert group_n == quant_block or (group_n == 1 and quant_block == 32)
+    assert group_n != 1 or not shuffle_scale, "shuffle_scale is per N block"
     inst = OpusGemmInstance(
         256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4,
-        1, quant_block, quant_block, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
+        1, group_n, quant_block, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
         wg_per_cu, splitk_workspace_dtype="fp32_t",
     )
     inst.name_root = "opus_bmm"
@@ -1547,6 +1557,24 @@ _bmm_flatmm_local.update({
     )
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
+# Per-row K32 (1x32) variants of every tile with a 32x32 twin, for the
+# row-major-weight entry. Local id 1800 + the mirror's last two digits, which
+# are distinct across the tiles, so global 9821 is kid 321 at 1x32.
+_MX1X32_KID_BASE = 1800
+_mx1x32_flatmm = {
+    _MX1X32_KID_BASE + kid % 100: _a8w8_mxscale_bmm_flatmm_splitk(
+        inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
+        direct_only=inst.direct_only, prefetch_scale=inst.prefetch_scale,
+        preload_sf=inst.preload_sf, quant_block=32, group_n=1,
+    )
+    for kid, inst in _bmm_flatmm_local.items()
+    if kid < MX32_KID_STRIDE and kid + MX32_KID_STRIDE in _bmm_flatmm_local
+}
+assert len(_mx1x32_flatmm) == sum(
+    1 for kid in _bmm_flatmm_local
+    if kid < MX32_KID_STRIDE and kid + MX32_KID_STRIDE in _bmm_flatmm_local
+), "1x32 flatmm kid ids collide"
+_bmm_flatmm_local.update(_mx1x32_flatmm)
 
 
 # ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this
@@ -1659,6 +1687,26 @@ _bmm_pipeline_local.update({
     150 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(GROUP_N=32, GROUP_K=32),
     158 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(
         preload_sf_lds=True, GROUP_N=32, GROUP_K=32
+    ),
+})
+# 1x32 twins, past the 18xx flatmm twins' kid % 100 range. A GROUP_N=1 B scale
+# is B_N rows, as large as the A one: 1891-1893 preload A only and read B per
+# lane from global; 1894-1896 slide a B panel along with the A window.
+_bmm_pipeline_local.update({
+    1890: _a8w8_mxscale_bmm_pipeline(GROUP_N=1, GROUP_K=32),
+    1891: _a8w8_mxscale_bmm_pipeline(preload_sfa_lds=True, GROUP_N=1, GROUP_K=32),
+    1892: _a8w8_mxscale_bmm_pipeline(
+        B_M=128, preload_sfa_lds=True, GROUP_N=1, GROUP_K=32
+    ),
+    1893: _a8w8_mxscale_bmm_pipeline(
+        B_N=128, preload_sfa_lds=True, GROUP_N=1, GROUP_K=32
+    ),
+    1894: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True, GROUP_N=1, GROUP_K=32),
+    1895: _a8w8_mxscale_bmm_pipeline(
+        B_M=128, preload_sf_lds=True, GROUP_N=1, GROUP_K=32
+    ),
+    1896: _a8w8_mxscale_bmm_pipeline(
+        B_N=128, preload_sf_lds=True, GROUP_N=1, GROUP_K=32
     ),
 })
 _bmm_mouter_local = {
