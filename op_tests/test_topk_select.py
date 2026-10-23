@@ -1154,6 +1154,70 @@ def _cross_device_failures():
     return failures
 
 
+class _NoFlyDSLState:
+    """A launcher with none of the state a TopK launcher copies per GPU."""
+
+
+# What a further GPU's launcher has to start from: FlyDSL 0.4.0's in-process
+# caches, and the target it resolves with the signature on a first call.
+_FRESH_PER_DEVICE = {
+    "_mem_cache": {},
+    "_call_state_cache": {},
+    "_last_compiled": None,
+    "cache_manager": None,
+    "manager_key": None,
+    "_sig": None,
+    "_backend_target": None,
+}
+
+
+def test_launcher_per_device():
+    """A launcher asked for on a further GPU is a copy that starts afresh, and
+    one whose FlyDSL state cannot be reset raises rather than being shared.
+
+    `test_cross_device` needs two GPUs and CI has one, so this asks for a device
+    id nothing is launched on: the copy is made, never run.
+    """
+    from aiter.ops.flydsl.kernels.topk.topk_launch import _launcher_on
+    from aiter.ops.flydsl.kernels.topk.topk_per_row_radix_stream import (
+        build_topk_per_row_radix_stream_module,
+    )
+
+    failures = []
+    dev = torch.cuda.current_device()
+    other = dev + 4096
+    # A build of its own, past the builder's cache, with a signature, a target
+    # and an in-process cache entry, as one that has run would have.
+    exe = build_topk_per_row_radix_stream_module.__wrapped__(16, wave_size_of(dev))
+    exe._ensure_sig()
+    exe._mem_cache["probe"] = object()
+    if _launcher_on(exe, dev) is not exe:
+        failures.append("the first GPU did not get the launcher itself")
+    own = _launcher_on(exe, other)
+    if own is exe:
+        failures.append("a further GPU shared the first one's launcher")
+    else:
+        for name, fresh in _FRESH_PER_DEVICE.items():
+            if getattr(own, name, "missing") != fresh:
+                failures.append(f"the copy kept {name}")
+        if own._mem_cache is exe._mem_cache:
+            failures.append("the copy shares the in-process cache")
+        if exe._sig is None or "probe" not in exe._mem_cache:
+            failures.append("making the copy reset the original")
+        if _launcher_on(exe, other) is not own:
+            failures.append("a second ask on the same GPU made another copy")
+    stub = _NoFlyDSLState()
+    _launcher_on(stub, dev)
+    try:
+        _launcher_on(stub, other)
+        failures.append("a launcher it cannot copy was shared with a further GPU")
+    except RuntimeError:
+        pass
+    for label in failures:
+        aiter.logger.error("LAUNCHER PER DEVICE FAILED: %s", label)
+    return failures
+
+
 def test_invariants(m, n, k):
     """The properties a value comparison cannot see."""
     failures = []
@@ -1362,6 +1426,12 @@ def main():
         "cross device: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"cross device: {len(bad)} failed"
+    bad = test_launcher_per_device()
+    aiter.logger.info(
+        "launcher per device: %s",
+        "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
+    )
+    assert not bad, f"launcher per device: {len(bad)} failed"
     bad = test_full_rows_graphs()
     aiter.logger.info(
         "full-rows graphs: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"

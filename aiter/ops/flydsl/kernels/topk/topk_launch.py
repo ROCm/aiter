@@ -9,15 +9,19 @@ import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-# A JitFunction's in-process caches. FlyDSL keys them -- its own and its
-# disk-cache manager's -- without the device, and a build loaded on one GPU
-# cannot launch on another.
-_PER_DEVICE_STATE = (
-    "_mem_cache",
-    "_call_state_cache",
-    "_last_compiled",
-    "cache_manager",
-)
+# A JitFunction's per-device state, each with the value it starts from: its
+# in-process caches, its own and its disk-cache manager's, which FlyDSL keys
+# without the device -- a build loaded on one GPU cannot launch on another --
+# and the GPU target it resolves once, with the signature, on its first call.
+_PER_DEVICE_STATE = {
+    "_mem_cache": dict,
+    "_call_state_cache": dict,
+    "_last_compiled": lambda: None,
+    "cache_manager": lambda: None,
+    "manager_key": lambda: None,
+    "_sig": lambda: None,
+    "_backend_target": lambda: None,
+}
 
 
 def _launch_key(args):
@@ -38,20 +42,32 @@ def _launch_key(args):
 
 def _launcher_on(exe, device):
     """`exe` on the first GPU it runs on; on each further GPU, a copy of it whose
-    in-process caches start empty and reload from disk."""
+    per-device state starts afresh, its builds reloading from disk.
+
+    Raises rather than share `exe` with a further GPU when this FlyDSL lacks a
+    piece of that state: the copy could not be told apart from the original.
+    """
     by_device = exe.__dict__.get("_topk_by_device")
     if by_device is None:
         by_device = exe._topk_by_device = {}
     own = by_device.get(device)
     if own is None:
-        if not by_device or not all(hasattr(exe, n) for n in _PER_DEVICE_STATE):
+        if not by_device:
             own = exe
         else:
+            missing = [n for n in _PER_DEVICE_STATE if not hasattr(exe, n)]
+            if missing:
+                raise RuntimeError(
+                    f"TopK launcher {getattr(exe, '__name__', type(exe).__name__)} "
+                    f"cannot get a launcher of its own on cuda:{device}: this "
+                    f"FlyDSL has no {', '.join(missing)}, so the one built on "
+                    "another GPU would be reused"
+                )
             own = copy.copy(exe)
             for n in ("_topk_by_device", "_cf", "_cf_by_specialization"):
                 own.__dict__.pop(n, None)
-            own._mem_cache, own._call_state_cache, own._last_compiled = {}, {}, None
-            own.cache_manager, own.manager_key = None, None
+            for n, fresh in _PER_DEVICE_STATE.items():
+                setattr(own, n, fresh())
             if hasattr(exe, "_extern_linkage_keys"):
                 own._extern_linkage_keys = set(exe._extern_linkage_keys)
         by_device[device] = own
