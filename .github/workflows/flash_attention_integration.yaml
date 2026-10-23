@@ -167,7 +167,7 @@ jobs:
           FROM ${{ env.BASE_IMAGE }}
 
           # Install test dependencies
-          RUN pip install --upgrade pip
+          RUN apt-get update && apt-get install -y git
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
           # The aiter under test, and flash-attention built against it. One script, shared with
@@ -179,7 +179,7 @@ jobs:
 
           # Verify aiter is installed from PR branch
           RUN pip show flash-attn && pip show amd-aiter && pip show triton && \
-              python -c "from importlib.metadata import distribution; d = distribution('amd-aiter'); loc = d.read_text('direct_url.json'); assert '/aiter' in loc, f'aiter not from PR branch: {loc}'"
+              python3 -c "from importlib.metadata import distribution; d = distribution('amd-aiter'); loc = d.read_text('direct_url.json'); assert '/aiter' in loc, f'aiter not from PR branch: {loc}'"
 
           WORKDIR /flash-attention
           EOF
@@ -234,7 +234,7 @@ jobs:
           docker exec fa_triton_test bash -c "
             cd /flash-attention
             FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-            python benchmarks/benchmark_flash_attention.py
+            python3 benchmarks/benchmark_flash_attention.py
           " |& tee benchmark_fa_triton_${{ matrix.label }}.log
 
       # MHA bench -> wide CSV (metric=throughput/TFLOPS, higher=faster). Runs on PRs
@@ -246,7 +246,7 @@ jobs:
           set -o pipefail
           docker exec fa_triton_test bash -c "
             cd /aiter
-            python op_tests/op_benchmarks/triton/bench_mha.py \
+            python3 op_tests/op_benchmarks/triton/bench_mha.py \
               -impl dao_ai -metric throughput -o /tmp/bench_dao_ai
           " |& tee benchmark_mha_daoai_${{ matrix.label }}.log
           docker cp fa_triton_test:/tmp/bench_dao_ai/ bench_dao_ai_${{ matrix.label }}/ 2>/dev/null || true
@@ -315,7 +315,7 @@ jobs:
           cat <<'EOF' > Dockerfile.triton_v3
           FROM ${{ env.BASE_IMAGE }}
 
-          RUN pip install --upgrade pip
+          RUN apt-get update && apt-get install -y git
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
           COPY . /aiter
@@ -332,7 +332,7 @@ jobs:
           RUN pip uninstall -y amd-aiter && pip install --no-build-isolation -e /aiter
 
           RUN pip show flash-attn-3 && pip show amd-aiter && pip show triton && \
-              python -c "from importlib.metadata import distribution; d = distribution('amd-aiter'); loc = d.read_text('direct_url.json'); assert '/aiter' in loc, f'aiter not from PR branch: {loc}'"
+              python3 -c "from importlib.metadata import distribution; d = distribution('amd-aiter'); loc = d.read_text('direct_url.json'); assert '/aiter' in loc, f'aiter not from PR branch: {loc}'"
 
           WORKDIR /flash-attention
           EOF
@@ -653,7 +653,7 @@ jobs:
           FROM ${{ env.BASE_IMAGE }}
 
           # Install test dependencies
-          RUN pip install --upgrade pip
+          RUN apt-get update && apt-get install -y git
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
           # Clone and install flash-attention (CK backend)
