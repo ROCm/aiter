@@ -51,6 +51,10 @@ except:  # noqa: E722
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 
+# Longest query (tokens per request) that gfx1250 runs on the 3d split-K kernel
+# when the batch is not all-decode, e.g. a speculative verify of 3 draft tokens.
+_GFX1250_SPLIT_MAX_QUERY_LEN = 4
+
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
@@ -123,6 +127,8 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+    # k/v_descale hold one scale per cached token: [num_blocks, num_kv_heads, block_size]
+    per_token_kv_scale: bool = False
 
 
 def _gfx950_gluon_supported(params: _UAParams):
@@ -172,10 +178,29 @@ def _gfx950_split_grid(params: _UAParams):
     return config["NUM_SEGMENTS"] > 1
 
 
+def _gfx1250_split_short_queries(params: _UAParams, backend: str):
+    """Short multi-token queries (speculative verify) take the 3d split-K kernel.
+    It masks the causal edge only in a block's last tile, so BLOCK_Q must be 1."""
+    if (
+        backend != "gluon"
+        or not params.shuffled_kv_cache
+        or params.max_seqlen_q > _GFX1250_SPLIT_MAX_QUERY_LEN
+        or not is_3d_gluon_available(params, backend)
+    ):
+        return False
+    config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    return block_m // params.num_queries_per_kv == 1
+
+
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
-    # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
+    # gfx1250: 3d for decode and short split-safe queries, 2d otherwise
     if IS_DEVICE_ARCH_GFX12:
-        return (params.sliding_window > 0) or (not params.all_decode)
+        if params.sliding_window > 0:
+            return True
+        if params.all_decode:
+            return False
+        return not _gfx1250_split_short_queries(params, backend)
 
     # The gfx950 Gluon kernel is one kernel with a decode and a prefill grid,
     # and it owns its KV split, so decode and split batches take the 3d path
@@ -200,6 +225,58 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
         or (params.max_seqlen_k <= 512)
         or (params.num_2d_prgms > gate)
     )
+
+
+def _is_per_token_kv_scale(k_descale, v_descale, num_blocks, num_kv_heads, block_size):
+    """True when k_descale and v_descale hold one scale per cached token.
+
+    Per-token scales have the page layout of the cache:
+    [num_blocks, num_kv_heads, block_size]. Other descales are per tensor.
+    """
+    page_shape = (num_blocks, num_kv_heads, block_size)
+
+    def per_token(descale):
+        return (
+            descale is not None
+            and descale.dim() >= 3
+            and tuple(descale.shape[:3]) == page_shape
+            and descale.numel() == num_blocks * num_kv_heads * block_size
+        )
+
+    if not per_token(k_descale) and not per_token(v_descale):
+        return False
+    for name, descale in (("k_descale", k_descale), ("v_descale", v_descale)):
+        assert per_token(descale), (
+            f"{name} must also be per-token with shape {page_shape}, "
+            f"got {None if descale is None else tuple(descale.shape)}"
+        )
+        assert descale.dtype == torch.float32 and descale.is_contiguous(), (
+            f"per-token {name} must be contiguous float32, "
+            f"got {descale.dtype}, strides {descale.stride()}"
+        )
+    return True
+
+
+def _check_per_token_kv_scale_path(params: "_UAParams", backend: str):
+    """Per-token KV scales are read only by the gfx1250 Gluon decode kernel."""
+    supported = (
+        DEVICE_ARCH == "gfx1250"
+        and params.q_dtype == torch.bfloat16
+        and params.kv_cache_dtype == e4m3_dtype
+        and not use_2d_kernel(params, backend)
+        and is_3d_gluon_available(params, backend)
+    )
+    if not supported:
+        raise NotImplementedError(
+            "per-token KV scales need gfx1250, the gluon backend, a batch on the "
+            "3d kernel (decode or a short split-safe query) without a sliding "
+            "window, a shuffled fp8 KV cache and a bf16 query; "
+            f"got arch={DEVICE_ARCH}, backend={backend}, "
+            f"all_decode={params.all_decode}, "
+            f"sliding_window={params.sliding_window}, "
+            f"shuffled_kv_cache={params.shuffled_kv_cache}, "
+            f"q_dtype={params.q_dtype}, kv_dtype={params.kv_cache_dtype}"
+        )
 
 
 def unified_attention(
@@ -296,6 +373,10 @@ def unified_attention(
             "size to match the query/key head size"
         )
 
+    per_token_kv_scale = _is_per_token_kv_scale(
+        k_descale, v_descale, num_blocks, num_kv_heads, block_size
+    )
+
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
     # only the plain layout exposes v's head size as its last dimension; a
@@ -375,7 +456,11 @@ def unified_attention(
         v_descale=v_descale,
         output_scale=output_scale,
         skip_reduce=skip_reduce,
+        per_token_kv_scale=per_token_kv_scale,
     )
+
+    if per_token_kv_scale:
+        _check_per_token_kv_scale_path(params, backend)
 
     # if batch contains a prefill
     if use_2d_kernel(params, backend):
@@ -407,6 +492,11 @@ def unified_attention(
             TILE_SIZE = block_size
         else:
             TILE_SIZE = config["TILE_SIZE"]
+        # per-token scales are read one page per tile
+        assert not per_token_kv_scale or TILE_SIZE == block_size, (
+            f"per-token KV scales need TILE_SIZE == block_size, "
+            f"got {TILE_SIZE} and {block_size}"
+        )
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
@@ -969,6 +1059,7 @@ def _unified_attention_3d_gfx1250(
         QUERY_DTYPE=QUERY_DTYPE,
         KV_CACHE_DTYPE=KV_CACHE_DTYPE,
         BLOCK_SCALES_SIZE=params.block_scales_size,
+        PER_TOKEN_KV_SCALE=params.per_token_kv_scale,
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         **config,

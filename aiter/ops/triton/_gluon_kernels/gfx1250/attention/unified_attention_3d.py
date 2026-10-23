@@ -1919,8 +1919,46 @@ unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "QUERY_DTYPE",
         "KV_CACHE_DTYPE",
+        "PER_TOKEN_KV_SCALE",
     ],
 )
+
+
+@gluon.jit
+def compute_pv_per_token(pgm, p, v, acc):
+    """P @ V for P scaled by the per-token V scales, with P split into bf16 high
+    and low parts. One bf16 P biases the output low against the fp32 row sum."""
+    p_hi = p.to(gl.bfloat16)
+    p_lo = (p - p_hi.to(gl.float32)).to(gl.bfloat16)
+    acc = pgm.compute_pv(p_hi, v, None, acc)
+    return pgm.compute_pv(p_lo, v, None, acc)
+
+
+@gluon.jit
+def load_per_token_kv_scales(
+    k_scale_ptr,
+    v_scale_ptr,
+    physical_block_idx,
+    tile_idx,
+    seq_len,
+    kv_head_idx,
+    cfg: AttentionConfig,
+):
+    """Load the K and V scales of the TILE_SIZE tokens in one page.
+
+    The scales are [num_blocks, num_kv_heads, BLOCK_SIZE]. Tokens past seq_len
+    get 0, so a stale scale in an unused slot cannot make NaN.
+    """
+    offs = gl.arange(
+        0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
+    )
+    base = (
+        physical_block_idx.to(gl.int64) * cfg.NUM_KV_HEADS + kv_head_idx
+    ) * cfg.BLOCK_SIZE
+    mask = tile_idx * cfg.TILE_SIZE + offs < seq_len
+    k_scales = gl.load(k_scale_ptr + base + offs, mask=mask, other=0.0)
+    v_scales = gl.load(v_scale_ptr + base + offs, mask=mask, other=0.0)
+    return k_scales, v_scales
 
 
 @gluon.jit(repr=unified_attention_gluon_kernel_3d_repr)
@@ -1938,8 +1976,8 @@ def _unified_attention_gluon_kernel_3d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     q_scale_ptr,  # [1, ], float32
-    k_scale_ptr,  # [1, ], float32
-    v_scale_ptr,  # [1, ], float32v
+    k_scale_ptr,  # [1, ] or [num_blks, num_kv_heads, blk_size] if PER_TOKEN_KV_SCALE, float32
+    v_scale_ptr,  # [1, ] or [num_blks, num_kv_heads, blk_size] if PER_TOKEN_KV_SCALE, float32
     out_scale_ptr,  # [1, ], float32
     softcap,  # float32
     num_seqs: gl.int32,  # int
@@ -1989,10 +2027,16 @@ def _unified_attention_gluon_kernel_3d(
     QUERY_DTYPE: gl.constexpr = "bf16",  # bool
     KV_CACHE_DTYPE: gl.constexpr = "bf16",  # bool
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
+    PER_TOKEN_KV_SCALE: gl.constexpr = False,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
     assert num_stages == 2
+    if PER_TOKEN_KV_SCALE:
+        # one tile is one page, so a tile reads the scales of one page
+        assert QUERY_DTYPE == "bf16" and KV_CACHE_DTYPE == "fp8"
+        assert SHUFFLED_KV_CACHE and NUM_BLOCKS_GATHER_PER_TILE == 1
+        assert TILE_SIZE == BLOCK_SIZE
     # Build config with all layouts and derived constants
     cfg = AttentionConfig(
         HEAD_SIZE,
@@ -2070,14 +2114,15 @@ def _unified_attention_gluon_kernel_3d(
     else:
         q_scale = None
 
-    if k_scale_ptr is not None:
+    # per-token K and V scales are applied per tile in the loop
+    if k_scale_ptr is not None and not PER_TOKEN_KV_SCALE:
         k_scale = gl.load(k_scale_ptr)
         qk_factor = qk_factor * k_scale
     else:
         k_scale = None
 
     out_factor: gl.float32 = 1.0
-    if v_scale_ptr is not None:
+    if v_scale_ptr is not None and not PER_TOKEN_KV_SCALE:
         out_factor = gl.load(v_scale_ptr)
 
     if out_scale_ptr is not None:
@@ -2276,6 +2321,16 @@ def _unified_attention_gluon_kernel_3d(
             query_mask_1_qk,
         )
 
+    # Segments split the whole sequence, but a query block that ends earlier
+    # (a non-last query of a multi-token request) can have no key in this
+    # segment. Store an empty partial (M = -inf) so the reduce weighs it 0.
+    if not cfg.ALL_DECODE and pgm.tile_start >= pgm.tile_end:
+        if KV_CACHE_DTYPE == "nvfp4" and cfg.HEAD_SIZE_SPLIT == 2:
+            pgm.store_output_3D_split_head(acc0, acc1, M, L, segm_idx)
+        else:
+            pgm.store_output_3D(acc, M, L, segm_idx)
+        return
+
     j_hbm_start: gl.int32 = pgm.tile_start
     max_num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
     j_hbm: gl.int32 = 0
@@ -2301,6 +2356,8 @@ def _unified_attention_gluon_kernel_3d(
     )
     pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=buffer_id)
     pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=buffer_id)
+    # page of the tile in buffer_id; physical_block_idx runs one tile ahead
+    scale_block_idx = physical_block_idx
 
     for j in range(pgm.tile_start, pgm.tile_end - (cfg.NUM_STAGES - 1)):
         # physical_block_idx = physical_block_idx + 1 # no-paging expt
@@ -2308,6 +2365,16 @@ def _unified_attention_gluon_kernel_3d(
         j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(
             j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
         )
+        if PER_TOKEN_KV_SCALE:
+            k_token_scales, v_token_scales = load_per_token_kv_scales(
+                k_scale_ptr,
+                v_scale_ptr,
+                scale_block_idx,
+                j,
+                seq_len,
+                kv_head_idx,
+                cfg,
+            )
         if KV_CACHE_DTYPE == "nvfp4":
             k = pgm.tdm_shared_load_k(wait_count=3, buffer_id=buffer_id)
             k_scales = pgm.tdm_shared_load_k_scales(
@@ -2322,6 +2389,8 @@ def _unified_attention_gluon_kernel_3d(
 
         S = pgm.compute_qk(k, q_scales, k_scales)
         S = S * qk_factor
+        if PER_TOKEN_KV_SCALE:
+            S = S * k_token_scales[None, :]
 
         S = pgm.apply_softcap(S)
         if need_addtional_mask:
@@ -2335,6 +2404,10 @@ def _unified_attention_gluon_kernel_3d(
             p, L, acc0, acc1 = pgm.softmax_part1_split_head(p, L, acc0, acc1, alpha)
         else:
             p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+        if PER_TOKEN_KV_SCALE:
+            # L sums the unscaled p; the V scale weights only the P @ V product
+            p = p * v_token_scales[None, :]
+        scale_block_idx = physical_block_idx
 
         if KV_CACHE_DTYPE == "nvfp4":
             if cfg.HEAD_SIZE_SPLIT == 2:
@@ -2355,7 +2428,10 @@ def _unified_attention_gluon_kernel_3d(
         else:
             v = pgm.tdm_shared_load_v(wait_count=2, buffer_id=buffer_id)
             v_scales = None
-            acc = pgm.compute_pv(p, v, v_scales, acc)
+            if PER_TOKEN_KV_SCALE:
+                acc = compute_pv_per_token(pgm, p, v, acc)
+            else:
+                acc = pgm.compute_pv(p, v, v_scales, acc)
 
         buffer_id = next_buffer_id
         if need_addtional_mask:
@@ -2366,6 +2442,16 @@ def _unified_attention_gluon_kernel_3d(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
         )[None, :]
 
+    if PER_TOKEN_KV_SCALE:
+        k_token_scales, v_token_scales = load_per_token_kv_scales(
+            k_scale_ptr,
+            v_scale_ptr,
+            scale_block_idx,
+            pgm.tile_end - (cfg.NUM_STAGES - 1),
+            seq_len,
+            kv_head_idx,
+            cfg,
+        )
     if KV_CACHE_DTYPE == "nvfp4":
         k = pgm.tdm_shared_load_k(wait_count=3, buffer_id=buffer_id)
         k_scales = pgm.tdm_shared_load_k_scales(wait_count=2, buffer_id=buffer_id).to(
@@ -2376,6 +2462,8 @@ def _unified_attention_gluon_kernel_3d(
         k_scales = None
     S = pgm.compute_qk(k, q_scales, k_scales)
     S = S * qk_factor
+    if PER_TOKEN_KV_SCALE:
+        S = S * k_token_scales[None, :]
 
     S = pgm.apply_softcap(S)
     seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
@@ -2388,6 +2476,8 @@ def _unified_attention_gluon_kernel_3d(
         p, L, acc0, acc1 = pgm.softmax_part1_split_head(p, L, acc0, acc1, alpha)
     else:
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+    if PER_TOKEN_KV_SCALE:
+        p = p * v_token_scales[None, :]
 
     if KV_CACHE_DTYPE == "nvfp4":
         if cfg.HEAD_SIZE_SPLIT == 2:
@@ -2408,7 +2498,10 @@ def _unified_attention_gluon_kernel_3d(
     else:
         v = pgm.tdm_shared_load_v(wait_count=0, buffer_id=buffer_id)
         v_scales = None
-        acc = pgm.compute_pv(p, v, v_scales, acc)
+        if PER_TOKEN_KV_SCALE:
+            acc = compute_pv_per_token(pgm, p, v, acc)
+        else:
+            acc = pgm.compute_pv(p, v, v_scales, acc)
     # M = M * qk_factor
 
     if cfg.NUM_SEGMENTS_PER_SEQ == 1:
