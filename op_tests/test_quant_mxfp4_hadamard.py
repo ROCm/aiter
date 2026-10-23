@@ -6,12 +6,14 @@
 import argparse
 import itertools
 import math
+import sys
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.quant import dynamic_per_group_scaled_quant, per_1x32_f4_quant_hip
 from aiter.test_common import benchmark, run_perftest
 
@@ -95,6 +97,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--perf", action="store_true")
     args = parser.parse_args()
+    if get_gfx() != "gfx950":
+        aiter.logger.info("hadamard_rotate requires gfx950, skipped on %s", get_gfx())
+        sys.exit(0)
 
     df = [
         test_fused_matches_rotate_then_quant(m, n, dt, sh)
