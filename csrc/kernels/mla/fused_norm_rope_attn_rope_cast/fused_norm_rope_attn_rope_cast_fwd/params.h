@@ -33,8 +33,8 @@ struct FusedNormRopeAttnRopeCastParams
     int stride_o_n;
     int stride_o_h;
     int stride_lse_n;
-    int stride_kv_page;       // shared by unified_kv and kv
-    int stride_kv_scale_page; // shared by unified_kv_scale and kv_scale
+    int stride_kv_page;       // prefix data row stride in bytes
+    int stride_kv_scale_page; // prefix scale row stride in bytes
     float softmax_scale;
 
     float* max_ptr;
@@ -58,8 +58,8 @@ struct FusedNormRopeAttnRopeCastParams
     bool q_norm;
     float norm_eps;
     int extend_capacity;
-    int stride_kv_extend;
-    int stride_kv_scale_extend;
+    int stride_kv_extend;       // independent extend data row stride in bytes
+    int stride_kv_scale_extend; // independent extend scale row stride in bytes
 };
 
 static_assert(sizeof(FusedNormRopeAttnRopeCastParams) == 304);

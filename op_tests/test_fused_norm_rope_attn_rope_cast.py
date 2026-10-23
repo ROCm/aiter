@@ -1893,3 +1893,29 @@ if __name__ == "__main__":
         )
     else:
         raise SystemExit(pytest.main([__file__, "-q", *pytest_args]))
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("mode", ["raw", "rotated", "prepared", "norm"])
+def test_two_source_rope_storage_offset(heads, mode):
+    kwargs, (_, mx, lse) = two_source_inputs(heads, "padded", mode, True, True, True)
+    reference = fused_v41(
+        **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
+    )
+    # Contiguous BF16 views can start two or six bytes past an aligned allocation.
+    for name, offset in (("cos", 1), ("sin", 3)):
+        original = kwargs[name]
+        storage = torch.empty(
+            original.numel() + offset, device=original.device, dtype=original.dtype
+        )
+        view = storage[offset:].view_as(original)
+        view.copy_(original)
+        assert view.is_contiguous() and view.data_ptr() % 8 != 0
+        kwargs[name] = view
+    actual = fused_v41(
+        **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
+    )
+    for out, expected in zip(actual, reference):
+        torch.testing.assert_close(
+            out.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+        )

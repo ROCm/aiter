@@ -68,7 +68,7 @@ using v_o_t = opus::vector_t<typename T::D_ACC, O_ELEMS<T>>;
 
 // ----------------------------------------------------------------------------------- pipeline
 
-constexpr int K_DEPTH       = 4;
+constexpr int K_DEPTH       = 3;
 constexpr int V_DEPTH       = 2;
 constexpr int V_SLOTS       = V_DEPTH + 1;
 constexpr int PV_TAIL_STEPS = V_DEPTH;
@@ -1322,9 +1322,29 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
     auto cs           = reinterpret_cast<const bf16_t*>(a.cos_ptr) + pos * 32;
     auto sn           = reinterpret_cast<const bf16_t*>(a.sin_ptr) + pos * 32;
     auto offsets      = layout_to_offsets<VEC>(make_layout_o_packed<T>(warp, lane, 512));
-    static_for<PV_GROUPS<T>>([&](auto r) {
-        const int head_off = (warp + r.value) % PV_GROUPS<T> * 16 * 512;
-        static_for<NC>([&](auto c) {
+    // Reuse each RoPE coefficient vector across all four head groups. The scalar
+    // path also accepts contiguous BF16 views with a nonzero storage offset.
+    static_for<NC>([&](auto c) {
+        const int d = offsets[c.value] % 512;
+        vector_t<float, 4> rope_cos, rope_sin;
+        if(warp == 3 && c.value >= 2)
+        {
+            const int ri = (d - 448) / 2;
+            if(((reinterpret_cast<uintptr_t>(cs) | reinterpret_cast<uintptr_t>(sn)) & 7) == 0)
+            {
+                rope_cos = cast<float>(*reinterpret_cast<const vector_t<bf16_t, 4>*>(cs + ri));
+                rope_sin = cast<float>(*reinterpret_cast<const vector_t<bf16_t, 4>*>(sn + ri));
+            }
+            else
+            {
+                static_for<4>([&](auto i) {
+                    rope_cos[i.value] = bf32(cs[ri + i.value]);
+                    rope_sin[i.value] = bf32(sn[ri + i.value]);
+                });
+            }
+        }
+        static_for<PV_GROUPS<T>>([&](auto r) {
+            const int head_off   = (warp + r.value) % PV_GROUPS<T> * 16 * 512;
             constexpr int base   = (r.value * NC + c.value) * VEC;
             auto buf             = cast<bf16_t>(slice(v_o, number<base>{}, number<base + VEC>{}));
             auto* p              = reinterpret_cast<u32_t*>(&buf);
@@ -1335,7 +1355,6 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
             p[1]                 = r1[0];
             p[3]                 = r1[1];
             const int off        = offsets[c.value] + head_off;
-            const int d          = off % 512;
             const int64_t global = (int64_t(token) * a.H + h_start) * 512 + off;
             if(a.out_ptr)
                 *reinterpret_cast<vector_t<bf16_t, 8>*>(reinterpret_cast<bf16_t*>(a.out_ptr) +
@@ -1346,8 +1365,8 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
             {
                 static_for<4>([&](auto i) {
                     constexpr int j = i.value * 2;
-                    const int ri    = (d + j - 448) / 2;
-                    const float co = bf32(cs[ri]), si = bf32(sn[ri]), x0 = x[j], x1 = x[j + 1];
+                    const float co = rope_cos[i.value], si = rope_sin[i.value];
+                    const float x0 = x[j], x1 = x[j + 1];
                     x[j]     = add_exact(mul_exact(x0, co), mul_exact(x1, si));
                     x[j + 1] = add_exact(mul_exact(x1, co), -mul_exact(x0, si));
                 });
