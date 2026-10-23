@@ -113,6 +113,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     k_is_bounded,
     n_is_bounded,
     parse_mxfp8_32_wmma_kernel_name,
+    scale_k_align,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as MXFP8_128_WMMA_PREFIX,
@@ -931,10 +932,11 @@ def _compile_mxfp8_wmma_to_cache(
         compile_gemm_a8w8_splitk_reduce,
     )
 
-    if k % scale_block:
-        raise ValueError(
-            f"{kernel_name}: K={k} must be aligned to scale_block={scale_block}"
-        )
+    k_align = scale_k_align(
+        scale_block == MX32_BLOCK_K, a_scale_preshuffled, b_scale_32x32
+    )
+    if k % k_align:
+        raise ValueError(f"{kernel_name}: K={k} must be aligned to {k_align}")
     dev = torch.device("cpu")
     k_blocks = (k + scale_block - 1) // scale_block
     if scale_block == MX32_BLOCK_K:  # row-major or shuffled A; B shuffled or 32x32

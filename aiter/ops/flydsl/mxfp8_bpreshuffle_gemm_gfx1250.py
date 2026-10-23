@@ -194,9 +194,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     if min(M, N, K, tile_m, tile_n, tile_k) < 1:
         raise RuntimeError("GEMM dimensions and tiles must be positive")
 
-    # Both 1x32 and 32x32 scales have one K scale per 32 elements; 128x128
-    # scales need a complete 128-element scale block.
-    k_align = MX32_BLOCK_K if mx32 else BLOCK_K
+    k_align = scale_k_align(mx32, a_scale_preshuffled, b_scale_32x32)
     n_align = MX32_BLOCK_K if b_scale_32x32 else _BLOCK_N
     if N % n_align != 0 or K % k_align != 0:
         raise RuntimeError(
@@ -518,6 +516,16 @@ def mxfp8_32_kernel_name(name: str, b_scale_32x32: bool = False) -> str:
 def compute_kernel_k_pair(num_buffers: int, tile_n: int) -> int:
     """K-tiles the compute-bound kernel stages per TDM super."""
     return 1 if num_buffers == 4 and tile_n == 256 else 2
+
+
+def scale_k_align(mx32: bool, a_scale_preshuffled: bool, b_scale_32x32: bool) -> int:
+    """K alignment the scale layouts need. Only the row-major 32x32 weight scale with a
+    plain activation scale holds one scale per 32 K; the 32x4-shuffled layouts (1x32
+    weight scale, preshuffled activation scale) and the 128x128 scales pack whole
+    128-element groups."""
+    return (
+        MX32_BLOCK_K if mx32 and b_scale_32x32 and not a_scale_preshuffled else BLOCK_K
+    )
 
 
 def k_is_bounded(

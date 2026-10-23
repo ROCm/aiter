@@ -26,6 +26,9 @@ from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
 SCALE_BLOCK_SHAPES = {"32x32": (32, 32), "128x128": block_shape}
+# Native 32x32 E8M0 dispatch exists on these archs only; elsewhere the op casts the
+# scales to FP32 and runs implementations that expect 128x128 blocks.
+W_SCALE_32X32_GFX = ("gfx950", "gfx1250")
 TEST_NUM_ITERS = 100
 
 
@@ -513,6 +516,15 @@ if args.csv is not None:
     scale_blocks = [_scale_block_for_row(row) for _, row in shapes_df.iterrows()]
 else:
     scale_blocks = [args.w_scale_block or "128x128"]
+
+if get_gfx() not in W_SCALE_32X32_GFX and "32x32" in scale_blocks:
+    print(f"Skipping the 32x32 cases: {get_gfx()} has no native 32x32 dispatch")
+    if args.csv is not None:
+        shapes_df = shapes_df[[b != "32x32" for b in scale_blocks]]
+    scale_blocks = [b for b in scale_blocks if b != "32x32"]
+if not scale_blocks:
+    print("No supported case left, nothing to run")
+    sys.exit(0)
 
 for w_scale_block in set(scale_blocks):
     if w_scale_block not in SCALE_BLOCK_SHAPES:
