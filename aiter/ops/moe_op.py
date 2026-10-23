@@ -296,6 +296,12 @@ def fmoe_fp8_blockscale_g1u1(
 
 
 @compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_fp8_blockscale_g1u1_has_kernel(
+    activation: int, xquant: bool, block_size_M: int, inter_dim: int, model_dim: int
+) -> int: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def moe_stage1_g1u1(
     input: Tensor,
     w1: Tensor,
