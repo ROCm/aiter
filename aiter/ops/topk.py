@@ -1026,7 +1026,7 @@ def decode_adaptive_width(width: int, max_row_len: int) -> int:
 def decode_backend_for_call(
     logits: torch.Tensor,
     next_n: int,
-    seq_lens: torch.Tensor,
+    seq_lens: torch.Tensor | None,
     indices: torch.Tensor,
     num_rows: int,
     stride0: int,
@@ -1060,9 +1060,14 @@ def decode_backend_for_call(
         num_rows,
         k,
         values is None,
-        # No bound means the host cannot size the adaptive config, so decline it;
-        # the single-launch bands still see the physical width.
-        None if max_row_len is None else decode_adaptive_width(width, max_row_len),
+        # No bound means the host cannot size the adaptive config, and no
+        # `seq_lens` leaves the adaptive kernel nothing to read row lengths from,
+        # so either declines it; the single-launch bands still see the width.
+        (
+            None
+            if max_row_len is None or seq_lens is None
+            else decode_adaptive_width(width, max_row_len)
+        ),
     )
     if backend == BACKEND_DEFAULT:
         return BACKEND_DEFAULT

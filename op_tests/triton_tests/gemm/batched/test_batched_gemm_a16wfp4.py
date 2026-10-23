@@ -61,6 +61,13 @@ def generate_batched_gemm_a16wfp4_inputs(B, M, N, K, dtype, layout="TN", output=
     w_scales = torch.randint(
         124, 128, (B, K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda"
     )
+    # Put w_scales at the head of a buffer whose tail is 0xFF, which is NaN in
+    # e8m0. A ragged-K tile that loads scale groups past the end of w_scales
+    # then turns the output NaN instead of reading whatever memory follows.
+    poisoned = torch.full(
+        (2 * B, K // SCALE_GROUP_SIZE, N), 0xFF, dtype=torch.uint8, device="cuda"
+    )
+    w_scales = poisoned[:B].copy_(w_scales)
     w_scales = w_scales.transpose(1, 2)
 
     y = None
@@ -123,6 +130,9 @@ def get_x_vals():
     ]
     # This mirrors GLM MLA's qk_nope_head_dim=192.
     x_vals_with_batch += [(16, 32, 512, 192)]
+    # K = 35 * 32 leaves a ragged tail under any BLOCK_SIZE_K >= 64, after
+    # several full K iterations rather than within the first one.
+    x_vals_with_batch += [(2, 7, 512, 1120), (3, 16, 128, 1120)]
     # x_vals_with_batch = [(1, 1, 128, 512+128), ] # TODO check
     return x_vals_with_batch
 

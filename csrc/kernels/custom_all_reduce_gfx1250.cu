@@ -93,10 +93,14 @@ void dispose(fptr_t _fa)
 // region is zero-initialized by the caller (which also resets the LL flags).
 // Takes world_size because the LL scratch is sized by it. Reserving
 // kLLMaxRanks slots unconditionally made TP=2 pay for eight ranks' worth.
+// Groups above kLLMaxRanks are allgather-only and never route to LL, so they
+// get no scratch (it would be 1 GiB per rank at 64).
 int64_t meta_size(int64_t world_size)
 {
     aiter::check_ngpus((int)world_size);
-    return (int64_t)(aiter::kLLScratchOffset + aiter::llScratchBytes((int)world_size));
+    size_t ll_bytes =
+        world_size <= aiter::kLLMaxRanks ? aiter::llScratchBytes((int)world_size) : 0;
+    return (int64_t)(aiter::kLLScratchOffset + ll_bytes);
 }
 
 // ---- Internal dispatch helper ----
@@ -484,7 +488,7 @@ void start_sync_latency(fptr_t _fa, int64_t blocks)
 #define LAUNCH_START_SYNC(NG) \
     aiter::start_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
         fa->sg_, fa->self_sg_, fa->rank_)
-    DISPATCH_NGPUS_1250(ws, LAUNCH_START_SYNC);
+    DISPATCH_AG_NGPUS_1250(ws, LAUNCH_START_SYNC);
 #undef LAUNCH_START_SYNC
 }
 
@@ -497,7 +501,7 @@ void end_sync_latency(fptr_t _fa, int64_t blocks)
 #define LAUNCH_END_SYNC(NG) \
     aiter::end_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
         fa->sg_, fa->self_sg_, fa->rank_)
-    DISPATCH_NGPUS_1250(ws, LAUNCH_END_SYNC);
+    DISPATCH_AG_NGPUS_1250(ws, LAUNCH_END_SYNC);
 #undef LAUNCH_END_SYNC
 }
 
@@ -510,7 +514,7 @@ void two_sync_latency(fptr_t _fa, int64_t blocks)
 #define LAUNCH_TWO_SYNC(NG) \
     aiter::two_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
         fa->sg_, fa->self_sg_, fa->rank_)
-    DISPATCH_NGPUS_1250(ws, LAUNCH_TWO_SYNC);
+    DISPATCH_AG_NGPUS_1250(ws, LAUNCH_TWO_SYNC);
 #undef LAUNCH_TWO_SYNC
 }
 
