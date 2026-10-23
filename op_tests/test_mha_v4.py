@@ -40,6 +40,7 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES,
     MHA_V4_QUERY_TILE_ROWS,
     mha_v4_q_multiplier,
+    mxfp4_k_raw_buffer_size,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
@@ -57,7 +58,9 @@ from aiter.ops.mha_v4_quant import (
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
+    rotate_activation_mxfp4_quant_k,
     rotate_activation_mxfp6_quant,
+    rotate_activation_mxfp6_quant_k,
 )
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
     _v_direct_kvtab,
@@ -535,12 +538,152 @@ def test_mha_v4_rotated_fp8_quantization_matches_reference(sequence, heads):
     assert torch.equal(scale, expected_scale)
 
 
-def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
+def test_mha_v4_rotated_fp8_quantization_rejects_a_strided_last_dimension():
     value = torch.randn((1, 1, 128, 2), device="cuda", dtype=torch.bfloat16)
     value = value.transpose(-1, -2)
 
-    with pytest.raises(ValueError, match="requires contiguous hd128 input"):
+    with pytest.raises(ValueError, match="contiguous last dimension"):
         quantize_fp8_rotated(value)
+
+
+def _strided_bshd_views(batch, sequence, heads):
+    """A sequence crop of a packed QKV tensor, NaN outside the crop, and a BHSD transpose."""
+    start = 37
+    qkv = torch.randn(
+        (batch, sequence + 2 * start, 3, heads, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    qkv[:, :start] = float("nan")
+    qkv[:, start + sequence :] = float("nan")
+    bhsd = torch.randn(
+        (batch, heads, sequence, 128), device="cuda", dtype=torch.bfloat16
+    )
+    return {
+        "qkv_crop": qkv[:, start : start + sequence, 1],
+        "bhsd": bhsd.transpose(1, 2),
+    }
+
+
+def _zero_filled_k_pack(packer, value, mean):
+    """Run a raw K packer into zeroed buffers: its tile padding is never written, so only a
+    zeroed allocation makes two runs comparable byte for byte."""
+    batch, sequence, heads, _ = value.shape
+    mean = value.new_empty((0,), dtype=torch.float32) if mean is None else mean
+    if packer is quantize_mxfp4_k:
+        raw = torch.zeros(
+            mxfp4_k_raw_buffer_size(batch, sequence, heads),
+            dtype=torch.uint8,
+            device=value.device,
+        )
+        scale = torch.zeros(
+            (batch, sequence, heads, 4), dtype=torch.uint8, device=value.device
+        )
+        rotate_activation_mxfp4_quant_k(raw, scale, value, mean)
+    else:
+        data_size, scale_size = fp6_k_raw_buffer_sizes(batch, sequence, heads)
+        raw = torch.zeros(data_size, dtype=torch.uint8, device=value.device)
+        scale = torch.zeros(scale_size, dtype=torch.uint8, device=value.device)
+        rotate_activation_mxfp6_quant_k(raw, scale, value, mean)
+    return raw, scale
+
+
+def _bitwise_equal(actual, expected):
+    if isinstance(actual, tuple):
+        return all(_bitwise_equal(a, e) for a, e in zip(actual, expected))
+    return torch.equal(
+        actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+    )
+
+
+_STRIDED_QUANTIZERS = {
+    "int8": lambda x, mean: quantize_int8(x),
+    "fp8": lambda x, mean: quantize_fp8(x),
+    "fp8_rotated": lambda x, mean: quantize_fp8_rotated(x, mean),
+    "mxfp8_q": lambda x, mean: quantize_mxfp8_q(x, 0.127),
+    "mxfp8_k": lambda x, mean: quantize_mxfp8_k(x, mean),
+    "mxfp4_q": lambda x, mean: quantize_mxfp4_q(x, 0.127),
+    "mxfp4_k": lambda x, mean: _zero_filled_k_pack(quantize_mxfp4_k, x, mean),
+    "mxfp6_q": lambda x, mean: quantize_mxfp6_q(x, 0.127),
+    "mxfp6_k": lambda x, mean: _zero_filled_k_pack(quantize_mxfp6_k, x, mean),
+    "v_fp8": lambda x, mean: quantize_v_fp8(x),
+    "v_mxfp4_fp6_p": lambda x, mean: quantize_v_mxfp4_fp6_p(x),
+    "v_mxfp6": lambda x, mean: quantize_v_mxfp6(x),
+    "v_mxfp6_fp6_p": lambda x, mean: quantize_v_mxfp6_fp6_p(x),
+}
+_GFX942_STRIDED_QUANTIZERS = {"int8", "fp8", "fp8_rotated", "v_fp8"}
+_GFX942_DENSE_ROWS = {
+    (AttentionFormat.FP8,) * 3,
+    (AttentionFormat.INT8, AttentionFormat.INT8, AttentionFormat.FP8),
+}
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers"
+)
+@pytest.mark.parametrize("quantizer", list(_STRIDED_QUANTIZERS))
+@pytest.mark.parametrize("batch,sequence,heads", [(2, 1001, 5), (1, 129, 2)])
+@pytest.mark.parametrize("with_mean", [False, True])
+def test_mha_v4_quantizers_read_strided_views_like_contiguous_input(
+    quantizer, batch, sequence, heads, with_mean
+):
+    """A view whose rows alone are dense quantizes exactly as its contiguous copy does.
+
+    The crop is NaN outside its rows, so a read past them would surface in the codes or scales.
+    """
+    if with_mean and not quantizer.endswith("_k") and quantizer != "fp8_rotated":
+        pytest.skip("only the K quantizers take a mean")
+    if get_gfx() != "gfx950" and quantizer not in _GFX942_STRIDED_QUANTIZERS:
+        pytest.skip(f"{quantizer} is a gfx950 quantizer")
+    torch.manual_seed(41)
+    for value in _strided_bshd_views(batch, sequence, heads).values():
+        assert not value.is_contiguous()
+        dense = value.contiguous()
+        mean = dense.float().mean(dim=1).contiguous() + 0.25 if with_mean else None
+        expected = _STRIDED_QUANTIZERS[quantizer](dense, mean)
+        actual = _STRIDED_QUANTIZERS[quantizer](value, mean)
+        assert _bitwise_equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 rows"
+)
+@pytest.mark.parametrize(
+    "formats",
+    [
+        (AttentionFormat.BF16,) * 3,
+        (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.FP8),
+        (AttentionFormat.FP8,) * 3,
+        (AttentionFormat.INT8, AttentionFormat.INT8, AttentionFormat.FP8),
+        (AttentionFormat.MXFP4,) * 3,
+        (AttentionFormat.MXFP6,) * 3,
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6, AttentionFormat.FP8),
+    ],
+    ids=lambda formats: "-".join(f.name for f in formats),
+)
+def test_mha_v4_runs_on_a_sequence_crop_of_packed_qkv(formats):
+    """Q, K and V taken as views of a cropped packed QKV need no copy and change nothing."""
+    if get_gfx() != "gfx950" and formats not in _GFX942_DENSE_ROWS:
+        pytest.skip(f"no {get_gfx()} row for {'-'.join(f.name for f in formats)}")
+    formats = tuple(
+        native_fp8_format() if f == AttentionFormat.FP8 else f for f in formats
+    )
+    torch.manual_seed(43)
+    batch, sequence, heads, start = 2, 1001, 5, 37
+    qkv = torch.randn(
+        (batch, sequence + 2 * start, 3, heads, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    qkv[:, :start] = float("nan")
+    qkv[:, start + sequence :] = float("nan")
+    q, k, v = qkv[:, start : start + sequence].unbind(2)
+
+    expected = mha_v4(q.contiguous(), k.contiguous(), v.contiguous(), *formats)
+    actual = mha_v4(q, k, v, *formats)
+
+    assert not torch.isnan(actual).any()
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize(

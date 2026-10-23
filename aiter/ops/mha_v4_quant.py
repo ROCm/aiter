@@ -66,7 +66,7 @@ def mha_v4_q_multiplier(softmax_scale: float) -> float:
 def _rotate_activation_hd128(
     out: Tensor, input: Tensor, mean: Tensor, partial_amax: Tensor
 ) -> None:
-    """Apply normalized Walsh-Hadamard rotation to contiguous hd128 rows."""
+    """Apply normalized Walsh-Hadamard rotation to hd128 rows."""
 
 
 def _or_empty(input: Tensor, mean: Optional[Tensor]) -> Tensor:  # noqa: UP045
@@ -169,8 +169,12 @@ def _quantize_v_mxfp4_fp6_p_hip(
 
 
 def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, int]:
-    if input.dim() != 4 or input.shape[-1] != 128 or not input.is_contiguous():
-        raise ValueError(f"{operation} requires contiguous hd128 BSHD input")
+    # The producers read rows through the batch, sequence and head strides, so only a row's 128
+    # channels have to be contiguous.
+    if input.dim() != 4 or input.shape[-1] != 128 or input.stride(-1) != 1:
+        raise ValueError(
+            f"{operation} requires hd128 BSHD input with a contiguous last dimension"
+        )
     return input.shape
 
 
@@ -185,19 +189,34 @@ def _quantize_per_tensor(
     clip: float,
     partial: Optional[Tensor] = None,  # noqa: UP045
 ) -> tuple[Tensor, Tensor]:
-    """Quantize to a single scale. `partial` supplies precomputed per-block amaxes."""
-    if not input.is_contiguous():
-        raise ValueError("MHA v4 per-tensor quantization requires contiguous input")
+    """Quantize to a single scale. `partial` supplies precomputed per-block amaxes.
+
+    The output is contiguous. The input may also be a BSHD view whose last dimension alone is
+    contiguous, such as a sequence crop of a packed QKV tensor.
+    """
+    strided = not input.is_contiguous()
+    if strided and (input.dim() != 4 or input.stride(-1) != 1):
+        raise ValueError(
+            "MHA v4 per-tensor quantization requires contiguous input or BSHD input with a "
+            "contiguous last dimension"
+        )
     numel = input.numel()
     blocks = triton.cdiv(numel, MHA_V4_PER_TENSOR_BLOCK_SIZE)
     scale = input.new_empty((1,), dtype=torch.float32)
     output = input.new_empty(input.shape, dtype=output_dtype)
+    if strided:
+        _, sequence, heads, head_dim = input.shape
+        layout = (head_dim, heads, sequence, *input.stride()[:3])
+    else:
+        layout = (1, 1, 1, 0, 0, 0)
     if partial is None:
         partial = input.new_empty((blocks,), dtype=torch.float32)
         mha_v4_per_tensor_amax_kernel[(blocks,)](
             input,
             partial,
             numel,
+            *layout,
+            STRIDED=strided,
             BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
             num_warps=8,
         )
@@ -225,7 +244,9 @@ def _quantize_per_tensor(
         output,
         scale,
         numel,
+        *layout,
         IS_INT8=output_dtype == torch.int8,
+        STRIDED=strided,
         BLOCK_SIZE=MHA_V4_PER_TENSOR_BLOCK_SIZE,
         num_warps=8,
     )
@@ -234,7 +255,7 @@ def _quantize_per_tensor(
 
 @torch.library.custom_op("aiter::mha_v4_quantize_int8_v2", mutates_args=())
 def quantize_int8(input: Tensor, clip: float = 1.0) -> tuple[Tensor, Tensor]:
-    """Per-tensor quantize a contiguous tensor to INT8 and return its scale."""
+    """Per-tensor quantize to INT8 and return its scale; see _quantize_per_tensor for layouts."""
     return _quantize_per_tensor(input, torch.int8, 127.0, clip)
 
 
@@ -248,7 +269,7 @@ def _quantize_int8_fake(input: Tensor, clip: float = 1.0) -> tuple[Tensor, Tenso
 
 @torch.library.custom_op("aiter::mha_v4_quantize_fp8", mutates_args=())
 def quantize_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
-    """Per-tensor quantize a contiguous tensor to native FP8 and return its scale."""
+    """Per-tensor quantize to native FP8 and return its scale; see _quantize_per_tensor for layouts."""
     return _quantize_per_tensor(input, dtypes.fp8, torch.finfo(dtypes.fp8).max, 1.0)
 
 
@@ -267,9 +288,11 @@ def quantize_fp8_rotated(
     The rotation kernel emits the amax as it goes, so this costs two passes over the tensor
     rather than three.
     """
-    if input.shape[-1] != 128 or not input.is_contiguous():
-        raise ValueError("rotated FP8 quantization requires contiguous hd128 input")
-    rotated = torch.empty_like(input)
+    if input.shape[-1] != 128 or input.stride(-1) != 1:
+        raise ValueError(
+            "rotated FP8 quantization requires hd128 input with a contiguous last dimension"
+        )
+    rotated = input.new_empty(input.shape)
     blocks = triton.cdiv(input.numel() // 128, MHA_V4_ROTATE_ROWS_PER_BLOCK)
     partial = input.new_empty((blocks,), dtype=torch.float32)
     rotate_activation_hd128(rotated, input, mean, partial)
@@ -569,7 +592,7 @@ def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     )
     block_k = 64
     blocks = triton.cdiv(sequence, block_k)
-    quantized = torch.empty_like(input, dtype=dtypes.fp8)
+    quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
     sage_quant_v_kernel[(batch * heads * blocks,)](
         input,
         quantized,
