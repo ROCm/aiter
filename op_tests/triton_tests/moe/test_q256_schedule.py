@@ -140,6 +140,25 @@ class TestGPUJobMap(unittest.TestCase):
         cls.torch = torch
         cls.launch = staticmethod(q256_make_job_map)
 
+    def _gpu_args(self, inputs):
+        torch = self.torch
+        return [torch.tensor(x, dtype=torch.int32, device="cuda") for x in inputs] + [
+            torch.empty(1024, dtype=torch.int32, device="cuda")
+        ]
+
+    def _check_exact_map(self, inputs, reuse=False):
+        expected = reference_job_map(*inputs)
+        args = self._gpu_args(inputs)
+        output = args[-1]
+        if reuse:
+            output.fill_(-99)
+        self.assertIs(self.launch(*args), output)
+        self.assertEqual(output.cpu().tolist(), expected)
+        if reuse:
+            output.fill_(-77)
+            self.launch(*args)
+            self.assertEqual(output.cpu().tolist(), expected)
+
     def test_exact_map_and_output_reuse(self):
         cases = [
             {"boundary": 256},
@@ -157,31 +176,15 @@ class TestGPUJobMap(unittest.TestCase):
         ]
         for case in cases:
             with self.subTest(case=case):
-                inputs = make_inputs(**case)
-                expected = reference_job_map(*inputs)
-                tensors = [
-                    self.torch.tensor(x, dtype=self.torch.int32, device="cuda")
-                    for x in inputs
-                ]
-                output = self.torch.full(
-                    (1024,), -99, dtype=self.torch.int32, device="cuda"
-                )
-                self.assertIs(self.launch(*tensors, output), output)
-                self.assertEqual(output.cpu().tolist(), expected)
-                output.fill_(-77)
-                self.launch(*tensors, output)
-                self.assertEqual(output.cpu().tolist(), expected)
+                self._check_exact_map(make_inputs(**case), reuse=True)
 
     def test_basic_tensor_validation(self):
         torch = self.torch
-        inputs = [
-            torch.tensor(x, dtype=torch.int32, device="cuda") for x in make_inputs()
-        ]
-        output = torch.empty(1024, dtype=torch.int32, device="cuda")
+        valid_args = self._gpu_args(make_inputs())
         for index in range(4):
             for invalid in ("dtype", "rank", "stride", "device", "type"):
                 with self.subTest(index=index, invalid=invalid):
-                    args = inputs + [output]
+                    args = valid_args.copy()
                     tensor = args[index]
                     args[index] = {
                         "dtype": lambda tensor=tensor: tensor.to(torch.int64),
@@ -196,7 +199,7 @@ class TestGPUJobMap(unittest.TestCase):
                         self.launch(*args)
         for index, size in ((0, 255), (1, 0), (2, 1), (3, 1023), (3, 1025)):
             with self.subTest(index=index, size=size):
-                args = inputs + [output]
+                args = valid_args.copy()
                 args[index] = torch.empty(size, dtype=torch.int32, device="cuda")
                 with self.assertRaises(ValueError):
                     self.launch(*args)
@@ -214,16 +217,7 @@ class TestGPUJobMap(unittest.TestCase):
                             )
                             token = rng.randrange(8192) if live else 8192
                             ids[tile * 256 + fragment * 32] = (7 << 24) | token
-                    expected = reference_job_map(ids, experts, counts)
-                    tensors = [
-                        self.torch.tensor(x, dtype=self.torch.int32, device="cuda")
-                        for x in (ids, experts, counts)
-                    ]
-                    output = self.torch.empty(
-                        1024, dtype=self.torch.int32, device="cuda"
-                    )
-                    self.launch(*tensors, output)
-                    self.assertEqual(output.cpu().tolist(), expected)
+                    self._check_exact_map((ids, experts, counts))
 
 
 if __name__ == "__main__":
