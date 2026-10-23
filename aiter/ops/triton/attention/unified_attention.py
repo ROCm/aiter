@@ -5,12 +5,14 @@ from typing import NamedTuple
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
+    get_arch,
+)
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
     reduce_segments,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms
