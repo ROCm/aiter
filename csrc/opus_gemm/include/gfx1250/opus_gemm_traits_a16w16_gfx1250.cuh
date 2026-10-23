@@ -374,7 +374,7 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int kSchedWmmaMask = 0x008;                 // WMMA group
     static constexpr int kSchedWmmaCount = kExpM * kExpN * kExpKHalf;
 
-#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+#if ((defined(__gfx1250__) || defined(__gfx1250_strict__)) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
     // The TDM window types live only where opus::tdm is available (gfx1250 device
     // pass + host pass, clang>=22). Non-gfx1250 device passes and clang-20
     // (ROCm 7.1) CI never reference them -- opus::tdm is gated identically.
@@ -397,7 +397,7 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
 // ── smem -> register read layouts (device-only; host pass compiles them too
 //    for vtype_c consistency). Reference each traits member; no local
 //    constexpr beyond loop-index helpers. ────────────────────────────────────
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__)) || !defined(__HIP_DEVICE_COMPILE__)
 
 // smem TILE layout (what the TDM write produces, ra/rb read): row-major
 // [rows][K] with padded row pitch.

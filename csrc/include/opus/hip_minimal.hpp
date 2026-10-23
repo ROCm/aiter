@@ -35,7 +35,7 @@
 #define __launch_bounds__(...) \
     __launch_bounds_select__(__VA_ARGS__, __launch_bounds_impl1__, __launch_bounds_impl0__, )(__VA_ARGS__)
 #endif
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
 #ifndef __cluster_dims__
 #define __cluster_dims__(...) __attribute__((cluster_dims(__VA_ARGS__)))
 #endif

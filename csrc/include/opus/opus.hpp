@@ -1215,7 +1215,7 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_fast_raw(float f)
     const unsigned int result  = ((bits & 0x7fffffffu) > 0x7f800000u) ? 0x7fff0000u : rounded;
     return static_cast<unsigned short>(result >> 16);
 }
-#if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
+#if (defined(__gfx950__) || (defined(__gfx1250__) || defined(__gfx1250_strict__)) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250/gfx12 has instruction conversion, leave 'rm' here for compatiblity
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
 #else
@@ -1236,7 +1236,7 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 // Template constexpr (packed variants, OPUS_CAST_DEFINE) survives because the check is deferred to instantiation.
 // TODO: we may remove constexpr from cast in the future
 OPUS_D auto fp32_to_fp8(const fp32_t& x) {
-#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || (defined(__gfx1250__) || defined(__gfx1250_strict__)))
     // RDNA3/3.5 (gfx1100/gfx115x) lack fp8-conversion-insts; compile-only stub so headers build. BF16 code paths never invoke fp8 conversion.
     (void)x; return __builtin_bit_cast(fp8_t, static_cast<signed char>(0));
 #else
@@ -1245,7 +1245,7 @@ OPUS_D auto fp32_to_fp8(const fp32_t& x) {
 #endif
 }
 OPUS_D auto fp8_to_fp32(const fp8_t& x) {
-#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || (defined(__gfx1250__) || defined(__gfx1250_strict__)))
     (void)x; return fp32_t(0.0f);
 #else
     int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
@@ -1412,7 +1412,7 @@ OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 
 }
 template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(static_cast<u32_t>(__builtin_bit_cast(u8_t, s)), scale, sel); }
-#elif defined(__gfx1250__)
+#elif (defined(__gfx1250__) || defined(__gfx1250_strict__))
 // gfx1250: pk8 builtins convert 8 fp4 <-> 8 f32 at once
 // f32->fp4: __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v8f32 src, float scale) -> i32
 // fp4->f32: __builtin_amdgcn_cvt_scale_pk8_f32_fp4(i32 src, i32 scale_sel, i32 imm) -> v8f32
@@ -1594,7 +1594,7 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 
 OPUS_H_D constexpr index_t get_warp_size()
 {
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     return 32;
 #elif defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
     return 64;
@@ -1608,7 +1608,7 @@ OPUS_H_D constexpr index_t get_smem_size()
 {
 #if defined(__gfx950__)
     return 163840;  // 160KB (CDNA4)
-#elif defined(__gfx1250__)
+#elif (defined(__gfx1250__) || defined(__gfx1250_strict__))
     return 327680;  // 320KB (CDNA5)
 #else
     return 65536;   // 64KB
@@ -1626,7 +1626,7 @@ OPUS_D index_t block_id_z()  { return __builtin_amdgcn_workgroup_id_z(); }
 OPUS_D index_t block_size_x() { return __builtin_amdgcn_workgroup_size_x(); }
 OPUS_D index_t block_size_y() { return __builtin_amdgcn_workgroup_size_y(); }
 OPUS_D index_t block_size_z() { return __builtin_amdgcn_workgroup_size_z(); }
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
 OPUS_D index_t cluster_workgroup_id_x() {return __builtin_amdgcn_cluster_workgroup_id_x();}
 OPUS_D index_t cluster_workgroup_id_y() {return __builtin_amdgcn_cluster_workgroup_id_y();}
 OPUS_D index_t cluster_workgroup_id_z() {return __builtin_amdgcn_cluster_workgroup_id_z();}
@@ -1700,7 +1700,7 @@ OPUS_D unsigned int lane_id() {
 }
 
 //gfx1250 only feature. Named-barrier / cluster-sync builtins + __amdgpu_named_workgroup_barrier_t only exist on clang>=22 (ROCm>=7.2); gate the host pass too so clang-20 (ROCm 7.1) CI does not parse them.
-#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+#if ((defined(__gfx1250__) || defined(__gfx1250_strict__)) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
 OPUS_D u32_t waveid_in_workgroup() { u32_t wave_id; asm volatile("s_bfe_u32 %0, ttmp8, 0x50019" : "=s"(wave_id)); return wave_id; }
 
 //Named Barrier define
@@ -1750,7 +1750,7 @@ OPUS_D constexpr auto buffer_default_config() {
 #elif defined(__gfx103__)
     return 0x31014000;
 // gfx1200/gfx1201 (Navi 44/48) listed explicitly -- __gfx11__/__gfx12__ are typos (clang predefines only uppercase __GFX11__/__GFX12__), so without this gfx1200/gfx1201 fall into the 0xffffffff sentinel and make_gmem<> stores silently drop.
-#elif defined(__gfx11__) || defined(__gfx12__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)
+#elif defined(__gfx11__) || defined(__gfx12__) || (defined(__gfx1250__) || defined(__gfx1250_strict__)) || defined(__gfx1201__) || defined(__gfx1200__)
     return 0x31004000;
 #else
     return 0xffffffff;
@@ -1772,22 +1772,22 @@ OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned in
 //   fadd.v2f16   : atomic-buffer-global-pk-add-f16-insts (gfx942/gfx950/gfx1250)
 //   fadd.v2bf16  : raw_buffer_atomic_fadd<v2bf16>        (gfx90a/gfx942/gfx950/gfx12+; gated to gfx950/gfx1250 per request)
 //   fmin/fmax.f32: atomic-fmin-fmax-global-f32           (gfx950/gfx1250)
-#if defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || (defined(__gfx1250__) || defined(__gfx1250_strict__)) || defined(__gfx1200__) || defined(__gfx1201__)
 #define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 1
 #else
 #define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 0
 #endif
-#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
+#if defined(__gfx942__) || defined(__gfx950__) || (defined(__gfx1250__) || defined(__gfx1250_strict__))
 #define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 1
 #else
 #define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 0
 #endif
-#if defined(__gfx950__) || defined(__gfx1250__)
+#if defined(__gfx950__) || (defined(__gfx1250__) || defined(__gfx1250_strict__))
 #define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 1
 #else
 #define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 0
 #endif
-#if defined(__gfx950__) || defined(__gfx1250__)
+#if defined(__gfx950__) || (defined(__gfx1250__) || defined(__gfx1250_strict__))
 #define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 1
 #else
 #define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 0
@@ -1834,7 +1834,7 @@ OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(i32_t src, i32_t cmp, i32
 OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_add_i32(i32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i32");
 #pragma clang diagnostic pop
 
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__)) || !defined(__HIP_DEVICE_COMPILE__)
 enum class atomic_scope : u8_t { cu=0, se=1, dev=2, sys=3 };   // VMEM cache scope[4:3] for atomics
 // RMW-atomic cpol (NOT make_cpol's load hints): TH[0]=returning (1=>returns pre-op value, tracked by LOADcnt; 0=>non-ret, STOREcnt), TH[1]=NT, TH[2]=cascade (defer scope of non-ret atomics; keep 0 for gates), scope[4:3]=cu/se/dev/sys (cross-cluster needs >=dev).
 OPUS_H_D constexpr int make_atomic_cpol(atomic_scope sc = atomic_scope::dev, bool returning = true, bool nt = false, bool cascade = false) { return (returning ? 1 : 0) | (nt ? (1 << 1) : 0) | (cascade ? (1 << 2) : 0) | ((int(sc) & 0x3) << 3); }
@@ -1851,7 +1851,7 @@ struct gmem {
 
     OPUS_D gmem(const void* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config())
         : cached_rsrc(make_buffer_rsrc(ptr, size, config))
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         , raw_ptr(static_cast<const char*>(ptr))
 #endif
     {}
@@ -1871,7 +1871,7 @@ struct gmem {
     template<index_t vec = 1, index_t i_os = 0, index_t aux = 0>
     OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
         using type = vector_type<vec>;
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         static_assert(i_os >= 0 && i_os <= (1 << 23) - 1, "_async_load: i_os exceeds gfx1250 VGLOBAL IOFFSET range [0, 2^23 - 1]");
         #define GPTR_(T, p) ((__attribute__((address_space(1))) T*)(p))
         #define LPTR_(T, p) ((OPUS_LDS_ADDR T*)(p))
@@ -1922,7 +1922,7 @@ struct gmem {
         else if constexpr (sizeof(vector_type<vec>) == 4)  { __builtin_amdgcn_raw_buffer_store_b32 (__builtin_bit_cast(i32_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(u32x2_t, x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 16) {
-#if defined(__gfx1250__) && (__clang_major__ <= 22)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__)) && (__clang_major__ <= 22)
             // clang<=22 (HIP<=7.2) miscompiles bounded b128 store under high C-store reg expansion (large gfx1250 clusterlaunch tiles, e.g. 128x128): sinks the uniform voffset part into the buffer BASE via readfirstlane, corrupting high address bits and bypassing the num_records bound -> OOB fault. Inline-asm barrier keeps voffset opaque so the full offset stays in the bounds-checked VGPR. Fixed in clang-23/HIP 7.14, where this branch compiles out.
             int vo_ = v_os;
             asm volatile("" : "+v"(vo_));
@@ -2176,7 +2176,7 @@ struct gmem {
     }
 
     __amdgpu_buffer_rsrc_t cached_rsrc;
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     const char* raw_ptr;  // flat pointer for global_load_async_to_lds (gfx1250 uses global addressing, not buffer rsrc)
 #endif
 };
@@ -2207,7 +2207,7 @@ struct smem {
         else if constexpr (elem_bits == 4)  { asm volatile("ds_read_b64_tr_b4 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
         else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); }
         return __builtin_bit_cast(type, raw);
-#elif defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__)
+#elif defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1250__) || defined(__gfx1250_strict__))
         using type = vector_type<vec>;
         constexpr index_t elem_bits = sizeof_bits_v<scalar_type>;
         OPUS_LDS_ADDR char* p = ptr + v_os + imm_offset;
@@ -2417,7 +2417,7 @@ template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // tdm (gfx1250): the tensor-DMA tile window -- tdm_traits configures, tdm_desc is the descriptor, tdm is what kernels call. Gated on clang>=22 (ROCm>=7.2), host pass included, so clang-20 CI never parses the DMA opcodes.
-#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+#if ((defined(__gfx1250__) || defined(__gfx1250_strict__)) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
 
 namespace impl {
 // Every D# byte figure is sizeof(element), so a sub-byte pack (fp4_t/int4_t/uint4_t) may only appear as the one whole byte, array<fp4_t, 2>. The bare type reports sizeof 1 for a 4-bit value, so a descriptor built from it strides twice as far as the data; array/vector of any other width instead makes the D#'s element several values at once, silently rescaling every extent, stride and pad. Neither is caught by the byte-size checks, and neither is converted for you.
@@ -2975,7 +2975,7 @@ template<typename T> constexpr bool is_smem_v = is_smem<remove_cvref_t<T>>::valu
 template<typename T> constexpr bool is_mem_v = is_gmem_v<T> || is_smem_v<T>;
 
 // A tdm window is a memory handle but not a `mem`: it has only the asynchronous DMA, so keeping it out of is_mem_v makes load(window) fail to compile.
-#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+#if ((defined(__gfx1250__) || defined(__gfx1250_strict__)) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
 template<typename>   struct is_tdm : false_type {};
 template<typename DataType, typename TileShape, typename... Policies>
 struct is_tdm<tdm<DataType, TileShape, Policies...>> : true_type {};
@@ -3010,7 +3010,7 @@ OPUS_D void async_load_if(Mem& mem, Args&&... args) { mem.template async_load_if
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // waitcnt
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
 // gfx1250: split wait counters, exposed as native instruction wrappers via LLVM IR intrinsics.
 // s_wait_expcnt/s_wait_samplecnt/s_wait_bvhcnt do NOT exist on gfx1250.
 #pragma clang diagnostic push
@@ -3208,7 +3208,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // wmma (RDNA4 / wave32) -- gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ -- gfx12 set is DISPATCH_WMMA_GFX12_*.
-#if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__)) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
 // f16/bf16/f32 builtins: (a_neg, A, b_neg, B, c_mod, C, matrix_a_reuse, matrix_b_reuse)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
@@ -3282,7 +3282,7 @@ struct wmma {
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) -> vtype_c {
         (void)a; (void)b; (void)c;
         if      constexpr (false) {}
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         // f16/bf16 16x16x32
         else if constexpr DISPATCH_WMMA_(fp16_t, fp16_t, fp32_t, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x32_f16)
         else if constexpr DISPATCH_WMMA_(fp16_t, fp16_t, fp16_t, 16, 16, 32, __builtin_amdgcn_wmma_f16_16x16x32_f16)
@@ -3363,7 +3363,7 @@ struct wmma {
                                      number<a_scale_sel> = {}, number<b_scale_sel> = {}) -> vtype_c {
         (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;
         if constexpr (false) {}
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         // 16x16x128 f8f6f4 (fp8/fp4 via format code): builtin always takes i32x16
         else if constexpr (fmt_a >= 0 && fmt_b >= 0 && std::is_same_v<dtype_c, fp32_t> && wave_m == 16 && wave_n == 16 && wave_k == 128) {
             // For packed types (fp4), vtype may be smaller than i32x16; zero-pad via union.
@@ -3402,7 +3402,7 @@ struct wmma {
                                      number<a_scale_sel> = {}, number<b_scale_sel> = {}) -> vtype_c {
         (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;
         if constexpr (false) {}
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         // 16x16x128 f8f6f4 BX16
         else if constexpr (fmt_a >= 0 && fmt_b >= 0 && std::is_same_v<dtype_c, fp32_t> && wave_m == 16 && wave_n == 16 && wave_k == 128) {
             auto pad_to_i32x16 = [](const auto& v) {
@@ -3700,7 +3700,7 @@ OPUS_D decltype(auto) make_mfma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { 
 // A:[(grpm_a<p>), (rept_a<y>, grpk_a<p>, pack_a<y>)], MxK
 // B:[(grpn_b<p>), (rept_b<y>, grpk_b<p>, pack_b<y>)], NxK
 // C:[(grpm_c<p>, rept_c<y>, pack_c<y>), (grpn_c<p>)], MxN
-#if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__)) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
 namespace impl {
 template<typename WMMA>
 struct wmma_adaptor : public remove_cvref_t<WMMA> {
@@ -4053,14 +4053,14 @@ OPUS_D decltype(auto) make_tiled_mma(MMA&& mma, ES, TS, A&& = {}) {
 }
 
 template<typename d_a, typename d_b, typename d_c, typename ES /* expand-m/n/k */, typename TS /* tile-m/n/k */, typename WS /* wave-m/n/k*/,
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
          typename WA = wmma_adaptor,
 #else
          typename WA = mfma_adaptor,
 #endif
          typename TA = tiled_mma_adaptor, index_t warp_size = get_warp_size()>
 OPUS_D decltype(auto) make_tiled_mma(ES, TS, WS, WA&& = {}, TA&& = {}) {
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     return TA{}(make_wmma<d_a, d_b, d_c>(WS{}, WA{}, number<warp_size>{}),
 #else
     return TA{}(make_mfma<d_a, d_b, d_c>(WS{}, WA{}, number<warp_size>{}),

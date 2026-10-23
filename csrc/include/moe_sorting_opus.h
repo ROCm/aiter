@@ -822,7 +822,7 @@ struct MoeSortingKernel
                             smem_tokens(curr_token_id, eid)++;
                     }
                 }
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
                 opus::s_wait_dscnt(opus::number<0>{});
 #else
                 opus::s_waitcnt_lgkmcnt(opus::number<0>{});
@@ -951,7 +951,7 @@ struct MoeSortingKernel
                     // NOTE: this waitcnt is a must, compiler will not generate waitcnt lgkmcnt()
                     // for above write however __syncthreads will cause barrier with waves other
                     // than 0(which is not we want)
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
                     opus::s_wait_dscnt(opus::number<0>{});
 #else
                     opus::s_waitcnt_lgkmcnt(opus::number<0>{});

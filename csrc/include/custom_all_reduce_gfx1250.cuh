@@ -195,7 +195,7 @@ constexpr size_t kLLScratchOffset =
 
 // gfx1250 128-bit global load/store at *system* scope ("" == system). A single
 // 16B transaction keeps a line's data and flags atomic w.r.t. a peer reader.
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__) &&                   \
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1250__) || defined(__gfx1250_strict__)) &&                   \
     __has_builtin(__builtin_amdgcn_global_store_b128) &&                         \
     __has_builtin(__builtin_amdgcn_global_load_b128)
 #define AITER_GFX1250_HAVE_B128 1

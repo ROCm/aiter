@@ -2829,7 +2829,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // and the unrolled loop counter, so it stays scalar; widening the block
     // with more threads instead made it thread-derived, pushed the address
     // chain into VGPRs and measured slower at every width.
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     // gfx1250: stage Q through the tensor engine, within the three tensor ops
     // a wave can hold in flight. A wave consumes only what it staged, so there
     // is no block barrier, just the tensor wait. The host sizes the dynamic

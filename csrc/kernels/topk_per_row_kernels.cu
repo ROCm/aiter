@@ -498,7 +498,7 @@ __global__ void radix_kernel_persistent(T const* in,
         }
         // Every wave drains its own no-return histogram atomics before
         // thread 0 participates in the cross-block arrival counter.
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         asm volatile("s_wait_storecnt 0" ::: "memory");
 #else
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");

@@ -109,7 +109,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // apart -- one byte per cache line, measured at 4.8 us (15% of the kernel) to move
     // 0.9 MB. Column-major makes that store contiguous and strides the data reads instead,
     // but each group still reads one contiguous 256B run. Net: 36.3 -> 32.0 us.
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     static constexpr bool kTunedForThisArch = true;
 #else
     static constexpr bool kTunedForThisArch = false;
@@ -144,7 +144,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         enable_tdm && kColumnMajorGroups && kTdmKPT > 1 && kTdmWaves >= 1 &&
         (block_size % WARP_SIZE) == 0;
 
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     // One descriptor per BLOCK: the tile is every wave's rows at once. tensorcnt retires
     // per wave, so only the issuer can wait and the rest need a barrier -- half the
     // descriptors and a 2x wider tile against two barriers per stage.
@@ -158,7 +158,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // All four lanes of a group share a group id, hence the same (x, y), so the DPP reduce
     // below never reads across an active/inactive lane boundary.
     auto resolve = [&](int64_t gid, int64_t& gx, int32_t& gy) -> bool {
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         if constexpr(grid_2d)
         {
             static_assert(kColumnMajorGroups && group_size == 128);
@@ -179,7 +179,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 #endif
         if constexpr(kColumnMajorGroups)
         {
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
             if constexpr(kTiledTdm)
             {
                 constexpr int kTileCols = kTdmGroupsPerBlock / kTileRows;
@@ -545,7 +545,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         }
     };   // process
 
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     if constexpr(kUseTdmShape)
     {
         // Wave 0 stages the block's groups into shared LDS. It waits on tensorcnt;
@@ -1008,7 +1008,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             {
                 auto buffer_map = opus::make_gmem<int>(smooth_scale_map + chunk_start, chunk_size * sizeof(int));
                 smscale_map_idx_list = buffer_map.load(lane_idx + i)[0];
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
                 opus::s_wait_loadcnt(opus::number<0>{});
 #else
                 opus::s_waitcnt_vmcnt(opus::number<0>{});
@@ -1373,7 +1373,7 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
     static_assert(kSteps * 4 * kSlices == 32 && kWaves % kSlices == 0);
     using vec_i = opus::vector_t<DTYPE_I, kElems>;
     using vec_o = opus::vector_t<opus::fp8_t, kElems>;
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     static constexpr bool kHwConvertDiv = std::is_same_v<DTYPE_I, opus::bf16_t>;
 #else
     static constexpr bool kHwConvertDiv = false;
@@ -2054,7 +2054,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
     float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
     auto buffer_input = opus::make_gmem<DTYPE_I>(input + (int64_t)token_idx * (int64_t)input_stride, cols * sizeof(DTYPE_I));
     vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(buffer_input, threadIdx.x * vec_size_i);
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     opus::s_wait_loadcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
 #else
     opus::s_waitcnt_vmcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});

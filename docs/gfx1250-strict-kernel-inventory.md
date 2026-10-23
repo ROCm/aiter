@@ -581,6 +581,74 @@ That is the intended behaviour -- the enablement plan requires strict tuning to 
 
 <!-- END generated: gfx1250 tuned rows -->
 
+## Strict silent-divergence analysis (code read, 2026-10-23)
+
+Verified empirically on ROCm 10.1 (clang 24.0.0git): `gfx1250-strict` defines
+`__gfx1250_strict__` and **not** `__gfx1250__`. So in device code every
+`#if defined(__gfx1250__)` guard takes its **`#else`** branch on a strict agent.
+These almost always compile (so the build matrix cannot catch them — a strict
+build matrix matches the gfx1250 one to within flaky-parallelism noise); the
+hazard is a **silent wrong path at runtime on A0**. The uniform,
+backward-compatible fix is `defined(__gfx1250__) || defined(__gfx1250_strict__)`
+— strict is gfx1250 (A0) hardware, so it should take the gfx1250 branch, and the
+extra arm is never taken on the shipping ROCm 7 build (no strict target).
+
+95 `__gfx1250__` guards across 24 files; each `#else` was read, because an
+automated "returns a number → wrong" pass over-flags (see `get_warp_size` below).
+Priority for A0 runtime verification:
+
+### Tier 1 — confirmed silent wrong value on A0 (verify first)
+
+| site | gfx1250 gives | strict (#else) gives | effect on A0 |
+|------|---------------|----------------------|--------------|
+| `opus.hpp:1611` `get_smem_size` | 327680 (320 KB) | 65536 (64 KB) | A0 has 320 KB LDS; kernel under-tiles / mis-sizes shared memory |
+| `opus.hpp:1753` `make_gmem` sentinel | valid store descriptor | `0xffffffff` sentinel | global stores **silently dropped** (author's own comment warns of this exact class) |
+| `mhc_kernels.cu:45` `mhc_bf16_mma_avail` | `true` (bf16 WMMA) | `false` | silently falls back to fp32 instead of the gfx1250 WMMA path |
+
+### Tier 1 — sync-counter divergence, needs A0 confirmation (likely race)
+
+On GFX12 the wait counters are split (dscnt / loadcnt / storecnt); gfx1250 uses
+those, strict's `#else` uses the legacy combined `lgkmcnt` / `vmcnt`. A0 is GFX12
+hardware, so the legacy wait may not fence the split-counter op — a data race
+with wrong results, unless the opus wrapper maps it to a full wait on GFX12.
+Confirm each on A0.
+
+| site | gfx1250 | strict (#else) |
+|------|---------|----------------|
+| `moe_sorting_opus.h:825`, `:954` | `s_wait_dscnt(0)` | `s_waitcnt_lgkmcnt(0)` |
+| `quant_kernels.cu:1011`, `:2057` | `s_wait_loadcnt` | `s_waitcnt_vmcnt` |
+| `aiter_opus_plus.h:948` | split wait | `s_waitcnt_lgkmcnt` |
+| `topk_per_row_kernels.cu:501` | split wait | inline `s_waitcnt vmcnt(0)` |
+
+### Safe example (do not "fix" blindly)
+
+`opus.hpp:1595` `get_warp_size`: strict falls through a contradictory
+`#elif (X && !X)` to `#else return 32`, which is correct for wave32 GFX12. The
+`#else` was written defensively. This is why each guard is read rather than
+swept — adding the strict arm here is harmless but unnecessary.
+
+### Remaining, by first-pass tier (need per-site reading before A0)
+
+- 11 feature-flag guards whose `#else` disables a path (`= false` / untuned),
+  e.g. `quant_kernels.cu:112` `kTunedForThisArch`, `mhc_kernels.cu:28,235` —
+  likely silent perf/precision degradation, same fix.
+- 27 path-divergence guards (`#else` selects a different code path).
+- 45 guards with no `#else` (gfx1250-only body simply vanishes on strict) —
+  many are no-op-off-gfx1250 by design (e.g. the TDM `KEEP`/`DRAIN` macros),
+  but each must be checked for a vanished declaration.
+- 3 effectively benign (`(void)`-style no-ops).
+
+**Status: fix applied.** All 97 `defined(__gfx1250__)` occurrences across 24
+csrc files were rewritten to
+`(defined(__gfx1250__) || defined(__gfx1250_strict__))`. The parentheses make it
+polarity-correct in every context (positive guards, `!(...)` exclusion lists,
+`||`/`&&` family lists), and the strict arm is never taken on the shipping
+ROCm 7 build, which has no strict target. Compile-verified on ROCm 10.1
+(clang 24.0.0git) for both `gfx1250-strict` and `gfx1250` on representative
+touched modules (module_mhc, module_top_k_per_row). Runtime correctness on A0 —
+smem size, WMMA vs fp32, store sentinel, sync counters — is left to the daily
+A0 op-test once those modules are built as gfx1250-strict.
+
 ## gfx1250 macro guards that go empty on strict (A0 fix pending)
 
 <!-- BEGIN generated: gfx1250 macro guards -->
