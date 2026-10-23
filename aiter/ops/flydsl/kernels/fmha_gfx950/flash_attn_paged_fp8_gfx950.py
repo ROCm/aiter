@@ -7,8 +7,8 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.fmha_gfx950.common import daz_denormal_attr
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_epilog import DualwaveFp8StoreHelper
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_gemm import DualwaveFp8GemmHelper
@@ -67,7 +67,7 @@ def build_flash_attn_paged_fp8_module(
     Only disable output-row guarding when the caller proves that every
     launched row's byte offset fits the hardware's 32-bit buffer offset.
     """
-    gpu_arch = get_hip_arch()
+    gpu_arch = get_gfx_runtime()
     if value_head_dim is None:
         value_head_dim = head_dim
 
