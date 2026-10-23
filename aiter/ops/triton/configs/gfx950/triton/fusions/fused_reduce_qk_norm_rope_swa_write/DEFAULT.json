@@ -1,0 +1,12 @@
+{
+    "HEADS_LEQ_15": {
+        "BLOCK_SIZE_M": 4,
+        "num_warps": 4,
+        "waves_per_eu": 0
+    },
+    "any": {
+        "BLOCK_SIZE_M": 8,
+        "num_warps": 4,
+        "waves_per_eu": 0
+    }
+}

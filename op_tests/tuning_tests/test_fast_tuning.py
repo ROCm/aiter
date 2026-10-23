@@ -819,9 +819,7 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
     def test_flydsl_aot_pool_honors_explicit_worker_budget(self):
         from aiter.aot.flydsl import common
 
-        with mock.patch.dict(
-            os.environ, {"AITER_FLYDSL_AOT_WORKERS": "7"}, clear=False
-        ):
+        with mock.patch.dict(os.environ, {"AITER_MAX_JOBS": "7"}, clear=False):
             self.assertEqual(common.get_max_workers(23), 7)
 
     def test_precompile_applies_tuning_swiglu_limit_to_stage1_jobs(self):
