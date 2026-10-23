@@ -699,6 +699,13 @@ def launch_gemm_a8w8_256x256(
         lds_load_b128, _ = make_lds_copy_ops(128)
 
         DS_PER_FRAG = 4  # ds_load_b128 per 16-dword fragment
+        WAR_SCHED = const_expr(
+            tile_m == 256 and half_m == 4 and half_n == 4 and not mx32
+        )
+        # Load windows (first, last WMMA position a load may follow) per quadrant.
+        WAR_Q0, WAR_Q1, WAR_Q2, WAR_Q3 = (4, 15), (0, 11), (4, 11), (3, 10)
+        WAR_WAIT_AT = 3
+        WAR_PERM_AT = 11
 
         def _frag_geom(kind, stage):
             if const_expr(kind == "a"):
@@ -847,32 +854,39 @@ def launch_gemm_a8w8_256x256(
             first_hook=None,
         ):
             """One K-tile, four 64x64 quadrants, at most three fragment groups live."""
-            sa_k = [_sa_of(seed_sa[sm].load()[0]) for sm in range_constexpr(N_SA)]
-            sb_k = [_sb_of(seed_sb[sn].load()[0]) for sn in range_constexpr(N_SB)]
+            if const_expr(WAR_SCHED):
+                # The previous K-step already broadcast the scale bytes.
+                sa_k = [seed_sa[sm].load()[0] for sm in range_constexpr(N_SA)]
+                sb_k = [seed_sb[sn].load()[0] for sn in range_constexpr(N_SB)]
+            else:
+                sa_k = [_sa_of(seed_sa[sm].load()[0]) for sm in range_constexpr(N_SA)]
+                sb_k = [_sb_of(seed_sb[sn].load()[0]) for sn in range_constexpr(N_SB)]
             a0, b0 = seed_a, seed_b
 
             rocdl.sched_barrier(0)
 
             refill = const_expr(boundary and future_kt is not None)
-            if const_expr(SA_PANEL_STAGES > 1):
-                sa_next_panel = sa_super // SA_PANEL_STAGES + num_buffers
-                sa_refill = (sa_super % SA_PANEL_STAGES == SA_PANEL_STAGES - 1) & (
-                    sa_next_panel < (SUPERS + SA_PANEL_STAGES - 1) // SA_PANEL_STAGES
-                )
-                prepared = (
-                    _prepare_tdm(
-                        future_slot,
-                        future_kt,
-                        sa_next_panel,
-                        sa_refill.select(fx.Int32(1), fx.Int32(0)),
+            prep_box = [None]
+
+            def _prep():
+                if const_expr(SA_PANEL_STAGES > 1):
+                    sa_next_panel = sa_super // SA_PANEL_STAGES + num_buffers
+                    sa_refill = (sa_super % SA_PANEL_STAGES == SA_PANEL_STAGES - 1) & (
+                        sa_next_panel
+                        < (SUPERS + SA_PANEL_STAGES - 1) // SA_PANEL_STAGES
                     )
-                    if const_expr(refill)
-                    else None
-                )
-            else:
-                prepared = (
-                    _prepare_tdm(future_slot, future_kt) if const_expr(refill) else None
-                )
+                    if const_expr(refill):
+                        prep_box[0] = _prepare_tdm(
+                            future_slot,
+                            future_kt,
+                            sa_next_panel,
+                            sa_refill.select(fx.Int32(1), fx.Int32(0)),
+                        )
+                elif const_expr(refill):
+                    prep_box[0] = _prepare_tdm(future_slot, future_kt)
+
+            if const_expr(not WAR_SCHED):
+                _prep()
 
             def _quad(
                 wm0,
@@ -970,18 +984,216 @@ def launch_gemm_a8w8_256x256(
 
             def _wait_refill():
                 if const_expr(boundary and has_next):
+                    # Without this fence the scheduler hoists the wait up to the
+                    # signal, and the WMMAs between them no longer hide it.
+                    rocdl.sched_barrier(0)
                     pipeline_fence_wait(use_cluster=False)
                     if const_expr(first_hook is not None):
                         first_hook()
                     if const_expr(refill and prefetch and pref_gate is not None):
                         if pref_gate == 1:
-                            tdm_ops.tensor_load_2d(prepared)
+                            tdm_ops.tensor_load_2d(prep_box[0])
                     elif const_expr(refill and prefetch):
                         if has_next_tile:
-                            tdm_ops.tensor_load_2d(prepared)
+                            tdm_ops.tensor_load_2d(prep_box[0])
                     elif const_expr(refill):
-                        tdm_ops.tensor_load_2d(prepared)
+                        tdm_ops.tensor_load_2d(prep_box[0])
                 rocdl.sched_barrier(0)
+
+            if const_expr(WAR_SCHED):
+                # Every fragment dies only in the last four WMMAs of a quadrant and
+                # every load issues at least four WMMAs after the latest death, so
+                # no ds_load overwrites VGPRs that an in-flight WMMA still reads.
+                a0 = [_rmem(16, t.load()) for t in seed_a]
+                b0 = [_rmem(16, t.load()) for t in seed_b]
+                frags = {}
+
+                def _frag_thunks(kind, stg, idx, dest):
+                    addr, row, span = _frag_geom(kind, stg)
+                    parts = []
+
+                    def _one(j):
+                        parts.append(Vec(lds_load_b128(addr, idx * row + span * j)))
+                        if const_expr(j == DS_PER_FRAG - 1):
+                            dest(_join(parts))
+
+                    return [lambda j=j: _one(j) for j in range_constexpr(DS_PER_FRAG)]
+
+                def _cur(kind, key):
+                    n = half_m if kind == "a" else half_n
+                    frags[key] = [None] * n
+                    out = []
+                    for i in range_constexpr(n):
+
+                        def _set(v, i=i):
+                            frags[key][i] = _rmem(16, v)
+
+                        out += _frag_thunks(kind, stage, n + i, _set)
+                    return out
+
+                def _seed(kind):
+                    if const_expr(not has_next):
+                        return []
+                    n = half_m if kind == "a" else half_n
+                    tgt = seed_a if kind == "a" else seed_b
+                    out = []
+                    for i in range_constexpr(n):
+
+                        def _set(v, i=i):
+                            tgt[i].store(v)
+
+                        out += _frag_thunks(kind, next_stage, i, _set)
+                    return out
+
+                def _seed_scales():
+                    sa_next = sa_super + int(stage % KPAIR == KPAIR - 1)
+                    for sm in range_constexpr(N_SA):
+                        seed_sa[sm].store(
+                            Vec.from_elements(
+                                [_stage_load_sa_raw(next_stage, sm, sa_next)], fx.Int32
+                            )
+                        )
+                    for sn in range_constexpr(N_SB):
+                        seed_sb[sn].store(
+                            Vec.from_elements(
+                                [_stage_load_sb_raw(next_stage, sn)], fx.Int32
+                            )
+                        )
+
+                def _spread(thunks, lo, hi):
+                    out = {}
+                    if const_expr(len(thunks) == 0):
+                        return out
+                    pos = list(range(lo, hi + 1))
+                    for t_i, t in enumerate(thunks):
+                        out.setdefault(pos[t_i * len(pos) // len(thunks)], []).append(t)
+                    return out
+
+                Qn = half_m
+                i_fast = [(p % Qn, p // Qn) for p in range(Qn * Qn)]
+                j_fast = [(p // Qn, p % Qn) for p in range(Qn * Qn)]
+                diag_last = [(i, j) for i in range(Qn) for j in range(Qn) if i != j] + [
+                    (k, k) for k in range(Qn)
+                ]
+
+                def _run(
+                    wm0,
+                    wn0,
+                    act,
+                    wt,
+                    order,
+                    loads,
+                    pre=None,
+                    at=None,
+                    head=None,
+                    free=0,
+                ):
+                    if const_expr(pre is not None):
+                        pre()
+                    if const_expr(head is not None):
+                        head()
+                    for pos in range_constexpr(len(order)):
+                        i, j = order[pos]
+                        _mma_one(wm0 + i, wn0 + j, act[i], wt[j], sa_k, sb_k)
+                        if const_expr(at is not None and pos in at):
+                            at[pos]()
+                        for t in loads.get(pos, []):
+                            t()
+                        if const_expr(pos >= free - 1):
+                            rocdl.sched_barrier(0)
+
+                def _perm_seeds():
+                    for sm in range_constexpr(N_SA):
+                        seed_sa[sm].store(
+                            Vec.from_elements([_sa_of(seed_sa[sm].load()[0])], fx.Int32)
+                        )
+                    for sn in range_constexpr(N_SB):
+                        seed_sb[sn].store(
+                            Vec.from_elements([_sb_of(seed_sb[sn].load()[0])], fx.Int32)
+                        )
+
+                l3_at = {WAR_PERM_AT: _perm_seeds} if const_expr(has_next) else None
+
+                l2_at = {WAR_WAIT_AT: _wait_refill}
+                if const_expr(has_next):
+                    l2_at = {WAR_WAIT_AT: lambda: (_wait_refill(), _seed_scales())}
+                if const_expr(parity == 0):
+                    _run(
+                        0,
+                        0,
+                        a0,
+                        b0,
+                        i_fast,
+                        _spread(_cur("b", "b1"), *WAR_Q0),
+                        head=_prep,
+                        free=WAR_Q0[0],
+                    )
+                    _run(
+                        0,
+                        half_n,
+                        a0,
+                        frags["b1"],
+                        i_fast,
+                        _spread(_cur("a", "a1"), *WAR_Q1),
+                    )
+                    _run(
+                        half_m,
+                        half_n,
+                        frags["a1"],
+                        frags["b1"],
+                        j_fast,
+                        _spread(_seed("a"), *WAR_Q2),
+                        pre=_sig,
+                        at=l2_at,
+                    )
+                    _run(
+                        half_m,
+                        0,
+                        frags["a1"],
+                        b0,
+                        diag_last,
+                        _spread(_seed("b"), *WAR_Q3),
+                        at=l3_at,
+                    )
+                else:
+                    _run(
+                        0,
+                        0,
+                        a0,
+                        b0,
+                        j_fast,
+                        _spread(_cur("a", "a1"), *WAR_Q0),
+                        head=_prep,
+                        free=WAR_Q0[0],
+                    )
+                    _run(
+                        half_m,
+                        0,
+                        frags["a1"],
+                        b0,
+                        j_fast,
+                        _spread(_cur("b", "b1"), *WAR_Q1),
+                    )
+                    _run(
+                        half_m,
+                        half_n,
+                        frags["a1"],
+                        frags["b1"],
+                        i_fast,
+                        _spread(_seed("b"), *WAR_Q2),
+                        pre=_sig,
+                        at=l2_at,
+                    )
+                    _run(
+                        0,
+                        half_n,
+                        a0,
+                        frags["b1"],
+                        diag_last,
+                        _spread(_seed("a"), *WAR_Q3),
+                        at=l3_at,
+                    )
+                return
 
             n_slots = half_m * half_n
             SLACK = n_slots // 4
@@ -1174,6 +1386,15 @@ def launch_gemm_a8w8_256x256(
         for group in _seed_thunks(0, 0, fx.Int32(0)):
             for thunk in group:
                 thunk()
+        if const_expr(WAR_SCHED):
+            for sm in range_constexpr(N_SA):
+                seed_sa[sm].store(
+                    Vec.from_elements([_sa_of(seed_sa[sm].load()[0])], fx.Int32)
+                )
+            for sn in range_constexpr(N_SB):
+                seed_sb[sn].store(
+                    Vec.from_elements([_sb_of(seed_sb[sn].load()[0])], fx.Int32)
+                )
 
         slot_delta = [
             fx.Int32(c + num_buffers) * tdm_global_step
