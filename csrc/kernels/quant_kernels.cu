@@ -57,6 +57,7 @@ static int dyn_gq_resident_per_cu(Kernel kernel, int block_size)
 // gfx1250: use 256-thread blocks once there are at least a quarter as many as SIMDs.
 constexpr int kDynGqWideBlkPerSimdDenom = 4;
 constexpr int kDynGqTdmKPT            = 2;  // staged steps per block (TDM kernels)
+constexpr int64_t kDynGqMaxGridY      = 65535; // HIP grid y limit; larger M takes the 1D kernel
 // MX scale tiles walked along the row by one mx32_tile block; two pay off for fp4 only.
 template <typename DTYPE_O>
 constexpr int kMx32TilesX = std::is_same_v<DTYPE_O, opus::fp8_t> ? 1 : 2;
@@ -1827,6 +1828,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         return static_cast<int64_t>(g.x) * g.y <=
                                static_cast<int64_t>(resident_per_cu) * dev.num_cu;
                     };
+                    auto grid_y_ok = [](dim3 g) { return g.y <= kDynGqMaxGridY; };
                     const bool tile_ok =
                         dev.tuned && num_rows_ptr == nullptr && row_stride % 8 == 0 &&
                         reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
@@ -1856,19 +1858,24 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                 tile_kernel(DynGqInt<kBlock1>{}, DynGqInt<kRows1>{}, DynGqInt<1>{});
                             static const int resident1 = dyn_gq_resident_per_cu(kernel1, kBlock1);
                             const dim3 grid1 = tile_grid(cols / 512, rows / kRows1);
-                            if(!all_resident(grid1, resident1))
+                            const bool resident = all_resident(grid1, resident1);
+                            const dim3 grid2 = tile_grid(cols / 512, rows / 32);
+                            if(!resident && grid_y_ok(grid2))
                             {
                                 launch_tile(
                                     tile_kernel(DynGqInt<256>{}, DynGqInt<32>{}, DynGqInt<2>{}),
-                                    tile_grid(cols / 512, rows / 32), 256);
+                                    grid2, 256);
                                 return;
                             }
                             // Row-major fp8 at single-step sizes keeps the generic kernel,
                             // whose 32B stores need no staging: 2048x4096 4.49 vs 4.88 us.
                             if constexpr(ss || kFp4)
                             {
-                                launch_tile(kernel1, grid1, kBlock1);
-                                return;
+                                if(resident)
+                                {
+                                    launch_tile(kernel1, grid1, kBlock1);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1888,7 +1895,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                                        : 2 * static_cast<int64_t>(dev.num_cu);
                         const bool mx32 =
                             dev.tuned && num_rows_ptr == nullptr && mx32_tiles >= min_tiles &&
-                            rows >= 32 && rows % 32 == 0 && scaleN % 8 == 0 &&
+                            rows >= 32 && rows % 32 == 0 && rows / 32 <= kDynGqMaxGridY &&
+                            scaleN % 8 == 0 &&
                             row_stride % 8 == 0 &&
                             reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
                             reinterpret_cast<uintptr_t>(scales.data_ptr()) % 16 == 0;
@@ -1927,7 +1935,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         const int64_t tiles_total = static_cast<int64_t>(bands) * tiles;
                         const bool tiled =
                             tile_ok && rows % 16 == 0 && tiles_total >= simds_bs &&
-                            tiles_total * 8 >= static_cast<int64_t>(grid2.x) * grid2.y * 7;
+                            tiles_total * 8 >= static_cast<int64_t>(grid2.x) * grid2.y * 7 &&
+                            grid_y_ok(grid2);
                         if(tiled)
                         {
                             // Halving the tile (8x512 fp4, 16x256 fp8) shortens the serial

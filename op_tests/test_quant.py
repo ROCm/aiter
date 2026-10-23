@@ -589,6 +589,16 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
         ["nan", "posinf", "neginf", "mixed"],
     ):
         test_mxfp8_nonfinite_g128(m, n, h_dtype, shuffle, pattern)
+    # Largest M: the tiled grids would need grid.y > 65535 (2^21 + 32 rows / 32,
+    # 2^20 rows / 16), so these take the generic kernel.
+    for shuffle in (True, False):
+        test_quant_1x32_e8m0(
+            (1 << 21) + 32, 512, dtypes.fp8, dtypes.bf16, shuffle, False, "mixed"
+        )
+        test_quant_1x32_e8m0(
+            (1 << 21) + 32, 512, dtypes.fp4x2, dtypes.bf16, shuffle, False
+        )
+        test_mxfp8_nonfinite_g128(1 << 20, 512, dtypes.bf16, shuffle, "mixed")
     for (m, n), h_dtype, pattern in itertools.product(
         ((40, 256), (1024, 7168)),
         [dtypes.bf16, dtypes.fp16],
