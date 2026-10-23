@@ -13,6 +13,7 @@
 #include "gemm_dispatch_utils.h"
 #include "quant.h"
 #include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include "rocprim/rocprim.hpp"
 #include <cstdlib>
 
@@ -285,7 +286,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     };
 
     auto process = [&](vec_i thread_data, int64_t x, int32_t y, int64_t groupId) {
-        float absMax = 1e-10f;
+        float absMax = aiter::kAmaxFloor;
         if constexpr(packed_bf16_amax && kTunedForThisArch)
         {
             static_assert(std::is_same_v<DTYPE_I, opus::bf16_t> && thread_data_size % 2 == 0);
@@ -999,7 +1000,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
 
     vec_s smscale_cur;
     size_t vec_idx = threadIdx.x;
-    float absMax   = 1e-10f;
+    float absMax   = aiter::kAmaxFloor;
     smscale_cur = load_vector_nbytes<float, thread_data_size, 16>(buffer_s, vec_idx * vec_size_i);
 #pragma unroll
     for(size_t j = 0; j < vec_size_i; j++)
@@ -1479,7 +1480,7 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
         const int r        = 4 * s.value + rsub; // row within the 32-row block
         const bool valid   = row0 + r < rows;
         vec_i thread_data  = data[s.value];
-        float absMax       = 1e-10f;
+        float absMax       = aiter::kAmaxFloor;
         for(int j = 0; j < kElems; ++j)
             absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
         absMax = multithread_reduce(absMax, aiter::Max(), 2);
@@ -2389,7 +2390,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
             {
                 vec_input_f[i] = static_cast<float>(vec_input[i]);
             }
-            float absMax = 1e-10f;
+            float absMax = aiter::kAmaxFloor;
             #pragma unroll
             for(int j = 0; j < vec_size_i; j++)
             {
@@ -2691,7 +2692,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 buffer_input, threadIdx.x * vec_size_i);
             vec_f vec_input_f;
             float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
-            float absMax       = 1e-10f;
+            float absMax       = aiter::kAmaxFloor;
             #pragma unroll
             for(int j = 0; j < vec_size_i; j++)
             {

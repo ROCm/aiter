@@ -235,7 +235,7 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -291,7 +291,7 @@ def _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel(
     offs_k = tl.arange(0, MAX_KSPLIT)
     c_in_ptrs = (
         c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )

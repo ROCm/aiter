@@ -62,7 +62,9 @@ def indexer_bwd(q, k, w, d_scores, compress_ratio):
     dot = torch.einsum("shd,pd->shp", q_f, k_f)
     scores = (F.relu(dot) * w_f.unsqueeze(-1)).sum(dim=1)
     allowed = _causal_mask(S, P, compress_ratio, q.device)
-    scores = torch.where(allowed, scores, torch.tensor(0.0, device=q.device))
+    scores = torch.where(
+        allowed, scores, torch.tensor(0.0, device=q.device, dtype=torch.float32)
+    )
 
     (scores * d_scores).sum().backward()
     return q_f.grad, k_f.grad, w_f.grad

@@ -462,7 +462,7 @@ def run_benchmark(args):
                     )
             elif layout == "thd":
                 seqlens = [0, S]
-                cu_seqlens = torch.Tensor(seqlens).to(torch.int).to(freqs.device)
+                cu_seqlens = torch.tensor(seqlens, dtype=torch.int, device=freqs.device)
                 if bwd:
                     fn = lambda: rope_thd_bwd(
                         gx,
