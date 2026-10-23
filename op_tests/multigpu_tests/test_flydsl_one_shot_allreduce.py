@@ -121,12 +121,12 @@ from aiter.test_common import benchmark, checkAllclose
 set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
-from aiter.ops.flydsl.allreduce_policy import oneshot_ladder
-from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
+from aiter.ops.flydsl.allreduce_policy import (
     SUPPORTED_ARCHS,
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
     OneShotRung,
+    oneshot_ladder,
 )
 from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
     DEFAULT_ATOMS,

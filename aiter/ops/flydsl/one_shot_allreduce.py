@@ -21,10 +21,12 @@ from .allreduce_host_shared import (
     payload_probes,
     require_arch,
 )
-from .allreduce_policy import oneshot_ladder, resolve_family_policy, resolve_link
-from .kernels.comm.allreduce_shared import (
+from .allreduce_policy import (
     AllReduceAlgorithm,
     OneShotRung,
+    oneshot_ladder,
+    resolve_family_policy,
+    resolve_link,
     select_rung,
 )
 from .kernels.comm.one_shot_allreduce import (

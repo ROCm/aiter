@@ -25,6 +25,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
+from ...allreduce_policy import SUPPORTED_BLOCKS, SUPPORTED_WORLDS
+
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
 # taxonomy are shared with the quantized kernels verbatim.
 from .allreduce_shared import (
@@ -32,8 +34,6 @@ from .allreduce_shared import (
     _CM_SC1,
     _INBOX_POLICY,
     _RECV_POLICY,
-    SUPPORTED_BLOCKS,
-    SUPPORTED_WORLDS,
     _buffer_load,
     _buffer_ptr,
     _buffer_store,

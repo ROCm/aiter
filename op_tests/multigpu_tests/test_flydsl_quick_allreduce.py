@@ -119,16 +119,19 @@ from aiter.test_common import benchmark, checkAllclose
 set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
-from aiter.ops.flydsl.allreduce_policy import mesh_st_ladder, ring_st_ladder
-from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
-    ATOMS,
-    BLOCK,
-    DEFAULT_GRID_CAP,
+from aiter.ops.flydsl.allreduce_policy import (
     MAX_PAYLOAD_BYTES,
     SUPPORTED_ARCHS,
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
     TwoShotRung,
+    mesh_st_ladder,
+    ring_st_ladder,
+)
+from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
+    ATOMS,
+    BLOCK,
+    DEFAULT_GRID_CAP,
 )
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import clamp_grid_cap
 from aiter.ops.flydsl.quick_allreduce import (

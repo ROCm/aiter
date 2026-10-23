@@ -44,21 +44,21 @@ from .allreduce_host_shared import (
 )
 from .allreduce_policy import (
     MIN_BATCH_BLOCKS,
+    PAYLOAD_ALIGN_BYTES,
     QUANT_MIN_PAYLOAD_BYTES,
     RS_INT6_MIN_WORLD,
+    SUPPORTED_BLOCKS,
+    TwoShotRung,
     mesh_st_ladder,
     resolve_link,
     ring_st_ladder,
+    select_rung,
 )
 from .kernels.comm.allreduce_shared import (
     ATOMS,
     BLOCK,
-    PAYLOAD_ALIGN_BYTES,
-    SUPPORTED_BLOCKS,
     WORLD,
-    TwoShotRung,
     has_release_fence,
-    select_rung,
 )
 from .kernels.comm.quick_allreduce_mesh import (
     MESH_CODECS,

@@ -32,6 +32,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
+from ...allreduce_policy import SUPPORTED_WORLDS
 from .allreduce_shared import (
     _INBOX_POLICY,
     _RECV_POLICY,
@@ -42,7 +43,6 @@ from .allreduce_shared import (
     FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
-    SUPPORTED_WORLDS,
     _acquire_inbox,
     _buffer_load,
     _buffer_ptr,

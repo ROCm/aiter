@@ -31,6 +31,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, ReductionOp, Stream, T, as_ir_value
 
+from ...allreduce_policy import SUPPORTED_ARCHS, SUPPORTED_WORLDS
 from .. import buffer_ops
 from ..quant_utils import emit_mx_e8m0_scale
 from .allreduce_shared import (
@@ -42,8 +43,6 @@ from .allreduce_shared import (
     FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
-    SUPPORTED_ARCHS,
-    SUPPORTED_WORLDS,
     TILE_BYTES,
     WAVE,
     WORLD,

@@ -40,8 +40,9 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
 
+from ...allreduce_policy import SUPPORTED_BLOCKS
 from ..kernels_common import ceildiv
-from .allreduce_shared import BLOCK, I32_BYTES, SUPPORTED_BLOCKS, WAVE
+from .allreduce_shared import BLOCK, I32_BYTES, WAVE
 
 SUPER_TILES = (1, 8)
 # Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.

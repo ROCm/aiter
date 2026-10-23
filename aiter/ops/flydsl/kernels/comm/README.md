@@ -20,7 +20,7 @@ The host classes are in `aiter/ops/flydsl/`:
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce`, the host class for the one-shot kernel. |
 | `quick_allreduce.py` | `FlyQuickAllReduce`, the host class for the mesh and the ring. |
-| `allreduce_policy.py` | The payload-size boundaries between the three kernels, and the tuning ladders. |
+| `allreduce_policy.py` | The limits, the payload-size boundaries between the three kernels, and the tuning ladders. |
 | `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
 ## Kernels
@@ -144,8 +144,8 @@ The code reads `AITER_FLY_AR` when it creates `CustomAllreduce` and
 
 `AITER_FLY_AR=1` does not enable a kernel on an unsupported system. The
 kernels need gfx942 or gfx950, a world size of 2, 4 or 8, and the `flydsl`
-package. These limits, and the other shared constants of the kernels, are in
-the "Limits" section of `aiter/ops/flydsl/kernels/comm/allreduce_shared.py`.
+package. These limits are in the "Limits" section of
+`aiter/ops/flydsl/allreduce_policy.py`.
 
 ### Set the interconnect type
 
