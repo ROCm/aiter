@@ -25,11 +25,11 @@
 # Environment overrides: IMAGE, REPO_URL, REF, RESULTS, RUN_NAME, DRY_RUN, DRY_SBATCH_ARGS,
 #   DRY_GPU_ARCHS (arch aiter imports for on the GPU-less dry run; default gfx950),
 #   TUNE_ARGS (extra tune.sh options for the real run, e.g. TUNE_ARGS='--tp "8 4"').
-#SBATCH --job-name=flydsl-ar-tunesplinter-ctr-bj78-02
+#SBATCH --job-name=flydsl-ar-tune
 #SBATCH --nodes=1
 #SBATCH --exclusive
-#SBATCH --gres=gpu:gfx950-mi35:8
-#SBATCH --time=24:00:00
+#SBATCH --gres=gpu:gfx950-mi355x:8
+#SBATCH --time=10:00:00
 #SBATCH --requeue
 
 set -euo pipefail
