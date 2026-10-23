@@ -48,10 +48,6 @@ def _kv_dtype_name(arch: str, dtype: torch.dtype) -> str | None:
     return "fp8" if dtype == _FP8_KV_DTYPES.get(arch) else None
 
 
-def _device_arch(device: torch.device) -> str:
-    return torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
-
-
 def _default_workgroup_budget(
     arch: str,
     num_compute_units: int,
@@ -94,7 +90,7 @@ def pa_decode_nhd_max_query_length(
     device = torch.device(device)
     if device.type != "cuda":
         return 0
-    arch = _device_arch(device)
+    arch = get_gfx_runtime()
     kv_name = _kv_dtype_name(arch, kv_dtype)
     if kv_name is None:
         return 0
@@ -120,7 +116,7 @@ def pa_decode_default_workgroup_budget(
     """
     device = torch.device(device)
     return _default_workgroup_budget(
-        _device_arch(device),
+        get_gfx_runtime(),
         torch.cuda.get_device_properties(device).multi_processor_count,
         kv_dtype,
         head_dim,
