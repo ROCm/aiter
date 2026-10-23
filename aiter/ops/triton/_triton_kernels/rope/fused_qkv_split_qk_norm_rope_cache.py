@@ -145,6 +145,15 @@ _fused_qkv_split_qk_norm_rope_cache_kernel_repr = make_kernel_repr(
         "HAVE_K_SCALE",
         "HAVE_V_SCALE",
         "Q_SCALE",
+        "WRITE_GATE",
+        "WRITE_V",
+        "HAS_MROPE",
+        "MROPE_INTERLEAVED",
+        "MROPE_SECTION_T",
+        "MROPE_SECTION_H",
+        "MROPE_SECTION_W",
+        "KV_CACHE_SHUFFLE",
+        "SHUFFLE_X",
     ],
 )
 
@@ -172,12 +181,19 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     stride_cos_t,
     stride_cos_d,
     stride_pos_t,
+    stride_pos_m,
     stride_q_t,
     stride_q_h,
     stride_q_d,
     stride_kv_t,
     stride_kv_h,
     stride_kv_d,
+    stride_gate_t,
+    stride_gate_h,
+    stride_gate_d,
+    stride_v_t,
+    stride_v_h,
+    stride_v_d,
     key_cache_stride_t,
     key_cache_stride_h,
     key_cache_stride_d,
@@ -205,6 +221,15 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
     Q_SCALE: tl.constexpr = 1.0,
+    WRITE_GATE: tl.constexpr = True,
+    WRITE_V: tl.constexpr = True,
+    HAS_MROPE: tl.constexpr = False,
+    MROPE_INTERLEAVED: tl.constexpr = True,
+    MROPE_SECTION_T: tl.constexpr = 0,
+    MROPE_SECTION_H: tl.constexpr = 0,
+    MROPE_SECTION_W: tl.constexpr = 0,
+    KV_CACHE_SHUFFLE: tl.constexpr = False,
+    SHUFFLE_X: tl.constexpr = 8,
 ):
     tl.assume(stride_qkv_t > 0)
     tl.assume(stride_qkv_d > 0)
@@ -240,8 +265,8 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     d_offs = tl.arange(0, BLOCK_D)
     t_mask = t_offs < T
 
+    pos_offs = t_offs * stride_pos_t
     if HAVE_POS:
-        pos_offs = t_offs * stride_pos_t
         pos = tl.load(pos_ptr + pos_offs, mask=t_mask)
         if HAVE_OFFS:
             offset = tl.load(off_ptr + pos_offs, mask=t_mask)
@@ -268,7 +293,32 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         d_cos_mask = d_cos_offs < EFFECTIVE_RDH * 2
 
     cos_mask = t_mask[:, None] & d_cos_mask[None, :]
-    cos_offs = t_cos_offs[:, None] * stride_cos_t + d_cos_offs[None, :] * stride_cos_d
+    if HAS_MROPE:
+        # 3-D positions [3, T] (temporal / height / width rows); each rotary
+        # frequency j = d_cos_offs belongs to one section and reads its row.
+        pos_h = tl.load(pos_ptr + stride_pos_m + pos_offs, mask=t_mask)
+        pos_w = tl.load(pos_ptr + 2 * stride_pos_m + pos_offs, mask=t_mask)
+        if MROPE_INTERLEAVED:
+            is_h = (d_cos_offs % 3 == 1) & (d_cos_offs < 3 * MROPE_SECTION_H)
+            is_w = (d_cos_offs % 3 == 2) & (d_cos_offs < 3 * MROPE_SECTION_W)
+        else:
+            is_h = (d_cos_offs >= MROPE_SECTION_T) & (
+                d_cos_offs < MROPE_SECTION_T + MROPE_SECTION_H
+            )
+            is_w = (d_cos_offs >= MROPE_SECTION_T + MROPE_SECTION_H) & (
+                d_cos_offs < MROPE_SECTION_T + MROPE_SECTION_H + MROPE_SECTION_W
+            )
+        t_cos_offs_2d = tl.where(
+            is_h[None, :],
+            pos_h[:, None],
+            tl.where(is_w[None, :], pos_w[:, None], t_cos_offs[:, None]),
+        ).to(tl.int64)
+        cos_offs = t_cos_offs_2d * stride_cos_t + d_cos_offs[None, :] * stride_cos_d
+    else:
+        cos_offs = (
+            t_cos_offs[:, None].to(tl.int64) * stride_cos_t
+            + d_cos_offs[None, :] * stride_cos_d
+        )
     if PARTIAL_ROTATION:
         cos = tl.load(cos_ptr + cos_offs, mask=cos_mask, other=1.0)
         sin = tl.load(sin_ptr + cos_offs, mask=cos_mask, other=0.0)
@@ -312,7 +362,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     if Q_SCALE != 1.0:
         q = (q.to(tl.float32) * Q_SCALE).to(q.dtype)
 
-    if ENABLE_GATED_Q:
+    if ENABLE_GATED_Q and WRITE_GATE:
         d_gate_offs = tl.arange(0, BLOCK_D)
         x_gate_mask = t_mask[:, None] & (d_gate_offs < BLOCK_D)[None, :]
         gate_in_offs = (
@@ -321,9 +371,9 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         )
         gate = tl.load(qkv_ptr + gate_in_offs, mask=x_gate_mask)
         gate_out_offs = (
-            t_offs[:, None] * stride_q_t
-            + d_gate_offs[None, :] * stride_q_d
-            + hq * stride_q_h
+            t_offs[:, None] * stride_gate_t
+            + d_gate_offs[None, :] * stride_gate_d
+            + hq * stride_gate_h
         )
         tl.store(gate_ptr + gate_out_offs, gate, mask=x_gate_mask)
 
@@ -438,14 +488,19 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
 
         k = k * cos + k_rotated * sin
 
-        # Store to contiguous K/V buffers
-        kv_out_offs = (
+        k_out_offs = (
             t_offs[:, None] * stride_kv_t
             + d_offs[None, :] * stride_kv_d
             + hq * stride_kv_h
         )
-        tl.store(k_ptr + kv_out_offs, k.to(k_ptr.dtype.element_ty), mask=x_mask)
-        tl.store(v_ptr + kv_out_offs, v.to(v_ptr.dtype.element_ty), mask=x_mask)
+        tl.store(k_ptr + k_out_offs, k.to(k_ptr.dtype.element_ty), mask=x_mask)
+        if WRITE_V:
+            v_out_offs = (
+                t_offs[:, None] * stride_v_t
+                + d_offs[None, :] * stride_v_d
+                + hq * stride_v_h
+            )
+            tl.store(v_ptr + v_out_offs, v.to(v_ptr.dtype.element_ty), mask=x_mask)
 
         # KV Caching Logic: skip cache writes for padding (slot < 0) or out-of-range
         # slots. Bounds use total_num_kv_cache_tokens (= num_blocks * block_size)
@@ -465,24 +520,48 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         v_scale_rcprl = 1 / v_scale
         v = v * v_scale_rcprl
 
-        k_cache_offs = (
-            t_slot_idx[:, None] * key_cache_stride_t
-            + hq * key_cache_stride_h
-            + d_offs[None, :] * key_cache_stride_d
-            + b_idx[:, None] * key_cache_stride_b
-        )
+        if KV_CACHE_SHUFFLE:
+            # AITER shuffle layout over a [num_blocks, block_size, kvh, D] buffer:
+            #   K: [num_blocks, kvh, D // x, block_size, x]
+            #   V: [num_blocks, kvh, block_size // x, D, x]
+            # (x = 16 B / element size), the layout the shuffle paged-attention
+            # kernels read.
+            head_base = hq * BLOCK_D * BLOCK_SIZE
+            k_cache_offs = (
+                t_slot_idx[:, None] * key_cache_stride_t
+                + head_base
+                + (d_offs // SHUFFLE_X)[None, :] * (BLOCK_SIZE * SHUFFLE_X)
+                + b_idx[:, None] * SHUFFLE_X
+                + (d_offs % SHUFFLE_X)[None, :]
+            )
+        else:
+            k_cache_offs = (
+                t_slot_idx[:, None] * key_cache_stride_t
+                + hq * key_cache_stride_h
+                + d_offs[None, :] * key_cache_stride_d
+                + b_idx[:, None] * key_cache_stride_b
+            )
         tl.store(
             key_cache_ptr + k_cache_offs,
             k.to(key_cache_ptr.dtype.element_ty),
             mask=cache_mask,
         )
 
-        v_cache_offs = (
-            t_slot_idx[:, None] * value_cache_stride_t
-            + hq * value_cache_stride_h
-            + d_offs[None, :] * value_cache_stride_d
-            + b_idx[:, None] * value_cache_stride_b
-        )
+        if KV_CACHE_SHUFFLE:
+            v_cache_offs = (
+                t_slot_idx[:, None] * value_cache_stride_t
+                + head_base
+                + (b_idx // SHUFFLE_X)[:, None] * (BLOCK_D * SHUFFLE_X)
+                + d_offs[None, :] * SHUFFLE_X
+                + (b_idx % SHUFFLE_X)[:, None]
+            )
+        else:
+            v_cache_offs = (
+                t_slot_idx[:, None] * value_cache_stride_t
+                + hq * value_cache_stride_h
+                + d_offs[None, :] * value_cache_stride_d
+                + b_idx[:, None] * value_cache_stride_b
+            )
         tl.store(
             value_cache_ptr + v_cache_offs,
             v.to(value_cache_ptr.dtype.element_ty),
