@@ -65,17 +65,16 @@ def launch_gemm_a8w8_256x256(
     a_scale_preshuffled: Constexpr[bool] = False,
     b_scale_32x32: Constexpr[bool] = False,
     bounded_k: Constexpr[bool] = False,
+    bounded_n: Constexpr[bool] = False,
 ):
-    """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
-    multiple of 2 when ``a_preshuffle``); K must have at least 512 elements per
-    split and be scale-block aligned.
+    """M is unrestricted (a multiple of 2 with ``a_preshuffle``); N and K must be
+    scale-block aligned, K >= 512 per split, and N a multiple of ``tile_n *
+    cluster_n * persistent_n_tiles`` unless ``bounded_n``.
 
-    ``b_scale_32x32`` (mxfp8_32 only): the weight scale is the raw row-major
-    ``[N/32, K/32]`` array instead of the 32x4-shuffled ``[N, K/32]`` 1x32 layout.
-
-    ``bounded_k``: K may end inside the last K super (``tile_k * KPAIR``) with a
-    single split. TDM clamps the loads to runtime K and the hardware zero-fills the
-    overhang; K must still align to the scale block."""
+    ``b_scale_32x32`` (mxfp8_32): B scale is the raw row-major ``[N/32, K/32]``.
+    ``bounded_k`` (single split): K may end inside the last K super; TDM zero-fills.
+    ``bounded_n`` (single split, no fused split-K): N may end inside the last tile;
+    padded tiles skip loads/stores but still run the loop to feed A multicast."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -115,6 +114,7 @@ def launch_gemm_a8w8_256x256(
     assert not a_scale_preshuffled or mx32, "a_scale_preshuffled is mxfp8_32 only"
     assert not b_scale_32x32 or mx32, "b_scale_32x32 is mxfp8_32 only"
     assert not bounded_k or split_k == 1, "bounded_k requires split_k=1"
+    assert not bounded_n or split_k == 1, "bounded_n requires split_k=1"
     SA_SUPERS = tile_m // 32
     SB_SUPERS = tile_n // 32
     K_WS = tile_k // WMMA_K
@@ -256,6 +256,15 @@ def launch_gemm_a8w8_256x256(
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C)
+        if const_expr(bounded_n):
+            n_left = i32_n - blk_n
+            n_cols = (n_left < tile_n).select(n_left, fx.Int32(tile_n))
+            n_cols = (n_cols > 0).select(n_cols, fx.Int32(0))
+            b_rows = (n_cols + 15) // 16
+            sb_n = 32 if mx32 else 128  # weight-scale rows per scale block
+            sb_rows = (n_cols + sb_n - 1) // sb_n
+        else:
+            n_cols = b_rows = sb_rows = None
         a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         sa_oob = (
             (
@@ -367,7 +376,7 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     i32_k * 16,
                     b_mask,
-                    None,
+                    b_rows,
                     0,
                     True,
                 )
@@ -395,7 +404,7 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     sb_gstride,
                     b_mask,
-                    None,
+                    sb_rows,
                     0,
                     True,
                 )
@@ -1229,7 +1238,7 @@ def launch_gemm_a8w8_256x256(
             )
             atomC = fx.rocdl.make_tdm_atom(
                 gtC,
-                [mn_oob, tile_n],
+                [mn_oob, n_cols if const_expr(bounded_n) else tile_n],
                 strides=[ldc64, None],
                 num_warps=num_waves,
             )
@@ -1285,6 +1294,10 @@ def launch_gemm_a8w8_256x256(
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
+    if const_expr(bounded_n):
+        # Whole cluster / persistent groups of tiles; the spare ones own no column.
+        n_group = cluster_n * persistent_n_tiles
+        gy = ((gy + (n_group - 1)) // n_group) * n_group
     gx = (((gx > 0).select(gx, fx.Int32(1)) + (cluster_m - 1)) // cluster_m) * cluster_m
     # Split gx exactly, so no workgroup is left over to recompute a duplicate tile.
     pow2 = gx & -gx

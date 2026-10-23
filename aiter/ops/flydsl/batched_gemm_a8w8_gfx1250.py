@@ -183,6 +183,8 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
             continue
         if not kernel_fits_shape(ki, m, n, k):
             continue
+        if k % ki.tile_k:
+            continue
         out.append(
             {
                 "tile_m": ki.tile_m,

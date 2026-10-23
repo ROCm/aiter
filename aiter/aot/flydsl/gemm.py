@@ -119,6 +119,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     cluster_m_fallback_values,
     is_compute_wmma_kernel_name,
     k_is_bounded,
+    n_is_bounded,
     parse_mxfp8_32_wmma_kernel_name,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
@@ -1052,8 +1053,9 @@ def _compile_mxfp8_wmma_to_cache(
         )
         compute_bound = is_compute_wmma_kernel_name(kernel_name)
         launch = launch_gemm_a8w8_256x256 if compute_bound else launch_gemm_a8w8
-        check_persistent_n_tiles(
-            persistent_n_tiles, n, tile_n, cluster_n, split_k, compute_bound
+        check_persistent_n_tiles(persistent_n_tiles, split_k, compute_bound)
+        bounded_n = n_is_bounded(
+            n, tile_n, cluster_n, persistent_n_tiles, compute_bound
         )
         for variant_cm in cluster_m_fallback_values(cluster_m):
             variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
@@ -1077,6 +1079,7 @@ def _compile_mxfp8_wmma_to_cache(
                         a_scale_preshuffled,
                         b_scale_32x32,
                         bounded_k,
+                        bounded_n,
                     )
             else:
                 launch(
