@@ -108,6 +108,50 @@ def test_flydsl_hgemm_gfx942_autoconfig(m, n, k, regime):
     _assert_close(y, ref, f"{regime} M{m} N{n} K{k} (dispatch)")
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"k_waves": 2},
+        {
+            "block_m": 128,
+            "block_n": 128,
+            "block_k": 64,
+            "stages": 2,
+            "split_k": 1,
+            "m_waves": 2,
+            "n_waves": 2,
+            "group_m": 0,
+        },
+    ],
+    ids=["unset", "k_waves-only", "explicit-default-tile"],
+)
+def test_flydsl_hgemm_gfx942_forwards_overrides(overrides, monkeypatch):
+    """flydsl_hgemm passes exactly the tile arguments it was given to the kernel."""
+    _require_gfx942()
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    compiled = {}
+    make_param = g.make_gemm_a16w16_gfx942_param
+
+    def recording_make_param(**kwargs):
+        compiled.update(kwargs)
+        return make_param(**kwargs)
+
+    monkeypatch.setattr(g, "make_gemm_a16w16_gfx942_param", recording_make_param)
+    m, n, k = 1024, 1024, 1024
+    x, w, ref = _inputs(m, n, k)
+    y = flydsl_hgemm(x, w, **overrides)
+    torch.cuda.synchronize()
+    _assert_close(y, ref, f"flydsl_hgemm {overrides}")
+    if overrides.keys() & g._STRUCTURAL_KEYS:
+        assert {key: compiled[key] for key in overrides} == overrides
+        assert not compiled.get("buffered_load", False)
+    else:
+        expected = {**g.gfx942_default_config(m, n, k), **overrides}
+        assert {key: compiled[key] for key in expected} == expected
+
+
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
 def test_gemm_a16w16_gfx942_split_k(out_dtype):
     """Explicit async split-K: fp32 output uses native atomics; bf16 goes via f32 accum."""

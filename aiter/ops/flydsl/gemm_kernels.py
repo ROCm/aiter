@@ -18,7 +18,6 @@ from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx942 import gemm_a16w16 as gemm_a16w16_gfx942
-from .kernels.gemm_a16w16_gfx942 import gfx942_default_config
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
@@ -118,25 +117,45 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     }
 
 
+# gfx950 and gfx1250 values of the flydsl_hgemm tile arguments left as None.
+_HGEMM_DEFAULT_TILE = {
+    "block_m": 128,
+    "block_n": 128,
+    "block_k": 64,
+    "stages": 2,
+    "split_k": 1,
+    "m_waves": 2,
+    "n_waves": 2,
+    "k_waves": 1,
+    "group_m": 0,
+}
+
+
 def flydsl_hgemm(
     a: torch.Tensor,
     b: torch.Tensor,
     out: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-    block_m: int = 128,
-    block_n: int = 128,
-    block_k: int = 64,
-    stages: int = 2,
-    split_k: int = 1,
-    m_waves: int = 2,
-    n_waves: int = 2,
-    k_waves: int = 1,
-    group_m: int = 0,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+    stages: int | None = None,
+    split_k: int | None = None,
+    m_waves: int | None = None,
+    n_waves: int | None = None,
+    k_waves: int | None = None,
+    group_m: int | None = None,
     policy: str = "ft",
     out_dtype: torch.dtype | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Run the A16W16 kernel for this arch with AITER's ``B[N, K]`` convention."""
+    """Run the A16W16 kernel for this arch with AITER's ``B[N, K]`` convention.
+
+    Tile arguments left as None are not overridden. On gfx942 they come from
+    the shape's tuned-table row (else the cost-model fallback), and the set
+    ones are passed as ``user_kwargs`` to its ``gemm_a16w16``. Elsewhere they
+    take ``_HGEMM_DEFAULT_TILE``.
+    """
 
     if policy not in ("ft", "ht", "hti"):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
@@ -146,7 +165,42 @@ def flydsl_hgemm(
     if launch_stream.device != a.device:
         raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
 
+    explicit = {
+        name: value
+        for name, value in {
+            "block_m": block_m,
+            "block_n": block_n,
+            "block_k": block_k,
+            "stages": stages,
+            "split_k": split_k,
+            "m_waves": m_waves,
+            "n_waves": n_waves,
+            "k_waves": k_waves,
+            "group_m": group_m,
+        }.items()
+        if value is not None
+    }
     gfx = get_gfx()
+    if gfx == "gfx942":
+        if not a.is_contiguous():
+            a = a.contiguous()
+        if not b.is_contiguous():
+            b = b.contiguous()
+        return gemm_a16w16_gfx942(
+            a,
+            b.t(),
+            out=out,
+            bias=bias,
+            user_kwargs=explicit,
+            stream=launch_stream,
+            layout="nt",
+            out_dtype=out_dtype,
+        )
+
+    tile = {**_HGEMM_DEFAULT_TILE, **explicit}
+    block_m, block_n, block_k = tile["block_m"], tile["block_n"], tile["block_k"]
+    stages, split_k, group_m = tile["stages"], tile["split_k"], tile["group_m"]
+    m_waves, n_waves, k_waves = tile["m_waves"], tile["n_waves"], tile["k_waves"]
     if gfx == "gfx1250":
         if k_waves != 1:
             raise ValueError("The gfx1250 FlyDSL A16W16 kernel supports k_waves=1 only")
@@ -166,53 +220,6 @@ def flydsl_hgemm(
                 split_k=split_k,
                 main_loop_unroll=policy in ("ht", "hti"),
             )
-    if gfx == "gfx942":
-        if not a.is_contiguous():
-            a = a.contiguous()
-        if not b.is_contiguous():
-            b = b.contiguous()
-        # When the caller leaves tiling at the signature defaults, use the
-        # tuned-table row (else the cost-model fallback); explicit overrides win.
-        untuned = (
-            block_m == 128
-            and block_n == 128
-            and block_k == 64
-            and stages == 2
-            and split_k == 1
-            and m_waves == 2
-            and n_waves == 2
-            and group_m == 0
-        )
-        if untuned:
-            user_kwargs = gfx942_default_config(
-                a.shape[0], b.shape[0], a.shape[1], out_dtype or a.dtype, a.device
-            )
-        else:
-            user_kwargs = {
-                "block_m": block_m,
-                "block_n": block_n,
-                "block_k": block_k,
-                "stages": stages,
-                "split_k": split_k,
-                "m_waves": m_waves,
-                "n_waves": n_waves,
-                "k_waves": k_waves,
-                "group_m": group_m,
-            }
-            if stages == 1:
-                # A single LDS buffer is only supported by the buffered pipeline.
-                user_kwargs.update(buffered_load=True, async_load_bytes=16)
-        return gemm_a16w16_gfx942(
-            a,
-            b.t(),
-            out=out,
-            bias=bias,
-            user_kwargs=user_kwargs,
-            stream=launch_stream,
-            layout="nt",
-            out_dtype=out_dtype,
-        )
-
     if gfx != "gfx950":
         raise RuntimeError(
             "The FlyDSL A16W16 kernel currently supports gfx942, gfx950 and gfx1250 only"

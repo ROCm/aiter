@@ -168,7 +168,9 @@ def make_gemm_a16w16_gfx942_param(
         raise ValueError("gfx942 bf16 MFMA is 16x16x16")
     if not buffered_load:
         if stages < 2:
-            raise ValueError("stages must be >= 2 for the staged LDS pipeline")
+            raise ValueError(
+                "the async pipeline needs stages >= 2; stages=1 needs buffered_load"
+            )
         if async_load_bytes != 4:
             raise ValueError(
                 "gfx942 async global->LDS loads are 32-bit only (async_load_bytes=4); "
@@ -1968,6 +1970,11 @@ def gemm_a16w16(
     ``layout`` follows the a16w16 convention (N = row-major, T = column-major);
     only ``nt``, the nn.Linear call (A [M,K] row-major, B = w.t() column-major),
     is supported on gfx942.
+
+    ``user_kwargs`` override the shape's default config (``gfx942_default_config``).
+    Setting a tile key (``_STRUCTURAL_KEYS``) also drops that config's pipeline
+    flags, so the caller's tile runs the async pipeline unless ``user_kwargs``
+    sets the flags too.
     """
     if bias is not None:
         raise NotImplementedError("gfx942 GEMM bias fusion is not implemented yet")
