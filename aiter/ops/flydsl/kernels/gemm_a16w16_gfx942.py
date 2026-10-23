@@ -71,6 +71,9 @@ from .kernels_common import run_cached
 #   the stable sched_* helpers only emit sched_group_barrier.
 # - rocdl.readfirstlane: makes k_wave_idx wave-uniform (SGPR), so the
 #   per-K-wave LDS offsets and branches stay scalar.
+# The gfx950 helpers imported above add their own: rocdl.sched_barrier in
+# async_load_to_lds, and raw llvm.InlineAsmOp stores plus
+# tensor_shim.buf_base_i64 in SplitKProtocol.zero_c (atomic split-K only).
 
 WAVE_SIZE = GFX950_WAVE_SIZE  # 64 lanes on CDNA3
 SMEM_CAPACITY_GFX942 = 65536  # 64 KB LDS / CU
@@ -190,14 +193,14 @@ def make_gemm_a16w16_gfx942_param(
             )
         if stages not in (1, 2):
             raise ValueError("buffered_load supports stages=1 (single LDS buffer) or 2")
+    if k_waves < 1:
+        raise ValueError("k_waves must be positive")
     if pingpong:
         if not (buffered_load and stages == 1):
             raise ValueError("pingpong requires buffered_load with stages=1")
         # Two equal halves of whole 128-bit (32-element) K chunks per K wave.
         if block_k % (k_waves * 64) != 0:
             raise ValueError("pingpong needs block_k // k_waves to be a multiple of 64")
-    if k_waves < 1:
-        raise ValueError("k_waves must be positive")
     if k_waves > 1:
         if k_waves & (k_waves - 1):
             raise ValueError("k_waves must be a power of two")
@@ -206,6 +209,11 @@ def make_gemm_a16w16_gfx942_param(
     # Each K wave reads LDS in 128-bit (32-element) K chunks of two MFMA K steps.
     if block_k % (k_waves * 32) != 0:
         raise ValueError("block_k // k_waves must be a multiple of 32")
+    # The async loader recovers a lane's global K column as its swizzled LDS
+    # offset modulo block_k. The swizzle XORs index bits 6-8 into bits 3-5, so
+    # that stays within the row only if a row spans whole 64-element segments.
+    if not buffered_load and block_k % 64 != 0:
+        raise ValueError("the async pipeline needs block_k to be a multiple of 64")
     if split_k < 1:
         raise ValueError("split_k must be >= 1")
     if split_k_reduce and split_k == 1:
@@ -221,16 +229,22 @@ def make_gemm_a16w16_gfx942_param(
     out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
     block_threads = m_waves * n_waves * k_waves * WAVE_SIZE
 
-    # LDS->global vector width of the cshuffle epilogue: 128 bits. Atomic
-    # split-K always outputs fp32 (gemm_a16w16 gives bf16 an fp32 scratch),
-    # so its vector is 4 wide.
-    max_cshuffle_vec = 16 // out_dbytes
     atomic_split_k = split_k > 1 and not split_k_reduce
-    cshuffle_r2g_vec_size = (
-        min(max_cshuffle_vec, 4) if atomic_split_k else max_cshuffle_vec
-    )
+    # CDNA3 has no packed-bf16 buffer atomic add; gemm_a16w16 gives bf16
+    # output an fp32 scratch.
+    if atomic_split_k and out_dtype_id != GEMM_A16W16_DTYPE_FP32:
+        raise ValueError("atomic split-K accumulates in fp32 output only")
+    # LDS->global vector width of the cshuffle epilogue: 128 bits.
+    cshuffle_r2g_vec_size = 16 // out_dbytes
     if block_n % cshuffle_r2g_vec_size != 0:
         raise ValueError("block_n must be divisible by the cshuffle store vector size")
+    # SplitKProtocol.zero_c clears the C tile in whole vectors, the same
+    # number per thread.
+    if atomic_split_k and (block_m * block_n) % (block_threads * cshuffle_r2g_vec_size):
+        raise ValueError(
+            "atomic split-K needs block_m * block_n to be a whole number of "
+            f"{cshuffle_r2g_vec_size}-wide vectors per thread"
+        )
 
     # LDS budget: A tile + B tile, per stage.
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
@@ -1550,8 +1564,9 @@ def get_split_k_buffers(stream_handle: int, device, split_k, split_k_reduce):
 
 
 # Search space of the fallback config and of the tuner's pingpong screen:
-# tiles with their (m, n, k) wave layouts. The cost model cannot tell
-# wave layouts or block_k apart, so earlier entries win its ties.
+# tiles with their (m, n, k) wave layouts. The cost model cannot tell m/n
+# wave splits, k_waves 2 from 4, or block_k apart, so earlier entries win
+# its ties.
 CANDIDATE_TILES_M = (32, 64, 128, 256)
 CANDIDATE_TILES_N = (32, 48, 64, 96, 112, 128, 160, 192, 256)
 CANDIDATE_WAVES = ((2, 2, 1), (2, 1, 2), (1, 2, 2), (1, 4, 1), (4, 1, 1), (1, 1, 4))
@@ -1580,12 +1595,12 @@ def pingpong_fill_cost_us(
     t_tile = max(0.0205 * (bm * bn / 128) + 0.23, (bm + bn) * 256 / 35e3)
     per_split = -(-k_tiles // split_k)
     if k_waves > 1 and split_k > 1 and bm * bn <= 64 * 64:
-        # Small k_waves=2 tiles save ~7% per K tile but pay a fixed LDS
+        # Small tiles with K waves save ~7% per K tile but pay a fixed LDS
         # reduction of ~1.7 tiles, so they win on long splits.
         cost = 1.8 + (0.93 * per_split + 1.7) * t_tile
     else:
         if k_waves > 1 and split_k > 1:
-            # Larger k_waves=2 tiles measured ~11% slower per K tile.
+            # Larger tiles with K waves run ~11% slower per K tile.
             t_tile *= 1.107
         cost = 1.8 + per_split * t_tile
     if split_k > 1:
@@ -1751,7 +1766,8 @@ def gfx942_fallback_config(
 _STRUCTURAL_KEYS = frozenset(
     ("block_m", "block_n", "block_k", "stages", "m_waves", "n_waves", "buffered_load")
 )
-_AUTO_ONLY_PIPELINE_KEYS = (
+_AUTO_ONLY_KEYS = (
+    "split_k",
     "stages",
     "buffered_load",
     "async_load_bytes",
@@ -1877,9 +1893,9 @@ def gemm_a16w16(
     is supported on gfx942.
 
     ``user_kwargs`` override the shape's default config (``gfx942_default_config``).
-    Setting a tile key (``_STRUCTURAL_KEYS``) also drops that config's pipeline
-    flags, so the caller's tile runs the async pipeline unless ``user_kwargs``
-    sets the flags too.
+    Setting a tile or pipeline key (``_STRUCTURAL_KEYS``) also drops that
+    config's pipeline flags and split-K, so the caller's tile runs the async
+    pipeline without split-K unless ``user_kwargs`` sets them too.
     """
     if bias is not None:
         raise NotImplementedError("gfx942 GEMM bias fusion is not implemented yet")
@@ -1937,9 +1953,9 @@ def gemm_a16w16(
     auto = gfx942_default_config(m, n, k, out_dtype, device)
     user_kwargs = dict(user_kwargs or {})
     if _STRUCTURAL_KEYS & user_kwargs.keys():
-        # A caller-chosen tile/pipeline must not inherit flags that were only
-        # valid for the default config's own tile/pipeline.
-        for key in _AUTO_ONLY_PIPELINE_KEYS:
+        # A caller-chosen tile/pipeline must not inherit the pipeline flags or
+        # split-K chosen for the default config's own tile/pipeline.
+        for key in _AUTO_ONLY_KEYS:
             auto.pop(key, None)
     kwargs.update(auto)
     kwargs.update(user_kwargs)

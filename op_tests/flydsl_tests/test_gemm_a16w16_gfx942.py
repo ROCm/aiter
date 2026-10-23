@@ -4,11 +4,12 @@
 """Oracle-gated correctness tests for the native gfx942 (CDNA3) bf16 GEMM.
 
 Compares the kernel against an f32 matmul oracle (bf16 inputs upcast to f32)
-to within one bf16 ulp, or f32 summation-order noise for fp32 output. Shapes cover down projections (large K, narrow N), up
-projections (short K, wide N), decode (tiny M), square compute-bound GEMMs and
-M/N boundary tiles, through both ``gemm_a16w16`` and the public
-``flydsl_hgemm`` dispatch (per-shape default config). Explicit configs cover every
-main-loop pipeline, split-K mode and output dtype.
+to within one bf16 ulp, or f32 summation-order noise for fp32 output. Shapes
+cover down projections (large K, narrow N), up projections (short K, wide N),
+decode (tiny M), square compute-bound GEMMs and M/N boundary tiles, through
+both ``gemm_a16w16`` and the public ``flydsl_hgemm`` dispatch (per-shape
+default config). Explicit configs cover every main-loop pipeline, split-K mode
+and output dtype.
 
 Skips unless running on real gfx942 hardware.
 """
@@ -70,7 +71,7 @@ SHAPES = [
     (100, 384, 10240, "boundary-M"),
     (1000, 10240, 320, "boundary-M"),
     (4095, 4096, 4096, "boundary-M"),
-    # non-divisible-N: N=336 and N=344 are not multiples of 64
+    # non-divisible-N: N=336 is not a multiple of 64
     (1024, 336, 10240, "boundary-N"),
     (4096, 336, 10240, "boundary-N"),
     (1000, 336, 10240, "boundary-MN"),
@@ -522,19 +523,57 @@ def test_gemm_a16w16_gfx942_ragged_n(n, split_k, out_dtype):
 
 
 @pytest.mark.parametrize(
-    "cfg,match",
+    "n,cfg,match",
     [
-        ({"split_k": 2, "split_k_reduce": False}, "multiple of 4"),
-        ({"block_k": 16}, "multiple of 32"),
+        (337, {"split_k": 2, "split_k_reduce": False}, "multiple of 4"),
+        (337, {"block_k": 16}, "multiple of 32"),
+        (337, {"block_k": 32}, "multiple of 64"),
+        (
+            336,
+            {
+                "block_m": 32,
+                "block_n": 48,
+                "block_k": 128,
+                "stages": 1,
+                "m_waves": 2,
+                "n_waves": 1,
+                "k_waves": 2,
+                "buffered_load": True,
+                "async_load_bytes": 16,
+                "pingpong": True,
+                "split_k": 2,
+            },
+            "vectors per thread",
+        ),
     ],
-    ids=["atomic-split-k-ragged-n", "block_k-16"],
+    ids=[
+        "atomic-split-k-ragged-n",
+        "block_k-16",
+        "async-block_k-32",
+        "atomic-split-k-partial-vectors",
+    ],
 )
-def test_gemm_a16w16_gfx942_rejects_unsupported(cfg, match):
+def test_gemm_a16w16_gfx942_rejects_unsupported(n, cfg, match):
     _require_gfx942()
-    x, w, _ = _inputs(64, 337, 256)
+    x, w, _ = _inputs(64, n, 512)
     tile = {"block_m": 32, "block_n": 32, "block_k": 64, "m_waves": 1, "n_waves": 1}
     with pytest.raises(ValueError, match=match):
         gemm_a16w16(x, w.t(), layout="nt", user_kwargs={**tile, **cfg})
+
+
+def test_gemm_a16w16_gfx942_tile_override_drops_split_k(monkeypatch):
+    """A caller tile does not inherit the default config's split-K: with
+    split_k_reduce dropped, it would turn into atomic split-K."""
+    _require_gfx942()
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    monkeypatch.setenv("AITER_FLYDSL_GEMM_GFX942_SKIP_TABLE", "1")
+    m, n, k = 250, 338, 10240
+    assert g.gfx942_default_config(m, n, k)["split_k"] > 1
+    x, w, ref = _inputs(m, n, k)
+    y = gemm_a16w16(x, w.t(), layout="nt", user_kwargs={"block_m": 64})
+    torch.cuda.synchronize()
+    _assert_close(y, ref, "block_m override of a split-K default")
 
 
 def test_flydsl_hgemm_gfx942_explicit_stream_non_contiguous():
