@@ -724,7 +724,7 @@ def _moe_gemm_a4w4_prefill(
             0, PACKED_BLOCK_M_X, layout=GATHER_IDX_LAYOUT
         )
         mask_idx = offs_x_m < M
-        offs_x_m = offs_x_m % M
+        offs_x_m = gl.minimum(offs_x_m, M - 1)
         GatherIndx += start_m
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
@@ -750,7 +750,7 @@ def _moe_gemm_a4w4_prefill(
             PACKED_BLOCK_M_X,
             layout=gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES),
         )
-        offs_x_m_scales = offs_x_m_scales % M
+        offs_x_m_scales = gl.minimum(offs_x_m_scales, M - 1)
         if GatherIndx is not None:
             offs_x_m_scales = gl.load(GatherIndx + offs_x_m_scales) // N_EXPTS_ACT
         offs_x_k_scales = gl.arange(
@@ -1566,7 +1566,7 @@ def _moe_gemm_a4w4_decode(
             0, PACKED_BLOCK_M_X, layout=GATHER_IDX_LAYOUT
         )
         mask_idx = offs_x_m < M
-        offs_x_m = offs_x_m % M
+        offs_x_m = gl.minimum(offs_x_m, M - 1)
         GatherIndx += start_m
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
@@ -1582,7 +1582,7 @@ def _moe_gemm_a4w4_decode(
             PACKED_BLOCK_M_X,
             layout=gl.SliceLayout(1, X_SCALES_OFFS_LAYOUT),
         )
-        offs_x_m_scales = offs_x_m_scales % M
+        offs_x_m_scales = gl.minimum(offs_x_m_scales, M - 1)
         if GatherIndx is not None:
             offs_x_m_scales = gl.load(GatherIndx + offs_x_m_scales) // N_EXPTS_ACT
         offs_x_k_scales = gl.arange(

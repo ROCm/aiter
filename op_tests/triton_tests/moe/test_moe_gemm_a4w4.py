@@ -5,6 +5,7 @@ from dataclasses import dataclass, fields
 
 import pytest
 import torch
+import triton
 
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
@@ -16,7 +17,15 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
 )
 
 # routing utilities
-from aiter.ops.triton.moe.moe_routing.routing import routing
+from aiter.ops.triton.moe.moe_routing.routing import (
+    _compute_expt_data_internal,
+    EpScatterGeometry,
+    ep_sort_routing,
+    ExptData,
+    RoutingData,
+    routing,
+)
+from aiter.ops.triton.moe.reduce import EpCombineScatter
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -291,3 +300,161 @@ def test_op(
         backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+# ---------------
+# In-kernel gather correctness: in-kernel gather must match pre-gathered for all
+# block sizes, including block_m=128 where a layout bug caused the gather index
+# tensor to repeat only 32 unique values instead of covering all 128 rows, and
+# block_m=64 where multi-block experts triggered a modular wrap-around in the
+# clamp used to guard OOB GatherIndx reads.
+# ---------------
+
+_SKIP_GATHER = pytest.mark.skipif(
+    get_arch() != "gfx1250",
+    reason="In-kernel gather via gluon prefill kernel is gfx1250-only",
+)
+
+
+def _ep_routing(M, E, E_LOCAL, TOPK, block_m_cap, device):
+    """Compute EP routing with a fixed random seed; returns (rd, gidx, sidx, gvalid, dst)."""
+    g = torch.Generator(device=device).manual_seed(7)
+    vals, ids = torch.topk(torch.randn(M, E, generator=g, device=device), TOPK, dim=-1)
+    ids = ids.to(torch.int32).contiguous()
+    wts = torch.softmax(vals, -1).contiguous()
+
+    emap = torch.full((E + 1,), -1, dtype=torch.int32, device=device)
+    emap[0:E_LOCAL] = torch.arange(E_LOCAL, dtype=torch.int32, device=device)
+
+    n_gates = M * TOPK
+    block_m = max(16, min(triton.next_power_of_2(max(1, n_gates // E)), block_m_cap))
+    bufs = _compute_expt_data_internal(E_LOCAL, n_gates, block_m, device)
+    geo = EpScatterGeometry(
+        src_token_map=torch.arange(M, dtype=torch.int32, device=device),
+        max_tokens_per_rank=M,
+        peer_rows=n_gates,
+    )
+    hist, gidx, sidx, gscal, gvalid, dst = ep_sort_routing(
+        wts,
+        ids,
+        emap,
+        E_LOCAL,
+        torch.full((1,), M, dtype=torch.int32, device=device),
+        M,
+        TOPK,
+        n_gates,
+        bufs,
+        ep_scatter_geometry=geo,
+    )
+    h = hist[:E_LOCAL]
+    rd = RoutingData(block_m, gscal, h, E_LOCAL, TOPK, ExptData(h, bufs[0], bufs[1], bufs[2]))
+    return rd, gidx, sidx, gvalid, dst
+
+
+def _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device):
+    """Run the full GEMM1 → GEMM2 pipeline in both modes and compare the final output.
+
+    Uses the preshuffled MXFP4 W4A4, SwiGLU, out_mx_quant (GEMM1) and
+    preshuffled MXFP4 W4A4 (GEMM2) configuration, matching the shape used by
+    DeepSeek-style models on gfx1250.  GEMM1 emits MXFP4-quantised intermediates
+    (out_mx_quant=True), which GEMM2 consumes directly.  The final bfloat16
+    output is what the test compares.
+    """
+    g = torch.Generator(device=device).manual_seed(0)
+    x = torch.randn(M, D, generator=g, device=device, dtype=torch.bfloat16)
+    xq, xs = mxfp4_quant(x)
+
+    def _make_weight(n_out, n_in, seed):
+        g2 = torch.Generator(device=device).manual_seed(seed)
+        w = torch.randn(E_LOCAL, n_out, n_in, generator=g2, device=device, dtype=torch.bfloat16) / n_in**0.5
+        q, s = mxfp4_quant(w.reshape(-1, n_in))
+        q = q.view(E_LOCAL, n_out, n_in // 2)
+        s = s.view(E_LOCAL, n_out, n_in // 32)
+        wk = moe_weight_decode_view(moe_shuffle_weight(q.contiguous()).contiguous())
+        sk = moe_shuffle_scale(s.contiguous()).transpose(-1, -2)
+        return wk, sk
+
+    w1k, s1k = _make_weight(2 * I, D, seed=1)
+    w2k, s2k = _make_weight(D, I, seed=2)
+
+    rd, gidx, sidx, gvalid, dst = _ep_routing(M, E, E_LOCAL, TOPK, block_m_cap, device)
+    assert rd.block_m == block_m_cap, f"routing chose block_m={rd.block_m}, expected {block_m_cap}"
+
+    gemm1_kw = dict(
+        swizzle_mx_scale="GFX1250_SCALE",
+        preshuffle_weights=True,
+        out_mx_quant=True,
+        apply_swiglu=True,
+        alpha=1.0,
+        limit=1e4,
+        swiglu_add_residual=False,
+    )
+    gemm2_kw = dict(swizzle_mx_scale="GFX1250_SCALE", preshuffle_weights=True)
+
+    def _run(in_kernel_gather):
+        if in_kernel_gather:
+            a, a_s, gi = xq, xs, gidx
+        else:
+            rows = gidx.to(torch.int64).clamp(0, M * TOPK - 1) // TOPK
+            a, a_s, gi = xq[rows], xs[rows], None
+        y1, y1s = moe_gemm_a4w4(a, w1k, a_s, s1k, None, rd, gather_indx=gi, **gemm1_kw)
+        raw = torch.zeros(M * TOPK, D, dtype=torch.bfloat16, device=device)
+        moe_gemm_a4w4(
+            y1, w2k, y1s, s2k, None, rd,
+            scatter_indx=sidx, gate_valid=gvalid,
+            ep_scatter=EpCombineScatter(out=raw, dst_row=dst),
+            **gemm2_kw,
+        )
+        return raw.view(M, TOPK, D)
+
+    out_ikg = _run(in_kernel_gather=True)
+    out_pg = _run(in_kernel_gather=False)
+
+    cos = torch.nn.functional.cosine_similarity(
+        out_ikg.float().flatten(), out_pg.float().flatten(), dim=0
+    ).item()
+    assert cos > 0.999, (
+        f"in-kernel gather vs pre-gathered cosine={cos:.6f} (block_m={rd.block_m})"
+    )
+
+
+@_SKIP_GATHER
+@pytest.mark.parametrize(
+    "M, block_m_cap",
+    [
+        # block_m=32: baseline, one M-tile covers most experts fully
+        (1024, 32),
+        # block_m=64: multi-block experts; % M clamp was wrong for block_id >= 1
+        (2048, 64),
+        # block_m=128: gather layout only produced 32 unique indices (repeated 4×)
+        (4096, 128),
+        # block_m=128 with a larger token count
+        (8192, 128),
+    ],
+)
+def test_gluon_in_kernel_gather_matches_pregathered(M, block_m_cap, device="cuda"):
+    """In-kernel gather must equal pre-gathered for all block sizes on gfx1250.
+
+    Covers two distinct bugs fixed together:
+    - block_m=128: GATHER_IDX_LAYOUT covered only 32 elements, so arange(128)
+      repeated [0..31] four times, loading the same 32 activation rows for all
+      128 rows of the tile.
+    - block_m=64 (multi-block experts): gather indices were clamped with ``% M``
+      instead of ``min(..., M-1)``, causing block_id >= 1 to wrap to wrong rows.
+    """
+    E, E_LOCAL, TOPK, D, I = 256, 128, 8, 2304, 2304
+    _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device)
+
+
+@_SKIP_GATHER
+def test_gluon_in_kernel_gather_multiblock_experts(device="cuda"):
+    """Verify correct gather output for experts whose token count exceeds block_m.
+
+    Uses block_m=64 and M=2048 so most experts have more than 64 tokens each
+    (histogram: min~43, max~83), exercising block_id=1 for the majority of
+    experts. The % M clamp bug caused block_id=1 to re-read rows 0..M_e-1
+    again instead of rows 64..M_e-1.
+    """
+    E, E_LOCAL, TOPK, D, I = 256, 128, 8, 2304, 2304
+    M, block_m_cap = 2048, 64
+    _gemm1_gemm2_ikg_vs_pregathered(M, E, E_LOCAL, TOPK, D, I, block_m_cap, device)
