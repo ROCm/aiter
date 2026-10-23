@@ -931,11 +931,16 @@ def _run_prefill(
         if output_padding_bytes is not None
         else 0
     )
+    # Opus may coalesce duplicate expert IDs in zero-weight HIP padding rows.
+    # Their omitted route slots are not written by invert_sorted_ids. Map those
+    # slots to a dedicated zero row instead of dereferencing uninitialized IDs.
+    zero_route_row = sorted_expert_ids.shape[0] * config.BLOCK_M
     gemm2_out = torch.empty(
-        [sorted_expert_ids.shape[0] * config.BLOCK_M, output_row_size],
+        [zero_route_row + 1, output_row_size],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
+    gemm2_out[zero_route_row].zero_()
     down_tile_n = {
         "default": 128,
         "1x4_64x256": 256,
@@ -995,8 +1000,9 @@ def _run_prefill(
     else:
         _launch(down_kernel, *down_args)
 
-    loc_ids = torch.empty(
+    loc_ids = torch.full(
         [problem.batch, problem.topk],
+        zero_route_row,
         dtype=torch.int32,
         device=hidden_states.device,
     )
