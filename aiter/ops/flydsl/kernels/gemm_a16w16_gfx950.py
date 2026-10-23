@@ -11,6 +11,7 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_num_xcds
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx950_utils import (
@@ -46,6 +47,7 @@ class GemmA16W16Gfx950Param:
     n_waves: fx.Constexpr[int]
     k_waves: fx.Constexpr[int]
     group_m: fx.Constexpr[int]
+    num_xcds: fx.Constexpr[int]
     use_half_tile_interleaved: fx.Constexpr[bool]
     a_is_transposed: fx.Constexpr[bool]
     b_is_transposed: fx.Constexpr[bool]
@@ -101,6 +103,7 @@ def make_gemm_a16w16_gfx950_param(
     n_waves: int = 4,
     k_waves: int = 1,
     group_m: int = 0,
+    num_xcds: int = 8,
     use_half_tile_interleaved: bool = False,
     a_is_transposed: bool = False,
     b_is_transposed: bool = True,
@@ -274,6 +277,7 @@ def make_gemm_a16w16_gfx950_param(
         n_waves=n_waves,
         k_waves=k_waves,
         group_m=group_m,
+        num_xcds=num_xcds,
         use_half_tile_interleaved=use_half_tile_interleaved,
         a_is_transposed=a_is_transposed,
         b_is_transposed=b_is_transposed,
@@ -301,6 +305,8 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     name += "_kst4" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
+    if param.num_xcds != 8:
+        name += f"_nxcd{param.num_xcds}"
     name += f"_bias{int(param.has_bias)}"
     a_layout = "t" if param.a_is_transposed else "n"
     b_layout = "t" if param.b_is_transposed else "n"
@@ -537,7 +543,7 @@ def gemm_a16w16_gfx950_kernel(
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
     block_swizzle = BlockSwizzle(
-        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+        NUM_XCDS=param.num_xcds, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
@@ -903,7 +909,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
     block_swizzle = BlockSwizzle(
-        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+        NUM_XCDS=param.num_xcds, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     ks_idx = fx.block_idx.y
@@ -1590,6 +1596,7 @@ def gemm_a16w16(
         assert bias.shape[0] == n
         assert bias.dtype == a.dtype
 
+    kwargs.setdefault("num_xcds", get_num_xcds())
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
     semaphore, signal = get_split_k_buffers(stream, device, split_k)
