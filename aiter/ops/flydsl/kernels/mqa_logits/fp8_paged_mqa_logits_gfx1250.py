@@ -494,7 +494,11 @@ def flydsl_fp8_paged_mqa_logits_gfx1250(
         )
     if q_fp8.dtype != get_fp8_e4m3_dtype():
         raise ValueError(f"q_fp8 must be native FP8 E4M3, got {q_fp8.dtype}")
-    if q_fp8.stride(3) != 1 or any(q_fp8.stride(i) % 16 for i in range(3)):
+    if (
+        q_fp8.stride(3) != 1
+        or any(q_fp8.stride(i) % 16 for i in range(3))
+        or q_fp8.data_ptr() % 16
+    ):
         raise ValueError("q_fp8 needs a contiguous, 16-byte aligned head dim")
     if not kv_cache.is_contiguous():
         raise ValueError("kv_cache must be contiguous")
@@ -505,7 +509,7 @@ def flydsl_fp8_paged_mqa_logits_gfx1250(
             f"weights must be float32 {(batch_size * next_n, heads)}, "
             f"got {weights.dtype} {tuple(weights.shape)}"
         )
-    if weights.stride(1) != 1 or weights.stride(0) % 4:
+    if weights.stride(1) != 1 or weights.stride(0) % 4 or weights.data_ptr() % 16:
         raise ValueError("weights rows must be contiguous and 16-byte aligned")
     if out_logits.shape[0] != batch_size * next_n or out_logits.stride(1) != 1:
         raise ValueError(f"out_logits must be [{batch_size * next_n}, N] row-major")

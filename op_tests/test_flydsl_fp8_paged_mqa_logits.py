@@ -918,7 +918,7 @@ def main():
         _summarize("fp8_paged_mqa_logits_ragged_long", long_ctx)
 
     wide = [
-        test_fp8_paged_mqa_logits_wide_out(batch, kvb, kvb)
+        test_fp8_paged_mqa_logits_wide_out(batch, KV_BLOCK_SIZE, kvb)
         for kvb, batch in itertools.product(kvbs, args.wide_batch)
     ]
     if wide:
