@@ -410,6 +410,42 @@ def test_gemm_a16w16_gfx942_fp32_out():
 
 
 @pytest.mark.parametrize(
+    "store",
+    [
+        {"direct_store": True},
+        {"direct_store": False},
+        {"split_k": 4, "split_k_reduce": True},
+        {"split_k": 4, "pingpong": False, "stream_operands": False},  # atomic
+    ],
+    ids=["direct", "cshuffle", "workspace-split-k", "atomic-split-k"],
+)
+def test_gemm_a16w16_gfx942_fp32_out_precision(store):
+    """fp32 output keeps fp32 accuracy on every store path (no bf16 rounding)."""
+    _require_gfx942()
+    m, n, k = 512, 512, 4096
+    x, w, ref = _inputs(m, n, k)
+    cfg = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 128,
+        "stages": 1,
+        "split_k": 1,
+        "m_waves": 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "buffered_load": True,
+        "async_load_bytes": 16,
+        "pingpong": True,
+        "stream_operands": True,
+        **store,
+    }
+    y = gemm_a16w16(x, w.t(), layout="nt", out_dtype=torch.float32, user_kwargs=cfg)
+    torch.cuda.synchronize()
+    rel = ((y - ref).abs().max() / ref.abs().max()).item()
+    assert rel < 1e-4, f"fp32 output {store}: relerr={rel:.3e} (bf16 rounding?)"
+
+
+@pytest.mark.parametrize(
     "m,n,k",
     [
         (1, 384, 320),

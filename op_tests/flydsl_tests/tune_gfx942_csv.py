@@ -6,6 +6,8 @@ Two files:
   ``aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv``) holds one complete
   config per (gfx, cu_num, M, N, K, out_dtype). Shapes without a row fall back
   to ``gfx942_fallback_config``, the cheapest candidate under the cost model.
+  Its ``source`` column is ``fallback`` for a row seeded with that config and
+  ``tuned`` once the row has been through a tuning run.
 * The measurement log (``--csv``, default ``gfx942_gemm_tuning.csv``) records
   every attempted config, including compile and correctness failures.
   ``--resume`` reuses its screen timings instead of re-measuring.
@@ -532,17 +534,16 @@ def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
     best = min(range(len(finalists)), key=lambda i: medians[i])
     inc_med = medians[0]
     if best != 0 and medians[best] < inc_med * (1 - args.margin):
-        winner, win_med, source = finalists[best], medians[best], "tuned"
+        winner, win_med = finalists[best], medians[best]
         print(
             f"    PROMOTE {describe(winner)}: {inc_med:.2f} -> {win_med:.2f}us",
             flush=True,
         )
     else:
         winner, win_med = incumbent, inc_med
-        source = table[key]["source"] if key in table else "fallback"
         print(f"    keep incumbent ({inc_med:.2f}us)", flush=True)
     if not args.dry_run:
-        table[key] = table_row(key, winner, win_med, hipb_med, source)
+        table[key] = table_row(key, winner, win_med, hipb_med, "tuned")
         write_table(args.table, table)
 
 

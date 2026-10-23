@@ -161,9 +161,7 @@ def make_gemm_a16w16_gfx942_param(
     stream_operands: bool = False,
 ) -> GemmA16W16Gfx942Param:
     if in_dtype_id != GEMM_A16W16_DTYPE_BF16:
-        raise ValueError(
-            f"gfx942 kernel is bf16-only (got in_dtype_id={in_dtype_id})"
-        )
+        raise ValueError(f"gfx942 kernel is bf16-only (got in_dtype_id={in_dtype_id})")
     if out_dtype_id not in (in_dtype_id, GEMM_A16W16_DTYPE_FP32):
         raise ValueError(f"unsupported out_dtype_id={out_dtype_id}")
     if (mma_m, mma_n, mma_k) != (16, 16, 16):
@@ -243,7 +241,7 @@ def make_gemm_a16w16_gfx942_param(
         )
 
     def c_chunk_bytes(chunks):
-        return block_m // chunks * block_n * in_dbytes
+        return block_m // chunks * block_n * out_dbytes
 
     # A C tile over 64 KB goes through LDS in row chunks of whole MMA M
     # repeats, sized to fit the A/B buffers when possible so LDS does not grow.
@@ -413,7 +411,6 @@ class _KernelState:
     copy_chunks: int
     mma_k_iters: int
     num_frgv: int
-    fine_schedule: bool
     frag_A: Any
     frag_B: Any
     frag_A_ret: Any
@@ -666,37 +663,7 @@ def _schedule_buffered_single_stage(s: _KernelState):
     n_rep = param.block_n // param.n_waves // param.mma_n
     n_mfma = m_rep * n_rep * (param.block_k // param.mma_k)
     n_dswr = param.ldg_a_iters + param.ldg_b_iters
-    if s.fine_schedule:
-        # Ops are emitted in dependency order (next-tile buffer_load,
-        # current-tile ds_read, next-tile ds_write, current-tile MFMA). These
-        # directives interleave them as: two ds_reads up front, ds_read +
-        # buffer_load pairs under MFMAs, the leftover reads/loads, then the
-        # ds_writes under the MFMA tail.
-        n_dsrd = s.copy_chunks * (m_rep + n_rep)
-        dsrd_preload = 2
-        paired_iters = min(n_dswr, (n_dsrd - dsrd_preload) // 2)
-        rocdl.sched_dsrd(dsrd_preload)
-        for _ in range(paired_iters):
-            rocdl.sched_dsrd(1)
-            rocdl.sched_vmem(1)
-            rocdl.sched_mfma(2)
-            rocdl.sched_dsrd(1)
-            rocdl.sched_mfma(2)
-        for _ in range(n_dswr - paired_iters):
-            rocdl.sched_vmem(1)
-            rocdl.sched_mfma(2)
-        used_mfma = 4 * paired_iters + 2 * (n_dswr - paired_iters)
-        used_dsrd = dsrd_preload + 2 * paired_iters
-        for _ in range(n_dsrd - used_dsrd):
-            rocdl.sched_dsrd(1)
-            rocdl.sched_mfma(1)
-        used_mfma += n_dsrd - used_dsrd
-        if n_mfma - used_mfma - 2 * n_dswr > 0:
-            rocdl.sched_mfma(n_mfma - used_mfma - 2 * n_dswr)
-        for _ in range(n_dswr):
-            rocdl.sched_dswr(1)
-            rocdl.sched_mfma(2)
-    elif n_mfma > n_dswr:
+    if n_mfma > n_dswr:
         rocdl.sched_mfma(n_mfma - n_dswr)
         for _ in range(n_dswr):
             rocdl.sched_dswr(1)
@@ -1013,22 +980,29 @@ def _store_cshuffle(
 ):
     """Stage the C tile through LDS for coalesced, boundary-masked stores.
 
-    Also serves atomic split-K and the fp32 output. A tile over 64 KB goes
-    through LDS in ``c_chunks`` row chunks.
+    Also serves atomic split-K and the fp32 output. The tile is staged in the
+    output dtype, so fp32 output is not rounded to bf16. A tile over 64 KB
+    goes through LDS in ``c_chunks`` row chunks.
     """
     block_m = param.block_m
     block_n = param.block_n
     block_threads = param.block_threads
     c_chunks = param.c_chunks
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
-    frag_C_out = fx.make_fragment_like(frag_C, fx.BFloat16)
-    frag_C_out.store(frag_C.load().to(fx.BFloat16))
+    if const_expr(is_fp32_output):
+        c_dtype = fx.Float32
+        frag_C_out = frag_C
+        c_s_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+    else:
+        c_dtype = fx.BFloat16
+        frag_C_out = fx.make_fragment_like(frag_C, fx.BFloat16)
+        frag_C_out.store(frag_C.load().to(fx.BFloat16))
+        c_s_atom = fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16)
     # The (value, M repeat, N repeat) partitions put chunk c's rows
     # [c * chunk_rows, (c + 1) * chunk_rows) in M repeats
     # [c * chunk_reps, (c + 1) * chunk_reps).
     chunk_reps = block_m // (param.mma_m * param.m_waves) // c_chunks
     chunk_rows = block_m // c_chunks
-    c_s_atom = fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16)
     frag_src = thr_copy_C_lds.retile(frag_C_out)
     sC_dst = thr_copy_C_lds.partition_D(sC_write)
     cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
@@ -1071,9 +1045,7 @@ def _store_cshuffle(
                 if (global_row < m) and (global_col < n) and is_last:
                     c_vec = fx.ptr_load(
                         smem_c + local_row * block_n + local_col,
-                        result_type=fx.Vector.make_type(
-                            cshuffle_r2g_vec_size, fx.BFloat16
-                        ),
+                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, c_dtype),
                     )
                     global_offset = global_row * n + global_col
                     write_cshuffle_vec_to_global(
@@ -1118,12 +1090,6 @@ def gemm_a16w16_gfx942_kernel(
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
     direct_store = param.direct_store
     c_chunks = param.c_chunks
-    # Tiles whose buffered stages=1 loop uses the hand-placed schedule in
-    # _schedule_buffered_single_stage.
-    fine_schedule = const_expr(
-        (block_m == 128 and block_n == 96 and block_k == 128 and param.n_waves == 2)
-        or (block_m == 128 and block_n == 256 and block_k == 64)
-    )
     elem_dtype = fx.BFloat16
     global_output_dtype = (
         fx.Float32
@@ -1184,7 +1150,9 @@ def gemm_a16w16_gfx942_kernel(
     class SharedStorage:
         ab: SharedABStorage
         c: fx.Array[
-            elem_dtype, 1 if direct_store else block_m // c_chunks * block_n, 16
+            global_output_dtype,
+            1 if direct_store else block_m // c_chunks * block_n,
+            16,
         ]
         red: fx.Array[fx.Float32, max(1, (k_waves // 2) * block_m * block_n), 16]
         flag: fx.Array[fx.Int32, 4, 16]
@@ -1364,7 +1332,15 @@ def gemm_a16w16_gfx942_kernel(
             fx.copy(uni_atom, b_src, sB_w)
 
     thr_copy_C_lds = fx.make_tiled_copy_C(
-        fx.make_copy_atom(fx.UniversalCopy16b(), elem_dtype), tiled_mma
+        fx.make_copy_atom(
+            (
+                fx.UniversalCopy32b()
+                if const_expr(is_fp32_output)
+                else fx.UniversalCopy16b()
+            ),
+            global_output_dtype,
+        ),
+        tiled_mma,
     ).get_slice(tid_mn)
 
     def async_load_a_to_lds(k_tile, stage):
@@ -1427,28 +1403,8 @@ def gemm_a16w16_gfx942_kernel(
             )
         )
         for c in range_constexpr(c_begin, c_end):
-            if const_expr(param.buffered_load and fine_schedule and stages == 1):
-                # Interleave A and B repeats so the first MFMA waits on two
-                # LDS reads (A0, B0) rather than every A repeat first.
-                # _schedule_buffered_single_stage places the rest under MFMAs.
-                m_repeat = const_expr(block_m // param.m_waves // param.mma_m)
-                n_repeat = const_expr(block_n // param.n_waves // param.mma_n)
-                for r in range_constexpr(max(m_repeat, n_repeat)):
-                    if const_expr(r < m_repeat):
-                        fx.copy(
-                            s2r_copy_atom,
-                            thr_sA[None, r, c],
-                            a_ret[None, r, c],
-                        )
-                    if const_expr(r < n_repeat):
-                        fx.copy(
-                            s2r_copy_atom,
-                            thr_sB[None, r, c],
-                            b_ret[None, r, c],
-                        )
-            else:
-                fx.copy(s2r_copy_atom, thr_sA[None, None, c], a_ret[None, None, c])
-                fx.copy(s2r_copy_atom, thr_sB[None, None, c], b_ret[None, None, c])
+            fx.copy(s2r_copy_atom, thr_sA[None, None, c], a_ret[None, None, c])
+            fx.copy(s2r_copy_atom, thr_sB[None, None, c], b_ret[None, None, c])
 
     def mma_tile(a_frag, b_frag):
         for g in range_constexpr(mma_k_iters):
@@ -1496,7 +1452,6 @@ def gemm_a16w16_gfx942_kernel(
         copy_chunks=copy_chunks,
         mma_k_iters=mma_k_iters,
         num_frgv=num_frgv,
-        fine_schedule=fine_schedule,
         frag_A=frag_A,
         frag_B=frag_B,
         frag_A_ret=frag_A_ret,
