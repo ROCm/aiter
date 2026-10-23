@@ -2198,3 +2198,60 @@ def test_fp8_decode_auto_and_poisoned_workspace(heads, mode, valid_indices):
         assert torch.count_nonzero(dequantize(*out[:2])) == 0
         assert torch.isneginf(out[2]).all()
         assert torch.isposinf(out[3]).all()
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("mode", ["raw", "prepared", "norm"])
+@pytest.mark.parametrize("valid_indices", [False, True])
+def test_fp8_decode_large_grid_replay(heads, mode, valid_indices):
+    kwargs, (expected, mx, lse) = two_source_inputs(
+        heads, "padded", mode, True, True, valid_indices
+    )
+    repeats = 22
+    for key in ("q", "q_scale"):
+        if kwargs[key] is not None:
+            x = kwargs[key]
+            kwargs[key] = x.view(torch.uint8).repeat(repeats, 1, 1).view(x.dtype)
+    kwargs["positions"] = kwargs["positions"].repeat(repeats)
+    for source in ("prefix", "extend"):
+        pk, ik = "kv_indptr_" + source, "kv_indices_" + source
+        ptr, ids = kwargs[pk], kwargs[ik]
+        count = int(ptr[-1])
+        kwargs[ik] = ids[:count].repeat(repeats)
+        kwargs[pk] = torch.cat(
+            [ptr[:-1] + i * count for i in range(repeats)] + [ptr[-1:] * repeats]
+        )
+    t = kwargs["q"].shape[0]
+    kwargs.update(
+        is_decode=True,
+        num_splits=2,
+        workspace=torch.full((t, 2, heads, 516), torch.nan, device="cuda"),
+        debug_out=torch.empty_like(expected.repeat(repeats, 1, 1)),
+        max_logits=torch.empty_like(mx.repeat(repeats, 1)),
+        lse=torch.empty_like(lse.repeat(repeats, 1)),
+    )
+    out = fused_v41(**kwargs)
+    kwargs["out"], kwargs["out_scale"] = out[:2]
+    torch.testing.assert_close(
+        kwargs["debug_out"], expected.repeat(repeats, 1, 1), rtol=0.02, atol=0.008
+    )
+    torch.testing.assert_close(out[2], mx.repeat(repeats, 1), rtol=1e-4, atol=3e-5)
+    torch.testing.assert_close(out[3], lse.repeat(repeats, 1), rtol=1e-4, atol=3e-5)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_v41(**kwargs)
+    for empty in [False, True, False]:
+        if empty:
+            kwargs["kv_indices_prefix"].fill_(-1)
+            kwargs["kv_indices_extend"].fill_(-1)
+        elif torch.all(kwargs["kv_indices_prefix"] == -1):
+            kwargs["kv_indices_prefix"].fill_(4)
+            kwargs["kv_indices_extend"].fill_(8)
+        refs = tuple(x.clone() for x in fused_v41(**kwargs))
+        for _ in range(4):
+            kwargs["workspace"].fill_(torch.nan)
+            graph.replay()
+            for actual, ref in zip(out, refs):
+                torch.testing.assert_close(
+                    actual.view(torch.uint8), ref.view(torch.uint8), rtol=0, atol=0
+                )

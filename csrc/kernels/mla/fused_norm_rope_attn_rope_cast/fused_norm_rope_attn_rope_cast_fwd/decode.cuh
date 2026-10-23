@@ -4,11 +4,11 @@
 #include "kernel.cuh"
 #include "kernel.h"
 
-template <bool RawQ, bool DirectQ = false>
+template <bool RawQ, bool DirectQ = false, int FixedSplits = 0>
 __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_kernel(
     FusedNormRopeAttnRopeCastParams args)
 {
-    using T = FusedNormRopeAttnRopeCastConfig<0, RawQ, DirectQ>;
+    using T = FusedNormRopeAttnRopeCastConfig<0, RawQ, DirectQ, FixedSplits>;
     __shared__ __align__(16) char smem[T::smem_bytes() + 2 * 68 * sizeof(int)];
     if(indices_valid<T, true>(args))
         fused_norm_rope_attn_rope_cast_fwd_impl<T, false, true, true>(args, smem);
@@ -18,12 +18,14 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_
 
 // Each reduction CTA owns sixteen heads. This exposes four independent CTAs
 // per attention tile and keeps only 32 output accumulators in each thread.
+template <int FixedSplits = 0>
 __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_reduce_kernel(
     FusedNormRopeAttnRopeCastParams a)
 {
     using namespace opus;
     using namespace fused_norm_rope_attn_rope_cast_fwd;
-    using T         = FusedNormRopeAttnRopeCastConfig<0, false>;
+    const int splits = FixedSplits ? FixedSplits : a.num_splits;
+    using T          = FusedNormRopeAttnRopeCastConfig<0, false>;
     const int token = blockIdx.x, h_start = blockIdx.y * 16;
     const int lane = threadIdx.x % 64, warp = threadIdx.x / 64;
     const int head         = h_start + lane % 16;
@@ -37,7 +39,7 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_
         a.partial_ptr + (int64_t(token) * a.num_splits * a.H + h_start / 64 * 64) * 516;
     const int64_t split_stride = int64_t(a.H) * 516;
     float maximum = -__FLT_MAX__, true_max = -__builtin_inff();
-    for(int s = 0; s < a.num_splits; ++s)
+    for(int s = 0; s < splits; ++s)
     {
         const auto stats = *reinterpret_cast<const vector_t<float, 4>*>(base + s * split_stride +
                                                                         64 * 512 + local_head * 4);
@@ -50,7 +52,7 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_decode_
                                        : -__builtin_inff();
     const float final_max = fmaxf(maximum, sink);
     float denominator = 0.0f, attention_sum = 0.0f;
-    for(int s = 0; s < a.num_splits; ++s)
+    for(int s = 0; s < splits; ++s)
     {
         const auto stats   = *reinterpret_cast<const vector_t<float, 4>*>(base + s * split_stride +
                                                                         64 * 512 + local_head * 4);

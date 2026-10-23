@@ -957,7 +957,13 @@ __device__ inline void compute_pv(char* smem,
             }();
             // Expose MFMA dependencies to LLVM for checked split segments.
             if constexpr(CompilerMFMA)
-                o_tiles[ot] = mfma_pv(p_op, v_op, o_tiles[ot]);
+            {
+                auto acc = mfma_pv(p_op, v_op, o_tiles[ot]);
+                // Keep checked-path accumulators in VGPRs between compiler-visible
+                // MFMAs, without retaining a second full accumulator bank in AGPRs.
+                asm volatile("" : "+v"(acc));
+                o_tiles[ot] = acc;
+            }
             else
                 o_tiles[ot] = pv_vgpr(p_op, v_op, o_tiles[ot]);
             if constexpr(REFILL && r.value == 0)
@@ -1440,14 +1446,19 @@ __device__ __forceinline__ CsrRange csr_range(const FusedNormRopeAttnRopeCastPar
     else
     {
         const auto p = read(false), e = read(true);
-        const int64_t pt    = (int64_t(p.end) - p.begin + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
-        const int64_t et    = (int64_t(e.end) - e.begin + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
-        const int64_t first = (pt + et) * blockIdx.z / a.num_splits;
-        const int64_t last  = (pt + et) * (blockIdx.z + 1) / a.num_splits;
-        const auto range    = extend ? e : p;
-        const int64_t shift = extend ? pt : 0;
-        const int64_t size  = int64_t(range.end) - range.begin;
-        const auto clamp    = [&](int64_t tile) {
+        // Each clamped CSR length is at most INT_MAX. With 64-row tiles and
+        // at most 32 splits, even (pt + et) * (split + 1) fits in uint32_t.
+        // Avoid the expensive general 64-bit division in every range lookup.
+        static_assert(T::KV_TILE_SIZE >= 64);
+        const uint32_t pt     = (uint32_t(p.end - p.begin) + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
+        const uint32_t et     = (uint32_t(e.end - e.begin) + T::KV_TILE_SIZE - 1) / T::KV_TILE_SIZE;
+        const uint32_t splits = T::NUM_SPLITS ? T::NUM_SPLITS : a.num_splits;
+        const uint32_t first  = (pt + et) * blockIdx.z / splits;
+        const uint32_t last   = (pt + et) * (blockIdx.z + 1) / splits;
+        const auto range      = extend ? e : p;
+        const int64_t shift   = extend ? pt : 0;
+        const int64_t size    = int64_t(range.end) - range.begin;
+        const auto clamp      = [&](int64_t tile) {
             return int(range.begin + min(size, max(int64_t(0), tile - shift) * T::KV_TILE_SIZE));
         };
         return {clamp(first), clamp(last)};
