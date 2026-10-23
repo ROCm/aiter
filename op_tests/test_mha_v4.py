@@ -1025,9 +1025,15 @@ def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
     # LSE ships for every measured format row, dense and sorted-sparse alike; a row outside that
-    # set is rejected rather than left to export a value nothing has compared against.
+    # set is rejected rather than left to export a value nothing has compared against. Off gfx950
+    # the architecture gate fires first, so that is the message to expect there.
     block_mask = torch.ones((1, 2, 1, 1), device="cuda", dtype=torch.bool)
-    with pytest.raises(NotImplementedError, match="not implemented for Q=FP4_E2M1"):
+    lse_rejection = (
+        "not implemented for Q=FP4_E2M1"
+        if get_gfx() == "gfx950"
+        else "LSE is not validated on"
+    )
+    with pytest.raises(NotImplementedError, match=lse_rejection):
         mha_v4(
             q,
             q,
@@ -1111,6 +1117,60 @@ def test_mha_v4_dense_lse_matches_reference(q_format, v_format, scale_modes):
     error = (lse - reference).abs()
     assert error.max().item() < 0.25, error.max().item()
     assert error.mean().item() < 0.05, error.mean().item()
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@pytest.mark.parametrize(
+    ("q_format", "v_format"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.BF16, AttentionFormat.FP8),
+        (AttentionFormat.INT8, AttentionFormat.FP8),
+        (AttentionFormat.FP8, AttentionFormat.FP8),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+    ],
+)
+@pytest.mark.parametrize("gqa_ratio", [2, 4])
+def test_mha_v4_dense_lse_under_gqa(q_format, v_format, gqa_ratio):
+    """K smoothing holds one mean per KV head, so the LSE correction has to expand it.
+
+    Every quantized recipe derives a k_mean; contracting it against Q without expanding across
+    the query-head group is a shape error, which is why this needs its own case per recipe
+    rather than one BF16 smoke test. BF16 rows carry no k_mean and exercise only the plumbing.
+    """
+    torch.manual_seed(37)
+    heads_k = 2
+    heads_q = heads_k * gqa_ratio
+    dim = 128
+    q = torch.randn((1, 256, heads_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 256, heads_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    softmax_scale = dim**-0.5
+
+    _, lse = mha_v4(
+        q,
+        k,
+        v,
+        q_format,
+        q_format,
+        v_format,
+        softmax_scale=softmax_scale,
+        return_lse=True,
+    )
+
+    # Expand the way the kernel does: query head j reads KV head j // ratio.
+    expanded = k.repeat_interleave(gqa_ratio, dim=2)
+    scores = torch.matmul(
+        q.float().permute(0, 2, 1, 3),
+        expanded.float().permute(0, 2, 1, 3).transpose(-1, -2),
+    )
+    reference = torch.logsumexp(scores * softmax_scale, dim=-1)
+
+    assert lse.shape == reference.shape
+    assert torch.isfinite(lse).all()
+    error = (lse - reference).abs().max().item()
+    assert error < 0.25, error
 
 
 @pytest.mark.parametrize(
@@ -1985,7 +2045,11 @@ def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
     assert torch.equal(dense, full)
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="dense varlen is a gfx950 row")
 def test_mha_v4_rejects_unusable_seqlens_k():
+    """Off gfx950 the capability gate preempts these, so the dtype and shape messages
+    are only reachable here. The sparse rejection below is covered arch-independently
+    by test_mha_v4_sparse_rejects_per_batch_key_lengths."""
     q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
     formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
 

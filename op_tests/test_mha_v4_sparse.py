@@ -505,6 +505,70 @@ def test_mha_v4_sparse_lse_is_neg_inf_where_the_row_selects_nothing(q_format, v_
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
+@pytest.mark.parametrize(
+    ("q_format", "v_format"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.BF16),
+        (AttentionFormat.FP8, AttentionFormat.FP8),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
+    ],
+)
+@pytest.mark.parametrize("gqa_ratio", [2, 4])
+def test_mha_v4_sparse_lse_under_gqa(q_format, v_format, gqa_ratio):
+    """The LUT holds one row per query head, but K smoothing holds one mean per KV head.
+
+    The quantized rows are the ones that matter: their LSE correction contracts a per-KV-head
+    mean against Q, which is a shape error unless it is expanded over the query-head group.
+    """
+    torch.manual_seed(41)
+    kv = mha_v4_kv_tile()
+    heads_k = 2
+    heads_q = heads_k * gqa_ratio
+    dim, tiles = 128, 4
+    sequence_q, sequence_k = 256, tiles * kv
+    q = torch.randn((1, sequence_q, heads_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, sequence_k, heads_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    scale = dim**-0.5
+
+    kept = [0, 2, 3]
+    mask = torch.zeros((1, heads_q, 1, tiles), device="cuda", dtype=torch.bool)
+    for tile in kept:
+        mask[..., tile] = True
+
+    _, lse = mha_v4(
+        q,
+        k,
+        v,
+        q_format,
+        q_format,
+        v_format,
+        softmax_scale=scale,
+        block_mask=mask,
+        return_lse=True,
+    )
+
+    index = torch.cat(
+        [torch.arange(t * kv, (t + 1) * kv, device=k.device) for t in kept]
+    )
+    expanded = k[:, index].repeat_interleave(gqa_ratio, dim=2)
+    scores = torch.matmul(
+        q.float().permute(0, 2, 1, 3),
+        expanded.float().permute(0, 2, 1, 3).transpose(-1, -2),
+    )
+    reference = torch.logsumexp(scores * scale, dim=-1)
+
+    assert lse.shape == reference.shape
+    assert torch.isfinite(lse).all()
+    error = (lse.float() - reference).abs().max().item()
+    assert error < 0.25, error
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
 def test_mha_v4_f4f4_sparse_all_true_mask_matches_dense():
     """Retained FP8-P sparse F4F4 remains close to dense FP6-P on an all-true mask."""
     torch.manual_seed(41)
@@ -1075,6 +1139,7 @@ def test_mha_v4_sparse_empty_row_writes_zeros(launch):
     ), "empty row disturbed the live row"
 
 
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 def test_mha_v4_rejects_non_bool_block_mask():
     """Counts come from a sum but the fill uses truthiness, so non-bool masks disagree."""
     q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
@@ -1179,7 +1244,9 @@ def test_mha_v4_sparse_rejects_ragged_key_length():
 def test_mha_v4_sparse_rejects_per_batch_key_lengths():
     """BF16 Q/V so the varlen capability gate cannot fire; only the sparse guard can raise."""
     q = torch.zeros((1, 256, 2, 128), dtype=torch.bfloat16)
-    mask = torch.ones((1, 2, 1, 256 // mha_v4_kv_tile()), dtype=torch.bool)
+    # A literal tile count, not mha_v4_kv_tile(): the guard runs before mask geometry is checked,
+    # and the manifest read would raise here on an architecture with no sparse row.
+    mask = torch.ones((1, 2, 1, 2), dtype=torch.bool)
     seqlens_k = torch.full((1,), 128, dtype=torch.int32)
     with pytest.raises(NotImplementedError, match="sorted-sparse"):
         mha_v4(

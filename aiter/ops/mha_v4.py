@@ -1181,6 +1181,10 @@ def _restore_k_mean_in_lse(
     if lse is None or k_mean is None:
         return lse
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    # k_mean carries one row per KV head, and under GQA query head j reads KV head j // ratio.
+    heads_q, heads_k = q.shape[2], k_mean.shape[1]
+    if heads_q != heads_k:
+        k_mean = k_mean.repeat_interleave(heads_q // heads_k, dim=1)
     lse += torch.einsum("bshd,bhd->bhs", q, k_mean.to(q.dtype)).float() * scale
     return lse
 
