@@ -201,6 +201,8 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
     skip_if_gluon_unavailable(backend)
     if y_per_token_quant and (has_bias or not output or not transpose_bm):
         pytest.skip("y_scale_out needs a pre-allocated YQ, transpose_bm and no bias")
+    if y_per_token_quant and backend == "gluon":
+        pytest.skip("gluon backend does not support y_scale_out")
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
