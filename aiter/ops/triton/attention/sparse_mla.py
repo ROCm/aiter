@@ -192,6 +192,7 @@ _LOOP_BOUND_ROWS_PER_CU = 64
 
 def _async_launch_config(
     fp8_dots: bool,
+    native_bf16: bool,
     has_invalid: bool,
     num_queries: int,
     heads_blocks: int,
@@ -213,9 +214,12 @@ def _async_launch_config(
     exchange rate per token.
     """
     ASYNC_LDS_DEFAULT = True
+    # The copy needs the cache bytes to be the dot operand: an fp8 cache with
+    # fp8 dots, or a bf16 cache. The bf16 tile is twice the bytes, but the
+    # staged walk it replaces buffers the same tile, so occupancy is unchanged.
     enabled = (
         ASYNC_LDS_DEFAULT
-        and fp8_dots
+        and (fp8_dots or native_bf16)
         and uni_tile
         and not has_invalid
         # The async tiles below are sized for gfx950's LDS.
@@ -818,8 +822,23 @@ def sparse_mla_fwd(
     col_reps = kv_lora_rank // 512
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, block_k // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
+    native_bf16 = fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
+    if native_bf16:
+        # The bf16 copy only pays at 32 heads per program. 16 leaves too little
+        # work to cover it, and the 64-head program's 512 threads hold the whole
+        # tile, so too few workgroups remain to hide a copy this walk does not
+        # prefetch.
+        native_bf16 = (
+            arch == "gfx950"
+            and num_heads >= 32
+            and _staged_block_m(
+                num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
+            )
+            == 32
+        )
     async_lds_on, block_k, waves_per_eu, async_dbuf = _async_launch_config(
         fp8_dots,
+        native_bf16,
         has_invalid,
         num_queries,
         heads_blocks,
@@ -845,7 +864,10 @@ def sparse_mla_fwd(
 
     # The wide head programs and the decode XCD remap below are tuned on gfx950.
     staged = fmt == "fp8_scalar" or fmt == "bf16"
-    if arch == "gfx950" and staged and num_heads >= 32 and not async_lds_on:
+    # The fp8 copy keeps the narrow tile below; the bf16 one does not stage a
+    # tile in registers either, so it can afford the wide head program.
+    wide_ok = (not async_lds_on) or not fp8_dots
+    if arch == "gfx950" and staged and num_heads >= 32 and wide_ok:
         # 32- or 64-head programs (_staged_block_m).
         block_m = _staged_block_m(
             num_heads, num_queries, num_splits, max(avg_main, avg_extra) / block_k
@@ -856,11 +878,12 @@ def sparse_mla_fwd(
             heads_blocks = (num_heads + block_m - 1) // block_m
 
     if async_lds_on:
-        # acc is [BLOCK_M, kv_lora_rank] f32, so only 16-head programs leave
-        # room for the four waves/SIMD this walk needs to pay off.
-        block_m, num_warps = 16, 4
-        head_aligned = num_heads % block_m == 0
-        heads_blocks = (num_heads + block_m - 1) // block_m
+        if fp8_dots:
+            # acc is [BLOCK_M, kv_lora_rank] f32, so only 16-head programs leave
+            # room for the four waves/SIMD this walk needs to pay off.
+            block_m, num_warps = 16, 4
+            head_aligned = num_heads % block_m == 0
+            heads_blocks = (num_heads + block_m - 1) // block_m
         grid_splits = num_splits if skip_reduce else _launch_splits(num_splits)
 
     # Both only pay with enough rows in flight to cover what they move. The
