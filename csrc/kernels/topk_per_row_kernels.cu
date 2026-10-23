@@ -4951,12 +4951,20 @@ void standalone_stable_radix_topk_one_block_(void* buf,
     //   k= 128  N= 8192  90-> 90   16384 122->115   32768 222->175
     // so require the row to be long both absolutely and relative to k. The
     // padded length picks the build, and the kernel holds each row to its own
-    // length (compact_row). Measured on MI355X only: elsewhere the build's
-    // staging can halve the blocks a CU holds (BPP=11, 64 KB of LDS), so other
-    // targets keep the re-scan build.
+    // length (compact_row). Below M=4096 the fixed cost weighs more: at
+    // len=16384 the build ran 1.01x-1.06x of the re-scan one (k=512 and 1024,
+    // 64..4096 rows) and 0.84x-0.98x at 24576 (k=1024, 256 and 1024 rows).
+    // Rows with their own bounds mostly end short of the padded length, so
+    // fewer of them compact: at k=1024, rows ending uniformly in [k, len] ran
+    // 1.05x-1.06x at len=16384 and up to 1.03x at 24576 (1024 and 4096 rows),
+    // and 0.74x-0.97x from 32768. Measured on MI355X only: elsewhere the
+    // build's staging can halve the blocks a CU holds (BPP=11, 64 KB of LDS),
+    // so other targets keep the re-scan build.
     if constexpr(!STABLE)
     {
-        if(len >= 16384 && len >= int64_t(16) * k && topk_oneblock_is_gfx950())
+        const int64_t compact_min_len =
+            (phase == Phase::Prefill && rowStarts && rowEnds) ? 32768 : 24576;
+        if(len >= compact_min_len && len >= int64_t(16) * k && topk_oneblock_is_gfx950())
         {
             radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES,
                                         false, phase, STABLE, /*COMPACT=*/true, NanHigh>
