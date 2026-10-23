@@ -2,6 +2,8 @@
 
 set -ex
 
+bash .github/scripts/ensure_python.sh
+
 retry_cmd() {
     local max_attempts="$1"
     shift

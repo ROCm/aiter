@@ -173,6 +173,7 @@ jobs:
           # The aiter under test, and flash-attention built against it. One script, shared with
           # the windows job, because the ORDER is the whole recipe.
           COPY . /aiter
+          RUN bash /aiter/.github/scripts/ensure_python.sh
           ENV FA_BRANCH=${{ env.FA_BRANCH }}
           ENV FA_REPOSITORY_URL=${{ env.FA_REPOSITORY_URL }}
           RUN bash /aiter/.github/scripts/install_flash_attention.sh /aiter /flash-attention
@@ -320,6 +321,7 @@ jobs:
 
           COPY . /aiter
 
+          RUN bash /aiter/.github/scripts/ensure_python.sh
           RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
               rm -rf /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
               cp -a /aiter /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
@@ -659,6 +661,7 @@ jobs:
           # Clone and install flash-attention (CK backend)
           # Override aiter submodule with local checkout
           COPY . /aiter
+          RUN bash /aiter/.github/scripts/ensure_python.sh
           RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
               rm -rf /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
               cp -a /aiter /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \

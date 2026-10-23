@@ -75,6 +75,7 @@ jobs:
             "${DOCKER_IMAGE}" \
             bash -lc '
               set -euo pipefail
+              bash .github/scripts/ensure_python.sh
               git config --global --add safe.directory /workspace
               rm -rf dist build aiter_meta ./*.egg-info
               pip install --upgrade build "setuptools_scm>=8"

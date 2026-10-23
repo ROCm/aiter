@@ -246,6 +246,7 @@ jobs:
             ${{ matrix.docker_image }} \
             bash -lc '
               set -euo pipefail
+              bash .github/scripts/ensure_python.sh
               git config --global --add safe.directory /workspace &&
               git -C /workspace rev-parse HEAD >/dev/null &&
               shopt -s nullglob &&
@@ -877,6 +878,7 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -lc "
+            bash .github/scripts/ensure_python.sh
             pip uninstall -y amd-aiter aiter || true
             pip install -r requirements.txt
             pip install --upgrade pandas pyzmq einops numpy==1.26.2
@@ -1200,6 +1202,7 @@ jobs:
           aiter_test \
           bash -lc "
             set -euo pipefail
+            bash .github/scripts/ensure_python.sh
             pip uninstall -y amd-aiter aiter || true
             pip install -r requirements.txt
             pip install --upgrade pandas pyzmq einops numpy==1.26.2
