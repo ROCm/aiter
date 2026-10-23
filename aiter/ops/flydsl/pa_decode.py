@@ -530,7 +530,8 @@ def pa_decode(
 
     if is_bf16_kv and arch != "gfx1250" and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
-    nhd_strides = (0,) * 6
+    # The gfx1250 launcher has no NHD stride parameters.
+    nhd_strides = () if arch == "gfx1250" else (0,) * 6
     if nhd_layout:
         if value_cache.shape != key_cache.shape:
             raise ValueError(

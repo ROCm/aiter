@@ -306,17 +306,17 @@ def compile_pa_decode_tile(
             stride_ks_head,
             stride_q_row,
             stride_q_head,
-            stride_k_block,
-            stride_k_token,
-            stride_k_head,
-            stride_v_block,
-            stride_v_token,
-            stride_v_head,
             num_sequences,
             planned_seq,
             planned_start,
             planned_end,
             planned_context,
+            stride_k_block=stride_k_block,
+            stride_k_token=stride_k_token,
+            stride_k_head=stride_k_head,
+            stride_v_block=stride_v_block,
+            stride_v_token=stride_v_token,
+            stride_v_head=stride_v_head,
         )
         PaDecodePipeline(ctx).run()
 
