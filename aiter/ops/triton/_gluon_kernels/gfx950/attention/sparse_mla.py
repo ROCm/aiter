@@ -428,7 +428,8 @@ class Cfg:
         self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
         self.SLOT_U32 = gl.constexpr(SLOT_U32)
         self.UNPEEL = gl.constexpr(UNPEEL)
-        ROPE_VEC = 16
+        # 128 bits per lane: 16 one-byte elements, 8 bf16 ones.
+        ROPE_VEC = 16 if FP8_MFMA else 8
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
         # bf16 dots on 16x16x32 (gfx950's full rate) on the dsv4 and STAGED_K32 walks.
         MFMA_K = 32 if FP8_MFMA or DSV4_WALK or STAGED_K32 else 16
@@ -540,7 +541,7 @@ class Cfg:
             )
         )
 
-        AVEC = 16  # 128-bit LDS-DMA
+        AVEC = 16 if FP8_MFMA else 8  # 128-bit LDS-DMA
         ATW = KV_DIM // AVEC
         self.async_l = gl.constexpr(
             gl.BlockedLayout(
@@ -562,9 +563,12 @@ class Cfg:
         self.slot_a_l = gl.constexpr(gl.SliceLayout(1, self.async_l.value))
         self.slot_rope_a_l = gl.constexpr(gl.SliceLayout(1, self.async_rope_l.value))
         if ASYNC_LDS:
+            # The interval has to be a multiple of this buffer's warp run,
+            # 64 * AVEC; the 1024 default is that run for a 1-byte tile.
+            KV_INTERVAL: gl.constexpr = PAD_INTERVAL if FP8_MFMA else 64 * AVEC
             self.kv_shared = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
-                    [[PAD_INTERVAL, LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
+                    [[KV_INTERVAL, LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
                 )
             )
             # 64 * ROPE_VEC is this buffer's warp run: the smallest legal interval.
@@ -939,7 +943,7 @@ def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
             )
         else:
             k = kv_smem.permute([1, 0]).load(cfg.k_layout)  # [KV_DIM, BLOCK_K]
-        if cfg.ASYNC_LDS:
+        if cfg.ASYNC_LDS and cfg.FP8_MFMA:
             k = k.to(gl.float8e4nv, bitcast=True)  # raw cache bytes; layout-preserving
         S = gl.amd.cdna4.mfma(q_dot, k, S)
     if cfg.ROPE_SEPARATE:
@@ -949,7 +953,7 @@ def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
             )
         else:
             k_rope = rope_smem.permute([1, 0]).load(cfg.k_layout)
-        if cfg.ASYNC_LDS:
+        if cfg.ASYNC_LDS and cfg.FP8_MFMA:
             k_rope = k_rope.to(gl.float8e4nv, bitcast=True)
         S = gl.amd.cdna4.mfma(q_rope_dot, k_rope, S)
     return S
@@ -1330,7 +1334,7 @@ def _load_v(cfg, kv_smem):
         v = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_smem, cfg.v_layout)
     else:
         v = kv_smem.load(cfg.v_layout)
-    if cfg.ASYNC_LDS:
+    if cfg.ASYNC_LDS and cfg.FP8_MFMA:
         v = v.to(gl.float8e4nv, bitcast=True)
     return v
 
@@ -2446,13 +2450,19 @@ def _sparse_mla(
         or (MAIN_FMT == "fp8_scalar" and (not HAS_EXTRA or EXTRA_FMT == "fp8_scalar")),
         "FP8_MFMA requires the per-tensor fp8 format on every segment",
     )
-    # The direct-to-LDS path stages raw code points, needs the clamped (branch-free)
-    # tail, and carries no per-tile validity vector.
+    # The copy lands cache bytes in LDS untouched, so the dot operand has to be the
+    # cache's own type: fp8 dots over an fp8 cache, or a bf16 cache. An fp8 cache
+    # with bf16 dots dequantizes, which goes through registers by definition. The
+    # walk also needs the clamped (branch-free) tail and carries no per-tile
+    # validity vector.
     # TODO(has_invalid): the sentinel restriction is conservative, not fundamental.
+    RAW_LDS: gl.constexpr = FP8_MFMA or (
+        MAIN_FMT == "bf16" and ((not HAS_EXTRA) or EXTRA_FMT == "bf16")
+    )
     gl.static_assert(
         (not ASYNC_LDS)
-        or (FP8_MFMA and UNI_TILE and not HAS_INVALID),
-        "ASYNC_LDS requires FP8_MFMA + UNI_TILE and no -1 sentinels",
+        or (RAW_LDS and UNI_TILE and not HAS_INVALID),
+        "ASYNC_LDS requires an fp8 dot or a bf16 cache, UNI_TILE and no -1 sentinels",
     )
     gl.static_assert(
         (not UNPEEL) or UNI_TILE,
@@ -2654,9 +2664,10 @@ def _sparse_mla(
 
     # An fp8 buffer is half the bytes of the bf16 staging it replaces.
     SMEM_DT: gl.constexpr = gl.float8e4nv if FP8_MFMA else gl.bfloat16
-    # The LDS-DMA converts nothing, so an async buffer's element type has to be the
-    # cache's own u8; the dot operands bitcast on read (free, layout-preserving).
-    BUF_DT: gl.constexpr = gl.uint8 if ASYNC_LDS else SMEM_DT
+    # The LDS-DMA converts nothing, so an fp8 async buffer holds the cache's own
+    # u8 and the dot operands bitcast on read (free, layout-preserving). A bf16
+    # cache is already the operand type, so its buffer needs no bitcast.
+    BUF_DT: gl.constexpr = gl.uint8 if (ASYNC_LDS and FP8_MFMA) else SMEM_DT
     kv_smem = gl.allocate_shared_memory(BUF_DT, [BLOCK_K, HEAD_SIZE], cfg.kv_shared)
     if ROPE_SEPARATE:
         rope_smem = gl.allocate_shared_memory(
