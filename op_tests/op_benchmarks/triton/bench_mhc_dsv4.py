@@ -7,15 +7,17 @@ Usage:
     python bench_mhc_dsv4.py
     python bench_mhc_dsv4.py --op head
     python bench_mhc_dsv4.py --op post
-    python bench_mhc_dsv4.py -metric bandwidth
+    python bench_mhc_dsv4.py --metric bandwidth
 """
-
-import argparse
 
 import torch
 import triton
 
 from aiter.ops.triton.fusions.mhc import mhc_head_dsv4, mhc_post_dsv4, mhc_pre_dsv4
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 # DSV4 representative shapes: (M, n, C)
@@ -117,9 +119,7 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark MHC DSV4 kernels", allow_abbrev=False
-    )
+    parser = get_parser(kernel_name="MHC DSV4 kernels")
     parser.add_argument(
         "--op",
         choices=["pre", "post", "head"],
@@ -131,12 +131,8 @@ def parse_args():
         choices=["bf16", "fp16"],
         default="bf16",
     )
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()
