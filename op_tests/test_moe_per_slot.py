@@ -98,6 +98,14 @@ FAMILIES = {
         chunked=(256,),
         **_PER_1X32,
     ),
+    # model_dim below what the per-slot default's K-split stage 1 needs.
+    "a4w4_small": Family(
+        a_dtype=dtypes.fp4x2,
+        w_dtype=dtypes.fp4x2,
+        shapes=((256, 256, 16, 4, 1), (256, 256, 16, 4, 2)),
+        tokens=(64,),
+        **_PER_1X32,
+    ),
     "a4w4_v2_atomic": Family(v2_epilog="atomic", **_V2),
     "a4w4_v2_reduce": Family(v2_epilog="reduce", **_V2),
     "a4w4_v2_scatter": Family(v2_epilog="scatter", **_V2),

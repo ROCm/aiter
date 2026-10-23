@@ -3661,9 +3661,15 @@ def _per_slot_default_cfg(
     if inter_dim < 2048:
         kernel_name2 = kernel_name2_small
     kernels = _get_flydsl_moe_kernels()
-    if kernels.get_flydsl_kernel_params(kernel_name1) is None or (
-        parse_flydsl_v2_gemm2_kernel(kernel_name2) is None
-        and kernels.get_flydsl_kernel_params(kernel_name2) is None
+    params1 = kernels.get_flydsl_kernel_params(kernel_name1)
+    if (
+        params1 is None
+        # A stage 1 split over k_wave waves needs tile_k columns per wave.
+        or model_dim % (params1["tile_k"] * params1.get("k_wave", 1))
+        or (
+            parse_flydsl_v2_gemm2_kernel(kernel_name2) is None
+            and kernels.get_flydsl_kernel_params(kernel_name2) is None
+        )
     ):
         return None
     return {
