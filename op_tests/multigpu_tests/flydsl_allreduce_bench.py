@@ -394,7 +394,13 @@ CANDIDATE_KNOBS = {
     ("oneshot", "ar_rmsnorm"): ("atoms", "grid_cap", "fanout", "block", "split"),
     ("mesh", "ar"): ("super_tile", "grid_cap", "block"),
     ("ring", "ar"): ("super_tile", "grid_cap", "block"),
-    ("mesh", "ar_rmsnorm"): ("super_tile", "grid_cap", "atoms_per_row"),
+    ("mesh", "ar_rmsnorm"): (
+        "super_tile",
+        "grid_cap",
+        "block",
+        "atoms_per_row",
+        "low_latency",
+    ),
     ("ring", "ar_rmsnorm"): ("super_tile", "grid_cap", "atoms_per_row"),
 }
 _CANDIDATE_COLUMNS = (
@@ -408,8 +414,11 @@ _CANDIDATE_COLUMNS = (
     "split",
     "super_tile",
     "atoms_per_row",
+    "low_latency",
     "sets",
 )
+# Columns a candidate file may leave out; a missing one is empty on every row.
+_OPTIONAL_CANDIDATE_COLUMNS = ("low_latency",)
 
 
 @dataclass(frozen=True)
@@ -434,7 +443,7 @@ def load_candidates(
 
     A candidate file is a CSV with the columns ``name, operation, algorithm``,
     one column per knob (``atoms, grid_cap, fanout, block, split, super_tile,
-    atoms_per_row``) and ``sets``. ``operation`` is ``ar`` or ``ar_rmsnorm``,
+    atoms_per_row``, and the optional ``low_latency``, 0 or 1) and ``sets``. ``operation`` is ``ar`` or ``ar_rmsnorm``,
     ``algorithm`` is ``oneshot``, ``mesh`` or ``ring``. A knob cell is empty
     when the row leaves it to the engine, and a row may only pin the knobs of
     its algorithm and operation (``CANDIDATE_KNOBS``). ``sets`` is a list of
@@ -442,6 +451,9 @@ def load_candidates(
     unique: each is a column prefix in the bench tables.
     """
     df = pd.read_csv(path, dtype=str, keep_default_na=False, comment="#")
+    for col in _OPTIONAL_CANDIDATE_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
     missing = set(_CANDIDATE_COLUMNS) - set(df.columns)
     if missing:
         raise ValueError(f"{path}: missing column(s) {sorted(missing)}")
@@ -465,7 +477,17 @@ def load_candidates(
                     f"{path} row {i} ({row['name']}): {col} is not a knob of "
                     f"{key[0]} {key[1]}"
                 )
-            knobs[col] = cell if col == "fanout" else int(cell)
+            if col == "fanout":
+                knobs[col] = cell
+            elif col == "low_latency":
+                if cell not in ("0", "1"):
+                    raise ValueError(
+                        f"{path} row {i} ({row['name']}): low_latency must be "
+                        f"0 or 1, got {cell!r}"
+                    )
+                knobs[col] = cell == "1"
+            else:
+                knobs[col] = int(cell)
         sets = tuple(t for t in row["sets"].replace(" ", "").split(";") if t)
         cand = Candidate(row["name"], row["operation"], row["algorithm"], knobs, sets)
         if (

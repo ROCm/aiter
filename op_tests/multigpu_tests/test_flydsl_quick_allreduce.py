@@ -2942,9 +2942,11 @@ def _fused_applies(algorithm: str, knobs: dict, tp: int, hidden: int) -> bool:
 
     ``atoms_per_row`` resolves to the nearest one a width has, and the column
     would then time another build under this candidate's name; a ``grid_cap``
-    above the CU count is clamped away by the one-workgroup-per-CU rule. Both
-    leave the cell empty instead.
+    above the resident workgroups (one per CU, two for the low-latency build)
+    is clamped away. Both leave the cell empty instead, and so does a
+    low-latency candidate at a width whose block is not ``BLOCK``.
     """
+    from aiter.ops.flydsl.kernels.comm.transport import BLOCK
     from aiter.ops.flydsl.quick_allreduce import (
         ALGORITHMS as HOST_ALGORITHMS,
     )
@@ -2953,10 +2955,17 @@ def _fused_applies(algorithm: str, knobs: dict, tp: int, hidden: int) -> bool:
         _resolve_codecs,
     )
 
+    low_latency = bool(knobs.get("low_latency"))
+    wgs_per_cu = (
+        FlyQuickAllReduceRMSNorm.LOW_LATENCY_WGS_PER_CU
+        if low_latency
+        else FlyQuickAllReduceRMSNorm.WGS_PER_CU
+    )
     cap = knobs.get("grid_cap")
     if (
         cap is not None
-        and cap > torch.cuda.get_device_properties(0).multi_processor_count
+        and cap
+        > wgs_per_cu * torch.cuda.get_device_properties(0).multi_processor_count
     ):
         return False
     apr = knobs.get("atoms_per_row")
@@ -2967,13 +2976,16 @@ def _fused_applies(algorithm: str, knobs: dict, tp: int, hidden: int) -> bool:
     eng.world_size = tp
     eng._algo = algo
     eng.rs_codec, _ag = _resolve_codecs(algo, tp, None, None)
-    eng.block = None
+    eng.block = knobs.get("block")
     eng.atoms_per_row = apr
     # ``_geom_for`` records a width whose ``atoms_per_row`` it substituted.
     eng._apr_substituted = set()
     if not eng.supports_hidden(hidden):
         return False
-    return apr is None or eng._geom_for(hidden)[1] == apr
+    block, got_apr, _h_pad = eng._geom_for(hidden)
+    if low_latency and block != BLOCK:
+        return False
+    return apr is None or got_apr == apr
 
 
 def _hip_fused_runs(qr, nbytes: int, hidden: int) -> bool:
