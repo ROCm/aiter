@@ -56,6 +56,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_g2_kname_any,
 )
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
+from aiter.ops.moe_op import is_q256_kernel
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
@@ -77,7 +78,6 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 
 AUX_SORT_OPUS = "opus"
-_Q256_KERNEL = "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate"
 
 
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
@@ -2146,17 +2146,13 @@ def fused_moe_1stage(
             )
             return moe_buf
 
-        if kernelName in (_Q256_KERNEL, _Q256_KERNEL + "_route_weighted"):
+        if is_q256_kernel(kernelName):
             if a2_scale is not None:
                 raise ValueError("Q256 does not support caller-provided hidden scales")
             from aiter.ops.moe_op import fmoe_q256
 
-            partials = torch.empty(
-                (token_num, topk, model_dim), dtype=dtypes.bf16, device=a1.device
-            )
             fmoe_q256(
                 moe_buf,
-                partials,
                 a1,
                 w1,
                 w2,
@@ -4008,14 +4004,8 @@ def get_2stage_cfgs(
             has_stage2_bias=has_stage2_bias,
         )
 
-    if kernelName1 in (_Q256_KERNEL, _Q256_KERNEL + "_route_weighted") and not (
-        get_gfx() == "gfx950"
-        and inter_dim == 256
-        and model_dim >= 512
-        and model_dim % 256 == 0
-        and 0 < topk <= min(expert, 127)
-        and dtype == dtypes.bf16
-        and q_dtype_a == dtypes.fp4x2
+    if is_q256_kernel(kernelName1) and not (
+        q_dtype_a == dtypes.fp4x2
         and q_dtype_w == dtypes.fp4x2
         and q_type == QuantType.per_1x32
         and q_dtype_a2 in (None, dtypes.fp4x2)
@@ -4062,11 +4052,7 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
             flat=cfg_flat,
-            output_aux=(
-                AUX_SORT_OPUS
-                if kernelName1 in (_Q256_KERNEL, _Q256_KERNEL + "_route_weighted")
-                else False
-            ),
+            output_aux=(AUX_SORT_OPUS if is_q256_kernel(kernelName1) else False),
             **route_bucket_metadata,
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")

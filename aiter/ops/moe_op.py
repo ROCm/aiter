@@ -745,9 +745,15 @@ def fmoe_q256_producer(
 ) -> None: ...
 
 
+_Q256_KERNEL = "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate"
+
+
+def is_q256_kernel(kernel_name):
+    return kernel_name in (_Q256_KERNEL, _Q256_KERNEL + "_route_weighted")
+
+
 def fmoe_q256(
     out: Tensor,
-    partials: Tensor,
     input: Tensor,
     gate: Tensor,
     down: Tensor,
@@ -763,23 +769,22 @@ def fmoe_q256(
     *,
     kernelName: str = "",
 ) -> None:
-    """Run the universal assembly producer and its supplied FP32 reducer."""
+    """Run both projections, SiLU, hidden MXFP4 quantization and route weighting.
+
+    The ASM producer writes BF16 contributions in token/top-k order. FlyDSL
+    sums those contributions in FP32 and writes the final caller output.
+    Weighted scheduling adds a planner launch only for the exact 8192-token
+    geometry; adjacent counts in that tuning bucket use the compact producer.
+    """
 
     tokens, model = out.shape
+    partials = torch.empty((tokens, topk, model), dtype=dtypes.bf16, device=out.device)
     job_map = None
-    if kernelName.endswith("_route_weighted"):
-        if (tokens, model, topk, gate.shape[0], partials.ndim) != (
-            8192,
-            8192,
-            11,
-            513,
-            3,
-        ):
-            raise ValueError("Q256 weighted scheduling requires compact Qwen 8K geometry")
-        from aiter.ops.triton._triton_kernels.moe.q256_schedule import make_job_map
+    if kernelName == _Q256_KERNEL + "_route_weighted" and tokens == 8192:
+        from aiter.ops.triton.moe.q256_schedule import q256_make_job_map
 
         job_map = torch.empty(1024, dtype=torch.int32, device=out.device)
-        make_job_map[(8,)](sorted_ids, sorted_experts, counts, job_map, STYLE=0)
+        q256_make_job_map(sorted_ids, sorted_experts, counts, job_map)
 
     fmoe_q256_producer(
         out,
@@ -798,26 +803,15 @@ def fmoe_q256(
         topk,
         job_map,
     )
-    if partials.ndim == 3:
-        from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
-        # Producer contributions already include the routing weights.
-        _run_moe_reduction(
-            partials,
-            out,
-            tokens,
-            topk,
-            model,
-            streaming_loads=(model, topk) == (8192, 11),
-        )
-        return
-    from aiter.ops.triton._triton_kernels.moe.reduce import _reduce_q256_routes
-
-    _reduce_q256_routes[(tokens, (model + 8191) // 8192)](
+    # Full-API captured-route measurements on gfx950 favor nontemporal loads
+    # for the 8K Qwen contribution buffer, which is consumed exactly once.
+    _run_moe_reduction(
         partials,
-        reverse_sorted,
         out,
-        model,
+        tokens,
         topk,
-        num_warps=4,
+        model,
+        streaming_loads=(tokens, model, topk) == (8192, 8192, 11),
     )
