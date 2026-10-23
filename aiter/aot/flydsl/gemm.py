@@ -428,6 +428,7 @@ def _compile_hgemm_to_cache(
     n_waves: int,
     k_waves: int,
     group_m: int,
+    num_xcds: int,
     use_half_tile_interleaved: bool,
     has_bias: bool,
     target_gfx: str,
@@ -468,6 +469,7 @@ def _compile_hgemm_to_cache(
         "n_waves": n_waves,
         "k_waves": k_waves,
         "group_m": group_m,
+        "num_xcds": num_xcds,
         "use_half_tile_interleaved": use_half_tile_interleaved,
         "a_is_transposed": False,
         "b_is_transposed": True,
@@ -850,6 +852,7 @@ def _compile_mxfp8_8wave_to_cache(
     k: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    num_xcds: int = DEFAULT_NUM_XCDS,
     w_scale_block: str = "1x32",
     **kwargs,
 ):
@@ -873,6 +876,7 @@ def _compile_mxfp8_8wave_to_cache(
         K=k,
         waves_per_eu=waves_per_eu,
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
         scale_preshuffled=False,
         w_scale_block=w_scale_block,
     )
@@ -1140,7 +1144,9 @@ def compile_one_config(
             if kind == "hgemm":
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
-                _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
+                _compile_hgemm_to_cache(
+                    m=m, n=n, k=k, num_xcds=num_xcds, **hgemm_kwargs
+                )
             elif kind == "a16w16_gfx1250":
                 a16w16_kwargs = dict(kwargs)
                 a16w16_kwargs["target_gfx"] = aot_arch
@@ -1152,7 +1158,9 @@ def compile_one_config(
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, num_xcds=num_xcds, **kwargs)
             elif kind == "mxfp8_8wave":
-                _compile_mxfp8_8wave_to_cache(m=m, n=n, k=k, **kwargs)
+                _compile_mxfp8_8wave_to_cache(
+                    m=m, n=n, k=k, num_xcds=num_xcds, **kwargs
+                )
             elif kind == "mxfp8_wmma":
                 _compile_mxfp8_wmma_to_cache(
                     kernel_name=kernel_name,
