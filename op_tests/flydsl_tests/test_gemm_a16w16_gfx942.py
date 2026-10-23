@@ -514,5 +514,21 @@ def test_gemm_a16w16_gfx942_rejects_transposed_layouts(layout):
         gemm_a16w16(x, w.t(), layout=layout)
 
 
+def test_gemm_a16w16_gfx942_split_k_workspace_growth(monkeypatch):
+    """Exact first size, at least doubling growth, outgrown buffers kept alive."""
+    _require_gfx942()
+    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
+
+    monkeypatch.setattr(g, "_SPLIT_K_WORKSPACE", {})
+    monkeypatch.setattr(g, "_RETIRED_SPLIT_K_WORKSPACES", [])
+    first = g.get_split_k_workspace("cuda", 1000)
+    assert first.numel() == 1000
+    assert g.get_split_k_workspace("cuda", 600) is first
+    grown = g.get_split_k_workspace("cuda", 1500)
+    assert grown.numel() == 2000
+    assert g._RETIRED_SPLIT_K_WORKSPACES == [first]
+    assert g.get_split_k_workspace("cuda", 5000).numel() == 5000
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

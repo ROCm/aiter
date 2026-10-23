@@ -46,12 +46,10 @@ from aiter.utility.graph_alloc import persistent_alloc
 from .gemm_a16w16_gfx950 import (
     AsyncLoadTile,
     async_load_to_lds,
-    get_split_k_buffers,
     write_cshuffle_vec_to_global,
 )
 from .gemm_a16w16_gfx950_utils import (
     GFX950_WAVE_SIZE,
-    SPLIT_K_SEMAPHORE_MAX_LEN,
     BlockSwizzle,
     SplitKProtocol,
     get_wave_lds_offset,
@@ -74,6 +72,8 @@ GEMM_A16W16_DTYPE_BF16 = 2
 GEMM_A16W16_DTYPE_FP32 = 1
 # CDNA3 buffer cache policy sc0 | sc1: system coherent, bypasses the per-XCD L2.
 CPOL_SC0_SC1 = 1 | 16
+# Split-K semaphore and signal slots per launch: one per output tile.
+SPLIT_K_MAX_TILES = 1024
 
 
 def ab_k_perm(mma_k: int, *, dtype_width: int = 16, copy_bits: int = 128):
@@ -1483,16 +1483,38 @@ def _dynamic_tensor_arg(tensor, leading_dim):
     )
 
 
+@functools.lru_cache(maxsize=128)
+def get_split_k_buffers(stream, device):
+    """Per-stream split-K tile semaphores and signals, zeroed once.
+
+    Safe to reuse: launches on a stream are ordered and every split-K launch
+    hands its slots back zeroed.
+    """
+    with persistent_alloc(torch.device(device)):
+        semaphore = torch.zeros((SPLIT_K_MAX_TILES,), dtype=torch.int32, device=device)
+        signal = torch.zeros((SPLIT_K_MAX_TILES,), dtype=torch.int32, device=device)
+    return semaphore, signal
+
+
 _SPLIT_K_WORKSPACE: dict = {}
+# Outgrown workspaces stay allocated: a captured CUDA graph may still use them.
+_RETIRED_SPLIT_K_WORKSPACES: list = []
 
 
 def get_split_k_workspace(device, numel: int) -> torch.Tensor:
-    """Grow-only fp32 scratch for split_k_reduce partial tiles (never needs zeroing)."""
+    """Grow-only fp32 scratch for split_k_reduce partial tiles (never needs zeroing).
+
+    Each growth at least doubles it, so the retired buffers together stay
+    smaller than the live one.
+    """
     key = torch.device(device)
     ws = _SPLIT_K_WORKSPACE.get(key)
     if ws is None or ws.numel() < numel:
+        if ws is not None:
+            _RETIRED_SPLIT_K_WORKSPACES.append(ws)
+            numel = max(numel, 2 * ws.numel())
         with persistent_alloc(key):
-            ws = torch.empty((max(numel, 1 << 20),), dtype=torch.float32, device=key)
+            ws = torch.empty((numel,), dtype=torch.float32, device=key)
         _SPLIT_K_WORKSPACE[key] = ws
     return ws
 
@@ -1568,10 +1590,10 @@ def shape_error(m: int, n: int, k: int, cfg: dict) -> str | None:
         )
     if split_k > 1:
         tiles = -(-m // cfg["block_m"]) * -(-n // cfg["block_n"])
-        if tiles > SPLIT_K_SEMAPHORE_MAX_LEN:
+        if tiles > SPLIT_K_MAX_TILES:
             return (
                 f"split-K needs {tiles} tile semaphores, "
-                f"more than {SPLIT_K_SEMAPHORE_MAX_LEN}"
+                f"more than {SPLIT_K_MAX_TILES}"
             )
     if cfg["pingpong"]:
         if last_split_tiles < 2:
