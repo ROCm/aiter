@@ -37,7 +37,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     transpose_bm_in: bool | None = False,
     config: dict | None = None,
     backend: str | None = None,
-    y_scale: torch.Tensor | None = None,
+    y_scale_out: torch.Tensor | None = None,
 ):
     """
     Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
@@ -61,13 +61,13 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             batched_gemm_a16w8). Passing a config with backend=None keeps the
             triton path, since the config is interpreted as a triton config.
         backend (Optional[str]): "triton", "gluon", or None (auto). Auto selects
-            gluon on gfx1250 when bias, config and y_scale are None and the inputs fit
+            gluon on gfx1250 when bias, config and y_scale_out are None and the inputs fit
             batched_gemm_a16w8 (bf16/fp16 X, fp8 WQ, both K-contiguous);
             otherwise triton. The gluon path keeps X in bf16 and upcasts
             WQ to bf16 in registers instead of quantizing X per token-group, so
             its numerics differ from the triton path (it is closer to the exact
-            bf16 product); group_size does not apply to it and bias and y_scale are unsupported.
-        y_scale (Optional[torch.Tensor]): Pre-allocated scale tensor with shape (M, 1) for a per-token quantized FP8 YQ.
+            bf16 product); group_size does not apply to it and bias and y_scale_out are unsupported.
+        y_scale_out (Optional[torch.Tensor]): Pre-allocated scale tensor with shape (M, 1) for a per-token quantized FP8 YQ.
 
     Returns:
         torch.Tensor: Output batch with shape (B, M, N) or (M, B, N) if transpose_bm=True.
@@ -101,7 +101,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             _is_gluon_available()
             and bias is None
             and config is None
-            and y_scale is None
+            and y_scale_out is None
         ):
             from aiter.ops.triton.gemm.batched.batched_gemm_a16w8 import (
                 is_batched_gemm_a16w8_supported,
@@ -119,7 +119,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     if backend == "gluon":
         assert _is_gluon_available(), f"gluon backend requires {_GLUON_SUPPORTED_ARCHS}"
         assert bias is None, "gluon backend does not support bias"
-        assert y_scale is None, "gluon backend does not support y_scale"
+        assert y_scale_out is None, "gluon backend does not support y_scale_out"
         from aiter.ops.triton.gemm.batched.batched_gemm_a16w8 import (
             batched_gemm_a16w8,
         )
@@ -154,7 +154,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             ), "Output dimension error"
 
     if config is None:
-        if y_scale is None:
+        if y_scale_out is None:
             config, _ = _get_config(M, N, K)
         else:
             config, _ = _get_config(M, N, K, B, y_per_token_quant=True)
@@ -171,19 +171,19 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         else torch.iinfo(WQ.dtype).max
     )
 
-    if y_scale is not None:
+    if y_scale_out is not None:
         assert (
             transpose_bm and not has_bias
-        ), "y_scale (per-token quant of Y) needs transpose_bm=True and no bias"
+        ), "y_scale_out (per-token quant of Y) needs transpose_bm=True and no bias"
         assert (
             torch.is_floating_point(YQ) and YQ.element_size() == 1
-        ), f"y_scale needs a pre-allocated FP8 YQ, got {YQ.dtype=}"
+        ), f"y_scale_out needs a pre-allocated FP8 YQ, got {YQ.dtype=}"
         assert (
             YQ.stride(2) == 1 and YQ.stride(1) == N
         ), "YQ must hold the B * N values of a token contiguously"
         assert (
-            y_scale.shape == (M, 1) and y_scale.dtype == torch.float32
-        ), "y_scale must be FP32 with shape (M, 1)"
+            y_scale_out.shape == (M, 1) and y_scale_out.dtype == torch.float32
+        ), "y_scale_out must be FP32 with shape (M, 1)"
 
         # Split K in whole quant groups and launch only non-empty splits.
         num_k_groups = triton.cdiv(K, group_size)
@@ -240,7 +240,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         _batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel[grid_reduce](
             y_pp,
             YQ,
-            y_scale,
+            y_scale_out,
             M,
             B * N,
             y_pp.stride(0),
@@ -248,7 +248,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             y_pp.stride(3),
             YQ.stride(0),
             YQ.stride(2),
-            y_scale.stride(0),
+            y_scale_out.stride(0),
             DTYPE_MAX=Y_DTYPE_MAX,
             DTYPE_MIN=-Y_DTYPE_MAX,
             BLOCK_SIZE_M=config["REDUCE_BLOCK_SIZE_M"],
