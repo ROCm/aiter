@@ -357,6 +357,7 @@ def test_mha_varlen_with_sink(
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("CAUSAL", [True])
 @pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 32, 64])
+@pytest.mark.parametrize("WINDOW_SIZE_RIGHT", [-1, 0, 16])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_with_sink_sliding_window(
     BATCH: int,
@@ -367,6 +368,7 @@ def test_mha_with_sink_sliding_window(
     HEAD_SZ: int,
     CAUSAL: bool,
     WINDOW_SIZE_LEFT: int,
+    WINDOW_SIZE_RIGHT: int,
     backend: str,
 ):
     skip_if_gluon_unsupported(backend)
@@ -399,7 +401,7 @@ def test_mha_with_sink_sliding_window(
         (NUM_Q_HEADS,), device=device, dtype=torch.float32, requires_grad=TEST_BWD
     )
 
-    window_size = (WINDOW_SIZE_LEFT, -1)
+    window_size = (WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT)
 
     with torch.set_grad_enabled(TEST_BWD):
         triton_out = flash_attn_func(
@@ -483,6 +485,7 @@ def test_mha_with_sink_sliding_window(
 @pytest.mark.parametrize("HEAD_SZ", [64])
 @pytest.mark.parametrize("CAUSAL", [True])
 @pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 32])
+@pytest.mark.parametrize("WINDOW_SIZE_RIGHT", [-1, 0, 16])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_sliding_window_no_sink(
     SEQLEN_Q: int,
@@ -492,6 +495,7 @@ def test_mha_sliding_window_no_sink(
     HEAD_SZ: int,
     CAUSAL: bool,
     WINDOW_SIZE_LEFT: int,
+    WINDOW_SIZE_RIGHT: int,
     backend: str,
 ):
     BATCH = 1
@@ -522,7 +526,7 @@ def test_mha_sliding_window_no_sink(
         requires_grad=TEST_BWD,
     )
 
-    window_size = (WINDOW_SIZE_LEFT, -1)
+    window_size = (WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT)
 
     with torch.set_grad_enabled(TEST_BWD):
         triton_out = flash_attn_func(
