@@ -182,7 +182,6 @@
     "SW.SWB": {
       "SEGMENTS_PER_CU": 1,
       "SPLIT_FIT_BUDGET": true,
-      "SPLIT_KV_WINDOW": true,
       "SPLIT_SEQS_PER_TILE": 1.5,
       "MFMA_DIM": 16,
       "SPLIT_MIN_TILES": 4,
