@@ -4,8 +4,9 @@
 """Default-dispatch regressions for CK MoE.
 
 gfx942 A16W16 covers shards aligned to 64 but not 128 (for example 320).
-gfx950 fp8 stage2 covers inter_dim 384 (K=128) and 512 (K=256), and rejects
-sizes that 128 does not divide.
+gfx950 fp8 stage2 covers shuffled inter_dim 384 (K=128) and 512 (K=256),
+rejects sizes that 128 does not divide, and rejects unshuffled plain fp8
+weights.
 """
 
 import pytest
@@ -103,35 +104,64 @@ def _rows(scale, rows):
     return scale.expand(-1, rows, 1).contiguous()
 
 
-def _check_gfx950_fp8(inter_dim, block_m, quant_type):
+def _gfx950_fp8_inputs(inter_dim, quant_type):
     torch.manual_seed(0)
     tokens, experts, topk, model_dim = 16, 8, 2, 896
     hidden = torch.randn(tokens, model_dim, device="cuda", dtype=torch.bfloat16)
-    w1 = torch.randn(
-        experts, inter_dim * 2, model_dim, device="cuda", dtype=torch.bfloat16
+    w1 = (
+        torch.randn(
+            experts, inter_dim * 2, model_dim, device="cuda", dtype=torch.bfloat16
+        )
+        * 0.02
     )
-    w2 = torch.randn(experts, model_dim, inter_dim, device="cuda", dtype=torch.bfloat16)
-    w1 = w1 * 0.02
-    w2 = w2 * 0.02
+    w2 = (
+        torch.randn(experts, model_dim, inter_dim, device="cuda", dtype=torch.bfloat16)
+        * 0.02
+    )
     weights, ids = torch.softmax(
         torch.randn(tokens, experts, device="cuda"), dim=-1
     ).topk(topk, dim=-1)
     ids = ids.to(torch.int32)
     w1q, w1_scale = _fp8_weight(w1, quant_type)
     w2q, w2_scale = _fp8_weight(w2, quant_type)
-    # This kernel reads the shuffled weight layout. The reference keeps the
-    # original layout and the same scales.
-    actual = fused_moe(
+    return hidden, w1q, w2q, w1_scale, w2_scale, weights, ids
+
+
+def _call_gfx950_fp8(inter_dim, block_m, quant_type, *, shuffle, a1_scale, inputs=None):
+    hidden, w1q, w2q, w1_scale, w2_scale, weights, ids = (
+        inputs if inputs is not None else _gfx950_fp8_inputs(inter_dim, quant_type)
+    )
+    if shuffle:
+        w1q_in, w2q_in = shuffle_weight(w1q), shuffle_weight(w2q)
+    else:
+        w1q_in, w2q_in = w1q, w2q
+    return fused_moe(
         hidden,
-        shuffle_weight(w1q),
-        shuffle_weight(w2q),
+        w1q_in,
+        w2q_in,
         weights,
         ids,
         quant_type=quant_type,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        a1_scale=a1_scale,
         block_size_M=block_m,
         dtype=torch.bfloat16,
+    )
+
+
+def _check_gfx950_fp8(inter_dim, block_m, quant_type):
+    inputs = _gfx950_fp8_inputs(inter_dim, quant_type)
+    hidden, w1q, w2q, w1_scale, w2_scale, weights, ids = inputs
+    # This kernel reads the shuffled weight layout. The reference keeps the
+    # original layout and the same scales.
+    actual = _call_gfx950_fp8(
+        inter_dim,
+        block_m,
+        quant_type,
+        shuffle=True,
+        a1_scale=None,
+        inputs=inputs,
     ).clone()
     expected = torch_moe(
         hidden,
@@ -160,3 +190,25 @@ def test_gfx950_fp8_stage2_k_alignment(inter_dim, block_m, quant_type):
 def test_gfx950_fp8_stage2_rejects_non_128(inter_dim):
     with pytest.raises(RuntimeError, match="multiple of"):
         _check_gfx950_fp8(inter_dim, 32, QuantType.per_Tensor)
+
+
+@pytest.mark.skipif(not _GFX950, reason="Exercises the gfx950 fp8 CK default dispatch")
+@pytest.mark.parametrize("inter_dim", [384, 512])
+@pytest.mark.parametrize(
+    ("quant_type", "static_scale"),
+    [
+        (QuantType.per_Token, False),
+        (QuantType.per_Tensor, True),
+        (QuantType.per_Tensor, False),
+    ],
+)
+def test_gfx950_fp8_rejects_unshuffled_weights(inter_dim, quant_type, static_scale):
+    # Issue 6452 passes unshuffled weights: per-token, per-tensor with a static
+    # activation scale, and per-tensor with a dynamic activation scale.
+    a1_scale = (
+        torch.tensor([1.0], dtype=torch.float32, device="cuda")
+        if static_scale
+        else None
+    )
+    with pytest.raises(RuntimeError, match="shuffle_weight"):
+        _call_gfx950_fp8(inter_dim, None, quant_type, shuffle=False, a1_scale=a1_scale)
