@@ -14,14 +14,14 @@ _MANIFESTS = (
         "f6f4gemm_bf16_per1x32Fp6Fp4.csv",
         "mxfp6_mxfp4_c0_256_padk2",
         "a6w4_asm_tuned_gemm.csv",
-        3,
+        25,
     ),
     (
         "f4f6gemm",
         "f4f6gemm_bf16_per1x32Fp4Fp6.csv",
         "mxfp4_c0_mxfp6_256_padk2",
         "a4w6_asm_tuned_gemm.csv",
-        2,
+        24,
     ),
 )
 
@@ -40,17 +40,20 @@ def test_mixed_mxfp_manifest_objects(
     kernel_names = {row["knl_name"] for row in rows}
     assert len(rows) >= 4
     assert len(kernel_names) == len(rows)
+    entrypoints = {}
     for kernel_name in kernel_names:
         match = re.fullmatch(r"_ZN5aiter(\d+)(.+)E", kernel_name)
         assert match is not None
         declared_length, entrypoint = match.groups()
         assert int(declared_length) == len(entrypoint)
         assert entrypoint.startswith(f"{module}_")
+        entrypoints[kernel_name] = entrypoint
     assert len({row["co_name"] for row in rows}) == len(rows)
     assert {row["co_name"] for row in rows} == {
         path.name for path in manifest_dir.glob("*.co")
     }
     for row in rows:
+        assert row["co_name"] == f"{entrypoints[row['knl_name']]}.co"
         assert row["pack_layout"] == pack_layout
         assert row["tile_M"] == row["tile_N"] == row["block_size"] == "256"
         assert row["splitK"] == "0"
