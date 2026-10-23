@@ -6,6 +6,8 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
 from aiter.test_common import benchmark, perftest
 
 
@@ -15,15 +17,15 @@ def create_random_logits(
     dtype: torch.dtype,
     seed: int,
     data_generation: str = "random",
+    physical_width: int | None = None,
 ) -> torch.Tensor:
     """Create random logits tensor for testing."""
     torch.manual_seed(seed)
     np.random.seed(seed)
+    width = physical_width if physical_width is not None else max(row_ends)
     # Generate logits with some structure to make testing more meaningful
     if data_generation == "random":
-        logits = torch.randn(
-            row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda"
-        )
+        logits = torch.randn(row_starts.shape[0], width, dtype=dtype, device="cuda")
     elif data_generation == "10LSBits" or data_generation == "mixed":
         top_22_bits_mask = 0xFFFFFC00
         last_10_bits_mask = 0x000003FF
@@ -32,7 +34,7 @@ def create_random_logits(
         random_bottom_bits = torch.randint(
             0,
             2**10,
-            (row_starts.shape[0], max(row_ends)),
+            (row_starts.shape[0], width),
             dtype=torch.int32,
             device="cuda",
         )
@@ -44,7 +46,7 @@ def create_random_logits(
 
     if data_generation == "mixed":
         logits_random = torch.randn(
-            row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda"
+            row_starts.shape[0], width, dtype=dtype, device="cuda"
         )
         # Mix the two logits tensors randomly
         mask = torch.randint(0, 2, (row_starts.shape[0], 1), device="cuda").bool()
@@ -74,6 +76,8 @@ def compare_topk_results(
     row_ends: torch.Tensor,
     top_k: int,
     tolerance: float = 1e-5,
+    stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> bool:
     """
     Compare results from CUDA top_k_per_row with torch.topk.
@@ -120,6 +124,29 @@ def compare_topk_results(
         ):
             return False
 
+    if stable:
+        for row, row_end in enumerate(row_ends.tolist()):
+            valid_count = min(top_k, row_end)
+            if valid_count > 1 and not bool(
+                torch.all(
+                    cuda_indices[row, 1:valid_count]
+                    >= cuda_indices[row, : valid_count - 1]
+                )
+            ):
+                return False
+
+    if values is not None:
+        valid = cuda_indices >= 0
+        gathered = torch.gather(
+            logits,
+            1,
+            cuda_indices.clamp_min(0).to(torch.int64),
+        )
+        if not torch.equal(values[valid], gathered[valid]):
+            return False
+        if not bool(torch.all(torch.isneginf(values[~valid]))):
+            return False
+
     return True
 
 
@@ -134,10 +161,26 @@ def run_top_k_per_row_prefill(
     stride_row: int,
     stride_col: int,
     k: int = 2048,
+    flydsl: bool = False,
+    stable: bool = False,
 ) -> None:
     """
-    Run the top_k_per_row kernel.
+    Run the top_k_per_row kernel. `flydsl=True` bypasses dispatch and calls the
+    one-block radix kernel directly.
     """
+    if flydsl:
+        return aiter.flydsl_radix_topk_one_block_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            values,
+            num_rows,
+            stride_row,
+            stride_col,
+            k,
+            stable,
+        )
     return aiter.top_k_per_row_prefill(
         logits,
         row_starts,
@@ -148,6 +191,7 @@ def run_top_k_per_row_prefill(
         stride_row,
         stride_col,
         k=k,
+        stable=stable,
     )
 
 
@@ -162,6 +206,9 @@ def run_top_k_per_row_decode(
     stride1: int,
     fast: bool,
     k: int = 2048,
+    flydsl: bool = False,
+    stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> None:
     """
     Run the top_k_per_row kernel.
@@ -170,8 +217,23 @@ def run_top_k_per_row_decode(
     precompiled `.co`; it ignores any caller-supplied `k`. The dispatch
     here only allows `_fast` when k == 2048.
     """
-    if fast:
+    if flydsl:
+        assert not fast, "fast and flydsl cannot both be enabled"
+        return aiter.flydsl_top_k_per_row_decode(
+            logits,
+            next_n,
+            seqLens,
+            indices,
+            numRows,
+            stride0,
+            stride1,
+            k,
+            stable,
+            values,
+        )
+    elif fast:
         assert k == 2048, "top_k_per_row_decode_fast only supports k=2048"
+        assert not stable and values is None
         return aiter.top_k_per_row_decode_fast(
             logits,
             next_n,
@@ -191,12 +253,20 @@ def run_top_k_per_row_decode(
             stride0,
             stride1,
             k=k,
+            stable=stable,
+            values=values,
         )
 
 
 @benchmark()
 def test_top_k_per_row_prefill(
-    num_rows: int, num_prefix: int, top_k: int, data_generation: str = "random"
+    num_rows: int,
+    num_prefix: int,
+    top_k: int,
+    data_generation: str = "random",
+    flydsl: bool = False,
+    stable: bool = False,
+    write_values: bool = False,
 ) -> dict:
     """
     Test topk_per_row_prefill.
@@ -207,13 +277,21 @@ def test_top_k_per_row_prefill(
     # Create test data
     row_starts, row_ends = create_row_boundaries(num_rows, num_prefix)
     logits = create_random_logits(
-        row_starts, row_ends, torch.float32, 42, data_generation
+        row_starts,
+        row_ends,
+        torch.float32,
+        42,
+        data_generation,
+        physical_width=max(int(max(row_ends)), top_k) if flydsl else None,
     )
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-
-    torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
+    values = (
+        torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
+        if write_values
+        else None
+    )
 
     # Run the kernel
     _, us = run_top_k_per_row_prefill(
@@ -221,11 +299,13 @@ def test_top_k_per_row_prefill(
         row_starts,
         row_ends,
         indices,
-        None,  # values
+        values,
         num_rows,
         logits.stride(0),
         logits.stride(1),
         k=top_k,
+        flydsl=flydsl,
+        stable=stable,
     )
 
     # Run reference implementation
@@ -237,7 +317,14 @@ def test_top_k_per_row_prefill(
 
     # Compare results
     all_close = compare_topk_results(
-        logits, indices, torch_indices, row_starts, row_ends, top_k
+        logits,
+        indices,
+        torch_indices,
+        row_starts,
+        row_ends,
+        top_k,
+        stable=stable,
+        values=values,
     )
 
     # measure performance
@@ -255,27 +342,52 @@ def test_top_k_per_row_decode(
     next_n: int,
     data_generation: str = "random",
     fast: bool = False,
+    flydsl: bool = False,
+    stable: bool = False,
+    write_values: bool = False,
+    ragged: bool = False,
 ) -> dict:
     """
     Test top_k_per_row_decode with seq_lens tensor.
+
+    ragged gives the requests different lengths in one buffer, so a launch
+    mixes rows that one CTA finishes with rows split across CTAs.
     """
     torch.set_default_device("cuda:0")
     ret = {}
     # Create test data
     num_rows = batch_size * next_n
-    seq_lens = torch.empty(batch_size, dtype=torch.int32, device="cuda").fill_(
-        context_len
-    )
+    if ragged:
+        lengths = [context_len, context_len // 8, context_len // 64, context_len // 2]
+        seq_lens = torch.tensor(
+            [max(next_n, lengths[i % len(lengths)]) for i in range(batch_size)],
+            dtype=torch.int32,
+            device="cuda",
+        )
+    else:
+        seq_lens = torch.empty(batch_size, dtype=torch.int32, device="cuda").fill_(
+            context_len
+        )
     row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
     row_indices = torch.arange(num_rows, device="cuda") // next_n
     next_n_offset = torch.arange(num_rows, device="cuda") % next_n
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
     logits = create_random_logits(
-        row_starts, row_ends, torch.float32, 42, data_generation
+        row_starts,
+        row_ends,
+        torch.float32,
+        42,
+        data_generation,
+        physical_width=max(context_len, top_k) if flydsl else None,
     )
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    values = (
+        torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
+        if write_values
+        else None
+    )
 
     # Run the kernel
     _, us = run_top_k_per_row_decode(
@@ -288,6 +400,9 @@ def test_top_k_per_row_decode(
         logits.stride(1),
         fast,
         k=top_k,
+        flydsl=flydsl,
+        stable=stable,
+        values=values,
     )
 
     torch.cuda.synchronize()
@@ -301,15 +416,164 @@ def test_top_k_per_row_decode(
 
     # Compare results
     all_close = compare_topk_results(
-        logits, indices, torch_indices, row_starts, row_ends, top_k
+        logits,
+        indices,
+        torch_indices,
+        row_starts,
+        row_ends,
+        top_k,
+        stable=stable,
+        values=values,
     )
 
     # measure performance
-    ret["context_len"] = logits.shape[1]
+    ret["width"] = logits.shape[1]
     ret["all_close"] = all_close
     ret["us"] = us
     ret["fast"] = fast
     return ret
+
+
+def _decode_reference(logits, row_ends, top_k):
+    ref = logits.topk(min(top_k, int(max(row_ends))), dim=-1)[1]
+    mask = (ref >= 0) & ((ref - row_ends[:, None]) < 0)
+    return ref.masked_fill(~mask, -1)
+
+
+def test_flydsl_decode_split_reuse():
+    """Long rows split across CTAs and merge in the same launch.
+
+    The per-row arrival counters rearm themselves; this drives repeated eager
+    calls, same-stream CUDA graph warmup/replay and two streams, stable and not,
+    over a buffer that mixes split rows with rows one CTA finishes.
+    """
+    if get_gfx() not in _FLYDSL_TOPK_DECODE_GATES:
+        print("[flydsl_decode_split_reuse] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    num_rows, width, top_k = 16, 1 << 19, 2048
+    seq_lens = torch.tensor(
+        [[width, 4096, 300_001, 70_003][i % 4] for i in range(num_rows)],
+        dtype=torch.int32,
+    )
+    row_starts = torch.zeros(num_rows, dtype=torch.int32)
+
+    def run(logits, indices, stable, values=None):
+        aiter.flydsl_top_k_per_row_decode(
+            logits, 1, seq_lens, indices, num_rows, width, 1, top_k, stable, values
+        )
+
+    def check(logits, indices, stable, what):
+        ref = _decode_reference(logits, seq_lens, top_k)
+        assert compare_topk_results(
+            logits, indices, ref, row_starts, seq_lens, top_k, stable=stable
+        ), f"flydsl decode split mismatch: {what}"
+
+    def new_logits(seed):
+        return create_random_logits(
+            row_starts, seq_lens, torch.float32, seed, physical_width=width
+        )
+
+    for stable in (False, True):
+        for call_idx, seed in enumerate((11, 22, 33)):
+            logits = new_logits(seed)
+            indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+            run(logits, indices, stable)
+            check(logits, indices, stable, f"eager call #{call_idx} stable={stable}")
+
+    logits = new_logits(34)
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+    values = torch.empty((num_rows, top_k), dtype=torch.float32)
+    run(logits, indices, True, values)
+    reference = _decode_reference(logits, seq_lens, top_k)
+    assert compare_topk_results(
+        logits,
+        indices,
+        reference,
+        row_starts,
+        seq_lens,
+        top_k,
+        stable=True,
+        values=values,
+    ), "stable merge values mismatch"
+
+    graphs, buffers = [], []
+    for seed in (44, 55):
+        logits = new_logits(seed)
+        indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            run(logits, indices, False)
+        capture_stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            run(logits, indices, False)
+        graphs.append(graph)
+        buffers.append((logits, indices, capture_stream))
+    graph_buffers = list(zip(graphs, buffers))
+    for replay in range(20):
+        # Replay the second graph first once: capture order must not initialize
+        # or otherwise affect another graph's counter.
+        replay_order = reversed(graph_buffers) if replay == 0 else graph_buffers
+        for graph, (logits, indices, capture_stream) in replay_order:
+            logits.copy_(new_logits(100 + replay))
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                graph.replay()
+            capture_stream.synchronize()
+            check(logits, indices, False, f"graph replay #{replay}")
+
+    # Warm the stream-local counter, then capture with a temporary output view.
+    logits = new_logits(58)
+    output_owner = torch.empty((num_rows + 1, top_k), dtype=torch.int32)
+    capture_stream = torch.cuda.Stream()
+    warmup_indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        run(logits, warmup_indices, False)
+    capture_stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        run(logits, output_owner[:num_rows], False)
+    victims = (
+        torch.full((num_rows, 16 * top_k), 17, dtype=torch.int32),
+        torch.full((num_rows, 16 * top_k), 19.0, dtype=torch.float32),
+        torch.full((num_rows,), 23, dtype=torch.int32),
+    )
+    for seed in (59, 60, 61):
+        eager_logits = new_logits(seed)
+        eager_indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+        run(eager_logits, eager_indices, False)
+        check(eager_logits, eager_indices, False, "eager after capture")
+    for replay in range(3):
+        logits.copy_(new_logits(80 + replay))
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            graph.replay()
+        capture_stream.synchronize()
+        check(logits, output_owner[:num_rows], False, "temporary-view graph replay")
+        assert bool((victims[0] == 17).all())
+        assert bool((victims[1] == 19).all())
+        assert bool((victims[2] == 23).all())
+
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    outs = []
+    for seed, stream in zip((66, 77), streams):
+        logits = new_logits(seed)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            calls = [
+                torch.empty((num_rows, top_k), dtype=torch.int32) for _ in range(10)
+            ]
+            for indices in calls:
+                run(logits, indices, False)
+        outs.append((logits, calls))
+    torch.cuda.synchronize()
+    for logits, calls in outs:
+        for indices in calls:
+            check(logits, indices, False, "concurrent streams")
+    print("[flydsl_decode_split_reuse] PASS: eager, graph replay and streams")
 
 
 def test_mb_workspace_reuse():
@@ -421,11 +685,29 @@ parser.add_argument(
     e.g.: -d random""",
 )
 
+parser.add_argument(
+    "--regressions",
+    choices=["mb-workspace-reuse", "flydsl-decode-split-reuse"],
+    nargs="*",
+    default=["mb-workspace-reuse", "flydsl-decode-split-reuse"],
+    help="""Regression checks to run before the configured sweep.
+    Pass --regressions with no values to skip both.""",
+)
+
 args = parser.parse_args()
 
 # Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
-test_mb_workspace_reuse()
+if "mb-workspace-reuse" in args.regressions:
+    test_mb_workspace_reuse()
+if "flydsl-decode-split-reuse" in args.regressions:
+    test_flydsl_decode_split_reuse()
 
+
+# Ask each path which arches it serves rather than keeping a second copy
+# here: a copy drifts, and a test that drives a kernel production never
+# dispatches reports on something nobody runs.
+one_block_available = get_gfx() in _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+flydsl_decode_available = get_gfx() in _FLYDSL_TOPK_DECODE_GATES
 
 df = []
 for data_generation in args.data_generation:
@@ -434,10 +716,27 @@ for data_generation in args.data_generation:
             for num_prefix in args.num_prefix:
                 ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
                 df.append(ret)
+                # Cover the one-block radix kernel directly, so a dispatch
+                # change cannot hide a kernel regression.
+                if not one_block_available:
+                    continue
+                for stable in (False, True):
+                    for write_values in (False, True):
+                        ret = test_top_k_per_row_prefill(
+                            m,
+                            num_prefix,
+                            k,
+                            data_generation,
+                            flydsl=True,
+                            stable=stable,
+                            write_values=write_values,
+                        )
+                        df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
+assert df["all_close"].all(), f"topk_per_row_prefill mismatch:\n{df_md}"
 
 
 df = []
@@ -446,17 +745,49 @@ for data_generation in args.data_generation:
         for ctx in args.context_len:
             for k in args.top_k:
                 for n in args.next_n:
-                    ret = test_top_k_per_row_decode(
-                        m, ctx, k, n, data_generation, False
-                    )
-                    df.append(ret)
-                    # `_fast` ASM kernel hardcodes k=2048; skip otherwise.
-                    if get_gfx() == "gfx942" and k == 2048:
-                        ret = test_top_k_per_row_decode(
-                            m, ctx, k, n, data_generation, True
-                        )
-                        df.append(ret)
+                    for stable in (False, True):
+                        for write_values in (False, True):
+                            ret = test_top_k_per_row_decode(
+                                m,
+                                ctx,
+                                k,
+                                n,
+                                data_generation,
+                                stable=stable,
+                                write_values=write_values,
+                            )
+                            df.append(ret)
+                            if flydsl_decode_available:
+                                # Ragged lengths only matter once some rows
+                                # are long enough to be split.
+                                for ragged in (
+                                    (False, True) if ctx >= 65536 else (False,)
+                                ):
+                                    ret = test_top_k_per_row_decode(
+                                        m,
+                                        ctx,
+                                        k,
+                                        n,
+                                        data_generation,
+                                        flydsl=True,
+                                        stable=stable,
+                                        write_values=write_values,
+                                        ragged=ragged,
+                                    )
+                                    df.append(ret)
+                        # `_fast` ASM kernel hardcodes k=2048 and is not stable.
+                        if get_gfx() == "gfx942" and k == 2048 and not stable:
+                            ret = test_top_k_per_row_decode(
+                                m,
+                                ctx,
+                                k,
+                                n,
+                                data_generation,
+                                fast=True,
+                            )
+                            df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
+assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"

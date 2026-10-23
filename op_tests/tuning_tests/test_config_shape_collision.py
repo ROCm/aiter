@@ -15,26 +15,32 @@ break ``main`` once both land (cross-PR / merge-skew hazard). This test drives
 the **real runtime merge** so the collision is caught statically -- there is no
 re-implementation of the merge/dedup/key logic here, so it cannot drift.
 
+Families with no ``model_configs/`` sibling have nothing to merge and resolve to
+their canonical CSV directly. That file can still hold two rows with the same
+key, so it is checked too; the self-checks below cover both paths, since a
+family test only proves its CSVs are clean, not that anything inspected them.
+
 How it stays side-effect free: ``update_config_files`` writes de-duplicated CSVs
 back to their source paths when it finds collisions. We copy the entire
 ``aiter/configs/`` tree to a temp dir and point ``core.AITER_ROOT_DIR`` at it, so
 all globbing, untuned-key lookups, and any write-backs hit the copy, never the
 real repo.
 
-Requires torch (importing ``aiter`` pulls it in); it does not need a GPU. It is
-**not yet wired into any CI workflow** -- run it manually in a torch-enabled
-environment, or add it to a suitable job (e.g. the CPU/level01 tuning tests) to
-make it an actual PR/main regression guard.
+Requires torch (importing ``aiter`` pulls it in); it does not need a GPU. The
+level 0+1 tuning workflow runs it as a PR/main regression guard.
 
 Run:
     python3 -m unittest op_tests.tuning_tests.test_config_shape_collision -v
 """
 
+import csv
+import errno
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 try:  # importing aiter requires torch; skip cleanly where it is unavailable.
     from aiter.jit import core
@@ -53,6 +59,9 @@ AITER_ROOT = os.path.dirname(
 # runtime; the merge set and dedup key are resolved entirely by get_config_file.
 FAMILIES = [
     ("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A6W4_ASM", "a6w4_asm_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A4W6_ASM", "a4w6_asm_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", "a8w8_bpreshuffle_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", "a8w8_blockscale_tuned_gemm"),
@@ -60,15 +69,30 @@ FAMILIES = [
         "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
         "a8w8_blockscale_bpreshuffle_tuned_gemm",
     ),
+    (
+        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+        "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+    ),
+    (
+        "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
+        "a8w8_mxfp8_bpreshuffle_tuned_gemm",
+    ),
     ("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm"),
     ("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm"),
     (
         "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
         "batched_gemm_a8w8_blockscale_mxscale_tuned",
     ),
+    (
+        "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+        "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+    ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
+    ("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
+    ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
+    ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
 ]
 
 
@@ -122,11 +146,17 @@ class TestConfigShapeCollision(unittest.TestCase):
     # ---- self-check / control: prove the harness itself detects collisions ----
 
     @staticmethod
-    def _build_synthetic_family(root, dup):
+    def _build_synthetic_family(root, dup, *, with_model_file=True, canonical_raw=None):
         """Write a minimal isolated config tree for one family and return
-        (env_name, name). With dup=True the model file duplicates the canonical
-        row's key; with dup=False it uses a distinct shape. Uses the
-        a8w8_blockscale family (untuned key = M,N,K)."""
+        (env_name, name). Uses the a8w8_blockscale family (untuned key = M,N,K).
+
+        `dup` makes the second row repeat the first row's key instead of using a
+        distinct shape. `with_model_file` decides which resolution path that
+        second row exercises: True puts it in a model_configs/ sibling, so
+        get_config_file merges two tables; False puts it in the canonical CSV
+        and writes no sibling at all, so there is nothing to merge and the file
+        is handed straight back. `canonical_raw` overrides the canonical file
+        contents verbatim, for malformed input."""
         name = "a8w8_blockscale_tuned_gemm"
         env_name = "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE"
         cfg = os.path.join(root, "aiter", "configs")
@@ -135,26 +165,37 @@ class TestConfigShapeCollision(unittest.TestCase):
         with open(os.path.join(cfg, "a8w8_blockscale_untuned_gemm.csv"), "w") as f:
             f.write("M,N,K\n")
         header = "gfx,cu_num,M,N,K,us\n"
+        second_row = f"gfx950,256,{'1,64,128' if dup else '2,64,128'},20.0\n"
         with open(os.path.join(cfg, f"{name}.csv"), "w") as f:
-            f.write(header)
-            f.write("gfx950,256,1,64,128,10.0\n")
-        model_shape = "1,64,128" if dup else "2,64,128"
-        with open(
-            os.path.join(cfg, "model_configs", f"selfcheck_{name}.csv"), "w"
-        ) as f:
-            f.write(header)
-            f.write(f"gfx950,256,{model_shape},20.0\n")
+            if canonical_raw is not None:
+                f.write(canonical_raw)
+            else:
+                f.write(header)
+                f.write("gfx950,256,1,64,128,10.0\n")
+                if not with_model_file:
+                    f.write(second_row)
+        if with_model_file:
+            with open(
+                os.path.join(cfg, "model_configs", f"selfcheck_{name}.csv"), "w"
+            ) as f:
+                f.write(header)
+                f.write(second_row)
         return env_name, name
 
-    def _run_synthetic(self, dup):
+    def _run_synthetic(self, dup, **kwargs):
+        """Resolve a synthetic family: return None on success, else the error.
+
+        Catches Exception rather than RuntimeError because reading a tuned CSV
+        to check it must not introduce new failure modes; anything else it
+        raises has to be visible here instead of escaping as a test error."""
         tmp = tempfile.mkdtemp(prefix="aiter_cfg_selfcheck_")
         try:
-            env_name, name = self._build_synthetic_family(tmp, dup=dup)
+            env_name, name = self._build_synthetic_family(tmp, dup=dup, **kwargs)
             try:
                 self._resolve(tmp, env_name, name)
                 return None
-            except RuntimeError as e:
-                return str(e)
+            except Exception as e:  # noqa: BLE001
+                return f"{type(e).__name__}: {e}"
         finally:
             core.AITER_ROOT_DIR = self._tmp  # restore for other tests
             _cache_clear()
@@ -172,14 +213,105 @@ class TestConfigShapeCollision(unittest.TestCase):
         )
         self.assertIn("duplicate shape", err.lower())
 
+    def test_duplicate_error_names_key_and_env_var(self):
+        """The collision error must say which key matched and which env var
+        selects tables explicitly, so users outside a source checkout have a
+        way out (ROCm/aiter#5184)."""
+        err = self._run_synthetic(dup=True)
+        self.assertIsNotNone(err)
+        self.assertIn("dedup key: ['M', 'N', 'K', 'cu_num', 'gfx']", err)
+        self.assertIn("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", err)
+
+    def test_duplicate_error_survives_read_only_sources(self):
+        """The dedup write-back runs before the diagnostic is raised, so on a
+        read-only install the write error would replace that diagnostic with a
+        bare PermissionError -- dropping the key and the env var hint in the
+        one environment that cannot act on them anyway (ROCm/aiter#5184), and
+        leaving any remaining source half-rewritten. Report the failure instead
+        and do not claim those files were updated."""
+
+        def _read_only(self, path_or_buf=None, *args, **kwargs):
+            raise PermissionError(errno.EROFS, "Read-only file system", path_or_buf)
+
+        import pandas as pd
+
+        for with_model_file in (True, False):
+            with self.subTest(with_model_file=with_model_file):
+                with mock.patch.object(pd.DataFrame, "to_csv", _read_only):
+                    err = self._run_synthetic(dup=True, with_model_file=with_model_file)
+                self.assertIsNotNone(err)
+                self.assertTrue(
+                    err.startswith("RuntimeError:"),
+                    f"write failure replaced the duplicate diagnostic:\n{err}",
+                )
+                self.assertIn("dedup key: ['M', 'N', 'K', 'cu_num', 'gfx']", err)
+                self.assertIn("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", err)
+                # The unwritten source must not be listed as updated.
+                self.assertIn("Not updated:", err)
+                self.assertIn("(no files updated)", err)
+
     def test_selfcheck_passes_on_clean(self):
         """Negative control: distinct shapes must NOT be flagged (no false
         positive)."""
         err = self._run_synthetic(dup=False)
         self.assertIsNone(err, f"harness false-positived on clean configs:\n{err}")
 
+    # ---- single-file path: no model_configs/ sibling, so nothing to merge ----
+
+    def test_selfcheck_detects_duplicate_in_single_file(self):
+        """Positive control for the single-file path. A family with no
+        model_configs/ sibling has nothing to merge, so get_config_file returns
+        the canonical CSV as-is -- but one file can still hold two rows with the
+        same key when a retune is appended instead of replacing the old row.
+
+        This path used to skip the check entirely, which is how
+        tuned_grouped_fmoe.csv kept a duplicate row (removed in #6332) while
+        every test in this file was green. Without this control the family
+        tests above only prove the CSVs are clean, not that anything looked."""
+        err = self._run_synthetic(dup=True, with_model_file=False)
+        self.assertIsNotNone(
+            err,
+            "a duplicate inside a single tuned CSV went undetected -- the check "
+            "is being skipped for families with no model_configs/ sibling, so a "
+            "PASS on their real configs means nothing.",
+        )
+        self.assertIn("duplicate shape", err.lower())
+
+    def test_selfcheck_passes_on_clean_single_file(self):
+        """Negative control for the same path: two distinct shapes in one file
+        must resolve normally."""
+        err = self._run_synthetic(dup=False, with_model_file=False)
+        self.assertIsNone(err, f"false-positived on a clean single file:\n{err}")
+
+    def test_selfcheck_tolerates_unparseable_single_file(self):
+        """Checking a single file means reading it, which must not become a new
+        way for a malformed table to fail, nor move that failure earlier. This
+        path previously handed the file back unread, so a parse error surfaced
+        from the op's own loader; keep it there."""
+        err = self._run_synthetic(
+            dup=False,
+            with_model_file=False,
+            # Unterminated quote: pandas raises ParserError, a ValueError
+            # subclass, so a bare `except RuntimeError` would not contain it.
+            canonical_raw='gfx,cu_num,M\n"unclosed,1,2\n,,,,,,\n1,2\n',
+        )
+        self.assertIsNone(
+            err,
+            "the duplicate-shape check turned an unparseable tuned CSV into an "
+            f"error raised from get_config_file:\n{err}",
+        )
+
     def test_a4w4_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")
+
+    def test_a6w6_blockscale(self):
+        self._check_family("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm")
+
+    def test_a6w4_asm(self):
+        self._check_family("AITER_CONFIG_GEMM_A6W4_ASM", "a6w4_asm_tuned_gemm")
+
+    def test_a4w6_asm(self):
+        self._check_family("AITER_CONFIG_GEMM_A4W6_ASM", "a4w6_asm_tuned_gemm")
 
     def test_a8w8(self):
         self._check_family("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm")
@@ -200,6 +332,12 @@ class TestConfigShapeCollision(unittest.TestCase):
             "a8w8_blockscale_bpreshuffle_tuned_gemm",
         )
 
+    def test_a8w8_blockscale_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm",
+        )
+
     def test_a8w8_batched(self):
         self._check_family("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm")
 
@@ -212,14 +350,122 @@ class TestConfigShapeCollision(unittest.TestCase):
             "batched_gemm_a8w8_blockscale_mxscale_tuned",
         )
 
+        # The generic config registry owns file discovery and merging; the
+        # dedicated caller policy still owns public-kid normalization.
+        from aiter.ops.opus import policy
+
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        rows = policy._load_mxscale_bmm_tuned("opus")
+        self.assertTrue(rows)
+        self.assertEqual(len(rows), len(set(rows)))
+        self.assertEqual(
+            rows[("gfx950", 2, 1, 1024, 4096, "128x128")]["kernelId"],
+            8311,
+            "legacy local OPUS kid 311 must become public global kid 8311",
+        )
+        self.assertEqual(
+            rows[("gfx950", 8, 128, 1024, 4096, "128x128")]["kernelId"],
+            8653,
+            "legacy local OPUS kid 653 must become public global kid 8653",
+        )
+        policy._load_mxscale_bmm_tuned.cache_clear()
+
+    def test_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+        )
+
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
+
+    def test_conv3d_bf16(self):
+        self._check_family("AITER_CONFIG_CONV3D_BF16", "bf16_tuned_conv3d")
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")
 
+    def test_fhmoe(self):
+        merged = self._resolve(
+            self._tmp,
+            "AITER_CONFIG_FHMOE",
+            "tuned_fhmoe",
+        )
+        with open(merged, newline="") as f:
+            rows = list(csv.DictReader(f))
+        dsv4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "7168",
+                "384",
+                "385",
+                "7",
+                "384",
+                "torch.float4_e2m1fn_x2",
+            )
+        ]
+        hy4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "6144",
+                "256",
+                "257",
+                "9",
+                "256",
+                "torch.float8_e4m3fn",
+            )
+        ]
+        self.assertEqual(
+            {int(row["token"]) for row in dsv4_rows},
+            {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048},
+        )
+        self.assertEqual(
+            {int(row["token"]) for row in hy4_rows},
+            {
+                1,
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+                32768,
+            },
+        )
+        self.assertEqual(len(dsv4_rows), 12)
+        self.assertEqual(len(hy4_rows), 16)
+
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
+
+    def test_gdn_k5_opt(self):
+        self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
 
 
 def _fix_real_tree():

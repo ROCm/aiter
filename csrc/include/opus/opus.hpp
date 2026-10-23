@@ -13,6 +13,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "dtypes.hpp"
+
 #ifndef OPUS_ENABLE_RUNTIME_QUERY
 #define OPUS_ENABLE_RUNTIME_QUERY 0
 #endif
@@ -1007,17 +1009,8 @@ template<typename T> struct is_dtype : false_type {};
 template<typename T> constexpr bool is_dtype_v = is_dtype<remove_cvref_t<T>>::value;    // use this!
 
 REGISTER_DTYPE(fp32, float)
-// clang>=24 types the half operands of the fp16 matrix-core builtins (wmma_*_f16, mfma_*f16) and of raw_ptr_buffer_atomic_fadd_v2f16 as _Float16, and an __fp16 ext_vector no longer converts to a _Float16 one -- every fp16 mfma/wmma dispatch below is a hard error under __fp16 there. _Float16 is what opus used before clang 20 and what ck_tile still uses; the cost of respelling it is that arithmetic on fp16_t becomes a native half fma (v_fma_f16) instead of the fp32-intermediate v_fma_mixlo_f16, so keep __fp16 on the older compilers rather than shifting their numerics.
-#if __clang_major__ >= 24
-REGISTER_DTYPE(bf16, __bf16)
-REGISTER_DTYPE(fp16, _Float16)
-#elif __clang_major__ >= 20   // enable for rocm 7.0+
-REGISTER_DTYPE(bf16, __bf16)
-REGISTER_DTYPE(fp16, __fp16)
-#else
-REGISTER_DTYPE(bf16, unsigned short)
-REGISTER_DTYPE(fp16, _Float16)
-#endif
+REGISTER_DTYPE(bf16, dtypes::bf16)
+REGISTER_DTYPE(fp16, dtypes::fp16)
 REGISTER_DTYPE(fp8 , _BitInt(8))
 REGISTER_DTYPE(bf8 , unsigned _BitInt(8))
 REGISTER_DTYPE(i32 , int)
@@ -1212,16 +1205,27 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
 }
+
+// Optimized software RNE, selected with rounding mode 5. Canonicalizes NaNs to 0x7fff.
+OPUS_D constexpr unsigned short fp32_to_bf16_rtn_fast_raw(float f)
+{
+    const unsigned int bits    = __builtin_bit_cast(unsigned int, f);
+    const unsigned int rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    // Fast-math builds may optimize away NaN handling.
+    const unsigned int result  = ((bits & 0x7fffffffu) > 0x7f800000u) ? 0x7fff0000u : rounded;
+    return static_cast<unsigned short>(result >> 16);
+}
 #if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250/gfx12 has instruction conversion, leave 'rm' here for compatiblity
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
 #else
-template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm 4:rta_asm(round to nearest away)
+template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm, 4:rta_asm(round to nearest away), 5:optimized software RNE
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
     if      constexpr (rm == 0) {return __builtin_bit_cast(bf16_t, fp32_to_bf16_rtn_raw(x)); }
     else if constexpr (rm == 1) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<unsigned short>(z | (!(~z & 0x7f800000) && (z & 0xffff) ? 0x10000 : 0) >> 16)); }
     else if constexpr (rm == 2) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<unsigned short>(z >> 16)); }
     else if constexpr (rm == 3) { return fp32_to_bf16_rtn_asm(x); }
+    else if constexpr (rm == 5) { return __builtin_bit_cast(bf16_t, fp32_to_bf16_rtn_fast_raw(x)); }
 }
 #endif
 
@@ -1604,6 +1608,8 @@ OPUS_H_D constexpr index_t get_smem_size()
 {
 #if defined(__gfx950__)
     return 163840;  // 160KB (CDNA4)
+#elif defined(__gfx1250__)
+    return 327680;  // 320KB (CDNA5)
 #else
     return 65536;   // 64KB
 #endif
@@ -2201,8 +2207,16 @@ struct smem {
         else if constexpr (elem_bits == 4)  { asm volatile("ds_read_b64_tr_b4 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
         else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); }
         return __builtin_bit_cast(type, raw);
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__)
+        using type = vector_type<vec>;
+        constexpr index_t elem_bits = sizeof_bits_v<scalar_type>;
+        OPUS_LDS_ADDR char* p = ptr + v_os + imm_offset;
+        if      constexpr (elem_bits == 16) { return __builtin_bit_cast(type, __builtin_amdgcn_ds_load_tr16_b128_v8i16(reinterpret_cast<OPUS_LDS_ADDR i16x8_t*>(p))); }
+        else if constexpr (elem_bits == 8)  { return __builtin_bit_cast(type, __builtin_amdgcn_ds_load_tr8_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(p))); }
+        else if constexpr (elem_bits == 4)  { return __builtin_bit_cast(type, __builtin_amdgcn_ds_load_tr4_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(p))); }
+        else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); return type{}; }
 #elif defined(__HIP_DEVICE_COMPILE__)
-        static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__");
+        static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__ or __gfx1250__");
         return _load<vec>(v_os + imm_offset);
 #else
         return _load<vec>(v_os + imm_offset);
@@ -2232,8 +2246,9 @@ struct smem {
     }
 
     // bulk load API, give me a Shape of this tile, will issue multiple load instruction based on the y-shape space
+    // A compile-time c_os element offset folds LDS slot displacements into ds_read immediates, avoiding per-load address arithmetic.
     template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
-    OPUS_D auto load(const Layout& u)
+    OPUS_D auto load(const Layout& u, int c_os = 0)
     {
         using LT = layout_load_traits<Layout, vec>;
         constexpr auto r_elem = LT::r_elem;
@@ -2242,13 +2257,13 @@ struct smem {
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         for (index_t i = 0; i < r_elem.value; i++) {
-            auto tmp = load<vec>(offsets[i]);
+            auto tmp = load<vec>(offsets[i] + c_os);
             for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
         }
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i]);
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i] + c_os);
         return r;
 #endif
     }
@@ -3194,18 +3209,18 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // wmma (RDNA4 / wave32) -- gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ -- gfx12 set is DISPATCH_WMMA_GFX12_*.
 #if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
-// f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
+// f16/bf16/f32 builtins: (a_neg, A, b_neg, B, c_mod, C, matrix_a_reuse, matrix_b_reuse)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
   wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
-    return inst_(false, a, false, b, static_cast<short>(0), c, false, false); }
-// bf16f32 special: accumulator is f32 but output is bf16 => (neg_a, A, neg_b, B, fmts, C_f32, clamp, neg_c)
+    return inst_(false, a, false, b, static_cast<short>(0), c, reuse_a, reuse_b); }
+// bf16f32 special: accumulator is f32 but output is bf16 => (a_neg, A, b_neg, B, c_mod, C_f32, matrix_a_reuse, matrix_b_reuse)
 // The builtin takes f32 accumulator and returns bf16 output; we store the f32 accum but return bf16.
 #define DISPATCH_WMMA_BF16F32_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
   wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
-    return inst_(false, a, false, b, static_cast<short>(0), c, false, false); }
-// fp8/bf8 builtins: (A, B, matrix_fmts, C, clamp, neg_c)  -- no neg_a/neg_b
+    return inst_(false, a, false, b, static_cast<short>(0), c, reuse_a, reuse_b); }
+// fp8/bf8 builtins: (A, B, c_mod, C, matrix_a_reuse, matrix_b_reuse)  -- no a_neg/b_neg
 // A/B are packed as _ExtVector<N, int>; bitcast from the fp8/bf8 vector
 #define DISPATCH_WMMA_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
@@ -3214,7 +3229,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
     constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), \
                  __builtin_bit_cast(vector_t<i32_t, i32_b>, b), \
-                 static_cast<short>(0), c, false, false); }
+                 static_cast<short>(0), c, reuse_a, reuse_b); }
 
 // gfx12 builtins: 3-arg (A, B, C) -- no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
 #define DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) \
@@ -3262,8 +3277,8 @@ struct wmma {
     static constexpr int fmt_a = std::is_same_v<dtype_a, fp8_t> ? 0 : std::is_same_v<dtype_a, bf8_t> ? 1 : std::is_same_v<dtype_a, fp4_t> ? 4 : -1;
     static constexpr int fmt_b = std::is_same_v<dtype_b, fp8_t> ? 0 : std::is_same_v<dtype_b, bf8_t> ? 1 : std::is_same_v<dtype_b, fp4_t> ? 4 : -1;
 
-    // Regular (non-scaled) dispatch
-    template<typename VA, typename VB, typename VC>
+    // Regular (non-scaled) dispatch. reuse_a/reuse_b are the gfx1250 matrix_{a,b}_reuse hints: assert the operand repeats the previous WMMA's. Undefined if it does not; matrix_a_reuse is a no-op on MI450.
+    template<bool reuse_a = false, bool reuse_b = false, typename VA, typename VB, typename VC>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) -> vtype_c {
         (void)a; (void)b; (void)c;
         if      constexpr (false) {}
@@ -3733,25 +3748,37 @@ struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
     // Only generate _c layout methods (shape_c/dim_c changed)
     OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(c)
 
-    template<typename VA, typename VB, typename VC>
+    // reuse_a/reuse_b name THIS call's operands, so they swap too: under swap_ab `a` lands in SRC1, making reuse_a the one that reaches the working bit.
+    template<bool reuse_a = false, bool reuse_b = false, typename VA, typename VB, typename VC>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) {
-        return base::operator()(b, a, c);
+        return base::template operator()<reuse_b, reuse_a>(b, a, c);
     }
 
     template<typename VA, typename VB>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b) {
-        typename WMMA::vtype_c c{0}; return operator()(b, a, c);
+        typename base::vtype_c c{0}; return operator()(a, b, c);
     }
 
-    // Scaled overloads (BX32 / BX16): swap a,b then forward to base
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
-        return base::operator()(b, a, c, scale_a, scale_b);
+    // BX32 scaled: scale word is an int holding 4 packed E8M0 bytes.
+    template<typename VA, typename VB, typename VC, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        return base::operator()(b, a, c, scale_b, scale_a, number<b_scale_sel>{}, number<a_scale_sel>{});
     }
 
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b) {
-        return base::operator()(b, a, c, scale_a, scale_b);
+    template<typename VA, typename VB, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        typename base::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<a_scale_sel>{}, number<b_scale_sel>{});
+    }
+
+    // BX16 scaled: scale word is a long holding 8 packed E8M0 bytes.
+    template<typename VA, typename VB, typename VC, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        return base::operator()(b, a, c, scale_b, scale_a, number<b_scale_sel>{}, number<a_scale_sel>{});
+    }
+
+    template<typename VA, typename VB, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, long scale_a, long scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        typename base::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<a_scale_sel>{}, number<b_scale_sel>{});
     }
 };
 } // namespace impl (wmma_adaptor)

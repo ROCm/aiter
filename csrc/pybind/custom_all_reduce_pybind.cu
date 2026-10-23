@@ -4,7 +4,7 @@
 #include "aiter_stream.h"
 #include "custom_all_reduce.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
       CUSTOM_ALL_REDUCE_PYBIND;
 }

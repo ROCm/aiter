@@ -135,6 +135,7 @@ def fused_allreduce_rmsnorm_quant_per_group(
     use_1stage: bool,
     bf16_out_ptr: int = 0,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -152,6 +153,7 @@ def fused_allreduce_rmsnorm_mxfp4_quant(
     reg_bytes: int,
     use_1stage: bool,
     bf16_out_ptr: int = 0,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -308,7 +310,7 @@ def dispose_gfx1250(_fa: int) -> None: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="meta_size", develop=True)
-def meta_size_gfx1250() -> int: ...
+def meta_size_gfx1250(world_size: int = 8) -> int: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer", develop=True)
@@ -376,7 +378,7 @@ def end_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
 def two_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
 
 
-@compile_ops(FUSED_AR_MHC_MD_NAME)
+@compile_ops(FUSED_AR_MHC_MD_NAME, develop=True)
 def fused_allreduce_mhc_post_only(
     _fa: int,
     inp: torch.Tensor,
@@ -391,7 +393,7 @@ def fused_allreduce_mhc_post_only(
 ) -> None: ...
 
 
-@compile_ops(FUSED_AR_MHC_MD_NAME)
+@compile_ops(FUSED_AR_MHC_MD_NAME, develop=True)
 def fused_allreduce_mhc_post_one_stage(
     _fa: int,
     inp: torch.Tensor,
@@ -406,7 +408,7 @@ def fused_allreduce_mhc_post_one_stage(
 ) -> None: ...
 
 
-@compile_ops(FUSED_AR_MHC_MD_NAME)
+@compile_ops(FUSED_AR_MHC_MD_NAME, develop=True)
 def fused_allreduce_mhc_post_split(
     _fa: int,
     inp: torch.Tensor,

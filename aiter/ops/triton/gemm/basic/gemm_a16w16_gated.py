@@ -4,7 +4,7 @@
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_gated import (
     _gemm_a16_w16_gated_kernel,
     _get_config,
@@ -39,7 +39,7 @@ def gemm_a16w16_gated(
     Returns:
         torch.Tensor: Gated output with shape (M, N//2).
     """
-    _LOGGER.info(f"GEMM_A16W16_GATED: x={tuple(x.shape)} w={tuple(w.shape)}")
+    _LOGGER.info("GEMM_A16W16_GATED: x=%s w=%s", tuple(x.shape), tuple(w.shape))
 
     # Shape checks
     assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."

@@ -30,19 +30,27 @@ _GFX942_A16W16_TAGS = (
     )
     + _NOSPLIT
 )
+_A16W16_CO_TAGS = (
+    "a16w16_4wave_co",
+    "a16w16_4wave_wl_co",
+    "a16w16_4wave_wlr_co",
+)
 _A16W16_TAGS = (
     "a16w16",
     "a16w16_flatmm",
     "a16w16_flatmm_splitk",
     "a16w16_persistent",
     "a16w16_mono_tile",
-    # gfx1250 cluster/TDM split-K (fp32 workspace + reduce kernel).
+    # gfx1250 cluster/TDM split-K (exact-kid typed workspace + reduce kernel).
     "a16w16_cluster_tdm_splitk_ws",
-    # gfx1250 CLUSTER-LAUNCH (multicast) TDM split-K (fp32 workspace + reduce).
+    # gfx1250 CLUSTER-LAUNCH (multicast) TDM split-K (typed workspace + reduce).
     "a16w16_clusterlaunch_tdm_splitk_ws",
-    # gfx1250 FUSED single-kernel in-cluster split-K reduce (no reduce kernel);
-    # B multicast + GL2-resident partial workspace + cluster-barrier sync.
+    # gfx1250 fused in-cluster reduction source (currently unregistered). When
+    # enabled it consumes caller-owned typed workspace without a second reduce.
     "a16w16_clusterlaunch_tdm_splitk_fuse",
+    # Pre-built gfx1250 device images. Their generated host launchers reuse the
+    # ordinary five-argument non-workspace exact-kid ABI.
+    *_A16W16_CO_TAGS,
 ) + _GFX942_A16W16_TAGS
 
 EMIT_REGISTRY = {}
@@ -51,6 +59,94 @@ EMIT_REGISTRY = {}
 # its overrides at import time; gen_instances merges them into the cross-arch
 # default maps.
 ARCH_MAP_REGISTRY = {}
+
+_SPLITK_WORKSPACE_TYPES = {
+    "bf16_t": ("bf16_t", "__bf16", "AITER_DTYPE_bf16"),
+    "fp32_t": ("fp32_t", "float", "AITER_DTYPE_fp32"),
+}
+
+
+_WRITTEN_PATHS = set()
+
+
+def write_if_changed(path, contents):
+    """Write ``contents`` to ``path`` only when the bytes differ.
+
+    The JIT deliberately keeps the blob staging tree across rebuilds so ninja
+    can be incremental, but a generator that rewrites every file defeats that:
+    each file comes back with a fresh mtime, so all 672 opus translation units
+    recompiled on every rebuild even when not a byte of their source had
+    changed. Leaving an identical file untouched restores the incremental
+    build -- an unrelated edit now costs only the TUs that actually depend on
+    it, instead of ~13s of full recompile.
+    """
+    import os as _os
+
+    path = _os.fspath(path)
+    _WRITTEN_PATHS.add(_os.path.abspath(path))
+    data = contents.encode()
+    try:
+        with open(path, "rb") as handle:
+            if handle.read() == data:
+                return False
+    except OSError:
+        pass
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return True
+
+
+def open_if_changed(path):
+    """``with``-block that buffers a text file and writes it only if changed.
+
+    A drop-in for ``open(path, "w")`` where the body streams into a handle. An
+    exception inside the block propagates without touching the file on disk.
+    """
+    import contextlib
+    import io
+
+    @contextlib.contextmanager
+    def _buffered():
+        buffer = io.StringIO()
+        yield buffer
+        write_if_changed(path, buffer.getvalue())
+
+    return _buffered()
+
+
+def reset_written_paths():
+    """Start a new bookkeeping generation for :func:`prune_unwritten`."""
+    _WRITTEN_PATHS.clear()
+
+
+def prune_unwritten(directory):
+    """Delete files in ``directory`` that this run did not write.
+
+    The generated trees used to be ``rmtree``'d before every run so that a kid
+    dropped from the compile set could not leave a stale source behind. That
+    also guaranteed a full recompile. Pruning gives the same guarantee while
+    leaving the surviving files -- and their mtimes -- alone.
+    """
+    import os as _os
+
+    if not _os.path.isdir(directory):
+        return
+    for name in _os.listdir(directory):
+        path = _os.path.join(directory, name)
+        if _os.path.isfile(path) and _os.path.abspath(path) not in _WRITTEN_PATHS:
+            _os.remove(path)
+
+
+def splitk_workspace_type(k):
+    """Return C++ storage, pointer, and Aiter dtype tokens declared by a kid."""
+    dtype = k.splitk_workspace_dtype
+    try:
+        return _SPLITK_WORKSPACE_TYPES[dtype]
+    except KeyError as exc:
+        raise ValueError(
+            f"workspace instance {getattr(k, 'name', '<unknown>')} must declare "
+            f"splitk_workspace_dtype as bf16_t or fp32_t, got {dtype!r}"
+        ) from exc
 
 
 def register_arch_map(arch, map_name, mapping):
@@ -67,7 +163,7 @@ def get_arch_map(arch, map_name):
 
 def kid_arch(k):
     """Resolve a kid's target arch_prefix (defaults to gfx950 for legacy kids)."""
-    return (getattr(k, "arch_prefix", "") or "gfx950").lower()
+    return (k.arch_prefix or "gfx950").lower()
 
 
 def register_emit(arch, kernel_tag, fn):

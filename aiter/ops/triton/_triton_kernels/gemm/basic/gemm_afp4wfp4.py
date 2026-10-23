@@ -4,8 +4,11 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_afp4wfp4_repr = make_kernel_repr(
@@ -196,7 +199,7 @@ def _gemm_afp4wfp4_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
@@ -472,7 +475,7 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
@@ -709,7 +712,7 @@ def _gemm_afp4wfp4_preshuffle_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
@@ -720,6 +723,7 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
+    backend: str = "triton",
 ):
     # Note: Config files use K=2*K in their naming
     K = 2 * K
@@ -730,6 +734,7 @@ def _get_config(
             N,
             K,
             bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+            backend=backend,
         )
     else:
-        return get_gemm_config("GEMM-AFP4WFP4", M, N, K)
+        return get_gemm_config("GEMM-AFP4WFP4", M, N, K, backend=backend)
