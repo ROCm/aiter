@@ -51,9 +51,7 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         return w0, w1, w2, w3
 
     def _packed_o_128_vec(self, v_o, dc, g):
-        return Vec.from_elements(
-            [fx.Int32(w) for w in self._packed_o_128_dwords(v_o, dc, g)], fx.Int32
-        )
+        return Vec.from_elements(self._packed_o_128_dwords(v_o, dc, g), fx.Int32)
 
     def store_final_o(self, v_o, q_row, m_row=None, l_row=None):
         for dc in range_constexpr(self.traits.D_CHUNKS):

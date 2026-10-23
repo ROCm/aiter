@@ -22,7 +22,9 @@ from ..kernels.topk.topk_per_row_decode import (
 )
 from ..kernels.topk.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
+    one_workgroup_rows_are_exact,
 )
+from .row_lens import row_len_slot
 
 # Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
@@ -35,10 +37,10 @@ def _validate_topk_signature(
     logits_stride: tuple[int, ...],
     logits_dtype: torch.dtype,
     logits_device: torch.device,
-    seq_lens_shape: torch.Size,
-    seq_lens_stride: tuple[int, ...],
-    seq_lens_dtype: torch.dtype,
-    seq_lens_device: torch.device,
+    seq_lens_shape: torch.Size | None,
+    seq_lens_stride: tuple[int, ...] | None,
+    seq_lens_dtype: torch.dtype | None,
+    seq_lens_device: torch.device | None,
     indices_shape: torch.Size,
     indices_stride: tuple[int, ...],
     indices_dtype: torch.dtype,
@@ -72,17 +74,19 @@ def _validate_topk_signature(
     if (stride0, stride1) != logits_stride:
         raise ValueError("stride0 and stride1 must match logits strides")
 
-    if len(seq_lens_shape) != 1 or seq_lens_dtype != torch.int32:
-        raise ValueError("seq_lens must be a 1D int32 tensor")
-    if seq_lens_stride != (1,):
-        raise ValueError("seq_lens must be contiguous")
-    if seq_lens_device != logits_device:
-        raise ValueError("seq_lens must be on the same CUDA device as logits")
     if next_n <= 0:
         raise ValueError("next_n must be positive")
-    required_seq_lens = (rows + next_n - 1) // next_n
-    if seq_lens_shape[0] < required_seq_lens:
-        raise ValueError("seq_lens does not have enough entries for logits rows")
+    # A None signature is `seq_lens=None`: every row is full-width.
+    if seq_lens_shape is not None:
+        if len(seq_lens_shape) != 1 or seq_lens_dtype != torch.int32:
+            raise ValueError("seq_lens must be a 1D int32 tensor")
+        if seq_lens_stride != (1,):
+            raise ValueError("seq_lens must be contiguous")
+        if seq_lens_device != logits_device:
+            raise ValueError("seq_lens must be on the same CUDA device as logits")
+        required_seq_lens = (rows + next_n - 1) // next_n
+        if seq_lens_shape[0] < required_seq_lens:
+            raise ValueError("seq_lens does not have enough entries for logits rows")
 
     if indices_shape != (rows, k) or indices_dtype != torch.int32:
         raise ValueError("indices must be an int32 tensor with shape [rows, k]")
@@ -115,7 +119,7 @@ def _validate_values_signature(
 def _validate_flydsl_topk_call(
     logits: torch.Tensor,
     next_n: int,
-    seq_lens: torch.Tensor,
+    seq_lens: torch.Tensor | None,
     indices: torch.Tensor,
     num_rows: int,
     stride0: int,
@@ -128,10 +132,7 @@ def _validate_flydsl_topk_call(
         logits.stride(),
         logits.dtype,
         logits.device,
-        seq_lens.shape,
-        seq_lens.stride(),
-        seq_lens.dtype,
-        seq_lens.device,
+        *_optional_tensor_signature(seq_lens),
         indices.shape,
         indices.stride(),
         indices.dtype,
@@ -189,6 +190,11 @@ _TensorSignature = tuple[torch.Size, tuple[int, ...], torch.dtype, torch.device]
 
 def _tensor_signature(tensor: torch.Tensor) -> _TensorSignature:
     return tensor.shape, tensor.stride(), tensor.dtype, tensor.device
+
+
+def _optional_tensor_signature(tensor: torch.Tensor | None) -> tuple:
+    """`_tensor_signature`, or four Nones for an absent tensor."""
+    return (None,) * 4 if tensor is None else _tensor_signature(tensor)
 
 
 @lru_cache(maxsize=128)
@@ -305,7 +311,7 @@ def _is_flydsl_radix_topk_one_block_supported(
 def is_flydsl_top_k_per_row_decode_supported(
     logits: torch.Tensor,
     next_n: int,
-    seq_lens: torch.Tensor,
+    seq_lens: torch.Tensor | None,
     indices: torch.Tensor,
     num_rows: int,
     stride0: int,
@@ -316,7 +322,7 @@ def is_flydsl_top_k_per_row_decode_supported(
     """Return whether a call satisfies every FlyDSL-only precondition."""
     return _is_flydsl_topk_call_supported(
         _tensor_signature(logits),
-        _tensor_signature(seq_lens),
+        _optional_tensor_signature(seq_lens),
         _tensor_signature(indices),
         next_n,
         num_rows,
@@ -330,7 +336,7 @@ def is_flydsl_top_k_per_row_decode_supported(
 def flydsl_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
-    seq_lens: torch.Tensor,
+    seq_lens: torch.Tensor | None,
     indices: torch.Tensor,
     num_rows: int,
     stride0: int,
@@ -347,6 +353,9 @@ def flydsl_top_k_per_row_decode(
     ``row_starts`` enables packed rows: row r starts at row_starts[r] in the
     input's first row, while output indices remain relative to that start.
     ``plane_width`` bounds every row and selects the launch geometry.
+    ``seq_lens=None`` makes every row ``plane_width`` (default: the logits
+    width) long; the kernels then read no length tensor, so there is nothing
+    for a captured graph to hold an address of.
     Before CUDAGraph capture, warm the split path on the capture stream so its
     stream-local arrival counter is allocated and initialized.
     """
@@ -364,19 +373,23 @@ def flydsl_top_k_per_row_decode(
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     packed = row_starts is not None
-    starts = row_starts if packed else seq_lens
+    full_rows = seq_lens is None
+    len_slot = row_len_slot(seq_lens, logits.device)
+    starts = row_starts if packed else len_slot
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
             k,
             wave_size=wave_size,
             write_values=values is not None,
             packed_rows=packed,
+            full_rows=full_rows,
+            exact_rows=full_rows and one_workgroup_rows_are_exact(width),
         )
         run_topk_launcher(
             launcher,
             logits,
             starts,
-            seq_lens,
+            len_slot,
             indices,
             values if values is not None else logits,
             width,
@@ -392,7 +405,7 @@ def flydsl_top_k_per_row_decode(
     launch_topk_per_row_decode(
         logits=logits,
         next_n=next_n,
-        seq_lens=seq_lens,
+        seq_lens=len_slot,
         row_starts=starts,
         indices=indices,
         rows=rows,
@@ -405,6 +418,7 @@ def flydsl_top_k_per_row_decode(
         num_cus=get_cu_num(),
         stream=stream,
         packed_rows=packed,
+        full_rows=full_rows,
     )
 
 

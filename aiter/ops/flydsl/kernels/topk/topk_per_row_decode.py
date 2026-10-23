@@ -71,8 +71,11 @@ def build_topk_per_row_decode_module(
     wave_size: int,
     arch: str,
     packed_rows: bool = False,
+    full_rows: bool = False,
 ):
     """Build the decode kernel; the grid is rows * num_parts CTAs.
+
+    full_rows: every row is `width` long and seq_lens is not read.
 
     gfx942 intentionally reuses the wave64 one-block body with
     _LONG_RADIX_DEFAULT. The standalone one-block arch allowlist is a
@@ -100,6 +103,7 @@ def build_topk_per_row_decode_module(
             f"topk_per_row_decode_k{k}_w{wave_size}"
             f"_v{int(write_values)}_s{int(stable)}"
             f"{'_packed' if packed_rows else ''}"
+            f"{'_full' if full_rows else ''}"
         ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
@@ -125,7 +129,7 @@ def build_topk_per_row_decode_module(
 
         # Row geometry, all CTA-uniform. A row takes more parts only while each
         # keeps part_elements, so every part is longer than k.
-        full_len = _row_length(row, seq_lens, width, next_n)
+        full_len = _row_length(row, seq_lens, width, next_n, full_rows)
         active_parts = one
         for i in range_constexpr(len(_PART_OPTIONS)):
             option = fx.Int32(_PART_OPTIONS[i])
@@ -164,7 +168,7 @@ def build_topk_per_row_decode_module(
                 fx.get_iter(logits_row), packed_start + row_start
             )
             seg_len = row_end - row_start
-            part_offset_bytes = fx.Int64(part * fx.Int32(k)) * fx.Int64(4)
+            part_offset_bytes = fx.Int64(part * fx.Int32(k)) * 4
             index_addr = direct_row.select(
                 fx.Int64(ptrtoint(fx.get_iter(final_indices))),
                 fx.Int64(ptrtoint(fx.get_iter(part_indices))) + part_offset_bytes,
@@ -208,9 +212,9 @@ def build_topk_per_row_decode_module(
             gpu.barrier()
             if tid == 0:
                 fence_agent_release()
-                counter_addr = fx.Int64(ptrtoint(fx.get_iter(counters))) + fx.Int64(
-                    row
-                ) * fx.Int64(4)
+                counter_addr = (
+                    fx.Int64(ptrtoint(fx.get_iter(counters))) + fx.Int64(row) * 4
+                )
                 arrived = fx.Int32(atomic_add_agent(counter_addr, one))
                 is_last = arrived == active_parts - one
                 if is_last:
@@ -225,7 +229,7 @@ def build_topk_per_row_decode_module(
                 fx.make_view(
                     fx.get_iter(part_indices), fx.make_layout(_MAX_ROW_ELEMENTS, 1)
                 ),
-                num_records_bytes=fx.Int64(merge_len) * fx.Int64(4),
+                num_records_bytes=fx.Int64(merge_len) * 4,
             )
             run_one_block_body(
                 storage,
@@ -330,7 +334,9 @@ def launch_topk_per_row_decode(
     num_cus: int,
     stream: torch.cuda.Stream,
     packed_rows: bool,
+    full_rows: bool = False,
 ) -> None:
+    """`full_rows`: every row is `width` long; `seq_lens` is a placeholder."""
     parts = topk_per_row_decode_parts(rows, width, k, num_cus, stable)
     if parts == 1:
         launcher = build_radix_topk_one_block_module(
@@ -343,6 +349,7 @@ def launch_topk_per_row_decode(
             wave_size=wave_size,
             arch=arch,
             packed_rows=packed_rows,
+            full_rows=full_rows,
         )
         run_topk_launcher(
             launcher,
@@ -365,6 +372,7 @@ def launch_topk_per_row_decode(
         wave_size=wave_size,
         arch=arch,
         packed_rows=packed_rows,
+        full_rows=full_rows,
     )
     partial_indices, partial_values, counters = _get_workspace(
         indices.device, stream.cuda_stream, rows, parts * k

@@ -145,7 +145,9 @@
             "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -1558,7 +1560,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1602,7 +1604,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1628,7 +1630,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'",
             "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'"
         ],
         "extra_ldflags": "None",
@@ -1653,7 +1655,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'",
             "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
             "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 1)}'"
         ],
@@ -1734,7 +1736,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1758,7 +1760,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1780,7 +1782,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'",
             "'-DCK_TILE_FMHA_FWD_SPLITKV_API=1'"
         ],
         "extra_ldflags": "None",

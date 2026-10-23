@@ -41,8 +41,8 @@ DTYPE_MAP = {
 
 
 def generate_inputs(M, N, K, preshuffle, a_group, w_group, transpose):
-    x = torch.randn((M, K), device="cuda").to(torch.float8_e4m3fn)
-    w = torch.randn((N, K), device="cuda").to(torch.float8_e4m3fn)
+    x = torch.randn((M, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    w = torch.randn((N, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
     xs = torch.randint(125, 130, (M, K // a_group), dtype=torch.uint8, device="cuda")
     ws = torch.randint(
         125,
@@ -247,13 +247,6 @@ def parse_args(args: list[str] | None = None):
         action="store_true",
         dest="preshuffle",
         help="Preshuffle the weight (layout=(16, 16)) and use gemm_afp8wfp8_preshuffle.",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["triton", "gluon"],
-        default=None,
-        help="Backend for the preshuffle kernel. Default auto-detects (gluon on gfx1250, else triton). Ignored without --shuffle.",
     )
     parser.add_argument(
         "--dtype",
