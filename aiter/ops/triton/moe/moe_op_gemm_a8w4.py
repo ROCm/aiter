@@ -2,6 +2,8 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+import json
+import os
 
 import torch
 import triton
@@ -31,7 +33,42 @@ from aiter.ops.triton.moe.reduce import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
+from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
+
+
+# gfx1250 gpt-oss recipe ("best"): AITER_A8W4_BACKEND=triton makes the plain-Triton
+# _moe_gemm_a8w4 the default backend on gfx1250 when the caller passes none (SGLang's gfx1250
+# W4A8 path passes none); AITER_A8W4_BACKEND_BY_N="5760:triton,2880:gluon" picks per output
+# width N. On the Triton path, gfx1250 uses gfx950's dispatch table (gfx1250-A8W4.json holds
+# gluon configs in another schema), then configs/moe/gfx1250-A8W4-triton.json (or
+# AITER_A8W4_TUNED_JSON): {"<backend>": {"bm<bm>_n<N>_k<K>": [{"max_m": rows, "cfg": {...}}]}},
+# first entry with M <= max_m wins.
+_A8W4_BACKEND = os.environ.get("AITER_A8W4_BACKEND", "").strip().lower()
+_A8W4_BACKEND_BY_N = dict(
+    (int(kv.split(":")[0]), kv.split(":")[1].strip().lower())
+    for kv in os.environ.get("AITER_A8W4_BACKEND_BY_N", "").split(",")
+    if ":" in kv
+)
+_A8W4_TUNED = None
+
+
+def _a8w4_tuned_override(backend, m, n, k, block_m):
+    global _A8W4_TUNED
+    path = os.environ.get("AITER_A8W4_TUNED_JSON")
+    if not path and backend == "triton" and get_arch() == "gfx1250":
+        path = f"{AITER_TRITON_CONFIGS_PATH}/moe/gfx1250-A8W4-triton.json"
+        if not os.path.exists(path):
+            path = None
+    if not path:
+        return None
+    if _A8W4_TUNED is None:
+        with open(path) as f:
+            _A8W4_TUNED = json.load(f)
+    for e in _A8W4_TUNED.get(backend, {}).get(f"bm{block_m}_n{n}_k{k}", []):
+        if m <= e["max_m"]:
+            return e["cfg"]
+    return None
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -109,6 +146,8 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()
+    if arch == "gfx1250":
+        arch = "gfx950"  # gfx1250-A8W4.json is the gluon table; see the note at the top
     split_k = 1
 
     # Tuned dispatch: per-(block_m, N, K) winners from a sweep tuner.
@@ -396,6 +435,8 @@ def moe_gemm_a8w4(
     """
     if backend is None:
         backend = "gluon" if get_arch() == "gfx1250" else "triton"
+        if get_arch() == "gfx1250":
+            backend = _A8W4_BACKEND_BY_N.get(w.shape[-1], _A8W4_BACKEND) or backend
     assert backend in ("triton", "gluon"), f"Invalid backend: {backend}"
     if backend == "gluon":
         assert (
@@ -440,6 +481,9 @@ def moe_gemm_a8w4(
         config = get_kernel_config_gluon(M, N, K, routing_data, out_mx_quant)
     else:
         config = get_kernel_config_triton(M, N, K, routing_data, swizzle_mx_scale)
+    tuned = _a8w4_tuned_override(backend, M, N, K, routing_data.block_m)
+    if tuned:
+        config = {**config, **tuned}
     # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries
     # pick BK<256 for utilization. Clamp only when swizzle is requested so
     # StridedLayout callers keep their tuned BK<256.
