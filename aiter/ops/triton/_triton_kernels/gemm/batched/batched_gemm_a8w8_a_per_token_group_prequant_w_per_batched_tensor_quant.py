@@ -93,7 +93,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     Key parameters:
     - A: Batch tensor A with shape (B, M, K).
     - B: Batch tensor B with shape (B, K, N).
-    - C: Batch tensor C with shape (B, M, N), or (NUM_KSPLIT, B, M, N) partial sums.
+    - C: Batch tensor C with shape (B, M, N), or (NUM_KSPLIT, M, B, N) partial sums.
     - A_scale: First scale batch tensor with shape (B, M, 1).
     - B_scale: Second scale batch tensor with shape (B, 1, N).
     - Bias: Bias batch tensor with shape (B, 1, N).
