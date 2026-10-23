@@ -78,6 +78,7 @@ def test_pool_is_one_per_device():
 def test_every_cached_scratch_comes_from_the_private_pool():
     """Needs no capture, so it also runs on the torch floor where the test above
     is skipped, and it names any site that loses its persistent_alloc."""
+    from aiter.fused_moe import _FLYDSL_STAGE1_OUT_CACHE, _get_flydsl_stage1_out
     from aiter.ops.flydsl.gemm_a16w16_gfx1250 import _split_k_counters
     from aiter.ops.flydsl.gemm_kernels import _get_preshuffle_split_buffers
     from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import get_split_k_buffers
@@ -88,7 +89,11 @@ def test_every_cached_scratch_comes_from_the_private_pool():
     dev = torch.device("cuda:0")
     s = torch.cuda.Stream(device=dev)
     sid = s.cuda_stream
+    with torch.cuda.stream(s):
+        stage1_out = _get_flydsl_stage1_out((256, 512), dev)
+    _FLYDSL_STAGE1_OUT_CACHE.clear()
     sites = {
+        "flydsl_moe_stage1_out": stage1_out,
         "preshuffle_split_k": _get_preshuffle_split_buffers(dev, s),
         "a16w16_gfx950": get_split_k_buffers(s, dev),
         "a16w16_gfx1250": _split_k_counters(dev, s),
