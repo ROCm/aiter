@@ -49,8 +49,6 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = [
-    "flydsl_fp8_paged_mqa_logits",
-    "flydsl_fp8_paged_mqa_logits_gfx950",
-    "flydsl_fp8_paged_mqa_logits_gfx1250",
-]
+# The per-arch entry points stay out of __all__: they only exist via
+# __getattr__, so a star import would load every arch's module.
+__all__ = ["flydsl_fp8_paged_mqa_logits"]
