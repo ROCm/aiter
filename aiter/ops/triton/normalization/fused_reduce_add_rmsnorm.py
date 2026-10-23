@@ -8,18 +8,11 @@ from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
     _fused_reduce_rms_fp8_group_quant_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import select_leq_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.normalization_config_utils import get_normalization_config
 
 _LOGGER = AiterTritonLogger()
-
-
-def _num_warps(block_size_n: int) -> int:
-    raw = get_normalization_config("fused_reduce_add_rmsnorm", get_arch())
-    for bound in sorted(int(k[len("N_LEQ_") :]) for k in raw if k.startswith("N_LEQ_")):
-        if block_size_n <= bound:
-            return raw[f"N_LEQ_{bound}"]["num_warps"]
-    return raw["any"]["num_warps"]
 
 
 def fused_reduce_add_rmsnorm(
@@ -59,6 +52,8 @@ def fused_reduce_add_rmsnorm(
         N,
     ), f"residual {tuple(residual.shape)} vs ({M}, {N})"
     assert weight.shape == (N,), f"weight {tuple(weight.shape)} vs ({N},)"
+    # The kernel reads the weight with unit stride.
+    assert weight.stride(0) == 1, f"weight must have stride 1, got {weight.stride(0)}"
     assert residual.dtype in (
         torch.float16,
         torch.bfloat16,
@@ -77,6 +72,9 @@ def fused_reduce_add_rmsnorm(
         return out, residual_out
 
     BLOCK_SIZE_N = triton.next_power_of_2(N)
+    config = select_leq_config(
+        get_normalization_config("fused_reduce_add_rmsnorm", get_arch()), BLOCK_SIZE_N
+    )
     _fused_reduce_rms_fp8_group_quant_kernel[(M,)](
         x,
         weight,
@@ -137,6 +135,6 @@ def fused_reduce_add_rmsnorm(
         HAS_QUANT=False,
         GEMMA_NORM=gemma_norm,
         HAVE_THIRD_INPUT=False,
-        num_warps=_num_warps(BLOCK_SIZE_N),
+        num_warps=config["num_warps"],
     )
     return out, residual_out
