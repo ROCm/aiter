@@ -171,7 +171,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
 def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
-    num_xcds = 8
+    num_xcds = get_num_xcds()
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
@@ -235,7 +235,7 @@ def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
 def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
-    num_xcds = 8
+    num_xcds = get_num_xcds()
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 1
