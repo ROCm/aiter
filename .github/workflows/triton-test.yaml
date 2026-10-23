@@ -68,7 +68,7 @@ jobs:
         env:
           # 'true': print the selection, but run what CI ran before test
           # selection existed. 'false': run only the selected tests.
-          DRY_RUN: "true"
+          DRY_RUN: "false"
           FULL_SUITE: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:triton-355') }}
         run: |
           set -euo pipefail
