@@ -34,6 +34,7 @@ Entry points are ``gemm_a16w16`` and ``flydsl_hgemm``; the table is tuned by
 (``pingpong``, ``buffered_load``, ``direct_store``, ``split_k_reduce``).
 """
 
+import contextlib
 import csv
 import functools
 import inspect
@@ -143,6 +144,8 @@ class Gfx942LoadContext:
     uni_copy_atom: Any
 
 
+# Cached: building the frozen param struct costs ~90 us of host time per launch.
+@functools.cache
 def make_gemm_a16w16_gfx942_param(
     in_dtype_id: int = GEMM_A16W16_DTYPE_BF16,
     out_dtype_id: int = GEMM_A16W16_DTYPE_BF16,
@@ -1521,9 +1524,13 @@ def _dynamic_tensor_arg(tensor, leading_dim):
     )
 
 
-@functools.lru_cache(maxsize=128)
+@functools.cache
 def get_split_k_buffers(stream, device, split_k, split_k_reduce):
     """Split-K tile semaphores and signals, one set per split_k and split_k_reduce.
+
+    Also one per stream, since launches on two streams may overlap. Sets
+    (12 KB each) live for the process: a captured CUDA graph keeps using them,
+    so they are never evicted.
 
     Zeroed once, never reset by the host. Atomic split-K (``SplitKProtocol``)
     never resets its 64-bit tickets: each launch advances them by split_k,
@@ -1537,31 +1544,6 @@ def get_split_k_buffers(stream, device, split_k, split_k_reduce):
         semaphore = torch.zeros((SPLIT_K_MAX_TILES,), dtype=sem_dtype, device=device)
         signal = torch.zeros((SPLIT_K_MAX_TILES,), dtype=torch.int32, device=device)
     return semaphore, signal
-
-
-_SPLIT_K_WORKSPACE: dict = {}
-# Outgrown workspaces stay allocated: a captured CUDA graph may still use them.
-_RETIRED_SPLIT_K_WORKSPACES: list = []
-
-
-def get_split_k_workspace(stream, device, numel: int) -> torch.Tensor:
-    """Grow-only fp32 scratch for split_k_reduce partial tiles (never needs zeroing).
-
-    One per stream: launches on one stream run in order, launches on two
-    streams may overlap. Each growth at least doubles it, so the retired
-    buffers together stay smaller than the live one.
-    """
-    device = torch.device(device)
-    key = (device, stream)
-    ws = _SPLIT_K_WORKSPACE.get(key)
-    if ws is None or ws.numel() < numel:
-        if ws is not None:
-            _RETIRED_SPLIT_K_WORKSPACES.append(ws)
-            numel = max(numel, 2 * ws.numel())
-        with persistent_alloc(device):
-            ws = torch.empty((numel,), dtype=torch.float32, device=device)
-        _SPLIT_K_WORKSPACE[key] = ws
-    return ws
 
 
 # Search space of the fallback config and of the tuner's pingpong screen:
@@ -1898,8 +1880,9 @@ def gemm_a16w16(
     """
     if bias is not None:
         raise NotImplementedError("gfx942 GEMM bias fusion is not implemented yet")
+    current = torch.cuda.current_stream()
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = current
     if layout.lower() != "nt":
         raise ValueError(
             f"gfx942 GEMM supports the 'nt' layout only (got {layout!r}); "
@@ -1917,13 +1900,10 @@ def gemm_a16w16(
         out_dtype = a.dtype if out is None else out.dtype
     if out_dtype not in (a.dtype, torch.float32):
         raise ValueError(f"unsupported output dtype {out_dtype}")
-    if out is None:
-        out = torch.empty((m, n), dtype=out_dtype, device=a.device)
-    else:
+    if out is not None:
         assert out.dtype == out_dtype and out.device == a.device
         assert out.is_contiguous()
-    out = out.view(-1, n)
-    assert out.shape[0] == m
+        assert out.numel() == m * n
 
     # Param defaults, overlaid by the shape's tuned-table row (else the
     # cost-model fallback), then by any caller overrides.
@@ -1948,15 +1928,11 @@ def gemm_a16w16(
     # end. f32-output split-K accumulates in place with f32 atomics.
     # split_k_reduce writes the final dtype directly.
     f32_accum_for_bf16 = (
-        split_k > 1 and not split_k_reduce and out.dtype is torch.bfloat16
+        split_k > 1 and not split_k_reduce and out_dtype is torch.bfloat16
     )
-    if f32_accum_for_bf16:
-        kernel_out = torch.empty((m, n), dtype=torch.float32, device=a.device)
-    else:
-        kernel_out = out
     kwargs["out_dtype_id"] = (
         GEMM_A16W16_DTYPE_FP32
-        if kernel_out.dtype is torch.float32
+        if f32_accum_for_bf16 or out_dtype is torch.float32
         else GEMM_A16W16_DTYPE_BF16
     )
 
@@ -1965,37 +1941,53 @@ def gemm_a16w16(
         raise ValueError(error)
     param = make_gemm_a16w16_gfx942_param(**kwargs)
 
-    semaphore, signal = get_split_k_buffers(stream, a.device, split_k, split_k_reduce)
-    if split_k_reduce:
-        num_tiles = ((m + param.block_m - 1) // param.block_m) * (
-            (n + param.block_n - 1) // param.block_n
-        )
-        workspace = get_split_k_workspace(
-            stream, a.device, num_tiles * split_k * param.block_m * param.block_n
-        )
-    else:
-        workspace = signal
-    a_arg = _dynamic_tensor_arg(a, 1)
-    b_arg = _dynamic_tensor_arg(b, 0)
-    out_arg = _dynamic_tensor_arg(kernel_out, 1)
-    dispatch_args = (
-        out_arg,
-        a_arg,
-        b_arg,
-        semaphore,
-        signal,
-        workspace,
-        split_k,
-        param,
-        stream,
+    # Allocate on the launch stream, so the caching allocator orders reuse of
+    # these buffers after the kernel, and copy back on it. Entering the stream
+    # context costs ~8 us of host time, so it is skipped when already current.
+    on_stream = (
+        contextlib.nullcontext() if stream == current else torch.cuda.stream(stream)
     )
-    run_cached(
-        gemm_a16w16_gfx942,
-        *dispatch_args,
-        constexpr_param=param,
-        compiler=flyc.compile,
-        dispatch_args=dispatch_args,
-    )
-    if f32_accum_for_bf16:
-        out.copy_(kernel_out)
+    with on_stream:
+        if out is None:
+            out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+        out = out.view(m, n)
+        if f32_accum_for_bf16:
+            kernel_out = torch.empty((m, n), dtype=torch.float32, device=a.device)
+        else:
+            kernel_out = out
+        semaphore, signal = get_split_k_buffers(
+            stream, a.device, split_k, split_k_reduce
+        )
+        if split_k_reduce:
+            # Partial tiles of every split; the last split of a tile reduces them.
+            num_tiles = ((m + param.block_m - 1) // param.block_m) * (
+                (n + param.block_n - 1) // param.block_n
+            )
+            workspace = torch.empty(
+                (num_tiles * split_k * param.block_m * param.block_n,),
+                dtype=torch.float32,
+                device=a.device,
+            )
+        else:
+            workspace = signal
+        dispatch_args = (
+            _dynamic_tensor_arg(kernel_out, 1),
+            _dynamic_tensor_arg(a, 1),
+            _dynamic_tensor_arg(b, 0),
+            semaphore,
+            signal,
+            workspace,
+            split_k,
+            param,
+            stream,
+        )
+        run_cached(
+            gemm_a16w16_gfx942,
+            *dispatch_args,
+            constexpr_param=param,
+            compiler=flyc.compile,
+            dispatch_args=dispatch_args,
+        )
+        if f32_accum_for_bf16:
+            out.copy_(kernel_out)
     return out

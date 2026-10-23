@@ -576,25 +576,32 @@ def test_gemm_a16w16_gfx942_split_k_launch_sequence():
             _assert_close(y, ref, f"launch {i} split_k_reduce={reduce}")
 
 
-def test_gemm_a16w16_gfx942_split_k_workspace_growth(monkeypatch):
-    """Exact first size, at least doubling growth, outgrown buffers kept alive,
-    and one workspace per stream."""
+@pytest.mark.parametrize(
+    "split",
+    [
+        {"split_k": 1},
+        {"split_k": 4, "split_k_reduce": True},
+        {"split_k": 4, "split_k_reduce": False},
+    ],
+    ids=["no-split-k", "workspace-split-k", "atomic-split-k"],
+)
+def test_gemm_a16w16_gfx942_explicit_stream(split):
+    """A launch on a delayed side stream is complete once that stream is:
+    no host-side allocation or copy runs ahead on the current stream."""
     _require_gfx942()
-    import aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 as g
-
-    monkeypatch.setattr(g, "_SPLIT_K_WORKSPACE", {})
-    monkeypatch.setattr(g, "_RETIRED_SPLIT_K_WORKSPACES", [])
-    stream = torch.cuda.current_stream()
-    first = g.get_split_k_workspace(stream, "cuda", 1000)
-    assert first.numel() == 1000
-    assert g.get_split_k_workspace(stream, "cuda", 600) is first
-    grown = g.get_split_k_workspace(stream, "cuda", 1500)
-    assert grown.numel() == 2000
-    assert g._RETIRED_SPLIT_K_WORKSPACES == [first]
-    live = g.get_split_k_workspace(stream, "cuda", 5000)
-    assert live.numel() == 5000
-    other = g.get_split_k_workspace(torch.cuda.Stream(), "cuda", 1000)
-    assert other.data_ptr() != live.data_ptr()
+    m, n, k = 256, 256, 2048
+    x, w, ref = _inputs(m, n, k)
+    cfg = {"block_m": 64, "block_n": 64, "block_k": 64, "stages": 2, **split}
+    # Compile first, so the delay below is not spent compiling. Negated input:
+    # a buffer the allocator hands back from this call holds -ref, not ref.
+    gemm_a16w16(-x, w.t(), layout="nt", user_kwargs=cfg)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(200_000_000)
+    y = gemm_a16w16(x, w.t(), layout="nt", user_kwargs=cfg, stream=stream)
+    stream.synchronize()
+    _assert_close(y, ref, f"explicit stream {split}")
 
 
 if __name__ == "__main__":
