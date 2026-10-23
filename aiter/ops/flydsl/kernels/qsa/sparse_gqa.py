@@ -14,10 +14,10 @@ gfx950 decode still overlays one tile. Only gfx950 prefill stores K and V
 separately (``split_kv_lds``) and gathers this tile's V after K is
 visible so QK can run while V is in flight.  Softmax stays in registers
 (full-D QK on every wave, in-wave P transpose); LDS is MMA scratch only.
-Expand, partial RoPE, and the sigmoid output gate remain outside K2.
+Expand, partial RoPE, and the sigmoid output gate remain outside paged GQA.
 
 The GQA shape is a build parameter: the caller's tensors supply it.
-Host dispatch lives in ``aiter.ops.flydsl.qsa``.
+Host dispatch lives in ``aiter.ops.flydsl.qsa_paged``.
 """
 
 import flydsl.compiler as flyc
@@ -153,7 +153,7 @@ def _merge_slice(head_dim: int) -> int:
     return 64 if head_dim % 64 == 0 else 32
 
 
-def _k2_coverage_reason(
+def _paged_gqa_coverage_reason(
     head_dim: int,
     block_n: int,
     block_threads: int,
@@ -231,10 +231,10 @@ def build_qsa_sparse_gqa_module(
     merge_per_lane = (n_splits + 63) // 64
     merge_slots = merge_per_lane * 64
     merge_slice = _merge_slice(head_dim)
-    # Same predicate qsa_sparse_gqa_supported applies to the selected launch. Raising
+    # Same predicate flydsl_qsa_paged_gqa_supported applies to the selected launch. Raising
     # here keeps a direct builder call from StopIteration on an empty gather
     # or from compiling a kernel that writes only a prefix of D.
-    coverage = _k2_coverage_reason(head_dim, block_n, block_threads)
+    coverage = _paged_gqa_coverage_reason(head_dim, block_n, block_threads)
     if coverage is not None:
         raise ValueError(coverage)
 
