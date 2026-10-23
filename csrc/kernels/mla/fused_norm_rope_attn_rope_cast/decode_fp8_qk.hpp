@@ -153,6 +153,38 @@ struct Fp8QkSource64 : PackedDecodeSource64<true, PageSize>
     }
 };
 
+// Carry raw-K prefetch across independent prefix and extend CSR ranges.
+// Padding each source to a tile preserves the original masks and row order.
+struct Fp8QkTwoSource64 : Fp8QkSource64<-3>
+{
+    mutable Fp8QkSource64<-3> current;
+    Fp8QkSource64<-3> extend;
+    int prefix_tiles;
+    mutable int source_begin = 0;
+
+    __device__ __forceinline__ int32_t prefetch_index(int i) const
+    {
+        // Indices are prefetched in tile order. Switch before loading the first
+        // extend index, retaining int32 values until raw-K prefetch consumes them.
+        // Every lane requests one row of the same tile. Make this uniform
+        // explicitly so current source pointers and strides remain in SGPRs.
+        if(__builtin_amdgcn_readfirstlane(i / 32) == prefix_tiles)
+        {
+            current      = extend;
+            source_begin = prefix_tiles * 32;
+        }
+        return current.prefetch_index(i - source_begin);
+    }
+    __device__ __forceinline__ RawTile prefetch_row(int64_t row, int wave, int lane) const
+    {
+        return current.prefetch_row(row, wave, lane);
+    }
+    __device__ __forceinline__ RawTile prefetch(int tile, int wave, int lane) const
+    {
+        return prefetch_row(prefetch_index(tile * 32 + (lane / 8) * 4 + wave), wave, lane);
+    }
+};
+
 namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1 {
 template <class Traits, bool H64Schedule = false, class Source>
 __device__ void fp8_qk_decode_accum64(const Source& source,

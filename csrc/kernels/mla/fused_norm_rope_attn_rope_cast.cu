@@ -608,7 +608,8 @@ template <bool RotateQ,
           int PageSize,
           bool PreparedQ   = false,
           bool H64Schedule = false,
-          bool QNorm       = false>
+          bool QNorm       = false,
+          bool TwoSources  = false>
 __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_decode_64(
     FusedNormRopeAttnRopeCastArgs a)
 {
@@ -698,54 +699,96 @@ __global__ __launch_bounds__(256, 1) void fused_norm_rope_attn_rope_cast_fp8_qk_
     });
     constexpr float log2e = 1.4426950408889634f;
     float m = -__FLT_MAX__, actual_max = -INFINITY, l = 0;
-    int begin = max(0, min(a.prefix_capacity, a.prefix_indptr[t]));
-    int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
-    if(end > begin)
+    if constexpr(PageSize == -3 && TwoSources)
     {
-        Fp8QkSource64<PageSize> src{{a.pool,
-                                     a.prefix_at<PageSize>(begin),
-                                     end - begin,
-                                     (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
-                                     a.cache}};
-        fp8_qk_decode_accum64<T, H64Schedule>(src,
-                                              end - begin,
-                                              (end - begin + 31) / 32,
-                                              reinterpret_cast<char*>(kv_tile),
-                                              q,
-                                              q_scales,
-                                              raw_k,
-                                              o,
-                                              actual_max,
-                                              m,
-                                              l,
-                                              a.softmax_scale * log2e);
-    }
-    // Both sources contribute to one online softmax; normalize only after the second.
-    if constexpr(PageSize == -3)
-    {
+        const int begin  = max(0, min(a.prefix_capacity, a.prefix_indptr[t]));
+        const int end    = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
+        int extend_begin = 0, extend_end = 0;
         if(a.extend_indptr)
         {
-            begin = max(0, min(a.extend_capacity, a.extend_indptr[t]));
-            end   = max(begin, min(a.extend_capacity, a.extend_indptr[t + 1]));
-            if(end > begin)
+            extend_begin = max(0, min(a.extend_capacity, a.extend_indptr[t]));
+            extend_end   = max(extend_begin, min(a.extend_capacity, a.extend_indptr[t + 1]));
+        }
+        const int prefix_tiles = (end - begin + 31) / 32;
+        const int tiles        = prefix_tiles + (extend_end - extend_begin + 31) / 32;
+        if(tiles)
+        {
+            Fp8QkSource64<-3> prefix{{a.pool,
+                                      a.prefix ? a.prefix_at<-3>(begin) : nullptr,
+                                      end - begin,
+                                      a.cache.num_rows,
+                                      a.cache}};
+            Fp8QkSource64<-3> extend{{reinterpret_cast<const uint8_t*>(a.extend_kv),
+                                      a.extend ? a.extend + extend_begin : nullptr,
+                                      extend_end - extend_begin,
+                                      a.extend_rows,
+                                      a.extend_cache}};
+            Fp8QkTwoSource64 src{{}, prefix, extend, prefix_tiles};
+            fp8_qk_decode_accum64<T, H64Schedule>(src,
+                                                  end - begin + extend_end - extend_begin,
+                                                  tiles,
+                                                  reinterpret_cast<char*>(kv_tile),
+                                                  q,
+                                                  q_scales,
+                                                  raw_k,
+                                                  o,
+                                                  actual_max,
+                                                  m,
+                                                  l,
+                                                  a.softmax_scale * log2e);
+        }
+    }
+    else
+    {
+        int begin = max(0, min(a.prefix_capacity, a.prefix_indptr[t]));
+        int end   = max(begin, min(a.prefix_capacity, a.prefix_indptr[t + 1]));
+        if(end > begin)
+        {
+            Fp8QkSource64<PageSize> src{{a.pool,
+                                         a.prefix_at<PageSize>(begin),
+                                         end - begin,
+                                         (PageSize == -2 ? a.cache.num_rows : a.pool_bytes),
+                                         a.cache}};
+            fp8_qk_decode_accum64<T, H64Schedule>(src,
+                                                  end - begin,
+                                                  (end - begin + 31) / 32,
+                                                  reinterpret_cast<char*>(kv_tile),
+                                                  q,
+                                                  q_scales,
+                                                  raw_k,
+                                                  o,
+                                                  actual_max,
+                                                  m,
+                                                  l,
+                                                  a.softmax_scale * log2e);
+        }
+        // Both sources contribute to one online softmax; normalize only after the second.
+        if constexpr(PageSize == -3)
+        {
+            if(a.extend_indptr)
             {
-                Fp8QkSource64<-3> src{{reinterpret_cast<const uint8_t*>(a.extend_kv),
-                                       a.extend + begin,
-                                       end - begin,
-                                       a.extend_rows,
-                                       a.extend_cache}};
-                fp8_qk_decode_accum64<T, H64Schedule>(src,
-                                                      end - begin,
-                                                      (end - begin + 31) / 32,
-                                                      reinterpret_cast<char*>(kv_tile),
-                                                      q,
-                                                      q_scales,
-                                                      raw_k,
-                                                      o,
-                                                      actual_max,
-                                                      m,
-                                                      l,
-                                                      a.softmax_scale * log2e);
+                begin = max(0, min(a.extend_capacity, a.extend_indptr[t]));
+                end   = max(begin, min(a.extend_capacity, a.extend_indptr[t + 1]));
+                if(end > begin)
+                {
+                    Fp8QkSource64<-3> src{{reinterpret_cast<const uint8_t*>(a.extend_kv),
+                                           a.extend + begin,
+                                           end - begin,
+                                           a.extend_rows,
+                                           a.extend_cache}};
+                    fp8_qk_decode_accum64<T, H64Schedule>(src,
+                                                          end - begin,
+                                                          (end - begin + 31) / 32,
+                                                          reinterpret_cast<char*>(kv_tile),
+                                                          q,
+                                                          q_scales,
+                                                          raw_k,
+                                                          o,
+                                                          actual_max,
+                                                          m,
+                                                          l,
+                                                          a.softmax_scale * log2e);
+                }
             }
         }
     }
@@ -957,7 +1000,7 @@ __global__ __launch_bounds__(512, 1) void fused_norm_rope_attn_rope_cast_decode_
 #endif
 }
 
-template <int PageSize>
+template <int PageSize, bool TwoSources = false>
 hipError_t
 launch_cache_mode(const FusedNormRopeAttnRopeCastArgs* a, int rotate_q, hipStream_t stream)
 {
@@ -973,39 +1016,71 @@ launch_cache_mode(const FusedNormRopeAttnRopeCastArgs* a, int rotate_q, hipStrea
             if(a->heads == 64)
             {
                 if(a->q_scale)
-                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false, PageSize, true, true>
+                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false,
+                                                                    PageSize,
+                                                                    true,
+                                                                    true,
+                                                                    false,
+                                                                    TwoSources>
                         <<<grid, 256, 0, stream>>>(*a);
                 else if(a->q_norm)
                     fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true,
                                                                     PageSize,
                                                                     false,
                                                                     true,
-                                                                    true>
+                                                                    true,
+                                                                    TwoSources>
                         <<<grid, 256, 0, stream>>>(*a);
                 else if(rotate_q)
-                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true, PageSize, false, true>
+                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true,
+                                                                    PageSize,
+                                                                    false,
+                                                                    true,
+                                                                    false,
+                                                                    TwoSources>
                         <<<grid, 256, 0, stream>>>(*a);
                 else
-                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false, PageSize, false, true>
+                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false,
+                                                                    PageSize,
+                                                                    false,
+                                                                    true,
+                                                                    false,
+                                                                    TwoSources>
                         <<<grid, 256, 0, stream>>>(*a);
             }
             else
             {
                 if(a->q_scale)
-                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false, PageSize, true>
+                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false,
+                                                                    PageSize,
+                                                                    true,
+                                                                    false,
+                                                                    false,
+                                                                    TwoSources>
                         <<<grid, 256, 0, stream>>>(*a);
                 else if(a->q_norm)
                     fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true,
                                                                     PageSize,
                                                                     false,
                                                                     false,
-                                                                    true>
+                                                                    true,
+                                                                    TwoSources>
                         <<<grid, 256, 0, stream>>>(*a);
                 else if(rotate_q)
-                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true, PageSize>
+                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<true,
+                                                                    PageSize,
+                                                                    false,
+                                                                    false,
+                                                                    false,
+                                                                    TwoSources>
                         <<<grid, 256, 0, stream>>>(*a);
                 else
-                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false, PageSize>
+                    fused_norm_rope_attn_rope_cast_fp8_qk_decode_64<false,
+                                                                    PageSize,
+                                                                    false,
+                                                                    false,
+                                                                    false,
+                                                                    TwoSources>
                         <<<grid, 256, 0, stream>>>(*a);
             }
             return hipGetLastError();
@@ -1098,7 +1173,11 @@ hipError_t launch_fused_norm_rope_attn_rope_cast(const FusedNormRopeAttnRopeCast
 {
     switch(a->cache.page_size)
     {
-    case -3: return launch_cache_mode<-3>(a, rotate_q, stream); // Two strided FP8 sources.
+    case -3:
+        // Capacities are host metadata; single-source requests keep their original kernel.
+        if(a->prefix_capacity > 0 && a->extend_capacity > 0)
+            return launch_cache_mode<-3, true>(a, rotate_q, stream);
+        return launch_cache_mode<-3>(a, rotate_q, stream);
     case -2: return launch_cache_mode<-2>(a, rotate_q, stream); // Contiguous BF16 rows.
     case 0: return launch_cache_mode<0>(a, rotate_q, stream);
     case 32: return launch_cache_mode<32>(a, rotate_q, stream);

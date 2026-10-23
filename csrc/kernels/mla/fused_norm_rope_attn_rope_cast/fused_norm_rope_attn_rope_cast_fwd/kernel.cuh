@@ -1841,29 +1841,47 @@ __device__ __forceinline__ bool indices_valid(const FusedNormRopeAttnRopeCastPar
     __shared__ int invalid_wave[4];
     const int t = blockIdx.x, lane = threadIdx.x % 64, warp = threadIdx.x / 64;
     bool valid = true;
-    for(int segment = 0; segment < 2; ++segment)
+    if constexpr(T::CACHE_MODE == 0 && T::RAW_Q)
     {
-        const auto* ptr = segment ? a.kv_indptr_extend : a.kv_indptr_prefix;
-        const auto* ids = segment ? a.kv_indices_extend : a.kv_indices_prefix;
-        if(!ptr)
-            continue;
-        const int cap   = segment ? a.extend_capacity : a.prefix_capacity;
-        const int begin = min(cap, max(0, ptr[t]));
-        const int end   = max(begin, min(cap, ptr[t + 1]));
-        for(int i = begin + threadIdx.x; i < end; i += 256)
+        // Validate the two independent row spaces without a dynamic source loop.
+        // A single unsigned comparison also rejects negative row indices.
+        auto validate = [&](const int* ptr, const int* ids, int cap, int rows) {
+            if(!ptr)
+                return;
+            const int begin = min(cap, max(0, ptr[t]));
+            const int end   = max(begin, min(cap, ptr[t + 1]));
+            for(int i = begin + threadIdx.x; i < end; i += 256)
+                valid &= uint32_t(ids[i]) < uint32_t(rows);
+        };
+        validate(a.kv_indptr_prefix, a.kv_indices_prefix, a.prefix_capacity, a.total_pages);
+        validate(a.kv_indptr_extend, a.kv_indices_extend, a.extend_capacity, a.total_tokens);
+    }
+    else
+    {
+        for(int segment = 0; segment < 2; ++segment)
         {
-            if constexpr(T::CACHE_MODE == 1)
+            const auto* ptr = segment ? a.kv_indptr_extend : a.kv_indptr_prefix;
+            const auto* ids = segment ? a.kv_indices_extend : a.kv_indices_prefix;
+            if(!ptr)
+                continue;
+            const int cap   = segment ? a.extend_capacity : a.prefix_capacity;
+            const int begin = min(cap, max(0, ptr[t]));
+            const int end   = max(begin, min(cap, ptr[t + 1]));
+            for(int i = begin + threadIdx.x; i < end; i += 256)
             {
-                const int64_t id = reinterpret_cast<const int64_t*>(ids)[i];
-                valid            = valid && id >= 0 && (id & 7) == 1 && a.pool_bytes >= 528 &&
-                        (uint64_t(id) >> 1) <= uint64_t(a.pool_bytes - 528);
-            }
-            else
-            {
-                const int id = ids[i];
-                const int rows =
-                    T::CACHE_MODE == 0 ? (segment ? a.total_tokens : a.total_pages) : a.cache_rows;
-                valid = valid && id >= 0 && id < rows;
+                if constexpr(T::CACHE_MODE == 1)
+                {
+                    const int64_t id = reinterpret_cast<const int64_t*>(ids)[i];
+                    valid            = valid && id >= 0 && (id & 7) == 1 && a.pool_bytes >= 528 &&
+                            (uint64_t(id) >> 1) <= uint64_t(a.pool_bytes - 528);
+                }
+                else
+                {
+                    const int id   = ids[i];
+                    const int rows = T::CACHE_MODE == 0 ? (segment ? a.total_tokens : a.total_pages)
+                                                        : a.cache_rows;
+                    valid          = valid && id >= 0 && id < rows;
+                }
             }
         }
     }
