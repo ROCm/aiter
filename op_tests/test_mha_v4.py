@@ -4,6 +4,9 @@
 import argparse
 import itertools
 import math
+import os
+import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -38,7 +41,6 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
     MHA_V4_MXFP4_V_SCALE_TILE_BYTES,
     MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES,
-    MHA_V4_QUERY_TILE_ROWS,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -49,7 +51,6 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
-    quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
@@ -970,36 +971,65 @@ def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
     assert coalesced.stride() == (3 * tiles * 8192, 64, tiles * 8192, 1)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
-@pytest.mark.parametrize("sequence", [1, 255, 256, 257, 513])
-@pytest.mark.parametrize(
-    "quantize",
-    [
-        lambda t: quantize_mxfp8_q(t, 1.0),
-        lambda t: quantize_mxfp4_q(t, 1.0),
-        lambda t: quantize_mxfp6_q(t, 1.0),
-    ],
-    ids=["mxfp8", "mxfp4", "mxfp6"],
-)
-def test_mha_v4_q_scale_backing_storage_covers_query_tile(quantize, sequence):
-    """The ASM Q-scale gather addresses all 256 rows of the tile it is running.
+def _llvm_objdump():
+    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    return shutil.which("llvm-objdump") or shutil.which(
+        "llvm-objdump", path=f"{rocm}/llvm/bin"
+    )
 
-    A partial final tile therefore reads past the logical sequence, so the backing storage must
-    cover the padded tile and read as zero. Without it those loads walk off the tensor and fault
-    the GPU at an unrelated later synchronization.
+
+@pytest.mark.skipif(_llvm_objdump() is None, reason="llvm-objdump not available")
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
+    """No DISPATCHABLE fmha_v4 object may fetch a scale with an unguarded global load.
+
+    This is the contract that lets the quant producers allocate Q scales at their logical
+    extent: the gather is clamped by its buffer descriptor's num_records, so the query tile's
+    overshoot past the sequence end reads zero instead of walking off the tensor. Nothing else
+    can catch a regression -- the overshot rows are past seqlen_q, so their values never reach
+    the output and every numeric test passes either way; the symptom is a fault at an unrelated
+    later synchronization, and only when the over-read crosses an unmapped page.
+
+    Driven off the manifest rather than the directory because fwd_hd128_f4f4*.co still ship
+    unguarded and are commented out there. Re-enabling a row without rebuilding it should fail
+    here.
     """
-    heads = 3
-    value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
-    _, scale = quantize(value)
+    asm_dir = os.environ.get(
+        "AITER_ASM_DIR", os.path.join(mha_v4_module.AITER_ROOT_DIR, "hsa")
+    )
+    root = os.path.join(asm_dir, arch, "fmha_v4_fwd")
+    with open(os.path.join(root, "fmha_v4_fwd.csv"), encoding="utf-8") as manifest:
+        rows = [
+            line.strip().split(",")
+            for line in manifest
+            if line.strip() and not line.startswith("#")
+        ]
+    header, rows = rows[0], rows[1:]
+    co_names = sorted({row[header.index("co_name")] for row in rows})
+    assert co_names, f"no dispatchable fmha_v4 rows for {arch}"
 
-    padded = -(-sequence // MHA_V4_QUERY_TILE_ROWS) * MHA_V4_QUERY_TILE_ROWS
-    slack = (padded - sequence) * heads * 4
-    assert scale.shape == (2, sequence, heads, 4)
-    assert scale.is_contiguous()
-    assert scale.untyped_storage().nbytes() == scale.numel() + slack
-    assert torch.equal(
-        scale.as_strided((slack,), (1,), scale.numel()),
-        torch.zeros(slack, device="cuda", dtype=torch.uint8),
+    # global_load_lds_dword is the bulk K-tile stage into LDS, not a scale fetch; it is bounded
+    # by the FP4 K/V slack the producers still reserve.
+    gather = re.compile(r"\bglobal_load_(?:dword|ubyte)\b")
+    offenders = {}
+    for name in co_names:
+        # gfx942 names its objects with an MI300/ prefix; gfx950 does not.
+        path = os.path.join(root, name)
+        assert os.path.isfile(
+            path
+        ), f"{arch} manifest names {name}, which is not shipped"
+        listing = subprocess.run(
+            [_llvm_objdump(), "-d", f"--mcpu={arch}", path],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        hits = len(gather.findall(listing))
+        if hits:
+            offenders[name] = hits
+    assert not offenders, (
+        f"{arch} dispatchable objects fetch scales with unguarded global loads: {offenders}; "
+        "the quant producers no longer reserve slack for an overshooting Q gather"
     )
 
 
@@ -1336,11 +1366,7 @@ def test_mha_v4_packed_rejects_wrong_scale_recipe():
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
 def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    # The Q-scale gather covers the whole 256-row query tile, so back the view with those rows.
-    scale_storage = torch.ones(
-        MHA_V4_QUERY_TILE_ROWS * 2 * 4, device="cuda", dtype=torch.uint8
-    )
-    qk_scale = scale_storage[: 128 * 2 * 4].view(1, 128, 2, 4)
+    qk_scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
     v_scale = torch.ones(1, device="cuda", dtype=torch.float32)
     mha_v4_packed(
         q,
@@ -1423,30 +1449,11 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
     """An external caller passing exact-size scales would fault the speculative gathers.
 
     clone() keeps the logical shape the size checks look at but drops the producer's
-    zeroed slack, which is exactly the shape of a caller-supplied tensor.
+    zeroed slack, which is exactly the shape of a caller-supplied tensor. Q is not checked:
+    its gather is bounded by a buffer descriptor, so it needs no slack.
     """
     torch.manual_seed(5)
     value = torch.randn((1, 257, 2, 128), device="cuda", dtype=torch.bfloat16)
-    fp8_format = native_fp8_format()
-
-    q_packed, q_scale = quantize_mxfp8_q(value, 1.0)
-    k_packed, k_scale = quantize_mxfp8_k(value)
-    v_packed, v_scale = quantize_fp8(value)
-    with pytest.raises(RuntimeError, match="speculative tile gather"):
-        mha_v4_packed(
-            q_packed,
-            k_packed,
-            v_packed,
-            q_scale.clone(),
-            k_scale,
-            v_scale,
-            fp8_format,
-            fp8_format,
-            fp8_format,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.E8M0_PER_1X32,
-            AttentionScaleMode.F32_PER_TENSOR,
-        )
 
     mxfp4_q, mxfp4_q_scale = quantize_mxfp4_q(value, 1.0)
     mxfp4_raw, mxfp4_k_scale = quantize_mxfp4_k(value)

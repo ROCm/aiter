@@ -216,10 +216,9 @@ void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* n
     }
 }
 
-// E8M0 scale gathers are unguarded global loads: they address every row of the tile they are
-// running, plus MXFP4 K's two-tile producer lead, so the final tiles read past the logical rows.
+// MXFP4 K's scale gather keeps a two-tile producer lead, so its final tiles read past the logical
+// rows. Q scales are bounded by their buffer descriptor and need no backing slack.
 constexpr int64_t kMxScaleBlocksPerRow      = 4;
-constexpr int64_t kQueryScaleTileRows       = 256;
 constexpr int64_t kKvScaleTileRows          = 128;
 constexpr int64_t kKvScaleLookaheadRows     = 2 * kKvScaleTileRows;
 constexpr int64_t kKvScaleTrailingDwordSlack = 4;
@@ -724,13 +723,6 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
         TORCH_CHECK(k_descale.sizes() ==
                         torch::IntArrayRef({shapes.batch, shapes.seqlen_k, shapes.nhead_k, 4}),
                     "MX K descale must have shape [batch, key_length, key_heads, 4]");
-        check_scale_backing_storage(q_descale,
-                                    shapes.seqlen_q,
-                                    shapes.nhead_q,
-                                    kQueryScaleTileRows,
-                                    0,
-                                    0,
-                                    "Q");
         if(recipe.k_format == format_id(AttentionFormat::Fp4E2M1))
         {
             check_scale_backing_storage(k_descale,
