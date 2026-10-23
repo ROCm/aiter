@@ -57,6 +57,7 @@ from aiter.dist.parallel_state import (
     set_custom_all_reduce,
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose
 from aiter.utility.fp4_utils import mxfp4_to_f32
 
@@ -556,7 +557,8 @@ def main():
                 "gemma_norm": True,
                 "hadamard_rotate": True,
             }
-            for shape in shapes
+            # The rotated quant needs the gfx950 hardware FP4 convert.
+            for shape in (shapes if get_gfx() == "gfx950" else [])
         ]
         # When forcing a specific kernel, only exercise shapes that the
         # kernel actually supports. Fallbacks under override would just

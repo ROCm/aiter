@@ -1569,6 +1569,9 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         (out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8),
                     __func__,
                     " hadamard_rotate requires fp4x2 output with group_size 32");
+        AITER_CHECK(get_gpu_arch() == "gfx950",
+                    __func__,
+                    " hadamard_rotate requires gfx950 hardware FP4 conversion");
     }
     if(scale_layout_m32k4)
     {

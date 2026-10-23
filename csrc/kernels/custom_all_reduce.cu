@@ -747,6 +747,9 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          bool gemma_norm,
                                          bool hadamard_rotate)
 {
+    AITER_CHECK(!hadamard_rotate || get_gpu_arch() == "gfx950",
+                __func__,
+                " hadamard_rotate requires gfx950 hardware FP4 conversion");
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype         = inp.dtype();
