@@ -25,19 +25,24 @@ Tuning a shape:
    winner only if its median beats the incumbent's by ``--margin``. Single
    runs vary by ~4%, so a screen result alone never replaces a row.
 
+A ``--shapes`` file has M, N, K columns and optional ``regime`` (a label) and
+``out_dtype`` (``bf16``/``fp32``, else ``--out-dtype``) columns, e.g. the
+table's shapes in ``aiter/configs/flydsl_gemm_a16w16_gfx942_untuned.csv``.
+
 Examples:
 
   # Seed the table with the fallback configs for a shape list.
   python op_tests/flydsl_tests/tune_gfx942_csv.py --seed \\
     --shapes op_tests/flydsl_tests/gfx942_gemm_tuning_shapes.csv
 
+
   # Tune one shape (screen 80 candidates), updating the table if a config wins.
   python op_tests/flydsl_tests/tune_gfx942_csv.py --M 1024 --N 336 --K 10240 \\
     --limit 80 --resume
 
-  # Benchmark what gemm_a16w16 runs by default (table row, else fallback).
+  # Benchmark what gemm_a16w16 runs by default on every table shape.
   python op_tests/flydsl_tests/tune_gfx942_csv.py --current-only \\
-    --shapes op_tests/flydsl_tests/gfx942_gemm_tuning_shapes.csv --csv run.csv
+    --shapes aiter/configs/flydsl_gemm_a16w16_gfx942_untuned.csv --csv run.csv
 """
 
 from __future__ import annotations
@@ -169,14 +174,16 @@ def graph_time_us(fn, iters: int, warmup: int, batch: int) -> float:
 # ---------------------------------------------------------------- files
 
 
-def read_shapes(path: Path) -> list[tuple[str, int, int, int]]:
+def read_shapes(path: Path) -> list[tuple[str, int, int, int, str | None]]:
+    """(regime, M, N, K, out_dtype) rows; regime and out_dtype columns are optional."""
     with path.open(newline="") as handle:
         return [
             (
-                row.get("regime", "unspecified"),
+                row.get("regime") or "unspecified",
                 int(row["M"]),
                 int(row["N"]),
                 int(row["K"]),
+                row.get("out_dtype") or None,
             )
             for row in csv.DictReader(handle)
         ]
@@ -621,7 +628,12 @@ def main() -> None:
     parser.add_argument("--K", type=int)
     parser.add_argument("--regime", default="manual")
     parser.add_argument("--shapes", type=Path)
-    parser.add_argument("--out-dtype", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument(
+        "--out-dtype",
+        choices=("bf16", "fp32"),
+        default="bf16",
+        help="output dtype of shapes without an out_dtype column value",
+    )
     parser.add_argument(
         "--table",
         type=Path,
@@ -689,9 +701,12 @@ def main() -> None:
     if args.shapes:
         shapes = read_shapes(args.shapes)
     elif None not in (args.M, args.N, args.K):
-        shapes = [(args.regime, args.M, args.N, args.K)]
+        shapes = [(args.regime, args.M, args.N, args.K, None)]
     else:
         parser.error("provide --M/--N/--K or --shapes")
+    bad = {dtype for *_, dtype in shapes} - {None, "bf16", "fp32"}
+    if bad:
+        parser.error(f"unsupported out_dtype in --shapes: {sorted(bad)}")
 
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     table = read_table(args.table)
@@ -700,8 +715,10 @@ def main() -> None:
         if args.seed
         else benchmark_shape if args.current_only else tune_shape
     )
-    for regime, m, n, k in shapes:
-        action(args, regime, m, n, k, table)
+    for regime, m, n, k, out_dtype in shapes:
+        shape_args = argparse.Namespace(**vars(args))
+        shape_args.out_dtype = out_dtype or args.out_dtype
+        action(shape_args, regime, m, n, k, table)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import re
 
@@ -183,20 +184,27 @@ def flydsl_hgemm(
     }
     gfx = get_gfx()
     if gfx == "gfx942":
-        if not a.is_contiguous():
-            a = a.contiguous()
-        if not b.is_contiguous():
-            b = b.contiguous()
-        return gemm_a16w16_gfx942(
-            a,
-            b.t(),
-            out=out,
-            bias=bias,
-            user_kwargs=explicit,
-            stream=launch_stream,
-            layout="nt",
-            out_dtype=out_dtype,
+        # The contiguous copies are made on the launch stream, ahead of the kernel.
+        on_stream = (
+            contextlib.nullcontext()
+            if stream is None
+            else torch.cuda.stream(launch_stream)
         )
+        with on_stream:
+            if not a.is_contiguous():
+                a = a.contiguous()
+            if not b.is_contiguous():
+                b = b.contiguous()
+            return gemm_a16w16_gfx942(
+                a,
+                b.t(),
+                out=out,
+                bias=bias,
+                user_kwargs=explicit,
+                stream=launch_stream,
+                layout="nt",
+                out_dtype=out_dtype,
+            )
 
     tile = {**_HGEMM_DEFAULT_TILE, **explicit}
     block_m, block_n, block_k = tile["block_m"], tile["block_n"], tile["block_k"]

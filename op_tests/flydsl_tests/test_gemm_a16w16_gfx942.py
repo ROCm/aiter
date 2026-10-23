@@ -537,6 +537,24 @@ def test_gemm_a16w16_gfx942_rejects_unsupported(cfg, match):
         gemm_a16w16(x, w.t(), layout="nt", user_kwargs={**tile, **cfg})
 
 
+def test_flydsl_hgemm_gfx942_explicit_stream_non_contiguous():
+    """flydsl_hgemm makes its contiguous copies on the launch stream: a delayed
+    current stream cannot leave the kernel reading unwritten copies."""
+    _require_gfx942()
+    m, n, k = 256, 256, 2048
+    x, w, ref = _inputs(m, n, k)
+    x_cm, w_cm = x.t().contiguous().t(), w.t().contiguous().t()
+    assert not x_cm.is_contiguous() and not w_cm.is_contiguous()
+    # Compile first; negated input, so a recycled copy holds -ref, not ref.
+    flydsl_hgemm(-x_cm, w_cm)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    torch.cuda._sleep(200_000_000)
+    y = flydsl_hgemm(x_cm, w_cm, stream=side)
+    torch.cuda.synchronize()
+    _assert_close(y, ref, "flydsl_hgemm non-contiguous on a side stream")
+
+
 def _invalid_inputs(case):
     x, w, _ = _inputs(64, 128, 256)
     b = w.t()

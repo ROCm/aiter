@@ -1529,7 +1529,7 @@ def get_split_k_buffers(stream, device, split_k, split_k_reduce):
     """Split-K tile semaphores and signals, one set per split_k and split_k_reduce.
 
     Also one per stream, since launches on two streams may overlap. Sets
-    (12 KB each) live for the process: a captured CUDA graph keeps using them,
+    (8-12 KB each) live for the process: a captured CUDA graph keeps using them,
     so they are never evicted.
 
     Zeroed once, never reset by the host. Atomic split-K (``SplitKProtocol``)
