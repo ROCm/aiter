@@ -3,12 +3,14 @@
 
 import functools
 
+import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils.device_info import get_num_xcds
 
 KW = 8
 KW_BIG = 8
@@ -44,8 +46,7 @@ def build_layouts(nw, kw=KW, kw_big=KW_BIG):
         "MMA_B": mma_b,
         "A_OP_B": gl.DotOperandLayout(0, mma_b, kw_big),
         "B_OP_B": gl.DotOperandLayout(1, mma_b, kw_big),
-        # Sources of the global -> LDS copies: 128 (or 32) bits per thread and
-        # no lane replication, as buffer_load_to_shared requires.
+        # Global -> LDS copy sources: no lane replication, as the copy requires.
         "BLK": gl.BlockedLayout([1, 8], [4, 16], [nw, 1], [1, 0]),
         "BLK_CC": gl.BlockedLayout([1, 2], [4, 16], [nw, 1], [1, 0]),
         # gt and beta: one element per thread.
@@ -126,14 +127,10 @@ def _issue_chunk(
     C: gl.constexpr,
     WITH_OUTPUT: gl.constexpr,
 ):
-    """Start fetching one chunk into LDS by async copy, as one commit group.
+    """Start the async copy of one chunk into LDS, as one commit group.
 
-    ``gt`` and ``beta`` (K1 applied its sigmoid) have fewer elements than
-    threads, and the async copy cannot lower lane replication, so they are
-    copied one element per thread (``o_t``) with the excess threads masked.
-    Tail rows of ``v`` are masked here; ``beta`` of a tail row is harmless
-    because the recurrence zeroes those rows of U anyway. ``WITH_OUTPUT``
-    (pass C) also fetches the output projection's ``qd`` and ``Mqk`` tiles.
+    ``gt`` and ``beta`` are copied one element per thread (``o_t``), excess
+    threads masked. ``WITH_OUTPUT`` (pass C) also fetches ``qd`` and ``Mqk``.
     """
     tb = t0 * H
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -212,16 +209,10 @@ def k2_ab_fused_gluon(
     independent, so the scheduler interleaves them, and that is what covers the
     serial dependence each one has on its own. Requires K == V, since the two
     states are then the same width and one program covers a column block of
-    both.
-
-    Chunk j+1's operands are fetched while chunk j computes: its tiles by async
-    global -> LDS copy into the other half of a double buffer, so the prefetch
-    costs no registers (a register prefetch halves occupancy). Without it the
-    kernel spent a third or more of its wave-cycles waiting on loads issued and
-    consumed in the same iteration.
+    both. Chunk j+1 is async-copied into the other half of an LDS double buffer
+    while chunk j computes.
     """
-    # Keeps a (segment, head)'s V blocks on one XCD, so their re-reads of the
-    # chunk workspace share an L2. See the Triton K2 for the full reasoning.
+    # Keeps a (segment, head)'s V blocks on one XCD, sharing an L2.
     n_w = gl.num_programs(0)
     pid = remap_xcd(
         gl.program_id(1) * n_w + gl.program_id(0), n_w * gl.num_programs(1), NUM_XCDS
@@ -263,8 +254,6 @@ def k2_ab_fused_gluon(
     s_kr = gl.allocate_shared_memory(gl.bfloat16, [2, C, K], SH_WS)
     s_inv = gl.allocate_shared_memory(inv_ty, [2, C, C], SH_PLAIN)
     s_v = gl.allocate_shared_memory(v_input.dtype.element_ty, [2, C, BW], SH_PLAIN)
-    # gt / beta live in LDS until their use, so the per-thread copies of the MMA
-    # slice layout are only materialized there.
     s_gt = gl.allocate_shared_memory(gl.float32, [2, NT], SH_1D)
     s_beta = gl.allocate_shared_memory(gl.float32, [2, NT], SH_1D)
 
@@ -281,9 +270,7 @@ def k2_ab_fused_gluon(
 
     for j in range(n_chunks):
         cur = j % 2
-        # Chunk j has landed in half `cur` (every thread's copies, once past the
-        # barrier the wait carries), and every thread is done reading the other
-        # half, which held chunk j-1, before it is refilled.
+        # Chunk j is in half `cur`, and every thread is done with half 1 - cur.
         gl.amd.cdna4.async_copy.wait_group(0)
         if j + 1 < n_chunks:
             _issue_chunk(ws_kd, ws_kr, ws_gt, ws_beta, ws_inv_mqk, v_input, None,
@@ -294,7 +281,7 @@ def k2_ab_fused_gluon(
                          cc_off, v_off, o_c_v, o_t, H, K, V, C, False)  # fmt: skip
 
         kd_a = gl.amd.cdna4.async_copy.load_shared_relaxed(s_kd.index(cur), A_OP_B)
-        # ws_kr is [C, K] in memory; the permuted view is the kr^T A operand.
+        # The permuted [C, K] view is the kr^T A operand.
         kr_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
             s_kr.index(cur).permute((1, 0)), A_OP
         )
@@ -388,14 +375,11 @@ def k2_c_gluon(
     NUM_XCDS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Pass C (the output pass): the recurrence of one segment from its incoming state.
+    """Pass C: one segment's recurrence from its incoming state, writing outputs.
 
     Same contract as ``_flash_kda_segment_kernel`` with ``COMPUTE_OUTPUT`` and
-    ``HAS_V`` and without ``STORE_H_OUT``, paged ``state_cache`` included. Chunk
-    j+1's tiles are prefetched into LDS while chunk j computes, as in the fused
-    pass A. The output is stored straight from the MFMA layout: converting it
-    for a wider store costs an LDS round trip and enough scratch to cost
-    occupancy at BW=128.
+    ``HAS_V`` and without ``STORE_H_OUT``, paged ``state_cache`` included.
+    Prefetches like pass A. The output is stored from the MFMA layout.
     """
     n_w = gl.num_programs(0)
     pid = remap_xcd(
@@ -410,11 +394,8 @@ def k2_c_gluon(
     n_chunks = gl.load(seg_nchunks + i_seg)
     tok_base = gl.load(seg_tok_base + i_seg).to(gl.int64)
     tok_end = gl.load(seg_tok_end + i_seg).to(gl.int64)
-    # Read up front, not after the loop: past the output stores the compiler
-    # must assume these words may have changed and loads them per lane, which
-    # leaves the final-state store a waterfall loop over a non-uniform pointer.
-    # When STORE_FINAL is false the final-state pointers are null and these
-    # must not be read.
+    # Read before the output stores, after which the compiler reloads them per
+    # lane (a waterfall loop on the final-state store). Null unless needed.
     if STORE_FINAL or PAGED_CACHE:
         i_n = gl.load(seg_seq + i_seg).to(gl.int64)
     if STORE_FINAL:
@@ -460,8 +441,7 @@ def k2_c_gluon(
     s_beta = gl.allocate_shared_memory(gl.float32, [2, NT], SH_1D)
 
     if PAGED_H_IN:
-        # A zero-start sequence's slot may hold a previous owner's state: mask
-        # the load so it is never read, not read and then discarded.
+        # A zero-start sequence's slot may hold a stale state: never read it.
         take = gl.load(has_initial_state + i_n).to(gl.int1)
         m_h = (o_k_m[:, None] < K) & (o_w_m[None, :] < V) & take
         h = gl.amd.cdna4.buffer_load(
@@ -512,9 +492,8 @@ def k2_c_gluon(
         )
         m_c = (t0 + o_c_m) < tok_end
 
-        # _recur's steps, split around the output projection: updating the state
-        # after it keeps the next state and kr out of registers meanwhile
-        # (1.1-1.2x on this kernel).
+        # _recur's steps, with the state update moved after the output
+        # projection to keep the next state and kr out of registers meanwhile.
         h_op = gl.convert_layout(h.to(gl.bfloat16), B_OP_B)
         tmp = gl.convert_layout(
             gl.amd.cdna4.mfma(kd_a, h_op, gl.zeros([C, BW], gl.float32, MMA_B)), MMA
@@ -562,3 +541,127 @@ def k2_c_gluon(
 
 k2_ab_fused_fast = fast_launch(k2_ab_fused_gluon)
 k2_c_fast = fast_launch(k2_c_gluon)
+
+
+def gluon_k2_ab_fused(
+    ws_kd,
+    ws_kr,
+    ws_gt,
+    ws_beta,
+    ws_inv_mqk,
+    v_input,
+    h_out_b,
+    h_out_a,
+    seg_chunk_base,
+    seg_nchunks,
+    seg_tok_base,
+    seg_tok_end,
+    TOTAL_TILES,
+    H,
+    K,
+    V,
+    C,
+    num_segs,
+    BW,
+    num_warps,
+    waves_per_eu=0,
+):
+    return k2_ab_fused_fast[(triton.cdiv(V, BW), num_segs * H)](
+        ws_kd=ws_kd,
+        ws_kr=ws_kr,
+        ws_gt=ws_gt,
+        ws_beta=ws_beta,
+        ws_inv_mqk=ws_inv_mqk,
+        v_input=v_input,
+        h_out_b=h_out_b,
+        h_out_a=h_out_a,
+        seg_chunk_base=seg_chunk_base,
+        seg_nchunks=seg_nchunks,
+        seg_tok_base=seg_tok_base,
+        seg_tok_end=seg_tok_end,
+        TOTAL_TILES=TOTAL_TILES,
+        H=H,
+        K=K,
+        V=V,
+        C=C,
+        BW=BW,
+        **build_layouts(num_warps),
+        NUM_XCDS=get_num_xcds(),
+        NUM_WARPS=num_warps,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+    )
+
+
+def gluon_k2_c(
+    ws_kd,
+    ws_qd,
+    ws_kr,
+    ws_gt,
+    ws_beta,
+    ws_inv_mqk,
+    v_input,
+    out,
+    h_in,
+    final_state,
+    seg_chunk_base,
+    seg_nchunks,
+    seg_tok_base,
+    seg_tok_end,
+    seg_seq,
+    seg_is_last,
+    state_cache,
+    state_indices,
+    has_initial_state,
+    cache_stride,
+    TOTAL_TILES,
+    H,
+    K,
+    V,
+    C,
+    num_segs,
+    BW,
+    num_warps,
+    STORE_FINAL,
+    STATE_V_FIRST,
+    CM_OUT="",
+):
+    paged = state_cache is not None
+    return k2_c_fast[(triton.cdiv(V, BW), num_segs * H)](
+        ws_kd=ws_kd,
+        ws_qd=ws_qd,
+        ws_kr=ws_kr,
+        ws_gt=ws_gt,
+        ws_beta=ws_beta,
+        ws_inv_mqk=ws_inv_mqk,
+        v_input=v_input,
+        out=out,
+        h_in=h_in,
+        final_state=final_state,
+        seg_chunk_base=seg_chunk_base,
+        seg_nchunks=seg_nchunks,
+        seg_tok_base=seg_tok_base,
+        seg_tok_end=seg_tok_end,
+        seg_seq=seg_seq,
+        seg_is_last=seg_is_last,
+        state_cache=state_cache,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
+        cache_stride=cache_stride,
+        TOTAL_TILES=TOTAL_TILES,
+        H=H,
+        K=K,
+        V=V,
+        C=C,
+        BW=BW,
+        HAS_H_IN=h_in is not None,
+        STORE_FINAL=STORE_FINAL,
+        STATE_V_FIRST=STATE_V_FIRST,
+        PAGED_CACHE=paged,
+        PAGED_H_IN=paged and h_in is None,
+        **build_layouts(num_warps),
+        NUM_XCDS=get_num_xcds(),
+        NUM_WARPS=num_warps,
+        CM_OUT=CM_OUT,
+        num_warps=num_warps,
+    )

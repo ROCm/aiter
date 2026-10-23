@@ -14,6 +14,7 @@ error rather than allclose.
 """
 
 import contextlib
+import importlib
 import math
 
 import pytest
@@ -78,8 +79,7 @@ def _route(k1: bool | None = None, k2: bool | None = None):
     flags, so a test that wants the other route sets the flags rather than the
     variable. Both default to on wherever the tile shape and the arch allow it,
     which leaves the Triton kernels unreached by every test that does not come
-    through here. ``k2=True`` also pins pass C to Gluon on the small
-    unsegmented shapes the dispatch would otherwise leave to Triton.
+    through here. ``k2=True`` also pins pass C to Gluon on small shapes.
     """
     saved = (
         _flash_kda.AITER_FDA_USE_GLUON_K1,
@@ -442,20 +442,25 @@ def test_published_k2_schedules_can_split_their_tile():
     for W in (64, 128, 256):
         for num_segs in (1, 2, 8, 64, 512):
             for H in (1, 4, 12, 64):
-                reached.add(_flash_kda._k2_gluon_schedule(W, num_segs, H)[:2])
+                sched = _flash_kda._k2_gluon_schedule(W, num_segs, H)
+                reached.add((sched.kwargs["BW"], sched.num_warps))
     assert len(reached) > 1, f"only one schedule reachable: {reached}"
     # Pass C splits its tile the same way.
-    reached |= {_flash_kda._k2c_gluon_schedule(seg)[:2] for seg in (False, True)}
+    if _flash_kda._GLUON_K2C_ARCH_OK:
+        for segmented in (False, True):
+            sched = _flash_kda._k2c_gluon_schedule(segmented)
+            reached.add((sched.kwargs["BW"], sched.num_warps))
     for bw, nw in sorted(reached):
         assert bw % 16 == 0, f"BW={bw} is not a whole number of MFMA tiles"
         assert nw <= bw // 16, f"BW={bw} cannot be split {nw} ways"
 
 
 def test_k1_schedule_comes_from_the_config(monkeypatch):
-    """K1's occupancy hint is read from the published config, and a published
-    warp count its layouts were not built for is rejected, not launched."""
-    if not _flash_kda._gluon_k1_usable(FLASH_KDA_CHUNK, K_DIM):
-        pytest.skip("this arch never routes K1 to Gluon")
+    """K1's occupancy hint comes from the config; a wrong warp count is rejected."""
+    if _flash_kda.DEVICE_ARCH != "gfx950" or not _flash_kda._gluon_k1_usable(
+        FLASH_KDA_CHUNK, K_DIM
+    ):
+        pytest.skip("only the gfx950 Gluon K1 reads its schedule itself")
     from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
         flash_kda_k1 as _g1,
     )
@@ -507,8 +512,7 @@ _CASES = {
         },
     ),
     "weak gate": lambda: (make_inputs(1, 512, 4), {"lower_bound": -0.01}),
-    # Only a segmented schedule has a pass A, so these are the cases where the
-    # Gluon pass A is reached at all -- see test_cases_reach_the_gluon_k2.
+    # Only a segmented shape has a pass A.
     "segmented": lambda: (
         make_inputs(1, 1024, 4),
         {"output_final_state": True, "chunks_per_seg": 4},
@@ -563,10 +567,7 @@ def test_routes_agree(case):
 
     Both sides write the same ABI and nothing downstream is told which one ran,
     so a divergence here is a bug in whichever kernel moved rather than a
-    tolerance to widen. Measured across these cases: K1's two implementations
-    differ at 3e-4 to 1e-3 on the output and under 3e-5 on the state, and K2's
-    pass C by an ulp or two of the output, its output projection being ordered
-    differently.
+    tolerance to widen.
     """
     args, kw = _CASES[case]()
     with _route(k1=False, k2=False):
@@ -580,20 +581,19 @@ def test_routes_agree(case):
 
 
 def test_cases_reach_the_gluon_k2():
-    """The cases above have to exercise the route they are comparing.
-
-    Pass C goes to Gluon on every shape, pass A only on segmented ones, so an
-    unsegmented case says nothing about pass A; nothing in the assertions of
-    test_routes_agree would say which kernels a case actually reached.
-    """
+    """The cases above have to exercise the route they are comparing."""
     if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
         pytest.skip("this arch or tile shape never routes K2 to Gluon")
-    from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
-        flash_kda_k2 as _g2,
+    _g2 = importlib.import_module(
+        "aiter.ops.triton._gluon_kernels."
+        f"{_flash_kda.DEVICE_ARCH}.kimi_delta_attn.flash_kda_k2"
     )
 
-    reached = {"k2_ab_fused_fast": set(), "k2_c_fast": set()}
-    saved = {name: getattr(_g2, name) for name in reached}
+    launchers = ["k2_ab_fused_fast"]
+    if _flash_kda._GLUON_K2C_ARCH_OK:
+        launchers.append("k2_c_fast")
+    reached = {name: set() for name in launchers}
+    saved = {name: getattr(_g2, name) for name in launchers}
 
     class _Counting:
         def __init__(self, name):
@@ -608,7 +608,7 @@ def test_cases_reach_the_gluon_k2():
 
             return launch
 
-    for name in reached:
+    for name in launchers:
         setattr(_g2, name, _Counting(name))
     try:
         for current, make in _CASES.items():
@@ -616,25 +616,25 @@ def test_cases_reach_the_gluon_k2():
             with _route(k1=True, k2=True):
                 run_flash(*args, **kw)
     finally:
-        for name, fn in saved.items():
-            setattr(_g2, name, fn)
+        for name in launchers:
+            setattr(_g2, name, saved[name])
 
-    want_a = {name for name in _CASES if name.startswith("segmented")}
-    missing_a = want_a - reached["k2_ab_fused_fast"]
-    missing_c = set(_CASES) - reached["k2_c_fast"]
-    assert not missing_a, f"never reached the Gluon pass A: {sorted(missing_a)}"
-    assert not missing_c, f"never reached the Gluon pass C: {sorted(missing_c)}"
+    want = {name for name in _CASES if name.startswith("segmented")}
+    missed = sorted(want - reached["k2_ab_fused_fast"])
+    assert not missed, f"never reached the Gluon pass A: {missed}"
+    if "k2_c_fast" in reached:
+        missed = sorted(set(_CASES) - reached["k2_c_fast"])
+        assert not missed, f"never reached the Gluon pass C: {missed}"
 
 
 def test_small_unsegmented_pass_c_stays_on_triton():
-    """The published floor sends few-pair unsegmented shapes to the Triton pass C.
-
-    Below it the serial walk sets the time and the Triton kernel's narrower tile
-    wins; above it, and whenever segmenting has supplied the blocks, Gluon does.
-    """
-    if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
-        pytest.skip("this arch or tile shape never routes K2 to Gluon")
-    if _flash_kda._k2c_gluon_schedule(False)[2] == 0:
+    """The published floor sends few-pair unsegmented shapes to the Triton pass C."""
+    if not (
+        _flash_kda._GLUON_K2C_ARCH_OK
+        and _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM)
+    ):
+        pytest.skip("this arch or tile shape never routes pass C to Gluon")
+    if not _flash_kda._k2c_gluon_schedule(False).kwargs.get("MIN_BLOCKS_PER_CU"):
         pytest.skip("this arch publishes no pass C floor")
     usable = _flash_kda._k2c_gluon_usable
     assert not usable(False, K_DIM, 1, 12)
@@ -888,11 +888,8 @@ def _kimi_kwargs(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
 @pytest.mark.parametrize("gluon_k2", [False, True])
 @pytest.mark.parametrize("T,chunks_per_seg", [(256, 0), (1024, 4)])
 def test_paged_cache_matches_dense(T, chunks_per_seg, gluon_k2):
-    """In-kernel paged I/O matches gather into a dense V-first state.
-
-    On both K2 routes: the two pass C kernels each carry their own paged loads
-    and stores.
-    """
+    """In-kernel paged I/O matches gather into a dense V-first state, on both
+    K2 routes."""
     if gluon_k2 and not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
         pytest.skip("this arch or tile shape never routes K2 to Gluon")
     H = 4

@@ -54,13 +54,12 @@ else:
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        # Token i's rows are loaded once, so one block spans all of K.
+        # One block spans all of K.
         "BK": lambda args: max(triton.next_power_of_2(args["K"]), 16),
     }
 )
 @triton.autotune(
-    # BH=1 idles most of a warp. The default is one config for all shapes,
-    # within 1.24x of the per-shape best on gfx950.
+    # BH=1 idles most of a warp.
     configs=autotune_configs(
         "CHUNK_DELTA_ATTN",
         [
@@ -145,8 +144,8 @@ def chunk_delta_attn_fwd_kernel_intra_token_parallel(
     m_k = o_k < K
     m_hk = m_hv[:, None] & m_k[None, :]
 
-    # Token i's rows are loaded once, outside the loop over j: re-reading them
-    # per (j, K block) made the kernel load-bound. beta is folded into k here.
+    # Token i's rows are loaded once, outside the loop over j; beta is folded
+    # into k.
     p_qk = o_h[:, None] * K + o_k[None, :]
     b_q = tl.load(q + i_t * H * K + p_qk, mask=m_hk, other=0).to(tl.float32)
     b_k = tl.load(k + i_t * H * K + p_qk, mask=m_hk, other=0).to(tl.float32)
