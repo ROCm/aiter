@@ -15,9 +15,8 @@ CDNA3 specifics:
   ``buffered_load``: a 128-bit ``buffer_load`` to registers then ``ds_write``.
 
 Main-loop pipelines (selected by the param, one per compiled kernel):
-- ``stream``: pingpong over one LDS buffer with each MMA operand set streamed
-  in two K halves; the default for most shapes.
-- ``pingpong``: one LDS buffer, two MMA operand sets, three tiles in flight.
+- ``pingpong``: one LDS buffer with the MMA operand set streamed in two K
+  halves; the default for most shapes.
 - ``buffered``: buffered_load with one or two LDS buffers.
 - ``async``: async DMA with ``stages`` LDS buffers; ``stages >= 3`` adds a
   register double buffer.
@@ -114,7 +113,6 @@ class GemmA16W16Gfx942Param:
     direct_store: fx.Constexpr[bool]
     pingpong: fx.Constexpr[bool]
     split_k_reduce: fx.Constexpr[bool]
-    stream_operands: fx.Constexpr[bool]
     async_load_bytes: fx.Constexpr[int]
     # derived
     in_data_bytes: fx.Constexpr[int]
@@ -158,7 +156,6 @@ def make_gemm_a16w16_gfx942_param(
     direct_store: bool = False,
     pingpong: bool = False,
     split_k_reduce: bool = False,
-    stream_operands: bool = False,
 ) -> GemmA16W16Gfx942Param:
     if in_dtype_id != GEMM_A16W16_DTYPE_BF16:
         raise ValueError(f"gfx942 kernel is bf16-only (got in_dtype_id={in_dtype_id})")
@@ -183,16 +180,12 @@ def make_gemm_a16w16_gfx942_param(
             )
         if stages not in (1, 2):
             raise ValueError("buffered_load supports stages=1 (single LDS buffer) or 2")
-    if pingpong and not (buffered_load and stages == 1):
-        raise ValueError("pingpong requires buffered_load with stages=1")
-    if stream_operands:
-        if not pingpong:
-            raise ValueError("stream_operands requires pingpong")
+    if pingpong:
+        if not (buffered_load and stages == 1):
+            raise ValueError("pingpong requires buffered_load with stages=1")
         # Two equal halves of whole 128-bit (32-element) K chunks per K wave.
         if block_k % (k_waves * 64) != 0:
-            raise ValueError(
-                "stream_operands needs block_k // k_waves to be a multiple of 64"
-            )
+            raise ValueError("pingpong needs block_k // k_waves to be a multiple of 64")
     if k_waves < 1:
         raise ValueError("k_waves must be positive")
     if k_waves > 1:
@@ -313,7 +306,6 @@ def make_gemm_a16w16_gfx942_param(
         direct_store=direct_store,
         pingpong=pingpong,
         split_k_reduce=split_k_reduce,
-        stream_operands=stream_operands,
         async_load_bytes=async_load_bytes,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
@@ -339,10 +331,7 @@ def make_gemm_a16w16_gfx942_kernel_name(param: GemmA16W16Gfx942Param) -> str:
         if param.direct_store
         else (f"_c{param.c_chunks}" if param.c_chunks > 1 else "")
     )
-    if param.pingpong:
-        pipe = "_pps" if param.stream_operands else "_pp"
-    else:
-        pipe = ""
+    pipe = "_pp" if param.pingpong else ""
     return (
         f"hgemm_bf16{out_suffix}_gfx942_"
         f"t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}{sk}_"
@@ -443,12 +432,11 @@ def _mma_groups(s: _KernelState, a_frag, b_frag, g_begin, g_end):
         )
 
 
-def _schedule_phase(n_mfma, n_rd, n_wr, n_ld, reload_in_place):
+def _schedule_phase(n_mfma, n_rd, n_wr, n_ld):
     """Spread one phase's memory ops evenly across its MFMAs.
 
-    A next-tile load normally targets the other staging set and is issued
-    before the LDS write of the same slot; with ``reload_in_place`` it reuses
-    the set being written, so it follows that write.
+    A next-tile load refills the staging registers being written to LDS, so
+    each load follows the LDS write of the same slot.
     """
     n_mem = n_rd + n_wr + n_ld
     used_mfma = 0
@@ -459,7 +447,7 @@ def _schedule_phase(n_mfma, n_rd, n_wr, n_ld, reload_in_place):
         if rd < n_rd:
             rocdl.sched_dsrd(1)
             rd += 1
-        elif (ld < wr if reload_in_place else ld <= wr) and ld < n_ld:
+        elif ld < wr and ld < n_ld:
             rocdl.sched_vmem(1)
             ld += 1
         elif wr < n_wr:
@@ -478,110 +466,13 @@ def _schedule_phase(n_mfma, n_rd, n_wr, n_ld, reload_in_place):
 
 @flyc.jit
 def _main_loop_pingpong(s: _KernelState):
-    """Single LDS buffer, two MMA operand sets, three tiles in flight.
-
-    At the top of iteration k the registers hold tile k, LDS holds tile k+1 and
-    tile k+2 is in flight from global memory. Each iteration has two phases,
-    each with half of tile k's MFMAs to hide its memory traffic behind:
-      A: ds_read tile k+1 into the other operand set | barrier (LDS free)
-      B: ds_write tile k+2, buffer_load tile k+3     | barrier (LDS full)
-    so no wait or barrier is ever reached without MFMA work before it. The
-    loop is unrolled by two so each tile is read straight into its own set.
-    Needs k_tiles >= 3 (checked on the host).
-    """
-    param = s.param
-    k_tiles = s.k_tiles
-    read_tile_into = s.read_tile_into
-    load_ab_to_reg = s.load_ab_to_reg
-    commit_ab_to_lds = s.commit_ab_to_lds
-    mma_k_iters = s.mma_k_iters
-    m_rep = const_expr(param.block_m // param.m_waves // param.mma_m)
-    n_rep = const_expr(param.block_n // param.n_waves // param.mma_n)
-    n_dsrd = const_expr(s.copy_chunks * (m_rep + n_rep))
-    n_dswr = const_expr(param.ldg_a_iters + param.ldg_b_iters)
-    split_g = const_expr(max(1, mma_k_iters // 2))
-    mma_frags = [
-        (s.frag_A, s.frag_B, s.frag_A_ret, s.frag_B_ret),
-        (s.frag_pf_A, s.frag_pf_B, s.frag_pf_A_ret, s.frag_pf_B_ret),
-    ]
-
-    def mma_groups(p, g_begin, g_end):
-        a_frag, b_frag, _, _ = mma_frags[p]
-        _mma_groups(s, a_frag, b_frag, g_begin, g_end)
-
-    def pipelined_iter(p, k_tile, commit, prefetch):
-        # Parity p: mma_frags[p] holds tile k and cp_frags[p] holds tile k+2;
-        # tile k+1 is read into mma_frags[1-p], tile k+3 into cp_frags[1-p].
-        _, _, next_a_ret, next_b_ret = mma_frags[1 - p]
-        # Phase A: read tile k+1 while the first half of tile k computes.
-        read_tile_into(0, next_a_ret, next_b_ret)
-        mma_groups(p, 0, split_g)
-        _schedule_phase(split_g * m_rep * n_rep, n_dsrd, 0, 0, False)
-        rocdl.sched_barrier(0)
-        if const_expr(commit):
-            rocdl.s_waitcnt(lgkmcnt=0)  # every wave is done reading LDS
-            rocdl.s_barrier()
-            # Phase B: refill LDS with tile k+2 while the second half computes.
-            rocdl.s_waitcnt(vmcnt=0)
-            commit_ab_to_lds(0, p)
-            if const_expr(prefetch):
-                load_ab_to_reg(k_tile + 3, 1 - p)
-        mma_groups(p, split_g, mma_k_iters)
-        _schedule_phase(
-            (mma_k_iters - split_g) * m_rep * n_rep,
-            0,
-            n_dswr if commit else 0,
-            n_dswr if prefetch else 0,
-            False,
-        )
-        rocdl.sched_barrier(0)
-        rocdl.s_waitcnt(lgkmcnt=0)
-        if const_expr(commit):
-            rocdl.s_barrier()  # tile k+2 visible before next read
-        rocdl.sched_barrier(0)
-
-    def drain(p, k_tile):
-        pipelined_iter(p, k_tile, True, False)
-        pipelined_iter(1 - p, k_tile + 1, False, False)
-        mma_groups(p, 0, mma_k_iters)
-
-    # Prologue: tile 0 into registers, tile 1 into LDS, tile 2 in flight.
-    load_ab_to_reg(fx.Int32(0))
-    rocdl.s_waitcnt(vmcnt=0)
-    commit_ab_to_lds(0)
-    load_ab_to_reg(fx.Int32(1))
-    rocdl.s_waitcnt(lgkmcnt=0)
-    rocdl.s_barrier()
-    read_tile_into(0, s.frag_A_ret, s.frag_B_ret)
-    rocdl.s_waitcnt(lgkmcnt=0)
-    rocdl.s_barrier()
-    rocdl.s_waitcnt(vmcnt=0)
-    commit_ab_to_lds(0)
-    load_ab_to_reg(fx.Int32(2))
-    rocdl.s_waitcnt(lgkmcnt=0)
-    rocdl.s_barrier()
-    rocdl.sched_barrier(0)
-    steady_iters = k_tiles - 3
-    steady_pairs = steady_iters // 2
-    for pair in range(0, steady_pairs, 1):
-        pipelined_iter(0, 2 * pair, True, True)
-        pipelined_iter(1, 2 * pair + 1, True, True)
-    if steady_iters % 2 == 1:
-        pipelined_iter(0, steady_iters - 1, True, True)
-        drain(1, steady_iters)
-    else:
-        drain(0, steady_iters)
-
-
-@flyc.jit
-def _main_loop_stream(s: _KernelState):
-    """Pingpong with one MMA operand set streamed in two K halves.
+    """One LDS buffer, with the MMA operand set streamed in two K halves.
 
     One operand set and one staging set, so a large tile fits without
     spilling. At the top of iteration k the registers hold half 0 of tile k,
     LDS holds tile k and tile k+1 is in flight from global memory:
       1: ds_read half 1 of tile k         | MFMAs on half 0   | barrier
-      2: ds_write tile k+1, reload the     | MFMAs on both     | barrier
+      2: ds_write tile k+1, reload the    | MFMAs on both     | barrier
          staging set with tile k+2        |   halves          |
       3: ds_read half 0 of tile k+1       | MFMAs on half 1
     Needs k_tiles >= 2 (checked on the host).
@@ -607,24 +498,23 @@ def _main_loop_stream(s: _KernelState):
     mfma_per_g = const_expr(m_rep * n_rep)
     n_dsrd_half = const_expr(half_c * (m_rep + n_rep))
 
-    def stream_iter(k_tile, commit, prefetch):
+    def pipelined_iter(k_tile, commit, prefetch):
         read_tile_into(0, frag_A_ret, frag_B_ret, half_c, copy_chunks)
         _mma_groups(s, frag_A, frag_B, 0, p1_end)
-        _schedule_phase(p1_end * mfma_per_g, n_dsrd_half, 0, 0, True)
+        _schedule_phase(p1_end * mfma_per_g, n_dsrd_half, 0, 0)
         rocdl.sched_barrier(0)
         if const_expr(commit):
             rocdl.s_waitcnt(lgkmcnt=0)  # every wave is done reading tile k
             rocdl.s_barrier()
-            commit_ab_to_lds(0, 0)
+            commit_ab_to_lds(0)
             if const_expr(prefetch):
-                load_ab_to_reg(k_tile + 2, 0)
+                load_ab_to_reg(k_tile + 2)
         _mma_groups(s, frag_A, frag_B, p1_end, p2_end)
         _schedule_phase(
             (p2_end - p1_end) * mfma_per_g,
             0,
             n_dswr if commit else 0,
             n_dswr if prefetch else 0,
-            True,
         )
         rocdl.sched_barrier(0)
         if const_expr(commit):
@@ -637,7 +527,6 @@ def _main_loop_stream(s: _KernelState):
             n_dsrd_half if commit else 0,
             0,
             0,
-            True,
         )
         rocdl.sched_barrier(0)
 
@@ -650,9 +539,9 @@ def _main_loop_stream(s: _KernelState):
     read_tile_into(0, frag_A_ret, frag_B_ret, 0, half_c)
     rocdl.sched_barrier(0)
     for k_tile in range(0, k_tiles - 2, 1):
-        stream_iter(k_tile, True, True)
-    stream_iter(k_tiles - 2, True, False)
-    stream_iter(k_tiles - 1, False, False)
+        pipelined_iter(k_tile, True, True)
+    pipelined_iter(k_tiles - 2, True, False)
+    pipelined_iter(k_tiles - 1, False, False)
 
 
 def _schedule_buffered_single_stage(s: _KernelState):
@@ -1241,10 +1130,10 @@ def gemm_a16w16_gfx942_kernel(
         thr_copy_C_direct = fx.make_tiled_copy_C(c_r2g_atom, tiled_mma).get_slice(
             tid_mn
         )
-    # Second A/B fragment pair: the next K-tile's LDS->reg read lands here while
-    # frag_A/frag_B feed the current MFMAs (stages>=3 and pingpong).
+    # Register double buffer of the async pipeline with stages >= 3: the next
+    # K-tile's LDS->reg read lands here while frag_A/frag_B feed the MFMAs.
     frag_pf_A = frag_pf_B = frag_pf_A_ret = frag_pf_B_ret = None
-    if const_expr(stages >= 3 or param.pingpong):
+    if const_expr(stages >= 3):
         frag_pf_A = thr_mma.make_fragment_A(sA0)
         frag_pf_B = thr_mma.make_fragment_B(sB0)
         frag_pf_A_ret = thr_copy_A.retile(frag_pf_A)
@@ -1300,38 +1189,22 @@ def gemm_a16w16_gfx942_kernel(
         gB_thr = b_g2r.partition_S(gB_all)
         b_cp_frag = fx.make_fragment_like(gB_thr[None, None, None, 0])
         b_cp_frag_ret = b_r2s.retile(b_cp_frag)
-        cp_frags = [(a_cp_frag, b_cp_frag, a_cp_frag_ret, b_cp_frag_ret)]
-        if const_expr(param.pingpong):
-            # Second staging set: the single-buffer pipeline loads tile k+3
-            # while tile k+2 is still being written to LDS from the first.
-            a_cp_frag1 = fx.make_fragment_like(gA_thr[None, None, None, 0])
-            b_cp_frag1 = fx.make_fragment_like(gB_thr[None, None, None, 0])
-            cp_frags.append(
-                (
-                    a_cp_frag1,
-                    b_cp_frag1,
-                    a_r2s.retile(a_cp_frag1),
-                    b_r2s.retile(b_cp_frag1),
-                )
-            )
         buffered_k_base = ks_begin // block_k
 
-        def load_ab_to_reg(k_tile, buf=0):
-            a_dst, b_dst, _, _ = cp_frags[buf]
+        def load_ab_to_reg(k_tile):
             global_k_tile = buffered_k_base + k_tile
-            fx.copy(buffer_atom, gA_thr[None, None, None, global_k_tile], a_dst)
-            fx.copy(buffer_atom, gB_thr[None, None, None, global_k_tile], b_dst)
+            fx.copy(buffer_atom, gA_thr[None, None, None, global_k_tile], a_cp_frag)
+            fx.copy(buffer_atom, gB_thr[None, None, None, global_k_tile], b_cp_frag)
 
-        def commit_ab_to_lds(lds_stage, buf=0):
-            _, _, a_src, b_src = cp_frags[buf]
+        def commit_ab_to_lds(lds_stage):
             sA_w = a_r2s.partition_D(
                 fx.make_view(smem_a + lds_stage * block_m * block_k, a_lds_layout)
             )
             sB_w = b_r2s.partition_D(
                 fx.make_view(smem_b + lds_stage * block_n * block_k, b_lds_layout)
             )
-            fx.copy(uni_atom, a_src, sA_w)
-            fx.copy(uni_atom, b_src, sB_w)
+            fx.copy(uni_atom, a_cp_frag_ret, sA_w)
+            fx.copy(uni_atom, b_cp_frag_ret, sB_w)
 
     thr_copy_C_lds = fx.make_tiled_copy_C(
         fx.make_copy_atom(
@@ -1476,9 +1349,7 @@ def gemm_a16w16_gfx942_kernel(
     if const_expr(is_split_k):
         splitk_protocol.zero_c()
 
-    if const_expr(param.pingpong and param.stream_operands):
-        _main_loop_stream(state)
-    elif const_expr(param.pingpong):
+    if const_expr(param.pingpong):
         _main_loop_pingpong(state)
     elif const_expr(param.buffered_load):
         _main_loop_buffered(state)
@@ -1628,19 +1499,18 @@ def get_split_k_workspace(device, numel: int) -> torch.Tensor:
     return ws
 
 
-# Search space of the fallback config and the tuner screen: streamed-operand
-# pingpong tiles with their (m, n, k) wave layouts. The cost model cannot tell
+# Search space of the fallback config and the tuner screen: pingpong tiles
+# with their (m, n, k) wave layouts. The cost model cannot tell
 # wave layouts or block_k apart, so earlier entries win its ties.
 CANDIDATE_TILES_M = (32, 64, 128, 256)
 CANDIDATE_TILES_N = (32, 48, 64, 96, 112, 128, 160, 192, 256)
 CANDIDATE_WAVES = ((2, 2, 1), (2, 1, 2), (1, 2, 2), (1, 4, 1), (4, 1, 1), (1, 1, 4))
 CANDIDATE_MAX_SPLIT_K = 8
-STREAM_PIPELINE = {
+PINGPONG_PIPELINE = {
     "stages": 1,
     "buffered_load": True,
     "async_load_bytes": 16,
     "pingpong": True,
-    "stream_operands": True,
 }
 
 
@@ -1705,10 +1575,9 @@ def shape_error(m: int, n: int, k: int, cfg: dict) -> str | None:
                 f"more than {SPLIT_K_SEMAPHORE_MAX_LEN}"
             )
     if cfg.get("pingpong", False):
-        min_tiles = 2 if cfg.get("stream_operands", False) else 3
-        if last_split_tiles < min_tiles:
+        if last_split_tiles < 2:
             return (
-                f"pingpong needs at least {min_tiles} K tiles per split "
+                f"pingpong needs at least 2 K tiles per split "
                 f"(K={k}, split_k={split_k}, block_k={block_k})"
             )
     elif not cfg.get("buffered_load", False):
@@ -1733,8 +1602,8 @@ def config_is_valid(
     return True
 
 
-def stream_candidates(m: int, n: int, k: int) -> list[tuple[float, dict]]:
-    """Streamed-operand pingpong configs of a shape with their modelled cost.
+def pingpong_candidates(m: int, n: int, k: int) -> list[tuple[float, dict]]:
+    """Pingpong configs of a shape with their modelled cost.
 
     Sorted cheapest first and not yet checked by ``config_is_valid``. Split-K
     only fills one round of workgroups, never more, and leaves every split at
@@ -1772,7 +1641,7 @@ def stream_candidates(m: int, n: int, k: int) -> list[tuple[float, dict]]:
             "group_m": 4,
             "split_k_reduce": sk > 1,
             "direct_store": False,
-            **STREAM_PIPELINE,
+            **PINGPONG_PIPELINE,
         }
         ranked.append((model_cost_us(m, n, k, cfg), order, cfg))
     ranked.sort(key=lambda item: item[:2])
@@ -1797,7 +1666,7 @@ def fallback_eligible(n: int, cfg: dict) -> bool:
 
 @functools.cache
 def _fallback_config(m: int, n: int, k: int, out_dtype_id: int) -> dict:
-    for _, cfg in stream_candidates(m, n, k):
+    for _, cfg in pingpong_candidates(m, n, k):
         if fallback_eligible(n, cfg) and config_is_valid(m, n, k, cfg, out_dtype_id):
             return cfg
     # Fewer than two block_k=64 tiles: the async pipeline, which needs one.
@@ -1818,8 +1687,7 @@ def gfx942_fallback_config(
     m: int, n: int, k: int, out_dtype: torch.dtype = torch.bfloat16
 ) -> dict:
     """Config for a shape that is not in the tuned table: the cheapest valid,
-    ``fallback_eligible`` streamed-operand pingpong config under
-    ``model_cost_us``."""
+    ``fallback_eligible`` pingpong config under ``model_cost_us``."""
     out_dtype_id = (
         GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else GEMM_A16W16_DTYPE_BF16
     )
@@ -1837,7 +1705,6 @@ _AUTO_ONLY_PIPELINE_KEYS = (
     "k_waves",
     "split_k_reduce",
     "direct_store",
-    "stream_operands",
 )
 
 # Config columns of the tuned table (aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv).
@@ -1856,10 +1723,9 @@ TUNED_CONFIG_COLUMNS = (
     "direct_store",
     "pingpong",
     "split_k_reduce",
-    "stream_operands",
 )
 TUNED_BOOL_COLUMNS = frozenset(
-    ("buffered_load", "direct_store", "pingpong", "split_k_reduce", "stream_operands")
+    ("buffered_load", "direct_store", "pingpong", "split_k_reduce")
 )
 TUNED_KEY_COLUMNS = ("gfx", "cu_num", "M", "N", "K", "out_dtype")
 

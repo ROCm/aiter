@@ -15,9 +15,10 @@ Two files:
 Tuning a shape:
 
 1. Screen: time the current config and up to ``--limit`` candidates once
-   each. Candidates are the fallback's streamed-operand pingpong search space
-   (``stream_candidates``), ranked by the same cost model so a small budget
-   covers the likeliest winners first.
+   each. Candidates are the fallback's pingpong search space
+   (``pingpong_candidates``), ranked by the same cost model so a small budget
+   covers the likeliest winners first. Small shapes also screen the async
+   pipeline (``async_configs``), which the cost model does not rank.
 2. Refine: re-screen the best few with other ``group_m`` / ``direct_store``.
 3. Promote: time the fastest ``--finalists`` plus the incumbent (the table row,
    else the fallback) over ``--rounds`` interleaved rounds and write the
@@ -43,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import os
 import socket
 import statistics
@@ -54,15 +56,16 @@ from typing import Any
 import torch
 
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    GFX942_NUM_CUS,
     TUNED_BOOL_COLUMNS,
     TUNED_CONFIG_COLUMNS,
     gemm_a16w16,
     gfx942_fallback_config,
     make_gemm_a16w16_gfx942_param,
     parse_tuned_config,
+    pingpong_candidates,
     reload_tuned_table,
     shape_error,
-    stream_candidates,
     tuned_table_path,
 )
 
@@ -123,7 +126,6 @@ CONFIG_DEFAULTS = {
     "direct_store": False,
     "pingpong": False,
     "split_k_reduce": False,
-    "stream_operands": False,
 }
 
 
@@ -147,11 +149,7 @@ def parse_config_row(row: dict[str, str]) -> dict[str, Any]:
 
 def describe(cfg: dict[str, Any]) -> str:
     c = normalized_config(cfg)
-    pipe = (
-        "stream"
-        if c["stream_operands"]
-        else ("pp" if c["pingpong"] else f"st{c['stages']}")
-    )
+    pipe = "pp" if c["pingpong"] else f"st{c['stages']}"
     return (
         f"{c['block_m']}x{c['block_n']}x{c['block_k']} "
         f"w{c['m_waves']}{c['n_waves']}{c['k_waves']} sk{c['split_k']} "
@@ -325,13 +323,13 @@ def valid_config(config: dict[str, Any], m: int, n: int, k: int) -> tuple[bool, 
 
 
 def grid_configs(m: int, n: int, k: int) -> list[dict[str, Any]]:
-    """Valid ``stream_candidates`` of a shape, cheapest modelled first.
+    """Valid ``pingpong_candidates`` of a shape, cheapest modelled first.
 
     The model cannot tell block_k or wave layouts apart, so the list takes the
     best variant of every (tile, split_k) family before any second variant.
     """
     families: dict[tuple, list[dict[str, Any]]] = {}
-    for _, cfg in stream_candidates(m, n, k):
+    for _, cfg in pingpong_candidates(m, n, k):
         cfg = normalized_config(cfg)
         if valid_config(cfg, m, n, k)[0]:
             families.setdefault(
@@ -341,6 +339,25 @@ def grid_configs(m: int, n: int, k: int) -> list[dict[str, Any]]:
     for depth in range(max((len(f) for f in families.values()), default=0)):
         ranked += [f[depth] for f in families.values() if depth < len(f)]
     return ranked
+
+
+def async_configs(m: int, n: int, k: int) -> list[dict[str, Any]]:
+    """Valid async-DMA configs of a shape with 32/64 tiles, stages 2 to 4.
+
+    stages >= 3 adds the register double buffer, which beats pingpong on some
+    small shapes (512x512). Tiles needing more than four rounds of workgroups
+    are skipped: there, pingpong's larger tiles win.
+    """
+    configs = []
+    for bm, bn, stages in itertools.product((32, 64), (32, 64), (2, 3, 4)):
+        if -(-m // bm) * -(-n // bn) > 4 * GFX942_NUM_CUS:
+            continue
+        cfg = normalized_config(
+            {"block_m": bm, "block_n": bn, "block_k": 64, "stages": stages}
+        )
+        if valid_config(cfg, m, n, k)[0]:
+            configs.append(cfg)
+    return configs
 
 
 def refine_configs(cfg: dict[str, Any], n: int) -> Iterable[dict[str, Any]]:
@@ -505,6 +522,8 @@ def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
     budget = args.limit or len(grid)
     for cfg in grid[:budget]:
         run("grid", cfg)
+    for cfg in async_configs(m, n, k):
+        run("async", cfg)
     ranked = sorted(
         (t, i, c) for i, (t, c) in enumerate(screened.values()) if t < float("inf")
     )

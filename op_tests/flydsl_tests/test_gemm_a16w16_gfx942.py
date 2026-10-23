@@ -324,8 +324,8 @@ def test_gemm_a16w16_gfx942_pingpong_edge_tiles(m, n, split_k, out_dtype):
     ],
 )
 @pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
-def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile, out_dtype):
-    """Streamed-operand pingpong: edge tiles, split-K, k_waves and two-K-tile shapes."""
+def test_gemm_a16w16_gfx942_pingpong(m, n, k, tile, out_dtype):
+    """Pingpong: edge tiles, split-K, k_waves and two-K-tile shapes."""
     _require_gfx942()
     x, w, ref = _inputs(m, n, k)
     out = _guarded_out(m, n, out_dtype)
@@ -337,7 +337,6 @@ def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile, out_dtype):
         "buffered_load": True,
         "async_load_bytes": 16,
         "pingpong": True,
-        "stream_operands": True,
         "split_k_reduce": split_k > 1,
         "direct_store": False,
     }
@@ -346,7 +345,7 @@ def test_gemm_a16w16_gfx942_stream_operands(m, n, k, tile, out_dtype):
         cfg["m_waves"] = 1
     y = gemm_a16w16(x, w.t(), out=out[:m], layout="nt", user_kwargs=cfg)
     torch.cuda.synchronize()
-    _assert_close(y, ref, f"stream M{m} N{n} K{k} {tile} {out_dtype}")
+    _assert_close(y, ref, f"pingpong M{m} N{n} K{k} {tile} {out_dtype}")
     assert torch.isnan(out[m:]).all(), "stores past M overwrote the guard rows"
 
 
@@ -418,7 +417,6 @@ def test_gemm_a16w16_gfx942_tuned_table(tmp_path, monkeypatch):
         "direct_store": False,
         "pingpong": True,
         "split_k_reduce": True,
-        "stream_operands": True,
     }
     table = tmp_path / "table.csv"
     table.write_text(
@@ -459,7 +457,7 @@ def test_gemm_a16w16_gfx942_fp32_out():
         {"direct_store": True},
         {"direct_store": False},
         {"split_k": 4, "split_k_reduce": True},
-        {"split_k": 4, "pingpong": False, "stream_operands": False},  # atomic
+        {"split_k": 4, "pingpong": False},  # atomic
     ],
     ids=["direct", "cshuffle", "workspace-split-k", "atomic-split-k"],
 )
@@ -480,7 +478,6 @@ def test_gemm_a16w16_gfx942_fp32_out_precision(store):
         "buffered_load": True,
         "async_load_bytes": 16,
         "pingpong": True,
-        "stream_operands": True,
         **store,
     }
     y = gemm_a16w16(x, w.t(), layout="nt", out_dtype=torch.float32, user_kwargs=cfg)
