@@ -913,14 +913,32 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
         size_dC = ldc * n;
         int64_t totalRotatingSizeNeeded = (size_dA + size_dB) * realDataTypeSize(intype) + (2 * size_dC + 2 * m + n) * realDataTypeSize(outtype);
 
-        hipblasLt_online_tuning(      
+        // Tuning allocates, benchmarks and synchronizes, none of which a capturing
+        // stream allows. During capture it runs on a private stream with this
+        // thread in relaxed capture mode, so the graph records the tuned GEMM.
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        CHECK_HIP_ERROR(hipStreamIsCapturing(stream, &capture_status));
+        const bool capturing = capture_status != hipStreamCaptureStatusNone;
+        hipStream_t tuning_stream = stream;
+        hipStreamCaptureMode capture_mode = hipStreamCaptureModeRelaxed;
+        if (capturing) {
+            CHECK_HIP_ERROR(hipThreadExchangeStreamCaptureMode(&capture_mode));
+            CHECK_HIP_ERROR(hipStreamCreateWithFlags(&tuning_stream, hipStreamNonBlocking));
+        }
+
+        hipblasLt_online_tuning(
 	        handle, m, n, k,
             matmul, matA, matB, matC,
             a, b, c,
             d_workspace, workspace_size, alpha, beta,
-            heuristicResult, 
+            heuristicResult,
             size_dA, size_dB, size_dC, totalRotatingSizeNeeded, intype, outtype,
-            stream);
+            tuning_stream);
+
+        if (capturing) {
+            CHECK_HIP_ERROR(hipStreamDestroy(tuning_stream));
+            CHECK_HIP_ERROR(hipThreadExchangeStreamCaptureMode(&capture_mode));
+        }
       
         append_hip_tuning_csv(
             heuristicResult[0].algo, "./hip_online_tuning_res.csv",
