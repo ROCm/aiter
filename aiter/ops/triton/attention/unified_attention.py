@@ -730,8 +730,12 @@ def _reduce_segments_triton(
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
+    v_head_size_padded = triton.next_power_of_2(params.head_size_v)
+    num_d_blocks = triton.cdiv(
+        v_head_size_padded, config.get("BLOCK_D") or v_head_size_padded
+    )
 
-    reduce_segments[(params.num_tokens, params.num_query_heads)](
+    reduce_segments[(params.num_tokens, params.num_query_heads, num_d_blocks)](
         output_ptr=params.out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
