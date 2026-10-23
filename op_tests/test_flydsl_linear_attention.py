@@ -22,6 +22,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import linear_attention_kernels as lak
 from aiter.ops.flydsl.kernels.gdn_decode_verify import (
     create_gdn_decode_verify_kernel,
 )
@@ -52,6 +53,8 @@ _MAX_PERF_ROTATIONS = 101
 # rounding boundary can land one ULP away -- a handful of such elements per
 # tensor is expected. A real correctness break moves far more than this.
 _TOL_ERR_RATIO = 1e-3
+# The kernel factory's ``g_min`` default, which ``flydsl_gdr_decode`` keeps.
+_KDA_G_MIN = -5.0
 
 
 @dataclass
@@ -64,6 +67,9 @@ class Args:
     head_k_dim: int
     head_v_dim: int
     use_qk_l2norm: bool = True
+    gate_mode: str = "gdr"
+    dt_bias_dtype: torch.dtype | None = None
+    state_dtype: torch.dtype = torch.float32
 
 
 def create_inputs(args):
@@ -82,20 +88,34 @@ def create_inputs(args):
         dtype=args.dtype,
         device="cuda",
     )
+    per_channel = args.gate_mode == "kda"
+    gate_shape = (args.b, args.sq, args.num_v_heads)
     a = torch.randn(
-        (args.b, args.sq, args.num_v_heads), dtype=args.dtype, device="cuda"
+        (*gate_shape, args.head_k_dim) if per_channel else gate_shape,
+        dtype=args.dtype,
+        device="cuda",
     )
-    b = torch.randn(
-        (args.b, args.sq, args.num_v_heads), dtype=args.dtype, device="cuda"
-    )
-    dt_bias = torch.randn((args.num_v_heads), dtype=args.dtype, device="cuda")
-    dt_bias.uniform_(1, 2)
-    A_log = torch.randn((args.num_v_heads), dtype=torch.float32, device="cuda")
-    A_log.uniform_(0, 16)
+    b = torch.randn(gate_shape, dtype=args.dtype, device="cuda")
+    dt_bias_dtype = args.dt_bias_dtype or args.dtype
+    if per_channel:
+        # The scalar ranges below would pin every channel at g_min and hide an
+        # A_log or dt_bias applied along the wrong axis.
+        dt_bias = 0.1 * torch.randn(
+            (args.num_v_heads, args.head_k_dim), dtype=torch.float32, device="cuda"
+        )
+        dt_bias = dt_bias.to(dt_bias_dtype)
+        A_log = 0.5 * torch.randn(
+            (args.num_v_heads), dtype=torch.float32, device="cuda"
+        )
+    else:
+        dt_bias = torch.randn((args.num_v_heads), dtype=dt_bias_dtype, device="cuda")
+        dt_bias.uniform_(1, 2)
+        A_log = torch.randn((args.num_v_heads), dtype=torch.float32, device="cuda")
+        A_log.uniform_(0, 16)
     indices = torch.arange(args.b - 1, -1, -1, dtype=torch.int32, device="cuda")
     state = torch.randn(
         (args.b, args.num_v_heads, args.head_k_dim, args.head_v_dim),
-        dtype=torch.float32,
+        dtype=args.state_dtype,
         device="cuda",
     )
     return (args, query, key, value, a, b, dt_bias, A_log, indices, state)
@@ -128,7 +148,10 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
 
 
 def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-    """Pure PyTorch fp32 reference for the indexed GDR decode recurrence."""
+    """Pure PyTorch fp32 reference for the indexed GDR decode recurrence.
+
+    A 4D ``a`` selects the per-channel KDA gate, as it does in the wrapper.
+    """
     q = query.float()
     k = key.float()
     v = value.float()
@@ -143,9 +166,13 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
     k = k.repeat_interleave(heads_per_k_head, dim=2)
 
     gate_input = a.float() + dt_bias.float()
-    decay = torch.exp(
-        -torch.exp(A_log.float()) * F.softplus(gate_input, beta=1.0, threshold=20.0)
-    )
+    if a.dim() == 4:
+        A = torch.exp(A_log.float())[:, None]
+        decay = torch.exp(_KDA_G_MIN * torch.sigmoid(A * gate_input))[..., None]
+    else:
+        decay = torch.exp(
+            -torch.exp(A_log.float()) * F.softplus(gate_input, beta=1.0, threshold=20.0)
+        )[..., None, None]
     beta = torch.sigmoid(b.float())
 
     # A negative slot is padding: the kernel leaves its state and output untouched.
@@ -154,7 +181,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
             continue
         h = state[state_idx].float()
         for token_idx in range(args.sq):
-            h = h * decay[batch_idx, token_idx, :, None, None]
+            h = h * decay[batch_idx, token_idx]
             residual = v[batch_idx, token_idx] - torch.einsum(
                 "hkv,hk->hv", h, k[batch_idx, token_idx]
             )
@@ -166,7 +193,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
         state[state_idx].copy_(h)
 
 
-def _recurrent_decode_work(args, query, state, A_log, indices):
+def _recurrent_decode_work(args, query, a, b, dt_bias, state, A_log, indices):
     tokens = args.b * args.sq
     k_dim = args.head_k_dim
     v_dim = args.head_v_dim
@@ -186,17 +213,17 @@ def _recurrent_decode_work(args, query, state, A_log, indices):
     # state reshuffle, so TB/s remains an algorithmic, implementation-neutral
     # bandwidth metric rather than an estimate of physical DRAM transactions.
     data_elements = (
-        2 * tokens * args.num_k_heads * k_dim
-        + 2 * tokens * args.num_v_heads * v_dim
-        + 2 * tokens * args.num_v_heads
-        + args.num_v_heads
+        2 * tokens * args.num_k_heads * k_dim + 2 * tokens * args.num_v_heads * v_dim
     )
     state_elements = args.b * args.num_v_heads * k_dim * v_dim
     nbytes = (
         data_elements * query.element_size()
+        + a.nbytes
+        + b.nbytes
+        + dt_bias.nbytes
         + 2 * state_elements * state.element_size()
-        + args.num_v_heads * A_log.element_size()
-        + args.b * indices.element_size()
+        + A_log.nbytes
+        + indices.nbytes
     )
     return flops, nbytes
 
@@ -234,6 +261,9 @@ def test_flydsl_gdr_decode(
     head_v_dim,
     dtype,
     use_qk_l2norm,
+    gate_mode,
+    dt_bias_dtype,
+    state_dtype,
 ):
     if b <= 0 or sq <= 0:
         raise ValueError(f"batch and sequence length must be positive, got {b=} {sq=}")
@@ -247,6 +277,9 @@ def test_flydsl_gdr_decode(
         head_k_dim=head_k_dim,
         head_v_dim=head_v_dim,
         use_qk_l2norm=use_qk_l2norm,
+        gate_mode=gate_mode,
+        dt_bias_dtype=dt_bias_dtype,
+        state_dtype=state_dtype,
     )
     (
         _,
@@ -293,7 +326,12 @@ def test_flydsl_gdr_decode(
         )
 
     candidates = {"flydsl": run_flydsl}
-    flops, nbytes = _recurrent_decode_work(args, query, initial_state, A_log, indices)
+    flops, nbytes = _recurrent_decode_work(
+        args, query, a, beta, dt_bias, initial_state, A_log, indices
+    )
+    # The reference rounds a bf16 state on store too, so one bf16 ULP apart
+    # (up to 0.8%) is still a match.
+    state_tol = 1e-2 if state_dtype == torch.bfloat16 else 1e-3
     ret = {"gfx": get_gfx()}
     for name, candidate in candidates.items():
         # GDR updates state in place. Pass state/output as timing arguments so
@@ -323,8 +361,8 @@ def test_flydsl_gdr_decode(
         err_state = checkAllclose(
             reference_state.to(dtypes.fp32),
             candidate_state.to(dtypes.fp32),
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=state_tol,
+            atol=state_tol,
             msg=f"{name}: GDR decode state ",
         )
         assert err_out <= _TOL_ERR_RATIO and err_state <= _TOL_ERR_RATIO, (
@@ -338,8 +376,8 @@ def test_flydsl_gdr_decode(
     return ret
 
 
-# The argument-driven benchmark is run by main(); pytest collects the two
-# contract regressions below.
+# The argument-driven benchmark is run by main(); pytest collects the contract
+# regressions below.
 test_flydsl_gdr_decode.__test__ = False
 
 
@@ -353,13 +391,19 @@ def test_flydsl_gdr_decode_default():
         128,
         dtypes.bf16,
         True,
+        "gdr",
+        dtypes.bf16,
+        dtypes.fp32,
     )
     assert result["flydsl err"] == 0
 
 
-@pytest.mark.parametrize("input_index,input_name", [(1, "query"), (2, "key")])
+@pytest.mark.parametrize(
+    "input_index,input_name,gate_mode",
+    [(1, "query", "gdr"), (2, "key", "gdr"), (4, "a", "kda")],
+)
 def test_flydsl_gdr_decode_rejects_noncontiguous_vector_dimension(
-    input_index, input_name
+    input_index, input_name, gate_mode
 ):
     args = Args(
         dtype=torch.bfloat16,
@@ -369,6 +413,7 @@ def test_flydsl_gdr_decode_rejects_noncontiguous_vector_dimension(
         num_v_heads=32,
         head_k_dim=128,
         head_v_dim=128,
+        gate_mode=gate_mode,
     )
     inouts = list(create_inputs(args) + create_outputs(args))
     tensor = inouts[input_index]
@@ -514,6 +559,137 @@ def test_flydsl_gdr_decode_invalid_indices_zero_output_without_state_write():
         state[untouched_slots].view(torch.int32),
         state_before[untouched_slots].view(torch.int32),
     )
+
+
+def test_flydsl_gdr_decode_stages_inputs_on_the_launch_stream():
+    """A busy current stream must not delay the staging copies made for ``stream``."""
+    args = Args(
+        dtype=torch.bfloat16,
+        b=2,
+        sq=1,
+        num_k_heads=12,
+        num_v_heads=12,
+        head_k_dim=128,
+        head_v_dim=128,
+        gate_mode="kda",
+        dt_bias_dtype=torch.float32,
+    )
+    _, query, key, value, a, b, dt_bias, A_log, indices, state = create_inputs(args)
+    # A strided dt_bias forces a staging copy; the shuffled state forces two more.
+    wide = torch.empty(
+        args.num_v_heads, 2 * args.head_k_dim, dtype=dt_bias.dtype, device="cuda"
+    )
+    wide[:, ::2] = dt_bias
+    dt_bias = wide[:, ::2]
+    assert not dt_bias.is_contiguous()
+    reference_state = state.clone()
+    reference_out = create_outputs(args)[0]
+    ref_func(
+        args,
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        indices,
+        reference_state,
+        reference_out,
+    )
+    out = create_outputs(args)[0]
+    # Compile first, so the JIT does not overlap the sleep below.
+    func(
+        args,
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        indices,
+        state.clone(),
+        torch.empty_like(out),
+    )
+
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    torch.cuda._sleep(100_000_000)
+    flydsl_gdr_decode(
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        indices,
+        state,
+        out,
+        use_qk_l2norm=True,
+        need_shuffle_state=True,
+        stream=side,
+    )
+    torch.cuda.synchronize()
+    err_out = checkAllclose(
+        reference_out.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-3,
+        atol=1e-3,
+        msg="side stream: output ",
+    )
+    err_state = checkAllclose(
+        reference_state.to(dtypes.fp32),
+        state.to(dtypes.fp32),
+        rtol=1e-3,
+        atol=1e-3,
+        msg="side stream: state ",
+    )
+    assert err_out <= _TOL_ERR_RATIO and err_state <= _TOL_ERR_RATIO
+
+
+def test_flydsl_gdr_decode_kda_tiling_is_kda_only():
+    kda_config = {"NUM_BLOCKS_PER_V_DIM": 4, "NUM_WARPS": 2, "WARP_THREADS_K": 32}
+    dtypes_key = ("torch.bfloat16", "torch.float32")
+    geometry = (4, 1, 12, 12, 128, 128)
+    part = (lak.GDR_GPU_ARCH, lak.get_num_sms())
+    saved = lak._KDA_DECODE_BY_PART
+    try:
+        lak._KDA_DECODE_BY_PART = {part: {4: (4, 2, 32)}}
+        assert lak.get_default_kwargs(*dtypes_key, *geometry, "kda") == kda_config
+        assert lak.get_default_kwargs(
+            *dtypes_key, *geometry, "gdr"
+        ) == lak._decode_tiling(
+            geometry[0], geometry[3], geometry[4], geometry[5], dtypes_key[1]
+        )
+    finally:
+        lak._KDA_DECODE_BY_PART = saved
+
+
+def test_flydsl_gdr_decode_kda_tiling_needs_this_parts_row():
+    dtypes_key = ("torch.bfloat16", "torch.float32")
+    geometry = (4, 1, 12, 12, 128, 128)
+    foreign = (lak.GDR_GPU_ARCH, lak.get_num_sms() + 1)
+    saved = lak._KDA_DECODE_BY_PART
+    try:
+        lak._KDA_DECODE_BY_PART = {foreign: {4: (4, 2, 32)}}
+        assert lak.get_default_kwargs(
+            *dtypes_key, *geometry, "kda"
+        ) == lak._decode_tiling(
+            geometry[0], geometry[3], geometry[4], geometry[5], dtypes_key[1]
+        )
+    finally:
+        lak._KDA_DECODE_BY_PART = saved
+
+
+def summarize(name, rows):
+    if rows:
+        aiter.logger.info(
+            "%s summary (markdown):\n%s",
+            name,
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
 
 
 def make_gdn_varlen_inputs(
@@ -863,6 +1039,29 @@ def main():
         help="Whether to normalize Q/K in-kernel (0 or 1).",
     )
     parser.add_argument(
+        "--gate-mode",
+        nargs="*",
+        choices=["gdr", "kda"],
+        default=["gdr", "kda"],
+        help="Decay gate: per head (gdr) or per channel (kda).",
+    )
+    parser.add_argument(
+        "--dt-bias-dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.bf16, dtypes.fp16, dtypes.fp32],
+        nargs="*",
+        default=[dtypes.bf16, dtypes.fp32],
+        help="dt_bias dtype. Example: --dt-bias-dtype bf16 fp32",
+    )
+    parser.add_argument(
+        "--state-dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.fp32, dtypes.bf16],
+        nargs="*",
+        default=[dtypes.fp32, dtypes.bf16],
+        help="Recurrent state dtype. Example: --state-dtype fp32 bf16",
+    )
+    parser.add_argument(
         "--tps",
         type=int,
         nargs="*",
@@ -882,12 +1081,24 @@ def main():
     args = parser.parse_args()
 
     rows = []
-    for dtype, batch, sq, head_config, l2norm in itertools.product(
+    for (
+        dtype,
+        batch,
+        sq,
+        head_config,
+        l2norm,
+        gate_mode,
+        dt_bias_dtype,
+        state_dtype,
+    ) in itertools.product(
         args.dtype,
         args.batch,
         args.sq,
         args.head_configs,
         args.l2norm,
+        args.gate_mode,
+        args.dt_bias_dtype,
+        args.state_dtype,
     ):
         if len(head_config) != 4:
             parser.error(
@@ -918,13 +1129,38 @@ def main():
                 head_v_dim,
                 dtype,
                 bool(l2norm),
+                gate_mode,
+                dt_bias_dtype,
+                state_dtype,
             )
         )
+    summarize("FlyDSL GDR decode", rows)
 
-    df = pd.DataFrame(rows)
-    aiter.logger.info(
-        "FlyDSL GDR decode summary (markdown):\n%s", df.to_markdown(index=False)
+    # Every tuned tiling for this part; `_kda_tiling` accepts only this shape.
+    tuned = lak._KDA_DECODE_BY_PART.get((lak.GDR_GPU_ARCH, lak.get_num_sms()), {})
+    summarize(
+        "FlyDSL KDA decode, tuned tilings",
+        [
+            test_flydsl_gdr_decode(
+                batch,
+                1,
+                12,
+                12,
+                128,
+                128,
+                dtypes.bf16,
+                True,
+                "kda",
+                dtypes.fp32,
+                dtypes.fp32,
+            )
+            for batch in sorted(tuned)
+        ],
     )
+
+    test_flydsl_gdr_decode_stages_inputs_on_the_launch_stream()
+    test_flydsl_gdr_decode_kda_tiling_is_kda_only()
+    test_flydsl_gdr_decode_kda_tiling_needs_this_parts_row()
 
     if get_gfx() not in GDN_VARLEN_GFX:
         aiter.logger.warning(
