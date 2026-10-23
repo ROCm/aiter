@@ -3,12 +3,11 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr
-from flydsl.expr.arith import ArithValue
+from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import _to_raw
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 
 
 def build_splitk_silu(I, split_k):
@@ -25,41 +24,31 @@ def build_splitk_silu(I, split_k):
         row = pid // nblocks
         col = (pid % nblocks) * block_n + tid * vec
         pr = buffer_ops.create_buffer_resource(
-            partials,
-            num_records_bytes=_to_raw(split_k * rows * 2 * I * 4),
+            partials, num_records_bytes=split_k * rows * 2 * I * 4
         )
-        outr = buffer_ops.create_buffer_resource(
-            out, num_records_bytes=_to_raw(rows * I * 2)
-        )
-        gate = [arith.constant(0.0, type=T.f32) for _ in range(vec)]
-        up = [arith.constant(0.0, type=T.f32) for _ in range(vec)]
+        outr = buffer_ops.create_buffer_resource(out, num_records_bytes=rows * I * 2)
+        one = fx.Float32(1.0)
+        gate = [fx.Float32(0.0) for _ in range(vec)]
+        up = [fx.Float32(0.0) for _ in range(vec)]
         for sk in range_constexpr(split_k):
             base = sk * rows * (2 * I) + row * (2 * I) + col
             gate_raw = buffer_ops.buffer_load(
-                pr, base, vec_width=vec, dtype=T.f32, mask=_to_raw(col < I)
+                pr, base, vec_width=vec, dtype=T.f32, mask=col < I
             )
             up_raw = buffer_ops.buffer_load(
-                pr, base + I, vec_width=vec, dtype=T.f32, mask=_to_raw(col < I)
+                pr, base + I, vec_width=vec, dtype=T.f32, mask=col < I
             )
             gate_vec = fx.Vector(gate_raw, shape=vec, dtype=fx.Float32)
             up_vec = fx.Vector(up_raw, shape=vec, dtype=fx.Float32)
-            gate = [arith.addf(gate[j], _to_raw(gate_vec[j])) for j in range(vec)]
-            up = [arith.addf(up[j], _to_raw(up_vec[j])) for j in range(vec)]
+            gate = [gate[j] + gate_vec[j] for j in range(vec)]
+            up = [up[j] + up_vec[j] for j in range(vec)]
         values = []
         for j in range_constexpr(vec):
-            exp = fx.rocdl.exp2(
-                T.f32,
-                arith.mulf(gate[j], arith.constant(-1.4426950408889634, type=T.f32)),
-            )
-            sigmoid = arith.divf(
-                arith.constant(1.0, type=T.f32),
-                arith.addf(arith.constant(1.0, type=T.f32), exp),
-            )
-            values.append(
-                arith.truncf(T.bf16, arith.mulf(arith.mulf(gate[j], sigmoid), up[j]))
-            )
-        packed = _to_raw(fx.Vector.from_elements(values, fx.BFloat16))
-        buffer_ops.buffer_store(packed, outr, row * I + col, mask=_to_raw(col < I))
+            # SiLU with an exact divide, as in the GEMM epilogue (not act.py's rcp).
+            exp = fx.Float32(fx.rocdl.exp2(T.f32, (gate[j] * -LOG2E).ir_value()))
+            values.append((gate[j] * (one / (one + exp)) * up[j]).to(fx.BFloat16))
+        packed = fx.Vector.from_elements(values, fx.BFloat16)
+        buffer_ops.buffer_store(packed, outr, row * I + col, mask=col < I)
 
     @flyc.jit
     def launch(
@@ -92,8 +81,7 @@ def build_finalize(H, topk, has_norm, has_scale, weight_dtype="bf16", split_k=1)
 
     def wave_sum(value):
         for shift in (32, 16, 8, 4, 2, 1):
-            peer = _to_raw(ArithValue(value).shuffle_xor(shift, 64))
-            value = arith.addf(value, peer)
+            value = value + value.shuffle_xor(shift, 64)
         return value
 
     @flyc.kernel(name="muse_moe_finalize_vector_flydsl")
@@ -112,22 +100,17 @@ def build_finalize(H, topk, has_norm, has_scale, weight_dtype="bf16", split_k=1)
         m = fx.block_idx.x
         tid = fx.thread_idx.x
         lane, wave = tid % 64, tid // 64
-        zero = arith.constant(0.0, type=T.f32)
-        one = arith.constant(1.0, type=T.f32)
+        zero = fx.Float32(0.0)
+        one = fx.Float32(1.0)
         yr = buffer_ops.create_buffer_resource(
-            y,
-            num_records_bytes=_to_raw(
-                split_k * rows * topk * H * (4 if split_k > 1 else 2)
-            ),
+            y, num_records_bytes=split_k * rows * topk * H * (4 if split_k > 1 else 2)
         )
         wr = buffer_ops.create_buffer_resource(
             gamma, num_records_bytes=H * weight_bytes
         )
         sr = buffer_ops.create_buffer_resource(scores, max_size=True)
         ir = buffer_ops.create_buffer_resource(ids, max_size=True)
-        outr = buffer_ops.create_buffer_resource(
-            out, num_records_bytes=_to_raw(rows * H * 2)
-        )
+        outr = buffer_ops.create_buffer_resource(out, num_records_bytes=rows * H * 2)
         lds = fx.SharedAllocator().allocate(Shared).peek()
         scales = []
         if fx.const_expr(has_norm and has_scale):
@@ -144,23 +127,26 @@ def build_finalize(H, topk, has_norm, has_scale, weight_dtype="bf16", split_k=1)
             for chunk in range_constexpr(chunks):
                 h = tid * vec + chunk * threads * vec
                 raw = buffer_ops.buffer_load(
-                    wr, h, vec_width=vec, dtype=wtype, mask=_to_raw(h < H)
+                    wr, h, vec_width=vec, dtype=wtype, mask=h < H
                 )
-                values = fx.Vector(raw, shape=vec, dtype=numeric) if vec > 1 else [raw]
+                values = (
+                    fx.Vector(raw, shape=vec, dtype=numeric)
+                    if vec > 1
+                    else [numeric(raw)]
+                )
                 for j in range_constexpr(vec):
-                    v = _to_raw(values[j])
-                    if fx.const_expr(weight_dtype != "fp32"):
-                        v = arith.extf(T.f32, v)
-                    v = arith.addf(v, _to_raw(gain))
-                    if fx.const_expr(weight_dtype != "fp32"):
-                        v = arith.extf(T.f32, arith.truncf(wtype, v))
-                    scales.append(v)
-        for slot_i, state in range(0, topk, 1, init=[zero for _ in range(elems)]):
-            slot = m * topk + fx.Int32(arith.index_cast(T.i32, _to_raw(slot_i)))
+                    # (gamma + gain), rounded to the weight dtype as the model does.
+                    v = values[j].to(fx.Float32) + gain
+                    scales.append(v.to(numeric).to(fx.Float32))
+        init = [zero.ir_value() for _ in range(elems)]
+        for slot_i, state in range(0, topk, 1, init=init):
+            slot = m * topk + fx.Int32(slot_i)
             e = fx.Int32(buffer_ops.buffer_load(ir, slot, vec_width=1, dtype=T.i32))
-            updated = _to_raw(fx.Vector.from_elements(state, fx.Float32))
+            updated = fx.Vector.from_elements(state, fx.Float32).ir_value()
             if (e >= local_start) & (e < local_start + num_local):
-                sc = buffer_ops.buffer_load(sr, slot, vec_width=1, dtype=T.f32)
+                sc = fx.Float32(
+                    buffer_ops.buffer_load(sr, slot, vec_width=1, dtype=T.f32)
+                )
                 values = []
                 ss = zero
                 for chunk in range_constexpr(chunks):
@@ -173,13 +159,10 @@ def build_finalize(H, topk, has_norm, has_scale, weight_dtype="bf16", split_k=1)
                                 sk * rows * topk * H + slot * H + h,
                                 vec_width=vec,
                                 dtype=T.f32,
-                                mask=_to_raw(h < H),
+                                mask=h < H,
                             )
                             vector = fx.Vector(raw, shape=vec, dtype=fx.Float32)
-                            partial = [
-                                arith.addf(partial[j], _to_raw(vector[j]))
-                                for j in range(vec)
-                            ]
+                            partial = [partial[j] + vector[j] for j in range(vec)]
                         vector = partial
                     else:
                         raw = buffer_ops.buffer_load(
@@ -187,65 +170,53 @@ def build_finalize(H, topk, has_norm, has_scale, weight_dtype="bf16", split_k=1)
                             slot * H + h,
                             vec_width=vec,
                             dtype=T.bf16,
-                            mask=_to_raw(h < H),
+                            mask=h < H,
                         )
                         vector = (
                             fx.Vector(raw, shape=vec, dtype=fx.BFloat16)
                             if vec > 1
-                            else [raw]
+                            else [fx.BFloat16(raw)]
                         )
                     for j in range_constexpr(vec):
-                        value = (
-                            arith.extf(T.f32, arith.truncf(T.bf16, _to_raw(vector[j])))
-                            if split_k > 1
-                            else arith.extf(T.f32, _to_raw(vector[j]))
-                        )
+                        if fx.const_expr(split_k > 1):
+                            value = vector[j].to(fx.BFloat16).to(fx.Float32)
+                        else:
+                            value = vector[j].to(fx.Float32)
                         if fx.const_expr(has_norm and has_scale):
-                            value = arith.extf(
-                                T.f32,
-                                arith.truncf(
-                                    T.bf16, arith.mulf(value, scales[chunk * vec + j])
-                                ),
-                            )
+                            value = value * scales[chunk * vec + j]
+                            value = value.to(fx.BFloat16).to(fx.Float32)
                         values.append(value)
-                        ss = arith.addf(ss, arith.mulf(value, value))
+                        ss = ss + value * value
                 if fx.const_expr(has_norm):
                     ss = wave_sum(ss)
-                    slot_base = fx.Int32(arith.index_cast(T.i32, _to_raw(slot_i))) * 4
+                    slot_base = fx.Int32(slot_i) * 4
                     if lane == 0:
-                        lds.sums[slot_base + wave] = fx.Float32(ss)
+                        lds.sums[slot_base + wave] = ss
                     fx.gpu.barrier()
                     total = zero
                     for w in range_constexpr(4):
-                        total = arith.addf(total, _to_raw(lds.sums[slot_base + w]))
-                    mean = arith.addf(
-                        arith.mulf(total, arith.constant(1.0 / H, type=T.f32)),
-                        _to_raw(eps),
-                    )
-                    sc = arith.mulf(sc, arith.divf(one, fx.rocdl.sqrt(T.f32, mean)))
-                updated = _to_raw(
-                    fx.Vector.from_elements(
-                        [
-                            arith.addf(state[j], arith.mulf(sc, values[j]))
-                            for j in range(elems)
-                        ],
-                        fx.Float32,
-                    )
-                )
+                        total = total + lds.sums[slot_base + w]
+                    mean = total * (1.0 / H) + eps
+                    rms = fx.Float32(fx.rocdl.sqrt(T.f32, mean.ir_value()))
+                    sc = sc * (one / rms)
+                updated = fx.Vector.from_elements(
+                    [fx.Float32(state[j]) + sc * values[j] for j in range(elems)],
+                    fx.Float32,
+                ).ir_value()
             next_values = [
-                _to_raw(fx.Vector(updated, shape=elems, dtype=fx.Float32)[j])
+                fx.Vector(updated, shape=elems, dtype=fx.Float32)[j].ir_value()
                 for j in range(elems)
             ]
             final = yield next_values
         for chunk in range_constexpr(chunks):
             h = tid * vec + chunk * threads * vec
-            packed = [arith.truncf(T.bf16, final[chunk * vec + j]) for j in range(vec)]
+            packed = [
+                fx.Float32(final[chunk * vec + j]).to(fx.BFloat16) for j in range(vec)
+            ]
             value = (
-                _to_raw(fx.Vector.from_elements(packed, fx.BFloat16))
-                if vec > 1
-                else packed[0]
+                fx.Vector.from_elements(packed, fx.BFloat16) if vec > 1 else packed[0]
             )
-            buffer_ops.buffer_store(value, outr, m * H + h, mask=_to_raw(h < H))
+            buffer_ops.buffer_store(value, outr, m * H + h, mask=h < H)
 
     @flyc.jit
     def launch(

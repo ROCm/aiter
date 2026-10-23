@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""Muse grouped GEMM with native BF16 or row-major packed MXFP4 weights.
+"""Muse grouped GEMM with BF16 or packed MXFP4 (E2M1 + E8M0) expert weights.
 
-Both stages share the same MFMA loop. Only the weight loader is specialized;
-no checkpoint transformation, preshuffle, or Triton GEMM is involved.
+Both stages share the same MFMA loop. Only the weight loader is specialized.
+MXFP4 weights are read in the checkpoint layout (row-major packed) or, with
+``FLYDSL_SHUFFLED_W``, in the aiter a16w4 preshuffle
+(``shuffle_weight_a16w4(w, 16, False)``). The scales stay row-major.
 """
 
 import functools
@@ -13,7 +15,8 @@ from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 
 def _row_swap(op_name, lhs, rhs):
@@ -22,14 +25,15 @@ def _row_swap(op_name, lhs, rhs):
     ``permlane16_swap`` trades the odd 16-lane rows of ``lhs`` for the even rows
     of ``rhs``; ``permlane32_swap`` trades the upper half of ``lhs`` for the
     lower half of ``rhs``. Both are plain VALU ops, so unlike ``ds_bpermute``
-    they neither occupy the LDS pipe nor add an ``lgkmcnt`` wait.
+    they neither occupy the LDS pipe nor add an ``lgkmcnt`` wait. FlyDSL 0.4.0
+    has no wrapper for these ops, so this helper keeps the raw ROCDL call.
     """
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import llvm, rocdl
 
     i32 = ir.IntegerType.get_signless(32)
     pair = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    swapped = getattr(rocdl, op_name)(pair, _to_raw(lhs), _to_raw(rhs), False, True)
+    swapped = getattr(rocdl, op_name)(pair, lhs.ir_value(), rhs.ir_value(), False, True)
     return (
         fx.Int32(llvm.extractvalue(i32, swapped, [0])),
         fx.Int32(llvm.extractvalue(i32, swapped, [1])),
@@ -87,7 +91,7 @@ def _launcher(
         raise ValueError("shuffled weight layout is MXFP4-only")
 
     def w_byte(col, kb):
-        """Byte offset of packed-FP4 weight (row ``col``, K byte ``kb``) inside one expert."""
+        """Byte offset of FP4 weight (row ``col``, K byte ``kb``) in one expert."""
         if fx.const_expr(shuffled_w):
             kb16 = kb // 16
             return (
@@ -122,15 +126,11 @@ def _launcher(
         absolute maximum is finite and non-zero, so both are unreachable in
         practice and the corner-case values are below BF16 denormal range.
         """
-        scale_bits = _to_raw(exponent << 23)
+        scale_bits = exponent << 23
         if fx.const_expr(exact_scale_edge):
-            scale_bits = _to_raw(
-                (exponent == 0).select(fx.Int32(0x00400000), fx.Int32(scale_bits))
-            )
-            scale_bits = _to_raw(
-                (exponent == 255).select(fx.Int32(0x7FC00000), fx.Int32(scale_bits))
-            )
-        return arith.bitcast(T.f32, scale_bits)
+            scale_bits = (exponent == 0).select(fx.Int32(0x00400000), scale_bits)
+            scale_bits = (exponent == 255).select(fx.Int32(0x7FC00000), scale_bits)
+        return scale_bits.bitcast(fx.Float32).ir_value()
 
     def decode_packed(packed, scale_f32):
         pairs = []
@@ -139,10 +139,11 @@ def _launcher(
                 T.vec(2, T.bf16), packed, scale_f32, sel
             )
             pairs.append(fx.Vector(pair).bitcast(fx.Int32)[0])
-        return _to_raw(fx.Vector.from_elements(pairs, fx.Int32).bitcast(fx.BFloat16))
+        return fx.Vector.from_elements(pairs, fx.Int32).bitcast(fx.BFloat16).ir_value()
 
     def decode_weight(packed, scale):
-        exponent = fx.Int32(arith.extui(T.i32, _to_raw(scale)))
+        # E8M0 is unsigned: zero-extend (a typed Int8 widen would sign-extend).
+        exponent = fx.Int32(arith.extui(T.i32, fx.Int8(scale).ir_value()))
         return decode_packed(packed, e8m0_to_f32(exponent))
 
     def transpose_packed(words):
@@ -185,12 +186,14 @@ def _launcher(
                 fx.Int32(
                     fx.rocdl.ds_bpermute(
                         T.i32,
-                        _to_raw(source_lane * 4),
-                        _to_raw(words[word]),
+                        (source_lane * 4).ir_value(),
+                        words[word].ir_value(),
                     )
                 )
             )
-        return _to_raw(fx.Vector.from_elements(gathered, fx.Int32).bitcast(fx.BFloat16))
+        return (
+            fx.Vector.from_elements(gathered, fx.Int32).bitcast(fx.BFloat16).ir_value()
+        )
 
     def schedule_bf16_lds_loop():
         # Keep the next tile's VMEM/DS writes in flight while the current tile
@@ -266,33 +269,23 @@ def _launcher(
                 b_r = buffer_ops.create_buffer_resource(
                     b,
                     max_size=True,
-                    base_byte_offset=_to_raw(
-                        fx.Int64(expert) * (w_rows * w_k * w_bytes)
-                    ),
+                    base_byte_offset=fx.Int64(expert) * (w_rows * w_k * w_bytes),
                 )
                 if fx.const_expr(mxfp4):
                     s_r = buffer_ops.create_buffer_resource(
                         scale,
                         max_size=True,
-                        base_byte_offset=_to_raw(
-                            fx.Int64(expert) * (w_rows * (K // 32))
-                        ),
+                        base_byte_offset=fx.Int64(expert) * (w_rows * (K // 32)),
                     )
                 else:
                     s_r = b_r
+                a_rows_valid = num_valid // topk if row_div else num_valid
                 a_r = buffer_ops.create_buffer_resource(
-                    a,
-                    num_records_bytes=_to_raw(
-                        (num_valid // topk if row_div else num_valid) * K * 2
-                    ),
+                    a, num_records_bytes=a_rows_valid * K * 2
                 )
                 c_cols = N * (2 if fuse_silu and split_k > 1 else 1)
-                c_r = buffer_ops.create_buffer_resource(
-                    c,
-                    num_records_bytes=_to_raw(
-                        split_k * num_valid * c_cols * (4 if split_k > 1 else 2)
-                    ),
-                )
+                c_bytes = split_k * num_valid * c_cols * (4 if split_k > 1 else 2)
+                c_r = buffer_ops.create_buffer_resource(c, num_records_bytes=c_bytes)
                 id_r = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
                 row_lane = lane % 16
                 k_lane = lane // 16 * 8
@@ -339,7 +332,7 @@ def _launcher(
                         )
                 acc_count = m_repeat * n_repeat * (2 if fuse_silu else 1)
                 initial = [
-                    _to_raw(fx.full(4, 0.0, fx.Float32)) for _ in range(acc_count)
+                    fx.full(4, 0.0, fx.Float32).ir_value() for _ in range(acc_count)
                 ]
 
                 def load_b_words(tile_i):
@@ -406,7 +399,7 @@ def _launcher(
                                     + ku * 32,
                                     vec_width=8,
                                     dtype=T.bf16,
-                                    mask=_to_raw(masks[mr]),
+                                    mask=masks[mr],
                                 )
                             )
                     return frags
@@ -445,15 +438,13 @@ def _launcher(
                         + load_a_frags(split_tile_base)
                     )
                 if fx.const_expr(use_lds):
+                    tiles = MXSharedTiles if use_mxfp4_lds else SharedTiles
+                    lds = fx.SharedAllocator().allocate(tiles).peek()
+                    a_lds_ptr = lds.a.ptr
+                    b_lds_ptr = lds.b.ptr
                     if fx.const_expr(use_mxfp4_lds):
-                        lds = fx.SharedAllocator().allocate(MXSharedTiles).peek()
-                        a_lds_ptr = lds.a.ptr
-                        b_lds_ptr = lds.b.ptr
                         s_lds_ptr = lds.scale.ptr
                     else:
-                        lds = fx.SharedAllocator().allocate(SharedTiles).peek()
-                        a_lds_ptr = lds.a.ptr
-                        b_lds_ptr = lds.b.ptr
                         b_base_addr = fx.Int64(fx.ptrtoint(fx.get_iter(b))) + fx.Int64(
                             expert
                         ) * fx.Int64(w_rows * K * 2)
@@ -516,7 +507,7 @@ def _launcher(
                                     a_row * K + tile_k + local_k,
                                     vec_width=a_load_vec,
                                     dtype=T.bf16,
-                                    mask=_to_raw(valid),
+                                    mask=valid,
                                 )
                                 fx.ptr_store(
                                     loaded,
@@ -590,11 +581,11 @@ def _launcher(
 
                     fill_lds(split_tile_base * lds_k, fx.Int32(0))
                     if fx.const_expr(use_bf16_lds):
-                        fx.rocdl.s_waitcnt(0)
+                        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                     fx.gpu.barrier()
                 # Only this small inner micro-tile is expanded. K stays a loop.
                 for tile, state in range(0, split_tiles, 1, init=initial):
-                    local_tile_i = fx.Int32(arith.index_cast(T.i32, _to_raw(tile)))
+                    local_tile_i = fx.Int32(tile)
                     tile_i = local_tile_i + split_tile_base
                     k0 = tile_i * (32 * unroll) + k_lane
                     stage = tile_i % lds_stages
@@ -682,7 +673,7 @@ def _launcher(
                                     + (lane % 4) * 8,
                                     vec_width=8,
                                     dtype=T.bf16,
-                                    mask=_to_raw(source_masks[mr]),
+                                    mask=source_masks[mr],
                                 )
                                 a_frag.append(
                                     transpose_bf16_fragment(loaded_a, lane, row_lane)
@@ -694,7 +685,7 @@ def _launcher(
                                         a_rows[mr] * K + k0 + ku * 32,
                                         vec_width=8,
                                         dtype=T.bf16,
-                                        mask=_to_raw(masks[mr]),
+                                        mask=masks[mr],
                                     )
                                 )
                         for nr in range_constexpr(n_repeat):
@@ -747,8 +738,8 @@ def _launcher(
                                         dword = dword >> (8 * (ku % 4))
                                     b_frag.append(
                                         decode_weight(
-                                            _to_raw(packed_tiles[pi][ku % 4]),
-                                            arith.trunci(T.i8, _to_raw(dword)),
+                                            packed_tiles[pi][ku % 4].ir_value(),
+                                            fx.Int8(dword),
                                         )
                                     )
                                 elif fx.const_expr(use_bf16_reg_transpose):
@@ -803,12 +794,12 @@ def _launcher(
                         if local_tile_i + 1 < split_tiles:
                             fill_lds(next_tile * lds_k, fx.Int32(0))
                             if fx.const_expr(use_bf16_lds):
-                                fx.rocdl.s_waitcnt(0)
+                                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                         fx.gpu.barrier()
                     elif fx.const_expr(use_lds):
                         if fx.const_expr(use_bf16_lds):
                             schedule_bf16_lds_loop()
-                            fx.rocdl.s_waitcnt(0)
+                            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                         fx.gpu.barrier()
                     final = yield updated + ahead
                 if fx.const_expr(acc_count == 1 and not pipelined):
@@ -825,52 +816,41 @@ def _launcher(
                         )
                         for nr in range_constexpr(n_repeat):
                             idx = (mr * n_repeat + nr) * (2 if fuse_silu else 1)
-                            value = _to_raw(
-                                fx.Vector(final_acc[idx], shape=4, dtype=fx.Float32)[j]
-                            )
+                            value = fx.Vector(
+                                final_acc[idx], shape=4, dtype=fx.Float32
+                            )[j]
                             if fx.const_expr(fuse_silu and split_k == 1):
-                                up = _to_raw(
-                                    fx.Vector(
-                                        final_acc[idx + 1], shape=4, dtype=fx.Float32
-                                    )[j]
+                                up = fx.Vector(
+                                    final_acc[idx + 1], shape=4, dtype=fx.Float32
+                                )[j]
+                                # SiLU with an exact divide; act.py's SiLU uses
+                                # rcp and an afn exp2, which round differently.
+                                exp = fx.Float32(
+                                    fx.rocdl.exp2(T.f32, (value * -LOG2E).ir_value())
                                 )
-                                exp = fx.rocdl.exp2(
-                                    T.f32,
-                                    arith.mulf(
-                                        value,
-                                        arith.constant(-1.4426950408889634, type=T.f32),
-                                    ),
-                                )
-                                sigmoid = arith.divf(
-                                    arith.constant(1.0, type=T.f32),
-                                    arith.addf(arith.constant(1.0, type=T.f32), exp),
-                                )
-                                value = arith.mulf(arith.mulf(value, sigmoid), up)
+                                one = fx.Float32(1.0)
+                                value = value * (one / (one + exp)) * up
                             if fx.const_expr(split_k > 1):
                                 for half in range_constexpr(halves):
-                                    raw_idx = idx + half
-                                    raw_value = _to_raw(
+                                    buffer_ops.buffer_store(
                                         fx.Vector(
-                                            final_acc[raw_idx],
+                                            final_acc[idx + half],
                                             shape=4,
                                             dtype=fx.Float32,
-                                        )[j]
-                                    )
-                                    buffer_ops.buffer_store(
-                                        raw_value,
+                                        )[j],
                                         c_r,
                                         split_id * (num_valid * c_cols)
                                         + slot * c_cols
                                         + half * N
                                         + cols[nr],
-                                        mask=_to_raw(slot < num_valid),
+                                        mask=slot < num_valid,
                                     )
                             else:
                                 buffer_ops.buffer_store(
-                                    arith.truncf(T.bf16, value),
+                                    value.to(fx.BFloat16),
                                     c_r,
                                     slot * N + cols[nr],
-                                    mask=_to_raw(slot < num_valid),
+                                    mask=slot < num_valid,
                                 )
 
     @flyc.jit
