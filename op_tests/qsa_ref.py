@@ -7,7 +7,7 @@ The kernels do not import this module. The Flash-Next and Gluon-parity
 specs below are the shapes the tests build from.
 
 Authoritative math: Qwen3.8-Next tech report ?2.1 (QSA). The oracle may
-materialize ``[M, n_blocks]`` scores. FlyDSL K1 does the same on every
+materialize ``[M, n_blocks]`` scores. The FlyDSL indexer does the same on every
 path except short-row emit: a private fp32 ``[M, n_columns]`` buffer,
 then top-512 block ids, and the scores are dropped. ``n_columns`` is
 the page-table capacity (``page_table.shape[1] * page_size``), so a
