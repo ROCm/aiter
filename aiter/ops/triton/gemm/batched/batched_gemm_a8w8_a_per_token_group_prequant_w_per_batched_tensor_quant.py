@@ -88,6 +88,10 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     assert dtype in [
         torch.bfloat16,
         torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
     ], f"Output {dtype=} is currently not supported in batched_gemm_a8w8"
     assert splitK is None, "Currently, there isn't any support for splitK on Triton"
 
