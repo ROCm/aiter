@@ -8,7 +8,9 @@ name: Triton Test
 #     back to 'true' is the revert for every PR.
 #   - PR label ci:triton-355: that PR runs the full suite.
 # Main runs the full suite once a night, on MI35X and MI300X. Pushes to main
-# do not run this workflow.
+# do not run this workflow. The nightly result goes on the open "Triton nightly
+# status" issue, with a mention of each user in
+# .github/triton-nightly-watchers.txt. GitHub emails the users that it mentions.
 
 on:
   schedule:
@@ -20,6 +22,11 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     branches: [main]
   workflow_dispatch:
+    inputs:
+      report:
+        description: Post the result on the Triton nightly status issue
+        type: boolean
+        default: false
 
 concurrency:
   # Labels other than ci:triton-300x and ci:triton-355 change nothing here: such
@@ -504,3 +511,74 @@ jobs:
           if [ "$NEEDS_MI300X" = true ]; then
             test "$MI300X_RESULT" = success
           fi
+
+  # The nightly result: one comment on the open "Triton nightly status" issue,
+  # with a mention of each user in .github/triton-nightly-watchers.txt.
+  nightly-report:
+    name: Nightly report
+    if: ${{ always() && (github.event_name == 'schedule' || inputs.report) }}
+    needs: [triton-test-finish]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout the watchers list
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/triton-nightly-watchers.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Post the result on the nightly status issue
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          RESULT: ${{ needs.triton-test-finish.result }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const icons = { success: '✅', failure: '❌', cancelled: '⏹️', skipped: '⏭️', timed_out: '⏱️' };
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner, repo, run_id: context.runId, per_page: 100,
+            });
+            const rows = jobs
+              .filter((job) => job.name.startsWith('Triton Tests ('))
+              .sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }))
+              .map((job) => {
+                const result = job.conclusion || job.status;
+                const shard = job.name.replace(/^Triton Tests \((.+)\) \/ Shard (\d+)$/, '$1 shard $2');
+                return `| ${shard} | ${icons[result] || '⏳'} [${result}](${job.html_url}) |`;
+              });
+            const watchers = fs.readFileSync('.github/triton-nightly-watchers.txt', 'utf8')
+              .split('\n')
+              .map((line) => line.replace(/#.*/, '').trim().replace(/^@/, ''))
+              .filter(Boolean);
+            const verdicts = { success: '✅ passed', failure: '❌ failed', cancelled: '⏹️ cancelled' };
+            const verdict = verdicts[process.env.RESULT] || `❌ ${process.env.RESULT}`;
+            const body = [
+              `### Triton nightly ${verdict} on \`${context.sha.slice(0, 9)}\``,
+              '',
+              `[Run log](${runUrl})`,
+              '',
+              '| Shard | Result |',
+              '| --- | --- |',
+              ...rows,
+              '',
+              watchers.length ? `cc ${watchers.map((user) => '@' + user).join(' ')}` : '',
+            ].join('\n');
+            const label = 'triton-nightly';
+            try {
+              await github.rest.issues.createLabel({ owner, repo, name: label, color: '5319e7' });
+            } catch (error) {
+              if (error.status !== 422) throw error;  // 422: the label exists
+            }
+            const open = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: label, per_page: 1,
+            });
+            if (open.data.length) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: open.data[0].number, body });
+            } else {
+              await github.rest.issues.create({ owner, repo, title: 'Triton nightly status', labels: [label], body });
+            }
