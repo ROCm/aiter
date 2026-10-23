@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from aiter import logger
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
+from aiter.ops.triton._triton_kernels.attention.dao_ai import flash_attn_2
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -805,7 +805,7 @@ def test_mha_backward(
 def test_mha_dao_ai_backward_head_size(
     head_size, varlen, seqlen_q, seqlen_k, strided, monkeypatch
 ):
-    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, interface_v2
+    from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd, interface_v2
     from aiter.ops.triton.attention import mha
 
     monkeypatch.setattr(interface_v2, "BWD_MODE", "fused")

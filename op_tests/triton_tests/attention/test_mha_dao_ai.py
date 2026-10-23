@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import contextlib
+from functools import partial
 
 import pytest
 import torch
@@ -120,6 +121,10 @@ def test_mha_dao_ai(
     dtype=torch.bfloat16,
 ):
     """Test dao_ai impl dispatch for fwd/bwd x varlen against PyTorch reference."""
+    dense = partial(flash_attn_func, implementation="dao_ai")
+    varlen = partial(flash_attn_varlen_func, implementation="dao_ai")
+    # Per-call selection must win over the process default, including in backward.
+    mha_set_impl("default")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -178,7 +183,7 @@ def test_mha_dao_ai(
         v_unpad.requires_grad_(BWD)
 
         with torch.set_grad_enabled(BWD):
-            triton_out = flash_attn_varlen_func(
+            triton_out = varlen(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -193,9 +198,7 @@ def test_mha_dao_ai(
         query_padding_mask = None
         key_padding_mask = None
         with torch.set_grad_enabled(BWD):
-            triton_out = flash_attn_func(
-                q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE
-            )
+            triton_out = dense(q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE)
 
     # Reference + tolerances. For backward, attention_ref_with_tol derives each
     # tensor's atol from the fp32-vs-bf16 reference gap (upstream FA pattern, as in
@@ -456,3 +459,32 @@ def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
     assert not torch.isnan(out_graph).any(), "Graph replay produced NaN"
     diff = (out_eager - out_graph).abs().max().item()
     assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
+
+
+@pytest.mark.parametrize(
+    "default, implementation, message",
+    [
+        ("dao_ai", None, "not supported by the dao_ai"),
+        ("default", "dao_ai", "not supported by the dao_ai"),
+        ("default", "unknown", "Unknown MHA implementation"),
+    ],
+)
+def test_mha_dao_ai_block_scale_selector(default, implementation, message):
+    """Block-scale FP8 resolves the selector before its forward: the dao_ai default
+    and an unknown selector are refused like an explicit dao_ai."""
+    q = torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16)
+    descale = torch.ones(1, 4, 2, device="cuda", dtype=torch.float32)
+    mha_set_impl(default)
+    try:
+        with pytest.raises(ValueError, match=message):
+            flash_attn_func(
+                q,
+                q,
+                q,
+                q_block_descale=descale,
+                k_block_descale=descale,
+                v_scale=torch.ones(1, device="cuda", dtype=torch.float32),
+                implementation=implementation,
+            )
+    finally:
+        mha_set_impl("default")
