@@ -308,6 +308,103 @@ def test_mha_dao_ai_dropout_scores(dao_ai_impl, causal, window_size):
     torch.testing.assert_close(lse, ref_lse.float(), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_mha_dao_ai_dropout_backward(varlen, causal):
+    """Backward with dropout keeps the forward's RNG state: gradients match a
+    reference that applies the dropout mask the forward returned."""
+    mha_set_impl("default")
+    torch.manual_seed(20)
+    batch, seqlen, heads, head_sz, dropout_p = 2, 96, 4, 64, 0.17
+    q, k, v = (
+        torch.randn(
+            batch,
+            seqlen,
+            heads,
+            head_sz,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        for _ in range(3)
+    )
+    query_padding_mask = key_padding_mask = None
+    if varlen:
+        query_padding_mask = generate_random_padding_mask(seqlen, batch, "cuda")
+        key_padding_mask = generate_random_padding_mask(seqlen, batch, "cuda")
+        (
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q,
+            k,
+            v,
+            output_pad_fn,
+            dq_pad_fn,
+            dk_pad_fn,
+        ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+        inputs = tuple(x.requires_grad_() for x in (q_unpad, k_unpad, v_unpad))
+        out, _, scores = flash_attn_varlen_func(
+            *inputs,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=dropout_p,
+            causal=causal,
+            return_lse=True,
+            return_attn_probs=True,
+            implementation="dao_ai",
+        )
+        out = output_pad_fn(out)
+    else:
+        inputs = (q, k, v)
+        out, _, scores = flash_attn_func(
+            *inputs,
+            dropout_p=dropout_p,
+            causal=causal,
+            return_lse=True,
+            return_attn_probs=True,
+            implementation="dao_ai",
+        )
+
+    do = torch.randn_like(out)
+    grads = torch.autograd.grad(out, inputs, do)
+    if varlen:
+        grads = (dq_pad_fn(grads[0]), dk_pad_fn(grads[1]), dk_pad_fn(grads[2]))
+
+    # The varlen mask covers the longest real sequence; pad it to seqlen as dropped.
+    scores = scores[:, :, :seqlen, :seqlen]
+    pad = (0, seqlen - scores.shape[3], 0, seqlen - scores.shape[2])
+    dropout_mask = torch.nn.functional.pad(scores, pad, value=-1.0) >= 0
+    ref_out, ref_grads, (fwd_atol, fwd_rtol), bwd_tols = attention_ref_with_tol(
+        q,
+        k,
+        v,
+        do,
+        dropout_p=dropout_p,
+        dropout_mask=dropout_mask,
+        causal=causal,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+    )
+    torch.testing.assert_close(out, ref_out, atol=fwd_atol, rtol=fwd_rtol)
+    for got, ref, (atol, rtol), name in zip(
+        grads, ref_grads, bwd_tols, ("dq", "dk", "dv")
+    ):
+        torch.testing.assert_close(
+            got,
+            ref,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda m, name=name: f"dao_ai dropout bwd {name} mismatch\n\n{m}\n",
+        )
+
+
 @pytest.mark.parametrize("default_device", ["cpu", "cuda"])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 def test_mha_dao_ai_graph(dao_ai_impl, mha_type, default_device):
