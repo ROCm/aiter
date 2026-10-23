@@ -83,9 +83,9 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             b_prev = [
                 [Vec(state[N_ACC + ni * _PACK + ks]) for ks in range(_PACK)] for ni in range(NUM_ACC_N)
             ]
-            cur_off = (sp & fx.Int32(1)) * fx.Int32(a_lds_i32)
-            nxt_off = ((sp + fx.Int32(1)) & fx.Int32(1)) * fx.Int32(a_lds_i32)
-            spn = sp + fx.Int32(1)
+            cur_off = (sp & 1) * fx.Int32(a_lds_i32)
+            nxt_off = ((sp + 1) & 1) * fx.Int32(a_lds_i32)
+            spn = sp + 1
             if const_expr(async_a_copy):
                 sb = [
                     fx.Int32(
@@ -171,8 +171,8 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             pairs = (K_ITERS - 1) // 2
             for pr_i, state in range(0, pairs, 1, init=init):
                 pr = fx.Int32(pr_i)
-                mid = _kstep(pr * fx.Int32(2), state)
-                yv = _kstep(pr * fx.Int32(2) + fx.Int32(1), mid)
+                mid = _kstep(pr * 2, state)
+                yv = _kstep(pr * 2 + 1, mid)
                 state = yield yv
             if const_expr((K_ITERS - 1) % 2):
                 state = _kstep(fx.Int32(K_ITERS - 2), state)
@@ -185,7 +185,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             [Vec(state[N_ACC + ni * _PACK + ks]) for ks in range(_PACK)]
             for ni in range(NUM_ACC_N)
         ]
-        final_off = (last & fx.Int32(1)) * fx.Int32(a_lds_i32)
+        final_off = (last & 1) * fx.Int32(a_lds_i32)
 
         def final_a_load(mi, ks, _base=final_off):
             return a_s2r.load_operand(a_buf, mi, ks, _base)
@@ -239,10 +239,10 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
         for sp_i, state in range(0, K_ITERS, 1, init=init):
             sp = fx.Int32(sp_i)
             acc = [Vec(a) for a in state]
-            cur_off = (sp & fx.Int32(1)) * fx.Int32(a_lds_i32)
-            nxt_off = ((sp + fx.Int32(1)) & fx.Int32(1)) * fx.Int32(a_lds_i32)
-            spn = (sp + fx.Int32(1) < last).select(
-                sp + fx.Int32(1),
+            cur_off = (sp & 1) * fx.Int32(a_lds_i32)
+            nxt_off = ((sp + 1) & 1) * fx.Int32(a_lds_i32)
+            spn = (sp + 1 < last).select(
+                sp + 1,
                 last,
             )
 
@@ -290,7 +290,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
-    source_rows=0, swiglu_limit=0.0, pair_k=False, evec,
+    source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
     act="silu", situ_beta=1.0, situ_linear_beta=1.0):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
@@ -302,13 +302,14 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     n_wave_base = wave_id * fx.Int32(n_per_wave)
 
     # fmt: off
-    a_gather = ATileLoader(row_bytes=model_dim, sort_block_m=sort_block_m,
+    a_pack = 2 if a_dtype == "fp4" else 1
+    a_gather = ATileLoader(row_bytes=model_dim // a_pack, sort_block_m=sort_block_m,
         k_step_bytes=a_k_step_bytes, total_threads=total_threads, swizzle=swizzle_a,
         x_tensor=x_tensor, async_copy=async_a_copy,
         indexed_input=indexed_input, row_map_rsrc=row_map_rsrc,
-        source_rows=source_rows)
+        source_rows=source_rows, a_dtype=a_dtype)
     # fmt: on
-    a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a)
+    a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a, a_dtype=a_dtype)
     b_loader = BWeightLoader(
         w_rsrc=w_rsrc,
         num_acc_n=num_acc_n,
@@ -325,12 +326,12 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         indexed_input=indexed_input,
         row_map_rsrc=row_map_rsrc,
     )
-    mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n)
+    mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n, a_dtype=a_dtype)
     # fmt: off
     epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
-        out_tensor=out_tensor if use_tile_resource else None, evec=evec,
+        out_tensor=out_tensor if use_tile_resource else None, evec=evec, out_dtype=out_dtype,
         act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta)
     # fmt: on
 
@@ -365,7 +366,7 @@ def compile_gemm1(
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, pipe_weights: bool = True,
     mfma_amajor: bool = False, swizzle_a: bool = True, async_a_copy: bool = False,
     use_tile_resource: bool = True, waves_per_eu_hint: int = 2, b_cache_modifier: int = 0,
-    swiglu_limit: float = 0.0,
+    a_dtype: str = "fp8", out_dtype: str = "fp8", swiglu_limit: float = 0.0,
     act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
 ):
     # fmt: on
@@ -376,6 +377,8 @@ def compile_gemm1(
     assert tile_n % num_waves == 0
     assert (2 * inter_dim) % tile_n == 0
     assert tile_k == 256 and model_dim % tile_k == 0
+    assert a_dtype in ("fp4", "fp8")
+    assert out_dtype in ("fp4", "fp8")
 
     n_per_wave = tile_n // num_waves
     n_tiles = (2 * inter_dim) // tile_n
@@ -383,8 +386,8 @@ def compile_gemm1(
     num_acc_n = n_per_wave // 16
     assert num_acc_n % 2 == 0 and m_repeat % 2 == 0
 
-    a_k_step_bytes = tile_k
-    out_row_bytes = inter_dim
+    a_k_step_bytes = tile_k // (2 if a_dtype == "fp4" else 1)
+    out_row_bytes = inter_dim // (2 if out_dtype == "fp4" else 1)
     k_iters = model_dim // tile_k
     total_threads = num_waves * 64
     a_lds_size = sort_block_m * a_k_step_bytes
@@ -417,7 +420,7 @@ def compile_gemm1(
         if const_expr(use_tile_resource):
             out_rsrc = None
         else:
-            out_elem = fx.Int16
+            out_elem = fx.Int8 if const_expr(out_dtype == "fp4") else fx.Int16
             out_rsrc = ptr_buf_tensor(
                 fx.get_iter(out),
                 out_elem,
@@ -427,7 +430,7 @@ def compile_gemm1(
         os_rsrc = ptr_buf_tensor(
             fx.get_iter(out_scale),
             fx.Int8,
-            num_records_bytes=num_valid * fx.Int32(scale_cols) + fx.Int32(8192),
+            num_records_bytes=num_valid * fx.Int32(scale_cols) + 8192,
         )
         wave_id = fx.thread_idx.x // 64
 
@@ -443,6 +446,7 @@ def compile_gemm1(
             expert_offset=expert_offset, b_cache_modifier=b_cache_modifier, swizzle_a=swizzle_a,
             pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, async_a_copy=async_a_copy,
             use_tile_resource=use_tile_resource, indirect_input=False,
+            a_dtype=a_dtype, out_dtype=out_dtype,
             swiglu_limit=swiglu_limit, evec=8 if use_tile_resource else 2,
             act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
 
@@ -475,7 +479,7 @@ def gemm1_kernel(
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, grid_mult: int = 4,
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
     async_a_copy: bool = False, use_tile_resource: bool = True, waves_per_eu_hint: int = 2,
-    num_cu: int = 256, b_cache_modifier: int = 0,
+    num_cu: int = 256, b_cache_modifier: int = 0, a_dtype: str = "fp8", out_dtype: str = "fp8",
     swiglu_limit: float = 0.0, act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
 ):
     # fmt: on
@@ -494,6 +498,7 @@ def gemm1_kernel(
         pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, swizzle_a=swizzle_a,
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, b_cache_modifier=b_cache_modifier,
+        a_dtype=a_dtype, out_dtype=out_dtype,
         swiglu_limit=swiglu_limit, act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
     )
     _run_compiled(

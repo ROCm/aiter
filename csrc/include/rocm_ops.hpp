@@ -25,6 +25,7 @@ namespace py = pybind11;
         .value("per_128x128", QuantType::per_128x128)                                       \
         .value("per_256x128", QuantType::per_256x128)                                       \
         .value("per_1024x128", QuantType::per_1024x128)                                     \
+        .value("iq2r_2bit", QuantType::iq2r_2bit)                                           \
         .export_values();                                                                   \
     pybind11::enum_<ActivationType>(m, "ActivationType")                                    \
         .value("No", ActivationType::No)                                                    \
@@ -33,6 +34,7 @@ namespace py = pybind11;
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .value("Situv2", ActivationType::Situv2)                                            \
         .value("GeluTanh", ActivationType::GeluTanh)                                        \
+        .value("Relu2", ActivationType::Relu2)                                              \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -636,7 +638,8 @@ namespace py = pybind11;
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
           py::arg("bf16_out_ptr")    = static_cast<int64_t>(0),                      \
-          py::arg("transpose_scale") = false);                                       \
+          py::arg("transpose_scale") = false,                                        \
+          py::arg("gemma_norm")      = false);                                       \
     m.def("fused_allreduce_rmsnorm_mxfp4_quant",                                     \
           &aiter::fused_allreduce_rmsnorm_mxfp4_quant,                               \
           py::arg("_fa"),                                                            \
@@ -650,7 +653,8 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                        \
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
-          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                        \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0),                         \
+          py::arg("gemma_norm")   = false);                                          \
     m.def("fused_qknorm_allreduce",                                                  \
           &aiter::fused_qknorm_allreduce,                                            \
           py::arg("_fa"),                                                            \
@@ -746,16 +750,16 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define GEMM_A4W4_BLOCKSCALE_PYBIND  \
-    m.def("gemm_a4w4_blockscale",    \
-          &gemm_a4w4_blockscale,     \
-          "fp4 blockscale gemm",     \
-          py::arg("XQ"),             \
-          py::arg("WQ"),             \
-          py::arg("x_scale"),        \
-          py::arg("w_scale"),        \
-          py::arg("Out"),            \
-          py::arg("splitK")     = 0, \
+#define GEMM_A4W4_BLOCKSCALE_PYBIND                 \
+    m.def("gemm_a4w4_blockscale",                   \
+          &aiter::torch_itfs::gemm_a4w4_blockscale, \
+          "fp4 blockscale gemm",                    \
+          py::arg("XQ"),                            \
+          py::arg("WQ"),                            \
+          py::arg("x_scale"),                       \
+          py::arg("w_scale"),                       \
+          py::arg("Out"),                           \
+          py::arg("splitK")     = 0,                \
           py::arg("kernelName") = "");
 
 #define GEMM_A8W8_BLOCKSCALE_PYBIND  \
@@ -856,16 +860,16 @@ namespace py = pybind11;
           py::arg("splitK")      = 0,                       \
           py::arg("preshuffleB") = true);
 
-#define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND \
-    m.def("gemm_a4w4_blockscale_tune",   \
-          &gemm_a4w4_blockscale_tune,    \
-          "gemm_a4w4_blockscale_tune",   \
-          py::arg("XQ"),                 \
-          py::arg("WQ"),                 \
-          py::arg("x_scale"),            \
-          py::arg("w_scale"),            \
-          py::arg("Out"),                \
-          py::arg("kernelId") = 0,       \
+#define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND                 \
+    m.def("gemm_a4w4_blockscale_tune",                   \
+          &aiter::torch_itfs::gemm_a4w4_blockscale_tune, \
+          "gemm_a4w4_blockscale_tune",                   \
+          py::arg("XQ"),                                 \
+          py::arg("WQ"),                                 \
+          py::arg("x_scale"),                            \
+          py::arg("w_scale"),                            \
+          py::arg("Out"),                                \
+          py::arg("kernelId") = 0,                       \
           py::arg("splitK")   = 0);
 
 #define GEMM_A8W8_PYBIND                    \
@@ -1496,7 +1500,20 @@ namespace py = pybind11;
           py::arg("dispatch_policy")   = 0,            \
           py::arg("local_topk_ids")    = std::nullopt, \
           py::arg("m_indices")         = std::nullopt, \
-          py::arg("reverse_sorted")    = std::nullopt);
+          py::arg("reverse_sorted")    = std::nullopt); \
+    m.def("mxfp4_moe_sort_quant_fwd",                  \
+          &mxfp4_moe_sort_quant_fwd,                   \
+          py::arg("hidden_states"),                    \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("activation_quant"),                 \
+          py::arg("activation_scale_token"),           \
+          py::arg("num_experts"));
 
 #define MLA_V4_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_gfx950_opus_fwd",      \
@@ -1895,8 +1912,13 @@ namespace py = pybind11;
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
           py::arg("world_size"),                                                           \
-          py::arg("qr_max_size") = std::nullopt);                                          \
+          py::arg("qr_max_size") = std::nullopt,                                           \
+          py::arg("quant_level") = std::nullopt);                                          \
     m.def("qr_destroy", &aiter::qr_destroy, "qr_destroy(int fa) -> ()", py::arg("fa"));    \
+    m.def("qr_uses_pull_q4",                                                               \
+          &aiter::qr_uses_pull_q4,                                                         \
+          "qr_uses_pull_q4(int fa) -> bool",                                               \
+          py::arg("fa"));                                                                  \
     m.def("qr_all_reduce",                                                                 \
           &aiter::qr_all_reduce,                                                           \
           "qr_all_reduce(int fa, Tensor inp, Tensor out,"                                  \
