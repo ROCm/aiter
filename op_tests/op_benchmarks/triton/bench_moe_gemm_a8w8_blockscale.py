@@ -1,7 +1,6 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-import argparse
 import csv
 import inspect
 import tempfile
@@ -21,6 +20,7 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # Default group_m, group_n, group_k
 group_shape = (128, 128, 128)
@@ -163,7 +163,7 @@ def bench_mlp_single_weight_init(
         / 10
     ).to(torch.float8_e4m3fn)
 
-    bg = torch.randn((n_expts_tot,), device=dev)
+    bg = torch.randn((n_expts_tot,), dtype=torch.float32, device=dev)
     b1 = torch.randn((n_expts_tot, dim2 // TP), dtype=torch.float32, device=dev)
     b2 = torch.randn((n_expts_tot, dim1), dtype=torch.float32, device=dev)
 
@@ -187,7 +187,7 @@ def bench_mlp_single_weight_init(
 
     # scales
     if x_dtype_str == "fp8":
-        x_static_scale = torch.tensor(1e-4, device=dev)
+        x_static_scale = torch.tensor(1e-4, dtype=torch.float32, device=dev)
     else:
         k_blocks_x = num_blocks(dim1, group_shape_k)
         if per_row_act_quant == "True":
@@ -199,7 +199,7 @@ def bench_mlp_single_weight_init(
             )
 
     if w_dtype_str == "fp8":
-        w_static_scale = torch.tensor(1e-4, device=dev)
+        w_static_scale = torch.tensor(1e-4, dtype=torch.float32, device=dev)
     else:
         k_blocks_w1 = num_blocks(dim1, group_shape_k)
         n_blocks_w1 = num_blocks(dim2 // TP, group_shape_n)
@@ -426,7 +426,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",

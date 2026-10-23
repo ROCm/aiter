@@ -58,7 +58,7 @@ def _gemm_splitk_reduce_kernel(
     offs_k = tl.arange(0, MAX_KSPLIT)
     c_in_ptrs = (
         c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
@@ -163,7 +163,7 @@ def _batched_gemm_splitk_reduce_kernel(
     c_in_ptrs = (
         c_in_ptr
         + batch_id * stride_c_in_b
-        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )

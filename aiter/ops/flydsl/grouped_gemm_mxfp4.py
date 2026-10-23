@@ -139,8 +139,14 @@ def flydsl_grouped_gemm_a8w4_masked(
     row_major_ascale=0,
     a_row_stride_bytes=0,
     a_scale_row_stride_bytes=0,
+    persistent_workers=0,
+    rolled_drain=0,
 ):
-    """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
+    """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
+
+    A positive persistent_workers bounds the grid independently of the routing
+    buffer capacity. Workers traverse the live device-side tile range.
+    """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
     if stream is None:
@@ -150,14 +156,37 @@ def flydsl_grouped_gemm_a8w4_masked(
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
         if float(situ_linear_beta) <= 0.0:
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
-    num_buffers = min(num_buffers, max(1, K // tile_k))
+    k_tiles = (K + tile_k - 1) // tile_k
+    num_buffers = min(num_buffers, max(1, k_tiles))
     has_bias = 1 if bias is not None else 0
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
     quant_scale_tensor = out if quant_scale is None else quant_scale.view(torch.uint8)
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
+    stage = 1 if stage1_act else 2
+    persistent_workers = int(
+        os.environ.get(
+            f"AITER_FLYDSL_PERSISTENT_WORKERS{stage}",
+            os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS", persistent_workers),
+        )
+    )
+    if persistent_workers < 0:
+        raise ValueError("persistent_workers must be nonnegative")
+    if persistent_workers:
+        if cluster_m != 1:
+            raise ValueError("persistent workers require cluster_m=1")
+        if stage2_scatter is not None and stage2_scatter.combine_quant_bits:
+            raise ValueError(
+                "persistent EP scatter requires an unquantized combine wire"
+            )
+        persistent_workers = (
+            (persistent_workers + cluster_n - 1) // cluster_n * cluster_n
+        )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    rolled_drain = int(rolled_drain)
+    if rolled_drain not in (0, 1):
+        raise ValueError("rolled_drain must be 0 or 1")
     if cluster_n > 1 and n_tiles % cluster_n:
         raise ValueError(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
@@ -230,5 +259,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         a_row_stride_bytes=int(a_row_stride_bytes),
         a_scale_row_stride_bytes=int(a_scale_row_stride_bytes),
         lds_soa_load_interleave=int(lds_soa_load_interleave),
+        persistent_workers=persistent_workers,
+        rolled_drain=rolled_drain,
     )
     return out
