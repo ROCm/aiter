@@ -350,7 +350,14 @@ def run_benchmark(args):
             num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
             num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
             block_attn_mask = (
-                torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+                torch.rand(
+                    BATCH,
+                    HQ,
+                    num_q_blocks,
+                    num_kv_blocks,
+                    device=device,
+                    dtype=torch.float32,
+                )
                 > args.block_sparsity
             ).to(torch.bool)
             block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
@@ -397,7 +404,9 @@ def run_benchmark_block_sparse_repetitions(args):
 
     # JIT warmup: compile kernel before timed runs so reported ms is not inflated.
     _warmup_mask = (
-        torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+        torch.rand(
+            BATCH, HQ, num_q_blocks, num_kv_blocks, device=device, dtype=torch.float32
+        )
         > args.block_sparsity
     ).to(torch.bool)
     _warmup_lut = block_attn_mask_to_ragged_lut(_warmup_mask)
@@ -411,7 +420,14 @@ def run_benchmark_block_sparse_repetitions(args):
     effective_tflops_list = []
     for _ in range(n_rep):
         block_attn_mask = (
-            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+            torch.rand(
+                BATCH,
+                HQ,
+                num_q_blocks,
+                num_kv_blocks,
+                device=device,
+                dtype=torch.float32,
+            )
             > args.block_sparsity
         ).to(torch.bool)
         block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
@@ -434,21 +450,21 @@ def run_benchmark_block_sparse_repetitions(args):
         effective_tflops = (sparse_flops / (ms * 1e-3)) / 1e12
         effective_tflops_list.append(effective_tflops)
 
-    t = torch.tensor(throughputs_tflops)
+    t = torch.tensor(throughputs_tflops, device=device, dtype=torch.float32)
     median_tflops = torch.quantile(t, 0.5).item()
     q1_tflops = torch.quantile(t, 0.25).item()
     q3_tflops = torch.quantile(t, 0.75).item()
     p10_tflops = torch.quantile(t, 0.1).item()
     p90_tflops = torch.quantile(t, 0.9).item()
 
-    t_lat = torch.tensor(latencies_ms)
+    t_lat = torch.tensor(latencies_ms, device=device, dtype=torch.float32)
     median_latency_ms = torch.quantile(t_lat, 0.5).item()
     q1_latency_ms = torch.quantile(t_lat, 0.25).item()
     q3_latency_ms = torch.quantile(t_lat, 0.75).item()
     p10_latency_ms = torch.quantile(t_lat, 0.1).item()
     p90_latency_ms = torch.quantile(t_lat, 0.9).item()
 
-    t_eff = torch.tensor(effective_tflops_list)
+    t_eff = torch.tensor(effective_tflops_list, device=device, dtype=torch.float32)
     median_effective_tflops = torch.quantile(t_eff, 0.5).item()
     q1_effective_tflops = torch.quantile(t_eff, 0.25).item()
     q3_effective_tflops = torch.quantile(t_eff, 0.75).item()
@@ -649,7 +665,8 @@ def load_captured_inputs(input_dir: str) -> list[dict[str, Any]]:
 
     inputs = []
     for f in input_files:
-        data = torch.load(f, weights_only=False)
+        # Keep captures in host memory. The full set can be larger than GPU memory.
+        data = torch.load(f, map_location="cpu", weights_only=False)
         inputs.append(data)
 
     return inputs
