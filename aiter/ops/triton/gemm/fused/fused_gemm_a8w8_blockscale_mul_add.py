@@ -139,9 +139,8 @@ def fused_gemm_a8w8_blockscale_mul_add(
         # (the dedicated fast 64x64 tile is miscompiled for fuse_type=1 on Triton 3.8).
         config, _ = _get_config(M, N, K, fuse_type)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
+    compute_splitk_params(config, K)
+
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
@@ -150,8 +149,6 @@ def fused_gemm_a8w8_blockscale_mul_add(
         )
     else:
         y_pp = None
-
-    compute_splitk_params(config, K)
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
