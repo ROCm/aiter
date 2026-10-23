@@ -417,6 +417,10 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
       DeepSeek-V4.1's original wo_a weight (32x32) and V4's (128x128) both run
       as is.
     * gfx1250, 128x128: flydsl.
+    * gfx1250, 32x32 or 1x32: flydsl's batched mxfp8_32 GEMM. A 32x32
+      w_scale is read raw; a 1x32 one is [G, N, K/32] holding
+      ``shuffle_scale_n32k4(w_scale, experts_cnt=G)`` bytes, the layout
+      every gfx1250 mxfp8_32 GEMM reads. Requires N % 32 == 0, K % 128 == 0.
 
     Returns a fresh token-major [M, G, N]. A caller that must write into its own
     buffer calls a backend directly (both keep ``out=``): the arch's

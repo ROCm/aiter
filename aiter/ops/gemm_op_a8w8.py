@@ -1198,6 +1198,18 @@ def gemm_a8w8_blockscale_bpreshuffle(
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     )
+    if use_gfx1250_flydsl_or_triton_mxfp8_128 and tuple(x_scale.shape) == (
+        m,
+        k // 32,
+    ):
+        # group32 (1x32 row-major x_scale) on gfx1250: FlyDSL mxfp8_32. A 1x32
+        # w_scale is the n32k4-shuffled one gemm_a8w8_mxfp8_bpreshuffle reads; a
+        # 32x32 one is read raw by the batched mxfp8_32 GEMM at B = 1.
+        if mxscale_w_scale_block(tuple(w_scale.shape), n, k) == "1x32":
+            return gemm_a8w8_mxfp8_bpreshuffle(
+                XQ, WQ, x_scale, w_scale, dtype=dtype, out=Y
+            )
+        return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y)
     if use_gfx1250_flydsl_or_triton_mxfp8_128:
         config = get_mxscale_bpreshuffle_config(
             m, n, k, mxscale_w_scale_block(tuple(w_scale.shape), n, k)
