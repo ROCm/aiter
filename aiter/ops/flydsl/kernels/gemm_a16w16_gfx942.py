@@ -835,11 +835,8 @@ def _reduce_split_k(
 
 @flyc.jit
 def _store_direct(frag_C, gC, thr_copy_C, c_r2g_atom, owns_tile, gated, is_fp32_output):
-    """Store the MMA fragment straight to global memory (aligned tiles only).
-
-    This removes the full-tile LDS cshuffle/barrier and allows macro-tiles whose
-    C footprint exceeds the 64 KB LDS capacity.
-    """
+    """Store the MMA fragment straight to global memory, skipping the LDS
+    staging and its barriers. Needs N to be a block_n multiple."""
     if const_expr(is_fp32_output):
         frag_C_out = frag_C
     else:
@@ -882,9 +879,9 @@ def _store_cshuffle(
 ):
     """Stage the C tile through LDS for coalesced, boundary-masked stores.
 
-    Also serves atomic split-K and the fp32 output. The tile is staged in the
-    output dtype, so fp32 output is not rounded to bf16. A tile over 64 KB
-    goes through LDS in ``c_chunks`` row chunks.
+    Atomic split-K always uses it. The tile is staged in the output dtype, so
+    fp32 output is not rounded to bf16. A tile over 64 KB goes through LDS in
+    ``c_chunks`` row chunks.
     """
     block_m = param.block_m
     block_n = param.block_n
@@ -1060,9 +1057,7 @@ def gemm_a16w16_gfx942_kernel(
         flag: fx.Array[fx.Int32, 4, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
-    # LDS stages are selected by offsetting these base pointers by
-    # stage * tile size: the swizzled LDS layouts must stay static, so the
-    # stage cannot be a dynamic layout mode.
+    # LDS stage s of the A/B tiles starts at s * tile size from these bases.
     smem_a = storage.ab.a.peek().ptr
     smem_b = storage.ab.b.peek().ptr
     smem_c = storage.c.peek().ptr
@@ -1487,12 +1482,14 @@ def _dynamic_tensor_arg(tensor, leading_dim):
 
 @functools.lru_cache(maxsize=128)
 def get_split_k_buffers(stream, device, split_k, split_k_reduce):
-    """Per-stream split-K tile semaphores and signals, zeroed once.
+    """Split-K tile semaphores and signals, one set per split_k and split_k_reduce.
 
-    Atomic split-K (``SplitKProtocol``) never resets its 64-bit tickets: each
-    launch advances them by split_k, which is how a split derives the launch
-    index, so they are keyed by split_k. The split_k_reduce arrival counters
-    are 32-bit and reset by the last split; they get their own buffers.
+    Zeroed once, never reset by the host. Atomic split-K (``SplitKProtocol``)
+    never resets its 64-bit tickets: each launch advances them by split_k,
+    which is how a split derives the launch index, so a set shared across
+    split_k values leaves splits waiting for a tag that never comes. The
+    split_k_reduce arrival counters are 32-bit and reset by the last split,
+    which would corrupt the tickets, so they get their own set.
     """
     sem_dtype = torch.int32 if split_k_reduce else torch.int64
     with persistent_alloc(torch.device(device)):
@@ -1524,8 +1521,8 @@ def get_split_k_workspace(device, numel: int) -> torch.Tensor:
     return ws
 
 
-# Search space of the fallback config and the tuner screen: pingpong tiles
-# with their (m, n, k) wave layouts. The cost model cannot tell
+# Search space of the fallback config and of the tuner's pingpong screen:
+# tiles with their (m, n, k) wave layouts. The cost model cannot tell
 # wave layouts or block_k apart, so earlier entries win its ties.
 CANDIDATE_TILES_M = (32, 64, 128, 256)
 CANDIDATE_TILES_N = (32, 48, 64, 96, 112, 128, 160, 192, 256)
@@ -1889,7 +1886,7 @@ def gemm_a16w16(
     user_kwargs = dict(user_kwargs or {})
     if _STRUCTURAL_KEYS & user_kwargs.keys():
         # A caller-chosen tile/pipeline must not inherit flags that were only
-        # valid for the auto-config's own tile/pipeline.
+        # valid for the default config's own tile/pipeline.
         for key in _AUTO_ONLY_PIPELINE_KEYS:
             auto.pop(key, None)
     kwargs.update(auto)

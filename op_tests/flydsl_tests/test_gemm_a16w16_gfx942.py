@@ -7,7 +7,7 @@ Compares the kernel against an f32 matmul oracle (bf16 inputs upcast to f32)
 within bf16 tolerance. Shapes cover down projections (large K, narrow N), up
 projections (short K, wide N), decode (tiny M), square compute-bound GEMMs and
 M/N boundary tiles, through both ``gemm_a16w16`` and the public
-``flydsl_hgemm`` dispatch (per-shape auto-config). Explicit configs cover every
+``flydsl_hgemm`` dispatch (per-shape default config). Explicit configs cover every
 main-loop pipeline, split-K mode and output dtype.
 
 Skips unless running on real gfx942 hardware.
@@ -97,7 +97,7 @@ def test_gemm_a16w16_gfx942(m, n, k, regime):
     "m,n,k,regime", SHAPES, ids=[f"{r}-M{m}" for m, n, k, r in SHAPES]
 )
 def test_flydsl_hgemm_gfx942_autoconfig(m, n, k, regime):
-    """Public dispatch with per-shape auto-config vs f32 oracle.
+    """Public dispatch with the per-shape default config vs f32 oracle.
 
     ``flydsl_hgemm`` takes AITER's B[N, K] convention directly (no transpose).
     """
