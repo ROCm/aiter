@@ -10,6 +10,7 @@
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 4,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 4
     },
     "M_LEQ_4": {
@@ -23,6 +24,7 @@
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 4,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 8
     },
     "M_LEQ_8": {
@@ -36,6 +38,7 @@
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 4,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 8
     },
     "M_LEQ_16": {
@@ -49,6 +52,7 @@
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 4,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 8
     },
     "M_LEQ_32": {
@@ -62,6 +66,7 @@
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 4,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 8
     },
     "M_LEQ_64": {
@@ -75,6 +80,7 @@
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 2,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 8
     },
     "M_LEQ_128": {
@@ -88,6 +94,7 @@
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 2,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 8
     },
     "M_LEQ_256": {
@@ -101,6 +108,7 @@
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 1,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 4
     },
     "M_LEQ_512": {
@@ -114,6 +122,7 @@
         "cache_modifier": null,
         "NUM_KSPLIT": 1,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 4
     },
     "any": {
@@ -127,6 +136,7 @@
         "cache_modifier": null,
         "NUM_KSPLIT": 1,
         "REDUCE_BLOCK_SIZE_M": 1,
+        "REDUCE_BLOCK_SIZE_N": 8192,
         "REDUCE_num_warps": 4
     }
 }

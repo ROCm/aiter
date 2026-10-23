@@ -15,6 +15,8 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
         "EVEN_K",
         "EVEN_MN",
         "cache_modifier",
@@ -24,7 +26,8 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "EVEN_K": lambda args: (args["K"] % args["SPLITK_BLOCK_SIZE"] == 0)
+        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
         "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
         and (args["N"] % args["BLOCK_SIZE_N"] == 0),
     }
@@ -57,6 +60,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     stride_in_cb,
     stride_in_cm,
     stride_in_cn,
+    stride_in_ck,
     stride_in_biasb,
     # Meta-parameters
     HAS_BIAS: tl.constexpr,
@@ -66,6 +70,8 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     EVEN_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
@@ -80,10 +86,13 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     The conversion scale for each matmul is received in the form of two 1D tensors that are multiplied to form a
     2D one before being applied.
 
+    With NUM_KSPLIT > 1, each program computes one K range of SPLITK_BLOCK_SIZE (whole quant groups) and
+    stores its scaled partial sum in plane pid_k of C (stride_ck). Bias is then not supported.
+
     Key parameters:
     - A: Batch tensor A with shape (B, M, K).
     - B: Batch tensor B with shape (B, K, N).
-    - C: Batch tensor C with shape (B, M, N).
+    - C: Batch tensor C with shape (B, M, N), or (NUM_KSPLIT, B, M, N) partial sums.
     - A_scale: First scale batch tensor with shape (B, M, 1).
     - B_scale: Second scale batch tensor with shape (B, 1, N).
     - Bias: Bias batch tensor with shape (B, 1, N).
@@ -98,6 +107,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     stride_cb = tl.cast(stride_in_cb, tl.int64)
     stride_cm = tl.cast(stride_in_cm, tl.int64)
     stride_cn = tl.cast(stride_in_cn, tl.int64)
+    stride_ck = tl.cast(stride_in_ck, tl.int64)
     stride_biasb = tl.cast(stride_in_biasb, tl.int64)
 
     tl.assume(stride_ab > 0)
@@ -114,197 +124,8 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     # -----------------------------------------------------------
     # Get batch program id
     batch_id = tl.program_id(axis=0)
-    # Map program ids `pid` to the block of C it should compute.
+    # Map program ids `pid` to the K split and the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
-    pid = tl.program_id(axis=1)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
-
-    batch_id = tl.cast(batch_id, tl.int64)
-    pid_m = tl.cast(pid_m, tl.int64)
-    pid_n = tl.cast(pid_n, tl.int64)
-
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    tl.assume(batch_id >= 0)
-
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    if EVEN_MN:
-        offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    else:
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    a_ptrs = a_ptr + (
-        batch_id * stride_ab
-        + offs_am[:, None] * stride_am
-        + offs_k[None, :] * stride_ak
-    )
-    b_ptrs = b_ptr + (
-        batch_id * stride_bb
-        + offs_k[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
-    )
-    one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
-    b_scale = tl.load(b_scale_ptr)
-
-    acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-
-    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
-        if EVEN_K:
-            a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs, cache_modifier=cache_modifier)
-        else:
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-
-        m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
-        a_scale = m.to(tl.float32) * one_over_DTYPE_MAX
-        a_scale_recip = 1.0 / a_scale
-        a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
-
-        accumulator += tl.dot(a, b) * a_scale
-
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    accumulator *= b_scale
-
-    if HAS_BIAS:
-        if EVEN_MN:
-            offs_bias = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        else:
-            offs_bias = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        bias = tl.load(bias_ptr + batch_id * stride_biasb + offs_bias)
-        accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
-
-    c = accumulator.to(c_ptr.type.element_ty)
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = (
-        c_ptr
-        + stride_cb * batch_id
-        + stride_cm * offs_cm[:, None]
-        + stride_cn * offs_cn[None, :]
-    )
-    if EVEN_MN:
-        tl.store(c_ptrs, c)
-    else:
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
-
-
-_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_splitk_repr = make_kernel_repr(
-    "_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_splitk_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "BLOCK_SIZE_K",
-        "GROUP_SIZE_M",
-        "NUM_KSPLIT",
-        "SPLITK_BLOCK_SIZE",
-        "EVEN_K",
-        "EVEN_MN",
-        "cache_modifier",
-    ],
-)
-
-
-@triton.heuristics(
-    {
-        "EVEN_K": lambda args: (args["K"] % args["SPLITK_BLOCK_SIZE"] == 0)
-        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
-        "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
-        and (args["N"] % args["BLOCK_SIZE_N"] == 0),
-    }
-)
-@triton.jit(
-    repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_splitk_repr,
-    do_not_specialize=["M", "N"],
-)
-def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_splitk_kernel(
-    # Pointers to matrices
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    # Matrix dimensions
-    M,
-    N,
-    K,
-    # Strides
-    stride_in_ab,
-    stride_in_am,
-    stride_in_ak,
-    stride_in_bb,
-    stride_in_bk,
-    stride_in_bn,
-    stride_in_ck,
-    stride_in_cb,
-    stride_in_cm,
-    stride_in_cn,
-    # Meta-parameters
-    DTYPE_MAX: tl.constexpr,
-    DTYPE_MIN: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    NUM_KSPLIT: tl.constexpr,
-    SPLITK_BLOCK_SIZE: tl.constexpr,
-    EVEN_K: tl.constexpr,
-    EVEN_MN: tl.constexpr,
-    cache_modifier: tl.constexpr,
-):
-    """
-    Note: this is Triton jited function and not meant to be called directly. Call
-    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant function with
-    y_scale
-
-    Key parameters:
-    - A: Batch tensor A with shape (B, M, K).
-    - B: Batch tensor B with shape (B, K, N).
-    - C: fp32 partial sums with shape (NUM_KSPLIT, B, M, N).
-    """
-
-    stride_ab = tl.cast(stride_in_ab, tl.int64)
-    stride_am = tl.cast(stride_in_am, tl.int64)
-    stride_ak = tl.cast(stride_in_ak, tl.int64)
-    stride_bb = tl.cast(stride_in_bb, tl.int64)
-    stride_bk = tl.cast(stride_in_bk, tl.int64)
-    stride_bn = tl.cast(stride_in_bn, tl.int64)
-    stride_ck = tl.cast(stride_in_ck, tl.int64)
-    stride_cb = tl.cast(stride_in_cb, tl.int64)
-    stride_cm = tl.cast(stride_in_cm, tl.int64)
-    stride_cn = tl.cast(stride_in_cn, tl.int64)
-
-    tl.assume(stride_ab > 0)
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bb > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
-    tl.assume(stride_ck > 0)
-    tl.assume(stride_cb > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
-
-    # -----------------------------------------------------------
-    # Get batch program id
-    batch_id = tl.program_id(axis=0)
-    # Map program ids `pid` to the split and the block of C it should compute.
     pid_unified = tl.program_id(axis=1)
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
@@ -354,8 +175,10 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_spl
         + offs_bn[None, :] * stride_bn
     )
     one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
+    b_scale = tl.load(b_scale_ptr)
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
     for k in range(tl.cdiv(k_span, BLOCK_SIZE_K)):
         if EVEN_K:
@@ -379,6 +202,18 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_spl
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
+    accumulator *= b_scale
+
+    if HAS_BIAS:
+        if EVEN_MN:
+            offs_bias = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        else:
+            offs_bias = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        bias = tl.load(bias_ptr + batch_id * stride_biasb + offs_bias)
+        accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
+
+    c = accumulator.to(c_ptr.type.element_ty)
+
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = (
@@ -389,10 +224,10 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_spl
         + stride_cn * offs_cn[None, :]
     )
     if EVEN_MN:
-        tl.store(c_ptrs, accumulator)
+        tl.store(c_ptrs, c)
     else:
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, accumulator, mask=c_mask)
+        tl.store(c_ptrs, c, mask=c_mask)
 
 
 _batched_gemm_a8w8_splitk_reduce_per_token_quant_repr = make_kernel_repr(
@@ -401,15 +236,38 @@ _batched_gemm_a8w8_splitk_reduce_per_token_quant_repr = make_kernel_repr(
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
         "NUM_KSPLIT",
+        "ONE_TILE",
         "EVEN_MN",
     ],
 )
 
 
+@triton.jit
+def _sum_splitk_partials(
+    c_in_ptrs,
+    stride_c_in_k,
+    mask,
+    NUM_KSPLIT: tl.constexpr,
+    EVEN_MN: tl.constexpr,
+):
+    if EVEN_MN:
+        acc = tl.load(c_in_ptrs).to(tl.float32)
+        for k in tl.static_range(1, NUM_KSPLIT):
+            acc += tl.load(c_in_ptrs + k * stride_c_in_k).to(tl.float32)
+    else:
+        acc = tl.load(c_in_ptrs, mask=mask, other=0.0).to(tl.float32)
+        for k in tl.static_range(1, NUM_KSPLIT):
+            acc += tl.load(c_in_ptrs + k * stride_c_in_k, mask=mask, other=0.0).to(
+                tl.float32
+            )
+    return acc
+
+
 @triton.heuristics(
     {
+        "ONE_TILE": lambda args: args["N"] <= args["BLOCK_SIZE_N"],
         "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
-        and (args["N"] == args["BLOCK_SIZE_N"]),
+        and (args["N"] % args["BLOCK_SIZE_N"] == 0),
     }
 )
 @triton.jit(
@@ -420,7 +278,6 @@ def _batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel(
     c_in_ptr,
     y_ptr,
     y_scale_ptr,
-    b_scale_ptr,
     M,
     N,
     stride_in_c_in_k,
@@ -434,6 +291,7 @@ def _batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
+    ONE_TILE: tl.constexpr,
     EVEN_MN: tl.constexpr,
 ):
     """
@@ -441,8 +299,12 @@ def _batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel(
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant function with
     y_scale
 
+    Sums the split-K partials of each row and quantizes the row to FP8 with one scale.
+    A row wider than BLOCK_SIZE_N is done in tiles: a first pass finds the row amax and a
+    second pass quantizes.
+
     Key parameters:
-    - C: Partial sums with shape (NUM_KSPLIT, M, N), N = batch * N of the GEMM.
+    - C: W-scaled partial sums with shape (NUM_KSPLIT, M, N), N = batch * N of the GEMM.
     - Y: Quantized output with shape (M, N).
     - Y_scale: Per-row scales with shape (M,).
     """
@@ -466,34 +328,65 @@ def _batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel(
 
     offs_m = tl.cast(pid_m, tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_N)
-    c_in_ptrs = (
-        c_in_ptr + offs_m[:, None] * stride_c_in_m + offs_n[None, :] * stride_c_in_n
-    )
-    if EVEN_MN:
-        acc = tl.load(c_in_ptrs).to(tl.float32)
-        for k in tl.static_range(1, NUM_KSPLIT):
-            acc += tl.load(c_in_ptrs + k * stride_c_in_k).to(tl.float32)
+    c_in_rows = c_in_ptr + offs_m[:, None] * stride_c_in_m
+    y_rows = y_ptr + offs_m[:, None] * stride_y_m
+    row_mask = offs_m[:, None] < M
+
+    if ONE_TILE:
+        mask = row_mask & (offs_n[None, :] < N)
+        acc = _sum_splitk_partials(
+            c_in_rows + offs_n[None, :] * stride_c_in_n,
+            stride_c_in_k,
+            mask,
+            NUM_KSPLIT,
+            EVEN_MN,
+        )
+        y_scale = tl.maximum(tl.max(tl.abs(acc), axis=1), 1e-10) * (1.0 / DTYPE_MAX)
+        y_scale_recip = 1.0 / y_scale
+        y = acc * y_scale_recip[:, None]
+        y = tl.clamp(y, DTYPE_MIN, DTYPE_MAX).to(y_ptr.dtype.element_ty)
+        y_ptrs = y_rows + offs_n[None, :] * stride_y_n
+        if EVEN_MN:
+            tl.store(y_ptrs, y)
+        else:
+            tl.store(y_ptrs, y, mask=mask)
     else:
-        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        acc = tl.load(c_in_ptrs, mask=mask, other=0.0).to(tl.float32)
-        for k in tl.static_range(1, NUM_KSPLIT):
-            acc += tl.load(c_in_ptrs + k * stride_c_in_k, mask=mask, other=0.0).to(
-                tl.float32
+        row_amax = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+        for start_n in range(0, N, BLOCK_SIZE_N):
+            cols = start_n + offs_n
+            mask = row_mask & (cols[None, :] < N)
+            acc = _sum_splitk_partials(
+                c_in_rows + cols[None, :] * stride_c_in_n,
+                stride_c_in_k,
+                mask,
+                NUM_KSPLIT,
+                EVEN_MN,
             )
-    acc *= tl.load(b_scale_ptr)
+            row_amax = tl.maximum(row_amax, tl.max(tl.abs(acc), axis=1))
+        y_scale = tl.maximum(row_amax, 1e-10) * (1.0 / DTYPE_MAX)
+        y_scale_recip = 1.0 / y_scale
+        for start_n in range(0, N, BLOCK_SIZE_N):
+            cols = start_n + offs_n
+            mask = row_mask & (cols[None, :] < N)
+            acc = _sum_splitk_partials(
+                c_in_rows + cols[None, :] * stride_c_in_n,
+                stride_c_in_k,
+                mask,
+                NUM_KSPLIT,
+                EVEN_MN,
+            )
+            y = acc * y_scale_recip[:, None]
+            y = tl.clamp(y, DTYPE_MIN, DTYPE_MAX).to(y_ptr.dtype.element_ty)
+            y_ptrs = y_rows + cols[None, :] * stride_y_n
+            if EVEN_MN:
+                tl.store(y_ptrs, y)
+            else:
+                tl.store(y_ptrs, y, mask=mask)
 
-    y_scale = tl.maximum(tl.max(tl.abs(acc), axis=1), 1e-10) * (1.0 / DTYPE_MAX)
-    y_scale_recip = 1.0 / y_scale
-    y = acc * y_scale_recip[:, None]
-    y = tl.clamp(y, DTYPE_MIN, DTYPE_MAX).to(y_ptr.dtype.element_ty)
-
-    y_ptrs = y_ptr + offs_m[:, None] * stride_y_m + offs_n[None, :] * stride_y_n
     y_scale_ptrs = y_scale_ptr + offs_m * stride_y_scale_m
     if EVEN_MN:
-        tl.store(y_ptrs, y)
         tl.store(y_scale_ptrs, y_scale)
     else:
-        tl.store(y_ptrs, y, mask=mask)
         tl.store(y_scale_ptrs, y_scale, mask=offs_m < M)
 
 
