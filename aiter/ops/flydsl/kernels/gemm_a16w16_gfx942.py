@@ -193,8 +193,9 @@ def make_gemm_a16w16_gfx942_param(
             raise ValueError("k_waves must be a power of two")
         if not pingpong:
             raise ValueError("k_waves > 1 requires the pingpong pipeline")
-        if block_k % (k_waves * 32) != 0:
-            raise ValueError("each K wave needs whole 32-element K chunks")
+    # Each K wave reads LDS in 128-bit (32-element) K chunks of two MFMA K steps.
+    if block_k % (k_waves * 32) != 0:
+        raise ValueError("block_k // k_waves must be a multiple of 32")
     if split_k < 1:
         raise ValueError("split_k must be >= 1")
     if split_k_reduce and split_k == 1:
@@ -941,12 +942,13 @@ def _store_cshuffle(
                 local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
                 global_row = block_m_offset + chunk * chunk_rows + local_row
                 global_col = block_n_offset + local_col
-                if (global_row < m) and (global_col < n) and is_last:
+                global_offset = global_row * n + global_col
+                in_rows = (global_row < m) and is_last
+                if in_rows and (global_col + cshuffle_r2g_vec_size <= n):
                     c_vec = fx.ptr_load(
                         smem_c + local_row * block_n + local_col,
                         result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, c_dtype),
                     )
-                    global_offset = global_row * n + global_col
                     write_cshuffle_vec_to_global(
                         out,
                         out_buf,
@@ -955,6 +957,27 @@ def _store_cshuffle(
                         is_split_k,
                         is_fp32_output,
                     )
+                # Ragged N: the vector straddling column n is stored element by
+                # element, else it would spill into the next row.
+                if (
+                    in_rows
+                    and (global_col < n)
+                    and (global_col + cshuffle_r2g_vec_size > n)
+                ):
+                    for e in range_constexpr(cshuffle_r2g_vec_size):
+                        if global_col + e < n:
+                            c_elem = fx.ptr_load(
+                                smem_c + local_row * block_n + local_col + e,
+                                result_type=fx.Vector.make_type(1, c_dtype),
+                            )
+                            write_cshuffle_vec_to_global(
+                                out,
+                                out_buf,
+                                global_offset + e,
+                                c_elem,
+                                is_split_k,
+                                is_fp32_output,
+                            )
 
 
 @flyc.kernel
@@ -1583,6 +1606,9 @@ def shape_error(m: int, n: int, k: int, cfg: dict) -> str | None:
         return f"K={k} must be divisible by block_k={block_k} (K-tail unsupported)"
     if cfg["direct_store"] and n % cfg["block_n"]:
         return "direct_store requires N to be a block_n multiple"
+    # SplitKProtocol.zero_c clears C in whole fp32x4 vectors.
+    if split_k > 1 and not cfg["split_k_reduce"] and n % 4:
+        return f"atomic split-K requires N to be a multiple of 4 (got N={n})"
     k_tiles = k // block_k
     last_split_tiles = k_tiles - (split_k - 1) * -(-k_tiles // split_k)
     if last_split_tiles < 1:

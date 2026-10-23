@@ -506,6 +506,42 @@ def test_gemm_a16w16_gfx942_fallback(m, n, k, monkeypatch):
     _assert_close(y, ref, f"fallback M{m} N{n} K{k}")
 
 
+@pytest.mark.parametrize("out_dtype", OUT_DTYPES, ids=OUT_DTYPE_IDS)
+@pytest.mark.parametrize(
+    "split_k",
+    [{}, {"split_k": 2, "split_k_reduce": True}],
+    ids=["default", "workspace-split-k"],
+)
+@pytest.mark.parametrize("n", [337, 339])
+def test_gemm_a16w16_gfx942_ragged_n(n, split_k, out_dtype):
+    """N not a multiple of the store vector: the last vector of each row stops at N."""
+    _require_gfx942()
+    m, k = 200, 512
+    x, w, ref = _inputs(m, n, k)
+    out = _guarded_out(m, n, out_dtype)
+    cfg = {"block_m": 64, "block_n": 64, "block_k": 64, **split_k} if split_k else {}
+    y = gemm_a16w16(x, w.t(), out=out[:m], layout="nt", user_kwargs=cfg)
+    torch.cuda.synchronize()
+    _assert_close(y, ref, f"ragged N{n} {split_k} {out_dtype}")
+    assert torch.isnan(out[m:]).all(), "stores past N overwrote the guard rows"
+
+
+@pytest.mark.parametrize(
+    "cfg,match",
+    [
+        ({"split_k": 2, "split_k_reduce": False}, "multiple of 4"),
+        ({"block_k": 16}, "multiple of 32"),
+    ],
+    ids=["atomic-split-k-ragged-n", "block_k-16"],
+)
+def test_gemm_a16w16_gfx942_rejects_unsupported(cfg, match):
+    _require_gfx942()
+    x, w, _ = _inputs(64, 337, 256)
+    tile = {"block_m": 32, "block_n": 32, "block_k": 64, "m_waves": 1, "n_waves": 1}
+    with pytest.raises(ValueError, match=match):
+        gemm_a16w16(x, w.t(), layout="nt", user_kwargs={**tile, **cfg})
+
+
 @pytest.mark.parametrize("layout", ["nn", "tn", "tt"])
 def test_gemm_a16w16_gfx942_rejects_transposed_layouts(layout):
     _require_gfx942()
