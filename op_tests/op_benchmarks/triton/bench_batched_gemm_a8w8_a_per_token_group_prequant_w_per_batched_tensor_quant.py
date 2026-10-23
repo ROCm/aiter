@@ -79,7 +79,7 @@ def bench_gemm_fn(
             YQ=y,
             transpose_bm=transpose_bm,
             backend=backend,
-            y_scale=y_scale,
+            y_scale_out=y_scale,
         )
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
