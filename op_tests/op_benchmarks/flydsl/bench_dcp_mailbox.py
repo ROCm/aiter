@@ -40,6 +40,11 @@ def _graph_us(fn, reps=29):
         for _ in range(reps):
             fn()
     torch.cuda.synchronize()
+    # Every rank waits on its peers, so align the ranks before the timed replay.
+    dist.barrier()
+    g.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
     start, end = torch.cuda.Event(True), torch.cuda.Event(True)
     start.record()
     g.replay()
@@ -55,20 +60,32 @@ def worker(rank, world):
     dist.init_process_group("nccl", rank=rank, world_size=world)
     group = _Group(dist.new_group(backend="gloo"), rank, world)
     try:
-        tokens, hl, dim = 16, 12, 512
-        cws = CombineWorkspace(group, torch.device("cuda"), hl, dim, 64)
-        out = torch.randn(tokens, world * hl, dim, device="cuda", dtype=torch.bfloat16)
-        lse = torch.randn(tokens, world * hl, device="cuda", dtype=torch.float32)
+        tokens, hl = 16, 12
+        for dim in (128, 512, 576):
+            cws = CombineWorkspace(group, torch.device("cuda"), hl, dim, 64)
+            out = torch.randn(
+                tokens, world * hl, dim, device="cuda", dtype=torch.bfloat16
+            )
+            lse = torch.randn(tokens, world * hl, device="cuda", dtype=torch.float32)
+            combine_us = _graph_us(
+                lambda w=cws, o=out, s=lse: dcp_lse_combine(w, o, s, return_lse=True)
+            )
+            if rank == 0:
+                print(
+                    f"DCP_MAILBOX_BENCH combine ranks={world} tokens={tokens} "
+                    f"heads={hl} dim={dim} {combine_us:.2f} us",
+                    flush=True,
+                )
+        dim = 512
         gws = GatherWorkspace(
             group, torch.device("cuda"), hl, dim, torch.bfloat16, world * hl, 64
         )
         query = torch.randn(tokens, hl, dim, device="cuda", dtype=torch.bfloat16)
-        combine_us = _graph_us(lambda: dcp_lse_combine(cws, out, lse, return_lse=True))
         gather_us = _graph_us(lambda: dcp_query_gather(gws, query))
         if rank == 0:
             print(
-                f"DCP_MAILBOX_BENCH ranks={world} tokens={tokens} heads={hl} dim={dim} "
-                f"combine={combine_us:.2f} us gather={gather_us:.2f} us",
+                f"DCP_MAILBOX_BENCH gather ranks={world} tokens={tokens} "
+                f"heads={hl} dim={dim} {gather_us:.2f} us",
                 flush=True,
             )
     finally:
