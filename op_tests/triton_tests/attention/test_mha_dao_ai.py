@@ -14,6 +14,7 @@ from aiter.ops.triton.attention.mha import (
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
+    attn_bias_from_alibi_slopes,
     construct_local_mask,
     generate_qkv,
     generate_random_padding_mask,
@@ -37,6 +38,80 @@ def dao_ai_impl():
     mha_set_impl("dao_ai")
     yield
     mha_set_impl("default")
+
+
+@pytest.mark.parametrize(
+    "batch,seqlen_q,seqlen_k,head_dim",
+    [(4, 113, 203, 59), (1, 256, 256, 64)],
+)
+def test_mha_dao_ai_causal_dropout_alibi_backward(batch, seqlen_q, seqlen_k, head_dim):
+    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 causal backward configuration regression")
+
+    torch.manual_seed(0)
+    heads = 6
+    shape_q = (batch, seqlen_q, heads, head_dim)
+    shape_kv = (batch, seqlen_k, heads, head_dim)
+    q = torch.randn(shape_q, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(shape_kv, device="cuda", dtype=torch.float16, requires_grad=True)
+    v = torch.randn(shape_kv, device="cuda", dtype=torch.float16, requires_grad=True)
+    slopes = torch.rand(batch, heads, device="cuda") * 0.3
+    dropout_p = 0.17
+
+    softmax_scale = head_dim**-0.5
+    out, lse, scores, rng_state = flash_attn_2.fwd(
+        q=q,
+        k=k,
+        v=v,
+        out=None,
+        alibi_slopes=slopes,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size_left=-1,
+        window_size_right=-1,
+        softcap=0.0,
+        return_softmax=True,
+    )
+    do = torch.randn_like(out)
+    dq, dk, dv, _ = flash_attn_2.bwd(
+        dout=do,
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        softmax_lse=lse,
+        dq=None,
+        dk=None,
+        dv=None,
+        alibi_slopes=slopes,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size_left=-1,
+        window_size_right=-1,
+        softcap=0.0,
+        deterministic=True,
+        rng_state=rng_state,
+    )
+
+    bias = attn_bias_from_alibi_slopes(slopes, seqlen_q, seqlen_k, causal=True)
+    out_ref, _, _ = attention_ref(
+        q,
+        k,
+        v,
+        attn_bias=bias,
+        dropout_p=dropout_p,
+        dropout_mask=scores >= 0,
+        causal=True,
+    )
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q, k, v), do)
+    for actual, expected in ((dq, dq_ref), (dk, dk_ref), (dv, dv_ref)):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import attention_mask
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     AUTOTUNE,
     DEBUG,
@@ -3112,7 +3113,6 @@ def _bwd_dq_inner(
     # if HEAD_DIM is padded
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK
     PADDED_HEAD_V: tl.constexpr = ACTUAL_HEAD_DIM_V != HEAD_DIM_V
-    delta_qk = seqlen_q - seqlen_k
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k_qk = tl.arange(0, HEAD_DIM_QK)
@@ -3146,7 +3146,6 @@ def _bwd_dq_inner(
             print(f"mask_n: {mask_n.shape}\n{mask_n}")
         mask_kT = mask_n[None, :]
         mask_vT = mask_n[None, :]
-        mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
         if PADDED_HEAD_QK:
             mask_kT &= offs_k_qk[:, None] < ACTUAL_HEAD_DIM_QK
         if PADDED_HEAD_V:
@@ -3185,48 +3184,23 @@ def _bwd_dq_inner(
         # We shift qk by m to avoid numerical issues
         qk_shifted = tl.where(m == float("-inf"), float("-inf"), qk_scaled - m)
 
+        allowed = attention_mask(
+            offs_m,
+            offs_n,
+            seqlen_q,
+            seqlen_k,
+            MASK,
+            USE_SLIDING_WINDOW,
+            WINDOW_SIZE_LEFT,
+            WINDOW_SIZE_RIGHT,
+        )
+        # This dQ iteration can stop before the end of K.
+        allowed = allowed & (offs_n[None, :] < end_n)
+        qk_shifted = tl.where(allowed, qk_shifted, float("-inf"))
         if USE_EXP2:
             p = tl.math.exp2(qk_shifted * RCP_LN2)
         else:
             p = tl.math.exp(qk_shifted)
-
-        # Causal and sliding-window masking.
-        if MASK or USE_SLIDING_WINDOW:
-            mask = mask_mn
-            if MASK:
-                causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
-                mask = causal_mask & mask
-            if USE_SLIDING_WINDOW:
-                # Per-element form of the band a query m attends:
-                #   m + (seqlen_k - seqlen_q) - L <= n <= m + (seqlen_k - seqlen_q) + R.
-                # _sliding_window_k_bounds() is the block-range inversion of this same
-                # inequality (it bounds n for a fixed Q block); keep the two in sync.
-                causal_offset = seqlen_k - seqlen_q
-                if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
-                    # both edges unbounded -> window keeps every key (the causal
-                    # cap, if any, is applied separately via MASK above)
-                    window_mask = offs_n[None, :] >= 0
-                elif WINDOW_SIZE_LEFT < 0:
-                    window_mask = offs_n[None, :] <= (
-                        offs_m[:, None] + causal_offset + WINDOW_SIZE_RIGHT
-                    )
-                elif WINDOW_SIZE_RIGHT < 0:
-                    # unbounded right, finite left (mirror of infinite-left)
-                    window_mask = offs_n[None, :] >= (
-                        offs_m[:, None] + causal_offset - WINDOW_SIZE_LEFT
-                    )
-                else:
-                    left_bound = offs_m[:, None] + causal_offset - WINDOW_SIZE_LEFT
-                    right_bound = offs_m[:, None] + causal_offset + WINDOW_SIZE_RIGHT
-                    window_mask = (offs_n[None, :] >= left_bound) & (
-                        offs_n[None, :] <= right_bound
-                    )
-                mask = window_mask & mask
-            p = tl.where(mask, p, 0.0)
-        else:
-            # Keys past end_n are loaded as 0, so p = exp(-m) there, which overflows to inf when every
-            # logit of the row is very negative (m < -88). inf * kT(=0) would then put NaN in dq.
-            p = tl.where(mask_mn, p, 0.0)
         # Compute dP and dS.
         if IS_FP8:
             dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
