@@ -17,7 +17,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 MMA_operation: gl.constexpr = (
     gl.amd.gfx1250.wmma if gl.constexpr(IS_DEVICE_ARCH_GFX12) else gl.amd.cdna4.mfma
 )

@@ -349,7 +349,7 @@ def mla_decode_v4_asm_eager(
     del softmax_scale  # kernel hardcodes 1/sqrt(512)
     dev = Q.device.index
     runtime_gfx, warp_size = _device_info(dev)
-    preload = runtime_gfx == "gfx1250"
+    preload = runtime_gfx in ("gfx1250", "gfx1250-strict")
 
     out_16_nosplit = 1 if int(num_kv_splits) == 1 else 0
     if sink is None or sink.data_ptr() == 0:

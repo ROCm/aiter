@@ -55,7 +55,7 @@ def flydsl_batched_gemm_mxfp4(
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"[FlyDSL] unsupported out dtype {dtype}")
 
-    if gfx == "gfx1250":
+    if gfx in ("gfx1250", "gfx1250-strict"):
         return _run_gfx1250(
             a,
             w,

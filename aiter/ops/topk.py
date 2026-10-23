@@ -78,7 +78,7 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     )
     if not input_ok or not bias_ok or not outputs_ok or not same_device:
         return False
-    return get_gfx_runtime() == "gfx1250"
+    return get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
 
 
 def _gfx1250_exact_sigmoid_topk(

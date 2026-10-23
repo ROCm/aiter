@@ -1072,7 +1072,7 @@ def resolve_activation_dtype(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    if gfx == "gfx1250":
+    if gfx in ("gfx1250", "gfx1250-strict"):
         if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
             q_dtype_a = dtypes.fp8
         else:
@@ -1479,7 +1479,11 @@ def _fused_moe_impl(
     isG1U1 = inter_dim != w1.shape[1]
     isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     # gfx1250: GUGU row-interleave, not 16-row block shuffle.
-    if get_gfx() == "gfx1250" and isG1U1 and gate_mode != GateMode.INTERLEAVE:
+    if (
+        get_gfx() in ("gfx1250", "gfx1250-strict")
+        and isG1U1
+        and gate_mode != GateMode.INTERLEAVE
+    ):
         raise ValueError(
             "gfx1250 fused_moe requires gu_interleave weight layout "
             f"(gate_mode={GateMode.INTERLEAVE.value!r}), got {gate_mode.value!r}"

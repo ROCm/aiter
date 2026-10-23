@@ -1946,7 +1946,7 @@ def _flash_attn_forward(
         # gfx1250 ASM bf16 forward (fmha_fwd_with_sink_asm).  Single-shot batched
         # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
         # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
-        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
+        ret = get_gfx() in ("gfx1250", "gfx1250-strict") and is_gfx1250_asm_supported()
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (hdim_q in (64, 128))
         ret = ret and (hdim_v == hdim_q)
@@ -1982,7 +1982,7 @@ def _flash_attn_forward(
         # (e4m3) q/k/v with microscaling (e8m0) block-scale descale buffers.
         # The e8m0 descale dtype is what distinguishes MXFP8 from the per-tensor
         # fp8 path (is_fmha_v3_fp8, which uses fp32 descales on gfx942/gfx950).
-        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
+        ret = get_gfx() in ("gfx1250", "gfx1250-strict") and is_gfx1250_asm_supported()
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -3013,7 +3013,7 @@ def _flash_attn_varlen_forward(
         # Packed THD (batch folded into the token axis); no dropout / swa /
         # quant / alibi / bias / paged (block_table) / logits-soft-cap.  Sink
         # logits (per-Q-head fp32) supported; sink-token (sink_size) not.
-        ret = get_gfx() == "gfx1250" and is_gfx1250_asm_supported()
+        ret = get_gfx() in ("gfx1250", "gfx1250-strict") and is_gfx1250_asm_supported()
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (
             (hdim_q in (64, 128) and hdim_v == hdim_q)

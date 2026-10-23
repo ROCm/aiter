@@ -210,7 +210,7 @@ def get_flydsl_a16w16_configs(
         return []
     if out_dtype not in (dtype, torch.float32):
         return []
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         return _gfx1250_configs(m, n, k)
     if make_gemm_a16w16_param_and_validate is None:
         return []

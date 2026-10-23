@@ -99,7 +99,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     PERSISTENT_NEXT_N: gl.constexpr = 1,
     ContextLenStride: gl.constexpr = 1,
 ):
-    IS_GFX1250: gl.constexpr = ARCH == "gfx1250"
+    IS_GFX1250: gl.constexpr = ARCH in ("gfx1250", "gfx1250-strict")
     if PERSISTENT:
         next_n = PERSISTENT_NEXT_N
     pid = tl.program_id(0)
@@ -577,7 +577,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     PERSISTENT_NEXT_N: gl.constexpr = 1,
     ContextLenStride: gl.constexpr = 1,
 ):
-    IS_GFX1250: gl.constexpr = ARCH == "gfx1250"
+    IS_GFX1250: gl.constexpr = ARCH in ("gfx1250", "gfx1250-strict")
     if PERSISTENT:
         next_n = PERSISTENT_NEXT_N
     # ===---------------------------------------------------

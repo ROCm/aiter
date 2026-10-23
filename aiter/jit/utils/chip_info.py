@@ -628,7 +628,7 @@ def get_device_name():
         return "MI300"
     elif gfx == "gfx950":
         return "MI350"
-    elif gfx == "gfx1250":
+    elif gfx in ("gfx1250", "gfx1250-strict"):
         return "MI400"
     else:
         raise RuntimeError("Unsupported gfx")

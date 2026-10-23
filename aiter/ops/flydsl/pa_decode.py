@@ -70,7 +70,7 @@ def launch_pa_decode_ps_reduce(
             f"{props.multi_processor_count} partitions"
         )
     arch = get_gfx_runtime()
-    wave = 32 if arch == "gfx1250" else 64
+    wave = 32 if arch in ("gfx1250", "gfx1250-strict") else 64
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = 1024 // wave
     batch, kv_heads = output.shape[0], output.shape[2]
@@ -605,7 +605,7 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
     direct_output = (
-        arch == "gfx1250"
+        arch in ("gfx1250", "gfx1250-strict")
         and num_partitions == 1
         and sinks is None
         and output.stride() == query.stride()

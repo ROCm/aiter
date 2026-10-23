@@ -178,7 +178,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
 ) -> Tensor:
     kernel_name = str(config.get("kernelName", ""))
     # gfx1250 runs the WMMA ptpc backend; other archs use the MFMA preshuffle path.
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
 
         return run_gemm_a8w8_bpreshuffle_gfx1250(
@@ -777,7 +777,7 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "flydsl":
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
             kernel_fits_shape,
             kernels_list,
@@ -1194,7 +1194,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
-        get_gfx() == "gfx1250"
+        get_gfx() in ("gfx1250", "gfx1250-strict")
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     )
@@ -1314,7 +1314,10 @@ def gemm_a8w8_blockscale_bpreshuffle(
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.
-    if (config is not None and config["libtype"] == "triton") or get_gfx() == "gfx1250":
+    if (config is not None and config["libtype"] == "triton") or get_gfx() in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
         # kernelName optionally carries the backend hint ("triton"/"gluon");
         # anything else -> None (auto gluon->triton detection). config=None lets
         # the triton impl load its own tuned config internally. WQ is already
@@ -1500,7 +1503,7 @@ def gemm_a8w8_blockscale_abpreshuffle(
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     if not (
-        get_gfx() == "gfx1250"
+        get_gfx() in ("gfx1250", "gfx1250-strict")
         and x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
     ):

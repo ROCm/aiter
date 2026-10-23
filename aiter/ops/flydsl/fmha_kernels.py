@@ -394,7 +394,7 @@ def flydsl_flash_attn_varlen_func(
         torch.is_tensor(sink) and sink.dtype == torch.float32 and sink.shape == (_nq,)
     )
     supported = (
-        get_gfx() == "gfx1250"
+        get_gfx() in ("gfx1250", "gfx1250-strict")
         and _use_fdsl_wave8_fmha
         and k.shape[-1] == qk_hdim
         and q.dtype in (torch.bfloat16, torch.float16)
@@ -516,7 +516,7 @@ def flydsl_flash_attn_batch_func(
         torch.is_tensor(sink) and sink.dtype == torch.float32 and sink.shape == (_nq,)
     )
     supported = (
-        get_gfx() == "gfx1250"
+        get_gfx() in ("gfx1250", "gfx1250-strict")
         and q.dim() == 4
         and _use_fdsl_wave8_fmha
         and k.shape[-1] == qk_hdim

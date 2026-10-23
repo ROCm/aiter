@@ -148,7 +148,7 @@ def _triton_add_rows(
 
 
 def _use_triton() -> bool:
-    return not ENABLE_CK or get_gfx() == "gfx1250"
+    return not ENABLE_CK or get_gfx() in ("gfx1250", "gfx1250-strict")
 
 
 # The CK binding rejects None for weight / bias; reject it the same way here.

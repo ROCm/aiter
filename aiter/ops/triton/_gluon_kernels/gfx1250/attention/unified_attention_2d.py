@@ -951,7 +951,7 @@ class AttentionProgram:
     ):
         casted_out = out.to(self.output_ptr.dtype.element_ty)
 
-        if USE_TDM and self.cfg.ARCH_NAME == "gfx1250":
+        if USE_TDM and self.cfg.ARCH_NAME in ("gfx1250", "gfx1250-strict"):
             STORE_COLS: gl.constexpr = self.cfg.NUM_QUERIES_PER_KV * self.cfg.HEAD_SIZE
             o_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
                 vec=1, per_phase=1, max_phase=1, order=[1, 0]
@@ -1268,11 +1268,12 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
     """
     cfg: gl.constexpr = pgm.cfg
     # Merged TDM waits require 3 buffers so V_{i+1} can stay pending
-    MERGE_LOOP_TDM_WAITS: gl.constexpr = (
-        cfg.NUM_BUFFERS == 3 and pgm.cfg.ARCH_NAME == "gfx1250"
+    MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3 and pgm.cfg.ARCH_NAME in (
+        "gfx1250",
+        "gfx1250-strict",
     )
     MERGE_EPI_TDM_WAITS: gl.constexpr = False
-    SPLIT_SOFTMAX0: gl.constexpr = pgm.cfg.ARCH_NAME == "gfx1250"
+    SPLIT_SOFTMAX0: gl.constexpr = pgm.cfg.ARCH_NAME in ("gfx1250", "gfx1250-strict")
     SPLIT_SOFTMAX0_EPI: gl.constexpr = False
     # Buffer rotation: tile m lives in slot m%N (K and V use disjoint LDS regions).
     #   buf_tile_cur   -> tile i     ( i   %N)
@@ -1763,7 +1764,7 @@ def load_q(
     query_stride_0,
     USE_TDM_LOAD: gl.constexpr = False,
 ):
-    if USE_TDM_LOAD and cfg.ARCH_NAME == "gfx1250":
+    if USE_TDM_LOAD and cfg.ARCH_NAME in ("gfx1250", "gfx1250-strict"):
         LOAD_COLS: gl.constexpr = cfg.NUM_QUERIES_PER_KV * cfg.HEAD_SIZE
         q_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]

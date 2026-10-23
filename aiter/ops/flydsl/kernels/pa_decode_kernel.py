@@ -148,7 +148,7 @@ def compile_pa_decode_tile(
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
-    if architecture == "gfx1250":
+    if architecture in ("gfx1250", "gfx1250-strict"):
         if direct_output and num_partitions != 1:
             raise ValueError("direct_output requires a one-partition plan")
         if query_splits is None:

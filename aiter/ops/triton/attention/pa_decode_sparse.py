@@ -238,7 +238,7 @@ def pa_decode_sparse(
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
     assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
 
-    use_gluon = DEVICE_ARCH == "gfx1250"
+    use_gluon = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).

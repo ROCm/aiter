@@ -1451,7 +1451,7 @@ def flydsl_qk_norm_rope_quant(
         raise ValueError("kv_write (swa_kv) is BF16 only; not supported with quant")
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    is_gfx1250 = _get_gfx() == "gfx1250"
+    is_gfx1250 = _get_gfx() in ("gfx1250", "gfx1250-strict")
 
     H = num_q_heads
     T_tok = q.shape[0]

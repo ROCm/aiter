@@ -279,7 +279,7 @@ def get_GEMM_A16W16_config(
             # for unscaled bf16/fp16 GEMMs; explicit tuned CSV entries still win
             # since they are matched before this fallback is reached.
             if (
-                gfx == "gfx1250"
+                gfx in ("gfx1250", "gfx1250-strict")
                 and not scaleAB
                 and eval(dtype) in (dtypes.bf16, dtypes.fp16)
             ):

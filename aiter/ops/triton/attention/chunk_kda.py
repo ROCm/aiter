@@ -14,7 +14,7 @@ from aiter.ops.triton.utils._triton import arch_info
 _ARCH = arch_info.get_arch()
 if _ARCH == "gfx950":
     from aiter.ops.triton._gluon_kernels.gfx950.attention.chunk_kda import prepare, walk
-elif _ARCH == "gfx1250":
+elif _ARCH in ("gfx1250", "gfx1250-strict"):
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.chunk_kda import (
         prepare,
         walk,

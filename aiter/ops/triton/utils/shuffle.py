@@ -52,7 +52,7 @@ def shuffle_weight(
     On gfx1250 the WMMA TDM layout (``_shuffle_weight_gfx1250``) is used; on every
     other arch this delegates to the base ``aiter.ops.shuffle.shuffle_weight``.
     """
-    if (arch or get_arch()) == "gfx1250":
+    if (arch or get_arch()) in ("gfx1250", "gfx1250-strict"):
         if use_int4 or is_guinterleave or gate_up or pad_k_to:
             raise NotImplementedError(
                 "shuffle_weight on gfx1250 does not support use_int4 / is_guinterleave / gate_up / pad_k_to "
@@ -141,7 +141,7 @@ def shuffle_scale_gemm(
     gfx950: preshuffle_factor = 32, scale_kwidth = 8
     gfx1250: preshuffle_factor = 16, scale_kwidth = 4
     """
-    if (arch or get_arch()) == "gfx1250":
+    if (arch or get_arch()) in ("gfx1250", "gfx1250-strict"):
         return _shuffle_scale_tile_gfx1250(scales, preshuffle_factor, scale_kwidth)
 
     if (arch or get_arch()) == "gfx950":
@@ -151,7 +151,7 @@ def shuffle_scale_gemm(
 
 def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tensor:
     """Inverse of ``shuffle_scale_gemm`` (gfx950 layout). gfx1250 has no consumer."""
-    if (arch or get_arch()) == "gfx1250":
+    if (arch or get_arch()) in ("gfx1250", "gfx1250-strict"):
         raise NotImplementedError("unshuffle_scale_gemm is not implemented for gfx1250")
     scales = scales_shuffled.clone()
     sm, sn = scales.shape
@@ -186,7 +186,7 @@ def shuffle_scale_moe(
     arch check of their own.
     """
     arch = arch or get_arch()
-    if arch == "gfx1250":
+    if arch in ("gfx1250", "gfx1250-strict"):
         tiled = _shuffle_scale_tile_gfx1250(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )

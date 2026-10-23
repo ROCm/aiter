@@ -145,7 +145,7 @@ def flydsl_hgemm(
         raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
 
     gfx = get_gfx()
-    if gfx == "gfx1250":
+    if gfx in ("gfx1250", "gfx1250-strict"):
         if k_waves != 1:
             raise ValueError("The gfx1250 FlyDSL A16W16 kernel supports k_waves=1 only")
         with torch.cuda.stream(launch_stream):

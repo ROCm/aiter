@@ -1280,7 +1280,7 @@ def get_mla_metadata_info_v1(
             # Mirrors the C++ gate, which tests max_seqlen_qo rather than the
             # sparse-collapsed length; a mismatch here would size the reduce
             # buffers for a fold the planner does not perform.
-            get_gfx() == "gfx1250"
+            get_gfx() in ("gfx1250", "gfx1250-strict")
             and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
@@ -1313,7 +1313,7 @@ def get_mla_metadata_info_v1(
             and fast_mode
         )
         or (
-            get_gfx() == "gfx1250"
+            get_gfx() in ("gfx1250", "gfx1250-strict")
             and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
@@ -1737,7 +1737,7 @@ def decode_update_mla_metadata_v1(
             and max_seqlen_qo <= 6
         )
         or (
-            arch_id == "gfx1250"
+            arch_id in ("gfx1250", "gfx1250-strict")
             and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
             and q_is_fp8
             and kv_is_fp8

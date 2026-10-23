@@ -78,7 +78,7 @@ def compile_pa_decode_ps_reduce(
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture not in ("gfx942", "gfx950", "gfx1250"):
         raise NotImplementedError(f"PA decode reducer does not support {architecture}")
-    wave = 32 if architecture == "gfx1250" else WAVE
+    wave = 32 if architecture in ("gfx1250", "gfx1250-strict") else WAVE
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = MAX_CTA_WAVES * WAVE // wave
     partitions = max_context_partition_num
@@ -330,7 +330,9 @@ def compile_pa_decode_ps_reduce(
                 logits[part] = _load_logits(fx.Int32(part), unit)
             # Wave32 reductions broadcast statistics to every output lane,
             # including lanes without a live partition.
-            offsets = _shuffle_offsets(wave if architecture == "gfx1250" else rung)
+            offsets = _shuffle_offsets(
+                wave if architecture in ("gfx1250", "gfx1250-strict") else rung
+            )
             (weight,) = _softmax_weights([part_sum], [part_max], offsets)
             acc = _zero()
             for part in fx.range_constexpr(rung):

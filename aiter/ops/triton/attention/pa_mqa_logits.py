@@ -330,7 +330,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
 ):
     gfx_version = get_gfx()
     assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
-    is_gfx1250 = gfx_version == "gfx1250"
+    is_gfx1250 = gfx_version in ("gfx1250", "gfx1250-strict")
     if is_gfx1250:
         if Preshuffle:
             assert KVBlockSize > 1 and ChunkK % KVBlockSize == 0, (
@@ -691,7 +691,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 "PersistentSchedule must be contiguous int32 [NumCTAs, 4] on the query device"
             )
 
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         if Preshuffle and hidden_dim <= 128:
             WavePerEU = 4
         else:
@@ -699,7 +699,7 @@ def deepgemm_fp8_paged_mqa_logits(
 
     TileQCount = batch_size * next_n
     if SplitKV is None:
-        if get_gfx() == "gfx1250":
+        if get_gfx() in ("gfx1250", "gfx1250-strict"):
             SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU * 2
         else:
             # One full residency wave, with the context split evenly across it.
@@ -737,7 +737,7 @@ def deepgemm_fp8_paged_mqa_logits(
             f"tile, or to be 8. Got KVBlockSize={KVBlockSize}."
         )
         assert not (
-            KVBlockSize < 16 and get_gfx() == "gfx1250"
+            KVBlockSize < 16 and get_gfx() in ("gfx1250", "gfx1250-strict")
         ), f"gfx1250 preshuffle (TDM block-load) needs KVBlockSize>=16; got {KVBlockSize}."
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
@@ -749,7 +749,7 @@ def deepgemm_fp8_paged_mqa_logits(
     kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
     kv_cache_scale = kv_cache_scale.view(torch.float32)
 
-    if VarCtxSchedule is not None and get_gfx() == "gfx1250":
+    if VarCtxSchedule is not None and get_gfx() in ("gfx1250", "gfx1250-strict"):
         import warnings
 
         warnings.warn(

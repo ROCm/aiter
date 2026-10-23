@@ -51,7 +51,7 @@ except:  # noqa: E722
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
@@ -382,7 +382,7 @@ def unified_attention(
         # sinks / output_scale / shuffled_kv_cache)
         use_gluon_2d = is_2d_gluon_available(params, backend)
         if use_gluon_2d:
-            if DEVICE_ARCH == "gfx1250":
+            if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
                 _unified_attention_2d_gfx1250(params)
             elif DEVICE_ARCH == "gfx950":
                 _unified_attention_2d_gfx950(params)
@@ -436,7 +436,7 @@ def unified_attention(
             segm_expsum = out  # dummy ptr
 
         if use_gluon_3d:
-            if DEVICE_ARCH == "gfx1250":
+            if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
                 _unified_attention_3d_gfx1250(
                     params,
                     segm_output,
@@ -477,7 +477,7 @@ def unified_attention(
             and backend == "gluon"
         )
         if use_gluon_reduce:
-            if DEVICE_ARCH == "gfx1250":
+            if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
                 _reduce_segments_gfx1250(
                     params,
                     segm_output,
@@ -505,7 +505,7 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
 
     # arch-specific gates
     use_gluon_arch = False
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         use_gluon_arch = (
             _unified_attention_kernel_2d_gfx1250 is not None
             and not params.softcap
@@ -527,7 +527,7 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
 
     # arch-specific gates
     use_gluon_arch = False
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         use_gluon_arch = (
             _unified_attention_kernel_3d_gfx1250 is not None
             and params.shuffled_kv_cache
@@ -546,7 +546,7 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
 
     # arch-specific gates
     use_gluon_arch = False
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         use_gluon_arch = (
             _reduce_segments_kernel_gfx1250 is not None
             and params.all_decode

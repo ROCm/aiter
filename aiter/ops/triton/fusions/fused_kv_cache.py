@@ -453,7 +453,7 @@ def _cat_and_cache_mla(
         # q_pe and the KV cache are bit-identical to the full-rope path.
         assert kh == 1, "q_nope_prestored supports a single KV head (MLA) only"
         assert (
-            DEVICE_ARCH == "gfx1250"
+            DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
             and gluon_qpe_htile_kernel is not None
             and b_slot == b
             and num_decode_toks_for_zeros == 0
@@ -506,7 +506,7 @@ def _cat_and_cache_mla(
 
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
-    if DEVICE_ARCH == "gfx1250":
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
@@ -790,7 +790,7 @@ def fused_qk_rope_reshape_and_cache(
     # On gfx1250 the gluon 2D kernel handles all bf16/fp8 cache layouts in
     # one path (BLOCK_T > 1). uint8/NVFP4 still falls back to the Triton
     # kernel (no NVFP4 support in the 2D gluon kernel yet).
-    if DEVICE_ARCH == "gfx1250" and kv_cache_dtype != torch.uint8:
+    if DEVICE_ARCH in ("gfx1250", "gfx1250-strict") and kv_cache_dtype != torch.uint8:
         if t < 1024:
             BLOCK_T = 1
         elif t < 2048:

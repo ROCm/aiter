@@ -37,7 +37,7 @@ def mhc_fn_kb(arch: str | None = None) -> int:
     """
     if arch is None:
         arch = get_gfx_runtime()
-    return 16 if arch == "gfx1250" else 8
+    return 16 if arch in ("gfx1250", "gfx1250-strict") else 8
 
 
 def mhc_shuffle_fn(fn: torch.Tensor, arch: str | None = None) -> torch.Tensor:
@@ -236,7 +236,7 @@ def mhc_res_shuffle_enabled(m: int, arch: str | None = None) -> bool:
     if arch is None:
         arch = get_gfx_runtime()
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
-    return arch == "gfx1250" and 0 < m < fused_m_upper_bound
+    return arch in ("gfx1250", "gfx1250-strict") and 0 < m < fused_m_upper_bound
 
 
 # Hidden sizes the gfx1250 Gluon mhc_post_pre kernels are tuned for (DSV4-Flash 4096,
@@ -364,7 +364,7 @@ def get_mhc_pre_splitk(
     prefill_tg_factor = (
         8
         if w_preshuffle_bf16
-        and arch == "gfx1250"
+        and arch in ("gfx1250", "gfx1250-strict")
         and num_cu == 256
         and m >= 2048
         and hc_hidden_size in (4 * 4096, 4 * 7168)
@@ -627,7 +627,7 @@ def get_mhc_fused_post_pre_config(
     if (
         w_preshuffle_bf16
         and res_preshuffle
-        and arch == "gfx1250"
+        and arch in ("gfx1250", "gfx1250-strict")
         and num_cu == 256
         and 1 <= m <= 1024
     ):
@@ -637,7 +637,12 @@ def get_mhc_fused_post_pre_config(
             tile_m = 16
         elif hidden_size == 4096 and 960 < m:
             split_k = 16
-    if w_preshuffle_bf16 and res_preshuffle and arch == "gfx1250" and num_cu == 256:
+    if (
+        w_preshuffle_bf16
+        and res_preshuffle
+        and arch in ("gfx1250", "gfx1250-strict")
+        and num_cu == 256
+    ):
         return _mhc_fused_bf16_shuffled_config_gfx1250_256(
             m, hidden_size, (split_k, tile_m, tile_n, tile_k)
         )

@@ -2314,7 +2314,7 @@ def flydsl_fused_compress_attn(
     # ---- gfx1250 dispatch (wave32) ----
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    if _get_gfx() == "gfx1250":
+    if _get_gfx() in ("gfx1250", "gfx1250-strict"):
         from .fused_compress_attn_gfx1250 import flydsl_fused_compress_attn_gfx1250
 
         return flydsl_fused_compress_attn_gfx1250(

@@ -347,7 +347,7 @@ def parse_csv(csv_path: str):
                     params = dict(params)
                     params["kind"] = (
                         "a16w16_gfx1250"
-                        if params["target_gfx"] == "gfx1250"
+                        if params["target_gfx"] in ("gfx1250", "gfx1250-strict")
                         else "hgemm"
                     )
             else:

@@ -47,7 +47,7 @@ def _dispatch(gfx: str, op_gfx950, op_gfx1250):
     the CoExec scheduler from a custom LLVM build that release images do not
     ship; see ``csrc/py_itfs_cu/mla_v4_prefill_opus_kernels.cu``.
     """
-    if gfx == "gfx1250":
+    if gfx in ("gfx1250", "gfx1250-strict"):
         return op_gfx1250
     if gfx == "gfx950":
         return op_gfx950
@@ -187,7 +187,7 @@ def pa_sparse_prefill_opus(
 
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_sparse_prefill_opus expects fp16/bf16 q, got {q.dtype}")
-    if gfx == "gfx1250" and q.dtype != torch.bfloat16:
+    if gfx in ("gfx1250", "gfx1250-strict") and q.dtype != torch.bfloat16:
         raise RuntimeError(
             f"the gfx1250 code object only provides the bf16 variant, got {q.dtype}"
         )

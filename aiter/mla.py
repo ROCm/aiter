@@ -324,7 +324,7 @@ def get_meta_param(
         # Take the max so either path applies; for V3 callers (tg_factor=1) the
         # gfx1250 auto-rule still kicks in, and for v4 callers the explicit
         # tg_factor governs.
-        is_gfx1250 = get_gfx() == "gfx1250"
+        is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
         wg_per_split = 2 if nhead == 128 and is_gfx1250 else 1
         bs_occ = bs * max(tg_factor, wg_per_split)
         if ignore_total_kv:
@@ -1248,7 +1248,7 @@ def mla_decode_fwd(
             and num_kv_splits == 1
             and nhead == 64
             and (max_seqlen_q == 1 or kv_shuffled_flag)
-            and get_gfx() == "gfx1250"
+            and get_gfx() in ("gfx1250", "gfx1250-strict")
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
         )
@@ -1418,7 +1418,7 @@ def mla_decode_fwd(
         ps1_is_bf16 = q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16
         use_flydsl_ps1 = (
             os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
-            and get_gfx() == "gfx1250"
+            and get_gfx() in ("gfx1250", "gfx1250-strict")
             and page_size == 1
             and (ps1_is_fp8 or ps1_is_bf16)
             and nhead in (16, 32, 64, 96, 128)

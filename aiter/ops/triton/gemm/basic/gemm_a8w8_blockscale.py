@@ -151,7 +151,7 @@ def gemm_a8w8_blockscale(
             impl = gluon_kernel
             extra_constexpr["NUM_WARPS"] = config["num_warps"]
             extra_constexpr["NUM_STAGES"] = max(config.get("num_stages", 2), 2)
-        elif arch == "gfx1250":
+        elif arch in ("gfx1250", "gfx1250-strict"):
             from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
                 _KERNEL_MAP,
             )

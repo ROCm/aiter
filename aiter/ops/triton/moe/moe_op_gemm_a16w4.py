@@ -402,7 +402,7 @@ def moe_gemm_a16w4(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
-    if get_arch() == "gfx1250":
+    if get_arch() in ("gfx1250", "gfx1250-strict"):
         assert swizzle_mx_scale in (
             None,
             "GFX1250_SCALE",
@@ -442,7 +442,7 @@ def moe_gemm_a16w4(
     if backend == "gluon":
         use_pipelined_gluon = False
 
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
             config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
         elif get_arch() == "gfx950":
             # Currently on gfx950, gluon kernels requires that swizzling is enabled
@@ -528,7 +528,7 @@ def moe_gemm_a16w4(
 
     # launch kernel
     if backend == "gluon":
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
             _moe_gemm_a16w4_gluon[(grid,)](
                 y,
                 y.stride(0),

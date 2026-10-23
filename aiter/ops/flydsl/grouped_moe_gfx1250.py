@@ -225,7 +225,7 @@ def _find_grouped_config(
 
 def _use_grouped_gemm_enabled() -> bool:
     env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
-    is_gfx1250 = get_gfx() == "gfx1250"
+    is_gfx1250 = get_gfx() in ("gfx1250", "gfx1250-strict")
     return env_enabled or is_gfx1250
 
 
