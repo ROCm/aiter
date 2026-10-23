@@ -17,7 +17,13 @@ def _library_names() -> tuple[str, ...]:
         # The unversioned symlink ships in the -devel package, which need not be
         # on LD_LIBRARY_PATH at runtime; split rocm-sdk pip layouts carry only the
         # versioned soname.
-        return ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6")
+        names = ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6")
+        torch_hip = _torch_hip_version()
+        if torch_hip:
+            torch_soname = f"libamdhip64.so.{torch_hip.split('.')[0]}"
+            if torch_soname not in names:
+                names += (torch_soname,)
+        return names
 
     # Windows ROCm ships a version-suffixed DLL, e.g. `amdhip64_7.dll`.
     from cpp_extension import _find_rocm_home
@@ -30,9 +36,39 @@ def _library_names() -> tuple[str, ...]:
     return (*dlls, "amdhip64.dll")
 
 
+def _torch_hip_version() -> str | None:
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    version = getattr(torch, "version", None)
+    if version is None:
+        return None
+    return getattr(version, "hip", None)
+
+
+def _loaded_hip_runtime() -> ctypes.CDLL | None:
+    """The HIP runtime already loaded into this process, e.g. torch's."""
+    if sys.platform == "win32":
+        return None
+    for name in _library_names():
+        try:
+            return ctypes.CDLL(name, mode=os.RTLD_NOLOAD | os.RTLD_LAZY)
+        except OSError:
+            continue
+    return None
+
+
 @functools.lru_cache(maxsize=1)
 def load_hip_runtime() -> ctypes.CDLL:
-    """Load the HIP runtime, or raise OSError reporting why each candidate failed."""
+    """Load the HIP runtime, or raise OSError reporting why each candidate failed.
+
+    Binds to the copy already loaded into the process when there is one (Linux
+    only), so the handle shares torch's runtime instead of loading a second one
+    by name. The choice is cached, so call this after torch has initialized HIP.
+    """
+    loaded = _loaded_hip_runtime()
+    if loaded is not None:
+        return loaded
     errors = []
     for soname in _library_names():
         try:
@@ -43,23 +79,30 @@ def load_hip_runtime() -> ctypes.CDLL:
 
 
 @functools.lru_cache(maxsize=1)
-def get_hip_runtime_version() -> tuple[int, int, int] | None:
-    """(major, minor, patch) of the loaded runtime, or None if unavailable.
-
-    The loaded library, not the ROCm installed on disk or the one torch was built
-    against; only it can say how an attribute ordinal will be read.
-    """
-    try:
-        libhip = load_hip_runtime()
-        val = ctypes.c_int(0)
-        if libhip.hipRuntimeGetVersion(ctypes.byref(val)) != 0:
-            return None
-    except Exception:  # noqa: BLE001
-        return None
+def _query_hip_runtime_version() -> tuple[int, int, int]:
+    """Cache successful version reads; exceptions are not cached."""
+    libhip = load_hip_runtime()
+    val = ctypes.c_int(0)
+    err = libhip.hipRuntimeGetVersion(ctypes.byref(val))
+    if err != 0:
+        raise RuntimeError(f"hipRuntimeGetVersion failed with error {err}")
 
     # HIP_VERSION = major * 10000000 + minor * 100000 + patch
     raw = val.value
     return raw // 10_000_000, (raw // 100_000) % 100, raw % 100_000
+
+
+def get_hip_runtime_version() -> tuple[int, int, int] | None:
+    """(major, minor, patch) of the loaded runtime, or None if unavailable.
+
+    The loaded library, not the ROCm installed on disk or the one torch was built
+    against; only it can say how an attribute ordinal will be read. Successful
+    reads are cached; failures return None and can be retried.
+    """
+    try:
+        return _query_hip_runtime_version()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def get_current_hip_device() -> int | None:
