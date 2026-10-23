@@ -44,8 +44,12 @@ def run_benchmark(args):
             x, residual, weight, 1e-6, gemma_norm=args.gemma_norm
         )
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
-        # Read the partials (or the GEMM output) and the residual; write out and residual_out.
-        nbytes = x.numel() * x.element_size() + 3 * M * N * residual.element_size()
+        # Read x, the residual and the norm weight; write out and residual_out.
+        nbytes = (
+            x.numel() * x.element_size()
+            + 3 * M * N * residual.element_size()
+            + weight.numel() * weight.element_size()
+        )
         if metric == "time":
             return ms * 1e3
         return nbytes / (ms * 1e-3) / 1e12
