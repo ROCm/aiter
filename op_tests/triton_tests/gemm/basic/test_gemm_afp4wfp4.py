@@ -6,7 +6,7 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_scale, shuffle_weight
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _get_config as _get_afp4wfp4_config,
 )
@@ -17,6 +17,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm_128row
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -30,6 +31,18 @@ pytestmark = pytest.mark.skipif(
 SCALE_GROUP_SIZE = 32
 
 
+def _shuffle_scales(scales, scale_layout):
+    # The gfx1250 kernel reads one row per 32-row (128-row for "128row") stripe
+    if scale_layout == "128row":
+        return shuffle_scale_gemm_128row(scales)
+    if scale_layout == "n32k4":
+        return shuffle_mxfp8fp4_scale(scales.contiguous()).view(
+            -1, scales.shape[1] * 32
+        )
+    s = shuffle_scale(scales)
+    return s.view(-1, s.shape[1] * 32)
+
+
 def generate_gemm_afp4wfp4_inputs(
     M,
     N,
@@ -39,6 +52,7 @@ def generate_gemm_afp4wfp4_inputs(
     output=True,
     shuffle_weight_fg=False,
     shuffle_scales_fg=False,
+    scale_layout="aiter",
 ):
     if shuffle_weight_fg:
         assert (
@@ -85,12 +99,10 @@ def generate_gemm_afp4wfp4_inputs(
         # the shuffled tensor's own shape, which is padded on both dims.
         # M < 32 stays un-shuffled (M, K//32) row-major.
         if M >= 32:
-            xs = shuffle_scale(x_scales[:M])
-            x_scales_shuffled = xs.view(-1, xs.shape[1] * 32)
+            x_scales_shuffled = _shuffle_scales(x_scales[:M], scale_layout)
         else:
             x_scales_shuffled = x_scales[:M].contiguous()
-        ws = shuffle_scale(w_scales)
-        w_scales_shuffled = ws.view(-1, ws.shape[1] * 32)
+        w_scales_shuffled = _shuffle_scales(w_scales, scale_layout)
     else:
         x_scales_shuffled = x_scales[:M]
         w_scales_shuffled = w_scales
@@ -373,3 +385,44 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
     )
 
     triton.testing.assert_close(torch_out, triton_out)
+
+
+@pytest.mark.parametrize(
+    "M, N, K, x_preshuffled, scale_layout",
+    [
+        (M, N, K, x_pre, layout)
+        for M, N, K in [(192, 7168, 4608), (2304, 24576, 1536), (4096, 4096, 4096)]
+        for x_pre in [False, True]
+        for layout in ["aiter", "n32k4", "128row"]
+    ]
+    + [(16, 4096, 2048, True, "aiter"), (16, 4096, 2048, False, "n32k4")],
+)
+def test_gemm_mxfp4_preshuffled_gfx1250_layouts(M, N, K, x_preshuffled, scale_layout):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("Preshuffled gfx1250 kernel only supported on gfx1250")
+
+    x, w, w_preshuf, x_scales, w_scales, x_scales_kernel, w_scales_kernel, _, y = (
+        generate_gemm_afp4wfp4_inputs(
+            M,
+            N,
+            K,
+            torch.bfloat16,
+            shuffle_scales_fg=True,
+            shuffle_weight_fg=True,
+            scale_layout=scale_layout,
+        )
+    )
+    torch_out = run_torch(x, w, x_scales, w_scales, torch.bfloat16).to(torch.bfloat16)
+
+    triton_out = gemm_afp4wfp4_preshuffle(
+        shuffle_weight(x) if x_preshuffled else x,
+        w_preshuf,
+        x_scales_kernel,
+        w_scales_kernel,
+        torch.bfloat16,
+        y,
+        x_preshuffled=x_preshuffled,
+        scale_layout=scale_layout,
+    )
+
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)

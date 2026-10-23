@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -14,6 +15,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     batched_model_benchmark_shapes,
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
@@ -37,7 +40,9 @@ def bench_gemm_fn(
     backend: str | None = None,
 ):
     c_dtype = torch.bfloat16
-    x, weight, w_scale, bias, y = generate_batched_gemm_a8w8_per_token_group_inputs(
+
+    _p_gen = functools.partial(
+        generate_batched_gemm_a8w8_per_token_group_inputs,
         batch,
         M,
         N,
@@ -48,32 +53,35 @@ def bench_gemm_fn(
         layout=layout,
         transpose_bm=transpose_bm,
     )
+    # kernel names its activation/weight/output kwargs X/WQ/YQ
+    _out_vals_keys = ["X", "WQ", "w_scale", "bias", "YQ"]
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4
+    )
+
+    kernel_fn = functools.partial(
+        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
+        group_size=group_size,
+        dtype=c_dtype,
+        transpose_bm=transpose_bm,
+        backend=backend,
+    )
+
     # flops
     flops = 2.0 * batch * M * N * K
     # memory transfer
+    bias_buf = rot_bufs[0]["bias"]
     mem_read = (
-        x.numel() * x.element_size()
-        + weight.numel() * weight.element_size()
-        + w_scale.numel() * w_scale.element_size()
-        + (bias.numel() * bias.element_size() if bias is not None else 0)
+        rot_bufs[0]["X"].numel() * rot_bufs[0]["X"].element_size()
+        + rot_bufs[0]["WQ"].numel() * rot_bufs[0]["WQ"].element_size()
+        + rot_bufs[0]["w_scale"].numel() * rot_bufs[0]["w_scale"].element_size()
+        + (bias_buf.numel() * bias_buf.element_size() if bias_buf is not None else 0)
     )
-    mem_write = y.numel() * y.element_size()
+    mem_write = rot_bufs[0]["YQ"].numel() * rot_bufs[0]["YQ"].element_size()
     mem = mem_read + mem_write
 
-    def fn():
-        return batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-            x,
-            weight,
-            w_scale,
-            group_size=group_size,
-            bias=bias,
-            dtype=c_dtype,
-            YQ=y,
-            transpose_bm=transpose_bm,
-            backend=backend,
-        )
-
-    ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":

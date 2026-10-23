@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -13,6 +14,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_shape_benchmark_object,
     print_vgpr,
@@ -30,7 +33,8 @@ def bench_gemm_fn(
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
-    x, weight, weight_shuffled, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
+    _p_gen = functools.partial(
+        generate_gemm_a16w8_blockscale_inputs,
         M,
         N,
         K,
@@ -41,32 +45,30 @@ def bench_gemm_fn(
         output=True,
         shuffle=preshuffle,
     )
+    # (x, weight, weight_shuffled, w_scale, y); keep only the weight variant in use
     if preshuffle:
-        bench_weight = weight_shuffled
+        _out_vals_keys = ["x", "_", "w", "w_scale", "y"]
+        kernel_fn = functools.partial(
+            gemm_a16w8_blockscale_preshuffle, dtype=c_dtype, prequant=False
+        )
     else:
-        bench_weight = weight
+        _out_vals_keys = ["x", "w", "_", "w_scale", "y"]
+        kernel_fn = functools.partial(
+            gemm_a16w8_blockscale, dtype=c_dtype, prequant=False
+        )
+
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4
+    )
 
     flops = 2.0 * M * N * K
-    mem_read = (M * K) * x.element_size() + (N * K) * weight.element_size()
+    mem_read = (M * K) * rot_bufs[0]["x"].element_size() + (N * K) * rot_bufs[0][
+        "w"
+    ].element_size()
     mem_write = (M * N) * 2
     mem = mem_read + mem_write
 
-    if preshuffle:
-        ms = triton.testing.do_bench(
-            lambda: gemm_a16w8_blockscale_preshuffle(
-                x, bench_weight, w_scale, c_dtype, y, prequant=False
-            ),
-            warmup=25,
-            rep=100,
-        )
-    else:
-        ms = triton.testing.do_bench(
-            lambda: gemm_a16w8_blockscale(
-                x, bench_weight, w_scale, c_dtype, y, prequant=False
-            ),
-            warmup=25,
-            rep=100,
-        )
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
 
     if metric == "time":
         return ms

@@ -33,6 +33,8 @@ _USE_GEMM_SPLITK_BF16 = False
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
 _GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
 _GLUON_DEFAULT_ARCHS = ("gfx1250",)
+# gfx1250 scale_layout -> kernel SCALE_MODE
+_SCALE_LAYOUTS = {"aiter": 0, "128row": 1, "n32k4": 2}
 
 
 def set_use_gemm_splitk_bf16(value: bool):
@@ -496,6 +498,8 @@ def gemm_afp4wfp4_preshuffle(
     y: torch.Tensor | None = None,
     config: dict | None = None,
     skip_reduce: bool | None = False,
+    x_preshuffled: bool = False,
+    scale_layout: str = "aiter",
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -524,7 +528,17 @@ def gemm_afp4wfp4_preshuffle(
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+            gfx1250 also has NUM_KSUB (K sub-steps per LDS stage), B2B_WMMA
+            (back-to-back WMMA) and EPI_SPLIT (2: store the output in two N halves).
         skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
+        x_preshuffled (bool): gfx1250 only. x is shuffle_weight(x), contiguous,
+            with M % 16 == 0.
+        scale_layout (str): gfx1250 only. Layout of x_scales and w_scales. For M < 32,
+            x_scales stay un-shuffled.
+            "aiter": shuffle_scale, as described above (default).
+            "n32k4": shuffle_mxfp8fp4_scale, viewed as (rows // 32, (K // 32) * 32).
+            "128row": shuffle_scale_gemm_128row. Needs num_warps=4 and a CTA tile of
+                128x128 or more. This is the fastest layout.
 
     Returns:
         y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
@@ -532,6 +546,8 @@ def gemm_afp4wfp4_preshuffle(
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
     use_gluon = arch_info.get_arch() in _GLUON_PRESHUFFLE_ARCHS
+    if not use_gluon and (x_preshuffled or scale_layout != "aiter"):
+        raise ValueError("x_preshuffled and scale_layout are only for gfx1250")
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
@@ -571,6 +587,7 @@ def gemm_afp4wfp4_preshuffle(
     )
 
     if use_gluon:
+        scale_mode = _SCALE_LAYOUTS[scale_layout]
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             cluster_shape,
             get_gemm_afp4wfp4_preshuffle_layouts,
@@ -597,7 +614,7 @@ def gemm_afp4wfp4_preshuffle(
         )
 
         num_ctas = config["num_ctas"]
-        ctas_m, _ = cluster_shape(
+        ctas_m, ctas_n = cluster_shape(
             num_ctas, config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
         )
         # The kernel takes a CTA's A scales as preshuffled iff it has 32+ rows.
@@ -606,13 +623,41 @@ def gemm_afp4wfp4_preshuffle(
             f"{config['BLOCK_SIZE_M']}, which num_ctas={num_ctas} splits {ctas_m} ways"
         )
 
+        assert scale_mode != 1 or (
+            config["num_warps"] == 4
+            and config["BLOCK_SIZE_M"] // ctas_m % 128 == 0
+            and config["BLOCK_SIZE_N"] // ctas_n % 128 == 0
+        ), "scale_layout='128row' needs num_warps=4 and a CTA tile of 128x128 or more"
+        # w_scales are always laid out by scale_layout: catch a mismatched tensor
+        pf = 128 if scale_mode == 1 else 32
+        if w_scales.shape[1] != (K_elems // 32) * pf:
+            raise ValueError(
+                f"w_scales shape {tuple(w_scales.shape)} does not match scale_layout="
+                f"{scale_layout!r}: expected (rows // {pf}, {(K_elems // 32) * pf})"
+            )
+        # K sub-steps and the sliced epilogue need two LDS stages. The sliced
+        # epilogue also needs N % (N of one CTA) == 0.
+        if config["NUM_BUFFERS"] < 2:
+            config["NUM_KSUB"] = 1
+            config["EPI_SPLIT"] = 1
+        if N % (config["BLOCK_SIZE_N"] // ctas_n):
+            config["EPI_SPLIT"] = 1
+
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(
             config["num_warps"],
             config["BLOCK_SIZE_M"],
             config["BLOCK_SIZE_N"],
             config["BLOCK_SIZE_K"],
             num_ctas,
+            scale_mode,
+            config.get("NUM_KSUB", 1),
+            int(x_preshuffled),
         )
+        if x_preshuffled:
+            assert (
+                M % 16 == 0 and x_fp4.is_contiguous()
+            ), "x_preshuffled needs M % 16 == 0 and a contiguous x"
+            x_fp4 = x_fp4.view(M // 16, K_bytes * 16)
 
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
@@ -634,6 +679,8 @@ def gemm_afp4wfp4_preshuffle(
             x_scales.stride(1),
             w_scales.stride(0),
             w_scales.stride(1),
+            SCALE_MODE=scale_mode,
+            A_DATA_PRESHUFFLE=int(x_preshuffled),
             **config,
             **layouts,
         )

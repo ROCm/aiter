@@ -260,6 +260,18 @@ def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tens
     return scales
 
 
+def shuffle_scale_gemm_128row(scales: torch.Tensor) -> torch.Tensor:
+    """Pack (rows, K//32) e8m0 GEMM scales for the gfx1250 scale_layout="128row".
+
+    Rows are padded to a multiple of 128 with 1.0. Returns (ceil(rows / 128), (K//32) * 128).
+    """
+    pad = (-scales.shape[0]) % 128
+    padded = torch.nn.functional.pad(
+        scales.view(torch.uint8), (0, 0, 0, pad), value=0x7F
+    )
+    return shuffle_scale_batched(padded.view(scales.dtype), scale_k_width=4)
+
+
 # --- MoE MX scales (a8w4 / a8w8 / a16w4 / a4w4) ---
 def shuffle_scale_moe(
     data: torch.Tensor,

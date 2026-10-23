@@ -37,6 +37,9 @@ SEARCH_SPACE = {
     "B_SCALE_TDM": [True, False],
     "kpack": [1, 2],
     "persistent": [True, False],
+    "NUM_KSUB": [1, 2],
+    "B2B_WMMA": [0, 1],
+    "EPI_SPLIT": [1, 2],
 }
 
 # Families that spell a key differently share its table row and shape rules;
