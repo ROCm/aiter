@@ -779,8 +779,7 @@ def _heuristic_mxscale_bmm_kid(
 ) -> int:
     """Choose a final global row-major kid when the tuned table has no usable row.
 
-    GROUP_K=32 takes each pick's twin (kid + 1000). The 256x256 pipeline tile
-    has none, so large M at 32 falls through to the 64x64 flatmm tile.
+    GROUP_K=32 takes each pick's twin (kid + 1000).
     """
     _validate_mxscale_bmm_group_size(group_size)
     offset = 1000 if group_size == 32 else 0
@@ -789,12 +788,11 @@ def _heuristic_mxscale_bmm_kid(
         return value % divisor == 0
 
     if (
-        group_size == 128
-        and divisible(n, 256)
+        divisible(n, 256)
         and divisible(k, 128)
         and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
-        return 8158 if 4096 <= k <= 8192 else 8150
+        return offset + (8158 if 4096 <= k <= 8192 else 8150)
     if m < 64:
         return offset + (8640 if divisible(n, 64) and divisible(k, 256) else 8653)
     if m <= 256 and k <= 1024 and divisible(n, 32) and divisible(k, 256):
