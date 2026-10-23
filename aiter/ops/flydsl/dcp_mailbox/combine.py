@@ -5,7 +5,8 @@
 """DCP LSE combine as one FlyDSL mailbox launch.
 
 Each rank pushes every peer's head and LSE as tagged pairs. Each rank polls
-its own heads and applies the LSE weights. One CTA owns one (token, local head).
+its own heads and applies the LSE weights. One CTA owns one (token, local head)
+and each of its ``dim / 4`` threads owns four values of the head.
 """
 
 from dataclasses import dataclass
@@ -43,7 +44,7 @@ from aiter.ops.flydsl.dcp_mailbox.ranks import peer_bases
 from aiter.ops.flydsl.dcp_mailbox.sync import Mailbox, preg, shift
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 
-THREADS = 128
+MAX_THREADS = 1024
 TAG_SLOTS = 256
 LOG2E = 1.4426950408889634
 NEG_INF = float("-inf")
@@ -223,7 +224,7 @@ def build(key: CombineBuild):
         return _BUILDS[key]
     n, hl, d, mt = key.ranks, key.heads, key.dim, key.max_tokens
     words = d // 2
-    assert words == 2 * THREADS, d
+    threads = d // 4
     nblk = key.tokens * hl
     lay = peer_layout(n, mt, hl, d)
     half = peer_bytes(n, mt, hl, d) // 2
@@ -233,7 +234,7 @@ def build(key: CombineBuild):
         f"_s{key.seqs}_e{int(key.base_e)}_l{int(key.ret_lse)}"
     )
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
     def combine(
         out: Int64,
         out_sb: Int32,
@@ -319,10 +320,10 @@ def build(key: CombineBuild):
         )
         _finish(tid, state, e, nblk)
 
-    return _jit(key, combine, nblk, keyed)
+    return _jit(key, combine, nblk, threads, keyed)
 
 
-def _jit(key, combine, nblk, keyed):
+def _jit(key, combine, nblk, threads, keyed):
     @flyc.jit
     def launch(
         out: Int64,
@@ -359,7 +360,7 @@ def _jit(key, combine, nblk, keyed):
             peers,
             rank,
             state,
-        ).launch(grid=(nblk,), block=(THREADS,), stream=stream)
+        ).launch(grid=(nblk,), block=(threads,), stream=stream)
 
     ABI.check(combine, launch)
     _BUILDS[key] = launch
@@ -399,13 +400,14 @@ def dcp_lse_combine(
 
     Returns this rank's heads [tokens, heads, dim]. With ``return_lse``, also
     returns the combined LSE [tokens, heads]. ``base_e`` selects natural-log LSE.
-    ``seq_lens`` and ``query_start_loc`` mask empty local KV rows.
+    ``seq_lens`` and ``query_start_loc`` mask empty local KV rows. ``dim`` must
+    be a multiple of 4 with ``4 * ranks <= dim <= 4 * MAX_THREADS``.
     """
     tokens, heads, dim = out.shape[0], ws.heads, ws.dim
     assert out.shape[1] == ws.ranks * heads and out.shape[2] == dim
     assert lse.shape == (tokens, ws.ranks * heads)
     assert out.dtype == torch.bfloat16 and lse.dtype == torch.float32
-    assert dim == 2 * THREADS
+    assert dim % 4 == 0 and 4 * ws.ranks <= dim <= 4 * MAX_THREADS, dim
     if res is None:
         res = out.new_empty((tokens, heads, dim))
     res_lse = torch.empty(
