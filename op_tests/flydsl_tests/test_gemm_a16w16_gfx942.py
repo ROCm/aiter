@@ -4,7 +4,7 @@
 """Oracle-gated correctness tests for the native gfx942 (CDNA3) bf16 GEMM.
 
 Compares the kernel against an f32 matmul oracle (bf16 inputs upcast to f32)
-within bf16 tolerance. Shapes cover down projections (large K, narrow N), up
+to within one bf16 ulp, or f32 summation-order noise for fp32 output. Shapes cover down projections (large K, narrow N), up
 projections (short K, wide N), decode (tiny M), square compute-bound GEMMs and
 M/N boundary tiles, through both ``gemm_a16w16`` and the public
 ``flydsl_hgemm`` dispatch (per-shape default config). Explicit configs cover every
@@ -20,7 +20,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import gemm_a16w16
 
-RTOL = ATOL = 1e-2
+ACCUM_TOL = 1e-5
 
 
 def _require_gfx942():
@@ -38,11 +38,22 @@ def _inputs(m, n, k):
 
 
 def _assert_close(y, ref, msg):
-    y = y.float()
-    rel = (y - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
-    assert (
-        torch.allclose(y, ref, rtol=RTOL, atol=ATOL) or rel < 2e-2
-    ), f"{msg}: relerr={rel:.3e} exceeds bf16 tolerance"
+    """Every element within one bf16 ulp of the f32 oracle (fp32 output: none),
+    plus f32 summation-order noise of ``ACCUM_TOL`` times the largest output.
+
+    A correctly rounded bf16 result is within half an ulp; the other half lets
+    a different summation order flip the rounding.
+    """
+    err = (y.float() - ref).abs()
+    noise = ACCUM_TOL * ref.abs().max()
+    if y.dtype == torch.bfloat16:
+        # bf16 keeps 8 significant bits: one ulp is 2^-7 of the leading power of two.
+        exponent = torch.floor(torch.log2(ref.abs().clamp_min(1e-30)))
+        tol = torch.exp2(exponent - 7) + noise
+    else:
+        tol = noise
+    worst = (err / tol).max().item()
+    assert worst <= 1.0, f"{msg}: error is {worst:.2f}x the {y.dtype} tolerance"
 
 
 OUT_DTYPES = [torch.bfloat16, torch.float32]
@@ -482,8 +493,7 @@ def test_gemm_a16w16_gfx942_fp32_out_precision(store):
     }
     y = gemm_a16w16(x, w.t(), layout="nt", out_dtype=torch.float32, user_kwargs=cfg)
     torch.cuda.synchronize()
-    rel = ((y - ref).abs().max() / ref.abs().max()).item()
-    assert rel < 1e-4, f"fp32 output {store}: relerr={rel:.3e} (bf16 rounding?)"
+    _assert_close(y, ref, f"fp32 output {store}")
 
 
 @pytest.mark.parametrize(
