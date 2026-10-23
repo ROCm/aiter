@@ -2881,6 +2881,10 @@ void
               "@@NAME@@ requires N % ", Bf16Traits::B_N, " == 0, got ", N);
   AITER_CHECK(K % Bf16Traits::B_K == 0,
               "@@NAME@@ requires K % ", Bf16Traits::B_K, " == 0, got ", K);
+  // The main loop and its tail consume K tiles in pairs; an odd count reads
+  // one tile past the end and silently corrupts Y.
+  AITER_CHECK((K / Bf16Traits::B_K) % 2 == 0,
+              "@@NAME@@ requires an even K / ", Bf16Traits::B_K, ", got K=", K);
 @@PRELOAD_CHECK@@
   opus_gemm_scale_kargs_gfx950 kargs{};
   kargs.ptr_a = O.data_ptr();
@@ -2918,15 +2922,32 @@ void
 """
 
 
+def _bmm_pipeline_sf_unbounded(k):
+    """Whether every LDS scale panel of the pipeline kid slides with K.
+
+    The GROUP_N=1 preload kids already slide both windows, so only their
+    launch guard held them to the panel ceiling; sf_long_k kids slide the
+    B block panel too.
+    """
+    return k.sf_long_k or (k.GROUP_N == 1 and (k.preload_sf_lds or k.preload_sfa_lds))
+
+
 def _bmm_pipeline_dual_traits_alias(k, traits_name):
     def one(suffix, out_dtype):
-        return (
-            f"using {k.name}_{suffix} = {traits_name}<{k.BLOCK_SIZE},\n"
+        base = (
+            f"{traits_name}<{k.BLOCK_SIZE},\n"
             f"    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,\n"
             f"    opus::tuple<fp8_t, fp8_t, {out_dtype}, fp32_t, unsigned char>,\n"
             f"    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,\n"
-            f"    opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>>;\n"
+            f"    opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>>"
         )
+        if _bmm_pipeline_sf_unbounded(k):
+            return (
+                f"struct {k.name}_{suffix} : {base} {{\n"
+                "    static constexpr int SF_PRELOAD_K_MAX = 1 << 20;\n"
+                "};\n"
+            )
+        return f"using {k.name}_{suffix} = {base};\n"
 
     return "\n" + one("Bf16Traits", "bf16_t") + one("Fp32Traits", "fp32_t")
 

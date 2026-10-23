@@ -455,6 +455,9 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // read four neighbouring columns, land in disjoint banks.
     constexpr bool SFB_WINDOW   = PRELOAD_SFB_LDS && T::SFB_PER_LANE_ROW;
     constexpr bool SFB_PANEL    = PRELOAD_SFB_LDS && !T::SFB_PER_LANE_ROW;
+    // Past the 8192 ceiling the whole-K block panel no longer fits beside the
+    // A window, so it holds the A window's K tiles and slides with it.
+    constexpr bool SFB_SLIDE    = SFB_PANEL && T::SF_PRELOAD_K_MAX > 8192;
     constexpr int SFB_COL_STRIDE = SFB_WINDOW ? T::B_N + 64 : 0;
     constexpr int SFA_PANEL_BYTES = SFB_WINDOW ? 27648 : 24576;
     constexpr int SFA_ROWS      = T::B_M / T::GROUP_M;
@@ -511,7 +514,8 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // sfb_offset with stride_sfb replaced by the compact per-N-group K length.
     // GROUP_N=1 uses the SFB_WINDOW panel instead (see the A panel above).
     constexpr int SFB_K_MAX       = T::SF_PRELOAD_K_MAX;
-    constexpr int SFB_K_TILES_MAX = SFB_PANEL ? (SFB_K_MAX / T::B_K) : 1;
+    constexpr int SFB_K_TILES_MAX =
+        SFB_SLIDE ? SFA_TILES_RESIDENT : SFB_PANEL ? (SFB_K_MAX / T::B_K) : 1;
     constexpr int SFB_SPK         = T::B_K / T::GROUP_K;         // scales per K-tile
     constexpr int SFB_NG_PER_HALF = T::SFB_GROUPS_PER_HALF;      // N-groups per half-n
     constexpr int SFB_ROWS        = T::SFB_TILE_GROUPS;          // N-groups in B_N tile
@@ -529,16 +533,18 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     __shared__ __align__(16) char smem_sfb[SFB_LDS_BYTES];
     D_SF* s_sfb_ptr = reinterpret_cast<D_SF*>(smem_sfb);
     const int sfb_k_scales = SFB_PANEL ? ((kargs.k / T::B_K) * SFB_SPK) : 1;
+    const int sfb_row_stride = SFB_SLIDE ? SFA_SCALES_MAX : sfb_k_scales;
     // The window is column-major and, within a half tile, subtile-minor: row
     // ng * T_N * W_N + lane_n of the half lands at lane_n * E_N + ng, so the E_N
     // rows a lane reads for one K column are one ds_read.
     const int sfb_window_lane_off =
         SFB_WINDOW ? sfb_lane_k * SFB_COL_STRIDE + sfb_lane_n * T::E_N : 0;
     auto sfb_lds_offset = [&](int half_tile_n, int tile_k) {
+        const int local_k = SFB_SLIDE ? (tile_k - sfa_base_tile) : tile_k;
         if constexpr (SFB_NG_MINOR) {
-            return tile_k * SFB_SPK * SFB_ROWS + half_tile_n * T::SFB_HALF_STRIDE;
+            return local_k * SFB_SPK * SFB_ROWS + half_tile_n * T::SFB_HALF_STRIDE;
         } else {
-            return half_tile_n * T::SFB_HALF_STRIDE * sfb_k_scales + tile_k * SFB_SPK;
+            return half_tile_n * T::SFB_HALF_STRIDE * sfb_row_stride + local_k * SFB_SPK;
         }
     };
     auto load_sfb = [&](int half_tile_n, int tile_k) {
@@ -576,7 +582,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
                 });
                 return v;
             } else {
-                return load_sfb_lane_groups<T, vtype_sfb>(s, 0, sfb_k_scales, sfb_lane_k, sfb_lane_n);
+                return load_sfb_lane_groups<T, vtype_sfb>(s, 0, sfb_row_stride, sfb_lane_k, sfb_lane_n);
             }
         } else {
             return load_sfb_lane_groups<T, vtype_sfb>(
@@ -614,11 +620,12 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // The count is compile-time, so at 128 this is one pass and the same single
     // predicated load it was; only the 32 twins spend the extra registers.
     constexpr int SFB_PANEL_MAX = SFB_ROWS * SFB_K_TILES_MAX * SFB_SPK;
+    constexpr bool SFB_PREFETCH = SFB_PANEL && !SFB_SLIDE;
     constexpr int SFB_FILL_ITERS =
-        SFB_PANEL ? ((SFB_PANEL_MAX + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE) : 1;
+        SFB_PREFETCH ? ((SFB_PANEL_MAX + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE) : 1;
     sfb_reg_t sfb_val[SFB_FILL_ITERS];
     bool sfb_take[SFB_FILL_ITERS] = {};
-    if constexpr (SFB_PANEL) {
+    if constexpr (SFB_PREFETCH) {
         const int tid = opus::thread_id_x();
         const int sfb_total = SFB_ROWS * sfb_k_scales;
         // Every pass is issued before any is stored, so all of them are in
@@ -720,6 +727,26 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         }
     };
 
+    // The SFB_SLIDE half of a window fill: the block panel's columns for the
+    // same window, laid out as the whole-K panel is but SFA_SCALES_MAX wide.
+    // At most two passes once per window, so they run back to back: holding
+    // them in flight together spills the 32 twin, which has no VGPR to spare.
+    auto sfb_slide_fill = [&](int col0, int cols) {
+        if constexpr (!SFB_SLIDE) { (void)col0; (void)cols; } else {
+        // Cut on the panel's compile-time width, skipping the columns a short
+        // last window does not own, so the index split needs no divide.
+        auto s_sfb = make_smem(s_sfb_ptr);
+#pragma unroll 1
+        for (int idx = (int)opus::thread_id_x(); idx < SFB_PANEL_MAX; idx += T::BLOCK_SIZE) {
+            const int ng = idx / SFA_SCALES_MAX;
+            const int c  = idx - ng * SFA_SCALES_MAX;
+            if (c >= cols) continue;
+            const int dst = SFB_NG_MINOR ? c * SFB_ROWS + ng : idx;
+            s_sfb.template store<1>(load<1>(g_sfb, ng * kargs.stride_sfb + col0 + c), dst);
+        }
+        }
+    };
+
     // kid157: one-shot cooperative fill of the A-scale panel into LDS, published by
     // the barrier below. Byte-at-a-time was 16 iterations per thread at K=4096, each
     // stalling on its own vmcnt(0). A chunk must not span two M rows nor land
@@ -739,6 +766,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
             ? (sfa_k_scales - col0 < SFA_SCALES_MAX ? sfa_k_scales - col0 : SFA_SCALES_MAX)
             : sfa_k_scales;
         sfb_reg_fill(col0, cols);
+        sfb_slide_fill(col0, cols);
         // Cutting the flat index on the panel's compile-time width instead of
         // the window's would trade the runtime divisor for a reciprocal-free
         // one, but it also walks the columns a short last window does not own:
@@ -872,7 +900,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     };
 
     if constexpr (PRELOAD_SFA_LDS) {
-        if constexpr (TUNE_MX32_PRELOAD && SFA_ASYNC16_OK && !SFB_WINDOW) {
+        if constexpr (TUNE_MX32_PRELOAD && SFA_ASYNC16_OK && !SFB_WINDOW && !SFB_SLIDE) {
             // The initial 96-column panel is contiguous in LDS: three 16B
             // passes bypass the temporary VGPRs and their dependent stores.
             // sfa_async_fill waits for VM completion; the shared publication
@@ -887,7 +915,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     }
 
     // Land the B scale fetched above; its latency is already spent by now.
-    if constexpr (SFB_PANEL) {
+    if constexpr (SFB_PREFETCH) {
         opus::static_for<SFB_FILL_ITERS>([&](auto it_c) {
             constexpr int it = decltype(it_c)::value;
             if (sfb_take[it]) {
@@ -940,7 +968,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         sfa_fill_window(first * SFA_SPK, opus::bool_constant<true>{});
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
-        if constexpr (SFB_WINDOW) __builtin_amdgcn_s_barrier();
+        if constexpr (SFB_WINDOW || SFB_SLIDE) __builtin_amdgcn_s_barrier();
     };
 
     // Prologue

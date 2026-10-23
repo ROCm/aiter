@@ -790,10 +790,10 @@ def _heuristic_mxscale_bmm_kid(
 
     if (
         divisible(n, 256)
-        and divisible(k, 128)
+        and divisible(k, 256)
         and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
-        return offset + (8158 if 4096 <= k <= 8192 else 8150)
+        return offset + (8158 if 4096 <= k <= 8192 else 8157 if k > 8192 else 8150)
     if m < 64:
         return offset + (8640 if divisible(n, 64) and divisible(k, 256) else 8653)
     if m <= 256 and k <= 1024 and divisible(n, 32) and divisible(k, 256):
@@ -822,8 +822,8 @@ def _heuristic_mxscale_bmm_plans(g: int, m: int, n: int, k: int, offset: int):
     G 1-16, M 1-2048, N 512-7168, K 1024-16384. Below M 64 the tile is as
     tall as M needs, since every padded row is weight bandwidth spent for
     nothing. The 256x256 pipeline needs about 2**23 outputs to fill the GPU
-    at K 4096-8192; at short K it is prologue bound and past 8192 it loses
-    the scale preload, so both want twice that. Split-K only pays at
+    from K 4096 up (past 8192 on the sliding-panel 8157); at short K it is
+    prologue bound and wants twice that. Split-K only pays at
     K >= 8192, and only while the tiles leave the CUs half empty, keeping at
     least 2048 of K per split.
     """
@@ -838,9 +838,9 @@ def _heuristic_mxscale_bmm_plans(g: int, m: int, n: int, k: int, offset: int):
         else:
             kid = 8320
     else:
-        big_log2 = 23 + (2 if k <= 1024 else 1 if (k < 4096 or k > 8192) else 0)
-        if n % 256 == 0 and k % 128 == 0 and e >= 1 << big_log2:
-            yield offset + (8158 if k <= 8192 else 8150), 1
+        big_log2 = 23 + (2 if k <= 1024 else 1 if k < 4096 else 0)
+        if n % 256 == 0 and k % 256 == 0 and e >= 1 << big_log2:
+            yield offset + (8158 if k <= 8192 else 8157), 1
         if (
             m > 64
             and k >= 2048
@@ -900,10 +900,13 @@ def _mx1x32_twin(kid32: int, g: int, m: int, n: int, k: int) -> int | None:
 
     The 256x256 pipeline tiles stage a sliding B-row window next to the A panel
     (9894), which takes a narrower window than the 32x32 tile; below 2**24
-    output elements the flatmm 256-wide tile is still ahead of it.
+    output elements a flatmm tile is still ahead of it: the 256-wide 9825
+    up to its 64 K-tiles, the 128x128 9837 past them.
     """
-    if kid32 in (9150, 9158):
-        return 9894 if g * m * n >= 1 << 24 and k <= 8192 else 9825
+    if kid32 in (9150, 9157, 9158):
+        if g * m * n >= 1 << 24:
+            return 9894
+        return 9825 if k <= 8192 else 9837
     return _mx1x32_twins().get(kid32)
 
 

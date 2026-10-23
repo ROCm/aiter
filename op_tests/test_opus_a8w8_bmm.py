@@ -573,6 +573,63 @@ def check_mx1x32_kids():
     return len(_MX1X32_KIDS)
 
 
+# --- pipeline kids past the K <= 8192 scale-panel ceiling -------------------
+# 12288 slides the panels a non-power-of-two number of times and ends on a
+# partial window; 32768 is four times the old ceiling. The odd K-tile count
+# must be refused, not computed: the main loop consumes tiles in pairs.
+_LONG_K_KIDS = (8157, 9157, 9894)
+_LONG_K_SHAPES = ((2, 300, 512, 12288), (1, 256, 256, 32768))
+
+
+def check_long_k_kids():
+    """Check the sliding-panel pipeline kids at K > 8192 against a reference."""
+    failures = []
+    checked = 0
+    for g, m, n, k in _LONG_K_SHAPES:
+        for kid in _LONG_K_KIDS:
+            inst = a8w8_mxscale_bmm_kernels_list[kid]
+            group, group_n = inst.GROUP_K, inst.GROUP_N
+            O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(
+                _block_varied((g, m, k), k), group=group
+            )
+            W_bf16 = _block_varied((g, n, k), k)
+            if group_n == 1:
+                row_amp = torch.exp2(torch.randint(-4, 4, (n, 1)).float())
+                W_bf16 = (W_bf16.float() * row_amp).to(dtypes.bf16)
+            W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16, group=group, group_n=group_n)
+            ref = run_torch(
+                O_mx, W_mx, xs_fp32, ws_fp32, group=group, group_n=group_n
+            ).transpose(0, 1)
+            out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
+            _run_opus(O_mx.transpose(0, 1), W_mx, out, xs_mx.transpose(0, 1), ws_mx, kid)
+            torch.cuda.synchronize()
+            delta = (out.to(dtypes.fp32) - ref).abs()
+            rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
+            err = rows.max().item()
+            if not (err <= _MX32_ERR_TOL):
+                failures.append(f"kid {kid} K={k}: worst row rel err {err:.4f}")
+            checked += 1
+    for kid in _LONG_K_KIDS:
+        inst = a8w8_mxscale_bmm_kernels_list[kid]
+        k = 12288 + 128
+        O_mx, xs_mx, _ = _quant_per_token_e8m0(
+            _block_varied((1, 256, k), k), group=inst.GROUP_K
+        )
+        W_mx, ws_mx, _ = _quant_block_e8m0(
+            _block_varied((1, 256, k), k), group=inst.GROUP_K, group_n=inst.GROUP_N
+        )
+        out = torch.empty((256, 1, 256), dtype=dtypes.bf16)
+        try:
+            _run_opus(O_mx.transpose(0, 1), W_mx, out, xs_mx.transpose(0, 1), ws_mx, kid)
+            torch.cuda.synchronize()
+            failures.append(f"kid {kid}: accepted an odd K-tile count (K={k})")
+        except RuntimeError as exc:
+            if "even K" not in str(exc):
+                failures.append(f"kid {kid}: K={k} refused for {str(exc)[-80:]}")
+    assert not failures, "long-K pipeline kids:\n  " + "\n  ".join(failures)
+    return checked
+
+
 # --- wave1 bpreshuffle, GROUP_N == GROUP_K == 128 -------------------------
 # The wave1 tiles are the only single-wave bpreshuffle pipeline in the family,
 # so nothing else instantiates their B-fragment addressing. M=17 is deliberate:
@@ -874,6 +931,8 @@ def main():
     aiter.logger.info(
         "wave1 bpreshuffle group128 passed for %d kid/split pairs", n_wave1
     )
+    n_long_k = check_long_k_kids()
+    aiter.logger.info("long-K pipeline kids passed for %d kid/shape pairs", n_long_k)
 
     if args.check_m_align:
         try:

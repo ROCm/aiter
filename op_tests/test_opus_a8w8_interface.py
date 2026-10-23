@@ -368,7 +368,9 @@ def test_mxscale_wrong_group_kid_is_skipped(mxscale_csv, caplog):
         ((2, 2048, 1024, 4096), 8137),
         ((2, 2048, 1024, 1024), 8653),
         ((16, 1024, 4096, 4096), 8158),
-        ((16, 1024, 4096, 16384), 8150),
+        ((16, 1024, 4096, 16384), 8157),
+        ((4, 2048, 1024, 12288), 8157),
+        ((16, 1024, 4096, 4224), 8137),
         ((2, 1, 64, 256), 8640),
         ((2, 1, 64, 128), 8653),
         ((2, 128, 32, 256), 8320),
@@ -419,6 +421,8 @@ def test_mxscale_untuned_split_k_fills_cus(
         (8, 300, 1024, 4096),
         (2, 2048, 1024, 4096),
         (16, 4096, 1024, 4096),
+        (4, 2048, 1024, 12288),
+        (16, 4096, 1024, 16384),
     ],
 )
 def test_mxscale_untuned_1x32_takes_the_32x32_twin(mxscale_csv, shape):
@@ -429,6 +433,21 @@ def test_mxscale_untuned_1x32_takes_the_32x32_twin(mxscale_csv, shape):
     assert not instance.needs_preshuffled_b
     kid32, _ = policy.resolve_a8w8_mxscale_bmm_plan(*shape, w_scale_block="32x32")
     assert kid == policy._mx1x32_twin(kid32, *shape)
+
+
+@pytest.mark.parametrize("kid", [8158, 9158, 9894, 8157])
+def test_mxscale_pipeline_plan_rejects_odd_k_tiles(kid):
+    from aiter.ops.opus.launch_plan import _build_a8w8_mxscale_bmm_plan
+
+    _build_a8w8_mxscale_bmm_plan(
+        arch="gfx950", kid=kid, output_dtype=torch.bfloat16,
+        M=256, batch=1, N=256, K=4096, split_k=1,
+    )
+    with pytest.raises(ValueError, match="even K"):
+        _build_a8w8_mxscale_bmm_plan(
+            arch="gfx950", kid=kid, output_dtype=torch.bfloat16,
+            M=256, batch=1, N=256, K=4224, split_k=1,
+        )
 
 
 def test_mxscale_untuned_1x32_raises_where_no_tile_runs(mxscale_csv):

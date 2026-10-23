@@ -182,6 +182,9 @@ class OpusGemmInstance:
     # The A scale panel alone (pipeline family). For GROUP_N=1, whose B panel
     # is B_N rows and does not fit beside the A panel.
     preload_sfa_lds: bool = False
+    # Pipeline family: slide the B scale panel with the A window instead of
+    # holding the whole K, which lifts the preload K ceiling.
+    sf_long_k: bool = False
     name_root: str = "opus_gemm"
 
     # gfx1250 fused single-kernel split-K. SplitK and the N-direction cluster
@@ -348,6 +351,8 @@ class OpusGemmInstance:
                 parts.append("preload_sf")
             elif self.preload_sfa_lds:
                 parts.append("preload_sfa")
+            if self.sf_long_k:
+                parts.append("longk")
         elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline_bpreshuffle":
             # opus_bmm_a8w8_mxscale_pipeline_bpreshuffle_<geom>[_preload_sf].
             # Without this branch the tag fell through to the bare default, so
@@ -1687,6 +1692,14 @@ _bmm_pipeline_local.update({
     150 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(GROUP_N=32, GROUP_K=32),
     158 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(
         preload_sf_lds=True, GROUP_N=32, GROUP_K=32
+    ),
+})
+# 158 and its twin for K > 8192: both scale panels slide, so K is unbounded.
+# Separate kids so 158's tuned footprint at K <= 8192 stays as it is.
+_bmm_pipeline_local.update({
+    157: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True, sf_long_k=True),
+    157 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(
+        preload_sf_lds=True, sf_long_k=True, GROUP_N=32, GROUP_K=32
     ),
 })
 # 1x32 twins, past the 18xx flatmm twins' kid % 100 range. A GROUP_N=1 B scale
