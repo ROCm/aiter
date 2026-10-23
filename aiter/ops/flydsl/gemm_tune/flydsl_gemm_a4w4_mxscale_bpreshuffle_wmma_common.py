@@ -8,7 +8,7 @@ Two kernels, both reading the 32x4-shuffled e8m0 scales and a 16x16-preshuffled 
 * the compute-bound 256x256 kernel (``flydsl_a4w4_bpreshuffle_compute_wmma_*``), 2x2 waves,
   4 buffers, a real workgroup cluster, optional clustered fused split-K;
 * the general kernel (``flydsl_a4w4_bpreshuffle_wmma_*``), 4 waves in a 1x4, 2x2 or 4x1 layout and
-  power-of-two tiles, for the M the compute kernel cannot serve.
+  power-of-two tiles, including the M below the compute tile.
 
 Compiling a config does not depend on (M, N, K), so ``kernels_list`` is shape independent and
 :func:`kernel_fits_shape` keeps the ones one shape can launch. The launch rules themselves live
@@ -213,6 +213,10 @@ def kernel_fits_shape(ki: A4W4KernelInstance, M: int, N: int, K: int) -> bool:
     """Whether ``ki`` can launch for (M, N, K) and is worth timing there."""
     cfg = ki.cfg
     if a4w4_launch_error(cfg, M, N, K) is not None:
+        return False
+    # A compute tile launches below tile_m (one partial M tile), but the search keeps
+    # screening it only where it fills whole tiles of M.
+    if ki.compute_bound and M < ki.tile_m:
         return False
     # Time exactly the config named: no cluster_m reduction, no padded cluster rows.
     m_tiles = _ceil_div(M, ki.tile_m)

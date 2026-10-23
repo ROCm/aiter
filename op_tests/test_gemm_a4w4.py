@@ -29,13 +29,17 @@ SCALE_GROUP_SIZE = 32
 SUPPORTED_GFX = ["gfx950", "gfx1250"]
 # gfx1250 M the tuned table lacks, with whether the kernel each must reach is the compute
 # one (every tuned compute row fills whole M tiles). 1 is below the smallest row; 17 and 257
-# leave a partial M tile of a general kernel, 2049 one of the compute kernel. Together they
-# reach the masked-M stores and partial-tile cluster reduction of both kernel families.
+# leave a partial M tile of a general kernel, 2049 one of the compute kernel. 129 and 255 are
+# below the 256-row compute tile of N=36864 and reach it through the padded M, as one partial
+# tile. Together they reach the masked-M stores and partial-tile cluster reduction of both
+# kernel families.
 OFF_GRID_SHAPES = {
     (1, 7168, 16384): False,
     (17, 7168, 16384): False,
     (257, 7168, 16384): False,
     (2049, 7168, 16384): True,
+    (129, 36864, 7168): True,
+    (255, 36864, 7168): True,
 }
 pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
@@ -111,10 +115,12 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     """gemm_a4w4 as ATOM calls it on gfx1250: the weight and the activation scale in the
     32x4 layout, the activation quantized straight into it. ``tuned`` is the public op, so
     it runs the backend the tuned CSV (or the FlyDSL fallback) picks for this shape."""
-    from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
-        parse_a4w4_kernel_name,
+    # Importing aiter.ops.flydsl needs flydsl itself, so only a FlyDSL run may import it.
+    from aiter.ops.gemm_op_a4w4 import (
+        _FLYDSL_AVAILABLE,
+        _a4w4_mxscale_config,
+        gemm_mxfp4_asm,
     )
-    from aiter.ops.gemm_op_a4w4 import _a4w4_mxscale_config, gemm_mxfp4_asm
 
     quant = aiter.get_hip_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
@@ -135,8 +141,13 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     }
     config = _a4w4_mxscale_config(M, N, K) or ("asm", "")
     # An asm pick, or the other kernel family, would hide the coverage an off-grid M is for.
+    # Without FlyDSL there is no family to check: both candidates still verify ASM.
     want_compute = OFF_GRID_SHAPES.get((M, N, K))
-    if want_compute is not None:
+    if want_compute is not None and _FLYDSL_AVAILABLE:
+        from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+            parse_a4w4_kernel_name,
+        )
+
         kernel = parse_a4w4_kernel_name(config[1]) if config[0] == "flydsl" else None
         assert kernel and kernel["compute_bound"] == want_compute, (
             f"M={M} N={N} K={K}: expected a FlyDSL "

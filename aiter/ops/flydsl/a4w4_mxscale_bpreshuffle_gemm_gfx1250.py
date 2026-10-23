@@ -208,8 +208,9 @@ def a4w4_launch_error(cfg: dict, M: int, N: int, K: int) -> str | None:
     """Why the kernel a parsed kernelName names cannot launch for (M, N, K), None when it can.
 
     One rule set for the launcher, the tuned-row lookup and the tuner. It mirrors the
-    asserts of the two FlyDSL launchers plus one safety rule: a compute kernel is not
-    launched with M < tile_m (a cluster of workgroups that own no M row can hang the GPU).
+    asserts of the two FlyDSL launchers. An M below tile_m is one partial M tile: the A /
+    scale-A loads and the C store are bounded by M, and :func:`a4w4_fit_cluster_m` keeps
+    cluster_m at 1 there, so no workgroup owns no M row.
     """
     tile_m, tile_n, tile_k = cfg["tile_m"], cfg["tile_n"], cfg["tile_k"]
     mw, nw, nb = cfg["m_warp"], cfg["n_warp"], cfg["num_buffers"]
@@ -238,8 +239,6 @@ def a4w4_launch_error(cfg: dict, M: int, N: int, K: int) -> str | None:
             return "unsupported compute tile profile"
         if cm * cn < 2:
             return f"compute needs a real cluster, got {cm}x{cn}"
-        if M < tile_m:
-            return f"compute kernel needs M >= tile_m={tile_m}, got M={M}"
         if N % (tile_n * cn) != 0:
             return f"N={N} must be a multiple of tile_n*cluster_n={tile_n * cn}"
         if K % (tile_k * sk) != 0 or K // sk < tile_k:
