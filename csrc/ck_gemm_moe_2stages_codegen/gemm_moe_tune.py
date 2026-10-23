@@ -5193,13 +5193,13 @@ class FmoeTuner(TunerCommon):
             # TUNE_ONLY: comma-list subset gate to isolate sources, e.g.
             #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
             #   TUNE_ONLY=opus    -> only gen_opus_2stages_task
-            # unset = flydslv2, or all sources for shapes flydslv2 does not cover;
+            # unset = flydslv2 if available, otherwise all (OPUS_ONLY applies);
             # empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE).
             tune_only = os.environ.get("TUNE_ONLY")
+            v2_tasks = None
             if tune_only is None:
-                tune_only = (
-                    "flydslv2" if self.gen_flydsl_v2_2stages_task(info, blockMs) else ""
-                )
+                v2_tasks = self.gen_flydsl_v2_2stages_task(info, blockMs)
+                tune_only = "flydslv2" if v2_tasks else ""
             _tune_only = {s for s in tune_only.split(",") if s}
 
             def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
@@ -5216,7 +5216,11 @@ class FmoeTuner(TunerCommon):
             if _want("flydsl"):
                 tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
             if _want("flydslv2"):
-                tasks_ck.extend(self.gen_flydsl_v2_2stages_task(info, blockMs))
+                tasks_ck.extend(
+                    v2_tasks
+                    if v2_tasks is not None
+                    else self.gen_flydsl_v2_2stages_task(info, blockMs)
+                )
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
             if _want("opus"):
