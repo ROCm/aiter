@@ -25,16 +25,24 @@ class _Group:
         self.world_size = world
 
 
-def _reference(parts, lses):
+def _reference(parts, lses, base_e):
     stacked = torch.stack(parts, 0).float()
     lse = torch.stack(lses, 0).float()
     lse = torch.where(torch.isnan(lse) | torch.isposinf(lse), float("-inf"), lse)
     m = lse.max(0).values
     m = torch.where(torch.isneginf(m), 0.0, m)
-    g = torch.log(torch.exp(lse - m).sum(0)) + m
-    w = torch.exp(lse - g)
+    exp, log = (torch.exp, torch.log) if base_e else (torch.exp2, torch.log2)
+    g = log(exp(lse - m).sum(0)) + m
+    w = exp(lse - g)
     w = torch.where(torch.isnan(w), 0.0, w)
     return (stacked * w[..., None]).sum(0).to(torch.bfloat16), g
+
+
+def _row_empty(tokens, seq_lens, qsl):
+    """Rows past qsl[-1] (graph padding) or whose request has no local KV."""
+    rows = torch.arange(tokens, device=seq_lens.device)
+    seq = torch.searchsorted(qsl[1:], rows, right=True).clamp(max=seq_lens.numel() - 1)
+    return (rows >= qsl[-1]) | (seq_lens[seq] == 0)
 
 
 def worker(rank, world):
@@ -44,35 +52,63 @@ def worker(rank, world):
     dist.init_process_group("nccl", rank=rank, world_size=world)
     group = _Group(dist.new_group(backend="gloo"), rank, world)
     try:
-        tokens, hl, dim = 8, 12, 512
+        tokens, hl = 8, 12
         gen = torch.Generator(device="cuda")
         gen.manual_seed(100 + rank)
-        cws = CombineWorkspace(group, torch.device("cuda"), hl, dim, 64)
-        for _ in range(3):
-            out = torch.randn(
-                tokens,
-                world * hl,
-                dim,
-                device="cuda",
-                dtype=torch.bfloat16,
-                generator=gen,
-            )
-            lse = torch.randn(
-                tokens, world * hl, device="cuda", dtype=torch.float32, generator=gen
-            )
-            if rank == 0:
-                lse[0, 0] = float("nan")
-            res, res_lse = dcp_lse_combine(cws, out, lse, return_lse=True)
-            torch.cuda.synchronize()
-            go = [torch.empty_like(out) for _ in range(world)]
-            gl = [torch.empty_like(lse) for _ in range(world)]
-            dist.all_gather(go, out)
-            dist.all_gather(gl, lse)
-            sl = slice(rank * hl, (rank + 1) * hl)
-            exp, exp_lse = _reference([g[:, sl] for g in go], [g[:, sl] for g in gl])
-            torch.testing.assert_close(res.float(), exp.float(), rtol=1e-2, atol=1e-2)
-            torch.testing.assert_close(res_lse, exp_lse, rtol=1e-4, atol=1e-4)
+        # Request 1 has no KV on every third rank; rows 6 and 7 are graph padding.
+        qsl = torch.tensor([0, 3, 6], device="cuda", dtype=torch.int32)
+        seq_lens = torch.tensor(
+            [5, 0 if rank % 3 == 0 else 7], device="cuda", dtype=torch.int32
+        )
+        for dim in (64, 128, 512, 576):
+            cws = CombineWorkspace(group, torch.device("cuda"), hl, dim, 64)
+            for base_e in (True, False):
+                for masked in (False, True):
+                    out = torch.randn(
+                        tokens,
+                        world * hl,
+                        dim,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                        generator=gen,
+                    )
+                    lse = torch.randn(
+                        tokens,
+                        world * hl,
+                        device="cuda",
+                        dtype=torch.float32,
+                        generator=gen,
+                    )
+                    if rank == 0:
+                        lse[0, 0] = float("nan")
+                    mask = {}
+                    if masked:
+                        mask = {"seq_lens": seq_lens, "query_start_loc": qsl}
+                    res, res_lse = dcp_lse_combine(
+                        cws, out, lse, return_lse=True, base_e=base_e, **mask
+                    )
+                    torch.cuda.synchronize()
+                    if masked:
+                        lse = lse.masked_fill(
+                            _row_empty(tokens, seq_lens, qsl)[:, None], float("-inf")
+                        )
+                    go = [torch.empty_like(out) for _ in range(world)]
+                    gl = [torch.empty_like(lse) for _ in range(world)]
+                    dist.all_gather(go, out)
+                    dist.all_gather(gl, lse)
+                    sl = slice(rank * hl, (rank + 1) * hl)
+                    exp, exp_lse = _reference(
+                        [g[:, sl] for g in go], [g[:, sl] for g in gl], base_e
+                    )
+                    torch.testing.assert_close(
+                        res.float(), exp.float(), rtol=1e-2, atol=1e-2
+                    )
+                    torch.testing.assert_close(res_lse, exp_lse, rtol=1e-4, atol=1e-4)
+                    if not masked:
+                        plain = dcp_lse_combine(cws, out, lse, base_e=base_e)
+                        torch.testing.assert_close(plain, res, rtol=0, atol=0)
 
+        dim = 512
         gws = GatherWorkspace(
             group, torch.device("cuda"), hl, dim, torch.bfloat16, world * hl, 64
         )
