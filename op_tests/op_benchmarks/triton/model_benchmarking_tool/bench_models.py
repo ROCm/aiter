@@ -6,20 +6,14 @@ import math
 import os
 import re
 import shlex
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from typing import TypeAlias
-import warnings
 
 import matplotlib.pyplot as plt
 import pandas as pd
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4_proton import (
-    main as bench_moe_gemm_a4w4_main,
-)
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4_proton import (
-    main as bench_moe_gemm_a8w4_main,
-)
 from triton.runtime.errors import OutOfResources
 
 from aiter.ops.triton.utils._triton import arch_info
@@ -46,6 +40,12 @@ from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
 )
 from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
 from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4_proton import (
+    main as bench_moe_gemm_a4w4_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4_proton import (
+    main as bench_moe_gemm_a8w4_main,
+)
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
     main as bench_moe_gemm_a8w8_main,
 )
@@ -627,9 +627,12 @@ def call_function(
     result: float | str = "N/A"
 
     try:
-        with warnings.catch_warnings(record=True) as captured_warnings:
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                bench_fn(shlex.split(handler.build_args()))
+        with (
+            warnings.catch_warnings(record=True) as captured_warnings,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            bench_fn(shlex.split(handler.build_args()))
         warning_output = "".join(
             warnings.formatwarning(
                 message=w.message,
