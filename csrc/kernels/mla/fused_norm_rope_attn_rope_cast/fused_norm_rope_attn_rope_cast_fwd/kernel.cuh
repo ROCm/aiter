@@ -1167,18 +1167,22 @@ __device__ inline float bf32(opus::bf16_t x)
 {
     return std::bit_cast<float>(uint32_t(__builtin_bit_cast(uint16_t, x)) << 16);
 }
-__device__ inline float mul_exact(float x, float y)
+// Preserve the separate FP32 products and sum while permitting packed
+// arithmetic for each RoPE pair. BF16 rounding stays at the existing call sites.
+template <bool Inverse>
+__device__ inline opus::vector_t<float, 2> rope_pair(float x0, float x1, float co, float si)
 {
-    float z;
-    asm("v_mul_f32 %0, %1, %2" : "=v"(z) : "v"(x), "v"(y));
-    return z;
+#pragma clang fp contract(off)
+    const opus::vector_t<float, 2> direct{x0, x1};
+    const opus::vector_t<float, 2> swapped{x1, x0};
+    auto cross = swapped * si;
+    if constexpr(Inverse)
+        cross[1] = -cross[1];
+    else
+        cross[0] = -cross[0];
+    return direct * co + cross;
 }
-__device__ inline float add_exact(float x, float y)
-{
-    float z;
-    asm("v_add_f32 %0, %1, %2" : "=v"(z) : "v"(x), "v"(y));
-    return z;
-}
+
 template <class T>
 __device__ __forceinline__ int
 prepare_q(const FusedNormRopeAttnRopeCastParams& a, char* smem, int warp, int lane, int t, int hs)
@@ -1211,11 +1215,10 @@ prepare_q(const FusedNormRopeAttnRopeCastParams& a, char* smem, int warp, int la
                         constexpr int j = i.value * 2;
                         const int ri    = (d + j - 448) / 2;
                         const float x0 = bf32(x[j]), x1 = bf32(x[j + 1]), co = bf32(cs[ri]),
-                                    si = bf32(sn[ri]);
-                        x[j] =
-                            static_cast<bf16_t>(add_exact(mul_exact(x0, co), -mul_exact(x1, si)));
-                        x[j + 1] =
-                            static_cast<bf16_t>(add_exact(mul_exact(x0, si), mul_exact(x1, co)));
+                                    si     = bf32(sn[ri]);
+                        const auto rotated = rope_pair<false>(x0, x1, co, si);
+                        x[j]               = static_cast<bf16_t>(rotated[0]);
+                        x[j + 1]           = static_cast<bf16_t>(rotated[1]);
                     });
             }
             vector_t<float, 16> f;
@@ -1273,10 +1276,9 @@ __device__ __forceinline__ int prepare_q_direct(
                         const int ri    = (d + j - 448) / 2;
                         const float x0 = bf32(x[j]), x1 = bf32(x[j + 1]);
                         const float co = bf32(cs[ri]), si = bf32(sn[ri]);
-                        x[j] =
-                            static_cast<bf16_t>(add_exact(mul_exact(x0, co), -mul_exact(x1, si)));
-                        x[j + 1] =
-                            static_cast<bf16_t>(add_exact(mul_exact(x0, si), mul_exact(x1, co)));
+                        const auto rotated = rope_pair<false>(x0, x1, co, si);
+                        x[j]               = static_cast<bf16_t>(rotated[0]);
+                        x[j + 1]           = static_cast<bf16_t>(rotated[1]);
                     });
             }
             vector_t<float, 16> f;
@@ -1317,6 +1319,8 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
     using namespace opus;
     constexpr int VEC = VEC_O2<T>;
     constexpr int NC  = O_ELEMS<T> / VEC / PV_GROUPS<T>;
+    static_assert(NC == 4 && PV_GROUPS<T> == 4 && T::W_M == 16);
+    vector_t<uint32_t, PV_GROUPS<T>> scale_words{};
     const int64_t pos = a.positions64 ? reinterpret_cast<const int64_t*>(a.positions_ptr)[token]
                                       : reinterpret_cast<const int*>(a.positions_ptr)[token];
     auto cs           = reinterpret_cast<const bf16_t*>(a.cos_ptr) + pos * 32;
@@ -1367,8 +1371,9 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
                     constexpr int j = i.value * 2;
                     const float co = rope_cos[i.value], si = rope_sin[i.value];
                     const float x0 = x[j], x1 = x[j + 1];
-                    x[j]     = add_exact(mul_exact(x0, co), mul_exact(x1, si));
-                    x[j + 1] = add_exact(mul_exact(x1, co), -mul_exact(x0, si));
+                    const auto rotated = rope_pair<true>(x0, x1, co, si);
+                    x[j]               = rotated[0];
+                    x[j + 1]           = rotated[1];
                 });
             }
             float am = 1e-8f;
@@ -1381,12 +1386,26 @@ __device__ __forceinline__ void fused_epilogue(const FusedNormRopeAttnRopeCastPa
             const float mul     = std::bit_cast<float>(uint32_t(127 - e) << 23);
             auto q              = cast<opus::fp8_t>(x * mul);
             *reinterpret_cast<uint64_t*>(a.output_q_ptr + global) = __builtin_bit_cast(uint64_t, q);
-            if(lane < 16)
-                a.output_s_ptr[global / 512 * 16 + d / 32] = e + 127;
+            scale_words[r.value] |= uint32_t(uint8_t(e + 127)) << (c.value * 8);
             if(a.debug_ptr)
                 *reinterpret_cast<vector_t<float, 8>*>(a.debug_ptr + global) = x;
         });
     });
+    // Each warp owns four adjacent scale bytes per head. Pack them before
+    // storing, while preserving support for unaligned output views.
+    if(lane < T::W_M)
+    {
+        const int64_t head_base = int64_t(token) * a.H + h_start + lane;
+        static_for<PV_GROUPS<T>>([&](auto r) {
+            const int head_group = (warp + r.value) % PV_GROUPS<T> * T::W_M;
+            auto* dst            = a.output_s_ptr + (head_base + head_group) * 16 + warp * NC;
+            if((reinterpret_cast<uintptr_t>(a.output_s_ptr) & 3) == 0)
+                *reinterpret_cast<uint32_t*>(dst) = scale_words[r.value];
+            else
+                static_for<NC>(
+                    [&](auto c) { dst[c.value] = uint8_t(scale_words[r.value] >> (c.value * 8)); });
+        });
+    }
 }
 
 // ------------------------------------------------------------------------------------ driver

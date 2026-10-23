@@ -19,12 +19,15 @@ inline bool launch_fused_norm_rope_attn_rope_cast_fwd(const FusedNormRopeAttnRop
     // Host capacities estimate rows/query without synchronizing the device CSR.
     const int64_t capacity = int64_t(a.prefix_capacity) + (strided ? a.extend_capacity : 0);
     const bool h128 = a.heads == 128 && a.tokens <= 320 && capacity >= int64_t(a.tokens) * 1024;
-    // The 64-row pipeline shares V across four head groups and loads KV directly
-    // into LDS. Small grids benefit at K512; larger grids need K1536 to amortize
-    // its LDS footprint. Keep the 32-row kernel for shorter lists and larger grids.
-    const bool h64 = a.heads == 64 && strided &&
+    // The shared-V 64-row pipeline amortizes its LDS footprint earlier for
+    // two-source prefill after fusing the Q and output transforms. Keep short
+    // lists and large grids on the 32-row kernel; preserve single-source limits.
+    const bool two_sources = a.prefix_capacity > 0 && a.extend_capacity > 0;
+    const bool h64         = a.heads == 64 && strided &&
                      ((a.tokens <= 256 && capacity >= int64_t(a.tokens) * 512) ||
-                      (a.tokens <= 1024 && capacity >= int64_t(a.tokens) * 1536));
+                      (a.tokens <= 1024 && capacity >= int64_t(a.tokens) * 1536) ||
+                      (two_sources && ((a.tokens <= 768 && capacity >= int64_t(a.tokens) * 768) ||
+                                       (a.tokens <= 1024 && capacity >= int64_t(a.tokens) * 896))));
     if(!h64 && !h128)
         return false;
     FusedNormRopeAttnRopeCastParams k{};

@@ -1720,13 +1720,24 @@ def run_benchmark(args, buffers):
     return fused_v41(**args, **buffers)
 
 
-@pytest.mark.parametrize("topk", [512, 1024])
+@pytest.mark.parametrize(
+    "tokens,topk",
+    [
+        (512, 512),
+        (768, 512),
+        (769, 512),
+        (1024, 448),
+        (1024, 512),
+        (1024, 768),
+        (1024, 1024),
+    ],
+)
 @pytest.mark.parametrize("mode", ["raw", "prepared", "norm"])
-def test_two_source_h64_causal_prefill(topk, mode):
+def test_two_source_h64_causal_prefill(tokens, topk, mode):
     # Long causal CSR rows exercise the 64-row pipeline, including its source
     # switch and final partial tile. Check all heads against a dense oracle.
     torch.manual_seed(23917 + topk)
-    tokens, heads, prefix_rows = 1024, 64, 65536
+    heads, prefix_rows = 64, 65536
     values, scales = quantize_fp8(
         torch.randn(prefix_rows + tokens, 512, device="cuda", dtype=torch.bfloat16)
         * 0.25
@@ -1782,7 +1793,7 @@ def test_two_source_h64_causal_prefill(topk, mode):
         max_logits=torch.empty(tokens, heads, device="cuda"),
         lse=torch.empty(tokens, heads, device="cuda"),
     )
-    probes = [0, 511, 512, 1023]
+    probes = sorted({0, tokens // 2 - 1, tokens // 2, tokens - 1})
     rows = [
         torch.cat((pids[t], eids[int(ep[t]) : int(ep[t + 1])] + prefix_rows))
         for t in probes
@@ -1915,6 +1926,32 @@ def test_two_source_rope_storage_offset(heads, mode):
     actual = fused_v41(
         **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
     )
+    for out, expected in zip(actual, reference):
+        torch.testing.assert_close(
+            out.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("mode", ["raw", "prepared"])
+@pytest.mark.parametrize("offset", [1, 3])
+def test_two_source_scale_output_storage_offset(heads, mode, offset):
+    kwargs, (_, mx, lse) = two_source_inputs(heads, "padded", mode, True, True, True)
+    reference = fused_v41(
+        **kwargs, max_logits=torch.empty_like(mx), lse=torch.empty_like(lse)
+    )
+    storage = torch.empty(
+        reference[1].numel() + offset, device="cuda", dtype=torch.uint8
+    )
+    scales = storage[offset:].view(reference[1].dtype).view_as(reference[1])
+    assert scales.is_contiguous() and scales.data_ptr() % 4 != 0
+    actual = fused_v41(
+        **kwargs,
+        out_scale=scales,
+        max_logits=torch.empty_like(mx),
+        lse=torch.empty_like(lse),
+    )
+    assert actual[1].data_ptr() == scales.data_ptr()
     for out, expected in zip(actual, reference):
         torch.testing.assert_close(
             out.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
