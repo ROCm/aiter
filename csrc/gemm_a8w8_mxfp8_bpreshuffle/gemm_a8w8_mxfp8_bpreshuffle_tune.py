@@ -52,6 +52,7 @@ from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
 TUNED_FILE = "aiter/configs/model_configs/dsv4_a8w8_mxfp8_bpreshuffle_tuned_gemm.csv"
+MXSCALE_CONFIG_ENV_NAME = "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE"
 # The w_scale blocks gfx1250 tunes.
 GFX1250_W_SCALE_BLOCKS = ("32x32", "128x128")
 # The block of a shape list without a w_scale_block column, and of a tuned
@@ -253,9 +254,23 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 return pipe.kernels_list[kernelId].name
         return None
 
+    def get_arg_defaults(self):
+        defaults = super().get_arg_defaults()
+        if getattr(self, "_mxscale_table", False):
+            # --run_config / --compare read the e8m0 block-scale table in this mode.
+            defaults["config_env_name"] = MXSCALE_CONFIG_ENV_NAME
+        return defaults
+
+    def pre_process(self, args):
+        # Before run(), so a standalone --run_config (which never calls tune) is set up too.
+        self._mxscale_table = bool(getattr(args, "mxscale_table", False))
+        super().pre_process(args)
+
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
 
+        _op._load_mxscale_bpreshuffle_tuned.cache_clear()
+        _op.get_mxscale_bpreshuffle_config.cache_clear()
         _op._get_mxfp8_bpreshuffle_config.cache_clear()
         _op._load_mxfp8_bpreshuffle_tuned.cache_clear()
         _op._CKGEMM_CONFIG_CACHE.clear()
@@ -318,8 +333,19 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         return super().calculate(results, bpes=(1, 1, 2))
 
     def run_config(self, args):
-        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8_bpreshuffle
+        from aiter.ops.gemm_op_a8w8 import (
+            gemm_a8w8_blockscale_bpreshuffle,
+            gemm_a8w8_mxfp8_bpreshuffle,
+        )
         from aiter.test_common import checkAllclose, run_perftest
+
+        # --mxscale_table rows (32x32 / 128x128) run through the blockscale operator,
+        # which reads the block from the w_scale shape; the 1x32 one takes shuffled scales.
+        op = (
+            gemm_a8w8_blockscale_bpreshuffle
+            if self._mxscale_table
+            else gemm_a8w8_mxfp8_bpreshuffle
+        )
 
         results = []
         for i in range(len(self.untunedf)):
@@ -331,7 +357,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             try:
                 d = generate_data(M, N, K, 0, block)
                 out, us = run_perftest(
-                    gemm_a8w8_mxfp8_bpreshuffle,
+                    op,
                     d["x"],
                     d["weight_shuffle"],
                     d["x_scale"],
