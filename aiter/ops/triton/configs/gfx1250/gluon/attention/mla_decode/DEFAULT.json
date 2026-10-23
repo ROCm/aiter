@@ -1,0 +1,55 @@
+{
+  "triton_mla_decode_fwd_reduce_kernel": {
+    "waves_per_eu": 0
+  },
+  "pipelined_unshuffled": {
+    "fp8_fp8": {
+      "H_LEQ_32": {},
+      "H_LEQ_64.B_LEQ_14": {},
+      "H_LEQ_64.B_LEQ_15.KV_LEQ_131072": {},
+      "H_LEQ_64.B_LEQ_15.KV_LEQ_262144": {
+        "BLOCK_M": 64,
+        "num_warps": 4,
+        "NUM_SEGMENTS_PER_SEQ": 32,
+        "num_stages": 3,
+        "TDM_PARTIAL_STORE": 1,
+        "Q_FROM_LDS": 1,
+        "waves_per_eu": 2
+      },
+      "H_LEQ_64.B_LEQ_18": {},
+      "H_LEQ_64.B_LEQ_19.KV_LEQ_32768": {},
+      "H_LEQ_64.B_LEQ_19.KV_LEQ_131072": {
+        "BLOCK_M": 64,
+        "num_warps": 4,
+        "NUM_SEGMENTS_PER_SEQ": 8,
+        "num_stages": 3,
+        "TDM_PARTIAL_STORE": 1,
+        "Q_FROM_LDS": 1,
+        "waves_per_eu": 2
+      },
+      "H_LEQ_64.B_LEQ_31": {},
+      "H_LEQ_64.B_LEQ_32.KV_LEQ_16384": {},
+      "H_LEQ_64.B_LEQ_32.KV_LEQ_131072": {
+        "BLOCK_M": 64,
+        "num_warps": 4,
+        "NUM_SEGMENTS_PER_SEQ": 8,
+        "num_stages": 3,
+        "TDM_PARTIAL_STORE": 1,
+        "Q_FROM_LDS": 1,
+        "waves_per_eu": 2
+      },
+      "H_LEQ_64.B_LEQ_127": {},
+      "H_LEQ_64.B_LEQ_128.KV_LEQ_16384": {},
+      "H_LEQ_64.B_LEQ_128.KV_LEQ_32768": {
+        "BLOCK_M": 64,
+        "num_warps": 4,
+        "NUM_SEGMENTS_PER_SEQ": 2,
+        "num_stages": 3,
+        "TDM_PARTIAL_STORE": 1,
+        "Q_FROM_LDS": 1,
+        "waves_per_eu": 2
+      },
+      "any": {}
+    }
+  }
+}

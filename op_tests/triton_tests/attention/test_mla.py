@@ -580,6 +580,104 @@ def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
         assert (storage[..., :offset].float() == 16).all()
 
 
+@torch.inference_mode()
+def test_mla_decode_fwd_unshuffled_pipeline_ring_wraparound(monkeypatch):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("unshuffled LDS pipeline requires gfx1250")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    kernel = mla_module.gluon_mla_decode_fwd_kernel
+    launches = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+                assert not kwargs["SHUFFLED_KV_CACHE"]
+                assert kwargs["num_stages"] == 3
+                assert kwargs["Q_FROM_LDS"]
+                assert kwargs["TDM_PARTIAL_STORE"]
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+    torch.manual_seed(0)
+    batch_size, num_query_heads, block_size, num_blocks = 32, 64, 64, 128
+    max_seqlen_kv = 16385
+    # This shape selects the shipped three-stage config. Mixed lengths cover
+    # short segment drains, ring reuse, and a partial final page in one launch.
+    lengths = [1, 65, 129, 257, 2049, max_seqlen_kv]
+    lengths.extend([65] * (batch_size - len(lengths)))
+    seq_lens_kv = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (batch_size, (max_seqlen_kv + block_size - 1) // block_size),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    # Logical pages may reuse physical pages; the oracle follows the same table.
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, 1, 576), dtype=torch.bfloat16, device="cuda"
+    ).to(e4m3_dtype)
+    query = torch.randn(
+        (batch_size, num_query_heads, 576), dtype=torch.bfloat16, device="cuda"
+    ).to(e4m3_dtype)
+    q_descale = torch.tensor([0.3], dtype=torch.float32, device="cuda")
+    kv_descale = torch.tensor([0.4], dtype=torch.float32, device="cuda")
+    output_scale = torch.tensor([0.7], dtype=torch.float32, device="cuda")
+    output = torch.empty(
+        (batch_size, num_query_heads, 512), dtype=torch.bfloat16, device="cuda"
+    )
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=max_seqlen_kv,
+        block_tables=block_tables,
+        softmax_scale=576**-0.5,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        causal=True,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        out_scale=output_scale,
+        shuffled_kv_cache=False,
+    )
+    assert len(launches) == 1
+    ref_output = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        512,
+        576**-0.5,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        out_scale=output_scale,
+        o_dtype=torch.float32,
+    )
+    assert torch.isfinite(output).all()
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.float(),
+            ref_output,
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=tol_err_ratio,
+            msg="mla_decode_fwd unshuffled pipeline output",
+        )
+        <= tol_err_ratio
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
