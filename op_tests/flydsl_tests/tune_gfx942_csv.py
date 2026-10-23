@@ -85,6 +85,7 @@ CSV_COLUMNS = [
     "M",
     "N",
     "K",
+    "out_dtype",
     "source",
     *CONFIG_COLUMNS,
     "status",
@@ -211,14 +212,28 @@ def append_row(path: Path, row: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
-def logged_screen_times(path: Path, m: int, n: int, k: int) -> dict[tuple, float]:
-    """Best logged screen time per config key of one shape."""
+def logged_screen_times(path: Path, shape_key: tuple) -> dict[tuple, float]:
+    """Best logged screen time per config key of one ``table_key``.
+
+    Rows logged without an out_dtype are never reused.
+    """
     times: dict[tuple, float] = {}
     if not path.exists():
         return times
+    _, _, m, n, k, _ = shape_key
     with path.open(newline="") as handle:
         for row in csv.DictReader(handle):
-            if (int(row["M"]), int(row["N"]), int(row["K"])) != (m, n, k):
+            if not row.get("out_dtype"):
+                continue
+            row_key = table_key(
+                row["gfx"],
+                row["cu_num"],
+                row["M"],
+                row["N"],
+                row["K"],
+                row["out_dtype"],
+            )
+            if row_key != shape_key:
                 continue
             key = config_key(m, n, k, parse_config_row(row))
             if row["status"] == "ok" and row["fly_us"]:
@@ -427,6 +442,7 @@ def log_measurement(
         "M": m,
         "N": n,
         "K": k,
+        "out_dtype": args.out_dtype,
         "source": source,
         **normalized_config(cfg),
         "status": status,
@@ -490,7 +506,7 @@ def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
         flush=True,
     )
 
-    logged = logged_screen_times(args.csv, m, n, k)
+    logged = logged_screen_times(args.csv, key)
     screened: dict[tuple, tuple[float, dict]] = {}
 
     def run(source, cfg):

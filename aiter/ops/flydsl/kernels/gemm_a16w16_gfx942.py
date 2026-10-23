@@ -26,6 +26,12 @@ cshuffle store.
 
 Configs come from the tuned table (``aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv``)
 and fall back to a cost-model search for shapes that are not in it.
+
+Entry points are ``gemm_a16w16`` and ``flydsl_hgemm``; the table is tuned by
+``op_tests/flydsl_tests/tune_gfx942_csv.py``. TunedGemm's FlyDSL catalog
+(``gemm_a16w16_policy``) and AOT compilation do not cover gfx942: their
+``flydsl_hgemm_*`` kernel names cannot encode the pipeline flags
+(``pingpong``, ``buffered_load``, ``direct_store``, ``split_k_reduce``).
 """
 
 import csv
@@ -33,6 +39,7 @@ import functools
 import inspect
 import itertools
 import os
+import types
 from dataclasses import dataclass
 from typing import Any
 
@@ -980,7 +987,6 @@ def _store_cshuffle(
                             )
 
 
-@flyc.kernel
 def gemm_a16w16_gfx942_kernel(
     out: fx.Tensor,
     a: fx.Tensor,
@@ -1440,6 +1446,21 @@ def gemm_a16w16_gfx942_kernel(
         )
 
 
+def named_gemm_a16w16_gfx942_kernel(name: str):
+    """``gemm_a16w16_gfx942_kernel`` as a ``flyc.kernel`` named ``name`` for
+    profilers. Each wraps a fresh copy of the function, since ``flyc.kernel``
+    rewrites the code of the function it decorates.
+
+    A plain function, not cached: FlyDSL's JIT cache key only follows plain
+    functions and rejects mutated globals. It runs once per compile.
+    """
+    body = gemm_a16w16_gfx942_kernel
+    fresh = types.FunctionType(
+        body.__code__, body.__globals__, body.__name__, body.__defaults__
+    )
+    return flyc.kernel(fresh, name=name)
+
+
 @flyc.jit
 def gemm_a16w16_gfx942(
     out: fx.Tensor,
@@ -1471,10 +1492,7 @@ def gemm_a16w16_gfx942(
     working_k = (working_k + split_alignment - 1) // split_alignment * split_alignment
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
-    gemm_a16w16_gfx942_kernel._func.__name__ = make_gemm_a16w16_gfx942_kernel_name(
-        param
-    )
-    gemm_a16w16_gfx942_kernel(
+    named_gemm_a16w16_gfx942_kernel(make_gemm_a16w16_gfx942_kernel_name(param))(
         out,
         a,
         b,
@@ -1526,20 +1544,22 @@ _SPLIT_K_WORKSPACE: dict = {}
 _RETIRED_SPLIT_K_WORKSPACES: list = []
 
 
-def get_split_k_workspace(device, numel: int) -> torch.Tensor:
+def get_split_k_workspace(stream, device, numel: int) -> torch.Tensor:
     """Grow-only fp32 scratch for split_k_reduce partial tiles (never needs zeroing).
 
-    Each growth at least doubles it, so the retired buffers together stay
-    smaller than the live one.
+    One per stream: launches on one stream run in order, launches on two
+    streams may overlap. Each growth at least doubles it, so the retired
+    buffers together stay smaller than the live one.
     """
-    key = torch.device(device)
+    device = torch.device(device)
+    key = (device, stream)
     ws = _SPLIT_K_WORKSPACE.get(key)
     if ws is None or ws.numel() < numel:
         if ws is not None:
             _RETIRED_SPLIT_K_WORKSPACES.append(ws)
             numel = max(numel, 2 * ws.numel())
-        with persistent_alloc(key):
-            ws = torch.empty((numel,), dtype=torch.float32, device=key)
+        with persistent_alloc(device):
+            ws = torch.empty((numel,), dtype=torch.float32, device=device)
         _SPLIT_K_WORKSPACE[key] = ws
     return ws
 
@@ -1951,7 +1971,7 @@ def gemm_a16w16(
             (n + param.block_n - 1) // param.block_n
         )
         workspace = get_split_k_workspace(
-            a.device, num_tiles * split_k * param.block_m * param.block_n
+            stream, a.device, num_tiles * split_k * param.block_m * param.block_n
         )
     else:
         workspace = signal

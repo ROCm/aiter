@@ -12,6 +12,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
+from flydsl.compiler.protocol import cache_signature
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
@@ -201,6 +202,7 @@ def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
 
 
 _compiled_cache_lock = Lock()
+_compiled_caches: dict[Any, dict[Any, Any]] = {}
 
 
 def run_cached(
@@ -211,8 +213,8 @@ def run_cached(
     dispatch_args: tuple[Any, ...],
 ) -> Any:
     """Cache a layout-dynamic FlyDSL dispatcher by constexpr param."""
-    cache_key = constexpr_param.__cache_signature__()
-    compiled_cache = getattr(jit_func, "_compiled_cache", None)
+    cache_key = cache_signature(constexpr_param)
+    compiled_cache = _compiled_caches.get(jit_func)
     if compiled_cache is not None:
         compiled = compiled_cache.get(cache_key)
         if compiled is not None:
@@ -221,11 +223,7 @@ def run_cached(
 
     dispatch_after_wait = False
     with _compiled_cache_lock:
-        compiled_cache = getattr(jit_func, "_compiled_cache", None)
-        if compiled_cache is None:
-            compiled_cache = {}
-            jit_func._compiled_cache = compiled_cache
-
+        compiled_cache = _compiled_caches.setdefault(jit_func, {})
         compiled = compiled_cache.get(cache_key)
         if compiled is None:
             compiled = compiler(jit_func, *compile_args)
