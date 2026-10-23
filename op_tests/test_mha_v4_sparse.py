@@ -1638,8 +1638,8 @@ _SOL_ATTN_RAW_RECIPES = [
 ]
 
 
-# gfx942 carries mode-2 rows for the two per-tensor recipes only; the MX ones skip themselves on
-# the per-recipe manifest check below. Everything else in this section reads its geometry from
+# gfx942 carries no mode-2 rows, so every recipe skips itself there on the per-recipe manifest
+# check below. Everything else in this section reads its geometry from
 # its recipe's own geometry, so it retiles from 256x128 to 256x64 without further arch branching.
 _MHA_V4_SOL_ATTN_ARCH = get_gfx() in ("gfx942", "gfx950")
 

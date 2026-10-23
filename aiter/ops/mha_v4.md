@@ -29,12 +29,12 @@ same V packing and scale modes, and every Sol-Attn row uses that packing too.
 | MXFP8 | FP8 | dense, sparse, Sol-Attn |
 | FP8 | FP8 | dense, sparse, Sol-Attn |
 | FP8 | MXFP6 | dense, sparse, Sol-Attn |
-| MXFP6 | FP8 | dense, sparse |
+| MXFP6 | FP8 | dense, sparse, Sol-Attn |
 | MXFP6 | MXFP6 | dense, sparse, Sol-Attn |
 | MXFP6 | MXFP4 | dense, sparse, Sol-Attn |
 | MXFP4 | MXFP4 | dense, sparse, Sol-Attn |
 
-GFX942 ships per-tensor FP8/FP8 and INT8/FP8 in all three modes.
+GFX942 ships per-tensor FP8/FP8 and INT8/FP8, dense and sparse. It has no Sol-Attn rows.
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
@@ -145,8 +145,7 @@ Raw callers pass an optional boolean `block_mask`:
 - geometry `block_tile`, defaulting to the recipe's own: on gfx950 256x64 for BF16 and BF16/FP8
   Q/K and 256x128 for the rest, on gfx942 256x64 throughout;
 - gfx950 also ships 64x64 sparse and Sol-Attn rows for FP8, INT8/FP8, BF16, BF16/FP8, MXFP8,
-  FP8/MXFP6, MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8. MXFP6/FP8's
-  Sol-Attn row is 64x64 only, so a Sol-Attn launch of it must pass `block_tile=(64, 64)`.
+  FP8/MXFP6, MXFP6, MXFP6/MXFP4, MXFP4 (the MX V rows in FP6-P order) and MXFP6/FP8.
 
 The geometry is a property of the manifest row, so the rows no longer agree on one KV tile per
 arch. Ask `mha_v4_block_tile(mha_v4_operands(...), mode)` or `mha_v4_block_tiles(...)` with the
@@ -191,12 +190,13 @@ kernel, so pool at `mha_v4_block_tile()`'s answer.
 Pooled scales: a per-tensor or per-channel descale survives pooling over the sequence, so BF16,
 BF16/FP8, FP8, and INT8/FP8 leave `mean_k_scale` and `mean_v_scale` unset. An E8M0 1x32 operand
 pools in dequantized space and is requantized, so its pooled scale must be passed: an MX Q/K
-recipe (including MXFP8) passes `mean_k_scale`, and an MX V recipe passes `mean_v_scale`. The requirement is checked against the scale
-modes, because an unset slot means "read the source scale", not "error". MX operands are not
-element addressable, so name them in `k_packed_format` / `v_packed_format` and pass the
-pre-quantization tensors as `k_source` / `v_source`; FP6-P V rows take `mxfp4_fp6_p` or
-`mxfp6_fp6_p`. A pooled V keeps V's 128-token packing whatever the KV tile, so at 64x64 its scale
-image covers the pooled rows rounded up to 128.
+recipe (including MXFP8) passes `mean_k_scale`, and an MX V recipe passes `mean_v_scale`. The
+requirement is checked against the scale modes, because an unset slot means "read the source
+scale", not "error". MXFP6/FP8's V descale is per channel, so it passes `mean_k_scale` only. MX
+operands are not element addressable, so name them in `k_packed_format` / `v_packed_format` and
+pass the pre-quantization tensors as `k_source` / `v_source`; FP6-P V rows take `mxfp4_fp6_p` or
+`mxfp6_fp6_p`, and MXFP6/FP8's FP8 V needs neither. A pooled V keeps V's 128-token packing
+whatever the KV tile, so at 64x64 its scale image covers the pooled rows rounded up to 128.
 
 Rows declaring `sorted` launch over a work table ordered by `lut_count` (`sorted_dispatch`); the
 order changes only scheduling, and the output is bitwise identical either way. `kv_range_tokens`
