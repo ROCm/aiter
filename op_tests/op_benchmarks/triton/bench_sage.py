@@ -102,15 +102,6 @@ def _production_quantize_mxfp8(query, key, value, softmax_scale):
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 
-def _production_quantize_f4f4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale = quantize_mxfp4_k(key)
-    k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
-    v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
-
-
 def _production_quantize_mxfp6(
     query, key, value, softmax_scale, v_format=None, fp6_p=False
 ):
@@ -218,11 +209,6 @@ KERNEL_SPECS = {
         uses_hadamard=True,
     ),
     "mha4_mxfp4": _mha_v4_spec(
-        (0.5, 0.5, 0.5),
-        supports_block_sparse=True,
-        uses_hadamard=True,
-    ),
-    "mha4_f4f4": _mha_v4_spec(
         (0.5, 0.5, 0.5),
         supports_block_sparse=True,
         uses_hadamard=True,
@@ -1491,29 +1477,24 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel in ("mha4_mxfp4", "mha4_f4f4"):
+    if args.kernel == "mha4_mxfp4":
         block_r = args.block_r
         if block_r != 128:
             raise ValueError(f"{args.kernel} requires block_r=128, got {block_r}")
         if args.qsmooth:
             raise ValueError(f"{args.kernel} does not support --qsmooth")
 
-        is_f4f4 = args.kernel == "mha4_f4f4"
         v_format = AttentionFormat.MXFP4
         scale_modes = scale_modes_for_formats(
             AttentionFormat.MXFP4, AttentionFormat.MXFP4, v_format
         )
-        # Both all-MXFP4 kernels consume an FP6 P operand, so both need the FP6-P V order.
+        # The all-MXFP4 kernel consumes an FP6 P operand, so it needs the FP6-P V order.
         v_pack = AttentionPack.V_FOR_FP6_P
 
         def _quantize_mxfp4():
             quant_q, quant_k = q_bshd, k_bshd
             if not args.hadamard_rotate:
                 quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
-            if is_f4f4:
-                return _production_quantize_f4f4(
-                    quant_q, quant_k, v_bshd, softmax_scale
-                )
             return _production_quantize_mxfp4(quant_q, quant_k, v_bshd, softmax_scale)
 
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
