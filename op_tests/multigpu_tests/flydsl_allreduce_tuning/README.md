@@ -34,7 +34,7 @@ CSVs, so a run on an 8x MI355X box fits the `("gfx950", "xgmi", N)` rows. Overri
 ## Quick start
 
 ```bash
-cd op_tests/dump_data/tuning/flydsl_allreduce_tuning
+cd op_tests/multigpu_tests/flydsl_allreduce_tuning
 ./tune.sh setup            # once per host: flydsl pin, pyzmq, tabulate
 ./tune.sh --smoke all      # a few minutes of plumbing check: tiny sweep + fit, results are NOT meaningful
 ./tune.sh all              # the real thing: check, sweep, fit, fused-sweep, fused-fit
@@ -45,6 +45,20 @@ cd op_tests/dump_data/tuning/flydsl_allreduce_tuning
 
 `tune.sh --help` lists every command and option. Output goes to `out/<hostname>/` next to the
 script (git-ignored); change it with `--out DIR`.
+
+## Running under Slurm
+
+`slurm_tune.sbatch` runs `tune.sh` in the `rocm/pytorch` Docker image on one whole node (8 GPUs):
+it clones the branch on the host, installs the Python deps in the container, runs `--smoke all` as a
+gate, then `all`. Results go to `~/flydsl_tuning/job-<id>/out`; header of the script lists the knobs.
+
+```bash
+DRY_RUN=1 bash slurm_tune.sbatch    # no GPU needed: image, clone, deps, `tune.sh --dry-run all`
+sbatch slurm_tune.sbatch            # the real run; after a time-out: RUN_NAME=job-<id> sbatch ...
+```
+
+`tune.sh --dry-run <cmd>` is the same rehearsal without Docker: it does not require GPUs, lists every
+chunk with its bench command, checks the input files exist, and only loads the fit scripts.
 
 ## Prerequisites
 

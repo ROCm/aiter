@@ -42,11 +42,11 @@ from ``T`` (inclusive) the other, and a rung at ``T`` takes payloads from ``T``.
 
 Usage::
 
-    python3 op_tests/dump_data/tuning/flydsl_allreduce_tuning/fit_allreduce_policy.py \\
+    python3 op_tests/multigpu_tests/flydsl_allreduce_tuning/fit_allreduce_policy.py \\
         out/sweep/*tp*_a_*.csv --link pcie
 
     # what the tables cost against a per-shape oracle, in detail
-    python3 op_tests/dump_data/tuning/flydsl_allreduce_tuning/fit_allreduce_policy.py \\
+    python3 op_tests/multigpu_tests/flydsl_allreduce_tuning/fit_allreduce_policy.py \\
         out/sweep/*tp*_a_*.csv --link pcie --verbose
 
 Normally this is driven by ``tune.sh fit`` / ``tune.sh audit`` (see README.md).

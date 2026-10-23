@@ -34,6 +34,9 @@
 #                   to keep a ladder of its own (default 0.02)
 #   --smoke         plumbing check: 3 shapes, the `smoke` candidates, few samples
 #   --force         redo chunks whose CSV already exists (default: skip = resumable)
+#   --dry-run       GPU-free rehearsal: runs the checks (GPU count not required), lists every
+#                   chunk with its bench command and verifies its inputs exist, and only
+#                   loads (--help) the fit scripts. Benchmarks and fits never run.
 #   -h, --help      this text
 set -uo pipefail
 
@@ -44,7 +47,7 @@ QUICK="$REPO/op_tests/multigpu_tests/test_flydsl_quick_allreduce.py"
 CANDS="$HERE/candidates.csv"
 PY=${PYTHON:-python}
 
-OUT=""; TPS="8 4 2"; LINK="auto"; WIDTHS="3072 4096 7168 8192"; WIDTH_GAIN=0.02; SMOKE=0; FORCE=0
+OUT=""; TPS="8 4 2"; LINK="auto"; WIDTHS="3072 4096 7168 8192"; WIDTH_GAIN=0.02; SMOKE=0; FORCE=0; DRY=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --out) OUT=$2; shift 2 ;;
@@ -54,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --width-gain) WIDTH_GAIN=$2; shift 2 ;;
     --smoke) SMOKE=1; shift ;;
     --force) FORCE=1; shift ;;
+    --dry-run) DRY=1; shift ;;
     -h|--help) sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option $1 (see --help)" >&2; exit 2 ;;
     *) break ;;
@@ -62,7 +66,7 @@ done
 CMD=${1:-}; [[ $# -gt 0 ]] && shift
 [[ -z $CMD ]] && { echo "no command given (see --help)" >&2; exit 2; }
 
-[[ -z $OUT ]] && OUT="$HERE/out/$(hostname -s)$([[ $SMOKE == 1 ]] && echo -smoke)"
+[[ -z $OUT ]] && OUT="$HERE/out/$(hostname -s)$([[ $SMOKE == 1 ]] && echo -smoke)$([[ $DRY == 1 ]] && echo -dryrun)"
 mkdir -p "$OUT"
 
 # --- environment ---------------------------------------------------------------------
@@ -103,18 +107,24 @@ FAILED=()
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { echo "error: $*" >&2; exit 1; }
 
-ngpu() { $PY -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0; }
+ngpu_real() { $PY -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0; }
+# A dry run has no GPUs; it pretends the node is full so every chunk is enumerated.
+ngpu() { if [[ $DRY == 1 ]]; then echo 8; else ngpu_real; fi; }
 
 resolve_link() {
   if [[ $LINK == auto ]]; then
     LINK=$($PY -c "
 from aiter.ops.flydsl.allreduce_policy import detect_link
 print(detect_link())" 2>/dev/null | tail -1)
-    [[ $LINK == xgmi || $LINK == pcie ]] || die "could not detect fabric; pass --link pcie|xgmi"
+    if [[ $LINK != xgmi && $LINK != pcie ]]; then
+      [[ $DRY == 1 ]] || die "could not detect fabric; pass --link pcie|xgmi"
+      LINK=xgmi; log "dry-run: no KFD topology, assuming link=xgmi"
+    fi
   fi
 }
 
 write_provenance() {
+  [[ $DRY == 1 ]] && return 0
   {
     echo "date:   $(date -Is)"
     echo "host:   $(hostname)"
@@ -127,12 +137,42 @@ write_provenance() {
   } >> "$OUT/provenance.txt"
 }
 
+# Progress: a command calls `plan <n>` with its chunk count; every bench_chunk then logs
+# [done/total], elapsed time and an ETA (mean time of the chunks actually run x chunks left).
+CHUNK_TOTAL=0; CHUNK_DONE=0; CHUNK_RAN=0; CHUNK_SECS=0; PLAN_T0=$SECONDS
+
+plan() { CHUNK_TOTAL=$1; CHUNK_DONE=0; CHUNK_RAN=0; CHUNK_SECS=0; PLAN_T0=$SECONDS; log "plan: $1 chunk(s)"; }
+
+fmt_secs() { printf '%d:%02d:%02d' $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 60)); }
+
+progress() {
+  CHUNK_DONE=$((CHUNK_DONE + 1))
+  local msg="progress $CHUNK_DONE/$CHUNK_TOTAL ($((100 * CHUNK_DONE / CHUNK_TOTAL))%), elapsed $(fmt_secs $((SECONDS - PLAN_T0)))"
+  if [[ $CHUNK_RAN -gt 0 && $CHUNK_DONE -lt $CHUNK_TOTAL ]]; then
+    msg+=", ETA ~$(fmt_secs $((CHUNK_SECS / CHUNK_RAN * (CHUNK_TOTAL - CHUNK_DONE))))"
+  fi
+  log "$msg"
+}
+
+# count_tps: how many of $TPS fit the visible GPUs (silent tp_ok).
+count_tps() { local n=0 tp; for tp in $TPS; do [[ $tp -le $NGPU ]] && n=$((n + 1)); done; echo $n; }
+
 # bench_chunk <tag> <outdir> <test script> <bench args...>: one resumable bench run.
 bench_chunk() {
-  local tag=$1 dir=$2 script=$3; shift 3
-  mkdir -p "$dir"
-  if [[ $FORCE == 0 && -s $dir/$tag.csv ]]; then log "skip $tag (done)"; return 0; fi
+  local tag=$1 dir=$2 script=$3 prev=""; shift 3
+  [[ $DRY == 1 ]] || mkdir -p "$dir"
+  if [[ $DRY == 0 && $FORCE == 0 && -s $dir/$tag.csv ]]; then log "skip $tag (done)"; progress; return 0; fi
+  if [[ $DRY == 1 ]]; then
+    local a
+    for a in "$@"; do
+      if [[ $prev == --shape-csv && ! -s $a ]]; then log "FAIL $tag: missing shape file $a"; FAILED+=("$tag"); fi
+      prev=$a
+    done
+    log "dry  $tag: $(basename "$script") --scenario bench $* --reps $REPS --rounds $ROUNDS"
+    progress; return 0
+  fi
   log "run  $tag"
+  local t0=$SECONDS
   if $PY "$script" --scenario bench "$@" --reps $REPS --rounds $ROUNDS \
        --report "$dir/$tag.md" --csv "$dir/$tag.csv" >"$dir/$tag.log" 2>&1 && [[ -s $dir/$tag.csv ]]; then
     log "done $tag"
@@ -140,6 +180,7 @@ bench_chunk() {
     rm -f "$dir/$tag.csv"
     log "FAIL $tag (see $dir/$tag.log)"; FAILED+=("$tag")
   fi
+  CHUNK_RAN=$((CHUNK_RAN + 1)); CHUNK_SECS=$((CHUNK_SECS + SECONDS - t0)); progress
 }
 
 tp_ok() { [[ $1 -le $NGPU ]] || { log "skip tp$1: only $NGPU GPU(s) visible"; return 1; }; }
@@ -153,6 +194,7 @@ finish() {
 # plain_chunks <outdir> <prefix> <candidate set>: both tests over every shape set.
 plain_chunks() {
   local dir=$1 prefix=$2 set=$3 tp shape
+  plan $(($(count_tps) * 3 * 2))
   for tp in $TPS; do tp_ok "$tp" || continue
     for shape in a_small a_large b_ksens; do
       bench_chunk "${prefix}oneshot_tp${tp}_${shape}" "$dir" "$ONESHOT" --tp "$tp" \
@@ -172,7 +214,9 @@ cmd_setup() {
 
 cmd_check() {
   local ok=1
-  NGPU=$(ngpu); log "GPUs visible: $NGPU"; [[ $NGPU -ge 2 ]] || { log "need >= 2 GPUs"; ok=0; }
+  NGPU=$(ngpu); log "GPUs visible: $(ngpu_real)"
+  if [[ $DRY == 1 ]]; then log "dry-run: GPU count not required"
+  else [[ $NGPU -ge 2 ]] || { log "need >= 2 GPUs"; ok=0; }; fi
   for mod in torch pandas tabulate zmq flydsl; do
     if $PY -c "import $mod" 2>/dev/null; then log "ok   import $mod"; else log "MISS import $mod  (run: tune.sh setup)"; ok=0; fi
   done
@@ -204,7 +248,18 @@ cmd_sweep() {
 
 fit_py() { $PY "$HERE/fit_allreduce_policy.py" "$@"; }
 
+# dry_fit_scripts: a dry run has no sweep data, so only prove the fit scripts import.
+dry_fit_scripts() {
+  local f
+  for f in "$@"; do
+    if $PY "$HERE/$f" --help >/dev/null 2>"$OUT/check_fit.err"; then log "ok   $f loads"; else
+      log "FAIL $f: $(tail -1 "$OUT/check_fit.err")"; FAILED+=("$f"); fi
+  done
+  finish
+}
+
 cmd_fit() {
+  if [[ $DRY == 1 ]]; then dry_fit_scripts fit_allreduce_policy.py; return; fi
   resolve_link; mkdir -p "$OUT/fit"
   local fit_in=() hold=()
   while IFS= read -r f; do fit_in+=("$f"); done < <(ls "$OUT"/sweep/*_tp*_a_*.csv 2>/dev/null)
@@ -220,6 +275,7 @@ cmd_fit() {
 }
 
 cmd_test() {
+  [[ $DRY == 1 ]] && { log "dry-run: skipping the unit tests"; return 0; }
   (cd "$REPO" && $PY -m pytest -q op_tests/flydsl_tests/test_flydsl_allreduce_policy.py)
 }
 
@@ -231,6 +287,7 @@ cmd_validate() {
 }
 
 cmd_audit() {
+  if [[ $DRY == 1 ]]; then dry_fit_scripts fit_allreduce_policy.py; return; fi
   resolve_link; mkdir -p "$OUT/audit"; local rc=0 acc f=()
   while IFS= read -r x; do f+=("$x"); done < <(ls "$OUT"/validate/val_*_tp*.csv 2>/dev/null)
   [[ ${#f[@]} -gt 0 ]] || die "no validation CSVs (run: tune.sh validate)"
@@ -245,6 +302,7 @@ cmd_audit() {
 cmd_report() {
   NGPU=$(ngpu); resolve_link; write_provenance
   local tp op
+  plan $(($(count_tps) * 2 * 2))
   for tp in $TPS; do tp_ok "$tp" || continue
     for op in ar ar_rmsnorm; do
       bench_chunk "report_oneshot_tp${tp}_${op}" "$OUT/report" "$ONESHOT" --tp "$tp" --operation "$op"
@@ -259,6 +317,7 @@ cmd_fused_sweep() {
   NGPU=$(ngpu); resolve_link; write_provenance
   log "fused sweep: candidate sets $FUSED_SET (one-shot) and $FUSED_QR_SET (mesh/ring), tp=[$TPS] widths=[$WIDTHS]"
   local tp h
+  plan $(($(count_tps) * $(wc -w <<<"$WIDTHS") * 2))
   for tp in $TPS; do tp_ok "$tp" || continue
     for h in $WIDTHS; do
       # One chunk per test: each pinned row is an engine with its own inbox, so
@@ -277,6 +336,7 @@ cmd_fused_sweep() {
 }
 
 cmd_fused_fit() {
+  if [[ $DRY == 1 ]]; then dry_fit_scripts fused/analyze_fused.py fused/fit_fused.py; return; fi
   resolve_link; local d=$OUT/fused/sweep
   ls "$d"/tp*_w*.csv >/dev/null 2>&1 || die "no fused sweep CSVs under $d (run: tune.sh fused-sweep)"
   $PY "$HERE/fused/analyze_fused.py" "$d" --summary-csv "$OUT/fused/summary.csv" > "$OUT/fused/summary.txt" \
@@ -300,6 +360,7 @@ case $CMD in
   fused-sweep) cmd_fused_sweep ;;
   fused-fit) cmd_fused_fit ;;
   all) cmd_check && cmd_sweep && cmd_fit && cmd_fused_sweep && cmd_fused_fit
+       [[ $DRY == 1 ]] && { log "dry-run OK: nothing was benchmarked or fitted"; exit 0; }
        log "all fits done. Now paste the fitted values into allreduce_policy.py (README step 5), then: tune.sh validate && tune.sh audit" ;;
   *) die "unknown command '$CMD' (see --help)" ;;
 esac

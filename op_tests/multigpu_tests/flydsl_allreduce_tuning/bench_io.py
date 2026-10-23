@@ -25,7 +25,7 @@ import sys
 import pandas as pd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
+_REPO = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
 _MULTIGPU = os.path.join(_REPO, "op_tests", "multigpu_tests")
 if _MULTIGPU not in sys.path:
     sys.path.insert(0, _MULTIGPU)

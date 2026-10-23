@@ -11,9 +11,9 @@ The fused grids depend on which row geometries the kernels can build, so they
 are generated from the kernel modules rather than written by hand. Re-run this
 after a change to those geometries, and check the file in::
 
-    python3 op_tests/dump_data/tuning/flydsl_allreduce_tuning/gen_candidates.py
+    python3 op_tests/multigpu_tests/flydsl_allreduce_tuning/gen_candidates.py
     # or, in CI or tune.sh check: fail if the checked-in file is stale
-    python3 op_tests/dump_data/tuning/flydsl_allreduce_tuning/gen_candidates.py --check
+    python3 op_tests/multigpu_tests/flydsl_allreduce_tuning/gen_candidates.py --check
 
 Names are the column prefixes of the bench tables and the keys the fit scripts
 report, so they stay stable: ``fly_1stage_b<block>_a<atoms>_g<cap>``,
@@ -40,7 +40,7 @@ import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
