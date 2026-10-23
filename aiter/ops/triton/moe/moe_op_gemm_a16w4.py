@@ -310,18 +310,25 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
     group_m = 4
     num_xcds = 8
     xcd_swizzle = num_xcds
-    w_cache_modifier = ".cg" if block_m <= 32 else None
+    # Launch-config sweep on MI300X (2026-10-22, DeepSeek-V4.1-Flash TP8 decode shapes, microbench vs exact
+    # oracle): the .cg (streaming) cache modifier on the weight loads costs 1.23x on the 3-tile down-proj
+    # (K=384, BLOCK_K=128) and is neutral elsewhere -> default loads for every block_m; the gate-up
+    # projection (K=5120, 20+ tiles) runs 1.32-1.44x faster with BLOCK_K=512 x 8 warps than with
+    # BLOCK_K=256 x 4 warps at block_m <= 32 (same 16 dwords per lane, half the iterations, 70 VGPRs).
+    w_cache_modifier = None
     num_stages = 1
     split_k = 1
 
     # the kernel needs K % BLOCK_K == 0 (no K tail); K is always a multiple of 128 here (checked by
     # the caller), but TP-sharded intermediate sizes padded to 128 (e.g. 384, 640) are not multiples of 256
     block_k_decode = 256 if k % 256 == 0 else 128
+    # long-K projections (gate-up: K = hidden size) at decode block sizes: wider K tile, 8 warps
+    gateup_decode = k % 512 == 0 and k >= 2048
 
     if block_m == 16:
         block_n = 128
-        block_k = block_k_decode
-        num_warps = 4
+        block_k = 512 if gateup_decode else block_k_decode
+        num_warps = 8 if gateup_decode else 4
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
         grid = grid_m * grid_n * split_k
@@ -332,8 +339,8 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
             grid = grid_m * grid_n * split_k
     elif block_m == 32:
         block_n = 128
-        block_k = block_k_decode
-        num_warps = 4
+        block_k = 512 if gateup_decode else block_k_decode
+        num_warps = 8 if gateup_decode else 4
     elif block_m == 64:
         block_n = 128
         block_k = 128
