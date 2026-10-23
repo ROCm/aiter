@@ -615,28 +615,11 @@ _FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
     "AITER_DISABLE_FLYDSL_TOPK_PREFILL", "0"
 ) in ("1", "true", "True", "yes", "YES")
 
-# Per architecture, the stride0 at which `sampled` overtakes the FlyDSL one-block
-# prefill path, which is what top_k_per_row_prefill reaches below it. Measured on
-# gfx950 per shape, k=2048, fp32, both ops under one @perftest on the same data
-# (flydsl_us / sampled_us, above 1.00 meaning `sampled` is faster):
-#
-#     M \ N     49152   65536  131072  262144
-#     1          0.92    1.06    1.68    2.71
-#     8          0.78    0.90    1.38    2.15
-#     64         0.72    0.83    1.17    1.57
-#     256        0.67    0.79    0.99    1.14
-#     512        0.72    0.77    1.08    1.27
-#     1024       0.89    0.96    1.07    1.30
-#     2048       0.85    0.89    1.02    1.37
-#     4096       0.83    0.92    1.04    1.32
-#
-# The crossover is a clean function of stride0 and not of the row count. M=256
-# at 131072 is 0.99, a wash, and is left on the simple rule rather than carved
-# out. An architecture without an entry never routes here, so a new target needs
-# its own measurement before it gets one. The floor was measured at k=2048
-# against FlyDSL; a shape FlyDSL declines, or any shape under
-# AITER_DISABLE_FLYDSL_TOPK_PREFILL=1, falls to mb/ob instead, against which it
-# has not been re-measured.
+# The pitch from which `sampled` serves at all, per architecture: both
+# callers' width door. On gfx950 at k=2048 it overtook the FlyDSL one-block
+# prefill path from 131072 on full rows at every row count measured, 1..4096
+# (0.99x at 256 rows of 131072, a wash). An architecture without an entry never
+# routes here, so a new target needs its own measurement first.
 _SAMPLED_MIN_STRIDE0 = {"gfx950": 131072}
 
 
@@ -660,15 +643,31 @@ def _sampled_on_device(device: int) -> bool:
     return _sampled_min_width(device) is not None
 
 
-# Below this k the sampled threshold rests on a handful of sample hits, and
-# enough rows land under k that some fall back to the exact full-row select:
-# still correct, but a call with one such row ran up to 5.3x slower than the
-# path it replaced. Measured on gfx950, bs 1..2048, N 131072..524288,
-# torch.randn: no row fell back at k >= 96 and `sampled` was faster through
-# both top_k_per_row_prefill and topk_select on every shape; at k = 64 two
-# shapes were slower through topk_select, and at k <= 48 most had fallback
-# rows. topk_select applies the same floor.
-_SAMPLED_MIN_K = 96
+# The k `sampled` is routed at by either caller. Below 512 the kernels the
+# callers fall back to won where rows are short: one row ending in [k, 4k] of a
+# 196608 pitch ran 1.41x slower through top_k_per_row_prefill at k=128, and in
+# topk_select stream and small_k beat it through both doors on many rows, up to
+# 1.49x. Above 2048 a row whose sample undershoots k takes the exact full-row
+# select often enough to matter on uniform rows too: 2.11x those kernels at 64
+# rows of 1M (k=4096, 1 of 8 seeds) and 1.12x at 1024 rows of 131072 (k=3072).
+_SAMPLED_MIN_K = 512
+_SAMPLED_MAX_K = 2048
+
+# top_k_per_row_prefill's door, against the per-row kernels it otherwise runs.
+# This entry always takes row bounds and cannot tell how far rows reach, and
+# the time `sampled` takes follows the pitch, not where rows end. Through 64
+# rows it ran 0.24x-1.00x of those kernels whether rows reached the pitch or
+# ended far short of it (in [k, 4k], k=512..2048); past them rows ending that
+# short ran up to 2.5x slower at 96..128 rows and 3.5x from 256.
+_SAMPLED_PREFILL_MAX_ROWS = 64
+
+# topk_select's doors, against the backend its other rules pick there, for
+# uniform rows only: rows ending far short of a preallocated pitch ran up to
+# 5.3x slower than the kernels that follow the live length (rows ending in
+# [k, 4k], k=512..4096). The work door -- `rows * width` from 2**28, where the
+# crossover sat at 256..4096 rows -- from k=768.
+_SAMPLED_WORK_MIN_K = 768
+_SAMPLED_MIN_WORK = 1 << 28
 
 
 def _should_use_sampled_prefill(
@@ -682,23 +681,62 @@ def _should_use_sampled_prefill(
     would turn a working call into an error purely because `sampled` became
     available.
 
-    The width door and the k floor are topk_select's too (`_sampled_min_width`,
-    `_SAMPLED_MIN_K`); the rest of its rule is not. Past the door it gives
-    gfx950 k=2048 rows at 3000+ to plain's LDS-tail kernel, which serves no row
-    bounds, and this entry always passes them. Below it, it also opens `sampled`
-    on total work and at some gfx950 k=2048 shapes; those doors were measured
-    against topk_select's backends, not against the per-row kernels this entry
-    falls back to, so it does not take them.
+    topk_select's door (`_sampled_takes`) shares the width door and the k
+    range. Its other terms were measured against topk_select's backends, not
+    against the per-row kernels this entry falls back to, so it does not take
+    them.
     """
-    if stable or stride1 != 1 or k < _SAMPLED_MIN_K:
+    if stable or stride1 != 1 or not _SAMPLED_MIN_K <= k <= _SAMPLED_MAX_K:
         return False
     floor = _sampled_min_width(device)
     if floor is None or stride0 < floor:
+        return False
+    if numRows > _SAMPLED_PREFILL_MAX_ROWS:
         return False
     # Last: the environment lookup costs more than every test above together.
     if os.environ.get("AITER_DISABLE_TOPK_SAMPLED", "0") == "1":
         return False
     return _sampled_supports_cached(numRows, stride0, k, device)
+
+
+def _sampled_takes(
+    rows: int,
+    width: int,
+    k: int,
+    device: int | None = None,
+    stride0: int | None = None,
+) -> bool:
+    """Whether topk_select hands uniform rows to `sampled`.
+
+    Two doors: total work (`_SAMPLED_MIN_WORK`) and the width door
+    (`_sampled_min_width`), which reaches the wide few-row corner the product
+    cannot -- 128 rows of 1M is 2**27 -- where `sampled` wins by the most. No
+    row floor: the candidate window `topk_shape.hip.hpp` plans leaves headroom
+    (`CAP_SAFE_FILL`), so few rows do not overflow into the exact fallback.
+
+    Fitted on `torch.randn`. Top-k time depends on the value distribution as
+    well as the shape, so a tie-dense input can move the answer.
+
+    `stride0` is the row pitch `_dispatch` launches `sampled` at, so the
+    capability is asked at that pitch. The kernels bound each row by it, so rows
+    that overlap -- a pitch below the width, as a broadcast row's 0 is -- stay
+    out. gfx950 at k=2048 adds doors of its own in front of these
+    (`topk_select._sampled_gfx950_k2048_takes`).
+    """
+    if not _SAMPLED_MIN_K <= k <= _SAMPLED_MAX_K:
+        return False
+    pitch = width if stride0 is None else stride0
+    if pitch < width:
+        return False
+    if device is None:
+        device = torch.cuda.current_device()
+    min_width = _sampled_min_width(device)
+    if min_width is None:
+        return False
+    work_door = _SAMPLED_WORK_MIN_K <= k and rows * width >= _SAMPLED_MIN_WORK
+    if not (work_door or width >= min_width):
+        return False
+    return _sampled_supports_cached(rows, pitch, k, device)
 
 
 def top_k_per_row_prefill(

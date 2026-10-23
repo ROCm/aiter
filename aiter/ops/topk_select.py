@@ -64,6 +64,7 @@ from aiter.ops.topk import (
     _sampled_on_device,
     _sampled_run,
     _sampled_supports_cached,
+    _sampled_takes,
     top_k_per_row_prefill_sampled,
 )
 from aiter.ops.topk_plain import (
@@ -169,30 +170,6 @@ _STREAM_BLOCK_WIDTHS = (512, 1024)
 # middling width it wins outright -- ahead of small_k, hence tested first. It is
 # never the fastest below k=1024: of the 64 cells it wins, 29 are k=1024 and 35
 # are k=2048.
-# rows * width at which `sampled` becomes the fastest backend here. See
-# `_sampled_takes` for the measurement and for what it was measured on.
-_SAMPLED_MIN_WORK = 1 << 28
-# The k each door holds for here, against the backend the rules pick without
-# `sampled` (device time of replayed graphs, MI355X, randn; 1..8192 rows of
-# 16384..1M columns, full and ragged rows, two runs). At k=96..256 both doors
-# lost on many rows: up to 1.49x through the work door (8192x32768) and 1.24x
-# through the width door (1024 rows of 1M). At k=512 the work door lost on
-# ragged rows (1.12x at 8192x65536), and at k=4096 to decode's any-row band
-# (`_DECODE_ANY_ROWS_K`; 1.51x at 8192x32768). From 768 to 3072 neither door
-# lost a cell, and from 512 to 4096 the width door ran 0.30x-1.01x -- but for
-# ragged rows below 262144 columns only through 2048 rows: past them it lost at
-# k=512 and 4096 (up to 1.11x at 8192 rows of 131072, the same GPU interleaved)
-# while it ran 0.33x-0.86x from 768 to 3072. At k=6144 it lost to decode by up
-# to 3.36x (one ragged row of 512K).
-_SAMPLED_SELECT_K = (512, 4096)
-_SAMPLED_WORK_MIN_K = 768
-_SAMPLED_RAGGED_MAX_ROWS = 2048
-_SAMPLED_RAGGED_ANY_ROWS_WIDTH = 262144
-# The second door into `sampled` is on the width rather than on the product,
-# because the product cannot express the wide few-row corner at all: 128 rows of
-# N=1M is 2**27, under the work threshold above. It is top_k_per_row_prefill's,
-# `_sampled_min_width`; see `_sampled_takes` for what was measured. There is no
-# row floor; see `_sampled_takes`.
 _PLAIN_MANY_ROWS = 256
 _PLAIN_MANY_ROWS_BAND = (8192, 65536)
 _PLAIN_MIN_K = 1024
@@ -213,60 +190,27 @@ _PLAIN_K2048_SMALL_CU_MIN_ROWS = 128
 _PLAIN_K2048_SMALL_CU_MAX_WIDTH = 20000
 _PLAIN_K2048_REG_WINDOW_BANDS = ((4096, 4098), (8192, 8194))
 _PLAIN_K2048_REG_WINDOW_MAX_ROWS = 4096
-# On gfx950 the plain dispatch serves every k=2048 row length up to 80 * 1024
-# columns with a register or LDS-tail variant picked from continuous ranges,
-# so the bands above are gfx942's alone.  There plain beat the backend
-# otherwise in place at every measured off-grid cell (seed-0 randn, MI355X):
-# stream from 2053 to 8191 columns at every row count measured, 1..100000
-# (0.31x--0.94x; 4096 rows of 4096 columns 26.2 against 43.7us), decode
-# from 8195 to 81920 columns through 128 rows (0.38x--0.94x), and stream at
-# 129..255 rows from 8192 to 65536 columns (0.37x--0.85x) and at 129..4000
-# rows from 65537 to 131071 columns (0.42x--0.89x).  Past 80 * 1024 columns
-# plain falls back to its generic kernel and decode is faster again at 8..32
-# rows from 100000 columns, so the few-row band stops there, at the kernels'
-# own `any_rows_max` (`_plain_width`).  Rows the
-# stream small-reject path serves with its specialised branch -- one or two
-# rejected columns (`_SMALL_REJECT_UNMASKED_MAX`) -- stay with it:
-# 1.09x-1.60x faster than plain at 1..16384 rows, bar 6..8 rows at two
-# rejects (2-4% slower).  From three rejects on, its rejection mask and prefix
-# scan run slower than plain at every row count measured, 1..16384 (plain
-# 0.54x-0.94x of it at 2051..2056 columns), so plain keeps those rows; the
-# kernel's wider limits (`_stream_small_reject`) still serve `stream` itself.
+# gfx950's k=2048 plain band (`_plain_gfx950_k2048_takes`). There plain's
+# dispatch serves every row length up to 80 * 1024 columns with a register or
+# LDS-tail kernel, and on uniform rows it beat what the rules pick otherwise,
+# 0.31x-0.94x: stream from 2053 to 8191 columns at any row count, decode from
+# 8192 columns to the kernels' own `any_rows_max` through 128 rows, and stream
+# past 128 rows to 131071 columns. Rows of one or two rejects stay with
+# `stream_reject`'s unmasked branch (`_SMALL_REJECT_UNMASKED_MAX`), 1.09x-1.60x
+# faster; from three rejects plain beat that kernel.
 _PLAIN_K2048_NARROW_WIDTH = 8192
 _PLAIN_K2048_FEW_ROWS = 128
 _PLAIN_K2048_MAX_WIDTH = 131071
-# Below sampled's width door these kernels beat `sampled` on every measured
-# uniform cell its work door took -- 2049..131072 rows of 2100..131071 columns,
-# 0.41x--0.97x (seed-0 randn, MI355X); 4096 rows of 65536 columns ran 200
-# against 268us -- so for uniform rows that door yields to plain's band there.
-# Ragged rows run plain's ranged form, which has none of these kernels and
-# measured 0.96x--1.50x of `sampled` on those cells, so they keep the work door.
-# The exception is a row in plain's band that its own dispatch hands to its
-# multi-block kernel, 1.7x--2.8x slower than `sampled` through the few-row
-# band, so `sampled` takes those rows. Which rows those are is the launcher's
-# answer, asked by `_plain_multiblock`. On the 256-CU MI355X these were
-# measured on, without overrides, they are at most two ragged rows from 65536
-# columns: a uniform row its one-block kernels serve at any row count stays
-# one-block (`plain_should_use_mulblocks`), and there plain is the fastest
-# backend -- at one and two rows of 65536..65538 columns 10.7-11.2us against
-# 16.2-17.3us for `sampled` and 25.6-26.4us for the multi-block kernel.
-#
-# Past the few-row band plain declines and decode took those rows, which
-# `sampled` serves 1.47x--2.56x faster on every measured cell of 1..128 rows
-# and 81921..131071 columns, uniform and ragged, so it takes them as well. It
-# loses only where a row's sample undershoots k and that row takes the exact
-# fallback, 25-31us flat, up to 1.32x decode's time. That follows the values,
-# not the shape: 3 of 480 seeded runs over the band (30 cells x 16 seeds), all
-# seed 0 at 106496 columns, which the other 15 seeds ran in 15-18us.
-#
-# Just past sampled's width door, plain's LDS-tail kernel still serves uniform
-# rows on gfx950 (one row per CU or more), and from 3000 rows on it beat
-# `sampled` at every measured cell of 3000..32768 rows and 131072..131840
-# columns: 0.80x-0.968x across four processes (seed-0 randn, MI355X; 4096 rows
-# of 131072 columns 405 against 420us). The edges are where that stopped:
-# 2816 rows reached 0.998x at 131104 columns, 2048 rows 0.979x at 131072, and
-# 4096 rows 0.978x at 131999 and 0.983x at 132000 columns. The width bound is
-# the kernels' own, `lds_tail_max` (`_plain_width`).
+# How that band and `sampled` share the widths (`_sampled_gfx950_k2048_takes`,
+# `_plain_k2048_lds_tail_takes`). Below sampled's width door uniform rows stay
+# in plain's band, which beat the work door's `sampled` there (0.41x-0.97x);
+# rows plain's own dispatch hands to its multi-block kernel (`_plain_multiblock`)
+# and the few-row band's rows past `any_rows_max` go to `sampled`, which beat
+# that kernel by 1.7x-2.8x and decode by 1.47x-2.56x -- bar a row whose sample
+# undershoots k and takes the exact fallback, which follows the values rather
+# than the shape (up to 1.32x decode's time). Past the door, uniform rows from
+# 3000 rows go to plain's LDS tail up to its own `lds_tail_max`, 0.80x-0.97x of
+# `sampled`.
 _PLAIN_K2048_LDS_TAIL_MIN_ROWS = 3000
 # Ragged rows at k=2048 on gfx950, which plain's band above does not take (see
 # `_plain_takes`). Every backend measured over 1..4096 rows of 2100..131071
@@ -282,10 +226,10 @@ _PLAIN_K2048_LDS_TAIL_MIN_ROWS = 3000
 # (`_PLAIN_MANY_ROWS`): from 129 rows it ran 0.53x-0.98x of stream, and
 # `sampled` lost to it by up to 2.13x on short rows and 1.28x on full ones.
 # From 256 rows plain keeps them: decode ran up to 1.06x slower there, and
-# 1.59x at 288..320 rows, over 16385..20000 columns. From 65536 columns
-# `sampled` takes every row count, 0.53x-0.95x of decode or plain at 1..512.
+# 1.59x at 288..320 rows, over 16385..20000 columns. From 65536 columns the
+# general rules take them; `sampled` serves uniform rows only (`_sampled_takes`).
 _RAGGED_K2048_STREAM_MAX_WIDTH = 8191
-_RAGGED_K2048_SAMPLED_MIN_WIDTH = 65536
+_RAGGED_K2048_DECODE_MAX_WIDTH = 65535
 # Rows that select all of their columns go to `whole_row` (`_stream_specialised`).
 # With the values wanted, one launch writing both replaces a selection and a
 # gather: 0.47x-0.78x of the fastest backend at every measured row count from
@@ -813,92 +757,6 @@ def _plain_k2048_lds_tail_takes(
     )
 
 
-def _sampled_takes(
-    rows: int,
-    width: int,
-    k: int,
-    ragged: bool = False,
-    device: int | None = None,
-    stride0: int | None = None,
-) -> bool:
-    """Total work past which `sampled` measured fastest of every backend here.
-
-    The threshold is on `rows * width`, not on either alone, and it is sharp:
-    across M=256..4096 the crossover landed on exactly 2**28 elements every
-    time -- 256x1M, 512x512K, 1024x256K, 2048x128K, 4096x64K -- with `sampled`
-    fastest at and above it and another backend fastest below.
-
-    Routing only where `sampled` measured fastest of ALL backends is what makes
-    this safe to ship: a cell that changes hands was already going to be at
-    least as slow under the previous rule, so no cell can regress. That is the
-    A/B-against-the-rule-in-place test this file asks for, rather than the
-    per-cell oracle.
-
-    Below 2**28 it stays out even where it won. M=128 took N=65536 and N=131072
-    and then lost N=262144 through N=1048576, which no monotone rule in the work
-    size can express; leaving those two cells on the old rule costs a little and
-    keeps the threshold honest. The rule is inert for M <= 128 anyway: at
-    N=1M, M=128 reaches only 2**27.
-
-    **Fitted on `torch.randn` and nothing else.** Top-k time depends on the
-    value distribution as well as the shape, and every cell
-    behind this constant was measured on one distribution. A tie-dense input
-    moves the answer. Re-fit before trusting it on real data.
-
-    The work threshold is no longer the only door. It cannot reach the wide,
-    few-row corner at all -- 128 rows of N=1M is 2**27 -- and that corner is
-    where `sampled` now wins by the most: re-measured over 390 shapes it is the
-    fastest backend on every shape of N >= 131072 except one, by up to 2.96x
-    (m=128 n=1M, `decode` 387.5us against 131.1us). So a width door was added
-    beside the work door. Simulated over the measured table against the rule it
-    replaces: 8 more shapes on their fastest backend, 0.943x of the total time,
-    and no shape more than 2% slower.
-
-    No row floor, and that is load-bearing rather than an omission. The width
-    door first shipped with one at 64 rows, because below that `topk_shape.hip.hpp`
-    took its small-S rule and planned a candidate window that filled Phase C's
-    cap to 99% -- 1.2% of rows at N=524288 then overflowed into the exact
-    fallback at a flat ~350us each, which took m=32 n=524288 from 39us to 388us
-    on one row in 32. `CAP_SAFE_FILL` made the S-rule leave headroom instead
-    (measured after: 0 fallback rows in 384 there), so the floor came out and
-    72 more cells changed hands at a median 0.711x, none slower.
-
-    gfx950 at k=2048 asks `_sampled_gfx950_k2048_takes`, which adds that k's
-    doors in front of these.
-
-    `stride0` is the row pitch `_dispatch` launches `sampled` at, so the
-    capability is asked at that pitch. The kernels bound each row by it, so rows
-    that overlap -- a pitch below the width, as a broadcast row's 0 is -- stay
-    out.
-
-    Nothing outside `_SAMPLED_SELECT_K`, whatever the shape, and the work door
-    only from `_SAMPLED_WORK_MIN_K` to below `_DECODE_ANY_ROWS_K`: see their
-    definition.
-    """
-    if not _SAMPLED_SELECT_K[0] <= k <= _SAMPLED_SELECT_K[1]:
-        return False
-    pitch = width if stride0 is None else stride0
-    if pitch < width:
-        return False
-    if device is None:
-        device = torch.cuda.current_device()
-    min_width = _sampled_min_width(device)
-    if min_width is None:
-        return False
-    work_k = _SAMPLED_WORK_MIN_K <= k < _DECODE_ANY_ROWS_K
-    work_door = work_k and rows * width >= _SAMPLED_MIN_WORK
-    if not (work_door or width >= min_width):
-        return False
-    if (
-        ragged
-        and not work_k
-        and rows > _SAMPLED_RAGGED_MAX_ROWS
-        and width < _SAMPLED_RAGGED_ANY_ROWS_WIDTH
-    ):
-        return False
-    return _sampled_supports_cached(rows, pitch, k, device)
-
-
 def _stream_small_reject(rows: int, rejects: int) -> bool:
     """Whether stream serves a gfx950 k=2048 row as a reject-r problem."""
     return rejects > 0 and (
@@ -996,36 +854,32 @@ def _sampled_gfx950_k2048_takes(
     width: int,
     plain_band: bool,
     yield_to_plain: bool,
-    ragged: bool,
     device: int,
     stride0: int | None,
 ) -> bool:
-    """`_sampled_takes` with gfx950's k=2048 doors in front of it.
+    """`_sampled_takes` for gfx950's k=2048 uniform rows, with that k's doors in
+    front of it.
 
     Below sampled's width door plain's one-block kernels beat it on every cell
     the work door took (200 against 268us at 4096x64K), so there the work door
-    yields to plain's band (`plain_band`) when `yield_to_plain` -- uniform rows,
-    plain available. Two doors point the other way: rows in plain's band that
-    its own dispatch hands to its multi-block kernel (`_plain_multiblock`, asked
-    at the length plain launches with: `stride0` for ragged rows, the width for
-    uniform ones, whose launch is sized by it at any pitch), and the few-row
-    band's rows past its width, which decode served 1.47x-2.56x slower. See
+    yields to plain's band (`plain_band`) when `yield_to_plain` -- plain
+    available. Two doors point the other way: rows in plain's band that its own
+    dispatch hands to its multi-block kernel (`_plain_multiblock`, asked at the
+    width, which sizes the launch at any pitch), and the few-row band's rows
+    past its width, which decode served 1.47x-2.56x slower. See
     `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`.
     """
     pitch = width if stride0 is None else stride0
     if pitch < width:
         return False
     if width < _sampled_min_width(device):
-        plain_pitch = pitch if ragged else width
-        if (
-            plain_band and _plain_multiblock(rows, plain_pitch, 2048, ragged, device)
-        ) or (rows <= _PLAIN_K2048_FEW_ROWS and width > _plain_width("any_rows_max")):
+        if (plain_band and _plain_multiblock(rows, width, 2048, False, device)) or (
+            rows <= _PLAIN_K2048_FEW_ROWS and width > _plain_width("any_rows_max")
+        ):
             return _sampled_supports_cached(rows, pitch, 2048, device)
         if yield_to_plain and plain_band:
             return False
-    return _sampled_takes(
-        rows, width, 2048, ragged=ragged, device=device, stride0=stride0
-    )
+    return _sampled_takes(rows, width, 2048, device=device, stride0=stride0)
 
 
 def _route_gfx950_k2048(
@@ -1038,9 +892,8 @@ def _route_gfx950_k2048(
 ) -> str:
     """Every gfx950 k=2048 band, in the order they are tried, then the general
     tail. Uniform rows past sampled's width door at 3000+ rows go to plain's LDS
-    tail, ragged rows to `_ragged_k2048_backend`, and the rest to `sampled` or
-    plain where their k=2048 doors take them."""
-    pitch = width if stride0 is None else stride0
+    tail, ragged rows to `_ragged_k2048_backend`, and other uniform rows to
+    `sampled` or plain where their k=2048 doors take them."""
     if (
         not ragged
         and "sampled" in available
@@ -1048,22 +901,15 @@ def _route_gfx950_k2048(
         and _plain_k2048_lds_tail_takes(rows, width, 2048, device, stride0)
     ):
         return "plain"
-    if ragged:
-        want = _ragged_k2048_backend(rows, width)
-        if want in available and (
-            want != "sampled"
-            or (pitch >= width and _sampled_supports_cached(rows, pitch, 2048, device))
-        ):
-            return want
+    if ragged and _ragged_k2048_backend(rows, width) in available:
+        return _ragged_k2048_backend(rows, width)
     plain_band = _plain_gfx950_k2048_takes(rows, width, device, ragged, stride0)
-    if "sampled" in available and _sampled_gfx950_k2048_takes(
-        rows,
-        width,
-        plain_band,
-        "plain" in available and not ragged,
-        ragged,
-        device,
-        stride0,
+    if (
+        not ragged
+        and "sampled" in available
+        and _sampled_gfx950_k2048_takes(
+            rows, width, plain_band, "plain" in available, device, stride0
+        )
     ):
         return "sampled"
     if "plain" in available and plain_band:
@@ -1113,9 +959,9 @@ def _ragged_k2048_backend(rows: int, width: int) -> str | None:
     the general rules; see `_RAGGED_K2048_STREAM_MAX_WIDTH`."""
     if width <= _RAGGED_K2048_STREAM_MAX_WIDTH:
         return "stream"
-    if width < _RAGGED_K2048_SAMPLED_MIN_WIDTH:
-        return "decode" if rows < _PLAIN_MANY_ROWS else None
-    return "sampled"
+    if width <= _RAGGED_K2048_DECODE_MAX_WIDTH and rows < _PLAIN_MANY_ROWS:
+        return "decode"
+    return None
 
 
 def _decode_takes(rows: int, width: int, k: int) -> bool:
@@ -1139,9 +985,9 @@ def topk_select_backend(
 ) -> str:
     """Name the backend to use for this shape among those that can serve it.
 
-    `ragged` is whether the caller gave row ends. Ragged rows run plain's ranged
-    form, so `sampled`'s work door does not yield to plain's gfx950 k=2048 band
-    for them; see `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`.
+    `ragged` is whether the caller gave row ends. Ragged rows never go to
+    `sampled`, whose time follows the pitch rather than where rows end; see
+    `_sampled_takes`.
 
     `with_values` is whether the caller wants the values back, which `whole_row`
     writes in the same launch.
@@ -1182,6 +1028,10 @@ def topk_select_backend(
     `topk_backend_fit.py`, whenever `_dispatch` changes what it hands a backend;
     twice now that has moved a boundary the fit alone would have kept.
 
+    Every band here was timed with
+    `op_tests/op_benchmarks/hip/bench_topk_select_routing.py`, which also
+    compares two trees cell by cell; rerun it rather than nudging a number.
+
     The returned name is always one of `available`.
     """
     if not available:
@@ -1209,8 +1059,10 @@ def topk_select_backend(
             and _plain_gfx942_k2048_takes(rows, width, ragged, device)
         ):
             return "plain"
-    if "sampled" in available and _sampled_takes(
-        rows, width, k, ragged=ragged, device=device, stride0=stride0
+    if (
+        not ragged
+        and "sampled" in available
+        and _sampled_takes(rows, width, k, device=device, stride0=stride0)
     ):
         return "sampled"
     if "plain" in available and _plain_takes(rows, width, k, device, ragged, stride0):

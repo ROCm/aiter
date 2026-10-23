@@ -7,7 +7,12 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.topk import _SAMPLED_MIN_K, _SAMPLED_MIN_STRIDE0
+from aiter.ops.topk import (
+    _SAMPLED_MAX_K,
+    _SAMPLED_MIN_K,
+    _SAMPLED_MIN_STRIDE0,
+    _SAMPLED_PREFILL_MAX_ROWS,
+)
 
 
 def _random_logits(num_rows, width):
@@ -37,16 +42,16 @@ def test_prefill_sampled_dispatch_routing():
     below = floor // 2
     at_or_above = floor
 
-    def run_prefill(width, stable=False, k=top_k):
-        logits, row_starts, row_ends = _random_logits(num_rows, width)
-        indices = torch.empty((num_rows, k), dtype=torch.int32, device="cuda")
+    def run_prefill(width, stable=False, k=top_k, rows=num_rows):
+        logits, row_starts, row_ends = _random_logits(rows, width)
+        indices = torch.empty((rows, k), dtype=torch.int32, device="cuda")
         aiter.top_k_per_row_prefill(
             logits,
             row_starts,
             row_ends,
             indices,
             None,
-            num_rows,
+            rows,
             logits.stride(0),
             logits.stride(1),
             k=k,
@@ -80,11 +85,24 @@ def test_prefill_sampled_dispatch_routing():
         ), f"k={_SAMPLED_MIN_K - 1} is below the k floor and must not use `sampled`"
 
         sampled_fn.reset_mock()
+        run_prefill(at_or_above, k=2 * _SAMPLED_MAX_K)
+        assert (
+            not sampled_fn.called
+        ), f"k={2 * _SAMPLED_MAX_K} is past the k bound and must not use `sampled`"
+
+        many = _SAMPLED_PREFILL_MAX_ROWS + 1
+        sampled_fn.reset_mock()
+        run_prefill(at_or_above, rows=many)
+        assert not sampled_fn.called, f"{many} rows must not use `sampled`"
+
+        sampled_fn.reset_mock()
         with mock.patch.dict(os.environ, {"AITER_DISABLE_TOPK_SAMPLED": "1"}):
             run_prefill(at_or_above)
         assert not sampled_fn.called, "AITER_DISABLE_TOPK_SAMPLED must withdraw it"
 
-    print("[prefill_sampled_dispatch] PASS: routing by stride0 / stable / env")
+    print(
+        "[prefill_sampled_dispatch] PASS: routing by stride0 / rows / k / stable / env"
+    )
 
 
 if __name__ == "__main__":
