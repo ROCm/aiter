@@ -146,6 +146,14 @@ def _plant_nonfinite(x, G, pattern):
     m, n = x.shape
     sn = n // G
     spots = [(0, 0), (m // 3, sn // 2), (m - 1, sn - 1), (m // 2, min(1, sn - 1))]
+    if pattern == "snan":
+        # The group max comes before the sNaN: gfx9's v_max_f32 used to restart the
+        # amax at a bf16 sNaN and drop it.
+        snan = 0x7F81 if x.dtype == dtypes.bf16 else 0x7C01
+        for r, g in spots:
+            x[r, g * G + 1] = 100.0
+            x[r, g * G + 2 : g * G + 3].view(torch.int16).fill_(snan)
+        return
     values = {
         "nan": [float("nan")],
         "posinf": [float("inf")],
@@ -200,12 +208,22 @@ def _fp8_bytes(out):
     return b if _device_arch() == "gfx942" else b.masked_fill(b == 0x7F, 0xFF)
 
 
+def _fp4_bytes(out, x):
+    """fp4x2 output bytes with the nibbles of NaN inputs cleared: FP4 has no NaN, and
+    what a NaN converts to is up to the arch."""
+    b = out.view(torch.uint8).clone()
+    nan = torch.isnan(x).reshape(*b.shape, 2)
+    b[nan[..., 0]] &= 0xF0
+    b[nan[..., 1]] &= 0x0F
+    return b
+
+
 def test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided, pattern=None):
     """Byte-exact dynamic_per_group_scaled_quant, group 32, e8m0 scales.
 
     Shapes with M % 32 == 0 and (N/32) % 8 == 0 take the gfx1250 tile path
     (fp4 also needs at least one 32x8 scale tile per CU); the others stay on
-    the generic kernel. `pattern` plants NaN/Inf (fp8 only).
+    the generic kernel. `pattern` plants NaN/Inf (fp4: "snan" only).
     """
     G = 32
     fp4 = q_dtype == dtypes.fp4x2
@@ -231,7 +249,9 @@ def test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided, pattern=None)
     ref_out, ref_scale = _mx_reference(x, G, q_dtype)
     got = scale[_mx32_indices(m, scale_n)] if shuffle else scale.view(m, scale_n)
     scale_err = int((got != ref_scale).sum())
-    got_out = out.view(torch.uint8) if fp4 else _fp8_bytes(out)
+    if fp4:
+        ref_out = _fp4_bytes(ref_out, x)
+    got_out = _fp4_bytes(out, x) if fp4 else _fp8_bytes(out)
     out_err = int((got_out != ref_out).sum())
     assert (
         scale_err == 0 and out_err == 0
@@ -450,9 +470,7 @@ def test_mx_quant_moe_sort_threshold(m, n, h_dtype, q_dtype, pattern=None):
     G, topk, block_m = 32, 8, 32
     fp4 = q_dtype == dtypes.fp4x2
     x = torch.randn((m, n), dtype=h_dtype)
-    if pattern == "snan":
-        x.view(torch.int16)[m - 1, 5] = 0x7F81 if h_dtype == dtypes.bf16 else 0x7C01
-    elif pattern is not None:
+    if pattern is not None:
         _plant_nonfinite(x, G, pattern)
     rows_pad = (m + block_m - 1) // block_m * block_m
     sorted_ids = torch.full((rows_pad,), m, dtype=torch.int32)
@@ -464,7 +482,9 @@ def test_mx_quant_moe_sort_threshold(m, n, h_dtype, q_dtype, pattern=None):
 
     ref_out, ref_scale = _mx_reference(x, G, q_dtype)
     got_scale = scale.view(torch.uint8).flatten()[_mx32_indices(m, n // G)]
-    got_out = out.view(torch.uint8) if fp4 else _fp8_bytes(out)
+    if fp4:
+        ref_out = _fp4_bytes(ref_out, x)
+    got_out = _fp4_bytes(out, x) if fp4 else _fp8_bytes(out)
     scale_err = int((got_scale != ref_scale).sum())
     out_err = int((got_out != ref_out).sum())
     assert (
@@ -654,6 +674,15 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx942", "gfx950", "gfx12
         [None, "nan", "posinf", "neginf", "mixed", "snan"],
     ):
         test_mx_quant_moe_sort_threshold(m, 7168, h_dtype, dtypes.fp8, pattern)
-        if pattern is None and get_gfx() != "gfx942":
-            test_mx_quant_moe_sort_threshold(m, 7168, h_dtype, dtypes.fp4x2)
+        if pattern in (None, "snan") and get_gfx() != "gfx942":
+            test_mx_quant_moe_sort_threshold(m, 7168, h_dtype, dtypes.fp4x2, pattern)
+    if get_gfx() != "gfx942":
+        # A large value then an sNaN, on the generic kernel and the gfx1250 tile paths.
+        for (m, n), q_dtype, h_dtype, shuffle in itertools.product(
+            ((40, 320), (1024, 7168)),
+            [dtypes.fp4x2, dtypes.fp8],
+            [dtypes.bf16, dtypes.fp16],
+            [True, False],
+        ):
+            test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, False, "snan")
     aiter.logger.info("fp8_mx_nonfinite passed")
