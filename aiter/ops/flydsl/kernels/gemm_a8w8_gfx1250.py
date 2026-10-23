@@ -62,11 +62,17 @@ def launch_gemm_a8w8(
     batch: fx.Int32 = 1,
     a_preshuffle: Constexpr[bool] = False,
     a_scale_preshuffled: Constexpr[bool] = False,
+    b_scale_32x32: Constexpr[bool] = False,
+    bounded_k: Constexpr[bool] = False,
 ):
     mx32 = is_mxscale and block_size == 32
     mx128 = is_mxscale and block_size == 128
     if a_scale_preshuffled and not mx32:
         raise ValueError("a_scale_preshuffled is supported only for mxfp8_32")
+    if b_scale_32x32 and not mx32:
+        raise ValueError("b_scale_32x32 is supported only for mxfp8_32")
+    if bounded_k and split_k != 1:
+        raise ValueError("[FlyDSL gfx1250] bounded_k requires split_k=1")
     preload = preload_ks > 0
     # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128]
     A_PAIR = 2 if a_preshuffle else 1
@@ -141,7 +147,11 @@ def launch_gemm_a8w8(
         if mx32
         else ((tile_m, K_WS) if sa_m_major else (K_WS, tile_m))
     )
-    SB_SHAPE = (tile_n // 32, tile_k) if mx32 else (N_BLOCKS, K_WS)
+    SB_SHAPE = (
+        (tile_n // 32, tile_k // 32 if b_scale_32x32 else tile_k)
+        if mx32
+        else (N_BLOCKS, K_WS)
+    )
     STAGE_SA = ((SA_SHAPE[0] * SA_SHAPE[1] + 15) // 16) * 16
     STAGE_SB = ((SB_SHAPE[0] * SB_SHAPE[1] + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
@@ -182,6 +192,8 @@ def launch_gemm_a8w8(
         + (f"_pre{preload_ks}" if preload else "")
         + ("_apre" if a_preshuffle else "")
         + ("_aspre" if a_scale_preshuffled else "")
+        + ("_wb32x32" if b_scale_32x32 else "")
+        + ("_ktail" if bounded_k else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -198,7 +210,12 @@ def launch_gemm_a8w8(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
     ):
-        K_TILES = i32_k // (tile_k * split_k)
+        # bounded_k: the last K tile may be partial, its overhang zero-filled by TDM.
+        K_TILES = (
+            (i32_k + (tile_k * split_k - 1)) // (tile_k * split_k)
+            if const_expr(bounded_k)
+            else i32_k // (tile_k * split_k)
+        )
         k64 = fx.Int64(i32_k)
         lda64 = fx.Int64(i32_lda)
         ldc64 = fx.Int64(i32_ldc)
@@ -327,12 +344,15 @@ def launch_gemm_a8w8(
                     def sa_imm(kt):
                         return fx.Int64(kt) * (tile_k // 32)
 
-                sb_off0 = blk_n64 // 32 * k64
-                gSB = _gv(arg_scale_b, sb_off0, SB_SHAPE, (tile_k, 1))
-                atomSB = _tdm1(gSB, None, None, k64, b_mask)
+                # 1x32 (32x4-shuffled): K bytes per n32 row; 32x32: K/32.
+                sb_row = k64 // 32 if const_expr(b_scale_32x32) else k64
+                sb_tile = SB_SHAPE[1]
+                sb_off0 = blk_n64 // 32 * sb_row
+                gSB = _gv(arg_scale_b, sb_off0, SB_SHAPE, (sb_tile, 1))
+                atomSB = _tdm1(gSB, None, None, sb_row, b_mask)
 
                 def sb_imm(kt):
-                    return fx.Int64(kt) * tile_k
+                    return fx.Int64(kt) * sb_tile
 
             else:
                 sb_off0 = blk_n64 // 128 * (k64 // 128)
@@ -360,9 +380,19 @@ def launch_gemm_a8w8(
                 def sb_imm(kt):
                     return fx.Int64(kt) * K_WS
 
-        def _wcopy(w, atom, gt, lv, imm_offset):
+        def _wcopy(w, atom, gt, lv, imm_offset, **extents):
             if wave == w:
+                for dim, extent in extents.items():
+                    atom = fx.atom_set_value(atom, dim, extent)
                 fx.copy(atom, gt, lv, imm_offset=imm_offset)
+
+        def _k_clamp(kt, per_k=1, block=1, dim="extent_1"):
+            """bounded_k: clamp the dim along K to the K that remains from tile ``kt``."""
+            if const_expr(not bounded_k):
+                return {}
+            rem = i32_k - fx.Int32(kt) * tile_k
+            rem = (rem < tile_k).select(rem, fx.Int32(tile_k))
+            return {dim: rem * per_k // block if block > 1 else rem * per_k}
 
         def issue(s, kt):
             pa = _buf_ptr(s)
@@ -373,6 +403,7 @@ def launch_gemm_a8w8(
                 gA,
                 _lv(pa, (A_LDS_ROWS, A_TDM_ROW), (A_LDS_ROW, 1)),
                 ktg * A_TDM_ROW,
+                **_k_clamp(kt, per_k=A_PAIR),
             )
             _wcopy(
                 W_B,
@@ -384,14 +415,26 @@ def launch_gemm_a8w8(
                     (B_LDS_ROW, 1),
                 ),
                 ktg * (tile_k * 16),
+                **_k_clamp(kt, per_k=16),
             )
             if const_expr(is_mxscale and not preload):
+                if const_expr(mx32):
+                    sa_clamp = _k_clamp(kt, block=1 if a_scale_preshuffled else 32)
+                    sb_clamp = _k_clamp(kt, block=32 if b_scale_32x32 else 1)
+                else:
+                    sa_clamp = _k_clamp(
+                        kt,
+                        block=128,
+                        dim="extent_1" if const_expr(sa_m_major) else "extent_0",
+                    )
+                    sb_clamp = _k_clamp(kt, block=128)
                 _wcopy(
                     W_SA,
                     atomSA,
                     gSA,
                     _lv(fx.add_offset(pa, SA_OFF), SA_SHAPE, (SA_SHAPE[1], 1)),
                     sa_imm(ktg),
+                    **sa_clamp,
                 )
                 _wcopy(
                     W_SB,
@@ -399,6 +442,7 @@ def launch_gemm_a8w8(
                     gSB,
                     _lv(fx.add_offset(pa, SB_OFF), SB_SHAPE, (SB_SHAPE[1], 1)),
                     sb_imm(ktg),
+                    **sb_clamp,
                 )
 
         panel_ptr = fx.add_offset(base_ptr, PANEL_OFF) if const_expr(preload) else None
@@ -496,6 +540,11 @@ def launch_gemm_a8w8(
             return lds_load_b32(buf, SA_OFF + word * 4)[0]
 
         def load_sb(buf, sbuf, wn, ks):
+            if const_expr(b_scale_32x32):
+                # One dword (four K32 scales) per n32 row, the same for every lane:
+                # a 16-column fragment never straddles two n32 rows.
+                row = (wnb + wn * 16) // 32
+                return lds_load_b32(buf, SB_OFF + row * SB_SHAPE[1] + ks * 4)[0]
             if const_expr(mx32):
                 col = wnb + wn * 16 + lane16
                 word = (col // 32) * SC_WORDS + ks * 32 + (col % 32)
@@ -508,9 +557,8 @@ def launch_gemm_a8w8(
                 n_block = (
                     blk_n + wnb + wn * 16
                 ) // 128 - blk_n // 128  # needs tile's runtime base
-            byte = fx.Uint8(
-                fx.ptr_load(sbuf + (SB_LDS_OFF + n_block * SB_LDS_ROW + ks))
-            )
+            off = SB_LDS_OFF + n_block * SB_LDS_ROW + ks
+            byte = fx.Uint8(fx.ptr_load(sbuf + off))
             return _bcast_byte(byte)
 
         wmma_atom = None

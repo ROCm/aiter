@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import itertools
+import math
 from dataclasses import dataclass
 
 from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
@@ -15,6 +17,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as NAME_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+    _fused_splitk_ok,
     cluster_m_grid_ok,
     compute_kernel_k_pair,
 )
@@ -74,12 +77,14 @@ class WmmaKernelInstance:
     name_prefix: str = NAME_PREFIX
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
+    fused_splitk: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + ("_fsk" if self.fused_splitk else "")
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
         )
@@ -127,18 +132,36 @@ def _cluster_valid(cm: int, cn: int) -> bool:
     return cm >= 1 and cn >= 1 and cm * cn <= 16
 
 
-def _mxfp8_128_stage_scale_bytes(ki: WmmaKernelInstance) -> tuple[int, int]:
-    k_blocks = _ceil_div(ki.tile_k, _BLOCK_K)
-    a_scale_bytes = ki.tile_m * k_blocks * _SCALE_BYTES + _SCALE_GUARD_BYTES
-    n_blocks = _ceil_div(ki.tile_n, _BLOCK_N) + 1
-    b_scale_bytes = n_blocks * k_blocks * _SCALE_BYTES + _SCALE_GUARD_BYTES
+def _stage_scale_bytes(
+    ki: WmmaKernelInstance, scale_block: int, b_scale_32x32: bool
+) -> tuple[int, int]:
+    if scale_block == 128:
+        k_blocks = _ceil_div(ki.tile_k, _BLOCK_K)
+        a_scale_bytes = ki.tile_m * k_blocks * _SCALE_BYTES + _SCALE_GUARD_BYTES
+        n_blocks = _ceil_div(ki.tile_n, _BLOCK_N) + 1
+        b_scale_bytes = n_blocks * k_blocks * _SCALE_BYTES + _SCALE_GUARD_BYTES
+    elif scale_block == 32:
+        a_scale_bytes = ki.tile_m * _ceil_div(ki.tile_k, 32) + _SCALE_GUARD_BYTES
+        b_k_blocks = _ceil_div(ki.tile_k, 32)
+        b_n_blocks = _ceil_div(ki.tile_n, 32)
+        b_scale_bytes = (
+            b_n_blocks * (b_k_blocks if b_scale_32x32 else ki.tile_k)
+            + _SCALE_GUARD_BYTES
+        )
+    else:
+        raise ValueError(f"unsupported scale block: {scale_block}")
     return a_scale_bytes, b_scale_bytes
 
 
-def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
-    """Conservative LDS upper bound for mxfp8_128 FP8 WMMA candidates."""
+def kernel_instance_estimated_lds_bytes(
+    ki: WmmaKernelInstance,
+    *,
+    scale_block: int = 128,
+    b_scale_32x32: bool = False,
+) -> int:
+    """Conservative LDS upper bound for the selected scale layout and WMMA tile."""
 
-    a_scale_bytes, b_scale_bytes = _mxfp8_128_stage_scale_bytes(ki)
+    a_scale_bytes, b_scale_bytes = _stage_scale_bytes(ki, scale_block, b_scale_32x32)
 
     a_pair = 2 if ki.a_preshuffle else 1
     lds_a_data = (ki.tile_m // a_pair) * (a_pair * ki.tile_k + _LDS_PAD_A_BYTES)
@@ -204,8 +227,39 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
 kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
 
 
-def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
-    """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``."""
+def uses_cluster(ki: WmmaKernelInstance) -> bool:
+    """Whether the launch groups workgroups into a cluster: cm * cn, times the K splits
+    of a fused split-K, which live in the cluster too."""
+    k_splits = ki.split_k if ki.fused_splitk else 1
+    return ki.cluster_m * ki.cluster_n * k_splits > 1
+
+
+def kernel_fits_shape(
+    ki: WmmaKernelInstance,
+    M: int,
+    N: int,
+    K: int,
+    *,
+    scale_block: int = _BLOCK_K,
+    b_scale_32x32: bool = False,
+) -> bool:
+    """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``.
+
+    ``scale_block`` sets the required K-scale alignment. A partial final K tile
+    is supported for a single split; split-K chunks remain tile-aligned.
+    """
+
+    if b_scale_32x32 and scale_block != 32:
+        return False
+    if b_scale_32x32 and ki.tile_n % 32:
+        return False
+    k_align = scale_block
+
+    if ki.fused_splitk and not (
+        is_compute_kernel(ki)
+        and _fused_splitk_ok(ki.tile_m, ki.cluster_m, ki.cluster_n, ki.split_k, True)
+    ):
+        return False
 
     # Row pairs need both rows, so an odd M has no valid pairing.
     if ki.a_preshuffle and M % 2 != 0:
@@ -224,11 +278,12 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
             return False
         if profile not in _COMPUTE_PROFILES:
             return False
-        if (ki.cluster_m, ki.cluster_n) not in _COMPUTE_CLUSTERS:
+        if not _cluster_valid(ki.cluster_m, ki.cluster_n):
             return False
-        # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA they
-        # must not launch when M < tile_m (cluster barrier hang on decode M).
-        if M < ki.tile_m:
+        # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA a
+        # clustered one must not launch when M < tile_m (cluster barrier hang on
+        # decode M). A 1x1 launch has no cluster barrier.
+        if M < ki.tile_m and uses_cluster(ki):
             return False
         if N % (ki.tile_n * ki.cluster_n) != 0:
             return False
@@ -248,22 +303,31 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         k_pair = compute_kernel_k_pair(ki.num_buffers, ki.tile_n)
         return (
             k_per_split >= _COMPUTE_MIN_K_PER_SPLIT
-            and k_per_split % (ki.tile_k * k_pair) == 0
+            and K % k_align == 0
+            and (k_per_split % (ki.tile_k * k_pair) == 0 or ki.split_k == 1)
         )
 
     if ki.persistent_n_tiles > 1:
         return False
-    if N % _BLOCK_N != 0 or K % _BLOCK_K != 0:
+    n_align = 32 if b_scale_32x32 else _BLOCK_N
+    if N % n_align != 0 or K % k_align != 0:
         return False
     if not _tile_valid(ki.tile_m, ki.tile_n, ki.tile_k, ki.m_warp, ki.n_warp):
         return False
     if not _cluster_valid(ki.cluster_m, ki.cluster_n):
         return False
-    if kernel_instance_estimated_lds_bytes(ki) > LDS_BYTES:
+    if (
+        kernel_instance_estimated_lds_bytes(
+            ki, scale_block=scale_block, b_scale_32x32=b_scale_32x32
+        )
+        > LDS_BYTES
+    ):
         return False
-    if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
+    if N % ki.tile_n != 0:
         return False
-    if (K // ki.split_k) // ki.tile_k < ki.num_buffers:
+    if K % (ki.split_k * ki.tile_k) != 0 and ki.split_k != 1:
+        return False
+    if _ceil_div(K // ki.split_k, ki.tile_k) < ki.num_buffers:
         return False
     # M may be ragged; the kernel handles partial M tiles via OOB clamping,
     # so tile_m > M is legal (and needed for small-M decode shapes).
@@ -294,3 +358,103 @@ def compute_grid_ctas(ki: WmmaKernelInstance, M: int, N: int) -> int:
 def is_compute_kernel(kernel: WmmaKernelInstance) -> bool:
     """Return whether a tuning instance targets the compute-bound kernel."""
     return kernel.name_prefix == COMPUTE_NAME_PREFIX
+
+
+# Fallback ranking constants, fitted on the tuned gfx1250 rows (the picks land
+# within ~5% geomean of the tuned optimum).
+_MAC_PER_NS = 12600.0  # per-CU WMMA rate at 256x256, ~sqrt(area) for smaller tiles
+_BYTES_PER_NS = 85.0  # per-CTA global->LDS bandwidth
+_LOAD_LATENCY_NS = 900.0  # global->LDS round trip, shared by num_buffers - 1 stages
+_COMPUTE_TILE_NS = 1100.0  # compute-bound kernel's per-tile barrier / TDM setup
+
+
+def fallback_rank(ki: WmmaKernelInstance, M: int, N: int, K: int, cu_num: int) -> tuple:
+    """Sort key picking a kernel for an untuned shape (split_k == 1 candidates).
+
+    Cost = waves of CTAs x per-tile time, so small shapes fill the CUs first and
+    large ones take the biggest tile. A tile iteration is bound by the WMMA rate,
+    by global->LDS bytes (cluster multicast splits them) or, for the sync kernel,
+    by the load latency. Ties prefer the larger cluster, then more buffers for
+    the sync kernel and fewer for the compute-bound one.
+    """
+    tm, tn, tk = ki.tile_m, ki.tile_n, ki.tile_k
+    compute = is_compute_kernel(ki)
+    mac = tm * tn * tk / (_MAC_PER_NS * min(1.0, math.sqrt(tm * tn / 65536)))
+    mem = (tm / ki.cluster_n + tn / ki.cluster_m) * tk / _BYTES_PER_NS
+    latency = 0.0 if compute else _LOAD_LATENCY_NS / (ki.num_buffers - 1)
+    tile_ns = _ceil_div(K, tk) * max(mac, mem, latency)
+    if compute:
+        tile_ns += _COMPUTE_TILE_NS
+    waves = _ceil_div(compute_grid_ctas(ki, M, N), cu_num)
+    return (
+        waves * ki.persistent_n_tiles * tile_ns,
+        -ki.cluster_m * ki.cluster_n,
+        ki.num_buffers if compute else -ki.num_buffers,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The 32x32 weight-scale tuner's space
+# ---------------------------------------------------------------------------
+# kernels_list is shape-agnostic and is also what the batched GEMM enumerates, so
+# the wider space the 32x32 tuner searches is built per shape instead of growing it.
+_TUNE_TILE_M_OPTS = (16, 32, 64, 96, 128, 192, 256)
+_TUNE_TILE_N_MAX = 1024
+_TUNE_WARP_OPTS = ((1, 2), (2, 1), (1, 4), (2, 2), (4, 1))
+# Every cluster with cm, cn <= 4, 1x1 included. The runtime fits cluster_m to the M a
+# table row serves by stepping down to cm = 1, which is always a valid launch. A fused
+# split-K puts its sk splits into the cluster too: cm * cn * sk <= 16.
+_TUNE_COMPUTE_CLUSTERS = tuple((cm, cn) for cm in (1, 2, 4) for cn in (1, 2, 4))
+
+
+def _tuning_candidates(N: int):
+    """Unfiltered candidates for a weight with ``N`` rows: tile_n is every multiple
+    of 32 up to _TUNE_TILE_N_MAX that divides N, so a shape like N = 1152 gets
+    tile_n = 96 / 192 / 288 / 576 and N = 5120 gets 160 / 320 / 640."""
+    tile_ns = [tn for tn in range(32, min(N, _TUNE_TILE_N_MAX) + 1, 32) if N % tn == 0]
+    # The sync kernel has no fused epilogue: its split-K runs the reduce kernel.
+    for sk, tm, tn, tk, (mw, nw), nb in itertools.product(
+        _SPLIT_K,
+        _TUNE_TILE_M_OPTS,
+        tile_ns,
+        _TILE_K_OPTS,
+        _TUNE_WARP_OPTS,
+        _NUM_BUFFERS_OPTS,
+    ):
+        if _tile_valid(tm, tn, tk, mw, nw):
+            yield WmmaKernelInstance(tm, tn, tk, nb, sk, 1, 1, mw, nw)
+    # The compute kernel's split-K is always the fused one.
+    for sk, (tm, tn, tk, mw, nw, nb), (cm, cn) in itertools.product(
+        _SPLIT_K, _COMPUTE_PROFILES, _TUNE_COMPUTE_CLUSTERS
+    ):
+        for ps in (1, *_PERSISTENT_N_TILES) if sk == 1 else (1,):
+            yield WmmaKernelInstance(
+                tm,
+                tn,
+                tk,
+                nb,
+                sk,
+                cm,
+                cn,
+                mw,
+                nw,
+                name_prefix=COMPUTE_NAME_PREFIX,
+                persistent_n_tiles=ps,
+                fused_splitk=sk > 1,
+            )
+
+
+def tuning_kernels(
+    M: int, N: int, K: int, *, scale_block: int, b_scale_32x32: bool
+) -> list[WmmaKernelInstance]:
+    """Every kernel of the tuner's space that can run ``(M, N, K)``. A table row also
+    serves the M below its own (down to about half), and a clustered compute kernel
+    must not launch below its tile_m, so it needs M >= 2 * tile_m."""
+    return [
+        ki
+        for ki in _tuning_candidates(N)
+        if kernel_fits_shape(
+            ki, M, N, K, scale_block=scale_block, b_scale_32x32=b_scale_32x32
+        )
+        and not (uses_cluster(ki) and M < 2 * ki.tile_m)
+    ]

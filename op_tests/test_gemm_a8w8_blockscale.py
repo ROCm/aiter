@@ -25,12 +25,13 @@ from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
+SCALE_BLOCK_SHAPES = {"32x32": (32, 32), "128x128": block_shape}
 TEST_NUM_ITERS = 100
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    block_shape_n, block_shape_k = block_shape
+def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16, scale_shape=block_shape):
+    block_shape_n, block_shape_k = scale_shape
     m, k = x.shape
     n = weight.shape[0]
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -40,7 +41,7 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     if w_scale.dtype == dtypes.fp8_e8m0:
         w_scale = fp4_utils.e8m0_to_f32(w_scale)
     x = x.to(x_scale.dtype).view(
-        m, k // block_shape[1], block_shape[1]
+        m, k // block_shape_k, block_shape_k
     ) * x_scale.unsqueeze(-1)
     x = x.view(m, k)
 
@@ -110,9 +111,19 @@ def test_gemm(
     scale_init="auto",
     seed=0,
     apre=False,
+    w_scale_block="128x128",
 ):
     ret = {}
-    block_shape_n, block_shape_k = block_shape
+    if w_scale_block not in SCALE_BLOCK_SHAPES:
+        raise ValueError(f"unsupported w_scale_block {w_scale_block!r}")
+    scale_shape = SCALE_BLOCK_SHAPES[w_scale_block]
+    use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
+    if w_scale_block == "32x32" and not use_flydsl_fp8_scale:
+        raise ValueError("32x32 scales require --flydsl and --ck_preshuffle True")
+    if w_scale_block == "32x32" and apre:
+        raise ValueError("32x32 scales do not support the A-preshuffle candidate")
+
+    block_shape_n, block_shape_k = scale_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
@@ -140,7 +151,6 @@ def test_gemm(
         w_scale_raw = bench_init.fill_scale_e8m0(
             (scale_n, scale_k), scale_init, generator
         )
-    use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
     if use_flydsl_fp8_scale:
         x_scale = x_scale_raw.view(dtypes.fp8_e8m0)
         w_scale = w_scale_raw.view(dtypes.fp8_e8m0)
@@ -148,11 +158,13 @@ def test_gemm(
         x_scale = fp4_utils.e8m0_to_f32(x_scale_raw)
         w_scale = fp4_utils.e8m0_to_f32(w_scale_raw)
 
-    a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
+    a, _ = run_torch(x, weight, x_scale, w_scale, dtype, scale_shape)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
+    gemm_x_scale = (
+        x_scale if w_scale_block == "32x32" or not ck_preshuffle else x_scale_t
+    )
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
@@ -169,6 +181,7 @@ def test_gemm(
             catastrophic_check=True,
         )
     ret["gfx"] = get_gfx()
+    ret["w_scale_block"] = w_scale_block
     ret["ck us"] = avg_b
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
@@ -192,16 +205,18 @@ def test_gemm(
         ret["apre/ck"] = avg_e / avg_b
 
     if not use_flydsl_fp8_scale:
-        tag = "asm"
-        weight_asm = shuffle_weight(weight, layout=(16, 16))
-        c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
+        # The ASM blockscale implementation has no gfx1250 kernel.
+        if get_gfx() != "gfx1250":
+            tag = "asm"
+            weight_asm = shuffle_weight(weight, layout=(16, 16))
+            c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-        err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
-        ret[f"{tag} us"] = avg_c
-        ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-        ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-        ret[f"{tag} err"] = err_asm
-        ret["asm/ck"] = avg_c / avg_b
+            err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
+            ret[f"{tag} us"] = avg_c
+            ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+            ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+            ret[f"{tag} err"] = err_asm
+            ret["asm/ck"] = avg_c / avg_b
 
         # Triton path requires a preshuffled weight. When not preshuffled we simply omit
         # these columns; pd.DataFrame NaN-fills them for those rows in the summary.
@@ -407,6 +422,12 @@ parser.add_argument(
     help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
 )
 parser.add_argument(
+    "--w-scale-block",
+    choices=tuple(SCALE_BLOCK_SHAPES),
+    default=None,
+    help="weight scale block (default: CSV w_scale_block column, else 128x128)",
+)
+parser.add_argument(
     "--apre",
     type=dtypes.str2bool,
     nargs="*",
@@ -422,6 +443,7 @@ parser.add_argument(
     type=str,
     default=None,
     help="""CSV file containing M, N, K columns (one shape per row).
+    An optional w_scale_block column selects 32x32 or 128x128 per row.
     e.g.: --csv shapes.csv""",
 )
 parser.add_argument(
@@ -473,12 +495,47 @@ if args.csv is not None:
     if not os.path.exists(args.csv):
         raise FileNotFoundError(f"CSV file not found: {args.csv}")
     shapes_df = pd.read_csv(args.csv)
+    if "gfx" in shapes_df.columns:
+        current_gfx = get_gfx()
+        shapes_df = shapes_df[shapes_df["gfx"].astype(str).str.strip() == current_gfx]
+        if shapes_df.empty:
+            parser.error(f"No rows for {current_gfx} in {args.csv}")
     print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
+
+    def _scale_block_for_row(row):
+        value = row.get("w_scale_block")
+        if args.w_scale_block:
+            return args.w_scale_block
+        return (
+            str(value).strip() if pd.notna(value) and str(value).strip() else "128x128"
+        )
+
+    scale_blocks = [_scale_block_for_row(row) for _, row in shapes_df.iterrows()]
+else:
+    scale_blocks = [args.w_scale_block or "128x128"]
+
+for w_scale_block in set(scale_blocks):
+    if w_scale_block not in SCALE_BLOCK_SHAPES:
+        parser.error(
+            f"unsupported w_scale_block {w_scale_block!r}; choose from "
+            f"{', '.join(SCALE_BLOCK_SHAPES)}"
+        )
+    if w_scale_block == "32x32":
+        if not args.flydsl:
+            parser.error("32x32 scales require --flydsl")
+        if any(not preshuffle for preshuffle in l_preshuffle):
+            parser.error("32x32 scales require --ck_preshuffle True")
+        if any(l_apre):
+            parser.error("32x32 scales do not support --apre True")
+
+if args.csv is not None:
     for dtype in args.dtype:
         for preshuffle in l_preshuffle:
             for data_init, scale_init in init_pairs:
                 for apre in l_apre:
-                    for _, row in shapes_df.iterrows():
+                    for (_, row), w_scale_block in zip(
+                        shapes_df.iterrows(), scale_blocks
+                    ):
                         ret = test_gemm(
                             dtype,
                             int(row["M"]),
@@ -490,6 +547,7 @@ if args.csv is not None:
                             scale_init=scale_init,
                             seed=args.seed,
                             apre=apre,
+                            w_scale_block=w_scale_block,
                         )
                         df.append(ret)
 else:
@@ -510,6 +568,7 @@ else:
                                 scale_init=scale_init,
                                 seed=args.seed,
                                 apre=apre,
+                                w_scale_block=args.w_scale_block or "128x128",
                             )
                             df.append(ret)
 
