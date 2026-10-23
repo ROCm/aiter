@@ -269,6 +269,7 @@ def gemm_a16w16_(
                 SKIP_REDUCE=bool(skip_reduce),
                 NUM_SMS=NUM_WGS,
                 NUM_PID_N=num_pid_n,
+                NUM_XCDS=get_num_xcds(),
                 num_warps=num_warps,
                 num_stages=num_stages,
                 waves_per_eu=waves_per_eu,
@@ -347,6 +348,7 @@ def gemm_a16w16_(
             ADD_BIAS=(bias is not None),
             SKIP_REDUCE=False,
             NUM_WGS=NUM_WGS,
+            NUM_XCDS=get_num_xcds(),
             **config,
         )
 
