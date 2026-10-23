@@ -46,7 +46,6 @@ from .gemm_a16w16_gfx950 import (
     AsyncLoadTile,
     async_load_to_lds,
     get_split_k_buffers,
-    make_gemm_ab_lds_layouts,
     write_cshuffle_vec_to_global,
 )
 from .gemm_a16w16_gfx950_utils import (
@@ -344,10 +343,10 @@ def make_k_sliced_lds_layout(rows, block_k, k_waves):
     """Row-major ``(rows, block_k)`` LDS tile stored as ``k_waves`` K sub-tiles.
 
     Each ``(rows, block_k // k_waves)`` sub-tile is contiguous and carries the
-    swizzle of ``make_lds_layout`` (gemm_a16w16_gfx950_utils), so a K wave
-    addresses its slice through a base-pointer offset and a static layout. The
-    3-bit swizzle never touches the sub-tile index bits because every sub-tile
-    spans a multiple of 512 elements.
+    swizzle of ``make_lds_layout`` (gemm_a16w16_gfx950_utils); a K wave reads
+    its sub-tile by slicing the ``k_waves`` mode. The 3-bit swizzle never
+    touches the sub-tile index bits because every sub-tile spans a multiple of
+    512 elements. With ``k_waves=1`` this is ``make_lds_layout``.
     """
     block_k_w = block_k // k_waves
     assert (rows * block_k_w) % 512 == 0
@@ -1087,23 +1086,15 @@ def gemm_a16w16_gfx942_kernel(
     )
     s2r_copy_atom = ctx.uni_copy_atom
 
-    # *_lds_layout spans the whole (rows, block_k) tile and is used by the LDS
-    # writers; *_rd_layout is one K wave's (rows, block_k_w) slice.
-    if const_expr(k_waves > 1):
-        a_lds_layout = make_k_sliced_lds_layout(block_m, block_k, k_waves)
-        b_lds_layout = make_k_sliced_lds_layout(block_n, block_k, k_waves)
-        a_rd_layout, b_rd_layout = make_gemm_ab_lds_layouts(
-            block_m, block_n, block_k_w, False, True
-        )
-        a_rd_offset = k_wave_idx * (block_m * block_k_w)
-        b_rd_offset = k_wave_idx * (block_n * block_k_w)
-    else:
-        a_lds_layout, b_lds_layout = make_gemm_ab_lds_layouts(
-            block_m, block_n, block_k, False, True
-        )
-        a_rd_layout, b_rd_layout = a_lds_layout, b_lds_layout
-        a_rd_offset = 0
-        b_rd_offset = 0
+    # The LDS writers address the whole (rows, block_k) tile; each K wave reads
+    # its (rows, block_k_w) slice of the k_waves mode.
+    a_lds_layout = make_k_sliced_lds_layout(block_m, block_k, k_waves)
+    b_lds_layout = make_k_sliced_lds_layout(block_n, block_k, k_waves)
+    k_slice = k_wave_idx if const_expr(k_waves > 1) else 0
+
+    def k_wave_view(base, lds_layout):
+        return fx.make_view(base, lds_layout)[None, (None, k_slice)]
+
     c_lds_layout = fx.make_layout((block_m // c_chunks, block_n), (block_n, 1))
 
     thr_mma = tiled_mma.thr_slice(tid_mn)
@@ -1113,8 +1104,8 @@ def gemm_a16w16_gfx942_kernel(
     gC = fx.flat_divide(out_buf, (block_m, block_n))[None, None, bid_m, bid_n]
     sC_write = fx.make_view(smem_c, c_lds_layout)
 
-    sA0 = fx.make_view(smem_a, a_rd_layout)
-    sB0 = fx.make_view(smem_b, b_rd_layout)
+    sA0 = k_wave_view(smem_a, a_lds_layout)
+    sB0 = k_wave_view(smem_b, b_lds_layout)
     frag_A = thr_mma.make_fragment_A(sA0)
     frag_B = thr_mma.make_fragment_B(sB0)
     frag_C = thr_mma.make_fragment_C(gC)
@@ -1268,14 +1259,10 @@ def gemm_a16w16_gfx942_kernel(
         Only 128-bit K chunks ``[c_begin, c_end)`` are read.
         """
         thr_sA = thr_copy_A.partition_S(
-            fx.make_view(
-                smem_a + read_stage * block_m * block_k + a_rd_offset, a_rd_layout
-            )
+            k_wave_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
         )
         thr_sB = thr_copy_B.partition_S(
-            fx.make_view(
-                smem_b + read_stage * block_n * block_k + b_rd_offset, b_rd_layout
-            )
+            k_wave_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
         )
         for c in range_constexpr(c_begin, c_end):
             fx.copy(s2r_copy_atom, thr_sA[None, None, c], a_ret[None, None, c])
@@ -1295,10 +1282,10 @@ def gemm_a16w16_gfx942_kernel(
     def compute_stage(read_stage):
         """Compute one LDS stage, issuing chunk c+1's ds_read before chunk c's MFMAs."""
         thr_sA = thr_copy_A.partition_S(
-            fx.make_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
+            k_wave_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
         )
         thr_sB = thr_copy_B.partition_S(
-            fx.make_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
+            k_wave_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
         )
 
         def rd(c):
