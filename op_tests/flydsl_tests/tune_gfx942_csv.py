@@ -56,6 +56,7 @@ from typing import Any
 import torch
 
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (
+    CONFIG_DEFAULTS,
     GFX942_NUM_CUS,
     TUNED_BOOL_COLUMNS,
     TUNED_CONFIG_COLUMNS,
@@ -109,24 +110,6 @@ TABLE_COLUMNS = [
     "source",
     "timestamp",
 ]
-
-# Kernel defaults for columns a config leaves out.
-CONFIG_DEFAULTS = {
-    "block_m": 128,
-    "block_n": 128,
-    "block_k": 64,
-    "stages": 2,
-    "split_k": 1,
-    "m_waves": 2,
-    "n_waves": 2,
-    "k_waves": 1,
-    "group_m": 0,
-    "async_load_bytes": 4,
-    "buffered_load": False,
-    "direct_store": False,
-    "pingpong": False,
-    "split_k_reduce": False,
-}
 
 
 def normalized_config(config: dict[str, Any]) -> dict[str, Any]:

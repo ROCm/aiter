@@ -30,6 +30,7 @@ and fall back to a cost-model search for shapes that are not in it.
 
 import csv
 import functools
+import inspect
 import itertools
 import os
 from dataclasses import dataclass
@@ -315,6 +316,16 @@ def make_gemm_a16w16_gfx942_param(
         ldg_a_iters=ldg_a_iters,
         ldg_b_iters=ldg_b_iters,
     )
+
+
+# Config keys: the make_gemm_a16w16_gfx942_param arguments except the dtypes
+# (set by gemm_a16w16) and the MFMA shape (fixed on gfx942), with their
+# signature defaults. Unset keys of a config take these values.
+CONFIG_DEFAULTS = {
+    name: arg.default
+    for name, arg in inspect.signature(make_gemm_a16w16_gfx942_param).parameters.items()
+    if name not in ("in_dtype_id", "out_dtype_id", "mma_m", "mma_n", "mma_k")
+}
 
 
 def make_gemm_a16w16_gfx942_kernel_name(param: GemmA16W16Gfx942Param) -> str:
@@ -1541,11 +1552,12 @@ def model_cost_us(m: int, n: int, k: int, cfg: dict) -> float:
 
 def shape_error(m: int, n: int, k: int, cfg: dict) -> str | None:
     """Why ``cfg`` cannot run an (m, n, k) problem beyond the param checks, or None."""
-    block_k = cfg.get("block_k", 64)
-    split_k = cfg.get("split_k", 1)
+    cfg = {**CONFIG_DEFAULTS, **cfg}
+    block_k = cfg["block_k"]
+    split_k = cfg["split_k"]
     if k % block_k:
         return f"K={k} must be divisible by block_k={block_k} (K-tail unsupported)"
-    if cfg.get("direct_store", False) and n % cfg.get("block_n", 128):
+    if cfg["direct_store"] and n % cfg["block_n"]:
         return "direct_store requires N to be a block_n multiple"
     k_tiles = k // block_k
     last_split_tiles = k_tiles - (split_k - 1) * -(-k_tiles // split_k)
@@ -1555,20 +1567,20 @@ def shape_error(m: int, n: int, k: int, cfg: dict) -> str | None:
             f"(K={k}, block_k={block_k})"
         )
     if split_k > 1:
-        tiles = -(-m // cfg.get("block_m", 128)) * -(-n // cfg.get("block_n", 128))
+        tiles = -(-m // cfg["block_m"]) * -(-n // cfg["block_n"])
         if tiles > SPLIT_K_SEMAPHORE_MAX_LEN:
             return (
                 f"split-K needs {tiles} tile semaphores, "
                 f"more than {SPLIT_K_SEMAPHORE_MAX_LEN}"
             )
-    if cfg.get("pingpong", False):
+    if cfg["pingpong"]:
         if last_split_tiles < 2:
             return (
                 f"pingpong needs at least 2 K tiles per split "
                 f"(K={k}, split_k={split_k}, block_k={block_k})"
             )
-    elif not cfg.get("buffered_load", False):
-        stages = cfg.get("stages", 2)
+    elif not cfg["buffered_load"]:
+        stages = cfg["stages"]
         if last_split_tiles < stages - 1:
             return (
                 f"async stages={stages} needs at least {stages - 1} K tiles per "
@@ -1695,24 +1707,9 @@ _AUTO_ONLY_PIPELINE_KEYS = (
 )
 
 # Config columns of the tuned table (aiter/configs/flydsl_gemm_a16w16_gfx942_tuned.csv).
-TUNED_CONFIG_COLUMNS = (
-    "block_m",
-    "block_n",
-    "block_k",
-    "stages",
-    "split_k",
-    "m_waves",
-    "n_waves",
-    "k_waves",
-    "group_m",
-    "async_load_bytes",
-    "buffered_load",
-    "direct_store",
-    "pingpong",
-    "split_k_reduce",
-)
+TUNED_CONFIG_COLUMNS = tuple(CONFIG_DEFAULTS)
 TUNED_BOOL_COLUMNS = frozenset(
-    ("buffered_load", "direct_store", "pingpong", "split_k_reduce")
+    name for name, value in CONFIG_DEFAULTS.items() if isinstance(value, bool)
 )
 TUNED_KEY_COLUMNS = ("gfx", "cu_num", "M", "N", "K", "out_dtype")
 
@@ -1858,20 +1855,9 @@ def gemm_a16w16(
     out = out.view(-1, n)
     assert out.shape[0] == m
 
-    # Base defaults, overlaid by the shape's tuned-table row (else the
+    # Param defaults, overlaid by the shape's tuned-table row (else the
     # cost-model fallback), then by any caller overrides.
-    kwargs = {
-        "block_m": 128,
-        "block_n": 128,
-        "block_k": 64,
-        "stages": 2,
-        "split_k": 1,
-        "m_waves": 2,
-        "n_waves": 2,
-        "k_waves": 1,
-        "group_m": 0,
-        "async_load_bytes": 4,
-    }
+    kwargs = dict(CONFIG_DEFAULTS)
     auto = gfx942_default_config(m, n, k, out_dtype, a.device)
     user_kwargs = dict(user_kwargs or {})
     if _STRUCTURAL_KEYS & user_kwargs.keys():
@@ -1885,7 +1871,7 @@ def gemm_a16w16(
     split_k = kwargs["split_k"]
     if split_k == 1:
         kwargs["split_k_reduce"] = False
-    split_k_reduce = kwargs.get("split_k_reduce", False)
+    split_k_reduce = kwargs["split_k_reduce"]
 
     # gfx942/CDNA3 has no packed-bf16 buffer atomic add, so bf16-output atomic
     # split-K accumulates through an f32 scratch buffer and casts to bf16 at the
