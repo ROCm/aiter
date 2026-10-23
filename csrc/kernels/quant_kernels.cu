@@ -76,6 +76,19 @@ __device__ __forceinline__ float mxfp8_cap_scale(float scale)
     return fminf(scale, 0x1.0p127f);
 }
 
+// |f| as an MX amax operand, f widened from a DTYPE_I value. A bf16 sNaN widens to an fp32 sNaN,
+// and gfx9's v_max_f32 returns it quieted instead of the other operand, which restarts the amax;
+// quieted first, it is skipped.
+template <typename DTYPE_I>
+__device__ __forceinline__ float mx_amax_abs(float f)
+{
+#if !defined(__gfx1250__)
+    if constexpr(std::is_same_v<DTYPE_I, opus::bf16_t>)
+        f = __builtin_canonicalizef(f);
+#endif
+    return abs(f);
+}
+
 // emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
 // byte scale, fp8 / i8 output a continuous fp32 per-group scale.
 //
@@ -428,7 +441,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         else
         {
             for(size_t j = 0; j < thread_data_size; ++j)
-                absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
+                absMax = max(absMax, mx_amax_abs<DTYPE_I>(static_cast<float>(thread_data[j])));
         }
         absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 
@@ -1610,7 +1623,7 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
         vec_i thread_data  = data[s.value];
         float absMax       = aiter::kAmaxFloor;
         for(int j = 0; j < kElems; ++j)
-            absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
+            absMax = max(absMax, mx_amax_abs<DTYPE_I>(static_cast<float>(thread_data[j])));
         absMax = multithread_reduce(absMax, aiter::Max(), 2);
         const float row_scale = mxfp8_cap_scale(
             aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax));
@@ -2959,7 +2972,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
             for(int j = 0; j < vec_size_i; j++)
             {
                 vec_input_f[j] = static_cast<float>(vec_input[j]);
-                absMax         = max(absMax, abs(vec_input_f[j]));
+                absMax         = max(absMax, mx_amax_abs<DTYPE_I>(vec_input_f[j]));
             }
             absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 

@@ -644,10 +644,6 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx942", "gfx950", "gfx12
             [dtypes.bf16, dtypes.fp16],
             ["nan", "posinf", "neginf", "nan_inf", "all_nan", "snan"],
         ):
-            # gfx9's v_max_f32 returns a quieted sNaN operand, so a bf16 sNaN (fp16 is
-            # quieted by its convert) restarts the amax; main behaves the same way.
-            if pattern == "snan" and h_dtype == dtypes.bf16 and get_gfx() != "gfx1250":
-                continue
             test_mxfp8_nonfinite(gs, shuffle, h_dtype, pattern)
         for amax_bits in [0x7F60, 0x7F61, 0x7F69, 0x7F7F]:
             test_mxfp8_large_finite(gs, shuffle, amax_bits)
@@ -657,8 +653,6 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx942", "gfx950", "gfx12
         [dtypes.bf16, dtypes.fp16],
         [None, "nan", "posinf", "neginf", "mixed", "snan"],
     ):
-        if pattern == "snan" and h_dtype == dtypes.bf16 and get_gfx() != "gfx1250":
-            continue
         test_mx_quant_moe_sort_threshold(m, 7168, h_dtype, dtypes.fp8, pattern)
         if pattern is None and get_gfx() != "gfx942":
             test_mx_quant_moe_sort_threshold(m, 7168, h_dtype, dtypes.fp4x2)
