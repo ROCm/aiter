@@ -38,3 +38,17 @@ M,N,K,q_dtype_w
 1024,4096,1280,torch.float8_e4m3fnuz
 2048,4096,1280,torch.float8_e4m3fnuz
 4096,4096,1280,torch.float8_e4m3fnuz
+256,5120,1024,torch.float8_e4m3fnuz
+512,5120,1024,torch.float8_e4m3fnuz
+1024,5120,1024,torch.float8_e4m3fnuz
+2048,5120,1024,torch.float8_e4m3fnuz
+4096,5120,1024,torch.float8_e4m3fnuz
+8192,5120,1024,torch.float8_e4m3fnuz
+16384,5120,1024,torch.float8_e4m3fnuz
+256,576,5120,torch.float8_e4m3fnuz
+512,576,5120,torch.float8_e4m3fnuz
+1024,576,5120,torch.float8_e4m3fnuz
+2048,576,5120,torch.float8_e4m3fnuz
+4096,576,5120,torch.float8_e4m3fnuz
+8192,576,5120,torch.float8_e4m3fnuz
+16384,576,5120,torch.float8_e4m3fnuz
