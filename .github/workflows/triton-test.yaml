@@ -266,7 +266,8 @@ jobs:
         run: |
           set -ex
           echo "Setting up Aiter and Triton..."
-          docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
+          docker exec -w /workspace triton_test bash -c \
+            "apt-get update && apt-get install -y git && ./.github/scripts/build_aiter_triton.sh"
 
       - name: Triton Tests
         timeout-minutes: 60
@@ -422,7 +423,8 @@ jobs:
         run: |
           set -ex
           echo "Setting up Aiter and Triton..."
-          docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
+          docker exec -w /workspace triton_test bash -c \
+            "apt-get update && apt-get install -y git && ./.github/scripts/build_aiter_triton.sh"
 
       - name: Triton Tests
         run: |
