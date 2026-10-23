@@ -177,7 +177,7 @@ struct CodecQ4 : public CodecBase
         int* qs_ptr       = reinterpret_cast<int*>(atom_ptr + kRankTileScaleOffset) + (thread / 8);
 
         int32_t qw = __builtin_nontemporal_load(qw_ptr);
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         // One scale load per quantization group, broadcast within the wave32.
         int qs = 0;
         if(threadIdx.x == group_leader)

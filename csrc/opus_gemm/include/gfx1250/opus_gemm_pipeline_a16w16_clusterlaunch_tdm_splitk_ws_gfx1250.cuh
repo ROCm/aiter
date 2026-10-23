@@ -80,13 +80,13 @@ __host__ __device__ constexpr inline int opus_ctdmcl_max_i(int a, int b) {
 // geometry from.
 template <typename UserTraits>
 __global__ __launch_bounds__(128, 1)
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__)) || !defined(__HIP_DEVICE_COMPILE__)
 __cluster_dims__(opus::remove_cvref_t<UserTraits>::kClusterWgM,
                  opus::remove_cvref_t<UserTraits>::kClusterWgN, 1)
 #endif
 void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_kargs_gfx1250 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     using T = remove_cvref_t<UserTraits>;
     using DataA = typename T::DataA;
     using DataB = typename T::DataB;

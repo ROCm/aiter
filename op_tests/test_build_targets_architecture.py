@@ -20,6 +20,10 @@ from aiter.jit.utils.build_targets import (
 
 
 class TestBuildTargetArchitecture(unittest.TestCase):
+    def test_gfx1250_strict_offline_build_target(self):
+        with mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx1250-strict"}, clear=True):
+            self.assertEqual(get_build_targets_env(), [("gfx1250-strict", 256)])
+
     def test_rdna_offline_build_target_defaults(self):
         targets = {
             "gfx1100": 96,
@@ -68,6 +72,102 @@ class TestBuildTargetArchitecture(unittest.TestCase):
         self.assertEqual(torch_processor_count_to_cu("gfx942", 304), 304)
 
 
+class TestArchTablesStayInSync(unittest.TestCase):
+    """The arch tables in build_targets.py and core.py must not drift apart.
+
+    Adding a target means editing GFX_MAP, GFX_CU_NUM_MAP and core.py's
+    allowed_archs, and nothing ties the three together -- allowed_archs
+    carried a duplicate "gfx1250" entry before gfx1250-strict was added,
+    which is what that drift looks like.
+    """
+
+    def setUp(self):
+        from aiter.jit import core
+        from aiter.jit.utils import chip_info
+
+        self.core = core
+        self.chip_info = chip_info
+        self.addCleanup(chip_info.get_gfx_custom_op_core.cache_clear)
+
+    def _resolves_everywhere(self, gfx):
+        from aiter.jit.utils.build_targets import GFX_MAP
+
+        with mock.patch.dict(os.environ, {"GPU_ARCHS": gfx}, clear=True):
+            # core.py accepts it as a build target and passes it through
+            # unchanged, which is what reaches hipcc as --offload-arch.
+            self.assertEqual(self.core.validate_and_update_archs(), [gfx])
+            # and chip_info can map it back through GFX_MAP.
+            self.chip_info.get_gfx_custom_op_core.cache_clear()
+            self.assertEqual(GFX_MAP[self.chip_info.get_gfx_custom_op_core()], gfx)
+
+    def test_every_offline_target_resolves_through_all_three_tables(self):
+        from aiter.jit.utils.build_targets import GFX_CU_NUM_MAP
+
+        for gfx in GFX_CU_NUM_MAP:
+            with self.subTest(gfx=gfx):
+                self._resolves_everywhere(gfx)
+
+    def test_strict_resolves_through_all_three_tables(self):
+        self._resolves_everywhere("gfx1250-strict")
+
+
+class TestClusterLaunchBuildArchs(unittest.TestCase):
+    """build_module's -DAITER_ENABLE_CLUSTER_LAUNCH arch test (aiter.jit.core)."""
+
+    def setUp(self):
+        from aiter.jit import core
+
+        self.core = core
+        self.detect = lambda: "gfx942"
+
+    def test_blank_gpu_archs_falls_back_to_detection(self):
+        # A Dockerfile's `ENV GPU_ARCHS=` leaves the variable set but empty.
+        # That must behave like "native", not raise out of every JIT build.
+        for value in ("", " ", ";", " ; ", "native", "NATIVE", "gfx942;native"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"GPU_ARCHS": value}, clear=True),
+            ):
+                self.assertEqual(
+                    self.core._build_archs_from_env(self.detect), ["gfx942"]
+                )
+                self.assertFalse(self.core._cluster_launch_target(self.detect))
+
+    def test_unset_gpu_archs_falls_back_to_detection(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.core._build_archs_from_env(self.detect), ["gfx942"])
+
+    def test_explicit_archs_win_over_detection(self):
+        with mock.patch.dict(
+            os.environ, {"GPU_ARCHS": " gfx1250 ; gfx942 "}, clear=True
+        ):
+            self.assertEqual(
+                self.core._build_archs_from_env(self.detect), ["gfx1250", "gfx942"]
+            )
+
+    def test_cluster_launch_follows_any_targeted_arch(self):
+        cases = {
+            "gfx1250": True,
+            "gfx1250-strict": True,
+            "gfx1250;gfx942": True,
+            "gfx942;gfx1250-strict": True,
+            "gfx942": False,
+            "gfx950": False,
+        }
+        for value, expected in cases.items():
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"GPU_ARCHS": value}, clear=True),
+            ):
+                self.assertEqual(
+                    self.core._cluster_launch_target(self.detect), expected
+                )
+
+    def test_detected_strict_device_enables_cluster_launch(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(self.core._cluster_launch_target(lambda: "gfx1250-strict"))
+
+
 class TestRuntimeArchitecture(unittest.TestCase):
     def setUp(self):
         import torch
@@ -80,6 +180,49 @@ class TestRuntimeArchitecture(unittest.TestCase):
 
     def tearDown(self):
         self.chip_info.get_gfx_runtime.cache_clear()
+
+    def test_native_detection_preserves_strict_variant(self):
+        self.chip_info._detect_native.cache_clear()
+        try:
+            with mock.patch.object(
+                self.chip_info,
+                "_gpu_info_output",
+                return_value="  Name: gfx1250-strict\n",
+            ):
+                self.assertEqual(self.chip_info._detect_native(), ["gfx1250-strict"])
+        finally:
+            self.chip_info._detect_native.cache_clear()
+
+    def test_agent_parsers_preserve_strict_variant(self):
+        rocminfo = """Agent 1
+  Name: gfx1250-strict
+  Device Type: GPU
+  ASIC Revision: 0
+"""
+        hipinfo = """device#0
+gcnArchName: gfx1250-strict
+asicRevision: 0
+"""
+        for is_windows, output, parser in (
+            (False, rocminfo, self.chip_info._rocminfo_gpu_agents),
+            (True, hipinfo, self.chip_info._hipinfo_gpu_agents),
+        ):
+            with (
+                self.subTest(is_windows=is_windows),
+                mock.patch.object(self.chip_info, "IS_WINDOWS", is_windows),
+                mock.patch.object(
+                    self.chip_info, "_gpu_info_output", return_value=output
+                ),
+            ):
+                parser.cache_clear()
+                self.assertEqual(parser(), [("gfx1250-strict", 0)])
+                parser.cache_clear()
+
+    def test_strict_runtime_architecture_is_supported(self):
+        with mock.patch.object(
+            self.chip_info, "_detect_native", return_value=["gfx1250-strict"]
+        ):
+            self.assertEqual(self.chip_info.get_gfx_runtime(), "gfx1250-strict")
 
     def test_hipinfo_architecture_takes_precedence(self):
         with (

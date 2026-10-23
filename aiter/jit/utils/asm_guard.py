@@ -9,17 +9,23 @@ logger = logging.getLogger("aiter")
 _A0_ALLOWLIST: frozenset[str] = frozenset()
 
 
-def _probe_arch_is_gfx1250() -> bool:
+def _probe_gfx1250_arch() -> str | None:
     # Arch undeterminable -> don't block; the C++ gate is authoritative for A0.
     try:
-        return get_gfx_runtime() == "gfx1250"
+        arch = get_gfx_runtime()
+        return arch if arch in ("gfx1250", "gfx1250-strict") else None
     except Exception:  # noqa: BLE001
-        return False
+        return None
 
 
 def _probe_stepping_ok() -> bool:
-    if not _probe_arch_is_gfx1250():
+    arch = _probe_gfx1250_arch()
+    if arch is None:
         return True
+    # gfx1250-strict is the compiler/runtime identity for MI450 A0.  Never let
+    # it reach shipped gfx1250 ASM, even if stepping discovery is unavailable.
+    if arch == "gfx1250-strict":
+        return False
     try:
         return get_asic_revision() >= 1
     except Exception as e:  # noqa: BLE001
@@ -41,7 +47,7 @@ _ASM_SUPPORTED = _probe_stepping_ok()
 
 
 def is_gfx1250_asm_supported() -> bool:
-    """False on gfx1250 A0 (shipped asm is B0+ only); True otherwise.
+    """False on gfx1250-strict/A0 (shipped asm is B0+ only); True otherwise.
 
     Frameworks can call this at startup to select a backend before the hard gate.
     """
@@ -49,10 +55,10 @@ def is_gfx1250_asm_supported() -> bool:
 
 
 def require_gfx1250_asm(op_name: str) -> None:
-    """Raise on gfx1250 A0 (shipped asm is B0+ only); no-op otherwise."""
+    """Raise on gfx1250-strict/A0; no-op on gfx1250 B0+ and other targets."""
     if _ASM_SUPPORTED or op_name in _A0_ALLOWLIST:
         return
     raise RuntimeError(
         f"{op_name} asm is only supported on gfx1250 B0+ "
-        "(current device is gfx1250 A0)."
+        "(current device is gfx1250-strict/A0)."
     )

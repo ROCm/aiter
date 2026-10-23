@@ -44,7 +44,7 @@
 
 #include <cstdint>
 
-#if !defined(__gfx1250__)
+#if !(defined(__gfx1250__) || defined(__gfx1250_strict__))
 #error "the 4wave_compute pipeline is gfx1250-only (WMMA 16x16x32 + TDM); build with --offload-arch=gfx1250"
 #endif
 

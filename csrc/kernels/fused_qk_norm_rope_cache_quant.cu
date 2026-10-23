@@ -5074,7 +5074,7 @@ namespace aiter {
       // in the coarse kernel's dynamic LDS, which only the TDM build allocates, so
       // this is off wherever the ring is off.
       constexpr bool kMergeQScaleStoreOk =
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
           Q_TDM_DEPTH > 0 && (nope_dim % vec_size_o) == 0
           && (static_cast<int32_t>(nope_vec) + kScaleCarrierSlots) <= WARP_SIZE
           && static_cast<size_t>(kScaleCarrierSlots) * vec_size_o <= kQScaleGatherBytes;
@@ -5126,7 +5126,7 @@ namespace aiter {
       // Per-wave scratch for the e8m0 scale gather, immediately after the TDM
       // ring. Sized and reserved by the launcher (kQScaleGatherBytes).
       [[maybe_unused]] uint16_t* q_scale_lds = nullptr;
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
       extern __shared__ char fqk_coarse_lds[];
       if constexpr (Q_TDM_DEPTH > 0) {
         const int32_t wave_in_blk = static_cast<int32_t>(threadIdx.x) / WARP_SIZE;
@@ -5247,7 +5247,7 @@ namespace aiter {
         // Ring slot this head reads. Carried out of the block below so the refill
         // site, which runs after the reduce, can hand it to the next head.
         [[maybe_unused]] int32_t q_read_slot = 0;
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         if constexpr (Q_TDM_DEPTH > 0) {
           const int32_t slot = q_slot;
           q_read_slot = slot;
@@ -5320,7 +5320,7 @@ namespace aiter {
         const float amax_raw = fmaxf(amax2.x, amax2.y);
         (void)amax_raw;
 
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
         if constexpr (Q_TDM_DEPTH > 0) {
           // Refill the slot the PREVIOUS head read, not the one just read.
           //

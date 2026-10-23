@@ -846,8 +846,8 @@ def validate_and_update_archs():
         "gfx1200",
         "gfx1201",
         "gfx1250",
+        "gfx1250-strict",
         "gfx950",
-        "gfx1250",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -1024,7 +1024,7 @@ def _so_offload_archs(so_path):
         with open(so_path, "rb") as f, mmap.mmap(
             f.fileno(), 0, access=mmap.ACCESS_READ
         ) as mm:
-            for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+)", mm):
+            for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+(?:-[0-9a-z]+)*)", mm):
                 archs.add(m.group(1).decode())
     except (OSError, ValueError, OverflowError):
         pass
@@ -1276,6 +1276,31 @@ def clear_build(md_name):
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _build_archs_from_env(detect_gfx) -> list[str]:
+    """Architectures this build targets, from GPU_ARCHS with a native fallback.
+
+    Mirrors aiter/ops/opus/_arch.py: an unset, empty, blank or "native"
+    GPU_ARCHS falls back to the detected arch and never raises.  Routing the
+    value through build_targets._parse_gpu_archs_env instead would turn a
+    Dockerfile's `ENV GPU_ARCHS=` into a RuntimeError on every JIT build.
+    """
+    gpu_archs_env = os.environ.get("GPU_ARCHS", "native").strip()
+    explicit = [
+        a.strip()
+        for a in gpu_archs_env.split(";")
+        if a.strip() and a.strip().lower() != "native"
+    ]
+    return explicit or [detect_gfx()]
+
+
+def _cluster_launch_target(detect_gfx) -> bool:
+    """True when any targeted arch wants -DAITER_ENABLE_CLUSTER_LAUNCH."""
+    return any(
+        arch in ("gfx1250", "gfx1250-strict")
+        for arch in _build_archs_from_env(detect_gfx)
+    )
+
+
 def build_module(
     md_name,
     srcs,
@@ -1382,9 +1407,7 @@ def build_module(
         # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
         # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
         # path was compiled out (AiterAsmKernelFast then rejects them at launch).
-        if (
-            get_gfx() == "gfx1250" or "gfx1250" in os.environ.get("GPU_ARCHS", "")
-        ) and hip_version >= Version("7.0.0"):
+        if _cluster_launch_target(get_gfx) and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
 
         if not torch_exclude:

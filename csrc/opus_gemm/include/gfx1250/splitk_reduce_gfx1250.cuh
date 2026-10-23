@@ -58,7 +58,7 @@ __global__ void splitk_reduce_kernel_gfx1250(const void* __restrict__ ws_ptr,
                                              int bias_stride_batch            = 0)
 {
 #ifdef __HIP_DEVICE_COMPILE__
-#if defined(__gfx1250__)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
     // Workspace dtype (partial sums). fp32 = full precision; bf16 = half the
     // split-K-dominated READ traffic (reduce reads split_k slices), summed in
     // fp32 here. The main GEMM must write the workspace in the SAME dtype.

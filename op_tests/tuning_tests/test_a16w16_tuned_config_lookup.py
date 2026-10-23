@@ -101,15 +101,19 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                     self.assertLessEqual(lds, 320 * 1024)
                     k_tiles = -(-(k // config["split_k"]) // config["block_k"])
                     self.assertGreaterEqual(k_tiles, config["stages"] - 1)
-                    name = flydsl_hgemm_kernel_name(
-                        dtype=torch.bfloat16,
-                        out_dtype=torch.bfloat16,
-                        config=config,
-                        has_bias=False,
-                        target_gfx="gfx1250",
-                    )
-                    params = get_flydsl_hgemm_kernel_params(name)
-                    self.assertEqual({key: params[key] for key in config}, config, name)
+                    for target_gfx in ("gfx1250", "gfx1250-strict"):
+                        name = flydsl_hgemm_kernel_name(
+                            dtype=torch.bfloat16,
+                            out_dtype=torch.bfloat16,
+                            config=config,
+                            has_bias=False,
+                            target_gfx=target_gfx,
+                        )
+                        params = get_flydsl_hgemm_kernel_params(name)
+                        self.assertEqual(
+                            {key: params[key] for key in config}, config, name
+                        )
+                        self.assertEqual(params["target_gfx"], target_gfx)
 
 
 if __name__ == "__main__":
