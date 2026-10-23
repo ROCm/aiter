@@ -243,6 +243,7 @@ def gemm_a8w8_preshuffle(
         skip_reduce (Optional[bool]): Skip reduction of split-K partial results.
             Enables kernel fusion with downstream operations (FP8/FP4 quantization,
             RMSNorm). Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
+        backend (str): "triton" (default) or "gluon".
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
@@ -262,6 +263,7 @@ def gemm_a8w8_preshuffle(
     K = K // 16
 
     assert x.shape[1] == K, "Incompatible dimensions!!!"
+    assert K % 32 == 0, "K must be a multiple of 32 for preshuffled weights"
 
     assert backend in (
         "triton",
@@ -283,11 +285,11 @@ def gemm_a8w8_preshuffle(
     if y is None and (config.get("NUM_KSPLIT", 1) == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    assert (
-        K % config["BLOCK_SIZE_K"] == 0
-    ), "K must be multiple of BLOCK_SIZE_K for preshuffling"
-
     if backend == "gluon":
+        assert (
+            K % config["BLOCK_SIZE_K"] == 0
+        ), "K must be multiple of BLOCK_SIZE_K for preshuffling"
+
         from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
             _gemm_a8w8_preshuffled_kernel as _gluon_gemm_a8w8_preshuffled_kernel,
         )
