@@ -179,7 +179,7 @@
     }
   },
   "kv_split": {
-    "SW.SWB": {
+    "SW_GEQ_256.SWB": {
       "SEGMENTS_PER_CU": 1,
       "SPLIT_FIT_BUDGET": true,
       "SPLIT_SEQS_PER_TILE": 1.5,

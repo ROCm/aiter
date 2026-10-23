@@ -843,8 +843,11 @@ def test_triton_unified_attn_sw_verify_split(
         (2048, 8, 200000, 1, 16, 1),
         (2048, 1, 2063, 1, 16, 1),
         (128, 4, 258, 1, 128, 1),
+        (255, 16, 270, 1, 16, 1),
+        (256, 16, 271, 1, 16, 8),
         (256, 8, 278, 7, 16, 8),
         (256, 8, 278, 8, 16, 1),
+        (256, 8, 390, 8, 128, 1),
         (2048, 8, 300, 4, 16, 8),
     ],
 )
@@ -878,6 +881,26 @@ def test_unified_attn_sw_kv_split_config(
         "kv_split", params, backend="gluon", arch="gfx950"
     )
     assert config["NUM_SEGMENTS"] == segments, config
+
+
+def test_unified_attn_sw_axis_lookup():
+    from aiter.ops.triton.utils import unified_attention_utils as uau
+
+    parts = {"SW_GEQ_512", "SW_GEQ_4096", "SW"}
+    assert uau._candidates("SW", 4096, parts) == [
+        "SW_GEQ_4096",
+        "SW_GEQ_512",
+        "SW",
+        "any",
+    ]
+    assert uau._candidates("SW", 300, parts) == ["SW", "any"]
+    assert uau._candidates("SW", 0, parts) == ["any"]
+    bf16 = torch.bfloat16
+    assert uau._axis_values(64, 8, 300, 2048, False, 16, bf16, bf16)["SW"] == 300
+    assert uau._axis_values(64, 1, 0, 128, False, 16, bf16, bf16)["SW"] == 1
+
+    with pytest.raises(AssertionError, match="mix LEQ and GEQ"):
+        uau._index(("SW_LEQ_512", "SW_GEQ_4096", "any"), ("SW",))
 
 
 @pytest.mark.parametrize(

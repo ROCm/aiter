@@ -26,6 +26,9 @@ that exists: an exact EQ first, then LEQ bounds ascending, then GEQ
 descending, then "any". So the leftmost axis wins: D before Q is what makes
 head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
+SW is the keys a row can see, min(window, max_seqlen_k), and 0 with no window:
+SW_GEQ_<n> targets a window size, a bare SW matches any window, and a table
+may not mix SW_LEQ and SW_GEQ keys.
 
 A section with no axes, like reduce above, is just a config.
 
@@ -64,7 +67,7 @@ _AXIS_KIND = {
     "D": "num",  # head_size
     "Q": "num",  # max_seqlen_q; Q_LEQ_1 is decode
     "BS": "num",  # block_size, the KV page size
-    "SW": "bool",  # sliding_window > 0
+    "SW": "opt_num",  # keys a row can see, 0 when off; bare SW = any window
     "SWB": "bool",
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
@@ -107,6 +110,14 @@ def _index(keys: tuple, axes: tuple) -> tuple:
         if key != "any":
             for part in key.split(_SEP):
                 parts[_axis_of(part)].add(part)
+    # every matching LEQ key outranks every GEQ key, so one direction per axis
+    for a in axes:
+        if _AXIS_KIND[a] == "opt_num":
+            dirs = {p.split("_")[1] for p in parts[a] if "_" in p}
+            assert not {"LEQ", "GEQ"} <= dirs, (
+                f"{_CONFIG_NAME}: {a} keys mix LEQ and GEQ "
+                f"({sorted(parts[a])}); use one direction"
+            )
     return {_canonical(k, axes): k for k in keys}, parts
 
 
@@ -122,6 +133,8 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
     if kind == "enum":
         q, kv = value
         return [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
+    if kind == "opt_num" and not value:
+        return ["any"]
 
     eq = sorted(c for c in parts if c.startswith(f"{axis}_EQ_"))
     leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound)
@@ -132,6 +145,7 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
         [c for c in eq if value == _bound(c)]
         + [c for c in leq if value <= _bound(c)]
         + [c for c in geq if value >= _bound(c)]
+        + ([axis] if kind == "opt_num" else [])
         + ["any"]
     )
 
@@ -251,7 +265,7 @@ def _axis_values(
         "D": head_size,
         "Q": max_seqlen_q,
         "BS": block_size,
-        "SW": sliding_window > 0,
+        "SW": max(1, min(sliding_window, max_seqlen_k)) if sliding_window > 0 else 0,
         "SWB": sliding_window_bounds_kv(
             max_seqlen_q, max_seqlen_k, sliding_window, block_size
         ),
