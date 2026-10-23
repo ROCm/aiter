@@ -8,7 +8,7 @@ budget. ``build_qsa_indexer_decode_scores_module`` and
 ``build_qsa_indexer_prefill_scores_module`` are the one-row and 16-row BF16
 MFMA scorers. ``build_qsa_indexer_active_columns_module`` reports the widest
 visible column count. Host dispatch and top-512 selection live in
-``aiter.ops.flydsl.qsa``.
+``aiter.ops.flydsl.qsa_paged``.
 
 Every shape these kernels serve shares one indexer contract. The scorers
 accept 4 or 8 heads, and each head count is its own compile.
@@ -197,7 +197,7 @@ def _k_page_row(
 
 
 def _qk_mfma(qk_mma, qk_a, qk_b, qk_c, a_vec, b_vec, c_vec):
-    """One K1 QK atom. Fragments are the caller's, reused across K steps."""
+    """One indexer QK atom. Fragments are the caller's, reused across K steps."""
     fx.memref_store_vec(a_vec, qk_a)
     fx.memref_store_vec(b_vec, qk_b)
     fx.memref_store_vec(c_vec, qk_c)
