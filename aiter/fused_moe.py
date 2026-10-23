@@ -1154,6 +1154,8 @@ def fused_moe(
     if has_shared_expert:
         routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
         unsupported = []
+        if ep_has_fake_route:
+            unsupported.append("ep_has_fake_route")
         if stage2_scatter is not None:
             unsupported.append("stage2_scatter")
         if quant_type_a is not None:
