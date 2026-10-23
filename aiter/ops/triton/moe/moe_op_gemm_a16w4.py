@@ -2,6 +2,8 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
 import itertools
+import os
+import weakref
 from functools import lru_cache
 
 import torch
@@ -394,6 +396,34 @@ def _gfx942_layouts_cached(block_m, block_n, block_k, num_warps):
     return gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps)
 
 
+# fp16 B operand with the e8m0 scale folded into the per-group lookup table (FP16_OPERAND in the gfx942 kernel):
+# 12 instead of 18.5 VALU ops per 8 weights, bit-identical weights when every e8m0 scale is in [114, 140]
+# (CPU AOT, MI300X: loop VALU -21 % at block_m 16, -13 % at 32; +2 % at 64/128, where the in-register bf16 -> fp16
+# activation convert outweighs the dequant saving, so block_m > 32 keeps the bf16 path)
+# (fp4 * 2^(e-127) a normal fp16) or 0 (all-zero padding groups). AITER_A16W4_GFX942_FP16=auto (default) checks
+# each scale tensor once (one reduction + sync, outside graph capture; the verdict lives as long as the scale
+# storage, so a freed and reallocated buffer is checked again; scales must not be modified in place afterwards),
+# 1 forces it, 0 disables it.
+_GFX942_FP16 = os.environ.get("AITER_A16W4_GFX942_FP16", "auto")
+_gfx942_fp16_scales_ok = {}
+
+
+def _gfx942_fp16_operand(w_scales):
+    if _GFX942_FP16 in ("0", "1"):
+        return _GFX942_FP16 == "1"
+    storage = w_scales.untyped_storage()
+    key = (w_scales.data_ptr(), tuple(w_scales.shape), tuple(w_scales.stride()))
+    hit = _gfx942_fp16_scales_ok.get(key)
+    if hit is not None and hit[0]() is storage:
+        return hit[1]
+    if torch.cuda.is_current_stream_capturing():
+        return False  # cannot sync here; the bf16 path is always exact
+    s = w_scales.view(torch.uint8)
+    ok = bool((((s >= 114) & (s <= 140)) | (s == 0)).all().item())
+    _gfx942_fp16_scales_ok[key] = (weakref.ref(storage), ok)
+    return ok
+
+
 def get_kernel_config_gluon_gfx1250(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
@@ -696,6 +726,7 @@ def moe_gemm_a16w4(
             LOAD_S=load_s,
             MFMA_LAYOUT=mfma_layout,
             UPCAST_INDICES=should_upcast_indices(x, w, y),
+            FP16_OPERAND=config["block_m"] <= 32 and _gfx942_fp16_operand(w_scales),
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
             waves_per_eu=config["waves_per_eu"],

@@ -21,6 +21,16 @@ Per 8 weight elements: ~18.5 VALU ops, all 32-bit, versus ~44 for the compiler-g
 
 Scale range: the bias C = 0x3000 keeps the lookup values below the sign bit and makes the
 subtract saturate +-0 to -0.0 for every scale 3 <= e8m0 <= 222 (weights 2^-124 .. 2^95).
+
+FP16_OPERAND variant (fp16 x fp16 MFMA, same f32 accumulation): every fp4 magnitude is an fp16
+whose low byte is zero, and so is fp4 * 2^k as long as it stays a normal fp16, so one byte per
+element carries the scaled weight. The e8m0 scale is folded into the byte lookup table once per
+32-K group (two table registers per group and column, shared by the lane's 4 dwords of that group),
+and per 8 weight elements the dequant is 12 VALU ops (2 lookups, 3 sign ops, 4 byte interleaves,
+3 magnitude extracts) instead of 18 + 0.5. Exact (bit-identical B operand values) for
+114 <= e8m0 <= 140; e8m0 = 0 is allowed for all-zero groups (zero padding). bf16 activations are
+converted to fp16 in registers before the LDS stage (exact for 2^-17 <= |x| <= 65504; larger
+magnitudes saturate to 65504, round toward zero). The wrapper selects this path per weight tensor.
 """
 
 import triton
@@ -95,6 +105,65 @@ TLO0 = tl.constexpr(0xC0800000)  # low bytes of T'[0..3]
 TLO1 = tl.constexpr(0xC0804000)  # low bytes of T'[4..7]
 THI0 = tl.constexpr(0x6F6F6F80)  # high bytes of T'[0..3]
 THI1 = tl.constexpr(0x70707070)  # high bytes of T'[4..7]
+
+# ---- FP16_OPERAND path
+# fp16 high bytes H[m] of the fp4 magnitudes m = 0..7 (low bytes are all zero):
+# 0, 0x38 (0.5), 0x3C (1), 0x3E (1.5), 0x40 (2), 0x42 (3), 0x44 (4), 0x46 (6). Scaling by 2^k adds 4k to
+# the high byte (exponent field = bits 2..6 of it) for m >= 1 while the result stays normal:
+# H[1] + 4k >= 0x04 and H[7] + 4k <= 0x7B  <=>  -13 <= k <= 13  <=>  114 <= e8m0 <= 140.
+F16_TBL_LO = tl.constexpr(0x3E3C3800)  # H[0..3]
+F16_TBL_HI = tl.constexpr(0x46444240)  # H[4..7]
+# Per (32-K group, n) scaled tables, $6 = e8m0 zero-extended: t = 4k = 4*e8m0 - 508,
+# a = 4k * 0x010101, lo = TBL_LO + 4k * 0x01010100 (byte 0 = H[0] = 0 untouched), hi = TBL_HI + 4k * 0x01010101.
+# Every byte stays in [0, 255] for 114 <= e8m0 <= 140, so the 32-bit sums equal the bytewise ones (no carries).
+# For e8m0 = 0 (zero padding) the tables are garbage but zero nibbles never read them (selector 0 = byte 0 of lo = 0).
+_ASM_F16_TABLES = tl.constexpr(
+    """
+s_mov_b32 $3, 0xfffffe04
+s_mov_b32 $4, 0x3e3c3800
+s_mov_b32 $5, 0x08080a40
+v_lshl_add_u32 $2, $6, 2, $3
+v_mul_i32_i24 $1, 0x10101, $2
+v_lshl_add_u32 $0, $1, 8, $4
+v_add3_u32 $1, $0, $2, $5
+"""
+)
+_ASM_F16_TABLES_CONSTRAINTS = tl.constexpr("=&v,=&v,=&v,=&s,=&s,=&s,v")
+# One packed dword ($9) of fp4 e0..e7 -> four fp16x2 registers, with the group's scaled tables lo ($10), hi ($11):
+# byte-planar lookups h_even = H(e0, e2, e4, e6), h_odd = H(e1, e3, e5, e7) (selector = 3-bit magnitude, bytes 0-3
+# from lo, 4-7 from hi), sign bits ORed into bit 7 of each byte, then one v_perm per output pair places the two
+# high bytes over zero low bytes (selector 0x0C = 0x00); bytes (0, 2) or (1, 3) of h_even / h_odd, so two selectors.
+# Outputs: $0 = (e0,e4), $1 = (e1,e5), $2 = (e2,e6), $3 = (e3,e7) as fp16x2 (low, high half); $4, $5 VGPR scratch,
+# $6..$8 SGPR scratch. 12 VALU ops per 8 weight elements.
+_ASM_DEQUANT_F16 = tl.constexpr(
+    """
+v_and_b32 $4, 0x07070707, $9
+v_lshrrev_b32 $5, 4, $9
+v_and_b32 $5, 0x07070707, $5
+v_perm_b32 $4, $11, $10, $4
+v_perm_b32 $5, $11, $10, $5
+s_mov_b32 $6, 0x80808080
+v_lshlrev_b32 $0, 4, $9
+v_and_or_b32 $4, $0, $6, $4
+v_and_or_b32 $5, $9, $6, $5
+s_mov_b32 $7, 0x020c000c
+s_mov_b32 $8, 0x030c010c
+v_perm_b32 $0, $4, $4, $7
+v_perm_b32 $1, $5, $5, $7
+v_perm_b32 $2, $4, $4, $8
+v_perm_b32 $3, $5, $5, $8
+"""
+)
+_ASM_DEQUANT_F16_CONSTRAINTS = tl.constexpr("=&v,=&v,=&v,=&v,=&v,=&v,=&s,=&s,=&s,v,v,v")
+# bf16x2 -> fp16x2 (exact in the normal fp16 range; round toward zero saturates |x| > 65504 to 65504, no inf)
+_ASM_BF16_TO_F16 = tl.constexpr(
+    """
+v_lshlrev_b32 $1, 16, $3
+v_and_b32 $2, 0xffff0000, $3
+v_cvt_pkrtz_f16_f32 $0, $1, $2
+"""
+)
+_ASM_BF16_TO_F16_CONSTRAINTS = tl.constexpr("=v,=&v,=&v,v")
 
 
 def gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps):
@@ -197,6 +266,27 @@ def _dequant_tile(
         is_pure=True,
         pack=2,
     )
+    return _assemble_operand(o0, o1, o2, o3, BLOCK_K, BLOCK_N, DOT_W).to(gl.bfloat16, bitcast=True)
+
+
+@gluon.jit
+def _dequant_tile_f16(wu, tlo, thi, BLOCK_K: gl.constexpr, BLOCK_N: gl.constexpr, DOT_W: gl.constexpr):
+    """FP16_OPERAND dequant: wu as in _dequant_tile; tlo, thi: the scaled fp16 high-byte tables of each element's
+    (group, n) (see _ASM_F16_TABLES), as uint16 pairs in the k_width=2 layout. Returns the fp16 B operand."""
+    o0, o1, o2, o3, _v1, _v2, _s1, _s2, _s3 = gl.inline_asm_elementwise(
+        _ASM_DEQUANT_F16,
+        _ASM_DEQUANT_F16_CONSTRAINTS,
+        [wu, tlo, thi],
+        dtype=(gl.uint16,) * 9,
+        is_pure=True,
+        pack=2,
+    )
+    return _assemble_operand(o0, o1, o2, o3, BLOCK_K, BLOCK_N, DOT_W).to(gl.float16, bitcast=True)
+
+
+@gluon.jit
+def _assemble_operand(o0, o1, o2, o3, BLOCK_K: gl.constexpr, BLOCK_N: gl.constexpr, DOT_W: gl.constexpr):
+    """o_s = (e_s, e_{s+4}) 16-bit pairs of every dword -> the (BLOCK_K, BLOCK_N) uint16 B operand in DOT_W."""
     # Each o_s register already holds one MFMA operand pair (register bit 0 = half h), so
     # assemble with h as the innermost join: register bits [h, s0, s1, kt...] == DOT_W.
     DN: gl.constexpr = BLOCK_K // 8
@@ -215,7 +305,15 @@ def _dequant_tile(
     wb = gl.join(j_lo, j_hi)  # (d, n, s, h)
     wb = gl.permute(wb, (0, 2, 3, 1))  # (d, s, h, n)
     wb = gl.reshape(wb, (BLOCK_K, BLOCK_N))
-    return gl.convert_layout(wb, DOT_W, assert_trivial=True).to(gl.bfloat16, bitcast=True)
+    return gl.convert_layout(wb, DOT_W, assert_trivial=True)
+
+
+@gluon.jit
+def _spread_groups(t, KGL: gl.constexpr, KG: gl.constexpr, BLOCK_N: gl.constexpr, DOT_W16: gl.constexpr):
+    """(KGL, 1, 4, BLOCK_N, 2) uint16 per-(group, n) dword -> (BLOCK_K//4, BLOCK_N) uint16 pairs in the k_width=2
+    operand layout, every dword of a group getting its group's value (register-local, no cross-lane movement)."""
+    t = gl.reshape(t.broadcast_to((KGL, 4, 4, BLOCK_N, 2)), (KG, 4, BLOCK_N, 2))  # dword kt = 4*j + r -> group j
+    return gl.convert_layout(gl.reshape(gl.permute(t, (0, 1, 3, 2)), (8 * KG, BLOCK_N)), DOT_W16)
 
 
 @gluon.jit(launch_metadata=matmul_launch_metadata)
@@ -276,6 +374,7 @@ def _moe_gemm_a16w4_gfx942(
     MFMA_LAYOUT: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
+    FP16_OPERAND: gl.constexpr = False,
 ):
     gl.assume(stride_y_k >= 0)
     gl.assume(stride_y_m >= 0)
@@ -294,7 +393,14 @@ def _moe_gemm_a16w4_gfx942(
 
     gl.static_assert(W.dtype.element_ty == gl.uint8, "mx_weight_ptr must be uint8")
     gl.static_assert(WMxScale.dtype.element_ty == gl.uint8, "mx_scale_ptr must be uint8")
-    gl.static_assert(X.dtype.element_ty == gl.bfloat16, "activations must be bf16")
+    if FP16_OPERAND:
+        gl.static_assert(
+            (X.dtype.element_ty == gl.bfloat16) | (X.dtype.element_ty == gl.float16), "activations must be bf16 or fp16"
+        )
+        OP_DTYPE: gl.constexpr = gl.float16
+    else:
+        gl.static_assert(X.dtype.element_ty == gl.bfloat16, "activations must be bf16")
+        OP_DTYPE: gl.constexpr = gl.bfloat16
     gl.static_assert(BLOCK_K % 128 == 0, "BLOCK_K must be a multiple of 128")
 
     KG: gl.constexpr = BLOCK_K // 32  # e8m0 groups (= packed dwords per lane) per tile
@@ -402,11 +508,12 @@ def _moe_gemm_a16w4_gfx942(
         offs_s = offs_s_kg * stride_w_mx_k + offs_s_n.to(index_type)[None, None, None, :] * stride_w_mx_n + w_expt_id * stride_w_mx_e
     SPtrs = WMxScale + offs_s
 
-    x_smem = gl.allocate_shared_memory(gl.bfloat16, [BLOCK_M, BLOCK_K], SMEM_X)
-    tlo0 = _const_u16_pairs((PK2, BLOCK_N), TLO0, DOT_W16)
-    tlo1 = _const_u16_pairs((PK2, BLOCK_N), TLO1, DOT_W16)
-    thi0 = _const_u16_pairs((PK2, BLOCK_N), THI0, DOT_W16)
-    thi1 = _const_u16_pairs((PK2, BLOCK_N), THI1, DOT_W16)
+    x_smem = gl.allocate_shared_memory(OP_DTYPE, [BLOCK_M, BLOCK_K], SMEM_X)
+    if not FP16_OPERAND:
+        tlo0 = _const_u16_pairs((PK2, BLOCK_N), TLO0, DOT_W16)
+        tlo1 = _const_u16_pairs((PK2, BLOCK_N), TLO1, DOT_W16)
+        thi0 = _const_u16_pairs((PK2, BLOCK_N), THI0, DOT_W16)
+        thi1 = _const_u16_pairs((PK2, BLOCK_N), THI1, DOT_W16)
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=MFMA_LAYOUT)
     num_k_iter = K // (BLOCK_K * SPLIT_K)
@@ -418,17 +525,29 @@ def _moe_gemm_a16w4_gfx942(
         # weights: relabel into the k_width=2 operand layout, spread the scales, dequantise
         wu = _relabel_w(wq, KG, BLOCK_N, DOT_W16)
         sc16 = sc.to(gl.uint16)  # (KGL, 1, 4, BLOCK_N)
-        sc16 = gl.join(sc16, sc16)  # both 16-bit halves of one dword per (group, n)
-        # exponent subtrahend once per 32-K group (not per dword): (KGL, 1, 4, BLOCK_N, 2) uint16
-        d16, _ds1, _ds2 = gl.inline_asm_elementwise(
-            _ASM_SUBTRAHEND, _ASM_SUBTRAHEND_CONSTRAINTS, [sc16], dtype=(gl.uint16, gl.uint16, gl.uint16), is_pure=True, pack=2
-        )
-        d16 = gl.reshape(d16.broadcast_to((KGL, 4, 4, BLOCK_N, 2)), (KG, 4, BLOCK_N, 2))  # dword kt = 4*j + r -> group j
-        # register-local broadcast + relabel into the k_width=2 operand layout (no cross-lane movement)
-        d16 = gl.convert_layout(gl.reshape(gl.permute(d16, (0, 1, 3, 2)), (PK2, BLOCK_N)), DOT_W16)
-        wb = _dequant_tile(wu, d16, tlo0, tlo1, thi0, thi1, BLOCK_K, BLOCK_N, DOT_W)
+        if FP16_OPERAND:
+            # scaled lookup tables once per 32-K group: e8m0 in the low half of one dword per (group, n)
+            sc16 = gl.join(sc16, gl.full(sc16.shape, 0, gl.uint16, layout=sc16.type.layout))
+            tlo, thi, _t, _ts1, _ts2, _ts3 = gl.inline_asm_elementwise(
+                _ASM_F16_TABLES, _ASM_F16_TABLES_CONSTRAINTS, [sc16], dtype=(gl.uint16,) * 6, is_pure=True, pack=2
+            )
+            tlo = _spread_groups(tlo, KGL, KG, BLOCK_N, DOT_W16)
+            thi = _spread_groups(thi, KGL, KG, BLOCK_N, DOT_W16)
+            wb = _dequant_tile_f16(wu, tlo, thi, BLOCK_K, BLOCK_N, DOT_W)
+        else:
+            sc16 = gl.join(sc16, sc16)  # both 16-bit halves of one dword per (group, n)
+            # exponent subtrahend once per 32-K group (not per dword): (KGL, 1, 4, BLOCK_N, 2) uint16
+            d16, _ds1, _ds2 = gl.inline_asm_elementwise(
+                _ASM_SUBTRAHEND, _ASM_SUBTRAHEND_CONSTRAINTS, [sc16], dtype=(gl.uint16, gl.uint16, gl.uint16), is_pure=True, pack=2
+            )
+            d16 = _spread_groups(d16, KGL, KG, BLOCK_N, DOT_W16)
+            wb = _dequant_tile(wu, d16, tlo0, tlo1, thi0, thi1, BLOCK_K, BLOCK_N, DOT_W)
 
         # activations: stage through LDS in the semantic K order of the W operand
+        if FP16_OPERAND and X.dtype.element_ty == gl.bfloat16:
+            x, _xs1, _xs2 = gl.inline_asm_elementwise(
+                _ASM_BF16_TO_F16, _ASM_BF16_TO_F16_CONSTRAINTS, [x], dtype=(gl.float16, gl.uint16, gl.uint16), is_pure=True, pack=2
+            )
         x_smem.store(_relabel_x(x, BLOCK_M, BLOCK_K))
         gl.barrier()
         xa = x_smem.load(DOT_X)
