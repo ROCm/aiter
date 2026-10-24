@@ -94,7 +94,9 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
 
 
-def _reference(query, key, value, table, lengths, query_length, window, sinks):
+def _reference(
+    query, key, value, table, lengths, query_length, window, sinks, causal=True
+):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()
     heads, dim = query.shape[1:]
@@ -112,7 +114,11 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
         offsets = tokens % page_size
         keys, values = key[pages, :, offsets], value[pages, :, offsets]
         scores = torch.einsum("qhgd,khd->qhgk", queries[seq], keys) * dim**-0.5
-        visible = length - query_length + 1 + positions
+        visible = (
+            length - query_length + 1 + positions
+            if causal
+            else torch.full_like(positions, length)
+        )
         masked = tokens[None, :] >= visible[:, None]
         if window > 0:
             masked |= tokens[None, :] < (visible - window)[:, None]
@@ -231,6 +237,122 @@ _COMMON_CASES = [
         for pattern in ("small_query", "probability_tail")
     ],
 ]
+# Non-causal blocks (e.g. DFlash draft blocks whose own keys are cached) let
+# every row see the whole context, so lengths below query_length leave no row
+# empty. FP8 P error over a handful of keys exceeds the tolerance, so random
+# FP8 cases keep lengths of 0, 1 or a few hundred; the FP8 one-hot case covers
+# short contexts exactly.
+_NONCAUSAL_CASES = [
+    (
+        "noncausal-q5-g4-d64",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "lengths": (0, 1, 255, 256, 257, 1029),
+            "max_partitions": 3,
+        },
+    ),
+    (
+        "noncausal-q7-page128",
+        {
+            "causal": False,
+            "query_length": 7,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 128,
+            "max_partitions": 5,
+            "sink_dtype": torch.float32,
+        },
+    ),
+    # Full and partial page-128 tiles at G16; this small plan splits the rows.
+    (
+        "noncausal-q4-g16-tile-edge",
+        {
+            "causal": False,
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (1, 256, 257, 259, 260, 515),
+            "max_partitions": 2,
+        },
+    ),
+    (
+        "noncausal-q5-mixed-np96",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "lengths": (97 * 256,) + (0, 1, 257, 1027) * 10,
+            "max_partitions": 96,
+            "budget": 4096,
+        },
+    ),
+    (
+        "noncausal-q5-g4-d64-page128",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 128,
+            "lengths": (0, 1, 255, 256, 257, 1029, 3000),
+            "max_partitions": 8,
+        },
+    ),
+    # One query row: the same kernels as causal, so the same output.
+    (
+        "noncausal-q1",
+        {"causal": False, "group_size": 8, "block_size": 64, "max_partitions": 2},
+    ),
+]
+_FP8_NONCAUSAL_CASES = _NONCAUSAL_CASES + [
+    # One-hot tokens cover contexts shorter than the block exactly.
+    (
+        "noncausal-q5-short-one-hot",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "block_size": 16,
+            "lengths": (0, 1, 2, 3, 4, 5, 6, 17),
+            "max_partitions": 2,
+            "pattern": "one_hot_token",
+        },
+    ),
+    # Full tiles of the fused gfx950 per-token MTP4 schedule skip the mask. A
+    # 66-tile row keeps the plan wide enough that the query rows stay fused.
+    (
+        "noncausal-q4-g16-mtp4-fused",
+        {
+            "causal": False,
+            "query_length": 4,
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (65 * 256 + 3, 1, 256, 257, 259, 515),
+            "max_partitions": 64,
+            "budget": 4096,
+            "mtp4_fused": True,
+        },
+    ),
+]
+# The mask does not depend on the query dtype or V layout: the per-tensor and
+# per-token (tuned gfx950) schedules in BF16, and the FP16 / plain-V path.
+_FP8_NONCAUSAL_VARIANTS = (
+    (torch.bfloat16, "per-tensor", True),
+    (torch.bfloat16, "per-token", True),
+    (torch.float16, "per-tensor", False),
+)
 _FP8_CASES = _COMMON_CASES + [
     (
         "packed-mtp4",
@@ -271,6 +393,7 @@ _FP8_CASES = _COMMON_CASES + [
     ),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *_NONCAUSAL_CASES,
     (
         "mtp",
         {
@@ -304,7 +427,29 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
+    (
+        "noncausal-head512-mtp-split2",
+        {
+            "causal": False,
+            "query_length": 4,
+            "group_size": 16,
+            "head_dim": 512,
+            "max_partitions": 4,
+        },
+    ),
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
+    (
+        "noncausal-graph-workspace",
+        {
+            "causal": False,
+            "query_length": 5,
+            "kv_heads": 2,
+            "group_size": 4,
+            "head_dim": 64,
+            "max_partitions": 7,
+            "capture": True,
+        },
+    ),
     (
         "loose-bound",
         {
@@ -402,6 +547,18 @@ _PIPE_CASES = [
         )
         for partitions in (81, 130)
     ),
+    # Without the causal mask each row of the one-hot pattern sees every token.
+    (
+        "d256-page64-q4-noncausal",
+        {
+            **_PIPE_BASE,
+            "causal": False,
+            "query_length": 4,
+            "lengths": (0, 1, 3, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "one_hot_token",
+        },
+    ),
     (
         "d256-page64-per-token",
         {
@@ -417,6 +574,18 @@ _PIPE_CASES = [
         {
             **_PIPE_BASE,
             "scale_mode": "per-token",
+            "query_length": 4,
+            "lengths": (0, 1, 65, 257, 2049),
+            "max_partitions": 4,
+            "pattern": "varied",
+        },
+    ),
+    (
+        "d256-page64-q4-per-token-noncausal",
+        {
+            **_PIPE_BASE,
+            "scale_mode": "per-token",
+            "causal": False,
             "query_length": 4,
             "lengths": (0, 1, 65, 257, 2049),
             "max_partitions": 4,
@@ -500,14 +669,26 @@ def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256
 
 def _check_pipe_policy(pa, case, arch, compile_kwargs):
     """Pin the selected specialization so a case cannot drift off its path."""
-    from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
+    from aiter.ops.flydsl.kernels.pa_decode.traits import (
+        PaDecodeSchedule,
+        PaDecodeTraits,
+    )
 
     assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
+    schedule_kwargs = dict(compile_kwargs[-1])
+    schedule_kwargs.pop("architecture", None)
+    schedule_kwargs.pop("direct_output", None)
+    if case["mtp4_fused"] is not None:
+        tuned = (
+            arch == "gfx950"
+            and case["scale_mode"] == "per-token"
+            and case["query_dtype"] == torch.bfloat16
+        )
+        schedule = PaDecodeSchedule.select(**schedule_kwargs)
+        fused = PaDecodeTraits.create(schedule).MTP4_FUSED
+        assert fused == (tuned and case["mtp4_fused"])
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
-        schedule_kwargs = dict(compile_kwargs[-1])
-        schedule_kwargs.pop("architecture", None)
-        schedule_kwargs.pop("direct_output", None)
         pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
@@ -534,6 +715,20 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
                 ("per-tensor", "per-token"),
                 (False, True),
             )
+        ],
+        *[
+            pytest.param(
+                dict(
+                    geometry,
+                    kv_dtype="fp8",
+                    query_dtype=dtype,
+                    scale_mode=scale_mode,
+                    trans_v=trans_v,
+                ),
+                id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
+            )
+            for name, geometry in _FP8_NONCAUSAL_CASES
+            for dtype, scale_mode, trans_v in _FP8_NONCAUSAL_VARIANTS
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
         *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
@@ -576,6 +771,8 @@ def test_pa_decode(case, device, monkeypatch):
             "wide": False,
             "pipe": False,
             "staged": None,
+            "causal": True,
+            "mtp4_fused": None,
         },
         **case,
     )
@@ -668,6 +865,7 @@ def test_pa_decode(case, device, monkeypatch):
         "value_scale": value_scale,
         "sinks": sinks,
         "sliding_window": window,
+        "causal": case["causal"],
         "max_context_length": (
             None
             if case["max_context"] is None
@@ -725,6 +923,7 @@ def test_pa_decode(case, device, monkeypatch):
             query_length,
             window,
             sinks,
+            case["causal"],
         )
         _check_output(output, reference)
 
@@ -746,3 +945,50 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
+
+
+def test_pa_decode_noncausal_contract(device):
+    """causal=False reuses single-query kernels and rejects sliding windows."""
+    from aiter.ops.flydsl.kernels.pa_decode.traits import PaDecodeSchedule
+
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    common = {
+        "head_dim": 128,
+        "query_group_size": 8,
+        "block_size": 64,
+        "num_seqs": 2,
+        "num_kv_heads": 1,
+        "num_compute_units": 256,
+        "work_capacity": 4,
+        "query_dtype": "bf16",
+        "kv_dtype": "bf16",
+    }
+
+    def key(**kwargs):
+        return PaDecodeSchedule.select(**common, **kwargs).cache_key
+
+    assert key(causal=False) == key()
+    assert key(query_length=4, causal=False) != key(query_length=4)
+    with pytest.raises(NotImplementedError, match="sliding windows"):
+        key(query_length=4, sliding_window=128, causal=False)
+
+    context = torch.full((2,), 8, dtype=torch.int32, device=device)
+    plan = pa.plan_pa_decode(context, 1, max_partitions=1)
+    empty = torch.empty(0, device=device)
+    for options, error in (
+        ({"causal": False, "sliding_window": 128}, NotImplementedError),
+        ({"causal": 0}, TypeError),
+    ):
+        with pytest.raises(error, match="causal"):
+            pa.pa_decode(
+                empty,
+                empty,
+                empty,
+                empty,
+                context,
+                empty,
+                1.0,
+                4,
+                work_plan=plan,
+                **options,
+            )

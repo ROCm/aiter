@@ -687,13 +687,15 @@ class Gfx1250Bf16Pipeline:
             next_state = []
             for m in range_constexpr(t.m_tiles):
                 row = m * 16 + ctx.lane16
-                upper = (
-                    ctx.planned_context
-                    - t.query_length
-                    + ctx.query_begin
-                    + row // t.query_group_size
-                    + 1
-                )
+                upper = ctx.planned_context
+                if const_expr(t.causal):
+                    upper = (
+                        upper
+                        - t.query_length
+                        + ctx.query_begin
+                        + row // t.query_group_size
+                        + 1
+                    )
                 units = []
                 for n in range_constexpr(2):
                     scores = fx.Vector.filled(8, 0.0, fx.Float32)
@@ -971,13 +973,15 @@ class Gfx1250Pipeline:
                 if const_expr(not t.per_token_kv and not t.bf16):
                     ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
                     scale = scale * fx.Float32(ks[0])
-                upper = (
-                    ctx.planned_context
-                    - t.query_length
-                    + ctx.query_begin
-                    + row // t.query_group_size
-                    + 1
-                )
+                upper = ctx.planned_context
+                if const_expr(t.causal):
+                    upper = (
+                        upper
+                        - t.query_length
+                        + ctx.query_begin
+                        + row // t.query_group_size
+                        + 1
+                    )
                 units, values = [], []
                 qk_k = 32 if t.bf16 else (128 if t.head_dim % 128 == 0 else 64)
                 for n in range_constexpr(t.TOKENS // 64):
