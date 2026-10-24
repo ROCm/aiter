@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from aiter import per_tensor_quant, pertoken_quant
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 
 @pytest.fixture
@@ -94,6 +94,165 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
 
 
+@pytest.mark.parametrize(
+    "arch,num_seqs,window,max_parts,capacity_per_seq,expected_splits",
+    [
+        ("gfx950", 1, 1024, 8, 8, 8),
+        ("gfx950", 8, 1024, 8, 8, 8),
+        ("gfx950", 16, 1024, 8, 8, 4),
+        ("gfx950", 32, 1024, 8, 8, 4),
+        ("gfx950", 64, 1024, 8, 8, 2),
+        ("gfx950", 128, 1024, 8, 8, 1),
+        ("gfx942", 8, 1024, 8, 8, 1),
+        ("gfx950", 8, 1023, 8, 8, 8),
+        ("gfx950", 8, 1025, 8, 8, 8),
+        ("gfx950", 1, 512, 8, 8, 8),
+        ("gfx950", 8, 512, 8, 8, 8),
+        ("gfx950", 32, 512, 8, 8, 4),
+        ("gfx950", 128, 512, 8, 8, 1),
+        ("gfx942", 8, 512, 8, 8, 1),
+        # Other windows require a budget that guarantees one tile per task.
+        ("gfx950", 8, 512, 1, 1, 1),
+        ("gfx950", 8, 512, 4, 4, 8),
+        ("gfx950", 8, 512, 8, 3, 1),
+        ("gfx950", 32, 2048, 8, 8, 1),
+        # W1024 keeps its existing split even with multiple tiles per task.
+        ("gfx950", 8, 1024, 1, 1, 8),
+        ("gfx950", 8, 1024, 4, 4, 8),
+        ("gfx950", 8, 1024, 8, 2, 8),
+    ],
+)
+def test_bf16_swa_query_split_schedule(
+    monkeypatch, arch, num_seqs, window, max_parts, capacity_per_seq, expected_splits
+):
+    """Window and budget boundaries preserve the tuned W1024 behavior."""
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
+    schedule = traits.PaDecodeSchedule.select(
+        head_dim=128,
+        value_dim=128,
+        query_group_size=16,
+        block_size=64,
+        num_seqs=num_seqs,
+        num_kv_heads=1,
+        num_compute_units=256,
+        work_capacity=num_seqs * capacity_per_seq,
+        num_partitions=max_parts,
+        query_dtype="bf16",
+        kv_dtype="bf16",
+        query_length=8,
+        trans_v=True,
+        max_context_length=8192,
+        sliding_window=window,
+    )
+    assert traits.PaDecodeTraits.create(schedule).query_splits == expected_splits
+
+
+@pytest.mark.parametrize(
+    "kv_dtype,scale_mode,window,expected_window",
+    [
+        ("fp8", "per-tensor", -1, 0),
+        ("fp8", "per-tensor", 0, 0),
+        ("fp8", "none", -1, 0),
+        ("fp8", "per-token", 128, None),
+        ("fp8", "per-tensor", -2, None),
+        ("bf16", "none", -1, 0),
+        ("bf16", "none", 0, 0),
+        *[
+            (dtype, scale, window, window)
+            for dtype, scale in (("fp8", "per-tensor"), ("bf16", "none"))
+            for window in (128, 129, 1024)
+        ],
+        *[
+            (dtype, scale, window, None)
+            for dtype, scale in (("fp8", "per-tensor"), ("bf16", "none"))
+            for window in (127, 1025)
+        ],
+    ],
+)
+def test_asymmetric_tuning_cli_window(kv_dtype, scale_mode, window, expected_window):
+    """The full-attention alias preserves the asymmetric dtype/scale contract."""
+    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
+    argv = [
+        "--head-dim",
+        "192",
+        "--value-dim",
+        "128",
+        "--query-length",
+        "8",
+        "--block-size",
+        "64",
+        "--kv-dtype",
+        kv_dtype,
+        "--scale-mode",
+        scale_mode,
+        "--sliding-window",
+        str(window),
+    ]
+    if expected_window is None:
+        with pytest.raises(SystemExit) as error:
+            tuning._parse_args(argv)
+        assert error.value.code == 2
+    else:
+        assert tuning._parse_args(argv).sliding_window == expected_window
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp8", "bf16"])
+@pytest.mark.parametrize("window", [127, 1025])
+def test_asymmetric_schedule_rejects_window(monkeypatch, kv_dtype, window):
+    """Direct scheduler calls must enforce the asymmetric window bounds."""
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
+    kwargs = {
+        "head_dim": 192,
+        "value_dim": 128,
+        "query_group_size": 16,
+        "block_size": 64,
+        "num_seqs": 1,
+        "num_kv_heads": 1,
+        "num_compute_units": 256,
+        "work_capacity": 8,
+        "num_partitions": 8,
+        "query_dtype": "bf16",
+        "kv_dtype": kv_dtype,
+        "query_length": 8,
+        "sliding_window": window,
+    }
+    with pytest.raises(ValueError, match=r"sliding window in \[128, 1024\]"):
+        traits.PaDecodeSchedule.select(**kwargs)
+
+
+@pytest.mark.parametrize("value_dim", [None, 128, 64])
+def test_gfx1250_value_width_dispatch(monkeypatch, value_dim):
+    """The gfx1250 dispatcher must not silently ignore an asymmetric width."""
+    kernel = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
+    calls = []
+
+    def compile_gfx1250(**kwargs):
+        calls.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(kernel, "compile_gfx1250_pa_decode", compile_gfx1250)
+    kwargs = {
+        "architecture": "gfx1250",
+        "head_dim": 128,
+        "value_dim": value_dim,
+        "query_group_size": 16,
+        "block_size": 64,
+        "num_seqs": 1,
+        "num_kv_heads": 1,
+        "num_compute_units": 256,
+        "work_capacity": 1,
+    }
+    if value_dim == 64:
+        with pytest.raises(NotImplementedError, match="asymmetric value width"):
+            kernel.compile_pa_decode_tile(**kwargs)
+        assert not calls
+    else:
+        assert kernel.compile_pa_decode_tile(**kwargs)["head_dim"] == 128
+        assert len(calls) == 1
+
+
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()
@@ -101,7 +260,10 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
     kv_heads, page_size = key.shape[1:3]
     group = heads // kv_heads
     queries = query.float().reshape(batch, query_length, kv_heads, group, dim)
-    output = torch.zeros_like(queries)
+    value_dim = value.shape[-1]
+    output = torch.zeros(
+        (*queries.shape[:-1], value_dim), dtype=torch.float32, device=query.device
+    )
     positions = torch.arange(query_length, device=query.device)
 
     for seq, length in enumerate(lengths.cpu().tolist()):
@@ -126,14 +288,15 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
         # Empty query rows have no attention mass, including with -inf sinks.
         probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
-    return output.reshape_as(query)
+    return output.reshape(batch * query_length, heads, value_dim)
 
 
 def _make_inputs(
     query_length,
     kv_heads,
     group_size,
-    dim,
+    head_dim,
+    value_dim,
     page_size,
     dtype,
     pattern,
@@ -153,12 +316,16 @@ def _make_inputs(
         # Block-table padding beyond the live pages must not reach the kernel.
         table = torch.nn.functional.pad(table, (0, table_width - pages_per_seq))
     query = torch.empty(
-        (batch * query_length, kv_heads * group_size, dim), dtype=dtype, device=device
+        (batch * query_length, kv_heads * group_size, head_dim),
+        dtype=dtype,
+        device=device,
     ).uniform_(-0.5, 0.5)
     key = torch.empty(
-        (num_pages, kv_heads, page_size, dim), dtype=dtype, device=device
+        (num_pages, kv_heads, page_size, head_dim), dtype=dtype, device=device
     ).uniform_(-0.5, 0.5)
-    value = torch.empty_like(key).uniform_(-0.5, 0.5)
+    value = torch.empty(
+        (num_pages, kv_heads, page_size, value_dim), dtype=dtype, device=device
+    ).uniform_(-0.5, 0.5)
 
     if pattern == "constant":
         query.zero_()
@@ -231,7 +398,71 @@ _COMMON_CASES = [
         for pattern in ("small_query", "probability_tail")
     ],
 ]
+_ASYMMETRIC_WINDOW_CASES = [
+    (
+        f"asymmetric-window-{window}",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "window": window,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "lengths": (0, 1, 7, 8, 63, 64, 65, 127, 128, 129, 257, 1027, 8192),
+        },
+    )
+    for window in (257, 1024)
+]
 _FP8_CASES = _COMMON_CASES + [
+    *_ASYMMETRIC_WINDOW_CASES,
+    (
+        "qlen8-full-d192-v128",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "scale_mode": "per-tensor",
+            "trans_v": True,
+            "lengths": (1027, 769),
+        },
+    ),
+    (
+        "qlen8-full-d192-v128-long",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "scale_mode": "per-tensor",
+            "trans_v": True,
+            "lengths": (16384,) * 8,
+        },
+    ),
+    (
+        "qlen8-w128-d192-v128",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "scale_mode": "per-tensor",
+            "trans_v": True,
+            "window": 128,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "lengths": (127, 128, 129, 257, 515),
+        },
+    ),
     (
         "packed-mtp4",
         {
@@ -271,6 +502,42 @@ _FP8_CASES = _COMMON_CASES + [
     ),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *_ASYMMETRIC_WINDOW_CASES,
+    (
+        "asymmetric-full",
+        {**_ASYMMETRIC_WINDOW_CASES[0][1], "window": 0},
+    ),
+    *[
+        (
+            f"qlen8-d128-w{window}-np{parts}",
+            {
+                "query_length": 8,
+                "group_size": 16,
+                "head_dim": 128,
+                "block_size": 64,
+                "max_partitions": parts,
+                "window": window,
+                "sink_dtype": torch.float32,
+                "capture": window == 1023,
+                "lengths": (0, 1, 127, 128, 129, 257, 515, 1027),
+            },
+        )
+        for window, parts in ((512, 4), (1023, 8), (1025, 8), (1024, 1), (1024, 4))
+    ],
+    (
+        "qlen8-w128-d192-v128",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "window": 128,
+            "sink_dtype": torch.float32,
+            "lengths": (127, 128, 129, 257, 515),
+        },
+    ),
     (
         "mtp",
         {
@@ -437,9 +704,11 @@ _INVALID_CASES = [
 ]
 
 
-def _check_output(output, reference):
+def _check_output(output, reference, tolerance=5e-3):
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(
+        output.float(), reference, atol=tolerance, rtol=tolerance
+    )
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
@@ -460,12 +729,15 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         value = torch.empty((1, 1, 4, 128, 16), dtype=query.dtype, device=query.device)
 
     def unexpected_compile(**_):
-        pytest.fail("invalid BF16 inputs reached kernel compilation")
+        pytest.fail("invalid inputs reached kernel compilation")
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
+    value_dim = query.shape[-1] if case["value_dim"] is None else case["value_dim"]
     with pytest.raises(case["error"], match=case["match"]):
         pa.pa_decode(
-            torch.empty_like(query),
+            torch.empty(
+                (*query.shape[:-1], value_dim), dtype=query.dtype, device=query.device
+            ),
             query,
             key,
             value,
@@ -534,9 +806,32 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
                 ("per-tensor", "per-token"),
                 (False, True),
             )
+            if geometry.get("value_dim") is None
+            or (dtype == torch.bfloat16 and scale_mode == "per-tensor" and trans_v)
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
         *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
+        *[
+            pytest.param(
+                {
+                    "invalid_input": "asymmetric-window",
+                    "error": NotImplementedError,
+                    "match": r"sliding window in \[128, 1024\]",
+                    "query_length": 8,
+                    "group_size": 16,
+                    "head_dim": 192,
+                    "value_dim": 128,
+                    "block_size": 64,
+                    "kv_dtype": dtype,
+                    "scale_mode": "per-tensor" if dtype == "fp8" else "none",
+                    "window": window,
+                    "lengths": (257,),
+                },
+                id=f"invalid-{dtype}-asymmetric-window-{window}",
+            )
+            for dtype in ("fp8", "bf16")
+            for window in (127, 1025)
+        ],
         *[
             pytest.param(
                 {
@@ -559,6 +854,7 @@ def test_pa_decode(case, device, monkeypatch):
             "kv_heads": 1,
             "group_size": 8,
             "head_dim": 128,
+            "value_dim": None,
             "block_size": 64,
             "max_partitions": 1,
             "window": 0,
@@ -593,7 +889,7 @@ def test_pa_decode(case, device, monkeypatch):
             and case["head_dim"] != 64
         ):
             pytest.skip("gfx1250 supports head_dim 64 or multiples of 128")
-    query_length, kv_heads, group_size, dim, page, window = (
+    query_length, kv_heads, group_size, head_dim, page, window = (
         case[name]
         for name in (
             "query_length",
@@ -604,12 +900,16 @@ def test_pa_decode(case, device, monkeypatch):
             "window",
         )
     )
+    value_dim = head_dim if case["value_dim"] is None else case["value_dim"]
+    if value_dim != head_dim and get_gfx() != "gfx950":
+        pytest.skip("asymmetric Q/K and V widths require gfx950")
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
         query_length,
         kv_heads,
         group_size,
-        dim,
+        head_dim,
+        value_dim,
         page,
         case["query_dtype"],
         case["pattern"],
@@ -645,12 +945,12 @@ def test_pa_decode(case, device, monkeypatch):
     logical_value = value.float() * (1.0 if value_scale is None else value_scale)
     pages = key.shape[0]
     key_cache = (
-        key.reshape(pages, kv_heads, page, dim // vector, vector)
+        key.reshape(pages, kv_heads, page, head_dim // vector, vector)
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
     value_cache = (
-        value.reshape(pages, kv_heads, page // vector, vector, dim)
+        value.reshape(pages, kv_heads, page // vector, vector, value_dim)
         .permute(0, 1, 2, 4, 3)
         .contiguous()
         if case["trans_v"]
@@ -678,7 +978,15 @@ def test_pa_decode(case, device, monkeypatch):
             )
         ),
     }
-    arguments = (query, key_cache, value_cache, context, table, dim**-0.5, query_length)
+    arguments = (
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        head_dim**-0.5,
+        query_length,
+    )
     plan = pa.plan_pa_decode(
         context,
         kv_heads,
@@ -700,7 +1008,12 @@ def test_pa_decode(case, device, monkeypatch):
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
 
-    output = torch.full_like(query, float("nan"))
+    output = torch.full(
+        (*query.shape[:-1], value_dim),
+        float("nan"),
+        dtype=query.dtype,
+        device=device,
+    )
     workspace = {}
     if case["capture"]:
         scalar_shape = (kv_heads, plan.capacity, query_length * group_size)
@@ -708,7 +1021,7 @@ def test_pa_decode(case, device, monkeypatch):
             "exp_sums": torch.empty(scalar_shape, dtype=torch.float32, device=device),
             "max_logits": torch.empty(scalar_shape, dtype=torch.float32, device=device),
             "temporary_output": torch.empty(
-                (*scalar_shape, dim), dtype=query.dtype, device=device
+                (*scalar_shape, value_dim), dtype=query.dtype, device=device
             ),
         }
 
@@ -726,7 +1039,10 @@ def test_pa_decode(case, device, monkeypatch):
             window,
             sinks,
         )
-        _check_output(output, reference)
+        tolerance = (
+            1e-2 if case["kv_dtype"] == "fp8" and value_dim != head_dim else 5e-3
+        )
+        _check_output(output, reference, tolerance)
 
     launch()
     check()
@@ -746,3 +1062,66 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp8", "bf16"])
+def test_asymmetric_autotune_plan(kv_dtype, device, tmp_path):
+    """Tuned and cached plans must decode with the physical V/output width."""
+    if get_gfx() != "gfx950":
+        pytest.skip("asymmetric Q/K and V widths require gfx950")
+    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    torch.manual_seed(0)
+    # B32/NP8 lets native tuning compare different work-plan capacities.
+    query, key, value, table, context = _make_inputs(
+        8, 1, 16, 192, 128, 64, torch.bfloat16, "random", device, (1027,) * 32
+    )
+    key_scale = value_scale = None
+    vector = 8
+    if kv_dtype == "fp8":
+        key, key_scale = per_tensor_quant(key, quant_dtype=torch.float8_e4m3fn)
+        value, value_scale = per_tensor_quant(value, quant_dtype=torch.float8_e4m3fn)
+        vector = 16
+    reference = _reference(
+        query,
+        key.float() * (1.0 if key_scale is None else key_scale),
+        value.float() * (1.0 if value_scale is None else value_scale),
+        table,
+        context,
+        8,
+        128,
+        None,
+    )
+    pages = key.shape[0]
+    key_cache = (
+        key.reshape(pages, 1, 64, 192 // vector, vector)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.reshape(pages, 1, 64 // vector, vector, 128)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    arguments = (query, key_cache, value_cache, context, table, 192**-0.5, 8)
+    options = {
+        "key_scale": key_scale,
+        "value_scale": value_scale,
+        "sliding_window": 128,
+        "max_context_length": 1027,
+    }
+    plan = tuning.prepare_pa_decode_plan(
+        *arguments, **options, max_partitions=8, tune=True, config_dir=tmp_path
+    )
+    assert (tmp_path / "gfx950" / "_pa_decode_autotuner.json").is_file()
+    tuning._get_pa_decode_autotuner.cache_clear()
+    assert tuning._get_pa_decode_autotuner("gfx950", tmp_path).cache
+    cached_plan = tuning.prepare_pa_decode_plan(
+        *arguments, **options, max_partitions=8, config_dir=tmp_path
+    )
+    assert cached_plan.capacity == plan.capacity
+    output = torch.empty((*query.shape[:-1], 128), dtype=query.dtype, device=device)
+    for selected_plan in (plan, cached_plan):
+        output.fill_(float("nan"))
+        pa.pa_decode(output, *arguments, **options, work_plan=selected_plan)
+        _check_output(output, reference, 1e-2 if kv_dtype == "fp8" else 5e-3)
