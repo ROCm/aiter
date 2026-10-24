@@ -868,7 +868,14 @@ def compile_gather_kv_b_proj_8w(
         # The main loop prefetches a_next1 one step behind; issue the final
         # K_ITERS - 1 tile here or c10 / c11 read stale A1 data.
         a1_g2s.load(a_next1, (K_ITERS - 1) * BLOCK_K)
-        rocdl.s_barrier()
+        # Every wave loads a slice of each LDS tile, and waves 4..7 run one
+        # barrier behind waves 0..3 (mfma.call ends in a barrier too). When
+        # N_LDS_STEPS_A >= N_LDS_STEPS_B the main loop's SAFE_VMCNT wait can
+        # leave the last K_ITERS - 1 a0 load in flight, and waves 0..3 read
+        # a_cur0 once waves 4..7 reach the plain barrier after b_next0. Drain
+        # it here (only the a_next1 load above stays in flight); otherwise
+        # waves can read LDS that waves 4..7 have not finished filling.
+        wait_barrier(N_LDS_STEPS_A)
 
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
