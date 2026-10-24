@@ -2981,6 +2981,10 @@ def _flash_attn_varlen_forward(
         ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
+        # fmha_v3_varlen_fwd has no sink argument, and the ASM launcher
+        # hardcodes has_sink=false and a null sink pointer. A learned sink
+        # or a streaming sink window must fall through to CK mha_varlen_fwd.
+        ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (
             (hdim_q == 128 and hdim_v == 128)
             or (hdim_q == 192 and hdim_v == 128)
@@ -2991,8 +2995,6 @@ def _flash_attn_varlen_forward(
                 and q.dtype == dtypes.bf16
                 and get_gfx() == "gfx950"
                 and nhead_q == nhead_k
-                and sink_size == 0
-                and sink_ptr is None
             )
         )
         ret = ret and (nhead_q % nhead_k == 0)
