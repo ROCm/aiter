@@ -17,12 +17,14 @@ Run:
 """
 
 import argparse
+import functools
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
+from aiter.bench import BenchResult, MeasureConfig, run_bench
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_hgemm
 from aiter.test_common import (
@@ -37,6 +39,11 @@ torch.set_default_device("cuda")
 # new card must not silently run an unbuilt kernel.
 SUPPORTED_GFX = ["gfx950"]
 SEED = 0
+# checkAllclose default: fraction of mismatching elements that still passes.
+TOL_ERR_RATIO = 0.05
+# Graph replay is the PR-verdict number in aiter/bench and complements
+# run_perftest's device-time mean. Warm cache matches graph-based serving.
+BENCH_MEASURE = MeasureConfig(mode="graph", cache="warm")
 
 # (m, n, k, block_m, block_n, block_k, stages, split_k, m_waves, n_waves, k_waves,
 #  group_m, hti)
@@ -130,11 +137,6 @@ def _tile_for(m, n, k, policy, split_k):
     return None
 
 
-def run_torch(a, w, dtype):
-    # Reference only: fp32 math, cast back. Not timed, not in the table.
-    return torch.mm(a.to(dtypes.fp32), w.t().to(dtypes.fp32)).to(dtype)
-
-
 def _atol_rtol(k, split_k, k_waves, dtype):
     k_scale = (k / 8192) ** 0.5 * split_k * k_waves
     if dtype is dtypes.bf16:
@@ -142,48 +144,119 @@ def _atol_rtol(k, split_k, k_waves, dtype):
     return 5e-2 * k_scale, 5e-2
 
 
+def run_torch_mm(a, b, out, *_tile, **_launch):
+    """``torch.mm`` with ``flydsl_hgemm``'s signature; tile/launch args are ignored."""
+    torch.mm(a, b.t(), out=out)
+    return out
+
+
+def run_perftest_bench(fn, *args, name=None, flops=None, nbytes=None, **kwargs):
+    """``run_perftest`` with the ``run_bench`` contract: ``(data, BenchResult)``."""
+    data, us = run_perftest(fn, *args, **kwargs)
+    result = BenchResult(
+        name=name or getattr(fn, "__name__", None),
+        backend="run_perftest",
+        metric="mean",
+        us=us,
+        mean_us=us,
+        flops=flops,
+        nbytes=nbytes,
+        tflops=flops / us / 1e6 if flops else None,
+        gb_s=nbytes / us / 1e3 if nbytes else None,
+    )
+    return data, result
+
+
+def run_candidates(candidates, _make_inputs, runners, *, reference, check):
+    """Benchmark and verify every candidate with every runner on fresh inputs.
+
+    Each runner follows the ``run_bench`` contract:
+    ``runner(fn, *inputs, name=name)`` returns ``(data, BenchResult)``, where
+    ``data`` is the output of an untimed call on ``inputs``. ``data`` is
+    verified with ``check(name, ref, data) -> (passed, err)`` against
+    ``ref = reference(*inputs)``, computed once from the first generated
+    inputs, and the verdict is recorded on the ``BenchResult``.
+
+    Returns ``(columns, results)``: table columns named
+    ``"{name} {runner_name} {column}"``, and ``{(name, runner_name): BenchResult}``.
+    """
+    ref = None
+    columns = {}
+    results = {}
+    for name, fn in candidates.items():
+        for runner_name, runner in runners.items():
+            inputs = _make_inputs()
+            if ref is None:
+                ref = reference(*inputs)
+            data, result = runner(fn, *inputs, name=name)
+            passed, result.err = check(name, ref, data)
+            result.verified = "pass" if passed else "fail"
+            results[(name, runner_name)] = result
+            prefix = f"{name} {runner_name}"
+            columns[f"{prefix} us"] = result.us
+            columns[f"{prefix} TFLOPS"] = result.tflops
+            columns[f"{prefix} TB/s"] = (
+                result.gb_s / 1e3 if result.gb_s is not None else None
+            )
+            columns[f"{prefix} err"] = result.err
+    return columns, results
+
+
 @benchmark()
 def test_hgemm(m, n, k, dtype, policy, split_k):
     tile = _tile_for(m, n, k, policy, split_k)
     assert tile is not None, f"no tuned tile for {(m, n, k, policy, split_k)}"
 
-    torch.manual_seed(SEED)
-    a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
-    w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
-    # Dirty preallocated C, as the model passes out= a buffer it owns.
-    out = torch.randn((m, n), dtype=dtype, device="cuda")
-    ref = run_torch(a, w, dtype)
-
-    def _run_flydsl():
-        return flydsl_hgemm(
+    def _make_inputs():
+        """Positional arguments of ``flydsl_hgemm``, in its parameter order."""
+        torch.manual_seed(SEED)
+        a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+        w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
+        # Dirty preallocated C, as the model passes out= a buffer it owns.
+        out = torch.randn((m, n), dtype=dtype, device="cuda")
+        bias = None
+        return (
             a,
             w,
-            out=out,
-            block_m=tile["block_m"],
-            block_n=tile["block_n"],
-            block_k=tile["block_k"],
-            stages=tile["stages"],
-            split_k=tile["split_k"],
-            m_waves=tile["m_waves"],
-            n_waves=tile["n_waves"],
-            k_waves=tile["k_waves"],
-            group_m=tile["group_m"],
-            policy=policy,
+            out,
+            bias,
+            tile["block_m"],
+            tile["block_n"],
+            tile["block_k"],
+            tile["stages"],
+            tile["split_k"],
+            tile["m_waves"],
+            tile["n_waves"],
+            tile["k_waves"],
+            tile["group_m"],
+            policy,
         )
 
-    out_mm = torch.empty_like(out)
+    candidates = {"flydsl": flydsl_hgemm, "torch_mm": run_torch_mm}
 
-    def _run_torch_mm():
-        torch.mm(a, w.t(), out=out_mm)
-        return out_mm
-
-    candidates = {"flydsl": _run_flydsl, "torch_mm": _run_torch_mm}
-
+    elem_size = torch.tensor([], dtype=dtype).element_size()
     flops = 2 * m * n * k
-    nbytes = (
-        m * k * a.element_size() + n * k * w.element_size() + m * n * out.element_size()
-    )
+    nbytes = (m * k + n * k + m * n) * elem_size
     atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtype)
+
+    def _check(name, ref, y):
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            y.to(dtypes.fp32),
+            rtol=rtol,
+            atol=atol,
+            tol_err_ratio=TOL_ERR_RATIO,
+            msg=f"{name}: flydsl hgemm",
+        )
+        return err <= TOL_ERR_RATIO, err
+
+    runners = {
+        "perftest": functools.partial(run_perftest_bench, flops=flops, nbytes=nbytes),
+        "bench": functools.partial(
+            run_bench, measure=BENCH_MEASURE, flops=flops, nbytes=nbytes
+        ),
+    }
+
     ret = {
         "gfx": get_gfx(),
         "tile": (
@@ -192,20 +265,14 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
         ),
         "waves": f"{tile['m_waves']}x{tile['n_waves']}x{tile['k_waves']}",
     }
-    for name, fn in candidates.items():
-        # Not `out`: `_run_flydsl` closes over the preallocated buffer.
-        y, us = run_perftest(fn)
-        err = checkAllclose(
-            ref.to(dtypes.fp32),
-            y.to(dtypes.fp32),
-            rtol=rtol,
-            atol=atol,
-            msg=f"{name}: flydsl hgemm",
-        )
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = err
+    columns, _results = run_candidates(
+        candidates,
+        _make_inputs,
+        runners,
+        reference=run_torch_mm,
+        check=_check,
+    )
+    ret.update(columns)
     return ret
 
 
