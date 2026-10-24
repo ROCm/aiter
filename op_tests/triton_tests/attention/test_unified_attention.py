@@ -3,6 +3,7 @@
 
 
 import random
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -1023,23 +1024,36 @@ def _spec_verify_seq_lens(batch: int, max_query_len: int, seed: int):
     ]
 
 
+@pytest.mark.parametrize(
+    "path, sliding_window", [("3d", None), ("2d", None), ("2d", 256), ("auto", None)]
+)
 @pytest.mark.parametrize("batch, seed", [(7, 0), (31, 1), (61, 2), (128, 3)])
 @pytest.mark.parametrize("max_query_len", [4, 8])
 @pytest.mark.parametrize("num_heads", [(16, 2), (16, 4), (16, 8), (16, 16)])
 @pytest.mark.parametrize("head_size", [128, 256])
 @torch.inference_mode()
-def test_unified_attn_3d_spec_verify_gfx1250(
+def test_unified_attn_spec_verify_gfx1250(
+    path: str,
+    sliding_window: int | None,
     batch: int,
     seed: int,
     max_query_len: int,
     num_heads: tuple[int, int],
     head_size: int,
+    monkeypatch,
 ) -> None:
-    """Short multi-token queries (speculative-decode verify) take the gfx1250 3D
-    split-KV kernel. Query rows of one block then have different causal horizons,
-    so a split segment can be partly or wholly past a row's horizon."""
+    """Short multi-token queries (speculative-decode verify) on gfx1250: the 3D
+    split-KV kernel, where query rows of one block have different causal horizons
+    so a split segment can be partly or wholly past a row's horizon, and the 2D
+    kernel with a BLOCK_M sized to the query rows."""
     if DEVICE_ARCH != "gfx1250":
-        pytest.skip("gfx1250 Gluon 3D kernel")
+        pytest.skip("gfx1250 Gluon kernels")
+    if path != "auto":
+        monkeypatch.setattr(
+            sys.modules[unified_attention.__module__],
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
     torch.manual_seed(seed)
     seq_lens = _spec_verify_seq_lens(batch, max_query_len, seed)
     block_size = 16
@@ -1065,6 +1079,7 @@ def test_unified_attn_3d_spec_verify_gfx1250(
         block_size=block_size,
         head_size=head_size,
         num_heads=num_heads,
+        sliding_window=sliding_window,
         shuffled_kv_cache=True,
         device="cuda",
     )
@@ -1097,7 +1112,7 @@ def test_unified_attn_3d_spec_verify_gfx1250(
         block_tables=block_tables,
         scale=scale,
         out_dtype=torch.bfloat16,
-        sliding_window=None,
+        sliding_window=sliding_window,
         soft_cap=None,
         sinks=None,
     )
