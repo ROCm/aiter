@@ -3292,6 +3292,9 @@ def test_heterogeneous_moe_rejects_invalid_shared_contract(
         else:
             kwargs["shared_w1_scale"] = weights.shared_s1[:-1].contiguous()
 
+    # A rejected call still consumes a registered presort, so it cannot apply to
+    # a later call on reused routing buffers.
+    aiter.fused_moe.register_presorted_moe({"topk_ids_ptr": all_ids.data_ptr()})
     with pytest.raises(ValueError, match=message):
         fused_moe(
             hidden,
@@ -3301,6 +3304,7 @@ def test_heterogeneous_moe_rejects_invalid_shared_contract(
             all_ids,
             **kwargs,
         )
+    assert aiter.fused_moe._pop_presorted_moe() is None, "presort survived the error"
 
 
 def test_a4w4_routed_fp8_shared_heterogeneous_path(
