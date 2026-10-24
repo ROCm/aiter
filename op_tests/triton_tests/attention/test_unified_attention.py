@@ -547,6 +547,84 @@ def test_triton_unified_attn_3d(
     )
 
 
+@torch.inference_mode()
+def test_unified_attention_zero_kv_decode_rows() -> None:
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("zero-KV padding regression covers the gfx1250 Gluon path")
+
+    seq_lens = [(1, 2048), (1, 0), (1, 0), (1, 0)]
+    query_lens = [query_len for query_len, _ in seq_lens]
+    (
+        query,
+        key_cache,
+        value_cache,
+        shuffled_key_cache,
+        shuffled_value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=128,
+        block_size=64,
+        head_size=64,
+        num_heads=(8, 1),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=shuffled_key_cache,
+        v=shuffled_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+        shuffled_kv_cache=True,
+        backend="gluon",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output[1:]) == 0
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
