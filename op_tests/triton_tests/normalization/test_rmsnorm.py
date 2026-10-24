@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import aiter
+from aiter.jit.core import get_gfx
 from aiter.ops.triton.normalization.rmsnorm import (
     _should_use_large_m_small_n,
     rms_norm,
@@ -51,13 +52,15 @@ def run_torch(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=Non
     return output_q, residual_out, y_scale, output
 
 
-def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
+def run_triton(
+    input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None, backend=None
+):
     # out_before_quant = None
     if y_scale_dtype is None:
         y_scale = None
         if residual is None:
             residual_out = None
-            output = rms_norm(input, weight, eps)
+            output = rms_norm(input, weight, eps, backend)
         else:
             residual_out = torch.empty_like(input)
             output = torch.empty_like(input)
@@ -138,11 +141,15 @@ def get_vals():
     "M, N",
     [(shape) for shape in get_vals()],
 )
-def test_rmsnorm(M, N, in_dtype_str):
+@pytest.mark.parametrize("backend", [None, "triton", "gluon"])
+def test_rmsnorm(M, N, in_dtype_str, backend):
 
     in_dtype = str_to_torch_dtype[in_dtype_str]
     out_dtype = in_dtype
     torch.manual_seed(0)
+
+    if backend == "gluon" and get_gfx() != "gfx1250":
+        pytest.skip("gluon rmsnorm requires gfx1250 hardware")
 
     x, weight = generate_rmsnorm_inputs(M, N, in_dtype)
 
@@ -152,7 +159,7 @@ def test_rmsnorm(M, N, in_dtype_str):
 
     # forward pass
     y_torch, *_ = run_torch(x, weight, 1e-5)
-    y_triton, *_ = run_triton(x, weight, 1e-5)
+    y_triton, *_ = run_triton(x, weight, 1e-5, backend=backend)
 
     # backward pass (triton)
     y_triton.backward(dy, retain_graph=True)
@@ -397,12 +404,12 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
     B_T = B * T
     # Use integers to ensure consistent results across layouts,
     # avoiding discrepancies in floating-point reductions with varying data layouts
-    x = torch.floor(
-        torch.empty((B_T, D), device="cuda", dtype=torch.float32).uniform_(-3, 3)
-    ).to(dtype)
-    w = torch.floor(
-        torch.empty((D,), device="cuda", dtype=torch.float32).uniform_(-3, 3)
-    ).to(dtype)
+    x = torch.floor(torch.distributions.Uniform(-3, 3).sample((B_T, D))).to(
+        dtype=dtype, device="cuda"
+    )
+    w = torch.floor(torch.distributions.Uniform(-3, 3).sample((D,))).to(
+        dtype=dtype, device="cuda"
+    )
 
     EPS = 1e-6
     quant_dtype = torch.float8_e4m3fnuz
