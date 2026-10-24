@@ -1092,8 +1092,11 @@ def reduce_segments(
                 segm_max_ptr + segm_base + segs, mask=segm_mask, other=float("-inf")
             )
             new_max = tl.maximum(overall_max, tl.max(segm_max))
-            alpha = tl.math.exp2(overall_max - new_max)
-            weight = tl.math.exp2(segm_max - new_max)
+            # a chunk of empty segments leaves new_max at -inf: rescale from 0 so
+            # alpha and weight are 0, not exp2(-inf - -inf) = NaN
+            safe_max = tl.where(new_max > float("-inf"), new_max, 0.0)
+            alpha = tl.math.exp2(overall_max - safe_max)
+            weight = tl.math.exp2(segm_max - safe_max)
             segm_expsum = tl.load(
                 segm_expsum_ptr + segm_base + segs, mask=segm_mask, other=0.0
             )
