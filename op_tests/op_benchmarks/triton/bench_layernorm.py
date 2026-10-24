@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton
 
@@ -11,13 +13,55 @@ from aiter.ops.triton.normalization.norm import (
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     print_vgpr,
 )
+
+
+def generate_layernorm_inputs(M, N, dtype, add_residual):
+    x = torch.randn(M, N, device="cuda", dtype=dtype)
+    weight = torch.rand(N, device="cuda", dtype=dtype)
+    bias = torch.rand(N, device="cuda", dtype=dtype)
+    res_in = torch.randn(M, N, device="cuda", dtype=dtype) if add_residual else None
+    return x, weight, bias, res_in
+
+
+def _generate_layernorm_backward_inputs(M, N, dtype, add_residual):
+    eps = 1e-5
+    x, weight, bias, res_in = generate_layernorm_inputs(M, N, dtype, add_residual)
+    x.requires_grad_(True)
+    weight.requires_grad_(True)
+    bias.requires_grad_(True)
+    if add_residual:
+        out = torch.empty_like(x)
+        res_out = torch.empty_like(x)
+        y = layernorm2d_fwd_with_add(out, x, res_in, res_out, weight, bias, eps)
+    else:
+        y = layer_norm(x, weight, bias, eps)
+    dy = torch.randn_like(y)
+    return x, weight, bias, dy, y
+
+
+def _generate_layernorm_forward_inputs(M, N, dtype, add_residual, quant):
+    x, weight, bias, res_in = generate_layernorm_inputs(M, N, dtype, add_residual)
+    res_out = torch.empty_like(x) if add_residual else None
+    out = out_i8 = yscale = xscale = None
+    if quant == "none":
+        if add_residual:
+            out = torch.empty_like(x)
+    else:
+        out_i8 = torch.empty((M, N), dtype=torch.int8, device="cuda")
+        yscale = torch.empty((M, 1), dtype=torch.float32, device="cuda")
+        xscale = torch.rand(N, device="cuda", dtype=torch.float32)
+    return x, weight, bias, res_in, res_out, out, out_i8, yscale, xscale
 
 
 def get_x_vals():
@@ -86,31 +130,27 @@ def run_benchmark(args):
     add_residual = args.add_residual
     do_backward = args.backward
     c_dtype = str_to_torch_dtype[args.dtype]
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     @triton.testing.perf_report([benchmark])
     def bench_layernorm(M, N, metric, **kwargs):
-        torch.manual_seed(0)
-        x = torch.randn(M, N, device="cuda", dtype=c_dtype)
-        weight = torch.rand(N, device="cuda", dtype=c_dtype)
-        bias = torch.rand(N, device="cuda", dtype=c_dtype)
         eps = 1e-5
-        es = x.element_size()
 
         if do_backward:
-            # build y once, time backward only
-            x = x.requires_grad_(True)
-            weight = weight.requires_grad_(True)
-            bias = bias.requires_grad_(True)
-            if add_residual:
-                out = torch.empty_like(x)
-                res_in = torch.randn(M, N, device="cuda", dtype=c_dtype)
-                res_out = torch.empty_like(x)
-                y = layernorm2d_fwd_with_add(out, x, res_in, res_out, weight, bias, eps)
-            else:
-                y = layer_norm(x, weight, bias, eps)
-            dy = torch.randn_like(y)
+            # backward() builds its autograd graph on the default stream; let CUDA
+            # graph capture (on its own side stream) adopt that stale reference.
+            torch.autograd.graph.set_override_stale_capture_stream(True)
+            _p_gen = functools.partial(
+                _generate_layernorm_backward_inputs, M, N, c_dtype, add_residual
+            )
+            _out_val_keys = ["x", "weight", "bias", "dy", "y"]
+            rot_bufs = generate_rotating_buffers_pool(
+                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+            )
+            es = rot_bufs[0]["x"].element_size()
 
-            def fn():
+            def _run(x, weight, bias, dy, y):
                 x.grad, weight.grad, bias.grad = None, None, None
                 y.backward(dy, retain_graph=True)
 
@@ -119,41 +159,81 @@ def run_benchmark(args):
             mem_write = M * N * es + 2 * N * es
             mem = mem_read + mem_write
             flops = 12 * M * N
+
+            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
         else:
-            res_in = res_out = None
-            if add_residual:
-                res_in = torch.randn(M, N, device="cuda", dtype=c_dtype)
-                res_out = torch.empty_like(x)
+            _p_gen = functools.partial(
+                _generate_layernorm_forward_inputs, M, N, c_dtype, add_residual, quant
+            )
+            _out_val_keys = [
+                "x",
+                "weight",
+                "bias",
+                "res_in",
+                "res_out",
+                "out",
+                "out_i8",
+                "yscale",
+                "xscale",
+            ]
+            rot_bufs = generate_rotating_buffers_pool(
+                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+            )
+            es = rot_bufs[0]["x"].element_size()
 
             if quant == "none":
                 if add_residual:
-                    out = torch.empty_like(x)
-                    fn = lambda: layernorm2d_fwd_with_add(
-                        out, x, res_in, res_out, weight, bias, eps
-                    )
+
+                    def _run(x, weight, bias, res_in, res_out, out, **_):
+                        layernorm2d_fwd_with_add(
+                            out, x, res_in, res_out, weight, bias, eps
+                        )
+
                 else:
-                    fn = lambda: layer_norm(x, weight, bias, eps)
+
+                    def _run(x, weight, bias, **_):
+                        layer_norm(x, weight, bias, eps)
+
                 out_bytes = M * N * es + 2 * M * 4  # y + mean/rstd
             else:
-                out_i8 = torch.empty((M, N), dtype=torch.int8, device="cuda")
-                yscale = torch.empty((M, 1), dtype=torch.float32, device="cuda")
-                xscale = torch.rand(N, device="cuda", dtype=torch.float32)
                 if quant == "smooth" and add_residual:
-                    fn = lambda: layernorm2d_fwd_with_add_smoothquant(
-                        out_i8, x, res_in, res_out, xscale, yscale, weight, bias, eps
-                    )
+
+                    def _run(
+                        x, weight, bias, res_in, res_out, out_i8, yscale, xscale, **_
+                    ):
+                        layernorm2d_fwd_with_add_smoothquant(
+                            out_i8,
+                            x,
+                            res_in,
+                            res_out,
+                            xscale,
+                            yscale,
+                            weight,
+                            bias,
+                            eps,
+                        )
+
                 elif quant == "smooth":
-                    fn = lambda: layernorm2d_fwd_with_smoothquant(
-                        out_i8, x, xscale, yscale, weight, bias, eps
-                    )
+
+                    def _run(x, weight, bias, out_i8, yscale, xscale, **_):
+                        layernorm2d_fwd_with_smoothquant(
+                            out_i8, x, xscale, yscale, weight, bias, eps
+                        )
+
                 elif add_residual:
-                    fn = lambda: layernorm2d_fwd_with_add_dynamicquant(
-                        out_i8, x, res_in, res_out, yscale, weight, bias, eps
-                    )
+
+                    def _run(x, weight, bias, res_in, res_out, out_i8, yscale, **_):
+                        layernorm2d_fwd_with_add_dynamicquant(
+                            out_i8, x, res_in, res_out, yscale, weight, bias, eps
+                        )
+
                 else:
-                    fn = lambda: layernorm2d_fwd_with_dynamicquant(
-                        out_i8, x, yscale, weight, bias, eps
-                    )
+
+                    def _run(x, weight, bias, out_i8, yscale, **_):
+                        layernorm2d_fwd_with_dynamicquant(
+                            out_i8, x, yscale, weight, bias, eps
+                        )
+
                 out_bytes = M * N + M * 4  # int8 out + per-row scale
 
             mem_read = M * N * es + 2 * N * es
@@ -171,7 +251,7 @@ def run_benchmark(args):
             if quant != "none":
                 flops += 2 * M * N
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
 
         if metric == "time":
             return ms

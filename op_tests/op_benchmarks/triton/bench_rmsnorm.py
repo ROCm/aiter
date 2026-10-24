@@ -1,3 +1,4 @@
+import functools
 import math
 
 import torch
@@ -6,10 +7,14 @@ import triton
 from aiter.ops.triton.normalization.rmsnorm import rms_norm
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_rms_mxfp4_quant
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
@@ -17,6 +22,21 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.triton_tests.normalization.test_rmsnorm import (
     generate_rmsnorm_inputs,
 )
+
+
+def _generate_rmsnorm_mxfp4_inputs(M, N, dtype, add_residual):
+    x, w = generate_rmsnorm_inputs(M, N, dtype)
+    res = torch.randn_like(x) if add_residual else None
+    return x, w, res
+
+
+def _generate_rmsnorm_backward_inputs(M, N, dtype, eps):
+    x, w = generate_rmsnorm_inputs(M, N, dtype)
+    x.requires_grad_(True)
+    w.requires_grad_(True)
+    y = rms_norm(x, w, eps)
+    dy = torch.randn_like(y)
+    return x, w, y, dy
 
 
 def model_benchmark_shapes(args):
@@ -100,35 +120,54 @@ def run_benchmark(args):
     do_backward = args.backward
     if do_backward and quant != "none":
         raise ValueError("--backward cannot be combined with --quant")
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     @triton.testing.perf_report([benchmark])
     def bench_rmsnorm(M, N, metric, model_name=None, **kwargs):
         c_dtype = torch.bfloat16
-        x, w = generate_rmsnorm_inputs(M, N, c_dtype)
         eps = 1e-6
 
         if quant == "mxfp4":
             # Fused RMSNorm (+ optional residual add) + MXFP4 quant epilogue.
             assert N % 2 == 0, "fused mxfp4 quant requires an even N (two fp4 -> uint8)"
-            res = torch.randn_like(x) if add_residual else None
-            fn = lambda: fused_rms_mxfp4_quant(x, w, eps, res1=res)
+            _p_gen = functools.partial(
+                _generate_rmsnorm_mxfp4_inputs, M, N, c_dtype, add_residual
+            )
+            _out_val_keys = ["x", "w", "res"]
+            rot_bufs = generate_rotating_buffers_pool(
+                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+            )
+            es = rot_bufs[0]["x"].element_size()
+
+            def _run(x, w, res):
+                fused_rms_mxfp4_quant(x, w, eps, res1=res)
+
             # Bytes moved: read x (+ residual), write packed fp4 (N/2 bytes/row)
             # + e8m0 block scales (cdiv(N,32) bytes/row) (+ residual passthrough).
             mxfp4_block = 32
-            mem_read = (M * 1) * N * x.element_size() * (2 if add_residual else 1)
+            mem_read = (M * 1) * N * es * (2 if add_residual else 1)
             mem_write = M * (N // 2) + M * triton.cdiv(N, mxfp4_block)
             if add_residual:
-                mem_write += M * N * x.element_size()
+                mem_write += M * N * es
             mem = mem_read + mem_write
             flops = 4 * M * N  # dominated by the norm; quant is elementwise
-        elif do_backward:
-            # Backward only: build y once, reuse the retained graph each trial.
-            x.requires_grad_(True)
-            w.requires_grad_(True)
-            y = rms_norm(x, w, eps)
-            dy = torch.randn_like(y)
 
-            def fn():
+            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
+        elif do_backward:
+            # backward() builds its autograd graph on the default stream; let CUDA
+            # graph capture (on its own side stream) adopt that stale reference.
+            torch.autograd.graph.set_override_stale_capture_stream(True)
+            _p_gen = functools.partial(
+                _generate_rmsnorm_backward_inputs, M, N, c_dtype, eps
+            )
+            _out_val_keys = ["x", "w", "y", "dy"]
+            rot_bufs = generate_rotating_buffers_pool(
+                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+            )
+            es = rot_bufs[0]["x"].element_size()
+
+            def _run(x, w, y, dy):
                 x.grad, w.grad = None, None
                 y.backward(dy, retain_graph=True)
 
@@ -138,9 +177,9 @@ def run_benchmark(args):
             num_sms = min(M, torch.cuda.get_device_properties(0).multi_processor_count)
             use_large_m = M > 8192 and N <= 1024
             # x, dy: input dtype; rsigma: fp32 (4 bytes)
-            mem_read = (2 * M * N) * x.element_size() + M * 4 + N * x.element_size()
+            mem_read = (2 * M * N) * es + M * 4 + N * es
             # dx: input dtype; dg: input dtype
-            mem_write = (M * N + N) * x.element_size()
+            mem_write = (M * N + N) * es
             if use_large_m:
                 # dg_tmp: written by bwd kernel, read by reduction (fp32)
                 mem_read += num_prgms_large * N * 4
@@ -151,15 +190,26 @@ def run_benchmark(args):
                 mem_write += num_sms * N * 4
             mem = mem_read + mem_write
             flops = 8 * M * N
+
+            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
         else:
-            fn = lambda: rms_norm(x, w, eps)
+            _p_gen = functools.partial(generate_rmsnorm_inputs, M, N, c_dtype)
+            _out_val_keys = ["x", "w"]
+            rot_bufs = generate_rotating_buffers_pool(
+                [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+            )
+            es = rot_bufs[0]["x"].element_size()
+
+            def _run(x, w):
+                rms_norm(x, w, eps)
+
             # memory transfer
-            mem_read = (M * 1) * N * x.element_size()  # x is (M,N) and g/weight is (N)
-            mem_write = M * N * x.element_size()  # output
+            mem_read = (M * 1) * N * es  # x is (M,N) and g/weight is (N)
+            mem_write = M * N * es  # output
             mem = mem_read + mem_write
             flops = 4 * M * N
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+            ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
