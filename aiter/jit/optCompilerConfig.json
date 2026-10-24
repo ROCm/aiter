@@ -290,7 +290,8 @@
         ],
         "flags_extra_hip": [
             "'-mllvm -greedy-reverse-local-assignment=1'",
-            "'-mllvm -enable-noalias-to-md-conversion=1'"
+            "'-mllvm -enable-noalias-to-md-conversion=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 5)}'"
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
     },
@@ -320,7 +321,8 @@
         ],
         "flags_extra_hip": [
             "'-mllvm -greedy-reverse-local-assignment=1'",
-            "'-mllvm -enable-noalias-to-md-conversion=1'"
+            "'-mllvm -enable-noalias-to-md-conversion=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 5)}'"
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE}'"
     },
@@ -413,7 +415,9 @@
             "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_cktile.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 5)}'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/include'",
@@ -987,7 +991,8 @@
         ],
         "flags_extra_hip": [
             "'-mllvm -greedy-reverse-local-assignment=1'",
-            "'-mllvm -enable-noalias-to-md-conversion=1'"
+            "'-mllvm -enable-noalias-to-md-conversion=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 5)}'"
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune'"
     },
@@ -1011,7 +1016,8 @@
         ],
         "flags_extra_hip": [
             "'-mllvm -greedy-reverse-local-assignment=1'",
-            "'-mllvm -enable-noalias-to-md-conversion=1'"
+            "'-mllvm -enable-noalias-to-md-conversion=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 5)}'"
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune'"
     },
@@ -1049,7 +1055,9 @@
             "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_cktile_tune.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 5)}'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/include'",
