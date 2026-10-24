@@ -282,12 +282,18 @@ def test_gfx942_gluon_fp16_operand_matches_bf16(m, n, k, n_expts_tot, n_expts_ac
             x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None,
             torch.bfloat16, False, backend="gluon",
         )
-    # same exact products and f32 accumulation (the bf16 path is checked against the exact reference above); the
+    # same exact products and f32 accumulation (the bf16 path is checked against the reference by test_op); the
     # only operand difference is activations below 2^-17, which fp16 rounds: last-bit output differences at most
     atol = 2.0**-20 * ys["0"].abs().max().item()
     torch.testing.assert_close(ys["1"], ys["0"], rtol=2.0**-7, atol=atol)
     assert (ys["1"] == ys["0"]).float().mean().item() > 0.99
     assert (ys["1"][:, -32:] == 0).all()
+    # |x| > 65504 saturates in the fp16 convert instead of producing inf
+    x[: m // 2, ::7] = 1.0e5
+    y_big = moe_gemm_a16w4(
+        x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False, backend="gluon"
+    )
+    assert torch.isfinite(y_big).all()
 
 
 def test_gfx942_gluon_fp16_operand_scale_check(monkeypatch):
@@ -304,6 +310,52 @@ def test_gfx942_gluon_fp16_operand_scale_check(monkeypatch):
         assert moe_mod._gfx942_fp16_operand(s.transpose(1, 2)) is ok, (lo, hi)
         assert moe_mod._gfx942_fp16_operand(s.transpose(1, 2)) is ok, (lo, hi)  # cached
         del s
+
+
+def test_gfx942_gluon_fp16_operand_graph_capture(monkeypatch):
+    """vLLM order: a large-M eager call (the profile run, block_m > 32) primes the scale check, then a decode-size
+    call is captured with no eager warmup at that size. The captured call must take the fp16 path from the cache
+    (no host sync under capture) and replay must match eager."""
+    if arch_info.get_arch() != "gfx942":
+        pytest.skip("gfx942 Gluon a16w4 kernel only")
+    import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_mod
+
+    monkeypatch.setattr(moe_mod, "_GFX942_FP16", "auto")
+    real, seen = moe_mod._gfx942_fp16_operand, []
+
+    def spy(scales):
+        r = real(scales)
+        seen.append((torch.cuda.is_current_stream_capturing(), r))
+        return r
+
+    monkeypatch.setattr(moe_mod, "_gfx942_fp16_operand", spy)
+    device = "cuda"
+    torch.manual_seed(0)
+    n, k, n_expts_tot, n_expts_act = 1536, 5120, 384, 6
+    w_packed = torch.randint(0, 256, (n_expts_tot, n, k // 2), dtype=torch.uint8, device=device)
+    w_scale = torch.randint(118, 129, (n_expts_tot, n, k // 32), dtype=torch.uint8, device=device)
+    w_tri, s_tri = w_packed.transpose(1, 2), w_scale.transpose(1, 2)
+
+    def make_call(m):
+        m, rdata, gindx, _ = init_routing_data(m, n_expts_tot, n_expts_act, True, False, device=device)
+        x = (torch.randn((m, k), device=device) * 0.1).to(torch.bfloat16)
+        return lambda: moe_gemm_a16w4(
+            x, w_tri, None, s_tri, None, None, None, rdata, gindx, None, None, None, torch.bfloat16, False, backend="gluon"
+        )
+
+    decode = make_call(192)
+    y_eager = decode()  # compile outside capture
+    monkeypatch.setattr(moe_mod, "_gfx942_fp16_scales_ok", {})
+    make_call(8192)()  # profile-run size
+    seen.clear()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        y_graph = decode()
+    g.replay()
+    torch.cuda.synchronize()
+    assert seen == [(True, True)], seen
+    assert torch.equal(y_graph, y_eager)
 
 
 def _ep_setup(

@@ -674,6 +674,9 @@ def moe_gemm_a16w4(
 
     # launch kernel
     if backend == "gluon" and get_arch() == "gfx942":
+        # scale check on every call (not only at block_m <= 32), so the large-M profile run fills the cache before
+        # graph capture; a first check inside capture would fall back to bf16 for the captured decode graphs
+        fp16_operand = _gfx942_fp16_operand(w_scales) and config["block_m"] <= 32
         load_x, load_w, load_s, mfma_layout = _gfx942_layouts_cached(
             config["block_m"], config["block_n"], config["block_k"], config["num_warps"]
         )
@@ -726,7 +729,7 @@ def moe_gemm_a16w4(
             LOAD_S=load_s,
             MFMA_LAYOUT=mfma_layout,
             UPCAST_INDICES=should_upcast_indices(x, w, y),
-            FP16_OPERAND=config["block_m"] <= 32 and _gfx942_fp16_operand(w_scales),
+            FP16_OPERAND=fp16_operand,
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
             waves_per_eu=config["waves_per_eu"],
