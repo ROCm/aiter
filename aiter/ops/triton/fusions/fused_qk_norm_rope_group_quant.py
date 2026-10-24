@@ -54,8 +54,11 @@ def fused_qk_norm_rope_group_quant(
         cos, sin: [max_pos, 32] contiguous bf16.
         eps: RMSNorm epsilon.
         swa_nope, swa_rope: contiguous SWA cache, [rows, 512] fp8 and [rows, 64] bf16.
-        swa_dest_rows: [T] int32 SWA row of each token. A negative row skips the write.
-        batch_ids: [T] int32. A negative batch id skips the SWA write.
+        swa_dest_rows: [>=T] int32 SWA row of each token. A negative row or a row
+            that is not less than ``rows`` skips the write.
+        batch_ids: [>=T] int32. A negative batch id skips the SWA write.
+
+    A negative position also skips the SWA write.
 
     Returns:
         q_nope [T, H, 512] fp8, q_rope [T, H, 64] bf16, k_nope [T, 512] fp8 and
@@ -71,6 +74,8 @@ def fused_qk_norm_rope_group_quant(
     assert q.is_contiguous() and swa_nope.is_contiguous() and swa_rope.is_contiguous()
     assert kv.stride(1) == 1 and kv.stride(0) * kv.element_size() % 16 == 0
     assert q.data_ptr() % 16 == 0 and kv.data_ptr() % 16 == 0
+    assert swa_rope.shape[0] == swa_nope.shape[0]
+    assert swa_dest_rows.shape[0] >= num_tokens and batch_ids.shape[0] >= num_tokens
 
     q_nope = torch.empty(
         (num_tokens, num_heads, head_dim), dtype=e4m3_dtype, device=q.device
@@ -101,6 +106,7 @@ def fused_qk_norm_rope_group_quant(
         batch_ids,
         swa_nope,
         swa_rope,
+        swa_nope.shape[0],
         EPS=eps,
         NUM_HEADS=num_heads,
         **config,
