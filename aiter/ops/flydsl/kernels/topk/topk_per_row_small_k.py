@@ -51,8 +51,9 @@ from flydsl.expr import (
 )
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
+from flydsl.runtime.device import get_rocm_arch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.act import sigmoid_batch, sigmoid_f32
 from aiter.ops.flydsl.kernels.kernels_common import (
     atomic_add_i32,
@@ -113,7 +114,6 @@ _LOCAL_PIN = 1e29
 _INT32_MIN = -2147483648
 
 
-@cache
 def lds_limit() -> int:
     """LDS one workgroup may claim on this device.
 
@@ -122,11 +122,12 @@ def lds_limit() -> int:
     -- so `serves` promised the router a k=16 selector over a 32768-wide row
     that then failed to load with `local memory (69696) exceeds limit (65536)`.
 
-    `get_gfx_runtime`, not `get_gfx`: the latter honours `GPU_ARCHS`, while
-    FlyDSL compiles for the live device either way, so the build target and this
-    budget would answer for different cards.
+    `get_rocm_arch`, not `get_gfx` or `get_gfx_runtime`. `get_gfx` honours
+    `GPU_ARCHS`, and `get_gfx_runtime` ignores `FLYDSL_GPU_ARCH`, so either can
+    answer for a different card than the one FlyDSL compiles this kernel for.
+    Read on every call: one AOT process compiles every arch.
     """
-    return get_lds_capacity_bytes(get_gfx_runtime())
+    return get_lds_capacity_bytes(get_rocm_arch())
 
 
 def topk_per_row_small_k_shape(

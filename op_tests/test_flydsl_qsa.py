@@ -1,0 +1,3945 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""QSA oracle, FlyDSL indexer, and paged GQA.
+
+Two layers:
+  * Correctness (pytest): ``test_*`` unit cases. CI runs pytest on this
+    file, then this script for the sweep. ``main`` only sweeps.
+  * Perf sweep (``__main__``): ``bench_qsa_flash_next_indexer`` (decode ``M<=8``
+    and a separate prefill table; HIP-graph select column for FlyDSL when
+    the table is wider than 20000 columns and ``M<=64``),
+    ``bench_qsa_gluon_parity_indexer`` (H=8 emit; long-``L`` is H=8; the published
+    page-size-8 point stays H=4),
+    ``bench_qsa_flash_next_paged_gqa`` (decode ``M<=8`` and a separate prefill table),
+    ``bench_qsa_flash_next_e2e`` / ``bench_qsa_gluon_parity_e2e`` (indexer through
+    GQA; Gluon-parity keeps both head counts),
+    ``bench_qsa_flash_next_e2e_graph`` (HIP graph replay at decode).
+
+Usage::
+
+    pytest -q op_tests/test_flydsl_qsa.py
+    HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py
+    HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --rotate 0 1
+    HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --pad-pages 4096
+    HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py --cache-layout wide
+
+Perf rows default to cold weights (``--rotate 0``); pass ``--rotate 1`` to
+reproduce the older hot-cache 1047 tables. ``--pad-pages 0`` (the default)
+keeps each indexer block table packed to the context. A positive width zero-fills
+it out to that many pages, which is how vLLM sizes the table for
+``max_model_len``. ``--cache-layout packed`` (the default) keeps each cache
+contiguous. ``wide`` is vLLM's per-layer view: the same pages, with a page
+stride that puts the byte span just past 4 GiB, which is the compile the
+indexer and paged GQA use for a serving KV pool.
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import math
+import os
+import sys
+
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import qsa_paged
+from aiter.ops.flydsl.kernels.qsa.sparse_gqa import (
+    _launch_config,
+    _merge_slice,
+    build_qsa_sparse_gqa_module,
+)
+from aiter.ops.flydsl.qsa_paged import (
+    _expand_block_ids,
+    flydsl_qsa_paged_gqa,
+    flydsl_qsa_paged_gqa_supported,
+    qsa_indexer_block_ids,
+    qsa_layer,
+    span_bytes,
+)
+from aiter.ops.qsa import qsa_expand_block_indices
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from op_tests.qsa_ref import (
+    FLASH_NEXT_GQA,
+    FLASH_NEXT_INDEXER,
+    FLASH_NEXT_SCORE_SCALE,
+    GLUON_PARITY_GQA,
+    GLUON_PARITY_INDEXER,
+    GLUON_PARITY_INDEXER_H8,
+    gather_paged_cache,
+    pack_paged_cache,
+    qsa_expand_tail,
+    qsa_indexer_scores,
+    qsa_oracle,
+    qsa_topk_blocks,
+    qsa_visible_blocks,
+)
+from op_tests.qsa_ref import (
+    qsa_sparse_gqa as sparse_gqa_ref,
+)
+
+SUPPORTED_GFX = ["gfx942", "gfx950"]
+# Exactly 4 GiB still fits in a V# offset. The wide compile starts past that.
+_FOUR_GIB = 1 << 32
+
+
+def _storage_tensor(view: torch.Tensor) -> torch.Tensor:
+    """Contiguous 1-D tensor over ``view``'s storage.
+
+    Cold rotation deep-copies this, which keeps the gaps. Copying the view
+    itself packs the pages and the span falls back under 4 GiB.
+    """
+    elem = view.element_size()
+    n_elems = view.untyped_storage().size() // elem - view.storage_offset()
+    flat = torch.empty(0, dtype=view.dtype, device=view.device)
+    flat.set_(view.untyped_storage(), view.storage_offset(), (n_elems,), (1,))
+    return flat
+
+
+def _widen_cache(cache: torch.Tensor) -> torch.Tensor:
+    """The same pages, with a page stride that puts the span just past 4 GiB.
+
+    vLLM allocates one KV pool and hands each layer a strided view, so the
+    page stride covers every layer and the span is the pool. Allocating that
+    pool is unnecessary: a few pages and a stride that lands the last page
+    just past 4 GiB selects the same compile. A one-page cache gains an
+    unreferenced trailing page, because a size of 1 ignores its stride.
+    The parent holds the span and no more. Page stride is a multiple of 8
+    elements, which is the gather alignment the indexer and paged GQA already require.
+    """
+    if cache.ndim != 4:
+        raise ValueError(
+            f"paged cache must be [pages, page_size, H, D], got {tuple(cache.shape)}"
+        )
+    n_pages, page_size, n_heads, head_dim = (int(s) for s in cache.shape)
+    if n_pages < 1:
+        return cache
+    page_elems = page_size * n_heads * head_dim
+    token_stride = n_heads * head_dim
+    head_stride = head_dim
+    view_pages = max(n_pages, 2)
+    elem = cache.element_size()
+    gaps = view_pages - 1
+    # span = (gaps * page_stride + page_elems) * elem, and it must exceed 4 GiB.
+    min_elems = (_FOUR_GIB + elem) // elem
+    page_stride = (min_elems - page_elems + gaps - 1) // gaps
+    page_stride = max(page_stride, page_elems)
+    if page_stride % 8:
+        page_stride += 8 - (page_stride % 8)
+    span_elems = gaps * page_stride + page_elems
+    parent = cache.new_empty(span_elems)
+    parent.zero_()
+    flat = cache.contiguous().reshape(n_pages, page_elems)
+    for i in range(n_pages):
+        parent[i * page_stride : i * page_stride + page_elems] = flat[i]
+    view = parent.as_strided(
+        (view_pages, page_size, n_heads, head_dim),
+        (page_stride, token_stride, head_stride, 1),
+    )
+    if span_bytes(view) <= _FOUR_GIB:
+        raise RuntimeError(f"wide cache span {span_bytes(view)} did not pass 4 GiB")
+    return view
+
+
+def _apply_cache_layout(cache: torch.Tensor, layout: str) -> torch.Tensor:
+    """``packed`` leaves the cache. ``wide`` is the serving span."""
+    if layout == "packed":
+        return cache
+    if layout != "wide":
+        raise ValueError(f"cache_layout must be packed or wide, got {layout}")
+    return _widen_cache(cache)
+
+
+def test_indexer_rows_scorer_layout_keeps_small_grids_parallel():
+    """Column reuse must not collapse short row-scorer launches."""
+    layout = qsa_paged._indexer_rows_scorer_layout
+    cases = (
+        # n_req, rows, heads, live columns, captured padded decode, expected
+        (4, 16, 4, 2048, False, (True, 1)),
+        (1, 16, 4, 2048, False, (False, 1)),
+        (1, 64, 4, 15000, False, (False, 2)),
+        (1, 128, 4, 2048, False, (False, 2)),
+        (1, 256, 4, 513, False, (False, 1)),
+        (1, 512, 4, 2048, False, (False, 4)),
+        (1, 64, 4, 65856, True, (False, 1)),
+        (1, 8192, 4, 2048, False, (False, 4)),
+    )
+    for n_req, rows, heads, columns, row_bounded, expected in cases:
+        got = layout(n_req, rows, heads, columns, row_bounded=row_bounded)
+        if got != expected:
+            raise AssertionError(
+                f"layout({n_req}, {rows}, {heads}, {columns}, "
+                f"row_bounded={row_bounded}) = {got}, expected {expected}"
+            )
+
+
+def _span_gib(cache: torch.Tensor) -> float:
+    return span_bytes(cache) / (1 << 30)
+
+
+def test_wide_cache_layout_spans_past_4gib():
+    """The bench view crosses 4 GiB without packing, and a clone does not.
+
+    A one-page cache has to grow a trailing page or the stride is ignored.
+    Rotating copies the storage and rebuilds the view; cloning the view
+    packs it back under 4 GiB, which would time the narrow compile.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    device = torch.device("cuda")
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < _FOUR_GIB + (1 << 30):
+        aiter.logger.warning(
+            "skip wide cache layout test: need %s bytes, %s free",
+            _FOUR_GIB + (1 << 30),
+            free,
+        )
+        return
+    try:
+        _apply_cache_layout(torch.empty(1, 1, 1, 8), "dense")
+    except ValueError as exc:
+        if "cache_layout" not in str(exc):
+            raise
+    else:
+        raise AssertionError("an unknown cache layout was accepted")
+    idx = FLASH_NEXT_INDEXER
+    page_size = 16
+    for n_pages in (1, 3):
+        n_blocks = n_pages * page_size
+        cache, _table = pack_paged_cache(
+            torch.randn(n_blocks, 1, idx.head_dim, dtype=dtypes.bf16, device=device),
+            page_size,
+        )
+        packed = _apply_cache_layout(cache, "packed")
+        if span_bytes(packed) > _FOUR_GIB:
+            raise AssertionError("packed layout crossed 4 GiB")
+        view = _apply_cache_layout(cache, "wide")
+        if span_bytes(view) <= _FOUR_GIB:
+            raise AssertionError(f"wide span {span_bytes(view)} did not pass 4 GiB")
+        if n_pages == 1 and view.shape[0] != 2:
+            raise AssertionError(f"one-page cache stayed at {view.shape[0]} pages")
+        if n_pages > 1 and view.shape[0] != n_pages:
+            raise AssertionError(f"wide page count {view.shape[0]} != {n_pages}")
+        if any(s % 8 for s in view.stride()[:3]) or view.stride(3) != 1:
+            raise AssertionError(
+                f"wide strides are not gather-aligned: {view.stride()}"
+            )
+        if not torch.equal(view[:n_pages], cache):
+            raise AssertionError("wide view changed the packed pages")
+        q = torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        table = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
+        reason = qsa_paged.qsa_indexer_supported(q, view, table, (4,))
+        if reason is not None:
+            raise AssertionError(f"wide indexer cache was rejected: {reason}")
+        if span_bytes(view.clone()) > _FOUR_GIB:
+            raise AssertionError("cloning the view kept the wide span")
+        restored = _storage_tensor(view).clone().as_strided(view.shape, view.stride())
+        if span_bytes(restored) <= _FOUR_GIB:
+            raise AssertionError("storage copy dropped the wide span")
+        if not torch.equal(restored[:n_pages], cache):
+            raise AssertionError("storage copy changed the packed pages")
+        del view, restored, cache
+
+
+def _time(fn, *args, rotate, **kwargs):
+    """Time ``fn`` under one cache policy for every candidate in the row.
+
+    ``rotate`` is ``run_perftest`` ``num_rotate_args``: ``0`` (the default)
+    auto-sizes extra copies from L2 so each timed call sees cold weights,
+    ``1`` reuses one buffer set (hot; the older 1047 tables), ``N>1`` uses
+    that many copies. Cold is the default because hot reuse credits a
+    backend for inter-iteration L2 residency that serving never has -- on
+    ``M=8`` decode it flatters live AMD by ~36% and paged GQA by ~12%. Callers must
+    pass paged caches as ``*args`` so deepcopy clones them -- a zero-arg
+    closure cannot rotate closed-over tensors. HIP-graph replay is not
+    combined with rotation.
+
+    A wide cache is a strided view over about 4 GiB. ``clone`` packs that
+    view and the next iteration would take the narrow compile, and one
+    copy is already larger than L2, so auto-rotate keeps a single copy.
+    An explicit ``rotate`` still makes that many copies. Each copy is the
+    storage, and the view is rebuilt per call.
+    """
+    wide = [
+        i
+        for i, arg in enumerate(args)
+        if isinstance(arg, torch.Tensor) and span_bytes(arg) > _FOUR_GIB
+    ]
+    if not wide:
+        return run_perftest(fn, *args, num_rotate_args=rotate, **kwargs)
+    rotate = max(rotate, 1)
+    call_args = list(args)
+    shapes = []
+    strides = []
+    for i in wide:
+        shapes.append(tuple(call_args[i].shape))
+        strides.append(tuple(int(s) for s in call_args[i].stride()))
+        call_args[i] = _storage_tensor(call_args[i])
+
+    def _restore(*restored, **restored_kwargs):
+        restored = list(restored)
+        for i, shape, stride in zip(wide, shapes, strides):
+            restored[i] = restored[i].as_strided(shape, stride)
+        return fn(*restored, **restored_kwargs)
+
+    return run_perftest(_restore, *call_args, num_rotate_args=rotate, **kwargs)
+
+
+def test_indexer_hand_checked_one_row():
+    """Tech report ?2.1: I_ib = sum_h ReLU(q[h] . k_bar[b]), complete blocks only.
+
+    One query at token position 6 (0-based) with r=4 and seq_len=8:
+      visible = min((6+1)//4, 8//4) = 1  -> only block 0 (tokens 0..3).
+    q heads [1,0] and [2,0]; k_bar[0]=[1,0] -> ReLU(1)+ReLU(2)=3.
+    k_bar[1]=[10,0] would score 30 but is incomplete -> -inf.
+    """
+    r = 4
+    q = torch.tensor([[[1.0, 0.0], [2.0, 0.0]]])  # [1, 2, 2]
+    k_bar = torch.tensor([[1.0, 0.0], [10.0, 0.0]])
+    qpos = torch.tensor([6], dtype=dtypes.i32)
+    slen = torch.tensor([8], dtype=dtypes.i32)
+    req = torch.tensor([0], dtype=dtypes.i32)
+
+    assert qsa_visible_blocks(qpos, slen, req, r).tolist() == [1]
+
+    scores = qsa_indexer_scores(q, k_bar, qpos, slen, req, r, score_scale=1.0)
+    assert scores.shape == (1, 2)
+    assert scores[0, 0].item() == 3.0
+    assert math.isinf(scores[0, 1].item()) and scores[0, 1].item() < 0
+
+    block_ids = qsa_topk_blocks(scores, k=1)
+    assert block_ids.tolist() == [[0]]
+
+    # token_topk = 1 block * 4; width = 4+4-1 = 7.
+    indices = qsa_expand_tail(block_ids, qpos, slen, req, r, token_topk=4)
+    # expanded 0..3, tail_start=4, tail_count=3 -> 4,5,6.
+    assert indices.tolist() == [[0, 1, 2, 3, 4, 5, 6]]
+
+
+def test_topk_smaller_index_wins_ties():
+    """HIP top_k_per_row_decode: equal finite scores keep the smaller block id."""
+    r = 4
+    q = torch.tensor([[[1.0, 0.0]]])  # H=1
+    k_bar = torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    qpos = torch.tensor([11], dtype=dtypes.i32)
+    slen = torch.tensor([12], dtype=dtypes.i32)
+    req = torch.tensor([0], dtype=dtypes.i32)
+    scores = qsa_indexer_scores(q, k_bar, qpos, slen, req, r)
+    # blocks 0 and 1 both score 1; block 2 scores 0.
+    assert scores[0].tolist() == [1.0, 1.0, 0.0]
+    block_ids = qsa_topk_blocks(scores, k=2)
+    assert block_ids.tolist() == [[0, 1]]
+
+    scaled = qsa_indexer_scores(
+        q, k_bar, qpos, slen, req, r, score_scale=FLASH_NEXT_SCORE_SCALE
+    )
+    assert qsa_topk_blocks(scaled, k=2).tolist() == [[0, 1]]
+
+
+def test_incomplete_blocks_not_selected():
+    r = 4
+    q = torch.tensor([[[1.0, 0.0]]])
+    k_bar = torch.tensor([[0.0, 0.0], [9.0, 0.0]])
+    qpos = torch.tensor([3], dtype=dtypes.i32)  # visible = 1
+    slen = torch.tensor([8], dtype=dtypes.i32)
+    req = torch.tensor([0], dtype=dtypes.i32)
+    scores = qsa_indexer_scores(q, k_bar, qpos, slen, req, r)
+    # block 1 is incomplete despite a huge potential score.
+    ids = qsa_topk_blocks(scores, k=2)
+    assert ids[0, 0].item() == 0
+    assert ids[0, 1].item() == -1
+
+
+def test_gqa_matches_dense_on_selected():
+    q = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])  # [1, 2, 2] group=2, Hk=1
+    k = torch.tensor([[[1.0, 0.0]], [[0.0, 0.0]], [[0.0, 1.0]]])
+    v = torch.tensor([[[2.0, 0.0]], [[0.0, 0.0]], [[0.0, 4.0]]])
+    indices = torch.tensor([[0, 2]], dtype=dtypes.i32)
+    out = sparse_gqa_ref(q, k, v, indices, softmax_scale=1.0)
+
+    e = math.exp(1.0)
+    p_hi = e / (e + 1.0)
+    p_lo = 1.0 / (e + 1.0)
+    # head 0 attends k[0]=[1,0] and k[2]=[0,1] -> scores 1 and 0.
+    expect_h0 = [p_hi * 2.0, p_lo * 4.0]
+    # head 1 scores 0 and 1.
+    expect_h1 = [p_lo * 2.0, p_hi * 4.0]
+    got = out[0].tolist()
+    assert abs(got[0][0] - expect_h0[0]) < 1e-5
+    assert abs(got[0][1] - expect_h0[1]) < 1e-5
+    assert abs(got[1][0] - expect_h1[0]) < 1e-5
+    assert abs(got[1][1] - expect_h1[1]) < 1e-5
+
+
+def test_flash_next_shapes_smoke():
+    """Flash-Next ABI with a short context (8 blocks << 512)."""
+    idx = FLASH_NEXT_INDEXER
+    gqa = FLASH_NEXT_GQA
+    m = 1
+    n_blocks = 8
+    seq = n_blocks * idx.compress_ratio  # 32
+    q_idx = torch.zeros(m, idx.n_heads, idx.head_dim)
+    q_idx[0, 0, 0] = 1.0
+    k_bar = torch.zeros(n_blocks, idx.head_dim)
+    k_bar[2, 0] = 1.0  # only block 2 scores 1
+    q_gqa = torch.zeros(m, gqa.n_heads, gqa.head_dim)
+    q_gqa[0, 0, 0] = 1.0
+    k = torch.zeros(seq, gqa.kv_heads, gqa.head_dim)
+    v = torch.zeros(seq, gqa.kv_heads, gqa.head_dim)
+    v[:, 0, 0] = torch.arange(seq, dtype=dtypes.fp32)
+    qpos = torch.tensor([seq - 1], dtype=dtypes.i32)
+    slen = torch.tensor([seq], dtype=dtypes.i32)
+    req = torch.tensor([0], dtype=dtypes.i32)
+
+    result = qsa_oracle(
+        q_idx,
+        k_bar,
+        q_gqa,
+        k,
+        v,
+        qpos,
+        slen,
+        req,
+        idx,
+        gqa,
+        score_scale=1.0,
+        softmax_scale=1.0,
+        out_dtype=dtypes.fp32,
+    )
+    assert result.block_ids.shape == (m, idx.block_budget)
+    assert result.indices.shape == (m, idx.index_width)
+    assert result.output.shape == (m, gqa.n_heads, gqa.head_dim)
+    assert result.block_ids[0, 0].item() == 2
+    assert set(result.block_ids[0, :n_blocks].tolist()) == set(range(n_blocks))
+    assert set(result.block_ids[0, n_blocks:].tolist()) == {-1}
+    # Highest-scoring block 2 is rank 0 -> tokens 8..11; seq is a multiple of r
+    # so there is no tail (remaining slots are -1).
+    expanded = [t for t in result.indices[0].tolist() if t >= 0]
+    assert expanded[:4] == [8, 9, 10, 11]
+
+
+def test_paged_roundtrip_tiny():
+    """Shuffled pages still gather back to dense (CPU, no kernel)."""
+    dense = torch.arange(48, dtype=dtypes.fp32).view(6, 2, 4)
+    physical = torch.tensor([1, 0], dtype=dtypes.i32)
+    cache, table = pack_paged_cache(dense, page_size=4, physical=physical)
+    assert cache.shape == (2, 4, 2, 4)
+    assert table.tolist() == [[1, 0]]
+    got = gather_paged_cache(cache, table, n_logical=6)
+    assert torch.equal(got, dense)
+    identity = torch.arange(2, dtype=dtypes.i32).unsqueeze(0)
+    wrong = gather_paged_cache(cache, identity, n_logical=6)
+    assert not torch.equal(wrong, dense)
+
+
+def _query_positions(m: int, seq_len: int, device) -> torch.Tensor:
+    return torch.arange(seq_len - m, seq_len, device=device, dtype=dtypes.i32)
+
+
+def _selected_width(indices: torch.Tensor) -> float:
+    """Mean non-padding selection slots per row.
+
+    ``indices`` is always allocated ``index_width`` wide (2051 on both
+    families), but the indexer can only fill ``complete_blocks * r + tail``
+    of it, capped at the budget. Below ``L = 2048`` the remainder is ``-1``
+    padding: a quarter of the row is live at ``L = 512`` decode and an eighth
+    at ``M = 512`` prefill. Deriving FLOPS and bytes from ``indices.shape[1]``
+    therefore overstates the work by up to 8x on those rows. The kernels still
+    walk all ``index_width`` columns -- that part is faithful to serving -- so
+    only the *derived* columns need the live count.
+    """
+    return float((indices >= 0).sum().item()) / indices.shape[0]
+
+
+def _pack_flash_next(k_bar, k, v, page_size, device):
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    gen_kv = torch.Generator(device=device)
+    gen_kv.manual_seed(2)
+    index_k = k_bar.unsqueeze(1)  # [n_blocks, 1, D]
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen_kv)
+    v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
+    if not torch.equal(kv_table, kv_table_v):
+        raise RuntimeError("K and V page tables diverged")
+    return index_cache, index_table, k_cache, v_cache, kv_table
+
+
+def _set_mismatch_ratio(
+    ref: torch.Tensor,
+    got: torch.Tensor,
+    scores: torch.Tensor | None = None,
+) -> float:
+    """Fraction of rows whose selected ids are not the oracle top-k.
+
+    Without ``scores`` the id sets must be equal. With ``scores``, every
+    id strictly above the worst score ``ref`` kept must be selected. An
+    id whose score equals that cutoff must be one ``ref`` kept: equal
+    scores keep the smaller block index. An id whose score differs from
+    the cutoff is accepted only when it is finite and at least one fp32
+    ulp below the cutoff. A block any lower still counts as a miss.
+    """
+    if scores is None:
+        miss = 0
+        rows = ref.shape[0]
+        for i in range(rows):
+            a = set(ref[i].tolist()) - {-1}
+            b = set(got[i].tolist()) - {-1}
+            if a != b:
+                miss += 1
+        return miss / rows if rows else 0.0
+
+    rows, n_blocks = scores.shape
+    if rows == 0:
+        return 0.0
+    in_range = ((ref < 0) | (ref < n_blocks)).all(dim=1) & (
+        (got < 0) | (got < n_blocks)
+    ).all(dim=1)
+    last = n_blocks - 1
+    ref_idx = ref.clamp(0, last)
+    got_idx = got.clamp(0, last)
+    ref_scores = scores.gather(1, ref_idx).masked_fill(ref < 0, float("inf"))
+    kth = ref_scores.min(dim=1).values
+    floor = torch.nextafter(kth, torch.full_like(kth, float("-inf")))
+    got_scores = scores.gather(1, got_idx)
+    got_valid = got >= 0
+    kth_col = kth.unsqueeze(1)
+    # Equal scores keep the smaller index, so a tie id has to be one the
+    # oracle kept. A different id is only the one-ulp boundary below kth.
+    ref_kept = torch.zeros(rows, n_blocks, dtype=torch.bool, device=scores.device)
+    ref_safe = (ref >= 0) & (ref < n_blocks)
+    ref_rows = torch.arange(rows, device=scores.device).unsqueeze(1).expand_as(ref)
+    ref_kept[ref_rows[ref_safe], ref[ref_safe]] = True
+    equal_tie = got_valid & (got_scores == kth_col)
+    bad_tie = equal_tie & ~ref_kept.gather(1, got_idx)
+    boundary = got_valid & (got_scores != kth_col)
+    bad_score = boundary & (
+        ~torch.isfinite(got_scores) | (got_scores < floor.unsqueeze(1))
+    )
+    selected = torch.zeros(rows, n_blocks, dtype=torch.bool, device=scores.device)
+    # A padded slot clamps to column 0. Scatter that False and it wipes a
+    # real selection of block 0, so only the in-range ids are marked.
+    safe = got_valid & (got < n_blocks)
+    row_idx = torch.arange(rows, device=scores.device).unsqueeze(1).expand_as(got)
+    selected[row_idx[safe], got[safe]] = True
+    n_got = got_valid.sum(dim=1)
+    n_ref = (ref >= 0).sum(dim=1)
+    count_bad = (selected.sum(dim=1) != n_got) | (n_got != n_ref)
+    required = torch.isfinite(scores) & (scores > kth.unsqueeze(1))
+    missing = (required & ~selected).any(dim=1)
+    miss = bad_score.any(dim=1) | bad_tie.any(dim=1) | ~in_range | count_bad | missing
+    return float(miss.sum().item()) / rows
+
+
+def _indexer_row_is_packed(row: torch.Tensor) -> str | None:
+    """Valid ids, each once, then only ``-1``. ``None`` when the row is packed."""
+    seen = set()
+    padding = False
+    for value in row.tolist():
+        if value == -1:
+            padding = True
+            continue
+        if padding:
+            return "valid id after -1"
+        if value in seen:
+            return "duplicate id"
+        seen.add(value)
+    return None
+
+
+def _assert_indexer_block_ids(ref: torch.Tensor, got: torch.Tensor, what: str) -> None:
+    """Set equality, plus no duplicates and a compact valid prefix on ``got``."""
+    for i in range(got.shape[0]):
+        reason = _indexer_row_is_packed(got[i])
+        if reason is not None:
+            raise AssertionError(f"{what}: row {i} {reason}")
+    if _set_mismatch_ratio(ref, got) != 0.0:
+        raise AssertionError(f"{what}: set mismatch")
+
+
+def test_indexer_block_ids_require_packed_prefix():
+    """An indexer id row is unique valid ids, then only ``-1``.
+
+    Order may differ from the oracle. A duplicate, a valid id after
+    ``-1``, or a different id set fails. With scores, an exact tie must
+    keep the smaller indexes; only a one-ulp-lower id may substitute.
+    """
+    ref = torch.tensor([[0, 1, -1]], dtype=torch.int32)
+    _assert_indexer_block_ids(
+        ref, torch.tensor([[1, 0, -1]], dtype=torch.int32), "order"
+    )
+    _assert_indexer_block_ids(
+        ref, torch.tensor([[0, 1, -1, -1]], dtype=torch.int32), "pad"
+    )
+    _assert_indexer_block_ids(
+        torch.full((1, 4), -1, dtype=torch.int32),
+        torch.full((1, 4), -1, dtype=torch.int32),
+        "empty",
+    )
+    same = torch.tensor([[0, -1]], dtype=torch.int32)
+    try:
+        _assert_indexer_block_ids(
+            same, torch.tensor([[0, 0]], dtype=torch.int32), "dup"
+        )
+    except AssertionError as exc:
+        if "duplicate" not in str(exc):
+            raise
+    else:
+        raise AssertionError("duplicate ids passed the indexer check")
+    try:
+        _assert_indexer_block_ids(
+            ref, torch.tensor([[0, -1, 1]], dtype=torch.int32), "hole"
+        )
+    except AssertionError as exc:
+        if "after -1" not in str(exc):
+            raise
+    else:
+        raise AssertionError("a valid id after -1 passed the indexer check")
+    try:
+        _assert_indexer_block_ids(
+            ref, torch.tensor([[2, 3, -1]], dtype=torch.int32), "sets"
+        )
+    except AssertionError as exc:
+        if "set mismatch" not in str(exc):
+            raise
+    else:
+        raise AssertionError("a set mismatch passed the indexer check")
+    n, k = 1024, 512
+    tied = torch.ones(1, n)
+    smaller = torch.arange(k, dtype=torch.int32).unsqueeze(0)
+    upper = torch.arange(k, n, dtype=torch.int32).unsqueeze(0)
+    if _set_mismatch_ratio(smaller, smaller, tied) != 0.0:
+        raise AssertionError("the smaller-index half of an exact tie failed")
+    if _set_mismatch_ratio(smaller, upper, tied) == 0.0:
+        raise AssertionError("the upper half of an exact tie passed")
+    one = smaller.clone()
+    one[0, -1] = k
+    boundary = tied.clone()
+    boundary[0, k] = torch.nextafter(tied[0, 0], tied.new_tensor(float("-inf")))
+    if _set_mismatch_ratio(smaller, one, boundary) != 0.0:
+        raise AssertionError("a one-ulp boundary swap was rejected")
+    boundary[0, k] = torch.nextafter(boundary[0, k], tied.new_tensor(float("-inf")))
+    if _set_mismatch_ratio(smaller, one, boundary) == 0.0:
+        raise AssertionError("a two-ulp substitution passed")
+
+
+def _indexer_ids_match_oracle(n_heads, m, seq_len, page_size, what, min_blocks=0):
+    """Public indexer block ids for ``n_heads`` match the oracle on this shape."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER if n_heads == 4 else GLUON_PARITY_INDEXER_H8
+    if idx.n_heads != n_heads:
+        raise AssertionError(f"indexer fixture has {idx.n_heads} heads, want {n_heads}")
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    if n_blocks < min_blocks:
+        raise AssertionError(f"{n_blocks} blocks is below {min_blocks}")
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen_i
+    )
+    ref_ids = qsa_topk_blocks(
+        qsa_indexer_scores(
+            q_indexer,
+            k_bar,
+            qpos,
+            slen,
+            token_to_req,
+            idx.compress_ratio,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+        ),
+        idx.block_budget,
+    )
+    got = qsa_indexer_block_ids(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        heads=(n_heads,),
+    )
+    _assert_indexer_block_ids(ref_ids, got, what)
+
+
+def test_indexer_flash_next_set_equality_short_decode():
+    """FlyDSL indexer block-id sets match the oracle on short decode, for H=4 and H=8."""
+    for n_heads in (4, 8):
+        _indexer_ids_match_oracle(
+            n_heads, 4, 512, 16, f"indexer H={n_heads} short decode diverged"
+        )
+
+
+def test_indexer_flash_next_set_equality_two_tiles():
+    """H=4 and H=8 match the oracle when n_blocks exceeds one 512-slot tile."""
+    for n_heads in (4, 8):
+        _indexer_ids_match_oracle(
+            n_heads,
+            2,
+            4096,
+            16,
+            f"indexer H={n_heads} two-tile block-id set diverged",
+            min_blocks=513,
+        )
+
+
+def test_indexer_flash_next_set_equality_wide_stream():
+    """FlyDSL indexer matches the oracle on 128k rows that take streaming radix."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 1, 131072, 16
+    n_blocks = seq_len // idx.compress_ratio
+    assert n_blocks >= 32768
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    got = qsa_indexer_block_ids(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        heads=(4,),
+    )
+    _assert_indexer_block_ids(
+        ref_ids, got, "indexer wide-row block-id set diverged from the oracle"
+    )
+
+
+def test_indexer_flash_next_set_equality_prefill():
+    """Single-request prefill at M=512 matches the oracle for H=4 and H=8.
+
+    H=8 is the 16-row tile on gfx950 and the one-row scorer on gfx942.
+    Both must return the oracle block ids.
+    """
+    for n_heads in (4, 8):
+        _indexer_ids_match_oracle(
+            n_heads,
+            512,
+            4096,
+            16,
+            f"indexer H={n_heads} prefill block-id set diverged",
+            min_blocks=513,
+        )
+
+
+def test_indexer_prefill_padded_page_table():
+    """Page-table entries past the context must not be loaded.
+
+    One request, M=32, context 4096. Sixty-four pages of 16 cover the
+    1024 visible blocks; four more entries are padding. Pad 0 matches
+    the oracle. Pad -1 and a huge page id must not fault or change
+    the selected set.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    m, context, page_size, n_real_pages, n_pad = 32, 4096, 16, 64, 4
+    n_blocks = context // idx.compress_ratio
+    if n_real_pages * page_size != n_blocks:
+        raise AssertionError("the real pages must cover the context exactly")
+    torch.manual_seed(0)
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, context, device)
+    slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    if index_table.shape[1] != n_real_pages:
+        raise AssertionError(f"expected {n_real_pages} pages, got {index_table.shape}")
+    ref_scores = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    for name, pad_value in (("zero", 0), ("negative", -1), ("huge", 100000)):
+        pad = torch.full((1, n_pad), pad_value, dtype=dtypes.i32, device=device)
+        table = torch.cat((index_table, pad), dim=1)
+        got = qsa_indexer_block_ids(
+            q, index_cache, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        _assert_indexer_block_ids(
+            ref_ids, got, f"indexer prefill pad {name} changed the selected set"
+        )
+
+
+def test_indexer_prefill_rejects_invalid_visible_page():
+    """The 16-row scorer must not select a visible block whose page id is -1.
+
+    One request, M=32, context 4096, so the 16-row scorer runs on every
+    supported arch. The gather zeroes K on that page. With an all-zero Q
+    every live score is 0 too, so a block on that page would tie into
+    the top 512 unless it scores -inf. The page is first, then inside
+    the visible range.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    m, context, page_size = 32, 4096, 16
+    n_blocks = context // idx.compress_ratio
+    torch.manual_seed(0)
+    q = torch.zeros(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, context, device)
+    slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    ref_scores = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    for bad_page in (0, 3):
+        table = index_table.clone()
+        table[0, bad_page] = -1
+        block0 = bad_page * page_size
+        scores = ref_scores.clone()
+        scores[:, block0 : block0 + page_size] = float("-inf")
+        ref_ids = qsa_topk_blocks(scores, idx.block_budget)
+        got = qsa_indexer_block_ids(
+            q, index_cache, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        _assert_indexer_block_ids(
+            ref_ids,
+            got,
+            f"indexer prefill kept a block on page {bad_page}, whose id is -1",
+        )
+
+
+def test_indexer_table_padded_to_max_model_len():
+    """A block table far wider than any request selects what the trimmed one does.
+
+    vLLM sizes the block table for max_model_len and zero-fills past each
+    request's pages, so the indexer sees tens of thousands of columns no row can see.
+    The table here is 4096 pages of 16 wide, which also crosses into the
+    streaming selector. Every request shares one packed cache and differs in
+    its length. Covers the one-row scorer (decode) and the 16-row scorer
+    (decode mixed with a prefill chunk, two prefill prompts, one request).
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    page_size, max_pages, context = 16, 4096, 65536
+    n_blocks = context // idx.compress_ratio
+    assert max_pages * page_size >= 32768
+    torch.manual_seed(0)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+
+    def run(seq_lens, token_to_req, qpos, what):
+        n_req = len(seq_lens)
+        slen = torch.tensor(seq_lens, dtype=dtypes.i32, device=device)
+        m = token_to_req.shape[0]
+        q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        ref_ids = qsa_topk_blocks(
+            qsa_indexer_scores(
+                q,
+                k_bar,
+                qpos,
+                slen,
+                token_to_req,
+                idx.compress_ratio,
+                score_scale=FLASH_NEXT_SCORE_SCALE,
+            ),
+            idx.block_budget,
+        )
+        table = torch.zeros(n_req, max_pages, dtype=dtypes.i32, device=device)
+        table[:, : index_table.shape[1]] = index_table
+        got = qsa_indexer_block_ids(
+            q, index_cache, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        _assert_indexer_block_ids(ref_ids, got, what)
+
+    decode_lens = [3000, 9000, 30000, context]
+    t2r = torch.arange(len(decode_lens), dtype=dtypes.i32, device=device)
+    run(
+        decode_lens,
+        t2r,
+        torch.tensor(decode_lens, dtype=dtypes.i32, device=device) - 1,
+        "indexer decode on a max_model_len table diverged from the oracle",
+    )
+
+    chunk = 64
+    mixed_lens = [chunk] + decode_lens
+    mixed_t2r = torch.cat(
+        (torch.zeros(chunk, dtype=dtypes.i32, device=device), t2r + 1)
+    )
+    mixed_pos = torch.cat(
+        (
+            torch.arange(chunk, dtype=dtypes.i32, device=device),
+            torch.tensor(decode_lens, dtype=dtypes.i32, device=device) - 1,
+        )
+    )
+    run(
+        mixed_lens,
+        mixed_t2r,
+        mixed_pos,
+        "indexer mixed prefill+decode on a max_model_len table diverged",
+    )
+
+    # Two prefill prompts. Eight rows end the long context and twenty-four
+    # end a short one, so the selected sets differ and the first 16-row
+    # block spans both.
+    left, right, short = 8, 24, 4096
+    two_pos = torch.cat(
+        (
+            torch.arange(context - left, context, dtype=dtypes.i32, device=device),
+            torch.arange(short - right, short, dtype=dtypes.i32, device=device),
+        )
+    )
+    two_t2r = torch.cat(
+        (
+            torch.zeros(left, dtype=dtypes.i32, device=device),
+            torch.ones(right, dtype=dtypes.i32, device=device),
+        )
+    )
+    run(
+        [context, short],
+        two_t2r,
+        two_pos,
+        "indexer two-prompt prefill on a max_model_len table diverged",
+    )
+
+    # Within a 16-row block the last row sees 4 blocks more than the first.
+    # Starting at 2559 puts the first row of every eighth block exactly on a
+    # 32-column tile edge (640 + 32k visible), so a tile skip keyed on the
+    # wrong row drops blocks the later rows must select from (> 512 visible).
+    m, start = 256, 2559
+    run(
+        [start + m],
+        torch.zeros(m, dtype=dtypes.i32, device=device),
+        torch.arange(start, start + m, dtype=dtypes.i32, device=device),
+        "indexer 16-row prefill on a max_model_len table diverged",
+    )
+
+
+def test_indexer_row_tile_spanning_requests_gathers_each_requests_pages():
+    """A 16-row block that spans requests scores each row on its own pages.
+
+    Every request has its own compressed K on disjoint physical pages, so a
+    block that gathers the wrong request's pages, or writes rows of another
+    request, selects a different set. Covers MTP decode (four requests of
+    four rows, one block, and uneven rows whose folded 4-row tiles straddle
+    requests), a prefill chunk whose last block also holds three decode
+    rows, and a batch with 20 rows per request, where each 16-row block walks
+    several column tiles while spanning requests.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    page_size, width = 16, 400
+    lens = [9001, 3000, 20000, 12345]
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    torch.manual_seed(2)
+    k_bars, caches, tables, base = [], [], [], 0
+    for n in lens:
+        k_bar = torch.randn(
+            n // idx.compress_ratio, idx.head_dim, dtype=dtypes.bf16, device=device
+        )
+        cache, table = pack_paged_cache(k_bar.unsqueeze(1), page_size, generator=gen)
+        k_bars.append(k_bar)
+        caches.append(cache)
+        tables.append(table[0] + base)
+        base += cache.shape[0]
+    index_cache = torch.cat(caches)
+    table = torch.zeros(len(lens), width, dtype=dtypes.i32, device=device)
+    for r, t in enumerate(tables):
+        table[r, : t.numel()] = t
+    slen = torch.tensor(lens, dtype=dtypes.i32, device=device)
+
+    def run(rows_per_req, what):
+        t2r = torch.cat(
+            [
+                torch.full((n,), r, dtype=dtypes.i32, device=device)
+                for r, n in enumerate(rows_per_req)
+            ]
+        )
+        qpos = torch.cat(
+            [
+                torch.arange(lens[r] - n, lens[r], dtype=dtypes.i32, device=device)
+                for r, n in enumerate(rows_per_req)
+            ]
+        )
+        q = torch.randn(
+            t2r.numel(), idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+        )
+        refs = []
+        for r, n in enumerate(rows_per_req):
+            rows = t2r == r
+            refs.append(
+                qsa_topk_blocks(
+                    qsa_indexer_scores(
+                        q[rows],
+                        k_bars[r],
+                        qpos[rows],
+                        slen[r : r + 1],
+                        torch.zeros(n, dtype=dtypes.i32, device=device),
+                        idx.compress_ratio,
+                        score_scale=FLASH_NEXT_SCORE_SCALE,
+                    ),
+                    idx.block_budget,
+                )
+            )
+        width_ids = max(ref.shape[1] for ref in refs)
+        ref_ids = torch.cat(
+            [
+                torch.nn.functional.pad(ref, (0, width_ids - ref.shape[1]), value=-1)
+                for ref in refs
+            ]
+        )
+        got = qsa_indexer_block_ids(q, index_cache, table, t2r, qpos, slen, heads=(4,))
+        _assert_indexer_block_ids(ref_ids, got, what)
+
+    run([4, 4, 4, 4], "indexer MTP decode block spanning four requests diverged")
+    run([5, 6, 7, 3], "indexer MTP decode with tiles straddling requests diverged")
+    run([37, 1, 1, 1], "indexer prefill chunk block holding decode rows diverged")
+    run([60, 1, 20, 1], "indexer multi-tile prefill block holding decode rows diverged")
+
+
+def test_indexer_padded_decode_graph_capture():
+    """Decode on a max_model_len table captures into a HIP graph and replays.
+
+    vLLM captures decode into full graphs, where the padded-table width
+    readback is not allowed. One live row is longer than the compact
+    selector's minimum, so replay finishes the later radix passes from
+    the first-pass candidates. Another row repeats one K vector: the
+    top-512 cut sits inside a tie wider than that candidate buffer, so
+    the same kernel falls back to the full-row passes and keeps the
+    smaller block indexes. Replays twice, the second time with new
+    queries written into the captured buffer, against the oracle.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    from aiter.ops.flydsl.kernels.topk.topk_per_row_decode_persistent import (
+        _COMPACT_LIMIT,
+        _COMPACT_MIN_ROW,
+    )
+    from aiter.ops.flydsl.topk.topk_per_row import _ONE_WORKGROUP_MAX_ROW_WIDTH
+
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    page_size, max_pages = 16, 4096
+    # 81920 / compress_ratio 4 = 20480 visible columns, above the compact cutoff.
+    context = 81920
+    n_blocks = context // idx.compress_ratio
+    n_columns = max_pages * page_size
+    if n_columns <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
+        raise AssertionError(
+            f"padded table has {n_columns} columns, at or under the "
+            "one-workgroup cutoff"
+        )
+    if n_blocks <= _COMPACT_MIN_ROW or n_blocks <= _COMPACT_LIMIT:
+        raise AssertionError(
+            f"{n_blocks} visible columns does not cross the compact selector"
+        )
+    torch.manual_seed(0)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    random_cache, random_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    # One repeated key: every complete block scores the same, so the
+    # top-512 cut is inside a tie as wide as the row.
+    tie_key = torch.ones(idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_tie = tie_key.unsqueeze(0).expand(n_blocks, -1).contiguous()
+    tie_cache, tie_table = pack_paged_cache(k_tie.unsqueeze(1), page_size)
+    index_cache = torch.cat((random_cache, tie_cache), dim=0)
+    varied_lens = [3000, 9000, 30000, context]
+    decode_lens = varied_lens + [context]
+    m = len(decode_lens)
+    n_varied = len(varied_lens)
+    slen = torch.tensor(decode_lens, dtype=dtypes.i32, device=device)
+    t2r = torch.arange(m, dtype=dtypes.i32, device=device)
+    qpos = slen - 1
+    visible = qsa_visible_blocks(qpos, slen, t2r, idx.compress_ratio)
+    if int(visible[n_varied - 1]) <= _COMPACT_MIN_ROW:
+        raise AssertionError("the long random row never reaches compact select")
+    if int(visible[n_varied]) <= _COMPACT_LIMIT:
+        raise AssertionError("the exact-tie row fits in the compact candidate buffer")
+    table = torch.zeros(m, max_pages, dtype=dtypes.i32, device=device)
+    table[:n_varied, : random_table.shape[1]] = random_table
+    table[n_varied, : tie_table.shape[1]] = tie_table + random_cache.shape[0]
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    out = torch.empty(m, qsa_paged._K, dtype=dtypes.i32, device=device)
+    tie_req = torch.zeros(1, dtype=dtypes.i32, device=device)
+
+    def oracle():
+        varied = qsa_topk_blocks(
+            qsa_indexer_scores(
+                q[:n_varied],
+                k_bar,
+                qpos[:n_varied],
+                slen[:n_varied],
+                t2r[:n_varied],
+                idx.compress_ratio,
+                score_scale=FLASH_NEXT_SCORE_SCALE,
+            ),
+            idx.block_budget,
+        )
+        tied = qsa_topk_blocks(
+            qsa_indexer_scores(
+                q[n_varied:],
+                k_tie,
+                qpos[n_varied:],
+                slen[n_varied:],
+                tie_req,
+                idx.compress_ratio,
+                score_scale=FLASH_NEXT_SCORE_SCALE,
+            ),
+            idx.block_budget,
+        )
+        smallest = torch.arange(idx.block_budget, device=device, dtype=dtypes.i32)
+        if not torch.equal(tied[0], smallest):
+            raise AssertionError("exact tie did not keep the smaller block indexes")
+        return varied, tied
+
+    def launch():
+        qsa_indexer_block_ids(
+            q, index_cache, table, t2r, qpos, slen, out=out, heads=(4,)
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for replay in range(2):
+        if replay:
+            q.copy_(torch.randn_like(q))
+        out.fill_(-2)
+        graph.replay()
+        torch.cuda.synchronize()
+        varied, tied = oracle()
+        _assert_indexer_block_ids(
+            varied,
+            out[:n_varied],
+            f"indexer padded decode graph replay {replay} diverged",
+        )
+        _assert_indexer_block_ids(
+            tied,
+            out[n_varied:],
+            f"indexer exact-tie graph replay {replay} diverged",
+        )
+
+
+def test_indexer_decode_rejects_invalid_page_ids():
+    """The one-row scorer must not load a page id that is not in the cache.
+
+    Both cases use M=4 so the one-row scorer runs, and a table wider
+    than 512 columns so the emit kernel does not. A request with no
+    live blocks still reads entry 0; that entry is ``-1``. A second
+    request has ``-1`` on a page inside the visible range.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    m, page_size = 4, 16
+
+    # No live blocks. Entry 0 is -1, and the table is wide enough that
+    # dead columns still index it.
+    n_pages = 33
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_cache = torch.zeros(
+        1, page_size, 1, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    table = torch.full((1, n_pages), -1, dtype=dtypes.i32, device=device)
+    qpos = torch.zeros(m, dtype=dtypes.i32, device=device)
+    slen = torch.zeros(1, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    got = qsa_indexer_block_ids(q, k_cache, table, token_to_req, qpos, slen, heads=(4,))
+    _assert_indexer_block_ids(
+        torch.full_like(got, -1),
+        got,
+        "indexer decode with no live pages selected a block",
+    )
+
+    # -1 inside the visible range. The other pages stay real.
+    context = 4096
+    n_blocks = context // idx.compress_ratio
+    torch.manual_seed(0)
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, context, device)
+    slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    bad_page = 3
+    index_table = index_table.clone()
+    index_table[0, bad_page] = -1
+    ref_scores = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    block0 = bad_page * page_size
+    ref_scores = ref_scores.clone()
+    ref_scores[:, block0 : block0 + page_size] = float("-inf")
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    got = qsa_indexer_block_ids(
+        q, index_cache, index_table, token_to_req, qpos, slen, heads=(4,)
+    )
+    _assert_indexer_block_ids(
+        ref_ids, got, "indexer decode kept a block whose page id is -1"
+    )
+
+
+def test_qsa_arch_allowlist(monkeypatch):
+    """_qsa_arch accepts the live gfx942 and gfx950 tokens.
+
+    ``get_gfx_runtime`` returns the bare arch. A longer token such as
+    gfx9420 raises, as does any other arch. The AOT compile context
+    substitutes the job arch for that lookup.
+    """
+    from aiter.aot.flydsl.qsa_paged import _qsa_compile_device
+    from aiter.ops.flydsl import qsa_paged as qsa_mod
+
+    for arch, cu_num in (("gfx942", 304), ("gfx950", 256)):
+        with _qsa_compile_device(arch, cu_num):
+            got = qsa_mod._qsa_arch()
+        if got != arch:
+            raise AssertionError(f"compile context {arch!r} resolved to {got!r}")
+    for arch in ("gfx942", "gfx950"):
+        monkeypatch.setattr(qsa_mod, "get_gfx_runtime", lambda arch=arch: arch)
+        got = qsa_mod._qsa_arch()
+        if got != arch:
+            raise AssertionError(f"{arch!r} resolved to {got!r}")
+    for bad in ("gfx1100", "gfx1250", "gfx90a", "gfx9420", "GFX950", ""):
+        monkeypatch.setattr(qsa_mod, "get_gfx_runtime", lambda bad=bad: bad)
+        try:
+            qsa_mod._qsa_arch()
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad!r} was accepted")
+
+
+def test_indexer_page_past_4gib():
+    """A physical indexer page at byte offset 2^32 must not alias page 0.
+
+    A page is 4096 bytes (page 16, one KV head, D=128, bf16), so physical
+    page 1048576 starts at 4 GiB. The table is 33 pages wide so the
+    scorers run, not emit. Logical page 32 is that far page and holds
+    ones; every other logical page is physical page 0 and holds zeros.
+    Q is ones, so only blocks 512..527 score above zero. M=4 uses the
+    one-row scorer and M=32 the prefill scorer.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    page_size = 16
+    page_bytes = page_size * 1 * idx.head_dim * dtypes.bf16.itemsize
+    alias = (1 << 32) // page_bytes
+    if alias * page_bytes != 1 << 32:
+        raise AssertionError(f"page of {page_bytes} bytes does not divide 4 GiB")
+    n_pages = alias + 1
+    n_logical = 33
+    far_logical = n_logical - 1
+    n_columns = n_logical * page_size
+    need = n_pages * page_bytes
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < need + (1 << 30):
+        aiter.logger.warning(
+            "skip indexer 4GiB page test: need %s bytes, %s free", need, free
+        )
+        return
+    k_cache = torch.empty(
+        n_pages, page_size, 1, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_cache[0].zero_()
+    k_cache[alias].fill_(1)
+    table = torch.zeros(1, n_logical, dtype=dtypes.i32, device=device)
+    table[0, far_logical] = alias
+    context = n_columns * idx.compress_ratio
+    k_bar = torch.zeros(n_columns, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar[far_logical * page_size : n_columns] = 1
+    for m in (4, 32):
+        q = torch.ones(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        qpos = torch.full((m,), context - 1, dtype=dtypes.i32, device=device)
+        slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        ref_scores = qsa_indexer_scores(
+            q,
+            k_bar,
+            qpos,
+            slen,
+            token_to_req,
+            idx.compress_ratio,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+        )
+        ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+        got = qsa_indexer_block_ids(
+            q, k_cache, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        _assert_indexer_block_ids(
+            ref_ids, got, f"indexer page past 4 GiB aliased page 0 at M={m}"
+        )
+
+
+def test_expand_rejects_out_that_cannot_hold_the_stores():
+    """A caller ``out`` must be int32 ``[rows, token_topk + compress_ratio - 1]``.
+
+    ``qsa_expand_block_indices`` rejects a narrower buffer or a non-int32
+    buffer before launch. A matching buffer is returned as the same tensor,
+    including a zero-row buffer that does not launch.
+    """
+    if not torch.cuda.is_available():
+        return
+    rows, compress_ratio, token_topk = 2, 4, 8
+    output_width = token_topk + compress_ratio - 1
+    device = torch.device("cuda")
+    block_indices = torch.zeros(
+        (rows, token_topk // compress_ratio), dtype=torch.int32, device=device
+    )
+    query_positions = torch.zeros(rows, dtype=torch.int32, device=device)
+    sequence_lengths = torch.zeros(1, dtype=torch.int32, device=device)
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+
+    def expand(out):
+        return qsa_expand_block_indices(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            compress_ratio,
+            token_topk,
+            out,
+        )
+
+    rejected = (
+        torch.empty((rows, 1), dtype=torch.int32, device=device),
+        torch.empty((rows, output_width), dtype=torch.int64, device=device),
+    )
+    for out in rejected:
+        try:
+            expand(out)
+        except ValueError as exc:
+            if "out has an invalid shape" not in str(exc):
+                raise
+        else:
+            raise AssertionError(
+                f"accepted out {out.dtype} {tuple(out.shape)} {out.device}"
+            )
+    empty_rows = torch.zeros(
+        (0, token_topk // compress_ratio), dtype=torch.int32, device=device
+    )
+    empty_out = torch.empty((0, output_width), dtype=torch.int32, device=device)
+    got = qsa_expand_block_indices(
+        empty_rows,
+        query_positions[:0],
+        sequence_lengths,
+        token_to_req[:0],
+        compress_ratio,
+        token_topk,
+        empty_out,
+    )
+    if got.data_ptr() != empty_out.data_ptr():
+        raise AssertionError("a matching caller out was replaced")
+
+
+def test_indexer_supported_padded_page_and_rejects_misaligned():
+    """A padded page stride is in contract; a 16-byte gather that cannot align is not.
+
+    vLLM keeps D contiguous and the token stride at D, and pads the page
+    stride. ``numel()`` undercounts that view. A D stride other than 1, or a
+    page/token/head stride that is not a multiple of 8 elements, is rejected.
+    """
+    page_size, d = 16, 128
+    n_pages = 3
+    page_elems = page_size * d
+    q = torch.zeros(1, 4, d, dtype=torch.bfloat16)
+    table = torch.zeros(1, 1, dtype=torch.int32)
+    dense = torch.zeros(n_pages, page_size, 1, d, dtype=torch.bfloat16)
+    if qsa_paged.qsa_indexer_supported(q, dense, table, (4,)) is not None:
+        raise AssertionError("a packed indexer cache was rejected")
+    page_stride = page_elems + 256
+    parent = torch.empty(n_pages, page_stride, dtype=torch.bfloat16)
+    view = parent.as_strided((n_pages, page_size, 1, d), (page_stride, d, d, 1))
+    if view.is_contiguous():
+        raise AssertionError("padded page stride should not be contiguous")
+    if qsa_paged.qsa_indexer_supported(q, view, table, (4,)) is not None:
+        raise AssertionError(f"padded page stride was rejected: {view.stride()}")
+    span = span_bytes(view)
+    packed = view.numel() * view.element_size()
+    if span <= packed:
+        raise AssertionError(f"span {span} did not exceed packed bytes {packed}")
+    bad = parent.as_strided((n_pages, page_size, 1, d), (page_elems + 4, d, d, 1))
+    reason = qsa_paged.qsa_indexer_supported(q, bad, table, (4,))
+    if reason is None or "multiples of 8" not in reason:
+        raise AssertionError(f"misaligned page stride served: {reason}")
+    wide = torch.empty(n_pages, page_size, 1, d * 2, dtype=torch.bfloat16)
+    strided_d = wide.as_strided(
+        dense.shape, (wide.stride(0), wide.stride(1), wide.stride(2), 2)
+    )
+    reason = qsa_paged.qsa_indexer_supported(q, strided_d, table, (4,))
+    if reason is None or "unit D" not in reason:
+        raise AssertionError(f"strided D was served: {reason}")
+    zero_page = torch.zeros(1, 0, 1, d, dtype=torch.bfloat16)
+    reason = qsa_paged.qsa_indexer_supported(q, zero_page, table, (4,))
+    if reason is None or "page_size" not in reason:
+        raise AssertionError(f"zero page size was served: {reason}")
+
+
+def _indexer_cache_with_page_gap(cache, gap_elems: int) -> torch.Tensor:
+    """Same pages, with ``gap_elems`` unused elements between them."""
+    n_pages, page_size, n_heads, head_dim = cache.shape
+    page_elems = page_size * n_heads * head_dim
+    page_stride = page_elems + gap_elems
+    parent = cache.new_empty(n_pages, page_stride)
+    parent.zero_()
+    parent[:, :page_elems] = cache.reshape(n_pages, page_elems)
+    return parent.as_strided(
+        cache.shape, (page_stride, n_heads * head_dim, head_dim, 1)
+    )
+
+
+def test_indexer_padded_page_stride_matches_packed():
+    """The indexer reads a padded page stride in place, on both scorers.
+
+    The one-row scorer (M=4) and the 16-row scorer (M=16) must match the
+    packed cache. ``n_columns`` is past 512 so this is the gather, not emit.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    page_size = 16
+    n_blocks = 528
+    seq_len = n_blocks * idx.compress_ratio
+    torch.manual_seed(0)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen)
+    gapped = _indexer_cache_with_page_gap(index_cache, 256)
+    if gapped.is_contiguous():
+        raise AssertionError("gapped indexer cache is contiguous")
+    if (
+        qsa_paged.qsa_indexer_supported(
+            torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device),
+            gapped,
+            index_table,
+            (4,),
+        )
+        is not None
+    ):
+        raise AssertionError("gapped indexer cache was rejected")
+    for m in (4, 16):
+        q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        qpos = _query_positions(m, seq_len, device)
+        slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        packed = qsa_indexer_block_ids(
+            q, index_cache, index_table, token_to_req, qpos, slen, heads=(4,)
+        )
+        got = qsa_indexer_block_ids(
+            q, gapped, index_table, token_to_req, qpos, slen, heads=(4,)
+        )
+        if not torch.equal(packed, got):
+            raise AssertionError(f"padded page stride diverged at M={m}")
+
+
+def test_indexer_wide_padded_page_does_not_alias():
+    """A page past 4 GiB is addressed by its real stride, not by numel.
+
+    Doubling the page stride puts view page ``alias / 2`` on the byte at
+    2^32. The view's packed byte count stays under 4 GiB, which is the
+    decision ``numel()`` would have made. A second view is the shared-pool
+    stride: 33 pages, with the last page just past 4 GiB, so the stride
+    itself is many times one page.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    page_size = 16
+    page_elems = page_size * idx.head_dim
+    page_bytes = page_elems * dtypes.bf16.itemsize
+    alias = (1 << 32) // page_bytes
+    if alias * page_bytes != 1 << 32 or alias % 2:
+        raise AssertionError(f"page of {page_bytes} bytes does not split 4 GiB")
+    n_storage = alias + 1
+    view_pages = alias // 2 + 1
+    if (view_pages - 1) * 2 != alias:
+        raise AssertionError("doubled stride does not land on the 4 GiB page")
+    need = n_storage * page_bytes
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < need + (1 << 30):
+        aiter.logger.warning(
+            "skip indexer wide padded page test: need %s bytes, %s free", need, free
+        )
+        return
+    parent = torch.empty(
+        n_storage, page_size, 1, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    parent[0].zero_()
+    parent[alias].fill_(1)
+    view = parent.as_strided(
+        (view_pages, page_size, 1, idx.head_dim),
+        (2 * page_elems, idx.head_dim, idx.head_dim, 1),
+    )
+    span = span_bytes(view)
+    packed = view.numel() * view.element_size()
+    if span <= (1 << 32) or packed > (1 << 32):
+        raise AssertionError(f"span {span} packed {packed} is not the wide-view case")
+    n_logical = 33
+    far_logical = n_logical - 1
+    n_columns = n_logical * page_size
+    table = torch.zeros(1, n_logical, dtype=dtypes.i32, device=device)
+    table[0, far_logical] = view_pages - 1
+    context = n_columns * idx.compress_ratio
+    k_bar = torch.zeros(n_columns, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar[far_logical * page_size : n_columns] = 1
+    for m in (4, 16):
+        q = torch.ones(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        qpos = torch.full((m,), context - 1, dtype=dtypes.i32, device=device)
+        slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        ref_scores = qsa_indexer_scores(
+            q,
+            k_bar,
+            qpos,
+            slen,
+            token_to_req,
+            idx.compress_ratio,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+        )
+        ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+        got = qsa_indexer_block_ids(
+            q, view, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        _assert_indexer_block_ids(
+            ref_ids, got, f"indexer wide padded page aliased page 0 at M={m}"
+        )
+
+    del parent, view
+    packed_cache = torch.zeros(
+        n_logical, page_size, 1, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    packed_cache[far_logical].fill_(1)
+    pool = _widen_cache(packed_cache)
+    if pool.stride(0) <= 2 * page_elems:
+        raise AssertionError(
+            f"pool page stride {pool.stride(0)} is not larger than 2x the page"
+        )
+    span = span_bytes(pool)
+    packed = pool.numel() * pool.element_size()
+    if span <= (1 << 32) or packed > (1 << 32):
+        raise AssertionError(f"span {span} packed {packed} is not the wide-view case")
+    table = torch.zeros(1, n_logical, dtype=dtypes.i32, device=device)
+    table[0, far_logical] = far_logical
+    for m in (4, 16):
+        q = torch.ones(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        qpos = torch.full((m,), context - 1, dtype=dtypes.i32, device=device)
+        slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        ref_scores = qsa_indexer_scores(
+            q,
+            k_bar,
+            qpos,
+            slen,
+            token_to_req,
+            idx.compress_ratio,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+        )
+        ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+        got = qsa_indexer_block_ids(
+            q, pool, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        _assert_indexer_block_ids(
+            ref_ids, got, f"indexer pool page stride aliased page 0 at M={m}"
+        )
+
+
+def test_paged_gqa_flash_next_decode_matches_oracle():
+    """Flash-Next FlyDSL sparse GQA decode matches the fp32 oracle on paged K/V."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    m, seq_len, page_size, width = 2, 64, 16, 8
+    torch.manual_seed(0)
+    q = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+    indices[:, -1] = -1
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+    v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
+    assert torch.equal(kv_table, kv_table_v)
+    ref = sparse_gqa_ref(q, k, v, indices)
+    out = flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="paged GQA vs oracle GQA",
+    )
+    if err != 0:
+        raise AssertionError(f"paged GQA decode diverged from the oracle (err={err})")
+
+
+def test_paged_gqa_merge_covers_every_head_dim_slice():
+    """A split launch merges every D slice, at 64 and at 32 elements wide.
+
+    D=192 decode splits into three 64-wide merge slices. D=96 prefill
+    splits too, and 96 is not a multiple of 64, so each slice is 32 wide
+    and half the wave stores nothing.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    device = torch.device("cuda")
+    seq_len, page_size = 256, 16
+    # (Hq, Hkv, D, rows, width, merge slice)
+    cases = ((16, 1, 192, 1, 32, 64), (16, 1, 96, 32, 64, 32))
+    for hq, hkv, d, m, width, slice_d in cases:
+        _, _, n_splits = _launch_config(m, width, hkv, d)
+        if n_splits < 2 or _merge_slice(d) != slice_d:
+            raise AssertionError(
+                f"D={d} M={m} W={width} launches {n_splits} splits with a "
+                f"{_merge_slice(d)}-wide merge"
+            )
+        torch.manual_seed(0)
+        q = torch.randn(m, hq, d, dtype=dtypes.bf16, device=device)
+        k = torch.randn(seq_len, hkv, d, dtype=dtypes.bf16, device=device)
+        v = torch.randn(seq_len, hkv, d, dtype=dtypes.bf16, device=device)
+        indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+        indices[:, -1] = -1
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        gen = torch.Generator(device=device)
+        gen.manual_seed(2)
+        k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+        v_cache, _ = pack_paged_cache(v, page_size, physical=kv_table[0])
+        ref = sparse_gqa_ref(q, k, v, indices)
+        out = flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"paged GQA D={d} merge vs oracle",
+        )
+        if err != 0:
+            raise AssertionError(f"D={d} split merge diverged (err={err})")
+
+
+def test_paged_gqa_flash_next_prefill_matches_oracle():
+    """The BLOCK_N=64/two-wave paged GQA specialization matches at prefill M=512."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    m, seq_len, page_size, width = 512, 64, 16, 8
+    torch.manual_seed(0)
+    q = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+    indices[:, -1] = -1
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+    v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
+    assert torch.equal(kv_table, kv_table_v)
+    ref = sparse_gqa_ref(q, k, v, indices)
+    out = flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="paged GQA prefill vs oracle GQA",
+    )
+    if err != 0:
+        raise AssertionError(f"paged GQA prefill diverged from the oracle (err={err})")
+
+
+def test_paged_gqa_two_prompt_prefill_matches_oracle():
+    """Two prefill prompts gather through different page-table rows.
+
+    Sixteen query rows each, so ``M=32`` takes the prefill launch. The
+    prompts have different V, and each row's token ids stay inside its own
+    sequence.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    page_size = 16
+    rows_each = 16
+    width = 8
+    torch.manual_seed(0)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    prompts = []
+    for seq_len, value in ((64, 1.0), (96, 2.0)):
+        k = torch.randn(
+            seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+        )
+        v = torch.full(
+            (seq_len, gqa.kv_heads, gqa.head_dim),
+            value,
+            dtype=dtypes.bf16,
+            device=device,
+        )
+        q = torch.randn(
+            rows_each, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+        )
+        indices = torch.randint(
+            0, seq_len, (rows_each, width), dtype=dtypes.i32, device=device
+        )
+        indices[:, -1] = -1
+        k_cache, table = pack_paged_cache(k, page_size, generator=gen)
+        v_cache, table_v = pack_paged_cache(v, page_size, physical=table[0])
+        if not torch.equal(table, table_v):
+            raise AssertionError("K and V page tables diverged")
+        prompts.append((q, k, v, k_cache, v_cache, table, indices))
+    page_offset = 0
+    page_width = max(prompt[5].shape[1] for prompt in prompts)
+    table = torch.zeros(len(prompts), page_width, dtype=dtypes.i32, device=device)
+    k_pages = []
+    v_pages = []
+    for req, (_q, _k, _v, k_cache, v_cache, prompt_table, _indices) in enumerate(
+        prompts
+    ):
+        n_pages = prompt_table.shape[1]
+        table[req, :n_pages] = prompt_table[0] + page_offset
+        page_offset += k_cache.shape[0]
+        k_pages.append(k_cache)
+        v_pages.append(v_cache)
+    q = torch.cat([prompt[0] for prompt in prompts], dim=0)
+    indices = torch.cat([prompt[6] for prompt in prompts], dim=0)
+    token_to_req = torch.cat(
+        [
+            torch.full((rows_each,), req, dtype=dtypes.i32, device=device)
+            for req in range(len(prompts))
+        ]
+    )
+    k_cache = torch.cat(k_pages, dim=0)
+    v_cache = torch.cat(v_pages, dim=0)
+    ref = torch.cat(
+        [
+            sparse_gqa_ref(prompt[0], prompt[1], prompt[2], prompt[6])
+            for prompt in prompts
+        ],
+        dim=0,
+    )
+    out = flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, table, token_to_req)
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="paged GQA two-prompt prefill vs oracle GQA",
+    )
+    if err != 0:
+        raise AssertionError(
+            f"paged GQA two-prompt prefill diverged from the oracle (err={err})"
+        )
+
+
+def test_paged_gqa_page_past_4gib():
+    """A physical page at byte offset 2^32 must not alias page 0.
+
+    Flash-Next pages are 16384 bytes (page 16, 2 KV heads, D=256, bf16), so
+    physical page 262144 starts at 4 GiB. Q is zero, so each live token
+    contributes its V with equal weight. Page 0 is ones and the far page
+    is twos. One row gathers both in a single tile.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    page_size = 16
+    page_bytes = page_size * gqa.kv_heads * gqa.head_dim * dtypes.bf16.itemsize
+    alias = (1 << 32) // page_bytes
+    if alias * page_bytes != 1 << 32:
+        raise AssertionError(f"page of {page_bytes} bytes does not divide 4 GiB")
+    n_pages = alias + 1
+    need = n_pages * page_bytes * 2
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < need + (1 << 30):
+        aiter.logger.warning(
+            "skip paged GQA 4GiB page test: need %s bytes, %s free", need, free
+        )
+        return
+    q = torch.zeros(3, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k_cache = torch.empty(
+        n_pages,
+        page_size,
+        gqa.kv_heads,
+        gqa.head_dim,
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    v_cache = torch.empty_like(k_cache)
+    k_cache[0].zero_()
+    k_cache[alias].zero_()
+    v_cache[0].fill_(1)
+    v_cache[alias].fill_(2)
+    page_table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
+    page_table[0, 0] = 0
+    page_table[0, alias] = alias
+    far_tok = alias * page_size
+    indices = torch.tensor(
+        [[far_tok, 0], [far_tok, -1], [0, -1]], dtype=dtypes.i32, device=device
+    )
+    token_to_req = torch.zeros(3, dtype=dtypes.i32, device=device)
+    out = flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, page_table, token_to_req)
+    got = out.float()
+    expect = (
+        torch.tensor([1.5, 2.0, 1.0], dtype=torch.float32, device=device)
+        .view(3, 1, 1)
+        .expand_as(got)
+    )
+    if not torch.equal(got, expect):
+        raise AssertionError(
+            "paged GQA page past 4 GiB aliased or collapsed: "
+            f"row means {got.mean(dim=(1, 2)).tolist()}"
+        )
+
+
+def _interleave_kv(k_cache, v_cache):
+    """vLLM's paged layout: one ``[pages, page_size, H, 2 * D]`` buffer, K|V."""
+    d = k_cache.shape[-1]
+    kv = torch.cat((k_cache, v_cache), dim=-1)
+    return kv[..., :d], kv[..., d:]
+
+
+def test_paged_gqa_interleaved_kv_view_matches_contiguous():
+    """Paged GQA reads K|V-interleaved cache views in place, bit-equal to copies.
+
+    Covers Flash-Next and its TP2 shard (12 query heads over 1 KV head), at
+    decode and prefill M.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    seq_len, page_size, width = 256, 16, 64
+    for n_heads, kv_heads in (
+        (gqa.n_heads, gqa.kv_heads),
+        (gqa.n_heads // 2, gqa.kv_heads // 2),
+    ):
+        for m in (2, 512):
+            torch.manual_seed(m)
+            q = torch.randn(m, n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+            k = torch.randn(
+                seq_len, kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+            )
+            v = torch.randn_like(k)
+            indices = torch.randint(
+                0, seq_len, (m, width), dtype=dtypes.i32, device=device
+            )
+            indices[:, -3:] = -1
+            token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+            gen = torch.Generator(device=device)
+            gen.manual_seed(2)
+            k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+            v_cache, _ = pack_paged_cache(v, page_size, physical=kv_table[0])
+            k_view, v_view = _interleave_kv(k_cache, v_cache)
+            if k_view.is_contiguous():
+                raise AssertionError("interleaved K view should be strided")
+            ref = flydsl_qsa_paged_gqa(
+                q, k_cache, v_cache, indices, kv_table, token_to_req
+            )
+            got = flydsl_qsa_paged_gqa(
+                q, k_view, v_view, indices, kv_table, token_to_req
+            )
+            if not torch.equal(ref, got):
+                diff = (ref.float() - got.float()).abs().max().item()
+                raise AssertionError(
+                    f"paged GQA on interleaved K|V diverged at Hq={n_heads} "
+                    f"Hk={kv_heads} M={m}: max |diff| {diff}"
+                )
+
+
+def test_paged_gqa_interleaved_kv_page_past_4gib():
+    """The wide path honours the view's page stride, not a dense one.
+
+    An interleaved K view of 2 KV heads at D=256 has a 32768-byte page
+    stride, so page 131072 starts at 4 GiB. The view's numel alone would
+    stay under 4 GiB and pick the narrow descriptor.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    page_size = 16
+    page_bytes = 2 * page_size * gqa.kv_heads * gqa.head_dim * dtypes.bf16.itemsize
+    alias = (1 << 32) // page_bytes
+    if alias * page_bytes != 1 << 32:
+        raise AssertionError(f"page of {page_bytes} bytes does not divide 4 GiB")
+    n_pages = alias + 1
+    need = n_pages * page_bytes
+    free, _total = torch.cuda.mem_get_info(device)
+    if free < need + (1 << 30):
+        aiter.logger.warning(
+            "skip paged GQA interleaved 4GiB page test: need %s bytes, %s free",
+            need,
+            free,
+        )
+        return
+    kv = torch.empty(
+        n_pages,
+        page_size,
+        gqa.kv_heads,
+        2 * gqa.head_dim,
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    k_view, v_view = kv[..., : gqa.head_dim], kv[..., gqa.head_dim :]
+    k_view[0].zero_()
+    k_view[alias].zero_()
+    v_view[0].fill_(1)
+    v_view[alias].fill_(2)
+    q = torch.zeros(3, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    page_table = torch.zeros(1, n_pages, dtype=dtypes.i32, device=device)
+    page_table[0, alias] = alias
+    far_tok = alias * page_size
+    indices = torch.tensor(
+        [[far_tok, 0], [far_tok, -1], [0, -1]], dtype=dtypes.i32, device=device
+    )
+    token_to_req = torch.zeros(3, dtype=dtypes.i32, device=device)
+    got = flydsl_qsa_paged_gqa(
+        q, k_view, v_view, indices, page_table, token_to_req
+    ).float()
+    expect = (
+        torch.tensor([1.5, 2.0, 1.0], dtype=torch.float32, device=device)
+        .view(3, 1, 1)
+        .expand_as(got)
+    )
+    if not torch.equal(got, expect):
+        raise AssertionError(
+            "paged GQA interleaved page past 4 GiB aliased or collapsed: "
+            f"row means {got.mean(dim=(1, 2)).tolist()}"
+        )
+
+
+def _paged_gqa_one_live_token(m, width, live_col):
+    """Q/K zero, V one, every index -1 except ``live_col``."""
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    q = torch.zeros(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k_cache = torch.zeros(
+        1, 16, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v_cache = torch.ones_like(k_cache)
+    page_table = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
+    indices = torch.full((m, width), -1, dtype=dtypes.i32, device=device)
+    indices[:, live_col] = 0
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    return flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, page_table, token_to_req)
+
+
+def test_paged_gqa_empty_first_tile_keeps_later_token():
+    """A masked tile ahead of the only live token must not zero the output.
+
+    The live token's score is zero and its V is one, so the output is one.
+    These are the review's columns: 16 inside M=1/W=2048, and 64 inside
+    M=512/W=128.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    cases = ((1, 2048, 16), (512, 128, 64))
+    for m, width, live_col in cases:
+        out = _paged_gqa_one_live_token(m, width, live_col).float()
+        if not torch.allclose(out, torch.ones_like(out)):
+            raise AssertionError(
+                f"paged GQA empty-to-valid M={m} W={width} column {live_col} "
+                f"mean {out.mean().item()} expected 1"
+            )
+
+
+def test_paged_gqa_default_out_ignores_query_strides():
+    """Default output matches the oracle for both review layouts.
+
+    Shape ``[2, 24, 256]``. The first query is contiguous, strides
+    ``(6144, 256, 1)``. The second holds the same values at strides
+    ``(6144, 1, 24)``. The plan cache keeps the first compile.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    m, seq_len, page_size, width = 2, 64, 16, 8
+    torch.manual_seed(0)
+    q_contig = torch.randn(
+        m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    if q_contig.stride() != (6144, 256, 1):
+        raise AssertionError(f"contiguous strides {q_contig.stride()}")
+    q_heads_last = q_contig.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    if q_heads_last.stride() != (6144, 1, 24):
+        raise AssertionError(f"transposed strides {q_heads_last.stride()}")
+    if not torch.equal(q_contig, q_heads_last):
+        raise AssertionError("the two query layouts do not hold the same values")
+    k = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+    indices[:, -1] = -1
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
+    v_cache, _kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
+    ref = sparse_gqa_ref(q_contig, k, v, indices)
+    for name, q in (("contiguous", q_contig), ("heads-last", q_heads_last)):
+        out = flydsl_qsa_paged_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"paged GQA default out vs oracle ({name})",
+        )
+        if err != 0:
+            raise AssertionError(
+                f"paged GQA default out diverged for {name} strides {tuple(q.stride())} "
+                f"(err={err})"
+            )
+
+
+def test_indexer_empty_or_short_request_geometry():
+    """Empty indexer geometry writes -1 without launching.
+
+    A context longer than the page table is rejected before launch. An
+    empty context, cache, or table used to clamp the index to 0 and load.
+    """
+    q = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 16, 1, 128, dtype=torch.bfloat16)
+    short_table = torch.zeros(1, 1, dtype=torch.int32)
+    context = torch.zeros(2, dtype=torch.int32)
+    positions = torch.zeros(1, dtype=torch.int32)
+    requests = torch.zeros(1, dtype=torch.int32)
+    try:
+        qsa_paged.qsa_indexer_block_ids(
+            q, cache, short_table, requests, positions, context
+        )
+    except ValueError as exc:
+        if "context lengths" not in str(exc):
+            raise
+    else:
+        raise AssertionError("a page table shorter than context_lens launched")
+    no_rows = torch.empty(0, 1, dtype=torch.int32)
+    one_context = torch.zeros(1, dtype=torch.int32)
+    try:
+        qsa_paged.qsa_indexer_block_ids(
+            q, cache, no_rows, requests, positions, one_context
+        )
+    except ValueError as exc:
+        if "context lengths" not in str(exc):
+            raise
+    else:
+        raise AssertionError("a page table with no request rows launched")
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    device = torch.device("cuda")
+    q = q.to(device)
+    cache = cache.to(device)
+    positions = positions.to(device)
+    requests = requests.to(device)
+    one_context = torch.zeros(1, dtype=torch.int32, device=device)
+    one_table = torch.zeros(1, 1, dtype=torch.int32, device=device)
+    empty_context = torch.empty(0, dtype=torch.int32, device=device)
+    empty_cache = torch.empty(0, 16, 1, 128, dtype=torch.bfloat16, device=device)
+    no_requests = torch.empty(0, 1, dtype=torch.int32, device=device)
+    no_pages = torch.empty(1, 0, dtype=torch.int32, device=device)
+    cases = (
+        ("empty context", cache, one_table, empty_context),
+        ("empty cache", empty_cache, one_table, one_context),
+        ("no request rows", cache, no_requests, empty_context),
+        ("no logical pages", cache, no_pages, one_context),
+    )
+    launched = []
+
+    def _record_launch(*_args, **_kwargs):
+        launched.append(1)
+        raise AssertionError("indexer launched on empty geometry")
+
+    original = qsa_paged._run_compiled
+    qsa_paged._run_compiled = _record_launch
+    try:
+        for name, k_cache, page_table, lengths in cases:
+            launched.clear()
+            out = qsa_paged.qsa_indexer_block_ids(
+                q, k_cache, page_table, requests, positions, lengths
+            )
+            if launched:
+                raise AssertionError(f"indexer launched for {name}")
+            if not torch.equal(out, torch.full_like(out, -1)):
+                raise AssertionError(f"indexer {name} output was not -1")
+    finally:
+        qsa_paged._run_compiled = original
+
+
+def test_qsa_indexer_rejects_a_score_workspace_before_launch():
+    """A provided score buffer is fp32 ``[M, n_columns]`` with unit columns.
+
+    The check runs on the host, including the emit path, which does not
+    read the buffer. A wrong buffer does not launch.
+    """
+    q = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 16, 1, 128, dtype=torch.bfloat16)
+    table = torch.zeros(1, 8, dtype=torch.int32)
+    rows = torch.zeros(1, dtype=torch.int32)
+    n_columns = int(table.shape[1]) * int(cache.shape[1])
+    cases = (
+        torch.empty(1, n_columns - 1),
+        torch.empty(1, n_columns, dtype=torch.float16),
+        torch.empty(1, n_columns * 2)[:, ::2],
+    )
+    for scores in cases:
+        try:
+            qsa_indexer_block_ids(q, cache, table, rows, rows, rows, scores=scores)
+        except ValueError as exc:
+            if "scores" not in str(exc):
+                raise
+        else:
+            raise AssertionError(
+                f"scores shape {tuple(scores.shape)} dtype {scores.dtype} "
+                f"stride {tuple(scores.stride())} was accepted"
+            )
+    q_gqa = torch.zeros(1, 24, 256, dtype=torch.bfloat16)
+    k_cache = torch.zeros(1, 16, 2, 256, dtype=torch.bfloat16)
+    try:
+        qsa_layer(
+            q,
+            cache,
+            table,
+            q_gqa,
+            k_cache,
+            k_cache,
+            table,
+            rows,
+            rows,
+            rows,
+            scores=torch.empty(1, 4),
+        )
+    except ValueError as exc:
+        if "scores must be float32" not in str(exc):
+            raise
+    else:
+        raise AssertionError("qsa_layer accepted a short score workspace")
+
+
+def test_qsa_indexer_caller_score_workspace_matches_the_private_buffer():
+    """A caller-owned score buffer selects the same block ids.
+
+    The long-row path writes that buffer and still returns only the ids.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 2, 4096, 16
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    n_columns = int(index_table.shape[1]) * page_size
+    private = qsa_indexer_block_ids(
+        q,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        heads=(idx.n_heads,),
+    )
+    workspace = torch.full((m, n_columns), float("nan"), device=device)
+    shared = qsa_indexer_block_ids(
+        q,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        heads=(idx.n_heads,),
+        scores=workspace,
+    )
+    _assert_indexer_block_ids(private, shared, "caller score workspace")
+    if not torch.isfinite(workspace).any():
+        raise AssertionError("caller score workspace was not written")
+
+
+def test_paged_gqa_empty_cache_or_table_returns_zeros():
+    """No pages and a nonempty index list returns zeros without launching.
+
+    The cache geometry has zero physical pages. The table geometry has
+    zero logical pages, or columns but no request row. Any of those used
+    to clamp the index to 0 and load.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    q = torch.randn(1, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    indices = torch.zeros(1, 4, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(1, dtype=dtypes.i32, device=device)
+    pages = torch.zeros(
+        1, 16, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    empty_cache = torch.empty(
+        0, 16, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    one_page = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
+    no_pages = torch.empty(1, 0, dtype=dtypes.i32, device=device)
+    no_requests = torch.empty(0, 1, dtype=dtypes.i32, device=device)
+    cases = (
+        ("empty cache", empty_cache, empty_cache, one_page),
+        ("empty table", pages, pages, no_pages),
+        ("no requests", pages, pages, no_requests),
+    )
+    launched = []
+
+    def _record_launch(*_args, **_kwargs):
+        launched.append(1)
+        raise AssertionError("flydsl_qsa_paged_gqa launched with no pages")
+
+    original = qsa_paged._run_compiled
+    qsa_paged._run_compiled = _record_launch
+    try:
+        for name, k_cache, v_cache, page_table in cases:
+            launched.clear()
+            out = flydsl_qsa_paged_gqa(
+                q, k_cache, v_cache, indices, page_table, token_to_req
+            )
+            if launched:
+                raise AssertionError(f"paged GQA launched for {name}")
+            if not torch.equal(out, torch.zeros_like(out)):
+                raise AssertionError(f"paged GQA {name} output was not zeros")
+    finally:
+        qsa_paged._run_compiled = original
+
+
+def test_paged_gqa_caller_workspace_is_the_only_partial_buffer():
+    """A caller-owned split workspace matches the default launch.
+
+    The kernel writes that pair. A workspace with the wrong split count
+    is rejected. A one-split launch ignores the workspace and still
+    matches the default output.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    m, seq_len, page_size, width = 1, 64, 16, 32
+    torch.manual_seed(0)
+    q = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    k = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    v = torch.randn(
+        seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+    )
+    indices = torch.randint(0, seq_len, (m, width), dtype=dtypes.i32, device=device)
+    indices[:, -1] = -1
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    k_cache, kv_table = pack_paged_cache(k, page_size)
+    v_cache, _ = pack_paged_cache(v, page_size, physical=kv_table[0])
+    out_default = torch.empty_like(q)
+    out_ws = torch.empty_like(q)
+    ref = flydsl_qsa_paged_gqa(
+        q, k_cache, v_cache, indices, kv_table, token_to_req, out=out_default
+    )
+    accepted = None
+    for n_splits in range(2, 33):
+        partial_out = torch.full(
+            (n_splits, m, gqa.n_heads, gqa.head_dim),
+            7,
+            dtype=torch.float32,
+            device=device,
+        )
+        partial_lse = torch.full(
+            (n_splits, m, gqa.n_heads), 3, dtype=torch.float32, device=device
+        )
+        try:
+            got = flydsl_qsa_paged_gqa(
+                q,
+                k_cache,
+                v_cache,
+                indices,
+                kv_table,
+                token_to_req,
+                out=out_ws,
+                workspace=(partial_out, partial_lse),
+            )
+        except ValueError:
+            continue
+        if torch.all(partial_out == 7):
+            continue
+        accepted = (got, n_splits, partial_lse)
+        break
+    if accepted is None:
+        raise AssertionError("no caller workspace was written")
+    got, n_splits, partial_lse = accepted
+    if not torch.equal(got, ref):
+        raise AssertionError("workspace launch diverged from the default launch")
+    bad = torch.empty(
+        (n_splits + 1, m, gqa.n_heads, gqa.head_dim),
+        dtype=torch.float32,
+        device=device,
+    )
+    try:
+        flydsl_qsa_paged_gqa(
+            q,
+            k_cache,
+            v_cache,
+            indices,
+            kv_table,
+            token_to_req,
+            out=out_ws,
+            workspace=(bad, partial_lse),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("wrong workspace shape was accepted")
+
+    m1, width1 = 2, 8
+    q1 = torch.randn(m1, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
+    indices1 = torch.randint(0, seq_len, (m1, width1), dtype=dtypes.i32, device=device)
+    indices1[:, -1] = -1
+    token1 = torch.zeros(m1, dtype=dtypes.i32, device=device)
+    out1 = torch.empty_like(q1)
+    ref1 = flydsl_qsa_paged_gqa(
+        q1, k_cache, v_cache, indices1, kv_table, token1, out=out1
+    )
+    ignored = (
+        torch.empty(1, dtype=torch.float32, device=device),
+        torch.empty(1, dtype=torch.float32, device=device),
+    )
+    out1b = torch.empty_like(q1)
+    got1 = flydsl_qsa_paged_gqa(
+        q1,
+        k_cache,
+        v_cache,
+        indices1,
+        kv_table,
+        token1,
+        out=out1b,
+        workspace=ignored,
+    )
+    if not torch.equal(got1, ref1):
+        raise AssertionError("one-split workspace launch diverged")
+
+
+def _indexer_select(
+    q,
+    k_cache,
+    page_table,
+    token_to_req,
+    query_positions,
+    sequence_lengths,
+    token_topk,
+    compress_ratio,
+    heads,
+):
+    """Block ids plus ``qsa_expand_block_indices``.
+
+    Set equality uses the block ids.
+    """
+    block_ids = qsa_indexer_block_ids(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        heads=heads,
+    )
+    indices = qsa_expand_block_indices(
+        block_ids,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        compress_ratio,
+        token_topk,
+    )
+    return indices, block_ids
+
+
+def _pad_index_table(index_table, pad_pages):
+    """Zero-fill a one-request block table out to ``pad_pages``.
+
+    ``pad_pages <= 0`` leaves the packed table. A wider table is what vLLM
+    allocates for ``max_model_len``: real pages in front, zeros after them.
+    A pad narrower than the packed table is an error; the sweep skips that
+    row before calling.
+    """
+    if pad_pages <= 0:
+        return index_table
+    n_pages = index_table.shape[1]
+    if pad_pages < n_pages:
+        raise ValueError(
+            f"pad_pages={pad_pages} is narrower than the packed table ({n_pages} pages)"
+        )
+    if pad_pages == n_pages:
+        return index_table
+    wide = torch.zeros(
+        index_table.shape[0],
+        pad_pages,
+        dtype=index_table.dtype,
+        device=index_table.device,
+    )
+    wide[:, : index_table.shape[1]] = index_table
+    return wide
+
+
+@benchmark()
+def bench_qsa_flash_next_indexer(
+    m, seq_len, page_size, dtype, rotate=0, pad_pages=0, cache_layout="packed"
+):
+    """Flash-Next FlyDSL indexer vs oracle set equality.
+
+    Short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
+    into an fp32 score matrix. Selection is decode radix below 32768 columns
+    and streaming radix at or above that width. Single-request prefill scores
+    16 query rows per workgroup. The FlyDSL column times block ids and then
+    ``qsa_expand_block_indices``. Set equality stays on block ids. Same
+    ``rotate`` on every select column.
+    ``pad_pages`` widens the block table every column sees; ``0`` keeps it
+    packed to the context. ``cache_layout="wide"`` gives every column the
+    serving cache span. The layer bench takes the same layout.
+
+    When ``M`` is at most 64 and the table is wider than 20000 columns, one
+    more column replays the select under HIP-graph capture. FlyDSL capture
+    selects the one-workgroup radix; the eager FlyDSL column readbacks the
+    live width and streams past 32768 columns. The replay uses one hot
+    buffer set and does not follow ``rotate``. Shorter tables leave the
+    graph column out.
+    ``--batch 4 16 64 --seq 131072 263424 --page-size 392`` is the long
+    decode: 263424 tokens fill 65856 columns, 168 pages of 392. Batches
+    above 8 print in the prefill table.
+    """
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    index_cache = _apply_cache_layout(index_cache.contiguous(), cache_layout)
+    index_table = _pad_index_table(index_table.contiguous(), pad_pages)
+
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+
+    flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
+    nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
+    select_args = (
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+    )
+    # Paged caches stay positional so ``_time`` can rotate them.
+    candidates = {
+        "indexer": (_indexer_select, {"heads": (4,)}),
+    }
+    ret = {
+        "gfx": get_gfx(),
+        "n_blocks": n_blocks,
+        "n_pages": int(index_table.shape[1]),
+        "cache_span_gib": _span_gib(index_cache),
+    }
+    for name, (fn, extra) in candidates.items():
+        got, us = _time(fn, *select_args, rotate=rotate, **extra)
+        err = _set_mismatch_ratio(ref_ids, got[1], ref_scores)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    # Capture takes the one-workgroup radix on a padded decode table.
+    # The eager column above readbacks and streams once the live width
+    # crosses 32768 columns, so the two FlyDSL times are the two selectors.
+    n_columns = int(index_table.shape[1]) * int(page_size)
+    if (
+        m <= qsa_paged._DECODE_MAX_ROWS
+        and n_columns > qsa_paged._ONE_WORKGROUP_MAX_ROW_WIDTH
+    ):
+        block_ids_g = torch.empty(m, idx.block_budget, dtype=dtypes.i32, device=device)
+        indices_g = torch.empty(m, idx.index_width, dtype=dtypes.i32, device=device)
+
+        def flydsl_graph():
+            qsa_indexer_block_ids(
+                q_indexer,
+                index_cache,
+                index_table,
+                token_to_req,
+                qpos,
+                slen,
+                out=block_ids_g,
+                heads=(4,),
+            )
+            qsa_expand_block_indices(
+                block_ids_g,
+                qpos,
+                slen,
+                token_to_req,
+                idx.compress_ratio,
+                idx.token_budget,
+                out=indices_g,
+            )
+
+        graph_candidates = {
+            "indexer_graph": (flydsl_graph, lambda: block_ids_g),
+        }
+        for name, (launch, ids) in graph_candidates.items():
+            us = _capture_replay_us(launch)
+            err = _set_mismatch_ratio(ref_ids, ids(), ref_scores)
+            ret[f"{name} us"] = us
+            ret[f"{name} TFLOPS"] = flops / us / 1e6
+            ret[f"{name} TB/s"] = nbytes / us / 1e6
+            ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def bench_qsa_flash_next_paged_gqa(
+    m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
+):
+    """Flash-Next FlyDSL sparse GQA vs the oracle.
+
+    Live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
+    log2 online softmax, direct output at one split, and a D-sliced merge.
+    Expand and sigmoid stay unfused. Same ``rotate`` on every GQA column.
+    ``cache_layout="wide"`` gives K and V the serving cache span. Sparse GQA
+    reads V with K's strides, so the two views share one page stride.
+    """
+    idx = FLASH_NEXT_INDEXER
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    q_gqa = torch.randn(
+        m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    _index_cache, _index_table, k_cache, v_cache, kv_table = _pack_flash_next(
+        k_bar, k, v, page_size, device
+    )
+    k_cache = _apply_cache_layout(k_cache.contiguous(), cache_layout)
+    v_cache = _apply_cache_layout(v_cache.contiguous(), cache_layout)
+    if k_cache.stride() != v_cache.stride():
+        raise RuntimeError(
+            f"K and V strides diverged: {k_cache.stride()} vs {v_cache.stride()}"
+        )
+    kv_table = kv_table.contiguous()
+    ref = qsa_oracle(
+        q_indexer,
+        k_bar,
+        q_gqa,
+        k,
+        v,
+        qpos,
+        slen,
+        token_to_req,
+        idx,
+        gqa,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+        out_dtype=dtypes.fp32,
+    )
+    indices = ref.indices.contiguous()
+
+    w_alloc = indices.shape[1]
+    w = _selected_width(indices)
+    flops = 4 * m * gqa.n_heads * gqa.head_dim * w
+    nbytes = (
+        m * gqa.n_heads * gqa.head_dim * 2 + 2 * w * gqa.kv_heads * gqa.head_dim
+    ) * dtype.itemsize
+    gqa_args = (q_gqa, k_cache, v_cache, indices, kv_table, token_to_req)
+    candidates = {
+        "paged_gqa": (flydsl_qsa_paged_gqa, "paged GQA vs oracle GQA"),
+    }
+    ret = {
+        "gfx": get_gfx(),
+        "n_blocks": n_blocks,
+        "width": w_alloc,
+        "valid%": 100.0 * w / w_alloc,
+        "cache_span_gib": _span_gib(k_cache),
+    }
+    for name, (fn, msg) in candidates.items():
+        out, us = _time(fn, *gqa_args, rotate=rotate)
+        err = checkAllclose(
+            ref.output,
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=msg,
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def test_indexer_gluon_parity_set_equality_published_indexer_point():
+    """Published indexer point: M=32, H=4, D=128, page_size=8, n_blocks=512.
+
+    ``pages=512`` is 512 compressed keys packed at ``page_size=8`` (64 pages).
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = GLUON_PARITY_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 32, 2048, 8
+    n_blocks = seq_len // idx.compress_ratio
+    assert n_blocks == 512
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    assert index_cache.shape[0] == 64
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=idx.head_dim**-0.5,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    got = qsa_indexer_block_ids(
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+    )
+    _assert_indexer_block_ids(
+        ref_ids,
+        got,
+        "Gluon-parity published indexer block-id set diverged from the oracle",
+    )
+
+
+@benchmark()
+def bench_qsa_gluon_parity_indexer(
+    m,
+    seq_len,
+    page_size,
+    dtype,
+    index_heads,
+    rotate=0,
+    pad_pages=0,
+    cache_layout="packed",
+):
+    """Gluon-parity FlyDSL indexer vs oracle set equality.
+
+    Emit on ``n_blocks <= 512``. Longer rows use the Flash-Next MFMA
+    scorer plus radix (``H=8`` is a second compile). ``H`` 4 and 8 emit
+    share one kernel. Separate table from Flash-Next. Expand is not fused.
+    ``pad_pages`` widens the block table every column sees; ``0`` keeps it
+    packed to the context. ``cache_layout="wide"`` gives the indexer cache
+    the serving span.
+    """
+    idx = _gluon_parity_indexer(index_heads)
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_k = k_bar.unsqueeze(1)
+    gen_i = torch.Generator(device=device)
+    gen_i.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
+    index_cache = _apply_cache_layout(index_cache.contiguous(), cache_layout)
+    index_table = _pad_index_table(index_table.contiguous(), pad_pages)
+    score_scale = idx.head_dim**-0.5
+
+    ref_scores = qsa_indexer_scores(
+        q_indexer,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=score_scale,
+    )
+    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+
+    flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
+    nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
+    select_args = (
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+    )
+    candidates = {
+        "indexer": qsa_indexer_block_ids,
+    }
+    ret = {
+        "gfx": get_gfx(),
+        "index_heads": idx.n_heads,
+        "n_blocks": n_blocks,
+        "n_pages": int(index_table.shape[1]),
+        "cache_span_gib": _span_gib(index_cache),
+    }
+    for name, fn in candidates.items():
+        block_ids, us = _time(
+            fn,
+            *select_args,
+            rotate=rotate,
+            score_scale=score_scale,
+        )
+        err = _set_mismatch_ratio(ref_ids, block_ids, ref_scores)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def _gluon_parity_indexer(index_heads):
+    if index_heads == GLUON_PARITY_INDEXER.n_heads:
+        return GLUON_PARITY_INDEXER
+    if index_heads == GLUON_PARITY_INDEXER_H8.n_heads:
+        return GLUON_PARITY_INDEXER_H8
+    raise ValueError(f"Gluon-parity indexer heads must be 4 or 8, got {index_heads}")
+
+
+def test_qsa_layer_rejects_a_selection_the_indexer_cannot_build():
+    """The indexer writes 512 block ids and divides positions by 4.
+
+    ``token_topk=1024`` at ratio 4 asks expand for 256 columns.
+    ``token_topk=4096`` at ratio 8 still has 512 columns, so expand would
+    accept the indexer's ratio-4 ids. The layer raises before launch.
+    """
+    q_indexer = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+    index_cache = torch.zeros(8, 16, 1, 128, dtype=torch.bfloat16)
+    index_table = torch.zeros(1, 8, dtype=torch.int32)
+    q_gqa = torch.zeros(1, 24, 256, dtype=torch.bfloat16)
+    k_cache = torch.zeros(8, 16, 2, 256, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    kv_table = torch.zeros(1, 8, dtype=torch.int32)
+    indices = torch.zeros(1, 2051, dtype=torch.int32)
+    rows = torch.zeros(1, dtype=torch.int32)
+    for token_topk, compress_ratio in ((1024, 4), (4096, 8)):
+        try:
+            qsa_layer(
+                q_indexer,
+                index_cache,
+                index_table,
+                q_gqa,
+                k_cache,
+                v_cache,
+                kv_table,
+                rows,
+                rows,
+                torch.ones(1, dtype=torch.int32),
+                indices=indices,
+                token_topk=token_topk,
+                compress_ratio=compress_ratio,
+            )
+        except ValueError as exc:
+            if "FlyDSL indexer selects" not in str(exc):
+                raise
+        else:
+            raise AssertionError(
+                f"layer accepted token_topk={token_topk} compress_ratio={compress_ratio}"
+            )
+
+
+def test_qsa_layer_warns_once_for_an_unswept_pair():
+    """An unswept rank-3 pair logs once and still runs.
+
+    A measured pair does not log. A query that is not rank 3 does not
+    log; the indexer reports a query that is not rank 3. Host tensors stop at
+    the device check after a shape the indexer accepts, so nothing launches.
+    """
+    import logging
+
+    from aiter.ops.flydsl import qsa_paged as qsa_mod
+
+    messages = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    def _layer_tensors(hq, index_heads, gqa_rows=1, indexer_rows=1):
+        q_indexer = torch.zeros(indexer_rows, index_heads, 128, dtype=torch.bfloat16)
+        q_gqa = torch.zeros(
+            gqa_rows, hq, 256 if hq != 16 else 128, dtype=torch.bfloat16
+        )
+        return q_indexer, q_gqa
+
+    def _run(q_indexer, q_gqa):
+        rows = torch.zeros(q_indexer.shape[0], dtype=torch.int32)
+        qsa_layer(
+            q_indexer,
+            index_cache,
+            index_table,
+            q_gqa,
+            k_cache,
+            v_cache,
+            kv_table,
+            rows,
+            rows,
+            torch.ones(1, dtype=torch.int32),
+        )
+
+    def _expect(q_indexer, q_gqa, needle):
+        try:
+            _run(q_indexer, q_gqa)
+        except ValueError as exc:
+            if needle not in str(exc):
+                raise AssertionError(f"expected {needle!r} in {exc}") from exc
+        else:
+            raise AssertionError("layer returned")
+
+    index_cache = torch.zeros(8, 16, 1, 128, dtype=torch.bfloat16)
+    index_table = torch.zeros(1, 8, dtype=torch.int32)
+    k_cache = torch.zeros(8, 16, 2, 256, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    kv_table = torch.zeros(1, 8, dtype=torch.int32)
+    handler = _Capture()
+    qsa_mod._log_unmeasured_gqa_query.cache_clear()
+    aiter.logger.addHandler(handler)
+    try:
+        untuned = _layer_tensors(16, 4)
+        _expect(*untuned, "every tensor must be on the GPU")
+        _expect(*untuned, "every tensor must be on the GPU")
+        wide = _layer_tensors(24, 16)
+        _expect(*wide, "heads must be a non-empty subset")
+        _expect(*wide, "heads must be a non-empty subset")
+        if messages != [
+            (
+                "QSA: query pair (GQA (16, 128), indexer heads 4) "
+                "is not in the measured table"
+            ),
+            (
+                "QSA: query pair (GQA (24, 256), indexer heads 16) "
+                "is not in the measured table"
+            ),
+        ]:
+            raise AssertionError(f"table-miss log was {messages}")
+
+        messages.clear()
+        _expect(*_layer_tensors(24, 4), "every tensor must be on the GPU")
+        _expect(
+            *_layer_tensors(24, 8, indexer_rows=2), "every tensor must be on the GPU"
+        )
+        if messages:
+            raise AssertionError(f"a measured pair logged {messages}")
+
+        messages.clear()
+        scalar = torch.zeros((), dtype=torch.bfloat16)
+        measured_indexer, measured_gqa = _layer_tensors(24, 4)
+        try:
+            qsa_layer(
+                scalar,
+                index_cache,
+                index_table,
+                measured_gqa,
+                k_cache,
+                v_cache,
+                kv_table,
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                torch.ones(1, dtype=torch.int32),
+            )
+        except ValueError as exc:
+            if "q must be" not in str(exc):
+                raise AssertionError(
+                    f"the indexer did not report the query: {exc}"
+                ) from exc
+        else:
+            raise AssertionError("a scalar indexer was accepted")
+        try:
+            qsa_layer(
+                measured_indexer,
+                index_cache,
+                index_table,
+                scalar,
+                k_cache,
+                v_cache,
+                kv_table,
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                torch.ones(1, dtype=torch.int32),
+            )
+        except ValueError as exc:
+            if "every tensor must be on the GPU" not in str(exc):
+                raise AssertionError(
+                    f"scalar GQA was not left to the indexer: {exc}"
+                ) from exc
+        else:
+            raise AssertionError("a scalar GQA query was accepted")
+        if messages:
+            raise AssertionError(f"a non-rank-3 query logged {messages}")
+    finally:
+        aiter.logger.removeHandler(handler)
+        qsa_mod._log_unmeasured_gqa_query.cache_clear()
+
+
+def test_qsa_metadata_strided_view_matches_packed():
+    """The in-tree expand loads metadata as a contiguous vector.
+
+    ``qsa_expand_block_indices`` rejects a view such as ``base[::2]``.
+    The layer packs that view before the call, so the packed copy and the
+    view select the same tokens.
+    """
+    blocks = torch.zeros(2, 1, dtype=torch.int32)
+    positions = torch.tensor([7, 0, 3, 0], dtype=torch.int32)[::2]
+    lengths = torch.tensor([20, 1, 8, 1], dtype=torch.int32)[::2]
+    requests = torch.tensor([0, 9, 1, 9], dtype=torch.int32)[::2]
+    if requests.is_contiguous():
+        raise AssertionError("the metadata fixture is already packed")
+    try:
+        qsa_expand_block_indices(blocks, positions, lengths, requests, 4, 4)
+    except ValueError as exc:
+        if "contiguous" not in str(exc):
+            raise
+    else:
+        raise AssertionError("strided metadata was accepted")
+    if not torch.cuda.is_available():
+        return
+
+    device = torch.device("cuda")
+    requests = torch.tensor([0, 9, 1, 9], dtype=torch.int32, device=device)[::2]
+    positions = torch.tensor([7, 0, 3, 0], dtype=torch.int32, device=device)[::2]
+    lengths = torch.tensor([20, 1, 8, 1], dtype=torch.int32, device=device)[::2]
+    blocks = torch.zeros(2, 1, dtype=torch.int32, device=device)
+    expanded = _expand_block_ids(blocks, positions, lengths, requests, 4, 4, None)
+    expanded_ref = qsa_expand_block_indices(
+        blocks,
+        positions.contiguous(),
+        lengths.contiguous(),
+        requests.contiguous(),
+        4,
+        4,
+    )
+    if not torch.equal(expanded, expanded_ref):
+        raise AssertionError("strided expand disagreed with the packed metadata")
+
+
+def test_paged_gqa_supported_rejects_shapes_the_builder_rejects():
+    """A geometry ``build_qsa_sparse_gqa_module`` raises on is a reason here.
+
+    An indivisible group, a group past the MFMA M=16 tile, a head_dim that
+    is not a multiple of 32, a head the selected gather or merge cannot
+    cover, or a zero page size is rejected.
+    """
+
+    def tensors(hq, hkv, d, page, rows=1, width=8):
+        q = torch.zeros(rows, hq, d, dtype=torch.bfloat16)
+        k = torch.zeros(1, page, hkv, d, dtype=torch.bfloat16)
+        indices = torch.zeros(rows, width, dtype=torch.int32)
+        table = torch.zeros(1, 1, dtype=torch.int32)
+        return q, k, torch.zeros_like(k), indices, table
+
+    if flydsl_qsa_paged_gqa_supported(*tensors(24, 2, 256, 16)) is not None:
+        raise AssertionError("Flash-Next GQA was rejected")
+    if flydsl_qsa_paged_gqa_supported(*tensors(16, 1, 128, 16)) is not None:
+        raise AssertionError("a group of 16 at head_dim 128 was rejected")
+    # D=192 at W=32 splits; the merge tiles it into three 64-wide slices.
+    if flydsl_qsa_paged_gqa_supported(*tensors(16, 1, 192, 16, 1, 32)) is not None:
+        raise AssertionError("a split decode at head_dim 192 was rejected")
+    # (Hq, Hkv, D, page, rows, width, needle). D=32/D=96 are the decode
+    # gather (BN16 x 128). D=192 at 32 rows is prefill, whose K map radix
+    # does not divide 6 rounds.
+    rejected = (
+        (24, 5, 256, 16, 1, 8, "do not group"),
+        (24, 0, 256, 16, 1, 8, "do not group"),
+        (24, 1, 256, 16, 1, 8, "MFMA"),
+        (17, 1, 128, 16, 1, 8, "MFMA"),
+        (24, 2, 80, 16, 1, 8, "multiple of 32"),
+        (24, 2, 256, 0, 1, 8, "page_size"),
+        (16, 1, 32, 16, 1, 8, "gather"),
+        (16, 1, 96, 16, 1, 8, "gather"),
+        (24, 2, 192, 16, 32, 8, "K LDS"),
+    )
+    for hq, hkv, d, page, rows, width, needle in rejected:
+        reason = flydsl_qsa_paged_gqa_supported(*tensors(hq, hkv, d, page, rows, width))
+        if reason is None or needle not in reason:
+            raise AssertionError(
+                f"Hq={hq} Hkv={hkv} D={d} page={page} rows={rows} "
+                f"width={width} -> {reason!r}"
+            )
+    try:
+        build_qsa_sparse_gqa_module(16, 1, 32, 16, True, 16, 128, 1, False)
+    except ValueError as exc:
+        if "gather" not in str(exc):
+            raise AssertionError(f"builder D=32 reason was {exc}") from exc
+    else:
+        raise AssertionError("builder compiled a D=32 decode gather")
+
+
+def test_qsa_aot_targets_follow_gpu_archs_without_a_device(monkeypatch):
+    """The wheel build lists gfx942 and gfx950 and has no GPU visible.
+
+    Those two archs are the compile targets. A GPU_ARCHS value with no
+    QSA arch is an error. With the variable unset and no device, both
+    supported archs are still compiled.
+    """
+    import torch
+
+    from aiter.aot.flydsl.qsa_paged import _qsa_aot_targets
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("GPU_ARCHS", "gfx942;gfx950")
+    monkeypatch.delenv("CU_NUM", raising=False)
+    assert _qsa_aot_targets() == [("gfx942", 304), ("gfx950", 256)]
+    monkeypatch.setenv("GPU_ARCHS", "gfx1250")
+    try:
+        _qsa_aot_targets()
+    except RuntimeError as error:
+        if "gfx1250" not in str(error):
+            raise AssertionError(str(error)) from error
+    else:
+        raise AssertionError("GPU_ARCHS with no QSA arch was accepted")
+    monkeypatch.delenv("GPU_ARCHS")
+    assert _qsa_aot_targets() == [("gfx942", 304), ("gfx950", 256)]
+
+
+def _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout="packed"):
+    device = torch.device("cuda")
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q_indexer = torch.randn(
+        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
+    q_gqa = torch.randn(
+        m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device
+    ).contiguous()
+    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
+    qpos = _query_positions(m, seq_len, device).contiguous()
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    index_cache, index_table, k_cache, v_cache, kv_table = _pack_flash_next(
+        k_bar, k, v, page_size, device
+    )
+    index_cache = _apply_cache_layout(index_cache.contiguous(), cache_layout)
+    index_table = index_table.contiguous()
+    k_cache = _apply_cache_layout(k_cache.contiguous(), cache_layout)
+    v_cache = _apply_cache_layout(v_cache.contiguous(), cache_layout)
+    if k_cache.stride() != v_cache.stride():
+        raise RuntimeError(
+            f"K and V strides diverged: {k_cache.stride()} vs {v_cache.stride()}"
+        )
+    kv_table = kv_table.contiguous()
+    ref = qsa_oracle(
+        q_indexer,
+        k_bar,
+        q_gqa,
+        k,
+        v,
+        qpos,
+        slen,
+        token_to_req,
+        idx,
+        gqa,
+        score_scale=idx.head_dim**-0.5,
+        out_dtype=dtypes.fp32,
+    )
+    return {
+        "n_blocks": n_blocks,
+        "q_indexer": q_indexer,
+        "index_cache": index_cache,
+        "index_table": index_table,
+        "q_gqa": q_gqa,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "kv_table": kv_table,
+        "token_to_req": token_to_req,
+        "qpos": qpos,
+        "slen": slen,
+        "ref": ref,
+    }
+
+
+def _layer_args(case):
+    return (
+        case["q_indexer"],
+        case["index_cache"],
+        case["index_table"],
+        case["q_gqa"],
+        case["k_cache"],
+        case["v_cache"],
+        case["kv_table"],
+        case["token_to_req"],
+        case["qpos"],
+        case["slen"],
+    )
+
+
+def _layer_kwargs(idx, **extra):
+    return {
+        "token_topk": idx.token_budget,
+        "compress_ratio": idx.compress_ratio,
+        "score_scale": idx.head_dim**-0.5,
+        **extra,
+    }
+
+
+def test_qsa_layer_flash_next_matches_oracle():
+    """The QSA layer matches the oracle on Flash-Next."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
+    case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
+    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
+    err = checkAllclose(
+        case["ref"].output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="layer vs oracle",
+    )
+    if err != 0:
+        raise AssertionError(f"QSA layer diverged from the oracle (err={err})")
+
+
+def test_qsa_layer_gluon_parity_matches_oracle():
+    """Gluon-parity FlyDSL layer matches the oracle (group 5, D=128)."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx, gqa = GLUON_PARITY_INDEXER, GLUON_PARITY_GQA
+    case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
+    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
+    err = checkAllclose(
+        case["ref"].output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="Gluon-parity flydsl layer vs oracle",
+    )
+    if err != 0:
+        raise AssertionError(f"Gluon-parity QSA layer diverged (err={err})")
+
+
+def _capture_replay_us(fn) -> float:
+    """Warm up, capture one HIP graph, and time ``replay``. Replay stays hot."""
+    fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.stream(stream):
+            graph.capture_begin()
+            fn()
+            graph.capture_end()
+    except RuntimeError:
+        torch.cuda.current_stream().wait_stream(stream)
+        raise
+    torch.cuda.current_stream().wait_stream(stream)
+    _ignored, us = run_perftest(graph.replay, num_rotate_args=1)
+    graph.replay()
+    torch.cuda.synchronize()
+    return us
+
+
+def test_qsa_layer_decode_graph_replays():
+    """Decode capture of the indexer, expand, and paged GQA replays and still matches the oracle."""
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
+    # n_blocks=1024 forces the long-row score buffer, not the emit fast path.
+    case = _prepare_qsa_layer(idx, gqa, 1, 4096, 16, dtypes.bf16)
+    device = case["q_gqa"].device
+    indices = torch.empty((1, idx.index_width), dtype=dtypes.i32, device=device)
+    block_ids = torch.empty((1, idx.block_budget), dtype=dtypes.i32, device=device)
+    out = torch.empty_like(case["q_gqa"])
+
+    def launch():
+        return qsa_layer(
+            *_layer_args(case),
+            indices=indices,
+            block_ids=block_ids,
+            out=out,
+            **_layer_kwargs(idx),
+        )
+
+    _capture_replay_us(launch)
+    err = checkAllclose(
+        case["ref"].output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="flydsl graph replay vs oracle",
+    )
+    if err != 0:
+        raise AssertionError(f"graph replay diverged from the oracle (err={err})")
+
+
+def _e2e_counts(case, idx, gqa, dtype):
+    indices = case["ref"].indices
+    w_alloc = indices.shape[1]
+    w = _selected_width(indices)
+    m = case["q_gqa"].shape[0]
+    flops = (
+        2 * m * idx.n_heads * idx.head_dim * case["n_blocks"]
+        + 4 * m * gqa.n_heads * gqa.head_dim * w
+    )
+    nbytes = (
+        m * idx.n_heads * idx.head_dim
+        + case["n_blocks"] * idx.head_dim
+        + m * gqa.n_heads * gqa.head_dim * 2
+        + 2 * w * gqa.kv_heads * gqa.head_dim
+    ) * dtype.itemsize
+    return w_alloc, w, flops, nbytes
+
+
+def _e2e_cells(name, us, err, flops, nbytes):
+    return {
+        f"{name} us": us,
+        f"{name} TFLOPS": flops / us / 1e6,
+        f"{name} TB/s": nbytes / us / 1e6,
+        f"{name} err": err,
+    }
+
+
+def _time_layer(case, idx, rotate):
+    out, us = _time(
+        qsa_layer,
+        *_layer_args(case),
+        rotate=rotate,
+        **_layer_kwargs(idx),
+    )
+    return out, us
+
+
+@benchmark()
+def bench_qsa_flash_next_e2e(
+    m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
+):
+    """One Flash-Next QSA layer: FlyDSL indexer, expand, and sparse GQA.
+
+    Expand is ``qsa_expand_block_indices``. Oracle is not timed. Same
+    ``rotate`` on every column. HIP graph replay is a separate table.
+    ``cache_layout="wide"`` is the serving span on the indexer cache and
+    on K and V.
+    """
+    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
+    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
+    ref = case["ref"].output
+    w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
+    ret = {
+        "gfx": get_gfx(),
+        "n_blocks": case["n_blocks"],
+        "width": w_alloc,
+        "valid%": 100.0 * w / w_alloc,
+        "cache_span_gib": _span_gib(case["k_cache"]),
+    }
+    out, us = _time_layer(case, idx, rotate)
+    err = checkAllclose(
+        ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="e2e vs oracle"
+    )
+    ret.update(_e2e_cells("flydsl_e2e", us, err, flops, nbytes))
+    return ret
+
+
+@benchmark()
+def bench_qsa_gluon_parity_e2e(
+    m, seq_len, page_size, dtype, index_heads, rotate=0, cache_layout="packed"
+):
+    """One Gluon-parity QSA layer.
+
+    Separate table from Flash-Next.
+    """
+    idx = _gluon_parity_indexer(index_heads)
+    gqa = GLUON_PARITY_GQA
+    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
+    ref = case["ref"].output
+    w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
+    ret = {
+        "gfx": get_gfx(),
+        "index_heads": idx.n_heads,
+        "n_blocks": case["n_blocks"],
+        "width": w_alloc,
+        "valid%": 100.0 * w / w_alloc,
+        "cache_span_gib": _span_gib(case["k_cache"]),
+    }
+    out, us = _time_layer(case, idx, rotate)
+    err = checkAllclose(
+        ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="Gluon-parity e2e"
+    )
+    ret.update(_e2e_cells("flydsl_e2e", us, err, flops, nbytes))
+    return ret
+
+
+@benchmark()
+def bench_qsa_flash_next_e2e_graph(m, seq_len, page_size, dtype, cache_layout="packed"):
+    """HIP graph replay of one Flash-Next decode layer. Not combined with rotate.
+
+    Each candidate is captured once, then ``replay`` is timed hot. The
+    output buffer after replay is the correctness check.
+    """
+    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
+    case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
+    ref = case["ref"].output
+    _w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
+    device = case["q_gqa"].device
+    width = idx.index_width
+
+    def _replay(out):
+        indices = torch.empty((m, width), dtype=dtypes.i32, device=device)
+        block_ids = torch.empty((m, idx.block_budget), dtype=dtypes.i32, device=device)
+
+        def launch():
+            return qsa_layer(
+                *_layer_args(case),
+                indices=indices,
+                block_ids=block_ids,
+                out=out,
+                **_layer_kwargs(idx),
+            )
+
+        us = _capture_replay_us(launch)
+        err = checkAllclose(
+            ref,
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg="graph replay vs oracle",
+        )
+        return us, err
+
+    us, err = _replay(torch.empty_like(case["q_gqa"]))
+    return {
+        "gfx": get_gfx(),
+        "n_blocks": case["n_blocks"],
+        "valid%": 100.0 * w / width,
+        "cache_span_gib": _span_gib(case["k_cache"]),
+        **_e2e_cells("flydsl_graph", us, err, flops, nbytes),
+    }
+
+
+def _indexer_paged_gqa_sweep_batches(batches):
+    """Split requested M into the Flash-Next indexer and sparse-GQA decode
+    and prefill tables.
+
+    Decode is ``M<=8``. Every larger M is prefill, so 64, 2048, and 8192
+    are run instead of dropped. Gluon-parity is not split this way: its tables
+    are emit versus long-L, and every requested M runs in one of them.
+    """
+    decode = [m for m in batches if m <= 8]
+    prefill = [m for m in batches if m > 8]
+    return decode, prefill
+
+
+def _skip_m_past_seq(m, seq_len, where):
+    if m <= seq_len:
+        return False
+    aiter.logger.warning("skip %s M=%s L=%s (M must fit in L)", where, m, seq_len)
+    return True
+
+
+def _skip_pad_narrower_than_context(
+    seq_len, page_size, pad_pages, compress_ratio, where
+):
+    """A pad that cannot hold the context would drop real pages."""
+    if pad_pages <= 0:
+        return False
+    n_blocks = seq_len // compress_ratio
+    packed_pages = (n_blocks + page_size - 1) // page_size
+    if packed_pages <= pad_pages:
+        return False
+    aiter.logger.warning(
+        "skip %s L=%s page=%s pad_pages=%s (context needs %s pages)",
+        where,
+        seq_len,
+        page_size,
+        pad_pages,
+        packed_pages,
+    )
+    return True
+
+
+def _raise_if_indexer_mismatch(err, m, seq_len, where="FlyDSL indexer"):
+    if err != 0:
+        raise AssertionError(f"{where} set mismatch at M={m} L={seq_len} (err={err})")
+
+
+def _raise_if_paged_gqa_above_tolerance(err, m, seq_len):
+    if err != 0:
+        raise AssertionError(
+            f"paged GQA err={err} at M={m} L={seq_len} is above the unit "
+            "tolerance rtol=1e-2 atol=1e-2"
+        )
+
+
+def _raise_if_row_mismatch(row, m, seq_len):
+    """Fail when a gated candidate's ``checkAllclose`` fraction is nonzero.
+
+    ``err != 0`` is one element outside the rtol/atol already passed to
+    ``checkAllclose``.
+    """
+    for key, err in row.items():
+        if key.endswith(" err") and err != 0:
+            raise AssertionError(
+                f"{key}={err} at M={m} L={seq_len} is above that column's tolerance"
+            )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description=(
+            "Flash-Next and Gluon-parity QSA sweeps, FlyDSL indexer and "
+            "sparse GQA, and the end-to-end layer opt-in"
+        ),
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.bf16],
+        help="activation dtype (Flash-Next is BF16)",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        default=[1, 8, 512],
+        help=(
+            "flattened query tokens M. Flash-Next indexer and sparse GQA "
+            "report M<=8 as\n"
+            "decode and every larger M as prefill."
+        ),
+    )
+    parser.add_argument(
+        "-s",
+        "--seq",
+        type=int,
+        nargs="*",
+        default=[512, 2048, 8192, 32768],
+        help="context length L in tokens (32k default; pass 131072 for 128k).\n"
+        "Bar shapes are budget-saturated: decode M in {1,8} at L=32768,\n"
+        "prefill M=512 at L=8192. L=512 is a fast smoke row -- only ~25%%\n"
+        "of the 2051 selection slots are live there (12.5%% at M=512), so\n"
+        "it measures the masked path more than the gather. See valid%%.",
+    )
+    parser.add_argument(
+        "-p",
+        "--page-size",
+        type=int,
+        nargs="*",
+        default=[16],
+        help="vLLM-style page size (indexer slots and GQA tokens)",
+    )
+    parser.add_argument(
+        "--pad-pages",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="Indexer block-table width in pages. 0 keeps the packed table.\n"
+        "A positive value zero-fills every indexer column's table out to that\n"
+        "many pages, which is how vLLM sizes it for max_model_len. A row\n"
+        "whose context already needs more pages is skipped. Examples:\n"
+        "--pad-pages 4096 with page size 16 is 65536 columns;\n"
+        "--page-size 392 --pad-pages 168 is the Flash-Next TP2 table\n"
+        "(65856 columns). Pass 0 and a width to sweep both.",
+    )
+    parser.add_argument(
+        "--cache-layout",
+        nargs="*",
+        default=["packed"],
+        choices=["packed", "wide"],
+        help="K and V cache layout. packed is one contiguous page after\n"
+        "another and stays under 4 GiB. wide keeps those pages and inserts\n"
+        "a page stride so the byte span is just past 4 GiB, which is how\n"
+        "vLLM's per-layer view selects the wide indexer and paged GQA compile. A one-page\n"
+        "cache gains an unreferenced trailing page so the stride counts.\n"
+        "Auto-rotate keeps one copy of a wide cache: it is already larger\n"
+        "than L2. Pass both names to sweep them.",
+    )
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="run_perftest num_rotate_args (copies of timed tensors).\n"
+        "0 = cold cache (default; auto-size copies from L2, matches serving).\n"
+        "1 = hot cache, one reused buffer set (older 1047 tables).\n"
+        "N>1 = that many copies.\n"
+        "Same value on every named backend in a row. Not combined with HIP graphs.",
+    )
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        aiter.logger.warning("no CUDA; skipping QSA sweep")
+        return
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("QSA unsupported on %s; skipping", get_gfx())
+        return
+
+    for dtype in args.dtype:
+        decode_m, prefill_m = _indexer_paged_gqa_sweep_batches(args.batch)
+
+        rows = []
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            pad_pages,
+            cache_layout,
+        ) in itertools.product(
+            decode_m,
+            args.seq,
+            args.page_size,
+            args.rotate,
+            args.pad_pages,
+            args.cache_layout,
+        ):
+            if _skip_m_past_seq(m, seq_len, "Flash-Next indexer decode"):
+                continue
+            if _skip_pad_narrower_than_context(
+                seq_len,
+                page_size,
+                pad_pages,
+                FLASH_NEXT_INDEXER.compress_ratio,
+                "Flash-Next indexer decode",
+            ):
+                continue
+            row = bench_qsa_flash_next_indexer(
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                rotate,
+                pad_pages,
+                cache_layout,
+            )
+            _raise_if_indexer_mismatch(row["indexer err"], m, seq_len)
+            if "indexer_graph err" in row:
+                _raise_if_indexer_mismatch(
+                    row["indexer_graph err"], m, seq_len, where="FlyDSL indexer graph"
+                )
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Flash-Next FlyDSL indexer summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size, rotate, cache_layout in itertools.product(
+            decode_m, args.seq, args.page_size, args.rotate, args.cache_layout
+        ):
+            if _skip_m_past_seq(m, seq_len, "Flash-Next sparse GQA decode"):
+                continue
+            row = bench_qsa_flash_next_paged_gqa(
+                m, seq_len, page_size, dtype, rotate, cache_layout
+            )
+            _raise_if_paged_gqa_above_tolerance(row["paged_gqa err"], m, seq_len)
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Flash-Next FlyDSL sparse GQA decode summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            pad_pages,
+            cache_layout,
+        ) in itertools.product(
+            prefill_m,
+            args.seq,
+            args.page_size,
+            args.rotate,
+            args.pad_pages,
+            args.cache_layout,
+        ):
+            if _skip_m_past_seq(m, seq_len, "Flash-Next indexer prefill"):
+                continue
+            if _skip_pad_narrower_than_context(
+                seq_len,
+                page_size,
+                pad_pages,
+                FLASH_NEXT_INDEXER.compress_ratio,
+                "Flash-Next indexer prefill",
+            ):
+                continue
+            row = bench_qsa_flash_next_indexer(
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                rotate,
+                pad_pages,
+                cache_layout,
+            )
+            _raise_if_indexer_mismatch(row["indexer err"], m, seq_len)
+            if "indexer_graph err" in row:
+                _raise_if_indexer_mismatch(
+                    row["indexer_graph err"], m, seq_len, where="FlyDSL indexer graph"
+                )
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Flash-Next FlyDSL indexer prefill summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size, rotate, cache_layout in itertools.product(
+            prefill_m, args.seq, args.page_size, args.rotate, args.cache_layout
+        ):
+            if _skip_m_past_seq(m, seq_len, "Flash-Next sparse GQA prefill"):
+                continue
+            row = bench_qsa_flash_next_paged_gqa(
+                m, seq_len, page_size, dtype, rotate, cache_layout
+            )
+            _raise_if_paged_gqa_above_tolerance(row["paged_gqa err"], m, seq_len)
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Flash-Next FlyDSL sparse GQA prefill summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            pad_pages,
+            cache_layout,
+        ) in itertools.product(
+            args.batch,
+            [s for s in args.seq if s // GLUON_PARITY_INDEXER_H8.compress_ratio <= 512],
+            args.page_size,
+            args.rotate,
+            args.pad_pages,
+            args.cache_layout,
+        ):
+            if _skip_m_past_seq(m, seq_len, "Gluon-parity indexer H=8"):
+                continue
+            if _skip_pad_narrower_than_context(
+                seq_len,
+                page_size,
+                pad_pages,
+                GLUON_PARITY_INDEXER_H8.compress_ratio,
+                "Gluon-parity indexer H=8",
+            ):
+                continue
+            row = bench_qsa_gluon_parity_indexer(
+                m, seq_len, page_size, dtype, 8, rotate, pad_pages, cache_layout
+            )
+            _raise_if_indexer_mismatch(row["indexer err"], m, seq_len)
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Gluon-parity FlyDSL indexer H=8 summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        # Published indexer point: M=32, H=4, page_size=8, n_blocks=512.
+        rows = []
+        for rotate, pad_pages, cache_layout in itertools.product(
+            args.rotate, args.pad_pages, args.cache_layout
+        ):
+            if _skip_pad_narrower_than_context(
+                2048,
+                8,
+                pad_pages,
+                GLUON_PARITY_INDEXER.compress_ratio,
+                "Gluon-parity indexer published",
+            ):
+                continue
+            row = bench_qsa_gluon_parity_indexer(
+                32, 2048, 8, dtype, 4, rotate, pad_pages, cache_layout
+            )
+            _raise_if_indexer_mismatch(row["indexer err"], 32, 2048)
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Gluon-parity FlyDSL published indexer point (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for (
+            m,
+            seq_len,
+            page_size,
+            index_heads,
+            rotate,
+            pad_pages,
+            cache_layout,
+        ) in itertools.product(
+            args.batch,
+            [s for s in args.seq if s // GLUON_PARITY_INDEXER.compress_ratio > 512],
+            args.page_size,
+            (8,),
+            args.rotate,
+            args.pad_pages,
+            args.cache_layout,
+        ):
+            if _skip_m_past_seq(m, seq_len, "Gluon-parity indexer long-L"):
+                continue
+            if _skip_pad_narrower_than_context(
+                seq_len,
+                page_size,
+                pad_pages,
+                GLUON_PARITY_INDEXER.compress_ratio,
+                "Gluon-parity indexer long-L",
+            ):
+                continue
+            row = bench_qsa_gluon_parity_indexer(
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                index_heads,
+                rotate,
+                pad_pages,
+                cache_layout,
+            )
+            _raise_if_indexer_mismatch(row["indexer err"], m, seq_len)
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Gluon-parity FlyDSL indexer long-L summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size, rotate, cache_layout in itertools.product(
+            args.batch, args.seq, args.page_size, args.rotate, args.cache_layout
+        ):
+            if m > seq_len:
+                continue
+            row = bench_qsa_flash_next_e2e(
+                m, seq_len, page_size, dtype, rotate, cache_layout
+            )
+            _raise_if_row_mismatch(row, m, seq_len)
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Flash-Next end-to-end summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for m, seq_len, page_size, cache_layout in itertools.product(
+            [b for b in args.batch if b <= 8],
+            args.seq,
+            args.page_size,
+            args.cache_layout,
+        ):
+            if m > seq_len:
+                continue
+            row = bench_qsa_flash_next_e2e_graph(
+                m, seq_len, page_size, dtype, cache_layout
+            )
+            _raise_if_row_mismatch(row, m, seq_len)
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Flash-Next decode HIP-graph summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+        rows = []
+        for (
+            m,
+            seq_len,
+            page_size,
+            index_heads,
+            rotate,
+            cache_layout,
+        ) in itertools.product(
+            args.batch,
+            args.seq,
+            args.page_size,
+            (4, 8),
+            args.rotate,
+            args.cache_layout,
+        ):
+            if m > seq_len:
+                continue
+            row = bench_qsa_gluon_parity_e2e(
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                index_heads,
+                rotate,
+                cache_layout,
+            )
+            _raise_if_row_mismatch(row, m, seq_len)
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "QSA Gluon-parity end-to-end summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
+
+
+if __name__ == "__main__":
+    main()
