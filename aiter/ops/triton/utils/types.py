@@ -5,7 +5,8 @@ from aiter.ops.triton.utils._triton import arch_info
 
 
 def get_dtype_max(dtype):
-    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
+    # Make this tensor on the CPU. It only checks the dtype.
+    if torch.is_floating_point(torch.tensor([], dtype=dtype, device="cpu")):
         return torch.finfo(dtype).max
     else:
         return torch.iinfo(dtype).max

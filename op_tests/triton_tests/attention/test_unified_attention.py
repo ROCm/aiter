@@ -136,7 +136,7 @@ def dynamic_nvfp4_quant_kv_cache(
     return key_cache_quant_and_shuffled, value_cache_quant_and_shuffled
 
 
-def uniform_random(shape, start=0, end=1, dtype=None, device=None):
+def uniform_random(shape, start=0, end=1, dtype=torch.float32, device="cuda"):
     return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
 
 
@@ -155,7 +155,7 @@ def generate_data(
     use_q_descale=None,
     use_kv_descale=None,
     use_out_scale=False,
-    device="cpu",
+    device="cuda",
 ):
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
@@ -239,9 +239,9 @@ def generate_data(
         min(max_num_blocks_per_seq * num_seqs, num_blocks) // num_seqs
     )
     total_ind_count = num_seqs * max_num_blocks_per_seq
-    values = torch.arange(0, total_ind_count, dtype=torch.int)
-    values = values[torch.randperm(total_ind_count)]
-    block_tables = values.view(num_seqs, max_num_blocks_per_seq).contiguous().to(device)
+    values = torch.arange(0, total_ind_count, dtype=torch.int, device=device)
+    values = values[torch.randperm(total_ind_count, device=device)]
+    block_tables = values.view(num_seqs, max_num_blocks_per_seq).contiguous()
 
     sinks = torch.randn(num_query_heads, dtype=torch.float32, device=device)
 
@@ -313,7 +313,6 @@ def ref_paged_attn(
     causal: int = 1,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
-    block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
     v_head_size = value_cache.shape[-1]
     outputs: list[torch.Tensor] = []
@@ -345,7 +344,7 @@ def ref_paged_attn(
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
         attn = torch.einsum("qhd,khd->hqk", q, k).float()
-        empty_mask = torch.ones(query_len, kv_len, device=q.device)
+        empty_mask = torch.ones(query_len, kv_len, device=q.device, dtype=torch.float32)
         mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
         if sliding_window is not None:
             sliding_window_mask = (
@@ -1005,7 +1004,9 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
         value_cache=value_cache[used].contiguous(),
         query_lens=query_lens,
         kv_lens=kv_lens_list,
-        block_tables=torch.arange(used.numel()).view(block_tables.shape),
+        block_tables=torch.arange(used.numel(), device=block_tables.device).view(
+            block_tables.shape
+        ),
         scale=scale,
         out_dtype=dtype,
     )

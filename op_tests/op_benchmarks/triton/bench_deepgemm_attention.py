@@ -221,15 +221,12 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
         # varctx schedule to the base kernel breaks compile (signature mismatch).
         EnableVarCtxOpt = var_ratio > 0.0 and args.kv_preshuffle and not args.no_varctx
 
-        context_lens = (
-            torch.randint(
-                int((1 - var_ratio) * avg_kv_length),
-                int(((1 + var_ratio)) * avg_kv_length) + 1,
-                (batch_size,),
-            )
-            .cuda()
-            .to(torch.int32)
-        )
+        context_lens = torch.randint(
+            int((1 - var_ratio) * avg_kv_length),
+            int(((1 + var_ratio)) * avg_kv_length) + 1,
+            (batch_size,),
+            device="cuda",
+        ).to(torch.int32)
         prefix_sum_context_lens = torch.zeros(
             (batch_size + 1,), device="cuda", dtype=torch.int32
         )
