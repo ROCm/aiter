@@ -3325,8 +3325,9 @@ def _flash_attn_varlen_backward(
     def can_impl_fmha_bwd_flydsl():
         # d_qk=192 / d_v=128 causal varlen self-attention -- the shape family both
         # `can_impl_fmha_v3_bwd*` gates exclude by requiring hdim_q == hdim_v.
-        # `deterministic` is absent on purpose: the kernel uses no atomics and
-        # writes each of dq/dk/dv exactly once, so it is deterministic either way.
+        # `deterministic` is forwarded rather than gated: 192 / 128 never takes the
+        # atomic-dQ fused kernel (its 12 MFMA d tiles exceed the 8 waves), so the flag
+        # only matters for the narrower head dims a direct caller may request.
         ret = get_gfx() == "gfx942"
         ret &= alibi_slopes is None
         ret &= dropout_p == 0.0
@@ -3380,6 +3381,7 @@ def _flash_attn_varlen_backward(
             max_seqlen_q,
             max_seqlen_k,
             softmax_scale,
+            deterministic,
         )
     elif can_impl_fmha_v3_bwd_:
         (
