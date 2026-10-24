@@ -13,7 +13,10 @@ def test_import_aiter_without_visible_gpu():
     env.pop("GPU_ARCHS", None)
     # Unlike HIP_VISIBLE_DEVICES, this also hides the GPUs from rocminfo.
     env["ROCR_VISIBLE_DEVICES"] = "-1"
-    code = "import torch; assert not torch.cuda.is_available(); import aiter"
+    code = (
+        "import torch; assert not torch.cuda.is_available(); "
+        "import aiter, aiter.ops.triton.quant"
+    )
     result = subprocess.run(
         [sys.executable, "-c", code],
         cwd=_REPO,

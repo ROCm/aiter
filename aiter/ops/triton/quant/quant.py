@@ -23,7 +23,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.quant_config_utils import get_quant_config
-from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 __all__ = [
     "_mxfp4_quant_op",
@@ -814,7 +814,7 @@ def dynamic_nvfp4_quant(
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     blockscale_e4m3 = torch.empty(
         ((N + NVFP4_QUANT_BLOCK_SIZE - 1) // NVFP4_QUANT_BLOCK_SIZE, M),
-        dtype=e4m3_dtype,
+        dtype=get_fp8_e4m3_dtype(),
         device=x.device,
     ).T
 
