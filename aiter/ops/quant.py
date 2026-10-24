@@ -1170,6 +1170,10 @@ def fused_dynamic_mx_quant_moe_sort(
         or (not is_stage1 and M <= token_num_quant_moe_sort_switch[1] * eff_topk)
         or group_size != 32
     )
+    if group_size == 32 and N > 8192:
+        # The fused kernel supports at most 32 * 256 = 8192 columns; the split
+        # path (per-1x32 MX quant + mxfp4_moe_sort) supports up to 16384.
+        use_fused = False
     if use_fused:
         out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
         common = (out, scale, input, sorted_ids, num_valid_ids, token_num, block_size)
