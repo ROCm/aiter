@@ -50,6 +50,9 @@ except:  # noqa: E722
 
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
+# gfx1250: batches whose longest query is at most this many tokens (speculative
+# decode verify, q_len = 1 + num_spec) take the 3D split-KV kernel, not the 2D one.
+_GFX12_3D_MAX_SEQLEN_Q = 16
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -181,9 +184,13 @@ def _gfx950_split_grid(params: _UAParams):
 
 
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
-    # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
+    # if IS_DEVICE_ARCH_GFX12, use 3D for decode and short (spec-decode verify)
+    # queries, 2D otherwise. At q_len 4 the 2D grid is ~2 workgroups per sequence
+    # and runs ~30x slower than the 3D split-KV kernel.
     if IS_DEVICE_ARCH_GFX12:
-        return (params.sliding_window > 0) or (not params.all_decode)
+        return (params.sliding_window > 0) or (
+            not params.all_decode and params.max_seqlen_q > _GFX12_3D_MAX_SEQLEN_Q
+        )
 
     # The gfx950 Gluon kernel is one kernel with a decode and a prefill grid,
     # and it owns its KV split, so decode and split batches take the 3d path

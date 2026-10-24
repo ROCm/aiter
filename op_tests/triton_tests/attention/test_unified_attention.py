@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -1010,4 +1011,95 @@ def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
         scale=scale,
         out_dtype=dtype,
     )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def _spec_verify_seq_lens(batch: int, max_query_len: int, seed: int):
+    """Verify-step batch: mixed query lengths up to 1 + num_spec, mixed contexts."""
+    rng = random.Random(seed)
+    return [
+        (rng.randint(1, max_query_len), rng.randint(max_query_len + 1, 3000))
+        for _ in range(batch)
+    ]
+
+
+@pytest.mark.parametrize("batch, seed", [(7, 0), (31, 1), (61, 2), (128, 3)])
+@pytest.mark.parametrize("max_query_len", [4, 8])
+@pytest.mark.parametrize("num_heads", [(16, 2), (16, 4), (16, 8), (16, 16)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@torch.inference_mode()
+def test_unified_attn_3d_spec_verify_gfx1250(
+    batch: int,
+    seed: int,
+    max_query_len: int,
+    num_heads: tuple[int, int],
+    head_size: int,
+) -> None:
+    """Short multi-token queries (speculative-decode verify) take the gfx1250 3D
+    split-KV kernel. Query rows of one block then have different causal horizons,
+    so a split segment can be partly or wholly past a row's horizon."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon 3D kernel")
+    torch.manual_seed(seed)
+    seq_lens = _spec_verify_seq_lens(batch, max_query_len, seed)
+    block_size = 16
+    (
+        query,
+        key_cache,
+        value_cache,
+        shuffled_key_cache,
+        shuffled_value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=batch * (3000 // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+    unified_attention(
+        q=query,
+        k=shuffled_key_cache,
+        v=shuffled_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=True,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=None,
+        soft_cap=None,
+        sinks=None,
+    )
+    assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
