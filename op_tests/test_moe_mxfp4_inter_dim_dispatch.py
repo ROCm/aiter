@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Dispatch-only coverage for non-256-aligned MXFP4 MoE shapes."""
 
+import contextlib
 import functools
 from types import SimpleNamespace
 
@@ -145,18 +146,15 @@ def test_mxfp4_takeover_requires_both_weights_shuffled():
     assert _stage_backend(meta.stage2) == "cktile"
 
 
-@_SKIP
-@pytest.mark.parametrize(
-    "kernel_name2",
-    ["cktile_test", "swiglu_mxfp4_bf16_cktile"],
-)
-def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch, kernel_name2):
+@contextlib.contextmanager
+def _tuned_cfg(monkeypatch, inter_dim, **cfg):
+    """Make ``cfg`` the only tuned row for ``inter_dim``, yielding its warnings."""
     key = (
         fused_moe_module.get_gfx_runtime(),
         fused_moe_module.get_cu_num(),
         TOKEN,
         MODEL_DIM,
-        INTER_DIM,
+        inter_dim,
         E,
         TOPK,
         str(ActivationType.Swiglu),
@@ -167,13 +165,6 @@ def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch, kernel_name2):
         True,
         False,
     )
-    cfg = {
-        "block_m": 32,
-        "ksplit": 2,
-        "kernelName1": "flydsl_test",
-        "kernelName2": kernel_name2,
-        "run_1stage": False,
-    }
     monkeypatch.setattr(fused_moe_module, "cfg_2stages", ({key: cfg}, {}))
     warnings = []
     monkeypatch.setattr(
@@ -183,12 +174,57 @@ def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch, kernel_name2):
     )
     get_2stage_cfgs.cache_clear()
     try:
-        meta = _dispatch()
+        yield warnings
     finally:
         get_2stage_cfgs.cache_clear()
 
+
+@_SKIP
+@pytest.mark.parametrize(
+    "kernel_name2",
+    ["cktile_test", "swiglu_mxfp4_bf16_cktile"],
+)
+def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch, kernel_name2):
+    with _tuned_cfg(
+        monkeypatch,
+        INTER_DIM,
+        block_m=32,
+        ksplit=2,
+        kernelName1="flydsl_test",
+        kernelName2=kernel_name2,
+        run_1stage=False,
+    ) as warnings:
+        meta = _dispatch()
+
     assert any("discarding unsafe CK-Tile MXFP4 stage2 config" in w for w in warnings)
     assert _stage_backend(meta.stage2) == "flydsl"
+
+
+# stage1 writes and stage2 reads the intermediate scales on a stride that rounds
+# scale-N up to a multiple of 8 columns, i.e. 256 elements of inter_dim, so an
+# exact non-256-aligned intermediate faults in moe_sorting on the inline-sort
+# path. DeepSeek-V4.1 at TP2 (2304 / 2 = 1152) is the shape that found this.
+@_SKIP
+@pytest.mark.parametrize(
+    ("inter_dim", "want_discard"),
+    [(384, True), (640, True), (1152, True), (512, False), (1280, False)],
+)
+def test_tuned_inline_sort_config_honours_inter_dim_alignment(
+    monkeypatch, inter_dim, want_discard
+):
+    with _tuned_cfg(
+        monkeypatch,
+        inter_dim,
+        block_m=16,
+        ksplit=0,
+        kernelName1="flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_xcd4",
+        kernelName2="flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_nt_sbm16",
+        run_1stage=False,
+    ) as warnings:
+        _dispatch(inter_dim=inter_dim)
+
+    discarded = any("discarding tuned inline-sort config at" in w for w in warnings)
+    assert discarded == want_discard
 
 
 @_SKIP
