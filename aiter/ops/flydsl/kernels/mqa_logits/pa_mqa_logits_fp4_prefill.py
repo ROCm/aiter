@@ -183,12 +183,21 @@ def _row_plan(le, block_k, P, s_max) -> _RowPlan:
         P,
         block_k,
         s_max,
+        max(1, (s_max - 1).bit_length() + 1),
         BLOCK_T=(
             _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS
         ),
-        SEARCH_STEPS=max(1, (s_max - 1).bit_length() + 1),
     )
     return plan
+
+
+def warmup_prefill_row_plan(device, block_k: int = 256) -> None:
+    """Compile both BLOCK_T variants of `_prefill_row_plan_kernel` before serving."""
+    buf = torch.empty(16, dtype=torch.int32, device=device)
+    for block_t in (_ROW_PLAN_BLOCK_FLOOR, _ROW_PLAN_MAX_ROWS):
+        _prefill_row_plan_kernel.warmup(
+            *([buf] * 6), 16, 16, block_k, 16, 5, BLOCK_T=block_t, grid=(1,)
+        )
 
 
 def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
@@ -229,7 +238,12 @@ def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
 # gives up the divisibility hint the wide blocks vectorize on, 41.1us -> 52.0us
 # at 16384 lanes. That lands on prefill, one call per ~500ms forward; the widths
 # decode runs stay hidden behind the call's own dispatch either way.
-@triton.jit(do_not_specialize=["T", "P"])
+# `s_max`, the search depth derived from it and `le`'s alignment all vary per batch;
+# specializing on them kept compiling new variants (~1.4 s each) mid-serving.
+@triton.jit(
+    do_not_specialize=["T", "P", "s_max", "search_steps"],
+    do_not_specialize_on_alignment=["le_ptr"],
+)
 def _prefill_row_plan_kernel(
     le_ptr,  # [T] int32 local_ends
     incl_ptr,  # [T] int32 out
@@ -241,8 +255,8 @@ def _prefill_row_plan_kernel(
     P,
     block_k,
     s_max,
+    search_steps,
     BLOCK_T: tl.constexpr,
-    SEARCH_STEPS: tl.constexpr,
 ):
     """Single-block row plan: chunk counts, split factor, and its prefix sums.
 
@@ -255,7 +269,7 @@ def _prefill_row_plan_kernel(
     Masked-out lanes carry `chunks = 0`, which contributes 0 CTAs at every s, so
     no reduction below needs a second mask.
 
-    `SEARCH_STEPS` is derived from `s_max`, not a generous constant: the range
+    `search_steps` is derived from `s_max`, not a generous constant: the range
     halves each step, so `(s_max - 1).bit_length()` converges it and the caller
     passes one more. Every surplus step is another reduction over all BLOCK_T
     lanes -- 0.74us each at 4096 rows -- and a fixed 32 was this kernel's ENTIRE
@@ -273,7 +287,7 @@ def _prefill_row_plan_kernel(
 
     lo = 1
     hi = s_max
-    for _ in tl.static_range(SEARCH_STEPS):
+    for _ in range(search_steps):
         mid = (lo + hi) // 2
         feasible = tl.sum((chunks + mid - 1) // mid, axis=0) <= P
         active = lo < hi
