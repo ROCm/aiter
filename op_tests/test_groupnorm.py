@@ -28,10 +28,13 @@ class GroupNormTimer:
         self.dtype = dtype
 
     @torch.inference_mode()
-    def run_and_get_time(self, input_dims: list, print_tensors: bool = False):
-        num_warmups = 5
-        num_iters = 25
-
+    def run_and_get_time(
+        self,
+        input_dims: list,
+        num_warmups: int,
+        num_iters: int,
+        print_tensors: bool = False,
+    ):
         assert len(input_dims) >= 3
         assert input_dims[1] == self.num_channels
 
@@ -70,8 +73,39 @@ class GroupNormTimer:
             print("z :")
             print(z)
 
-        is_equal = torch.allclose(y, z, rtol=1e-3, atol=1e-2)
-        return (time_elapsed_torch, time_elapsed_opt, is_equal)
+        y_float = y.float()
+        z_float = z.float()
+        diff = (y_float - z_float).abs()
+        max_abs = diff.max().item()
+        # BF16 has a 0.016 default relative tolerance in torch.testing. Keep
+        # a small absolute floor for reduction-order drift near zero.
+        rtol = 0.016 if self.dtype == torch.bfloat16 else 1e-3
+        atol = 2e-2 if self.dtype == torch.bfloat16 else 1e-2
+        allowed = atol + rtol * y_float.abs()
+        violation = diff - allowed
+        mismatches = (violation > 0).sum().item()
+        is_equal = mismatches == 0
+        worst = None
+        if not is_equal:
+            flat_index = violation.argmax().item()
+            index = tuple(
+                int(i) for i in np.unravel_index(flat_index, tuple(y.shape))
+            )
+            worst = {
+                "index": index,
+                "torch": y_float[index].item(),
+                "aiter": z_float[index].item(),
+                "abs": diff[index].item(),
+                "allowed": allowed[index].item(),
+            }
+        return (
+            time_elapsed_torch,
+            time_elapsed_opt,
+            max_abs,
+            mismatches,
+            is_equal,
+            worst,
+        )
 
 
 def str2tuple(s):
@@ -94,18 +128,34 @@ def main(args):
     bench_shapes = args.bench_shapes
 
     speedups = []
+    failures = []
     for shape in bench_shapes:
         norm_timer = GroupNormTimer(shape[0], shape[2], device, dtype)
-        torch_time, opt_time, is_equal = norm_timer.run_and_get_time(
-            shape[1:], print_tensors=args.print_tensors
+        torch_time, opt_time, max_abs, mismatches, is_equal, worst = (
+            norm_timer.run_and_get_time(
+                shape[1:],
+                args.num_warmups,
+                args.num_iters,
+                print_tensors=args.print_tensors,
+            )
         )
         speedup = torch_time / opt_time if opt_time > 0 else float("inf")
         speedups.append(speedup)
 
         print(
-            f"shape={shape} torch_time={torch_time:.4f} ms, opt_time={opt_time:.4f} ms, speedup={speedup:.4f} is_equal={is_equal}",
+            f"shape={shape} torch_time={torch_time:.4f} ms, opt_time={opt_time:.4f} ms, "
+            f"speedup={speedup:.4f} max_abs={max_abs:.6g} mismatches={mismatches} "
+            f"is_equal={is_equal}",
             flush=True,
         )
+        if not is_equal:
+            print(
+                f"  worst index={worst['index']} torch={worst['torch']:.9g} "
+                f"aiter={worst['aiter']:.9g} abs={worst['abs']:.9g} "
+                f"allowed={worst['allowed']:.9g}",
+                flush=True,
+            )
+            failures.append((shape, max_abs, mismatches, worst))
 
     print("\n=== Performance Summary ===")
     print("Speedups with all shapes, including batch_size > 1 and odd hw values:")
@@ -117,6 +167,14 @@ def main(args):
         speedups_batch1 = speedups[:-6]
         print(f"Average speedup: {np.mean(speedups_batch1):.4f}", flush=True)
         print(f"Median speedup: {np.median(speedups_batch1):.4f}", flush=True)
+
+    if failures:
+        details = "; ".join(
+            f"shape={shape} max_abs={max_abs:.6g} mismatches={mismatches} "
+            f"worst={worst}"
+            for shape, max_abs, mismatches, worst in failures
+        )
+        raise AssertionError(f"GroupNorm correctness failures: {details}")
 
 
 if __name__ == "__main__":
@@ -140,6 +198,9 @@ if __name__ == "__main__":
             [32, 1, 128, 9, 144, 256],
             [32, 1, 128, 17, 256, 128],
             [32, 1, 128, 17, 256, 256],
+            # Group span is divisible by four, but each channel has an odd
+            # element count. Vectorizing this shape crosses channel boundaries.
+            [32, 1, 128, 32769],
             [32, 1, 256, 9, 128, 128],
             [32, 1, 256, 9, 128, 256],
             [32, 1, 256, 17, 144, 256],
