@@ -276,7 +276,7 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
         rows = policy._load_mxscale_bmm_tuned(None, False)
         assert rows[("gfx950", 3, 1, 1024, 4096, "128x128")]["kernelId"] == 42
         assert policy.resolve_a8w8_mxscale_bmm_plan(2, 1, 1024, 4096) == (
-            8640,
+            8319,
             1,
         )
         assert len(warnings) == 1
@@ -284,6 +284,281 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
     finally:
         policy.lookup_mxscale_bmm_config.cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()
+
+
+@pytest.fixture
+def mxscale_csv(monkeypatch, tmp_path):
+    from aiter.ops.opus import policy
+
+    path = tmp_path / "mxscale.csv"
+    monkeypatch.setattr(
+        policy,
+        "AITER_CONFIGS",
+        SimpleNamespace(
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE=str(path)
+        ),
+    )
+    monkeypatch.setattr(policy, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(policy, "get_padded_m", lambda m, *_: m)
+    monkeypatch.setattr(policy.logger, "propagate", True)
+    caches = (
+        policy._load_mxscale_bmm_tuned,
+        policy.lookup_mxscale_bmm_config,
+        batched_a8w8._get_mxscale_bmm_launch_plan,
+    )
+    for cache in caches:
+        cache.cache_clear()
+    yield path, policy
+    for cache in caches:
+        cache.cache_clear()
+
+
+def test_mxscale_legacy_csv_defaults_to_128x128(mxscale_csv, caplog):
+    path, policy = mxscale_csv
+    path.write_text(
+        "gfx,b,m,n,k,libtype,kernelId,splitK\n" "gfx950,2,128,1024,4096,opus,653,1\n"
+    )
+    assert policy.resolve_a8w8_mxscale_bmm_plan(2, 128, 1024, 4096) == (8653, 1)
+    assert "w_scale_block" in caplog.text
+    assert (
+        policy.lookup_mxscale_bmm_config(2, 128, 1024, 4096, w_scale_block="32x32")
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "w_scale_block,kid,split_k", [("128x128", 8326, 2), ("32x32", 9325, 1)]
+)
+def test_mxscale_group_specific_tuned_rows(mxscale_csv, w_scale_block, kid, split_k):
+    path, policy = mxscale_csv
+    path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+        "gfx950,2,128,1024,4096,128x128,opus,8326,2\n"
+        "gfx950,2,128,1024,4096,32x32,opus,9325,1\n"
+    )
+    assert policy.resolve_a8w8_mxscale_bmm_plan(
+        2, 128, 1024, 4096, w_scale_block=w_scale_block
+    ) == (kid, split_k)
+    assert (
+        batched_a8w8.lookup_mxscale_bmm_config(
+            2, 128, 1024, 4096, w_scale_block=w_scale_block
+        )["kernelId"]
+        == kid
+    )
+
+
+def test_mxscale_wrong_group_kid_is_skipped(mxscale_csv, caplog):
+    path, policy = mxscale_csv
+    path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+        "gfx950,2,128,1024,4096,32x32,opus,8653,1\n"
+    )
+    assert policy.resolve_a8w8_mxscale_bmm_plan(
+        2, 128, 1024, 4096, w_scale_block="32x32"
+    ) == (
+        9321,
+        1,
+    )
+    assert "Skipping 1 invalid OPUS row" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "shape,gs128_kid",
+    [
+        ((2, 2048, 1024, 4096), 8137),
+        ((2, 2048, 1024, 1024), 8653),
+        ((16, 1024, 4096, 4096), 8158),
+        ((16, 1024, 4096, 16384), 8157),
+        ((4, 2048, 1024, 12288), 8157),
+        ((16, 1024, 4096, 4224), 8137),
+        ((2, 1, 64, 256), 8640),
+        ((2, 1, 64, 128), 8653),
+        ((2, 128, 32, 256), 8320),
+        ((2, 512, 64, 128), 8653),
+        ((2, 512, 128, 256 + 128), 8653),
+        ((2, 512, 32, 128), 8000),
+    ],
+)
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_mxscale_untuned_group_fallback(mxscale_csv, shape, gs128_kid, group_size):
+    _, policy = mxscale_csv
+    kid, split_k = policy.resolve_a8w8_mxscale_bmm_plan(
+        *shape, w_scale_block=f"{group_size}x{group_size}"
+    )
+    assert (kid, split_k) == (gs128_kid + (1000 if group_size == 32 else 0), 1)
+    instance = policy.get_kernel_instance("gfx950", "a8w8_mxscale_bmm", kid)
+    assert (instance.GROUP_N, instance.GROUP_K) == (group_size, group_size)
+
+
+@pytest.mark.parametrize(
+    "shape,plan",
+    [
+        ((4, 64, 512, 16384), (8653, 8)),
+        ((16, 256, 512, 16384), (8137, 2)),
+        ((4, 64, 512, 4096), (8321, 1)),
+        ((1, 1, 1024, 16384), (8319, 8)),
+        ((4, 32, 1024, 4096), (8321, 1)),
+        ((4, 48, 4096, 4096), (8653, 1)),
+    ],
+)
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_mxscale_untuned_split_k_fills_cus(
+    mxscale_csv, monkeypatch, shape, plan, group_size
+):
+    _, policy = mxscale_csv
+    monkeypatch.setattr(policy, "get_cu_num", lambda: 256)
+    kid, split_k = policy.resolve_a8w8_mxscale_bmm_plan(
+        *shape, w_scale_block=f"{group_size}x{group_size}"
+    )
+    assert (kid, split_k) == (plan[0] + (1000 if group_size == 32 else 0), plan[1])
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (2, 1, 1024, 4096),
+        (2, 128, 512, 1024),
+        (8, 300, 1024, 4096),
+        (2, 2048, 1024, 4096),
+        (16, 4096, 1024, 4096),
+        (4, 2048, 1024, 12288),
+        (16, 4096, 1024, 16384),
+    ],
+)
+def test_mxscale_untuned_1x32_takes_the_32x32_twin(mxscale_csv, shape):
+    _, policy = mxscale_csv
+    kid, _ = policy.resolve_a8w8_mxscale_bmm_plan(*shape, w_scale_block="1x32")
+    instance = policy.get_kernel_instance("gfx950", "a8w8_mxscale_bmm", kid)
+    assert (instance.GROUP_N, instance.GROUP_K) == (1, 32)
+    assert not instance.needs_preshuffled_b
+    kid32, _ = policy.resolve_a8w8_mxscale_bmm_plan(*shape, w_scale_block="32x32")
+    assert kid == policy._mx1x32_twin(kid32, *shape)
+
+
+@pytest.mark.parametrize("kid", [8158, 9158, 9894, 8157])
+def test_mxscale_pipeline_plan_rejects_odd_k_tiles(kid):
+    from aiter.ops.opus.launch_plan import _build_a8w8_mxscale_bmm_plan
+
+    _build_a8w8_mxscale_bmm_plan(
+        arch="gfx950",
+        kid=kid,
+        output_dtype=torch.bfloat16,
+        M=256,
+        batch=1,
+        N=256,
+        K=4096,
+        split_k=1,
+    )
+    with pytest.raises(ValueError, match="even K"):
+        _build_a8w8_mxscale_bmm_plan(
+            arch="gfx950",
+            kid=kid,
+            output_dtype=torch.bfloat16,
+            M=256,
+            batch=1,
+            N=256,
+            K=4224,
+            split_k=1,
+        )
+
+
+def test_mxscale_direct_only_kid_with_workspace_rejects_split_k(monkeypatch):
+    def unexpected_launch(*args, **kwargs):
+        raise AssertionError("direct-only split-K reached the backend")
+
+    monkeypatch.setattr(opus_a8w8, "_launch_a8w8_backend", unexpected_launch)
+    M, batch, N, K = 64, 1, 128, 512
+    with pytest.raises(ValueError, match="requires split_k <= 1"):
+        opus_a8w8._launch_a8w8_mxscale_bmm(
+            torch.empty((batch, M, K), dtype=dtypes.fp8),
+            torch.empty((batch, N, K), dtype=dtypes.fp8),
+            torch.empty((batch, M, N), dtype=torch.bfloat16),
+            torch.empty((batch, M, K // 32), dtype=torch.uint8),
+            torch.empty((batch, N // 32, K // 32), dtype=torch.uint8),
+            kid=9646,
+            split_k=2,
+            workspace=torch.empty(M * N * 2),
+            route_arch="gfx950",
+            instance=SimpleNamespace(direct_only=True),
+        )
+
+
+def test_mxscale_untuned_1x32_raises_where_no_tile_runs(mxscale_csv):
+    _, policy = mxscale_csv
+    with pytest.raises(ValueError, match="no row-major 1x32"):
+        policy.resolve_a8w8_mxscale_bmm_plan(2, 8, 16, 4096, w_scale_block="1x32")
+
+
+def test_mxscale_1x32_tuned_row_must_be_1x32(mxscale_csv, caplog):
+    path, policy = mxscale_csv
+    path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK\n"
+        "gfx950,2,128,1024,4096,1x32,opus,9325,1\n"
+        "gfx950,4,128,1024,4096,1x32,opus,9825,1\n"
+    )
+    kid, _ = policy.resolve_a8w8_mxscale_bmm_plan(
+        2, 128, 1024, 4096, w_scale_block="1x32"
+    )
+    assert kid != 9325
+    assert policy.mxscale_bmm_kid_block(kid) == "1x32"
+    assert policy.resolve_a8w8_mxscale_bmm_plan(
+        4, 128, 1024, 4096, w_scale_block="1x32"
+    ) == (9825, 1)
+
+
+@pytest.mark.parametrize("w_scale_block", ["0x0", "64x64", "256x256", "1x128", "128"])
+def test_mxscale_rejects_unsupported_group(mxscale_csv, w_scale_block):
+    _, policy = mxscale_csv
+    with pytest.raises(ValueError, match="unsupported OPUS MXFP8 BMM scale block"):
+        policy.resolve_a8w8_mxscale_bmm_plan(
+            2, 128, 1024, 4096, w_scale_block=w_scale_block
+        )
+
+
+@pytest.mark.parametrize("split_k", [1, 2])
+def test_mxscale_public_entry_routes_and_caches_each_group(monkeypatch, split_k):
+    calls, resolutions = [], []
+
+    def resolve(g, m, n, k, *, w_scale_block="128x128"):
+        resolutions.append(w_scale_block)
+        return (9326 if w_scale_block == "32x32" else 8326), split_k
+
+    def raw(*args):
+        calls.append((args[-2], args[-1], "raw"))
+
+    def opus(*args, **kwargs):
+        calls.append((kwargs["kid"], kwargs["split_k"], "workspace"))
+
+    monkeypatch.setattr(batched_a8w8, "_resolve_a8w8_mxscale_bmm_plan", resolve)
+    monkeypatch.setattr(batched_a8w8, "_get_mxscale_bmm_launchers", lambda: (raw, opus))
+    batched_a8w8._get_mxscale_bmm_launch_plan.cache_clear()
+    try:
+        x = torch.empty((96, 2, 2048), dtype=dtypes.fp8)
+        w = torch.empty((2, 128, 2048), dtype=dtypes.fp8)
+        for group in (128, 32, 128, 32):
+            xs = torch.empty((96, 2, 2048 // group), dtype=torch.uint8)
+            ws = torch.empty((2, 128 // group, 2048 // group), dtype=torch.uint8)
+            y = batched_a8w8.batched_gemm_a8w8_mxscale(x, w, xs, ws)
+            assert y.shape == (96, 2, 128)
+        assert resolutions == ["128x128", "32x32"]
+        route = "raw" if split_k == 1 else "workspace"
+        assert calls == [(8326, split_k, route), (9326, split_k, route)] * 2
+    finally:
+        batched_a8w8._get_mxscale_bmm_launch_plan.cache_clear()
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_mxscale_group_size_fake_tensor(group_size):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        x = torch.empty((96, 2, 2048), dtype=dtypes.fp8)
+        w = torch.empty((2, 128, 2048), dtype=dtypes.fp8)
+        xs = torch.empty((96, 2, 2048 // group_size), dtype=torch.uint8)
+        ws = torch.empty((2, 128 // group_size, 2048 // group_size), dtype=torch.uint8)
+        result = batched_a8w8.batched_gemm_a8w8_mxscale(x, w, xs, ws)
+        assert result.shape == (96, 2, 128)
+        assert result.dtype == torch.bfloat16
 
 
 if __name__ == "__main__":

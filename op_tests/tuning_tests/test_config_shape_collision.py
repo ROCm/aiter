@@ -354,20 +354,61 @@ class TestConfigShapeCollision(unittest.TestCase):
         # dedicated caller policy still owns public-kid normalization.
         from aiter.ops.opus import policy
 
+        # Exercise legacy local-kid normalization without pinning this test to
+        # whichever kids happen to win two production tuning rows. Retuning is
+        # allowed to change those winners; rewrite two rows only in the temp
+        # config copy and require the loader to restore their global ids.
+        tuned = os.path.join(
+            self._tmp,
+            "aiter",
+            "configs",
+            "model_configs",
+            "dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
+        )
+        with open(tuned, newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            tuned_rows = list(reader)
+
+        normalized = []
+        for row in tuned_rows:
+            if row.get("libtype") != "opus":
+                continue
+            global_kid = int(row["kernelId"])
+            local_kid = global_kid - 8000
+            if not 0 <= local_kid <= 1899:
+                continue
+            key = (
+                row["gfx"],
+                int(row["b"]),
+                int(row["m"]),
+                int(row["n"]),
+                int(row["k"]),
+                row["w_scale_block"],
+            )
+            row["kernelId"] = str(local_kid)
+            normalized.append((key, global_kid))
+            if len(normalized) == 2:
+                break
+        self.assertEqual(len(normalized), 2)
+
+        with open(tuned, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(tuned_rows)
+
+        _cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()
         rows = policy._load_mxscale_bmm_tuned("opus")
         self.assertTrue(rows)
         self.assertEqual(len(rows), len(set(rows)))
-        self.assertEqual(
-            rows[("gfx950", 2, 1, 1024, 4096, "128x128")]["kernelId"],
-            8311,
-            "legacy local OPUS kid 311 must become public global kid 8311",
-        )
-        self.assertEqual(
-            rows[("gfx950", 8, 128, 1024, 4096, "128x128")]["kernelId"],
-            8653,
-            "legacy local OPUS kid 653 must become public global kid 8653",
-        )
+        for key, global_kid in normalized:
+            self.assertEqual(
+                rows[key]["kernelId"],
+                global_kid,
+                f"legacy local OPUS kid {global_kid - 8000} must become "
+                f"public global kid {global_kid}",
+            )
         policy._load_mxscale_bmm_tuned.cache_clear()
 
     def test_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle(self):
@@ -375,6 +416,39 @@ class TestConfigShapeCollision(unittest.TestCase):
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
             "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
         )
+
+    def test_mxscale_merge_legacy_and_group32_preserves_sources(self):
+        from pathlib import Path
+
+        name = "batched_gemm_a8w8_blockscale_mxscale_tuned"
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "aiter/configs"
+            cfg.mkdir(parents=True)
+            (cfg / name.replace("tuned", "untuned")).with_suffix(".csv").write_text(
+                "gfx,b,m,n,k\n"
+            )
+            old, new = cfg / "old.csv", cfg / "new.csv"
+            old.write_text(
+                "gfx,b,m,n,k,kernelId,splitK,us\ngfx950,2,128,1024,4096,653,1,20\n"
+            )
+            new.write_text(
+                "gfx,b,m,n,k,w_scale_block,kernelId,splitK,us\n"
+                "gfx950,2,128,1024,4096,32x32,9653,1,22\n"
+            )
+            before = [p.read_bytes() for p in (old, new)]
+            try:
+                core.AITER_ROOT_DIR = tmp
+                merged = core.AITER_CONFIGS.update_config_files(f"{old}:{new}", name)
+                with open(merged, newline="") as f:
+                    rows = list(csv.DictReader(f))
+                self.assertEqual(
+                    {r["w_scale_block"] for r in rows}, {"32x32", "128x128"}
+                )
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(before, [p.read_bytes() for p in (old, new)])
+            finally:
+                core.AITER_ROOT_DIR = self._tmp
+                _cache_clear()
 
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
