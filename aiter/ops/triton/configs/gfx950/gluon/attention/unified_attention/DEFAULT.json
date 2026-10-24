@@ -14,6 +14,7 @@
     ],
     "kv_split": [
       "SW",
+      "SWB",
       "D",
       "Q",
       "DT"
@@ -178,6 +179,17 @@
     }
   },
   "kv_split": {
+    "SW_GEQ_256.SWB": {
+      "SEGMENTS_PER_CU": 1,
+      "SPLIT_FIT_BUDGET": true,
+      "SPLIT_SEQS_PER_TILE": 1.5,
+      "MFMA_DIM": 16,
+      "SPLIT_MIN_TILES": 4,
+      "SEGMENT_TILE_MIN": 64,
+      "SEGMENT_TILE_MAX": 64,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
     "SW": {
       "SEGMENTS_PER_CU": 2,
       "MFMA_DIM": 16,

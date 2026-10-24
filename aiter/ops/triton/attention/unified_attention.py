@@ -18,6 +18,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
     get_dtype_str,
     get_unified_attention_config,
+    sliding_window_bounds_kv,
 )
 
 # gfx1250
@@ -150,20 +151,35 @@ def _gfx950_gluon_supported(params: _UAParams):
 
 def _gfx950_split_params(params: _UAParams):
     """Size the split by the gluon grid when a sequence spans several query blocks."""
-    if params.all_decode or params.max_seqlen_q * params.num_queries_per_kv <= 128:
+    q_rows = params.max_seqlen_q * params.num_queries_per_kv
+    if params.all_decode or (q_rows <= 128 and params.sliding_window <= 0):
         return params
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    if q_rows <= 128:
+        block_m = max(block_m, triton.next_power_of_2(q_rows))
     block_q = block_m // params.num_queries_per_kv
     num_q_blocks = params.num_tokens // block_q + params.num_seqs
     return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
+
+
+_SW_SPLIT_MAX_Q = 16
 
 
 def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
         return True
-    if params.sliding_window > 0:
+    if params.sliding_window > 0 and not (
+        params.max_seqlen_q <= _SW_SPLIT_MAX_Q
+        and params.max_seqlen_q * params.num_queries_per_kv <= 128
+        and sliding_window_bounds_kv(
+            params.max_seqlen_q,
+            params.max_seqlen_k,
+            params.sliding_window,
+            params.block_size,
+        )
+    ):
         return False
     # unsplit, the 2d grid is faster
     config = get_unified_attention_config(

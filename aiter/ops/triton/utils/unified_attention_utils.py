@@ -26,6 +26,9 @@ that exists: an exact EQ first, then LEQ bounds ascending, then GEQ
 descending, then "any". So the leftmost axis wins: D before Q is what makes
 head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
+SW is the keys a row can see, min(window, max_seqlen_k), and 0 with no window:
+SW_GEQ_<n> targets a window size, a bare SW matches any window, and a table
+may not mix SW_LEQ and SW_GEQ keys.
 
 A section with no axes, like reduce above, is just a config.
 
@@ -64,7 +67,8 @@ _AXIS_KIND = {
     "D": "num",  # head_size
     "Q": "num",  # max_seqlen_q; Q_LEQ_1 is decode
     "BS": "num",  # block_size, the KV page size
-    "SW": "bool",  # sliding_window > 0
+    "SW": "opt_num",  # keys a row can see, 0 when off; bare SW = any window
+    "SWB": "bool",
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
     "DT": "enum",  # (q dtype tag, kv dtype tag)
@@ -106,6 +110,14 @@ def _index(keys: tuple, axes: tuple) -> tuple:
         if key != "any":
             for part in key.split(_SEP):
                 parts[_axis_of(part)].add(part)
+    # every matching LEQ key outranks every GEQ key, so one direction per axis
+    for a in axes:
+        if _AXIS_KIND[a] == "opt_num":
+            dirs = {p.split("_")[1] for p in parts[a] if "_" in p}
+            assert not {"LEQ", "GEQ"} <= dirs, (
+                f"{_CONFIG_NAME}: {a} keys mix LEQ and GEQ "
+                f"({sorted(parts[a])}); use one direction"
+            )
     return {_canonical(k, axes): k for k in keys}, parts
 
 
@@ -121,6 +133,8 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
     if kind == "enum":
         q, kv = value
         return [f"{axis}_{q}_{kv}", f"{axis}_{q}_any", f"{axis}_any_{kv}", "any"]
+    if kind == "opt_num" and not value:
+        return ["any"]
 
     eq = sorted(c for c in parts if c.startswith(f"{axis}_EQ_"))
     leq = sorted((c for c in parts if c.startswith(f"{axis}_LEQ_")), key=_bound)
@@ -131,6 +145,7 @@ def _candidates(axis: str, value, parts: set) -> list[str]:
         [c for c in eq if value == _bound(c)]
         + [c for c in leq if value <= _bound(c)]
         + [c for c in geq if value >= _bound(c)]
+        + ([axis] if kind == "opt_num" else [])
         + ["any"]
     )
 
@@ -181,11 +196,24 @@ def compute_segment_params(config: dict, params) -> dict:
     mfma_dim = config.pop("MFMA_DIM", None)
     min_tiles = config.pop("SPLIT_MIN_TILES", 0)
     min_share = config.pop("SPLIT_MIN_SHARE", 0)
+    fit_budget = config.pop("SPLIT_FIT_BUDGET", False)
+    seqs_per_tile = config.pop("SPLIT_SEQS_PER_TILE", 0)
 
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
-    limit = triton.cdiv(params.max_seqlen_k, tile)
+    kv_len = params.max_seqlen_k
+    # rows see at most window + q - 1 keys; the split carves seq_len, so count
+    # only those when the window bounds the table
+    if sliding_window_bounds_kv(
+        params.max_seqlen_q,
+        params.max_seqlen_k,
+        params.sliding_window,
+        params.block_size,
+    ):
+        kv_len = min(kv_len, params.sliding_window + params.max_seqlen_q - 1)
+    limit = triton.cdiv(kv_len, tile)
+    too_many_seqs = seqs_per_tile and params.num_seqs > seqs_per_tile * limit
     if cap is not None:
         limit = min(cap, limit)
 
@@ -198,7 +226,9 @@ def compute_segment_params(config: dict, params) -> dict:
         )
         budget //= num_waves
     share = triton.cdiv(budget, prgms)
-    if limit <= min_tiles or share < min_share:
+    if fit_budget:
+        share = 1 << ((budget // prgms).bit_length() - 1) if budget >= prgms else 0
+    if limit <= min_tiles or share < min_share or too_many_seqs:
         segments = 1
     else:
         claim = max(min(lo, limit), min(limit, max(1, share)))
@@ -209,6 +239,16 @@ def compute_segment_params(config: dict, params) -> dict:
         # the split landed on its floor: too few segments to be worth 2 warps
         config["num_warps"] = 1
     return config
+
+
+def sliding_window_bounds_kv(
+    max_seqlen_q: int, max_seqlen_k: int, sliding_window: int, block_size: int
+) -> bool:
+    return (
+        sliding_window > 0
+        and max_seqlen_q > 1
+        and max_seqlen_k <= sliding_window + max_seqlen_q + block_size - 2
+    )
 
 
 def _axis_values(
@@ -225,7 +265,10 @@ def _axis_values(
         "D": head_size,
         "Q": max_seqlen_q,
         "BS": block_size,
-        "SW": sliding_window > 0,
+        "SW": max(1, min(sliding_window, max_seqlen_k)) if sliding_window > 0 else 0,
+        "SWB": sliding_window_bounds_kv(
+            max_seqlen_q, max_seqlen_k, sliding_window, block_size
+        ),
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype)),
