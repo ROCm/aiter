@@ -2,13 +2,16 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import functools
 import gc
 import itertools
 import logging
 import os
 from contextlib import ExitStack, nullcontext
+from unittest.mock import patch
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -35,6 +38,7 @@ from aiter.int4_utils import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops import moe_op
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
@@ -64,8 +68,302 @@ from aiter.ops.shuffle import (
 
 logger = logging.getLogger(__name__)
 
+_Q256_KERNEL = "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate"
+
+
+def _check_q256_reference(reference, output, msg):
+    # checkAllclose returns a mismatch *ratio*, including accepted rounding
+    # differences. Use a stricter ratio than its repository default (5%) and
+    # independently bound the energy of the numerical error to 1% NRMS.
+    reference, output = reference.float(), output.float()
+    assert torch.isfinite(output).all(), msg
+    err = checkAllclose(reference, output, tol_err_ratio=0.01, msg=msg)
+    nrms = (
+        (
+            (reference - output).square().sum()
+            / reference.square().sum().clamp_min(1e-30)
+        )
+        .sqrt()
+        .item()
+    )
+    assert err <= 0.01 and nrms < 0.01, f"{msg}: mismatch={err}, NRMS={nrms}"
+    return nrms
+
+
+def _torch_q256_stage2(hidden, weight, scales, ids, routing_weights):
+    """Independent down projection with the producer's BF16 route-output contract.
+
+    The ordinary two-stage reference rounds only after the top-k sum; Q256
+    rounds each weighted contribution before the FP32 reduction.
+    """
+    tokens, topk = ids.shape
+    model, inter = weight.shape[1], weight.shape[2] * 2
+    scales = scales.view(weight.shape[0], model, inter // 32)
+    hidden_q, hidden_scale = aiter.get_torch_quant(aiter.QuantType.per_1x32)(
+        hidden, quant_dtype=dtypes.fp4x2
+    )
+    dequant = fp4_utils.mxfp4_to_f32(hidden_q).view(tokens, topk, inter // 32, 32)
+    dequant = (
+        dequant * fp4_utils.e8m0_to_f32(hidden_scale).view(tokens, topk, inter // 32, 1)
+    ).view(tokens, topk, inter)
+    contributions = torch.empty(
+        (tokens, topk, model), dtype=dtypes.bf16, device=hidden.device
+    )
+    for expert in range(weight.shape[0]):
+        mask = ids == expert
+        if not mask.any():
+            continue
+        w = fp4_utils.mxfp4_to_f32(weight[expert]).view(model, inter // 32, 32)
+        w = (
+            w * fp4_utils.e8m0_to_f32(scales[expert]).view(model, inter // 32, 1)
+        ).view(model, inter)
+        contributions[mask] = (
+            (dequant[mask] @ w.T) * routing_weights[mask].unsqueeze(-1)
+        ).to(dtypes.bf16)
+    return contributions.float().sum(1).to(dtypes.bf16)
+
+
+def _profile_q256(call, kernel_name):
+    # A Python dispatch hit alone does not prove that the assembly was launched.
+    call()  # Compile before profiling and graph capture.
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as prof:
+        out = call()
+        torch.cuda.synchronize()
+    names = [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert (
+        kernel_name in names
+    ), f"Q256 producer {kernel_name!r} did not execute: {names}"
+    reductions = [name for name in names if name.startswith("moe_reduction_")]
+    assert reductions, f"Q256 reduction did not execute: {names}"
+    expected_streaming = out.shape == (8192, 8192)
+    assert all(
+        name.endswith("_nt") == expected_streaming for name in reductions
+    ), f"Q256 reduction cache policy mismatch: {reductions}, {expected_streaming=}"
+    return out
+
+
+def _check_q256_integration(
+    call_args,
+    kwargs,
+    a1_qt,
+    a1_scale,
+    w1_qt,
+    w2_qt,
+    w1_scale,
+    w2_scale,
+    reference,
+    expected_kernel,
+    shared_expert_id=None,
+):
+    """Check real dispatch, compact producer parity, and model call contracts."""
+    hidden, w1, _w2, _weights, ids = call_args
+    tokens, model = hidden.shape
+    topk = ids.shape[1]
+    weighted = expected_kernel.endswith("_route_weighted") and tokens == 8192
+    actual_kernel = _Q256_KERNEL + ("_route_weighted" if weighted else "_route")
+    native = moe_op.fmoe_q256_producer
+    captured = []
+
+    def producer(*args, **kw):
+        assert not kw, "update this test if the producer ABI changes"
+        out, partials = args[:2]
+        assert out.shape == (tokens, model)
+        assert partials.shape == (tokens, topk, model)
+        assert partials.dtype == dtypes.bf16
+        job_map = args[14] if len(args) > 14 else None
+        assert (job_map is not None) == weighted, "wrong Q256 scheduling path"
+        if not captured:
+            captured.append(args)
+        return native(*args)
+
+    def call():
+        return fused_moe(*call_args, **kwargs)
+
+    with patch.object(moe_op, "fmoe_q256_producer", producer):
+        out = _profile_q256(call, actual_kernel)
+    assert captured, "fused_moe did not call fmoe_q256_producer"
+    nrms = _check_q256_reference(reference, out, "Q256 torch reference")
+
+    # Compare weighted scheduling against the ordinary compact producer, then
+    # reduce with torch independently of the production FlyDSL reducer.
+    args = captured[0]
+    if weighted and shared_expert_id is not None:
+        # Inspect actual eager sorting/planner outputs on the host, never inside
+        # the producer hook (which is also used during graph capture).
+        assert shared_expert_id == 512, "Q256 weighted scheduling requires expert 512"
+        assert bool((ids[:, -1] == shared_expert_id).all())
+        assert bool((ids[:, :-1] != shared_expert_id).all())
+        counts = args[8].cpu().tolist()
+        assert counts[1] == tokens == 8192
+        assert counts[0] % 256 == 0
+        physical_tiles = counts[0] // 256
+        assert physical_tiles <= args[7].numel()
+        boundary = physical_tiles - 32
+        jobs = boundary + 64
+        assert boundary >= 1 and jobs <= 1024, "Q256 shared geometry does not qualify"
+        experts = args[7][:physical_tiles].cpu()
+        assert bool(
+            (experts[boundary:] == 512).all()
+        ), "Q256 shared suffix is not 32 tiles"
+        assert (
+            experts[boundary - 1].item() != 512
+        ), "Q256 shared suffix exceeds 32 tiles"
+        job_map = args[14].cpu()
+        identity = torch.arange(job_map.numel(), dtype=job_map.dtype, device="cpu")
+        identity[identity >= jobs] = -1
+        assert not torch.equal(job_map, identity), "Q256 weighted job map is identity"
+    partials = args[1]
+    compact_partials = torch.empty_like(partials)
+    baseline_args = list(args[:14])
+    baseline_args[0] = torch.empty_like(out)
+    baseline_args[1] = compact_partials
+    native(*baseline_args)
+    assert torch.equal(partials, compact_partials), "weighted/compact producer mismatch"
+    producer_ref = compact_partials.float().sum(1)
+    assert torch.equal(
+        producer_ref.to(out.dtype), out
+    ), "Q256 compact producer reduction"
+    del compact_partials, producer_ref, baseline_args
+
+    output = torch.full_like(out, float("nan"))
+    with patch.object(moe_op, "fmoe_q256_producer", producer):
+        returned = fused_moe(*call_args, output=output, **kwargs)
+        assert returned is output, "Q256 did not return the caller's output buffer"
+        assert torch.equal(output, out), "Q256 output buffer was not overwritten"
+        prequantized = fused_moe(
+            a1_qt, *call_args[1:], a1_scale=a1_scale, dtype=dtypes.bf16, **kwargs
+        )
+    assert torch.equal(prequantized, out), "Q256 prequantized input differs"
+
+    if (tokens, model) == (8192, 8192):
+        _check_q256_dynamic_routes(
+            call_args, kwargs, a1_qt, a1_scale, w1_qt, w2_qt, w1_scale, w2_scale
+        )
+        for index, bad in (
+            (1, torch.empty((tokens, topk - 1, model), dtype=dtypes.bf16)),
+            (2, torch.empty((tokens, model // 2), dtype=dtypes.fp32)),
+            (3, torch.empty((w1.shape[0], 256, model // 2), dtype=w1.dtype)),
+            (13, 128),
+        ):
+            invalid = list(args[:14])
+            invalid[index] = bad
+            with pytest.raises((RuntimeError, ValueError), match="Q256"):
+                native(*invalid)
+        for invalid_kwargs in (
+            {"output": torch.empty((tokens, model + 1), dtype=dtypes.bf16)},
+            {"output": torch.empty((tokens, model), dtype=dtypes.fp32)},
+            {"output": hidden},
+            {"a2_scale": torch.empty((tokens, topk, 8), dtype=dtypes.fp8_e8m0)},
+        ):
+            with (
+                patch.object(
+                    moe_op,
+                    "fmoe_q256_producer",
+                    side_effect=AssertionError("invalid config reached producer"),
+                ),
+                pytest.raises((RuntimeError, ValueError), match=r"(?s).+"),
+            ):
+                fused_moe(*call_args, **kwargs, **invalid_kwargs)
+    return {
+        "Q256 producer compared": True,
+        "Q256 executed kernel": actual_kernel,
+        "Q256 NRMS": nrms,
+    }
+
+
+def _check_q256_dynamic_routes(
+    call_args, kwargs, a1_qt, a1_scale, w1, w2, w1_scale, w2_scale
+):
+    hidden, shuffled_w1, shuffled_w2, weights, ids = call_args
+    tokens, model = hidden.shape
+    topk = ids.shape[1]
+    static_ids, static_weights = ids.clone(), weights.clone()
+    output = torch.empty((tokens, model), dtype=dtypes.bf16)
+
+    def call():
+        return fused_moe(
+            hidden,
+            shuffled_w1,
+            shuffled_w2,
+            static_weights,
+            static_ids,
+            output=output,
+            **kwargs,
+        )
+
+    def reference():
+        intermediate = torch_moe_stage1(
+            a1_qt,
+            w1,
+            w2,
+            static_weights,
+            static_ids,
+            dtype=dtypes.fp32,
+            activation=aiter.ActivationType.Silu,
+            quant_type=aiter.QuantType.per_1x32,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+        )
+        return _torch_q256_stage2(
+            intermediate, w2, w2_scale, static_ids, static_weights
+        )
+
+    # Change routes and weights in place after capture, including shared suffix.
+    call()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = call()
+    assert returned is output
+    boundaries = []
+    native = moe_op.fmoe_q256_producer
+
+    def observe(*args, **kw):
+        boundaries.append(int(args[8][0].item()) // 256 - 32)
+        return native(*args, **kw)
+
+    for active, shared, zero in (
+        (512, True, False),
+        (127, True, False),
+        (512, False, False),
+        (127, True, True),
+    ):
+        routed = (
+            torch.arange(tokens)[:, None] * (topk - 1) + torch.arange(topk)[None, :]
+        ) % active
+        if shared:
+            routed[:, -1] = 512
+        static_ids.copy_(routed)
+        static_weights.copy_(torch.full_like(weights, 0.0 if zero else 1.0 / topk))
+        expected = torch.zeros_like(output) if zero else reference()
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(output).all())
+        _check_q256_reference(
+            expected, output, f"Q256 replay {active=} {shared=} {zero=}"
+        )
+        if zero:
+            assert torch.count_nonzero(output).item() == 0
+        with patch.object(moe_op, "fmoe_q256_producer", observe):
+            eager = call().clone()
+        _check_q256_reference(expected, eager, "Q256 changed routes eager")
+    assert (
+        boundaries[0] != boundaries[1]
+    ), "route changes did not shift the shared expert boundary"
+
+
 torch.int4 = getattr(torch, "int4", torch.uint32)
-torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
@@ -114,7 +412,15 @@ def test_fmoe(
     disable_stage2_bias=False,
     ref_dtype="bf16",
     gate_up_layout: bool | None = None,
+    expected_kernel=None,
+    shared_expert_id=None,
 ):
+    if shared_expert_id is not None:
+        if not 0 <= shared_expert_id < E:
+            raise ValueError(f"shared_expert_id must be in [0, E={E})")
+        if topk < 2:
+            raise ValueError("shared expert routing requires topk >= 2")
+    torch.set_default_device("cuda")
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
     if actType == aiter.ActivationType.Situv2:
@@ -177,7 +483,24 @@ def test_fmoe(
     else:
         score = torch.randn((token, E), dtype=dtype)
 
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    if shared_expert_id is None:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    else:
+        # Model route structure: topk-1 renormalized routed probabilities plus
+        # an always-present shared expert. Its sigmoid weight is synthetic,
+        # derived from the original score, not an exact model gate weight.
+        routed_score = torch.cat(
+            (score[:, :shared_expert_id], score[:, shared_expert_id + 1 :]), dim=1
+        )
+        topk_weights, topk_ids = fused_topk(input, routed_score, topk - 1, True)
+        topk_ids = topk_ids + (topk_ids >= shared_expert_id).to(topk_ids.dtype)
+        topk_ids = torch.cat(
+            (topk_ids, torch.full_like(topk_ids[:, :1], shared_expert_id)), dim=1
+        )
+        shared_weight = (
+            score[:, shared_expert_id : shared_expert_id + 1].float().sigmoid()
+        )
+        topk_weights = torch.cat((topk_weights.float(), shared_weight), dim=1)
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -415,6 +738,9 @@ def test_fmoe(
     # the 2-stage flydsl/torch path does via its bf16 a2 buffer).
     if ref_dtype == "fp32":
         stage1_ref_dtype = dtypes.fp32
+    if expected_kernel is not None and moe_op.is_q256_kernel(expected_kernel):
+        # Q256 quantizes the FP32 SiLU*up result, without a BF16 round trip.
+        stage1_ref_dtype = dtypes.fp32
 
     out1_ref = torch_moe_stage1(
         a1_qt,
@@ -465,19 +791,22 @@ def test_fmoe(
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
-    out2_ref = torch_moe_stage2(
-        a2_qt,
-        w1_qt,  # E, inter_dim*2, model_dim
-        w2_qt,  # E, model_dim, inter_dim
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        quant_type=qType,
-        w2_scale=w2_scale,
-        a2_scale=a2_scale,
-        w2_bias=exp_bias2,
-        doweight=not doweight_stage1,
-    )
+    if expected_kernel is not None and moe_op.is_q256_kernel(expected_kernel):
+        out2_ref = _torch_q256_stage2(out1_ref, w2_qt, w2_scale, topk_ids, topk_weights)
+    else:
+        out2_ref = torch_moe_stage2(
+            a2_qt,
+            w1_qt,  # E, inter_dim*2, model_dim
+            w2_qt,  # E, model_dim, inter_dim
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            quant_type=qType,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            w2_bias=exp_bias2,
+            doweight=not doweight_stage1,
+        )
 
     # ######################## stage 2 end ###########
     _fused_moe_kwargs = {
@@ -587,6 +916,37 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
+    if expected_kernel is not None and moe_op.is_q256_kernel(expected_kernel):
+        ret = _check_q256_integration(
+            (input, w1_qt_aiter, w2_qt_aiter, topk_weights, topk_ids),
+            _fused_moe_kwargs,
+            a1_qt,
+            a1_scale,
+            w1_qt,
+            w2_qt,
+            w1_scale,
+            w2_scale,
+            out2_ref,
+            expected_kernel,
+            shared_expert_id=shared_expert_id,
+        )
+        flops = token * model_dim * inter_dim * (3 if use_g1u1 else 2) * topk * 2
+        nbytes = sum(
+            t.numel() * t.element_size()
+            for t in (input, w1_qt_aiter, w2_qt_aiter, out2_ref)
+        )
+        ret.update(
+            {
+                "us": us2,
+                "logits_diff": float(logits_diff),
+                "gfx": get_gfx(),
+                "fused_moe us": us2,
+                "fused_moe TFLOPS": flops / us2 / 1e6,
+                "fused_moe TB/s": nbytes / us2 / 1e6,
+                "fused_moe err": err,
+            }
+        )
+        return ret
     return {"us": us2, "logits_diff": float(logits_diff)}
 
 
@@ -798,7 +1158,7 @@ parser.add_argument(
     "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
 )
 
-args = parser.parse_args()
+args = parser.parse_args() if __name__ == "__main__" else parser.parse_args([])
 
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
@@ -867,7 +1227,7 @@ def _row_to_kwargs(row):
 
 
 def _iter_csv_cases():
-    """Yield FlyDSL/Opus cases from every selected model CSV."""
+    """Yield FlyDSL/Opus/Q256 cases from every selected model CSV."""
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     df_csv = pd.read_csv(merged_csv)
@@ -882,7 +1242,10 @@ def _iter_csv_cases():
             "flydsl_" not in kernel_name1
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
+            and not moe_op.is_q256_kernel(kernel_name1)
         ):
+            continue
+        if moe_op.is_q256_kernel(kernel_name1) and get_gfx() != "gfx950":
             continue
         if args.csv_filter:
             _kn = kernel_name1 + " " + kernel_name2
@@ -946,6 +1309,11 @@ def _iter_csv_cases():
             args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
         )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
+        if moe_op.is_q256_kernel(kernel_name1):
+            kwargs["expected_kernel"] = kernel_name1
+            kwargs["shared_expert_id"] = 512
+            kwargs["check_aot_cache"] = False
+            kwargs["disable_stage2_bias"] = True
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
@@ -1384,6 +1752,120 @@ def test_route_workspace_token_capacity():
     aiter.logger.info("moe_2stage: route workspace capacity passed")
 
 
+def _q256_case(token, model_dim, shared_expert_id=512):
+    # 512 routed experts (top-10) plus one shared expert in every token's routes.
+    return {
+        "dtype": dtypes.bf16,
+        "token": token,
+        "model_dim": model_dim,
+        "inter_dim": 256,
+        "E": 513,
+        "topk": 11,
+        "shared_expert_id": shared_expert_id,
+        "actType": aiter.ActivationType.Silu,
+        "gateMode": GateMode.SEPARATED.value,
+        "qType": aiter.QuantType.per_1x32,
+        "AQDType": dtypes.fp4x2,
+        "WQDType": dtypes.fp4x2,
+        "use_g1u1": True,
+        "check_aot_cache": False,
+        "disable_stage2_bias": True,
+        "expected_kernel": _Q256_KERNEL
+        + ("_route_weighted" if (token, model_dim) == (8192, 8192) else ""),
+    }
+
+
+def test_q256_prefill():
+    """Six shared-route shapes, random control, and scheduling boundaries on gfx950."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip Q256 prefill on %s", get_gfx())
+        return
+    cases = [
+        _q256_case(token, model_dim)
+        for model_dim, token in itertools.product((4096, 8192), (8192, 16384, 32768))
+    ] + [_q256_case(8192, 8192, shared_expert_id=None)]
+    rows = []
+    for case in cases:
+        rows.append(test_fmoe(**case))
+        gc.collect()
+        torch.cuda.empty_cache()
+    aiter.logger.info(
+        "Q256 shared/random-route summary (markdown):\n%s",
+        pd.DataFrame(rows)
+        .fillna({"shared_expert_id": "None"})
+        .to_markdown(index=False),
+    )
+    test_q256_token_boundaries()
+
+
+def _q256_metadata(**overrides):
+    kwargs = {
+        "token": get_padded_M(8192),
+        "model_dim": 8192,
+        "inter_dim": 256,
+        "expert": 513,
+        "topk": 11,
+        "dtype": dtypes.bf16,
+        "q_dtype_a": dtypes.fp4x2,
+        "q_dtype_w": dtypes.fp4x2,
+        "q_type": aiter.QuantType.per_1x32,
+        "use_g1u1": True,
+        "activation": aiter.ActivationType.Silu,
+        "doweight_stage1": False,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "is_shuffled": True,
+        "gate_mode": GateMode.SEPARATED.value,
+    }
+    kwargs.update(overrides)
+    return get_2stage_cfgs(**kwargs)
+
+
+def test_q256_token_boundaries():
+    """Keep the weighted tuned selector while varying the *actual* token count.
+
+    Explicitly bind the existing 8K metadata so untuned boundary shapes cannot
+    pass by silently selecting a different backend. Production scheduling must
+    choose the ordinary producer at every token count other than exactly 8192.
+    """
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip Q256 boundaries on %s", get_gfx())
+        return
+    import dataclasses
+
+    metadata = _q256_metadata()
+    assert metadata.run_1stage and metadata.block_m == 256
+    assert moe_op.is_q256_kernel(metadata.stage1.keywords["kernelName"])
+    for unsupported in (
+        {"is_ep": True},
+        {"has_stage1_bias": True},
+        {"has_stage2_bias": True},
+        {"has_stage2_scatter": True},
+        {"has_num_local_tokens": True},
+        {"q_dtype_a2": dtypes.fp8},
+        {"swiglu_limit": 7.0},
+    ):
+        with pytest.raises(ValueError, match="Q256"):
+            _q256_metadata(**unsupported)
+    stage1 = functools.partial(
+        metadata.stage1.func,
+        **{**metadata.stage1.keywords, "kernelName": _Q256_KERNEL + "_route_weighted"},
+    )
+    forced = dataclasses.replace(metadata, stage1=stage1)
+    rows = []
+    for token in (4096, 4097, 8191, 8192, 8193):
+        case = _q256_case(token, 8192)
+        case["expected_kernel"] = _Q256_KERNEL + "_route_weighted"
+        with patch.object(aiter.fused_moe, "get_2stage_cfgs", return_value=forced):
+            rows.append(test_fmoe(**case))
+        gc.collect()
+        torch.cuda.empty_cache()
+    aiter.logger.info(
+        "Q256 boundary summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 def test_bm16_tiled_scale_boundary():
     """Validate tuned BM16 dispatch and the 33-row scale boundary."""
     if get_gfx() != "gfx950":
@@ -1713,27 +2195,6 @@ def _iter_with_env(case_iter, **env_overrides):
         yield from case_iter
 
 
-_case_iters = []
-test_route_workspace_token_capacity()
-if args.bm16_scale_boundary:
-    test_bm16_tiled_scale_boundary()
-else:
-    test_output_buffer_contract()
-    test_swiglu_mxfp4_nonsplit_nobias_dispatch()
-    test_swiglu_mxfp4_untagged_layout_dispatch()
-    # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
-    if not args.no_flydsl_csv and args.quant is None:
-        _case_iters.append(
-            _iter_with_env(
-                _iter_csv_cases(),
-                AITER_SITUV2_A8W4="1",
-                AITER_SITUV2_A4W4=None,
-            )
-        )
-    if not args.no_legacy:
-        _case_iters.append(_iter_legacy_cases())
-case_iter = itertools.chain(*_case_iters)
-
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
 
 
@@ -1756,62 +2217,94 @@ def _write_bench_csv(rows):
         )
 
 
-df = []
-seen = 0
-for kwargs, extras in case_iter:
-    seen += 1
-    skip_reason = _moe_2stage_skip_reason(kwargs)
-    if skip_reason is not None:
-        aiter.logger.warning(
-            "skip moe_2stage case: %s (%s)",
-            _format_moe_2stage_case(kwargs),
-            skip_reason,
-        )
-        continue
-    _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
-    _force_moe_bound_zero = (
-        kwargs["qType"],
-        kwargs["AQDType"],
-        kwargs["WQDType"],
-    ) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4)
-    if _force_moe_bound_zero:
-        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
-    try:
-        aot_guard = (
-            run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
-        )
-        with aot_guard:
-            ret = test_fmoe(
-                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+def main():
+    torch.set_default_device("cuda")
+    _case_iters = []
+    test_route_workspace_token_capacity()
+    if args.bm16_scale_boundary:
+        test_bm16_tiled_scale_boundary()
+    else:
+        test_output_buffer_contract()
+        test_swiglu_mxfp4_nonsplit_nobias_dispatch()
+        test_swiglu_mxfp4_untagged_layout_dispatch()
+        # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
+        if not args.no_flydsl_csv and args.quant is None:
+            _case_iters.append(
+                _iter_with_env(
+                    _iter_csv_cases(),
+                    AITER_SITUV2_A8W4="1",
+                    AITER_SITUV2_A4W4=None,
+                )
             )
-    except torch.cuda.OutOfMemoryError as exc:
-        aiter.logger.warning(
-            "skip moe_2stage case after OOM: %s (%s)",
-            _format_moe_2stage_case(kwargs),
-            exc,
-        )
-        ret = None
-    finally:
-        if _force_moe_bound_zero:
-            if _old_moe_bound is None:
-                os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
-            else:
-                os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
-        # Reclaim per-case VRAM to avoid OOM under fragmentation.
-        gc.collect()
-        torch.cuda.empty_cache()
-    if ret is None:
-        continue
-    ret.update(extras)
-    df.append(ret)
-    _write_bench_csv(df)
+        if not args.no_legacy:
+            _case_iters.append(_iter_legacy_cases())
+    case_iter = itertools.chain(*_case_iters)
 
-aiter.logger.info(
-    "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",
-    seen,
-    len(df),
-    seen - len(df),
-)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+    df = []
+    seen = 0
+    q256_selected = False
+    for kwargs, extras in case_iter:
+        seen += 1
+        q256_selected |= moe_op.is_q256_kernel(kwargs.get("expected_kernel", ""))
+        skip_reason = _moe_2stage_skip_reason(kwargs)
+        if skip_reason is not None:
+            aiter.logger.warning(
+                "skip moe_2stage case: %s (%s)",
+                _format_moe_2stage_case(kwargs),
+                skip_reason,
+            )
+            continue
+        _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+        _force_moe_bound_zero = (
+            kwargs["qType"],
+            kwargs["AQDType"],
+            kwargs["WQDType"],
+        ) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4)
+        if _force_moe_bound_zero:
+            os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+        try:
+            aot_guard = (
+                run_only_env()
+                if kwargs.get("check_aot_cache", False)
+                else nullcontext()
+            )
+            with aot_guard:
+                ret = test_fmoe(
+                    **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+                )
+        except torch.cuda.OutOfMemoryError as exc:
+            aiter.logger.warning(
+                "skip moe_2stage case after OOM: %s (%s)",
+                _format_moe_2stage_case(kwargs),
+                exc,
+            )
+            ret = None
+        finally:
+            if _force_moe_bound_zero:
+                if _old_moe_bound is None:
+                    os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+                else:
+                    os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
+            # Reclaim per-case VRAM to avoid OOM under fragmentation.
+            gc.collect()
+            torch.cuda.empty_cache()
+        if ret is None:
+            continue
+        ret.update(extras)
+        df.append(ret)
+        _write_bench_csv(df)
+    aiter.logger.info(
+        "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",
+        seen,
+        len(df),
+        seen - len(df),
+    )
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+    if q256_selected:
+        test_q256_token_boundaries()
+
+
+if __name__ == "__main__":
+    main()

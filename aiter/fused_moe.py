@@ -56,6 +56,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_g2_kname_any,
 )
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
+from aiter.ops.moe_op import is_q256_kernel
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
@@ -1828,9 +1829,14 @@ def _fused_moe_impl(
                 "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
                 "(only the layout-v2 scatter GEMM2 handles the masked aux sort)."
             )
-        _stage2_kwargs = metadata.stage2.keywords
-        _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
-        _atomic = parse_g2_kname_any(_kn2)["atomic"]
+        if metadata.run_1stage:
+            _atomic = True  # Allocate the final output for producer + reduction.
+        else:
+            _stage2_kwargs = metadata.stage2.keywords
+            _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get(
+                "kernelName", ""
+            )
+            _atomic = parse_g2_kname_any(_kn2)["atomic"]
         # BM16's adaptive sort already emits routes and zeroes the output without
         # quantizing. Keep the Opus crossover for the configured aux pipeline.
         sorting_ret = moe_sorting(
@@ -1937,6 +1943,10 @@ def _fused_moe_impl(
             device=topk_ids.device,
             doweight_stage1=doweight_stage1,
         )
+        if metadata.output_aux:
+            _stage1_call = functools.partial(
+                _stage1_call, reverse_sorted=sort_reverse_sorted
+            )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
         return _return_output(_stage1_call(), output)
@@ -2022,6 +2032,7 @@ def fused_moe_1stage(
     device=None,
     doweight_stage1: bool | None = None,
     flat: int = 0,
+    reverse_sorted=None,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -2132,6 +2143,29 @@ def fused_moe_1stage(
                 w2_scale,
                 fc2_smooth_scale=None,
                 activation=activation,
+            )
+            return moe_buf
+
+        if is_q256_kernel(kernelName):
+            if a2_scale is not None:
+                raise ValueError("Q256 does not support caller-provided hidden scales")
+            from aiter.ops.moe_op import fmoe_q256
+
+            fmoe_q256(
+                moe_buf,
+                a1,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                reverse_sorted,
+                a1_scale,
+                w1_scale,
+                w2_scale,
+                topk,
+                kernelName=kernelName,
             )
             return moe_buf
 
@@ -3970,6 +4004,34 @@ def get_2stage_cfgs(
             has_stage2_bias=has_stage2_bias,
         )
 
+    if is_q256_kernel(kernelName1) and not (
+        q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and q_type == QuantType.per_1x32
+        and q_dtype_a2 in (None, dtypes.fp4x2)
+        and activation == ActivationType.Silu
+        and use_g1u1
+        and gate_mode == GateMode.SEPARATED
+        and is_shuffled
+        and not (
+            is_ep
+            or doweight_stage1
+            or hidden_pad
+            or intermediate_pad
+            or has_stage1_bias
+            or has_stage2_bias
+            or has_stage2_scatter
+            or has_num_local_tokens
+            or swiglu_limit
+        )
+        and situ_beta == 1.0
+        and situ_linear_beta == 1.0
+        and run_1stage
+        and block_m == 256
+        and not (ksplit or cfg_flat or run_1stage_xbf16)
+    ):
+        raise ValueError("Unsupported Q256 fused MoE configuration")
+
     if run_1stage:
         # never hard code block_m for 1-stage since it can be tuned by kernel itself, and we have different heuristics for different quant types
         # # TODO: enable this approach for other quant types and archs
@@ -3990,6 +4052,7 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
             flat=cfg_flat,
+            output_aux=(AUX_SORT_OPUS if is_q256_kernel(kernelName1) else False),
             **route_bucket_metadata,
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
