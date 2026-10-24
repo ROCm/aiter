@@ -1,0 +1,1 @@
+# Derivation of r21 from r20: derive_a.py <small/r21 dir> (a fresh copy of small/r20 minus SOURCE_SHA256.txt, NOTES-r20.md, tools/) rewrites ABI, t1_roles.hpp, layouts asserts, traits PFK3, GEMM dispatch, push mapping. derive_tests_*.py <small/r20 dir> <small/r21 dir> generate the two checkers from r20's.
