@@ -61,6 +61,7 @@ GLUON_CHUNK_K = (128, 256)
 GLUON_WAVE_PER_EU = (1, 2, 4)
 FLYDSL_WG_PER_CU = (1, 2, 3, 4)
 DEFAULT_MAX_MODEL_LEN = 131072
+DEFAULT_CONTEXT_LEN = "8192;60000"
 MAX_CALC_DIFF = 1e-3
 RUN_CONFIG_TOL_PCT = 10.0
 CONTEXT_SEP = ";"
@@ -178,6 +179,12 @@ class PagedMqaLogitsTuner(TunerCommon):
             default=DEFAULT_MAX_MODEL_LEN,
             help="Logits row width the shapes are timed with",
         )
+        self.parser.add_argument(
+            "--context_len",
+            default=DEFAULT_CONTEXT_LEN,
+            help="Contexts (';'-separated) for rows whose untuned CSV has no "
+            "context_len, e.g. one in the generic schema",
+        )
 
     def _clear_op_caches(self):
         pmql.reload_tuned_table()
@@ -190,8 +197,15 @@ class PagedMqaLogitsTuner(TunerCommon):
         gfx, cu_num = self.get_gfx(), self.get_cu_num()
         untunedf = self.get_untuned_gemm_list(args.untune_file)
         untunedf["gfx"], untunedf["cu_num"] = gfx, cu_num
+        # An empty context list would time nothing and report the shape as failed.
+        if not _contexts(args.context_len):
+            raise ValueError(f"--context_len {args.context_len!r} has no lengths")
         if "context_len" not in untunedf.columns:
-            untunedf["context_len"] = ""
+            untunedf["context_len"] = args.context_len
+        untunedf["context_len"] = [
+            args.context_len if pd.isna(v) or not _contexts(v) else v
+            for v in untunedf["context_len"]
+        ]
         self.untunedf = (
             untunedf.groupby(LOOKUP_KEYS, sort=False)["context_len"]
             .agg(lambda s: _join_contexts(c for v in s for c in _contexts(v)))
