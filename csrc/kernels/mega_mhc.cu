@@ -2630,7 +2630,6 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
         const HipDeviceGuard guard(residual.device_id);
         if(get_gpu_arch() == "gfx1250")
         {
-            AITER_CHECK(!mxfp8, "Mega-MHC mxfp8 requires gfx950");
             mega_mhc_gfx1250(residual_out,
                              post_out,
                              comb_out,
@@ -2657,7 +2656,10 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                              has_post,
                              identity_pre,
                              variant,
-                             res_preshuffle);
+                             res_preshuffle,
+                             quant_out,
+                             quant_scale,
+                             mxfp8);
             return;
         }
     }

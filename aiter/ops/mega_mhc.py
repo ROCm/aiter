@@ -421,12 +421,21 @@ def mega_mhc(
     other positive repeat counts use the generic stream kernel with the same
     pack.
 
-    out_dtype="mxfp8" (gfx950 only) returns (norm, q, e8m0) in place of norm:
-    BF16 norm (T, H), float8_e4m3fn q (T, H), and uint8 exponent bytes (T, H/32).
+    out_dtype="mxfp8" (gfx950 and gfx1250) returns (norm, q, e8m0) in place of
+    norm: the BF16 norm (T, H), float8_e4m3fn q (T, H) and uint8 E8M0 exponent
+    bytes, one per group of 32 columns. The call is the same on both
+    architectures. The exponent bytes use the layout of each architecture's
+    MXFP8 GEMM:
+
+    * gfx950: (T, H/32), row-major.
+    * gfx1250: (pad32(T), H/32) in the gfx1250 MXFP8 GEMM A-scale layout, that
+      is the bytes of aiter.ops.shuffle.shuffle_mxfp8fp4_scale. Padding rows
+      hold 0x7F. H must be divisible by 128.
+
     Quantization uses the rounded BF16 norm and group32 power-of-two scales,
     ceil_pow2(max(amax, 1e-10) / 448), matching FlyDSL Mega-MHC. Reinterpret
-    scale bytes with .view(torch.float8_e8m0fnu) for consumers requiring E8M0.
-    The same workspace supports both output modes, including graph replay.
+    the scale bytes with .view(torch.float8_e8m0fnu) for consumers that require
+    E8M0. The same workspace supports both output modes, including graph replay.
 
     res_preshuffle=True (gfx1250 only): residual and the returned residual are
     in the aiter.ops.mhc.mhc_res_shuffle layout with ks=32, that is
@@ -484,9 +493,12 @@ def mega_mhc(
             )
         residual_out = residual
     with torch.cuda.device(device):
-        if out_dtype == "mxfp8" and get_gfx_runtime() != "gfx950":
-            raise RuntimeError("Mega-MHC mxfp8 requires gfx950")
-        if res_preshuffle and get_gfx_runtime() != "gfx1250":
+        arch = get_gfx_runtime()
+        if out_dtype == "mxfp8" and arch not in ("gfx950", "gfx1250"):
+            raise RuntimeError("Mega-MHC mxfp8 requires gfx950 or gfx1250")
+        if out_dtype == "mxfp8" and arch == "gfx1250" and h % 128:
+            raise ValueError("Mega-MHC mxfp8 on gfx1250 requires H divisible by 128")
+        if res_preshuffle and arch != "gfx1250":
             raise RuntimeError("Mega-MHC res_preshuffle requires gfx1250")
         if workspace is None:
             scratch = _prepare_scratch(device, t, h)
@@ -508,7 +520,11 @@ def mega_mhc(
         layer_input = norm
         if out_dtype == "mxfp8":
             quant_out = torch.empty((t, h), device=device, dtype=torch.float8_e4m3fn)
-            quant_scale = torch.empty((t, h // 32), device=device, dtype=torch.uint8)
+            # gfx1250 pads rows to 32 for the m32k4 GEMM A-scale layout.
+            scale_rows = (t + 31) // 32 * 32 if arch == "gfx1250" else t
+            quant_scale = torch.empty(
+                (scale_rows, h // 32), device=device, dtype=torch.uint8
+            )
             layer_input = (norm, quant_out, quant_scale)
         partials, counters = scratch.partials, scratch.counters
         variant = scratch.variant

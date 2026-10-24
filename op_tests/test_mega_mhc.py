@@ -22,6 +22,7 @@ from aiter.ops.mega_mhc import (
     mega_mhc_shuffle_fn,
     prepare_mega_mhc,
 )
+from aiter.ops.shuffle import shuffle_mxfp8fp4_scale
 from aiter.test_common import benchmark, device_memory_profiling, run_perftest
 
 # rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, sinkhorn_repeat
@@ -155,14 +156,16 @@ def check(out, reference):
         norm, q, scale = norm
         assert norm.dtype == torch.bfloat16
         assert q.dtype == torch.float8_e4m3fn and q.shape == norm.shape
-        assert scale.dtype == torch.uint8 and scale.shape == (
-            norm.shape[0],
-            norm.shape[1] // 32,
-        )
+        # gfx1250 writes the m32k4 GEMM A-scale layout with rows padded to 32.
+        m32k4 = get_gfx_runtime() == "gfx1250"
+        rows = (norm.shape[0] + 31) // 32 * 32 if m32k4 else norm.shape[0]
+        assert scale.dtype == torch.uint8 and scale.shape == (rows, norm.shape[1] // 32)
         assert all(t.is_contiguous() and t.device == norm.device for t in (q, scale))
         # HIP and FlyDSL can round the MHC norm differently within its existing
         # tolerance. Quantization itself must be exact on each backend's norm.
         ref_q, ref_scale = ref_mxfp8(norm)
+        if m32k4:
+            ref_scale = shuffle_mxfp8fp4_scale(ref_scale)
         torch.testing.assert_close(
             q.view(torch.uint8), ref_q.view(torch.uint8), rtol=0, atol=0
         )
@@ -427,8 +430,8 @@ def main():
     arch = get_gfx_runtime()
     if arch not in ("gfx950", "gfx942", "gfx1250"):
         parser.error("Mega-MHC requires gfx950, gfx942 or gfx1250")
-    if "mxfp8" in args.out_dtype and arch != "gfx950":
-        parser.error("Mega-MHC mxfp8 requires gfx950")
+    if "mxfp8" in args.out_dtype and arch not in ("gfx950", "gfx1250"):
+        parser.error("Mega-MHC mxfp8 requires gfx950 or gfx1250")
     if args.res_preshuffle and arch != "gfx1250":
         parser.error("Mega-MHC res_preshuffle requires gfx1250")
     backends = tuple(
