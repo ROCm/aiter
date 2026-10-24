@@ -1,0 +1,13 @@
+{
+ "gfx": "gfx950",
+ "cu_num": 256,
+ "device": "AMD Radeon Graphics",
+ "hip_visible_devices": "0",
+ "pci": "0000:78:00",
+ "used_gib_at_start": 0.619140625,
+ "torch": "2.10.0+rocm7.2.4.git3d3aa833",
+ "mm_tflops": 1459.1854059967452,
+ "copy_gbs": 4457.702233632568,
+ "mm_tflops_sus": 1171.993352430956,
+ "copy_gbs_sus": 4518.206083998848
+}
