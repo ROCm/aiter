@@ -27,6 +27,8 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "BlockMfmaDecodeConfig": (".gemm_kernels", "BlockMfmaDecodeConfig"),
+    "DecodeConfig": (".gemm_kernels", "DecodeConfig"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".fp8_mqa_logits_kernels",
         "DEFAULT_VARIANT",
@@ -41,6 +43,7 @@ _LAZY_IMPORTS = {
         ".gemm_a16wfp4",
         "PreshuffledA16WFP4Weight",
     ),
+    "WaveDecodeConfig": (".gemm_kernels", "WaveDecodeConfig"),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
@@ -126,6 +129,7 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "gemm_decode_bf16": (".gemm_kernels", "gemm_decode_bf16"),
     "pa_decode": (".pa_decode", "pa_decode"),
     "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
     "prepare_gemm_a16wfp4_weight": (
@@ -175,11 +179,14 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "BlockMfmaDecodeConfig",
+    "DecodeConfig",
     "DenseGemmConfig",
     "Fp4MqaPlan",
     "GateMode",
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
+    "WaveDecodeConfig",
     "a16wfp4_shape_supported",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
@@ -207,6 +214,7 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "gemm_decode_bf16",
     "make_fp4_mqa_plan",
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",
