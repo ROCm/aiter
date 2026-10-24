@@ -12,14 +12,25 @@ from aiter.ops.triton.quant.fast_transpose import (
     transpose_packed_fp4,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 
 def _torch_transpose_2d(x: torch.Tensor) -> torch.Tensor:
     return x.t().contiguous()
+
+
+def _generate_fast_transpose_pool_inputs(M, N, dtype):
+    x = torch.randn(M, N, dtype=torch.float32, device="cuda").to(dtype)
+    return (x,)
 
 
 def benchmark_fast_transpose(args):
@@ -34,6 +45,8 @@ def benchmark_fast_transpose(args):
         else [(m, n) for m in [1024, 4096, 8192] for n in [1024, 4096, 8192]]
     )
     unit = "ms" if args.metric == "time" else "GB/s"
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     config = triton.testing.Benchmark(
         x_names=["M", "N"],
@@ -49,15 +62,18 @@ def benchmark_fast_transpose(args):
 
     @triton.testing.perf_report([config])
     def _run(M, N, provider):
-        x = torch.randn(M, N, dtype=torch.float32, device="cuda").to(dtype)
-        fn = partial(
-            _torch_transpose_2d if provider == "torch" else fast_transpose_2d, x
+        _p_gen = partial(_generate_fast_transpose_pool_inputs, M, N, dtype)
+        _out_val_keys = ["x"]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
         )
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        kernel_fn = _torch_transpose_2d if provider == "torch" else fast_transpose_2d
+
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         if args.metric == "time":
             return ms
         # read M*N + write N*M elements
-        gb = 2 * M * N * x.element_size() * 1e-9
+        gb = 2 * M * N * rot_bufs[0]["x"].element_size() * 1e-9
         return gb / (ms * 1e-3)
 
     _run.run(save_path="." if args.o else None, print_data=True, show_plots=False)
@@ -71,6 +87,11 @@ def _torch_transpose_packed_fp4(data_fp4: torch.Tensor) -> torch.Tensor:
     return transposed[:, 0::2] | (transposed[:, 1::2] << 4)
 
 
+def _generate_packed_fp4_transpose_pool_inputs(M, N):
+    data_fp4 = torch.randint(0, 256, (M, N // 2), dtype=torch.uint8, device="cuda")
+    return (data_fp4,)
+
+
 def benchmark_packed_fp4_transpose(args):
     shapes = (
         [tuple(args.shape)]
@@ -78,6 +99,8 @@ def benchmark_packed_fp4_transpose(args):
         else [(6144, 4096), (4096, 4096), (24576, 4096), (4096, 12288)]
     )
     unit = "ms" if args.metric == "time" else "GB/s"
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     config = triton.testing.Benchmark(
         x_names=["M", "N"],
         x_vals=shapes,
@@ -94,16 +117,18 @@ def benchmark_packed_fp4_transpose(args):
     def _run(M, N, provider):
         if M % 2 != 0 or N % 2 != 0:
             raise ValueError(f"logical M and N must be even, got ({M}, {N})")
-        data_fp4 = torch.randint(0, 256, (M, N // 2), dtype=torch.uint8, device="cuda")
-        fn = partial(
-            (
-                transpose_packed_fp4
-                if provider == "triton"
-                else _torch_transpose_packed_fp4
-            ),
-            data_fp4,
+        _p_gen = partial(_generate_packed_fp4_transpose_pool_inputs, M, N)
+        _out_val_keys = ["data_fp4"]
+        rot_bufs = generate_rotating_buffers_pool(
+            [_p_gen], [_out_val_keys], **kwargs_rot_bufs
         )
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        kernel_fn = (
+            transpose_packed_fp4
+            if provider == "triton"
+            else _torch_transpose_packed_fp4
+        )
+
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         if args.metric == "time":
             return ms
         bytes_read_and_written = M * N
