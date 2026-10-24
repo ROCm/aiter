@@ -40,6 +40,9 @@ enum class AttentionFormat : int64_t
 
 constexpr int64_t format_id(AttentionFormat format) { return static_cast<int64_t>(format); }
 
+// V's layout within its format, shared with AttentionPack in mha_v4.py and the manifest's v_pack
+// column. Two rows can take the same format and scale mode in different layouts (MXFP4 V in the
+// column-major order or in the order an FP6 P operand contracts over), so it is part of the key.
 enum class AttentionPack : int64_t
 {
     Default  = 0,
@@ -73,15 +76,6 @@ struct MhaV4Recipe
 };
 
 constexpr int64_t kHeadDim = 128;
-constexpr int64_t kGfx950StagedSparseMaxKvTiles = 8192;
-
-bool uses_gfx950_staged_sparse_lut(const MhaV4Recipe& recipe)
-{
-    return recipe.q_format == format_id(AttentionFormat::Bf16) ||
-           recipe.q_format == format_id(AttentionFormat::Fp8E4M3) ||
-           recipe.q_format == format_id(AttentionFormat::Fp4E2M1) ||
-           recipe.q_format == format_id(AttentionFormat::Int8);
-}
 
 struct PointerSlot
 {
@@ -216,6 +210,111 @@ void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* n
     }
 }
 
+// Threads per workgroup for a row. Every kernel in this family gives each wave 32 query rows, so
+// the wave count is ts_qo/32 and the workgroup is that many 64-lane waves. Derived rather than
+// stored in the manifest so a row cannot declare a tile and a launch width that disagree -- a
+// mismatch here does not return wrong numbers, it hangs, because the row's internal
+// synchronization waits on waves that were never dispatched.
+constexpr int kQueryRowsPerWave = 32;
+
+int workgroup_size_for(const fmha_v4_fwdConfig& cfg)
+{
+    TORCH_CHECK(cfg.ts_qo % kQueryRowsPerWave == 0,
+                "MHA v4 row ",
+                cfg.knl_name,
+                " has ts_qo=",
+                cfg.ts_qo,
+                ", which is not a multiple of the ",
+                kQueryRowsPerWave,
+                " query rows each wave owns");
+    return cfg.ts_qo / kQueryRowsPerWave * 64;
+}
+
+// A row stages its LUT in a fixed-capacity region -- lut_max in the manifest -- and overrunning
+// it reads back whatever follows rather than faulting, so the ceiling is checked here. The bound
+// is the shape's, not the row's actual count: a row may legitimately select every block, and
+// reading lut_count to find its true maximum would mean a device sync on every launch.
+void check_lut_capacity(const fmha_v4_fwdConfig& cfg, int64_t kv_tiles, const char* mode_name)
+{
+    TORCH_CHECK(cfg.lut_max > 0,
+                mode_name,
+                " MHA v4 row ",
+                cfg.knl_name,
+                " declares no lut_max; a block-sparse row must state its LUT capacity");
+    TORCH_CHECK(kv_tiles <= cfg.lut_max,
+                mode_name,
+                " MHA v4 row ",
+                cfg.knl_name,
+                " holds ",
+                cfg.lut_max,
+                " LUT entries, but this key length is ",
+                kv_tiles,
+                " blocks of ",
+                cfg.ts_kv,
+                " tokens. Split the sequence, or dispatch a geometry with a larger LUT region.");
+}
+
+// `ts_qo`/`ts_kv` participate in the key because one arch can ship several tile geometries for the
+// SAME recipe and mode (gfx950 has both 256x128 and 64x64 FP8 sparse rows), and they are not
+// interchangeable: the block mask and LUT a caller builds are in units of ts_kv.
+// A block-sparse caller therefore names the geometry it prepared its operands for, so a missing row
+// is an error rather than silently whichever row the manifest listed first.
+//
+// 0 means "any", which is what the dense path passes. Dense builds no mask, so its geometry is an
+// implementation detail of the row -- and it genuinely varies (bf16 tiles 256x64 where the
+// quantized rows tile 256x128), so there is nothing for a dense caller to name.
+const fmha_v4_fwdConfig& find_config(const std::string& arch,
+                                     const MhaV4Recipe& recipe,
+                                     int64_t mode,
+                                     int64_t ts_qo,
+                                     int64_t ts_kv)
+{
+    // cfg_fmha_v4_fwd is an unordered_map, so "first row that matches" is only well defined when at
+    // most one row can match. That holds for dense, but gfx950 now has two block-sparse FP8 rows
+    // per mode, so leaving the geometry unnamed there would pick a tile by hash order.
+    TORCH_CHECK(mode == 0 || (ts_qo != 0 && ts_kv != 0),
+                "block-sparse MHA v4 (mode=",
+                mode,
+                ") requires an explicit q_tile/kv_tile: several tile geometries can serve one "
+                "recipe and the LUT is in units of kv_tile");
+    for(const auto& entry : cfg_fmha_v4_fwd)
+    {
+        const auto& cfg = entry.second;
+        if(cfg.arch == arch && cfg.q_format == recipe.q_format &&
+           cfg.k_format == recipe.k_format && cfg.v_format == recipe.v_format &&
+           cfg.v_pack == recipe.v_pack && cfg.q_scale_mode == recipe.q_scale_mode &&
+           cfg.k_scale_mode == recipe.k_scale_mode && cfg.v_scale_mode == recipe.v_scale_mode &&
+           cfg.o_format == format_id(AttentionFormat::Bf16) &&
+           cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == kHeadDim &&
+           cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode &&
+           (ts_qo == 0 || cfg.ts_qo == ts_qo) && (ts_kv == 0 || cfg.ts_kv == ts_kv))
+            return cfg;
+    }
+    TORCH_CHECK(false,
+                "no MHA v4 kernel for arch=",
+                arch,
+                ", q_format=",
+                recipe.q_format,
+                ", k_format=",
+                recipe.k_format,
+                ", v_format=",
+                recipe.v_format,
+                ", v_pack=",
+                recipe.v_pack,
+                ", q_scale_mode=",
+                recipe.q_scale_mode,
+                ", k_scale_mode=",
+                recipe.k_scale_mode,
+                ", v_scale_mode=",
+                recipe.v_scale_mode,
+                ", output=BF16, head_dim=128, mode=",
+                mode,
+                " (0=dense, 1=sorted-sparse), tile=",
+                ts_qo,
+                "x",
+                ts_kv);
+}
+
 // E8M0 scale gathers are unguarded global loads: they address every row of the tile they are
 // running, plus MXFP4 K's two-tile producer lead, so the final tiles read past the logical rows.
 constexpr int64_t kMxScaleBlocksPerRow      = 4;
@@ -249,43 +348,6 @@ void check_scale_backing_storage(const at::Tensor& descale,
                 backed,
                 " are backed; allocate it with the aiter.ops.mha_v4_quant producers, which reserve "
                 "zeroed slack");
-}
-
-const fmha_v4_fwdConfig&
-find_config(const std::string& arch, const MhaV4Recipe& recipe, int64_t mode)
-{
-    for(const auto& entry : cfg_fmha_v4_fwd)
-    {
-        const auto& cfg = entry.second;
-        if(cfg.arch == arch && cfg.q_format == recipe.q_format &&
-           cfg.k_format == recipe.k_format && cfg.v_format == recipe.v_format &&
-           cfg.v_pack == recipe.v_pack && cfg.q_scale_mode == recipe.q_scale_mode &&
-           cfg.k_scale_mode == recipe.k_scale_mode && cfg.v_scale_mode == recipe.v_scale_mode &&
-           cfg.o_format == format_id(AttentionFormat::Bf16) &&
-           cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == kHeadDim &&
-           cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode)
-            return cfg;
-    }
-    TORCH_CHECK(false,
-                "no MHA v4 kernel for arch=",
-                arch,
-                ", q_format=",
-                recipe.q_format,
-                ", k_format=",
-                recipe.k_format,
-                ", v_format=",
-                recipe.v_format,
-                ", v_pack=",
-                recipe.v_pack,
-                ", q_scale_mode=",
-                recipe.q_scale_mode,
-                ", k_scale_mode=",
-                recipe.k_scale_mode,
-                ", v_scale_mode=",
-                recipe.v_scale_mode,
-                ", output=BF16, head_dim=128, mode=",
-                mode,
-                " (0=dense, 1=sorted-sparse)");
 }
 
 // Every stride and extent below occupies a 32-bit kernarg slot. Truncating one would not fault; it
@@ -348,6 +410,29 @@ constexpr int32_t kWorkTableSortThreads = 1024;
 // Host-side wave width, only used to size the grid. Device code reads warpSize directly, and the
 // grid-stride loop stays correct if the two disagree.
 constexpr int32_t kWorkTableWave = 64;
+// Work-table order. LPT is the global longest-first order the table was built for. HEAD_LOCAL
+// keeps heads in raster order and sorts longest-first within each one, so the work items in
+// flight share a head's K/V in L2 while every head still starts its heavy tiles first. RASTER is
+// the identity. AITER_MHA_V4_WORK_ORDER=lpt|head|raster selects it per call.
+enum class WorkOrder : int32_t
+{
+    Lpt       = 0,
+    HeadLocal = 1,
+    Raster    = 2,
+};
+
+WorkOrder work_order()
+{
+    const char* value = std::getenv("AITER_MHA_V4_WORK_ORDER");
+    if(value == nullptr || value[0] == '\0' || std::strcmp(value, "lpt") == 0)
+        return WorkOrder::Lpt;
+    if(std::strcmp(value, "head") == 0)
+        return WorkOrder::HeadLocal;
+    if(std::strcmp(value, "raster") == 0)
+        return WorkOrder::Raster;
+    TORCH_CHECK(false, "AITER_MHA_V4_WORK_ORDER must be lpt, head or raster, got ", value);
+    return WorkOrder::Lpt;
+}
 
 // Order and pack in a single launch, by counting each entry's rank rather than moving entries past
 // each other. The key carries the whole ordering: the count is complemented into the high half so
@@ -370,14 +455,27 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
                                                 const int32_t* __restrict__ lut_count,
                                                 const int32_t total,
                                                 const int32_t q_tiles,
-                                                const int32_t nhead)
+                                                const int32_t nhead,
+                                                const int32_t order)
 {
     __shared__ uint64_t keys[kWorkTableFusedMax];
 
     for(int32_t slot = threadIdx.x; slot < total; slot += blockDim.x)
     {
-        keys[slot] = (static_cast<uint64_t>(~static_cast<uint32_t>(lut_count[slot])) << 32) |
-                     static_cast<uint32_t>(slot);
+        const uint32_t level = static_cast<uint32_t>(lut_count[slot]);
+        if(order == static_cast<int32_t>(WorkOrder::HeadLocal))
+        {
+            // (batch, head) in the top 16 bits, the complemented level below it; batch < 256 and
+            // heads < 256 keep the group in range, and a LUT is never longer than 65536.
+            const uint64_t group = static_cast<uint32_t>(slot / q_tiles);
+            const uint64_t rank  = 0xFFFFu - (level < 0xFFFFu ? level : 0xFFFFu);
+            keys[slot] = (group << 48) | (rank << 32) | static_cast<uint32_t>(slot);
+        }
+        else if(order == static_cast<int32_t>(WorkOrder::Raster))
+            keys[slot] = static_cast<uint32_t>(slot);
+        else
+            keys[slot] = (static_cast<uint64_t>(~level) << 32) |
+                         static_cast<uint32_t>(slot);
     }
     __syncthreads();
 
@@ -400,7 +498,10 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
 }
 
 at::Tensor
-build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhead, int64_t q_tiles)
+build_sorted_work_table(const at::Tensor& lut_count,
+                        int64_t batch,
+                        int64_t nhead,
+                        int64_t q_tiles)
 {
     auto flat           = lut_count.reshape({-1}).contiguous();
     const int64_t total = batch * nhead * q_tiles;
@@ -420,6 +521,7 @@ build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhea
     // ATen ops, whose launch overhead on a few hundred entries dwarfs the arithmetic.
     auto table               = at::empty({total}, flat.options().dtype(at::kInt));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const WorkOrder order    = work_order();
 
     if(total <= kWorkTableFusedMax)
     {
@@ -432,17 +534,28 @@ build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhea
             flat.data_ptr<int32_t>(),
             static_cast<int32_t>(total),
             static_cast<int32_t>(q_tiles),
-            static_cast<int32_t>(nhead));
+            static_cast<int32_t>(nhead),
+            static_cast<int32_t>(order));
         return table;
     }
 
     // Past the LDS staging limit, defer the sort to ATen and pack separately. A stable sort keeps
     // the tie behaviour identical to the fused path.
-    const auto order = at::argsort(flat, /*stable=*/true, /*dim=*/0, /*descending=*/true);
+    at::Tensor permutation;
+    if(order == WorkOrder::Raster)
+        permutation = at::arange(total, flat.options().dtype(at::kLong));
+    else if(order == WorkOrder::HeadLocal)
+    {
+        const auto group = at::floor_divide(at::arange(total, flat.options().dtype(at::kLong)), q_tiles);
+        const auto key   = group * 65536 + (65535 - flat.to(at::kLong).clamp_max(65535));
+        permutation      = at::argsort(key, /*stable=*/true, /*dim=*/0, /*descending=*/false);
+    }
+    else
+        permutation = at::argsort(flat, /*stable=*/true, /*dim=*/0, /*descending=*/true);
     constexpr int32_t block_size = 256;
     const dim3 grid(static_cast<uint32_t>((total + block_size - 1) / block_size));
     pack_work_table_kernel<<<grid, dim3(block_size), 0, stream>>>(table.data_ptr<int32_t>(),
-                                                                  order.data_ptr<int64_t>(),
+                                                                  permutation.data_ptr<int64_t>(),
                                                                   static_cast<int32_t>(total),
                                                                   static_cast<int32_t>(q_tiles),
                                                                   static_cast<int32_t>(nhead));
@@ -452,7 +565,8 @@ build_sorted_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhea
 // LUT contents are device data, so the launcher cannot check them without a synchronization. This
 // is therefore opt-in: off, an out-of-range index reaches the ASM and faults with only a raw address
 // to go on; on, it fails at the launcher with the offending condition named. A row with
-// lut_count == 0 is not an error: the ASM skips it and writes zeros for that query tile.
+// lut_count == 0 is not an error in either mode: sparse skips it and writes zeros for that query
+// tile.
 enum LutError : int32_t
 {
     kLutNegative   = 1 << 0,
@@ -575,6 +689,9 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
     args.s_k_Hs.value        = byte_stride(k, 2, "K head stride");
     args.s_k_Bs.value        = byte_stride(k, 0, "K batch stride");
     args.s_opt.value         = 5;
+    // LSE off unless a caller asks: set_lse_kernarg below overwrites these three slots. A row
+    // whose code object has no LSE store ignores all of them, which is why asking is checked
+    // against the manifest rather than against the pointer being non-null.
     args.s_lse.value         = 0;
     args.s_kv_seq_len.value  = fit_u32(seqlen_k, "key length");
     args.s_qk_head_dim.value = kHeadDim;
@@ -616,6 +733,60 @@ struct PackedMhaV4Shapes
     int64_t nhead_k;
     int64_t gqa_ratio;
 };
+
+// Point the kernel's LSE slots at `lse`, or leave the launch writing no LSE when it is nullopt.
+//
+// The kernel writes row (b, h) as seqlen_q unit-stride floats at ptr_lse + (b * nhead_q + h) *
+// s_lse_Hs, and writes nothing past seqlen_q. So the rows must be unit-stride float32 and the batch
+// stride is not independently settable: a tensor whose batch stride is not nhead_q * head stride
+// would have its heads written over each other. A contiguous [batch, nhead_q, seqlen_q] tensor
+// satisfies both.
+void set_lse_kernarg(FmhaV4Kernarg& args,
+                     const std::optional<at::Tensor>& lse,
+                     const fmha_v4_fwdConfig& cfg,
+                     const at::Tensor& q,
+                     int64_t batch,
+                     int64_t nhead_q,
+                     int64_t seqlen_q,
+                     const char* mode_name)
+{
+    if(!lse.has_value())
+    {
+        return;
+    }
+    const at::Tensor& t = lse.value();
+    TORCH_CHECK(cfg.lse != 0,
+                mode_name,
+                " MHA v4 row ",
+                cfg.knl_name,
+                " has no LSE store in its code object, so return_lse would leave the buffer as "
+                "allocated -- which reads as a log-sum-exp of whatever was in it. Use a row whose "
+                "manifest lse column is 1.");
+    TORCH_CHECK(t.is_cuda() && t.get_device() == q.get_device(),
+                mode_name,
+                " MHA v4 LSE must be a GPU tensor on the same device as Q");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, mode_name, " MHA v4 LSE must be float32");
+    TORCH_CHECK(t.dim() == 3 && t.size(0) == batch && t.size(1) == nhead_q &&
+                    t.size(2) == seqlen_q,
+                mode_name,
+                " MHA v4 LSE must be [batch, nhead_q, seqlen_q] = [",
+                batch,
+                ", ",
+                nhead_q,
+                ", ",
+                seqlen_q,
+                "], got ",
+                t.sizes());
+    TORCH_CHECK(t.stride(2) == 1, mode_name, " MHA v4 LSE rows must be unit-stride");
+    TORCH_CHECK(t.stride(0) == nhead_q * t.stride(1),
+                mode_name,
+                " MHA v4 LSE batch stride must be nhead_q * head stride; the kernel derives the "
+                "batch offset from the head stride and cannot honour an independent one");
+
+    args.ptr_lse.value  = t.data_ptr();
+    args.s_lse.value    = 1;
+    args.s_lse_Hs.value = byte_stride(t, 1, "LSE head stride");
+}
 
 PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
                                          const at::Tensor& k,
@@ -851,7 +1022,7 @@ void fmha_v4_fwd(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(arch, recipe, /*mode=*/0);
+    const auto& cfg = find_config(arch, recipe, /*mode=*/0, /*ts_qo=*/0, /*ts_kv=*/0);
 
     FmhaV4Kernarg args{};
     populate_dense_kernarg(args,
@@ -869,6 +1040,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                            shapes.nhead_q,
                            shapes.gqa_ratio,
                            softmax_scale);
+    set_lse_kernarg(
+        args, lse, cfg, q, shapes.batch, shapes.nhead_q, shapes.seqlen_q, "dense");
 
     // Per-batch key lengths are optional: the kernels read this slot only when it is non-null, so a
     // dense launch leaves it zero rather than selecting a different code object.
@@ -890,32 +1063,6 @@ void fmha_v4_fwd(const at::Tensor& q,
         args.ptr_kseq.value = seqlens_k->data_ptr();
     }
 
-    // LSE is opt-in the same way: the kernels branch on s_lse and skip the store when it is zero,
-    // so a launch without it leaves the reserved slots at zero and keeps the same code object.
-    if(lse.has_value())
-    {
-        TORCH_CHECK(lse->is_cuda() && lse->device() == q.device(),
-                    "MHA v4 lse must be a GPU tensor on the same device as Q");
-        TORCH_CHECK(lse->scalar_type() == at::kFloat,
-                    "MHA v4 lse must be float32, got ",
-                    lse->scalar_type());
-        TORCH_CHECK(lse->is_contiguous(), "MHA v4 lse must be contiguous");
-        TORCH_CHECK(lse->dim() == 3 && lse->size(0) == shapes.batch &&
-                        lse->size(1) == shapes.nhead_q && lse->size(2) == shapes.seqlen_q,
-                    "MHA v4 lse must be [batch, nhead_q, seqlen_q] = [",
-                    shapes.batch,
-                    ", ",
-                    shapes.nhead_q,
-                    ", ",
-                    shapes.seqlen_q,
-                    "]");
-        // The kernel derives the batch stride as q_head_num * s_lse_Hs, which only holds for a
-        // contiguous [batch, head, seqlen_q] buffer.
-        args.ptr_lse.value  = lse->data_ptr();
-        args.s_lse.value    = 1;
-        args.s_lse_Hs.value = byte_stride(*lse, 1, "LSE head stride");
-    }
-
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
     auto& kernel                = kernels.get_or_create(
@@ -926,7 +1073,7 @@ void fmha_v4_fwd(const at::Tensor& q,
     const int gdy            = shapes.nhead_q;
     const int gdz            = shapes.batch;
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, 512, 1, 1, stream});
+    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, workgroup_size_for(cfg), 1, 1, stream});
 }
 
 void fmha_v4_fwd_sparse(const at::Tensor& q,
@@ -946,7 +1093,10 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         double softmax_scale,
                         const at::Tensor& kv_block_indices,
                         const at::Tensor& lut_start,
-                        const at::Tensor& lut_count)
+                        const at::Tensor& lut_count,
+                        int64_t q_tile,
+                        int64_t kv_tile,
+                        std::optional<at::Tensor> lse)
 {
     const MhaV4Recipe recipe{q_format,
                              k_format,
@@ -970,22 +1120,17 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(arch, recipe, /*mode=*/1);
-    TORCH_CHECK(shapes.seqlen_k % cfg.ts_kv == 0,
-                "sorted-sparse MHA v4 requires key length padded to a multiple of ",
+    const auto& cfg = find_config(arch, recipe, /*mode=*/1, q_tile, kv_tile);
+    TORCH_CHECK(cfg.ragged_kv != 0 || shapes.seqlen_k % cfg.ts_kv == 0,
+                "sorted-sparse MHA v4 row ",
+                cfg.knl_name,
+                " requires key length padded to a multiple of ",
                 cfg.ts_kv);
 
     const int64_t q_tiles  = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
     const int64_t kv_tiles = (shapes.seqlen_k + cfg.ts_kv - 1) / cfg.ts_kv;
-    if(arch == "gfx950" && uses_gfx950_staged_sparse_lut(recipe))
-    {
-        TORCH_CHECK(kv_tiles <= kGfx950StagedSparseMaxKvTiles,
-                    "gfx950 LDS-staged sparse MHA v4 supports at most ",
-                    kGfx950StagedSparseMaxKvTiles,
-                    " KV tiles, got ",
-                    kv_tiles);
-    }
     const int64_t lut_rows = shapes.batch * shapes.nhead_q * q_tiles;
+    check_lut_capacity(cfg, kv_tiles, "sorted-sparse");
     TORCH_CHECK(kv_block_indices.is_cuda() && lut_start.is_cuda() && lut_count.is_cuda(),
                 "LUT tensors must be GPU tensors");
     TORCH_CHECK(kv_block_indices.device() == q.device() && lut_start.device() == q.device() &&
@@ -1043,6 +1188,8 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                            shapes.nhead_q,
                            shapes.gqa_ratio,
                            softmax_scale);
+    set_lse_kernarg(
+        args.dense, lse, cfg, q, shapes.batch, shapes.nhead_q, shapes.seqlen_q, "sorted-sparse");
     args.ptr_kv_block_indices.value = kv_idx.data_ptr();
     args.ptr_lut_start.value        = start.data_ptr();
     args.ptr_lut_count.value        = count.data_ptr();
@@ -1057,7 +1204,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
 
     size_t arg_size          = sizeof(args);
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    kernel.launch_kernel({&args, &arg_size, static_cast<int>(lut_rows), 1, 1, 512, 1, 1, stream});
+    kernel.launch_kernel({&args, &arg_size, static_cast<int>(lut_rows), 1, 1, workgroup_size_for(cfg), 1, 1, stream});
 }
 
 } // namespace torch_itfs
