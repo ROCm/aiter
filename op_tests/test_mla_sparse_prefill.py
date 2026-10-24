@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness and performance comparison for sparse paged prefill attention.
+"""Correctness and performance comparison for MLA sparse prefill attention.
 
 Three backends implement the same two-region sparse attention -- a paged
 prefix source (``unified_kv``) plus a flat extend source (``kv``), joined by
@@ -14,8 +14,15 @@ and the extend range is causal.
 
 The ``prec`` axis picks both the input format and the backends that run:
 
-* ``bf16`` -- single ``D=512`` Q/K/V/O tensor: ``opus``, ``triton``.
-* ``fp8``  -- split NoPE-fp8 / RoPE-bf16 DSA inputs: ``opus``, ``asm``.
+* ``bf16`` -- single ``D=512`` Q/K/V/O tensor (``mla_sparse_prefill``): ``opus``,
+  ``triton``.
+* ``v4``   -- v4 split NoPE-fp8 / RoPE-bf16 inputs (``mla_sparse_prefill_v4``):
+  ``opus``, ``asm``.
+* ``v41``  -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
+  (``mla_sparse_prefill_v41``): ``opus``, gfx950 only.
+
+The ``pa_sparse_prefill*_opus`` names kept for existing callers are checked by
+``test_pa_sparse_prefill_opus_compat``.
 
 ``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
 gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
@@ -23,10 +30,10 @@ Both are gfx1250-only here and drop out of the sweep elsewhere.
 
 Example CLI usage::
 
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --topk 256 2048
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py --backend opus \\
-        -n 1024 --h_q 128 --prec fp8 --no-verify
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --topk 256 2048
+    PYTHONPATH=. python3 op_tests/test_mla_sparse_prefill.py --backend opus \\
+        -n 1024 --h_q 128 --prec v4 --no-verify
 """
 
 from __future__ import annotations
@@ -41,12 +48,18 @@ import pandas as pd
 import pytest
 import torch
 
-import aiter  # noqa: F401  (registers the top-level export)
+import aiter
 from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
-from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_fp8_asm
+from aiter.ops.mla_sparse_prefill import (
+    mla_sparse_prefill,
+    mla_sparse_prefill_v4,
+    mla_sparse_prefill_v41,
+)
+from aiter.ops.opus.mla import opus_mla_v4_prefill_a16w16_gfx950_fwd
 from aiter.ops.pa_sparse_prefill_opus import (
     pa_sparse_prefill_fp8_opus,
+    pa_sparse_prefill_gfx950_opus_fwd,
     pa_sparse_prefill_opus,
 )
 from aiter.test_common import (
@@ -54,6 +67,7 @@ from aiter.test_common import (
     checkAllclose,
     perftest,
 )
+from aiter.utility import dtypes
 
 try:
     from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
@@ -94,7 +108,7 @@ def _skip_if_unsupported(d: int) -> bool:
     arch = _get_gpu_arch()
     if arch not in _SUPPORTED_ARCHS:
         return _skip(
-            f"pa_sparse_prefill_opus requires one of {_SUPPORTED_ARCHS}, found {arch}"
+            f"opus MLA sparse prefill requires one of {_SUPPORTED_ARCHS}, found {arch}"
         )
     if d != 512:
         return _skip(f"Only D=512 is compiled, requested D={d}")
@@ -106,7 +120,7 @@ def _skip_if_unsupported(d: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _ref_pa_sparse_prefill_opus(
+def _ref_mla_sparse_prefill(
     q: torch.Tensor,  # [N, H, D]
     unified_kv: torch.Tensor,  # [total_pages, D]
     kv_indices_prefix: torch.Tensor,  # [nnz_prefix] int32
@@ -172,12 +186,13 @@ _FP8_BLK = 32
 _FP8_MAX = 448.0
 
 
-def _quantize_nope(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack ``[R, 448]`` reals into a ``[R, 512]`` fp8 row, returning it
-    alongside the dequantized ``[R, 448]`` fp32 values the kernel sees.
-    """
-    r = real.shape[0]
-    blk = real.reshape(r, _FP8_NBLK, _FP8_BLK).to(torch.float32)
+def _quantize_e8m0_blocks(
+    real: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``[R, C]`` reals -> (e4m3 ``[R, C]``, uint8 E8M0 ``[R, C / 32]``, the
+    dequantized fp32 ``[R, C]`` the kernel sees)."""
+    r, c = real.shape
+    blk = real.reshape(r, c // _FP8_BLK, _FP8_BLK).to(torch.float32)
     amax = blk.abs().amax(dim=-1)
 
     e_unbiased = torch.ceil(torch.log2(amax.clamp(min=1e-30) / _FP8_MAX)).to(
@@ -188,17 +203,26 @@ def _quantize_nope(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     s = torch.exp2(e_unbiased.to(torch.float32)).unsqueeze(-1)
 
     q = (blk / s).to(torch.float8_e4m3fn)
-    deq = (q.to(torch.float32) * s).reshape(r, _FP8_D_NOPE)
+    deq = (q.to(torch.float32) * s).reshape(r, c)
+    return q.reshape(r, c), e_byte, deq
+
+
+def _quantize_nope(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack ``[R, 448]`` reals into a ``[R, 512]`` fp8 row, returning it
+    alongside the dequantized ``[R, 448]`` fp32 values the kernel sees.
+    """
+    r = real.shape[0]
+    q, e_byte, deq = _quantize_e8m0_blocks(real)
 
     packed = torch.full(
         (r, _FP8_D_NOPE_PADDED), 0xFF, dtype=torch.uint8, device=real.device
     )
-    packed[:, :_FP8_D_NOPE] = q.reshape(r, _FP8_D_NOPE).view(torch.uint8)
+    packed[:, :_FP8_D_NOPE] = q.view(torch.uint8)
     packed[:, _FP8_D_NOPE : _FP8_D_NOPE + _FP8_NBLK] = e_byte
     return packed.view(torch.float8_e4m3fn), deq
 
 
-def _ref_pa_sparse_prefill_fp8(
+def _ref_mla_sparse_prefill_fp8(
     q_fp32: torch.Tensor,  # [N, H, 512] fp32 (dequant NoPE + RoPE)
     ukv_fp32: torch.Tensor,  # [total_pages, 512] fp32
     kv_fp32: torch.Tensor,  # [total_tokens, 512] fp32
@@ -470,6 +494,77 @@ def _make_inputs_fp8(
     return {"kernel": kernel, "ref": ref}
 
 
+_V41_D = 512
+_V41_D_SCALE = _V41_D // _FP8_BLK
+
+
+def _make_inputs_v41(
+    n: int,
+    h: int,
+    total_pages: int,
+    total_tokens: int,
+    *,
+    topk: int = 1024,
+    device: torch.device | str = "cuda",
+    seed: int = 0,
+    data_init: str = "norm",
+) -> dict:
+    """:func:`_make_inputs_fp8` for v41: e4m3 rows with ``[rows, 16]`` E8M0 scales."""
+    device = torch.device(device)
+    gen = make_generator(seed, device=device)
+
+    def _stream(rows: int):
+        real = fill((rows, _V41_D), data_init, gen, dtype=torch.float32, device=device)
+        return _quantize_e8m0_blocks(real * 0.5)
+
+    q, q_scale, q_fp32 = _stream(n * h)
+    q = q.reshape(n, h, _V41_D)
+    q_scale = q_scale.reshape(n, h, _V41_D_SCALE)
+    q_fp32 = q_fp32.reshape(n, h, _V41_D)
+    ukv, ukv_scale, ukv_fp32 = _stream(total_pages)
+    kv, kv_scale, kv_fp32 = _stream(total_tokens)
+
+    attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
+
+    ip_p, ix_p = _page_table_csr(
+        n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
+    )
+    ip_e, ix_e = _page_table_csr(
+        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+    )
+
+    # 0xFF is NaN both as e4m3 and as E8M0.
+    _poison_unreferenced(total_pages, ix_p, nope=ukv)
+    _poison_unreferenced(total_pages, ix_p, nope=ukv_scale)
+    _poison_unreferenced(total_tokens, ix_e, nope=kv)
+    _poison_unreferenced(total_tokens, ix_e, nope=kv_scale)
+
+    kernel = {
+        "q": q,
+        "q_scale": q_scale,
+        "unified_kv": ukv,
+        "unified_kv_scale": ukv_scale,
+        "kv_indices_prefix": ix_p,
+        "kv_indptr_prefix": ip_p,
+        "kv": kv,
+        "kv_scale": kv_scale,
+        "kv_indices_extend": ix_e,
+        "kv_indptr_extend": ip_e,
+        "attn_sink": attn_sink,
+    }
+    ref = {
+        "q_fp32": q_fp32,
+        "ukv_fp32": ukv_fp32,
+        "kv_fp32": kv_fp32,
+        "kv_indices_prefix": ix_p,
+        "kv_indptr_prefix": ip_p,
+        "kv_indices_extend": ix_e,
+        "kv_indptr_extend": ip_e,
+        "attn_sink": attn_sink,
+    }
+    return {"kernel": kernel, "ref": ref}
+
+
 # ---------------------------------------------------------------------------
 # Backends
 # ---------------------------------------------------------------------------
@@ -478,7 +573,8 @@ _BACKENDS = ("opus", "asm", "triton")
 
 _PREC_BACKENDS = {
     "bf16": ("opus", "triton"),
-    "fp8": ("opus", "asm"),
+    "v4": ("opus", "asm"),
+    "v41": ("opus",),
 }
 
 # Baked into the asm code object; its Q address math needs gridDim.y == 1.
@@ -506,7 +602,7 @@ def _profile_func(target_func, *, backend: str):
 # ---------------------------------------------------------------------------
 
 
-_PRECS = ("bf16", "fp8")
+_PRECS = ("bf16", "v4", "v41")
 _PREC_TO_DTYPE = {"bf16": torch.bfloat16}
 
 _RTOL = 1e-2
@@ -519,7 +615,7 @@ _ATOL = 1e-2
 
 
 @benchmark()
-def run_pa_sparse_prefill(
+def run_mla_sparse_prefill(
     n: int,
     h: int,
     d: int,
@@ -556,7 +652,28 @@ def run_pa_sparse_prefill(
     # Lambdas, not partials: @perftest() deep-copies args, cloning bound tensors.
     candidates: list = []
 
-    if prec == "fp8":
+    if prec == "v41":
+        data = _make_inputs_v41(
+            n,
+            h,
+            total_pages,
+            total_tokens,
+            topk=topk,
+            seed=seed,
+            data_init=data_init,
+        )
+        kernel_inputs = data["kernel"]
+        ref_fn, ref_inputs = _ref_mla_sparse_prefill_fp8, data["ref"]
+        if "opus" in wanted and _get_gpu_arch() == "gfx950":
+            candidates.append(
+                (
+                    "opus",
+                    lambda: mla_sparse_prefill_v41(
+                        **kernel_inputs, softmax_scale=softmax_scale, backend="opus"
+                    ),
+                )
+            )
+    elif prec == "v4":
         data = _make_inputs_fp8(
             n,
             h,
@@ -567,13 +684,13 @@ def run_pa_sparse_prefill(
             data_init=data_init,
         )
         kernel_inputs = data["kernel"]
-        ref_fn, ref_inputs = _ref_pa_sparse_prefill_fp8, data["ref"]
+        ref_fn, ref_inputs = _ref_mla_sparse_prefill_fp8, data["ref"]
         if "opus" in wanted:
             candidates.append(
                 (
                     "opus",
-                    lambda: pa_sparse_prefill_fp8_opus(
-                        **kernel_inputs, softmax_scale=softmax_scale
+                    lambda: mla_sparse_prefill_v4(
+                        **kernel_inputs, softmax_scale=softmax_scale, backend="opus"
                     ),
                 )
             )
@@ -581,8 +698,8 @@ def run_pa_sparse_prefill(
             candidates.append(
                 (
                     "asm",
-                    lambda: mla_sparse_prefill_fp8_asm(
-                        **kernel_inputs, softmax_scale=softmax_scale
+                    lambda: mla_sparse_prefill_v4(
+                        **kernel_inputs, softmax_scale=softmax_scale, backend="asm"
                     ),
                 )
             )
@@ -598,15 +715,16 @@ def run_pa_sparse_prefill(
             seed=seed,
             data_init=data_init,
         )
-        ref_fn, ref_inputs = _ref_pa_sparse_prefill_opus, kernel_inputs
+        ref_fn, ref_inputs = _ref_mla_sparse_prefill, kernel_inputs
         if "opus" in wanted:
             candidates.append(
                 (
                     "opus",
-                    lambda: pa_sparse_prefill_opus(
+                    lambda: mla_sparse_prefill(
                         **kernel_inputs,
                         softmax_scale=softmax_scale,
                         num_kv_splits=num_kv_splits,
+                        backend="opus",
                     ),
                 )
             )
@@ -674,7 +792,7 @@ def run_pa_sparse_prefill(
 # ---------------------------------------------------------------------------
 
 
-_PYTEST_PRECS = ["bf16", "fp8"]
+_PYTEST_PRECS = ["bf16", "v4", "v41"]
 
 # topk rides in the case instead of being its own axis: crossed with the shapes,
 # most combinations would collapse onto the same whole-pool budget.
@@ -696,8 +814,8 @@ _PYTEST_CASES = [
     _PYTEST_CASES,
     ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
 )
-def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
-    run_pa_sparse_prefill(
+def test_mla_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
+    run_mla_sparse_prefill(
         n=n,
         h=h,
         d=512,
@@ -711,6 +829,123 @@ def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
     )
 
 
+def test_mla_sparse_prefill_v41_packed_pool():
+    """v41 over KV sources that are views of one ``[rows, 528]`` buffer (512
+    data bytes, then 16 scale bytes) must match the same rows held densely."""
+    if _skip_if_unsupported(d=512):
+        return
+    if _get_gpu_arch() != "gfx950":
+        _skip("mla_sparse_prefill_v41 is gfx950 only")
+        return
+    n, h, total_pages, total_tokens = 96, 128, 1024, 96
+    inputs = _make_inputs_v41(n, h, total_pages, total_tokens, topk=300, seed=7)[
+        "kernel"
+    ]
+    dense = mla_sparse_prefill_v41(**inputs, softmax_scale=1.0 / math.sqrt(512))
+
+    packed = dict(inputs)
+    for data, scale in (("unified_kv", "unified_kv_scale"), ("kv", "kv_scale")):
+        rows = inputs[data].shape[0]
+        pool = torch.empty(
+            rows, _V41_D + _V41_D_SCALE, dtype=torch.uint8, device="cuda"
+        )
+        pool[:, :_V41_D] = inputs[data].view(torch.uint8)
+        pool[:, _V41_D:] = inputs[scale]
+        packed[data] = pool[:, :_V41_D].view(dtypes.fp8)
+        # The E8M0 dtype is accepted as well as uint8.
+        packed[scale] = pool[:, _V41_D:].view(dtypes.fp8_e8m0)
+    out = mla_sparse_prefill_v41(**packed, softmax_scale=1.0 / math.sqrt(512))
+    assert torch.equal(out, dense)
+
+    with pytest.raises(RuntimeError, match=r"supports \(q, kv\) dtypes"):
+        mla_sparse_prefill_v41(
+            **{**inputs, "q": inputs["q"].to(torch.bfloat16)}, softmax_scale=1.0
+        )
+
+
+def test_mla_sparse_prefill_v41_lse_and_no_sink():
+    """v41 lse output, and ``attn_sink=None`` as a sink of -inf."""
+    if _skip_if_unsupported(d=512):
+        return
+    if _get_gpu_arch() != "gfx950":
+        _skip("mla_sparse_prefill_v41 is gfx950 only")
+        return
+    n, h, total_pages, total_tokens = 64, 80, 1024, 64
+    scale = 1.0 / math.sqrt(512)
+    data = _make_inputs_v41(n, h, total_pages, total_tokens, topk=300, seed=11)
+    inputs, ref = dict(data["kernel"]), data["ref"]
+    # Token 0 has no rows.
+    for ip, ix in (
+        ("kv_indptr_prefix", "kv_indices_prefix"),
+        ("kv_indptr_extend", "kv_indices_extend"),
+    ):
+        first = int(inputs[ip][1])
+        inputs[ix] = inputs[ix][first:].contiguous()
+        inputs[ip] = (inputs[ip] - first).clamp_min(0).contiguous()
+
+    lse = torch.empty(n, h, dtype=torch.float32, device="cuda")
+    out = mla_sparse_prefill_v41(**inputs, softmax_scale=scale, lse=lse)
+    assert torch.equal(out, mla_sparse_prefill_v41(**inputs, softmax_scale=scale))
+
+    p_ip = inputs["kv_indptr_prefix"].tolist()
+    e_ip = inputs["kv_indptr_extend"].tolist()
+    p_ix = inputs["kv_indices_prefix"].long()
+    e_ix = inputs["kv_indices_extend"].long()
+    ref_lse = torch.full((n, h), float("inf"), device="cuda")
+    for i in range(1, n):
+        rows = torch.cat(
+            [
+                ref["ukv_fp32"][p_ix[p_ip[i] : p_ip[i + 1]]],
+                ref["kv_fp32"][e_ix[e_ip[i] : e_ip[i + 1]]],
+            ]
+        )
+        ref_lse[i] = torch.logsumexp(ref["q_fp32"][i] @ rows.t() * scale, dim=1)
+    assert torch.isinf(lse[0]).all() and (lse[0] > 0).all()
+    assert not out[0].any()
+    # The kernel sums bf16 P: off by up to log(1 + 2^-9).
+    torch.testing.assert_close(lse[1:], ref_lse[1:], atol=2e-3, rtol=0)
+
+    lse_no_sink = torch.empty_like(lse)
+    out_no_sink = mla_sparse_prefill_v41(
+        **{**inputs, "attn_sink": None}, softmax_scale=scale, lse=lse_no_sink
+    )
+    neg_inf = torch.full_like(inputs["attn_sink"], float("-inf"))
+    assert torch.equal(
+        out_no_sink,
+        mla_sparse_prefill_v41(**{**inputs, "attn_sink": neg_inf}, softmax_scale=scale),
+    )
+    assert torch.equal(lse_no_sink, lse)
+
+
+def test_pa_sparse_prefill_opus_compat():
+    """The opus-pinned entries ATOM calls keep their names, torch ops and results,
+    and the backend-choosing entries pick opus where asm does not apply."""
+    if _skip_if_unsupported(d=512):
+        return
+    scale = 1.0 / math.sqrt(512)
+    bf16 = _make_inputs(64, 64, 512, 512, 512, torch.bfloat16, topk=200, seed=3)
+    fp8 = _make_inputs_fp8(64, 64, 512, 64, topk=200, seed=4)["kernel"]
+
+    assert torch.equal(
+        pa_sparse_prefill_opus(**bf16, softmax_scale=scale),
+        mla_sparse_prefill(**bf16, softmax_scale=scale),
+    )
+    assert torch.equal(
+        pa_sparse_prefill_fp8_opus(*fp8.values(), scale),
+        mla_sparse_prefill_v4(*fp8.values(), scale),
+    )
+    assert pa_sparse_prefill_gfx950_opus_fwd is opus_mla_v4_prefill_a16w16_gfx950_fwd
+    for name in ("pa_sparse_prefill_opus", "pa_sparse_prefill_fp8_opus"):
+        assert hasattr(aiter, name) and hasattr(torch.ops.aiter, name)
+    with pytest.raises(ValueError):
+        mla_sparse_prefill(**bf16, softmax_scale=scale, backend="triton")
+    as_bf16 = {
+        k: v.to(torch.bfloat16) if v.dtype == dtypes.fp8 else v for k, v in fp8.items()
+    }
+    with pytest.raises(RuntimeError, match="supports NoPE dtypes"):
+        mla_sparse_prefill_v4(**as_bf16, softmax_scale=scale, backend="opus")
+
+
 # ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
 # ---------------------------------------------------------------------------
@@ -719,7 +954,7 @@ def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description=(
-        "opus / asm / triton sparse-prefill correctness + benchmark driver.\n"
+        "opus / asm / triton MLA sparse prefill correctness + benchmark driver.\n"
         "All list arguments are swept via itertools.product."
     ),
 )
@@ -773,12 +1008,13 @@ parser.add_argument(
     "--prec",
     type=str,
     nargs="*",
-    default=["bf16", "fp8"],
+    default=list(_PRECS),
     choices=list(_PRECS),
     help=(
-        "precision(s) to sweep (default: [bf16, fp8]).\n"
+        "precision(s) to sweep (default: [bf16, v4, v41]).\n"
         "  bf16: single-tensor Q/K/V/O kernel      -> opus, triton\n"
-        "  fp8 : split NoPE-fp8 / RoPE-bf16 kernel -> opus, asm"
+        "  v4  : split NoPE-fp8 / RoPE-bf16 kernel -> opus, asm\n"
+        "  v41 : e4m3 rows + E8M0 scales (MLA v4.1) -> opus (gfx950)"
     ),
 )
 parser.add_argument(
@@ -837,7 +1073,7 @@ if __name__ == "__main__":
         args.num_kv_splits,
     ):
         total_tokens = args.total_tokens if args.total_tokens is not None else n
-        row = run_pa_sparse_prefill(
+        row = run_mla_sparse_prefill(
             n=n,
             h=h,
             d=args.head_dim,
@@ -871,6 +1107,6 @@ if __name__ == "__main__":
         rest = [c for c in df.columns if c not in lead]
         metrics = [c for b in _BACKENDS for c in rest if c.startswith(f"{b} ")]
         df = df[lead + [c for c in rest if c not in metrics] + metrics]
-        print_json_table("pa_sparse_prefill summary", df)
+        print_json_table("mla_sparse_prefill summary", df)
         sys.exit(0)
     sys.exit(0)
