@@ -62,6 +62,8 @@ SEED = 0
 A8W8_BLOCKS = {"gfx950": (32, 128), "gfx1250": (32, 128)}
 # Archs whose a8w8 GEMM also reads a 1x32 weight scale (n32k4-shuffled).
 A8W8_1X32_GFX = ["gfx1250"]
+# Archs whose a8w8 32x32 GEMM runs a ragged last k-tile (K not a multiple of 128).
+RAGGED_K_GFX = ["gfx1250"]
 
 
 def _to_e8m0_scale(scale):
@@ -214,7 +216,8 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     candidates, nbytes = {}, {}
 
     # A ragged K (not a multiple of 128) has no whole n32k4 scale group, so
-    # a8w4, a8w8_128 and the n32k4 1x32 scale do not run it; 32x32 does.
+    # a8w4, a8w8_128 and the n32k4 1x32 scale do not run it; 32x32 does, on the
+    # archs in RAGGED_K_GFX.
     ragged_k = k % 128 != 0
     if get_gfx() in A8W4_GFX and not ragged_k:
         # Offline weight prep (not in the hot path); act quant mirrors every forward.
@@ -246,7 +249,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
 
     a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
     for block in a8w8_blocks:
-        if ragged_k and block != 32:
+        if ragged_k and (block != 32 or get_gfx() not in RAGGED_K_GFX):
             continue
         x8, xs8 = quant_act_e8m0(o_mbn, block)
         w8, ws8 = quant_weight_e8m0(w_bnk, block)
