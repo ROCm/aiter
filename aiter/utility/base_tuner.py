@@ -316,11 +316,56 @@ class TunerCommon:
         merge_df.to_csv(new_file_path, index=False)
         return new_file_path
 
+    # Columns of an untuned shape list that name a quantization dtype.
+    _QUANT_DTYPE_COLS: ClassVar[tuple[str, ...]] = ("q_dtype_a", "q_dtype_w")
+
+    @staticmethod
+    def _resolve_fp8_name(value):
+        """Map a 'torch.float8_e4m3*' cell onto the arch-native e4m3 encoding.
+
+        Only one e4m3 encoding exists per chip (gfx942 e4m3fnuz, gfx950 OCP
+        e4m3fn), so a shape list naming the other one describes an unrunnable
+        configuration rather than a distinct problem; left alone it aborts with
+        "Unsupported dtype" or is silently skipped by the tuners that require
+        q_dtype_w == dtypes.fp8.
+
+        Resolved by name lookup rather than eval(): these cells come from CSV
+        files whose path is caller-supplied, and eval() would turn the tuner
+        into a code-execution sink. Anything that is not a recognised e4m3
+        dtype name is returned untouched.
+        """
+        if not isinstance(value, str):
+            return value
+        name = value.strip()
+        if not name.startswith("torch.float8_e4m3"):
+            return value
+        dtype = getattr(torch, name[len("torch.") :], None)
+        if dtype is None:
+            return value
+        return str(dtypes.normalize_fp8_dtype(dtype))
+
+    def _normalize_fp8_columns(self, untunedf):
+        """Resolve the fp8 flavor of every quant-dtype column in a shape list.
+
+        Applied on ingest, in the shared loader, so that every tuner family
+        benefits -- a8w8, a8w8_bpreshuffle, blockscale, batched and fmoe alike.
+        Normalizing here rather than at point of use also keeps the shape keys,
+        the tuned rows we emit and the tuner's own tuned/untuned bookkeeping all
+        agreeing on one dtype; applied late, a tuned row lands as e4m3fnuz while
+        the untuned frame still says e4m3fn and the shape is reported as never
+        tuned.
+        """
+        for col in self._QUANT_DTYPE_COLS:
+            if col in untunedf.columns:
+                untunedf[col] = untunedf[col].map(self._resolve_fp8_name)
+        return untunedf
+
     def get_untuned_gemm_list(self, untuned_gemm_file):
         assert os.path.exists(
             untuned_gemm_file
         ), f"Not exist untuned file: {untuned_gemm_file}"
         untunedf = _read_csv(untuned_gemm_file)
+        untunedf = self._normalize_fp8_columns(untunedf)
         filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
         return filtered_df
 
