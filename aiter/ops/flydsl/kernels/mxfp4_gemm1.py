@@ -31,6 +31,7 @@ from .mxfp4_gemm_common import (
     _umod,
     bq_bytes_for,
     bscale_bytes_for,
+    global_typed_ptr,
     k_half_for,
     kas_per_chunk_dw_for,
     kbs_per_expert_dw_for,
@@ -95,13 +96,40 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     k_stages=kStages,
+    fold_expert=None,
+    fold_rows=None,
+    fold_publish=None,
+    fold_token_rows=None,
+    split_k=1,
+    sk_idx=None,
+    arg_sk_part=None,
+    b_scale_aux=0,
 ):
+    # Sort-fold hooks (BM16 inline-quant only, see mxfp4_gemm1_sort_fold.py):
+    #   fold_expert      expert of this m-block, resolved by the in-kernel sort.
+    #   fold_rows        LDS i32 tiles holding the m-block's 16 token rows.
+    #   fold_publish     callable that ranks the rows and publishes the stage-2
+    #                    sort tables. When given, the first k_stages B tiles are
+    #                    issued before it (they only need the expert) and the
+    #                    hidden loads run one K tile ahead.
+    #   fold_token_rows  hidden loads of the prologue tiles (+1) already issued
+    #                    with LDS A row r = token r. The m-block's rows are then
+    #                    gathered at LDS-read time instead of at load time.
+    #   split_k          K partitions over grid axis 1; partition 0 hands its
+    #                    fp32 accumulators to partition 1 through arg_sk_part.
+    fold = fold_expert is not None
+    early_b = fold_publish is not None
+    token_rows = fold_token_rows is not None
+    if const_expr(early_b):
+        prefetch_hidden = True
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
     K_HALF = k_half_for(K)
     # A row bytes: fp4 = K/2, fp8 = K (B is always mxfp4 -> keeps K_HALF).
     A_ROW_BYTES = K if a_dtype == "fp8" else K_HALF
-    K_TILES_TOTAL = K // BK
+    # Under split-K each CTA walks K/split_k tiles; its window is re-based
+    # through the wave-uniform B, B-scale and hidden-state base offsets.
+    K_TILES_TOTAL = K // BK // split_k
     K_TILES_PER_WAVE = K_TILES_TOTAL // k_wave
     kAS_per_chunk_dw = kas_per_chunk_dw_for(K)
     ASCALE_CHUNK_BYTES = kAS_per_chunk_dw * 4
@@ -145,8 +173,17 @@ def _gemm1_body(
 
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx)))
+    if const_expr(fold):
+        e = fold_expert
+    else:
+        e = rocdl.readfirstlane(
+            T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx))
+        )
     m_row = m_block_idx * fx.Int32(BM)
+    if const_expr(split_k > 1):
+        sk_b_byte = sk_idx * fx.Int32(K_TILES_TOTAL * 2048)
+        sk_bs_byte = sk_idx * fx.Int32(K_TILES_TOTAL * kBS_stride_k0_dw * 4)
+        sk_h_byte = sk_idx * fx.Int32(K_TILES_TOTAL * BK * 2)
 
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
@@ -161,7 +198,7 @@ def _gemm1_body(
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
 
     bscale_tiles = _global_i32_buffer_tiles(arg_bscale, BSCALE_BYTES, 1)
-    bscale_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+    bscale_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(b_scale_aux), fx.Int32)
 
     # aq/ascale: global->LDS async DMA (no register fragment), via BufferCopyLDS.
     aq_buf = _global_i32_buffer_view(arg_aq, aq_num_records)
@@ -186,9 +223,18 @@ def _gemm1_body(
 
     cached_actual_row = []
     cached_row_inline = None
+    # LDS A row read for MFMA row lane % 16; token_rows gathers it instead.
+    a_lds_row = lane_mod_16
     if const_expr(inline_quant):
         rcls = wave_n * fx.Int32(4) + lane_div_16
-        cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
+        if const_expr(token_rows):
+            cached_row_inline = rcls
+        elif const_expr(early_b):
+            pass  # resolved after fold_publish() in the early-B prologue
+        elif const_expr(fold):
+            cached_row_inline = _global_i32_load(fold_rows, rcls)
+        else:
+            cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
     elif const_expr(num_waves == 2):
         for load_group in range_constexpr(2):
             idx = (
@@ -237,6 +283,8 @@ def _gemm1_body(
             n0 = tile_il >> fx.Int32(1)
             col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
         v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
+        if const_expr(split_k > 1):
+            v = v + sk_b_byte
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     if const_expr(interleave):
@@ -258,6 +306,8 @@ def _gemm1_body(
         base = (
             e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
         ) * fx.Int32(4)
+        if const_expr(split_k > 1):
+            base = base + sk_bs_byte
         base = rocdl.readfirstlane(T.i32, base)
         b_scale_s_base.append(base)
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
@@ -413,7 +463,7 @@ def _gemm1_body(
         return r
 
     def issue_a_ds_read(slot, khalf=None):
-        mask = _lds_swizzle_mask(lane_mod_16)
+        mask = _lds_swizzle_mask(a_lds_row)
         a = [[None, None] for _ in range(kMChunks)]
         halves = range_constexpr(2) if khalf is None else (khalf,)
         if const_expr(kMChunks == 1):
@@ -434,7 +484,7 @@ def _gemm1_body(
                 kbase = fx.Int32(k * 128)
                 lo_col = (lane_div_16 * fx.Int32(16) + kbase) ^ mask
                 hi_col = (lane_div_16 * fx.Int32(16) + kbase + fx.Int32(64)) ^ mask
-                lds_row = lane_mod_16 + fx.Int32(i * 16)
+                lds_row = a_lds_row + fx.Int32(i * 16)
                 boff = (
                     aq_group_base
                     + fx.Int32(slot * (BM * KH_TILE))
@@ -451,7 +501,7 @@ def _gemm1_body(
                 a[i][k] = t
             else:
                 lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
-                lds_row = lane_mod_16 + fx.Int32(i * 16)
+                lds_row = a_lds_row + fx.Int32(i * 16)
                 off = (
                     aq_group_base
                     + fx.Int32(slot * (BM * KH_TILE))
@@ -639,7 +689,7 @@ def _gemm1_body(
                 fx.Int32(sub * kAS_per_chunk_dw)
                 + fx.Int32(kt * 64)
                 + lane_div_16 * fx.Int32(16)
-                + lane_mod_16
+                + a_lds_row
             )
             out.append(as_ir_value(_global_i32_load(asc_i32_tiles, lds_dw)))
         return out
@@ -654,7 +704,10 @@ def _gemm1_body(
             + lane_shr2_and3 * fx.Int32(64)
             + lib * fx.Int32(16)
         )
-        s_soff = rocdl.readfirstlane(T.i32, fx.Int32(kt * (BK * 2) + B128_IDX * 256))
+        s_soff = fx.Int32(kt * (BK * 2) + B128_IDX * 256)
+        if const_expr(split_k > 1):
+            s_soff = s_soff + sk_h_byte
+        s_soff = rocdl.readfirstlane(T.i32, s_soff)
         r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
         fx.copy(
             hidden_copy_atom,
@@ -957,12 +1010,15 @@ def _gemm1_body(
         if const_expr(not inline_quant):
             issue_a_scale_load()
         hidden_prefetch = None
-        if const_expr(inline_quant and prefetch_hidden):
+        if const_expr(early_b):
+            hidden_prefetch = early_b_hidden_next
+        elif const_expr(inline_quant and prefetch_hidden):
             hidden_prefetch = (
                 inline_quant_load_kt(0, global_k_tile(0), cached_row_inline),
                 inline_quant_load_kt(1, global_k_tile(0), cached_row_inline),
             )
-        for K_C_LOCAL in range_constexpr(k_stages):
+        # The early-B prologue below has already filled the first k_stages.
+        for K_C_LOCAL in range_constexpr(0 if early_b else k_stages):
             K_C = global_k_tile(K_C_LOCAL)
             if const_expr(inline_quant):
                 scale_accum = fx.Int32(0)
@@ -1077,6 +1133,38 @@ def _gemm1_body(
                     J,
                 )
 
+    early_b_hidden_next = None
+    if const_expr(early_b):
+        for K_C_LOCAL in range_constexpr(k_stages):
+            for j in range_constexpr(N_REPS):
+                issue_b_load_j(b[K_C_LOCAL], K_C_LOCAL, j)
+            issue_b_scale_load(b_scale_v[K_C_LOCAL], K_C_LOCAL)
+        fold_publish()
+        if const_expr(token_rows):
+            a_lds_row = _global_i32_load(fold_rows, lane_mod_16)
+            hidden_pro = fold_token_rows
+        else:
+            cached_row_inline = _global_i32_load(fold_rows, rcls)
+            hidden_pro = [
+                [inline_quant_load_kt(h, kt, cached_row_inline) for h in range(2)]
+                for kt in range(k_stages)
+            ]
+        rocdl.sched_barrier(0)
+        for K_C_LOCAL in range_constexpr(k_stages):
+            scale_accum = _inline_quant_core_batch(
+                [(0, 0, hidden_pro[K_C_LOCAL][0]), (1, 0, hidden_pro[K_C_LOCAL][1])],
+                K_C_LOCAL,
+                fx.Int32(0),
+            )
+            inline_quant_pack_write(K_C_LOCAL, scale_accum)
+        if const_expr(token_rows):
+            early_b_hidden_next = tuple(fold_token_rows[k_stages])
+        else:
+            early_b_hidden_next = (
+                inline_quant_load_kt(0, k_stages, cached_row_inline),
+                inline_quant_load_kt(1, k_stages, cached_row_inline),
+            )
+
     if const_expr(k_wave == 1):
         run_k_slice(0)
     elif const_expr(k_wave == 2):
@@ -1095,6 +1183,11 @@ def _gemm1_body(
             run_k_slice(3 * K_TILES_PER_WAVE)
 
     gpu.barrier()
+
+    if const_expr(split_k > 1):
+        _split_k_handoff(
+            accm, arg_sk_part, bx_i32, sk_idx, i32_total_m_blocks * NUM_N_BLOCKS
+        )
 
     # lds_acc reuses the s_aq region (offset 0) as an f32 accumulator.
     # Four dwords of row padding rotate each four-row store group by 16 banks
@@ -1429,32 +1522,134 @@ def _gemm1_body(
                         fx.Int16,
                     )
 
-    if const_expr(epi_splits > 1):
-        for split in range_constexpr(epi_splits):
-            if const_expr(split > 0):
+    def store_and_epilogue():
+        if const_expr(epi_splits > 1):
+            for split in range_constexpr(epi_splits):
+                if const_expr(split > 0):
+                    gpu.barrier()
+                store_acc_split(split)
                 gpu.barrier()
-            store_acc_split(split)
+                run_epilogue(split)
+            store_scales()
+        else:
+            store_acc_split(0)
             gpu.barrier()
-            run_epilogue(split)
-        store_scales()
+            if wave_k == fx.Int32(0):
+                if const_expr(num_waves == 2):
+                    run_epilogue(0)
+                    store_scales()
+                elif const_expr(BN == 64):
+                    if wave_grp == fx.Int32(0):
+                        run_epilogue(0)
+                        store_scales()
+                elif const_expr(BN == 128):
+                    if wave_grp < fx.Int32(2):
+                        run_epilogue(0)
+                        store_scales()
+                else:
+                    run_epilogue(0)
+                    store_scales()
+
+    if const_expr(split_k > 1):
+        # Only the last K partition owns the combined tile.
+        if sk_idx == fx.Int32(split_k - 1):
+            store_and_epilogue()
     else:
-        store_acc_split(0)
-        gpu.barrier()
-        if wave_k == fx.Int32(0):
-            if const_expr(num_waves == 2):
-                run_epilogue(0)
-                store_scales()
-            elif const_expr(BN == 64):
-                if wave_grp == fx.Int32(0):
-                    run_epilogue(0)
-                    store_scales()
-            elif const_expr(BN == 128):
-                if wave_grp < fx.Int32(2):
-                    run_epilogue(0)
-                    store_scales()
-            else:
-                run_epilogue(0)
-                store_scales()
+        store_and_epilogue()
+
+
+# A split-K partial slot holds one CTA's BM16 x BN256 fp32 accumulators as
+# 256 threads x 4 x float4. 0xFFFFFFFF marks a slot whose producer has not
+# published yet; it is never a value an MFMA accumulator produces from
+# finite inputs.
+SPLIT_K_SLOT_BYTES = 16 * 256 * 4
+SPLIT_K_SENTINEL = -1
+
+
+@flyc.jit
+def _split_k_handoff(accm, arg_sk_part, bx_i32, sk_idx, i32_num_tiles):
+    """Static-role split-K=2 combine for the BM16 BN256 GEMM1 tile.
+
+    K partition 0 streams its raw MFMA accumulators from VGPRs to its slot and
+    is done: no LDS spill, no counter. Partition 1 polls the slot until no
+    element holds the sentinel (every fp32 store is single-copy atomic, so the
+    stores themselves are the release), adds it into its own accumulators,
+    re-arms the slot for the next launch and runs the epilogue. Grid axis 1
+    dispatches all partition-0 CTAs before any partition-1 CTA, so a waiting
+    consumer never keeps its producer from becoming resident. The slot traffic
+    uses sc0|sc1 (aux 17) so it is coherent across XCDs.
+    """
+    assert len(accm) == 1 and len(accm[0]) == 4, "BM16 BN256 4-wave tile only"
+    tx = fx.Int32(gpu.thread_id("x"))
+    vecs_per_slot = SPLIT_K_SLOT_BYTES // 16
+    part_bytes = fx.Int64(i32_num_tiles) * fx.Int64(SPLIT_K_SLOT_BYTES)
+    part_view = fx.Tensor(
+        fx.make_view(
+            global_typed_ptr(arg_sk_part, T.f32, 16),
+            fx.make_layout(part_bytes // fx.Int64(4), 1),
+        )
+    )
+    part_tiles = fx.logical_divide(
+        fx.rocdl.make_buffer_tensor(
+            part_view, max_size=False, num_records_bytes=part_bytes
+        ),
+        fx.make_layout(4, 1),
+    )
+    part_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(17), fx.Float32)
+    slot0 = bx_i32 * fx.Int32(vecs_per_slot) + tx
+
+    def slot(q):
+        return fx.slice(part_tiles, (None, slot0 + fx.Int32(q * 256)))
+
+    def load_peer(q):
+        r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+        fx.copy_atom_call(part_atom, slot(q), r)
+        return r.load()
+
+    def unpublished(v):
+        n = fx.Int32(0)
+        for x in range_constexpr(4):
+            is_sent = fx.Float32(v[x]).bitcast(fx.Int32) == fx.Int32(SPLIT_K_SENTINEL)
+            n = n + is_sent.select(fx.Int32(1), fx.Int32(0))
+        return n
+
+    if sk_idx == fx.Int32(0):
+        for q in range_constexpr(4):
+            fx.copy_atom_call(part_atom, accm[0][q], slot(q))
+    else:
+        p0 = load_peer(0)
+        p1 = load_peer(1)
+        p2 = load_peer(2)
+        p3 = load_peer(3)
+        pending = unpublished(p0) + unpublished(p1) + unpublished(p2) + unpublished(p3)
+        while pending > fx.Int32(0):
+            # The side-effecting sleep keeps the poll loads inside the loop;
+            # without it LLVM hoists the plain buffer loads and spins forever.
+            fx.rocdl.s_sleep(1)
+            p0 = load_peer(0)
+            p1 = load_peer(1)
+            p2 = load_peer(2)
+            p3 = load_peer(3)
+            pending = (
+                unpublished(p0) + unpublished(p1) + unpublished(p2) + unpublished(p3)
+            )
+        peer = [p0, p1, p2, p3]
+        for q in range_constexpr(4):
+            mine = fx.Vector(fx.memref_load_vec(accm[0][q]))
+            accm[0][q].store(
+                fx.Vector.from_elements(
+                    [
+                        fx.Float32(mine[x]) + fx.Float32(peer[q][x])
+                        for x in range_constexpr(4)
+                    ],
+                    fx.Float32,
+                )
+            )
+        sentinel = fx.Int32(SPLIT_K_SENTINEL).bitcast(fx.Float32)
+        for q in range_constexpr(4):
+            r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+            r.store(fx.Vector.from_elements([sentinel] * 4, fx.Float32))
+            fx.copy_atom_call(part_atom, r, slot(q))
 
 
 def _bm_constants(

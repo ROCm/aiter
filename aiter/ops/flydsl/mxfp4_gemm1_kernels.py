@@ -8,6 +8,7 @@ import torch
 
 from aiter.ops.flydsl import moe_kernels as _moe_kernels
 from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
+from aiter.utility.graph_alloc import persistent_alloc
 
 
 @functools.cache
@@ -284,5 +285,126 @@ def flydsl_mxfp4_gemm1(
             hidden_states.data_ptr(),
             0 if bias is None else bias.data_ptr(),
             torch.cuda.current_stream() if stream is None else stream,
+        ),
+    )
+
+
+# Small-M bucket of the sort-folded GEMM1: K split over two CTAs plus the
+# token-row prologue. At M <= 7 the BM16 grid has at most ~126 CTAs on 256 CUs.
+SORT_FOLD_SPLIT_K_MAX_M = 7
+
+
+def sort_fold_variant(n_tokens, topk):
+    """(route capacity, split_k, token-row prologue) of the folded GEMM1 at M."""
+    from .kernels.mxfp4_gemm1_sort_fold import sort_fold_cap
+
+    small = n_tokens <= SORT_FOLD_SPLIT_K_MAX_M
+    return sort_fold_cap(n_tokens * topk), 2 if small else 1, small
+
+
+@functools.cache
+def _get_compiled_mxfp4_gemm1_sort_fold(
+    D_HIDDEN, D_INTER, NE, topk, cap, split_k, token_rows, zero_output
+):
+    from .kernels.mxfp4_gemm1_sort_fold import compile_gemm1_sort_fold
+
+    return compile_gemm1_sort_fold(
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        NE=NE,
+        TOPK=topk,
+        CAP=cap,
+        split_k=split_k,
+        token_rows=token_rows,
+        zero_output=zero_output,
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_sort_fold_split_k_slots(
+    device: torch.device, stream_id: int, n_tiles: int
+) -> torch.Tensor:
+    # Safe to reuse: launches on a stream are ordered and the consumer CTA
+    # re-arms every slot it reads with the sentinel.
+    from .kernels.mxfp4_gemm1 import SPLIT_K_SENTINEL, SPLIT_K_SLOT_BYTES
+
+    with persistent_alloc(device):
+        return torch.full(
+            (n_tiles * SPLIT_K_SLOT_BYTES // 4,),
+            SPLIT_K_SENTINEL,
+            dtype=torch.int32,
+            device=device,
+        )
+
+
+def flydsl_mxfp4_gemm1_sort_fold(
+    *,
+    w1_u8,
+    w1_scale_u8,
+    hidden_states,
+    topk_ids,
+    topk_weights,
+    sorted_token_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    cumsum_tensor,
+    moe_buf,
+    inter_sorted_quant,
+    inter_sorted_shuffled_scale,
+    NE,
+    D_HIDDEN,
+    D_INTER,
+    topk,
+    stream=None,
+):
+    """BM16 inline-quant GEMM1 that also emits the stage-2 sort tables.
+
+    Writes sorted_token_ids / sorted_weights / sorted_expert_ids /
+    cumsum_tensor (num_valid_ids) with the same contract as the BM16 aux sort
+    and zeroes moe_buf when it is non-empty (atomic stage 2), so no sort
+    kernel runs before it.
+    """
+    from .kernels.mxfp4_gemm1 import gemm1_grid
+
+    n_tokens = hidden_states.shape[0]
+    cap, split_k, token_rows = sort_fold_variant(n_tokens, topk)
+    if cap == 0:
+        raise NotImplementedError(
+            f"sort-folded GEMM1 covers at most 576 routes, got {n_tokens * topk}"
+        )
+    zero_output = moe_buf.numel() > 0
+    launch = _get_compiled_mxfp4_gemm1_sort_fold(
+        D_HIDDEN, D_INTER, NE, topk, cap, split_k, token_rows, zero_output
+    )
+    grid = gemm1_grid(n_tokens, 16, NE=NE, TOPK=topk, INTER=D_INTER, BN=256)
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    sk_part_ptr = 0
+    if split_k > 1:
+        max_grid = gemm1_grid(
+            SORT_FOLD_SPLIT_K_MAX_M, 16, NE=NE, TOPK=topk, INTER=D_INTER, BN=256
+        )
+        sk_part_ptr = _get_sort_fold_split_k_slots(
+            hidden_states.device, stream.cuda_stream, max_grid
+        ).data_ptr()
+    _moe_kernels._run_compiled(
+        launch,
+        (
+            w1_u8.data_ptr(),
+            w1_scale_u8.data_ptr(),
+            n_tokens,
+            grid,
+            hidden_states.data_ptr(),
+            topk_ids.data_ptr(),
+            topk_weights.data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            cumsum_tensor.data_ptr(),
+            inter_sorted_quant.data_ptr(),
+            inter_sorted_shuffled_scale.data_ptr(),
+            sorted_token_ids.data_ptr(),
+            sorted_weights.data_ptr(),
+            moe_buf.data_ptr() if zero_output else 0,
+            sk_part_ptr,
+            stream,
         ),
     )
