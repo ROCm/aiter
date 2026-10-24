@@ -896,7 +896,7 @@ def _load_mxscale_bpreshuffle_tuned() -> dict:
     """{(gfx, cu_num, M, N, K, w_scale_block): row} of the e8m0 block-scale
     table for preshuffled weights."""
     path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
-    df = pd.read_csv(path).drop_duplicates()
+    df = with_mxscale_w_scale_block(pd.read_csv(path).drop_duplicates(), path)
     return df.set_index(_MXSCALE_BPRESHUFFLE_KEYS).to_dict("index")
 
 
@@ -933,11 +933,11 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     """E8M0 block-scale GEMM on (16, 16)-preshuffled weights, scales raw (as
     quantized): a 128-wide x_scale has column-major bytes (blockscale), a
     32-wide one is row-major (group32/MX). A tuned row's kernelId names the
-    backend: "mxfp8" is gfx950's mxpsh / 8-wave GEMM (run_gemm_a8w8_mxfp8_gfx950;
-    its x_scale block goes with the w_scale's: 1x128 with 128x128, else 1x32),
-    "bmm" the flydsl batched
-    GEMM (flydsl.batched_gemm_a8w8) run with B = 1, which also serves untuned
-    shapes."""
+    backend: "mxfp8" is gfx950's mxpsh / 8-wave GEMM (run_gemm_a8w8_mxfp8_gfx950),
+    "bmm" the flydsl batched GEMM (flydsl.batched_gemm_a8w8) run with B = 1.
+    Both are tuned with the x_scale block that goes with the w_scale's (1x128
+    with 128x128, else 1x32); untuned shapes and other x_scale blocks run bmm
+    under its heuristic."""
     m, k = XQ.shape
     n = WQ.shape[0]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
@@ -951,16 +951,17 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
             f"mxscale bpreshuffle row {config['libtype']}/{config['kernelId']} "
             f"has no implementation"
         )
+    # Rows are tuned with the x_scale block that goes with their w_scale's
+    # (1x128 with 128x128, else 1x32); bmm reads every other pairing too, its
+    # heuristic picks.
+    if x_block != (_BLOCKSCALE_X_BLOCK if w_scale_block == "128x128" else 32):
+        config = backend = None
     if backend == MXSCALE_MXFP8_KERNEL_ID:
-        if x_block == (128 if w_scale_block == "128x128" else 32):
-            from .flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
+        from .flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
 
-            return run_gemm_a8w8_mxfp8_gfx950(
-                XQ, WQ, x_scale, w_scale, Y, str(config["kernelName"]), w_scale_block
-            )
-        # An x_scale block the mxfp8 kernels do not pair with this w_scale:
-        # bmm reads every pairing, its heuristic picks.
-        config = None
+        return run_gemm_a8w8_mxfp8_gfx950(
+            XQ, WQ, x_scale, w_scale, Y, str(config["kernelName"]), w_scale_block
+        )
     from .flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
 
     run_bmm_a8w8_mxfp8(
