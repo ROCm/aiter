@@ -704,6 +704,7 @@ def compile_flydsl_moe_stage1(
             # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
             # fp4 byte-LUT decode, LDS staging) from this arch string.
             rocm_arch=str(get_rocm_arch()),
+            has_bias=enable_bias,
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
@@ -790,8 +791,9 @@ def compile_flydsl_moe_stage2(
             # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
             # fp4 byte-LUT decode, atomic epilogue) from this arch string.
             rocm_arch=str(get_rocm_arch()),
-            epilog=("reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"),
+            epilog=("reduce" if mode == "reduce" else "atomic"),
             topk=topk,
+            has_bias=enable_bias,
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
@@ -1592,6 +1594,7 @@ def _flydsl_moe_stage1_impl(
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
             w_dtype=b_dtype,
             w_layout="standard",
+            bias=bias,
         )
         return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
@@ -2049,8 +2052,8 @@ def _flydsl_moe_stage2_impl(
 
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
         # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4). Default atomic-scatters
-        # into the caller's moe_sorting-zeroed `out`. a16wi4 mode=reduce writes
-        # unique [M*topk,H] rows then moe_reduce. Tiles from the kernelName (like
+        # into the caller's moe_sorting-zeroed `out`. mode=reduce writes unique
+        # [M*topk,H] rows then moe_reduce, which sums the top-k slots in a fixed order. Tiles from the kernelName (like
         # a4w4/a8w4). a16wi4 W2 uses the OLD-kernel int4 layout
         # (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) + (E,G//2,N,2) bf16 scale.
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
@@ -2080,7 +2083,7 @@ def _flydsl_moe_stage2_impl(
         )
         _epilog = "atomic"
         gemm2_out = out
-        if b_dtype == "int4" and mode == "reduce":
+        if mode == "reduce":
             _epilog = "reduce"
             gemm2_out = torch.empty(
                 (M_logical * int(topk), model_dim),
@@ -2116,6 +2119,7 @@ def _flydsl_moe_stage2_impl(
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
             epilog=_epilog,
+            bias=bias,
         )
         if _epilog == "reduce":
             _run_moe_reduction(

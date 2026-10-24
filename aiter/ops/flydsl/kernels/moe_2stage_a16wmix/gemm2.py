@@ -16,6 +16,7 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
 )
 
 from .utils import (
+    _global_f32_at,
     _global_i32_at,
     _mma_bf16,
     _raw,
@@ -228,7 +229,9 @@ def _reduce_bf16_epilog(
         row_in_block = fx.Int32(mr * 8) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         slot = packed[mr] >> fx.Int32(24)
-        if token_id < i32_M:
+        # Padding rows of the sort carry slot == topk; with num_local_tokens they
+        # can also carry a token id below M, so check the slot too.
+        if (token_id < i32_M) & (slot < fx.Int32(TOPK)):
             row_base_addr = (
                 (token_id * fx.Int32(TOPK) + slot) * fx.Int32(N_OUT)
                 + n_block_idx * fx.Int32(BN)
@@ -264,6 +267,7 @@ def _gemm2_body_a16w4(
     lane,
     wave,
     i32_M,
+    arg_bias=None,
     *,
     BM,
     TILE_N,
@@ -276,11 +280,14 @@ def _gemm2_body_a16w4(
     rocm_arch="",
     use_reduce=False,
     topk=1,
+    has_bias=False,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
     A = bf16 stage1 intermediate by SORTED position. W2 = mxfp4/int4/bf16 (see gemm1).
     Output = bf16 atomic-fadd (routing-weighted) scatter to [tokens, model_dim].
+    ``has_bias``: add the f32 per-expert bias ``arg_bias`` ``[NE, N_OUT]`` before the
+    routing weight.
     """
     _is_gfx942 = str(rocm_arch).startswith("gfx942")
     elem_bytes = 2
@@ -388,6 +395,18 @@ def _gemm2_body_a16w4(
         gpu.barrier()
 
     gpu.barrier()
+    if const_expr(has_bias):
+        # Same column mapping as the epilogues: wave w owns TILE_N//4 columns of the tile.
+        for ni in range_constexpr(num_acc_n):
+            col = by_n + wave * fx.Int32(_n_per_wave) + fx.Int32(ni * 16) + lane_mod_16
+            b = _global_f32_at(arg_bias, e * fx.Int32(N_OUT) + col)
+            for mi in range_constexpr(m_repeat):
+                v = Vec(fx.memref_load_vec(accm[mi][ni]))
+                accm[mi][ni].store(
+                    Vec.from_elements(
+                        [v[vv] + b for vv in range_constexpr(4)], fx.Float32
+                    )
+                )
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     accm_v = [
         [accm[i][J].load().ir_value() for J in range(num_acc_n)]
@@ -459,12 +478,14 @@ def compile_gemm2_a16w4_port(
     rocm_arch,
     epilog="atomic",
     topk=1,
+    has_bias=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
     N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction).
     ``epilog="atomic"``: routing-weighted scatter into [tokens, model_dim].
     ``epilog="reduce"``: unique [token*topk+slot, N] rows (caller runs moe_reduce).
+    ``has_bias``: per-expert f32 bias ``[NE, N_OUT]`` added before the routing weight.
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
@@ -519,6 +540,8 @@ def compile_gemm2_a16w4_port(
         _name += "_persist"
     if _use_reduce:
         _name += f"_reduce_tk{_topk}"
+    if has_bias:
+        _name += "_bias"
 
     @fx.struct
     class SharedStorage:
@@ -535,6 +558,7 @@ def compile_gemm2_a16w4_port(
         arg_sweights: fx.Int64,
         i32_M: fx.Int32,
         i32_max_m_blocks: fx.Int32,
+        arg_bias: fx.Int64,
         arg_out: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
@@ -582,6 +606,7 @@ def compile_gemm2_a16w4_port(
                 lane,
                 wave,
                 i32_M,
+                arg_bias,
                 BM=BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,
@@ -593,6 +618,7 @@ def compile_gemm2_a16w4_port(
                 rocm_arch=rocm_arch,
                 use_reduce=_use_reduce,
                 topk=_topk,
+                has_bias=has_bias,
             )
 
         if const_expr(persist):
@@ -622,6 +648,7 @@ def compile_gemm2_a16w4_port(
         i32_M: fx.Int32,
         i32_max_m_blocks: fx.Int32,
         i32_grid: fx.Int32,
+        arg_bias: fx.Int64,
         arg_out: fx.Int64,
         stream: fx.Stream,
     ):
@@ -636,6 +663,7 @@ def compile_gemm2_a16w4_port(
             arg_sweights,
             i32_M,
             i32_max_m_blocks,
+            arg_bias,
             arg_out,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)

@@ -16,6 +16,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 from .utils import (
     _BCol,
+    _global_f32_at,
     _global_i32_at,
     _mma_bf16,
     _udiv,
@@ -43,6 +44,7 @@ def _gemm1_body_a16w4(
     wave,
     i32_ntok,
     situ,
+    arg_bias=None,
     *,
     BM,
     TILE_N,
@@ -57,12 +59,15 @@ def _gemm1_body_a16w4(
     w_layout="standard",
     k_wave=1,
     rocm_arch="",
+    has_bias=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
     A is native bf16 (no A-scale). W is mxfp4/int4 (packed, per-group scale, upconverted
     in-kernel) or raw bf16. Non-scaled MFMA(16,16,32,bf16) K=32; epilogue SiLU(gate)*up
     -> bf16 intermediate ``[sorted_size, inter_dim]`` stored by SORTED POSITION.
+    ``has_bias``: add the f32 per-expert bias ``arg_bias`` ``[NE, 2*INTER]`` (gate | up)
+    to gate and up before the activation.
     """
     _is_gfx942 = str(rocm_arch).startswith("gfx942")
     N_OUT = 2 * INTER
@@ -351,6 +356,12 @@ def _gemm1_body_a16w4(
     # tokens) masked out; for k_wave>1 only the primary k-group (wave_k_id==0) writes.
     if const_expr(k_wave > 1):
         _is_primary = wave_k_id == fx.Int32(0)
+    if const_expr(has_bias):
+        bias_row = e * fx.Int32(2 * INTER)
+        bias_gate = [_global_f32_at(arg_bias, bias_row + c) for c in col_g_list]
+        bias_up = [
+            _global_f32_at(arg_bias, bias_row + inter_i32 + c) for c in col_g_list
+        ]
     for mi in range_constexpr(m_repeat):
         for ii in range_constexpr(4):
             row_in_tile = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
@@ -363,6 +374,9 @@ def _gemm1_body_a16w4(
             for ni in range_constexpr(num_acc_n):
                 g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
                 u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
+                if const_expr(has_bias):
+                    g = g + bias_gate[ni]
+                    u = u + bias_up[ni]
                 y = gate_up_act(act, [g], [u], situ)[0]
                 yb = y.to(fx.BFloat16)
                 out_idx = sorted_row * inter_i32 + col_g_list[ni]
@@ -393,6 +407,7 @@ def compile_gemm1_a16w4_port(
     w_layout="standard",
     k_wave=1,
     rocm_arch,
+    has_bias=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -480,7 +495,8 @@ def compile_gemm1_a16w4_port(
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
-    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
+    _bias_tag = "_bias" if has_bias else ""
+    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_bias_tag}"
 
     @fx.struct
     class SharedStorage:
@@ -500,6 +516,7 @@ def compile_gemm1_a16w4_port(
         f32_situ_linbeta: fx.Float32,
         f32_situ_linbeta_rcp: fx.Float32,
         f32_swiglu_limit: fx.Float32,
+        arg_bias: fx.Int64,
         arg_out: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
@@ -562,6 +579,7 @@ def compile_gemm1_a16w4_port(
                 wave,
                 i32_ntok,
                 _situ,
+                arg_bias,
                 BM=BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,
@@ -575,6 +593,7 @@ def compile_gemm1_a16w4_port(
                 w_layout=w_layout,
                 k_wave=k_wave,
                 rocm_arch=rocm_arch,
+                has_bias=has_bias,
             )
 
     @flyc.jit
@@ -592,6 +611,7 @@ def compile_gemm1_a16w4_port(
         f32_situ_linbeta: fx.Float32,
         f32_situ_linbeta_rcp: fx.Float32,
         f32_swiglu_limit: fx.Float32,
+        arg_bias: fx.Int64,
         arg_out: fx.Int64,
         stream: fx.Stream,
     ):
@@ -609,6 +629,7 @@ def compile_gemm1_a16w4_port(
             f32_situ_linbeta,
             f32_situ_linbeta_rcp,
             f32_swiglu_limit,
+            arg_bias,
             arg_out,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
