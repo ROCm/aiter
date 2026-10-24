@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith
 from flydsl.expr.typing import T
 
@@ -28,12 +29,15 @@ __all__ = [
     "atomic_add_lds",
     "atomic_add_system",
     "atomic_add_workgroup",
+    "atomic_umax_agent",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
     "fence_release",
     "fence_system_acquire",
     "fence_system_release",
+    "hw_xcc_id",
+    "invalidate_l1",
     "load_i32_acquire",
     "load_i32_global_agent",
     "load_i32_global_system",
@@ -53,6 +57,7 @@ __all__ = [
     "store_i32_global_system_release",
     "store_i32_lds",
     "store_i32_system",
+    "store_i64_global",
     "store_i64_global_system",
     "wait_i32_until_equals",
     "wait_i32_until_greater_than",
@@ -265,6 +270,41 @@ def store_i64_global_system(addr_i64, val):
         fx.Int64(val),
         memory_order=fx.AtomicOrdering.Release,
         syncscope="one-as",
+    )
+
+
+def store_i64_global(addr_i64, val):
+    """Plain (non-atomic) global i64 store to ``addr_i64``."""
+    fx.ptr_store(fx.Int64(val), _to_ptr_global(addr_i64, fx.Int64, 8))
+
+
+def atomic_umax_agent(addr_i64, val):
+    """Agent-scope monotonic global unsigned fetch-and-max on an i32 word."""
+    return fx.atomic_max(
+        _to_ptr_global(addr_i64, fx.Uint32, 4),
+        fx.Uint32(val),
+        syncscope=fx.rocdl.SyncScope.Agent,
+    )
+
+
+# FlyDSL has no wrapper for the two instructions below.
+def hw_xcc_id():
+    """Wave-uniform XCC (die) index of the executing wave."""
+    return fx.Int32(
+        llvm.InlineAsmOp(
+            T.i32,
+            [],
+            "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID, 0, 4)",
+            "=s",
+            has_side_effects=True,
+        ).result
+    )
+
+
+def invalidate_l1():
+    """Invalidate this CU's vector L1 only (the XCD's L2 is untouched)."""
+    llvm.InlineAsmOp(
+        None, [], "buffer_inv sc0\ns_waitcnt vmcnt(0)", "", has_side_effects=True
     )
 
 
