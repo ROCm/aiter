@@ -275,6 +275,11 @@ a8w8_gemm2_kernels_list_gfx950= {
     #  4: kernelInstanceGEMM2(       256,        64,       128,       256,     1,       4,         3,),
      5: kernelInstanceGEMM2(       256,       128,       128,       128,     1,       4,         3,),
      6: kernelInstanceGEMM2(       256,       256,       128,       128,     1,       4,         3,),
+    # KPerBlock=128 small-M instances. Stage 2 runs K = inter_dim under
+    # GemmSpecialization::Default, so an inter_dim that is a multiple of 128 but
+    # not of 256 (e.g. the 384 of a TP4 shard) has no KPerBlock=256 instance.
+     7: kernelInstanceGEMM2(       256,        32,       128,       128,     1,       4,         1,),
+     8: kernelInstanceGEMM2(       256,        64,       128,       128,     1,       4,         1,),
     # inter_dim=192 default instances with KPerBlock=64
     # disabled currently due to gfx950 fp8 mfma instruction used in CK not supporting these cases
     #  10: kernelInstanceGEMM2(       256,        32,        64,       64,     1,       4,         1,),
