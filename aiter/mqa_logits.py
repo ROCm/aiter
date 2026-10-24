@@ -142,6 +142,16 @@ def flydsl_supports(Q, KV, variant: str) -> bool:
     return {Q.dtype, KV.dtype} <= {torch.float8_e4m3fn, torch.float8_e4m3fnuz}
 
 
+def flydsl_operands_packed(kv_scales, weights, cu_starts, cu_ends) -> bool:
+    """Whether FlyDSL reads these operands correctly.
+
+    The FlyDSL wrapper makes Q and KV contiguous but only reshapes these, and the
+    kernel addresses them as packed rows, so a strided view is misread. Triton
+    takes their strides.
+    """
+    return all(t.is_contiguous() for t in (kv_scales, weights, cu_starts, cu_ends))
+
+
 def run_mqa_logits(
     config: dict,
     Q: torch.Tensor,
@@ -154,6 +164,11 @@ def run_mqa_logits(
 ) -> torch.Tensor:
     """Launch one explicit config. ``mqa_logits`` and the tuner share it."""
     if config["backend"] == "flydsl":
+        if not flydsl_operands_packed(kv_scales, weights, cu_starts, cu_ends):
+            raise ValueError(
+                "FlyDSL mqa_logits needs contiguous kv_scales, weights, cu_starts "
+                "and cu_ends; mqa_logits() runs strided ones on Triton"
+            )
         return _flydsl_kernels().flydsl_fp8_mqa_logits(
             Q,
             KV,
@@ -193,12 +208,18 @@ def mqa_logits(
         clean_logits: write ``-inf`` outside each row's window. If False, those
             positions are unspecified.
 
+    A strided ``kv_scales``, ``weights``, ``cu_starts`` or ``cu_ends`` runs on
+    Triton rather than being copied for FlyDSL.
+
     Returns:
         ``[seq_len, seq_len_kv]`` float32 logits.
     """
     seq_len, heads, head_dim = Q.shape
     config = get_mqa_logits_config(seq_len, KV.shape[0], heads, head_dim)
-    if config["backend"] == "flydsl" and not flydsl_supports(Q, KV, config["variant"]):
+    if config["backend"] == "flydsl" and not (
+        flydsl_supports(Q, KV, config["variant"])
+        and flydsl_operands_packed(kv_scales, weights, cu_starts, cu_ends)
+    ):
         config = dict(DEFAULT_CONFIG)
     return run_mqa_logits(
         config, Q, KV, kv_scales, weights, cu_starts, cu_ends, clean_logits

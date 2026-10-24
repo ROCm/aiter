@@ -206,6 +206,33 @@ def check_flydsl_fallback_uses_triton():
         mql.flydsl_supports = original_supports
 
 
+def check_strided_weights_match_reference():
+    """A ``weights`` view with row stride 2H, on a shape the table sends to FlyDSL,
+    must still give the reference logits; FlyDSL reads rows as packed."""
+    row = _shipped_flydsl_row()
+    seq_len, seq_len_kv = (row[0], row[1]) if row else (1024, 8192)
+    inp = build_inputs(seq_len, seq_len_kv)
+    wide = torch.randn(
+        (seq_len, 2 * HEADS), dtype=torch.float32, device=inp["weights"].device
+    )
+    inp["weights"] = wide[:, :HEADS]
+    assert not inp["weights"].is_contiguous()
+    ref = run_torch(inp)
+    with torch.inference_mode():
+        got = mql.mqa_logits(*launch_args(inp))[:, :seq_len_kv]
+    ref_inf = torch.isneginf(ref)
+    assert torch.equal(torch.isneginf(got), ref_inf), "strided weights: -inf mask"
+    diff = calc_diff(ref.masked_fill(ref_inf, 0), got.masked_fill(ref_inf, 0))
+    assert diff < 1e-3, f"strided weights: calc_diff={diff}"
+    if row is not None:
+        try:
+            mql.run_mqa_logits(row[2], *launch_args(inp))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("FlyDSL accepted strided weights")
+
+
 def main():
     if os.environ.get(_SHIPPED_ROW_CHILD):
         assert get_gfx() != get_gfx_runtime()
@@ -219,6 +246,7 @@ def main():
     check_lookup_uses_live_gpu()
     check_dispatches_shipped_row()
     check_flydsl_fallback_uses_triton()
+    check_strided_weights_match_reference()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
