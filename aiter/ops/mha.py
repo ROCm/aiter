@@ -1545,7 +1545,7 @@ def cmdGenFunc_mha_batch_prefill(
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
-    if max_seqlen_q == 1 and alibi_slopes is None:
+    if max_seqlen_q == 1 and alibi_slopes is None and sink_ptr is None:
         causal = False
         if window_size_left >= max_seqlen_k:
             window_size_left = -1
