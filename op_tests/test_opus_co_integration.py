@@ -332,7 +332,7 @@ def test_gfx1250_co_loader_handles_missing_assets(tmp_path, capsys):
 
     document = json.loads(Path(CO_KERNELS_JSON).read_text())
     document[GFX1250] = document[GFX1250][:1]
-    manifest = tmp_path / "co_kernels.json"
+    manifest = tmp_path / "co_kernels_gfx1250.json"
     manifest.write_text(json.dumps(document))
 
     assert _load_co_kernels(manifest) == {}
@@ -348,7 +348,7 @@ def test_gfx1250_co_loader_rejects_duplicate_identity(tmp_path, duplicate):
     if duplicate == "name":
         second["kid"] += 1
     document[GFX1250] = [first, second]
-    manifest = tmp_path / "co_kernels.json"
+    manifest = tmp_path / "co_kernels_gfx1250.json"
     manifest.write_text(json.dumps(document))
 
     expected = "duplicate co kid" if duplicate == "kid" else "same symbol"

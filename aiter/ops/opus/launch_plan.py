@@ -455,16 +455,6 @@ _A8W8_BLOCKSCALE_FAMILY = "a8w8_blockscale"
 _A8W8_BPRESHUFFLE_FAMILY = "a8w8_blockscale_bpreshuffle"
 _A8W8_MXSCALE_BMM_FAMILY = "a8w8_mxscale_bmm"
 
-# Derived, not restated. This used to be a second hand-kept copy of the tag list
-# in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY, and the two drifted the moment the
-# preshuffled-B families were added: get_kernel_instance consults the catalog's
-# copy first and rejected every preshuffled kid as "no registered OPUS kernel",
-# so adding the tags here alone changed nothing and the failure pointed at a
-# missing kernel rather than a missing list entry.
-#
-# Union across arches: this set is only used to answer "is this kid an MXFP8
-# BMM kernel at all", and the arch check has already happened in
-# get_kernel_instance by the time it is consulted.
 _A8W8_MXSCALE_BMM_TAGS = frozenset(
     tag
     for arch_families in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.values()
@@ -492,6 +482,7 @@ _A8W8_FAMILY_BY_TAG = {
     "a8w8": _A8W8_FAMILY,
     "a8w8_scale": _A8W8_BLOCKSCALE_FAMILY,
     "a8w8_blockscale_bpreshuffle_singlebuf": _A8W8_BPRESHUFFLE_FAMILY,
+    "a8w8_mxscale_gemm_bpreshuffle": _A8W8_BPRESHUFFLE_FAMILY,
     **{tag: _A8W8_MXSCALE_BMM_FAMILY for tag in _A8W8_MXSCALE_BMM_TAGS},
 }
 _A8W8_FAMILY_LAYOUT = {

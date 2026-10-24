@@ -1,0 +1,1730 @@
+{
+  "llvm_bin": "/root/toolchains/llvm-amdgpu-pin-op-dst-49c41889-build/bin",
+  "kernels": [
+    {
+      "kid": 9501,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_u2"
+    },
+    {
+      "kid": 9502,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_u2"
+    },
+    {
+      "kid": 9503,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k16384_ma1792_reset_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k16384_ma1792_reset_u2"
+    },
+    {
+      "kid": 9504,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_1x4_16x16x128_1x128x128_ma40960.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_1x4_16x16x128_1x128x128_ma40960"
+    },
+    {
+      "kid": 9505,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_1x4_16x16x128_1x128x128_ma2048.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_1x4_16x16x128_1x128x128_ma2048"
+    },
+    {
+      "kid": 9506,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_1x4_16x16x128_1x128x128_ma1984.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_1x4_16x16x128_1x128x128_ma1984"
+    },
+    {
+      "kid": 9507,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma256_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma256_u2"
+    },
+    {
+      "kid": 9508,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma256_reset_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma256_reset_u2"
+    },
+    {
+      "kid": 9509,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma64_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma64_u2"
+    },
+    {
+      "kid": 95010,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma64_u4.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma64_u4"
+    },
+    {
+      "kid": 95011,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k384_ma256_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k384_ma256_u2"
+    },
+    {
+      "kid": 95012,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp32_k3072_ma256_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp32_k3072_ma256_u2"
+    },
+    {
+      "kid": 95013,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k7168_ma256_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k7168_ma256_u2"
+    },
+    {
+      "kid": 95014,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k16384_ma256_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k16384_ma256_u2"
+    },
+    {
+      "kid": 95015,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k384_ma256_reset_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k384_ma256_reset_u2"
+    },
+    {
+      "kid": 95016,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp32_k3072_ma256_reset_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp32_k3072_ma256_reset_u2"
+    },
+    {
+      "kid": 95017,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k7168_ma256_reset_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k7168_ma256_reset_u2"
+    },
+    {
+      "kid": 95018,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k16384_ma256_reset_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k16384_ma256_reset_u2"
+    },
+    {
+      "kid": 95019,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k7168_ma16_u4.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k7168_ma16_u4"
+    },
+    {
+      "kid": 95020,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma1856_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma1856_u2"
+    },
+    {
+      "kid": 95021,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_ma65536_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_ma65536_u2"
+    },
+    {
+      "kid": 95022,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma1920_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma1920_u2"
+    },
+    {
+      "kid": 95023,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp32_k0_ma12288_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp32_k0_ma12288_u2"
+    },
+    {
+      "kid": 95024,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma28672_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma28672_u2"
+    },
+    {
+      "kid": 95025,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k0_ma1664_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k0_ma1664_u2"
+    },
+    {
+      "kid": 95026,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma1280_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma1280_u2"
+    },
+    {
+      "kid": 95027,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma57344_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma57344_u2"
+    },
+    {
+      "kid": 95028,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_ma57344_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_ma57344_u2"
+    },
+    {
+      "kid": 95029,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp32_k0_ma4096_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp32_k0_ma4096_u2"
+    },
+    {
+      "kid": 95030,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma1792_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma1792_u2"
+    },
+    {
+      "kid": 95031,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp32_k0_ma28672_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp32_k0_ma28672_u2"
+    },
+    {
+      "kid": 95032,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma4096_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma4096_u2"
+    },
+    {
+      "kid": 95033,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma49152_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma49152_u2"
+    },
+    {
+      "kid": 95034,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma10240_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma10240_u2"
+    },
+    {
+      "kid": 95035,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_ma28672_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_ma28672_u2"
+    },
+    {
+      "kid": 95036,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma65536_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma65536_u2"
+    },
+    {
+      "kid": 95037,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k0_ma1984_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k0_ma1984_u2"
+    },
+    {
+      "kid": 95038,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma1984_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_ma1984_u2"
+    },
+    {
+      "kid": 95039,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma6144_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma6144_u2"
+    },
+    {
+      "kid": 95040,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp32_k0_ma32768_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp32_k0_ma32768_u2"
+    },
+    {
+      "kid": 95041,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma32768_u2.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp16_k0_ma32768_u2"
+    },
+    {
+      "kid": 95042,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_u2_wide"
+    },
+    {
+      "kid": 95043,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_u2_wide"
+    },
+    {
+      "kid": 95044,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_gm4_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_gm4_u2_wide"
+    },
+    {
+      "kid": 95045,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_gm4_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_gm4_u2_wide"
+    },
+    {
+      "kid": 95046,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_gm8_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_gm8_u2_wide"
+    },
+    {
+      "kid": 95047,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_gm8_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_gm8_u2_wide"
+    },
+    {
+      "kid": 95048,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_gm16_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm0_sp64_k0_gm16_u2_wide"
+    },
+    {
+      "kid": 95049,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_gm16_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k0_gm16_u2_wide"
+    },
+    {
+      "kid": 95050,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x128x128_4x2_16x16x128_1x128x128_sp16_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x128x128_4x2_16x16x128_1x128x128_sp16_vf0"
+    },
+    {
+      "kid": 95051,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x128x128_4x2_16x16x128_1x128x128_sp16_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x128x128_4x2_16x16x128_1x128x128_sp16_vf1"
+    },
+    {
+      "kid": 95052,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x128x128_4x2_16x16x128_1x128x128_sp128_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x128x128_4x2_16x16x128_1x128x128_sp128_vf0"
+    },
+    {
+      "kid": 95053,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x128x128_4x2_16x16x128_1x128x128_sp128_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x128x128_4x2_16x16x128_1x128x128_sp128_vf1"
+    },
+    {
+      "kid": 95054,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp16_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp16_vf0"
+    },
+    {
+      "kid": 95055,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp16_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp16_vf1"
+    },
+    {
+      "kid": 95056,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_vf0"
+    },
+    {
+      "kid": 95057,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_vf1"
+    },
+    {
+      "kid": 95058,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x128x128_4x2_16x16x128_1x128x128_sp16_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x128x128_4x2_16x16x128_1x128x128_sp16_vf0"
+    },
+    {
+      "kid": 95059,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x128x128_4x2_16x16x128_1x128x128_sp16_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x128x128_4x2_16x16x128_1x128x128_sp16_vf1"
+    },
+    {
+      "kid": 95060,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x128x128_4x2_16x16x128_1x128x128_sp128_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x128x128_4x2_16x16x128_1x128x128_sp128_vf0"
+    },
+    {
+      "kid": 95061,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x128x128_4x2_16x16x128_1x128x128_sp128_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x128x128_4x2_16x16x128_1x128x128_sp128_vf1"
+    },
+    {
+      "kid": 95062,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_vf0"
+    },
+    {
+      "kid": 95063,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_vf1"
+    },
+    {
+      "kid": 95064,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp128_k0_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp128_k0_vf0"
+    },
+    {
+      "kid": 95065,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp128_k0_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp128_k0_vf1"
+    },
+    {
+      "kid": 95066,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B0C0"
+    },
+    {
+      "kid": 95067,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x64x256x128_2x2_16x16x128_1x128x128_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x64x256x128_2x2_16x16x128_1x128x128_vf0"
+    },
+    {
+      "kid": 95068,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x64x256x128_2x2_16x16x128_1x128x128_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x64x256x128_2x2_16x16x128_1x128x128_vf1"
+    },
+    {
+      "kid": 95069,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x96x128x128_2x2_16x16x128_1x128x128_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x96x128x128_2x2_16x16x128_1x128x128_vf0"
+    },
+    {
+      "kid": 95070,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x96x128x128_2x2_16x16x128_1x128x128_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x96x128x128_2x2_16x16x128_1x128x128_vf1"
+    },
+    {
+      "kid": 95071,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x96x256x128_2x2_16x16x128_1x128x128_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x96x256x128_2x2_16x16x128_1x128x128_vf0"
+    },
+    {
+      "kid": 95072,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x96x256x128_2x2_16x16x128_1x128x128_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x96x256x128_2x2_16x16x128_1x128x128_vf1"
+    },
+    {
+      "kid": 95073,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf0_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf0_pinA0B0C0"
+    },
+    {
+      "kid": 95074,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B0C0"
+    },
+    {
+      "kid": 95075,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_gm4_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_gm4_vf0"
+    },
+    {
+      "kid": 95076,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_gm4_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_gm4_vf1"
+    },
+    {
+      "kid": 95077,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_gm8_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_gm8_vf0"
+    },
+    {
+      "kid": 95078,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_gm8_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x128x256x128_4x2_16x16x128_1x128x128_sp128_gm8_vf1"
+    },
+    {
+      "kid": 95079,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_gm4_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_gm4_vf0"
+    },
+    {
+      "kid": 95080,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_gm4_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_gm4_vf1"
+    },
+    {
+      "kid": 95081,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_gm8_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_gm8_vf0"
+    },
+    {
+      "kid": 95082,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_gm8_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k0_gm8_vf1"
+    },
+    {
+      "kid": 95083,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm4_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm4_vf0"
+    },
+    {
+      "kid": 95084,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm4_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm4_vf1"
+    },
+    {
+      "kid": 95085,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm8_vf0.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm8_vf0"
+    },
+    {
+      "kid": 95086,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm8_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm8_vf1"
+    },
+    {
+      "kid": 95087,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf0_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf0_pinA0B0C0"
+    },
+    {
+      "kid": 95088,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA0B0C0"
+    },
+    {
+      "kid": 95089,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p4_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p4_vf0"
+    },
+    {
+      "kid": 95090,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1"
+    },
+    {
+      "kid": 95091,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p3_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p3_vf0"
+    },
+    {
+      "kid": 95092,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1"
+    },
+    {
+      "kid": 95093,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p6_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p6_vf0"
+    },
+    {
+      "kid": 95094,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p6_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p6_vf1"
+    },
+    {
+      "kid": 95095,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k768_p4_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k768_p4_vf0"
+    },
+    {
+      "kid": 95096,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1"
+    },
+    {
+      "kid": 95097,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_512x128x256x128_1x8_16x16x128_1x128x128_k768_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_512x128x256x128_1x8_16x16x128_1x128x128_k768_vf0"
+    },
+    {
+      "kid": 95098,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_512x128x256x128_1x8_16x16x128_1x128x128_k768_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_512x128x256x128_1x8_16x16x128_1x128x128_k768_vf1"
+    },
+    {
+      "kid": 95099,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf0_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf0_pinA0B0C0"
+    },
+    {
+      "kid": 950100,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA0B0C0"
+    },
+    {
+      "kid": 950101,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf0"
+    },
+    {
+      "kid": 950102,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1"
+    },
+    {
+      "kid": 950103,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p3_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p3_vf0"
+    },
+    {
+      "kid": 950104,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p3_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p3_vf1"
+    },
+    {
+      "kid": 950105,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p6_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p6_vf0"
+    },
+    {
+      "kid": 950106,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p6_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p6_vf1"
+    },
+    {
+      "kid": 950107,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf0"
+    },
+    {
+      "kid": 950108,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1"
+    },
+    {
+      "kid": 950109,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_512x128x256x128_1x8_16x16x128_1x128x128_k7168_vf0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_512x128x256x128_1x8_16x16x128_1x128x128_k7168_vf0"
+    },
+    {
+      "kid": 950110,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_512x128x256x128_1x8_16x16x128_1x128x128_k7168_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_512x128x256x128_1x8_16x16x128_1x128x128_k7168_vf1"
+    },
+    {
+      "kid": 950111,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_pinA0B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_pinA0B0C1"
+    },
+    {
+      "kid": 950112,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x64x64x128_1x2_16x16x128_1x128x128_p6_c0x0x2.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x64x64x128_1x2_16x16x128_1x128x128_p6_c0x0x2"
+    },
+    {
+      "kid": 950113,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c0x0x2_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c0x0x2_pinA0B0C0"
+    },
+    {
+      "kid": 950114,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c0x0x2_pinA0B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c0x0x2_pinA0B0C1"
+    },
+    {
+      "kid": 950115,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c0x0x2_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c0x0x2_pinA1B0C1"
+    },
+    {
+      "kid": 950116,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x128x128_1x4_16x16x128_1x128x128.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x128x128_1x4_16x16x128_1x128x128"
+    },
+    {
+      "kid": 950117,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x64x64x128_1x2_16x16x128_1x128x128_p6_c1x17x2.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x64x64x128_1x2_16x16x128_1x128x128_p6_c1x17x2"
+    },
+    {
+      "kid": 950118,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c1x17x2_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c1x17x2_pinA1B0C1"
+    },
+    {
+      "kid": 950119,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c17x1x2_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c17x1x2_pinA1B0C1"
+    },
+    {
+      "kid": 950120,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA1B1C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA1B1C1_frag"
+    },
+    {
+      "kid": 950121,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA1B1C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA1B1C1_frag"
+    },
+    {
+      "kid": 950122,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k384_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k384_vf1"
+    },
+    {
+      "kid": 950123,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k768_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k768_vf1"
+    },
+    {
+      "kid": 950124,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k1536_vf1.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x192x256x128_4x2_16x16x128_1x128x128_sp16_k1536_vf1"
+    },
+    {
+      "kid": 950125,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B1C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B1C1_frag"
+    },
+    {
+      "kid": 950126,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B1C1_bounded_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B1C1_bounded_frag"
+    },
+    {
+      "kid": 950127,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p4_vf1_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p4_vf1_pinA0B0C0"
+    },
+    {
+      "kid": 950128,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p4_vf1_pinA0B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p4_vf1_pinA0B0C0_contig"
+    },
+    {
+      "kid": 950129,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p2_vf1_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p2_vf1_pinA0B0C0"
+    },
+    {
+      "kid": 950130,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p2_vf1_pinA0B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p2_vf1_pinA0B0C0_contig"
+    },
+    {
+      "kid": 950131,
+      "status": "ready",
+      "vgpr_count": 420,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA0B0C1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA0B0C1_contig"
+    },
+    {
+      "kid": 950132,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA0B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA0B0C0_contig"
+    },
+    {
+      "kid": 950133,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_gm4_pinA0B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_gm4_pinA0B0C1"
+    },
+    {
+      "kid": 950134,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_gm8_c0x0x2_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_gm8_c0x0x2_pinA1B0C1"
+    },
+    {
+      "kid": 950135,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8"
+    },
+    {
+      "kid": 950136,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k1536_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k1536_u2_wide"
+    },
+    {
+      "kid": 950137,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k1536_gm8_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k1536_gm8_u2_wide"
+    },
+    {
+      "kid": 950138,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k384_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp16_k384_u2_wide"
+    },
+    {
+      "kid": 950139,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k384_p4_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k384_p4_vf1"
+    },
+    {
+      "kid": 950140,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k768_p2_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k768_p2_vf1"
+    },
+    {
+      "kid": 950141,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k7168_gm8_u2_wide.co",
+      "symbol": "opus_gemm_gfx950_4wave_pin_agpr_co_256x256x256x128_2x2_16x16x128_1x128x128_pm1_sp64_k7168_gm8_u2_wide"
+    },
+    {
+      "kid": 950142,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x48x64x256_1x2_16x16x128_1x128x128.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x48x64x256_1x2_16x16x128_1x128x128"
+    },
+    {
+      "kid": 950143,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x64x64x256_1x2_16x16x128_1x128x128_pinA0B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x64x64x256_1x2_16x16x128_1x128x128_pinA0B0C1"
+    },
+    {
+      "kid": 950144,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x64x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1"
+    },
+    {
+      "kid": 950145,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1_pinA0B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1_pinA0B0C0_contig"
+    },
+    {
+      "kid": 950146,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_pinA0B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_pinA0B0C0_contig"
+    },
+    {
+      "kid": 950147,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA0B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA0B0C0_contig"
+    },
+    {
+      "kid": 950148,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_contig"
+    },
+    {
+      "kid": 950149,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x80x64x128_1x2_16x16x128_1x128x128_p4_c0x0x2_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x80x64x128_1x2_16x16x128_1x128x128_p4_c0x0x2_pinA1B0C1"
+    },
+    {
+      "kid": 950150,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x80x64x256_1x4_16x16x128_1x128x128.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x80x64x256_1x4_16x16x128_1x128x128"
+    },
+    {
+      "kid": 950151,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x80x64x128_1x2_16x16x128_1x128x128_p4_c17x1x2_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x80x64x128_1x2_16x16x128_1x128x128_p4_c17x1x2_pinA1B0C1"
+    },
+    {
+      "kid": 950152,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x80x64x128_1x2_16x16x128_1x128x128_p5_c0x0x2_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x80x64x128_1x2_16x16x128_1x128x128_p5_c0x0x2_pinA1B0C1"
+    },
+    {
+      "kid": 950153,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x112x64x128_1x2_16x16x128_1x128x128.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x112x64x128_1x2_16x16x128_1x128x128"
+    },
+    {
+      "kid": 950154,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pub1_pinA1B1C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pub1_pinA1B1C1_frag"
+    },
+    {
+      "kid": 950155,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA1B1C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA1B1C1_frag"
+    },
+    {
+      "kid": 950156,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_o2_pub0_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_o2_pub0_pinA1B0C1"
+    },
+    {
+      "kid": 950157,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_o2_pub1_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_o2_pub1_pinA1B0C1"
+    },
+    {
+      "kid": 950158,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub0_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub0_pinA1B0C1"
+    },
+    {
+      "kid": 950159,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub1_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub1_pinA1B0C1"
+    },
+    {
+      "kid": 950160,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub0_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub0_pinA1B0C1"
+    },
+    {
+      "kid": 950161,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub1_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub1_pinA1B0C1"
+    },
+    {
+      "kid": 9502667,
+      "status": "ready",
+      "vgpr_count": 128,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_pinA0B0C0"
+    },
+    {
+      "kid": 9502668,
+      "status": "ready",
+      "vgpr_count": 128,
+      "agpr_count": 24,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_pinA1B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_pinA1B0C0"
+    },
+    {
+      "kid": 9502669,
+      "status": "ready",
+      "vgpr_count": 232,
+      "agpr_count": 152,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p4_pinA1B0C1"
+    },
+    {
+      "kid": 9502670,
+      "status": "ready",
+      "vgpr_count": 184,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c0x0x2_pinA1B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_c0x0x2_pinA1B0C0"
+    },
+    {
+      "kid": 9502671,
+      "status": "ready",
+      "vgpr_count": 190,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_gm8_c0x0x2_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_gm8_c0x0x2_pinA0B0C0"
+    },
+    {
+      "kid": 9502672,
+      "status": "ready",
+      "vgpr_count": 184,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_gm8_c0x0x2_pinA1B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_gm8_c0x0x2_pinA1B0C0"
+    },
+    {
+      "kid": 9502673,
+      "status": "ready",
+      "vgpr_count": 308,
+      "agpr_count": 176,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_gm8_c0x0x2_pinA0B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x128x128_1x4_16x16x128_1x128x128_gm8_c0x0x2_pinA0B0C1"
+    },
+    {
+      "kid": 9502674,
+      "status": "ready",
+      "vgpr_count": 228,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_pinA1B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_pinA1B0C0_contig"
+    },
+    {
+      "kid": 9502675,
+      "status": "ready",
+      "vgpr_count": 340,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_pinA0B0C1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_pinA0B0C1_contig"
+    },
+    {
+      "kid": 9502676,
+      "status": "ready",
+      "vgpr_count": 292,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_pinA1B0C1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p3_vf1_pinA1B0C1_contig"
+    },
+    {
+      "kid": 9502677,
+      "status": "ready",
+      "vgpr_count": 212,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA1B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA1B0C0_contig"
+    },
+    {
+      "kid": 9502678,
+      "status": "ready",
+      "vgpr_count": 340,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA0B0C1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA0B0C1_contig"
+    },
+    {
+      "kid": 9502679,
+      "status": "ready",
+      "vgpr_count": 292,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA1B0C1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k768_p4_vf1_pinA1B0C1_contig"
+    },
+    {
+      "kid": 9502680,
+      "status": "ready",
+      "vgpr_count": 228,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1_pinA1B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1_pinA1B0C0_contig"
+    },
+    {
+      "kid": 9502681,
+      "status": "ready",
+      "vgpr_count": 340,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1_pinA0B0C1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1_pinA0B0C1_contig"
+    },
+    {
+      "kid": 9502682,
+      "status": "ready",
+      "vgpr_count": 292,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1_pinA1B0C1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k384_p3_vf1_pinA1B0C1_contig"
+    },
+    {
+      "kid": 9502683,
+      "status": "ready",
+      "vgpr_count": 224,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x64x64x256_1x2_16x16x128_1x128x128_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x64x64x256_1x2_16x16x128_1x128x128_pinA0B0C0"
+    },
+    {
+      "kid": 9502684,
+      "status": "ready",
+      "vgpr_count": 232,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x64x64x256_1x2_16x16x128_1x128x128_pinA1B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x64x64x256_1x2_16x16x128_1x128x128_pinA1B0C0"
+    },
+    {
+      "kid": 9502685,
+      "status": "ready",
+      "vgpr_count": 288,
+      "agpr_count": 160,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x64x64x256_1x2_16x16x128_1x128x128_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x64x64x256_1x2_16x16x128_1x128x128_pinA1B0C1"
+    },
+    {
+      "kid": 9502686,
+      "status": "ready",
+      "vgpr_count": 256,
+      "agpr_count": 48,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA1B0C0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA1B0C0_contig"
+    },
+    {
+      "kid": 9502687,
+      "status": "ready",
+      "vgpr_count": 420,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA0B0C1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA0B0C1_contig"
+    },
+    {
+      "kid": 9502688,
+      "status": "ready",
+      "vgpr_count": 296,
+      "agpr_count": 224,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA1B0C1_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x96x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf1_pinA1B0C1_contig"
+    },
+    {
+      "kid": 9502689,
+      "status": "ready",
+      "vgpr_count": 214,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub0_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub0_pinA0B0C0"
+    },
+    {
+      "kid": 9502690,
+      "status": "ready",
+      "vgpr_count": 216,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub0_pinA1B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub0_pinA1B0C0"
+    },
+    {
+      "kid": 9502691,
+      "status": "ready",
+      "vgpr_count": 348,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub0_pinA0B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub0_pinA0B0C1"
+    },
+    {
+      "kid": 9502692,
+      "status": "ready",
+      "vgpr_count": 214,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub1_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub1_pinA0B0C0"
+    },
+    {
+      "kid": 9502693,
+      "status": "ready",
+      "vgpr_count": 216,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub1_pinA1B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub1_pinA1B0C0"
+    },
+    {
+      "kid": 9502694,
+      "status": "ready",
+      "vgpr_count": 348,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub1_pinA0B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o2_pub1_pinA0B0C1"
+    },
+    {
+      "kid": 9502695,
+      "status": "ready",
+      "vgpr_count": 214,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub0_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub0_pinA0B0C0"
+    },
+    {
+      "kid": 9502696,
+      "status": "ready",
+      "vgpr_count": 216,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub0_pinA1B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub0_pinA1B0C0"
+    },
+    {
+      "kid": 9502697,
+      "status": "ready",
+      "vgpr_count": 340,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub0_pinA0B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub0_pinA0B0C1"
+    },
+    {
+      "kid": 9502698,
+      "status": "ready",
+      "vgpr_count": 214,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub1_pinA0B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub1_pinA0B0C0"
+    },
+    {
+      "kid": 9502699,
+      "status": "ready",
+      "vgpr_count": 216,
+      "agpr_count": 64,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub1_pinA1B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub1_pinA1B0C0"
+    },
+    {
+      "kid": 9502700,
+      "status": "ready",
+      "vgpr_count": 340,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub1_pinA0B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_overlap_co_256x128x128x128_1x4_16x16x128_1x128x128_gm8_o0_pub1_pinA0B0C1"
+    },
+    {
+      "kid": 9502701,
+      "status": "ready",
+      "vgpr_count": 150,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B0C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B0C0_frag"
+    },
+    {
+      "kid": 9502702,
+      "status": "ready",
+      "vgpr_count": 152,
+      "agpr_count": 24,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA1B0C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA1B0C0_frag"
+    },
+    {
+      "kid": 9502703,
+      "status": "ready",
+      "vgpr_count": 216,
+      "agpr_count": 96,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B1C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B1C0_frag"
+    },
+    {
+      "kid": 9502704,
+      "status": "ready",
+      "vgpr_count": 192,
+      "agpr_count": 96,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA1B1C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA1B1C0_frag"
+    },
+    {
+      "kid": 9502705,
+      "status": "ready",
+      "vgpr_count": 280,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B0C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B0C1_frag"
+    },
+    {
+      "kid": 9502706,
+      "status": "ready",
+      "vgpr_count": 256,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA1B0C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA1B0C1_frag"
+    },
+    {
+      "kid": 9502707,
+      "status": "ready",
+      "vgpr_count": 248,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B1C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k0_pinA0B1C1_frag"
+    },
+    {
+      "kid": 9502708,
+      "status": "ready",
+      "vgpr_count": 250,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B0C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B0C0_frag"
+    },
+    {
+      "kid": 9502709,
+      "status": "ready",
+      "vgpr_count": 252,
+      "agpr_count": 24,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA1B0C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA1B0C0_frag"
+    },
+    {
+      "kid": 9502710,
+      "status": "ready",
+      "vgpr_count": 316,
+      "agpr_count": 128,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B1C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B1C0_frag"
+    },
+    {
+      "kid": 9502711,
+      "status": "ready",
+      "vgpr_count": 292,
+      "agpr_count": 128,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA1B1C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA1B1C0_frag"
+    },
+    {
+      "kid": 9502712,
+      "status": "ready",
+      "vgpr_count": 380,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B0C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B0C1_frag"
+    },
+    {
+      "kid": 9502713,
+      "status": "ready",
+      "vgpr_count": 356,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA1B0C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA1B0C1_frag"
+    },
+    {
+      "kid": 9502714,
+      "status": "ready",
+      "vgpr_count": 316,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B1C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_vf1_pinA0B1C1_frag"
+    },
+    {
+      "kid": 9502715,
+      "status": "ready",
+      "vgpr_count": 150,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA0B0C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA0B0C0_frag"
+    },
+    {
+      "kid": 9502716,
+      "status": "ready",
+      "vgpr_count": 152,
+      "agpr_count": 24,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B0C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B0C0_frag"
+    },
+    {
+      "kid": 9502717,
+      "status": "ready",
+      "vgpr_count": 216,
+      "agpr_count": 96,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA0B1C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA0B1C0_frag"
+    },
+    {
+      "kid": 9502718,
+      "status": "ready",
+      "vgpr_count": 192,
+      "agpr_count": 96,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B1C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B1C0_frag"
+    },
+    {
+      "kid": 9502719,
+      "status": "ready",
+      "vgpr_count": 280,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA0B0C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA0B0C1_frag"
+    },
+    {
+      "kid": 9502720,
+      "status": "ready",
+      "vgpr_count": 256,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B0C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA1B0C1_frag"
+    },
+    {
+      "kid": 9502721,
+      "status": "ready",
+      "vgpr_count": 248,
+      "agpr_count": 192,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA0B1C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x128x128_2x2_16x16x128_1x128x128_k7168_pinA0B1C1_frag"
+    },
+    {
+      "kid": 9502722,
+      "status": "ready",
+      "vgpr_count": 252,
+      "agpr_count": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA0B0C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA0B0C0_frag"
+    },
+    {
+      "kid": 9502723,
+      "status": "ready",
+      "vgpr_count": 252,
+      "agpr_count": 24,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA1B0C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA1B0C0_frag"
+    },
+    {
+      "kid": 9502724,
+      "status": "ready",
+      "vgpr_count": 316,
+      "agpr_count": 128,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA0B1C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA0B1C0_frag"
+    },
+    {
+      "kid": 9502725,
+      "status": "ready",
+      "vgpr_count": 292,
+      "agpr_count": 128,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA1B1C0_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA1B1C0_frag"
+    },
+    {
+      "kid": 9502726,
+      "status": "ready",
+      "vgpr_count": 380,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA0B0C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA0B0C1_frag"
+    },
+    {
+      "kid": 9502727,
+      "status": "ready",
+      "vgpr_count": 356,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA1B0C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA1B0C1_frag"
+    },
+    {
+      "kid": 9502728,
+      "status": "ready",
+      "vgpr_count": 316,
+      "agpr_count": 256,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "private_segment_fixed_size": 0,
+      "image": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA0B1C1_frag.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_256x128x256x128_2x2_16x16x128_1x128x128_pub1_vf1_pinA0B1C1_frag"
+    },
+    {
+      "kid": 9502729,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_vf0_bounded.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_vf0_bounded"
+    },
+    {
+      "kid": 9502730,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm8_vf0_bounded.co",
+      "symbol": "opus_gemm_gfx950_m_repeat_co_512x256x256x128_4x2_16x16x128_1x128x128_gm8_vf0_bounded"
+    },
+    {
+      "kid": 9502731,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_interleave_co_512x256x256x256_2x4_16x16x128_1x128x128_c0x0_xcd.co",
+      "symbol": "opus_gemm_gfx950_interleave_co_512x256x256x256_2x4_16x16x128_1x128x128_c0x0_xcd"
+    },
+    {
+      "kid": 9502732,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_interleave_co_512x256x256x256_2x4_16x16x128_1x128x128_c0x0.co",
+      "symbol": "opus_gemm_gfx950_interleave_co_512x256x256x256_2x4_16x16x128_1x128x128_c0x0"
+    },
+    {
+      "kid": 9502733,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_interleave_co_512x192x256x256_2x4_16x16x128_1x128x128_c0x0.co",
+      "symbol": "opus_gemm_gfx950_interleave_co_512x192x256x256_2x4_16x16x128_1x128x128_c0x0"
+    },
+    {
+      "kid": 9502734,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_interleave_co_512x256x256x256_2x4_16x16x128_1x128x128_c1x17_xcd.co",
+      "symbol": "opus_gemm_gfx950_interleave_co_512x256x256x256_2x4_16x16x128_1x128x128_c1x17_xcd"
+    },
+    {
+      "kid": 9502735,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_interleave_co_512x192x256x256_2x4_16x16x128_1x128x128_c1x17.co",
+      "symbol": "opus_gemm_gfx950_interleave_co_512x192x256x256_2x4_16x16x128_1x128x128_c1x17"
+    },
+    {
+      "kid": 9502736,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_interleave_co_256x128x256x256_2x2_16x16x128_1x128x128.co",
+      "symbol": "opus_gemm_gfx950_interleave_co_256x128x256x256_2x2_16x16x128_1x128x128"
+    },
+    {
+      "kid": 9502737,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf0_contig.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_256x128x256x128_1x4_16x16x128_1x128x128_k7168_p4_vf0_contig"
+    },
+    {
+      "kid": 9502738,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x64x64x128_1x2_16x16x128_1x128x128_p5_c0x0x2.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x64x64x128_1x2_16x16x128_1x128x128_p5_c0x0x2"
+    },
+    {
+      "kid": 9502739,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x80x64x128_1x2_16x16x128_1x128x128_p5_c0x0x2_pinA1B0C0.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x80x64x128_1x2_16x16x128_1x128x128_p5_c0x0x2_pinA1B0C0"
+    },
+    {
+      "kid": 9502740,
+      "status": "ready",
+      "image": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p5_pinA1B0C1.co",
+      "symbol": "opus_gemm_gfx950_b_vgpr_co_128x48x64x128_1x2_16x16x128_1x128x128_p5_pinA1B0C1"
+    }
+  ]
+}
