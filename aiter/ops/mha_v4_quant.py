@@ -11,6 +11,7 @@ from torch import Tensor
 
 from aiter import dtypes
 from aiter.jit.core import compile_ops
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     mha_v4_per_tensor_amax_kernel,
     mha_v4_per_tensor_quant_kernel,
@@ -168,13 +169,36 @@ def _quantize_v_mxfp4_fp6_p_hip(
     """Pack MXFP4 V in the contraction order required by an FP6 P operand."""
 
 
-def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, int]:
-    # The producers read rows through the batch, sequence and head strides, so only a row's 128
-    # channels have to be contiguous.
-    if input.dim() != 4 or input.shape[-1] != 128 or input.stride(-1) != 1:
+def _validate_hip_row_layout_impl(input: Tensor, operation: str) -> None:
+    if input.dim() < 1 or input.shape[-1] != 128 or input.stride(-1) != 1:
         raise ValueError(
-            f"{operation} requires hd128 BSHD input with a contiguous last dimension"
+            f"{operation} requires hd128 input with a contiguous last dimension"
         )
+    if input.data_ptr() % 16:
+        raise ValueError(f"{operation} input must start on a 16-byte boundary")
+    if input.dim() == 4:
+        element_size = input.element_size()
+        if any(
+            input.shape[dimension] != 1 and input.stride(dimension) * element_size % 16
+            for dimension in range(3)
+        ):
+            raise ValueError(
+                f"{operation} input batch, sequence and head strides must be "
+                "multiples of 16 bytes"
+            )
+    elif not input.is_contiguous():
+        raise ValueError(f"{operation} input that is not BSHD must be contiguous")
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=lambda input, operation: None)
+def _validate_hip_row_layout(input: Tensor, operation: str) -> None:
+    _validate_hip_row_layout_impl(input, operation)
+
+
+def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, int]:
+    if input.dim() != 4:
+        raise ValueError(f"{operation} requires hd128 BSHD input")
+    _validate_hip_row_layout_impl(input, operation)
     return input.shape
 
 
@@ -288,10 +312,7 @@ def quantize_fp8_rotated(
     The rotation kernel emits the amax as it goes, so this costs two passes over the tensor
     rather than three.
     """
-    if input.shape[-1] != 128 or input.stride(-1) != 1:
-        raise ValueError(
-            "rotated FP8 quantization requires hd128 input with a contiguous last dimension"
-        )
+    _validate_hip_row_layout(input, "rotated FP8 quantization")
     rotated = input.new_empty(input.shape)
     blocks = triton.cdiv(input.numel() // 128, MHA_V4_ROTATE_ROWS_PER_BLOCK)
     partial = input.new_empty((blocks,), dtype=torch.float32)

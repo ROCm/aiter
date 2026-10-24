@@ -611,6 +611,19 @@ _STRIDED_QUANTIZERS = {
     "v_mxfp6": lambda x, mean: quantize_v_mxfp6(x),
     "v_mxfp6_fp6_p": lambda x, mean: quantize_v_mxfp6_fp6_p(x),
 }
+_HIP_ROW_LAYOUT_QUANTIZERS = {
+    "fp8_rotated": lambda x: quantize_fp8_rotated(x),
+    "mxfp8_q": lambda x: quantize_mxfp8_q(x, 0.127),
+    "mxfp8_k": lambda x: quantize_mxfp8_k(x),
+    "mxfp4_q": lambda x: quantize_mxfp4_q(x, 0.127),
+    "mxfp4_k": lambda x: quantize_mxfp4_k(x),
+    "mxfp6_q": lambda x: quantize_mxfp6_q(x, 0.127),
+    "mxfp6_k": lambda x: quantize_mxfp6_k(x),
+    "v_fp8": quantize_v_fp8,
+    "v_mxfp4_fp6_p": quantize_v_mxfp4_fp6_p,
+    "v_mxfp6": quantize_v_mxfp6,
+    "v_mxfp6_fp6_p": quantize_v_mxfp6_fp6_p,
+}
 _GFX942_STRIDED_QUANTIZERS = {"int8", "fp8", "fp8_rotated", "v_fp8"}
 _GFX942_DENSE_ROWS = {
     (AttentionFormat.FP8,) * 3,
@@ -643,6 +656,35 @@ def test_mha_v4_quantizers_read_strided_views_like_contiguous_input(
         expected = _STRIDED_QUANTIZERS[quantizer](dense, mean)
         actual = _STRIDED_QUANTIZERS[quantizer](value, mean)
         assert _bitwise_equal(actual, expected)
+
+
+@pytest.mark.parametrize("quantizer", list(_HIP_ROW_LAYOUT_QUANTIZERS))
+@pytest.mark.parametrize(
+    ("layout", "message"),
+    [
+        ("misaligned_pointer", "start on a 16-byte boundary"),
+        ("misaligned_outer_stride", "strides must be multiples of 16 bytes"),
+    ],
+)
+def test_mha_v4_hip_quantizers_reject_unsupported_bshd_layouts(
+    quantizer, layout, message
+):
+    row = 136 if layout == "misaligned_pointer" else 129
+    storage = torch.randn((1, 128, 2, row), device="cuda", dtype=torch.bfloat16)
+    value = (
+        storage[..., 1:129] if layout == "misaligned_pointer" else storage[..., :128]
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _HIP_ROW_LAYOUT_QUANTIZERS[quantizer](value)
+
+
+def test_mha_v4_rotated_fp8_rejects_noncontiguous_non_bshd_input():
+    value = torch.randn((2, 3, 128), device="cuda", dtype=torch.bfloat16)
+    value = value.transpose(0, 1)
+
+    with pytest.raises(ValueError, match="not BSHD must be contiguous"):
+        quantize_fp8_rotated(value)
 
 
 @pytest.mark.skipif(
