@@ -547,6 +547,97 @@ def test_triton_unified_attn_3d(
     )
 
 
+@pytest.mark.parametrize("seq_lens", [[(1, 1328), (1, 523), (1, 37), (1, 2011)]])
+@pytest.mark.parametrize("num_heads", [(16, 8), (32, 4)])
+@pytest.mark.parametrize("head_size", [64, 128, 256, 512])
+@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize("soft_cap", [None, 50.0])
+@torch.inference_mode()
+def test_triton_unified_attn_decode_page_size_1(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: int | None,
+    soft_cap: float | None,
+) -> None:
+    """bf16 decode with one token per KV page, so each tile spans many pages."""
+    query_lens = [x[0] for x in seq_lens]
+    (
+        query,
+        key_cache,
+        value_cache,
+        _,
+        _,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        block_size=1,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+    )
+
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output,
+            ref_output.to(torch.bfloat16),
+            atol=1.5e-2,
+            rtol=1e-2,
+            tol_err_ratio=tol_err_ratio,
+            msg="unified_attn decode output",
+        )
+        <= tol_err_ratio
+    )
+
+
 @pytest.mark.parametrize(
     "seq_lens",
     [
