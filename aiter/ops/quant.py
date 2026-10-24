@@ -816,6 +816,10 @@ def dynamic_per_group_scaled_quant(
     (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
     sizes.
 
+    For MXFP8 (fp8 output, e8m0 scales), NaN elements stay NaN and do not
+    affect the scale. A group holding an Inf gets scale 2^127 (0xFE): its Inf
+    becomes an FP8 NaN and its finite elements are scaled as usual.
+
     Only ``group_size`` in {32, 64, 128} is supported.
 
     ``scale_layout_m32k4=True`` (fp8 output, e8m0 scale, ``group_size == 32``)
