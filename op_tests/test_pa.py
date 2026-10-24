@@ -19,6 +19,15 @@ from aiter.test_common import (
     tensor_load,
 )
 
+# gfx950-only: aiter.pa_decode_opus raises on anything else, so the arch has to
+# gate the call. Mirrors the op's own check so the two cannot disagree.
+try:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    HAS_OPUS_PA_DECODE = torch.cuda.is_available() and get_gfx_runtime() == "gfx950"
+except Exception:  # noqa: BLE001
+    HAS_OPUS_PA_DECODE = False
+
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
@@ -406,6 +415,20 @@ def run_aiter_asm(
 
 
 @perftest()
+def run_aiter_opus(
+    query,
+    k_cache,
+    v_cache,
+    block_tables,
+    seq_lens,
+    scale,
+):
+    # Unlike the asm path this one is handed `query` as-is, so the non-contiguous
+    # stride that test_paged_attention builds is part of what gets exercised.
+    return aiter.pa_decode_opus(query, k_cache, v_cache, block_tables, seq_lens, scale)
+
+
+@perftest()
 def run_aiter_common(
     query,
     k_cache,
@@ -670,6 +693,7 @@ def test_paged_attention(
     # tensor_dump(out_aiter, 'out_aiter')
 
     time_aiter_asm = None
+    time_aiter_asm_bf16 = None
     if dtype == dtypes.bf16:
         out_aiter_asm, time_aiter_asm = run_aiter_asm(
             query.contiguous(),  # this kernel need contiguous buffer
@@ -690,7 +714,36 @@ def test_paged_attention(
             out_aiter_asm,
             msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......",
         )
+        # time_aiter_asm is reassigned by the quantized-cache runs below, so the
+        # summary would otherwise report an fp8/int8 time next to the bf16 ones.
+        time_aiter_asm_bf16 = time_aiter_asm
         # tensor_dump(out_aiter, 'out_aiter')
+
+    # OPUS decode kernel: gfx950, bf16, head_size 128, page 16, GQA <= 16, no
+    # alibi -- everything outside that envelope is skipped.
+    time_aiter_opus = None
+    if (
+        HAS_OPUS_PA_DECODE
+        and dtype == dtypes.bf16
+        and kv_cache_dtype == "auto"
+        and head_size == 128
+        and block_size == 16
+        and num_queries_per_kv <= 16
+        and alibi_slopes is None
+    ):
+        out_aiter_opus, time_aiter_opus = run_aiter_opus(
+            query,
+            k_cache,
+            v_cache,
+            block_tables,
+            seq_lens,
+            scale,
+        )
+        checkAllclose(
+            out_golden,
+            out_aiter_opus,
+            msg=f"golden vs aiter_opus:{time_aiter_opus:>8.2f} us......",
+        )
 
     # Test paged_attention_common which automatically switches between ASM and HIP
     # The routing is internal, so we just test the common API regardless of which path it takes
@@ -968,6 +1021,8 @@ def test_paged_attention(
     return {
         "aiter_shomy": time_aiter,
         "aiter_asm": time_aiter_asm,
+        "aiter_asm_bf16": time_aiter_asm_bf16,
+        "aiter_opus": time_aiter_opus,
         "aiter_common": time_aiter_common,
     }
 
