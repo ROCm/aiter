@@ -337,9 +337,13 @@ def build_moe_apre_fused_quant_scatter_module(
         # it. All launched workgroups are resident, so this atomic spin barrier
         # cannot wait on an unscheduled producer.
         if const_expr(not scatter_only):
+            # Publish every wave's compact stores at device scope before the WG
+            # leader announces arrival; waitcnt alone does not promote scope.
+            if q_wave < q_token_num:
+                llvm.FenceOp(llvm.AtomicOrdering.release, syncscope="agent")
+                _wait_mem()
+                rocdl.sched_barrier(0)
             gpu.barrier()
-            _wait_mem()
-            rocdl.sched_barrier(0)
             if tid == fx.Uint32(0):
                 arrival = _atomic_add(barrier, c0_i32, c1_i32)
                 last = arrival == fx.Uint32(grid_blocks) - fx.Uint32(1)
@@ -351,6 +355,9 @@ def build_moe_apre_fused_quant_scatter_module(
                     while released == fx.Uint32(0):
                         released = _atomic_add(barrier, c1_i32, c0_i32)
             gpu.barrier()
+            # All consumer waves must invalidate stale compact rows after the
+            # leader observes the release, including rows produced by other WGs.
+            llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="agent")
             _wait_mem()
             rocdl.sched_barrier(0)
 

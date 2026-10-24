@@ -743,6 +743,7 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     c4 = fx.Int32(4)
     c16 = fx.Int32(16)
     lane = c.lane
+    copy_lanes = getattr(c, "copy_lanes", 32)
     dst = c.dests[0]
 
     payload_bytes_per_row = c.payload_bytes_per_row
@@ -759,7 +760,7 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     src_rsrc = buffer_ops.create_buffer_resource_from_addr(
         src_addr, num_records_bytes=c.feat_bytes_per_row
     )
-    n_iter = (payload_bytes_per_row // 16 + 31) // 32
+    n_iter = (payload_bytes_per_row // 16 + copy_lanes - 1) // copy_lanes
 
     src_scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
         c.src_scale_base + fx.Uint64(c.feat_row_i32) * c.src_scale_bytes_per_row,
@@ -770,12 +771,12 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     c_n_scale_dwords = fx.Int32(n_scale_dwords)
     scale_row_dword_base = dst.scale_row_dword_base
     scale_t_i32 = c.scale_t_i32
-    n_sc_iter = (n_scale_dwords + 31) // 32
+    n_sc_iter = (n_scale_dwords + copy_lanes - 1) // copy_lanes
 
     # Cluster all loads before stores for memory-level parallelism.
     payload_chunks = []
     for it in range_constexpr(n_iter):
-        chunk_idx = fx.Int32(it * 32) + lane
+        chunk_idx = fx.Int32(it * copy_lanes) + lane
         v = buffer_ops.buffer_load(
             src_rsrc,
             chunk_idx * c4,
@@ -786,7 +787,7 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
         payload_chunks.append((chunk_idx, v))
     scale_chunks = []
     for it in range_constexpr(n_sc_iter):
-        g = fx.Int32(it * 32) + lane
+        g = fx.Int32(it * copy_lanes) + lane
         src_dword = buffer_ops.buffer_load(
             src_scale_rsrc,
             g,
@@ -1712,6 +1713,13 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             f"{payload_bytes_per_lane} B/lane"
         )
 
+    # Even source_topk keeps each adjacent route pair on the same source token.
+    copy_rows = (2 if prequantized and not ksplit and not remap_rows
+                 and not fuse_ep_psum
+                 and row_major_scale and quant_mode == "fp4"
+                 and source_topk > 0 and source_topk % 2 == 0 else 1)
+    copy_lanes = wave_size // copy_rows
+
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
     remap_tag = "_remap" if remap_rows or fuse_ep_psum else ""
     psum_tag = "_eppsum" if fuse_ep_psum else ""
@@ -1729,6 +1737,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{psum_tag}{ksplit_tag}"
         f"{prequant_tag}{rm_tag}{'_apre' if payload_preshuffled else ''}"
+        f"{'_rpg2' if copy_rows == 2 else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -1838,13 +1847,13 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                         p_p[tid] = start + fx.Int32(m_p[tid])
                 gpu.barrier()
 
-        # One warp owns one route, so tid // wave is wave-invariant -- but the
-        # backend cannot see that. readfirstlane says it, which keeps `route`
-        # (and the row and destination descriptor derived from it) uniform;
-        # otherwise every payload store goes through a readfirstlane waterfall.
+        # Keep the wave index uniform. The paired copy adds a half-wave route
+        # index; other paths retain their uniform per-route descriptors.
         warp_in_block = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
         lane = tid - warp_in_block * c_wave
         route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+        if const_expr(copy_rows > 1):
+            route = route * copy_rows + lane // copy_lanes
 
         # Dynamic EP token count (capture-safe, no host sync): grid is launched over
         # the static numel routes, but routes >= num_valid_routes (= total_recv*topk)
@@ -1859,9 +1868,11 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         # predicate covers both.
         row_raw = fx.Int32(DROPPED_ROUTE_ROW)
         if route_in_range:
-            # Scalar (SMEM) load: `route` is wave-uniform, and landing the row in
-            # an SGPR is what makes the per-row destination descriptor uniform.
-            row_raw = fx.Int32(buf_scalar_load(rows_t, route))
+            if const_expr(copy_rows > 1):
+                row_raw = fx.Int32(rows_t[route])
+            else:
+                # The single-route path keeps its scalar destination row.
+                row_raw = fx.Int32(buf_scalar_load(rows_t, route))
         row_is_mapped = row_raw >= fx.Int32(0)
         if row_is_mapped:
             row = fx.Uint32(row_raw)
@@ -1923,6 +1934,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                     source_row = route >> c_source_topk_shift
                 else:
                     source_row = fx.Uint32(route) // fx.Uint32(c_source_topk)
+                if const_expr(copy_rows > 1):
+                    source_row = fx.Uint32(rocdl.readfirstlane(i32, source_row))
                 feat_row_i32 = source_row
             else:
                 feat_row_i32 = row
@@ -1979,7 +1992,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 ],
                 scale_t=scale_t,
                 scale_t_i32=scale_t_i32,
-                lane=lane,
+                lane=lane % copy_lanes if copy_rows > 1 else lane,
+                copy_lanes=copy_lanes,
                 wmma_rep=wmma_rep,
                 row_major_scale=row_major_scale,
             )
@@ -2017,6 +2031,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        if const_expr(copy_rows > 1):
+            grid_route_blocks = (fx.Uint32(grid_route_blocks) + copy_rows - 1) // copy_rows
         grid_x = arith.index_cast(T.index, grid_route_blocks)
         grid_y = arith.index_cast(T.index, arith.constant(_grid_y_dim, type=T.i32))
         fused_kernel(
