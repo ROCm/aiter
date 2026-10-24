@@ -110,7 +110,10 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     check_persistent_n_tiles,
     cluster_m_fallback_values,
     is_compute_wmma_kernel_name,
+    k_is_bounded,
+    n_is_bounded,
     parse_mxfp8_32_wmma_kernel_name,
+    scale_k_align,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as MXFP8_128_WMMA_PREFIX,
@@ -914,6 +917,7 @@ def _compile_mxfp8_wmma_to_cache(
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
     scale_block: int = SCALE_BLOCK_SIZE,
+    b_scale_32x32: bool = False,
     **kwargs,
 ):
     del kwargs
@@ -928,10 +932,16 @@ def _compile_mxfp8_wmma_to_cache(
         compile_gemm_a8w8_splitk_reduce,
     )
 
+    k_align = scale_k_align(
+        scale_block == MX32_BLOCK_K, a_scale_preshuffled, b_scale_32x32
+    )
+    if k % k_align:
+        raise ValueError(f"{kernel_name}: K={k} must be aligned to {k_align}")
     dev = torch.device("cpu")
     k_blocks = (k + scale_block - 1) // scale_block
-    if scale_block == MX32_BLOCK_K:  # row-major or shuffled A; shuffled B
-        a_rows, b_rows = (((m + 31) // 32) * 32 if a_scale_preshuffled else m), n
+    if scale_block == MX32_BLOCK_K:  # row-major or shuffled A; B shuffled or 32x32
+        a_rows = ((m + 31) // 32) * 32 if a_scale_preshuffled else m
+        b_rows = n // 32 if b_scale_32x32 else n
     else:
         a_rows, b_rows = m, (n + 127) // 128
     xq = torch.empty((m, k), device=dev, dtype=torch.uint8)
@@ -939,7 +949,17 @@ def _compile_mxfp8_wmma_to_cache(
     a_scale = torch.empty((a_rows, k_blocks), device=dev, dtype=torch.uint8)
     b_scale = torch.empty((b_rows, k_blocks), device=dev, dtype=torch.uint8)
     out = torch.empty((m, n), device=dev, dtype=torch.bfloat16)
+    stride_ascale_k = a_scale.numel() // a_scale.stride(0)
+    lda, ldc = xq.stride(0), out.stride(0)
     stream = fx.Stream(0)
+    bounded_k = k_is_bounded(
+        k,
+        split_k,
+        tile_k,
+        num_buffers,
+        tile_n,
+        is_compute_wmma_kernel_name(kernel_name),
+    )
 
     with compile_only_env():
         launch_args = (
@@ -952,9 +972,9 @@ def _compile_mxfp8_wmma_to_cache(
             stream,
             n,
             k,
-            a_scale.numel() // a_scale.stride(0),
-            xq.stride(0),
-            out.stride(0),
+            stride_ascale_k,
+            lda,
+            ldc,
             tile_m,
             tile_n,
             tile_k,
@@ -968,12 +988,11 @@ def _compile_mxfp8_wmma_to_cache(
         )
         compute_bound = is_compute_wmma_kernel_name(kernel_name)
         launch = launch_gemm_a8w8_256x256 if compute_bound else launch_gemm_a8w8
-        check_persistent_n_tiles(
-            persistent_n_tiles, n, tile_n, cluster_n, split_k, compute_bound
+        check_persistent_n_tiles(persistent_n_tiles, split_k, compute_bound)
+        bounded_n = n_is_bounded(
+            n, tile_n, cluster_n, persistent_n_tiles, compute_bound
         )
-        for variant_cm in cluster_m_fallback_values(
-            cluster_m, cluster_n, compute_bound
-        ):
+        for variant_cm in cluster_m_fallback_values(cluster_m):
             variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
             if compute_bound:
                 fused = fused_splitk and _fused_splitk_ok(
@@ -993,6 +1012,9 @@ def _compile_mxfp8_wmma_to_cache(
                         fused,
                         bounded_m,
                         a_scale_preshuffled,
+                        b_scale_32x32,
+                        bounded_k,
+                        bounded_n,
                     )
             else:
                 launch(
@@ -1004,6 +1026,8 @@ def _compile_mxfp8_wmma_to_cache(
                     1,
                     a_preshuffle,
                     a_scale_preshuffled,
+                    b_scale_32x32,
+                    bounded_k,
                 )
         if split_k > 1:
             compile_gemm_a8w8_splitk_reduce(

@@ -63,10 +63,18 @@ def launch_gemm_a8w8_256x256(
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
     a_scale_preshuffled: Constexpr[bool] = False,
+    b_scale_32x32: Constexpr[bool] = False,
+    bounded_k: Constexpr[bool] = False,
+    bounded_n: Constexpr[bool] = False,
 ):
-    """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
-    multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
-    least 512 per split."""
+    """M is unrestricted (a multiple of 2 with ``a_preshuffle``); N and K must be
+    scale-block aligned, K >= 512 per split, and N a multiple of ``tile_n *
+    cluster_n * persistent_n_tiles`` unless ``bounded_n``.
+
+    ``b_scale_32x32`` (mxfp8_32): B scale is the raw row-major ``[N/32, K/32]``.
+    ``bounded_k`` (single split): K may end inside the last K super; TDM zero-fills.
+    ``bounded_n`` (single split, no fused split-K): N may end inside the last tile;
+    padded tiles skip loads/stores but still run the loop to feed A multicast."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -76,8 +84,8 @@ def launch_gemm_a8w8_256x256(
         (128, 256, 128, 2, 2, 3),
     ), "only the tuned 2x2-wave profiles are supported"
     assert (
-        1 <= cluster_m < 16 and 1 <= cluster_n < 16 and 1 < cluster_m * cluster_n <= 16
-    ), f"cluster_m*cluster_n must be 2..16, got {cluster_m}x{cluster_n}"
+        1 <= cluster_m < 16 and 1 <= cluster_n < 16 and cluster_m * cluster_n <= 16
+    ), f"cluster_m*cluster_n must be 1..16, got {cluster_m}x{cluster_n}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert (
         persistent_n_tiles >= 1
@@ -93,6 +101,7 @@ def launch_gemm_a8w8_256x256(
     assert (
         cluster_m * cluster_n * cluster_k <= 16
     ), "all K splits must fit in one cluster with at most 16 workgroups"
+    use_cluster = cluster_m * cluster_n * cluster_k > 1
     cluster_sync_revs = 8
     m_run_max, m_run_min = 32, 8
     WMMA_M = WMMA_N = 16
@@ -103,6 +112,9 @@ def launch_gemm_a8w8_256x256(
     mx32 = block_size == 32
     assert mx32 or block_size == 128, f"block_size must be 32 or 128, got {block_size}"
     assert not a_scale_preshuffled or mx32, "a_scale_preshuffled is mxfp8_32 only"
+    assert not b_scale_32x32 or mx32, "b_scale_32x32 is mxfp8_32 only"
+    assert not bounded_k or split_k == 1, "bounded_k requires split_k=1"
+    assert not bounded_n or split_k == 1, "bounded_n requires split_k=1"
     SA_SUPERS = tile_m // 32
     SB_SUPERS = tile_n // 32
     K_WS = tile_k // WMMA_K
@@ -144,7 +156,9 @@ def launch_gemm_a8w8_256x256(
         if mx32
         else SC_K * (((tile_m + 15) // 16) * 16)
     )
-    STAGE_SB = SB_SUPERS * SUPER_K if mx32 else ((N_BLOCKS + 15) // 16) * 16
+    # One n32 row of the weight scale per K super: SUPER_K bytes shuffled, SUPER_K/32 raw.
+    SB_ROW = SUPER_K // 32 if b_scale_32x32 else SUPER_K
+    STAGE_SB = SB_SUPERS * SB_ROW if mx32 else ((N_BLOCKS + 15) // 16) * 16
     # B first so it keeps a 64-KiB-aligned base; the rest packs behind it.
     PLANAR_B_BASE = 0
     PLANAR_A_BASE = PLANAR_B_BASE + num_buffers * STAGE_B
@@ -174,6 +188,8 @@ def launch_gemm_a8w8_256x256(
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
         + ("_fsk" if cluster_splitk else "")
         + ("_aspre" if a_scale_preshuffled else "")
+        + ("_wb32x32" if b_scale_32x32 else "")
+        + ("_ktail" if bounded_k else "")
     )
 
     def _run_tile(
@@ -191,7 +207,12 @@ def launch_gemm_a8w8_256x256(
         arg_out: fx.Pointer,
         tile_idx=0,
     ):
-        K_TILES = i32_k // (tile_k * split_k)
+        # bounded_k: the last K tile may be partial, its overhang zero-filled by TDM.
+        K_TILES = (
+            (i32_k + (tile_k * split_k - 1)) // (tile_k * split_k)
+            if const_expr(bounded_k)
+            else i32_k // (tile_k * split_k)
+        )
         k64 = fx.Int64(i32_k)
         lda64 = fx.Int64(i32_lda)
         ldc64 = fx.Int64(i32_ldc)
@@ -216,8 +237,11 @@ def launch_gemm_a8w8_256x256(
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
-        local_x, local_y = cluster.compute_cluster_position()
-        a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
+        if const_expr(use_cluster):
+            local_x, local_y = cluster.compute_cluster_position()
+            a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
+        else:
+            a_mask, b_mask = 0, 0
         cluster_plane = fx.Int32(0)
         if const_expr(cluster_splitk):
             # Multicast inputs only within the matching K split. The hardware
@@ -232,6 +256,15 @@ def launch_gemm_a8w8_256x256(
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C)
+        if const_expr(bounded_n):
+            n_left = i32_n - blk_n
+            n_cols = (n_left < tile_n).select(n_left, fx.Int32(tile_n))
+            n_cols = (n_cols > 0).select(n_cols, fx.Int32(0))
+            b_rows = (n_cols + 15) // 16
+            sb_n = 32 if mx32 else 128  # weight-scale rows per scale block
+            sb_rows = (n_cols + sb_n - 1) // sb_n
+        else:
+            n_cols = b_rows = sb_rows = None
         a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         sa_oob = (
             (
@@ -275,7 +308,11 @@ def launch_gemm_a8w8_256x256(
                 if const_expr(a_scale_preshuffled)
                 else blk_m64 * (k64 // 32) + k_elem0 // 32
             )
-            sb_off0 = (blk_n64 // 32) * k64 + k_elem0
+            sb_off0 = (
+                (blk_n64 // 32) * (k64 // 32) + k_elem0 // 32
+                if const_expr(b_scale_32x32)
+                else (blk_n64 // 32) * k64 + k_elem0
+            )
         else:
             scale_k0 = kt_base * K_WS
             sa_off0 = blk_m64 + scale_k0 * fx.Int64(i32_stride_ascale_k)
@@ -294,11 +331,11 @@ def launch_gemm_a8w8_256x256(
                 if const_expr(a_scale_preshuffled)
                 else (tile_m, SA_PANEL_WIDTH)
             )
-            SB_SHAPE = (SB_SUPERS, SUPER_K)
+            SB_SHAPE = (SB_SUPERS, SB_ROW)
             SA_LDS_STRIDE = SUPER_K if const_expr(a_scale_preshuffled) else SA_PANEL_ROW
-            SB_LDS_STRIDE = SUPER_K
+            SB_LDS_STRIDE = SB_ROW
             sa_gstride = i32_k if const_expr(a_scale_preshuffled) else i32_k // 32
-            sb_gstride = i32_k
+            sb_gstride = i32_k // 32 if const_expr(b_scale_32x32) else i32_k
             sa_bound = sa_oob
             sa_step = SUPER_K if const_expr(a_scale_preshuffled) else SA_PANEL_WIDTH
             sb_step = SUPER_K
@@ -339,7 +376,7 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     i32_k * 16,
                     b_mask,
-                    None,
+                    b_rows,
                     0,
                     True,
                 )
@@ -367,11 +404,11 @@ def launch_gemm_a8w8_256x256(
                 stride, mask, bound, pad, early = (
                     sb_gstride,
                     b_mask,
-                    None,
+                    sb_rows,
                     0,
                     True,
                 )
-                if const_expr(not mx32):
+                if const_expr(not mx32 and use_cluster):
                     flat_wg = (
                         fx.Int32(local_x)
                         + fx.Int32(local_y) * cluster_m
@@ -404,28 +441,57 @@ def launch_gemm_a8w8_256x256(
                     if const_expr(owner == 2)
                     else (sb_step if const_expr(owner == 3) else shape[1])
                 )
-            return desc, shape[0] * lds_stride, step
+            # Express the remaining K extent in each owner's data/scale units.
+            k_last = fx.Int32(0)
+            if const_expr(bounded_k):
+                last_k = (i32_k - 1) % SUPER_K + 1
+                if const_expr(owner == 0):
+                    k_last = last_k * A_PAIR
+                elif const_expr(owner == 1):
+                    k_last = last_k * 16
+                elif const_expr(owner == 2):
+                    if const_expr(mx32):
+                        k_last = (
+                            last_k if const_expr(a_scale_preshuffled) else last_k // 32
+                        )
+                    else:
+                        k_last = last_k // 128
+                elif const_expr(mx32 and not b_scale_32x32):
+                    k_last = last_k
+                else:
+                    k_last = last_k // block_size
+            return desc, shape[0] * lds_stride, step, k_last
 
         def _owned_tdm_desc(owner):
-            desc, lds_step, global_step = _build_tdm_desc(owner)
+            desc, lds_step, global_step, k_last = _build_tdm_desc(owner)
             return (
                 Vec(desc.dgroup0),
                 Vec(desc.dgroup1),
                 fx.Int32(lds_step),
                 fx.Int32(global_step),
+                k_last,
             )
 
         dgroup0 = fx.full(4, 0, fx.Int32)
         dgroup1 = fx.full(8, 0, fx.Int32)
         tdm_lds_step, tdm_global_step = fx.Int32(0), fx.Int32(0)
+        tdm_k_last = fx.Int32(0)
         if wave == 0:
-            dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(0)
+            dgroup0, dgroup1, tdm_lds_step, tdm_global_step, tdm_k_last = (
+                _owned_tdm_desc(0)
+            )
         elif wave == 1:
-            dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(1)
+            dgroup0, dgroup1, tdm_lds_step, tdm_global_step, tdm_k_last = (
+                _owned_tdm_desc(1)
+            )
         elif wave == 2:
-            dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(2)
+            dgroup0, dgroup1, tdm_lds_step, tdm_global_step, tdm_k_last = (
+                _owned_tdm_desc(2)
+            )
         else:
-            dgroup0, dgroup1, tdm_lds_step, tdm_global_step = _owned_tdm_desc(3)
+            dgroup0, dgroup1, tdm_lds_step, tdm_global_step, tdm_k_last = (
+                _owned_tdm_desc(3)
+            )
 
         tdm_desc = tdm_ops.TDMDescriptor2D(as_ir_value(dgroup0), as_ir_value(dgroup1))
         tdm_base_lds, tdm_base_lo, tdm_base_hi = (
@@ -448,6 +514,24 @@ def launch_gemm_a8w8_256x256(
                 tdm_base_hi,
                 tile_delta,
             )
+            if const_expr(bounded_k):
+                is_last = tile_delta >= last_delta
+                if const_expr(SA_PANEL_STAGES == 1):
+                    if const_expr(not mx32):
+                        desc = tdm_ops.clamp_tensor_descriptor_2d_outer_extent(
+                            desc, tdm_k_last, is_last & (wave == 2)
+                        )
+                        desc = tdm_ops.clamp_tensor_descriptor_2d_inner_extent(
+                            desc, tdm_k_last, is_last & (wave != 2)
+                        )
+                    else:
+                        desc = tdm_ops.clamp_tensor_descriptor_2d_inner_extent(
+                            desc, tdm_k_last, is_last
+                        )
+                else:
+                    desc = tdm_ops.clamp_tensor_descriptor_2d_inner_extent(
+                        desc, tdm_k_last, is_last & (wave != 2)
+                    )
             if const_expr(SA_PANEL_STAGES > 1):
                 desc = tdm_ops.clamp_tensor_descriptor_2d_inner_extent(
                     desc,
@@ -539,7 +623,10 @@ def launch_gemm_a8w8_256x256(
         if const_expr(persistent_n_tiles > 1):
             rocdl.sched_barrier(0)
             tdm_ops.tensor_wait(0)
-        cluster.cluster_barrier()
+        if const_expr(use_cluster):
+            cluster.cluster_barrier()
+        else:
+            workgroup_barrier(use_cluster=False)
         # Keep fragment displacements as DS immediates inside the K loop.
         stage_a_addr, stage_b_addr, stage_sa_addr, stage_sb_addr = (
             [],
@@ -574,8 +661,11 @@ def launch_gemm_a8w8_256x256(
                     else sa_row * SA_PANEL_ROW
                 ),
             )
+            # 32x32: one dword per n32 row, the same for all 32 lanes.
             sb_byte = fx.index_cast(
-                T.index, (sb_col // 32) * SUPER_K + (sb_col % 32) * 4
+                T.index,
+                (sb_col // 32) * SB_ROW
+                + (0 if const_expr(b_scale_32x32) else (sb_col % 32) * 4),
             )
         else:
             sa_sel = ((wmb + lane) % 4) * 0x01010101
@@ -602,7 +692,11 @@ def launch_gemm_a8w8_256x256(
                 if const_expr(mx32)
                 else par * (STAGE_SA // SC_K)
             )
-            sc_par_b = par * tile_k if const_expr(mx32) else par
+            sc_par_b = (
+                par * (tile_k // 32 if const_expr(b_scale_32x32) else tile_k)
+                if const_expr(mx32)
+                else par
+            )
             stage_sa_addr.append(
                 _planar_base(PLANAR_SA_BASE, STAGE_SA, slot) + sa_byte + sc_par_a
             )
@@ -670,7 +764,7 @@ def launch_gemm_a8w8_256x256(
 
         def _stage_load_sb_raw(stage, sn):
             if const_expr(mx32):
-                return lds_load_b32(stage_sb_addr[stage], sn * SUPER_K)[0]
+                return lds_load_b32(stage_sb_addr[stage], sn * SB_ROW)[0]
             return lds_load_b32(stage_sb_addr[stage], 0)[0]
 
         def _sa_of(word):
@@ -988,7 +1082,11 @@ def launch_gemm_a8w8_256x256(
                     pre=sched_fence,
                 )
 
-        SUPERS = K_TILES // KPAIR
+        SUPERS = (
+            (K_TILES + (KPAIR - 1)) // KPAIR
+            if const_expr(bounded_k)
+            else K_TILES // KPAIR
+        )
         last_delta = (SUPERS - 1) * tdm_global_step
         for i in range_constexpr(num_buffers):
             seed_delta = fx.Int32(i) * tdm_global_step
@@ -1043,8 +1141,9 @@ def launch_gemm_a8w8_256x256(
                         owner_parity,
                         rev * num_buffers + g // KPAIR,
                     )
-                if do_sync:
-                    cluster.cluster_barrier()
+                if const_expr(use_cluster):  # noqa: SIM102
+                    if do_sync:
+                        cluster.cluster_barrier()
 
         wave_parity = fx.Int32(
             llvm_dialect.inline_asm(
@@ -1081,7 +1180,7 @@ def launch_gemm_a8w8_256x256(
                 )
         accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
 
-        pipeline_fence(outstanding=0, use_cluster=True)
+        pipeline_fence(outstanding=0, use_cluster=use_cluster)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             if const_expr(cluster_splitk):
@@ -1139,7 +1238,7 @@ def launch_gemm_a8w8_256x256(
             )
             atomC = fx.rocdl.make_tdm_atom(
                 gtC,
-                [mn_oob, tile_n],
+                [mn_oob, n_cols if const_expr(bounded_n) else tile_n],
                 strides=[ldc64, None],
                 num_warps=num_waves,
             )
@@ -1195,6 +1294,10 @@ def launch_gemm_a8w8_256x256(
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
+    if const_expr(bounded_n):
+        # Whole cluster / persistent groups of tiles; the spare ones own no column.
+        n_group = cluster_n * persistent_n_tiles
+        gy = ((gy + (n_group - 1)) // n_group) * n_group
     gx = (((gx > 0).select(gx, fx.Int32(1)) + (cluster_m - 1)) // cluster_m) * cluster_m
     # Split gx exactly, so no workgroup is left over to recompute a duplicate tile.
     pow2 = gx & -gx
@@ -1213,7 +1316,7 @@ def launch_gemm_a8w8_256x256(
     gy_launch = gy // persistent_n_tiles if const_expr(persistent_n_tiles > 1) else gy
     grid_arg = (m_run, gy_launch, m_chunks * split_k)
     # Runtime N/K shape checks belong to the caller.
-    cluster_arg = (cluster_m, cluster_n, cluster_k)
+    cluster_arg = (cluster_m, cluster_n, cluster_k) if use_cluster else None
     kernel_gemm_a8w8_256x256(
         arg_c,
         arg_a,
@@ -1227,7 +1330,11 @@ def launch_gemm_a8w8_256x256(
         i32_lda,
         i32_ldc,
         arg_out,
-        value_attrs={"rocdl.cluster_dims": f"{cluster_m},{cluster_n},{cluster_k}"},
+        value_attrs={
+            "rocdl.cluster_dims": (
+                f"{cluster_m},{cluster_n},{cluster_k}" if use_cluster else None
+            )
+        },
     ).launch(
         grid=grid_arg,
         block=(block, 1, 1),
