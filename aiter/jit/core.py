@@ -506,7 +506,15 @@ class AITER_CONFIG:
         dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
         if not dedup_keys:
             return
-        duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
+
+        def as_numbers(column):
+            values = pd.to_numeric(column, errors="coerce")
+            written = column.astype(str).str.strip() != ""
+            return values if values[written].notna().all() else column
+
+        # Numeric columns compare as numbers, so 256 and 256.0 are one shape.
+        comparable = merge_df.apply(as_numbers)
+        duplicated_mask = comparable.duplicated(subset=dedup_keys, keep=False)
         if not duplicated_mask.any():
             return
 
@@ -529,9 +537,13 @@ class AITER_CONFIG:
                 + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
             )
 
-        # Auto-dedup: globally determine best row (lowest 'us') per shape
+        # Auto-dedup: globally determine best row (lowest 'us') per shape. One
+        # unparseable us cell (e.g. nan) leaves the column textual in
+        # `comparable`, where "10.5" sorts before "9.5", so coerce it alone.
+        us = pd.to_numeric(merge_df["us"], errors="coerce")
         best_row_index = set(
-            merge_df.sort_values("us", kind="stable")
+            comparable.assign(us=us)
+            .sort_values("us", kind="stable")
             .drop_duplicates(subset=dedup_keys, keep="first")
             .index
         )
@@ -599,7 +611,9 @@ class AITER_CONFIG:
             single = path_list[0] if path_list else None
             if single and os.path.exists(single):
                 try:
-                    df = pd.read_csv(single)
+                    # As text, like the merge below, so a dedup rewrite keeps
+                    # every cell as written.
+                    df = pd.read_csv(single, dtype=str, keep_default_na=False)
                 except (OSError, UnicodeError, ValueError, pd.errors.ParserError):
                     # This path previously handed the file back unread, so an
                     # unparseable CSV surfaced from the op's own loader. Keep
@@ -625,7 +639,10 @@ class AITER_CONFIG:
                 logger.info(f"path {i + 1}: {path} (not exist)")
                 continue
 
-            df = pd.read_csv(path)
+            # Kept as text so the merged file reproduces every cell as written:
+            # parsed, a column with a blank cell turns 64 into 64.0, which
+            # readers that take integers from the text reject.
+            df = pd.read_csv(path, dtype=str, keep_default_na=False)
             source_pairs.append((path, df))
 
         if not source_pairs:
@@ -650,9 +667,10 @@ class AITER_CONFIG:
                         # a cu_num stay distinguishable after the merge.
                         from aiter.jit.utils.chip_info import gfx_from_cu_num
 
-                        df[c] = df["cu_num"].map(gfx_from_cu_num)
+                        cu_num = pd.to_numeric(df["cu_num"], errors="coerce")
+                        df[c] = cu_num.map(gfx_from_cu_num)
                     else:
-                        df[c] = _FILL_DEFAULTS.get(c, 0)
+                        df[c] = str(_FILL_DEFAULTS.get(c, 0))
             source_pairs[i] = (path, df[all_cols])
 
         non_empty = [df for _, df in source_pairs if not df.empty]
