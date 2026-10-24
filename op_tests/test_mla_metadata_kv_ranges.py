@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The v1_0 (intra-batch) MLA metadata must cover every key of every batch exactly once."""
+"""The v1_0 (intra-batch) and v1_2 (fast) MLA metadata must cover every key of every batch exactly once."""
 
 import pytest
 import torch
@@ -19,7 +19,12 @@ NAMES = (
 )
 
 
-def _covered_ranges(kv_lens, kv_start=0, kv_granularity=16, nhead=16):
+# (fast_mode, intra_batch_mode): v1_0 is the "fake non-persistent" planner, v1_2 the fast one.
+PLANNERS = {"v1_0": (False, True), "v1_2": (True, False)}
+
+
+def _covered_ranges(kv_lens, kv_start=0, kv_granularity=16, nhead=16, planner="v1_0"):
+    fast_mode, intra_batch_mode = PLANNERS[planner]
     batch = len(kv_lens)
     kv_indptr = torch.full((batch + 1,), kv_start, dtype=torch.int32, device="cuda")
     kv_indptr[1:] += torch.tensor(kv_lens, device="cuda").cumsum(0).int()
@@ -32,9 +37,9 @@ def _covered_ranges(kv_lens, kv_start=0, kv_granularity=16, nhead=16):
         dtypes.bf16,
         dtypes.fp8,
         is_sparse=True,
-        fast_mode=False,
+        fast_mode=fast_mode,
         num_kv_splits=64,
-        intra_batch_mode=True,
+        intra_batch_mode=intra_batch_mode,
     )
     meta = {
         name: torch.empty(shape, dtype=dtype, device="cuda")
@@ -57,10 +62,10 @@ def _covered_ranges(kv_lens, kv_start=0, kv_granularity=16, nhead=16):
         kv_granularity=kv_granularity,
         max_seqlen_qo=1,
         uni_seqlen_qo=1,
-        fast_mode=False,
-        topk=2048,
+        fast_mode=fast_mode,
+        topk=-1,
         max_split_per_batch=64,
-        intra_batch_mode=True,
+        intra_batch_mode=intra_batch_mode,
         dtype_q=dtypes.bf16,
         dtype_kv=dtypes.fp8,
     )
@@ -81,19 +86,28 @@ def _assert_exact_cover(kv_indptr, ranges):
             assert end == start, (b, spans)
 
 
+@pytest.mark.parametrize("planner", list(PLANNERS))
 @pytest.mark.parametrize("kv_granularity", [16, 32, 64])
-def test_every_key_length_is_fully_covered(kv_granularity):
-    # A 1-4 key tail folded into the only remaining split used to be dropped.
-    _assert_exact_cover(*_covered_ranges(list(range(1, 401)), 0, kv_granularity))
+def test_every_key_length_is_fully_covered(planner, kv_granularity):
+    # v1_0 used to drop a 1-4 key tail folded into the only remaining split.
+    _assert_exact_cover(
+        *_covered_ranges(list(range(1, 401)), 0, kv_granularity, planner=planner)
+    )
 
 
-def test_first_batch_starts_at_its_indptr():
-    # Batch 0 used to start at key 0 instead of kv_indptr[0].
-    _assert_exact_cover(*_covered_ranges([1, 17, 300, 2048, 5], kv_start=1000))
+@pytest.mark.parametrize("planner", list(PLANNERS))
+@pytest.mark.parametrize("batches", [1, 3, 10, 240, 1100])
+def test_ranges_start_at_the_indptr_base(planner, batches):
+    # v1_0 started batch 0 at key 0, v1_2 started every batch there, instead of at
+    # kv_indptr[0]; the batch counts reach each of v1_2's code paths.
+    lens = [(7 * i) % 300 + 1 for i in range(batches)]
+    _assert_exact_cover(*_covered_ranges(lens, kv_start=1000, planner=planner))
 
 
 if __name__ == "__main__":
-    for granularity in (16, 32, 64):
-        test_every_key_length_is_fully_covered(granularity)
-    test_first_batch_starts_at_its_indptr()
-    print("v1_0 MLA metadata kv ranges: OK")
+    for planner in PLANNERS:
+        for granularity in (16, 32, 64):
+            test_every_key_length_is_fully_covered(planner, granularity)
+        for batches in (1, 3, 10, 240, 1100):
+            test_ranges_start_at_the_indptr_base(planner, batches)
+    print("MLA metadata kv ranges: OK")
