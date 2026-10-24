@@ -537,7 +537,6 @@ def mp_tuner(
 
     while remaining_tasks:
         completed_this_round = []
-        dummy_failed_tasks = []
         consecutive_timeouts = 0
         half_gpu = max(1, (mp_num + 1) // 2)
 

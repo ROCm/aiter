@@ -15,9 +15,7 @@ class TestCudaEventTimingSelection(unittest.TestCase):
             self.assertTrue(_use_cuda_event_timing(True))
 
     def test_environment_enables_event_timing_in_workers(self):
-        with patch.dict(
-            os.environ, {"AITER_PERFTEST_USE_CUDA_EVENT": "1"}, clear=True
-        ):
+        with patch.dict(os.environ, {"AITER_PERFTEST_USE_CUDA_EVENT": "1"}, clear=True):
             self.assertTrue(_use_cuda_event_timing(False))
 
     def test_profiler_remains_default(self):

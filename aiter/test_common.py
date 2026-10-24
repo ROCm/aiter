@@ -22,9 +22,7 @@ pd.set_option("display.max_rows", 200)
 
 
 def _use_cuda_event_timing(requested):
-    return requested or bool(
-        int(os.environ.get("AITER_PERFTEST_USE_CUDA_EVENT", "0"))
-    )
+    return requested or bool(int(os.environ.get("AITER_PERFTEST_USE_CUDA_EVENT", "0")))
 
 
 def ensure_spawn_method():
