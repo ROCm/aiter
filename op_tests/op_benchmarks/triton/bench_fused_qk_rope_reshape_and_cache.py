@@ -22,6 +22,7 @@ Usage Example:
 """
 
 import argparse
+import functools
 
 import torch
 import triton
@@ -30,10 +31,14 @@ from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_reshape_and_ca
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
     get_caller_name_no_ext,
 )
 
@@ -62,6 +67,97 @@ X_NAMES = ["M", "QH", "KH", "D", "block_size"]
 def get_x_vals(args):
     m_vals = args.M if isinstance(args.M, list) else [args.M]
     return [(M, args.QH, args.KH, args.D, args.block_size) for M in m_vals]
+
+
+def _generate_inputs(
+    M,
+    QH,
+    KH,
+    D,
+    block_size,
+    cache_dtype,
+    num_blocks,
+    x_size,
+    max_pos,
+    d_freq,
+    cache_layout,
+    slot_pattern,
+    apply_scale,
+    output_zeros,
+):
+    dtype = torch.bfloat16  # qkv dtype
+
+    # assumed contiguous, split into 3
+    qkv = torch.randn((M, (QH + 2 * KH) * D), dtype=dtype, device="cuda")
+    q_flat, k_flat, v_flat = torch.split(qkv, [QH * D, KH * D, KH * D], dim=-1)
+    q = q_flat.view(M, QH, D)
+    k = k_flat.view(M, KH, D)
+    v = v_flat.view(M, KH, D)
+
+    # mock rotation tables
+    freqs = torch.randn((max_pos, 1, 1, d_freq), dtype=dtype, device="cuda")
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+
+    positions = torch.randint(0, max_pos, (M,), device="cuda")
+
+    # create mock caches
+    if cache_layout == "flash":
+        key_cache = torch.zeros(
+            (num_blocks, block_size, KH, D), dtype=cache_dtype, device="cuda"
+        )
+        value_cache = torch.zeros_like(key_cache)
+    else:
+        key_cache = torch.zeros(
+            (num_blocks, KH, D // x_size, block_size, x_size),
+            dtype=cache_dtype,
+            device="cuda",
+        )
+        if cache_layout == "nonflash_v_shuffle":
+            value_cache = torch.zeros(
+                (num_blocks, KH, block_size // x_size, D, x_size),
+                dtype=cache_dtype,
+                device="cuda",
+            )
+        else:
+            value_cache = torch.zeros(
+                (num_blocks, KH, D, block_size), dtype=cache_dtype, device="cuda"
+            )
+
+    # map slots, blocked (prefill) or random (decode)
+    if slot_pattern == "blocked":
+        n_blocks = triton.cdiv(M, block_size)
+        blocks = torch.randperm(num_blocks, device="cuda")[:n_blocks]
+        within = torch.arange(block_size, device="cuda")
+        slot_mapping = (blocks[:, None] * block_size + within[None, :]).reshape(-1)[:M]
+    else:
+        slot_mapping = torch.randperm(num_blocks * block_size, device="cuda")[:M]
+    slot_mapping = slot_mapping.contiguous()
+
+    if apply_scale:
+        k_scale = torch.ones((), dtype=torch.float32, device="cuda")
+        v_scale = torch.ones((), dtype=torch.float32, device="cuda")
+    else:
+        k_scale = None
+        v_scale = None
+
+    # HAVE_ZEROS in caller
+    zeros_out = torch.empty_like(q) if output_zeros else None
+
+    return (
+        q,
+        k,
+        v,
+        cos,
+        sin,
+        positions,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        zeros_out,
+    )
 
 
 def bench_qk_rope_fn(
@@ -111,70 +207,80 @@ def bench_qk_rope_fn(
 
     torch.cuda.empty_cache()
 
-    dtype = torch.bfloat16  # qkv dtype
-
-    # assumed contiguous, split into 3
-    qkv = torch.randn((M, (QH + 2 * KH) * D), dtype=dtype, device="cuda")
-    q_flat, k_flat, v_flat = torch.split(qkv, [QH * D, KH * D, KH * D], dim=-1)
-    q = q_flat.view(M, QH, D)
-    k = k_flat.view(M, KH, D)
-    v = v_flat.view(M, KH, D)
-
     # mock rotation tables
     d_freq = D // 2 if args.reuse_freqs_front_part else D
-    freqs = torch.randn((max_pos, 1, 1, d_freq), dtype=dtype, device="cuda")
-    cos = torch.cos(freqs)
-    sin = torch.sin(freqs)
-
-    positions = torch.randint(0, max_pos, (M,), device="cuda")
-
-    # create mock caches
-    if args.cache_layout == "flash":
-        key_cache = torch.zeros(
-            (num_blocks, block_size, KH, D), dtype=cache_dtype, device="cuda"
-        )
-        value_cache = torch.zeros_like(key_cache)
-    else:
-        key_cache = torch.zeros(
-            (num_blocks, KH, D // x_size, block_size, x_size),
-            dtype=cache_dtype,
-            device="cuda",
-        )
-        if args.cache_layout == "nonflash_v_shuffle":
-            value_cache = torch.zeros(
-                (num_blocks, KH, block_size // x_size, D, x_size),
-                dtype=cache_dtype,
-                device="cuda",
-            )
-        else:
-            value_cache = torch.zeros(
-                (num_blocks, KH, D, block_size), dtype=cache_dtype, device="cuda"
-            )
-
-    # map slots, blocked (prefill) or random (decode)
-    if args.slot_pattern == "blocked":
-        n_blocks = triton.cdiv(M, block_size)
-        blocks = torch.randperm(num_blocks, device="cuda")[:n_blocks]
-        within = torch.arange(block_size, device="cuda")
-        slot_mapping = (blocks[:, None] * block_size + within[None, :]).reshape(-1)[:M]
-    else:
-        slot_mapping = torch.randperm(num_blocks * block_size, device="cuda")[:M]
-    slot_mapping = slot_mapping.contiguous()
 
     # scale only applied with fp8
     apply_scale = cache_dtype != torch.bfloat16
-    if apply_scale:
-        k_scale = torch.ones((), dtype=torch.float32, device="cuda")
-        v_scale = torch.ones((), dtype=torch.float32, device="cuda")
-    else:
-        k_scale = None
-        v_scale = None
 
-    # HAVE_ZEROS in caller
-    zeros_out = torch.empty_like(q) if args.output_zeros else None
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
-    ms = triton.testing.do_bench_cudagraph(
-        lambda: fused_qk_rope_reshape_and_cache(
+    _p_gen = functools.partial(
+        _generate_inputs,
+        M,
+        QH,
+        KH,
+        D,
+        block_size,
+        cache_dtype,
+        num_blocks,
+        x_size,
+        max_pos,
+        d_freq,
+        args.cache_layout,
+        args.slot_pattern,
+        apply_scale,
+        args.output_zeros,
+    )
+    _out_val_keys = [
+        "q",
+        "k",
+        "v",
+        "cos",
+        "sin",
+        "positions",
+        "key_cache",
+        "value_cache",
+        "slot_mapping",
+        "k_scale",
+        "v_scale",
+        "zeros_out",
+    ]
+    rot_bufs = generate_rotating_buffers_pool(
+        [_p_gen], [_out_val_keys], **kwargs_rot_bufs
+    )
+    sample = rot_bufs[0]
+
+    flops = M * QH * D * 3 + M * KH * D * 3  # rope
+
+    elem = sample["q"].element_size()
+
+    # q + k + v
+    mem_read = M * QH * D * elem + 2 * M * KH * D * elem
+
+    cache_bytes_per_token = KH * D * sample["key_cache"].element_size()
+
+    # q + k + kv cache
+    mem_write = M * QH * D * elem + M * KH * D * elem + 2 * M * cache_bytes_per_token
+
+    mem = mem_read + mem_write
+
+    def _run(
+        q,
+        k,
+        v,
+        cos,
+        sin,
+        positions,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        zeros_out,
+    ):
+        fused_qk_rope_reshape_and_cache(
             q=q,
             k=k,
             v=v,
@@ -195,23 +301,9 @@ def bench_qk_rope_fn(
             output_zeros=args.output_zeros,
             zeros_out=zeros_out,
             upcast_operand=args.upcast_operand,
-        ),
-        return_mode="median",
-    )
+        )
 
-    flops = M * QH * D * 3 + M * KH * D * 3  # rope
-
-    elem = q.element_size()
-
-    # q + k + v
-    mem_read = M * QH * D * elem + 2 * M * KH * D * elem
-
-    cache_bytes_per_token = KH * D * key_cache.element_size()
-
-    # q + k + kv cache
-    mem_write = M * QH * D * elem + M * KH * D * elem + 2 * M * cache_bytes_per_token
-
-    mem = mem_read + mem_write
+    ms = do_bench_aiter_triton(_run, rot_bufs, **kwargs_do_bench_graph)
 
     if metric == "time":
         return ms
@@ -264,6 +356,9 @@ def parse_int_or_list(value):
 def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="fused_qk_rope_reshape_and_cache")
     override_parser_action(parser, action="--metric", default="time")
+    # Caches are large paged allocations (num_blocks can be ~1.7e5), so default
+    # to a smaller rotation target than the shared 256 MB to avoid ballooning.
+    override_parser_action(parser, action="--rot-bufs-target-mb", default=64)
     parser.add_argument(
         "-M",
         type=parse_int_or_list,
