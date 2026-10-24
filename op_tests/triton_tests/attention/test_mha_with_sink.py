@@ -588,6 +588,69 @@ def test_mha_sliding_window_no_sink(
     )
 
 
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (64, 128)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 1), (8, 8)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("WINDOW_SIZE", [(16, 16), (32, 0), (-1, 32), (4, 64)])
+def test_mha_non_causal_right_window(
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    WINDOW_SIZE: tuple[int, int],
+):
+    # A right window works with the default impl, without calling mha_set_impl.
+    BATCH = 2
+    device: str = "cuda"
+    dtype: torch.dtype = torch.bfloat16
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+
+    triton_out = flash_attn_func(q, k, v, causal=False, window_size=WINDOW_SIZE)
+    torch_out, _, _ = attention_ref(q, k, v, causal=False, window_size=WINDOW_SIZE)
+    torch.testing.assert_close(
+        triton_out,
+        torch_out,
+        atol=1e-2,
+        rtol=1e-2,
+        msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
+    )
+
+    do = torch.randn_like(q)
+    triton_grads = torch.autograd.grad(triton_out, (q, k, v), do)
+    torch_grads = torch.autograd.grad(torch_out, (q, k, v), do)
+    for name, triton_grad, torch_grad in zip(
+        ("dq", "dk", "dv"), triton_grads, torch_grads
+    ):
+        torch.testing.assert_close(
+            triton_grad,
+            torch_grad,
+            atol=1.5e-2,
+            rtol=1.5e-2,
+            msg=lambda msg, name=name: f"bwd {name} mismatch\n\n{msg}\n",
+        )
+
+
 def test_mha_sliding_window_fused_backward_raises():
     q = torch.randn(
         (1, 128, 8, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True

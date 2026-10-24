@@ -85,6 +85,27 @@ def mha_set_impl(impl: Literal["default", "dao_ai"]):
     _MHA_IMPL = impl
 
 
+def _resolve_mha_impl(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    window_size_right: int,
+    sink: torch.Tensor | None,
+) -> Literal["default", "dao_ai"]:
+    # The default kernel has no right-side sliding window but dao_ai does, so
+    # use dao_ai for such calls when it supports the rest of the call (no sink,
+    # no positional-encoding head dim, no FP8). Forward and backward call this
+    # with the same inputs so both passes run on the same implementation.
+    if (
+        _MHA_IMPL == "default"
+        and int(window_size_right) != -1
+        and sink is None
+        and q.shape[-1] == v.shape[-1]
+        and not types._is_fp8(q)
+    ):
+        return "dao_ai"
+    return _MHA_IMPL
+
+
 _USE_INT64_STRIDES = True
 
 
@@ -518,7 +539,8 @@ def _flash_attn_forward(
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    if _MHA_IMPL != "dao_ai" and window_size_right != -1:
+    impl = _resolve_mha_impl(q, v, window_size_right, sink)
+    if impl != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
     sliding_window = max(window_size_left, 0)
 
@@ -625,7 +647,7 @@ def _flash_attn_forward(
     else:
         s_dmask = None
 
-    if _MHA_IMPL == "dao_ai":
+    if impl == "dao_ai":
         assert sink is None, "dao_ai impl does not support attention sink."
         assert (
             pe_head_dim == 0
@@ -875,7 +897,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
         sliding_window = _get_sliding_window_size(ctx.window_size)
 
-        if _MHA_IMPL == "dao_ai":
+        if _resolve_mha_impl(q, v, ctx.window_size[1], sink) == "dao_ai":
             assert sink is None, "dao_ai impl does not support attention sink."
             flash_attn_2.bwd(
                 do_padded,
@@ -1208,7 +1230,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_og % 8])
         sliding_window = _get_sliding_window_size(ctx.window_size)
 
-        if _MHA_IMPL == "dao_ai":
+        if _resolve_mha_impl(q, v, ctx.window_size[1], sink) == "dao_ai":
             assert sink is None, "dao_ai impl does not support attention sink."
             flash_attn_2.varlen_bwd(
                 do_padded,
