@@ -23,6 +23,8 @@ _gemm_a16w16_gated_repr = make_kernel_repr(
         "cache_modifier",
         "activation",
         "use_activation",
+        "ADD_BIAS",
+        "GATE_FIRST",
     ],
 )
 
@@ -38,6 +40,7 @@ _gemm_a16w16_gated_repr = make_kernel_repr(
 def _gemm_a16_w16_gated_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M,
     N,
@@ -58,6 +61,8 @@ def _gemm_a16_w16_gated_kernel(
     cache_modifier: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+    GATE_FIRST: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -138,10 +143,22 @@ def _gemm_a16_w16_gated_kernel(
         b0_ptrs += BLOCK_SIZE_K * stride_bk
         b1_ptrs += BLOCK_SIZE_K * stride_bk
 
-    if use_activation:
-        acc0 = activation(acc0)
+    if ADD_BIAS:
+        acc0 += tl.load(bias_ptr + offs_bn0).to(acc_dtype)[None, :]
+        acc1 += tl.load(bias_ptr + offs_bn1).to(acc_dtype)[None, :]
 
-    acc_gated = acc0 * acc1
+    # GATE_FIRST: the first half of the N outputs is the gate (SwiGLU style).
+    # Otherwise the second half is the gate (diffusers GEGLU style).
+    if GATE_FIRST:
+        gate = acc0
+        value = acc1
+    else:
+        gate = acc1
+        value = acc0
+    if use_activation:
+        gate = activation(gate)
+
+    acc_gated = gate * value
     c = acc_gated.to(c_ptr.type.element_ty)
 
     # Write back the block of the output matrix C with masks.
