@@ -207,6 +207,20 @@ class FMoeKernel
         }
         else if(this->flat_mode == 2)
         {
+            // EMSORT partitions token/expert assignments across four waves,
+            // each with 512 worker slots, so its queue holds 2048 assignments.
+            // Its per-expert LDS histogram is a 64-bit token bitmap.
+            constexpr uint64_t max_assignments = 2048;
+            AITER_CHECK(token_cnt <= 64,
+                        __func__,
+                        ": EMSORT supports token_cnt <= 64; got ",
+                        token_cnt);
+            AITER_CHECK(static_cast<uint64_t>(token_cnt) * topk <= max_assignments,
+                        __func__,
+                        ": EMSORT supports token_cnt*topk <= ",
+                        max_assignments,
+                        "; got ",
+                        static_cast<uint64_t>(token_cnt) * topk);
             AITER_CHECK(eprt <= 1024,
                         __func__,
                         ": EMSORT supports at most 1024 experts; got ",
