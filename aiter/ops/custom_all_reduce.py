@@ -154,6 +154,7 @@ def fused_allreduce_rmsnorm_mxfp4_quant(
     use_1stage: bool,
     bf16_out_ptr: int = 0,
     gemma_norm: bool = False,
+    hadamard_rotate: bool = False,
 ) -> None: ...
 
 

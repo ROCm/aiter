@@ -2481,6 +2481,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
         emit_bf16: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         K = inp.shape[-1]
         _validate_mxfp4_hidden_dim(K, inp.element_size())
@@ -2512,6 +2513,7 @@ class CustomAllreduce:
             use_1stage,
             bf16_ptr,
             gemma_norm,
+            hadamard_rotate,
         )
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
@@ -2591,6 +2593,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
         emit_bf16: bool = False,
         gemma_norm: bool = False,
+        hadamard_rotate: bool = False,
     ):
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -2605,6 +2608,7 @@ class CustomAllreduce:
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                     gemma_norm=gemma_norm,
+                    hadamard_rotate=hadamard_rotate,
                 )
             else:
                 K = input.shape[-1]
@@ -2633,6 +2637,7 @@ class CustomAllreduce:
             use_1stage=use_1stage,
             emit_bf16=emit_bf16,
             gemma_norm=gemma_norm,
+            hadamard_rotate=hadamard_rotate,
         )
 
     def close(self):
