@@ -102,15 +102,6 @@ def _production_quantize_mxfp8(query, key, value, softmax_scale):
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 
-def _production_quantize_f4f4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale = quantize_mxfp4_k(key)
-    k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
-    v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
-
-
 def _production_quantize_mxfp6(
     query, key, value, softmax_scale, v_format=None, fp6_p=False
 ):
@@ -218,11 +209,6 @@ KERNEL_SPECS = {
         uses_hadamard=True,
     ),
     "mha4_mxfp4": _mha_v4_spec(
-        (0.5, 0.5, 0.5),
-        supports_block_sparse=True,
-        uses_hadamard=True,
-    ),
-    "mha4_f4f4": _mha_v4_spec(
         (0.5, 0.5, 0.5),
         supports_block_sparse=True,
         uses_hadamard=True,
@@ -356,6 +342,13 @@ _DIFFUSION_CHANNEL_SIGMA = 0.16
 _DIFFUSION_LOGIT_STD = 2.2
 _DIFFUSION_V_OUTLIER_DIM_GAIN = 2.0
 _DIFFUSION_V_OUTLIER_TOKEN_GAIN = 4.0
+# Attention concentrated on ~10-20 effective tokens, where averaging fewer V rows cancels less of
+# the independent MX quantization noise. Calibrated to land near p64 of real heads in that band.
+_PEAKED_LOGIT_STD = 4.0
+# Tied-key pairs for `tiebreak`. The gaps span the formats' mantissa resolution so each flips a
+# different fraction of the ties; a single gap only yields an arbitrary, non-monotone ranking.
+_TIEBREAK_PEAK_LOGIT = 20.0
+_TIEBREAK_GAPS = (0.005, 0.011, 0.025, 0.055, 0.12, 0.26)
 
 
 def _coherent_rows(batch, heads, seq, dim, rho, sigma, device):
@@ -385,6 +378,7 @@ def _generate_diffusion_qkv(
     d_head: int,
     d_head_v: int,
     device: str,
+    logit_std: float = _DIFFUSION_LOGIT_STD,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diffusion-transformer activations. Returns fp32 q/k/v.
 
@@ -411,7 +405,7 @@ def _generate_diffusion_qkv(
     # common modes, which are ratios.
     probe = torch.arange(0, sq, max(1, sq // 64), device=device)[:64]
     measured = ((q[0, 0, probe] @ k[0, 0].T) * (d_head**-0.5)).std(-1).median()
-    q *= _DIFFUSION_LOGIT_STD / measured.clamp_min(1e-9)
+    q *= logit_std / measured.clamp_min(1e-9)
     return q, k, v
 
 
@@ -419,6 +413,8 @@ _NAMED_DISTRIBUTIONS = (
     "zero",
     "normal",
     "diffusion",
+    "peaked",
+    "tiebreak",
     "padded",
     "transformer",
     "sink",
@@ -660,6 +656,49 @@ def generate_test_tensors(
         direction = torch.randn((hk, d_head), device=device, dtype=torch.float32)
         direction /= direction.norm(dim=-1, keepdim=True)
         k += 16.0 * k.norm(dim=-1).mean() * direction[None, :, None, :]
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "peaked":
+        # Diffusion activations peaked onto ~10-20 effective tokens, the regime where MX V
+        # quantization starts to hurt. Reproduces a TYPICAL head for that diffuseness, not the
+        # p90+ tail where real heads amplify 3-6x; use dump:PATH when severity matters.
+        q, k, v = _generate_diffusion_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device, logit_std=_PEAKED_LOGIT_STD
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "tiebreak":
+        # Near-degenerate attention (n_eff ~1.6): nothing averages, so the output inherits V's own
+        # quantization error unattenuated, and the near-tied keys add a smaller Q/K-precision term.
+        # Measured: V is the larger contributor at MXFP4 (~0.12 against ~0.035 for Q/K).
+        if sk < 2 * len(_TIEBREAK_GAPS):
+            raise ValueError(
+                f"tiebreak needs at least {2 * len(_TIEBREAK_GAPS)} keys, got sk={sk}"
+            )
+        q, k, v = _generate_diffusion_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
+        )
+        pairs = len(_TIEBREAK_GAPS)
+        direction = torch.nn.functional.normalize(
+            torch.randn((pairs, hk, d_head), device=device, dtype=torch.float32), dim=-1
+        )
+        # Independent, not opposing: opposing rows cancel the tied reference output to ~0.
+        v_axis = torch.nn.functional.normalize(
+            torch.randn((2 * pairs, hk, d_head_v), device=device, dtype=torch.float32),
+            dim=-1,
+        )
+        # q.k = amp^2 and the kernel scales by d^-0.5, so this lands the winners at the target.
+        amp = (_TIEBREAK_PEAK_LOGIT * d_head**0.5) ** 0.5
+        row_norm = v.norm(dim=-1).mean()
+        for i, gap in enumerate(_TIEBREAK_GAPS):
+            k[:, :, 2 * i, :] = amp * direction[i]
+            k[:, :, 2 * i + 1, :] = amp * (1.0 + gap) * direction[i]
+            v[:, :, 2 * i, :] = row_norm * v_axis[2 * i]
+            v[:, :, 2 * i + 1, :] = row_norm * v_axis[2 * i + 1]
+        # Each query row points at one pair, so the shards of the output ride on different ties.
+        kv_of_q = torch.arange(hq, device=device) // (hq // hk)
+        pair_of_row = torch.arange(sq, device=device) % pairs
+        q[:] = amp * direction[pair_of_row][:, kv_of_q].permute(1, 0, 2)
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution == "padded":
@@ -1439,29 +1478,24 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel in ("mha4_mxfp4", "mha4_f4f4"):
+    if args.kernel == "mha4_mxfp4":
         block_r = args.block_r
         if block_r != 128:
             raise ValueError(f"{args.kernel} requires block_r=128, got {block_r}")
         if args.qsmooth:
             raise ValueError(f"{args.kernel} does not support --qsmooth")
 
-        is_f4f4 = args.kernel == "mha4_f4f4"
         v_format = AttentionFormat.MXFP4
         scale_modes = scale_modes_for_formats(
             AttentionFormat.MXFP4, AttentionFormat.MXFP4, v_format
         )
-        # Both all-MXFP4 kernels consume an FP6 P operand, so both need the FP6-P V order.
+        # The all-MXFP4 kernel consumes an FP6 P operand, so it needs the FP6-P V order.
         v_pack = AttentionPack.V_FOR_FP6_P
 
         def _quantize_mxfp4():
             quant_q, quant_k = q_bshd, k_bshd
             if not args.hadamard_rotate:
                 quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
-            if is_f4f4:
-                return _production_quantize_f4f4(
-                    quant_q, quant_k, v_bshd, softmax_scale
-                )
             return _production_quantize_mxfp4(quant_q, quant_k, v_bshd, softmax_scale)
 
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
@@ -1611,6 +1645,10 @@ def compute_accuracy_metrics(
 
 
 def fp8_max_diff_percentage(args: argparse.Namespace) -> float:
+    # tiebreak diverges from the BF16 reference by construction, so closeness to BF16 is not the
+    # property under test; this bound is only a backstop against gross breakage.
+    if args.input_distribution == "tiebreak":
+        return 25.0
     # The coherent distributions and the LLM one are both harder on FP8 than iid inputs.
     if args.input_distribution in (
         "transformer",
@@ -2381,10 +2419,18 @@ def parse_args() -> argparse.Namespace:
         "--input-distribution",
         type=_input_distribution,
         default="diffusion",
-        metavar="{zero,normal,diffusion,padded,transformer,sink,underflow,latepeak,maxstair,kcommon,dump:PATH}",
+        metavar="{zero,normal,diffusion,peaked,tiebreak,padded,transformer,sink,underflow,latepeak,maxstair,kcommon,dump:PATH}",
         help=(
-            "Distribution used for generated Q/K/V tensors. 'diffusion' (default) is calibrated "
-            "to dumped Wan, HunyuanVideo 1.5 and Flux2 attention; 'transformer' is the LLM "
+            "Distribution used for generated Q/K/V tensors. The three that cover diffusion latent "
+            "self-attention are 'diffusion', 'peaked' and 'tiebreak'. 'diffusion' (default) is the "
+            "benign bulk, calibrated to dumped Wan, HunyuanVideo 1.5, Flux2, Z-Image, MiniMax-H3 "
+            "and LTX-2.5 attention (n_eff ~190, V-quantization amplification ~0.36); 'peaked' "
+            "concentrates attention on ~10-20 effective tokens, the regime where MX V quantization "
+            "starts to hurt, and lands at about the median real head for that diffuseness; "
+            "'tiebreak' drives attention onto ~2 near-tied keys so nothing averages, which is "
+            "the worst case for inheriting V's own quantization error and also exposes Q/K "
+            "precision. "
+            "'transformer' is the LLM "
             "activation model, which differs mainly in carrying almost no token-common "
             "component; 'padded' is diffusion with empty Ulysses-padding heads, which real "
             "sharded models produce and which no other distribution covers; 'zero' "
@@ -2394,7 +2440,7 @@ def parse_args() -> argparse.Namespace:
             "for alternating query-row groups; 'kcommon' adds a shared K direction far past what "
             "real models reach, which inflates quantization noise without changing any softmax "
             "statistic; 'dump:PATH' replays Q/K/V captured from a real model, which no synthetic "
-            "distribution here reproduces the quantization error of."
+            "distribution here reproduces the worst-case severity of."
         ),
     )
     parser.add_argument(
