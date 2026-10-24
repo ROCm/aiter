@@ -354,20 +354,61 @@ class TestConfigShapeCollision(unittest.TestCase):
         # dedicated caller policy still owns public-kid normalization.
         from aiter.ops.opus import policy
 
+        # Exercise legacy local-kid normalization without pinning this test to
+        # whichever kids happen to win two production tuning rows. Retuning is
+        # allowed to change those winners; rewrite two rows only in the temp
+        # config copy and require the loader to restore their global ids.
+        tuned = os.path.join(
+            self._tmp,
+            "aiter",
+            "configs",
+            "model_configs",
+            "dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
+        )
+        with open(tuned, newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            tuned_rows = list(reader)
+
+        normalized = []
+        for row in tuned_rows:
+            if row.get("libtype") != "opus":
+                continue
+            global_kid = int(row["kernelId"])
+            local_kid = global_kid - 8000
+            if not 0 <= local_kid <= 1899:
+                continue
+            key = (
+                row["gfx"],
+                int(row["b"]),
+                int(row["m"]),
+                int(row["n"]),
+                int(row["k"]),
+                row["w_scale_block"],
+            )
+            row["kernelId"] = str(local_kid)
+            normalized.append((key, global_kid))
+            if len(normalized) == 2:
+                break
+        self.assertEqual(len(normalized), 2)
+
+        with open(tuned, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(tuned_rows)
+
+        _cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()
         rows = policy._load_mxscale_bmm_tuned("opus")
         self.assertTrue(rows)
         self.assertEqual(len(rows), len(set(rows)))
-        self.assertEqual(
-            rows[("gfx950", 2, 1, 1024, 4096, "128x128")]["kernelId"],
-            8311,
-            "legacy local OPUS kid 311 must become public global kid 8311",
-        )
-        self.assertEqual(
-            rows[("gfx950", 8, 128, 1024, 4096, "128x128")]["kernelId"],
-            8653,
-            "legacy local OPUS kid 653 must become public global kid 8653",
-        )
+        for key, global_kid in normalized:
+            self.assertEqual(
+                rows[key]["kernelId"],
+                global_kid,
+                f"legacy local OPUS kid {global_kid - 8000} must become "
+                f"public global kid {global_kid}",
+            )
         policy._load_mxscale_bmm_tuned.cache_clear()
 
     def test_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle(self):
