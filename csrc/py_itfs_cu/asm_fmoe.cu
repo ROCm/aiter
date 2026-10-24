@@ -210,6 +210,12 @@ class FMoeKernel
             // EMSORT partitions token/expert assignments across four waves,
             // each with 512 worker slots, so its queue holds 2048 assignments.
             // Its per-expert LDS histogram is a 64-bit token bitmap.
+            //
+            // The producer is the last Y workgroup. Every other workgroup spins
+            // on its ready flag, so the whole grid has to be resident together.
+            // The dispatcher is that resident set: num_persistent_tgs is
+            // tg_num_perCU * num_cu, rounded down to lcm(ps_deno, tgs_align),
+            // and the launch is exactly that pool.
             constexpr uint64_t max_assignments = 2048;
             AITER_CHECK(token_cnt <= 64,
                         __func__,
@@ -231,10 +237,14 @@ class FMoeKernel
                         inter_dim,
                         ", sub_GU=",
                         sub_GU);
+            AITER_CHECK(this->num_persistent_tgs > 0 && args.total_tgs > 0,
+                        __func__,
+                        ": EMSORT requires the dispatcher resident grid; got total_tgs=",
+                        args.total_tgs,
+                        ", pool=",
+                        this->num_persistent_tgs);
             gdx = inter_dim / sub_GU;
-            const int emsort_tgs = args.total_tgs > 0
-                                       ? static_cast<int>(args.total_tgs)
-                                       : 256;
+            const int emsort_tgs = static_cast<int>(args.total_tgs);
             AITER_CHECK(gdx > 0 && (emsort_tgs % gdx) == 0,
                         __func__,
                         ": EMSORT requires total_tgs divisible by inter_dim/sub_GU; got total_tgs=",
@@ -244,6 +254,16 @@ class FMoeKernel
             bdx = 256;
             gdy = emsort_tgs / gdx;
             gdz = 1;
+            const uint32_t launched =
+                static_cast<uint32_t>(gdx) * static_cast<uint32_t>(gdy);
+            // num_persistent_tgs is tg_num_perCU * num_cu. That is the resident
+            // set this kernel was built to fill (2 workgroups/CU on gfx950).
+            AITER_CHECK(launched <= this->num_persistent_tgs,
+                        __func__,
+                        ": EMSORT grid must be fully resident; launched ",
+                        launched,
+                        " workgroups, dispatcher pool ",
+                        this->num_persistent_tgs);
         }
         else if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
                 (args.total_tgs % args.ps_deno) == 0) // ps
