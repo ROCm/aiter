@@ -34,6 +34,11 @@ from aiter.ops.flydsl.conv3d_policy import (
     max_lds_bytes,
     tile_kernel_name,
 )
+from aiter.ops.flydsl.conv3d_policy_gfx1250 import (
+    get_flydsl_conv3d_configs_gfx1250,
+    is_legal_tile_gfx1250,
+    tile_kernel_name_gfx1250,
+)
 from aiter.ops.flydsl.conv_kernels import (
     LIBTYPE_FLYDSL,
     TUNED_BLOCK_ROWS_COLUMN,
@@ -150,6 +155,19 @@ def conv3d_ref(x, weight, bias, params):
     ref_bias = bias.to(x.dtype) if bias is not None else None
     y = F.conv3d(x.permute(0, 4, 1, 2, 3).contiguous(), weight, bias=ref_bias, **params)
     return y.permute(0, 2, 3, 4, 1).contiguous()
+
+
+def strict_compare(ref, res, msg="", printLog=False):
+    """1.0 if any element is outside RTOL/ATOL, else 0.0.
+
+    mp_tuner rounds the error ratio to 4 decimals, so a plain ratio under 5e-5
+    -- thousands of wrong elements on the larger VAE layers -- would pass
+    errRatio=0.
+    """
+    bad = int((~torch.isclose(res, ref, rtol=RTOL, atol=ATOL)).sum().item())
+    if bad and printLog:
+        logger.info(f"{msg}{bad} of {ref.numel()} elements outside tolerance")
+    return 1.0 if bad else 0.0
 
 
 def _shape_key(row):
@@ -340,10 +358,19 @@ class Conv3dTuner(TunerCommon):
         has_bias = _parse_tuned_bool(kv["bias"])
         params = _row_params(kv)
         m_gemm, n_gemm, _k_gemm, _ = self._gemm_dims(keys)
+        gfx = self.get_gfx()
+        is_1250 = str(gfx).startswith("gfx1250")
 
         # crs is built from the *padded* per-group channel count, matching what
         # the kernel computes; splitK divisibility depends on it.
-        cgp = _pad_channels(c // groups)
+        # gfx1250 aligns C/groups to 32 (CGP_ALIGN); gfx950 uses LDG_VEC via
+        # _pad_channels.
+        if is_1250:
+            from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import CGP_ALIGN
+
+            cgp = (c // groups + CGP_ALIGN - 1) // CGP_ALIGN * CGP_ALIGN
+        else:
+            cgp = _pad_channels(c // groups)
         crs = cgp * kt * kh * kw
 
         def splitk_for(tile):
@@ -390,30 +417,37 @@ class Conv3dTuner(TunerCommon):
             ]
             return min(sizes) if sizes else float("inf")
 
-        configs = get_flydsl_conv3d_configs(
-            m_gemm,
-            n_gemm,
-            groups,
-            self.get_cu_num(),
-            max_configs=max_configs,
-            lds_bytes_fn=lds_bytes_fn,
-        )
+        if is_1250:
+            # The gfx1250 policy already sweeps block_rows per tile.
+            candidates = get_flydsl_conv3d_configs_gfx1250(
+                m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
+            )
+        else:
+            configs = get_flydsl_conv3d_configs(
+                m_gemm,
+                n_gemm,
+                groups,
+                self.get_cu_num(),
+                max_configs=max_configs,
+                lds_bytes_fn=lds_bytes_fn,
+            )
+            candidates = [
+                (*cfg5, r)
+                for cfg5 in configs
+                for r, plan in block_rows_options(tuple(cfg5[:4]))
+                if r == 1 or plan_lds_bytes(plan) <= max_lds_bytes()
+            ]
         # BASELINE_TILES covers the heuristic default but not a borrowed one: a
         # tile tuned at another resolution of this layer can fall outside this
         # npq's max_configs cut, and the runtime serves it until this row exists.
         borrowed = _borrow_tuned_tile(
-            (self.get_gfx(), self.get_cu_num()),
+            (gfx, self.get_cu_num()),
             _shape_key(keys[len(TUNED_DEVICE_COLUMNS) :]),
         )
-        candidates = [
-            (*cfg5, r)
-            for cfg5 in configs
-            for r, plan in block_rows_options(tuple(cfg5[:4]))
-            if r == 1 or plan_lds_bytes(plan) <= max_lds_bytes()
-        ]
         if borrowed is not None:
             b = (*borrowed[0], borrowed[1], borrowed[3])
-            if b not in candidates:
+            legal = not is_1250 or is_legal_tile_gfx1250(*b[:4], b[5])
+            if legal and b not in candidates:
                 candidates.append(b)
 
         tasks = []
@@ -428,6 +462,14 @@ class Conv3dTuner(TunerCommon):
             # the value that ran and AOT compiles the artifact the runtime asks
             # for.
             sk = splitk_for(tile)
+            if is_1250:
+                kname = tile_kernel_name_gfx1250(
+                    tile_m, tile_n, wave_m, wave_n, block_rows
+                )
+            else:
+                kname = tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm) + (
+                    f"_r{block_rows}" if block_rows > 1 else ""
+                )
             info = (
                 keys,
                 tile_m,
@@ -437,8 +479,7 @@ class Conv3dTuner(TunerCommon):
                 wgm,
                 sk,
                 block_rows,
-                tile_kernel_name(tile_m, tile_n, wave_m, wave_n, wgm)
-                + (f"_r{block_rows}" if block_rows > 1 else ""),
+                kname,
             )
             tasks.append(
                 (
@@ -454,10 +495,8 @@ class Conv3dTuner(TunerCommon):
                     None,
                     RTOL,
                     ATOL,
-                    None,  # compare_fn
+                    strict_compare,
                     None,  # max_abs_delta
-                    # No output_keys: conv3d_implicit allocates and returns its
-                    # own output, so there is no caller-owned buffer to NaN-fill.
                     None,
                 )
             )
@@ -573,7 +612,8 @@ class Conv3dTuner(TunerCommon):
                 print(
                     f"Tuning result for {str(dict(zip(self.keys, keys))).strip('{}')} "
                     f"is tile=({tile_m},{tile_n},{wave_m},{wave_n}) wgm={wgm} "
-                    f"splitK={splitk}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
+                    f"block_rows={block_rows} splitK={splitk}, {time}us, "
+                    f"{err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
                 )
             rows.append(row)
         return pd.DataFrame(rows, columns=self.columns)

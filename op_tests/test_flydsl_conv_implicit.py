@@ -306,7 +306,38 @@ KW_CASES = [
     ("3d_1x1x1", 3, _X3, (48, 32, 1, 1, 1), {}, None, True),
     ("2d_3x3_pad1", 2, _X2, _W2, {"padding": 1}, None, False),
     ("2d_1x1", 2, _X2, (96, 96, 1, 1), {}, None, False),
-    ("2d_splitk2", 2, _X2, _W2, {"padding": 1, "splitk": 2}, {"padding": 1}, False),
+    # Tile must divide Ho/Wo and kg so split-K is not rejected by the tail gate
+    # (gfx950 and gfx1250 both refuse split-K with a masked tile edge).
+    (
+        "2d_splitk2",
+        2,
+        _X2,
+        _W2,
+        {
+            "padding": 1,
+            "splitk": 2,
+            "tile": (64, 32, 2, 1),
+            "block_rows": 4,
+            "patch_reuse": False,
+        },
+        {"padding": 1},
+        False,
+    ),
+    (
+        "3d_splitk2",
+        3,
+        (1, 32, 4, 32, 32),
+        (64, 32, 2, 2, 2),
+        {
+            "padding": 0,
+            "splitk": 2,
+            "tile": (64, 64, 2, 2),
+            "block_rows": 4,
+            "patch_reuse": False,
+        },
+        {"padding": 0},
+        False,
+    ),
     ("1d_3_pad1", 1, (1, 32, 128), (64, 32, 3), {"padding": 1}, None, False),
     # Independent input/output layouts; torch has no such kwargs (ref_kw).
     (
@@ -367,12 +398,13 @@ KW_CASES = [
         True,
     ),
     # Pin wider tiles; KW shapes otherwise land on the narrowest _pick_tile.
+    # gfx1250 uses wave32 so (wave_m, wave_n) differ from gfx950's wave64 tiles.
     (
         "3d_tile_128",
         3,
         _X3,
         _W3,
-        {"padding": 1, "tile": (128, 128, 2, 4)},
+        {"padding": 1, "tile": (128, 128, 2, 4), "block_rows": 8},
         {"padding": 1},
         False,
     ),
@@ -381,7 +413,7 @@ KW_CASES = [
         2,
         _X2,
         _W2,
-        {"padding": 1, "tile": (256, 256, 2, 4)},
+        {"padding": 1, "tile": (256, 256, 2, 4), "block_rows": 8},
         {"padding": 1},
         False,
     ),
@@ -434,7 +466,32 @@ KW_CASES = [
         {"stride": 2, "padding": 1},
         True,
     ),
+    # gfx1250: R/C tail + N tail with an oversize N tile.
+    (
+        "3d_tail_blocks",
+        3,
+        (1, 32, 3, 17, 19),
+        _W3,
+        {"padding": 1, "tile": (64, 64, 2, 2), "block_rows": 4},
+        {"padding": 1},
+        True,
+    ),
 ]
+
+# gfx1250 caps a block at 4 waves (conv3d_gfx1250_utils.MAX_WAVES), so the
+# gfx950-sized tiles pinned above map to the widest legal gfx1250 tiles.
+_GFX1250_TILES = {
+    (128, 128, 2, 4): (128, 128, 2, 2),
+    (256, 256, 2, 4): (256, 96, 4, 1),
+}
+
+
+def _arch_kwargs(kw):
+    if "tile" in kw and get_gfx().split(":", 1)[0] == "gfx1250":
+        tile = tuple(kw["tile"])
+        return {**kw, "tile": _GFX1250_TILES.get(tile, tile)}
+    return kw
+
 
 # -c labels, read back off the sweep builders so the choices cannot drift from the
 # shapes. Resolution and clip length scale extents and call counts, never names, so
@@ -761,7 +818,9 @@ def main():
         name = str(dtype).split(".")[-1]
 
         rows = [
-            test_conv_implicit(case, rank, xs, ws, dtype, kw, ref_kw, bias)
+            test_conv_implicit(
+                case, rank, xs, ws, dtype, _arch_kwargs(kw), ref_kw, bias
+            )
             for case, rank, xs, ws, kw, ref_kw, bias in KW_CASES
             if case in args.cases
         ]
