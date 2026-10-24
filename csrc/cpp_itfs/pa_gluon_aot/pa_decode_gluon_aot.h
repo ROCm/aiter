@@ -86,6 +86,7 @@ inline std::string pa_decode_cache_key(
     int query_seq_len,
     int one_query_group_size,
     int head_size_pow2,
+    bool head_padded,
     int kv_block_size,
     int context_partition_size,
     int query_quant_mode,
@@ -100,6 +101,7 @@ inline std::string pa_decode_cache_key(
         std::to_string(query_seq_len) + "_" +
         std::to_string(one_query_group_size) + "_" +
         std::to_string(head_size_pow2) + "_" +
+        std::to_string(head_padded) + "_" +
         std::to_string(kv_block_size) + "_" +
         std::to_string(context_partition_size) + "_" +
         std::to_string(query_quant_mode) + "_" +
