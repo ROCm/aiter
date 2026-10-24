@@ -31,6 +31,8 @@ from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..gemm_op_common import get_padded_m, with_mxscale_w_scale_block
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
+    _A8W8_MXSCALE_BMM_PREFETCH_TAGS,
+    A8W8_MXSCALE_BMM_WAVE8_TAGS,
     A16W16LaunchPlan,
     _get_cached_a8w8_mxscale_bmm_plan,
     _get_cached_a16w16_launch_plan,
@@ -809,21 +811,39 @@ def _heuristic_mxscale_bmm_kid(
 # there most often at K=4096; the later ones only have to run where it cannot,
 # which is why each band ends in the 32-wide, 128-deep tiles that divide any N
 # and K the family accepts at all, and then in the compact tiles.
-#
-# K-tile sufficiency is not screened here. Every band family is in
-# launch_plan._A8W8_MXSCALE_BMM_PREFETCH_TAGS, so the plan call below already
-# rejects a candidate whose K cannot feed that instance's own prefetch depth.
-# Screening on a blanket bound instead denied a fallback to every K below four
-# of the shallowest band tile's 128, so K=128, 256 and 384 raised even where a
-# tile ran. The compact family sits outside that tag set because it consumes a
-# single K tile, which is what leaves it as the only candidate for a K no band
-# tile can prefetch; it goes last so it only answers shapes the bands drop.
-# GROUP_K=32 has no compact twin and so keeps the band tiles' K floor.
 _BPRESHUFFLE_FALLBACK_BANDS = (
     (64, (179, 398, 171, 338, 483, 484)),
     (512, (171, 175, 338, 398, 483, 484)),
     (None, (205, 348, 175, 338, 398, 484, 483)),
 )
+# A candidate whose K cannot feed its prefetch ring has to be screened out, and
+# which screen applies depends on the family. For the tags the launch plan
+# prefetch-validates -- the bdirect and blds tiles above -- it already checks K
+# against a8w8_mxscale_flatmm_prefetch_k_iter of that exact instance, which is both
+# authoritative and tighter than any bound here: 338 needs 3 tiles of 128, not the
+# 4 a blanket bound demands. The wave8n4 (175, 348) and wavetm1 (205) tiles run
+# their own traits, and the plan checks them against
+# a8w8_mxscale_wave8_prefetch_k_iter, a mirror of those.
+#
+# Compact needs no screen at all, and shows why the helper cannot simply be
+# extended by tag: it reports a depth of 9 for 483, yet test_compact_mxscale_bmm
+# runs that tile at a K of one tile. Its pipeline consumes one K tile with no
+# cross-tile ring, which is what leaves it as the only candidate for a K no band
+# tile can prefetch. It goes last in each band so it only answers shapes the bands
+# drop. GROUP_K=32 has no compact twin and so keeps the band tiles' K floor.
+_BPRESHUFFLE_FALLBACK_MIN_K_TILES = 4
+_BPRESHUFFLE_NO_K_TILE_FLOOR = frozenset({"a8w8_mxscale_bmm_bpreshuffle_compact"})
+
+
+def _bpreshuffle_fallback_k_tiles_ok(inst, k: int) -> bool:
+    """False when nothing else will screen this candidate's K-tile count."""
+    if (
+        inst.kernel_tag in _A8W8_MXSCALE_BMM_PREFETCH_TAGS
+        or inst.kernel_tag in A8W8_MXSCALE_BMM_WAVE8_TAGS
+        or inst.kernel_tag in _BPRESHUFFLE_NO_K_TILE_FLOOR
+    ):
+        return True
+    return k // inst.B_K >= _BPRESHUFFLE_FALLBACK_MIN_K_TILES
 
 
 def _heuristic_mxscale_bmm_bpreshuffle_kid(
@@ -841,19 +861,67 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
     Per-row K32 scales prefer larger tiles for sufficiently large output grids.
     Every candidate is checked for admissibility; None when no candidate runs.
     """
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernels_list
+
     _validate_mxscale_bmm_group_size(group_size)
     group_n = group_size if group_n is None else group_n
     block = f"{group_n}x{group_size}"
     mxscale_bmm_groups_of_block(block)
     if block == "1x32":
-        # The 64x64 tile amortizes operand/scale loads once there are enough
-        # output tiles. Smaller grids retain the decode tiles; tuned rows can
-        # additionally choose split-K. Keep K128/N16 alignment fallbacks.
-        wide_tiles = g * ((m + 63) // 64) * (n // 64)
-        preferred = (9713,) if m >= 64 and wide_tiles >= 256 else ()
-        if m >= 256:
-            preferred += (9703,)
-        for kid in (*preferred, 9700, 9704, 9708, 9710):
+        # Fitted to an sk1 sweep of every 1x32 kid over G 1-16, M 1-4096,
+        # N 512-4096, K 1024-7168: within ~2% of the per-shape best on
+        # geomean. What decides the tile is how many 64x64 output tiles the
+        # grid has against the 256 CUs; M only matters where a tile's rows
+        # would sit empty. The first pick may not run the shape (9724 holds
+        # at most 25 K-tiles, the 128-wide tiles need N%128), so each is
+        # followed by kids with looser bounds.
+        t = g * ((m + 63) // 64) * (n // 64)
+        # (largest tile count, candidates); None closes each band list.
+        if m <= 16:
+            bands = ((64, (9709,)), (128, (9705,)), (512, (9701,)), (None, (9706,)))
+        elif m <= 32:
+            bands = (
+                (32, (9709,)),
+                (64, (9705,)),
+                (128, (9724, 9703)),
+                (None, (9724, 9721)),
+            )
+        else:
+            # Past 128 tiles the wavetm1 per-row kids (9760-9766) win, up to
+            # 1.9x over 9715 at 2048+; 1.008x of the per-shape best on
+            # geomean over the M>32 half of the sweep, at most 1.15x.
+            bands = (
+                (16, (9708,)),
+                (32, (9700,)),
+                (64, (9724, 9703)),
+                (128, (9725,)),
+                (256, (9766, 9721)),
+                (512, (9766, 9716 if m >= 128 else 9719)),
+                (1024, (9765, 9764, 9715)),
+                (2048, (9761, 9763, 9715)),
+                (None, (9761, 9760, 9715)),
+            )
+        preferred = next(c for bound, c in bands if bound is None or t <= bound)
+        fallback = (9714, 9721, 9725, 9700, 9704, 9708, 9710)
+
+        # The tile count above is in 64-row units, so it cannot see a pick
+        # whose rows sit mostly empty (M=192 on a 128-row tile pads by a
+        # third). Below 80% row use the next smaller tile goes first.
+        def rows_used(rows):
+            return m / (-(-m // rows) * rows) >= 0.8
+
+        rows = a8w8_mxscale_bmm_kernels_list[preferred[0]].B_M
+        if m > 32 and not rows_used(rows):
+            if rows == 128:
+                smaller = (9766, 9721) if rows_used(64) else (9724, 9725, 9721)
+                preferred = (*smaller, *preferred)
+            elif rows == 64:
+                preferred = (9724, 9725, *preferred)
+        for kid in (*preferred, *fallback):
+            if not _bpreshuffle_fallback_k_tiles_ok(
+                a8w8_mxscale_bmm_kernels_list[kid], k
+            ):
+                continue
             try:
                 _get_cached_a8w8_mxscale_bmm_plan(
                     get_gfx(), kid, output_dtype, m, g, n, k, 1
@@ -873,6 +941,7 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
             and mxscale_bmm_kid_takes_b_layout(kid, True)
             and mxscale_bmm_kid_takes_plain_scales(kid)
             and mxscale_bmm_kid_runs_m(kid, m)
+            and _bpreshuffle_fallback_k_tiles_ok(a8w8_mxscale_bmm_kernels_list[kid], k)
         ):
             continue
         try:

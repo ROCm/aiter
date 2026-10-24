@@ -10,6 +10,7 @@ from functools import cache, lru_cache
 import torch
 
 from csrc.opus_gemm.opus_gemm_common import (
+    A8W8_MXSCALE_BMM_WAVE8_TAGS,
     BIAS_AWARE_KIDS,
     GFX942_BF16WS_EXACT_N,
     GFX942_EVEN_LOOP_SPLITK_TAGS,
@@ -19,6 +20,8 @@ from csrc.opus_gemm.opus_gemm_common import (
     SPLITK_KIDS,
     OpusGemmInstance,
     a8w8_mxscale_flatmm_prefetch_k_iter,
+    a8w8_mxscale_sf_panel_k_tiles,
+    a8w8_mxscale_wave8_prefetch_k_iter,
     a16w16_flatmm_prefetch_k_iter,
     get_kernel_instance,
 )
@@ -730,6 +733,27 @@ def _build_a8w8_mxscale_bmm_plan(
             raise ValueError(
                 f"OPUS BMM kid {resolved_kid} requires at least "
                 f"{prefetch_k_iter} K-tiles; K={K} gives {total_iters}"
+            )
+        # The launcher raises past this bound too, but only once a heuristic or
+        # tuned row has already settled on the kid.
+        panel_k_tiles = a8w8_mxscale_sf_panel_k_tiles(instance)
+        split_iters = (total_iters + abi_split_k - 1) // abi_split_k
+        if panel_k_tiles is not None and split_iters > panel_k_tiles:
+            raise ValueError(
+                f"OPUS BMM kid {resolved_kid} holds at most {panel_k_tiles} "
+                f"K-tiles per split in its LDS scale panel; K={K}, "
+                f"split_k={abi_split_k} gives {split_iters}"
+            )
+    elif tag in A8W8_MXSCALE_BMM_WAVE8_TAGS:
+        total_iters = K // k_align
+        prefetch_k_iter = a8w8_mxscale_wave8_prefetch_k_iter(instance)
+        iters_full = (total_iters + abi_split_k - 1) // abi_split_k
+        last_loops = total_iters - (abi_split_k - 1) * iters_full
+        if last_loops < prefetch_k_iter:
+            raise ValueError(
+                f"OPUS BMM kid {resolved_kid} requires every split to have "
+                f"at least {prefetch_k_iter} K-tiles; K={K}, "
+                f"split_k={abi_split_k}, last split has {last_loops}"
             )
 
     workspace_numel = 0

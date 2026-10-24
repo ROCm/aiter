@@ -626,6 +626,31 @@ __attribute__((always_inline)) OPUS_D int sfb_group_base(int wave_id_n) {
     }
 }
 
+// The B scale panel row this lane reads for its N scale group ng.
+//
+// At GROUP_N >= W_N a group covers whole subtiles, so one scale serves all 16
+// of a subtile's N rows and the row *is* the group: wave-uniform, which is why
+// every caller could pass the group index straight through.
+//
+// GROUP_N == 1 is OCP MX's per-row scale. The group index then names a subtile
+// and the lane names its row within it, because the swap_ab MFMA already takes
+// B's N row from lane % W_N -- the same lane term sf_lane_k_block uses for B's
+// K block. So a per-row scale needs no extra group and no extra register, only
+// this term. Both the global path and the ring's LDS read address the panel by
+// row, so both go through here; the ring *fill* is a flat (row, K byte) copy
+// sized by N_SCALE_GROUPS, which is already B_N at GROUP_N == 1, and so needs
+// nothing.
+template<typename T>
+__attribute__((always_inline)) OPUS_D int sfb_panel_row(int wave_id_n, int ng, int lane_id) {
+    const int g = sfb_group_base<T>(wave_id_n) + ng;
+    if constexpr (T::GROUP_N == 1) {
+        return g * T::W_N + lane_id % T::W_N;
+    } else {
+        (void)lane_id;
+        return g;
+    }
+}
+
 template<typename T, typename S>
 __attribute__((always_inline)) OPUS_D int sf_scale_word(S scale) {
     if constexpr (T::SF_PER_MFMA_K == 1) {
@@ -807,6 +832,17 @@ OPUS_D void mma_mxscale_tiled(Mma& mma, const VA& v_a, const VB& v_b,
         const int scale_b = sf_scale_word<T>(v_sfb[0]);
         v_c = mma(v_a, v_b, v_c, scale_a, scale_b, 0_I, 0_I);
     } else if constexpr (MODE == mxscale_pack::shuffle_scale) {
+        // The shuffled layout stores one word per N scale group, with each K byte
+        // duplicated so a single scale_op_sel immediate serves both operands.
+        // GROUP_N == 1 has no such group -- its scale varies per lane, which a
+        // wave-uniform word cannot carry -- and shuf_b_word0 still indexes by
+        // group, so an instantiation that got here would read row 0's scale for
+        // all 16 rows of every subtile: plausible numbers, wrong ones. The kid
+        // tables exclude shuffle_scale from the GROUP_N=1 twins; this is the
+        // chokepoint that keeps that an invariant rather than a convention.
+        static_assert(T::GROUP_N != 1,
+                      "shuffle_scale packs one word per N scale group, which a "
+                      "per-row GROUP_N=1 scale does not have");
         // v_sfa / v_sfb are already the packed dwords the layout stores, so this
         // path has no pack step: A's word covers subtiles 2p and 2p+1, B's covers
         // one N scale group with each K byte stored twice, and opsel_shuf picks
@@ -1058,11 +1094,11 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                          + b_gmem_tile_base_mxsk<T>(col, k_start, kargs.stride_b));
     const bool direct_store = DIRECT_ONLY || (!std::is_void_v<D_OUT> && kargs.split_k == 1);
     const int stride_c_main = direct_store ? kargs.stride_c : kargs.stride_ws;
+    const size_t sfa_off = (size_t)row * kargs.stride_sfa + sf_start;
     const unsigned int sfa_bytes =
         (unsigned int)rows_avail * (unsigned int)kargs.stride_sfa * sizeof(D_SF);
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
-                           + (size_t)batch_id * kargs.stride_sfa_batch
-                           + (size_t)row * kargs.stride_sfa + sf_start,
+                           + (size_t)batch_id * kargs.stride_sfa_batch + sfa_off,
                            sfa_bytes);
     // Bounded, because the scale ring's padding lanes read past the live groups
     // on purpose and this buffer carried no num_records at all -- unbounded they
@@ -1084,7 +1120,10 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // below, GROUP_K=32 takes the ring, because the panel cannot hold a 32 split.
     // GROUP_K=32 preload kids keep the panel wherever it fits (SF_PANEL_FITS),
     // and take the ring otherwise.
-    constexpr bool SF_PANEL = PRELOAD_SF_LDS && (T::SF_PER_MFMA_K == 1 || T::SF_PANEL_FITS);
+    // An SFA_PANEL kid always takes the ring for B: the combined panel would
+    // hold B's rows too.
+    constexpr bool SF_PANEL = PRELOAD_SF_LDS && T::SF_LAYOUT == 0
+                              && (T::SF_PER_MFMA_K == 1 || T::SF_PANEL_FITS);
     static_assert(!(PRELOAD_SF_LDS && !SF_PANEL && !T::SF_USE_RING),
                   "a GROUP_K=32 preload kid needs the panel or the ring, and neither fits");
     // The scale ring decouples scale loading from PRELOAD_SF_LDS.
@@ -1094,6 +1133,8 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // SHUFFLE_SCALE reads its packed words and DIRECT_ONLY uses its separate
     // staging schedule. Group128 may use the ring where it preserves A/B depth.
     constexpr bool SF_RING = T::SF_USE_RING && !SF_PANEL && !SHUFFLE_SCALE && !DIRECT_ONLY;
+    static_assert(T::SF_LAYOUT == 0 || SF_RING,
+                  "an SFA_PANEL kid reads its B scales from the ring");
     // Where the scales come from, which is what the waits below turn on. Keyed
     // on this rather than on PRELOAD_SF_LDS: a ring kid reads its scales out of
     // LDS whether or not it asked for a panel, and reading them without the
@@ -1220,7 +1261,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // The reach stays the traits' rather than a literal 8192: the derived
     // bpreshuffle traits set their own, and the launchers check the same value.
     constexpr int SFA_K_MAX        = T::SF_PRELOAD_K_MAX;
-    constexpr int SFA_K_TILES_MAX  = SF_PANEL ? (SFA_K_MAX / T::B_K) : 1;
+    constexpr int SFA_K_TILES_MAX  = (SF_PANEL || T::SFA_PANEL) ? (SFA_K_MAX / T::B_K) : 1;
     constexpr int SF_SCALES_MAX    = SFA_K_TILES_MAX * T::SCALES_PER_BK;
     constexpr int SFA_ROWS         = T::B_M / T::GROUP_M;
     // GROUP_K=32 panel kids overlap too, whatever their tile: their panel is
@@ -1242,9 +1283,12 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     // long and whose LDS this work leaves alone.
     constexpr int SF_PANEL_PAD =
         (SF_PANEL && T::SF_PER_MFMA_K > 1 && !SF_PLAIN_OVERLAP_PROLOGUE) ? T::SF_PANEL_PAD : 0;
+    // SFA_PANEL: the B ring, then the padded A panel behind it.
+    constexpr int SFA_PANEL_ELEMS  =
+        T::SFA_PANEL ? SFA_ROWS * (SF_SCALES_MAX + T::SF_PANEL_PAD) : 0;
     constexpr int SF_LDS_ELEMS     =
         SF_PANEL ? ((SFA_ROWS + T::N_SCALE_GROUPS) * (SF_SCALES_MAX + SF_PANEL_PAD))
-                 : (SF_RING ? T::SF_RING_LDS : 1);
+                 : (SF_RING ? T::SF_RING_LDS + SFA_PANEL_ELEMS : 1);
     // 16B-aligned so the panel fill below can land ds_write_b128; a byte array is
     // only byte-aligned as far as the language is concerned.
     __shared__ __align__(16) D_SF smem_sf[SF_LDS_ELEMS];
@@ -1309,8 +1353,9 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
     const int sf_swz_mask =
         (SF_SWZ && ((sf_k_scales | kargs.stride_sfa) & 15) == 0
          && (sf_chunks & (sf_chunks - 1)) == 0) ? sf_chunks - 1 : 0;
-    D_SF* s_sfa_ptr = smem_sf;
+    D_SF* s_sfa_ptr = T::SFA_PANEL ? smem_sf + T::SF_RING_LDS : smem_sf;
     D_SF* s_sfb_ptr = smem_sf + SFA_ROWS * sf_pitch;
+    const int sfa_pitch = T::SFA_PANEL ? sf_k_scales + T::SF_PANEL_PAD : sf_pitch;
     constexpr int mb_a = T::a_buffer_load_insts;
     // B_DIRECT_REG issues no staged B, so it contributes nothing to mb.
     constexpr int mb_b = T::B_DIRECT_REG ? 0 : T::b_buffer_load_insts;
@@ -1387,7 +1432,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             v_sfa = load<T::SF_LANE_LOAD_VEC>(g_sfa, u_sfa, scale_base);
             opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+                load_sfb_lane<T, ng>(g_sfb, sfb_panel_row<T>(wave_id_n_cons, ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                     sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             s_waitcnt_vmcnt(0_I);
@@ -1528,6 +1573,33 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
             s_waitcnt_lgkmcnt(0_I);
             __builtin_amdgcn_s_barrier();
         }
+    }
+
+    // SFA_PANEL: A's whole-split panel, filled by every thread before the
+    // producer/consumer split and published by its own barrier; B's scales come
+    // through the ring as before. Each row is K/32 contiguous bytes, so a row is
+    // read once as whole lines rather than SCALES_PER_BK bytes per K tile. The
+    // launcher keeps a split within the reach; this only guards misuse.
+    if constexpr (T::SFA_PANEL) {
+        if (loops > SFA_K_TILES_MAX) return;
+        auto sm_sfa = make_smem(s_sfa_ptr);
+        const int total = SFA_ROWS * sf_k_scales;
+        auto fill_a = [&](auto vec_c) {
+            constexpr int VEC = decltype(vec_c)::value;
+            for (int idx = opus::thread_id_x() * VEC; idx < total;
+                 idx += T::BLOCK_SIZE * VEC) {
+                const int r  = idx / sf_k_scales;
+                const int kt = idx - r * sf_k_scales;
+                sm_sfa.template store<VEC>(load<VEC>(g_sfa, r * kargs.stride_sfa + kt),
+                                           r * sfa_pitch + kt);
+            }
+        };
+        // GROUP_K=32 keeps both a multiple of four (SCALES_PER_BK % 4, K % 128).
+        if (((sf_k_scales | kargs.stride_sfa) & 15) == 0) fill_a(number<16>{});
+        else                                              fill_a(number<4>{});
+        s_waitcnt_vmcnt(0_I);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
     }
 
     // SF_SHUF_IN_LDS: the shuffled panel's one-shot fill. Same position and contract
@@ -1770,7 +1842,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
         auto u_sfa = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, kargs.stride_sfa);
         // LDS read layout for the preloaded SFA panel: same lane/wave mapping as
         // u_sfa but with the compact per-row K-scale count as the row stride.
-        auto u_sfa_lds = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, sf_pitch);
+        auto u_sfa_lds = make_layout_sfa_mxsk<T>(lane_id, wave_id_m, sfa_pitch);
         // The ring's rows are one K tile wide, so its stride is compile-time and
         // the slot base carries the K position instead of a scale_base offset.
         auto u_sfa_ring = make_layout_sfa_mxsk<T, T::SF_RING_ESTRIDE>(
@@ -1820,6 +1892,12 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 issue_tile_aw(pub + T::prefetch_k_iter - 1);
                 s_waitcnt_vmcnt(number<aw_inflight>{});
             }
+            // Tile pub-1's ds_reads must have returned before this barrier: the
+            // producer refills their slot with tile pub-1+prefetch_k_iter right
+            // after it, and s_barrier does not wait on lgkmcnt. Left in flight,
+            // a read that a co-resident WG's LDS traffic delays past the
+            // refill's LDS DMA returns the next tile's bytes.
+            if constexpr (!T::ALL_WAVE) s_waitcnt_lgkmcnt(0_I);
             __builtin_amdgcn_s_barrier();
         };
 
@@ -2020,13 +2098,18 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 // the fill wrote.
                 D_SF* slot = smem_sf
                            + (loop_k % T::SF_RING_SLOTS) * T::SF_RING_SLOT;
-                auto sm_a = make_smem(slot);
-                v_sfa = load<T::SF_RING_LOAD_VEC>(sm_a, u_sfa_ring);
+                if constexpr (T::SFA_PANEL) {
+                    auto sm_pa = make_smem(s_sfa_ptr + scale_base);
+                    v_sfa = load<T::SF_LANE_LOAD_VEC>(sm_pa, u_sfa_lds);
+                } else {
+                    auto sm_a = make_smem(slot);
+                    v_sfa = load<T::SF_RING_LOAD_VEC>(sm_a, u_sfa_ring);
+                }
                 opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(
                         slot + T::SF_RING_A_BYTES
-                        + (sfb_group_base<T>(wave_id_n_cons) + ng) * T::SCALES_PER_BK
+                        + sfb_panel_row<T>(wave_id_n_cons, ng, lane_id) * T::SCALES_PER_BK
                               * T::SF_RING_ESTRIDE);
                     load_sfb_lane<T, ng, T::SF_RING_ESTRIDE>(
                         sm_b, 0, sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
@@ -2052,7 +2135,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(s_sfb_ptr
-                                          + (sfb_group_base<T>(wave_id_n_cons) + ng) * sf_pitch + scale_base);
+                                          + sfb_panel_row<T>(wave_id_n_cons, ng, lane_id) * sf_pitch + scale_base);
                     load_sfb_lane<T, ng>(sm_b, 0,
                                          sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
@@ -2070,7 +2153,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
                     auto sm_b = make_smem(s_sfb_ptr
-                                          + (sfb_group_base<T>(wave_id_n_cons) + ng) * sf_pitch + scale_base);
+                                          + sfb_panel_row<T>(wave_id_n_cons, ng, lane_id) * sf_pitch + scale_base);
                     load_sfb_lane<T, ng>(sm_b, 0,
                                          sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
@@ -2083,7 +2166,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                     constexpr int ng = decltype(ng_c)::value;
                     load_sfb_lane<T, ng>(
                         g_sfb,
-                        (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb
+                        sfb_panel_row<T>(wave_id_n_cons, ng, lane_id) * kargs.stride_sfb
                             + sfb_base + scale_base,
                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
@@ -2457,29 +2540,30 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                 store_c(g_c);
                 if (xcd_fused) {
                     // All of this tile's splits run on this XCD, so their partials
-                    // meet in its L2: draining this workgroup's stores and a
-                    // workgroup-scope arrival count publish them, with none of the
-                    // L2 writeback / invalidate an agent-scope fence emits. The
-                    // last to arrive sums every split's partial in split order --
-                    // the same order whichever split that is -- and re-arms the
-                    // counter for the next launch.
-                    // Only consumer waves get here, so the arrival is counted by
-                    // the first consumer wave's lane 0 -- not thread 0, whose wave
-                    // is a producer on the split kids (role above) and has already
-                    // left, which left xcd_last unset and the counter unbumped.
-                    __shared__ int xcd_last;
-                    const int lead_wave = T::ALL_WAVE ? 0 : (1 ^ ((wgid >> 8) & 1));
-                    const bool lead = wave_id == lead_wave && lane_id == 0;
+                    // meet in its L2. The last to arrive sums every split's
+                    // partial in split order -- the same order whichever split
+                    // that is -- and re-arms the counter for the next launch.
+                    //
+                    // Counted per consumer wave, not per workgroup: a wave reads
+                    // back exactly the C fragment it stored (load_c mirrors
+                    // store_c), so each wave's fragment is its own hand-off and
+                    // needs only its own stores retired. The per-workgroup count
+                    // (one lead lane, s_barrier on either side) returned whole
+                    // wrong tiles on kid 9740 at split-K 2-8 -- most runs at
+                    // M=4096 -- and agent-scope fences only made that rarer.
+                    constexpr int CONS_WAVES =
+                        T::ALL_WAVE ? T::BLOCK_SIZE / 64 : T::BLOCK_SIZE / 128;
+                    const int cons_wave = T::ALL_WAVE ? wave_id : wave_id >> 1;
+                    int* counter = kargs.ptr_xcd_counters
+                                 + (batch_id * tiles_per_batch + wgid) * CONS_WAVES + cons_wave;
                     s_waitcnt_vmcnt(0_I);
-                    __builtin_amdgcn_s_barrier();
-                    int* counter = kargs.ptr_xcd_counters + batch_id * tiles_per_batch + wgid;
-                    if (lead) {
-                        xcd_last = __hip_atomic_fetch_add(counter, 1, __ATOMIC_RELAXED,
-                                                          __HIP_MEMORY_SCOPE_WORKGROUP)
-                                   == kargs.split_k - 1;
+                    int arrived = 0;
+                    if (lane_id == 0) {
+                        arrived = __hip_atomic_fetch_add(counter, 1, __ATOMIC_RELAXED,
+                                                         __HIP_MEMORY_SCOPE_AGENT);
                     }
-                    s_waitcnt_lgkmcnt(0_I);
-                    __builtin_amdgcn_s_barrier();
+                    const bool xcd_last =
+                        __builtin_amdgcn_readfirstlane(arrived) == kargs.split_k - 1;
                     if (xcd_last) {
                         const size_t split_stride = (size_t)kargs.batch * kargs.stride_ws_batch;
                         D_C* tile_ws = ws_c_ptr - (size_t)split_id * split_stride;
@@ -2523,7 +2607,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_kernel(opus_gemm_scale_splitk_kargs_gfx950 
                         auto g_out = make_gmem(out_ptr,
                             (unsigned int)rows_avail * (unsigned int)kargs.stride_c * sizeof(D_OUT));
                         store_c_v(g_out, acc, u_gc_o, u_gc1_o);
-                        if (lead)
+                        if (lane_id == 0)
                             __hip_atomic_store(counter, 0, __ATOMIC_RELAXED,
                                                __HIP_MEMORY_SCOPE_AGENT);
                     }
@@ -2798,7 +2882,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_mouter_kernel(opus_gemm_scale_splitk_kargs_
                 vtype_sfb v_sfb;
                 opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                     constexpr int ng = decltype(ng_c)::value;
-                    load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+                    load_sfb_lane<T, ng>(g_sfb, sfb_panel_row<T>(wave_id_n_cons, ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                         sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
                 });
                 if constexpr (!SKIP_SCALE_WAIT) {
@@ -3108,7 +3192,7 @@ void gemm_a8w8_mxscale_flatmm_minterleave_kernel(opus_gemm_scale_splitk_kargs_gf
             vtype_sfb v_sfb;
             opus::static_for<T::SFB_GROUPS_PER_WAVE>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
-                load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(wave_id_n_cons) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+                load_sfb_lane<T, ng>(g_sfb, sfb_panel_row<T>(wave_id_n_cons, ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                     sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
             });
             opus::static_for<MI>([&](auto mi_c) {
@@ -3300,7 +3384,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave8n2_kernel(opus_gemm_scale_splitk_kargs
             // N-wave offset to apply. Asserted rather than assumed: a T_N > 1
             // instantiation would read wave 0's scale groups from every wave.
             static_assert(T::T_N == 1, "no N-wave split here, so no scale group base");
-            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+            load_sfb_lane<T, ng>(g_sfb, sfb_panel_row<T>(0, ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                 sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         s_waitcnt_vmcnt(0_I);
@@ -3465,7 +3549,7 @@ void gemm_a8w8_mxscale_flatmm_splitk_wave4m2_selfload_kernel(opus_gemm_scale_spl
             // N-wave offset to apply. Asserted rather than assumed: a T_N > 1
             // instantiation would read wave 0's scale groups from every wave.
             static_assert(T::T_N == 1, "no N-wave split here, so no scale group base");
-            load_sfb_lane<T, ng>(g_sfb, (sfb_group_base<T>(0) + ng) * kargs.stride_sfb + sfb_base + scale_base,
+            load_sfb_lane<T, ng>(g_sfb, sfb_panel_row<T>(0, ng, lane_id) * kargs.stride_sfb + sfb_base + scale_base,
                                 sf_lane_k_block<T>(lane_id, T::W_N), v_sfb);
         });
         if constexpr (!SKIP_SCALE_WAIT) {

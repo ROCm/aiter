@@ -1824,7 +1824,9 @@ void
     // kernel (see xcd_fused in the pipeline), so there is no reduce launch and
     // no second pass over the workspace. Launched on the direct-output
     // specialization, whose D_OUT the last split writes.
-    const size_t n_counters = (size_t)num_tiles_m * num_tiles_n * batch;
+    // Room for one counter per consumer wave (at most 8) of every tile: the
+    // flatmm tail counts arrivals per wave.
+    const size_t n_counters = (size_t)num_tiles_m * num_tiles_n * batch * 8;
     int* xcd_counters = @@XCD_FUSE@@ ? opus_bmm_xcd_counters(n_counters, stream) : nullptr;
     if (xcd_counters) {
       kargs.ptr_xcd_counters = xcd_counters;
@@ -1925,12 +1927,14 @@ def gen_bmm_mxscale_flatmm_splitk_instance(
     # Non-templated traits alias: fp32 split-K workspace is fixed; the workspace
     # tuple slot 4 (scale) is `unsigned char` for the e8m0 mxscale path.
     ring_arg = f", {k.wave1_ring}" if k.wave1_ring else ""
+    # Only when set, so every kid without it emits the text it always did.
+    sf_layout_arg = f", {k.sf_layout}" if k.sf_layout else ""
     traits_aliases = f"""
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
     opus::tuple<{da}, {db}, fp32_t, fp32_t, unsigned char>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
-    opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
+    opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}{sf_layout_arg}>,
     {k.WG_PER_CU}{ring_arg}>;
 """
 
@@ -2017,12 +2021,24 @@ __global__ void opus_bmm_splitk_reduce_kernel(
         # that term stands on its own rather than under preload_sf (a flatmm
         # panel kid necessarily has preload_sf False, the two panels being
         # alternative fills of the same LDS). Drop it and the kid skips the bound
-        # and returns a fast buffer of zeros.
+        # and returns a fast buffer of zeros. A GROUP_N=1 wave8 panel holds a K
+        # window and reloads it across the split (SF_WINDOW there), so any K runs.
         .replace(
             "@@PANEL@@",
             (
                 "true"
-                if ((k.preload_sf and not k.shuffle_scale) or k.sf_shuf_in_lds)
+                if (
+                    (
+                        k.preload_sf
+                        and not k.shuffle_scale
+                        and not (
+                            kernel_func == "gemm_a8w8_mxscale_bpreshuffle_wave8_kernel"
+                            and k.GROUP_N == 1
+                        )
+                    )
+                    or k.sf_shuf_in_lds
+                    or (getattr(k, "sf_layout", 0) & 4)
+                )
                 else "false"
             ),
         )
@@ -2033,7 +2049,7 @@ __global__ void opus_bmm_splitk_reduce_kernel(
                 if k.sf_shuf_in_lds
                 else (
                     "Traits::SF_PRELOAD_K_MAX / Traits::B_K"
-                    if k.preload_sf
+                    if k.preload_sf or (getattr(k, "sf_layout", 0) & 4)
                     # No panel: the bound is compiled out, and the wave1 traits
                     # carry no panel geometry to name.
                     else "0"

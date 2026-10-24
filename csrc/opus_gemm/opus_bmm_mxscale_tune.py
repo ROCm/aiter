@@ -46,6 +46,7 @@ from opus_gemm_common import (
     MX32_KID_STRIDE,
     _opus_sf_shuf_sub,
     a8w8_mxscale_bmm_kernel_lists,
+    a8w8_mxscale_sf_panel_k_tiles,
     bmm_mxscale_global_kid,
 )
 
@@ -326,8 +327,50 @@ _TUNE_POLICY.update(
     }
 )
 _TUNE_POLICY = _globalise_policy(_TUNE_POLICY)
+
+# Families whose launcher honors splitK>1: they write fp32 partials to the
+# caller-owned workspace and carry the fused reduce tail (per-tile counter,
+# last arrival sums in split order). Everything else is splitK==1 only, so a
+# policy entry sweeping splitK>1 on another family is a bug -- fail at import
+# rather than silently benchmark a wrong result.
+#
+# This has to agree with _A8W8_MXSCALE_BMM_WORKSPACE_TAGS in
+# aiter/ops/opus/launch_plan.py, which is what actually hands out the workspace;
+# it is spelled out rather than imported because that module pulls in torch.
+# bdirect and blds belong here -- they run the same flatmm split-K kernel and
+# launcher as flatmm_splitk, which is why the plan grants them the partials
+# workspace -- and were missing only because no policy entry had ever asked
+# them for a split. bdirect_tilen and allwave are deliberately absent: the plan
+# has no workspace for them, so a split there fails the launcher's own check.
+_SPLITK_FAMILIES = frozenset(
+    {
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_fused",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
+    }
+)
+
+# 1x32 used to be wave1's alone, so a blanket split-K sweep here was implicitly
+# a statement about that one family. It now spans blds and bdirect as well, and
+# while those are split-K capable (see _SPLITK_FAMILIES) not every family that
+# could carry a 1x32 tile is -- bdirect_tilen and allwave are not in the launch
+# plan's workspace tags. So the sweep asks the family rather than assuming it;
+# the assert below would otherwise fail at import for a tile added in good faith.
 _TUNE_POLICY.update(
-    {kid: [1, 2, 4, 8] for kid in _CODEGEN_BMM if _kid_block(kid) == "1x32"}
+    {
+        kid: (
+            [1, 2, 4, 8]
+            if _CODEGEN_BMM[kid].kernel_tag in _SPLITK_FAMILIES
+            and not _CODEGEN_BMM[kid].direct_only
+            else [1]
+        )
+        for kid in _CODEGEN_BMM
+        if kid >= BMM_MXSCALE_KID_OFFSET
+        and _kid_block(kid) == "1x32"
+        and kid not in _RELAYOUT_KIDS
+    }
 )
 _SHUF_POLICY = _globalise_policy(_SHUF_POLICY)
 _CANDIDATE_KIDS = tuple(_TUNE_POLICY) + tuple(_SHUF_POLICY)
@@ -347,18 +390,6 @@ def _shuf_arm(inst):
 # and kid192 sat here that way. Fail at import instead.
 _dead = sorted(set(_TUNE_POLICY) - set(_CODEGEN_BMM))
 assert not _dead, f"_TUNE_POLICY lists kids the codegen does not emit: {_dead}"
-
-# Families whose launcher honors splitK>1: they write fp32 partials to the
-# caller-owned workspace and carry the fused reduce tail (per-tile counter,
-# last arrival sums in split order). Everything else is splitK==1 only, so a
-# policy entry sweeping splitK>1 on another family is a bug -- fail at import
-# rather than silently benchmark a wrong result.
-_SPLITK_FAMILIES = frozenset(
-    {
-        "a8w8_mxscale_bmm_flatmm_splitk",
-        "a8w8_mxscale_bmm_bpreshuffle_wave1",
-    }
-)
 
 for _kid, _sks in _TUNE_POLICY.items():
     if any(s > 1 for s in _sks):
@@ -556,10 +587,13 @@ def _applicable(kid, g, m, n, k, pool="all", *, split_ks=None):
         return []
     if k_inst.GROUP_N == 1:
         tiles = k // k_inst.B_K
+        panel = a8w8_mxscale_sf_panel_k_tiles(k_inst)
         return [
             s
             for s in (split_ks if split_ks is not None else _TUNE_POLICY[kid])
-            if s >= 1 and tiles - (s - 1) * ((tiles + s - 1) // s) >= 1
+            if s >= 1
+            and tiles - (s - 1) * ((tiles + s - 1) // s) >= 1
+            and (panel is None or (tiles + s - 1) // s <= panel)
         ]
     if k_inst.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
         if not (
