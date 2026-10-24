@@ -35,7 +35,7 @@ from ..triton._triton_kernels.gated_delta_net.utils import (
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
-from .kernels.gdr_prefill import compile_gdn_prepare
+from .kernels.gdn_prefill import compile_gdn_prepare
 from .kernels.tensor_shim import _run_compiled
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
@@ -455,7 +455,7 @@ def _get_or_compile_opt(
             f"tiled-copy API), but got `{getattr(flydsl, '__version__', 'unknown')}`."
         )
 
-    from .kernels.gdr_prefill import compile_chunk_gated_delta_h
+    from .kernels.gdn_prefill import compile_chunk_gated_delta_h
 
     return compile_chunk_gated_delta_h(
         K=K,
