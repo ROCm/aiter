@@ -740,8 +740,8 @@ def test_triton_unified_attn(
 @pytest.mark.parametrize(
     "seq_lens, num_heads, block_size, sliding_window, grids",
     [
-        ([(4, 3000), (8, 40000), (1, 9000)], (16, 2), 16, 2048, ["2d", 32]),
-        ([(8, 8704)], (16, 2), 128, 2048, ["2d", 64]),
+        ([(4, 3000), (8, 40000), (1, 9000)], (16, 2), 16, 2048, [32, 32]),
+        ([(8, 8704)], (16, 2), 128, 2048, [64, 64]),
         ([(8, 582), (1, 582)], (16, 2), 64, 512, [16, 16]),
         ([(1, 8704)] * 4, (16, 2), 16, 2048, [1, 1]),
         ([(128, 1100)], (32, 32), 64, 1024, ["2d", "2d"]),
@@ -790,7 +790,7 @@ def test_triton_unified_attn_sw_verify_split(
     trimmed_lens = [kv - fb * block_size for kv, fb in zip(kv_lens, first)]
     assert max(trimmed_lens) <= sliding_window + max_q + block_size - 2
 
-    calls = []
+    calls, tiles = [], []
     run_2d, run_3d = ua._unified_attention_2d_gfx950, ua._unified_attention_3d_gfx950
     monkeypatch.setattr(
         ua, "_unified_attention_2d_gfx950", lambda p: calls.append("2d") or run_2d(p)
@@ -798,8 +798,11 @@ def test_triton_unified_attn_sw_verify_split(
     monkeypatch.setattr(
         ua,
         "_unified_attention_3d_gfx950",
-        lambda p, o, m, s, n, *a: calls.append(n) or run_3d(p, o, m, s, n, *a),
+        lambda p, o, m, s, n, t: calls.append(n)
+        or tiles.append(t)
+        or run_3d(p, o, m, s, n, t),
     )
+    outs = []
     for block_table, lens, max_seqlen_k in [
         (table, kv_lens_t, max_k),
         (
@@ -829,7 +832,117 @@ def test_triton_unified_attn_sw_verify_split(
             sinks=sinks,
         )
         torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+        outs.append(out)
     assert calls == grids, calls
+    if tiles and any(first) and all(f * block_size % tiles[0] == 0 for f in first):
+        # whole-tile trim: the window carve splits the same keys the same way
+        torch.testing.assert_close(outs[1], outs[0], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # verify rows: long, around the window, shorter than it, decode
+        [(8, 40000), (3, 2050), (16, 2047), (1, 9000), (5, 300)],
+        # several query blocks per sequence, window and causal edges inside a tile
+        [(32, 9050), (32, 2120), (1, 5000), (5, 300)],
+        # decode only
+        [(1, 9000), (1, 2047), (1, 300), (1, 40000)],
+    ],
+)
+@pytest.mark.parametrize(
+    "block_size, sliding_window, head_size", [(16, 2048, 64), (64, 2048, 256)]
+)
+@pytest.mark.parametrize("num_segments", [8, 64])
+@pytest.mark.parametrize("backend", ["gluon", "triton"])
+@torch.inference_mode()
+def test_triton_unified_attn_sw_split_carve(
+    seq_lens, block_size, sliding_window, head_size, num_segments, backend, monkeypatch
+):
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 split-KV")
+    import aiter.ops.triton.attention.unified_attention as ua
+
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, sinks, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            head_size=head_size,
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    sinks = sinks + 8.0
+    ref = ref_paged_attn(
+        q,
+        k,
+        v,
+        query_lens,
+        kv_lens,
+        table,
+        scale,
+        torch.bfloat16,
+        sliding_window,
+        sinks=sinks,
+    ).float()
+
+    get_config = ua.get_unified_attention_config
+
+    def config(op, params, *args, **kwargs):
+        config = get_config(op, params, *args, **kwargs)
+        if op == "kv_split":
+            config["NUM_SEGMENTS"] = num_segments
+        return config
+
+    # a partial the producer does not write stays NaN, so the reduce must skip it
+    name = "_unified_attention_3d_" + ("gfx950" if backend == "gluon" else "triton")
+    run_3d = getattr(ua, name)
+    partials = []
+
+    def poisoned(p, o, m, s, n, tile):
+        for t in (o, m, s):
+            t.fill_(float("nan"))
+        partials.append((m, tile))
+        return run_3d(p, o, m, s, n, tile)
+
+    monkeypatch.setattr(ua, "get_unified_attention_config", config)
+    monkeypatch.setattr(ua, "use_2d_kernel", lambda *args: False)
+    monkeypatch.setattr(ua, name, poisoned)
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=sinks,
+        backend=backend,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+    # the producer writes exactly the segments the window carve gives each sequence
+    ((m, tile),) = partials
+    start = 0
+    for query_len, kv_len in seq_lens:
+        tile_lo = max(kv_len - query_len - sliding_window + 1, 0) // tile
+        window_tiles = -(-kv_len // tile) - tile_lo
+        written = -(-window_tiles // -(-window_tiles // num_segments))
+        rows = m[start : start + query_len]
+        assert not rows[..., :written].isnan().any()
+        assert rows[..., written:].isnan().all()
+        start += query_len
 
 
 @pytest.mark.parametrize(
@@ -902,15 +1015,19 @@ def test_triton_unified_attn_sw_split_no_sinks(
         (2048, 8, 2070, 12, 16, 4),
         (2048, 8, 2070, 32, 16, 2),
         (2048, 8, 2070, 36, 16, 1),
-        (2048, 8, 2071, 1, 16, 1),
-        (2048, 8, 200000, 1, 16, 1),
+        (2048, 8, 2071, 1, 16, 64),
+        (2048, 8, 200000, 1, 16, 64),
+        (2048, 8, 200000, 32, 16, 2),
         (2048, 1, 2063, 1, 16, 1),
+        (2048, 1, 200000, 1, 16, 1),
         (128, 4, 258, 1, 128, 1),
         (255, 16, 270, 1, 16, 1),
         (256, 16, 271, 1, 16, 8),
         (256, 8, 278, 7, 16, 8),
         (256, 8, 278, 8, 16, 1),
         (256, 8, 390, 8, 128, 1),
+        (256, 8, 32768, 7, 16, 8),
+        (256, 8, 32768, 8, 16, 1),
         (2048, 8, 300, 4, 16, 8),
     ],
 )
@@ -961,6 +1078,11 @@ def test_unified_attn_sw_axis_lookup():
     bf16 = torch.bfloat16
     assert uau._axis_values(64, 8, 300, 2048, False, 16, bf16, bf16)["SW"] == 300
     assert uau._axis_values(64, 1, 0, 128, False, 16, bf16, bf16)["SW"] == 1
+
+    table, axes, _ = uau._load("kv_split", "gluon", "gfx950")
+    for max_seqlen_q, key in [(8, "SW_GEQ_256.Q_GEQ_2"), (1, "SW")]:
+        values = uau._axis_values(64, max_seqlen_q, 200000, 2048, False, 16, bf16, bf16)
+        assert uau._lookup(table, axes, values)[0] == key
 
     with pytest.raises(AssertionError, match="mix LEQ and GEQ"):
         uau._index(("SW_LEQ_512", "SW_GEQ_4096", "any"), ("SW",))

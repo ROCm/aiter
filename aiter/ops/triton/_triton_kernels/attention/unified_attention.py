@@ -52,6 +52,18 @@ def find_seq_idx(
     return left - 1
 
 
+@triton.jit
+def split_window_tiles(seq_len, query_len, TILE_SIZE, SLIDING_WINDOW: tl.constexpr):
+    """First tile and tile count a sliding-window split carves for one sequence.
+
+    No row sees a key before row 0's first, seq_len - query_len - SLIDING_WINDOW
+    + 1, so the split covers only [tile_lo, cdiv(seq_len, TILE_SIZE)). The 3d
+    kernels and reduce_segments must carve alike.
+    """
+    tile_lo = tl.maximum(seq_len - query_len - SLIDING_WINDOW + 1, 0) // TILE_SIZE
+    return tile_lo, cdiv_fn(seq_len, TILE_SIZE) - tile_lo
+
+
 _kernel_unified_attention_2d_repr = make_kernel_repr(
     "kernel_unified_attention_2d",
     [
@@ -668,9 +680,17 @@ def kernel_unified_attention_3d(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    if SLIDING_WINDOW > 0:
+        tile_lo, window_tiles = split_window_tiles(
+            seq_len, cur_batch_query_len, TILE_SIZE, SLIDING_WINDOW
+        )
+        tiles_per_segment = cdiv_fn(window_tiles, num_segments)
+        segm_tile_start = tile_lo + segm_idx * tiles_per_segment
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        segm_tile_start = segm_idx * tiles_per_segment
 
-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    if segm_tile_start * TILE_SIZE >= seq_len:
         return
 
     offs_m = tl.arange(0, BLOCK_M)
@@ -786,8 +806,8 @@ def kernel_unified_attention_3d(
 
     # iterate through tiles within current segment
     for j in range(
-        segm_idx * tiles_per_segment,
-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
+        segm_tile_start,
+        min(segm_tile_start + tiles_per_segment, num_tiles),
     ):
         seq_offset = j * TILE_SIZE + offs_t
         if TILE_SIZE == BLOCK_SIZE:
@@ -1006,6 +1026,7 @@ def reduce_segments(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
+    SLIDING_WINDOW: tl.constexpr = 0,  # int, the producer's; carves its window
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -1023,10 +1044,20 @@ def reduce_segments(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
-
-    # create masks for subsequent loads
-    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    if SLIDING_WINDOW > 0:
+        query_len = tl.load(query_start_len_ptr + seq_idx + 1) - tl.load(
+            query_start_len_ptr + seq_idx
+        )
+        _, window_tiles = split_window_tiles(
+            seq_len, query_len, TILE_SIZE, SLIDING_WINDOW
+        )
+        tiles_per_segment = cdiv_fn(window_tiles, num_segments)
+        # create masks for subsequent loads
+        act_num_segments = cdiv_fn(window_tiles, tiles_per_segment)
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        # create masks for subsequent loads
+        act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
     single_tile: tl.constexpr = (
         SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ
     )

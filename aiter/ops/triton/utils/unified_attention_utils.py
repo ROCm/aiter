@@ -68,7 +68,6 @@ _AXIS_KIND = {
     "Q": "num",  # max_seqlen_q; Q_LEQ_1 is decode
     "BS": "num",  # block_size, the KV page size
     "SW": "opt_num",  # keys a row can see, 0 when off; bare SW = any window
-    "SWB": "bool",
     "SKLT": "bool",  # max_seqlen_k < 2048
     "SHUF": "bool",  # shuffled_kv_cache
     "DT": "enum",  # (q dtype tag, kv dtype tag)
@@ -203,14 +202,9 @@ def compute_segment_params(config: dict, params) -> dict:
     tile = triton.next_power_of_2(params.block_size)
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
     kv_len = params.max_seqlen_k
-    # rows see at most window + q - 1 keys; the split carves seq_len, so count
-    # only those when the window bounds the table
-    if sliding_window_bounds_kv(
-        params.max_seqlen_q,
-        params.max_seqlen_k,
-        params.sliding_window,
-        params.block_size,
-    ):
+    # a sliding-window split carves only the window: rows see at most
+    # window + q - 1 keys
+    if params.sliding_window > 0:
         kv_len = min(kv_len, params.sliding_window + params.max_seqlen_q - 1)
     limit = triton.cdiv(kv_len, tile)
     too_many_seqs = seqs_per_tile and params.num_seqs > seqs_per_tile * limit
@@ -241,16 +235,6 @@ def compute_segment_params(config: dict, params) -> dict:
     return config
 
 
-def sliding_window_bounds_kv(
-    max_seqlen_q: int, max_seqlen_k: int, sliding_window: int, block_size: int
-) -> bool:
-    return (
-        sliding_window > 0
-        and max_seqlen_q > 1
-        and max_seqlen_k <= sliding_window + max_seqlen_q + block_size - 2
-    )
-
-
 def _axis_values(
     head_size,
     max_seqlen_q,
@@ -266,9 +250,6 @@ def _axis_values(
         "Q": max_seqlen_q,
         "BS": block_size,
         "SW": max(1, min(sliding_window, max_seqlen_k)) if sliding_window > 0 else 0,
-        "SWB": sliding_window_bounds_kv(
-            max_seqlen_q, max_seqlen_k, sliding_window, block_size
-        ),
         "SKLT": max_seqlen_k < 2048,
         "SHUF": shuffled_kv_cache,
         "DT": (get_dtype_str(q_dtype), get_dtype_str(kv_dtype)),
