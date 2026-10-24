@@ -72,11 +72,23 @@ def _get_flydsl_moe_kernels():
 BLOCK_SIZE_M = 32
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
-_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
+_FLYDSL_SORTING_ENV = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING")
+_USE_FLYDSL_MOE_SORTING = (
+    _FLYDSL_SORTING_ENV == "1"
+    if _FLYDSL_SORTING_ENV is not None
+    else get_gfx_runtime() == "gfx1250"
+)
 # Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 
 AUX_SORT_OPUS = "opus"
+
+
+def _use_opus_moe_sorting() -> bool:
+    # The current Opus sorter uses wave64 DPP broadcast controls. Those
+    # instructions are rejected by the gfx1250 wave32 assembler, while the CK
+    # sorter already supports this contract.
+    return not _USE_CK_MOE_SORTING and get_gfx_runtime() != "gfx1250"
 
 
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
@@ -809,7 +821,7 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
-            use_opus=not _USE_CK_MOE_SORTING,
+            use_opus=_use_opus_moe_sorting(),
             return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
             output_aux=output_aux,
@@ -1072,7 +1084,9 @@ def resolve_activation_dtype(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    if gfx == "gfx1250":
+    if gfx == "gfx1250" and not (
+        quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8
+    ):
         if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
             q_dtype_a = dtypes.fp8
         else:
@@ -1505,6 +1519,16 @@ def _fused_moe_impl(
     _validate_output_buffer_no_overlap(output, hidden_states)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
+    if quant_type == QuantType.per_1x32 and q_dtype_w == torch.uint8:
+        # ATOM can preserve MX weights as raw byte tensors. Recover the logical
+        # dtype from the complete two-GEMM byte count; otherwise an MXFP8 weight
+        # is mistaken for packed FP4 and gfx1250 reads only half of every K row.
+        weight_nbytes = w1.numel() * w1.element_size() + w2.numel() * w2.element_size()
+        logical_elements = E * (3 * inter_dim * model_dim)
+        if weight_nbytes == logical_elements:
+            q_dtype_w = dtypes.fp8
+        elif weight_nbytes == logical_elements // 2:
+            q_dtype_w = dtypes.fp4x2
     q_dtype_a = resolve_activation_dtype(
         quant_type,
         q_dtype_w,

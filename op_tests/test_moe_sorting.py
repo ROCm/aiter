@@ -20,6 +20,14 @@ BLOCK_SIZE_M = 32
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
+def test_moe_sorting_backend_respects_gfx1250_wave32(monkeypatch):
+    monkeypatch.setattr(fm, "_USE_CK_MOE_SORTING", False)
+    monkeypatch.setattr(fm, "get_gfx_runtime", lambda: "gfx1250")
+    assert fm._use_opus_moe_sorting() is False
+    monkeypatch.setattr(fm, "get_gfx_runtime", lambda: "gfx950")
+    assert fm._use_opus_moe_sorting() is True
+
+
 def test_moe_sorting_opus_host_dispatch_boundaries():
     if get_gfx() != "gfx950":
         device_id = torch.cuda.current_device()

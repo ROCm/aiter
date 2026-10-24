@@ -117,6 +117,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     num_buffers=3,
     out_is_f16=0,
     a_is_fp4=0,
+    w_is_fp8=0,
     stage1_act=0,
     bias=None,
     swiglu_limit=7.0,
@@ -142,7 +143,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_workers=0,
     rolled_drain=0,
 ):
-    """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
+    """Launch a contiguous-M grouped A8W4/A8W8 GEMM.
 
     A positive persistent_workers bounds the grid independently of the routing
     buffer capacity. Workers traverse the live device-side tile range.
@@ -224,6 +225,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         out_is_f16,
         num_buffers,
         a_is_fp4,
+        w_is_fp8,
         ptr_arg(m_tile_map),
         n_experts,
         stage1_act,
