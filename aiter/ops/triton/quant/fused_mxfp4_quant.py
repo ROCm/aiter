@@ -200,6 +200,7 @@ def fused_rms_gated_mxfp4_quant(
     activation: str = "silu",
     group_size: int | None = None,
     transpose_scale: bool = False,
+    hadamard_rotate: bool = False,
 ):
     """
     Gated RMSNorm followed by MXFP4 quantization, the RMSNormGated + per-1x32
@@ -223,6 +224,11 @@ def fused_rms_gated_mxfp4_quant(
     - transpose_scale: If True, store out_bs column-major (strides (1, M)),
       the layout dynamic_mxfp4_quant returns. gemm_afp4wfp4 reads it
       faster than the row-major default once M reaches about 1024.
+    - hadamard_rotate: If True, quantize
+      y.view(M, N // 32, 32) @ (scipy.linalg.hadamard(32) / sqrt(32)),
+      rotated in fp32 and rounded to x.dtype, with the per_1x32_f4_quant_hip
+      scale ceil_pow2(amax / 6). The caller rotates the weight the same way.
+      gfx950 only.
 
     Returns:
     - out_fp4: The output matrix with shape (M, N // 2).
@@ -241,6 +247,10 @@ def fused_rms_gated_mxfp4_quant(
     if activation not in ("silu", "swish", "sigmoid"):
         raise ValueError(
             f"activation must be 'silu', 'swish' or 'sigmoid', got {activation!r}"
+        )
+    if hadamard_rotate and get_arch() != "gfx950":
+        raise ValueError(
+            f"hadamard_rotate requires gfx950 hardware FP4 conversion, got {get_arch()}"
         )
     M, N = x.shape
     G = N if group_size is None else int(group_size)
@@ -292,6 +302,7 @@ def fused_rms_gated_mxfp4_quant(
         ACTIVATION=_get_activation_from_str(
             "silu" if activation == "swish" else activation
         ),
+        HADAMARD_ROTATE=hadamard_rotate,
         num_warps=num_warps,
     )
 

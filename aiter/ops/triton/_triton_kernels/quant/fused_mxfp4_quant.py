@@ -3,7 +3,11 @@ from functools import partial
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton._triton_kernels.quant.quant import (
+    _mxfp4_ceil_scale_from_amax,
+    _mxfp4_pack_op,
+    _mxfp4_quant_op,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n as _even_m_n
 
@@ -18,6 +22,45 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
     else:
         rms_norm = row * norm_factor[:, None]
     return rms_norm
+
+
+@triton.jit
+def _hadamard_butterfly_stage(
+    y, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, H: tl.constexpr
+):
+    v = y.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // (2 * H), 2, H)
+    a, b = tl.split(tl.permute(v, (0, 1, 3, 2)))
+    v = tl.permute(tl.join(a + b, a - b), (0, 1, 3, 2))
+    return v.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N)
+
+
+@triton.jit
+def _hadamard32_op(y, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    """Rotates each 32-element block of the fp32 rows by the normalized
+    Sylvester Hadamard matrix with a 5-stage butterfly: at stage h,
+    (v[j], v[j + h]) becomes (v[j] + v[j + h], v[j] - v[j + h]). Keeping
+    this fp32 order makes the result bit-identical to the HIP per-1x32
+    quant's rotation."""
+    y = _hadamard_butterfly_stage(y, BLOCK_SIZE_M, BLOCK_SIZE_N, 1)
+    y = _hadamard_butterfly_stage(y, BLOCK_SIZE_M, BLOCK_SIZE_N, 2)
+    y = _hadamard_butterfly_stage(y, BLOCK_SIZE_M, BLOCK_SIZE_N, 4)
+    y = _hadamard_butterfly_stage(y, BLOCK_SIZE_M, BLOCK_SIZE_N, 8)
+    y = _hadamard_butterfly_stage(y, BLOCK_SIZE_M, BLOCK_SIZE_N, 16)
+    return y * 0.17677669529663687
+
+
+@triton.jit
+def _mxfp4_quant_hip_op(y, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+    """The MXFP4 quant of per_1x32_f4_quant_hip: 1e-10 amax floor, RoundUp e8m0
+    scale (ceil_pow2(amax / 6)) and the gfx950 FP4 convert."""
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // 32
+    y = y.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, 32)
+    amax = tl.maximum(tl.max(tl.abs(y), axis=-1, keep_dims=True), 1e-10)
+    bs_e8m0, quant_scale = _mxfp4_ceil_scale_from_amax(amax)
+    y_fp4 = _mxfp4_pack_op(
+        y * quant_scale, BLOCK_SIZE_N, BLOCK_SIZE_M, 32, USE_ASM=True
+    )
+    return y_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
 
 _fused_rms_mxfp4_quant_repr = make_kernel_repr(
@@ -257,6 +300,7 @@ _fused_rms_gated_mxfp4_quant_repr = make_kernel_repr(
         "MXFP4_QUANT_BLOCK_SIZE",
         "NORM_BEFORE_GATE",
         "ACTIVATION",
+        "HADAMARD_ROTATE",
         "EVEN_M_N",
     ],
 )
@@ -290,11 +334,14 @@ def _fused_rms_gated_mxfp4_quant_kernel(
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    HADAMARD_ROTATE: tl.constexpr,
     EVEN_M_N: tl.constexpr,
 ):
     """One norm group per row: RMSNorm over N, the act(z) gate, then MXFP4
     quant. The gated activation is rounded to the input dtype before quant,
-    as it is when RMSNormGated and the quant run as separate ops.
+    as it is when RMSNormGated and the quant run as separate ops. With
+    HADAMARD_ROTATE each 32-element block is rotated and rounded to the input
+    dtype again before a quant that matches per_1x32_f4_quant_hip.
 
     Row r is group r % groups_per_row of input row r // groups_per_row; the
     scale strides are those of the caller's (input rows, scale columns) view,
@@ -338,9 +385,15 @@ def _fused_rms_gated_mxfp4_quant_kernel(
         y = y * gate
     y = y.to(x_ptr.type.element_ty).to(tl.float32)
 
-    y_fp4, bs_e8m0 = _mxfp4_quant_op(
-        y, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-    )
+    if HADAMARD_ROTATE:
+        tl.static_assert(MXFP4_QUANT_BLOCK_SIZE == 32)
+        y = _hadamard32_op(y, BLOCK_SIZE_M, BLOCK_SIZE_N)
+        y = y.to(x_ptr.type.element_ty).to(tl.float32)
+        y_fp4, bs_e8m0 = _mxfp4_quant_hip_op(y, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    else:
+        y_fp4, bs_e8m0 = _mxfp4_quant_op(
+            y, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+        )
 
     half_offs_n = tl.arange(0, BLOCK_SIZE_N // 2)
     out_mask = None
