@@ -18,6 +18,7 @@ import aiter.ops.mha_v4 as mha_v4_module
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
+    MHA_V4_SPARSE_MODE,
     AttentionFormat,
     AttentionPack,
     AttentionScaleMode,
@@ -26,6 +27,7 @@ from aiter.ops.mha_v4 import (
     _resolve_raw_recipe,
     mha_v4,
     mha_v4_kv_tile,
+    mha_v4_operands,
     mha_v4_packed,
     native_fp8_format,
     scale_modes_for_formats,
@@ -558,6 +560,7 @@ def test_mha_v4_k_quantizers_reject_an_off_device_mean(quantize):
     Out of process because these checks abort rather than raise, as every AITER_CHECK in that
     translation unit does. All four quantizers share one validator, so all four are covered.
     """
+    _require_mx_kernels(mx="mx" in quantize)
     source = textwrap.dedent(f"""
         import torch
         from aiter.ops.mha_v4_quant import {quantize} as quantize
@@ -630,6 +633,36 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
     assert torch.equal(compiled, expected)
 
 
+_MX_FORMATS = frozenset(
+    {AttentionFormat.MXFP4, AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6_E3M2}
+)
+
+
+def _require_mx_kernels(formats=(), scale_modes=(), mx=False):
+    """MX recipes have kernels on gfx950 only, and elsewhere their quantizers abort the process."""
+    mx = (
+        mx
+        or bool(_MX_FORMATS.intersection(formats))
+        or AttentionScaleMode.E8M0_PER_1X32 in tuple(scale_modes)
+    )
+    if mx and get_gfx() != "gfx950":
+        pytest.skip(f"MX recipes have no {get_gfx()} kernels")
+
+
+def _mha_v4_lse(*args, **kwargs):
+    """mha_v4 with return_lse, skipping where this arch's row stores no LSE."""
+    try:
+        return mha_v4(*args, return_lse=True, **kwargs)
+    except NotImplementedError as error:
+        if "LSE is not validated" not in str(error):
+            raise
+        pytest.skip(str(error))
+    except RuntimeError as error:
+        if "has no LSE store" not in str(error):
+            raise
+        pytest.skip(f"this {get_gfx()} row stores no LSE")
+
+
 @pytest.mark.skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 FP8 recipe validation",
@@ -662,6 +695,7 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     else:
         formats = (AttentionFormat.MXFP4,) * 3
         scale_modes = {}
+    _require_mx_kernels(formats, scale_modes.values())
 
     errors = []
     for common in (0.0, 16.0):
@@ -711,6 +745,7 @@ def test_mha_v4_lse_survives_k_common_mode(recipe):
     else:
         formats = (AttentionFormat.MXFP4,) * 3
         scale_modes = {}
+    _require_mx_kernels(formats, scale_modes.values())
 
     softmax_scale = q.shape[-1] ** -0.5
     errors = []
@@ -720,12 +755,11 @@ def test_mha_v4_lse_survives_k_common_mode(recipe):
             q.float().permute(0, 2, 1, 3) @ k.float().permute(0, 2, 3, 1)
         ) * softmax_scale
         reference = torch.logsumexp(scores, dim=-1)
-        _, lse = mha_v4(
+        _, lse = _mha_v4_lse(
             q,
             k,
             v,
             *formats,
-            return_lse=True,
             softmax_scale=softmax_scale,
             **scale_modes,
         )
@@ -1024,19 +1058,6 @@ def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
 
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    # Dense LSE is supported for every shipped format row; the sorted-sparse path is not.
-    block_mask = torch.ones((1, 2, 1, 1), device="cuda", dtype=torch.bool)
-    with pytest.raises(NotImplementedError, match="sorted-sparse path"):
-        mha_v4(
-            q,
-            q,
-            q,
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
-            return_lse=True,
-            block_mask=block_mask,
-        )
     with pytest.raises(ValueError, match="matching Q and K formats"):
         mha_v4(
             q,
@@ -1116,12 +1137,12 @@ def test_mha_v4_dense_lse_matches_reference(q_format, v_format, scale_modes):
     ("q_format", "v_format", "max_spread"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16, 0.05),
-        (AttentionFormat.BF16, AttentionFormat.FP8, 0.05),
-        (AttentionFormat.INT8, AttentionFormat.FP8, 0.05),
-        (AttentionFormat.FP8, AttentionFormat.FP8, 0.75),
-        (AttentionFormat.FP8, AttentionFormat.MXFP6, 0.75),
+        (AttentionFormat.BF16, native_fp8_format(), 0.05),
+        (AttentionFormat.INT8, native_fp8_format(), 0.05),
+        (native_fp8_format(), native_fp8_format(), 0.75),
+        (native_fp8_format(), AttentionFormat.MXFP6, 0.75),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.35),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8, 0.35),
+        (AttentionFormat.MXFP6_E2M3, native_fp8_format(), 0.35),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, 0.35),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, 0.35),
     ],
@@ -1135,6 +1156,7 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
     a rollback missing from the exported max is then invisible. With this input the recipes span
     0.00 to 0.24 nats, while that defect measured 4.55.
     """
+    _require_mx_kernels((q_format, v_format))
     torch.manual_seed(31)
     batch, sequence, heads, head_dim, chunks = 1, 2048, 5, 128, 4
     query = torch.randn(
@@ -1149,7 +1171,7 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
     biases = []
     for start in range(0, sequence, span):
         key_chunk = key[:, start : start + span]
-        _, lse = mha_v4(
+        _, lse = _mha_v4_lse(
             query,
             key_chunk,
             value[:, start : start + span],
@@ -1157,7 +1179,6 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
             q_format,
             v_format,
             softmax_scale=softmax_scale,
-            return_lse=True,
         )
         scores = query.float().permute(0, 2, 1, 3) @ key_chunk.float().permute(
             0, 2, 3, 1
@@ -1984,6 +2005,16 @@ def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
     assert torch.equal(dense, full)
 
 
+def _i8fp8_sparse_kv_tile():
+    """The KV tile of the INT8/FP8 sparse row, which a mask for that recipe has to be cut to."""
+    fp8 = native_fp8_format()
+    formats = (AttentionFormat.INT8, AttentionFormat.INT8, fp8)
+    return mha_v4_kv_tile(
+        mha_v4_operands(*formats, *scale_modes_for_formats(*formats)),
+        MHA_V4_SPARSE_MODE,
+    )
+
+
 def test_mha_v4_rejects_unusable_seqlens_k():
     q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
     formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
@@ -2005,7 +2036,9 @@ def test_mha_v4_rejects_unusable_seqlens_k():
             AttentionFormat.INT8,
             native_fp8_format(),
             block_mask=torch.ones(
-                (2, 4, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+                (2, 4, 1, 256 // _i8fp8_sparse_kv_tile()),
+                device="cuda",
+                dtype=torch.bool,
             ),
             seqlens_k=torch.ones(2, device="cuda", dtype=torch.int32),
         )
