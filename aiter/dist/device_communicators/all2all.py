@@ -140,6 +140,11 @@ class MoriAll2AllManager(All2AllManagerBase):
 
         mori_config = mori.ops.EpDispatchCombineConfig(**kwargs)
         handle = mori.ops.EpDispatchCombineOp(mori_config)
+        logger.info(
+            "[MORI] EP all2all handle created: kernel=%s internode=%s",
+            kwargs["kernel_type"].name,
+            self.internode,
+        )
         return handle
 
     def get_handle(self, kwargs, index: int = 0):
