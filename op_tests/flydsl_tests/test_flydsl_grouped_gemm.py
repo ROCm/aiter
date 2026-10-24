@@ -839,6 +839,29 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
     )
 
 
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+@pytest.mark.parametrize("tokens", [1, 4, 12, 16])
+def test_grouped_swiglu_m3_tp_decode(tokens, data_format, monkeypatch):
+    # MiniMax-M3 per-rank TP4 shape (128 routed + 1 shared expert, top-5) at
+    # decode, where the TP path routes all tokens in one fused launch. gfx1250
+    # quantizes activations to MXFP4 (a4w4, the production path) unless
+    # AITER_FORCE_A8W4=1 selects MXFP8, which the a8w4 reference assumes.
+    if data_format == "a8w4":
+        monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    else:
+        monkeypatch.delenv("AITER_FORCE_A8W4", raising=False)
+    run_moe(
+        data_format,
+        experts=129,
+        tokens=tokens,
+        topk=5,
+        model_dim=6144,
+        inter_dim=768,
+        activation=ActivationType.Swiglu,
+        check_aot_cache=False,
+    )
+
+
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)
