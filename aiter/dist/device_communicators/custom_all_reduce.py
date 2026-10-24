@@ -903,6 +903,7 @@ class CustomAllreduce:
             # kernel ops (arch)
             self._ops_meta_size = ops.meta_size_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
+            self._ops_all_reduce_residual = None
             self._ops_all_gather = ops.all_gather_gfx1250
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_dispose = ops.dispose_gfx1250
@@ -925,6 +926,7 @@ class CustomAllreduce:
             self._ops_meta_size = ops.meta_size
             self._ops_init_custom_ar = ops.init_custom_ar
             self._ops_all_reduce = ops.all_reduce
+            self._ops_all_reduce_residual = ops.all_reduce_residual
             self._ops_all_gather = None
             self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_dispose = ops.dispose
@@ -1705,6 +1707,65 @@ class CustomAllreduce:
         )
         return out
 
+    def uses_1stage_ar(self, inp: torch.Tensor) -> bool:
+        """Whether custom_all_reduce(inp) runs a one-shot kernel.
+
+        Mirrors CustomAllreduce::select_ar_stage; gfx1250 has only one-shot
+        kernels (LL and naive).
+        """
+        if self.disabled:
+            return False
+        if self._is_gfx1250 or self.world_size == 2:
+            return True
+        nbytes = inp.numel() * inp.element_size()
+        limit = 160 * 1024 if self.world_size <= 4 else 80 * 1024
+        return self.fully_connected and nbytes < limit
+
+    def all_reduce_residual(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        registered_input: bool = False,
+    ):
+        """Out-of-place all reduce followed by ``+ residual``.
+
+        ``residual`` must be identical on every rank. Uses the same 1-/2-stage
+        crossover as all_reduce.
+        """
+        assert residual.shape == inp.shape, "residual must match the input shape"
+        if out is None:
+            out = torch.empty_like(inp)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        assert is_weak_contiguous(residual), "residual tensor is not weak-contiguous"
+        reg_inp = 0 if registered_input else self._pool["input"].data_ptr
+        reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
+        self._ops_all_reduce_residual(
+            self._ptr, inp, out, residual, reg_inp, reg_inp_bytes
+        )
+        return out
+
+    def custom_all_reduce_residual(
+        self, input: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor | None:
+        # None when custom allreduce is disabled or has no residual kernel (gfx1250)
+        if (
+            self.disabled
+            or self._ops_all_reduce_residual is None
+            or not self.should_custom_ar(input)
+        ):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.all_reduce_residual(
+                    input,
+                    residual,
+                    registered_input=self.enable_register_for_capturing,
+                )
+            return torch.zeros_like(input)
+        return self.all_reduce_residual(input, residual, registered_input=False)
+
     def custom_all_reduce(
         self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
     ) -> torch.Tensor | None:
@@ -1961,8 +2022,31 @@ class CustomAllreduce:
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
         emit_bf16: bool = False,
+        num_norm_rows: int = -1,
+        skip_residual: bool = False,
     ):
         valid_dim = w.numel()
+        rows = inp.numel() // inp.shape[-1]
+        # Width of the output the call writes, including one it allocates below;
+        # a padded width takes the pad kernel, which has no row options.
+        out_dim = (
+            out.shape[-1] if out is not None else (out_hidden_dim or inp.shape[-1])
+        )
+        if skip_residual or 0 <= num_norm_rows < rows:
+            # Only the plain 2-stage kernels implement these options.
+            if use_1stage:
+                raise ValueError(
+                    "skip_residual and num_norm_rows < rows require use_1stage=False"
+                )
+            if (
+                post_per_token_quant
+                or inp.shape[-1] != valid_dim
+                or out_dim != valid_dim
+            ):
+                raise ValueError(
+                    "skip_residual and num_norm_rows are not supported with "
+                    "quant or padded fused allreduce rmsnorm"
+                )
         if res_out is None:
             res_out = torch.empty(
                 inp.shape[:-1] + (valid_dim,), dtype=inp.dtype, device=inp.device
@@ -1971,7 +2055,6 @@ class CustomAllreduce:
         reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
             if out is None:
-                out_dim = out_hidden_dim or inp.shape[-1]
                 out = torch.empty(
                     inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device
                 )
@@ -1989,6 +2072,8 @@ class CustomAllreduce:
                     reg_bytes,
                     use_1stage,
                     gemma_norm,
+                    num_norm_rows,
+                    skip_residual,
                 )
             else:
                 ops.fused_allreduce_rmsnorm_pad(
@@ -2050,6 +2135,10 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
+        residual_out: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        num_norm_rows: int = -1,
+        skip_residual: bool = False,
     ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -2059,12 +2148,16 @@ class CustomAllreduce:
                 return self.fused_ar_rms(
                     input,
                     residual_inp,
+                    res_out=residual_out,
+                    out=out,
                     w=weight,
                     eps=eps,
                     registered=self._capture_registered(input),
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
+                    num_norm_rows=num_norm_rows,
+                    skip_residual=skip_residual,
                 )
             else:
                 out_dim = out_hidden_dim or input.shape[-1]
@@ -2084,12 +2177,16 @@ class CustomAllreduce:
             return self.fused_ar_rms(
                 input,
                 residual_inp,
+                res_out=residual_out,
+                out=out,
                 w=weight,
                 eps=eps,
                 registered=False,
                 use_1stage=use_1stage,
                 out_hidden_dim=out_hidden_dim,
                 gemma_norm=gemma_norm,
+                num_norm_rows=num_norm_rows,
+                skip_residual=skip_residual,
             )
 
     def custom_fused_ar_rms_packed_input(
