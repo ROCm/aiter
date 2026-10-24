@@ -16,6 +16,11 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
+from .kernels.pa_decode.traits import (
+    d256_page64_pipe,
+    nhd_max_query_length,
+    require_nhd_pipe,
+)
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -25,6 +30,115 @@ from .kernels.pa_decode_reduce import (
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+
+_FP8_KV_DTYPES = {
+    "gfx942": torch.float8_e4m3fnuz,
+    "gfx950": torch.float8_e4m3fn,
+    "gfx1250": torch.float8_e4m3fn,
+}
+
+
+def _kv_dtype_name(arch: str, dtype: torch.dtype) -> str | None:
+    """``"bf16"``, ``"fp8"`` (the arch's FP8 format) or None if unsupported."""
+    if dtype == torch.bfloat16:
+        return "bf16"
+    return "fp8" if dtype == _FP8_KV_DTYPES.get(arch) else None
+
+
+def _device_arch(device: torch.device) -> str:
+    return torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+
+
+def _default_workgroup_budget(
+    arch: str,
+    num_compute_units: int,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    block_size: int,
+    query_length: int,
+    query_group_size: int,
+    sliding_window: int,
+) -> int:
+    kv_name = _kv_dtype_name(arch, kv_dtype)
+    one_cta_per_cu = (
+        kv_name is not None
+        and sliding_window <= 0
+        and d256_page64_pipe(
+            arch, kv_name, head_dim, block_size, query_length, query_group_size
+        )
+    )
+    return num_compute_units if one_cta_per_cu else 2 * num_compute_units
+
+
+def pa_decode_nhd_max_query_length(
+    device: torch.device,
+    *,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    block_size: int,
+    query_group_size: int,
+) -> int:
+    """Longest uniform query length ``pa_decode`` takes with NHD K/V caches.
+
+    NHD caches are 4D, ``[num_blocks, block_size, num_kv_heads, head_dim]``,
+    and ``pa_decode`` selects them by ``key_cache.dim() == 4``. Returns 0 when
+    NHD cannot serve the device and configuration at all; ``pa_decode`` raises
+    ``NotImplementedError`` for any longer query, including MTP verify steps.
+    Sliding windows do not change the limit. Reads device properties only, so
+    callers can decide per layer before allocating caches or capturing graphs.
+    Per-call strides, alignment and scales are validated by ``pa_decode``.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return 0
+    arch = _device_arch(device)
+    kv_name = _kv_dtype_name(arch, kv_dtype)
+    if kv_name is None:
+        return 0
+    return nhd_max_query_length(arch, kv_name, head_dim, block_size, query_group_size)
+
+
+def pa_decode_default_workgroup_budget(
+    device: torch.device,
+    *,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    block_size: int,
+    query_length: int,
+    query_group_size: int,
+    sliding_window: int = 0,
+) -> int:
+    """Untuned ``plan_pa_decode`` work budget for this device and shape.
+
+    The budget ``prepare_pa_decode_plan`` uses when no tuned result is cached:
+    the CU count for dense page-64 shapes of the gfx950 FP8 head-256 pipe,
+    packed or NHD, and twice the CU count otherwise. ``plan_pa_decode``
+    defaults to twice the CU count because it does not see the cache shape.
+    """
+    device = torch.device(device)
+    return _default_workgroup_budget(
+        _device_arch(device),
+        torch.cuda.get_device_properties(device).multi_processor_count,
+        kv_dtype,
+        head_dim,
+        block_size,
+        query_length,
+        query_group_size,
+        sliding_window,
+    )
+
+
+def _nhd_strides(view: torch.Tensor) -> tuple[int, int, int]:
+    """Block, token and head strides; size-1 axes are never stepped, so 0."""
+    shape, stride = view.shape, view.stride()
+    return tuple(0 if shape[d] == 1 else stride[d] for d in range(3))
+
+
+def _view_span(view: torch.Tensor) -> int:
+    """Elements from the view's first element through its last, inclusive."""
+    return 1 + sum(
+        (size - 1) * stride for size, stride in zip(view.shape, view.stride())
+    )
 
 
 def _flydsl_pointer_dtype(dtype: torch.dtype):
@@ -173,8 +287,8 @@ def launch_pa_decode_ps_reduce(
 def pa_decode(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x] or NHD [num_blocks, 64, num_kv_heads, 256]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x] or NHD like key_cache
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -199,11 +313,23 @@ def pa_decode(
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
-    A non-transposed 4D key cache is not implemented.
 
     The gfx950 FP8 head-256 page-16/64 pipe supports both packed V layouts,
     per-tensor or per-token scales, and sliding windows, with at most 32
     query rows (query_length times the GQA group size).
+
+    A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
+    [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
+    arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
+    requires gfx950, FP8 KV, head 256, page 64, and a uniform query_length
+    whose rows (query_length times the GQA group size) fit two 16-row M-tiles,
+    e.g. query_length 1-4 at GQA 8. Both scale modes and positive sliding
+    windows are supported. Each view must be
+    16-byte aligned with 16-byte multiple strides, its token rows must not
+    overlap, and its strides and in-page span must fit int32; heads-outermost
+    storage with several KV heads is thus limited to 2 GiB per head.
+    ``pa_decode_nhd_max_query_length`` reports the longest query a
+    configuration takes.
 
     ``compute_type=None`` infers compute from the cache dtype. BF16 K/V requires
     no K/V scales and uses x=8; FP8 uses x=16. gfx942/gfx950 require BF16 queries
@@ -225,9 +351,8 @@ def pa_decode(
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
     calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
-    FlyDSL autotune to select its budget before graph capture. A cache miss uses
-    the device CU count for the gfx950 head-256 pipe shapes and twice that
-    otherwise; ``tune=True`` forces a search during preparation.
+    FlyDSL autotune to select its budget before graph capture, and documents the
+    default budget; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, a cap
     of one writes output directly when sinks are absent and query/output strides
@@ -306,10 +431,6 @@ def pa_decode(
                 f"{name} must be {expected}, got shape {tuple(tensor.shape)}"
             )
 
-    trans_k = key_cache.dim() == 5
-    if not trans_k:
-        raise NotImplementedError("Non-transposed key cache is not implemented")
-
     num_seqs = context_lengths.shape[0]
     total_q_rows, num_q_heads, head_dim = query.shape
     if query.device.type != "cuda":
@@ -332,19 +453,28 @@ def pa_decode(
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
+    trans_k = key_cache.dim() == 5
     trans_v = value_cache.dim() == 5
-    num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
+    nhd_layout = not trans_k
+    if nhd_layout:
+        num_blocks, block_size, num_kv_heads, k_head = key_cache.shape
+        if k_head != head_dim:
+            raise ValueError(
+                "NHD key_cache shape must be "
+                "[num_blocks, block_size, num_kv_heads, head_dim], "
+                f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
+            )
+    else:
+        num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = (
+            key_cache.shape
+        )
     if num_kv_heads < 1:
         raise ValueError(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
         )
 
     arch = get_gfx_runtime()
-    expected_fp8_dtype = {
-        "gfx942": torch.float8_e4m3fnuz,
-        "gfx950": torch.float8_e4m3fn,
-        "gfx1250": torch.float8_e4m3fn,
-    }.get(arch)
+    expected_fp8_dtype = _FP8_KV_DTYPES.get(arch)
     if expected_fp8_dtype is None:
         raise NotImplementedError(
             f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
@@ -357,6 +487,15 @@ def pa_decode(
         raise NotImplementedError(
             f"pa_decode requires compute_type={expected_kv_dtype} for the KV cache "
             f"on {arch}, got {compute_type}"
+        )
+    if nhd_layout:
+        require_nhd_pipe(
+            arch,
+            kv_dtype,
+            head_dim,
+            block_size,
+            query_length,
+            num_q_heads // num_kv_heads,
         )
     vector_width = 8 if is_bf16_kv else 16
 
@@ -375,7 +514,9 @@ def pa_decode(
                 else "are 64 and multiples of 128 in [128, 1024]"
             )
         )
-    if num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
+    if not nhd_layout and (
+        num_hgroups != head_dim // vector_width or hgroup_width != vector_width
+    ):
         raise ValueError(
             "key_cache shape must be "
             f"[num_blocks, num_kv_heads, head_dim // {vector_width}, "
@@ -389,7 +530,45 @@ def pa_decode(
 
     if is_bf16_kv and arch != "gfx1250" and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
-    if trans_v:
+    nhd_strides = (0,) * 6
+    if nhd_layout:
+        if value_cache.shape != key_cache.shape:
+            raise ValueError(
+                "NHD value_cache shape must match key_cache, "
+                f"got {tuple(value_cache.shape)} vs {tuple(key_cache.shape)}"
+            )
+        if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
+            raise ValueError("NHD key and value head axes must be contiguous")
+        nhd_strides = _nhd_strides(key_cache) + _nhd_strides(value_cache)
+        for name, view, strides in (
+            ("key_cache", key_cache, nhd_strides[:3]),
+            ("value_cache", value_cache, nhd_strides[3:]),
+        ):
+            # K loads and V LDS-DMAs move 16-byte chunks.
+            if view.data_ptr() % 16 or any(stride % 16 for stride in strides):
+                raise ValueError(
+                    f"NHD {name} needs a 16-byte aligned base and block, token "
+                    f"and head strides that are multiples of 16, got data_ptr "
+                    f"{view.data_ptr():#x} and strides {view.stride()}"
+                )
+            # The V tail bound is live_tokens * token_stride bytes.
+            if strides[1] < head_dim:
+                raise ValueError(
+                    f"NHD {name} token rows must not overlap, got token stride "
+                    f"{view.stride(1)} for head_dim={head_dim}"
+                )
+        # Strides are i32 kernel arguments, and the in-page offset and V tail
+        # bound stay i32 even in wide mode.
+        k_block, k_token, k_head, v_block, v_token, v_head = nhd_strides
+        page_span = block_size * max(k_token, v_token)
+        if max(k_block, k_head, v_block, v_head, page_span) >= 2**31:
+            raise NotImplementedError(
+                "NHD pa_decode requires int32 block and head strides and "
+                "block_size * token_stride < 2**31, got strides "
+                f"{key_cache.stride()} and {value_cache.stride()}"
+            )
+        v_num_blocks, v_num_kv_heads = num_blocks, num_kv_heads
+    elif trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
         expected_v_tail = (block_size // vector_width, head_dim, vector_width)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
@@ -498,6 +677,8 @@ def pa_decode(
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
     ):
+        if nhd_layout and name in ("key_cache", "value_cache"):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
@@ -611,11 +792,19 @@ def pa_decode(
         and output.stride() == query.stride()
     )
 
-    # Bound byte offsets as well as element indices for 16-bit BF16 caches.
-    cache_extent = max(
-        key_cache.numel() * key_cache.element_size(),
-        value_cache.numel() * value_cache.element_size(),
-    )
+    # Bound byte offsets as well as element indices for 16-bit BF16 caches. A
+    # strided NHD view can span more bytes than numel(), and its head stride
+    # may scale with num_blocks, so measure the highest byte offset.
+    if nhd_layout:
+        cache_extent = (
+            max(_view_span(key_cache), _view_span(value_cache))
+            * key_cache.element_size()
+        )
+    else:
+        cache_extent = max(
+            key_cache.numel() * key_cache.element_size(),
+            value_cache.numel() * value_cache.element_size(),
+        )
     wide_kv_addressing = cache_extent >= 2**31
     kv_buffer_u32 = cache_extent < 2**32
 
@@ -733,6 +922,7 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
+            *nhd_strides,
             ptr_arg(work_plan.work_info, fx.Int32),
             work_plan.capacity,
             s,
