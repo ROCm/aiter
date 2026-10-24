@@ -491,8 +491,8 @@ def sage_quant(
     q,
     k,
     v,
-    FP8_TYPE,
-    FP8_MAX,
+    v_dtype,
+    v_dtype_max,
     BLKQ=128,
     BLKK=64,
     sm_scale=None,
@@ -505,14 +505,20 @@ def sage_quant(
     BLOCK_R=None,
 ):
     """
-    Quantize Q and K tensors to INT8 with per-block scaling.
+    Quantize Q and K tensors to INT8 with per-block scaling, and prepare V.
+
+    V is quantized only when ``v_dtype`` is an FP8 type: it is scaled per
+    channel by ``amax / v_dtype_max`` and the scales are returned in
+    ``v_scale``. When ``v_dtype`` is FP16 or BF16, V is passed through (cast
+    to ``v_dtype`` if needed, without scaling), ``v_scale`` contains ones and
+    ``v_dtype_max`` is not used.
 
     Args:
         q: Query tensor
         k: Key tensor
         v: Value tensor
-        FP8_TYPE: Floating-point type for the quantized V tensor
-        FP8_MAX: Maximum value for the quantized V tensor
+        v_dtype: Type of the returned V tensor (FP8, FP16 or BF16)
+        v_dtype_max: Maximum value of ``v_dtype``, used to scale an FP8 V
         BLKQ: Block size for Q quantization
         BLKK: Block size for K quantization
         sm_scale: Softmax scale factor (defaults to head_dim^-0.5)
@@ -529,18 +535,19 @@ def sage_quant(
         q_scale: Per-block scales for Q
         k_int8: Quantized K tensor
         k_scale: Per-block scales for K
-        v_fp8: Quantized V tensor
-        v_scale: Per-(B,H,D) scales for V
+        v_out: V tensor in ``v_dtype``
+        v_scale: Per-(B,H,D) scales for V (ones when V is not quantized)
         delta_s (when q_smoothing=True): [B,H,Q_blks,seqlen_k] bias for Q smoothing
         delta_lse (when return_lse=True): float32 (B, H_q, S_q) ring-attention LSE fixup
     """
     q_int8 = torch.empty_like(q, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
-    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
+    quantize_v = v_dtype not in (torch.float16, torch.bfloat16)
 
     order = _bshd_order(layout)
     b, qo_len, h_qo, head_dim = map_dims(q.shape, order)
     _, kv_len, h_kv, _ = map_dims(k.shape, order)
+    head_dim_v = map_dims(v.shape, order)[3]
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
@@ -601,11 +608,21 @@ def sage_quant(
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
 
-    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-
     q_task_count = b * h_qo * Q_NUM_BLKS
     k_task_count = b * h_kv * K_NUM_BLKS
-    v_task_count = b * h_kv * K_NUM_BLKS
+    if quantize_v:
+        v_out = torch.empty_like(v, dtype=v_dtype, device=v.device)
+        v_scale = (
+            v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32)
+            / v_dtype_max
+        )
+        v_task_count = b * h_kv * K_NUM_BLKS
+    else:
+        v_out = v if v.dtype == v_dtype else v.to(v_dtype)
+        v_scale = torch.ones(
+            (b, h_kv, head_dim_v), device=v.device, dtype=torch.float32
+        )
+        v_task_count = 0
 
     grid = (q_task_count + k_task_count + v_task_count,)
 
@@ -623,14 +640,14 @@ def sage_quant(
         k_int8,
         k_scale,
         v,
-        v_fp8,
+        v_out,
         v_scale,
         *_bhnd_strides(q),
         *_bhnd_strides(q_int8),
         *_bhnd_strides(k),
         *_bhnd_strides(k_int8),
         *_bhnd_strides(v),
-        *_bhnd_strides(v_fp8),
+        *_bhnd_strides(v_out),
         q_scale.stride(0),
         q_scale.stride(1),
         k_scale.stride(0),
@@ -648,7 +665,7 @@ def sage_quant(
         qo_len,
         kv_len,
         triton.next_power_of_2(kv_len),
-        FP8_MAX=FP8_MAX,
+        QUANTIZE_V=quantize_v,
         INT8_MAX=torch.iinfo(q_int8.dtype).max,
         D=head_dim,
         BLK_Q=BLKQ,
@@ -657,7 +674,7 @@ def sage_quant(
         num_warps=8,
     )
 
-    out = [q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale]
+    out = [q_int8, q_scale, k_int8, k_scale, v_out, v_scale]
     if q_smoothing:
         out.append(delta_s)
     if return_lse:
