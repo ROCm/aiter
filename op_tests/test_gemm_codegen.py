@@ -37,7 +37,7 @@ sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "aiter", "jit", "utils"))
 import pandas as pd
 from build_targets import (
-    GFX_CU_NUM_MAP,
+    GFX_CU_NUMS_MAP,
     filter_tune_df,
     get_build_targets_env,
 )
@@ -53,12 +53,14 @@ REPRO_BPRESHUFFLE_CSV = os.path.join(
     "gemm_codegen_gfx_filter_bpreshuffle.csv",
 )
 
-# GPU targets used throughout this test.  cu_num values match GFX_CU_NUM_MAP
+# GPU targets used throughout this test.  cu_num values match GFX_CU_NUMS_MAP
 # in aiter/jit/utils/build_targets.py (re-exported via chip_info.py) — update
 # here if that mapping changes.
 TARGET_A = ("gfx942", 304)  # MI300X
 TARGET_B = ("gfx950", 256)  # MI350
 TARGET_C = ("gfx942", 80)  # MI308X — gfx942 with CU_NUM override
+TARGETS_GFX942 = [TARGET_A, ("gfx942", 228), TARGET_C]
+TARGETS_GFX950 = [TARGET_B, ("gfx950", 128)]
 
 # ---------------------------------------------------------------------------
 # Minimal test harness (no external test framework required)
@@ -98,10 +100,12 @@ def test_get_build_targets():
     orig_cu = os.environ.pop("CU_NUM", None)
 
     try:
-        # 1.1 Single known arch
+        # 1.1 Single known arch expands to every listed CU count
         os.environ["GPU_ARCHS"] = TARGET_A[0]
         t = get_build_targets_env()
-        _check(f"GPU_ARCHS={TARGET_A[0]} → [{TARGET_A}]", t == [TARGET_A], str(t))
+        _check(
+            f"GPU_ARCHS={TARGET_A[0]} → {TARGETS_GFX942}", t == TARGETS_GFX942, str(t)
+        )
 
         # 1.2 CU_NUM override (MI308X: gfx942 but cu_num=80)
         os.environ["GPU_ARCHS"] = TARGET_C[0]
@@ -117,14 +121,16 @@ def test_get_build_targets():
         # 1.3 Second known arch
         os.environ["GPU_ARCHS"] = TARGET_B[0]
         t = get_build_targets_env()
-        _check(f"GPU_ARCHS={TARGET_B[0]} → [{TARGET_B}]", t == [TARGET_B], str(t))
+        _check(
+            f"GPU_ARCHS={TARGET_B[0]} → {TARGETS_GFX950}", t == TARGETS_GFX950, str(t)
+        )
 
         # 1.4 Multi-arch (semicolon-separated)
         os.environ["GPU_ARCHS"] = f"{TARGET_A[0]};{TARGET_B[0]}"
         t = get_build_targets_env()
         _check(
-            f"GPU_ARCHS={TARGET_A[0]};{TARGET_B[0]} → two targets",
-            t == [TARGET_A, TARGET_B],
+            f"GPU_ARCHS={TARGET_A[0]};{TARGET_B[0]} → every listed pair of both",
+            t == [*TARGETS_GFX942, *TARGETS_GFX950],
             str(t),
         )
 
@@ -146,11 +152,21 @@ def test_get_build_targets():
             raised = True
         _check("GPU_ARCHS=' ; ' → RuntimeError", raised)
 
-        # 1.7 GFX_CU_NUM_MAP covers at least the two known production targets
-        _check(
-            "GFX_CU_NUM_MAP contains gfx942 and gfx950",
-            "gfx942" in GFX_CU_NUM_MAP and "gfx950" in GFX_CU_NUM_MAP,
-        )
+        # 1.7 GFX_CU_NUMS_MAP lists every fixture target, full GPU first
+        for gfx, cu_num in (TARGET_A, TARGET_B, TARGET_C):
+            cu_nums = GFX_CU_NUMS_MAP.get(gfx, ())
+            _check(
+                f"GFX_CU_NUMS_MAP lists {gfx}/cu_num={cu_num}",
+                cu_num in cu_nums,
+                str(cu_nums),
+            )
+        for gfx, cu_num in (TARGET_A, TARGET_B):
+            cu_nums = GFX_CU_NUMS_MAP.get(gfx, ())
+            _check(
+                f"GFX_CU_NUMS_MAP lists {gfx}/cu_num={cu_num} first",
+                cu_nums[:1] == (cu_num,),
+                str(cu_nums),
+            )
 
         # 1.8 Live GPU fallback — requires torch and a GPU; skipped otherwise
         del os.environ["GPU_ARCHS"]
@@ -244,7 +260,17 @@ def test_gen_instances_filter(
         f"multi={n_multi}, {gfx_a}/{cu_a}={n_a}, {gfx_b}/{cu_b}={n_b}",
     )
 
-    # 2.6 All MNK shapes in the repro CSV have different kernelIds across gfx targets
+    # 2.6 Expanding an arch to its listed CU counts keeps every row of that arch
+    arch_targets = [(gfx_a, cu_num) for cu_num in GFX_CU_NUMS_MAP[gfx_a]]
+    filtered = filter_tune_df(df, arch_targets)
+    expected = df[df["gfx"] == gfx_a]
+    _check(
+        f"{pfx}{gfx_a}/listed cu_nums filter keeps every {gfx_a} row",
+        filtered.index.equals(expected.index),
+        f"rows={len(filtered)}, cu_num={sorted(filtered['cu_num'].unique().tolist())}",
+    )
+
+    # 2.7 All MNK shapes in the repro CSV have different kernelIds across gfx targets
     grp = df.groupby(["M", "N", "K"])["kernelId"].nunique()
     shapes_with_diff = grp[grp > 1]
     _check(
@@ -253,7 +279,7 @@ def test_gen_instances_filter(
         f"shapes with diverging kernelIds: {len(shapes_with_diff)}/{len(grp)}",
     )
 
-    # 2.7 Contamination: the two targets share MNK shapes with different kernelIds
+    # 2.8 Contamination: the two targets share MNK shapes with different kernelIds
     d_a = filter_tune_df(df, [target_a]).set_index(["M", "N", "K"])
     d_b = filter_tune_df(df, [target_b]).set_index(["M", "N", "K"])
     common = d_a.index.intersection(d_b.index)

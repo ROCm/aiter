@@ -310,7 +310,8 @@ def get_build_targets() -> list[tuple[str, int]]:
 
     Priority:
       1. GPU_ARCHS set to an explicit non-empty target list -> delegate to
-         get_build_targets_env() (no GPU needed).
+         get_build_targets_env() (no GPU needed), which pairs each arch with
+         every CU count in GFX_CU_NUMS_MAP unless CU_NUM is set.
       2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo/hipinfo when GPU_ARCHS is
          unset) and get_cu_num(), which correctly reflect partition mode and
