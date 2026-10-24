@@ -37,6 +37,7 @@ class TestCSVValidation(unittest.TestCase):
         "bf16": "bf16_tuned_gemm.csv",
         "bf16_batched": "bf16_tuned_batched_gemm.csv",
         "fmoe": "tuned_fmoe.csv",
+        "fhmoe": "tuned_fhmoe.csv",
     }
 
     def _load_csv(self, name):
@@ -211,6 +212,24 @@ class TestCSVValidation(unittest.TestCase):
             "FlyDSL stage2 sorting layout mismatches:\n" + "\n".join(mismatches),
         )
 
+    def test_fhmoe_no_duplicates(self):
+        self._check_no_duplicates(
+            "fhmoe",
+            extra_keys=[
+                "act_type",
+                "dtype",
+                "q_dtype_a",
+                "q_dtype_w",
+                "q_type",
+                "use_g1u1",
+                "doweight_stage1",
+                "shared_expert_id",
+                "hidden_pad",
+                "intermediate_pad",
+                "gate_mode",
+            ],
+        )
+
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
             with self.subTest(csv=name):
@@ -265,11 +284,26 @@ class TestCSVValidation(unittest.TestCase):
             "a8w8_untuned_batched_gemm.csv",
             "bf16_untuned_batched_gemm.csv",
             "untuned_fmoe.csv",
+            "untuned_fhmoe.csv",
         ]
         for f in untuned_files:
             with self.subTest(file=f):
                 path = os.path.join(CONFIGS_DIR, f)
                 self.assertTrue(os.path.exists(path), f"Missing: {f}")
+
+    def test_fhmoe_untuned_tokens_are_serving_buckets(self):
+        # FhmoeTuner times a row at its raw token but publishes it under
+        # get_padded_M(token): below 32768 that is the next power of two.
+        path = os.path.join(CONFIGS_DIR, "untuned_fhmoe.csv")
+        if not os.path.exists(path):
+            self.skipTest("untuned_fhmoe.csv not found")
+        tokens = pd.read_csv(path)["token"].astype(int)
+        bad = tokens[(tokens < 1) | (tokens >= 32768) | (tokens & (tokens - 1) != 0)]
+        self.assertEqual(
+            len(bad),
+            0,
+            f"untuned_fhmoe.csv tokens must be powers of two below 32768: {bad.tolist()}",
+        )
 
 
 if __name__ == "__main__":
