@@ -20,6 +20,7 @@
 // 3. BlockTopkMerge - Efficient merging of pre-sorted chunks
 //    - Assumes input is already sorted in k-sized chunks
 //    - Used for multi-block reduction phase
+//    - For k < 32 with many chunks, filters them with WaveTopkFilter instead
 //
 // AMD GPU Optimizations Used:
 //   - DPP (Data Parallel Primitives) for small-stride shuffles (≤8)
@@ -1026,7 +1027,9 @@ buffer_load_dwordx4(int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t a
 //   - Compute len_per_wave based on launch configuration
 //   - If len_per_wave ≤ capacity × 4: Use BlockTopkSort
 //   - If len_per_wave > capacity × 4: Use BlockTopkFilter
-//   - For multi-block reduction: Always use BlockTopkMerge
+//   - For multi-block reduction: Always use BlockTopkMerge, whose waves
+//     filter the chunks instead of merging them when k < 32 and each wave
+//     has many chunks (see topk_kernel_launcher)
 //
 
 template <int capacity, bool descending, typename T, typename IdxT>
@@ -1044,8 +1047,11 @@ struct BlockTopkFilter;
 template <int capacity, bool descending, typename T, typename IdxT>
 struct BlockTopkSort;
 
+template <int capacity, bool descending, typename T, typename IdxT, bool filter_chunks>
+struct BlockTopkMergeImpl;
+
 template <int capacity, bool descending, typename T, typename IdxT>
-struct BlockTopkMerge;
+using BlockTopkMerge = BlockTopkMergeImpl<capacity, descending, T, IdxT, false>;
 
 // ============================================================================
 // WAVE BUFFER (Stores priorities in ComputeType)
@@ -1088,6 +1094,11 @@ struct WaveBuffer
         for(int i = 0; i < slots_per_lane; ++i)
         {
             priorities[i] = sentinel;
+            // An input equal to the sentinel (-inf when finding the largest) never
+            // displaces a sentinel slot, so a row with fewer than k other values
+            // flushes sentinel slots. Give them an in-range row offset instead of
+            // an uninitialized register.
+            positions[i] = 0;
         }
     }
 
@@ -1199,7 +1210,7 @@ __global__ void __launch_bounds__(512, 2) topk_sort_kernel(const DataT* __restri
                                                            IdxT* __restrict__ out_idx,
                                                            compute_t<DataT> sentinel);
 
-template <int capacity, bool greater, typename DataT, typename IdxT>
+template <int capacity, bool greater, typename DataT, typename IdxT, bool filter_chunks = false>
 __global__ void __launch_bounds__(512, 2) topk_merge_kernel(const DataT* __restrict__ in,
                                                             const IdxT* __restrict__ in_idx,
                                                             int batch_size,
@@ -1291,16 +1302,25 @@ int calc_lds_size_for_block_wide(int num_wave, IdxT k)
     return base_size;
 }
 
+template <typename T, typename IdxT>
+void calc_launch_parameter_by_occupancy(KernelFuncPtr<T, IdxT> func,
+                                        IdxT k,
+                                        int* block_size,
+                                        int* min_grid_size)
+{
+    auto calc_lds = [k](int bs) {
+        return calc_lds_size_for_block_wide<T, IdxT>(bs / opus::get_warp_size(), k);
+    };
+    HIP_CHECK(
+        hipOccupancyMaxPotentialBlockSizeVariableSMem(min_grid_size, block_size, func, calc_lds));
+}
+
 template <template <int, bool, typename, typename> class StrategyClass, typename T, typename IdxT>
 void calc_launch_parameter_by_occupancy(IdxT k, int* block_size, int* min_grid_size)
 {
     const int capacity = utils::calc_capacity(k);
     auto func          = get_kernel_function_pointer<true, StrategyClass, T, IdxT>(capacity);
-    auto calc_lds      = [k](int bs) {
-        return calc_lds_size_for_block_wide<T, IdxT>(bs / opus::get_warp_size(), k);
-    };
-    HIP_CHECK(
-        hipOccupancyMaxPotentialBlockSizeVariableSMem(min_grid_size, block_size, func, calc_lds));
+    calc_launch_parameter_by_occupancy<T, IdxT>(func, k, block_size, min_grid_size);
 }
 
 template <template <int, bool, typename, typename> class StrategyClass>
@@ -1323,6 +1343,25 @@ struct LaunchThreshold<BlockTopkSort>
     static constexpr int single_block_factor = 4;
 };
 
+// Filling every block slot of the device with a few rows makes the merge, which
+// runs one block per row, combine more partial results than the first pass
+// saves. About one block per CU is enough to keep the first pass busy, two
+// when it streams enough data to be bound by memory bandwidth. Each row is
+// further limited to as many chunks as one merge block handles well: the
+// filtering merge used for k < 32 copes with far more than the chunk-wise one.
+template <typename T, typename IdxT>
+int calc_max_block_per_batch(int batch_size, IdxT len, IdxT k)
+{
+    int device = 0;
+    int num_cu = 0;
+    HIP_CHECK(hipGetDevice(&device));
+    HIP_CHECK(hipDeviceGetAttribute(&num_cu, hipDeviceAttributeMultiprocessorCount, device));
+    const bool bandwidth_bound =
+        k <= 128 && static_cast<uint64_t>(batch_size) * len * sizeof(T) >= (16u << 20);
+    const int max_chunks = k < 32 ? 128 : k < 256 ? 32 : 16384 / k;
+    return std::max(1, std::min((bandwidth_bound ? 2 : 1) * num_cu / batch_size, max_chunks));
+}
+
 template <template <int, bool, typename, typename> class StrategyClass, typename T, typename IdxT>
 void calc_launch_parameter(int batch_size, IdxT len, IdxT k, int* p_num_of_block, int* p_num_wave)
 {
@@ -1336,7 +1375,8 @@ void calc_launch_parameter(int batch_size, IdxT len, IdxT k, int* p_num_of_block
     if(batch_size < min_grid_size)
     {
         num_wave           = block_size / opus::get_warp_size();
-        block_per_batch    = min_grid_size / batch_size;
+        block_per_batch =
+            std::min(min_grid_size / batch_size, calc_max_block_per_batch<T>(batch_size, len, k));
         IdxT len_per_block = (len - 1) / block_per_batch + 1;
         IdxT len_per_wave  = (len_per_block - 1) / num_wave + 1;
         len_per_wave       = utils::round_up_to_multiple_of<opus::get_warp_size()>(len_per_wave);
@@ -1388,12 +1428,13 @@ void calc_launch_parameter(int batch_size, IdxT len, IdxT k, int* p_num_of_block
 }
 
 template <typename T, typename IdxT>
-void calc_launch_parameter_for_merge(IdxT len, IdxT k, int* block_per_batch, int* num_wave)
+void calc_launch_parameter_for_merge(
+    KernelFuncPtr<T, IdxT> func, IdxT len, IdxT k, int* block_per_batch, int* num_wave)
 {
     *block_per_batch  = 1;
     int block_size    = 0;
     int min_grid_size = 0;
-    calc_launch_parameter_by_occupancy<BlockTopkMerge, T, IdxT>(k, &block_size, &min_grid_size);
+    calc_launch_parameter_by_occupancy<T, IdxT>(func, k, &block_size, &min_grid_size);
     *num_wave         = block_size / opus::get_warp_size();
     IdxT len_per_wave = (len - 1) / (*num_wave) + 1;
     len_per_wave      = ((len_per_wave - 1) / k + 1) * k;
@@ -1718,7 +1759,9 @@ struct WaveTopkFilter
             constexpr IdxT tile    = elements;
             const IdxT block_tile  = blockDim.x * tile;
             const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
-            const IdxT tail        = end_aligned - block_tile;
+            // An empty slice must not fall back into [start - block_tile, start):
+            // those elements belong to the previous block and would be counted twice.
+            const IdxT tail = (n > 0) ? end_aligned - block_tile : end_aligned;
 
             using VecType = std::conditional_t<std::is_same_v<DataT, __bf16>,
                                                buffer_load_helpers::bf16x8_t,
@@ -1784,6 +1827,37 @@ struct WaveTopkFilter
             }
         }
 
+        finalize();
+    }
+
+    // Filter candidates that carry their own positions, such as the per-block
+    // partial results topk_merge_kernel combines. Each lane issues all loads of
+    // a step before consuming any, so a wave waits on memory once per
+    // `unroll * warp_size` candidates instead of once per load.
+    __device__ void filter_indexed(const DataT* __restrict__ in,
+                                   const IdxT* __restrict__ in_idx,
+                                   IdxT start,
+                                   IdxT end)
+    {
+        constexpr int unroll = 8;
+        constexpr IdxT step  = unroll * opus::get_warp_size();
+        for(IdxT base = start; base < end; base += step)
+        {
+            ComputeT vals[unroll];
+            IdxT idxs[unroll];
+#pragma unroll
+            for(int u = 0; u < unroll; ++u)
+            {
+                const IdxT i = base + u * opus::get_warp_size() + buffer_.lane_id;
+                vals[u] = (i < end) ? type_convert::to_compute<DataT>(in[i]) : buffer_.sentinel;
+                idxs[u] = (i < end) ? in_idx[i] : IdxT{0};
+            }
+#pragma unroll
+            for(int u = 0; u < unroll; ++u)
+            {
+                filter_and_stage(vals[u], idxs[u]);
+            }
+        }
         finalize();
     }
 
@@ -2017,10 +2091,14 @@ __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const DataT* __rest
     const IdxT block_per_batch     = gridDim.x / batch_size;
     const IdxT batch_id            = blockIdx.x / block_per_batch;
     const IdxT block_id_in_a_batch = blockIdx.x % block_per_batch;
-    // TODO: Consider multiple blocks
-    const IdxT len_per_block   = len;
+    // Each block filters its own slice of the row; topk_merge_kernel combines the
+    // per-block results. Slices start on a 16-byte boundary so the vector loads in
+    // sort_buffer_addressing stay aligned to the row.
+    constexpr IdxT elems_per_vec = 16 / sizeof(DataT);
+    const IdxT len_per_block =
+        utils::round_up_to_multiple_of((len - 1) / block_per_batch + 1, elems_per_vec);
     const uint64_t batch_start = static_cast<uint64_t>(batch_id) * len;
-    IdxT start                 = block_id_in_a_batch * len_per_block;
+    IdxT start                 = std::min(block_id_in_a_batch * len_per_block, len);
     IdxT end                   = std::min(start + len_per_block, len);
 
     BlockTopkFilter<capacity, greater, DataT, IdxT> topk(k, sentinel, lds_buf);
@@ -2143,12 +2221,14 @@ struct WaveTopkMerge
     WaveBuffer<capacity, DataT, IdxT> buffer_;
 };
 
-template <int capacity, bool descending, typename DataT, typename IdxT>
-struct BlockTopkMerge
+// filter_chunks: see topk_kernel_launcher for when each wave filters its share
+// of the partial results instead of merging them chunk by chunk.
+template <int capacity, bool descending, typename DataT, typename IdxT, bool filter_chunks>
+struct BlockTopkMergeImpl
 {
     using ComputeT = compute_t<DataT>;
 
-    __device__ BlockTopkMerge(IdxT k, ComputeT sentinel, void* lds_buf)
+    __device__ BlockTopkMergeImpl(IdxT k, ComputeT sentinel, void* lds_buf)
         : wave_topk_(k, sentinel), k_(k), sentinel_(sentinel)
     {
         const int num_waves = blockDim.x / opus::get_warp_size();
@@ -2180,9 +2260,20 @@ struct BlockTopkMerge
         const int wave_id = threadIdx.x / opus::get_warp_size();
         IdxT len_per_wave = (end - start - 1) / num_waves + 1;
         len_per_wave      = ((len_per_wave - 1) / k_ + 1) * k_;
-        IdxT wave_start   = start + wave_id * len_per_wave;
-        IdxT wave_end     = std::min(wave_start + len_per_wave, end);
-        wave_topk_.merge_data(in, in_idx, wave_start, wave_end);
+        if constexpr(filter_chunks)
+        {
+            len_per_wave = utils::round_up_to_multiple_of<opus::get_warp_size()>(len_per_wave);
+        }
+        IdxT wave_start = start + wave_id * len_per_wave;
+        IdxT wave_end   = std::min(wave_start + len_per_wave, end);
+        if constexpr(filter_chunks)
+        {
+            wave_topk_.filter_indexed(in, in_idx, wave_start, wave_end);
+        }
+        else
+        {
+            wave_topk_.merge_data(in, in_idx, wave_start, wave_end);
+        }
     }
 
     __device__ void reduce()
@@ -2217,14 +2308,17 @@ struct BlockTopkMerge
     }
 
     private:
-    WaveTopkMerge<capacity, descending, DataT, IdxT> wave_topk_;
+    std::conditional_t<filter_chunks,
+                       WaveTopkFilter<capacity, descending, DataT, IdxT>,
+                       WaveTopkMerge<capacity, descending, DataT, IdxT>>
+        wave_topk_;
     IdxT k_;
     ComputeT sentinel_;
     ComputeT* val; // LDS buffer for values (ComputeT)
     IdxT* pos;     // LDS buffer for positions
 };
 
-template <int capacity, bool greater, typename DataT, typename IdxT>
+template <int capacity, bool greater, typename DataT, typename IdxT, bool filter_chunks>
 __global__ void __launch_bounds__(512, 2) topk_merge_kernel(const DataT* __restrict__ in,
                                                             const IdxT* __restrict__ in_idx,
                                                             int batch_size,
@@ -2242,13 +2336,22 @@ __global__ void __launch_bounds__(512, 2) topk_merge_kernel(const DataT* __restr
     IdxT start                    = block_id_in_a_batch * len_per_block;
     IdxT end                      = std::min(start + len_per_block, len);
 
-    BlockTopkMerge<capacity, greater, DataT, IdxT> topk(k, sentinel, lds_buf);
+    BlockTopkMergeImpl<capacity, greater, DataT, IdxT, filter_chunks> topk(k, sentinel, lds_buf);
     topk(in + static_cast<size_t>(batch_id) * len,
          in_idx + static_cast<size_t>(batch_id) * len,
          out + static_cast<size_t>(blockIdx.x) * k,
          out_idx + static_cast<size_t>(blockIdx.x) * k,
          start,
          end);
+}
+
+// Bytes of per-block partial results (values, then 16-byte aligned indices) that
+// the multi-block path hands from the first pass to topk_merge_kernel.
+template <typename DataT, typename IdxT>
+size_t calc_merge_scratch_size(size_t num_blocks, IdxT k)
+{
+    return utils::round_up_to_multiple_of<16>(sizeof(DataT) * num_blocks * k) +
+           sizeof(IdxT) * num_blocks * k;
 }
 
 template <bool greater,
@@ -2264,6 +2367,8 @@ void topk_kernel_launcher(int block_per_batch,
                           IdxT k,
                           DataT* __restrict__ out,
                           IdxT* __restrict__ out_idx,
+                          void* workspace,
+                          size_t workspace_bytes,
                           hipStream_t stream)
 {
     using ComputeT = compute_t<DataT>;
@@ -2271,14 +2376,23 @@ void topk_kernel_launcher(int block_per_batch,
     DataT* tmp_val = nullptr;
     IdxT* tmp_idx  = nullptr;
 
-    // Allocate temporary buffers if multi-block reduction is needed
-    // Intermediate buffers use DataT (first-pass outputs DataT, merge reads DataT)
+    // Intermediate buffers for the multi-block reduction (first pass outputs
+    // DataT, merge reads DataT). They come from the caller's workspace so the
+    // call stays graph-capturable; hipMalloc is only a fallback for callers
+    // that pass none.
+    const size_t num_blocks   = static_cast<size_t>(batch_size) * block_per_batch;
+    const size_t scratch_size = calc_merge_scratch_size<DataT, IdxT>(num_blocks, k);
+    const bool own_scratch    = block_per_batch > 1 && workspace_bytes < scratch_size;
     if(block_per_batch > 1)
     {
-        size_t tmp_size = sizeof(DataT) * block_per_batch * k * batch_size;
-        size_t idx_size = sizeof(IdxT) * block_per_batch * k * batch_size;
-        HIP_CHECK(hipMalloc(&tmp_val, tmp_size));
-        HIP_CHECK(hipMalloc(&tmp_idx, idx_size));
+        char* scratch = static_cast<char*>(workspace);
+        if(own_scratch)
+        {
+            HIP_CHECK(hipMalloc(&scratch, scratch_size));
+        }
+        tmp_val = reinterpret_cast<DataT*>(scratch);
+        tmp_idx = reinterpret_cast<IdxT*>(
+            scratch + utils::round_up_to_multiple_of<16>(sizeof(DataT) * num_blocks * k));
     }
 
     // Sentinel in ComputeT space
@@ -2330,20 +2444,51 @@ void topk_kernel_launcher(int block_per_batch,
         // Launch single block in merge phase
         int merge_block_per_batch = 1;
         int merge_wave_per_block  = 0;
+        auto merge_kernel =
+            get_kernel_function_pointer<greater, BlockTopkMerge, DataT, IdxT>(capacity);
         calc_launch_parameter_for_merge<DataT, IdxT>(
-            merge_len, k, &merge_block_per_batch, &merge_wave_per_block);
+            merge_kernel, merge_len, k, &merge_block_per_batch, &merge_wave_per_block);
+        // The merge block reads what the other CUs wrote, so its time goes to
+        // the cache lines each wave requests. Merging chunks shorter than a line
+        // one by one wastes most of every request; with many chunks per wave it
+        // pays to filter them with whole-line loads instead.
+        constexpr int warp_size = opus::get_warp_size();
+        if(capacity == warp_size && k < 32 && block_per_batch > 8 * merge_wave_per_block)
+        {
+            merge_kernel = topk_merge_kernel<warp_size, greater, DataT, IdxT, true>;
+            calc_launch_parameter_for_merge<DataT, IdxT>(
+                merge_kernel, merge_len, k, &merge_block_per_batch, &merge_wave_per_block);
+        }
         block_dim = merge_wave_per_block * opus::get_warp_size();
         lds_size  = calc_lds_size_for_block_wide<DataT, IdxT>(merge_wave_per_block, k);
 
         // Merge kernel reads DataT (converts to ComputeT internally), outputs DataT
-        auto topk_merge_kernel =
-            get_kernel_function_pointer<greater, BlockTopkMerge, DataT, IdxT>(capacity);
-        topk_merge_kernel<<<batch_size, block_dim, lds_size, stream>>>(
+        merge_kernel<<<batch_size, block_dim, lds_size, stream>>>(
             tmp_val, tmp_idx, batch_size, merge_len, k, out, out_idx, sentinel);
 
-        HIP_CHECK(hipFree(tmp_val));
-        HIP_CHECK(hipFree(tmp_idx));
+        if(own_scratch)
+        {
+            HIP_CHECK(hipFree(tmp_val));
+        }
     }
+}
+
+// Upper bound of calc_merge_scratch_size over every launch AdaptiveTopK can
+// pick for this k. Whenever calc_launch_parameter returns block_per_batch > 1,
+// batch_size * block_per_batch <= min_grid_size of that strategy, so the bound
+// depends on k and the device only.
+template <typename DataT, typename IdxT>
+size_t calc_merge_workspace_size(IdxT k)
+{
+    size_t size       = 0;
+    int block_size    = 0;
+    int min_grid_size = 0;
+    calc_launch_parameter_by_occupancy<BlockTopkSort, DataT, IdxT>(k, &block_size, &min_grid_size);
+    size = std::max(size, calc_merge_scratch_size<DataT, IdxT>(min_grid_size, k));
+    calc_launch_parameter_by_occupancy<BlockTopkFilter, DataT, IdxT>(
+        k, &block_size, &min_grid_size);
+    size = std::max(size, calc_merge_scratch_size<DataT, IdxT>(min_grid_size, k));
+    return size;
 }
 
 // Uniform length version of AdaptiveTopK
@@ -2355,6 +2500,7 @@ void AdaptiveTopK(int batch_size,
                   T* __restrict__ out,
                   IdxT* __restrict__ out_idx,
                   void* workspace,
+                  size_t workspace_bytes,
                   hipStream_t stream = 0)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
@@ -2382,8 +2528,6 @@ void AdaptiveTopK(int batch_size,
             return;
         }
     }
-    (void)workspace; // only the radix path above consumes the caller workspace
-
     const int capacity  = utils::calc_capacity(k);
     int block_per_batch = 0;
     int wave_per_block  = 0;
@@ -2396,15 +2540,33 @@ void AdaptiveTopK(int batch_size,
     if(len_per_wave <=
        static_cast<IdxT>(capacity) * LaunchThreshold<BlockTopkSort>::choosing_factor)
     {
-        topk_kernel_launcher<greater, BlockTopkSort, T, IdxT>(
-            block_per_batch, wave_per_block, in, batch_size, len, k, out, out_idx, stream);
+        topk_kernel_launcher<greater, BlockTopkSort, T, IdxT>(block_per_batch,
+                                                              wave_per_block,
+                                                              in,
+                                                              batch_size,
+                                                              len,
+                                                              k,
+                                                              out,
+                                                              out_idx,
+                                                              workspace,
+                                                              workspace_bytes,
+                                                              stream);
     }
     else
     {
         calc_launch_parameter<BlockTopkFilter, T, IdxT>(
             batch_size, len, k, &block_per_batch, &wave_per_block);
-        topk_kernel_launcher<greater, BlockTopkFilter, T, IdxT>(
-            block_per_batch, wave_per_block, in, batch_size, len, k, out, out_idx, stream);
+        topk_kernel_launcher<greater, BlockTopkFilter, T, IdxT>(block_per_batch,
+                                                                wave_per_block,
+                                                                in,
+                                                                batch_size,
+                                                                len,
+                                                                k,
+                                                                out,
+                                                                out_idx,
+                                                                workspace,
+                                                                workspace_bytes,
+                                                                stream);
     }
 }
 
@@ -2421,6 +2583,7 @@ void AdaptiveTopK(int batch_size,
                   int64_t stride0,
                   int64_t stride1,
                   void* workspace,
+                  size_t workspace_bytes,
                   hipStream_t stream = 0)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
@@ -2471,6 +2634,7 @@ void AdaptiveTopK(int batch_size,
                                            out + batch_id * k,
                                            out_idx + batch_id * k,
                                            workspace,
+                                           workspace_bytes,
                                            stream);
         }
     }
@@ -2543,6 +2707,8 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
     // Caller-provided device scratch for the radix path (fp32 only); allocated +
     // cached on the Python side and passed in so this host code never allocates.
     void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
+    const size_t ws_bytes =
+        workspace.has_value() ? workspace.value().numel() * workspace.value().element_size() : 0;
 
     // Check if we're using variable length mode
     // Empty tensors are conveyed as nullopt or numel()==0, so check both.
@@ -2589,6 +2755,7 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
                                                             stride0,
                                                             stride1,
                                                             ws_ptr,
+                                                            ws_bytes,
                                                             stream);
             }
             else
@@ -2604,6 +2771,7 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
                                                              stride0,
                                                              stride1,
                                                              ws_ptr,
+                                                             ws_bytes,
                                                              stream);
             }
         }
@@ -2618,6 +2786,7 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
                                                             topk_out_kernel_ptr,
                                                             topk_ids_ptr,
                                                             ws_ptr,
+                                                            ws_bytes,
                                                             stream);
             }
             else
@@ -2629,6 +2798,7 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
                                                              topk_out_kernel_ptr,
                                                              topk_ids_ptr,
                                                              ws_ptr,
+                                                             ws_bytes,
                                                              stream);
             }
         }
@@ -2643,4 +2813,17 @@ int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k)
 {
     return invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Prefill>(
         static_cast<int32_t>(numRows), static_cast<int32_t>(stride0), static_cast<int>(k));
+}
+
+// Scratch for the multi-block (Sort/Filter + Merge) path, which every dtype can
+// take when the batch is smaller than the grid. Sized for the widest supported
+// dtype so one value serves fp16, bf16 and fp32; depends on k and the device only.
+int64_t topk_plain_merge_workspace_size(int64_t k)
+{
+    using IdxT      = int32_t;
+    const IdxT topk = static_cast<IdxT>(k);
+    return static_cast<int64_t>(
+        std::max({topk::calc_merge_workspace_size<ck_tile::fp32_t, IdxT>(topk),
+                  topk::calc_merge_workspace_size<ck_tile::fp16_t, IdxT>(topk),
+                  topk::calc_merge_workspace_size<ck_tile::bf16_t, IdxT>(topk)}));
 }
