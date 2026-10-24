@@ -448,6 +448,7 @@ def test_pa_ps(
     kv_dtype: torch.dtype = dtypes.fp8,
     is_causal: bool = True,
     high_precision: int = 1,
+    metadata_mode: str = "v1_2",
 ) -> dict:
     ret = {}
     seed = 0
@@ -580,7 +581,9 @@ def test_pa_ps(
         (reduce_indptr_size, reduce_indptr_type),
         (reduce_final_map_size, reduce_final_map_type),
         (reduce_partial_map_size, reduce_partial_map_type),
-    ) = aiter.get_pa_metadata_info_v1(batch_size, num_kv_heads)
+    ) = aiter.get_pa_metadata_info_v1(
+        batch_size, num_kv_heads, fast_mode=metadata_mode == "v1_2"
+    )
     work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
     work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
     work_info = torch.empty(work_info_set_size, dtype=work_info_set_type)
@@ -613,11 +616,11 @@ def test_pa_ps(
     else:
         # warmup for get_pa_metadata_v1
         aiter.get_pa_metadata_v1(
-            torch.tensor([0], dtype=torch.int32),
-            torch.tensor([0], dtype=torch.int32),
-            torch.tensor([0], dtype=torch.int32),
-            1,
-            1,
+            qo_indptr,
+            kv_indptr,
+            seq_lens_kv,
+            num_query_heads // num_kv_heads,
+            num_kv_heads,
             is_causal,
             work_metadata_ptrs,
             work_indptr,
@@ -627,9 +630,9 @@ def test_pa_ps(
             reduce_partial_map,
             kv_granularity=max(block_size, 16),
             block_size=block_size,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=True,
+            max_seqlen_qo=int(max_qlen),
+            uni_seqlen_qo=qlen,
+            fast_mode=metadata_mode == "v1_2",
             max_split_per_batch=-1,
         )
         torch.cuda.synchronize()
@@ -653,7 +656,7 @@ def test_pa_ps(
             block_size=block_size,
             max_seqlen_qo=int(max_qlen),
             uni_seqlen_qo=qlen,
-            fast_mode=True,
+            fast_mode=metadata_mode == "v1_2",
             max_split_per_batch=-1,
         )
         end_event.record()
@@ -872,6 +875,12 @@ parser.add_argument(
 parser.add_argument(
     "--output", default="pa_ps.csv", help="Path for the benchmark CSV output."
 )
+parser.add_argument(
+    "--metadata-mode",
+    choices=["v1_2", "v1_1"],
+    default="v1_2",
+    help="PA metadata strategy; v1_1 uses prefix-budget GPU planning (dense, one Q tile).",
+)
 args = parser.parse_args()
 
 if gpu_arch != "gfx950" and 16 in args.block_size:
@@ -929,6 +938,7 @@ for dtype in args.dtype:
             kv_dtype=kv_dtype,
             is_causal=is_causal,
             high_precision=high_precision,
+            metadata_mode=args.metadata_mode,
         )
         df.append(ret)
 df = pd.DataFrame(df)
