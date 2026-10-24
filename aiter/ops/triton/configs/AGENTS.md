@@ -106,10 +106,14 @@ get_gemm_config(config_name, M, N=None, K=None, bounds=None,
 
 1. It reads `<arch>/<backend>/gemm/<d_type>/DEFAULT.json`. This file must
    exist.
-2. It uses a specialized file if one matches: `<CONFIG_NAME>-B=..-N=..-K=..`,
-   then `<CONFIG_NAME>-N=..-K=..`, or `<CONFIG_NAME>-<specialized_filename>`.
-   A specialized file with `"DEFAULT_FALLBACK": true` gets the buckets that
-   it does not have from `DEFAULT.json`.
+2. It uses a specialized file if one matches. The first existing file wins:
+   `<CONFIG_NAME>-B=..-N=..-K=..-CU=<cu>`, `<CONFIG_NAME>-B=..-N=..-K=..`,
+   `<CONFIG_NAME>-N=..-K=..-CU=<cu>`, `<CONFIG_NAME>-N=..-K=..`, or
+   `<CONFIG_NAME>-<specialized_filename>`. `cu` is the device CU count
+   (`CU_NUM` overrides it). A `-CU=` file replaces the arch-wide file for
+   that CU count, so it must be a complete table. A specialized file with
+   `"DEFAULT_FALLBACK": true` gets the buckets that it does not have from
+   `DEFAULT.json`.
 3. In the file it tries the `M_LEQ_<x>` keys in increasing order, then
    `"any"`.
 

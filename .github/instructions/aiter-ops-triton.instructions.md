@@ -93,6 +93,9 @@ All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
   top of `configs/`.
 - An arch prefix in a file name in `configs/<arch>/...`. The default file must
   be `DEFAULT.json`.
+- A CU-specific GEMM file not named `...-N={N}-K={K}-CU={cu}.json` or
+  `...-B={B}-N={N}-K={K}-CU={cu}.json`. It replaces the arch-wide file for
+  that CU count, so it must be a complete table.
 - A specialized file in a folder without `DEFAULT.json`, when the loader needs
   the default.
 - Two folders for one family that differ only by `-` and `_`

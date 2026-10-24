@@ -1,3 +1,6 @@
+import functools
+import os
+
 import triton
 
 
@@ -25,6 +28,24 @@ def get_arch():
     if _CACHED_ARCH is None:
         _CACHED_ARCH = _probe_arch()
     return _CACHED_ARCH
+
+
+@functools.lru_cache(maxsize=1)
+def _get_device_cu_count():
+    try:
+        driver = triton.runtime.driver.active
+        props = driver.utils.get_device_properties(driver.get_current_device())
+        return int(props["multiprocessor_count"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def get_cu_count():
+    """CU count of the current device (CU_NUM overrides), or None if unknown."""
+    cu_num = int(os.environ.get("CU_NUM", "0") or 0)
+    if cu_num > 0:
+        return cu_num
+    return _get_device_cu_count()
 
 
 def is_gluon_avail():

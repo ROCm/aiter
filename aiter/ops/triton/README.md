@@ -160,6 +160,10 @@ def _get_config(M: int, N: int, K: int):
     return get_gemm_config("GEMM-A16W16", M, N, K)  # returns (config, is_tuned)
 ```
 
+The first existing specialized file wins, in this order:
+`B={B}-N={N}-K={K}-CU={cu}`, `B={B}-N={N}-K={K}`, `N={N}-K={K}-CU={cu}`,
+`N={N}-K={K}`. `cu` is the device CU count (`CU_NUM` overrides it).
+
 [`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
 loaders, the JSON format and the steps to add a config. To tune a GEMM, use
 the scripts in [`utils/_triton/tuning/`](utils/_triton/tuning/README.md).
