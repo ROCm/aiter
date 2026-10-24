@@ -2200,6 +2200,13 @@ struct smem {
         using type = vector_type<vec>;
         static_assert(sizeof(type) == 8, "DS_READ_B64_TR requires 8-byte (64-bit) load");
         constexpr index_t elem_bits = sizeof_bits_v<scalar_type>;
+#if defined(OPUS_GFX950_NO_INLINE_ASM_TR_LOAD)
+        static_assert(elem_bits == 16,
+                      "the gfx950 no-asm transpose fallback currently supports 16-bit elements");
+        auto* p = reinterpret_cast<OPUS_LDS_ADDR type*>(
+            ptr + v_os + imm_offset);
+        return __builtin_amdgcn_ds_read_tr16_b64_v4bf16(p);
+#else
         i32x2_t raw;
         const u32_t addr = static_cast<u32_t>(reinterpret_cast<__UINTPTR_TYPE__>(ptr + v_os));
         if      constexpr (elem_bits == 16) { asm volatile("ds_read_b64_tr_b16 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
@@ -2207,6 +2214,7 @@ struct smem {
         else if constexpr (elem_bits == 4)  { asm volatile("ds_read_b64_tr_b4 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
         else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); }
         return __builtin_bit_cast(type, raw);
+#endif
 #elif defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__)
         using type = vector_type<vec>;
         constexpr index_t elem_bits = sizeof_bits_v<scalar_type>;
