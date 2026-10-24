@@ -56,10 +56,10 @@ from ..kernels_common import LOG2E
 from ..tensor_shim import _run_compiled
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
-# in fmha_b16_buffer_managers. Under mode 2 the LLVM setreg (via the
+# in fmha_buffer_managers. Under mode 2 the LLVM setreg (via the
 # amdgpu-expert-scheduling-mode hint, set in _ensure_*_kernel) makes LLVM insert all
 # depctr covers itself for the plain intrinsics the kernel emits.
-from .fmha_b16_buffer_managers import (
+from .fmha_buffer_managers import (
     ENABLE_SCHED_MODE2,
     KManager16bV1,
     KManager16bV2,
@@ -231,7 +231,7 @@ PVQK_LAG = 2
 PVQK_HEAD_CARRY = 20
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
-# granularity) live inside fmha_b16_buffer_managers.py — they are intrinsic to the
+# granularity) live inside fmha_buffer_managers.py — they are intrinsic to the
 # managers' LDS layouts, so the kernel no longer declares them here.
 
 
@@ -361,21 +361,34 @@ def _keepalive(vals):
     )
 
 
-def _ring_num_prefetch(num_frag, ring, ring_lag):
+def _concat(parts):
+    """Join a fragment's ds_load results into one WMMA operand. A pure shufflevector --
+    the register allocator coalesces it into adjacent registers, so it costs no VALU."""
+    cur = list(parts)
+    while len(cur) > 1:
+        cur = [
+            cur[i].shuffle(cur[i + 1], list(range(2 * cur[i].numel)))
+            for i in range(0, len(cur), 2)
+        ]
+    return cur[0]
+
+
+def _ring_num_prefetch(num_ld, ring, ring_lag):
     """In-flight ds_load depth (NP) of a ``_ring_drive`` with this geometry. A tile that
     fits in the ring never wraps, so nothing is refilled and the WAR lag buys nothing --
     prefetch it whole. Only a wrapping ring pays for lag."""
-    num_ld = 2 * num_frag
     if num_ld <= ring:
         return num_ld
     return ring - 2 * ring_lag
 
 
-def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None):
+def _ring_drive(*, widths, emit, consume, ring, ring_lag, head=None, dies=None):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
-    ``emit(j)`` emits ds_load ``j`` (2 per WMMA fragment); ``consume(i, lo, hi)`` emits
-    fragment ``i``'s WMMA chain. Only ``ring`` loads are live at once and
+    ``widths[i]`` is how many ds_loads fragment ``i`` is built from -- 2 where one load
+    covers half a 32-byte operand (b128), 4 where it covers a quarter (8-bit V, whose
+    transpose load is the half-width ``tr8_b64``). ``emit(j)`` emits ds_load ``j`` of the
+    flat stream; ``consume(i, *parts)`` emits fragment ``i``'s WMMA chain. Only ``ring`` loads are live at once and
     ``NP = ring - 2*lag`` are in flight, so a refill targets slots last read ``lag``
     fragments ago -- trading pipeline depth for WAR distance at fixed VGPR cost. Refills
     are hoisted ABOVE the wmma, which is what keeps the ring from reintroducing the
@@ -391,8 +404,12 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
     registers fall free the instant their last wmma issues and the next refill grabs them
     at a WAR distance of one VALU, instead of the ``2*rel`` the ring pairs enjoy.
     """
-    num_ld = 2 * num_frag
-    num_prefetch = _ring_num_prefetch(num_frag, ring, ring_lag)
+    num_frag = len(widths)
+    starts = [0]
+    for w in widths:
+        starts.append(starts[-1] + w)
+    num_ld = starts[-1]
+    num_prefetch = _ring_num_prefetch(num_ld, ring, ring_lag)
     ring = min(ring, num_ld)
     assert (
         num_prefetch > 0
@@ -416,20 +433,20 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
             rocdl.sched_barrier(0)
         rocdl.sched_barrier(0)  # pin the num_prefetch-deep burst above the stream
 
-    steady = num_frag - num_prefetch // 2
-    held = []  # held[i] = the pair fragment i read; released rel fragments later
+    issued = num_prefetch
+    held = []  # held[i] = the loads fragment i read; released rel fragments later
     rel = (
         ring_lag + 1
     )  # refill is hoisted, so hold one fragment PAST the refill of that slot
 
-    def _refill(i):
-        for k in range(2):
-            j = 2 * i + num_prefetch + k
-            if j < num_ld:
-                a[j % ring] = schedule_bank(
-                    emit(j), bank=1, soft=True, reason="ring_frag"
-                )
-                rocdl.sched_barrier(0)
+    def _refill(upto):
+        nonlocal issued
+        while issued < min(upto, num_ld):
+            a[issued % ring] = schedule_bank(
+                emit(issued), bank=1, soft=True, reason="ring_frag"
+            )
+            rocdl.sched_barrier(0)
+            issued += 1
 
     def _release(i):
         j = i - rel
@@ -442,29 +459,26 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
             rocdl.sched_barrier(0)
             held[j] = None
 
-    def _record(i, pair):
-        vals = list(pair) if pair is not None else []
+    def _record(i, parts):
+        vals = list(parts) if parts is not None else []
         if dies is not None:
             vals.extend(dies(i))
         held.append(tuple(vals) if vals else None)
 
-    for i in range(steady):
-        _waitn(num_prefetch - 2)
+    for i in range(num_frag):
+        # The wait is placed before the refill, so it is measured against what is already
+        # outstanding: everything issued past the end of this fragment may still be in
+        # flight, and the refill below only adds younger loads.
+        _waitn(issued - starts[i + 1])
         _release(i)
-        _refill(i)
-        lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
+        refilling = issued < num_ld
+        _refill(starts[i + 1] + num_prefetch)
+        parts = tuple(a[(starts[i] + k) % ring] for k in range(widths[i]))
         rocdl.sched_barrier(0)
-        consume(i, lo, hi)
+        consume(i, *parts)
         rocdl.sched_barrier(0)
-        _record(i, (lo, hi) if ring_lag else None)
-    for i in range(steady, num_frag):
-        _waitn(num_prefetch - 2 * (i - steady + 1))
-        _release(i)
-        lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
-        rocdl.sched_barrier(0)
-        consume(i, lo, hi)
-        rocdl.sched_barrier(0)
-        _record(i, None)
+        # Past the last refill nothing can clobber the slots, so holding them buys nothing.
+        _record(i, parts if (ring_lag and refilling) else None)
     for p in held:
         if p is not None:
             _keepalive(p)
@@ -730,6 +744,7 @@ def _pv_qk_gemm(
     head=None,
     ring=PVQK_RING,
     ring_lag=PVQK_LAG,
+    vld_per_frag=2,
     phase="pvqk",
 ):
     """GEMM2(u-1) then GEMM1(u) driven by ONE ring over the concatenated V-then-K
@@ -767,9 +782,13 @@ def _pv_qk_gemm(
     """
     num_q_tiles = len(p_list)
     d_tiles = v_hdim // WMMA_M
-    num_contract_tiles = n_block // WMMA_K
+    # Contraction depth follows the V load width: each tile is one WMMA's worth of kv,
+    # vld_per_frag transpose loads of 16 rows each (32 kv at 16-bit, 64 at 8-bit).
+    num_contract_tiles = n_block // (vld_per_frag * WMMA_N)
     num_kv_frags = n_block // WMMA_N
     num_k_tiles = len(q_frags_list[0])
+    # softmax tiles per PV B operand: one per 16 kv rows of the contraction
+    num_p_parts = num_kv_frags // num_contract_tiles
 
     # ``phase`` drops one half of the stream when the caller knows it is dead (the
     # single-KV-tile core runs QK and PV as separate passes around softmax).
@@ -777,7 +796,7 @@ def _pv_qk_gemm(
     do_qk = phase != "pv"
     num_v_frags = d_tiles * num_contract_tiles if do_pv else 0
     num_k_frags = num_kv_frags * num_k_tiles if do_qk else 0
-    num_vld = 2 * num_v_frags
+    num_vld = vld_per_frag * num_v_frags
 
     out_list = [[None] * d_tiles for _ in range(num_q_tiles)]
     if not do_pv:
@@ -790,10 +809,10 @@ def _pv_qk_gemm(
     def emit(j):
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
 
-    def consume(i, lo, hi):
+    def consume(i, *parts):
         if i < num_v_frags:
             d_tile_idx, k_tile_idx = divmod(i, num_contract_tiles)
-            v_frag = lo.shuffle(hi, list(range(16)))
+            v_frag = _concat(parts)
             for q_tile_idx in range(num_q_tiles):
                 acc = out_list[q_tile_idx][d_tile_idx]
                 if acc is None:
@@ -803,15 +822,15 @@ def _pv_qk_gemm(
                         else fx.full(8, 0.0, fx.Float32)
                     )
                 p = p_list[q_tile_idx]
-                p_frag = p[2 * k_tile_idx].shuffle(
-                    p[2 * k_tile_idx + 1], list(range(16))
+                p_frag = _concat(
+                    [p[num_p_parts * k_tile_idx + t] for t in range(num_p_parts)]
                 )
                 p_frags[(q_tile_idx, k_tile_idx)] = p_frag
                 out_list[q_tile_idx][d_tile_idx] = _wmma(v_frag, p_frag, acc)
                 rocdl.sched_barrier(0)
             return
         kv, d_tile_idx = divmod(i - num_v_frags, num_k_tiles)
-        k_frag = lo.shuffle(hi, list(range(16)))
+        k_frag = _concat(parts)
         for q_tile_idx in range(num_q_tiles):
             acc = (
                 s_acc_list[q_tile_idx][kv]
@@ -840,7 +859,7 @@ def _pv_qk_gemm(
     # in its softmax VALU here, and the gemm half must win issue arbitration.
     rocdl.s_setprio(2)
     _ring_drive(
-        num_frag=num_v_frags + num_k_frags,
+        widths=[vld_per_frag] * num_v_frags + [2] * num_k_frags,
         emit=emit,
         consume=consume,
         ring=ring,
@@ -890,7 +909,7 @@ def _alloc_lds():
     return fx.Int32(fx.ptrtoint(smem.peek().ptr))
 
 
-# Keys ``_prologue_attention`` shares with the compute cores' kwarg dict.
+# Keys ``_attention_prologue`` shares with the compute cores' kwarg dict.
 _PROLOGUE_KEYS = (
     "qk_hdim",
     "v_hdim",
@@ -919,7 +938,60 @@ _PROLOGUE_KEYS = (
 )
 
 
-def _prologue_attention(
+def _build_managers(
+    *, qk_hdim, v_hdim, n_block, gqa_ratio, num_q_tiles_per_wave, elem_dtype
+):
+    """The Q/K/V staging managers both cores use; USE_TDM_LOADER picks the transport.
+
+    Pure object construction -- no IR is emitted until a manager method is called, so
+    sharing this between the cores cannot move the generated code.
+    """
+    if USE_TDM_LOADER:
+        return (
+            QManager16bV2(
+                qk_hdim=qk_hdim,
+                gqa_ratio=gqa_ratio,
+                num_waves=NUM_WAVES,
+                q_tiles_per_wave=num_q_tiles_per_wave,
+                elem_dtype=elem_dtype,
+            ),
+            KManager16bV2(
+                qk_hdim=qk_hdim,
+                n_block=n_block,
+                num_waves=NUM_WAVES,
+                elem_dtype=elem_dtype,
+            ),
+            VManager16bV2(
+                v_hdim=v_hdim,
+                n_block=n_block,
+                num_waves=NUM_WAVES,
+                elem_dtype=elem_dtype,
+            ),
+        )
+    return (
+        QManager16bV1(
+            qk_hdim=qk_hdim,
+            gqa_ratio=gqa_ratio,
+            num_waves=NUM_WAVES,
+            q_tiles_per_wave=num_q_tiles_per_wave,
+            elem_dtype=elem_dtype,
+        ),
+        KManager16bV1(
+            qk_hdim=qk_hdim,
+            n_block=n_block,
+            num_waves=NUM_WAVES,
+            elem_dtype=elem_dtype,
+        ),
+        VManager16bV1(
+            v_hdim=v_hdim,
+            n_block=n_block,
+            num_waves=NUM_WAVES,
+            elem_dtype=elem_dtype,
+        ),
+    )
+
+
+def _attention_prologue(
     *,
     qk_hdim,
     v_hdim,
@@ -968,40 +1040,14 @@ def _prologue_attention(
     # K/V staging: N_KV_PP slots of 2 LDS_CHUNK_BYTES chunks each, every tile split 2-way
     # along n_block into chunks 6 apart (different 64 KB segments). Q time-shares slot 1's
     # chunks, O the two slots the loop has finished with -- see the 12-chunk map up top.
-    if USE_TDM_LOADER:
-        q_mgr = QManager16bV2(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=num_q_tiles_per_wave,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV2(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV2(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
-    else:
-        q_mgr = QManager16bV1(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=num_q_tiles_per_wave,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV1(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV1(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
+    q_mgr, k_mgr, v_mgr = _build_managers(
+        qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
+        n_block=n_block,
+        gqa_ratio=gqa_ratio,
+        num_q_tiles_per_wave=num_q_tiles_per_wave,
+        elem_dtype=elem_dtype,
+    )
     k_blk_bytes = k_mgr.get_lds_size_in_byte()
     v_blk_bytes = v_mgr.get_lds_size_in_byte()
     assert k_blk_bytes % KV_LDS_SPLITS == 0 and v_blk_bytes % KV_LDS_SPLITS == 0
@@ -1319,7 +1365,7 @@ def _o_unpack(wide, num_tiles):
     ]
 
 
-def _core_attention_multi_kv_tiles(
+def _attention_core_multi_kv_tiles(
     *,
     qk_hdim,
     v_hdim,
@@ -1363,13 +1409,13 @@ def _core_attention_multi_kv_tiles(
     warp_idx,  # runtime fx.Int32 wave index
     warp_type,  # compile-time WarpType (LO/HI x SIMD parity)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
-    prologue,  # dict from _prologue_attention: managers, LDS map, KV span, Q fragments
+    prologue,  # dict from _attention_prologue: managers, LDS map, KV span, Q fragments
     elem_dtype,  # compile-time fx.BFloat16 / fx.Float16 for Q/K/V/P/O fragments
 ):
     """Layout-agnostic m32x8 compute, shared by the THD and BSHD kernel entries.
 
-    Takes over from ``_prologue_attention`` (Q already in VGPR, the first tiles already
-    in flight) and hands ``_epilogue_attention`` the finished softmax/O state. The caller
+    Takes over from ``_attention_prologue`` (Q already in VGPR, the first tiles already
+    in flight) and hands ``_attention_epilogue`` the finished softmax/O state. The caller
     dispatches on runtime ``warp_type``, tracing this body once per compile-time value;
     the two instantiations differ only in their main-loop phase ordering (LO drives the
     K load, HI shadows it), which is why only this middle part is duplicated.
@@ -1500,24 +1546,26 @@ def _core_attention_multi_kv_tiles(
 
     # Carried ring head: _num_head_carry of the first body's V loads, issued here (slot 0 is resident
     # -- the prologue fence just drained it) and thereafter at the end of each body.
-    _num_k_frags = k_mgr.num_ds_loads() // 2
-    _num_v_frags = v_mgr.num_ds_loads() // 2
-    _num_prefetch = _ring_num_prefetch(_num_v_frags + _num_k_frags, PVQK_RING, PVQK_LAG)
+    _num_k_frags = k_mgr.num_ds_loads() // k_mgr.loads_per_frag
+    _num_v_frags = v_mgr.num_ds_loads() // v_mgr.loads_per_frag
+    _num_vld = v_mgr.num_ds_loads()
+    _vld_group = v_mgr.loads_per_frag  # pin the head in whole V fragments
+    _num_prefetch = _ring_num_prefetch(
+        _num_vld + k_mgr.num_ds_loads(), PVQK_RING, PVQK_LAG
+    )
     # The lagging half opens its body with softmax, so its ring head is issued there and
     # consumed after the barrier -- within one body, nothing to carry.
     # The carry is issued a body early, where only V is resident, so it cannot run past V.
     _num_head_carry = (
-        0
-        if _is_lagging_softmax
-        else min(PVQK_HEAD_CARRY, _num_prefetch, 2 * _num_v_frags)
+        0 if _is_lagging_softmax else min(PVQK_HEAD_CARRY, _num_prefetch, _num_vld)
     )
-    assert _num_head_carry <= 2 * _num_v_frags, "carried head must be V loads only"
+    assert _num_head_carry <= _num_vld, "carried head must be V loads only"
     _head_carry_idx = len(_init)
     _seed_head = []
     for j in range(_num_head_carry):
         # Same per-pair pin as ``_issue_head`` in the body.
         _seed_head.append(_raw(v_mgr.load_one_to_reg(v_lds_ld[0], j)))
-        if len(_seed_head) % 2 == 0:
+        if len(_seed_head) % _vld_group == 0:
             rocdl.sched_barrier(0)
     _init = _init + _seed_head
 
@@ -1640,22 +1688,22 @@ def _core_attention_multi_kv_tiles(
             return v_mgr.load_one_to_reg(v_curr, j)
 
         def _issue_head(emit, first, last, carried=()):
-            # Pin every fragment's load PAIR in place. The ring consumes loads 2i and
-            # 2i+1 for fragment i, but the scheduler scatters the 20-deep burst freely --
+            # Pin every fragment's loads in place. The ring consumes one group per
+            # fragment, but the scheduler scatters the 20-deep burst freely --
             # in the dumps a partner load drifted 12+ slots back, so the wmma waited on
             # most of the burst (s_wait_dscnt 0x9 / 0x7) instead of the ring's 0x12.
             # NOT _keepalive -- that is a USE, so it drags an s_wait_dscnt 0x0 in with it.
             out = list(carried)
             for j in range(first, last):
                 out.append(emit(j))
-                if len(out) % 2 == 0:
+                if len(out) % _vld_group == 0:
                     rocdl.sched_barrier(0)
             return out
 
         def _vk_emit(j):
             # The ring runs V then K; past the V loads the head continues into K, matching
             # ``_pv_qk_gemm``'s emit. Both slots are resident, so either is issuable here.
-            return _v_emit(j) if j < 2 * _num_v_frags else _k_emit(j - 2 * _num_v_frags)
+            return _v_emit(j) if j < _num_vld else _k_emit(j - _num_vld)
 
         def _pvqk_head():
             # The first _num_head_carry loads came from the previous body (issued under its softmax);
@@ -1782,6 +1830,7 @@ def _core_attention_multi_kv_tiles(
             o_out, s_acc = _pv_qk_gemm(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
+                vld_per_frag=v_mgr.loads_per_frag,
                 p_list=p_list,
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
@@ -1801,6 +1850,7 @@ def _core_attention_multi_kv_tiles(
             o_acc, s_list = _pv_qk_gemm(
                 v_emit=_v_emit,
                 k_emit=_k_emit,
+                vld_per_frag=v_mgr.loads_per_frag,
                 p_list=carry_prev,
                 q_frags_list=q_frags,
                 v_hdim=v_hdim,
@@ -1940,7 +1990,7 @@ def _core_attention_multi_kv_tiles(
     # The trailing body's dead clamped tile copies are still in flight. HI's targets
     # final[1], a V chunk O never touches; LO's two K copies land in final[2] and final[1],
     # and final[2] IS an O chunk -- so the drain needs a rendezvous behind it, which
-    # ``_epilogue_attention`` supplies, since a wave only retires its own copies and O's
+    # ``_attention_epilogue`` supplies, since a wave only retires its own copies and O's
     # chunk halves are shared by wave pairs.
     _copy_wait(*_kv_drain)
     return _epi_state(
@@ -1960,7 +2010,7 @@ def _core_attention_multi_kv_tiles(
     )
 
 
-def _core_attention_one_kv_tile(
+def _attention_core_one_kv_tile(
     *,
     qk_hdim,
     v_hdim,
@@ -2021,40 +2071,14 @@ def _core_attention_one_kv_tile(
     _q_scale = softmax_scale * fx.Float32(LOG2E)
     num_q_tiles = num_q_tiles_per_wave
 
-    if USE_TDM_LOADER:
-        q_mgr = QManager16bV2(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=num_q_tiles,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV2(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV2(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
-    else:
-        q_mgr = QManager16bV1(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=num_q_tiles,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV1(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV1(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
+    q_mgr, k_mgr, v_mgr = _build_managers(
+        qk_hdim=qk_hdim,
+        v_hdim=v_hdim,
+        n_block=n_block,
+        gqa_ratio=gqa_ratio,
+        num_q_tiles_per_wave=num_q_tiles,
+        elem_dtype=elem_dtype,
+    )
     _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES
     slot_bytes = 2 * LDS_CHUNK_BYTES
     for _label, _bytes in (
@@ -2175,6 +2199,7 @@ def _core_attention_one_kv_tile(
     _, s_list = _pv_qk_gemm(
         v_emit=None,
         k_emit=_k_emit,
+        vld_per_frag=v_mgr.loads_per_frag,
         p_list=[[] for _ in range(num_q_tiles)],
         q_frags_list=q_frags,
         v_hdim=v_hdim,
@@ -2185,12 +2210,12 @@ def _core_attention_one_kv_tile(
     )
 
     # PV's ring head goes out before softmax so its LDS latency hides under the VALU.
-    _num_prefetch = _ring_num_prefetch(v_mgr.num_ds_loads() // 2, PVQK_RING, PVQK_LAG)
+    _num_prefetch = _ring_num_prefetch(v_mgr.num_ds_loads(), PVQK_RING, PVQK_LAG)
     rocdl.sched_barrier(0)
     pv_head = []
     for j in range(_num_prefetch):
         pv_head.append(_v_emit(j))
-        if len(pv_head) % 2 == 0:
+        if len(pv_head) % v_mgr.loads_per_frag == 0:
             rocdl.sched_barrier(0)
     rocdl.sched_barrier(0)
 
@@ -2230,6 +2255,7 @@ def _core_attention_one_kv_tile(
     o_list, _ = _pv_qk_gemm(
         v_emit=_v_emit,
         k_emit=None,
+        vld_per_frag=v_mgr.loads_per_frag,
         p_list=p_list,
         q_frags_list=q_frags,
         v_hdim=v_hdim,
@@ -2371,7 +2397,7 @@ def _store_o_lse(
             )
 
 
-# Keys ``_epilogue_attention`` shares with the compute cores' kwarg dict.
+# Keys ``_attention_epilogue`` shares with the compute cores' kwarg dict.
 _EPILOGUE_KEYS = (
     "v_hdim",
     "gqa_ratio",
@@ -2417,7 +2443,7 @@ def _epi_state_zeros(*, num_q_tiles_per_wave, v_hdim):
     )
 
 
-def _epilogue_attention(
+def _attention_epilogue(
     *,
     epi_state,
     rendezvous,  # compile-time: the multi core leaves KV copies in O's chunk
@@ -2760,20 +2786,20 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     num_q_tiles_per_wave=NUM_Q_TILES, v_hdim=V_HDIM
                 )
                 if ONE_KV_TILE:
-                    _epi_state_out = _core_attention_one_kv_tile(
+                    _epi_state_out = _attention_core_one_kv_tile(
                         warp_idx=warp_idx, lds_base=lds_base, **_core_kwargs
                     )
                 else:
                     # One traced copy of Q's load and the first KV tiles, outside the
                     # warp-type branch; the two halves differ only under its own branches.
-                    _prologue = _prologue_attention(
+                    _prologue = _attention_prologue(
                         warp_idx=warp_idx,
                         lds_base=lds_base,
                         **{k: _core_kwargs[k] for k in _PROLOGUE_KEYS},
                     )
                     # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
                     if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-                        _epi_state_out = _core_attention_multi_kv_tiles(
+                        _epi_state_out = _attention_core_multi_kv_tiles(
                             warp_idx=warp_idx,
                             warp_type=WarpType.LO,
                             lds_base=lds_base,
@@ -2781,7 +2807,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                             **_core_kwargs,
                         )
                     else:
-                        _epi_state_out = _core_attention_multi_kv_tiles(
+                        _epi_state_out = _attention_core_multi_kv_tiles(
                             warp_idx=warp_idx,
                             warp_type=WarpType.HI,
                             lds_base=lds_base,
@@ -2789,7 +2815,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                             **_core_kwargs,
                         )
                 # One traced copy of the O/LSE tail, outside the warp-type branch.
-                _epilogue_attention(
+                _attention_epilogue(
                     epi_state=_epi_state_out,
                     rendezvous=not ONE_KV_TILE,
                     warp_idx=warp_idx,
@@ -2899,20 +2925,20 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             num_q_tiles_per_wave=NUM_Q_TILES, v_hdim=V_HDIM
         )
         if ONE_KV_TILE:
-            _epi_state_out = _core_attention_one_kv_tile(
+            _epi_state_out = _attention_core_one_kv_tile(
                 warp_idx=warp_idx, lds_base=lds_base, **_core_kwargs
             )
         else:
             # One traced copy of Q's load and the first KV tiles, outside the
             # warp-type branch; the two halves differ only under its own branches.
-            _prologue = _prologue_attention(
+            _prologue = _attention_prologue(
                 warp_idx=warp_idx,
                 lds_base=lds_base,
                 **{k: _core_kwargs[k] for k in _PROLOGUE_KEYS},
             )
             # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
             if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-                _epi_state_out = _core_attention_multi_kv_tiles(
+                _epi_state_out = _attention_core_multi_kv_tiles(
                     warp_idx=warp_idx,
                     warp_type=WarpType.LO,
                     lds_base=lds_base,
@@ -2920,7 +2946,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     **_core_kwargs,
                 )
             else:
-                _epi_state_out = _core_attention_multi_kv_tiles(
+                _epi_state_out = _attention_core_multi_kv_tiles(
                     warp_idx=warp_idx,
                     warp_type=WarpType.HI,
                     lds_base=lds_base,
@@ -2928,7 +2954,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     **_core_kwargs,
                 )
         # One traced copy of the O/LSE tail, outside the warp-type branch.
-        _epilogue_attention(
+        _attention_epilogue(
             epi_state=_epi_state_out,
             rendezvous=not ONE_KV_TILE,
             warp_idx=warp_idx,
@@ -3199,6 +3225,55 @@ def _ensure_bshd_kernel(
     }
     _launch.compile_hints["waves_per_eu"] = 2
     _launch_fns[key] = _launch
+
+
+def flash_attn_a16w16_m32x8_supported(
+    mode,
+    q,
+    k,
+    v,
+    *,
+    dropout_p=0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    sink=None,
+    block_table=None,
+    return_attn_probs=False,
+) -> bool:
+    """Can the m32x8 prefill kernel serve this configuration?
+
+    Metadata only -- no allocation, compile or launch -- so a caller can gate before
+    preparing buffers. The ARCH is the caller's business: dispatch on it first and call
+    this only on gfx1250. ``mode`` is "varlen" or "batch"; both are served by the same
+    kernel today, so it is accepted and ignored.
+
+    Per-call buffer validation (a caller-provided ``out``) stays with the entry points.
+    """
+    del mode  # same gate for both layouts today
+    qk_hdim, v_hdim = q.shape[-1], v.shape[-1]
+    num_q, num_kv = q.shape[-2], k.shape[-2]
+    sink_ok = sink is None or (
+        torch.is_tensor(sink) and sink.dtype == torch.float32 and sink.shape == (num_q,)
+    )
+    return (
+        qk_hdim in SUPPORTED_QK_HDIM
+        and v_hdim in SUPPORTED_V_HDIM
+        and k.shape[-1] == qk_hdim
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and num_kv > 0
+        and num_q % num_kv == 0
+        and supports_gqa_ratio(num_q // max(num_kv, 1))
+        and dropout_p == 0.0
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and block_table is None
+        and bias is None
+        and alibi_slopes is None
+        and sink_ok
+        and not return_attn_probs
+    )
 
 
 def flash_attn_varlen_m32x8(
