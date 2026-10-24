@@ -172,7 +172,9 @@
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_gfx1250_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce_gfx1250.cu'"
         ],
-        "flags_extra_cc": ["'-DENABLE_CK=0'"],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -1913,13 +1915,18 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v32_fwd_decode_m16x4_fp8_fp8.cuh'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": ["'-DKITTENS_CDNA4'"],
+        "flags_extra_hip": [
+            "'-DKITTENS_CDNA4'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''",
-        "third_party": ["'HipKittens'", "'ComposableKernel'"],
+        "third_party": [
+            "'HipKittens'",
+            "'ComposableKernel'"
+        ],
         "is_experimental": "True"
     },
     "module_hk_mla_v40_fwd_mi3xx": {
@@ -1932,7 +1939,9 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1.cuh'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": ["'-DKITTENS_CDNA4'"],
+        "flags_extra_hip": [
+            "'-DKITTENS_CDNA4'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -2167,5 +2176,108 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_gfx1201_sage_prepare": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gfx1201_sage_prepare_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sage_prepare.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffp-contract=off'",
+            "'-fno-gpu-flush-denormals-to-zero'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_gfx1201_sage_attention": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gfx1201_sage_attention_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sage_attention.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_gfx1201_sage_attention_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gfx1201_sage_attention.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m sage_attn --output_dir {{}}'"
+        ]
+    },
+    "module_gfx1201_sage_prepare_h3": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gfx1201_sage_prepare_h3_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sage_prepare_h3/gfx1201_sage_prepare_h3.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-fgpu-flush-denormals-to-zero'",
+            "'-fno-offload-uniform-block'",
+            "'-mwavefrontsize64'",
+            "'-DHIP_ENABLE_WARP_SYNC_BUILTINS=1'",
+            "'-mllvm'",
+            "'--lsr-drop-solution=1'",
+            "'-mllvm'",
+            "'-enable-post-misched=1'",
+            "'-mllvm'",
+            "'-amdgpu-early-inline-all=true'",
+            "'-mllvm'",
+            "'-amdgpu-function-calls=false'",
+            "'-DH3_STAT_CHUNK=2048'",
+            "'-DH3_K_PACK=2'",
+            "'-DH3_K_GROUPS=4'",
+            "'-DH3_V_PADDING=4'",
+            "'-DH3_PACKED_CONVERSION=1'",
+            "'-DH3_CENTER_KEY=0'",
+            "'-DH3_HEADS_FIRST=1'",
+            "'-DH3_ORIGINAL_V=0'",
+            "'-DH3_SAMPLE_CENTER=2048'",
+            "'-DH3_UNIT_V_GUARD=0'",
+            "'-DH3_SAMPLE_V_GUARD=1'",
+            "'-DH3_GLOBAL_K_SCALE=1'",
+            "'-DH3_COMPACT_K_SCALE=0'",
+            "'-DH3_SAMPLE_K_GUARD=2048'",
+            "'-DH3_K_GUARD_MARGIN=1.25f'",
+            "'-DH3_K_GUARD_PARTIAL=1'",
+            "'-DH3_V_GUARD_PARTIAL=0'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sage_prepare_h3'"
+        ],
+        "verbose": "False",
+        "torch_exclude": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_gfx1201_sage_attention_h3_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gfx1201_sage_attention_h3.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m sage_attn_h3 --output_dir {{}}'"
+        ]
     }
 }
