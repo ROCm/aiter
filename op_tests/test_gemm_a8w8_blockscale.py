@@ -303,6 +303,39 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     )
 
 
+def test_asm_out_zeroed(m=32, n=2560, k=6144, dtype=dtypes.bf16, splitK=2):
+    """A split-K asm launch into an output its producer already zeroed matches the default
+    launch; out_zeroed skips the memset, so a non-zero buffer shows through."""
+    block_shape_n, block_shape_k = block_shape
+    scale_n = (n + block_shape_n - 1) // block_shape_n
+    scale_k = (k + block_shape_k - 1) // block_shape_k
+    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    weight_asm = shuffle_weight(weight, layout=(16, 16))
+
+    def launch(fill, out_zeroed):
+        out = torch.full((m, n), fill, dtype=dtype, device="cuda")
+        return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(
+            x, weight_asm, out, x_scale_t, w_scale, splitK=splitK, out_zeroed=out_zeroed
+        )
+
+    ref = launch(7.0, False)
+    err = checkAllclose(
+        ref,
+        launch(0.0, True),
+        msg=f"asm out_zeroed splitK={splitK}",
+        rtol=1e-2,
+        atol=1e-2,
+        catastrophic_check=True,
+    )
+    assert err < 0.05, f"out_zeroed changed the asm split-K output: err={err:.4g}"
+    shift = (launch(7.0, True).float() - ref.float()).mean().item()
+    assert shift > 6, f"out_zeroed did not skip the memset (mean shift {shift:.3g})"
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -529,6 +562,9 @@ for splitK in [1, 2]:
 # Two K loops per split for the default CK-Tile tile, the shortest split it runs.
 for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
     test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
+if get_gfx() in ("gfx942", "gfx950"):
+    for splitK in [2, 3]:
+        test_asm_out_zeroed(splitK=splitK)
 
 # Save results from benchmarks
 if args.output:
