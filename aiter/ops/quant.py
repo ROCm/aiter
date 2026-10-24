@@ -517,6 +517,7 @@ def per_1x32_mx_quant_hip(
     num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
     scale_type=None,
+    scale_layout_m32k4: bool = False,
 ):
     """1x32 per-group MX dynamic quant (HIP).
 
@@ -536,12 +537,30 @@ def per_1x32_mx_quant_hip(
               MXFP8 "split" path  (per_1x32 quant -> sorted-scale shuffle)
               that mirrors the existing MXFP4 split path.
 
+    ``scale_layout_m32k4=True`` (fp4x2 output only here) writes the e8m0 scale
+    straight into the gfx1250 ASM / FlyDSL GEMM A-scale layout, the bytes of
+    :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`: ``(pad32(m), n // 32)``,
+    pad rows 0x7F, ``shuffle`` ignored, ``n % 128 == 0``. fp8 output takes this
+    layout through ``per_group_quant_hip(scale_layout_m32k4=True)``.
+
     The legacy ``per_1x32_f4_quant_hip`` is kept as a thin wrapper for
     backward compatibility.
     """
     m, n = x.shape
     assert n % 32 == 0, f"n={n} must be divisible by 32"
     device = x.device
+    if scale_layout_m32k4:
+        assert (
+            quant_dtype == dtypes.fp4x2 and num_rows is None and scale is None
+        ), "scale_layout_m32k4 here needs fp4x2 output, no num_rows and no static scale"
+        scale = torch.empty(
+            ((m + 31) // 32 * 32, n // 32), dtype=torch.uint8, device=device
+        ).view(dtypes.fp8_e8m0)
+        y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)
+        dynamic_per_group_scaled_quant(
+            y, x, scale, 32, num_rows=None, scale_layout_m32k4=True
+        )
+        return y, scale
 
     # Per-dtype defaults / validation.
     if quant_dtype == dtypes.fp4x2:
@@ -818,8 +837,8 @@ def dynamic_per_group_scaled_quant(
 
     Only ``group_size`` in {32, 64, 128} is supported.
 
-    ``scale_layout_m32k4=True`` (fp8 output, e8m0 scale, ``group_size == 32``)
-    writes the scale directly in the gfx1250 MXFP8 ASM GEMM A-scale layout,
+    ``scale_layout_m32k4=True`` (fp8 or fp4x2 output, e8m0 scale, ``group_size == 32``)
+    writes the scale directly in the gfx1250 ASM / FlyDSL GEMM A-scale layout,
     i.e. the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`:
     ``scales`` must hold ``(pad32(M), K // 32)`` bytes, the pad rows are written
     as 0x7F, and ``shuffle_scale`` is ignored.
