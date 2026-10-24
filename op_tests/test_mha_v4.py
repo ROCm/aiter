@@ -25,6 +25,7 @@ from aiter.ops.mha_v4 import (
     _RawRecipeKind,
     _resolve_raw_recipe,
     mha_v4,
+    mha_v4_kv_splits,
     mha_v4_kv_tile,
     mha_v4_packed,
     native_fp8_format,
@@ -1167,6 +1168,257 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
 
     spread = max(biases) - min(biases)
     assert spread < max_spread, f"per-chunk bias {biases} spans {spread:.4f} nats"
+
+
+_KV_SPLIT_FORMATS = [
+    (AttentionFormat.BF16,) * 3,
+    (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.FP8),
+    (AttentionFormat.INT8, AttentionFormat.INT8, AttentionFormat.FP8),
+    (AttentionFormat.FP8,) * 3,
+]
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@pytest.mark.parametrize(
+    "formats", _KV_SPLIT_FORMATS, ids=lambda formats: "-".join(f.name for f in formats)
+)
+@pytest.mark.parametrize("splits", [2, 3, 4])
+@pytest.mark.parametrize(
+    ("batch", "query_length", "key_length", "query_heads", "kv_heads"),
+    [(1, 1000, 1024, 3, 3), (2, 333, 768, 4, 2), (2, 333, 1001, 4, 2)],
+    ids=["b1", "b2-gqa", "b2-gqa-remainder"],
+)
+def test_mha_v4_kv_splits_match_the_unsplit_call(
+    formats, splits, batch, query_length, key_length, query_heads, kv_heads
+):
+    """Splitting the keys costs no accuracy against full-precision attention.
+
+    Operands are quantized once, before the split, so the scales and the LSE bias are those of
+    the unsplit call. The result is still not the unsplit one: each partial output is rounded to
+    BF16, and a quantized P is scaled by its range's running max rather than the row's. The keys
+    escalate along the sequence so the ranges carry very different softmax mass, and a range
+    weighted by anything other than its true LSE shows up as a large error. A count that does
+    not divide the keys ends the shorter ranges through seqlens_k, on the operands that take it.
+    """
+    torch.manual_seed(47)
+    q = torch.randn(
+        (batch, query_length, query_heads, 128), device="cuda", dtype=torch.bfloat16
+    )
+    ramp = torch.linspace(1.0, 4.0, key_length, device="cuda").view(1, -1, 1, 1)
+    k = (torch.randn((batch, key_length, kv_heads, 128), device="cuda") * ramp).to(
+        torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    ratio = query_heads // kv_heads
+    scores = (
+        torch.einsum(
+            "bshd,bthd->bhst", q.float(), k.float().repeat_interleave(ratio, dim=2)
+        )
+        * 128**-0.5
+    )
+    reference_lse = torch.logsumexp(scores, dim=-1)
+    reference = torch.einsum(
+        "bhst,bthd->bshd",
+        torch.softmax(scores, dim=-1),
+        v.float().repeat_interleave(ratio, dim=2),
+    )
+
+    def errors(out, lse):
+        output = (out.float() - reference).norm() / reference.norm()
+        return output.item(), (lse - reference_lse).abs().max().item()
+
+    if key_length % splits and not mha_v4_module._varlen_capable(
+        formats[0], formats[2]
+    ):
+        with pytest.raises(ValueError, match="divide the key length"):
+            mha_v4(q, k, v, *formats, kv_splits=splits)
+        return
+    unsplit = errors(*mha_v4(q, k, v, *formats, return_lse=True))
+    actual, actual_lse = mha_v4(q, k, v, *formats, return_lse=True, kv_splits=splits)
+    split = errors(actual, actual_lse)
+
+    assert torch.equal(mha_v4(q, k, v, *formats, kv_splits=splits), actual)
+    assert split[0] < unsplit[0] * 1.1 + 1e-3, (split, unsplit)
+    assert split[1] < unsplit[1] + 2e-2, (split, unsplit)
+
+
+def test_mha_v4_kv_splits_auto_fills_one_wave(monkeypatch):
+    """The grid grows to the CU count and no further, in a count that divides the keys."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: type("Props", (), {"multi_processor_count": 256})(),
+    )
+    # 3 heads x 17 query tiles is 51 work-groups: 5 fit, but 4352 splits evenly into 4.
+    assert mha_v4_kv_splits(1, 4352, 3, 4352) == 4
+    assert mha_v4_kv_splits(1, 4096, 3, 4096) == 4
+    # 32 heads already fill two waves.
+    assert mha_v4_kv_splits(1, 4352, 32, 4352) == 1
+    # A prime key length has no even split.
+    assert mha_v4_kv_splits(1, 4352, 3, 4349) == 1
+    # Ranges stay at least 512 keys long.
+    assert mha_v4_kv_splits(1, 256, 1, 1536) == 3
+    assert mha_v4_kv_splits(1, 256, 1, 1000) == 1
+    # Operands that take per-batch key lengths need no divisor: the last range takes the rest.
+    assert mha_v4_kv_splits(1, 4352, 3, 4352, ragged=True) == 5
+    assert mha_v4_kv_splits(1, 4352, 3, 4349, ragged=True) == 5
+    assert mha_v4_kv_splits(1, 256, 1, 1000, ragged=True) == 1
+
+
+@pytest.mark.parametrize(
+    ("batch", "key_length", "splits"),
+    [(1, 1024, 4), (1, 1001, 3), (2, 1024, 4), (2, 1001, 3)],
+)
+def test_mha_v4_kv_splits_fold_every_key_once(batch, key_length, splits):
+    """Each range starts where the last one ends, and only an uneven batched fold copies."""
+    k = torch.randn((batch, key_length, 2, 128), device="cuda", dtype=torch.bfloat16)
+    ranges = mha_v4_module._fold_key_ranges(k, splits)
+    lengths = mha_v4_module._key_range_lengths(batch, splits, key_length, k.device)
+    if lengths is None:
+        lengths = torch.full((batch * splits,), ranges.shape[1], dtype=torch.int32)
+    lengths = lengths.tolist()
+
+    for b in range(batch):
+        keys = [ranges[b * splits + i, : lengths[b * splits + i]] for i in range(splits)]
+        assert torch.equal(torch.cat(keys), k[b])
+    view = ranges.untyped_storage().data_ptr() == k.untyped_storage().data_ptr()
+    assert view == (batch == 1 or key_length % splits == 0)
+
+
+@pytest.mark.parametrize(
+    ("cus", "splits"),
+    [(304, 16), (256, 16), (228, 8), (80, 4)],
+    ids=["MI300X", "MI355X", "MI300A", "MI308X"],
+)
+def test_mha_v4_kv_splits_auto_follows_the_cu_count(monkeypatch, cus, splits):
+    """Each SKU sizes the split by its own CU count: 16 work-groups fill a different wave on each."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: type("Props", (), {"multi_processor_count": cus})(),
+    )
+    assert mha_v4_kv_splits(1, 4096, 1, 8192) == splits
+
+
+def test_mha_v4_kv_splits_follow_the_lse_gate(monkeypatch):
+    """The ranges merge by their LSE, so where the LSE gate refuses, auto is 1 and a count raises."""
+    monkeypatch.setattr(mha_v4_module, "get_gfx", lambda: "gfx942")
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    bf16 = (AttentionFormat.BF16,) * 3
+    recipe = mha_v4_module._resolve_raw_recipe(*bf16, None, None, None, sparse=False)
+
+    assert (
+        mha_v4_module._resolve_kv_splits("auto", recipe, *bf16[::2], q, q, False, False)
+        == 1
+    )
+    with pytest.raises(NotImplementedError, match="not validated on gfx942"):
+        mha_v4(q, q, q, *bf16, kv_splits=2)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+def test_mha_v4_kv_splits_auto_leaves_unsupported_calls_unsplit():
+    """auto is a performance hint: where splitting is unsupported it must run the plain call."""
+    torch.manual_seed(59)
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    # BF16's 256x64 geometry.
+    mask = torch.ones((1, 4, 16), device="cuda", dtype=torch.bool)
+    formats = (AttentionFormat.MXFP4,) * 3
+
+    assert torch.equal(
+        mha_v4(q, k, v, *formats, kv_splits="auto"), mha_v4(q, k, v, *formats)
+    )
+    bf16 = (AttentionFormat.BF16,) * 3
+    assert torch.equal(
+        mha_v4(q, k, v, *bf16, block_mask=mask, kv_splits="auto"),
+        mha_v4(q, k, v, *bf16, block_mask=mask),
+    )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@pytest.mark.parametrize(
+    ("kwargs", "error", "match"),
+    [
+        ({"kv_splits": 0}, ValueError, "positive int"),
+        ({"kv_splits": "many"}, ValueError, "positive int"),
+        (
+            {"kv_splits": 3, "formats": (AttentionFormat.FP8,) * 3},
+            ValueError,
+            "divide the key length",
+        ),
+        ({"kv_splits": 1025}, ValueError, "at most the key length"),
+        (
+            {"kv_splits": 2, "block_mask": torch.ones((1, 4, 8), dtype=torch.bool)},
+            NotImplementedError,
+            "block_mask",
+        ),
+        (
+            {"kv_splits": 2, "seqlens_k": torch.tensor([512], dtype=torch.int32)},
+            NotImplementedError,
+            "seqlens_k",
+        ),
+        (
+            {"kv_splits": 2, "formats": (AttentionFormat.MXFP4,) * 3},
+            NotImplementedError,
+            "per-tensor",
+        ),
+        (
+            {
+                "kv_splits": 2,
+                "formats": (
+                    AttentionFormat.FP8,
+                    AttentionFormat.FP8,
+                    AttentionFormat.MXFP6,
+                ),
+            },
+            NotImplementedError,
+            "per-tensor",
+        ),
+    ],
+    ids=[
+        "zero",
+        "string",
+        "fp8-non-divisor",
+        "more-than-keys",
+        "block-mask",
+        "seqlens-k",
+        "mxfp4",
+        "fp8-mxfp6",
+    ],
+)
+def test_mha_v4_kv_splits_rejects_what_it_cannot_split(kwargs, error, match):
+    q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(kwargs)
+    formats = kwargs.pop("formats", (AttentionFormat.BF16,) * 3)
+    for name in ("block_mask", "seqlens_k"):
+        if name in kwargs:
+            kwargs[name] = kwargs[name].cuda()
+    with pytest.raises(error, match=match):
+        mha_v4(q, q, q, *formats, **kwargs)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@pytest.mark.parametrize(
+    "formats",
+    [(AttentionFormat.BF16,) * 3, (AttentionFormat.FP8,) * 3],
+    ids=["BF16", "FP8"],
+)
+def test_mha_v4_kv_splits_compile_parity(formats):
+    torch._dynamo.reset()
+    torch.manual_seed(61)
+    q = torch.randn((1, 1024, 3, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    eager = mha_v4(q, k, v, *formats, return_lse=True, kv_splits=4)
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q, k, v, *formats, return_lse=True, kv_splits=4
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager[0], compiled[0])
+    assert torch.equal(eager[1], compiled[1])
 
 
 def test_mha_v4_lse_is_gated_off_gfx950(monkeypatch):
