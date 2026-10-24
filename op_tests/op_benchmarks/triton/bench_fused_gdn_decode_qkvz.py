@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark the fused Qwen3-Next GDN decode op.
+"""Benchmark the fused Qwen3-Next GDN decode op (gfx950, gfx1250).
 
 Reports achieved HBM bandwidth against the arch peak. The kernel is bound by the
-FP32 recurrent state, which it reads and writes once per token per value head
-and which dominates every other tensor by an order of magnitude, so bytes moved
-is the right roofline denominator -- it performs no MFMA and no gl.dot.
+recurrent state (fp32 or bf16), which it reads and writes once per token per
+value head and which dominates every other tensor by an order of magnitude, so
+bytes moved is the right roofline denominator -- it performs no MFMA and no
+gl.dot.
 
 Timed under CUDA graph replay. Timing the Python call instead measures host
 overhead (shape checks, allocation), which at small batches is ~2.5x the kernel
@@ -20,6 +21,9 @@ them.
 Usage:
     python3 bench_fused_gdn_decode_qkvz.py
     python3 bench_fused_gdn_decode_qkvz.py --batch 1,32,256 --no-fp8
+    # Qwen3.5-35B-A3B at TP4 on gfx1250: flat packing, bf16 state, 30 calls per graph
+    python3 bench_fused_gdn_decode_qkvz.py --layout flat --state-dtype bf16 --no-fp8 \\
+        --graph-kernels-per-graph 30
 """
 
 import functools
@@ -27,6 +31,7 @@ import sys
 
 import torch
 
+from aiter import logger
 from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
     fused_gdn_decode_qkvz,
 )
@@ -41,22 +46,10 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 )
 
 # Peak theoretical HBM bandwidth, bytes/s.
-_PEAK_BW = {"gfx950": 8.0e12, "gfx942": 5.3e12}
+_PEAK_BW = {"gfx1250": 18.64e12, "gfx950": 8.0e12, "gfx942": 5.3e12}
+_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 _HEAD_DIM = 128
 _CONV_WIDTH = 4
-
-_OUT_VAL_KEYS = [
-    "projected_qkvz",
-    "projected_ba",
-    "conv_state",
-    "ssm_state",
-    "ssm_state_indices",
-    "conv_weight",
-    "conv_bias",
-    "A_log",
-    "dt_bias",
-    "norm_weight",
-]
 
 _OUT_VAL_KEYS = [
     "projected_qkvz",
@@ -184,14 +177,14 @@ def main():
         "--state-dtype",
         choices=("fp32", "bf16"),
         default="fp32",
-        help="recurrent state pool dtype (bf16 runs the ratio-generic kernel)",
+        help="recurrent state pool dtype (on gfx950, bf16 runs the ratio-generic kernel)",
     )
     args = ap.parse_args()
     state_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[args.state_dtype]
 
     arch = get_arch()
-    if arch != "gfx950":
-        print(f"fused_gdn_decode_qkvz is gfx950-only; this is {arch}")
+    if arch not in _SUPPORTED_ARCHS:
+        logger.warning("fused_gdn_decode_qkvz runs on gfx950 and gfx1250, got %s", arch)
         return 0
 
     quant_dtype = None if args.no_fp8 else torch.float8_e4m3fn
