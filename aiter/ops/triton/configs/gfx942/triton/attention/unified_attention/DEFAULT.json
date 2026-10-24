@@ -3,6 +3,7 @@
     "attn_2d": [
       "D",
       "Q",
+      "SW",
       "DT"
     ],
     "attn_3d": [
@@ -40,6 +41,14 @@
       "waves_per_eu": 2,
       "TILE_SIZE_MIN": 32,
       "TILE_SIZE_MAX": 64
+    },
+    "D_GEQ_256.Q_LEQ_1.SW.DT_bf16_bf16": {
+      "BLOCK_M": 16,
+      "num_warps": 4,
+      "num_stages": 3,
+      "waves_per_eu": 1,
+      "TILE_SIZE_MIN": 32,
+      "TILE_SIZE_MAX": 32
     },
     "D_GEQ_256.Q_LEQ_1": {
       "BLOCK_M": 16,
