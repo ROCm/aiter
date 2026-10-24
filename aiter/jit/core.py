@@ -262,6 +262,11 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
 )
 
+AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
+    "AITER_CONFIG_PAGED_MQA_LOGITS",
+    f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -440,6 +445,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_MEGA_MOE_TP_BIGM",
             AITER_CONFIG_MEGA_MOE_TP_BIGM,
             "mega_moe_tp_bigm_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_PAGED_MQA_LOGITS_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_PAGED_MQA_LOGITS",
+            AITER_CONFIG_PAGED_MQA_LOGITS,
+            "paged_mqa_logits_tuned",
         )
 
     @property
