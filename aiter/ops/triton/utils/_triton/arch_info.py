@@ -47,6 +47,11 @@ def is_sw_emulated_fp8_avail():
     return get_arch() in ("gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151")
 
 
+def is_any_fp8_avail():
+    # FP8 through hardware or through software emulation.
+    return is_fp8_avail() or is_sw_emulated_fp8_avail()
+
+
 def is_mx_scale_preshuffling_avail():
     return get_arch() in ("gfx950", "gfx1250")
 

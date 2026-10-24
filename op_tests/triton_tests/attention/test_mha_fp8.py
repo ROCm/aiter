@@ -5,10 +5,7 @@ import pytest
 import torch
 
 from aiter import logger
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
-    FP8_ARCHS,
-    SW_EMULATED_FP8_ARCHS,
-)
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import ANY_FP8_ARCHS
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
@@ -24,8 +21,7 @@ from aiter.test_mha_common import (
 arch = get_arch()
 
 pytestmark = pytest.mark.skipif(
-    arch not in FP8_ARCHS | SW_EMULATED_FP8_ARCHS,
-    reason=f"FP8 not supported on {arch}",
+    arch not in ANY_FP8_ARCHS, reason=f"FP8 not supported on {arch}"
 )
 
 

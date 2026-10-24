@@ -95,7 +95,7 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -124,7 +124,7 @@ def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
 
 
 def test_per_1x32_mxfp8_quant_preallocated_scale():
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -143,7 +143,7 @@ def test_per_1x32_mxfp8_quant_preallocated_scale():
 
 def test_per_1x32_mxfp8_quant_multidim():
     """Wrapper folds higher dims into M; sanity-check 3D input."""
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(0)
@@ -186,7 +186,7 @@ def torch_fp8_legacy_to_mxfp8(x_fnuz: torch.Tensor, x_scale_fp32: torch.Tensor):
     ],
 )
 def test_fp8_legacy_to_mxfp8(M: int, N: int):
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(5)
@@ -214,7 +214,7 @@ def test_fp8_legacy_to_mxfp8(M: int, N: int):
 
 
 def test_fp8_legacy_to_mxfp8_preallocated():
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(5)
@@ -265,7 +265,7 @@ def torch_rmsnorm_mxfp8_quant(x, weight, eps):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_rmsnorm_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(11)
@@ -288,7 +288,7 @@ def test_rmsnorm_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
 
 
 def test_rmsnorm_mxfp8_quant_preallocated():
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(11)
@@ -330,7 +330,7 @@ def torch_dual_rmsnorm_mxfp8_quant(q, k, q_weight, k_weight, eps_q, eps_k):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dual_rmsnorm_mxfp8_quant(M: int, KQ: int, KK: int, dtype: torch.dtype):
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(13)
@@ -361,7 +361,7 @@ def test_dual_rmsnorm_mxfp8_quant(M: int, KQ: int, KK: int, dtype: torch.dtype):
 
 def test_dual_rmsnorm_mxfp8_quant_default_eps_k():
     """eps_k defaults to eps_q when not provided."""
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(13)
@@ -404,7 +404,7 @@ def test_dual_rmsnorm_mxfp8_quant_default_eps_k():
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_flatten_mxfp8_quant(M: int, N1: int, N2: int, dtype: torch.dtype):
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(17)
@@ -437,7 +437,7 @@ def test_fused_flatten_mxfp8_quant(M: int, N1: int, N2: int, dtype: torch.dtype)
 def test_fused_flatten_mxfp8_quant_matches_per_1x32_after_flatten():
     """Sanity: the flatten+quant path should match dynamic_mxfp8_quant
     applied to the pre-flattened (M, N1 * N2) tensor."""
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     torch.cuda.empty_cache()
     torch.manual_seed(19)
@@ -1420,7 +1420,7 @@ def test_dynamic_mxfp8_quant_gluon_matches_triton(M: int, K: int, dtype):
 
 
 def test_dynamic_mxfp8_quant_backend_validation():
-    if not (arch_info.is_fp8_avail() or arch_info.is_sw_emulated_fp8_avail()):
+    if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
     x = torch.randn((4, 64), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="Unknown backend"):

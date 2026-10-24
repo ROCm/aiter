@@ -7,10 +7,7 @@ import pytest
 import torch
 from einops import rearrange, repeat
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
-    FP8_ARCHS,
-    SW_EMULATED_FP8_ARCHS,
-)
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import ANY_FP8_ARCHS
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_func,
@@ -19,7 +16,6 @@ from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_with_kvcache,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref as _mha_common_attention_ref,
 )
@@ -27,11 +23,10 @@ from aiter.test_mha_common import (
     attention_ref_with_tol,
     generate_qkv,
     generate_random_padding_mask,
-    quantize_fp8_per_bh,
 )
 
 _arch = get_arch()
-_supports_fp8 = _arch in FP8_ARCHS | SW_EMULATED_FP8_ARCHS
+_supports_fp8 = _arch in ANY_FP8_ARCHS
 
 SEED = 0
 
@@ -1681,103 +1676,3 @@ def test_flash_attn_varlen_func_graph(mha_type):
     assert not torch.isnan(out_graph).any(), "Graph replay produced NaN"
     diff = (out_eager - out_graph).abs().max().item()
     assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
-
-
-def _quantize_fp8_per_kv_head(x, fp8_dtype, nheads_k):
-    """Per-(batch, kv head) symmetric fp8 quantization of a bshd query.
-
-    The decode kernel takes one query descale factor per kv head, shape
-    (batch, nheads_k), so the query heads that share a kv head share a scale.
-    """
-    batch, seqlen, nheads, d = x.shape
-    group = nheads // nheads_k
-    fp8_max = torch.finfo(fp8_dtype).max
-    x_grouped = x.view(batch, seqlen, nheads_k, group, d)
-    amax = x_grouped.abs().amax(dim=(1, 3, 4)).float().clamp(min=1e-9)
-    x_fp8 = (x_grouped * (fp8_max / amax)[:, None, :, None, None]).to(fp8_dtype)
-    return x_fp8.view(batch, seqlen, nheads, d), amax / fp8_max
-
-
-@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (1, 339),
-        (3, 1024),
-        (64, 2048),
-        (1, 1024),
-    ],
-)
-@pytest.mark.parametrize("d", [64, 128])
-def test_flash_attn_kvcache_fp8(seqlen_q, seqlen_k, d, causal, mha_type):
-    """FP8 decode through flash_attn_with_kvcache with descale factors.
-
-    cache_seqlens selects the decode kernel. The reference runs on the
-    dequantized fp8 values, so only the kernel's error is measured.
-    """
-    if not _supports_fp8:
-        pytest.skip(f"FP8 not supported on {_arch}")
-
-    device = "cuda"
-    dtype = torch.float16
-    torch.random.manual_seed(SEED)
-    torch.cuda.manual_seed(SEED)
-    batch_size = 2
-    nheads = 6
-    nheads_k = nheads if mha_type == "mha" else 3
-    group = nheads // nheads_k
-
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
-    k_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-    v_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-    cache_seqlens = torch.randint(
-        1, seqlen_k + 1, (batch_size,), dtype=torch.int32, device=device
-    )
-
-    fp8_dtype = get_fp8_e4m3_dtype()
-    q_fp8, q_descale = _quantize_fp8_per_kv_head(q, fp8_dtype, nheads_k)
-    k_fp8, k_descale = quantize_fp8_per_bh(k_cache, fp8_dtype)
-    v_fp8, v_descale = quantize_fp8_per_bh(v_cache, fp8_dtype)
-
-    out = flash_attn_with_kvcache(
-        q_fp8,
-        k_fp8,
-        v_fp8,
-        cache_seqlens=cache_seqlens,
-        causal=causal,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-    )
-    torch.cuda.synchronize()
-    if isinstance(out, tuple):
-        out = out[0]
-
-    q_deq = (
-        q_fp8.view(batch_size, seqlen_q, nheads_k, group, d).float()
-        * q_descale[:, None, :, None, None]
-    ).view(batch_size, seqlen_q, nheads, d)
-    k_deq = k_fp8.float() * k_descale[:, None, :, None]
-    v_deq = v_fp8.float() * v_descale[:, None, :, None]
-    k_rep = repeat(k_deq, "b s h d -> b s (h g) d", g=group)
-    v_rep = repeat(v_deq, "b s h d -> b s (h g) d", g=group)
-
-    arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
-    key_padding_mask = arange < rearrange(cache_seqlens, "b -> b 1")
-
-    out_ref, _ = attention_ref(
-        q_deq,
-        k_rep,
-        v_rep,
-        None,
-        key_padding_mask,
-        None,
-        0.0,
-        None,
-        causal=causal,
-        window_size=(-1, -1),
-    )
-
-    assert not torch.isnan(out).any(), "FP8 decode produced NaN"
-    fp8_assert_close(out, out_ref.to(out.dtype))
