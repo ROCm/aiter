@@ -521,6 +521,8 @@ template <class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
 template <class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
+template <class Traits>
+__global__ void opus_mla_v4_prefill_a8w8_pc_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
 
 // Pull in the device kernel template bodies only on the gfx950 device pass.
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
@@ -538,6 +540,10 @@ __global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_
 }
 template <class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs)
+{
+}
+template <class Traits>
+__global__ void opus_mla_v4_prefill_a8w8_pc_kernel(opus_mla_v4_prefill_fp8_kargs)
 {
 }
 #else
@@ -593,6 +599,61 @@ __device__ inline void global_load(const D* g_base, void* smem_base,
             *reinterpret_cast<const opus::vector_t<D, VEC>*>(src + g_delta);
 #endif
     });
+}
+
+// global -> LDS async copy, SADDR form: wave-uniform 64-bit base in SGPRs + 32-bit unsigned per-lane
+// byte offset (row_off + layout offset). Caller guarantees row_off + layout offset < 2^32
+// (host gate on the pool byte size). Saves the 64-bit per-lane address VALU and VGPR pairs.
+template<opus::index_t VEC, class D, class LayoutG, class LayoutS>
+__device__ inline void global_load_off32(const D* g_base, unsigned int row_off, void* smem_base,
+                                         const LayoutG& u_gmem, const LayoutS& u_smem) {
+    constexpr opus::index_t BYTES = VEC * static_cast<opus::index_t>(sizeof(D));
+    constexpr opus::index_t N     = opus::layout_load_traits<LayoutG, VEC>::r_elem.value;
+    constexpr auto g_imm = opus::layout_imm_offsets_v<LayoutG, VEC>;
+    constexpr auto s_imm = opus::layout_imm_offsets_v<LayoutS, VEC>;
+
+    const auto g_os = opus::layout_to_offsets<VEC>(u_gmem);
+    const auto s_os = opus::layout_to_offsets<VEC>(u_smem);
+    auto* s_ptr = reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
+    const unsigned int voff = row_off + static_cast<unsigned int>(g_os[0]) * static_cast<unsigned int>(sizeof(D));
+    const unsigned int m0_base = __builtin_amdgcn_readfirstlane(static_cast<unsigned int>(
+        reinterpret_cast<__UINTPTR_TYPE__>(s_ptr + s_os[0] * static_cast<int>(sizeof(D)))));
+
+    opus::static_for<N>([&](auto i) {
+        constexpr int g_delta = (g_imm[i.value] - g_imm[0]) * static_cast<int>(sizeof(D));
+        constexpr int m0_fix  = (s_imm[i.value] - s_imm[0]) * static_cast<int>(sizeof(D)) - g_delta;
+        static_assert(m0_fix >= 0 && m0_fix % 4 == 0,
+                      "offset: shifts the LDS address too, so M0 must absorb it (ISA 9.1.9 / 10.3)");
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+        const unsigned int m0_val = m0_base + m0_fix;
+        const unsigned int vo = voff;
+        const D* sb = g_base;
+        #define OPUS_MLA_V4_GLOBAL_LOAD_LDS_S(mnemonic)                                     \
+            asm volatile("s_mov_b32 m0, %0\n\ts_nop 0\n\t" mnemonic " %1, %2 offset:%3"     \
+                         :: "s"(m0_val), "v"(vo), "s"(sb), "n"(g_delta) : "memory")
+        if      constexpr (BYTES == 16) OPUS_MLA_V4_GLOBAL_LOAD_LDS_S("global_load_lds_dwordx4");
+        else if constexpr (BYTES == 12) OPUS_MLA_V4_GLOBAL_LOAD_LDS_S("global_load_lds_dwordx3");
+        else if constexpr (BYTES ==  4) OPUS_MLA_V4_GLOBAL_LOAD_LDS_S("global_load_lds_dword");
+        else if constexpr (BYTES ==  2) OPUS_MLA_V4_GLOBAL_LOAD_LDS_S("global_load_lds_ushort");
+        else                            OPUS_MLA_V4_GLOBAL_LOAD_LDS_S("global_load_lds_ubyte");
+        #undef OPUS_MLA_V4_GLOBAL_LOAD_LDS_S
+#else
+        *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<D, VEC>*>(
+            s_ptr + s_os[i.value] * static_cast<int>(sizeof(D))) =
+            *reinterpret_cast<const opus::vector_t<D, VEC>*>(reinterpret_cast<const char*>(g_base) + voff + g_delta);
+#endif
+    });
+}
+
+// Row gather with a 32-bit row byte offset (24x24 mad): row < 2^24 and row stride bytes < 2^24.
+// The row must be a valid pool row: the 24-bit multiply and 32-bit offset wrap, so an out-of-range
+// kv index can silently read the wrong memory instead of faulting.
+template<opus::index_t VEC, class D, class LayoutG, class LayoutS>
+__device__ inline void gather_row_lds_off32(const D* g_base, int row, int stride_elems, void* smem_base,
+                                            const LayoutG& u_gmem, const LayoutS& u_smem) {
+    const unsigned int row_off = __umul24(static_cast<unsigned int>(row),
+                                          static_cast<unsigned int>(stride_elems) * static_cast<unsigned int>(sizeof(D)));
+    global_load_off32<VEC>(g_base, row_off, smem_base, u_gmem, u_smem);
 }
 
 // global -> VGPR, one issue per y-position of the layout (drop-in for opus::load(gmem, layout)).
@@ -3835,6 +3896,619 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w
     auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
     auto v_o_out = cast<D_OUT>(v_o);
     store<T::VEC_O>(g_o, v_o_out, u_o);
+}
+
+// =============================================================================
+// Warp-specialized producer/consumer variant of the a8w8 16-head-tile kernel (H == 128).
+// One WG per token, 12 waves (3 per SIMD), one s_barrier per KV tile.
+//   waves 0..3  (producers p): heads [32p, 32p+32) as two 16-head M tiles. QK^T (fp8 MX NoPE
+//                + bf16 RoPE), online softmax, bf16 P + per-head O-rescale factor -> LDS,
+//                V dequant (fp8 -> bf16, WG-shared copy) + V-rope copy -> LDS.
+//   waves 4..11 (consumers c): O for heads [32*(c/2), +32) x D half (c%2) (128 fp32/lane).
+//                PV of the previous step's tile from LDS P/V; KV row gathers (the 16mx8_32nx1
+//                kernel's 8-warp gather partition, warp = c) with 32-bit row offsets.
+// Step t: producers work on tile t (K slot t%3 -> P/V slot t%2); consumers run PV of tile t-1
+// and issue the gather of tile t+2 (K slot (t+2)%3). Same math/operand layouts as 16mx8_32nx1.
+// =============================================================================
+namespace opus_mla_v4_prefill_pc {
+using namespace opus_mla_v4_prefill_a8w8_16mx8_32nx1;
+
+template<class T>
+struct pc_cfg {
+    static constexpr int NUM_PROD     = 4;
+    static constexpr int NUM_CONS     = 8;
+    static constexpr int NUM_WAVES    = NUM_PROD + NUM_CONS;
+    static constexpr int BLOCK        = NUM_WAVES * 64;
+    static constexpr int K_SLOTS      = 3;
+    static constexpr int V_SLOTS      = 2;
+    static constexpr int K_SLOT_BYTES = static_cast<int>(T::smem_k_nope_bytes + T::smem_k_rope_bytes);
+    static constexpr int V_SLOT_BYTES = static_cast<int>(T::smem_v_bytes);
+    static constexpr int P_SLOT_BYTES = 8 * 64 * 16;
+    static constexpr int A_SLOT_BYTES = 128 * 4;
+    static constexpr int V_OFF        = 0;
+    static constexpr int K_OFF        = V_OFF + V_SLOTS * V_SLOT_BYTES;
+    static constexpr int P_OFF        = K_OFF + K_SLOTS * K_SLOT_BYTES;
+    static constexpr int A_OFF        = P_OFF + V_SLOTS * P_SLOT_BYTES;
+    static constexpr int S_OFF        = A_OFF + V_SLOTS * A_SLOT_BYTES;
+    static constexpr int I_OFF        = S_OFF + 128 * 4;               // per-consumer kv-index ring
+    static constexpr int DUMMY_OFF    = I_OFF + NUM_CONS * K_SLOTS * 256;  // sink for pad-lane dequant stores
+    static constexpr int TOTAL        = DUMMY_OFF + 2560;
+    static constexpr int O_ROW        = 264;
+    static constexpr int O_WAVE_BYTES = 16 * O_ROW * 2;
+    static_assert(TOTAL <= 160 * 1024, "LDS budget");
+    static_assert(NUM_CONS * O_WAVE_BYTES <= K_OFF, "O staging must fit the V area");
+};
+
+// LDS-complete + workgroup barrier that is also a compiler memory barrier.
+__device__ __forceinline__ void pc_sync() { asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory"); }
+
+struct pc_tile_src {
+    const int* idx;
+    int nvalid;
+    int is_ext;
+};
+
+__device__ __forceinline__ pc_tile_src pc_tile(const opus_mla_v4_prefill_fp8_kargs& kargs, int u, int PT,
+                                               int pbeg, int plen, int ebeg, int elen) {
+    pc_tile_src r;
+    const bool x = u >= PT;
+    const int ue = u - PT;
+    r.idx    = x ? (kargs.kv_indices_extend + ebeg + ue * 32) : (kargs.kv_indices_prefix + pbeg + u * 32);
+    const int nv = x ? (elen - ue * 32) : (plen - u * 32);
+    r.nvalid = nv < 32 ? nv : 32;
+    r.is_ext = x;
+    return r;
+}
+
+// Producer V dequant: the bank swizzle lives in the read/write ADDRESSES (no data cndmask swaps):
+// 4x ds_read_b64 of fp8 per partition at lane-swizzled offsets, 16 cvt, 4x ds_write_b128 in register
+// order; per-lane offsets are hoisted out of the tile loop; pad lanes write a dummy sink.
+// Per-lane byte offsets of producer p's dequant (partition vw = 2p + j adds j * 512 to all).
+struct pc_dq_offs {
+    int ra, rb;   // fp8 source in the K-nope slot: words k = 0,2 at ra (+16), k = 1,3 at rb (+16)
+    int wa, wb;   // bf16 dest relative to smem (V slot 0), or the dummy sink for pad lanes
+    int vs;       // V slot stride for real lanes, 0 for pad lanes
+};
+
+template<class T>
+__device__ __forceinline__ pc_dq_offs pc_dq_make_offs(int p, int lane_id, int v_off, int dummy_off, int v_slot_bytes) {
+    // identical element mapping to make_layout_rv_dequant / make_layout_sv_dequant + the swizzled stores
+    constexpr int BLK_N = (T::smem_linear_wave_nope + T::smem_padding_32B_nope);            // 1056 B (fp8)
+    constexpr int BLK_V = (T::smem_linear_wave_rope + T::smem_padding_32B_rope) * 2;        // 1056 B (bf16)
+    static_assert(BLK_N == 1056 && BLK_V == 1056, "dequant offset formulas assume 1056-byte LDS rows");
+    const int ln = lane_id & 15;
+    const int g  = lane_id >> 4;
+    const int sw = (lane_id >> 2) & 1;
+    const int r0 = (p * 4 + (ln & 3)) * BLK_N + (ln >> 2) * 128 + g * 32;
+    const int w0 = ((2 * p + (g >> 1)) * 4 + (ln & 3)) * BLK_V + (ln >> 2) * 128 + (g & 1) * 64;
+    const bool real = (p * T::W_K_NOPE + g * 32) < T::D_NOPE_SIZE;
+    const int wbase = real ? v_off + w0 : dummy_off + (lane_id & 31) * 64;
+    pc_dq_offs o;
+    o.ra = r0 + 8 * sw;
+    o.rb = r0 + 8 - 8 * sw;
+    o.wa = wbase + 16 * sw;
+    o.wb = wbase + 16 - 16 * sw;
+    o.vs = real ? v_slot_bytes : 0;
+    return o;
+}
+
+template<class T>
+struct pc_dq_src {
+    opus::vector_t<opus::u32_t, 2> f[2][4];                      // fp8 words of partitions j = 0, 1
+    opus::vector_t<typename T::D_ROPE, T::VEC_KV_ROPE> rope;       // V-rope copy source
+};
+
+// issue the LDS reads of producer p's dequant (fp8 V source + V-rope copy source)
+template<class T>
+__device__ __forceinline__ void pc_dq_issue(pc_dq_src<T>& d, char* kb, const pc_dq_offs& o, int p, int lane_id) {
+    using namespace opus;
+    using D_ROPE = typename T::D_ROPE;
+    using W2 = vector_t<u32_t, 2>;
+    OPUS_LDS_ADDR char* kbl = reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(kb));
+    OPUS_LDS_ADDR char* ra = kbl + o.ra;
+    OPUS_LDS_ADDR char* rb = kbl + o.rb;
+    auto s_k_rope = make_smem(reinterpret_cast<D_ROPE*>(kb + T::smem_k_nope_bytes));
+    d.rope = load<T::VEC_KV_ROPE>(s_k_rope, make_layout_cp_rope<T>(p, lane_id));
+    static_for<2>([&](auto j) {
+        constexpr int jo = j.value * 512;
+        d.f[j.value][0] = *reinterpret_cast<OPUS_LDS_ADDR W2*>(ra + jo);
+        d.f[j.value][1] = *reinterpret_cast<OPUS_LDS_ADDR W2*>(rb + jo);
+        d.f[j.value][2] = *reinterpret_cast<OPUS_LDS_ADDR W2*>(ra + jo + 16);
+        d.f[j.value][3] = *reinterpret_cast<OPUS_LDS_ADDR W2*>(rb + jo + 16);
+    });
+}
+
+// convert + store: b128 stores in register order, the bank swizzle lives in the addresses
+template<class T>
+__device__ __forceinline__ void pc_dq_finish(const pc_dq_src<T>& d, char* smem, char* vb, int vslot, const pc_dq_offs& o,
+                                             opus::u32_t sk0, opus::u32_t sk1, int p, int lane_id) {
+    using namespace opus;
+    using D_ROPE = typename T::D_ROPE;
+    using B8 = vector_t<D_ROPE, 8>;
+    OPUS_LDS_ADDR char* sml = reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(smem));
+    const int vso = vslot * o.vs;
+    OPUS_LDS_ADDR char* wa = sml + (o.wa + vso);
+    OPUS_LDS_ADDR char* wb = sml + (o.wb + vso);
+    auto s_v_rope = make_smem(reinterpret_cast<D_ROPE*>(vb + T::smem_v_nope_bytes));
+    store<T::VEC_KV_ROPE>(s_v_rope, d.rope, make_layout_cp_rope<T>(p, lane_id));
+    static_for<2>([&](auto j) {
+        const u32_t skj = j.value == 0 ? sk0 : sk1;
+        const float scale = std::bit_cast<float>(__builtin_amdgcn_ubfe(skj, static_cast<u32_t>(p * 8), 8u) << 23);
+        constexpr int jo = j.value * 512;
+        static_for<4>([&](auto k) {
+            B8 b;
+            auto* pk = reinterpret_cast<vector_t<D_ROPE, 2>*>(&b);
+            static_for<2>([&](auto dd) {
+                pk[dd.value * 2 + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(d.f[j.value][k.value][dd.value], scale, false);
+                pk[dd.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(d.f[j.value][k.value][dd.value], scale, true);
+            });
+            OPUS_LDS_ADDR char* wp = ((k.value & 1) ? wb : wa) + jo + (k.value >> 1) * 32;
+            *reinterpret_cast<OPUS_LDS_ADDR B8*>(wp) = b;
+        });
+    });
+}
+
+template<class T>
+__device__ __forceinline__ void pc_producer(const opus_mla_v4_prefill_fp8_kargs& kargs, char* smem, int tok, int p_in,
+                                            int pbeg, int plen, int ebeg, int elen, int PT, int NT) {
+    using namespace opus;
+    using C      = pc_cfg<T>;
+    using D_NOPE = typename T::D_NOPE;
+    using D_ROPE = typename T::D_ROPE;
+    using D_ACC  = typename T::D_ACC;
+
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));
+    const int p = p_in;
+
+    // ---- Q (two 16-head M tiles: head tile hw = 2p + mt) ----
+    const D_NOPE* qn = reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + static_cast<int64_t>(tok) * kargs.stride_q_nope_n;
+    const D_ROPE* qr = reinterpret_cast<const D_ROPE*>(kargs.q_rope_ptr) + static_cast<int64_t>(tok) * kargs.stride_q_rope_n;
+    auto g_q_nope = make_gmem(qn, kargs.H * kargs.stride_q_nope_h * sizeof(D_NOPE));
+    auto g_q_rope = make_gmem(qr, kargs.H * kargs.stride_q_rope_h * sizeof(D_ROPE));
+    using QN = decltype(load<T::VEC_Q_NOPE>(g_q_nope, make_layout_q_nope<T>(0, lane_id)));
+    using QR = decltype(load<T::VEC_Q_ROPE>(g_q_rope, make_layout_q_rope<T>(0, lane_id)));
+    QN v_q_nope[2];
+    QR v_q_rope[2];
+    int scale_q[2];
+    static_for<2>([&](auto mt) {
+        const int hw = 2 * p + mt.value;
+        v_q_nope[mt.value] = load<T::VEC_Q_NOPE>(g_q_nope, make_layout_q_nope<T>(hw, lane_id));
+        constexpr index_t q_nope_len  = vector_traits<QN>::size();
+        constexpr index_t q_nope_vals = T::Q_TILE_SIZE * T::D_NOPE_SIZE / T::WARP_SIZE;
+        static_for([&](auto i) { v_q_nope[mt.value][i.value] = static_cast<D_NOPE>(0); }, number<q_nope_vals>{}, number<q_nope_len>{});
+        auto v_q_mxscl = load<1>(g_q_nope, make_layout_q_mxscl<T>(hw, lane_id) + T::D_NOPE_SIZE);
+        v_q_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_q_mxscl[3];
+        scale_q[mt.value] = reinterpret_cast<int&>(v_q_mxscl);
+        v_q_rope[mt.value] = load<T::VEC_Q_ROPE>(g_q_rope, make_layout_q_rope<T>(hw, lane_id));
+    });
+
+    constexpr D_ACC LOG2_E = 1.44269504089f;
+    const D_ACC ts = kargs.softmax_scale * LOG2_E;
+    D_ACC m_row[2] = {numeric_limits<D_ACC>::lowest(), numeric_limits<D_ACC>::lowest()};
+    D_ACC l_row[2] = {0.0f, 0.0f};
+
+    auto u_rk_nope  = make_layout_rk_nope<T>(lane_id);
+    auto u_rk_mxscl = make_layout_rk_mxscl<T>(lane_id);
+    auto u_rk_rope  = make_layout_rk_rope<T>(lane_id);
+    auto mfma0_nope = make_mfma<D_NOPE, D_NOPE, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_NOPE>{});
+    auto mma0_rope = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
+        seq<T::GEMM0_E_M, T::GEMM0_E_N, 1_I>{},
+        seq<1_I, 1_I, 1_I>{},
+        seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+        mfma_adaptor_swap_ab{});
+
+    using k_nope_tile_t = vector_t<D_NOPE, T::W_N * T::W_K_NOPE / T::WARP_SIZE>;
+    using s_tile_t      = vector_t<D_ACC,  T::W_M * T::W_N / T::WARP_SIZE>;
+    using S_T           = typename decltype(mma0_rope)::vtype_c;
+    constexpr index_t s_len = vector_traits<S_T>::size();
+
+    auto sk_nope_slice = [](auto slice_idx) {
+        constexpr int s = decltype(slice_idx)::value;
+        return number<s * T::smem_n_rpt * (T::smem_linear_wave_nope + T::smem_padding_32B_nope)>{};
+    };
+    auto sk_rope_slice = [](auto slice_idx) {
+        constexpr int s = decltype(slice_idx)::value;
+        return number<s * T::SLICE_D>{};
+    };
+    constexpr int mxscl_chunk = T::D_NOPE_SIZE / T::D_128B_NOPE_SIZE;
+    constexpr int mxscl_col   = T::D_NOPE_SIZE % T::D_128B_NOPE_SIZE;
+    const int mx_row_off = layout_to_offsets<1>(u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}))[0] - lane_id / T::W_N;
+
+    // V dequant (two of the 16mx8_32nx1 kernel's 8 warp partitions: vw = 2p, 2p+1) + V-rope copy (chunk p).
+    const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
+
+    pc_dq_offs dqo{};
+    {
+        int lid = lane_id;
+        asm volatile("" : "+v"(lid));
+        dqo = pc_dq_make_offs<T>(p, lid, C::V_OFF, C::DUMMY_OFF, C::V_SLOT_BYTES);
+    }
+    pc_sync();   // prologue barrier (consumers' tile-0 gather landed)
+
+    int kslot = 0;
+    for (int t = 0; t < NT; ++t) {
+        char* kb = smem + C::K_OFF + kslot * C::K_SLOT_BYTES;
+        char* vb = smem + C::V_OFF + (t & 1) * C::V_SLOT_BYTES;
+        char* pb = smem + C::P_OFF + (t & 1) * C::P_SLOT_BYTES;
+        char* ab = smem + C::A_OFF + (t & 1) * C::A_SLOT_BYTES;
+        kslot = (kslot == C::K_SLOTS - 1) ? 0 : kslot + 1;
+        auto s_k_nope = make_smem(reinterpret_cast<D_NOPE*>(kb));
+        auto s_k_rope = make_smem(reinterpret_cast<D_ROPE*>(kb + T::smem_k_nope_bytes));
+
+        // mx scales (raw b128 reads + v_perm byte gather)
+        constexpr int e_stride = (T::W_N / T::smem_n_rpt) * T::D_128B_NOPE_SIZE;
+        vector_t<u32_t, 4 * T::GEMM0_E_N> mx_raw;
+        static_for<T::GEMM0_E_N>([&](auto e) {
+            auto r = __builtin_bit_cast(vector_t<u32_t, 4>, s_k_nope.template load<16>(mx_row_off + e.value * e_stride));
+            static_for<4>([&](auto q) { mx_raw[e.value * 4 + q.value] = r[q.value]; });
+        });
+        vector_t<D_NOPE, T::GEMM0_E_N * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k[2];
+        v_k[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
+        v_k[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
+        vector_t<u32_t, T::GEMM0_E_N> scale_k;
+        {
+            int lid = lane_id;
+            asm volatile("" : "+v"(lid));
+            const u32_t mx_j   = static_cast<u32_t>(lid) >> 4;
+            const u32_t sel_lo = 0x0c0c0400u + 0x0101u * mx_j;
+            const u32_t sel_hi = __builtin_amdgcn_alignbit(sel_lo, sel_lo, 16);
+            static_for<T::GEMM0_E_N>([&](auto e) {
+                constexpr int b = e.value * 4;
+                u32_t lo = __builtin_amdgcn_perm(mx_raw[b + 1], mx_raw[b + 0], sel_lo);
+                u32_t hi = __builtin_amdgcn_perm(mx_raw[b + 3], mx_raw[b + 2], sel_hi);
+                u32_t v = lo | hi;
+                scale_k[e.value] = (lid >= 32) ? (v & 0x00ffffffu) : v;
+            });
+        }
+
+        S_T v_s[2];
+        clear(v_s[0]);
+        clear(v_s[1]);
+        // The K-rope operand reads are issued inside the nope loop, right after the last nope slice
+        // load, so their LDS latency hides under the remaining nope MFMAs.
+        using KR_T = vector_t<D_ROPE, T::GEMM0_E_N * T::W_N * T::W_K_ROPE / T::WARP_SIZE>;
+        KR_T v_kr[2];
+        static_assert(T::GEMM0_NOPE_E_K >= 3, "early K-rope issue point");
+        static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
+            constexpr int idx  = ek.value;
+            constexpr int slot = idx & 1;
+            if constexpr (idx + 1 == T::GEMM0_NOPE_E_K) {
+                auto& k_blk = reinterpret_cast<vector_t<D_NOPE, 16>(&)[4]>(v_k[slot]);
+                clear(k_blk[1]);
+                clear(k_blk[3]);
+            }
+            auto k_tile = reinterpret_cast<k_nope_tile_t*>(&v_k[slot]);
+            static_for<2>([&](auto mt) {
+                auto q_sl   = reinterpret_cast<vector_t<D_NOPE, T::W_M * T::W_K_NOPE / T::WARP_SIZE>*>(&v_q_nope[mt.value]);
+                auto s_tile = reinterpret_cast<s_tile_t*>(&v_s[mt.value]);
+                s_tile[0] = mfma0_nope(k_tile[0], q_sl[idx], s_tile[0], static_cast<int>(scale_k[0]), scale_q[mt.value], ek, ek);
+                s_tile[1] = mfma0_nope(k_tile[1], q_sl[idx], s_tile[1], static_cast<int>(scale_k[1]), scale_q[mt.value], ek, ek);
+            });
+            if constexpr (idx + 2 < T::GEMM0_NOPE_E_K)
+                v_k[slot] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(number<idx + 2>{}));
+            if constexpr (idx + 3 == T::GEMM0_NOPE_E_K) {
+                v_kr[0] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope);
+                v_kr[1] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + sk_rope_slice(1_I));
+                __builtin_amdgcn_sched_barrier(0);   // keep the reads ahead of the remaining nope MFMAs
+            }
+        });
+        static_for<2>([&](auto mt) {
+            auto qr_sl = reinterpret_cast<vector_t<D_ROPE, T::W_M * T::W_K_ROPE / T::WARP_SIZE>*>(&v_q_rope[mt.value]);
+            v_s[mt.value] = mma0_rope(qr_sl[0], v_kr[0], v_s[mt.value]);
+            v_s[mt.value] = mma0_rope(qr_sl[1], v_kr[1], v_s[mt.value]);
+        });
+
+        // V dequant source reads issued here: their LDS latency hides under the softmax.
+        pc_dq_src<T> dqs;
+        pc_dq_issue<T>(dqs, kb, dqo, p, lane_id);
+        // ---- online softmax per M tile -> P (bf16) + rescale factor ----
+        const int nvalid = pc_tile(kargs, t, PT, pbeg, plen, ebeg, elen).nvalid;
+        // Straight-line softmax of both M tiles (one mask branch, no exec-masked alpha store):
+        // the two independent row chains share one basic block and interleave.
+        if (nvalid < T::KV_TILE_SIZE) {
+            static_for<2>([&](auto mt) { attn_mask_oob_score<T>(v_s[mt.value], nvalid, 0, neg_inf_v); });
+        }
+        D_ACC rmax[2], mnew[2], alpha[2], rsum[2];
+        static_assert(s_len == 8, "tree reductions assume 8 scores per lane");
+        static_for<2>([&](auto mt) {
+            constexpr int m = mt.value;
+            // tree row max: in-lane, then across the 4 lane groups of the row
+            D_ACC a = max(max(v_s[m][0], v_s[m][1]), max(v_s[m][2], v_s[m][3]));
+            D_ACC b = max(max(v_s[m][4], v_s[m][5]), max(v_s[m][6], v_s[m][7]));
+            D_ACC x = max(a, b);
+            vector_t<u32_t, 2> r32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<u32_t>(x), std::bit_cast<u32_t>(x), false, true);
+            x = max(std::bit_cast<float>(r32.x), std::bit_cast<float>(r32.y));
+            vector_t<u32_t, 2> r16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<u32_t>(x), std::bit_cast<u32_t>(x), false, true);
+            rmax[m] = max(std::bit_cast<float>(r16.x), std::bit_cast<float>(r16.y)) * ts;
+        });
+        static_for<2>([&](auto mt) {
+            constexpr int m = mt.value;
+            const bool below     = (rmax[m] - m_row[m]) <= 8.0f;
+            const bool all_below = (__builtin_amdgcn_ballot_w64(below) == __builtin_amdgcn_read_exec());
+            mnew[m]  = all_below ? m_row[m] : max(m_row[m], rmax[m]);
+            alpha[m] = (mnew[m] == m_row[m]) ? 1.0f : __builtin_amdgcn_exp2f(m_row[m] - mnew[m]);
+            m_row[m] = mnew[m];
+        });
+        // P (bf16) store of M tile m and the alpha store (row (lane & 15) of M tile (lane >> 4) & 1;
+        // lanes 32..63 store the same values again).
+        auto store_p = [&](auto mt) {
+            constexpr int m = decltype(mt)::value;
+            auto v_p = cast<D_ROPE>(v_s[m]);
+            const int hw = 2 * p + m;
+            *reinterpret_cast<OPUS_LDS_ADDR decltype(v_p)*>(reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(pb)) + hw * 1024 + lane_id * 16) = v_p;
+        };
+        // Alpha is selected between register copies: selecting between alpha[1] and alpha[0] directly
+        // is a dynamically indexed private array, which LLVM promotes to LDS (ds_write2_b32 +
+        // ds_read_b32 + s_waitcnt lgkmcnt(0) on every step).
+        {
+            asm volatile("" : "+v"(alpha[0]), "+v"(alpha[1]));
+            __builtin_amdgcn_sched_barrier(0);
+            // Alpha store right after alpha (depends only on the row max), pinned before the exps.
+            D_ACC a0 = alpha[0], a1 = alpha[1];
+            const D_ACC a_st = (lane_id & 16) ? a1 : a0;
+            *reinterpret_cast<OPUS_LDS_ADDR float*>(reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(ab)) + (2 * p * 16 + (lane_id & 31)) * 4) = a_st;
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        static_for<2>([&](auto mt) {
+            constexpr int m = mt.value;
+            attn_row_scale_sub<T>(v_s[m], ts, mnew[m]);
+            attn_exp2_slice<T, 0, s_len>(v_s[m]);
+        });
+        // P stores right after the exps, before the dequant finish and the row sum, so their LDS
+        // latency drains under the remaining softmax/dequant VALU.
+        asm volatile("" : "+v"(v_s[0]), "+v"(v_s[1]));
+        __builtin_amdgcn_sched_barrier(0);
+        store_p(number<0>{});
+        store_p(number<1>{});
+        __builtin_amdgcn_sched_barrier(0);
+        // V dequant cvt + bf16 V stores after the exps. The empty asms pin the exp results before,
+        // and the cvt sources after, this point (else LLVM sinks the exps to the row sum and hoists
+        // the cvts, and their read waits, to the row max); sched_barrier pins the stores.
+        asm volatile("" : "+v"(v_s[0]), "+v"(v_s[1]));
+        __builtin_amdgcn_sched_barrier(0);
+        asm volatile("" : "+v"(dqs.f[0][0]), "+v"(dqs.f[0][1]), "+v"(dqs.f[0][2]), "+v"(dqs.f[0][3]));
+        asm volatile("" : "+v"(dqs.f[1][0]), "+v"(dqs.f[1][1]), "+v"(dqs.f[1][2]), "+v"(dqs.f[1][3]));
+        pc_dq_finish<T>(dqs, smem, vb, t & 1, dqo, scale_k[0], scale_k[1], p, lane_id);
+        __builtin_amdgcn_sched_barrier(0);
+        static_for<2>([&](auto mt) {
+            constexpr int m = mt.value;
+            rsum[m] = attn_row_sum<T>(v_s[m]);
+            l_row[m] = l_row[m] * alpha[m] + rsum[m];
+        });
+
+        pc_sync();
+    }
+
+    // Idle step (consumers run the last PV): publish the final per-head output scale.
+    static_for<2>([&](auto mt) {
+        constexpr int m = mt.value;
+        const int hw = 2 * p + m;
+        auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
+        D_ACC sink_log2 = load(g_attn_sink, hw * 16 + (lane_id % 16))[0] * LOG2_E;
+        D_ACC m_final = max(m_row[m], sink_log2);
+        D_ACC alpha = __builtin_amdgcn_exp2f(m_row[m] - m_final);
+        D_ACC l_final = l_row[m] * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
+        D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
+        if (lane_id < 16)
+            *reinterpret_cast<OPUS_LDS_ADDR float*>(reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(smem + C::S_OFF)) + (hw * 16 + lane_id) * 4) = o_scale;
+    });
+    pc_sync();
+}
+
+template<class T, int G>
+__device__ __forceinline__ void pc_consumer(const opus_mla_v4_prefill_fp8_kargs& kargs, char* smem, int tok, int c,
+                                            int pbeg, int plen, int ebeg, int elen, int PT, int NT) {
+    using namespace opus;
+    using C      = pc_cfg<T>;
+    using D_NOPE = typename T::D_NOPE;
+    using D_ROPE = typename T::D_ROPE;
+    using D_ACC  = typename T::D_ACC;
+
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));
+    const int hg = c >> 1;
+    const int dh = c & 1;
+
+    auto mma1 = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
+        seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+        mfma_adaptor_swap_ab{});
+    using VA = typename decltype(mma1)::vtype_a;
+    using VB = typename decltype(mma1)::vtype_b;
+    using OS = vector_t<D_ACC, T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>;
+    constexpr int NSL = T::NUM_D_SLICES / 2;   // 8 slices of 32 D per half
+    constexpr int PV_NB = 2;                   // V fragment prefetch depth (slices in flight)
+    vector_t<D_ACC, NSL * vector_traits<OS>::size()> v_o[2];
+    clear(v_o[0]);
+    clear(v_o[1]);
+
+    auto u_rv = make_layout_rv<T>(lane_id);
+    auto sv_slice = [](auto slice_idx) {
+        constexpr int s = decltype(slice_idx)::value;
+        return number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave_rope + T::smem_padding_32B_rope) + (s % 2) * T::SLICE_D>{};
+    };
+    constexpr int dh_off_elems = decltype(sv_slice(number<NSL>{}))::value;
+
+    // ---- gather partition (the 16mx8_32nx1 kernel's warp c of 8) ----
+    auto u_kv_indices = make_layout_kv_indices<T>(c, lane_id);
+    auto u_gk_nope    = make_layout_gk_nope<T>(c, lane_id);
+    auto u_sk_nope    = make_layout_sk_nope<T>(c);
+    auto u_gk_rope    = make_layout_gk_rope<T>(lane_id);
+    auto u_sk_rope    = make_layout_sk_rope<T>(c);
+    const int idx_row = layout_to_offsets<1>(u_kv_indices)[0];
+    // K-rope DMA dedup: make_layout_sk_rope uses c % smem_n_rpt (= c % 4), so consumers
+    // c and c+4 gather the SAME K-rope rows into the SAME LDS bytes. Only group G == 0 (c 0-3) issues it;
+    // G == 1 (c 4-7) has one fewer vmcnt-tracked load per tile. The producer reads K-rope only after the
+    // step barrier, by which point every rope owner has waited for its own DMA (vmcnt below).
+    constexpr bool rope_owner = G == 0;
+
+    // kv indices: per-lane DMA (GLOBAL_LOAD_LDS, vmcnt-tracked like the row gathers) into a
+    // private 3-slot LDS ring, read back with a compiler-visible ds_read.
+    auto idx_dma = [&](int u) {
+        const pc_tile_src s = pc_tile(kargs, u, PT, pbeg, plen, ebeg, elen);
+        const int lr = lane_id & 31;
+        const int r = lr < s.nvalid ? lr : s.nvalid - 1;
+        const unsigned int off = static_cast<unsigned int>(r) * 4u;
+        const int* base = s.idx;
+        const unsigned int m0 = __builtin_amdgcn_readfirstlane(static_cast<unsigned int>(reinterpret_cast<__UINTPTR_TYPE__>(
+            reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(smem + C::I_OFF + (c * C::K_SLOTS + u % C::K_SLOTS) * 256)))));
+        asm volatile("s_mov_b32 m0, %0\n\ts_nop 0\n\tglobal_load_lds_dword %1, %2" :: "s"(m0), "v"(off), "s"(base) : "memory");
+    };
+    auto idx_read = [&](int u) {
+        return *reinterpret_cast<OPUS_LDS_ADDR int*>(reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(
+            smem + C::I_OFF + (c * C::K_SLOTS + u % C::K_SLOTS) * 256)) + idx_row * 4);
+    };
+    auto gather = [&](int u, int idx) {
+        const bool x = u >= PT;
+        const D_NOPE* pn = reinterpret_cast<const D_NOPE*>(x ? kargs.kv_nope_ptr : kargs.unified_kv_nope_ptr);
+        const D_ROPE* pr = reinterpret_cast<const D_ROPE*>(x ? kargs.kv_rope_ptr : kargs.unified_kv_rope_ptr);
+        const int sl = u % C::K_SLOTS;
+        char* kb = smem + C::K_OFF + sl * C::K_SLOT_BYTES;
+        gather_row_lds_off32<T::VEC_KV_NOPE>(pn, idx, kargs.stride_kv_nope_page, kb, u_gk_nope, u_sk_nope);
+        if constexpr (rope_owner)
+            gather_row_lds_off32<T::VEC_KV_ROPE>(pr, idx, kargs.stride_kv_rope_page, kb + T::smem_k_nope_bytes, u_gk_rope, u_sk_rope);
+    };
+    // vmcnt helpers (per tile: idx dword + 2x nope b128 + 1x rope b128 for owners, no rope otherwise)
+    auto vm_wait_tail = [&]() {   // all but the newest tile's (idx + gather)
+        if constexpr (rope_owner) asm volatile("s_waitcnt vmcnt(4)" ::: "memory");
+        else                      asm volatile("s_waitcnt vmcnt(3)" ::: "memory");
+    };
+    auto vm_wait_gather = [&]() { // all but the newest tile's gather
+        if constexpr (rope_owner) asm volatile("s_waitcnt vmcnt(3)" ::: "memory");
+        else                      asm volatile("s_waitcnt vmcnt(2)" ::: "memory");
+    };
+
+    // ---- prologue: gathers of tiles 0 and 1 ----
+    if (NT == 0) {
+        pc_sync();
+        pc_sync();
+    } else {
+        idx_dma(0);
+        idx_dma(NT > 1 ? 1 : 0);
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+        gather(0, idx_read(0));
+        idx_dma(NT > 2 ? 2 : NT - 1);
+        if (NT > 1) {
+            gather(1, idx_read(1));
+            vm_wait_tail();
+        } else {
+            asm volatile("s_waitcnt vmcnt(1)" ::: "memory");
+        }
+        pc_sync();
+        // step loop
+        for (int t = 0; t <= NT; ++t) {
+            const bool issue = (t + 2) < NT;
+            if (issue) {
+                vm_wait_gather();
+                const int cur = idx_read(t + 2);
+                idx_dma((t + 3) < NT ? t + 3 : NT - 1);
+                gather(t + 2, cur);
+            }
+            if (t >= 1) {
+                const int ps = (t - 1) & 1;
+                char* vb = smem + C::V_OFF + ps * C::V_SLOT_BYTES + dh * dh_off_elems * static_cast<int>(sizeof(D_ROPE));
+                OPUS_LDS_ADDR char* pb = reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(smem + C::P_OFF + ps * C::P_SLOT_BYTES));
+                OPUS_LDS_ADDR char* ab = reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(smem + C::A_OFF + ps * C::A_SLOT_BYTES));
+                VA v_p[2];
+                D_ACC alpha[2];
+                static_for<2>([&](auto ht) {
+                    const int hw = 2 * hg + ht.value;
+                    v_p[ht.value]   = *reinterpret_cast<OPUS_LDS_ADDR VA*>(pb + hw * 1024 + lane_id * 16);
+                    alpha[ht.value] = *reinterpret_cast<OPUS_LDS_ADDR float*>(ab + (hw * 16 + (lane_id & 15)) * 4);
+                });
+                auto s_v = make_smem(reinterpret_cast<D_ROPE*>(vb));
+                VB v_v[PV_NB];
+                static_for<PV_NB>([&](auto i) {
+                    v_v[i.value] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(number<i.value>{}));
+                });
+                static_for<2>([&](auto ht) {
+                    const bool need = __builtin_amdgcn_ballot_w64(alpha[ht.value] != 1.0f) != 0;
+                    if (need) {
+                        const D_ACC a = alpha[ht.value];
+                        static_for<vector_traits<decltype(v_o[0])>::size()>([&](auto i) { v_o[ht.value][i.value] *= a; });
+                    }
+                });
+                auto o0 = reinterpret_cast<OS*>(&v_o[0]);
+                auto o1 = reinterpret_cast<OS*>(&v_o[1]);
+                static_for<NSL>([&](auto i) {
+                    constexpr int idx  = i.value;
+                    constexpr int slot = idx % PV_NB;
+                    if constexpr (idx + 1 < NSL) {
+                        constexpr int last = (idx + PV_NB - 1 < NSL - 1) ? (idx + PV_NB - 1) : (NSL - 1);
+                        s_waitcnt_lgkmcnt(number<(last - idx) * T::v_ds_read_insts>{});
+                    } else {
+                        s_waitcnt_lgkmcnt(0_I);
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+                    o0[idx] = mma1(v_p[0], v_v[slot], o0[idx]);
+                    o1[idx] = mma1(v_p[1], v_v[slot], o1[idx]);
+                    if constexpr (idx + PV_NB < NSL)
+                        v_v[slot] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slice(number<idx + PV_NB>{}));
+                    __builtin_amdgcn_sched_barrier(0);
+                });
+            }
+            if (issue) vm_wait_tail();
+            else       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            pc_sync();
+        }
+    }
+
+    // ---- normalize + store O through a per-wave LDS transpose (V area is dead) ----
+    using D_OUT = typename T::D_OUT;
+    const float* sc = reinterpret_cast<const float*>(smem + C::S_OFF);
+    auto s_o = make_smem(reinterpret_cast<D_OUT*>(smem + C::V_OFF + c * C::O_WAVE_BYTES));
+    D_OUT* outp = reinterpret_cast<D_OUT*>(kargs.out_ptr) + static_cast<int64_t>(tok) * kargs.stride_o_n;
+    const int h  = lane_id % T::W_M;
+    const int g  = lane_id / T::W_M;
+    const int wr = h * C::O_ROW + g * 4;
+    const int rr = (lane_id / 32) * C::O_ROW + (lane_id % 32) * 8;
+    static_for<2>([&](auto ht) {
+        const int hw = 2 * hg + ht.value;
+        const float osc = *reinterpret_cast<const OPUS_LDS_ADDR float*>(reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(sc)) + (hw * 16 + h) * 4);
+        auto vo = v_o[ht.value];
+        static_for<vector_traits<decltype(vo)>::size()>([&](auto i) { vo[i.value] *= osc; });
+        auto v_out = cast<D_OUT>(vo);
+        static_for<16>([&](auto n) {
+            vector_t<D_OUT, 4> x;
+            static_for<4>([&](auto v) { x[v.value] = v_out[n.value * 4 + v.value]; });
+            s_o.template store<4>(x, wr + n.value * 16);
+        });
+        vector_t<D_OUT, 8> rd[8];
+        static_for<8>([&](auto k) { rd[k.value] = s_o.template load<8>(rr + k.value * 2 * C::O_ROW); });
+        static_for<8>([&](auto k) {
+            const int head = hw * 16 + lane_id / 32 + 2 * k.value;
+            *reinterpret_cast<vector_t<D_OUT, 8>*>(outp + static_cast<int64_t>(head) * kargs.stride_o_h + dh * 256 + (lane_id % 32) * 8) = rd[k.value];
+        });
+    });
+}
+
+} // namespace opus_mla_v4_prefill_pc
+
+// 768 threads = 3 waves per SIMD, which caps the kernel at 168 VGPRs (512 / 3, rounded down to 8).
+// It uses all 168 without spilling, so extra live state would spill rather than lower occupancy.
+template<class Traits>
+__global__ __launch_bounds__(768, 1) void opus_mla_v4_prefill_a8w8_pc_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
+    using namespace opus;
+    using namespace opus_mla_v4_prefill_pc;
+    using T = opus::remove_cvref_t<Traits>;
+    using C = pc_cfg<T>;
+    __shared__ char smem[C::TOTAL];
+    const int tok  = block_id_x();
+    const int wave = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+    const int pbeg = kargs.kv_indptr_prefix[tok];
+    const int plen = kargs.kv_indptr_prefix[tok + 1] - pbeg;
+    const int ebeg = kargs.kv_indptr_extend[tok];
+    const int elen = kargs.kv_indptr_extend[tok + 1] - ebeg;
+    const int PT = ceil_div(plen, T::KV_TILE_SIZE);
+    const int NT = PT + ceil_div(elen, T::KV_TILE_SIZE);
+    if (wave < C::NUM_PROD)
+        pc_producer<T>(kargs, smem, tok, wave, pbeg, plen, ebeg, elen, PT, NT);
+    else if (wave < C::NUM_PROD + 4)
+        pc_consumer<T, 0>(kargs, smem, tok, wave - C::NUM_PROD, pbeg, plen, ebeg, elen, PT, NT);
+    else
+        pc_consumer<T, 1>(kargs, smem, tok, wave - C::NUM_PROD, pbeg, plen, ebeg, elen, PT, NT);
 }
 
 // =============================================================================

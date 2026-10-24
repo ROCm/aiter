@@ -339,6 +339,7 @@ def _make_inputs(
     dtype: torch.dtype,
     *,
     topk: int = 1024,
+    extend_topk: int | None = None,
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
@@ -364,7 +365,12 @@ def _make_inputs(
         n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
     )
     ip_e, ix_e = _page_table_csr(
-        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+        n,
+        total_tokens,
+        topk if extend_topk is None else extend_topk,
+        causal=True,
+        device=device,
+        seed=seed * 2 + 2,
     )
 
     _poison_unreferenced(total_pages, ix_p, bf16=unified_kv)
@@ -389,6 +395,7 @@ def _make_inputs_fp8(
     total_tokens: int,
     *,
     topk: int = 1024,
+    extend_topk: int | None = None,
     device: torch.device | str = "cuda",
     seed: int = 0,
     data_init: str = "norm",
@@ -437,7 +444,12 @@ def _make_inputs_fp8(
         n, total_pages, topk, causal=False, device=device, seed=seed * 2 + 1
     )
     ip_e, ix_e = _page_table_csr(
-        n, total_tokens, topk, causal=True, device=device, seed=seed * 2 + 2
+        n,
+        total_tokens,
+        topk if extend_topk is None else extend_topk,
+        causal=True,
+        device=device,
+        seed=seed * 2 + 2,
     )
 
     # The fp32 copies stay clean; the reference only reads rows that were named.
@@ -532,6 +544,7 @@ def run_pa_sparse_prefill(
     seed: int = 0,
     data_init: str = "norm",
     num_kv_splits: int | None = None,
+    extend_topk: int | None = None,
     verify: bool = True,
     bench: bool = True,
 ) -> dict | None:
@@ -548,7 +561,8 @@ def run_pa_sparse_prefill(
     softmax_scale = 1.0 / math.sqrt(d)
     msg = (
         f"[N={n} H={h} D={d} total_pages={total_pages} total_tokens={total_tokens} "
-        f"prec={prec} topk={topk} data_init={data_init} seed={seed} "
+        f"prec={prec} topk={topk} extend_topk={extend_topk} "
+        f"data_init={data_init} seed={seed} "
         f"num_kv_splits={num_kv_splits}]"
     )
     wanted = [b for b in _PREC_BACKENDS[prec] if b in backends]
@@ -563,6 +577,7 @@ def run_pa_sparse_prefill(
             total_pages,
             total_tokens,
             topk=topk,
+            extend_topk=extend_topk,
             seed=seed,
             data_init=data_init,
         )
@@ -595,6 +610,7 @@ def run_pa_sparse_prefill(
             total_tokens,
             _PREC_TO_DTYPE[prec],
             topk=topk,
+            extend_topk=extend_topk,
             seed=seed,
             data_init=data_init,
         )
@@ -686,7 +702,14 @@ _PYTEST_CASES = [
     (64, 64, 1024, 1024, 1024),
     (192, 96, 1024, 192, 256),
     (256, 128, 2048, 2048, 512),
+    (300, 128, 65536, 300, 1000),  # H=128 kernel: partial last KV tile
     (64, 32, 0, 0, 128),  # empty pools -> sink-only
+    (64, 128, 0, 0, 128),  # empty pools -> sink-only, H=128 kernel
+    # H=128 kernel, short KV streams (32-row tiles) that reach the consumer's
+    # 1- and 2-tile prologue branches:
+    (64, 128, 0, 256, 128),  # empty prefix; causal extend: 1 tile, then 2 tiles
+    (64, 128, 32, 64, 32),  # 1 prefix tile + 1 extend tile
+    (64, 128, 16, 0, 16),  # 1 partial prefix tile, empty extend
 ]
 
 
@@ -709,6 +732,85 @@ def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
         verify=True,
         bench=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# fp8 dispatch on gfx950: which kernel runs. Correctness alone cannot tell a
+# silent fallback to the 16mx8_32nx1 kernel from the H == 128 producer/consumer
+# kernel, so these cases also check the launched kernel by its profiler name.
+# ---------------------------------------------------------------------------
+
+_FP8_PC_KERNEL = "opus_mla_v4_prefill_a8w8_pc_kernel"
+_FP8_16MX8_KERNEL = "opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel"
+
+_PYTEST_DISPATCH_CASES = [
+    # (N, H, total_pages, total_tokens, topk, out offset in elements, kernel)
+    (256, 128, 2048, 2048, 512, 0, _FP8_PC_KERNEL),
+    (64, 128, 0, 256, 128, 0, _FP8_PC_KERNEL),  # empty prefix, 1-2 tiles
+    (64, 128, 32, 64, 32, 0, _FP8_PC_KERNEL),  # 2 tiles
+    (64, 128, 16, 0, 16, 0, _FP8_PC_KERNEL),  # 1 tile
+    (64, 128, 0, 0, 128, 0, _FP8_PC_KERNEL),  # no tile, sink only
+    # out 2 bytes off 16-byte alignment -> 16mx8_32nx1 fallback
+    (256, 128, 2048, 2048, 512, 1, _FP8_16MX8_KERNEL),
+    (64, 64, 1024, 1024, 1024, 0, _FP8_16MX8_KERNEL),  # H != 128
+]
+
+
+def _opus_kernels_launched(fn) -> list[str]:
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        fn()
+        torch.cuda.synchronize()
+    return sorted({e.name for e in prof.events() if "opus_mla_v4_prefill" in e.name})
+
+
+@pytest.mark.parametrize(
+    "n,h,total_pages,total_tokens,topk,out_offset,kernel",
+    _PYTEST_DISPATCH_CASES,
+    ids=lambda v: str(v).replace("opus_mla_v4_prefill_a8w8_", ""),
+)
+def test_pa_sparse_prefill_fp8_dispatch(
+    n, h, total_pages, total_tokens, topk, out_offset, kernel
+):
+    if _skip_if_unsupported(d=512):
+        return
+    if _get_gpu_arch() != "gfx950":
+        pytest.skip("the H == 128 fp8 kernel is built for gfx950 only")
+    data = _make_inputs_fp8(
+        n,
+        h,
+        total_pages,
+        total_tokens,
+        topk=topk,
+        seed=(hash((n, h, total_pages, total_tokens, topk, out_offset)) & 0xFFFF),
+    )
+    softmax_scale = 1.0 / math.sqrt(_FP8_D_HEAD)
+    # The op takes a preallocated out, as the serving caller passes one.
+    numel = n * h * _FP8_D_HEAD
+    buf = torch.empty(numel + 8, dtype=torch.bfloat16, device="cuda")
+    out = buf[out_offset : out_offset + numel].view(n, h, _FP8_D_HEAD)
+
+    names = _opus_kernels_launched(
+        lambda: pa_sparse_prefill_fp8_opus(
+            **data["kernel"], softmax_scale=softmax_scale, out=out
+        )
+    )
+    others = {_FP8_PC_KERNEL, _FP8_16MX8_KERNEL} - {kernel}
+    assert any(kernel in nm for nm in names) and not any(
+        o in nm for nm in names for o in others
+    ), f"expected {kernel}, launched {names}"
+
+    ref = _ref_pa_sparse_prefill_fp8(**data["ref"], softmax_scale=softmax_scale)
+    err = checkAllclose(
+        out,
+        ref,
+        rtol=_RTOL,
+        atol=_ATOL,
+        tol_err_ratio=_ERR_TOL,
+        msg=f"opus fp8 dispatch [N={n} H={h} out_offset={out_offset}]",
+    )
+    assert err <= _ERR_TOL, f"mismatch ratio {err:.3%} exceeds {_ERR_TOL:.1%}"
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +922,13 @@ parser.add_argument(
     help="bf16 OPUS split-K counts: auto (the op's own choice), 1, 2, 4 or 8; "
     "a forced count runs on gfx950 with H <= 32 (default: auto)",
 )
+parser.add_argument(
+    "--extend_topk",
+    type=int,
+    default=None,
+    help="per-token budget of the (causal) extend range, e.g. a 128-row sliding "
+    "window; default: the same as --topk",
+)
 
 
 if __name__ == "__main__":
@@ -849,6 +958,7 @@ if __name__ == "__main__":
             seed=args.seed,
             data_init=data_init,
             num_kv_splits=splits,
+            extend_topk=args.extend_topk,
             verify=not args.no_verify,
             bench=not args.no_bench,
         )

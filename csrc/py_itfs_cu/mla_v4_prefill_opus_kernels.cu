@@ -17,6 +17,7 @@
 #include "aiter_tensor.h"
 
 #include <cstddef>
+#include <cstdint>
 
 // The bf16/fp16 kernels' shared validation and arguments (`kargs.N` 0: nothing to run).
 static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t& q,
@@ -360,6 +361,25 @@ void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
     kargs.stride_kv_rope_page = stride_kv_rope_page;
     kargs.softmax_scale       = softmax_scale;
 
+    // H == 128 runs the warp-specialized producer/consumer kernel. It gathers KV rows with a 32-bit
+    // byte offset (SGPR base + 24x24 row mad), so every row of the four KV pools must fit:
+    // rows < 2^24, row stride bytes < 2^24 and (rows - 1) * stride + row bytes < 2^32.
+    // Its O store writes 16-byte vectors, so out must be 16-byte aligned per head row.
+    // Everything else keeps the 16mx8_32nx1 kernel.
+    auto pool_fits32 = [](int64_t rows, int64_t stride_bytes, int64_t row_bytes) {
+        if(rows <= 0)
+            return true;
+        return rows < (int64_t(1) << 24) && stride_bytes > 0 && stride_bytes < (int64_t(1) << 24) &&
+               (rows - 1) * stride_bytes + row_bytes <= (int64_t(1) << 32) - 1;
+    };
+    const bool use_pc = H == 128 &&
+                        pool_fits32(total_pages, int64_t(stride_kv_nope_page), D_NOPE_PADDED) &&
+                        pool_fits32(total_tokens, int64_t(stride_kv_nope_page), D_NOPE_PADDED) &&
+                        pool_fits32(total_pages, int64_t(stride_kv_rope_page) * 2, D_ROPE * 2) &&
+                        pool_fits32(total_tokens, int64_t(stride_kv_rope_page) * 2, D_ROPE * 2) &&
+                        reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0 &&
+                        kargs.stride_o_n % 8 == 0 && kargs.stride_o_h % 8 == 0;
+
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q_nope.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -374,10 +394,18 @@ void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
         HIP_CALL_LAUNCH(hipGetLastError());                                       \
     } while(0)
 
-    // 16mx8_32nx1 (T_M=NUM_WARPS) for H > 32; 16mx1_16nx4 (T_M=1) for H <= 32.
+    // 16mx1_16nx4 (T_M=1) for H <= 32; the producer/consumer kernel (one 768-thread WG per
+    // token, 4 producer + 8 consumer waves) for H == 128; 16mx8_32nx1 (T_M=NUM_WARPS) otherwise.
     if(H <= 32)
         LAUNCH_OPUS_MLA_V4_PREFILL_FP8(opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel,
                                        opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits, 64, 4);
+    else if(use_pc)
+    {
+        using KTraits =
+            opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>;
+        opus_mla_v4_prefill_a8w8_pc_kernel<KTraits><<<dim3(N, 1, 1), dim3(768), 0, stream>>>(kargs);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    }
     else
         LAUNCH_OPUS_MLA_V4_PREFILL_FP8(opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel,
                                        opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits, 32, 8);
