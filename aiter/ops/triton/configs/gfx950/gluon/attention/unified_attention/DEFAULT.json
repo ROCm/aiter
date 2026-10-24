@@ -16,7 +16,6 @@
     ],
     "kv_split": [
       "SW",
-      "SWB",
       "D",
       "Q",
       "DT"
@@ -217,7 +216,7 @@
     }
   },
   "kv_split": {
-    "SW_GEQ_256.SWB": {
+    "SW_GEQ_256.Q_GEQ_2": {
       "SEGMENTS_PER_CU": 1,
       "SPLIT_FIT_BUDGET": true,
       "SPLIT_SEQS_PER_TILE": 1.5,
