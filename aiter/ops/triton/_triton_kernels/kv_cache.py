@@ -23,7 +23,9 @@ def _store_mla_kv_cache(
     SHUFFLED_KV_CACHE: tl.constexpr,
     SCALE_K_WIDTH_NOPE: tl.constexpr,
     SCALE_K_WIDTH_ROPE: tl.constexpr,
+    mask=None,
 ):
+    # mask: optional scalar store mask (e.g. slot >= 0), applied to every store.
     if SHUFFLED_KV_CACHE:
         if kv_cache_ptr.dtype.element_ty == tl.bfloat16:
             # BF16
@@ -75,10 +77,14 @@ def _store_mla_kv_cache(
         ) * kv_cache_stride_d
 
         tl.store(
-            kv_cache_ptrs + kv_cache_nope_offs, k_nope.to(kv_cache_ptr.dtype.element_ty)
+            kv_cache_ptrs + kv_cache_nope_offs,
+            k_nope.to(kv_cache_ptr.dtype.element_ty),
+            mask=mask,
         )
         tl.store(
-            kv_cache_ptrs + kv_cache_pe_offs, k_pe.to(kv_cache_ptr.dtype.element_ty)
+            kv_cache_ptrs + kv_cache_pe_offs,
+            k_pe.to(kv_cache_ptr.dtype.element_ty),
+            mask=mask,
         )
 
         if kv_cache_ptr.dtype.element_ty == tl.uint8:
@@ -122,12 +128,14 @@ def _store_mla_kv_cache(
                 k_nope_scales.to(e4m3_dtype).to(
                     kv_cache_ptr.dtype.element_ty, bitcast=True
                 ),
+                mask=mask,
             )
             tl.store(
                 kv_cache_ptrs + kv_cache_pe_scales_offs,
                 k_pe_scales.to(e4m3_dtype).to(
                     kv_cache_ptr.dtype.element_ty, bitcast=True
                 ),
+                mask=mask,
             )
     else:
         # non-shuffled KV cache
@@ -137,10 +145,14 @@ def _store_mla_kv_cache(
         kv_cache_nope_offs = d_nope_offs * kv_cache_stride_d
         kv_cache_pe_offs = (d_pe_offs + BLOCK_D_nope) * kv_cache_stride_d
         tl.store(
-            kv_cache_ptrs + kv_cache_nope_offs, k_nope.to(kv_cache_ptr.dtype.element_ty)
+            kv_cache_ptrs + kv_cache_nope_offs,
+            k_nope.to(kv_cache_ptr.dtype.element_ty),
+            mask=mask,
         )
         tl.store(
-            kv_cache_ptrs + kv_cache_pe_offs, k_pe.to(kv_cache_ptr.dtype.element_ty)
+            kv_cache_ptrs + kv_cache_pe_offs,
+            k_pe.to(kv_cache_ptr.dtype.element_ty),
+            mask=mask,
         )
 
 

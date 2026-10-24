@@ -1038,3 +1038,128 @@ def test_fused_qk_rope_cosine_cache_llama(
     torch.testing.assert_close(
         torch_value_cache, triton_value_cache, atol=1e-1, rtol=1e-1
     )
+
+
+@pytest.mark.parametrize("T, num_k_only", [(1, 0), (64, 0), (300, 0), (64, 7)])
+@pytest.mark.parametrize("QH", [16, 24, 128])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
+@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
+@pytest.mark.parametrize(
+    "cache_dtype, shuffled_kv_cache, block_size",
+    [
+        (torch.bfloat16, False, 1),
+        (e4m3_dtype, True, 64),
+    ],
+)
+@pytest.mark.parametrize("upcast_operand", [False, True])
+@pytest.mark.parametrize("impl", ["gluon", "triton"])
+def test_fused_qk_rope_cat_and_cache_mla_q_nope_prestored(
+    T: int,
+    num_k_only: int,
+    QH: int,
+    rotate_style: int,
+    reuse_freqs_front_part: bool,
+    cache_dtype: torch.dtype,
+    shuffled_kv_cache: bool,
+    block_size: int,
+    upcast_operand: bool,
+    impl: str,
+    monkeypatch,
+):
+    """q_nope_prestored=True must match the full path bit for bit.
+
+    q_out[..., :D_lora] is prefilled with q_nope (as a q_nope producer would),
+    and q_out, k_pe_out and the KV cache are compared against the full path,
+    which the test above checks against the torch reference. impl="gluon" is
+    the default dispatch (gluon on gfx1250 pure decode, else Triton);
+    impl="triton" forces the Triton kernel. num_k_only > 0 adds tokens that
+    only carry k (B_slot > B), and QH=24 leaves a partial head tile.
+    """
+    import aiter.ops.triton.fusions.fused_kv_cache as fused_kv_cache_mod
+
+    monkeypatch.setattr(fused_kv_cache_mod, "_QPE_ROPE_IMPL", impl)
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    D_lora, D_pe, max_pos, num_kv_cache_tokens = 512, 64, 4096, 16384
+    b_slot = T + num_k_only
+    q_out_dtype = e4m3_dtype if cache_dtype == e4m3_dtype else dtype
+
+    q_nope = torch.randn((T, QH, D_lora), dtype=dtype, device="cuda")
+    q_pe = torch.randn((T, QH, D_pe), dtype=dtype, device="cuda")
+    k_nope = (torch.randn((b_slot, 1, D_lora), device="cuda") / 20).to(dtype)
+    k_pe = (torch.randn((b_slot, 1, D_pe), device="cuda") / 20).to(dtype)
+    d_freq = D_pe // 2 if reuse_freqs_front_part else D_pe
+    freqs = torch.randn((max_pos, 1, 1, d_freq), dtype=torch.float32, device="cuda")
+    cos, sin = freqs.cos().to(dtype), freqs.sin().to(dtype)
+    positions = torch.randint(0, max_pos, (b_slot,), device="cuda")
+    slot_mapping = torch.randperm(num_kv_cache_tokens, device="cuda")[:b_slot]
+    if num_k_only > 0:
+        slot_mapping[-1] = -1  # a padded k-only token is skipped
+    if shuffled_kv_cache:
+        kv_cache = torch.zeros(
+            (num_kv_cache_tokens // block_size, 1, block_size, D_lora + D_pe),
+            dtype=cache_dtype,
+            device="cuda",
+        )
+    else:
+        kv_cache = torch.zeros(
+            (num_kv_cache_tokens, 1, D_lora + D_pe), dtype=cache_dtype, device="cuda"
+        )
+    k_scale = torch.tensor(0.37, dtype=torch.float32, device="cuda")
+    is_neox = rotate_style == RotateStyle.NEOX
+
+    def run(prestored, kv, q_out):
+        # Sentinel-filled so rows a path does not write compare deterministically.
+        k_pe_out = torch.full((b_slot, 1, D_pe), 7.0, dtype=dtype, device="cuda")
+        return fused_qk_rope_cat_and_cache_mla(
+            q_nope,
+            q_pe,
+            k_nope,
+            k_pe,
+            kv,
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            k_scale,
+            is_neox,
+            num_decode_toks_for_zeros=0,
+            apply_scale=(cache_dtype != dtype),
+            q_out=q_out,
+            k_pe_out=k_pe_out,
+            shuffled_kv_cache=shuffled_kv_cache,
+            upcast_operand=upcast_operand,
+            q_nope_prestored=prestored,
+        )
+
+    ref_kv = kv_cache.clone()
+    ref_q_out = torch.empty((T, QH, D_lora + D_pe), dtype=q_out_dtype, device="cuda")
+    _, _, ref_k_pe, _ = run(False, ref_kv, ref_q_out)
+
+    q_out = torch.empty_like(ref_q_out)
+    q_out[..., :D_lora] = q_nope.to(q_out_dtype)
+    _, _, k_pe_out, _ = run(True, kv_cache, q_out)
+
+    assert torch.equal(q_out.view(torch.uint8), ref_q_out.view(torch.uint8))
+    assert torch.equal(kv_cache.view(torch.uint8), ref_kv.view(torch.uint8))
+    assert torch.equal(k_pe_out, ref_k_pe)
+
+    with pytest.raises(AssertionError, match="q_nope_prestored"):
+        fused_qk_rope_cat_and_cache_mla(
+            q_nope,
+            q_pe,
+            k_nope,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            k_scale,
+            is_neox,
+            num_decode_toks_for_zeros=T,
+            apply_scale=(cache_dtype != dtype),
+            q_out=q_out,
+            shuffled_kv_cache=shuffled_kv_cache,
+            q_nope_prestored=True,
+        )
