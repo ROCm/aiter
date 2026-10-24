@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import functools
 import gc
 import itertools
 import logging
@@ -1702,6 +1703,372 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
     )
 
 
+# The MXFP8 conversion in the fused sort+quant kernel is gfx950-only.
+A8W4_SORT_QUANT_GFX = ["gfx950"]
+# Kimi-K3 A8W4 MoE: E=896, topk=16, model_dim=3584 (inter_dim 384 at TP=8,
+# 512 at TP=6).
+_KIMI_A8W4_E, _KIMI_A8W4_TOPK, _KIMI_A8W4_MODEL_DIM = 896, 16, 3584
+
+
+@benchmark()
+def test_a8w4_sort_quant_kernel(
+    token,
+    row_stride,
+    routing,
+    E=_KIMI_A8W4_E,
+    topk=_KIMI_A8W4_TOPK,
+    model_dim=_KIMI_A8W4_MODEL_DIM,
+):
+    """The MXFP8 sort+quant kernel at the Kimi-K3 A8W4 shape.
+
+    Its sort must give the MXFP4 sort_quant's expert blocks and be a valid
+    routing (order within an expert block is not deterministic), its quant must
+    match per_1x32_f8_scale_f8_quant, it must read a row-strided input
+    (row_stride > model_dim), and it must zero moe_buf for the atomic stage2.
+    routing="mixed" pads every other route with -1, which both sorts must skip.
+    """
+    mb = 32
+    alloc = aiter.fused_moe._alloc_aux_sort_buffers
+
+    def alloc_bufs(quant_dtype):
+        _, *sort_bufs = alloc(token, E, topk, mb, torch.device("cuda"))
+        if quant_dtype == dtypes.fp8:
+            a_quant = torch.empty((token, model_dim), dtype=dtypes.fp8)
+        else:
+            a_quant = torch.empty((token, model_dim // 2), dtype=torch.uint8)
+        a_scale = torch.empty((token, model_dim // 32), dtype=torch.uint8)
+        moe_buf = torch.full((token, model_dim), float("nan"), dtype=dtypes.bf16)
+        return (*sort_bufs, a_quant, a_scale, moe_buf)
+
+    def launch(hidden, topk_ids, topk_weights, bufs):
+        ids, experts, nv, weights, rev, m_idx, a_quant, a_scale, moe_buf = bufs
+        aiter.mxfp4_moe_sort_quant(
+            a_input=hidden,
+            topk_ids=topk_ids,
+            topk_weight=topk_weights,
+            sorted_token_ids=ids,
+            sorted_expert_ids=experts,
+            cumsum_tensor=nv,
+            reverse_sorted=rev,
+            sorted_weights=weights,
+            a_quant=a_quant,
+            a_scale=a_scale,
+            m_indices=m_idx,
+            bf16_zero_out=moe_buf,
+            NE=E,
+            TOPK=topk,
+            D_HIDDEN=model_dim,
+            MB=mb,
+        )
+        return bufs
+
+    torch.manual_seed(0)
+    # A row_stride above model_dim makes the input a row-strided view.
+    hidden = torch.randn((token, row_stride), dtype=dtypes.bf16)[:, :model_dim]
+    gating = torch.randn((token, E), dtype=dtypes.bf16)
+    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    if routing == "mixed":
+        # moe_sorting accepts -1 padding routes (test_moe_sorting.py "mixed").
+        invalid = torch.arange(token * topk).view(token, topk) % 2 == 1
+        topk_ids = topk_ids.masked_fill(invalid, -1)
+        topk_weights = topk_weights.masked_fill(invalid, 0)
+    flat_ids = topk_ids.flatten().long()
+    valid = flat_ids >= 0
+    n_routes = int(valid.sum())
+    counts = torch.bincount(flat_ids[valid], minlength=E)
+    expected_n_valid = int(((counts + mb - 1) // mb * mb).sum())
+    # The MXFP4 sort_quant needs dense rows. At token=1, .contiguous() keeps the
+    # row-strided one-row view, which it must still accept: one row has no
+    # row stride to honor.
+    hidden_mxfp4 = hidden.contiguous()
+    if token == 1:
+        assert hidden_mxfp4.stride(0) == row_stride
+    ref_q, ref_s = per_1x32_f8_scale_f8_quant(
+        hidden_mxfp4, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    bufs4 = launch(hidden_mxfp4, topk_ids, topk_weights, alloc_bufs(dtypes.fp4x2))
+    experts4, nv4 = bufs4[1], bufs4[2]
+
+    def check(bufs):
+        ids8, experts8, nv8, w8, rev, m_idx, q8, s8, buf8 = bufs
+        n_valid = int(nv8[0].item())
+        assert n_valid == expected_n_valid, f"M={token}: num_valid_ids {n_valid}"
+        assert torch.equal(nv8, nv4), f"M={token}: num_valid_ids differ"
+        n_blocks = n_valid // mb
+        assert torch.equal(
+            experts8[:n_blocks], experts4[:n_blocks]
+        ), f"M={token}: expert blocks differ"
+        rev_all = rev[: token * topk]
+        assert torch.all(rev_all[~valid] == -1), f"M={token}: -1 route was placed"
+        # Every valid route lands once, in a block of its expert, with its weight.
+        route = rev_all[valid].long()
+        tok = torch.arange(token).repeat_interleave(topk)[valid]
+        slot = torch.arange(topk).repeat(token)[valid]
+        assert torch.equal(ids8[route].long(), slot << 24 | tok), f"M={token}: ids"
+        assert torch.equal(
+            w8[route], topk_weights.flatten()[valid]
+        ), f"M={token}: bad weights"
+        assert torch.equal(
+            experts8[route // mb].long(), flat_ids[valid]
+        ), f"M={token}: route in the wrong expert block"
+        assert torch.equal(m_idx[route].long(), tok), f"M={token}: bad m_indices"
+        # The rest of the valid region is padding.
+        assert (
+            int((ids8[:n_valid] != token).sum()) == n_routes
+        ), f"M={token}: bad padding"
+        assert torch.equal(
+            s8, ref_s.view(torch.uint8)
+        ), f"M={token}: e8m0 scales differ"
+        assert torch.equal(
+            q8.view(torch.uint8), ref_q.view(torch.uint8)
+        ), f"M={token}: fp8 activations differ"
+        assert torch.count_nonzero(buf8) == 0, f"M={token}: moe_buf not zeroed"
+
+    # First launch into a NaN moe_buf checks the zeroing; the timed launches
+    # reuse the same buffers, and their final output is checked again.
+    bufs8 = launch(hidden, topk_ids, topk_weights, alloc_bufs(dtypes.fp8))
+    check(bufs8)
+    bufs8, us = run_perftest(launch, hidden, topk_ids, topk_weights, bufs8)
+    check(bufs8)
+    q8 = bufs8[6]
+    err = checkAllclose(
+        ref_q.to(dtypes.fp32),
+        q8.to(dtypes.fp32),
+        rtol=0,
+        atol=0,
+        msg=f"a8w4 sort_quant M={token} stride={row_stride}: fp8 activations ",
+    )
+    # bf16 input + fp8 out + e8m0 scales + zeroed moe_buf + routing in/out.
+    nbytes = (
+        token * model_dim * (2 + 1 + 2)
+        + token * model_dim // 32
+        + topk_ids.nbytes
+        + topk_weights.nbytes
+        + sum(b.nbytes for b in bufs8[:6])
+    )
+    return {
+        "gfx": get_gfx(),
+        "sort_quant_fp8 us": us,
+        "sort_quant_fp8 TB/s": nbytes / us / 1e6,
+        "sort_quant_fp8 err": err,
+    }
+
+
+@functools.lru_cache(maxsize=1)
+def _kimi_a8w4_weights(inter_dim, E, model_dim):
+    """Per-1x32 fp4x2 weights: raw (torch reference) and shuffled (fused_moe)."""
+    torch.manual_seed(0)
+    dtype = dtypes.bf16
+    torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+    w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.fp4x2)
+    del w1
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
+    w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.fp4x2)
+    del w2
+    w1_qt = w1_qt.view(E, inter_dim * 2, model_dim // 2)
+    w2_qt = w2_qt.view(E, model_dim, inter_dim // 2)
+    raw = (w1_qt, w2_qt, w1_scale, w2_scale)
+    # a8w4 runs gate/up-interleaved w1 (gate_mode INTERLEAVE).
+    shuffled = (
+        shuffle_weight_a16w4(w1_qt, 16, True),
+        shuffle_weight_a16w4(w2_qt, 16, False),
+        shuffle_scale_a16w4(w1_scale, E, True),
+        shuffle_scale_a16w4(w2_scale, E, False),
+    )
+    return raw, shuffled
+
+
+@benchmark()
+def test_a8w4_fused_sort_quant_e2e(
+    token,
+    inter_dim,
+    E=_KIMI_A8W4_E,
+    topk=_KIMI_A8W4_TOPK,
+    model_dim=_KIMI_A8W4_MODEL_DIM,
+):
+    """fused_moe with the fused sort+quant against the separate launches.
+
+    Candidates: "fused" (bf16 input, default path), "unfused" (bf16 input with
+    the fused sort+quant disabled) and "fp8_input" (MXFP8 dispatch: fp8 input
+    with an unsorted e8m0 a1_scale, whose scales must still get sorted). Only
+    "fused" may take the fused sort+quant, and only up to the token cap. Each is
+    checked against the torch reference, and "fused" must also match the other
+    two element-wise.
+    """
+    dtype = dtypes.bf16
+    beta, linear_beta = DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
+    raw, shuffled = _kimi_a8w4_weights(inter_dim, E, model_dim)
+    w1_qt, w2_qt, w1_scale, w2_scale = raw
+    w1_sh, w2_sh, w1_scale_sh, w2_scale_sh = shuffled
+    kwargs = {
+        "w1_scale": w1_scale_sh,
+        "w2_scale": w2_scale_sh,
+        "quant_type": aiter.QuantType.per_1x32,
+        "activation": aiter.ActivationType.Situv2,
+        "beta": beta,
+        "linear_beta": linear_beta,
+        "gate_mode": GateMode.INTERLEAVE.value,
+    }
+
+    torch.manual_seed(0)
+    hidden = torch.randn((token, model_dim), dtype=dtype)
+    gating = torch.randn((token, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    args = (w1_sh, w2_sh, topk_weights, topk_ids)
+    a1, a1_scale = per_1x32_f8_scale_f8_quant(
+        hidden, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+
+    # Torch reference (untimed), as in test_fmoe for a8w4.
+    out1_ref = torch_moe_stage1(
+        a1,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        activation=aiter.ActivationType.Situv2,
+        quant_type=aiter.QuantType.per_1x32,
+        a1_scale=a1_scale,
+        w1_scale=w1_scale,
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+    )
+    a2, a2_scale = per_1x32_f8_scale_f8_quant(
+        out1_ref, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    ref = torch_moe_stage2(
+        a2.view(token, topk, -1),
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        quant_type=aiter.QuantType.per_1x32,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+    )
+
+    def calc_diff(x, y):
+        x, y = x.double(), y.double()
+        return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
+
+    fm = aiter.fused_moe
+    candidates = {
+        "fused": lambda: fused_moe(hidden, *args, **kwargs),
+        "unfused": lambda: fused_moe(hidden, *args, **kwargs),
+        "fp8_input": lambda: fused_moe(
+            a1, *args, a1_scale=a1_scale, dtype=dtype, **kwargs
+        ),
+    }
+    # Set per candidate so AITER_MOE_A8W4_FUSED_SORT_QUANT=0 cannot skew them;
+    # fp8_input keeps fusion on so only its dtype gate excludes it.
+    fusion_enabled = {"fused": True, "unfused": False, "fp8_input": True}
+
+    flops = 2 * token * topk * model_dim * inter_dim * 3
+    n_experts = int(topk_ids.unique().numel())
+    nbytes = (
+        n_experts * (w1_sh.nbytes + w2_sh.nbytes + w1_scale_sh.nbytes) // E
+        + n_experts * w2_scale_sh.nbytes // E
+        + hidden.nbytes
+        + token * model_dim * hidden.element_size()
+    )
+
+    real_fused = fm._a8w4_fused_sort_quant
+    real_fusion_enabled = fm._MOE_A8W4_FUSED_SORT_QUANT
+    calls = []
+
+    def counting_fused(*a, **kw):
+        calls.append(a[0].shape[0])
+        return real_fused(*a, **kw)
+
+    cap = fm._A8W4_SORT_QUANT_MAX_TOKENS
+    tag = f"inter_dim={inter_dim} token={token}"
+    ret = {"gfx": get_gfx()}
+    outs = {}
+    with override_env("AITER_SITUV2_A8W4", "1"):
+        try:
+            fm._a8w4_fused_sort_quant = counting_fused
+            for name, fn in candidates.items():
+                fm._MOE_A8W4_FUSED_SORT_QUANT = fusion_enabled[name]
+                calls.clear()
+                out, us = run_perftest(fn)
+                torch.cuda.synchronize()
+                want = {token} if name == "fused" and token <= cap else set()
+                assert set(calls) == want, f"{tag} {name}: fused calls {set(calls)}"
+                assert not out.isnan().any(), f"{tag} {name}: NaN"
+                # The fp32 torch reference differs from every kernel path by
+                # ~2% (fp8 intermediate, accumulation order), so err uses a
+                # matching tolerance and accuracy is gated on logits_diff, as
+                # in test_fmoe.
+                err = checkAllclose(
+                    ref.to(dtypes.fp32),
+                    out.to(dtypes.fp32),
+                    rtol=5e-2,
+                    atol=0.5,
+                    msg=f"{tag} {name} ",
+                )
+                diff = calc_diff(ref, out)
+                assert diff < 1e-2, f"{tag} {name}: logits_diff {diff} vs torch"
+                outs[name] = out
+                ret[f"{name} us"] = us
+                ret[f"{name} TFLOPS"] = flops / us / 1e6
+                ret[f"{name} TB/s"] = nbytes / us / 1e6
+                ret[f"{name} err"] = err
+                ret[f"{name} logits_diff"] = diff
+        finally:
+            fm._a8w4_fused_sort_quant = real_fused
+            fm._MOE_A8W4_FUSED_SORT_QUANT = real_fusion_enabled
+
+    for name in ("unfused", "fp8_input"):
+        other = outs[name]
+        # Atomic bf16 accumulation reorders run to run: even two calls on the
+        # same path differ by up to 0.375 at |out| ~ 32 (bf16 step 0.25). atol
+        # is two such steps; every element must pass.
+        mismatch = checkAllclose(
+            outs["fused"],
+            other,
+            rtol=1e-2,
+            atol=0.5,
+            tol_err_ratio=0.0,
+            msg=f"{tag}: fused vs {name} ",
+        )
+        assert mismatch == 0, f"{tag}: fused vs {name} mismatch {mismatch}"
+        diff = calc_diff(outs["fused"], other)
+        assert diff < 1e-3, f"{tag}: fused vs {name} diff {diff}"
+    return ret
+
+
+def _log_summary(name, rows):
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
+
+
+def run_a8w4_sort_quant_tests():
+    if get_gfx() not in A8W4_SORT_QUANT_GFX:
+        aiter.logger.warning("a8w4 fused sort_quant unsupported on %s; skip", get_gfx())
+        return
+    _log_summary(
+        "a8w4 sort_quant kernel",
+        [
+            test_a8w4_sort_quant_kernel(token, row_stride, routing)
+            for token, row_stride, routing in itertools.product(
+                (1, 7, 32), (_KIMI_A8W4_MODEL_DIM, 4096), ("valid", "mixed")
+            )
+        ],
+    )
+    cap = aiter.fused_moe._A8W4_SORT_QUANT_MAX_TOKENS
+    _log_summary(
+        "a8w4 fused sort_quant e2e",
+        [
+            test_a8w4_fused_sort_quant_e2e(token, inter_dim)
+            for inter_dim, token in itertools.product((384, 512), (1, cap, cap + 1))
+        ],
+    )
+    _kimi_a8w4_weights.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1721,6 +2088,7 @@ else:
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
+    run_a8w4_sort_quant_tests()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(

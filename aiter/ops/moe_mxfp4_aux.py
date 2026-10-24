@@ -84,6 +84,16 @@ def _mxfp4_moe_sort_internal_is_supported(
 
 
 @compile_ops("module_moe_mxfp4_aux", develop=True)
+def _mxfp4_moe_sort_quant_fp8_is_supported(
+    NE: int,
+    TOPK: int,
+    D_HIDDEN: int,
+    MB: int,
+) -> bool:
+    """Private probe for the MXFP8 (a8w4) sort_quant instance."""
+
+
+@compile_ops("module_moe_mxfp4_aux", develop=True)
 def mxfp4_moe_sort_quant(
     a_input: Tensor,
     topk_ids: Tensor,
