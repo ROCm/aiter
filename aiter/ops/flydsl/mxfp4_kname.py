@@ -173,6 +173,16 @@ def parse_flydsl_v2_gemm2_kernel(name):
     }
 
 
+def with_flydsl_v2_gemm2_epilog(name, epilog):
+    """``name`` with its epilogue replaced, or None if it is not a v2 GEMM2 name."""
+    if epilog not in ("atomic", "reduce", "scatter"):
+        raise ValueError(f"unknown FlyDSL v2 GEMM2 epilogue {epilog!r}")
+    m = _FLYDSL_V2_GEMM2_RE.match(name or "")
+    if not m:
+        return None
+    return name[: m.start("epilog")] + epilog + name[m.end("epilog") :]
+
+
 def parse_g2_kname_any(kname) -> dict:
     """Parse either gemm2 name family into the fields the stage2 dispatch needs.
 
