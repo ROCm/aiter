@@ -1,0 +1,2 @@
+min_splits,max_splits,knl_name,co_name
+2,8,_ZN5aiter42fmha_fwd_hd192x128_bf16_rtna_group_splitkvE,fwd_hd192x128_bf16_rtna_group_splitkv.co
