@@ -655,11 +655,12 @@ def _fmha_v4_fwd_sparse_fake(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del kv_block_indices, lut_start, lut_count
+    del kv_block_indices, lut_start, lut_count, lse
     del out
 
 
@@ -687,10 +688,11 @@ def _fmha_v4_fwd_sparse(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None: ...
 
 
-@torch.library.custom_op("aiter::mha_v4_fwd_sparse_launch", mutates_args=("out",))
+@torch.library.custom_op("aiter::mha_v4_fwd_sparse_launch", mutates_args=("out", "lse"))
 def _mha_v4_fwd_sparse_launch(
     q: Tensor,
     k: Tensor,
@@ -710,6 +712,7 @@ def _mha_v4_fwd_sparse_launch(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     _fmha_v4_fwd_sparse(
         q,
@@ -730,6 +733,7 @@ def _mha_v4_fwd_sparse_launch(
         kv_block_indices,
         lut_start,
         lut_count,
+        lse,
     )
 
 
@@ -753,11 +757,12 @@ def _mha_v4_fwd_sparse_launch_fake(
     kv_block_indices: Tensor,
     lut_start: Tensor,
     lut_count: Tensor,
+    lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del kv_block_indices, lut_start, lut_count
+    del kv_block_indices, lut_start, lut_count, lse
 
 
 # (q_format, v_format) rows whose code object implements the LSE epilogue. The kernels branch on
@@ -784,14 +789,8 @@ _LSE_CAPABLE_QV = frozenset(
 )
 
 
-def _check_lse_capable(
-    q_format: AttentionFormat, v_format: AttentionFormat, sparse: bool
-) -> None:
+def _check_lse_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
     """Reject LSE where the exported value has not been measured."""
-    if sparse:
-        raise NotImplementedError(
-            "MHA v4 does not produce LSE on the sorted-sparse path yet"
-        )
     arch = get_gfx()
     if arch != "gfx950":
         # The gfx942 objects do carry the epilogue, but they predate the frozen-max correction
@@ -883,11 +882,18 @@ def mha_v4_packed(
     Pass the ragged LUT triple to select the sorted-sparse row; omit all three
     tensors for dense. The work table is built inside the sparse custom op.
     With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
-    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
+    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max`` over the scores the
+    kernel actually computed, i.e. the QUANTIZED scores. Its error tracks the row max at
+    each format's score precision: about 0.001 nats for BF16 Q/K, but 36 (MXFP6) and 153
+    (MXFP4) against 1418 nats of range. That is harmless when merging ring-attention
+    chunks produced by the SAME recipe, where a chunk whose row max sits far above its
+    peers carries an exponentially larger merge weight. Do not use it as an absolute
+    quantity (entropy, perplexity) or to merge chunks across DIFFERENT recipes, where the
+    per-recipe biases stop cancelling.
     """
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
     if return_lse:
-        _check_lse_capable(q_format, v_format, lut is not None)
+        _check_lse_capable(q_format, v_format)
     _validate_pack_contract(v_format, v_pack)
     scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
     _validate_scale_recipe(q_format, k_format, v_format, scale_modes)
@@ -978,7 +984,7 @@ def mha_v4_packed(
                 "sorted-sparse MHA v4 requires key length padded to a "
                 f"multiple of {kv_tile}"
             )
-        _mha_v4_fwd_sparse_launch(*launch_args, *lut)
+        _mha_v4_fwd_sparse_launch(*launch_args, *lut, lse)
     if return_lse:
         return out, lse
     return out
@@ -1175,6 +1181,10 @@ def _restore_k_mean_in_lse(
     if lse is None or k_mean is None:
         return lse
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    # k_mean carries one row per KV head, and under GQA query head j reads KV head j // ratio.
+    heads_q, heads_k = q.shape[2], k_mean.shape[1]
+    if heads_q != heads_k:
+        k_mean = k_mean.repeat_interleave(heads_q // heads_k, dim=1)
     lse += torch.einsum("bshd,bhd->bhs", q, k_mean.to(q.dtype)).float() * scale
     return lse
 
@@ -1241,10 +1251,17 @@ def mha_v4(
     uses the GQA ratio. A row may select nothing: an all-False row is a no-op
     that writes a zero output tile.
     With ``return_lse`` the call returns ``(out, lse)``, where ``lse`` is FP32
-    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max``.
+    ``[batch, heads, Sq]`` holding ``ln(sum exp(s - max)) + max`` over the scores the
+    kernel actually computed, i.e. the QUANTIZED scores. Its error tracks the row max at
+    each format's score precision: about 0.001 nats for BF16 Q/K, but 36 (MXFP6) and 153
+    (MXFP4) against 1418 nats of range. That is harmless when merging ring-attention
+    chunks produced by the SAME recipe, where a chunk whose row max sits far above its
+    peers carries an exponentially larger merge weight. Do not use it as an absolute
+    quantity (entropy, perplexity) or to merge chunks across DIFFERENT recipes, where the
+    per-recipe biases stop cancelling.
     """
     if return_lse:
-        _check_lse_capable(q_format, v_format, block_mask is not None)
+        _check_lse_capable(q_format, v_format)
     # Checked here as well as in mha_v4_packed: the MXFP4 and MXFP6 recipes return through their
     # own launchers, which never forward seqlens_k.
     if seqlens_k is not None:
