@@ -1575,6 +1575,7 @@ def test_low_level_fhmoe_rejects_separated_mxfp8():
 @pytest.mark.parametrize(
     ("argument", "value"),
     (
+        ("ep_has_fake_route", True),
         ("stage2_scatter", object()),
         ("quant_type_a", aiter.QuantType.per_1x32),
         ("quant_dtype_a", dtypes.fp8),
@@ -1702,11 +1703,12 @@ def test_clamp_shared_preserves_existing_positional_argument_order():
     import aiter.fhmoe as fhmoe_module
 
     parameters = list(inspect.signature(fused_moe).parameters)
-    assert parameters[-4:] == [
+    assert parameters[-5:] == [
         "quant_type_a",
         "quant_dtype_a",
         "quant_dtype_a2",
         "clamp_shared",
+        "ep_has_fake_route",
     ]
     assert list(inspect.signature(fhmoe_module.fhmoe_fake).parameters)[-2:] == [
         "output",

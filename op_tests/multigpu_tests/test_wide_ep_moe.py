@@ -483,6 +483,7 @@ class TestWideEpMoe:
             context.weights,
             context.expert_ids,
             expert_mask=self.expert_mask,
+            ep_has_fake_route=True,
             activation=self.activation,
             gate_mode=self.gate_mode.value,
             quant_type=QuantType.per_1x32,
@@ -844,6 +845,7 @@ def _a8w4_stage1_reference_dtype(
         getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False),
         gate_mode,
         is_ep=True,
+        ep_has_fake_route=True,
         has_stage2_bias=False,
         opus_weights_shuffled=(
             getattr(w1, "is_shuffled", False) and getattr(w2, "is_shuffled", False)
