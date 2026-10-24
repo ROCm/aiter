@@ -280,6 +280,10 @@ class MqaLogitsTuner(TunerCommon):
         if not self.failed.empty:
             print(self.failed.to_string(index=False), flush=True)
             sys.exit(1)
+        # run() catches errors and interrupts and reports them here; without a
+        # failed row they would otherwise exit 0 and op_tune.sh would pass.
+        if status != "Finished":
+            sys.exit(1)
 
     def result_to_df(self, results):
         return pd.DataFrame(results, columns=self.columns)
