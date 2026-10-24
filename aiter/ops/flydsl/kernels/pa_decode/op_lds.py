@@ -74,7 +74,8 @@ class PaDecodeLds:
 
 
 class PaDecodeQueryLoader:
-    """Load Q early and stage native BF16 or normalized FP8 MFMA operands."""
+    """Load Q early and stage MFMA operands: native BF16, FP8 quantized in-kernel
+    from f16/bf16, or externally quantized FP8 query that bypasses quantization."""
 
     def __init__(self, ctx, lds, gemm):
         self.ctx = ctx
@@ -88,11 +89,17 @@ class PaDecodeQueryLoader:
             if self.traits.QLOAD_UNIT == 8
             else fx.rocdl.BufferCopy64b()
         )
-        self.q_buf = ptr_buf_tensor(self.ctx.query_ptr, self.traits.Q_DTYPE)
+        if self.traits.FP8_QUERY:
+            _q_copy_op = (
+                fx.rocdl.BufferCopy64b()
+                if self.traits.QLOAD_UNIT == 8
+                else fx.rocdl.BufferCopy32b()
+            )
+        self.q_buf = ptr_buf_tensor(self.ctx.query_ptr, self.traits.Q_INPUT_DTYPE)
         self.q_tiled = fx.logical_divide(self.q_buf, fx.make_layout(1, 1))
-        self.q_copy_atom = fx.make_copy_atom(_q_copy_op, self.traits.Q_DTYPE)
+        self.q_copy_atom = fx.make_copy_atom(_q_copy_op, self.traits.Q_INPUT_DTYPE)
         self.q_reg = fx.make_rmem_tensor(
-            fx.make_layout(self.traits.QLOAD_UNIT, 1), self.traits.Q_DTYPE
+            fx.make_layout(self.traits.QLOAD_UNIT, 1), self.traits.Q_INPUT_DTYPE
         )
 
     def load_chunk(self, elem_idx):
@@ -101,14 +108,12 @@ class PaDecodeQueryLoader:
 
     def load_row(self, qi, gs_head):
         qh0 = self.ctx.kv_h * self.traits.query_group_size + gs_head
-        row_byte0 = (
+        base_elem = (
             (self.ctx.seq * self.traits.query_length + self.ctx.query_begin + qi)
             * self.ctx.stride_q_row
             + qh0 * self.ctx.stride_q_head
-        ) * 2  # 16-bit float = 2B/elem
-        base_elem = (
-            row_byte0 + self.ctx.lane16 * (self.traits.QCHUNK * 2)
-        ) // 2  # byte offset -> element index
+            + self.ctx.lane16 * self.traits.QCHUNK
+        )
         return [
             self.load_chunk(base_elem + u * self.traits.QLOAD_UNIT)
             for u in range_constexpr(self.traits.N_QLOADS)
@@ -175,6 +180,15 @@ class PaDecodeQueryLoader:
                     + u * self.traits.QLOAD_UNIT
                 )
                 self.lds.store(q_row_off + elem_off * 2, fx.BFloat16, q_units[u])
+        elif const_expr(self.traits.FP8_QUERY):
+            for u in range_constexpr(self.traits.N_QLOADS):
+                self.lds.store_words(
+                    q_row_off
+                    + self.ctx.qh_local * self.traits.head_dim
+                    + self.ctx.lane16 * self.traits.QCHUNK
+                    + u * self.traits.QLOAD_UNIT,
+                    q_units[u].bitcast(fx.Int32),
+                )
         else:
             self.quantize_row(m, q_row_off, q_units)
 
@@ -215,12 +229,14 @@ class PaDecodeQueryLoader:
                         + self.ctx.lane16 * self.traits.QCHUNK,
                         fx.full(self.traits.QCHUNK // 4, 0, fx.Int32),
                     )
-                    if self.ctx.lane16 == 0:
-                        self.lds.store_scalar(
-                            self.traits.sQscale_off,
-                            self.ctx.qh_local * self.traits.M_TILES + m,
-                            self.ctx.ZERO_F,
-                        )
+                    # const_expr gate must stay separate from the runtime lane test.
+                    if const_expr(not self.traits.FP8_QUERY):  # noqa: SIM102
+                        if self.ctx.lane16 == 0:
+                            self.lds.store_scalar(
+                                self.traits.sQscale_off,
+                                self.ctx.qh_local * self.traits.M_TILES + m,
+                                self.ctx.ZERO_F,
+                            )
 
     def load_operands(self):
         # Match the head-dim permutation of PaDecodeKVLoader.load_k_chunk.
@@ -638,7 +654,50 @@ class PaDecodeKVLoader:
         )
         return self.load_k_from_pages(phys_vec), phys_vec
 
-    def load_v(self, phys_row, vh):
+    @flyc.jit
+    def load_v(self, phys_row, vh, tt):
+        words = fx.Vector.from_elements(self._load_v(phys_row, vh), fx.Int64)
+        if tt * self.traits.TILE_TOK + self.traits.TILE_TOK > self.ctx.context_len:
+            loader = self
+            words = loader.mask_v_tail(words, tt)
+        return [words[i] for i in range_constexpr(self.traits.NVOPS)]
+
+    def mask_v_tail(self, words, tt):
+        elems_per_word = 2 if const_expr(self.traits.is_bf16_kv) else 4
+        bits_per_elem = 32 // elems_per_word
+        # Lane zero supplies zero through a branch-local subgroup operation;
+        # keeping the bound dependent on it prevents full-tile mask setup.
+        lane_zero = fx.Int32(
+            fx.gpu.shuffle_idx(self.ctx.lane, fx.Int32(0), fx.Int32(64))
+        )
+        valid = (
+            self.ctx.context_len
+            - tt * self.traits.TILE_TOK
+            - lane_zero
+            - self.ctx.rgroup * self.traits.TOK_PER_WARP
+        )
+        dwords = words.bitcast(fx.Int32)
+        masked = []
+        for sub in range_constexpr(self.traits.PAGES_PER_CHUNK):
+            for step in range_constexpr(self.traits.STEPS_PER_CHUNK):
+                group = sub * self.traits.STEPS_PER_CHUNK + step
+                token = (
+                    sub * self.traits.block_size + step * self.traits.KV_VECTOR_WIDTH
+                )
+                for word in range_constexpr(4):
+                    count = valid - (token + word * elems_per_word)
+                    value = dwords[group * 4 + word]
+                    # Select payload pieces, not a mask vector live across V loads.
+                    for n in range_constexpr(elems_per_word - 1, 0, -1):
+                        value = (count <= n).select(
+                            value & fx.Int32((1 << (n * bits_per_elem)) - 1),
+                            value,
+                        )
+                    masked.append((count > 0).select(value, fx.Int32(0)))
+        # Preserve every valid payload bit, including NaNs.
+        return fx.Vector.from_elements(masked, fx.Int32).bitcast(fx.Int64)
+
+    def _load_v(self, phys_row, vh):
         head_group = ((vh * self.traits.VHE_SIZE) // 16) + self.ctx.warp
         head_element = head_group * 16 + self.ctx.lane16
         ops = []

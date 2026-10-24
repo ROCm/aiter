@@ -49,7 +49,10 @@ def _cache_geometry(key_cache):
 class _PADecodeAutotuneResources:
     """Prepare candidate plans and graphs outside FlyDSL's timed replay."""
 
-    def __init__(self, query, args, options, max_partitions, max_batch_size=None):
+    def __init__(
+        self, query, args, options, max_partitions, *, output_dtype, max_batch_size=None
+    ):
+        self.output_dtype = output_dtype
         self.query = query
         self.args = args
         self.options = options
@@ -94,7 +97,10 @@ class _PADecodeAutotuneResources:
         rows = query_length * self.query.shape[1] // num_kv_heads
         scalar_shape = (num_kv_heads, plan.capacity, rows)
         output = torch.full_like(
-            self.query, float("nan"), memory_format=torch.contiguous_format
+            self.query,
+            float("nan"),
+            dtype=self.output_dtype,
+            memory_format=torch.contiguous_format,
         )
         workspace = {
             "exp_sums": torch.empty(
@@ -193,6 +199,7 @@ def _validate_pa_decode_config(arguments):
         "block_size",
         "query_length",
         "query_dtype",
+        "output_dtype",
         "kv_dtype",
         "per_token_kv",
         "trans_v",
@@ -213,6 +220,7 @@ def _pa_decode_autotuner(
     block_size,
     query_length,
     query_dtype,
+    output_dtype,
     kv_dtype,
     per_token_kv,
     trans_v,
@@ -254,6 +262,8 @@ def prepare_pa_decode_plan(
     query_length: int,
     *,
     compute_type: torch.dtype | None = None,
+    query_scale: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
     key_scale: torch.Tensor | float | None = None,
     value_scale: torch.Tensor | float | None = None,
     sinks: torch.Tensor | None = None,
@@ -290,6 +300,9 @@ def prepare_pa_decode_plan(
     plan_pa_decode(..., plan=plan) when context lengths change; decode never
     invokes autotune. Workspace sizes follow the returned plan.capacity.
     """
+    output_dtype = query.dtype if output_dtype is None else output_dtype
+    if output_dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("FP8 query tuning requires BF16/FP16 output_dtype")
     with torch.cuda.device(query.device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("prepare_pa_decode_plan must run before graph capture")
@@ -308,6 +321,7 @@ def prepare_pa_decode_plan(
         )
         options = {
             "compute_type": compute_type,
+            "query_scale": query_scale,
             "key_scale": key_scale,
             "value_scale": value_scale,
             "sinks": sinks,
@@ -326,7 +340,8 @@ def prepare_pa_decode_plan(
             ),
             options,
             limit,
-            default_plan.max_batch_size,
+            output_dtype=output_dtype,
+            max_batch_size=default_plan.max_batch_size,
         )
 
         arch = get_gfx_runtime()
@@ -340,6 +355,7 @@ def prepare_pa_decode_plan(
             "block_size": block_size,
             "query_length": query_length,
             "query_dtype": str(query.dtype),
+            "output_dtype": str(output_dtype),
             "kv_dtype": str(key_cache.dtype),
             "per_token_kv": (
                 isinstance(key_scale, torch.Tensor) and key_scale.numel() > 1

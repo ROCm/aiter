@@ -8,7 +8,7 @@ are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
 and the head-256 page-16/64 pipe use K128 MFMA instead of K32, preserving normalized
 Q/P and operand layouts.
-Every FP8-path Q row uses absmax normalization; per-tensor and per-token K/V scales
+Externally quantized FP8 Q bypasses Q normalization; 16-bit Q uses absmax normalization; per-tensor and per-token K/V scales
 retain range normalization for P.
 BF16 K/V use vector-8 caches and native BF16 Q/K/P/V MFMA operands, with
 f32 softmax state and accumulation. BF16 KV does not use quantization scales.
@@ -24,7 +24,7 @@ with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 
 Logical layouts (not preshuffled):
 
-* ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
+* ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16/fp8
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
 * ``value_cache``  [num_blocks, num_kv_heads, block_size//x, head_dim, x] (trans_v)
                    or [num_blocks, num_kv_heads, head_dim, block_size] (FP8 plain)
@@ -33,7 +33,7 @@ Logical layouts (not preshuffled):
 * ``work_info``    [capacity, 4]  int32 sequence/tile bounds/context length
 * ``pmax``, ``psum`` [num_kv_heads, capacity, query_length * query_group_size] f32
 * ``pout``         [num_kv_heads, capacity, query_length * query_group_size, head_dim]
-                   same dtype as query; normalized partition output
+                   same dtype as output; normalized partition output
 * K/V scales      [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
 
 Four-wave CTAs process 256-token blocks: QK splits tokens, PV splits head dim,
@@ -47,7 +47,6 @@ this module keeps the compilation API and launch wrappers.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -104,6 +103,7 @@ def compile_pa_decode_tile(
     query_splits: int | None = None,
     max_context_length: int | None = None,
     sliding_window: int = 0,
+    output_dtype: str | None = None,
     direct_output: bool = False,
     trans_k: bool = True,
 ):
@@ -193,6 +193,7 @@ def compile_pa_decode_tile(
         num_partitions=num_partitions,
         softmax_scale=softmax_scale,
         query_dtype=query_dtype,
+        output_dtype=output_dtype,
         kv_dtype=kv_dtype,
         per_token_kv=per_token_kv,
         query_length=query_length,
@@ -240,6 +241,7 @@ def compile_pa_decode_tile(
         planned_start: fx.Int32,
         planned_end: fx.Int32,
         planned_context: fx.Int32,
+        query_scale_ptr: fx.Pointer,
     ):
         _ = _pa_decode_cache_tag
         ctx = PaDecodeContext(
@@ -264,6 +266,7 @@ def compile_pa_decode_tile(
             planned_start,
             planned_end,
             planned_context,
+            query_scale_ptr,
         )
         PaDecodePipeline(ctx).run()
 
@@ -285,6 +288,7 @@ def compile_pa_decode_tile(
         stride_q_head: fx.Int32,
         work_info_ptr: fx.Pointer,
         num_sequences: fx.Int32,
+        query_scale_ptr: fx.Pointer,
     ):
         def _run_task(seq, start, end, context):
             _pa_decode_tile_task(
@@ -307,6 +311,7 @@ def compile_pa_decode_tile(
                 start,
                 end,
                 context,
+                query_scale_ptr,
             )
 
         # Skip cleared padding records: no scratch writes or Q loads.
@@ -348,45 +353,50 @@ def compile_pa_decode_tile(
         stride_q_head: fx.Int32,
         work_info: fx.Pointer,
         work_capacity: fx.Int32,
+        query_scale: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _ = _pa_decode_cache_tag
-        # Ambient contract permits FMAs; explicit per-op fastmath still wins.
-        with CompilationContext.compile_hints({"fastmath": "contract"}):
-            pa_decode_tile_kernel(
-                pmax,
-                psum,
-                pout,
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                key_scale,
-                value_scale,
-                max_blocks_per_seq,
-                stride_ks_block,
-                stride_ks_head,
-                stride_q_row,
-                stride_q_head,
-                work_info,
-                num_seqs,
-            ).launch(
-                grid=(
-                    (
-                        num_seqs,
-                        num_kv_heads * traits.query_splits,
-                        work_capacity // num_seqs,
-                    )
-                    if traits.batch_first_plan_grid
-                    else (
-                        work_capacity,
-                        num_kv_heads * traits.query_splits,
-                        1,
-                    )
-                ),
-                block=(traits.BLOCK_THREADS, 1, 1),
-                stream=stream,
-            )
+        pa_decode_tile_kernel(
+            pmax,
+            psum,
+            pout,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            key_scale,
+            value_scale,
+            max_blocks_per_seq,
+            stride_ks_block,
+            stride_ks_head,
+            stride_q_row,
+            stride_q_head,
+            work_info,
+            num_seqs,
+            query_scale,
+        ).launch(
+            grid=(
+                (
+                    num_seqs,
+                    num_kv_heads * traits.query_splits,
+                    work_capacity // num_seqs,
+                )
+                if traits.batch_first_plan_grid
+                else (
+                    work_capacity,
+                    num_kv_heads * traits.query_splits,
+                    1,
+                )
+            ),
+            block=(traits.BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    # Ambient contract permits FMAs; explicit per-op fastmath still wins. Hints
+    # ride the launcher (public JitFunction attribute) instead of a
+    # CompilationContext scope inside the traced body.
+    pa_decode_tile_launch.compile_hints = {"fastmath": "contract"}
 
     compiled = {
         "launch": pa_decode_tile_launch,
