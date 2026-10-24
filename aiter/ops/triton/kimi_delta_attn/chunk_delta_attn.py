@@ -23,9 +23,10 @@ Notes on the fla-compatible surface:
       kernel reads it. Since this path is forward-only and returns no scratch,
       honouring ``True`` would allocate and write a ``T x HV x K`` tensor that
       nothing can observe, so the flag is pinned off internally.
-    * ``allow_neg_eigval`` / ``return_intermediate_states`` / ``cp_context`` /
-      ``cu_seqlens_cpu`` have no counterpart yet and are rejected rather than
-      silently ignored.
+    * ``allow_neg_eigval`` / ``return_intermediate_states`` / ``cp_context``
+      have no counterpart yet and are rejected rather than silently ignored.
+    * ``cu_seqlens_cpu`` is used for every host-side read of the sequence
+      bounds, not only for the chunk indices as in fla.
     * Tensor arguments are made contiguous here, as fla's ``@input_guard``
       does, because some kernels below assume contiguous strides.
     * This path is forward-only, so the output carries no ``grad_fn`` even
@@ -65,6 +66,7 @@ def chunk_kimi_delta_attn(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -161,6 +163,13 @@ def chunk_kimi_delta_attn(
         has_initial_state (torch.Tensor, optional):
             Bool `[N]`. False starts that sequence from zero. Required with
             `state_cache`.
+        cu_seqlens_cpu (torch.LongTensor, optional):
+            `cu_seqlens` on the CPU, for a caller that already holds it there.
+            Without it, the first call per `cu_seqlens` tensor reads the bounds
+            back to the host, which waits for all work queued before it. With
+            it, `cu_seqlens` is not read back and the chunk metadata is uploaded
+            without a sync. Trusted to hold the same values as `cu_seqlens`;
+            checking would need the read it avoids. Default: `None`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -219,6 +228,18 @@ def chunk_kimi_delta_attn(
                 "The number of initial states is expected to be equal to the number "
                 f"of input sequences, i.e., {len(cu_seqlens) - 1} rather than "
                 f"{initial_state.shape[0]}."
+            )
+    if cu_seqlens_cpu is not None:
+        if cu_seqlens is None:
+            raise ValueError("`cu_seqlens_cpu` is given without `cu_seqlens`.")
+        if (
+            cu_seqlens_cpu.device.type != "cpu"
+            or cu_seqlens_cpu.shape != cu_seqlens.shape
+        ):
+            raise ValueError(
+                "`cu_seqlens_cpu` must be a CPU tensor shaped like `cu_seqlens` "
+                f"{tuple(cu_seqlens.shape)}, got {cu_seqlens_cpu.device} "
+                f"{tuple(cu_seqlens_cpu.shape)}."
             )
     if initial_state is not None and not initial_state.is_floating_point():
         raise ValueError(
@@ -302,5 +323,6 @@ def chunk_kimi_delta_attn(
         state_cache=state_cache,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
     return o.to(q.dtype), final_state

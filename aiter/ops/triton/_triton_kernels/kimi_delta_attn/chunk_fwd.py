@@ -72,6 +72,7 @@ def chunk_delta_attn_fwd(
     state_cache: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -110,6 +111,8 @@ def chunk_delta_attn_fwd(
         out:                Optional contiguous output buffer, same shape as
                             ``v``. FlashKDA-only, like ``state_cache``.
         state_cache:        Optional paged fp32 V-first cache. FlashKDA-only.
+        cu_seqlens_cpu:     Optional host copy of ``cu_seqlens``. When given,
+                            ``cu_seqlens`` is not read back to the host.
 
     Returns:
         (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg)
@@ -155,9 +158,6 @@ def chunk_delta_attn_fwd(
             f"`chunk_size` must be either 32 or 64 for chunk_delta_attn, got {chunk_size}."
         )
 
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-
     if state_cache is not None and not use_flash_kda:
         raise ValueError(
             "paged state_cache is only implemented on the FlashKDA path; "
@@ -189,8 +189,12 @@ def chunk_delta_attn_fwd(
             state_cache=state_cache,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
         return o, final_state, None, None, None, None, None, None, None
+
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu)
 
     # ------------------------------------------------------------------
     # Step 0 — Optional QK L2 normalization (matches FLA API)

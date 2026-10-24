@@ -28,6 +28,9 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     flash_kda_fwd,
     flash_kda_supported,
 )
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
+    prepare_chunk_indices,
+)
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 
@@ -1026,3 +1029,68 @@ def test_paged_cache_rejected_on_default_pipeline():
                 has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
             )
         )
+
+
+def _cu_seqlens_pair(lens):
+    """``cu_seqlens`` on the device and the same values on the host."""
+    host = torch.tensor([0, *lens], dtype=torch.int32).cumsum(0).int()
+    return host.to(device), host
+
+
+def test_cu_seqlens_cpu_issues_no_sync():
+    """With host bounds nothing synchronizes, cache miss included, and the
+    result equals the device-bounds call's.
+
+    The same call with only device bounds must trip the check, or the check
+    proves nothing.
+    """
+    lens, H = [100, 0, 257, 33], 4
+    args = make_inputs(1, sum(lens), H)
+    h0 = torch.randn(len(lens), H, K_DIM, K_DIM, device=device) * 0.1
+
+    def fresh(with_host):
+        # New tensors each time, so no identity cache can answer.
+        cu_seqlens, cu_seqlens_cpu = _cu_seqlens_pair(lens)
+        cache, indices, _ = _paged_pool(len(lens), H, h0)
+        extra = {"cu_seqlens_cpu": cu_seqlens_cpu} if with_host else {}
+        return _kimi_kwargs(
+            *args,
+            cu_seqlens=cu_seqlens,
+            out=torch.full_like(args[2], float("nan")),
+            state_cache=cache,
+            state_indices=indices,
+            # Alternating, so both the load and the zero start are in the result.
+            has_initial_state=torch.arange(len(lens), device=device) % 2 == 0,
+            **extra,
+        )
+
+    chunk_kimi_delta_attn(**fresh(True))  # compile, autotune, pinned pool
+    host_kw, dev_kw = fresh(True), fresh(False)
+    torch.cuda.synchronize()
+    saved = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _flash_kda._build_metadata.cache_clear()  # take the upload path
+        chunk_kimi_delta_attn(**host_kw)
+        _flash_kda._build_metadata.cache_clear()
+        with pytest.raises(RuntimeError, match="synchronizing CUDA operation"):
+            chunk_kimi_delta_attn(**dev_kw)
+    finally:
+        torch.cuda.set_sync_debug_mode(saved)
+    # The read-back raised before any kernel ran, so dev_kw is still fresh.
+    _flash_kda._build_metadata.cache_clear()
+    chunk_kimi_delta_attn(**dev_kw)
+    assert torch.equal(host_kw["out"], dev_kw["out"])
+    assert torch.equal(host_kw["state_cache"], dev_kw["state_cache"])
+
+
+def test_prepare_chunk_indices_numbers_empty_sequences():
+    """A chunk's sequence id indexes cu_seqlens, so an empty sequence still counts."""
+    lens, chunk_size = [0, 100, 0, 0, 257, 33], 64
+    counts = torch.tensor([-(-n // chunk_size) for n in lens])
+    seq = torch.repeat_interleave(torch.arange(len(lens)), counts)
+    chunk = torch.arange(seq.numel()) - (torch.cumsum(counts, 0) - counts)[seq]
+    cu_seqlens, _ = _cu_seqlens_pair(lens)
+    got = prepare_chunk_indices(cu_seqlens, chunk_size)
+    assert got.dtype == cu_seqlens.dtype and got.device == cu_seqlens.device
+    assert torch.equal(got.cpu(), torch.stack([seq, chunk], 1).int())
