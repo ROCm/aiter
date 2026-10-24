@@ -27,6 +27,7 @@ from csrc.opus_gemm.opus_gemm_common import (
 )
 
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
+from ...jit.utils.chip_info import get_cu_num
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..gemm_op_common import get_padded_m, with_mxscale_w_scale_block
 from ._arch import GFX942, GFX950, GFX1250
@@ -632,6 +633,14 @@ def _load_mxscale_bmm_tuned(
         raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
     df = with_mxscale_w_scale_block(df, path)
 
+    # A missing, blank or non-positive cu_num leaves a row unbound: keyed on gfx
+    # alone, so it matches any CU count of its arch. jit/core.py
+    # update_config_files fills cu_num with 0 for per-model CSVs without it.
+    if "cu_num" not in df.columns:
+        df["cu_num"] = 0
+    cu_num = pd.to_numeric(df["cu_num"], errors="coerce").fillna(0).astype(int)
+    df["cu_num"] = cu_num.clip(lower=0)
+
     if libtype is not None and "libtype" in df.columns:
         df = df[df["libtype"] == libtype].copy()
 
@@ -694,12 +703,25 @@ def _load_mxscale_bmm_tuned(
     # could hand a 128 kid a scale buffer with sixteen times the entries -- not
     # a shape error downstream, just the wrong stride, so a plausible wrong
     # answer at full speed.
-    shape_keys = ["gfx", "b", "m", "n", "k", "w_scale_block"]
+    shape_keys = ["gfx", "cu_num", "b", "m", "n", "k", "w_scale_block"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
     if duplicate_shapes.any():
         rows = df.loc[duplicate_shapes, shape_keys].drop_duplicates().to_dict("records")
         raise RuntimeError(f"duplicate shapes across MXFP8 BMM tuned CSV files: {rows}")
-    return df.set_index(shape_keys).to_dict("index")
+
+    unbound = df["cu_num"] == 0
+    if unbound.any():
+        logger.info(
+            "MXFP8 BMM tuned CSV %r has %d row(s) without a cu_num; they match "
+            "any CU count of their arch. Re-run the tuner to bind them to the "
+            "device they were measured on.",
+            path,
+            int(unbound.sum()),
+        )
+    unbound_keys = [key for key in shape_keys if key != "cu_num"]
+    tuned = df[unbound].drop(columns="cu_num").set_index(unbound_keys).to_dict("index")
+    tuned.update(df[~unbound].set_index(shape_keys).to_dict("index"))
+    return tuned
 
 
 @lru_cache(maxsize=1024)
@@ -723,11 +745,14 @@ def lookup_mxscale_bmm_config(
     tuned for one block is meaningless for the other.
     """
     gfx = get_gfx()
+    cu_num = get_cu_num()
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
-        row = tuned.get((gfx, b, padded_m, n, k, w_scale_block))
+        row = tuned.get((gfx, cu_num, b, padded_m, n, k, w_scale_block))
+        if row is None:
+            row = tuned.get((gfx, b, padded_m, n, k, w_scale_block))
         if row is not None:
             break
 
@@ -746,11 +771,12 @@ def lookup_mxscale_bmm_config(
             key: value for key, value in row.items() if key not in _TUNED_PERF_COLUMNS
         }
         logger.info(
-            "shape B:%s M:%s N:%s K:%s uses padded_M:%s MXFP8 config %s",
+            "shape B:%s M:%s N:%s K:%s cu_num:%s uses padded_M:%s MXFP8 config %s",
             b,
             m,
             n,
             k,
+            cu_num,
             padded_m,
             cfg,
         )
