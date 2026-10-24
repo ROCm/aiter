@@ -84,7 +84,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     if(lane_idx == 0)
     {
         p_lds_shift[0]     = 0;
-        p_lds_kv_seqlen[0] = 0;
+        p_lds_kv_seqlen[0] = params.p_seqlens_kv_indptr[0];
         for(int32_t bid = 1; bid < params.num_batches; bid++)
         {
             p_lds_shift[bid] = p_lds_shift[bid - 1] + p_lds_split[bid - 1];
@@ -129,7 +129,8 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
             work_info.kv_end =
                 opus::min(work_info.kv_start + payload * params.kv_granularity, kv_end);
             work_info.kv_offset = kv_end - work_info.kv_end;
-            if(work_info.kv_offset <= 4 && split_local > 1)
+            // Covers a tail folded into the only remaining split as well.
+            if(work_info.kv_offset <= 4)
             {
                 work_info.kv_end    = kv_end;
                 work_info.kv_offset = 0;

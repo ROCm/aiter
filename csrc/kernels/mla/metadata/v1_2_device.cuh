@@ -430,7 +430,13 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
                 work_info.kv_end          = frag_kv_end;
                 work_info.kv_offset       = kv_end - frag_kv_end;
                 work_info.partial_qo_loc  = partial_qo_loc;
-                p_work_info_set[work_idx] = work_info;
+                // Stored ranges index kv_indices globally; the math above is relative.
+                const int32_t kv_global_base =
+                    Traits::kIsSparse ? 0 : params.p_seqlens_kv_indptr[0];
+                MlaWorkInfo stored_info = work_info;
+                stored_info.kv_start += kv_global_base;
+                stored_info.kv_end += kv_global_base;
+                p_work_info_set[work_idx] = stored_info;
 
                 if(is_split)
                 {
@@ -545,10 +551,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t curr_sub_head_idx = 0;
 
     int32_t curr_kv_begin = 0;
-    // The size of 1st element equals to the end loc of the 1st element.
-    int32_t curr_kv_end    = Traits::kLdsBatchInfo ? p_lds_seqlens_kv[0]
-                             : Traits::kIsSparse   ? min(params.p_seqlens_kv_indptr[1], params.topk)
-                                                   : params.p_seqlens_kv_indptr[1];
+    // Ranges are relative to kv_indptr[0]; the first batch spans indptr[0]..indptr[1].
+    const int32_t first_kv_len = params.p_seqlens_kv_indptr[1] - params.p_seqlens_kv_indptr[0];
+    int32_t curr_kv_end        = Traits::kLdsBatchInfo ? p_lds_seqlens_kv[0]
+                                 : Traits::kIsSparse   ? min(first_kv_len, params.topk)
+                                                       : first_kv_len;
     int32_t curr_kv_seqlen = curr_kv_end - curr_kv_begin;
 
     int32_t num_works          = 0;
@@ -652,7 +659,19 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                         params.p_reduce_indptr[global_qo_tile_idx + 1] = last_reduce_indptr;
                     }
 
-                    p_work_info_set[num_works] = work_info;
+                    // Stored ranges index kv_indices globally; the math above is relative.
+
+                    const int32_t kv_global_base =
+
+                        Traits::kIsSparse ? 0 : params.p_seqlens_kv_indptr[0];
+
+                    MlaWorkInfo stored_info = work_info;
+
+                    stored_info.kv_start += kv_global_base;
+
+                    stored_info.kv_end += kv_global_base;
+
+                    p_work_info_set[num_works] = stored_info;
                 };
 
                 // record a work in work_info_set
@@ -788,7 +807,13 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                         work_info.partial_qo_loc = partial_idx;
                         if(!cur_tail_done)
                         {
-                            p_work_info_set[num_works] = work_info;
+                            // Stored ranges index kv_indices globally; the math above is relative.
+                            const int32_t kv_global_base =
+                                Traits::kIsSparse ? 0 : params.p_seqlens_kv_indptr[0];
+                            MlaWorkInfo stored_info = work_info;
+                            stored_info.kv_start += kv_global_base;
+                            stored_info.kv_end += kv_global_base;
+                            p_work_info_set[num_works] = stored_info;
                         }
                     };
 
@@ -1153,7 +1178,19 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                 params.p_reduce_indptr[gti + 1] = r0;
             }
 
-            p_work_info_set[work_idx] = work_info;
+            // Stored ranges index kv_indices globally; the math above is relative.
+
+            const int32_t kv_global_base =
+
+                Traits::kIsSparse ? 0 : params.p_seqlens_kv_indptr[0];
+
+            MlaWorkInfo stored_info = work_info;
+
+            stored_info.kv_start += kv_global_base;
+
+            stored_info.kv_end += kv_global_base;
+
+            p_work_info_set[work_idx] = stored_info;
         }
     }
 }
