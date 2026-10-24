@@ -1,5 +1,4 @@
 {
-  "_comment": "SonicMoE grouped GEMM kernels on gfx1151, BF16. Copy of gfx1150 (same RDNA 3.5 generation), not measured on gfx1151.",
   "_grouped_gemm_kernel": {
     "_bounds": {
       "small": [256, 256, 8],
