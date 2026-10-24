@@ -16,7 +16,9 @@ Example::
 
 from __future__ import annotations
 
+import functools
 import importlib.util
+import itertools
 import statistics
 import sys
 import time
@@ -32,7 +34,11 @@ from aiter.ops.prefill_batch_metadata import (
 from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    generate_rotating_buffers_pool,
 )
 
 CHUNK_SIZE = 64
@@ -129,8 +135,14 @@ def _stage_of(kernel_name: str) -> str:
     return "other"
 
 
-def _build_inputs(case, seed, with_state_pool=False):
-    torch.manual_seed(seed)
+def _generate_case_pool_entry(case, with_state_pool):
+    """Build one full q/k/v/g/beta + state set.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random tensors (no internal reseed), so replaying through the
+    pool during timing defeats cache residency the same way a repeat-and-
+    average loop would.
+    """
     device = torch.device("cuda")
     context_lens = case.resolve_context_lens()
     total_tokens = sum(context_lens)
@@ -204,43 +216,64 @@ def _build_inputs(case, seed, with_state_pool=False):
         else None
     )
 
-    return {
-        "q": q,
-        "k": k,
-        "v": v,
-        "g": g,
-        "beta": beta,
-        "initial_state": initial_state,
-        "state_pool": state_pool,
-        "state_indices": state_indices,
-        "cu_seqlens": cu_seqlens,
-        "metadata": metadata,
-        "total_tokens": total_tokens,
-        "num_seqs": num_states,
-    }
+    return (
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        state_pool,
+        state_indices,
+        cu_seqlens,
+        metadata,
+        total_tokens,
+        num_states,
+    )
+
+
+_TENSORS_POOL_FIELDS = [
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "initial_state",
+    "state_pool",
+    "state_indices",
+    "cu_seqlens",
+    "metadata",
+    "total_tokens",
+    "num_seqs",
+]
 
 
 def _make_callable(
-    tensors,
+    tensors_pool,
     case,
     backend,
     snapshot_dtype,
-    prefill_metadata,
-    state_indices=None,
     *,
+    use_state_pool=False,
     cold_indices_check=False,
 ):
-    initial_state = (
-        tensors["state_pool"] if state_indices is not None else tensors["initial_state"]
-    )
-    pool_size = initial_state.shape[0] if state_indices is not None else 0
+    pool_len = len(tensors_pool)
+    counter = itertools.count()
 
     def run():
-        if cold_indices_check and state_indices is not None:
-            new_slots = torch.randperm(pool_size, device=state_indices.device)[
-                : state_indices.numel()
-            ]
-            state_indices.copy_(new_slots.to(dtype=state_indices.dtype))
+        tensors = tensors_pool[next(counter) % pool_len]
+        if use_state_pool:
+            initial_state = tensors["state_pool"]
+            state_indices = tensors["state_indices"]
+            if cold_indices_check:
+                pool_size = initial_state.shape[0]
+                new_slots = torch.randperm(pool_size, device=state_indices.device)[
+                    : state_indices.numel()
+                ]
+                state_indices.copy_(new_slots.to(dtype=state_indices.dtype))
+        else:
+            initial_state = tensors["initial_state"]
+            state_indices = None
         return chunk_gated_delta_rule_opt_vk(
             q=tensors["q"],
             k=tensors["k"],
@@ -255,7 +288,7 @@ def _make_callable(
             use_chunk_hip=backend == "hip",
             state_dtype=case.ssm_state_dtype,
             snapshot_dtype=snapshot_dtype,
-            prefill_metadata=prefill_metadata,
+            prefill_metadata=tensors["metadata"],
         )
 
     return run
@@ -393,27 +426,32 @@ def _run_case(case_id, case, args):
         return []
 
     with_pool = args.with_state_pool and case.output_final_state
-    tensors = _build_inputs(case, args.seed, with_state_pool=with_pool)
-    state_variants = [("", None)]
+
+    torch.manual_seed(args.seed)
+    pool_gen = functools.partial(_generate_case_pool_entry, case, with_pool)
+    tensors_pool = generate_rotating_buffers_pool(
+        [pool_gen], [_TENSORS_POOL_FIELDS], **get_rot_bufs_kwargs(args)
+    )
+
+    state_variants = [("", False, False)]
     if with_pool:
-        state_variants.append(("pool", tensors["state_indices"]))
+        state_variants.append(("pool", True, False))
         if args.with_state_pool_cold_check:
-            state_variants.append(("pool-cold", tensors["state_indices"]))
+            state_variants.append(("pool-cold", True, True))
 
     records = []
     labels, rows, per_kernel_rows = [], {}, {}
     for backend in args.backends:
         snapshot_dtype = case.snapshot_dtype or case.dtype
         snapshot_name = "fp32" if snapshot_dtype == torch.float32 else "bf16"
-        for state_name, state_indices in state_variants:
+        for state_name, use_state_pool, cold_check in state_variants:
             run = _make_callable(
-                tensors,
+                tensors_pool,
                 case,
                 backend,
                 snapshot_dtype,
-                prefill_metadata=tensors["metadata"],
-                state_indices=state_indices,
-                cold_indices_check=state_name == "pool-cold",
+                use_state_pool=use_state_pool,
+                cold_indices_check=cold_check,
             )
             parts = (backend, snapshot_name, state_name)
             label = " ".join(part for part in parts if part)
@@ -429,17 +467,18 @@ def _run_case(case_id, case, args):
             )
 
     if not args.summary_only:
+        case_tensors = tensors_pool[0]
         if with_pool:
-            pool_note = f", pool={2 * tensors['num_seqs']} slots"
+            pool_note = f", pool={2 * case_tensors['num_seqs']} slots"
         elif args.with_state_pool:
             pool_note = ", pool skipped (needs final_state=on)"
         else:
             pool_note = ""
-        layout = "dense" if not case.is_varlen else f"varlen N={tensors['num_seqs']}"
+        layout = "dense" if not case.is_varlen else f"varlen N={case_tensors['num_seqs']}"
         print(f"\n== {case_id}")
         print(
             f"TP{case.tp} Hg={case.Hg} H={case.H} K={case.K} V={case.V} {layout}, "
-            f"T={tensors['total_tokens']}, "
+            f"T={case_tensors['total_tokens']}, "
             f"final_state={'on' if case.output_final_state else 'off'}{pool_note}"
         )
         _print_table(labels, rows)
