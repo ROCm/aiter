@@ -225,6 +225,66 @@ def batched_gemm_bf16(shape, backend):
     return call, (x, w, bias, y), should_skip
 
 
+def _batched_gemm_afp8wfp8(shape, w_scale_group_size):
+    import torch
+
+    from aiter.ops.triton.gemm.batched.batched_gemm_afp8wfp8 import (
+        batched_gemm_afp8wfp8 as gemm,
+    )
+    from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp8wfp8 import (
+        generate_batched_gemm_afp8wfp8_inputs,
+    )
+
+    B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
+    x, w, x_scales, w_scales, y = generate_batched_gemm_afp8wfp8_inputs(
+        B,
+        M,
+        N,
+        K,
+        torch.bfloat16,
+        layout="MBK",
+        output=True,
+        w_scale_group_size=w_scale_group_size,
+    )
+
+    def call(config, x, w, x_scales, w_scales, y):
+        return gemm(
+            x,
+            w,
+            x_scales,
+            w_scales,
+            torch.bfloat16,
+            y,
+            config=config,
+            w_scale_group_size=w_scale_group_size,
+        )
+
+    def should_skip(config):
+        return config["BLOCK_SIZE_K"] % 32 != 0  # one E8M0 scale per 32 K values
+
+    return call, (x, w, x_scales, w_scales, y), should_skip
+
+
+@kernel(
+    "BATCHED_GEMM-AFP8WFP8_A32_W1X32",
+    dims=("B", "M", "N", "K"),
+    bits=(8, 8),
+    backend_kwarg=False,
+)
+def batched_gemm_afp8wfp8(shape, backend):
+    return _batched_gemm_afp8wfp8(shape, (1, 32))
+
+
+@kernel(
+    "BATCHED_GEMM-AFP8WFP8_A32_W32X32",
+    dims=("B", "M", "N", "K"),
+    bits=(8, 8),
+    backend_kwarg=False,
+)
+def batched_gemm_afp8wfp8_w32x32(shape, backend):
+    return _batched_gemm_afp8wfp8(shape, (32, 32))
+
+
 @kernel(
     "GEMM-A16W16",
     gluon_archs=("gfx1250",),
