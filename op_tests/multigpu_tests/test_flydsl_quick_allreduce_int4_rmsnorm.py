@@ -43,8 +43,8 @@ from aiter.test_common import checkAllclose, run_perftest
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import WORLD, mxfp4_scale_shape
-from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
+from aiter.ops.flydsl.kernels.comm.allreduce_shared import WORLD
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import mxfp4_scale_shape
 
 try:
     ARCH = get_gfx_runtime()
@@ -134,7 +134,7 @@ def _unfused_mxfp4(fly, inp, res, weight, out, ar, res_t, q, q_s, *, gemma_norm)
     aiter.per_1x32_f4_quant_hip(out, shuffle=True)
 
 
-def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
+def _run_rank(rank, tp, init_method, cases, time_it):
     import torch.distributed as dist
 
     from aiter.ops.flydsl import QuickAllReduceInt4
@@ -151,7 +151,7 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
     fly = QuickAllReduceInt4(
-        group=gloo, device=device, rank=rank, world_size=tp, grid_cap=grid_cap
+        group=gloo, device=device, rank=rank, world_size=tp, min_bytes=0
     )
     rows = []
     # compile_rmsnorm must cover every fused build the cases pick: a case that
@@ -159,7 +159,7 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
     for hidden, gemma_norm in sorted({(c[1], c[2]) for c in cases}):
         for mxfp4 in (False, True) if fly.supports_mxfp4 else (False,):
             fly.compile_rmsnorm(hidden, EPS, gemma_norm=gemma_norm, mxfp4=mxfp4)
-    warmed = [set(e._norm_launch) for e in fly._by_st.values()]
+    warmed = set(fly._norm_launch)
     try:
         for ntok, hidden, gemma_norm, inplace in cases:
             gen = torch.Generator().manual_seed(1234 + rank)
@@ -198,6 +198,13 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
             dist.all_gather(gathered, res_out, group=group)
             same_res = all(torch.equal(g, gathered[0]) for g in gathered)
 
+            # The unfused all-reduce takes the ladder's pick. When the fused one
+            # falls back to another block (the ladder's block is wider than a
+            # row), the two quantize differently and only the SQNR check against
+            # the fp32 reference is meaningful.
+            nbytes = inp.numel() * inp.element_size()
+            same_cfg = fly._pick_cfg(nbytes)[0] == fly._norm_cfg(nbytes, hidden)[0]
+
             tag = f"rank {rank} {ntok}x{hidden} gemma={gemma_norm}"
             row = {
                 "tokens": ntok,
@@ -206,26 +213,34 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
                 "inplace": inplace,
                 "sqnr_out_db": _sqnr_db(out.float(), ref_out.float()),
                 "sqnr_res_db": _sqnr_db(res_out.float(), ref_res.float()),
-                "err_out_vs_unfused": float(
-                    checkAllclose(
-                        unf_out.float(),
-                        out.float(),
-                        rtol=TIGHT_RTOL,
-                        atol=TIGHT_ATOL,
-                        tol_err_ratio=TIGHT_ERR_RATIO,
-                        printLog=False,
-                        msg=f"{tag} out",
+                "err_out_vs_unfused": (
+                    0.0
+                    if not same_cfg
+                    else float(
+                        checkAllclose(
+                            unf_out.float(),
+                            out.float(),
+                            rtol=TIGHT_RTOL,
+                            atol=TIGHT_ATOL,
+                            tol_err_ratio=TIGHT_ERR_RATIO,
+                            printLog=False,
+                            msg=f"{tag} out",
+                        )
                     )
                 ),
-                "err_res_vs_unfused": float(
-                    checkAllclose(
-                        unf_res.float(),
-                        res_out.float(),
-                        rtol=TIGHT_RTOL,
-                        atol=TIGHT_ATOL,
-                        tol_err_ratio=TIGHT_ERR_RATIO,
-                        printLog=False,
-                        msg=f"{tag} residual_out",
+                "err_res_vs_unfused": (
+                    0.0
+                    if not same_cfg
+                    else float(
+                        checkAllclose(
+                            unf_res.float(),
+                            res_out.float(),
+                            rtol=TIGHT_RTOL,
+                            atol=TIGHT_ATOL,
+                            tol_err_ratio=TIGHT_ERR_RATIO,
+                            printLog=False,
+                            msg=f"{tag} residual_out",
+                        )
                     )
                 ),
                 "ranks_equal": same_out and same_res,
@@ -279,7 +294,7 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
                     )
             rows.append(row)
             dist.barrier(group=group)
-        if [set(e._norm_launch) for e in fly._by_st.values()] != warmed:
+        if set(fly._norm_launch) != warmed:
             raise AssertionError("a case compiled a fused build compile_rmsnorm missed")
     finally:
         fly.close()
@@ -287,7 +302,7 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
     return rows
 
 
-def _spawn(tp, cases, *, time_it, grid_cap):
+def _spawn(tp, cases, *, time_it):
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
     pool = Pool(processes=tp)
@@ -295,7 +310,7 @@ def _spawn(tp, cases, *, time_it, grid_cap):
         futs = [
             pool.apply_async(
                 _run_rank,
-                args=(rank, tp, init_method, cases, time_it, grid_cap),
+                args=(rank, tp, init_method, cases, time_it),
             )
             for rank in range(tp)
         ]
@@ -335,7 +350,6 @@ def main():
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tp", type=int, default=WORLD)
-    parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
     parser.add_argument(
         "--bench",
         type=str,
@@ -348,7 +362,7 @@ def main():
         aiter.logger.warning("need %s GPUs; skipping", args.tp)
         return
 
-    ranks = _spawn(args.tp, _VALIDITY_CASES, time_it=False, grid_cap=args.grid_cap)
+    ranks = _spawn(args.tp, _VALIDITY_CASES, time_it=False)
     _assert_valid(ranks, _VALIDITY_CASES)
     aiter.logger.info(
         "validity (rank 0):\n%s", pd.DataFrame(ranks[0]).to_markdown(index=False)
@@ -359,7 +373,7 @@ def main():
         t, h = (int(x) for x in pair.split(","))
         bench.append((t, h, False, False))
     if bench:
-        ranks = _spawn(args.tp, bench, time_it=True, grid_cap=args.grid_cap)
+        ranks = _spawn(args.tp, bench, time_it=True)
         _assert_valid(ranks, bench)
         has_mxfp4 = ARCH == "gfx950"
         df = pd.DataFrame(
