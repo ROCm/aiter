@@ -14,6 +14,8 @@ python bench_fused_kda_decode.py --batches 1 16 64 128
 python bench_fused_kda_decode.py --Hloc 8
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -26,7 +28,15 @@ from aiter.ops.triton.gated_delta_net.causal_conv1d_decode import (
     causal_conv1d_update_split_qkv,
 )
 from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+)
 
 DEVICE = "cuda"
 D = 128
@@ -158,6 +168,233 @@ def _make_spec_inputs(batch, Hloc, num_spec):
     }
 
 
+def _generate_spec_pool_inputs(batch, Hloc, num_spec):
+    """Build one speculative-decode case, with its own state clones.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random projections and state, so replaying through the pool
+    during timing defeats cache residency instead of timing one fixed
+    buffer repeatedly. State drifts across replays same as it did across
+    do_bench reps in the single-buffer version; that does not change the
+    launch shape or instruction path.
+    """
+    inp = _make_spec_inputs(batch, Hloc, num_spec)
+    conv_state = inp["conv_state"].clone()
+    ssm_state = inp["ssm_state"].clone()
+    out = torch.empty(inp["mixed_qkv"].shape[0], Hloc * D, dtype=DTYPE, device=DEVICE)
+    return (
+        inp["mixed_qkv"],
+        conv_state,
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        ssm_state,
+        inp["ssm_state_indices"],
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        inp["num_accepted_tokens"],
+        inp["conv_state_indices"],
+        out,
+    )
+
+
+_SPEC_POOL_FIELDS = [
+    "mixed_qkv",
+    "conv_state",
+    "conv_weight",
+    "gate",
+    "beta",
+    "out_gate",
+    "A_log",
+    "dt_bias",
+    "ssm_state",
+    "ssm_state_indices",
+    "cu_seqlens",
+    "norm_weight",
+    "num_accepted_tokens",
+    "conv_state_indices",
+    "out",
+]
+
+
+def _make_spec_kernel_fn(Hloc):
+    def kernel_fn(
+        mixed_qkv,
+        conv_state,
+        conv_weight,
+        gate,
+        beta,
+        out_gate,
+        A_log,
+        dt_bias,
+        ssm_state,
+        ssm_state_indices,
+        cu_seqlens,
+        norm_weight,
+        num_accepted_tokens,
+        conv_state_indices,
+        out,
+    ):
+        fused_kda_decode(
+            mixed_qkv,
+            conv_state,
+            conv_weight,
+            gate,
+            beta,
+            out_gate,
+            A_log,
+            dt_bias,
+            ssm_state,
+            ssm_state_indices,
+            cu_seqlens,
+            norm_weight,
+            1e-6,
+            D,
+            Hloc,
+            -5.0,
+            num_accepted_tokens=num_accepted_tokens,
+            conv_state_indices=conv_state_indices,
+            out=out,
+        )
+
+    return kernel_fn
+
+
+def _generate_decode_pool_inputs(batch, Hloc):
+    """Build one decode case, with its own 3-kernel and fused state clones.
+
+    Pure setup, not measured. See _generate_spec_pool_inputs for why state
+    drift across replays is fine here.
+    """
+    inp = _make_inputs(batch, Hloc)
+    return (
+        inp["mixed_qkv"],
+        inp["conv_weight"],
+        inp["gate"],
+        inp["beta"],
+        inp["out_gate"],
+        inp["A_log"],
+        inp["dt_bias"],
+        inp["ssm_state_indices"],
+        inp["cu_seqlens"],
+        inp["norm_weight"],
+        inp["conv_state"].clone(),
+        inp["ssm_state"].clone(),
+        inp["conv_state"].clone(),
+        inp["ssm_state"].clone(),
+    )
+
+
+_DECODE_POOL_FIELDS = [
+    "mixed_qkv",
+    "conv_weight",
+    "gate",
+    "beta",
+    "out_gate",
+    "A_log",
+    "dt_bias",
+    "ssm_state_indices",
+    "cu_seqlens",
+    "norm_weight",
+    "cs_3k",
+    "ss_3k",
+    "cs_f",
+    "ss_f",
+]
+
+
+def _make_3k_kernel_fn(Hloc):
+    def kernel_fn(
+        mixed_qkv,
+        conv_weight,
+        gate,
+        beta,
+        out_gate,
+        A_log,
+        dt_bias,
+        ssm_state_indices,
+        cu_seqlens,
+        norm_weight,
+        cs_3k,
+        ss_3k,
+        **_,
+    ):
+        T = mixed_qkv.shape[0]
+        lp = Hloc * D
+        q, k, v = causal_conv1d_update_split_qkv(
+            mixed_qkv,
+            cs_3k,
+            conv_weight,
+            lp,
+            lp,
+            bias=None,
+            activation="silu",
+            conv_state_indices=ssm_state_indices,
+            use_gluon=False,
+        )
+        out = torch.empty(T, Hloc, D, dtype=q.dtype, device=DEVICE)
+        fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=gate,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=rearrange(q, "t (h d) -> 1 t h d", d=D),
+            k=rearrange(k, "t (h d) -> 1 t h d", d=D),
+            v=rearrange(v, "t (h d) -> 1 t h d", d=D),
+            b=beta,
+            initial_state_source=ss_3k,
+            initial_state_indices=ssm_state_indices,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+        )
+        og3d = rearrange(out_gate[:T], "t (h d) -> t h d", d=D)
+        rmsnorm_gated_bf16(out, norm_weight, og3d, 1e-6)
+
+    return kernel_fn
+
+
+def _make_fused_kernel_fn(Hloc):
+    def kernel_fn(
+        mixed_qkv,
+        conv_weight,
+        gate,
+        beta,
+        out_gate,
+        A_log,
+        dt_bias,
+        ssm_state_indices,
+        cu_seqlens,
+        norm_weight,
+        cs_f,
+        ss_f,
+        **_,
+    ):
+        fused_kda_decode(
+            mixed_qkv,
+            cs_f,
+            conv_weight,
+            gate,
+            beta,
+            out_gate,
+            A_log,
+            dt_bias,
+            ss_f,
+            ssm_state_indices,
+            cu_seqlens,
+            norm_weight,
+            1e-6,
+            D,
+            Hloc,
+            -5.0,
+        )
+
+    return kernel_fn
+
+
 def _count_parallel_launches(fkd_module, fn):
     """How many times one call launches the parallel-V kernel.
 
@@ -186,6 +423,8 @@ def _count_parallel_launches(fkd_module, fn):
 
 
 def run_spec_benchmark(args):
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     Hloc, num_spec = args.Hloc, args.num_spec
     print(f"\nSpeculative decode: Hloc={Hloc}, D={D}, W={W}, tokens/seq={num_spec + 1}")
     header = (
@@ -195,41 +434,11 @@ def run_spec_benchmark(args):
     print(header)
     print("-" * len(header))
     for batch in args.batches:
-        inp = _make_spec_inputs(batch, Hloc, num_spec)
-        # Clone once, outside the timed region: per-iteration clones bill the
-        # kernel for bookkeeping serving never does. State values drift, but
-        # they do not change the launch shape or instruction path.
-        cs = inp["conv_state"].clone()
-        ss = inp["ssm_state"].clone()
-        out = torch.empty(
-            inp["mixed_qkv"].shape[0],
-            Hloc * D,
-            dtype=DTYPE,
-            device=DEVICE,
+        pool_gen = functools.partial(_generate_spec_pool_inputs, batch, Hloc, num_spec)
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_SPEC_POOL_FIELDS], **kwargs_rot_bufs
         )
-
-        def fn_fused(inp=inp, cs=cs, ss=ss, out=out):
-            fused_kda_decode(
-                inp["mixed_qkv"],
-                cs,
-                inp["conv_weight"],
-                inp["gate"],
-                inp["beta"],
-                inp["out_gate"],
-                inp["A_log"],
-                inp["dt_bias"],
-                ss,
-                inp["ssm_state_indices"],
-                inp["cu_seqlens"],
-                inp["norm_weight"],
-                1e-6,
-                D,
-                Hloc,
-                -5.0,
-                num_accepted_tokens=inp["num_accepted_tokens"],
-                conv_state_indices=inp["conv_state_indices"],
-                out=out,
-            )
+        kernel_fn = _make_spec_kernel_fn(Hloc)
 
         # Time the generic kernel on the same inputs by failing the dispatch
         # gate's arch test, so the speedup is reproducible rather than taken on
@@ -244,12 +453,20 @@ def run_spec_benchmark(args):
             # that would also change the generic launch from gfx950's four
             # warps to gfx942's two warps.
             _fkd.get_arch = lambda: "gfx950-generic"
-            t_generic = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
+            t_generic = (
+                do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+                * 1000
+            )
         finally:
             _fkd.get_arch = real_arch
 
-        launched = _count_parallel_launches(_fkd, fn_fused)
-        t_fused = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
+        launched = _count_parallel_launches(
+            _fkd,
+            lambda kernel_fn=kernel_fn, rot_bufs=rot_bufs: kernel_fn(**rot_bufs[0]),
+        )
+        t_fused = (
+            do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph) * 1000
+        )
 
         picked = "parallel" if launched else "generic"
         # A "generic" row timed the same kernel twice, so its ratio would be
@@ -257,8 +474,7 @@ def run_spec_benchmark(args):
         # tie between the two paths.
         ratio = f"{t_generic / t_fused:>7.2f}x" if launched else f"{'-':>8}"
         print(
-            f"{batch:>6}  {t_generic:>12.1f}  {t_fused:>13.1f}  "
-            f"{ratio}  {picked:>10}"
+            f"{batch:>6}  {t_generic:>12.1f}  {t_fused:>13.1f}  {ratio}  {picked:>10}"
         )
 
 
@@ -266,6 +482,8 @@ def run_benchmark(args):
     if args.num_spec > 0:
         run_spec_benchmark(args)
         return
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
     Hloc = args.Hloc
     batches = args.batches
 
@@ -275,69 +493,24 @@ def run_benchmark(args):
     print("-" * len(header))
 
     for batch in batches:
-        inp = _make_inputs(batch, Hloc)
-        # Clone once per arm, outside the timed region; see run_spec_benchmark.
-        # Charging both arms does not cancel out, it drags the ratio toward 1.0.
-        cs_3k = inp["conv_state"].clone()
-        ss_3k = inp["ssm_state"].clone()
-        cs_f = inp["conv_state"].clone()
-        ss_f = inp["ssm_state"].clone()
+        # Each pool entry carries its own cs_3k/ss_3k and cs_f/ss_f clones,
+        # so the two arms never share a state buffer -- charging both would
+        # drag the ratio toward 1.0 otherwise.
+        pool_gen = functools.partial(_generate_decode_pool_inputs, batch, Hloc)
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_DECODE_POOL_FIELDS], **kwargs_rot_bufs
+        )
+        kernel_fn_3k = _make_3k_kernel_fn(Hloc)
+        kernel_fn_fused = _make_fused_kernel_fn(Hloc)
 
-        def fn_3k(inp=inp, cs=cs_3k, ss=ss_3k):
-            T = inp["mixed_qkv"].shape[0]
-            lp = Hloc * D
-            q, k, v = causal_conv1d_update_split_qkv(
-                inp["mixed_qkv"],
-                cs,
-                inp["conv_weight"],
-                lp,
-                lp,
-                bias=None,
-                activation="silu",
-                conv_state_indices=inp["ssm_state_indices"],
-                use_gluon=False,
-            )
-            out = torch.empty(T, Hloc, D, dtype=q.dtype, device=DEVICE)
-            fused_sigmoid_gating_delta_rule_update(
-                A_log=inp["A_log"],
-                a=inp["gate"],
-                dt_bias=inp["dt_bias"],
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                q=rearrange(q, "t (h d) -> 1 t h d", d=D),
-                k=rearrange(k, "t (h d) -> 1 t h d", d=D),
-                v=rearrange(v, "t (h d) -> 1 t h d", d=D),
-                b=inp["beta"],
-                initial_state_source=ss,
-                initial_state_indices=inp["ssm_state_indices"],
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=inp["cu_seqlens"],
-            )
-            og3d = rearrange(inp["out_gate"][:T], "t (h d) -> t h d", d=D)
-            rmsnorm_gated_bf16(out, inp["norm_weight"], og3d, 1e-6)
-
-        def fn_fused(inp=inp, cs=cs_f, ss=ss_f):
-            fused_kda_decode(
-                inp["mixed_qkv"],
-                cs,
-                inp["conv_weight"],
-                inp["gate"],
-                inp["beta"],
-                inp["out_gate"],
-                inp["A_log"],
-                inp["dt_bias"],
-                ss,
-                inp["ssm_state_indices"],
-                inp["cu_seqlens"],
-                inp["norm_weight"],
-                1e-6,
-                D,
-                Hloc,
-                -5.0,
-            )
-
-        t_3k = triton.testing.do_bench(fn_3k, warmup=50, rep=200) * 1000
-        t_fused = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
+        t_3k = (
+            do_bench_aiter_triton(kernel_fn_3k, rot_bufs, **kwargs_do_bench_graph)
+            * 1000
+        )
+        t_fused = (
+            do_bench_aiter_triton(kernel_fn_fused, rot_bufs, **kwargs_do_bench_graph)
+            * 1000
+        )
         speedup = t_3k / t_fused
 
         print(f"{batch:>6}  {t_3k:>13.1f}  {t_fused:>10.1f}  {speedup:>7.2f}x")

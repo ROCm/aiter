@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import json
 import sys
 
@@ -17,10 +18,16 @@ from aiter.ops.triton.attention.chunk_kda import (
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
     get_parser,
+    get_rot_bufs_kwargs,
     override_parser_action,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+    get_caller_name_no_ext,
+)
 
 K3_HEAD_DIM = 128
 K3_NUM_HEADS = [24, 12]  # 96 heads sharded tp4 / tp8
@@ -70,48 +77,149 @@ def traffic_bytes(B, T, H, stage, device, state_dtype=torch.float32):
     return {"prepare": prepare, "walk": walk, "total": prepare + walk}[stage]
 
 
-def _time(fn, args):
-    if args.timing == "cudagraph":
-        return _bench_graph(fn, args.graph_ms, args.n_replays)
-    return triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+def _generate_kda_pool_inputs(B, T, H, device):
+    """Build one dense q/k/v/g/beta/state/out set.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random projections and state, so replaying through the pool
+    during timing defeats cache residency instead of timing one fixed buffer
+    repeatedly. cu_seqlens/chunk_indices/chunk_offsets stay fixed outside the
+    pool -- they are deterministic given (B, T), and prepare_chunk_kda_metadata
+    syncs the host, which a graph capture rejects.
+    """
+    inp = make_inputs(B, T, H, device)
+    state = torch.randn(B, H, K3_HEAD_DIM, K3_HEAD_DIM, device=device)
+    out = torch.empty_like(inp["v"])
+    return (
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["g"],
+        inp["beta"],
+        inp["A_log"],
+        inp["dt_bias"],
+        state,
+        out,
+    )
 
 
-def _bench_graph(fn, graph_ms, n_replays):
-    # replay a graph of ~graph_ms of launches; mean ms per launch
-    for _ in range(5):
-        fn()
-    torch.cuda.synchronize()
-    ev0, ev1 = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-    ev0.record()
-    for _ in range(20):
-        fn()
-    ev1.record()
-    torch.cuda.synchronize()
-    est_ms = ev0.elapsed_time(ev1) / 20
-    n_per_graph = max(1, int(graph_ms / est_ms)) if est_ms > 0 else 1000
+_KDA_POOL_FIELDS = ["q", "k", "v", "g", "beta", "A_log", "dt_bias", "state", "out"]
 
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(3):
-            fn()
-        side.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=side):
-            for _ in range(n_per_graph):
-                fn()
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
 
-    per_iter = []
-    for _ in range(n_replays):
-        s, e = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-        s.record()
-        graph.replay()
-        e.record()
-        torch.cuda.synchronize()
-        per_iter.append(s.elapsed_time(e) / n_per_graph)
-    return sum(per_iter) / len(per_iter)
+def _generate_kda_walk_pool_inputs(B, T, H, device, cu_seqlens, chunk_indices):
+    """Build one walk workspace via an untimed chunk_kda_prepare call."""
+    inp = make_inputs(B, T, H, device)
+    ws = chunk_kda_prepare(
+        q=inp["q"],
+        k=inp["k"],
+        v=inp["v"],
+        g=inp["g"],
+        beta=inp["beta"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        lower_bound=K3_LOWER_BOUND,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    state = torch.randn(B, H, K3_HEAD_DIM, K3_HEAD_DIM, device=device)
+    out = torch.empty_like(ws["u"])
+    return ws["qg"], ws["w"], ws["u"], ws["kg_t"], ws["aqk"], ws["decay"], state, out
+
+
+_KDA_WALK_POOL_FIELDS = ["qg", "w", "u", "kg_t", "aqk", "decay", "state", "out"]
+
+
+def _make_gluon_kernel_fn(
+    cu_seqlens, chunk_indices, chunk_offsets, state_indices, has_initial_state, config
+):
+    def kernel_fn(q, k, v, g, beta, A_log, dt_bias, state, out):
+        chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=K3_LOWER_BOUND,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            out=out,
+            config=config,
+            state_cache=state,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+        )
+
+    return kernel_fn
+
+
+def _make_prepare_kernel_fn(cu_seqlens, chunk_indices):
+    def kernel_fn(q, k, v, g, beta, A_log, dt_bias, **_):
+        chunk_kda_prepare(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=K3_LOWER_BOUND,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+
+    return kernel_fn
+
+
+def _make_walk_kernel_fn(
+    cu_seqlens, chunk_offsets, state_indices, has_initial_state, config
+):
+    def kernel_fn(qg, w, u, kg_t, aqk, decay, state, out):
+        chunk_kda_walk(
+            qg=qg,
+            w=w,
+            u=u,
+            kg_t=kg_t,
+            aqk=aqk,
+            decay=decay,
+            cu_seqlens=cu_seqlens,
+            chunk_offsets=chunk_offsets,
+            out=out,
+            config=config,
+            state_cache=state,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+        )
+
+    return kernel_fn
+
+
+def _make_triton_kernel_fn(cu_seqlens, state_indices, has_initial_state):
+    def kernel_fn(q, k, v, g, beta, A_log, dt_bias, state, out):
+        chunk_kimi_delta_attn(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=True,
+            lower_bound=K3_LOWER_BOUND,
+            state_v_first=True,
+            cu_seqlens=cu_seqlens,
+            out=out,
+            state_cache=state,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+        )
+
+    return kernel_fn
 
 
 def benchmark(args):
@@ -138,83 +246,61 @@ def benchmark(args):
         )
     ]
 
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
+
     @triton.testing.perf_report(configs)
     def bench_chunk_kda(H, B, T, provider):
         torch.manual_seed(0)
-        inp = make_inputs(B, T, H, args.device)
-        state = torch.randn(
-            B, H, K3_HEAD_DIM, K3_HEAD_DIM, dtype=state_dtype, device=args.device
-        )
-        idx = torch.arange(B, dtype=torch.int32, device=args.device)
-        has_init = torch.ones(B, dtype=torch.bool, device=args.device)
-        paged = {
-            "state_cache": state,
-            "state_indices": idx,
-            "has_initial_state": has_init,
-        }
+        device = args.device
+        total = B * T
+        # Deterministic given (B, T), so computed once and shared by every
+        # pool entry rather than rotated.
+        cu_seqlens = torch.arange(0, total + 1, T, dtype=torch.int32, device=device)
+        state_indices = torch.arange(B, dtype=torch.int32, device=device)
+        has_initial_state = torch.ones(B, dtype=torch.bool, device=device)
         # built once: the metadata syncs the host, which a graph capture rejects
-        ci, co = prepare_chunk_kda_metadata(inp["cu_seqlens"])
+        ci, co = prepare_chunk_kda_metadata(cu_seqlens)
         stage = "total"
+
         if provider == "gluon":
-            out = torch.empty_like(inp["v"])
-
-            def fn():
-                chunk_kda(
-                    **inp,
-                    lower_bound=K3_LOWER_BOUND,
-                    chunk_indices=ci,
-                    chunk_offsets=co,
-                    out=out,
-                    config=args.config,
-                    **paged,
-                )
-
+            pool_gen = functools.partial(_generate_kda_pool_inputs, B, T, H, device)
+            rot_bufs = generate_rotating_buffers_pool(
+                [pool_gen], [_KDA_POOL_FIELDS], **kwargs_rot_bufs
+            )
+            kernel_fn = _make_gluon_kernel_fn(
+                cu_seqlens, ci, co, state_indices, has_initial_state, args.config
+            )
         elif provider == "gluon_prepare":
             stage = "prepare"
-
-            def fn():
-                chunk_kda_prepare(**inp, lower_bound=K3_LOWER_BOUND, chunk_indices=ci)
-
+            pool_gen = functools.partial(_generate_kda_pool_inputs, B, T, H, device)
+            rot_bufs = generate_rotating_buffers_pool(
+                [pool_gen], [_KDA_POOL_FIELDS], **kwargs_rot_bufs
+            )
+            kernel_fn = _make_prepare_kernel_fn(cu_seqlens, ci)
         elif provider.startswith("gluon_walk:"):
             stage = "walk"
             bv, nw = (int(x) for x in provider.split(":")[1].split(","))
-            ws = chunk_kda_prepare(**inp, lower_bound=K3_LOWER_BOUND, chunk_indices=ci)
-            out = torch.empty_like(ws["u"])
-
-            def fn():
-                chunk_kda_walk(
-                    **ws,
-                    cu_seqlens=inp["cu_seqlens"],
-                    chunk_offsets=co,
-                    out=out,
-                    config={**args.config, "BV": bv, "num_warps": nw},
-                    **paged,
-                )
-
+            walk_config = {**args.config, "BV": bv, "num_warps": nw}
+            pool_gen = functools.partial(
+                _generate_kda_walk_pool_inputs, B, T, H, device, cu_seqlens, ci
+            )
+            rot_bufs = generate_rotating_buffers_pool(
+                [pool_gen], [_KDA_WALK_POOL_FIELDS], **kwargs_rot_bufs
+            )
+            kernel_fn = _make_walk_kernel_fn(
+                cu_seqlens, co, state_indices, has_initial_state, walk_config
+            )
         else:
-            out = torch.empty_like(inp["v"])
+            pool_gen = functools.partial(_generate_kda_pool_inputs, B, T, H, device)
+            rot_bufs = generate_rotating_buffers_pool(
+                [pool_gen], [_KDA_POOL_FIELDS], **kwargs_rot_bufs
+            )
+            kernel_fn = _make_triton_kernel_fn(
+                cu_seqlens, state_indices, has_initial_state
+            )
 
-            def fn():
-                chunk_kimi_delta_attn(
-                    inp["q"],
-                    inp["k"],
-                    inp["v"],
-                    inp["g"],
-                    inp["beta"],
-                    A_log=inp["A_log"],
-                    dt_bias=inp["dt_bias"],
-                    use_qk_l2norm_in_kernel=True,
-                    use_gate_in_kernel=True,
-                    use_beta_sigmoid_in_kernel=True,
-                    safe_gate=True,
-                    lower_bound=K3_LOWER_BOUND,
-                    state_v_first=True,
-                    cu_seqlens=inp["cu_seqlens"],
-                    out=out,
-                    **paged,
-                )
-
-        ms = _time(fn, args)
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
         if args.metric == "time":
             return ms * 1e3
         return traffic_bytes(B, T, H, stage, args.device, state_dtype) / ms * 1e-9
@@ -247,12 +333,36 @@ def parse_args():
         help="json overrides of the tuned walk config",
     )
     parser.add_argument(
-        "--timing", choices=["cudagraph", "do_bench"], default="do_bench"
+        "--timing",
+        choices=["cudagraph", "do_bench"],
+        default="do_bench",
+        help="Unused: timing is always do_bench_aiter_triton's rotating-buffer "
+        "CUDA graph replay now. Kept for CLI compatibility.",
     )
-    parser.add_argument("--graph_ms", type=float, default=20.0)
-    parser.add_argument("--n_replays", type=int, default=20)
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
+    parser.add_argument(
+        "--graph_ms",
+        type=float,
+        default=20.0,
+        help="Unused, see --timing. Kept for CLI compatibility.",
+    )
+    parser.add_argument(
+        "--n_replays",
+        type=int,
+        default=20,
+        help="Unused, see --timing. Kept for CLI compatibility.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=25,
+        help="Unused, see --timing. Kept for CLI compatibility.",
+    )
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=100,
+        help="Unused, see --timing. Kept for CLI compatibility.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "-o", action="store_true", default=False, help="Write CSV results"
