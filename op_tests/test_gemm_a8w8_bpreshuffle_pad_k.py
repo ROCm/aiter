@@ -40,6 +40,44 @@ def test_preshuffle_flat_buffers_stay_below_4gib():
         _check_preshuffle_flat_buffer_capacity(16, 65536, 65536, 1, 1, 2)
 
 
+@pytest.mark.parametrize("m, backend", [(65536, "flydsl"), (65537, "ck")])
+def test_flydsl_bpreshuffle_row_falls_back_to_ck_above_m_max(monkeypatch, m, backend):
+    from aiter.ops.flydsl import gemm_kernels
+
+    # Kimi-K3's 6144x7168 M=8192 row, which padded-M lookup returns for every
+    # M > 8192. Meta tensors stand in for the 470 MB activation.
+    row = {
+        "libtype": "flydsl",
+        "splitK": 0,
+        "kernelName": "flydsl_bpreshuflle_128x256x128_F8_F8_B16_1x2x4x2_default",
+    }
+    n, k = 6144, 7168
+    xq = torch.empty((m, k), device="meta", dtype=dtypes.fp8)
+    wq = torch.empty((n, k), device="meta", dtype=dtypes.fp8)
+    x_scale = torch.empty((m, 1), device="meta", dtype=torch.float32)
+    w_scale = torch.empty((n, 1), device="meta", dtype=torch.float32)
+    out = torch.empty((m, n), device="meta", dtype=torch.bfloat16)
+    seen = []
+
+    def fake_flydsl(*args, **kwargs):
+        seen.append("flydsl")
+
+    def fake_ck(XQ, WQ, x_scale, w_scale, Y, splitK=0):
+        seen.append("ck")
+        return Y
+
+    # gfx1250 routes every kernel name to its WMMA backend before the M-limit check.
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(gemm_kernels, "flydsl_preshuffle_gemm_a8", fake_flydsl)
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
+
+    got = gemm_mod.gemm_a8w8_bpreshuffle_flydsl(xq, wq, x_scale, w_scale, out, row)
+
+    assert gemm_kernels.PRESHUFFLE_M_MAX == 65536
+    assert seen == [backend]
+    assert got is out
+
+
 def test_two_wave_vgpr_estimate_uses_128_threads():
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
         _estimate_max_wpe,
