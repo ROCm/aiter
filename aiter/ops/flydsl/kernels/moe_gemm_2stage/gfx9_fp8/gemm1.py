@@ -34,6 +34,7 @@ def compile_moe_gemm1(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    fused_down_clear=False,
 ):
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
@@ -45,6 +46,10 @@ def compile_moe_gemm1(
         activation,
         swiglu_limit,
     )
+    if alg == "batch1":
+        assert K % 256 == 0, "batch1 Gate/Up requires K divisible by 256"
+    if fused_down_clear:
+        assert alg == "batch1" and K % 8 == 0
 
     if alg == "splitk":
         assert (
@@ -732,17 +737,23 @@ def compile_moe_gemm1(
         p_weight: fx.Pointer,
         p_output: fx.Pointer,
         p_topk_ids: fx.Pointer,
+        p_clear_output: fx.Pointer,
         p_w_scale: fx.Pointer,
     ):
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
         e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        route_idx = batch_idx * TOPK + e_idx
 
-        arg_p_input = fx.make_view(fxh._as_ptr(p_input), fx.make_layout((1, K), (K, 1)))
+        arg_p_input = fx.make_view(
+            fxh._as_ptr(p_input) + fx.Int64(batch_idx) * K,
+            fx.make_layout((1, K), (K, 1)),
+        )
         if const_expr(weight_dtype != fx.BFloat16):
             p_weight = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_weight))
         arg_p_expert_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
-        expert_id = arg_p_expert_ids[e_idx]
+        expert_id = arg_p_expert_ids[route_idx]
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         contiguous_n = min(64, BLOCK_TILE_SIZE_N // 2)
 
@@ -765,7 +776,7 @@ def compile_moe_gemm1(
         )
 
         arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output),
+            fxh._as_ptr(p_output) + fx.Int64(batch_idx) * TOPK * (N // 2),
             fx.make_layout((1, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
         )
         out_tensor = fx.rocdl.make_buffer_tensor(
@@ -801,6 +812,27 @@ def compile_moe_gemm1(
         c_src = c_tiled_g.get_slice(tid).retile(c_frag_bf16)
 
         fx.copy(cp_atom_w, c_src, c_dst[None, None, None, 0])
+
+        if const_expr(fused_down_clear):
+            clear_blocks = (N + BLOCK_TILE_SIZE_N - 1) // BLOCK_TILE_SIZE_N
+            clear_threads = clear_blocks * 256
+            clear_rounds = (K // 8 + clear_threads - 1) // clear_threads
+            for clear_round in range_constexpr(clear_rounds):
+                clear_idx = blk_n * 256 + tid + clear_round * clear_threads
+                if e_idx == 0 and clear_idx < K // 8:
+                    clear_output = fx.make_view(
+                        fxh._as_ptr(p_clear_output)
+                        + fx.Int64(batch_idx) * K
+                        + fx.Int64(clear_idx) * 8,
+                        fx.make_layout(8, 1),
+                    )
+                    clear_frag = fx.make_fragment_like(clear_output)
+                    clear_frag.fill(0)
+                    fx.copy(
+                        fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16),
+                        clear_frag,
+                        clear_output,
+                    )
 
     @flyc.kernel
     def moe_2stage_gateup_prefill_1x4(
@@ -1010,17 +1042,19 @@ def compile_moe_gemm1(
         p_weight: fx.Pointer,
         p_output: fx.Pointer,
         p_topk_ids: fx.Pointer,
-        p_topk_weights: fx.Pointer,
+        p_clear_output: fx.Pointer,
         p_w_scale: fx.Pointer,
         task_num: fx.Int32,
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
+        batch_size = task_num // TOPK
+        # Other launchers take the routing weights in the p_clear_output position.
         moe_2stage_gateup_batch1(
-            p_input, p_weight, p_output, p_topk_ids, p_w_scale
+            p_input, p_weight, p_output, p_topk_ids, p_clear_output, p_w_scale
         ).launch(
-            grid=(num_n_blocks, task_num, 1),
+            grid=(num_n_blocks, TOPK, batch_size),
             block=(256, 1, 1),
             stream=stream,
         )

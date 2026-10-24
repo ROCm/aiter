@@ -235,6 +235,10 @@ def test_config_strings():
     # Rows tuned before the Down suffix existed keep loading as the default Down.
     for legacy in ("16_16_16_False", "64_128_128_True", "64_256_128_True"):
         assert Config.from_string(legacy) == Config.from_string(f"{legacy}:default:0")
+    # Tiles without the direct-decoding flag keep their meaning.
+    assert Config.from_string("16_16_16_False_False:default:0") == Config.from_string(
+        "16_16_16_False:default:0"
+    )
     for invalid in (
         "64_256_128_True:default",
         "64_256_128_True:default:0:0",
@@ -243,6 +247,10 @@ def test_config_strings():
         "64_256_128_True:default:128",
         "64_256_128_True:8x2:128",
         "16_16_16_False:8x1_compact:128",
+        "16_16_16_False_Maybe:default:0",
+        "16_16_16_False_True_False:default:0",
+        "16_16_16_True_True:default:0",
+        "16_16_16_False_True:1x4_64x256:128",
     ):
         try:
             Config.from_string(invalid)

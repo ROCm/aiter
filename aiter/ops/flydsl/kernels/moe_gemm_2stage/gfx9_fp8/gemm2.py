@@ -45,6 +45,8 @@ def compile_moe_gemm2(
         activation,
         swiglu_limit,
     )
+    if alg == "batch1":
+        assert K % TILE_K == 0, "batch1 Down requires K divisible by 64"
     if alg == "prefill_1x4":
         assert K % 64 == 0, f"down prefill requires K to be divisible by 64, got K={K}"
         assert N % 256 == 0, (
@@ -292,17 +294,19 @@ def compile_moe_gemm2(
         tid = gpu.thread_idx.x
         blk_n = gpu.block_idx.x
         e_idx = gpu.block_idx.y
+        batch_idx = gpu.block_idx.z
+        route_idx = batch_idx * TOPK + e_idx
 
         arg_p_input = fx.make_view(
-            fxh._as_ptr(p_input) + fx.Int64(e_idx * K),
+            fxh._as_ptr(p_input) + fx.Int64(route_idx) * K,
             fx.make_layout((BLOCK_TILE_SIZE_M, K), (0, 1)),
         )
         if const_expr(weight_dtype != fx.BFloat16):
             p_weight = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_weight))
         arg_p_topk_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))
         arg_p_topk_weights = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weights))
-        expert_id = arg_p_topk_ids[e_idx]
-        topk_weight = arg_p_topk_weights[e_idx]
+        expert_id = arg_p_topk_ids[route_idx]
+        topk_weight = arg_p_topk_weights[route_idx]
         arg_p_weight = _make_down_weight_view(p_weight, expert_id)
 
         c_frag = gemm_splitk(
@@ -324,7 +328,8 @@ def compile_moe_gemm2(
         c_frag_bf16 = _cvt_f32_to_bf16(c_frag)
 
         arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output), fx.make_layout((1, N), (N, 1))
+            fxh._as_ptr(p_output) + fx.Int64(batch_idx) * N,
+            fx.make_layout((1, N), (N, 1)),
         )
         cp_atom_w = fx.make_copy_atom(
             fx.UniversalAtomic(fx.AtomicOp.Add, fx.BFloat16), fx.BFloat16
@@ -751,10 +756,11 @@ def compile_moe_gemm2(
     ):
         CompilationContext.get_current()
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
+        batch_size = task_num // TOPK
         moe_2stage_down_batch1(
             p_input, p_weight, p_output, p_topk_ids, p_topk_weights, p_w_scale
         ).launch(
-            grid=(num_n_blocks, task_num, 1),
+            grid=(num_n_blocks, TOPK, batch_size),
             block=(64, 1, 1),
             stream=stream,
         )
