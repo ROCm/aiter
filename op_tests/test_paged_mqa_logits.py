@@ -290,6 +290,25 @@ def check_flydsl_fallback_keeps_gluon_knobs():
         pmql.run_paged_mqa_logits = original_run
 
 
+def check_strided_context_lens_rejected():
+    """A strided ``[B]`` view (the last column of a ``(B, next_n)`` table) is
+    rejected for both backends instead of being read as dense."""
+    inp = build_inputs((64, 8, HEADS, HEAD_DIM, KV_BLOCK_SIZE, True), 1024, 1024)
+    table = inp["context_lens"][:, None].repeat(1, 8)
+    inp["context_lens"] = table[:, -1]
+    assert not inp["context_lens"].is_contiguous()
+    args = launch_args(inp)
+    for name, launch in (
+        ("paged_mqa_logits", lambda: pmql.paged_mqa_logits(*args)),
+        ("gluon", lambda: pmql.run_paged_mqa_logits(pmql.DEFAULT_CONFIG, *args)),
+    ):
+        try:
+            launch()
+        except ValueError:
+            continue
+        raise AssertionError(f"{name} accepted a strided context_lens")
+
+
 def main():
     if os.environ.get(_SHIPPED_ROW_CHILD):
         assert get_gfx() != get_gfx_runtime()
@@ -300,6 +319,7 @@ def main():
         return
     check_launches_shipped_row()
     check_flydsl_fallback_keeps_gluon_knobs()
+    check_strided_context_lens_rejected()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,

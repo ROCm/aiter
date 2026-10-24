@@ -13,7 +13,7 @@ cached token inside that row's causal bound. It takes:
 - ``weights``: ``[B * next_n, H]`` float32 head weights.
 - ``out_logits``: ``[B * next_n, >= max_model_len]`` float32, written in place.
   Columns outside a row's causal bound are left as they are.
-- ``context_lens``: ``[B]`` int32 sequence lengths on the GPU.
+- ``context_lens``: ``[B]`` contiguous int32 sequence lengths on the GPU.
 - ``kv_indices``: ``[B, max_blocks]`` int32 block table.
 - ``max_model_len``: logical row width.
 
@@ -210,6 +210,12 @@ def run_paged_mqa_logits(
     KVBlockSize: int,
 ) -> torch.Tensor:
     """Launch one explicit config. ``paged_mqa_logits`` and the tuner share it."""
+    # Both kernels read context_lens as packed int32: Gluon rejects a strided
+    # view and FlyDSL would read it as dense, so reject it for both here.
+    if not context_lens.is_contiguous():
+        raise ValueError(
+            f"context_lens must be contiguous, got strides {context_lens.stride()}"
+        )
     if config["backend"] == "flydsl":
         _flydsl_kernel().flydsl_fp8_paged_mqa_logits(
             q_fp8,
@@ -266,7 +272,7 @@ def paged_mqa_logits(
         weights: ``[B * next_n, H]`` float32 head weights.
         out_logits: ``[B * next_n, >= max_model_len]`` float32 output. Only
             columns inside each row's causal bound are written.
-        context_lens: ``[B]`` int32 sequence lengths.
+        context_lens: ``[B]`` contiguous int32 sequence lengths.
         kv_indices: ``[B, max_blocks]`` int32 block table.
         max_model_len: Logical row width.
 
