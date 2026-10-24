@@ -60,6 +60,14 @@ DEFAULT_SEQ_START: int = seq_k_to_token_count(DEFAULT_SEQ_START_K)
 DEFAULT_SEQ_INC: int = seq_k_to_token_count(DEFAULT_SEQ_INC_K)
 DEFAULT_SEQ_END: int = seq_k_to_token_count(DEFAULT_SEQ_END_K)
 
+# Shapes file model name -> bench_mla_decode.py --model value
+# (<family>-<size> from utils/model_configs.json). The MLA benchmark is skipped
+# for MLA models that aren't in this mapping.
+MLA_BENCH_MODELS: dict[str, str] = {
+    "DeepSeek-R1 (Decode)": "deepseek-V3",
+    "Kimi-K2 Thinking (Decode)": "kimik25-tp4",
+}
+
 
 class TritonCache:
     cache_dir: Path | None
@@ -191,6 +199,12 @@ class Model:
 
     def kernel_backend_str(self) -> str:
         return "mla" if self.use_mla else "mha"
+
+    def mha_window(self) -> tuple[int, int]:
+        """(left, right) bounds for bench_mha. 0 means dense, encoded as (-1, -1)."""
+        if self.sliding_window_left > 0:
+            return self.sliding_window_left, -1
+        return -1, -1
 
     def effective_d_qk_v(self, kernel: "Kernel") -> tuple[int, int]:
         """
@@ -367,6 +381,13 @@ class BenchArgs:
         }
         fn: str = fn_map[(self.kernel, is_varlen)]
 
+        # Pass both bounds. An omitted window option in bench_mha.py runs its default
+        # sweep (dense plus a representative causal sliding window).
+        window_left: int
+        window_right: int
+        window_left, window_right = m.mha_window()
+        has_window: bool = window_left >= 0 or window_right >= 0
+
         args_dict: dict[str, str] = {
             "-fn": fn,
             "-causal": "true",
@@ -378,6 +399,8 @@ class BenchArgs:
             "-sk": s,
             "-d": str(effective_dqk),
             "-dv": str(effective_dv),
+            "--window-size-left": str(window_left),
+            "--window-size-right": str(window_right),
             "-metric": metric.name,
         }
 
@@ -386,8 +409,12 @@ class BenchArgs:
             args_list.append("-equal_seqlens")
         if m.use_sink:
             args_list.append("-sink")
-        if m.sliding_window_left > 0:
-            args_list.extend(("--window-size-left", str(m.sliding_window_left)))
+        # Native bf16 Triton has no sliding window. dao_ai has the window but
+        # rejects a sink. Gluon has a sink and a left window, and is forward-only.
+        if has_window and m.use_sink and window_right < 0 and self.kernel == "fwd":
+            args_list.extend(("-backend", "gluon"))
+        elif has_window and not m.use_sink:
+            args_list.extend(("-impl", "dao_ai"))
         if self.kernel == "bwdf":
             args_list.append("-fused_bwd")
         args_str: str = " ".join(args_list)
@@ -399,7 +426,7 @@ class BenchArgs:
         assert self.kernel == "fwd", "MLA only support forward kernel."
 
         args_dict: dict[str, str] = {
-            "--model": "deepseek-V3",
+            "--model": MLA_BENCH_MODELS[self.tp_model.model.name],
             "--dtype": "bf16",
             "--tensor-parallelism": str(self.tp_model.tp),
             "-b": str(self.b),
@@ -501,8 +528,8 @@ def get_mha_bench_result(
     Expected stdout (4 lines):
     Line 1 - progress: "[1/1] <model> B=... HQ=... ..."
     Line 2 - plot name: "bench_mha:"
-    Line 3 - header: "model  BATCH  HQ  HK  N_CTX_Q  N_CTX_K  D_HEAD  D_HEAD_V  causal  function  dtype  impl  fused  <unit>"
-    Line 4 - data: "0  <model>  <b>  <hq>  <hk>  <sq>  <sk>  <d>  <dv>  <causal>  <fn>  <dtype>  <impl>  <fused>  <value>"
+    Line 3 - header: "model  BATCH  HQ  HK  N_CTX_Q  N_CTX_K  D_HEAD  D_HEAD_V  causal  function  dtype  impl  fused  window_left  window_right  <unit>"
+    Line 4 - data: "0  <model>  <b>  <hq>  <hk>  <sq>  <sk>  <d>  <dv>  <causal>  <fn>  <dtype>  <impl>  <fused>  <wl>  <wr>  <value>"
     """
     # Get preprocessed stdout (4 lines: progress + plot name + header + data):
     out_lines: list[list[str]] | None = get_stdout(out, err, num_out_lines=4)
@@ -522,30 +549,36 @@ def get_mha_bench_result(
         logger.error("Benchmark name doesn't match: %s", l1)
         return None
     # Check stdout line #3 (table header):
-    # x_names: model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, causal, function, dtype, impl, fused
-    # Metric column is at index 13; triton sometimes appends an extra "(unit)" annotation at index 14.
+    # x_names: model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, causal,
+    # function, dtype, impl, fused, window_left, window_right.
+    # Metric column is at index 15; triton sometimes appends an extra "(unit)" annotation.
     if not (
         l2[:6] == ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
-        and len(l2) in (14, 15)
-        and l2[13] == metric.user_unit
-        and (len(l2) == 14 or l2[14] == f"({metric.user_unit})")
+        and l2[13:15] == ["window_left", "window_right"]
+        and len(l2) in (16, 17)
+        and l2[15] == metric.user_unit
+        and (len(l2) == 16 or l2[16] == f"({metric.user_unit})")
     ):
         logger.error("Table header doesn't match: %s", l2)
         return None
     # Check stdout line #4 (table data):
     # Columns: row_idx, model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
-    #          causal, function, dtype, impl, fused, <metric> (15 tokens total).
+    #          causal, function, dtype, impl, fused, window_left, window_right,
+    #          <metric> (17 tokens total).
     m: Model = args.tp_model.model
+    window_left, window_right = m.mha_window()
     try:
         if not all(
             [
-                len(l3) == 15,
+                len(l3) == 17,
                 l3[0] == "0",
                 int(float(l3[2])) == args.b,
                 int(float(l3[3])) == m.hq,
                 int(float(l3[4])) == m.hkv,
                 int(float(l3[5])) == args.s,
                 int(float(l3[6])) == args.s,
+                int(float(l3[14])) == window_left,
+                int(float(l3[15])) == window_right,
             ]
         ):
             logger.error("Table data doesn't match: %s", l3)
@@ -596,7 +629,7 @@ def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> float | None:
             [
                 len(l2) == 10,
                 l2[0] == "0",
-                l2[1] == "deepseek-V3",
+                l2[1] == MLA_BENCH_MODELS[args.tp_model.model.name],
                 int(float(l2[2])) == args.b,
                 int(float(l2[3])) == args.tp_model.model.hq,
                 int(float(l2[4])) == args.s,
@@ -969,13 +1002,23 @@ def get_bench_args(
         seq_range.to_range(),
     ):
         model = tp_model.model
+        # Fused backward has no sink and no sliding window. One-kernel backward
+        # has a sink, but the only sink-plus-window path is Gluon, which is forward-only.
+        skip_reason: str | None = None
         if kernel == "bwdf" and (model.use_sink or model.sliding_window_left > 0):
+            skip_reason = (
+                "fused backward doesn't support sink or sliding window attention."
+            )
+        elif kernel == "bwdo" and model.use_sink and model.sliding_window_left > 0:
+            skip_reason = "one-kernel backward doesn't support sink with sliding window attention."
+        if skip_reason is not None:
             skipped_key = (model.name, kernel)
             if skipped_key not in skipped_model_kernels:
                 logger.info(
-                    "Skipping %s for model '%s': fused backward doesn't support sink or sliding window attention.",
+                    "Skipping %s for model '%s': %s",
                     kernel,
                     model.name,
+                    skip_reason,
                 )
                 skipped_model_kernels.add(skipped_key)
             continue
@@ -984,17 +1027,28 @@ def get_bench_args(
         )
     # MLA kernel backend:
     # Only forward kernel, layout option doesn't make sense.
+    # bench_mla_decode.py hardcodes the DeepSeek-V3 MLA dimensions and takes
+    # only the head count from model_configs.json. Run it only for models with
+    # a model_configs.json entry in MLA_BENCH_MODELS.
     if "fwd" in kernels:
-        bench_args.extend(
-            [
+        for tp_model, b, s in product(
+            (tp_model for tp_model in tp_models if tp_model.model.use_mla),
+            batch_range.to_range(),
+            seq_range.to_range(),
+        ):
+            model = tp_model.model
+            if model.name not in MLA_BENCH_MODELS:
+                skipped_key = (model.name, "fwd")
+                if skipped_key not in skipped_model_kernels:
+                    logger.info(
+                        "Skipping fwd for model '%s': bench_mla_decode.py has no config for this model.",
+                        model.name,
+                    )
+                    skipped_model_kernels.add(skipped_key)
+                continue
+            bench_args.append(
                 BenchArgs(kernel="fwd", layout=None, tp_model=tp_model, b=b, s=s)
-                for tp_model, b, s in product(
-                    (tp_model for tp_model in tp_models if tp_model.model.use_mla),
-                    batch_range.to_range(),
-                    seq_range.to_range(),
-                )
-            ]
-        )
+            )
     return bench_args
 
 

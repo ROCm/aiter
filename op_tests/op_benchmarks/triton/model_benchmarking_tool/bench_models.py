@@ -2,9 +2,11 @@ import argparse
 import io
 import json
 import logging
+import math
 import os
 import re
 import shlex
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
@@ -12,12 +14,6 @@ from typing import TypeAlias
 
 import matplotlib.pyplot as plt
 import pandas as pd
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
-    main as bench_moe_gemm_a4w4_main,
-)
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
-    main as bench_moe_gemm_a8w4_main,
-)
 from triton.runtime.errors import OutOfResources
 
 from aiter.ops.triton.utils._triton import arch_info
@@ -44,6 +40,12 @@ from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
 )
 from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
 from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4_proton import (
+    main as bench_moe_gemm_a4w4_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4_proton import (
+    main as bench_moe_gemm_a8w4_main,
+)
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
     main as bench_moe_gemm_a8w8_main,
 )
@@ -99,6 +101,14 @@ ROPE_METRIC_NOTE = (
 )
 
 MLA_METRIC_NOTE = "Note: MLA benchmark only reports time (ms)."
+
+# model_shapes.json model name -> bench_mla_decode.py --model value
+# (<family>-<size> from utils/model_configs.json). The MLA benchmark is skipped
+# for models that aren't in this mapping.
+MLA_BENCH_MODELS: dict[str, str] = {
+    "DeepSeek-R1": "deepseek-V3",
+    "Kimi-K2 Thinking": "kimik25-tp4",
+}
 
 
 class KernelHandler(ABC):
@@ -394,16 +404,27 @@ class MhaKernelHandler(KernelHandler):
 
     def build_args(self) -> str:
         shape = self._shape
-        # bshd (batch-seq-head-dim) - fwd
-        # thd (token-head-dim) - fwd_varlen with equal seq lens
+        # bshd uses fwd. thd uses fwd_varlen with equal sequence lengths.
         fn = "fwd_varlen" if self._mha_layout == "thd" else "fwd"
-        sliding_window_left = shape.get("sliding_window_left", -1)
+        window_left = int(shape.get("sliding_window_left", -1))
+        window_right = int(shape.get("sliding_window_right", -1))
         sink = shape.get("sink", None)
+        has_window = window_left >= 0 or window_right >= 0
+        # Pass both window bounds. An omitted window option in bench_mha.py runs its default sweep
+        # (dense plus a representative causal sliding window case).
         args = (
             f"-fn {fn} -causal true --dtype bf16 -b {self._batch_size} "
             f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
-            f"-d {shape['dqk']} -dv {shape['dv']} --window-size-left {sliding_window_left} -metric {self._metric}"
+            f"-d {shape['dqk']} -dv {shape['dv']} "
+            f"--window-size-left {window_left} --window-size-right {window_right} "
+            f"-metric {self._metric}"
         )
+        # Native bf16 Triton has no sliding window. dao_ai has the window but
+        # rejects a sink. Gluon has a sink and a left window.
+        if has_window and sink and window_right < 0:
+            args += " -backend gluon"
+        elif has_window and not sink:
+            args += " -impl dao_ai"
         if fn == "fwd_varlen":
             args += " -equal_seqlens"
         if sink:
@@ -440,7 +461,7 @@ class MhaKernelHandler(KernelHandler):
             "dqk": shape["dqk"],
             "dv": shape["dv"],
             "mha_layout": self._mha_layout,
-            "sink": shape.get("sink", "false"),
+            "sink": bool(shape.get("sink", False)),
             "sliding_window": shape.get("sliding_window_left", None),
             self._metric: bench_result,
         }
@@ -459,7 +480,8 @@ class MlaKernelHandler(KernelHandler):
 
     def build_args(self) -> str:
         return (
-            f"--model deepseek-V3 --dtype bf16 --tensor-parallelism {self._tp} "
+            f"--model {MLA_BENCH_MODELS[self._model]} --dtype bf16 "
+            f"--tensor-parallelism {self._tp} "
             f"-b {self._batch_size} --seqlen {self._seq_len} -equal_seqlens -causal"
         )
 
@@ -474,6 +496,14 @@ class MlaKernelHandler(KernelHandler):
         data = lines[2]
         if len(data) < 10:
             raise ValueError(f"Unexpected MLA bench data line: {data!r}")
+        # Columns: row_idx, model, B, H, S, kv_lora_rank, qk_rope_head_dim,
+        #          rotary_dim, num_kv_splits, <time>.
+        # The benchmark takes the head count from model_configs.json, so check
+        # it against the head count from model_shapes.json.
+        if int(float(data[3])) != self._shape["hq"]:
+            raise ValueError(
+                f"MLA bench head count H={data[3]} doesn't match hq={self._shape['hq']}"
+            )
         return float(data[9])
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
@@ -575,20 +605,52 @@ def read_json(json_path: str) -> ModelShapesData:
     return data
 
 
+def validate_result(value: float | str, handler: KernelHandler) -> float | str:
+    # Time, throughput, and bandwidth are always positive. Zero or negative is
+    # considered sentinel value.
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        print(f"Non-numeric result on {handler.to_str()}: {value!r}")
+        return "N/A"
+    if not math.isfinite(number) or number <= 0:
+        print(f"Invalid result on {handler.to_str()}: {value!r}")
+        return "N/A"
+    return value
+
+
 def call_function(
     bench_fn: Callable[[list[str]], None], handler: KernelHandler
-) -> str | None:
+) -> float | str:
     stdout = io.StringIO()
     stderr = io.StringIO()
-    raw_result: str | None = None
+    result: float | str = "N/A"
 
     try:
-        with redirect_stdout(stdout), redirect_stderr(stderr):
+        with (
+            warnings.catch_warnings(record=True) as captured_warnings,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
             bench_fn(shlex.split(handler.build_args()))
+        warning_output = "".join(
+            warnings.formatwarning(
+                message=w.message,
+                category=w.category,
+                filename=w.filename,
+                lineno=w.lineno,
+                line=w.line,
+            )
+            for w in captured_warnings
+        )
+        if warning_output:
+            # TODO: Replace this print statement with proper logging - warning.
+            print(f"Warnings stream isn't empty: [{warning_output}]")
         if stderr.getvalue():
+            # TODO: Replace this print statement with proper logging - error.
             print(f"Standard error stream isn't empty: [{stderr.getvalue()}]")
         else:
-            raw_result = stdout.getvalue()
+            result = validate_result(handler.parse_stdout(stdout.getvalue()), handler)
     except OutOfResources as e:
         # Parse the error message to extract required LDS and hardware limit.
         # Expected format: "out of resource: shared memory, Required: XXXX, Hardware limit: XXXX..."
@@ -611,7 +673,7 @@ def call_function(
 
     # Close matplotlib figures to silence errors and avoid memory leaks.
     plt.close("all")
-    return raw_result
+    return result
 
 
 def print_and_save_results(
@@ -679,9 +741,17 @@ def run_benchmarks(
                 print(f"FP4 is not supported on this device. Skipping {kernel}.")
                 continue
 
-            if kernel == "moe_op_gemm_a8w8" and arch_info.get_arch() != "gfx950":
+            if kernel == "moe_op_gemm_a8w8" and not arch_info.is_fp8_avail():
+                print(f"FP8 is not supported on this device. Skipping {kernel}.")
+                continue
+
+            # bench_mla_decode.py hardcodes the DeepSeek-V3 MLA dimensions and
+            # takes only the head count from model_configs.json. Run it only for
+            # models with a model_configs.json entry in MLA_BENCH_MODELS.
+            if kernel == "mla" and model not in MLA_BENCH_MODELS:
                 print(
-                    f"Float8 x MX is not supported on this device. Skipping {kernel}."
+                    f"Skipping mla for model '{model}': "
+                    "bench_mla_decode.py has no config for this model."
                 )
                 continue
 
@@ -697,11 +767,7 @@ def run_benchmarks(
                 for batch_size in batch_sizes:
                     for seq_len in seq_lens:
                         handler.set_iteration(shape, batch_size, seq_len)
-                        stdout = call_function(bench_fn, handler)
-                        if stdout is not None:
-                            bench_result = handler.parse_stdout(stdout)
-                        else:
-                            bench_result = "N/A"
+                        bench_result = call_function(bench_fn, handler)
                         results.append(handler.build_result_row(bench_result))
     return results
 
