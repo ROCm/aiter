@@ -25,6 +25,10 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_hgemm
+from aiter.ops.flydsl.gemm_kernels import (
+    flydsl_hgemm_supports_shape,
+    get_flydsl_hgemm_kernel_params,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -72,6 +76,8 @@ _TUNED = [
     (800, 384, 7168, 64, 96, 64, 4, 4, 2, 2, 1, 0, False),
     (32, 7168, 2048, 32, 32, 64, 8, 1, 2, 1, 1, 0, False),
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
+    # M * N > 2^31
+    (360448, 6144, 1280, 256, 256, 64, 2, 1, 2, 4, 1, 0, True),
 ]
 
 
@@ -209,6 +215,60 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     return ret
 
 
+def check_shape_limits():
+    params = get_flydsl_hgemm_kernel_params(
+        "flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias1_ktail0_gm0_pht_gfx950"
+    )
+    # A must stay below the 4 GiB flat-buffer limit: 1677721 * 1280 * 2 < 2^32.
+    assert flydsl_hgemm_supports_shape(1677721, 6144, 1280, params)
+    assert not flydsl_hgemm_supports_shape(1677722, 6144, 1280, params)
+
+
+def check_strided_out():
+    # A row-strided `out` (a view into a larger buffer) is written in place.
+    for row in _TUNED:
+        m, n, k, policy, split_k, tile = _unpack(row)
+        if (m, n, k, policy, split_k) not in (
+            (32, 14336, 4096, "ft", 1),
+            (4096, 4096, 4096, "hti", 1),
+            (16, 5120, 2880, "ft", 3),
+        ):
+            continue
+        torch.manual_seed(SEED)
+        a = torch.empty((m, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
+        parent = torch.full(
+            (m + tile["block_m"], n + tile["block_n"]), 4096.0, dtype=dtypes.bf16
+        )
+        out = parent[:m, :n]
+        y = flydsl_hgemm(
+            a,
+            w,
+            out=out,
+            block_m=tile["block_m"],
+            block_n=tile["block_n"],
+            block_k=tile["block_k"],
+            stages=tile["stages"],
+            split_k=tile["split_k"],
+            m_waves=tile["m_waves"],
+            n_waves=tile["n_waves"],
+            k_waves=tile["k_waves"],
+            group_m=tile["group_m"],
+            policy=policy,
+        )
+        assert y is out
+        assert torch.all(parent[m:] == 4096) and torch.all(parent[:, n:] == 4096)
+        atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtypes.bf16)
+        err = checkAllclose(
+            run_torch(a, w, dtypes.bf16).to(dtypes.fp32),
+            y.to(dtypes.fp32),
+            rtol=rtol,
+            atol=atol,
+            msg=f"strided out {m}x{n}x{k} {policy} ks{split_k}",
+        )
+        assert err == 0
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -248,6 +308,8 @@ def main():
     )
     args = parser.parse_args()
     wanted = set(args.mnk)
+    check_shape_limits()
+    check_strided_out()
 
     for dtype in args.dtype:
         rows = []
