@@ -1,4 +1,5 @@
 import argparse
+import functools
 import itertools
 import sys
 
@@ -7,7 +8,15 @@ import triton
 
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.utils.types import e4m3_dtype
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    do_bench_aiter_triton,
+    generate_rotating_buffers_pool,
+)
 from op_tests.triton_tests.attention.test_unified_attention import (
     ref_paged_attn,
     shuffle_kv_cache,
@@ -141,6 +150,178 @@ def make_inputs(
     }
 
 
+def _make_seqlens(BATCH, N_CTX_Q, N_CTX_K, varlen, DECODE_P):
+    if isinstance(N_CTX_Q, list):
+        seqlens_q = torch.tensor(N_CTX_Q, dtype=torch.int32, device="cuda")
+    elif varlen:
+        seqlens_q = torch.randint(
+            1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda"
+        )
+    else:
+        seqlens_q = torch.full((BATCH,), N_CTX_Q, dtype=torch.int32, device="cuda")
+
+    if isinstance(N_CTX_K, list):
+        seqlens_k = torch.tensor(N_CTX_K, dtype=torch.int32, device="cuda")
+    elif varlen:
+        seqlens_k = torch.randint(
+            1, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda"
+        )
+    else:
+        seqlens_k = torch.full((BATCH,), N_CTX_K, dtype=torch.int32, device="cuda")
+
+    seqlens_k = torch.maximum(seqlens_k, seqlens_q)
+
+    if DECODE_P > 0.0:
+        num_decode = round(DECODE_P * BATCH)
+        if num_decode > 0:
+            decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
+            seqlens_q[decode_idx] = 1
+
+    return seqlens_q, seqlens_k
+
+
+def _generate_ua_pool_inputs(
+    BATCH,
+    N_CTX_Q,
+    N_CTX_K,
+    HQ,
+    HK,
+    D_HEAD,
+    D_HEAD_V,
+    DECODE_P,
+    varlen,
+    block_size,
+    num_blocks,
+    fp8_q,
+    fp8_kv,
+    fp8_output,
+    out_scale_value,
+    shuffled_kv_cache,
+):
+    """Build one full request batch: random per-sequence lengths, a fresh KV
+    cache, and (optionally) its FP8/shuffled views.
+
+    Pure setup, not measured. Each call is one rotating-buffer pool entry:
+    independent random sequence lengths and cache contents, so replaying
+    through the pool during timing defeats cache residency and avoids biasing
+    the measurement on a single lucky/unlucky varlen draw.
+    """
+    seqlens_q, seqlens_k = _make_seqlens(BATCH, N_CTX_Q, N_CTX_K, varlen, DECODE_P)
+
+    inputs = make_inputs(
+        seq_lens=list(zip(seqlens_q.tolist(), seqlens_k.tolist())),
+        num_heads=(HQ, HK),
+        head_size_qk=D_HEAD,
+        head_size_v=D_HEAD_V,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=fp8_q,
+        fp8_kv=fp8_kv,
+        fp8_output=fp8_output,
+        out_scale_value=out_scale_value,
+    )
+
+    q = inputs["q_fp8"] if fp8_q else inputs["query"]
+    # The kernel reads the (optionally) shuffled layout; k_ref/v_ref stay
+    # unshuffled for the reference correctness check.
+    k_ref = inputs["k_fp8"] if fp8_kv else inputs["key_cache"]
+    v_ref = inputs["v_fp8"] if fp8_kv else inputs["value_cache"]
+    if shuffled_kv_cache:
+        k, v = shuffle_kv_cache(k_ref, v_ref)
+    else:
+        k, v = k_ref, v_ref
+
+    return (
+        q,
+        k,
+        v,
+        k_ref,
+        v_ref,
+        inputs["output"],
+        inputs["cu_query_lens"],
+        inputs["kv_lens"],
+        inputs["query_lens"],
+        inputs["block_tables"],
+        inputs["q_descale"],
+        inputs["k_descale"],
+        inputs["v_descale"],
+        inputs["out_scale"],
+        inputs["max_query_len"],
+        inputs["max_kv_len"],
+        inputs["scale"],
+    )
+
+
+_UA_POOL_FIELDS = [
+    "q",
+    "k",
+    "v",
+    "k_ref",
+    "v_ref",
+    "output",
+    "cu_seqlens_q",
+    "seqused_k",
+    "query_lens",
+    "block_table",
+    "q_descale",
+    "k_descale",
+    "v_descale",
+    "output_scale",
+    "max_seqlen_q",
+    "max_seqlen_k",
+    "softmax_scale",
+]
+
+
+def _make_unified_attention_fn(window_size, shuffled_kv_cache, backend):
+    """Parameterized unified_attention callable for do_bench_aiter_triton.
+
+    Argument names match a rotating-buffer pool entry's keys (``**_``
+    absorbs the ones the kernel call does not need).
+    """
+
+    def kernel_fn(
+        q,
+        k,
+        v,
+        output,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        **_,
+    ):
+        unified_attention(
+            q=q,
+            k=k,
+            v=v,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_table,
+            softcap=0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            output_scale=output_scale,
+            shuffled_kv_cache=shuffled_kv_cache,
+            backend=backend,
+        )
+
+    return kernel_fn
+
+
 def _mode_label(args):
     parts = []
     if args.fp8:
@@ -161,6 +342,8 @@ def run_benchmark(custom, args):
 
     any_fp8 = args.fp8 or args.fp8_kv or args.fp8_output
     label = _mode_label(args)
+    kwargs_do_bench_graph = get_do_bench_graph_kwargs(args)
+    kwargs_rot_bufs = get_rot_bufs_kwargs(args)
 
     def create_configs():
         hk = args.hq if not args.hk else args.hk
@@ -226,67 +409,24 @@ def run_benchmark(custom, args):
     ):
         varlen = not args.equal_seqlens
 
-        if isinstance(N_CTX_Q, list):
-            seqlens_q = torch.tensor(N_CTX_Q, dtype=torch.int32, device="cuda")
-        elif varlen:
-            seqlens_q = torch.randint(
-                1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda"
-            )
-        else:
-            seqlens_q = torch.full((BATCH,), N_CTX_Q, dtype=torch.int32, device="cuda")
-
-        if isinstance(N_CTX_K, list):
-            seqlens_k = torch.tensor(N_CTX_K, dtype=torch.int32, device="cuda")
-        elif varlen:
-            seqlens_k = torch.randint(
-                1, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda"
-            )
-        else:
-            seqlens_k = torch.full((BATCH,), N_CTX_K, dtype=torch.int32, device="cuda")
-
-        seqlens_k = torch.maximum(seqlens_k, seqlens_q)
-
-        if DECODE_P > 0.0:
-            num_decode = round(DECODE_P * BATCH)
-            if num_decode > 0:
-                decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
-                seqlens_q[decode_idx] = 1
-
+        # Fixed across pool entries: sized off the sweep point's upper bound
+        # (N_CTX_K), not any one entry's random draw, so block_tables stays a
+        # consistent shape across the whole rotating pool.
+        n_ctx_k_max = max(N_CTX_K) if isinstance(N_CTX_K, list) else N_CTX_K
         block_size = args.block_size if args.block_size else 512
-        max_num_blocks_per_seq = (seqlens_k.max().item() + block_size - 1) // block_size
+        max_num_blocks_per_seq = (n_ctx_k_max + block_size - 1) // block_size
         min_required_blocks = BATCH * max_num_blocks_per_seq
         num_blocks = (
             args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
         )
 
-        inputs = make_inputs(
-            seq_lens=list(zip(seqlens_q.tolist(), seqlens_k.tolist())),
-            num_heads=(HQ, HK),
-            head_size_qk=D_HEAD,
-            head_size_v=D_HEAD_V,
-            block_size=block_size,
-            num_blocks=num_blocks,
-            fp8_q=args.fp8,
-            fp8_kv=args.fp8 or args.fp8_kv,
-            fp8_output=args.fp8_output,
-            out_scale_value=args.out_scale,
-        )
-
-        q_tensor = inputs["q_fp8"] if args.fp8 else inputs["query"]
-        k_tensor = inputs["k_fp8"] if (args.fp8 or args.fp8_kv) else inputs["key_cache"]
-        v_tensor = (
-            inputs["v_fp8"] if (args.fp8 or args.fp8_kv) else inputs["value_cache"]
-        )
-        # The kernel reads the shuffled layout; the reference below still uses
-        # the unshuffled caches held in `inputs`.
         if args.shuffled_kv_cache:
-            assert (
-                D_HEAD == D_HEAD_V
-            ), "Shuffled KV cache requires equal Q/K and V head sizes"
-            assert (
-                block_size >= 16 and block_size & (block_size - 1) == 0
-            ), "Shuffled KV cache requires a power-of-2 block size >= 16"
-            k_tensor, v_tensor = shuffle_kv_cache(k_tensor, v_tensor)
+            assert D_HEAD == D_HEAD_V, (
+                "Shuffled KV cache requires equal Q/K and V head sizes"
+            )
+            assert block_size >= 16 and block_size & (block_size - 1) == 0, (
+                "Shuffled KV cache requires a power-of-2 block size >= 16"
+            )
 
         window_size = (
             (args.sliding_window - 1, 0)
@@ -294,62 +434,58 @@ def run_benchmark(custom, args):
             else (-1, -1)
         )
 
-        def fn():
-            return unified_attention(
-                q=q_tensor,
-                k=k_tensor,
-                v=v_tensor,
-                out=inputs["output"],
-                cu_seqlens_q=inputs["cu_query_lens"],
-                seqused_k=inputs["kv_lens"],
-                max_seqlen_q=inputs["max_query_len"],
-                max_seqlen_k=inputs["max_kv_len"],
-                softmax_scale=inputs["scale"],
-                causal=True,
-                window_size=window_size,
-                block_table=inputs["block_tables"],
-                softcap=0,
-                q_descale=inputs["q_descale"],
-                k_descale=inputs["k_descale"],
-                v_descale=inputs["v_descale"],
-                output_scale=inputs["out_scale"],
-                shuffled_kv_cache=args.shuffled_kv_cache,
-                backend=args.backend,
-            )
+        pool_gen = functools.partial(
+            _generate_ua_pool_inputs,
+            BATCH,
+            N_CTX_Q,
+            N_CTX_K,
+            HQ,
+            HK,
+            D_HEAD,
+            D_HEAD_V,
+            DECODE_P,
+            varlen,
+            block_size,
+            num_blocks,
+            args.fp8,
+            args.fp8 or args.fp8_kv,
+            args.fp8_output,
+            args.out_scale,
+            args.shuffled_kv_cache,
+        )
+        rot_bufs = generate_rotating_buffers_pool(
+            [pool_gen], [_UA_POOL_FIELDS], **kwargs_rot_bufs
+        )
+        kernel_fn = _make_unified_attention_fn(
+            window_size, args.shuffled_kv_cache, args.backend
+        )
 
-        ms = triton.testing.do_bench_cudagraph(fn)
+        ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
 
+        sample = rot_bufs[0]
         if args.test:
-            fn()
+            kernel_fn(**sample)
             ref_output = ref_paged_attn(
-                query=inputs["q_fp8"] if args.fp8 else inputs["query"],
-                key_cache=(
-                    inputs["k_fp8"]
-                    if (args.fp8 or args.fp8_kv)
-                    else inputs["key_cache"]
-                ),
-                value_cache=(
-                    inputs["v_fp8"]
-                    if (args.fp8 or args.fp8_kv)
-                    else inputs["value_cache"]
-                ),
-                query_lens=inputs["query_lens"],
-                kv_lens=inputs["kv_lens"],
-                block_tables=inputs["block_tables"],
-                scale=inputs["scale"],
+                query=sample["q"],
+                key_cache=sample["k_ref"],
+                value_cache=sample["v_ref"],
+                query_lens=sample["query_lens"],
+                kv_lens=sample["seqused_k"],
+                block_tables=sample["block_table"],
+                scale=sample["softmax_scale"],
                 sliding_window=args.sliding_window,
                 soft_cap=None,
-                q_descale=inputs["q_descale"],
-                k_descale=inputs["k_descale"],
-                v_descale=inputs["v_descale"],
-                output_scale=inputs["out_scale"],
-                out_dtype=inputs["output"].dtype,
+                q_descale=sample["q_descale"],
+                k_descale=sample["k_descale"],
+                v_descale=sample["v_descale"],
+                output_scale=sample["output_scale"],
+                out_dtype=sample["output"].dtype,
             )
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
             else:
                 atol, rtol = 1.5e-2, 1e-2
-            out_f32 = inputs["output"].to(torch.float32)
+            out_f32 = sample["output"].to(torch.float32)
             ref_f32 = ref_output.to(torch.float32)
             max_diff = torch.max(torch.abs(out_f32 - ref_f32)).item()
             shape_str = f"(B={BATCH}, HQ={HQ}, HK={HK}, SQ={N_CTX_Q}, SK={N_CTX_K}, D={D_HEAD}, DV={D_HEAD_V})"
@@ -360,7 +496,10 @@ def run_benchmark(custom, args):
                 print(f"  FAIL {shape_str}  max_diff={max_diff:.6f}")
                 print(f"    {e}")
 
-        cu_query_lens = inputs["cu_query_lens"]
+        # Metrics are computed from one representative pool entry -- the
+        # original single-buffer benchmark was equally a single random draw.
+        cu_query_lens = sample["cu_seqlens_q"]
+        seqlens_k = sample["seqused_k"]
         num_contexts = len(cu_query_lens) - 1
         # Kernel disables windowing for non-positive values (SLIDING_WINDOW > 0).
         window = (
@@ -389,10 +528,10 @@ def run_benchmark(custom, args):
             total_k += kv_read
 
         total_q = cu_query_lens[-1].item()
-        q_bytes = total_q * HQ * D_HEAD * q_tensor.element_size()
-        k_bytes = total_k * HK * D_HEAD * k_tensor.element_size()
-        v_bytes = total_k * HK * D_HEAD_V * v_tensor.element_size()
-        o_bytes = total_q * HQ * D_HEAD_V * inputs["output"].element_size()
+        q_bytes = total_q * HQ * D_HEAD * sample["q"].element_size()
+        k_bytes = total_k * HK * D_HEAD * sample["k"].element_size()
+        v_bytes = total_k * HK * D_HEAD_V * sample["v"].element_size()
+        o_bytes = total_q * HQ * D_HEAD_V * sample["output"].element_size()
         mem = q_bytes + k_bytes + v_bytes + o_bytes
 
         if args.metric == "time":
@@ -514,9 +653,9 @@ def main(args: list[str] | None = None) -> None:
         custom_config = True
         if not args.dv:
             args.dv = args.d
-        assert (
-            args.b and args.hq and args.sq and args.d and args.dv
-        ), "Custom config requires -b, -hq, -sq, -d (and optionally -dv)"
+        assert args.b and args.hq and args.sq and args.d and args.dv, (
+            "Custom config requires -b, -hq, -sq, -d (and optionally -dv)"
+        )
 
     run_benchmark(custom_config, args)
 
