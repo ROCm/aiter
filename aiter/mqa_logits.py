@@ -147,7 +147,7 @@ def flydsl_operands_packed(kv_scales, weights, cu_starts, cu_ends) -> bool:
 
     The FlyDSL wrapper makes Q and KV contiguous but only reshapes these, and the
     kernel addresses them as packed rows, so a strided view is misread. Triton
-    takes their strides.
+    takes the strides of ``weights`` only; ``run_mqa_logits`` rejects the others.
     """
     return all(t.is_contiguous() for t in (kv_scales, weights, cu_starts, cu_ends))
 
@@ -163,11 +163,19 @@ def run_mqa_logits(
     clean_logits: bool = True,
 ) -> torch.Tensor:
     """Launch one explicit config. ``mqa_logits`` and the tuner share it."""
+    # Neither backend takes strides for these, so a strided view would be misread.
+    for name, t in (
+        ("kv_scales", kv_scales),
+        ("cu_starts", cu_starts),
+        ("cu_ends", cu_ends),
+    ):
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous, got strides {t.stride()}")
     if config["backend"] == "flydsl":
-        if not flydsl_operands_packed(kv_scales, weights, cu_starts, cu_ends):
+        if not weights.is_contiguous():
             raise ValueError(
-                "FlyDSL mqa_logits needs contiguous kv_scales, weights, cu_starts "
-                "and cu_ends; mqa_logits() runs strided ones on Triton"
+                "FlyDSL mqa_logits needs a contiguous weights; mqa_logits() runs a "
+                "strided one on Triton"
             )
         return _flydsl_kernels().flydsl_fp8_mqa_logits(
             Q,
@@ -208,8 +216,9 @@ def mqa_logits(
         clean_logits: write ``-inf`` outside each row's window. If False, those
             positions are unspecified.
 
-    A strided ``kv_scales``, ``weights``, ``cu_starts`` or ``cu_ends`` runs on
-    Triton rather than being copied for FlyDSL.
+    A strided ``weights`` runs on Triton rather than being copied for FlyDSL. A
+    strided ``kv_scales``, ``cu_starts`` or ``cu_ends`` raises ``ValueError``:
+    neither backend reads one correctly.
 
     Returns:
         ``[seq_len, seq_len_kv]`` float32 logits.

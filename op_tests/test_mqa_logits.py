@@ -208,7 +208,8 @@ def check_flydsl_fallback_uses_triton():
 
 def check_strided_weights_match_reference():
     """A ``weights`` view with row stride 2H, on a shape the table sends to FlyDSL,
-    must still give the reference logits; FlyDSL reads rows as packed."""
+    must still give the reference logits; FlyDSL reads rows as packed. A strided
+    ``kv_scales`` must be rejected, since neither backend takes its stride."""
     row = _shipped_flydsl_row()
     seq_len, seq_len_kv = (row[0], row[1]) if row else (1024, 8192)
     inp = build_inputs(seq_len, seq_len_kv)
@@ -231,6 +232,23 @@ def check_strided_weights_match_reference():
             pass
         else:
             raise AssertionError("FlyDSL accepted strided weights")
+
+    # Neither backend takes strides for kv_scales, so both must reject a view.
+    inp["weights"] = inp["weights"].contiguous()
+    base = torch.empty(
+        (2 * seq_len_kv,), dtype=torch.float32, device=inp["kv_scales"].device
+    )
+    base[::2] = inp["kv_scales"]
+    inp["kv_scales"] = base[::2]
+    for name, launch in (
+        ("mqa_logits", lambda: mql.mqa_logits(*launch_args(inp))),
+        ("triton", lambda: mql.run_mqa_logits(mql.DEFAULT_CONFIG, *launch_args(inp))),
+    ):
+        try:
+            launch()
+        except ValueError:
+            continue
+        raise AssertionError(f"{name} accepted a strided kv_scales")
 
 
 def main():
