@@ -19,8 +19,15 @@ from .gemm_util import (
     BScaleLoader,
     BWeightLoader,
     MfmaScaleGU,
+    PackedAScaleLoader,
+    ScopedAS2RLoader,
+    ScopedAScaleLoader,
     SiluQuantEpilogue,
+    SwizzledQuantEpilogue,
     TileScheduler,
+    UniformATileLoader,
+    make_lds_dma_scopes,
+    opaque_sgpr,
     wait_lds_barrier,
 )
 
@@ -283,6 +290,295 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
     epi.store(acc, m_tile, tile_row_base, n_tile_base)
 
 
+def _kstep_b_early(mfma, a_load, b_prev, acc, sa, sb, b_issue):
+    """One A-major K step with A ds_read lookahead 1.
+
+    ``b_issue()`` issues every B pack of the next K step up front, ksub-major
+    (the order the next step consumes them; vmcnt retires in order), and
+    returns them; None for the last step.
+    """
+    nn = mfma._num_acc_n
+    groups = [(mi, ks) for mi in range(mfma._m_repeat) for ks in range(_PACK)]
+    ngrp = len(groups)
+    a_cur = a_load(*groups[0])
+    b_next = b_issue() if b_issue is not None else None
+    for g in range_constexpr(ngrp):
+        mi, ksub = groups[g]
+        a_nxt = a_load(*groups[g + 1]) if g + 1 < ngrp else None
+        for ni in range_constexpr(nn):
+            aidx = mfma.idx(mi, ni)
+            acc[aidx] = mfma._mfma(
+                a_cur, b_prev[ni][ksub], acc[aidx], sa[mi // _PACK],
+                sb[ni // _PACK], ksub, mi % _PACK, ni % _PACK,
+            )
+        a_cur = a_nxt
+    return acc, b_next
+
+
+def _b_issuer(b_loader, b_row, num_acc_n, kstep):
+    def _issue():
+        out = [[None] * _PACK for _ in range(num_acc_n)]
+        for ks in range_constexpr(_PACK):
+            for ni in range_constexpr(num_acc_n):
+                out[ni][ks] = b_loader._load_pack(b_row, ni, kstep, ks)
+        return out
+
+    return _issue
+
+
+# fmt: off
+@flyc.jit
+def do_tile_prefill(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi,
+    a_buf, a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, trb_rsrc, tib_rsrc,
+    indirect_input):
+# fmt: on
+    """128-row tile with LDS-DMA A (pipe_weights, A-major MFMA order).
+
+    Per K step: the next step's A copy, B scale and A scale are issued
+    first, then every next-step B pack, then the MFMAs.  The K loop is
+    unrolled by two so the B double buffer alternates register sets (no
+    loop-carried copies and no vmcnt(0) at the loop top), and the ping-pong
+    A offsets go through ``opaque_sgpr`` so their addresses are not hoisted
+    and spilled.
+    """
+    N_ACC = M_REPEAT * NUM_ACC_N
+    NUM_B_SCALE = NUM_ACC_N // _PACK
+    NUM_A_SCALE = M_REPEAT // _PACK
+    NB = NUM_ACC_N * _PACK
+    SB0 = N_ACC + NB
+    SA0 = SB0 + NUM_B_SCALE
+    last_i = K_ITERS - 1
+    tile_row_base = trb_rsrc[m_tile]
+    tile_input_base = tile_row_base
+    if const_expr(indirect_input):
+        tile_input_base = tib_rsrc[m_tile]
+    b_row = sched.gate_base_row(expert) + n_tile_base
+    a_gather.for_tile(tile_input_base)
+    a_gather.prefetch_to_lds(fx.Int32(0), a_buf, fx.Int32(0))
+    a_scale.stage(a_scale_lds, tile_input_base)
+    wait_lds_barrier(0)
+
+    def flat_b(bl):
+        return [h for ni_list in bl for h in ni_list]
+
+    def unpack(state):
+        acc = [Vec(state[i]) for i in range(N_ACC)]
+        bk = [[Vec(state[N_ACC + ni * _PACK + ks]) for ks in range(_PACK)]
+              for ni in range(NUM_ACC_N)]
+        sb = [fx.Int32(state[SB0 + g]) for g in range(NUM_B_SCALE)]
+        sa = [fx.Int32(state[SA0 + g]) for g in range(NUM_A_SCALE)]
+        return acc, bk, sb, sa
+
+    def one_step(sp, cur_off, nxt_off, acc, b_cur, sb, sa, clamp=False):
+        # K step sp reads ping-pong cur_off and prefetches step sp + 1 into
+        # nxt_off.  With clamp the prefetch target may be K_ITERS; it is
+        # clamped to the last step (a harmless re-copy into the idle half).
+        spn = sp + fx.Int32(1)
+        if const_expr(clamp):
+            spn = (spn < fx.Int32(last_i)).select(spn, fx.Int32(last_i))
+
+        def a_load(mi, ks, _base=cur_off):
+            return a_s2r.load_operand(a_buf, mi, ks, _base)
+
+        rocdl.sched_barrier(0)
+        a_gather.prefetch_to_lds(spn * fx.Int32(A_K_STEP_BYTES), a_buf, nxt_off)
+        rocdl.sched_barrier(0)
+        sb_next = b_scale.load_step(b_row, spn)
+        sa_next = a_scale.load_step(a_scale_lds, spn)
+        acc, b_next = _kstep_b_early(
+            mfma, a_load, b_cur, acc, sa, sb, _b_issuer(b_loader, b_row, NUM_ACC_N, spn)
+        )
+        wait_lds_barrier(NB + NUM_B_SCALE)
+        return acc, b_next, sb_next, sa_next
+
+    init = [mfma.zero_value for _ in range(N_ACC)]
+    init += flat_b(b_loader.load_step(b_row, fx.Int32(0)))
+    init += b_scale.load_step(b_row, fx.Int32(0))
+    init += a_scale.load_step(a_scale_lds, fx.Int32(0))
+
+    if const_expr(K_ITERS % 2 == 0):
+        # Every K step runs inside the unrolled loop; the last step's
+        # prefetch is clamped and drained before the epilogue.
+        for pi, state in range(0, K_ITERS // 2, 1, init=init):
+            acc, b_cur, sb, sa = unpack(state)
+            sp0 = fx.Int32(pi) * fx.Int32(2)
+            off0 = opaque_sgpr(fx.Int32(0))
+            off1 = opaque_sgpr(fx.Int32(a_lds_i32))
+            acc, b_mid, sb, sa = one_step(sp0, off0, off1, acc, b_cur, sb, sa)
+            acc, b_nxt, sb, sa = one_step(sp0 + fx.Int32(1), off1, off0, acc,
+                                          b_mid, sb, sa, clamp=True)
+            yv = list(acc) + flat_b(b_nxt) + list(sb) + list(sa)
+            state = yield yv
+        acc = [Vec(state[i]) for i in range(N_ACC)]
+        # Drain the clamped prefetch too: the epilogue aliases A_buf as
+        # cshuffle LDS.
+        wait_lds_barrier(0)
+    else:
+        for pi, state in range(0, last_i // 2, 1, init=init):
+            acc, b_cur, sb, sa = unpack(state)
+            sp0 = fx.Int32(pi) * fx.Int32(2)
+            off0 = opaque_sgpr(fx.Int32(0))
+            off1 = opaque_sgpr(fx.Int32(a_lds_i32))
+            acc, b_mid, sb, sa = one_step(sp0, off0, off1, acc, b_cur, sb, sa)
+            acc, b_nxt, sb, sa = one_step(sp0 + fx.Int32(1), off1, off0, acc,
+                                          b_mid, sb, sa)
+            yv = list(acc) + flat_b(b_nxt) + list(sb) + list(sa)
+            state = yield yv
+        acc, b_cur, sb, sa = unpack(state)
+        final_off = opaque_sgpr(fx.Int32((last_i % 2) * a_lds_i32))
+
+        def final_a_load(mi, ks, _base=final_off):
+            return a_s2r.load_operand(a_buf, mi, ks, _base)
+
+        acc, _unused = _kstep_b_early(mfma, final_a_load, b_cur, acc, sa, sb, None)
+        # The epilogue aliases A_buf as cshuffle LDS.
+        wait_lds_barrier()
+    epi.store(acc, m_tile, tile_row_base, n_tile_base)
+
+
+# fmt: off
+@flyc.jit
+def do_tile_pd2(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi,
+    a_buf, a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, trb_rsrc, tib_rsrc,
+    indirect_input, N_DMA):
+# fmt: on
+    """Small decode tile with prefetch distance 2.
+
+    One HBM round trip per K step bounds a decode tile at prefetch distance
+    1.  Here the B packs, the B scales and the A LDS-DMA run two K steps
+    ahead, through a 3-stage A LDS ring (stage k % 3); the loop is unrolled
+    by three so every B register set is fixed, and the two non-issuing tail
+    steps are peeled.
+    """
+    N_ACC = M_REPEAT * NUM_ACC_N
+    NUM_B_SCALE = NUM_ACC_N // _PACK
+    NUM_A_SCALE = M_REPEAT // _PACK
+    NB = NUM_ACC_N * _PACK
+    B0 = N_ACC
+    B1 = B0 + NB
+    S0 = B1 + NB
+    S1 = S0 + NUM_B_SCALE
+    SA = S1 + NUM_B_SCALE
+    tile_row_base = trb_rsrc[m_tile]
+    tile_input_base = tile_row_base
+    if const_expr(indirect_input):
+        tile_input_base = tib_rsrc[m_tile]
+    b_row = sched.gate_base_row(expert) + n_tile_base
+    b_pro = [b_loader.load_step(b_row, fx.Int32(0)),
+             b_loader.load_step(b_row, fx.Int32(1))]
+    sb_pro = [b_scale.load_step(b_row, fx.Int32(0)),
+              b_scale.load_step(b_row, fx.Int32(1))]
+    a_gather.for_tile(tile_input_base)
+    a_gather.prefetch_to_lds(fx.Int32(0), a_buf, fx.Int32(0))
+    a_gather.prefetch_to_lds(fx.Int32(A_K_STEP_BYTES), a_buf, fx.Int32(a_lds_i32))
+    a_scale.stage(a_scale_lds, tile_input_base)
+    wait_lds_barrier(0)
+
+    def flat_b(bl):
+        return [h for ni_list in bl for h in ni_list]
+
+    def unb(state, base):
+        return [[Vec(state[base + ni * _PACK + ks]) for ks in range(_PACK)]
+                for ni in range(NUM_ACC_N)]
+
+    def one_step(sp, acc, b_k, sb_k, sa_k, issue, last=False):
+        # K step sp (runtime); ring stage sp % 3.
+        cur_off = (sp % fx.Int32(3)) * fx.Int32(a_lds_i32)
+
+        def a_load(mi, ks, _base=cur_off):
+            return a_s2r.load_operand(a_buf, mi, ks, _base)
+
+        sa_next = None
+        if const_expr(not last):
+            sa_next = a_scale.load_step(a_scale_lds, sp + fx.Int32(1))
+        sb_n2 = None
+        b_iss = None
+        if const_expr(issue):
+            sp2 = sp + fx.Int32(2)
+            rocdl.sched_barrier(0)
+            nxt_off = (sp2 % fx.Int32(3)) * fx.Int32(a_lds_i32)
+            a_gather.prefetch_to_lds(sp2 * fx.Int32(A_K_STEP_BYTES), a_buf, nxt_off)
+            rocdl.sched_barrier(0)
+            sb_n2 = b_scale.load_step(b_row, sp2)
+            b_iss = _b_issuer(b_loader, b_row, NUM_ACC_N, sp2)
+        acc, b_n2 = _kstep_b_early(mfma, a_load, b_k, acc, sa_k, sb_k, b_iss)
+        if const_expr(not last):
+            if const_expr(issue):
+                wait_lds_barrier(N_DMA + NUM_B_SCALE + NB)
+            else:
+                wait_lds_barrier(0)
+        return acc, b_n2, sb_n2, sa_next
+
+    init = [mfma.zero_value for _ in range(N_ACC)]
+    init += flat_b(b_pro[0]) + flat_b(b_pro[1])
+    init += list(sb_pro[0]) + list(sb_pro[1])
+    init += a_scale.load_step(a_scale_lds, fx.Int32(0))
+
+    n_issue = K_ITERS - 2
+    n_trips = n_issue // 3
+    for ti, state in range(0, n_trips, 1, init=init):
+        acc = [Vec(state[i]) for i in range(N_ACC)]
+        b0 = unb(state, B0)
+        b1 = unb(state, B1)
+        sb0 = [fx.Int32(state[S0 + g]) for g in range(NUM_B_SCALE)]
+        sb1 = [fx.Int32(state[S1 + g]) for g in range(NUM_B_SCALE)]
+        sa0 = [fx.Int32(state[SA + g]) for g in range(NUM_A_SCALE)]
+        sp0 = fx.Int32(ti) * fx.Int32(3)
+        acc, b2, sb2, sa1 = one_step(sp0, acc, b0, sb0, sa0, True)
+        acc, b3, sb3, sa2 = one_step(sp0 + fx.Int32(1), acc, b1, sb1, sa1, True)
+        acc, b4, sb4, sa3 = one_step(sp0 + fx.Int32(2), acc, b2, sb2, sa2, True)
+        yv = list(acc) + flat_b(b3) + flat_b(b4) + list(sb3) + list(sb4) + list(sa3)
+        state = yield yv
+    acc = [Vec(state[i]) for i in range(N_ACC)]
+    bA = unb(state, B0)
+    bB = unb(state, B1)
+    sbA = [fx.Int32(state[S0 + g]) for g in range(NUM_B_SCALE)]
+    sbB = [fx.Int32(state[S1 + g]) for g in range(NUM_B_SCALE)]
+    sa = [fx.Int32(state[SA + g]) for g in range(NUM_A_SCALE)]
+    sp = n_trips * 3
+    for _r in range_constexpr(n_issue % 3):
+        acc, bC, sbC, sa = one_step(fx.Int32(sp), acc, bA, sbA, sa, True)
+        bA, bB, sbA, sbB = bB, bC, sbB, sbC
+        sp += 1
+    acc, _u, _v, sa = one_step(fx.Int32(sp), acc, bA, sbA, sa, False)
+    acc, _u, _v, _w = one_step(fx.Int32(sp + 1), acc, bB, sbB, sa, False, last=True)
+    # The epilogue aliases A_buf as cshuffle LDS.
+    wait_lds_barrier()
+    epi.store(acc, m_tile, tile_row_base, n_tile_base)
+
+
+def _tuned_prefill_tile(*, tuned, sort_block_m, tile_n, num_waves, pipe_weights, mfma_amajor,
+                        async_a_copy, use_tile_resource, indexed_input, a_dtype, out_dtype, model_dim):
+    return bool(
+        tuned and sort_block_m == 128 and tile_n == 512 and num_waves == 8
+        and pipe_weights and mfma_amajor and async_a_copy and use_tile_resource
+        and not indexed_input and a_dtype == "fp8" and out_dtype == "fp8"
+        and (model_dim // 32) % 16 == 0
+    )
+
+
+def _tuned_pd2_tile(*, tuned, sort_block_m, pipe_weights, async_a_copy, indexed_input, a_dtype,
+                    total_threads):
+    # The register-staged A variant (the smallest decode buckets) runs with
+    # LDS-DMA A and prefetch distance 2 instead.
+    return bool(
+        tuned and sort_block_m == 32 and pipe_weights and not async_a_copy
+        and not indexed_input and a_dtype == "fp8"
+        and (sort_block_m * 16) % total_threads == 0
+    )
+
+
+def gemm1_a_lds_stages(*, tuned, sort_block_m, pipe_weights, async_a_copy, indexed_input,
+                       a_dtype, total_threads):
+    """Number of A-tile LDS stages build_fused_gemm1 needs for this variant."""
+    pd2 = _tuned_pd2_tile(
+        tuned=tuned, sort_block_m=sort_block_m, pipe_weights=pipe_weights,
+        async_a_copy=async_a_copy, indexed_input=indexed_input, a_dtype=a_dtype,
+        total_threads=total_threads,
+    )
+    return 3 if pd2 else 2
+
+
 # fmt: off
 def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     out_rsrc, os_rsrc, trb_rsrc, tib_rsrc, expert_rsrc, out_tensor, a_buf, a_scale_lds, c_tile,
@@ -291,25 +587,52 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
-    act="silu", situ_beta=1.0, situ_linear_beta=1.0):
+    act="silu", situ_beta=1.0, situ_linear_beta=1.0, tuned=False):
     # fmt: on
-    """Build the GEMM1 atoms and return its expert resolver and tile runner."""
+    """Build the GEMM1 atoms and return its expert resolver and tile runner.
+
+    ``tuned`` (compact Stage1) selects the tuned tile bodies where they apply:
+    the 128-row prefill tile (do_tile_prefill), the register-staged decode
+    tile as an LDS-DMA prefetch-distance-2 tile (do_tile_pd2), and a
+    wave-uniform A loader for the other LDS-DMA variants.  Outputs are
+    unchanged.
+    """
     sched = TileScheduler(
         expert_rsrc=expert_rsrc,
         inter_dim=inter_dim,
         expert_offset=expert_offset,  # GLOBAL sorted_expert_id -> LOCAL w1 index
     )
     n_wave_base = wave_id * fx.Int32(n_per_wave)
+    prefill_tile = _tuned_prefill_tile(
+        tuned=tuned, sort_block_m=sort_block_m, tile_n=tile_n, num_waves=num_waves,
+        pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, async_a_copy=async_a_copy,
+        use_tile_resource=use_tile_resource, indexed_input=indexed_input, a_dtype=a_dtype,
+        out_dtype=out_dtype, model_dim=model_dim,
+    )
+    pd2_tile = _tuned_pd2_tile(
+        tuned=tuned, sort_block_m=sort_block_m, pipe_weights=pipe_weights,
+        async_a_copy=async_a_copy, indexed_input=indexed_input, a_dtype=a_dtype,
+        total_threads=total_threads,
+    )
+    uniform_a = bool(tuned and not indexed_input and a_dtype == "fp8"
+                     and (async_a_copy or pd2_tile))
+    lds_scopes = make_lds_dma_scopes() if (prefill_tile or pd2_tile) else None
 
     # fmt: off
     a_pack = 2 if a_dtype == "fp4" else 1
-    a_gather = ATileLoader(row_bytes=model_dim // a_pack, sort_block_m=sort_block_m,
+    a_loader_cls = UniformATileLoader if uniform_a else ATileLoader
+    a_gather = a_loader_cls(row_bytes=model_dim // a_pack, sort_block_m=sort_block_m,
         k_step_bytes=a_k_step_bytes, total_threads=total_threads, swizzle=swizzle_a,
-        x_tensor=x_tensor, async_copy=async_a_copy,
+        x_tensor=x_tensor, async_copy=async_a_copy or pd2_tile,
         indexed_input=indexed_input, row_map_rsrc=row_map_rsrc,
         source_rows=source_rows, a_dtype=a_dtype)
     # fmt: on
-    a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a, a_dtype=a_dtype)
+    if lds_scopes is not None:
+        a_gather.lds_scopes = lds_scopes
+        a_s2r = ScopedAS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a,
+                                 a_dtype=a_dtype, lds_scopes=lds_scopes)
+    else:
+        a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a, a_dtype=a_dtype)
     b_loader = BWeightLoader(
         w_rsrc=w_rsrc,
         num_acc_n=num_acc_n,
@@ -317,18 +640,42 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         cache_modifier=b_cache_modifier,
     )
     b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=num_acc_n, model_dim=model_dim)
-    a_scale = AScaleLoader(
-        scale_rsrc=sx_rsrc,
-        m_repeat=m_repeat,
-        model_dim=model_dim,
-        sort_block_m=sort_block_m,
-        total_threads=total_threads,
-        indexed_input=indexed_input,
-        row_map_rsrc=row_map_rsrc,
-    )
+    if prefill_tile:
+        a_scale = PackedAScaleLoader(
+            scale_rsrc=sx_rsrc,
+            m_repeat=m_repeat,
+            model_dim=model_dim,
+            sort_block_m=sort_block_m,
+            total_threads=total_threads,
+            indexed_input=indexed_input,
+            row_map_rsrc=row_map_rsrc,
+            lds_scopes=lds_scopes,
+        )
+    elif pd2_tile:
+        a_scale = ScopedAScaleLoader(
+            scale_rsrc=sx_rsrc,
+            m_repeat=m_repeat,
+            model_dim=model_dim,
+            sort_block_m=sort_block_m,
+            total_threads=total_threads,
+            indexed_input=indexed_input,
+            row_map_rsrc=row_map_rsrc,
+            lds_scopes=lds_scopes,
+        )
+    else:
+        a_scale = AScaleLoader(
+            scale_rsrc=sx_rsrc,
+            m_repeat=m_repeat,
+            model_dim=model_dim,
+            sort_block_m=sort_block_m,
+            total_threads=total_threads,
+            indexed_input=indexed_input,
+            row_map_rsrc=row_map_rsrc,
+        )
     mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n, a_dtype=a_dtype)
+    epi_cls = SwizzledQuantEpilogue if prefill_tile else SiluQuantEpilogue
     # fmt: off
-    epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
+    epi = epi_cls(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
         out_tensor=out_tensor if use_tile_resource else None, evec=evec, out_dtype=out_dtype,
@@ -349,11 +696,23 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
         expert = sched.expert_of(m_tile)
         # fmt: off
-        do_tile(m_tile, n_tile_base, expert, sched, a_gather,
-            a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
-            a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
-            a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input, pair_k)
+        if prefill_tile:
+            do_tile_prefill(m_tile, n_tile_base, expert, sched, a_gather,
+                a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
+                a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
+                a_k_step_bytes, trb_rsrc, tib_rsrc, indirect_input)
+        elif pd2_tile:
+            do_tile_pd2(m_tile, n_tile_base, expert, sched, a_gather,
+                a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
+                a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
+                a_k_step_bytes, trb_rsrc, tib_rsrc, indirect_input,
+                (sort_block_m * 16) // total_threads)
+        else:
+            do_tile(m_tile, n_tile_base, expert, sched, a_gather,
+                a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
+                a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
+                a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
+                trb_rsrc, tib_rsrc, indirect_input, pair_k)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile
