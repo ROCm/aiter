@@ -22,12 +22,13 @@ gfx11 WMMA ``16x16x16`` (v16 operands, v8 f32 accumulator) lane contract:
   C/D       : lane L, slot si holds ``D[2*si + L // 16][L % 16]``
 Operands are chosen so every load is either contiguous per lane or coalesced
 across lanes 0-15; ``compute_out`` builds its P operand from an accumulator of
-``B C^T`` with a single ``xor 16`` lane exchange, so no LDS round trip is needed.
+``B C^T`` with a single ``xor 16`` lane exchange instead of an LDS transpose,
+and stages only the strided x tile (plus decay / dt) in LDS.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32
 from flydsl.expr.typing import Vector as Vec
 
@@ -56,22 +57,41 @@ def _carried(state):
     return [Vec(v) for v in state] if isinstance(state, (list, tuple)) else [Vec(state)]
 
 
-def _row_view(t, vec_loads):
-    """bf16 buffer view addressed by element offset; 8-wide (128-bit) units if ``vec_loads``."""
-    if vec_loads:
-        return ptr_buf_tensor(t, fx.BFloat16, unit_elems=8, unit_stride=1)
-    return ptr_buf_tensor(t, fx.BFloat16)
+def _lds_base(storage_type):
+    """Byte-addressed base of one SharedAllocator buffer (a plain pointer value, so
+    it can cross scf control flow where the storage handle cannot)."""
+    lds = fx.SharedAllocator().allocate(storage_type).peek()
+    return fx.recast_iter(fx.Uint8, lds.buf.ptr)
 
 
-def _load16(view, off, vec_loads):
-    """16 contiguous bf16 at element offset ``off``: two dwordx4 loads or 16 scalar ones."""
-    if vec_loads:
-        lo = buf_copy_load(view, off, fx.BFloat16, unit_elems=8)
-        hi = buf_copy_load(view, off + 8, fx.BFloat16, unit_elems=8)
-        return lo.shuffle(hi, list(range(16)))
-    return Vec.from_elements(
-        [view[off + k] for k in range_constexpr(TILE)], fx.BFloat16
+def _lds_ptr(base, byte_off, elem):
+    ptr_ty = fx.PointerType.get(elem.ir_type, fx.AddressSpace.Shared, elem.width // 8)
+    return fx.recast_iter(ptr_ty, fx.add_offset(base, fx.make_int_tuple(byte_off)))
+
+
+def _lds_load(base, byte_off, elem, n=1):
+    v = Vec(
+        fx.ptr_load(_lds_ptr(base, byte_off, elem), result_type=Vec.make_type(n, elem))
     )
+    return v[0] if n == 1 else v
+
+
+def _lds_store(base, byte_off, elem, val):
+    if not isinstance(val, Vec):
+        val = Vec.from_elements([val], elem)
+    fx.ptr_store(val, _lds_ptr(base, byte_off, elem))
+
+
+def _row_view(t):
+    """bf16 buffer view addressed by element offset, read 8 elements (128 bits) at a time."""
+    return ptr_buf_tensor(t, fx.BFloat16, unit_elems=8, unit_stride=1)
+
+
+def _load16(view, off):
+    """16 contiguous bf16 at element offset ``off`` (16-byte aligned): two dwordx4 loads."""
+    lo = buf_copy_load(view, off, fx.BFloat16, unit_elems=8)
+    hi = buf_copy_load(view, off + 8, fx.BFloat16, unit_elems=8)
+    return lo.shuffle(hi, list(range(16)))
 
 
 def build_chunk_cumsum(num_heads, chunk_size, block_h):
@@ -273,20 +293,34 @@ def build_fwd_pass_state(
     return launch
 
 
-def build_compute_out(
-    num_heads, num_groups, head_size, state_size, chunk_size, rp, vec_loads
-):
+def build_compute_out(num_heads, num_groups, head_size, state_size, chunk_size, rp):
     """One block per (chunk, p-tile, batch*head); wave w owns token rows 16w..16w+15.
 
-    ``vec_loads`` reads the contiguous B / C / state rows 128 bits at a time;
-    which width wins depends on the shape, so it is tuned.
+    The block first stages the chunk's x tile (transposed) and its decay / dt
+    into LDS with coalesced 128-bit loads, so the waves' source-tile loops read
+    the strided x operand from LDS instead of gathering it from memory. B, C and
+    the chunk-entry state rows are contiguous and stay 128-bit global reads
+    (staging B too costs more occupancy than it saves).
     """
     H, G, P, N, L = num_heads, num_groups, head_size, state_size, chunk_size
     HPG = H // G
     NWAVES = L // TILE
+    THREADS = NWAVES * WAVE
     NK = N // TILE
     BP = TILE * rp
     assert P % BP == 0 and N % TILE == 0 and L % TILE == 0
+
+    # LDS rows are padded by 8 elements (16 bytes) to spread banks while
+    # keeping every 16-element operand read 16-byte aligned.
+    XS = L + 8
+    X_OFF = 0
+    DEC_OFF = X_OFF + BP * XS * 2
+    DT_OFF = DEC_OFF + L * 4
+    LDS_TOTAL = DT_OFF + L * 4
+
+    @fx.struct
+    class SharedStorage:
+        buf: fx.Array[fx.Uint8, LDS_TOTAL, 16]
 
     @flyc.kernel
     def compute_out_kernel(
@@ -300,14 +334,15 @@ def build_compute_out(
         out: fx.Tensor,
         num_tokens: Int32,
     ):
-        x_r = ptr_buf_tensor(x, fx.BFloat16)
-        b_rows = _row_view(b, vec_loads)
-        c_rows = _row_view(c, vec_loads)
+        x_rows = _row_view(x)
+        b_rows = _row_view(b)
+        c_rows = _row_view(c)
+        hid_rows = _row_view(hiddens)
         d_r = ptr_buf_tensor(d, fx.Float32)
         dec_r = ptr_buf_tensor(decay, fx.Float32)
         dt_r = ptr_buf_tensor(dt_bht, fx.Float32)
-        hid_rows = _row_view(hiddens, vec_loads)
         out_w = ptr_buf_tensor(out, fx.BFloat16)
+        lds = _lds_base(SharedStorage)
 
         tid = fx.thread_idx.x
         wave = tid // WAVE
@@ -329,14 +364,32 @@ def build_compute_out(
         bc_chunk = (batch * num_tokens + t_chunk) * bc_row + g * N
         x_chunk = (batch * num_tokens + t_chunk) * x_row + h * P
 
-        # A-operand row of this lane: token t_a = 16*wave + l16 of the chunk.
-        t_a = TILE * wave + l16
-        d_ta = fx.Float32(dec_r[tok_base + t_a])
-
-        c_base = bc_chunk + t_a * bc_row
+        # ---- stage the chunk into LDS ----
+        for k in range_constexpr(BP // 16):  # x tile, written transposed: xT[p][s]
+            u = tid + k * THREADS
+            s = u // (BP // 8)
+            pc = u % (BP // 8) * 8
+            v = buf_copy_load(
+                x_rows, x_chunk + s * x_row + p0 + pc, fx.BFloat16, unit_elems=8
+            )
+            for j in range_constexpr(8):
+                _lds_store(lds, X_OFF + ((pc + j) * XS + s) * 2, fx.BFloat16, v[j])
+        if tid < L:
+            _lds_store(
+                lds, DEC_OFF + tid * 4, fx.Float32, fx.Float32(dec_r[tok_base + tid])
+            )
+            _lds_store(
+                lds, DT_OFF + tid * 4, fx.Float32, fx.Float32(dt_r[tok_base + tid])
+            )
+        gpu.barrier()
 
         def c_op(kn):
-            return _load16(c_rows, c_base + TILE * kn, vec_loads)
+            return _load16(c_rows, c_base + TILE * kn)
+
+        # A-operand row of this lane: token t_a = 16*wave + l16 of the chunk.
+        t_a = TILE * wave + l16
+        d_ta = _lds_load(lds, DEC_OFF + t_a * 4, fx.Float32)
+        c_base = bc_chunk + t_a * bc_row
 
         # Carried-state term: (exp2(d_t) * C) @ h^T, h = chunk-entry state [P, N].
         hid_base = (bh * num_chunks + chunk) * (P * N)
@@ -348,29 +401,26 @@ def build_compute_out(
                 [fx.Float32(c_kn[k]) * exp_dt for k in range_constexpr(TILE)]
             )
             for i in range_constexpr(rp):
-                b_op = _load16(
-                    hid_rows,
-                    hid_base + (p0 + TILE * i + l16) * N + TILE * kn,
-                    vec_loads,
+                h_op = _load16(
+                    hid_rows, hid_base + (p0 + TILE * i + l16) * N + TILE * kn
                 )
-                accs[i] = _wmma(a_op, b_op, accs[i])
+                accs[i] = _wmma(a_op, h_op, accs[i])
 
         # Intra-chunk term over source tiles s <= t (causal, so tiles 0..wave).
         for st_iv, state in range(0, wave + 1, 1, init=accs):
-            st = fx.Int32(st_iv)
             s_accs = _carried(state)
-            s0 = st * TILE
+            s0 = fx.Int32(st_iv) * TILE
             # S^T[s, t] = B[s] . C[t]: A = B rows (lane row s0 + l16), B = C rows (lane col t_a).
             sT = Vec.filled(8, 0.0, fx.Float32)
             b_base = bc_chunk + (s0 + l16) * bc_row
             for kn in range_constexpr(NK):
-                sT = _wmma(_load16(b_rows, b_base + TILE * kn, vec_loads), c_op(kn), sT)
+                sT = _wmma(_load16(b_rows, b_base + TILE * kn), c_op(kn), sT)
             # Slot si holds source s = s0 + 2*si + hi for target t_a.
             own = []
             for si in range_constexpr(8):
                 s = s0 + 2 * si + hi
-                d_s = fx.Float32(dec_r[tok_base + s])
-                dt_s = fx.Float32(dt_r[tok_base + s])
+                d_s = _lds_load(lds, DEC_OFF + s * 4, fx.Float32)
+                dt_s = _lds_load(lds, DT_OFF + s * 4, fx.Float32)
                 expo = (s <= t_a).select(d_ta - d_s, fx.Float32(float("-inf")))
                 own.append(fx.Float32(sT[si]) * expo.exp2() * dt_s)
             other = [v.shuffle_xor(16, WAVE) for v in own]
@@ -382,9 +432,8 @@ def build_compute_out(
                 p_vals.append(is_lo.select(other[si], own[si]))
             p_op = _bf16_vec(p_vals)
             for i in range_constexpr(rp):
-                xb = x_chunk + s0 * x_row + p0 + TILE * i + l16
-                x_op = Vec.from_elements(
-                    [x_r[xb + k * x_row] for k in range_constexpr(TILE)], fx.BFloat16
+                x_op = _lds_load(
+                    lds, X_OFF + ((TILE * i + l16) * XS + s0) * 2, fx.BFloat16, TILE
                 )
                 s_accs[i] = _wmma(p_op, x_op, s_accs[i])
             results = yield s_accs
@@ -394,9 +443,11 @@ def build_compute_out(
             acc = _carried(results)[i]
             for si in range_constexpr(8):
                 t = TILE * wave + 2 * si + hi
-                off = x_chunk + t * x_row + p0 + TILE * i + l16
-                y = fx.Float32(acc[si]) + d_h * fx.Float32(x_r[off])
-                out_w[off] = y.to(fx.BFloat16)
+                x_t = _lds_load(
+                    lds, X_OFF + ((TILE * i + l16) * XS + t) * 2, fx.BFloat16
+                )
+                y = fx.Float32(acc[si]) + d_h * fx.Float32(x_t)
+                out_w[x_chunk + t * x_row + p0 + TILE * i + l16] = y.to(fx.BFloat16)
 
     @flyc.jit
     def launch(
@@ -415,7 +466,7 @@ def build_compute_out(
     ):
         compute_out_kernel(x, b, c, d, decay, dt_bht, hiddens, out, num_tokens).launch(
             grid=(fx.Int64(num_chunks), P // BP, fx.Int64(batch * H)),
-            block=(NWAVES * WAVE, 1, 1),
+            block=(THREADS, 1, 1),
             stream=stream,
         )
 

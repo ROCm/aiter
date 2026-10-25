@@ -47,16 +47,15 @@ def _state_configs(P, N):
 
 
 def _out_configs(P):
-    for rp, vec_loads in itertools.product(_TILE_REPEATS, (False, True)):
+    for rp in _TILE_REPEATS:
         if P % (16 * rp) == 0:
-            yield {"rp": rp, "vec_loads": vec_loads}
+            yield {"rp": rp}
 
 
 def default_config(head_size, state_size):
     """Untuned fallback: widest tiles that divide the head and state sizes."""
     state = list(_state_configs(head_size, state_size))[-1]
-    rp = list(_out_configs(head_size))[-1]["rp"]
-    return {**state, "rp": rp, "vec_loads": False}
+    return {**state, **list(_out_configs(head_size))[-1]}
 
 
 @functools.cache
@@ -70,8 +69,8 @@ def _state(H, G, P, N, L, rm, rn):
 
 
 @functools.cache
-def _out(H, G, P, N, L, rp, vec_loads):
-    return build_compute_out(H, G, P, N, L, rp, vec_loads)
+def _out(H, G, P, N, L, rp):
+    return build_compute_out(H, G, P, N, L, rp)
 
 
 def _pick(name, key, configs, launch):
@@ -142,7 +141,7 @@ def mamba2_chunk_forward_flydsl(
 
         def launch_out(cfg):
             _run_compiled(
-                _out(H, G, P, N, L, cfg["rp"], cfg["vec_loads"]),
+                _out(H, G, P, N, L, cfg["rp"]),
                 x,
                 b,
                 c,
