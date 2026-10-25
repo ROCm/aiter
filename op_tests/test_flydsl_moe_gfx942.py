@@ -19,7 +19,13 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
+from aiter.fused_moe import (
+    AUX_SORT_OPUS,
+    fused_topk,
+    moe_sorting,
+    torch_moe_stage1,
+    torch_moe_stage2,
+)
 from aiter.fused_moe_registry import (
     FusedMoeRequest,
     make_fused_moe_impl_kernel_name,
@@ -31,10 +37,7 @@ from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     gemm2_8x1_compact as compact,
 )
-from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
-    invert_sorted_ids,
-    sorted_sum,
-)
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import sorted_sum
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.ops.shuffle import shuffle_weight
@@ -181,9 +184,11 @@ def test_sorted_sum(token, model_dim, topk, padding):
     dtype = dtypes.bf16
     experts = max(4, topk)
     ids = (torch.arange(token * topk).reshape(token, topk) % experts).to(torch.int32)
+    # Sorting keeps one route of a repeated expert ID and gives the others -1.
+    ids[-1] = 0
     weights = torch.ones((token, topk), dtype=torch.float32)
     storage = torch.full((token * model_dim + 2 * GUARD,), CANARY, dtype=dtype)
-    sorted_ids, _, sorted_experts, valid_rows, output = moe_sorting(
+    _, _, sorted_experts, _, output, _, loc_ids = moe_sorting(
         ids,
         weights,
         experts,
@@ -191,18 +196,19 @@ def test_sorted_sum(token, model_dim, topk, padding):
         dtype,
         64,
         output=storage[GUARD:-GUARD].view(token, model_dim),
+        output_aux=AUX_SORT_OPUS,
     )
-    loc_ids = torch.empty_like(ids)
-    invert_sorted_ids(topk)(sorted_ids, loc_ids, valid_rows, sorted_ids.numel(), token)
+    valid = loc_ids.view(token, topk) >= 0
+    assert int((~valid).sum()) == topk - 1, "repeated expert IDs kept extra routes"
     # Specialized Down rows carry padding that holds canaries the sum must skip.
     down_output = torch.full(
         (sorted_experts.numel() * 64, model_dim + padding // 2), CANARY, dtype=dtype
     )
     routes = torch.randn((token, topk, model_dim)).to(dtype)
-    down_output[loc_ids.long(), :model_dim] = routes
-    reference = routes[:, 0].float()
-    for route in range(1, topk):
-        reference = reference + routes[:, route].float()
+    down_output[loc_ids.view(token, topk)[valid].long(), :model_dim] = routes[valid]
+    reference = torch.zeros((token, model_dim))
+    for route in range(topk):
+        reference = reference + routes[:, route].float() * valid[:, route, None]
     reduce = sorted_sum(topk, model_dim, padding)
 
     def run():
@@ -261,10 +267,15 @@ def test_config_strings():
 
 def route(hidden, experts, topk, routing):
     token = hidden.shape[0]
-    if routing == "random":
-        return fused_topk(
+    if routing in ("random", "padding"):
+        weights, ids = fused_topk(
             hidden, torch.randn((token, experts), dtype=hidden.dtype), topk, True
         )
+        if routing == "padding":
+            # HIP padding rows: zero weights and expert 0 repeated, which sorting merges.
+            weights[-65:] = 0
+            ids[-65:, :-1] = 0
+        return weights, ids
     # "hot": every token picks the same highest experts and the others stay empty.
     ids = torch.arange(experts - topk, experts, dtype=torch.int32)
     weights = torch.rand((token, topk), dtype=torch.float32)
@@ -550,6 +561,14 @@ EDGE_CASES = [
         )
         for path in ("8x1_compact", "1x4_64x256")
         for padding in (0, 32, 64)
+    ),
+    # Padding rows whose merged routes reach the reduction as -1.
+    *(
+        (2048, 2560, 320, 513, 11, quant, "silu", "padding", config)
+        for quant, config in (
+            ("no", "64_128_128_True:default:0"),
+            ("ptpc", "64_128_256_True:1x4_64x256:128"),
+        )
     ),
 ]
 
