@@ -73,8 +73,24 @@ def _out(H, G, P, N, L, rp):
     return build_compute_out(H, G, P, N, L, rp)
 
 
-def _pick(name, key, configs, launch):
-    """Benchmark every config once for this shape and cache the fastest."""
+def _tuning_key(*args):
+    return tuple(
+        (
+            (tuple(arg.shape), tuple(arg.stride()), arg.dtype, str(arg.device))
+            if torch.is_tensor(arg)
+            else arg
+        )
+        for arg in args
+    )
+
+
+def _tuned_config(name, key, configs, launch, config):
+    """TileGym's tune-once / cache / launch: an explicit ``config`` wins, else
+    benchmark every candidate once per shape and keep the fastest."""
+    if config is not None:
+        return config
+    if not _AUTOTUNE:
+        return configs[-1]
     if (name, key) not in _tuned:
         timed = []
         for cfg in configs:
@@ -82,95 +98,133 @@ def _pick(name, key, configs, launch):
             timed.append((do_bench(lambda: launch(cfg)), cfg))
         ms, best = min(timed, key=lambda t: t[0])
         logger.info(
-            f"mamba2 {name} {key}: {best} ({ms * 1e3:.1f} us of {len(timed)} configs)"
+            f"mamba2 {name}: {best} ({ms * 1e3:.1f} us, best of {len(timed)} configs)"
         )
         _tuned[name, key] = best
     return _tuned[name, key]
 
 
+def _validate_chunk_size(num_tokens, chunk_size):
+    if chunk_size <= 0 or num_tokens % chunk_size != 0:
+        raise ValueError("num_tokens must be divisible by a positive chunk_size")
+
+
+def _chunk_cumsum(a, dt, chunk_size, stream):
+    """dt:[b,t,h] -> (decay_bht [b,h,t], dt_bht [b,h,t]), decay in log2 units."""
+    batch_size, num_tokens, num_heads = dt.shape
+    decay_bht = dt.new_empty(batch_size, num_heads, num_tokens, dtype=torch.float32)
+    dt_bht = torch.empty_like(decay_bht)
+    _run_compiled(
+        _cumsum(num_heads, chunk_size),
+        a,
+        dt,
+        decay_bht,
+        dt_bht,
+        num_tokens,
+        num_tokens // chunk_size,
+        batch_size,
+        stream,
+    )
+    return decay_bht, dt_bht
+
+
+def _fwd_pass_state(x, b, dt_bht, decay_bht, init_state, chunk_size, stream, config):
+    """Return chunk-entry states (narrowed to x.dtype) and the fp32 final state."""
+    batch_size, num_tokens, num_heads, head_size = x.shape
+    num_groups, state_size = b.shape[2], b.shape[3]
+    num_chunks = num_tokens // chunk_size
+    hiddens = x.new_empty(batch_size, num_heads, num_chunks, head_size, state_size)
+    final_state = torch.empty_like(init_state)
+
+    def launch(cfg):
+        _run_compiled(
+            _state(
+                num_heads,
+                num_groups,
+                head_size,
+                state_size,
+                chunk_size,
+                cfg["rm"],
+                cfg["rn"],
+                cfg["ks"],
+            ),
+            x,
+            b,
+            decay_bht,
+            dt_bht,
+            init_state,
+            hiddens,
+            final_state,
+            num_tokens,
+            batch_size,
+            stream,
+        )
+
+    configs = list(_state_configs(head_size, state_size, chunk_size))
+    key = _tuning_key(x, b, init_state, chunk_size)
+    launch(_tuned_config("fwd_pass_state", key, configs, launch, config))
+    return hiddens, final_state
+
+
+def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, config):
+    batch_size, num_tokens, num_heads, head_size = x.shape
+    num_groups, state_size = b.shape[2], b.shape[3]
+    out = torch.empty_like(x)
+
+    def launch(cfg):
+        _run_compiled(
+            _out(num_heads, num_groups, head_size, state_size, chunk_size, cfg["rp"]),
+            x,
+            b,
+            c,
+            d,
+            decay_bht,
+            dt_bht,
+            hiddens,
+            out,
+            num_tokens,
+            num_tokens // chunk_size,
+            batch_size,
+            stream,
+        )
+
+    configs = list(_out_configs(head_size))
+    key = _tuning_key(x, b, chunk_size)
+    launch(_tuned_config("compute_out", key, configs, launch, config))
+    return out
+
+
 def mamba2_chunk_forward_flydsl(
     x, a, b, c, d, dt, init_state, chunk_size=64, config=None
 ):
+    """Return the output and fp32 final state; chunk-entry states are kept in
+    c.dtype, as in TileGym's mamba2_chunk_forward."""
     if get_gfx() not in SUPPORTED_GFX:
         raise RuntimeError(
             f"mamba2_chunk_forward_flydsl needs gfx11 WMMA; got {get_gfx()}"
         )
-    B, T, H, P = x.shape
-    G, N = b.shape[2], b.shape[3]
-    L = chunk_size
-    if T % L:
-        raise ValueError(f"num_tokens={T} must be a multiple of chunk_size={L}")
-    if L % 16 or P % 16 or N % 16 or H % G:
+    _validate_chunk_size(x.shape[1], chunk_size)
+    head_size, state_size = x.shape[3], b.shape[3]
+    if chunk_size % 16 or head_size % 16 or state_size % 16:
         raise ValueError("chunk_size, head_size and state_size must be multiples of 16")
-    for t, dtype in (
-        (x, torch.bfloat16),
-        (b, torch.bfloat16),
-        (c, torch.bfloat16),
-        (dt, torch.bfloat16),
-    ):
-        if t.dtype != dtype or not t.is_contiguous():
+    if x.shape[2] % b.shape[2]:
+        raise ValueError("num_heads must be a multiple of num_groups")
+    for t in (x, b, c, dt):
+        if t.dtype != torch.bfloat16 or not t.is_contiguous():
             raise ValueError("x, b, c, dt must be contiguous bf16")
-    nc = T // L
+    if config is not None:
+        config = {**default_config(head_size, state_size, chunk_size), **config}
 
     a = a.float().contiguous()
     d = d.float().contiguous()
     init_state = init_state.float().contiguous()
-    decay = torch.empty(B, H, T, device=x.device, dtype=torch.float32)
-    dt_bht = torch.empty(B, H, T, device=x.device, dtype=torch.float32)
-    hiddens = torch.empty(B, H, nc, P, N, device=x.device, dtype=torch.bfloat16)
-    final_state = torch.empty(B, H, P, N, device=x.device, dtype=torch.float32)
-    out = torch.empty_like(x)
-
     with torch.cuda.device(x.device):
         stream = fx.Stream(torch.cuda.current_stream(x.device))
-
-        def launch_state(cfg):
-            _run_compiled(
-                _state(H, G, P, N, L, cfg["rm"], cfg["rn"], cfg["ks"]),
-                x,
-                b,
-                decay,
-                dt_bht,
-                init_state,
-                hiddens,
-                final_state,
-                T,
-                B,
-                stream,
-            )
-
-        def launch_out(cfg):
-            _run_compiled(
-                _out(H, G, P, N, L, cfg["rp"]),
-                x,
-                b,
-                c,
-                d,
-                decay,
-                dt_bht,
-                hiddens,
-                out,
-                T,
-                nc,
-                B,
-                stream,
-            )
-
-        _run_compiled(_cumsum(H, L), a, dt, decay, dt_bht, T, nc, B, stream)
-        key = (B, T, G, H, N, P, L)
-        if config is not None:
-            cfg = {**default_config(P, N, L), **config}
-            state_cfg = out_cfg = cfg
-        elif _AUTOTUNE:
-            state_cfg = _pick(
-                "fwd_pass_state", key, list(_state_configs(P, N, L)), launch_state
-            )
-            out_cfg = None  # tuned below, once the hiddens it reads are final
-        else:
-            state_cfg = out_cfg = default_config(P, N, L)
-
-        launch_state(state_cfg)  # the tuning runs above clobbered hiddens / final_state
-        if out_cfg is None:
-            out_cfg = _pick("compute_out", key, list(_out_configs(P)), launch_out)
-        launch_out(out_cfg)
+        decay_bht, dt_bht = _chunk_cumsum(a, dt, chunk_size, stream)
+        hiddens, final_state = _fwd_pass_state(
+            x, b, dt_bht, decay_bht, init_state, chunk_size, stream, config
+        )
+        out = _compute_out(
+            x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, config
+        )
     return out, final_state
