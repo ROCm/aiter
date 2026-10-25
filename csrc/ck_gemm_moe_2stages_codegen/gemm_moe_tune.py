@@ -5735,8 +5735,9 @@ class FmoeTuner(TunerCommon):
                     profileDF.loc[non_xbf16, "us1"] + us_quant
                 )
 
-            # moe_sorting fairness: flat=1 kernels sort internally; add host sort cost to others.
-            has_flat = "flat" in profileDF.columns and (profileDF["flat"] == 1).any()
+            # moe_sorting fairness: nonzero flat sorts internally (flat=1 one-token
+            # grid, flat=2 EMSORT). Add the host sort cost to flat=0 rows only.
+            has_flat = "flat" in profileDF.columns and (profileDF["flat"] != 0).any()
             if has_flat:
                 from aiter.fused_moe import moe_sorting
                 from aiter.test_common import run_perftest
@@ -5784,7 +5785,7 @@ class FmoeTuner(TunerCommon):
             # (additive fairness + idxmin) stays exactly as it was.
             if has_flat:
                 try:
-                    flat_mask = profileDF["flat"] == 1
+                    flat_mask = profileDF["flat"] != 0
                     nf_mask = profileDF["flat"] == 0
                     if not (flat_mask.any() and nf_mask.any()):
                         raise RuntimeError("missing FLAT or non-FLAT class")

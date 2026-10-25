@@ -80,6 +80,10 @@ class FMoeKernel
     const char* name            = nullptr;
     // flat_mode: 0 = host-sorted, 1 = flat one-token-per-TG grid, 2 = emsort persistent grid
     int flat_mode = 0;
+    // Manifest limits. 0 max_tokens means no separate token cap.
+    uint32_t max_tokens      = 0;
+    uint32_t max_assignments = 0;
+    uint32_t max_experts     = 0;
 
     public:
     FMoeKernel(const char* name,
@@ -87,13 +91,19 @@ class FMoeKernel
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0,
                int flat_mode               = 0,
-               uint32_t tgs_align          = 1) : kernel(name, hsaco)
+               uint32_t tgs_align          = 1,
+               uint32_t max_tokens         = 0,
+               uint32_t max_assignments    = 0,
+               uint32_t max_experts        = 0) : kernel(name, hsaco)
     {
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->tgs_align          = std::max(tgs_align, 1u);
         this->name               = name;
         this->flat_mode          = flat_mode;
+        this->max_tokens         = max_tokens;
+        this->max_assignments    = max_assignments;
+        this->max_experts        = max_experts;
     };
 
     const char* get_name() const { return name; }
@@ -207,29 +217,46 @@ class FMoeKernel
         }
         else if(this->flat_mode == 2)
         {
-            // EMSORT partitions token/expert assignments across four waves,
-            // each with 512 worker slots, so its queue holds 2048 assignments.
-            // Its per-expert LDS histogram is a 64-bit token bitmap.
+            // Each EMSORT binary declares its own queue in the manifest
+            // (max_tokens, max_assignments, max_experts). A zero max_tokens
+            // means that binary has no separate token cap.
             //
             // The producer is the last Y workgroup. Every other workgroup spins
-            // on its ready flag, so the whole grid has to be resident together.
-            // The dispatcher is that resident set: num_persistent_tgs is
-            // tg_num_perCU * num_cu, rounded down to lcm(ps_deno, tgs_align),
-            // and the launch is exactly that pool.
-            constexpr uint64_t max_assignments = 2048;
-            AITER_CHECK(token_cnt <= 64,
+            // on its ready flag, so this launch assumes the whole grid is
+            // resident together. num_persistent_tgs is tg_num_perCU * num_cu,
+            // rounded down to lcm(ps_deno, tgs_align), and the grid below is
+            // exactly that pool. Occupancy (whether tg_num_perCU fits in a CU)
+            // and room left by another stream or a CU mask are not queried.
+            AITER_CHECK(this->max_assignments > 0 && this->max_experts > 0,
                         __func__,
-                        ": EMSORT supports token_cnt <= 64; got ",
-                        token_cnt);
-            AITER_CHECK(static_cast<uint64_t>(token_cnt) * topk <= max_assignments,
+                        ": EMSORT manifest row must set max_assignments and max_experts for ",
+                        this->name);
+            if(this->max_tokens > 0)
+            {
+                AITER_CHECK(token_cnt <= static_cast<int>(this->max_tokens),
+                            __func__,
+                            ": EMSORT ",
+                            this->name,
+                            " supports token_cnt <= ",
+                            this->max_tokens,
+                            "; got ",
+                            token_cnt);
+            }
+            AITER_CHECK(static_cast<uint64_t>(token_cnt) * topk <= this->max_assignments,
                         __func__,
-                        ": EMSORT supports token_cnt*topk <= ",
-                        max_assignments,
+                        ": EMSORT ",
+                        this->name,
+                        " supports token_cnt*topk <= ",
+                        this->max_assignments,
                         "; got ",
                         static_cast<uint64_t>(token_cnt) * topk);
-            AITER_CHECK(eprt <= 1024,
+            AITER_CHECK(eprt <= static_cast<int>(this->max_experts),
                         __func__,
-                        ": EMSORT supports at most 1024 experts; got ",
+                        ": EMSORT ",
+                        this->name,
+                        " supports at most ",
+                        this->max_experts,
+                        " experts; got ",
                         eprt);
             AITER_CHECK(inter_dim % sub_GU == 0,
                         __func__,
@@ -256,8 +283,9 @@ class FMoeKernel
             gdz = 1;
             const uint32_t launched =
                 static_cast<uint32_t>(gdx) * static_cast<uint32_t>(gdy);
-            // num_persistent_tgs is tg_num_perCU * num_cu. That is the resident
-            // set this kernel was built to fill (2 workgroups/CU on gfx950).
+            // Documents the dispatcher assumption above. gdy is total_tgs / gdx
+            // and total_tgs is num_persistent_tgs rounded down, so launched is
+            // total_tgs and this comparison holds for every input that reached it.
             AITER_CHECK(launched <= this->num_persistent_tgs,
                         __func__,
                         ": EMSORT grid must be fully resident; launched ",
@@ -425,7 +453,15 @@ FMoeKernel* get_heuristic_kernel(int inter_dim,
 
         impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
             return FMoeKernel(
-                name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat, cfg.tgs_align);
+                name,
+                co_name,
+                cfg.subGU_n,
+                num_persistent_tgs,
+                cfg.flat,
+                cfg.tgs_align,
+                static_cast<uint32_t>(std::max(cfg.max_tokens, 0)),
+                static_cast<uint32_t>(std::max(cfg.max_assignments, 0)),
+                static_cast<uint32_t>(std::max(cfg.max_experts, 0)));
         });
     }
     else
