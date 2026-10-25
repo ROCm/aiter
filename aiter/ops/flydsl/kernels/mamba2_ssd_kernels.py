@@ -51,16 +51,27 @@ def _bf16_vec(vals):
     return Vec.from_elements([fx.Float32(v).to(fx.BFloat16) for v in vals], fx.BFloat16)
 
 
-def _row_view(t):
-    """bf16 buffer view addressed by element offset, read 8 elements (128 bits) at a time."""
-    return ptr_buf_tensor(t, fx.BFloat16, unit_elems=8, unit_stride=1)
+def _carried(state):
+    """Loop-carried accumulators as a list; a lone loop result comes back bare."""
+    return [Vec(v) for v in state] if isinstance(state, (list, tuple)) else [Vec(state)]
 
 
-def _load16(view, off):
-    """16 contiguous bf16 at element offset ``off`` (16-byte aligned): two dwordx4 loads."""
-    lo = buf_copy_load(view, off, fx.BFloat16, unit_elems=8)
-    hi = buf_copy_load(view, off + 8, fx.BFloat16, unit_elems=8)
-    return lo.shuffle(hi, list(range(16)))
+def _row_view(t, vec_loads):
+    """bf16 buffer view addressed by element offset; 8-wide (128-bit) units if ``vec_loads``."""
+    if vec_loads:
+        return ptr_buf_tensor(t, fx.BFloat16, unit_elems=8, unit_stride=1)
+    return ptr_buf_tensor(t, fx.BFloat16)
+
+
+def _load16(view, off, vec_loads):
+    """16 contiguous bf16 at element offset ``off``: two dwordx4 loads or 16 scalar ones."""
+    if vec_loads:
+        lo = buf_copy_load(view, off, fx.BFloat16, unit_elems=8)
+        hi = buf_copy_load(view, off + 8, fx.BFloat16, unit_elems=8)
+        return lo.shuffle(hi, list(range(16)))
+    return Vec.from_elements(
+        [view[off + k] for k in range_constexpr(TILE)], fx.BFloat16
+    )
 
 
 def build_chunk_cumsum(num_heads, chunk_size, block_h):
@@ -115,7 +126,9 @@ def build_chunk_cumsum(num_heads, chunk_size, block_h):
     return launch
 
 
-def build_fwd_pass_state(num_heads, num_groups, head_size, state_size, chunk_size, rm, rn):
+def build_fwd_pass_state(
+    num_heads, num_groups, head_size, state_size, chunk_size, rm, rn
+):
     """Carry the state across chunks; one wave owns a (16*rm) x (16*rn) state tile."""
     H, G, P, N, L = num_heads, num_groups, head_size, state_size, chunk_size
     HPG = H // G
@@ -163,7 +176,10 @@ def build_fwd_pass_state(num_heads, num_groups, head_size, state_size, chunk_siz
             for j in range_constexpr(rn):
                 accs.append(
                     Vec.from_elements(
-                        [fx.Float32(init_r[state_base + state_off(i, j, si)]) for si in range_constexpr(8)],
+                        [
+                            fx.Float32(init_r[state_base + state_off(i, j, si)])
+                            for si in range_constexpr(8)
+                        ],
                         fx.Float32,
                     )
                 )
@@ -174,14 +190,16 @@ def build_fwd_pass_state(num_heads, num_groups, head_size, state_size, chunk_siz
 
         for c_iv, state in range(0, num_chunks, 1, init=accs):
             c = fx.Int32(c_iv)
-            s_accs = [Vec(v) for v in state]
+            s_accs = _carried(state)
             # Chunk-entry state, narrowed to the dtype compute_out consumes.
             hid_base = (bh * num_chunks + c) * (P * N)
             for i in range_constexpr(rm):
                 for j in range_constexpr(rn):
                     acc = s_accs[i * rn + j]
                     for si in range_constexpr(8):
-                        hid_w[hid_base + state_off(i, j, si)] = fx.Float32(acc[si]).to(fx.BFloat16)
+                        hid_w[hid_base + state_off(i, j, si)] = fx.Float32(acc[si]).to(
+                            fx.BFloat16
+                        )
 
             t_chunk = c * L
             d_last = fx.Float32(dec_r[tok_base + t_chunk + L - 1])
@@ -192,30 +210,42 @@ def build_fwd_pass_state(num_heads, num_groups, head_size, state_size, chunk_siz
                 t0 = t_chunk + TILE * kk
                 # w[t] = dt[t] * exp2(d_last - d[t]); wave-uniform.
                 w = [
-                    fx.Float32(dt_r[tok_base + t0 + k]) * (d_last - fx.Float32(dec_r[tok_base + t0 + k])).exp2()
+                    fx.Float32(dt_r[tok_base + t0 + k])
+                    * (d_last - fx.Float32(dec_r[tok_base + t0 + k])).exp2()
                     for k in range_constexpr(TILE)
                 ]
                 x_tok = (batch * num_tokens + t0) * x_row + h * P + p0 + l16
                 b_tok = (batch * num_tokens + t0) * b_row + g * N + n0 + l16
                 a_ops = [
                     Vec.from_elements(
-                        [x_r[x_tok + k * x_row + TILE * i] for k in range_constexpr(TILE)], fx.BFloat16
+                        [
+                            x_r[x_tok + k * x_row + TILE * i]
+                            for k in range_constexpr(TILE)
+                        ],
+                        fx.BFloat16,
                     )
                     for i in range_constexpr(rm)
                 ]
                 b_ops = [
-                    _bf16_vec([fx.Float32(b_r[b_tok + k * b_row + TILE * j]) * w[k] for k in range_constexpr(TILE)])
+                    _bf16_vec(
+                        [
+                            fx.Float32(b_r[b_tok + k * b_row + TILE * j]) * w[k]
+                            for k in range_constexpr(TILE)
+                        ]
+                    )
                     for j in range_constexpr(rn)
                 ]
                 for i in range_constexpr(rm):
                     for j in range_constexpr(rn):
-                        s_accs[i * rn + j] = _wmma(a_ops[i], b_ops[j], s_accs[i * rn + j])
+                        s_accs[i * rn + j] = _wmma(
+                            a_ops[i], b_ops[j], s_accs[i * rn + j]
+                        )
 
             results = yield s_accs
 
         for i in range_constexpr(rm):
             for j in range_constexpr(rn):
-                acc = Vec(results[i * rn + j])
+                acc = _carried(results)[i * rn + j]
                 for si in range_constexpr(8):
                     fin_w[state_base + state_off(i, j, si)] = fx.Float32(acc[si])
 
@@ -232,7 +262,9 @@ def build_fwd_pass_state(num_heads, num_groups, head_size, state_size, chunk_siz
         batch: Int32,
         stream: fx.Stream,
     ):
-        fwd_pass_state_kernel(x, b, decay, dt_bht, init_state, hiddens, final_state, num_tokens).launch(
+        fwd_pass_state_kernel(
+            x, b, decay, dt_bht, init_state, hiddens, final_state, num_tokens
+        ).launch(
             grid=(P // BP, N // BN, fx.Int64(batch * H)),
             block=(WAVE, 1, 1),
             stream=stream,
@@ -241,8 +273,14 @@ def build_fwd_pass_state(num_heads, num_groups, head_size, state_size, chunk_siz
     return launch
 
 
-def build_compute_out(num_heads, num_groups, head_size, state_size, chunk_size, rp):
-    """One block per (chunk, p-tile, batch*head); wave w owns token rows 16w..16w+15."""
+def build_compute_out(
+    num_heads, num_groups, head_size, state_size, chunk_size, rp, vec_loads
+):
+    """One block per (chunk, p-tile, batch*head); wave w owns token rows 16w..16w+15.
+
+    ``vec_loads`` reads the contiguous B / C / state rows 128 bits at a time;
+    which width wins depends on the shape, so it is tuned.
+    """
     H, G, P, N, L = num_heads, num_groups, head_size, state_size, chunk_size
     HPG = H // G
     NWAVES = L // TILE
@@ -263,12 +301,12 @@ def build_compute_out(num_heads, num_groups, head_size, state_size, chunk_size, 
         num_tokens: Int32,
     ):
         x_r = ptr_buf_tensor(x, fx.BFloat16)
-        b_v8 = _row_view(b)
-        c_v8 = _row_view(c)
+        b_rows = _row_view(b, vec_loads)
+        c_rows = _row_view(c, vec_loads)
         d_r = ptr_buf_tensor(d, fx.Float32)
         dec_r = ptr_buf_tensor(decay, fx.Float32)
         dt_r = ptr_buf_tensor(dt_bht, fx.Float32)
-        hid_v8 = _row_view(hiddens)
+        hid_rows = _row_view(hiddens, vec_loads)
         out_w = ptr_buf_tensor(out, fx.BFloat16)
 
         tid = fx.thread_idx.x
@@ -295,30 +333,38 @@ def build_compute_out(num_heads, num_groups, head_size, state_size, chunk_size, 
         t_a = TILE * wave + l16
         d_ta = fx.Float32(dec_r[tok_base + t_a])
 
-        # The lane's C row is reused by every source tile: load it once, 128 bits at a time.
         c_base = bc_chunk + t_a * bc_row
-        c_ops = [_load16(c_v8, c_base + TILE * kn) for kn in range_constexpr(NK)]
+
+        def c_op(kn):
+            return _load16(c_rows, c_base + TILE * kn, vec_loads)
 
         # Carried-state term: (exp2(d_t) * C) @ h^T, h = chunk-entry state [P, N].
         hid_base = (bh * num_chunks + chunk) * (P * N)
         exp_dt = d_ta.exp2()
         accs = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(rp)]
         for kn in range_constexpr(NK):
-            a_op = _bf16_vec([fx.Float32(c_ops[kn][k]) * exp_dt for k in range_constexpr(TILE)])
+            c_kn = c_op(kn)
+            a_op = _bf16_vec(
+                [fx.Float32(c_kn[k]) * exp_dt for k in range_constexpr(TILE)]
+            )
             for i in range_constexpr(rp):
-                b_op = _load16(hid_v8, hid_base + (p0 + TILE * i + l16) * N + TILE * kn)
+                b_op = _load16(
+                    hid_rows,
+                    hid_base + (p0 + TILE * i + l16) * N + TILE * kn,
+                    vec_loads,
+                )
                 accs[i] = _wmma(a_op, b_op, accs[i])
 
         # Intra-chunk term over source tiles s <= t (causal, so tiles 0..wave).
         for st_iv, state in range(0, wave + 1, 1, init=accs):
             st = fx.Int32(st_iv)
-            s_accs = [Vec(v) for v in state]
+            s_accs = _carried(state)
             s0 = st * TILE
             # S^T[s, t] = B[s] . C[t]: A = B rows (lane row s0 + l16), B = C rows (lane col t_a).
             sT = Vec.filled(8, 0.0, fx.Float32)
             b_base = bc_chunk + (s0 + l16) * bc_row
             for kn in range_constexpr(NK):
-                sT = _wmma(_load16(b_v8, b_base + TILE * kn), c_ops[kn], sT)
+                sT = _wmma(_load16(b_rows, b_base + TILE * kn, vec_loads), c_op(kn), sT)
             # Slot si holds source s = s0 + 2*si + hi for target t_a.
             own = []
             for si in range_constexpr(8):
@@ -337,13 +383,15 @@ def build_compute_out(num_heads, num_groups, head_size, state_size, chunk_size, 
             p_op = _bf16_vec(p_vals)
             for i in range_constexpr(rp):
                 xb = x_chunk + s0 * x_row + p0 + TILE * i + l16
-                x_op = Vec.from_elements([x_r[xb + k * x_row] for k in range_constexpr(TILE)], fx.BFloat16)
+                x_op = Vec.from_elements(
+                    [x_r[xb + k * x_row] for k in range_constexpr(TILE)], fx.BFloat16
+                )
                 s_accs[i] = _wmma(p_op, x_op, s_accs[i])
             results = yield s_accs
 
         d_h = fx.Float32(d_r[h])
         for i in range_constexpr(rp):
-            acc = Vec(results[i])
+            acc = _carried(results)[i]
             for si in range_constexpr(8):
                 t = TILE * wave + 2 * si + hi
                 off = x_chunk + t * x_row + p0 + TILE * i + l16
