@@ -164,6 +164,7 @@ def _check_q256_integration(
     reference,
     expected_kernel,
     shared_expert_id=None,
+    check_dispatch_regressions=True,
 ):
     """Check real dispatch, compact producer parity, and model call contracts."""
     hidden, w1, _w2, _weights, ids = call_args
@@ -237,7 +238,7 @@ def _check_q256_integration(
 
     output = torch.full_like(out, float("nan"))
     with patch.object(moe_op, "fmoe_q256_producer", producer):
-        returned = fused_moe(*call_args, output=output, **kwargs)
+        returned = fused_moe(*call_args, output=output, block_size_M=256, **kwargs)
         assert returned is output, "Q256 did not return the caller's output buffer"
         assert torch.equal(output, out), "Q256 output buffer was not overwritten"
         prequantized = fused_moe(
@@ -246,6 +247,12 @@ def _check_q256_integration(
     assert torch.equal(prequantized, out), "Q256 prequantized input differs"
 
     if (tokens, model) == (8192, 8192):
+        if check_dispatch_regressions and shared_expert_id == 512:
+            _check_q256_dispatch_regressions(
+                call_args,
+                kwargs,
+                (a1_qt, a1_scale, w1_qt, w2_qt, w1_scale, w2_scale),
+            )
         _check_q256_dynamic_routes(
             call_args, kwargs, a1_qt, a1_scale, w1_qt, w2_qt, w1_scale, w2_scale
         )
@@ -263,7 +270,6 @@ def _check_q256_integration(
             {"output": torch.empty((tokens, model + 1), dtype=dtypes.bf16)},
             {"output": torch.empty((tokens, model), dtype=dtypes.fp32)},
             {"output": hidden},
-            {"a2_scale": torch.empty((tokens, topk, 8), dtype=dtypes.fp8_e8m0)},
         ):
             with (
                 patch.object(
@@ -279,6 +285,113 @@ def _check_q256_integration(
         "Q256 executed kernel": actual_kernel,
         "Q256 NRMS": nrms,
     }
+
+
+def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
+    """Exercise automatic model-CSV selection through unmocked public dispatch."""
+    activities = [
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ]
+    torch.cuda.synchronize()
+    for block_size in (128, 64):
+        with torch.profiler.profile(activities=activities) as prof:
+            with pytest.raises(ValueError, match=r"Q256.*block_size_M.*256"):
+                fused_moe(*call_args, block_size_M=block_size, **kwargs)
+            torch.cuda.synchronize()
+        names = [
+            event.name
+            for event in prof.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        assert not any(
+            "sort" in name.lower() or name.startswith(_Q256_KERNEL) for name in names
+        ), f"invalid Q256 {block_size=} launched sorting/producer kernels: {names}"
+
+    hidden, _w1, _w2, weights, ids = call_args
+    input_q, input_scale, w1, w2, w1_scale, w2_scale = reference_inputs
+    tokens, model = hidden.shape
+    scales = torch.full(
+        (tokens * ids.shape[1], 256 // 32),
+        127,
+        dtype=torch.uint8,
+        device=hidden.device,
+    ).view(dtypes.fp8_e8m0)
+    for overrides, metadata_overrides in (
+        ({"quant_dtype_a2": dtypes.fp8}, {"q_dtype_a2": dtypes.fp8}),
+        ({"a2_scale": scales}, {"has_a2_scale": True}),
+    ):
+        metadata = _q256_metadata(**metadata_overrides)
+        assert not metadata.run_1stage and metadata.stage2 is not None
+        assert not moe_op.is_q256_kernel(metadata.stage1.keywords.get("kernelName", ""))
+        if "quant_dtype_a2" in overrides:
+            assert metadata.fuse_quant == "fp8"
+            assert "_afp8_" in metadata.stage2.keywords["kernelName"]
+        output = torch.full_like(hidden, float("nan"))
+
+        call = functools.partial(
+            fused_moe, *call_args, **{**kwargs, **overrides}, output=output
+        )
+
+        call()  # Compile the real two-stage fallback before profiling.
+        torch.cuda.synchronize()
+        output.fill_(float("nan"))
+        torch.cuda.synchronize()
+        with torch.profiler.profile(activities=activities) as prof:
+            returned = call()
+            torch.cuda.synchronize()
+        names = [
+            event.name
+            for event in prof.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        aiter.logger.info(
+            "Q256 automatic fallback %s GPU kernels: %s", overrides.keys(), names
+        )
+        assert returned is output and output.shape == (tokens, model)
+        assert torch.isfinite(output).all(), "nonfinite Q256 fallback output"
+        assert not any(name.startswith(_Q256_KERNEL) for name in names), names
+        # Actual FlyDSL symbols, rather than Python wrapper/config names.
+        assert any(name.startswith("mfma_moe1_silu_mul_") for name in names), names
+        assert any(name.startswith("mfma_moe2_") for name in names), names
+        intermediate = torch_moe_stage1(
+            input_q,
+            w1,
+            w2,
+            weights,
+            ids,
+            dtype=dtypes.fp32 if metadata.fuse_quant else hidden.dtype,
+            activation=aiter.ActivationType.Silu,
+            quant_type=aiter.QuantType.per_1x32,
+            a1_scale=input_scale,
+            w1_scale=w1_scale,
+        )
+        if metadata.fuse_quant == "fp8":
+            quantized, scale = per_1x32_f8_scale_f8_quant(
+                intermediate, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            )
+        else:
+            quantized, scale = aiter.get_torch_quant(aiter.QuantType.per_1x32)(
+                intermediate, quant_dtype=dtypes.fp4x2
+            )
+        reference = torch_moe_stage2(
+            quantized.view(tokens, ids.shape[1], -1),
+            w1,
+            w2,
+            weights,
+            ids,
+            dtype=hidden.dtype,
+            quant_type=aiter.QuantType.per_1x32,
+            a2_scale=scale,
+            w2_scale=w2_scale,
+        )
+        # Legacy atomic GEMM2 rounds its running sum to BF16, unlike Q256's
+        # FP32 reducer. Bound the independent reference error by energy.
+        nrms = (
+            (reference.float() - output.float()).norm()
+            / reference.float().norm().clamp_min(1e-30)
+        ).item()
+        assert nrms < 0.01, f"two-stage fallback {overrides.keys()}: NRMS={nrms}"
 
 
 def _check_q256_dynamic_routes(
@@ -414,6 +527,7 @@ def test_fmoe(
     gate_up_layout: bool | None = None,
     expected_kernel=None,
     shared_expert_id=None,
+    q256_dispatch_regressions=True,
 ):
     if shared_expert_id is not None:
         if not 0 <= shared_expert_id < E:
@@ -929,6 +1043,7 @@ def test_fmoe(
             out2_ref,
             expected_kernel,
             shared_expert_id=shared_expert_id,
+            check_dispatch_regressions=q256_dispatch_regressions,
         )
         flops = token * model_dim * inter_dim * (3 if use_g1u1 else 2) * topk * 2
         nbytes = sum(
@@ -1844,9 +1959,11 @@ def test_q256_token_boundaries():
         {"has_num_local_tokens": True},
         {"q_dtype_a2": dtypes.fp8},
         {"swiglu_limit": 7.0},
+        {"has_a2_scale": True},
     ):
-        with pytest.raises(ValueError, match="Q256"):
-            _q256_metadata(**unsupported)
+        fallback = _q256_metadata(**unsupported)
+        assert not fallback.run_1stage and fallback.stage2 is not None
+        assert not moe_op.is_q256_kernel(fallback.stage1.keywords.get("kernelName", ""))
     stage1 = functools.partial(
         metadata.stage1.func,
         **{**metadata.stage1.keywords, "kernelName": _Q256_KERNEL + "_route_weighted"},
@@ -1856,6 +1973,9 @@ def test_q256_token_boundaries():
     for token in (4096, 4097, 8191, 8192, 8193):
         case = _q256_case(token, 8192)
         case["expected_kernel"] = _Q256_KERNEL + "_route_weighted"
+        # Public-dispatch regressions run with the prepared inputs in the normal
+        # sweep; this boundary sweep deliberately binds patched metadata.
+        case["q256_dispatch_regressions"] = False
         with patch.object(aiter.fused_moe, "get_2stage_cfgs", return_value=forced):
             rows.append(test_fmoe(**case))
         gc.collect()

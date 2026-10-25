@@ -1655,6 +1655,7 @@ def _fused_moe_impl(
             has_stage2_scatter=stage2_scatter is not None,
             has_activation_scales=a1_scale is not None or a2_scale is not None,
             has_num_local_tokens=num_local_tokens is not None,
+            has_a2_scale=a2_scale is not None,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -1716,6 +1717,13 @@ def _fused_moe_impl(
             f"kernel block size {metadata.block_m}"
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    if (
+        is_q256_kernel(getattr(metadata.stage1, "keywords", {}).get("kernelName", ""))
+        and block_size_M != 256
+    ):
+        raise ValueError(
+            f"Q256 block_size_M={block_size_M} is incompatible: sorting requires 256-row tiles"
+        )
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
             FusedMoeRequest(
@@ -3413,6 +3421,7 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
+    has_a2_scale=False,
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
@@ -3719,6 +3728,45 @@ def get_2stage_cfgs(
                     "incomplete metadata"
                 )
 
+    if cfg is not None and is_q256_kernel(kn1):
+        q256_supported = (
+            q_dtype_a == dtypes.fp4x2
+            and q_dtype_w == dtypes.fp4x2
+            and q_type == QuantType.per_1x32
+            and q_dtype_a2 in (None, dtypes.fp4x2)
+            and activation == ActivationType.Silu
+            and use_g1u1
+            and gate_mode == GateMode.SEPARATED
+            and is_shuffled
+            and not (
+                is_ep
+                or doweight_stage1
+                or hidden_pad
+                or intermediate_pad
+                or has_stage1_bias
+                or has_stage2_bias
+                or has_stage2_scatter
+                or has_num_local_tokens
+                or has_a2_scale
+                or swiglu_limit
+            )
+            and situ_beta == 1.0
+            and situ_linear_beta == 1.0
+            and cfg.get("run_1stage", False)
+            and cfg.get("block_m") == 256
+            and not (
+                cfg.get("ksplit", 0) or cfg.get("flat", 0) or cfg.get("xbf16", False)
+            )
+        )
+        if not q256_supported:
+            if config_file is not None:
+                raise ValueError("Unsupported Q256 fused MoE configuration")
+            cfg = None
+            logger.warning(
+                "[fused_moe] discarding incompatible automatic Q256 config; "
+                "using default heuristics"
+            )
+
     if cfg is not None and _is_mxfp4_kname(kn1):
         parsed_g1 = _parse_mxfp4_g1_kname(kn1)
         configured_act = parsed_g1["act"]
@@ -4003,34 +4051,6 @@ def get_2stage_cfgs(
             has_stage1_bias=has_stage1_bias,
             has_stage2_bias=has_stage2_bias,
         )
-
-    if is_q256_kernel(kernelName1) and not (
-        q_dtype_a == dtypes.fp4x2
-        and q_dtype_w == dtypes.fp4x2
-        and q_type == QuantType.per_1x32
-        and q_dtype_a2 in (None, dtypes.fp4x2)
-        and activation == ActivationType.Silu
-        and use_g1u1
-        and gate_mode == GateMode.SEPARATED
-        and is_shuffled
-        and not (
-            is_ep
-            or doweight_stage1
-            or hidden_pad
-            or intermediate_pad
-            or has_stage1_bias
-            or has_stage2_bias
-            or has_stage2_scatter
-            or has_num_local_tokens
-            or swiglu_limit
-        )
-        and situ_beta == 1.0
-        and situ_linear_beta == 1.0
-        and run_1stage
-        and block_m == 256
-        and not (ksplit or cfg_flat or run_1stage_xbf16)
-    ):
-        raise ValueError("Unsupported Q256 fused MoE configuration")
 
     if run_1stage:
         # never hard code block_m for 1-stage since it can be tuned by kernel itself, and we have different heuristics for different quant types
@@ -4381,6 +4401,8 @@ def get_2stage_cfgs(
             _a_type = "fp4"
         else:
             _a_type = "fp8"
+        _fp8_inter = q_dtype_a2 == dtypes.fp8 and _a_type == "fp4"
+        _a2_type = "fp8" if _fp8_inter else _a_type
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
@@ -4397,7 +4419,7 @@ def get_2stage_cfgs(
             1, _a_type, _w_type, _out_type, _tile_m, 128, 256
         )
         _base_kn2 = flydsl_kernel_name(
-            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+            2, _a2_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
         )
         kn1 = f"{_base_kn1}{_s1_sfx}"
         kn2 = f"{_base_kn2}{_s2_sfx}"
@@ -4428,6 +4450,7 @@ def get_2stage_cfgs(
                 activation=activation,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
+                out_dtype="fp8" if _fp8_inter else None,
             ),
             functools.partial(
                 _flydsl_stage2_wrapper,
@@ -4440,6 +4463,7 @@ def get_2stage_cfgs(
             False,
             has_bias=enable_bias,
             stage2_has_bias=enable_bias,
+            fuse_quant="fp8" if _fp8_inter else "",
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -4716,6 +4740,7 @@ def fused_moe_2stages(
         gate_up_interleave=getattr(w1, "gate_up_interleave", None),
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
+        has_a2_scale=a2_scale is not None,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
