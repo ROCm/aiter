@@ -118,12 +118,12 @@
         "waves_per_eu": 1
     },
     "any": {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 64,
-        "NUM_BUFFERS": 4,
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 32,
+        "NUM_BUFFERS": 2,
         "num_warps": 4,
-        "kernel_type": "bandwidth_bound",
-        "waves_per_eu": 4
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 1
     }
 }
