@@ -28,14 +28,14 @@ torch.set_default_device("cuda")
 
 
 def _ref_decay_cumsum(a, dt, chunk_size):
-    """Per-chunk cumsum of a * dt (TileGym _compute_ref_decay_cumsum)."""
+    """Per-chunk cumsum of a * dt."""
     B, T, H = dt.shape
     decay = (a * dt.float()).view(B, T // chunk_size, chunk_size, H)
     return decay.cumsum(dim=2).view(B, T, H)
 
 
 def _ref_pass_state(x, b, dt, decay_cumsum, init_state, chunk_size):
-    """Chunk-entry states and final state (TileGym _compute_ref_pass_state)."""
+    """Chunk-entry states and final state."""
     H, G = x.shape[2], b.shape[2]
     x, b, dt = x.float(), b.float().repeat_interleave(H // G, dim=2), dt.float()
     hid, hiddens = init_state, []
@@ -51,7 +51,7 @@ def _ref_pass_state(x, b, dt, decay_cumsum, init_state, chunk_size):
 
 
 def _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size):
-    """Fused chunk output (TileGym _compute_ref_out)."""
+    """Fused chunk output."""
     H, G = x.shape[2], b.shape[2]
     x, dt = x.float(), dt.float()
     b = b.float().repeat_interleave(H // G, dim=2)
@@ -72,7 +72,7 @@ def _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size):
 
 
 def run_torch(x, a, b, c, d, dt, init_state, chunk_size):
-    """TileGym's chunked Mamba-2 forward reference, in fp32."""
+    """Chunked Mamba-2 forward reference, in fp32."""
     decay_cumsum = _ref_decay_cumsum(a, dt, chunk_size)
     hiddens, final_state = _ref_pass_state(
         x, b, dt, decay_cumsum, init_state, chunk_size
@@ -87,8 +87,8 @@ def _bf16_ulp(x):
 
 
 def make_inputs(B, T, G, H, N, P, L, dtype):
-    """TileGym Mamba2ProblemSpec inputs; the initial state comes from one chunk of
-    the recurrence (TileGym _init_hidden) so it is in distribution."""
+    """Random inputs; the initial state comes from one chunk of the recurrence
+    so it is in distribution."""
     x = F.silu(torch.randn(B, T, H, P, dtype=dtype))
     a = -torch.empty(H, dtype=dtypes.fp32).uniform_(1, 16)
     b = F.silu(torch.randn(B, T, G, N, dtype=dtype))
@@ -162,7 +162,7 @@ def test_mamba2_chunk_forward(
 
     # bf16 operands round at the scale of the largest output terms, and those
     # errors survive cancellation into small outputs, so allow one bf16 ulp of
-    # the output's magnitude on top of TileGym's atol.
+    # the output's magnitude on top of the base atol.
     out_atol = 2e-2 + _bf16_ulp(ref_out.abs().max().item())
 
     ret = {"gfx": get_gfx()}
@@ -208,7 +208,7 @@ def main():
         default="bf16,",
         help="input dtype",
     )
-    # Defaults follow TileGym's Mamba-2 test_perf sweep (T capped for smaller GPUs).
+    # Default sweep: B=4, H=8, P=64, chunk 128, state 64-512.
     parser.add_argument(
         "-b", "--batch", type=int, nargs="*", default=[4], help="batch size"
     )

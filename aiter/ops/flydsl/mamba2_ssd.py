@@ -2,15 +2,14 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Mamba-2 SSD chunked forward (FlyDSL).
 
-Same contract as TileGym's ``mamba2_chunk_forward``::
+Contract::
 
     x    [B, T, H, P] bf16      a  [H] f32        d [H] f32
     b, c [B, T, G, N] bf16      dt [B, T, H] bf16 (post-softplus)
     init_state [B, H, P, N] f32
     -> out [B, T, H, P] bf16, final_state [B, H, P, N] f32
 
-Tile configs are autotuned once per shape (TileGym's tune-once / cache /
-launch pattern); set ``AITER_MAMBA2_AUTOTUNE=0`` to use the defaults.
+Tile configs are autotuned once per shape (tune once, cache, launch); set ``AITER_MAMBA2_AUTOTUNE=0`` to use the defaults.
 """
 
 import functools
@@ -47,7 +46,7 @@ def _state_configs(P, N, L):
 
 
 def _out_configs(P, N):
-    # TileGym _compute_out_configs: plain grid, or persistent at 1-2 blocks per CU;
+    # Plain grid, or persistent at 1-2 blocks per CU;
     # the state-tile K loop runs 4 tiles per trip or fully unrolled.
     nk = N // 16
     kus = sorted({nk} | ({4} if nk % 4 == 0 else set()))
@@ -91,7 +90,7 @@ def _tuning_key(*args):
 
 
 def _tuned_config(name, key, configs, launch, config):
-    """TileGym's tune-once / cache / launch: an explicit ``config`` wins, else
+    """Tune once / cache / launch: an explicit ``config`` wins, else
     benchmark every candidate once per shape and keep the fastest."""
     if config is not None:
         return config
@@ -219,7 +218,7 @@ def mamba2_chunk_forward_flydsl(
     x, a, b, c, d, dt, init_state, chunk_size=64, config=None
 ):
     """Return the output and fp32 final state; chunk-entry states are kept in
-    c.dtype, as in TileGym's mamba2_chunk_forward."""
+    c.dtype."""
     if get_gfx() not in SUPPORTED_GFX:
         raise RuntimeError(
             f"mamba2_chunk_forward_flydsl needs gfx11 WMMA; got {get_gfx()}"

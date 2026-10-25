@@ -2,8 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """FlyDSL Mamba-2 SSD chunked forward kernels (gfx11 WMMA, wave32).
 
-Port of TileGym's cuTile ``mamba2_chunk_forward``, split into the same three
-kernels:
+The chunked forward is split into three kernels:
 
 * ``chunk_cumsum``  -- per-chunk cumulative log2 decay ``LOG2E * cumsum(a*dt)``,
   written token-contiguous (``[b, h, t]``) so later kernels read it with
@@ -157,7 +156,7 @@ def build_fwd_pass_state(
     weights ``w[t] = dt[t] * exp2(d_last - d[t])``. The next slab's global loads
     are issued into registers before the current slab's WMMAs and written to LDS
     after them -- the register-staged prefetch of FlyDSL's RDNA3 GEMM, standing
-    in for cuTile's load latency hints on this serial loop. ``ks`` trades LDS /
+    in for load latency hints on this serial loop. ``ks`` trades LDS /
     prefetch registers (occupancy) against barriers per chunk; it is tuned.
     """
     H, G, P, N, L = num_heads, num_groups, head_size, state_size, chunk_size
@@ -380,7 +379,7 @@ def build_compute_out(
     (staging B too costs more occupancy than it saves).
 
     Tiles are numbered heads-fastest. ``persistent`` launches a fixed grid whose
-    blocks stride over the tiles (TileGym's persistent compute_out); otherwise
+    blocks stride over the tiles; otherwise
     each block takes one tile.
     """
     H, G, P, N, L = num_heads, num_groups, head_size, state_size, chunk_size
@@ -438,7 +437,7 @@ def build_compute_out(
 
         @flyc.jit
         def process_tile(tile):
-            # Heads vary fastest (TileGym _compute_out_tiles): concurrent tiles are
+            # Heads vary fastest: concurrent tiles are
             # the heads of one (batch, chunk), which share its B / C rows in L2.
             h = tile % H
             rest = tile // H
@@ -489,9 +488,9 @@ def build_compute_out(
             # Carried-state term: (exp2(d_t) * C) @ h^T, h = chunk-entry state [P, N].
             hid_base = (bh * num_chunks + chunk) * (P * N)
             exp_dt = d_ta.exp2()
-            # The K loops over state tiles run at runtime, KU tiles per trip (as
-            # TileGym loops over state tiles): fully unrolling a large state
-            # hoists every operand load and spills. KU is tuned.
+            # The K loops over state tiles run at runtime, KU tiles per trip:
+            # fully unrolling a large state hoists every operand load and
+            # spills. KU is tuned.
             accs = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(rp)]
             for kb, state in range(0, NK // KU, 1, init=accs):
                 k_accs = _carried(state)
