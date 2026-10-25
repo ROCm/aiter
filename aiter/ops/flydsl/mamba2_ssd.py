@@ -14,6 +14,7 @@ Tile configs are autotuned once per shape (tune once, cache, launch); set ``AITE
 
 import functools
 import itertools
+import math
 import os
 
 import flydsl.expr as fx
@@ -320,3 +321,137 @@ def mamba2_chunk_forward_flydsl(
             x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, config
         )
     return out, final_state
+
+
+def _chunked(t, chunk_size):
+    """[B, T, H, ...] -> [B, H, num_chunks, chunk_size, ...]."""
+    B, T, H = t.shape[:3]
+    return t.reshape(B, T // chunk_size, chunk_size, H, *t.shape[3:]).movedim(3, 1)
+
+
+def _unchunked(t):
+    """[B, H, num_chunks, chunk_size, ...] -> [B, T, H, ...]."""
+    B, H, nc, L = t.shape[:4]
+    return t.movedim(1, 3).reshape(B, nc * L, H, *t.shape[4:])
+
+
+def _chunk_grads(x, a, b, c, d, dt_bht, decay_bht, hiddens, dout, dhiddens, L):
+    """Per-chunk gradients from the chunk states and state gradients (fp32).
+
+    Numerics: no small quantity is formed as a difference of large, separately
+    rounded ones (the decay gradient's reverse cumsum is a direct suffix scan;
+    ddt is accumulated without dt and never divided by it), and the decay
+    gradient of the shift-invariant terms -- those depending only on d_t - d_s
+    within a chunk -- is re-centred to sum to exactly zero, as the exact
+    gradient does.
+    """
+    B, T, H, _ = x.shape
+    G, N = b.shape[2], b.shape[3]
+    HPG = H // G
+    X, DO = _chunked(x.float(), L), _chunked(dout.float(), L)
+    Bm = _chunked(b.float().repeat_interleave(HPG, 2), L)
+    Cm = _chunked(c.float().repeat_interleave(HPG, 2), L)
+    DT = dt_bht.view(B, H, T // L, L)
+    dec = decay_bht.view(B, H, T // L, L) * math.log(2.0)  # log2 -> natural units
+    gl = dec[..., -1]
+    causal = torch.ones(L, L, dtype=torch.bool, device=x.device).tril()
+    seg = torch.exp(  # mask before exp: the upper triangle would overflow
+        torch.where(causal, dec[..., :, None] - dec[..., None, :], -torch.inf)
+    )
+    w_b = DT * torch.exp(gl[..., None] - dec)  # weight of B_s in the state update
+
+    cb_raw = Cm @ Bm.transpose(-1, -2)
+    cb = cb_raw * seg
+    hm = DO @ X.transpose(-1, -2)  # dout_t . x_s, without dt
+    dcb = hm * DT[..., None, :] * seg
+    m = dcb * cb_raw
+
+    dx = DO * d[None, :, None, None, None] + DT[..., None] * (cb.transpose(-1, -2) @ DO)
+    dx = dx + (Bm * w_b[..., None]) @ dhiddens.transpose(-1, -2)
+    u = X @ dhiddens
+    q = torch.exp(gl[..., None] - dec) * (u * Bm).sum(-1)
+    ddt = (cb * hm).sum(-2) + q
+    dD = (DO * X).sum((2, 3, 4))  # [B, H]
+
+    v = DO @ hiddens
+    e_d = torch.exp(dec)[..., None]
+    dc = v * e_d + dcb @ Bm
+    db = dcb.transpose(-1, -2) @ Cm + u * w_b[..., None]
+
+    dd = (v * Cm * e_d).sum(-1)
+    dd_shift = m.sum(-1) - m.sum(-2) - DT * q
+    dd_shift[..., -1] += (DT * q).sum(-1)
+    dd = dd + dd_shift - dd_shift.mean(-1, keepdim=True)
+    dd[..., -1] += (dhiddens * hiddens).sum((-1, -2)) * torch.exp(gl)
+    dd_rev = dd.flip(-1).cumsum(-1).flip(-1)  # suffix scan
+    ddt = ddt + dd_rev * a[None, :, None, None]
+    da = (DT * dd_rev).sum((0, 2, 3))
+
+    db = _unchunked(db).reshape(B, T, G, HPG, N).sum(3)
+    dc = _unchunked(dc).reshape(B, T, G, HPG, N).sum(3)
+    return _unchunked(dx), da, db, dc, dD.sum(0), _unchunked(ddt)
+
+
+def mamba2_chunk_backward_flydsl(
+    x, a, b, c, d, dt, init_state, dout, dfinal_state, chunk_size=64, config=None
+):
+    """Return dx, da, db, dc, dd, ddt and the initial-state gradient.
+
+    The chunk states (fp32) and the state gradients (the forward recurrence run
+    in reverse) come from the FlyDSL pass_state kernel.
+    """
+    _check_inputs(x, a, b, c, d, dt, init_state, chunk_size)
+    if (
+        dout.shape != x.shape
+        or dout.dtype != torch.bfloat16
+        or not dout.is_contiguous()
+    ):
+        raise ValueError("dout must be contiguous bf16 shaped like x")
+    if dfinal_state.shape != init_state.shape or dfinal_state.device != x.device:
+        raise ValueError("dfinal_state must be shaped like init_state, on x's device")
+    head_size, state_size = x.shape[3], b.shape[3]
+    if config is not None:
+        config = {**default_config(head_size, state_size, chunk_size), **config}
+
+    a = a.float().contiguous()
+    d = d.float().contiguous()
+    init_state = init_state.float().contiguous()
+    dfinal_state = dfinal_state.float().contiguous()
+    with torch.cuda.device(x.device):
+        stream = fx.Stream(torch.cuda.current_stream(x.device))
+        decay_bht, dt_bht = _chunk_cumsum(a, dt, chunk_size, stream)
+        hiddens, _ = _fwd_pass_state(
+            x,
+            b,
+            dt_bht,
+            decay_bht,
+            init_state,
+            chunk_size,
+            stream,
+            config,
+            state_dtype=torch.float32,
+        )
+        dhiddens, dinit_state = _fwd_pass_state(
+            dout,
+            c,
+            dt_bht,
+            decay_bht,
+            dfinal_state,
+            chunk_size,
+            stream,
+            config,
+            backward=True,
+            state_dtype=torch.float32,
+        )
+        dx, da, db, dc, dd, ddt = _chunk_grads(
+            x, a, b, c, d, dt_bht, decay_bht, hiddens, dout, dhiddens, chunk_size
+        )
+    return (
+        dx.to(x.dtype),
+        da,
+        db.to(b.dtype),
+        dc.to(c.dtype),
+        dd,
+        ddt.to(dt.dtype),
+        dinit_state,
+    )
