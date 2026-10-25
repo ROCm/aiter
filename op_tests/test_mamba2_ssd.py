@@ -26,41 +26,75 @@ except ImportError:
 torch.set_default_device("cuda")
 
 
-def run_torch(x, a, b, c, d, dt, init_state, chunk_size):
-    """TileGym's chunked SSD reference in fp32; chunk-entry states narrowed to bf16."""
-    B, T, H, P = x.shape
-    G = b.shape[2]
-    L = chunk_size
-    x, b, c, dt = x.float(), b.float(), c.float(), dt.float()
-    b = b.repeat_interleave(H // G, dim=2)
-    c = c.repeat_interleave(H // G, dim=2)
-    decay = (a * dt).view(B, T // L, L, H).cumsum(2).view(B, T, H)
-    hid = init_state.float()
-    out = torch.empty_like(x)
-    for ci in range(T // L):
-        sl = slice(ci * L, (ci + 1) * L)
+def _ref_decay_cumsum(a, dt, chunk_size):
+    """Per-chunk cumsum of a * dt (TileGym _compute_ref_decay_cumsum)."""
+    B, T, H = dt.shape
+    decay = (a * dt.float()).view(B, T // chunk_size, chunk_size, H)
+    return decay.cumsum(dim=2).view(B, T, H)
+
+
+def _ref_pass_state(x, b, dt, decay_cumsum, init_state, chunk_size):
+    """Chunk-entry states and final state (TileGym _compute_ref_pass_state)."""
+    H, G = x.shape[2], b.shape[2]
+    x, b, dt = x.float(), b.float().repeat_interleave(H // G, dim=2), dt.float()
+    hid, hiddens = init_state, []
+    for ci in range(x.shape[1] // chunk_size):
+        hiddens.append(hid.clone())
+        sl = slice(ci * chunk_size, (ci + 1) * chunk_size)
+        xc, bc = x[:, sl].transpose(1, 2), b[:, sl].transpose(1, 2)
+        dtc, dc = dt[:, sl].transpose(1, 2), decay_cumsum[:, sl].transpose(1, 2)
+        g_last = dc[:, :, -1]
+        bw = bc * (dtc * torch.exp(g_last[..., None] - dc))[..., None]
+        hid = hid * torch.exp(g_last[..., None, None]) + xc.transpose(-1, -2) @ bw
+    return torch.stack(hiddens, dim=2), hid
+
+
+def _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size):
+    """Fused chunk output (TileGym _compute_ref_out)."""
+    H, G = x.shape[2], b.shape[2]
+    x, dt = x.float(), dt.float()
+    b = b.float().repeat_interleave(H // G, dim=2)
+    c = c.float().repeat_interleave(H // G, dim=2)
+    out = torch.zeros_like(x)
+    for ci in range(hiddens.shape[2]):
+        sl = slice(ci * chunk_size, (ci + 1) * chunk_size)
         xc, bc, cc = (t[:, sl].transpose(1, 2) for t in (x, b, c))
-        dtc, dc = dt[:, sl].transpose(1, 2), decay[:, sl].transpose(1, 2)
-        h_entry = hid.to(dtypes.bf16).float()
+        dtc, dc = dt[:, sl].transpose(1, 2), decay_cumsum[:, sl].transpose(1, 2)
         cb = cc @ bc.transpose(-1, -2)
-        cb = torch.tril(cb * torch.exp(torch.tril(dc[..., :, None] - dc[..., None, :])))
-        y = (cc * torch.exp(dc)[..., None]) @ h_entry.transpose(-1, -2)
+        cb = torch.tril(cb * torch.tril(torch.exp(dc[..., None] - dc[..., None, :])))
+        y = (cc * torch.exp(dc[..., None])) @ hiddens[:, :, ci].float().transpose(
+            -1, -2
+        )
         y = y + cb @ (dtc[..., None] * xc) + d[None, :, None, None] * xc
         out[:, sl] = y.transpose(1, 2)
-        g_last = dc[..., -1]
-        bw = bc * (dtc * torch.exp(g_last[..., None] - dc))[..., None]
-        hid = hid * torch.exp(g_last)[..., None, None] + xc.transpose(-1, -2) @ bw
-    return out.to(dtypes.bf16), hid
+    return out
 
 
-def make_inputs(B, T, G, H, N, P, dtype):
+def run_torch(x, a, b, c, d, dt, init_state, chunk_size):
+    """TileGym's chunked Mamba-2 forward reference, in fp32."""
+    decay_cumsum = _ref_decay_cumsum(a, dt, chunk_size)
+    hiddens, final_state = _ref_pass_state(
+        x, b, dt, decay_cumsum, init_state, chunk_size
+    )
+    out = _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size)
+    return out.to(x.dtype), final_state
+
+
+def make_inputs(B, T, G, H, N, P, L, dtype):
+    """TileGym Mamba2ProblemSpec inputs; the initial state comes from one chunk of
+    the recurrence (TileGym _init_hidden) so it is in distribution."""
     x = F.silu(torch.randn(B, T, H, P, dtype=dtype))
     a = -torch.empty(H, dtype=dtypes.fp32).uniform_(1, 16)
     b = F.silu(torch.randn(B, T, G, N, dtype=dtype))
     c = F.silu(torch.randn(B, T, G, N, dtype=dtype))
     d = torch.randn(H, dtype=dtypes.fp32)
     dt = F.softplus(torch.randn(B, T, H, dtype=dtype))
-    init_state = 0.1 * torch.randn(B, H, P, N, dtype=dtypes.fp32)
+    x0 = F.silu(torch.randn(B, L, H, P, dtype=dtype))
+    b0 = F.silu(torch.randn(B, L, G, N, dtype=dtype))
+    dt0 = F.softplus(torch.randn(B, L, H, dtype=dtype))
+    a0 = -torch.empty(H, dtype=dtypes.fp32).uniform_(1, 16)
+    zeros = torch.zeros(B, H, P, N, dtype=dtypes.fp32)
+    _, init_state = _ref_pass_state(x0, b0, dt0, (a0 * dt0).cumsum(dim=1), zeros, L)
     return x, a, b, c, d, dt, init_state
 
 
@@ -77,7 +111,7 @@ def test_mamba2_chunk_forward(
         head_size,
         chunk_size,
     )
-    x, a, b, c, d, dt, init_state = make_inputs(B, T, G, H, N, P, dtype)
+    x, a, b, c, d, dt, init_state = make_inputs(B, T, G, H, N, P, L, dtype)
     ref_out, ref_state = run_torch(x, a, b, c, d, dt, init_state, L)
 
     candidates = {
@@ -163,15 +197,16 @@ def main():
         default="bf16,",
         help="input dtype",
     )
+    # Defaults follow TileGym's Mamba-2 test_perf sweep (T capped for smaller GPUs).
     parser.add_argument(
-        "-b", "--batch", type=int, nargs="*", default=[1, 4], help="batch size"
+        "-b", "--batch", type=int, nargs="*", default=[4], help="batch size"
     )
     parser.add_argument(
         "-t",
         "--num_tokens",
         type=int,
         nargs="*",
-        default=[1024, 4096],
+        default=[1024, 4096, 16384],
         help="sequence length",
     )
     parser.add_argument(
@@ -179,11 +214,11 @@ def main():
         "--shape",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[(1, 8, 64, 64), (1, 8, 128, 64), (2, 8, 64, 64)],
+        default=[(1, 8, s, 64) for s in (64, 128, 256, 512)],
         help="(num_groups, num_heads, state_size, head_size), e.g. -s 1,8,128,64",
     )
     parser.add_argument(
-        "-c", "--chunk_size", type=int, nargs="*", default=[64, 128], help="chunk size"
+        "-c", "--chunk_size", type=int, nargs="*", default=[128], help="chunk size"
     )
     args = parser.parse_args()
 
