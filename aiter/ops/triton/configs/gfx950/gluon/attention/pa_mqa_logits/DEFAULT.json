@@ -1,0 +1,7 @@
+{
+    "plain_wave_cap": {
+        "chunk_q": 64,
+        "hidden_dim": 128,
+        "max_waves_per_eu_by_chunk_k": {"64": 5, "128": 3, "256": 2}
+    }
+}

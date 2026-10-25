@@ -31,7 +31,11 @@ from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
+    resolve_config_dir,
+)
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
@@ -314,9 +318,16 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     )
 
 
-# Largest waves_per_eu that the gfx950 plain (non-preshuffle) gluon kernel
-# compiles without scratch spills, for ChunkQ=64 / HiddenDim=128, by ChunkK.
-_GFX950_PLAIN_MAX_WAVES_PER_EU = {64: 5, 128: 3, 256: 2}
+@cache
+def _plain_wave_cap() -> dict | None:
+    """Largest waves_per_eu the plain (non-preshuffle) gluon kernel compiles
+    without scratch spills, by ChunkK, if the running arch has a tuned table."""
+    cfg = load_config_json(
+        f"{resolve_config_dir('attention', 'PA_MQA_LOGITS', backend='gluon')}"
+        "/DEFAULT.json",
+        required=False,
+    )
+    return None if cfg is None else cfg["plain_wave_cap"]
 
 
 @cache
@@ -404,14 +415,16 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["ContextLenStride"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
+    wave_cap = (
+        _plain_wave_cap()
+        if not Preshuffle and not Persistent and enable_jit_gluon_pa_mqa_logits_kernel
+        else None
+    )
     if (
-        gfx_version == "gfx950"
-        and not Preshuffle
-        and not Persistent
-        and enable_jit_gluon_pa_mqa_logits_kernel
-        and ChunkQ == 64
-        and HiddenDim == 128
-        and ChunkK in _GFX950_PLAIN_MAX_WAVES_PER_EU
+        wave_cap is not None
+        and ChunkQ == wave_cap["chunk_q"]
+        and HiddenDim == wave_cap["hidden_dim"]
+        and str(ChunkK) in wave_cap["max_waves_per_eu_by_chunk_k"]
     ):
         # waves_per_eu is a hard VGPR cap for LLVM (512 // waves_per_eu). The
         # plain (per-token paged) kernel needs ~140 VGPRs at ChunkK=128, so
@@ -421,7 +434,8 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         # occupancy that does not spill; the grid (SplitKV) is still sized
         # from the caller's WavePerEU.
         effective_wave_per_eu = min(
-            effective_wave_per_eu, _GFX950_PLAIN_MAX_WAVES_PER_EU[ChunkK]
+            effective_wave_per_eu,
+            wave_cap["max_waves_per_eu_by_chunk_k"][str(ChunkK)],
         )
     effective_num_warps = 1 if is_gfx1250 and Preshuffle else 4
     options = {

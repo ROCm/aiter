@@ -7,6 +7,7 @@
 #  Top-K on GPU:  1-stage (tiny rows) + 2-stage (large rows) Triton kernels,
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -19,9 +20,19 @@ from aiter.ops.triton._triton_kernels.topk import (
     topk_stage2_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+@functools.cache
+def _large_row_config() -> dict | None:
+    """Two-stage launch for large rows, if the running arch has one tuned."""
+    cfg = load_config_json(
+        f"{resolve_config_dir('topk', 'TOPK')}/DEFAULT.json", required=False
+    )
+    return None if cfg is None else dict(cfg["two_stage_large_rows"])
 
 
 def _pick_block(m: int, k: int) -> int:
@@ -69,17 +80,18 @@ def two_stage_topk(x, k, dim=-1, largest=True):
     batch_size = math.prod(x.shape) // topk_elem_cnt
 
     use_tdm = is_tdm_avail()
-    stage1_num_warps = 4
+    stage1_launch = {}
+    large = None if use_tdm else _large_row_config()
     if topk_elem_cnt < 1024:
         chunk_size = 256
-    elif not use_tdm and (
-        topk_elem_cnt >= 65536 or batch_size * topk_elem_cnt >= (1 << 23)
+    elif large is not None and (
+        topk_elem_cnt >= large["min_row_len"]
+        or batch_size * topk_elem_cnt >= large["min_total_elems"]
     ):
         # Large vocabularies: fewer, wider chunks with fewer warps per chunk keep
-        # the per-chunk argmax loop cheap and shrink stage 2 (measured on gfx950:
-        # 1.2-10x faster for N >= 128K at any batch, and for B*N >= 8M).
-        chunk_size = 4096
-        stage1_num_warps = 2
+        # the per-chunk argmax loop cheap and shrink stage 2.
+        chunk_size = large["chunk_size"]
+        stage1_launch["num_warps"] = large["num_warps"]
     else:
         chunk_size = 1024
 
@@ -110,7 +122,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
         descending,
         float("-inf") if descending else float("inf"),
         USE_TDM=use_tdm,
-        num_warps=stage1_num_warps,
+        **stage1_launch,
     )
     stage2_elem_cnt = chunk_num * k
     BLOCK_SIZE = triton.next_power_of_2(stage2_elem_cnt)

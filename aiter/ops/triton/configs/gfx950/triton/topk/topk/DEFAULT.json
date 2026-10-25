@@ -1,0 +1,8 @@
+{
+    "two_stage_large_rows": {
+        "min_row_len": 65536,
+        "min_total_elems": 8388608,
+        "chunk_size": 4096,
+        "num_warps": 2
+    }
+}

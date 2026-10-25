@@ -7,6 +7,8 @@
 # The kernels in this file are adapted from LightLLM's context_attention_fwd:
 # https://github.com/ModelTC/lightllm/blob/main/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py
 
+import functools
+
 import torch
 import triton
 from packaging.version import Version
@@ -15,7 +17,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_prefill import (
     _fwd_kernel,
     _fwd_kernel_alibi,
 )
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -23,31 +25,33 @@ _LOGGER = AiterTritonLogger()
 BASE_BLOCK = 64
 NUM_WARPS = 1
 
-# Triton >= 3.8 schedules this kernel differently from 3.7: the 1-warp,
-# single-stage launch below lost 8-15% on gfx950 (llama3 GQA shapes) and the
-# 2-warp launches win on 3.8/main. Measured on MI350X (gfx950), bench_pa_prefill:
-#   head_dim <= 64 (deepseek-V3): num_warps=2, waves_per_eu=2, num_stages=1 is
-#     the fastest launch on 3.7, 3.8 and main alike (-17..-31%).
-#   head_dim > 64, 16-bit KV cache, Triton >= 3.8: num_warps=2, num_stages=2,
-#     waves_per_eu=1.
-#   head_dim > 64, FP8 KV cache, Triton >= 3.9: num_warps=2, num_stages=2,
-#     no waves_per_eu hint (on 3.8 this is 6-10% slower than the original).
-# Older Triton keeps the original launch for head_dim > 64, which is still
-# the fastest there. Other archs keep the original launch (not re-tuned).
+# The launch the kernel has always used; archs without a tuned table keep it.
+_BASELINE_LAUNCH = {"num_warps": NUM_WARPS, "waves_per_eu": 1, "num_stages": 1}
 _TRITON_VERSION = Version(Version(triton.__version__).base_version)
 
 
-def _fwd_kernel_launch_params(head_dim_padded: int, kv_cache_is_fp8: bool):
-    if arch_info.get_arch() != "gfx950":
-        return {"num_warps": NUM_WARPS, "waves_per_eu": 1, "num_stages": 1}
-    if head_dim_padded <= 64:
-        return {"num_warps": 2, "waves_per_eu": 2, "num_stages": 1}
-    if kv_cache_is_fp8:
-        if _TRITON_VERSION >= Version("3.9.0"):
-            return {"num_warps": 2, "waves_per_eu": 0, "num_stages": 2}
-    elif _TRITON_VERSION >= Version("3.8.0"):
-        return {"num_warps": 2, "waves_per_eu": 1, "num_stages": 2}
-    return {"num_warps": NUM_WARPS, "waves_per_eu": 1, "num_stages": 1}
+@functools.cache
+def _fwd_dispatch() -> tuple:
+    """First-match launch rules for _fwd_kernel from the arch's tuned table."""
+    cfg = load_config_json(
+        f"{resolve_config_dir('attention', 'PA_PREFILL')}/DEFAULT.json",
+        required=False,
+    )
+    return () if cfg is None else tuple(cfg["fwd"]["dispatch"])
+
+
+def _fwd_kernel_launch_params(head_dim_padded: int, kv_cache_is_fp8: bool) -> dict:
+    # A rule can depend on the Triton version: the best launch for this kernel
+    # changed between Triton 3.7, 3.8 and 3.9.
+    for rule in _fwd_dispatch():
+        if head_dim_padded > rule.get("max_head_dim", head_dim_padded):
+            continue
+        if rule.get("kv_fp8", kv_cache_is_fp8) != kv_cache_is_fp8:
+            continue
+        if _TRITON_VERSION < Version(rule.get("min_triton", "0")):
+            continue
+        return dict(rule["config"])
+    return dict(_BASELINE_LAUNCH)
 
 
 @torch.inference_mode()
@@ -182,14 +186,12 @@ def context_attention_fwd(
             BLOCK_DMODEL_PADDED=Lk_padded,
             BLOCK_N=BLOCK,
             SKIP_DECODE=skip_decode,
-            num_warps=NUM_WARPS,
-            waves_per_eu=1,
-            num_stages=1,
+            **_BASELINE_LAUNCH,
         )
         return
 
     if q_dtype_is_f32:
-        launch_params = {"num_warps": NUM_WARPS, "waves_per_eu": 1, "num_stages": 1}
+        launch_params = dict(_BASELINE_LAUNCH)
     else:
         launch_params = _fwd_kernel_launch_params(
             Lk_padded,

@@ -1,0 +1,20 @@
+{
+    "fwd": {
+        "dispatch": [
+            {
+                "max_head_dim": 64,
+                "config": {"num_warps": 2, "waves_per_eu": 2, "num_stages": 1}
+            },
+            {
+                "kv_fp8": true,
+                "min_triton": "3.9.0",
+                "config": {"num_warps": 2, "waves_per_eu": 0, "num_stages": 2}
+            },
+            {
+                "kv_fp8": false,
+                "min_triton": "3.8.0",
+                "config": {"num_warps": 2, "waves_per_eu": 1, "num_stages": 2}
+            }
+        ]
+    }
+}
