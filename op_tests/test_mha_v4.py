@@ -285,9 +285,7 @@ def test_mha_v4_resolves_bf16_sparse_recipe(v_format, kind):
 
 @pytest.mark.parametrize("sparse", [False, True])
 def test_mha_v4_rejects_unimplemented_mxfp4_mxfp6_recipe(sparse):
-    with pytest.raises(
-        NotImplementedError, match="raw preprocessing is not implemented"
-    ):
+    with pytest.raises(NotImplementedError, match="MXFP4 Q/K requires MXFP4 V"):
         _resolve_raw_recipe(
             AttentionFormat.MXFP4,
             AttentionFormat.MXFP4,

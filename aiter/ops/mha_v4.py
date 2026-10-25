@@ -422,9 +422,11 @@ def _resolve_raw_recipe(
         kind = _RawRecipeKind.FP8
     elif q_format == AttentionFormat.MXFP4:
         if v_format != AttentionFormat.MXFP4:
+            # Retired, not pending: the MXFP4-Q/FP8-V row was dropped from the manifest, and no
+            # other V has ever had one.
             raise NotImplementedError(
-                "raw preprocessing is not implemented yet for "
-                f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
+                "MHA v4 MXFP4 Q/K requires MXFP4 V; no other V row exists "
+                f"(got Q={q_format.name}, K={k_format.name}, V={v_format.name})"
             )
         kind = _RawRecipeKind.MXFP4
     elif q_format == AttentionFormat.MXFP6:
