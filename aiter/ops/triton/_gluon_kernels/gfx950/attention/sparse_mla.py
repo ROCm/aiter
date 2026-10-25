@@ -2214,12 +2214,14 @@ def _epilogue_store(
         x = _mxfp8(x, scale_ptr + row * scale_stride0, h0, num_heads)
     hs = h0 + gl.arange(0, M, layout=gl.SliceLayout(1, x.type.layout))
     ds = gl.arange(0, D, layout=gl.SliceLayout(0, x.type.layout))
+    # row * out_stride0 is this query row's whole-row offset, which scales with
+    # the batch and can overflow buffer_store's 32-bit offset for a wide
+    # num_heads; fold it (64-bit) into the pointer instead.
+    row_ptr = out_ptr + row.to(gl.int64) * out_stride0
     gl.amd.cdna4.buffer_store(
         x.to(out_ptr.dtype.element_ty),
-        ptr=out_ptr,
-        offsets=(row * out_stride0 + hs[:, None] * out_stride1 + ds[None, :]).to(
-            gl.int32
-        ),
+        ptr=row_ptr,
+        offsets=(hs[:, None] * out_stride1 + ds[None, :]).to(gl.int32),
         mask=(hs < num_heads)[:, None],
     )
 
@@ -2579,11 +2581,14 @@ def _sparse_mla(
     offs_d_q = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.blocked_q))
     h_q = h_off + offs_m_q
     h_mask_q = h_q < num_heads
-    q_off = (query_idx * q_stride0 + h_q[:, None] * q_stride1 + offs_d_q[None, :]).to(
-        gl.int32
-    )
+    # query_idx * q_stride0 is this program's whole-row offset into q, which
+    # scales with the batch and can overflow buffer_load's 32-bit offset for a
+    # wide num_heads; fold it (64-bit) into the pointer instead, leaving only
+    # the one-row-wide h_q * q_stride1 + offs_d_q in the per-lane offset.
+    q_row_ptr = q_ptr + query_idx.to(gl.int64) * q_stride0
+    q_off = (h_q[:, None] * q_stride1 + offs_d_q[None, :]).to(gl.int32)
     q = gl.amd.cdna4.buffer_load(
-        ptr=q_ptr, offsets=q_off, mask=h_mask_q[:, None], other=0.0, cache=Q_CACHE
+        ptr=q_row_ptr, offsets=q_off, mask=h_mask_q[:, None], other=0.0, cache=Q_CACHE
     )
     if FP8_MFMA and not Q_FP8:
         # bf16 q: quantize here, one e4m3 scale for this program's whole Q tile
@@ -2600,13 +2605,14 @@ def _sparse_mla(
     if ROPE_SEPARATE:
         offs_d_qr = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, cfg.blocked_q))
         qr_off = (
-            query_idx * q_stride0
-            + h_q[:, None] * q_stride1
-            + HEAD_SIZE
-            + offs_d_qr[None, :]
+            h_q[:, None] * q_stride1 + HEAD_SIZE + offs_d_qr[None, :]
         ).to(gl.int32)
         q_rope = gl.amd.cdna4.buffer_load(
-            ptr=q_ptr, offsets=qr_off, mask=h_mask_q[:, None], other=0.0, cache=Q_CACHE
+            ptr=q_row_ptr,
+            offsets=qr_off,
+            mask=h_mask_q[:, None],
+            other=0.0,
+            cache=Q_CACHE,
         )
         q_rope_dot = gl.convert_layout(q_rope, cfg.q_layout)
     else:
@@ -2709,7 +2715,9 @@ def _sparse_mla(
         )
         main_splits = gl.minimum(gl.maximum(m_tiles, 1), work_splits)
         if split_id >= work_splits:
-            pm_base = query_idx * pm_stride0 + split_id * pm_stride_s
+            # pm_stride0 scales query_idx over the whole batch, so a large batch
+            # can overflow the add below in 32-bit; go 64-bit instead.
+            pm_base = query_idx * pm_stride0.to(gl.int64) + split_id * pm_stride_s
             gl.amd.cdna4.buffer_store(
                 gl.full(
                     [BLOCK_M],
@@ -2871,15 +2879,15 @@ def _sparse_mla(
                 OUT_MXFP8,
             )
         else:
+            # query_idx * out_stride0 is this program's whole-row offset, which
+            # scales with the batch and can overflow buffer_store's 32-bit offset
+            # for a wide num_heads; fold it (64-bit) into the pointer instead.
+            out_row_ptr = out_ptr + query_idx.to(gl.int64) * out_stride0
             offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-            o_off = (
-                query_idx * out_stride0
-                + h_pv[:, None] * out_stride1
-                + offs_d_o[None, :]
-            ).to(gl.int32)
+            o_off = (h_pv[:, None] * out_stride1 + offs_d_o[None, :]).to(gl.int32)
             gl.amd.cdna4.buffer_store(
                 out.to(out_ptr.dtype.element_ty),
-                ptr=out_ptr,
+                ptr=out_row_ptr,
                 offsets=o_off,
                 mask=head_mask_pv[:, None],
             )
@@ -2894,8 +2902,10 @@ def _sparse_mla(
             )
     else:
         # Un-normalized partials for the reduce kernel; m stays in the base-2
-        # exponent domain (the triton reduce's convention too).
-        pm_base = query_idx * pm_stride0 + split_id * pm_stride_s
+        # exponent domain (the triton reduce's convention too). pm_stride0 and
+        # pa_stride0 scale query_idx over the whole batch, so a large batch can
+        # overflow the adds below in 32-bit; go 64-bit instead.
+        pm_base = query_idx * pm_stride0.to(gl.int64) + split_id * pm_stride_s
         gl.amd.cdna4.buffer_store(
             m_pv,
             ptr=part_m_ptr + pm_base,
@@ -2911,12 +2921,12 @@ def _sparse_mla(
             cache=PART_STORE_CACHE,
         )
         offs_d_a = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-        a_base = query_idx * pa_stride0 + split_id * pa_stride_s
-        a_off = (a_base + h_pv[:, None] * pa_stride_h + offs_d_a[None, :]).to(gl.int32)
+        a_base = query_idx * pa_stride0.to(gl.int64) + split_id * pa_stride_s
+        a_off = (h_pv[:, None] * pa_stride_h + offs_d_a[None, :]).to(gl.int32)
         # Follow part_acc's own dtype: bf16 halves the partial HBM traffic.
         gl.amd.cdna4.buffer_store(
             acc.to(part_acc_ptr.dtype.element_ty),
-            ptr=part_acc_ptr,
+            ptr=part_acc_ptr + a_base,
             offsets=a_off,
             mask=head_mask_pv[:, None],
             cache=PART_STORE_CACHE,
@@ -3000,25 +3010,29 @@ def _sparse_mla_reduce(
     EPI_L: gl.constexpr = gl.BlockedLayout(
         [1, max(2, HEAD_SIZE // (64 * NUM_WARPS))], [1, 64], [1, NUM_WARPS], [1, 0]
     )
+    # query_idx * pm_stride0 / pa_stride0 is this query's whole-row offset,
+    # which scales with the batch and can overflow buffer_load's 32-bit offset
+    # for a wide num_heads; fold it (64-bit) into the pointer instead.
+    query_idx64 = query_idx.to(gl.int64)
+    pm_row_ptr = part_m_ptr + query_idx64 * pm_stride0
+    pl_row_ptr = part_l_ptr + query_idx64 * pm_stride0
+    pa_row_ptr = part_acc_ptr + query_idx64 * pa_stride0
     for mi in gl.static_range(BLOCK_M):
         h = pid_h * BLOCK_M + mi
         live = split_ok & (h < num_heads)
-        stat_off = query_idx * pm_stride0 + offs_s * pm_stride_s + h
+        stat_off = offs_s * pm_stride_s + h
         m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr, offsets=stat_off, mask=live, other=neg_inf, cache=".cg"
+            ptr=pm_row_ptr, offsets=stat_off, mask=live, other=neg_inf, cache=".cg"
         )
         l_s = gl.amd.cdna4.buffer_load(
-            ptr=part_l_ptr, offsets=stat_off, mask=live, other=0.0, cache=".cg"
+            ptr=pl_row_ptr, offsets=stat_off, mask=live, other=0.0, cache=".cg"
         )
         # Issued before the weights exist: nothing in the address depends on them.
         a_off = (
-            query_idx * pa_stride0
-            + offs_s[:, None] * pa_stride_s
-            + h * pa_stride_h
-            + offs_d[None, :]
+            offs_s[:, None] * pa_stride_s + h * pa_stride_h + offs_d[None, :]
         ).to(gl.int32)
         acc_s = gl.amd.cdna4.buffer_load(
-            ptr=part_acc_ptr,
+            ptr=pa_row_ptr,
             offsets=a_off,
             mask=live[:, None],
             other=0.0,
@@ -3067,10 +3081,14 @@ def _sparse_mla_reduce(
                 OUT_MXFP8,
             )
         else:
-            o_off = (query_idx * out_stride0 + h * out_stride1 + offs_d).to(gl.int32)
+            # query_idx * out_stride0 is this query's whole-row offset, which
+            # scales with the batch and can overflow buffer_store's 32-bit offset
+            # for a wide num_heads; fold it (64-bit) into the pointer instead.
+            o_row_ptr = out_ptr + query_idx.to(gl.int64) * out_stride0
+            o_off = (h * out_stride1 + offs_d).to(gl.int32)
             gl.amd.cdna4.buffer_store(
                 out.to(out_ptr.dtype.element_ty),
-                ptr=out_ptr,
+                ptr=o_row_ptr,
                 offsets=o_off,
                 mask=(offs_d < HEAD_SIZE) & (h < num_heads),
             )
