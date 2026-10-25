@@ -202,9 +202,24 @@ def build_chunk_cumsum(num_heads, chunk_size, block_h):
 
 
 def build_fwd_pass_state(
-    arch, num_heads, num_groups, head_size, state_size, chunk_size, rm, rn, ks
+    arch,
+    num_heads,
+    num_groups,
+    head_size,
+    state_size,
+    chunk_size,
+    rm,
+    rn,
+    ks,
+    backward=False,
+    state_f32=False,
 ):
     """Carry the state across chunks; one wave owns a (16*rm) x (16*rn) state tile.
+
+    ``backward`` runs the adjoint recurrence instead: chunks in reverse order,
+    with ``x`` <- dout, ``b`` <- c and weights ``w[t] = exp2(d[t])``, giving the
+    state gradient leaving each chunk and the initial-state gradient. Chunk
+    states are stored in fp32 if ``state_f32``, else bf16.
 
     The chunk loop is walked in slabs of ``16 * ks`` tokens (the GEMM K loop of
     ``x^T @ (B * w)``). Each slab's x and B tiles are staged into LDS transposed
@@ -223,6 +238,7 @@ def build_fwd_pass_state(
     SPC = L // SL  # slabs per chunk
     W_PASSES = (SL + WAVE - 1) // WAVE
     BP, BN = TILE * rm, TILE * rn
+    STATE_ELEM = fx.Float32 if state_f32 else fx.BFloat16
     assert P % BP == 0 and N % BN == 0 and L % SL == 0
 
     # Transposed slab tiles xT[p][t] and bT[n][t]; rows padded by 8 elements.
@@ -254,7 +270,7 @@ def build_fwd_pass_state(
         dec_r = ptr_buf_tensor(decay, fx.Float32)
         dt_r = ptr_buf_tensor(dt_bht, fx.Float32)
         init_r = ptr_buf_tensor(init_state, fx.Float32)
-        hid_w = ptr_buf_tensor(hiddens, fx.BFloat16)
+        hid_w = ptr_buf_tensor(hiddens, STATE_ELEM)
         fin_w = ptr_buf_tensor(final_state, fx.Float32)
         lds = _lds_base(SharedStorage)
 
@@ -273,11 +289,17 @@ def build_fwd_pass_state(
         x_row = H * P
         b_row = G * N
 
+        def chunk_of(it):
+            c = it // SPC
+            if const_expr(backward):
+                c = num_chunks - 1 - c
+            return c
+
         def load_slab(it):
             """Global -> registers for slab ``it``: x / B tiles (128-bit), weights,
             and the state decay to apply before it (1 except on a chunk's first slab).
             """
-            c, step = it // SPC, it % SPC
+            c, step = chunk_of(it), it % SPC
             t0 = c * L + step * SL
             row0 = batch * num_tokens + t0
             xv = []
@@ -296,7 +318,12 @@ def build_fwd_pass_state(
                 t = (
                     tok_base + t0 + (lane + k * WAVE) % SL
                 )  # wrapped lanes are not stored
-                w.append(fx.Float32(dt_r[t]) * (d_last - fx.Float32(dec_r[t])).exp2())
+                if const_expr(backward):
+                    w.append(fx.Float32(dec_r[t]).exp2())
+                else:
+                    w.append(
+                        fx.Float32(dt_r[t]) * (d_last - fx.Float32(dec_r[t])).exp2()
+                    )
             scale = (step == 0).select(d_last.exp2(), fx.Float32(1.0))
             return xv, bv, w, scale
 
@@ -348,15 +375,15 @@ def build_fwd_pass_state(
             it = fx.Int32(it_iv)
             s_accs = _carried(state)
             if it % SPC == 0:
-                # Chunk-entry state, narrowed to the dtype compute_out consumes.
-                hid_base = (bh * num_chunks + it // SPC) * (P * N)
+                # State entering the chunk (leaving it, for backward).
+                hid_base = (bh * num_chunks + chunk_of(it)) * (P * N)
                 for i in range_constexpr(rm):
                     for j in range_constexpr(rn):
                         acc = s_accs[i * rn + j]
                         for si in range_constexpr(8):
                             hid_w[hid_base + state_off(i, j, si)] = fx.Float32(
                                 acc[si]
-                            ).to(fx.BFloat16)
+                            ).to(STATE_ELEM)
 
             # Prefetch the next slab (the last iteration reloads its own, harmlessly).
             nxt = load_slab((it + 1 < num_slabs).select(it + 1, it))

@@ -93,8 +93,10 @@ def _cumsum(H, L):
 
 
 @functools.cache
-def _state(H, G, P, N, L, rm, rn, ks):
-    return build_fwd_pass_state(get_gfx_runtime(), H, G, P, N, L, rm, rn, ks)
+def _state(H, G, P, N, L, rm, rn, ks, backward=False, state_f32=False):
+    return build_fwd_pass_state(
+        get_gfx_runtime(), H, G, P, N, L, rm, rn, ks, backward, state_f32
+    )
 
 
 @functools.cache
@@ -195,12 +197,29 @@ def _chunk_cumsum(a, dt, chunk_size, stream):
     return decay_bht, dt_bht
 
 
-def _fwd_pass_state(x, b, dt_bht, decay_bht, init_state, chunk_size, stream, config):
-    """Return chunk-entry states (narrowed to x.dtype) and the fp32 final state."""
+def _fwd_pass_state(
+    x,
+    b,
+    dt_bht,
+    decay_bht,
+    init_state,
+    chunk_size,
+    stream,
+    config,
+    backward=False,
+    state_dtype=None,
+):
+    """Return chunk-entry states (x.dtype unless ``state_dtype``) and the fp32
+    final state. With ``backward``, x / b / init_state are dout / c / dfinal_state
+    and this returns the per-chunk state gradients and the initial-state gradient.
+    """
+    state_dtype = x.dtype if state_dtype is None else state_dtype
     batch_size, num_tokens, num_heads, head_size = x.shape
     num_groups, state_size = b.shape[2], b.shape[3]
     num_chunks = num_tokens // chunk_size
-    hiddens = x.new_empty(batch_size, num_heads, num_chunks, head_size, state_size)
+    hiddens = x.new_empty(
+        batch_size, num_heads, num_chunks, head_size, state_size, dtype=state_dtype
+    )
     final_state = torch.empty_like(init_state)
 
     def launch(cfg):
@@ -214,6 +233,8 @@ def _fwd_pass_state(x, b, dt_bht, decay_bht, init_state, chunk_size, stream, con
                 cfg["rm"],
                 cfg["rn"],
                 cfg["ks"],
+                backward,
+                state_dtype == torch.float32,
             ),
             x,
             b,
@@ -228,7 +249,7 @@ def _fwd_pass_state(x, b, dt_bht, decay_bht, init_state, chunk_size, stream, con
         )
 
     configs = list(_state_configs(head_size, state_size, chunk_size))
-    key = _tuning_key(x, b, init_state, chunk_size)
+    key = _tuning_key(x, b, init_state, chunk_size, backward, state_dtype)
     launch(_tuned_config("fwd_pass_state", key, configs, launch, config))
     return hiddens, final_state
 
