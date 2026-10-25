@@ -12,6 +12,7 @@ Usage:
   python test_moe_topk_gating.py --section ties,eplb
   python test_moe_topk_gating.py --section biased-sigmoid --num-experts 896 \
       --num-tokens 1,8,32,128 --topk 16 --dtype bf16
+  python test_moe_topk_gating.py --section biased-nan
 """
 
 import argparse
@@ -690,6 +691,44 @@ def bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype):
 
 
 @benchmark()
+def bench_biased_grouped_topk_nan(num_experts, num_tokens, topk, dtype):
+    """NaN/Inf robustness for aiter.biased_grouped_topk's HIP kernel. Poisons
+    every row but the first with a single bad value and checks that the kernel
+    still returns finite weights and topk-unique expert ids, instead of
+    propagating NaN/Inf into topk_weights."""
+    torch.random.manual_seed(0)
+    correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    results = {}
+    for bad_value in (float("nan"), float("inf")):
+        gating_output = _make_gating(num_experts, num_tokens, dtype)
+        gating_output[1:, :] = bad_value
+
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device="cuda"
+        )
+        topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+        biased_grouped_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            1,
+            1,
+            False,  # need_renorm
+            1.0,
+        )
+        torch.cuda.synchronize()
+        tag = "nan" if math.isnan(bad_value) else "inf"
+        results[f"{tag}_finite"] = bool(topk_weights[1:].isfinite().all().item())
+        unique_ok = all(row.unique().numel() == topk for row in topk_ids[1:])
+        results[f"{tag}_unique_ids"] = unique_ok
+
+    ret = {"gfx": get_gfx()}
+    ret.update(results)
+    return ret
+
+
+@benchmark()
 def bench_topk_gating_ties(num_experts, num_tokens, topk, score_func, dtype):
     """Exact-tie benchmark. The other cases build rows of distinct values, but
     real gating output repeats, and lanes that disagree about which of two equal
@@ -976,9 +1015,18 @@ def main():
         "--score-func",
         dest="section",
         type=lambda s: [x.strip() for x in s.split(",")],
-        default=["sigmoid", "softplus", "softmax", "nan", "ties", "eplb", "shared"],
+        default=[
+            "sigmoid",
+            "softplus",
+            "softmax",
+            "nan",
+            "biased-nan",
+            "ties",
+            "eplb",
+            "shared",
+        ],
         help="Comma-separated list of sections to run: "
-        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared "
+        "sigmoid,biased-sigmoid,biased-nan,softplus,softmax,nan,ties,eplb,shared "
         "(default: all except biased-sigmoid). "
         "Sigmoid, softplus and softmax are named after score functions; nan, ties and eplb "
         "each sweep all score functions. --score-func is a deprecated alias.",
@@ -1121,6 +1169,39 @@ def main():
             )
             print(errors.to_string(index=False))
             failed_sections.append("nan")
+
+    # -- biased_grouped_topk NaN/Inf robustness (num_expert_group=1) --------
+    if "biased-nan" in sections:
+        biased_nan_dtypes = [d for d in dtype_list if d != torch.float32] + [
+            torch.float32
+        ]
+        biased_nan_configs = list(
+            itertools.product(
+                [e for e in num_experts_list if e in (6, 8, 16)] or [6, 8, 16],
+                num_tokens_list,
+                [k for k in topk_list if k in (3, 4)] or [3, 4],
+                biased_nan_dtypes,
+            )
+        )
+        df = [bench_biased_grouped_topk_nan(*cfg) for cfg in biased_nan_configs]
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "biased_grouped_topk NaN/Inf robustness summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[
+            (~df["nan_finite"])
+            | (~df["nan_unique_ids"])
+            | (~df["inf_finite"])
+            | (~df["inf_unique_ids"])
+        ]
+        if len(errors) > 0:
+            print(
+                f"\nERROR: {len(errors)} biased-nan config(s) had non-finite "
+                f"weights or duplicate expert ids!"
+            )
+            print(errors.to_string(index=False))
+            failed_sections.append("biased-nan")
 
     # -- topk_gating exact-tie handling ------------------------------------
     if "ties" in sections:
