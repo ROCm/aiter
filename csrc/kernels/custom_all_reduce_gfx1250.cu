@@ -464,7 +464,8 @@ void all_reduce(fptr_t _fa,
 
     bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
 
-    if(reg_inp_ptr != 0)
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(reg_inp_ptr != 0 && !fa->routes_to_ll((size_t)data_bytes))
     {
         if(data_bytes > reg_inp_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
@@ -475,6 +476,48 @@ void all_reduce(fptr_t _fa,
 
     _all_reduce(_fa, actual_inp, actual_out, numel, dtype,
                 use_new, is_broadcast_reg_outptr);
+}
+
+// ---- Fused all-reduce + residual add + RMSNorm (LL lane) ----
+
+bool fused_allreduce_rmsnorm(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             const aiter_tensor_t& residual_inp,
+                             const aiter_tensor_t& residual_out,
+                             const aiter_tensor_t& out,
+                             const aiter_tensor_t& weight,
+                             double eps,
+                             bool gemma_norm)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const int hidden   = (int)weight.numel();
+    if(hidden <= 0 || inp.numel() % hidden != 0)
+        throw std::runtime_error("fused_allreduce_rmsnorm: input is not rows of weight.numel()");
+    const int rows = (int)(inp.numel() / hidden);
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_bf16:
+        return fa->fused_allreduce_rmsnorm_ll<opus::bf16_t>(
+            stream,
+            reinterpret_cast<const opus::bf16_t*>(inp.data_ptr()),
+            reinterpret_cast<const opus::bf16_t*>(residual_inp.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(residual_out.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+            reinterpret_cast<const opus::bf16_t*>(weight.data_ptr()),
+            (float)eps, rows, hidden, gemma_norm);
+    case AITER_DTYPE_fp16:
+        return fa->fused_allreduce_rmsnorm_ll<opus::fp16_t>(
+            stream,
+            reinterpret_cast<const opus::fp16_t*>(inp.data_ptr()),
+            reinterpret_cast<const opus::fp16_t*>(residual_inp.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(residual_out.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
+            reinterpret_cast<const opus::fp16_t*>(weight.data_ptr()),
+            (float)eps, rows, hidden, gemma_norm);
+    default: return false;
+    }
 }
 
 // ---- Sync latency measurement kernels ----

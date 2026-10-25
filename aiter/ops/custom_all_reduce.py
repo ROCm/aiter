@@ -278,6 +278,19 @@ def all_reduce_gfx1250(
 ) -> None: ...
 
 
+@compile_ops(GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm", develop=True)
+def fused_allreduce_rmsnorm_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    residual_inp: torch.Tensor,
+    residual_out: torch.Tensor,
+    out: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gemma_norm: bool,
+) -> bool: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="reduce_scatter", develop=True)
 def reduce_scatter_gfx1250(
     _fa: int,

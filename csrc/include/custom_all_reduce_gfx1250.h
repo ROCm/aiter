@@ -48,6 +48,16 @@ void all_reduce(fptr_t _fa,
                 bool open_fp8_quant,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
+// Fused all-reduce + residual add + RMSNorm on the LL lane. Returns false,
+// doing nothing, when the message does not fit that lane.
+bool fused_allreduce_rmsnorm(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             const aiter_tensor_t& residual_inp,
+                             const aiter_tensor_t& residual_out,
+                             const aiter_tensor_t& out,
+                             const aiter_tensor_t& weight,
+                             double eps,
+                             bool gemma_norm);
 void all_gather(fptr_t _fa,
                 const aiter_tensor_t& inp,
                 const aiter_tensor_t& out,

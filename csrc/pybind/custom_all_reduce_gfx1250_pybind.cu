@@ -21,6 +21,10 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("use_new"), py::arg("open_fp8_quant"),
           py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
+    m.def("fused_allreduce_rmsnorm", &aiter::fused_allreduce_rmsnorm,
+          py::arg("_fa"), py::arg("inp"), py::arg("residual_inp"),
+          py::arg("residual_out"), py::arg("out"), py::arg("weight"),
+          py::arg("eps"), py::arg("gemma_norm"));
     m.def("reduce_scatter", &aiter::reduce_scatter,
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("m"), py::arg("n"), py::arg("k"),

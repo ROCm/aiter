@@ -2036,6 +2036,15 @@ class CustomAllreduce:
         emit_bf16: bool = False,
     ):
         valid_dim = w.numel()
+        if (
+            self._is_gfx1250
+            and not post_per_token_quant
+            and inp.shape[-1] == valid_dim
+            and out_hidden_dim in (0, valid_dim)
+        ):
+            return self._fused_ar_rms_gfx1250(
+                inp, res_inp, res_out, out, w, eps, registered, gemma_norm
+            )
         if res_out is None:
             res_out = torch.empty(
                 inp.shape[:-1] + (valid_dim,), dtype=inp.dtype, device=inp.device
@@ -2113,6 +2122,31 @@ class CustomAllreduce:
             if emit_bf16:
                 return out, res_out, scale_out, bf16_out
             return out, res_out, scale_out
+
+    def _fused_ar_rms_gfx1250(
+        self, inp, res_inp, res_out, out, w, eps, registered, gemma_norm
+    ):
+        """gfx1250 fused all-reduce + residual add + RMSNorm.
+
+        The CDNA module's fused kernels read the communicator handle as their own
+        struct, so they cannot take a gfx1250 one. Messages that fit the LL lane
+        run the gfx1250 fused kernel; larger ones run the gfx1250 all-reduce and
+        then the add + norm kernel, which is what the fusion replaces.
+        """
+        shape = inp.shape[:-1] + (w.numel(),)
+        if res_out is None:
+            res_out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+        if out is None:
+            out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+        if ops.fused_allreduce_rmsnorm_gfx1250(
+            self._ptr, inp, res_inp, res_out, out, w, eps, gemma_norm
+        ):
+            return out, res_out
+        ar_out = self.all_reduce(inp, registered_input=registered)
+        from aiter import rmsnorm2d_fwd_with_add
+
+        rmsnorm2d_fwd_with_add(out, ar_out, res_inp, res_out, w, eps, gemma_norm, 0)
+        return out, res_out
 
     def custom_fused_ar_rms(
         self,

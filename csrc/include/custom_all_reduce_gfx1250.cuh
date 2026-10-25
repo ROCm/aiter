@@ -157,6 +157,8 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 constexpr int    kLLMaxRanks       = kMaxNgpusAr;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
 constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
+// Fused all-reduce + RMSNorm switches from one-shot to two-shot at this size.
+constexpr size_t kFusedArTwoShotMinBytes = ~(size_t)0;
 // Hard per-message payload cap (one slot). Comfortably above the routing
 // threshold so all dtypes at <=128 KiB fit.
 constexpr size_t kLLScratchCapBytes = 4194304;          // 4 MiB
@@ -352,6 +354,386 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
 
     // Entry blockIdx.x + k * gridDim.x is written by thread k, so the epoch
     // fan-out costs one store per thread even for a single-block launch.
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
+}
+
+// LL all-reduce fused with the residual add and RMSNorm that follow it:
+//   residual_out = residual_inp + bf16(sum_r input_r)
+//   out          = rmsnorm(residual_out) * w        (* (1 + w) for GEMMA_NORM)
+// The norm reads residual_out as stored (rounded to T), as the unfused add +
+// norm does. Phase 1 is ar_ll_gfx1250's publish; in phase 2 each block owns
+// whole rows, so it can pull a row from every peer, reduce, add and normalize
+// it without a second pass. It shares the LL scratch banks and the per-launch
+// epoch with ar_ll_gfx1250.
+template <typename T, int ngpus, int kPktPerThread, bool GEMMA_NORM>
+__global__ void __launch_bounds__(1024, 1) ar_ll_rms_gfx1250(
+    T* const* __restrict__ peer_scratch,
+    const T* __restrict__ sendbuff,
+    const T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    T* __restrict__ out,
+    const T* __restrict__ weight,
+    float eps,
+    int rows,
+    int pkt_per_row, // row bytes / 8
+    int rank,
+    uint32_t* __restrict__ block_flags)
+{
+    constexpr int LP = 8 / sizeof(T); // elements per 8-byte payload
+    using PL         = typename opus::vector_t<T, LP>;
+    constexpr size_t slot  = kLLPackCapacity;
+    const int        nWarps = (int)(blockDim.x >> 5);
+
+    __shared__ uint32_t s_flag;
+    __shared__ float s_sq[32];
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 2u; // flag is never 0 (0 == cleared scratch); keep bank parity
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag        = s_flag;
+    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+    const size_t   nPk         = (size_t)rows * pkt_per_row;
+    const uint32_t* in         = reinterpret_cast<const uint32_t*>(sendbuff);
+
+    // Phase 1: publish my payload into every peer's slot[rank].
+    for(size_t pk = (size_t)blockIdx.x * blockDim.x + threadIdx.x; pk < nPk;
+        pk += (size_t)gridDim.x * blockDim.x)
+    {
+        const uint32_t d0 = in[2 * pk];
+        const uint32_t d1 = in[2 * pk + 1];
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            int          peer = (rank + r) % ngpus;
+            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
+                               bankOffPkts + (size_t)rank * slot;
+            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d0, flag, d1, flag);
+        }
+    }
+
+    // Phase 2: per row, reduce the peers' packets, add the residual, normalize.
+    LLPackedMsg* myBase =
+        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+    const float inv_hidden = 1.0f / (float)(pkt_per_row * LP);
+    for(int row = blockIdx.x; row < rows; row += gridDim.x)
+    {
+        float x[kPktPerThread][LP];
+        float sq = 0.0f;
+#pragma unroll
+        for(int i = 0; i < kPktPerThread; ++i)
+        {
+            const int j = threadIdx.x + i * blockDim.x;
+            if(j < pkt_per_row)
+            {
+                const size_t pk = (size_t)row * pkt_per_row + j;
+                PL selfv        = *reinterpret_cast<const PL*>(&in[2 * pk]);
+                float acc[LP];
+#pragma unroll
+                for(int e = 0; e < LP; ++e)
+                    acc[e] = upcast_s(selfv[e]);
+                for(int r = 1; r < ngpus; ++r)
+                {
+                    int                   peer = (rank + r) % ngpus;
+                    volatile LLPackedMsg* src  = myBase + (size_t)peer * slot;
+                    uint32_t d0, f0, d1, f1;
+                    do
+                    {
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(
+                                         const_cast<LLPackedMsg*>(&src[pk])),
+                                     d0, f0, d1, f1);
+                    } while(f0 != flag || f1 != flag);
+                    const uint32_t w[2] = {d0, d1};
+                    PL             pv   = *reinterpret_cast<const PL*>(w);
+#pragma unroll
+                    for(int e = 0; e < LP; ++e)
+                        acc[e] += upcast_s(pv[e]);
+                }
+                PL resv = reinterpret_cast<const PL*>(residual_inp)[pk];
+                PL rout;
+#pragma unroll
+                for(int e = 0; e < LP; ++e)
+                {
+                    // the all-reduce result and the residual sum both round to T,
+                    // as AR -> add -> norm does unfused
+                    rout[e] = downcast_s<T>(upcast_s(downcast_s<T>(acc[e])) +
+                                            upcast_s(resv[e]));
+                    x[i][e] = upcast_s(rout[e]);
+                    sq += x[i][e] * x[i][e];
+                }
+                reinterpret_cast<PL*>(residual_out)[pk] = rout;
+            }
+        }
+        // block sum of squares (wave32)
+#pragma unroll
+        for(int off = 16; off > 0; off >>= 1)
+            sq += __shfl_xor(sq, off, 32);
+        if((threadIdx.x & 31) == 0)
+            s_sq[threadIdx.x >> 5] = sq;
+        __syncthreads();
+        float total = 0.0f;
+        for(int wv = 0; wv < nWarps; ++wv)
+            total += s_sq[wv];
+        const float denom = rsqrtf(total * inv_hidden + eps);
+#pragma unroll
+        for(int i = 0; i < kPktPerThread; ++i)
+        {
+            const int j = threadIdx.x + i * blockDim.x;
+            if(j < pkt_per_row)
+            {
+                PL wv = reinterpret_cast<const PL*>(weight)[j];
+                PL ov;
+#pragma unroll
+                for(int e = 0; e < LP; ++e)
+                {
+                    float wf = upcast_s(wv[e]);
+                    if constexpr(GEMMA_NORM)
+                        wf += 1.0f;
+                    ov[e] = downcast_s<T>(x[i][e] * denom * wf);
+                }
+                reinterpret_cast<PL*>(out)[(size_t)row * pkt_per_row + j] = ov;
+            }
+        }
+        __syncthreads(); // s_sq is reused by the next row
+    }
+
+    // Same epoch fan-out as ar_ll_gfx1250: every entry, launched block or not.
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
+}
+
+// Residual add + RMSNorm of one row whose all-reduce result each thread holds
+// as kPktPerThread packets `arv`, already rounded to T as the unfused
+// all-reduce rounds it. Writes residual_out and out; the norm reads
+// residual_out as stored. Every thread of the block must call it.
+template <typename T, int kPktPerThread, bool GEMMA_NORM>
+DINLINE void ll_rms_row(const typename opus::vector_t<T, 8 / sizeof(T)> (&arv)[kPktPerThread],
+                        int row,
+                        int pkt_per_row,
+                        const T* __restrict__ residual_inp,
+                        T* __restrict__ residual_out,
+                        T* __restrict__ out,
+                        const T* __restrict__ weight,
+                        float eps,
+                        float* s_sq)
+{
+    constexpr int LP = 8 / sizeof(T);
+    using PL         = typename opus::vector_t<T, LP>;
+    const int   nWarps     = (int)(blockDim.x >> 5);
+    const float inv_hidden = 1.0f / (float)(pkt_per_row * LP);
+    float x[kPktPerThread][LP];
+    float sq = 0.0f;
+#pragma unroll
+    for(int i = 0; i < kPktPerThread; ++i)
+    {
+        const int j = threadIdx.x + i * blockDim.x;
+        if(j < pkt_per_row)
+        {
+            const size_t pk = (size_t)row * pkt_per_row + j;
+            PL resv         = reinterpret_cast<const PL*>(residual_inp)[pk];
+            PL rout;
+#pragma unroll
+            for(int e = 0; e < LP; ++e)
+            {
+                rout[e] = downcast_s<T>(upcast_s(arv[i][e]) + upcast_s(resv[e]));
+                x[i][e] = upcast_s(rout[e]);
+                sq += x[i][e] * x[i][e];
+            }
+            reinterpret_cast<PL*>(residual_out)[pk] = rout;
+        }
+    }
+#pragma unroll
+    for(int off = 16; off > 0; off >>= 1)
+        sq += __shfl_xor(sq, off, 32);
+    if((threadIdx.x & 31) == 0)
+        s_sq[threadIdx.x >> 5] = sq;
+    __syncthreads();
+    float total = 0.0f;
+    for(int wv = 0; wv < nWarps; ++wv)
+        total += s_sq[wv];
+    const float denom = rsqrtf(total * inv_hidden + eps);
+#pragma unroll
+    for(int i = 0; i < kPktPerThread; ++i)
+    {
+        const int j = threadIdx.x + i * blockDim.x;
+        if(j < pkt_per_row)
+        {
+            PL wv = reinterpret_cast<const PL*>(weight)[j];
+            PL ov;
+#pragma unroll
+            for(int e = 0; e < LP; ++e)
+            {
+                float wf = upcast_s(wv[e]);
+                if constexpr(GEMMA_NORM)
+                    wf += 1.0f;
+                ov[e] = downcast_s<T>(x[i][e] * denom * wf);
+            }
+            reinterpret_cast<PL*>(out)[(size_t)row * pkt_per_row + j] = ov;
+        }
+    }
+    __syncthreads(); // s_sq is reused by the next row
+}
+
+// Two-shot form of ar_ll_rms_gfx1250, for the larger decode messages: row r
+// belongs to rank r % ngpus. Each rank sends its partial of every other row to
+// that row's owner (reduce-scatter), sums the rows it owns and sends those sums
+// to every peer (all-gather), then adds the residual and normalizes every row
+// locally. Each rank moves about half the bytes of the one-shot kernel, and
+// all ranks normalize the same, owner-rounded sums.
+//
+// In a rank's LL slot for peer p, the reduce-scatter lines sit at the row's
+// index within its owner's share and the all-gather lines half a slot above.
+// Blocks finish their own rows before waiting on other ranks' rows, so the
+// cross-rank waits cannot form a cycle.
+template <typename T, int ngpus, int kPktPerThread, bool GEMMA_NORM>
+__global__ void __launch_bounds__(1024, 1) ar_ll_rms_2s_gfx1250(
+    T* const* __restrict__ peer_scratch,
+    const T* __restrict__ sendbuff,
+    const T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    T* __restrict__ out,
+    const T* __restrict__ weight,
+    float eps,
+    int rows,
+    int pkt_per_row, // row bytes / 8
+    int rank,
+    uint32_t* __restrict__ block_flags)
+{
+    constexpr int LP = 8 / sizeof(T); // elements per 8-byte payload
+    using PL         = typename opus::vector_t<T, LP>;
+    constexpr size_t slot = kLLPackCapacity;
+    constexpr size_t half = slot / 2;
+
+    __shared__ uint32_t s_flag;
+    __shared__ float s_sq[32];
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 2u; // flag is never 0 (0 == cleared scratch); keep bank parity
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag        = s_flag;
+    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+    const size_t   nPk         = (size_t)rows * pkt_per_row;
+    const uint32_t* in         = reinterpret_cast<const uint32_t*>(sendbuff);
+
+    // Phase 1 (reduce-scatter): my partial of every row I do not own goes to
+    // its owner.
+    for(size_t pk = (size_t)blockIdx.x * blockDim.x + threadIdx.x; pk < nPk;
+        pk += (size_t)gridDim.x * blockDim.x)
+    {
+        const int row   = (int)(pk / pkt_per_row);
+        const int owner = row % ngpus;
+        if(owner == rank)
+            continue;
+        const size_t j   = pk - (size_t)row * pkt_per_row;
+        LLPackedMsg* dst = reinterpret_cast<LLPackedMsg*>(peer_scratch[owner]) +
+                           bankOffPkts + (size_t)rank * slot +
+                           (size_t)(row / ngpus) * pkt_per_row + j;
+        ll_store_b128(reinterpret_cast<uint32_t*>(dst), in[2 * pk], flag, in[2 * pk + 1], flag);
+    }
+
+    LLPackedMsg* myBase =
+        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+
+    // Phase 2: my rows. Sum the peers' partials, send the sum to every peer,
+    // then add the residual and normalize.
+    const int owned = rows > rank ? (rows - 1 - rank) / ngpus + 1 : 0;
+    for(int li = blockIdx.x; li < owned; li += gridDim.x)
+    {
+        const int row = li * ngpus + rank;
+        PL arv[kPktPerThread];
+#pragma unroll
+        for(int i = 0; i < kPktPerThread; ++i)
+        {
+            const int j = threadIdx.x + i * blockDim.x;
+            if(j < pkt_per_row)
+            {
+                const size_t pk = (size_t)row * pkt_per_row + j;
+                PL selfv        = *reinterpret_cast<const PL*>(&in[2 * pk]);
+                float acc[LP];
+#pragma unroll
+                for(int e = 0; e < LP; ++e)
+                    acc[e] = upcast_s(selfv[e]);
+                for(int r = 1; r < ngpus; ++r)
+                {
+                    const int             peer = (rank + r) % ngpus;
+                    volatile LLPackedMsg* src =
+                        myBase + (size_t)peer * slot + (size_t)li * pkt_per_row + j;
+                    uint32_t d0, f0, d1, f1;
+                    do
+                    {
+                        ll_load_b128(reinterpret_cast<const uint32_t*>(
+                                         const_cast<LLPackedMsg*>(src)),
+                                     d0, f0, d1, f1);
+                    } while(f0 != flag || f1 != flag);
+                    const uint32_t w[2] = {d0, d1};
+                    PL             pv   = *reinterpret_cast<const PL*>(w);
+#pragma unroll
+                    for(int e = 0; e < LP; ++e)
+                        acc[e] += upcast_s(pv[e]);
+                }
+#pragma unroll
+                for(int e = 0; e < LP; ++e)
+                    arv[i][e] = downcast_s<T>(acc[e]);
+                uint32_t w[2];
+                __builtin_memcpy(w, &arv[i], sizeof(w));
+#pragma unroll
+                for(int r = 1; r < ngpus; ++r)
+                {
+                    const int    peer = (rank + r) % ngpus;
+                    LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
+                                       bankOffPkts + (size_t)rank * slot + half +
+                                       (size_t)li * pkt_per_row + j;
+                    ll_store_b128(reinterpret_cast<uint32_t*>(dst), w[0], flag, w[1], flag);
+                }
+            }
+        }
+        ll_rms_row<T, kPktPerThread, GEMMA_NORM>(
+            arv, row, pkt_per_row, residual_inp, residual_out, out, weight, eps, s_sq);
+    }
+
+    // Phase 3: every other row, from its owner's sum.
+    const int others = rows - owned;
+    for(int oi = blockIdx.x; oi < others; oi += gridDim.x)
+    {
+        const int q     = oi / (ngpus - 1);
+        const int m     = oi - q * (ngpus - 1);
+        const int owner = m < rank ? m : m + 1;
+        const int row   = q * ngpus + owner;
+        PL arv[kPktPerThread];
+#pragma unroll
+        for(int i = 0; i < kPktPerThread; ++i)
+        {
+            const int j = threadIdx.x + i * blockDim.x;
+            if(j < pkt_per_row)
+            {
+                volatile LLPackedMsg* src =
+                    myBase + (size_t)owner * slot + half + (size_t)q * pkt_per_row + j;
+                uint32_t d0, f0, d1, f1;
+                do
+                {
+                    ll_load_b128(reinterpret_cast<const uint32_t*>(
+                                     const_cast<LLPackedMsg*>(src)),
+                                 d0, f0, d1, f1);
+                } while(f0 != flag || f1 != flag);
+                const uint32_t w[2] = {d0, d1};
+                arv[i]              = *reinterpret_cast<const PL*>(w);
+            }
+        }
+        ll_rms_row<T, kPktPerThread, GEMMA_NORM>(
+            arv, row, pkt_per_row, residual_inp, residual_out, out, weight, eps, s_sq);
+    }
+
+    // Same epoch fan-out as ar_ll_gfx1250: every entry, launched block or not.
     for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
         e += gridDim.x * blockDim.x)
         block_flags[e] = flag;
@@ -1110,6 +1492,83 @@ public:
 #undef LAUNCH_LL
     }
 
+    // Fused all-reduce + residual add + RMSNorm over the LL transport. Returns
+    // false, launching nothing, when the message does not fit the LL lane; the
+    // caller then runs the unfused all-reduce and norm.
+    template <typename T>
+    bool fused_allreduce_rmsnorm_ll(hipStream_t stream,
+                                    const T* input,
+                                    const T* residual_inp,
+                                    T* residual_out,
+                                    T* output,
+                                    const T* weight,
+                                    float eps,
+                                    int rows,
+                                    int hidden,
+                                    bool gemma_norm)
+    {
+        const size_t row_bytes = (size_t)hidden * sizeof(T);
+        const size_t bytes     = row_bytes * (size_t)rows;
+        if(!ll_enabled() || world_size_ > kLLMaxRanks || bytes > kLLArMaxBytes ||
+           row_bytes % 8 != 0 || rows < 1)
+            return false;
+        const int ppr = (int)(row_bytes / 8);
+        // one packet per thread while the row fits a 1024-thread block
+        const int threads = std::min(1024, std::max(64, (ppr + 31) / 32 * 32));
+        const int ppt     = (ppr + threads - 1) / threads;
+        if(ppt > 16)
+            return false;
+        // Two-shot from AITER_FUSED_AR_TWO_SHOT_MIN_BYTES up, when a rank's share
+        // of the rows fits half an LL slot (the all-gather takes the other half).
+        static const size_t two_shot_min = [] {
+            const char* e = std::getenv("AITER_FUSED_AR_TWO_SHOT_MIN_BYTES");
+            return e != nullptr && *e != '\0' ? (size_t)std::strtoull(e, nullptr, 10)
+                                              : kFusedArTwoShotMinBytes;
+        }();
+        const bool two_shot =
+            world_size_ > 2 && bytes >= two_shot_min &&
+            (size_t)((rows + world_size_ - 1) / world_size_) * ppr <= kLLPackCapacity / 2;
+        ensure_ll_tables_();
+        const int blocks = std::min<int>(kMaxBlocks, rows);
+        T* const* peers  = reinterpret_cast<T* const*>(d_ll_peers_);
+#define LAUNCH_LL_RMS_PPT(NG, PPT, GEMMA)                                              \
+        do                                                                             \
+        {                                                                              \
+            if(two_shot)                                                               \
+                ar_ll_rms_2s_gfx1250<T, NG, PPT, GEMMA><<<blocks, threads, 0, stream>>>( \
+                    peers, input, residual_inp, residual_out, output, weight, eps, rows, \
+                    ppr, rank_, d_ll_block_flags_);                                    \
+            else                                                                       \
+                ar_ll_rms_gfx1250<T, NG, PPT, GEMMA><<<blocks, threads, 0, stream>>>(    \
+                    peers, input, residual_inp, residual_out, output, weight, eps, rows, \
+                    ppr, rank_, d_ll_block_flags_);                                    \
+        } while(0)
+#define LAUNCH_LL_RMS_GEMMA(NG, PPT)        \
+        if(gemma_norm)                      \
+            LAUNCH_LL_RMS_PPT(NG, PPT, true); \
+        else                                \
+            LAUNCH_LL_RMS_PPT(NG, PPT, false)
+#define LAUNCH_LL_RMS(NG)                                \
+        do                                               \
+        {                                                \
+            if(ppt <= 1)                                 \
+                LAUNCH_LL_RMS_GEMMA(NG, 1);              \
+            else if(ppt <= 2)                            \
+                LAUNCH_LL_RMS_GEMMA(NG, 2);              \
+            else if(ppt <= 4)                            \
+                LAUNCH_LL_RMS_GEMMA(NG, 4);              \
+            else if(ppt <= 8)                            \
+                LAUNCH_LL_RMS_GEMMA(NG, 8);              \
+            else                                         \
+                LAUNCH_LL_RMS_GEMMA(NG, 16);             \
+        } while(0)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_LL_RMS);
+#undef LAUNCH_LL_RMS
+#undef LAUNCH_LL_RMS_GEMMA
+#undef LAUNCH_LL_RMS_PPT
+        return true;
+    }
+
     // gfx1250: return raw device pointers (no hipIpc handles).
     std::vector<int64_t> get_graph_buffer_ptrs()
     {
@@ -1388,6 +1847,13 @@ public:
             input_ptrs, sg_, self_sg_, output, rank_, size);
     }
 
+    // Whether allreduce() sends a message of this size to the LL lane, which
+    // reads its input in place and so needs no copy into a registered buffer.
+    bool routes_to_ll(size_t bytes) const
+    {
+        return ll_enabled() && bytes <= kLLArMaxBytes && world_size_ <= kLLMaxRanks;
+    }
+
     template <typename T>
     void allreduce(hipStream_t stream,
                    T* input,
@@ -1406,8 +1872,7 @@ public:
         // shared peer scratch — no registered peer-input table (_input_dp) is
         // needed, so branch before get_buffer_RD.
         const size_t bytes = (size_t)size * sizeof(T);
-        if(ll_enabled() && bytes <= kLLArMaxBytes &&
-           world_size_ <= kLLMaxRanks)
+        if(routes_to_ll(bytes))
         {
             allreduce_ll<T>(stream, input, output, size);
             return;
