@@ -12,7 +12,11 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.mamba2_ssd import SUPPORTED_GFX, mamba2_chunk_forward_flydsl
+from aiter.ops.flydsl.mamba2_ssd import (
+    SUPPORTED_GFX,
+    mamba2_chunk_backward_flydsl,
+    mamba2_chunk_forward_flydsl,
+)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -64,7 +68,11 @@ def _ref_out(x, b, c, d, dt, decay_cumsum, hiddens, chunk_size):
         xc, bc, cc = (t[:, sl].transpose(1, 2) for t in (x, b, c))
         dtc, dc = dt[:, sl].transpose(1, 2), decay_cumsum[:, sl].transpose(1, 2)
         cb = cc @ bc.transpose(-1, -2)
-        cb = torch.tril(cb * torch.tril(torch.exp(dc[..., None] - dc[..., None, :])))
+        # Mask the exponent, not its result: exp of the upper triangle overflows,
+        # and autograd through inf * 0 turns da / ddt into NaN.
+        causal = torch.ones(cb.shape[-2:], dtype=torch.bool, device=cb.device).tril()
+        seg = torch.where(causal, dc[..., None] - dc[..., None, :], -torch.inf)
+        cb = cb * torch.exp(seg)
         y = (cc * torch.exp(dc[..., None])) @ hiddens[:, :, ci].float().transpose(
             -1, -2
         )
@@ -196,6 +204,96 @@ def test_mamba2_chunk_forward(
     return ret
 
 
+def run_torch_backward(x, a, b, c, d, dt, init_state, dout, dfinal_state, chunk_size):
+    """Gradients of the fp32 reference by autograd (reference only, not timed)."""
+    leaves = [t.detach().float().requires_grad_() for t in (x, a, b, c, d, dt)]
+    h0 = init_state.detach().float().requires_grad_()
+    out, final = run_torch(*leaves, h0, chunk_size)
+    torch.autograd.backward([out, final], [dout.float(), dfinal_state.float()])
+    return [t.grad for t in leaves] + [h0.grad]  # dx, da, db, dc, dd, ddt, dinit
+
+
+@benchmark()
+def test_mamba2_chunk_backward(
+    batch, num_tokens, num_groups, num_heads, state_size, head_size, chunk_size, dtype
+):
+    B, T, G, H, N, P, L = (
+        batch,
+        num_tokens,
+        num_groups,
+        num_heads,
+        state_size,
+        head_size,
+        chunk_size,
+    )
+    x, a, b, c, d, dt, init_state = make_inputs(B, T, G, H, N, P, L, dtype)
+    dout = torch.randn_like(x)
+    dfinal = 0.1 * torch.randn_like(init_state)
+    ref = run_torch_backward(x, a, b, c, d, dt, init_state, dout, dfinal, L)
+
+    candidates = {
+        "flydsl": lambda: mamba2_chunk_backward_flydsl(
+            x, a, b, c, d, dt, init_state, dout, dfinal, chunk_size=L
+        ),
+    }
+    if chunk_simple_gla is not None:
+        # fla's backward via autograd on the simple-GLA mapping, chained back to
+        # the Mamba-2 gradients (dv -> dx, ddt; dg -> ddt, da; dq / dk summed per group).
+        HPG = H // G
+        q_f = c.repeat_interleave(HPG, dim=2).contiguous().requires_grad_()
+        k_f = b.repeat_interleave(HPG, dim=2).contiguous().requires_grad_()
+        v_f = (x.float() * dt.float()[..., None]).to(dtype).requires_grad_()
+        g_f = (a * dt.float()).requires_grad_()
+        h0_f = init_state.transpose(-1, -2).contiguous().requires_grad_()
+        o, ht = chunk_simple_gla(
+            q_f,
+            k_f,
+            v_f,
+            g=g_f,
+            scale=1.0,
+            initial_state=h0_f,
+            output_final_state=True,
+            chunk_size=L,
+        )
+        dfinal_t = dfinal.transpose(-1, -2)
+
+        def fla_fn():
+            dq, dk, dv, dg, dh0 = torch.autograd.grad(
+                [o, ht], [q_f, k_f, v_f, g_f, h0_f], [dout, dfinal_t], retain_graph=True
+            )
+            dv = dv.float()
+            return (
+                dv * dt.float()[..., None] + d[:, None] * dout.float(),
+                (dg * dt.float()).sum((0, 1)),
+                dk.float().view(B, T, G, HPG, N).sum(3),
+                dq.float().view(B, T, G, HPG, N).sum(3),
+                (dout.float() * x.float()).sum((0, 1, 3)),
+                (dv * x.float()).sum(-1) + dg * a,
+                dh0.transpose(-1, -2),
+            )
+
+        candidates["fla_triton"] = fla_fn
+
+    names = ["dx", "da", "db", "dc", "dd", "ddt", "dinit"]
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        grads, us = run_perftest(fn)
+        errs = []
+        for gname, r, g in zip(names, ref, grads):
+            errs.append(
+                checkAllclose(
+                    r,
+                    g.to(dtypes.fp32),
+                    rtol=2e-2,
+                    atol=2e-2 + _bf16_ulp(r.abs().max().item()),
+                    msg=f"{name}: {gname}",
+                )
+            )
+        ret[f"{name} us"] = us
+        ret[f"{name} err"] = max(errs)
+    return ret
+
+
 def main():
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -239,17 +337,27 @@ def main():
     parser.add_argument(
         "-c", "--chunk_size", type=int, nargs="*", default=[128], help="chunk size"
     )
+    parser.add_argument(
+        "--direction",
+        nargs="*",
+        default=["fwd", "bwd"],
+        choices=["fwd", "bwd"],
+        help="forward and / or backward",
+    )
     args = parser.parse_args()
 
-    for dtype in args.dtype:
+    tests = {"fwd": test_mamba2_chunk_forward, "bwd": test_mamba2_chunk_backward}
+    for direction, dtype in itertools.product(args.direction, args.dtype):
         df = []
         for b, t, (g, h, n, p), cs in itertools.product(
             args.batch, args.num_tokens, args.shape, args.chunk_size
         ):
-            df.append(test_mamba2_chunk_forward(b, t, g, h, n, p, cs, dtype))
+            df.append(tests[direction](b, t, g, h, n, p, cs, dtype))
         df = pd.DataFrame(df)
         aiter.logger.info(
-            "mamba2_chunk_forward summary (markdown):\n%s", df.to_markdown(index=False)
+            "mamba2_chunk %s summary (markdown):\n%s",
+            direction,
+            df.to_markdown(index=False),
         )
 
 
