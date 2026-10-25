@@ -2135,38 +2135,56 @@ def test_mha_v4_launch_rejects_off_device_lse():
         _launch_bf16_dense(q, out, lse=torch.empty((2, 4, 256), dtype=torch.float32))
 
 
-@pytest.mark.parametrize(
-    "formats",
-    [
-        (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4),
-        (AttentionFormat.MXFP6, AttentionFormat.MXFP6, AttentionFormat.MXFP6),
-        (AttentionFormat.INT8, AttentionFormat.INT8, None),
-        (None, None, None),
-    ],
-)
-def test_mha_v4_rejects_seqlens_k_on_recipes_that_ignore_it(formats):
-    """Only the BF16 Q/K objects read the slot; the rest must fail, not silently pad-attend.
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@pytest.mark.parametrize("arch", ["gfx950"])
+def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
+    """Every dense row _VARLEN_CAPABLE_QV claims must really read the per-batch length.
 
-    MXFP4 and MXFP6 matter most: they return through their own launchers, which never forward
-    seqlens_k, so a missing gate here is invisible rather than merely unsupported.
+    The gate is keyed on (q_format, v_format) alone, so a pair that gains a second object -- a
+    different head dim, say -- would inherit the claim without being rebuilt. Nothing numeric
+    catches that: the kernel just attends over the full padded key length and returns the dense
+    answer. Only the emitted object can refute it.
     """
-    q_format, k_format, v_format = formats
-    fp8 = native_fp8_format()
-    q_format = q_format or fp8
-    k_format = k_format or fp8
-    v_format = v_format or fp8
-    q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
+    asm_dir = os.environ.get(
+        "AITER_ASM_DIR", os.path.join(mha_v4_module.AITER_ROOT_DIR, "hsa")
+    )
+    root = os.path.join(asm_dir, arch, "fmha_v4_fwd")
+    with open(os.path.join(root, "fmha_v4_fwd.csv"), encoding="utf-8") as manifest:
+        rows = [
+            line.strip().split(",")
+            for line in manifest
+            if line.strip() and not line.startswith("#")
+        ]
+    header, rows = rows[0], rows[1:]
+    q_at, v_at = header.index("q_format"), header.index("v_format")
+    mode_at, co_at = header.index("mode"), header.index("co_name")
 
-    with pytest.raises(NotImplementedError, match="per-batch key lengths"):
-        mha_v4(
-            q,
-            q,
-            q,
-            q_format,
-            k_format,
-            v_format,
-            seqlens_k=torch.full((2,), 128, device="cuda", dtype=torch.int32),
-        )
+    claimed = sorted(
+        {
+            row[co_at]
+            for row in rows
+            if row[mode_at] == "0"
+            and (AttentionFormat(int(row[q_at])), AttentionFormat(int(row[v_at])))
+            in mha_v4_module._VARLEN_CAPABLE_QV
+        }
+    )
+    assert claimed, f"no dense {arch} rows are claimed varlen-capable"
+
+    silent = []
+    for name in claimed:
+        listing = subprocess.run(
+            [_llvm_objdump(), "-d", f"--mcpu={arch}", os.path.join(root, name)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        # Drop the trailing "// address: encoding" first, or a code address matches 0x1c0.
+        if not re.search(r"\b0x1c0\b", re.sub(r"//.*", "", listing)):
+            silent.append(name)
+    assert not silent, (
+        f"{arch} rows claimed in _VARLEN_CAPABLE_QV never load kernarg 0x1C0: {silent}; "
+        "they would ignore seqlens_k and silently attend over the full padded key length"
+    )
 
 
 if __name__ == "__main__":

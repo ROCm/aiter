@@ -776,8 +776,8 @@ _LSE_CAPABLE_QV = frozenset(
         (AttentionFormat.BF16, AttentionFormat.FP8_E4M3_FNUZ),
         (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3),
         (AttentionFormat.FP8_E4M3_FNUZ, AttentionFormat.FP8_E4M3_FNUZ),
-        (AttentionFormat.FP8_E4M3, AttentionFormat.FP6_E2M3),
-        (AttentionFormat.FP8_E4M3_FNUZ, AttentionFormat.FP6_E2M3),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.MXFP6),
+        (AttentionFormat.FP8_E4M3_FNUZ, AttentionFormat.MXFP6),
         (AttentionFormat.INT8, AttentionFormat.FP8_E4M3),
         (AttentionFormat.INT8, AttentionFormat.FP8_E4M3_FNUZ),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
@@ -807,11 +807,20 @@ def _check_lse_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> 
 # (q_format, v_format) rows whose code object consumes the seqlens_k kernarg. Every dense source
 # carries the load, but only these objects were rebuilt with it; the rest would silently attend
 # over the full padded key length, so they are rejected rather than left to return a wrong answer.
+# Ordered to mirror _LSE_CAPABLE_QV above so the two diff by eye. (FP8, FP8) covers both the fp8
+# and mxfp8 objects, which differ only by scale mode.
 _VARLEN_CAPABLE_QV = frozenset(
     {
         (AttentionFormat.BF16, AttentionFormat.BF16),
         (AttentionFormat.BF16, AttentionFormat.FP8_E4M3),
         (AttentionFormat.BF16, AttentionFormat.FP8_E4M3_FNUZ),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.FP8_E4M3, AttentionFormat.MXFP6),
+        (AttentionFormat.INT8, AttentionFormat.FP8_E4M3),
+        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
+        (AttentionFormat.MXFP6, AttentionFormat.MXFP4),
+        (AttentionFormat.MXFP6, AttentionFormat.FP8_E4M3),
     }
 )
 
@@ -819,10 +828,14 @@ _VARLEN_CAPABLE_QV = frozenset(
 def _check_varlen_capable(q_format: AttentionFormat, v_format: AttentionFormat) -> None:
     """Reject per-batch key lengths on rows whose code object ignores them."""
     arch = get_gfx()
-    if arch != "gfx950" or (q_format, v_format) not in _VARLEN_CAPABLE_QV:
+    if arch != "gfx950":
+        raise NotImplementedError(
+            f"MHA v4 per-batch key lengths are not implemented on {arch} yet"
+        )
+    if (q_format, v_format) not in _VARLEN_CAPABLE_QV:
         raise NotImplementedError(
             f"MHA v4 per-batch key lengths are not implemented for "
-            f"Q={q_format.name} V={v_format.name} on {arch} yet"
+            f"Q={q_format.name} V={v_format.name} yet"
         )
 
 
@@ -1004,6 +1017,7 @@ def _launch_mxfp4_coalesced(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
@@ -1035,6 +1049,7 @@ def _launch_mxfp4_coalesced(
         lse=lse,
         return_lse=lse is not None,
         v_pack=resolved_v_pack,
+        seqlens_k=seqlens_k,
     )
 
 
@@ -1050,21 +1065,11 @@ def _launch_mxfp4_coalesced_fake(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
-    del (
-        q,
-        q_descale,
-        k_data,
-        k_descale,
-        v_data,
-        v_descale,
-        v_format,
-        v_pack,
-        softmax_scale,
-        lse,
-    )
-    del out
+    del q, q_descale, k_data, k_descale, v_data, v_descale, out
+    del v_format, v_pack, softmax_scale, seqlens_k, lse
 
 
 @torch.library.custom_op("aiter::mha_v4_launch_mxfp6_v3", mutates_args=("out", "lse"))
@@ -1081,6 +1086,7 @@ def _launch_mxfp6(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
@@ -1112,6 +1118,7 @@ def _launch_mxfp6(
         lse=lse,
         return_lse=lse is not None,
         v_pack=resolved_v_pack,
+        seqlens_k=seqlens_k,
     )
 
 
@@ -1129,10 +1136,11 @@ def _launch_mxfp6_fake(
     v_format: int,
     v_pack: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, q_descale, k_raw, k_descale_raw, v_data, v_descale
-    del sequence_k, heads, v_format, v_pack, softmax_scale, lse
+    del sequence_k, heads, v_format, v_pack, softmax_scale, seqlens_k, lse
     del out
 
 
@@ -1262,8 +1270,7 @@ def mha_v4(
     """
     if return_lse:
         _check_lse_capable(q_format, v_format)
-    # Checked here as well as in mha_v4_packed: the MXFP4 and MXFP6 recipes return through their
-    # own launchers, which never forward seqlens_k.
+    # Checked before quantization so the MX paths fail here, not inside their own launcher.
     if seqlens_k is not None:
         if block_mask is not None:
             raise NotImplementedError(
@@ -1351,6 +1358,7 @@ def mha_v4(
                 int(v_format),
                 int(recipe.v_pack),
                 softmax_scale,
+                seqlens_k,
             )
         else:
             k_view = mxfp4_k_view(k_quantized, k_descale)
@@ -1383,6 +1391,7 @@ def mha_v4(
                 int(v_format),
                 int(recipe.v_pack),
                 softmax_scale,
+                seqlens_k,
             )
         else:
             k_view, k_descale_view = mxfp6_k_view(
