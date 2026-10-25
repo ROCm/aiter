@@ -4806,7 +4806,15 @@ def fused_moe_2stages(
         )
     else:
         _a2_dtype = dtype
-        a2 = torch.empty(
+        # Stage1 does not write slots with topk_ids == -1 or masked out by
+        # expert_mask, but dynamic per-tensor a2 quant reads the whole buffer,
+        # so stale memory in those slots can set the scale.
+        _a2_alloc = (
+            torch.zeros
+            if quant_type == QuantType.per_Tensor and a2_scale is None
+            else torch.empty
+        )
+        a2 = _a2_alloc(
             (token_num, topk, inter_dim),
             dtype=_a2_dtype,
             device=device,
