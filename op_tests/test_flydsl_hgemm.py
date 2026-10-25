@@ -29,6 +29,7 @@ from aiter.ops.flydsl.gemm_kernels import (
     flydsl_hgemm_supports_shape,
     get_flydsl_hgemm_kernel_params,
 )
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import gemm_a16w16
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -224,6 +225,50 @@ def check_shape_limits():
     assert not flydsl_hgemm_supports_shape(1677722, 6144, 1280, params)
 
 
+def check_input_span():
+    # A strided A spans 4 GiB while M * K * 2 stays below it; no memory needed.
+    a = torch.empty_strided((600000, 1280), (4096, 1), dtype=dtypes.bf16, device="meta")
+    b = torch.empty((256, 1280), dtype=dtypes.bf16, device="meta").t()
+    try:
+        gemm_a16w16(a, b)
+    except ValueError as e:
+        assert "A must span less than 4 GiB" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for a 4 GiB A span")
+
+
+def check_large_a():
+    # A just under 4 GiB: its byte offsets pass 2^31. Checks the first and last rows.
+    m, n, k = 1677721, 256, 1280
+    torch.manual_seed(SEED)
+    a = torch.empty((m, k), dtype=dtypes.bf16).uniform_(-1, 1)
+    w = torch.empty((n, k), dtype=dtypes.bf16).uniform_(-1, 1)
+    y = flydsl_hgemm(
+        a,
+        w,
+        block_m=256,
+        block_n=256,
+        block_k=64,
+        stages=2,
+        split_k=1,
+        m_waves=2,
+        n_waves=4,
+        k_waves=1,
+        group_m=0,
+        policy="hti",
+    )
+    rows = torch.cat([torch.arange(1024), torch.arange(m - 1024, m)])
+    atol, rtol = _atol_rtol(k, 1, 1, dtypes.bf16)
+    err = checkAllclose(
+        run_torch(a[rows], w, dtypes.bf16).to(dtypes.fp32),
+        y[rows].to(dtypes.fp32),
+        rtol=rtol,
+        atol=atol,
+        msg=f"{m}x{n}x{k} first and last rows",
+    )
+    assert err == 0
+
+
 def check_strided_out():
     # A row-strided `out` (a view into a larger buffer) is written in place.
     for row in _TUNED:
@@ -308,8 +353,11 @@ def main():
     )
     args = parser.parse_args()
     wanted = set(args.mnk)
-    check_shape_limits()
-    check_strided_out()
+    if wanted == set(_default_mnk()):
+        check_shape_limits()
+        check_input_span()
+        check_strided_out()
+        check_large_a()
 
     for dtype in args.dtype:
         rows = []

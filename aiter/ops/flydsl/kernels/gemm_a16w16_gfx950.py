@@ -1469,6 +1469,13 @@ def get_split_k_buffers(stream, device, split_k):
     return semaphore, signal
 
 
+def _span_bytes(tensor):
+    last = sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return (last + 1) * tensor.element_size()
+
+
 def _dynamic_tensor_arg(tensor, leading_dim):
     return flyc.from_torch_tensor(tensor.detach()).mark_layout_dynamic(
         leading_dim=leading_dim
@@ -1614,15 +1621,24 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
+    # A and B are read through flat buffer descriptors with i32 offsets.
+    for name, operand in (("A", a), ("B", b)):
+        if operand.numel() and _span_bytes(operand) >= GFX950_FLAT_BUFFER_LIMIT_BYTES:
+            raise ValueError(
+                f"{name} must span less than 4 GiB; got shape={tuple(operand.shape)} "
+                f"and stride={operand.stride()}"
+            )
     if not param.c_is_contiguous:
         if (
             out.stride(1) != 1
             or out.stride(0) < n
+            or out.stride(0) >= 1 << 31
             or out.stride(0) % param.cshuffle_r2g_vec_size != 0
         ):
             raise ValueError(
-                "out must be row-major with a leading stride of at least N and a "
-                f"multiple of {param.cshuffle_r2g_vec_size}; got stride={out.stride()}"
+                "out must be row-major with a leading stride of at least N, below "
+                f"2^31, and a multiple of {param.cshuffle_r2g_vec_size}; "
+                f"got stride={out.stride()}"
             )
         # Split-K's buffer atomics address C with i32 offsets.
         span = ((m - 1) * out.stride(0) + n) * out.element_size()
