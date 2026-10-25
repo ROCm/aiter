@@ -147,14 +147,38 @@ def build_chunk_cumsum(num_heads, chunk_size, block_h):
 
 
 def build_fwd_pass_state(
-    num_heads, num_groups, head_size, state_size, chunk_size, rm, rn
+    num_heads, num_groups, head_size, state_size, chunk_size, rm, rn, ks
 ):
-    """Carry the state across chunks; one wave owns a (16*rm) x (16*rn) state tile."""
+    """Carry the state across chunks; one wave owns a (16*rm) x (16*rn) state tile.
+
+    The chunk loop is walked in slabs of ``16 * ks`` tokens (the GEMM K loop of
+    ``x^T @ (B * w)``). Each slab's x and B tiles are staged into LDS transposed
+    (token-contiguous, so a WMMA operand is two 128-bit LDS reads) with its
+    weights ``w[t] = dt[t] * exp2(d_last - d[t])``. The next slab's global loads
+    are issued into registers before the current slab's WMMAs and written to LDS
+    after them -- the register-staged prefetch of FlyDSL's RDNA3 GEMM, standing
+    in for cuTile's load latency hints on this serial loop. ``ks`` trades LDS /
+    prefetch registers (occupancy) against barriers per chunk; it is tuned.
+    """
     H, G, P, N, L = num_heads, num_groups, head_size, state_size, chunk_size
     HPG = H // G
-    KT = L // TILE
+    SL = TILE * ks  # tokens per slab
+    SPC = L // SL  # slabs per chunk
+    W_PASSES = (SL + WAVE - 1) // WAVE
     BP, BN = TILE * rm, TILE * rn
-    assert P % BP == 0 and N % BN == 0 and L % TILE == 0
+    assert P % BP == 0 and N % BN == 0 and L % SL == 0
+
+    # Transposed slab tiles xT[p][t] and bT[n][t]; rows padded by 8 elements.
+    XS = SL + 8
+    X_OFF = 0
+    B_OFF = X_OFF + BP * XS * 2
+    W_OFF = B_OFF + BN * XS * 2
+    SCALE_OFF = W_OFF + SL * 4
+    LDS_TOTAL = SCALE_OFF + 4
+
+    @fx.struct
+    class SharedStorage:
+        buf: fx.Array[fx.Uint8, LDS_TOTAL, 16]
 
     @flyc.kernel
     def fwd_pass_state_kernel(
@@ -167,13 +191,14 @@ def build_fwd_pass_state(
         final_state: fx.Tensor,
         num_tokens: Int32,
     ):
-        x_r = ptr_buf_tensor(x, fx.BFloat16)
-        b_r = ptr_buf_tensor(b, fx.BFloat16)
+        x_rows = _row_view(x)
+        b_rows = _row_view(b)
         dec_r = ptr_buf_tensor(decay, fx.Float32)
         dt_r = ptr_buf_tensor(dt_bht, fx.Float32)
         init_r = ptr_buf_tensor(init_state, fx.Float32)
         hid_w = ptr_buf_tensor(hiddens, fx.BFloat16)
         fin_w = ptr_buf_tensor(final_state, fx.Float32)
+        lds = _lds_base(SharedStorage)
 
         lane = fx.thread_idx.x
         l16 = lane % 16
@@ -185,6 +210,59 @@ def build_fwd_pass_state(
         h = bh % H
         g = h // HPG
         num_chunks = num_tokens // L
+
+        tok_base = bh * num_tokens  # [b, h, t] row of decay / dt
+        x_row = H * P
+        b_row = G * N
+
+        def load_slab(it):
+            """Global -> registers for slab ``it``: x / B tiles (128-bit), weights,
+            and the state decay to apply before it (1 except on a chunk's first slab).
+            """
+            c, step = it // SPC, it % SPC
+            t0 = c * L + step * SL
+            row0 = batch * num_tokens + t0
+            xv = []
+            for k in range_constexpr(SL * BP // (8 * WAVE)):
+                u = lane + k * WAVE
+                off = (row0 + u // (BP // 8)) * x_row + h * P + p0 + u % (BP // 8) * 8
+                xv.append(buf_copy_load(x_rows, off, fx.BFloat16, unit_elems=8))
+            bv = []
+            for k in range_constexpr(SL * BN // (8 * WAVE)):
+                u = lane + k * WAVE
+                off = (row0 + u // (BN // 8)) * b_row + g * N + n0 + u % (BN // 8) * 8
+                bv.append(buf_copy_load(b_rows, off, fx.BFloat16, unit_elems=8))
+            d_last = fx.Float32(dec_r[tok_base + c * L + L - 1])
+            w = []
+            for k in range_constexpr(W_PASSES):
+                t = (
+                    tok_base + t0 + (lane + k * WAVE) % SL
+                )  # wrapped lanes are not stored
+                w.append(fx.Float32(dt_r[t]) * (d_last - fx.Float32(dec_r[t])).exp2())
+            scale = (step == 0).select(d_last.exp2(), fx.Float32(1.0))
+            return xv, bv, w, scale
+
+        def store_slab(xv, bv, w, scale):
+            """Registers -> LDS, transposing x and B to token-contiguous rows."""
+            for k in range_constexpr(len(xv)):
+                u = lane + k * WAVE
+                s, pc = u // (BP // 8), u % (BP // 8) * 8
+                for e in range_constexpr(8):
+                    _lds_store(
+                        lds, X_OFF + ((pc + e) * XS + s) * 2, fx.BFloat16, xv[k][e]
+                    )
+            for k in range_constexpr(len(bv)):
+                u = lane + k * WAVE
+                s, nc = u // (BN // 8), u % (BN // 8) * 8
+                for e in range_constexpr(8):
+                    _lds_store(
+                        lds, B_OFF + ((nc + e) * XS + s) * 2, fx.BFloat16, bv[k][e]
+                    )
+            for k in range_constexpr(W_PASSES):
+                if lane + k * WAVE < SL:
+                    _lds_store(lds, W_OFF + (lane + k * WAVE) * 4, fx.Float32, w[k])
+            if lane == 0:
+                _lds_store(lds, SCALE_OFF, fx.Float32, scale)
 
         # Accumulator element (rm, rn, si) is state[p0 + 16*rm + 2*si + hi, n0 + 16*rn + l16].
         def state_off(i, j, si):
@@ -204,63 +282,60 @@ def build_fwd_pass_state(
                     )
                 )
 
-        tok_base = bh * num_tokens  # [b, h, t] row of decay / dt
-        x_row = H * P
-        b_row = G * N
+        num_slabs = num_chunks * SPC
+        store_slab(*load_slab(fx.Int32(0)))
+        gpu.barrier()
 
-        for c_iv, state in range(0, num_chunks, 1, init=accs):
-            c = fx.Int32(c_iv)
+        for it_iv, state in range(0, num_slabs, 1, init=accs):
+            it = fx.Int32(it_iv)
             s_accs = _carried(state)
-            # Chunk-entry state, narrowed to the dtype compute_out consumes.
-            hid_base = (bh * num_chunks + c) * (P * N)
-            for i in range_constexpr(rm):
-                for j in range_constexpr(rn):
-                    acc = s_accs[i * rn + j]
-                    for si in range_constexpr(8):
-                        hid_w[hid_base + state_off(i, j, si)] = fx.Float32(acc[si]).to(
-                            fx.BFloat16
-                        )
+            if it % SPC == 0:
+                # Chunk-entry state, narrowed to the dtype compute_out consumes.
+                hid_base = (bh * num_chunks + it // SPC) * (P * N)
+                for i in range_constexpr(rm):
+                    for j in range_constexpr(rn):
+                        acc = s_accs[i * rn + j]
+                        for si in range_constexpr(8):
+                            hid_w[hid_base + state_off(i, j, si)] = fx.Float32(
+                                acc[si]
+                            ).to(fx.BFloat16)
 
-            t_chunk = c * L
-            d_last = fx.Float32(dec_r[tok_base + t_chunk + L - 1])
-            scale = d_last.exp2()
+            # Prefetch the next slab (the last iteration reloads its own, harmlessly).
+            nxt = load_slab((it + 1 < num_slabs).select(it + 1, it))
+
+            scale = _lds_load(lds, SCALE_OFF, fx.Float32)
             s_accs = [acc * Vec.filled(8, scale, fx.Float32) for acc in s_accs]
-
-            for kk in range_constexpr(KT):
-                t0 = t_chunk + TILE * kk
-                # w[t] = dt[t] * exp2(d_last - d[t]); wave-uniform.
-                w = [
-                    fx.Float32(dt_r[tok_base + t0 + k])
-                    * (d_last - fx.Float32(dec_r[tok_base + t0 + k])).exp2()
-                    for k in range_constexpr(TILE)
-                ]
-                x_tok = (batch * num_tokens + t0) * x_row + h * P + p0 + l16
-                b_tok = (batch * num_tokens + t0) * b_row + g * N + n0 + l16
+            for kk in range_constexpr(ks):
+                t0 = TILE * kk
+                wv = _lds_load(lds, W_OFF + t0 * 4, fx.Float32, TILE)
                 a_ops = [
-                    Vec.from_elements(
-                        [
-                            x_r[x_tok + k * x_row + TILE * i]
-                            for k in range_constexpr(TILE)
-                        ],
-                        fx.BFloat16,
+                    _lds_load(
+                        lds, X_OFF + ((TILE * i + l16) * XS + t0) * 2, fx.BFloat16, TILE
                     )
                     for i in range_constexpr(rm)
                 ]
-                b_ops = [
-                    _bf16_vec(
-                        [
-                            fx.Float32(b_r[b_tok + k * b_row + TILE * j]) * w[k]
-                            for k in range_constexpr(TILE)
-                        ]
+                b_ops = []
+                for j in range_constexpr(rn):
+                    b_raw = _lds_load(
+                        lds, B_OFF + ((TILE * j + l16) * XS + t0) * 2, fx.BFloat16, TILE
                     )
-                    for j in range_constexpr(rn)
-                ]
+                    b_ops.append(
+                        _bf16_vec(
+                            [
+                                fx.Float32(b_raw[k]) * wv[k]
+                                for k in range_constexpr(TILE)
+                            ]
+                        )
+                    )
                 for i in range_constexpr(rm):
                     for j in range_constexpr(rn):
                         s_accs[i * rn + j] = _wmma(
                             a_ops[i], b_ops[j], s_accs[i * rn + j]
                         )
 
+            gpu.barrier()
+            store_slab(*nxt)
+            gpu.barrier()
             results = yield s_accs
 
         for i in range_constexpr(rm):

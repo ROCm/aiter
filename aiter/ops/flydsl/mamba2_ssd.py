@@ -40,10 +40,10 @@ _AUTOTUNE = os.environ.get("AITER_MAMBA2_AUTOTUNE", "1") == "1"
 _tuned = {}
 
 
-def _state_configs(P, N):
-    for rm, rn in itertools.product(_TILE_REPEATS, _TILE_REPEATS):
-        if P % (16 * rm) == 0 and N % (16 * rn) == 0:
-            yield {"rm": rm, "rn": rn}
+def _state_configs(P, N, L):
+    for rm, rn, ks in itertools.product(_TILE_REPEATS, _TILE_REPEATS, _TILE_REPEATS):
+        if P % (16 * rm) == 0 and N % (16 * rn) == 0 and L % (16 * ks) == 0:
+            yield {"rm": rm, "rn": rn, "ks": ks}
 
 
 def _out_configs(P):
@@ -52,9 +52,9 @@ def _out_configs(P):
             yield {"rp": rp}
 
 
-def default_config(head_size, state_size):
+def default_config(head_size, state_size, chunk_size):
     """Untuned fallback: widest tiles that divide the head and state sizes."""
-    state = list(_state_configs(head_size, state_size))[-1]
+    state = list(_state_configs(head_size, state_size, chunk_size))[-1]
     return {**state, **list(_out_configs(head_size))[-1]}
 
 
@@ -64,8 +64,8 @@ def _cumsum(H, L):
 
 
 @functools.cache
-def _state(H, G, P, N, L, rm, rn):
-    return build_fwd_pass_state(H, G, P, N, L, rm, rn)
+def _state(H, G, P, N, L, rm, rn, ks):
+    return build_fwd_pass_state(H, G, P, N, L, rm, rn, ks)
 
 
 @functools.cache
@@ -126,7 +126,7 @@ def mamba2_chunk_forward_flydsl(
 
         def launch_state(cfg):
             _run_compiled(
-                _state(H, G, P, N, L, cfg["rm"], cfg["rn"]),
+                _state(H, G, P, N, L, cfg["rm"], cfg["rn"], cfg["ks"]),
                 x,
                 b,
                 decay,
@@ -159,15 +159,15 @@ def mamba2_chunk_forward_flydsl(
         _run_compiled(_cumsum(H, L), a, dt, decay, dt_bht, T, nc, B, stream)
         key = (B, T, G, H, N, P, L)
         if config is not None:
-            cfg = {**default_config(P, N), **config}
+            cfg = {**default_config(P, N, L), **config}
             state_cfg = out_cfg = cfg
         elif _AUTOTUNE:
             state_cfg = _pick(
-                "fwd_pass_state", key, list(_state_configs(P, N)), launch_state
+                "fwd_pass_state", key, list(_state_configs(P, N, L)), launch_state
             )
             out_cfg = None  # tuned below, once the hiddens it reads are final
         else:
-            state_cfg = out_cfg = default_config(P, N)
+            state_cfg = out_cfg = default_config(P, N, L)
 
         launch_state(state_cfg)  # the tuning runs above clobbered hiddens / final_state
         if out_cfg is None:
