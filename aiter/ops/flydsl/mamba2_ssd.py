@@ -46,19 +46,22 @@ def _state_configs(P, N, L):
             yield {"rm": rm, "rn": rn, "ks": ks}
 
 
-def _out_configs(P):
-    # TileGym _compute_out_configs: plain grid, or persistent at 1-2 blocks per CU.
-    for rp, (persistent, occupancy) in itertools.product(
-        _TILE_REPEATS, ((False, 0), (True, 1), (True, 2))
+def _out_configs(P, N):
+    # TileGym _compute_out_configs: plain grid, or persistent at 1-2 blocks per CU;
+    # the state-tile K loop runs 4 tiles per trip or fully unrolled.
+    nk = N // 16
+    kus = sorted({nk} | ({4} if nk % 4 == 0 else set()))
+    for rp, ku, (persistent, occupancy) in itertools.product(
+        _TILE_REPEATS, kus, ((False, 0), (True, 1), (True, 2))
     ):
         if P % (16 * rp) == 0:
-            yield {"rp": rp, "persistent": persistent, "occupancy": occupancy}
+            yield {"rp": rp, "ku": ku, "persistent": persistent, "occupancy": occupancy}
 
 
 def default_config(head_size, state_size, chunk_size):
     """Untuned fallback: widest tiles that divide the head and state sizes."""
     state = list(_state_configs(head_size, state_size, chunk_size))[-1]
-    return {**state, **list(_out_configs(head_size))[-1]}
+    return {**state, **list(_out_configs(head_size, state_size))[-1]}
 
 
 @functools.cache
@@ -72,8 +75,8 @@ def _state(H, G, P, N, L, rm, rn, ks):
 
 
 @functools.cache
-def _out(H, G, P, N, L, rp, persistent):
-    return build_compute_out(H, G, P, N, L, rp, persistent)
+def _out(H, G, P, N, L, rp, ku, persistent):
+    return build_compute_out(H, G, P, N, L, rp, ku, persistent)
 
 
 def _tuning_key(*args):
@@ -189,6 +192,7 @@ def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, con
                 state_size,
                 chunk_size,
                 cfg["rp"],
+                cfg["ku"],
                 cfg["persistent"],
             ),
             x,
@@ -205,7 +209,7 @@ def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, con
             stream,
         )
 
-    configs = list(_out_configs(head_size))
+    configs = list(_out_configs(head_size, state_size))
     key = _tuning_key(x, b, chunk_size)
     launch(_tuned_config("compute_out", key, configs, launch, config))
     return out

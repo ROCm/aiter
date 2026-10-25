@@ -369,7 +369,7 @@ def build_fwd_pass_state(
 
 
 def build_compute_out(
-    num_heads, num_groups, head_size, state_size, chunk_size, rp, persistent
+    num_heads, num_groups, head_size, state_size, chunk_size, rp, ku, persistent
 ):
     """One block per (chunk, p-tile, batch*head); wave w owns token rows 16w..16w+15.
 
@@ -390,7 +390,8 @@ def build_compute_out(
     NK = N // TILE
     BP = TILE * rp
     NPT = P // BP  # p tiles per head
-    assert P % BP == 0 and N % TILE == 0 and L % TILE == 0
+    KU = ku  # state tiles per K-loop trip; KU == NK is fully unrolled
+    assert P % BP == 0 and N % TILE == 0 and L % TILE == 0 and NK % KU == 0
 
     # LDS rows are padded by 8 elements (16 bytes) to spread banks while
     # keeping every 16-element operand read 16-byte aligned.
@@ -488,27 +489,41 @@ def build_compute_out(
             # Carried-state term: (exp2(d_t) * C) @ h^T, h = chunk-entry state [P, N].
             hid_base = (bh * num_chunks + chunk) * (P * N)
             exp_dt = d_ta.exp2()
+            # The K loops over state tiles run at runtime, KU tiles per trip (as
+            # TileGym loops over state tiles): fully unrolling a large state
+            # hoists every operand load and spills. KU is tuned.
             accs = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(rp)]
-            for kn in range_constexpr(NK):
-                c_kn = c_op(kn)
-                a_op = _bf16_vec(
-                    [fx.Float32(c_kn[k]) * exp_dt for k in range_constexpr(TILE)]
-                )
-                for i in range_constexpr(rp):
-                    h_op = _load16(
-                        hid_rows, hid_base + (p0 + TILE * i + l16) * N + TILE * kn
+            for kb, state in range(0, NK // KU, 1, init=accs):
+                k_accs = _carried(state)
+                for u in range_constexpr(KU):
+                    kn = fx.Int32(kb) * KU + u
+                    c_kn = c_op(kn)
+                    a_op = _bf16_vec(
+                        [fx.Float32(c_kn[k]) * exp_dt for k in range_constexpr(TILE)]
                     )
-                    accs[i] = _wmma(a_op, h_op, accs[i])
+                    for i in range_constexpr(rp):
+                        h_op = _load16(
+                            hid_rows, hid_base + (p0 + TILE * i + l16) * N + TILE * kn
+                        )
+                        k_accs[i] = _wmma(a_op, h_op, k_accs[i])
+                k_results = yield k_accs
+            accs = _carried(k_results)
 
             # Intra-chunk term over source tiles s <= t (causal, so tiles 0..wave).
             for st_iv, state in range(0, wave + 1, 1, init=accs):
                 s_accs = _carried(state)
                 s0 = fx.Int32(st_iv) * TILE
                 # S^T[s, t] = B[s] . C[t]: A = B rows (lane row s0 + l16), B = C rows (lane col t_a).
-                sT = Vec.filled(8, 0.0, fx.Float32)
                 b_base = bc_chunk + (s0 + l16) * bc_row
-                for kn in range_constexpr(NK):
-                    sT = _wmma(_load16(b_rows, b_base + TILE * kn), c_op(kn), sT)
+                for kb, s_state in range(
+                    0, NK // KU, 1, init=[Vec.filled(8, 0.0, fx.Float32)]
+                ):
+                    sT = _carried(s_state)[0]
+                    for u in range_constexpr(KU):
+                        kn = fx.Int32(kb) * KU + u
+                        sT = _wmma(_load16(b_rows, b_base + TILE * kn), c_op(kn), sT)
+                    s_results = yield [sT]
+                sT = _carried(s_results)[0]
                 # Slot si holds source s = s0 + 2*si + hi for target t_a.
                 own = []
                 for si in range_constexpr(8):
