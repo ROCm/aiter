@@ -34,6 +34,7 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 BT = 64
 ATOL_G = 1e-3
 ATOL_WU = 5e-2
+MERGE_REL_RMS_TOL = 3e-3
 PERF_ITERS = 21
 PERF_WARMUP = 3
 
@@ -163,8 +164,13 @@ def run_torch_gdn_prepare(
     seq_lens: tuple[int, ...] | None = None,
     num_decodes: int = 0,
     use_exp2: bool = True,
+    output_dtype: torch.dtype = torch.bfloat16,
 ):
-    """Fp32 algebraic specification of cumsum, KKT, solve and WY GEMMs."""
+    """Fp32 algebraic specification of cumsum, KKT, solve and WY GEMMs.
+
+    ``output_dtype`` controls the final w/u cast. FP32 retains the WY result
+    for relative-error checks; existing callers keep the BF16 output reference.
+    """
     b, t, hg, k_dim = k.shape
     h, v_dim = v.shape[2], v.shape[3]
     if h % hg:
@@ -231,8 +237,8 @@ def run_torch_gdn_prepare(
     if use_exp2:
         g_cumsum *= math.log2(math.e)
     return (
-        w_bar.transpose(1, 2).contiguous().to(torch.bfloat16),
-        u_bar.transpose(1, 2).contiguous().to(torch.bfloat16),
+        w_bar.transpose(1, 2).contiguous().to(output_dtype),
+        u_bar.transpose(1, 2).contiguous().to(output_dtype),
         g_cumsum.transpose(1, 2).contiguous(),
     )
 
@@ -401,6 +407,59 @@ def _check_prepare_outputs(name, ref, out, b, shape):
         ),
     ]
     return max(errors)
+
+
+@torch.no_grad()
+def test_gdn_prepare_merge_precision():
+    """Correlated keys expose precision lost in off-diagonal inverse merges."""
+    for hg, h in ((8, 24), (4, 12)):
+        shape = GDNShape(t=BT, hg=hg, h=h)
+        gen = torch.Generator(device="cuda").manual_seed(2026)
+        base = torch.randn(1, 1, hg, shape.k, device="cuda", generator=gen)
+        k = torch.nn.functional.normalize(
+            base
+            + 0.01 * torch.randn(1, shape.t, hg, shape.k, device="cuda", generator=gen),
+            dim=-1,
+        ).to(dtypes.bf16)
+        v = torch.randn(
+            1, shape.t, h, shape.v, device="cuda", dtype=dtypes.bf16, generator=gen
+        )
+        g = torch.full((1, shape.t, h), -1e-4, device="cuda")
+        beta = torch.full_like(g, 0.999)
+
+        for use_exp2 in (False, True):
+            label = f"merge_precision Hg={hg} H={h} exp2={use_exp2}"
+            ref = run_torch_gdn_prepare(
+                k, v, g, beta, use_exp2=use_exp2, output_dtype=dtypes.fp32
+            )
+            out = _run_flydsl_prepare(
+                k,
+                v,
+                g,
+                beta,
+                cu_seqlens=None,
+                use_exp2=use_exp2,
+                shape=shape,
+                prefill_metadata=None,
+            )
+            torch.testing.assert_close(out[2], ref[2], atol=1e-6, rtol=1e-5)
+            for name, actual, expected in zip(("w", "u"), out[:2], ref[:2]):
+                relative_rms = (
+                    (
+                        (actual.float() - expected).square().mean()
+                        / expected.square().mean()
+                    )
+                    .sqrt()
+                    .item()
+                )
+                assert relative_rms < MERGE_REL_RMS_TOL, (
+                    f"{label}: {name} relative RMS error {relative_rms} "
+                    f">= {MERGE_REL_RMS_TOL}"
+                )
+                aiter.logger.info(
+                    "%s: %s relative RMS error %.6g", label, name, relative_rms
+                )
+            _check_prepare_outputs(label, ref, out, 1, shape)
 
 
 @benchmark()
@@ -1023,6 +1082,7 @@ def main():
         return
 
     _load_kernels()
+    test_gdn_prepare_merge_precision()
     _run_contract_checks()
 
     direct_rows = []
