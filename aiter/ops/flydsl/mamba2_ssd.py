@@ -22,7 +22,7 @@ import torch
 from flydsl.autotune import do_bench
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .kernels.mamba2_ssd_kernels import (
@@ -47,9 +47,12 @@ def _state_configs(P, N, L):
 
 
 def _out_configs(P):
-    for rp in _TILE_REPEATS:
+    # TileGym _compute_out_configs: plain grid, or persistent at 1-2 blocks per CU.
+    for rp, (persistent, occupancy) in itertools.product(
+        _TILE_REPEATS, ((False, 0), (True, 1), (True, 2))
+    ):
         if P % (16 * rp) == 0:
-            yield {"rp": rp}
+            yield {"rp": rp, "persistent": persistent, "occupancy": occupancy}
 
 
 def default_config(head_size, state_size, chunk_size):
@@ -69,8 +72,8 @@ def _state(H, G, P, N, L, rm, rn, ks):
 
 
 @functools.cache
-def _out(H, G, P, N, L, rp):
-    return build_compute_out(H, G, P, N, L, rp)
+def _out(H, G, P, N, L, rp, persistent):
+    return build_compute_out(H, G, P, N, L, rp, persistent)
 
 
 def _tuning_key(*args):
@@ -170,10 +173,24 @@ def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, con
     batch_size, num_tokens, num_heads, head_size = x.shape
     num_groups, state_size = b.shape[2], b.shape[3]
     out = torch.empty_like(x)
+    num_chunks = num_tokens // chunk_size
 
     def launch(cfg):
+        if cfg["persistent"]:
+            num_programs = cfg["occupancy"] * get_cu_num()
+        else:
+            num_programs = batch_size * num_chunks * num_heads * head_size
+            num_programs //= 16 * cfg["rp"]
         _run_compiled(
-            _out(num_heads, num_groups, head_size, state_size, chunk_size, cfg["rp"]),
+            _out(
+                num_heads,
+                num_groups,
+                head_size,
+                state_size,
+                chunk_size,
+                cfg["rp"],
+                cfg["persistent"],
+            ),
             x,
             b,
             c,
@@ -183,8 +200,8 @@ def _compute_out(x, b, c, d, dt_bht, decay_bht, hiddens, chunk_size, stream, con
             hiddens,
             out,
             num_tokens,
-            num_tokens // chunk_size,
             batch_size,
+            num_programs,
             stream,
         )
 
