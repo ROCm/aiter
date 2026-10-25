@@ -696,8 +696,9 @@ def _pa_decode_sparse_gfx950_gluon(
     staged_bf16 = (
         not FLAT_POOL and main_fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
     )
-    # 32- and 64-head programs (8 warps) stage each key tile once for all heads.
-    if num_heads in (32, 64):
+    # Wide head programs (8 warps) stage each key tile once for all their heads.
+    # Both helpers reject a head count their tile would not divide.
+    if num_heads >= 32:
         if packed_fp8:
             BLOCK_M = _dsv4_block_m(
                 num_heads, num_queries, num_splits, row_tiles, has_extra
