@@ -582,6 +582,14 @@ namespace py = pybind11;
           py::arg("out"),                                                            \
           py::arg("reg_bytes"),                                                      \
           py::arg("dim"));                                                           \
+    m.def("all_gatherv",                                                             \
+          &aiter::all_gatherv,                                                       \
+          py::arg("_fa"),                                                            \
+          py::arg("inps"),                                                           \
+          py::arg("outs"),                                                           \
+          py::arg("sizes"),                                                          \
+          py::arg("reg_buffer"),                                                     \
+          py::arg("reg_bytes"));                                                     \
     m.def("fused_allreduce_rmsnorm",                                                 \
           &aiter::fused_allreduce_rmsnorm,                                           \
           py::arg("_fa"),                                                            \
@@ -1382,6 +1390,7 @@ namespace py = pybind11;
           py::arg("need_renorm"),                                              \
           py::arg("num_shared_experts")         = 0,                           \
           py::arg("shared_expert_scoring_func") = "",                          \
+          py::arg("num_valid_rows")             = std::nullopt,                \
           "Apply topk softmax to the gating outputs.");                        \
     m.def("topk_softmax_fused_shared_gate",                                     \
           &aiter::topk_softmax_fused_shared_gate,                               \
@@ -1396,6 +1405,7 @@ namespace py = pybind11;
           py::arg("gate_weight"),                                              \
           py::arg("shared_expert_scale")        = 1.0f,                        \
           py::arg("shared_expert_base")         = -1,                          \
+          py::arg("num_valid_rows")             = std::nullopt,                \
           "Apply topk softmax with in-kernel shared-expert gate GEMV "         \
           "(Option A fuse-gate).");                                            \
     m.def("grouped_topk",                                                      \
@@ -1408,6 +1418,7 @@ namespace py = pybind11;
           py::arg("need_renorm"),                                              \
           py::arg("is_softmax")            = true,                             \
           py::arg("routed_scaling_factor") = 1.0f,                             \
+          py::arg("num_valid_rows")        = std::nullopt,                     \
           "Apply grouped topk softmax/sigmodd to the gating outputs.");        \
     m.def("biased_grouped_topk",                                               \
           &biased_grouped_topk,                                                \
@@ -1419,6 +1430,7 @@ namespace py = pybind11;
           py::arg("topk_grp"),                                                 \
           py::arg("need_renorm"),                                              \
           py::arg("routed_scaling_factor") = 1.0f,                             \
+          py::arg("num_valid_rows")        = std::nullopt,                     \
           "Apply biased grouped topk softmax to the gating outputs.");         \
     m.def("moe_fused_gate",                                                    \
           &moe_fused_gate,                                                     \
@@ -1431,6 +1443,7 @@ namespace py = pybind11;
           py::arg("topk"),                                                     \
           py::arg("n_share_experts_fusion"),                                   \
           py::arg("routed_scaling_factor") = 1.0,                              \
+          py::arg("num_valid_rows")        = std::nullopt,                     \
           "Apply biased grouped topk softmax to the gating outputs.");         \
     m.def("moe_align_block_size",                                              \
           &aiter::moe_align_block_size,                                        \
@@ -1449,6 +1462,7 @@ namespace py = pybind11;
           py::arg("routed_scaling_factor") = 1.0,            \
           py::arg("score_func")            = "sqrtsoftplus", \
           py::arg("num_shared_experts")    = 0,              \
+          py::arg("num_valid_rows")        = std::nullopt,   \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
 
 #define MOE_TOPK_CK_PYBIND          \
@@ -1784,6 +1798,7 @@ namespace py = pybind11;
           py::arg("num_valid_ids"),                                      \
           py::arg("token_num"),                                          \
           py::arg("block_m"),                                            \
+          py::arg("total_routes"),                                       \
           py::arg("group_size")     = 32,                                \
           py::arg("sorted_weights") = py::none());                       \
     m.def("fused_dynamic_mx_quant_moe_sort_hip_bounded",                 \

@@ -117,6 +117,7 @@ void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& out,         // [token_
                                             const aiter_tensor_t& num_valid_ids,
                                             int token_num,
                                             int block_m,
+                                            int64_t total_routes, // token_num * routing top-k
                                             int group_size = 32,
                                             std::optional<aiter_tensor_t> sorted_weights = std::nullopt);
 
