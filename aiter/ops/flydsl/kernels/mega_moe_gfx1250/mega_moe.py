@@ -46,10 +46,12 @@ _COMBINE_QUANT_BITS = {"none": 0, "mxfp8": 8, "mxfp4": 4}
 # `_combine_tile` walks these down until the tile fits a given topk.
 _COMBINE_TOKENS_PER_BLOCK = 16
 _COMBINE_CHUNKS_PER_ITER = 1
-# The MXFP8 wire wants a larger C: its scale plane puts only C*8 bytes in a TDM
+# The MX wire wants a larger C: its scale plane puts only C*8 bytes in a TDM
 # row, so a small C makes that load pull a whole cache line per row for a
-# handful of bytes.
-_COMBINE_QUANT_TOKENS_PER_BLOCK = 8
+# handful of bytes. T stays at 4. A T=8 MX tile is a 512-thread reduce on
+# gfx1250; on DeepSeek-V4.1-Flash EP4 (hidden 5120, topk 6) that lost to
+# BF16, while T=4 keeps this chunk coverage and a 256-thread block.
+_COMBINE_QUANT_TOKENS_PER_BLOCK = 4
 _COMBINE_QUANT_CHUNKS_PER_ITER = 4
 
 
@@ -62,8 +64,9 @@ def _combine_tile(*, topk, hidden_dim, quant_bits):
 
     T then takes the tile as high as the LDS budget allows, since trips per block
     is what keeps the prefetch pipeline fed. LDS grows as T*topk, so a large topk
-    trades height away: topk=8 on the mxfp8 wire needs 164KB at the preferred
-    T=8 and lands on T=7.
+    trades height away. The MX ceiling is T=4 unless
+    ``AITER_MEGA_COMBINE_QUANT_TOKENS`` and
+    ``AITER_MEGA_COMBINE_QUANT_CHUNKS`` name another tile.
     """
     n_chunks = hidden_dim // _COMBINE_CHUNK_ELEMS
     max_chunks, max_toks = (
@@ -71,6 +74,21 @@ def _combine_tile(*, topk, hidden_dim, quant_bits):
         if quant_bits
         else (_COMBINE_CHUNKS_PER_ITER, _COMBINE_TOKENS_PER_BLOCK)
     )
+    # Both values are read before kernel construction, so every rank in the
+    # process builds the same reduce.
+    if quant_bits:
+        chunks_env = os.environ.get("AITER_MEGA_COMBINE_QUANT_CHUNKS")
+        toks_env = os.environ.get("AITER_MEGA_COMBINE_QUANT_TOKENS")
+        if (chunks_env is None) != (toks_env is None):
+            raise ValueError(
+                "set both AITER_MEGA_COMBINE_QUANT_CHUNKS and "
+                "AITER_MEGA_COMBINE_QUANT_TOKENS, or neither"
+            )
+        if chunks_env is not None:
+            chunks, toks = int(chunks_env), int(toks_env)
+            if chunks <= 0 or toks <= 0:
+                raise ValueError("MegaMoE combine tile dimensions must be positive")
+            max_chunks, max_toks = chunks, toks
     for chunks in range(max_chunks, 0, -1):
         if n_chunks % chunks or (2 * topk) % chunks:
             continue
