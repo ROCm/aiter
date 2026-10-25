@@ -1041,7 +1041,7 @@ def main():
         nargs="*",
         choices=list(PREPARE_SHAPES),
         default=list(PREPARE_SHAPES),
-        help="Direct prepare shape labels.",
+        help="Direct prepare shape labels; pass no values to skip this sweep.",
     )
     parser.add_argument(
         "--pipeline-shapes",
@@ -1049,7 +1049,7 @@ def main():
         nargs="*",
         choices=list(PIPELINE_SHAPES),
         default=list(PIPELINE_SHAPES),
-        help="Model-facing pipeline shape labels.",
+        help="Model-facing pipeline shape labels; pass no values to skip this sweep.",
     )
     parser.add_argument(
         "--hidden-backends",
@@ -1107,7 +1107,8 @@ def main():
                 dtype,
             )
         )
-    _summarize("gdn_prepare", direct_rows)
+    if args.shapes:
+        _summarize("gdn_prepare", direct_rows)
 
     pipeline_rows = []
     for dtype, b, shape_name, hidden_backend in itertools.product(
@@ -1133,7 +1134,8 @@ def main():
                 dtype,
             )
         )
-    _summarize("gdn_prepare_pipeline", pipeline_rows)
+    if args.pipeline_shapes:
+        _summarize("gdn_prepare_pipeline", pipeline_rows)
 
 
 if __name__ == "__main__":
