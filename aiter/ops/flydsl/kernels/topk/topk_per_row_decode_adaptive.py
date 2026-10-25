@@ -189,6 +189,9 @@ PARTS_CAP = 32
 # Fitted jointly with `MEASURED_PARTS`; neither can be re-fitted alone.
 COMPACT_MIN = ((32, 262144), (1, 1048576))
 
+# Per part, the row length past which compacting pays when the bound overstates the row.
+COMPACT_ROW_PER_PART = 10240
+
 COMPACT_SLICE = 40960
 """Past 32 rows, the slice length a part needs before compacting it pays.
 
@@ -352,6 +355,8 @@ class DecodeAdaptiveConfig:
     short_max: int
     compact: bool
     scratch_slots: int  # 0 when the build keeps no candidate buffer
+    # Under `compact`, a row shorter than this reads the row, not the buffer.
+    compact_min: int = 0
 
     @property
     def parts_magic(self) -> int:
@@ -399,6 +404,13 @@ def decode_adaptive_config(
         kw["histogram_certificate"] = True
     if compact:
         kw["compact"] = True
+    # Up to 32 rows a row compacts from COMPACT_ROW_PER_PART per part, capped at the
+    # floor that compacts this build so a row as long as the bound still does. Past
+    # 32 rows compacting already pays above `short_max`.
+    compact_min = short_max + 1
+    if rows <= 32:
+        build_floor = next(f for at, f in COMPACT_MIN if rows >= at)
+        compact_min = max(compact_min, min(COMPACT_ROW_PER_PART * parts, build_floor))
     return DecodeAdaptiveConfig(
         kw=kw,
         grid=grid,
@@ -406,6 +418,7 @@ def decode_adaptive_config(
         short_max=short_max,
         compact=compact,
         scratch_slots=decode_scratch_slots(rows, compact, COMPACT_CAP_MULT * k),
+        compact_min=compact_min,
     )
 
 
@@ -464,9 +477,9 @@ def create_topk_per_row_decode_adaptive_kernel(
     # after any pass whose boundary bucket falls whole.
     short_early_stop = bool(early_stop) and short_tier
     meta_slots = SMEM_META_SLOTS if short_early_stop else 8
-    # Ordered short rows reach the cooperating path at one part, where they read
-    # the row rather than the candidate buffer; unordered ones never reach it.
-    short_rows_read_row = compact and ordered and tier_mode == "auto"
+    # Rows below `compact_min` read the row rather than the candidate buffer:
+    # ordered short rows at one part, and any row the bound overstates.
+    short_rows_read_row = compact and tier_mode == "auto"
     # Early stop replaces the last pass with one row walk, so it needs that pass to
     # be reading the row: under `compact` it reads the candidate buffer instead,
     # except on the ordered short rows, which alone take it there.
@@ -550,6 +563,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         long_parts: fx.Int32,
         parts_magic: fx.Int32,
         short_max: fx.Int32,
+        compact_min: fx.Int32,
     ) -> None:
         block_x = gpu.block_id("x")
         block_y = gpu.block_id("y")
@@ -1616,7 +1630,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                     # A short row keeps no buffer, as the host decides for a launch
                     # whose rows are all short: it marks itself spilled, which sends
                     # the rescans and the emit back to the row.
-                    if row_len <= short_max:
+                    if row_len < compact_min:
                         mark_compact_spilled(s_run)
                         row_scan(pass_id, start_bit, previous_start_bit, current_bits)
                     else:
@@ -2005,7 +2019,7 @@ def create_topk_per_row_decode_adaptive_kernel(
                 early = local_len == local_k
                 if const_expr(compact):
                     # Row-uniform, so the row's blocks still agree on `early`.
-                    early = early & (row_len <= short_max)
+                    early = early & (row_len < compact_min)
                 if const_expr(not ordered):  # noqa: SIM102 - constexpr guard
                     if early:
                         early_write_all(settled_bit, kth_bits, local_k)
@@ -2088,6 +2102,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         long_parts: fx.Int32,
         parts_magic: fx.Int32,
         short_max: fx.Int32,
+        compact_min: fx.Int32,
         stream: fx.Stream,
     ) -> None:
         grid_y = fx.Index(num_rows)
@@ -2104,6 +2119,7 @@ def create_topk_per_row_decode_adaptive_kernel(
             long_parts,
             parts_magic,
             short_max,
+            compact_min,
         ).launch(
             grid=(1 if single_workgroup else fx.Index(blocks_per_row), grid_y, 1),
             block=(block_threads, 1, 1),

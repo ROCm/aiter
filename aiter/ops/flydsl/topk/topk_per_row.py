@@ -494,6 +494,7 @@ def _run_adaptive(
         cfg.parts,
         cfg.parts_magic,
         cfg.short_max,
+        cfg.compact_min,
         stream,
     )
 
