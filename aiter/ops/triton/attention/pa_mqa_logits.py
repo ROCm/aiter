@@ -315,6 +315,11 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     )
 
 
+# Largest waves_per_eu that the gfx950 plain (non-preshuffle) gluon kernel
+# compiles without scratch spills, for ChunkQ=64 / HiddenDim=128, by ChunkK.
+_GFX950_PLAIN_MAX_WAVES_PER_EU = {64: 5, 128: 3, 256: 2}
+
+
 @cache
 def _compile_deepgemm_fp8_paged_mqa_logits(
     ChunkQ,
@@ -403,6 +408,25 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["ContextLenStride"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
+    if (
+        gfx_version == "gfx950"
+        and not Preshuffle
+        and not Persistent
+        and enable_jit_gluon_pa_mqa_logits_kernel
+        and ChunkQ == 64
+        and HiddenDim == 128
+        and ChunkK in _GFX950_PLAIN_MAX_WAVES_PER_EU
+    ):
+        # waves_per_eu is a hard VGPR cap for LLVM (512 // waves_per_eu). The
+        # plain (per-token paged) kernel needs ~140 VGPRs at ChunkK=128, so
+        # WavePerEU=5 (96 VGPRs) spills 176-260 B/lane to scratch and runs
+        # 2-3x slower (paged_mqa_logits B=128, kv=4096: 67us vs 25us on Triton
+        # main, 57us vs 20us on 3.7). Cap the compile hint at the largest
+        # occupancy that does not spill; the grid (SplitKV) is still sized
+        # from the caller's WavePerEU.
+        effective_wave_per_eu = min(
+            effective_wave_per_eu, _GFX950_PLAIN_MAX_WAVES_PER_EU[ChunkK]
+        )
     effective_num_warps = 1 if is_gfx1250 and Preshuffle else 4
     options = {
         "num_warps": effective_num_warps,
