@@ -213,27 +213,6 @@ def _wave_inclusive_scan(val, tid, width, zero):
     return csum
 
 
-def _mfma16_bf16x2(a, b, c):
-    """Merge inverse blocks using two BF16 components per FP32 operand.
-
-    Casting each inverse block straight to BF16 loses the small residuals in
-    products of strongly correlated keys. Accumulate all four cross products
-    in FP32, retaining those residuals while using the fast BF16 MFMA.
-    """
-    a, b = fx.Float32x4(a), fx.Float32x4(b)
-    ah, bh = _accum_to_bf16x4(a), _accum_to_bf16x4(b)
-    al = fx.BFloat16x4(
-        [(a[p] - ah[p].to(fx.Float32)).to(fx.BFloat16) for p in range(4)]
-    )
-    bl = fx.BFloat16x4(
-        [(b[p] - bh[p].to(fx.Float32)).to(fx.BFloat16) for p in range(4)]
-    )
-    out = _mfma16(al, bl, c)
-    out = _mfma16(al, bh, out)
-    out = _mfma16(ah, bl, out)
-    return _mfma16(ah, bh, out)
-
-
 @functools.lru_cache(maxsize=64)
 def compile_gdn_prepare(
     *,
@@ -520,7 +499,8 @@ def compile_gdn_prepare(
                     s_A[br + rr, br + cc] = zero_f
             gpu.barrier()
 
-            # Merge the diagonal inverses in place.
+            # Keep off-diagonal merges in FP32 as well: BF16 round trips
+            # discard residuals when the keys are strongly correlated.
             sav_L32 = fx.Float32x4(0.0)
             sav_L43 = fx.Float32x4(0.0)
             sav_L42 = fx.Float32x4(0.0)
@@ -536,36 +516,36 @@ def compile_gdn_prepare(
             kept_c32 = z4
             kept_c31 = z4
             if warp == 0:
-                t = _mfma16_bf16x2(
+                t = _mfma16_f32(
                     _load_fp32_tile_raw(s_A, 16, 0, wave_copy_A32, lds_copy32),
                     _load_fp32_tile_raw(s_A, 0, 0, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                kept_c21 = -_mfma16_bf16x2(
+                kept_c21 = -_mfma16_f32(
                     _load_fp32_tile_raw(s_A, 16, 16, wave_copy_A32, lds_copy32),
                     fx.Float32x4(t),
                     z4,
                 )
                 _store_fp32_tile(s_A, 16, 0, kept_c21, wave_copy_C32, lds_copy32)
             if warp == 1:
-                t = _mfma16_bf16x2(
+                t = _mfma16_f32(
                     _load_fp32_tile_raw(s_A, 32, 16, wave_copy_A32, lds_copy32),
                     _load_fp32_tile_raw(s_A, 16, 16, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                kept_c32 = -_mfma16_bf16x2(
+                kept_c32 = -_mfma16_f32(
                     _load_fp32_tile_raw(s_A, 32, 32, wave_copy_A32, lds_copy32),
                     fx.Float32x4(t),
                     z4,
                 )
                 _store_fp32_tile(s_A, 32, 16, kept_c32, wave_copy_C32, lds_copy32)
             if warp == 2:
-                t = _mfma16_bf16x2(
+                t = _mfma16_f32(
                     _load_fp32_tile_raw(s_A, 48, 32, wave_copy_A32, lds_copy32),
                     _load_fp32_tile_raw(s_A, 32, 32, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                c43 = -_mfma16_bf16x2(
+                c43 = -_mfma16_f32(
                     _load_fp32_tile_raw(s_A, 48, 48, wave_copy_A32, lds_copy32),
                     fx.Float32x4(t),
                     z4,
@@ -574,26 +554,26 @@ def compile_gdn_prepare(
             gpu.barrier()
 
             if warp == 0:
-                t = _mfma16_bf16x2(
+                t = _mfma16_f32(
                     _load_fp32_tile_raw(s_A, 32, 0, wave_copy_A32, lds_copy32),
                     _load_fp32_tile_raw(s_A, 0, 0, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                t = _mfma16_bf16x2(sav_L32, fx.Float32x4(kept_c21), t)
-                kept_c31 = -_mfma16_bf16x2(
+                t = _mfma16_f32(sav_L32, fx.Float32x4(kept_c21), t)
+                kept_c31 = -_mfma16_f32(
                     _load_fp32_tile_raw(s_A, 32, 32, wave_copy_A32, lds_copy32),
                     fx.Float32x4(t),
                     z4,
                 )
                 _store_fp32_tile(s_A, 32, 0, kept_c31, wave_copy_C32, lds_copy32)
             if warp == 1:
-                t = _mfma16_bf16x2(
+                t = _mfma16_f32(
                     _load_fp32_tile_raw(s_A, 48, 16, wave_copy_A32, lds_copy32),
                     _load_fp32_tile_raw(s_A, 16, 16, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                t = _mfma16_bf16x2(sav_L43, fx.Float32x4(kept_c32), t)
-                c42 = -_mfma16_bf16x2(
+                t = _mfma16_f32(sav_L43, fx.Float32x4(kept_c32), t)
+                c42 = -_mfma16_f32(
                     _load_fp32_tile_raw(s_A, 48, 48, wave_copy_A32, lds_copy32),
                     fx.Float32x4(t),
                     z4,
@@ -602,14 +582,14 @@ def compile_gdn_prepare(
             gpu.barrier()
 
             if warp == 0:
-                t = _mfma16_bf16x2(
+                t = _mfma16_f32(
                     _load_fp32_tile_raw(s_A, 48, 0, wave_copy_A32, lds_copy32),
                     _load_fp32_tile_raw(s_A, 0, 0, wave_copy_B32, lds_copy32, True),
                     z4,
                 )
-                t = _mfma16_bf16x2(sav_L42, fx.Float32x4(kept_c21), t)
-                t = _mfma16_bf16x2(sav_L43, fx.Float32x4(kept_c31), t)
-                c41 = -_mfma16_bf16x2(
+                t = _mfma16_f32(sav_L42, fx.Float32x4(kept_c21), t)
+                t = _mfma16_f32(sav_L43, fx.Float32x4(kept_c31), t)
+                c41 = -_mfma16_f32(
                     _load_fp32_tile_raw(s_A, 48, 48, wave_copy_A32, lds_copy32),
                     fx.Float32x4(t),
                     z4,
