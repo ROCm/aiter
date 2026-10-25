@@ -697,6 +697,7 @@ class MegaMoEGfx1250:
         next_topk_ids: torch.Tensor | None = None,
         next_recv_token_bound: int | None = None,
         combine_quant: str | None = None,
+        post_norm_rms_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
@@ -718,6 +719,12 @@ class MegaMoEGfx1250:
         enough tokens on the wire to pay for it and leave the rest on bf16.
         Omitting it means bf16 -- naming a format at construction only builds
         it, each step still has to ask for it.
+
+        ``post_norm_rms_w``, when provided, applies a per-slot RMSNorm to each
+        expert output AFTER the topk-weight multiply and BEFORE the P2P scatter.
+        Shape: [hidden_dim], dtype bfloat16.  The combine reduce then sums the
+        normed slots (still an unweighted sum).  Not compatible with a quantized
+        combine wire.
         """
         combine_quant_bits = self._resolve_combine_quant(combine_quant)
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
@@ -813,7 +820,7 @@ class MegaMoEGfx1250:
         if self.activation == ActivationType.Situv2:
             extra["beta"] = self.situ_beta
             extra["linear_beta"] = self.situ_linear_beta
-        scatter = self._scatter_context(routing, combine_quant_bits)
+        scatter = self._scatter_context(routing, combine_quant_bits, post_norm_rms_w)
         from aiter.ops.flydsl.grouped_moe_gfx1250 import (
             set_flydsl_dispatch_context,
         )
@@ -1738,7 +1745,10 @@ class MegaMoEGfx1250:
         )
 
     def _scatter_context(
-        self, routing: Routing, combine_quant_bits: int
+        self,
+        routing: Routing,
+        combine_quant_bits: int,
+        post_norm_rms_w: torch.Tensor | None = None,
     ) -> Stage2ScatterContext:
         return Stage2ScatterContext(
             arena_handle=self._arena.handle,
@@ -1768,6 +1778,7 @@ class MegaMoEGfx1250:
             compact_align_m=(self._compact_step_align_m if self._compact_plan else 0),
             compact_rows=(self._compact_step_rows if self._compact_plan else 0),
             combine_quant_bits=combine_quant_bits,
+            post_norm_rms_w=post_norm_rms_w,
         )
 
     def _combine(self, routing: Routing, combine_quant_bits: int = 0) -> torch.Tensor:

@@ -163,6 +163,8 @@ def launch_gemm_a8w4_tdm(
     ep_world_size: Constexpr[int] = 0,
     ep_quant_bits: Constexpr[int] = 0,
     arg_ep_row_map: fx.Tensor = None,
+    arg_ep_post_norm_rms_w: fx.Tensor = None,
+    ep_post_norm: Constexpr[int] = 0,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     row_major_ascale: Constexpr[int] = 0,
@@ -281,8 +283,13 @@ def launch_gemm_a8w4_tdm(
         ep_quant_bits,
         persistent_workers,
         rolled_drain,
+        ep_post_norm,
     )
     _ = cache_tag
+    if ep_post_norm and not enable_ep_scatter:
+        raise ValueError("ep_post_norm requires enable_ep_scatter")
+    if ep_post_norm and ep_quant_bits:
+        raise ValueError("ep_post_norm is not supported with ep_quant_bits")
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
@@ -408,7 +415,15 @@ def launch_gemm_a8w4_tdm(
     )
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
-    ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    _norm_scratch_b = (
+        ceildiv(tile_m * 4, 16) * 16
+        if (ep_post_norm and enable_ep_scatter and not ep_quant_bits)
+        else 0
+    )
+    ARENA_B = max(
+        AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0),
+        C_STORE_B + _norm_scratch_b,
+    )
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -435,6 +450,7 @@ def launch_gemm_a8w4_tdm(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
+    _postnorm = "_postnorm" if ep_post_norm else ""
     _mma_group = (
         f"_mg{MMA_GROUP}"
         if MMA_FIRST_GROUP == MMA_GROUP
@@ -453,7 +469,7 @@ def launch_gemm_a8w4_tdm(
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_cluster_sync}"
         f"{_next_stage}{_as_prologue}"
-        f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
+        f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}{_postnorm}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}{_persistent}{_drain}"
@@ -2099,6 +2115,115 @@ def launch_gemm_a8w4_tdm(
                 rocdl.s_barrier_wait(-1)
             else:
                 workgroup_barrier()
+
+            # -- Optional per-slot RMSNorm (GEMM2 -> RMSNorm -> reduce) --
+            # Applied to the weighted BF16 rows already in LDS, before the P2P
+            # scatter.  Each warp owns warp_tile_m rows × warp_tile_n cols; we
+            # reduce sum(x²) across all n_warp column warps per row via LDS
+            # atomics, then apply rsqrt(ss/N + eps) * rms_w[col].
+            if const_expr(ep_post_norm and enable_ep_scatter and not ep_quant_bits):
+                # Scratchpad: tile_m f32 partial-sum accumulators placed just
+                # after the BF16 C tile in LDS (ARENA_B is enlarged to hold them).
+                _NORM_SCRATCH_OFF = tile_m * _lds_row_bytes
+                _norm_eps = fx.Float32(1e-6)
+                _norm_n_inv = fx.Float32(1.0 / tile_n)
+
+                _f32_lds_ptr_ty = fx.PointerType.get(
+                    fx.Float32.ir_type, fx.AddressSpace.Shared, alignment=4
+                )
+
+                # --- Pass 1: zero the scratchpad ---
+                # Each thread handles ceil(tile_m / block) rows in the scratchpad.
+                _flat_tid = wave * fx.Int32(WAVE) + lane
+                for _zi in range_constexpr(ceildiv(tile_m, num_waves * WAVE)):
+                    _zrow = _flat_tid + fx.Int32(_zi * num_waves * WAVE)
+                    if _zrow < fx.Int32(tile_m):
+                        _sc_ptr = fx.inttoptr(
+                            _f32_lds_ptr_ty,
+                            fx.Int32(stC_idx)
+                            + fx.Int32(_NORM_SCRATCH_OFF)
+                            + _zrow * fx.Int32(4),
+                        )
+                        fx.ptr_store(fx.Float32(0.0), _sc_ptr)
+                workgroup_barrier()
+
+                # --- Pass 2: accumulate partial sum(x²) per row into scratchpad ---
+                # Each warp accumulates its warp_tile_n-wide column strip; the two
+                # kgrp lanes (lane and lane^16) that share the same 16-element row
+                # stripe are folded by a single shuffle before the atomic add.
+                for _wm in range_constexpr(wmma_m_rep):
+                    _row_rel = fx.Int32(wmb + _wm * 16) + fx.Int32(lane16)
+                    _row_byte = _row_rel * fx.Int32(_lds_row_bytes)
+                    _partial = fx.Float32(0.0)
+                    for _wn in range_constexpr(output_n_rep):
+                        _col_rel = fx.Int32(wnb + _wn * 16 + kgrp * 8)
+                        _lds_byte = _row_byte + _col_rel * fx.Int32(2)
+                        _v = fx.Vector(
+                            lds_load_b128(stC_idx, _lds_byte)
+                        ).bitcast(fx.BFloat16).to(fx.Float32)
+                        for _i in range_constexpr(8):
+                            _partial = _partial + _v[_i] * _v[_i]
+                    # Fold the two kgrp half-waves for the same row strip.
+                    _peer_bits = rocdl.ds_bpermute(
+                        T.i32,
+                        (lane ^ fx.Int32(16)) * fx.Int32(4),
+                        _partial.bitcast(fx.Int32),
+                    )
+                    _partial = _partial + fx.Int32(_peer_bits).bitcast(fx.Float32)
+                    # kgrp==1 already contributed; only kgrp==0 does the atomic add.
+                    if kgrp == fx.Int32(0):
+                        _sc_ptr = fx.inttoptr(
+                            _f32_lds_ptr_ty,
+                            fx.Int32(stC_idx)
+                            + fx.Int32(_NORM_SCRATCH_OFF)
+                            + _row_rel * fx.Int32(4),
+                        )
+                        fx.atomic_add(_sc_ptr, _partial, syncscope="workgroup")
+                workgroup_barrier()
+
+                # --- Pass 3: load final sum, compute rstd, apply norm weight ---
+                _rms_w_iter = fx.recast_iter(
+                    fx.PointerType.get(
+                        fx.Int16.ir_type, fx.AddressSpace.Global, alignment=2
+                    ),
+                    arg_ep_post_norm_rms_w,
+                )
+                for _wm in range_constexpr(wmma_m_rep):
+                    _row_rel = fx.Int32(wmb + _wm * 16) + fx.Int32(lane16)
+                    _sc_ptr = fx.inttoptr(
+                        _f32_lds_ptr_ty,
+                        fx.Int32(stC_idx)
+                        + fx.Int32(_NORM_SCRATCH_OFF)
+                        + _row_rel * fx.Int32(4),
+                    )
+                    _ss = fx.ptr_load(_sc_ptr)
+                    _rstd = fx.math.rsqrt(_ss * _norm_n_inv + _norm_eps)
+                    _row_byte = _row_rel * fx.Int32(_lds_row_bytes)
+                    for _wn in range_constexpr(output_n_rep):
+                        _col_rel = fx.Int32(wnb + _wn * 16 + kgrp * 8)
+                        _lds_byte = _row_byte + _col_rel * fx.Int32(2)
+                        _v_raw = fx.Vector(
+                            lds_load_b128(stC_idx, _lds_byte)
+                        ).bitcast(fx.BFloat16).to(fx.Float32)
+                        # Load rms_w[blk_n + col_rel : blk_n + col_rel + 8] as BF16.
+                        _gcol = fx.Int64(fx.Int32(blk_n) + _col_rel)
+                        _w_raw = fx.Vector(
+                            fx.ptr_load(
+                                _rms_w_iter + _gcol,
+                                result_type=T.vec(8, T.i16),
+                            )
+                        ).bitcast(fx.BFloat16).to(fx.Float32)
+                        _normed = Vec.from_elements(
+                            [_v_raw[_i] * _rstd * _w_raw[_i] for _i in range_constexpr(8)],
+                            fx.Float32,
+                        ).to(oc).bitcast(fx.Int32).ir_value()
+                        lds_store_b128(
+                            stC_idx,
+                            _lds_byte,
+                            _normed,
+                        )
+                workgroup_barrier()
+
             if const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
                 # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots

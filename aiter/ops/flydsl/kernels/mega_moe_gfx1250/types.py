@@ -93,6 +93,10 @@ class Stage2ScatterContext:
     # gemm2 epilogue quantize per 1x32 e8m0 before the P2P write and have
     # ep_combine_fused dequantize on the way out.
     combine_quant_bits: int = 0
+    # Optional per-slot RMSNorm weight applied AFTER the topk weight multiply and
+    # BEFORE the P2P scatter.  Shape: [hidden_dim], dtype bfloat16.  None disables
+    # the norm; the combine reduce is then an unweighted sum as before.
+    post_norm_rms_w: torch.Tensor | None = None
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):
@@ -116,3 +120,12 @@ class Stage2ScatterContext:
             or not self.source_token_map.is_contiguous()
         ):
             raise ValueError("source_token_map must be contiguous int32")
+        if self.post_norm_rms_w is not None:
+            if self.post_norm_rms_w.dtype != torch.bfloat16:
+                raise ValueError("post_norm_rms_w must be bfloat16")
+            if not self.post_norm_rms_w.is_contiguous():
+                raise ValueError("post_norm_rms_w must be contiguous")
+            if self.combine_quant_bits:
+                raise ValueError(
+                    "post_norm_rms_w is not supported with a quantized combine wire"
+                )

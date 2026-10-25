@@ -253,6 +253,16 @@ def flydsl_grouped_gemm_a8w4_masked(
             int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
         ),
         arg_ep_row_map=ep_row_map_tensor,
+        arg_ep_post_norm_rms_w=(
+            stage2_scatter.post_norm_rms_w
+            if (enable_ep_scatter and stage2_scatter.post_norm_rms_w is not None)
+            else out
+        ),
+        ep_post_norm=(
+            1
+            if (enable_ep_scatter and stage2_scatter.post_norm_rms_w is not None)
+            else 0
+        ),
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
         row_major_ascale=int(row_major_ascale),
