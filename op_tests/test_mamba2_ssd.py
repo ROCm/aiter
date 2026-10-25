@@ -65,13 +65,25 @@ def make_inputs(B, T, G, H, N, P, dtype):
 
 
 @benchmark()
-def test_mamba2_chunk_forward(batch, num_tokens, num_groups, num_heads, state_size, head_size, chunk_size, dtype):
-    B, T, G, H, N, P, L = batch, num_tokens, num_groups, num_heads, state_size, head_size, chunk_size
+def test_mamba2_chunk_forward(
+    batch, num_tokens, num_groups, num_heads, state_size, head_size, chunk_size, dtype
+):
+    B, T, G, H, N, P, L = (
+        batch,
+        num_tokens,
+        num_groups,
+        num_heads,
+        state_size,
+        head_size,
+        chunk_size,
+    )
     x, a, b, c, d, dt, init_state = make_inputs(B, T, G, H, N, P, dtype)
     ref_out, ref_state = run_torch(x, a, b, c, d, dt, init_state, L)
 
     candidates = {
-        "flydsl": lambda: mamba2_chunk_forward_flydsl(x, a, b, c, d, dt, init_state, chunk_size=L),
+        "flydsl": lambda: mamba2_chunk_forward_flydsl(
+            x, a, b, c, d, dt, init_state, chunk_size=L
+        ),
     }
     if chunk_simple_gla is not None:
         # Mamba-2 SSD == simple GLA with q=C, k=B, v=dt*x, g=a*dt, scale=1, state [N, P].
@@ -85,7 +97,14 @@ def test_mamba2_chunk_forward(batch, num_tokens, num_groups, num_heads, state_si
 
         def fla_fn():
             o, ht = chunk_simple_gla(
-                q_f, k_f, v_f, g=g_f, scale=1.0, initial_state=h0_f, output_final_state=True, chunk_size=L
+                q_f,
+                k_f,
+                v_f,
+                g=g_f,
+                scale=1.0,
+                initial_state=h0_f,
+                output_final_state=True,
+                chunk_size=L,
             )
             return (o + d[:, None] * x).to(dtype), ht.transpose(-1, -2)
 
@@ -104,8 +123,20 @@ def test_mamba2_chunk_forward(batch, num_tokens, num_groups, num_heads, state_si
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
         (out, state), us = run_perftest(fn)
-        err = checkAllclose(ref_out.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-2, atol=2e-2, msg=f"{name}: out")
-        checkAllclose(ref_state, state.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg=f"{name}: final_state")
+        err = checkAllclose(
+            ref_out.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{name}: out",
+        )
+        checkAllclose(
+            ref_state,
+            state.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"{name}: final_state",
+        )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -115,15 +146,34 @@ def test_mamba2_chunk_forward(batch, num_tokens, num_groups, num_heads, state_si
 
 def main():
     if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("mamba2_chunk_forward (FlyDSL) unsupported on %s; skipping", get_gfx())
+        aiter.logger.warning(
+            "mamba2_chunk_forward (FlyDSL) unsupported on %s; skipping", get_gfx()
+        )
         return
 
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter, description="config input of test"
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
     )
-    parser.add_argument("-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default="bf16,", help="input dtype")
-    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 4], help="batch size")
-    parser.add_argument("-t", "--num_tokens", type=int, nargs="*", default=[1024, 4096], help="sequence length")
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default="bf16,",
+        help="input dtype",
+    )
+    parser.add_argument(
+        "-b", "--batch", type=int, nargs="*", default=[1, 4], help="batch size"
+    )
+    parser.add_argument(
+        "-t",
+        "--num_tokens",
+        type=int,
+        nargs="*",
+        default=[1024, 4096],
+        help="sequence length",
+    )
     parser.add_argument(
         "-s",
         "--shape",
@@ -132,15 +182,21 @@ def main():
         default=[(1, 8, 64, 64), (1, 8, 128, 64), (2, 8, 64, 64)],
         help="(num_groups, num_heads, state_size, head_size), e.g. -s 1,8,128,64",
     )
-    parser.add_argument("-c", "--chunk_size", type=int, nargs="*", default=[64, 128], help="chunk size")
+    parser.add_argument(
+        "-c", "--chunk_size", type=int, nargs="*", default=[64, 128], help="chunk size"
+    )
     args = parser.parse_args()
 
     for dtype in args.dtype:
         df = []
-        for b, t, (g, h, n, p), cs in itertools.product(args.batch, args.num_tokens, args.shape, args.chunk_size):
+        for b, t, (g, h, n, p), cs in itertools.product(
+            args.batch, args.num_tokens, args.shape, args.chunk_size
+        ):
             df.append(test_mamba2_chunk_forward(b, t, g, h, n, p, cs, dtype))
         df = pd.DataFrame(df)
-        aiter.logger.info("mamba2_chunk_forward summary (markdown):\n%s", df.to_markdown(index=False))
+        aiter.logger.info(
+            "mamba2_chunk_forward summary (markdown):\n%s", df.to_markdown(index=False)
+        )
 
 
 if __name__ == "__main__":
