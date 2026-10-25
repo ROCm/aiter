@@ -3,6 +3,7 @@
 
 import argparse
 import itertools
+import math
 
 import pandas as pd
 import torch
@@ -80,6 +81,11 @@ def run_torch(x, a, b, c, d, dt, init_state, chunk_size):
     return out.to(x.dtype), final_state
 
 
+def _bf16_ulp(x):
+    """Spacing of bf16 values at magnitude x (8 significant bits)."""
+    return 2.0 ** (math.floor(math.log2(x)) - 7) if x > 0 else 0.0
+
+
 def make_inputs(B, T, G, H, N, P, L, dtype):
     """TileGym Mamba2ProblemSpec inputs; the initial state comes from one chunk of
     the recurrence (TileGym _init_hidden) so it is in distribution."""
@@ -154,6 +160,11 @@ def test_mamba2_chunk_forward(
         + 2 * B * H * P * N * 4  # init / final state
     )
 
+    # bf16 operands round at the scale of the largest output terms, and those
+    # errors survive cancellation into small outputs, so allow one bf16 ulp of
+    # the output's magnitude on top of TileGym's atol.
+    out_atol = 2e-2 + _bf16_ulp(ref_out.abs().max().item())
+
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
         (out, state), us = run_perftest(fn)
@@ -161,7 +172,7 @@ def test_mamba2_chunk_forward(
             ref_out.to(dtypes.fp32),
             out.to(dtypes.fp32),
             rtol=2e-2,
-            atol=2e-2,
+            atol=out_atol,
             msg=f"{name}: out",
         )
         checkAllclose(
