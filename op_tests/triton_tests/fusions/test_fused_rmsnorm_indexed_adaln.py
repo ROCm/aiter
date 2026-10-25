@@ -44,7 +44,9 @@ def make(M, N, G, dtype, device, *, runs=True, seed=0):
         indices = torch.randint(
             0, G, (M,), generator=gen, device=device, dtype=torch.int64
         )
-    return x, weight, shift, scale, indices
+    # Drawn last, so the tensors above keep their existing values.
+    bias = torch.randn(N, generator=gen, device=device, dtype=dtype)
+    return x, weight, shift, scale, indices, bias
 
 
 @pytest.mark.parametrize("round_intermediate", [False, True])
@@ -63,7 +65,7 @@ def make(M, N, G, dtype, device, *, runs=True, seed=0):
 @pytest.mark.parametrize("runs", [True, False])
 def test_matches_norm_then_gathered_affine(dtype, M, N, G, runs, round_intermediate):
     dev = "cuda"
-    x, weight, shift, scale, indices = make(M, N, G, dtype, dev, runs=runs)
+    x, weight, shift, scale, indices, _ = make(M, N, G, dtype, dev, runs=runs)
     got = fused_rmsnorm_indexed_adaln(
         x,
         weight,
@@ -112,7 +114,7 @@ def test_uniform_and_scattered_indices_agree():
     """
     dev = "cuda"
     M, N, G = 256, 5376, 6
-    x, weight, shift, scale, _ = make(M, N, G, torch.bfloat16, dev)
+    x, weight, shift, scale, _, _ = make(M, N, G, torch.bfloat16, dev)
     # Entries 2 and 5 now modulate identically, so which one a row picks is
     # invisible in the output but decides which branch its block takes.
     shift[5] = shift[2]
@@ -141,7 +143,7 @@ def test_every_index_is_honoured():
     uniform test and fail this one."""
     dev = "cuda"
     N, G = 512, 6
-    x, weight, shift, scale, _ = make(G, N, G, torch.float32, dev)
+    x, weight, shift, scale, _, _ = make(G, N, G, torch.float32, dev)
     indices = torch.arange(G, device=dev, dtype=torch.int64)
     got = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices, eps=1e-5)
     want = reference(x, weight, shift, scale, indices, 1e-5)
@@ -150,7 +152,7 @@ def test_every_index_is_honoured():
 
 def test_out_parameter_is_written_in_place():
     dev = "cuda"
-    x, weight, shift, scale, indices = make(64, 1024, 3, torch.bfloat16, dev)
+    x, weight, shift, scale, indices, _ = make(64, 1024, 3, torch.bfloat16, dev)
     dst = torch.empty_like(x)
     got = fused_rmsnorm_indexed_adaln(
         x, weight, shift, scale, indices, out=dst, eps=1e-5
@@ -166,7 +168,7 @@ def test_out_parameter_is_written_in_place():
 
 def test_int32_indices_are_accepted():
     dev = "cuda"
-    x, weight, shift, scale, indices = make(64, 1024, 3, torch.bfloat16, dev)
+    x, weight, shift, scale, indices, _ = make(64, 1024, 3, torch.bfloat16, dev)
     got = fused_rmsnorm_indexed_adaln(
         x, weight, shift, scale, indices.to(torch.int32), eps=1e-5
     )
@@ -176,7 +178,7 @@ def test_int32_indices_are_accepted():
 
 def test_rejects_mismatched_shapes():
     dev = "cuda"
-    x, weight, shift, scale, indices = make(32, 256, 3, torch.bfloat16, dev)
+    x, weight, shift, scale, indices, _ = make(32, 256, 3, torch.bfloat16, dev)
     with pytest.raises(AssertionError):
         fused_rmsnorm_indexed_adaln(x, weight[:-1], shift, scale, indices)
     with pytest.raises(AssertionError):
@@ -221,12 +223,11 @@ def test_layernorm_matches_norm_then_gathered_affine(
     dtype, M, N, G, affine, runs, round_intermediate
 ):
     dev = "cuda"
-    x, weight, shift, scale, indices = make(M, N, G, dtype, dev, runs=runs)
-    bias = None
+    x, weight, shift, scale, indices, bias = make(M, N, G, dtype, dev, runs=runs)
     if affine == "none":
         weight = None
-    elif affine == "weight_bias":
-        bias = torch.randn(N, device=dev, dtype=dtype)
+    if affine != "weight_bias":
+        bias = None
     got = fused_layernorm_indexed_adaln(
         x,
         shift,
@@ -243,9 +244,21 @@ def test_layernorm_matches_norm_then_gathered_affine(
 
     assert got.shape == x.shape and got.dtype == x.dtype
     if round_intermediate and dtype != torch.float32:
-        tol = 2 * torch.finfo(dtype).eps
-    else:
-        tol = {torch.float32: 2e-6, torch.float16: 4e-3, torch.bfloat16: 3e-2}[dtype]
+        full_precision = layernorm_reference(
+            x, weight, bias, shift, scale, indices, 1e-6, round_intermediate=False
+        )
+        assert not torch.equal(
+            want, full_precision
+        ), "test input does not expose intermediate rounding"
+        unrounded = fused_layernorm_indexed_adaln(
+            x, shift, scale, indices, eps=1e-6, weight=weight, bias=bias
+        )
+        assert not torch.equal(
+            got, unrounded
+        ), "round_intermediate=True did not change the kernel output"
+    # One table for both paths: a rounded intermediate can land on the other
+    # side of a midpoint from the reference, and the add does not shrink the gap.
+    tol = {torch.float32: 2e-6, torch.float16: 4e-3, torch.bfloat16: 3e-2}[dtype]
     torch.testing.assert_close(got.float(), want.float(), atol=tol, rtol=tol)
 
 
@@ -256,7 +269,7 @@ def test_layernorm_large_mean(N):
     has errors near 1e-2 on this input."""
     dev = "cuda"
     M, G = 64, 2
-    x, _, shift, scale, indices = make(M, N, G, torch.float32, dev)
+    x, _, shift, scale, indices, _ = make(M, N, G, torch.float32, dev)
     x = x * 0.01 + 1000.0
     got = fused_layernorm_indexed_adaln(x, shift, scale, indices, eps=1e-6)
     xn = torch.nn.functional.layer_norm(x.double(), (N,), eps=1e-6)
@@ -269,7 +282,7 @@ def test_layernorm_per_sample_modulation():
     token."""
     dev = "cuda"
     B, S, N = 2, 333, 1152
-    x, _, shift, scale, _ = make(B * S, N, B, torch.bfloat16, dev)
+    x, _, shift, scale, _, _ = make(B * S, N, B, torch.bfloat16, dev)
     indices = torch.arange(B, device=dev).repeat_interleave(S)
     got = fused_layernorm_indexed_adaln(x, shift, scale, indices, eps=1e-6)
     xn = torch.nn.functional.layer_norm(x.float().view(B, S, N), (N,), eps=1e-6)
@@ -279,7 +292,7 @@ def test_layernorm_per_sample_modulation():
 
 def test_layernorm_rejects_mismatched_shapes():
     dev = "cuda"
-    x, weight, shift, scale, indices = make(32, 256, 3, torch.bfloat16, dev)
+    x, weight, shift, scale, indices, _ = make(32, 256, 3, torch.bfloat16, dev)
     with pytest.raises(AssertionError):
         fused_layernorm_indexed_adaln(x, shift, scale, indices, weight=weight[:-1])
     with pytest.raises(AssertionError):
