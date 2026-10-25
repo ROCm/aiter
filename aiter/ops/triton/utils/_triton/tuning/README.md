@@ -115,8 +115,9 @@ bucket it lacks from `DEFAULT.json`. The M bounds are the kernel's explicit boun
 `M_BOUNDS`, else the standard list. Each swept M replaces its `M_LEQ_<smallest family bound >= M>`
 bucket with the fastest `ok` record, the installed baseline included; when several swept Ms share a
 bucket the largest M wins. Ms above the largest bound (8192) are not tuned. Every installed file
-ships an `any`: a copy of `DEFAULT.json`'s `any`, so an M above every tuned bucket gets the
-family fallback, never a small-M tile. `DEFAULT.json` is never written. Every swept M is then re-read
+ships an `any` for them: a copy of the largest-bound bucket (`M_LEQ_8192` for the standard bounds),
+the tile tuned at the largest M. A file without that bucket gets a copy of `DEFAULT.json`'s `any`,
+never a smaller-M tile. `DEFAULT.json` is never written. Every swept M is then re-read
 through `get_gemm_config` and must come back `is_tuned`; if not, the previous file is put back and
 the command fails.
 Config reads are cached per process, so restart Python to pick up a new file.

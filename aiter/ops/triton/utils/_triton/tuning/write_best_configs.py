@@ -7,7 +7,8 @@ Flow:  load_winners    fastest ok record per M; the installed baseline competes 
                        an M above the largest bound is not written
        build_table     seeded with this shape's file if it exists, else a new file marked
                        DEFAULT_FALLBACK (the loader serves its missing buckets from DEFAULT.json);
-                       "any" is a copy of DEFAULT.json's; DEFAULT.json is never written
+                       "any" is a copy of the largest bound's bucket (DEFAULT.json's "any" when
+                       the file has no such bucket); DEFAULT.json is never written
        write, confirm  write the file, re-resolve every assigned M through the real loader, and
                        put the previous file back if the loader disagrees
 
@@ -93,7 +94,7 @@ def assign_buckets(winners, bounds):
         bucket = bucket_for(M, bounds)
         if bucket is None:
             print(
-                f"  M={M}: above the largest bound {bounds[-1]}, not written ('any' is DEFAULT.json's)"
+                f"  M={M}: above the largest bound {bounds[-1]}, not written ('any' copies M_LEQ_{bounds[-1]})"
             )
             continue
         if bucket in assignments:
@@ -166,8 +167,10 @@ def install(spec, backend, shape_nk, runs_dir):
             f"no swept M is within the bounds (largest {bounds[-1]}); nothing installed"
         )
     table = build_table(seed, assignments, arch, keys)
-    # every file ships DEFAULT.json's "any": a tuned small-M tile must never become the fallback
-    table["any"] = copy.deepcopy(default_buckets["any"])
+    # "any" serves M above the largest bound: the tile tuned at the largest M, else DEFAULT.json's
+    # "any"; a tuned smaller-M tile must never become the fallback
+    top = f"M_LEQ_{bounds[-1]}"
+    table["any"] = copy.deepcopy(table.get(top, default_buckets["any"]))
     for bucket, winner in sorted(assignments.items(), key=lambda kv: kv[1].M):
         gain = ""
         if winner.baseline is not None:
@@ -175,6 +178,7 @@ def install(spec, backend, shape_nk, runs_dir):
         print(
             f"  M={winner.M:<6} {bucket:<12} {winner.record['us']:10.3f} us  {gain:<36} {json.dumps(table[bucket])}"
         )
+    print(f"  any: a copy of {top if top in table else 'the any of DEFAULT.json'}")
 
     config_dir = resolve_config_dir("gemm", spec.config_name, backend=backend)
     target = f"{config_dir}/{specialized_filename(spec.config_name, shape_nk)}"

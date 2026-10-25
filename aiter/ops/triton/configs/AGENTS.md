@@ -149,8 +149,10 @@ File format:
   `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim`,
   `cache_modifier` and `NUM_KSPLIT`. The tuning scripts tune only the keys
   in `DEFAULT.json`.
-- The tuning scripts write a specialized file with `"DEFAULT_FALLBACK": true`,
-  the tuned buckets and a copy of the `"any"` of `DEFAULT.json`.
+- The tuning scripts write a specialized file with `"DEFAULT_FALLBACK": true`
+  and the tuned buckets. Its `"any"` is a copy of the largest bucket
+  (`M_LEQ_8192` for the standard bounds). A file without that bucket gets a
+  copy of the `"any"` of `DEFAULT.json`.
 - You can use `cache_modifier` on all archs, also on gfx1250.
 
 Names:
