@@ -3093,6 +3093,84 @@ def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
     assert _cosine(ordered[0], corrected) > 0.999
 
 
+def _sol_attn_far_pooled_inputs(kv_tile, kv_tiles, heads=2, sequence_q=512, seed=0):
+    """BF16 Q/K/V whose pooled blocks sit 6 to 9 nats below one top key in block 0.
+
+    Every query points along one direction per head, the top key scores 10 nats on it, and each
+    other block's keys score a fixed 6 to 9 nats lower, so the pooled blocks carry nearly all of
+    the softmax mass at P far below 1. Each block's V adds its own offset, so a misweighted block
+    moves the output rather than averaging out.
+    """
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    def noise(*shape):
+        return torch.randn(*shape, device="cuda", generator=generator)
+
+    d, q_norm, top = 128, 8.0, 10.0
+    direction = torch.nn.functional.normalize(noise(heads, d), dim=-1)
+    to_key = 1.0 / (_SOL_ATTN_SOFTMAX_SCALE * q_norm)
+    q = q_norm * direction + 0.3 * noise(sequence_q, heads, d)
+    gap = torch.linspace(6.0, 9.0, kv_tiles - 1, device="cuda")
+    order = torch.randperm(kv_tiles - 1, device="cuda", generator=generator)
+    level = torch.cat([gap.new_zeros(1), gap[order]])
+    k = ((top - level) * to_key).repeat_interleave(kv_tile)[:, None, None] * direction
+    k = k + 0.3 * noise(kv_tiles * kv_tile, heads, d)
+    k[:kv_tile] = 0.3 * noise(kv_tile, heads, d)
+    k[0] = top * to_key * direction
+    v = noise(kv_tiles, heads, d).repeat_interleave(kv_tile, dim=0)
+    v = v + 0.5 * noise(kv_tiles * kv_tile, heads, d)
+    return tuple(x.unsqueeze(0).to(torch.bfloat16).contiguous() for x in (q, k, v))
+
+
+@pytest.mark.parametrize(
+    ("recipe", "block_tile"),
+    [
+        p
+        for p in _SOL_ATTN_GFX950_PARAMS
+        if p.values[0].v_format == native_fp8_format()
+    ],
+)
+def test_mha_v4_sol_fp8_p_keeps_pooled_mass_far_below_the_exact_max(
+    recipe, block_tile
+):
+    """FP8-V rows quantize P to e4m3 against the exact pass's max. A pooled block's P carries the
+    block's token count; folded into the accumulators instead, it falls to 2^-9 and below, where
+    e4m3 is subnormal and flushes to zero. One exact block holds the top key and every other block
+    is pooled 6 to 9 nats below it, so the pooled mass is the output and any P lost to the
+    subnormal range shows up in it."""
+    from aiter.test_mha_common import sol_attn_ref
+
+    _skip_without_sol_row(recipe, block_tile)
+    heads, sequence_q, kv_tiles = 2, 512, 64
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    operands = recipe.quantize(
+        *_sol_attn_far_pooled_inputs(kv_tile, kv_tiles, heads, sequence_q)
+    )
+    mask = torch.zeros(
+        (1, heads, sequence_q // q_tile, kv_tiles), device="cuda", dtype=torch.bool
+    )
+    mask[..., 0] = True
+    args, kwargs = recipe.prepare_args(*operands, block_tile=block_tile)
+    plan = sol_prepare(*args, block_attn_mask=mask, num_heads=heads, **kwargs)
+    sol = _sol_attn_launch(*operands, plan, recipe=recipe, block_tile=block_tile)
+    torch.cuda.synchronize()
+
+    reference, _ = sol_attn_ref(
+        *recipe.reference_operands(*operands),
+        plan["block_attn_mask"],
+        recipe.dequantize_pooled(plan, "mean_k", operands[1]),
+        recipe.dequantize_pooled(plan, "mean_v", operands[2]),
+        BLOCK_M=q_tile,
+        BLOCK_N=kv_tile,
+        softmax_scale=recipe.ref_softmax_scale,
+    )
+    error = (
+        (sol.float() - reference.float()).norm() / reference.float().norm()
+    ).item()
+    # Unfolded P lands at 0.012 to 0.075 across these rows, folded at 0.10 to 0.52.
+    assert error < 0.09, f"relative error {error}"
+
+
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 def test_mha_v4_sol_sorted_dispatch_needs_a_row_that_declares_it():
     """Insisting on sorted dispatch fails loudly where it cannot be honoured.
