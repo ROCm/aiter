@@ -437,56 +437,71 @@ def resolve_h_pad(hidden: int, h_pad: int | None) -> int:
     return h_pad
 
 
-def _quick_reduce_atoms_choices(world_size: int) -> tuple[int, ...]:
-    """``atoms_per_row`` values one reduce-scatter chunk can carry.
+def quick_reduce_atoms_choices(
+    world_size: int, *, wide_rows: bool = False
+) -> tuple[int, ...]:
+    """``atoms_per_row`` values a quick-reduce row may span.
 
     A rank owns ``rank_atoms = ATOMS // world_size`` consecutive atoms of a
-    tile and the epilogue runs on a whole chunk, so a row must fit inside one:
-    ``atoms_per_row`` has to divide ``rank_atoms``.
+    tile. The ring normalizes one reduce-scatter chunk at a time, so a row must
+    fit inside one: ``atoms_per_row`` has to divide ``rank_atoms``.
+
+    ``wide_rows`` is the mesh's wider set: the mesh normalizes only once the
+    all-gather has handed it the whole tile, so a row may span any divisor of
+    ``ATOMS``, chunks of several ranks included.
     """
     world_size = int(world_size)
     if world_size <= 0 or ATOMS % world_size:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
-    rank_atoms = ATOMS // world_size
-    return tuple(a for a in range(1, rank_atoms + 1) if rank_atoms % a == 0)
+    span = ATOMS if wide_rows else ATOMS // world_size
+    return tuple(a for a in range(1, span + 1) if span % a == 0)
 
 
 def quick_reduce_row_block_options(
-    hidden: int, world_size: int
+    hidden: int, world_size: int, *, wide_rows: bool = False
 ) -> tuple[tuple[int, int], ...]:
-    """Every ``(block, atoms_per_row)`` a fused mesh or ring build can use."""
+    """Every ``(block, atoms_per_row)`` a fused mesh or ring build can use;
+    ``wide_rows`` as in :func:`quick_reduce_atoms_choices`."""
     return row_block_options(
         hidden,
-        atoms_choices=_quick_reduce_atoms_choices(world_size),
+        atoms_choices=quick_reduce_atoms_choices(world_size, wide_rows=wide_rows),
         align=BLOCK_ALIGN,
     )
 
 
 def quick_reduce_padded_row_block_options(
-    hidden: int, world_size: int
+    hidden: int, world_size: int, *, wide_rows: bool = False
 ) -> tuple[tuple[int, int, int], ...]:
     """Every ``(block, atoms_per_row, h_pad)`` a padded mesh or ring build can use."""
     return padded_row_block_options(
         hidden,
-        atoms_choices=_quick_reduce_atoms_choices(world_size),
+        atoms_choices=quick_reduce_atoms_choices(world_size, wide_rows=wide_rows),
         align=BLOCK_ALIGN,
     )
 
 
-def quick_reduce_row_block(hidden: int, world_size: int) -> tuple[int, int]:
+def quick_reduce_row_block(
+    hidden: int, world_size: int, *, wide_rows: bool = False
+) -> tuple[int, int]:
     """``(block, atoms_per_row)`` for a fused mesh or ring build.
 
     The narrowest row -- the fewest atoms per row, hence the widest block --
-    that both :func:`row_block` accepts and the reduce-scatter split can carry.
+    that both :func:`row_block` accepts and the row-span rule allows.
 
     At ``atoms_per_row == 1`` one atom is one row and this succeeds for every
     multiple of 1024 up to 8192. Wider rows need ``atoms_per_row > 1``, which
-    TP8 cannot offer and hidden=16384 is TP2/TP4 only.
+    a reduce-scatter chunk cannot carry at TP8, so hidden=16384 is TP2/TP4 only
+    -- unless ``wide_rows`` (mesh only) lifts the chunk bound.
     """
-    opts = quick_reduce_row_block_options(hidden, world_size)
+    opts = quick_reduce_row_block_options(hidden, world_size, wide_rows=wide_rows)
     if opts:
         return opts[0]
-    rank_atoms = ATOMS // int(world_size)
+    span = max(quick_reduce_atoms_choices(world_size, wide_rows=wide_rows))
+    why = (
+        "a tile's atoms"
+        if wide_rows
+        else "atoms wide (it has to fit inside one reduce-scatter chunk)"
+    )
     narrowest = None
     try:
         row_block(hidden, per_thread=ATOM_ELEMS, align=BLOCK_ALIGN)
@@ -494,14 +509,17 @@ def quick_reduce_row_block(hidden: int, world_size: int) -> tuple[int, int]:
         narrowest = exc
     raise ValueError(
         f"no fused build for hidden={hidden} at world_size={world_size}: a row "
-        f"must be 1..{rank_atoms} atoms wide (it has to fit inside one "
-        f"reduce-scatter chunk) and the resulting block a multiple of "
+        f"must be 1..{span} {why} and the resulting block a multiple of "
         f"{BLOCK_ALIGN} at most {MAX_BLOCK} threads -- {narrowest}"
     ) from narrowest
 
 
 def quick_reduce_row_block_at(
-    hidden: int, world_size: int, block: int | None = None
+    hidden: int,
+    world_size: int,
+    block: int | None = None,
+    *,
+    wide_rows: bool = False,
 ) -> tuple[int, int]:
     """``(block, atoms_per_row)`` for a fused mesh or ring build, block optional.
 
@@ -509,9 +527,9 @@ def quick_reduce_row_block_at(
     every caller got before the block was tunable.
     """
     if block is None:
-        return quick_reduce_row_block(hidden, world_size)
+        return quick_reduce_row_block(hidden, world_size, wide_rows=wide_rows)
     block = int(block)
-    opts = quick_reduce_row_block_options(hidden, world_size)
+    opts = quick_reduce_row_block_options(hidden, world_size, wide_rows=wide_rows)
     for b, a in opts:
         if b == block:
             return b, a
@@ -529,24 +547,30 @@ def quick_reduce_row_block_for(
     *,
     block: int | None = None,
     atoms_per_row: int | None = None,
+    wide_rows: bool = False,
 ) -> tuple[int, int]:
     """``(block, atoms_per_row)``, pinned by either knob or the widest default."""
     if block is not None and atoms_per_row is not None:
         raise ValueError("pin block or atoms_per_row, not both")
     if atoms_per_row is None:
-        return quick_reduce_row_block_at(hidden, world_size, block)
-    opts = quick_reduce_row_block_options(hidden, world_size)
+        return quick_reduce_row_block_at(
+            hidden, world_size, block, wide_rows=wide_rows
+        )
+    opts = quick_reduce_row_block_options(hidden, world_size, wide_rows=wide_rows)
     if not opts:
-        return quick_reduce_row_block(hidden, world_size)  # raises, naming why
+        # Raises, naming why.
+        return quick_reduce_row_block(hidden, world_size, wide_rows=wide_rows)
     want = int(atoms_per_row)
     pick = min(opts, key=lambda ba: (abs(ba[1] - want), ba[1]))
     return pick
 
 
-def quick_reduce_hidden_supported(hidden: int, world_size: int) -> bool:
+def quick_reduce_hidden_supported(
+    hidden: int, world_size: int, *, wide_rows: bool = False
+) -> bool:
     """Whether a fused mesh/ring build exists for this width. For host gates."""
     try:
-        quick_reduce_row_block(hidden, world_size)
+        quick_reduce_row_block(hidden, world_size, wide_rows=wide_rows)
     except ValueError:
         return False
     return True

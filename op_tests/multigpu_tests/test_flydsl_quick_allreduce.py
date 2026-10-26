@@ -72,7 +72,9 @@ rank agreement, and ``test_quick_allreduce_host_checks``.
 output of ``allreduce_rmsnorm_mxfp4``, bit for bit against
 ``per_1x32_f4_quant_hip``. ``--extended`` adds
 ``test_quick_allreduce_rmsnorm_low_latency``, the mesh with the low-latency
-build pinned on every rung.
+build pinned on every rung, and ``test_quick_allreduce_rmsnorm_wide_rows``, the
+default mesh build at the same 256-thread block where its row spans several
+ranks' reduce-scatter chunks (a geometry only the mesh has).
 
 With ``--operation ar_rmsnorm``, bench times each fused schedule
 (``FlyQuickAllReduceRMSNorm`` as production builds it) against two sets of
@@ -2141,15 +2143,25 @@ _FUSED_OPTION_CASES = (
     (4096, 8192, True, True),
 )
 
-#: Cases of the pinned low-latency build (``--extended``), kept at the widths
-#: that have one at a world size (``_low_latency_hidden_ok``).
+#: Cases of the pinned low-latency build and of the default mesh build at the
+#: same block (``--extended``), kept at the widths that have one
+#: (``_low_latency_hidden_ok``).
 _FUSED_LOW_LATENCY_CASES = (
     (1, 2048, False, False),
+    (37, 2048, False, False),
     (256, 2048, True, False),
+    (37, 4096, True, False),
     (37, 4096, False, True),
+    (512, 4096, False, False),
     (512, 4096, True, True),
+    (3072, 4096, True, False),
+    (37, 8192, False, True),
     (1536, 8192, False, False),
-    (4096, 8192, True, False),
+    (1536, 8192, False, True),
+    (4096, 8192, False, False),
+    (4096, 8192, True, True),
+    (16384, 8192, False, False),
+    (37, 16384, True, True),
 )
 
 #: The low-latency build is a mesh build at this block.
@@ -2157,10 +2169,13 @@ _LOW_LATENCY_BLOCK = 256
 
 
 def _low_latency_hidden_ok(hidden: int, tp: int) -> bool:
-    """Whether *hidden* has a native ``_LOW_LATENCY_BLOCK``-thread fused build
-    at *tp* ranks: a row's 2048-element atoms divide a rank's share of a tile."""
+    """Whether *hidden* has a native ``_LOW_LATENCY_BLOCK``-thread mesh build:
+    a row of 2048-element atoms spanning a divisor of the tile's ``ATOMS``.
+    The mesh normalizes the gathered tile, so the row need not fit one rank's
+    chunk, and this holds at every *tp*."""
+    del tp  # a mesh row may span several ranks' chunks
     atoms_per_row, rem = divmod(hidden, 2048)
-    return rem == 0 and (ATOMS // tp) % atoms_per_row == 0
+    return rem == 0 and atoms_per_row >= 1 and ATOMS % atoms_per_row == 0
 
 
 def _pinned_st_kw(super_tile: int) -> dict:
@@ -2379,6 +2394,41 @@ def test_quick_allreduce_rmsnorm_low_latency(tp, tokens, hidden, gemma_norm, inp
     ]
     _check(
         f"tp{tp} {tokens}x{hidden} gemma={gemma_norm} inplace={inplace} low-latency",
+        fails,
+    )
+    return _option_summary(rows)
+
+
+def _wide_row_case(hidden: int, tp: int) -> bool:
+    """Whether the ``_LOW_LATENCY_BLOCK`` mesh row at *hidden* spans several
+    ranks' reduce-scatter chunks at *tp* -- a geometry only the mesh has."""
+    return _low_latency_hidden_ok(hidden, tp) and hidden // 2048 > ATOMS // tp
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_wide_rows(tp, tokens, hidden, gemma_norm, inplace):
+    """The default mesh build at ``_LOW_LATENCY_BLOCK`` where its row spans
+    several ranks' chunks (``wide_rows``), graded like
+    ``test_quick_allreduce_rmsnorm_low_latency``: the low-latency build's twin,
+    and the geometry the ring cannot build."""
+    cases = [c for c in _FUSED_LOW_LATENCY_CASES if _wide_row_case(c[1], tp)]
+    batch = _fused_batch(
+        (tp, "wide-rows", "mesh"),
+        cases,
+        algorithm="mesh",
+        engine_kw={"block": _LOW_LATENCY_BLOCK},
+        unfused=True,
+        mxfp4=True,
+    )
+    rows = batch[(tokens, hidden, gemma_norm, inplace)]
+    fails = (
+        _fused_sqnr_fails(rows)
+        + _fused_disagree_fails(rows)
+        + _fused_unfused_fails(rows)
+        + _fused_mxfp4_fails(rows)
+    )
+    _check(
+        f"tp{tp} {tokens}x{hidden} gemma={gemma_norm} inplace={inplace} wide rows",
         fails,
     )
     return _option_summary(rows)
@@ -2760,6 +2810,72 @@ def _host_rejects_unsupported_hidden() -> list[str]:
     return fails
 
 
+def _bare_fused_engine(algorithm: str, tp: int, **knobs):
+    """A ``FlyQuickAllReduceRMSNorm`` with just enough state to resolve row
+    geometry (``supports_hidden``, ``_geom_for``) without a process group."""
+    from aiter.ops.flydsl.quick_allreduce import (
+        ALGORITHMS as HOST_ALGORITHMS,
+    )
+    from aiter.ops.flydsl.quick_allreduce import (
+        FlyQuickAllReduceRMSNorm,
+        _resolve_codecs,
+    )
+
+    algo = HOST_ALGORITHMS[algorithm]
+    eng = FlyQuickAllReduceRMSNorm.__new__(FlyQuickAllReduceRMSNorm)
+    eng.world_size = tp
+    eng._algo = algo
+    eng.rs_codec, _ag = _resolve_codecs(algo, tp, None, None)
+    eng.block = knobs.get("block")
+    eng.atoms_per_row = knobs.get("atoms_per_row")
+    eng._apr_substituted = set()
+    eng._pins = {"low_latency": True} if knobs.get("low_latency") else {}
+    return eng
+
+
+def _host_mesh_wide_rows() -> list[str]:
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
+        quick_reduce_hidden_supported,
+        quick_reduce_row_block_at,
+    )
+
+    fails = []
+    for hidden, apr in ((2048, 1), (4096, 2), (8192, 4), (16384, 8)):
+        got = quick_reduce_row_block_at(hidden, 8, 256, wide_rows=True)
+        if got != (256, apr):
+            fails.append(f"wide hidden={hidden} block=256: {got}, want (256, {apr})")
+        if apr > 1:
+            fails += _expect_raises(
+                f"chunk-bound hidden={hidden} block=256",
+                "legal blocks",
+                lambda h=hidden: quick_reduce_row_block_at(h, 8, 256),
+            )
+    for hidden in (12288, 16384):
+        if not quick_reduce_hidden_supported(hidden, 8, wide_rows=True):
+            fails.append(f"wide hidden={hidden} tp=8: reported unsupported")
+        if quick_reduce_hidden_supported(hidden, 8):
+            fails.append(f"chunk-bound hidden={hidden} tp=8: reported supported")
+
+    # The host gate, at TP8.
+    for knobs, hidden, want in (
+        ({"block": 256}, 8192, (256, 4, 8192)),
+        ({"block": 256, "low_latency": True}, 16384, (256, 8, 16384)),
+        ({"atoms_per_row": 4}, 8192, (256, 4, 8192)),
+        ({"atoms_per_row": 1}, 8192, (1024, 1, 8192)),
+    ):
+        eng = _bare_fused_engine("mesh", 8, **knobs)
+        got = eng._geom_for(hidden) if eng.supports_hidden(hidden) else None
+        if got != want:
+            fails.append(f"mesh tp=8 {knobs} hidden={hidden}: {got}, want {want}")
+    eng = _bare_fused_engine("mesh", 8, atoms_per_row=1)
+    if eng.supports_hidden(16384):
+        fails.append("mesh tp=8 atoms_per_row=1: took hidden=16384 unasked")
+    eng = _bare_fused_engine("ring", 8, block=256)
+    if eng.supports_hidden(8192):
+        fails.append("ring tp=8 block=256: took hidden=8192, a row wider than a chunk")
+    return fails
+
+
 def _host_supported_hiddens() -> list[str]:
     """Every multiple of 1024 up to 8192 builds at every world size."""
     from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
@@ -2860,13 +2976,13 @@ def _host_padded_hidden_limits() -> list[str]:
 def _padded_pick(hidden: int, world_size: int):
     from aiter.ops.flydsl.allreduce_policy import BLOCK_ALIGN
     from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
-        _quick_reduce_atoms_choices,
+        quick_reduce_atoms_choices,
         padded_row_block,
     )
 
     return padded_row_block(
         hidden,
-        atoms_choices=_quick_reduce_atoms_choices(world_size),
+        atoms_choices=quick_reduce_atoms_choices(world_size),
         align=BLOCK_ALIGN,
     )
 
@@ -3010,6 +3126,7 @@ def _host_fused_one_shot_block_options() -> list[str]:
 _HOST_CHECKS = {
     "rejects_unsupported_hidden": _host_rejects_unsupported_hidden,
     "supported_hiddens": _host_supported_hiddens,
+    "mesh_wide_rows": _host_mesh_wide_rows,
     "padded_row_block_is_least_wire": _host_padded_row_block_is_least_wire,
     "padded_hidden_limits": _host_padded_hidden_limits,
     "mesh_fanout_quad_budget": _host_mesh_fanout_quad_budget_gates_narrow_blocks,
@@ -3331,6 +3448,16 @@ def _verify_fused(tps, algos, extended: bool) -> None:
         ],
     )
     _summarize(
+        "flydsl quick allreduce rmsnorm mesh rows wider than a chunk",
+        [
+            test_quick_allreduce_rmsnorm_wide_rows(tp, *case)
+            for tp in sorted({c[0] for c in fused})
+            if extended and mesh
+            for case in _FUSED_LOW_LATENCY_CASES
+            if _wide_row_case(case[1], tp)
+        ],
+    )
+    _summarize(
         "flydsl quick allreduce rmsnorm host-side geometry checks",
         [test_quick_allreduce_host_checks(check) for check in _HOST_CHECKS],
     )
@@ -3346,13 +3473,7 @@ def _fused_applies(algorithm: str, knobs: dict, tp: int, hidden: int) -> bool:
     low-latency candidate at a width whose block is not ``BLOCK``.
     """
     from aiter.ops.flydsl.kernels.comm.transport import BLOCK
-    from aiter.ops.flydsl.quick_allreduce import (
-        ALGORITHMS as HOST_ALGORITHMS,
-    )
-    from aiter.ops.flydsl.quick_allreduce import (
-        FlyQuickAllReduceRMSNorm,
-        _resolve_codecs,
-    )
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
 
     low_latency = bool(knobs.get("low_latency"))
     wgs_per_cu = (
@@ -3367,17 +3488,11 @@ def _fused_applies(algorithm: str, knobs: dict, tp: int, hidden: int) -> bool:
     ):
         return False
     apr = knobs.get("atoms_per_row")
-    if apr is not None and (8 // tp) % apr:
+    # A ring row fits a rank's chunk; a mesh row may span the whole tile.
+    span = ATOMS if algorithm == "mesh" else ATOMS // tp
+    if apr is not None and span % apr:
         return False
-    algo = HOST_ALGORITHMS[algorithm]
-    eng = FlyQuickAllReduceRMSNorm.__new__(FlyQuickAllReduceRMSNorm)
-    eng.world_size = tp
-    eng._algo = algo
-    eng.rs_codec, _ag = _resolve_codecs(algo, tp, None, None)
-    eng.block = knobs.get("block")
-    eng.atoms_per_row = apr
-    # ``_geom_for`` records a width whose ``atoms_per_row`` it substituted.
-    eng._apr_substituted = set()
+    eng = _bare_fused_engine(algorithm, tp, **knobs)
     if not eng.supports_hidden(hidden):
         return False
     block, got_apr, _h_pad = eng._geom_for(hidden)

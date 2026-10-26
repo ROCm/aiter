@@ -768,9 +768,21 @@ class FlyQuickAllReduceRMSNorm:
         ok = self._algo.fused_block_ok
         return ok is None or ok(int(block), self.world_size, self.rs_codec)
 
+    def _wide_rows(self, hidden: int) -> bool:
+        """Whether *hidden* may take a mesh row wider than a reduce-scatter
+        chunk."""
+        if self._algo.name != "mesh":
+            return False
+        if self.block is not None or getattr(self, "_pins", {}).get("low_latency"):
+            return True
+        want = self._row_atoms(hidden)
+        return want is not None and int(want) > ATOMS // self.world_size
+
     def _native_opts(self, hidden: int) -> tuple[tuple[int, int], ...]:
         """``(block, atoms_per_row)`` this width admits with no padding."""
-        opts = quick_reduce_row_block_options(int(hidden), self.world_size)
+        opts = quick_reduce_row_block_options(
+            int(hidden), self.world_size, wide_rows=self._wide_rows(hidden)
+        )
         opts = tuple(o for o in opts if self._block_ok(o[0]))
         if self.block is not None:
             opts = tuple(o for o in opts if o[0] == self.block)
@@ -782,7 +794,9 @@ class FlyQuickAllReduceRMSNorm:
         Ascending ``h_pad``, so ``[0]`` is the least wire volume that every
         constraint accepts.
         """
-        opts = quick_reduce_padded_row_block_options(int(hidden), self.world_size)
+        opts = quick_reduce_padded_row_block_options(
+            int(hidden), self.world_size, wide_rows=self._wide_rows(hidden)
+        )
         opts = tuple(o for o in opts if self._block_ok(o[0]))
         if self.block is not None:
             opts = tuple(o for o in opts if o[0] == self.block)
@@ -818,6 +832,7 @@ class FlyQuickAllReduceRMSNorm:
                 self.world_size,
                 block=self.block,
                 atoms_per_row=want,
+                wide_rows=self._wide_rows(hidden),
             )
             if want is not None and apr != want and hidden not in self._apr_substituted:
                 # The width has no block for the requested atoms_per_row,
@@ -843,6 +858,7 @@ class FlyQuickAllReduceRMSNorm:
                 self.world_size,
                 block=self.block,
                 atoms_per_row=want,
+                wide_rows=self._wide_rows(hidden),
             )
             return block, apr, hidden
         tied = [o for o in opts if o[2] == opts[0][2]]
@@ -918,7 +934,9 @@ class FlyQuickAllReduceRMSNorm:
         hidden = int(hidden)
         if not self.supports_hidden(hidden):
             # Resolve again for the message: it names the constraint that failed.
-            quick_reduce_row_block_at(hidden, self.world_size, self.block)
+            quick_reduce_row_block_at(
+                hidden, self.world_size, self.block, wide_rows=self._wide_rows(hidden)
+            )
         block, _atoms_per_row, h_pad = self._geom_for(hidden)
         _rungs, by_cap = self._ladder(hidden)
         for (st, low_latency), rung_cap in by_cap.items():
@@ -1058,7 +1076,9 @@ class FlyQuickAllReduceRMSNorm:
         ):
             raise ValueError("out/residual_out must have the input's shape")
         if not self.supports_hidden(hidden):
-            quick_reduce_row_block_at(hidden, self.world_size, self.block)
+            quick_reduce_row_block_at(
+                hidden, self.world_size, self.block, wide_rows=self._wide_rows(hidden)
+            )
         live_bytes = int(inp.numel()) * 2
         if live_bytes > 0xFFFFFFFF:
             raise ValueError("payload must not exceed the 4 GiB buffer window")
