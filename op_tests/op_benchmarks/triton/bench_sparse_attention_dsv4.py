@@ -16,7 +16,6 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py --shapes prefill
 """
 
-import argparse
 import functools
 
 import torch
@@ -27,6 +26,7 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
 )
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 from aiter.ops.triton.utils._triton import arch_info
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # The Gluon prefill kernel is opt-in (gfx950 + Triton >= 3.6). Probe it once at
 # import time; the benchmark falls back to Triton-only when unavailable.
@@ -421,7 +421,7 @@ def check_correctness(device: str):
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = get_parser(kernel_name="Sparse Attention DSV4")
     p.add_argument(
         "--shapes",
         choices=["all", "prefill"],

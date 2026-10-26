@@ -203,7 +203,7 @@ def _fused_gemm_a16w16_quant_x_kernel(
                 c_ptr
                 + stride_cm * offs_cm[:, None]
                 + stride_cn * offs_cn[None, :]
-                + pid_k * stride_ck
+                + pid_k.to(tl.int64) * stride_ck
             )
             if EVEN_MN:
                 tl.store(c_ptrs, c)

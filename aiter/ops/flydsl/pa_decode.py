@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8 or BF16 paged-attention decode on gfx942/gfx950.
+"""FP8 or BF16 paged-attention decode on gfx942/gfx950/gfx1250.
 
 Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
-OCP on gfx950. See ``kernels.pa_decode_kernel`` for Q/P quantization and
-MFMA specialization details. Native BF16 uses unscaled, 8-element vectorized
-K/V caches and BF16 queries.
+OCP on gfx950/gfx1250. See ``kernels.pa_decode_kernel`` for Q/P quantization and
+MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
+K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 """
 
 import flydsl.compiler as flyc
@@ -21,9 +21,7 @@ from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     DUAL_REGISTER_PARTITIONS,
-    MAX_CTA_WAVES,
     REGISTER_PARTITIONS,
-    WAVE,
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
@@ -71,12 +69,16 @@ def launch_pa_decode_ps_reduce(
             "FlyDSL pa_decode reduce supports at most "
             f"{props.multi_processor_count} partitions"
         )
+    arch = get_gfx_runtime()
+    wave = 32 if arch == "gfx1250" else 64
+    register_partitions = min(REGISTER_PARTITIONS, wave)
+    max_cta_waves = 1024 // wave
     batch, kv_heads = output.shape[0], output.shape[2]
     rows = query_seq_len * query_group_size
-    # Exact bounds keep the register ladder short; above 64 a power of two
+    # Exact bounds keep the register ladder short; above a wave a power of two
     # bounds the specialization count.
     partitions = min(partition_bound, max_partitions)
-    if partitions > REGISTER_PARTITIONS:
+    if partitions > register_partitions:
         partitions = min(max_partitions, 1 << (partitions - 1).bit_length())
     # A per-sequence span <= INT32_MAX keeps every attempted byte offset,
     # including inactive partitions, below 2**32, so out-of-bounds reads
@@ -94,7 +96,7 @@ def launch_pa_decode_ps_reduce(
     # Paired loads need dword alignment; scalar output stores do not. The
     # register-only kernel pairs only D128/D256: at larger heads, halving its
     # waves costs more latency hiding than the wider loads save.
-    dual = partitions > REGISTER_PARTITIONS
+    dual = partitions > register_partitions
     pairs = (
         (head_size % 128 == 0 if dual else head_size in (128, 256))
         and logits.dtype in (torch.bfloat16, torch.float16)
@@ -106,19 +108,24 @@ def launch_pa_decode_ps_reduce(
     if dual:
         # Partition groups fill the CTA while the grid stays within 16 waves
         # per CU. D128 sequences averaging at most 32 partitions keep one.
-        group_waves = head_size // WAVE // (2 if pairs else 1)
-        budget = MAX_CTA_WAVES * props.multi_processor_count
+        group_waves = head_size // wave // (2 if pairs else 1)
+        budget = max_cta_waves * props.multi_processor_count
         if head_size != 128 or exp_sums.shape[1] > DUAL_REGISTER_PARTITIONS * batch:
             while (
-                2 * groups * group_waves <= MAX_CTA_WAVES
+                2 * groups * group_waves <= max_cta_waves
                 and 2 * groups * group_waves * ctas <= budget
             ):
                 groups *= 2
         per_seq = rows * kv_heads
-        if ctas * group_waves >= budget and batch * per_seq * per_seq <= 2**30:
+        if (
+            arch != "gfx1250"
+            and ctas * group_waves >= budget
+            and batch * per_seq * per_seq <= 2**30
+        ):
             num_xcds = get_num_xcds()
     num_xcds = num_xcds if num_xcds > 1 else 0
     compiled = compile_pa_decode_ps_reduce(
+        architecture=arch,
         max_context_partition_num=partitions,
         head_size=head_size,
         output_dtype_str=get_dtype_str(output.dtype),
@@ -174,7 +181,7 @@ def pa_decode(
     query_length: int,
     *,
     context_partition_size: int = 256,
-    compute_type: torch.dtype = torch.bfloat16,
+    compute_type: torch.dtype | None = None,
     query_scale: torch.Tensor = None,
     key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -198,11 +205,16 @@ def pa_decode(
     per-tensor or per-token scales, and sliding windows, with at most 32
     query rows (query_length times the GQA group size).
 
-    BF16 K/V requires BF16 queries, compute_type=torch.bfloat16, no K/V scales,
-    and vectorized 5D caches with x=8; FP8 uses x=16. BF16 Q/P operands stay
+    ``compute_type=None`` infers compute from the cache dtype. BF16 K/V requires
+    no K/V scales and uses x=8; FP8 uses x=16. gfx942/gfx950 require BF16 queries
+    and vectorized 5D BF16 caches. gfx1250 also supports FP16 queries and plain
+    BF16 V caches, with head dimensions 64 or multiples of 128 up to 1024.
+    BF16 Q/P operands stay
     in BF16 and softmax statistics and MFMA accumulation stay in FP32.
-    BF16 automatically splits query positions to keep each CTA within 64 KiB
-    of LDS; a single query's GQA rows must fit that limit. Q/K and V/output
+    gfx942/gfx950 BF16 automatically splits query positions to keep each CTA
+    within 64 KiB of LDS; a single query's GQA rows must fit that limit. gfx1250
+    splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
+    into separate query CTAs. Q/K and V/output
     head dimensions must match.
     ALiBi and externally quantized queries are unsupported.
 
@@ -217,8 +229,9 @@ def pa_decode(
     the device CU count for the gfx950 head-256 pipe shapes and twice that
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
-    partition cap with ``plan_pa_decode(max_partitions=...)``; even a cap of one
-    uses packed scratch and reduction.
+    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, a cap
+    of one writes output directly when sinks are absent and query/output strides
+    match. Other plans use packed scratch and reduction.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -330,14 +343,16 @@ def pa_decode(
     expected_fp8_dtype = {
         "gfx942": torch.float8_e4m3fnuz,
         "gfx950": torch.float8_e4m3fn,
+        "gfx1250": torch.float8_e4m3fn,
     }.get(arch)
     if expected_fp8_dtype is None:
         raise NotImplementedError(
-            f"pa_decode only supports gfx942 and gfx950, got {arch}"
+            f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
     is_bf16_kv = key_cache.dtype == torch.bfloat16
     kv_dtype = "bf16" if is_bf16_kv else "fp8"
     expected_kv_dtype = torch.bfloat16 if is_bf16_kv else expected_fp8_dtype
+    compute_type = key_cache.dtype if compute_type is None else compute_type
     if compute_type != expected_kv_dtype:
         raise NotImplementedError(
             f"pa_decode requires compute_type={expected_kv_dtype} for the KV cache "
@@ -350,14 +365,14 @@ def pa_decode(
     if not (
         64 <= head_dim <= 1024
         and head_dim % 64 == 0
-        and (is_bf16_kv or q_chunk <= 8 or q_chunk % 8 == 0)
+        and ((is_bf16_kv and arch != "gfx1250") or q_chunk <= 8 or q_chunk % 8 == 0)
     ):
         raise NotImplementedError(
             f"pa_decode does not support head_dim={head_dim}; supported values "
             + (
                 "are multiples of 64 in [64, 1024] for BF16 KV"
-                if is_bf16_kv
-                else "are 64 and multiples of 128 in [128, 1024] for FP8 KV"
+                if is_bf16_kv and arch != "gfx1250"
+                else "are 64 and multiples of 128 in [128, 1024]"
             )
         )
     if num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
@@ -372,7 +387,7 @@ def pa_decode(
             f"pa_decode only supports block_size in (16, 64, 128), got {block_size}"
         )
 
-    if is_bf16_kv and not trans_v:
+    if is_bf16_kv and arch != "gfx1250" and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
     if trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
@@ -423,7 +438,7 @@ def pa_decode(
         query_dtype = "f16"
     else:
         raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
-    if is_bf16_kv and query.dtype != torch.bfloat16:
+    if is_bf16_kv and arch != "gfx1250" and query.dtype != torch.bfloat16:
         raise NotImplementedError("BF16 KV requires bfloat16 queries")
     if output.dtype != query.dtype:
         raise TypeError(
@@ -589,6 +604,12 @@ def pa_decode(
     pmax = max_logits
     psum = exp_sums
     pout = temporary_output
+    direct_output = (
+        arch == "gfx1250"
+        and num_partitions == 1
+        and sinks is None
+        and output.stride() == query.stride()
+    )
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -600,6 +621,7 @@ def pa_decode(
 
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
+            architecture=arch,
             head_dim=head_dim,
             query_group_size=query_group_size,
             block_size=int(block_size),
@@ -620,6 +642,7 @@ def pa_decode(
             work_capacity=work_plan.capacity,
             max_context_length=schedule_context_length,
             sliding_window=sliding_window,
+            direct_output=direct_output,
             trans_k=trans_k,
         )
 
@@ -680,9 +703,15 @@ def pa_decode(
         s = torch.cuda.current_stream(dev)
         _run_compiled(
             compiled["launch"],
-            ptr_arg(pmax, fx.Float32),
+            (
+                ptr_arg(work_plan.reduce_info, fx.Float32)
+                if direct_output
+                else ptr_arg(pmax, fx.Float32)
+            ),
             ptr_arg(psum, fx.Float32),
-            ptr_arg(pout, _flydsl_pointer_dtype(pout.dtype)),
+            ptr_arg(
+                output if direct_output else pout, _flydsl_pointer_dtype(pout.dtype)
+            ),
             ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
             ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
             ptr_arg(value_cache, _flydsl_pointer_dtype(value_cache.dtype)),
@@ -708,6 +737,8 @@ def pa_decode(
             work_plan.capacity,
             s,
         )
+        if direct_output:
+            return
         output_5d = output.reshape(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
         )

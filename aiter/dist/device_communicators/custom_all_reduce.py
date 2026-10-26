@@ -661,6 +661,14 @@ class IPCBufferPool:
         their IPC handles across all ranks and completes registration.
         """
         count = self._graph_count_fn(ar_ptr)
+        counts = self.all_gather_object(count)
+        if any(c != count for c in counts):
+            raise RuntimeError(
+                "custom allreduce: ranks recorded different numbers of CUDA "
+                f"graph buffers during capture (per rank: {counts}). They are "
+                "registered by position, so every rank must capture the same "
+                "collectives in the same order."
+            )
         if count == 0:
             return
         handle_sz = 64  # sizeof(hipIpcMemHandle_t)
@@ -870,6 +878,9 @@ class CustomAllreduce:
     defers_capture_registration = True
 
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
+    # gfx1250 allgather also runs at 16/32/64 (multi-node symm_mem); all-reduce
+    # stays within _SUPPORTED_WORLD_SIZES.
+    _SUPPORTED_WORLD_SIZES_GFX1250: ClassVar[list[Any]] = [2, 4, 6, 8, 16, 32, 64]
 
     def _meta_size(self) -> int:
         """Bytes of shared meta buffer this group needs.
@@ -990,13 +1001,18 @@ class CustomAllreduce:
             # No need to initialize custom allreduce for single GPU case.
             return
 
-        if world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
+        supported = (
+            CustomAllreduce._SUPPORTED_WORLD_SIZES_GFX1250
+            if self._is_gfx1250
+            else CustomAllreduce._SUPPORTED_WORLD_SIZES
+        )
+        if world_size not in supported:
             logger.warning(
                 "Custom allreduce is disabled due to an unsupported world"
                 " size: %d. Supported world sizes: %s. To silence this "
                 "warning, specify disable_custom_all_reduce=True explicitly.",
                 world_size,
-                str(CustomAllreduce._SUPPORTED_WORLD_SIZES),
+                str(supported),
             )
             return
 
@@ -1104,9 +1120,10 @@ class CustomAllreduce:
         self._register_for_capturing_init = enable_register_for_capturing
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
-        # 8*world_size bytes where world_size is at most 8. Allocating 8MB
-        # is enough for 131072 such tuples. The largest model I've seen only
-        # needs less than 10000 of registered tuples.
+        # 8*kMaxNgpus bytes (kMaxNgpus is 8 on old arch, 64 on gfx1250).
+        # Allocating 8MB is enough for 16384 such tuples even at 64. The
+        # largest model I've seen only needs less than 10000 of registered
+        # tuples.
         self.rank_data = torch.empty(
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
@@ -1615,6 +1632,9 @@ class CustomAllreduce:
         # AITER_CUSTOM_AR_MAX_SIZE=0 disables custom AR entirely -> RCCL for all.
         if self._car_max_size <= 0:
             return False
+        # gfx1250 groups above 8 ranks are allgather-only.
+        if self.world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
+            return False
         # AITER_CUSTOM_AR_MIN_SIZE lower bound: inputs at or below it fall back
         # to RCCL (custom AR runs only in the (min, max] window). Default 0 keeps
         # the historical behavior of accepting all sizes down to 16 bytes.
@@ -1932,6 +1952,71 @@ class CustomAllreduce:
         if view_dtype is not None and out is not None:
             out = out.view(orig_dtype)
         return out
+
+    # Tensors one `all_gatherv` launch takes (kAllGatherVMax).
+    _ALL_GATHERV_MAX: ClassVar[int] = 4
+    # Past this many bytes per rank, times the group size, NCCL's grouped
+    # all-gather is faster. Measured on MI355X gathering MoE routed rows
+    # in a replayed graph: the two cross near 4.5 / 9 / 21 MB a rank at
+    # 2 / 4 / 8 ranks.
+    _ALL_GATHERV_BYTES_PER_RANK: ClassVar[int] = 2 << 20
+
+    def custom_all_gatherv(
+        self, inps: list[torch.Tensor], sizes: list[int] | None = None
+    ) -> list[torch.Tensor] | None:
+        """First-dim all-gather of every tensor in `inps`, rank r holding
+        `sizes[r]` rows of each (every rank this one's count when None), in
+        one launch and one rank barrier. Each output is a contiguous
+        `[sum(sizes), ...]` of its input's dtype.
+
+        None where one launch cannot take them -- the gfx1250 path, too many
+        tensors, rows not a multiple of 4 bytes, a non-contiguous input, more
+        than the registered pool holds -- or where NCCL is the faster (more
+        than `_ALL_GATHERV_BYTES_PER_RANK` times the group's size a rank), so
+        the caller gathers another way.
+        Every condition reads only what all ranks share (row widths, `sizes`),
+        so all ranks decide alike.
+
+        Binds the inputs as `custom_all_gather` does: read in place while
+        capturing on the registered path, copied into the registered pool
+        otherwise.
+        """
+        if self._ops_all_gather is not None:
+            return None
+        if not 0 < len(inps) <= self._ALL_GATHERV_MAX:
+            return None
+        if sizes is None:
+            sizes = [inps[0].shape[0]] * self.world_size
+        # From the row shape, not a row: this rank may hold none.
+        row_bytes = [
+            t.shape[1:].numel() * t.element_size() if t.dim() else 0 for t in inps
+        ]
+        if any(
+            b == 0 or b % 4 or not t.is_contiguous() for b, t in zip(row_bytes, inps)
+        ):
+            return None
+        rank_bytes = max(sizes) * sum(row_bytes)
+        if rank_bytes > self._ALL_GATHERV_BYTES_PER_RANK * self.world_size:
+            return None
+        registered = (
+            self._IS_CAPTURING
+            and torch.cuda.is_current_stream_capturing()
+            and all(self._capture_registered(t) for t in inps)
+        )
+        pool = self._pool["input"]
+        if not registered and pool.max_size < sum(
+            (max(sizes) * b + 15) // 16 * 16 for b in row_bytes
+        ):
+            return None
+        total = sum(sizes)
+        outs = [
+            torch.empty((total, *t.shape[1:]), dtype=t.dtype, device=t.device)
+            for t in inps
+        ]
+        if total:
+            reg, reg_bytes = (0, 0) if registered else (pool.data_ptr, pool.max_size)
+            ops.all_gatherv(self._ptr, inps, outs, list(sizes), reg, reg_bytes)
+        return outs
 
     def fused_ar_rms(
         self,

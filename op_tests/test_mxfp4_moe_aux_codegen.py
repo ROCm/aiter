@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU-only checks for MXFP4 MoE auxiliary source generation."""
 
+import ast
 import importlib.util
 import sys
 import tempfile
@@ -13,6 +14,17 @@ GENERATOR = (
     / "csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py"
 )
 JIT_CACHE = Path(__file__).resolve().parents[1] / "aiter/jit/utils/jit_cache.py"
+AUX_OPS = Path(__file__).resolve().parents[1] / "aiter/ops/moe_mxfp4_aux.py"
+
+
+def supported_shapes():
+    """`MXFP4_MOE_SUPPORTED_SHAPES`, read without importing aiter."""
+    for node in ast.parse(AUX_OPS.read_text()).body:
+        if isinstance(node, ast.Assign) and any(
+            getattr(t, "id", None) == "MXFP4_MOE_SUPPORTED_SHAPES" for t in node.targets
+        ):
+            return set(ast.literal_eval(node.value.args[0]))
+    raise AssertionError("MXFP4_MOE_SUPPORTED_SHAPES not found")
 
 
 def load_module(name, path):
@@ -23,6 +35,11 @@ def load_module(name, path):
 
 
 class TestMxfp4MoeAuxCodegen(unittest.TestCase):
+    def test_supported_shapes_have_generated_instances(self):
+        module = load_module("mxfp4_moe_aux_codegen", GENERATOR)
+        missing = supported_shapes() - set(module.SHAPES)
+        self.assertEqual(missing, set())
+
     def test_regeneration_removes_stale_instance_source(self):
         module = load_module("mxfp4_moe_aux_codegen", GENERATOR)
 
