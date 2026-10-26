@@ -665,20 +665,24 @@ def run_benchmark(run: BenchRun):
         has_pe = D_HEAD > D_HEAD_V
         # Dense iff BOTH bounds are off (-1); either set = a window (matches the kernel's
         # `LEFT < 0 and RIGHT < 0` dense test -- neither side is privileged).
-        has_sliding_window = window_size_left >= 0 or window_size_right >= 0
         window_size = (window_size_left, window_size_right)
         mha_set_impl(impl)
-        # SWA runs on the dao_ai path (any dtype), the fp8 path (routes to FA3, which
-        # has it) and the Gluon backend; only native non-fp8 triton lacks it (left-only,
-        # right rejected). Skip that combo cleanly rather than hard-error mid-sweep.
+        # Native Triton and Gluon support a left window (and a sink on the native
+        # one-kernel path). A right window needs dao_ai or the fp8/FA3 path.
+        # Skip that combo cleanly rather than hard-error mid-sweep.
         if is_gluon and not is_gluon_available():
             warnings.warn(
                 "Skipping: Gluon MHA backend is not available on this device."
             )
             return 0
-        if has_sliding_window and not is_gluon and impl != "dao_ai" and dtype != "fp8":
+        if (
+            window_size_right >= 0
+            and not is_gluon
+            and impl != "dao_ai"
+            and dtype != "fp8"
+        ):
             warnings.warn(
-                "Skipping: sliding window needs -impl dao_ai (or an fp8 dtype)."
+                "Skipping: right sliding window needs -impl dao_ai (or an fp8 dtype)."
             )
             return 0
         if is_gluon and window_size_right >= 0:
