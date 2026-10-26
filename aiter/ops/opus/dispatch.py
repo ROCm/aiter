@@ -186,6 +186,8 @@ def _opus_dispatch(
             kid=kid,
             split_k=split_k,
             workspace=workspace,
+            route_arch=key.gfx,
+            route_cu_num=key.cu_num,
             instance=instance,
         )
 
