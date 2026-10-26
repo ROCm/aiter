@@ -568,6 +568,9 @@ def check_rows(model):
         before = [x.clone() for x in inputs]
         refs = [run_torch(rows, case.data, r) for r in range(rows.rows)]
         tag = f"{rows.label} page{case.page_size}x{case.pages_per_block}"
+        table_out = (
+            {}
+        )  # an instance's Table logits: its other modes must equal them bit for bit
         for name, (cfg, build) in ways(case).items():
             r = rows
             guard = r.width * 4
@@ -603,6 +606,13 @@ def check_rows(model):
                 bad.append("out's guard bands written")
             if flat is not None and not bool(torch.isnan(flat[total:]).all()):
                 bad.append("the flat out's guard written")
+            inst, mode = name.split(":")
+            if mode == "table":
+                table_out[inst] = out.clone()
+            elif not torch.equal(
+                out.view(torch.int32), table_out[inst].view(torch.int32)
+            ):
+                bad.append(f"differs from {inst}:table bit for bit")
             results.append((f"{tag} {name}", bad))
         if not all(torch.equal(a, b) for a, b in zip(inputs, before)):
             results.append((tag, ["an input was written"]))

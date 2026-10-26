@@ -22,7 +22,7 @@
 #include "mqa_logits_mxfp4_gfx1250_v41.cuh"
 #else
 namespace opus_logits::gfx1250 {
-template<class T> __global__ void h64_kernel(mqa_logits_mxfp4_kargs) {}
+template<class T, int SCHED> __global__ void h64_kernel(mqa_logits_mxfp4_kargs) {}
 template<class T, int SCHED> __global__ void v41_kernel(mqa_logits_mxfp4_kargs) {}
 }  // namespace opus_logits::gfx1250
 #endif
@@ -41,19 +41,16 @@ using v41g_s4L    = v41_traits<1, 1, 4, 0, 1>;    // V4.1 candidate decode (Pref
 using v41g_s3L    = v41_traits<1, 1, 3, 0, 1>;    // V4.1 candidate prefill (Prefill)
 
 template<class T>
-hipError_t h64_launch(int mode, const mqa_logits_mxfp4_kargs& k, int grid, hipStream_t stream) {
-    if (mode != SCHED_TABLE) return hipErrorInvalidValue;
-    h64_kernel<T><<<dim3(grid), dim3(T::BLOCK_SIZE), 0, stream>>>(k);
-    return hipGetLastError();
+auto h64_kernel_of(int mode) -> void (*)(mqa_logits_mxfp4_kargs) {
+    switch (mode) {
+    case SCHED_TABLE:   return h64_kernel<T, SCHED_TABLE>;
+    case SCHED_FREE:    return h64_kernel<T, SCHED_FREE>;
+    case SCHED_PREFILL: return h64_kernel<T, SCHED_PREFILL>;
+    default:            return nullptr;
+    }
 }
 
-template<class T>
-hipError_t h64_occupancy(int mode, int* ctas_per_cu) {
-    if (mode != SCHED_TABLE) return hipErrorInvalidValue;
-    return hipOccupancyMaxActiveBlocksPerMultiprocessor(ctas_per_cu, h64_kernel<T>, T::BLOCK_SIZE, 0);
-}
-
-// The kernel of `mode`, or null. Free is not compiled for the candidate kernel (v41_assign says
+// The kernel of `mode`, or null. Free is not compiled for the candidate kernel (mqa_assign says
 // why).
 template<class T>
 auto v41_kernel_of(int mode) -> void (*)(mqa_logits_mxfp4_kargs) {
@@ -67,23 +64,22 @@ auto v41_kernel_of(int mode) -> void (*)(mqa_logits_mxfp4_kargs) {
     }
 }
 
-template<class T>
-hipError_t v41_launch(int mode, const mqa_logits_mxfp4_kargs& k, int grid, hipStream_t stream) {
-    const auto kernel = v41_kernel_of<T>(mode);
+template<class T, auto KERNEL_OF>
+hipError_t launch(int mode, const mqa_logits_mxfp4_kargs& k, int grid, hipStream_t stream) {
+    const auto kernel = KERNEL_OF(mode);
     if (!kernel) return hipErrorInvalidValue;
     void* args[] = {const_cast<mqa_logits_mxfp4_kargs*>(&k)};
     return hipLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(grid), dim3(T::BLOCK_SIZE),
                            args, 0, stream);
 }
 
-template<class T>
-hipError_t v41_occupancy(int mode, int* ctas_per_cu) {
-    const auto kernel = v41_kernel_of<T>(mode);
+template<class T, auto KERNEL_OF>
+hipError_t occupancy(int mode, int* ctas_per_cu) {
+    const auto kernel = KERNEL_OF(mode);
     if (!kernel) return hipErrorInvalidValue;
     return hipOccupancyMaxActiveBlocksPerMultiprocessor(ctas_per_cu, kernel, T::BLOCK_SIZE, 0);
 }
 
-constexpr int MODES_TABLE   = 1 << SCHED_TABLE;
 constexpr int MODES_ALL     = (1 << SCHED_TABLE) | (1 << SCHED_FREE) | (1 << SCHED_PREFILL);
 constexpr int MODES_GATHER  = (1 << SCHED_TABLE) | (1 << SCHED_PREFILL);
 constexpr int ENTRY_ANY_RUN = 1 << 30;   // any power-of-two multiple of the 64-key tile
@@ -92,8 +88,8 @@ template<class T>
 constexpr mqa_logits_instance h64_entry() {
     // A table entry is one 64-key tile: 64 rows (page_size * pages_per_block).
     return {"gfx1250", T::N_HEADS, 1, T::NUM_WAVES, T::STAGES, T::SCALE_TDM, 0,
-            T::KV_TILE_SIZE, T::KV_TILE_SIZE, T::KV_TILE_SIZE, MODES_TABLE, 0,
-            h64_launch<T>, h64_occupancy<T>};
+            T::KV_TILE_SIZE, T::KV_TILE_SIZE, T::KV_TILE_SIZE, MODES_ALL, 0,
+            launch<T, h64_kernel_of<T>>, occupancy<T, h64_kernel_of<T>>};
 }
 
 template<class T>
@@ -102,7 +98,7 @@ constexpr mqa_logits_instance v41_entry() {
     return {"gfx1250", T::N_HEADS, T::ROWS_PER_WAVE, T::NUM_WAVES, T::STAGES, T::SCALE_TDM, T::GATHER,
             T::GATHER ? T::PAGE_ROWS : T::TILE_KEYS, T::GATHER ? T::PAGE_ROWS : ENTRY_ANY_RUN,
             T::TILE_KEYS, T::GATHER ? MODES_GATHER : MODES_ALL, 1,
-            v41_launch<T>, v41_occupancy<T>};
+            launch<T, v41_kernel_of<T>>, occupancy<T, v41_kernel_of<T>>};
 }
 
 }  // namespace

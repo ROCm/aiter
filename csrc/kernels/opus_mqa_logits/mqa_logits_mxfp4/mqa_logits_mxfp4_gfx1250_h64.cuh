@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// The n_heads = 64 (DeepSeek-V4) kernel on gfx1250: Table schedule, 64-row pages, one table
-// entry a 64-key tile. Device pass on gfx1250 only (mqa_logits_mxfp4_gfx1250.cu).
+// The n_heads = 64 (DeepSeek-V4) kernel on gfx1250: 64-row pages, one table entry a 64-key tile.
+// Device pass on gfx1250 only (mqa_logits_mxfp4_gfx1250.cu). Where a CTA's work comes from:
+// template SCHED, mqa_logits_mxfp4_gfx1250_assign.cuh.
 //
 // The structure (opus-ops opus_logits/gfx1250/docs/H64_PORT.md):
 //   * A tile's accumulators are pipelined by n-tile -- n-tile m's two WMMAs (one an m-tile), then
@@ -13,13 +14,15 @@
 //     one-row CTAs the row's Q ahead of the first tiles' TDM, in four-row CTAs behind it; the
 //     block-table word one tile ahead; the TDM descriptors built once, a tile patching its
 //     address and stage.
-//   * Wave priority by progress in one-round schedules (the record's `_pad`, see the builder).
+//   * Wave priority by progress in one-round launches: a Table schedule's (the record's `_pad`,
+//     see the builder) and Free's, never Prefill's (there the age order retires CTAs early for
+//     the next round).
 #pragma once
-#include "mqa_logits_mxfp4_gfx1250_common.cuh"
+#include "mqa_logits_mxfp4_gfx1250_assign.cuh"
 
 namespace opus_logits::gfx1250 {
 
-template<class T>
+template<class T, int SCHED>
 __global__ __launch_bounds__(T::BLOCK_SIZE, 1)
 void h64_kernel(mqa_logits_mxfp4_kargs k) {
     using D_BYTE   = opus::u8_t;
@@ -54,17 +57,17 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
     int   bt_stride    = k.bt_stride;
     pin_sgpr(num_rows); pin_sgpr(stride_out); pin_sgpr(weight_scale); pin_sgpr(bt_stride);
 
-    // The record's window is the group's union and alone sets the trip count (the barrier
-    // count); a row's own window only masks its stores. A wave past a short group runs with an
-    // empty window, so it stores nothing and the barrier count stays uniform.
-    const opus_mqa_cta_record rec = k.ptr_cta_info[opus::block_id_x()];
-    if (rec.chunk_count <= 0 || rec.row_id >= num_rows) return;   // CTA-uniform
-    const bool slot_ok     = wave < rec.group_rows && rec.row_id + wave < num_rows;
-    const int  row_id      = rec.row_id + (slot_ok ? wave : 0);
-    int        batch_id    = rec.batch_id;
-    const int  chunk_start = rec.chunk_start;                 // absolute tile index
-    const int  tile_count  = rec.chunk_count;
-    const int  chunk_max   = rec._pad;                        // one-round schedules only, else 0
+    // The group's window is its union and alone sets the trip count (the barrier count); a row's
+    // own window only masks its stores. A wave past a short group runs with an empty window, so it
+    // stores nothing and the barrier count stays uniform.
+    mqa_work wk;
+    if (!mqa_assign<T::NUM_WAVES, T::KV_TILE_SIZE, false, SCHED, true>(k, lane, wk)) return;   // CTA-uniform
+    const bool slot_ok     = wave < wk.group_rows && wk.row_id + wave < num_rows;
+    const int  row_id      = wk.row_id + (slot_ok ? wave : 0);
+    int        batch_id    = wk.batch_id;
+    const int  chunk_start = wk.chunk_start;                  // absolute tile index
+    const int  tile_count  = wk.chunk_count;
+    const int  chunk_max   = SCHED == SCHED_PREFILL ? 0 : wk.chunk_max;   // 0: no priority
     pin_sgpr(batch_id);
 
     // ---- the tile's page: block table -> TDM into the LDS ring ----

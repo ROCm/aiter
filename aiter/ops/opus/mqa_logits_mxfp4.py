@@ -203,9 +203,10 @@ def _rule(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
     """
     decode = max_qlen <= _DECODE_MAX_QLEN
     if heads == 64:
-        # one-row CTAs for MTP-1 decode, four-row ones otherwise; no schedule-free mode yet
+        # one-row CTAs for MTP-1 decode, four-row ones otherwise
         rpc = 1 if max_qlen == 1 else 4
-        return {"rows_per_cta": rpc, "stages": 2, "scale_tdm": 1, "gather": 0}, None
+        want = {"rows_per_cta": rpc, "stages": 2, "scale_tdm": 1, "gather": 0}
+        return want, FREE if decode else PREFILL
     if heads == 32 and entry_rows >= _TILE:
         if max_qlen == 1:
             # decode without DSpark speculation: one row a sequence, so one row a CTA. ~1.5x R3W2,
