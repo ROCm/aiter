@@ -96,13 +96,9 @@ def _run_allreduce_case(rankID, tp_size, case_idx, shape, dtype, withGraph, grap
 def _run_all_gather_lastdim_add_case(
     rankID, tp_size, case_idx, shape, dtype, withGraph, graphs
 ):
-    """Run ``all_gather_lastdim_add`` on one ``[rows, n]`` shard per rank and
-    check it bit-exactly against ``cat(shards, -1) + add_b + add_c``.
-
-    The kernel rounds to ``dtype`` after each add, like the unfused sequence,
-    so the comparison uses ``atol=rtol=0``. Graph mode keeps the captured
-    graph alive in ``graphs`` for the same reason as the all-reduce sweep.
-    """
+    """Check ``all_gather_lastdim_add`` against ``cat(shards, -1) + add_b + add_c``
+    with atol=rtol=0: the kernel rounds to ``dtype`` after each add, like the
+    unfused sequence."""
     rows, n = shape
     gen = torch.Generator(device="cuda").manual_seed(case_idx)
     shards = [
