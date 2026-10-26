@@ -111,9 +111,3 @@ csrc/opus_gemm/gen_co/*/asm/
 
 # Merge-conflict backups, which git writes next to the file being merged.
 *.orig
-
-# Local-only MXFP4 tuner tests, kept out of the repo but runnable in a tree.
-/op_tests/tuning_tests/_mxfp4_test_process.py
-/op_tests/tuning_tests/test_mxfp4_tuner.py
-/op_tests/tuning_tests/test_mxfp4_staged.py
-/op_tests/tuning_tests/test_mxfp4_aot_configuration.py
