@@ -197,8 +197,9 @@ def _normalize_causal_window_size(
     # With causal masking, a right window >= 0 never masks anything the causal
     # mask doesn't already mask, so drop it. This lets causal sliding-window
     # callers that pass e.g. (left, 0) or (left, left) use the kernels that only
-    # support a left window.
-    if causal and int(window_size[1]) >= 0:
+    # support a left window. A zero left window is left as is: those kernels
+    # treat it as no window, so (0, 0) must keep failing there.
+    if causal and int(window_size[0]) != 0 and int(window_size[1]) >= 0:
         return (int(window_size[0]), -1)
     return window_size
 

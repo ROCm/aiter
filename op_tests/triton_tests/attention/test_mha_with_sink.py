@@ -592,6 +592,16 @@ def test_mha_sliding_window_no_sink(
     )
 
 
+def test_mha_causal_zero_left_window_raises():
+    # (0, 0) means diagonal-only attention, which the default kernel can't mask.
+    q, k, v = (
+        torch.randn((1, 128, 8, 64), device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    with pytest.raises(ValueError, match="window_size_right is not supported"):
+        flash_attn_func(q, k, v, causal=True, window_size=(0, 0))
+
+
 def test_mha_sliding_window_fused_backward_raises():
     q = torch.randn(
         (1, 128, 8, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True
