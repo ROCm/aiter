@@ -29,9 +29,9 @@ Sets (``--candidate-set``):
   (one-shot and mesh; the ring is never dispatched on xGMI).
 * ``fused``     -- the fused one-shot grid, unsplit and split.
 * ``fused_qr``  -- the fused mesh/ring grid.
-* ``fused_ll``  -- the low-latency mesh rows and the whole ``fused_qr`` grid,
-  timed together by ``tune.sh low-latency``. Not fitted: the fused fit cannot
-  emit a low-latency rung.
+* ``fused_ll``  -- the low-latency mesh rows, timed by ``tune.sh low-latency``
+  against the shipping fused mesh. Not fitted: the fused fit cannot emit a
+  low-latency rung.
 * ``smoke``     -- a handful of rows of each, for ``tune.sh --smoke``.
 """
 
@@ -217,7 +217,7 @@ def rows() -> list[dict]:
                             f"fused_fly_{algorithm}_a{apr}_st{st}_g{g}",
                             "ar_rmsnorm",
                             algorithm,
-                            ("fused_qr", "fused_ll"),
+                            ("fused_qr",),
                             super_tile=st,
                             grid_cap=g,
                             atoms_per_row=apr,

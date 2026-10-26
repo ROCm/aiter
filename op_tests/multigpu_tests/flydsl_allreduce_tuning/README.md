@@ -93,7 +93,7 @@ depend on which row geometries the kernels can build -- and checked in; edit the
 | `validate` | plain one-shot and mesh grids (the choices the shipped dispatcher has) | `validate` |
 | `fused` | fused one-shot: every legal block x grid cap, and every legal split x block x cap | `fused-sweep` (one-shot chunks) |
 | `fused_qr` | fused mesh/ring: atoms per row x super-tile x grid cap | `fused-sweep` (`qr_` chunks) |
-| `fused_ll` | the low-latency fused mesh (`fused_fly_mesh_ll_st1_g<cap>`) and every `fused_qr` row | `low-latency` |
+| `fused_ll` | the low-latency fused mesh (`fused_fly_mesh_ll_st1_g<cap>`) | `low-latency` |
 | `smoke` | a few rows of each | `--smoke` |
 
 A row is timed only where it builds exactly as named; elsewhere its cell is empty (n/a): a block or
@@ -324,21 +324,17 @@ super-tile 1, so a row is `hidden / 2048` atoms, which must divide a rank's `8 /
 hidden 2048 at TP8, 2048 and 4096 at TP4, 2048, 4096 and 8192 at TP2. The fused fit does not time it
 and cannot emit a low-latency rung, and the ladder loader accepts one on xGMI only.
 
-The command times, per (TP, width) that has the build, the `fused_ll` set -- the low-latency rows at
-grid caps up to 512 (two per CU; a cap above the device's is n/a) next to every `fused_qr` row -- into
-`out/<host>/low_latency/sweep/ll_tp<N>_w<H>.csv`, then writes `low_latency/compare.txt` (and
-`compare.csv`, tagged with arch and link, to put two hosts side by side). Per shape it reports, as
-speedups of the low-latency build (> 1: it is faster):
+The command times, per (TP, width) that has the build, the quick test's mesh only (`-a mesh`) with the
+`fused_ll` set -- the low-latency rows at grid caps up to 512 (two per CU; a cap above the device's is
+n/a) -- next to the shipping fused mesh, into `out/<host>/low_latency/sweep/ll_tp<N>_w<H>.csv`. It then
+writes `low_latency/compare.txt` (and `compare.csv`, tagged with arch and link, to put two hosts side
+by side). Per shape it reports the best low-latency cap, the shipping mesh and the kernel it ran,
+`mesh/ll` (> 1: the low-latency build is faster), and the shipping one-shot and HIP fused kernel in
+microseconds for context: where the one-shot is faster, the mesh does not dispatch.
 
-* `twin/ll`: against the same kernel without it (`mesh_a<hidden/2048>_st1`) -- the effect of the
-  build itself;
-* `best_qr/ll`: against the best of every other mesh/ring instance and the shipping engines -- what a
-  low-latency rung would gain over the best ladder the fit can build;
-* `mesh/ll`, and the shipping one-shot and HIP fused kernel in microseconds, for context: where the
-  one-shot is faster, no quantized schedule dispatches.
-
-The summary counts the shapes where `best_qr/ll` exceeds `1 + --min-gain` (default 3%). A
-low-latency column whose variant is not a `_low_lat` kernel is reported and left out.
+The summary counts the shapes where `mesh/ll` exceeds `1 + --min-gain` (default 3%), and where it
+falls below its inverse. A low-latency column whose variant is not a `_low_lat` kernel is reported and
+left out.
 
 ## Known pitfalls
 
@@ -361,7 +357,7 @@ fit_allreduce_policy.py     plain fit + --audit-auto
 shapes/                     plain sweep shape sets (M,K,label)
 fused/analyze_fused.py      per-shape summary of the fused sweep
 fused/fit_fused.py          fused ladders (one-shot, mesh, ring; default and per width), row width and window fit
-fused/compare_low_latency.py  the low-latency mesh build vs every other mesh/ring instance (tune.sh low-latency)
+fused/compare_low_latency.py  the low-latency mesh build vs the shipping fused mesh (tune.sh low-latency)
 fused/ladders_json.py       writes the fused ladder file (fused_allreduce_ladders.json) the fit emits
 fused/shapes/               fused sweep shape sets, one per hidden size
 out/                        sweep data, fits, logs (git-ignored; large)

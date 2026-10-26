@@ -24,8 +24,8 @@
 #   validate     re-sweep the shipping engines vs the pinned rows            -> $OUT/validate
 #   audit        grade the shipped dispatcher against the best pinned row    -> $OUT/audit
 #   report       reference bench tables: shipping engines vs stock kernels   -> $OUT/report
-#   low-latency  the low-latency fused mesh build vs every other fused mesh/ring
-#                instance, at each (TP, width) that has the build; sweep, then
+#   low-latency  the low-latency fused mesh build vs the shipping fused mesh,
+#                at each (TP, width) that has the build; sweep, then
 #                compare (not part of `all`)                    -> $OUT/low_latency/compare.txt
 #
 # Options (before the command):
@@ -372,9 +372,11 @@ cmd_low_latency() {
   [[ ${#pairs[@]} -gt 0 ]] || die "no low-latency build at tp=[$TPS] widths=[$LL_WIDTHS]"
   log "low-latency sweep: candidate set $LL_SET, (tp:width) = ${pairs[*]}"
   plan ${#pairs[@]}
+  # Only the low-latency rows and the shipping mesh (-a mesh): the ring and the
+  # rest of the mesh grid are the fused sweep's business.
   for p in "${pairs[@]}"; do
     tp=${p%:*}; h=${p#*:}
-    bench_chunk "ll_tp${tp}_w${h}" "$OUT/low_latency/sweep" "$QUICK" --operation ar_rmsnorm \
+    bench_chunk "ll_tp${tp}_w${h}" "$OUT/low_latency/sweep" "$QUICK" --operation ar_rmsnorm -a mesh \
       --tp "$tp" --shape-csv "$FUSED_SHAPES/fused_w${h}.csv" \
       --candidates "$CANDS" --candidate-set "$LL_SET"
   done
