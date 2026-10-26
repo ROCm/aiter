@@ -31,7 +31,11 @@ def make(M, N, G, dtype, device, *, runs=True, seed=0):
     shift = torch.randn(G, N, generator=gen, device=device, dtype=dtype)
     scale = torch.randn(G, N, generator=gen, device=device, dtype=dtype) * 0.1
     if runs:
-        edges = torch.linspace(0, M, G + 1).round().long()
+        edges = (
+            torch.linspace(0, M, G + 1, dtype=torch.float32, device=device)
+            .round()
+            .long()
+        )
         indices = torch.zeros(M, dtype=torch.int64, device=device)
         for g in range(G):
             indices[edges[g] : edges[g + 1]] = g
