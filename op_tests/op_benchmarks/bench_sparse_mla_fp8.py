@@ -5,9 +5,9 @@ import argparse
 import hashlib
 import json
 import math
-from pathlib import Path
 import statistics
 import sys
+from pathlib import Path
 
 import torch
 
@@ -116,7 +116,9 @@ def main():
     if args.tilelang:
         source = Path(tilelang_sparse_fwd.__code__.co_filename)
         config["tilelang_source"] = str(source)
-        config["tilelang_source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+        config["tilelang_source_sha256"] = hashlib.sha256(
+            source.read_bytes()
+        ).hexdigest()
     (args.output / "config.json").write_text(json.dumps(config, default=str, indent=2))
     slots = args.pool_bytes // 512
     kv = torch.empty((slots, 512), device="cuda", dtype=torch.float8_e4m3fn)
@@ -147,7 +149,7 @@ def main():
                     * args.capacity
                 )
 
-                def run_gluon():
+                def run_gluon(q=q, indptr=indptr, ids=ids):
                     return gluon(
                         q,
                         kv,
@@ -162,11 +164,13 @@ def main():
                     )[0]
 
                 calls = {
-                    "HIP": lambda: sparse_mla_fp8_fwd(q, kv, ids, 1 / 16)[0],
+                    "HIP": lambda q=q, ids=ids: sparse_mla_fp8_fwd(q, kv, ids, 1 / 16)[
+                        0
+                    ],
                     "Gluon": run_gluon,
                 }
                 if args.tilelang:
-                    calls["TileLang"] = lambda: tilelang_sparse_fwd(
+                    calls["TileLang"] = lambda q=q, ids=ids: tilelang_sparse_fwd(
                         q, kv.view(slots, 1, 512), ids.unsqueeze(1), 1 / 16
                     ).squeeze(0)
                 hip_out = calls["HIP"]()
@@ -189,14 +193,14 @@ def main():
                 if phase % 2:
                     calls = dict(reversed(list(calls.items())))
                 samples = measure(calls, args.graph_repetitions, args.samples)
-                row = dict(
-                    phase=phase,
-                    q=n,
-                    rrms=errors,
-                    gluon_block_m=tap.block_m,
-                    samples_us=samples,
-                    medians_us={k: statistics.median(v) for k, v in samples.items()},
-                )
+                row = {
+                    "phase": phase,
+                    "q": n,
+                    "rrms": errors,
+                    "gluon_block_m": tap.block_m,
+                    "samples_us": samples,
+                    "medians_us": {k: statistics.median(v) for k, v in samples.items()},
+                }
                 log.write(json.dumps(row) + "\n")
                 log.flush()
                 for k, v in row["medians_us"].items():
@@ -210,16 +214,16 @@ def main():
         hip, g = (statistics.median(medians[n][k]) for k in ["HIP", "Gluon"])
         kv_bytes = n * args.valid_k * 512
         qo_bytes = n * 2 * 64 * 512 * 2  # BF16 Q and BF16 O.
-        row = dict(
-            q=n,
-            hip_us=hip,
-            gluon_us=g,
-            speedup_pct=100 * (g / hip - 1),
-            logical_kv_tbps=kv_bytes / hip / 1e6,
-            logical_kv_qo_tbps=(kv_bytes + qo_bytes) / hip / 1e6,
-            gluon_logical_kv_tbps=kv_bytes / g / 1e6,
-            gluon_logical_kv_qo_tbps=(kv_bytes + qo_bytes) / g / 1e6,
-        )
+        row = {
+            "q": n,
+            "hip_us": hip,
+            "gluon_us": g,
+            "speedup_pct": 100 * (g / hip - 1),
+            "logical_kv_tbps": kv_bytes / hip / 1e6,
+            "logical_kv_qo_tbps": (kv_bytes + qo_bytes) / hip / 1e6,
+            "gluon_logical_kv_tbps": kv_bytes / g / 1e6,
+            "gluon_logical_kv_qo_tbps": (kv_bytes + qo_bytes) / g / 1e6,
+        }
         if args.tilelang:
             t = statistics.median(medians[n]["TileLang"])
             row.update(
@@ -229,21 +233,21 @@ def main():
                 tilelang_logical_kv_qo_tbps=(kv_bytes + qo_bytes) / t / 1e6,
             )
         rows.append(row)
-    result = dict(
-        rows=rows,
-        minimum_speedup_pct=min(r["speedup_pct"] for r in rows),
-        geometric_mean_speedup_pct=100
+    result = {
+        "rows": rows,
+        "minimum_speedup_pct": min(r["speedup_pct"] for r in rows),
+        "geometric_mean_speedup_pct": 100
         * (
             math.exp(
                 statistics.mean(math.log(r["gluon_us"] / r["hip_us"]) for r in rows)
             )
             - 1
         ),
-        numerical_checks_passed=True,
-        endpoint="BF16 Q to BF16 O",
-        kv_dtype="E4M3FN",
-        logical_bandwidth_is_hbm_traffic=False,
-    )
+        "numerical_checks_passed": True,
+        "endpoint": "BF16 Q to BF16 O",
+        "kv_dtype": "E4M3FN",
+        "logical_bandwidth_is_hbm_traffic": False,
+    }
     if args.tilelang:
         result.update(
             minimum_speedup_vs_tilelang_pct=min(

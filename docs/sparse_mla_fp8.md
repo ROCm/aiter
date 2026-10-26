@@ -52,10 +52,37 @@ as FP8 with decoding scale 1/256. There is one FP8 Q component and one QK
 computation. Accumulators, softmax and LSE are FP32; split partial O and final O
 are BF16.
 
-Numerical tests compare against independent FP64 attention on the quantized Q,
-with per-head relative RMS <=0.07 and elementwise atol/rtol=0.07. This measures
-implementation error for FP8 attention; it does not imply equivalence to BF16
-attention or establish model accuracy.
+Numerical coverage separates quantization error from a tighter arithmetic check:
+
+- General normal-distributed inputs are compared with independent ideal FP64
+  attention after Q encoding. Per-head relative RMS is at most 0.07, with
+  elementwise atol/rtol=0.07; this includes FP8 P and BF16 partial-store error.
+  LSE has a separate atol=5e-4, rtol=1e-5 gate, since P and partial O rounding
+  do not affect it.
+- A second independent Torch reference uses FP64 matmuls, explicit FP8 P
+  rounding at scale 1/256, and BF16 split-store rounding. Two seeds of dyadic
+  Q/KV inputs make QK sums exactly representable, avoiding amplification of
+  QK roundoff at discontinuous FP8 P rounding boundaries. Every row/head is
+  checked at dispatch boundaries through Q129, including compact Q8, with
+  full valid selections and tail-only selections at K=2112 and K=2176.
+  The gate is per-head relative RMS <=0.005, elementwise atol=0.002,
+  rtol=0.005, and LSE atol=1e-5, rtol=1e-6. A deliberately perturbed output
+  verifies that the gate rejects a 2% output error.
+
+The ideal FP64 checks cover all rows through Q129. Larger Q checks use 32
+stratified rows and both sides of each 2048-row boundary; the Q4096/8192/16384
+chunk-equivalence tests additionally check **every random-input row** against
+ideal FP64 attention in bounded batches. Chunk equivalence remains a separate
+consistency check. An analytic single-selected-slot test also checks every
+output element and LSE at those three large Q sizes, using row-dependent slots
+and valid positions throughout the tail, including the last capacity entry.
+Its output check is exact BF16 equality and does not call another HIP kernel
+as the oracle. Both padded and fully valid capacities are tested; graph replays
+include valid tails, masked tails, and all-invalid selections.
+
+These checks do not imply equivalence to BF16 attention or establish model
+accuracy. The previously reported 190 passes were local validation, not a
+successful GitHub GPU CI run.
 
 The operator uses the current HIP stream. Validation reads tensor metadata,
 not GPU values. Graph capture fixes the shape-dependent dispatch and replay

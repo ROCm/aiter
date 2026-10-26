@@ -9,8 +9,8 @@ are still required. It does not prove all assembly dependency hazards.
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 
 
 def audit(path):
@@ -74,12 +74,12 @@ def audit(path):
     modes = re.findall(r"\.amdhsa_float_denorm_mode_32\s+(\d+)", text)
     if not modes or any(mode != "3" for mode in modes):
         errors.append("FP32 denormals must be preserved")
-    return dict(
-        passed=not errors,
-        errors=errors,
-        kernels=kernels,
-        assembly_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-    )
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "kernels": kernels,
+        "assembly_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
 
 
 if __name__ == "__main__":
