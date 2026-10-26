@@ -501,6 +501,53 @@ def gemm_a8w8(shape, backend):
     return call, (x, w, x_scale, w_scale, y), None
 
 
+@kernel("GEMM-A8W8_PRESHUFFLED", bits=(8, 8))
+def gemm_a8w8_preshuffle(shape, backend):
+    import torch
+
+    from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle as gemm
+    from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+    from aiter.ops.triton.utils.types import get_fp8_dtypes
+    from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
+        generate_gemm_a8w8_inputs,
+    )
+
+    M, N, K = shape["M"], shape["N"], shape["K"]
+    _, fp8 = get_fp8_dtypes()
+    x, _, w, x_scale, w_scale, _, y = generate_gemm_a8w8_inputs(
+        M,
+        N,
+        K,
+        in_dtype=fp8,
+        out_dtype=torch.bfloat16,
+        layout="TN",
+        output=True,
+        shuffle=True,
+    )
+
+    def call(config, x, w, x_scale, w_scale, y):
+        if config is not None:
+            compute_splitk_params(
+                config, K
+            )  # mutates: derives SPLITK_BLOCK_SIZE, may shrink BK
+        return gemm(
+            x,
+            w,
+            x_scale,
+            w_scale,
+            bias=None,
+            dtype=torch.bfloat16,
+            y=y,
+            config=config,
+            backend=backend,
+        )
+
+    def should_skip(config):
+        return config["BLOCK_SIZE_N"] % 16 != 0 or config["BLOCK_SIZE_K"] % 32 != 0
+
+    return call, (x, w, x_scale, w_scale, y), should_skip
+
+
 @kernel(
     "GEMM-A8W8_BLOCKSCALE",
     bits=(8, 8),
