@@ -233,11 +233,13 @@ def mega_moe_ep_consts(
     # the pool uses the GEMM2 cshuffle (RG*TILE_N*4), which also fits GEMM1's.
     a_k_step = TILE_K if a8 else TILE_K // 2
     a_lds_size = RG * a_k_step
-    # The A pool is JUST the NAB-bank A-ring now (the cshuffle C-tile moved to its own
-    # L_C region for both GEMM1 and GEMM2, so L_A no longer needs RG*TILE_N f32 -- that
-    # aliasing was the pre-loader design).  Sizing it to the ring alone reclaims the
-    # (RG*TILE_N*4 - NAB*a_lds_size) bytes (~32 KB at MT4) for headroom.
-    lds_pool = NAB * a_lds_size
+    # The A pool is the A-ring. NW4's dedicated async loader uses the full NAB-bank ring;
+    # NW8's inline-A GEMMs only double-buffer (2 banks, _bank % 2 in gemm1_nw8 / gemm2_nw8),
+    # so size the pool to the banks ACTUALLY used. At NW8 this reclaims (NAB-2)*a_lds_size
+    # (~16 KB a4 / 32 KB a8), which drops a4w4 NW8 back under the 80 KB (2 CTA/CU) occupancy
+    # threshold (the TILE_N=512 cshuffle L_C had pushed it to 83.8 KB -> only 1 CTA/CU).
+    a_banks = 2 if NW == 8 else NAB
+    lds_pool = a_banks * a_lds_size
     c = {
         "RG": RG,
         "A_ROW": a_row,
