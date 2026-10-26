@@ -147,12 +147,10 @@ def _mla_gluon(
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
-    # REGIME_SEL: every program evaluates eff = sel_bs * max_b(L_b) and exits when
-    # eff >= sel_thresh, leaving the batch to a caller-provided alternative kernel.
-    # Program (0, 0, 0) publishes that kernel's kv_indptr (zeros when this kernel
-    # runs, so every alternative program early-exits) and the flag.
+    # REGIME_SEL: exit when sel_bs * max_b(L_b) >= sel_thresh, leaving the batch to
+    # the caller's alternative kernel. Program (0, 0, 0) publishes that kernel's
+    # kv_indptr (zeros when this kernel runs, so it early-exits) and the flag.
     if REGIME_SEL:
-        # The prologue reads per-batch lengths as kv_indptr deltas.
         gl.static_assert(
             USE_2D_VIEW == 0, "REGIME_SEL requires USE_2D_VIEW=False (kv_indptr)"
         )
