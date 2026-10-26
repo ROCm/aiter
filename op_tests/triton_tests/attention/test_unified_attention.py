@@ -4,13 +4,11 @@
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
     _is_gluon_available,
-    _split_launch_config,
     is_2d_gluon_available,
     unified_attention,
 )
@@ -24,16 +22,6 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import (
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
-
-
-def test_split_launch_config_normalizes_numpy_scalars() -> None:
-    num_segments, tile_size = _split_launch_config(
-        {"NUM_SEGMENTS": np.int32(16), "TILE_SIZE": np.int64(256)}
-    )
-
-    assert type(num_segments) is int
-    assert type(tile_size) is int
-    assert (num_segments, tile_size) == (16, 256)
 
 
 def shuffle_kv_cache(

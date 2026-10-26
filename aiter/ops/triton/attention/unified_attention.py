@@ -65,9 +65,10 @@ def _is_gluon_available():
 
 
 def _split_launch_config(config):
-    # Tuned CSV values can be numpy scalar integers. Gluon constexpr arguments
-    # must be native Python scalars; passing numpy.int32 fails during TTIR
-    # lowering once a runtime shape selects the 3D path.
+    # NUM_SEGMENTS inherits the caller's max_seqlen_k type when the context
+    # length bounds the split, so a numpy max_seqlen_k makes it a numpy scalar.
+    # Gluon constexpr arguments must be native Python scalars; numpy ones fail
+    # during TTIR lowering once a runtime shape selects the 3D path.
     return int(config["NUM_SEGMENTS"]), int(config["TILE_SIZE"])
 
 
