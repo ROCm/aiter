@@ -36,6 +36,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
 from aiter.ops.topk import _device_arch, _sampled_on_device, _sampled_supports_cached
 from aiter.ops.topk_select import (
     _available,
+    _choose,
     topk_select,
     topk_select_backend,
 )
@@ -1225,6 +1226,28 @@ def test_launcher_per_device():
     return failures
 
 
+def test_arch_decisions():
+    """The arch-specific choices take the arch they are given, which the
+    dispatch derives from the input's GPU: at k=2048 the streaming selector fits
+    gfx950's LDS and not gfx942's, and the whole-row shortcut is gfx950's."""
+    failures = []
+    if _device_arch(0) != "gfx950":
+        aiter.logger.info("arch decisions: device 0 is not gfx950, skipped")
+        return failures
+    n, k = 131072, 2048
+    for arch, served in (("gfx950", True), ("gfx942", False)):
+        if ("stream" in _available(n, k, 64, False, True, False, arch)) != served:
+            failures.append(f"stream at {n}x{k} on {arch}: expected {served}")
+        if ("whole_row" in _available(k, k, 64, False, True, False, arch)) != served:
+            failures.append(f"whole_row at {k}x{k} on {arch}: expected {served}")
+    got = _choose.__wrapped__(4096, k, k, k, 64, False, None, False, True, 0, True)
+    if got != "whole_row":
+        failures.append(f"4096x{k} k={k} on gfx950 chose {got}, not whole_row")
+    for label in failures:
+        aiter.logger.error("ARCH DECISIONS FAILED: %s", label)
+    return failures
+
+
 def test_invariants(m, n, k):
     """The properties a value comparison cannot see."""
     failures = []
@@ -1439,6 +1462,11 @@ def main():
         "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
     )
     assert not bad, f"launcher per device: {len(bad)} failed"
+    bad = test_arch_decisions()
+    aiter.logger.info(
+        "arch decisions: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"arch decisions: {len(bad)} failed"
     bad = test_full_rows_graphs()
     aiter.logger.info(
         "full-rows graphs: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
