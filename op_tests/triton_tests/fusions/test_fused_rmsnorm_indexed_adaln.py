@@ -297,3 +297,18 @@ def test_layernorm_rejects_mismatched_shapes():
         fused_layernorm_indexed_adaln(x, shift, scale, indices, weight=weight[:-1])
     with pytest.raises(AssertionError):
         fused_layernorm_indexed_adaln(x, shift, scale, indices, bias=weight[:-1])
+
+
+def test_rejects_strided_affine():
+    """A strided view has the right shape, but the kernel reads it with the
+    column offset alone, so it would take the wrong elements."""
+    dev = "cuda"
+    x, weight, shift, scale, indices, _ = make(32, 256, 3, torch.bfloat16, dev)
+    strided = weight.repeat(2)[::2]
+    assert strided.shape == weight.shape and not strided.is_contiguous()
+    with pytest.raises(AssertionError):
+        fused_rmsnorm_indexed_adaln(x, strided, shift, scale, indices)
+    with pytest.raises(AssertionError):
+        fused_layernorm_indexed_adaln(x, shift, scale, indices, weight=strided)
+    with pytest.raises(AssertionError):
+        fused_layernorm_indexed_adaln(x, shift, scale, indices, bias=strided)

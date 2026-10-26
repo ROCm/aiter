@@ -118,6 +118,8 @@ def _indexed_adaln(
         assert p is None or p.shape == (
             N,
         ), f"{name} must be [{N}], got {tuple(p.shape)}"
+        # The kernel indexes these with the column offset alone.
+        assert p is None or p.is_contiguous(), f"{name} must be contiguous"
     assert shift.shape == scale.shape, "shift and scale must have the same shape"
     assert (
         shift.ndim == 2 and shift.shape[1] == N
