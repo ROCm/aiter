@@ -105,9 +105,13 @@ def opus_mla_v4_prefill_a16w16_gfx1250_fwd(
     kv: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,  # [H] fp32
     out: torch.Tensor,
     softmax_scale: float,
+    num_splits: int = 1,
+    partial_o: torch.Tensor | None = None,  # [N, num_splits, H, 512] fp32
+    partial_max: torch.Tensor | None = None,  # [N, num_splits, H] fp32
+    partial_sum: torch.Tensor | None = None,  # [N, num_splits, H] fp32
 ) -> None: ...
 
 
@@ -145,9 +149,13 @@ def opus_mla_v4_prefill_a8w8_gfx1250_fwd(
     kv_rope: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,  # [H] fp32
     out: torch.Tensor,
     softmax_scale: float,
+    num_splits: int = 1,
+    partial_o: torch.Tensor | None = None,  # [N, num_splits, H, 512] fp32
+    partial_max: torch.Tensor | None = None,  # [N, num_splits, H] fp32
+    partial_sum: torch.Tensor | None = None,  # [N, num_splits, H] fp32
 ) -> None: ...
 
 

@@ -107,6 +107,8 @@ def _asm_sparse_prefill_v4(
     if gfx != "gfx1250":
         raise RuntimeError(f"mla_sparse_prefill_fp8_asm requires gfx1250, got {gfx}")
     require_gfx1250_asm("mla_sparse_prefill_fp8_asm")
+    if attn_sink is None:
+        raise RuntimeError("mla_sparse_prefill_fp8_asm requires attn_sink")
 
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(
@@ -237,11 +239,22 @@ def _opus_fwd(gfx: str, op_gfx950, op_gfx1250):
     )
 
 
-# Split-K (gfx950) cuts each token's keys over num_kv_splits workgroups and folds them in
-# a second launch. Auto picks the most splits (8, 4, 2) whose workgroups fit in cap x CUs
-# and that keep at least min_keys keys each. Keyed by the heads a workgroup covers; fit on
-# MI355X over topk 256-2048, N 8-768 and H 16-128 to lose nowhere.
-_KV_SPLIT_FIT = {16: (1.5, 192), 128: (0.75, 192), 64: (1.0, 384)}
+# Split-K cuts each token's keys over num_kv_splits workgroups and folds them in a second
+# launch. Auto picks the most splits (8, 4, 2) whose workgroups fit in cap x CUs and that
+# keep at least min_keys keys each. Keyed by arch and the heads a workgroup covers; fit
+# over topk 256-2048, N 8-768 and H 16-128 to lose nowhere, gfx950 on MI355X.
+_KV_SPLIT_FIT = {
+    ("gfx950", 16): (1.5, 192),
+    ("gfx950", 128): (0.75, 192),
+    ("gfx950", 64): (1.0, 384),
+}
+
+
+def _opus_heads_per_wg(gfx: str, h: int) -> int:
+    """Heads one workgroup of the v4 kernel that serves ``h`` covers."""
+    if gfx == "gfx1250":
+        return 16 if h <= 16 else 32 if h <= 32 else 64
+    return 16 if h <= 32 else 128
 
 
 def _kv_splits(
@@ -250,9 +263,10 @@ def _kv_splits(
     """The split count. Auto reads host scalars only (``nnz``: all tokens' rows, from the
     index tensors' sizes), so a captured graph's choice is its shape's."""
     if num_kv_splits is None:
-        if gfx != "gfx950" or n == 0:
+        fit = _KV_SPLIT_FIT.get((gfx, heads_per_wg))
+        if fit is None or n == 0:
             return 1
-        cap, min_keys = _KV_SPLIT_FIT[heads_per_wg]
+        cap, min_keys = fit
         wgs = n * -(-h // heads_per_wg)
         keys = nnz / n
         return next(
@@ -266,13 +280,11 @@ def _kv_splits(
     if num_kv_splits not in (1, 2, 4, 8):
         # ValueError, a caller's error; RuntimeError would read as a missing kernel.
         raise ValueError(f"num_kv_splits must be 1, 2, 4 or 8, got {num_kv_splits}")
-    if num_kv_splits > 1 and gfx != "gfx950":
-        raise RuntimeError(f"num_kv_splits > 1 runs on gfx950, got {gfx}")
     return num_kv_splits
 
 
 def _split_args(n: int, num_kv_splits: int, h: int, device) -> tuple:
-    """The gfx950 kernels' trailing split-K arguments, none without split-K: num_splits,
+    """The opus kernels' trailing split-K arguments, none without split-K: num_splits,
     partial_o [N, S, H, 512], partial_max and partial_sum [N, S, H], fp32."""
     if num_kv_splits == 1:
         return ()
@@ -330,7 +342,7 @@ def _opus_sparse_prefill(
 
     n, h, _ = q.shape
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, 16 if h <= 32 else 128, nnz)
+    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, _opus_heads_per_wg(gfx, h), nnz)
     fwd(
         q,
         unified_kv,
@@ -403,7 +415,7 @@ def _opus_sparse_prefill_v4(
         attn_sink,
     )
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, 16 if h <= 32 else 128, nnz)
+    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, _opus_heads_per_wg(gfx, h), nnz)
     fwd(
         *args,
         out,
@@ -535,13 +547,13 @@ def mla_sparse_prefill(
         concatenated per token.
       kv_indptr_extend:  ``[T+1]`` int32 CSR row pointers.
       attn_sink:         ``[H]`` fp32 per-head softmax-denom bias, or ``None``
-        for no sink (gfx950).
+        for no sink.
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, D]`` output (``q``'s dtype);
         allocated if ``None``.
       num_kv_splits:     split each token's keys over this many workgroups and
-        fold them in a second launch: 1, or 2, 4, 8 on gfx950. ``None`` picks it
-        from the token and head counts.
+        fold them in a second launch: 1, 2, 4 or 8. ``None`` picks it from the
+        token and head counts.
       backend:           ``"opus"`` or ``None``.
 
     Returns:
@@ -621,7 +633,7 @@ def mla_sparse_prefill_v4(
         sources, concatenated per token.
       kv_indptr_extend:  ``[T+1]`` int32 CSR row pointers.
       attn_sink:         ``[H]`` fp32 per-head softmax-denom bias, or ``None``
-        for no sink (gfx950).
+        for no sink (opus; ``None`` makes the default backend opus).
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, 512]`` bf16 output; allocated if ``None``.
       num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only).
@@ -654,6 +666,7 @@ def mla_sparse_prefill_v4(
     if (
         backend is None
         and unsplit
+        and attn_sink is not None
         and get_gfx_runtime() == "gfx1250"
         and q_nope.size(1) == _ASM_HEADS
     ):

@@ -14,7 +14,7 @@ struct opus_mla_v4_prefill_kargs
     const void* __restrict__ q_ptr;          // [N, H, D]
     const void* __restrict__ unified_kv_ptr; // [total_pages, D], prefix source
     const void* __restrict__ kv_ptr;         // [total_tokens, D], extend source
-    const void* __restrict__ attn_sink_ptr;  // [H], softmax denominator sink, may be nullptr on gfx950
+    const void* __restrict__ attn_sink_ptr;  // [H], softmax denominator sink, may be nullptr
     void* __restrict__ out_ptr;              // [N, H, D]
     const int* __restrict__ kv_indptr_prefix;  // [N+1]
     const int* __restrict__ kv_indices_prefix; // [nnz_prefix]
@@ -40,7 +40,7 @@ struct opus_mla_v4_prefill_fp8_kargs
     const void* __restrict__ unified_kv_rope_ptr; // [total_pages, D_ROPE]        bf16
     const void* __restrict__ kv_nope_ptr;         // [total_tokens, D_NOPE_PADDED] fp8
     const void* __restrict__ kv_rope_ptr;         // [total_tokens, D_ROPE]        bf16
-    const void* __restrict__ attn_sink_ptr;       // [H], may be nullptr on gfx950
+    const void* __restrict__ attn_sink_ptr;       // [H], may be nullptr
     void* __restrict__ out_ptr;                   // [N, H, D_HEAD] bf16
     const int* __restrict__ kv_indptr_prefix;     // [N+1]
     const int* __restrict__ kv_indices_prefix;    // [nnz_prefix]

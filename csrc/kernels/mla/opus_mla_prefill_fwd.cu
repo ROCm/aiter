@@ -533,6 +533,23 @@ OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_kv_nope_page, 1
 OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, stride_kv_rope_page, 140);
 OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_v4_prefill_fp8_kargs, softmax_scale, 144);
 
+static_assert(sizeof(opus_mla_prefill_split_args) == 32,
+              "opus_mla_prefill_split_args resized; rebuild the gfx1250 code objects");
+OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_args, partial_o, 0);
+OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_args, partial_max, 8);
+OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_args, partial_sum, 16);
+OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_args, num_splits, 24);
+
+static_assert(sizeof(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>) == 144,
+              "opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs> resized; rebuild the "
+              "gfx1250 code objects");
+OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>, split, 112);
+
+static_assert(sizeof(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>) == 184,
+              "opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs> resized; rebuild the "
+              "gfx1250 code objects");
+OPUS_MLA_V4_GFX1250_CO_ABI(opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>, split, 152);
+
 #undef OPUS_MLA_V4_GFX1250_CO_ABI
 
 namespace {
@@ -555,7 +572,8 @@ constexpr int kGfx1250DNopePadded = 512;
 constexpr int kGfx1250DRope       = 64;
 constexpr int kGfx1250DHead       = 512;
 
-// Each symbol name is its code object's file stem plus an optional `_cyN` and `_kernel`.
+// Each symbol name is its code object's file stem plus an optional `_cyN`, `_split` for split-K,
+// and `_kernel`.
 constexpr const char* kGfx1250A16W16Co =
     "mla_opus/opus_mla_v4_prefill_a16w16_16mx4_64nx1.co";
 constexpr const char* kGfx1250A16W16Co16mx1 =
@@ -590,6 +608,72 @@ int gfx1250_pick_cluster_y(int num_h_blocks)
     return 1;
 }
 
+// Launches `<name>[_split]_kernel` of `co` over grid (N, grid_y, num_splits).
+template <class Kargs>
+void gfx1250_launch(const std::string& name,
+                    const char* co,
+                    const Kargs& kargs,
+                    const opus_mla_prefill_split_args& split,
+                    int grid_y,
+                    int cluster_y,
+                    hipStream_t stream)
+{
+    static SynchronizedCache<std::string, PrebuiltKernel> kernels;
+    const bool split_k     = split.num_splits > 1;
+    const std::string sym  = name + (split_k ? "_split_kernel" : "_kernel");
+    PrebuiltKernel& impl   = kernels.get_or_create(sym, [&] { return PrebuiltKernel(sym.c_str(), co); });
+    auto launch = [&](auto args) {
+        size_t arg_size = sizeof(args);
+        impl.launch_kernel({&args,
+                            &arg_size,
+                            kargs.N,
+                            grid_y,
+                            split.num_splits,
+                            kGfx1250BlockSize,
+                            1,
+                            1,
+                            stream,
+                            1,
+                            cluster_y,
+                            1});
+    };
+    if(split_k)
+        launch(opus_mla_prefill_split_kargs<Kargs>{kargs, split});
+    else
+        launch(kargs);
+}
+
+// 16mx1_16nx4 for H <= 16, 32mx1_16nx4 for H <= 32, else the clustered 16mx4_64nx1.
+template <class Kargs>
+void gfx1250_dispatch(const char* co_16mx1,
+                      const char* co_32mx1,
+                      const char* co_16mx4,
+                      const Kargs& kargs,
+                      const opus_mla_prefill_split_args& split,
+                      hipStream_t stream)
+{
+    auto stem = [](const char* co) {
+        std::string s(co);
+        return s.substr(s.rfind('/') + 1, s.size() - s.rfind('/') - 4);
+    };
+    const int H = kargs.H;
+    if(H <= kGfx1250Heads16mx1)
+        return gfx1250_launch(
+            stem(co_16mx1), co_16mx1, kargs, split, ceil_div(H, kGfx1250Heads16mx1), 1, stream);
+    if(H <= kGfx1250Heads32mx1)
+        return gfx1250_launch(
+            stem(co_32mx1), co_32mx1, kargs, split, ceil_div(H, kGfx1250Heads32mx1), 1, stream);
+    const int num_h_blocks = ceil_div(H, kGfx1250HeadsPerBlk);
+    const int cluster_y    = gfx1250_pick_cluster_y(num_h_blocks);
+    gfx1250_launch(stem(co_16mx4) + "_cy" + std::to_string(cluster_y),
+                   co_16mx4,
+                   kargs,
+                   split,
+                   num_h_blocks,
+                   cluster_y,
+                   stream);
+}
+
 } // namespace
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
@@ -601,12 +685,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* kv,
      aiter_tensor_t* kv_indices_extend,
      aiter_tensor_t* kv_indptr_extend,
-     aiter_tensor_t* attn_sink,
+     aiter_tensor_t* attn_sink, // [H] fp32 (nullable)
      aiter_tensor_t* out,
      float softmax_scale,
+     int num_splits,
+     aiter_tensor_t* partial_o,   // [N, num_splits, H, 512] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_max, // [N, num_splits, H] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_sum, // [N, num_splits, H] fp32 (nullable if num_splits 1)
      hipStream_t stream),
     (q, unified_kv, kv_indices_prefix, kv_indptr_prefix, kv, kv_indices_extend,
-     kv_indptr_extend, attn_sink, out, softmax_scale, stream))
+     kv_indptr_extend, attn_sink, out, softmax_scale, num_splits, partial_o, partial_max,
+     partial_sum, stream))
 {
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q->dim() == 3, "q must be 3-D [N, H, D], got ndim=", q->dim());
@@ -615,7 +704,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 unified_kv->dim());
     AITER_CHECK(kv->dim() == 2, "kv must be 2-D [total_tokens, D], got ndim=", kv->dim());
     AITER_CHECK(out->dim() == 3, "out must be 3-D [N, H, D], got ndim=", out->dim());
-    AITER_CHECK(attn_sink->dim() == 1, "attn_sink must be 1-D [H]");
 
     AITER_CHECK(q->dtype() == kv->dtype() && q->dtype() == unified_kv->dtype() &&
                     q->dtype() == out->dtype(),
@@ -623,7 +711,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // Only the bf16 traits are instantiated in the gfx1250 code object.
     AITER_CHECK(q->dtype() == AITER_DTYPE_bf16,
                 "the gfx1250 code object only provides the bf16 variant");
-    AITER_CHECK(attn_sink->dtype() == AITER_DTYPE_fp32, "attn_sink must be fp32");
 
     AITER_CHECK(kv_indptr_prefix->dtype() == AITER_DTYPE_i32, "kv_indptr_prefix must be int32");
     AITER_CHECK(kv_indices_prefix->dtype() == AITER_DTYPE_i32, "kv_indices_prefix must be int32");
@@ -638,7 +725,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(kv->size(1) == D, "kv last dim must equal q last dim (D=512)");
     AITER_CHECK(out->size(0) == N && out->size(1) == H && out->size(2) == D,
                 "out shape must match q [N, H, D]");
-    AITER_CHECK(attn_sink->size(0) == H, "attn_sink length must equal H");
+    if(attn_sink)
+        AITER_CHECK(attn_sink->dim() == 1 && attn_sink->size(0) == H &&
+                        attn_sink->dtype() == AITER_DTYPE_fp32 && attn_sink->is_contiguous(),
+                    "attn_sink must be a contiguous fp32 [H]");
     AITER_CHECK(kv_indptr_prefix->size(0) == N + 1, "kv_indptr_prefix length must be N+1");
     AITER_CHECK(kv_indptr_extend->size(0) == N + 1, "kv_indptr_extend length must be N+1");
 
@@ -646,9 +736,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     out->stride(2) == 1,
                 "Q/UnifiedKV/KV/O must be contiguous along the head-dim D");
     AITER_CHECK(kv_indices_prefix->is_contiguous() && kv_indptr_prefix->is_contiguous() &&
-                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous() &&
-                    attn_sink->is_contiguous(),
-                "kv_indices/kv_indptr (prefix+extend) and attn_sink must be contiguous");
+                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous(),
+                "kv_indices/kv_indptr (prefix+extend) must be contiguous");
+    const opus_mla_prefill_split_args split =
+        opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
 
     if(N == 0)
         return;
@@ -658,7 +749,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.q_ptr             = q->data_ptr();
     args.unified_kv_ptr    = unified_kv->data_ptr();
     args.kv_ptr            = kv->data_ptr();
-    args.attn_sink_ptr     = attn_sink->data_ptr();
+    args.attn_sink_ptr     = attn_sink ? attn_sink->data_ptr() : nullptr;
     args.out_ptr           = out->data_ptr();
     args.kv_indptr_prefix  = reinterpret_cast<const int*>(kv_indptr_prefix->data_ptr());
     args.kv_indices_prefix = reinterpret_cast<const int*>(kv_indices_prefix->data_ptr());
@@ -678,59 +769,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
-
-    size_t arg_size = sizeof(args);
-
-    // 16mx1_16nx4 for H <= 16, 32mx1_16nx4 for H <= 32, else the clustered 16mx4_64nx1.
-    if(H <= kGfx1250Heads16mx1)
-    {
-        static PrebuiltKernel impl("opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel",
-                                   kGfx1250A16W16Co16mx1);
-        impl.launch_kernel({&args,
-                            &arg_size,
-                            N,
-                            ceil_div(H, kGfx1250Heads16mx1),
-                            1,
-                            kGfx1250BlockSize,
-                            1,
-                            1,
-                            stream});
-        return;
-    }
-
-    if(H <= kGfx1250Heads32mx1)
-    {
-        static PrebuiltKernel impl("opus_mla_v4_prefill_a16w16_32mx1_16nx4_kernel",
-                                   kGfx1250A16W16Co32mx1);
-        impl.launch_kernel({&args,
-                            &arg_size,
-                            N,
-                            ceil_div(H, kGfx1250Heads32mx1),
-                            1,
-                            kGfx1250BlockSize,
-                            1,
-                            1,
-                            stream});
-        return;
-    }
-
-    const int num_h_blocks = ceil_div(H, kGfx1250HeadsPerBlk);
-    const int cluster_y    = gfx1250_pick_cluster_y(num_h_blocks);
-
-    if(cluster_y == 2)
-    {
-        static PrebuiltKernel impl("opus_mla_v4_prefill_a16w16_16mx4_64nx1_cy2_kernel",
-                                   kGfx1250A16W16Co);
-        impl.launch_kernel(
-            {&args, &arg_size, N, num_h_blocks, 1, kGfx1250BlockSize, 1, 1, stream, 1, 2, 1});
-    }
-    else
-    {
-        static PrebuiltKernel impl("opus_mla_v4_prefill_a16w16_16mx4_64nx1_cy1_kernel",
-                                   kGfx1250A16W16Co);
-        impl.launch_kernel(
-            {&args, &arg_size, N, num_h_blocks, 1, kGfx1250BlockSize, 1, 1, stream});
-    }
+    gfx1250_dispatch(
+        kGfx1250A16W16Co16mx1, kGfx1250A16W16Co32mx1, kGfx1250A16W16Co, args, split, stream);
+    if(num_splits > 1)
+        opus_mla_prefill_split_reduce<__hip_bfloat16>(split, args.attn_sink_ptr, out, N, H, stream);
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
@@ -745,13 +787,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* kv_rope,
      aiter_tensor_t* kv_indices_extend,
      aiter_tensor_t* kv_indptr_extend,
-     aiter_tensor_t* attn_sink,
+     aiter_tensor_t* attn_sink, // [H] fp32 (nullable)
      aiter_tensor_t* out,
      float softmax_scale,
+     int num_splits,
+     aiter_tensor_t* partial_o,   // [N, num_splits, H, 512] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_max, // [N, num_splits, H] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_sum, // [N, num_splits, H] fp32 (nullable if num_splits 1)
      hipStream_t stream),
     (q_nope, q_rope, unified_kv_nope, unified_kv_rope, kv_indices_prefix, kv_indptr_prefix,
      kv_nope, kv_rope, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale,
-     stream))
+     num_splits, partial_o, partial_max, partial_sum, stream))
 {
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q_nope->dim() == 3, "q_nope must be 3-D [N, H, 512], got ndim=", q_nope->dim());
@@ -769,7 +815,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 "kv_rope must be 2-D [total_tokens, 64], got ndim=",
                 kv_rope->dim());
     AITER_CHECK(out->dim() == 3, "out must be 3-D [N, H, 512], got ndim=", out->dim());
-    AITER_CHECK(attn_sink->dim() == 1, "attn_sink must be 1-D [H]");
 
     AITER_CHECK(q_nope->dtype() == AITER_DTYPE_fp8 && unified_kv_nope->dtype() == AITER_DTYPE_fp8 &&
                     kv_nope->dtype() == AITER_DTYPE_fp8,
@@ -778,7 +823,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     kv_rope->dtype() == AITER_DTYPE_bf16,
                 "q_rope/unified_kv_rope/kv_rope must be bf16");
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, "out must be bf16");
-    AITER_CHECK(attn_sink->dtype() == AITER_DTYPE_fp32, "attn_sink must be fp32");
 
     AITER_CHECK(kv_indptr_prefix->dtype() == AITER_DTYPE_i32, "kv_indptr_prefix must be int32");
     AITER_CHECK(kv_indices_prefix->dtype() == AITER_DTYPE_i32, "kv_indices_prefix must be int32");
@@ -803,7 +847,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 "kv_nope and kv_rope must share total_tokens");
     AITER_CHECK(out->size(0) == N && out->size(1) == H && out->size(2) == kGfx1250DHead,
                 "out shape must be [N, H, 512]");
-    AITER_CHECK(attn_sink->size(0) == H, "attn_sink length must equal H");
+    if(attn_sink)
+        AITER_CHECK(attn_sink->dim() == 1 && attn_sink->size(0) == H &&
+                        attn_sink->dtype() == AITER_DTYPE_fp32 && attn_sink->is_contiguous(),
+                    "attn_sink must be a contiguous fp32 [H]");
     AITER_CHECK(kv_indptr_prefix->size(0) == N + 1, "kv_indptr_prefix length must be N+1");
     AITER_CHECK(kv_indptr_extend->size(0) == N + 1, "kv_indptr_extend length must be N+1");
 
@@ -818,9 +865,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(out->stride(2) == 1, "out must be contiguous along the head-dim");
 
     AITER_CHECK(kv_indices_prefix->is_contiguous() && kv_indptr_prefix->is_contiguous() &&
-                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous() &&
-                    attn_sink->is_contiguous(),
-                "kv_indices/kv_indptr (prefix+extend) and attn_sink must be contiguous");
+                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous(),
+                "kv_indices/kv_indptr (prefix+extend) must be contiguous");
+    const opus_mla_prefill_split_args split =
+        opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
 
     if(N == 0)
         return;
@@ -840,7 +888,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.unified_kv_rope_ptr = unified_kv_rope->data_ptr();
     args.kv_nope_ptr         = kv_nope->data_ptr();
     args.kv_rope_ptr         = kv_rope->data_ptr();
-    args.attn_sink_ptr       = attn_sink->data_ptr();
+    args.attn_sink_ptr       = attn_sink ? attn_sink->data_ptr() : nullptr;
     args.out_ptr             = out->data_ptr();
     args.kv_indptr_prefix    = reinterpret_cast<const int*>(kv_indptr_prefix->data_ptr());
     args.kv_indices_prefix   = reinterpret_cast<const int*>(kv_indices_prefix->data_ptr());
@@ -862,59 +910,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q_nope->device_id);
-
-    size_t arg_size = sizeof(args);
-
-    // 16mx1_16nx4 for H <= 16, 32mx1_16nx4 for H <= 32, else the clustered 16mx4_64nx1.
-    if(H <= kGfx1250Heads16mx1)
-    {
-        static PrebuiltKernel impl("opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel",
-                                   kGfx1250A8W8Co16mx1);
-        impl.launch_kernel({&args,
-                            &arg_size,
-                            N,
-                            ceil_div(H, kGfx1250Heads16mx1),
-                            1,
-                            kGfx1250BlockSize,
-                            1,
-                            1,
-                            stream});
-        return;
-    }
-
-    if(H <= kGfx1250Heads32mx1)
-    {
-        static PrebuiltKernel impl("opus_mla_v4_prefill_a8w8_32mx1_16nx4_kernel",
-                                   kGfx1250A8W8Co32mx1);
-        impl.launch_kernel({&args,
-                            &arg_size,
-                            N,
-                            ceil_div(H, kGfx1250Heads32mx1),
-                            1,
-                            kGfx1250BlockSize,
-                            1,
-                            1,
-                            stream});
-        return;
-    }
-
-    const int num_h_blocks = ceil_div(H, kGfx1250HeadsPerBlk);
-    const int cluster_y    = gfx1250_pick_cluster_y(num_h_blocks);
-
-    if(cluster_y == 2)
-    {
-        static PrebuiltKernel impl("opus_mla_v4_prefill_a8w8_16mx4_64nx1_cy2_kernel",
-                                   kGfx1250A8W8Co);
-        impl.launch_kernel(
-            {&args, &arg_size, N, num_h_blocks, 1, kGfx1250BlockSize, 1, 1, stream, 1, 2, 1});
-    }
-    else
-    {
-        static PrebuiltKernel impl("opus_mla_v4_prefill_a8w8_16mx4_64nx1_cy1_kernel",
-                                   kGfx1250A8W8Co);
-        impl.launch_kernel(
-            {&args, &arg_size, N, num_h_blocks, 1, kGfx1250BlockSize, 1, 1, stream});
-    }
+    gfx1250_dispatch(kGfx1250A8W8Co16mx1, kGfx1250A8W8Co32mx1, kGfx1250A8W8Co, args, split, stream);
+    if(num_splits > 1)
+        opus_mla_prefill_split_reduce<__hip_bfloat16>(split, args.attn_sink_ptr, out, N, H, stream);
 }
 
 // ============================================================================
