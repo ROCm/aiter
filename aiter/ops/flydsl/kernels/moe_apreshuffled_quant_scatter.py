@@ -28,7 +28,7 @@ from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 # Each K1024 slice contains four K256 blocks. Padding and the K32 swizzle
 # distribute vector payload accesses and scale transposes across LDS banks.
 _M_TILE_ROWS = 16
-_K_TILE_SIZE = 7168
+_MAX_K_TILE_SIZE = 16384
 _K_SLICE_SIZE = 1024
 _K256_SIZE = 256
 _MX_BLOCK_SIZE = 32
@@ -36,7 +36,6 @@ _DWORD_BYTES = 4
 _FP4_VALUES_PER_BYTE = 2
 _PAYLOAD_VECTOR_BYTES = 16
 _PAYLOAD_VECTOR_DWORDS = _PAYLOAD_VECTOR_BYTES // _DWORD_BYTES
-_K_SLICES_PER_TILE = _K_TILE_SIZE // _K_SLICE_SIZE
 _K256_PER_SLICE = _K_SLICE_SIZE // _K256_SIZE
 _K32_PER_K256 = _K256_SIZE // _MX_BLOCK_SIZE
 _ROWS_PER_SWIZZLE_GROUP = 4
@@ -51,22 +50,13 @@ _SCALE_LDS_ROW_DWORDS = _SCALE_DWORDS_PER_SLICE_ROW + 1
 _SCALE_LDS_SLICE_DWORDS = _M_TILE_ROWS * _SCALE_LDS_ROW_DWORDS
 
 
-@fx.struct
-class _PayloadLdsK7168:
-    """Seven K1024 payload slices, loaded asynchronously before one barrier."""
-
-    payload: fx.Array[
-        fx.Int32, _K_SLICES_PER_TILE * _PAYLOAD_LDS_SLICE_DWORDS, _PAYLOAD_VECTOR_BYTES
-    ]
-
-
-@fx.struct
-class _ScaleLdsK7168:
-    """Seven padded scale slices for the full K7168 row."""
-
-    scale: fx.Array[
-        fx.Int32, _K_SLICES_PER_TILE * _SCALE_LDS_SLICE_DWORDS, _PAYLOAD_VECTOR_BYTES
-    ]
+def validate_apre_k(feat_dim: int) -> None:
+    """Require complete K1024 slices that fit the full-row LDS specialization."""
+    if not 0 < feat_dim <= _MAX_K_TILE_SIZE or feat_dim % _K_SLICE_SIZE:
+        raise ValueError(
+            "A-preshuffle requires K divisible by "
+            f"{_K_SLICE_SIZE} with 0 < K <= {_MAX_K_TILE_SIZE}, got K={feat_dim}"
+        )
 
 
 def build_moe_apre_quant_module(
@@ -76,7 +66,7 @@ def build_moe_apre_quant_module(
     """Build a BF16-to-MXFP4 quantizer that writes compact source rows.
 
     Args:
-        feat_dim: Logical feature count K, divisible by 256.
+        feat_dim: Logical feature count K, a multiple of 1024 up to 16384.
         wmma_rep: GEMM scale-layout repetition factor.
 
     Returns:
@@ -84,14 +74,13 @@ def build_moe_apre_quant_module(
         token and workgroup counts, and an optional stream.
 
     Raises:
-        ValueError: K is not divisible by 256.
+        ValueError: K is outside the supported range or not divisible by 1024.
         NotImplementedError: The target lacks gfx1250 pk8 or wave32 support.
     """
+    validate_apre_k(feat_dim)
     quant_layout = route_quant._quant_layout(feat_dim, "fp4", wmma_rep)
     if not quant_layout.use_pk8 or quant_layout.lanes_per_mx_block != 4:
         raise NotImplementedError("A-preshuffle quant requires gfx1250 pk8")
-    if feat_dim % 256:
-        raise ValueError("A-preshuffle quant requires K divisible by 256")
     if quant_layout.wave_size != 32:
         raise NotImplementedError("A-preshuffle quant requires wave32")
 
@@ -233,15 +222,15 @@ def build_moe_apre_scatter_module(
 ) -> Callable:
     """Scatter compact MXFP4 rows into M16 A-preshuffled payload and scales.
 
-    Each 16-wave workgroup gathers one M16 x K7168 tile through padded LDS.
-    Seven K1024 slices are loaded asynchronously before one data-ready barrier.
+    Each 16-wave workgroup gathers one M16 x K tile through padded LDS.
+    All K1024 slices are loaded asynchronously before one data-ready barrier.
     Ordinary LDS reads and buffer stores write the A-preshuffled output.
     LDS is never reused; there is no persistent loop or cross-tile prefetch.
     Each wave ballots the same M16 row map, so early quit needs no TG barrier.
     Eight waves write scales; all 16 waves transfer payloads.
 
     Args:
-        feat_dim: Logical feature count K; this specialization requires 7168.
+        feat_dim: Logical feature count K, a multiple of 1024 up to 16384.
         wmma_rep: Number of M16 tiles grouped in the output scale layout.
         src_scale_stride_bytes: Input scale row stride, including transport
             padding. Zero selects the compact stride K / 32.
@@ -252,14 +241,14 @@ def build_moe_apre_scatter_module(
         Negative map entries are padding; fully empty M16 tiles are untouched.
 
     Raises:
-        ValueError: K is not 7168, or the input scale stride is invalid.
+        ValueError: K is outside the supported range, not divisible by 1024,
+            or the input scale stride is invalid.
         NotImplementedError: The target lacks gfx1250 pk8 or wave32 support.
     """
+    validate_apre_k(feat_dim)
     quant_layout = route_quant._quant_layout(feat_dim, "fp4", wmma_rep)
     if not quant_layout.use_pk8 or quant_layout.lanes_per_mx_block != 4:
         raise NotImplementedError("A-preshuffle scatter requires gfx1250 pk8")
-    if feat_dim != _K_TILE_SIZE:
-        raise ValueError(f"A-preshuffle async scatter requires K={_K_TILE_SIZE}")
 
     wave_size = quant_layout.wave_size
     if wave_size != 32:
@@ -280,9 +269,19 @@ def build_moe_apre_scatter_module(
     payload_slice_row_dwords = payload_dwords_per_row // num_k_slices
     output_k256_dwords = _M_TILE_ROWS * _PAYLOAD_K256_ROW_DWORDS
     output_k32_dwords = _M_TILE_ROWS * _PAYLOAD_VECTOR_DWORDS
+
+    @fx.struct
+    class ScatterLds:
+        payload: fx.Array[
+            fx.Int32, num_k_slices * _PAYLOAD_LDS_SLICE_DWORDS, _PAYLOAD_VECTOR_BYTES
+        ]
+        scale: fx.Array[
+            fx.Int32, num_k_slices * _SCALE_LDS_SLICE_DWORDS, _PAYLOAD_VECTOR_BYTES
+        ]
+
     module_name = (
         f"moe_apre_scatter_fd{feat_dim}_r{wmma_rep}_fp4_pk8"
-        f"_w{_M_TILE_ROWS}_tk{_K_TILE_SIZE}"
+        f"_w{_M_TILE_ROWS}_tk{feat_dim}"
     )
     if src_scale_stride_bytes != quant_layout.mx_blocks_per_row:
         module_name += f"_ss{src_scale_stride_bytes}"
@@ -307,11 +306,10 @@ def build_moe_apre_scatter_module(
         lane_id = thread_id - wave_id * fx.Uint32(wave_size)
 
         shared_allocator = fx.SharedAllocator()
-        payload_storage = shared_allocator.allocate(_PayloadLdsK7168).peek()
-        scale_storage = shared_allocator.allocate(_ScaleLdsK7168).peek()
-        payload_lds = payload_storage.payload.ptr
+        storage = shared_allocator.allocate(ScatterLds).peek()
+        payload_lds = storage.payload.ptr
         payload_lds_base_bytes = fx.Index(fx.ptrtoint(payload_lds))
-        scale_lds = scale_storage.scale.ptr
+        scale_lds = storage.scale.ptr
         output_payload_resource = buffer_ops.create_buffer_resource_from_addr(
             fx.Int64(ptrtoint(grouped_payload)),
             num_records_bytes=route_quant._SCALE_RSRC_MAX_BYTES,
@@ -486,7 +484,7 @@ def build_moe_apre_scatter_module(
                     )
                     rocdl.global_load_async_to_lds_b32(gptr, lptr, 0)
 
-        # Each TG owns one M16 x K7168 tile. LDS is written once and never reused.
+        # Each TG owns one M16 x K tile. LDS is written once and never reused.
         m16_tile_id = block_id
         # Every wave reads the same M16 map. The second lane half repeats the
         # first half's addresses, so all 32 lanes can load without an OOB mask.

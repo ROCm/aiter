@@ -3340,6 +3340,7 @@ def flydsl_moe_fused_quant_preshuffle(
     Returns (payload, scale). Pass masked_m to skip padding rows. When
     payload_preshuffled is true, FP4 payload bytes follow the logical
     (M/16, K/128, 4, 16, 32) layout; each final 32-element span is 16 bytes.
+    This mode requires logical K divisible by 1024, with 0 < K <= 16384.
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
@@ -3348,8 +3349,6 @@ def flydsl_moe_fused_quant_preshuffle(
         )
     if payload_preshuffled and row_major_scale:
         raise ValueError("A-preshuffled payload requires M16K4 scales")
-    if payload_preshuffled and (quant_mode != "fp4" or grouped_in.shape[-1] % 128):
-        raise ValueError("preshuffled payload requires MXFP4 with K divisible by 128")
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
     # row on the wire: nothing left to convert, only scatter + preshuffle.
     prequantized = prequantized_scale is not None
@@ -3388,6 +3387,14 @@ def flydsl_moe_fused_quant_preshuffle(
     feat_dim = grouped_in.shape[-1]
     if prequantized and quant_mode == "fp4":
         feat_dim *= 2
+    if payload_preshuffled:
+        from aiter.ops.flydsl.kernels.moe_apreshuffled_quant_scatter import (
+            validate_apre_k,
+        )
+
+        if quant_mode != "fp4":
+            raise ValueError("A-preshuffled payload requires MXFP4")
+        validate_apre_k(feat_dim)
     rows_per_tile = wmma_rep * 16
     assert (
         max_m % rows_per_tile == 0
@@ -3523,7 +3530,6 @@ def flydsl_moe_fused_quant_preshuffle(
         use_prequantized_apre_scatter = (
             prequantized
             and row_to_token is not None
-            and feat_dim % 1024 == 0
             and not remap_rows
             and not fuse_ep_psum
         )

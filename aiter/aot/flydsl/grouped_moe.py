@@ -126,6 +126,8 @@ def parse_csv(csv_path: str):
                 "tile_k": _TILE_K,
                 "m_warp": m_warp,
                 "n_warp": n_warp,
+                "tile_m2": _as_int(row.get("tile_m2"), tile_m),
+                "m_warp2": _as_int(row.get("m_warp2"), m_warp),
                 "num_buffers": int(row.get("num_buffers") or 2),
                 "split_k1": int(row.get("split_k1") or 1),
                 "split_k2": int(row.get("split_k2") or 1),
@@ -137,6 +139,7 @@ def parse_csv(csv_path: str):
                 "data_format": (
                     "fp4" if "float4" in row.get("q_dtype_a", "") else "a8w4"
                 ),
+                "a_preshuffle": _as_bool(row.get("a_preshuffle")),
                 "gfx": row.get("gfx", ""),
             }
             for job in _scheduler_variants(row, base_job):
@@ -157,6 +160,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     import torch
 
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_remap_ep_module,
         build_moe_contiguous_psum_remap_module,
     )
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
@@ -185,10 +189,14 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     tile_m = job["tile_m"]
     token_num = max(1, job["token_num"])
     out_dtype = job["out_dtype"]
-    numel = token_num * topk
+    payload_preshuffled = quant_mode == "fp4" and job.get("a_preshuffle", False)
+    wmma_rep2 = job.get("tile_m2", tile_m) // job.get("m_warp2", job["m_warp"]) // 16
+    # EP CSV rows use topk=-1 as a lookup wildcard. Route counts are runtime
+    # scalars; use a positive placeholder for compile-only launches.
+    numel = token_num * max(1, topk)
     grid = max(1, (numel + 255) // 256)
 
-    def _route_ksplit(feat_dim, source_topk, out_e, out_m):
+    def _route_ksplit(feat_dim, source_topk, out_e, out_m, *, wmma_rep=wmma_rep):
         # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never
         # sets remap_rows on the grouped MoE fast path (row_starts stays None).
         # Precompile both ksplit=True (small token) and ksplit=False (large token).
@@ -200,6 +208,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 source_topk=source_topk,
                 remap_rows=False,
                 ksplit=ks,
+                payload_preshuffled=payload_preshuffled,
             )
             launch(
                 ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
@@ -229,12 +238,13 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 stream=0,
             )
 
-    def _plain_preshuffle(feat_dim, out_e, out_m, skip_padding):
+    def _plain_preshuffle(feat_dim, out_e, out_m, skip_padding, *, wmma_rep=wmma_rep):
         launch = build_moe_fused_quant_preshuffle_module(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
             skip_padding=skip_padding,
+            payload_preshuffled=payload_preshuffled,
         )
         n_rows = out_e * out_m
         launch(
@@ -260,11 +270,45 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             stream=0,
         )
 
+    def _apre_stage1(out_e, out_m):
+        from aiter.ops.flydsl.kernels.moe_apreshuffled_quant_scatter import (
+            build_moe_apre_quant_module,
+            build_moe_apre_scatter_module,
+        )
+
+        # These launchers have runtime token/workgroup counts, so the same
+        # artifacts cover BF16 input and already-quantized EP receive buffers.
+        build_moe_apre_quant_module(model_dim, wmma_rep)(
+            ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            token_num,
+            grid,
+            stream=0,
+        )
+        # Compact quant output and the 128-byte-aligned transport scale row
+        # have different scatter identities (224 vs 256 bytes for K=7168).
+        scale_bytes = model_dim // 32
+        for scale_stride in sorted({scale_bytes, _align_up(scale_bytes, 128)}):
+            build_moe_apre_scatter_module(
+                model_dim, wmma_rep, src_scale_stride_bytes=scale_stride
+            )(
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                token_num,
+                out_e * out_m,
+                grid,
+                stream=0,
+            )
+
     # --- Stage1 activation prep (a1): fused route + MX-quant + scatter ---
     if contiguous:
         # DeepGEMM contiguous-M: topids_to_rows -> contiguous psum+remap ->
         # route-indexed quant+preshuffle into a single contiguous (E=1) buffer.
-        ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
+        ub = numel + int(E) * (int(tile_m) - 1)
         contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
 
         _topids_to_rows()
@@ -281,21 +325,50 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             max_m,
             tile_m,
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),  # row_to_token (null)
+            max(1, topk),  # EP CSV topk=-1 is a lookup sentinel, not a divisor.
             stream=0,
         )
 
-        _route_ksplit(
-            feat_dim=model_dim,
-            source_topk=topk,
-            out_e=1,
-            out_m=contiguous_m,
-        )
+        if payload_preshuffled:
+            # EP scatter-combine uses the sibling remapper; the inverse-map
+            # pointer and topk are runtime arguments, not specialization keys.
+            build_moe_contiguous_psum_remap_ep_module()(
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                E,
+                max_m,
+                tile_m,
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                max(1, topk),
+                token_num,
+                token_num * max(1, topk),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),  # row_to_token
+                stream=0,
+            )
+            _apre_stage1(1, contiguous_m)
+        else:
+            _route_ksplit(
+                feat_dim=model_dim,
+                source_topk=topk,
+                out_e=1,
+                out_m=contiguous_m,
+            )
         a2_out_e, a2_out_m = 1, contiguous_m
     else:
         # Dense masked layout (one (E, max_m, *) bucket per expert).
         use_routeks_stage1 = token_num > 1 and topk > 1 and quant_mode == "fp4"
         use_st_ksplit = token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0
-        if use_routeks_stage1:
+        if payload_preshuffled:
+            _topids_to_rows()
+            _apre_stage1(E, max_m)
+        elif use_routeks_stage1:
             _topids_to_rows()
             _route_ksplit(
                 feat_dim=model_dim,
@@ -343,14 +416,21 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     # (almost always), taking the route-ksplit path with source_topk=0; the
     # plain skip-padding path is the rare capacity-overflow fallback.
     capacity_rows = a2_out_e * a2_out_m
+    if payload_preshuffled:
+        # Runtime's separate stage2 quantizer has no route map, even when
+        # stage1 has one. Cover it in addition to the route-indexed variant.
+        _plain_preshuffle(
+            inter_dim, a2_out_e, a2_out_m, not contiguous, wmma_rep=wmma_rep2
+        )
     if numel < capacity_rows:
         _route_ksplit(
             feat_dim=inter_dim,
             source_topk=0,
             out_e=a2_out_e,
             out_m=a2_out_m,
+            wmma_rep=wmma_rep2,
         )
-    else:
+    elif not payload_preshuffled:
         # masked_m is None on the contiguous path -> skip_padding=False;
         # passed on the dense path -> skip_padding=True.
         _plain_preshuffle(
@@ -358,6 +438,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             out_e=a2_out_e,
             out_m=a2_out_m,
             skip_padding=not contiguous,
+            wmma_rep=wmma_rep2,
         )
 
     # --- Epilogue: token-order gather-reduce (bf16/f16 fast path only) ---
