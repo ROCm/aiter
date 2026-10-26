@@ -157,9 +157,8 @@ fx.copy(copy, fx.slice(tA, (None, tid)), rA)   # after partitioning tA (§7b: pr
 - gfx1250 TDM uses a different atom — `fx.rocdl.cdna5.make_tiled_tdm_atom` +
   `fx.rocdl.cdna5.tdm_partition` (raw VA, not a buffer resource). A site still on
   `fx.rocdl.make_tdm_atom` is one to migrate: its `tensor_extents=` and `strides=`
-  move into the global view's layout, its `imm_offset=` becomes the coordinate
-  tensor's i32 tile index, and `tdm_ops.tensor_wait(n)` becomes
-  `rocdl.s_wait_tensorcnt(n)`. Leave it alone only for the gather/scatter family
+  move into the global view's layout, and its `imm_offset=` becomes the coordinate
+  tensor's i32 tile index. Leave it alone only for the gather/scatter family
   (`make_tensor_gather_descriptor` / `tensor_load_gather`, per-row addresses) or a
   tile whose innermost dimension spans under 16 bytes per warp.
 - A scalar-base + per-thread-offset load with no layout form may stay on

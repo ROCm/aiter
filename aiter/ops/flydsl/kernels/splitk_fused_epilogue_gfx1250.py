@@ -100,7 +100,7 @@ def emit_fused_splitk_epilogue(
         store, fx.rocdl.wave_id(), fx.make_layout(block // 32, 1), lds_box, out_blk
     )
     fx.copy(store, tOs[None, 0], tOg[None, 0])
-    fx.rocdl.s_wait_tensorcnt(0)
+    fx.rocdl.tdm_ops.tensor_wait(0)
     cluster.cluster_barrier()
 
     output_base = (
@@ -254,4 +254,4 @@ def emit_fused_splitk_epilogue(
             out_blk2,
         )
         fx.copy(store_atom, tO2s[None, 0], tO2g[None, 0])
-        fx.rocdl.s_wait_tensorcnt(0)
+        fx.rocdl.tdm_ops.tensor_wait(0)

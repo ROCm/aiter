@@ -635,7 +635,7 @@ lds_box = fx.Tensor(fx.make_view(lds.ptr, fx.make_layout((tile, PIPE),
                                                          ((LDS_ROW, 1), PITCH))))
 ts, tg = fx.rocdl.cdna5.tdm_partition(atom, wave, fx.make_layout(4, 1), lds_box, blk)
 fx.copy(atom, tg[None, k_tile_i32], ts[None, stage])       # Global -> LDS
-fx.rocdl.s_wait_tensorcnt(0)                               # await async DMA
+fx.rocdl.tdm_ops.tensor_wait(0)                                  # await async DMA
 ```
 
 The older `fx.rocdl.make_tdm_atom` + `fx.copy_atom_call` + `advance_tdm_atom`

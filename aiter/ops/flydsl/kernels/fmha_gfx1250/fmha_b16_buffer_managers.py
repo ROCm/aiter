@@ -353,18 +353,20 @@ def _tdm_load_views(
     pad_elems,
     lds_base,
     elem_dtype,
-    num_warps=_DEFAULT_NUM_WAVES,
+    num_warps=1,
 ):
     """Build a LIST of ``(atom, g_view, lds_view)`` TDM global->LDS copies for one
     ``[num_rows, hdim]`` tile into row-major padded LDS -- PURE (no memory op); issue each with
-    ``fx.copy(*view)``, then drain with ``s_wait_tensorcnt(0)``.
+    ``fx.copy(*view)``, then drain with ``tensor_wait(0)``.
 
     One copy per ``_pow2_segments`` column segment ``(c0, w)``, carrying ``pad_interval=w`` and
     ``pad_amount=(hdim + pad_elems - w)`` so the LDS row still advances by the padded stride.
-    The per-row extent ``valid`` is what gives HW OOB zero-fill. ``num_warps`` waves split the
-    tile by rows and the lowering takes the share from ``wave_id % num_warps``, so waves 4..7
-    issuing a ``num_warps=4`` copy cover the same tile as waves 0..3. Strides in ELEMENTS.
+    The per-row extent ``valid`` is what gives HW OOB zero-fill. Only ``num_warps=1`` is
+    supported: ``tdm_partition`` maps the warp coordinate through ``make_layout(num_warps, 1)``
+    and does not wrap it, so a wave id at or above ``num_warps`` would address a tile outside
+    its own share. Strides in ELEMENTS.
     """
+    assert num_warps == 1, "_tdm_load_views only supports num_warps=1"
     row_elems = hdim + pad_elems
     off = fx.Int64(row0) * fx.Int64(stride_seq) + fx.Int64(head) * fx.Int64(stride_head)
     base_iter = fx.get_iter(ptr_x)
@@ -397,7 +399,7 @@ def _tdm_load_views(
         )
         ts, tg = fx.rocdl.cdna5.tdm_partition(
             atom,
-            fx.rocdl.wave_id() if num_warps > 1 else 0,
+            0,
             fx.make_layout(num_warps, 1),
             lds_view,
             blk,
