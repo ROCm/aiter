@@ -221,7 +221,7 @@ an arch that runs the GQA decode kernel needs the `v1_w_dot` entry.
 | | `split_max_partitions` | Largest number of partitions for one sequence. |
 | | `split_max_programs` | A grid with this many programs or more is not split. |
 | | `split_short_seq`, `split_short_min_programs` | A sequence shorter than the first value on a grid with at least the second value is not split. |
-| `launch.<v1_w_dot or v2_w_dot>` | `BLK_LEQ_<x>`, `any` | `num_warps`, `num_stages` and `waves_per_eu` for page sizes up to `<x>`, else `any`. |
+| `launch.<v1_w_dot, v2_w_dot, v1_wo_dot or v2_wo_dot>` | `BLK_LEQ_<x>`, `any` | `num_warps`, `num_stages` and `waves_per_eu` for page sizes up to `<x>`, else `any`. `w_dot` kernels run GQA, `wo_dot` kernels run MHA. |
 
 - A `split_*` key is optional. Without `split_target_programs` the kernel does
   not split.

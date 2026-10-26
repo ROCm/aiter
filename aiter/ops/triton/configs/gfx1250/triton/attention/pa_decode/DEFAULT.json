@@ -26,11 +26,19 @@
     "launch": {
         "v1_w_dot": {
             "BLK_LEQ_16": {"num_warps": 4, "num_stages": 2, "waves_per_eu": 3},
-            "any": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 3}
+            "any": {"num_warps": 2, "num_stages": 2, "waves_per_eu": 1}
         },
         "v2_w_dot": {
             "BLK_LEQ_16": {"num_warps": 4, "num_stages": 2, "waves_per_eu": 0},
             "any": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 2}
+        },
+        "v1_wo_dot": {
+            "BLK_LEQ_16": {"num_warps": 4},
+            "any": {"num_warps": 32, "num_stages": 1}
+        },
+        "v2_wo_dot": {
+            "BLK_LEQ_16": {"num_warps": 4},
+            "any": {"num_warps": 32, "num_stages": 1}
         }
     }
 }

@@ -248,6 +248,7 @@ def paged_attn_decode_v1(
     # MHA- Multi-Head Attention
     if query_grp_sz == 1:
         grid = (num_q_heads, num_seqs, 1)
+        launch = _get_launch_config("v1_wo_dot", kv_blk_sz) or {}
         _paged_attn_decode_v1_wo_dot_kernel[grid](
             output,
             query,
@@ -273,6 +274,7 @@ def paged_attn_decode_v1(
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
+            **launch,
         )
     # GQA - Grouped Query Attention
     else:
@@ -371,6 +373,7 @@ def paged_attn_decode_v2(
         tmp_output = torch.empty(
             (*shape_info, head_sz), dtype=output.dtype, device=output.device
         )
+        launch = _get_launch_config("v2_wo_dot", kv_blk_sz) or {}
         _paged_attn_decode_v2_wo_dot_kernel[grid](
             exp_sums,
             max_logits,
@@ -403,6 +406,7 @@ def paged_attn_decode_v2(
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            **launch,
         )
         grid = (num_q_heads, num_seqs, 1)
         _paged_attn_decode_v2_wo_dot_reduce_kernel[grid](

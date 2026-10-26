@@ -6,5 +6,10 @@
         "fp16": {
             "v1_min_programs": 256
         }
+    },
+    "launch": {
+        "v1_w_dot": {
+            "any": {"num_warps": 4, "num_stages": 1, "waves_per_eu": 3}
+        }
     }
 }
