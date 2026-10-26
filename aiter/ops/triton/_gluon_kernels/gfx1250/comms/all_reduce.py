@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-
 """All-reduce of bf16 data over 4 GPUs. A sender writes a chunk of x into the inbox
 of each peer as 16-byte lines [word, call, word, call]. A receiver waits until its
 lines carry the current call number, then adds the 4 chunks. Even and odd calls
