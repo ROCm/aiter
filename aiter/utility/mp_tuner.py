@@ -149,7 +149,12 @@ def worker(
             res, us = run_perftest(func, *args, **kwargs)
             retry_count += 1
         if us == 0:
-            print(f"Warning: try run {max_retries} times, but still get 0!")
+            print(
+                f"Warning: try run {max_retries} times, but still get 0! "
+                "Marking the measurement as failed."
+            )
+            us = -1
+            max_err_ratio = 1.0
         torch.cuda.synchronize()
         if us == -1 or res is None:
             return info, us, round(max_err_ratio, 4)

@@ -19,6 +19,7 @@ import sys
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
+from unittest.mock import patch
 
 
 def _wait_for_release(release, value):
@@ -413,6 +414,26 @@ class TestTaskWorkerExit(unittest.TestCase):
         finally:
             pool.terminate()
             pool.join()
+
+
+class TestZeroTiming(unittest.TestCase):
+
+    def test_zero_after_retries_is_marked_failed(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        measured_result = object()
+
+        with (
+            patch(
+                "aiter.test_common.run_perftest",
+                return_value=(measured_result, 0),
+            ) as run_perftest,
+            patch.object(tuner.torch.cuda, "set_device"),
+            patch.object(tuner.torch.cuda, "synchronize"),
+        ):
+            result = tuner.worker(0, "candidate", lambda: None, [], {})
+
+        self.assertEqual(run_perftest.call_count, 4)
+        self.assertEqual(result, ("candidate", -1, 1.0))
 
 
 class TestWorkerErrorRatio(unittest.TestCase):

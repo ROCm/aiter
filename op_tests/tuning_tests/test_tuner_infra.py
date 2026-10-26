@@ -253,19 +253,77 @@ class TestPostProcess(unittest.TestCase):
         self.assertEqual(float(resultdf.iloc[0]["us"]), 8.0)
 
     def test_filters_invalid_and_inf_times(self):
-        """us=-1 (error) and us=inf (timeout) should be excluded."""
+        """Non-positive and non-finite measurements should be excluded."""
         tuner = _StubTuner.get()
         args = self._make_args()
         rets = [
             self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, -1, err=0.0),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 1, 0, 0, err=0.0),
             self._make_result(
-                (TEST_GFX, 304, 1, 1024, 512), 1, 0, float("inf"), err=0.0
+                (TEST_GFX, 304, 1, 1024, 512), 2, 0, float("inf"), err=0.0
             ),
-            self._make_result((TEST_GFX, 304, 1, 1024, 512), 2, 0, 7.0, err=0.01),
+            self._make_result(
+                (TEST_GFX, 304, 1, 1024, 512), 3, 0, float("nan"), err=0.0
+            ),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 4, 0, 7.0, err=0.01),
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
         self.assertEqual(len(resultdf), 1)
         self.assertEqual(float(resultdf.iloc[0]["us"]), 7.0)
+
+    def test_all_zero_measurements_produce_failed_fallback(self):
+        tuner = _StubTuner.get()
+        args = self._make_args()
+        shape = (TEST_GFX, 304, 1, 1024, 512)
+        rets = [
+            self._make_result(shape, 0, 0, 0, err=0.0),
+            self._make_result(shape, 1, 0, 0, err=0.0),
+        ]
+
+        resultdf = tuner.post_process(rets, args, topk=1)
+
+        self.assertEqual(len(resultdf), 1)
+        self.assertEqual(float(resultdf.iloc[0]["us"]), tuner.INVALID_TIME)
+        self.assertEqual(float(resultdf.iloc[0]["errRatio"]), 1.0)
+
+    def test_zero_measurement_does_not_overwrite_tuned_config(self):
+        tuner = _StubTuner.get()
+        old = pd.DataFrame(
+            [
+                {
+                    "gfx": TEST_GFX,
+                    "cu_num": 304,
+                    "M": 1,
+                    "N": 1024,
+                    "K": 512,
+                    "kernelId": 7,
+                    "splitK": 0,
+                    "us": 12.5,
+                    "kernelName": "existing",
+                    "tflops": 1.0,
+                    "bw": 1.0,
+                    "errRatio": 0.0,
+                }
+            ],
+            columns=tuner.columns,
+        )
+        zero = old.copy()
+        zero.loc[0, ["kernelId", "us", "kernelName"]] = [8, 0.0, "zero"]
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+            path = f.name
+        try:
+            old.to_csv(path, index=False)
+            tuner.result_to_csv(zero, path)
+            written = pd.read_csv(path)
+
+            self.assertEqual(len(written), 1)
+            self.assertEqual(int(written.iloc[0]["kernelId"]), 7)
+            self.assertEqual(float(written.iloc[0]["us"]), 12.5)
+            self.assertEqual(len(tuner.failed), 1)
+            self.assertEqual(float(tuner.failed.iloc[0]["us"]), 0.0)
+        finally:
+            os.unlink(path)
 
     def test_topk_not_leak_across_shapes(self):
         """BUG REGRESSION: topk must not leak between shapes.
