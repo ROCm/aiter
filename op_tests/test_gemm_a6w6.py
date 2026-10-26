@@ -197,6 +197,10 @@ def test_direct_scale_dmabig_matches_current_fallback_bitwise(
 
 
 def test_manifest_excludes_shape_guarded_kernels_from_incompatible_sweeps():
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("A6W6 manifest ships only for gfx950")
     small = _manifest_kernel_names(257, 513, 129)
     assert not any("f6gemm_bf16_per1x32Fp6_m9472_" in name for name in small)
     square = _manifest_kernel_names(9450, 5120, 5120)
