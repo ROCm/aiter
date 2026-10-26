@@ -724,9 +724,7 @@ class opus_gemm_codegen:
             return sorted(
                 (kid, k.name)
                 for kid, k in kernels_dict.items()
-                if kid.family == family
-                and kid.gfx == arch
-                and ctype in k.output_dtypes
+                if kid.family == family and kid.gfx == arch and ctype in k.output_dtypes
             )
 
         def _emit_map(f, macro_name, rows, ctype):
@@ -1310,9 +1308,7 @@ if __name__ == "__main__":
                         family = "a8w8_blockscale" if scale_ab else "a8w8"
                     else:
                         family = args.family or "a8w8_blockscale_bpreshuffle"
-                key = KernelKey(
-                    family, str(row["gfx"]), int(row["cu_num"]), int(value)
-                )
+                key = KernelKey(family, str(row["gfx"]), int(row["cu_num"]), int(value))
             except (ValueError, KeyError, TypeError, OverflowError):
                 continue
             if (key.gfx, key.cu_num) not in targets or (
@@ -1332,7 +1328,9 @@ if __name__ == "__main__":
     sidecar_keys = set()
     try:
         document = json.loads(Path(sidecar_path).read_text())
-        if isinstance(document, list) and all(isinstance(value, str) for value in document):
+        if isinstance(document, list) and all(
+            isinstance(value, str) for value in document
+        ):
             sidecar_keys = {KernelKey.decode(value) for value in document}
     except (OSError, ValueError, TypeError, KeyError):
         pass
@@ -1372,4 +1370,6 @@ if __name__ == "__main__":
     codegen = opus_gemm_codegen(args.working_path, args.tune)
     codegen.gen_instances({key: available[key] for key in sorted(selected)})
     Path(sidecar_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(sidecar_path).write_text(json.dumps(sorted(key.encode() for key in selected)) + "\n")
+    Path(sidecar_path).write_text(
+        json.dumps(sorted(key.encode() for key in selected)) + "\n"
+    )

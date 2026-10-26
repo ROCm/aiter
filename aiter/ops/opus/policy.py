@@ -82,9 +82,7 @@ def _load_a16w16_opus_tuned() -> dict:
         try:
             kid = parse_integer(row["solidx"], name="saved kernel id")
             cu_num = parse_integer(row["cu_num"], name="saved CU count", minimum=1)
-            instance = get_kernel_instance(
-                row["gfx"], "a16w16", kid, cu_num=cu_num
-            )
+            instance = get_kernel_instance(row["gfx"], "a16w16", kid, cu_num=cu_num)
             name = str(row.get("kernelName", ""))
             if instance is None or (
                 name not in ("", "nan", "None") and name != instance.name
@@ -648,15 +646,16 @@ def _load_mxscale_bmm_tuned(
                 df.at[index, "cu_num"], name="saved CU count", minimum=1
             )
             arch = str(df.at[index, "gfx"]).lower().split(":", 1)[0]
-            instance = get_kernel_instance(
-                arch, "a8w8_mxscale_bmm", kid, cu_num=cu_num
-            )
+            instance = get_kernel_instance(arch, "a8w8_mxscale_bmm", kid, cu_num=cu_num)
             name = str(df.at[index, "kernelName"]) if "kernelName" in df else ""
             if instance is None or (
                 name not in ("", "nan", "None") and name != instance.name
             ):
                 raise ValueError("saved kernel symbol disagrees with the catalog")
-            if f"{instance.GROUP_N}x{instance.GROUP_K}" != df.at[index, "w_scale_block"]:
+            if (
+                f"{instance.GROUP_N}x{instance.GROUP_K}"
+                != df.at[index, "w_scale_block"]
+            ):
                 raise ValueError("kid and weight-scale block disagree")
             split_k = _parse_mxscale_bmm_tuned_split_k(df.at[index, "splitK"])
             batch, m, n, k = (
@@ -905,7 +904,9 @@ def mxscale_bmm_kid_takes_b_layout(
 def mxscale_bmm_kid_takes_plain_scales(kid: int, *, gfx=None, cu_num=None) -> bool:
     """True iff kid reads x_scale / w_scale as the public entry passes them."""
     entry = _mxscale_bmm_entry(kid, gfx, cu_num)
-    return entry is not None and not (entry.needs_mpacked_sfa or entry.needs_shuffle_scale)
+    return entry is not None and not (
+        entry.needs_mpacked_sfa or entry.needs_shuffle_scale
+    )
 
 
 def mxscale_bmm_kid_group(kid: int, *, gfx=None, cu_num=None) -> int | None:
@@ -950,7 +951,12 @@ def resolve_a8w8_mxscale_bmm_plan(
         try:
             kid = int(config["kernelId"])
             entry = _mxscale_bmm_entry(kid, gfx, cu_num)
-            if entry is None or entry.needs_preshuffled_b or entry.needs_mpacked_sfa or entry.needs_shuffle_scale:
+            if (
+                entry is None
+                or entry.needs_preshuffled_b
+                or entry.needs_mpacked_sfa
+                or entry.needs_shuffle_scale
+            ):
                 raise ValueError(
                     f"kid {kid} wants a preshuffled B or host-rearranged scales"
                 )

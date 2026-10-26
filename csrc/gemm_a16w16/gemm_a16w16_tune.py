@@ -988,12 +988,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
             if with_hipblaslt and ("all" in libtype or "hipblaslt" in libtype):
                 hipblaslt_rets.extend(self._run_hipblaslt(ds, args))
 
-        if opus_kids and _opus_ensure_kids_compiled is not None:
-            if _opus_ensure_kids_compiled(opus_kids):
-                logger.info(
-                    f"opus subset-compile: prepared module for "
-                    f"{len(opus_kids)} candidate kids"
-                )
+        if (
+            opus_kids
+            and _opus_ensure_kids_compiled is not None
+            and _opus_ensure_kids_compiled(opus_kids)
+        ):
+            logger.info(
+                f"opus subset-compile: prepared module for "
+                f"{len(opus_kids)} candidate kids"
+            )
 
         ret = []
         if task:

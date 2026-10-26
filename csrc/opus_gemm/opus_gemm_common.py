@@ -6,7 +6,6 @@ import os
 import sys
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
@@ -584,8 +583,6 @@ _BMM_M_ALIGN_TILES = {
 
 # GROUP_N=GROUP_K=32 counterparts use the base local kid plus this stride.
 MX32_KID_STRIDE = 1000
-
-
 
 
 def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, cachectl_a=0, cachectl_b=17):
@@ -2954,8 +2951,11 @@ def parse_integer(value, *, name, minimum=0):
 
 def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
     kid = min(
-        (kid for kid, instance in get_registry(family, gfx, cu_num).items()
-         if instance.name == name),
+        (
+            kid
+            for kid, instance in get_registry(family, gfx, cu_num).items()
+            if instance.name == name
+        ),
         default=None,
     )
     if kid is None:
@@ -2997,6 +2997,7 @@ def group_kids(name, gfx, family="a16w16", *, cu_num):
         for kid, instance in get_registry(family, gfx, cu_num).items()
         if _in_group(name, family, instance)
     )
+
 
 BMM_MXSCALE_WORKSPACE_TAGS = frozenset(
     {
@@ -3193,7 +3194,6 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         "a8w8_blockscale_bpreshuffle": frozenset(),
     },
 }
-
 
 
 def canonical_output_dtype(output_dtype) -> str | None:

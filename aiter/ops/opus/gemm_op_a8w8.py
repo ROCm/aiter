@@ -364,7 +364,8 @@ def _launch_a8w8_mxscale_bmm(
     if instance is None:
         if any(tensor.dim() != 3 for tensor in (XQ, WQ, Y, x_scale, w_scale)):
             raise ValueError(
-                "opus_bmm A8W8 mxscale expects batch-first 3D " "XQ/WQ/Y/x_scale/w_scale"
+                "opus_bmm A8W8 mxscale expects batch-first 3D "
+                "XQ/WQ/Y/x_scale/w_scale"
             )
         if XQ.dtype not in _FP8_DTYPES or WQ.dtype != XQ.dtype:
             raise ValueError(
