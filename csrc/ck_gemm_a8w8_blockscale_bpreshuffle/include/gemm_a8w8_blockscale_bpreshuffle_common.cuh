@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <numeric>
 
 #include <ATen/ATen.h>
@@ -135,12 +136,17 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tenso
     int StrideA = XQ.stride(-2);
     int StrideB = WQ.stride(-2);
     // A size-1 dim may carry any stride, so a single row is laid out as if contiguous.
-    int StrideE = M > 1 ? Y.stride(-2) : N;
-    TORCH_CHECK(StrideE >= N,
+    int64_t row_stride = M > 1 ? Y.stride(-2) : N;
+    TORCH_CHECK(row_stride >= N,
                 "CK blockscale bpreshuffle GEMM: Y rows overlap, row stride ",
-                StrideE,
+                row_stride,
                 " < N=",
                 N);
+    TORCH_CHECK(row_stride <= std::numeric_limits<int>::max(),
+                "CK blockscale bpreshuffle GEMM: Y row stride ",
+                row_stride,
+                " does not fit the kernel's int index");
+    int StrideE = static_cast<int>(row_stride);
 
     auto a_element_op   = AElementOp{};
     auto b_element_op   = BElementOp{};

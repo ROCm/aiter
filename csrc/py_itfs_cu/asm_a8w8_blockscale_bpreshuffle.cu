@@ -4,6 +4,7 @@
 #include "aiter_ctypes_error.h"
 #include "asm_fp8gemm_blockscale_configs.hpp"
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <hip/hip_runtime.h>
@@ -274,10 +275,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int stride_a = static_cast<int>(A->stride(0));
     int stride_b = static_cast<int>(B->stride(0));
     // A size-1 dim may carry any stride, so a single row is laid out as if contiguous.
-    int stride_c = static_cast<int>(Mdim > 1 ? out->stride(0) : Ndim) * sizeof(uint16_t);
-    AITER_CHECK(stride_c >= Ndim * static_cast<int>(sizeof(uint16_t)),
-                __func__, " output rows overlap: row stride ", stride_c / sizeof(uint16_t),
-                " < N=", Ndim);
+    int64_t row_stride = Mdim > 1 ? out->stride(0) : Ndim;
+    AITER_CHECK(row_stride >= Ndim,
+                __func__, " output rows overlap: row stride ", row_stride, " < N=", Ndim);
+    constexpr int64_t max_row_stride = std::numeric_limits<int>::max() / sizeof(uint16_t);
+    AITER_CHECK(row_stride <= max_row_stride, __func__, " output row stride ", row_stride,
+                " does not fit the kernel's int byte stride");
+    int stride_c = static_cast<int>(row_stride * sizeof(uint16_t));
     std::optional<int> opt_splitK = (splitK >= 0) ? std::optional<int>(splitK) : std::nullopt;
     std::optional<bool> opt_bpreshuffle =
         bpreshuffle ? std::optional<bool>(true) : std::optional<bool>(false);
