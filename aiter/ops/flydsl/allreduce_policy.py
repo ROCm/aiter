@@ -1282,12 +1282,20 @@ def load_fused_ladders(path: str) -> FusedLadders:
                 tables[family][(*cell, hidden)] = rungs
                 if "atoms_per_row" in entry:
                     apr = entry["atoms_per_row"]
+                    # The ring normalizes one reduce-scatter chunk at a time, so
+                    # its row fits in one; the mesh normalizes the gathered
+                    # tile, so its row may span a whole tile of 8 atoms.
+                    span = 8 if family == "mesh" else 8 // ws
                     if apr is not None and (
-                        not _is_int(apr) or apr < 1 or (8 // ws) % apr
+                        not _is_int(apr) or apr < 1 or span % apr
                     ):
+                        what = (
+                            "a tile's 8 atoms"
+                            if family == "mesh"
+                            else f"a rank's reduce-scatter chunk of {span} atoms"
+                        )
                         raise ValueError(
-                            f"{ew}.atoms_per_row: must divide a rank's "
-                            f"reduce-scatter chunk of {8 // ws} atoms, got {apr!r}"
+                            f"{ew}.atoms_per_row: must divide {what}, got {apr!r}"
                         )
                     row_atoms[(*cell, family, hidden)] = apr
     return FusedLadders(row_atoms=row_atoms, **tables)

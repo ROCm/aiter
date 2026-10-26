@@ -8,7 +8,9 @@ the block so that ``atoms_per_row`` 16 B atoms are one token row (see
 ``quick_allreduce_fusions.quick_reduce_row_block``): the mesh ends a tile
 holding ``rows_per_tile`` whole rows, and every chunk the ring completes is
 ``rows_per_chunk`` whole rows, so the norm runs inside the op that receives it
-rather than waiting for the tile to be reassembled.
+rather than waiting for the tile to be reassembled. The ring therefore needs a
+row to fit inside one rank's chunk; the mesh, which normalizes the gathered
+tile, does not (``wide_rows``), so its rows may span up to the whole tile.
 
 ``mxfp4=True`` additionally quantizes each finished ``out`` atom to MXFP4 in
 place (:meth:`_BoundQuickReduceRMSNorm._store_mxfp4`), so the schedules need no
@@ -53,6 +55,10 @@ def _atom_f16_to_f32(atom):
 class _QuickReduceRMSNorm:
     fusion = "rmsnorm"
     takes_operands = True
+    #: Whether a row may span several ranks' reduce-scatter chunks
+    #: (``quick_reduce_atoms_choices``): true where the norm waits for the
+    #: whole gathered tile.
+    wide_rows = False
 
     def __init__(
         self,
@@ -77,12 +83,11 @@ class _QuickReduceRMSNorm:
         # An explicit block picks among the widths this hidden dim admits; None
         # keeps the widest.
         self.block, self.atoms_per_row = quick_reduce_row_block_at(
-            self.h_pad, world_size, block
+            self.h_pad, world_size, block, wide_rows=self.wide_rows
         )
         self.padded = self.h_pad != hidden
         self.rank_atoms = ATOMS // world_size
         self.rows_per_tile = ATOMS // self.atoms_per_row
-        self.rows_per_chunk = self.rank_atoms // self.atoms_per_row
         self.n_waves = self.block // WAVE
         # i32 between one token row and the next *in HBM*, and the HBM bytes a
         # whole tile spans. The wire tile is rows_per_tile rows of h_pad, the
@@ -302,7 +307,9 @@ class _BoundQuickReduceRMSNorm:
 
 class MeshRMSNormEpilogue(_QuickReduceRMSNorm):
     """The mesh ends a tile holding every atom of it: ``rows_per_tile``
-    independent rows, each reduced inside this block.
+    independent rows, each reduced inside this block. Since the norm waits for
+    the whole gathered tile, a row may span several ranks' chunks
+    (``wide_rows``): up to all ``ATOMS`` atoms.
 
     ``low_latency`` hoists the residual loads of a tile ahead of its reduce-scatter
     (``prefetch``), so the HBM reads retire during the two exchanges instead of
@@ -311,6 +318,8 @@ class MeshRMSNormEpilogue(_QuickReduceRMSNorm):
     the host to keep two per CU resident (see ``FlyQuickAllReduceRMSNorm``), and
     for ``super_tile=1``, the only loop that carries a tile through its waits.
     """
+
+    wide_rows = True
 
     def __init__(self, *, low_latency: bool = False, **kwargs):
         super().__init__(**kwargs)
@@ -372,6 +381,11 @@ class RingRMSNormEpilogue(_QuickReduceRMSNorm):
     whole rows. The epilogue runs *after* the chunk has been forwarded, so no
     norm arithmetic sits between a receive and the send that unblocks the
     successor."""
+
+    @property
+    def rows_per_chunk(self) -> int:
+        """Whole rows in one reduce-scatter chunk; a ring row never spans two."""
+        return self.rank_atoms // self.atoms_per_row
 
     def _rows_per_norm(self):
         return self.rows_per_chunk

@@ -176,8 +176,14 @@ The quick-reduce RMSNorm epilogue has two extras, both used through
 The mesh also has a low-latency build (`low_latency=true` on a ladder rung, or the
 `low_latency=` argument of `FlyQuickAllReduceRMSNorm`): the epilogue loads the
 residual ahead of the exchanges (`prefetch`) and two workgroups per CU stay
-resident. It needs `super_tile=1` and the 256-thread block, which at 8 ranks
-only hidden 2048 has. It is currently enabled only on xGMI.
+resident. It needs `super_tile=1` and the 256-thread block. It is currently
+enabled only on xGMI.
+
+A mesh row may span several ranks' reduce-scatter chunks (`wide_rows` in
+`quick_reduce_atoms_choices`): the mesh normalizes only once the all-gather has
+handed it the whole tile, so `atoms_per_row` may be any divisor of the tile's 8
+atoms. The ring normalizes chunk by chunk, so its row still has
+to fit one rank's `8 / world_size` atoms.
 
 A split row (one token row over several workgroups; opt-in with
 `AITER_FLY_AR_FUSED_SPLIT=1`) joins its sum of squares

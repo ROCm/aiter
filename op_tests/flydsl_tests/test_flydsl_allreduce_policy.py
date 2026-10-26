@@ -719,14 +719,17 @@ def test_fused_oneshot_split_is_opt_in():
 
 
 def test_fused_row_atoms_divide_the_chunk():
-    """Every ``FUSED_QR_ROW_ATOMS`` entry divides a rank's reduce-scatter
-    chunk, ``8 // world_size`` atoms, and names a platform that exists."""
+    """Every ``FUSED_QR_ROW_ATOMS`` entry divides what its schedule normalizes
+    at once -- a ring row a rank's reduce-scatter chunk, ``8 // world_size``
+    atoms, a mesh row the gathered tile's 8 -- and names a platform that
+    exists."""
     platforms = {(a, link, ws) for link, ws, a in CELLS}
     for (arch, link, ws, algorithm, _h), atoms in P.FUSED_QR_ROW_ATOMS.items():
         assert (arch, link, ws) in platforms, (arch, link, ws)
         assert algorithm in ("mesh", "ring"), algorithm
+        span = 8 if algorithm == "mesh" else 8 // ws
         if atoms is not None:
-            assert atoms >= 1 and (8 // ws) % atoms == 0, (arch, link, ws, atoms)
+            assert atoms >= 1 and span % atoms == 0, (arch, link, ws, atoms)
 
 
 def test_fused_ladder_lookup_rejects_unknown_keys():
@@ -872,7 +875,9 @@ _MESH = ("mesh", "default")
         (_set((*_D1, "atoms"), 3), "atoms"),
         (_set((*_D1, "fanout"), "ring"), "fanout"),
         (_set((*_D1, "min_bytes"), "0 KB"), "KiB"),
-        (_set((*_MESH, "atoms_per_row"), 4), "atoms_per_row"),
+        (_set((*_MESH, "atoms_per_row"), 3), "atoms_per_row"),
+        # TP4: a ring row must fit a rank's 2-atom chunk; the mesh's need not.
+        (_set(("ring", "default", "atoms_per_row"), 4), "atoms_per_row"),
         (_set(("oneshot", "default", "atoms_per_row"), 1), "unknown"),
         (_set(("oneshot", "hidden", "07168"), {"rungs": [_oneshot_rung(0)]}), "width"),
         (_set(("oneshot", "hidden", "-1"), {"rungs": [_oneshot_rung(0)]}), "width"),
@@ -887,6 +892,16 @@ def test_fused_ladder_file_rejects(tmp_path, edit, match):
     edit(doc["platforms"][0])
     with pytest.raises(ValueError, match=match):
         P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+
+@pytest.mark.parametrize("apr", [4, 8])
+def test_fused_ladder_file_takes_wide_mesh_rows(tmp_path, apr):
+    """A mesh row may span several ranks' chunks (up to the tile's 8 atoms);
+    at TP4 a chunk is 2 atoms, so these are wider than a ring row could be."""
+    doc = _ladder_doc()
+    _set((*_MESH, "atoms_per_row"), apr)(doc["platforms"][0])
+    got = P.load_fused_ladders(_write_ladders(tmp_path, doc))
+    assert apr in got.row_atoms.values()
 
 
 def test_fused_ladder_file_rejects_duplicates_and_other_schemas(tmp_path):
