@@ -550,13 +550,16 @@ class AITER_CONFIG:
                 + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
             )
 
-        # Auto-dedup: globally determine best row (lowest 'us') per shape. One
-        # unparseable us cell (e.g. nan) leaves the column textual in
-        # `comparable`, where "10.5" sorts before "9.5", so coerce it alone.
+        # Auto-dedup: keep the preferred row per shape. Latency mode uses the
+        # lowest 'us'. AITER_SELECT=power uses the highest tflops_per_w when
+        # that column was written by a power tune. One unparseable us cell
+        # (e.g. nan) leaves the column textual in `comparable`, where "10.5"
+        # sorts before "9.5", so coerce it alone.
+        from aiter.utility.tune_result import sort_frame_for_selection
+
         us = pd.to_numeric(merge_df["us"], errors="coerce")
         best_row_index = set(
-            comparable.assign(us=us)
-            .sort_values("us", kind="stable")
+            sort_frame_for_selection(comparable.assign(us=us))
             .drop_duplicates(subset=dedup_keys, keep="first")
             .index
         )

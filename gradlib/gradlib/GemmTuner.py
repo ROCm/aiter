@@ -360,6 +360,12 @@ class Gemm:
 
     def run_solutions(self):
         self.run_fast_solutions()
+        from aiter.utility.tune_result import power_selection_enabled
+
+        # The fast screen keeps only topn by latency. A power winner can sit
+        # outside that window, so the accurate pass has to time every solution.
+        if power_selection_enabled():
+            self.topn = max(self.topn, len(self.hipb_sols))
         self.functional_get_topn_fastest()
         rets = self.run_best_solutions()
         return rets
@@ -439,6 +445,8 @@ class GemmTuner(GemmCommonTuner):
                 "err_ratio",
                 "tflops",
                 "bw",
+                "watts",
+                "tflops_per_w",
             ]
         if key is None:
             key = [
@@ -716,8 +724,11 @@ class GemmTuner(GemmCommonTuner):
         return ret
 
     def processResult(self, rets, fast_mode):
+        from aiter.utility.tune_result import power_columns, sort_frame_for_selection
+
         results = []
-        for info, us, err_ratio in rets:
+        for el in rets:
+            info, us, err_ratio = el
             res_one = []
             solidx = info[1]
             splitK = info[2]
@@ -744,21 +755,30 @@ class GemmTuner(GemmCommonTuner):
                 self.get_bpe(eval(info[0][4])),
                 self.get_bpe(eval(info[0][5])),
             )
+            watts, tflops_per_w = power_columns(el, tflops)
             res_one.append(tflops)
             res_one.append(bw)
+            res_one.append(watts)
+            res_one.append(tflops_per_w)
 
             results.append(res_one)
         gtimedf = pd.DataFrame(results, columns=self.columns)
-        gtimedf = gtimedf.sort_values(by="us")
+        gtimedf = sort_frame_for_selection(gtimedf)
         return gtimedf
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         from collections import defaultdict
 
+        from aiter.utility.tune_result import (
+            power_selection_enabled,
+            sort_frame_for_selection,
+        )
+
         grouped_rets = defaultdict(list)
 
-        for info, us, max_err_ratio in rets:
-            grouped_rets[info[0]].append((info, us, max_err_ratio))
+        for el in rets:
+            info, _us, _max_err_ratio = el
+            grouped_rets[info[0]].append(el)
 
         grouped_results = list(grouped_rets.items())
         gtimedf_dic = {}
@@ -777,7 +797,7 @@ class GemmTuner(GemmCommonTuner):
         best_gtimedfs = pd.DataFrame(columns=self.columns)
         for key, df in gtimedf_dic.items():
             gtimedf_dic[key] = df[df["err_ratio"] < args.errRatio]
-            best_gtimedf = gtimedf_dic[key].sort_values(by="us")
+            best_gtimedf = sort_frame_for_selection(gtimedf_dic[key])
 
             if len(gtimedf_dic[key]) == 0:
                 print(">>> No valid hipblaslt solutions found!", flush=True)
@@ -792,7 +812,8 @@ class GemmTuner(GemmCommonTuner):
             else:
                 best_gtimedfs = pd.concat([best_gtimedfs, resultdf1], ignore_index=True)
 
-            print(f"{key} >>> Fastest Solution is \n {resultdf1}", flush=True)
+            metric = "power" if power_selection_enabled() else "latency"
+            print(f"{key} >>> selected ({metric}) solution is \n {resultdf1}", flush=True)
         return best_gtimedfs
 
     def save_profile(self, timedf, profile_file):

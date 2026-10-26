@@ -5,7 +5,9 @@
 Reads shapes from ``aiter/configs/iq2r_glm53_untuned.csv``, checks and times
 every candidate (gate kernel and grid, down kernel and grid, prefill down
 chunks) on synthetic packed weights on the current GPU, and writes the
-fastest to the tuned CSV read by :func:`aiter.iq2r_glm53.iq2r_glm53_config`.
+winner to the tuned CSV read by :func:`aiter.iq2r_glm53.iq2r_glm53_config`.
+``--select latency`` keeps the lowest ``us``. ``--select power`` keeps the
+lowest ``us * package watts``.
 
     python3 csrc/kernels/iq2r/iq2r_glm53_tune.py               # untuned shapes
     python3 csrc/kernels/iq2r/iq2r_glm53_tune.py --all         # retune them all
@@ -337,11 +339,35 @@ class IQ2RGlm53Tuner(TunerCommon):
                     tolerance = 1e-2 * reference.float().abs().max().item()
                 us = self._time(shape, config, args)
                 tflops, tbps = self.calculate((info, us, 0.0))
+                from aiter.utility.tune_result import (
+                    TuneResult,
+                    power_selection_enabled,
+                )
+
+                watts = float("nan")
+                if power_selection_enabled(getattr(args, "select", None)):
+                    from aiter.utility.package_power import record_package_watts
+
+                    calls = [
+                        functools.partial(self._run, shape, config, *call)
+                        for call in shape.calls
+                    ]
+
+                    def replay(calls=calls):
+                        for call in calls:
+                            call()
+
+                    watts = record_package_watts(replay)
+                watt_text = (
+                    f", {watts:.1f} W"
+                    if watts == watts and watts > 0
+                    else ""
+                )
                 print(
                     f"{label} {self.getKernelName(config)}: {us:.2f} us, "
-                    f"{tflops:.1f} TFLOPS, {tbps:.2f} TB/s"
+                    f"{tflops:.1f} TFLOPS, {tbps:.2f} TB/s{watt_text}"
                 )
-                results.append((info, us, 0.0))
+                results.append(TuneResult(info, us, 0.0, watts))
             del shape
         return results
 

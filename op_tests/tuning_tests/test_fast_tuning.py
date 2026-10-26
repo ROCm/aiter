@@ -905,5 +905,235 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
         self.assertNotIn("swiglu_limit", precompiled[2])
 
 
+class TestMoePowerRanking(unittest.TestCase):
+    def test_power_rank_orders_pairs_by_stage_energy(self):
+        import pandas as pd
+
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
+
+        pairs = pd.DataFrame(
+            [
+                {
+                    "kernelName1": "fast_hot",
+                    "kernelName2": "stage2_a",
+                    "us1": 40.0,
+                    "us2": 20.0,
+                    "us": 60.0,
+                    "watts1": 700.0,
+                    "watts2": 700.0,
+                    "tflops": 100.0,
+                },
+                {
+                    "kernelName1": "slower_cooler",
+                    "kernelName2": "stage2_b",
+                    "us1": 50.0,
+                    "us2": 20.0,
+                    "us": 70.0,
+                    "watts1": 400.0,
+                    "watts2": 400.0,
+                    "tflops": 80.0,
+                },
+                {
+                    "kernelName1": "one_stage",
+                    "kernelName2": None,
+                    "us1": 55.0,
+                    "us2": 0.0,
+                    "us": 55.0,
+                    "watts1": 500.0,
+                    "watts2": float("nan"),
+                    "tflops": 90.0,
+                },
+            ]
+        )
+        ranked = rank_moe_pairs(pairs, select_power=True)
+        # one_stage 55*500 = 27500, slower_cooler 50*400+20*400 = 28000,
+        # fast_hot 40*700+20*700 = 42000.
+        self.assertEqual(
+            list(ranked["kernelName1"]),
+            ["one_stage", "slower_cooler", "fast_hot"],
+        )
+        self.assertEqual(list(ranked["rank"]), [1, 2, 3])
+        self.assertEqual(float(ranked.iloc[0]["energy"]), 27500.0)
+        self.assertAlmostEqual(float(ranked.iloc[0]["watts"]), 500.0, places=3)
+        self.assertAlmostEqual(float(ranked.iloc[0]["tflops_per_w"]), 90 / 500, places=5)
+
+    def test_latency_rank_ignores_energy_order(self):
+        import pandas as pd
+
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
+
+        pairs = pd.DataFrame(
+            [
+                {
+                    "kernelName1": "slow",
+                    "us1": 80.0,
+                    "us2": 0.0,
+                    "us": 80.0,
+                    "watts1": 100.0,
+                },
+                {
+                    "kernelName1": "fast",
+                    "us1": 40.0,
+                    "us2": 0.0,
+                    "us": 40.0,
+                    "watts1": 600.0,
+                },
+            ]
+        )
+        ranked = rank_moe_pairs(pairs, select_power=False)
+        self.assertEqual(list(ranked["kernelName1"]), ["fast", "slow"])
+        self.assertEqual(int(ranked.iloc[0]["rank"]), 1)
+
+    def test_unmeasured_power_sorts_last(self):
+        import pandas as pd
+
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import rank_moe_pairs
+
+        pairs = pd.DataFrame(
+            [
+                {"kernelName1": "no_watts", "us1": 10.0, "us2": 10.0, "us": 20.0},
+                {
+                    "kernelName1": "measured",
+                    "us1": 30.0,
+                    "us2": 10.0,
+                    "us": 40.0,
+                    "watts1": 500.0,
+                    "watts2": 500.0,
+                },
+            ]
+        )
+        ranked = rank_moe_pairs(pairs, select_power=True)
+        self.assertEqual(ranked.iloc[0]["kernelName1"], "measured")
+        self.assertTrue(pd.isna(ranked.iloc[1]["energy"]))
+
+
+class TestPowerSelectionGaps(unittest.TestCase):
+    def test_candidate_beats_uses_energy_only_in_power_mode(self):
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import _candidate_beats
+
+        hot = {"us": 10.0, "watts": 1000.0}
+        cool = {"us": 20.0, "watts": 200.0}
+        self.assertTrue(_candidate_beats(hot, cool, True))
+        self.assertFalse(_candidate_beats(cool, hot, True))
+        self.assertFalse(_candidate_beats(hot, cool, False))
+        self.assertTrue(_candidate_beats(hot, {"us": 9.0, "watts": 5000.0}, False))
+        self.assertTrue(_candidate_beats(None, hot, True))
+
+    def test_grouped_power_keeps_lower_energy_tile(self):
+        import pandas as pd
+
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.GroupedFmoeTuner.__new__(gemm_moe_tune.GroupedFmoeTuner)
+        hot = {"tile_m": 128, "kernelName1": "hot"}
+        cool = {"tile_m": 16, "kernelName1": "cool"}
+        args = SimpleNamespace(fast_scan=False, select="power", warmup=1, iters=1)
+        frame = pd.DataFrame(
+            [{"token": 4, "inter_dim": 32, "q_dtype_a": "fp4", "expert": 2, "topk": 1}]
+        )
+
+        def run_candidate(_row, candidate, _args):
+            if candidate["tile_m"] == 128:
+                candidate["watts"] = 1000.0
+                return 10.0
+            candidate["watts"] = 200.0
+            return 20.0
+
+        with (
+            mock.patch.object(tuner, "_candidate_rows", return_value=[hot, cool]),
+            mock.patch.object(tuner, "_run_candidate", side_effect=run_candidate),
+            mock.patch("builtins.print"),
+        ):
+            rows = tuner.tune(frame, None, args)
+
+        self.assertEqual(rows[0]["kernelName1"], "cool")
+
+        args.select = "latency"
+        with (
+            mock.patch.object(tuner, "_candidate_rows", return_value=[hot, cool]),
+            mock.patch.object(tuner, "_run_candidate", side_effect=run_candidate),
+            mock.patch("builtins.print"),
+        ):
+            rows = tuner.tune(frame, None, args)
+
+        self.assertEqual(rows[0]["kernelName1"], "hot")
+
+    def test_mxfp4_power_retimes_every_accurate_candidate(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
+
+        def candidate(name):
+            return {"kernelName1": f"g1_{name}", "kernelName2": f"g2_{name}", "us": 0}
+
+        candidates = [candidate(f"candidate_{i}") for i in range(4)]
+        args = SimpleNamespace(
+            fast_scan=True,
+            fast_scan_warmup_accuracy_checks=1,
+            fast_scan_iters=10,
+            fast_scan_final_iters=100,
+            fast_scan_finalists=1,
+            timeout=0,
+            errRatio=0.1,
+            warmup=1,
+            iters=2,
+            select="power",
+            mxfp4_search_mode="prune",
+        )
+        row = {
+            "token": 1,
+            "model_dim": 256,
+            "inter_dim": 256,
+            "expert": 8,
+            "topk": 2,
+            "act_type": "ActivationType.Silu",
+        }
+        final_names = []
+
+        def run_candidate(_row, candidate, _args, **kwargs):
+            name = candidate["kernelName1"]
+            if kwargs.get("num_iters") == 10:
+                candidate["us"] = 10.0 + candidates.index(candidate)
+                candidate["err1"] = 0.01
+                return candidate["us"]
+            final_names.append(name)
+            # Last candidate is slower and much cooler, so it wins on energy.
+            candidate["us"] = 40.0 if name.endswith("_3") else 10.0
+            candidate["watts"] = 100.0 if name.endswith("_3") else 1000.0
+            candidate["err1"] = 0.01
+            return candidate["us"]
+
+        with (
+            mock.patch.object(tuner, "_candidate_rows", return_value=candidates),
+            mock.patch.object(tuner, "_precompile_candidates", return_value=(4, 0)),
+            mock.patch.object(tuner, "_prepare_case", return_value="fixture"),
+            mock.patch.object(tuner, "_torch_ref", return_value="reference"),
+            mock.patch.object(tuner, "_run_candidate", side_effect=run_candidate),
+            mock.patch("builtins.print"),
+        ):
+            best = tuner._tune_one_shape(row, args)
+
+        self.assertEqual(
+            final_names,
+            [f"g1_candidate_{i}" for i in range(4)],
+        )
+        self.assertEqual(best["kernelName1"], "g1_candidate_3")
+
+    def test_k5_post_process_keeps_lower_energy_duplicate(self):
+        from csrc.gdn_k5.chunk_gdn_h_opt_tune import K5BvTuner
+
+        tuner = K5BvTuner.__new__(K5BvTuner)
+        tuner.keys = ["H"]
+        tuner.columns = ["H", "BV", "us"]
+        rows = [
+            {"H": 1, "BV": 64, "us": 10.0, "watts": 1000.0},
+            {"H": 1, "BV": 16, "us": 20.0, "watts": 200.0},
+        ]
+        power = tuner.post_process(rows, SimpleNamespace(select="power"))
+        latency = tuner.post_process(rows, SimpleNamespace(select="latency"))
+        self.assertEqual(int(power.iloc[0]["BV"]), 16)
+        self.assertEqual(int(latency.iloc[0]["BV"]), 64)
+
+
 if __name__ == "__main__":
     unittest.main()
