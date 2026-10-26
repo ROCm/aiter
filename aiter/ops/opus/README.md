@@ -1,4 +1,153 @@
-# OPUS GEMM and BMM Python interfaces
+# Opus operators: architecture and ownership
+
+Opus is the device programming layer, not a second copy of AITER's operator
+hierarchy. Keep existing AITER public APIs where callers already use them;
+organize implementation by **operator family**, with a small shared foundation
+and a clear Python → host → device boundary. Do not introduce a generic
+dispatcher for operators with unrelated tensor/layout/launch contracts.
+
+## Implemented operator map
+
+This is a source/entry-point inventory, not a claim that every family is selected
+by default or validated on every supported architecture.
+
+| Operator family | Python entry / owner | Native implementation / status |
+|---|---|---|
+| GEMM / BMM | This package: `opus_gemm`, `opus_bmm`, `gemm_a16w16_opus`; `gemm_op_a16w16.py`, `gemm_op_a8w8.py` | `csrc/opus_gemm/`: exact-ID A16W16 and A8 families; architecture/dtype matrix below |
+| MoE forward | `moe_stage1_a8w4.py`, `moe_stage2_a8w4.py`; integration through fused MoE | `csrc/opus_moe/`: gfx950 A8W4 gate/up and down stages, output reduction; private BF16 Stage2 source is not a public fused-MoE route |
+| MoE backward | `moe_backward.py`, `moe_backward_types.py` | `csrc/opus_moe/moe_backward/`: gfx950 BF16 fixed/compact routing, dX/dW1/dW2/dScores, biases and partial autograd attachment |
+| Router backward | `moe_backward.py`: selected-logit softmax and Jacobian/scatter | Same backward reduction implementation; not a full-softmax-before-TopK gradient |
+| MoE sorting | `aiter/ops/moe_sorting_opus.py` | `csrc/py_itfs_cu/moe_sorting_opus_kernels.cu` and `csrc/pybind/moe_sorting_opus_pybind.cu`; separate routing API, not backward-owned |
+| RMSNorm / add / quantization | `aiter/ops/rmsnorm.py` | `csrc/kernels/rmsnorm/rmsnorm_opus_*`; general AITER dispatch also has non-Opus fast paths |
+| BF16 FMHA forward | `aiter/ops/mha.py`: dense and varlen Opus entries | `csrc/py_itfs_cu/fmha_fwd_bf16_opus_kernels.cu`; enabled only for supported attention contracts |
+| MLA decode | `aiter/ops/attention.py`: `opus_mla_decode_*_fwd` | `csrc/kernels/mla/opus_mla_decode_fwd.cu` and `mla/opus/` |
+| Sparse prefill | `aiter/ops/pa_sparse_prefill_opus.py` | `csrc/py_itfs_cu/mla_v4_prefill_opus_kernels.cu`; gfx950 source / gfx1250 code objects |
+| Paged MXFP4 MQA logits | `pa_mqa_logits_mxfp4.py` | `csrc/kernels/opus_mqa_logits/pa_mqa_logits_mxfp4/`; gfx950/gfx1250 kernel and schedule variants |
+
+`aiter.ops.opus.__init__` intentionally exports the three GEMM/BMM APIs only.
+MoE and MQA use their existing module imports. Do not eagerly import every
+operator here: that expands import dependencies and couples unrelated JITs.
+
+## Architecture: few files, meaningful boundaries
+
+```text
+public API / fused-model integration          aiter/ops/
+        │ checked tensors, allocation, saved state, autograd
+        ▼
+operator-family wrapper                     aiter/ops/opus/{family}.py
+        │ exact launch request / existing raw JIT ABI
+        ▼
+host implementation + typed contract         csrc/{family}/
+        │ validate kargs → select legal instance → schedule launches
+        ▼
+architecture-specific traits + kernels      include/{gfx}/{dtype}/
+        │ shared loads, stores, MFMA, conversions, barriers
+        ▼
+Opus device primitives                      csrc/include/opus/
+
+torch-free registry → code generator → build-local manifests / device shards
+independent references + tests + benchmarks  op_tests/ (not runtime imports)
+```
+
+Recommended boundaries:
+
+- One **operator family**, not one mathematical step, owns a wrapper. Fixed
+  and compact MoE backward share one wrapper and versioned metadata contract.
+- Keep host tensor/ABI validation separate from launch policy and device code.
+  Host implementation headers are included by one TU, not by arbitrary clients.
+- Split device files where the algorithm or compilation unit really differs:
+  down, route-dX and weight-gradient GEMMs remain separate; short reductions
+  share a file. Do not split every helper, experiment or one-line include.
+- Create shared policy/types files only with a real cross-caller contract.
+  GEMM `policy.py` is used by high-level tuned callers, while exact launch
+  `launch_plan.py` owns immutable workspace contracts. Merging them would mix
+  selection with execution and risk circular imports.
+- Architecture directories represent implemented backends. Use the existing
+  architecture probe directly; no forwarding header for a hypothetical backend.
+- Generated manifests, specialization shards and code objects are build outputs
+  or packaged binaries, not extra hand-maintained source abstractions. Forward
+  MoE's device-only shards preserve parallel compilation; do not concatenate
+  them into a host/device monolithic TU just to reduce a file count.
+
+## Python file responsibilities
+
+| File | Owns | Must not own |
+|---|---|---|
+| `__init__.py` | Small stable GEMM/BMM public facade | Eager imports of every Opus family |
+| `_arch.py` | Shared architecture/device probe and cache | Operator-specific kernel selection |
+| `dispatch.py` | Exact GEMM/BMM public validation and family routing | Tuned CSV lookup or silent kid redirects |
+| `launch_plan.py` | Exact launch legality and immutable workspace plans | Model-level dispatch or tuning experiments |
+| `policy.py` | Caller-side tuned candidates, heuristics and legacy resolution | Device launch or workspace allocation |
+| `gemm_op_a16w16.py`, `gemm_op_a8w8.py` | Family executors, JIT ABI and compatibility entry points | A second canonical registry |
+| `moe_stage1_a8w4.py`, `moe_stage2_a8w4.py` | Separate forward-stage ABIs and fused-MoE adapters | Backward saved-state assumptions |
+| `moe_backward.py` | Checked family/full-chain APIs, raw JIT bindings, allocation and autograd attachment | Kernel implementations or independent golden equations |
+| `moe_backward_types.py` | Forward-consumable route metadata and output containers | Dispatch, JIT imports or allocations |
+| `megatron_moe.py` | Megatron local-expert K=1 metadata adapter and autograd attachment | Benchmark shape catalogs, router, all-to-all or full-network scheduling |
+| `pa_mqa_logits_mxfp4.py` | Variant/schedule contract and paged-logit launcher | Unrelated dense attention dispatch |
+
+The two backward Python modules are intentional: metadata is consumed by
+forward as well as backward, and old class import paths remain valid through
+re-export. The 2.5K-line wrapper uses in-file sections rather than extra modules
+for each raw binding, validation helper or autograd Function. Extract another
+file only when it has a distinct user or removes a proven dependency cycle.
+
+## Native MoE backward: compact source map
+
+The implemented backward family has **16 source files**, down from 22. The
+count includes its two Python modules and pybind TU, but excludes documentation
+and generated manifests. Public Python module names are unchanged.
+
+```text
+aiter/ops/opus/
+  moe_backward.py                        API / JIT / allocation / autograd
+  moe_backward_types.py                  route metadata / result containers
+csrc/pybind/
+  opus_moe_backward_pybind.cu             Python-facing ABI bindings
+csrc/opus_moe/moe_backward/
+  opus_moe_backward_common.py             canonical instance registry
+  gen_instances.py                       deterministic manifest generation
+  opus_moe_backward.cu                   single implementation TU
+  include/
+    opus_moe_backward.h                  tensor + launch declarations
+    opus_moe_backward_common.cuh         kargs / enums / shared contracts
+    opus_moe_backward_host_impl.cuh      tensor checks / kargs construction
+    opus_moe_backward_launch.cuh         policy / family launches / chain order
+    gfx950/
+      opus_moe_backward_dispatch_gfx950.cuh   exact-ID tables
+      bf16/
+        opus_moe_backward_traits_gfx950.cuh
+        opus_moe_down_bwd_pipeline_gfx950.cuh
+        opus_moe_route_dx_pipeline_gfx950.cuh
+        opus_moe_weight_bwd_pipeline_gfx950.cuh
+        opus_moe_reduction_pipeline_gfx950.cuh
+```
+
+Read a backward change in this order: Python contract → `.h`/kargs → host
+tensor adapter → launch policy → exact table → relevant device kernel.
+Bias, route dX reduction and router Jacobian/scatter are grouped in the
+reduction file; their kernel names, traits and registration IDs remain distinct.
+Selected-softmax forward uses device-side PyTorch operations in the wrapper;
+the Jacobian/scatter backward is native Opus.
+No facade headers are retained for the removed internal include paths.
+
+## Where a change belongs
+
+| Requested change | Primary owner | Required companion check |
+|---|---|---|
+| Tensor shape/dtype or cache contract | Python wrapper + host tensor adapter | Matching public validation and negative tests |
+| Workspace or kargs layout | Types/contract + host adapter + launch planner | ABI, graph replay and padding checks |
+| Auto policy or launch ordering | Family policy / launch file | Geometry coverage and matched A/B/A timing |
+| Kernel tile/layout/synchronization | Traits + relevant device file | Fresh ISA/resources, numerical reference and performance |
+| Add/remove an explicit instance | Canonical registry + generator | Deterministic manifest, all selector targets still registered |
+| Model tuned entry | Existing high-level integration/tuner | Model-level contract and accuracy/performance evidence |
+| Documentation/file consolidation | This map + family README | No dangling imports/includes; fresh build for device includes |
+
+The forward [source map](../../../csrc/opus_moe/README.md) and backward
+[contracts](../../../csrc/opus_moe/moe_backward/README.md) remain family-local.
+Historical tuning belongs in `TUNING_HISTORY.md`, not in active API ownership
+tables. Test oracles stay independent of the implementation being checked.
+
+## GEMM and BMM interface reference
 
 OPUS exposes strict exact-kid functions for logical 2D GEMM and batch-first 3D
 BMM, plus the retained shape-driven `gemm_a16w16_opus` compatibility entry.
@@ -447,6 +596,54 @@ dtype or expose the physical 3D raw ABI of a GEMM-only A8 family as public
 BMM. The A8 family module exports only its legacy tuner compatibility name.
 
 ## Validation
+
+### Megatron BF16 MoE backward
+
+`megatron_moe.py` replaces the dispatch-after local expert backward for
+Mixtral 8x7B and Qwen3-235B-A22B while leaving token dispatch, EP all-to-all,
+router losses and unpermute in Megatron.  Enable TE single grouped weights and
+call the adapter after FC2 has produced its output:
+
+```python
+output = opus_megatron_grouped_mlp_attach_backward(
+    output,
+    fc1_output,
+    permuted_local_hidden_states,
+    self.linear_fc1.weight,
+    self.linear_fc2.weight,
+    permuted_probs.squeeze(-1),
+    tokens_per_expert_gpu,
+)
+```
+
+The target configuration must use BF16 SwiGLU, no expert bias, no GLU
+interleaving/clamp/offset, `moe_apply_probs_on_input=False`, ETP=1, and
+`--moe-single-grouped-weight`.  Preserve the GPU `tokens_per_expert` tensor;
+do not reconstruct it from the Python list used by older TE interfaces.
+Pass `activated_scaled=bias_act_output` only after the selected route geometry
+passes the cached K1 policy; otherwise the ordinary path recomputes that
+intermediate during backward.
+Gradient-accumulation/main-grad integration and zero-route ranks require an
+end-to-end Megatron optimizer-step test before enabling the backend by default.
+The adapter builds already-grouped K=1 route metadata in one HIP launch and
+uses one vectorized HIP launch to copy each compact forward cache into Opus'
+32-row padded layout.  It does not run a general sorter or synchronize counts
+back to the host.  Saving a padded X cache remains opt-in: for the measured
+Qwen3 shape its faster K4 did not recover the forward copy cost or extra
+activation memory.
+
+For a same-shape comparison with the checked-in AITER Triton reference and a
+local-expert proxy built from two TransformerEngine GroupedLinear modules using
+CK grouped GEMM, run:
+
+```bash
+NVTE_USE_CK_GROUPED_GEMM=1 NVTE_CK_USES_BWD_V3=1 \
+PYTHONPATH=. python op_tests/op_benchmarks/bench_opus_megatron_moe_compare.py
+```
+
+The script reports proxy backward separately from proxy forward+backward and
+checks dX, dW1, dW2 and dProb against Opus before timing.  It does not execute
+a Megatron layer, dispatcher, communication, gradient accumulation or optimizer.
 
 Run the retained OPUS numerical tests on matching target GPUs rather than
 treating architecture skips as coverage:
