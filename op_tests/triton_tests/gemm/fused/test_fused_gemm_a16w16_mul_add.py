@@ -26,7 +26,7 @@ def generate_fused_gemm_a16w16_mul_add_inputs(
 
     def operand(kind):
         if kind == "scalar":
-            return float(torch.randn(1).item())
+            return float(torch.randn(1, device="cuda", dtype=torch.float32).item())
         if kind == "channel":
             return torch.randn((N,), dtype=dtype, device="cuda")
         if kind == "gate":

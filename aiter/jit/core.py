@@ -41,15 +41,18 @@ AITER_DISABLE_KERNARG_PRELOAD = (
 )
 
 
+@functools.lru_cache(maxsize=256)
+def _atoi_flag(raw: str) -> bool:
+    m = re.match(r"\s*([+-]?\d+)", raw)
+    return m is not None and int(m.group(1)) != 0
+
+
+def env_flag_atoi(name: str, default: str = "") -> bool:
+    return _atoi_flag(os.environ.get(name, default))
+
+
 def is_experimental_enabled() -> bool:
-    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
-    # any other integer value as enabled. Non-numeric strings are treated as
-    # disabled to avoid accidentally turning on experimental code paths.
-    val = os.environ.get("AITER_ENABLE_EXPERIMENTAL", "0")
-    try:
-        return int(val) != 0
-    except ValueError:
-        return False
+    return env_flag_atoi("AITER_ENABLE_EXPERIMENTAL")
 
 
 aiter_lib = None
@@ -177,6 +180,11 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
 AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_mxscale_bpreshuffle_tuned_gemm.csv",
 )
 
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
@@ -365,6 +373,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
             AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE,
             "a8w8_mxfp8_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE,
+            "a4w4_mxscale_bpreshuffle_tuned_gemm",
         )
 
     @property
@@ -1796,6 +1812,29 @@ def _is_union(origin):
 ) = range(7)
 
 
+def build_ctypes_module(md_name: str) -> str:
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
+    if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
+        d_args = get_args_of_build(md_name)
+        d_args["torch_exclude"] = True
+        build_module(
+            md_name,
+            d_args["srcs"],
+            d_args["flags_extra_cc"],
+            d_args["flags_extra_hip"],
+            d_args["blob_gen_cmd"],
+            d_args["extra_include"],
+            d_args["extra_ldflags"],
+            d_args["verbose"],
+            d_args["is_python_module"],
+            d_args["is_standalone"],
+            d_args["torch_exclude"],
+            d_args.get("third_party", []),
+            flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+        )
+    return so_path
+
+
 def _ctypes_call(func, fc_name, md_name):
     """Build a ctypes-based caller for a torch-free .so module.
 
@@ -1841,25 +1880,7 @@ def _ctypes_call(func, fc_name, md_name):
     def _ensure_loaded():
         if _cache:
             return
-        so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
-        if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
-            d_args = get_args_of_build(md_name)
-            d_args["torch_exclude"] = True
-            build_module(
-                md_name,
-                d_args["srcs"],
-                d_args["flags_extra_cc"],
-                d_args["flags_extra_hip"],
-                d_args["blob_gen_cmd"],
-                d_args["extra_include"],
-                d_args["extra_ldflags"],
-                d_args["verbose"],
-                d_args["is_python_module"],
-                d_args["is_standalone"],
-                d_args["torch_exclude"],
-                d_args.get("third_party", []),
-                flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
-            )
+        so_path = build_ctypes_module(md_name)
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
 
@@ -2146,6 +2167,16 @@ def _pybind_develop_hooks():
             torch.cuda.current_device,
         )
     return _pybind_develop_hooks_cache
+
+
+def _develop_arg(a, convert, tensor_cls):
+    """`a` as a develop=True pybind op takes it: a tensor converted, and so is
+    every tensor of a list (a std::vector<aiter_tensor_t> argument)."""
+    if isinstance(a, tensor_cls):
+        return convert(a)
+    if isinstance(a, (list, tuple)) and any(isinstance(x, tensor_cls) for x in a):
+        return [convert(x) if isinstance(x, tensor_cls) else x for x in a]
+    return a
 
 
 def compile_ops(
@@ -2453,12 +2484,10 @@ def compile_ops(
                             ),
                         )
 
-                    args = tuple(
-                        convert(a) if isinstance(a, tensor_cls) else a for a in args
-                    )
+                    args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
                     if kwargs:
                         kwargs = {
-                            k: convert(v) if isinstance(v, tensor_cls) else v
+                            k: _develop_arg(v, convert, tensor_cls)
                             for k, v in kwargs.items()
                         }
 
