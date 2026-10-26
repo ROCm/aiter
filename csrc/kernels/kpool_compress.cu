@@ -436,7 +436,10 @@ struct TailArgs {
 // / v_cmp round trip), which doubles the SALU chain in front of the ring loads.
 __device__ __forceinline__ uint32_t s_bit31(uint32_t x) {
   uint32_t r;
-  asm("s_lshr_b32 %0, %1, 31" : "=s"(r) : "s"(x));
+  // readfirstlane: free for a value already in an SGPR, and keeps the "s"
+  // constraint satisfiable when the compiler cannot prove x uniform (with
+  // KPOOL_META_SMEM it handed the asm a VGPR and failed to assemble)
+  asm("s_lshr_b32 %0, %1, 31" : "=s"(r) : "s"(__builtin_amdgcn_readfirstlane(x)));
   return r;
 }
 
