@@ -7,7 +7,7 @@ import gc
 import itertools
 import logging
 import os
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from unittest.mock import patch
 
 import pandas as pd
@@ -69,6 +69,16 @@ from aiter.ops.shuffle import (
 logger = logging.getLogger(__name__)
 
 _Q256_KERNEL = "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate"
+
+
+@contextmanager
+def _with_default_device(device):
+    previous = torch.get_default_device()
+    try:
+        torch.set_default_device(device)
+        yield
+    finally:
+        torch.set_default_device(previous)
 
 
 def _check_q256_reference(reference, output, msg):
@@ -317,9 +327,32 @@ def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
         dtype=torch.uint8,
         device=hidden.device,
     ).view(dtypes.fp8_e8m0)
-    for overrides, metadata_overrides in (
-        ({"quant_dtype_a2": dtypes.fp8}, {"q_dtype_a2": dtypes.fp8}),
-        ({"a2_scale": scales}, {"has_a2_scale": True}),
+    # Clones drop tensor metadata but retain valid packed legacy bytes. These
+    # cases check shuffle tags, not support for physically unshuffled weights.
+    untagged_w1, untagged_w2 = _w1.clone(), _w2.clone()
+    assert not getattr(untagged_w1, "is_shuffled", False)
+    assert not getattr(untagged_w2, "is_shuffled", False)
+    assert _w1.is_shuffled and _w2.is_shuffled
+    for label, call_args_variant, overrides, metadata_overrides in (
+        (
+            "fp8_a2",
+            call_args,
+            {"quant_dtype_a2": dtypes.fp8},
+            {"q_dtype_a2": dtypes.fp8},
+        ),
+        ("a2_scale", call_args, {"a2_scale": scales}, {"has_a2_scale": True}),
+        (
+            "untagged_w1",
+            (hidden, untagged_w1, _w2, weights, ids),
+            {},
+            {"opus_weights_shuffled": False},
+        ),
+        (
+            "untagged_w2",
+            (hidden, _w1, untagged_w2, weights, ids),
+            {},
+            {"opus_weights_shuffled": False},
+        ),
     ):
         metadata = _q256_metadata(**metadata_overrides)
         assert not metadata.run_1stage and metadata.stage2 is not None
@@ -330,7 +363,7 @@ def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
         output = torch.full_like(hidden, float("nan"))
 
         call = functools.partial(
-            fused_moe, *call_args, **{**kwargs, **overrides}, output=output
+            fused_moe, *call_args_variant, **{**kwargs, **overrides}, output=output
         )
 
         call()  # Compile the real two-stage fallback before profiling.
@@ -345,9 +378,7 @@ def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
             for event in prof.events()
             if event.device_type == torch.autograd.DeviceType.CUDA
         ]
-        aiter.logger.info(
-            "Q256 automatic fallback %s GPU kernels: %s", overrides.keys(), names
-        )
+        aiter.logger.info("Q256 automatic fallback %s GPU kernels: %s", label, names)
         assert returned is output and output.shape == (tokens, model)
         assert torch.isfinite(output).all(), "nonfinite Q256 fallback output"
         assert not any(name.startswith(_Q256_KERNEL) for name in names), names
@@ -391,7 +422,7 @@ def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
             (reference.float() - output.float()).norm()
             / reference.float().norm().clamp_min(1e-30)
         ).item()
-        assert nrms < 0.01, f"two-stage fallback {overrides.keys()}: NRMS={nrms}"
+        assert nrms < 0.01, f"two-stage fallback {label}: NRMS={nrms}"
 
 
 def _check_q256_dynamic_routes(
@@ -497,6 +528,7 @@ def parse_num_expert_activated():
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 
+@_with_default_device("cuda")
 @benchmark()
 def test_fmoe(
     dtype,
@@ -534,7 +566,6 @@ def test_fmoe(
             raise ValueError(f"shared_expert_id must be in [0, E={E})")
         if topk < 2:
             raise ValueError("shared expert routing requires topk >= 2")
-    torch.set_default_device("cuda")
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
     if actType == aiter.ActivationType.Situv2:
@@ -1901,7 +1932,10 @@ def test_q256_prefill():
     ] + [_q256_case(8192, 8192, shared_expert_id=None)]
     rows = []
     for case in cases:
-        rows.append(test_fmoe(**case))
+        with _with_default_device("cpu"):
+            rows.append(test_fmoe(**case))
+            assert torch.get_default_device() == torch.device("cpu")
+            assert torch.empty(0).device.type == "cpu"
         gc.collect()
         torch.cuda.empty_cache()
     aiter.logger.info(
@@ -1951,7 +1985,16 @@ def test_q256_token_boundaries():
     metadata = _q256_metadata()
     assert metadata.run_1stage and metadata.block_m == 256
     assert moe_op.is_q256_kernel(metadata.stage1.keywords["kernelName"])
+    for gate_up_interleave in (False, None):
+        supported = _q256_metadata(
+            opus_weights_shuffled=True, gate_up_interleave=gate_up_interleave
+        )
+        assert supported.run_1stage and supported.block_m == 256
+        assert moe_op.is_q256_kernel(supported.stage1.keywords["kernelName"])
     for unsupported in (
+        {"opus_weights_shuffled": False},
+        {"is_shuffled": False},
+        {"opus_weights_shuffled": True, "gate_up_interleave": True},
         {"is_ep": True},
         {"has_stage1_bias": True},
         {"has_stage2_bias": True},
@@ -2058,6 +2101,7 @@ def test_bm16_tiled_scale_boundary():
             os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
 
 
+@_with_default_device("cuda")
 def test_output_buffer_contract():
     """Validate output identity, copy-back, validation, and compile contracts."""
     torch.manual_seed(0)
@@ -2337,8 +2381,8 @@ def _write_bench_csv(rows):
         )
 
 
+@_with_default_device("cuda")
 def main():
-    torch.set_default_device("cuda")
     _case_iters = []
     test_route_workspace_token_capacity()
     if args.bm16_scale_boundary:
@@ -2424,6 +2468,31 @@ def main():
     aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
     if q256_selected:
         test_q256_token_boundaries()
+
+
+def test_moe_default_device_state():
+    """GPU entry points restore a CPU caller's allocation state, including errors."""
+    with _with_default_device("cpu"):
+        with pytest.raises(RuntimeError, match="negative dimension"):
+            test_fmoe(**_q256_case(-1, 4096))
+        assert torch.get_default_device() == torch.device("cpu")
+        assert torch.empty(0).device.type == "cpu"
+        with (
+            patch.object(args, "no_legacy", True),
+            patch.object(args, "no_flydsl_csv", True),
+        ):
+            main()
+        assert torch.get_default_device() == torch.device("cpu")
+        assert torch.empty(0).device.type == "cpu"
+        with (
+            patch(
+                f"{__name__}.test_route_workspace_token_capacity",
+                side_effect=RuntimeError("device scope failure"),
+            ),
+            pytest.raises(RuntimeError, match="device scope failure"),
+        ):
+            main()
+        assert torch.get_default_device() == torch.device("cpu")
 
 
 if __name__ == "__main__":
