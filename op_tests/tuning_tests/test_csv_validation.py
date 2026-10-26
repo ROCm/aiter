@@ -37,6 +37,7 @@ class TestCSVValidation(unittest.TestCase):
         "bf16": "bf16_tuned_gemm.csv",
         "bf16_batched": "bf16_tuned_batched_gemm.csv",
         "fmoe": "tuned_fmoe.csv",
+        "mha_fwd": "tuned_mha_fwd.csv",
     }
 
     def _load_csv(self, name):
@@ -210,6 +211,23 @@ class TestCSVValidation(unittest.TestCase):
             mismatches,
             "FlyDSL stage2 sorting layout mismatches:\n" + "\n".join(mismatches),
         )
+
+    def test_mha_fwd_runtime_schema(self):
+        from aiter.ops.mha_fwd_policy import (
+            MHA_FWD_RUNTIME_CSV_FIELDS,
+            MHA_FWD_TUNING_KEY_FIELDS,
+            _load_mha_fwd_tuning_table,
+        )
+
+        df = self._load_csv("mha_fwd")
+        self.assertEqual(list(df.columns), list(MHA_FWD_RUNTIME_CSV_FIELDS))
+        self.assertFalse(df["gpu_model"].isna().any())
+        self.assertFalse(df["gpu_model"].astype(str).str.strip().eq("").any())
+        self.assertFalse(df.duplicated(subset=list(MHA_FWD_TUNING_KEY_FIELDS)).any())
+
+        path = os.path.join(CONFIGS_DIR, "tuned_mha_fwd.csv")
+        _load_mha_fwd_tuning_table.cache_clear()
+        self.assertEqual(len(_load_mha_fwd_tuning_table(path)), len(df))
 
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
