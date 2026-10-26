@@ -6,9 +6,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from functools import lru_cache
 from pathlib import Path
-from types import MappingProxyType
 
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
@@ -538,81 +536,29 @@ def a16w16_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     )
 
 
-def a8w8_mxscale_k_tile_bounds(instance: OpusGemmInstance) -> tuple[int, int | None]:
-    """Mirror gfx950 traits' prefetch floor and native scale-panel ceiling."""
-    tag = instance.kernel_tag
-    if tag == "a8w8_mxscale_bmm_bpreshuffle_wave1":
-        return 1, None
-    if tag in ("a8w8_mxscale_bmm_pipeline", "a8w8_mxscale_bmm_pipeline_bpreshuffle"):
-        return 1, 8192 // instance.B_K if instance.preload_sf_lds else None
-
-    bm, bn, bk = instance.B_M, instance.B_N, instance.B_K
-    gm, gn, gk = instance.GROUP_M, instance.GROUP_N, instance.GROUP_K
-    n_groups = (bn + gn - 1) // gn
-    panel_rows = bm // gm + n_groups
-    max_lds = 163840 // instance.WG_PER_CU
-    wave8 = tag in (
-        "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
-        "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
-        "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+def a8w8_mxscale_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
+    """Mirror gfx950 MXFP8 flatmm ``Traits::prefetch_k_iter``."""
+    if instance.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave1":
+        return 1  # the wave1 traits' per-split floor: its ring pads past the end
+    sizeof_da = 1  # FP8
+    is_tile_n = instance.B_M == 16
+    load_group_m = 16 if is_tile_n else 32
+    load_group_n = 16 if is_tile_n else 32
+    load_group_k = instance.W_K
+    num_m = instance.B_M // load_group_m
+    num_n = instance.B_N // load_group_n
+    num_k = instance.B_K // load_group_k
+    smem_linear = 64 * 16 // sizeof_da  # WARP_SIZE=64
+    smem_sub = smem_linear // load_group_k
+    slots = load_group_m // smem_sub
+    padding = 2 * 16 // sizeof_da
+    per_group_load = slots * (smem_linear + padding) * sizeof_da
+    per_iter = (num_m + num_n) * num_k * per_group_load
+    lds_total = 163840
+    return max(
+        1,
+        (lds_total // max(instance.WG_PER_CU, 1)) // max(per_iter, 1),
     )
-    direct_b = tag in (
-        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
-        "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
-    )
-    tile_n = bm == 16 or tag == "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen"
-    load_group = instance.T_M * 16 if wave8 else (16 if tile_n else 32)
-    stage_bytes = (load_group // 8) * 1056 * (bk // 128)
-    per_iter = bm // load_group * stage_bytes
-    if wave8:
-        b_lds = tag == "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds"
-        per_iter += bn * bk if b_lds else 0
-        prefetch = min(max_lds // per_iter, 4 if b_lds else 3)
-        staging = prefetch * per_iter
-        residency = max(1, 163840 // (staging + panel_rows * 64))
-        ceiling = min(max_lds, 163840 // residency)
-        padding = (
-            instance.T_M
-            * 16
-            * (bm // (instance.T_M * 16) * (bk // gk) if gk == 128 else 16)
-        )
-        fit = (ceiling - staging - 256 - padding) // panel_rows * gk
-        panel_k_max = min(fit, 32768) // bk * bk
-        shuf_budget = ceiling - prefetch * (bm // load_group * stage_bytes) - 256
-    else:
-        per_iter += 0 if direct_b else bn // load_group * stage_bytes
-        scales_per_bk = bk // gk
-        vec = 4 if gk == 32 else 1
-        chunk = 64 * vec
-        chunks = (bm // gm * scales_per_bk + chunk - 1) // chunk
-        chunks += (n_groups * scales_per_bk + chunk - 1) // chunk
-        ring_slot = ((chunks + 1) // 2 * 2) * chunk * (4 // vec)
-        plain_depth = max_lds // per_iter
-        ring_depth = (max_lds - ring_slot) // (per_iter + ring_slot)
-        if direct_b:
-            plain_depth, ring_depth = min(plain_depth, 3), min(ring_depth, 3)
-        use_ring = ring_depth >= 3 and (
-            scales_per_bk % vec == 0 if gk == 32 else ring_depth == plain_depth
-        )
-        prefetch = ring_depth if use_ring else plain_depth
-        fit = ((max_lds - prefetch * per_iter - 256) // panel_rows - 16) * gk // bk * bk
-        panel_fits = (
-            gk == 32 and fit >= 4096 and not (bm == bn == bk == 128 and not direct_b)
-        )
-        panel_k_max = min(fit, 8192) if panel_fits else 8192
-        shuf_budget = max_lds - prefetch * per_iter - 256
-
-    max_tiles = None
-    if instance.sf_shuf_in_lds:
-        words_per_k1 = ((bm + 31) // 32) * 16 + n_groups
-        com_rep_k = bk // 128
-        kd = max(1, com_rep_k // 2)
-        cap = panel_k_max // bk * kd if com_rep_k >= 2 else (panel_k_max // bk + 1) // 2
-        k1_max = min(max(0, shuf_budget) // (4 * words_per_k1), cap)
-        max_tiles = k1_max // kd if com_rep_k >= 2 else 2 * k1_max
-    elif instance.preload_sf and not instance.shuffle_scale:
-        max_tiles = panel_k_max // bk
-    return prefetch, max_tiles
 
 
 _BMM_M_ALIGN_TILES = {
@@ -636,95 +582,8 @@ _BMM_M_ALIGN_TILES = {
     "a8w8_mxscale_bmm_mouter_tunable": 1,
 }
 
-# GROUP_N=GROUP_K=32 counterparts use explicit local ids.
-_MX32_KID_OF = {
-    0: 145,
-    1: 146,
-    2: 147,
-    8: 148,
-    9: 149,
-    23: 150,
-    24: 151,
-    25: 152,
-    26: 153,
-    27: 154,
-    28: 155,
-    29: 156,
-    30: 157,
-    32: 158,
-    33: 159,
-    34: 160,
-    35: 161,
-    36: 162,
-    37: 163,
-    38: 164,
-    39: 165,
-    42: 166,
-    43: 167,
-    45: 168,
-    46: 169,
-    47: 170,
-    48: 171,
-    49: 172,
-    50: 173,
-    51: 174,
-    52: 175,
-    53: 176,
-    54: 177,
-    55: 178,
-    56: 179,
-    57: 180,
-    58: 181,
-    59: 182,
-    60: 183,
-    61: 184,
-    63: 185,
-    64: 186,
-    65: 187,
-    66: 188,
-    67: 189,
-    68: 190,
-    69: 191,
-    70: 192,
-    71: 193,
-    72: 194,
-    73: 195,
-    74: 196,
-    75: 197,
-    76: 198,
-    77: 199,
-    78: 200,
-    79: 201,
-    80: 202,
-    81: 203,
-    82: 204,
-    83: 205,
-    84: 206,
-    85: 207,
-    86: 208,
-    87: 209,
-    88: 210,
-    89: 211,
-    90: 212,
-    91: 213,
-    92: 214,
-    93: 215,
-    94: 216,
-    96: 217,
-    97: 218,
-    98: 219,
-    117: 220,
-    118: 221,
-    120: 222,
-    121: 223,
-    122: 224,
-    124: 225,
-    140: 226,
-    141: 227,
-    142: 228,
-    143: 229,
-    144: 230,
-}
+# GROUP_N=GROUP_K=32 counterparts use the base local kid plus this stride.
+MX32_KID_STRIDE = 1000
 
 
 
@@ -1256,7 +1115,7 @@ _bmm_bpre_allwave_local = {
 # Geometry and scheduling stay aligned with their group128 counterparts.
 # Shuffled-scale variants require a different producer layout and are excluded.
 def _mx32_twins(local, ctor, skip=frozenset(), **ctor_kwargs):
-    """The same tile at quant_block=32, using explicit local ids.
+    """{mirror + MX32_KID_STRIDE: the same tile at quant_block=32}.
 
     `skip` holds mirrors whose twin clang 22 cannot compile, the same defect
     _MX32_CLANG_REGCLASS_SKIP covers for the split-K family, plus any whose twin
@@ -1268,7 +1127,7 @@ def _mx32_twins(local, ctor, skip=frozenset(), **ctor_kwargs):
             continue
         if inst.shuffle_scale or getattr(inst, "sf_shuf_in_lds", False):
             continue
-        twins[_MX32_KID_OF[kid]] = ctor(
+        twins[kid + MX32_KID_STRIDE] = ctor(
             inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
             prefetch_scale=inst.prefetch_scale,
             preload_sf=inst.preload_sf,
@@ -1567,7 +1426,7 @@ def _mx32_wave8_twins(local, ctor, *lead, skip=frozenset(), **ctor_kwargs):
     # as a different kernel wearing the twin's id. It has to be passed back in
     # here, by the caller, the same way the mirror's own dict passes it.
     return {
-        _MX32_KID_OF[kid]: ctor(
+        kid + MX32_KID_STRIDE: ctor(
             *[getattr(inst, a) for a in lead],
             inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
             xcd_wgm=inst.xcd_wgm, quant_block=32, **ctor_kwargs,
@@ -1656,12 +1515,12 @@ _bmm_bpre_wave1_local[242] = _a8w8_mxscale_bmm_bpreshuffle_wave1(
 )
 
 
-# Derive GROUP_N=GROUP_K=32 flatmm variants with explicit local IDs.
+# Derive GROUP_N=GROUP_K=32 flatmm variants with kid + MX32_KID_STRIDE.
 # Exclude tiles affected by the ROCm 7.2.4 clang-22
 # register-class defect at the larger register footprints.
 _MX32_CLANG_REGCLASS_SKIP = frozenset({4, 10, 62})
 _bmm_flatmm_local.update({
-    _MX32_KID_OF[kid]: _a8w8_mxscale_bmm_flatmm_splitk(
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
         bm, bn, bk, wg, direct, prefetch, quant_block=32
     )
     for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
@@ -1670,7 +1529,7 @@ _bmm_flatmm_local.update({
 # GROUP_K=32 PRELOAD_SF_LDS variants use the bounded scale ring selected
 # by SF_USE_RING, instead of allocating a whole-split scale panel.
 _bmm_flatmm_local.update({
-    _MX32_KID_OF[kid]: _a8w8_mxscale_bmm_flatmm_splitk(
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
         bm, bn, bk, wg, preload_sf=True, quant_block=32
     )
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
@@ -2935,7 +2794,7 @@ gfx1250_4wave_co_kernels_declared = {
 GFX1250_SPLITK_FUSE_KID_BASE = max(
     (*gfx1250_kernels_list, *gfx1250_clusterlaunch_kernels_list,
      *gfx1250_4wave_co_kernels_declared), default=-1,
-) + 1
+) + 1000
 _sf_kid = GFX1250_SPLITK_FUSE_KID_BASE
 _fuse_tiles_seen = set()
 _fuse_tiles = _GFX1250_CLUSTERLAUNCH_TILES if GFX1250_SPLITK_FUSE_ENABLED else ()
@@ -3033,20 +2892,6 @@ KERNEL_REGISTRY = {
     "a8w8_blockscale_bpreshuffle": {"gfx942": {cu: dict(gfx942_a8w8_kernels_list) for cu in (80, 228, 304)}},
 }
 
-DEFAULT_CU_BY_ARCH = {"gfx950": 256, "gfx942": 304, "gfx1250": 256}
-declared_kernels_list = {
-    (family, gfx, kid): instance
-    for family, arches in KERNEL_REGISTRY.items()
-    for gfx, tables in arches.items()
-    for kid, instance in tables[DEFAULT_CU_BY_ARCH[gfx]].items()
-}
-kernels_list = {
-    key: instance
-    for key, instance in declared_kernels_list.items()
-    if instance.kernel_tag not in _A16W16_CO_TAGS
-    or os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
-}
-
 # fmt: on
 
 
@@ -3060,8 +2905,6 @@ class KernelKey:
     def __post_init__(self):
         object.__setattr__(self, "family", self.family.strip().lower())
         object.__setattr__(self, "gfx", self.gfx.split(":", 1)[0].strip().lower())
-        if not self.family or not self.gfx.startswith("gfx"):
-            raise ValueError("kernel identity requires family and gfx")
         if type(self.cu_num) is not int or self.cu_num <= 0:
             raise ValueError("kernel identity requires a positive integer cu_num")
         if type(self.kid) is not int or self.kid < 0:
@@ -3076,134 +2919,60 @@ class KernelKey:
         return cls(family, gfx, int(cu_num), int(kid))
 
 
-@lru_cache(maxsize=128)
-def declared_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
-    """Select the explicitly registered family/gfx/CU table."""
-    key = KernelKey(family, gfx, cu_num, 0)
-    tables = KERNEL_REGISTRY.get(key.family, {}).get(key.gfx, {})
-    if not tables:
-        return MappingProxyType({})
-    if key.cu_num not in tables:
-        raise ValueError(
-            f"unregistered OPUS namespace {key.family}/{key.gfx}/{key.cu_num}"
-        )
-    return MappingProxyType(tables[key.cu_num])
-
-
 def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
-    """Check optional image availability at use time, including after a build."""
-    records = declared_registry(family, gfx, cu_num)
-    if not records:
-        return records
-    instance = next(iter(records.values()))
-    tags = OPUS_KERNEL_TAGS_BY_ARCH_FAMILY[instance.arch_prefix or "gfx950"]
-    if _A16W16_CO_TAGS.isdisjoint(tags.get(family.strip().lower(), ())):
-        return records
-    directory = Path(co_image_path(CO_KERNELS_JSON, instance)).parent
-    try:
-        with os.scandir(directory) as entries:
-            images = frozenset(
-                entry.name
-                for entry in entries
-                if entry.name.endswith(".co") and entry.is_file()
-            )
-    except FileNotFoundError:
-        images = frozenset()
-    return _available_registry(family, gfx, cu_num, images)
-
-
-@lru_cache(maxsize=128)
-def _available_registry(family, gfx, cu_num, images):
-    records = declared_registry(family, gfx, cu_num)
-    return MappingProxyType(
-        {
+    """Select available kernels from the family/gfx/CU table."""
+    family = family.strip().lower()
+    gfx = gfx.split(":", 1)[0].strip().lower()
+    tables = KERNEL_REGISTRY.get(family, {}).get(gfx, {})
+    if not tables:
+        return {}
+    if type(cu_num) is not int or cu_num not in tables:
+        raise ValueError(f"unregistered OPUS namespace {family}/{gfx}/{cu_num}")
+    records = tables[cu_num]
+    if family == "a16w16" and gfx == "gfx1250":
+        return {
             kid: instance
             for kid, instance in records.items()
             if instance.kernel_tag not in _A16W16_CO_TAGS
-            or Path(co_image_path(CO_KERNELS_JSON, instance)).name in images
+            or os.path.isfile(co_image_path(CO_KERNELS_JSON, instance))
         }
-    )
-
-
-def _clear_registry_cache():
-    declared_registry.cache_clear()
-    _available_registry.cache_clear()
-
-
-get_registry.cache_clear = _clear_registry_cache
+    return records
 
 
 def parse_integer(value, *, name, minimum=0):
     try:
         number = Decimal(str(value))
-        if (
-            not number.is_finite()
-            or number != number.to_integral_value()
-            or number < minimum
-        ):
+        integer = int(number)
+        if number != integer or integer < minimum:
             raise ValueError
-        return int(number)
-    except (InvalidOperation, ValueError, TypeError) as exc:
+        return integer
+    except (InvalidOperation, ValueError, TypeError, OverflowError) as exc:
         raise ValueError(
             f"invalid {name} {value!r}; expected an integer >= {minimum}"
         ) from exc
 
 
-def resolve_kernel(key: KernelKey, *, require_available=True):
-    registry = get_registry if require_available else declared_registry
-    try:
-        return registry(key.family, key.gfx, key.cu_num)[key.kid]
-    except KeyError as exc:
-        raise ValueError(f"unknown OPUS kernel {key.encode()}") from exc
-
-
 def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
-    matches = [
-        kid
-        for kid, instance in get_registry(family, gfx, cu_num).items()
-        if instance.name == name
-    ]
-    if not matches:
+    kid = min(
+        (kid for kid, instance in get_registry(family, gfx, cu_num).items()
+         if instance.name == name),
+        default=None,
+    )
+    if kid is None:
         raise ValueError(
             f"kernel symbol {name!r} is absent from {family}/{gfx}/{cu_num}"
         )
-    return min(matches)
+    return kid
 
 
-def default_compiled_keys(gfx: str, cu_num: int, family="a16w16") -> set[KernelKey]:
+def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
     """Select the default compile set from the current CU table."""
-    if family != "a16w16":
-        return set()
     defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((gfx, cu_num), ())
     return {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)
         if kid in defaults
     }
-
-
-def required_compiled_keys(gfx: str, cu_num: int, extra_keys=()) -> set[KernelKey]:
-    """Share the runtime and builder's complete required identity set."""
-    extra_keys = set(extra_keys)
-    families = {key.family for key in extra_keys}
-    if len(families) > 1 or any(
-        (key.gfx, key.cu_num) != (gfx, cu_num) for key in extra_keys
-    ):
-        raise ValueError("required kernel namespace disagrees with the build target")
-    family = next(iter(families), "a16w16")
-    return default_compiled_keys(gfx, cu_num, family) | extra_keys
-
-
-def compile_document(keys) -> list[str]:
-    return sorted(key.encode() for key in set(keys))
-
-
-def compiled_keys(document) -> set[KernelKey]:
-    if not isinstance(document, list) or not all(
-        isinstance(value, str) for value in document
-    ):
-        return set()  # integer-only caches must be rebuilt
-    return {KernelKey.decode(value) for value in document}
 
 
 def _in_group(name, family, instance):
@@ -3221,31 +2990,13 @@ def _in_group(name, family, instance):
     return family == "a8w8_mxscale_bmm" and name == "BMM_MXSCALE_KIDS"
 
 
-def group_kids(name, gfx=None, family="a16w16", *, cu_num=None):
+def group_kids(name, gfx, family="a16w16", *, cu_num):
     """Derive capability groups from the selected namespace's instances."""
-    if gfx is not None and cu_num is not None:
-        return frozenset(
-            kid
-            for kid, instance in get_registry(family, gfx, cu_num).items()
-            if _in_group(name, family, instance)
-        )
-    keys = frozenset(
-        key
-        for key, instance in kernels_list.items()
-        if _in_group(name, key[0], instance)
-        and (gfx is None or key[:2] == (family, gfx))
+    return frozenset(
+        kid
+        for kid, instance in get_registry(family, gfx, cu_num).items()
+        if _in_group(name, family, instance)
     )
-    return keys if gfx is None else frozenset(key[2] for key in keys)
-
-
-SPLITK_KIDS = group_kids("SPLITK_KIDS")
-NON_SPLITK_KIDS = group_kids("NON_SPLITK_KIDS")
-BIAS_AWARE_KIDS = group_kids("BIAS_AWARE_KIDS")
-BMM_MXSCALE_KIDS = group_kids("BMM_MXSCALE_KIDS")
-GFX1250_4WAVE_CO_KIDS = group_kids("GFX1250_4WAVE_CO_KIDS")
-SPLITK_4G_SAFE_KIDS = group_kids("SPLITK_4G_SAFE_KIDS")
-NON_SPLITK_4G_SAFE_KIDS = group_kids("NON_SPLITK_4G_SAFE_KIDS")
-FOUR_G_SAFE_KIDS = group_kids("FOUR_G_SAFE_KIDS")
 
 BMM_MXSCALE_WORKSPACE_TAGS = frozenset(
     {
@@ -3464,15 +3215,11 @@ def canonical_output_dtype(output_dtype) -> str | None:
     return aliases.get(value, value)
 
 
-def get_kernel_instance(arch, family, kid, output_dtype=None, *, cu_num=None):
+def get_kernel_instance(arch, family, kid, output_dtype=None, *, cu_num):
     """Resolve a local id; runtime callers supply the actual device CU count."""
     arch = str(arch).lower().split(":", 1)[0]
     family = str(family).lower()
     if type(kid) is not int or kid < 0:
-        return None
-    if cu_num is None:
-        cu_num = DEFAULT_CU_BY_ARCH.get(arch)
-    if cu_num is None:
         return None
     instance = get_registry(family, arch, cu_num).get(kid)
     if instance is None:
@@ -3494,7 +3241,7 @@ def get_kernel_instance(arch, family, kid, output_dtype=None, *, cu_num=None):
     return instance
 
 
-def kernel_needs_external_workspace(arch, family, kid, *, cu_num=None):
+def kernel_needs_external_workspace(arch, family, kid, *, cu_num):
     instance = get_kernel_instance(arch, family, kid, cu_num=cu_num)
     if instance is None:
         raise KeyError(f"unknown OPUS kernel {(family, arch, cu_num, kid)}")

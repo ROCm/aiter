@@ -68,17 +68,17 @@ _SPLITK_SEEDS = {
         141,
         143,
         144,
-        145,
-        146,
-        147,
-        149,
-        *range(185, 198),
-        199,
-        200,
-        226,
-        227,
-        229,
-        230,
+        1000,
+        1001,
+        1002,
+        1009,
+        *range(1063, 1076),
+        1077,
+        1078,
+        1140,
+        1141,
+        1143,
+        1144,
         *range(231, 243),
     ),
     (1, 4): range(107, 115),
@@ -89,7 +89,10 @@ _splitk_choices = {
     kid: list(splits) for splits, kids in _SPLITK_SEEDS.items() for kid in kids
 }
 _DEFAULT_EXCLUDED_KIDS = frozenset(
-    (0, 85, 86, 87, *range(117, 125), 145, 207, 208, 209, *range(220, 226))
+    (
+        0, 85, 86, 87, *range(117, 125),
+        1000, 1085, 1086, 1087, 1117, 1118, 1120, 1121, 1122, 1124,
+    )
 )
 _TUNE_POLICY = {
     kid: _splitk_choices.get(kid, [1])
@@ -315,9 +318,6 @@ def make_bmm_tuning_task(
 
 
 class OpusBmmMxscaleTuner(GemmCommonTuner):
-    def get_gfx(self):
-        return _device_arch_and_cu(torch.cuda.current_device())[0]
-
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": "",
@@ -606,7 +606,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         if not (args.all or args.run_config or args.compare) and not self.tunedf.empty:
             have = set(self.tunedf[self.keys].apply(tuple, axis=1))
             self.untunedf = self.untunedf[
-                ~self.untunedf[self.keys].apply(tuple, axis=1).isin(have)
+                ~self.untunedf.apply(tuple, axis=1).isin(have)
             ].reset_index(drop=True)
         self.opus_policy = {
             kid: _TUNE_POLICY.get(kid, _SHUF_POLICY.get(kid)) for kid in _CANDIDATE_KIDS

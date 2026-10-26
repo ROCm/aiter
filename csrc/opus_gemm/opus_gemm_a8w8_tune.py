@@ -25,16 +25,12 @@ from csrc.opus_gemm.opus_gemm_common import (
 _SUPPORTED_GFX = "gfx950"
 
 
-def candidate_kids_for_shape(gfx, m, n, k, scale_ab, outdtype="fp32", *, cu_num=None):
+def candidate_kids_for_shape(gfx, m, n, k, scale_ab, outdtype="fp32", *, cu_num):
     """Return registered plain A8W8 kids whose launch constraints fit the shape."""
     if min(m, n, k) <= 0 or k % 2:
         return []
     family = "a8w8_blockscale" if scale_ab else "a8w8"
     candidates = []
-    if cu_num is None:
-        runtime_gfx, cu_num = _device_arch_and_cu(torch.cuda.current_device())
-        if runtime_gfx != gfx:
-            raise ValueError("candidate namespace requires the target device CU count")
     output_dtype = canonical_output_dtype(outdtype)
     for kid, instance in get_registry(family, gfx, cu_num).items():
         if output_dtype is not None and output_dtype not in instance.output_dtypes:
@@ -124,17 +120,13 @@ _REF_KEYS = ("x", "w", "x_scale", "w_scale")
 
 
 class OpusA8W8Tuner(GemmCommonTuner):
-    def get_gfx(self):
-        return _device_arch_and_cu(torch.cuda.current_device())[0]
-
     ARG_DEFAULTS: ClassVar[dict] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": "/tmp/opus_a8w8_tuned.csv",
         "errRatio": 0.0,
     }
 
-    def __init__(self, family=None):
-        self.family = family
+    def __init__(self):
         super().__init__(
             "opus_a8w8",
             key=["gfx", "cu_num", "M", "N", "K", "dtype", "outdtype", "scaleAB"],
@@ -166,12 +158,6 @@ class OpusA8W8Tuner(GemmCommonTuner):
             help="Output tuned CSV (alias for -o/--tune_file)",
         )
         self.parser.add_argument("--libtype", choices=["opus"], default="opus")
-        self.parser.add_argument(
-            "--family",
-            choices=["a8w8", "a8w8_blockscale"],
-            default=self.family,
-            help="Restrict tuning to one FP8 family.",
-        )
         for action in self.parser._actions:
             if action.dest in {
                 "splitK",
@@ -197,7 +183,7 @@ class OpusA8W8Tuner(GemmCommonTuner):
             "cu_num": self.get_cu_num(),
             "dtype": "fp8",
             "outdtype": "fp32",
-            "scaleAB": self.family == "a8w8_blockscale",
+            "scaleAB": False,
         }
         for column, default in defaults.items():
             if column not in df:
@@ -239,7 +225,6 @@ class OpusA8W8Tuner(GemmCommonTuner):
         return self._normalize_rows(df) if not df.empty else df
 
     def pre_process(self, args):
-        self.family = args.family
         gfx = self.get_gfx()
         if gfx != _SUPPORTED_GFX:
             self.parser.error(
@@ -257,17 +242,11 @@ class OpusA8W8Tuner(GemmCommonTuner):
                 raise FileNotFoundError(args.run_config)
             self.tunedf = self.get_tuned_gemm_list(args.run_config)
             self.untunedf = self.tunedf
-            if self.family is not None:
-                self.untunedf = self.untunedf[
-                    self.untunedf["scaleAB"].eq(self.family == "a8w8_blockscale")
-                ]
             return
         if not args.untune_file:
             self.parser.error("--input_file/-i is required for tuning")
         df = self._normalize_rows(self.get_untuned_gemm_list(args.untune_file))
         df = df[(df["gfx"] == gfx) & (df["cu_num"] == self.get_cu_num())]
-        if self.family is not None:
-            df = df[df["scaleAB"].eq(self.family == "a8w8_blockscale")]
         if df.empty:
             raise ValueError("No input shapes match the current GPU's gfx/cu_num")
         self.untunedf = df[self.keys].drop_duplicates().reset_index(drop=True)
@@ -288,8 +267,8 @@ class OpusA8W8Tuner(GemmCommonTuner):
                 row.M,
                 row.N,
                 row.K,
-                family == "a8w8_blockscale",
-                "fp32",
+                row.scaleAB,
+                row.outdtype,
                 cu_num=cu_num,
             )
             if not kids:
@@ -327,12 +306,7 @@ class OpusA8W8Tuner(GemmCommonTuner):
         )
 
     def getKernelName(self, kernel_id):
-        if self.family is None:
-            return None
-        instance = get_kernel_instance(
-            self.get_gfx(), self.family, kernel_id, cu_num=self.get_cu_num()
-        )
-        return instance.name if instance is not None else None
+        return None
 
     def calculate(self, results, bpes=(1, 1, 4)):
         return super().calculate(results, bpes)

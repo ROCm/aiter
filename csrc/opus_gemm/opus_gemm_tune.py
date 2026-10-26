@@ -827,7 +827,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
 def _ensure_kids_compiled(candidate_kids):
     """Compile required local kernels before spawning tuning workers."""
 
-    from opus_gemm_common import KERNEL_REGISTRY, KernelKey, required_compiled_keys
+    from opus_gemm_common import KERNEL_REGISTRY, KernelKey, default_compiled_keys
 
     from aiter.jit import core
     from aiter.jit.utils.chip_info import get_build_targets
@@ -837,7 +837,7 @@ def _ensure_kids_compiled(candidate_kids):
         return False
     gfx, cu = _device_arch_and_cu(torch.cuda.current_device())
     requests = {KernelKey("a16w16", gfx, cu, int(kid)) for kid in candidate_kids}
-    required = {key.encode() for key in required_compiled_keys(gfx, cu, requests)}
+    required = {key.encode() for key in default_compiled_keys(gfx, cu) | requests}
     md_name = "module_deepgemm_opus"
     sidecar = _opus_sidecar_path()
     artifact = os.path.join(core.get_user_jit_dir(), md_name + core.JIT_LIB_EXT)
@@ -1236,10 +1236,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         "tflops",
         "bw",
     ]
-
-    def get_gfx(self):
-        return _device_arch_and_cu(torch.cuda.current_device())[0]
-
 
     def getKernelName(self, kernelId):
         k = a16w16_all_kernels.get(kernelId)

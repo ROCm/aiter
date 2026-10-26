@@ -12,7 +12,7 @@ from torch import Tensor
 from csrc.opus_gemm.opus_gemm_common import (
     KernelKey,
     OpusGemmInstance,
-    resolve_kernel,
+    get_kernel_instance,
 )
 
 from . import gemm_op_a8w8 as _a8w8_family
@@ -61,7 +61,9 @@ def _resolve_contract(
     split_k: int,
 ) -> OpusGemmInstance:
     """Validate/cache the public contract and selected kernel instance."""
-    instance = resolve_kernel(key)
+    instance = get_kernel_instance(key.gfx, key.family, key.kid, cu_num=key.cu_num)
+    if instance is None:
+        raise ValueError(f"unknown OPUS kernel {key.encode()}")
     kid = key.kid
 
     if key.family == "a16w16":

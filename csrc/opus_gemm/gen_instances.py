@@ -28,8 +28,6 @@ from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
-    compile_document,
-    compiled_keys,
     default_compiled_keys,
     get_registry,
 )
@@ -40,8 +38,7 @@ def _build_targets_standalone(explicit_targets=()):
         targets = []
         for value in explicit_targets:
             gfx, cu = value.split("/")
-            key = KernelKey("a16w16", gfx, int(cu), 0)
-            targets.append((key.gfx, key.cu_num))
+            targets.append((gfx.split(":", 1)[0].strip().lower(), int(cu)))
         return sorted(set(targets))
     utils = str(Path(__file__).resolve().parents[2] / "aiter/jit/utils")
     if utils not in sys.path:
@@ -1334,7 +1331,9 @@ if __name__ == "__main__":
     )
     sidecar_keys = set()
     try:
-        sidecar_keys = compiled_keys(json.loads(Path(sidecar_path).read_text()))
+        document = json.loads(Path(sidecar_path).read_text())
+        if isinstance(document, list) and all(isinstance(value, str) for value in document):
+            sidecar_keys = {KernelKey.decode(value) for value in document}
     except (OSError, ValueError, TypeError, KeyError):
         pass
     defaults = {
@@ -1373,4 +1372,4 @@ if __name__ == "__main__":
     codegen = opus_gemm_codegen(args.working_path, args.tune)
     codegen.gen_instances({key: available[key] for key in sorted(selected)})
     Path(sidecar_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(sidecar_path).write_text(json.dumps(compile_document(selected)) + "\n")
+    Path(sidecar_path).write_text(json.dumps(sorted(key.encode() for key in selected)) + "\n")

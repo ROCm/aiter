@@ -15,7 +15,7 @@ from csrc.opus_gemm.opus_gemm_common import (
     GFX942_MAX_AUTO_SPLIT_K,
     GFX942_MIN_ITERS_PER_SPLIT,
     OpusGemmInstance,
-    a8w8_mxscale_k_tile_bounds,
+    a8w8_mxscale_flatmm_prefetch_k_iter,
     a16w16_flatmm_prefetch_k_iter,
     get_kernel_instance,
 )
@@ -439,11 +439,6 @@ _A8W8_MXSCALE_BMM_PREFETCH_TAGS = _A8W8_MXSCALE_BMM_WORKSPACE_TAGS | frozenset(
         "a8w8_mxscale_bmm_minterleave",
         "a8w8_mxscale_bmm_mouter",
         "a8w8_mxscale_bmm_mouter_tunable",
-        "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
-        "a8w8_mxscale_bmm_bpreshuffle_allwave",
-        "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
-        "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
-        "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
     }
 )
 _A8W8_FAMILY_LAYOUT = {
@@ -661,17 +656,9 @@ def _build_a8w8_mxscale_bmm_plan(
     if instance.direct_only and abi_split_k != 1:
         raise ValueError(f"OPUS BMM kid {resolved_kid} requires split_k <= 1")
 
-    total_iters = K // k_align
-    prefetch_k_iter, max_k_tiles = a8w8_mxscale_k_tile_bounds(instance)
-    if (
-        max_k_tiles is not None
-        and (total_iters + abi_split_k - 1) // abi_split_k > max_k_tiles
-    ):
-        raise ValueError(
-            f"OPUS BMM kid {resolved_kid} scale panel supports at most "
-            f"{max_k_tiles} K-tiles per split; got K={K}, split_k={abi_split_k}"
-        )
     if tag in _A8W8_MXSCALE_BMM_PREFETCH_TAGS:
+        total_iters = K // k_align
+        prefetch_k_iter = a8w8_mxscale_flatmm_prefetch_k_iter(instance)
         if tag in _A8W8_MXSCALE_BMM_WORKSPACE_TAGS:
             if abi_split_k > total_iters:
                 raise ValueError(

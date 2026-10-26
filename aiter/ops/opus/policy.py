@@ -11,8 +11,8 @@ import pandas as pd
 from aiter import logger
 from csrc.opus_gemm.opus_gemm_common import (
     DEFAULT_COMPILED_KIDS_BY_NAMESPACE,
-    DEFAULT_CU_BY_ARCH,
     GFX942_BF16WS_EXACT_N,
+    MX32_KID_STRIDE,
     canonical_output_dtype,
     get_kernel_instance,
     get_registry,
@@ -206,7 +206,7 @@ def _heuristic_a16w16_kid_gfx1250(
 @lru_cache(maxsize=8)
 def _gfx942_heuristic_symbol_to_kid(cu_num=None) -> dict[str, int]:
     """Map heuristic symbols in the selected gfx942 CU table."""
-    cu_num = DEFAULT_CU_BY_ARCH[GFX942] if cu_num is None else cu_num
+    cu_num = get_cu_num() if cu_num is None else cu_num
     result: dict[str, int] = {}
     for kid in DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((GFX942, cu_num), ()):
         instance = get_kernel_instance(GFX942, "a16w16", kid, cu_num=cu_num)
@@ -393,9 +393,9 @@ def select_a16w16_heuristic_kid(
     heuristic = _A16W16_HEURISTICS.get(arch)
     if heuristic is None:
         raise ValueError(f"no OPUS a16w16 heuristic for runtime arch {arch}")
+    cu_num = get_cu_num() if cu_num is None else cu_num
     args = (M, N, K, batch, has_bias, output_dtype)
     kid = int(heuristic(*args, cu_num=cu_num) if arch == GFX942 else heuristic(*args))
-    cu_num = DEFAULT_CU_BY_ARCH[arch] if cu_num is None else cu_num
     if kid not in DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((arch, cu_num), ()):
         raise RuntimeError(
             f"{arch}/{cu_num} a16w16 heuristic returned kid {kid} outside its default compile set"
@@ -783,8 +783,8 @@ def _heuristic_mxscale_bmm_kid(
     """Select a row-major fallback in the current gfx/CU namespace."""
     _validate_mxscale_bmm_group_size(group_size)
 
-    def pick(k128, k32):
-        return k32 if group_size == 32 else k128
+    def pick(kid):
+        return kid + MX32_KID_STRIDE if group_size == 32 else kid
 
     if (
         group_size == 128
@@ -794,13 +794,13 @@ def _heuristic_mxscale_bmm_kid(
     ):
         seed = 16 if 4096 <= k <= 8192 else 15
     elif m < 64:
-        seed = pick(140, 226) if n % 64 == 0 and k % 256 == 0 else pick(144, 230)
+        seed = pick(140) if n % 64 == 0 and k % 256 == 0 else pick(144)
     elif m <= 256 and k <= 1024 and n % 32 == 0 and k % 256 == 0:
-        seed = pick(71, 193)
+        seed = pick(71)
     elif n % 64 == 0 and k % 128 == 0:
-        seed = pick(144, 230)
+        seed = pick(144)
     else:
-        seed = pick(0, 145)
+        seed = pick(0)
     gfx = gfx or get_gfx()
     cu_num = get_cu_num() if cu_num is None else cu_num
     instance = get_kernel_instance(gfx, "a8w8_mxscale_bmm", seed, cu_num=cu_num)
@@ -817,9 +817,9 @@ _BPRESHUFFLE_FALLBACK_BANDS = {
         (None, (34, 83, 27, 80, 88, 139, 138)),
     ),
     32: (
-        (64, (155, 210, 151, 202)),
-        (512, (151, 154, 202, 210)),
-        (None, (160, 205, 154, 202, 210)),
+        (64, (1028, 1088, 1024, 1080)),
+        (512, (1024, 1027, 1080, 1088)),
+        (None, (1034, 1083, 1027, 1080, 1088)),
     ),
 }
 
@@ -882,31 +882,16 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
 # Read kernel layout, scale grouping and M alignment from the registry.
 
 
-@cache
-def _mxscale_bmm_kid_table(gfx: str, cu_num: int) -> dict[int, tuple]:
-    """Metadata for the concrete family/gfx/CU namespace."""
-    return {
-        kid: (
-            int(inst.m_align),
-            bool(inst.needs_preshuffled_b),
-            bool(inst.needs_mpacked_sfa or inst.needs_shuffle_scale),
-            int(inst.GROUP_K),
-            int(inst.GROUP_N),
-        )
-        for kid, inst in get_registry("a8w8_mxscale_bmm", gfx, cu_num).items()
-    }
-
-
 def _mxscale_bmm_entry(kid: int, gfx: str | None, cu_num: int | None):
     gfx = gfx or get_gfx()
     cu_num = get_cu_num() if cu_num is None else cu_num
-    return _mxscale_bmm_kid_table(gfx, cu_num).get(int(kid))
+    return get_registry("a8w8_mxscale_bmm", gfx, cu_num).get(int(kid))
 
 
 def mxscale_bmm_kid_runs_m(kid: int, m: int, *, gfx=None, cu_num=None) -> bool:
     """True iff kid's launcher accepts this M. Unknown kid -> False."""
     entry = _mxscale_bmm_entry(kid, gfx, cu_num)
-    return entry is not None and m % entry[0] == 0
+    return entry is not None and m % entry.m_align == 0
 
 
 def mxscale_bmm_kid_takes_b_layout(
@@ -914,25 +899,25 @@ def mxscale_bmm_kid_takes_b_layout(
 ) -> bool:
     """True iff kid wants B in the layout the caller says it has."""
     entry = _mxscale_bmm_entry(kid, gfx, cu_num)
-    return entry is not None and entry[1] == bool(b_preshuffled)
+    return entry is not None and entry.needs_preshuffled_b == bool(b_preshuffled)
 
 
 def mxscale_bmm_kid_takes_plain_scales(kid: int, *, gfx=None, cu_num=None) -> bool:
     """True iff kid reads x_scale / w_scale as the public entry passes them."""
     entry = _mxscale_bmm_entry(kid, gfx, cu_num)
-    return entry is not None and not entry[2]
+    return entry is not None and not (entry.needs_mpacked_sfa or entry.needs_shuffle_scale)
 
 
 def mxscale_bmm_kid_group(kid: int, *, gfx=None, cu_num=None) -> int | None:
     """The kid's quantisation block (GROUP_K), or None for an unknown kid."""
     entry = _mxscale_bmm_entry(kid, gfx, cu_num)
-    return None if entry is None else entry[3]
+    return None if entry is None else entry.GROUP_K
 
 
 def mxscale_bmm_kid_block(kid: int, *, gfx=None, cu_num=None) -> str | None:
     """Complete weight-scale block, including independent N grouping."""
     entry = _mxscale_bmm_entry(kid, gfx, cu_num)
-    return None if entry is None else f"{entry[4]}x{entry[3]}"
+    return None if entry is None else f"{entry.GROUP_N}x{entry.GROUP_K}"
 
 
 def resolve_a8w8_mxscale_bmm_plan(
@@ -965,7 +950,7 @@ def resolve_a8w8_mxscale_bmm_plan(
         try:
             kid = int(config["kernelId"])
             entry = _mxscale_bmm_entry(kid, gfx, cu_num)
-            if entry is None or entry[1] or entry[2]:
+            if entry is None or entry.needs_preshuffled_b or entry.needs_mpacked_sfa or entry.needs_shuffle_scale:
                 raise ValueError(
                     f"kid {kid} wants a preshuffled B or host-rearranged scales"
                 )
