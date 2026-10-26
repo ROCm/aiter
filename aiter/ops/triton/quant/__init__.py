@@ -17,6 +17,7 @@ from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_flatten_mxfp4_quant,
     fused_reduce_act_mul_and_mxfp4_quant,
     fused_reduce_rms_mxfp4_quant,
+    fused_rms_gated_mxfp4_quant,
     fused_rms_mxfp4_quant,
 )
 from aiter.ops.triton.quant.fused_mxfp8_quant import (
@@ -81,6 +82,7 @@ __all__ = [
     "fused_rms_fp8_per_tensor_static_quant",
     "fused_rms_gated_fp8_group_quant",
     # fused_mxfp4_quant.py exports
+    "fused_rms_gated_mxfp4_quant",
     "fused_rms_mxfp4_quant",
     # fused_mxfp8_quant.py exports
     "fused_rms_mxfp8_quant",
