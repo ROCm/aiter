@@ -443,7 +443,7 @@ def compile_gfx1250_pa_decode(
         buf: fx.Array[fx.Int32, t.total_bytes // 4, 16]
 
     @flyc.kernel(known_block_size=(128, 1, 1))
-    def kernel(
+    def pa_decode_tile_kernel(
         pmax: fx.Pointer,
         psum: fx.Pointer,
         pout: fx.Pointer,
@@ -552,7 +552,7 @@ def compile_gfx1250_pa_decode(
         stream: fx.Stream,
     ):
         _ = tag
-        kernel(
+        pa_decode_tile_kernel(
             pmax,
             psum,
             pout,
@@ -579,5 +579,5 @@ def compile_gfx1250_pa_decode(
             stream=stream,
         )
 
-    compiled = {"launch": launch, "kernel": kernel}
+    compiled = {"launch": launch, "kernel": pa_decode_tile_kernel}
     return _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)

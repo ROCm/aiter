@@ -146,7 +146,7 @@ def compile_pa_decode_ps_reduce(
         partials: fx.Array[fx.Float32, max(1, (groups - 1) * head_size), 16]
 
     @flyc.kernel(known_block_size=block)
-    def pa_decode_ps_reduce_kernel(
+    def pa_decode_reduce_kernel(
         output_ptr: fx.Pointer,
         exp_sums_ptr: fx.Pointer,
         max_logits_ptr: fx.Pointer,
@@ -475,7 +475,7 @@ def compile_pa_decode_ps_reduce(
     ):
         query_rows = query_seq_len * fx.Int32(query_group_size)
         num_ctas = batch_size * num_kv_heads * query_rows
-        pa_decode_ps_reduce_kernel(
+        pa_decode_reduce_kernel(
             output,
             exp_sums,
             max_logits,
@@ -508,5 +508,5 @@ def compile_pa_decode_ps_reduce(
 
     return {
         "launch": launch_pa_decode_ps_reduce_kernel,
-        "kernel": pa_decode_ps_reduce_kernel,
+        "kernel": pa_decode_reduce_kernel,
     }
