@@ -25,7 +25,8 @@ void top_k_per_row_decode(const aiter_tensor_t& logits,
                           int64_t stride1,
                           int64_t k                               = 2048,
                           std::optional<aiter_tensor_t> workspace = std::nullopt,
-                          bool stable                             = false);
+                          bool stable                             = false,
+                          std::optional<aiter_tensor_t> values    = std::nullopt);
 
 // Workspace-management queries exposed to Python (see get_topk_mb_workspace).
 int64_t topk_mb_workspace_size(int64_t numRows, int64_t stride0, int64_t k, bool is_decode);

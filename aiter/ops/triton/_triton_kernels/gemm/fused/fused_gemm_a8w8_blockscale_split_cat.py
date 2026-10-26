@@ -5,8 +5,26 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+_fused_gemm_a8w8_blockscale_split_cat_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_split_cat",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "cache_modifier",
+    ],
+)
 
 
 @triton.heuristics(
@@ -16,7 +34,7 @@ from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_split_cat_repr)
 def _fused_gemm_a8w8_blockscale_split_cat(
     # Pointers to matrices
     a_ptr,
@@ -238,10 +256,25 @@ def _fused_gemm_a8w8_blockscale_split_cat(
                 c1_ptr
                 + stride_c1_m * offs_c1_m[:, None]
                 + stride_c1_n * offs_c1_n[None, :]
-                + stride_c1_k * pid_k
+                + stride_c1_k * pid_k.to(tl.int64)
             )
             c1_mask = (offs_c1_m[:, None] < M) & (offs_c1_n[None, :] < N)
             tl.store(c1_ptrs, c, mask=c1_mask)
+
+
+_fused_gemm_a8w8_blockscale_preshuffle_split_cat_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_preshuffle_split_cat",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "cache_modifier",
+    ],
+)
 
 
 @triton.heuristics(
@@ -251,7 +284,7 @@ def _fused_gemm_a8w8_blockscale_split_cat(
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_preshuffle_split_cat_repr)
 def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     # Pointers to matrices
     a_ptr,
@@ -491,13 +524,25 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
                 c1_ptr
                 + stride_c1_m * offs_c1_m[:, None]
                 + stride_c1_n * offs_c1_n[None, :]
-                + stride_c1_k * pid_k
+                + stride_c1_k * pid_k.to(tl.int64)
             )
             c1_mask = (offs_c1_m[:, None] < M) & (offs_c1_n[None, :] < N)
             tl.store(c1_ptrs, c, mask=c1_mask)
 
 
-@triton.jit
+_fused_gemm_a8w8_blockscale_split_cat_reduce_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_split_cat_reduce",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_S3",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
+
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_split_cat_reduce_repr)
 def _fused_gemm_a8w8_blockscale_split_cat_reduce(
     c_ptr,
     c1_ptr,
@@ -550,7 +595,7 @@ def _fused_gemm_a8w8_blockscale_split_cat_reduce(
     offs_k = tl.arange(0, MAX_KSPLIT)
     c_ptrs = (
         c_ptr
-        + (offs_k[:, None, None] * stride_c_k)
+        + (offs_k[:, None, None].to(tl.int64) * stride_c_k)
         + (offs_m[None, :, None] * stride_c_m)
         + (offs_n[None, None, :] * stride_c_n)
     )

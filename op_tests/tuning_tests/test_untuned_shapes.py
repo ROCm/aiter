@@ -83,13 +83,14 @@ class TestUntunedShapes(unittest.TestCase):
     def test_shard_id_uses_explicit_value_or_hostname_and_pid(self):
         with mock.patch.dict(os.environ, {"AITER_TUNE_GEMM_SHARD_ID": "rank/0"}):
             self.assertTrue(self._path().endswith("a8w8_untuned_gemm.rank_0.csv"))
-        with mock.patch.dict(os.environ, {"AITER_TUNE_GEMM_SHARD_ID": ""}), mock.patch.object(
-            untuned_shapes.socket, "gethostname", return_value="worker-a"
+        with (
+            mock.patch.dict(os.environ, {"AITER_TUNE_GEMM_SHARD_ID": ""}),
+            mock.patch.object(
+                untuned_shapes.socket, "gethostname", return_value="worker-a"
+            ),
         ):
             self.assertTrue(
-                self._path().endswith(
-                    f"a8w8_untuned_gemm.worker-a.{os.getpid()}.csv"
-                )
+                self._path().endswith(f"a8w8_untuned_gemm.worker-a.{os.getpid()}.csv")
             )
 
     def test_same_process_deduplicates_rows(self):
@@ -229,13 +230,16 @@ class TestCompiledGraphRecording(unittest.TestCase):
 
         from aiter.ops import gemm_op_a8w8
 
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ,
-            {
-                "AITER_TUNE_GEMM": "1",
-                "AITER_TUNE_GEMM_DIR": directory,
-                "AITER_TUNE_GEMM_SHARD_ID": "capture-test",
-            },
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "AITER_TUNE_GEMM": "1",
+                    "AITER_TUNE_GEMM_DIR": directory,
+                    "AITER_TUNE_GEMM_SHARD_ID": "capture-test",
+                },
+            ),
         ):
             untuned_shapes._ENABLED = None
             untuned_shapes._SEEN.clear()
@@ -261,8 +265,12 @@ class TestCompiledGraphRecording(unittest.TestCase):
                     return file.read().splitlines()
 
             with (
-                mock.patch.object(gemm_op_a8w8, "gemm_a8w8_ck", side_effect=fake_kernel),
-                mock.patch.object(gemm_op_a8w8, "_ck_a8w8_supported", return_value=True),
+                mock.patch.object(
+                    gemm_op_a8w8, "gemm_a8w8_ck", side_effect=fake_kernel
+                ),
+                mock.patch.object(
+                    gemm_op_a8w8, "_ck_a8w8_supported", return_value=True
+                ),
                 mock.patch.object(gemm_op_a8w8, "get_gfx", return_value="gfx950"),
                 mock.patch.object(gemm_op_a8w8, "get_cu_num", return_value=304),
             ):

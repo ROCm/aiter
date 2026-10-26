@@ -13,6 +13,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "dtypes.hpp"
+
 #ifndef OPUS_ENABLE_RUNTIME_QUERY
 #define OPUS_ENABLE_RUNTIME_QUERY 0
 #endif
@@ -1007,17 +1009,8 @@ template<typename T> struct is_dtype : false_type {};
 template<typename T> constexpr bool is_dtype_v = is_dtype<remove_cvref_t<T>>::value;    // use this!
 
 REGISTER_DTYPE(fp32, float)
-// clang>=24 types the half operands of the fp16 matrix-core builtins (wmma_*_f16, mfma_*f16) and of raw_ptr_buffer_atomic_fadd_v2f16 as _Float16, and an __fp16 ext_vector no longer converts to a _Float16 one -- every fp16 mfma/wmma dispatch below is a hard error under __fp16 there. _Float16 is what opus used before clang 20 and what ck_tile still uses; the cost of respelling it is that arithmetic on fp16_t becomes a native half fma (v_fma_f16) instead of the fp32-intermediate v_fma_mixlo_f16, so keep __fp16 on the older compilers rather than shifting their numerics.
-#if __clang_major__ >= 24
-REGISTER_DTYPE(bf16, __bf16)
-REGISTER_DTYPE(fp16, _Float16)
-#elif __clang_major__ >= 20   // enable for rocm 7.0+
-REGISTER_DTYPE(bf16, __bf16)
-REGISTER_DTYPE(fp16, __fp16)
-#else
-REGISTER_DTYPE(bf16, unsigned short)
-REGISTER_DTYPE(fp16, _Float16)
-#endif
+REGISTER_DTYPE(bf16, dtypes::bf16)
+REGISTER_DTYPE(fp16, dtypes::fp16)
 REGISTER_DTYPE(fp8 , _BitInt(8))
 REGISTER_DTYPE(bf8 , unsigned _BitInt(8))
 REGISTER_DTYPE(i32 , int)
@@ -1212,16 +1205,27 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
 }
+
+// Optimized software RNE, selected with rounding mode 5. Canonicalizes NaNs to 0x7fff.
+OPUS_D constexpr unsigned short fp32_to_bf16_rtn_fast_raw(float f)
+{
+    const unsigned int bits    = __builtin_bit_cast(unsigned int, f);
+    const unsigned int rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    // Fast-math builds may optimize away NaN handling.
+    const unsigned int result  = ((bits & 0x7fffffffu) > 0x7f800000u) ? 0x7fff0000u : rounded;
+    return static_cast<unsigned short>(result >> 16);
+}
 #if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250/gfx12 has instruction conversion, leave 'rm' here for compatiblity
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
 #else
-template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm 4:rta_asm(round to nearest away)
+template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm, 4:rta_asm(round to nearest away), 5:optimized software RNE
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
     if      constexpr (rm == 0) {return __builtin_bit_cast(bf16_t, fp32_to_bf16_rtn_raw(x)); }
     else if constexpr (rm == 1) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<unsigned short>(z | (!(~z & 0x7f800000) && (z & 0xffff) ? 0x10000 : 0) >> 16)); }
     else if constexpr (rm == 2) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<unsigned short>(z >> 16)); }
     else if constexpr (rm == 3) { return fp32_to_bf16_rtn_asm(x); }
+    else if constexpr (rm == 5) { return __builtin_bit_cast(bf16_t, fp32_to_bf16_rtn_fast_raw(x)); }
 }
 #endif
 
@@ -1604,6 +1608,8 @@ OPUS_H_D constexpr index_t get_smem_size()
 {
 #if defined(__gfx950__)
     return 163840;  // 160KB (CDNA4)
+#elif defined(__gfx1250__)
+    return 327680;  // 320KB (CDNA5)
 #else
     return 65536;   // 64KB
 #endif
@@ -2240,8 +2246,9 @@ struct smem {
     }
 
     // bulk load API, give me a Shape of this tile, will issue multiple load instruction based on the y-shape space
+    // A compile-time c_os element offset folds LDS slot displacements into ds_read immediates, avoiding per-load address arithmetic.
     template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
-    OPUS_D auto load(const Layout& u)
+    OPUS_D auto load(const Layout& u, int c_os = 0)
     {
         using LT = layout_load_traits<Layout, vec>;
         constexpr auto r_elem = LT::r_elem;
@@ -2250,13 +2257,13 @@ struct smem {
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         for (index_t i = 0; i < r_elem.value; i++) {
-            auto tmp = load<vec>(offsets[i]);
+            auto tmp = load<vec>(offsets[i] + c_os);
             for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
         }
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i]);
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i] + c_os);
         return r;
 #endif
     }

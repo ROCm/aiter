@@ -21,9 +21,8 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 try:
     from triton.language.extra.libdevice import (
@@ -860,10 +859,8 @@ def _hstu_attn_bwd(
 def _get_fwd_config(
     AUTOTUNE_Z: int,
 ):
-    dev = arch_info.get_arch()
-    config = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_FWD.json",
-    )
+    cfg_dir = resolve_config_dir("attention", "HSTU_ATTN_FWD", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
 
     if AUTOTUNE_Z < 512:
         batch_key = "small_batch"
@@ -879,10 +876,8 @@ def _get_fwd_config(
 def _get_bwd_config(
     AUTOTUNE_Z: int,
 ):
-    dev = arch_info.get_arch()
-    config = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_BWD.json",
-    )
+    cfg_dir = resolve_config_dir("attention", "HSTU_ATTN_BWD", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
 
     if AUTOTUNE_Z < 512:
         batch_key = "small_batch"

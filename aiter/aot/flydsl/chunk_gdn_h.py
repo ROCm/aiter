@@ -42,10 +42,9 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.flydsl.kernels.chunk_gated_delta_h_opt import (
-    compile_chunk_gated_delta_h_opt,
-)
+from aiter.ops.flydsl.kernels.gdr_prefill import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 CHUNK_GDN_H_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_opt"
@@ -74,7 +73,7 @@ _FIXED_SWITCHES: dict[str, bool] = {
 
 def _parse_bool(s: str) -> bool:
     """CSV-friendly bool parser. Tolerates ``"True"``/``"False"`` (Python
-    ``str(bool)`` style, used by gdr_decode_tuned.csv) plus the more
+    ``str(bool)`` style, which is what a tuner writes) plus the more
     permissive ``"1"/"0"``, ``"yes"/"no"`` for handwritten csvs."""
     s = s.strip()
     if s in ("True", "true", "1", "yes"):
@@ -244,7 +243,7 @@ def _compile_to_cache(
         else int32_dummy
     )
 
-    launch_fn = compile_chunk_gated_delta_h_opt(
+    launch_fn = compile_chunk_gated_delta_h(
         K=K,
         V=V,
         BT=BT,
@@ -399,4 +398,5 @@ def main():
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()

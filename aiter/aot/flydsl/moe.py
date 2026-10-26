@@ -48,11 +48,15 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    requires_flydsl_stage2_global_a,
+    requires_flydsl_stage2_reduce,
+    resolve_flydsl_grid_y_persist_m,
     resolve_flydsl_stage1_tile_n,
     resolve_flydsl_stage2_tile_k,
     runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -60,6 +64,11 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
+
+
+def _mx_w2_scale_numel(experts: int, model_dim: int, inter_dim: int) -> int:
+    scale_k = (inter_dim + 255) // 256 * 256
+    return experts * model_dim * (scale_k // 32)
 
 
 def parse_csv(csv_path: str):
@@ -85,8 +94,11 @@ def parse_csv(csv_path: str):
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
+            gfx = (row.get("gfx") or "").strip()
             block_m = int(row.get("block_m", "0") or "0")
             shared_expert_id = int(row.get("shared_expert_id", "-1") or "-1")
+            model_dim_pad = int(row.get("hidden_pad", "0") or "0")
+            inter_dim_pad = int(row.get("intermediate_pad", "0") or "0")
             act_type = row.get("act_type", "")
             act_name = act_type.strip().split(".")[-1].lower()
             act = act_name if act_name in ("swiglu", "situv2") else "silu"
@@ -137,8 +149,9 @@ def parse_csv(csv_path: str):
                     "inter_dim": inter_dim,
                     "topk": topk,
                     "cu_num": cu_num,
+                    "gfx": gfx,
                     # Not used by the epilogue compile; zeroed so dedup keys on
-                    # (act, inter_dim, topk, cu_num) only.
+                    # (act, inter_dim, topk, gfx, cu_num) only.
                     "model_dim": 0,
                     "experts": 0,
                 }
@@ -174,14 +187,17 @@ def parse_csv(csv_path: str):
                         "topk": topk,
                         "doweight_stage1": doweight_stage1,
                         "cu_num": cu_num,
+                        "gfx": gfx,
                         "act": act,
                         "enable_bias": enable_bias,
                         "token_num": token,
                         "block_m": block_m,
+                        "model_dim_pad": model_dim_pad,
+                        "inter_dim_pad": inter_dim_pad,
                     }
                     if shared_expert_id >= 0:
                         job["shared_expert_id"] = shared_expert_id
-                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
+                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant --
                     # this changes the shape of a2_scale (sorted scale buffer
                     # vs separate quant call output).
                     if params["stage"] == 2:
@@ -195,12 +211,23 @@ def parse_csv(csv_path: str):
                         full_job["v2_output_layout"] = True
                         if stage2_v2_params is not None:
                             full_job["out_dtype"] = stage2_v2_params["a_dtype"]
-                    key = job_identity(full_job)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-
-                    jobs.append(full_job)
+                    is_fhmoe_stage1 = (
+                        params["stage"] == 1
+                        and shared_expert_id >= 0
+                        and params["b_dtype"] == "fp8"
+                    )
+                    compile_jobs = [full_job]
+                    if is_fhmoe_stage1:
+                        compile_jobs = [
+                            {**full_job, "clamp_shared": True},
+                            {**full_job, "clamp_shared": False},
+                        ]
+                    for compile_job in compile_jobs:
+                        key = job_identity(compile_job)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        jobs.append(compile_job)
 
     return jobs
 
@@ -236,12 +263,15 @@ def _precompile_to_cache(
     cu_num: int = 0,
     token_num: int = 0,
     block_m: int = 0,
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    clamp_shared: bool = True,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -259,8 +289,8 @@ def _precompile_to_cache(
     topk, a_dtype, b_dtype, ...)`` combination, then dispatches into the same
     runtime entry points used by the fused-MoE op.  ``COMPILE_ONLY=1`` causes
     the executor to compile and persist the artifact without launching a
-    kernel.  This guarantees that the cache key written here equals the cache
-    key the runtime will look up at inference time.
+    kernel. Tests compare representative AOT/runtime identities and run-only
+    retrieval so cache-key drift is detected.
     """
     import torch
 
@@ -321,7 +351,7 @@ def _precompile_to_cache(
         return None
 
     def _make_a1_scale():
-        """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
+        """Mirror per-1x32 MXFP4/MXFP8 runtime a1_scale construction."""
         if not use_mx_gemm:
             return None
         if a_dtype == "fp8":
@@ -352,7 +382,7 @@ def _precompile_to_cache(
         """Stage2 a2_scale construction per fused_moe_2stages.
 
         When upstream stage1 fuses fp4/fp8 quant (``stage1_fuse_quant`` set),
-        stage2 receives stage1's ``out_scale_sorted`` buffer directly — that
+        stage2 receives stage1's ``out_scale_sorted`` buffer directly -- that
         buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
         its own input and the resulting sorted scale uses 32-row alignment.
         """
@@ -397,7 +427,7 @@ def _precompile_to_cache(
         return None
 
     def _make_w_scale(scale_storage_numel: int):
-        # mxfp4 e8m0 scale — viewed as uint8 by _view_safe before kernel launch.
+        # MX E8M0 scale storage is viewed as uint8 before kernel launch.
         return torch.zeros(scale_storage_numel, dtype=torch.uint8, device=dev)
 
     def _make_a_user(a_dtype_user_shape):
@@ -598,30 +628,35 @@ def _precompile_to_cache(
                 if _aot_backend is None
                 else _aot_backend.compile_stage1
             )
-            exe = compile_stage1(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=E,
-                topk=topk,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                doweight_stage1=(sw is not None),
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                out_dtype=_gemm_out_dtype,
-                act=act,
-                use_async_copy=True,
-                k_batch=k_batch,
-                waves_per_eu=waves_per_eu,
-                b_nt=b_nt,
-                gate_mode=gate_mode,
-                enable_bias=(kernel_bias is not None),
-                a_scale_one=a_scale_one,
-                xcd_swizzle=xcd_swizzle,
-                k_wave=k_wave,
-                v2_output_layout=_v2_output_layout,
-            )
+            stage1_compile_kwargs = {
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "experts": E,
+                "topk": topk,
+                "tile_m": tile_m,
+                "tile_n": tile_n,
+                "tile_k": tile_k,
+                "doweight_stage1": (sw is not None),
+                "a_dtype": a_dtype,
+                "b_dtype": b_dtype,
+                "out_dtype": _gemm_out_dtype,
+                "act": act,
+                "use_async_copy": True,
+                "k_batch": k_batch,
+                "waves_per_eu": waves_per_eu,
+                "b_nt": b_nt,
+                "gate_mode": gate_mode,
+                "model_dim_pad": model_dim_pad,
+                "inter_dim_pad": inter_dim_pad,
+                "enable_bias": (kernel_bias is not None),
+                "a_scale_one": a_scale_one,
+                "xcd_swizzle": xcd_swizzle,
+                "k_wave": k_wave,
+                "v2_output_layout": _v2_output_layout,
+            }
+            if _aot_backend is not None:
+                stage1_compile_kwargs["clamp_shared"] = clamp_shared
+            exe = compile_stage1(**stage1_compile_kwargs)
             _run_compiled(exe, args)
 
             if _gui_sk_fused or _gui_sk or _splitk_fp4:
@@ -669,7 +704,6 @@ def _precompile_to_cache(
             # inter_dim=384), in which case runtime compiles the legal fallback.
             tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
 
-            # Stage2 input is (token_num, topk, inter_dim) in a_dtype storage.
             if a_dtype == "fp4":
                 a_shape = (tokens, topk, inter_dim // 2)
             else:
@@ -680,7 +714,7 @@ def _precompile_to_cache(
 
             a2_scale = _make_a2_scale_for_stage2()
             if use_mx_gemm:
-                w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
+                w2_scale = _make_w_scale(_mx_w2_scale_numel(E, model_dim, inter_dim))
             else:
                 w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
 
@@ -692,7 +726,9 @@ def _precompile_to_cache(
             )
 
             torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
-            accumulate = mode != "reduce"
+            accumulate = mode != "reduce" and not requires_flydsl_stage2_reduce(
+                tokens, model_dim, 2
+            )
             out = torch.zeros((tokens, model_dim), dtype=torch_out_dtype, device=dev)
             target = out
             if not accumulate:
@@ -733,7 +769,9 @@ def _precompile_to_cache(
             else:
                 _persist_m = -1 if m_blocks > 256 else 1
             if a_dtype == "fp8":
-                _persist_m = 1
+                # Mirror runtime normalization for legacy tuned names that
+                # retain `_persist` as part of their identity.
+                _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
             _n_in = model_dim
             _k_in = inter_dim
@@ -755,6 +793,7 @@ def _precompile_to_cache(
                     sw_arg,
                     num_valid_ids,
                     tokens,
+                    tokens * topk,
                     _n_in,
                     _k_in,
                     m_blocks,
@@ -802,8 +841,11 @@ def _precompile_to_cache(
                 sort_block_m=sort_block_m,
                 waves_per_eu=waves_per_eu,
                 use_async_copy=use_async_copy,
+                use_global_a=requires_flydsl_stage2_global_a(a),
                 cu_num_mul=cu_num_mul,
                 b_nt=b_nt,
+                model_dim_pad=model_dim_pad,
+                inter_dim_pad=inter_dim_pad,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
             )
@@ -843,6 +885,7 @@ def _precompile_a16w4_to_cache(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    waves_per_eu: int | None = None,
     b_dtype: str = "fp4",
     **kwargs,
 ):
@@ -851,8 +894,8 @@ def _precompile_a16w4_to_cache(
     The port launch ABI (raw fx.Int64 device pointers) differs from the generic MX
     gemm (``_s1_args_fp4``), so it can't reuse ``_precompile_to_cache``'s arg
     builders.  Instead drive the SAME runtime launchers (``flydsl_a16w4_gemm{1,2}``)
-    the fused-MoE op uses, under ``COMPILE_ONLY=1`` — the cache key then matches
-    runtime by construction (``waves_per_eu=None``, ``persist=False``,
+    the fused-MoE op uses, under ``COMPILE_ONLY=1`` -- the cache key then matches
+    runtime by construction (``waves_per_eu`` follows runtime, ``persist=False``,
     ``w_layout="standard"``, g2 tile downgrade are all applied inside the
     launcher).  The compiled artifact is keyed only on the kernel's constexpr
     params (shapes/tiles/topk/act), never on the launch pointers, grid, or
@@ -878,7 +921,6 @@ def _precompile_a16w4_to_cache(
         "tile_m": tile_m,
         "b_nt": b_nt,
         "xcd_swizzle": xcd_swizzle,
-        "waves_per_eu": None,
         "stream": 0,
     }
     with compile_only_env():
@@ -893,6 +935,7 @@ def _precompile_a16w4_to_cache(
                 tile_n=tile_n,
                 tile_k=tile_k,
                 k_wave=k_wave,
+                waves_per_eu=None if waves_per_eu == 1 else waves_per_eu,
                 act=("situv2" if act in ("situv2", "situ") else act),
                 w_dtype=b_dtype,
                 w_layout="standard",
@@ -923,6 +966,11 @@ def _precompile_a16w4_to_cache(
                 tile_n=g2_tile_n,
                 tile_k=g2_tile_k,
                 w_dtype=b_dtype,
+                epilog=(
+                    "reduce"
+                    if b_dtype == "int4" and kwargs.get("mode") == "reduce"
+                    else "atomic"
+                ),
                 **common,
             )
 
@@ -1003,6 +1051,7 @@ def compile_one_config(
     experts: int,
     topk: int,
     cu_num: int = 0,
+    gfx: str = "",
     **kwargs,
 ) -> dict:
     """Compile one MoE kernel configuration and save to cache.
@@ -1012,7 +1061,7 @@ def compile_one_config(
 
     Returns a dict with timing info.
     """
-    aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
+    aot_arch = gfx or cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
     is_epilogue = kwargs.get("stage") == "epilogue"
     shape_str = (
         f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
@@ -1074,6 +1123,7 @@ def compile_one_config(
 
                         precompile = precompile_fhmoe_to_cache
                         kwargs["shared_expert_id"] = shared_expert_id
+                        kwargs["gfx"] = aot_arch
                     else:
                         precompile = _precompile_to_cache
                     precompile(
@@ -1131,7 +1181,7 @@ def main():
     print(f"  Stage2 jobs:    {len(stage2_jobs)}")
     print(f"  Epilogue jobs:  {len(epilogue_jobs)}")
     print(f"  Total jobs:     {len(all_jobs)}")
-    print("  Compile arch: (from cu_num)")
+    print("  Compile arch: (from gfx, with legacy cu_num fallback)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)
@@ -1171,4 +1221,5 @@ def main():
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()

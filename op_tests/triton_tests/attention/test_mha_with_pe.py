@@ -15,7 +15,10 @@ from aiter.test_mha_common import (
     generate_qkv,
     generate_random_padding_mask,
 )
-from op_tests.triton_tests.attention.mha_test_utils import pad_rearrange_dropout_mask
+from op_tests.triton_tests.attention.mha_test_utils import (
+    pad_rearrange_dropout_mask,
+    skip_if_gluon_unsupported,
+)
 
 arch = get_arch()
 
@@ -29,6 +32,7 @@ arch = get_arch()
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(128, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.25])
 @pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -39,10 +43,16 @@ def test_mha_with_pe(
     HEAD_SZ_V: int,
     DROPOUT: float,
     CAUSAL: bool,
+    backend: str,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
+
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+    )
 
     # TODO: Enable these test cases once this is fixed
     if arch == "gfx942" and (CAUSAL or HAS_DROPOUT):
@@ -72,6 +82,7 @@ def test_mha_with_pe(
         causal=CAUSAL,
         return_lse=HAS_DROPOUT,
         return_attn_probs=HAS_DROPOUT,
+        backend=backend,
     )
     if HAS_DROPOUT:
         assert len(triton_out) == 3
@@ -102,6 +113,7 @@ def test_mha_with_pe(
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(96, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.17])
 @pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_varlen_with_pe(
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -111,11 +123,17 @@ def test_mha_varlen_with_pe(
     HEAD_SZ_V: int,
     DROPOUT: float,
     CAUSAL: bool,
+    backend: str,
 ):
     BATCH = 5
     HAS_DROPOUT: bool = DROPOUT > 0.0
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
+
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+    )
 
     # TODO: Enable these test cases once this is fixed
     if arch == "gfx942" and (CAUSAL or HAS_DROPOUT):
@@ -166,6 +184,7 @@ def test_mha_varlen_with_pe(
         causal=CAUSAL,
         return_lse=HAS_DROPOUT,
         return_attn_probs=HAS_DROPOUT,
+        backend=backend,
     )
     if HAS_DROPOUT:
         assert len(triton_out) == 3
