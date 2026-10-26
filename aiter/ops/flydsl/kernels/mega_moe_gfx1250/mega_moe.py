@@ -1480,6 +1480,27 @@ class MegaMoEGfx1250:
         self._tdm_stage_capacity = stg_cap
         return variants
 
+    @staticmethod
+    def _mori_dispatch_stores_total_recv() -> bool:
+        """Whether mori's gfx1250 dispatch stores total_recv rather than adding to it.
+
+        Read off the source mori JIT-compiles, the same tree it builds from; anything
+        unexpected answers False and keeps the per-forward reset.
+        """
+        try:
+            from mori.jit.config import get_mori_source_root
+
+            root = get_mori_source_root()
+            src = (
+                root / "src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp"
+            ).read_text()
+        except Exception:
+            return False
+        return (
+            "*args.totalRecvTokenNum = myRecv;" in src
+            and "atomicAdd(args.totalRecvTokenNum" not in src
+        )
+
     def _build_mori_dispatch(self, config: MegaMoEConfig) -> dict:
         """Build mori HIP/JIT dispatch launchers keyed by (block, warp) spec.
 
@@ -1532,6 +1553,7 @@ class MegaMoEGfx1250:
             plans[spec] = plan
         # The kernels dereference the window, so the plans have to outlive them.
         self._mori_plans = plans
+        self._mori_stores_total_recv = self._mori_dispatch_stores_total_recv()
 
         # mori's op layer builds the tokoff-ext slot allocator in
         # EpDispatchCombineOpHip.__init__; driving EpDispatchPlan directly
@@ -1567,9 +1589,11 @@ class MegaMoEGfx1250:
                 stream,
                 reset_recv=True,
             ):
-                # mori's dispatch only accumulates into total_recv (this package's
-                # zeroes it in Phase 2), so without this it grows every forward.
-                if reset_recv:
+                # mori before ROCm/mori#599 only accumulated into total_recv, so
+                # it was zeroed before every dispatch; from #599 on the dispatch
+                # stores it, and the reset is dead work every layer. A caller
+                # whose routing kernel already zeroed it skips it too.
+                if reset_recv and not self._mori_stores_total_recv:
                     self._total_recv.zero_()
                 plan.launch(
                     stream=torch.cuda.current_stream().cuda_stream,
