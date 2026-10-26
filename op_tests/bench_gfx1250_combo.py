@@ -2042,9 +2042,7 @@ def _run_mla_v4_decode_ep(args):
                             row.get("opus us") is not None
                             and row.get("asm us") is not None
                         ):
-                            row["opus/asm"] = _perf_ratio(
-                                row["opus us"], row["asm us"]
-                            )
+                            row["opus/asm"] = _perf_ratio(row["opus us"], row["asm us"])
                 except (RuntimeError, AssertionError, ValueError) as exc:
                     msg = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
                     row["err_msg"] = msg
