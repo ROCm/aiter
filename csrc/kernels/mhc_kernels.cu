@@ -2420,7 +2420,16 @@ namespace aiter {
             MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 7168, 512, 512, true); \
         } \
     } else if (hidden_size == 4096) { \
-        if (m < 4 * cu_num) { \
+        if (get_gpu_arch() == "gfx950" && cu_num == 256) { \
+            /* Pin the 2-row/512 reduction topology across the m = 4*cu_num \
+             * boundary. Keep the existing use_nt threshold; use_nt does \
+             * not change the arithmetic. */ \
+            if (m > 8 * cu_num) { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 4096, 512, 512, true); \
+            } else { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 4096, 512, 512, false); \
+            } \
+        } else if (m < 4 * cu_num) { \
             if (WARP_SIZE == 32) { \
                 MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 1, 4096, 1024, 1024, false); \
             } else { \

@@ -7,7 +7,7 @@ import math
 import torch
 from torch import Tensor
 
-from aiter import dtypes
+from aiter import dtypes, logger
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
@@ -111,6 +111,53 @@ def mhc_pre_big_fuse_rmsnorm(
     sinkhorn_repeat: int = 20,
     res_preshuffle: int = 0,
 ) -> None: ...
+
+
+# Keep the pre GEMM reduction tree independent of runtime M for this family.
+# The fused output RMSNorm needs a matching native topology pin below. This
+# policy also covers large_m_splitk, but not the separate fused post+pre GEMM.
+_MHC_STABLE_PRE_FAMILIES = {
+    # hc_hidden_size = hc_mult * hidden_size = 4 * 4096.
+    ("gfx950", 256, 16384): (16, 128),
+}
+_MHC_STABLE_PRE_LOGGED: set[tuple[str, int, int]] = set()
+
+# The fused output RMSNorm has its own M-dependent native launch policy.  Keep
+# this registry beside the selector pin so runtime telemetry makes both
+# invariants explicit. The native kernel owns the matching launch dispatch;
+# cross-M GPU tests exercise it, including odd rows and dispatch boundaries.
+_MHC_STABLE_RMSNORM_FAMILIES = {
+    # (num_rows, residual_block, norm_block)
+    ("gfx950", 256, 4096): (2, 512, 512),
+}
+_MHC_STABLE_RMSNORM_LOGGED: set[tuple[str, int, int]] = set()
+
+
+def _get_stable_mhc_pre_config(
+    arch: str, num_cu: int, hc_hidden_size: int
+) -> tuple[int, int] | None:
+    """Pinned (split_k, tile_k) for a registered family, else None."""
+    return _MHC_STABLE_PRE_FAMILIES.get((arch, num_cu, hc_hidden_size))
+
+
+def _log_stable_mhc_rmsnorm_family(hidden_size: int) -> None:
+    arch = get_gfx_runtime()
+    num_cu = get_cu_num()
+    family = (arch, num_cu, hidden_size)
+    config = _MHC_STABLE_RMSNORM_FAMILIES.get(family)
+    if config is None or family in _MHC_STABLE_RMSNORM_LOGGED:
+        return
+    logger.info(
+        "mHC pre stable fused RMSNorm family selected: "
+        "arch=%s cu_num=%d hidden_size=%d num_rows=%d "
+        "residual_block=%d norm_block=%d "
+        "reason=cross_m_layer_input_consistency",
+        arch,
+        num_cu,
+        hidden_size,
+        *config,
+    )
+    _MHC_STABLE_RMSNORM_LOGGED.add(family)
 
 
 # Pre-shuffled residual layout selected independently with res_preshuffle=1
@@ -351,14 +398,37 @@ def mhc_res_unshuffle(shuffled: torch.Tensor, ks: int | None = None) -> torch.Te
     return mhc_res_unshuffle_flydsl(shuffled, ks)
 
 
-@functools.lru_cache(maxsize=1024)
 def get_mhc_pre_splitk(
     m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
 ) -> tuple[int, int]:
+    # Include the runtime family in the cache key so a configuration selected
+    # for another architecture/CU count cannot bypass the stability pin.
+    return _get_mhc_pre_splitk(
+        m, hc_hidden_size, w_preshuffle_bf16, get_gfx_runtime(), get_cu_num()
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_mhc_pre_splitk(
+    m: int, hc_hidden_size: int, w_preshuffle_bf16: bool, arch: str, num_cu: int
+) -> tuple[int, int]:
     prefetch_stages = 2
     tile_m = 16 * 4
-    num_cu = get_cu_num()
-    arch = get_gfx_runtime()
+    stable_config = _get_stable_mhc_pre_config(arch, num_cu, hc_hidden_size)
+    if stable_config is not None:
+        family = (arch, num_cu, hc_hidden_size)
+        if family not in _MHC_STABLE_PRE_LOGGED:
+            logger.info(
+                "mHC pre stable split-K family selected: "
+                "arch=%s cu_num=%d hc_hidden_size=%d split_k=%d tile_k=%d "
+                "reason=cross_m_reduction_tree",
+                arch,
+                num_cu,
+                hc_hidden_size,
+                *stable_config,
+            )
+            _MHC_STABLE_PRE_LOGGED.add(family)
+        return stable_config
     # Vector LDS weight reads shorten the gfx1250 BF16 loop. More split-K
     # workgroups improve latency hiding for large M without changing FP32 tuning.
     prefill_tg_factor = (
@@ -730,6 +800,7 @@ def mhc_pre(
     comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
     layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
     if norm_weight is not None:
+        _log_stable_mhc_rmsnorm_family(hidden_size)
         mhc_pre_big_fuse_rmsnorm(
             post_mix,
             comb_mix,
@@ -797,7 +868,16 @@ def get_mhc_pre_splitk_large_m(
     m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
 ) -> tuple[int, int]:
     """Split-K policy for gfx950 large-M post_pre kernel (M > 1024)."""
-    if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
+    arch = get_gfx_runtime()
+    num_cu = get_cu_num()
+    # A pinned family must own this path too. The short-circuit below changes
+    # split-K exactly at its M >= 8192 boundary, which would otherwise
+    # reintroduce the M dependence this pin exists to remove.
+    if _get_stable_mhc_pre_config(arch, num_cu, hc_hidden_size) is not None:
+        return get_mhc_pre_splitk(
+            m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16
+        )
+    if arch == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
         return 8, 64
     return get_mhc_pre_splitk(m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16)
 
