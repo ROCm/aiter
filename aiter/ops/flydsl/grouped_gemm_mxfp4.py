@@ -10,7 +10,7 @@ import os
 import torch
 
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from .kernels.tensor_shim import ptr_arg
+from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
@@ -206,15 +206,7 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
-    launch_gemm_a8w4_tdm(
-        out,
-        ptr_arg(a),
-        ptr_arg(w),
-        a_scales.view(torch.int32),
-        w_scales.view(torch.int32),
-        contiguous_m,
-        stream,
-        N,
+    gemm_spec = (
         K,
         tile_m,
         tile_n,
@@ -224,42 +216,64 @@ def flydsl_grouped_gemm_a8w4_masked(
         out_is_f16,
         num_buffers,
         a_is_fp4,
-        ptr_arg(m_tile_map),
-        n_experts,
-        stage1_act,
-        has_bias,
-        bias_ptr,
-        float(swiglu_limit),
-        stage1_quant_out,
-        quant_wmma_rep,
-        quant_scale_tensor,
+    )
+    route_spec = (n_experts, stage1_act, has_bias)
+    quant_spec = (stage1_quant_out, quant_wmma_rep)
+    tdm_spec = (
         cluster_n,
         cluster_m,
         _select_bool_env("AITER_TDM_NEXT_STAGE_PREFETCH", next_stage_prefetch),
         waves_per_tensor_tdm,
         _select_bool_env("AITER_GROUPED_GEMM_AS_PROLOGUE", tdm_as_in_prologue),
         _select_tdm_b_th(tdm_b_th),
-        enable_ep_scatter=int(enable_ep_scatter),
-        ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
-        ep_combine_input_offset=(
-            int(stage2_scatter.combine_input_offset) if enable_ep_scatter else 0
+    )
+    ep_spec = (
+        int(enable_ep_scatter),
+        int(stage2_scatter.arena_handle) if enable_ep_scatter else 0,
+        int(stage2_scatter.combine_input_offset) if enable_ep_scatter else 0,
+        int(stage2_scatter.slot_stride_bytes) if enable_ep_scatter else 0,
+        int(ep_destination_stride),
+        int(stage2_scatter.world_size) if enable_ep_scatter else 0,
+        int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0,
+    )
+    layout_spec = (
+        int(row_major_ascale),
+        int(a_row_stride_bytes),
+        int(a_scale_row_stride_bytes),
+        int(lds_soa_load_interleave),
+        persistent_workers,
+        rolled_drain,
+    )
+    _run_compiled(
+        launch_gemm_a8w4_tdm,
+        out,
+        ptr_arg(a),
+        ptr_arg(w),
+        a_scales.view(torch.int32),
+        w_scales.view(torch.int32),
+        contiguous_m,
+        stream,
+        N,
+        *gemm_spec,
+        ptr_arg(m_tile_map),
+        *route_spec,
+        bias_ptr,
+        float(swiglu_limit),
+        *quant_spec,
+        quant_scale_tensor,
+        *tdm_spec,
+        *ep_spec,
+        ep_row_map_tensor,
+        float(situ_beta),
+        float(situ_linear_beta),
+        *layout_spec,
+        specialization_key=(
+            gemm_spec,
+            route_spec,
+            quant_spec,
+            tdm_spec,
+            ep_spec,
+            layout_spec,
         ),
-        ep_slot_stride_bytes=(
-            int(stage2_scatter.slot_stride_bytes) if enable_ep_scatter else 0
-        ),
-        ep_destination_stride=int(ep_destination_stride),
-        ep_world_size=int(stage2_scatter.world_size) if enable_ep_scatter else 0,
-        ep_quant_bits=(
-            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
-        ),
-        arg_ep_row_map=ep_row_map_tensor,
-        f32_situ_beta=float(situ_beta),
-        f32_situ_linear_beta=float(situ_linear_beta),
-        row_major_ascale=int(row_major_ascale),
-        a_row_stride_bytes=int(a_row_stride_bytes),
-        a_scale_row_stride_bytes=int(a_scale_row_stride_bytes),
-        lds_soa_load_interleave=int(lds_soa_load_interleave),
-        persistent_workers=persistent_workers,
-        rolled_drain=rolled_drain,
     )
     return out

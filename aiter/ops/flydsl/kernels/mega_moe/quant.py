@@ -10,7 +10,11 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
-from ..tensor_shim import buf_copy_atom, ptr_buf_tensor
+from ..tensor_shim import (
+    _run_compiled,
+    buf_copy_atom,
+    ptr_buf_tensor,
+)
 
 BLOCK = 64
 GROUP = 32
@@ -181,8 +185,14 @@ def per_1x32_mx_quant(x, quant_mode="fp4", stream=None):
         stream if stream is not None else torch.cuda.current_stream().cuda_stream
     )
     # Store FP4 as bytes and return the payload with aiter's packed FP4 dtype.
-    _get_launcher(n, quant_mode)(
-        x, y, scale, int(m), int(grid_blocks), stream=fx_stream
+    _run_compiled(
+        _get_launcher(n, quant_mode),
+        x,
+        y,
+        scale,
+        int(m),
+        int(grid_blocks),
+        fx_stream,
     )
     if quant_mode == "fp4":
         y = y.view(torch.float4_e2m1fn_x2)
@@ -287,12 +297,13 @@ def mxfp4_moe_scale_sort(
     fx_stream = fx.Stream(
         stream if stream is not None else torch.cuda.current_stream().cuda_stream
     )
-    launcher(
+    _run_compiled(
+        launcher,
         scale_u8,
         sorted_ids,
         num_valid,
         out_u8,
         int(token_num),
         int(grid_tiles),
-        stream=fx_stream,
+        fx_stream,
     )

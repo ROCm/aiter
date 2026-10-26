@@ -16,6 +16,7 @@ from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
+from ..tensor_shim import _run_compiled
 from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
     _i32_buffer,
@@ -930,7 +931,8 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     if stream is None:
         stream = torch.cuda.current_stream()
 
-    launcher(
+    _run_compiled(
+        launcher,
         out,
         q_fp4,
         q_scale,

@@ -26,6 +26,8 @@ import flydsl.expr as fx
 import torch
 from flydsl.compiler.protocol import dsl_size_of as sizeof
 
+from ..tensor_shim import _run_compiled
+
 BLOCK_SIZE = 256
 BM, BN = 64, 64
 Q_HEADS = 4
@@ -510,7 +512,9 @@ def qsa_paged_mqa_logits_flydsl(
     token_to_request = token_to_request.to(torch.int32)
     query_positions = query_positions.to(torch.int32)
     context_lens = context_lens.to(torch.int32)
-    _qsa_logits_layout_launch(
+    inv_divisor = 1.0 / divisor
+    _run_compiled(
+        _qsa_logits_layout_launch,
         q,
         compressed_k_cache,
         page_table,
@@ -526,6 +530,7 @@ def qsa_paged_mqa_logits_flydsl(
         page_table.shape[0],
         page_table.shape[1],
         _cdiv(rows, BM) * _cdiv(columns, BN),
-        1.0 / divisor,
-        stream=torch.cuda.current_stream(),
+        inv_divisor,
+        torch.cuda.current_stream(),
+        specialization_key=inv_divisor,
     )
