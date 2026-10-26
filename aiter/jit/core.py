@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import sys
-import threading
 import time
 import traceback
 import types
@@ -40,19 +39,20 @@ ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 AITER_DISABLE_KERNARG_PRELOAD = (
     int(os.environ.get("AITER_DISABLE_KERNARG_PRELOAD", "0")) != 0
 )
-_MAX_JOBS_LOCK = threading.Lock()
-_LAST_AUTO_MAX_JOBS = None
+
+
+@functools.lru_cache(maxsize=256)
+def _atoi_flag(raw: str) -> bool:
+    m = re.match(r"\s*([+-]?\d+)", raw)
+    return m is not None and int(m.group(1)) != 0
+
+
+def env_flag_atoi(name: str, default: str = "") -> bool:
+    return _atoi_flag(os.environ.get(name, default))
 
 
 def is_experimental_enabled() -> bool:
-    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
-    # any other integer value as enabled. Non-numeric strings are treated as
-    # disabled to avoid accidentally turning on experimental code paths.
-    val = os.environ.get("AITER_ENABLE_EXPERIMENTAL", "0")
-    try:
-        return int(val) != 0
-    except ValueError:
-        return False
+    return env_flag_atoi("AITER_ENABLE_EXPERIMENTAL")
 
 
 aiter_lib = None
@@ -182,6 +182,11 @@ AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxfp8_bpreshuffle_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_mxscale_bpreshuffle_tuned_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_abpreshuffle_tuned_gemm.csv",
@@ -248,6 +253,18 @@ AITER_CONFIG_IQ2R_GLM53 = os.getenv(
 AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
     "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
+)
+
+# MegaMoE TP (aiter/ops/flydsl/mega_moe_tp.py): the small-batch engine's launch configs and
+# the big-M kernel's chunk plans
+AITER_CONFIG_MEGA_MOE_TP = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_tuned.csv",
+)
+
+AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
+    "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+    f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
 )
 
 
@@ -359,6 +376,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE,
+            "a4w4_mxscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
     def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE",
@@ -414,6 +439,20 @@ class AITER_CONFIG:
             "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
             AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
             "tuned_dispatch_combine_intranode",
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP", AITER_CONFIG_MEGA_MOE_TP, "mega_moe_tp_tuned"
+        )
+
+    @property
+    def AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MEGA_MOE_TP_BIGM",
+            AITER_CONFIG_MEGA_MOE_TP_BIGM,
+            "mega_moe_tp_bigm_tuned",
         )
 
     @property
@@ -898,36 +937,6 @@ def check_LLVM_MAIN_REVISION():
         except OSError:
             pass
     return 554785 - 1
-
-
-def check_and_set_ninja_worker():
-    global _LAST_AUTO_MAX_JOBS
-
-    with _MAX_JOBS_LOCK:
-        max_jobs_env = os.environ.get("MAX_JOBS")
-        if max_jobs_env is not None:
-            try:
-                max_jobs = int(max_jobs_env)
-                if max_jobs > 0 and max_jobs_env != _LAST_AUTO_MAX_JOBS:
-                    os.environ["MAX_JOBS"] = str(max_jobs)
-                    _LAST_AUTO_MAX_JOBS = None
-                    return
-            except ValueError:
-                pass
-
-        max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
-        import psutil
-
-        # calculate the maximum allowed NUM_JOBS based on free memory
-        free_memory_gb = psutil.virtual_memory().available / (
-            1024**3
-        )  # free memory in GB
-        max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
-
-        # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-        max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
-        _LAST_AUTO_MAX_JOBS = str(max_jobs)
-        os.environ["MAX_JOBS"] = _LAST_AUTO_MAX_JOBS
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
@@ -1426,8 +1435,6 @@ def build_module(
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
-        check_and_set_ninja_worker()
-
         blob_dir = f"{op_dir}/blob"
         staged_blob_dir = None
         staged_token = None
@@ -1806,6 +1813,29 @@ def _is_union(origin):
 ) = range(7)
 
 
+def build_ctypes_module(md_name: str) -> str:
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
+    if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
+        d_args = get_args_of_build(md_name)
+        d_args["torch_exclude"] = True
+        build_module(
+            md_name,
+            d_args["srcs"],
+            d_args["flags_extra_cc"],
+            d_args["flags_extra_hip"],
+            d_args["blob_gen_cmd"],
+            d_args["extra_include"],
+            d_args["extra_ldflags"],
+            d_args["verbose"],
+            d_args["is_python_module"],
+            d_args["is_standalone"],
+            d_args["torch_exclude"],
+            d_args.get("third_party", []),
+            flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+        )
+    return so_path
+
+
 def _ctypes_call(func, fc_name, md_name):
     """Build a ctypes-based caller for a torch-free .so module.
 
@@ -1851,25 +1881,7 @@ def _ctypes_call(func, fc_name, md_name):
     def _ensure_loaded():
         if _cache:
             return
-        so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
-        if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
-            d_args = get_args_of_build(md_name)
-            d_args["torch_exclude"] = True
-            build_module(
-                md_name,
-                d_args["srcs"],
-                d_args["flags_extra_cc"],
-                d_args["flags_extra_hip"],
-                d_args["blob_gen_cmd"],
-                d_args["extra_include"],
-                d_args["extra_ldflags"],
-                d_args["verbose"],
-                d_args["is_python_module"],
-                d_args["is_standalone"],
-                d_args["torch_exclude"],
-                d_args.get("third_party", []),
-                flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
-            )
+        so_path = build_ctypes_module(md_name)
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
 
@@ -2158,6 +2170,16 @@ def _pybind_develop_hooks():
     return _pybind_develop_hooks_cache
 
 
+def _develop_arg(a, convert, tensor_cls):
+    """`a` as a develop=True pybind op takes it: a tensor converted, and so is
+    every tensor of a list (a std::vector<aiter_tensor_t> argument)."""
+    if isinstance(a, tensor_cls):
+        return convert(a)
+    if isinstance(a, (list, tuple)) and any(isinstance(x, tensor_cls) for x in a):
+        return [convert(x) if isinstance(x, tensor_cls) else x for x in a]
+    return a
+
+
 def compile_ops(
     _md_name: str,
     fc_name: str | None = None,
@@ -2262,7 +2284,6 @@ def compile_ops(
                     return None
 
                 def check_args():
-                    get_asm_dir()
                     import inspect
                     import re
 
@@ -2464,12 +2485,10 @@ def compile_ops(
                             ),
                         )
 
-                    args = tuple(
-                        convert(a) if isinstance(a, tensor_cls) else a for a in args
-                    )
+                    args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
                     if kwargs:
                         kwargs = {
-                            k: convert(v) if isinstance(v, tensor_cls) else v
+                            k: _develop_arg(v, convert, tensor_cls)
                             for k, v in kwargs.items()
                         }
 

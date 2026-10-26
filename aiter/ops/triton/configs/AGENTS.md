@@ -8,8 +8,8 @@ rename or tune a config file.
 ## Rules
 
 1. Put tuning values in JSON. Do not put them in Python: no `setdefault`, no
-   inline dicts, no arch-specific constants and no fallback configs. If a
-   value is missing, fix the JSON.
+   inline dicts, no arch-specific constants and no fallback configs. Do not
+   put them in CSV files. If a value is missing, fix the JSON.
 2. Read configs only through a loader in `utils/`. The loaders use
    `resolve_config_dir()` and `load_config_json()`. Do not use
    `json.load(open(...))`, function-attribute caches or paths built by hand
@@ -27,6 +27,9 @@ rename or tune a config file.
    support it. On RDNA (gfx11xx, gfx120x), it has no effect.
 8. Do not add `.gitkeep` files. Make a `<d_type>/` folder only when you add
    files to it.
+9. Put only config values in the JSON files. Do not add comments or notes,
+   for example `"_comment"` or `"_note"` keys. Put the explanation in the code
+   that reads the config, or in the PR description.
 
 ## Layout
 
@@ -39,7 +42,7 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 | ---- | ------ |
 | `<arch>` | `gfx942`, `gfx950`, `gfx1100`, `gfx1101`, `gfx1150`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
 | `<backend>` | `triton` or `gluon` |
-| `<op>` | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant` |
+| `<op>` | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`, `normalization` |
 | `<d_type>` | `config_name.lower().replace("-", "_")`: `GEMM-AFP4WFP4` → `gemm_afp4wfp4` |
 
 Examples:
@@ -59,12 +62,13 @@ Two config names must not give the same `<d_type>`: `GEMM-FOO-BAR` and
 | Module | Functions |
 | ------ | --------- |
 | `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, `select_leq_config` |
-| `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
+| `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `clamp_num_buffers`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` |
 | `utils/conv_config_utils.py` | `get_conv_config` and the shape-key helpers |
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` and the other MHC loaders |
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config`, `autotune_configs` |
 | `utils/quant_config_utils.py` | `get_quant_config` (Gluon quant) |
+| `utils/normalization_config_utils.py` | `get_normalization_config` |
 
 Each function has one home. Do not add re-exports or forwarding wrappers.
 Attention and GMM kernels read their `DEFAULT.json` with
@@ -177,10 +181,10 @@ there is no file. Do not change the returned dict.
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
 
 - `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
-- `<bucket>` comes from `m2bucket()`: `tiny`, `small`, `medium`, `medium2`,
-  `large` and `xlarge` (M split at 8, 32, 128, 256 and 512). Give each new
-  Gluon shape all six buckets. A missing bucket falls back to
-  `bm<block_m>_any`.
+- `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
+  `medium` (M ≤ 128), `medium2` (M ≤ 256), `large` (M ≤ 512) and `xlarge`
+  (M > 512). Give each new Gluon shape all six buckets. A missing bucket
+  falls back to `bm<block_m>_any`.
 - Each Gluon file has a `bm<block_m>_any` entry for each `block_m`.
 
 ## Conv
@@ -232,6 +236,8 @@ in lowercase (`mhc_fused_sinkhorn`).
 When an arch has no file for a family, copy the file from the nearest
 measured arch. The copy must be byte identical. Say it in the commit message.
 The allowed seeds are gfx950 → gfx1250 and gfx1151 → gfx1150, Triton only.
+The seed from gfx1101 to gfx1200 and gfx1201 is also allowed, for Triton MHA
+only.
 Never seed a Gluon folder. Never seed into gfx950. Replace seeds with
 measured values.
 
