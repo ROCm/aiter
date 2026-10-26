@@ -28,10 +28,11 @@ split-K neighbours), and a row's kernelId names the backend that runs it,
 On gfx1250 the same table's 32x32 and 128x128 blocks are tuned alike
 (--mxscale_table; its 1x32 block has a 32x4-shuffled w_scale, not tuned here): the
 candidates are the FlyDSL WMMA kernels that fit the shape, named for the block's
-runner (``flydsl_mxfp8_128_...``; ``flydsl_mxfp8_32_..._wb32x32`` on the raw
-[N/32, K/32] w_scale). 32x32 searches wmma_common.tuning_kernels, a per-shape
-space wider than kernels_list (tile_n follows N, more tile_m / warp / cluster
-choices, split-K of the compute kernel always fused); 128x128 keeps kernels_list.
+runner (``flydsl_mxfp8_128_...``; ``flydsl_mxfp8_32_...`` on the raw [N/32, K/32]
+w_scale; the row's w_scale_block names the block, as for gfx950 and the batched
+table). 32x32 searches wmma_common.tuning_kernels, a per-shape space wider than
+kernels_list (tile_n follows N, more tile_m / warp / cluster choices, split-K of
+the compute kernel always fused); 128x128 keeps kernels_list.
 """
 
 from typing import Any, ClassVar
@@ -198,7 +199,7 @@ def gfx1250_candidates(m, n, k, w_scale_block):
 
     w32 = w_scale_block == "32x32"
     if w32:
-        kernels = enumerate(tuning_kernels(m, n, k, scale_block=32, b_scale_32x32=True))
+        kernels = enumerate(tuning_kernels(m, n, k, scale_block=32, w_scale_32x32=True))
     else:
         kernels = (
             (kid, ki)
@@ -206,7 +207,7 @@ def gfx1250_candidates(m, n, k, w_scale_block):
             if kernel_fits_shape(ki, m, n, k, allow_n_tail=True)
         )
     return [
-        (kid, ki.split_k, mxfp8_32_kernel_name(ki.name, True) if w32 else ki.name)
+        (kid, ki.split_k, mxfp8_32_kernel_name(ki.name) if w32 else ki.name)
         for kid, ki in kernels
     ]
 
@@ -218,21 +219,14 @@ def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_nam
         run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250,
     )
 
-    # The kernelName carries the block, as gfx950's does: mxfp8_32 names are the
-    # 32x32 (``_wb32x32``) runner's, the rest mxfp8_128's.
-    cfg = parse_mxfp8_32_wmma_kernel_name(kernel_name)
-    if cfg is None:
+    # gfx1250 tunes 32x32 and 128x128 only: mxfp8_32 names run the raw 32x32
+    # w_scale, the rest are mxfp8_128's.
+    if parse_mxfp8_32_wmma_kernel_name(kernel_name) is None:
         return run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
             x, weight_shuffle, x_scale, w_scale, out, kernel_name
         )
     return run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
-        x,
-        weight_shuffle,
-        x_scale,
-        w_scale,
-        out,
-        kernel_name,
-        b_scale_32x32=cfg["b_scale_32x32"],
+        x, weight_shuffle, x_scale, w_scale, out, kernel_name, w_scale_32x32=True
     )
 
 

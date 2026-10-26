@@ -71,6 +71,10 @@ from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
     compile_bmm_a8w8_mxfp8_gfx950,
     parse_bmm_kernel_name,
 )
+from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+    BMM_MX32_WMMA_NAME_PREFIX,
+    parse_bmm_mx32_kernel_name,
+)
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
@@ -118,7 +122,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     check_persistent_n_tiles,
     cluster_m_fallback_values,
     is_compute_wmma_kernel_name,
-    k_is_bounded,
+    k_has_tail,
     n_is_bounded,
     parse_mxfp8_32_wmma_kernel_name,
     scale_k_align,
@@ -211,6 +215,26 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
         "lds_stage": int(m.group("lds_stage")) if m.group("lds_stage") else 2,
         "scheduler": m.group("scheduler"),
         "k_split": int(m.group("k_split")) if m.group("k_split") else 1,
+    }
+
+
+def _bmm_mx32_job(row: dict, kernel_name: str, b: int, n: int, k: int) -> dict | None:
+    """A gfx1250 batched mxfp8_32 row as a compile job (M is a runtime argument).
+
+    One job per kernel, B, N, K serves every M bucket; the w_scale block is the row's.
+    """
+    if parse_bmm_mx32_kernel_name(kernel_name) is None:
+        return None
+    return {
+        "kernel_name": kernel_name,
+        "kind": "bmm_mx32",
+        "m": 1,
+        "n": n,
+        "k": k,
+        "cu_num": 0,
+        "gfx": row.get("gfx", "").strip(),
+        "b": b,
+        "w_scale_block": row.get("w_scale_block", "").strip(),
     }
 
 
@@ -328,6 +352,10 @@ def parse_csv(csv_path: str):
 
         if row.get("b", "").strip():  # a batched row (may be in a mixed table)
             job = None
+            if kernel_name.startswith(f"{BMM_MX32_WMMA_NAME_PREFIX}_"):
+                job = _bmm_mx32_job(
+                    row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
+                )
             if kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
                 job = _bmm_mfma_job(
                     row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
@@ -410,6 +438,8 @@ def parse_csv(csv_path: str):
                 params = dict(params)
                 params["kind"] = "mxfp8_wmma"
                 params["scale_block"] = MX32_BLOCK_K
+                # The block is the row's (w_scale_block), not the name's.
+                params["w_scale_32x32"] = mxfp8_block == "32x32"
         elif kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
             params = parse_ptpc_wmma_kernel_name(kernel_name)
             if params is not None:
@@ -964,6 +994,72 @@ def _compile_bmm_mfma_to_cache(
         compile_bmm_a8w8_mxfp8_gfx950(kernel_name, b, n, k, rows, x_scale_transposed)
 
 
+def _compile_bmm_mx32_to_cache(
+    *, kernel_name: str, n: int, k: int, b: int, w_scale_block: str = "1x32", **kwargs
+):
+    """Compile one gfx1250 batched mxfp8_32 config (compile-only, CPU dummies).
+
+    The launch takes run_bmm_a8w8_mxfp8_32_gfx1250's argument order (PR #6864), so the
+    cache entry is the one that runner hits at run time."""
+    del kwargs
+    import torch
+
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import MX32_BLOCK_K
+    from aiter.ops.flydsl.kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
+
+    cfg = parse_bmm_mx32_kernel_name(kernel_name)
+    if cfg is None:
+        raise ValueError(f"{kernel_name}: not a batched mxfp8_32 kernelName")
+    b32 = w_scale_block == "32x32"
+    if k % MX32_BLOCK_K or n % 32 or (not b32 and k % 128):
+        raise ValueError(f"{kernel_name}: N={n}, K={k} misaligned for its scale")
+    dev = torch.device("cpu")
+    k_blocks = k // MX32_BLOCK_K
+    m = 1
+    xq = torch.empty((m, b, k), device=dev, dtype=torch.uint8)
+    wq = torch.empty((b, n, k), device=dev, dtype=torch.uint8)
+    xs = torch.empty((m, b, k_blocks), device=dev, dtype=torch.uint8)
+    ws = torch.empty(
+        (b, n // 32 if b32 else n, k_blocks), device=dev, dtype=torch.uint8
+    )
+    out = torch.empty((m, b, n), device=dev, dtype=torch.bfloat16)
+    k_tail = k % cfg["tile_k"] != 0
+    with compile_only_env():
+        launch_gemm_a8w8(
+            _ptr_view_safe(out),
+            _ptr_view_safe(xq),
+            _ptr_view_safe(wq),
+            _ptr_view_safe(xs),
+            _ptr_view_safe(ws),
+            m,
+            fx.Stream(0),
+            n,
+            k,
+            b * k_blocks,
+            b * k,
+            b * n,
+            cfg["tile_m"],
+            cfg["tile_n"],
+            cfg["tile_k"],
+            cfg["m_warp"],
+            cfg["n_warp"],
+            0,
+            cfg["num_buffers"],
+            1,
+            1,
+            True,
+            MX32_BLOCK_K,
+            1,
+            True,
+            0,
+            b,
+            False,
+            False,
+            b32,
+            k_tail,
+        )
+
+
 def _compile_mxfp8_wmma_to_cache(
     *,
     kernel_name: str,
@@ -984,7 +1080,7 @@ def _compile_mxfp8_wmma_to_cache(
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
     scale_block: int = SCALE_BLOCK_SIZE,
-    b_scale_32x32: bool = False,
+    w_scale_32x32: bool = False,
     **kwargs,
 ):
     del kwargs
@@ -1000,7 +1096,7 @@ def _compile_mxfp8_wmma_to_cache(
     )
 
     k_align = scale_k_align(
-        scale_block == MX32_BLOCK_K, a_scale_preshuffled, b_scale_32x32
+        scale_block == MX32_BLOCK_K, a_scale_preshuffled, w_scale_32x32
     )
     if k % k_align:
         raise ValueError(f"{kernel_name}: K={k} must be aligned to {k_align}")
@@ -1008,7 +1104,7 @@ def _compile_mxfp8_wmma_to_cache(
     k_blocks = (k + scale_block - 1) // scale_block
     if scale_block == MX32_BLOCK_K:  # row-major or shuffled A; B shuffled or 32x32
         a_rows = ((m + 31) // 32) * 32 if a_scale_preshuffled else m
-        b_rows = n // 32 if b_scale_32x32 else n
+        b_rows = n // 32 if w_scale_32x32 else n
     else:
         a_rows, b_rows = m, (n + 127) // 128
     xq = torch.empty((m, k), device=dev, dtype=torch.uint8)
@@ -1016,10 +1112,8 @@ def _compile_mxfp8_wmma_to_cache(
     a_scale = torch.empty((a_rows, k_blocks), device=dev, dtype=torch.uint8)
     b_scale = torch.empty((b_rows, k_blocks), device=dev, dtype=torch.uint8)
     out = torch.empty((m, n), device=dev, dtype=torch.bfloat16)
-    stride_ascale_k = a_scale.numel() // a_scale.stride(0)
-    lda, ldc = xq.stride(0), out.stride(0)
     stream = fx.Stream(0)
-    bounded_k = k_is_bounded(
+    k_tail = k_has_tail(
         k,
         split_k,
         tile_k,
@@ -1039,9 +1133,9 @@ def _compile_mxfp8_wmma_to_cache(
             stream,
             n,
             k,
-            stride_ascale_k,
-            lda,
-            ldc,
+            a_scale.numel() // a_scale.stride(0),
+            xq.stride(0),
+            out.stride(0),
             tile_m,
             tile_n,
             tile_k,
@@ -1079,8 +1173,8 @@ def _compile_mxfp8_wmma_to_cache(
                         fused,
                         bounded_m,
                         a_scale_preshuffled,
-                        b_scale_32x32,
-                        bounded_k,
+                        w_scale_32x32,
+                        k_tail,
                         bounded_n,
                     )
             else:
@@ -1093,8 +1187,8 @@ def _compile_mxfp8_wmma_to_cache(
                     1,
                     a_preshuffle,
                     a_scale_preshuffled,
-                    b_scale_32x32,
-                    bounded_k,
+                    w_scale_32x32,
+                    k_tail,
                 )
         if split_k > 1:
             compile_gemm_a8w8_splitk_reduce(
@@ -1272,6 +1366,8 @@ def compile_one_config(
                 _compile_a4w4_to_cache(kernel_name=kernel_name, m=m, n=n, k=k, **kwargs)
             elif kind == "bmm_mfma":
                 _compile_bmm_mfma_to_cache(kernel_name=kernel_name, n=n, k=k, **kwargs)
+            elif kind == "bmm_mx32":
+                _compile_bmm_mx32_to_cache(kernel_name=kernel_name, n=n, k=k, **kwargs)
             else:
                 raise ValueError(f"Unknown GEMM AOT kind: {kind}")
 

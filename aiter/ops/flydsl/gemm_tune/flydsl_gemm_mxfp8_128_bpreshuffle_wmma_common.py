@@ -137,7 +137,7 @@ def _cluster_valid(cm: int, cn: int) -> bool:
 
 
 def _stage_scale_bytes(
-    ki: WmmaKernelInstance, scale_block: int, b_scale_32x32: bool
+    ki: WmmaKernelInstance, scale_block: int, w_scale_32x32: bool
 ) -> tuple[int, int]:
     if scale_block == 128:
         k_blocks = _ceil_div(ki.tile_k, _BLOCK_K)
@@ -149,7 +149,7 @@ def _stage_scale_bytes(
         b_k_blocks = _ceil_div(ki.tile_k, 32)
         b_n_blocks = _ceil_div(ki.tile_n, 32)
         b_scale_bytes = (
-            b_n_blocks * (b_k_blocks if b_scale_32x32 else ki.tile_k)
+            b_n_blocks * (b_k_blocks if w_scale_32x32 else ki.tile_k)
             + _SCALE_GUARD_BYTES
         )
     else:
@@ -161,11 +161,11 @@ def kernel_instance_estimated_lds_bytes(
     ki: WmmaKernelInstance,
     *,
     scale_block: int = 128,
-    b_scale_32x32: bool = False,
+    w_scale_32x32: bool = False,
 ) -> int:
     """Conservative LDS upper bound for the selected scale layout and WMMA tile."""
 
-    a_scale_bytes, b_scale_bytes = _stage_scale_bytes(ki, scale_block, b_scale_32x32)
+    a_scale_bytes, b_scale_bytes = _stage_scale_bytes(ki, scale_block, w_scale_32x32)
 
     a_pair = 2 if ki.a_preshuffle else 1
     lds_a_data = (ki.tile_m // a_pair) * (a_pair * ki.tile_k + _LDS_PAD_A_BYTES)
@@ -245,7 +245,7 @@ def kernel_fits_shape(
     K: int,
     *,
     scale_block: int = _BLOCK_K,
-    b_scale_32x32: bool = False,
+    w_scale_32x32: bool = False,
     allow_n_tail: bool = False,
 ) -> bool:
     """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``.
@@ -257,9 +257,9 @@ def kernel_fits_shape(
     only); the untuned fallback and the batched GEMM leave it off.
     """
 
-    if b_scale_32x32 and scale_block != 32:
+    if w_scale_32x32 and scale_block != 32:
         return False
-    if b_scale_32x32 and ki.tile_n % 32:
+    if w_scale_32x32 and ki.tile_n % 32:
         return False
     k_align = scale_block
 
@@ -296,7 +296,7 @@ def kernel_fits_shape(
         if ki.persistent_n_tiles > 1 and ki.split_k != 1:
             return False
         if n_is_bounded(N, ki.tile_n, ki.cluster_n, ki.persistent_n_tiles, True):
-            n_align = 32 if b_scale_32x32 else _BLOCK_N
+            n_align = 32 if w_scale_32x32 else _BLOCK_N
             if not allow_n_tail or ki.split_k != 1 or N % n_align:
                 return False
             n_tiles = _ceil_div(N, ki.tile_n)
@@ -316,7 +316,7 @@ def kernel_fits_shape(
 
     if ki.persistent_n_tiles > 1:
         return False
-    n_align = 32 if b_scale_32x32 else _BLOCK_N
+    n_align = 32 if w_scale_32x32 else _BLOCK_N
     if N % n_align != 0 or K % k_align != 0:
         return False
     if not _tile_valid(ki.tile_m, ki.tile_n, ki.tile_k, ki.m_warp, ki.n_warp):
@@ -325,14 +325,16 @@ def kernel_fits_shape(
         return False
     if (
         kernel_instance_estimated_lds_bytes(
-            ki, scale_block=scale_block, b_scale_32x32=b_scale_32x32
+            ki, scale_block=scale_block, w_scale_32x32=w_scale_32x32
         )
         > LDS_BYTES
     ):
         return False
     if N % ki.tile_n != 0:
         return False
-    if K % (ki.split_k * ki.tile_k) != 0 and ki.split_k != 1:
+    # The sync kernel takes a partial last K tile only on one split with the
+    # mxfp8_32 32x32 weight scale (launch_gemm_a8w8's k_tail).
+    if K % (ki.split_k * ki.tile_k) != 0 and (ki.split_k != 1 or not w_scale_32x32):
         return False
     if _ceil_div(K // ki.split_k, ki.tile_k) < ki.num_buffers:
         return False
@@ -457,7 +459,7 @@ def _tuning_candidates(N: int):
 
 
 def tuning_kernels(
-    M: int, N: int, K: int, *, scale_block: int, b_scale_32x32: bool
+    M: int, N: int, K: int, *, scale_block: int, w_scale_32x32: bool
 ) -> list[WmmaKernelInstance]:
     """Every kernel of the tuner's space that can run ``(M, N, K)``. A table row also
     serves the M below its own (down to about half), and a clustered compute kernel
@@ -471,7 +473,7 @@ def tuning_kernels(
             N,
             K,
             scale_block=scale_block,
-            b_scale_32x32=b_scale_32x32,
+            w_scale_32x32=w_scale_32x32,
             allow_n_tail=True,
         )
         and not (uses_cluster(ki) and M < 2 * ki.tile_m)

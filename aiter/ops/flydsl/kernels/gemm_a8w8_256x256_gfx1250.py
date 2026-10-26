@@ -64,7 +64,7 @@ def launch_gemm_a8w8_256x256(
     bounded_m: Constexpr[bool] = True,
     a_scale_preshuffled: Constexpr[bool] = False,
     b_scale_32x32: Constexpr[bool] = False,
-    bounded_k: Constexpr[bool] = False,
+    k_tail: Constexpr[bool] = False,
     bounded_n: Constexpr[bool] = False,
 ):
     """M is unrestricted (a multiple of 2 with ``a_preshuffle``); N and K must be
@@ -72,7 +72,7 @@ def launch_gemm_a8w8_256x256(
     cluster_n * persistent_n_tiles`` unless ``bounded_n``.
 
     ``b_scale_32x32`` (mxfp8_32): B scale is the raw row-major ``[N/32, K/32]``.
-    ``bounded_k`` (single split): K may end inside the last K super; TDM zero-fills.
+    ``k_tail`` (single split): K may end inside the last K super; TDM zero-fills.
     ``bounded_n`` (single split, no fused split-K): N may end inside the last tile;
     padded tiles skip loads/stores but still run the loop to feed A multicast."""
 
@@ -113,7 +113,7 @@ def launch_gemm_a8w8_256x256(
     assert mx32 or block_size == 128, f"block_size must be 32 or 128, got {block_size}"
     assert not a_scale_preshuffled or mx32, "a_scale_preshuffled is mxfp8_32 only"
     assert not b_scale_32x32 or mx32, "b_scale_32x32 is mxfp8_32 only"
-    assert not bounded_k or split_k == 1, "bounded_k requires split_k=1"
+    assert not k_tail or split_k == 1, "k_tail requires split_k=1"
     assert not bounded_n or split_k == 1, "bounded_n requires split_k=1"
     SA_SUPERS = tile_m // 32
     SB_SUPERS = tile_n // 32
@@ -188,8 +188,8 @@ def launch_gemm_a8w8_256x256(
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
         + ("_fsk" if cluster_splitk else "")
         + ("_aspre" if a_scale_preshuffled else "")
-        + ("_wb32x32" if b_scale_32x32 else "")
-        + ("_ktail" if bounded_k else "")
+        + ("_bs32x32" if b_scale_32x32 else "")
+        + ("_ktail" if k_tail else "")
     )
 
     def _run_tile(
@@ -207,10 +207,10 @@ def launch_gemm_a8w8_256x256(
         arg_out: fx.Pointer,
         tile_idx=0,
     ):
-        # bounded_k: the last K tile may be partial, its overhang zero-filled by TDM.
+        # k_tail: the last K tile may be partial, its overhang zero-filled by TDM.
         K_TILES = (
             (i32_k + (tile_k * split_k - 1)) // (tile_k * split_k)
-            if const_expr(bounded_k)
+            if const_expr(k_tail)
             else i32_k // (tile_k * split_k)
         )
         k64 = fx.Int64(i32_k)
@@ -443,7 +443,7 @@ def launch_gemm_a8w8_256x256(
                 )
             # Express the remaining K extent in each owner's data/scale units.
             k_last = fx.Int32(0)
-            if const_expr(bounded_k):
+            if const_expr(k_tail):
                 last_k = (i32_k - 1) % SUPER_K + 1
                 if const_expr(owner == 0):
                     k_last = last_k * A_PAIR
@@ -514,7 +514,7 @@ def launch_gemm_a8w8_256x256(
                 tdm_base_hi,
                 tile_delta,
             )
-            if const_expr(bounded_k):
+            if const_expr(k_tail):
                 is_last = tile_delta >= last_delta
                 if const_expr(SA_PANEL_STAGES == 1):
                     if const_expr(not mx32):
@@ -1083,9 +1083,7 @@ def launch_gemm_a8w8_256x256(
                 )
 
         SUPERS = (
-            (K_TILES + (KPAIR - 1)) // KPAIR
-            if const_expr(bounded_k)
-            else K_TILES // KPAIR
+            (K_TILES + (KPAIR - 1)) // KPAIR if const_expr(k_tail) else K_TILES // KPAIR
         )
         last_delta = (SUPERS - 1) * tdm_global_step
         for i in range_constexpr(num_buffers):
