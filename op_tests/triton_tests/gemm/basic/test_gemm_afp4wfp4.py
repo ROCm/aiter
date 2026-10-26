@@ -51,11 +51,11 @@ def generate_gemm_afp4wfp4_inputs(
 
     if layout[0] == "T":
         # 34 is two packed e2m1 values 0010 which is 1.0.
-        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
-        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
     else:
-        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
-        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
+        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
+        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
 
     if layout[1] == "N":
         w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
@@ -64,10 +64,7 @@ def generate_gemm_afp4wfp4_inputs(
         w_low = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
         w_high = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
 
-    x = (
-        x_high << 4 | x_low
-    )  # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
-    x = x.to(device="cuda")
+    x = x_high << 4 | x_low
 
     w = w_low | w_high << 4
     # Scale of 1.0 in e8m0, bias 127.
@@ -108,7 +105,7 @@ def generate_gemm_afp4wfp4_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype).cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
         out_dtype = (None,)
     else:
         out_dtype = dtype
@@ -135,6 +132,7 @@ def get_x_vals():
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
     x_vals += [(2048, 7168, 16384), (2304, 24576, 1536)]
     x_vals += [(1, 256, 512), (16, 256, 256), (31, 7168, 4608)]  # M < 32 case
+    x_vals += [(v, 96, 5120) for v in (32, 128, 192, 256, 8000)]
     return x_vals
 
 

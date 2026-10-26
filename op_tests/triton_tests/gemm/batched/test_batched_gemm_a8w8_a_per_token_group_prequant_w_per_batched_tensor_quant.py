@@ -59,7 +59,7 @@ def generate_batched_gemm_a16w8_inputs(
 
     w_scale = torch.rand([1], dtype=torch.float32, device="cuda")[0]
     if has_bias:
-        bias = torch.rand([B, 1, N], dtype=dtype).cuda() * 10
+        bias = torch.rand([B, 1, N], dtype=dtype, device="cuda") * 10
     else:
         bias = None
 
