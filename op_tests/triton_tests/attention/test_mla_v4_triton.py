@@ -457,7 +457,9 @@ def make_packed_cache(num_tokens, D, dtype):
     nope = D - rope  # NoPE dim, stored fp8 e4m3 OCP
     nb = triton.cdiv(num_tokens, block)
     if dtype == "bf16":
-        cache = (torch.randn(nb, block, D, device=device) * 0.4).to(torch.bfloat16)
+        cache = (
+            torch.randn(nb, block, D, device=device, dtype=torch.float32) * 0.4
+        ).to(torch.bfloat16)
         return cache, cache.reshape(nb * block, D).float()
 
     # per token: [nope fp8 (1B) | rope bf16 (2B) | 8 UE8M0 scale bytes]
@@ -468,11 +470,13 @@ def make_packed_cache(num_tokens, D, dtype):
     flat = cache.view(nb, block * row_bytes)
     data = flat[:, : block * data_bytes].view(nb, block, data_bytes)
     scales_region = flat[:, block * data_bytes :].view(nb, block, scale_bytes)
-    nope_fp8 = (torch.randn(nb, block, nope, device=device) * 0.4).to(
-        torch.float8_e4m3fn
-    )
+    nope_fp8 = (
+        torch.randn(nb, block, nope, device=device, dtype=torch.float32) * 0.4
+    ).to(torch.float8_e4m3fn)
     data[:, :, :nope] = nope_fp8.view(torch.uint8)
-    rope_bf16 = (torch.randn(nb, block, rope, device=device) * 0.4).to(torch.bfloat16)
+    rope_bf16 = (
+        torch.randn(nb, block, rope, device=device, dtype=torch.float32) * 0.4
+    ).to(torch.bfloat16)
     data[:, :, nope:data_bytes] = rope_bf16.view(torch.uint8).view(nb, block, rope * 2)
     num_groups = nope // 64
     exps = torch.randint(

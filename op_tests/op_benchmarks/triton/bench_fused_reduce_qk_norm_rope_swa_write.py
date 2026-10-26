@@ -101,7 +101,7 @@ def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args)
         return ms
 
     # q_in read + q_out write + kv read/write (+ SWA row write); cos/sin are tiny.
-    elem = torch.tensor([], dtype=dtype).element_size()
+    elem = torch.tensor([], dtype=dtype, device=device).element_size()
     mem = (splitk * M * N + M * N + 2 * M * head_dim) * elem
     if not args.no_swa:
         mem += M * head_dim * elem
