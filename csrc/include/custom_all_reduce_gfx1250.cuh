@@ -1268,6 +1268,13 @@ public:
             (void)hipFree(d_ll_block_flags_);
     }
 
+    // Whether allreduce of this size takes the LL kernel, which reads the input
+    // in place and so needs no registered copy of it.
+    bool use_ll(size_t bytes) const
+    {
+        return ll_enabled() && bytes <= kLLArMaxBytes && world_size_ <= kLLMaxRanks;
+    }
+
     // Whether the LL small-message fast path is enabled. On by default; set
     // AITER_CUSTOM_AR_DISABLE_LL=1 to force the naive kernel for all sizes.
     static bool ll_enabled()
@@ -1621,8 +1628,7 @@ public:
         // shared peer scratch — no registered peer-input table (_input_dp) is
         // needed, so branch before get_buffer_RD.
         const size_t bytes = (size_t)size * sizeof(T);
-        if(ll_enabled() && bytes <= kLLArMaxBytes &&
-           world_size_ <= kLLMaxRanks)
+        if(use_ll(bytes))
         {
             allreduce_ll<T>(stream, input, output, size);
             return;

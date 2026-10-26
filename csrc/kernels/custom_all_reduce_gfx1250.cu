@@ -464,7 +464,8 @@ void all_reduce(fptr_t _fa,
 
     bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
 
-    if(reg_inp_ptr != 0)
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(reg_inp_ptr != 0 && !fa->use_ll(data_bytes))
     {
         if(data_bytes > reg_inp_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
