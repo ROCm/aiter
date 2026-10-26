@@ -575,7 +575,7 @@ def _grouped_a8w4_tdm_moe(
     doweight_stage1,
     tile_m=64,
     tile_n=256,
-    tile_k=256,
+    tile_k=128,
     m_warp=1,
     n_warp=4,
     num_buffers=3,
@@ -1614,7 +1614,7 @@ def grouped_gemm_gfx1250_a8w4(
         if cfg_row is not None:
             _tdm_kw["tile_m"] = _as_int(cfg_row.get("tile_m"), tile_m)
             _tdm_kw["tile_n"] = _as_int(cfg_row.get("tile_n"), int(n_warp) * 64)
-            _tdm_kw["tile_k"] = _as_int(cfg_row.get("tile_k"), 256)
+            _tdm_kw["tile_k"] = _as_int(cfg_row.get("tile_k"), 128)
             _tdm_kw["m_warp"] = _as_int(cfg_row.get("m_warp"), 1)
             _tdm_kw["n_warp"] = _as_int(cfg_row.get("n_warp"), n_warp)
             _tdm_kw["num_buffers"] = _as_int(cfg_row.get("num_buffers"), num_buffers)
@@ -1690,7 +1690,7 @@ def grouped_gemm_gfx1250_a8w4(
             _base_n = (
                 _ov_n if _ov_n is not None else _tdm_kw.get("tile_n", int(n_warp) * 64)
             )
-            _base_k = _ov_k if _ov_k is not None else _tdm_kw.get("tile_k", 256)
+            _base_k = _ov_k if _ov_k is not None else _tdm_kw.get("tile_k", 128)
             _base_nb = (
                 _ov_nb
                 if _ov_nb is not None
