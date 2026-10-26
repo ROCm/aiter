@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from aiter import QuantType
 from aiter import dtypes as aiter_dtypes
 from aiter.fused_moe import fused_moe, get_2stage_cfgs, torch_moe
+from aiter.ops.moe_op import ck_moe_stage2_fwd
 from aiter.ops.quant import pertoken_quant
 from aiter.ops.shuffle import shuffle_weight
 
@@ -251,5 +252,29 @@ def test_gfx950_int8_stage2_k_alignment(inter_dim, block_m):
 
 @pytest.mark.skipif(not _GFX950, reason="Exercises the gfx950 int8 CK default dispatch")
 def test_gfx950_int8_stage2_rejects_non_128():
+    # Int8 fused_moe stage 1 is the ASM kernel, and every gfx950 int8 stage-1
+    # tile is 128 or 256, so width 192 fails there and never reaches stage 2.
+    # The K check added in this change lives in the shared CK stage-2 dispatch.
+    inter_dim, model_dim, tokens, experts = 192, 128, 4, 1
+    inter = torch.empty((tokens, inter_dim), dtype=torch.int8, device="cuda")
+    w1 = torch.empty(
+        (experts, inter_dim * 2, model_dim), dtype=torch.int8, device="cuda"
+    )
+    w2 = torch.empty((experts, model_dim, inter_dim), dtype=torch.int8, device="cuda")
+    sorted_ids = torch.zeros(32, dtype=torch.int32, device="cuda")
+    sorted_expert_ids = torch.zeros(4, dtype=torch.int32, device="cuda")
+    num_valid = torch.zeros(1, dtype=torch.int32, device="cuda")
+    out = torch.empty((tokens, model_dim), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(RuntimeError, match="multiple of"):
-        _check_gfx950_fp8(192, 32, QuantType.per_Tensor, quant_dtype=aiter_dtypes.i8)
+        ck_moe_stage2_fwd(
+            inter,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid,
+            out,
+            1,
+            block_m=32,
+            quant_type=QuantType.per_Tensor,
+        )
