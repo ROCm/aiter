@@ -241,6 +241,26 @@ def check_payload(inp, out, *, device_index: int, owner: str) -> int:
     return live_bytes
 
 
+def eligible_payload_bytes(inp, *, device: torch.device) -> int | None:
+    """The payload size of *inp* in bytes if ``check_payload`` accepts it as the
+    input of an all-reduce on *device*, otherwise None. Never raises.
+
+    The dispatchers call this before they pick a FlyDSL engine. The output
+    checks of ``check_payload`` do not apply: the dispatchers allocate ``out``.
+    """
+    align = PAYLOAD_ALIGN_BYTES
+    if not isinstance(inp, torch.Tensor) or inp.dtype is not torch.bfloat16:
+        return None
+    if inp.device != device:
+        return None
+    if not inp.is_contiguous() or int(inp.data_ptr()) % align:
+        return None
+    nbytes = int(inp.numel()) * int(inp.element_size())
+    if nbytes % align or nbytes > MAX_PAYLOAD_BYTES:
+        return None
+    return nbytes
+
+
 def _validate_ipc_process_group(
     group, *, rank: int, world_size: int, owner: str
 ) -> None:

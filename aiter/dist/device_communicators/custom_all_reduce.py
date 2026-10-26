@@ -40,11 +40,13 @@ from .rocm_version import get_rocm_version
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
+    from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
 
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
+    eligible_payload_bytes = None
     OneShotAllReduce = None
     _FLY_IMPORT_OK = False
 
@@ -1790,16 +1792,8 @@ class CustomAllreduce:
             return False
         if open_fp8_quant or not use_new:
             return False
-        if inp.dtype is not torch.bfloat16:
-            return False
-        if not inp.is_contiguous():
-            return False
-        if inp.data_ptr() % fly_policy.PAYLOAD_ALIGN_BYTES:
-            return False
-        if inp.device.index != self.device.index:
-            return False
-        nbytes = inp.numel() * inp.element_size()
-        if nbytes > fly_policy.MAX_PAYLOAD_BYTES:
+        nbytes = eligible_payload_bytes(inp, device=self.device)
+        if nbytes is None:
             return False
         return self._fly_window.contains(nbytes)
 

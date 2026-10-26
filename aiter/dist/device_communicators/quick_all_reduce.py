@@ -43,11 +43,13 @@ except Exception:  # noqa: BLE001
 # checked at import time.
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
+    from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
     from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduce
 
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
+    eligible_payload_bytes = None
     FlyQuickAllReduce = None
     _FLY_IMPORT_OK = False
 
@@ -435,17 +437,8 @@ class QuickAllReduce:
 
         if self._fly_policy is None:
             return False
-        if inp.dtype is not torch.bfloat16:
-            return False
-        if not inp.is_contiguous():
-            return False
-        if inp.data_ptr() % fly_policy.PAYLOAD_ALIGN_BYTES:
-            return False
-        nbytes = inp.numel() * inp.element_size()
-        if (
-            nbytes % fly_policy.PAYLOAD_ALIGN_BYTES
-            or nbytes > fly_policy.MAX_PAYLOAD_BYTES
-        ):
+        nbytes = eligible_payload_bytes(inp, device=self.device)
+        if nbytes is None:
             return False
         alg = self._fly_policy.select(nbytes, quantized=True)
         return alg in self._fly_engines

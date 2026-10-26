@@ -21,7 +21,9 @@ from aiter.dist.device_communicators.custom_all_reduce import (
     is_weak_contiguous,
 )
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
+from aiter.ops.flydsl import allreduce_host_shared as H
 from aiter.ops.flydsl import allreduce_policy as P
+from aiter.ops.flydsl.allreduce_host_shared import eligible_payload_bytes
 from aiter.ops.flydsl.allreduce_policy import (
     SUPPORTED_BLOCKS,
     AllReduceAlgorithm,
@@ -447,7 +449,9 @@ def test_selectors_reject_non_contiguous():
     """
     policy = _row("pcie", 4, "gfx950")
     qr = SimpleNamespace(
-        _fly_policy=policy, _fly_engines={MESH: object(), RING: object()}
+        _fly_policy=policy,
+        _fly_engines={MESH: object(), RING: object()},
+        device=torch.device("cpu"),
     )
     t = _full_storage_transpose(policy.window(MESH, quantized=True).min + (64 << 10))
     assert QuickAllReduce._should_fly(qr, t.contiguous())
@@ -460,6 +464,27 @@ def test_selectors_reject_non_contiguous():
     t = _full_storage_transpose(max(one.min, 1 << 12))
     assert CustomAllreduce._should_fly_oneshot(ca, t.contiguous(), True, False)
     assert not CustomAllreduce._should_fly_oneshot(ca, t, True, False)
+
+
+def test_eligible_payload_bytes():
+    """The size of an input ``check_payload`` accepts, and None for each input
+    it rejects, without raising."""
+    cpu = torch.device("cpu")
+    x = torch.zeros(1024, dtype=torch.bfloat16)
+    assert eligible_payload_bytes(x, device=cpu) == 2048
+    assert eligible_payload_bytes(x[:0], device=cpu) == 0
+    rejected = {
+        "not a tensor": [0.0] * 8,
+        "fp16": x.half(),
+        "other device": x.to("meta"),
+        "non-contiguous": x.view(32, 32).t(),
+        "misaligned address": x[1:9],
+        "size not a multiple of 16 B": x[:7],
+    }
+    for name, inp in rejected.items():
+        assert eligible_payload_bytes(inp, device=cpu) is None, name
+    with mock.patch.object(H, "MAX_PAYLOAD_BYTES", 1024):
+        assert eligible_payload_bytes(x, device=cpu) is None, "too large"
 
 
 if __name__ == "__main__":
