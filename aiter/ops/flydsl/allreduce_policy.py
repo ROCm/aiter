@@ -199,11 +199,9 @@ class FamilyPolicy:
     We have three families of all-reduce kernels: one-shot, mesh and ring.
     Depending on the interconnect type (PCIe or xGMI), the one-shot is best for
     smaller messages, the mesh overtakes for bigger messages, and finally the
-    ring is the choice for very large messages. The ring is in the tables of
-    gfx942/xGMI, where it starts at 128 MiB, and of PCIe at TP4 and TP8. On
-    gfx950/xGMI the ring is off. The message sizes at which the transitions take
-    place depend on the architecture, the world size and the interconnect type,
-    so a policy belongs to one ``(arch, link, world_size)``.
+    ring is the choice for very large messages. The message sizes at which the
+    transitions take place depend on the architecture, the world size and the
+    interconnect type, so a policy belongs to one ``(arch, link, world_size)``.
 
     Each algorithm has a ``Window`` of payload sizes. ``None`` or an empty
     window disables the algorithm. A payload in no window goes to
@@ -409,25 +407,9 @@ _POLICY_BY_KEY = _index(FAMILY_POLICIES)
 
 
 # One-shot, ``OneShotRung``.
-#
-#   PCIe
-#
-#     TP2  b256 a1 cap128 -- the 4 KiB tile to 384 KiB, then b512 a4 cap128,
-#                            the 32 KiB tile, over the rest of the exact-mode
-#                            window, which runs to 64 MiB.
-#     TP4  b128 a1 cap128 -- the 2 KiB tile to 96 KiB, then b512 a2 cap64, the
-#                            16 KiB tile, to the 896 KiB exact-mode ceiling.
-#     TP8  b64 a1 cap64   -- the 1 KiB tile, except b256 a1 cap64, the 4 KiB
-#                            tile, from 48 to 192 KiB.
-#
-#   xGMI
-#
-#     TP2  atoms=1 cap128 b128/b256 -- the 2 KiB tile to 256 KiB, the most it
-#                               covers in one round, then the 4 KiB tile.
-#     TP4  atoms=1 cap128 b256 -- one rung over the whole window
-#     TP8  atoms=1 cap128 b128 -- one rung over the whole window
 ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    # TP2: 256 KiB is the most the 2 KiB tile covers in one round of 128 blocks.
     ("gfx942", "xgmi", 2): (
         OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
         OneShotRung(
@@ -473,11 +455,6 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 }
 
 # Mesh, ``TwoShotRung``.
-#
-#   xGMI  ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
-#         Block 512 from 4 MiB.
-#   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
-#         TP8 ST=8 everywhere.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (

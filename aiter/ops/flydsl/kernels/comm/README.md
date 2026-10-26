@@ -74,15 +74,10 @@ its own chunk from the packet that it sent.
 
 ### Accuracy limits
 
-The kernels convert the bf16 payload to fp16 and do all arithmetic in packed
-fp16, for every wire format.
-
-* A magnitude above 65504 saturates to 65504. The `fp16` wire format is not
-  lossless for bf16 values outside the fp16 range.
-* The group scale is an E4M3 byte with a largest magnitude of 480. A group
-  with an extremum above 480 clips at about 480, and NaN and Inf become finite
-  values. The ring requantizes the partial sum at each reduce-scatter hop, so a
-  sum of several values near 300 can also clip.
+The mesh and the ring do all arithmetic in packed fp16, for every wire format,
+so large values can saturate or clip, and NaN and Inf become finite values.
+The limits are in the "Limitations" section of the `quick_allreduce_codec.py`
+docstring.
 
 ## Inbox memory
 
