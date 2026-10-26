@@ -2478,6 +2478,8 @@ void moe_smooth_per_token_scaled_quant_v2(
 // `aiter::mx_scale_shuffle_idx`. The legacy kernel name
 // `mxfp4_quant_moe_sort_kernel` was misleading because it implied fp4-only
 // — the implementation has always been dtype-templated.
+// Zeroes a zero-weight route's output row and its scale. The row must be the
+// route's own (one input row per route); see `route_owns_row`.
 template <typename DTYPE_O, int thread_data_size>
 __device__ void store_zero_mx_quant_moe_sort_row(
     DTYPE_O* __restrict__ out,
@@ -2487,8 +2489,6 @@ __device__ void store_zero_mx_quant_moe_sort_row(
     const int32_t scaleN_valid,
     const int scale_k,
     const int num_thread_per_group,
-    const int topk_id,
-    const int topk,
     const int64_t offset_base,
     const int cols)
 {
@@ -2497,26 +2497,23 @@ __device__ void store_zero_mx_quant_moe_sort_row(
         int addr    = aiter::mx_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k);
         scale[addr] = 0;
     }
-    if(topk_id < topk || topk == 1)
-    {
-        const int64_t row_bytes = std::is_same_v<DTYPE_O, opus::fp4_t> ? cols / 2 : cols;
-        uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
-        const int64_t row_offset = offset_base * row_bytes;
-        auto buffer_o = opus::make_gmem<uint8_t>(out_u8 + row_offset, row_bytes);
+    const int64_t row_bytes = std::is_same_v<DTYPE_O, opus::fp4_t> ? cols / 2 : cols;
+    uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
+    const int64_t row_offset = offset_base * row_bytes;
+    auto buffer_o = opus::make_gmem<uint8_t>(out_u8 + row_offset, row_bytes);
 
-        static constexpr int32_t zero_vec_bytes = 16;
-        opus::vector_t<uint8_t, zero_vec_bytes> zero_vec;
+    static constexpr int32_t zero_vec_bytes = 16;
+    opus::vector_t<uint8_t, zero_vec_bytes> zero_vec;
 #pragma unroll
-        for(int j = 0; j < zero_vec_bytes; j++)
-        {
-            zero_vec[j] = 0;
-        }
+    for(int j = 0; j < zero_vec_bytes; j++)
+    {
+        zero_vec[j] = 0;
+    }
 
-        const int32_t num_vecs = (row_bytes + zero_vec_bytes - 1) / zero_vec_bytes;
-        for(int32_t vec_idx = threadIdx.x; vec_idx < num_vecs; vec_idx += blockDim.x)
-        {
-            buffer_o.template store<zero_vec_bytes>(zero_vec, vec_idx * zero_vec_bytes);
-        }
+    const int32_t num_vecs = (row_bytes + zero_vec_bytes - 1) / zero_vec_bytes;
+    for(int32_t vec_idx = threadIdx.x; vec_idx < num_vecs; vec_idx += blockDim.x)
+    {
+        buffer_o.template store<zero_vec_bytes>(zero_vec, vec_idx * zero_vec_bytes);
     }
 }
 
@@ -2536,7 +2533,8 @@ __global__ void fused_mx_quant_moe_sort_kernel(
     const int32_t num_blocks,
     const int32_t num_tg,
     const int32_t topk,
-    const int32_t input_stride)
+    const int32_t input_stride,
+    const bool route_owns_row)
 {
     int num_thread_per_group = group_size / thread_data_size;
     int num_valid_ids_value  = num_valid_ids[0];
@@ -2602,7 +2600,11 @@ __global__ void fused_mx_quant_moe_sort_kernel(
 
             int64_t offset_base = topk == 1 ? (int64_t)(token_idx) : (int64_t)(token_idx * topk + topk_id);
             const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
-            if(sorted_weights != nullptr && sorted_weights[sorted_row] == 0.0f)
+            // A shared row (one per token, quantized by each of its routes) only
+            // ever receives the token's own bytes, so its writers agree; zeroing
+            // it for one zero-weight route would race the token's other routes.
+            if(route_owns_row && sorted_weights != nullptr &&
+               sorted_weights[sorted_row] == 0.0f)
             {
                 store_zero_mx_quant_moe_sort_row<DTYPE_O, thread_data_size>(
                     out,
@@ -2612,8 +2614,6 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                     scaleN_valid,
                     scale_k,
                     num_thread_per_group,
-                    topk_id,
-                    topk,
                     offset_base,
                     cols);
                 continue;
@@ -2694,7 +2694,8 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 num_blocks,                                                                     \
                 num_tg,                                                                         \
                 topk,                                                                           \
-                input_stride);                                                                  \
+                input_stride,                                                                   \
+                route_owns_row);                                                                \
     });
 
 
@@ -2731,12 +2732,17 @@ static void fused_dynamic_mx_quant_moe_sort_hip_impl(aiter_tensor_t& output,
                                                      const aiter_tensor_t& num_valid_ids,
                                                      int token_num,
                                                      int block_m,
+                                                     int64_t total_routes,
                                                      int group_size,
                                                      std::optional<aiter_tensor_t> sorted_weights,
                                                      int64_t padded_rows_upper_bound)
 {
+    AITER_CHECK(total_routes >= 0, __func__, " total_routes must be non-negative");
     int cols = input.size(-1);
     int topk = input.numel() / (cols * token_num);
+    // One input row per route (stage 2's topk-replicated rows, or top-1
+    // routing) versus one per token shared by its routes (stage 1).
+    const bool route_owns_row = static_cast<int64_t>(topk) * token_num == total_routes;
     int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
     if(sorted_weights.has_value())
     {
@@ -2801,6 +2807,7 @@ void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& output,
                                          const aiter_tensor_t& num_valid_ids,
                                          int token_num,
                                          int block_m,
+                                         int64_t total_routes,
                                          int group_size,
                                          std::optional<aiter_tensor_t> sorted_weights)
 {
@@ -2811,6 +2818,7 @@ void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& output,
                                              num_valid_ids,
                                              token_num,
                                              block_m,
+                                             total_routes,
                                              group_size,
                                              sorted_weights,
                                              -1);
@@ -2828,7 +2836,6 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
                                                  int group_size,
                                                  std::optional<aiter_tensor_t> sorted_weights)
 {
-    AITER_CHECK(total_routes >= 0, __func__, " total_routes must be non-negative");
     // A non-positive bound clamps the launch extent to 0, silently skipping
     // every row, so reject it instead of under-launching.
     AITER_CHECK(num_experts_upper_bound > 0, __func__, " num_experts_upper_bound must be positive");
@@ -2841,6 +2848,7 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
                                              num_valid_ids,
                                              token_num,
                                              block_m,
+                                             total_routes,
                                              group_size,
                                              sorted_weights,
                                              padded_rows_upper_bound);
