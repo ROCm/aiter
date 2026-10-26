@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib
+
 import pytest
 import torch
 
-from aiter.ops.triton.quant import dual_layout_quant_mxfp4
-from aiter.ops.triton.quant.dual_layout_mxfp4 import _philox_streams
+from aiter.ops.triton.quant import fused_quant_transpose_hadamard_mxfp4
+from aiter.ops.triton.quant.fused_quant_transpose_hadamard_mxfp4 import _philox_streams
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.mxfp4 import (
     mxfp4_data_shuffle_supported,
@@ -26,7 +28,7 @@ _MAX_PHILOX_COUNTER = (1 << 63) - 1
 
 requires_gfx950 = pytest.mark.skipif(
     not torch.cuda.is_available() or arch_info.get_arch() != "gfx950",
-    reason="dual-layout MXFP4 quantization requires gfx950",
+    reason="fused quantization, transpose and Hadamard MXFP4 requires gfx950",
 )
 
 
@@ -75,12 +77,12 @@ def _signs(device: torch.device) -> torch.Tensor:
 @requires_gfx950
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("shape", [(32, 32), (64, 96), (96, 64), (256, 256)])
-def test_dual_layout_quant_mxfp4_rtn_matches_reference(shape, dtype):
+def test_fused_quant_transpose_hadamard_mxfp4_rtn_matches_reference(shape, dtype):
     torch.manual_seed(17)
     x = torch.randn(shape, dtype=dtype, device="cuda") * 4.0
     sign = _signs(x.device)
 
-    actual = dual_layout_quant_mxfp4(x, sign)
+    actual = fused_quant_transpose_hadamard_mxfp4(x, sign)
     row_expected = _quantize_rtn(x)
     transposed_expected = _quantize_rtn(_h16_transposed(x, sign))
 
@@ -96,25 +98,25 @@ def test_dual_layout_quant_mxfp4_rtn_matches_reference(shape, dtype):
 
 
 @requires_gfx950
-def test_dual_layout_quant_mxfp4_h16_is_not_plain_transpose():
+def test_fused_quant_transpose_hadamard_mxfp4_h16_is_not_plain_transpose():
     torch.manual_seed(23)
     x = torch.randn((64, 96), dtype=torch.bfloat16, device="cuda")
     sign = _signs(x.device)
 
-    _, _, transposed, _ = dual_layout_quant_mxfp4(x, sign)
+    _, _, transposed, _ = fused_quant_transpose_hadamard_mxfp4(x, sign)
     plain_transposed, _ = _quantize_rtn(x.T.contiguous())
 
     assert not torch.equal(transposed, plain_transposed)
 
 
 @requires_gfx950
-def test_dual_layout_quant_mxfp4_fused_gemm_layouts_match_shared_shuffles():
+def test_fused_quant_transpose_hadamard_mxfp4_fused_gemm_layouts_match_shared_shuffles():
     torch.manual_seed(25)
     x = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda")
     sign = _signs(x.device)
 
-    row, row_scale, col, col_scale = dual_layout_quant_mxfp4(x, sign)
-    fused = dual_layout_quant_mxfp4(
+    row, row_scale, col, col_scale = fused_quant_transpose_hadamard_mxfp4(x, sign)
+    fused = fused_quant_transpose_hadamard_mxfp4(
         x,
         sign,
         swizzle_scale=True,
@@ -153,12 +155,12 @@ def test_dual_layout_quant_mxfp4_fused_gemm_layouts_match_shared_shuffles():
 
 
 @requires_gfx950
-def test_dual_layout_quant_mxfp4_preserves_e8m0_endpoints():
+def test_fused_quant_transpose_hadamard_mxfp4_preserves_e8m0_endpoints():
     sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device="cuda")
 
     zeros = torch.zeros((32, 32), dtype=torch.float32, device="cuda")
     zero_row, zero_row_scale, zero_transposed, zero_transposed_scale = (
-        dual_layout_quant_mxfp4(zeros, sign)
+        fused_quant_transpose_hadamard_mxfp4(zeros, sign)
     )
     assert torch.count_nonzero(zero_row).item() == 0
     assert torch.count_nonzero(zero_transposed).item() == 0
@@ -167,7 +169,9 @@ def test_dual_layout_quant_mxfp4_preserves_e8m0_endpoints():
 
     smallest_value = 2.0**-125
     smallest = torch.full((32, 32), smallest_value, dtype=torch.float32, device="cuda")
-    smallest_row, smallest_row_scale, _, _ = dual_layout_quant_mxfp4(smallest, sign)
+    smallest_row, smallest_row_scale, _, _ = fused_quant_transpose_hadamard_mxfp4(
+        smallest, sign
+    )
     assert torch.all(smallest_row_scale == 0)
     assert torch.all(smallest_row == 0x66)
 
@@ -175,15 +179,17 @@ def test_dual_layout_quant_mxfp4_preserves_e8m0_endpoints():
     # the rotated-transposed layout its own raw-zero scale oracle.
     smallest_transposed_input = torch.zeros_like(smallest)
     smallest_transposed_input[::_HADAMARD_SIZE, :] = 4.0 * smallest_value
-    _, _, smallest_transposed, smallest_transposed_scale = dual_layout_quant_mxfp4(
-        smallest_transposed_input, sign
+    _, _, smallest_transposed, smallest_transposed_scale = (
+        fused_quant_transpose_hadamard_mxfp4(smallest_transposed_input, sign)
     )
     assert torch.all(smallest_transposed_scale == 0)
     assert torch.all(smallest_transposed == 0x66)
 
     largest = torch.zeros((32, 32), dtype=torch.float32, device="cuda")
     largest[:, 0] = torch.finfo(torch.float32).max
-    largest_row, largest_row_scale, _, _ = dual_layout_quant_mxfp4(largest, sign)
+    largest_row, largest_row_scale, _, _ = fused_quant_transpose_hadamard_mxfp4(
+        largest, sign
+    )
     largest_row_expected = torch.zeros_like(largest_row)
     largest_row_expected[:, 0] = 0x04
     assert torch.all(largest_row_scale == 254)
@@ -197,8 +203,8 @@ def test_dual_layout_quant_mxfp4_preserves_e8m0_endpoints():
         dtype=torch.float32,
         device="cuda",
     )
-    _, _, largest_transposed, largest_transposed_scale = dual_layout_quant_mxfp4(
-        largest_transposed_input, sign
+    _, _, largest_transposed, largest_transposed_scale = (
+        fused_quant_transpose_hadamard_mxfp4(largest_transposed_input, sign)
     )
     largest_transposed_expected = torch.zeros_like(largest_transposed)
     largest_transposed_expected[:, 0] = 0x04
@@ -214,8 +220,7 @@ def test_dual_layout_quant_mxfp4_preserves_e8m0_endpoints():
     "use_sr_row,use_sr_transposed",
     [(True, False), (False, True), (True, True)],
 )
-@requires_gfx950
-def test_dual_layout_quant_mxfp4_sr_is_reproducible_and_reuses_rtn_scales(
+def test_fused_quant_transpose_hadamard_mxfp4_sr_is_reproducible_and_reuses_rtn_scales(
     use_sr_row,
     use_sr_transposed,
 ):
@@ -229,9 +234,9 @@ def test_dual_layout_quant_mxfp4_sr_is_reproducible_and_reuses_rtn_scales(
         "philox_offset": (1 << 32) + 17,
     }
 
-    actual = dual_layout_quant_mxfp4(x, sign, **kwargs)
-    repeated = dual_layout_quant_mxfp4(x, sign, **kwargs)
-    rtn = dual_layout_quant_mxfp4(x, sign)
+    actual = fused_quant_transpose_hadamard_mxfp4(x, sign, **kwargs)
+    repeated = fused_quant_transpose_hadamard_mxfp4(x, sign, **kwargs)
+    rtn = fused_quant_transpose_hadamard_mxfp4(x, sign)
 
     for result, expected in zip(actual, repeated):
         torch.testing.assert_close(result, expected, atol=0, rtol=0)
@@ -248,28 +253,28 @@ def test_dual_layout_quant_mxfp4_sr_is_reproducible_and_reuses_rtn_scales(
 
 
 @requires_gfx950
-def test_dual_layout_quant_mxfp4_assigns_adjacent_nonoverlapping_streams():
+def test_fused_quant_transpose_hadamard_mxfp4_assigns_adjacent_nonoverlapping_streams():
     sign = torch.ones(_HADAMARD_SIZE, dtype=torch.float32, device="cuda")
     h16 = _hadamard16(sign.device)
     block_h16 = torch.block_diag(h16, h16, h16, h16)
     x = torch.eye(64, dtype=torch.float32, device="cuda") + block_h16
     counters_per_layout = x.numel() // 8
 
-    row_only = dual_layout_quant_mxfp4(
+    row_only = fused_quant_transpose_hadamard_mxfp4(
         x,
         sign,
         use_sr_row=True,
         philox_seed=1234,
         philox_offset=17,
     )
-    transposed_only = dual_layout_quant_mxfp4(
+    transposed_only = fused_quant_transpose_hadamard_mxfp4(
         x,
         sign,
         use_sr_transposed=True,
         philox_seed=1234,
         philox_offset=17,
     )
-    both = dual_layout_quant_mxfp4(
+    both = fused_quant_transpose_hadamard_mxfp4(
         x,
         sign,
         use_sr_row=True,
@@ -277,7 +282,7 @@ def test_dual_layout_quant_mxfp4_assigns_adjacent_nonoverlapping_streams():
         philox_seed=1234,
         philox_offset=17,
     )
-    shifted_row = dual_layout_quant_mxfp4(
+    shifted_row = fused_quant_transpose_hadamard_mxfp4(
         x,
         sign,
         use_sr_row=True,
@@ -293,13 +298,13 @@ def test_dual_layout_quant_mxfp4_assigns_adjacent_nonoverlapping_streams():
 
 
 @requires_gfx950
-def test_dual_layout_quant_mxfp4_does_not_reuse_counters_across_tiles():
+def test_fused_quant_transpose_hadamard_mxfp4_does_not_reuse_counters_across_tiles():
     torch.manual_seed(31)
     tile = torch.randn((32, 32), dtype=torch.bfloat16, device="cuda")
     x = tile.repeat(2, 3)
     sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device="cuda")
 
-    row, scales, _, _ = dual_layout_quant_mxfp4(
+    row, scales, _, _ = fused_quant_transpose_hadamard_mxfp4(
         x,
         sign,
         use_sr_row=True,
@@ -313,21 +318,25 @@ def test_dual_layout_quant_mxfp4_does_not_reuse_counters_across_tiles():
     assert not torch.equal(row[:, :16], row[:, 16:32])
 
 
-def test_dual_layout_quant_mxfp4_validates_input_contract():
+def test_fused_quant_transpose_hadamard_mxfp4_validates_input_contract():
     sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="must be 2-D"):
-        dual_layout_quant_mxfp4(torch.empty(32, dtype=torch.bfloat16), sign)
+        fused_quant_transpose_hadamard_mxfp4(
+            torch.empty(32, dtype=torch.bfloat16), sign
+        )
     with pytest.raises(TypeError, match="torch.bfloat16 or torch.float32"):
-        dual_layout_quant_mxfp4(torch.empty((32, 32), dtype=torch.float16), sign)
+        fused_quant_transpose_hadamard_mxfp4(
+            torch.empty((32, 32), dtype=torch.float16), sign
+        )
     with pytest.raises(ValueError, match="block_size must be 32"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((32, 32), dtype=torch.bfloat16),
             sign,
             block_size=16,
         )
     with pytest.raises(ValueError, match="g must be 16"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((32, 32), dtype=torch.bfloat16),
             sign,
             g=32,
@@ -415,80 +424,80 @@ def test_philox_streams_accept_inclusive_last_counter_boundary(
 
 
 @requires_gfx950
-def test_dual_layout_quant_mxfp4_validates_shape_and_sign():
+def test_fused_quant_transpose_hadamard_mxfp4_validates_shape_and_sign():
     good_sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device="cuda")
 
     with pytest.raises(ValueError, match="must be non-zero"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((0, 32), dtype=torch.bfloat16, device="cuda"), good_sign
         )
     with pytest.raises(ValueError, match="both be divisible by 32"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((32, 48), dtype=torch.bfloat16, device="cuda"), good_sign
         )
     with pytest.raises(ValueError, match="cannot be swizzled"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
             good_sign,
             swizzle_scale=True,
         )
     with pytest.raises(ValueError, match="cannot be shuffled"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
             good_sign,
             shuffle_col=True,
         )
     noncontiguous = torch.empty((32, 64), dtype=torch.bfloat16, device="cuda")[:, ::2]
     with pytest.raises(ValueError, match="must be contiguous"):
-        dual_layout_quant_mxfp4(noncontiguous, good_sign)
+        fused_quant_transpose_hadamard_mxfp4(noncontiguous, good_sign)
     with pytest.raises(TypeError, match="sign_vector must have dtype"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
             good_sign.to(torch.float16),
         )
     with pytest.raises(ValueError, match="must contain 16 elements"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
             good_sign[:8],
         )
     invalid_sign = good_sign.clone()
     invalid_sign[0] = 0
     with pytest.raises(ValueError, match=r"finite and equal to \+1 or -1"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
             invalid_sign,
         )
 
     with torch.inference_mode():
         inference_sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device="cuda")
-    dual_layout_quant_mxfp4(
+    fused_quant_transpose_hadamard_mxfp4(
         torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"),
         inference_sign,
     )
 
     mutable_sign = good_sign.clone()
-    dual_layout_quant_mxfp4(
+    fused_quant_transpose_hadamard_mxfp4(
         torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"), mutable_sign
     )
     mutable_sign[0] = 0
     with pytest.raises(ValueError, match=r"finite and equal to \+1 or -1"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             torch.empty((32, 32), dtype=torch.bfloat16, device="cuda"), mutable_sign
         )
 
 
 @requires_gfx950
-def test_dual_layout_quant_mxfp4_validates_philox_contract():
+def test_fused_quant_transpose_hadamard_mxfp4_validates_philox_contract():
     x = torch.empty((32, 32), dtype=torch.bfloat16, device="cuda")
     sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="philox_seed is required"):
-        dual_layout_quant_mxfp4(x, sign, use_sr_row=True)
+        fused_quant_transpose_hadamard_mxfp4(x, sign, use_sr_row=True)
     with pytest.raises(TypeError, match="must be integers"):
-        dual_layout_quant_mxfp4(x, sign, use_sr_row=True, philox_seed=1.5)
+        fused_quant_transpose_hadamard_mxfp4(x, sign, use_sr_row=True, philox_seed=1.5)
     with pytest.raises(ValueError, match="philox_seed must be"):
-        dual_layout_quant_mxfp4(x, sign, use_sr_row=True, philox_seed=-1)
+        fused_quant_transpose_hadamard_mxfp4(x, sign, use_sr_row=True, philox_seed=-1)
     with pytest.raises(ValueError, match="leave room for enabled layouts"):
-        dual_layout_quant_mxfp4(
+        fused_quant_transpose_hadamard_mxfp4(
             x,
             sign,
             use_sr_transposed=True,
@@ -496,47 +505,52 @@ def test_dual_layout_quant_mxfp4_validates_philox_contract():
             philox_offset=_MAX_PHILOX_COUNTER - x.numel() // 8 + 2,
         )
     with pytest.raises(ValueError, match="only valid"):
-        dual_layout_quant_mxfp4(x, sign, philox_seed=1)
+        fused_quant_transpose_hadamard_mxfp4(x, sign, philox_seed=1)
 
 
-def test_dual_layout_quant_mxfp4_rejects_unsupported_arch(monkeypatch):
+def test_fused_quant_transpose_hadamard_mxfp4_rejects_unsupported_arch(monkeypatch):
     monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx942")
     x = torch.empty((32, 32), dtype=torch.bfloat16)
     sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="requires gfx950"):
-        dual_layout_quant_mxfp4(x, sign)
+        fused_quant_transpose_hadamard_mxfp4(x, sign)
 
 
 @requires_gfx950
-def test_dual_layout_quant_mxfp4_requires_published_config(monkeypatch):
+def test_fused_quant_transpose_hadamard_mxfp4_requires_published_config(monkeypatch):
     def missing_config(path, required=True):
         assert required
-        assert path.endswith("/gfx950/triton/fusions/dual_layout_mxfp4/DEFAULT.json")
+        assert path.endswith(
+            "/gfx950/triton/fusions/fused_quant_transpose_hadamard_mxfp4/DEFAULT.json"
+        )
         raise FileNotFoundError(path)
 
-    monkeypatch.setattr(
-        "aiter.ops.triton.quant.dual_layout_mxfp4.load_config_json", missing_config
+    wrapper_module = importlib.import_module(
+        "aiter.ops.triton.quant.fused_quant_transpose_hadamard_mxfp4"
     )
+    monkeypatch.setattr(wrapper_module, "load_config_json", missing_config)
     x = torch.zeros((32, 32), dtype=torch.bfloat16, device="cuda")
     sign = torch.ones(_HADAMARD_SIZE, dtype=torch.bfloat16, device=x.device)
-    with pytest.raises(FileNotFoundError, match="dual_layout_mxfp4/DEFAULT.json"):
-        dual_layout_quant_mxfp4(x, sign)
+    with pytest.raises(
+        FileNotFoundError, match="fused_quant_transpose_hadamard_mxfp4/DEFAULT.json"
+    ):
+        fused_quant_transpose_hadamard_mxfp4(x, sign)
 
 
 @requires_gfx950
-def test_dual_layout_quant_mxfp4_graph_capture():
+def test_fused_quant_transpose_hadamard_mxfp4_graph_capture():
     x = torch.randn((32, 32), dtype=torch.bfloat16, device="cuda")
     sign = _signs(x.device)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        expected = dual_layout_quant_mxfp4(x, sign)
+        expected = fused_quant_transpose_hadamard_mxfp4(x, sign)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = dual_layout_quant_mxfp4(x, sign)
+        actual = fused_quant_transpose_hadamard_mxfp4(x, sign)
     graph.replay()
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)

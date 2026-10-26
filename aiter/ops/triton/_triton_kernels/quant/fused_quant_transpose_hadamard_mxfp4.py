@@ -9,17 +9,15 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _mxfp4_scale_from_amax,
     _mxfp4_sr_pack,
     _mxfp4_sr_random_words,
-)
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.mxfp4 import (
     mxfp4_apply_quant_scale,
     mxfp4_shuffled_data_offsets,
     mxfp4_swizzled_scale_offsets,
     normalized_hadamard16,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-_dual_layout_quant_mxfp4_repr = make_kernel_repr(
-    "_dual_layout_quant_mxfp4_kernel",
+_fused_quant_transpose_hadamard_mxfp4_repr = make_kernel_repr(
+    "_fused_quant_transpose_hadamard_mxfp4_kernel",
     [
         "BLOCK_SIZE",
         "HADAMARD_SIZE",
@@ -33,8 +31,8 @@ _dual_layout_quant_mxfp4_repr = make_kernel_repr(
 )
 
 
-@triton.jit(repr=_dual_layout_quant_mxfp4_repr)
-def _dual_layout_quant_mxfp4_kernel(
+@triton.jit(repr=_fused_quant_transpose_hadamard_mxfp4_repr)
+def _fused_quant_transpose_hadamard_mxfp4_kernel(
     x_ptr,
     row_ptr,
     row_scale_ptr,

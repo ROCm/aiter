@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark fused dual-layout H16 MXFP4 quantization."""
+"""Benchmark fused quantization, transpose and H16 MXFP4."""
 
 import argparse
 import sys
@@ -9,7 +9,10 @@ import sys
 import torch
 import triton
 
-from aiter.ops.triton.quant import dual_layout_quant_mxfp4, dynamic_mxfp4_quant
+from aiter.ops.triton.quant import (
+    dynamic_mxfp4_quant,
+    fused_quant_transpose_hadamard_mxfp4,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_weight
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -92,7 +95,9 @@ def _default_shapes() -> list[tuple[int, int]]:
 
 def run_benchmark(args) -> None:
     if arch_info.get_arch() != "gfx950":
-        raise RuntimeError("dual-layout MXFP4 quantization requires gfx950")
+        raise RuntimeError(
+            "fused quantization, transpose and Hadamard MXFP4 requires gfx950"
+        )
     shapes = [tuple(args.shape)] if args.shape is not None else _default_shapes()
     providers = args.provider.split(",")
     known_providers = {
@@ -139,7 +144,7 @@ def run_benchmark(args) -> None:
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_dual_layout_mxfp4(
+    def bench_fused_quant_transpose_hadamard_mxfp4(
         M,
         N,
         provider,
@@ -158,12 +163,12 @@ def run_benchmark(args) -> None:
         if provider == "fused_rtn":
 
             def fn():
-                return dual_layout_quant_mxfp4(x, sign)
+                return fused_quant_transpose_hadamard_mxfp4(x, sign)
 
         elif provider == "fused_rtn_layout":
 
             def fn():
-                return dual_layout_quant_mxfp4(
+                return fused_quant_transpose_hadamard_mxfp4(
                     x,
                     sign,
                     swizzle_scale=True,
@@ -173,7 +178,7 @@ def run_benchmark(args) -> None:
         elif provider == "fused_sr":
 
             def fn():
-                return dual_layout_quant_mxfp4(
+                return fused_quant_transpose_hadamard_mxfp4(
                     x,
                     sign,
                     use_sr_row=True,
@@ -208,7 +213,7 @@ def run_benchmark(args) -> None:
             return 100.0 * bandwidth_gbps / peak_bandwidth_gbps
         raise ValueError(f"unknown metric: {metric}")
 
-    bench_dual_layout_mxfp4.run(
+    bench_fused_quant_transpose_hadamard_mxfp4.run(
         save_path="." if args.output else None,
         print_data=True,
     )
@@ -216,7 +221,7 @@ def run_benchmark(args) -> None:
 
 def parse_args(args: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        prog="Benchmark dual-layout H16 MXFP4 quantization",
+        prog="Benchmark fused quantization, transpose and H16 MXFP4",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

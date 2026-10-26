@@ -3,8 +3,8 @@
 
 import torch
 
-from aiter.ops.triton._triton_kernels.quant.dual_layout_mxfp4 import (
-    _dual_layout_quant_mxfp4_kernel,
+from aiter.ops.triton._triton_kernels.quant.fused_quant_transpose_hadamard_mxfp4 import (
+    _fused_quant_transpose_hadamard_mxfp4_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.mxfp4 import (
@@ -21,14 +21,14 @@ from aiter.ops.triton.utils.mxfp4 import (
     prepare_h16_sign,
 )
 
-__all__ = ["dual_layout_quant_mxfp4"]
+__all__ = ["fused_quant_transpose_hadamard_mxfp4"]
 
 
 _LOGGER = AiterTritonLogger()
 _MXFP4_BLOCK_SIZE = 32
 _HADAMARD_SIZE = 16
 _MAX_PHILOX_COUNTER = (1 << 63) - 1
-_CONFIG_NAME = "DUAL-LAYOUT-MXFP4"
+_CONFIG_NAME = "FUSED-QUANT-TRANSPOSE-HADAMARD-MXFP4"
 
 
 def _philox_streams(
@@ -70,7 +70,7 @@ def _philox_streams(
     return philox_seed, row_offset, transposed_offset
 
 
-def dual_layout_quant_mxfp4(
+def fused_quant_transpose_hadamard_mxfp4(
     x: torch.Tensor,
     sign_vector: torch.Tensor,
     *,
@@ -103,13 +103,13 @@ def dual_layout_quant_mxfp4(
         ``(row_fp4, row_scales, transposed_fp4, transposed_scales)``: packed
         E2M1 payloads of shape ``(M, N // 2)`` and ``(N, M // 2)``, with E8M0
         scales of shape ``(M, N // 32)`` and ``(N, M // 32)``.
-        ``swizzle_scale=True`` stores each scale tensor in the padded gfx950
-        GEMM scale arrangement instead of its logical row-major shape;
+        ``swizzle_scale=True`` stores scales in the gfx950 GEMM arrangement
+        with physical shapes ``(M // 32, N)`` and ``(N // 32, M)`` (no padding);
         ``shuffle_col=True`` likewise stores ``transposed_fp4`` in the
         preshuffled gfx950 B-operand arrangement.
     """
     _LOGGER.info(
-        "DUAL_LAYOUT_QUANT_MXFP4: shape=%s sr_row=%s sr_transposed=%s "
+        "FUSED_QUANT_TRANSPOSE_HADAMARD_MXFP4: shape=%s sr_row=%s sr_transposed=%s "
         "swizzle_scale=%s shuffle_col=%s",
         tuple(x.shape),
         use_sr_row,
@@ -143,7 +143,9 @@ def dual_layout_quant_mxfp4(
             f"{_MXFP4_BLOCK_SIZE}, got {tuple(x.shape)}"
         )
     if arch_info.get_arch() != "gfx950":
-        raise RuntimeError("dual-layout MXFP4 quantization requires gfx950")
+        raise RuntimeError(
+            "fused quantization, transpose and Hadamard MXFP4 requires gfx950"
+        )
 
     row_scale_cols = N // block_size
     transposed_scale_cols = M // block_size
@@ -192,10 +194,10 @@ def dual_layout_quant_mxfp4(
 
     config_dir = resolve_config_dir("fusions", _CONFIG_NAME)
     config = load_config_json(f"{config_dir}/DEFAULT.json")[
-        "_dual_layout_quant_mxfp4_kernel"
+        "_fused_quant_transpose_hadamard_mxfp4_kernel"
     ]
     grid = (M // _MXFP4_BLOCK_SIZE, N // _MXFP4_BLOCK_SIZE)
-    _dual_layout_quant_mxfp4_kernel[grid](
+    _fused_quant_transpose_hadamard_mxfp4_kernel[grid](
         x,
         row_fp4,
         row_scales,

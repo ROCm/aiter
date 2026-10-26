@@ -1,5 +1,5 @@
 {
-    "_dual_layout_quant_mxfp4_kernel": {
+    "_fused_quant_transpose_hadamard_mxfp4_kernel": {
         "num_warps": 4,
         "num_stages": 1
     }

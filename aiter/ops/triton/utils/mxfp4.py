@@ -31,7 +31,27 @@ def prepare_h16_sign(
     reference: torch.Tensor,
     size: int = 16,
 ) -> torch.Tensor:
-    """Validate and flatten a same-device vector of H16 signs."""
+    """Validate H16 signs and return a flat, contiguous tensor on their device.
+
+    ``sign_vector`` must contain ``size`` finite +1/-1 values in bfloat16 or
+    float32 on ``reference.device``; ``reference`` supplies only the device.
+    The default size is 16. A reshape or contiguous copy may be returned.
+
+    Value validation is cached on the original tensor's PyTorch version;
+    version-tracked mutations trigger validation on the next Python call.
+    Tensors without a version counter (e.g. inference tensors) are checked on
+    every call. Outside capture, the value check synchronizes via ``item()``.
+
+    For optional CUDA graph capture, validate or warm up the consuming wrapper
+    before capture and keep the signs unchanged. An uncached check during
+    capture uses ``torch._assert_async`` if available, otherwise raises.
+    Graph replay does not rerun Python or the version-cache check; only checks
+    recorded during capture replay, so replay must not be relied on to
+    revalidate changed signs.
+
+    Example: ``sign = prepare_h16_sign(sign, x)`` before passing ``sign`` to
+    ``fused_quant_transpose_hadamard_mxfp4(x, sign)`` (and before capture).
+    """
     if not isinstance(sign_vector, torch.Tensor):
         raise TypeError("sign_vector must be a torch.Tensor")
     if sign_vector.dtype not in (torch.bfloat16, torch.float32):
