@@ -6,9 +6,7 @@ from collections.abc import Callable
 import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
-from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
-    gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
-)
+from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
@@ -125,16 +123,12 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-    if args.gluon:
-        if args.shuffle:
-            impl = gluon_gemm_a8w8_preshuffle
-        else:
-            impl = functools.partial(triton_gemm_a8w8, backend="gluon")
+    backend = "gluon" if args.gluon else "triton"
+    if args.shuffle:
+        impl = functools.partial(gemm_a8w8_preshuffle, backend=backend)
+    elif args.gluon:
+        impl = functools.partial(triton_gemm_a8w8, backend="gluon")
     else:
-        if args.shuffle:
-            raise RuntimeError(
-                "Argument --shuffle is only supported with --gluon flag."
-            )
         impl = triton_gemm_a8w8
     if args.model:
         unsupported_args = []
