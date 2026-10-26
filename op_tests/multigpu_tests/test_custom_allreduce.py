@@ -187,6 +187,8 @@ def _allreduce_tail_regression(
     )
     ca_comm = None
     try:
+        # Exercise the custom kernels at every size, also on non-XGMI groups.
+        os.environ["AITER_CUSTOM_AR_MIN_SIZE"] = "0"
         ca_comm = CustomAllreduce(dist.group.WORLD, device)
         assert not ca_comm.disabled, "The tail regression requires custom allreduce"
 
@@ -340,6 +342,9 @@ def _allreduce_mixed_size_regression(
     dist.init_process_group(
         "gloo", world_size=tp_size, rank=rank, init_method=distributed_init_method
     )
+    # These regressions drive the LL / LL128 kernels themselves; keep every size on
+    # the custom path even where the default routes small inputs to RCCL (non-XGMI).
+    os.environ["AITER_CUSTOM_AR_MIN_SIZE"] = "0"
     ca_comm = CustomAllreduce(dist.group.WORLD, device)
     assert not ca_comm.disabled, f"The {name} regression requires custom allreduce"
     generator = torch.Generator().manual_seed(2026)
