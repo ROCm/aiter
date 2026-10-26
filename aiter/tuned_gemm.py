@@ -372,6 +372,35 @@ def gemm_a16w16(
     scale_b: Tensor | None = None,
     scale_c: Tensor | None = None,
 ) -> Tensor:
+    return _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c)
+
+
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *a, **k: None)
+def gemm_a16w16_out(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+) -> None:
+    """`gemm_a16w16` written into ``out`` -- the [M, N] tensor of ``otype`` --
+    for a caller whose consumer reads one fixed address."""
+    _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
+
+
+def _gemm_a16w16(
+    A: Tensor,
+    B: Tensor,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+    out: Tensor | None = None,
+) -> Tensor:
     bpreshuffle = False
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
         bpreshuffle = True
@@ -380,7 +409,7 @@ def gemm_a16w16(
             inp_view = A.view(-1, A.size(-1))
             batched = True
         except RuntimeError:
-            return F.linear(A, B, bias)
+            return _into(out, F.linear(A, B, bias))
     else:
         inp_view = A
         batched = False
@@ -388,6 +417,8 @@ def gemm_a16w16(
     n = B.shape[0]
     use_bias = bias is not None
     otype = otype if otype is not None else inp_view.dtype
+    if out is not None and out.dtype != otype:
+        raise ValueError(f"gemm_a16w16: out is {out.dtype} but otype is {otype}")
     from aiter.ops.opus._arch import _device_arch_and_cu
 
     gfx, cu_num = _device_arch_and_cu(inp_view.device)
@@ -406,7 +437,8 @@ def gemm_a16w16(
     libtype = config["libtype"]
     solution_idx = config["solidx"]
     solfunc = solMap[libtype]
-    out = solfunc(
+    out_2d = None if out is None else out.view(-1, n)
+    result = solfunc(
         inp_view,
         B,
         solution_idx,
@@ -417,11 +449,17 @@ def gemm_a16w16(
         scale_c,
         bpreshuffle,
         config=config,
+        out=out_2d,
     )
+    # Every backend must answer in the caller's buffer: one that hands back a
+    # tensor of its own leaves `out` unwritten, and nothing downstream notices.
+    assert (
+        out_2d is None or result.data_ptr() == out_2d.data_ptr()
+    ), f"the {libtype} gemm did not write into out="
     if batched:
-        out = out.view(*A.shape[:-1], B.shape[0])
-    if otype is not None and out.dtype != otype:
-        out = out.to(otype)
+        result = result.view(*A.shape[:-1], B.shape[0])
+    if otype is not None and result.dtype != otype:
+        result = result.to(otype)
     save_shapes(
         m,
         n,
@@ -432,7 +470,25 @@ def gemm_a16w16(
         scale_a is not None or scale_b is not None,
         bpreshuffle,
     )
-    return out
+    return result
+
+
+def _result_buffer(
+    out: Tensor | None, m: int, n: int, dtype: torch.dtype, device: torch.device
+) -> Tensor:
+    """The [m, n] buffer a backend writes: the caller's ``out``, else a new one."""
+    return torch.empty(m, n, dtype=dtype, device=device) if out is None else out
+
+
+def _into(out: Tensor | None, result: Tensor) -> Tensor:
+    """``result``, or the caller's ``out`` holding it.
+
+    For the paths that cannot write in place: a copy, so only off the tuned ones.
+    A ``result`` that already is ``out`` is returned as is.
+    """
+    if out is None or result is out:
+        return result
+    return out.copy_(result)
 
 
 def skinny_gemm(
@@ -446,30 +502,28 @@ def skinny_gemm(
     scale_c: Tensor | None = None,
     bpreshuffle=False,
     config: dict | None = None,
+    out: Tensor | None = None,
 ):
     import aiter as ops
 
     assert not bpreshuffle, "bpreshuffle is not supported in skinny_gemm!"
+    # The skinny kernels write the input dtype, so a caller's buffer of another
+    # dtype takes the result by copy rather than as the kernels' output.
+    direct = out if out is not None and out.dtype == inp.dtype else None
+    result = _result_buffer(
+        direct, inp.shape[0], weights.shape[0], inp.dtype, inp.device
+    )
     if solidx == 0:
-        out = torch.empty(
-            inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
-        )
-        ops.wvSpltK(weights, inp, out, inp.shape[0], get_cu_num())
+        ops.wvSpltK(weights, inp, result, inp.shape[0], get_cu_num())
     elif solidx == 1:
-        out = torch.empty(
-            inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
-        )
-        ops.LLMM1(weights, inp, out, 4)
+        ops.LLMM1(weights, inp, result, 4)
     if solidx == 2:
-        out = torch.empty(
-            inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
-        )
-        ops.wv_splitk_small_fp16_bf16(weights, inp, out, inp.shape[0], get_cu_num())
+        ops.wv_splitk_small_fp16_bf16(weights, inp, result, inp.shape[0], get_cu_num())
     if bias is not None:
-        out += bias
-    if otype is not None and out.dtype != otype:
-        out = out.to(otype)
-    return out
+        result += bias
+    if otype is not None and result.dtype != otype:
+        result = result.to(otype)
+    return _into(out, result)
 
 
 def hipb_gemm(
@@ -483,6 +537,7 @@ def hipb_gemm(
     scale_c: Tensor | None = None,
     bpreshuffle=False,
     config: dict | None = None,
+    out: Tensor | None = None,
 ):
     if otype is None:
         otype = inp.dtype
@@ -491,8 +546,46 @@ def hipb_gemm(
         hipb_create_extension()
         extensions_created = True
     return hipb_mm(
-        inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c, bpreshuffle
+        inp,
+        weights.t(),
+        solidx,
+        bias,
+        otype,
+        scale_a,
+        scale_b,
+        scale_c,
+        bpreshuffle,
+        out=out,
     )
+
+
+def _torch_scaled_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    bias: Tensor | None,
+    otype: torch.dtype | None,
+    scale_a: Tensor | None,
+    scale_b: Tensor | None,
+) -> Tensor:
+    """FP8 through `torch._scaled_mm`, or an FP32 emulation where it is refused."""
+    if scale_a is None:
+        scale_a = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
+    if scale_b is None:
+        scale_b = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
+    try:
+        return torch._scaled_mm(
+            inp,
+            weights.t(),
+            out_dtype=otype,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            bias=bias,
+        )
+    except RuntimeError:
+        result = (
+            F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32)) * scale_a * scale_b
+        )
+        return (result.to(otype) + bias) if bias is not None else result.to(otype)
 
 
 def torch_gemm(
@@ -506,30 +599,13 @@ def torch_gemm(
     scale_c: Tensor | None = None,
     bpreshuffle=False,
     config: dict | None = None,
+    out: Tensor | None = None,
 ):
     assert not bpreshuffle, "bpreshuffle is not supported in torch_gemm!"
     if inp.dtype == dtypes.fp8:
-        if scale_a is None:
-            scale_a = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
-        if scale_b is None:
-            scale_b = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
-        try:
-            out = torch._scaled_mm(
-                inp,
-                weights.t(),
-                out_dtype=otype,
-                scale_a=scale_a,
-                scale_b=scale_b,
-                bias=bias,
-            )
-        except RuntimeError:
-            out = (
-                F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32))
-                * scale_a
-                * scale_b
-            )
-            out = (out.to(otype) + bias) if bias is not None else out.to(otype)
-        return out
+        return _into(
+            out, _torch_scaled_gemm(inp, weights, bias, otype, scale_a, scale_b)
+        )
     if otype == dtypes.fp32 and inp.dtype in (dtypes.bf16, dtypes.fp16):
         # `F.linear` returns the *input* dtype, so widening its result
         # afterwards preserves nothing: the values are already on the BF16
@@ -537,12 +613,17 @@ def torch_gemm(
         # `out_dtype` writes the accumulator instead, which is what the tuned
         # ASM (`bf16gemm_fp32bf16_*`) and OPUS kernels do -- an untuned shape
         # must not disagree with them about what `otype` means.
-        out = torch.mm(inp, weights.t(), out_dtype=otype)
-        return out if bias is None else out + bias
-    out = F.linear(inp, weights, bias)
-    if otype is not None and out.dtype != otype:
-        out = out.to(otype)
-    return out
+        result = torch.mm(inp, weights.t(), out_dtype=otype, out=out)
+        return result if bias is None else result.add_(bias)
+    if out is not None and out.dtype == inp.dtype:
+        # F.linear's own form, bias added in the accumulator.
+        if bias is None:
+            return torch.mm(inp, weights.t(), out=out)
+        return torch.addmm(bias, inp, weights.t(), out=out)
+    result = F.linear(inp, weights, bias)
+    if otype is not None and result.dtype != otype:
+        result = result.to(otype)
+    return _into(out, result)
 
 
 def asm_gemm(
@@ -556,13 +637,12 @@ def asm_gemm(
     scale_c: Tensor | None = None,
     bpreshuffle=False,
     config: dict | None = None,
+    out: Tensor | None = None,
 ):
     kernelName = config.get("kernelName") if config else None
     splitK = config.get("splitK") if config else None
-    out_asm = torch.empty(
-        inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
-    )
-    return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, kernelName, bpreshuffle)
+    result = _result_buffer(out, inp.shape[0], weights.shape[0], otype, inp.device)
+    return gemm_a16w16_asm(inp, weights, result, bias, splitK, kernelName, bpreshuffle)
 
 
 def flydsl_gemm(
@@ -576,6 +656,7 @@ def flydsl_gemm(
     scale_c: Tensor | None = None,
     bpreshuffle=False,
     config: dict | None = None,
+    out: Tensor | None = None,
 ):
     assert (
         scale_a is None and scale_b is None and scale_c is None
@@ -591,9 +672,10 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    out = flydsl_gemm_kernels.flydsl_hgemm(
+    result = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
+        out=out,
         bias=fused_bias,
         block_m=flydsl_config["block_m"],
         block_n=flydsl_config["block_n"],
@@ -609,10 +691,11 @@ def flydsl_gemm(
     )
 
     if bias is not None and fused_bias is None:
-        out = out.to(bias.dtype) + bias
-    if otype is not None and out.dtype != otype:
-        out = out.to(otype)
-    return out
+        # Into the caller's buffer it can only be added in place, at its dtype.
+        result = result.to(bias.dtype) + bias if out is None else result.add_(bias)
+    if otype is not None and result.dtype != otype:
+        result = result.to(otype)
+    return result
 
 
 def opus_gemm(
@@ -626,6 +709,7 @@ def opus_gemm(
     scale_c: Tensor | None = None,
     bpreshuffle: bool | None = False,
     config: dict | None = None,
+    out: Tensor | None = None,
 ):
     """Run one tuned OPUS A16W16 row through the exact-kid interface."""
     if _opus_launch is None:
@@ -651,7 +735,7 @@ def opus_gemm(
     splitK = int(config.get("splitK", 0)) if config is not None else 0
     m, _k = inp.shape
     n = weights.shape[0]
-    Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
+    Y = _result_buffer(out, m, n, otype or inp.dtype, inp.device)
     _opus_launch(
         inp,
         weights,
@@ -676,6 +760,7 @@ def triton_gemm(
     scale_c: Tensor | None = None,
     bpreshuffle: bool | None = False,
     config: dict | None = None,
+    out: Tensor | None = None,
 ):
     from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
@@ -683,7 +768,7 @@ def triton_gemm(
         scale_a is None and scale_b is None and scale_c is None
     ), "Triton gemm_a16w16 does not support scaling yet"
     assert not bpreshuffle, "Triton gemm_a16w16 does not support bpreshuffle yet."
-    return gemm_a16w16(inp, weights, bias=bias, dtype=otype)
+    return gemm_a16w16(inp, weights, bias=bias, dtype=otype, y=out)
 
 
 solMap = {
@@ -730,11 +815,23 @@ class TunedGemm:
         scale_a: Tensor | None = None,
         scale_b: Tensor | None = None,
         scale_c: Tensor | None = None,
+        out: Tensor | None = None,
     ):
-
-        out = gemm_a16w16(
+        """``out``: write the result there (`gemm_a16w16_out`) and return it."""
+        if out is None:
+            return gemm_a16w16(
+                inp,
+                weights,
+                bias=bias,
+                otype=otype,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                scale_c=scale_c,
+            )
+        gemm_a16w16_out(
             inp,
             weights,
+            out,
             bias=bias,
             otype=otype,
             scale_a=scale_a,

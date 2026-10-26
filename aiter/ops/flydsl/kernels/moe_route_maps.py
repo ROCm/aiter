@@ -436,7 +436,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             my_rank = fx.Uint32(
                 fx.atomic_add(
                     lds_cnt + eff_e,
-                    fx.Int32(c1),
+                    c1,
                     syncscope="workgroup",
                 )
             )
