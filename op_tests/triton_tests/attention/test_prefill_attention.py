@@ -112,7 +112,10 @@ def test_op_fwd(Z, H, SEQLEN, HEAD_DIM, causal, absorb, varlen, dtype=torch.floa
             # Apply causal mask to scores (set future positions to -inf)
             # Create a causal mask
             causal_mask = torch.triu(
-                torch.ones(seqlen_q, seqlen_k, device=scores.device), diagonal=1
+                torch.ones(
+                    seqlen_q, seqlen_k, device=scores.device, dtype=torch.float32
+                ),
+                diagonal=1,
             ).bool()
             scores.masked_fill_(causal_mask.unsqueeze(1), float("-inf"))
         scores = scores.float()
