@@ -57,6 +57,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
         {
             find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f
             printf '%s\n' \
+                "$TEST_DIR/tuning_tests/test_block_race.py" \
                 "$TEST_DIR/tuning_tests/test_csv_validation.py" \
                 "$TEST_DIR/tuning_tests/test_config_shape_collision.py" \
                 "$TEST_DIR/tuning_tests/test_fast_tuning.py" \
