@@ -14,6 +14,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart, resubmitting a faulted group's remaining candidates, fault detection by type or failing synchronize |
 | `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` when a candidate faults, kills its worker, or fails preparing inputs: only that candidate fails, for untyped and `return_status` callers |
 | `test_dispatch_verification.py` | 1 | No | `dispatch_verification` against a stub family: verified, wrong selection, wrong output, unchecked, other-GPU rows; `TunerCommon.run_config` against the config file's row, unchecked-row warning, model_configs merge |
+| `test_block_race.py` | 1 | No | Interleaved elimination race: incumbent protection, resume, tie-breaking, from synthetic latencies |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
