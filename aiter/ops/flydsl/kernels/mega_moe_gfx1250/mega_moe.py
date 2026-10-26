@@ -697,6 +697,7 @@ class MegaMoEGfx1250:
         next_topk_ids: torch.Tensor | None = None,
         next_recv_token_bound: int | None = None,
         combine_quant: str | None = None,
+        recv_counter_is_zero: bool = False,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
@@ -789,7 +790,7 @@ class MegaMoEGfx1250:
                 self._compact_recv_bound(token_count, recv_token_bound)
             )
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
-            hidden_states, topk_weights, topk_ids
+            hidden_states, topk_weights, topk_ids, recv_counter_is_zero
         )
         if recv_token_bound is not None and not self._compact_plan:
             bound = int(recv_token_bound)
@@ -1564,10 +1565,12 @@ class MegaMoEGfx1250:
                 my_lsa_rank,
                 inp_cur_tok,
                 stream,
+                reset_recv=True,
             ):
                 # mori's dispatch only accumulates into total_recv (this package's
                 # zeroes it in Phase 2), so without this it grows every forward.
-                self._total_recv.zero_()
+                if reset_recv:
+                    self._total_recv.zero_()
                 plan.launch(
                     stream=torch.cuda.current_stream().cuda_stream,
                     token_indices=addr_inp_idx,
@@ -1673,6 +1676,7 @@ class MegaMoEGfx1250:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        recv_counter_is_zero: bool = False,
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
@@ -1707,6 +1711,10 @@ class MegaMoEGfx1250:
             self._compact_psum = self._psums[self._compact_slot]
         else:
             tok_map = self._token_destination_map
+        reset_args = {}
+        if recv_counter_is_zero:
+            assert self._config.dispatch_backend == "mori"
+            reset_args["reset_recv"] = False
         self._dispatch_variants[spec](
             self._arena.handle,
             payload.data_ptr(),
@@ -1719,6 +1727,7 @@ class MegaMoEGfx1250:
             self._config.rank,
             token_count,
             stream,
+            **reset_args,
         )
         reverse_source_view = _from_gpu_ptr(
             self._arena.local_ptr("recv_to_src_token"),
