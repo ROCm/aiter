@@ -519,9 +519,8 @@ def _staged_block_m(num_heads, num_queries, num_splits, row_tiles):
     enough; else 32 from two tiles per program."""
     num_sms = get_num_sms()
     if num_heads % 64 == 0 and num_splits == 1:
-        # At 64 heads the wide tile is one block per row and re-reads no keys,
-        # so a half-full round pays. Above that each row splits into blocks that
-        # re-read its keys, so it has to fill the CUs first.
+        # At 64 heads one block/row re-reads no keys, so half-full pays; above
+        # that, rows split into re-reading blocks, so it must fill the CUs first.
         programs = num_queries * (num_heads // 64)
         if programs >= (num_sms // 2 + 1 if num_heads == 64 else num_sms):
             return 64
@@ -696,8 +695,7 @@ def _pa_decode_sparse_gfx950_gluon(
     staged_bf16 = (
         not FLAT_POOL and main_fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
     )
-    # Wide head programs (8 warps) stage each key tile once for all their heads.
-    # Both helpers reject a head count their tile would not divide.
+    # Wide head programs (8 warps) stage each tile once for all their heads.
     if num_heads >= 32:
         if packed_fp8:
             BLOCK_M = _dsv4_block_m(
