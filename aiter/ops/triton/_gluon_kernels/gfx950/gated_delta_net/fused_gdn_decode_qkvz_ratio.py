@@ -67,16 +67,17 @@ def _gating(
     DTBias,
     token,
     head,
+    ba_row_stride,
     VH: gl.constexpr,
     RATIO: gl.constexpr,
     FLAT: gl.constexpr,
 ):
     """Gating inputs of one value head (loads only, so they can all be in flight)."""
     if FLAT:
-        b = gl.load(BA + token * 2 * VH + head).to(gl.float32)
-        a = gl.load(BA + token * 2 * VH + VH + head).to(gl.float32)
+        b = gl.load(BA + token * ba_row_stride + head).to(gl.float32)
+        a = gl.load(BA + token * ba_row_stride + VH + head).to(gl.float32)
     else:
-        offset = token * 2 * VH + (head // RATIO) * (2 * RATIO) + head % RATIO
+        offset = token * ba_row_stride + (head // RATIO) * (2 * RATIO) + head % RATIO
         b = gl.load(BA + offset).to(gl.float32)
         a = gl.load(BA + offset + RATIO).to(gl.float32)
     a_log = gl.load(ALog + head)
@@ -157,6 +158,8 @@ def _decode_group_ratio(
     conv_channel_stride,
     conv_width_stride,
     ssm_slot_stride,
+    proj_row_stride,
+    ba_row_stride,
     KH: gl.constexpr,
     VH: gl.constexpr,
     K: gl.constexpr,
@@ -173,7 +176,8 @@ def _decode_group_ratio(
 ):
     """One program per (token, key-head group). Rows with an empty ``QueryStartLoc``
     segment (``HAS_QSL``) or ``PAD_SLOT_ID`` are padded and skipped; ``conv_*_stride``
-    / ``ssm_slot_stride`` are the element strides of the (possibly paged) pools.
+    / ``ssm_slot_stride`` are the element strides of the (possibly paged) pools, and
+    ``proj_row_stride`` / ``ba_row_stride`` the token-row strides of the projections.
     ``State`` is fp32 or bf16; the update runs in fp32 and is stored in its dtype."""
     gl.static_assert(VH == RATIO * KH, "VH must be RATIO * KH")
     gl.static_assert(RATIO >= 1, "RATIO must be positive")
@@ -216,16 +220,18 @@ def _decode_group_ratio(
     logs = ()
     biases = ()
     for h in gl.static_range(RATIO):
-        b, a, a_log, bias = _gating(BA, ALog, DtBias, token, head0 + h, VH, RATIO, FLAT)
+        b, a, a_log, bias = _gating(
+            BA, ALog, DtBias, token, head0 + h, ba_row_stride, VH, RATIO, FLAT
+        )
         bs = bs + (b,)
         as_ = as_ + (a,)
         logs = logs + (a_log,)
         biases = biases + (bias,)
     if FLAT:
-        proj_row = token * (KH * group_width)
+        proj_row = token * proj_row_stride
         gate_ptr = Projection + proj_row + 2 * KH * K + VH * V + head0 * V + vrow
     else:
-        base = token_group * group_width
+        base = token * proj_row_stride + group * group_width
         gate_ptr = Projection + base + 2 * K + RATIO * V + vrow
     gates = ()
     for h in gl.static_range(RATIO):

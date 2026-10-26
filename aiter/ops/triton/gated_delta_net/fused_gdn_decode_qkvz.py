@@ -58,11 +58,26 @@ _CONV_WIDTH = 4
 
 
 def _uses_ratio_generic_kernel(
-    ratio: int, flat: bool, has_qsl: bool, state_dtype: torch.dtype
+    ratio: int,
+    flat: bool,
+    has_qsl: bool,
+    state_dtype: torch.dtype,
+    strided_rows: bool = False,
 ) -> bool:
-    """Ratio 2 in the interleaved layout with an fp32 state and no padding runs the
-    generated pair kernels; every other call runs the ratio-generic kernel."""
-    return ratio != 2 or flat or has_qsl or state_dtype is not torch.float32
+    """Ratio 2 in the interleaved layout with an fp32 state, dense projection rows and
+    no padding runs the generated pair kernels; every other call runs the
+    ratio-generic kernel."""
+    return (
+        ratio != 2
+        or flat
+        or has_qsl
+        or state_dtype is not torch.float32
+        or strided_rows
+    )
+
+
+def _strided_rows(projected_qkvz: torch.Tensor, projected_ba: torch.Tensor) -> bool:
+    return not (projected_qkvz.is_contiguous() and projected_ba.is_contiguous())
 
 
 def _arch_supported() -> tuple[bool, str]:
@@ -242,8 +257,6 @@ def fused_gdn_decode_qkvz_supported(
     # The kernels address every one of these with flat pointer arithmetic, so a
     # same-shaped strided view would be read from the wrong locations.
     flat = {
-        "projected_qkvz": projected_qkvz,
-        "projected_ba": projected_ba,
         "ssm_state_indices": ssm_state_indices,
         "conv_weight": conv_weight,
         "conv_bias": conv_bias,
@@ -254,6 +267,13 @@ def fused_gdn_decode_qkvz_supported(
     non_contiguous = [name for name, t in flat.items() if not t.is_contiguous()]
     if non_contiguous:
         return False, f"operands must be contiguous: {', '.join(non_contiguous)}"
+    # Token rows of the projections may be strided (e.g. column views of one GEMM
+    # that also produces ba); each row must be dense.
+    if projected_qkvz.stride(-1) != 1 or projected_ba.stride(-1) != 1:
+        return False, (
+            "projected_qkvz / projected_ba rows must be dense, got strides "
+            f"{projected_qkvz.stride()} / {projected_ba.stride()}"
+        )
     # The recurrent state must be dense within a slot; the slot dimension of both
     # pools may be strided (a serving engine packs a block's conv and recurrent
     # states into one page) and the conv window may be stored channel-major or
@@ -294,12 +314,13 @@ def fused_gdn_decode_qkvz_supported(
         qkvz_layout == "flat",
         query_start_loc is not None,
         ssm_state.dtype,
+        _strided_rows(projected_qkvz, projected_ba),
     )
     if not generic and not (conv_state.is_contiguous() and ssm_state.is_contiguous()):
         return False, (
             "strided state pools are only supported by the ratio-generic kernel "
-            "(num_v_heads / num_k_heads != 2, the flat layout, query_start_loc or a "
-            "bf16 state); "
+            "(num_v_heads / num_k_heads != 2, the flat layout, query_start_loc, a "
+            "bf16 state or strided projection rows); "
             f"got conv strides {conv_state.stride()}, ssm strides {ssm_state.stride()}"
         )
 
@@ -335,7 +356,9 @@ def fused_gdn_decode_qkvz(
             ``in_proj_qkvz`` output (``ratio = VH // KH``, 1 to 4). Split
             internally; no separate split kernel.
         projected_ba: [T, 2*VH] bf16, packed ``in_proj_ba`` output (betas then a's
-            per key-head group).
+            per key-head group). Token rows of both may be strided (each row dense),
+            e.g. column views of one GEMM that produces qkvz and ba together; that
+            runs the ratio-generic kernel.
         conv_state: [N, channels, 3] bf16, rolling conv window. **Mutated in place.**
         ssm_state: [N, VH, VD, KD] fp32 or bf16, delta-rule state. **Mutated in
             place.** The update runs in fp32 either way; a bf16 state runs the
@@ -443,10 +466,14 @@ def fused_gdn_decode_qkvz(
         v_heads,
     )
     if _uses_ratio_generic_kernel(
-        ratio, flat, query_start_loc is not None, ssm_state.dtype
+        ratio,
+        flat,
+        query_start_loc is not None,
+        ssm_state.dtype,
+        _strided_rows(projected_qkvz, projected_ba),
     ):
         # Ratio-generic kernel at every batch size; the bands below hardcode
-        # ratio 2, the interleaved layout, dense pools and an fp32 state.
+        # ratio 2, the interleaved layout, dense pools and rows and an fp32 state.
         from aiter.ops.triton._gluon_kernels.gfx950.gated_delta_net.fused_gdn_decode_qkvz_ratio import (
             _decode_group_ratio,
         )
@@ -459,6 +486,8 @@ def fused_gdn_decode_qkvz(
             *launch_args[5:-2],
             *conv_state.stride(),
             ssm_state.stride(0),
+            projected_qkvz.stride(0),
+            projected_ba.stride(0),
             k_heads,
             v_heads,
             head_k_dim,
