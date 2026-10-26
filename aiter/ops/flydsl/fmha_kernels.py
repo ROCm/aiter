@@ -406,6 +406,10 @@ def flydsl_flash_attn_varlen_fwd(
         _is_b8 = q.dtype in _GFX1250_A8W8_IN_DTYPES
         if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
             return None
+        if any(t.stride(-1) != 1 for t in (q, k, v)):
+            return None
+        if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
+            return None
         _out_dtype = _GFX1250_A8W8_OUT_DTYPE if _is_b8 else q.dtype
         _supported = (
             flash_attn_gfx1250_a8w8_supported
@@ -522,6 +526,10 @@ def flydsl_flash_attn_batch_fwd(
     elif gfxip == "gfx1250" and q.dim() == 4:
         _is_b8 = q.dtype in _GFX1250_A8W8_IN_DTYPES
         if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
+            return None
+        if any(t.stride(-1) != 1 for t in (q, k, v)):
+            return None
+        if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
             return None
         _out_dtype = _GFX1250_A8W8_OUT_DTYPE if _is_b8 else q.dtype
         _supported = (
