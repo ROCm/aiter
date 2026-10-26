@@ -22,6 +22,19 @@ from aiter.ops.mha_fwd_policy import (
 )
 from aiter.utility import dispatch_verification
 
+
+def _triton_mha_imports():
+    try:
+        import aiter.ops.triton.attention.mha  # noqa: F401
+    except (ImportError, RuntimeError):
+        return False
+    return True
+
+
+needs_triton_mha = unittest.skipUnless(
+    _triton_mha_imports(), "Triton's MHA module probes the GPU when imported"
+)
+
 HARDWARE = {"gfx": "gfx942", "gpu_model": "mi325x", "cu_num": 304}
 HARDWARE_CELLS = ("gfx942", "mi325x", "304")
 
@@ -61,12 +74,17 @@ def _problem_row(**overrides):
     }
 
 
-def _tuned_row(backend="ck", **key):
+def _tuned_row(backend="ck", config_digest="", **key):
     return {
         **_problem_row(**key),
         "backend": backend,
         "us": "",
+        "config_digest": config_digest,
     }
+
+
+TRITON_TILE = {"BLOCK_M": 128, "BLOCK_N": 64, "num_warps": 4}
+TRITON_DIGEST = policy.config_digest(TRITON_TILE)
 
 
 def _key_args(max_seqlen_k=42700, **overrides):
@@ -175,6 +193,11 @@ class TestMhaFwdKey(unittest.TestCase):
                     MhaFwdProblem.from_mapping(row).key(),
                 )
 
+    def test_a_digest_never_reads_as_a_number(self):
+        digest = policy.config_digest({"BLOCK_M": 1})
+        self.assertTrue(digest.startswith("sha256:"))
+        self.assertEqual(len(digest), len("sha256:") + 12)
+
 
 class TestMhaFwdTable(_Table):
     def test_a_bad_row_is_skipped_and_the_rest_still_load(self):
@@ -206,6 +229,138 @@ class TestMhaFwdTable(_Table):
         ):
             self.assertEqual(policy._load_mha_fwd_tuning_table(path), {})
         self.assertIn("does not exist", logs.output[0])
+
+
+class TestTritonRows(_Table):
+    def load(self, rows, gfx="gfx942", tile=TRITON_TILE):
+        with (
+            mock.patch.object(policy, "get_gfx", return_value=gfx),
+            mock.patch.object(policy, "triton_config", return_value=tile) as resolve,
+        ):
+            table = policy._load_mha_fwd_tuning_table(self.use(rows))
+        return table, resolve
+
+    def assert_skipped(self, row, reason, tile=TRITON_TILE):
+        policy.clear_mha_fwd_tuning_cache()
+        with self.assertLogs("aiter", level="WARNING") as logs:
+            table, _ = self.load([row], tile=tile)
+        self.assertEqual(table, {})
+        self.assertIn(reason, logs.output[0])
+
+    def test_a_row_tuned_with_the_tile_triton_resolves_loads(self):
+        table, resolve = self.load([_tuned_row("triton", config_digest=TRITON_DIGEST)])
+        self.assertEqual(list(table.values()), ["triton"])
+        self.assertEqual(resolve.call_args.args[1], "triton")
+
+    def test_a_stale_or_missing_digest_is_skipped(self):
+        with self.subTest("triton resolves another tile"):
+            self.assert_skipped(
+                _tuned_row("triton", config_digest=TRITON_DIGEST),
+                "retune it with op_tests/tuners/tune_mha_fwd.py",
+                tile={**TRITON_TILE, "num_warps": 8},
+            )
+        with self.subTest("no digest"):
+            self.assert_skipped(_tuned_row("triton"), "needs config_digest")
+
+    def test_a_row_whose_digest_check_fails_to_run_is_skipped(self):
+        # A renamed private resolver, or a row Triton cannot resolve, must
+        # cost that row only, not every MHA call.
+        rows = [
+            _tuned_row("triton", config_digest=TRITON_DIGEST),
+            _tuned_row("asm_v3", total_q=2048, max_seqlen_q=2048),
+        ]
+        for error in (ImportError("no _get_config"), AttributeError("bfloat17")):
+            with self.subTest(error=type(error).__name__):
+                policy.clear_mha_fwd_tuning_cache()
+                with (
+                    mock.patch.object(policy, "get_gfx", return_value="gfx942"),
+                    mock.patch.object(policy, "triton_config", side_effect=error),
+                    self.assertLogs("aiter", level="WARNING"),
+                ):
+                    table = policy._load_mha_fwd_tuning_table(self.use(rows))
+                self.assertEqual(list(table.values()), ["asm_v3"])
+
+    @needs_triton_mha
+    def test_a_row_triton_cannot_serve_is_skipped(self):
+        cases = (
+            ("triton", {"logits_soft_cap": 30.0}, "soft-cap"),
+            ("triton", {"has_q_descale": 1}, "FP8"),
+            ("triton", {"return_lse": 1}, "layout"),
+            ("triton", {"is_grad": 1}, "backward"),
+            ("triton", {"has_bias": 1}, "bias"),
+            ("triton", {"min_seqlen_q": 16}, "min_seqlen_q"),
+            ("triton", {"window_left": 0}, "left window"),
+            ("triton", {"has_alibi": 1}, "ALiBi"),
+            ("triton", {"has_sink": 1}, "sink logits"),
+            ("triton", {"causal": 1, "window_left": 127, "window_right": 0}, "right"),
+            ("gluon", {"dropout_p": 0.1}, "dropout"),
+        )
+        with mock.patch(
+            "aiter.ops.triton.attention.mha.is_gluon_available", return_value=True
+        ):
+            for backend, key, reason in cases:
+                with self.subTest(backend=backend, **key):
+                    self.assert_skipped(
+                        _tuned_row(backend, config_digest=TRITON_DIGEST, **key), reason
+                    )
+
+    def test_rows_for_another_arch_are_not_resolved(self):
+        table, resolve = self.load(
+            [_tuned_row("triton", config_digest="stale")], gfx="gfx950"
+        )
+        self.assertEqual(len(table), 1)
+        resolve.assert_not_called()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Triton resolves per GPU arch")
+    def test_the_digest_is_of_the_tile_triton_itself_resolves(self):
+        from aiter.ops.triton.attention import mha as triton_mha
+
+        batch, seqlen, nhead = 2, 64, 12
+        problem = MhaFwdProblem.from_mapping(
+            _problem_row(
+                batch=batch,
+                total_q=batch * seqlen,
+                total_k=batch * seqlen,
+                max_seqlen_q=seqlen,
+                max_seqlen_k=seqlen,
+                nhead_q=nhead,
+                nhead_k=nhead,
+            )
+        )
+        q = torch.randn(
+            (batch * seqlen, nhead, 192), dtype=torch.bfloat16, device="cuda"
+        )
+        v = torch.randn(
+            (batch * seqlen, nhead, 128), dtype=torch.bfloat16, device="cuda"
+        )
+        cu = torch.arange(
+            0, (batch + 1) * seqlen, seqlen, dtype=torch.int32, device="cuda"
+        )
+        resolve = triton_mha._get_config
+        resolved = []
+
+        def record(*args, **kwargs):
+            resolved.append(dict(resolve(*args, **kwargs)))
+            return resolve(*args, **kwargs)
+
+        with mock.patch.object(triton_mha, "_get_config", side_effect=record):
+            triton_mha.flash_attn_varlen_func(
+                q, torch.randn_like(q), v, cu, cu, seqlen, seqlen
+            )
+        self.assertEqual(resolved, [policy.triton_config(problem, "triton")])
+
+    @needs_triton_mha
+    def test_the_gluon_digest_derives_fp8_from_the_dtype_like_the_entry(self):
+        from aiter.ops.triton._gluon_kernels.gfx950.attention import mha as gluon
+        from aiter.ops.triton.utils import types
+
+        problem = MhaFwdProblem.from_mapping(_problem_row(dtype="float8_e4m3fn"))
+        with (
+            mock.patch.object(types.arch_info, "is_fp8_avail", return_value=True),
+            mock.patch.object(gluon, "_get_config", return_value={"t": 1}) as get,
+        ):
+            self.assertEqual(policy.triton_config(problem, "gluon"), {"t": 1})
+        get.assert_called_once_with(is_fp8=True, has_pe=True)
 
 
 class TestMhaFwdLookup(_Table):
@@ -365,6 +520,26 @@ class TestFlashAttnVarlenFunc(_Table):
         ):
             mha.flash_attn_varlen_func(q, k, v, cu_q, cu_k, 4, 8)
         self.assertEqual(apply.call_args.args[-1], "opus")
+
+    @needs_triton_mha
+    def test_a_triton_row_calls_triton_without_a_config_and_fills_out(self):
+        out = torch.full((8, 12, 128), float("nan"))
+        computed = torch.ones_like(out)
+        with (
+            mock.patch(
+                "aiter.ops.triton.attention.mha.flash_attn_varlen_func",
+                return_value=computed,
+            ) as triton_entry,
+            _recorded_selections() as selections,
+        ):
+            result, apply = self._route("gluon", out=out)
+        apply.assert_not_called()
+        self.assertIs(result, out)
+        self.assertTrue(torch.equal(out, computed))
+        kwargs = triton_entry.call_args.kwargs
+        self.assertEqual(kwargs["backend"], "gluon")
+        self.assertNotIn("config", kwargs)
+        self.assertEqual(selections, [{"backend": "gluon"}])
 
     def test_a_declined_flydsl_row_continues_as_auto_select(self):
         for name, flydsl, available in (
