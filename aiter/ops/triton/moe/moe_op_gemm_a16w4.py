@@ -6,7 +6,6 @@ from functools import lru_cache
 
 import torch
 import triton
-from packaging.version import Version
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
@@ -101,11 +100,8 @@ def get_kernel_config_triton(m, n, k, routing_data):
 
     # Entries carry no BLOCK_SIZE_M: block_m is the dispatch key, not a
     # tunable, because routing fixes it for the layer.
-    # Triton < 3.8 uses the previous bm128_n5120_k768 row.
     arch = get_arch()
     key = f"bm{block_m}_n{n}_k{k}"
-    if key == "bm128_n5120_k768" and Version(triton.__version__) < Version("3.8"):
-        key = f"{key}_lt38"
     tuned = get_moe_dispatch("A16W4", arch, "triton").get(key)
     if tuned is not None:
         config = {

@@ -32,15 +32,6 @@
         "waves_per_eu": 0,
         "kpack": 2
     },
-    "bm128_n5120_k768_lt38": {
-        "BLOCK_SIZE_K": 64,
-        "BLOCK_SIZE_N": 256,
-        "matrix_instr_nonkdim": 32,
-        "num_stages": 2,
-        "num_warps": 4,
-        "waves_per_eu": 2,
-        "kpack": 1
-    },
     "bm16_n3072_k3072": {
         "BLOCK_SIZE_K": 256,
         "BLOCK_SIZE_N": 64,
