@@ -801,21 +801,33 @@ __device__ __forceinline__ void decode_request(
     rs[i] = load_dw<VEC>(sbase + (uint32_t)(j * d.ss_st), sub);
   }
   ivec loc, pos, ts;
-#ifdef KPOOL_META_SMEM
-#pragma unroll
-  for (int i = 0; i < NMAX; ++i) {
-    const uint32_t j = (uint32_t)(base + min(i, n - 1));
-    loc[i] = m_loc[j];
-    pos[i] = m_pos[j];
-    ts[i] = m_ts[j];
-  }
+  // Metadata: the three words per token wait ~1100 clocks on the ATT ledger
+  // either way (three s_load_dword in one batch, or one global_load_dword
+  // with a per-lane pointer select + v_readlane). Measured on the remote
+  // MI355X (B=1024): next_n=1 closing wave 4542 clocks with the scalar
+  // loads vs 4868 with the vector load (fewer VALU, no readlane); next_n=4
+  // 7.2 vs 7.9 us with the vector load (12 scalar loads otherwise). So the
+  // one-token kernel uses the scalar loads, NMAX > 1 the vector load.
+  // KPOOL_META_SMEM / KPOOL_META_VMEM force one path for every NMAX.
+#if defined(KPOOL_META_SMEM)
+  constexpr bool META_SMEM = true;
+#elif defined(KPOOL_META_VMEM)
+  constexpr bool META_SMEM = false;
 #else
-  {
+  constexpr bool META_SMEM = NMAX == 1;
+#endif
+  if constexpr (META_SMEM) {
+#pragma unroll
+    for (int i = 0; i < NMAX; ++i) {
+      const uint32_t j = (uint32_t)(base + min(i, n - 1));
+      loc[i] = m_loc[j];
+      pos[i] = m_pos[j];
+      ts[i] = m_ts[j];
+    }
+  } else {
     // One vector load fetches the 3 * NMAX metadata words (lane l: array
     // l / NMAX, token l % NMAX; the other lanes repeat the last one), then
-    // readlane. Three s_load_dword to three arrays cost ~1100 clocks on the
-    // ATT ledger (the scalar cache serves the three lines nearly serially);
-    // one VMEM load of three lines is one vector round trip (~700).
+    // readlane.
     const int l = min(sub, 3 * NMAX - 1);
     const int arr = l / NMAX;
     const int tok = l - arr * NMAX;
@@ -829,7 +841,6 @@ __device__ __forceinline__ void decode_request(
       pos[i] = __builtin_amdgcn_readlane(v, 2 * NMAX + i);
     }
   }
-#endif
   // APE rows: loaded only when a pool closes (one step in POOL), together
   // with the ring rows; the row pointer is pinned uniform so the lane offset
   // stays a 32-bit saddr offset.
