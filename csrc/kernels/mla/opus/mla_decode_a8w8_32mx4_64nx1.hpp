@@ -1345,7 +1345,7 @@ mla_decode_fwd_persistent(opus_mla_decode_a8w8_kargs kargs)
 } // namespace mla_decode_fwd_32mx4_64nx1_a8w8
 
 // The register map above only holds with the amdgpu-named-reg-pin-std toolchain, which is how
-// the prebuilt code object is built (see mla_decode_a8w8_32mx4_64nx1_co.hip). A stock ROCm 7.1
+// the prebuilt code object is built (see mla_decode_a8w8_32mx4_64nx1.cu). A stock ROCm 7.1
 // clang selects every MFMA in AGPR form at 512 registers per lane, and O (256) plus the two score
 // buffers (64) do not fit 256 AGPRs: that build spills heavily and is kept for reference only.
 template <class Traits>

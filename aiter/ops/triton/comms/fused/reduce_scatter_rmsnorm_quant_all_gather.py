@@ -264,7 +264,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         >>> with IrisCommContext() as ctx:
         >>>     # Input must be in Iris shared memory for reduce-scatter
         >>>     input_tensor = ctx.iris_ctx.ones((8192, 7168), dtype=torch.float32)
-        >>>     gamma = torch.ones(7168, device="cuda")
+        >>>     gamma = torch.ones(7168, dtype=torch.float32, device=input_tensor.device)
         >>>     norm, quant, gathered = reduce_scatter_rmsnorm_quant_all_gather(
         >>>         input_tensor, gamma, ctx=ctx, quant_mode="fp8_per_token"
         >>>     )

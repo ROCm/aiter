@@ -275,7 +275,7 @@ class MxMfma:
             for osa in range(4)
             for osb in range(4)
         }
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.zero_value = fx.full(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
 
@@ -344,7 +344,7 @@ class StoreBf16:
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 for i in range_constexpr(4):
                     fx.memref_store_vec(
-                        Vec.filled(1, vec_f32[i].to(fx.BFloat16), fx.BFloat16),
+                        fx.full(1, vec_f32[i].to(fx.BFloat16), fx.BFloat16),
                         self.reg_bf16_1,
                     )
                     c_index = (row + i) * self.c_cols + col

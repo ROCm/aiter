@@ -40,31 +40,6 @@ AITER_CTYPES_ERROR_DEF
 
 namespace {
 
-// Fixed properties of the prebuilt code objects.
-struct OpusDecodeVariant
-{
-    const char* kernel_name;
-    const char* co_path;
-    int heads_per_block;
-    int block_size;
-};
-
-constexpr OpusDecodeVariant kA16W16_16mx4{"opus_mla_decode_a16w16_16mx4_64nx1_kernel",
-                                       "mla_opus/opus_mla_decode_a16w16_16mx4_64nx1.co",
-                                       64,
-                                       256};
-constexpr OpusDecodeVariant kA16W16_32mx1{"opus_mla_decode_a16w16_32mx1_16nx4_kernel",
-                                       "mla_opus/opus_mla_decode_a16w16_32mx1_16nx4.co",
-                                       32,
-                                       256};
-constexpr OpusDecodeVariant kA16W16_32mx4{"opus_mla_decode_a16w16_32mx4_32nx1_kernel",
-                                       "mla_opus/opus_mla_decode_a16w16_32mx4_32nx1.co",
-                                       128,
-                                       256};
-constexpr OpusDecodeVariant kA16W16_32mx3{"opus_mla_decode_a16w16_32mx3_32nx1_kernel",
-                                       "mla_opus/opus_mla_decode_a16w16_32mx3_32nx1.co",
-                                       96,
-                                       256};
 // fp8 32mx4 / 64nx1 (csrc/kernels/mla/opus/mla_decode_a8w8_32mx4_64nx1.hpp): 4 waves x 32 packed
 // query rows, i.e. the 128-row work items aiter's metadata packs by default for fp8. Prebuilt
 // only: its register map (Q, half of O and the K/V ring in AGPRs, the other half of O and both
@@ -72,13 +47,13 @@ constexpr OpusDecodeVariant kA16W16_32mx3{"opus_mla_decode_a16w16_32mx3_32nx1_ke
 // AGPR form, which cannot fit. One entry per specialization.
 constexpr const char* kA8W8_32mx4_co = "mla_opus/opus_mla_decode_a8w8_32mx4_64nx1.co";
 // fp8 32mx2 / 32nx2 (mla_decode_a8w8_32mx2_32nx2.hpp): two wave pairs of 32 packed query rows,
-// 32x32x64 for both GEMMs, prebuilt the same way (mla_decode_a8w8_32mx2_32nx2_co.hip). 64 packed
+// 32x32x64 for both GEMMs, prebuilt the same way (mla_decode_a8w8_32mx2_32nx2.cu). 64 packed
 // query rows per workgroup, so a work item must not carry more than 64 rows -- hand it a
 // 128-row item and the rows past 64 are never computed -- which the metadata guarantees for
 // exactly the shapes opus_a8w8_route sends here (64 rows or fewer per request, and
 // kPackedQoLenPerWg 64 for nhead 32 x 3).
 constexpr const char* kA8W8_32mx2_co = "mla_opus/opus_mla_decode_a8w8_32mx2_32nx2.co";
-constexpr int kA8W8_co_block         = 256;
+constexpr int kCoBlockSize           = 256;
 
 constexpr int kHeadDimQk = 576;
 constexpr int kHeadDimVo = 512;
@@ -171,38 +146,29 @@ constexpr const char* kFwdName = "opus_mla_decode_fwd";
 // causal specialization, so max_seqlen_q and causal do not reach them.
 void opus_mla_decode_bf16(opus_mla_decode_kargs kargs, int num_workers, hipStream_t stream)
 {
-    const int H = kargs.H;
-    const OpusDecodeVariant& variant = (H <= kA16W16_32mx1.heads_per_block) ? kA16W16_32mx1
-                                       : (H % kA16W16_32mx4.heads_per_block == 0) ? kA16W16_32mx4
-                                       : (H % kA16W16_32mx3.heads_per_block == 0) ? kA16W16_32mx3
-                                                                                  : kA16W16_16mx4;
-    const int num_h_blocks = (H + variant.heads_per_block - 1) / variant.heads_per_block;
-
-    size_t arg_size = opus_mla_decode_bf16_kargs_bytes;
-    auto launch     = [&](AiterAsmKernel& impl) {
-        impl.launch_kernel({&kargs, &arg_size, num_workers, num_h_blocks, 1,
-                            variant.block_size, 1, 1, stream});
+    const int H     = kargs.H;
+    size_t arg_size = sizeof(kargs);
+    auto launch_co  = [&](AiterAsmKernel& impl, int heads_per_block) {
+        const int num_h_blocks = (H + heads_per_block - 1) / heads_per_block;
+        impl.launch_kernel(
+            {&kargs, &arg_size, num_workers, num_h_blocks, 1, kCoBlockSize, 1, 1, stream});
     };
-    if(&variant == &kA16W16_32mx1)
-    {
-        static AiterAsmKernel impl(kA16W16_32mx1.kernel_name, kA16W16_32mx1.co_path);
-        launch(impl);
-    }
-    else if(&variant == &kA16W16_32mx4)
-    {
-        static AiterAsmKernel impl(kA16W16_32mx4.kernel_name, kA16W16_32mx4.co_path);
-        launch(impl);
-    }
-    else if(&variant == &kA16W16_32mx3)
-    {
-        static AiterAsmKernel impl(kA16W16_32mx3.kernel_name, kA16W16_32mx3.co_path);
-        launch(impl);
-    }
+#define OPUS_A16W16_CO_LAUNCH(name, co, heads_per_block)                                \
+    do                                                                                  \
+    {                                                                                   \
+        static AiterAsmKernel impl("opus_mla_decode_a16w16_" name "_kernel",            \
+                                   "mla_opus/opus_mla_decode_a16w16_" co ".co");       \
+        launch_co(impl, heads_per_block);                                               \
+    } while(0)
+    if(H <= 32)
+        OPUS_A16W16_CO_LAUNCH("32mx1_16nx4", "32mx1_16nx4", 32);
+    else if(H % 128 == 0)
+        OPUS_A16W16_CO_LAUNCH("32mx4_32nx1", "32mxt_32nx1", 128);
+    else if(H % 96 == 0)
+        OPUS_A16W16_CO_LAUNCH("32mx3_32nx1", "32mxt_32nx1", 96);
     else
-    {
-        static AiterAsmKernel impl(kA16W16_16mx4.kernel_name, kA16W16_16mx4.co_path);
-        launch(impl);
-    }
+        OPUS_A16W16_CO_LAUNCH("16mx4_64nx1", "16mx4_64nx1", 64);
+#undef OPUS_A16W16_CO_LAUNCH
 }
 
 // fp8 NoPE and RoPE merged into one d=576 buffer, with per-tensor scalar descales. No build
@@ -255,7 +221,7 @@ void opus_mla_decode_a8w8(const opus_mla_decode_kargs& base,
     const bool use_cprr = use_causal && kargs.cp_world_size > 1;
     size_t arg_size       = sizeof(kargs);
     auto launch_co        = [&](AiterAsmKernel& impl) {
-        impl.launch_kernel({&kargs, &arg_size, num_workers, 1, 1, kA8W8_co_block, 1, 1, stream});
+        impl.launch_kernel({&kargs, &arg_size, num_workers, 1, 1, kCoBlockSize, 1, 1, stream});
     };
 #define OPUS_A8W8_CO_ENTRY(name, entry, co)                                            \
     do                                                                                 \

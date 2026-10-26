@@ -184,13 +184,6 @@ def parse_args(args: list[str] | None = None):
         help="Disable bias (required for --backend gluon).",
     )
     parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["triton", "gluon"],
-        default=None,
-        help="Kernel backend (default: auto -- gluon on gfx1250 when bias is off).",
-    )
-    parser.add_argument(
         "--transpose-bm",
         action="store_true",
         default=False,

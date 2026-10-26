@@ -36,8 +36,7 @@ from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import rocdl as rocdl_ir
+from flydsl.compiler.mlir_utils import convert_to_mlir_attr
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import BFloat16, Constexpr, Float32, Int8, Int32, T
 from flydsl.expr.typing import Vector as Vec
@@ -465,7 +464,7 @@ def launch_bmm_a8w8_mxscale(
                 return fx.logical_divide(buf, fx.make_layout(1, 1))
 
             # Rows past M read zero: the A and A-scale records end at the last row.
-            rows = fx.Int64(i32_m - fx.Int32(1))
+            rows = fx.Int64(i32_m - 1)
             a_src = _buffer(a_base, T.i8, 16, rows * lda + K)
             sa_records = (
                 fx.Int64(i32_m) * (K // x_scale_k)
@@ -513,14 +512,14 @@ def launch_bmm_a8w8_mxscale(
                 lds_ptr = fx.to_llvm_ptr(
                     fx.add_offset(lds_i8, rocdl.readfirstlane(T.i32, lds_off))
                 )
-                rocdl_ir.raw_ptr_buffer_load_async_lds(
+                rocdl.raw_ptr_buffer_load_async_lds(
                     rsrc,
                     lds_ptr,
                     fx.Int32(size).ir_value(),
                     fx.Int32(byte).ir_value(),
                     fx.Int32(0).ir_value(),
                     fx.Int32(0).ir_value(),
-                    aux=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), aux),
+                    aux=convert_to_mlir_attr(aux),
                 )
 
             def _dma_b(byte, lds_off):
@@ -681,7 +680,7 @@ def launch_bmm_a8w8_mxscale(
                     fx.add_offset(lds_i32, off_i32), fx.make_layout(4, 1)
                 )
                 fx.copy(read16, view, frag)
-                return Vec(fx.memref_load_vec(frag))
+                return fx.memref_load_vec(frag)
 
             def _pair(lo_off, hi_off, hi_mask=None):
                 # fp8 halves 64 K apart form one i32[8] MFMA operand (f8f6f4 ABI).
@@ -749,21 +748,21 @@ def launch_bmm_a8w8_mxscale(
             )
             accs = [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(n_acc)]
             for acc in accs:
-                acc.store(Vec.filled(4, 0.0, Float32))
+                acc.store(fx.full(4, 0.0, Float32))
 
             b_words = _buffer(b_base, T.i32, 16, fx.Int64(N * K))
 
             def _load_global(off_i32):
                 frag = fx.make_rmem_tensor(4, Int32)
                 fx.copy(load_b16, fx.slice(b_words, (None, off_i32)), frag)
-                return Vec(frag.load())
+                return frag.load()
 
             byte8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), 8)
 
             def _load_byte(src, off):
                 frag = fx.make_rmem_tensor(1, Int8)
                 fx.copy(byte8, fx.slice(src, (None, off)), frag)
-                return fx.Uint8(Vec(frag.load())[0]).to(Int32)
+                return fx.Uint8(frag.load()[0]).to(Int32)
 
             # A column-major x_scale's last column ends mid dword unless M is a
             # multiple of 4, and that dword reads zero whole, valid bytes too: the
@@ -1074,9 +1073,7 @@ def launch_bmm_a8w8_mxscale(
                 if fx.Int32(fx.ptr_load(flag)) == splits - 1:
                     # sc0 sc1: read past this CU's L1, which never held the others.
                     load16_cv = fx.make_copy_atom(fx.rocdl.BufferCopy128b(17), 32)
-                    total = [
-                        Vec.filled(4, 0.0, Float32) for _ in range_constexpr(n_acc)
-                    ]
+                    total = [fx.full(4, 0.0, Float32) for _ in range_constexpr(n_acc)]
                     for s in range_constexpr(splits):
                         for f in range_constexpr(n_acc):
                             frag = fx.make_rmem_tensor(4, Int32)
@@ -1088,7 +1085,7 @@ def launch_bmm_a8w8_mxscale(
                                 ),
                                 frag,
                             )
-                            total[f] = total[f] + Vec(frag.load()).bitcast(Float32)
+                            total[f] = total[f] + frag.load().bitcast(Float32)
                     if const_expr(tile_m * tile_n <= 32 * 32):
                         store_direct(total)
                     else:

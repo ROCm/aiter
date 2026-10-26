@@ -270,7 +270,7 @@ def compile_gemm_a16w16(
             a_base_off = blk_m64 * lda64 + split_k_base64
         else:
             a_base_off = split_k_base64 * lda64 + blk_m64
-        a_stride_rt = fx.Int32(i32_lda)
+        a_stride_rt = i32_lda
         gA, atom_a = _mk_side(
             arg_x,
             a_base_off,
@@ -284,7 +284,7 @@ def compile_gemm_a16w16(
             b_base_off = split_k_base64 * ldb64 + blk_n64
         else:
             b_base_off = blk_n64 * ldb64 + split_k_base64
-        b_stride_rt = fx.Int32(i32_ldb)
+        b_stride_rt = i32_ldb
         gB, atom_b = _mk_side(
             arg_w,
             b_base_off,
@@ -489,7 +489,7 @@ def compile_gemm_a16w16(
                         fx.slice(bias_elems, (None, tile_idx * 4 + e)),
                         r1,
                     )
-                    elems.append(fx.Vector(r1.load())[0])
+                    elems.append(r1.load()[0])
                 return fx.Vector.from_elements(elems, _fx_elem)
 
         def epilogue_stores(final_accs):
@@ -580,11 +580,11 @@ def compile_gemm_a16w16(
                         fx.copy(st_atom, _rmem_vec(h_vec, 8, _out_num), gY[None, c_off])
                     else:
                         n_left = fx.Int32(N) - fx.Int32(col_base)
-                        if n_left >= fx.Int32(8):
+                        if n_left >= 8:
                             fx.copy(
                                 st_atom, _rmem_vec(h_vec, 8, _out_num), gY[None, c_off]
                             )
-                        if n_left < fx.Int32(8):
+                        if n_left < 8:
                             for e in range_constexpr(8):
                                 if fx.Int32(e) < n_left:
                                     one_vec = fx.Vector.from_elements(
@@ -607,13 +607,13 @@ def compile_gemm_a16w16(
                             )
                         else:
                             n_left = fx.Int32(N) - fx.Int32(col)
-                            if n_left >= fx.Int32(4):
+                            if n_left >= 4:
                                 fx.copy(
                                     st_atom,
                                     _rmem_vec(vec4, 4, fx.Float32),
                                     gY[None, row * ld_y + col],
                                 )
-                            if n_left < fx.Int32(4):
+                            if n_left < 4:
                                 for e in range_constexpr(4):
                                     if fx.Int32(e) < n_left:
                                         one_vec = fx.Vector.from_elements(
@@ -640,7 +640,7 @@ def compile_gemm_a16w16(
                     store_partial(final_accs[acc_idx], acc_idx)
                 comm_ops.waitcnt_all()
                 gpu.barrier()
-                if fx.Int32(tx) == fx.Int32(0):
+                if fx.Int32(tx) == 0:
                     arrival = fx.Int32(comm_ops.atomic_add_agent(sem_addr, fx.Int32(1)))
                     fx.ptr_store(
                         (arrival == fx.Int32(split_k - 1)).select(
@@ -656,7 +656,7 @@ def compile_gemm_a16w16(
                             row, col_base = _coords(wm, wn)
                             total = sum_partials(pending[wm * wmma_n_rep + wn])
                             store_final(total, row, col_base, wn)
-                    if fx.Int32(tx) == fx.Int32(0):
+                    if fx.Int32(tx) == 0:
                         comm_ops.atomic_add_agent(sem_addr, fx.Int32(-split_k))
 
         def _pack_state(accs_, a_, b_):
@@ -683,7 +683,7 @@ def compile_gemm_a16w16(
             accs_, _, _ = wmma_tile(accs_, ca, cb)
             return accs_, na, nb
 
-        acc_zero = fx.Vector.filled(8, fx.Float32(0.0), fx.Float32)
+        acc_zero = fx.full(8, 0.0, fx.Float32)
         accs = [acc_zero] * n_accs
 
         # Prologue:

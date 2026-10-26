@@ -32,12 +32,14 @@ from aiter.fused_moe import (
 )
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.quant import (
-    fused_dynamic_mxfp4_quant_moe_sort as hip_fused_mxfp4_quant_moe_sort,
-)
-from aiter.ops.quant import (
+    fused_dynamic_mx_quant_moe_sort_hip,
+    fused_dynamic_mx_quant_moe_sort_hip_bounded,
     per_1x32_f4_quant_hip,
     per_1x32_f8_scale_f8_quant,
     per_1x32_mx_quant_hip,
+)
+from aiter.ops.quant import (
+    fused_dynamic_mxfp4_quant_moe_sort as hip_fused_mxfp4_quant_moe_sort,
 )
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -478,6 +480,102 @@ for dtype in args.dtype:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_%s_quant_sort_stage2 summary (markdown):\n%s", _label, df_md)
+
+
+# ---------------------------------------------------------------------------
+# Zero routing weights in the fused quant + sort kernel.
+#
+# A zero-weight route's row is zeroed (with its scales) so a padded token's
+# garbage cannot reach the GEMM -- but only where the route owns its row (as
+# many input rows as routes: stage 2, or top-1 routing). At stage 1 a token's
+# one row is shared by its routes and must always carry the token's quantized
+# bytes: zeroing it for one route raced the token's other routes and dropped
+# the token at random.
+# ---------------------------------------------------------------------------
+_ZW_TOKENS, _ZW_COLS, _ZW_EXPERTS, _ZW_BLOCK, _ZW_LAUNCHES = 64, 512, 64, 32, 20
+_SENTINEL = 0x5A
+
+
+def _zero_weight_routing(topk):
+    """Routes where tokens 0..15 mix zero and nonzero weights and tokens
+    60..63 are padding (every weight zero)."""
+    torch.manual_seed(7)
+    scores = torch.rand(_ZW_TOKENS, _ZW_EXPERTS)
+    weights, ids = scores.topk(topk, dim=1)
+    weights, ids = weights.contiguous(), ids.to(torch.int32).contiguous()
+    if topk > 1:
+        weights[:16, topk // 2 :] = 0.0
+    weights[60:] = 0.0
+    return weights, ids
+
+
+def _launch_quant_sort(x, sorted_ids, sorted_w, num_valid, topk, quant_dtype, bound):
+    """Both launchers, outputs pre-filled with a sentinel so unwritten bytes show."""
+    rows = x.shape[0]
+    out_cols = _ZW_COLS // 2 if quant_dtype == dtypes.fp4x2 else _ZW_COLS
+    out = torch.full((rows, out_cols), _SENTINEL, dtype=torch.uint8)
+    scale = torch.full(
+        ((sorted_ids.shape[0] + 31) // 32 * 32, _ZW_COLS // 32), _SENTINEL,
+        dtype=torch.uint8,
+    )  # fmt: skip
+    args = (out.view(quant_dtype), scale.view(dtypes.fp8_e8m0), x, sorted_ids,
+            num_valid, _ZW_TOKENS, _ZW_BLOCK, _ZW_TOKENS * topk)  # fmt: skip
+    if bound:
+        fused_dynamic_mx_quant_moe_sort_hip_bounded(*args, _ZW_EXPERTS, 32, sorted_w)
+    else:
+        fused_dynamic_mx_quant_moe_sort_hip(*args, 32, sorted_w)
+    return out, scale
+
+
+def _check_zero_weight_routes(quant_dtype, topk, stage, bound):
+    weights, ids = _zero_weight_routing(topk)
+    sorted_ids, sorted_w, _, num_valid, _ = moe_sorting(
+        ids, weights, _ZW_EXPERTS, _ZW_COLS, torch.bfloat16, _ZW_BLOCK
+    )
+    rows = _ZW_TOKENS * (topk if stage == "stage2" else 1)
+    torch.manual_seed(8)
+    x = torch.randn(rows, _ZW_COLS, dtype=torch.bfloat16)
+    route_zero = (weights == 0).view(-1)
+    owns_row = rows == _ZW_TOKENS * topk
+    # Garbage in the rows a zeroed route owns must not survive the zeroing.
+    x.view(-1, _ZW_COLS)[route_zero if owns_row else (weights == 0).all(1)] = float(
+        "nan"
+    )
+    # The weight-blind reference; finite where a route owns its row, so every
+    # scale the zeroing must clear is nonzero in it.
+    ref_out, ref_scale = _launch_quant_sort(
+        x.nan_to_num(nan=1.0) if owns_row else x,
+        sorted_ids, None, num_valid, topk, quant_dtype, bound,
+    )  # fmt: skip
+    tag = f"{quant_dtype} topk={topk} {stage} bound={bound}"
+    for _ in range(_ZW_LAUNCHES):
+        out, scale = _launch_quant_sort(
+            x, sorted_ids, sorted_w, num_valid, topk, quant_dtype, bound
+        )
+        if not owns_row:
+            # Shared rows: identical to the weight-blind launch, byte for byte.
+            assert torch.equal(out, ref_out), f"{tag}: a token row was dropped"
+            assert torch.equal(scale, ref_scale), f"{tag}: scales differ"
+            continue
+        zeroed = route_zero.nonzero().flatten()
+        live = (~route_zero).nonzero().flatten()
+        assert (out[zeroed] == 0).all(), f"{tag}: a zero-weight row kept data"
+        assert torch.equal(out[live], ref_out[live]), f"{tag}: a live row changed"
+        changed = scale != ref_scale
+        assert (scale[changed] == 0).all(), f"{tag}: a scale changed to nonzero"
+        assert int(changed.sum()) == int(route_zero.sum()) * (_ZW_COLS // 32), (
+            f"{tag}: zeroed {int(changed.sum())} scale bytes, expected "
+            f"{int(route_zero.sum()) * (_ZW_COLS // 32)}"
+        )
+    aiter.logger.info("zero-weight routes OK: %s", tag)
+
+
+for _qd, _topk, _stage, _bound in itertools.product(
+    (dtypes.fp8, dtypes.fp4x2), (6, 1), ("stage1", "stage2"), (False, True)
+):
+    if _topk == 1 and _stage == "stage2":
+        continue  # top-1 has one row per route at either stage
+    _check_zero_weight_routes(_qd, _topk, _stage, _bound)
 
 
 # ---------------------------------------------------------------------------

@@ -14,8 +14,10 @@ This test pins the a8w4 path the model will run:
   2. ``preshuffle_a8w4_weight_mbn`` — offline MXFP4 weight + n32k4 scale,
   3. ``flydsl_batched_gemm_a8w4_v2`` (layout='mbn', preallocated ``out=``),
 and the a8w8 path ``batched_gemm_a8w8_mxscale_bpreshuffle`` with each e8m0
-block the arch runs: 1x32 / 32x32 and 1x128 / 128x128 on gfx950, 1x128 /
-128x128 on gfx1250.
+block the arch runs: 1x32 / 32x32 and 1x128 / 128x128 on gfx950 and gfx1250,
+plus gfx1250's 1x32 (n32k4-shuffled) weight scale. A K that 128 does not divide
+runs only on 1x32 / 32x32 (a ragged last k-tile); DeepSeek-V4.1's shared-expert
+down projection has K = 576 at TP4.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -57,7 +59,11 @@ SUPPORTED_GFX = ["gfx950", "gfx1250"]
 A8W4_GFX = ["gfx1250"]  # flydsl_batched_gemm_a8w4_v2
 SEED = 0
 # a8w8 e8m0 blocks per arch: 1xBLOCK on the activation, BLOCKxBLOCK on the weight.
-A8W8_BLOCKS = {"gfx950": (32, 128), "gfx1250": (128,)}
+A8W8_BLOCKS = {"gfx950": (32, 128), "gfx1250": (32, 128)}
+# Archs whose a8w8 GEMM also reads a 1x32 weight scale (n32k4-shuffled).
+A8W8_1X32_GFX = ["gfx1250"]
+# Archs whose a8w8 32x32 GEMM runs a ragged last k-tile (K not a multiple of 128).
+RAGGED_K_GFX = ["gfx1250"]
 
 
 def _to_e8m0_scale(scale):
@@ -118,6 +124,15 @@ def blockwise_randn(*shape, dtype):
     mag = torch.exp2(torch.randint(-2, 3, mag_shape).float())
     mag = mag.repeat_interleave(32, -1).repeat_interleave(32, -2)[..., : lead[-1], :]
     return (x * mag).to(dtype)
+
+
+def expand_32x32_to_n32k4(ws):
+    """[B, N/32, K/32] 32x32 e8m0 -> [B, N, K/32] 1x32, n32k4-shuffled."""
+    from aiter.ops.shuffle import shuffle_scale_n32k4
+
+    b, nb, kb = ws.shape
+    rows = ws.repeat_interleave(32, dim=1)
+    return shuffle_scale_n32k4(rows, experts_cnt=b).view(b, nb * 32, kb)
 
 
 def _a8w8(x8, w8_shuf, xs8, ws8, dtype):
@@ -200,7 +215,11 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     ref = run_torch_wo_a(o_mbn, w_bnk, dtype)
     candidates, nbytes = {}, {}
 
-    if get_gfx() in A8W4_GFX:
+    # A ragged K (not a multiple of 128) has no whole n32k4 scale group, so
+    # a8w4, a8w8_128 and the n32k4 1x32 scale do not run it; 32x32 does, on the
+    # archs in RAGGED_K_GFX.
+    ragged_k = k % 128 != 0
+    if get_gfx() in A8W4_GFX and not ragged_k:
         # Offline weight prep (not in the hot path); act quant mirrors every forward.
         w_codes, w_scales = preshuffle_a8w4_weight_mbn(w_bnk)
         a_fp8, a_scales = quant_act_mxfp8_mbn(o_mbn)
@@ -230,6 +249,8 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
 
     a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
     for block in a8w8_blocks:
+        if ragged_k and (block != 32 or get_gfx() not in RAGGED_K_GFX):
+            continue
         x8, xs8 = quant_act_e8m0(o_mbn, block)
         w8, ws8 = quant_weight_e8m0(w_bnk, block)
         name = f"a8w8_{block}"
@@ -243,6 +264,13 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             + b * (n // block) * (k // block)  # B scale (block x block)
             + b * m * n * y_phys.element_size()
         )
+        if block == 32 and get_gfx() in A8W8_1X32_GFX and not ragged_k:
+            candidates["a8w8_1x32"] = functools.partial(
+                _a8w8, x8, shuffle_weight(w8), xs8, expand_32x32_to_n32k4(ws8), dtype
+            )
+            nbytes["a8w8_1x32"] = (
+                nbytes[name] - b * (n // 32) * (k // 32) + b * n * (k // 32)
+            )
 
     flops = 2 * b * m * n * k
 
@@ -317,6 +345,9 @@ def main():
             (1024, 1024, 4096),
             (4096, 1024, 4096),
             (16384, 1024, 4096),  # chunked-prefill budget
+            # K not a multiple of 128: a ragged last k-tile (32x32 scale only).
+            (33, 1024, 544),
+            (4096, 512, 576),
         ],
         help="Shape m,n,k.\n        e.g.: -s 128,1024,4096",
     )
@@ -334,6 +365,8 @@ def main():
     for dtype in args.dtype:
         quant_rows = []
         for b, (m, n, k) in itertools.product(args.batch, args.mnk):
+            if k % 128:  # n32k4 groups four 32-wide scales: whole 128-K groups only
+                continue
             quant_rows.append(test_fused_quant_n32k4_mbn(b, m, k, dtype))
         summarize("fused_quant_n32k4_mbn", quant_rows)
 

@@ -18,7 +18,6 @@ python bench_chunk_delta_attn.py --shape 2 4096 16 64 64
 python bench_chunk_delta_attn.py -o
 """
 
-import argparse
 import math
 import os
 import sys
@@ -37,6 +36,7 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 # (B, T, H, K, V)  – representative prefill shapes
@@ -179,10 +179,7 @@ def run_benchmark(args):
 
 
 def parse_args(args=None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark chunk_delta_attn forward",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="chunk_delta_attn forward")
     parser.add_argument(
         "--shape",
         type=int,

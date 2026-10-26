@@ -92,6 +92,7 @@ NONE_WRAPPED_OP = [
     "qr_destroy",
     "qr_open_handles",
     "qr_get_handle",
+    "qr_uses_pull_q4",
     # These take pybind aiter_tensor_t, not torch.Tensor -- incompatible with torch.compile
     "all_reduce",
     "reduce_scatter",
@@ -100,6 +101,9 @@ NONE_WRAPPED_OP = [
     "fused_allreduce_rmsnorm",
     "fused_allreduce_rmsnorm_quant",
     "fused_qknorm_allreduce",
+    "get_mla_decode_head_plan_v1",
+    "mla_metadata_cluster_multiplier_v1",
+    "mla_reduce_v1_supports",
 ]
 
 
@@ -135,6 +139,8 @@ def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
                 type_str = "Tensor?"
         elif param_type in (torch.SymInt, int):
             type_str = "SymInt"
+        elif param_type == (int | None):
+            type_str = "SymInt?"
         elif param_type in (float, bool, str):
             type_str = param_type.__name__
         elif param_type == (torch.Generator | None):

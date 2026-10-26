@@ -88,6 +88,7 @@ from aiter.ops.flydsl.kernels.kernels_common import (
     kernel_signature,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
+from aiter.ops.flydsl.kernels.topk.topk_common import _bounded_row_len
 
 _VEC = 4
 # Half the CU's threads, so two or three workgroups stay resident and one
@@ -401,6 +402,7 @@ def build_topk_per_row_radix_stream_module(
     lds_budgets: tuple[int, int] | None = None,
     vec: int = _VEC,
     lds_plan: tuple[int, int] | None = None,
+    full_rows: bool = False,
 ):
     """Compile the streaming selector for one k. The row width is a runtime value.
 
@@ -424,6 +426,9 @@ def build_topk_per_row_radix_stream_module(
     by the ORIGINAL column and so return the same answer as an unsplit one.
     A slice selector has positions that mean something and never needs it, so
     the two modes are exclusive.
+
+    `full_rows` takes every row's length from the runtime `width` and never
+    reads `row_lens`; otherwise each row's entry is clamped to `width`.
     """
     if labelled and partial:
         raise ValueError(
@@ -476,6 +481,7 @@ def build_topk_per_row_radix_stream_module(
             blk=block_threads,
             vec=vec,
             cap=capacity,
+            **({"full": 1} if full_rows else {}),
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -485,6 +491,7 @@ def build_topk_per_row_radix_stream_module(
         indices: fx.Tensor,
         part_val: fx.Tensor,
         col_label: fx.Tensor,
+        width: fx.Int32,
         num_parts: fx.Int32,
     ):
         block = fx.block_idx.x
@@ -508,7 +515,7 @@ def build_topk_per_row_radix_stream_module(
 
         # In partial mode this block owns one slice of the row, and every column
         # it reports is still numbered in the row's own coordinates.
-        full_len = row_lens[row]
+        full_len = _bounded_row_len(row_lens, row, width, full_rows)
         chunk = fx.ceildiv(fx.ceildiv(full_len, num_parts), Int32(vec)) * Int32(vec)
         col_base = chunk * part if partial else Int32(0)
         row_len = fx.min(chunk, full_len - col_base) if partial else full_len
@@ -975,12 +982,13 @@ def build_topk_per_row_radix_stream_module(
         indices: fx.Tensor,
         part_val: fx.Tensor,
         col_label: fx.Tensor,
+        width: fx.Int32,
         num_parts: fx.Int32,
         blocks: fx.Int32,
         stream: fx.Stream,
     ):
         topk_per_row_radix_stream_kernel(
-            scores, row_lens, indices, part_val, col_label, num_parts
+            scores, row_lens, indices, part_val, col_label, width, num_parts
         ).launch(
             grid=(blocks, 1, 1),
             block=(block_threads, 1, 1),

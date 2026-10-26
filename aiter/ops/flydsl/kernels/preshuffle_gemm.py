@@ -606,9 +606,9 @@ def compile_preshuffle_gemm(
 
         # ── Prologue ──────────────────────────────────────────────
         acc_zero = (
-            Vec.filled(acc_size, 0, Int32)
+            fx.full(acc_size, 0, Int32)
             if const_expr(is_int8)
-            else Vec.filled(acc_size, 0.0, Float32)
+            else fx.full(acc_size, 0.0, Float32)
         )
         if const_expr(use_async_copy):
             dma_a_to_lds(fx.Int32(0), 0)
@@ -698,7 +698,7 @@ def compile_preshuffle_gemm(
         def _epi_read1(tiles, idx, elem_ty, atom):
             r = fx.make_rmem_tensor(fx.make_layout(1, 1), elem_ty)
             fx.copy(atom, fx.slice(tiles, (None, fx.Int32(idx))), r)
-            return fx.Vector(fx.memref_load_vec(r))[0]
+            return fx.memref_load_vec(r)[0]
 
         def load_epi_operands():
             s_a = s_b = bias = None
@@ -730,15 +730,15 @@ def compile_preshuffle_gemm(
                     arg_scale_a,
                     4,
                     max_size=False,
-                    num_records_bytes=fx.Int64(i32_m) * fx.Int64(4),
+                    num_records_bytes=fx.Int64(i32_m) * 4,
                 )
                 sa_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Float32)
                 s_a = []
                 for mi in range_constexpr(m_repeat):
                     r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
-                    idx = fx.Int32(bx_m + mi * 16 + lane_div_16 * 4) // fx.Int32(4)
+                    idx = fx.Int32(bx_m + mi * 16 + lane_div_16 * 4) // 4
                     fx.copy(sa_atom, fx.slice(sa_tiles, (None, idx)), r)
-                    s_a.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Float32))
+                    s_a.append(fx.memref_load_vec(r).bitcast(fx.Float32))
             if const_expr(_has_bias):
                 # Per-column bias (out_dtype), one scalar per N-block, shared across rows.
                 bias_elem_ty = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
@@ -851,7 +851,7 @@ def compile_preshuffle_gemm(
                 out_elem_cls,
             )
             final_values = Vec(frag_C_out.load())
-            oob = fx.Int32(i32_m * i32_n)
+            oob = i32_m * i32_n
             for p in range_constexpr(acc_size):
                 ni = p // (m_repeat * 4)
                 mi = (p // 4) % m_repeat
@@ -862,7 +862,7 @@ def compile_preshuffle_gemm(
                 in_bounds = (row < i32_m) & (col < i32_n)
                 safe_index = in_bounds.select(c_index, oob)
                 fx.memref_store_vec(
-                    Vec.filled(1, final_values[p], out_elem_cls), scalar_out
+                    fx.full(1, final_values[p], out_elem_cls), scalar_out
                 )
                 fx.copy(
                     scalar_atom,

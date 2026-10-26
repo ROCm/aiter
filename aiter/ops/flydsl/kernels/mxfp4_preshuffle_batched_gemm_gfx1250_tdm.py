@@ -17,6 +17,7 @@ from .gemm_common_gfx1250 import (
     pipeline_fence,
     workgroup_barrier,
 )
+from .gfx1250_cluster import compute_mcast_masks
 
 
 @flyc.jit
@@ -120,9 +121,7 @@ def launch_gemm_a8w4_tdm(
         wave_n = wave % n_warp
         if const_expr(use_cluster):
             local_x, local_y = cluster.compute_cluster_position()
-            a_mask, b_mask = cluster.compute_mcast_masks(
-                local_x, local_y, cluster_m, cluster_n
-            )
+            a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
         else:
             a_mask, b_mask = 0, 0
         blk_m = bid_x * tile_m

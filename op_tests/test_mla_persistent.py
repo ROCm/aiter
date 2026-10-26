@@ -13,7 +13,6 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -600,6 +599,9 @@ def torch_mla_extend_split_kv(
     is_causal=True,
     q_scale=None,
     kv_scale=None,
+    fast_mode=True,
+    intra_batch_mode=False,
+    plan_dtypes=None,
 ):
 
     _num_page, page_size, _nhead_kv, _ = kvc_cache.shape
@@ -607,6 +609,8 @@ def torch_mla_extend_split_kv(
     dev = kvc_cache.device
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
+    if plan_dtypes is None:
+        plan_dtypes = (q.dtype, kvc_cache.dtype)
 
     if is_fp8_q:
         q = q.to(torch.float)
@@ -623,77 +627,19 @@ def torch_mla_extend_split_kv(
 
     io_transformed = False
     q_ratio = 1
-    if (
-        nheads == 16
-        or (get_gfx() == "gfx942" and nheads == 128 and is_fp8_q and is_fp8_kvc)
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 128
-            and is_fp8_q
-            and is_fp8_kvc
-            and is_experimental_enabled()
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads in (16, 32, 64)
-            and nheads * max_seqlen_q == 128
-            and is_fp8_q
-            and is_fp8_kvc
-            and is_experimental_enabled()
-        )
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 8
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 4
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads == 8
-            and not is_fp8_q
-            and not is_fp8_kvc
-            and max_seqlen_q == 2
-        )
-        or (
-            # fp8/fp8 PS GQA catch-all -- mirrors aiter/mla.py / asm_mla.cu
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and ((nheads == 32) or (nheads == 64) or (nheads == 128))
-        )
-        or (
-            get_gfx() == "gfx942"
-            and nheads == 64
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 1
-        )
-        or (get_gfx() == "gfx950" and not is_fp8_q and not is_fp8_kvc)
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 96
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q <= 6
-        )
-        or (
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and nheads == 12
-            and nheads * max_seqlen_q <= 128
-        )
-    ):
-        # Natively support cases
-        pass
-    elif nheads in range(32, 128 + 1, 16):
-        # we use nhead=16 to simulate such cases by customized metadata
-        # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
+    # Read the head fold from the planner rules mla_decode_fwd and
+    # get_mla_metadata_v1 use, for the planner mode the metadata was built with.
+    fold_factor = aiter.get_mla_decode_shape_support(
+        nheads,
+        max_seqlen_q,
+        *plan_dtypes,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+    ).fold_factor
+    if fold_factor > 1:
+        # mla_decode_fwd views qo as (total_s * fold_factor, nheads // fold_factor)
         ori_nheads = nheads
-
-        fold_factor = nheads // 16
-        nheads = 16
+        nheads = nheads // fold_factor
         total_s = total_q * fold_factor
         if max_seqlen_q == 1:
             q_ratio = fold_factor
@@ -986,6 +932,9 @@ def torch_mla_split_kv_and_reduce(
     is_causal=True,
     q_scale=None,
     kv_scale=None,
+    fast_mode=True,
+    intra_batch_mode=False,
+    plan_dtypes=None,
 ):
     total_q, nhead, _ = q.shape
     partial_out, partial_lse, split_out, split_lse, io_transformed = (
@@ -1007,6 +956,9 @@ def torch_mla_split_kv_and_reduce(
             is_causal=is_causal,
             q_scale=q_scale,
             kv_scale=kv_scale,
+            fast_mode=fast_mode,
+            intra_batch_mode=intra_batch_mode,
+            plan_dtypes=plan_dtypes,
         )
     )
 
@@ -1077,6 +1029,8 @@ def torch_mla_extend_3buffer_split_kv_and_reduce(
     q_scale=None,
     kv_scale=None,
     scale_dim=4,
+    fast_mode=True,
+    intra_batch_mode=False,
 ):
 
     num_page = kvc_cache.shape[0]
@@ -1120,7 +1074,20 @@ def torch_mla_extend_3buffer_split_kv_and_reduce(
         is_causal,
         q_scale,
         kv_scale,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+        # mla_decode_fwd plans the byte KV buffer as fp8.
+        plan_dtypes=(q.dtype, dtypes.fp8),
     )
+
+
+# get_mla_metadata_v1 planner per mode: (fast_mode, intra_batch_mode).
+# fast -> v1_2, v1_0 -> the -nps default, v1_1 -> neither flag.
+MLA_METADATA_MODES = {
+    "fast": (True, False),
+    "v1_0": (False, True),
+    "v1_1": (False, False),
+}
 
 
 def _make_mla_metadata(
@@ -1138,7 +1105,11 @@ def _make_mla_metadata(
     non_persistent_mode=False,
     causal=True,
     is_cp_round_robin=False,
+    metadata_mode=None,
 ):
+    if metadata_mode is None:
+        metadata_mode = "v1_0" if non_persistent_mode else "fast"
+    fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
     names = (
         "work_meta_data",
         "work_indptr",
@@ -1154,9 +1125,9 @@ def _make_mla_metadata(
         dtype,
         kvtype,
         is_sparse=False,
-        fast_mode=not non_persistent_mode,
+        fast_mode=fast_mode,
         num_kv_splits=max_split_per_batch,
-        intra_batch_mode=non_persistent_mode,
+        intra_batch_mode=intra_batch_mode,
     )
     metadata = {
         name: torch.empty(shape, dtype=buffer_dtype, device=qo_indptr.device)
@@ -1182,9 +1153,9 @@ def _make_mla_metadata(
         ),
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
-        fast_mode=not non_persistent_mode,
+        fast_mode=fast_mode,
         max_split_per_batch=max_split_per_batch,
-        intra_batch_mode=non_persistent_mode,
+        intra_batch_mode=intra_batch_mode,
         dtype_q_nope=dtype,
         dtype_kv_nope=kvtype,
         is_cp_round_robin=is_cp_round_robin,
@@ -1212,6 +1183,7 @@ def test_mla(
     scale_dim,
     return_lse,
     causal,
+    metadata_mode=None,
 ):
     ret = {}
 
@@ -1333,6 +1305,9 @@ def test_mla(
             (cu_num + batch_size - 1) // batch_size, max_split_per_batch
         )
 
+    if metadata_mode is None:
+        metadata_mode = "v1_0" if non_persistent_mode else "fast"
+    fast_mode, intra_batch_mode = MLA_METADATA_MODES[metadata_mode]
     metadata = _make_mla_metadata(
         qo_indptr,
         kv_indptr,
@@ -1345,8 +1320,8 @@ def test_mla(
         max_seqlen_qo,
         decode_qlen,
         max_split_per_batch,
-        non_persistent_mode=non_persistent_mode,
         causal=causal,
+        metadata_mode=metadata_mode,
     )
     work_meta_data = metadata["work_meta_data"]
     work_indptr = metadata["work_indptr"]
@@ -1469,7 +1444,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             kv_scale=kv_scale,
             causal=causal,
         )
@@ -1508,6 +1484,8 @@ def test_mla(
                     is_causal=causal,
                     q_scale=None,
                     kv_scale=kv_scale,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1547,7 +1525,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             return_lse=return_lse,
             causal=causal,
         )
@@ -1584,6 +1563,8 @@ def test_mla(
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
                     is_causal=causal,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1650,7 +1631,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             return_lse=return_lse,
             causal=causal,
         )
@@ -1696,6 +1678,8 @@ def test_mla(
                     is_causal=causal,
                     q_scale=q_scale,
                     kv_scale=kv_scale,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -1771,7 +1755,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
+            intra_batch_mode=intra_batch_mode,
+            fast_mode=fast_mode,
             causal=causal,
         )
 
@@ -1810,6 +1795,8 @@ def test_mla(
                     max_seqlen_q=max_seqlen_qo,
                     is_causal=causal,
                     scale_dim=scale_dim,
+                    fast_mode=fast_mode,
+                    intra_batch_mode=intra_batch_mode,
                 )
             )
 
@@ -2255,6 +2242,16 @@ parser.add_argument(
     --varlen # True""",
 )
 parser.add_argument(
+    "-mm",
+    "--metadata_mode",
+    type=str,
+    choices=list(MLA_METADATA_MODES),
+    default=None,
+    help="""get_mla_metadata_v1 planner: fast (v1_2), v1_0 or v1_1.
+    Default: v1_0 with -nps, else fast.
+    e.g.: -mm v1_1""",
+)
+parser.add_argument(
     "-pl",
     "--paged_layout",
     type=str,
@@ -2364,6 +2361,8 @@ def main():
                     scale_dim=args.scale_dim,
                     return_lse=args.return_lse,
                     causal=args.causal,
+                    metadata_mode=args.metadata_mode
+                    or ("v1_0" if args.non_persistent_mode else "fast"),
                 )
                 df.append(ret)
         df = pd.DataFrame(df)

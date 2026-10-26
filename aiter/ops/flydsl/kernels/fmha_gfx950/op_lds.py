@@ -111,9 +111,9 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
             grp = slot // slots_per_group
             rem = slot % slots_per_group
             dest_n = fx.Int32(grp * 8 + rem % 8)
-            w16 = dest_n % fx.Int32(16)
-            c_add = (w16 >= fx.Int32(4)) & (w16 < fx.Int32(8))
-            c_sub = (w16 >= fx.Int32(8)) & (w16 < fx.Int32(12))
+            w16 = dest_n % 16
+            c_add = (w16 >= 4) & (w16 < 8)
+            c_sub = (w16 >= 8) & (w16 < 12)
             n = (
                 dest_n
                 + c_add.select(fx.Int32(4), fx.Int32(0))

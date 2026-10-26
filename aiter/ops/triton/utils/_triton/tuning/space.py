@@ -28,7 +28,7 @@ SEARCH_SPACE = {
     "matrix_instr_nonkdim": [16],
     "cache_modifier": [".cg", None],
     "NUM_KSPLIT": [1, 3, 4, 7, 8, 14, 16, 28],
-    "NUM_BUFFERS": [1, 2, 3, 4, 6, 8],
+    "NUM_BUFFERS": [2, 3, 4, 5, 6, 7, 8],
     "kernel_type": ["bandwidth_bound", "compute_bound"],
     "num_ctas": [1, 2, 4, 8, 16],
     "CTAS_M": [1, 2, 4],

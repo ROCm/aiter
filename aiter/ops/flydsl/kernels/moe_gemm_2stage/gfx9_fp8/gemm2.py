@@ -32,6 +32,8 @@ def compile_moe_gemm2(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    down_path="default",
+    down_output_padding_bytes=0,
 ):
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
@@ -49,6 +51,28 @@ def compile_moe_gemm2(
             f"down prefill requires N to be divisible by 256 for paired "
             f"128-wide tiles, got N={N}"
         )
+    if down_path != "default":
+        assert alg == "prefill_1x4" and BLOCK_TILE_SIZE_M == 64
+        assert weight_dtype == "fp8"
+        options = {
+            "N": N,
+            "K": K,
+            "weight_quant_type": weight_quant_type,
+            "act_quant_type": act_quant_type,
+            "TOPK": TOPK,
+            "padding": down_output_padding_bytes,
+        }
+        if down_path == "1x4_64x256":
+            from .gemm2_1x4 import _build_moe_gemm2_1x4_n256
+
+            return _build_moe_gemm2_1x4_n256(**options)
+        if down_path == "8x1_compact":
+            from .gemm2_8x1_compact import _build_moe_gemm2_8x1_compact
+
+            return _build_moe_gemm2_8x1_compact(E=E, **options)
+        raise ValueError(f"Unsupported Down path: {down_path}")
+    if down_output_padding_bytes != 0:
+        raise ValueError("The default Down path does not support output padding")
 
     if alg == "splitk":
         assert (

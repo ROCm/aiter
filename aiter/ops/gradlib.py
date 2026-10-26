@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from enum import IntEnum
+
 import torch
 
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
@@ -28,6 +30,13 @@ def hipb_destroy_extension() -> None:
     """
 
 
+class HipblasLtMatmulScaleMode(IntEnum):
+    SCALAR_32F = 0
+    VEC32_UE8M0 = 2
+    OUTER_VEC_32F = 3
+    BLK32_UE8M0_32_8_EXT = 1001
+
+
 def gen_hipb_mm_fake_tensor(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
@@ -39,16 +48,26 @@ def gen_hipb_mm_fake_tensor(
     scaleOut: torch.Tensor | None = None,
     bpreshuffle: bool | None = None,
     use_gelu: bool | None = None,
+    out: torch.Tensor | None = None,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ):
-    mat1_sizes = mat1.size()
-    mat2_sizes = mat2.size()
-    in_dtype = mat1.dtype
-    out_dtype = out_dtype if out_dtype is not None else in_dtype
-    result = torch.empty(
-        (mat1_sizes[0], mat2_sizes[1]), dtype=out_dtype, device=mat1.device
+    return torch.empty(
+        (mat1.size(0), mat2.size(1)),
+        dtype=_hipb_mm_out_dtype(mat1, out_dtype, out),
+        device=mat1.device,
     )
 
-    return result
+
+def _hipb_mm_out_dtype(
+    mat1: torch.Tensor, out_dtype: torch.dtype | None, out: torch.Tensor | None
+) -> torch.dtype:
+    """The result dtype: ``out``'s when given, else ``out_dtype``, else the input's."""
+    if out is None:
+        return out_dtype if out_dtype is not None else mat1.dtype
+    if out_dtype is not None and out_dtype != out.dtype:
+        raise ValueError(f"hipb_mm: out_dtype={out_dtype} but out is {out.dtype}")
+    return out.dtype
 
 
 # torch-free kernel entry: writes into caller-allocated `result` (the de-torched C++
@@ -65,6 +84,8 @@ def _hipb_mm(
     scaleOut: torch.Tensor | None = None,
     bpreshuffle: bool | None = None,
     use_gelu: bool | None = None,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ) -> None: ...
 
 
@@ -79,10 +100,16 @@ def hipb_mm(
     scaleOut: torch.Tensor | None = None,
     bpreshuffle: bool | None = None,
     use_gelu: bool | None = None,
+    out: torch.Tensor | None = None,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ) -> torch.Tensor:
-    out_dtype = out_dtype if out_dtype is not None else mat1.dtype
-    result = torch.empty(
-        (mat1.size(0), mat2.size(1)), dtype=out_dtype, device=mat1.device
+    """``out``: the [M, N] tensor to write instead of allocating; returned."""
+    dtype = _hipb_mm_out_dtype(mat1, out_dtype, out)
+    result = (
+        torch.empty((mat1.size(0), mat2.size(1)), dtype=dtype, device=mat1.device)
+        if out is None
+        else out
     )
     _hipb_mm(
         mat1,
@@ -95,6 +122,8 @@ def hipb_mm(
         scaleOut,
         bpreshuffle,
         use_gelu,
+        scaleA_mode,
+        scaleB_mode,
     )
     return result
 
@@ -102,7 +131,7 @@ def hipb_mm(
 direct_register_custom_op(
     "hipb_mm",
     hipb_mm,
-    [],
+    ["out"],
     fake_impl=gen_hipb_mm_fake_tensor,
 )
 
@@ -118,6 +147,8 @@ def _hipb_findallsols(
     scaleC: torch.Tensor | None = None,
     bpreshuffle: bool = False,
     use_gelu: bool = False,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ) -> list[int]: ...
 
 
@@ -131,13 +162,25 @@ def hipb_findallsols(
     scaleC: torch.Tensor | None = None,
     bpreshuffle: bool = False,
     use_gelu: bool = False,
+    scaleA_mode: int | None = None,
+    scaleB_mode: int | None = None,
 ) -> list[int]:
     out_dtype = out_dtype if out_dtype is not None else mat1.dtype
     result = torch.empty(
         (mat1.size(0), mat2.size(1)), dtype=out_dtype, device=mat1.device
     )
     return _hipb_findallsols(
-        mat1, mat2, result, bias, scaleA, scaleB, scaleC, bpreshuffle, use_gelu
+        mat1,
+        mat2,
+        result,
+        bias,
+        scaleA,
+        scaleB,
+        scaleC,
+        bpreshuffle,
+        use_gelu,
+        scaleA_mode,
+        scaleB_mode,
     )
 
 

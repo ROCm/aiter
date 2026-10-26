@@ -436,6 +436,34 @@ def gemm_a16wfp4(shape, backend):
     return call, (x, w, w_scales, y), None
 
 
+# The kernel dequantizes the int4 weight tile to 16 bits before it goes to LDS.
+@kernel("GEMM-A16W4", bits=(16, 16), backend_kwarg=False)
+def gemm_a16w4(shape, backend):
+    import torch
+
+    from aiter.ops.triton.gemm.basic.gemm_a16w4 import gemm_a16w4 as gemm
+    from op_tests.triton_tests.gemm.basic.test_gemm_a16w4 import (
+        generate_gemm_a16w4_inputs,
+    )
+
+    M, N, K = shape["M"], shape["N"], shape["K"]
+    # Per-channel scales when K is not a multiple of the group size, as the benchmark does.
+    group_size = 128 if K % 128 == 0 else -1
+    x, w, w_scales, _, _, _, y, _ = generate_gemm_a16w4_inputs(
+        M, N, K, group_size=group_size, dtype=torch.bfloat16, output=True
+    )
+
+    def call(config, x, w, w_scales, y):
+        return gemm(x, w, w_scales, y=y, config=config)
+
+    def should_skip(config):
+        # tl.dot needs blocks of 16 or more in each dimension.
+        block = ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
+        return min(config[key] for key in block) < 16
+
+    return call, (x, w, w_scales, y), should_skip
+
+
 @kernel("GEMM-A8W8", bits=(8, 8), gluon_archs=("gfx950",))
 def gemm_a8w8(shape, backend):
     import torch
@@ -480,7 +508,7 @@ def gemm_a8w8(shape, backend):
     gluon_default_archs=("gfx1250",),
     gluon_candidates={
         "num_stages": [2, 3, 4, 6]
-    },  # gfx1250 gluon reads it as NUM_BUFFERS
+    },  # gfx950 gluon reads it as NUM_STAGES, at least 2
 )
 def gemm_a8w8_blockscale(shape, backend):
     import torch
@@ -532,9 +560,6 @@ def gemm_a8w8_blockscale(shape, backend):
     bits=(8, 8),
     gluon_archs=("gfx1250",),
     gluon_default_archs=("gfx1250",),
-    gluon_candidates={
-        "num_stages": [2, 3, 4, 6]
-    },  # gfx1250 gluon reads it as NUM_BUFFERS
 )
 def gemm_a8w8_blockscale_preshuffle(shape, backend):
     import torch

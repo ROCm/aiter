@@ -191,9 +191,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
                 fx.make_layout(ARENA_B, 1),
             )
         )
-        index_rsrc = ptr_rsrc(
-            arg_indices, num_records_bytes=fx.Int64(i32_m) * fx.Int64(4)
-        )
+        index_rsrc = ptr_rsrc(arg_indices, num_records_bytes=fx.Int64(i32_m) * 4)
 
         zero_indices = [fx.Int32(0) for _ in range_constexpr(A_GATHER_ROWS)]
         gather_template = make_tensor_gather_descriptor(
@@ -330,7 +328,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
         )
         c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
         for cf in c_frags:
-            cf.store(Vec.filled(8, 0.0, fx.Float32))
+            cf.store(fx.full(8, 0.0, fx.Float32))
 
         def _rmem(n, v):
             t = fx.make_rmem_tensor(n, fx.Int32)
@@ -422,7 +420,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
                 sb_r[wn][0].load().shuffle(sb_r[wn][1].load(), list(range(8)))
                 for wn in range_constexpr(wmma_n_rep)
             ]
-            sa = Vec.filled(8, activation_scale, fx.Float32)
+            sa = fx.full(8, activation_scale, fx.Float32)
             for wm in range_constexpr(wmma_m_rep):
                 for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
@@ -538,7 +536,7 @@ def launch_gather_kv_b_proj_8wave_gfx1250(
 
         head = bid_y
         lds_base = _bidx(base_ptr)
-        rope_scale = Vec.filled(8, activation_scale, fx.Float32)
+        rope_scale = fx.full(8, activation_scale, fx.Float32)
         rope_lanes_per_row = _ROPE_WIDTH // 8
         rope_rows_per_wave = WAVE // rope_lanes_per_row
         rope_row_in_wave = lane // rope_lanes_per_row

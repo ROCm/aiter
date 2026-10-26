@@ -14,8 +14,6 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --qk_rope_head_dim 0
 """
 
-import argparse
-
 import torch
 import triton
 from torch.autograd import DeviceType
@@ -28,6 +26,10 @@ from aiter.ops.triton.attention.sparse_mla import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -99,7 +101,7 @@ def build_case(
     min(pos + 1, topk), which is what the index converter emits.
     """
     torch.manual_seed(0)
-    gen = torch.Generator().manual_seed(1)
+    gen = torch.Generator(device=device).manual_seed(1)
     pool = num_seqs * context
 
     kv = torch.randn(pool, d_qk, dtype=torch.bfloat16, device=device) * 0.125
@@ -120,15 +122,17 @@ def build_case(
         for t in range(num_tokens):
             pos = context - 1 if num_tokens == 1 else t
             if pos + 1 <= topk:
-                sel = torch.arange(pos + 1, dtype=torch.int64)  # everything fits
+                sel = torch.arange(
+                    pos + 1, dtype=torch.int64, device=device
+                )  # everything fits
             else:
-                sel = torch.randperm(pos + 1, generator=gen)[:topk]
+                sel = torch.randperm(pos + 1, generator=gen, device=device)[:topk]
             rows.append((sel + base).to(torch.int32))
             lens.append(sel.numel())
 
-    indices = torch.cat(rows).to(device)
-    indptr = torch.zeros(len(lens) + 1, dtype=torch.int32)
-    indptr[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
+    indices = torch.cat(rows)
+    indptr = torch.zeros(len(lens) + 1, dtype=torch.int32, device=device)
+    indptr[1:] = torch.tensor(lens, dtype=torch.int32, device=device).cumsum(0)
 
     # fp8 dots want the flat per-tensor format; bf16 dots read kv as it is.
     scale = (kv.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
@@ -136,7 +140,7 @@ def build_case(
         torch.uint8
     )
 
-    return q, kv, kv_fp8, scale.to(device), indices, indptr.to(device)
+    return q, kv, kv_fp8, scale, indices, indptr
 
 
 def run_benchmark(args):
@@ -247,10 +251,7 @@ def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sparse MLA Benchmark",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="Sparse MLA Benchmark")
     parser.add_argument(
         "--num_seqs",
         type=int,
@@ -283,12 +284,8 @@ def main():
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "throughput", "bandwidth"],
-        default="time",
-        help="metric to plot",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     args = parser.parse_args()
     over = [t for t in args.num_tokens if t > args.context]

@@ -7,6 +7,7 @@
 #include "aiter_stream.h"
 #include "iq2r.h"
 #include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
@@ -134,7 +135,7 @@ __device__ __forceinline__ uint8_t glm53_quant32(const opus::bf16_t* __restrict_
     using input_vector        = opus::vector_t<opus::bf16_t, kQuantGroup>;
     const input_vector values = *reinterpret_cast<const input_vector*>(input);
 
-    float abs_max = 1.0e-10f;
+    float abs_max = aiter::kAmaxFloor;
 #pragma unroll
     for(int element = 0; element < kQuantGroup; ++element)
         abs_max = fmaxf(abs_max, fabsf(static_cast<float>(values[element])));

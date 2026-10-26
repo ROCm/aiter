@@ -1,4 +1,3 @@
-import argparse
 import math
 
 import torch
@@ -6,8 +5,11 @@ import triton
 
 from aiter.ops.triton.normalization.rmsnorm import rms_norm
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_rms_mxfp4_quant
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_available_models,
     get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
@@ -175,24 +177,7 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark RMSNorm",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    available_models = get_available_models()  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
-    )
-    parser.add_argument(
-        "--model-configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    parser.add_argument("--model", type=str, help=model_help)
+    parser = get_parser(kernel_name="RMSNorm")
     parser.add_argument(
         "-M",
         type=int,
@@ -206,13 +191,7 @@ def parse_args(args: list[str] | None = None):
         metavar=("M", "N"),
         help="user-defined shape to benchmark",
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "bandwidth", "throughput"],
-        default="bandwidth",
-        help="metric to plot",
-    )
+    override_parser_action(parser, action="--metric", default="bandwidth")
     parser.add_argument(
         "--quant",
         type=str,

@@ -110,6 +110,8 @@ struct opus_mla_decode_mxfp8_16mx8_32nx1_traits
 
 __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
+static constexpr float MLA_DECODE_LN_2 = 0.69314718055994531f;
+
 // Round-robin CP causal bound. `g` is the row's global query position minus cp_rank, so local
 // token j (global j * world + rank) is visible iff j * world <= g; returns the last visible
 // local index counted from `kv_off`, the work item's offset into the batch's local KV. g < 0
@@ -900,4 +902,242 @@ struct opus_mla_decode_a8w8_16mx1_32nx4_traits
         (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE); // 4
     static constexpr int v_ds_read_insts =
         (GEMM1_E_N * W_N * W_K_ROPE) / (WARP_SIZE * VEC_TR_V); // 2
+};
+
+template <int Q_TILE_SIZE_  = 16,
+          int KV_TILE_SIZE_ = 64,
+          int NUM_WARPS_    = 4,
+          typename D_ATTN_  = bf16_t,
+          typename D_OUT_   = bf16_t>
+struct opus_mla_decode_a16w16_16mx4_64nx1_traits
+{
+    static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS    = NUM_WARPS_;
+
+    static constexpr int WARP_SIZE  = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    static constexpr int D_QK_SIZE = 576;
+    static constexpr int D_VO_SIZE = 512;
+
+    using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    static constexpr int T_M = NUM_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_QK_SIZE / W_K;
+
+    static constexpr int SLICE_D      = 32;
+    static constexpr int NUM_D_SLICES = D_VO_SIZE / SLICE_D;
+
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = SLICE_D / W_N;
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+
+    static constexpr int VEC_Q    = 8;
+    static constexpr int VEC_KV   = 8;
+    static constexpr int VEC_TR_V = 4;
+    static constexpr int VEC_O    = 4;
+
+    static constexpr int dwordx4_size     = 16;
+    static constexpr int D_128B_SIZE      = 128 / sizeof(D_ATTN);
+    static constexpr int smem_linear_wave = WARP_SIZE * dwordx4_size / sizeof(D_ATTN);
+    static constexpr int smem_n_per_wave  = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_n_rpt       = KV_TILE_SIZE / smem_n_per_wave;
+    static constexpr int smem_d_rpt       = D_QK_SIZE / D_128B_SIZE;
+    static constexpr int smem_d_rpt_v     = D_VO_SIZE / D_128B_SIZE;
+    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
+    static constexpr int smem_brick       = smem_linear_wave + smem_padding_32B;
+
+    static constexpr int smem_n_sub_tile     = smem_n_per_wave * NUM_WARPS;
+    static constexpr int smem_n_sub_tile_rpt = KV_TILE_SIZE / smem_n_sub_tile;
+    static constexpr int kv_async_load_insts = smem_n_sub_tile_rpt * smem_d_rpt;
+
+    static constexpr size_t smem_kv_bytes =
+        (size_t)smem_n_rpt * smem_d_rpt * smem_brick * sizeof(D_ATTN);
+
+    static constexpr int NUM_KV_BUFS     = 2;
+    static constexpr int smem_slot_elems = (int)(smem_kv_bytes / sizeof(D_ATTN));
+    static constexpr size_t smem_bytes() { return NUM_KV_BUFS * smem_kv_bytes; }
+};
+
+template <int Q_TILE_SIZE_  = 32,
+          int KV_TILE_SIZE_ = 64,
+          int NUM_WARPS_    = 4,
+          typename D_ATTN_  = bf16_t,
+          typename D_OUT_   = bf16_t>
+struct opus_mla_decode_a16w16_32mx1_16nx4_traits
+{
+    static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS    = NUM_WARPS_;
+
+    static constexpr int WARP_SIZE  = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    static constexpr int D_QK_SIZE = 576;
+    static constexpr int D_VO_SIZE = 512;
+
+    using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    static constexpr int T_M = 1;
+    static constexpr int T_N = NUM_WARPS;
+    static constexpr int T_K = 1;
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_QK_SIZE / W_K;
+
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = D_VO_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+
+    static constexpr int VEC_Q    = 8;
+    static constexpr int VEC_KV   = 8;
+    static constexpr int VEC_TR_V = 4;
+    static constexpr int VEC_O    = 4;
+
+    static constexpr int dwordx4_size     = 16;
+    static constexpr int D_128B_SIZE      = 128 / sizeof(D_ATTN);
+    static constexpr int smem_linear_wave = WARP_SIZE * dwordx4_size / sizeof(D_ATTN);
+    static constexpr int smem_n_per_wave  = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_n_rpt       = KV_TILE_SIZE / smem_n_per_wave;
+    static constexpr int smem_d_rpt       = D_QK_SIZE / D_128B_SIZE;
+    static constexpr int smem_d_rpt_v     = D_VO_SIZE / D_128B_SIZE;
+    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
+    static constexpr int smem_brick       = smem_linear_wave + smem_padding_32B;
+
+    static constexpr int smem_n_sub_tile     = smem_n_per_wave * NUM_WARPS;
+    static constexpr int smem_n_sub_tile_rpt = KV_TILE_SIZE / smem_n_sub_tile;
+    static constexpr int kv_async_load_insts = smem_n_sub_tile_rpt * smem_d_rpt;
+
+    static constexpr size_t smem_kv_bytes =
+        (size_t)smem_n_rpt * smem_d_rpt * smem_brick * sizeof(D_ATTN);
+
+    static constexpr int NUM_KV_BUFS     = 2;
+    static constexpr int smem_slot_elems = (int)(smem_kv_bytes / sizeof(D_ATTN));
+
+    static constexpr int ML_ELEMS         = GEMM0_E_M;
+    static constexpr int ML_SLOT_ELEMS    = GEMM0_E_M * W_M * T_N;
+    static constexpr int P_SLOT_ELEMS     = Q_TILE_SIZE * KV_TILE_SIZE;
+    static constexpr size_t smem_ml_bytes = 2 * (size_t)ML_SLOT_ELEMS * sizeof(D_ACC);
+    static constexpr size_t smem_p_bytes  = 2 * (size_t)P_SLOT_ELEMS * sizeof(D_ATTN);
+
+    static constexpr size_t smem_bytes()
+    { return NUM_KV_BUFS * smem_kv_bytes + smem_ml_bytes + smem_p_bytes; }
+};
+
+template <int Q_TILE_SIZE_,
+          int KV_TILE_SIZE_,
+          int NUM_WARPS_,
+          int NUM_COMPUTE_WARPS_,
+          typename D_ATTN_,
+          typename D_OUT_>
+struct opus_mla_decode_a16w16_32mxt_32nx1_traits_base
+{
+    static constexpr int Q_TILE_SIZE       = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE      = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS         = NUM_WARPS_;
+    static constexpr int NUM_COMPUTE_WARPS = NUM_COMPUTE_WARPS_;
+
+    static constexpr int WARP_SIZE  = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    static constexpr int D_QK_SIZE = 576;
+    static constexpr int D_VO_SIZE = 512;
+
+    using D_ATTN = D_ATTN_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    static constexpr int T_M = NUM_COMPUTE_WARPS;
+    static constexpr int T_N = 1;
+    static constexpr int T_K = 1;
+
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_E_K = D_QK_SIZE / W_K;
+
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = D_VO_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
+
+    static constexpr int VEC_Q    = 8;
+    static constexpr int VEC_KV   = 8;
+    static constexpr int VEC_TR_V = 4;
+    static constexpr int VEC_O    = 4;
+
+    static constexpr int dwordx4_size     = 16;
+    static constexpr int D_128B_SIZE      = 128 / sizeof(D_ATTN);
+    static constexpr int smem_linear_wave = WARP_SIZE * dwordx4_size / sizeof(D_ATTN);
+    static constexpr int smem_n_per_wave  = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_n_rpt       = KV_TILE_SIZE / smem_n_per_wave;
+    static constexpr int smem_d_rpt       = D_QK_SIZE / D_128B_SIZE;
+    static constexpr int smem_d_rpt_v     = D_VO_SIZE / D_128B_SIZE;
+    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
+    static constexpr int smem_brick       = smem_linear_wave + smem_padding_32B;
+
+    static constexpr int smem_n_sub_tile     = smem_n_per_wave * NUM_WARPS;
+    static constexpr int smem_n_sub_tile_rpt = KV_TILE_SIZE / smem_n_sub_tile;
+    static constexpr int kv_async_load_insts = smem_n_sub_tile_rpt * smem_d_rpt;
+
+    static constexpr size_t smem_kv_bytes =
+        (size_t)smem_n_rpt * smem_d_rpt * smem_brick * sizeof(D_ATTN);
+
+    static constexpr int NUM_KV_BUFS     = 4;
+    static constexpr int smem_slot_elems = (int)(smem_kv_bytes / sizeof(D_ATTN));
+
+    static constexpr int ML_ELEMS = GEMM0_E_M;
+
+    static constexpr size_t smem_bytes() { return NUM_KV_BUFS * smem_kv_bytes; }
+};
+
+template <int Q_TILE_SIZE_  = 32,
+          int KV_TILE_SIZE_ = 32,
+          int NUM_WARPS_    = 4,
+          typename D_ATTN_  = bf16_t,
+          typename D_OUT_   = bf16_t>
+struct opus_mla_decode_a16w16_32mx4_32nx1_traits
+    : opus_mla_decode_a16w16_32mxt_32nx1_traits_base<Q_TILE_SIZE_,
+                                                     KV_TILE_SIZE_,
+                                                     NUM_WARPS_,
+                                                     NUM_WARPS_,
+                                                     D_ATTN_,
+                                                     D_OUT_>
+{
+};
+
+template <int Q_TILE_SIZE_  = 32,
+          int KV_TILE_SIZE_ = 32,
+          int NUM_WARPS_    = 4,
+          typename D_ATTN_  = bf16_t,
+          typename D_OUT_   = bf16_t>
+struct opus_mla_decode_a16w16_32mx3_32nx1_traits
+    : opus_mla_decode_a16w16_32mxt_32nx1_traits_base<Q_TILE_SIZE_,
+                                                     KV_TILE_SIZE_,
+                                                     NUM_WARPS_,
+                                                     NUM_WARPS_ - 1,
+                                                     D_ATTN_,
+                                                     D_OUT_>
+{
 };

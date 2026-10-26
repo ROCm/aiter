@@ -600,10 +600,11 @@ def _flash_attn_forward(
     # exp_scores [batch, num_q_heads, seqlen_q, seqlen_k]
     enable_dropout = dropout_p > 0.0
     if enable_dropout:
-        philox_seed = torch.randint(0, 0xFFFFFF, (1,))[
+        # Make the seeds on the CPU. A GPU tensor would sync the device in .item().
+        philox_seed = torch.randint(0, 0xFFFFFF, (1,), device="cpu")[
             0
         ].item()  # No specific reason to restrict range to 0xffffff
-        philox_offset = torch.randint(0, 0xFFFFFF, (1,))[
+        philox_offset = torch.randint(0, 0xFFFFFF, (1,), device="cpu")[
             0
         ].item()  # Pass in an int, not Tensor
     else:
@@ -818,6 +819,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         )
         softmax_scale = _get_softmax_scale(q, softmax_scale)
         head_size_og = q.size(3)
+        ctx.head_sizes = (q.shape[-1], k.shape[-1], v.shape[-1])
         if head_size_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
@@ -955,9 +957,9 @@ class _FlashAttnFunc(torch.autograd.Function):
                     sliding_window=sliding_window,
                 )
 
-        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : k.shape[-1]]
-        dv = dv[..., : v.shape[-1]]
+        dq = dq[..., : ctx.head_sizes[0]]
+        dk = dk[..., : ctx.head_sizes[1]]
+        dv = dv[..., : ctx.head_sizes[2]]
         return (
             dq,
             dk,
@@ -1146,6 +1148,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         )
         softmax_scale = _get_softmax_scale(q, softmax_scale)
         head_size_og = q.size(2)
+        ctx.head_sizes = (q.shape[-1], k.shape[-1], v.shape[-1])
         if head_size_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
@@ -1292,9 +1295,9 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                     sliding_window=sliding_window,
                 )
 
-        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : k.shape[-1]]
-        dv = dv[..., : v.shape[-1]]
+        dq = dq[..., : ctx.head_sizes[0]]
+        dk = dk[..., : ctx.head_sizes[1]]
+        dv = dv[..., : ctx.head_sizes[2]]
         return (
             dq,
             dk,

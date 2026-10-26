@@ -250,7 +250,7 @@ def _store_fp8_packed_w64(
 
     base = out_base_i64 + fx.Int64(row_base_bytes)
     packed_i64 = fx.Vector.from_elements([p0, p1], dtype=fx.Int32).bitcast(fx.Int64)[0]
-    _scalar_store(base, idx, fx.Int64(packed_i64), fx.Int64, 64)
+    _scalar_store(base, idx, packed_i64, fx.Int64, 64)
 
 
 def _store_fp8_packed_w32(
@@ -487,8 +487,8 @@ def _build_kernel_w64(
                             amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
                         )
                     )
-                    quant_exp = fx.Int32(254) - e8m0_biased
-                    quant_scale = (quant_exp << fx.Int32(23)).bitcast(fx.Float32)
+                    quant_exp = 254 - e8m0_biased
+                    quant_scale = (quant_exp << 23).bitcast(fx.Float32)
                     factor = rstd * quant_scale
                     scale_to_store = e8m0_biased.to(fx.Int8)
                     scale_store_dt, scale_store_bits = fx.Int8, 8
@@ -619,7 +619,7 @@ def _build_kernel_w64(
                 )
         else:
             kv_in_base = fx.Int64(ptrtoint(kv_in)) + fx.Int64(bid_t) * (
-                fx.Int64(kv_in_row_stride) * fx.Int64(2)
+                fx.Int64(kv_in_row_stride) * 2
             )
             kv_in_row = _bf16_row_view(kv_in_base, D, D * 2)
             kv_in_part = _row_part_S(kv_in_row)
@@ -672,9 +672,9 @@ def _build_kernel_w64(
                     # test, reads the PREVIOUS request's table entry, and lands the
                     # write 44 rows before that block. The C++ sibling's first gate
                     # is `bid < 0 || pos < 0`; match it, in both modes.
-                    pos_ok = pos_i32 >= fx.Int32(0)
-                    do_swa = (bid_i32 >= fx.Int32(0)) & pos_ok
-                    bid_safe = (bid_i32 >= fx.Int32(0)).select(bid_i32, fx.Int32(0))
+                    pos_ok = pos_i32 >= 0
+                    do_swa = (bid_i32 >= 0) & pos_ok
+                    bid_safe = (bid_i32 >= 0).select(bid_i32, fx.Int32(0))
                     pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                     if const_expr(paged):
                         blk = pos_safe // swa_cache_size
@@ -703,9 +703,7 @@ def _build_kernel_w64(
                         # Bound the final row against the pool, as the C++ does:
                         # a phys id left over from a larger pool would otherwise
                         # write past the end of swa_kv.
-                        row_ok = (
-                            blk_ok & (phys >= fx.Int32(0)) & (row_raw < swa_num_rows)
-                        )
+                        row_ok = blk_ok & (phys >= 0) & (row_raw < swa_num_rows)
                         do_swa = do_swa & row_ok
                         # Clamp too: a negative row would move the descriptor
                         # base backwards, out of this tensor entirely.
@@ -719,7 +717,7 @@ def _build_kernel_w64(
                                 32,
                             )
                         )
-                        dest_ok = (dest >= fx.Int32(0)) & (dest < swa_num_rows)
+                        dest_ok = (dest >= 0) & (dest < swa_num_rows)
                         do_swa = do_swa & dest_ok
                         row = dest_ok.select(dest, fx.Int32(0))
                     # Fold the row's byte offset into the base ptr; the per-token
@@ -729,9 +727,10 @@ def _build_kernel_w64(
                     # 3% of the way in, and the windows this writes live at the
                     # far end. The base address is 64-bit; the descriptor's own
                     # offset field is not.
-                    swa_base = fx.Int64(ptrtoint(swa_kv)) + fx.Int64(row) * fx.Int64(
-                        swa_pos_stride
-                    ) * fx.Int64(2)
+                    swa_base = (
+                        fx.Int64(ptrtoint(swa_kv))
+                        + fx.Int64(row) * fx.Int64(swa_pos_stride) * 2
+                    )
                     swa_out_part = _row_part_D(_bf16_row_view(swa_base, D, D * 2))
 
                 emit_body(
@@ -1062,9 +1061,7 @@ def _build_kernel_w32(
                             amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
                         )
                     )
-                    quant_scale = ((fx.Int32(254) - e8m0_biased) << 23).bitcast(
-                        fx.Float32
-                    )
+                    quant_scale = ((254 - e8m0_biased) << 23).bitcast(fx.Float32)
                     factor = rstd * quant_scale
                     scale_store = e8m0_biased.to(fx.Int8)
                 else:
@@ -1298,9 +1295,7 @@ def _build_kernel_w32(
                     # multiply, and let it reach the descriptor through the
                     # base address (`static_bytes_offset_i64`) rather than
                     # through the 32-bit offset field, whose window is 4 GiB.
-                    swa_off_bytes = (
-                        fx.Int64(row_safe) * fx.Int64(swa_pos_stride) * fx.Int64(2)
-                    )
+                    swa_off_bytes = fx.Int64(row_safe) * fx.Int64(swa_pos_stride) * 2
                     swa_g_tmp = GTensor(
                         swa_kv,
                         dtype=T.bf16,
@@ -1968,9 +1963,7 @@ def _build_kernel_w32_tdm(
                         dtype=fp8_mx_dtype,
                     )
                 )
-                factor = rstd_q * ((fx.Int32(254) - e8m0_biased) << 23).bitcast(
-                    fx.Float32
-                )
+                factor = rstd_q * ((254 - e8m0_biased) << 23).bitcast(fx.Float32)
                 scaled = xw * factor
                 scale_store = e8m0_biased.to(fx.Int8)
             elif const_expr(quant):
@@ -2214,7 +2207,7 @@ def _build_kernel_w32_tdm(
                     dtype=T.bf16,
                     shape=(D,),
                     static_bytes_offset_i64=(
-                        fx.Int64(row_safe) * fx.Int64(swa_pos_stride) * fx.Int64(2)
+                        fx.Int64(row_safe) * fx.Int64(swa_pos_stride) * 2
                     ),
                 ).rsrc
                 swa_row_base = fx.Int32(0)

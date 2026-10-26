@@ -11,6 +11,7 @@ from .kernels.tensor_shim import ptr_arg
 
 __all__ = [
     "flydsl_mla_decode_reduce",
+    "flydsl_mla_pagesize1_bf16_bf16",
     "flydsl_mla_pagesize1_fp8_fp8",
     "flydsl_mla_pagesize64_fp8_fp8",
 ]
@@ -59,6 +60,7 @@ def _validate_pagesize1_inputs(
     final_lse,
     max_seqlen_q,
     causal,
+    qkv_dtype,
 ):
     arch = str(get_rocm_arch() or "").split(":", 1)[0]
     _require_runtime(
@@ -79,13 +81,13 @@ def _validate_pagesize1_inputs(
         f"max_seqlen_q: expected one of [1, 2, 3, 4], got {max_seqlen_q}",
     )
     _require(
-        num_q_heads in (16,)
-        or num_q_heads > _PAGESIZE1_PACKED_Q_HEADS
-        or max_seqlen_q == 1,
-        f"q: {num_q_heads} heads only support max_seqlen_q=1",
+        num_q_heads > _PAGESIZE1_PACKED_Q_HEADS
+        or num_q_heads * max_seqlen_q <= 2 * _PAGESIZE1_PACKED_Q_HEADS,
+        f"q: {num_q_heads} heads support max_seqlen_q up to "
+        f"{min(4, 2 * _PAGESIZE1_PACKED_Q_HEADS // num_q_heads)}, got {max_seqlen_q}",
     )
-    _require_layout("q", q, torch.float8_e4m3fn, (total_q, num_q_heads, 576))
-    _require_layout("kv_buffer", kv_buffer, torch.float8_e4m3fn, (None, 1, 1, 576))
+    _require_layout("q", q, qkv_dtype, (total_q, num_q_heads, 576))
+    _require_layout("kv_buffer", kv_buffer, qkv_dtype, (None, 1, 1, 576))
     _require_layout("split_data", split_data, torch.float32, (None, num_q_heads, 512))
     _require_layout(
         "split_lse", split_lse, torch.float32, (split_data.size(0), num_q_heads)
@@ -96,8 +98,9 @@ def _validate_pagesize1_inputs(
     _require_layout("kv_page_indices", kv_page_indices, torch.int32)
     _require_layout("work_indptr", work_indptr, torch.int32)
     _require_layout("work_info", work_info, torch.int32, (None, 8))
-    for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
-        _require(scale is not None, f"{name}: expected a float32 scalar tensor")
+    if qkv_dtype == torch.float8_e4m3fn:
+        for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
+            _require(scale is not None, f"{name}: expected a float32 scalar tensor")
     # Only the work items the planner left un-split write here; the ones it did
     # split are the reduce's job. None means the caller wants no LSE at all.
     if final_lse is not None:
@@ -117,7 +120,10 @@ def _validate_pagesize1_inputs(
     )
 
 
-def flydsl_mla_pagesize1_fp8_fp8(
+def _run_pagesize1(
+    launch,
+    qkv_dtype,
+    qkv_type,
     split_data,
     split_lse,
     final_output,
@@ -127,18 +133,17 @@ def flydsl_mla_pagesize1_fp8_fp8(
     work_indptr,
     work_info,
     softmax_scale,
-    *,
     q_scale,
     kv_scale,
-    final_lse=None,
-    max_seqlen_q=1,
-    causal=False,
-    qo_indptr=None,
-    kv_indptr=None,
-    g_kv_indptr=None,
-    cp_world_size=1,
-    cp_rank=0,
-    stream=None,
+    final_lse,
+    max_seqlen_q,
+    causal,
+    qo_indptr,
+    kv_indptr,
+    g_kv_indptr,
+    cp_world_size,
+    cp_rank,
+    stream,
 ):
     (
         num_cus,
@@ -163,6 +168,7 @@ def flydsl_mla_pagesize1_fp8_fp8(
         final_lse,
         max_seqlen_q,
         causal,
+        qkv_dtype,
     )
     cp_world_size = int(cp_world_size)
     cp_rank = int(cp_rank)
@@ -191,13 +197,19 @@ def flydsl_mla_pagesize1_fp8_fp8(
             if final_lse is None
             else ptr_arg(final_lse, fx.Float32)
         ),
-        ptr_arg(q, fx.Int8),
-        ptr_arg(kv_buffer, fx.Int8),
+        ptr_arg(q, qkv_type),
+        ptr_arg(kv_buffer, qkv_type),
         ptr_arg(kv_page_indices, fx.Int32),
         ptr_arg(work_indptr, fx.Int32),
         ptr_arg(work_info, fx.Int32),
-        ptr_arg(q_scale, fx.Float32),
-        ptr_arg(kv_scale, fx.Float32),
+        *(
+            (
+                flyc.from_c_void_p(fx.Float32, 0)
+                if scale is None
+                else ptr_arg(scale, fx.Float32)
+            )
+            for scale in (q_scale, kv_scale)
+        ),
         softmax_scale,
         kv_buffer.size(0),
         kv_page_indices.numel(),
@@ -219,12 +231,7 @@ def flydsl_mla_pagesize1_fp8_fp8(
         cp_world_size if cp_round_robin else 1,
         cp_rank if cp_round_robin else 0,
     )
-
-    from .kernels.mla_gfx1250.mla_pagesize1_fp8_fp8 import (
-        launch_mla_pagesize1_fp8_fp8,
-    )
-
-    launch_mla_pagesize1_fp8_fp8(
+    launch(
         *buffers,
         num_q_heads,
         max_seqlen_q,
@@ -234,6 +241,113 @@ def flydsl_mla_pagesize1_fp8_fp8(
         num_cus,
         lds_size,
         stream=stream,
+    )
+
+
+def flydsl_mla_pagesize1_fp8_fp8(
+    split_data,
+    split_lse,
+    final_output,
+    q,
+    kv_buffer,
+    kv_page_indices,
+    work_indptr,
+    work_info,
+    softmax_scale,
+    *,
+    q_scale,
+    kv_scale,
+    final_lse=None,
+    max_seqlen_q=1,
+    causal=False,
+    qo_indptr=None,
+    kv_indptr=None,
+    g_kv_indptr=None,
+    cp_world_size=1,
+    cp_rank=0,
+    stream=None,
+):
+    from .kernels.mla_gfx1250.mla_pagesize1_fp8_fp8 import (
+        launch_mla_pagesize1_fp8_fp8,
+    )
+
+    _run_pagesize1(
+        launch_mla_pagesize1_fp8_fp8,
+        torch.float8_e4m3fn,
+        fx.Int8,
+        split_data,
+        split_lse,
+        final_output,
+        q,
+        kv_buffer,
+        kv_page_indices,
+        work_indptr,
+        work_info,
+        softmax_scale,
+        q_scale,
+        kv_scale,
+        final_lse,
+        max_seqlen_q,
+        causal,
+        qo_indptr,
+        kv_indptr,
+        g_kv_indptr,
+        cp_world_size,
+        cp_rank,
+        stream,
+    )
+
+
+def flydsl_mla_pagesize1_bf16_bf16(
+    split_data,
+    split_lse,
+    final_output,
+    q,
+    kv_buffer,
+    kv_page_indices,
+    work_indptr,
+    work_info,
+    softmax_scale,
+    *,
+    final_lse=None,
+    max_seqlen_q=1,
+    causal=False,
+    qo_indptr=None,
+    kv_indptr=None,
+    g_kv_indptr=None,
+    cp_world_size=1,
+    cp_rank=0,
+    stream=None,
+):
+    """BF16 Q/KV form of :func:`flydsl_mla_pagesize1_fp8_fp8`; no scales."""
+    from .kernels.mla_gfx1250.mla_pagesize1_bf16_bf16 import (
+        launch_mla_pagesize1_bf16_bf16,
+    )
+
+    _run_pagesize1(
+        launch_mla_pagesize1_bf16_bf16,
+        torch.bfloat16,
+        fx.BFloat16,
+        split_data,
+        split_lse,
+        final_output,
+        q,
+        kv_buffer,
+        kv_page_indices,
+        work_indptr,
+        work_info,
+        softmax_scale,
+        None,
+        None,
+        final_lse,
+        max_seqlen_q,
+        causal,
+        qo_indptr,
+        kv_indptr,
+        g_kv_indptr,
+        cp_world_size,
+        cp_rank,
+        stream,
     )
 
 

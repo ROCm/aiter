@@ -112,8 +112,8 @@ def ref_compute(
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
     if use_rope:
-        q_input = torch.empty(B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype).to(
-            device
+        q_input = torch.empty(
+            B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype, device=device
         )
         q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
 
@@ -189,8 +189,8 @@ def ref_compute_full_fwd(
 
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
-    q_input = torch.empty(B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype).to(
-        device
+    q_input = torch.empty(
+        B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype, device=device
     )
     q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
 

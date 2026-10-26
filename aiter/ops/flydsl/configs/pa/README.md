@@ -8,7 +8,8 @@ aiter/ops/flydsl/configs/pa/<arch>/_pa_decode_autotuner.json
 ```
 
 For example, MI300/MI308 results use `gfx942/` and MI350/MI355 results use
-`gfx950/`. FlyDSL creates the directory and JSON file when tuning saves a result.
+`gfx950/`, and gfx1250 results use `gfx1250/`. FlyDSL creates the directory and
+JSON file when tuning saves a result.
 Preparing a plan without a cached result uses the `2*CU` default and does not
 create a file.
 
@@ -30,6 +31,9 @@ below. Each invocation searches the requested shape and retains cached results
 for other shapes. `--context-length` accepts one length for all batch rows or one
 length per row; lengths include query tokens. Use `--kv-dtype bf16` for unscaled
 BF16 K/V and `--help` for all shape, layout, window, sink, and device options.
+Both FP8 and native BF16 are supported on gfx942, gfx950, and gfx1250. The
+Python API infers compute type from the KV cache dtype when it is omitted.
+A non-transposed 4D key cache is not implemented.
 
 Python callers can import `prepare_pa_decode_plan` from
 `aiter.ops.flydsl.pa_decode_tuning` (or `aiter.ops.flydsl`) and pass their actual
