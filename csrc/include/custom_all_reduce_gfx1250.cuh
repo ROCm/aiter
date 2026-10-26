@@ -258,13 +258,15 @@ DINLINE void ll_load_b128(
 // (waiting on the flag), sums them with its own sendbuff (fp32 accumulation),
 // and writes recvbuff. Self is read directly from sendbuff.
 //
-// Graph-safe device epoch: each block owns a persistent device flag
-// block_flags[blockIdx.x] that the kernel itself bumps (mirrors Signal::_flag).
-// A packet is always published+consumed by the same (blockIdx, threadIdx) on
-// every rank, so only the *same block across ranks* must agree on the flag; each
-// block runs once per launch, keeping per-block flags in lockstep. Scratch is
-// double-buffered (bank = epoch & 1); the per-epoch flag disambiguates stale
-// lines, so no clearing is needed and it survives CUDA-graph replay.
+// Graph-safe device epoch: a persistent device array block_flags[kMaxBlocks]
+// that the kernel itself bumps (mirrors Signal::_flag). The grid size and block
+// size follow the message size, so the block that owns a packet changes between
+// calls of different sizes. Every launch therefore writes its epoch to all
+// kMaxBlocks entries, including those of blocks it did not launch, so all
+// blocks always start the next call on one shared epoch. Scratch is
+// double-buffered (bank = epoch & 1) with a fixed per-rank slot stride; the
+// per-epoch flag disambiguates stale lines, so no clearing is needed and it
+// survives CUDA-graph replay.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
     T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
@@ -272,7 +274,7 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
     const T* __restrict__ sendbuff,
     size_t nPk,          // number of 8-byte packets = bytes / 8
     int rank,
-    uint32_t* __restrict__ block_flags) // device array[gridDim.x], persisted
+    uint32_t* __restrict__ block_flags) // device array[kMaxBlocks], persisted
 {
     constexpr int LP = 8 / sizeof(T); // elements per 8-byte payload
     using PL         = typename opus::vector_t<T, LP>;
@@ -284,7 +286,7 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
     {
         uint32_t f = block_flags[blockIdx.x] + 1u;
         if(f == 0u)
-            f = 1u; // flag is never 0 (0 == cleared scratch)
+            f = 2u; // flag is never 0 (0 == cleared scratch); keep bank parity
         s_flag = f;
     }
     __syncthreads();
@@ -348,8 +350,11 @@ __global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
         reinterpret_cast<PL*>(recvbuff)[pk] = ov;
     }
 
-    if(threadIdx.x == 0)
-        block_flags[blockIdx.x] = flag;
+    // Entry blockIdx.x + k * gridDim.x is written by thread k, so the epoch
+    // fan-out costs one store per thread even for a single-block launch.
+    for(int e = blockIdx.x + threadIdx.x * gridDim.x; e < kMaxBlocks;
+        e += gridDim.x * blockDim.x)
+        block_flags[e] = flag;
 }
 
 // ---------------------------------------------------------------------------

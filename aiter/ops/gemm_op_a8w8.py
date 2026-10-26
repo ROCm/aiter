@@ -1193,6 +1193,19 @@ def gemm_a8w8_blockscale_bpreshuffle(
     else:
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
+    if (
+        x_scale.dtype == dtypes.fp8_e8m0
+        and w_scale.dtype == dtypes.fp8_e8m0
+        and tuple(x_scale.shape) == (m, k // 32)
+    ):
+        # group32 (1x32 row-major x_scale): the flydsl batched GEMM at B = 1
+        # when the running arch has a kernel for this w_scale block; flydsl
+        # picks it.
+        from .flydsl.batched_gemm_a8w8 import bmm_a8w8_mxfp8_supported
+
+        if bmm_a8w8_mxfp8_supported(mxscale_w_scale_block(tuple(w_scale.shape), n, k)):
+            return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y)
+
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         get_gfx() in ("gfx1250", "gfx1250-strict")
         and x_scale.dtype == dtypes.fp8_e8m0

@@ -26,6 +26,7 @@ def topk_gating_fwd(
     routed_scaling_factor: float = 1.0,
     score_func: str = "sqrtsoftplus",
     num_shared_experts: int = 0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -162,6 +163,7 @@ def topk_gating(
     routed_scaling_factor: float = 1.0,
     score_func: str = "sqrtsoftplus",
     num_shared_experts: int = 0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None:
     """Unified fused topk gating for MoE routing.
 
@@ -178,6 +180,11 @@ def topk_gating(
             topk_weights must be wide enough for those columns, and it must
             share its row stride with topk_indices. Shared-expert ids are not
             written; the caller prefills them.
+        num_valid_rows: optional int32 device tensor whose first element is
+            the count of real rows. Rows at or past it are padding: their
+            routed ids are written -1 (which expert-parallel dispatch skips)
+            and their weights 0; shared columns are written as for any row.
+            Read on device, so a replayed CUDA graph follows each step's count.
     """
     assert (
         score_func in _VALID_SCORE_FUNCS
@@ -196,7 +203,8 @@ def topk_gating(
             f"correction_bias dtype {correction_bias.dtype} is not supported for "
             f"{gating_output.dtype} gating_output, expected one of {valid}"
         )
-    if _use_flydsl_herd(
+    # The HERD kernels take no pad-row count.
+    if num_valid_rows is None and _use_flydsl_herd(
         topk_weights, topk_indices, gating_output, correction_bias, score_func
     ):
         from .flydsl.herd_topk import herd_topk_gating
@@ -220,6 +228,7 @@ def topk_gating(
         routed_scaling_factor,
         score_func,
         num_shared_experts,
+        num_valid_rows,
     )
 
 
@@ -238,6 +247,7 @@ def biased_grouped_topk_hip(
     topk_grp: int,
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -251,6 +261,7 @@ def grouped_topk(
     need_renorm: bool,
     is_softmax: bool = True,
     routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -264,6 +275,7 @@ def gen_moe_fused_gate_fake_tensor(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output = torch.empty_like(
         topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
@@ -285,6 +297,7 @@ def _moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -298,6 +311,7 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # C side fills topk_weights / topk_ids in place and returns void; return the
     # (aliased) tensors to preserve the original API.
@@ -311,6 +325,7 @@ def moe_fused_gate(
         topk,
         n_share_experts_fusion,
         routed_scaling_factor,
+        num_valid_rows,
     )
     return topk_weights, topk_ids
 
@@ -324,11 +339,14 @@ def biased_grouped_topk(
     topk_group: int,
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
+    num_valid_rows: torch.Tensor | None = None,  # see topk_gating
 ):
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
+    # The HERD and gfx1250 kernels take no pad-row count.
     if (
-        num_expert_group == 1
+        num_valid_rows is None
+        and num_expert_group == 1
         and topk_group == 1
         and _use_flydsl_herd(
             topk_weights,
@@ -351,7 +369,8 @@ def biased_grouped_topk(
         )
         return
     if (
-        num_expert_group == 1
+        num_valid_rows is None
+        and num_expert_group == 1
         and topk_group == 1
         and _can_use_gfx1250_exact_sigmoid_topk(
             gating_output,
@@ -379,6 +398,7 @@ def biased_grouped_topk(
             topk_group,
             need_renorm,
             routed_scaling_factor,
+            num_valid_rows,
         )
     else:
         topk = topk_ids.shape[1]
@@ -393,6 +413,7 @@ def biased_grouped_topk(
             topk,
             n_share_experts_fusion=0,
             routed_scaling_factor=routed_scaling_factor,
+            num_valid_rows=num_valid_rows,
         )
 
 

@@ -15,6 +15,7 @@
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
 #include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include <hip/hip_bf16.h>
 #include "rocprim/rocprim.hpp"
 
@@ -619,7 +620,7 @@ __global__ void act_and_mul_quant_kernel(
         }
     }
 
-    float thread_max = 1e-10f;
+    float thread_max = aiter::kAmaxFloor;
 #pragma unroll
     for(int i = 0; i < VEC_SIZE_I; i += 2)
     {
