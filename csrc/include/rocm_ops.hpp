@@ -1527,7 +1527,8 @@ namespace py = pybind11;
           py::arg("moe_buf"),                          \
           py::arg("activation_quant"),                 \
           py::arg("activation_scale_token"),           \
-          py::arg("num_experts"));
+          py::arg("num_experts"),                      \
+          py::arg("num_local_tokens") = std::nullopt);
 
 #define MLA_V4_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_gfx950_opus_fwd",      \
