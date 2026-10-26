@@ -299,6 +299,30 @@ def test_layernorm_rejects_mismatched_shapes():
         fused_layernorm_indexed_adaln(x, shift, scale, indices, bias=weight[:-1])
 
 
+def test_rejects_column_strided_table():
+    """Only the row stride reaches the kernel, so a column-strided table would
+    take the wrong elements. A row-strided view still has to work: that is one
+    chunk of a packed table, which is how a DiT holds its modulation."""
+    dev = "cuda"
+    N = 256
+    x, weight, shift, scale, indices, _ = make(32, N, 3, torch.bfloat16, dev)
+    packed = torch.cat([shift, scale], dim=1)
+
+    strided_shift, strided_scale = packed[:, ::2], packed[:, 1::2]
+    assert strided_shift.shape == shift.shape and strided_shift.stride(1) == 2
+    with pytest.raises(AssertionError):
+        fused_rmsnorm_indexed_adaln(x, weight, strided_shift, strided_scale, indices)
+    with pytest.raises(AssertionError):
+        fused_layernorm_indexed_adaln(x, strided_shift, strided_scale, indices)
+
+    # The two chunks of that table: row stride 2N, columns still adjacent.
+    chunk_shift, chunk_scale = packed[:, :N], packed[:, N:]
+    assert chunk_shift.stride(0) == 2 * N and chunk_shift.stride(1) == 1
+    got = fused_layernorm_indexed_adaln(x, chunk_shift, chunk_scale, indices, eps=1e-6)
+    want = layernorm_reference(x, None, None, shift, scale, indices, 1e-6)
+    torch.testing.assert_close(got.float(), want.float(), atol=3e-2, rtol=3e-2)
+
+
 def test_rejects_strided_affine():
     """A strided view has the right shape, but the kernel reads it with the
     column offset alone, so it would take the wrong elements."""

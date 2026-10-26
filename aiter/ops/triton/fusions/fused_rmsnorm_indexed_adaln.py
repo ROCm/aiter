@@ -124,6 +124,11 @@ def _indexed_adaln(
     assert (
         shift.ndim == 2 and shift.shape[1] == N
     ), f"modulation table must be [G, {N}], got {tuple(shift.shape)}"
+    # Only the row stride reaches the kernel, so the columns must be adjacent.
+    # A row-strided view, such as one chunk of a packed table, is fine.
+    assert N == 1 or (
+        shift.stride(1) == 1 and scale.stride(1) == 1
+    ), "shift and scale must have unit column stride"
     assert indices.shape == (M,), f"indices must be [{M}], got {tuple(indices.shape)}"
     assert x.is_contiguous(), "x must be contiguous"
     assert indices.is_contiguous(), "indices must be contiguous"
