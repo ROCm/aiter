@@ -606,7 +606,10 @@ __global__ void __launch_bounds__(64) kpool_insert_kernel(
 
 constexpr int DEC_LANES = 64;
 constexpr int DEC_DPL = HEAD_DIM / DEC_LANES;  // 2 dims = one dword per lane per row
-constexpr int DEC_BLOCK_WAVES = 4;             // requests per workgroup in the standalone decode kernel
+#ifndef KPOOL_DEC_BLOCK_WAVES
+#define KPOOL_DEC_BLOCK_WAVES 4
+#endif
+constexpr int DEC_BLOCK_WAVES = KPOOL_DEC_BLOCK_WAVES;  // requests per workgroup in the standalone decode kernel
 
 struct DecodeArgs {
   const uint16_t* key;       // [B, next_n, 128] bf16
@@ -618,6 +621,43 @@ struct DecodeArgs {
   int next_n;
   int num_requests;
 };
+
+// All decode kernel arguments in one 128 B, 16 B aligned block: two
+// s_load_dwordx16 fetch everything (the compiler splits a long parameter list
+// into many misaligned s_loads).
+struct __attribute__((aligned(16))) DecodeKArgs {
+  const uint16_t* key;       // [B, next_n, 128] bf16
+  const uint16_t* score;     // [B, next_n, 128] bf16
+  const int32_t* tail_slot;  // [B, next_n]
+  const int32_t* slot_map;   // [B, next_n]
+  const int32_t* positions;  // [B, next_n]
+  const float* ape;          // [POOL, 128] fp32, contiguous
+  uint16_t* tail;            // [num_blocks, 2, ring, 128] bf16
+  uint8_t* cache;            // [num_blocks, page, 132] u8
+  int key_sb, key_st, ss_sb, ss_st;  // strides in elements (checked to fit int32)
+  int next_n, num_requests;
+  int block_elems, head_elems;       // tail strides (elements; the tail has < 2^31 elements)
+  int ring_mask, ring_shift;         // ring - 1, log2(ring)
+  int page_size, page_shift;         // page_shift = log2(page_size) or -1
+  uint32_t page_bytes;               // page_size * 132
+  int flags;                         // bit1: preshuffle, bit2: round_scale
+  int pad0, pad1;
+};
+static_assert(sizeof(DecodeKArgs) == 128, "two s_load_dwordx16");
+
+__host__ __device__ __forceinline__ DecodeKArgs make_kargs(const DecodeArgs& da, const float* ape, TailArgs ta,
+                                                           uint8_t* cache, int page_size, int page_shift,
+                                                           uint32_t page_bytes, int flags) {
+  DecodeKArgs k;
+  k.key = da.key; k.score = da.score; k.tail_slot = da.tail_slot; k.slot_map = da.slot_map;
+  k.positions = da.positions; k.ape = ape; k.tail = ta.tail; k.cache = cache;
+  k.key_sb = da.key_sb; k.key_st = da.key_st; k.ss_sb = da.ss_sb; k.ss_st = da.ss_st;
+  k.next_n = da.next_n; k.num_requests = da.num_requests;
+  k.block_elems = ta.block_elems; k.head_elems = ta.head_elems; k.ring_mask = ta.ring_mask; k.ring_shift = ta.ring_shift;
+  k.page_size = page_size; k.page_shift = page_shift; k.page_bytes = page_bytes; k.flags = flags;
+  k.pad0 = k.pad1 = 0;
+  return k;
+}
 
 // Empty asm that requires x in SGPRs: forces a wave-uniform value to be
 // materialized there (kernargs: fetched before this point; derived pointers:
@@ -687,27 +727,19 @@ __device__ __forceinline__ auto vpick(const V& v, int idx) {
 template <int POOL, int NMAX, bool VEC>
 __device__ __forceinline__ void decode_request(
     int req,  // wave-uniform
-    const DecodeArgs& da,
-    const float* __restrict__ ape,
-    int ape_stride,
-    TailArgs ta,
-    uint8_t* __restrict__ cache,
-    int page_size,
-    int page_shift,
-    uint32_t page_bytes,
-    int flags,  // bit1: preshuffle, bit2: round_scale
+    const DecodeKArgs& d,
     int sub,    // lane, 0..63
     bool valid = true) {  // wave-uniform; false = padding wave (loads only, no stores)
   typedef typename Vec<NMAX>::i ivec;
   typedef typename Vec<NMAX>::u uvec;
-  // Every kernarg is consumed here, so the compiler fetches them all in one
-  // SMEM batch (one wait) instead of one lazy batch + wait per first use.
-  const DecodeArgs d = da;
   const gptr<const int32_t> m_ts = (gptr<const int32_t>)d.tail_slot, m_loc = (gptr<const int32_t>)d.slot_map,
                             m_pos = (gptr<const int32_t>)d.positions;
-  const gptr<const float> ape_g = (gptr<const float>)ape;
-  const gptr<uint16_t> tail = (gptr<uint16_t>)ta.tail;
-  const gptr<uint8_t> cache_g = (gptr<uint8_t>)cache;
+  const gptr<const float> ape_g = (gptr<const float>)d.ape;
+  const gptr<uint16_t> tail = (gptr<uint16_t>)d.tail;
+  const gptr<uint8_t> cache_g = (gptr<uint8_t>)d.cache;
+  const TailArgs ta{d.tail, d.block_elems, d.head_elems, d.ring_mask, d.ring_shift};
+  const int page_size = d.page_size, page_shift = d.page_shift, flags = d.flags;
+  const uint32_t page_bytes = d.page_bytes;
   const bool preshuffle = (flags & 2) != 0, round_scale = (flags & 4) != 0;
   const int n = d.next_n;  // 1 <= n <= NMAX
   __builtin_assume(n >= 1 && n <= NMAX);
@@ -723,7 +755,7 @@ __device__ __forceinline__ void decode_request(
   // fetches all kernargs in one SMEM batch with one wait, instead of one lazy
   // batch and one wait per first use along the chain.
   asm("" : "+s"(kb), "+s"(sb)
-         : "s"(m_ts), "s"(m_loc), "s"(m_pos), "s"(ape_g), "s"(ape_stride), "s"(tail), "s"(ta.block_elems),
+         : "s"(m_ts), "s"(m_loc), "s"(m_pos), "s"(ape_g), "s"(tail), "s"(ta.block_elems),
            "s"(ta.head_elems), "s"(ta.ring_mask), "s"(ta.ring_shift), "s"(cache_g), "s"(page_size), "s"(page_shift),
            "s"(page_bytes), "s"(flags), "s"(d.key_st), "s"(d.ss_st));
   const gptr<const uint16_t> kbase = (gptr<const uint16_t>)kb;
@@ -747,7 +779,7 @@ __device__ __forceinline__ void decode_request(
   // stays a 32-bit saddr offset.
   float apev[POOL][DEC_DPL];
   auto load_ape = [&]() {
-    (void)ape_stride;  // == HEAD_DIM (ape contiguous, checked by the entry point): immediate row offsets
+    // ape is contiguous (checked by the entry point): row s at s * HEAD_DIM, immediate offsets
 #pragma unroll
     for (int s = 0; s < POOL; ++s) {
       const f32x2 a = ((gptr<const f32x2>)(ape_g + s * HEAD_DIM))[(uint32_t)sub];
@@ -900,26 +932,16 @@ __device__ __forceinline__ void decode_request(
 
 
 template <int POOL, int NMAX, bool VEC>
-__global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) kpool_decode_kernel(
-    DecodeArgs da,
-    const float* __restrict__ ape,
-    int ape_stride,
-    TailArgs ta,
-    uint8_t* __restrict__ cache,
-    int page_size,
-    int page_shift,
-    uint32_t page_bytes,
-    int flags) {  // bit1: preshuffle, bit2: round_scale
+__global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) kpool_decode_kernel(DecodeKArgs d) {
   const int lane = threadIdx.x & 63;
   const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
   // No early return: the padding waves of the last workgroup clamp to the
   // last request (its loads are in bounds) and store nothing, so every
   // kernarg is fetched in one SMEM batch instead of num_requests first.
   const int req_raw = blockIdx.x * DEC_BLOCK_WAVES + wave;
-  const bool valid = req_raw < da.num_requests;
-  const int req = valid ? req_raw : da.num_requests - 1;
-  decode_request<POOL, NMAX, VEC>(req, da, ape, ape_stride, ta, cache, page_size, page_shift, page_bytes, flags,
-                                  lane, valid);
+  const bool valid = req_raw < d.num_requests;
+  const int req = valid ? req_raw : d.num_requests - 1;
+  decode_request<POOL, NMAX, VEC>(req, d, lane, valid);
 }
 
 // ===========================================================================
@@ -950,8 +972,8 @@ __global__ void __launch_bounds__(64) kpool_mixed_kernel(
   const int lane = threadIdx.x;
   const int n_dec = da.num_requests;
   if ((int)blockIdx.x < n_dec) {
-    decode_request<POOL, NMAX, VEC>(blockIdx.x, da, ape, (int)ape_stride, ta, cache, page_size, page_shift,
-                                    (uint32_t)page_bytes, flags & 6, lane);
+    const DecodeKArgs d = make_kargs(da, ape, ta, cache, page_size, page_shift, (uint32_t)page_bytes, flags & 6);
+    decode_request<POOL, NMAX, VEC>(blockIdx.x, d, lane);
   } else {
     constexpr int GROUPS_PER_WAVE = 64 / LANES;
     const int grp = GROUPS_PER_WAVE == 1 ? 0 : lane / LANES;
@@ -1023,14 +1045,13 @@ int launch_decode_n(bool vec, const DecodeArgs& da, const void* ape, int64_t ape
                     int page_size, int64_t page_bytes, int flags, hipStream_t stream) {
   const int grid = (da.num_requests + DEC_BLOCK_WAVES - 1) / DEC_BLOCK_WAVES;
   if (grid == 0) return 0;
+  (void)ape_stride;  // == HEAD_DIM, checked by the entry point
+  const DecodeKArgs d = make_kargs(da, (const float*)ape, ta, (uint8_t*)cache, page_size, page_shift_of(page_size),
+                                   (uint32_t)page_bytes, flags);
   if (vec)
-    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, true>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream,
-                       da, (const float*)ape, (int)ape_stride, ta, (uint8_t*)cache, page_size,
-                       page_shift_of(page_size), (uint32_t)page_bytes, flags);
+    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, true>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream, d);
   else
-    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, false>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream,
-                       da, (const float*)ape, (int)ape_stride, ta, (uint8_t*)cache, page_size,
-                       page_shift_of(page_size), (uint32_t)page_bytes, flags);
+    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, false>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream, d);
   return (int)hipGetLastError();
 }
 
