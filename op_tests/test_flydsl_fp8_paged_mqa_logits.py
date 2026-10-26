@@ -3,15 +3,18 @@
 
 """FlyDSL paged FP8 MQA logits (decode) vs a torch reference.
 
-The kernel is the gfx950 H=32 / D=128 / KVB=64 preshuffled path the indexer
-calls: compact Q ``[B, next_n, 32, 128]``, preallocated ``out_logits``, optional
-``next_n_lens``. Torch is the reference only (not timed). Gluon is a candidate
-on the uniform compact path.
+The kernel is the H=32 / D=128 preshuffled path the indexer calls: compact Q
+``[B, next_n, 32, 128]``, preallocated ``out_logits``, optional ``next_n_lens``.
+gfx950 runs KVB=64; gfx1250 also runs the 8- and 16-token pages DeepSeek-V4.1's
+FP8 index cache uses (``--kv-block-size``). Torch is the reference only (not
+timed). Gluon is a candidate on the uniform compact path where it supports the
+page size.
 
 Shape mapping (decode indexer):
 - ``batch`` / ``nq`` = sequences
 - ``next_n`` = MTP rows per sequence (compact ``Q.shape[1]`` / ragged pad)
-- ``kv_len`` = tokens per sequence (multiple of kvb=64 preferred)
+- ``kv_len`` = tokens per sequence (multiple of kvb preferred)
+- ``kv_block_size`` = tokens per KV page
 
 ``test_fp8_paged_mqa_logits_probe1079`` is the production decode contract from
 the probe_1079 bs64 histogram: 44362-block KV pool, scattered 8 KiB pages,
@@ -38,10 +41,12 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx950"]
+SUPPORTED_GFX = ["gfx950", "gfx1250"]
 HEADS = 32
 HEAD_DIM = 128
 KV_BLOCK_SIZE = 64
+# Page sizes each arch's kernel runs; gfx1250's 8 is DeepSeek-V4.1's FP8 index page.
+ARCH_KV_BLOCK_SIZES = {"gfx950": [64], "gfx1250": [8, 16, 64]}
 INDEX_DIM = HEAD_DIM + 4
 MAX_NN = 8
 WIDE_MAX_MODEL_LEN = 1 << 20
@@ -92,14 +97,17 @@ def preshuffle_kv_data(kv_cache_fp8, head_dim):
     from aiter.ops.shuffle import shuffle_weight
 
     num_blocks, block_size, one, index_dim = kv_cache_fp8.shape
-    assert block_size % 16 == 0, "preshuffle requires KVBlockSize % 16 == 0"
+    assert (
+        block_size % 16 == 0 or block_size == 8
+    ), "preshuffle requires KVBlockSize % 16 == 0 or KVBlockSize == 8"
     flat = kv_cache_fp8.reshape(num_blocks, block_size * index_dim).clone()
     data = (
         flat[:, : block_size * head_dim]
         .contiguous()
         .view(num_blocks, block_size, head_dim)
     )
-    shuffled = shuffle_weight(data, layout=(16, 16)).reshape(
+    # An 8-token page is shuffled in groups of its own length.
+    shuffled = shuffle_weight(data, layout=(min(block_size, 16), 16)).reshape(
         num_blocks, block_size * head_dim
     )
     flat[:, : block_size * head_dim] = shuffled
@@ -381,6 +389,13 @@ def live_row_mask(next_n_lens, max_nn, max_model_len):
     return live.reshape(batch * max_nn, 1).expand(-1, max_model_len)
 
 
+def _gluon_runs(block_size):
+    """Whether the Gluon candidate supports this page size here."""
+    if deepgemm_fp8_paged_mqa_logits is None:
+        return False
+    return not (get_gfx() == "gfx1250" and block_size < 16)
+
+
 def _split_arg(split_kv):
     return None if int(split_kv) <= 0 else int(split_kv)
 
@@ -430,10 +445,12 @@ def _time_candidates(candidates, ref, flops, nbytes, msg):
 
 
 @benchmark()
-def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype):
+def test_fp8_paged_mqa_logits(
+    batch, next_n, kv_len, split_kv, dtype, kv_block_size=KV_BLOCK_SIZE
+):
     q_dtype = _Q_DTYPE[dtype]
     inp = _build_inputs(
-        batch, next_n, HEADS, HEAD_DIM, kv_len, q_dtype, block_size=KV_BLOCK_SIZE
+        batch, next_n, HEADS, HEAD_DIM, kv_len, q_dtype, block_size=kv_block_size
     )
     kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
     ref = run_torch(
@@ -444,7 +461,7 @@ def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype):
         inp.block_tables,
         inp.max_model_len,
         inp.fp8_dtype,
-        block_size=KV_BLOCK_SIZE,
+        block_size=kv_block_size,
     )
     split = _split_arg(split_kv)
 
@@ -459,14 +476,14 @@ def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype):
             inp.block_tables,
             inp.max_model_len,
             Preshuffle=True,
-            KVBlockSize=KV_BLOCK_SIZE,
+            KVBlockSize=kv_block_size,
             SplitKV=split,
         )
 
     candidates = {"flydsl": (flydsl, out)}
     # Gluon is a real kernel under test, not the torch reference. It only
     # accepts a launch-wide next_n = Q.shape[1], so it is compact-only.
-    if deepgemm_fp8_paged_mqa_logits is not None:
+    if _gluon_runs(kv_block_size):
         out_g = out.clone()
 
         def gluon():
@@ -481,7 +498,7 @@ def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype):
                 inp.max_model_len,
                 ChunkK=256,
                 Preshuffle=True,
-                KVBlockSize=KV_BLOCK_SIZE,
+                KVBlockSize=kv_block_size,
                 WavePerEU=2,
             )
 
@@ -556,9 +573,11 @@ def test_fp8_paged_mqa_logits_probe1079(nq, next_n, kv_len, dtype):
 
 
 @benchmark()
-def test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv):
+def test_fp8_paged_mqa_logits_ragged(
+    batch, next_n, kv_len, split_kv, kv_block_size=KV_BLOCK_SIZE
+):
     inp = _build_inputs(
-        batch, next_n, HEADS, HEAD_DIM, kv_len, _E4M3_NATIVE, block_size=KV_BLOCK_SIZE
+        batch, next_n, HEADS, HEAD_DIM, kv_len, _E4M3_NATIVE, block_size=kv_block_size
     )
     kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
     next_n_lens = sample_next_n_lens(batch, next_n).cuda()
@@ -572,7 +591,7 @@ def test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv):
         inp.max_model_len,
         inp.fp8_dtype,
         max_nn=next_n,
-        block_size=KV_BLOCK_SIZE,
+        block_size=kv_block_size,
     )
     split = _split_arg(split_kv)
     live = int(next_n_lens.sum().item())
@@ -589,7 +608,7 @@ def test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv):
             inp.max_model_len,
             next_n_lens=next_n_lens,
             Preshuffle=True,
-            KVBlockSize=KV_BLOCK_SIZE,
+            KVBlockSize=kv_block_size,
             SplitKV=split,
         )
 
@@ -614,11 +633,11 @@ def test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv):
 
 
 @benchmark()
-def test_fp8_paged_mqa_logits_wide_out(batch, kv_len):
+def test_fp8_paged_mqa_logits_wide_out(batch, kv_len, kv_block_size=KV_BLOCK_SIZE):
     """Padded output row 512 crosses the signed i32 byte-offset boundary."""
     next_n = MAX_NN
     inp = _build_inputs(
-        batch, next_n, HEADS, HEAD_DIM, kv_len, _E4M3_NATIVE, block_size=KV_BLOCK_SIZE
+        batch, next_n, HEADS, HEAD_DIM, kv_len, _E4M3_NATIVE, block_size=kv_block_size
     )
     kv_cache_kernel, _compact = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
     next_n_lens = torch.ones(batch, dtype=torch.int32, device="cuda")
@@ -637,7 +656,7 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len):
         inp.max_model_len,
         inp.fp8_dtype,
         max_nn=next_n,
-        block_size=KV_BLOCK_SIZE,
+        block_size=kv_block_size,
     )
     split = 1
 
@@ -655,7 +674,7 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len):
             WIDE_MAX_MODEL_LEN,
             next_n_lens=next_n_lens,
             Preshuffle=True,
-            KVBlockSize=KV_BLOCK_SIZE,
+            KVBlockSize=kv_block_size,
             SplitKV=split,
         )
         return scored
@@ -665,6 +684,56 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len):
     )
     return _time_candidates(
         {"flydsl": (flydsl, scored)}, ref, flops, nbytes, "paged wide_out"
+    )
+
+
+@benchmark()
+def test_fp8_paged_mqa_logits_big_cache(batch, kv_len, kv_block_size):
+    """A KV pool past 2 GiB: pages scattered over it need 64-bit cache offsets."""
+    page_bytes = kv_block_size * INDEX_DIM
+    pool_blocks = (5 << 30) // (2 * page_bytes)  # ~2.5 GiB of FP8 pages
+    inp = _build_inputs(
+        batch,
+        1,
+        HEADS,
+        HEAD_DIM,
+        kv_len,
+        _E4M3_NATIVE,
+        block_size=kv_block_size,
+        pool_blocks=pool_blocks,
+    )
+    assert inp.kv_cache_fp8.numel() > (1 << 31)
+    kv_cache_kernel, out = _kernel_inputs(inp, batch, 1, HEAD_DIM)
+    ref = run_torch(
+        inp.q,
+        inp.kv_cache_fp8,
+        inp.weights,
+        inp.context_lens,
+        inp.block_tables,
+        inp.max_model_len,
+        inp.fp8_dtype,
+        block_size=kv_block_size,
+    )
+
+    def flydsl():
+        out.fill_(float("-inf"))
+        return flydsl_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            kv_cache_kernel,
+            inp.weights,
+            out,
+            inp.context_lens,
+            inp.block_tables,
+            inp.max_model_len,
+            Preshuffle=True,
+            KVBlockSize=kv_block_size,
+        )
+
+    flops, nbytes = _roofline(
+        batch, 1, kv_len, inp.context_lens, inp.q_fp8, inp.weights, out
+    )
+    return _time_candidates(
+        {"flydsl": (flydsl, out)}, ref, flops, nbytes, "paged big_cache"
     )
 
 
@@ -713,11 +782,20 @@ def main():
         help="Compact Q dim-1 / ragged pad.\n    e.g.: --next-n 1 8",
     )
     parser.add_argument(
+        "-kvb",
+        "--kv-block-size",
+        type=int,
+        nargs="*",
+        default=ARCH_KV_BLOCK_SIZES[get_gfx()],
+        help="Tokens per KV page (gfx950: 64; gfx1250: 8/16/64).\n"
+        "    e.g.: -kvb 8 64",
+    )
+    parser.add_argument(
         "--kv-len",
         type=int,
         nargs="*",
         default=[1024],
-        help="Tokens per sequence (multiple of kvb=64 preferred).\n    e.g.: --kv-len 128 8192",
+        help="Tokens per sequence (multiple of kvb preferred).\n    e.g.: --kv-len 128 8192",
     )
     parser.add_argument(
         "--split-kv",
@@ -776,6 +854,13 @@ def main():
         help="Batch for the wide-output i32-offset table.",
     )
     parser.add_argument(
+        "--big-cache-batch",
+        type=int,
+        nargs="*",
+        default=[4] if get_gfx() == "gfx1250" else [],
+        help="Batch for the >2 GiB KV-pool table (gfx1250).",
+    )
+    parser.add_argument(
         "--hist-nq",
         type=int,
         nargs="*",
@@ -800,18 +885,20 @@ def main():
     )
     args = parser.parse_args()
 
+    kvbs = args.kv_block_size
     compact = [
-        test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype)
-        for dtype, batch, next_n, kv_len, split_kv in itertools.product(
-            args.dtype, args.batch, args.next_n, args.kv_len, args.split_kv
+        test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype, kvb)
+        for kvb, dtype, batch, next_n, kv_len, split_kv in itertools.product(
+            kvbs, args.dtype, args.batch, args.next_n, args.kv_len, args.split_kv
         )
     ]
     if compact:
         _summarize("fp8_paged_mqa_logits", compact)
 
     ragged = [
-        test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv)
-        for batch, next_n, kv_len, split_kv in itertools.product(
+        test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv, kvb)
+        for kvb, batch, next_n, kv_len, split_kv in itertools.product(
+            kvbs,
             args.ragged_batch,
             args.ragged_next_n,
             args.ragged_kv_len,
@@ -822,20 +909,27 @@ def main():
         _summarize("fp8_paged_mqa_logits_ragged", ragged)
 
     long_ctx = [
-        test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv)
-        for batch, next_n, kv_len, split_kv in itertools.product(
-            args.long_batch, args.ragged_next_n, args.long_kv_len, args.split_kv
+        test_fp8_paged_mqa_logits_ragged(batch, next_n, kv_len, split_kv, kvb)
+        for kvb, batch, next_n, kv_len, split_kv in itertools.product(
+            kvbs, args.long_batch, args.ragged_next_n, args.long_kv_len, args.split_kv
         )
     ]
     if long_ctx:
         _summarize("fp8_paged_mqa_logits_ragged_long", long_ctx)
 
     wide = [
-        test_fp8_paged_mqa_logits_wide_out(batch, KV_BLOCK_SIZE)
-        for batch in args.wide_batch
+        test_fp8_paged_mqa_logits_wide_out(batch, KV_BLOCK_SIZE, kvb)
+        for kvb, batch in itertools.product(kvbs, args.wide_batch)
     ]
     if wide:
         _summarize("fp8_paged_mqa_logits_wide_out", wide)
+
+    big = [
+        test_fp8_paged_mqa_logits_big_cache(batch, 8192, kvb)
+        for kvb, batch in itertools.product(kvbs, args.big_cache_batch)
+    ]
+    if big:
+        _summarize("fp8_paged_mqa_logits_big_cache", big)
 
     hist = [
         test_fp8_paged_mqa_logits_probe1079(nq, next_n, kv_len, dtype)
