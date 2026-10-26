@@ -13,11 +13,9 @@ from aiter import ActivationType, QuantType, dtypes, logger
 
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import _online_tune_fmoe, moe_sorting
 from aiter.jit.core import (
-    AITER_CSRC_DIR,
     AITER_ROOT_DIR,
-    PY,
     bd_dir,
     mp_lock,
 )
@@ -441,14 +439,22 @@ def get_2stage_cfgs(
     )
 
     def MainFunc():
-        with open(untune_file, "a") as f:
-            q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
-            f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
-            )
-        logger.info("\033[34m Start tuning fmoe")
-        os.system(
-            f"{PY} {AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
+        return _online_tune_fmoe(
+            untune_file,
+            tune_file,
+            profile_file,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            activation,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
         )
 
     def FinalFunc():

@@ -4,6 +4,7 @@
 import functools
 import os
 import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -3346,6 +3347,66 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
+_UNTUNED_FMOE_HEADER = (
+    "token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+    "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+)
+
+
+def _online_tune_fmoe(
+    untune_file,
+    tune_file,
+    profile_file,
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    doweight_stage1,
+):
+    """Append one shape to untune_file and tune it into tune_file.
+
+    Shared by the AITER_ONLINE_TUNE paths of fused_moe and
+    fused_moe_dp_shared_expert. Returns True only if gemm_moe_tune.py exited 0.
+    """
+    with open(untune_file, "a") as f:
+        if os.path.getsize(untune_file) == 0:
+            f.write(_UNTUNED_FMOE_HEADER)
+        q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
+        f.write(
+            f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
+        )
+    logger.info("\033[34m Start tuning fmoe")
+    cmd = [
+        PY,
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+        "-i",
+        untune_file,
+        "-o",
+        tune_file,
+        "-o2",
+        profile_file,
+        "--last",
+    ]
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        logger.error(
+            f"[fused_moe] online tune exited {result.returncode}; {tune_file} "
+            "may not contain this shape, falling back to default configs"
+        )
+        return False
+    logger.info(
+        f"[Hint] tuned configs are saved in {tune_file}, you can set AITER_CONFIG_FMOE to this file to use tuned configs"
+    )
+    return True
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -3565,24 +3626,25 @@ def get_2stage_cfgs(
         keys_disabled += fhmoe_keys
 
     def MainFunc():
-        with open(untune_file, "a") as f:
-            if os.path.getsize(untune_file) == 0:
-                f.write(
-                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
-                )
-            q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
-            f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
-            )
-        logger.info("\033[34m Start tuning fmoe")
-        os.system(
-            f"{PY} {AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
+        return _online_tune_fmoe(
+            untune_file,
+            tune_file,
+            profile_file,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            activation,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
         )
 
     def FinalFunc():
-        logger.info(
-            f"[Hint] tuned configs are saved in {tune_file}, you can set AITER_CONFIG_FMOE to this file to use tuned configs"
-        )
         logger.info("\033[0m")
 
     def _lookup_cfg(c2s):
