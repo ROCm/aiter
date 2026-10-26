@@ -277,6 +277,24 @@ def test_layernorm_large_mean(N):
     torch.testing.assert_close(got.double(), want, atol=1e-5, rtol=1e-5)
 
 
+def test_layernorm_leading_outlier():
+    """Column 0 holds a value large enough that fp32 cannot resolve the rest
+    against it. An anchor taken from that one column would round the other
+    values together and lose the variance."""
+    dev = "cuda"
+    N = 8192
+    x = torch.empty(1, N, device=dev, dtype=torch.float32)
+    x[0, 0] = 2.0**24
+    x[0, 1::2] = 0.0
+    x[0, 2::2] = -1.0
+    shift = torch.zeros(1, N, device=dev, dtype=torch.float32)
+    scale = torch.zeros(1, N, device=dev, dtype=torch.float32)
+    indices = torch.zeros(1, device=dev, dtype=torch.int64)
+    got = fused_layernorm_indexed_adaln(x, shift, scale, indices, eps=1e-6)
+    want = torch.nn.functional.layer_norm(x.double(), (N,), eps=1e-6)
+    torch.testing.assert_close(got.double(), want, atol=2e-6, rtol=2e-6)
+
+
 def test_layernorm_per_sample_modulation():
     """The common DiT case: a [B, N] modulation and indices = sample of each
     token."""

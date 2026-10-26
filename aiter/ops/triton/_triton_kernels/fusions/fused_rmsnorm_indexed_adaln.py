@@ -68,14 +68,22 @@ def _fused_rmsnorm_indexed_adaln_kernel(
     if IS_LAYERNORM:
         # Mean and variance per column tile, merged with Chan's formula. This
         # keeps two passes over the row and avoids E[x^2] - E[x]^2. The
-        # statistics are of x - x[:, 0], so a large mean does not cost precision.
-        ref = tl.load(x_ptr + rows * stride_x_row, mask=row_mask, other=0.0).to(
-            tl.float32
-        )
-        mean = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        m2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        count = 0.0
-        for start in tl.range(0, N, BLOCK_N):
+        # statistics are of x - ref, the mean of the first tile, so a large mean
+        # does not cost precision and one element cannot set the anchor.
+        cols = tl.arange(0, BLOCK_N)
+        col_mask = cols < N
+        x = tl.load(
+            x_ptr + rows[:, None] * stride_x_row + cols[None, :],
+            mask=row_mask[:, None] & col_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        count = tl.minimum(N, BLOCK_N).to(tl.float32)
+        ref = tl.sum(x, axis=1) / count
+        x = tl.where(col_mask[None, :], x - ref[:, None], 0.0)
+        mean = tl.sum(x, axis=1) / count
+        centered = tl.where(col_mask[None, :], x - mean[:, None], 0.0)
+        m2 = tl.sum(centered * centered, axis=1)
+        for start in tl.range(BLOCK_N, N, BLOCK_N):
             cols = start + tl.arange(0, BLOCK_N)
             col_mask = cols < N
             x = tl.load(
