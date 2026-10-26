@@ -528,6 +528,12 @@ def rows_shapes(model):
                     False,
                 ),
                 (full_layer("v41 dec r1", [3000, 2048], [6, 6], 1), False),
+                (
+                    full_layer(
+                        "v41 dec r2 tiers", [2048, 1500, 777, 3000], [2, 3, 4, 8], 2
+                    ),
+                    False,
+                ),
                 (full_layer("v41 dec r1 short", [70], [6], 1), False),
                 (full_layer("v41 pre r2 fresh 300", [300], [300], 2), False),
                 (full_layer("v41 pre r1 chunk 200@1000", [1200], [200], 1), False),

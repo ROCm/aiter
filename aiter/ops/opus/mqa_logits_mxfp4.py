@@ -71,6 +71,16 @@ _SCHED_SCRATCH_RECORDS = 96
 _GROUPS_BUILD_MAX_BATCH = 2048
 # max_qlen above this is a prefill bucket (V4.1 decode is <= 6 rows a sequence, V4's <= 4).
 _DECODE_MAX_QLEN = 8
+# V4.1 full-layer decode: the rows a CTA (a tier, the smallest >= max_qlen) -> (rows_per_wave,
+# waves, scale_tdm). Up to _DECODE_MAX_QLEN.
+_V41_DECODE_TIERS = {
+    1: (1, 1, 0),
+    2: (1, 2, 1),
+    3: (3, 1, 1),
+    4: (2, 2, 1),
+    6: (3, 2, 1),
+    8: (4, 2, 1),
+}
 # V4.1 candidate layers switch to the shallower ring at prefill size (ATOM's 16384-token batch).
 _CANDIDATE_PREFILL_ROWS = 16384
 # The Prefill split, from static shapes only. Full layers: PREFILL_ROUNDS rounds of resident CTAs
@@ -208,23 +218,19 @@ def _rule(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
         want = {"rows_per_cta": rpc, "stages": 2, "scale_tdm": 1, "gather": 0}
         return want, FREE if decode else PREFILL
     if heads == 32 and entry_rows >= _TILE:
-        if max_qlen == 1:
-            # decode without DSpark speculation: one row a sequence, so one row a CTA. ~1.5x R3W2,
-            # which would idle 5 of its 6 row slots; S2L has the best worst case of the R1W1
-            # rings on MTP-1 decode (fixed + random sets, ratio 2 and 1).
-            return {
-                "rows_per_wave": 1,
-                "waves": 1,
-                "stages": 2,
-                "scale_tdm": 0,
-                "gather": 0,
-            }, FREE
         if decode:
+            # A sequence's rows a CTA, the smallest group that holds max_qlen: a bigger one idles
+            # row slots, a smaller one re-reads the keys. 1 row (no DSpark speculation): ~1.5x
+            # R3W2, S2L the best worst case of the R1W1 rings. 2 / 3 / 4 rows: 1.37 / 1.28 /
+            # 1.17x R3W2, 7-8: 1.31x (fixed + random sets, ratio 2 and 1); 6 (DSpark): R3W2.
+            rows_per_wave, waves, scale_tdm = _V41_DECODE_TIERS[
+                min(t for t in _V41_DECODE_TIERS if t >= max_qlen)
+            ]
             return {
-                "rows_per_wave": 3,
-                "waves": 2,
+                "rows_per_wave": rows_per_wave,
+                "waves": waves,
                 "stages": 2,
-                "scale_tdm": 1,
+                "scale_tdm": scale_tdm,
                 "gather": 0,
             }, FREE
         return {
