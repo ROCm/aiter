@@ -192,20 +192,19 @@ H=128 and N=512 for the CSA/HCA KV pools. The TP result keeps the
 the shipped H=128 kernel coverage; the model-local H=32 path is not enabled by
 the kargpreld test/dispatcher yet.
 
-The DSv4 ``mla_v4_prefill`` op runs eight performance cases at H=128 and
-D=512: compressed prefix-pool rows 4096/16384, crossed with dense/sparse CSR
-modes, crossed with fp8/bf16. The current chunk remains uncompressed:
+The DSv4 ``mla_v4_prefill`` op runs twelve performance cases at H=128 and
+D=512: compressed prefix-pool rows 4096/16384, crossed with topk 0/1024/2048,
+crossed with fp8/bf16. The current chunk remains uncompressed:
 
     python3 op_tests/test_pa_sparse_prefill.py \
       -n <token sweep> --h_q 128 -d 512 \
       --total_pages 4096 16384 --total_tokens <token sweep> \
-      --prec fp8 bf16 --mode dense sparse --no-verify
+      --prec fp8 bf16 --topk 0 1024 2048 --no-verify
 
 The UT compares the backends it has for each precision -- opus and asm on fp8,
 opus and triton on bf16 -- so one run covers both precisions and all three
-backends. There is no nnz axis to sweep: the CSR is generated from --mode
-(sparse draws a random nnz per row, dense fills every row) under --seed, so
-nnz is an outcome, not an input.
+backends. --topk is the rows each token draws from each range; 0 takes the
+whole pool, which is what the removed --mode dense did.
 
 The ``inverse_rope`` op runs the TP1 and TP4 attention-output shapes (-b is
 (n_local_heads, n_local_groups); 128,16 and 32,4 are V4-Pro at TP1 and TP4):
@@ -1103,6 +1102,11 @@ def _run_child(
     # env=None means "inherit ours", which already carries these two.
     if env is not None:
         _pin_arch(env)
+    # HIP init in this process exports ROCPROFILER_REGISTER_LIBRARY at the C
+    # level; a child that inherits it records no GPU events, so every
+    # run_perftest in it reports 0 us. Always pass an explicit env without it.
+    env = (os.environ if env is None else env).copy()
+    env.pop("ROCPROFILER_REGISTER_LIBRARY", None)
     monitor = None
     monitor_start = None
     if outer_smi and os.environ.get("AITER_SMI_MONITOR") == "1":
@@ -1945,8 +1949,6 @@ def run_mla_v4_decode(args):
             str(_MLA_V4_EP_BATCH),
             "--prec",
             "fp8",
-            "--mode",
-            "sparse",
             "--backend",
             "opus",
             "asm",
@@ -2208,11 +2210,11 @@ def run_inverse_rope(args):
 
 
 def run_mla_v4_prefill(args):
-    """Run DSv4 prefill across two precisions, pools and CSR modes."""
+    """Run DSv4 prefill across two precisions, pools and topk budgets."""
     _unused_scale_init(args, "mla_v4_prefill")
     data_inits = args.data_init or ["norm"]
 
-    def run_case(tokens, pages, precs, modes, backends, init_values, label):
+    def run_case(tokens, pages, precs, topks, backends, init_values, label):
         _run_child(
             label,
             [
@@ -2233,8 +2235,8 @@ def run_mla_v4_prefill(args):
                 # bf16 takes the single-tensor Q/K/V/O kernel; only fp8 has an
                 # asm candidate, so the bf16 rows compare opus against triton
                 # and leave the asm columns empty.
-                "--mode",
-                *modes,
+                "--topk",
+                *topks,
                 "--backend",
                 *backends,
                 "--no-verify",
@@ -2253,7 +2255,9 @@ def run_mla_v4_prefill(args):
             tokens,
             (4096, 16384),
             ("fp8", "bf16"),
-            ("dense", "sparse"),
+            # #5805 replaced --mode with --topk: 0 takes the whole pool (the
+            # old dense mode), 1024/2048 are the UT's sparse defaults.
+            ("0", "1024", "2048"),
             ("opus", "asm", "triton"),
             data_inits,
             f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
