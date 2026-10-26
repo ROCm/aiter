@@ -20,6 +20,8 @@ a bad argument raises ValueError.
 """
 
 import functools
+import math
+from typing import NamedTuple
 
 import torch
 
@@ -240,39 +242,73 @@ def _opus_fwd(gfx: str, op_gfx950, op_gfx1250):
 
 
 # Split-K cuts each token's keys over num_kv_splits workgroups and folds them in a second
-# launch. Auto takes, among the counts whose workgroups still fit in one wave of CUs (past
-# it a split loses), the one that minimizes the keys a workgroup walks plus _KV_SPLIT_COST
-# keys for the partials and their reduce. Fit on gfx1250 over topk 256-4096, N 8-768 and
-# H 16-128.
-_KV_SPLIT_COST = 1280
+# launch. While its workgroups fit in one wave (past it a split loses), a launch takes about
+# one workgroup's walk: a token's keys over the splits, in whole KV tiles. A split adds c0
+# keys for the reduce and c1 keys per partial row, N * H * S of them. Auto takes the count
+# that minimizes the sum.
+class _SplitFit(NamedTuple):
+    heads_per_wg: int
+    kv_tile: int
+    wgs_per_cu: int  # resident workgroups per CU
+    counts: tuple  # the split counts auto picks from
+    c0: float
+    c1: float
 
 
-def _opus_heads_per_wg(gfx: str, h: int) -> int:
-    """Heads one workgroup of the v4 kernel that serves ``h`` covers."""
+# The reduce gives each split a lane of one wave, so a wave32 arch caps the count.
+_MAX_KV_SPLITS = 32
+_ANY_COUNT = tuple(range(2, _MAX_KV_SPLITS + 1))
+
+# (arch, kernel) -> fit. gfx950 fit on MI355X over topk 384-4096, N 8-768, H 16-128 and
+# 1-32 splits; gfx1250 over topk 512-4096, N 8-128, H 16-128 and 1-32 splits.
+_KV_SPLIT_FIT = {
+    ("gfx950", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 90, 0.043),
+    ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.012),
+    ("gfx950", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 55, 0.022),
+    ("gfx950", "v4_a8w8_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.0095),
+    ("gfx950", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 90, 0.025),
+    ("gfx1250", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 0, 0.095),
+    ("gfx1250", "v4_a16w16_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 300, 0.055),
+    ("gfx1250", "v4_a16w16_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 200, 0.030),
+    ("gfx1250", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 200, 0.12),
+    ("gfx1250", "v4_a8w8_32mx1_16nx4"): _SplitFit(32, 64, 2, _ANY_COUNT, 300, 0.055),
+    ("gfx1250", "v4_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 600, 0.030),
+}
+
+
+def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
+    """The split-K fit of the ``kernel`` (v4_a16w16, v4_a8w8, v41_a8w8) variant that serves
+    ``h`` heads, as the launcher picks it."""
     if gfx == "gfx1250":
-        return 16 if h <= 16 else 32 if h <= 32 else 64
-    return 16 if h <= 32 else 128
+        tile = "16mx1_16nx4" if h <= 16 else "32mx1_16nx4" if h <= 32 else "16mx4_64nx1"
+    elif kernel == "v41_a8w8":
+        tile = "16mx4_64nx1"
+    else:
+        tile = "16mx1_16nx4" if h <= 32 else "16mx8_32nx1"
+    return _KV_SPLIT_FIT[(gfx, f"{kernel}_{tile}")]
 
 
 def _kv_splits(
-    num_kv_splits: int | None, n: int, h: int, heads_per_wg: int, nnz: int
+    num_kv_splits: int | None, fit: _SplitFit, n: int, h: int, nnz: int
 ) -> int:
     """The split count. Auto reads host scalars only (``nnz``: all tokens' rows, from the
     index tensors' sizes), so a captured graph's choice is its shape's."""
     if num_kv_splits is None:
         if n == 0:
             return 1
-        wgs = n * -(-h // heads_per_wg)
         keys = nnz / n
-        fits = [s for s in (2, 4, 8) if wgs * s <= get_cu_num()]
+        max_splits = fit.wgs_per_cu * get_cu_num() // (n * -(-h // fit.heads_per_wg))
 
         def cost(s: int) -> float:
-            return keys / s + (_KV_SPLIT_COST if s > 1 else 0)
+            walk = -(-math.ceil(keys / s) // fit.kv_tile) * fit.kv_tile
+            return walk + (fit.c0 + fit.c1 * n * h * s if s > 1 else 0)
 
-        return min([1, *fits], key=cost)
-    if num_kv_splits not in (1, 2, 4, 8):
+        return min([1, *(s for s in fit.counts if s <= max_splits)], key=cost)
+    if not 1 <= num_kv_splits <= _MAX_KV_SPLITS:
         # ValueError, a caller's error; RuntimeError would read as a missing kernel.
-        raise ValueError(f"num_kv_splits must be 1, 2, 4 or 8, got {num_kv_splits}")
+        raise ValueError(
+            f"num_kv_splits must be in [1, {_MAX_KV_SPLITS}], got {num_kv_splits}"
+        )
     return num_kv_splits
 
 
@@ -335,7 +371,8 @@ def _opus_sparse_prefill(
 
     n, h, _ = q.shape
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    num_kv_splits = _kv_splits(num_kv_splits, n, h, _opus_heads_per_wg(gfx, h), nnz)
+    fit = _opus_split_fit(gfx, "v4_a16w16", h)
+    num_kv_splits = _kv_splits(num_kv_splits, fit, n, h, nnz)
     fwd(
         q,
         unified_kv,
@@ -408,7 +445,8 @@ def _opus_sparse_prefill_v4(
         attn_sink,
     )
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    num_kv_splits = _kv_splits(num_kv_splits, n, h, _opus_heads_per_wg(gfx, h), nnz)
+    fit = _opus_split_fit(gfx, "v4_a8w8", h)
+    num_kv_splits = _kv_splits(num_kv_splits, fit, n, h, nnz)
     fwd(
         *args,
         out,
@@ -477,7 +515,8 @@ def _opus_sparse_prefill_v41(
         attn_sink,
     )
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    num_kv_splits = _kv_splits(num_kv_splits, n, h, 64, nnz)
+    fit = _opus_split_fit(gfx, "v41_a8w8", h)
+    num_kv_splits = _kv_splits(num_kv_splits, fit, n, h, nnz)
     fwd(*args, out, float(softmax_scale), *_split_args(n, num_kv_splits, h, q.device))
     return out
 
@@ -545,7 +584,7 @@ def mla_sparse_prefill(
       out:               Optional ``[T, H, D]`` output (``q``'s dtype);
         allocated if ``None``.
       num_kv_splits:     split each token's keys over this many workgroups and
-        fold them in a second launch: 1, 2, 4 or 8. ``None`` picks it from the
+        fold them in a second launch: 1 to 32. ``None`` picks it from the
         token, head and key counts.
       backend:           ``"opus"`` or ``None``.
 
@@ -767,5 +806,4 @@ __all__ = [
     "mla_sparse_prefill_fp8_asm_fwd",
     "mla_sparse_prefill_v4",
     "mla_sparse_prefill_v41",
-    "opus_mla_v41_prefill_a8w8_gfx950_fwd",
 ]

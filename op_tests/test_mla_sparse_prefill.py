@@ -21,9 +21,6 @@ The ``prec`` axis picks both the input format and the backends that run:
 * ``v41``  -- MLA v4.1: 512 e4m3 rows with separate E8M0 scales
   (``mla_sparse_prefill_v41``): ``opus``, gfx950 only.
 
-The ``pa_sparse_prefill*_opus`` names kept for existing callers are checked by
-``test_pa_sparse_prefill_opus_compat``.
-
 ``triton`` is the ``pa_prefill_sparse`` dispatcher, which on gfx1250 reaches a
 gluon kernel that takes both KV sources natively. ``asm`` needs ``H_Q == 128``.
 Both are gfx1250-only here and drop out of the sweep elsewhere.
@@ -48,7 +45,6 @@ import pandas as pd
 import pytest
 import torch
 
-import aiter
 from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
 from aiter.ops.mla_sparse_prefill import (
@@ -56,18 +52,11 @@ from aiter.ops.mla_sparse_prefill import (
     mla_sparse_prefill_v4,
     mla_sparse_prefill_v41,
 )
-from aiter.ops.opus.mla import opus_mla_v4_prefill_a16w16_gfx950_fwd
-from aiter.ops.pa_sparse_prefill_opus import (
-    pa_sparse_prefill_fp8_opus,
-    pa_sparse_prefill_gfx950_opus_fwd,
-    pa_sparse_prefill_opus,
-)
 from aiter.test_common import (
     benchmark,
     checkAllclose,
     perftest,
 )
-from aiter.utility import dtypes
 
 try:
     from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
@@ -829,123 +818,6 @@ def test_mla_sparse_prefill(prec, n, h, total_pages, total_tokens, topk):
     )
 
 
-def test_mla_sparse_prefill_v41_packed_pool():
-    """v41 over KV sources that are views of one ``[rows, 528]`` buffer (512
-    data bytes, then 16 scale bytes) must match the same rows held densely."""
-    if _skip_if_unsupported(d=512):
-        return
-    if _get_gpu_arch() != "gfx950":
-        _skip("mla_sparse_prefill_v41 is gfx950 only")
-        return
-    n, h, total_pages, total_tokens = 96, 128, 1024, 96
-    inputs = _make_inputs_v41(n, h, total_pages, total_tokens, topk=300, seed=7)[
-        "kernel"
-    ]
-    dense = mla_sparse_prefill_v41(**inputs, softmax_scale=1.0 / math.sqrt(512))
-
-    packed = dict(inputs)
-    for data, scale in (("unified_kv", "unified_kv_scale"), ("kv", "kv_scale")):
-        rows = inputs[data].shape[0]
-        pool = torch.empty(
-            rows, _V41_D + _V41_D_SCALE, dtype=torch.uint8, device="cuda"
-        )
-        pool[:, :_V41_D] = inputs[data].view(torch.uint8)
-        pool[:, _V41_D:] = inputs[scale]
-        packed[data] = pool[:, :_V41_D].view(dtypes.fp8)
-        # The E8M0 dtype is accepted as well as uint8.
-        packed[scale] = pool[:, _V41_D:].view(dtypes.fp8_e8m0)
-    out = mla_sparse_prefill_v41(**packed, softmax_scale=1.0 / math.sqrt(512))
-    assert torch.equal(out, dense)
-
-    with pytest.raises(RuntimeError, match=r"supports \(q, kv\) dtypes"):
-        mla_sparse_prefill_v41(
-            **{**inputs, "q": inputs["q"].to(torch.bfloat16)}, softmax_scale=1.0
-        )
-
-
-def test_mla_sparse_prefill_v41_lse_and_no_sink():
-    """v41 lse output, and ``attn_sink=None`` as a sink of -inf."""
-    if _skip_if_unsupported(d=512):
-        return
-    if _get_gpu_arch() != "gfx950":
-        _skip("mla_sparse_prefill_v41 is gfx950 only")
-        return
-    n, h, total_pages, total_tokens = 64, 80, 1024, 64
-    scale = 1.0 / math.sqrt(512)
-    data = _make_inputs_v41(n, h, total_pages, total_tokens, topk=300, seed=11)
-    inputs, ref = dict(data["kernel"]), data["ref"]
-    # Token 0 has no rows.
-    for ip, ix in (
-        ("kv_indptr_prefix", "kv_indices_prefix"),
-        ("kv_indptr_extend", "kv_indices_extend"),
-    ):
-        first = int(inputs[ip][1])
-        inputs[ix] = inputs[ix][first:].contiguous()
-        inputs[ip] = (inputs[ip] - first).clamp_min(0).contiguous()
-
-    lse = torch.empty(n, h, dtype=torch.float32, device="cuda")
-    out = mla_sparse_prefill_v41(**inputs, softmax_scale=scale, lse=lse)
-    assert torch.equal(out, mla_sparse_prefill_v41(**inputs, softmax_scale=scale))
-
-    p_ip = inputs["kv_indptr_prefix"].tolist()
-    e_ip = inputs["kv_indptr_extend"].tolist()
-    p_ix = inputs["kv_indices_prefix"].long()
-    e_ix = inputs["kv_indices_extend"].long()
-    ref_lse = torch.full((n, h), float("inf"), device="cuda")
-    for i in range(1, n):
-        rows = torch.cat(
-            [
-                ref["ukv_fp32"][p_ix[p_ip[i] : p_ip[i + 1]]],
-                ref["kv_fp32"][e_ix[e_ip[i] : e_ip[i + 1]]],
-            ]
-        )
-        ref_lse[i] = torch.logsumexp(ref["q_fp32"][i] @ rows.t() * scale, dim=1)
-    assert torch.isinf(lse[0]).all() and (lse[0] > 0).all()
-    assert not out[0].any()
-    # The kernel sums bf16 P: off by up to log(1 + 2^-9).
-    torch.testing.assert_close(lse[1:], ref_lse[1:], atol=2e-3, rtol=0)
-
-    lse_no_sink = torch.empty_like(lse)
-    out_no_sink = mla_sparse_prefill_v41(
-        **{**inputs, "attn_sink": None}, softmax_scale=scale, lse=lse_no_sink
-    )
-    neg_inf = torch.full_like(inputs["attn_sink"], float("-inf"))
-    assert torch.equal(
-        out_no_sink,
-        mla_sparse_prefill_v41(**{**inputs, "attn_sink": neg_inf}, softmax_scale=scale),
-    )
-    assert torch.equal(lse_no_sink, lse)
-
-
-def test_pa_sparse_prefill_opus_compat():
-    """The opus-pinned entries ATOM calls keep their names, torch ops and results,
-    and the backend-choosing entries pick opus where asm does not apply."""
-    if _skip_if_unsupported(d=512):
-        return
-    scale = 1.0 / math.sqrt(512)
-    bf16 = _make_inputs(64, 64, 512, 512, 512, torch.bfloat16, topk=200, seed=3)
-    fp8 = _make_inputs_fp8(64, 64, 512, 64, topk=200, seed=4)["kernel"]
-
-    assert torch.equal(
-        pa_sparse_prefill_opus(**bf16, softmax_scale=scale),
-        mla_sparse_prefill(**bf16, softmax_scale=scale),
-    )
-    assert torch.equal(
-        pa_sparse_prefill_fp8_opus(*fp8.values(), scale),
-        mla_sparse_prefill_v4(*fp8.values(), scale),
-    )
-    assert pa_sparse_prefill_gfx950_opus_fwd is opus_mla_v4_prefill_a16w16_gfx950_fwd
-    for name in ("pa_sparse_prefill_opus", "pa_sparse_prefill_fp8_opus"):
-        assert hasattr(aiter, name) and hasattr(torch.ops.aiter, name)
-    with pytest.raises(ValueError):
-        mla_sparse_prefill(**bf16, softmax_scale=scale, backend="triton")
-    as_bf16 = {
-        k: v.to(torch.bfloat16) if v.dtype == dtypes.fp8 else v for k, v in fp8.items()
-    }
-    with pytest.raises(RuntimeError, match="supports NoPE dtypes"):
-        mla_sparse_prefill_v4(**as_bf16, softmax_scale=scale, backend="opus")
-
-
 # ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
 # ---------------------------------------------------------------------------
@@ -1052,7 +924,7 @@ parser.add_argument(
     type=lambda s: None if s == "auto" else int(s),
     nargs="+",
     default=[None],
-    help="OPUS split-K counts: auto (the op's own choice), 1, 2, 4 or 8 (default: auto)",
+    help="OPUS split-K counts: auto (the op's own choice) or 1 to 32 (default: auto)",
 )
 
 

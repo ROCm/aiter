@@ -26,6 +26,9 @@ AITER_CTYPES_ERROR_DEF
 
 // ---- Split-K (opus/mla_prefill_split.h) ---------------------------------------------------
 
+// The reduce gives each split a lane of one wave, so a wave32 arch caps it.
+static constexpr int kOpusMlaPrefillMaxSplits = 32;
+
 // num_splits 1 runs without split-K and takes null partial buffers.
 static opus_mla_prefill_split_args opus_mla_prefill_split_buffers(aiter_tensor_t* partial_o,
                                                                   aiter_tensor_t* partial_max,
@@ -34,8 +37,10 @@ static opus_mla_prefill_split_args opus_mla_prefill_split_buffers(aiter_tensor_t
                                                                   int H,
                                                                   int num_splits)
 {
-    AITER_CHECK(num_splits == 1 || num_splits == 2 || num_splits == 4 || num_splits == 8,
-                "num_splits must be 1, 2, 4 or 8, got ",
+    AITER_CHECK(num_splits >= 1 && num_splits <= kOpusMlaPrefillMaxSplits,
+                "num_splits must be in [1, ",
+                kOpusMlaPrefillMaxSplits,
+                "], got ",
                 num_splits);
     if(num_splits == 1)
         return {nullptr, nullptr, nullptr, 1};
@@ -89,12 +94,9 @@ static void opus_mla_prefill_split_reduce(const opus_mla_prefill_split_args& spl
                                                 0);
         HIP_CALL_LAUNCH(hipGetLastError());
     };
-    if(S == 2)
-        reduce(std::integral_constant<int, 2>{});
-    else if(S == 4)
-        reduce(std::integral_constant<int, 4>{});
-    else
-        reduce(std::integral_constant<int, 8>{});
+    [&]<int... I>(std::integer_sequence<int, I...>) {
+        ((S == I + 2 && (reduce(std::integral_constant<int, I + 2>{}), true)) || ...);
+    }(std::make_integer_sequence<int, kOpusMlaPrefillMaxSplits - 1>{});
 }
 
 // The bf16/fp16 kernels' shared validation and arguments (`kargs.N` 0: nothing to run).
