@@ -458,8 +458,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         hidden_dim = int(input_.shape[-1])
         element_size = input_.element_size()
         total_bytes = input_.numel() * element_size
+        # gfx1250 fuses only above the 4 MiB LL range, so the old-arch default
+        # would rule its fused kernel out; bound it like the unquantized path.
+        default_quant_bytes = (
+            8 * 1024 * 8192
+            if self.ca_comm is not None and not self.ca_comm.has_old_arch_fused_kernels
+            else 4096 * 1024
+        )
         fused_quant_bytes_limit = (
-            self._ar_quant_max_bytes if self._ar_quant_max_bytes >= 0 else 4096 * 1024
+            self._ar_quant_max_bytes
+            if self._ar_quant_max_bytes >= 0
+            else default_quant_bytes
         )
         no_prefill_quant_bytes_limit = (
             self._ar_quant_no_prefill_max_bytes
