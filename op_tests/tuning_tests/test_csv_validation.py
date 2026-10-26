@@ -283,6 +283,7 @@ class TestCSVValidation(unittest.TestCase):
             "a8w8_untuned_batched_gemm.csv",
             "bf16_untuned_batched_gemm.csv",
             "untuned_fmoe.csv",
+            "untuned_mha_fwd.csv",
         ]
         for f in untuned_files:
             with self.subTest(file=f):

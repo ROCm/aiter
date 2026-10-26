@@ -731,6 +731,59 @@ class TestTunePipeline(unittest.TestCase):
     def test_gdn_k5_opt_mp1(self):
         self._run_one("gdn_k5_opt", mp=1)
 
+    def test_mha_fwd_mp1(self):
+        """Measure one shape on two backends and write the faster one."""
+        from aiter.ops.mha_fwd_policy import (
+            MHA_FWD_PROBLEM_KEY_FIELDS,
+            MHA_FWD_TUNER_SCRIPT,
+        )
+
+        shape = {
+            **dict.fromkeys(MHA_FWD_PROBLEM_KEY_FIELDS, 0),
+            "mode": "varlen",
+            "batch": 2,
+            "total_q": 512,
+            "total_k": 512,
+            "max_seqlen_q": 256,
+            "max_seqlen_k": 256,
+            "nhead_q": 8,
+            "nhead_k": 8,
+            "hdim_q": 128,
+            "hdim_v": 128,
+            "dtype": "bfloat16",
+            "window_left": -1,
+            "window_right": -1,
+            "dropout_p": 0.0,
+            "logits_soft_cap": 0.0,
+            "how_v3_bf16_cvt": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            untuned = os.path.join(tmp, "untuned.csv")
+            tuned = os.path.join(tmp, "tuned.csv")
+            _write_csv(
+                untuned,
+                MHA_FWD_PROBLEM_KEY_FIELDS,
+                [[shape[field] for field in MHA_FWD_PROBLEM_KEY_FIELDS]],
+            )
+            result = _run_tuner(
+                MHA_FWD_TUNER_SCRIPT,
+                untuned,
+                tuned,
+                extra_args=["--backends", "ck,triton"],
+                timeout=900,
+                mp=1,
+            )
+            if result.returncode != 0:
+                print(f"\n=== mha_fwd STDOUT ===\n{result.stdout[-2000:]}")
+                print(f"\n=== mha_fwd STDERR ===\n{result.stderr[-2000:]}")
+            self.assertEqual(result.returncode, 0, "mha_fwd tuner failed")
+            written = pd.read_csv(tuned, dtype=str, keep_default_na=False)
+        self.assertEqual(len(written), 1, written)
+        row = written.iloc[0]
+        self.assertIn(row["backend"], ("ck", "triton"))
+        if row["backend"] == "triton":
+            self.assertRegex(row["config_digest"], r"^sha256:[0-9a-f]{12}$")
+
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
 class TestShapeGrouped(unittest.TestCase):

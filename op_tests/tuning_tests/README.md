@@ -8,7 +8,8 @@ Minimal test suite for validating the aiter tuning infrastructure.
 |------|-------|-----|---------------|
 | `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts |
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
-| `test_mha_fwd_dispatch.py` | 1 | No | MHA forward tuned-row lookup: exact key, bad rows skipped, unservable rows fall back to auto-select, dispatch records what it ran |
+| `test_mha_fwd_dispatch.py` | 1 | No (Triton cases skip) | MHA forward tuned-row lookup: exact key, bad rows skipped, unservable rows fall back to auto-select, dispatch records what it ran |
+| `test_mha_tuner_logic.py` | 1 | No (Triton cases skip) | MHA forward tuner: the chunked reference, the candidate field per arch, the tolerance, stale Triton rows skipped or retuned, the per-shape winner and table write, the selection hooks |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results`, auto-select removal, stale rows retuned |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart, resubmitting a faulted group's remaining candidates, fault detection by type or failing synchronize |
 | `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` when a candidate faults, kills its worker, or fails preparing inputs: only that candidate fails, for untyped and `return_status` callers |
@@ -46,6 +47,7 @@ runtime budgets.
 | `fhmoe` | `op_tests/tuners/tune_fhmoe.py` | `tuned_fhmoe.csv` | — | ✓ (HY4 MXFP8/FP8) |
 | `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
 | `gdn_k5_opt` | `csrc/gdn_k5/chunk_gdn_h_opt_tune.py` | `model_configs/*_chunk_gdn_h_opt_tuned.csv` | ✓ | ✓ (shape-only varlen smoke) |
+| `mha_fwd` | `op_tests/tuners/tune_mha_fwd.py` | `tuned_mha_fwd.csv` | skipped until the CSV has rows for the GPU | ✓ (one varlen shape, CK and Triton) |
 
 Mixed-MXFP coverage is provided by
 `csrc/gemm_a6w4/gemm_a6w4_tune.py` and
