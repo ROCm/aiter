@@ -20,7 +20,8 @@ report, so they stay stable: ``fly_1stage_b<block>_a<atoms>_g<cap>``,
 ``fly_int4[_ring]_b<block>_st<st>_g<cap>``,
 ``fused_fly_1stage[_k<split>]_b<block>_g<cap>``,
 ``fused_fly_<mesh|ring>_a<atoms_per_row>_st<st>_g<cap>`` and
-``fused_fly_mesh_ll_st1_g<cap>`` (the low-latency mesh build).
+``fused_fly_mesh_ll_st1_g<cap>`` (the low-latency mesh build) and
+``fused_fly_mesh_b<block>_st1_g<cap>`` (its default-build twin).
 
 Sets (``--candidate-set``):
 
@@ -29,9 +30,10 @@ Sets (``--candidate-set``):
   (one-shot and mesh; the ring is never dispatched on xGMI).
 * ``fused``     -- the fused one-shot grid, unsplit and split.
 * ``fused_qr``  -- the fused mesh/ring grid.
-* ``fused_ll``  -- the low-latency mesh rows, timed by ``tune.sh low-latency``
-  against the shipping fused mesh. Not fitted: the fused fit cannot emit a
-  low-latency rung.
+* ``fused_ll``  -- the low-latency mesh rows and their twins (the default build
+  at the same block and super-tile), timed by ``tune.sh low-latency`` against
+  the shipping engines. Not fitted: the fused fit cannot emit a low-latency
+  rung.
 * ``smoke``     -- a handful of rows of each, for ``tune.sh --smoke``.
 """
 
@@ -91,13 +93,16 @@ FUSED_CAPS = (8, 32, 64, 128)
 # A split build spends ``split`` workgroups per row, so 256 lets k2 match the
 # unsplit 128.
 FUSED_SPLIT_CAPS = (*FUSED_CAPS, 256)
-# Fused mesh/ring: atoms per row x super-tile x grid cap.
-FUSED_QR_ROW_ATOMS = (1, 2, 4)
+# Fused mesh/ring: atoms per row x super-tile x grid cap. A ring row fits a
+# rank's reduce-scatter chunk (at most 4 atoms, at TP2); a mesh row may span the
+# whole gathered tile, 8 atoms. A row a width or world size cannot build is n/a.
+FUSED_QR_ROW_ATOMS = {"mesh": (1, 2, 4, 8), "ring": (1, 2, 4)}
 FUSED_QR_CAPS = (32, 64, 128, 256)
 # The low-latency mesh build runs two workgroups per CU, so its cap goes to
 # twice the CU count; a cap above that on a device is n/a there. It exists only
 # at ``block=BLOCK`` and ``super_tile=1``, which fixes ``atoms_per_row`` to
-# ``hidden / 2048``: hidden 2048 at TP8, 2048/4096 at TP4, 2048/4096/8192 at TP2.
+# ``hidden / 2048``: hidden 2048, 4096, 8192 and 16384, at every world size (the
+# mesh's rows may span several ranks' chunks).
 FUSED_LL_CAPS = (*FUSED_QR_CAPS, 512)
 
 SMOKE = {
@@ -105,6 +110,7 @@ SMOKE = {
     "fly_int4_b256_st1_g128",
     "fused_fly_mesh_a1_st1_g128",
     "fused_fly_ring_a1_st8_g128",
+    "fused_fly_mesh_b256_st1_g128",
     "fused_fly_mesh_ll_st1_g128",
 }
 
@@ -209,7 +215,7 @@ def rows() -> list[dict]:
     out += fused_one
 
     for algorithm in ("mesh", "ring"):
-        for apr in FUSED_QR_ROW_ATOMS:
+        for apr in FUSED_QR_ROW_ATOMS[algorithm]:
             for st in ALGORITHMS[algorithm].super_tiles:
                 for g in FUSED_QR_CAPS:
                     out.append(
@@ -223,6 +229,21 @@ def rows() -> list[dict]:
                             atoms_per_row=apr,
                         )
                     )
+    # The low-latency build's twin: the default build at the same geometry
+    # (BLOCK threads, super-tile 1), so a comparison separates what the
+    # low-latency build changes from what its block or grid cap does.
+    for g in FUSED_QR_CAPS:
+        out.append(
+            _row(
+                f"fused_fly_mesh_b{BLOCK}_st1_g{g}",
+                "ar_rmsnorm",
+                "mesh",
+                ("fused_ll",),
+                super_tile=1,
+                grid_cap=g,
+                block=BLOCK,
+            )
+        )
     # Pinned by block, not atoms_per_row: the build exists only at BLOCK.
     for g in FUSED_LL_CAPS:
         out.append(

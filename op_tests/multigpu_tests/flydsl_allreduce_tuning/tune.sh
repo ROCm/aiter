@@ -24,16 +24,19 @@
 #   validate     re-sweep the shipping engines vs the pinned rows            -> $OUT/validate
 #   audit        grade the shipped dispatcher against the best pinned row    -> $OUT/audit
 #   report       reference bench tables: shipping engines vs stock kernels   -> $OUT/report
-#   low-latency  the low-latency fused mesh build vs the shipping fused mesh,
-#                at each (TP, width) that has the build; sweep, then
+#   low-latency  the low-latency fused mesh build vs what the policy dispatches and
+#                vs its default-build twin, at each (TP, width) that has it; sweep, then
 #                compare (not part of `all`)                    -> $OUT/low_latency/compare.txt
+#   pr6369       PR #6369's original low-latency build vs its default build, at the PR's
+#                shapes and small payloads (not part of `all`)       -> $OUT/pr6369/compare.txt
 #
 # Options (before the command):
 #   --out DIR       output root (default: <this dir>/out/<host>; "out/" is git-ignored)
 #   --tp "8 4 2"    world sizes (default "8 4 2"; sizes above the GPU count are skipped)
 #   --link L        pcie|xgmi|auto (default auto: read from the KFD topology)
-#   --widths "..."  hidden sizes for the fused sweep (default "3072 4096 7168 8192")
-#                   and for low-latency (default "2048 4096 8192", its only widths)
+#   --widths "..."  hidden sizes for the fused sweep (default "2048 3072 4096 7168 8192")
+#                   and for low-latency (default "2048 4096 8192 16384", its only
+#                   widths; shapes up to PR #6369's in fused/shapes/ll)
 #   --width-gain G  speedup over the default fused ladder, minus 1, that a width needs
 #                   to keep a ladder of its own (default 0.02)
 #   --smoke         plumbing check: 3 shapes, the `smoke` candidates, few samples
@@ -51,7 +54,7 @@ QUICK="$REPO/op_tests/multigpu_tests/test_flydsl_quick_allreduce.py"
 CANDS="$HERE/candidates.csv"
 PY=${PYTHON:-python}
 
-OUT=""; TPS="8 4 2"; LINK="auto"; WIDTHS="3072 4096 7168 8192"; LL_WIDTHS="2048 4096 8192"
+OUT=""; TPS="8 4 2"; LINK="auto"; WIDTHS="2048 3072 4096 7168 8192"; LL_WIDTHS="2048 4096 8192 16384"
 WIDTH_GAIN=0.02; SMOKE=0; FORCE=0; DRY=0
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -102,15 +105,16 @@ unset TRITON_LIBHIP_PATH
 # fused fit, `fused_ll` for the low-latency comparison.
 SWEEP_SET=sweep; VAL_SET=validate; FUSED_SET=fused; FUSED_QR_SET=fused_qr; LL_SET=fused_ll
 REPS=10; ROUNDS=12
-SHAPES=$HERE/shapes; FUSED_SHAPES=$HERE/fused/shapes
+SHAPES=$HERE/shapes; FUSED_SHAPES=$HERE/fused/shapes; LL_SHAPES=$HERE/fused/shapes/ll
 if [[ $SMOKE == 1 ]]; then
   SWEEP_SET=smoke; VAL_SET=smoke; FUSED_SET=smoke; FUSED_QR_SET=smoke; LL_SET=smoke
   REPS=2; ROUNDS=3; TPS=${TPS_SMOKE:-2}
   WIDTHS="4096"; LL_WIDTHS="4096"
-  SHAPES=$OUT/smoke_shapes; FUSED_SHAPES=$OUT/smoke_shapes_fused
-  mkdir -p "$SHAPES" "$FUSED_SHAPES"
+  SHAPES=$OUT/smoke_shapes; FUSED_SHAPES=$OUT/smoke_shapes_fused; LL_SHAPES=$OUT/smoke_shapes_ll
+  mkdir -p "$SHAPES" "$FUSED_SHAPES" "$LL_SHAPES"
   for f in "$HERE"/shapes/*.csv; do head -4 "$f" > "$SHAPES/$(basename "$f")"; done
   for f in "$HERE"/fused/shapes/*.csv; do head -4 "$f" > "$FUSED_SHAPES/$(basename "$f")"; done
+  for f in "$HERE"/fused/shapes/ll/*.csv; do head -4 "$f" > "$LL_SHAPES/$(basename "$f")"; done
 fi
 FAILED=()
 
@@ -365,11 +369,12 @@ cmd_fused_fit() {
 }
 
 # ll_ok <tp> <hidden>: whether the low-latency mesh build exists there. It is a
-# 256-thread build, so a row is hidden/2048 atoms, which must divide a rank's
-# 8/tp atoms of a tile (_low_latency_hidden_ok in the quick test).
+# 256-thread build, so a row is hidden/2048 atoms, which must divide the tile's 8:
+# the mesh normalizes the gathered tile, so a row may span several ranks' chunks
+# and <tp> does not matter (_low_latency_hidden_ok in the quick test).
 ll_ok() {
   local apr=$(($2 / 2048))
-  [[ $(($2 % 2048)) == 0 && $apr -ge 1 && $((8 / $1 % apr)) == 0 ]]
+  [[ $(($2 % 2048)) == 0 && $apr -ge 1 && $((8 % apr)) == 0 ]]
 }
 
 cmd_low_latency() {
@@ -383,12 +388,13 @@ cmd_low_latency() {
   [[ ${#pairs[@]} -gt 0 ]] || die "no low-latency build at tp=[$TPS] widths=[$LL_WIDTHS]"
   log "low-latency sweep: candidate set $LL_SET, (tp:width) = ${pairs[*]}"
   plan ${#pairs[@]}
-  # Only the low-latency rows and the shipping mesh (-a mesh): the ring and the
-  # rest of the mesh grid are the fused sweep's business.
+  # The low-latency rows and their twins next to the shipping engines -- mesh and ring,
+  # since the policy may route a size to either; the rest of the grid is the fused
+  # sweep's business.
   for p in "${pairs[@]}"; do
     tp=${p%:*}; h=${p#*:}
-    bench_chunk "ll_tp${tp}_w${h}" "$OUT/low_latency/sweep" "$QUICK" --operation ar_rmsnorm -a mesh \
-      --tp "$tp" --shape-csv "$FUSED_SHAPES/fused_w${h}.csv" \
+    bench_chunk "ll_tp${tp}_w${h}" "$OUT/low_latency/sweep" "$QUICK" --operation ar_rmsnorm \
+      --tp "$tp" --shape-csv "$LL_SHAPES/ll_w${h}.csv" \
       --candidates "$CANDS" --candidate-set "$LL_SET"
   done
   finish
@@ -399,9 +405,32 @@ cmd_low_latency() {
   log "low-latency comparison -> $OUT/low_latency/compare.txt (per shape: compare.csv)"
 }
 
+# pr6369: one spawn per world size, so it is not chunked or resumable; --force is moot.
+cmd_pr6369() {
+  NGPU=$(ngpu); resolve_link; write_provenance
+  local dir=$OUT/pr6369 tps=() tp args=()
+  for tp in $TPS; do tp_ok "$tp" && tps+=("$tp"); done
+  [[ ${#tps[@]} -gt 0 ]] || die "no world size in [$TPS] fits $NGPU GPU(s)"
+  args=(--tp "${tps[@]}" --link "$LINK" --work "$dir" --csv "$dir/compare.csv")
+  [[ $SMOKE == 1 ]] && args+=(--shapes 16,4096 1024,8192 --rounds 2 --iters 11)
+  if [[ $DRY == 1 ]]; then
+    log "dry  pr6369: pr6369_low_latency.py ${args[*]}"
+    dry_fit_scripts pr6369_low_latency.py; return
+  fi
+  mkdir -p "$dir"
+  log "run  pr6369 (tp=${tps[*]})"
+  $PY "$HERE/pr6369_low_latency.py" "${args[@]}" > "$dir/compare.log" 2>&1
+  local rc=$?
+  # The report is the tail of the log: everything from its title on.
+  sed -n '/^# PR #6369/,$p' "$dir/compare.log" | tee "$dir/compare.txt"
+  [[ $rc == 0 ]] || die "pr6369 failed (rc=$rc, see $dir/compare.log)"
+  log "pr6369 comparison -> $dir/compare.txt (per shape: compare.csv)"
+}
+
 case $CMD in
   setup) cmd_setup ;;
   low-latency) cmd_low_latency ;;
+  pr6369) cmd_pr6369 ;;
   check) cmd_check ;;
   sweep) cmd_sweep ;;
   fit) cmd_fit ;;

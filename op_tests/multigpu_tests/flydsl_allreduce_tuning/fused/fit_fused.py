@@ -81,6 +81,10 @@ _QR_KEY = re.compile(
     r"^fused_fly_(?P<alg>mesh|ring)_a(?P<a>\d+)_st(?P<st>\d+)_g(?P<g>\d+)$"
 )
 ATOMS = (1, 2, 4)
+# ``atoms_per_row`` a quantized schedule's row may take, and what it must divide:
+# a ring row fits a rank's reduce-scatter chunk (8 // tp atoms), a mesh row
+# may span the gathered tile's 8.
+QR_ROW_ATOMS = {"mesh": (1, 2, 4, 8), "ring": (1, 2, 4)}
 CAPS = (8, 32, 64, 128, 256)
 SPLITS = (1, 2, 4, 8, 16)
 
@@ -320,8 +324,9 @@ def fit_qr(shapes, alg, max_rungs, penalty):
     tp = shapes[0]["tp"]
     cfgs = sorted({(st, g) for s in shapes for _a, st, g in s["qr"][alg]})
     fits = {}
-    for apr in ATOMS:
-        if (8 // tp) % apr:
+    span = 8 if alg == "mesh" else 8 // tp
+    for apr in QR_ROW_ATOMS[alg]:
+        if span % apr:
             continue
         rungs = fit_ladder(
             shapes,
