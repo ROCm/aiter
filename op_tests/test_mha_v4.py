@@ -12,7 +12,6 @@ import sys
 import textwrap
 
 import pandas as pd
-import pytest
 import torch
 import torch._dynamo
 
@@ -75,16 +74,26 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-
-@pytest.fixture(autouse=True)
-def _reset_kv_tile_cache():
-    """monkeypatch restores get_gfx, but not the mha_v4_kv_tile cache it may have warmed.
-
-    A stale tile is silently wrong mask geometry rather than an error, and it would leak into
-    every later test in the process, including the sparse file.
-    """
-    yield
-    mha_v4_module.mha_v4_kv_tile.cache_clear()
+try:
+    from mha_v4_check_harness import (
+        CheckRegistry,
+        expect_raises,
+        param,
+        parametrize,
+        patched_attr,
+        skipif,
+    )
+except ModuleNotFoundError as e:
+    if e.name != "mha_v4_check_harness":
+        raise
+    from op_tests.mha_v4_check_harness import (
+        CheckRegistry,
+        expect_raises,
+        param,
+        parametrize,
+        patched_attr,
+        skipif,
+    )
 
 
 def _e2m1_code_ties_low(value):
@@ -107,17 +116,14 @@ def _rotate_hd128_reference(value):
     return (rotated / 128**0.5).to(value.dtype)
 
 
-@pytest.fixture(autouse=True)
-def isolate_dynamo_cache():
-    """Keep each test's ``torch.compile`` behaviour independent of the tests that ran before it.
-
-    Dynamo caches compiled entries per code object, and this file compiles ``mha_v4`` under many
-    format combinations. Sharing that cache across tests means the suite drifts toward the recompile
-    limit and whichever test compiles last fails under ``fullgraph=True`` -- a failure that reports
-    against a kernel while actually depending on how many earlier tests got far enough to compile.
-    """
-    torch._dynamo.reset()
-    yield
+# Dynamo caches compiled entries per code object and this file compiles mha_v4 under many format
+# combinations, so a shared cache drifts toward the recompile limit and whichever check compiles
+# last fails under fullgraph. The kv-tile cache is cleared because patched_attr restores get_gfx
+# but not a tile it may have warmed, and a stale tile is wrong mask geometry rather than an error.
+_CHECKS = CheckRegistry(
+    setup=torch._dynamo.reset,
+    teardown=lambda: mha_v4_module.mha_v4_kv_tile.cache_clear(),
+)
 
 
 def test_attention_format_ids_are_stable():
@@ -178,7 +184,7 @@ def test_mha_v4_bf16fp8_scale_recipe():
     )
 
 
-@pytest.mark.parametrize(
+@parametrize(
     ("q_format", "v_format", "sparse", "kind", "v_pack"),
     [
         (
@@ -256,7 +262,7 @@ def test_mha_v4_resolves_raw_recipe(q_format, v_format, sparse, kind, v_pack):
     assert recipe.scale_modes == scale_modes_for_formats(q_format, q_format, v_format)
 
 
-@pytest.mark.parametrize(
+@parametrize(
     ("v_format", "kind"),
     [
         (
@@ -283,9 +289,9 @@ def test_mha_v4_resolves_bf16_sparse_recipe(v_format, kind):
     assert recipe.v_pack == AttentionPack.DEFAULT
 
 
-@pytest.mark.parametrize("sparse", [False, True])
+@parametrize("sparse", [False, True])
 def test_mha_v4_rejects_unimplemented_mxfp4_mxfp6_recipe(sparse):
-    with pytest.raises(NotImplementedError, match="MXFP4 Q/K requires MXFP4 V"):
+    with expect_raises(NotImplementedError, match="MXFP4 Q/K requires MXFP4 V"):
         _resolve_raw_recipe(
             AttentionFormat.MXFP4,
             AttentionFormat.MXFP4,
@@ -298,7 +304,7 @@ def test_mha_v4_rejects_unimplemented_mxfp4_mxfp6_recipe(sparse):
 
 
 def test_mha_v4_rejects_f8f4_format_pair():
-    with pytest.raises(ValueError, match="matching FP8 or MXFP6 V"):
+    with expect_raises(ValueError, match="matching FP8 or MXFP6 V"):
         scale_modes_for_formats(
             AttentionFormat.FP8, AttentionFormat.FP8, AttentionFormat.MXFP4
         )
@@ -322,7 +328,7 @@ def test_mha_v4_f8f6_v_kv_table_matches_live_p_pack():
     assert _v_direct_kvtab().tolist() == expected
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
 def test_mha_v4_mxfp6_v_layout_contract():
     value = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
 
@@ -335,9 +341,9 @@ def test_mha_v4_mxfp6_v_layout_contract():
     assert scale.dtype == torch.uint8
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
-@pytest.mark.parametrize("sequence", [256, 257])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
+@parametrize("sequence", [256, 257])
+@parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mha_v4_mxfp6_fp6_p_layout_matches_permuted_canonical(sequence, dtype):
     torch.manual_seed(41)
     value = torch.randn((1, sequence, 2, 128), device="cuda", dtype=dtype)
@@ -377,7 +383,7 @@ def test_mha_v4_mxfp6_fp6_p_layout_matches_permuted_canonical(sequence, dtype):
     )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 F8F6 kernel")
+@skipif(get_gfx() != "gfx950", reason="gfx950 F8F6 kernel")
 def test_mha_v4_f8f6_raw_compile_parity():
     torch.manual_seed(43)
     q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
@@ -413,8 +419,8 @@ def test_mha_v4_f8f6_raw_compile_parity():
     assert torch.isfinite(compiled).all()
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
-@pytest.mark.parametrize("sequence", [256, 257])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
+@parametrize("sequence", [256, 257])
 def test_mha_v4_mxfp6_v_direct_buffers_match_combined_reference(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((1, sequence, 2, 128), device="cuda", dtype=torch.bfloat16)
@@ -446,8 +452,8 @@ def test_mha_v4_mxfp6_v_direct_buffers_match_combined_reference(sequence):
     assert torch.equal(scale, expected_scale.view(-1))
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
-@pytest.mark.parametrize("clip", [1.0, 0.9])
+@skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
+@parametrize("clip", [1.0, 0.9])
 def test_mha_v4_int8_quantization_matches_torch(clip):
     torch.manual_seed(17)
     value = torch.randn((2, 257, 3, 128), device="cuda", dtype=torch.bfloat16)
@@ -462,7 +468,7 @@ def test_mha_v4_int8_quantization_matches_torch(clip):
     assert torch.equal(scale, expected_scale.reshape(1))
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
+@skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
 def test_mha_v4_fp8_quantization_matches_torch():
     torch.manual_seed(19)
     value = torch.randn((2, 257, 3, 128), device="cuda", dtype=torch.bfloat16)
@@ -475,7 +481,7 @@ def test_mha_v4_fp8_quantization_matches_torch():
     assert torch.equal(scale, expected_scale.reshape(1))
 
 
-@pytest.mark.parametrize("sequence,heads", [(1, 1), (257, 3), (1024, 2)])
+@parametrize("sequence,heads", [(1, 1), (257, 3), (1024, 2)])
 def test_mha_v4_v_fp8_quantization_matches_torch(sequence, heads):
     torch.manual_seed(29)
     value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
@@ -488,12 +494,12 @@ def test_mha_v4_v_fp8_quantization_matches_torch(sequence, heads):
     assert torch.equal(actual, (value.float() / scale[:, None]).to(dtypes.fp8))
 
 
-@pytest.mark.skipif(
+@skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 hd128 rotation",
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("sequence,heads", [(1, 1), (129, 5), (2048, 1)])
+@parametrize("dtype", [torch.bfloat16, torch.float16])
+@parametrize("sequence,heads", [(1, 1), (129, 5), (2048, 1)])
 def test_mha_v4_rotation_matches_an_explicit_hadamard_matrix(dtype, sequence, heads):
     """The rotation is the orthonormal hd128 Walsh-Hadamard transform, not merely self-consistent.
 
@@ -524,11 +530,11 @@ def test_mha_v4_rotation_matches_an_explicit_hadamard_matrix(dtype, sequence, he
     assert torch.equal(rotated, expected.to(dtype).reshape(value.shape))
 
 
-@pytest.mark.skipif(
+@skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 rotated FP8 quantization",
 )
-@pytest.mark.parametrize("sequence,heads", [(257, 3), (512, 1), (2048, 1)])
+@parametrize("sequence,heads", [(257, 3), (512, 1), (2048, 1)])
 def test_mha_v4_rotated_fp8_quantization_matches_reference(sequence, heads):
     torch.manual_seed(23)
     value = torch.randn((1, heads, sequence, 128), device="cuda", dtype=torch.bfloat16)
@@ -549,11 +555,11 @@ def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
     value = torch.randn((1, 1, 128, 2), device="cuda", dtype=torch.bfloat16)
     value = value.transpose(-1, -2)
 
-    with pytest.raises(ValueError, match="requires contiguous hd128 input"):
+    with expect_raises(ValueError, match="requires contiguous hd128 input"):
         quantize_fp8_rotated(value)
 
 
-@pytest.mark.parametrize(
+@parametrize(
     "quantize",
     [
         "quantize_fp8_rotated",
@@ -588,7 +594,7 @@ def test_mha_v4_k_quantizers_reject_an_off_device_mean(quantize):
     assert "same GPU as input" in finished.stderr, finished.stderr[-2000:]
 
 
-@pytest.mark.skipif(
+@skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 activation rotation",
 )
@@ -661,27 +667,17 @@ def check_k_mean_bound(kernel, seq, heads):
     )
 
 
-def check_k_mean_bounds():
-    for kernel in _K_MEAN_OOB_KERNELS:
-        for seq, heads in _K_MEAN_OOB_SHAPES:
-            check_k_mean_bound(kernel, seq, heads)
-    aiter.logger.info(
-        "K-mean bound: %d rotate-kernel/shape combos stayed in bounds",
-        len(_K_MEAN_OOB_KERNELS) * len(_K_MEAN_OOB_SHAPES),
-    )
-
-
-@pytest.mark.skipif(
+@skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 activation rotation",
 )
-@pytest.mark.parametrize("kernel", _K_MEAN_OOB_KERNELS)
-@pytest.mark.parametrize("seq,heads", _K_MEAN_OOB_SHAPES)
+@parametrize("kernel", _K_MEAN_OOB_KERNELS)
+@parametrize("seq,heads", _K_MEAN_OOB_SHAPES)
 def test_mha_v4_rotate_kernels_bound_the_k_mean_read(kernel, seq, heads):
     check_k_mean_bound(kernel, seq, heads)
 
 
-@pytest.mark.skipif(
+@skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 FP8 recipe validation",
 )
@@ -719,11 +715,11 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
     assert torch.equal(compiled, expected)
 
 
-@pytest.mark.skipif(
+@skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 FP8 recipe validation",
 )
-@pytest.mark.parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
+@parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
 def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     """A direction shared by every key must not cost accuracy.
 
@@ -767,11 +763,11 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     )
 
 
-@pytest.mark.skipif(
+@skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 FP8 recipe validation",
 )
-@pytest.mark.parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
+@parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
 def test_mha_v4_lse_survives_k_common_mode(recipe):
     """K smoothing must not leak into the exported LSE.
 
@@ -830,8 +826,8 @@ def test_mha_v4_lse_survives_k_common_mode(recipe):
     )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
-@pytest.mark.parametrize("case", ["random", "zero", "powers", "extreme"])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
+@parametrize("case", ["random", "zero", "powers", "extreme"])
 def test_mha_v4_mxfp8_q_matches_unfused_pipeline(case):
     from aiter import dtypes
 
@@ -869,8 +865,8 @@ def test_mha_v4_mxfp8_q_matches_unfused_pipeline(case):
     assert torch.equal(scale, expected_scale)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
-@pytest.mark.parametrize("case", ["random", "zero", "extreme"])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 quantization")
+@parametrize("case", ["random", "zero", "extreme"])
 def test_mha_v4_mxfp8_k_matches_unfused_pipeline(case):
     from aiter import dtypes
 
@@ -897,10 +893,8 @@ def test_mha_v4_mxfp8_k_matches_unfused_pipeline(case):
     assert torch.equal(scale, expected_scale)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
-@pytest.mark.parametrize(
-    "quantize", [quantize_int8, quantize_fp8, quantize_fp8_rotated]
-)
+@skipif(get_gfx() != "gfx950", reason="gfx950 per-tensor quantization")
+@parametrize("quantize", [quantize_int8, quantize_fp8, quantize_fp8_rotated])
 def test_mha_v4_per_tensor_quantization_handles_zero(quantize):
     value = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
 
@@ -921,9 +915,7 @@ def test_mha_v4_raw_buffer_sizes_are_stable():
     assert fp4_v_raw_buffer_size(2, 129, 3) == 2 * 256 * 3 * 64 + 64
 
 
-@pytest.mark.parametrize(
-    "batch,sequence,heads", [(1, 128, 5), (1, 129, 2), (2, 257, 3)]
-)
+@parametrize("batch,sequence,heads", [(1, 128, 5), (1, 129, 2), (2, 257, 3)])
 def test_mha_v4_mxfp4_v_backing_storage_covers_logical_view(batch, sequence, heads):
     padded_sequence = fp4_v_padded_sequence(sequence)
     payload_size = batch * heads * padded_sequence * 64
@@ -939,8 +931,8 @@ def test_mha_v4_mxfp4_v_backing_storage_covers_logical_view(batch, sequence, hea
     assert max_logical_offset < raw_size
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
-@pytest.mark.parametrize("sequence", [1, 63, 64, 127, 128, 129, 255, 257])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
+@parametrize("sequence", [1, 63, 64, 127, 128, 129, 255, 257])
 def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
@@ -977,8 +969,8 @@ def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
     assert torch.equal(compiled_scale, expected_scale)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 K validation")
-@pytest.mark.parametrize("sequence", [128, 129, 257])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 K validation")
+@parametrize("sequence", [128, 129, 257])
 def test_mha_v4_mxfp6_k_raw_views(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
@@ -1011,8 +1003,8 @@ def test_mha_v4_mxfp6_k_raw_views(sequence):
     )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 K validation")
-@pytest.mark.parametrize("sequence", [1, 127, 128, 129, 257])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 K validation")
+@parametrize("sequence", [1, 127, 128, 129, 257])
 def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
@@ -1055,8 +1047,8 @@ def _llvm_objdump():
     )
 
 
-@pytest.mark.skipif(_llvm_objdump() is None, reason="llvm-objdump not available")
-@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+@skipif(_llvm_objdump() is None, reason="llvm-objdump not available")
+@parametrize("arch", ["gfx942", "gfx950"])
 def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
     """No DISPATCHABLE fmha_v4 object may fetch a scale with an unguarded global load.
 
@@ -1109,9 +1101,9 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
     )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
-@pytest.mark.parametrize("sequence", [1, 128, 129, 257, 512])
-@pytest.mark.parametrize(
+@skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
+@parametrize("sequence", [1, 128, 129, 257, 512])
+@parametrize(
     "quantize",
     [quantize_v_mxfp4_fp6_p],
     ids=["fp6_p"],
@@ -1150,7 +1142,7 @@ def test_mha_v4_rejects_unsupported_contracts():
         if get_gfx() == "gfx950"
         else "LSE is not validated on"
     )
-    with pytest.raises(NotImplementedError, match=lse_rejection):
+    with expect_raises(NotImplementedError, match=lse_rejection):
         mha_v4(
             q,
             q,
@@ -1161,7 +1153,7 @@ def test_mha_v4_rejects_unsupported_contracts():
             return_lse=True,
             block_mask=block_mask,
         )
-    with pytest.raises(ValueError, match="matching Q and K formats"):
+    with expect_raises(ValueError, match="matching Q and K formats"):
         mha_v4(
             q,
             q,
@@ -1172,8 +1164,8 @@ def test_mha_v4_rejects_unsupported_contracts():
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@pytest.mark.parametrize(
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@parametrize(
     ("q_format", "v_format", "scale_modes"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16, None),
@@ -1236,8 +1228,8 @@ def test_mha_v4_dense_lse_matches_reference(q_format, v_format, scale_modes):
     assert error.mean().item() < 0.05, error.mean().item()
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@pytest.mark.parametrize(
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@parametrize(
     ("q_format", "v_format"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16),
@@ -1248,7 +1240,7 @@ def test_mha_v4_dense_lse_matches_reference(q_format, v_format, scale_modes):
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
     ],
 )
-@pytest.mark.parametrize("gqa_ratio", [2, 4])
+@parametrize("gqa_ratio", [2, 4])
 def test_mha_v4_dense_lse_under_gqa(q_format, v_format, gqa_ratio):
     """K smoothing holds one mean per KV head, so the LSE correction has to expand it.
 
@@ -1290,7 +1282,7 @@ def test_mha_v4_dense_lse_under_gqa(q_format, v_format, gqa_ratio):
     assert error < 0.25, error
 
 
-@pytest.mark.parametrize(
+@parametrize(
     ("q_format", "v_format", "max_spread"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16, 0.05),
@@ -1347,23 +1339,23 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
     assert spread < max_spread, f"per-chunk bias {biases} spans {spread:.4f} nats"
 
 
-def test_mha_v4_lse_is_gated_off_gfx950(monkeypatch):
+def test_mha_v4_lse_is_gated_off_gfx950():
     """gfx942 carries the epilogue, but its exported value has never been measured.
 
     A wrong LSE passes every output test, because O never reads it, so presence of the store is
     not evidence of correctness. Drop the gate once MI300 is compared against torch.logsumexp.
     """
-    monkeypatch.setattr(mha_v4_module, "get_gfx", lambda: "gfx942")
-    q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
-    formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
+    with patched_attr(mha_v4_module, "get_gfx", lambda: "gfx942"):
+        q = torch.randn((1, 128, 4, 128), device="cuda", dtype=torch.bfloat16)
+        formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
 
-    with pytest.raises(NotImplementedError, match="not validated on gfx942"):
-        mha_v4(q, q, q, *formats, return_lse=True)
+        with expect_raises(NotImplementedError, match="not validated on gfx942"):
+            mha_v4(q, q, q, *formats, return_lse=True)
 
-    assert torch.isfinite(mha_v4(q, q, q, *formats)).all()
+        assert torch.isfinite(mha_v4(q, q, q, *formats)).all()
 
 
-@pytest.mark.parametrize(
+@parametrize(
     "q_format",
     [
         AttentionFormat.FP16,
@@ -1376,7 +1368,7 @@ def test_mha_v4_lse_is_gated_off_gfx950(monkeypatch):
 )
 def test_mha_v4_rejects_reserved_raw_formats(q_format):
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises((ValueError, NotImplementedError)):
+    with expect_raises((ValueError, NotImplementedError)):
         mha_v4(
             q,
             q,
@@ -1389,7 +1381,7 @@ def test_mha_v4_rejects_reserved_raw_formats(q_format):
 
 def test_mha_v4_raw_rejects_partial_scale_recipe():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="must all be set or all omitted"):
+    with expect_raises(ValueError, match="must all be set or all omitted"):
         mha_v4(
             q,
             q,
@@ -1403,7 +1395,7 @@ def test_mha_v4_raw_rejects_partial_scale_recipe():
 
 def test_mha_v4_raw_rejects_unsupported_scale_recipe():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="unsupported scale recipe"):
+    with expect_raises(ValueError, match="unsupported scale recipe"):
         mha_v4(
             q,
             q,
@@ -1417,12 +1409,12 @@ def test_mha_v4_raw_rejects_unsupported_scale_recipe():
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_packed_rejects_wrong_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.int8)
     v = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="unsupported scale recipe"):
+    with expect_raises(ValueError, match="unsupported scale recipe"):
         mha_v4_packed(
             q,
             q,
@@ -1439,7 +1431,7 @@ def test_mha_v4_packed_rejects_wrong_scale_recipe():
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
 def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     qk_scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
@@ -1460,11 +1452,11 @@ def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_packed_rejects_wrong_fp8_encoding():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
-    with pytest.raises(RuntimeError, match="must be FP8 E4M3 FNUZ"):
+    with expect_raises(RuntimeError, match="must be FP8 E4M3 FNUZ"):
         mha_v4_packed(
             q,
             q,
@@ -1481,7 +1473,7 @@ def test_mha_v4_packed_rejects_wrong_fp8_encoding():
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 K validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 K validation")
 def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
     q = torch.zeros((1, 128, 2, 64), device="cuda", dtype=torch.uint8)
     scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
@@ -1497,7 +1489,7 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
             AttentionScaleMode.E8M0_PER_1X32,
         ),
     ):
-        with pytest.raises(ValueError, match="coalesced MHA v4 tile layout"):
+        with expect_raises(ValueError, match="coalesced MHA v4 tile layout"):
             mha_v4_packed(
                 q,
                 q,
@@ -1520,7 +1512,7 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
     assert coalesced_k.stride() == (16384, 64, 8192, 1)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
 def test_mha_v4_packed_rejects_unbacked_mx_scales():
     """An external caller passing exact-size scales would fault the speculative gathers.
 
@@ -1534,7 +1526,7 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
     mxfp4_q, mxfp4_q_scale = quantize_mxfp4_q(value, 1.0)
     mxfp4_raw, mxfp4_k_scale = quantize_mxfp4_k(value)
     mxfp4_v_raw, mxfp4_v_scale = quantize_v_mxfp4_fp6_p(value)
-    with pytest.raises(RuntimeError, match="speculative tile gather"):
+    with expect_raises(RuntimeError, match="speculative tile gather"):
         mha_v4_packed(
             mxfp4_q,
             mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
@@ -1550,7 +1542,7 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
             AttentionScaleMode.E8M0_PER_1X32,
         )
 
-    with pytest.raises(RuntimeError, match="MX V descale needs"):
+    with expect_raises(RuntimeError, match="MX V descale needs"):
         mha_v4_packed(
             mxfp4_q,
             mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
@@ -1567,8 +1559,8 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@pytest.mark.parametrize(
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@parametrize(
     ("q_format", "v_format"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16),
@@ -1585,8 +1577,8 @@ def test_mha_v4_zero_inputs_are_finite(q_format, v_format):
     assert torch.isfinite(out).all()
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@pytest.mark.parametrize(
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@parametrize(
     ("q_format", "v_format", "scale_modes"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16, {}),
@@ -1633,8 +1625,8 @@ def test_mha_v4_empty_heads_are_finite(q_format, v_format, scale_modes):
     assert torch.count_nonzero(out[:, :, :2]) > 0
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 BF16-FP8 validation")
-@pytest.mark.parametrize(("sequence_q", "sequence_k"), [(129, 257), (257, 193)])
+@skipif(get_gfx() != "gfx950", reason="gfx950 BF16-FP8 validation")
+@parametrize(("sequence_q", "sequence_k"), [(129, 257), (257, 193)])
 def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
     torch.manual_seed(sequence_q + sequence_k)
     q = torch.randn((1, sequence_q, 5, 128), device="cuda", dtype=torch.bfloat16)
@@ -1667,7 +1659,7 @@ def test_mha_v4_bf16fp8_matches_dequantized_reference(sequence_q, sequence_k):
     assert cosine > 0.998
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 GQA validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 GQA validation")
 def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
     torch.manual_seed(41)
     q = torch.randn((2, 129, 64, 128), device="cuda", dtype=torch.bfloat16)
@@ -1695,9 +1687,7 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
     assert torch.equal(gqa, mha)
 
 
-@pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 I8FP8 validation"
-)
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 I8FP8 validation")
 def test_mha_v4_packed_i8fp8_compile_parity():
     torch.manual_seed(17)
     q = torch.randint(-32, 33, (1, 512, 5, 128), device="cuda", dtype=torch.int8)
@@ -1743,9 +1733,7 @@ def test_mha_v4_packed_i8fp8_compile_parity():
     assert torch.equal(eager, compiled)
 
 
-@pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 FP8 validation"
-)
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 FP8 validation")
 def test_mha_v4_packed_fp8_compile_parity():
     torch.manual_seed(23)
     q = torch.randn((1, 512, 5, 128), device="cuda").to(dtypes.fp8)
@@ -1788,7 +1776,7 @@ def test_mha_v4_packed_fp8_compile_parity():
     assert torch.equal(eager, compiled)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
 def test_mha_v4_native_schema_mutates_only_out():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
@@ -1815,8 +1803,8 @@ def test_mha_v4_native_schema_mutates_only_out():
     assert schema.endswith("-> ()")
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@pytest.mark.parametrize(
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@parametrize(
     ("q_format", "v_format"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16),
@@ -1854,7 +1842,7 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
     assert churn.numel() == 16 * 1024 * 1024
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
 def test_mha_v4_raw_mxfp8_compile_parity():
     torch.manual_seed(41)
     q = torch.randn((1, 257, 5, 128), device="cuda", dtype=torch.bfloat16)
@@ -1901,8 +1889,8 @@ def test_mha_v4_raw_mxfp8_compile_parity():
     assert torch.isfinite(compiled).all()
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
-@pytest.mark.parametrize("q_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
+@parametrize("q_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
 def test_mha_v4_raw_mxfp4_v_supports_unaligned_sequence(q_format):
     torch.manual_seed(37)
     q = torch.randn((1, 129, 2, 128), device="cuda", dtype=torch.bfloat16)
@@ -1938,16 +1926,16 @@ def _cosine_against_attention(actual, q, k, v):
 _MX_UNALIGNED_COSINE = 0.95
 
 _MX_V_RECIPES = [
-    pytest.param(native_fp8_format(), AttentionFormat.MXFP6, id="f8f6"),
-    pytest.param(AttentionFormat.MXFP6, AttentionFormat.MXFP6, id="mxfp6"),
-    pytest.param(AttentionFormat.MXFP6, AttentionFormat.MXFP4, id="f6f4"),
-    pytest.param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, id="mxfp4"),
+    param(native_fp8_format(), AttentionFormat.MXFP6, id="f8f6"),
+    param(AttentionFormat.MXFP6, AttentionFormat.MXFP6, id="mxfp6"),
+    param(AttentionFormat.MXFP6, AttentionFormat.MXFP4, id="f6f4"),
+    param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, id="mxfp4"),
 ]
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX V validation")
-@pytest.mark.parametrize(("qk_format", "v_format"), _MX_V_RECIPES)
-@pytest.mark.parametrize("tail", [1, 8, 32, 64, 96, 127])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX V validation")
+@parametrize(("qk_format", "v_format"), _MX_V_RECIPES)
+@parametrize("tail", [1, 8, 32, 64, 96, 127])
 def test_mha_v4_mx_v_partial_kv_tile_matches_attention(qk_format, v_format, tail):
     """Every MX V recipe must stay correct when the last KV tile is partly filled.
 
@@ -2102,11 +2090,6 @@ def main():
             frame.to_markdown(index=False),
         )
 
-    # Invariants a numeric sweep cannot reach: a row that ignores seqlens_k still returns the
-    # dense answer, and the K-mean over-read is a fault rather than a wrong number.
-    check_varlen_capable_objects()
-    check_k_mean_bounds()
-
     # Raised after the table so every recipe is reported, not just the first bad one.
     failed = sorted(
         {
@@ -2131,7 +2114,7 @@ def _dense_reference(q, k, v, valid):
     ).permute(0, 2, 1, 3)
 
 
-@pytest.mark.parametrize("lengths", [(300, 137), (512, 64), (1, 511), (65, 65)])
+@parametrize("lengths", [(300, 137), (512, 64), (1, 511), (65, 65)])
 def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
     torch.manual_seed(41)
     batch, sequence, heads = len(lengths), 512, 4
@@ -2179,7 +2162,7 @@ def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
     assert torch.equal(dense, full)
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="dense varlen is a gfx950 row")
+@skipif(get_gfx() != "gfx950", reason="dense varlen is a gfx950 row")
 def test_mha_v4_rejects_unusable_seqlens_k():
     """Off gfx950 the capability gate preempts these, so the dtype and shape messages
     are only reachable here. The sparse rejection below is covered arch-independently
@@ -2187,15 +2170,15 @@ def test_mha_v4_rejects_unusable_seqlens_k():
     q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
     formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
 
-    with pytest.raises(ValueError, match="int32"):
+    with expect_raises(ValueError, match="int32"):
         mha_v4(
             q, q, q, *formats, seqlens_k=torch.ones(2, device="cuda", dtype=torch.int64)
         )
-    with pytest.raises(ValueError, match="one entry per batch"):
+    with expect_raises(ValueError, match="one entry per batch"):
         mha_v4(
             q, q, q, *formats, seqlens_k=torch.ones(1, device="cuda", dtype=torch.int32)
         )
-    with pytest.raises(NotImplementedError, match="per-batch key lengths"):
+    with expect_raises(NotImplementedError, match="per-batch key lengths"):
         mha_v4(
             q,
             q,
@@ -2239,7 +2222,7 @@ def test_mha_v4_launch_rejects_off_device_seqlens_k():
     q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
     out = torch.empty_like(q)
 
-    with pytest.raises(RuntimeError, match="same device as Q"):
+    with expect_raises(RuntimeError, match="same device as Q"):
         _launch_bf16_dense(q, out, seqlens_k=torch.full((2,), 256, dtype=torch.int32))
 
 
@@ -2248,7 +2231,7 @@ def test_mha_v4_launch_rejects_off_device_lse():
     q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
     out = torch.empty_like(q)
 
-    with pytest.raises(RuntimeError, match="same device as Q"):
+    with expect_raises(RuntimeError, match="same device as Q"):
         _launch_bf16_dense(q, out, lse=torch.empty((2, 4, 256), dtype=torch.float32))
 
 
@@ -2305,15 +2288,14 @@ def check_varlen_capable_objects(arch="gfx950"):
     )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@pytest.mark.parametrize("arch", ["gfx950"])
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@parametrize("arch", ["gfx950"])
 def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
     check_varlen_capable_objects(arch)
 
 
 if __name__ == "__main__":
     main()
-    # CI runs this file as a script, so the checks only execute if we invoke pytest here.
-    pytest_status = pytest.main([__file__, "-v"])
-    if pytest_status != pytest.ExitCode.OK:
-        raise SystemExit(pytest_status)
+    # CI runs this file as a script, so the checks only execute if main() invokes them.
+    if _CHECKS.run(globals()):
+        raise SystemExit(1)
