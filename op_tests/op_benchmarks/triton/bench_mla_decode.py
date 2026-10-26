@@ -32,19 +32,27 @@ def ref_preprocess(kv_cache, kv_lora_rank):
 # - kimik25: Kimi-K2 family. kimik25-tp4 has the full head count (64), and
 #   --tensor-parallelism divides it, so this config works with any TP degree.
 #   The tp4 suffix doesn't apply to MLA.
+# --model all expands to MLA_MODEL_ALL (explicit <family>-<size> entries, not
+# bare families: a bare kimik25 would also pull kimik25-ep4 and duplicate rows).
 # A long term solution would be to add "kv_lora_rank", "qk_rope_head_dim" and
 # "rotary_dim" to the model config file or make this benchmark model agnostic,
 # i.e. accept only shapes instead of models.
 MLA_MODEL_FAMILIES = ("deepseek", "kimik25")
+MLA_MODEL_ALL = ("deepseek-V3", "kimik25-tp4")
 
 
 def model_benchmark_configs(args):
-    assert any(family in args.model for family in MLA_MODEL_FAMILIES), (
+    # Shared get_parser() --model help advertises "all". Expand it to the
+    # configs this benchmark can run instead of asserting before any load.
+    models = args.model
+    if models == "all":
+        models = ",".join(MLA_MODEL_ALL)
+    assert any(family in models for family in MLA_MODEL_FAMILIES), (
         f"Only these model families are supported for this benchmark: "
         f"{', '.join(MLA_MODEL_FAMILIES)}."
     )
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models=args.model)
+    configs = get_model_configs(config_path=config_file, models=models)
 
     batch_size = args.b if args.b else 1
 
