@@ -987,7 +987,7 @@ def get_pa_metadata_info_v1(
         )
         capacity = min(
             batch_size * max_partitions,
-            max(batch_size, (2 * cu_num + num_head_k - 1) // num_head_k),
+            batch_size + cu_num // num_head_k - 1,
         )
         max_work = capacity * num_head_k
         max_split_tiles = capacity
@@ -1045,12 +1045,15 @@ def get_pa_metadata_v1(
                        is at least 256 tokens and must be a multiple of block_size. Inputs must provide consistent Q/page
                        indptrs and valid context lengths. Empty contexts receive no work; callers
                        remain responsible for their final output values.
-                       Each request builds its plan on the GPU, followed by a same-stream
-                       finalizer for work_indptr. No GPU-to-CPU length readback is needed.
-                       Each nonempty request gets one partition, then integer prefix quotas
-                       distribute the remaining 2*CUs task budget across KV heads by KV tile count.
-                       Each request is split into equal contiguous tile ranges, matching the
-                       FlyDSL PA plan's 256-token partition rule when kv_granularity <= 256.
+                       Batches up to 512 share a block-wide prefix scan, write tasks in parallel,
+                       and finalize work_indptr in the same launch. Larger batches use per-request
+                       planning and a same-stream finalizer. No GPU-to-CPU length readback is needed.
+                       Prefix sums of page count times Q length divide work into persistent
+                       worker budgets. Contiguous tiles of one request assigned to the same
+                       worker form one partition, avoiding redundant partial outputs. Unlike
+                       a fixed task budget, long requests can still split in large batches.
+                       Small single-KV-head batches with uniform Q and highly uneven contexts
+                       retain proportional subdivision, coalesced within each worker.
                        All KV heads share the partition and reduction layout; persistent workers
                        may process multiple works. A restrictive max_split_per_batch limits
                        partitions and can reduce load balance.

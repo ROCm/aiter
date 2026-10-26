@@ -448,7 +448,7 @@ def test_pa_ps(
     kv_dtype: torch.dtype = dtypes.fp8,
     is_causal: bool = True,
     high_precision: int = 1,
-    metadata_mode: str = "v1_2",
+    metadata_mode: str = "v1_1",
 ) -> dict:
     ret = {}
     seed = 0
@@ -878,8 +878,8 @@ parser.add_argument(
 parser.add_argument(
     "--metadata-mode",
     choices=["v1_2", "v1_1"],
-    default="v1_2",
-    help="PA metadata strategy; v1_1 uses prefix-budget GPU planning (dense, one Q tile).",
+    default="v1_1",
+    help="PA metadata strategy; default v1_1 uses prefix-budget GPU planning (dense, one Q tile).",
 )
 args = parser.parse_args()
 
