@@ -447,7 +447,7 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
         const int k256 = 256 / sizeof({A0DataType});
         TORCH_CHECK(
             inter_dim % k128 == 0,
-            "gfx950 fp8 stage2 requires inter_dim to be a multiple of ",
+            "gfx950 a8w8 stage2 requires inter_dim to be a multiple of ",
             k128,
             ", got ",
             inter_dim);

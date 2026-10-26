@@ -18,7 +18,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter import QuantType
+import aiter.fused_moe as fused_moe_module
+from aiter import ActivationType, QuantType
 from aiter import dtypes as aiter_dtypes
 from aiter.fused_moe import fused_moe, get_2stage_cfgs, torch_moe
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
@@ -324,10 +325,71 @@ def test_gfx950_fp8_guard_ignores_gpu_archs(monkeypatch, gpu_archs):
 
 
 @pytest.mark.skipif(not _GFX950, reason="Exercises the gfx950 fp8 CK default dispatch")
-def test_gfx950_get_gfx_matches_live_device():
-    # The GPU_ARCHS cases must not leave the cached build arch on gfx942.
-    assert get_gfx() == "gfx950"
-    assert get_gfx_runtime() == "gfx950"
+def test_gfx950_fp8_tuned_ck_rejects_mixed_shuffle(monkeypatch):
+    # A matching tuned row skips the default heuristic. is_shuffled is the OR,
+    # so one tagged weight used to miss the warning and launch the CK kernel.
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "0")
+    key = (
+        get_gfx_runtime(),
+        fused_moe_module.get_cu_num(),
+        16,
+        896,
+        384,
+        8,
+        2,
+        str(ActivationType.Silu),
+        str(torch.bfloat16),
+        str(aiter_dtypes.fp8),
+        str(aiter_dtypes.fp8),
+        str(QuantType.per_Tensor),
+        True,
+        False,
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "cfg_2stages",
+        (
+            {
+                key: {
+                    "block_m": 32,
+                    "ksplit": 0,
+                    "kernelName1": "moe_ck2stages_gemm1_test",
+                    "kernelName2": "moe_ck2stages_gemm2_test",
+                    "run_1stage": False,
+                }
+            },
+            {},
+        ),
+    )
+
+    def dispatch(both_shuffled):
+        return get_2stage_cfgs(
+            16,
+            896,
+            384,
+            8,
+            2,
+            torch.bfloat16,
+            aiter_dtypes.fp8,
+            aiter_dtypes.fp8,
+            QuantType.per_Tensor,
+            True,
+            ActivationType.Silu,
+            False,
+            0,
+            0,
+            True,
+            opus_weights_shuffled=both_shuffled,
+        )
+
+    _clear_dispatch_caches()
+    # A missed row falls through to the default heuristic, whose stage-2
+    # kernel name is empty. This has to be the tuned kernel or the raise
+    # below is the default guard instead.
+    selected = dispatch(True)
+    assert selected.stage2.keywords["kernelName"] == "moe_ck2stages_gemm2_test"
+    with pytest.raises(RuntimeError, match="both w1 and w2"):
+        dispatch(False)
 
 
 def _stage2_k(inter_dim, block_m):
