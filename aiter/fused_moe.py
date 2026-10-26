@@ -3737,6 +3737,7 @@ def get_2stage_cfgs(
             and activation == ActivationType.Silu
             and use_g1u1
             and gate_mode == GateMode.SEPARATED
+            and (gate_up_interleave is None or gate_up_interleave is False)
             and is_shuffled
             and not (
                 is_ep
