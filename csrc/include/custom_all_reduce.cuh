@@ -21,6 +21,8 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -757,6 +759,66 @@ __global__ void __launch_bounds__(512, 1) allgather_vec(
     {
         int write_idx                                   = warp_id * size + idx;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// Up to this many tensors gathered by one allgatherv launch.
+constexpr int kAllGatherVMax = 4;
+
+// One launch, one rank barrier, for the first-dim all-gather of several
+// tensors whose row counts may differ per rank. Rank w holds `rows[w]` rows of
+// every tensor; tensor t's rows are `row_bytes[t]` bytes, read at `in_off[t]`
+// past rank w's `dp[t]` pointer and written to the contiguous `out[t]` from
+// row `row_start[w]`.
+struct AllGatherVArgs
+{
+    const RankData* dp[kAllGatherVMax];
+    int64_t in_off[kAllGatherVMax];
+    uint8_t* out[kAllGatherVMax];
+    int64_t row_bytes[kAllGatherVMax];
+    int64_t rows[8];
+    int64_t row_start[8];
+    int n;
+};
+
+template <int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    allgatherv(AllGatherVArgs args, RankSignals sg, Signal* self_sg, int rank)
+{
+    using P                = opus::vector_t<uint32_t, 4>;
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    int warp_id            = threadIdx.x / tnum_gpu;
+    int lane_id            = threadIdx.x % tnum_gpu;
+    int tid                = blockIdx.x * tnum_gpu + lane_id;
+    int stride             = gridDim.x * tnum_gpu;
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for(int t = 0; t < args.n; ++t)
+    {
+        const int64_t row_bytes = args.row_bytes[t];
+        // Under 2 GiB a rank (checked on the host), so 32-bit indices.
+        const int bytes = static_cast<int>(args.rows[warp_id] * row_bytes);
+        const uint8_t* src =
+            static_cast<const uint8_t*>(args.dp[t]->ptrs[warp_id]) + args.in_off[t];
+        uint8_t* dst = args.out[t] + args.row_start[warp_id] * row_bytes;
+        // 16-byte units when every rank's slice stays 16-byte aligned in the
+        // output, 4-byte words otherwise.
+        if(row_bytes % 16 == 0)
+        {
+            for(int idx = tid; idx < bytes / 16; idx += stride)
+            {
+                reinterpret_cast<P*>(dst)[idx] = reinterpret_cast<const P*>(src)[idx];
+            }
+        }
+        else
+        {
+            for(int idx = tid; idx < bytes / 4; idx += stride)
+            {
+                reinterpret_cast<uint32_t*>(dst)[idx] =
+                    reinterpret_cast<const uint32_t*>(src)[idx];
+            }
+        }
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
@@ -4291,7 +4353,6 @@ class CustomAllreduce
                     rd.ptrs[j] = self_ptr;
                 }
             }
-            output_buffers_[self_ptr] = d_rank_data_end_ - 1 - i;
         }
 
         if(num_input_buffers > 0)
@@ -4928,6 +4989,57 @@ void dispatchAllGather(
             break;
         default: printf("allgather world_size error\n");
         }
+    }
+}
+
+// First-dim all-gather of `n` tensors in one launch, rank w contributing
+// `rows[w]` rows of each: tensor i's rows are `row_bytes[i]` bytes (a multiple
+// of 4), read at `in_off[i]` past `inputs[i]` -- a buffer resolved like any
+// other collective input (registered, or bound in capture) -- and written to
+// `outputs[i]` in rank order.
+void dispatchAllGatherV(hipStream_t stream,
+                        int n,
+                        void* const* inputs,
+                        const int64_t* in_off,
+                        void* const* outputs,
+                        const int64_t* row_bytes,
+                        const int64_t* rows)
+{
+    AllGatherVArgs args{};
+    args.n           = n;
+    int64_t max_rows = 0, start = 0;
+    for(int w = 0; w < world_size_; ++w)
+    {
+        args.rows[w]      = rows[w];
+        args.row_start[w] = start;
+        start += rows[w];
+        max_rows = std::max(max_rows, rows[w]);
+    }
+    int64_t units = 0;
+    for(int i = 0; i < n; ++i)
+    {
+        const int64_t bytes = max_rows * row_bytes[i];
+        // The kernel walks a rank's slice with 32-bit indices.
+        AITER_CHECK(row_bytes[i] % 4 == 0 && bytes <= INT32_MAX,
+                    "allgatherv needs rows of a multiple of 4 bytes, under 2 GiB a rank");
+        args.dp[i]        = get_buffer_RD(stream, inputs[i]);
+        args.in_off[i]    = in_off[i];
+        args.out[i]       = static_cast<uint8_t*>(outputs[i]);
+        args.row_bytes[i] = row_bytes[i];
+        units             = std::max(units, row_bytes[i] % 16 == 0 ? bytes / 16 : bytes / 4);
+    }
+    // Sized by every rank's row counts, so all ranks launch the same grid:
+    // the barrier flags are kept per block, kMaxBlocks of them.
+    int tnum_per_block = 512 / world_size_;
+    int64_t block_num  = (units + tnum_per_block - 1) / tnum_per_block;
+    dim3 grid(static_cast<int>(std::clamp<int64_t>(block_num, 1, kMaxBlocks)));
+    dim3 block(512);
+    switch(world_size_)
+    {
+    case 8: allgatherv<8><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
+    case 4: allgatherv<4><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
+    case 2: allgatherv<2><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
+    default: throw std::runtime_error("allgatherv world_size error");
     }
 }
 
