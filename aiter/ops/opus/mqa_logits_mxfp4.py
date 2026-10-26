@@ -29,13 +29,20 @@ concurrent streams. Nothing reads device data on the host, so every path can be 
 A slice of rows ``[start, start + count)`` (a band) is scored by slicing the per-row tensors and
 passing ``query_start_loc.clamp(start, start + count) - start``.
 
-LAYOUTS (gfx1250's natural ones; nothing here touches the data)::
+LAYOUTS (the caller's; nothing here touches the data). Every arch::
 
-    q          [rows, H, D/2]         uint8 / fp4x2      weights   [rows, H]       bf16
-    q_scale    [rows, H, D/32]        uint8 (E8M0)       row_ends  [rows]          int32
-    kv_cache   [pages, page_size, D/2]                   query_start_loc [seqs + 1] int32
-    kv_scale   [pages, page_size, D/32]                  block_tables [seqs, width] int32
-    out        [rows, >= max_seq_len] fp32, or flat with out_offsets [rows] int64
+    q          [rows, H, D/2]  uint8 / fp4x2     weights          [rows, H]       bf16
+    row_ends   [rows]          int32             query_start_loc  [seqs + 1]      int32
+    block_tables [seqs, width] int32             out [rows, >= max_seq_len] fp32, or flat
+                                                     with out_offsets [rows] int64
+
+and per arch (the KV cache writer's; both have the same byte counts, so only the ndim tells
+them apart -- checked here, as nothing on device can)::
+
+               gfx1250 (natural)                 gfx950 (MFMA-permuted, page_size 64)
+    q_scale    [rows, H, D/32]   uint8 (E8M0)    [rows, 2, 32, 4]
+    kv_cache   [pages, page_size, D/2]           [pages, 4, page_size, 16]
+    kv_scale   [pages, page_size, D/32]          [pages, 2, 32, 4]
 
 Only ``out[r, c]`` for ``c < row_ends[r]`` is written; rows past ``query_start_loc[-1]`` (CUDAGraph
 padding) are untouched. The caller owes what the kernel cannot check: ``row_ends`` does not
@@ -64,7 +71,7 @@ _MD_NAME = "module_mqa_logits_mxfp4_opus"
 TABLE, FREE, PREFILL = 0, 1, 2
 _MODE_NAMES = {"table": TABLE, "free": FREE, "prefill": PREFILL}
 
-_TILE = 64  # keys a KV tile, every instance's
+_TILE = 64  # keys a KV tile, every gfx1250 instance's (gfx1250's rule tells V4.1 layers by it)
 # Mirrors of the C++ builder's constants (mqa_logits_mxfp4_sched.cuh).
 _SCHED_RECORD_INTS = 8
 _SCHED_SCRATCH_RECORDS = 96
@@ -94,8 +101,14 @@ _PREFILL_ROUNDS = 8
 _PREFILL_MIN_WALK = 16
 _CAND_MAX_WALK = 32
 
-# gfx950 scales / kv_cache are 4-D (MFMA-permuted); gfx1250's are 3-D (natural).
-_LAYOUT_NDIM = {GFX950: 4, GFX1250: 3}
+# Per arch: the ndim of q_scale / kv_scale / kv_cache, and kv_cache's page-rows dim. gfx950's are
+# MFMA-permuted (4-D, kv_cache [pages, 4, page_size, 16]); gfx1250's natural (3-D).
+_LAYOUT = {GFX950: (4, 2), GFX1250: (3, 1)}
+# Requests an arch serves through another op, not this one.
+_ELSEWHERE = {
+    (GFX950, 32): "V4.1 (heads=32) on gfx950 runs FlyDSL's row-group kernel "
+    "(aiter.ops.flydsl.flydsl_pa_mqa_logits_fp4), not this op",
+}
 
 
 # == JIT stubs: signatures must match MQA_LOGITS_MXFP4_PYBIND exactly ============================
@@ -174,11 +187,13 @@ class _Instance:
         """Whether it reads a table whose entries name `entry_rows` plane rows."""
         if not self.entry_rows_min <= entry_rows <= self.entry_rows_max:
             return False
-        # contiguous tiles: an entry is a power-of-two run of whole tiles
-        runs = entry_rows // self.tile_keys
-        return bool(self.gather) or (
-            entry_rows % self.tile_keys == 0 and runs & (runs - 1) == 0
-        )
+        if self.gather:
+            return True
+        # contiguous tiles: an entry is a power-of-two run of whole tiles, or a tile a
+        # power-of-two run of whole entries (the registry's entry_rows bounds say which)
+        big, small = max(entry_rows, self.tile_keys), min(entry_rows, self.tile_keys)
+        runs = big // small
+        return big % small == 0 and runs & (runs - 1) == 0
 
 
 @functools.cache
@@ -210,10 +225,9 @@ def _describe(insts) -> str:
     )
 
 
-def _rule(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
-    """§3.2's selection: the wanted attributes and the schedule-free mode, from static bounds.
-
-    Mixed batches run the prefill choice. Returns None for a request no rule covers.
+def _rule_gfx1250(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
+    """§3.2's selection on gfx1250: the wanted attributes and the schedule-free mode, from
+    static bounds. Mixed batches run the prefill choice. None: no rule covers the request.
     """
     decode = max_qlen <= _DECODE_MAX_QLEN
     if heads == 64:
@@ -255,6 +269,17 @@ def _rule(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
             "gather": 1,
         }, PREFILL
     return None
+
+
+def _rule_gfx950(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
+    """gfx950: no instance is registered under this interface yet (design §7 step 3); its rule
+    lands here with the measurements that pick its instances. V4.1 runs FlyDSL (_ELSEWHERE).
+    """
+
+
+# Each arch's selection, (heads, entry_rows, max_rows, max_qlen) -> (wanted attributes, the
+# schedule-free mode) or None. Its constants are the arch's own measurements.
+_RULES = {GFX1250: _rule_gfx1250, GFX950: _rule_gfx950}
 
 
 def _matches(inst: _Instance, want: dict) -> bool:
@@ -306,7 +331,7 @@ class MqaLogitsConfig:
     _mode: (
         int | None
     )  # the schedule-free mode, or None: no schedule means an internal one
-    _tpb_shift: int  # log2(64-key tiles a table entry), contiguous tiles
+    _tpb_shift: int  # log2(tiles a table entry); 0 where a tile spans entries
     _table_slots: int  # the Table grid at the bounds
     _empty_i32: torch.Tensor
     _empty_i64: torch.Tensor
@@ -430,10 +455,13 @@ def _config(
     ):
         raise ValueError("every bound must be >= 1")
     arch = _device_arch(dev)
+    if (arch, heads) in _ELSEWHERE:
+        raise ValueError(_ELSEWHERE[arch, heads])
     insts = _instances(dev)
     entry_rows = page_size * pages_per_block
     supported = [i for i in insts if i.heads == heads and i.reads(entry_rows)]
-    rule = _rule(heads, entry_rows, max_rows, max_qlen)
+    rule_of = _RULES.get(arch)
+    rule = rule_of(heads, entry_rows, max_rows, max_qlen) if rule_of else None
     if override is not None:
         inst = _resolve_instance(insts, override)
         if inst not in supported:
@@ -594,14 +622,14 @@ def mqa_logits_mxfp4(
     inst = cfg._instance
     if q.device != cfg.device:
         raise ValueError(f"q is on {q.device}; the config is for {cfg.device}")
-    want = _LAYOUT_NDIM[cfg.arch]
+    want, page_dim = _LAYOUT[cfg.arch]
     for name, t in (
         ("q_scale", q_scale),
         ("kv_scale", kv_scale),
         ("kv_cache", kv_cache),
     ):
         if t.dim() != want:
-            other = [a for a, n in _LAYOUT_NDIM.items() if n == t.dim()]
+            other = [a for a, (n, _) in _LAYOUT.items() if n == t.dim()]
             why = (
                 f"; {t.dim()}-D is {other[0]}'s layout, which has the SAME byte count -- the "
                 "launch would accept it and return wrong logits"
@@ -613,9 +641,10 @@ def mqa_logits_mxfp4(
             )
     if q.dim() != 3 or q.shape[1] != cfg.heads:
         raise ValueError(f"q must be [rows, {cfg.heads}, D/2], got {tuple(q.shape)}")
-    if kv_cache.shape[1] != cfg.page_size:
+    if kv_cache.shape[page_dim] != cfg.page_size:
         raise ValueError(
-            f"kv_cache pages hold {kv_cache.shape[1]} rows; the config is for {cfg.page_size}"
+            f"kv_cache pages hold {kv_cache.shape[page_dim]} rows; the config is for "
+            f"{cfg.page_size}"
         )
     if block_tables.dim() != 2 or block_tables.shape[1] < cfg.block_table_width:
         raise ValueError(
@@ -663,7 +692,7 @@ def mqa_logits_mxfp4(
             cta_target = inst.resident[FREE]
             grid = groups + cta_target
         else:
-            parts = _prefill_parts(inst, groups, -(-cfg.max_seq_len // _TILE))
+            parts = _prefill_parts(inst, groups, -(-cfg.max_seq_len // inst.tile_keys))
             grid = groups * parts
     else:
         if not cfg._internal:
