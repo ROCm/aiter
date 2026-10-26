@@ -94,7 +94,10 @@ def _verify_dispatch(layout):
     # fmha_kernels imports the entries under aliases, and there are two families now
     # (a16w16 and the 8-bit a8w8 sibling), so watch whichever one this dtype routes to.
     suffix = "varlen" if layout == "thd" else "batch"
-    names = [f"flash_attn_{suffix}_gfx1250", f"flash_attn_{suffix}_gfx1250_a8w8"]
+    names = [
+        f"flash_attn_{suffix}_a16w16_gfx1250",
+        f"flash_attn_{suffix}_a8w8_gfx1250",
+    ]
     origs = {n: getattr(fk, n) for n in names}
     calls = {"n": 0}
 

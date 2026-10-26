@@ -36,25 +36,25 @@ import torch.nn.functional as F
 from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
-    TORCH_O_DTYPE as _GFX1250_A8W8_OUT_DTYPE,
+    TORCH_O_DTYPE as _A8W8_GFX1250_OUT_DTYPE,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
-    flash_attn_a8w8_m32x8_supported as flash_attn_gfx1250_a8w8_supported,
+    flash_attn_a8w8_m32x8_supported as flash_attn_a8w8_gfx1250_supported,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
-    flash_attn_batch_a8w8_m32x8 as flash_attn_batch_gfx1250_a8w8,
+    flash_attn_batch_a8w8_m32x8 as flash_attn_batch_a8w8_gfx1250,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
-    flash_attn_varlen_a8w8_m32x8 as flash_attn_varlen_gfx1250_a8w8,
+    flash_attn_varlen_a8w8_m32x8 as flash_attn_varlen_a8w8_gfx1250,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
-    flash_attn_a16w16_m32x8_supported as flash_attn_gfx1250_supported,
+    flash_attn_a16w16_m32x8_supported as flash_attn_a16w16_gfx1250_supported,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
-    flash_attn_batch_m32x8 as flash_attn_batch_gfx1250,
+    flash_attn_batch_m32x8 as flash_attn_batch_a16w16_gfx1250,
 )
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
-    flash_attn_varlen_m32x8 as flash_attn_varlen_gfx1250,
+    flash_attn_varlen_m32x8 as flash_attn_varlen_a16w16_gfx1250,
 )
 
 __all__ = [
@@ -252,7 +252,7 @@ def _check_out(out, q, v_hdim, out_dtype=None):
     ), f"out shape {tuple(out.shape)} != expected {want} (v_hdim={v_hdim})"
 
 
-_GFX1250_A8W8_IN_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_A8W8_GFX1250_IN_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 def _fp8_gfx950_supported(
@@ -403,18 +403,18 @@ def flydsl_flash_attn_varlen_fwd(
     elif gfxip == "gfx1250":
         # 8-bit Q/K/V go to the a8w8 sibling, which writes bf16 output; everything
         # else to a16w16, whose output follows the input.
-        _is_b8 = q.dtype in _GFX1250_A8W8_IN_DTYPES
+        _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
         if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
             return None
         if any(t.stride(-1) != 1 for t in (q, k, v)):
             return None
         if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
             return None
-        _out_dtype = _GFX1250_A8W8_OUT_DTYPE if _is_b8 else q.dtype
+        _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype
         _supported = (
-            flash_attn_gfx1250_a8w8_supported
+            flash_attn_a8w8_gfx1250_supported
             if _is_b8
-            else flash_attn_gfx1250_supported
+            else flash_attn_a16w16_gfx1250_supported
         )
         if not _supported(
             "varlen",
@@ -435,7 +435,9 @@ def flydsl_flash_attn_varlen_fwd(
         else:
             _check_out(out, q, v.shape[-1], out_dtype=_out_dtype)
         return (
-            flash_attn_varlen_gfx1250_a8w8 if _is_b8 else flash_attn_varlen_gfx1250
+            flash_attn_varlen_a8w8_gfx1250
+            if _is_b8
+            else flash_attn_varlen_a16w16_gfx1250
         )(
             q,
             k,
@@ -524,18 +526,18 @@ def flydsl_flash_attn_batch_fwd(
     # deterministic is a backward-only flag (this forward is atomic-free), and
     # flash_attn_func defaults it True -- gating on it would reject every request.
     elif gfxip == "gfx1250" and q.dim() == 4:
-        _is_b8 = q.dtype in _GFX1250_A8W8_IN_DTYPES
+        _is_b8 = q.dtype in _A8W8_GFX1250_IN_DTYPES
         if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
             return None
         if any(t.stride(-1) != 1 for t in (q, k, v)):
             return None
         if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
             return None
-        _out_dtype = _GFX1250_A8W8_OUT_DTYPE if _is_b8 else q.dtype
+        _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype
         _supported = (
-            flash_attn_gfx1250_a8w8_supported
+            flash_attn_a8w8_gfx1250_supported
             if _is_b8
-            else flash_attn_gfx1250_supported
+            else flash_attn_a16w16_gfx1250_supported
         )
         if not _supported(
             "batch",
@@ -555,7 +557,9 @@ def flydsl_flash_attn_batch_fwd(
             out = q.new_empty((*q.shape[:-1], v.shape[-1]), dtype=_out_dtype)
         else:
             _check_out(out, q, v.shape[-1], out_dtype=_out_dtype)
-        return (flash_attn_batch_gfx1250_a8w8 if _is_b8 else flash_attn_batch_gfx1250)(
+        return (
+            flash_attn_batch_a8w8_gfx1250 if _is_b8 else flash_attn_batch_a16w16_gfx1250
+        )(
             q,
             k,
             v,
