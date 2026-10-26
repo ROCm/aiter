@@ -737,8 +737,16 @@ def run_benchmarks(
                 print(f"FP4 is not supported on this device. Skipping {kernel}.")
                 continue
 
-            if kernel == "moe_op_gemm_a8w8" and not arch_info.is_fp8_avail():
-                print(f"FP8 is not supported on this device. Skipping {kernel}.")
+            # Default FP8xFP8 path. Verified on gfx950 and gfx1250. is_fp8_avail()
+            # also admits gfx942 / gfx1200 / gfx1201, but the wrapper leaves
+            # USE_FNUZ=False while gfx942 tensors are FNUZ, so keep those gated out.
+            if kernel == "moe_op_gemm_a8w8" and arch_info.get_arch() not in (
+                "gfx950",
+                "gfx1250",
+            ):
+                print(
+                    f"moe_op_gemm_a8w8 is not verified on this device. Skipping {kernel}."
+                )
                 continue
 
             # bench_mla_decode.py hardcodes the DeepSeek-V3 MLA dimensions and
