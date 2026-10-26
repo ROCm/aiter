@@ -61,7 +61,7 @@ plus ``FUSED_QR_ROW_ATOMS``. All three fused families live in one slot
 rungs run unsplit unless ``AITER_FLY_AR_FUSED_SPLIT=1``.
 
 The fused ladders are also keyed by the hidden size, and are read from
-``fused_allreduce_ladders.json`` (or the file ``AITER_FLY_AR_FUSED_LADDERS``
+``configs/comm/fused_allreduce_ladders.json`` (or the file ``AITER_FLY_AR_FUSED_LADDERS``
 names).
 """
 
@@ -291,11 +291,18 @@ class FusedOneShotRung:
 class FusedTwoShotRung:
     """The fused mesh or ring configuration for payloads of at least
     ``min_bytes``. Without ``block``: a fused build sizes
-    its workgroup to the token row (``FUSED_QR_ROW_ATOMS``)."""
+    its workgroup to the token row (``FUSED_QR_ROW_ATOMS``).
+
+    ``low_latency`` picks the mesh's low-latency build: the residual is loaded
+    ahead of the exchanges, and two workgroups per CU stay resident instead of
+    one, so ``grid_cap`` may go up to twice the CU count. It needs
+    ``super_tile=1`` and a width whose block is ``BLOCK``.
+    """
 
     min_bytes: int
     super_tile: int
     grid_cap: int
+    low_latency: bool = False
 
 
 def select_rung(ladder, nbytes: int):
@@ -995,29 +1002,28 @@ FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         ring=None,
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
     FamilyPolicy(
         arch="gfx950",
         link="xgmi",
         world_size=2,
-        oneshot=Window(0, 32 * MiB),
-        mesh=Window(2 * MiB, None),
-        ring=None,
+        oneshot=Window(0, 1792 * KiB),
+        mesh=None,
+        ring=Window(768 * KiB, None),
     ),
     FamilyPolicy(
         arch="gfx950",
         link="xgmi",
         world_size=4,
-        oneshot=Window(0, 512 * KiB),
-        mesh=Window(1344 * KiB, None),
+        oneshot=Window(0, 256 * KiB),
+        mesh=Window(768 * KiB, None),
         ring=None,
     ),
     FamilyPolicy(
         arch="gfx950",
         link="xgmi",
         world_size=8,
-        oneshot=Window(0, 128 * KiB),
-        mesh=Window(448 * KiB, None),
+        oneshot=Window(0, 168 * KiB),
+        mesh=Window(576 * KiB, None),
         ring=None,
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
@@ -1026,7 +1032,7 @@ FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="pcie",
         world_size=2,
         oneshot=Window(0, 32 * MiB),
-        mesh=Window(672 * KiB, 768 * KiB),
+        mesh=None,
         ring=Window(768 * KiB, None),
     ),
     FamilyPolicy(
@@ -1034,15 +1040,15 @@ FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="pcie",
         world_size=4,
         oneshot=Window(0, 32 * MiB),
-        mesh=Window(336 * KiB, 21 * MiB),
-        ring=Window(21 * MiB, None),
+        mesh=Window(384 * KiB, 24 * MiB),
+        ring=Window(24 * MiB, None),
     ),
     FamilyPolicy(
         arch="gfx950",
         link="pcie",
         world_size=8,
         oneshot=Window(0, 32 * MiB),
-        mesh=Window(168 * KiB, None),
+        mesh=Window(192 * KiB, None),
         ring=None,
     ),
 )
@@ -1059,7 +1065,10 @@ _FUSED_POLICY_BY_KEY = _index(FUSED_FAMILY_POLICIES)
 # The environment variable that names another ladder file.
 FUSED_LADDERS_ENV = "AITER_FLY_AR_FUSED_LADDERS"
 FUSED_LADDERS_JSON = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "fused_allreduce_ladders.json"
+    os.path.dirname(os.path.abspath(__file__)),
+    "configs",
+    "comm",
+    "fused_allreduce_ladders.json",
 )
 FUSED_LADDERS_SCHEMA_VERSION = 1
 
@@ -1123,10 +1132,18 @@ def _check_oneshot_rung(rung: FusedOneShotRung, where: str) -> None:
         )
 
 
-def _two_shot_check(super_tiles):
+def _two_shot_check(super_tiles, *, low_latency: bool):
     def check(rung: FusedTwoShotRung, where: str) -> None:
         _check_in(rung.super_tile, super_tiles, f"{where}.super_tile")
         _check_grid_cap(rung, where)
+        if not isinstance(rung.low_latency, bool):
+            msg = f"{where}.low_latency: must be true or false"
+            raise ValueError(msg)  # noqa: TRY004
+        if rung.low_latency and not (low_latency and rung.super_tile == 1):
+            raise ValueError(
+                f"{where}.low_latency: only a mesh rung with super_tile=1 can be a "
+                "low-latency build"
+            )
 
     return check
 
@@ -1134,20 +1151,23 @@ def _two_shot_check(super_tiles):
 # The rung record and the rung check of each family in the file.
 _FUSED_FAMILIES = {
     "oneshot": (FusedOneShotRung, _check_oneshot_rung),
-    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES)),
-    "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES)),
+    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES, low_latency=True)),
+    "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES, low_latency=False)),
 }
 
 
 def _parse_rungs(raw, cls, check, where: str) -> tuple:
     if not isinstance(raw, list) or not raw:
         raise ValueError(f"{where}.rungs: expected a non-empty list")
-    names = [f.name for f in dataclasses.fields(cls)]
+    all_fields = dataclasses.fields(cls)
+    names = [f.name for f in all_fields if f.default is dataclasses.MISSING]
+    optional = {f.name: f.default for f in all_fields if f.name not in names}
     rungs = []
     for i, fields in enumerate(raw):
         rw = f"{where}.rungs[{i}]"
-        _check_keys(fields, rw, names)
+        _check_keys(fields, rw, names, optional)
         values = {name: fields[name] for name in names}
+        values.update({k: fields.get(k, v) for k, v in optional.items()})
         values["min_bytes"] = _parse_bytes(values["min_bytes"], f"{rw}.min_bytes")
         rung = cls(**values)
         check(rung, rw)
@@ -1244,6 +1264,14 @@ def load_fused_ladders(path: str) -> FusedLadders:
             for hidden, entry, ew in entries:
                 _check_keys(entry, ew, ("rungs",), ("atoms_per_row",) if qr else ())
                 rungs = _parse_rungs(entry["rungs"], cls, check, ew)
+                if link != "xgmi" and any(
+                    getattr(r, "low_latency", False) for r in rungs
+                ):
+                    raise ValueError(
+                        f"{ew}: a low-latency rung is only for xgmi: the build "
+                        "has not been measured on other links, where it ran "
+                        "slower than the default"
+                    )
                 if family == "oneshot" and hidden is None:
                     splits = sorted({r.split for r in rungs} - {1})
                     if splits:

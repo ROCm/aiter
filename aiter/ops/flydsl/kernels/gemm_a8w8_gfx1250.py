@@ -552,7 +552,7 @@ def launch_gemm_a8w8(
             )
         c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
         for cf in c_frags:
-            cf.store(Vec.filled(8, 0.0, fx.Float32))
+            cf.store(fx.full(8, 0.0, fx.Float32))
 
         def _rmem(n, v):
             t = fx.make_rmem_tensor(n, fx.Int32)
@@ -760,10 +760,10 @@ def launch_gemm_a8w8(
             sa_view = fx.Tensor(fx.make_view(gSA_base, fx.make_layout(i32_m, 1)))
             sb_view = fx.Tensor(fx.make_view(gSB_base, fx.make_layout(i32_n, 1)))
             sa_buf = fx.rocdl.make_buffer_tensor(
-                sa_view, max_size=False, num_records_bytes=i32_m * fx.Int32(4)
+                sa_view, max_size=False, num_records_bytes=i32_m * 4
             )
             sb_buf = fx.rocdl.make_buffer_tensor(
-                sb_view, max_size=False, num_records_bytes=i32_n * fx.Int32(4)
+                sb_view, max_size=False, num_records_bytes=i32_n * 4
             )
             sa_lay, sb_lay = (fx.make_layout(1, 1), fx.make_layout(4, 1))
             sa_tiles = fx.logical_divide(sa_buf, sa_lay)

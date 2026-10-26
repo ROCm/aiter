@@ -24,8 +24,8 @@ from aiter.dist.device_communicators.custom_all_reduce import (
 )
 from aiter.dist.device_communicators.flydsl_backends import (
     FlyDSLAllReduceRMSNorm,
+    FlyDSLQuickAllReduce,
 )
-from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.allreduce_policy import (
     RING_SUPER_TILES,
@@ -519,11 +519,12 @@ def test_selectors_reject_non_contiguous():
     """
     policy = _row("pcie", 4, "gfx950")
     qr = SimpleNamespace(
-        _fly_policy=policy, _fly_engines={MESH: object(), RING: object()}
+        disabled=False, policy=policy, engines={MESH: object(), RING: object()}
     )
+    qr.select = lambda nbytes: FlyDSLQuickAllReduce.select(qr, nbytes)
     t = _full_storage_transpose(policy.window(MESH, quantized=True).min + (64 << 10))
-    assert QuickAllReduce._should_fly(qr, t.contiguous())
-    assert not QuickAllReduce._should_fly(qr, t)
+    assert FlyDSLQuickAllReduce.should_fly_ar(qr, t.contiguous())
+    assert not FlyDSLQuickAllReduce.should_fly_ar(qr, t)
 
     one = policy.window(ONESHOT, quantized=False)
     ca = SimpleNamespace(
@@ -701,7 +702,10 @@ def test_fused_oneshot_split_is_opt_in():
     for link, ws, arch in CELLS:
         for hidden in _widths(link, ws, arch):
             kw = {"world_size": ws, "link": link, "arch": arch, "hidden": hidden}
-            table = P.FUSED_ONESHOT_LADDER[(arch, link, ws, hidden)]
+            # A width with a mesh/ring ladder only runs the default one-shot.
+            table = P.FUSED_ONESHOT_LADDER.get(
+                (arch, link, ws, hidden), P.FUSED_ONESHOT_LADDER[(arch, link, ws, None)]
+            )
             with mock.patch.dict(os.environ):
                 os.environ.pop(P.FUSED_SPLIT_ENV, None)
                 off = P.fused_oneshot_ladder(**kw)
@@ -1115,3 +1119,69 @@ def test_fused_backend_declines_together_when_policies_differ(differ_by):
     assert not any(differ for _r, _s, differ, _d, _b in got)
     # No rank started an engine build, which is the collective that hangs.
     assert [builds for *_rest, builds in got] == [[], []]
+
+
+def _plain_agreement_rank(rank, init_method, queue, differ):
+    """One rank of the plain-backend agreement test: when *differ*, rank 1
+    moves the mesh window, and both ranks must decline without building."""
+    import torch.distributed as dist
+
+    os.environ["AITER_FLY_AR"] = "1"
+    if rank == 1 and differ:
+        os.environ["AITER_FLY_AR_MESH_MIN_BYTES"] = str(1 << 20)
+    dist.init_process_group("gloo", init_method=init_method, world_size=2, rank=rank)
+    from aiter.dist.device_communicators import flydsl_backends as B
+
+    builds = []
+
+    def fake_engine(**kw):
+        builds.append(kw["algorithm"])
+        raise RuntimeError("no GPU here")
+
+    with (
+        mock.patch("aiter.jit.utils.chip_info.get_gfx_runtime", return_value="gfx950"),
+        mock.patch.object(P, "detect_link", return_value="pcie"),
+        mock.patch.object(B, "FlyQuickAllReduce", side_effect=fake_engine),
+    ):
+        backend = B.FlyDSLQuickAllReduce(
+            group=dist.group.WORLD, device=torch.device("cpu")
+        )
+    queue.put((rank, backend.disabled, builds))
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("differ", (False, True))
+def test_plain_backend_declines_together(differ):
+    """The quantized plain backend declines on every rank together: before any
+    build when the ranks resolved different policies, and after a failed build
+    (here: no GPU) otherwise."""
+    import torch.multiprocessing as mp
+
+    from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    procs = [
+        ctx.Process(target=_plain_agreement_rank, args=(r, init_method, queue, differ))
+        for r in range(2)
+    ]
+    for p in procs:
+        p.start()
+    got = sorted(queue.get(timeout=120) for _ in procs)
+    for p in procs:
+        p.join(timeout=60)
+        assert p.exitcode == 0
+    assert [(r, disabled) for r, disabled, _b in got] == [(0, True), (1, True)]
+    builds = [b for *_rest, b in got]
+    if differ:
+        assert builds == [[], []]
+    else:
+        # The gfx950/pcie TP2 row serves the mesh; each rank tried to build it.
+        assert all(builds) and builds[0] == builds[1]
+
+
+def test_unknown_quantization_declines():
+    with mock.patch.object(P, "enabled", return_value=True):
+        backend = FlyDSLQuickAllReduce(None, torch.device("cpu"), quantization="INT8")
+    assert backend.disabled and backend.select(1 << 20) is None

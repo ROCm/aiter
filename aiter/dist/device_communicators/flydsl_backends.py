@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The FlyDSL fused all-reduce + RMSNorm backend.
+"""The FlyDSL backends of the communicators: the quantized plain all-reduce
+(``FlyDSLQuickAllReduce``) and the fused all-reduce + RMSNorm
+(``FlyDSLAllReduceRMSNorm``).
 
-The message size windows come from the fused policy, ``resolve_fused_policy``,
-and ``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES`` override them.
+The message size windows come from the policies, ``resolve_family_policy`` and
+``resolve_fused_policy``, and ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` and
+``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES`` override them.
 """
 
 import hashlib
@@ -21,14 +24,23 @@ logger = logging.getLogger(__name__)
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
-    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
+    from aiter.ops.flydsl.quick_allreduce import (
+        FlyQuickAllReduce,
+        FlyQuickAllReduceRMSNorm,
+    )
 
     _FLY_IMPORT_OK = True
 except Exception:  # noqa: BLE001
     fly_policy = None
     OneShotAllReduceRMSNorm = None
+    FlyQuickAllReduce = None
     FlyQuickAllReduceRMSNorm = None
     _FLY_IMPORT_OK = False
+
+# Quantization levels the FlyDSL plain all-reduce serves, by quick-reduce
+# regime name, mapped to the wire formats to pin on the ring's two laps.
+# ``None`` means "use the schedule's own per-world default".
+FLY_QUANTIZATIONS = {"INT4": (None, None)}
 
 
 def all_ranks_agree(ok: bool, group) -> bool:
@@ -50,6 +62,12 @@ def all_ranks_same(value: int, group) -> bool:
 _POLICY_DECLINED = 0
 
 
+def _digest(parts) -> int:
+    """A nonzero number that is equal on two ranks exactly when *parts* are."""
+    digest = hashlib.sha256(repr(parts).encode()).digest()
+    return int.from_bytes(digest[:8], "little") % ((1 << 62) - 1) + 1
+
+
 def _policy_digest(
     *, quantized: bool, link: str, arch: str, policy, world_size: int, hiddens
 ) -> int:
@@ -64,8 +82,7 @@ def _policy_digest(
         fly_policy.fused_platform_ladders(world_size=world_size, link=link, arch=arch),
         fly_policy.fused_hiddens(hiddens),
     )
-    digest = hashlib.sha256(repr(parts).encode()).digest()
-    return int.from_bytes(digest[:8], "little") % ((1 << 62) - 1) + 1
+    return _digest(parts)
 
 
 def preload_fly_engines(engines, *args) -> None:
@@ -86,6 +103,193 @@ def preload_fly_engines(engines, *args) -> None:
 
     for engine, payload_range in engines:
         engine.preload(*args, payload_range=payload_range)
+
+
+class FlyDSLQuickAllReduce:
+    """Quantized FlyDSL plain all-reduce: the mesh and ring schedules.
+
+    The policy (``resolve_family_policy``, quantized) picks the schedule per
+    payload and leaves the one-shot window to the exact one-shot, which the
+    custom all-reduce serves; :meth:`should_fly_ar` declines those sizes.
+
+    Construction is collective: every rank of *group* must construct it, and
+    all of them build or decline together. Every binary the policy routes to is
+    compiled here, so a call is a pure launch and safe inside a HIP graph
+    capture. Calls must use one stream and run in the same order on every rank.
+    """
+
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: torch.device,
+        *,
+        quantization: str = "INT4",
+    ):
+        self.disabled = True
+        self.policy = None
+        self.engines: dict[Any, Any] = {}
+        self._tag = "FlyDSL quick all-reduce (%s)" % quantization
+
+        if not _FLY_IMPORT_OK or not fly_policy.enabled():
+            return
+        if quantization not in FLY_QUANTIZATIONS:
+            logger.warning(
+                "%s disabled: supported quantizations are %s.",
+                self._tag,
+                tuple(FLY_QUANTIZATIONS),
+            )
+            return
+
+        world_size = dist.get_world_size(group=group)
+        if world_size not in fly_policy.SUPPORTED_WORLDS:
+            return
+
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = get_gfx_runtime()
+        if arch not in fly_policy.SUPPORTED_ARCHS:
+            logger.debug("%s disabled: unsupported arch %s.", self._tag, arch)
+            return
+
+        # As in FlyDSLAllReduceRMSNorm: building is a collective, so the ranks
+        # agree on what they would build before any of them starts.
+        digest = _POLICY_DECLINED
+        try:
+            link = fly_policy.detect_link()
+            policy = fly_policy.resolve_family_policy(
+                world_size=world_size, arch=arch, link=link
+            )
+            digest = _digest(("plain", quantization, link, arch, policy))
+        except fly_policy.NoPolicyError as e:
+            logger.debug("%s disabled: %s", self._tag, e)
+        except ValueError as e:
+            logger.warning("%s disabled: %s", self._tag, e)
+        if not all_ranks_same(digest, group):
+            if digest != _POLICY_DECLINED:
+                logger.warning(
+                    "%s disabled: the ranks resolved different policies (check "
+                    "that the AITER_FLY_AR* variables are the same on every rank).",
+                    self._tag,
+                )
+            return
+        if digest == _POLICY_DECLINED:
+            return
+
+        self.group = group
+        self.device = device
+        self.rank = dist.get_rank(group=group)
+        self.world_size = world_size
+        self.link = link
+        algorithms = [
+            alg
+            for alg in policy.algorithms(quantized=True)
+            if alg != fly_policy.AllReduceAlgorithm.OneShot
+        ]
+        if not algorithms:
+            logger.debug("%s disabled by the policy.", self._tag)
+            return
+
+        rs_codec, ag_codec = FLY_QUANTIZATIONS[quantization]
+        ok = True
+        try:
+            for alg in algorithms:
+                # The policy window is the floor here, not the engine's own.
+                self.engines[alg] = FlyQuickAllReduce(
+                    group=group,
+                    device=device,
+                    rank=self.rank,
+                    world_size=world_size,
+                    algorithm=alg.value,
+                    rs_codec=rs_codec,
+                    ag_codec=ag_codec,
+                    min_bytes=0,
+                    link=link,
+                )
+            preload_fly_engines(
+                (eng, policy.window(alg, quantized=True).inclusive_range())
+                for alg, eng in self.engines.items()
+            )
+        except Exception:
+            logger.warning(
+                "%s disabled: engine construction or warmup failed.",
+                self._tag,
+                exc_info=True,
+            )
+            ok = False
+
+        if not all_ranks_agree(ok, group):
+            if ok:
+                logger.warning(
+                    "%s disabled: a peer rank failed to build its engines.",
+                    self._tag,
+                )
+            self.close()
+            return
+
+        self.policy = policy
+        self.disabled = False
+        logger.info(
+            "%s enabled: TP%d on %s, %s, %.1f MiB of IPC inbox.",
+            self._tag,
+            world_size,
+            link,
+            ", ".join(
+                f"{alg.value} {policy.window(alg, quantized=True)}"
+                for alg in self.engines
+            ),
+            self.inbox_bytes / 2**20,
+        )
+
+    @property
+    def inbox_bytes(self) -> int:
+        return sum(e.inbox_bytes for e in self.engines.values())
+
+    def select(self, nbytes: int):
+        """The algorithm that runs *nbytes*, or None when this path declines."""
+        if self.policy is None:
+            return None
+        alg = self.policy.select(int(nbytes), quantized=True)
+        return alg if alg in self.engines else None
+
+    def should_fly_ar(self, inp) -> bool:
+        """Whether this path can and should all-reduce *inp*. Never raises."""
+        if self.disabled:
+            return False
+        if not isinstance(inp, torch.Tensor) or inp.dtype is not torch.bfloat16:
+            return False
+        # Strictly contiguous: the engines reject weakly-contiguous views.
+        if not inp.is_contiguous() or inp.data_ptr() % 16:
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        # Every FlyDSL schedule reads and writes 16 B atoms.
+        if nbytes % 16 or nbytes > fly_policy.MAX_PAYLOAD_BYTES:
+            return False
+        return self.select(nbytes) is not None
+
+    def fly_ar(self, inp, *, out=None):
+        """The all-reduce of *inp*, into *out* when given. Only call when
+        :meth:`should_fly_ar` said yes."""
+        if out is None:
+            out = torch.empty_like(inp)
+        alg = self.select(inp.numel() * inp.element_size())
+        self.engines[alg].allreduce(inp, out)
+        return out
+
+    def close(self):
+        for eng in self.engines.values():
+            try:
+                eng.close()
+            except (AttributeError, RuntimeError):
+                pass
+        self.engines = {}
+        self.policy = None
+        self.disabled = True
+
+    def __del__(self):
+        try:
+            self.close()
+        except (AttributeError, RuntimeError, TypeError):
+            pass
 
 
 class FlyDSLAllReduceRMSNorm:

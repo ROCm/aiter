@@ -12,7 +12,8 @@ RMSNorm ones.
 At build time an epilogue fixes ``block`` and the HBM geometry (``spec()``,
 ``tag``, ``hbm_tile_bytes``, ``partial_floats`` -- per-wave LDS partials the
 kernel allocates for it). ``takes_operands`` picks the launcher: the plain one
-passes zeros for the residual, weight and eps arguments.
+passes zeros for the residual, weight, eps, Gemma bias and MXFP4 output
+arguments.
 
 In the kernel body ``bind`` returns an object with:
 
@@ -20,8 +21,12 @@ In the kernel body ``bind`` returns an object with:
 * Mesh: ``stash_own(tile, atom, value)`` / ``unstash_own(tile, atom)`` park
   this rank's reduced chunk between the super-tile loops (``unstash_own``
   returns None where the stash was already the final store), and
-  ``finish_tile(tile, gathered)`` disposes of a whole gathered tile (``None``
-  marks atoms already stored).
+  ``finish_tile(tile, gathered, pre)`` disposes of a whole gathered tile
+  (``None`` marks atoms already stored). ``prefetch(tile)`` runs once the
+  tile's input is loaded and before its reduce-scatter, and returns what
+  ``finish_tile`` takes as *pre* (``None`` when there is nothing to hoist); only
+  the single-super-tile loop calls it, so an epilogue that prefetches has to
+  be built for ``super_tile=1``.
 * Ring: ``begin_chunk(tile, chunk, recv)`` runs before a completing op's
   receive, ``complete(tile, atom, value, recv)`` takes each finished atom, and
   ``end_chunk(tile, chunk, recv)`` runs after the op's fanout. *recv* is a list
@@ -97,7 +102,10 @@ class _BoundPlain:
     def unstash_own(self, tile, atom):
         return None
 
-    def finish_tile(self, tile, gathered):
+    def prefetch(self, tile):
+        return None
+
+    def finish_tile(self, tile, gathered, pre=None):
         for atom in range_constexpr(ATOMS):
             if gathered[atom] is not None:
                 self._store(tile, atom, gathered[atom])

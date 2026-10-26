@@ -181,9 +181,13 @@ def make_quick_allreduce_mesh_kernel(
     hidden: int | None = None,
     block: int | None = None,
     h_pad: int | None = None,
+    mxfp4: bool = False,
+    low_latency: bool = False,
     rank: int,
 ):
-    check_fusion_args(fusion, hidden, h_pad)
+    check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
+    if low_latency and (fusion == "none" or super_tile != 1):
+        raise ValueError("low_latency needs a fused build with super_tile=1")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -201,7 +205,12 @@ def make_quick_allreduce_mesh_kernel(
         epilogue = QuickReducePlainEpilogue(block=block, world_size=world_size)
     else:
         epilogue = MeshRMSNormEpilogue(
-            hidden=hidden, h_pad=h_pad, block=block, world_size=world_size
+            hidden=hidden,
+            h_pad=h_pad,
+            block=block,
+            world_size=world_size,
+            mxfp4=mxfp4,
+            low_latency=low_latency,
         )
     block = epilogue.block
     tile_i32 = block * ATOMS * 4
@@ -302,6 +311,9 @@ def make_quick_allreduce_mesh_kernel(
         res_out_ptr: fx.Int64,
         w_ptr: fx.Int64,
         eps: fx.Float32,
+        w_bias: fx.Float32,
+        q_ptr: fx.Int64,
+        q_scale_ptr: fx.Int64,
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -358,6 +370,9 @@ def make_quick_allreduce_mesh_kernel(
             res_out_ptr=res_out_ptr,
             w_ptr=w_ptr,
             eps=eps,
+            w_bias=w_bias,
+            q_ptr=q_ptr,
+            q_scale_ptr=q_scale_ptr,
             allocator=allocator,
         )
         # Bare names, not ``ep.<hook>(...)``: the rewriter takes a method call
@@ -366,6 +381,7 @@ def make_quick_allreduce_mesh_kernel(
         _load_atom = ep.load_atom
         _stash_own = ep.stash_own
         _unstash_own = ep.unstash_own
+        _prefetch = ep.prefetch
         _finish_tile = ep.finish_tile
         _load_color, _store_color = _color_io(colors_ptr, bid)
 
@@ -644,6 +660,7 @@ def make_quick_allreduce_mesh_kernel(
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
                 tile = bid + i * n_blocks
                 atoms = _load_tile_atoms(tile)
+                pre = _prefetch(tile)
                 _pack_reduce_scatter(atoms)
                 gpu.barrier()
                 _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
@@ -661,7 +678,7 @@ def make_quick_allreduce_mesh_kernel(
 
                 _wait_release(PHASE_ALL_GATHER, color)
                 gathered = _recv_all_gather(fx.Int32(0), own_ag)
-                _finish_tile(tile, gathered)
+                _finish_tile(tile, gathered, pre)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
@@ -717,7 +734,7 @@ def make_quick_allreduce_mesh_kernel(
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks
                     gathered = _recv_all_gather(s, _unstash_own_chunk(tile))
-                    _finish_tile(tile, gathered)
+                    _finish_tile(tile, gathered, None)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
@@ -755,6 +772,9 @@ def make_quick_allreduce_mesh_kernel(
             fx.Int64(0),
             fx.Int64(0),
             fx.Float32(0.0),
+            fx.Float32(0.0),
+            fx.Int64(0),
+            fx.Int64(0),
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),
@@ -776,6 +796,9 @@ def make_quick_allreduce_mesh_kernel(
         res_out_ptr: fx.Int64,
         w_ptr: fx.Int64,
         eps: fx.Float32,
+        w_bias: fx.Float32,
+        q_ptr: fx.Int64,
+        q_scale_ptr: fx.Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         quick_allreduce_mesh(
@@ -791,6 +814,9 @@ def make_quick_allreduce_mesh_kernel(
             res_out_ptr,
             w_ptr,
             eps,
+            w_bias,
+            q_ptr,
+            q_scale_ptr,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),

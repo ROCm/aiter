@@ -10,6 +10,11 @@ holding ``rows_per_tile`` whole rows, and every chunk the ring completes is
 ``rows_per_chunk`` whole rows, so the norm runs inside the op that receives it
 rather than waiting for the tile to be reassembled.
 
+``mxfp4=True`` additionally quantizes each finished ``out`` atom to MXFP4 in
+place (:meth:`_BoundQuickReduceRMSNorm._store_mxfp4`), so the schedules need no
+hook for it. A 32-element scale group is four lanes of one atom, which is why
+it stays inside the row the epilogue already owns.
+
 The fused operands -- input, residual, weight and the final output -- are read
 as raw bf16 atoms through ``quick_allreduce_fusions.RowIO`` rather than the
 plain path's ``_payload_io``. At ``h_pad != hidden`` the wire tile is wider than
@@ -19,12 +24,17 @@ lane read the next row instead of zero -- which would then ride the wire into
 """
 
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import arith, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import ReductionOp, T, as_ir_value
 
+from .. import buffer_ops
+from ..quant_utils import emit_mx_e8m0_scale
 from .quick_allreduce_codec import _atom_bf16_to_f16
 from .quick_allreduce_fusions import (
+    MXFP4_GROUP,
     make_row_io,
     make_wave_partials,
+    mxfp4_scale_shape,
     pack_bf16,
     quick_reduce_row_block_at,
     residual_add,
@@ -32,7 +42,7 @@ from .quick_allreduce_fusions import (
     rms_rstd,
     scale_by_weight,
 )
-from .transport import ATOMS, WAVE
+from .transport import ATOMS, BLOCK, WAVE
 
 
 def _atom_f16_to_f32(atom):
@@ -44,10 +54,26 @@ class _QuickReduceRMSNorm:
     fusion = "rmsnorm"
     takes_operands = True
 
-    def __init__(self, *, hidden: int, h_pad: int | None, block, world_size: int):
+    def __init__(
+        self,
+        *,
+        hidden: int,
+        h_pad: int | None,
+        block,
+        world_size: int,
+        mxfp4: bool = False,
+    ):
         hidden = int(hidden)
         self.hidden = hidden
         self.h_pad = resolve_h_pad(hidden, h_pad)
+        # Also quantize ``out`` to MXFP4 (packed fp4x2 + shuffled e8m0 scales),
+        # the layout ``per_1x32_f4_quant_hip(out, shuffle=True)`` writes.
+        self.mxfp4 = bool(mxfp4)
+        if self.mxfp4 and (self.h_pad != hidden or hidden % MXFP4_GROUP):
+            raise ValueError(
+                f"mxfp4 needs an unpadded hidden that is a multiple of "
+                f"{MXFP4_GROUP}, got hidden={hidden} (h_pad={self.h_pad})"
+            )
         # An explicit block picks among the widths this hidden dim admits; None
         # keeps the widest.
         self.block, self.atoms_per_row = quick_reduce_row_block_at(
@@ -80,6 +106,8 @@ class _QuickReduceRMSNorm:
         tag = f"_rms_h{self.hidden}"
         if self.padded:
             tag += f"_p{self.h_pad}"
+        if self.mxfp4:
+            tag += "_mxfp4"
         return tag
 
     def spec(self) -> dict:
@@ -88,6 +116,7 @@ class _QuickReduceRMSNorm:
             "hidden": self.hidden,
             "h_pad": self.h_pad,
             "padded": self.padded,
+            "mxfp4": self.mxfp4,
             "atoms_per_row": self.atoms_per_row,
             "rows_per_tile": self.rows_per_tile,
         }
@@ -107,11 +136,18 @@ class _BoundQuickReduceRMSNorm:
         res_out_ptr,
         w_ptr,
         eps,
+        w_bias,
+        q_ptr,
+        q_scale_ptr,
         allocator,
     ):
         self.epi = epi
         self.tid = tid
         self.eps = eps
+        self.w_bias = w_bias
+        self.nbytes = nbytes
+        if epi.mxfp4:
+            self._bind_mxfp4(q_ptr, q_scale_ptr)
         io = make_row_io(
             tid=tid,
             nbytes=nbytes,
@@ -151,6 +187,73 @@ class _BoundQuickReduceRMSNorm:
             io.load(w_buf, fx.Int32(0), a) for a in range_constexpr(epi.atoms_per_row)
         ]
 
+    def _bind_mxfp4(self, q_ptr, q_scale_ptr):
+        epi = self.epi
+        self.scale_n = mxfp4_scale_shape(1, epi.hidden)[1]
+        self.n_rows = self.nbytes // fx.Int64(epi.hidden * 2)
+        self.q_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            q_ptr, num_records_bytes=self.nbytes // 4
+        )
+        self.q_scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            q_scale_ptr,
+            num_records_bytes=(self.n_rows + 255) // 256 * fx.Int64(256 * self.scale_n),
+        )
+        # Lane part of the shuffled scale index for group ``tid // 4`` of an
+        # atom; the atom's group base is a multiple of 8, so the row and atom
+        # parts fold into soffset.
+        g = self.tid // fx.Int32(MXFP4_GROUP // 8)
+        self.scale_lane = (g // 8) * 256 + (g % 4) * 64 + ((g % 8) // 4) * 2
+
+    def _store_mxfp4(self, tile, row_in_tile, a, out_atom):
+        """MXFP4-quantize atom *a* of the row *row_in_tile* of ``out``.
+
+        A 32-element group spans four consecutive lanes. The round-up e8m0
+        scale and the hardware scaled convert match ``per_1x32_f4_quant_hip``
+        bit for bit. Rows past the payload are dropped by the mask.
+        """
+        epi = self.epi
+        yb = fx.Vector(out_atom).bitcast(fx.BFloat16)
+        amax = abs(yb.to(fx.Float32)).reduce(ReductionOp.MAX)
+        for off in range_constexpr(2):
+            amax = fx.maxnumf(amax, amax.shuffle_xor(1 << off, WAVE))
+        e8m0 = fx.Int32(emit_mx_e8m0_scale(amax))
+        scale = as_ir_value((e8m0 << 23).bitcast(fx.Float32))
+        words = fx.Vector(out_atom)
+        pk = as_ir_value(fx.Int32(0))
+        for j in range_constexpr(4):
+            pk = rocdl.cvt_scalef32_pk_fp4_bf16(
+                T.i32,
+                pk,
+                as_ir_value(
+                    fx.Vector.from_elements([words[j]], fx.Int32).bitcast(fx.BFloat16)
+                ),
+                scale,
+                j,
+            )
+        row = tile * fx.Int32(epi.rows_per_tile) + fx.Int32(row_in_tile)
+        live = fx.Int64(row) < self.n_rows
+        buffer_ops.buffer_store(
+            fx.Int32(pk),
+            self.q_rsrc,
+            self.tid,
+            mask=live,
+            soffset_bytes=row * fx.Int32(epi.hidden // 2) + fx.Int32(a * epi.block * 4),
+        )
+        # The group's four lanes store the same byte.
+        scale_row = (
+            (row // fx.Int32(32)) * fx.Int32(32 * self.scale_n)
+            + (row % fx.Int32(16)) * fx.Int32(4)
+            + (row % fx.Int32(32)) // fx.Int32(16)
+        )
+        groups_per_atom = epi.block * 8 // MXFP4_GROUP
+        buffer_ops.buffer_store(
+            arith.trunci(T.i8, as_ir_value(e8m0)),
+            self.q_scale_rsrc,
+            self.scale_lane,
+            mask=live,
+            soffset_bytes=scale_row + fx.Int32(a * groups_per_atom // 8 * 256),
+        )
+
     def load_atom(self, tile, atom):
         """The input reaches ``inp`` through the per-row bounded route, so a
         padded row's pad lanes come back zero; bf16 -> fp16 for the codec."""
@@ -184,9 +287,11 @@ class _BoundQuickReduceRMSNorm:
             rows, self.eps, epi.hidden, tid=self.tid, block=epi.block, lds=self.sq_lds
         )
         for r in range_constexpr(n_rows):
-            outs = scale_by_weight(rows[r], rstds[r], self.w_atoms)
+            outs = scale_by_weight(rows[r], rstds[r], self.w_atoms, self.w_bias)
             for a in range_constexpr(apr):
                 self.io.store(self.out_buf, tile, base + r * apr + a, outs[a])
+                if epi.mxfp4:
+                    self._store_mxfp4(tile, base // apr + r, a, outs[a])
         if self.sq_lds is not None:
             # The next call reuses these slots, and nothing else between here
             # and there is guaranteed to be a barrier -- the mesh's super-tile
@@ -197,7 +302,31 @@ class _BoundQuickReduceRMSNorm:
 
 class MeshRMSNormEpilogue(_QuickReduceRMSNorm):
     """The mesh ends a tile holding every atom of it: ``rows_per_tile``
-    independent rows, each reduced inside this block."""
+    independent rows, each reduced inside this block.
+
+    ``low_latency`` hoists the residual loads of a tile ahead of its reduce-scatter
+    (``prefetch``), so the HBM reads retire during the two exchanges instead of
+    after them. It holds ``ATOMS`` more atoms of registers across both waits, so
+    it is built for the 256-thread block, whose workgroup is small enough for
+    the host to keep two per CU resident (see ``FlyQuickAllReduceRMSNorm``), and
+    for ``super_tile=1``, the only loop that carries a tile through its waits.
+    """
+
+    def __init__(self, *, low_latency: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.low_latency = bool(low_latency)
+        if self.low_latency and self.block != BLOCK:
+            raise ValueError(
+                f"the low-latency build needs block={BLOCK}, hidden={self.hidden} "
+                f"gives block={self.block}"
+            )
+
+    @property
+    def tag(self) -> str:
+        return super().tag + ("_low_lat" if self.low_latency else "")
+
+    def spec(self) -> dict:
+        return {**super().spec(), "low_latency": self.low_latency}
 
     def _rows_per_norm(self):
         return self.rows_per_tile
@@ -217,13 +346,24 @@ class _BoundMeshRMSNorm(_BoundQuickReduceRMSNorm):
     def unstash_own(self, tile, atom):
         return self.io.load(self.out_buf, tile, atom)
 
-    def finish_tile(self, tile, gathered):
+    def prefetch(self, tile):
+        """The tile's residual atoms, issued before its reduce-scatter. Plain HBM
+        with no dependence on a peer, so the loads retire during the exchanges."""
+        if not self.epi.low_latency:
+            return None
+        return [self.io.load(self.res_in_buf, tile, j) for j in range_constexpr(ATOMS)]
+
+    def finish_tile(self, tile, gathered, pre=None):
         self._norm_rows(
             tile,
             0,
             self.epi.rows_per_tile,
             gathered,
-            lambda j: self.io.load(self.res_in_buf, tile, j),
+            (
+                (lambda j: self.io.load(self.res_in_buf, tile, j))
+                if pre is None
+                else (lambda j: pre[j])
+            ),
         )
 
 

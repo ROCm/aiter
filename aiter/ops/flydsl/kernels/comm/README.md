@@ -162,6 +162,23 @@ because the FlyDSL AST rewriter sees only the `@flyc.kernel` body and
 `@flyc.jit` functions. The one-shot's split-row exchange is a `@flyc.jit`
 helper for that reason.
 
+The quick-reduce RMSNorm epilogue has two extras, both used through
+`FlyQuickAllReduceRMSNorm` directly and not routed by the dispatcher:
+
+* `gemma_norm=True` scales by `1 + weight`. It is a runtime kernel operand
+  (`w_bias`), so it shares the engines of the usual build.
+* `allreduce_rmsnorm_mxfp4` also quantizes `out` to MXFP4 (gfx950, unpadded
+  hidden): packed fp4x2 values and shuffled e8m0 scales, bit for bit what
+  `per_1x32_f4_quant_hip(out, shuffle=True)` returns. It is a compile-time
+  variant (`mxfp4=True`) of the epilogue, so it gets its own engines, built on
+  first use or by `preload(hidden, mxfp4=True)`.
+
+The mesh also has a low-latency build (`low_latency=true` on a ladder rung, or the
+`low_latency=` argument of `FlyQuickAllReduceRMSNorm`): the epilogue loads the
+residual ahead of the exchanges (`prefetch`) and two workgroups per CU stay
+resident. It needs `super_tile=1` and the 256-thread block, which at 8 ranks
+only hidden 2048 has. It is currently enabled only on xGMI.
+
 A split row (one token row over several workgroups; opt-in with
 `AITER_FLY_AR_FUSED_SPLIT=1`) joins its sum of squares
 through an integer atomic in HBM, so that every rank decodes the same bits. The
@@ -197,8 +214,9 @@ The fused path has its own policy tables in `allreduce_policy.py`:
 `FUSED_MESH_ST_LADDER`, `FUSED_RING_ST_LADDER` and `FUSED_QR_ROW_ATOMS` for the
 configurations. Above the one-shot window, the exact path declines.
 
-The configuration ladders are read from `fused_allreduce_ladders.json`, next to
-`allreduce_policy.py`, when it is imported. `AITER_FLY_AR_FUSED_LADDERS=<file>`
+The configuration ladders are read from
+`aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json` when
+`allreduce_policy.py` is imported. `AITER_FLY_AR_FUSED_LADDERS=<file>`
 names another file. Each platform has a default ladder per family and may have
 a ladder of its own for a hidden size. A width without its own ladder runs the
 default, and the default one-shot ladder never splits a row. Every rank must
@@ -207,7 +225,8 @@ read the same ladders, or the fused path declines.
 The fused path declines a call if:
 
 * a tensor is not bf16, not contiguous, or not 16-byte aligned,
-* the caller asks for gemma norm or a padded output,
+* the caller asks for gemma norm or a padded output (the quick-reduce
+  classes themselves accept `gemma_norm`; the dispatcher does not route it),
 * no build exists for the hidden size. One workgroup covers one row, so only
   some widths are supported, some of them with padding.
 
@@ -323,6 +342,7 @@ overrides included.
 |---|---|
 | `AITER_FLY_AR_FUSED_HIDDENS` | Comma-separated hidden sizes to build at startup, for example `4096,7168`. |
 | `AITER_FLY_AR_FUSED_SPLIT` | `1` lets the fused one-shot split a token row over several workgroups, where its ladder has a split rung. Not set (the default): every rung runs unsplit. Set it the same on every rank. |
+| `AITER_FLY_AR_FUSED_LADDERS` | Path to a ladder file to read instead of `aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json`. Read once at import; a malformed file raises `ValueError` naming the bad entry. Set it to the same file on every rank, or the fused path declines. |
 | `AITER_FLY_AR_FUSED_ONESHOT_MIN_BYTES` | The minimum of the fused one-shot window. |
 | `AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES` | The maximum of the fused one-shot window. |
 | `AITER_FLY_AR_FUSED_MESH_MIN_BYTES` | The minimum of the fused mesh window. |
