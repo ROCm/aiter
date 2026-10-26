@@ -159,7 +159,7 @@ def _mla_gluon(
         ip_lo = gl.load(B_seq_len + offs_sel, mask=offs_sel <= sel_bs, other=0)
         ip_hi = gl.load(B_seq_len + offs_sel + 1, mask=offs_sel < sel_bs, other=0)
         sel_max_len = gl.max(gl.where(offs_sel < sel_bs, ip_hi - ip_lo, 0), axis=0)
-        use_alt = sel_max_len * sel_bs >= sel_thresh
+        use_alt = sel_max_len.to(gl.int64) * sel_bs >= sel_thresh
         if (gl.program_id(0) == 0) & (gl.program_id(1) == 0) & (gl.program_id(2) == 0):
             flag_v = gl.where(offs_sel == sel_bs + 1, use_alt.to(gl.int32), 0)
             sel_v = gl.where(offs_sel <= sel_bs, gl.where(use_alt, ip_lo, 0), flag_v)
@@ -862,6 +862,9 @@ def mla_gluon(
     return_lse=False,
     has_pe=True,
     attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
+    sel_buf=None,  # int32 [batch + 2], enables on-device kernel selection
+    sel_thresh=0,
+    skip_reduce=False,
 ):
     """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
 
@@ -885,9 +888,24 @@ def mla_gluon(
     DSv4 Sparse prefill packs NoPE and RoPE in to one contiguous row (448+64).
     To run DSv4 prefill, it requires has_pe=False, prepares valid Q / K in q_nope / kv_c,
     and attn_sink, q_pe / k_pe are unused placeholders.
+
+    skip_reduce=True: returns the stage-1 partials (logits_buf, mid_lse) and the
+        caller reduces them. With one KV split, stage-1 writes o directly and
+        (o, final_lse) is returned as usual.
+
+    sel_buf: hands long batches to another kernel captured in the same CUDA
+        graph. When batch * max_b(L_b) >= sel_thresh this kernel does no work,
+        and sel_buf gets kv_indptr in [:batch + 1] and 1 in [batch + 1].
+        Otherwise it runs as usual and sel_buf is all zeros, so the other
+        kernel sees empty sequences. Requires kv_indptr (use_2d_view=False)
+        and skip_reduce=True.
     """
     if k_pe is None:
         k_pe = kv_c
+    regime_sel = sel_buf is not None
+    if regime_sel:
+        assert not use_2d_view and skip_reduce
+        assert sel_buf.dtype == torch.int32 and sel_buf.numel() >= q_nope.shape[0] + 2
 
     # Accept plain decode (3-D, qlen=1) or MTP (4-D, [batch, qlen, nhead, dim]).
     # DSv4 sparse prefill (has_pe=False) always uses the 3-D path.
@@ -1115,16 +1133,18 @@ def mla_gluon(
         QLEN=qlen,
         HAS_PE=has_pe,
         HAS_ATTN_SINK=has_attn_sink,
-        Sel_buf=None,
-        sel_bs=0,
-        sel_thresh=0,
-        SEL_P2=1,
-        REGIME_SEL=False,
+        Sel_buf=sel_buf,
+        sel_bs=batch_size,
+        sel_thresh=sel_thresh,
+        SEL_P2=max(256, triton.next_power_of_2(batch_size + 2)) if regime_sel else 1,
+        REGIME_SEL=regime_sel,
     )
 
     if NUM_KV_SPLITS == 1:
         # Fast path: stage-1 already wrote o (and lse) directly.
         return o, final_lse
+    if skip_reduce:
+        return logits_buf, mid_lse
 
     # Stage-2: reduce per-split (acc, lse) into o (and lse when return_lse).
     # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).

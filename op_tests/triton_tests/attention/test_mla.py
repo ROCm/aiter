@@ -894,3 +894,66 @@ def test_mla_decode_fwd_lds_pipeline_eligibility(
         assert isinstance(result, tuple) and len(result) == 3
     else:
         assert result is output
+
+
+@pytest.mark.parametrize("batch", [4, 32])  # 4: split-KV partials; 32: one split
+@torch.inference_mode()
+def test_mla_gluon_regime_select(batch, qlen=8, nhead=12):
+    """sel_buf hands the batch to another kernel when batch * max(L) >= sel_thresh,
+    and otherwise leaves this kernel's output unchanged."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+
+    torch.manual_seed(0)
+    lens = torch.randint(qlen, 2048, (batch,), dtype=torch.int32, device="cuda")
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+    kv_indptr[1:] = torch.cumsum(lens, 0)
+    total = int(kv_indptr[-1])
+    kv = torch.randn((total, 576), device="cuda").to(torch.float8_e4m3fn)
+    kv_indices = torch.arange(total, dtype=torch.int32, device="cuda")
+    q = torch.randn((batch, qlen, nhead, 576), dtype=torch.bfloat16, device="cuda")
+    eff = batch * int(lens.max())
+
+    def run(sel=None, thresh=0):
+        o = torch.zeros((batch, qlen, nhead, 512), dtype=torch.bfloat16, device="cuda")
+        out = mla_gluon(
+            q[..., :512],
+            q[..., 512:],
+            kv,
+            o,
+            kv_indices,
+            kv_indptr,
+            576**-0.5,
+            use_2d_view=False,
+            sel_buf=sel,
+            sel_thresh=thresh,
+            skip_reduce=True,
+        )
+        return out[0].clone(), o
+
+    ref, _ = run()
+
+    sel = torch.full((batch + 2,), -1, dtype=torch.int32, device="cuda")
+    out, _ = run(sel, eff + 1)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+    assert (sel == 0).all()
+
+    sel.fill_(-1)
+    _, o = run(sel, eff)
+    torch.testing.assert_close(sel[: batch + 1], kv_indptr, atol=0, rtol=0)
+    assert int(sel[batch + 1]) == 1
+    if ref.dim() == 4:
+        assert (o == 0).all()  # one split: nothing written in the other regime
+
+    # The choice follows device-side KV lengths across CUDA-graph replays.
+    thresh = eff
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(sel, thresh)
+    for longest, expect in [(int(lens.max()), 1), (qlen, 0)]:
+        kv_indptr[1:] = torch.arange(1, batch + 1, device="cuda") * longest
+        sel.fill_(-1)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert int(sel[batch + 1]) == expect
