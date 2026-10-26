@@ -878,10 +878,13 @@ def _iter_csv_cases():
             continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
+        # ASM 1-stage emsort/flat rows dispatch through fused_moe too;
+        # include them so the test harness exercises the emsort path.
         if (
             "flydsl_" not in kernel_name1
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
+            and not kernel_name1.startswith("_ZN5aiter")
         ):
             continue
         if args.csv_filter:
