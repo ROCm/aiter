@@ -419,7 +419,7 @@ def run_ep_csv(args):
     for csv_path in csv_paths:
         try:
             _run_ep_csv_file(args, csv_path)
-        except Exception as exc:  # Finish the other files before reporting failures.
+        except (AssertionError, OSError, ValueError) as exc:
             failures.append((csv_path, str(exc)))
             logger.exception("[ep-csv] %s: FAILED", csv_path)
     if failures:
