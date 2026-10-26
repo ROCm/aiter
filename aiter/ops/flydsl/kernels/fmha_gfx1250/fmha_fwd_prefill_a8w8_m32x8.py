@@ -175,9 +175,11 @@ _TORCH_DTYPE_MAP = {"fp8": torch.float8_e4m3fn, "bf8": torch.float8_e5m2}
 _B8_DTYPES = (fx.Float8E4M3FN, fx.Float8E5M2)
 # ``q_dtype`` types Q, ``kv_dtype`` types K and V; the two are independent (the wmma
 # takes a per-operand type) so fp8 Q against bf8 KV, or the reverse, is a legal build.
-# P and O follow neither: softmax P is always bf8 (its [0,1] range wants the wider
-# exponent, not fp8's extra mantissa bit), and the O accumulator and store stay 16-bit.
-P_DTYPE = fx.Float8E5M2
+# P and O follow neither: softmax P is always fp8 -- the gemm sees UNNORMALIZED
+# exp(S - m), whose row max is exactly 1.0, so the extra mantissa bit beats bf8's
+# exponent range (terms under e4m3's floor are negligible against a sum >= 1). The O
+# accumulator and store stay 16-bit.
+P_DTYPE = fx.Float8E4M3FN
 O_DTYPE = fx.BFloat16
 TORCH_O_DTYPE = torch.bfloat16
 # Q/K/V inputs this kernel serves; 16-bit belongs to the a16w16 sibling.
