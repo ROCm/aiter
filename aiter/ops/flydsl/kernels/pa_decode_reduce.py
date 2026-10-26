@@ -76,7 +76,7 @@ def compile_pa_decode_ps_reduce(
     and add their denominator mass once.
     """
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
-    if architecture not in ("gfx942", "gfx950", "gfx1250"):
+    if architecture not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
         raise NotImplementedError(f"PA decode reducer does not support {architecture}")
     wave = 32 if architecture in ("gfx1250", "gfx1250-strict") else WAVE
     register_partitions = min(REGISTER_PARTITIONS, wave)

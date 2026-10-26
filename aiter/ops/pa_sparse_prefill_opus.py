@@ -36,7 +36,7 @@ from ..jit.utils.torch_guard import torch_compile_guard
 
 MD_NAME = "module_mla_v4_prefill_opus"
 
-SUPPORTED_ARCHS = ("gfx950", "gfx1250")
+SUPPORTED_ARCHS = ("gfx950", "gfx1250", "gfx1250-strict")
 
 
 def _dispatch(gfx: str, op_gfx950, op_gfx1250):

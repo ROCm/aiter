@@ -31,9 +31,15 @@ _LOGGER = AiterTritonLogger()
 _FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
 _TRITON_VERSION = Version(triton.__version__)
 
-_GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
-_GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
-_GLUON_DEFAULT_ARCHS = ("gfx1250",)
+_GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250", "gfx1250-strict")
+_GLUON_PRESHUFFLE_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
+_GLUON_DEFAULT_ARCHS = (
+    "gfx1250",
+    "gfx1250-strict",
+)
 _GLUON_KERNEL_TYPES = ("bandwidth_bound", "compute_bound")
 
 

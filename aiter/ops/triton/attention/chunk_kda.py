@@ -420,7 +420,7 @@ def chunk_kda(
         (o, final_state); final_state is None unless output_final_state is set without
         state_cache.
     """
-    if _ARCH not in ("gfx1250", "gfx950"):
+    if _ARCH not in ("gfx1250", "gfx1250-strict", "gfx950"):
         from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
         assert out_gate is None, "the fused output norm needs the Gluon path"

@@ -55,7 +55,7 @@ DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
+_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024

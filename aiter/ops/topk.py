@@ -128,7 +128,7 @@ def _use_flydsl_herd(
     if gating_output.dim() != 2:
         return False
     tokens = gating_output.shape[0]
-    if get_gfx() not in ("gfx950", "gfx1250") or not (
+    if get_gfx() not in ("gfx950", "gfx1250", "gfx1250-strict") or not (
         _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
     ):
         return False

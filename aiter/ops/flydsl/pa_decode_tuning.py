@@ -555,7 +555,7 @@ def main(argv=None):
     device = torch.device("cuda", args.device)
     properties = torch.cuda.get_device_properties(device)
     arch = get_gfx_runtime()
-    if arch not in ("gfx942", "gfx950", "gfx1250"):
+    if arch not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             f"PA decode tuning only supports gfx942/gfx950/gfx1250, got {arch}"
         )

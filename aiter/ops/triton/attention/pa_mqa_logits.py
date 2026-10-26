@@ -41,7 +41,7 @@ enable_aot_gluon_pa_mqa_logits = os.environ.get(
 )
 enable_aot_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits == "1"
 triton_version = Version(Version(triton.__version__).base_version)
-_GLUON_PA_MQA_LOGITS_ARCHS = ("gfx942", "gfx950", "gfx1250")
+_GLUON_PA_MQA_LOGITS_ARCHS = ("gfx942", "gfx950", "gfx1250", "gfx1250-strict")
 if triton_version >= Version("3.5.0"):
     from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
 

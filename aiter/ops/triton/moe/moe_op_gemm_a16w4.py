@@ -27,7 +27,7 @@ from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
+_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 
 
 @lru_cache(maxsize=1)
