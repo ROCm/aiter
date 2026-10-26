@@ -52,7 +52,7 @@ def _fused_rmsnorm_indexed_adaln_kernel(
     of the norm are optional (HAS_WEIGHT, HAS_BIAS).
 
     One program owns BLOCK_M rows and walks the row in BLOCK_N column tiles:
-    once to accumulate the sum of squares, once to normalise and modulate. The
+    once to accumulate the statistics, once to normalise and modulate. The
     row is small enough to still be in cache on the second pass, so x is read
     from memory once and written once -- against read/write/read/write for a
     separate norm followed by a separate modulation.
@@ -66,10 +66,10 @@ def _fused_rmsnorm_indexed_adaln_kernel(
     )
 
     if IS_LAYERNORM:
-        # Mean and variance per column tile, merged with Chan's formula. This
-        # keeps two passes over the row and avoids E[x^2] - E[x]^2. The
-        # statistics are of x - ref, the mean of the first tile, so a large mean
-        # does not cost precision and one element cannot set the anchor.
+        # Mean and variance per column tile, merged with Chan's formula, which
+        # avoids E[x^2] - E[x]^2. The statistics are of x - ref, the mean of the
+        # first tile, so a large mean does not cost precision and one element
+        # cannot set the anchor.
         cols = tl.arange(0, BLOCK_N)
         col_mask = cols < N
         x = tl.load(
@@ -78,7 +78,9 @@ def _fused_rmsnorm_indexed_adaln_kernel(
             other=0.0,
         ).to(tl.float32)
         count = tl.minimum(N, BLOCK_N).to(tl.float32)
-        ref = tl.sum(x, axis=1) / count
+        # Divide before the sum. This tile reduces raw values, which overflow
+        # an fp32 sum when the row is near the limit.
+        ref = tl.sum(x / count, axis=1)
         x = tl.where(col_mask[None, :], x - ref[:, None], 0.0)
         mean = tl.sum(x, axis=1) / count
         centered = tl.where(col_mask[None, :], x - mean[:, None], 0.0)

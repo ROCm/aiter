@@ -295,6 +295,20 @@ def test_layernorm_leading_outlier():
     torch.testing.assert_close(got.double(), want, atol=2e-6, rtol=2e-6)
 
 
+def test_layernorm_near_fp32_limit():
+    """Every value is finite, but a tile of them sums past the fp32 limit. The
+    anchor has to scale before it reduces, or the row comes back as NaN."""
+    dev = "cuda"
+    N = 8192
+    x = torch.full((1, N), 1e36, device=dev, dtype=torch.float32)
+    shift = torch.zeros(1, N, device=dev, dtype=torch.float32)
+    scale = torch.zeros(1, N, device=dev, dtype=torch.float32)
+    indices = torch.zeros(1, device=dev, dtype=torch.int64)
+    got = fused_layernorm_indexed_adaln(x, shift, scale, indices, eps=1e-6)
+    want = torch.nn.functional.layer_norm(x.double(), (N,), eps=1e-6)
+    torch.testing.assert_close(got.double(), want, atol=2e-6, rtol=2e-6)
+
+
 def test_layernorm_per_sample_modulation():
     """The common DiT case: a [B, N] modulation and indices = sample of each
     token."""

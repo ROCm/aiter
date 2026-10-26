@@ -23,11 +23,9 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.triton_tests.fusions.test_fused_rmsnorm_indexed_adaln import make
 
 _PROVIDERS = ("fused", "eager")
-# [M, N] arrays moved. The kernel walks the row twice, once for the statistics
-# and once to normalise and modulate, and writes the output: 2 reads + 1 write.
-# Eager writes the normalised row, both gathered tables and the two products,
-# and reads each one back. Its count is an upper bound; a cache hit on a short
-# row moves less.
+# [M, N] arrays moved: the kernel reads the row twice and writes it once, eager
+# also materialises and reads back the normalised row, both gathered tables and
+# the two products. The eager count is an upper bound.
 _ARRAYS = {"fused": 3, "eager": 12}
 # (tokens, hidden, table rows) for the diffusion transformers this op targets.
 # Tokens is batch x sequence. The table holds one row per batch sample.
