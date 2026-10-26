@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -37,8 +37,54 @@ class _Event:
         pass
 
 
+class _Device:
+    """Stand-in for ``torch.cuda.device``: entering it selects nothing. A class,
+    since torch tests ``isinstance(device, torch.cuda.device)``."""
+
+    def __init__(self, device=None):
+        self.idx = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class GpuRuntimeReached(RuntimeError):
+    """Host code under :func:`dry_run` reached the GPU runtime."""
+
+
 def _forbid(*_args, **_kwargs):
-    raise RuntimeError("FlyDSL AOT dry run reached the GPU runtime")
+    raise GpuRuntimeReached("FlyDSL AOT dry run reached the GPU runtime")
+
+
+class _TritonDriver:
+    """Stand-in for Triton's active driver: answers the target queries that
+    modules make at import (e.g. picking autotune configs per backend). A
+    Triton launch is another backend's, which the dry run does not carry out."""
+
+    def __init__(self, arch: str):
+        from triton.backends.compiler import GPUTarget
+
+        self._target = GPUTarget("hip", arch, 32 if arch.startswith("gfx1") else 64)
+
+    def get_current_target(self):
+        return self._target
+
+    def get_current_device(self):
+        return 0
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"Triton {name} is outside the FlyDSL AOT dry run")
+
+
+def _triton_driver_patches(arch: str) -> list:
+    try:
+        from triton.runtime.driver import driver
+    except ImportError:
+        return []
+    return [(driver, "_active", _TritonDriver(arch))]
 
 
 def _torch_guard_modules() -> list:
@@ -61,16 +107,21 @@ def _register_stream_stub() -> None:
 
 
 @contextmanager
-def dry_run(arch: str, cu_num: int, name: str | None = None) -> Iterator[None]:
+def dry_run(
+    arch: str, cu_num: int, name: str | None = None, *, python_ops: bool = False
+) -> Iterator[None]:
     """Make the current process look like an ``arch`` GPU with ``cu_num`` CUs.
     ``name`` is the device name host code reads, e.g. to pick a per-GPU-model
-    tuning table; it defaults to ``arch``."""
+    tuning table; it defaults to ``arch``. With ``python_ops``, aiter's
+    registered ops that have a Python body run it instead of their fake, so a
+    replay can enter at a public op (e.g. ``gemm_a8w8_bpreshuffle``)."""
     import torch
     from flydsl.compiler.jit_executor import CompiledArtifact
     from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
     from aiter.jit import core as jit_core
     from aiter.jit.utils import chip_info
+    from aiter.utility import graph_alloc
 
     _register_stream_stub()
     stream = _Stream(torch.device("cuda", 0))
@@ -117,9 +168,16 @@ def dry_run(arch: str, cu_num: int, name: str | None = None) -> Iterator[None]:
             (torch.cuda, "Stream", _Stream),
             (torch.cuda, "Event", _Event),
             (torch.cuda, "current_device", lambda: 0),
+            (torch.cuda, "device", _Device),
             (torch.cuda, "get_device_properties", lambda *_a, **_k: properties),
             (torch.cuda, "synchronize", lambda *_a, **_k: None),
+            # Scratch buffers that outlive a graph capture come from a MemPool
+            # of their own; a FakeTensor needs none.
+            (torch.cuda, "use_mem_pool", lambda *_a, **_k: nullcontext()),
+            (torch.cuda, "is_current_stream_capturing", lambda: False),
+            (graph_alloc, "_persistent_pool", lambda _index: None),
             (torch.Tensor, "data_ptr", data_ptr),
+            (torch.Tensor, "record_stream", lambda *_a, **_k: None),
             (chip_info, "_detect_native", lambda: [arch]),
             (
                 jit_core,
@@ -130,10 +188,14 @@ def dry_run(arch: str, cu_num: int, name: str | None = None) -> Iterator[None]:
             # Rebuilding one for this arch would pull it from under replays of
             # other archs that share it.
             (jit_core, "_needs_arch_rebuild", lambda _md_name: False),
+            *_triton_driver_patches(arch),
         ):
             stack.enter_context(mock.patch.object(owner, attribute, value))
         for module in _torch_guard_modules():
             previous = module.run_host_scalar_ops_for_real(True)
             stack.callback(module.run_host_scalar_ops_for_real, previous)
+            if python_ops:
+                previous = module.run_python_ops_for_real(True)
+                stack.callback(module.run_python_ops_for_real, previous)
         stack.enter_context(FakeTensorMode(allow_non_fake_inputs=True))
         yield
