@@ -121,6 +121,7 @@ op_tests/test_mla_persistent_round_robin.py	584
 op_tests/test_mla_prefill_ps.py	36
 op_tests/test_mla_reduce.py	42
 op_tests/test_mla_sparse.py	584
+op_tests/test_mla_sparse_prefill.py	23
 op_tests/test_mla_stage2_merge.py	18
 op_tests/test_mla_v40_persistent.py	4
 op_tests/test_mla_v4_kargpreld.py	4
@@ -159,7 +160,6 @@ op_tests/test_pa_mtp.py	172
 op_tests/test_pa_ps.py	55
 op_tests/test_pa_ragged.py	38
 op_tests/test_pa_ragged_experimental.py	28
-op_tests/test_pa_sparse_prefill.py	23
 op_tests/test_pa_v1.py	28
 op_tests/test_pretune.py	1
 op_tests/test_ps_metadata_sizing.py	5
