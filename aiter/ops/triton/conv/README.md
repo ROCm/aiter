@@ -68,9 +68,8 @@ y = conv2d(
 ### Conv2D padding modes
 
 The routed APIs `conv2d`, `conv2d_nchw`, and `conv2d_nhwc` accept the
-keyword-only argument `padding_mode`, defaulting to `"zeros"`. Existing
-positional arguments are unchanged. Padding is symmetric on opposing sides
-and accepts an integer or `(pad_height, pad_width)`.
+keyword-only argument `padding_mode`, defaulting to `"zeros"`. Padding is
+symmetric on opposing sides and accepts an integer or `(pad_height, pad_width)`.
 
 | Mode | Border behavior | Padding limits per spatial axis |
 |---|---|---|
@@ -82,27 +81,16 @@ and accepts an integer or `(pad_height, pad_width)`.
 Input spatial dimensions must be positive, and padding must be nonnegative.
 Invalid modes are rejected even when padding is zero.
 
-For nonzero modes with positive padding, `torch.nn.functional.pad` prepares
-the input before route selection and activation packing. The result is
-converted to the requested storage layout when needed. Existing Triton
-convolution kernels receive the padded dimensions and effective padding
-`(0, 0)`. Routing may select a different kernel for the enlarged input.
-Materialization adds a temporary input tensor, with another copy possible
-for layout conversion. No padding-specific Triton configurations are used.
+`zeros` uses implicit padding. For other modes with nonzero padding, the input
+is padded with `torch.nn.functional.pad` before routing and activation packing;
+convolution then uses padding `(0, 0)`. Zero padding amounts skip materialization.
+Layout conversion may require an extra copy.
 
-The `zeros` path and valid modes with padding `(0, 0)` skip padding
-materialization. Input layout conversion may still be required.
+Input, weight, and bias must share a CUDA/ROCm device. Routed calls use that
+device and restore the caller's current device afterward. Mixed-architecture
+execution within one process is unsupported.
 
-Input, weight, and bias must be on the same CUDA/ROCm device. Routed APIs
-select the input device for preparation, configuration lookup, activation
-packing, and convolution, then restore the caller's current device. Existing
-architecture and configuration caches are process-wide; multi-GPU use
-requires the same GPU architecture throughout the process. Mixed-architecture
-device support is outside this change.
-
-Direct specialized entry points such as `conv2d_1x1`, `conv2d_general`, and
-the direct, channel-blocked, and Winograd wrappers still accept only implicit
-zero padding. Extending their public signatures is a separate stage.
+Direct specialized Conv2D APIs and Conv3D support only implicit zero padding.
 
 ### Inference tensors
 
@@ -184,14 +172,6 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
   example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D.
 - Inputs must be `fp16` or `bf16`.
 - Forward only (no backward / training).
-
-The internal Conv2D padding-preparation helper in `_launch.py` uses
-`torch.nn.functional.pad` for reflect, replicate, and circular padding, followed
-by a storage-layout conversion when needed. It leaves zero padding implicit and
-reuses the input when no materialization is needed. This helper does not require
-a custom padding kernel or padding-specific launch configurations. Wiring
-`padding_mode` into the public Conv2D entry points is a separate integration
-stage; the public constraints above still apply.
 
 ---
 
