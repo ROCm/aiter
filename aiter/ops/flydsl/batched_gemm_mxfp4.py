@@ -108,9 +108,9 @@ def flydsl_batched_gemm_mxfp4(
         out if out is not None else torch.empty(shape, dtype=dtype, device=a.device)
     )
 
+    # @flyc.jit caches per Constexpr config internally; M rides i32_m at runtime (not baked).
     # Operands go in as ptr_arg (raw data_ptr) so each launch skips per-tensor DLPack conversion.
-    _run_compiled(
-        launch_gemm,
+    launch_gemm(
         ptr_arg(out_phys.view(-1)),
         ptr_arg(a.reshape(-1)),
         ptr_arg(w),
@@ -129,17 +129,6 @@ def flydsl_batched_gemm_mxfp4(
         B,
         *strides,
         0,
-        specialization_key=(
-            N,
-            K,
-            tile_m,
-            tile_n,
-            tile_k,
-            a_dtype,
-            out_dtype,
-            B,
-            *strides,
-        ),
     )
 
     # mbn C physical [M,B,N] -> logical [B,M,N] view.
@@ -247,15 +236,12 @@ def _run_gfx1250(
     # A/B only need the base address (views built in-kernel) -> pass as pointers;
     # bind the contiguous A to a local so its storage outlives the async launch.
     a_c = a.contiguous()
-    scale_a_i32 = a_scales.view(torch.int32)
-    scale_b_i32 = w_scales.view(torch.int32)
-    _run_compiled(
-        launch_gemm_a8w4_tdm,
+    launch_gemm_a8w4_tdm(
         out_phys,
         ptr_arg(a_c),
         ptr_arg(w),
-        scale_a_i32,
-        scale_b_i32,
+        a_scales.view(torch.int32),
+        w_scales.view(torch.int32),
         M,
         torch.cuda.current_stream(),
         N,
@@ -272,19 +258,6 @@ def _run_gfx1250(
         a_is_fp4,
         ptr_arg(a_c),  # masked_m unused when grouped_masked=0
         0,
-        specialization_key=(
-            K,
-            tile_m,
-            tile_n,
-            tile_k,
-            m_warp,
-            n_warp,
-            out_is_f16,
-            B,
-            layout_mbn,
-            num_buffers,
-            a_is_fp4,
-        ),
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys
 

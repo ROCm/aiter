@@ -17,10 +17,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from aiter.ops.flydsl.kernels.tensor_shim import (
-    _run_compiled,
-    ptr_arg,
-)
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")

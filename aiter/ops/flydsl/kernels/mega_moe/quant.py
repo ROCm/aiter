@@ -10,11 +10,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
-from ..tensor_shim import (
-    _run_compiled,
-    buf_copy_atom,
-    ptr_buf_tensor,
-)
+from ..tensor_shim import _run_compiled, buf_copy_atom, ptr_buf_tensor
 
 BLOCK = 64
 GROUP = 32
