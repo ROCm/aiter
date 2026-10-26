@@ -55,6 +55,18 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m pa --output_dir {{}}'"
     },
+    "module_attention_ps_reduce_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_attention_ps_reduce.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m reduce --output_dir {{}}'"
+    },
     "module_pa_metadata": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/pa_metadata_pybind.cu'",
@@ -133,7 +145,9 @@
             "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -324,6 +338,7 @@
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}'"
     },
     "module_gemm_a8w8_bpreshuffle": {
@@ -433,6 +448,20 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m bf16gemm --output_dir {{}}'"
+    },
+    "module_gemm_a16w8_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a16w8.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m a16w8gemm --output_dir {{}}'"
+        ]
     },
     "module_gemm_a4w4_asm": {
         "srcs": [
@@ -673,10 +702,18 @@
         "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_moe/gen_instances.py --working_path {{0}}'"
     },
-    "module_mla_v4_prefill_opus": {
+    "module_mla_prefill_opus": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/mla_v4_prefill_opus_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/mla_v4_prefill_opus_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_prefill_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a16w16_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a16w16_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a8w8_16mx1_16nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_a8w8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_kargs.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_traits.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v41_prefill_kargs.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_prefill_split.h'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -684,7 +721,7 @@
             "'-mllvm -enable-post-misched=1'"
         ],
         "flags_extra_hip_per_source": {
-            "*mla_v4_prefill_opus_kernels.cu": [
+            "*opus_mla_prefill_fwd.cu": [
                 "-mllvm -amdgpu-early-inline-all=false"
             ]
         },
@@ -711,6 +748,24 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py --working_path {{}}'"
+    },
+    "module_iq2r_moe": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/iq2r/iq2r_gemm_gfx950.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/iq2r/iq2r_moe_aux_gfx950.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/iq2r_pybind.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [
+            "'-DENABLE_CK=0'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
     },
     "module_fmha_fwd_bf16_opus": {
         "srcs": [
@@ -793,7 +848,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-D__HIPCC_RTC__'"
+            "'-D__HIPCC_RTC__'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -809,7 +865,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
-            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -825,7 +881,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
-            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -980,6 +1036,7 @@
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
+        "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances.py --working_path {{}} --tune'"
     },
     "module_gemm_a8w8_bpreshuffle_tune": {
@@ -1511,7 +1568,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1555,7 +1612,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1581,7 +1638,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'",
             "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'"
         ],
         "extra_ldflags": "None",
@@ -1606,7 +1663,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'",
             "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
             "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 1)}'"
         ],
@@ -1687,7 +1744,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1711,7 +1768,7 @@
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -1733,7 +1790,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 4)}'",
             "'-DCK_TILE_FMHA_FWD_SPLITKV_API=1'"
         ],
         "extra_ldflags": "None",
@@ -1939,6 +1996,57 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_mega_mhc_stream_h5120": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DMHC_HIDDEN=5120'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'",
+            "'-gline-tables-only'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mega_mhc_stream_h7168": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DMHC_HIDDEN=7168'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'",
+            "'-gline-tables-only'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mega_mhc_stream_generic": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DMHC_HIDDEN=0'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'",
+            "'-gline-tables-only'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_mhc": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mhc_pybind.cu'",
@@ -2053,7 +2161,8 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mla/opus_mla_decode_fwd.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_mxfp8_16mx8_32nx1.hpp'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_fp8_16mx8_32nx1.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_a8w8_16mx1_32nx4.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_kargs.h'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_decode_traits.h'"
         ],
