@@ -5,12 +5,18 @@
 A row pins the backend for one exact problem on one GPU, never a backend's own
 tile. Dispatch's own gates still decide whether that backend can serve a call;
 a row it cannot honor falls back to auto-select.
+
+Triton and Gluon tiles live in Triton's JSON configs, so their rows carry
+``config_digest``, the hash of the tile Triton resolved at tuning time, and are
+dropped once Triton resolves another one.
 """
 
 from __future__ import annotations
 
 import csv
 import functools
+import hashlib
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
@@ -38,8 +44,11 @@ def get_tuning_hardware(device_id: int = 0) -> dict[str, str | int]:
 
 
 MHA_FWD_FAMILY = "mha_fwd"
+MHA_FWD_TUNER_SCRIPT = "op_tests/tuners/tune_mha_fwd.py"
 MHA_FWD_CONFIG_ENV = "AITER_CONFIG_MHA_FWD"
+MHA_FWD_CONFIG_PROPERTY = "AITER_CONFIG_MHA_FWD_FILE"
 MHA_FWD_TUNED_CSV = "tuned_mha_fwd.csv"
+MHA_FWD_UNTUNED_CSV = "untuned_mha_fwd.csv"
 
 MHA_FWD_PROBLEM_KEY_FIELDS = (
     "mode",
@@ -75,13 +84,18 @@ MHA_FWD_TUNING_KEY_FIELDS = (
     *TUNING_HARDWARE_FIELDS,
     *MHA_FWD_PROBLEM_KEY_FIELDS,
 )
-# Dispatch reads backend; us is kept for people.
+# Dispatch reads backend; us is kept for people, and config_digest is only set
+# for the Triton backends.
 MHA_FWD_RUNTIME_CSV_FIELDS = (
     *MHA_FWD_TUNING_KEY_FIELDS,
     "backend",
     "us",
+    "config_digest",
 )
-MHA_FWD_BACKENDS = frozenset({"asm_v3", "ck", "flydsl", "opus"})
+MHA_FWD_TRITON_BACKENDS = frozenset({"triton", "gluon"})
+MHA_FWD_BACKENDS = frozenset(
+    {"asm_v3", "ck", "flydsl", "opus", *MHA_FWD_TRITON_BACKENDS}
+)
 MHA_FWD_DTYPES = frozenset(
     {
         "bfloat16",
@@ -227,11 +241,101 @@ class MhaFwdProblem:
         )
 
 
+def triton_unsupported_reason(problem: MhaFwdProblem, backend: str) -> str | None:
+    """Why Triton's varlen entry cannot stand in for the CK path here, else None.
+
+    On a CK build the caller expects what the CK path returns, not just the
+    same attention.
+    """
+    if problem.logits_soft_cap:
+        return "Triton MHA has no logits soft-cap"
+    if problem.has_q_descale:
+        return "prequantized FP8 attention stays on CK"
+    if problem.sink_size:
+        return "Triton MHA has no sink tokens in the window"
+    if problem.return_lse or problem.return_attn_probs:
+        return "Triton returns LSE and probabilities in another layout than CK"
+    if problem.is_grad:
+        return "a forward-tuned row must not move the backward pass to Triton"
+    if problem.window_right != -1:
+        return "Triton MHA has no right window"
+    if problem.has_bias:
+        return "Triton MHA has no bias"
+    if problem.min_seqlen_q:
+        return "the Triton varlen entry ignores min_seqlen_q, which CK honours"
+    if problem.window_left == 0:
+        return "Triton reads a left window of 0 as no window"
+    if problem.has_alibi or problem.has_sink:
+        return "no tuner run measures ALiBi or sink logits on Triton"
+    if backend != "gluon":
+        return None
+    from .triton.attention.mha import gluon_forward_unsupported_reason
+
+    return gluon_forward_unsupported_reason(dropout_p=problem.dropout_p)
+
+
+def triton_config(problem: MhaFwdProblem, backend: str) -> dict[str, Any]:
+    """The tile Triton's own resolver picks for this problem on this GPU.
+
+    Mirrors the arguments the Triton varlen entry passes when ``config`` is None.
+    """
+    has_pe = problem.hdim_q > problem.hdim_v
+    dtype = getattr(torch, problem.dtype)
+    if backend == "gluon":
+        from .triton._gluon_kernels.gfx950.attention.mha import _get_config
+        from .triton.utils import types
+
+        is_fp8 = types._is_fp8(torch.empty(0, dtype=dtype))
+        return dict(_get_config(is_fp8=is_fp8, has_pe=has_pe))
+
+    from .triton._triton_kernels.attention.mha import _get_config
+
+    return dict(
+        _get_config(
+            problem.dropout_p > 0.0,
+            dtype,
+            has_pe=has_pe,
+            head_dim_v=problem.hdim_v,
+            causal=problem.causal,
+            max_seqlen_q=problem.max_seqlen_q,
+            max_seqlen_k=problem.max_seqlen_k,
+            batch_heads=problem.batch * problem.nhead_q,
+        )
+    )
+
+
+def config_digest(config: Mapping[str, Any]) -> str:
+    # Prefixed so it never reads as a number: a CSV merge without dtype=str
+    # would turn an all-digit hex digest into an int or a float.
+    payload = json.dumps(dict(config), sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+def _triton_row_rejection(row: dict, problem: MhaFwdProblem) -> str | None:
+    """Why a Triton or Gluon row must not be honored on this GPU, else None."""
+    backend = row["backend"].strip()
+    reason = triton_unsupported_reason(problem, backend)
+    if reason is not None:
+        return reason
+    expected = (row.get("config_digest") or "").strip()
+    if not expected:
+        return f"a {backend} row needs config_digest"
+    actual = config_digest(triton_config(problem, backend))
+    if actual != expected:
+        return (
+            f"Triton now resolves another {backend} config for this shape "
+            f"(digest {actual}, row tuned with {expected}); retune it with "
+            f"{MHA_FWD_TUNER_SCRIPT}"
+        )
+    return None
+
+
 @functools.lru_cache(maxsize=8)
 def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], str]:
     """Exact key -> backend.
 
     A bad row is skipped with a warning, so one row cannot break every MHA call.
+    Only Triton and Gluon rows for this GPU's arch are checked against Triton.
     """
     table: dict[tuple[str, ...], str] = {}
     if not os.path.isfile(path):
@@ -258,7 +362,12 @@ def _load_mha_fwd_tuning_table(path: str) -> dict[tuple[str, ...], str]:
                 if backend not in MHA_FWD_BACKENDS:
                     raise ValueError(f"unknown backend {backend!r}")
                 problem = MhaFwdProblem.from_mapping(row)
+                if backend in MHA_FWD_TRITON_BACKENDS and problem.gfx == get_gfx():
+                    reason = _triton_row_rejection(row, problem)
+                    if reason is not None:
+                        raise ValueError(reason)
                 key = problem.key()
+            # Any error: the digest check imports and runs Triton's resolver.
             except Exception as error:  # noqa: BLE001
                 logger.warning("%s:%d: skipping MHA tuned row: %s", path, line, error)
                 continue
