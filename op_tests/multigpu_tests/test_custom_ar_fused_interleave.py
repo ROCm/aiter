@@ -51,6 +51,13 @@ def _reduced(seeds, shape, device):
     return sum(_inputs(s, shape, device).float() for s in seeds)
 
 
+def _is_gfx1250() -> bool:
+    return (
+        torch.cuda.is_available()
+        and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    )
+
+
 def _rmsnorm(h, weight, eps):
     return h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
 
@@ -127,6 +134,9 @@ def test_mixed_size_custom_ar_under_skew(
     fused_big_rows=(384, 1024),
     timeout_s=600,
 ):
+    # The kernels and dispatch this guards are gfx1250-only.
+    if not _is_gfx1250():
+        return
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     args = [
         (tp_size, r, init_method, steps, hidden, small_rows, big_rows, fused_big_rows)
@@ -148,4 +158,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     test_mixed_size_custom_ar_under_skew(tp_size=args.tp, steps=args.steps)
-    print("PASSED")
+    print("PASSED" if _is_gfx1250() else "SKIPPED (gfx1250 only)")
