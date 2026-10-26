@@ -160,6 +160,7 @@ def fmoe_g1u1(
     kernelName: str | None = "",
     fc2_smooth_scale: Tensor | None = None,
     activation: int | None = ActivationType.Silu.value,
+    intermediate_pad: int = 0,
 ) -> None: ...
 
 

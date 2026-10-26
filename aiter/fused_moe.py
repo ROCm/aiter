@@ -1601,6 +1601,7 @@ def fused_moe_1stage(
     device=None,
     doweight_stage1: bool | None = None,
     flat: int = 0,
+    intermediate_pad: int = 0,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -1694,7 +1695,9 @@ def fused_moe_1stage(
                 block_size_M=block_size_M,
             )
         elif isG1U1:
-            fmoe_func = aiter.fmoe_g1u1
+            fmoe_func = functools.partial(
+                aiter.fmoe_g1u1, intermediate_pad=intermediate_pad
+            )
         else:
             aiter.fmoe_int8_g1u0(
                 moe_buf,
@@ -3096,6 +3099,38 @@ def get_2stage_cfgs(
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
 
+    # A padded call (stored inter_dim, zero-filled intermediate_pad) can reuse a
+    # row tuned at the logical width, but only a FLAT MXFP4 1-stage row: those
+    # kernels launch over the logical columns and stride over the stored ones.
+    # Every other kernel computes over the full stored width it was tuned for.
+    if (
+        cfg is None
+        and config_file is None
+        and intermediate_pad
+        and active_cfg_2stages
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+    ):
+        logical_keys = (
+            keys[:4]
+            + (inter_dim - intermediate_pad,)
+            + keys[5:7]
+            + (str(activation),)
+            + keys[8:]
+        )
+        logical_cfg = active_cfg_2stages[0].get(logical_keys)
+        if (
+            logical_cfg is not None
+            and logical_cfg.get("run_1stage") == 1
+            and logical_cfg.get("flat") == 1
+        ):
+            cfg = logical_cfg
+            logger.info(
+                f"[fused_moe] using the FLAT row tuned at inter_dim="
+                f"{inter_dim - intermediate_pad} for {keys} with "
+                f"intermediate_pad={intermediate_pad}"
+            )
+
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
@@ -3426,6 +3461,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 xbf16=run_1stage_xbf16,
                 flat=cfg_flat,
+                intermediate_pad=intermediate_pad,
             ),
             None,
             block_m,

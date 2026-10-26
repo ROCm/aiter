@@ -3,6 +3,7 @@
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_fmoe_configs.hpp"
+#include <algorithm>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <memory>
@@ -79,6 +80,8 @@ class FMoeKernel
     const char* name            = nullptr;
     // flat_mode: 0 = host-sorted, 1 = flat one-token-per-TG grid, 2 = emsort persistent grid
     int flat_mode = 0;
+    // Required model_dim multiple from the manifest's dim_align column; 0 = unspecified.
+    int dim_align = 0;
 
     public:
     FMoeKernel(const char* name,
@@ -86,19 +89,23 @@ class FMoeKernel
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0,
                int flat_mode               = 0,
-               uint32_t block_size         = 256) : kernel(name, hsaco)
+               uint32_t block_size         = 256,
+               int dim_align               = 0)
+        : kernel(name, hsaco)
     {
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->name               = name;
         this->flat_mode          = flat_mode;
         this->block_size         = block_size == 0 ? 256 : block_size;
+        this->dim_align          = dim_align;
     };
 
     const char* get_name() const { return name; }
     int get_num_persistent_tgs() { return num_persistent_tgs; }
     int get_sub_GU() { return sub_GU; }
     int get_flat_mode() const { return flat_mode; }
+    int get_dim_align() const { return dim_align; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
     template <int I_elemSize, int O_elemSize, bool switchGxy = false>
@@ -115,7 +122,8 @@ class FMoeKernel
                        aiter_tensor_t* w1_dqn        = nullptr,
                        aiter_tensor_t* w2_dqn        = nullptr,
                        aiter_tensor_t* w2_smooth_qnt = nullptr,
-                       hipStream_t stream         = nullptr)
+                       hipStream_t stream         = nullptr,
+                       int intermediate_pad       = 0)
     {
         int token_cnt       = out->size(0);
         int dim             = w2->size(1);
@@ -194,8 +202,25 @@ class FMoeKernel
         // flat_mode==2: emsort persistent grid; no host moe_sort, same grid as ps.
         if(this->flat_mode == 1)
         {
+            // FLAT tiles hard-code their N-slice offsets and take only the gate->up
+            // half offset and the w2 scale row pitch from args.inter_dim, so the
+            // kernel is given the stored width and the grid covers only the
+            // logical (stored - intermediate_pad) columns. A tile straddling that
+            // boundary would read pad rows, or the up half when unpadded.
+            const int logical_dim = inter_dim - intermediate_pad;
+            AITER_CHECK(logical_dim > 0 && logical_dim % sub_GU == 0,
+                        __func__,
+                        ": FLAT kernel ",
+                        this->name,
+                        " needs inter_dim - intermediate_pad divisible by sub_GU; got "
+                        "inter_dim=",
+                        inter_dim,
+                        ", intermediate_pad=",
+                        intermediate_pad,
+                        ", sub_GU=",
+                        sub_GU);
             bdx = this->block_size;
-            gdx = ((inter_dim + sub_GU - 1) / sub_GU);
+            gdx = logical_dim / sub_GU;
             gdy = static_cast<int>(topk);
             gdz = static_cast<int>(token_cnt);
         }
@@ -243,9 +268,16 @@ class FMoeKernel
     };
 };
 
-FMoeKernel* get_heuristic_kernel(
-    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "", int block_size_M = 32)
+FMoeKernel* get_heuristic_kernel(int inter_dim,
+                                 int sub_X_cnt,
+                                 CFG* cfgs,
+                                 int smf                 = 0,
+                                 std::string kernel_name = "",
+                                 int block_size_M        = 32,
+                                 int intermediate_pad    = 0,
+                                 int model_dim           = 0)
 {
+    const int flat_inter_dim    = inter_dim - intermediate_pad;
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
     uint32_t empty_cu           = num_cu;
@@ -307,9 +339,11 @@ FMoeKernel* get_heuristic_kernel(
                 const auto& cfg = el.second;
                 if(cfg.smf != smf || cfg.flat != 1)
                     continue;
-                if((inter_dim % cfg.subGU_n) != 0)
+                if((flat_inter_dim % cfg.subGU_n) != 0)
                     continue;
-                tg_num               = inter_dim / cfg.subGU_n * sub_X_cnt;
+                if(model_dim > 0 && cfg.dim_align > 0 && (model_dim % cfg.dim_align) != 0)
+                    continue;
+                tg_num               = flat_inter_dim / cfg.subGU_n * sub_X_cnt;
                 uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
                 if(local_round < round ||
                    (local_round == round && empty_cu > (local_round * num_cu - tg_num)))
@@ -345,7 +379,7 @@ FMoeKernel* get_heuristic_kernel(
 
         impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
             return FMoeKernel(
-                name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat, cfg.bdx);
+                name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat, cfg.bdx, cfg.dim_align);
         });
     }
     else
@@ -574,8 +608,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const char* kernel_name,
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
+    int intermediate_pad,              // zero-filled tail of each gate/up half and of w2's K
     hipStream_t stream),
-    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc2_smooth_scale, activation, stream))
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc2_smooth_scale, activation, intermediate_pad, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -596,6 +631,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int sub_X_cnt = sorted_expert_ids->size(0);
     static SynchronizedCache<std::string_view, FMoeKernel> impl_ptr_map;
     std::string kernel_name_str = kernel_name ? kernel_name : "";
+    AITER_CHECK(intermediate_pad >= 0 && intermediate_pad < inter_dim,
+                __func__,
+                ": intermediate_pad must be in [0, inter_dim); got intermediate_pad=",
+                intermediate_pad,
+                ", inter_dim=",
+                inter_dim);
 
     if(gate->dtype() == AITER_DTYPE_u32 || gate->dtype() == AITER_DTYPE_i32) // int4
     {
@@ -640,7 +681,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        impl_ptr = get_heuristic_kernel(inter_dim,
+                                        sub_X_cnt,
+                                        config_map,
+                                        smf,
+                                        kernel_name_str,
+                                        32,
+                                        intermediate_pad,
+                                        model_dim);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
     }
@@ -660,7 +708,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        impl_ptr = get_heuristic_kernel(inter_dim,
+                                        sub_X_cnt,
+                                        config_map,
+                                        smf,
+                                        kernel_name_str,
+                                        32,
+                                        intermediate_pad,
+                                        model_dim);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
     }
@@ -706,14 +761,19 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // No smaller remainder is expressible, so a non-multiple of 512 would leave the
     // trailing columns unwritten and return a silently wrong result. The large-tile
     // host-sorted kernels (sub_GU > 128, non-FLAT) use a different epilogue and stay
-    // unconstrained.
+    // unconstrained. Kernels without the tail drain declare dim_align=1024 in their
+    // manifest.
     if(is_mxfp4 && (impl_ptr->get_sub_GU() <= 128 || impl_ptr->get_flat_mode() == 1))
     {
-        AITER_CHECK(model_dim >= 512 && (model_dim % 512) == 0,
+        const int dim_align = std::max(impl_ptr->get_dim_align(), 512);
+        AITER_CHECK(model_dim >= dim_align && (model_dim % dim_align) == 0,
                     __func__,
-                    " asm MXFP4 kernels require model_dim to be a positive multiple of 512;"
-                    " got model_dim=" +
-                        std::to_string(model_dim));
+                    " asm MXFP4 kernel ",
+                    impl_ptr->get_name(),
+                    " requires model_dim to be a positive multiple of ",
+                    dim_align,
+                    "; got model_dim=",
+                    model_dim);
     }
 
     impl_ptr->launch_kernel<1, 2>(out,
@@ -730,7 +790,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                   fc1_scale,
                                   fc2_scale,
                                   fc2_smooth_scale,
-                                  stream);
+                                  stream,
+                                  is_mxfp4 && impl_ptr->get_flat_mode() == 1 ? intermediate_pad
+                                                                             : 0);
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
