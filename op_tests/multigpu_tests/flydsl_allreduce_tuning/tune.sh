@@ -24,12 +24,16 @@
 #   validate     re-sweep the shipping engines vs the pinned rows            -> $OUT/validate
 #   audit        grade the shipped dispatcher against the best pinned row    -> $OUT/audit
 #   report       reference bench tables: shipping engines vs stock kernels   -> $OUT/report
+#   low-latency  the low-latency fused mesh build vs every other fused mesh/ring
+#                instance, at each (TP, width) that has the build; sweep, then
+#                compare (not part of `all`)                    -> $OUT/low_latency/compare.txt
 #
 # Options (before the command):
 #   --out DIR       output root (default: <this dir>/out/<host>; "out/" is git-ignored)
 #   --tp "8 4 2"    world sizes (default "8 4 2"; sizes above the GPU count are skipped)
 #   --link L        pcie|xgmi|auto (default auto: read from the KFD topology)
 #   --widths "..."  hidden sizes for the fused sweep (default "3072 4096 7168 8192")
+#                   and for low-latency (default "2048 4096 8192", its only widths)
 #   --width-gain G  speedup over the default fused ladder, minus 1, that a width needs
 #                   to keep a ladder of its own (default 0.02)
 #   --smoke         plumbing check: 3 shapes, the `smoke` candidates, few samples
@@ -47,13 +51,14 @@ QUICK="$REPO/op_tests/multigpu_tests/test_flydsl_quick_allreduce.py"
 CANDS="$HERE/candidates.csv"
 PY=${PYTHON:-python}
 
-OUT=""; TPS="8 4 2"; LINK="auto"; WIDTHS="3072 4096 7168 8192"; WIDTH_GAIN=0.02; SMOKE=0; FORCE=0; DRY=0
+OUT=""; TPS="8 4 2"; LINK="auto"; WIDTHS="3072 4096 7168 8192"; LL_WIDTHS="2048 4096 8192"
+WIDTH_GAIN=0.02; SMOKE=0; FORCE=0; DRY=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --out) OUT=$2; shift 2 ;;
     --tp) TPS=$2; shift 2 ;;
     --link) LINK=$2; shift 2 ;;
-    --widths) WIDTHS=$2; shift 2 ;;
+    --widths) WIDTHS=$2; LL_WIDTHS=$2; shift 2 ;;
     --width-gain) WIDTH_GAIN=$2; shift 2 ;;
     --smoke) SMOKE=1; shift ;;
     --force) FORCE=1; shift ;;
@@ -88,14 +93,14 @@ export FLYDSL_QR_TIMEOUT=${FLYDSL_QR_TIMEOUT:-3600}
 # --- candidates and sampling -----------------------------------------------------------
 # Sets of candidates.csv (see gen_candidates.py): `sweep` for the plain fit,
 # `validate` for the shipped dispatcher's choices, `fused` and `fused_qr` for the
-# fused fit.
-SWEEP_SET=sweep; VAL_SET=validate; FUSED_SET=fused; FUSED_QR_SET=fused_qr
+# fused fit, `fused_ll` for the low-latency comparison.
+SWEEP_SET=sweep; VAL_SET=validate; FUSED_SET=fused; FUSED_QR_SET=fused_qr; LL_SET=fused_ll
 REPS=10; ROUNDS=12
 SHAPES=$HERE/shapes; FUSED_SHAPES=$HERE/fused/shapes
 if [[ $SMOKE == 1 ]]; then
-  SWEEP_SET=smoke; VAL_SET=smoke; FUSED_SET=smoke; FUSED_QR_SET=smoke
+  SWEEP_SET=smoke; VAL_SET=smoke; FUSED_SET=smoke; FUSED_QR_SET=smoke; LL_SET=smoke
   REPS=2; ROUNDS=3; TPS=${TPS_SMOKE:-2}
-  WIDTHS="4096"
+  WIDTHS="4096"; LL_WIDTHS="4096"
   SHAPES=$OUT/smoke_shapes; FUSED_SHAPES=$OUT/smoke_shapes_fused
   mkdir -p "$SHAPES" "$FUSED_SHAPES"
   for f in "$HERE"/shapes/*.csv; do head -4 "$f" > "$SHAPES/$(basename "$f")"; done
@@ -348,8 +353,42 @@ cmd_fused_fit() {
     "(per-shape summary: $OUT/fused/summary.txt); README step 5"
 }
 
+# ll_ok <tp> <hidden>: whether the low-latency mesh build exists there. It is a
+# 256-thread build, so a row is hidden/2048 atoms, which must divide a rank's
+# 8/tp atoms of a tile (_low_latency_hidden_ok in the quick test).
+ll_ok() {
+  local apr=$(($2 / 2048))
+  [[ $(($2 % 2048)) == 0 && $apr -ge 1 && $((8 / $1 % apr)) == 0 ]]
+}
+
+cmd_low_latency() {
+  NGPU=$(ngpu); resolve_link; write_provenance
+  local tp h p pairs=()
+  for tp in $TPS; do tp_ok "$tp" || continue
+    for h in $LL_WIDTHS; do
+      if ll_ok "$tp" "$h"; then pairs+=("$tp:$h"); else log "skip tp$tp w$h: no low-latency build"; fi
+    done
+  done
+  [[ ${#pairs[@]} -gt 0 ]] || die "no low-latency build at tp=[$TPS] widths=[$LL_WIDTHS]"
+  log "low-latency sweep: candidate set $LL_SET, (tp:width) = ${pairs[*]}"
+  plan ${#pairs[@]}
+  for p in "${pairs[@]}"; do
+    tp=${p%:*}; h=${p#*:}
+    bench_chunk "ll_tp${tp}_w${h}" "$OUT/low_latency/sweep" "$QUICK" --operation ar_rmsnorm \
+      --tp "$tp" --shape-csv "$FUSED_SHAPES/fused_w${h}.csv" \
+      --candidates "$CANDS" --candidate-set "$LL_SET"
+  done
+  finish
+  if [[ $DRY == 1 ]]; then dry_fit_scripts fused/compare_low_latency.py; return; fi
+  $PY "$HERE/fused/compare_low_latency.py" "$OUT/low_latency/sweep" --link "$LINK" \
+    --csv "$OUT/low_latency/compare.csv" 2>&1 | tee "$OUT/low_latency/compare.txt"
+  [[ ${PIPESTATUS[0]} == 0 ]] || die "compare_low_latency failed"
+  log "low-latency comparison -> $OUT/low_latency/compare.txt (per shape: compare.csv)"
+}
+
 case $CMD in
   setup) cmd_setup ;;
+  low-latency) cmd_low_latency ;;
   check) cmd_check ;;
   sweep) cmd_sweep ;;
   fit) cmd_fit ;;

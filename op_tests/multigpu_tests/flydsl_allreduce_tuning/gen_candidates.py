@@ -18,8 +18,9 @@ after a change to those geometries, and check the file in::
 Names are the column prefixes of the bench tables and the keys the fit scripts
 report, so they stay stable: ``fly_1stage_b<block>_a<atoms>_g<cap>``,
 ``fly_int4[_ring]_b<block>_st<st>_g<cap>``,
-``fused_fly_1stage[_k<split>]_b<block>_g<cap>`` and
-``fused_fly_<mesh|ring>_a<atoms_per_row>_st<st>_g<cap>``.
+``fused_fly_1stage[_k<split>]_b<block>_g<cap>``,
+``fused_fly_<mesh|ring>_a<atoms_per_row>_st<st>_g<cap>`` and
+``fused_fly_mesh_ll_st1_g<cap>`` (the low-latency mesh build).
 
 Sets (``--candidate-set``):
 
@@ -28,6 +29,9 @@ Sets (``--candidate-set``):
   (one-shot and mesh; the ring is never dispatched on xGMI).
 * ``fused``     -- the fused one-shot grid, unsplit and split.
 * ``fused_qr``  -- the fused mesh/ring grid.
+* ``fused_ll``  -- the low-latency mesh rows and the whole ``fused_qr`` grid,
+  timed together by ``tune.sh low-latency``. Not fitted: the fused fit cannot
+  emit a low-latency rung.
 * ``smoke``     -- a handful of rows of each, for ``tune.sh --smoke``.
 """
 
@@ -56,6 +60,7 @@ COLUMNS = (
     "split",
     "super_tile",
     "atoms_per_row",
+    "low_latency",
     "sets",
 )
 
@@ -89,12 +94,18 @@ FUSED_SPLIT_CAPS = (*FUSED_CAPS, 256)
 # Fused mesh/ring: atoms per row x super-tile x grid cap.
 FUSED_QR_ROW_ATOMS = (1, 2, 4)
 FUSED_QR_CAPS = (32, 64, 128, 256)
+# The low-latency mesh build runs two workgroups per CU, so its cap goes to
+# twice the CU count; a cap above that on a device is n/a there. It exists only
+# at ``block=BLOCK`` and ``super_tile=1``, which fixes ``atoms_per_row`` to
+# ``hidden / 2048``: hidden 2048 at TP8, 2048/4096 at TP4, 2048/4096/8192 at TP2.
+FUSED_LL_CAPS = (*FUSED_QR_CAPS, 512)
 
 SMOKE = {
     "fly_1stage_b256_a1_g128",
     "fly_int4_b256_st1_g128",
     "fused_fly_mesh_a1_st1_g128",
     "fused_fly_ring_a1_st8_g128",
+    "fused_fly_mesh_ll_st1_g128",
 }
 
 
@@ -113,6 +124,7 @@ def rows() -> list[dict]:
         fused_block_options,
         fused_split_options,
     )
+    from aiter.ops.flydsl.kernels.comm.transport import BLOCK
     from aiter.ops.flydsl.quick_allreduce import ALGORITHMS
 
     out = []
@@ -205,12 +217,26 @@ def rows() -> list[dict]:
                             f"fused_fly_{algorithm}_a{apr}_st{st}_g{g}",
                             "ar_rmsnorm",
                             algorithm,
-                            ("fused_qr",),
+                            ("fused_qr", "fused_ll"),
                             super_tile=st,
                             grid_cap=g,
                             atoms_per_row=apr,
                         )
                     )
+    # Pinned by block, not atoms_per_row: the build exists only at BLOCK.
+    for g in FUSED_LL_CAPS:
+        out.append(
+            _row(
+                f"fused_fly_mesh_ll_st1_g{g}",
+                "ar_rmsnorm",
+                "mesh",
+                ("fused_ll",),
+                super_tile=1,
+                grid_cap=g,
+                block=BLOCK,
+                low_latency=1,
+            )
+        )
     return out
 
 

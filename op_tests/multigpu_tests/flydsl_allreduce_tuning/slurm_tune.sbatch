@@ -24,7 +24,9 @@
 #
 # Environment overrides: IMAGE, REPO_URL, REF, RESULTS, RUN_NAME, DRY_RUN, DRY_SBATCH_ARGS,
 #   DRY_GPU_ARCHS (arch aiter imports for on the GPU-less dry run; default gfx950),
-#   TUNE_ARGS (extra tune.sh options for the real run, e.g. TUNE_ARGS='--tp "8 4"').
+#   TUNE_ARGS (extra tune.sh options for the real run, e.g. TUNE_ARGS='--tp "8 4"'),
+#   TUNE_CMD (the tune.sh command of the smoke, real and dry runs; default all, e.g.
+#   TUNE_CMD=low-latency for the low-latency comparison alone).
 #SBATCH --job-name=flydsl-ar-tune
 #SBATCH --nodes=1
 #SBATCH --exclusive
@@ -59,6 +61,7 @@ REF=${REF:-users/vpietila/flydsl-fused-comm-kernels-with-tuning}
 RESULTS=${RESULTS:-$HOME/flydsl_tuning}
 DRY_RUN=${DRY_RUN:-0}
 TUNE_ARGS=${TUNE_ARGS:-}
+TUNE_CMD=${TUNE_CMD:-all}
 JOB=${SLURM_JOB_ID:-local$$}
 RUN_NAME=${RUN_NAME:-$([[ $DRY_RUN == 1 ]] && echo "dryrun-$JOB" || echo "job-$JOB")}
 RUN_DIR=$RESULTS/$RUN_NAME
@@ -138,14 +141,14 @@ python -m pip install -r requirements.txt pyzmq tabulate
 cd "$TUNE_REL"
 ./tune.sh setup
 if [[ $DRY_RUN == 1 ]]; then
-  ./tune.sh --dry-run all
-  ./tune.sh --dry-run --smoke all
+  ./tune.sh --dry-run "$TUNE_CMD"
+  ./tune.sh --dry-run --smoke "$TUNE_CMD"
   exit 0
 fi
 # The smoke pass uses its own --out: its tiny CSVs share chunk names with the real run's
 # and would otherwise be skipped over as "already done".
-./tune.sh --smoke --out /work/out-smoke all
-eval "./tune.sh --out /work/out $TUNE_ARGS all"
+./tune.sh --smoke --out /work/out-smoke "$TUNE_CMD"
+eval "./tune.sh --out /work/out $TUNE_ARGS $TUNE_CMD"
 INNER
 
 GPU_FLAGS=()
@@ -156,7 +159,7 @@ fi
 
 log "starting container (gpu flags: ${GPU_FLAGS[*]:-none})"
 docker run --rm ${GPU_FLAGS[@]+"${GPU_FLAGS[@]}"} -v "$RUN_DIR:/work" \
-  -e DRY_RUN="$DRY_RUN" -e TUNE_ARGS="$TUNE_ARGS" -e TUNE_REL="$TUNE_REL" \
+  -e DRY_RUN="$DRY_RUN" -e TUNE_ARGS="$TUNE_ARGS" -e TUNE_CMD="$TUNE_CMD" -e TUNE_REL="$TUNE_REL" \
   -e DRY_GPU_ARCHS="${DRY_GPU_ARCHS:-}" \
   "$IMAGE" bash /work/inner.sh
 log "finished; results in $RUN_DIR/out"
