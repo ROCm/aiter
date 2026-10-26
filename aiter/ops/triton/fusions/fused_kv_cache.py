@@ -263,7 +263,7 @@ def fused_qk_cat_and_cache_mla(
     - k_pe_out: A copy of k_pe with shape (B_slot, KH, D2); rows whose slot is -1 are not written.
     - q_nope_zeros_out: Zeros with shape (num_decode_toks_for_zeros, QH, D1).
     """
-    assert DEVICE_ARCH != "gfx1250", (
+    assert DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"), (
         "fused_qk_cat_and_cache_mla has no gfx1250 kernel; the gluon "
         "fused_qk_rope_cat_and_cache_mla kernel requires rope"
     )

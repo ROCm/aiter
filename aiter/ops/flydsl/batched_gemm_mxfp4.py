@@ -368,7 +368,7 @@ def flydsl_batched_gemm_a8w4_v2(
     )
 
     gfx = get_gfx()
-    if gfx != "gfx1250":
+    if gfx not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(f"[FlyDSL] batched a8w4 v2 requires gfx1250, got {gfx}")
     if layout not in ("bmn", "mbn"):
         raise ValueError(f"[FlyDSL] layout must be 'bmn' or 'mbn'; got {layout!r}")

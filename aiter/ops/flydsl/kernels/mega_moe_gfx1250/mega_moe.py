@@ -582,7 +582,7 @@ class MegaMoEGfx1250:
         single cco symmetric arena instead of one per layer.
         """
         gfx = get_gfx()
-        if gfx != "gfx1250":
+        if gfx not in ("gfx1250", "gfx1250-strict"):
             raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}")

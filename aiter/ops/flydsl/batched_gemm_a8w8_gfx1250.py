@@ -289,7 +289,7 @@ def _check_bmm_operands(
     tag: str, XQ: Tensor, WQ: Tensor, Out: Tensor
 ) -> tuple[int, int, int, int, str]:
     """Shared operand checks of the batched runners; returns (m, b, n, k, out)."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             f"[FlyDSL gfx1250 bmm] batched {tag} requires gfx1250, got {get_gfx()}"
         )

@@ -281,7 +281,7 @@ def pa_decode_sparse(
     # "gfx1250-only". An explicit unified_kv_rope on gfx950 still reaches that
     # raise, which is right -- the caller asked for this path by name.
     if (
-        DEVICE_ARCH == "gfx1250"
+        DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
         and unified_kv_rope is None
         and unified_kv.dim() == 3
         and unified_kv.shape[-1] == _V4_REC_ALIGNED
@@ -1234,7 +1234,7 @@ def _pa_decode_sparse_gfx1250_fp8(
     ``_pa_decode_sparse_gfx950_gluon`` for the reference implementation and
     ``test_pa_decode_sparse_inv_rope_mxfp8_epilogue`` for the expected numerics.
     """
-    if DEVICE_ARCH != "gfx1250":
+    if DEVICE_ARCH not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             f"the DSv4 2buff packed-fp8 path is gfx1250-only, got {DEVICE_ARCH}"
         )

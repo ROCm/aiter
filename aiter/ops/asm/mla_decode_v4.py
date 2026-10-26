@@ -286,7 +286,7 @@ def _select_nm_kernel(arch, q_type, kv_type, gqa_ratio, max_seqlen_q):
         )
     )
     csv_gqa, csv_qseqlen = gqa_ratio, max_seqlen_q
-    if arch != "gfx1250" and supported:
+    if arch not in ("gfx1250", "gfx1250-strict") and supported:
         csv_gqa, csv_qseqlen = 64, 1
     cfg = _get_heuristic_kernel(arch, q_type, kv_type, csv_gqa, 0, 0, 0, csv_qseqlen, 0)
     if "sub_Q" in cfg:
@@ -698,7 +698,7 @@ def is_mla_v4_fused_eligible(Q, KV, max_seqlen_q, num_kv_splits):
 
 
 def _fused_eligible(arch, Q, KV, max_seqlen_q, num_kv_splits):
-    if arch != "gfx1250":
+    if arch not in ("gfx1250", "gfx1250-strict"):
         return False
     nsplit = int(num_kv_splits)
     if not (2 <= nsplit <= MLA_V4_FUSED_MAX_SPLITS):

@@ -689,7 +689,7 @@ def _mla_scale_on_device(scale, q: torch.Tensor, name: str) -> torch.Tensor:
 
 def _check_mla_qh128_inputs(q, kv, out, seq_lens, page_table, lse):
     """Validate the public contract without reading any GPU tensor contents."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError("kv_shuffled MLA ASM requires gfx1250")
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise RuntimeError("Q must be a GPU tensor")
@@ -817,7 +817,7 @@ def _mla_decode_fwd_kv_shuffled(
 
 def _check_mla_qh64_shuffled_inputs(q, kv, out, qo, indptr, indices, last, splits):
     """Check the packed CSR contract without synchronizing GPU metadata."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError("kv_shuffled QH64 requires gfx1250")
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise ValueError("Q must be a GPU tensor")

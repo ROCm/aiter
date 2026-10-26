@@ -2136,7 +2136,7 @@ def _mla_legacy_max_qo_tiles_per_batch(
             # Mirrors the C++ gate, which tests max_seqlen_qo rather than the
             # sparse-collapsed length; a mismatch here would size the reduce
             # buffers for a fold the planner does not perform.
-            get_gfx() == "gfx1250"
+            get_gfx() in ("gfx1250", "gfx1250-strict")
             and env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
@@ -2169,7 +2169,7 @@ def _mla_legacy_max_qo_tiles_per_batch(
             and fast_mode
         )
         or (
-            get_gfx() == "gfx1250"
+            get_gfx() in ("gfx1250", "gfx1250-strict")
             and env_flag_atoi("AITER_MLA_DECODE_PS1_FLYDSL")
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8

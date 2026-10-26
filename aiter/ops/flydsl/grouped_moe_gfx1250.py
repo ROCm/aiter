@@ -1512,7 +1512,11 @@ def grouped_gemm_gfx1250_a8w4(
         for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
     )
     _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
-    if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and not _force_gfx1250:
+    if (
+        get_gfx() not in ("gfx1250", "gfx1250-strict")
+        and "gfx1250" not in _gfx_env
+        and not _force_gfx1250
+    ):
         return None
 
     device = hidden_states.device

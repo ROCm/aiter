@@ -228,7 +228,7 @@ def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
     a_is_preshuffled: bool = False,
 ) -> Tensor:
     kernel_name = str(config.get("kernelName", ""))
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             "gemm_a8w8_mxfp8_128_bpreshuffle_flydsl is only supported on gfx1250"
         )
@@ -2173,7 +2173,7 @@ def _mxfp8_bpreshuffle_tuned_nk(tuned_file: str) -> frozenset:
 
 def mxfp8_bpreshuffle_tuned(N: int, K: int) -> bool:
     """Whether this arch has tuned MXFP8 1x32 GEMM configs for (N, K)."""
-    if get_gfx() != "gfx1250":
+    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         return False
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
     return (get_gfx(), get_cu_num(), N, K) in _mxfp8_bpreshuffle_tuned_nk(tuned_file)
@@ -2311,7 +2311,7 @@ def gemm_a8w8_mxfp8_bpreshuffle(
     M, K = XQ.shape
     N = WQ.shape[0]
     gfx = get_gfx()
-    if a_scale_preshuffled and gfx != "gfx1250":
+    if a_scale_preshuffled and gfx not in ("gfx1250", "gfx1250-strict"):
         raise ValueError("a_scale_preshuffled is supported only on gfx1250")
     Y = torch.empty(M, N, dtype=dtype, device=XQ.device) if out is None else out
     if M == 0:

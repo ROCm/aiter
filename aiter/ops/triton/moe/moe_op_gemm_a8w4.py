@@ -278,7 +278,7 @@ def m2bucket(m):
 
 def get_gluon_a8w4_ctas_per_cga(m):
     num_ctas = 1
-    if num_ctas == 1 or get_arch() != "gfx1250":
+    if num_ctas == 1 or get_arch() not in ("gfx1250", "gfx1250-strict"):
         return [1, 1]
     # Decode: shard the cluster along N only.
     if m < 1024:

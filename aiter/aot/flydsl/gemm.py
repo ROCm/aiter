@@ -417,7 +417,9 @@ def parse_csv(csv_path: str):
             if params is not None:
                 params = dict(params)
                 params["kind"] = (
-                    "a16w16_gfx1250" if params["target_gfx"] == "gfx1250" else "hgemm"
+                    "a16w16_gfx1250"
+                    if params["target_gfx"] in ("gfx1250", "gfx1250-strict")
+                    else "hgemm"
                 )
         else:
             params = None
@@ -613,7 +615,7 @@ def _compile_a16w16_gfx1250_to_cache(
 
     import torch
 
-    if target_gfx != "gfx1250":
+    if target_gfx not in ("gfx1250", "gfx1250-strict"):
         raise ValueError(
             f"The FlyDSL gfx1250 A16W16 kernel only supports gfx1250, got {target_gfx}"
         )

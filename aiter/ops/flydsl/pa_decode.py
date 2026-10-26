@@ -118,7 +118,7 @@ def launch_pa_decode_ps_reduce(
                 groups *= 2
         per_seq = rows * kv_heads
         if (
-            arch != "gfx1250"
+            arch not in ("gfx1250", "gfx1250-strict")
             and ctas * group_waves >= budget
             and batch * per_seq * per_seq <= 2**30
         ):
@@ -365,13 +365,17 @@ def pa_decode(
     if not (
         64 <= head_dim <= 1024
         and head_dim % 64 == 0
-        and ((is_bf16_kv and arch != "gfx1250") or q_chunk <= 8 or q_chunk % 8 == 0)
+        and (
+            (is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict"))
+            or q_chunk <= 8
+            or q_chunk % 8 == 0
+        )
     ):
         raise NotImplementedError(
             f"pa_decode does not support head_dim={head_dim}; supported values "
             + (
                 "are multiples of 64 in [64, 1024] for BF16 KV"
-                if is_bf16_kv and arch != "gfx1250"
+                if is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict")
                 else "are 64 and multiples of 128 in [128, 1024]"
             )
         )
@@ -387,7 +391,7 @@ def pa_decode(
             f"pa_decode only supports block_size in (16, 64, 128), got {block_size}"
         )
 
-    if is_bf16_kv and arch != "gfx1250" and not trans_v:
+    if is_bf16_kv and arch not in ("gfx1250", "gfx1250-strict") and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
     if trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
@@ -438,7 +442,11 @@ def pa_decode(
         query_dtype = "f16"
     else:
         raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
-    if is_bf16_kv and arch != "gfx1250" and query.dtype != torch.bfloat16:
+    if (
+        is_bf16_kv
+        and arch not in ("gfx1250", "gfx1250-strict")
+        and query.dtype != torch.bfloat16
+    ):
         raise NotImplementedError("BF16 KV requires bfloat16 queries")
     if output.dtype != query.dtype:
         raise TypeError(

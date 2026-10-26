@@ -280,7 +280,7 @@ def mhc_res_ks(
 
 
 def _check_mhc_res_preshuffle_arch(shuffled: bool, arch: str) -> None:
-    if shuffled and arch != "gfx1250":
+    if shuffled and arch not in ("gfx1250", "gfx1250-strict"):
         raise ValueError(
             f"res_preshuffle=1 is only supported on gfx1250, got {arch}; "
             "use res_preshuffle=0 (BF16 compute is controlled independently)"
