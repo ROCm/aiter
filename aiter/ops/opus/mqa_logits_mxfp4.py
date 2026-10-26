@@ -208,10 +208,16 @@ def _rule(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
         return {"rows_per_cta": rpc, "stages": 2, "scale_tdm": 1, "gather": 0}, None
     if heads == 32 and entry_rows >= _TILE:
         if max_qlen == 1:
-            # decode without DSpark speculation: one row a sequence. The natural instance (one row
-            # a CTA, contiguous tiles) is not compiled yet; R3W2 / R1W4 would idle 5/6 or 3/4 of
-            # their row slots.
-            return None
+            # decode without DSpark speculation: one row a sequence, so one row a CTA. ~1.5x R3W2,
+            # which would idle 5 of its 6 row slots; S2L has the best worst case of the R1W1
+            # rings on MTP-1 decode (fixed + random sets, ratio 2 and 1).
+            return {
+                "rows_per_wave": 1,
+                "waves": 1,
+                "stages": 2,
+                "scale_tdm": 0,
+                "gather": 0,
+            }, FREE
         if decode:
             return {
                 "rows_per_wave": 3,
@@ -426,15 +432,10 @@ def _config(
     else:
         chosen = [i for i in supported if rule is not None and _matches(i, rule[0])]
         if not chosen:
-            why = (
-                " (heads=32 at max_qlen=1 over contiguous tiles has no instance yet)"
-                if heads == 32 and entry_rows >= _TILE and max_qlen == 1
-                else ""
-            )
             raise ValueError(
                 f"no MXFP4 MQA-logits instance on {arch} for heads={heads}, "
                 f"page_size={page_size} x pages_per_block={pages_per_block}, "
-                f"max_qlen={max_qlen}{why}; {arch} has {_describe(insts)}"
+                f"max_qlen={max_qlen}; {arch} has {_describe(insts)}"
             )
         inst, free_mode = chosen[0], rule[1]
     if mode_name is not None:

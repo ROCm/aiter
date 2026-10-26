@@ -521,6 +521,12 @@ def rows_shapes(model):
                     full_layer("v41 dec r2 ragged", [2048, 1500, 777], [6, 4, 1], 2),
                     False,
                 ),
+                (
+                    full_layer(
+                        "v41 dec r1 mtp1", [3000, 2048, 777, 70], [1, 1, 1, 1], 1
+                    ),
+                    False,
+                ),
                 (full_layer("v41 dec r1", [3000, 2048], [6, 6], 1), False),
                 (full_layer("v41 dec r1 short", [70], [6], 1), False),
                 (full_layer("v41 pre r2 fresh 300", [300], [300], 2), False),
@@ -605,7 +611,7 @@ def check_rows(model):
 
 def edge_case(model):
     """Nine sequences, each carrying one source of NaN / Inf; the case, each sequence's rows and
-    what it carries. Two rows a full-layer sequence (V4.1 has no contiguous instance at one).
+    what it carries. Two rows a full-layer sequence, so the multi-row instances take it too.
     """
     heads, n = MODEL_HEADS[model], 9
     if model == "cand":
@@ -864,16 +870,6 @@ def check_errors(model):
             row_ends=torch.cat([ends, ends]),
         ),
         "int64 row_ends": call(row_ends=ends.long()),
-        "H = 32 at max_qlen 1 over contiguous tiles": lambda: mqa_logits_mxfp4_config(
-            torch.cuda.current_device(),
-            heads=32,
-            page_size=8,
-            pages_per_block=16,
-            max_rows=64,
-            max_seqs=64,
-            max_qlen=1,
-            max_seq_len=4096,
-        ),
         "table entries no instance reads": lambda: mqa_logits_mxfp4_config(
             torch.cuda.current_device(),
             heads=64,
