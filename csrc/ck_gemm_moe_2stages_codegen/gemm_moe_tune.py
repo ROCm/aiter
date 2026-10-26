@@ -338,6 +338,17 @@ def _parse_fast_scan_iters(value):
     return value
 
 
+def _mxfp4_search_mode(args):
+    """The MXFP4 search mode: an omitted one is staged, or prune under --fast-scan.
+
+    prune is internal only; the CLI accepts full and staged.
+    """
+    mode = getattr(args, "mxfp4_search_mode", None)
+    if mode:
+        return mode
+    return "prune" if getattr(args, "fast_scan", False) else "staged"
+
+
 def _normalized_latency_difference(latency, fastest_latency):
     if fastest_latency > 0:
         return (latency - fastest_latency) / fastest_latency
@@ -654,17 +665,17 @@ class FmoeTuner(TunerCommon):
         )
         self.parser.add_argument(
             "--mxfp4-search-mode",
-            choices=("prune", "full", "staged"),
-            help="prune by M_est (default), exhaust all legal variants (full), "
-            "or screen the pruned stages (staged; shapes with M_est < 4 validate "
-            "every pruned pair unscreened); requires --mxfp4-flydsl.",
+            choices=("full", "staged"),
+            help="screen the M_est-pruned stages (staged, the default; shapes with "
+            "M_est < 4 validate every pruned pair unscreened) or exhaust all legal "
+            "variants (full). Omitted with --fast-scan, every M_est-pruned pair is "
+            "scanned. Requires --mxfp4-flydsl.",
         )
         self.parser.add_argument(
             "--mxfp4-screen-topk",
             type=int,
             help="positive screening top-K per stage context (default 2); "
-            "requires explicit --mxfp4-search-mode staged; unused for M_est < 4; "
-            "distinct from routing top-k.",
+            "staged search only; unused for M_est < 4; distinct from routing top-k.",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -673,27 +684,30 @@ class FmoeTuner(TunerCommon):
             self.parser.error("--fast-scan requires --mxfp4-flydsl")
         if not hasattr(args, "fast_scan"):
             args.fast_scan = False
-        # None distinguishes an omitted mode from an explicit prune request.
-        if args.mxfp4_search_mode is not None and (
-            not args.mxfp4_flydsl
-            or args.grouped_gemm
-            or not isinstance(self, Mxfp4FlydslTuner)
-        ):
+        mxfp4_port = (
+            args.mxfp4_flydsl
+            and not args.grouped_gemm
+            and isinstance(self, Mxfp4FlydslTuner)
+        )
+        # None distinguishes an omitted mode from an explicit one.
+        if args.mxfp4_search_mode is not None and not mxfp4_port:
             self.parser.error(
                 "--mxfp4-search-mode requires --mxfp4-flydsl without --grouped-gemm"
             )
         if args.mxfp4_screen_topk is not None:
             if args.mxfp4_screen_topk <= 0:
                 self.parser.error("--mxfp4-screen-topk must be a positive integer")
-            if args.mxfp4_search_mode != "staged":
+            if not mxfp4_port or _mxfp4_search_mode(args) != "staged":
                 self.parser.error(
-                    "--mxfp4-screen-topk requires explicit --mxfp4-search-mode staged"
+                    "--mxfp4-screen-topk requires --mxfp4-flydsl staged search "
+                    "(no --fast-scan, no --mxfp4-search-mode full)"
                 )
         if args.fast_scan and args.mxfp4_search_mode == "staged":
             self.parser.error(
-                "--fast-scan applies to prune/full search, not --mxfp4-search-mode staged"
+                "--fast-scan applies to pruned or full search, not "
+                "--mxfp4-search-mode staged"
             )
-        args.mxfp4_search_mode = args.mxfp4_search_mode or "prune"
+        args.mxfp4_search_mode = _mxfp4_search_mode(args)
         args.mxfp4_screen_topk = args.mxfp4_screen_topk or 2
         return args
 
@@ -6755,11 +6769,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
     """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
     unit.
 
-    By default, prune GEMM1 using M_est = ceil(token * topk / expert). This
-    reduces candidate evaluation work and is expected to shorten tuning wall
-    time; the actual speedup has not been measured. Kernel performance and
-    winner retention on unseen shapes require separate validation. Use
-    --mxfp4-search-mode full to enumerate all statically supported GEMM1 variants.
+    By default, prune GEMM1 using M_est = ceil(token * topk / expert) and screen
+    the pruned stages (staged search); with --fast-scan and no explicit mode,
+    every pruned pair is scanned instead. Pruning reduces candidate evaluation
+    work and is expected to shorten tuning wall time; the actual speedup has not
+    been measured. Kernel performance and winner retention on unseen shapes
+    require separate validation. Use --mxfp4-search-mode full to enumerate all
+    statically supported GEMM1 variants.
     """
 
     SUPPORTS_FAST_SCAN = True
@@ -6949,7 +6965,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return arch, cu
 
     def get_gfx(self) -> "str":
-        # Single-slot prune/full runs on the current GPU.
+        # Single-slot pruned and full runs use the current GPU.
         return (
             str(
                 torch.cuda.get_device_properties(
@@ -7099,7 +7115,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return m_est >= 64
         raise ValueError(
             f"Missing GEMM1 pruning rule for BM{bm}; add an M_est pruning rule "
-            "for this BM in Mxfp4FlydslTuner._g1_matches_m_est before using prune mode."
+            "for this BM in Mxfp4FlydslTuner._g1_matches_m_est before pruning by M_est."
         )
 
     def _g1_variants(
@@ -8147,7 +8163,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         small_batch = m_est < self._STAGED_SMALL_BATCH_M_EST
         if small_batch:
             # Isolated stage time does not predict pipeline time at this scale,
-            # so time every pruned pair end to end, exactly as prune mode does.
+            # so time every pruned pair end to end, as --fast-scan does.
             print(
                 f"[mxfp4-staged] small batch M_est={m_est}: validating all "
                 f"{len(plan.pairs)} pruned pairs without screening",
@@ -8243,7 +8259,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return _mxfp4_failed_row(self.keys, row, f"UNSUPPORTED: {reason}")
 
         timeout = int(getattr(args, "timeout", 0) or 0)
-        if getattr(args, "mxfp4_search_mode", "prune") == "staged":
+        if _mxfp4_search_mode(args) == "staged":
             return self._tune_staged_shape(row, args, timeout)
 
         class _CandidateTimeout(Exception):
@@ -8259,7 +8275,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 timeout = 0  # not on the main thread; cannot arm SIGALRM
 
         candidates = self._candidate_rows(
-            row, full_search=getattr(args, "mxfp4_search_mode", "prune") == "full"
+            row, full_search=_mxfp4_search_mode(args) == "full"
         )
         fast_scan = bool(getattr(args, "fast_scan", False))
         best, failures, successful = None, [], []
@@ -8466,12 +8482,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
-        if (
-            getattr(args, "fast_scan", False)
-            and getattr(args, "mxfp4_search_mode", "prune") == "staged"
-        ):
+        if getattr(args, "fast_scan", False) and _mxfp4_search_mode(args) == "staged":
             raise ValueError(
-                "--fast-scan applies to prune/full search, not "
+                "--fast-scan applies to pruned or full search, not "
                 "--mxfp4-search-mode staged"
             )
         self._invocation_configuration(args)
@@ -8483,7 +8496,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         mp_num = int(getattr(args, "mp", 1) or 1)
         ngpu = torch.cuda.device_count()
         mp_num = max(1, min(mp_num, ngpu, len(rows)))
-        staged = getattr(args, "mxfp4_search_mode", "prune") == "staged"
+        staged = _mxfp4_search_mode(args) == "staged"
         identities = (
             self._preflight_devices(mp_num, ngpu, staged=True)
             if staged

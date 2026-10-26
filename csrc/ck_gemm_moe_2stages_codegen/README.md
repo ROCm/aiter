@@ -40,15 +40,14 @@ Above `M_est = 32`, BM32 keeps only 4-wave, `k_wave=1`, non-NT candidates.
 Above `M_est = 64`, BM64 keeps only non-NT candidates. All legal BN,
 `xcd_swizzle`, and BM16 `prefetch_hidden` choices remain available.
 
-`--mxfp4-search-mode {prune,full,staged}` selects the GEMM1 search mode. It
-defaults to `prune`; `full` enumerates every statically supported GEMM1
-candidate; `staged` screens the pruned candidates stage by stage before
-end-to-end validation (see [Staged search](#staged-search)):
+`--mxfp4-search-mode {full,staged}` selects the GEMM1 search mode. It
+defaults to `staged`, which screens the pruned candidates stage by stage before
+end-to-end validation (see [Staged search](#staged-search)); `full` enumerates
+every statically supported GEMM1 candidate. With `--fast-scan` and no explicit
+mode, every pruned pair is scanned instead (see
+[Fast MXFP4 FlyDSL scan](#fast-mxfp4-flydsl-scan)):
 
 ```bash
-python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
-  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode prune
-
 python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
   -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode full
 
@@ -79,7 +78,7 @@ the line attributable when `--mp` workers interleave their stdout.
 Full search and shapes with no removed candidates omit that summary.
 
 Pruning reduces candidate evaluation work and is expected to shorten tuning
-wall time. The actual wall time of `full` and `prune` has not been compared, so
+wall time. The actual wall time of full and pruned search has not been compared, so
 no measured speedup is reported. The performance of the selected kernels and
 winner retention on unseen shapes require separate validation; use full search
 to investigate those shapes. GEMM2 enumeration and the same-BM pairing rule are
@@ -91,11 +90,11 @@ for a worked example and static validation results.
 
 ##### Staged search
 
-`staged` starts from the same pruned pairs as `prune` and screens each stage
-before end-to-end validation:
+`staged` starts from the pruned pairs and screens each stage before
+end-to-end validation:
 
 - Shapes with `M_est < 4` skip screening and validate every pruned pair end to
-  end, so they save no validations compared with `prune`.
+  end, so they save no validations compared with timing every pruned pair.
 - Otherwise, for each BM the tuner first finds a reference GEMM2 consumer
   (atomic) and a reference GEMM1 producer that pass the correctness check.
   It then times GEMM1 candidates in isolation per BM, and GEMM2 candidates per
@@ -113,12 +112,13 @@ before end-to-end validation:
 - Every shape runs in its own spawned process, also with `--mp 1`. Staged
   search does not use the parallel precompile, so cold-cache JIT time counts
   against `--timeout`.
-- `--mxfp4-screen-topk` requires an explicit `--mxfp4-search-mode staged`;
-  `staged` cannot be combined with `--fast-scan`.
+- `--mxfp4-screen-topk` applies only to staged search; an explicit
+  `--mxfp4-search-mode staged` cannot be combined with `--fast-scan`.
 
 Isolated stage times do not always rank pipelines the same way, so `staged`
-can select a slower winner than `prune`. Use `prune` or `full` to check
-shapes where the selected kernel matters.
+can select a slower winner than timing every pruned pair. Use `--fast-scan`
+or `--mxfp4-search-mode full` to check shapes where the selected kernel
+matters.
 
 #### `--last`
 - **Type**: Flag (boolean)
@@ -231,7 +231,8 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 #### Fast MXFP4 FlyDSL scan
 
 Use `--fast-scan` with `--mxfp4-flydsl` to scan each legal coupled G1/G2
-candidate using the profiler-summed active GPU-kernel time, excluding launch
+candidate (the pruned candidates, or all of them with
+`--mxfp4-search-mode full`) using the profiler-summed active GPU-kernel time, excluding launch
 overhead and idle gaps. The scan prepares one input fixture per shape and
 builds one shared torch reference. Candidates that exceed
 `--errRatio`, return a non-finite error, or fail to launch are rejected
@@ -339,8 +340,8 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 - **Description**: Ordinary tuners use it as a per-task watchdog: a lost task
   (dead worker) is reaped and the pool restarted after this many seconds.
   With `--mxfp4-flydsl` it is a best-effort SIGALRM timeout per operation:
-  per candidate in `prune`/`full`, and per reference check, screening run or
-  validation in `staged`. It fires only when control returns to Python; there
+  per candidate in `--fast-scan` and `full` search, and per reference check,
+  screening run or validation in `staged`. It fires only when control returns to Python; there
   is no shape-level hard deadline, so a permanent GPU hang may wait
   indefinitely.
 
