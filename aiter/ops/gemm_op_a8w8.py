@@ -816,15 +816,19 @@ def gemm_a8w8_bpreshuffle(
     """Per-token/per-channel FP8 or signed-INT8 preshuffled GEMM.
 
     The gfx950 INT8 path uses the 4-wave FlyDSL kernel with INT32
-    accumulation, FP32 row/column scales, and BF16 output. Bias is not fused;
-    callers add it after the GEMM. Untuned supported shapes use the same
-    kernel through a conservative persistent/non-persistent fallback policy.
+    accumulation, FP32 row/column scales, and BF16 output. Untuned supported
+    shapes use the same kernel through a conservative persistent/non-persistent
+    fallback policy.
+
+    INT8 requires ``bias=None``. A bias tensor is rejected before dispatch;
+    callers add bias to the BF16 output after the GEMM.
 
     INT8 requires contiguous ``XQ[M,K]`` and ``WQ[N,K_w]`` tensors, with WQ
     produced by ``shuffle_weight(..., layout=(16, 16))``. K and K_w are
     multiples of 128, K >= 256, N is a multiple of 16, and K_w may be greater
     than K. In that padded-weight case XQ is zero-padded and dispatch resolves
-    against the effective launch K_w.
+    against the effective launch K_w. The kernel uses 32-bit offsets, so
+    ``M * N * 2``, ``M * K_w`` and ``N * K_w`` must each be below ``2**31``.
 
     AOT packaging covers only specializations reachable from tuned CSV rows.
     An untuned fallback whose K, CU/XCD topology, or persistence variant is not

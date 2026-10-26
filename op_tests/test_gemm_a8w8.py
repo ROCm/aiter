@@ -736,6 +736,7 @@ def test_skinny_gemm_a8w8_pertoken_quant():
 def run_int8_4wave_ci_correctness():
     """Observable correctness cases run by AITER's script-based CI entry."""
     if get_gfx() != "gfx950":
+        aiter.logger.info("INT8 4-wave correctness: skipped, requires gfx950")
         return
 
     cases = (
@@ -883,6 +884,11 @@ def run_int8_4wave_ci_correctness():
     side.synchronize()
     assert torch.equal(streamed, eager)
     assert torch.equal(consumed, eager.float() * 2)
+    aiter.logger.info(
+        "INT8 4-wave correctness: passed %d bit-exact shapes, padded K, signed "
+        "extrema, zero rows, contract rejections, compile, graph and stream",
+        len(cases),
+    )
 
 
 def _iter_flydsl_csv_cases():
