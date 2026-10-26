@@ -4483,8 +4483,9 @@ def get_2stage_cfgs(
         else:
             # Plain fp8 CK instances read the shuffle_weight() layout on both
             # w1 and w2. is_shuffled is true when either weight is tagged, so
-            # a mixed pair would skip this check and one stage would read the
-            # wrong layout. weights_shuffled is true only when both are tagged.
+            # a mixed pair would skip a check on that flag. weights_shuffled
+            # is the both-weights flag when the caller passed
+            # opus_weights_shuffled, which fused_moe and fused_moe_2stages do.
             # gfx is the live device; get_gfx() follows GPU_ARCHS and can hide
             # an actual gfx950 process from this guard.
             if (
