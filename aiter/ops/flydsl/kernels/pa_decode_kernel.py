@@ -503,7 +503,7 @@ def compile_gfx1250_pa_decode(
                 fx.Int32(task[2]),
                 fx.Int32(task[3]),
             )
-            if const_expr(t.bf16_packed):
+            if const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()

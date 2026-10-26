@@ -773,25 +773,28 @@ class Gfx1250Traits:
     FP8_MAX = 448.0
 
     @property
-    def bf16_page16_packed(self):
-        # Four waves gather one vector-8 page each into a 64-token LDS tile.
+    def bf16_packed(self):
+        # Page16 gathers one vector-8 page per wave. Page128 keeps resident
+        # Q/accumulator registers bounded and two pages within LDS.
         return (
             self.bf16
             and self.trans_v
-            and self.block_size == 16
             and self.head_dim in (64, 128, 256)
+            and (
+                self.block_size == 16
+                or (
+                    self.block_size == 128 and (self.head_dim <= 128 or self.rows <= 32)
+                )
+            )
         )
 
     @property
-    def bf16_packed(self):
-        # Bound resident Q/accumulator registers and keep two pages within LDS.
-        return (
-            self.bf16
-            and self.trans_v
-            and self.block_size == 128
-            and self.head_dim in (64, 128, 256)
-            and (self.head_dim <= 128 or self.rows <= 32)
-        )
+    def bf16_page16_packed(self):
+        return self.bf16_packed and self.block_size == 16
+
+    @property
+    def bf16_page128_packed(self):
+        return self.bf16_packed and self.block_size == 128
 
     @property
     def TOKENS(self):
@@ -799,7 +802,7 @@ class Gfx1250Traits:
         # Windowed rows retain 64-token normalization for FP8 accuracy.
         return (
             128
-            if self.bf16_packed
+            if self.bf16_page128_packed
             or (
                 self.packed_lds
                 and self.head_dim in (128, 256)
@@ -847,7 +850,7 @@ class Gfx1250Traits:
 
     @property
     def q_bytes(self):
-        return 0 if self.bf16_packed else self.q_tiles * 16 * self.q_stride
+        return 0 if self.bf16_page128_packed else self.q_tiles * 16 * self.q_stride
 
     @property
     def packed_lds(self):
@@ -874,7 +877,7 @@ class Gfx1250Traits:
 
     @property
     def k_bytes(self):
-        if self.bf16_packed or self.bf16_page16_packed:
+        if self.bf16_packed:
             return self.TOKENS * self.head_dim * self.elem_bytes
         return self.TOKENS * (self.head_dim if self.packed_lds else self.q_stride)
 
@@ -884,7 +887,7 @@ class Gfx1250Traits:
 
     @property
     def v_bytes(self):
-        if self.bf16_packed or self.bf16_page16_packed:
+        if self.bf16_packed:
             return self.TOKENS * self.head_dim * self.elem_bytes
         return self.head_dim * (self.TOKENS if self.packed_lds else self.v_stride)
 
@@ -893,11 +896,7 @@ class Gfx1250Traits:
         return (
             self.k_bytes
             + self.v_bytes
-            + (
-                0
-                if self.bf16_packed or self.bf16_page16_packed
-                else 2 * self.TOKENS * 4
-            )
+            + (0 if self.bf16_packed else 2 * self.TOKENS * 4)
         )
 
     @property
