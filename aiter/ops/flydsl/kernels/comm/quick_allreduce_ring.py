@@ -113,9 +113,9 @@ def make_quick_allreduce_ring_kernel(
     rank: int,
     super_tile: int = 1,
     grid: int,
-    inbox_memory: str = "finegrained",
-    rs_codec: str = "int4",
-    ag_codec: str = "int4",
+    inbox_memory: str,
+    rs_codec: str,
+    ag_codec: str,
     block: int = BLOCK,
 ):
     """Build the ring kernel for one *rank*.

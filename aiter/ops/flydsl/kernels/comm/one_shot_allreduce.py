@@ -132,7 +132,7 @@ def make_one_shot_allreduce_kernel(
     world_size: int,
     atoms: int = DEFAULT_ATOMS,
     grid: int,
-    inbox_memory: str = "uncached",
+    inbox_memory: str,
     fanout: str = DEFAULT_FANOUT,
     rank: int,
     block: int = DEFAULT_BLOCK,
