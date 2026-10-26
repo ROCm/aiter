@@ -341,7 +341,8 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
     for(int i = 0; i < ngpus; i++)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i]    = (const P*)_input_dp->ptrs[i];
         tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
@@ -513,7 +514,8 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     for(int i = 0; i < ngpus; i++)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i]    = (const P*)_input_dp->ptrs[i];
         tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
@@ -3630,7 +3632,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
 #pragma unroll
         for (int i = 1; i < ngpus; ++i)
         {
-          int peer = (rank + i) % ngpus;
+          int peer = (i - 1) + (i - 1 >= rank);
           src[i - 1] = myBase + (size_t)peer * slot;
         }
         bool still_loop;
@@ -3660,7 +3662,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
 #pragma unroll
           for (int j = 0; j < LP; ++j)
           {
-            acc[j] += upcast_s(pv[j]);
+            // Insert the local value at its rank, not before all peers.
+            if(i == 0 && rank != 0)
+                acc[j] = upcast_s(pv[j]);
+            else
+                acc[j] += upcast_s(pv[j]);
+            if(i + 1 == rank)
+                acc[j] += upcast_s(selfv[j]);
           }
         }
 
@@ -3922,7 +3930,8 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 #pragma unroll
     for (int i = 1; i < ngpus; ++i)
     {
-      scratch_base[i - 1] = self_scratch + ((self_rank + i) % ngpus) * kLL128SlotStride + idx * 8 * 2 * 4;
+      int peer = (i - 1) + (i - 1 >= self_rank);
+      scratch_base[i - 1] = self_scratch + peer * kLL128SlotStride + idx * 8 * 2 * 4;
       scratch_flag_addr[0][i - 1] = scratch_base[i - 1] + 7 * 4;
       scratch_flag_addr[1][i - 1] = scratch_flag_addr[0][i - 1] + 8 * 4;
     }
@@ -3951,7 +3960,12 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 #pragma unroll
       for (int j = 0; j < pack_size; ++j)
       {
-        reduce_rslt_f32[0][j] += upcast_s(reduce_elem[i][j]);
+        if(i == 0 && self_rank != 0)
+            reduce_rslt_f32[0][j] = upcast_s(reduce_elem[i][j]);
+        else
+            reduce_rslt_f32[0][j] += upcast_s(reduce_elem[i][j]);
+        if(i + 1 == self_rank)
+            reduce_rslt_f32[0][j] += upcast_s(inp_reg[0][j]);
       }
     }
 
@@ -3977,7 +3991,12 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 #pragma unroll
       for (int j = 0; j < pack_size; ++j)
       {
-        reduce_rslt_f32[1][j] += upcast_s(reduce_elem[i][j]);
+        if(i == 0 && self_rank != 0)
+            reduce_rslt_f32[1][j] = upcast_s(reduce_elem[i][j]);
+        else
+            reduce_rslt_f32[1][j] += upcast_s(reduce_elem[i][j]);
+        if(i + 1 == self_rank)
+            reduce_rslt_f32[1][j] += upcast_s(inp_reg[1][j]);
       }
     }
 
