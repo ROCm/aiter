@@ -654,6 +654,25 @@ struct __attribute__((aligned(16))) DecodeKArgs {
 };
 static_assert(sizeof(DecodeKArgs) == 128, "two s_load_dwordx16");
 
+// Kernarg preload (-mllvm -amdgpu-kernarg-preload-count=16, honoured by
+// hipcc >= 7.2 on gfx950): the first 14 dwords of the kernargs arrive in
+// user SGPRs with the wave, so the kernel issues its first loads without an
+// SMEM round trip. The pass preloads whole arguments only, so the standalone
+// decode kernel takes the fields needed before the first loads as scalars
+// (5 pointers + 4 ints = 14 dwords) and the rest, needed only after the
+// metadata round trip, as one 64 B struct fetched by s_load in its shadow.
+struct __attribute__((aligned(16))) DecodeKRest {
+  const float* ape;
+  uint16_t* tail;
+  uint8_t* cache;
+  int key_st, ss_st;
+  int block_elems, head_elems, ring_mask, ring_shift;
+  int page_size, page_shift;
+  uint32_t page_bytes;
+  int flags;
+};
+static_assert(sizeof(DecodeKRest) == 64, "one s_load_dwordx16");
+
 __host__ __device__ __forceinline__ DecodeKArgs make_kargs(const DecodeArgs& da, const float* ape, TailArgs ta,
                                                            uint8_t* cache, int page_size, int page_shift,
                                                            uint32_t page_bytes, int flags) {
@@ -763,10 +782,12 @@ __device__ __forceinline__ void decode_request(
   // The first loads "depend" on every other kernarg (empty asm): the compiler
   // fetches all kernargs in one SMEM batch with one wait, instead of one lazy
   // batch and one wait per first use along the chain.
+#ifdef KPOOL_PIN_ALL_KARGS
   asm("" : "+s"(kb), "+s"(sb), "+s"(m_ts), "+s"(m_loc), "+s"(m_pos)
          : "s"(ape_g), "s"(tail), "s"(ta.block_elems),
            "s"(ta.head_elems), "s"(ta.ring_mask), "s"(ta.ring_shift), "s"(cache_g), "s"(page_size), "s"(page_shift),
            "s"(page_bytes), "s"(flags), "s"(d.key_st), "s"(d.ss_st));
+#endif
   const gptr<const uint16_t> kbase = (gptr<const uint16_t>)kb;
   const gptr<const uint16_t> sbase = (gptr<const uint16_t>)sb;
 #pragma unroll
@@ -963,7 +984,16 @@ __device__ __forceinline__ void decode_request(
 
 
 template <int POOL, int NMAX, bool VEC>
-__global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) kpool_decode_kernel(DecodeKArgs d) {
+__global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) kpool_decode_kernel(
+    const uint16_t* key, const uint16_t* score, const int32_t* tail_slot, const int32_t* slot_map,
+    const int32_t* positions, int key_sb, int ss_sb, int next_n, int num_requests, DecodeKRest r) {
+  DecodeKArgs d;
+  d.key = key; d.score = score; d.tail_slot = tail_slot; d.slot_map = slot_map; d.positions = positions;
+  d.key_sb = key_sb; d.ss_sb = ss_sb; d.next_n = next_n; d.num_requests = num_requests;
+  d.ape = r.ape; d.tail = r.tail; d.cache = r.cache; d.key_st = r.key_st; d.ss_st = r.ss_st;
+  d.block_elems = r.block_elems; d.head_elems = r.head_elems; d.ring_mask = r.ring_mask; d.ring_shift = r.ring_shift;
+  d.page_size = r.page_size; d.page_shift = r.page_shift; d.page_bytes = r.page_bytes; d.flags = r.flags;
+  d.pad0 = d.pad1 = 0;
   const int lane = threadIdx.x & 63;
   const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
   // No early return: the padding waves of the last workgroup clamp to the
@@ -1080,10 +1110,16 @@ int launch_decode_n(bool vec, const DecodeArgs& da, const void* ape, int64_t ape
   (void)ape_stride;  // == HEAD_DIM, checked by the entry point
   const DecodeKArgs d = make_kargs(da, (const float*)ape, ta, (uint8_t*)cache, page_size, page_shift_of(page_size),
                                    (uint32_t)page_bytes, flags);
+  DecodeKRest r;
+  r.ape = d.ape; r.tail = d.tail; r.cache = d.cache; r.key_st = d.key_st; r.ss_st = d.ss_st;
+  r.block_elems = d.block_elems; r.head_elems = d.head_elems; r.ring_mask = d.ring_mask; r.ring_shift = d.ring_shift;
+  r.page_size = d.page_size; r.page_shift = d.page_shift; r.page_bytes = d.page_bytes; r.flags = d.flags;
   if (vec)
-    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, true>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream, d);
+    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, true>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream,
+                       d.key, d.score, d.tail_slot, d.slot_map, d.positions, d.key_sb, d.ss_sb, d.next_n, d.num_requests, r);
   else
-    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, false>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream, d);
+    hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, false>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream,
+                       d.key, d.score, d.tail_slot, d.slot_map, d.positions, d.key_sb, d.ss_sb, d.next_n, d.num_requests, r);
   return (int)hipGetLastError();
 }
 
