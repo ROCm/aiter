@@ -55,11 +55,15 @@ __device__ inline bool mqa_assign(const mqa_logits_mxfp4_kargs& k, int lane, mqa
     const int slot = opus::block_id_x();
 
     if constexpr (SCHED == SCHED_TABLE) {
+        // The whole record in one round, before the branch (the pins), and no early return: its
+        // bool phi split the prologue, and the record's tail and the kargs the first tile needs
+        // went out one dependent round apart.
         const opus_mqa_cta_record rec = k.ptr_cta_info[slot];
-        if (rec.chunk_count <= 0 || rec.row_id >= k.num_rows) return false;
         wk = {rec.row_id, rec.batch_id, rec.group_rows, rec.chunk_start, rec.chunk_count,
               TABLE_PAD ? rec._pad : rec.chunk_count};
-        return true;
+        pin_sgpr(wk.row_id); pin_sgpr(wk.batch_id); pin_sgpr(wk.group_rows);
+        pin_sgpr(wk.chunk_start); pin_sgpr(wk.chunk_count); pin_sgpr(wk.chunk_max);
+        return wk.chunk_count > 0 && wk.row_id < k.num_rows;
     } else {
         static_assert(!(GATHER && SCHED == SCHED_FREE),
                       "candidate rows are each a group: Free's every-CTA-reads-every-sequence "
