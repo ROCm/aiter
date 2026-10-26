@@ -45,7 +45,13 @@ from aiter.ops.triton.utils.gmm_common import (
     str_from_dtype,
     str_from_group_sizes_dtype,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import positive_int
+
+# AITER: shared argparse helper
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+    positive_int,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +385,7 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="benchmark GMM Triton kernels")
+    parser = get_parser(kernel_name="GMM")
 
     # Shape
     parser.add_argument("M", type=positive_int, nargs="?", help="number of rows")
@@ -441,16 +447,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="evenly distributes tokens among all groups",
     )
-
-    # Benchmark metric
-    parser.add_argument(
-        "--metric",
-        type=str.lower,
-        choices=METRICS,
-        default=DEFAULT_METRIC,
-        help=f"benchmark metric (default: {DEFAULT_METRIC})",
+    override_parser_action(
+        parser, action="--metric", choices=METRICS, default=DEFAULT_METRIC
     )
-
     # Other arguments
     parser.add_argument(
         "--use-bias",

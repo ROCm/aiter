@@ -49,6 +49,8 @@ SUPPORTED_GFX = ["gfx1250"]
 # (d_qk, d_v) pairs the FlyDSL kernels can serve at all. Anything else is
 # rejected up front rather than silently falling through to CK/Triton.
 SUPPORTED_D_QK_V = [
+    (256, 256),
+    (128, 256),
     (256, 128),
     (192, 128),
     (128, 128),

@@ -19,9 +19,10 @@ Both resolve their per-workgroup base offsets + sequence bounds, then call the
 layout-agnostic ``_core_attention`` helper.
 
 Scope — v1 (this file is intentionally config-agnostic in its name):
-  - ``qk_hdim in {64, 128, 192, 256}`` (D_qk), ``v_hdim in {64, 128}`` (D_v); they are
+  - ``qk_hdim in {64, 128, 192, 256}`` (D_qk), ``v_hdim in {64, 128, 256}`` (D_v); they are
     independent. ``n_block`` is picked by ``pick_n_block`` (128 at qk_hdim <= 128,
-    64 at 192/256)
+    64 at 192/256). v_hdim 256 runs at BLOCK_M 128 only: the BLOCK_M 256 O tile
+    does not fit its LDS staging chunk
   - dtype: bf16 for Q/K/V/O
   - grouped-query attention (GQA): ``gqa = nheads_q // nheads_k``
   - causal and non-causal
@@ -97,8 +98,10 @@ NUM_Q_TILES_CHOICES = (1, 2)
 # A wave owns WMMA_M * num_q_tiles contiguous packed (seq, q_head_in_group) rows, and Q/O
 # describe that tile with ONE rectangular TDM box. That only works when a head group is
 # never split across waves: either a wave holds whole groups, or it sits inside one.
-def supported_num_q_tiles(gqa_ratio):
-    """The num_q_tiles choices whose packed-row tile never splits a head group.
+def supported_num_q_tiles(gqa_ratio, v_hdim=None):
+    """The num_q_tiles choices whose packed-row tile never splits a head group and
+    whose O epilogue staging fits its LDS chunk at ``v_hdim`` (256 fits one tile
+    only). ``v_hdim=None`` skips the LDS check.
 
     ``_pick_num_q_tiles`` picks only from these, so a ratio is servable as long as ONE
     choice packs it -- gqa 48 straddles at rows_per_warp 32 but fits inside a group at 16.
@@ -106,13 +109,28 @@ def supported_num_q_tiles(gqa_ratio):
     return tuple(
         n
         for n in sorted(NUM_Q_TILES_CHOICES)
-        if gqa_ratio % (WMMA_M * n) == 0 or (WMMA_M * n) % gqa_ratio == 0
+        if (gqa_ratio % (WMMA_M * n) == 0 or (WMMA_M * n) % gqa_ratio == 0)
+        and (v_hdim is None or _o_fits(v_hdim, gqa_ratio, n))
     )
 
 
-def supports_gqa_ratio(gqa_ratio):
+@functools.cache
+def _o_fits(v_hdim, gqa_ratio, num_q_tiles_per_wave):
+    try:
+        _o_manager(
+            v_hdim=v_hdim,
+            gqa_ratio=gqa_ratio,
+            num_q_tiles_per_wave=num_q_tiles_per_wave,
+            elem_dtype=_DTYPE_MAP[DEFAULT_DTYPE],
+        )
+    except AssertionError:
+        return False
+    return True
+
+
+def supports_gqa_ratio(gqa_ratio, v_hdim=None):
     """True when some BLOCK_M can tile this ratio; the routers gate on it."""
-    return bool(supported_num_q_tiles(gqa_ratio))
+    return bool(supported_num_q_tiles(gqa_ratio, v_hdim))
 
 
 # Causal work grows with the M index, so dispatch the heavy tiles first.
@@ -126,7 +144,7 @@ def _block_m(num_q_tiles_per_wave):
 def _m_tile_idx():
     x = fx.Int32(gpu.block_id("x"))
     if REVERSE_M_ORDER:
-        x = fx.Int32(gpu.grid_dim.x) - fx.Int32(1) - x
+        x = fx.Int32(gpu.grid_dim.x) - 1 - x
     return x
 
 
@@ -153,7 +171,7 @@ DEFAULT_DTYPE = "bf16"
 _DTYPE_MAP = {"bf16": fx.BFloat16, "fp16": fx.Float16}
 _TORCH_DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
 SUPPORTED_QK_HDIM = (64, 128, 192, 256)
-SUPPORTED_V_HDIM = (64, 128)
+SUPPORTED_V_HDIM = (64, 128, 256)
 
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
 N_BLOCK_CHOICES = (32, 64, 128, 256)
@@ -819,7 +837,7 @@ def _pv_qk_gemm(
                     acc = (
                         o_acc_list[q_tile_idx][d_tile_idx]
                         if o_acc_list is not None
-                        else fx.Vector.filled(8, 0.0, fx.Float32)
+                        else fx.full(8, 0.0, fx.Float32)
                     )
                 p = p_list[q_tile_idx]
                 p_frag = _concat(
@@ -835,7 +853,7 @@ def _pv_qk_gemm(
             acc = (
                 s_acc_list[q_tile_idx][kv]
                 if d_tile_idx > 0
-                else fx.Vector.filled(8, 0.0, fx.Float32)
+                else fx.full(8, 0.0, fx.Float32)
             )
             s_acc_list[q_tile_idx][kv] = _wmma(
                 k_frag, q_frags_list[q_tile_idx][d_tile_idx], acc
@@ -1512,12 +1530,12 @@ def _attention_core_multi_kv_tiles(
                 _raw(m_init[q_tile_idx]),
                 _raw(d_init[q_tile_idx]),
             ]
-            + [_raw(fx.Vector.filled(8 * d_tiles, 0.0, fx.Float32))]
+            + [_raw(fx.full(8 * d_tiles, 0.0, fx.Float32))]
             + [
                 _raw(
-                    fx.Vector.filled(8, float("-inf"), fx.Float32)
+                    fx.full(8, float("-inf"), fx.Float32)
                     if _is_lagging_softmax
-                    else fx.Vector.filled(8, 0.0, fx.Float32).to(elem_dtype)
+                    else fx.full(8, 0.0, fx.Float32).to(elem_dtype)
                 )
                 for _ in range(num_kv_frags)
             ]
@@ -1746,9 +1764,7 @@ def _attention_core_multi_kv_tiles(
             # not-taken s_cbranch_vccz, and a row that stayed stale has corr == 1 exactly,
             # making its rescale inside the taken branch the identity.
             corr_vecs = [
-                fx.Vector.from_elements(
-                    [corr_list[q_tile_idx]], fx.Float32
-                ).broadcast_to(8)
+                fx.full(8, fx.Float32(corr_list[q_tile_idx]), fx.Float32)
                 for q_tile_idx in range(num_q_tiles)
             ]
             o_vecs = [
@@ -1964,7 +1980,7 @@ def _attention_core_multi_kv_tiles(
     state = _run_tiles(
         state,
         clean_hi_idx,
-        fx.Int32(num_tiles) + fx.Int32(1),
+        fx.Int32(num_tiles) + 1,
         mask_left=mask_left,
         mask_right=mask_right,
         kv_len=kv_len,
@@ -2348,7 +2364,7 @@ def _store_o_lse(
         inv_denom = (d_final > fx.Float32(0.0)).select(
             fx.Float32(1.0) / d_final, fx.Float32(0.0)
         )
-        inv_denom_vec = fx.Vector.from_elements([inv_denom], fx.Float32).broadcast_to(8)
+        inv_denom_vec = fx.full(8, fx.Float32(inv_denom), fx.Float32)
         o_norm = [o_final[d_tile_idx] * inv_denom_vec for d_tile_idx in range(d_tiles)]
         if q_tile_idx > 0:
             rocdl.s_wait_dscnt(0)  # drain prev q-tile's O ring/DS ops before reuse
@@ -2438,7 +2454,7 @@ def _epi_state_zeros(*, num_q_tiles_per_wave, v_hdim):
         m_list=[fx.Float32(0.0) for _ in range(num_q_tiles)],
         d_list=[fx.Float32(0.0) for _ in range(num_q_tiles)],
         o_list=[
-            [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(d_tiles)]
+            [fx.full(8, 0.0, fx.Float32) for _ in range(d_tiles)]
             for _ in range(num_q_tiles)
         ],
         o_lds_warp=fx.Int32(0),
@@ -2559,13 +2575,11 @@ def _zero_fill_attention(
 
     # i64: an i32 product (large total_q * stride) can overflow negative, then the
     # descriptor sign-extends it to a huge bound, defeating the 0x7FFFFFFF OOB drop.
-    o_num_records_bytes = (
-        fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(2)
-    )
+    o_num_records_bytes = fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * 2
     o_rsrc = buffer_ops.create_buffer_resource(
         ptr_O, num_records_bytes=o_num_records_bytes
     )
-    zero_o = fx.Vector.filled(_chunk_elems, 0.0, elem_dtype)
+    zero_o = fx.full(_chunk_elems, 0.0, elem_dtype)
     for r in range(BLOCK_M * num_chunks_per_row // BLOCK_SIZE):
         chunk_idx = (
             fx.Int32(r * BLOCK_SIZE) + thread_idx
@@ -2739,8 +2753,8 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             lse_num_records_bytes = (
                 fx.Int64(q_start + q_len - fx.Int32(1)) * fx.Int64(stride_lse_seq)
                 + fx.Int64(num_heads_q - fx.Int32(1)) * fx.Int64(stride_lse_head)
-                + fx.Int64(1)
-            ) * fx.Int64(4)
+                + 1
+            ) * 4
 
             # An empty batch must not enter the core: kv_len==0 would write O/0 = NaN.
             if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
@@ -2881,9 +2895,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         # LSE is [B, nheads_q, seq_q]: base = batch*stride_lse_batch; every valid
         # element offset is < base + stride_lse_batch (< the 0x7FFFFFFF drop).
         lse_base_elems = batch * stride_lse_batch
-        lse_num_records_bytes = fx.Int64(lse_base_elems + stride_lse_batch) * fx.Int64(
-            4
-        )
+        lse_num_records_bytes = fx.Int64(lse_base_elems + stride_lse_batch) * 4
 
         _core_kwargs = {
             "qk_hdim": QK_HDIM,
@@ -2985,13 +2997,13 @@ def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, dtype_str):
     return int(max_seqlen_k) <= n_block
 
 
-def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio):
+def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio, v_hdim):
     """Smallest Q tile whose grid still fits one workgroup wave; the largest otherwise."""
     rows = int(max_seqlen_q) * int(gqa_ratio)
     per_tile = int(num_kv_heads) * int(batch)
     NUM_WGS_PER_CU = 1  # the >256 KB LDS footprint pins occupancy at one WG per CU
     resident = get_cu_num() * NUM_WGS_PER_CU
-    ok = supported_num_q_tiles(gqa_ratio)
+    ok = supported_num_q_tiles(gqa_ratio, v_hdim)
     for num_tiles in ok:
         block_m = _block_m(num_tiles)
         if ((rows + block_m - 1) // block_m) * per_tile <= resident:
@@ -3271,7 +3283,7 @@ def flash_attn_a16w16_m32x8_supported(
         and v.dtype == q.dtype
         and num_kv > 0
         and num_q % num_kv == 0
-        and supports_gqa_ratio(num_q // max(num_kv, 1))
+        and supports_gqa_ratio(num_q // max(num_kv, 1), v_hdim)
         and dropout_p == 0.0
         and (len(window_size) < 3 or window_size[2] == 0)
         and block_table is None
@@ -3299,7 +3311,7 @@ def flash_attn_varlen_m32x8(
     lse=None,
     num_q_tiles_per_wave=None,
 ):
-    """Host entry — varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128}, bf16 or fp16.
+    """Host entry — varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
 
     ``window_size`` is ``(left, right)`` sliding-window bounds, ``-1`` meaning infinite
     on that side; ``causal`` forces ``right=0``. Only finiteness is baked into the kernel
@@ -3384,7 +3396,9 @@ def flash_attn_varlen_m32x8(
     stride_o_head = out.stride(1)
 
     if num_q_tiles_per_wave is None:
-        num_q_tiles_per_wave = _pick_num_q_tiles(nheads_k, batch, max_seqlen_q, gqa)
+        num_q_tiles_per_wave = _pick_num_q_tiles(
+            nheads_k, batch, max_seqlen_q, gqa, v_hdim
+        )
     num_q_tiles_per_wave = int(num_q_tiles_per_wave)
 
     one_kv_tile = _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, dtype_str)
@@ -3464,7 +3478,7 @@ def flash_attn_batch_m32x8(
     lse=None,
     num_q_tiles_per_wave=None,
 ):
-    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {64,128,192,256} / v_hdim in {64,128}, bf16 or fp16.
+    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
 
     Uses the dedicated BSHD kernel with a uniform ``seq_len`` scalar (no cu_seqlens), so
     there is nothing transient to bake into a CUDA graph. ``window_size``, ``causal``,
@@ -3564,7 +3578,9 @@ def flash_attn_batch_m32x8(
     stride_o_head = out.stride(2)
 
     if num_q_tiles_per_wave is None:
-        num_q_tiles_per_wave = _pick_num_q_tiles(nheads_k, batch, seq_len_q, gqa)
+        num_q_tiles_per_wave = _pick_num_q_tiles(
+            nheads_k, batch, seq_len_q, gqa, v_hdim
+        )
     num_q_tiles_per_wave = int(num_q_tiles_per_wave)
 
     one_kv_tile = _pick_one_kv_tile(seq_len_k, qk_hdim, v_hdim, dtype_str)
