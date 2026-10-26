@@ -23,7 +23,7 @@ _FP8_E4M3_INV_MAX_POS_BITS = 0x3B124925
 def _load_i32x4(buffer, index):
     fragment = fx.make_rmem_tensor(4, fx.Int32)
     fx.copy(buf_copy_atom(16), fx.slice(buffer, (index, None)), fragment)
-    return fx.Vector(fragment.load())
+    return fragment.load()
 
 
 def _store_i32x4(buffer, index, value):
@@ -221,7 +221,7 @@ def build_mxfp4_moe_scale_sort_module(cols: int):
         row_base = block << fx.Int32(5)
         tile_base = block * fx.Int32(n32)
         num_valid_ids = nv_buf[fx.Int32(0)]
-        token_max = token_num - fx.Int32(1)
+        token_max = token_num - 1
 
         def token_scale_base(row):
             fused = sid_buf[row]

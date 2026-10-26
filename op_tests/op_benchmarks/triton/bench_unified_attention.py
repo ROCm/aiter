@@ -31,7 +31,7 @@ def default_benchmark_configs():
 def quantize_to_fp8(tensor):
     """Per-tensor symmetric FP8 quantization. Returns (quantized, descale)."""
     abs_max = tensor.abs().amax().clamp(min=1e-9)
-    descale = (abs_max / FP8_MAX).to(torch.float32).unsqueeze(0).cuda()
+    descale = (abs_max / FP8_MAX).to(torch.float32).unsqueeze(0)
     quantized = (tensor * (FP8_MAX / abs_max)).to(FP8_TYPE)
     return quantized, descale
 
@@ -488,13 +488,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Sliding window size (default: disabled)",
     )
-    parser.add_argument(
-        "-backend",
-        type=str,
-        default=None,
-        choices=["triton", "gluon"],
-        help="Kernel backend",
-    )
+
     parser.add_argument(
         "--shuffled_kv_cache",
         "-shuffled_kv_cache",
