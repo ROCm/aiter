@@ -188,19 +188,28 @@ def softplus(x):
 def input_guard(fn: Callable | None = None, *, skip: tuple[str, ...] = ()) -> Callable:
     """Ensure tensor arguments are contiguous before kernel launch.
 
-    ``skip`` names keyword arguments that keep their original storage. The
-    paged ``state_cache`` is one: each slot's ``[H, V, K]`` plane is dense,
-    but ``stride(0)`` may be padded, and packing the pool would copy it and
-    write a clone instead of the live cache. Those tensors must be indexed
-    with their own strides.
+    ``skip`` names arguments that keep their storage, by keyword or by
+    position, such as a padded ``state_cache`` that is written in place.
     """
     skip_keys = frozenset(skip)
 
     def decorator(inner: Callable) -> Callable:
+        skip_positions = frozenset(
+            i
+            for i, p in enumerate(inspect.signature(inner).parameters.values())
+            if p.name in skip_keys
+            and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        )
+
         @functools.wraps(inner)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             args = tuple(
-                a.contiguous() if isinstance(a, torch.Tensor) else a for a in args
+                (
+                    a
+                    if i in skip_positions or not isinstance(a, torch.Tensor)
+                    else a.contiguous()
+                )
+                for i, a in enumerate(args)
             )
             kwargs = {
                 k: (
