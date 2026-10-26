@@ -21,10 +21,12 @@ from .allreduce_host_shared import (
     payload_probes,
     require_arch,
 )
-from .allreduce_policy import oneshot_ladder, resolve_family_policy, resolve_link
-from .kernels.comm.allreduce_shared import (
+from .allreduce_policy import (
     AllReduceAlgorithm,
     OneShotRung,
+    oneshot_ladder,
+    resolve_family_policy,
+    resolve_link,
     select_rung,
 )
 from .kernels.comm.one_shot_allreduce import (
@@ -263,7 +265,7 @@ class OneShotAllReduce:
                 f"{self.max_bytes} B ceiling: this kernel pushes the whole "
                 "payload to every peer, so its wire volume is (N-1)x the "
                 "message where a mesh schedule moves 2(N-1)/N. Route large messages "
-                "to QuickAllReduceInt4 or cross_device_reduce, or pass max_bytes to "
+                "to FlyQuickAllReduce or cross_device_reduce, or pass max_bytes to "
                 "override."
             )
         self._launch(inp, out, stream, live_bytes=live_bytes)

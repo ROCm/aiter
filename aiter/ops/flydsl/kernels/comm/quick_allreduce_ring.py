@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4/INT6 **ring** all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} INT4/INT6/FP16 **ring** all-reduce.
 
 Topology of the lap: the ranks form a cycle and every step is a single
 contiguous run into exactly one peer's inbox:
@@ -32,10 +32,10 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
+from ...allreduce_policy import SUPPORTED_WORLDS
 from .allreduce_shared import (
-    _CM_SC0,
-    _CM_SC1,
     _INBOX_POLICY,
+    _RECV_POLICY,
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
@@ -43,7 +43,6 @@ from .allreduce_shared import (
     FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
-    SUPPORTED_WORLDS,
     _acquire_inbox,
     _buffer_load,
     _buffer_ptr,
@@ -88,13 +87,6 @@ RING_SUPER_TILES = (1, 8, 16, 32)
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
 
-# Cache policy for the loads of a rank-tile from our own inbox. The ring uses
-# this policy for all inbox types. It does not use the ``recv`` entry of
-# ``_INBOX_POLICY``, which is ``nt`` on a fine-grained inbox. ``nt`` is only a
-# reuse hint, and the ring needs a cache bypass. With ``sc0 sc1``, the load
-# goes to memory.
-_RECV_POLICY = _CM_SC0 | _CM_SC1
-
 
 def _load_i32_at(ptr, elem_off, cache_modifier):
     """One i32 from the buffer pointer *ptr* at an element offset.
@@ -121,9 +113,9 @@ def make_quick_allreduce_ring_kernel(
     rank: int,
     super_tile: int = 1,
     grid: int,
-    inbox_memory: str = "finegrained",
-    rs_codec: str = "int4",
-    ag_codec: str = "int4",
+    inbox_memory: str,
+    rs_codec: str,
+    ag_codec: str,
     block: int = BLOCK,
 ):
     """Build the ring kernel for one *rank*.
@@ -221,7 +213,7 @@ def make_quick_allreduce_ring_kernel(
         return (rank - j) % world_size
 
     @flyc.kernel(known_block_size=[block, 1, 1])
-    def quick_allreduce_int4_ring(
+    def quick_allreduce_ring(
         rank_unused: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -581,7 +573,7 @@ def make_quick_allreduce_ring_kernel(
     flat_wg = f"{block},{block}"
 
     @flyc.jit
-    def launch_quick_allreduce_int4_ring(
+    def launch_quick_allreduce_ring(
         rank_arg: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -592,7 +584,7 @@ def make_quick_allreduce_ring_kernel(
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        quick_allreduce_int4_ring(
+        quick_allreduce_ring(
             rank_arg,
             nbytes,
             num_tiles,
@@ -613,15 +605,13 @@ def make_quick_allreduce_ring_kernel(
         f"_{rs_codec}_{ag_codec}"
     )
     tag += f"_b{block}"
-    launch_quick_allreduce_int4_ring.func.__name__ = (
-        f"launch_quick_allreduce_int4_ring_{tag}"
-    )
+    launch_quick_allreduce_ring.func.__name__ = f"launch_quick_allreduce_ring_{tag}"
     try:
-        quick_allreduce_int4_ring.func.__name__ = f"quick_allreduce_int4_ring_{tag}"
+        quick_allreduce_ring.func.__name__ = f"quick_allreduce_ring_{tag}"
     except AttributeError:
         pass
     return {
-        "launch": launch_quick_allreduce_int4_ring,
+        "launch": launch_quick_allreduce_ring,
         "flags_bytes": 0,  # the handshake rides in each slot's 64 B tail
         "data_bytes": inbox_bytes,
         "lds_bytes": lds_bytes,

@@ -10,14 +10,14 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from .allreduce_policy import resolve_link
-from .kernels.comm.allreduce_shared import (
+from .allreduce_policy import (
     MAX_PAYLOAD_BYTES,
     PAYLOAD_ALIGN_BYTES,
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
+    resolve_link,
 )
-from .quick_allreduce_int4_ipc import UncachedIpcHeap
+from .ipc_heap import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
 
@@ -241,6 +241,26 @@ def check_payload(inp, out, *, device_index: int, owner: str) -> int:
     return live_bytes
 
 
+def eligible_payload_bytes(inp, *, device: torch.device) -> int | None:
+    """The payload size of *inp* in bytes if ``check_payload`` accepts it as the
+    input of an all-reduce on *device*, otherwise None. Never raises.
+
+    The dispatchers call this before they pick a FlyDSL engine. The output
+    checks of ``check_payload`` do not apply: the dispatchers allocate ``out``.
+    """
+    align = PAYLOAD_ALIGN_BYTES
+    if not isinstance(inp, torch.Tensor) or inp.dtype is not torch.bfloat16:
+        return None
+    if inp.device != device:
+        return None
+    if not inp.is_contiguous() or int(inp.data_ptr()) % align:
+        return None
+    nbytes = int(inp.numel()) * int(inp.element_size())
+    if nbytes % align or nbytes > MAX_PAYLOAD_BYTES:
+        return None
+    return nbytes
+
+
 def _validate_ipc_process_group(
     group, *, rank: int, world_size: int, owner: str
 ) -> None:
@@ -329,13 +349,15 @@ def kernel_symbol(launch) -> str:
 
 
 def payload_probes(floors, lo: int, hi: int) -> tuple[int, ...]:
-    """Sample payload sizes that select all the configs a ladder can use for a
-    payload of ``lo..hi`` bytes (inclusive).
+    """Payload sizes in ``lo..hi`` bytes (inclusive) that together select every
+    rung a ladder can use in that range.
 
-    *floors* are the ``min_bytes`` values of the ladder rungs. The function
-    returns ``()`` if no payload size in the range is valid.
+    *floors* are the rungs' ``min_bytes``. The result is both ends of the range
+    plus the valid sizes on either side of each floor inside it, all multiples
+    of ``PAYLOAD_ALIGN_BYTES``, sorted. It is ``()`` if the range holds no valid
+    size.
     """
-    step = 16
+    step = PAYLOAD_ALIGN_BYTES
     lo = max(step, -(-int(lo) // step) * step)
     hi = int(hi) // step * step
     if lo > hi:

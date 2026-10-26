@@ -9,9 +9,10 @@ Kernels
 
 * **one-shot** (``OneShotAllReduce``) -- one round, no grid-wide barrier, wire
   volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding.
-* **mesh** (``QuickAllReduceInt4(algorithm="mesh")``) -- two-shot, fanout to all
-  ``N-1`` peers twice, wire volume ``2(N-1)/N*S``, INT4 on the wire.
-* **ring** (``QuickAllReduceInt4(algorithm="ring")``) -- two-shot, ``2(N-1)``
+* **mesh** (``FlyQuickAllReduce(algorithm="mesh")``) -- two-shot, fanout to all
+  ``N-1`` peers twice, wire volume ``2(N-1)/N*S``, INT4 on the wire by default
+  (INT5, INT6 or FP16 when pinned).
+* **ring** (``FlyQuickAllReduce(algorithm="ring")``) -- two-shot, ``2(N-1)``
   hops, same wire volume as the mesh, traded for per-destination locality.
 
 The decisions come in two levels.
@@ -53,24 +54,242 @@ one engine per rung.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import functools
 import logging
 import os
-
-from .kernels.comm.allreduce_shared import (
-    BLOCK,
-    LINKS,
-    MAX_PAYLOAD_BYTES,  # noqa: F401  -- re-exported for the dispatchers
-    SUPPORTED_ARCHS,  # noqa: F401  -- re-exported for the dispatchers
-    SUPPORTED_WORLDS,
-    AllReduceAlgorithm,
-    FamilyPolicy,
-    OneShotRung,
-    TwoShotRung,
-    Window,
-)
+from dataclasses import dataclass
 
 logger = logging.getLogger("aiter")
+
+
+# Limits
+# ======
+#
+# What the FlyDSL all-reduce kernels and their hosts support. The other
+# modules import these instead of restating them.
+
+SUPPORTED_ARCHS = ("gfx942", "gfx950")
+SUPPORTED_WORLDS = (2, 4, 8)
+# Fabric between GPUs.
+LINKS = ("pcie", "xgmi")
+# Threads per workgroup that every kernel can build. The block sets the tile.
+SUPPORTED_BLOCKS = (64, 128, 256, 512)
+# Payload and buffer address alignment, in bytes: one 16 B store per lane.
+PAYLOAD_ALIGN_BYTES = 16
+# Largest payload, in bytes: the window of a buffer descriptor.
+MAX_PAYLOAD_BYTES = 0xFFFFFFFF
+
+
+# Ladder rungs
+# ============
+#
+# A ladder is a tuple of rungs in ascending ``min_bytes`` order, and the first
+# rung has ``min_bytes == 0``. The host builds one engine per distinct rung
+# and, at launch, runs a payload on the last rung whose ``min_bytes`` is at
+# most the payload size.
+
+
+@dataclass(frozen=True)
+class OneShotRung:
+    """The one-shot kernel configuration for payloads of at least ``min_bytes``.
+
+    ``atoms`` and ``block`` both scale the tile, and their product sets the
+    block count. In addition, ``block`` also changes the workgroup size, and ``atoms``
+    also changes how many stores one thread has in flight. ``grid_cap`` bounds
+    the block count. ``fanout`` selects the order of the stores to the peers.
+    """
+
+    min_bytes: int
+    atoms: int
+    grid_cap: int
+    fanout: str
+    block: int
+
+    @property
+    def cfg(self) -> tuple[int, int, str, int]:
+        """The engine key: every field except ``min_bytes``."""
+        return (self.atoms, self.grid_cap, self.fanout, self.block)
+
+
+@dataclass(frozen=True)
+class TwoShotRung:
+    """The mesh or ring kernel configuration for payloads of at least
+    ``min_bytes``.
+
+    ``super_tile`` is the number of tiles a block publishes at once, and
+    ``block`` sets the tile. ``grid_cap`` bounds the block count, and with
+    ``super_tile`` it sets the size of the IPC inbox.
+    """
+
+    min_bytes: int
+    super_tile: int
+    grid_cap: int
+    block: int
+
+
+def select_rung(ladder, nbytes: int):
+    """The rung of *ladder* that runs a payload of *nbytes*."""
+    chosen = ladder[0]
+    for rung in ladder:
+        if nbytes >= rung.min_bytes:
+            chosen = rung
+    return chosen
+
+
+# Dispatch policy records
+# =======================
+
+
+class AllReduceAlgorithm(enum.Enum):
+    """The FlyDSL all-reduce algorithms."""
+
+    OneShot = "oneshot"
+    TwoShotMesh = "mesh"
+    TwoShotRing = "ring"
+
+
+@dataclass(frozen=True)
+class Window:
+    """A range of payload sizes in bytes: ``min`` inclusive, ``max`` exclusive.
+
+    ``max=None`` means no upper limit. ``min == max`` is an empty window, which
+    disables the algorithm it belongs to.
+    """
+
+    min: int
+    max: int | None = None
+
+    def __post_init__(self):
+        if self.min < 0:
+            raise ValueError(f"window min ({self.min}) must be non-negative")
+        if self.max is not None and self.max < self.min:
+            raise ValueError(f"window max ({self.max}) must be >= min ({self.min})")
+
+    @property
+    def is_empty(self) -> bool:
+        return self.max is not None and self.max <= self.min
+
+    def contains(self, nbytes: int) -> bool:
+        return self.min <= nbytes and (self.max is None or nbytes < self.max)
+
+    def inclusive_range(self) -> tuple[int, int]:
+        """``(first, last)`` payload sizes, both inclusive, for the callers
+        that need finite bounds. An unbounded window ends at
+        ``MAX_PAYLOAD_BYTES``."""
+        return self.min, MAX_PAYLOAD_BYTES if self.max is None else self.max - 1
+
+    def __str__(self) -> str:
+        return f"[{_fmt_bytes(self.min)}, {_fmt_bytes(self.max)})"
+
+
+def _fmt_bytes(nbytes: int | None) -> str:
+    if nbytes is None:
+        return "inf"
+    for unit, shift in (("MiB", 20), ("KiB", 10)):
+        if nbytes >= 1 << shift and nbytes % (1 << shift) == 0:
+            return f"{nbytes >> shift} {unit}"
+    return f"{nbytes} B"
+
+
+@dataclass(frozen=True)
+class FamilyPolicy:
+    """Which algorithm runs which payload sizes, on one platform.
+
+    We have three families of all-reduce kernels: one-shot, mesh and ring.
+    Depending on the interconnect type (PCIe or xGMI), the one-shot is best for
+    smaller messages, the mesh overtakes for bigger messages, and finally the
+    ring is the choice for very large messages. The message sizes at which the
+    transitions take place depend on the architecture, the world size and the
+    interconnect type, so a policy belongs to one ``(arch, link, world_size)``.
+
+    Each algorithm has a ``Window`` of payload sizes. ``None`` or an empty
+    window disables the algorithm. A payload in no window goes to
+    ``cross_device_reduce`` or RCCL.
+
+    The mesh and the ring are quantized, so they run only with quantization on
+    (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``), and their windows do not
+    overlap. The one-shot is exact and runs in both modes. ``QuickAllReduce``
+    serves the mesh and the ring before ``CustomAllreduce`` serves the
+    one-shot, and when enabled, the mesh and the ring take the payloads
+    of their windows first.
+    """
+
+    arch: str
+    link: str
+    world_size: int
+    oneshot: Window | None
+    mesh: Window | None
+    ring: Window | None
+
+    def __post_init__(self):
+        if self.arch not in SUPPORTED_ARCHS:
+            raise ValueError(
+                f"arch must be one of {SUPPORTED_ARCHS}, got {self.arch!r}"
+            )
+        if self.link not in LINKS:
+            raise ValueError(f"link must be one of {LINKS}, got {self.link!r}")
+        if self.world_size not in SUPPORTED_WORLDS:
+            raise ValueError(
+                f"world_size must be one of {SUPPORTED_WORLDS}, got {self.world_size}"
+            )
+        mesh, ring = self.mesh, self.ring
+        if mesh is None or mesh.is_empty or ring is None or ring.is_empty:
+            return
+        lo, hi = sorted((mesh, ring), key=lambda w: w.min)
+        if lo.max is None or lo.max > hi.min:
+            raise ValueError(
+                f"{self._cell()}: the mesh window {mesh} overlaps the ring "
+                f"window {ring}"
+            )
+
+    def _cell(self) -> str:
+        return f"{self.arch}/{self.link}/TP{self.world_size}"
+
+    def window(
+        self, algorithm: AllReduceAlgorithm, *, quantized: bool
+    ) -> Window | None:
+        """The window of *algorithm*, or None if it is disabled."""
+        if algorithm == AllReduceAlgorithm.OneShot:
+            w = self.oneshot
+        elif not quantized:
+            w = None
+        elif algorithm == AllReduceAlgorithm.TwoShotMesh:
+            w = self.mesh
+        else:
+            w = self.ring
+        return None if w is None or w.is_empty else w
+
+    def algorithms(self, *, quantized: bool) -> tuple[AllReduceAlgorithm, ...]:
+        """The enabled algorithms, in payload order."""
+        enabled = [
+            (w.min, alg)
+            for alg in AllReduceAlgorithm
+            if (w := self.window(alg, quantized=quantized)) is not None
+        ]
+        return tuple(alg for _min, alg in sorted(enabled, key=lambda e: e[0]))
+
+    def select(self, nbytes: int, *, quantized: bool) -> AllReduceAlgorithm | None:
+        """The algorithm that runs *nbytes*, or None for
+        ``cross_device_reduce`` or RCCL. The mesh and the ring come first, as
+        in dispatch."""
+        for alg in (
+            AllReduceAlgorithm.TwoShotMesh,
+            AllReduceAlgorithm.TwoShotRing,
+            AllReduceAlgorithm.OneShot,
+        ):
+            w = self.window(alg, quantized=quantized)
+            if w is not None and w.contains(nbytes):
+                return alg
+        return None
+
+    def describe(self, *, quantized: bool) -> str:
+        """The enabled windows, for logs."""
+        parts = [
+            f"{alg.value} {self.window(alg, quantized=quantized)}"
+            for alg in self.algorithms(quantized=quantized)
+        ]
+        return ", ".join(parts) or "no FlyDSL algorithm"
 
 
 # Level 1: algorithm boundaries
@@ -188,25 +407,9 @@ _POLICY_BY_KEY = _index(FAMILY_POLICIES)
 
 
 # One-shot, ``OneShotRung``.
-#
-#   PCIe
-#
-#     TP2  b256 a1 cap128 -- the 4 KiB tile to 384 KiB, then b512 a4 cap128,
-#                            the 32 KiB tile, over the rest of the exact-mode
-#                            window, which runs to 64 MiB.
-#     TP4  b128 a1 cap128 -- the 2 KiB tile to 96 KiB, then b512 a2 cap64, the
-#                            16 KiB tile, to the 896 KiB exact-mode ceiling.
-#     TP8  b64 a1 cap64   -- the 1 KiB tile, except b256 a1 cap64, the 4 KiB
-#                            tile, from 48 to 192 KiB.
-#
-#   xGMI
-#
-#     TP2  atoms=1 cap128 b128/b256 -- the 2 KiB tile to 256 KiB, the most it
-#                               covers in one round, then the 4 KiB tile.
-#     TP4  atoms=1 cap128 b256 -- one rung over the whole window
-#     TP8  atoms=1 cap128 b128 -- one rung over the whole window
 ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    # TP2: 256 KiB is the most the 2 KiB tile covers in one round of 128 blocks.
     ("gfx942", "xgmi", 2): (
         OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
         OneShotRung(
@@ -252,11 +455,6 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 }
 
 # Mesh, ``TwoShotRung``.
-#
-#   xGMI  ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
-#         Block 512 from 4 MiB.
-#   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
-#         TP8 ST=8 everywhere.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (
@@ -306,32 +504,32 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
 RING_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=256),
     ),
     ("gfx942", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=256),
     ),
     ("gfx942", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=256),
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
     # TODO: measured on gfx942; tune on gfx950.
     ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=256),
     ),
     ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=256),
     ),
     ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=256),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (
@@ -389,6 +587,12 @@ MIN_BATCH_BLOCKS = 32
 # the running partial at every hop, and the partial's extremum grows with the
 # contributions folded in, so unlike the mesh its error grows with N.
 RS_INT6_MIN_WORLD = 8
+
+# Default ``min_bytes`` of a ``FlyQuickAllReduce`` built directly, outside the
+# dispatchers: the payload below which its ``allreduce`` refuses to run. The
+# dispatchers pass ``min_bytes=0`` and route by the ``FAMILY_POLICIES`` windows,
+# so this value never applies to them.
+QUANT_MIN_PAYLOAD_BYTES = 128 * KiB
 
 
 # Host and environment
