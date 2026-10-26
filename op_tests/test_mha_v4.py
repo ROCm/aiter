@@ -2253,6 +2253,45 @@ def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
         assert cosine > 0.99, f"batch {b} of {lengths}"
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+@parametrize(
+    "lengths,padded",
+    [((192, 128), 256), ((320, 192, 64), 384), ((576, 320, 128, 64), 640)],
+)
+def test_mha_v4_mxfp4_hd256_seqlens_k_matches_truncated_kv(lengths, padded):
+    """hd256 MXFP4 per-batch key lengths, against the same kernel on cut-down K/V.
+
+    A torch reference cannot adjudicate this: MXFP4 sits at a flat ~0.978 cosine whatever the
+    length, which is looser than the failure. The hazard is that kv_seq_len also strides the MX
+    scale slices, so shrinking it before the bases are built relocates each batch's scale base
+    and leaves batch 0 right and batches 1+ wrong -- hence the per-batch comparison.
+    """
+    torch.manual_seed(41)
+    batch, heads = len(lengths), 4
+    formats = (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4)
+    q = torch.randn((batch, 256, heads, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, padded, heads, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    varlen = mha_v4(
+        q,
+        k,
+        v,
+        *formats,
+        seqlens_k=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+    )
+    torch.cuda.synchronize()
+
+    for b, valid in enumerate(lengths):
+        truncated = mha_v4(
+            q[b : b + 1], k[b : b + 1, :valid], v[b : b + 1, :valid], *formats
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(
+            varlen[b : b + 1], truncated
+        ), f"batch {b} of {lengths} differs from its truncated control"
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
 def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
     """A null slot and a slot naming the whole key length must run the same code path."""
