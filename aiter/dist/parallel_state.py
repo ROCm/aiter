@@ -1180,9 +1180,17 @@ class GroupCoordinator:
         input_size = input_.size()
 
         is_last_dim = dim == input_.dim() - 1
-        can_use_custom = use_custom and (
-            dim == 0
-            or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+        # Custom all-gather needs the IPC pool, which is absent when custom
+        # all-reduce is disabled (e.g. non-XGMI groups); fall back to NCCL there.
+        ca_comm = self.device_communicator.ca_comm
+        can_use_custom = (
+            use_custom
+            and ca_comm is not None
+            and not ca_comm.disabled
+            and (
+                dim == 0
+                or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+            )
         )
 
         if can_use_custom:

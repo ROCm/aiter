@@ -347,6 +347,82 @@ except Exception as e:  # noqa: BLE001
     logger.warning(f"Custom allreduce is disabled: {e}")
 
 
+# Default custom-AR lower size bound (bytes) for groups that are not 1-hop XGMI
+# connected but keep custom all-reduce (CDNA over PCIe, e.g. MI350P). There the
+# small-message LL kernels (ar_ll_gfx9 / ar_ll128_unroll2), whose thresholds were
+# tuned on XGMI, poll peer flags over PCIe and run ~10x slower than RCCL (8x MI350P:
+# 404 us vs 40 us for a 16 KB all-reduce). Inputs at or below this go to RCCL; the
+# 1-/2-stage kernels still serve larger inputs, where they beat RCCL over PCIe.
+# AITER_CUSTOM_AR_MIN_SIZE overrides it.
+_PCIE_CAR_MIN_SIZE = 64 * 1024
+# Archs whose custom all-reduce kernels are validated over PCIe peer-to-peer.
+# Elsewhere (e.g. RDNA gfx1201, where the IPC kernel deadlocks over PCIe) custom
+# all-reduce is disabled for world_size > 2 on non-XGMI groups.
+_PCIE_CUSTOM_AR_ARCHS = ("gfx942", "gfx950")
+
+
+def _local_pci_address(device: torch.device) -> str:
+    p = torch.cuda.get_device_properties(device)
+    return f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}"
+
+
+def _is_full_xgmi(group: ProcessGroup, device: torch.device, world_size: int) -> bool:
+    """Whether every GPU pair in `group` shares a single-hop XGMI link.
+
+    Each rank contributes its PCI address (robust to HIP/CUDA_VISIBLE_DEVICES
+    reordering); pairs are checked with amdsmi_topo_get_link_type (type 2 =
+    XGMI). Collective over `group`: every rank must call it. If the topology
+    cannot be read, returns True, i.e. the historical assumption.
+    """
+    try:
+        local = _local_pci_address(device)
+    except Exception as e:  # noqa: BLE001
+        local = None
+        logger.debug("Custom allreduce: cannot read PCI address (%s).", e)
+    addrs = [None] * world_size
+    dist.all_gather_object(addrs, local, group=group)
+    if any(a is None for a in addrs):
+        return True
+    try:
+        import amdsmi
+    except ImportError:
+        logger.debug("Custom allreduce: amdsmi unavailable; assuming XGMI.")
+        return True
+    try:
+        amdsmi.amdsmi_init()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Custom allreduce: amdsmi init failed (%s); assuming XGMI.", e)
+        return True
+    try:
+        by_addr = {
+            amdsmi.amdsmi_get_gpu_device_bdf(h).lower().rsplit(".", 1)[0]: h
+            for h in amdsmi.amdsmi_get_processor_handles()
+        }
+        handles = [by_addr[a] for a in addrs]
+        for i in range(world_size):
+            for j in range(i + 1, world_size):
+                link = amdsmi.amdsmi_topo_get_link_type(handles[i], handles[j])
+                if link["hops"] != 1 or link["type"] != 2:
+                    logger.info(
+                        "Custom allreduce: %s <-> %s is not single-hop XGMI "
+                        "(link type %s, %s hops).",
+                        addrs[i],
+                        addrs[j],
+                        link["type"],
+                        link["hops"],
+                    )
+                    return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Custom allreduce: XGMI detection failed (%s); assuming XGMI.", e)
+        return True
+    finally:
+        try:
+            amdsmi.amdsmi_shut_down()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Custom allreduce: amdsmi shutdown failed (%s).", e)
+
+
 def is_weak_contiguous(inp: torch.Tensor):
     return inp.is_contiguous() or (
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
@@ -1029,22 +1105,20 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        # device_ids = get_cuda_visible_devices()
+        # The custom kernels were tuned for single-hop XGMI. On PCIe-only groups:
+        # - CDNA archs in _PCIE_CUSTOM_AR_ARCHS keep custom all-reduce, with small
+        #   inputs routed to RCCL (see _PCIE_CAR_MIN_SIZE);
+        # - other archs disable it for world_size > 2 and use RCCL.
+        # `fully_connected` also selects the 1-/2-stage kernels in C++
+        # (full_nvlink_); with it False and world_size > 2 that dispatch launches
+        # no kernel, so it must stay True whenever custom all-reduce stays on.
+        self.xgmi_connected = _is_full_xgmi(group, device, world_size)
+        self._pcie_custom_ar = False
+        if not self.xgmi_connected:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        # physical_device_id = device_ids[device.index]
-        # tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        # gather_list = [
-        #     torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-        # ]
-        # dist.all_gather(gather_list, tensor, group=self.group)
-        # physical_device_ids = [t.item() for t in gather_list]
-
-        # test nvlink first, this will filter out most of the cases
-        # where custom allreduce is not supported
-        # this checks hardware and driver support for NVLink
-        # assert current_platform.is_cuda() or current_platform.is_rocm()
-        # fully_connected = current_platform.is_full_nvlink(physical_device_ids)
-        fully_connected = True
+            self._pcie_custom_ar = get_gfx_runtime() in _PCIE_CUSTOM_AR_ARCHS
+        fully_connected = self.xgmi_connected or self._pcie_custom_ar
         if world_size > 2 and not fully_connected:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
@@ -1136,6 +1210,14 @@ class CustomAllreduce:
         # to RCCL. Default 0 (no lower bound). Overridable via
         # AITER_CUSTOM_AR_MIN_SIZE. Custom AR runs only in (min, max].
         self._car_min_size = _resolve_car_min_size()
+        if self._pcie_custom_ar and not os.environ.get(_CAR_MIN_SIZE_ENV, "").strip():
+            self._car_min_size = _PCIE_CAR_MIN_SIZE
+            logger.info(
+                "Custom allreduce: group is not XGMI connected; inputs <= %d bytes "
+                "use RCCL (override with %s).",
+                self._car_min_size,
+                _CAR_MIN_SIZE_ENV,
+            )
 
         self.fully_connected = fully_connected
 
