@@ -360,9 +360,11 @@ def test_mha_flydsl_varlen(
     ref, ref_lses = ref_result if return_lse else (ref_result, None)
 
     candidates = {"flydsl": _call_varlen}
-    # Triton has no sink / sliding-window support here, so cross-check it only on
-    # plain configs; elsewhere its column stays nan.
-    if "triton" in kernels and not sink and tuple(window) == (-1, -1):
+    # Triton has no sink / sliding-window support here, and its 8-bit kernel wants
+    # descales ``_call_varlen_triton`` does not pass (plus its own hdim rule), so
+    # cross-check it only on plain 16-bit configs; elsewhere its column stays nan.
+    _b8_case = q_dtype in _B8_TORCH or kv_dtype in _B8_TORCH
+    if "triton" in kernels and not sink and tuple(window) == (-1, -1) and not _b8_case:
         candidates["triton"] = _call_varlen_triton
 
     flops = _flops(list(zip(seqs_q, seqs_k)), H_q, d_qk, d_v, causal)
