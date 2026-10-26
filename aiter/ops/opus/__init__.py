@@ -16,6 +16,7 @@ def opus_gemm(
     Y: Tensor,
     *,
     kid: int,
+    family: str,
     layout: str = "plain",
     x_scale: Tensor | None = None,
     w_scale: Tensor | None = None,
@@ -23,7 +24,7 @@ def opus_gemm(
     split_k: int = 0,
     workspace: Tensor | None = None,
 ) -> Tensor:
-    """Launch logical 2D ``[M,K] x [N,K] -> [M,N]`` by exact ``kid``.
+    """Launch logical 2D ``[M,K] x [N,K] -> [M,N]`` by local ``kid`` in the ``family`` and actual device gfx/CU.
 
     ``Y`` is caller-owned and returned. ``layout='bpreshuffle'`` declares a
     transformed WQ content layout that Tensor metadata cannot prove.
@@ -35,6 +36,7 @@ def opus_gemm(
         WQ,
         Y,
         kid=kid,
+        family=family,
         layout=layout,
         x_scale=x_scale,
         w_scale=w_scale,
@@ -50,6 +52,7 @@ def opus_bmm(
     Y: Tensor,
     *,
     kid: int,
+    family: str,
     layout: str = "plain",
     x_scale: Tensor | None = None,
     w_scale: Tensor | None = None,
@@ -65,6 +68,7 @@ def opus_bmm(
         WQ,
         Y,
         kid=kid,
+        family=family,
         layout=layout,
         x_scale=x_scale,
         w_scale=w_scale,

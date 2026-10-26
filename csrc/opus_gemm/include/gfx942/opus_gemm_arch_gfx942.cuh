@@ -42,30 +42,31 @@ namespace opus_gfx942_detail
 {
 struct OpusA16W16KidEntry
 {
-    int kid;
+    std::pair<int, int> kid;
     OpusA16W16Kernel func;
 };
 
 struct OpusA16W16WorkspaceKidEntry
 {
-    int kid;
+    std::pair<int, int> kid;
     OpusA16W16WorkspaceKernel func;
 };
 
 template <typename Kernel>
 struct OpusA8W8KidEntry
 {
-    int kid;
+    std::pair<int, int> kid;
     Kernel func;
 };
 
 template <typename Entry, size_t Size>
 inline const Entry* find_kid(const std::array<Entry, Size>& entries, int kid)
 {
+    const auto key = std::make_pair(opus_get_arch_info().cu_num, kid);
     const auto it = std::lower_bound(
-        entries.begin(), entries.end(), kid,
-        [](const Entry& entry, int value) { return entry.kid < value; });
-    return it != entries.end() && it->kid == kid ? &*it : nullptr;
+        entries.begin(), entries.end(), key,
+        [](const Entry& entry, std::pair<int, int> value) { return entry.kid < value; });
+    return it != entries.end() && it->kid == key ? &*it : nullptr;
 }
 
 inline const OpusA16W16WorkspaceKidEntry* workspace_entry(int kid)
@@ -162,9 +163,6 @@ opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx942<bf16_t>(int id)
         Entry,
         GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX942_BF16_SIZE>
         kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX942_BF16}};
-    AITER_CHECK(!kKids.empty(),
-                "no registered kernel for OPUS "
-                "a8w8_blockscale_bpreshuffle on gfx942 with bf16 Y");
     const auto* entry = opus_gfx942_detail::find_kid(kKids, id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id, " for OPUS "
@@ -182,9 +180,6 @@ opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx942<fp32_t>(int id)
         Entry,
         GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX942_FP32_SIZE>
         kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX942_FP32}};
-    AITER_CHECK(!kKids.empty(),
-                "no registered kernel for OPUS "
-                "a8w8_blockscale_bpreshuffle on gfx942 with fp32 Y");
     const auto* entry = opus_gfx942_detail::find_kid(kKids, id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id, " for OPUS "

@@ -10,15 +10,12 @@ from functools import cache, lru_cache
 import torch
 
 from csrc.opus_gemm.opus_gemm_common import (
-    BIAS_AWARE_KIDS,
     GFX942_BF16WS_EXACT_N,
     GFX942_EVEN_LOOP_SPLITK_TAGS,
     GFX942_MAX_AUTO_SPLIT_K,
     GFX942_MIN_ITERS_PER_SPLIT,
-    OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
-    SPLITK_KIDS,
     OpusGemmInstance,
-    a8w8_mxscale_flatmm_prefetch_k_iter,
+    a8w8_mxscale_k_tile_bounds,
     a16w16_flatmm_prefetch_k_iter,
     get_kernel_instance,
 )
@@ -193,59 +190,32 @@ def _build_a16w16_workspace_spec(
     N: int,
 ) -> WorkspaceSpec | None:
     """Build workspace metadata from the already-resolved registry instance."""
-    needs_workspace = resolved_kid in SPLITK_KIDS
-    declares_workspace = instance.splitk_workspace_dtype is not None
-    if needs_workspace != declares_workspace:
-        raise RuntimeError(
-            "inconsistent OPUS a16w16 workspace registry for "
-            f"{registry_arch} kid {resolved_kid}"
-        )
-    if not needs_workspace:
+    if instance.splitk_workspace_dtype is None:
         return None
 
-    is_fused = instance.kernel_tag == _GFX1250_FUSED_SPLITK_TAG
-    split_k = (
-        int(instance.fuse_split_k) if is_fused else int(workspace_capacity_split_k)
-    )
-    if split_k <= 0:
-        raise ValueError(
-            "opus_gemm_a16w16_launch: workspace capacity split_k must be "
-            f"positive, got {split_k}"
-        )
+    split_k = int(workspace_capacity_split_k)
 
     block_m = int(instance.B_M)
     block_n = int(instance.B_N)
+    num_tiles_m = (M + block_m - 1) // block_m
+    num_tiles_n = (N + block_n - 1) // block_n
 
-    if registry_arch == GFX1250:
-        if batch != 1:
-            raise ValueError(
-                "opus_gemm_a16w16_launch: gfx1250 workspace kids require "
-                f"batch=1; got batch={batch}"
-            )
-        num_tiles_m = (M + block_m - 1) // block_m
-        num_tiles_n = (N + block_n - 1) // block_n
-        if is_fused:
-            if split_k < 2:
-                raise ValueError(
-                    "opus_gemm_a16w16_launch: "
-                    f"gfx1250 fused kid {resolved_kid} must declare "
-                    f"compile-time SplitK >= 2, got {split_k}"
-                )
-            shape = (
-                num_tiles_m,
-                num_tiles_n,
-                split_k - 1,
-                block_m,
-                block_n,
-            )
-        else:
-            padded_m = num_tiles_m * block_m
-            padded_n = num_tiles_n * block_n
-            shape = (split_k, padded_m, padded_n)
+    if registry_arch == GFX1250 and instance.kernel_tag == _GFX1250_FUSED_SPLITK_TAG:
+        shape = (
+            num_tiles_m,
+            num_tiles_n,
+            split_k - 1,
+            block_m,
+            block_n,
+        )
     else:
-        padded_m = ((M + block_m - 1) // block_m) * block_m
-        padded_n = ((N + block_n - 1) // block_n) * block_n
-        shape = (split_k, batch, padded_m, padded_n)
+        padded_m = num_tiles_m * block_m
+        padded_n = num_tiles_n * block_n
+        shape = (
+            (split_k, padded_m, padded_n)
+            if registry_arch == GFX1250
+            else (split_k, batch, padded_m, padded_n)
+        )
 
     dtype_token = instance.splitk_workspace_dtype
     try:
@@ -306,9 +276,14 @@ def _build_a16w16_launch_plan(
             f"OPUS a16w16 requires bf16 XQ/WQ, got input dtype {input_dtype}"
         )
 
-    instance = get_kernel_instance(registry_arch, "a16w16", resolved_kid, output_dtype)
+    instance = get_kernel_instance(
+        registry_arch, "a16w16", resolved_kid, output_dtype, cu_num=cu_num
+    )
     if instance is None:
-        if get_kernel_instance(registry_arch, "a16w16", resolved_kid) is None:
+        if (
+            get_kernel_instance(registry_arch, "a16w16", resolved_kid, cu_num=cu_num)
+            is None
+        ):
             raise ValueError(
                 f"OPUS kid {resolved_kid} is not an a16w16 kernel for "
                 f"runtime arch {registry_arch}"
@@ -322,7 +297,7 @@ def _build_a16w16_launch_plan(
             f"OPUS kid {resolved_kid} requires M <= {instance.max_m}; got M={M}"
         )
 
-    needs_workspace = resolved_kid in SPLITK_KIDS
+    needs_workspace = instance.splitk_workspace_dtype is not None
     if instance.kernel_tag in _GFX1250_CO_TAGS and requested_split_k > 1:
         raise ValueError(
             f"gfx1250 CO kid {resolved_kid} does not support split-K; "
@@ -348,7 +323,11 @@ def _build_a16w16_launch_plan(
             f"OPUS kid {resolved_kid} is incompatible with "
             f"shape (batch={batch}, M={M}, N={N}, K={K})"
         )
-    if has_bias and resolved_kid not in BIAS_AWARE_KIDS:
+    if (
+        has_bias
+        and instance.kernel_tag not in {"a16w16", "a16w16_flatmm_splitk"}
+        and instance.splitk_workspace_dtype is None
+    ):
         raise ValueError(f"OPUS kid {resolved_kid} does not support bias")
     if has_bias and instance.kernel_tag == _GFX1250_FUSED_SPLITK_TAG:
         raise ValueError(
@@ -388,17 +367,6 @@ def _build_a16w16_launch_plan(
                 requested=requested_split_k,
             )
         workspace_capacity_split_k = max(1, abi_split_k)
-
-        # Validate the launch split-K independently of workspace sizing.
-        launch_split_k = max(1, abi_split_k)
-        block_k = int(instance.B_K)
-        max_useful_split_k = (K + block_k - 1) // block_k
-        if launch_split_k > max_useful_split_k:
-            raise ValueError(
-                "opus_gemm_a16w16_launch: "
-                f"launch split_k={launch_split_k} exceeds the per-kid "
-                f"K-tile limit {max_useful_split_k} for K={K}, B_K={block_k}"
-            )
 
     workspace_spec = _build_a16w16_workspace_spec(
         instance,
@@ -455,21 +423,6 @@ _A8W8_BLOCKSCALE_FAMILY = "a8w8_blockscale"
 _A8W8_BPRESHUFFLE_FAMILY = "a8w8_blockscale_bpreshuffle"
 _A8W8_MXSCALE_BMM_FAMILY = "a8w8_mxscale_bmm"
 
-# Derived, not restated. This used to be a second hand-kept copy of the tag list
-# in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY, and the two drifted the moment the
-# preshuffled-B families were added: get_kernel_instance consults the catalog's
-# copy first and rejected every preshuffled kid as "no registered OPUS kernel",
-# so adding the tags here alone changed nothing and the failure pointed at a
-# missing kernel rather than a missing list entry.
-#
-# Union across arches: this set is only used to answer "is this kid an MXFP8
-# BMM kernel at all", and the arch check has already happened in
-# get_kernel_instance by the time it is consulted.
-_A8W8_MXSCALE_BMM_TAGS = frozenset(
-    tag
-    for arch_families in OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.values()
-    for tag in arch_families.get(_A8W8_MXSCALE_BMM_FAMILY, ())
-)
 # The preshuffled-B bdirect/blds kids run the same flatmm split-K kernel and
 # launcher as flatmm_splitk, so they take its FP32 partials workspace too.
 _A8W8_MXSCALE_BMM_WORKSPACE_TAGS = frozenset(
@@ -486,14 +439,13 @@ _A8W8_MXSCALE_BMM_PREFETCH_TAGS = _A8W8_MXSCALE_BMM_WORKSPACE_TAGS | frozenset(
         "a8w8_mxscale_bmm_minterleave",
         "a8w8_mxscale_bmm_mouter",
         "a8w8_mxscale_bmm_mouter_tunable",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+        "a8w8_mxscale_bmm_bpreshuffle_allwave",
+        "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
     }
 )
-_A8W8_FAMILY_BY_TAG = {
-    "a8w8": _A8W8_FAMILY,
-    "a8w8_scale": _A8W8_BLOCKSCALE_FAMILY,
-    "a8w8_blockscale_bpreshuffle_singlebuf": _A8W8_BPRESHUFFLE_FAMILY,
-    **{tag: _A8W8_MXSCALE_BMM_FAMILY for tag in _A8W8_MXSCALE_BMM_TAGS},
-}
 _A8W8_FAMILY_LAYOUT = {
     _A8W8_FAMILY: "plain",
     _A8W8_BLOCKSCALE_FAMILY: "plain",
@@ -522,7 +474,7 @@ class A8W8MxscaleBMMPlan:
 
 def _validate_a8w8_public_contract(
     *,
-    kernel_tag: str,
+    family: str,
     kid: int,
     input_dtype: torch.dtype,
     weight_dtype: torch.dtype,
@@ -533,14 +485,8 @@ def _validate_a8w8_public_contract(
     has_bias: bool,
     has_workspace: bool,
     split_k: int,
-) -> str:
+) -> None:
     """Validate immutable options for the public A8W8 operation routers."""
-    try:
-        family = _A8W8_FAMILY_BY_TAG[kernel_tag]
-    except KeyError as exc:
-        raise ValueError(
-            f"OPUS kid {kid} has unsupported registry tag {kernel_tag!r}"
-        ) from exc
 
     if input_dtype != weight_dtype:
         raise ValueError(
@@ -580,7 +526,7 @@ def _validate_a8w8_public_contract(
             raise ValueError("OPUS a8w8_mxscale_bmm requires x_scale and w_scale")
         if split_k == 0 and has_workspace:
             raise ValueError("OPUS a8w8_mxscale_bmm split_k=0 does not use workspace")
-        return family
+        return
 
     if has_workspace:
         raise ValueError(f"OPUS family {family} does not use workspace")
@@ -591,7 +537,6 @@ def _validate_a8w8_public_contract(
             raise ValueError("OPUS a8w8 kid does not accept scales")
     elif not has_x_scale:
         raise ValueError(f"OPUS family {family} requires x_scale and w_scale")
-    return family
 
 
 @cache
@@ -600,9 +545,13 @@ def _require_registered_kid_cached(
     family: str,
     resolved_kid: int,
     output_dtype: torch.dtype,
+    cu_num: int,
 ) -> int:
     """Validate one A8W8 registry entry and cache successful lookups."""
-    if get_kernel_instance(arch, family, resolved_kid, output_dtype) is None:
+    if (
+        get_kernel_instance(arch, family, resolved_kid, output_dtype, cu_num=cu_num)
+        is None
+    ):
         raise ValueError(
             "no registered OPUS kernel for "
             f"(arch={arch!r}, family={family!r}, kid={resolved_kid}, "
@@ -617,13 +566,16 @@ def _require_registered_kid(
     family: str,
     kid: object,
     output_dtype: torch.dtype,
+    cu_num: int,
 ) -> int:
     """Normalize a kid and require the matching A8W8 registry entry."""
     try:
         resolved_kid = int(kid)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"OPUS {family} kid must be an integer, got {kid!r}") from exc
-    return _require_registered_kid_cached(arch, family, resolved_kid, output_dtype)
+    return _require_registered_kid_cached(
+        arch, family, resolved_kid, output_dtype, cu_num=cu_num
+    )
 
 
 def _build_a8w8_mxscale_bmm_plan(
@@ -636,6 +588,7 @@ def _build_a8w8_mxscale_bmm_plan(
     N: int,
     K: int,
     split_k: int,
+    cu_num: int,
 ) -> A8W8MxscaleBMMPlan:
     """Resolve one MXFP8 BMM kid, ABI split-K and FP32 workspace."""
     registry_arch = str(arch).lower().split(":", 1)[0]
@@ -648,6 +601,7 @@ def _build_a8w8_mxscale_bmm_plan(
         _A8W8_MXSCALE_BMM_FAMILY,
         resolved_kid,
         output_dtype,
+        cu_num=cu_num,
     )
     if instance is None:
         raise ValueError(
@@ -658,8 +612,6 @@ def _build_a8w8_mxscale_bmm_plan(
         )
 
     tag = instance.kernel_tag
-    if tag not in _A8W8_MXSCALE_BMM_TAGS:
-        raise ValueError(f"OPUS kid {resolved_kid} is not an MXFP8 BMM kernel")
 
     if requested_split_k < 0 or requested_split_k > (1 << 31) - 1:
         raise ValueError(
@@ -709,9 +661,17 @@ def _build_a8w8_mxscale_bmm_plan(
     if instance.direct_only and abi_split_k != 1:
         raise ValueError(f"OPUS BMM kid {resolved_kid} requires split_k <= 1")
 
+    total_iters = K // k_align
+    prefetch_k_iter, max_k_tiles = a8w8_mxscale_k_tile_bounds(instance)
+    if (
+        max_k_tiles is not None
+        and (total_iters + abi_split_k - 1) // abi_split_k > max_k_tiles
+    ):
+        raise ValueError(
+            f"OPUS BMM kid {resolved_kid} scale panel supports at most "
+            f"{max_k_tiles} K-tiles per split; got K={K}, split_k={abi_split_k}"
+        )
     if tag in _A8W8_MXSCALE_BMM_PREFETCH_TAGS:
-        total_iters = K // k_align
-        prefetch_k_iter = a8w8_mxscale_flatmm_prefetch_k_iter(instance)
         if tag in _A8W8_MXSCALE_BMM_WORKSPACE_TAGS:
             if abi_split_k > total_iters:
                 raise ValueError(
@@ -774,10 +734,12 @@ def _get_cached_a8w8_mxscale_bmm_plan(
     N: int,
     K: int,
     split_k: int,
+    cu_num: int,
 ) -> A8W8MxscaleBMMPlan:
     """Return a scalar-only cached MXFP8 BMM launch plan."""
     return _build_a8w8_mxscale_bmm_plan(
         arch=arch,
+        cu_num=cu_num,
         kid=kid,
         output_dtype=output_dtype,
         M=M,
