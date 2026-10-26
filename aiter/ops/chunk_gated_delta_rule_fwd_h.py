@@ -9,7 +9,7 @@ import triton
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from .triton._triton_kernels.gated_delta_rule.utils.prefill_metadata import (
+from .triton._triton_kernels.gated_delta_net.utils.prefill_metadata import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
 )
@@ -277,6 +277,11 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
             "`initial_state_indices` requires in-place update; "
             "leave `inplace_final_state` unset or set it to True."
         )
+    if has_indices and not output_final_state:
+        raise ValueError(
+            "`initial_state_indices` requires `output_final_state=True` "
+            "(the indexed path writes the final state back into the pool)."
+        )
 
     k_hip = k.contiguous()
     w_hip = w.contiguous()
@@ -292,7 +297,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     )
 
     if is_varlen:
-        from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+        from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
             prepare_chunk_offsets,
             prepare_rebased_cu_seqlens,
         )

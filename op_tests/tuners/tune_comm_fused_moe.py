@@ -1,0 +1,1067 @@
+# SPDX-License-Identifier: MIT
+"""Offline tuner for communication-fused FlyDSL MoE."""
+
+import argparse
+import csv
+import dataclasses
+import json
+import os
+import statistics
+from dataclasses import MISSING, dataclass, fields
+from itertools import product
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
+
+from aiter import ActivationType, QuantType, dtypes
+from aiter.dist.parallel_state import (
+    ensure_model_parallel_initialized,
+    get_dcp_group,
+    get_dp_group,
+    get_ep_group,
+    get_pcp_group,
+    get_pp_group,
+    get_tp_group,
+    init_distributed_environment,
+    set_custom_all_reduce,
+)
+from aiter.fused_moe import (
+    get_2stage_cfgs,
+    get_padded_M,
+    moe_sorting,
+    stage2_uses_route_reduce,
+)
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.ops.flydsl.comm_fused_moe_host import (
+    ShapeKey,
+    config_name,
+    config_record,
+    create_runner,
+    get_gpu_model,
+)
+from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.config import (
+    DirectConfig,
+    MegakernelConfig,
+    PipelineConfig,
+    Shape,
+    WindowConfig,
+)
+from aiter.ops.quant import (
+    mxfp4_moe_sort_fwd,
+    per_1x32_f4_quant,
+    per_1x32_f8_scale_f8_quant,
+)
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+
+@dataclass
+class _Stage2Case:
+    inter_states: torch.Tensor
+    w2: torch.Tensor
+    w2_scale: torch.Tensor
+    a2_scale: torch.Tensor
+    sorted_token_ids: torch.Tensor
+    sorted_expert_ids: torch.Tensor
+    sorted_weights: torch.Tensor
+    num_valid_ids: torch.Tensor
+    partial_out: torch.Tensor
+    topk: int
+    block_m: int
+
+
+def _setup_distributed(expected_world: int):
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    if world != expected_world:
+        raise ValueError(
+            f"torchrun world size is {world}, but expected {expected_world}"
+        )
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=world,
+        rank=rank,
+        local_rank=local_rank,
+        distributed_init_method="env://",
+        backend="nccl",
+    )
+    ensure_model_parallel_initialized(world, 1)
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1, dtype=torch.int32, device=device), group=group)
+    torch.cuda.synchronize(device)
+    return rank, device, group
+
+
+def _cleanup_distributed():
+    for get_group in (
+        get_tp_group,
+        get_pcp_group,
+        get_pp_group,
+        get_dp_group,
+        get_ep_group,
+        get_dcp_group,
+    ):
+        group = get_group()
+        communicator = group.device_communicator
+        if communicator is not None:
+            communicator.destroy()
+            group.device_communicator = None
+        group.mq_broadcaster = None
+    dist.destroy_process_group()
+
+
+def _make_stage2_case(args, rank: int, device, *, accumulate: bool, sorted_inter: bool):
+    token = torch.arange(args.token, dtype=torch.int64, device=device)[:, None]
+    slot = torch.arange(args.topk, dtype=torch.int64, device=device)[None, :]
+    if args.route == "uniform":
+        topk_ids = (token * args.topk + slot) % args.experts
+    else:
+        topk_ids = 1 + ((token + slot - 1) % (args.experts - 1))
+        hot_slot = (token % 8) != 7
+        cold_slot = 1 + ((token + args.topk - 1) % (args.experts - 1))
+        topk_ids[:, :1] = torch.where(hot_slot, 0, cold_slot)
+    weights = (slot + 1).expand(args.token, -1).to(torch.float32)
+    topk_weights = (weights / weights.sum(dim=1, keepdim=True)).contiguous()
+    (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        sorting_out,
+    ) = moe_sorting(
+        topk_ids.to(torch.int32).contiguous(),
+        topk_weights,
+        args.experts,
+        args.model_dim,
+        torch.bfloat16,
+        args.tile_m,
+        accumulate=accumulate,
+    )
+    sorted_ids = sorted_ids.to(torch.int32).contiguous()
+    sorted_weights = sorted_weights.to(torch.float32).contiguous()
+    sorted_expert_ids = sorted_expert_ids.to(torch.int32).contiguous()
+    num_valid_ids = num_valid_ids.to(torch.int32).contiguous()
+    row_capacity = int(sorted_expert_ids.numel()) * args.tile_m
+    if sorted_ids.numel() < row_capacity:
+        sentinel = (args.topk << 24) | args.token
+        sorted_ids = torch.nn.functional.pad(
+            sorted_ids, (0, row_capacity - sorted_ids.numel()), value=sentinel
+        ).contiguous()
+        sorted_weights = torch.nn.functional.pad(
+            sorted_weights,
+            (0, row_capacity - sorted_weights.numel()),
+            value=0.0,
+        ).contiguous()
+
+    generator = torch.Generator(device=device).manual_seed(args.seed + rank)
+    activations = torch.randn(
+        (args.token, args.topk, args.inter_dim),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ).mul_(args.inter_dim**-0.25)
+    inter_states, a2_scale_unsorted = per_1x32_f8_scale_f8_quant(
+        activations,
+        quant_dtype=dtypes.fp8,
+        scale_type=dtypes.fp8_e8m0,
+    )
+    del activations
+    inter_states = inter_states.view(args.token, args.topk, args.inter_dim)
+    a2_scale = mxfp4_moe_sort_fwd(
+        a2_scale_unsorted.view(args.token * args.topk, -1),
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=args.token,
+        cols=args.inter_dim,
+    ).contiguous()
+    if sorted_inter:
+        packed = sorted_ids[:row_capacity].to(torch.int64)
+        token_id, slot_id = packed & 0x00FFFFFF, packed >> 24
+        ok = (token_id < args.token) & (slot_id < args.topk)
+        flat = inter_states.reshape(args.token * args.topk, args.inter_dim)
+        inter_states = flat.new_zeros((row_capacity, args.inter_dim))
+        inter_states[ok] = flat[(token_id * args.topk + slot_id)[ok]]
+
+    w2_bf16 = torch.randn(
+        (args.experts, args.model_dim, args.inter_dim),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    ).mul_(args.inter_dim**-0.25)
+    first_quant, first_scale = per_1x32_f4_quant(w2_bf16[0], quant_dtype=dtypes.fp4x2)
+    w2_quant = torch.empty(
+        (args.experts, *first_quant.shape), dtype=first_quant.dtype, device=device
+    )
+    w2_scale = torch.empty(
+        (args.experts, *first_scale.shape), dtype=first_scale.dtype, device=device
+    )
+    w2_quant[0].copy_(first_quant)
+    w2_scale[0].copy_(first_scale)
+    for expert in range(1, args.experts):
+        quant, scale = per_1x32_f4_quant(w2_bf16[expert], quant_dtype=dtypes.fp4x2)
+        w2_quant[expert].copy_(quant)
+        w2_scale[expert].copy_(scale)
+    del w2_bf16
+    w2 = shuffle_weight_a16w4(w2_quant, 16, False).contiguous()
+    w2_scale = shuffle_scale_a16w4(
+        w2_scale.view(-1, w2_scale.shape[-1]), args.experts, False
+    ).contiguous()
+    del w2_quant
+    partial_out = (
+        sorting_out
+        if sorting_out.numel()
+        else torch.empty(
+            (args.token, args.model_dim), dtype=torch.bfloat16, device=device
+        )
+    )
+    return _Stage2Case(
+        inter_states,
+        w2,
+        w2_scale,
+        a2_scale,
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        partial_out,
+        args.topk,
+        args.tile_m,
+    )
+
+
+def _resolve_ordinary_stage2(args):
+    metadata = get_2stage_cfgs(
+        get_padded_M(args.token),
+        args.model_dim,
+        args.inter_dim,
+        args.experts,
+        args.topk,
+        dtypes.bf16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Silu,
+        False,
+        0,
+        0,
+        is_shuffled=True,
+        gate_mode="separated",
+        is_ep=False,
+        has_stage2_bias=False,
+        opus_weights_shuffled=True,
+    )
+    return (
+        metadata,
+        not stage2_uses_route_reduce(metadata.stage2),
+        bool(metadata.skip_inter_quant),
+    )
+
+
+def _run_ordinary_stage2_local(
+    case, metadata, *, requires_output_zero, shared_partial=None
+):
+    if requires_output_zero:
+        case.partial_out.zero_()
+    metadata.stage2(
+        case.inter_states,
+        None,
+        case.w2,
+        case.sorted_token_ids,
+        case.sorted_expert_ids,
+        case.num_valid_ids,
+        case.partial_out,
+        case.topk,
+        w2_scale=case.w2_scale.view(dtypes.fp8_e8m0),
+        a2_scale=case.a2_scale,
+        block_m=int(metadata.block_m),
+        sorted_weights=case.sorted_weights,
+    )
+    if shared_partial is not None:
+        case.partial_out.add_(shared_partial)
+    return case.partial_out
+
+
+def _run_ordinary_stage2_allreduce(
+    case, metadata, *, requires_output_zero, shared_partial=None
+):
+    partial = _run_ordinary_stage2_local(
+        case,
+        metadata,
+        requires_output_zero=requires_output_zero,
+        shared_partial=shared_partial,
+    )
+    return get_tp_group().all_reduce(partial, ca_fp8_quant=False)
+
+
+def _run_ordinary_stage2_reducescatter(
+    case, metadata, *, requires_output_zero, shared_partial=None
+):
+    partial = _run_ordinary_stage2_local(
+        case,
+        metadata,
+        requires_output_zero=requires_output_zero,
+    )
+    output = get_tp_group().reduce_scatter_tensor(partial)
+    if shared_partial is not None:
+        output.add_(shared_partial)
+    return output
+
+
+_BASE_KEY_FIELDS = (
+    "gfx",
+    "cu_num",
+    "token",
+    "model_dim",
+    "inter_dim",
+    "expert",
+    "topk",
+    "act_type",
+    "dtype",
+    "q_dtype_a",
+    "q_dtype_w",
+    "q_type",
+    "use_g1u1",
+    "doweight_stage1",
+)
+_WINNER_KEY_FIELDS = (
+    *_BASE_KEY_FIELDS,
+    "comm_tp",
+    "comm_add_shared",
+    "comm_mode",
+    "comm_gpu_model",
+)
+_COMM_MODES = ("ar", "rs")
+_COMM_CONFIGS_FIELD = "comm_fused_configs"
+PROFILE_FIELDS = (
+    *_WINNER_KEY_FIELDS,
+    "block_m",
+    "comm_stage2_tp_us",
+    "comm_kernel_name",
+    "max_abs",
+    "rel_l2",
+)
+_DIRECT_TUNER_WORKSPACE_BYTES = 8 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class TuningResult:
+    config: PipelineConfig
+    latency_us: float
+    max_abs: float
+    rel_l2: float
+    block_m: int | None = None
+
+
+def _graph_latency_us(
+    run,
+    *,
+    tp_group,
+    process_group,
+    device,
+    warmup_replays,
+    rounds,
+    iterations,
+    synchronize_each_replay=False,
+):
+    def synchronize_reuse():
+        # Direct's production caller reaches Stage2 only after input-gather has
+        # proved that every rank consumed the previous partial.  The standalone
+        # tuner has no input-gather, so establish the same precondition outside
+        # the measured graph before allowing its destination to be overwritten.
+        torch.cuda.synchronize(device)
+        dist.barrier(group=process_group)
+
+    if synchronize_each_replay:
+        synchronize_reuse()
+    else:
+        dist.barrier(group=process_group)
+    graph = torch.cuda.CUDAGraph()
+    with tp_group.graph_capture() as capture, torch.cuda.graph(
+        graph, stream=capture.stream
+    ):
+        run()
+
+    if synchronize_each_replay:
+        for _ in range(warmup_replays):
+            synchronize_reuse()
+            graph.replay()
+        synchronize_reuse()
+    else:
+        for _ in range(warmup_replays):
+            graph.replay()
+        torch.cuda.synchronize(device)
+        dist.barrier(group=process_group)
+
+    world = dist.get_world_size(process_group)
+    samples = []
+    for _ in range(rounds):
+        if synchronize_each_replay:
+            elapsed_us = 0.0
+            for _ in range(iterations):
+                synchronize_reuse()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                graph.replay()
+                end.record()
+                end.synchronize()
+                elapsed_us += start.elapsed_time(end) * 1000.0
+            latency_us = elapsed_us / iterations
+        else:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iterations):
+                graph.replay()
+            end.record()
+            end.synchronize()
+            latency_us = start.elapsed_time(end) * 1000.0 / iterations
+        local = torch.tensor(
+            [latency_us],
+            dtype=torch.float64,
+            device=device,
+        )
+        ranks = torch.empty(world, dtype=torch.float64, device=device)
+        dist.all_gather_into_tensor(ranks, local, group=process_group)
+        samples.append(float(ranks.max().item()))
+    return statistics.median(samples)
+
+
+def _candidates(config_type, shape, m, axes):
+    config_fields = tuple(
+        field for field in fields(config_type) if field.name not in ("shape", "m")
+    )
+    value_axes = []
+    for field in config_fields:
+        if field.name in axes:
+            value_axes.append(axes[field.name])
+        elif field.default is not MISSING:
+            value_axes.append((field.default,))
+        elif field.default_factory is not MISSING:
+            value_axes.append((field.default_factory(),))
+        else:
+            raise KeyError(field.name)
+    for values in product(*value_axes):
+        yield config_type(
+            shape=shape,
+            m=m,
+            **{field.name: value for field, value in zip(config_fields, values)},
+        )
+
+
+def benchmark(
+    *,
+    tp_group,
+    process_group,
+    config: PipelineConfig,
+    stage2_args: tuple,
+    stage2_kwargs: dict,
+    ordinary_stage2=None,
+    shared_partial: torch.Tensor | None,
+    reference: torch.Tensor,
+    warmup_replays: int = 100,
+    rounds: int = 3,
+    iterations: int = 20,
+    external_reuse_sync: bool = False,
+) -> TuningResult:
+    """Measure one fused Stage2 + TP communication candidate."""
+
+    direct_candidate = isinstance(config, DirectConfig)
+    direct_external_reuse_sync = external_reuse_sync and direct_candidate
+    workspace = None
+    if direct_candidate:
+        # Production carves Direct buffers from a larger packed symmetric arena.
+        # Match that peer-window footprint for both reuse protocols in this
+        # single-runner tuner without changing the production allocation policy.
+        workspace = symm_mem.empty(
+            (max(config.workspace_bytes, _DIRECT_TUNER_WORKSPACE_BYTES),),
+            dtype=torch.uint8,
+            device=reference.device,
+        )
+    runner = create_runner(tp_group, config, workspace=workspace)
+    runner.output.fill_(float("nan"))
+    candidate_shared = shared_partial.clone() if shared_partial is not None else None
+
+    def run():
+        runner_kwargs = {}
+        if direct_external_reuse_sync:
+            runner_kwargs["reuse_is_synchronized"] = True
+        elif isinstance(config, DirectConfig):
+            runner.wait_for_stage2_destination_reuse()
+            runner_kwargs["reuse_waited_before_stage2_write"] = True
+        stage2_destination = runner.stage2_destination
+        if stage2_destination is not None:
+            stage2_destination.zero_()
+        prepared_shared = (
+            None
+            if candidate_shared is None
+            else runner.prepare_shared_partial(candidate_shared)
+        )
+        return runner(
+            stage2_args=stage2_args,
+            stage2_kwargs=stage2_kwargs,
+            shared_partial=prepared_shared,
+            ordinary_stage2=ordinary_stage2,
+            **runner_kwargs,
+        )
+
+    reference_f32 = reference.float()
+    output = run()
+    diff = output.float() - reference_f32
+    error = torch.stack(
+        (
+            diff.abs().max(),
+            diff.norm() / reference_f32.norm().clamp_min(1.0e-12),
+        )
+    )
+    dist.all_reduce(error, op=dist.ReduceOp.MAX, group=process_group)
+
+    latency_us = _graph_latency_us(
+        run,
+        tp_group=tp_group,
+        process_group=process_group,
+        device=reference.device,
+        warmup_replays=warmup_replays,
+        rounds=rounds,
+        iterations=iterations,
+        synchronize_each_replay=external_reuse_sync,
+    )
+    graph_diff = output.float() - reference_f32
+    graph_error = torch.stack(
+        (
+            graph_diff.abs().max(),
+            graph_diff.norm() / reference_f32.norm().clamp_min(1.0e-12),
+        )
+    )
+    dist.all_reduce(graph_error, op=dist.ReduceOp.MAX, group=process_group)
+    error = torch.maximum(error, graph_error)
+
+    return TuningResult(
+        config,
+        latency_us,
+        float(error[0].item()),
+        float(error[1].item()),
+        int(stage2_kwargs["block_m"]),
+    )
+
+
+_CONFIG_TYPES = {
+    "direct": DirectConfig,
+    "mega": MegakernelConfig,
+    "window": WindowConfig,
+}
+
+
+def _parse_axis(field, raw_values: str):
+    if not raw_values.strip():
+        raise ValueError(f"empty axis for {field.name}")
+
+    def parse(raw):
+        if field.type is bool:
+            normalized = raw.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
+                return True
+            if normalized in ("0", "false", "no", "off"):
+                return False
+            raise ValueError(f"invalid boolean {raw!r} for {field.name}")
+        if field.type is str:
+            return raw
+        return int(raw)
+
+    values = tuple(parse(raw) for raw in raw_values.split(","))
+    return values
+
+
+def candidate_configs(
+    current,
+    family: str,
+    axis_specs: tuple[str, ...],
+    *,
+    shape: Shape | None = None,
+    m: int | None = None,
+):
+    if current is None and family == "current":
+        raise ValueError("family='current' requires a production config")
+    config_type = type(current) if family == "current" else _CONFIG_TYPES[family]
+    config_fields = {
+        field.name: field
+        for field in fields(config_type)
+        if field.name not in ("shape", "m")
+    }
+    axes = {}
+    if current is not None and type(current) is config_type:
+        axes = {name: (getattr(current, name),) for name in config_fields}
+    for spec in axis_specs:
+        name, separator, raw_values = spec.partition("=")
+        if not separator or name not in config_fields:
+            valid = ", ".join(sorted(config_fields))
+            raise ValueError(f"invalid --axis {spec!r}; valid fields: {valid}")
+        axes[name] = _parse_axis(config_fields[name], raw_values)
+    if current is not None:
+        shape = current.shape
+        m = current.m
+    if shape is None or m is None:
+        raise ValueError("shape and m are required without a production config")
+    candidates = list(_candidates(config_type, shape, m, axes))
+    return tuple(dict.fromkeys(candidates))
+
+
+def production_config(shape: ShapeKey, token: int, family: str):
+    """Return the existing winner, allowing explicit families to bootstrap."""
+
+    from aiter.ops.flydsl.comm_fused_moe_host import winners_for
+
+    try:
+        current = winners_for(shape).get(token)
+    except KeyError:
+        # A new model shape has no production table yet.  Explicit candidate
+        # families are the bootstrap path used to create that first table.
+        current = None
+    if current is None and family == "current":
+        raise KeyError(
+            f"no production comm_fused config for M={token}; "
+            "select an explicit --family"
+        )
+    return current
+
+
+def select_winner(
+    results,
+    *,
+    max_abs: float = 1.0,
+    max_rel_l2: float = 0.05,
+    ordinary_us: float | None = None,
+) -> TuningResult | None:
+    valid = tuple(
+        result
+        for result in results
+        if result.max_abs <= max_abs and result.rel_l2 <= max_rel_l2
+    )
+    if not valid:
+        return None
+    winner = min(valid, key=lambda result: result.latency_us)
+    if ordinary_us is not None and winner.latency_us >= ordinary_us:
+        return None
+    return winner
+
+
+def _winner_key(shape: ShapeKey, token: int) -> dict:
+    return {
+        "gfx": shape.gfx,
+        "cu_num": shape.cu_num if shape.cu_num is not None else get_cu_num(),
+        "token": token,
+        "model_dim": shape.model_dim,
+        "inter_dim": shape.inter_dim,
+        "expert": shape.experts,
+        "topk": shape.topk,
+        "act_type": shape.act_type,
+        "dtype": shape.dtype,
+        "q_dtype_a": shape.q_dtype_a,
+        "q_dtype_w": shape.q_dtype_w,
+        "q_type": shape.q_type,
+        "use_g1u1": shape.use_g1u1,
+        "doweight_stage1": shape.doweight_stage1,
+        "comm_add_shared": int(shape.add_shared),
+        "comm_tp": shape.tp,
+        "comm_mode": shape.comm,
+        "comm_gpu_model": shape.gpu_model or get_gpu_model(),
+    }
+
+
+def _row_key(row: dict, field_names: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(str(row.get(field, "")) for field in field_names)
+
+
+def _check_matching_block_m(row: dict, winner: dict, base_key) -> None:
+    existing = row.get("block_m")
+    if existing not in (None, "") and int(existing) != int(winner["block_m"]):
+        raise ValueError(
+            f"comm_fused block_m={winner['block_m']} does not match "
+            f"ordinary block_m={existing} for {base_key}"
+        )
+
+
+def _comm_config(mode, tp, add_shared, gpu_model, config, latency):
+    if mode not in _COMM_MODES:
+        raise ValueError(f"unsupported comm mode {mode!r}")
+    if not gpu_model:
+        raise ValueError("gpu_model is required for a comm-fused winner")
+    record = {
+        "tp": int(tp),
+        "add_shared": bool(int(add_shared)),
+        "gpu_model": str(gpu_model).lower(),
+        **config_record(config),
+    }
+    if latency not in (None, ""):
+        record["us"] = float(latency)
+    return record
+
+
+def _comm_configs(row: dict) -> dict:
+    raw = row.get(_COMM_CONFIGS_FIELD)
+    if not raw:
+        return {}
+    configs = json.loads(raw)
+    if not isinstance(configs, dict):
+        raise TypeError(f"{_COMM_CONFIGS_FIELD} must be a JSON object")
+    unknown = set(configs).difference(_COMM_MODES)
+    if unknown:
+        raise ValueError(f"unsupported comm_fused modes: {sorted(unknown)}")
+    return configs
+
+
+def _find_output_row(rows: list[dict], base_key) -> dict:
+    matches = [row for row in rows if _row_key(row, _BASE_KEY_FIELDS) == base_key]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected exactly one ordinary tuned_fmoe row for {base_key}, "
+            f"found {len(matches)}"
+        )
+    return matches[0]
+
+
+def winner_row(shape: ShapeKey, result: TuningResult) -> dict:
+    config = result.config
+    block_m = getattr(config, "sort_block_m", result.block_m)
+    if block_m is None:
+        raise ValueError("block_m is required for a comm-fused pipeline winner")
+    if result.block_m is not None and int(result.block_m) != int(block_m):
+        raise ValueError(
+            f"tuned block_m={result.block_m} does not match "
+            f"kernel sort_block_m={block_m}"
+        )
+    row = {
+        **_winner_key(shape, config.m),
+        "block_m": block_m,
+        "comm_stage2_tp_us": result.latency_us,
+        "comm_kernel_name": config_name(config),
+        "max_abs": result.max_abs,
+        "rel_l2": result.rel_l2,
+    }
+    return {field: row.get(field, "") for field in PROFILE_FIELDS}
+
+
+def write_winner(path, row: dict, config: PipelineConfig) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    fieldnames = None
+    if path.exists():
+        with path.open(newline="") as file:
+            reader = csv.DictReader(file)
+            rows = list(reader)
+            fieldnames = reader.fieldnames
+    if fieldnames is None or "kernelName1" not in fieldnames:
+        raise ValueError("comm-fused winners must be written to a tuned_fmoe CSV")
+    if _COMM_CONFIGS_FIELD not in fieldnames:
+        fieldnames.append(_COMM_CONFIGS_FIELD)
+    base_key = _row_key(row, _BASE_KEY_FIELDS)
+    output_row = _find_output_row(rows, base_key)
+    if output_row.get("block_m") in (None, ""):
+        output_row["block_m"] = row["block_m"]
+    else:
+        _check_matching_block_m(output_row, row, base_key)
+    mode = row["comm_mode"]
+    configs = _comm_configs(output_row)
+    configs[mode] = _comm_config(
+        mode,
+        row["comm_tp"],
+        row["comm_add_shared"],
+        row["comm_gpu_model"],
+        config,
+        row["comm_stage2_tp_us"],
+    )
+    output_row[_COMM_CONFIGS_FIELD] = json.dumps(
+        configs, separators=(",", ":"), sort_keys=True
+    )
+    with path.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def remove_winner(path, shape: ShapeKey, token: int) -> None:
+    path = Path(path)
+    if not path.exists():
+        return
+    with path.open(newline="") as file:
+        reader = csv.DictReader(file)
+        rows = list(reader)
+        fieldnames = reader.fieldnames
+    if fieldnames is None or "kernelName1" not in fieldnames:
+        raise ValueError("comm-fused winners must be written to a tuned_fmoe CSV")
+    if _COMM_CONFIGS_FIELD not in fieldnames:
+        return
+    winner_key = _winner_key(shape, token)
+    base_key = _row_key(winner_key, _BASE_KEY_FIELDS)
+    matching = [row for row in rows if _row_key(row, _BASE_KEY_FIELDS) == base_key]
+    if matching:
+        output_row = _find_output_row(rows, base_key)
+        configs = _comm_configs(output_row)
+        if configs.pop(shape.comm, None) is None:
+            return
+        output_row[_COMM_CONFIGS_FIELD] = (
+            json.dumps(configs, separators=(",", ":"), sort_keys=True)
+            if configs
+            else ""
+        )
+        with path.open("w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Tune one FlyDSL GEMM2 + TP communication shape."
+    )
+    parser.add_argument("--token", type=int, required=True)
+    parser.add_argument("--model-dim", type=int, default=7168)
+    parser.add_argument("--inter-dim", type=int, default=384)
+    parser.add_argument("--experts", type=int, default=384)
+    parser.add_argument("--topk", type=int, default=6)
+    parser.add_argument("--tp", type=int, default=8)
+    parser.add_argument(
+        "--comm-mode",
+        choices=("ar", "rs"),
+        default="ar",
+        help="Tune Stage2 + AllReduce or DPA Stage2 + ReduceScatter.",
+    )
+    parser.add_argument(
+        "--add-shared",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Whether the fused Stage2 epilogue adds a shared partial.",
+    )
+    parser.add_argument("--route", choices=("uniform", "skew"), default="uniform")
+    parser.add_argument("--seed", type=int, default=20260819)
+    parser.add_argument(
+        "--family",
+        choices=("current", *_CONFIG_TYPES),
+        default="current",
+        help="Candidate family; current starts from the production winner.",
+    )
+    parser.add_argument(
+        "--axis",
+        action="append",
+        default=[],
+        metavar="FIELD=V1,V2",
+        help="Override one config field with a comma-separated search axis.",
+    )
+    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=100,
+        help="Graph replays used to warm each candidate before timing.",
+    )
+    parser.add_argument("--max-abs", type=float, default=1.0)
+    parser.add_argument("--max-rel-l2", type=float, default=0.05)
+    parser.add_argument(
+        "--ordinary-only",
+        action="store_true",
+        help="Measure the matching ordinary Stage2 + TP collective and exit.",
+    )
+    parser.add_argument(
+        "--external-reuse-sync",
+        action="store_true",
+        help=(
+            "Benchmark Direct with the production external-reuse contract; "
+            "synchronize ranks before each replay outside the timed graph."
+        ),
+    )
+    parser.add_argument("--profile-output", type=Path)
+    parser.add_argument("--winner-output", type=Path)
+    return parser.parse_args()
+
+
+def main():
+    args = _parse_args()
+    rank, device, group = _setup_distributed(args.tp)
+    try:
+        metadata, requires_zero, sorted_inter = _resolve_ordinary_stage2(args)
+        args.tile_m = int(metadata.block_m)
+        case = _make_stage2_case(
+            args, rank, device, accumulate=requires_zero, sorted_inter=sorted_inter
+        )
+        shared = None
+        if args.add_shared:
+            shared_rows = (
+                args.token // args.tp if args.comm_mode == "rs" else args.token
+            )
+            shared = (
+                torch.arange(shared_rows, device=device, dtype=torch.float32)
+                .remainder(7)
+                .mul_(1.0 / 32.0)
+                .view(-1, 1)
+                + torch.arange(args.model_dim, device=device, dtype=torch.float32)
+                .remainder(17)
+                .mul_(1.0 / 128.0)
+                .view(1, -1)
+                + float(rank + 1) / 16.0
+            ).to(torch.bfloat16)
+        run_ordinary_collective = (
+            _run_ordinary_stage2_allreduce
+            if args.comm_mode == "ar"
+            else _run_ordinary_stage2_reducescatter
+        )
+        reference = run_ordinary_collective(
+            case,
+            metadata,
+            requires_output_zero=requires_zero,
+            shared_partial=shared,
+        ).clone()
+
+        def run_ordinary():
+            return run_ordinary_collective(
+                case,
+                metadata,
+                requires_output_zero=requires_zero,
+                shared_partial=shared,
+            )
+
+        ordinary_us = _graph_latency_us(
+            run_ordinary,
+            tp_group=get_tp_group(),
+            process_group=group,
+            device=device,
+            warmup_replays=args.warmup,
+            rounds=args.rounds,
+            iterations=args.iterations,
+            synchronize_each_replay=args.external_reuse_sync,
+        )
+        if rank == 0:
+            print(
+                f"COMM_FUSED_TUNE_ORDINARY us={ordinary_us:.4f}",
+                flush=True,
+            )
+        if args.ordinary_only:
+            return
+        shape = ShapeKey(
+            get_gfx_runtime(),
+            args.model_dim,
+            args.inter_dim,
+            args.experts,
+            args.topk,
+            args.tp,
+            get_cu_num(),
+            add_shared=bool(args.add_shared),
+            comm=args.comm_mode,
+            gpu_model=get_gpu_model(),
+        )
+        current = production_config(shape, args.token, args.family)
+        candidates = candidate_configs(
+            current,
+            args.family,
+            tuple(args.axis),
+            shape=shape.kernel_shape(),
+            m=args.token,
+        )
+        candidates = [
+            (
+                dataclasses.replace(config, gather_output=args.comm_mode == "ar")
+                if isinstance(config, WindowConfig)
+                else config
+            )
+            for config in candidates
+        ]
+        if sorted_inter:
+            candidates = [
+                dataclasses.replace(config, sorted_input=True) for config in candidates
+            ]
+        if rank == 0:
+            print(
+                f"COMM_FUSED_TUNE_START M={args.token} route={args.route} "
+                f"comm={args.comm_mode} "
+                f"family={args.family} candidates={len(candidates)}",
+                flush=True,
+            )
+        stage2_args = (
+            case.inter_states,
+            None,
+            case.w2,
+            case.sorted_token_ids,
+            case.sorted_expert_ids,
+            case.num_valid_ids,
+            case.partial_out,
+            case.topk,
+        )
+        stage2_kwargs = {
+            "w2_scale": case.w2_scale.view(dtypes.fp8_e8m0),
+            "a2_scale": case.a2_scale,
+            "block_m": case.block_m,
+            "sorted_weights": case.sorted_weights,
+        }
+        results = []
+        for index, config in enumerate(candidates, 1):
+            result = benchmark(
+                tp_group=get_tp_group(),
+                process_group=group,
+                config=config,
+                stage2_args=stage2_args,
+                stage2_kwargs=stage2_kwargs,
+                ordinary_stage2=metadata.stage2,
+                shared_partial=shared,
+                reference=reference,
+                warmup_replays=args.warmup,
+                rounds=args.rounds,
+                iterations=args.iterations,
+                external_reuse_sync=args.external_reuse_sync,
+            )
+            results.append(result)
+            if rank == 0:
+                print(
+                    f"COMM_FUSED_TUNE_RESULT {index}/{len(candidates)} "
+                    f"us={result.latency_us:.4f} "
+                    f"max_abs={result.max_abs:.6f} "
+                    f"rel_l2={result.rel_l2:.6f} "
+                    f"kernel={config_name(config)}",
+                    flush=True,
+                )
+        winner = select_winner(
+            results,
+            max_abs=args.max_abs,
+            max_rel_l2=args.max_rel_l2,
+            ordinary_us=ordinary_us,
+        )
+        if rank == 0:
+            if args.profile_output is not None:
+                args.profile_output.parent.mkdir(parents=True, exist_ok=True)
+                with args.profile_output.open("w", newline="") as file:
+                    writer = csv.DictWriter(file, fieldnames=PROFILE_FIELDS)
+                    writer.writeheader()
+                    writer.writerows(winner_row(shape, result) for result in results)
+            if winner is None:
+                if args.winner_output is not None:
+                    remove_winner(args.winner_output, shape, args.token)
+                print(
+                    f"COMM_FUSED_TUNE_WINNER ordinary_us={ordinary_us:.4f} "
+                    "kernel=ordinary",
+                    flush=True,
+                )
+            else:
+                winner_data = winner_row(shape, winner)
+                if args.winner_output is not None:
+                    write_winner(args.winner_output, winner_data, winner.config)
+                print(
+                    f"COMM_FUSED_TUNE_WINNER us={winner.latency_us:.4f} "
+                    f"ordinary_us={ordinary_us:.4f} "
+                    f"speedup={ordinary_us / winner.latency_us:.4f}x "
+                    f"max_abs={winner.max_abs:.6f} "
+                    f"rel_l2={winner.rel_l2:.6f} "
+                    f"kernel={winner_data['comm_kernel_name']}",
+                    flush=True,
+                )
+    finally:
+        _cleanup_distributed()
+
+
+if __name__ == "__main__":
+    main()

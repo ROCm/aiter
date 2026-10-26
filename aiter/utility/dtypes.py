@@ -4,8 +4,6 @@ import argparse
 
 import torch
 
-from ..jit.utils.chip_info import get_gfx_runtime
-from ..ops.enum import ActivationType, QuantType
 from .aiter_types import aiter_dtypes, aiter_tensor_t
 
 defaultDtypes = {
@@ -14,6 +12,7 @@ defaultDtypes = {
     "gfx1100": {"fp8": torch.float8_e4m3fn},
     "gfx1101": {"fp8": torch.float8_e4m3fn},
     "gfx1102": {"fp8": torch.float8_e4m3fn},
+    "gfx1150": {"fp8": torch.float8_e4m3fn},
     "gfx1151": {"fp8": torch.float8_e4m3fn},
     "gfx1200": {"fp8": torch.float8_e4m3fn},
     "gfx1201": {"fp8": torch.float8_e4m3fn},
@@ -24,7 +23,12 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    return defaultDtypes.get(get_gfx_runtime(), {"fp8": _8bit_fallback})["fp8"]
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return _8bit_fallback
+    from ..jit.utils.chip_info import get_gfx_runtime
+
+    gfx = get_gfx_runtime()
+    return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]
 
 
 i4x2 = getattr(torch, "int4", _8bit_fallback)
@@ -57,30 +61,44 @@ def _aiter_dtype_id(dtype) -> int:
         raise AssertionError(f"Unsupported dtype: {dtype}") from None
 
 
+# Resolved on first use rather than at import time: aiter.jit.core imports this
+# module, so a top-level import would close the cycle.
+_aiter_tensor_cls = None
+
+
 def torch_to_aiter_pybind(tensor: torch.Tensor):
     """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.
 
     Unlike torch_to_aiter() which returns a ctypes aiter_tensor_t struct,
     this function constructs a *pybind11* aiter_tensor_t via
     module_aiter_core.  The two types are not interchangeable.
+
+    Called once per tensor argument of every ffi_type="pybind" op, so the class
+    lookup is cached: resolving it per call cost a sys.modules round trip plus a
+    get_module() dict lookup for work whose answer never changes.
     """
+    global _aiter_tensor_cls
+    if _aiter_tensor_cls is None:
+        from ..jit.core import get_module
+
+        _aiter_tensor_cls = get_module("module_aiter_core").aiter_tensor_t
+
     shape = tensor.shape
     ndim = len(shape)
     assert ndim <= 8, f"aiter_tensor_t supports at most 8 dims, got {ndim}"
     dtype_ = _aiter_dtype_id(tensor.dtype)
-    index = tensor.device.index
 
-    from ..jit.core import get_module
-
-    aiter_tensor_cls = get_module("module_aiter_core").aiter_tensor_t
-    return aiter_tensor_cls(
+    return _aiter_tensor_cls(
         tensor.data_ptr(),
         tensor.numel(),
         ndim,
         list(shape),
         list(tensor.stride()),
         dtype_,
-        -1 if index is None else index,
+        # get_device() returns the ordinal directly, and already answers -1 for a
+        # CPU tensor; `.device.index` materializes a torch.device to say the same
+        # thing and then needs None folded to -1.
+        tensor.get_device(),
     )
 
 
@@ -149,6 +167,8 @@ def str2Dtype(v):
         elif s in d_dtypes:
             return d_dtypes[s]
         else:
+            from ..ops.enum import QuantType
+
             # Case-insensitive lookup for QuantType
             s_lower = s.lower()
             for name in dir(QuantType):
@@ -167,5 +187,17 @@ def str2Dtype(v):
 
 
 def str2ActivationType(s):
-    """Convert string to ActivationType."""
-    return getattr(ActivationType, s.capitalize())
+    from ..ops.enum import ActivationType
+
+    s = str(s)
+    members = getattr(ActivationType, "__members__", None)
+    if members is not None:
+        s_lower = s.lower()
+        for name, member in members.items():
+            if name.lower() == s_lower:
+                return member
+        raise argparse.ArgumentTypeError(f"invalid activation type: {s}")
+    try:
+        return getattr(ActivationType, s.capitalize())
+    except AttributeError as e:
+        raise argparse.ArgumentTypeError(f"invalid activation type: {s}") from e

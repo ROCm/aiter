@@ -479,6 +479,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     int seqlen_q, seqlen_kv;                 // effective Q / KV lengths for this WG
     int64_t q_batch_base, o_batch_base;      // Q/O base offset (excludes q_block_start & head)
     int64_t k_batch_base, v_batch_base;      // K/V base offset (excludes head)
+    int64_t lse_batch_base;                  // LSE base offset (excludes q_block_start & head)
     int q_block_idx, h;
     if constexpr (T::GROUP_MODE) {
         // Rotated axis order (matches production asm GROUP_MODE): head=x, group=y,
@@ -498,6 +499,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         o_batch_base = qpad * kargs.stride_o_n;
         k_batch_base = kpad * kargs.stride_k_n;
         v_batch_base = kpad * kargs.stride_v_n;
+        lse_batch_base = qpad;                    // [H, total_q]: unit stride along the packed row
         h           = block_id_x();          // head    ← hw x
         q_block_idx = block_id_z();          // Q-block ← hw z (empty tail blocks on slowest axis)
         // short-circuit: drop workgroups past this group's real Q-block count (the
@@ -513,6 +515,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         o_batch_base = (int64_t)b * kargs.stride_o_b;
         k_batch_base = (int64_t)b * kargs.stride_k_b;
         v_batch_base = (int64_t)b * kargs.stride_v_b;
+        lse_batch_base = (int64_t)b * kargs.stride_lse_b;
         q_block_idx = block_id_x();          // config A: q-block=x, head=y, batch=z
         h = block_id_y();
     }
@@ -530,6 +533,11 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     // fixed up to -inf by the border mask after QK. Capped to the 32-bit descriptor.
     auto rec_bytes = [](int64_t elems) -> unsigned int {
         const int64_t bytes = elems * (int64_t)sizeof(D_ATTN);
+        return bytes >= (int64_t)0xffffffffu ? 0xffffffffu : (unsigned int)bytes;
+    };
+    // Same bound for the fp32 LSE buffer (different element size than D_ATTN).
+    auto rec_bytes_lse = [](int64_t elems) -> unsigned int {
+        const int64_t bytes = elems * (int64_t)sizeof(D_ACC);
         return bytes >= (int64_t)0xffffffffu ? 0xffffffffu : (unsigned int)bytes;
     };
 
@@ -638,12 +646,15 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     // Register fragments
     typename decltype(mma0)::vtype_a v_q;             // full Q (spans D_QK)
     typename decltype(mma0)::vtype_b v_k;             // one K super unit
-    typename decltype(mma1)::vtype_a v_p;             // full P (spans KV_TILE)
     typename decltype(mma1)::vtype_b v_v;             // one V super unit
 
     // Two full S tiles (ping/pong) so gemm0 of tile t overlaps the softmax of
     // tile t-1, and one full O accumulator (2 super units along D).
-    vector_t<D_ACC, T::GEMM0_E_N * (T::W_M * T::W_N / T::WARP_SIZE)> v_s0, v_s1;
+    union s_frag_t {
+        vector_t<D_ACC, T::GEMM0_E_N * (T::W_M * T::W_N / T::WARP_SIZE)> s;
+        typename decltype(mma1)::vtype_a p;           // full P (spans KV_TILE)
+        __device__ s_frag_t() {}
+    } v_s0, v_s1;
     vector_t<D_ACC, T::GEMM1_E_N * (T::W_M * T::W_N / T::WARP_SIZE)> v_o;
     constexpr index_t s_len      = T::GEMM0_E_N * (T::W_M * T::W_N / T::WARP_SIZE); // 32
     constexpr index_t s_half_len = s_len / 2;                                       // 16
@@ -690,12 +701,12 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         __builtin_amdgcn_sched_barrier(0);
     };
     // GEMM1 super-unit accumulation into the matching half of the O tile.
-    auto gemm1_su0 = [&]() {
+    auto gemm1_su0 = [&](const auto& v_p) {
         auto o = slice(v_o, number<0>{}, number<O_SU_LEN>{});
         o = mma1(v_p, v_v, o);
         set_slice(v_o, o, number<0>{}, number<O_SU_LEN>{});
     };
-    auto gemm1_su1 = [&]() {
+    auto gemm1_su1 = [&](const auto& v_p) {
         auto o = slice(v_o, number<O_SU_LEN>{}, number<2 * O_SU_LEN>{});
         o = mma1(v_p, v_v, o);
         set_slice(v_o, o, number<O_SU_LEN>{}, number<2 * O_SU_LEN>{});
@@ -758,6 +769,60 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         auto u_rk = make_layout_rk_su<T>(lane_id);
         auto u_rv = make_layout_rv_su<T>(lane_id);
 
+        // Result store, in its own lambda so the no-keys exit below can jump straight
+        // here, mirroring the production asm's `s_cmp_le_u32 s_KV_seq_len, 0 /
+        // s_cbranch_scc1 label_write_out`.
+        auto store_result = [&]() {
+            if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
+                constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
+                const D_ACC lse = (l_row > D_ACC(0.0f))
+                                      ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
+                                      : -opus::numeric_limits<D_ACC>::infinity();
+                auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) + lse_batch_base +
+                                           (int64_t)h * kargs.stride_lse_h + q_block_start,
+                                       rec_bytes_lse(seqlen_q - q_block_start));
+                g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
+            }
+
+            D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
+            static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
+
+            // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group
+            // at a time so store(g) overlaps the cvt/permlane of group g+1 (a monolithic
+            // pack would serialize that). group g owns v_o [g*VEC_O_X4, (g+1)*VEC_O_X4).
+            constexpr index_t VEC_X4    = T::VEC_O_X4;                                  // bf16 / dwordx4
+            constexpr index_t NUM_GROUP = o_len / VEC_X4;                               // store groups / lane
+            constexpr index_t GRP_U32   = VEC_X4 * sizeof(D_ATTN) / sizeof(opus::u32_t); // u32 regs / group
+            constexpr index_t GRP_HALF  = GRP_U32 / 2;                                  // permlane swap pairs
+            auto u_o  = make_layout_o_x4<T>(warp_id, lane_id, kargs.stride_o_n);
+            auto offs = opus::layout_to_offsets<VEC_X4>(u_o);
+            auto g_o  = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + o_gmem_offset, o_num_records);
+            opus::static_for<NUM_GROUP>([&](auto g) {
+                auto grp_f  = slice(v_o, number<g.value * VEC_X4>{}, number<g.value * VEC_X4 + VEC_X4>{});
+                auto grp_bf = opus::cast<D_ATTN>(grp_f);
+                auto gu = __builtin_bit_cast(opus::vector_t<opus::u32_t, GRP_U32>, grp_bf);
+                // Swap this lane's high head_dim half [GRP_HALF, GRP_U32) with the lane±32
+                // partner's low half so each half ends up holding VEC_O contiguous head_dim
+                // → together VEC_O_X4 contiguous per lane.
+                opus::static_for<GRP_HALF>([&](auto i) {
+                    opus::vector_t<opus::u32_t, 2> s =
+                        __builtin_amdgcn_permlane32_swap(gu[i.value], gu[i.value + GRP_HALF], false, true);
+                    gu[i.value] = s.x; gu[i.value + GRP_HALF] = s.y;
+                });
+                auto out = __builtin_bit_cast(opus::vector_t<D_ATTN, VEC_X4>, gu);
+                store<VEC_X4>(g_o, out, offs[g.value]);
+            });
+        };
+
+        // No keys at all: nothing to accumulate, and l_row == 0 already makes the store
+        // emit lse = -inf and O = 0. seqlen_kv is workgroup-uniform, so both wave groups
+        // exit together — neither reaches the stagger balancing barrier below.
+        if (num_kv_tiles == 0) {
+            clear(v_o);
+            store_result();
+            return;
+        }
+
         // ─── One pipelined phase (8 stages): gemm0+softmax-head of tile t into vs_cur
         //     while finishing softmax-tail + gemm1 of t-1 from vs_prev. cur/prev = smem
         //     buffer parity for t / t-1. ───
@@ -772,11 +837,11 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             stage_end();
 
             // stage1 [compute]: gemm0 su0(t) [12 MFMA]; softmax-tail(t-1) exp slice [8 EXP].
-            set_slice(vs_cur, mma0(v_q, v_k), number<0>{}, number<S_SU_LEN>{});
+            set_slice(vs_cur.s, mma0(v_q, v_k), number<0>{}, number<S_SU_LEN>{});
             // tail(t-1) exp: [0,24) — the head-exp [0,16) was moved here from stage7 so the
             // gemm1-heavy stage5/stage7 are relieved; stage1 has spare MFMA shadows (12 MFMA).
-            attn_exp2_slice<T, 0, s_half_len + s_quarter>(vs_prev);
-            asm volatile("" : "+v"(vs_prev) ::);
+            attn_exp2_slice<T, 0, s_half_len + s_quarter>(vs_prev.s);
+            asm volatile("" : "+v"(vs_prev.s) ::);
             if constexpr(STAGGER) {
                 sched_mfma_exp<1, 3, 1>();
                 sched_mfma_tail<3, 1>();       // 4 MFMA dense
@@ -799,13 +864,13 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             s_waitcnt_vmcnt(number<T::KEEP_VMCNT>{});   // uniform: K is always prefetched (clamped) → constant in-flight count
             stage_end();
 
-            // stage3 [compute]: gemm0 su1(t) → full S(t); finish softmax-tail(t-1) → v_p
-            set_slice(vs_cur, mma0(v_q, v_k), number<S_SU_LEN>{}, number<2 * S_SU_LEN>{});
-            attn_exp2_slice<T, s_half_len + s_quarter, s_quarter>(vs_prev);
-            l_row += attn_sum<T>(vs_prev);
-            v_p = opus::cast<D_ATTN>(vs_prev);
+            // stage3 [compute]: gemm0 su1(t) → full S(t); finish softmax-tail(t-1) → P
+            set_slice(vs_cur.s, mma0(v_q, v_k), number<S_SU_LEN>{}, number<2 * S_SU_LEN>{});
+            attn_exp2_slice<T, s_half_len + s_quarter, s_quarter>(vs_prev.s);
+            l_row += attn_sum<T>(vs_prev.s);
+            vs_prev.p = opus::cast<D_ATTN>(vs_prev.s);
             asm volatile("" : "+v"(l_row) ::);
-            asm volatile("" : "+v"(v_p) ::);
+            asm volatile("" : "+v"(vs_prev.p) ::);
             // stage3 co-exec: 12 MFMA; 8 EXP (tail second half) then ~48 VALU (sum + cast).
             sched_mfma_exp<2, 3, 2>();     // 3 MFMA × 3 EXP  (covers 8 EXP)
             sched_mfma_exp_valu<1, 2, 2, 2>(); 
@@ -839,30 +904,30 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
                 const int dt = tile_idx(t);
                 const int kv_end_pos = (dt + 1) * T::KV_TILE_SIZE;
                 if (q_start_pos + causal_offset < kv_end_pos) {
-                    attn_mask_causal_tile<T>(vs_cur, q_start_pos + causal_offset, dt, neg_inf_v, lane_id);
+                    attn_mask_causal_tile<T>(vs_cur.s, q_start_pos + causal_offset, dt, neg_inf_v, lane_id);
                 }
             } else {
                 // Non-causal: mask padded columns (global KV idx >= seqlen_k) of the last
                 // KV tile to -inf when seqlen_k is not a multiple of KV_TILE.
                 if ((seqlen_kv % T::KV_TILE_SIZE) != 0 && t == max_num_tiles - 1) {
                     __builtin_amdgcn_sched_barrier(0);
-                    attn_mask_border_tile<T>(vs_cur, seqlen_kv, t, neg_inf_v, lane_id);
+                    attn_mask_border_tile<T>(vs_cur.s, seqlen_kv, t, neg_inf_v, lane_id);
                 }
             }
             s_waitcnt_lgkmcnt(0_I);
             stage_end();
 
             // stage5 [compute]: gemm1 su0(t-1); softmax-head(t) row-max + rescale decision.
-            gemm1_su0();
-            D_ACC row_max = temperature_scale * attn_row_max<T>(vs_cur);
+            gemm1_su0(vs_prev.p);
+            D_ACC row_max = temperature_scale * attn_row_max<T>(vs_cur.s);
             bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
             bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
             row_max = all_below ? m_row : max(m_row, row_max);
             asm volatile("" : "+v"(row_max) ::);
             // scale-sub a leading slice (STAGE5_SUB_CNT) of the S tile here (moved forward
             // from stage7); the rest stays in stage7. Pin vs_cur so it stays in this stage.
-            attn_scale_sub_row_slice<T, 0, STAGE5_SUB_CNT>(vs_cur, temperature_scale, row_max);
-            asm volatile("" : "+v"(vs_cur) ::);
+            attn_scale_sub_row_slice<T, 0, STAGE5_SUB_CNT>(vs_cur.s, temperature_scale, row_max);
+            asm volatile("" : "+v"(vs_cur.s) ::);
             sched_mfma_valu<2, 5, 3>();    // 6 MFMA × 6 VALU
             sched_mfma_valu<1, 6, 3>();
             sched_mfma_valu<1, 4, 3>();
@@ -880,9 +945,9 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             stage_end();
 
             // stage7 [compute]: gemm1 su1(t-1) → full O update; softmax-head(t) sub+exp+rescale
-            gemm1_su1();
-            attn_scale_sub_row_slice<T, STAGE5_SUB_CNT, s_len - STAGE5_SUB_CNT>(vs_cur, temperature_scale, row_max);
-            asm volatile("" : "+v"(vs_cur) ::);
+            gemm1_su1(vs_prev.p);
+            attn_scale_sub_row_slice<T, STAGE5_SUB_CNT, s_len - STAGE5_SUB_CNT>(vs_cur.s, temperature_scale, row_max);
+            asm volatile("" : "+v"(vs_cur.s) ::);
             // stage7 co-exec: 8 MFMA; ~32 VALU (sub) + rescale mul. Pin vs_cur so the compiler
             // cannot sink the sub past the `if(!all_below)` branch below (d128 trick).
             if constexpr(STAGGER) {
@@ -934,7 +999,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     s_waitcnt_lgkmcnt(0_I); //wait LDS-K.blk[0].su0
     stage_end();
 
-    set_slice(v_s0, mma0(v_q, v_k), number<0>{}, number<S_SU_LEN>{});
+    set_slice(v_s0.s, mma0(v_q, v_k), number<0>{}, number<S_SU_LEN>{});
     clear(v_o);
     sched_mfma_valu<12, 3, 5>();
     pin_output_tile(v_o); 
@@ -944,21 +1009,21 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     s_waitcnt_lgkmcnt(0_I); //wait LDS-K.blk[0].su1
     stage_end();
 
-    set_slice(v_s0, mma0(v_q, v_k), number<S_SU_LEN>{}, number<2 * S_SU_LEN>{});
+    set_slice(v_s0.s, mma0(v_q, v_k), number<S_SU_LEN>{}, number<2 * S_SU_LEN>{});
     if constexpr (T::CAUSAL) {
         const int dt0 = tile_idx(0);
         if (q_start_pos + causal_offset < (dt0 + 1) * T::KV_TILE_SIZE) {
-            attn_mask_causal_tile<T>(v_s0, q_start_pos + causal_offset, dt0, neg_inf_v, lane_id);
+            attn_mask_causal_tile<T>(v_s0.s, q_start_pos + causal_offset, dt0, neg_inf_v, lane_id);
         }
     } else {
         // Non-causal: border-mask tile 0 only when it is also the last tile
         // (tiny seqlen, num_kv_tiles==1) and seqlen_k is not KV_TILE-aligned.
         if ((seqlen_kv % T::KV_TILE_SIZE) != 0 && max_num_tiles == 1) {
-            attn_mask_border_tile<T>(v_s0, seqlen_kv, 0, neg_inf_v, lane_id);
+            attn_mask_border_tile<T>(v_s0.s, seqlen_kv, 0, neg_inf_v, lane_id);
         }
     }
-    m_row = temperature_scale * attn_row_max<T>(v_s0);
-    attn_scale_sub_row<T>(v_s0, temperature_scale, m_row);
+    m_row = temperature_scale * attn_row_max<T>(v_s0.s);
+    attn_scale_sub_row<T>(v_s0.s, temperature_scale, m_row);
     // head-exp of tile 0 moved to the first main-loop phase's tail (stage1/stage3, on v_s0).
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{}); // wait vmem-K.blk[1]
     stage_end();
@@ -998,23 +1063,23 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     auto do_epilogue = [&](auto& vs_last, int v_buf) {
         // stage0 [compute]: finish softmax-tail of the last tile (full exp: head-exp was
         // moved out of the last phase's stage7 into the tail, so epilogue does the whole tile).
-        attn_exp2_slice<T, 0, s_len>(vs_last);
-        l_row += attn_sum<T>(vs_last);
-        v_p = opus::cast<D_ATTN>(vs_last);
+        attn_exp2_slice<T, 0, s_len>(vs_last.s);
+        l_row += attn_sum<T>(vs_last.s);
+        vs_last.p = opus::cast<D_ATTN>(vs_last.s);
         stage_end();
         // stage1 [mem]: read V(T-1) su0
         v_v = tr_load<T::VEC_TR_V>(s_v[v_buf], u_rv);
         s_waitcnt_lgkmcnt(0_I);
         stage_end();
         // stage2 [compute]: gemm1 su0
-        gemm1_su0();
+        gemm1_su0(vs_last.p);
         stage_end();
         // stage3 [mem]: read V(T-1) su1
         v_v = tr_load<T::VEC_TR_V>(s_v[v_buf], u_rv + V_SU1_OFF);
         s_waitcnt_lgkmcnt(0_I);
         stage_end();
         // stage4 [compute]: gemm1 su1
-        gemm1_su1();
+        gemm1_su1(vs_last.p);
     };
     if ((max_num_tiles & 1) == 0) do_epilogue(v_s1, 1);
     else                          do_epilogue(v_s0, 0);
@@ -1023,35 +1088,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     // Stagger: the group that skipped the prologue barrier does its extra one here.
     if (!stagger) { __builtin_amdgcn_s_barrier(); }
 
-    // ─── Normalize O and store to gmem ───
-    D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
-    static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
-
-    // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group at a
-    // time so store(g) overlaps the cvt/permlane of group g+1 (a monolithic pack would
-    // serialize that). group g owns v_o elements [g*VEC_O_X4, (g+1)*VEC_O_X4).
-    constexpr index_t VEC_X4    = T::VEC_O_X4;                                  // bf16 / dwordx4
-    constexpr index_t NUM_GROUP = o_len / VEC_X4;                               // store groups / lane
-    constexpr index_t GRP_U32   = VEC_X4 * sizeof(D_ATTN) / sizeof(opus::u32_t); // u32 regs / group
-    constexpr index_t GRP_HALF  = GRP_U32 / 2;                                  // permlane swap pairs
-    auto u_o  = make_layout_o_x4<T>(warp_id, lane_id, kargs.stride_o_n);
-    auto offs = opus::layout_to_offsets<VEC_X4>(u_o);
-    auto g_o  = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + o_gmem_offset, o_num_records);
-    opus::static_for<NUM_GROUP>([&](auto g) {
-        auto grp_f  = slice(v_o, number<g.value * VEC_X4>{}, number<g.value * VEC_X4 + VEC_X4>{});
-        auto grp_bf = opus::cast<D_ATTN>(grp_f);
-        auto gu = __builtin_bit_cast(opus::vector_t<opus::u32_t, GRP_U32>, grp_bf);
-        // Swap this lane's high head_dim half [GRP_HALF, GRP_U32) with the lane±32
-        // partner's low half so each half ends up holding VEC_O contiguous head_dim →
-        // together VEC_O_X4 contiguous per lane.
-        opus::static_for<GRP_HALF>([&](auto i) {
-            opus::vector_t<opus::u32_t, 2> s =
-                __builtin_amdgcn_permlane32_swap(gu[i.value], gu[i.value + GRP_HALF], false, true);
-            gu[i.value] = s.x; gu[i.value + GRP_HALF] = s.y;
-        });
-        auto out = __builtin_bit_cast(opus::vector_t<D_ATTN, VEC_X4>, gu);
-        store<VEC_X4>(g_o, out, offs[g.value]);
-    });
+    store_result();
     };   // end run_pass lambda
 
     reverse = false;

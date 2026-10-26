@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import (
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     AUTOTUNE,
     DEBUG,
     AutotuneMode,
@@ -13,10 +13,11 @@ from .utils import (
     is_fp8,
     remap_xcd,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 PREPROCESS_AUTOTUNE_KEYS = [
     "max_seqlen_q",
-    "ACTUAL_HEAD_DIM",
+    "ACTUAL_HEAD_DIM_V",
     "IS_VARLEN",
 ]
 
@@ -24,7 +25,8 @@ CAUSAL_AUTOTUNE_KEYS = [
     "dropout_p",
     "max_seqlen_q",
     "max_seqlen_k",
-    "ACTUAL_HEAD_DIM",
+    "ACTUAL_HEAD_DIM_QK",
+    "ACTUAL_HEAD_DIM_V",
     "IS_VARLEN",
     "HQ",
     "HK",
@@ -34,7 +36,8 @@ NONCAUSAL_AUTOTUNE_KEYS = [
     "dropout_p",
     "max_seqlen_q",
     "max_seqlen_k",
-    "ACTUAL_HEAD_DIM",
+    "ACTUAL_HEAD_DIM_QK",
+    "ACTUAL_HEAD_DIM_V",
     "IS_VARLEN",
     "HQ",
     "HK",
@@ -758,10 +761,28 @@ def get_bwd_configs(mode: AutotuneMode):
 
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 (
-    preprocess_autotune_configs,
-    causal_autotune_configs,
-    noncausal_autotune_configs,
+    _bwd_preprocess_cfgs,
+    _bwd_causal_cfgs,
+    _bwd_noncausal_cfgs,
 ) = get_bwd_configs(AUTOTUNE)
+preprocess_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    _bwd_preprocess_cfgs,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
+causal_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    _bwd_causal_cfgs,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
+noncausal_autotune_configs = autotune_configs(
+    "FLASH_ATTN",
+    _bwd_noncausal_cfgs,
+    env="FLASH_ATTENTION_TRITON_AMD_AUTOTUNE",
+    default="1",
+)
 
 
 @triton.jit
@@ -860,6 +881,10 @@ def _bwd_dq_inner_split(
             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
             mask = causal_mask * mask_mn
             p = tl.where(mask, p, 0.0)
+        else:
+            # Keys past end_n are loaded as 0, so p = exp(-m) there, which overflows to inf when every
+            # logit of the row is very negative (m < -88). inf * kT(=0) would then put NaN in dq.
+            p = tl.where(mask_mn, p, 0.0)
 
         # dp
         if IS_FP8:
@@ -2744,7 +2769,6 @@ def _bwd_kernel_split_dq_noncausal(
 @triton.autotune(
     configs=preprocess_autotune_configs,
     key=PREPROCESS_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def _bwd_preprocess(
@@ -2970,19 +2994,19 @@ def _bwd_dkdv_inner(
                     # cap, if any, is applied separately via MASK above)
                     window_mask = offs_n[:, None] >= 0
                 elif WINDOW_SIZE_LEFT < 0:
-                    window_mask = offs_n[:, None] <= (
-                        offs_m[None, :] + causal_offset + WINDOW_SIZE_RIGHT
-                    )
+                    rel = offs_n[:, None] - offs_m[None, :] - causal_offset
+                    window_mask = rel <= WINDOW_SIZE_RIGHT
                 elif WINDOW_SIZE_RIGHT < 0:
                     # unbounded right, finite left (mirror of infinite-left)
-                    window_mask = offs_n[:, None] >= (
-                        offs_m[None, :] + causal_offset - WINDOW_SIZE_LEFT
-                    )
+                    rel = offs_n[:, None] - offs_m[None, :] - causal_offset
+                    window_mask = rel >= -WINDOW_SIZE_LEFT
                 else:
-                    left_bound = offs_m[None, :] + causal_offset - WINDOW_SIZE_LEFT
-                    right_bound = offs_m[None, :] + causal_offset + WINDOW_SIZE_RIGHT
-                    window_mask = (offs_n[:, None] >= left_bound) & (
-                        offs_n[:, None] <= right_bound
+                    # Keep the relative-distance form:
+                    # broadcasting explicit left/right bound tiles potentially makes the
+                    # gfx950 backend spill the buffer descriptors and return silently wrong dK/dV.
+                    rel = offs_n[:, None] - offs_m[None, :] - causal_offset
+                    window_mask = (rel >= -WINDOW_SIZE_LEFT) & (
+                        rel <= WINDOW_SIZE_RIGHT
                     )
                 mask = window_mask & mask
             if DEBUG_TRITON_DETAIL and start_n == 256:
@@ -3199,6 +3223,10 @@ def _bwd_dq_inner(
                     )
                 mask = window_mask & mask
             p = tl.where(mask, p, 0.0)
+        else:
+            # Keys past end_n are loaded as 0, so p = exp(-m) there, which overflows to inf when every
+            # logit of the row is very negative (m < -88). inf * kT(=0) would then put NaN in dq.
+            p = tl.where(mask_mn, p, 0.0)
         # Compute dP and dS.
         if IS_FP8:
             dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
@@ -3310,7 +3338,6 @@ def _sliding_window_k_bounds(
 @triton.autotune(
     configs=causal_autotune_configs,
     key=CAUSAL_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), batch)
@@ -3442,6 +3469,13 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             seqlen_q = q_end - q_start
             seqlen_k = k_end - k_start
 
+    # Resolve the sequence bases once; inner loops only select a query head.
+    Q += bid * stride_qb + q_start * stride_qm
+    DO += bid * stride_dob + q_start * stride_dom
+    DQ += bid * stride_dqb + q_start * stride_dqm
+    M += bid * stride_lse_b + q_start * stride_lse_m
+    Delta += bid * stride_delta_b + q_start * stride_delta_m
+
     delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON:
         print(f"delta_qk = {delta_qk}")
@@ -3490,6 +3524,20 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             mask_d_v = offs_d_v < ACTUAL_HEAD_DIM_V
             mask_v &= mask_d_v[None, :]
 
+        # Packed sequences use global token rows; dense tensors use a batch offset.
+        kv_rows = k_start + offs_n
+        dk_base = DK + hkid * stride_dkh
+        dv_base = DV + hkid * stride_dvh
+        if not IS_VARLEN:
+            dk_base += bid * stride_dkb
+            dv_base += bid * stride_dvb
+        dk_ptrs = (
+            dk_base + kv_rows[:, None] * stride_dkn + offs_d_qk[None, :] * stride_dkd
+        )
+        dv_ptrs = (
+            dv_base + kv_rows[:, None] * stride_dvn + offs_d_v[None, :] * stride_dvd
+        )
+
         # K/V tensors not changed for the group
         adj_k = (
             bid * stride_kb
@@ -3510,7 +3558,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
         v = tl.load(V + adj_v, mask=mask_v)
         # If MQA / GQA, set the K and V head offsets appropriately.
         # hqid = hkid
-        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
+        for group_idx in range(GROUP_SIZE):
+            hqid = hkid * GROUP_SIZE + group_idx
             if delta_qk >= 0:
                 start_m = start_n + start_delta
                 len_m = BLOCK_N1
@@ -3526,15 +3575,13 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                     print(f"residue_m = {residue_m}")
 
             # offset input and output tensor by batch and Q/K heads
-            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
+            adj_q = hqid * stride_qh
             Q_ptr = Q + adj_q
-            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
+            adj_do = hqid * stride_doh
             DO_ptr = DO + adj_do
-            adj_delta = (
-                bid * stride_delta_b + hqid * stride_delta_h + q_start * stride_delta_m
-            )
+            adj_delta = hqid * stride_delta_h
             Delta_ptr = Delta + adj_delta
-            adj_m = bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m
+            adj_m = hqid * stride_lse_h
             M_ptr = M + adj_m
 
             if USE_ALIBI:
@@ -3701,15 +3748,9 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
         # end of GQA/MQA of dkdv
-        # Write back dV
-        adj_dv = bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
-        offs_dv = offs_n[:, None] * stride_dvn + offs_d_v[None, :] * stride_dvd
-        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_v)
-        # write back dk
-        adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
-        offs_dk = offs_n[:, None] * stride_dkn + offs_d_qk[None, :] * stride_dkd
+        tl.store(dv_ptrs, dv, mask=mask_v)
         dk *= sm_scale
-        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_k)
+        tl.store(dk_ptrs, dk, mask=mask_k)
 
     # This part does dq
     start_m = pid * BLOCK_M2
@@ -3743,7 +3784,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
         V += bid * stride_vb + hkid * stride_vh + k_start * stride_vn
 
         # If MQA / GQA, set the K and V head offsets appropriately.
-        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
+        for group_idx in range(GROUP_SIZE):
+            hqid = hkid * GROUP_SIZE + group_idx
             # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front
             #   for every M-tile
             end_n = start_m + BLOCK_M2 - delta_qk
@@ -3752,13 +3794,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             if DEBUG_TRITON:
                 print(f"delta_qk: {delta_qk}; end_n: {end_n}")
             # offset input and output tensor by batch and Q/K heads
-            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
-            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
-            adj_delta = (
-                bid * stride_delta_b + hqid * stride_delta_h + q_start * stride_delta_m
-            )
+            adj_q = hqid * stride_qh
+            adj_do = hqid * stride_doh
+            adj_delta = hqid * stride_delta_h
             Delta_ptr = Delta + adj_delta
-            adj_m = bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m
+            adj_m = hqid * stride_lse_h
             M_ptr = M + adj_m
 
             if USE_ALIBI:
@@ -3922,7 +3962,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
             # Write back dQ.
-            adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
+            adj_dq = hqid * stride_dqh
             offs_dq = offs_m[:, None] * stride_dqm + offs_d_qk[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
@@ -3932,7 +3972,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
 @triton.autotune(
     configs=noncausal_autotune_configs,
     key=NONCAUSAL_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def bwd_kernel_fused_noncausal(

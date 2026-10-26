@@ -5,9 +5,11 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
+    _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel,
+    _gluon_fused_reduce_rms_mxfp4_quant_kernel,
     _gluon_fused_rms_mxfp4_quant_kernel,
 )
-from aiter.ops.triton._triton_kernels.activation import (
+from aiter.ops.triton._triton_kernels.common.activation import (
     _get_activation_from_str,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
@@ -15,9 +17,11 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_flatten_mxfp4_quant,
     _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
     _fused_reduce_rms_mxfp4_quant_kernel,
+    _fused_rms_gated_mxfp4_quant_kernel,
     _fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 
@@ -55,7 +59,7 @@ def fused_rms_mxfp4_quant(
 
         always returns (out1_fp4, out1_bs), out1, out2, out_res1
     """
-    _LOGGER.info(f"FUSED_RMS_MXFP4_QUANT: inp1={tuple(x1.shape)}")
+    _LOGGER.info("FUSED_RMS_MXFP4_QUANT: inp1=%s", tuple(x1.shape))
 
     MXFP4_QUANT_BLOCK_SIZE = 32
     M, N1 = x1.shape
@@ -186,6 +190,114 @@ def fused_rms_mxfp4_quant(
     return (out1_fp4, out1_bs), out1, out2, out_res1
 
 
+def fused_rms_gated_mxfp4_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    z: torch.Tensor,
+    eps: float,
+    *,
+    norm_before_gate: bool = True,
+    activation: str = "silu",
+    group_size: int | None = None,
+    transpose_scale: bool = False,
+):
+    """
+    Gated RMSNorm followed by MXFP4 quantization, the RMSNormGated + per-1x32
+    activation quant sequence in front of an MXFP4 linear:
+        norm_before_gate=True:  y = rms_norm(x) * weight * act(z)
+        norm_before_gate=False: y = rms_norm(x * act(z)) * weight
+    with the RMS taken over each group_size slice of the last dimension
+    (the whole row if None). y is rounded to x.dtype, then quantized.
+
+    Key parameters:
+    - x, z: Matrices with shape (M, N), contiguous.
+    - weight: Vector with shape (group_size,) or (N,) if group_size is None,
+      shared by every group.
+    - eps: Added to the mean of squares before the reciprocal square root.
+    - norm_before_gate: Selects between the two formulas above. The default,
+      True, is the order of RMSNormGated(norm_before_gate=True).
+    - activation: "silu" (or "swish") or "sigmoid", applied to z.
+    - group_size: Length of each RMS group along N, or None for the whole row.
+      It must divide N and be a multiple of 32, so that no MXFP4 block spans
+      two groups.
+    - transpose_scale: If True, store out_bs column-major (strides (1, M)),
+      the layout dynamic_mxfp4_quant returns. gemm_afp4wfp4 reads it
+      faster than the row-major default once M reaches about 1024.
+
+    Returns:
+    - out_fp4: The output matrix with shape (M, N // 2).
+    - out_bs: The e8m0 block scales with shape (M, N // 32), unshuffled.
+    """
+    _LOGGER.info("FUSED_RMS_GATED_MXFP4_QUANT: inp=%s", tuple(x.shape))
+
+    MXFP4_QUANT_BLOCK_SIZE = 32
+    if x.dim() != 2 or x.shape != z.shape:
+        raise ValueError(
+            f"x and z must be 2-D with the same shape, got {tuple(x.shape)} "
+            f"and {tuple(z.shape)}"
+        )
+    if not (x.is_contiguous() and z.is_contiguous()):
+        raise ValueError("x and z must be contiguous")
+    if activation not in ("silu", "swish", "sigmoid"):
+        raise ValueError(
+            f"activation must be 'silu', 'swish' or 'sigmoid', got {activation!r}"
+        )
+    M, N = x.shape
+    G = N if group_size is None else int(group_size)
+    if G <= 0 or N % G != 0 or G % MXFP4_QUANT_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"group_size ({G}) must divide N ({N}) and be a multiple of "
+            f"{MXFP4_QUANT_BLOCK_SIZE}"
+        )
+    if weight.numel() != G:
+        raise ValueError(
+            f"weight must have group_size ({G}) elements, got {weight.numel()}"
+        )
+
+    x = x.view(-1, G)
+    z = z.view(-1, G)
+    rows = x.shape[0]
+    out_fp4 = torch.empty((rows, G // 2), dtype=torch.uint8, device=x.device)
+    n_scales = N // MXFP4_QUANT_BLOCK_SIZE
+    if transpose_scale:
+        out_bs = torch.empty((n_scales, M), dtype=torch.uint8, device=x.device).T
+    else:
+        out_bs = torch.empty((M, n_scales), dtype=torch.uint8, device=x.device)
+
+    BLOCK_SIZE_N = triton.next_power_of_2(G)
+    # 512 elements (eight per lane) per warp: within 0.4 us of the fastest
+    # split swept for group_size 128, M from 1 to 16384. It does not depend on
+    # M, so neither does a row's result.
+    BLOCK_SIZE_M = max(1, 512 // BLOCK_SIZE_N)
+    num_warps = min(8, max(1, BLOCK_SIZE_N // 512))
+    grid = (triton.cdiv(rows, BLOCK_SIZE_M),)
+    _fused_rms_gated_mxfp4_quant_kernel[grid](
+        x,
+        z,
+        weight.contiguous(),
+        out_fp4,
+        out_bs,
+        eps,
+        rows,
+        G,
+        N // G,
+        x.stride(0),
+        z.stride(0),
+        out_fp4.stride(0),
+        *out_bs.stride(),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+        NORM_BEFORE_GATE=norm_before_gate,
+        ACTIVATION=_get_activation_from_str(
+            "silu" if activation == "swish" else activation
+        ),
+        num_warps=num_warps,
+    )
+
+    return out_fp4.view(M, N // 2), out_bs
+
+
 def fused_flatten_mxfp4_quant(
     x: torch.Tensor,
 ):
@@ -199,7 +311,7 @@ def fused_flatten_mxfp4_quant(
     - out: The output matrix with shape (M, (N1 * N2) // 2).
     - out_block_scales: The output matrix with shape (M, cdiv(N1 * N2, MXFP4_QUANT_BLOCK_SIZE)).
     """
-    _LOGGER.info(f"FUSED_FLATTEN_MXFP4_QUANT: x={tuple(x.shape)}")
+    _LOGGER.info("FUSED_FLATTEN_MXFP4_QUANT: x=%s", tuple(x.shape))
     M, N1, N2 = x.shape
 
     MXFP4_QUANT_BLOCK_SIZE = 32
@@ -238,7 +350,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     scaling_mode: str = "even",
     shuffle: bool = False,
     scale_shuffle_padding: bool = False,
-    dtype: float | None = torch.bfloat16,
+    dtype: torch.dtype | None = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply reduction along the first dimension and apply the activation function + per-token group quantization to MX FP4 format.
@@ -252,7 +364,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         if x is 2-dim,
             x: (M, 2*N1), dtype = fp16 or bf16.
             x2 must be None
-            the kernel is essentially identical to aiter.ops.triton.activation.act_mul_and_mxfp4_group_quant
+            the kernel is essentially identical to aiter.ops.triton.fusions.activation.act_mul_and_mxfp4_group_quant
 
         activation: activation function to apply before quantization.
             - It splits the features into two parts and applies the activation to the first part.
@@ -267,6 +379,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
             - etc.
         shuffle: Indicates whether to enable preshuffling of scales.
             - When enabled, scale dimensions (X, Y) are adjusted to be multiples of 8 and 256, respectively.
+        dtype: dtype of y2. If None, y2 has the dtype of x2.
     Returns:
         tuple: (y, y_scale), y2
             if shuffle or scale_shuffle_padding:
@@ -284,7 +397,10 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         A tuple of (y, y_scale).
     """
     _LOGGER.info(
-        f"ACT_MUL_MXFP4_QUANT: x={tuple(x.shape)} activation={activation} shuffle={shuffle}"
+        "FUSED_REDUCE_ACT_MUL_MXFP4_QUANT: x=%s activation=%s shuffle=%s",
+        tuple(x.shape),
+        activation,
+        shuffle,
     )
 
     assert (
@@ -304,7 +420,9 @@ def fused_reduce_act_mul_and_mxfp4_quant(
             x_num_splitk > 1
         ), "x.shape[0] should be larger then 1 in x.dim() == 3 cases"
         X_HAS_SPLITK = True
-        y2 = torch.empty((M, N2), dtype=dtype, device=x2.device)
+        y2 = torch.empty(
+            (M, N2), dtype=dtype if dtype is not None else x2.dtype, device=x2.device
+        )
     else:
         M, N1 = x.shape
     # Activation (N/2) and storing results in uint8 (N/2) results in a feature dimension of N/4
@@ -421,6 +539,7 @@ def fused_reduce_rms_mxfp4_quant(
     output_unquantized_inp1=False,
     dtype=None,
     out3=None,
+    args: str = "auto",
 ):
     """
     This op contains several steps:
@@ -443,7 +562,7 @@ def fused_reduce_rms_mxfp4_quant(
 
         always returns (out1_fp4, out1_bs), out1, out2, out_res1, out3
     """
-    _LOGGER.info(f"FUSED_RMS_MXFP4_QUANT: inp1={tuple(x1.shape)}")
+    _LOGGER.info("FUSED_RMS_MXFP4_QUANT: inp1=%s", tuple(x1.shape))
 
     out_dtype = dtype if dtype is not None else x1.dtype
     MXFP4_QUANT_BLOCK_SIZE = 32
@@ -545,7 +664,21 @@ def fused_reduce_rms_mxfp4_quant(
     elif x2 is not None:
         r = 2
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * r,)
-    _fused_reduce_rms_mxfp4_quant_kernel[grid](
+
+    # check if args is gluon and arch is not gfx1250
+    if args == "gluon" and get_arch() != "gfx1250":
+        _LOGGER.warning(
+            "Gluon kernel is not supported on this arch, defaulting to triton kernel"
+        )
+
+    # select kernel based on args and arch
+    kernel = (
+        _gluon_fused_reduce_rms_mxfp4_quant_kernel
+        if (args in ["gluon", "auto"]) and get_arch() == "gfx1250"
+        else _fused_reduce_rms_mxfp4_quant_kernel
+    )
+
+    kernel[grid](
         x1,
         x1_weight,
         x2,
@@ -606,6 +739,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     topk: int,
     block_size: int = 32,
     scaling_mode: str = "even",
+    args: str = "auto",
 ):
     """
     Fusing dynamic_mxfp4_quant and moe_mxfp4_sort
@@ -668,7 +802,17 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     num_pid = triton.cdiv(M, BLOCK_SIZE_Mx) * scaleN + triton.cdiv(
         M_o, BLOCK_SIZE_M
     ) * triton.cdiv(N_i, BLOCK_SIZE_N)
-    _fused_dynamic_mxfp4_quant_moe_sort_kernel[(num_pid,)](
+
+    if args == "gluon" and get_arch() != "gfx1250":
+        raise ValueError("Gluon is only supported on gfx1250")
+
+    kernel = (
+        _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel
+        if (args in ["gluon", "auto"] and get_arch() == "gfx1250")
+        else _fused_dynamic_mxfp4_quant_moe_sort_kernel
+    )
+
+    kernel[(num_pid,)](
         x,
         x_fp4,
         sorted_ids,
@@ -701,7 +845,18 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     )
 
 
-@triton.jit
+_fused_quant_fp8_sort_repr = make_kernel_repr(
+    "_fused_quant_fp8_sort_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "QUANT_BLOCK_SIZE",
+        "TOPK",
+    ],
+)
+
+
+@triton.jit(repr=_fused_quant_fp8_sort_repr)
 def _fused_quant_fp8_sort_kernel(
     # Pointers
     input_ptr,
@@ -847,7 +1002,7 @@ def fused_quant_fp8_sort(
         DTYPE_MAX = 448.0
         DTYPE_MIN = -448.0
 
-    x_fp8 = torch.empty_like(input, dtype=quant_dtype, device="cuda")
+    x_fp8 = torch.empty_like(input, dtype=quant_dtype, device=input.device)
     M_o, N_o = sorted_ids.shape[0], N_blocks
 
     # [M_sorted_blocks/2, N_blocks/2, BLOCK_SIZE_N_u32, BLOCK_SIZE_M_u32]

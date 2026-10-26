@@ -8,6 +8,7 @@ from triton.language.core import _aggregate as aggregate
 from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
     _weighted_sum_fma_fold,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
@@ -492,7 +493,7 @@ def mqa_logits_loop_pipelined(
         scales_next = scales_next2
 
         logits_ptr += BLOCK_KV * stride_logits_k
-    kv_pos_post = (start_ind + end_pairs) * BLOCK_KV
+    kv_pos_post = start_ind + end_pairs * BLOCK_KV
     # Odd leftover: one sub-iter A so the epilogue's two stores line up
     # with the last full tile + partial tail.
     if odd_peel:
@@ -567,7 +568,23 @@ def mqa_logits_loop_pipelined(
     )
 
 
-@gluon.jit
+_gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
+    "_gluon_fp8_mqa_logits_kernel",
+    [
+        "NUM_HEADS",
+        "HEAD_SIZE",
+        "BLOCK_KV",
+        "NUM_WARPS",
+        "NUM_BUFFERS",
+        "NUM_CHAINS",
+        "LOOP_VARIANT",
+        "USE_BUFFER_LOAD",
+        "USE_BUFFER_STORE",
+    ],
+)
+
+
+@gluon.jit(repr=_gluon_fp8_mqa_logits_kernel_repr)
 def _gluon_fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, NUM_HEADS, HEAD_SIZE]
     KV_ptr,  # fp8e4m3 [seq_len_kv, HEAD_SIZE]

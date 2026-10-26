@@ -7,109 +7,7 @@
 
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass
-from typing import Any
-
-from aiter.aot.flydsl.common import cu_num_to_arch, job_identity
-
-
-def _normalized_enum(value: str) -> str:
-    return value.strip().split(".")[-1].lower()
-
-
-def _is_dsv4_fhmoe_row(row: dict[str, str]) -> bool:
-    """Return whether a tuned row describes the supported DSV4 FHMoE path."""
-    return (
-        int(row["model_dim"]) == 7168
-        and int(row["inter_dim"]) == 512
-        and int(row["expert"]) == 385
-        and int(row["topk"]) == 7
-        and _normalized_enum(row.get("act_type", "")) == "silu"
-        and row.get("dtype", "") == "torch.bfloat16"
-        and row.get("use_g1u1", "") == "1"
-        and "_gui" in row.get("kernelName1", "")
-        and _normalized_enum(row.get("q_type", "")) == "per_1x32"
-        and "float8_e4m3fn" in row.get("q_dtype_a", "")
-        and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
-    )
-
-
-def _row_job_keys(row: dict[str, str]) -> set[tuple[Any, ...]]:
-    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
-
-    stage1_name = row.get("kernelName1", "").strip()
-    stage1_params = get_flydsl_kernel_params(stage1_name)
-    stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
-    stage1_fuse_quant = stage1_out_dtype if stage1_out_dtype in ("fp4", "fp8") else None
-    prefix = (
-        int(row["token"]),
-        int(row["model_dim"]),
-        int(row["inter_dim"]),
-        int(row["expert"]),
-        int(row["topk"]),
-        bool(int(row.get("doweight_stage1", "0"))),
-        int(row.get("cu_num", "0")),
-        int(row.get("block_m", "0") or "0"),
-        _normalized_enum(row.get("act_type", "")),
-    )
-    return {
-        (*prefix, name, fuse_quant)
-        for name, fuse_quant in (
-            (stage1_name, None),
-            (row.get("kernelName2", "").strip(), stage1_fuse_quant),
-        )
-        if name.startswith("flydsl_")
-    }
-
-
-def _job_key(job: dict[str, Any]) -> tuple[Any, ...]:
-    return (
-        job["token_num"],
-        job["model_dim"],
-        job["inter_dim"],
-        job["experts"],
-        job["topk"],
-        job["doweight_stage1"],
-        job["cu_num"],
-        job["block_m"],
-        job["act"],
-        job["kernel_name"],
-        job.get("stage1_fuse_quant"),
-    )
-
-
-def extend_fhmoe_jobs(
-    csv_path: str,
-    ordinary_jobs: list[dict[str, Any]],
-    seen: set[tuple[Any, ...]],
-) -> list[dict[str, Any]]:
-    """Append FHMoE variants for eligible ordinary jobs in ``csv_path``."""
-    eligible_keys: set[tuple[Any, ...]] = set()
-    with open(csv_path, newline="") as f:
-        for row in csv.DictReader(f):
-            if _is_dsv4_fhmoe_row(row):
-                eligible_keys.update(_row_job_keys(row))
-
-    fhmoe_jobs = []
-    for job in ordinary_jobs:
-        if (
-            job.get("stage") not in (1, 2)
-            or job.get("enable_bias", False)
-            or _job_key(job) not in eligible_keys
-        ):
-            continue
-        fhmoe_job = {
-            **job,
-            "shared_expert_id": job["experts"] - 1,
-        }
-        key = job_identity(fhmoe_job)
-        if key in seen:
-            continue
-        seen.add(key)
-        fhmoe_jobs.append(fhmoe_job)
-
-    return [*ordinary_jobs, *fhmoe_jobs]
 
 
 def _shared_weight(device, n_in: int, k_in: int):
@@ -192,6 +90,7 @@ class _FHMoEAOTBackend:
         sorted_weights,
         num_valid_ids,
         token_num,
+        x_rows,
         n_in,
         k_in,
         blocks,
@@ -214,6 +113,7 @@ class _FHMoEAOTBackend:
             sorted_weights,
             num_valid_ids,
             token_num,
+            x_rows,
             n_in,
             k_in,
             blocks,
@@ -227,9 +127,11 @@ class _FHMoEAOTBackend:
     def compile_stage1(self, **kwargs):
         from aiter.ops.flydsl.fhmoe import compile_flydsl_fhmoe_stage1
 
+        clamp_shared = kwargs.pop("clamp_shared", True)
         return compile_flydsl_fhmoe_stage1(
             **kwargs,
             shared_expert_id=self.shared_expert_id,
+            clamp_shared=clamp_shared,
         )
 
     def compile_stage2(self, **kwargs):
@@ -243,42 +145,66 @@ class _FHMoEAOTBackend:
 
 def precompile_fhmoe_to_cache(
     *,
+    stage: int,
     experts: int,
     shared_expert_id: int,
     a_dtype: str = "fp8",
     b_dtype: str = "fp4",
     act: str = "silu",
     cu_num: int = 0,
+    gfx: str = "gfx950",
     enable_bias: bool = False,
     **kwargs,
 ):
     """Precompile one heterogeneous MoE job through the shared AOT harness."""
+    if stage not in (1, 2):
+        raise ValueError(f"FHMoE AOT stage must be 1 or 2, got {stage}")
     if shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE AOT expects the shared expert to be the final logical expert; "
             f"got {shared_expert_id=} for {experts=}"
         )
-    if a_dtype != "fp8" or b_dtype != "fp4":
+    if a_dtype != "fp8" or b_dtype not in ("fp4", "fp8"):
         raise ValueError(
-            "FHMoE AOT supports routed FP8 activations and MXFP4 weights; "
+            "FHMoE AOT supports routed FP8 activations with MXFP4 or MXFP8 weights; "
             f"got {a_dtype=} and {b_dtype=}"
+        )
+    gate_mode = kwargs.get("gate_mode", "separated")
+    if stage == 1 and b_dtype == "fp8" and gate_mode != "interleave":
+        raise ValueError(
+            "FHMoE AOT requires interleaved gate/up layout for MXFP8 routed "
+            f"weights, got {gate_mode=}"
+        )
+    if stage == 1 and not kwargs.get("clamp_shared", True) and b_dtype != "fp8":
+        raise ValueError(
+            "clamp_shared=False requires MXFP8 routed weights; "
+            "MXFP4/FP8 FHMoE keeps the shared expert clamped"
         )
     if enable_bias:
         raise ValueError("FHMoE AOT does not support expert bias")
     if act != "silu":
         raise ValueError(f"FHMoE AOT supports only SiLU, got {act=}")
-    if cu_num_to_arch(cu_num) != "gfx950":
-        raise ValueError(f"FHMoE AOT supports only gfx950, got {cu_num=}")
+    gfx = gfx or "gfx950"
+    if cu_num <= 0:
+        cu_num = 256
+    if gfx != "gfx950" or cu_num != 256:
+        raise ValueError(
+            "FHMoE AOT requires target gfx950 with 256 CUs, "
+            f"got {gfx=} and {cu_num=}"
+        )
 
+    from aiter.aot.flydsl.common import override_env
     from aiter.aot.flydsl.moe import _precompile_to_cache
 
-    return _precompile_to_cache(
-        experts=experts,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        act=act,
-        cu_num=cu_num,
-        enable_bias=enable_bias,
-        _aot_backend=_FHMoEAOTBackend(shared_expert_id),
-        **kwargs,
-    )
+    with override_env("FLYDSL_GPU_ARCH", gfx):
+        return _precompile_to_cache(
+            stage=stage,
+            experts=experts,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            act=act,
+            cu_num=cu_num,
+            enable_bias=enable_bias,
+            _aot_backend=_FHMoEAOTBackend(shared_expert_id),
+            **kwargs,
+        )

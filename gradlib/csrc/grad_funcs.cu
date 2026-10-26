@@ -485,7 +485,7 @@ void destroy_extension()
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     m.def("create_extension", &create_extension, "create_extension");
     m.def("destroy_extension", &destroy_extension, "destroy_extension");

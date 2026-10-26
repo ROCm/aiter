@@ -22,6 +22,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE]
 _WARP_TILE_N = 64
@@ -209,6 +210,21 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 1,
                 numel,
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                # src_scale: read only by the prequantized build, which this job
+                # does not emit; the pointer still has to be passed. Missing it
+                # would not fail loudly -- compile_one_config swallows the
+                # TypeError and the routeks kernels just stop being precompiled.
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                0,
+                1,
+                1,
+                1,
+                1,
                 grid,
                 stream=0,
             )
@@ -386,7 +402,7 @@ def compile_one_config(**job):
     t0 = time.time()
     try:
         # TODO(aot): only the auxiliary (non-GEMM) kernels are precompiled here.
-        # The grouped GEMM itself moved to the felix TDM batched kernel
+        # The grouped GEMM itself moved to the TDM batched kernel
         # (aiter.ops.flydsl.batched_gemm_mxfp4), which has no AOT wiring yet, so
         # it JIT-compiles on first use. Add TDM GEMM jobs here to restore the
         # coverage the deleted moe_grouped_gemm_mxscale path used to provide.
@@ -444,4 +460,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main(sys.argv[1:])

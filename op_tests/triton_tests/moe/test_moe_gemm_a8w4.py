@@ -21,12 +21,13 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import (
     downcast_to_mxfp,
     downcast_to_static_fp8,
-    upcast_from_mxfp,
 )
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.triton_tests.moe.moe_test_utils import assert_close
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 
 def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
@@ -111,76 +112,6 @@ def dtype_str_to_torch(dtype_str: str) -> torch.dtype:
     return torch.uint8 if dtype_str == "float4_e2m1" else getattr(torch, dtype_str)
 
 
-def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=True):
-    if tri.dtype.itemsize == 1:
-        ref_as_type = ref.to(tri.dtype)
-        if ref.dtype == tri.dtype:
-            assert torch.all(ref_as_type == tri)
-            return
-        ref = ref_as_type
-
-    if ref.numel() == 0:
-        return
-
-    if maxtol is None:
-        maxtol = 2e-2
-    if rmstol is None:
-        rmstol = 4e-3
-    """
-    Compare reference values against obtained values.
-    """
-
-    # cast to float32:
-    ref = ref.to(torch.float32).detach()
-    tri = tri.to(torch.float32).detach()
-    assert (
-        ref.shape == tri.shape
-    ), f"Tensors must have same size {ref.shape=} {tri.shape=}"
-
-    # deal with infinite elements:
-    inf_mask_ref = torch.isinf(ref)
-    inf_mask_tri = torch.isinf(tri)
-    assert torch.equal(
-        inf_mask_ref, inf_mask_tri
-    ), "Tensor must have same infinite elements"
-    refn = torch.where(inf_mask_ref, 0, ref)
-    trin = torch.where(inf_mask_tri, 0, tri)
-
-    # normalise so that RMS calculation doesn't overflow:
-    eps = 1.0e-30
-    multiplier = 1.0 / (torch.max(torch.abs(refn)) + eps)
-    refn *= multiplier
-    trin *= multiplier
-
-    ref_rms = torch.sqrt(torch.square(refn).mean()) + eps
-
-    rel_err = torch.abs(refn - trin) / torch.maximum(ref_rms, torch.abs(refn))
-    max_err = torch.max(rel_err).item()
-    rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
-
-    if verbose:
-        print(
-            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
-        )
-        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
-
-    if max_err > maxtol:
-        bad_idxs = torch.nonzero(rel_err > maxtol)
-        num_nonzero = bad_idxs.size(0)
-        bad_idxs = bad_idxs[:1000]
-        print(
-            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
-            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
-        )
-
-        bad_idxs = bad_idxs.unbind(-1)
-        print("ref values: ", ref[tuple(bad_idxs)].cpu())
-        print("tri values: ", tri[tuple(bad_idxs)].cpu())
-
-    assert max_err <= maxtol
-    assert rms_err <= rmstol
-
-
 # ---------------
 # unit tests
 # ---------------
@@ -241,6 +172,7 @@ class Case:
 @pytest.mark.parametrize("fused_quant", [False, True])
 @pytest.mark.parametrize("out_mx_quant", [False, True])
 @pytest.mark.parametrize("preshuffled", [False, True])
+@pytest.mark.parametrize("backend", ["gluon", "triton"])
 def test_op(
     m,
     n,
@@ -252,6 +184,7 @@ def test_op(
     fused_quant,
     out_mx_quant,
     preshuffled,
+    backend,
     n_expts_tot,
     n_expts_act,
     act_dtype_str,
@@ -262,8 +195,14 @@ def test_op(
     if get_arch() != "gfx950" and get_arch() != "gfx1250":
         pytest.skip("Kernel not supported on this GPU.")
 
+    if backend == "gluon" and get_arch() != "gfx1250":
+        pytest.skip(f"Gluon backend requires gfx1250, got {get_arch()}.")
+
     if preshuffled and get_arch() != "gfx1250":
         pytest.skip("Preshuffled weights are only supported on gfx1250.")
+
+    if preshuffled and backend == "triton":
+        pytest.skip("Preshuffled weights are decoded by the gluon kernel only.")
 
     if preshuffled and ((k // 2) % 32 != 0 or n % 16 != 0):
         pytest.skip(
@@ -271,7 +210,7 @@ def test_op(
             f"got k//2={k // 2}, N={n}."
         )
 
-    if get_arch() == "gfx1250":
+    if get_arch() == "gfx1250" and backend == "gluon":
         # temporary
         if do_gather and m > 1024 and act_dtype_str == "mxfloat8_e4m3fn":
             pytest.skip("do_gather (TDM async_gather) is not supported on gfx1250.")
@@ -340,9 +279,12 @@ def test_op(
             w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
         else:
             assert get_arch() == "gfx950"
-            swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+                w_scale_tri,
+                arch="gfx950",
+                preshuffle_factor=32,
+                scale_kwidth=8,
+                return_layout=True,
             )
     else:
         swizzle_mx_scale = None
@@ -388,6 +330,7 @@ def test_op(
         apply_swiglu,
         preshuffled=preshuffled,
         out_mx_quant=out_mx_quant,
+        backend=backend,
     )
     if out_mx_quant:
         tri_y, tri_y_scale = tri_y

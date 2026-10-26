@@ -26,6 +26,8 @@ def compile_gemm_a4w4(*, N: int, K: int, BM: int = 16):
         raise ValueError(f"N must be a positive multiple of 256, got {N}")
     if K <= 0 or K % 128:
         raise ValueError(f"K must be a positive multiple of 128, got {K}")
+    if K > 8192:
+        raise ValueError("K exceeds the shared weight-scale loader limit of 8192")
     if BM not in (16, 64):
         raise ValueError(f"BM must be 16 or 64, got {BM}")
 
@@ -35,7 +37,7 @@ def compile_gemm_a4w4(*, N: int, K: int, BM: int = 16):
     if k_tiles < 3:
         raise ValueError(f"K must contain at least three BK={BK} tiles, got K={K}")
     k_a_stages, k_scale_subblocks, _, lds_bytes = _bm_constants(
-        BM, BN, BK // 2, k_tiles
+        BM, BN, BK // 2, k_tiles, scale_chunks=(K + 255) // 256
     )
     if BM == 64:
         # Dense output is written directly from accm, so unlike the shared MoE
@@ -77,7 +79,6 @@ def compile_gemm_a4w4(*, N: int, K: int, BM: int = 16):
             arg_out,
             arg_a,
             arg_out,
-            i32_m,
             block,
             lane,
             wave,
@@ -93,6 +94,8 @@ def compile_gemm_a4w4(*, N: int, K: int, BM: int = 16):
             NE=1,
             interleave=False,
             dense=True,
+            arg_dense_out=arg_out,
+            i32_dense_m=i32_m,
         )
 
     @flyc.jit

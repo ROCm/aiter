@@ -11,10 +11,19 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes, hipb_create_extension, hipb_mm
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.gemm_op_a16w16 import _SEMA_SHAPE, get_semaphore_workspace
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
-from aiter.tuned_gemm import tgemm, triton_gemm
+from aiter.tuned_gemm import (
+    get_GEMM_A16W16_config,
+    hipb_gemm,
+    skinny_gemm,
+    tgemm,
+    triton_gemm,
+)
 
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
@@ -428,6 +437,229 @@ def test_skinny_gemm():
     return df
 
 
+def check_graph(dtype, m, n, k, otype):
+    """Capture the asm split-K GEMM in a HIP graph, replay it, compare against eager.
+
+    Not part of the perf table: this is a pass/fail check that the split-K
+    semaphore survives capture/replay. The kernel needs its counter to be zero
+    when a launch starts; a graph records launches, not the memset that zeroed
+    the counter, so a replay can start dirty and the kernel spins forever.
+    """
+    if dtype != dtypes.bf16 or otype not in (dtypes.bf16, dtypes.fp32):
+        return  # the asm a16w16 path only takes bf16 in, bf16/fp32 out
+    if k % 64 or n % 64:
+        return
+
+    x = torch.randn(m, k, dtype=dtype, device="cuda")
+    weight = torch.randn(n, k, dtype=dtype, device="cuda")
+    wshuffle = shuffle_weight(weight, layout=(16, 16))
+    out = torch.empty(m, n, dtype=otype, device="cuda")
+
+    # Warm up outside capture: the first call loads the module and allocates the
+    # semaphore workspace, neither of which may happen inside a capture region.
+    aiter.gemm_a16w16_asm(x, wshuffle, out, bpreshuffle=wshuffle.is_shuffled)
+    torch.cuda.synchronize()
+    eager = out.clone()
+
+    # Capture on a stream no warmup ran on: that is what makes the counter's
+    # (device, stream) key miss and allocate inside the capture region, which is
+    # where it can inherit a freed intermediate's address.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        aiter.gemm_a16w16_asm(x, wshuffle, out, bpreshuffle=wshuffle.is_shuffled)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # splitK reduces in whatever order the blocks finish, so the same inputs are
+    # not bit-identical run to run; compare with the file's usual tolerance.
+    err = checkAllclose(
+        eager,
+        out,
+        msg=f"graph dim: {(m, n, k)!s:<20} dtype: {dtype} otype: {otype}, replay vs eager: ",
+        catastrophic_check=True,
+    )
+    assert err == 0, f"graph replay diverged from eager at {(m, n, k)} {dtype} {otype}"
+
+    # The counter a capture hands out must not live on an address another graph
+    # in the same pool writes. The kernel hands it back at zero on its own, so
+    # nothing has to re-zero it per replay -- but an inherited address is
+    # overwritten every replay. Checked without a kernel so a regression asserts
+    # here in milliseconds instead of spinning in the GEMM above.
+    sink = torch.zeros(1, device=x.device)
+    pool = torch.cuda.graph_pool_handle()
+    src = torch.full((_SEMA_SHAPE[0] * _SEMA_SHAPE[1],), 3.0, device=x.device)
+    decoy = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(decoy, pool=pool, stream=stream):
+        transient = src * 2.0
+        transient_ptr = transient.data_ptr()
+        transient.sum()
+        del transient
+    probe = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(probe, pool=pool, stream=stream):
+        sema = get_semaphore_workspace(x.device)
+        sink.add_(1)  # a graph needs at least one node
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    assert (
+        sema.data_ptr() != transient_ptr
+    ), f"splitK counter inherited a freed intermediate's address at {(m, n, k)}"
+    decoy.replay()
+    torch.cuda.synchronize()
+    assert (
+        int(sema.view(torch.int32).max().item()) == 0
+    ), f"another graph in the pool wrote into the splitK counter at {(m, n, k)}"
+
+
+def _tuned_rows_per_libtype(libtypes):
+    """One tuned (M, N, K, bias, otype) per libtype for this GPU, unshuffled B."""
+    df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE)
+    df = df[
+        (df["gfx"] == get_gfx())
+        & (df["cu_num"] == get_cu_num())
+        & (df["dtype"] == str(dtypes.bf16))
+        & (~df["bpreshuffle"].astype(bool))
+        & (~df["scaleAB"].astype(bool))
+    ]
+    rows = {}
+    for lib in libtypes:
+        hit = df[df["libtype"] == lib]
+        if len(hit):
+            r = hit.iloc[0]
+            rows[lib] = (
+                int(r["M"]),
+                int(r["N"]),
+                int(r["K"]),
+                bool(r["bias"]),
+                getattr(torch, r["outdtype"].removeprefix("torch.")),
+            )
+    return rows
+
+
+def _check_out(label, expect_lib, x, w, bias, otype, call):
+    """`call(out)` into a NaN-filled buffer, judged against `call(None)`.
+
+    The reference is the same backend without ``out``, so this measures only
+    whether ``out`` is honoured -- each backend's accuracy has its own tests.
+    """
+    shape = (*x.shape[:-1], w.shape[0])
+    if expect_lib is not None:
+        cfg = get_GEMM_A16W16_config(
+            M=x.shape[0],
+            N=w.shape[0],
+            K=x.shape[1],
+            bias=bias is not None,
+            dtype=str(x.dtype),
+            otype=str(otype),
+            bpreshuffle=bool(getattr(w, "is_shuffled", False)),
+        )
+        assert cfg["libtype"] == expect_lib, f"{label}: routed to {cfg['libtype']}"
+    out = torch.full(shape, float("nan"), dtype=otype, device="cuda")
+    ret = call(out)
+    return {
+        "case": label,
+        "libtype": expect_lib or "direct",
+        "returns out": ret.data_ptr() == out.data_ptr(),
+        "written": not bool(out.isnan().any()),
+        "err vs no out": checkAllclose(call(None), out, msg=f"{label}: "),
+    }
+
+
+def test_gemm_out():
+    """`tgemm.mm(out=)` lands in the caller's buffer on every backend.
+
+    A backend that returns a tensor of its own leaves `out` unwritten without
+    any error -- the fp8 torch path once did -- so each case asserts the
+    routing it meant to reach, then that `out` is the answer and holds it.
+    """
+    bf16 = dtypes.bf16
+    rand = lambda *shape, dtype=bf16: torch.randn(*shape, dtype=dtype, device="cuda")
+    cases = []
+
+    def via_mm(label, lib, x, w, bias, otype):
+        cases.append(
+            (
+                label,
+                lib,
+                x,
+                w,
+                bias,
+                otype,
+                lambda out: tgemm.mm(x, w, bias, otype=otype, out=out),
+            )
+        )
+
+    x, w, b = rand(128, 8192), rand(32, 8192), rand(32)
+    via_mm("torch bf16+bias", "torch", x, w, b, bf16)
+    via_mm("torch bf16->fp32+bias", "torch", x, w, b, dtypes.fp32)
+    via_mm("torch bf16->fp16", "torch", x, w, None, dtypes.fp16)
+    x8, w8 = x.to(dtypes.fp8), w.to(dtypes.fp8)
+    via_mm("torch fp8->bf16", "torch", x8, w8, None, bf16)
+    xs, ws = rand(4, 8192), rand(32, 8192)
+    via_mm("skinny bf16+bias", "skinny", xs, ws, rand(32), bf16)
+    # The router sends no fp32-out shape to skinny, so called direct: its
+    # kernels write bf16, and a buffer of another dtype takes that by copy.
+    cases.append(
+        (
+            "skinny bf16->fp32",
+            None,
+            xs,
+            ws,
+            None,
+            dtypes.fp32,
+            lambda out: skinny_gemm(xs, ws, 2, None, dtypes.fp32, out=out),
+        )
+    )
+    # A 3-D input that `view` cannot flatten goes to `F.linear` untuned.
+    xt = rand(4, 64, 8192).transpose(0, 1)
+    via_mm("unflattenable 3-D input", None, xt, w, None, bf16)
+    if get_gfx() == "gfx950":
+        xa, wa = rand(64, 5120), rand(256, 5120)
+        wa_shuffled = shuffle_weight(wa, layout=(16, 16))
+        # fp32 out: at bf16 out this path differs run to run by up to 3.0 here,
+        # which would drown the comparison against its own `out=None` call.
+        via_mm("asm shuffled", "asm", xa, wa_shuffled, None, dtypes.fp32)
+    for lib, (m, n, k, has_bias, otype) in _tuned_rows_per_libtype(
+        ["asm", "flydsl", "opus", "triton"]
+    ).items():
+        via_mm(
+            f"{lib} tuned {m}x{n}x{k}",
+            lib,
+            rand(m, k),
+            rand(n, k),
+            rand(n) if has_bias else None,
+            otype,
+        )
+    init_hipblas()
+    xh, wh, bh = rand(128, 4096), rand(256, 4096), rand(256)
+    cases.append(
+        (
+            "hipblaslt bf16+bias",
+            None,
+            xh,
+            wh,
+            bh,
+            bf16,
+            lambda out: hipb_gemm(xh, wh, -1, bh, bf16, out=out),
+        )
+    )
+
+    rows = [_check_out(*case) for case in cases]
+    torch.cuda.synchronize()
+    bad = [
+        r["case"]
+        for r in rows
+        if not (r["returns out"] and r["written"] and r["err vs no out"] == 0)
+    ]
+    assert not bad, f"out= not honoured by: {bad}"
+    return rows
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -437,11 +669,12 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny"],
+    choices=["normal", "skinny", "out"],
     default=["normal"],
     help="""Select test to run.
     e.g.: -t normal    # default
-          or -t skinny""",
+          or -t skinny
+          or -t out    # tgemm.mm(out=) on every backend""",
 )
 parser.add_argument(
     "-d",
@@ -495,6 +728,13 @@ parser.add_argument(
     help="""Scale B.
     e.g.: -sb 0.5""",
 )
+parser.add_argument(
+    "--graph",
+    action="store_true",
+    help="""Also run the HIP-graph capture/replay check for the asm splitK path
+    over the same sweep. Use shapes that select splitK (small m, large k).
+    e.g.: --graph -mnk 64,256,5120 32,512,8192 -d bf16 -o fp32""",
+)
 args = parser.parse_args()
 
 df = []
@@ -503,6 +743,8 @@ for test in args.test:
         for dtype in args.dtype:
             for otype in args.otype:
                 for m, n, k in args.mnk:
+                    if args.graph:
+                        check_graph(dtype, m, n, k, otype)
                     ret = test_gemm(
                         dtype,
                         m,
@@ -518,6 +760,10 @@ for test in args.test:
     elif test == "skinny":
         ret = test_skinny_gemm()
         df += ret
+    elif test == "out":
+        df += test_gemm_out()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
+if args.graph:
+    aiter.logger.info("all graph capture/replay checks passed")

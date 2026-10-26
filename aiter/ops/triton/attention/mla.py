@@ -35,63 +35,12 @@ except:  # noqa: E722
     gluon_mla_decode_fwd_kernel = None
     gluon_mla_decode_fwd_reduce_kernel = None
 
-try:
-    from aiter.ops.triton._gluon_kernels.gfx950.attention.mla import (
-        mla_gluon as gfx950_mla_decode_fwd,
-    )
-except ImportError:
-    gfx950_mla_decode_fwd = None
-
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
-IS_DEVICE_ARCH_GFX950 = DEVICE_ARCH == "gfx950"
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
-
-
-def _use_gfx950_gluon_decode(
-    num_query_heads,
-    num_kv_heads,
-    block_size,
-    q_dtype,
-    kv_dtype,
-    out_dtype,
-    kv_lora_rank,
-    qk_rope_head_dim,
-    shuffled_kv_cache,
-    q_descale,
-    kv_descale,
-    q_scales,
-    out_scale,
-    skip_reduce,
-    q_is_contiguous,
-    kv_buffer_is_contiguous,
-    out_is_contiguous,
-):
-    """Select Gluon only for the validated gfx950 low-head decode layout."""
-    return (
-        IS_DEVICE_ARCH_GFX950
-        and gfx950_mla_decode_fwd is not None
-        and 0 < num_query_heads <= 16
-        and num_kv_heads == 1
-        and block_size == 1
-        and q_dtype == torch.bfloat16
-        and kv_dtype == torch.bfloat16
-        and out_dtype == torch.bfloat16
-        and kv_lora_rank == 512
-        and qk_rope_head_dim == 64
-        and not shuffled_kv_cache
-        and q_descale is None
-        and kv_descale is None
-        and q_scales is None
-        and out_scale is None
-        and not skip_reduce
-        and q_is_contiguous
-        and kv_buffer_is_contiguous
-        and out_is_contiguous
-    )
 
 
 def select_2d_config(
@@ -312,6 +261,17 @@ def mla_prefill_fwd(
     return out
 
 
+def _fits_int32_offsets(tensor):
+    # Kernels receive a pointer to the view origin, so storage_offset is not
+    # part of the relative index. numel alone does not bound a strided view.
+    strides = tensor.stride()
+    return (
+        all(0 <= stride < 2**31 for stride in strides)
+        and sum((size - 1) * stride for size, stride in zip(tensor.shape, strides))
+        < 2**31
+    )
+
+
 def mla_decode_fwd(
     q,  # [num_tokens_per_seq * num_seqs, num_query_heads, qk_lora_rank + qk_rope_head_dim]
     kv_buffer,  # [num_blocks, block_size, num_kv_heads, qk_lora_rank + qk_rope_head_dim]
@@ -391,55 +351,6 @@ def mla_decode_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    if _use_gfx950_gluon_decode(
-        num_query_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        block_size=block_size,
-        q_dtype=q_dtype,
-        kv_dtype=kv_buffer_dtype,
-        out_dtype=out.dtype,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        shuffled_kv_cache=shuffled_kv_cache,
-        q_descale=q_descale,
-        kv_descale=kv_descale,
-        q_scales=q_scales,
-        out_scale=out_scale,
-        skip_reduce=skip_reduce,
-        q_is_contiguous=q.is_contiguous(),
-        kv_buffer_is_contiguous=kv_buffer.is_contiguous(),
-        out_is_contiguous=out.is_contiguous(),
-    ):
-        q_view = q.view(
-            num_seqs,
-            num_tokens_per_seq,
-            num_query_heads,
-            qk_head_dim,
-        )
-        out_view = out.view(
-            num_seqs,
-            num_tokens_per_seq,
-            num_query_heads,
-            kv_lora_rank,
-        )
-        if num_tokens_per_seq == 1:
-            q_view = q_view[:, 0]
-            out_view = out_view[:, 0]
-
-        gfx950_mla_decode_fwd(
-            q_nope=q_view[..., :kv_lora_rank],
-            q_pe=q_view[..., kv_lora_rank:],
-            kv_c=kv_buffer.view(-1, qk_head_dim),
-            o=out_view,
-            page_table=block_tables,
-            seq_info=seqused_k,
-            sm_scale=softmax_scale,
-            kv_pe_offset=kv_lora_rank,
-            use_2d_view=True,
-            min_kv_seq_len=max_seqlen_kv,
-        )
-        return out
-
     MAX_BLOCK_M = 128 if kv_buffer_dtype == e4m3_dtype else 64
     if num_queries_per_kv <= 16:
         BLOCK_M = 16
@@ -472,7 +383,37 @@ def mla_decode_fwd(
         BLOCK_M,
     )
 
-    NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
+    selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
+    use_lds_pipeline = (
+        DEVICE_ARCH == "gfx1250"
+        and ALL_DECODE
+        and total_num_tokens == num_seqs
+        and shuffled_kv_cache
+        and QUERY_DTYPE == "fp8"
+        and KV_CACHE_DTYPE == "fp8"
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 64
+        and block_size == 64
+        and num_query_heads == 128 * num_kv_heads
+        and NUM_HEAD_BLOCKS == 1
+        and (
+            selected_num_segments == 1
+            # Zero means unknown, not a short context. Preserve partial-output
+            # semantics when skip_reduce requests multiple segments.
+            or (not skip_reduce and 0 < max_seqlen_kv <= 3 * block_size)
+        )
+        and q_scales is None
+        and q.stride(2) == 1
+        and kv_buffer.stride(3) == 1
+        and 0 < kv_buffer.stride(1) < 2**31
+        and num_blocks * num_kv_heads < 2**31
+        and out.stride(2) == 1
+        and block_tables.stride(1) == 1
+        and _fits_int32_offsets(q)
+        and _fits_int32_offsets(out)
+        and _fits_int32_offsets(block_tables)
+    )
+    NUM_SEGMENTS = 1 if use_lds_pipeline else selected_num_segments
     if NUM_SEGMENTS > 1:
         segm_output = torch.empty(
             total_num_tokens,
@@ -501,6 +442,23 @@ def mla_decode_fwd(
         segm_max = out  # dummy ptr
         segm_expsum = out  # dummy ptr
 
+    if use_lds_pipeline:
+        attn_config.update(
+            NUM_SEGMENTS_PER_SEQ=1,
+            num_warps=4,
+            num_stages=4,
+            waves_per_eu=1,
+            USE_LDS_PIPELINE=True,
+            output_stride_0=out.stride(0),
+            output_stride_1=out.stride(1),
+            # TDM needs aligned BF16 rows. Other output views use direct stores.
+            TDM_STORE=(
+                out.dtype == torch.bfloat16
+                and out.data_ptr() % 16 == 0
+                and out.stride(0) % 8 == 0
+                and out.stride(1) % 8 == 0
+            ),
+        )
     if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
             impl = gluon_mla_decode_fwd_kernel

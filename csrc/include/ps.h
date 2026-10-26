@@ -106,7 +106,8 @@ void get_ps_metadata_v1(const aiter_tensor_t& seqlens_qo_indptr,     // [batch s
                         const int32_t        qlen_granularity,
                         const int32_t        kvlen_granlarity,
                         const int32_t        block_size,
-                        const bool           is_causal);
+                        const bool           is_causal,
+                        const bool           need_lse);
 
 
 // DEBUG
