@@ -8,6 +8,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 |------|-------|-----|---------------|
 | `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts |
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
+| `test_mha_fwd_dispatch.py` | 1 | No | MHA forward tuned-row lookup: exact key, bad rows skipped, unservable rows fall back to auto-select, dispatch records what it ran |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results`, auto-select removal, stale rows retuned |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart, resubmitting a faulted group's remaining candidates, fault detection by type or failing synchronize |
 | `test_mp_tuner_fault.py` | 2 | Yes | `mp_tuner` when a candidate faults, kills its worker, or fails preparing inputs: only that candidate fails, for untyped and `return_status` callers |
