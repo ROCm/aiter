@@ -18,7 +18,7 @@ from .kernels.fp8_quant_gfx1201 import (
     flydsl_fp8_qkv_d64_quant,
 )
 
-_INT32_MAX = (1 << 31) - 1
+_BUFFER_BYTE_EXTENT_LIMIT = 1 << 32
 
 
 @lru_cache(maxsize=16)
@@ -33,7 +33,7 @@ def _gpu_arch(device: torch.device) -> str:
     return _gpu_arch_cached(device.index)
 
 
-def _validate_quant_dword_offsets(
+def _validate_quant_buffer_byte_extent(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -41,14 +41,14 @@ def _validate_quant_dword_offsets(
     head_dim: int,
     native_head_dim: int,
 ) -> None:
-    """Reject native quantizer inputs whose BF16 dword offsets overflow Int32."""
+    """Reject BF16 input extents that cannot fit the V# byte-count field."""
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         rows = tensor.numel() // head_dim
-        dwords = rows * native_head_dim // 2
-        if dwords - 1 > _INT32_MAX:
+        input_bytes = rows * native_head_dim * tensor.element_size()
+        if input_bytes >= _BUFFER_BYTE_EXTENT_LIMIT:
             raise ValueError(
-                f"flydsl_fp8_quant {name} requires dword offset {dwords - 1}, "
-                f"exceeding the native quantizer Int32 limit ({_INT32_MAX})"
+                f"flydsl_fp8_quant {name} requires {input_bytes} input bytes, "
+                "but the native quantizer V# byte extent must stay below 2^32"
             )
 
 
@@ -80,9 +80,9 @@ def flydsl_fp8_quant(
         raise ValueError(f"flydsl_fp8_quant requires gfx1201, got {arch!r}")
     if not (q.dtype == k.dtype == v.dtype == torch.bfloat16):
         raise ValueError("q/k/v dtype must match and be bfloat16")
-    if any(x.dim() == 0 for x in (q, k, v)) or not (
-        q.shape[-1] == k.shape[-1] == v.shape[-1]
-    ):
+    if any(x.dim() != 4 for x in (q, k, v)):
+        raise ValueError("q/k/v must be 4D BSHD tensors")
+    if not (q.shape[-1] == k.shape[-1] == v.shape[-1]):
         raise ValueError("q/k/v must share head_dim")
     if any(x.numel() == 0 for x in (q, k, v)):
         raise ValueError("q/k/v must be non-empty")
@@ -103,7 +103,7 @@ def flydsl_fp8_quant(
         raise ValueError(
             f"native FP8 quant has no packed specialization for head_dim={head_dim}"
         )
-    _validate_quant_dword_offsets(
+    _validate_quant_buffer_byte_extent(
         q, k, v, head_dim=head_dim, native_head_dim=padded_dim
     )
     if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):

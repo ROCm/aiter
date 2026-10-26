@@ -142,18 +142,19 @@ def _validate_gfx1201_launch_limits(
                 f"one BF16/F16 V batch requires {v_batch_bytes} bytes, but the "
                 "gfx1201 buffer descriptor requires a byte count below 2^32"
             )
-    # The FP8 kernel's typed V# helpers narrow flattened Q/K/V/O element
-    # offsets to Int32. Bound the padded tensors before materializing them so
-    # a large batch cannot wrap those buffer indices.
-    for name, elements in (
-        ("padded Q/O", batch * seq_len * num_heads * head_dim),
-        ("padded K/V", batch * seq_len_kv * num_heads * head_dim),
-    ):
-        if elements > _GFX1201_KERNEL_INT32_MAX:
-            raise ValueError(
-                f"{name} requires {elements} elements, exceeding the gfx1201 "
-                f"FP8 buffer-index Int32 limit ({_GFX1201_KERNEL_INT32_MAX})"
-            )
+    else:
+        # The FP8 kernel's typed V# helpers narrow flattened Q/K/V/O element
+        # offsets to Int32. Bound the padded tensors before materializing them
+        # so a large batch cannot wrap those buffer indices.
+        for name, elements in (
+            ("padded Q/O", batch * seq_len * num_heads * head_dim),
+            ("padded K/V", batch * seq_len_kv * num_heads * head_dim),
+        ):
+            if elements > _GFX1201_KERNEL_INT32_MAX:
+                raise ValueError(
+                    f"{name} requires {elements} elements, exceeding the gfx1201 "
+                    f"FP8 buffer-index Int32 limit ({_GFX1201_KERNEL_INT32_MAX})"
+                )
 
 
 @lru_cache(maxsize=64)
@@ -345,6 +346,8 @@ def flydsl_flash_attn_func(
                 )
         dtype_str = "bf16"
     else:
+        if any(scale is not None for scale in (q_descale, k_descale, v_descale)):
+            raise ValueError("q/k/v descales are only valid for FP8 input")
         dtype_str = _torch_dtype_to_str(q.dtype)
 
     output_dtype = torch.bfloat16 if is_fp8 else q.dtype
@@ -504,10 +507,13 @@ def flydsl_flash_attn_func(
                     ),
                 )
                 exe(
-                    q_p.reshape(-1),
-                    k_p.reshape(-1),
-                    v_p.reshape(-1),
-                    o_p.reshape(-1),
+                    # Preserve the original rank: FlyDSL's tensor ABI stores
+                    # each dimension as signed Int32, so flattening a legal
+                    # 2^31-element tensor would make its sole dimension overflow.
+                    q_p,
+                    k_p,
+                    v_p,
+                    o_p,
                     batch,
                     seq_len_pad,
                     seq_len_kv_real,

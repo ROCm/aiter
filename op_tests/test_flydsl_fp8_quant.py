@@ -9,12 +9,14 @@ import math
 import warnings
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_fp8_quant
+from aiter.ops.flydsl.fp8_quant import _validate_quant_buffer_byte_extent
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 SUPPORTED_GFX = ["gfx1201"]
@@ -147,6 +149,30 @@ def _exercise_public_contracts():
         torch.cuda.set_device(previous_device)
 
 
+def _check_bf16_input_at_4gib_boundary_is_rejected():
+    q = torch.empty((1, 266240, 64, 128), dtype=torch.bfloat16, device="meta")
+    k = v = torch.empty((1, 128, 64, 128), dtype=torch.bfloat16, device="meta")
+
+    with pytest.raises(ValueError, match="byte"):
+        _validate_quant_buffer_byte_extent(q, k, v, head_dim=128, native_head_dim=128)
+
+
+def _check_non_bshd_input_is_rejected():
+    q = torch.ones((64, 64), dtype=torch.bfloat16, device="cuda")
+
+    with pytest.raises(ValueError, match="4D BSHD"):
+        flydsl_fp8_quant(q, q, q, rotation=False)
+
+
+def test_flydsl_fp8_quant_rejects_bf16_input_at_4gib_boundary():
+    _check_bf16_input_at_4gib_boundary_is_rejected()
+
+
+@pytest.mark.skipif(get_gfx() != "gfx1201", reason="requires gfx1201")
+def test_flydsl_fp8_quant_rejects_non_bshd_input():
+    _check_non_bshd_input_is_rejected()
+
+
 @benchmark()
 def run_flydsl_fp8_quant(shape, batch, seq_q, seq_kv, heads, head_dim, rotation):
     """Time the public producer and compare it to a torch/FWHT reference."""
@@ -199,6 +225,8 @@ def main():
         help="Quantizer shape groups to sweep.",
     )
     args = parser.parse_args()
+    _check_bf16_input_at_4gib_boundary_is_rejected()
+    _check_non_bshd_input_is_rejected()
     _exercise_public_contracts()
     rows = [
         run_flydsl_fp8_quant(*config)

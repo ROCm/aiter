@@ -6,8 +6,6 @@
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
 
-from ..tensor_shim import ptr_arg as _ptr_arg
-
 
 def kv_load_schedule(block_size, head_dim, block_n, vec_width):
     """Return cooperative-load geometry derived only from static tile sizes."""
@@ -52,22 +50,3 @@ def mask_scores(
             )
             masked.append(pred.select(c_neg_inf, scores[idx]))
     return masked
-
-
-def pointer_arg(value):
-    """Convert tensor-like launch arguments to raw FlyDSL pointers."""
-    if not hasattr(value, "data_ptr"):
-        return value
-    return _ptr_arg(value)
-
-
-def wrap_pointer_args(args, kwargs, positional_indices, keyword_names):
-    """Convert selected positional and keyword launch arguments to pointers."""
-    args = list(args)
-    for idx in positional_indices:
-        if idx < len(args):
-            args[idx] = pointer_arg(args[idx])
-    for name in keyword_names:
-        if name in kwargs:
-            kwargs[name] = pointer_arg(kwargs[name])
-    return tuple(args), kwargs

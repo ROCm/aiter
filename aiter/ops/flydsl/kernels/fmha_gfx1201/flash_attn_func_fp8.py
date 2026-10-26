@@ -47,6 +47,9 @@ from .flash_attn_func_common import (
 
 NUM_PREFETCH_K = 1
 NUM_PREFETCH_V = 1
+# E4M3FN tops out at 448, so 2**8=256 is the largest exact power-of-two
+# lift that keeps the maximum scaled softmax probability in range.
+_FP8_PROBABILITY_LOG2_SCALE = 8.0
 
 
 def _fmul_scalar(a, b):
@@ -85,6 +88,7 @@ def _update_online_softmax(
     l_running,
     o_accs,
     sm_scale_log2e,
+    probability_log2_scale,
     c_zero_f,
     *,
     num_scores,
@@ -99,7 +103,10 @@ def _update_online_softmax(
 
     diff_m_scaled = _fmul_scalar(_fsub_scalar(m_running, m_new), sm_scale_log2e)
     corr = fx.exp2(diff_m_scaled, fastmath="fast")
-    neg_scaled_max = _fsub_scalar(c_zero_f, _fmul_scalar(sm_scale_log2e, m_new))
+    neg_scaled_max = _fadd_scalar(
+        _fsub_scalar(c_zero_f, _fmul_scalar(sm_scale_log2e, m_new)),
+        probability_log2_scale,
+    )
 
     probabilities = []
     local_sum = _raw(c_zero_f)
@@ -527,11 +534,18 @@ def build_flash_attn_func_module(
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
+        c_probability_log2_scale = fx.Float32(_FP8_PROBABILITY_LOG2_SCALE)
         c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
         # fp8-input: fold per-tensor q_scale*k_scale into the softmax log2e scale
         # (S = q_scale*k_scale * (Q_fp8 . K_fp8^T)). Runtime scalar, computed once.
         c_sm_scale_log2e_rt = _fmul_scalar(
             _fmul_scalar(q_scale, k_scale), c_sm_scale_log2e
+        )
+        # A zero Q/K scale means all dequantized scores are zero. Use the
+        # smallest normal f32 scale so masked -inf scores remain masked while
+        # every finite score is still indistinguishable from zero.
+        c_sm_scale_log2e_rt = (c_sm_scale_log2e_rt == c_zero_f).select(
+            fx.Float32(2.0**-126), c_sm_scale_log2e_rt
         )
         c_zero_v8f32 = Vec.filled(8, 0.0, fx.Float32)
         _q_end = q_start + BLOCK_M
@@ -622,6 +636,7 @@ def build_flash_attn_func_module(
                 l_running,
                 o_accs,
                 c_sm_scale_log2e_rt,
+                c_probability_log2_scale,
                 c_zero_f,
                 num_scores=NUM_S_VALS,
                 d_chunks=D_CHUNKS,
@@ -696,8 +711,8 @@ def build_flash_attn_func_module(
         l_final = loop_results[1]
         o_finals = [loop_results[2 + dc] for dc in range_constexpr(D_CHUNKS)]
 
-        # fp8-input: O = v_scale * (P . V_fp8); fold v_scale into the 1/l
-        # normalizer. The launch compile hints provide the FP fast-math policy.
+        # fp8-input: both P and l carry the same exact power-of-two lift, so it
+        # cancels in P/l. Fold only v_scale into the output normalizer.
         inv_l = c_one_f / fx.Float32(l_final)
         inv_l = _fmul_scalar(inv_l, v_scale)
         inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()

@@ -10,6 +10,7 @@ import itertools
 import warnings
 from contextlib import nullcontext
 from itertools import pairwise
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -20,6 +21,8 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_flash_attn_func, flydsl_fp8_quant
+from aiter.ops.flydsl import fmha_kernels as flydsl_fmha_kernels
+from aiter.ops.flydsl.fmha_kernels import _validate_gfx1201_launch_limits
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 
@@ -174,6 +177,136 @@ def test_flydsl_fmha_rejects_dtype_mismatch():
     v = torch.randn(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="dtype"):
         flydsl_flash_attn_func(q, k, v)
+
+
+def _check_gfx1201_launch_limits_allow_large_bf16_batch():
+    _validate_gfx1201_launch_limits(
+        batch=16,
+        seq_len=32768,
+        seq_len_kv_real=32768,
+        seq_len_kv=32768,
+        num_heads=32,
+        head_dim=128,
+        fp8=False,
+    )
+
+
+def test_gfx1201_launch_limits_allow_large_bf16_batch():
+    _check_gfx1201_launch_limits_allow_large_bf16_batch()
+
+
+def _check_bf16_launch_preserves_tensor_args():
+    q = torch.ones((1, 128, 1, 64), dtype=torch.bfloat16, device="cuda")
+    out = torch.empty_like(q)
+    captured = []
+
+    def fake_kernel(*args, **kwargs):
+        captured.extend(args[:4])
+
+    with patch.object(flydsl_fmha_kernels, "_get_kernel", lambda **kwargs: fake_kernel):
+        result = flydsl_flash_attn_func(q, q, q, out=out)
+
+    assert result.data_ptr() == out.data_ptr()
+    assert captured[0] is q
+    assert captured[1] is q
+    assert captured[2] is q
+    assert captured[3] is out
+    assert all(tensor.shape == q.shape for tensor in captured)
+
+
+@_gfx1201_only
+def test_flydsl_fmha_bf16_launch_preserves_tensor_args():
+    _check_bf16_launch_preserves_tensor_args()
+
+
+def _check_zero_q_descale_produces_uniform_attention():
+    q = torch.ones((1, 97, 2, 64), dtype=FP8_DTYPE, device="cuda")
+    scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    zero = torch.zeros(1, dtype=torch.float32, device="cuda")
+
+    out = flydsl_flash_attn_func(
+        q,
+        q,
+        q,
+        q_descale=zero,
+        k_descale=scale,
+        v_descale=scale,
+    )
+
+    torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=0)
+
+
+@_gfx1201_only
+def test_flydsl_fmha_zero_q_descale_produces_uniform_attention():
+    _check_zero_q_descale_produces_uniform_attention()
+
+
+def _check_descales_for_bf16_are_rejected():
+    q = torch.ones((1, 128, 2, 64), dtype=torch.bfloat16, device="cuda")
+    scale = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    with pytest.raises(ValueError, match="only valid for FP8"):
+        flydsl_flash_attn_func(
+            q,
+            q,
+            q,
+            q_descale=scale,
+            k_descale=scale,
+            v_descale=scale,
+        )
+
+
+@_gfx1201_only
+def test_flydsl_fmha_rejects_descales_for_bf16():
+    _check_descales_for_bf16_are_rejected()
+
+
+def _check_fp8_softmax_normalizes_v_ones(zero_row):
+    q = torch.zeros((1, 1, 1, 64), dtype=FP8_DTYPE, device="cuda")
+    q[..., 0] = 1.0
+    k = torch.zeros((1, 4096, 1, 64), dtype=FP8_DTYPE, device="cuda")
+    k[..., 0] = -7.5
+    k[:, zero_row, :, 0] = 0.0
+    v = torch.ones_like(k)
+    scale = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    out = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0,
+        q_descale=scale,
+        k_descale=scale,
+        v_descale=scale,
+    )
+
+    torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=2e-2)
+
+
+@_gfx1201_only
+@pytest.mark.parametrize("zero_row", [0, -1])
+def test_flydsl_fmha_fp8_softmax_normalizes_v_ones(zero_row):
+    _check_fp8_softmax_normalizes_v_ones(zero_row)
+
+
+def _check_bf16_v_ones_bias_is_bounded():
+    q = torch.zeros((1, 1, 1, 64), dtype=torch.bfloat16, device="cuda")
+    q[..., 0] = 1.0
+    k = torch.zeros((1, 4096, 1, 64), dtype=torch.bfloat16, device="cuda")
+    k[..., 0] = -7.5
+    k[:, 0, :, 0] = 0.0
+    v = torch.ones_like(k)
+
+    out = flydsl_flash_attn_func(q, k, v, softmax_scale=1.0)
+
+    # BF16 probability packing truncates, yielding 0.99609375 for this probe.
+    # Bound that known bias so larger normalization errors still fail.
+    torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=4e-3)
+
+
+@_gfx1201_only
+def test_flydsl_fmha_bf16_v_ones_bias_is_bounded():
+    _check_bf16_v_ones_bias_is_bounded()
 
 
 @_gfx1201_only
@@ -1949,7 +2082,9 @@ def _optest_gfx1201_reference(q, k, v, *, causal):
     )
 
 
-def _optest_assert_gfx1201_quality(actual, expected, *, head_dim, minimum, mean):
+def _optest_assert_gfx1201_quality(
+    actual, expected, *, head_dim, minimum, mean, max_abs
+):
     cosine = F.cosine_similarity(
         actual.float().reshape(-1, head_dim),
         expected.float().reshape(-1, head_dim),
@@ -1957,12 +2092,22 @@ def _optest_assert_gfx1201_quality(actual, expected, *, head_dim, minimum, mean)
     )
     min_cos = cosine.min().item()
     mean_cos = cosine.mean().item()
+    max_abs_error = (actual.float() - expected.float()).abs().max().item()
     assert min_cos > minimum, f"min_cos={min_cos:.6f}"
     assert mean_cos > mean, f"mean_cos={mean_cos:.6f}"
+    assert max_abs_error < max_abs, f"max_abs_error={max_abs_error:.6f}"
 
 
 def _optest_gfx1201_contracts():
     """Check durable public-wrapper boundaries outside timed benchmark rows."""
+    _check_gfx1201_launch_limits_allow_large_bf16_batch()
+    _check_bf16_launch_preserves_tensor_args()
+    _check_zero_q_descale_produces_uniform_attention()
+    _check_descales_for_bf16_are_rejected()
+    for zero_row in (0, -1):
+        _check_fp8_softmax_normalizes_v_ones(zero_row)
+    _check_bf16_v_ones_bias_is_bounded()
+
     q, k, v = _optest_make_gfx1201_qkv(1, 97, 97, 2, 128)
     out = torch.full_like(q, float("nan"))
     result = flydsl_flash_attn_func(q, k, v, out=out)
@@ -1973,6 +2118,7 @@ def _optest_gfx1201_contracts():
         head_dim=128,
         minimum=0.99,
         mean=0.999,
+        max_abs=5e-2,
     )
 
     stream = torch.cuda.Stream(device=q.device)
@@ -1986,6 +2132,7 @@ def _optest_gfx1201_contracts():
         head_dim=128,
         minimum=0.99,
         mean=0.999,
+        max_abs=5e-2,
     )
 
     q_storage = torch.randn((1, 97, 2, 256), dtype=torch.bfloat16, device="cuda")
@@ -2003,6 +2150,7 @@ def _optest_gfx1201_contracts():
         head_dim=128,
         minimum=0.99,
         mean=0.999,
+        max_abs=5e-2,
     )
 
 
@@ -2058,7 +2206,12 @@ def run_flydsl_fmha_optest(
             msg=f"{name}: {shape}",
         )
         _optest_assert_gfx1201_quality(
-            result, ref, head_dim=head_dim, minimum=minimum, mean=mean
+            result,
+            ref,
+            head_dim=head_dim,
+            minimum=minimum,
+            mean=mean,
+            max_abs=2e-1 if is_fp8 else 5e-2,
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
