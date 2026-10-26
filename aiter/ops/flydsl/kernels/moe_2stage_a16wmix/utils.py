@@ -50,10 +50,6 @@ def _global_i32_at(addr_i64, idx):
     return global_typed_ptr(addr_i64, T.i32)[idx]
 
 
-def _global_f32_at(addr_i64, idx):
-    return fx.Float32(global_typed_ptr(addr_i64, T.f32)[idx])
-
-
 def _buffer_i32_scalar_read(tiles1, idx, atom):
     """Read one i32 dword at element ``idx`` from a ``_global_i32_buffer_tiles(..., 1)``
     view via the layout-API BufferCopy atom (buffer_load_dword; OOB-clamped by the

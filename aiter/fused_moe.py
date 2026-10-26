@@ -857,8 +857,8 @@ def _stage2_honors_runtime_reduce_override(stage2: Callable) -> bool:
             "Runtime reduce overrides require a recognized FlyDSL stage2 "
             f"kernel, got {kernel_name!r}"
         )
-    # The a16w-mix launcher returns before the environment override: it follows
-    # only its configured kernel mode.
+    # The a16w-mix launcher returns before the environment override. MXFP4
+    # always atomically scatters; INT4 follows only its configured kernel mode.
     return not (
         parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") in ("fp4", "int4")
     )
@@ -871,6 +871,12 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
     if _is_flydsl_stage2(func):
         parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
         if parsed is None:
+            return False
+        # a16w4 (bf16 A x mxfp4 W) down-proj only supports atomic scatter into a
+        # pre-zeroed buffer; the ported gemm2 launcher ignores the kernelName's
+        # mode, so a "reduce"-named a16w4 config must still get accumulate=True
+        # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here.
+        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") == "fp4":
             return False
         return parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
@@ -1125,13 +1131,12 @@ def fused_moe(
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
     ``deterministic=True`` gives bitwise the same output for a token whatever the
-    batch, and from run to run: no atomic accumulation, no split-K, bf16
-    activations and one tile configuration for every token count. It is
-    supported for bf16 activations x MXFP4 weights (``QuantType.per_1x32``,
-    separated gate/up, preshuffled), SwiGLU or SiTUv2, bf16 output, without
-    expert parallelism, and is slower than the default. Its kernels (block_m 32,
-    reduce epilogue) are not in the tuned configs, so AOT precompilation does not
-    cover them and they are JIT-compiled on first use.
+    batch, and from run to run: MXFP4 activations at every token count, the
+    FlyDSL kernels with one K structure for every token count, no split-K, and
+    the non-atomic reduce epilogue in stage 2 (the top-k partials are summed in
+    a fixed order). It is supported on gfx950 for MXFP4 weights
+    (``QuantType.per_1x32``, separated gate/up, preshuffled) with SwiGLU, bf16
+    output, without expert parallelism.
 
     Supplying any shared tensor (or ``shared_expert_id``) requires all four
     shared weight/scale tensors and dispatches through the gfx950 FHMoE path.
@@ -1551,10 +1556,14 @@ def _fused_moe_impl(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_size_M=block_size_M,
+            tokens=M,
         )
         # The default picks the activation dtype by token count (bf16, then
-        # fp8/fp4 above a bound), which would make results depend on the batch.
-        q_dtype_a = dtypes.bf16
+        # fp4 above a bound), which would make results depend on the batch.
+        # Deterministic mode quantizes the activations to MXFP4 at every token
+        # count: the quantization is per 1x32 block within a token's row, so a
+        # row's result does not depend on the other rows.
+        q_dtype_a = dtypes.fp4x2
 
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
@@ -1639,10 +1648,7 @@ def _fused_moe_impl(
                     f"(gfx={get_gfx()!r})"
                 ),
             ),
-            (
-                (bias1 is not None or bias2 is not None) and not deterministic,
-                "per-expert bias",
-            ),
+            (bias1 is not None or bias2 is not None, "per-expert bias"),
             (expert_mask is not None, "expert-parallel masking"),
             (
                 not (isShuffled and isG1U1 and not doweight_stage1),
@@ -1658,9 +1664,9 @@ def _fused_moe_impl(
         activation, beta, linear_beta, swiglu_limit
     )
 
-    def _resolve_metadata(disable_inline_sort=False):
+    def _resolve_metadata(disable_inline_sort=False, tokens=None):
         metadata = get_2stage_cfgs(
-            get_padded_M(M),
+            get_padded_M(M if tokens is None else tokens),
             model_dim,
             inter_dim,
             E,
@@ -1698,11 +1704,8 @@ def _fused_moe_impl(
         )
 
     if deterministic:
-        metadata = _deterministic_a16w4_metadata(
-            inter_dim=inter_dim,
-            activation=activation,
-            hidden_pad=hidden_pad,
-            intermediate_pad=intermediate_pad,
+        metadata = _deterministic_metadata(
+            _resolve_metadata(tokens=_DETERMINISTIC_TEMPLATE_TOKENS), M
         )
     else:
         metadata = _resolve_metadata()
@@ -3392,11 +3395,6 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
-# One sorting block and tile size for every token count, so that neither the
-# kernels nor their tiling change with the batch.
-_DETERMINISTIC_BLOCK_M = 32
-
-
 def _check_deterministic_supported(
     *,
     dtype,
@@ -3414,6 +3412,7 @@ def _check_deterministic_supported(
     a1_scale,
     a2_scale,
     block_size_M,
+    tokens,
 ):
     """Raise NotImplementedError naming what fused_moe(deterministic=True) cannot run."""
     unsupported = [
@@ -3424,20 +3423,20 @@ def _check_deterministic_supported(
                 f"weights other than MXFP4 ({quant_type!s}, {q_dtype_w})",
             ),
             (
-                q_dtype_a is not None and q_dtype_a != dtypes.bf16,
-                f"activation dtype {q_dtype_a} (bf16 only)",
+                q_dtype_a is not None and q_dtype_a != dtypes.fp4x2,
+                f"activation dtype {q_dtype_a} (MXFP4 only)",
             ),
             (dtype != dtypes.bf16, f"output dtype {dtype} (bf16 only)"),
             (
-                # SiLU would take the MXFP4 activation-quantization path before both
-                # stages instead of the bf16 inputs these kernels read.
-                activation not in (ActivationType.Swiglu, ActivationType.Situv2),
-                f"activation {activation!s}",
+                # SwiGLU is where the default also uses MXFP4 activations (from 256
+                # tokens); SiTUv2's default keeps bf16 activations.
+                activation != ActivationType.Swiglu,
+                f"activation {activation!s} (SwiGLU only)",
             ),
             (gate_mode != GateMode.SEPARATED, f"gate_mode={gate_mode.value!r}"),
             (
                 not _flydsl_mxfp4_layout_is_compatible(
-                    dtypes.bf16, gate_mode, gate_up_interleave
+                    dtypes.fp4x2, gate_mode, gate_up_interleave
                 ),
                 "gate/up-interleaved weights (the separated preshuffle only)",
             ),
@@ -3453,13 +3452,10 @@ def _check_deterministic_supported(
             ),
             (
                 block_size_M is not None
-                and int(block_size_M) != _DETERMINISTIC_BLOCK_M,
-                f"block_size_M={block_size_M} (uses {_DETERMINISTIC_BLOCK_M})",
+                and int(block_size_M) != _deterministic_block_m(tokens),
+                f"block_size_M={block_size_M} (uses {_deterministic_block_m(tokens)})",
             ),
-            (
-                get_gfx_runtime() not in ("gfx942", "gfx950"),
-                f"gfx={get_gfx_runtime()!r}",
-            ),
+            (get_gfx_runtime() != "gfx950", f"gfx={get_gfx_runtime()!r}"),
         )
         if bad
     ]
@@ -3469,52 +3465,47 @@ def _check_deterministic_supported(
         )
 
 
-def _deterministic_a16w4_metadata(
-    *, inter_dim, activation, hidden_pad, intermediate_pad
-):
-    """FlyDSL a16w4 kernels with the non-atomic reduce epilogue and no split-K."""
-    from aiter.ops.flydsl.moe_kernels import (
-        flydsl_kernel_name,
-        get_flydsl_kernel_params,
-        pick_flydsl_stage2_tile_k,
-    )
+# The tuned MXFP4 configurations change the stage-1 K waves, the fused fp4 output
+# and the stage-2 kernel family (v1 / v2 layout, tile_k 128 / 256) with the token
+# count, and each changes how a row's sums are split. Deterministic mode keeps the
+# configuration of this token count at every M and only grows the tile height,
+# which does not change a row's reduction.
+_DETERMINISTIC_TEMPLATE_TOKENS = 32
 
-    out_type = "bf16"  # the reduce epilogue stores bf16 only
-    block_m = _DETERMINISTIC_BLOCK_M
-    kn1 = flydsl_kernel_name(1, "bf16", "fp4", out_type, block_m, 128, 256)
-    kn2 = flydsl_kernel_name(
-        2,
-        "bf16",
-        "fp4",
-        out_type,
-        block_m,
-        128,
-        pick_flydsl_stage2_tile_k(inter_dim),
-        "reduce",
+
+def _deterministic_block_m(tokens: int) -> int:
+    return 32 if tokens <= 1024 else (64 if tokens <= 2048 else 128)
+
+
+def _deterministic_metadata(template, tokens):
+    """The template configuration with a fixed K structure, made deterministic.
+
+    Stage 1: FlyDSL a4w4 with two K waves and tile_k 256; stage 2: the
+    non-atomic reduce epilogue instead of atomic adds of the top-k partials; no
+    split-K. The tile height follows the token count.
+    """
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    block_m = _deterministic_block_m(tokens)
+    names = (
+        f"flydsl_moe1_afp4_wfp4_bf16_t{block_m}x128x256_w2",
+        f"flydsl_moe2_afp4_wfp4_bf16_t{block_m}x128x256_reduce",
     )
-    for kn in (kn1, kn2):
-        params = get_flydsl_kernel_params(kn)
-        assert params is not None, f"unregistered FlyDSL kernel {kn}"
-        assert params.get("k_batch", 1) == 1, f"{kn} uses split-K"
-    return MOEMetadata(
-        functools.partial(
-            _flydsl_stage1_wrapper,
-            kernelName=kn1,
-            activation=activation,
-            inter_dim_pad=intermediate_pad,
-            model_dim_pad=hidden_pad,
-        ),
-        functools.partial(
-            _flydsl_stage2_wrapper,
-            kernelName=kn2,
-            inter_dim_pad=intermediate_pad,
-            model_dim_pad=hidden_pad,
-        ),
-        block_m,
-        -1,  # no split-K
-        False,
-        has_bias=True,
-        stage2_has_bias=True,
+    stages = []
+    for stage, name in zip((template.stage1, template.stage2), names):
+        kw = getattr(stage, "keywords", None) or {}
+        tuned = kw.get("kernelName", "")
+        if not tuned.startswith("flydsl_moe") or "_layout_" in tuned:
+            raise NotImplementedError(
+                f"fused_moe(deterministic=True) needs the FlyDSL v1 MoE kernels, "
+                f"got {tuned or stage!r}"
+            )
+        params = get_flydsl_kernel_params(name)
+        if params is None or params.get("k_batch", 1) != 1:
+            raise NotImplementedError(f"{name} is not registered without split-K")
+        stages.append(functools.partial(stage.func, **{**kw, "kernelName": name}))
+    return replace(
+        template, stage1=stages[0], stage2=stages[1], block_m=block_m, ksplit=-1
     )
 
 
