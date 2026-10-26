@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """AOT pre-compilation for the gfx942 FlyDSL fp8 unified-attention kernels.
 
 No tuning CSV: the builder is keyed by layer shape, page size, K/V strides and
-decode-only, so the reachable set is finite. Per shape in ``DEFAULT_SHAPES``:
-every served page size x two K/V layouts (separate contiguous caches; vLLM's
-views of one ``[blocks, kv_heads, page, 2 * head_dim]`` cache) x the unified
-and decode-only builds, plus two combine kernels per (head dim, query heads),
-for decode splits and for a lone chunk's KV splits. Each job calls the
-adapter's builders with its arguments under ``FakeTensorMode`` +
-``COMPILE_ONLY=1``, on fake tensors whose dtypes, ranks and strides match the
-runtime call.
+decode-only. Per shape in ``DEFAULT_SHAPES``: every served page size x the two
+canonical K/V layouts (separate contiguous caches; vLLM's views of one
+``[blocks, kv_heads, page, 2 * head_dim]`` cache) x the unified and
+decode-only builds, plus two combine kernels per (head dim, query heads), for
+decode splits and for a lone chunk's KV splits. Other K/V strides the support
+gate accepts, such as padded caches, build different keys: they compile
+just-in-time, and under ``FLYDSL_RUNTIME_RUN_ONLY=1`` the gate sends them to
+Triton. Each job calls the adapter's builders with its arguments under
+``FakeTensorMode`` + ``COMPILE_ONLY=1``, on fake tensors whose dtypes, ranks
+and strides match the runtime call.
 
 Usage:
     python -m aiter.aot.flydsl.unified_attention
@@ -38,7 +40,6 @@ AOT_ARCH = "gfx942"
 DEFAULT_SHAPES = {
     "gemma4_31b_tp1": [(32, 4, 512, None), (32, 16, 256, 1024)],
 }
-LAYOUTS = ("plain", "vllm")
 # The adapter builds decode-only batches (max_seqlen_q == 1) separately.
 MODES = ("unified", "decode")
 # Fake geometry: only dtypes, ranks and strides reach the compile key.
@@ -55,14 +56,15 @@ def _attention_name(num_heads, num_kv_heads, head_dim, window, page_size, layout
 
 
 def default_jobs(shapes: dict[str, list] = DEFAULT_SHAPES) -> list[dict]:
-    """Every attention and combine variant ``DEFAULT_SHAPES`` can reach."""
-    from aiter.ops.flydsl.unified_attention_kernels import _PAGE_SIZES
+    """Attention and combine kernels for the two canonical cache layouts of
+    each listed layer shape."""
+    from aiter.ops.flydsl.unified_attention_kernels import _PAGE_SIZES, KV_LAYOUTS
 
     jobs = []
     for entries in shapes.values():
         for num_heads, num_kv_heads, head_dim, window in entries:
             for page_size in _PAGE_SIZES:
-                for layout in LAYOUTS:
+                for layout in KV_LAYOUTS:
                     for mode in MODES:
                         jobs.append(
                             {

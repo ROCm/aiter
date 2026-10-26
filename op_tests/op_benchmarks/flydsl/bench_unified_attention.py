@@ -5,11 +5,12 @@
 
 Times the FlyDSL kernel directly (past the dispatch cede rule; never the router
 or Triton fallback) against aiter's Triton ``unified_attention`` on Gemma-4's
-two layer shapes. Triton reads this tree's table, or a ``DEFAULT.json`` given
-with ``--triton-config`` (e.g. ROCm/aiter #5650's). That flag also times this
-tree's table and reports it as ``triton``. The gate stays on the given table.
+two layer shapes. Triton reads this tree's table, or another ``DEFAULT.json``
+given with ``--triton-config``, such as a table tuned at another revision.
+That flag also times this tree's table and reports it as ``triton``. The gate
+stays on the given table.
 
-Suites: ``acceptance`` (default, the PR evidence) runs prefill at 1K-32K,
+Suites: ``acceptance`` (default) runs prefill at 1K-32K,
 decode at context 32K with batch 1/16/64/128, a q256 prefix chunk at 16K and
 two mixed prompt-or-chunk + decode steps, on random and sink-like data;
 ``stress`` is a broad matrix; ``quick`` a short random-data check. --isl,
@@ -22,9 +23,10 @@ candidate is captured once into a HIP graph; replays alternate, each sample at
 least 2 ms, and the median per-call time is reported, without host launch
 overhead (as in vLLM's graph-captured decode).
 
-Gates per page: FlyDSL agrees with Triton within --tolerance (NaN fails) and
-FlyDSL / Triton time is within --margin, in every cell; --enforce-bar exits
-nonzero on a miss. The independent fp32 oracle is
+Gates per page: FlyDSL agrees with Triton within --tolerance of the cell's
+max |Triton| and within --row-tolerance of each (sequence, head)'s max
+|Triton| (NaN fails), and FlyDSL / Triton time is within --margin, in every
+cell; --enforce-bar exits nonzero on a miss. The independent fp32 oracle is
 op_tests/test_unified_attention.py; this does not replace model E2E.
 
 Output: markdown on stdout (a table per page, rows as they finish, then step
@@ -32,9 +34,9 @@ geomeans and gates) and a CSV of every cell (-o, default under aiter_logs/).
 
 Usage, from the repo root (``-m`` puts it on sys.path for ``op_tests``):
 
-    # Acceptance grid against #5650's table, failing on any FlyDSL miss
+    # Acceptance grid against another tuned table, failing on any FlyDSL miss
     python -m op_tests.op_benchmarks.flydsl.bench_unified_attention \\
-        --triton-config pr5650/DEFAULT.json --enforce-bar | tee report.md
+        --triton-config tuned/DEFAULT.json --enforce-bar | tee report.md
 
     # Page 64 decode only, against this tree's table
     python -m op_tests.op_benchmarks.flydsl.bench_unified_attention \\
@@ -69,7 +71,7 @@ from aiter.ops.triton.attention.unified_attention import (
     unified_attention as triton_unified_attention,
 )
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
-from op_tests.test_unified_attention import SHAPES
+from op_tests.test_unified_attention import SHAPES, row_max
 
 FP8 = torch.float8_e4m3fnuz
 # N(0, 1) values are scaled into FNUZ range (max 240); the descale undoes it.
@@ -343,12 +345,15 @@ def time_round_robin(fns, sets, iters):
     return {name: statistics.median(times) for name, times in samples.items()}
 
 
-def diff_vs(got, want):
-    """max |got - want| / max |want|; inf when either holds a NaN or inf."""
+def diff_vs(got, want, query_lens):
+    """max |got - want| over max |want| of the cell and of each element's
+    (sequence, head); both inf when either tensor holds a NaN or inf."""
     got, want = got.float(), want.float()
     if not (torch.isfinite(got).all() and torch.isfinite(want).all()):
-        return math.inf
-    return ((got - want).abs().max() / want.abs().max()).item()
+        return math.inf, math.inf
+    diff = (got - want).abs()
+    rows = row_max(want, query_lens).clamp(min=torch.finfo(torch.float32).tiny)
+    return (diff.max() / want.abs().max()).item(), (diff / rows).max().item()
 
 
 def bench_cell(kind, label, specs, shape, layer, page, data, args, baselines):
@@ -366,7 +371,7 @@ def bench_cell(kind, label, specs, shape, layer, page, data, args, baselines):
     with triton_table(baselines[0][1]):
         run_triton(first, out_t, layer)
     torch.cuda.synchronize()
-    diff = diff_vs(out_f, out_t)
+    diff, row_diff = diff_vs(out_f, out_t, [q for q, _ in specs])
     fns = {
         "flydsl": (
             contextlib.nullcontext,
@@ -397,6 +402,7 @@ def bench_cell(kind, label, specs, shape, layer, page, data, args, baselines):
         row[f"triton_{bname}_us"] = times[bname]
         row[f"ratio_{bname}"] = times["flydsl"] / times[bname]
     row["max_diff_vs_triton"] = diff
+    row["max_row_diff_vs_triton"] = row_diff
     return row
 
 
@@ -405,7 +411,7 @@ def _md_line(cells):
 
 
 def _column_names(names):
-    """In-tree Triton first, then the extra table: triton, then pr5650."""
+    """This tree's Triton table first, then the --triton-config table."""
     return sorted(names, key=lambda name: name not in ("triton", "tree"))
 
 
@@ -496,9 +502,14 @@ def gate_failures(rows, name, args):
     for row in rows:
         where = f"{row['shape']} {row['case']} [{row['data']}] page {row['page']}"
         diff = row["max_diff_vs_triton"]
+        row_diff = row["max_row_diff_vs_triton"]
         # NaN-safe: a NaN diff fails, it does not compare false and pass.
         if not diff <= args.tolerance:
             correctness.append(f"- {where}: diff {diff:.6f} > {args.tolerance}")
+        if not row_diff <= args.row_tolerance:
+            correctness.append(
+                f"- {where}: per-row diff {row_diff:.6f} > {args.row_tolerance}"
+            )
         ratio = row[f"ratio_{name}"]
         if not ratio <= args.margin:
             performance.append(f"- {where} vs {name}: {ratio:.6f} > {args.margin:.3f}")
@@ -544,8 +555,8 @@ def parse_args():
     parser.add_argument(
         "--triton-config",
         metavar="DEFAULT.json",
-        help="Extra Triton table to compare against, besides this tree's,"
-        "\ne.g. ROCm/aiter #5650's DEFAULT.json. The gate uses this table.",
+        help="Extra Triton table to compare against, besides this tree's."
+        "\nThe gate uses this table.",
     )
     parser.add_argument(
         "--shape", choices=["full", "sliding"], nargs="+", default=["full", "sliding"]
@@ -591,6 +602,13 @@ def parse_args():
         help="max |candidate - Triton| / max |Triton| allowed per cell",
     )
     parser.add_argument(
+        "--row-tolerance",
+        type=float,
+        default=0.15,
+        help="max |candidate - Triton| / max |Triton| of the same (sequence, head);"
+        "\nthe kernels round P to FNUZ at different points, so rows differ by a few %%",
+    )
+    parser.add_argument(
         "--margin",
         type=float,
         default=1.0,
@@ -620,7 +638,7 @@ def main():
                 "--triton-config must be an existing file named DEFAULT.json"
             )
         args.triton_config = str(config_path)
-    if get_gfx() != "gfx942" or not is_flydsl_available(torch.cuda.current_device()):
+    if get_gfx() != "gfx942" or not is_flydsl_available():
         aiter.logger.warning(
             "FlyDSL unified attention needs gfx942 and FlyDSL; skipping (%s)", get_gfx()
         )
@@ -674,7 +692,7 @@ def main():
     )
     if args.suite == "acceptance" and not custom:
         print(
-            "- Scope: focused PR performance across prefill, prefix, decode and "
+            "- Scope: the acceptance workload across prefill, prefix, decode and "
             "mixed phases. Exhaustive correctness is in "
             "op_tests/test_unified_attention.py; OSL 1K belongs to model E2E. "
             "'sink' is a sharp-softmax data pattern, not the attention-sinks API.\n"

@@ -84,8 +84,10 @@ python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 The gfx942 unified-attention kernel compiles in the layer shape, page size, K/V
 strides and decode-only flag. `unified_attention` builds, per layer shape in its
 `DEFAULT_SHAPES` (`num_heads, num_kv_heads, head_dim, window`),
-every served page size for both K/V layouts (separate caches, or vLLM's views
-of one cache), in the unified and decode-only builds. It takes no `--csv`.
+every served page size for the two canonical K/V layouts (separate caches, or
+vLLM's views of one cache), in the unified and decode-only builds. It takes no
+`--csv`. Other strides, such as a padded cache, compile on first use; under
+`FLYDSL_RUNTIME_RUN_ONLY=1` they fall back to Triton.
 
 ```bash
 # Gemma-4-31B at TP1: 16 attention + 4 combine kernels

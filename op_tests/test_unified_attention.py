@@ -1,21 +1,26 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """FP8 unified attention: public dispatch and focused direct-launch regressions.
 
-Covers the FlyDSL gfx942 backend on Gemma-4's two layer shapes against an
-independent fp32 paged-attention oracle. Timings use warm, fixed buffers;
-TB/s is logical traffic, not measured HBM bandwidth. The run-only check
-covers warm JIT-cache reuse, not wheel AOT packaging. Performance against
-Triton is op_tests/op_benchmarks/flydsl/bench_unified_attention.py.
+Covers the FlyDSL gfx942 backend on Gemma-4's two layer shapes against the
+Triton suite's fp32 paged-attention oracle. Routing and support-gate checks
+run on every architecture with stubbed kernels and CPU tensors. The AOT
+matrix runs first and loads every prebuilt kernel with JIT disabled, so it
+needs the cache aiter's build writes, or one from
+``python -m aiter.aot.flydsl.unified_attention`` in ``FLYDSL_RUNTIME_CACHE_DIR``.
+Timings use warm, fixed buffers; TB/s is logical traffic, not measured HBM
+bandwidth. Performance against Triton is
+op_tests/op_benchmarks/flydsl/bench_unified_attention.py.
 """
 
 import argparse
-import importlib.util
+import importlib
 import itertools
 import os
 import sys
 from functools import partial
+from types import SimpleNamespace
 from unittest import mock
 
 import pandas as pd
@@ -27,14 +32,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import aiter
 import aiter.ops.unified_attention as ua
 from aiter import dtypes
+from aiter.aot.flydsl.common import run_only_env
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 PAGE = 64
 # Gemma-4-31B layers: (head dim, query heads, KV heads, sliding window in keys).
 SHAPES = {"full": (512, 32, 4, None), "sliding": (256, 32, 16, 1024)}
-# Max |err| against the oracle, as a fraction of max |ref|.
+# Max |err| against the oracle: TOLERANCE of the batch's max |ref|, and
+# ROW_TOLERANCE of the max |ref| of the element's own sequence and head, so a
+# row of small outputs, such as a long-context average, cannot drift or vanish.
+# Rounding P to FNUZ (half-step 2**-4 relative) costs a single row about 5%.
 TOLERANCE = 0.04
+ROW_TOLERANCE = 0.1
 # One-token sequences at the decode boundaries, plus a (0, 0) padding entry.
 DECODE_QUERY_LENS = [1] * 8 + [0]
 DECODE_KV_LENS = [1, 65, 1023, 1024, 1025, 2047, 4097, 8192, 0]
@@ -44,81 +54,6 @@ def q8(x):
     dtype = dtypes.get_dtype_fp8()
     s = x.abs().amax().clamp(min=1e-4) / torch.finfo(dtype).max
     return (x / s).to(dtype), s.reshape(1).float().to(x.device)
-
-
-def ref_paged_attn(
-    query,
-    key_cache,
-    value_cache,
-    query_lens,
-    kv_lens,
-    block_tables,
-    scale,
-    out_dtype=torch.float32,
-    sliding_window=None,
-    soft_cap=None,
-    sinks=None,
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
-    output_scale=None,
-    causal=1,
-):
-    # Local copy of the established paged oracle; never import a test suite.
-    num_seqs = len(query_lens)
-    block_tables = block_tables.cpu().numpy()
-    _, block_size, num_kv_heads, head_size = key_cache.shape
-    outputs = []
-    start_idx = 0
-    query = query.to(torch.float32)
-    key_cache = key_cache.to(torch.float32)
-    value_cache = value_cache.to(torch.float32)
-    if q_descale is not None:
-        query = query * q_descale
-    if k_descale is not None:
-        key_cache = key_cache * k_descale
-    if v_descale is not None:
-        value_cache = value_cache * v_descale
-    for i in range(num_seqs):
-        query_len = query_lens[i]
-        kv_len = kv_lens[i]
-        q = query[start_idx : start_idx + query_len]
-        q *= scale
-        num_kv_blocks = (kv_len + block_size - 1) // block_size
-        block_indices = block_tables[i, :num_kv_blocks]
-        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
-        if q.shape[1] != k.shape[1]:
-            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
-            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
-        attn = torch.einsum("qhd,khd->hqk", q, k).float()
-        empty_mask = torch.ones(query_len, kv_len, device=q.device)
-        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-        if sliding_window is not None:
-            sliding_window_mask = (
-                torch.triu(
-                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
-                )
-                .bool()
-                .logical_not()
-            )
-            mask |= sliding_window_mask
-        if soft_cap is not None and soft_cap > 0:
-            attn = soft_cap * torch.tanh(attn / soft_cap)
-        if causal:
-            attn.masked_fill_(mask, float("-inf"))
-        if sinks is not None:
-            s_aux = sinks[:, None, None].repeat_interleave(attn.shape[-2], dim=-2)
-            attn = torch.cat((attn, s_aux), dim=-1)
-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
-        if sinks is not None:
-            attn = attn[..., :-1]
-        outputs.append(torch.einsum("hqk,khd->qhd", attn, v))
-        start_idx += query_len
-    out = torch.cat(outputs, dim=0)
-    if output_scale is not None:
-        out = out / output_scale
-    return out.to(out_dtype)
 
 
 def make_case(query_lens, kv_lens, shape, page=PAGE, seed=3):
@@ -177,7 +112,14 @@ def window_of(case):
 
 
 def reference(case, query_lens, kv_lens):
-    return ref_paged_attn(
+    """The Triton suite's fp32 oracle. A query whose position is below 0 sees
+    no key; the oracle leaves its row NaN and the kernel writes zeros."""
+    # Imported here: the Triton suite reads the GPU architecture at import.
+    from op_tests.triton_tests.attention.test_unified_attention import (
+        ref_paged_attn,
+    )
+
+    want = ref_paged_attn(
         case["q"],
         case["k"],
         case["v"],
@@ -185,14 +127,19 @@ def reference(case, query_lens, kv_lens):
         kv_lens,
         case["block_table"],
         case["softmax_scale"],
+        torch.float32,
+        sliding_window=window_of(case),
+        soft_cap=case["softcap"],
         q_descale=case["q_descale"],
         k_descale=case["k_descale"],
         v_descale=case["v_descale"],
         causal=case["causal"],
-        soft_cap=case["softcap"],
-        sinks=case.get("sinks"),
-        sliding_window=window_of(case),
     )
+    start = 0
+    for q_len, kv_len in zip(query_lens, kv_lens):
+        want[start : start + max(0, q_len - kv_len)] = 0
+        start += q_len
+    return want
 
 
 def interleave_kv(k, v):
@@ -258,22 +205,58 @@ def flydsl_candidate(case, kv_lens):
 def attended_pairs(query_lens, kv_lens, window):
     pairs = 0
     for q_len, kv_len in zip(query_lens, kv_lens):
-        for pos in range(kv_len - q_len, kv_len):
+        for pos in range(max(0, kv_len - q_len), kv_len):
             pairs += pos + 1 if window is None else min(pos + 1, window)
     return pairs
 
 
-def compare(want, got, atol, name):
-    want, got = want.float(), got.float()
-    err = checkAllclose(want, got, rtol=0, atol=atol, tol_err_ratio=0, msg=name)
-    assert err == 0, f"{name}: {err:.3%} elements exceed atol={atol}"
+def row_max(ref, query_lens):
+    """Each element's (sequence, head) max |ref|."""
+    ref = ref.float().abs()
+    peak = torch.zeros_like(ref)
+    start = 0
+    for q_len in query_lens:
+        if q_len:
+            rows = ref[start : start + q_len]
+            peak[start : start + q_len] = rows.amax(dim=(0, 2), keepdim=True)
+        start += q_len
+    return peak
+
+
+def allowed_err(want, query_lens):
+    """The largest error allowed at each element. A row whose reference is
+    zero, such as a query that sees no key, must be zero."""
+    cap = TOLERANCE * want.float().abs().max().item()
+    allowed = (ROW_TOLERANCE * row_max(want, query_lens)).clamp(max=cap)
+    return allowed.clamp(min=torch.finfo(torch.float32).tiny)
+
+
+def err_ratio(want, got, query_lens):
+    """max |got - want| as a fraction of the error allowed there."""
+    allowed = allowed_err(want, query_lens)
+    return ((got.float() - want.float()).abs() / allowed).max().item()
+
+
+def compare(want, got, query_lens, name):
+    allowed = allowed_err(want, query_lens)
+    err = checkAllclose(
+        want.float() / allowed,
+        got.float() / allowed,
+        rtol=0,
+        atol=1,
+        tol_err_ratio=0,
+        msg=name,
+    )
+    assert err == 0, f"{name}: {err:.3%} elements exceed the allowed error"
     return err
 
 
-def measure(candidates, case, want, query_lens, kv_lens, atol=None):
-    peak = want.float().abs().max().item()
-    if atol is None:
-        atol = TOLERANCE * peak
+def assert_same(a, b, name):
+    err = checkAllclose(a.float(), b.float(), rtol=0, atol=0, tol_err_ratio=0, msg=name)
+    assert err == 0, f"{name}: {err:.3%} elements differ"
+
+
+def measure(candidates, case, want, query_lens, kv_lens):
     _, num_heads, head_dim = case["q"].shape
     num_kv_heads = case["k"].shape[2]
     window = window_of(case)
@@ -287,18 +270,37 @@ def measure(candidates, case, want, query_lens, kv_lens, atol=None):
     ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         got = fn()
-        err = compare(want, got, atol, name)
-        ret[f"{name} max err / max ref"] = (
-            got.float() - want.float()
-        ).abs().max().item() / peak
+        err = compare(want, got, query_lens, name)
+        ret[f"{name} max err / allowed"] = err_ratio(want, got, query_lens)
         _, us = run_perftest(fn, num_rotate_args=1)
         assert us > 0, f"{name}: empty timing"
-        compare(want, got, atol, f"{name} after timing")
+        compare(want, got, query_lens, f"{name} after timing")
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+@benchmark()
+def test_aot_matrix(shape, page, layout, path):
+    """Every prebuilt attention and combine kernel loads with JIT disabled.
+
+    Runs before the other cases: a launcher this process already compiled
+    returns before FlyDSL's run-only cache check.
+    """
+    if path == "prefill":
+        # A prefix chunk: the unified build, and its KV splits' combine.
+        query_lens, kv_lens = [64], [1024]
+    else:
+        query_lens, kv_lens = [1] * 4, [1024] * 4
+    case = make_case(query_lens, kv_lens, shape, page=page, seed=23)
+    want = reference(case, query_lens, kv_lens)
+    if layout == "vllm":
+        case["k"], case["v"] = interleave_kv(case["k"], case["v"])
+    call = direct_candidate(case, kv_lens)
+    with run_only_env():
+        return measure({"aot_run_only": call}, case, want, query_lens, kv_lens)
 
 
 @benchmark()
@@ -317,7 +319,15 @@ def test_decode(shape, page, layout):
     if layout == "vllm":
         case["k"], case["v"] = interleave_kv(case["k"], case["v"])
     candidates = {"flydsl": flydsl_candidate(case, DECODE_KV_LENS)}
-    return measure(candidates, case, want, DECODE_QUERY_LENS, DECODE_KV_LENS)
+    ret = measure(candidates, case, want, DECODE_QUERY_LENS, DECODE_KV_LENS)
+    # The 4097- and 8192-key rows are small next to the one-key rows; losing
+    # them must still fail the comparison.
+    lost = case["out"].clone()
+    lost[6:8] = 0
+    assert (
+        err_ratio(want, lost, DECODE_QUERY_LENS) > 1
+    ), "the comparison accepted zeroed long-context rows"
+    return ret
 
 
 @benchmark()
@@ -345,11 +355,31 @@ def test_mixed_batch(shape, page, scale):
 
 
 @benchmark()
-def test_cross_attention_mask(shape, query_len, kv_len):
-    case = make_case([query_len], [kv_len], shape)
-    want = reference(case, [query_len], [kv_len])
-    candidates = {"flydsl": flydsl_candidate(case, [kv_len])}
-    return measure(candidates, case, want, [query_len], [kv_len])
+def test_no_visible_key(shape, path):
+    """Queries at positions below 0 see no key and write zeros: a prefill
+    longer than its KV, or a decode with no KV. The blind sequence comes
+    first, behind a block-table entry and unused entries that name an
+    out-of-range page, so K/V loaded through column -1 faults."""
+    if path == "prefill":
+        query_lens, kv_lens = [64, 64], [1, 1024]
+    else:
+        query_lens, kv_lens = [1, 1], [0, 77]
+    case = make_case(query_lens, kv_lens, shape)
+    want = reference(case, query_lens, kv_lens)
+    table = case["block_table"]
+    storage = torch.full(
+        (table.numel() + 1,), 1 << 30, device=table.device, dtype=table.dtype
+    )
+    case["block_table"] = storage[1:].view(table.shape)
+    page = case["k"].shape[1]
+    for i, kv_len in enumerate(kv_lens):
+        used = -(-kv_len // page)
+        case["block_table"][i, :used] = table[i, :used]
+    candidates = {"flydsl": flydsl_candidate(case, kv_lens)}
+    ret = measure(candidates, case, want, query_lens, kv_lens)
+    blind = query_lens[0] - kv_lens[0]
+    assert (case["out"][:blind] == 0).all(), "a query that sees no key is not zero"
+    return ret
 
 
 @benchmark()
@@ -383,66 +413,10 @@ def test_overestimated_max_seqlen_q(shape):
         case["q"].shape, float("nan"), device="cuda", dtype=dtypes.bf16
     )
     got = direct_candidate(case, kv_lens)()
-    compare(want, got[:1], TOLERANCE * want.abs().max().item(), "padded direct launch")
+    compare(want, got[:1], query_lens, "padded direct launch")
     assert torch.isnan(got[1:]).all(), "padded query rows were written"
-    ret["padded direct max err / max ref"] = (
-        (got[:1].float() - want.float()).abs().max() / want.abs().max()
-    ).item()
+    ret["padded direct max err / allowed"] = err_ratio(want, got[:1], query_lens)
     return ret
-
-
-@benchmark()
-def test_window_boundary():
-    """The key at pos-window is excluded; pos-window+1 is included."""
-    values = {}
-    for name, key, expected in (
-        ("excluded", 0, 0.0),
-        ("included", 1, 1.0),
-    ):
-        query_lens, kv_lens = [1], [1025]
-        case = make_case(query_lens, kv_lens, "sliding")
-        case["q"].fill_(4)
-        case["k"].zero_()
-        case["v"].zero_()
-        case["q_descale"].fill_(1)
-        case["k_descale"].fill_(1)
-        case["v_descale"].fill_(1)
-        case["softmax_scale"] = 1.0
-        page = case["k"].shape[1]
-        physical_page = int(case["block_table"][0, key // page])
-        case["k"][physical_page, key % page].fill_(4)
-        case["v"][physical_page, key % page].fill_(1)
-        want = reference(case, query_lens, kv_lens)
-        got = ua.unified_attention(**case, backend="flydsl")
-        compare(want, got, 0.01, f"window boundary {name}")
-        observed = got.float().mean().item()
-        assert abs(observed - expected) < 0.01, (name, observed)
-        values[name] = observed
-
-    # Prefill positions 1024..1027 have left edges 1..4. A dominant key at 1
-    # must affect only the first query, including through prefill KV splits.
-    query_lens, kv_lens = [4], [1028]
-    case = make_case(query_lens, kv_lens, "sliding")
-    case["q"].fill_(4)
-    case["k"].zero_()
-    case["v"].zero_()
-    case["q_descale"].fill_(1)
-    case["k_descale"].fill_(1)
-    case["v_descale"].fill_(1)
-    case["softmax_scale"] = 1.0
-    page = case["k"].shape[1]
-    physical_page = int(case["block_table"][0, 1 // page])
-    case["k"][physical_page, 1 % page].fill_(4)
-    case["v"][physical_page, 1 % page].fill_(1)
-    want = reference(case, query_lens, kv_lens)
-    got = ua.unified_attention(**case, backend="flydsl")
-    compare(want, got, 0.01, "window boundary prefill")
-    first = got[0].float().mean().item()
-    rest = got[1:].float().abs().max().item()
-    assert abs(first - 1.0) < 0.01 and rest < 0.01, (first, rest)
-    values["prefill first"] = first
-    values["prefill rest max"] = rest
-    return {"gfx": get_gfx_runtime(), **values}
 
 
 def nan_workspace(device, numel):
@@ -451,12 +425,12 @@ def nan_workspace(device, numel):
     return torch.full((numel,), float("nan"), device=device, dtype=torch.float32)
 
 
-def check_on_nan_workspace(launch, case, want, name):
+def check_on_nan_workspace(launch, case, want, query_lens, name):
     """Every split must write its partial before a combine reads it."""
     from aiter.ops.flydsl import unified_attention_kernels as adapter
 
     with mock.patch.object(adapter, "_workspace", nan_workspace):
-        compare(want, launch(), TOLERANCE * want.float().abs().max().item(), name)
+        compare(want, launch(), query_lens, name)
     case["out"].fill_(float("nan"))
 
 
@@ -465,7 +439,9 @@ def test_splitk_combine(shape, splits):
     case = make_case(DECODE_QUERY_LENS, DECODE_KV_LENS, shape)
     want = reference(case, DECODE_QUERY_LENS, DECODE_KV_LENS)
     launch = direct_candidate(case, DECODE_KV_LENS, splits)
-    check_on_nan_workspace(launch, case, want, f"{splits} splits on a NaN workspace")
+    check_on_nan_workspace(
+        launch, case, want, DECODE_QUERY_LENS, f"{splits} splits on a NaN workspace"
+    )
     ret = measure({"splitk": launch}, case, want, DECODE_QUERY_LENS, DECODE_KV_LENS)
     ret["splits run"] = splits
     return ret
@@ -481,7 +457,9 @@ def test_prefill_splits(shape, page, chunk, splits):
     want = reference(case, query_lens, kv_lens)
     case["k"], case["v"] = interleave_kv(case["k"], case["v"])
     launch = direct_candidate(case, kv_lens, prefill_splits=splits)
-    check_on_nan_workspace(launch, case, want, "prefill splits on a NaN workspace")
+    check_on_nan_workspace(
+        launch, case, want, query_lens, "prefill splits on a NaN workspace"
+    )
     ret = measure({"prefill_splits": launch}, case, want, query_lens, kv_lens)
     ret["splits run"] = splits or "planned"
     return ret
@@ -518,10 +496,9 @@ def test_paged_addressing(shape, boundary_gib, layout):
         cases[name] = case
         candidates[name] = direct_candidate(case, kv_lens)
     ret = measure(candidates, cases["identity"], want, query_lens, kv_lens)
-    compare(
+    assert_same(
         cases["identity"]["out"],
         cases["reversed"]["out"],
-        0,
         "page permutation invariance",
     )
     ret["K pool GiB"] = cases["identity"]["k"].numel() / 2**30
@@ -580,159 +557,223 @@ def test_token_stride_overflow(shape):
     return ret
 
 
-@benchmark()
-def test_routing_backend_gate(config):
-    import aiter.ops.flydsl.unified_attention_kernels as adapter
-
-    if config == "ceded decode":
-        query_lens, kv_lens = [1] * 2, [1024] * 2
-        case = make_case(query_lens, kv_lens, "full")
-    elif config == "short prefill":
-        query_lens, kv_lens = [256], [256]
-        case = make_case(query_lens, kv_lens, "full")
-    elif config == "page32 sliding decode":
-        query_lens, kv_lens = [1] * 48, [32] * 48
-        case = make_case(query_lens, kv_lens, "sliding", page=32)
-    elif config == "untuned shape":
-        query_lens, kv_lens = [768, 1], [768, 700]
-        case = make_case(query_lens, kv_lens, "sliding")
-        # The generic kernel can build this shape, but automatic dispatch is
-        # intentionally limited to Gemma-4's validated layer/window tuples.
-        case["window_size"] = (-1, -1)
-    else:
-        query_lens, kv_lens = [768, 1], [768, 700]
-        case = make_case(query_lens, kv_lens, "sliding")
-    if config == "softcap":
-        case["softcap"] = 30.0
-    elif config == "sinks":
-        case["sinks"] = torch.zeros(case["q"].shape[1], device="cuda")
-    want = reference(case, query_lens, kv_lens)
-    explicit = partial(ua.unified_attention, **case, backend="flydsl")
-    if config != "supported":
-        try:
-            explicit()
-        except RuntimeError as exc:
-            assert "does not support this configuration" in str(exc)
-        else:
-            raise AssertionError("explicit FlyDSL silently accepted a declined config")
-    real = adapter.flydsl_unified_attention
-    with mock.patch.object(adapter, "flydsl_unified_attention", wraps=real) as spy:
-        auto = ua.unified_attention(**case).clone()
-        assert spy.call_count > 0, "automatic dispatch never offered the call to FlyDSL"
-    compare(want, auto, TOLERANCE * want.abs().max().item(), "automatic routing")
-    candidates = {"triton": partial(ua.unified_attention, **case, backend="triton")}
-    with mock.patch.object(
-        adapter,
-        "flydsl_unified_attention",
-        side_effect=AssertionError("explicit backend selected FlyDSL"),
+def check_window_boundary():
+    """The key at pos - window is excluded and pos - window + 1 included, in
+    decode and through prefill KV splits."""
+    for name, key, expected in (
+        ("excluded", 0, 0.0),
+        ("included", 1, 1.0),
     ):
-        ret = measure(candidates, case, want, query_lens, kv_lens)
-        if config != "supported":
-            compare(auto, case["out"], 0, "declined config vs Triton bitwise")
-    if config == "supported":
-        ret.update(measure({"flydsl": explicit}, case, want, query_lens, kv_lens))
-    return ret
+        query_lens, kv_lens = [1], [1025]
+        case = make_case(query_lens, kv_lens, "sliding")
+        case["q"].fill_(4)
+        case["k"].zero_()
+        case["v"].zero_()
+        case["q_descale"].fill_(1)
+        case["k_descale"].fill_(1)
+        case["v_descale"].fill_(1)
+        case["softmax_scale"] = 1.0
+        page = case["k"].shape[1]
+        physical_page = int(case["block_table"][0, key // page])
+        case["k"][physical_page, key % page].fill_(4)
+        case["v"][physical_page, key % page].fill_(1)
+        want = reference(case, query_lens, kv_lens)
+        got = ua.unified_attention(**case, backend="flydsl")
+        compare(want, got, query_lens, f"window boundary {name}")
+        observed = got.float().mean().item()
+        assert abs(observed - expected) < 0.01, (name, observed)
+
+    # Prefill positions 1024..1027 have left edges 1..4. A dominant key at 1
+    # must affect only the first query, including through prefill KV splits.
+    query_lens, kv_lens = [4], [1028]
+    case = make_case(query_lens, kv_lens, "sliding")
+    case["q"].fill_(4)
+    case["k"].zero_()
+    case["v"].zero_()
+    case["q_descale"].fill_(1)
+    case["k_descale"].fill_(1)
+    case["v_descale"].fill_(1)
+    case["softmax_scale"] = 1.0
+    page = case["k"].shape[1]
+    physical_page = int(case["block_table"][0, 1 // page])
+    case["k"][physical_page, 1 % page].fill_(4)
+    case["v"][physical_page, 1 % page].fill_(1)
+    want = reference(case, query_lens, kv_lens)
+    got = ua.unified_attention(**case, backend="flydsl")
+    compare(want, got, query_lens, "window boundary prefill")
+    first = got[0].float().mean().item()
+    rest = got[1:].float().abs().max().item()
+    assert abs(first - 1.0) < 0.01 and rest < 0.01, (first, rest)
+    aiter.logger.info("window boundary checks: passed")
 
 
-def test_cede_policy():
+def router_case(
+    shape="full", page=PAGE, query_lens=(1, 1), kv_lens=(4096, 4096), **overrides
+):
+    """A supported call on CPU tensors; only the gate and the cede policy read it."""
+    head_dim, num_heads, num_kv_heads, window = SHAPES[shape]
+    tokens, blocks, fp8 = sum(query_lens), 4, torch.float8_e4m3fnuz
+    case = {
+        "q": torch.zeros(tokens, num_heads, head_dim, dtype=fp8),
+        "k": torch.zeros(blocks, page, num_kv_heads, head_dim, dtype=fp8),
+        "v": torch.zeros(blocks, page, num_kv_heads, head_dim, dtype=fp8),
+        "out": torch.zeros(tokens, num_heads, head_dim, dtype=torch.bfloat16),
+        "cu_seqlens_q": torch.tensor(
+            [0, *itertools.accumulate(query_lens)], dtype=torch.int32
+        ),
+        "max_seqlen_q": max(query_lens),
+        "seqused_k": torch.tensor(kv_lens, dtype=torch.int32),
+        "max_seqlen_k": max(kv_lens),
+        "softmax_scale": 1.0,
+        "causal": True,
+        "window_size": (-1, -1) if window is None else (window - 1, 0),
+        "block_table": torch.zeros(len(query_lens), blocks, dtype=torch.int32),
+        "softcap": 0,
+        "q_descale": torch.ones(1),
+        "k_descale": torch.ones(1),
+        "v_descale": torch.ones(1),
+    }
+    case.update(overrides)
+    return case
+
+
+def check_routing():
+    """Backend precedence, the support gate, the cede policy and the AOT
+    layouts, with stubbed kernels and CPU tensors: no GPU is needed."""
+    from aiter.aot.flydsl.unified_attention import DEFAULT_SHAPES, _fake_kv
+    from aiter.ops.flydsl import unified_attention_kernels as adapter
     from aiter.ops.flydsl.kernels.unified_attention_fp8_gfx942 import (
-        plan_num_kv_splits,
         plan_prefill_splits,
     )
-    from aiter.ops.flydsl.unified_attention_kernels import _cede_to_triton
 
-    # Lone sequences: short fresh prefills cede (through 256 tokens at head
-    # 512 or 384 at head 256). Longer ones and chunks over 4+ cached tiles are
-    # served.
-    assert _cede_to_triton(512, 256, 1, 256, 64, None)
-    assert _cede_to_triton(256, 32, 1, 32, 32, 1024)
-    assert _cede_to_triton(256, 200, 1, 300, 64, 1024)
-    assert _cede_to_triton(256, 384, 1, 384, 32, 1024)
-    assert not _cede_to_triton(256, 512, 1, 512, 32, 1024)
-    assert not _cede_to_triton(512, 384, 1, 384, 64, None)
-    assert not _cede_to_triton(512, 16, 1, 4096, 64, None)
-    assert not _cede_to_triton(256, 16, 1, 16384, 32, 1024)
-    assert not _cede_to_triton(256, 4096, 1, 4096, 32, 1024)
-    # Mixed batches keep short chunks on Triton: through 128 queries at head
-    # 512, and at head 256 through 512 on page 32 and 256 on page 64.
-    assert _cede_to_triton(512, 128, 33, 16384, 64, None)
-    assert not _cede_to_triton(512, 256, 33, 16384, 64, None)
-    assert not _cede_to_triton(512, 512, 4, 4096, 64, None)
-    assert not _cede_to_triton(512, 1024, 33, 16384, 64, None)
-    assert _cede_to_triton(256, 512, 33, 16384, 32, 1024)
-    assert not _cede_to_triton(256, 1024, 33, 16384, 32, 1024)
-    assert _cede_to_triton(256, 256, 33, 16384, 64, 1024)
-    assert not _cede_to_triton(256, 384, 33, 16384, 64, 1024)
-    # A fresh prefill never splits; a short chunk fills the GPU.
+    calls = []
+
+    def stub(name):
+        def run(q, k, v, out, *args, **kwargs):
+            calls.append(name)
+            return out
+
+        return run
+
+    def routed(arch="gfx942", env="auto", **overrides):
+        calls.clear()
+        with (
+            mock.patch.object(adapter, "get_gfx_runtime", return_value=arch),
+            mock.patch.object(ua, "_BACKEND_OVERRIDE", env),
+        ):
+            ua.unified_attention(**router_case(**overrides))
+        return calls
+
+    def raises(error, **kwargs):
+        try:
+            routed(**kwargs)
+        except error:
+            return True
+        return False
+
+    def kv(layout="plain", page=PAGE, pad=0):
+        """Full-layer K and V in a cache layout; pad widens each plain row."""
+        head_dim, _, num_kv_heads, _ = SHAPES["full"]
+        fp8 = torch.float8_e4m3fnuz
+        if layout == "plain":
+            cache = torch.zeros(4, page, num_kv_heads, head_dim + pad, dtype=fp8)
+            return {"k": cache[..., :head_dim], "v": cache[..., :head_dim]}
+        cache = torch.zeros(4, num_kv_heads, page, 2 * head_dim, dtype=fp8)
+        cache = cache.transpose(1, 2)
+        return {"k": cache[..., :head_dim], "v": cache[..., head_dim:]}
+
+    cpu = router_case()
+    assert not adapter._devices_ok(cpu["q"], cpu["k"]), "CPU tensors are served"
+    triton = SimpleNamespace(unified_attention=stub("triton"))
+    fp8 = torch.float8_e4m3fnuz
+    misaligned = torch.zeros(2 * 32 * 512 + 4, dtype=torch.bfloat16)[4:]
+    declined = {
+        "bf16 query": {"q": torch.zeros(2, 32, 512, dtype=torch.bfloat16)},
+        "per-token query descale": {"q_descale": torch.ones(2)},
+        "fp16 key descale": {"k_descale": torch.ones(1, dtype=torch.float16)},
+        "non-unit head-dim stride": {
+            "k": torch.zeros(4, PAGE, 4, 1024, dtype=fp8)[..., ::2]
+        },
+        "shuffled cache": {"shuffled_kv_cache": True},
+        "softcap": {"softcap": 30.0},
+        "sinks": {"sinks": torch.zeros(32)},
+        "8-byte aligned output": {"out": misaligned.view(2, 32, 512)},
+        "empty block table": {"block_table": torch.zeros(2, 0, dtype=torch.int32)},
+    }
+    with (
+        mock.patch.dict(
+            sys.modules, {"aiter.ops.triton.attention.unified_attention": triton}
+        ),
+        mock.patch.object(adapter, "_devices_ok", return_value=True),
+        mock.patch.object(adapter, "_launch", side_effect=stub("flydsl")),
+    ):
+        # An explicit backend beats the environment, and only a call that
+        # reads an invalid environment value raises: importing does not.
+        with mock.patch.dict(os.environ, {"AITER_UNIFIED_ATTENTION_BACKEND": "bogus"}):
+            importlib.reload(ua)
+        importlib.reload(ua)
+        assert routed() == ["flydsl"]
+        assert routed(env="triton") == ["triton"]
+        assert routed(env="flydsl", backend="triton") == ["triton"]
+        assert routed(env="bogus", backend="gluon") == ["triton"]
+        assert raises(ValueError, env="bogus")
+        assert raises(ValueError, backend="bogus")
+        # FlyDSL is built for gfx942 only.
+        assert routed(arch="gfx950") == ["triton"]
+        assert raises(RuntimeError, arch="gfx950", backend="flydsl")
+        for name, overrides in declined.items():
+            assert routed(**overrides) == ["triton"], name
+            assert raises(RuntimeError, backend="flydsl", **overrides), name
+        # Run-only mode serves only the prebuilt layouts; a padded cache
+        # (strides 67584, 2112, 528 at page 32) would miss the cache.
+        padded = kv(page=32, pad=16)
+        assert routed(**padded) == ["flydsl"]
+        with run_only_env():
+            assert routed(**padded) == ["triton"]
+            assert routed(**kv(page=32)) == ["flydsl"]
+            assert routed(**kv("vllm", page=32)) == ["flydsl"]
+        # One boundary per cede rule: tiny head-512 decode, page-32 sliding
+        # decode past 38 sequences, a short fresh prefill, and a mixed
+        # batch's short chunk.
+        assert routed(kv_lens=(1024, 1024)) == ["triton"]
+        sliding = {"shape": "sliding", "page": 32}
+        assert routed(**sliding, query_lens=(1,) * 38, kv_lens=(1024,) * 38) == [
+            "flydsl"
+        ]
+        assert routed(**sliding, query_lens=(1,) * 39, kv_lens=(1024,) * 39) == [
+            "triton"
+        ]
+        assert routed(query_lens=(256,), kv_lens=(256,)) == ["triton"]
+        assert routed(query_lens=(384,), kv_lens=(384,)) == ["flydsl"]
+        assert routed(query_lens=(128, 1), kv_lens=(16384, 4096)) == ["triton"]
+        assert routed(query_lens=(256, 1), kv_lens=(16384, 4096)) == ["flydsl"]
+    # A fresh prefill never splits its KV range; a short chunk over a long
+    # prefix does.
     assert plan_prefill_splits(4096, 4096, 4096, 32, 4, None, 512, 304) == 1
-    assert plan_prefill_splits(16, 4096, 16, 32, 4, None, 512, 304) == 38
-    assert plan_prefill_splits(256, 4096, 256, 32, 4, None, 512, 304) == 2
-    assert plan_prefill_splits(16, 4096, 16, 32, 16, 1024, 256, 304) == 7
-    # Decode cedes tiny head-512 batches, page-64 head-512 batches past 256
-    # sequences, and page-32 sliding batches past 38 sequences.
-    assert _cede_to_triton(512, 1, 2, 1024, 64, None)
-    assert not _cede_to_triton(512, 1, 16, 32768, 64, None)
-    assert not _cede_to_triton(512, 1, 128, 4096, 64, None)
-    assert not _cede_to_triton(512, 1, 256, 4096, 64, None)
-    assert _cede_to_triton(512, 1, 384, 4096, 64, None)
-    assert not _cede_to_triton(512, 1, 32, 32768, 32, None)
-    assert not _cede_to_triton(512, 1, 512, 4096, 32, None)
-    assert not _cede_to_triton(256, 1, 38, 1024, 32, 1024)
-    assert _cede_to_triton(256, 1, 39, 1024, 32, 1024)
-    assert _cede_to_triton(256, 1, 128, 32768, 32, 1024)
-    assert not _cede_to_triton(256, 1, 96, 4096, 64, 1024)
-    assert not _cede_to_triton(256, 1, 512, 4096, 64, 1024)
-    expected_splits = {24: 6, 28: 8, 32: 4, 40: 5, 48: 3, 64: 2, 80: 3, 96: 3}
-    for batch, expected in expected_splits.items():
-        assert (
-            plan_num_kv_splits(batch, 32768, 4, None, 512, decode_only=True) == expected
-        )
-    return {"gfx": get_gfx_runtime(), "policy": "passed"}
-
-
-@benchmark()
-def test_warm_cache_run_only(shape, path):
-    from aiter.aot.flydsl.common import run_only_env
-
-    query_lens, kv_lens = ([256], [256]) if path == "prefill" else ([1] * 8, [4096] * 8)
-    case = make_case(query_lens, kv_lens, shape, seed=17)
-    want = reference(case, query_lens, kv_lens)
-    call = flydsl_candidate(case, kv_lens)
-    call()
-    torch.cuda.synchronize()
-    case["out"].fill_(float("nan"))
-    # Missing artifacts must raise rather than quietly compile a replacement.
-    with run_only_env():
-        return measure({"warm_run_only": call}, case, want, query_lens, kv_lens)
-
-
-@benchmark()
-def test_aot_matrix(shape, page, layout, path):
-    """Exercise every TP1 attention AOT key under run-only mode."""
-    if path == "prefill":
-        # A prefix chunk: the unified build, and its KV splits' combine.
-        query_lens, kv_lens = [64], [1024]
-    else:
-        query_lens, kv_lens = [1] * 4, [1024] * 4
-    case = make_case(query_lens, kv_lens, shape, page=page, seed=23)
-    want = reference(case, query_lens, kv_lens)
-    if layout == "vllm":
-        case["k"], case["v"] = interleave_kv(case["k"], case["v"])
-    call = direct_candidate(case, kv_lens)
-    return measure({"aot_run_only": call}, case, want, query_lens, kv_lens)
+    assert plan_prefill_splits(16, 4096, 16, 32, 4, None, 512, 304) > 1
+    # The gate's prebuilt strides are the layouts AOT compiles.
+    for entries in DEFAULT_SHAPES.values():
+        for _, num_kv_heads, head_dim, _ in entries:
+            for page in adapter._PAGE_SIZES:
+                for layout in adapter.KV_LAYOUTS:
+                    k, v = _fake_kv(layout, page, num_kv_heads, head_dim)
+                    want = adapter.kv_layout_strides(
+                        layout, page, num_kv_heads, head_dim
+                    )
+                    assert k.stride()[:3] == v.stride()[:3] == want, (layout, page)
+    aiter.logger.info("routing and support-gate checks: passed")
 
 
 def main():
+    check_routing()
     arch = get_gfx_runtime()
     if get_gfx() != "gfx942" or arch != "gfx942":
         aiter.logger.warning(
-            "FlyDSL unified attention requires gfx942; skipping (build=%s, attached=%s)",
+            "FlyDSL unified attention requires gfx942; skipping kernel cases "
+            "(build=%s, attached=%s)",
             get_gfx(),
             arch,
         )
-        return
-    if importlib.util.find_spec("flydsl") is None:
-        aiter.logger.warning("FlyDSL unified attention requires FlyDSL; skipping")
         return
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -749,13 +790,15 @@ def main():
     )
     parser.add_argument("--splits", type=int, nargs="+", default=[1, 5, 16, 64])
     parser.add_argument("--boundary-gib", type=int, nargs="+", default=[2, 4])
-    parser.add_argument(
-        "--aot-matrix",
-        action="store_true",
-        help="exercise every TP1 page/layout/mode AOT key",
-    )
     args = parser.parse_args()
     sweeps = [
+        (
+            "TP1 AOT matrix, run-only",
+            test_aot_matrix,
+            itertools.product(
+                args.shape, args.page, args.layout, ["prefill", "decode"]
+            ),
+        ),
         ("prefill", test_prefill, itertools.product(args.shape, args.page)),
         (
             "decode",
@@ -768,16 +811,15 @@ def main():
             itertools.product(args.shape, args.page, ["1/sqrt(d)", "1 (Gemma-4)"]),
         ),
         (
-            "cross-attention mask",
-            test_cross_attention_mask,
-            itertools.product(args.shape, [320], [1024, 2000]),
+            "no visible key",
+            test_no_visible_key,
+            itertools.product(args.shape, ["prefill", "decode"]),
         ),
         (
             "overestimated max query length",
             test_overestimated_max_seqlen_q,
             itertools.product(args.shape),
         ),
-        ("window boundary", test_window_boundary, [()]),
         (
             "split-K combine",
             test_splitk_combine,
@@ -789,7 +831,7 @@ def main():
             itertools.product(
                 args.shape,
                 args.page,
-                [(16, 1500), (37, 4096), (300, 3000)],
+                [(16, 1500), (37, 4096), (300, 3000), (320, 1024)],
                 [None, 3, 8],
             ),
         ),
@@ -803,41 +845,7 @@ def main():
             test_token_stride_overflow,
             itertools.product(args.shape),
         ),
-        (
-            "routing/backend gate",
-            test_routing_backend_gate,
-            itertools.product(
-                [
-                    "supported",
-                    "softcap",
-                    "sinks",
-                    "ceded decode",
-                    "short prefill",
-                    "page32 sliding decode",
-                    "untuned shape",
-                ]
-            ),
-        ),
-        ("cede policy", test_cede_policy, [()]),
-        (
-            "warm-cache run-only (not full AOT)",
-            test_warm_cache_run_only,
-            itertools.product(args.shape, ["prefill", "decode"]),
-        ),
     ]
-    if args.aot_matrix:
-        sweeps.append(
-            (
-                "TP1 AOT matrix",
-                test_aot_matrix,
-                itertools.product(
-                    args.shape,
-                    args.page,
-                    args.layout,
-                    ["prefill", "decode"],
-                ),
-            )
-        )
     for name, fn, parameters in sweeps:
         rows = [fn(*values) for values in parameters]
         df = pd.DataFrame(rows)
@@ -846,6 +854,7 @@ def main():
             name,
             df.to_markdown(index=False, missingval=""),
         )
+    check_window_boundary()
     aiter.logger.info(
         "PASS: all unified-attention test groups; all candidate timings non-zero"
     )

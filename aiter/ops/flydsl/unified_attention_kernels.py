@@ -16,14 +16,19 @@ one-token sequences as KV splits merged by a combine launch. All-decode
 batches use a decode-only build, which writes the output itself at one split.
 A lone multi-token sequence that cannot fill the GPU splits its KV range,
 merged by a prefill combine.
+
+A query row that sees no key, because its sequence has fewer keys than its
+causal position needs (including zero keys), is written as zeros.
 """
 
 from __future__ import annotations
 
-import importlib.util
-from functools import cache, lru_cache
+from functools import cache
 
 import torch
+from flydsl.utils import env as flydsl_env
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.unified_attention_fp8_gfx942 import (
     build_unified_attention_fp8_gfx942_combine_module,
@@ -45,19 +50,26 @@ _GEMMA4_SHAPES = {
     (32, 4, 512, None),
     (32, 16, 256, 1024),
 }
+# Cache layouts AOT prebuilds: "plain" is one contiguous
+# [blocks, page, kv_heads, head_dim] cache per tensor; "vllm" is vLLM's K and
+# V views of one [blocks, kv_heads, page, 2 * head_dim] cache.
+KV_LAYOUTS = ("plain", "vllm")
 
 
-@lru_cache(maxsize=1)
-def _is_flydsl_installed() -> bool:
-    return importlib.util.find_spec("flydsl") is not None
+def kv_layout_strides(layout, page_size, num_kv_heads, head_dim):
+    """(page, token, head) element strides that K and V share in a layout."""
+    if layout == "plain":
+        return (page_size * num_kv_heads * head_dim, num_kv_heads * head_dim, head_dim)
+    return (
+        num_kv_heads * page_size * 2 * head_dim,
+        2 * head_dim,
+        page_size * 2 * head_dim,
+    )
 
 
-@cache
-def is_flydsl_available(device_index: int) -> bool:
-    if not _is_flydsl_installed():
-        return False
-    props = torch.cuda.get_device_properties(device_index)
-    return props.gcnArchName.split(":", 1)[0] == "gfx942"
+def is_flydsl_available() -> bool:
+    """The kernel is built for gfx942 only."""
+    return get_gfx_runtime() == "gfx942"
 
 
 @cache
@@ -139,7 +151,9 @@ def _geometry_ok(
     num_seqs,
 ) -> bool:
     """Head dim the kernel is built for; the GQA group divides the 16 MFMA
-    rows a wave owns; cu_seqlens covers every sequence."""
+    rows a wave owns; cu_seqlens covers every sequence. A sequence without
+    keys reads physical page 0 and block-table column 0, so neither may be
+    empty."""
     if (
         q.dim() != 3
         or k.dim() != 4
@@ -152,6 +166,7 @@ def _geometry_ok(
     _, num_query_heads, head_size = q.shape
     return (
         head_size in _HEAD_DIMS
+        and k.shape[0] > 0
         and tuple(k.shape[1:]) == (block_size, num_kv_heads, head_size)
         and num_query_heads == num_kv_heads * num_queries_per_kv
         and num_queries_per_kv > 0
@@ -159,13 +174,15 @@ def _geometry_ok(
         and cu_seqlens_q.numel() == num_seqs + 1
         and num_seqs > 0
         and block_table.shape[0] >= num_seqs
+        and block_table.shape[1] > 0
     )
 
 
 def _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
     """Contiguous Q and O. K and V may be strided views of one cache (vLLM)
     with a unit head-dim stride; their other strides are compiled in. The
-    kernel's vector loads promise 16-byte alignment to LLVM."""
+    Q/K/V vector loads and the head-512 combine's output stores promise
+    16-byte alignment to LLVM."""
     return (
         q.is_contiguous()
         and out.is_contiguous()
@@ -177,14 +194,27 @@ def _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
         and all(stride % 16 == 0 for stride in k.stride()[:3])
         and all(stride % 16 == 0 for stride in v.stride()[:3])
         and block_table.stride(1) == 1
-        and all(t.data_ptr() % 16 == 0 for t in (q, k, v))
-        and out.data_ptr() % 8 == 0
+        and all(t.data_ptr() % 16 == 0 for t in (q, k, v, out))
         and all(t.data_ptr() % 4 == 0 for t in (cu_seqlens_q, seqused_k, block_table))
     )
 
 
+def _prebuilt_ok(k, v, num_kv_heads, block_size) -> bool:
+    """FLYDSL_RUNTIME_RUN_ONLY=1 loads prebuilt kernels and never compiles,
+    so serve only the K/V strides AOT enumerates; others go to Triton."""
+    if not flydsl_env.runtime.run_only:
+        return True
+    strides = k.stride()[:3] + v.stride()[:3]
+    return any(
+        strides == 2 * kv_layout_strides(layout, block_size, num_kv_heads, k.shape[3])
+        for layout in KV_LAYOUTS
+    )
+
+
 def _gemma4_shape_ok(q, num_kv_heads, window_size) -> bool:
-    """Only route the Gemma-4 TP1 shapes covered by this ticket."""
+    """Only the Gemma-4 TP1 layer shapes: 32 query heads over 4 KV heads at
+    head dim 512 with full attention, and over 16 KV heads at head dim 256
+    with a 1024-key window."""
     window = _window_keys(window_size)
     return (q.shape[1], num_kv_heads, q.shape[2], window) in _GEMMA4_SHAPES
 
@@ -243,8 +273,7 @@ def _supported(
         v_descale,
     ):
         return False
-    device_index = q.device.index
-    if device_index is None or not is_flydsl_available(device_index):
+    if not is_flydsl_available():
         return False
     return (
         _dispatch_mode_ok(
@@ -270,6 +299,7 @@ def _supported(
             softcap, alibi_slopes, qq_bias, q_scales, output_scale, sinks
         )
         and _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table)
+        and _prebuilt_ok(k, v, num_kv_heads, block_size)
     )
 
 

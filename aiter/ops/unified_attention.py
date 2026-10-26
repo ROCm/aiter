@@ -1,12 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """Route unified attention between FlyDSL and Triton/Gluon backends."""
 
 import os
 
+_BACKENDS = ("flydsl", "triton", "gluon")
 _BACKEND_OVERRIDE = os.environ.get("AITER_UNIFIED_ATTENTION_BACKEND", "auto").lower()
-if _BACKEND_OVERRIDE not in ("auto", "flydsl", "triton", "gluon"):
-    raise ValueError(
-        "AITER_UNIFIED_ATTENTION_BACKEND must be auto, flydsl, triton or gluon"
-    )
 
 
 def unified_attention(
@@ -42,13 +42,18 @@ def unified_attention(
     ``backend=None`` tries FlyDSL, then Triton/Gluon; ``"flydsl"`` raises if
     the config is declined; ``"triton"`` and ``"gluon"`` skip FlyDSL.
     AITER_UNIFIED_ATTENTION_BACKEND=flydsl|triton|gluon replaces
-    ``backend=None`` (default: auto).
+    ``backend=None`` (default: auto). An invalid value raises only in a call
+    that reads it, so an explicit ``backend`` still works.
     """
     if backend is None and _BACKEND_OVERRIDE != "auto":
+        if _BACKEND_OVERRIDE not in _BACKENDS:
+            raise ValueError(
+                "AITER_UNIFIED_ATTENTION_BACKEND must be auto, flydsl, triton or gluon"
+            )
         backend = _BACKEND_OVERRIDE
     if backend is not None:
         backend = backend.lower()
-    if backend not in (None, "flydsl", "triton", "gluon"):
+    if backend not in (None, *_BACKENDS):
         raise ValueError(
             f"Unknown backend '{backend}', must be None, 'triton', 'gluon' or 'flydsl'"
         )
