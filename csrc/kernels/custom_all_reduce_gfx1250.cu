@@ -98,8 +98,9 @@ void dispose(fptr_t _fa)
 int64_t meta_size(int64_t world_size)
 {
     aiter::check_ngpus((int)world_size);
-    size_t ll_bytes =
-        world_size <= aiter::kLLMaxRanks ? aiter::llScratchBytes((int)world_size) : 0;
+    size_t ll_bytes = world_size <= aiter::kLLMaxRanks
+                          ? aiter::llScratchBytes((int)world_size) + aiter::kArRmsShardBytes
+                          : 0;
     return (int64_t)(aiter::kLLScratchOffset + ll_bytes);
 }
 

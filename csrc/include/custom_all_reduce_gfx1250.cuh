@@ -190,10 +190,19 @@ constexpr size_t llScratchBytes(int ngpus)
 
 // Byte offset of the LL scratch within the shared meta buffer: right after the
 // Signal struct, 128-byte aligned. The meta buffer (see meta_size()) is sized
-// kLLScratchOffset + llScratchBytes(world_size) and zero-initialized, which
-// doubles as the LL flag reset (flag 0 == cleared line).
+// kLLScratchOffset + llScratchBytes(world_size) + kArRmsShardBytes and
+// zero-initialized, which doubles as the LL flag reset (flag 0 == cleared line).
 constexpr size_t kLLScratchOffset =
     ((sizeof(Signal) + 127) / 128) * 128;
+
+// Two-stage fused AR + RMSNorm stages each rank's reduced shard right after the
+// LL scratch, so LL never polls a line it did not write. 16 MiB covers the
+// communicator's 64 MiB fused limit at TP4.
+constexpr size_t kArRmsShardBytes = 16 * 1024 * 1024;
+constexpr size_t arRmsShardOffset(int ngpus)
+{
+    return kLLScratchOffset + llScratchBytes(ngpus);
+}
 
 // gfx1250 128-bit global load/store at *system* scope ("" == system). A single
 // 16B transaction keeps a line's data and flags atomic w.r.t. a peer reader.
@@ -492,8 +501,8 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 // gfx1250 fused allreduce + residual add + RMSNorm (+ per-token FP8 quant)
 // ---------------------------------------------------------------------------
 // Stage 1 of the large-message path. Each rank owns one contiguous hidden
-// shard, reduces that shard in fixed rank order, and writes it to its local
-// peer-visible scratch. Stage 2 reads the reduced shards below.
+// shard, reduces that shard in fixed rank order, and writes it to its
+// peer-visible staging region. Stage 2 reads the reduced shards below.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) ar_rmsnorm_reduce_scatter_gfx1250(
     RankData* _input_dp,
@@ -512,7 +521,7 @@ __global__ void __launch_bounds__(512, 1) ar_rmsnorm_reduce_scatter_gfx1250(
     for(int i = 0; i < ngpus; ++i)
         ptrs[i] = reinterpret_cast<const P*>(_input_dp->ptrs[i]);
     P* scratch =
-        reinterpret_cast<P*>(reinterpret_cast<char*>(self_sg) + kLLScratchOffset);
+        reinterpret_cast<P*>(reinterpret_cast<char*>(self_sg) + arRmsShardOffset(ngpus));
 
     const int tid    = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
@@ -596,7 +605,7 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
     {
         if constexpr(TWO_STAGE)
             ptrs[i] = reinterpret_cast<const P*>(
-                reinterpret_cast<const char*>(sg.signals[i]) + kLLScratchOffset);
+                reinterpret_cast<const char*>(sg.signals[i]) + arRmsShardOffset(ngpus));
         else
             ptrs[i] = reinterpret_cast<const P*>(_input_dp->ptrs[i]);
     }
@@ -1679,11 +1688,11 @@ public:
         const size_t bytes   = (size_t)tokens * hidden * sizeof(T);
         // At TP4+, two-stage halves or better the peer traffic of direct-read.
         // Its three single-block barriers do not amortize at TP2 or narrow rows.
-        // The reduced shard reuses the LL scratch and is capacity-checked here.
+        // Each rank's reduced shard must fit its staging region.
         const bool two_stage =
             world_size_ >= 4 && hidden >= kArRmsTwoStageMinHidden &&
             hidden / pack_size % world_size_ == 0 &&
-            bytes / world_size_ <= llScratchBytes(world_size_) && bytes > kLLArMaxBytes;
+            bytes / world_size_ <= kArRmsShardBytes && bytes > kLLArMaxBytes;
 #define LAUNCH_AR_RMS(NG)                                                                   \
         if(two_stage)                                                                       \
         {                                                                                   \
