@@ -6,13 +6,15 @@
 
 #pragma once
 
+#include "mla_prefill_split.h"
+
 // Kernel arguments.
 struct opus_mla_v4_prefill_kargs
 {
     const void* __restrict__ q_ptr;          // [N, H, D]
     const void* __restrict__ unified_kv_ptr; // [total_pages, D], prefix source
     const void* __restrict__ kv_ptr;         // [total_tokens, D], extend source
-    const void* __restrict__ attn_sink_ptr;  // [H], softmax denominator sink
+    const void* __restrict__ attn_sink_ptr;  // [H], softmax denominator sink, may be nullptr on gfx950
     void* __restrict__ out_ptr;              // [N, H, D]
     const int* __restrict__ kv_indptr_prefix;  // [N+1]
     const int* __restrict__ kv_indices_prefix; // [nnz_prefix]
@@ -29,20 +31,6 @@ struct opus_mla_v4_prefill_kargs
     float softmax_scale;
 };
 
-// The gfx950 16mx1_16nx4 split-K kernel's arguments: the shared ones and the
-// partials. grid.z splits each token's keys over num_splits; split s writes
-// its normalized O, its row max (natural units) and its sum of exponentials
-// (split 0's counting the sink), which aiter's pa_decode_ps_reduce_hip_kernel
-// folds into the output.
-struct opus_mla_v4_prefill_split_kargs
-{
-    opus_mla_v4_prefill_kargs base;
-    float* __restrict__ partial_o;   // [N, num_splits, H, D]
-    float* __restrict__ partial_max; // [N, num_splits, H]
-    float* __restrict__ partial_sum; // [N, num_splits, H]
-    int num_splits;
-};
-
 // Kernel arguments for the split-precision (NoPE fp8 / RoPE bf16) DSA prefill.
 struct opus_mla_v4_prefill_fp8_kargs
 {
@@ -52,7 +40,7 @@ struct opus_mla_v4_prefill_fp8_kargs
     const void* __restrict__ unified_kv_rope_ptr; // [total_pages, D_ROPE]        bf16
     const void* __restrict__ kv_nope_ptr;         // [total_tokens, D_NOPE_PADDED] fp8
     const void* __restrict__ kv_rope_ptr;         // [total_tokens, D_ROPE]        bf16
-    const void* __restrict__ attn_sink_ptr;       // [H]
+    const void* __restrict__ attn_sink_ptr;       // [H], may be nullptr on gfx950
     void* __restrict__ out_ptr;                   // [N, H, D_HEAD] bf16
     const int* __restrict__ kv_indptr_prefix;     // [N+1]
     const int* __restrict__ kv_indices_prefix;    // [nnz_prefix]

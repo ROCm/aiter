@@ -24,6 +24,79 @@
 
 AITER_CTYPES_ERROR_DEF
 
+// ---- Split-K (opus/mla_prefill_split.h) ---------------------------------------------------
+
+// num_splits 1 runs without split-K and takes null partial buffers.
+static opus_mla_prefill_split_args opus_mla_prefill_split_buffers(aiter_tensor_t* partial_o,
+                                                                  aiter_tensor_t* partial_max,
+                                                                  aiter_tensor_t* partial_sum,
+                                                                  int N,
+                                                                  int H,
+                                                                  int num_splits)
+{
+    AITER_CHECK(num_splits == 1 || num_splits == 2 || num_splits == 4 || num_splits == 8,
+                "num_splits must be 1, 2, 4 or 8, got ",
+                num_splits);
+    if(num_splits == 1)
+        return {nullptr, nullptr, nullptr, 1};
+    AITER_CHECK(partial_o && partial_max && partial_sum,
+                "split-K takes partial_o, partial_max and partial_sum");
+    for(aiter_tensor_t* t : {partial_o, partial_max, partial_sum})
+        AITER_CHECK(t->dtype() == AITER_DTYPE_fp32 && t->is_contiguous(),
+                    "partial_o / partial_max / partial_sum must be contiguous fp32");
+    const int64_t rows = static_cast<int64_t>(N) * num_splits * H;
+    AITER_CHECK(partial_o->numel() >= rows * 512 && partial_max->numel() >= rows &&
+                    partial_sum->numel() >= rows,
+                "partial_o must hold [N, num_splits, H, 512], partial_max / partial_sum [N, "
+                "num_splits, H]");
+    // The reduce addresses partial_o by 32-bit byte offsets.
+    AITER_CHECK(rows * 512 * sizeof(float) <= INT32_MAX, "split-K partial_o must stay under 2 GiB");
+    return {reinterpret_cast<float*>(partial_o->data_ptr()),
+            reinterpret_cast<float*>(partial_max->data_ptr()),
+            reinterpret_cast<float*>(partial_sum->data_ptr()),
+            num_splits};
+}
+
+// Folds the splits and the sink: a token is a batch row, a head a "kv head" of one query and a
+// thread one of the 512 columns.
+template <class D_OUT>
+static void opus_mla_prefill_split_reduce(const opus_mla_prefill_split_args& split,
+                                          const void* attn_sink,
+                                          aiter_tensor_t* out,
+                                          int N,
+                                          int H,
+                                          hipStream_t stream)
+{
+    const int S = split.num_splits;
+    auto reduce = [&](auto parts) {
+        constexpr int PARTS = decltype(parts)::value;
+        aiter::pa_decode_ps_reduce_hip_kernel<D_OUT, float, float, true, 512, 1, PARTS>
+            <<<dim3(N, H, 1), 512, 0, stream>>>(reinterpret_cast<D_OUT*>(out->data_ptr()),
+                                                split.partial_sum,
+                                                split.partial_max,
+                                                split.partial_o,
+                                                static_cast<const float*>(attn_sink),
+                                                static_cast<int>(out->stride(0)),
+                                                0,
+                                                static_cast<int>(out->stride(1)),
+                                                0,
+                                                S * H,
+                                                1,
+                                                H,
+                                                S * H * 512,
+                                                512,
+                                                H * 512,
+                                                0);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    };
+    if(S == 2)
+        reduce(std::integral_constant<int, 2>{});
+    else if(S == 4)
+        reduce(std::integral_constant<int, 4>{});
+    else
+        reduce(std::integral_constant<int, 8>{});
+}
+
 // The bf16/fp16 kernels' shared validation and arguments (`kargs.N` 0: nothing to run).
 static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t* q,
                                                                   aiter_tensor_t* unified_kv,
@@ -45,14 +118,12 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
                 "kv must be 2-D [total_tokens, D], got ndim=",
                 kv->dim());
     AITER_CHECK(out->dim() == 3, "out must be 3-D [N, H, D], got ndim=", out->dim());
-    AITER_CHECK(attn_sink->dim() == 1, "attn_sink must be 1-D [H]");
 
     AITER_CHECK(q->dtype() == kv->dtype() && q->dtype() == unified_kv->dtype() &&
                     q->dtype() == out->dtype(),
                 "q/unified_kv/kv/out must share dtype");
     AITER_CHECK(q->dtype() == AITER_DTYPE_bf16 || q->dtype() == AITER_DTYPE_fp16,
                 "Only bf16/fp16 are supported");
-    AITER_CHECK(attn_sink->dtype() == AITER_DTYPE_fp32, "attn_sink must be fp32");
 
     AITER_CHECK(kv_indptr_prefix->dtype() == AITER_DTYPE_i32, "kv_indptr_prefix must be int32");
     AITER_CHECK(kv_indices_prefix->dtype() == AITER_DTYPE_i32, "kv_indices_prefix must be int32");
@@ -68,7 +139,10 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
     AITER_CHECK(kv->size(1) == D, "kv last dim must equal q last dim (D=512)");
     AITER_CHECK(out->size(0) == N && out->size(1) == H && out->size(2) == D,
                 "out shape must match q [N, H, D]");
-    AITER_CHECK(attn_sink->size(0) == H, "attn_sink length must equal H");
+    if(attn_sink)
+        AITER_CHECK(attn_sink->dim() == 1 && attn_sink->size(0) == H &&
+                        attn_sink->dtype() == AITER_DTYPE_fp32 && attn_sink->is_contiguous(),
+                    "attn_sink must be a contiguous fp32 [H]");
     AITER_CHECK(kv_indptr_prefix->size(0) == N + 1,
                 "kv_indptr_prefix length must be N+1");
     AITER_CHECK(kv_indptr_extend->size(0) == N + 1,
@@ -81,9 +155,8 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
 
     // Kernel reads these 1-D buffers via raw pointer arithmetic; stride must be 1.
     AITER_CHECK(kv_indices_prefix->is_contiguous() && kv_indptr_prefix->is_contiguous() &&
-                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous() &&
-                    attn_sink->is_contiguous(),
-                "kv_indices/kv_indptr (prefix+extend) and attn_sink must be contiguous");
+                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous(),
+                "kv_indices/kv_indptr (prefix+extend) must be contiguous");
 
     const int total_pages  = static_cast<int>(unified_kv->size(0));
     const int total_tokens = static_cast<int>(kv->size(0));
@@ -93,7 +166,7 @@ static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t
     kargs.q_ptr             = q->data_ptr();
     kargs.unified_kv_ptr    = unified_kv->data_ptr();
     kargs.kv_ptr            = kv->data_ptr();
-    kargs.attn_sink_ptr     = attn_sink->data_ptr();
+    kargs.attn_sink_ptr     = attn_sink ? attn_sink->data_ptr() : nullptr;
     kargs.out_ptr           = out->data_ptr();
     kargs.kv_indptr_prefix  = reinterpret_cast<const int*>(kv_indptr_prefix->data_ptr());
     kargs.kv_indices_prefix = reinterpret_cast<const int*>(kv_indices_prefix->data_ptr());
@@ -124,22 +197,61 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* kv,
      aiter_tensor_t* kv_indices_extend,
      aiter_tensor_t* kv_indptr_extend,
-     aiter_tensor_t* attn_sink,
+     aiter_tensor_t* attn_sink, // [H] fp32 (nullable)
      aiter_tensor_t* out,
      float softmax_scale,
+     int num_splits,
+     aiter_tensor_t* partial_o,   // [N, num_splits, H, 512] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_max, // [N, num_splits, H] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_sum, // [N, num_splits, H] fp32 (nullable if num_splits 1)
      hipStream_t stream),
     (q, unified_kv, kv_indices_prefix, kv_indptr_prefix, kv, kv_indices_extend,
-     kv_indptr_extend, attn_sink, out, softmax_scale, stream))
+     kv_indptr_extend, attn_sink, out, softmax_scale, num_splits, partial_o, partial_max,
+     partial_sum, stream))
 {
     const opus_mla_v4_prefill_kargs kargs = opus_mla_v4_prefill_a16w16_kargs(
         q, unified_kv, kv_indices_prefix, kv_indptr_prefix, kv, kv_indices_extend,
         kv_indptr_extend, attn_sink, out, softmax_scale);
     const int N = kargs.N;
     const int H = kargs.H;
+    const opus_mla_prefill_split_args split =
+        opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
     if (N == 0) return;
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
+
+    if(num_splits > 1)
+    {
+        const opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs> split_kargs{kargs, split};
+        auto launch = [&](auto dtype_tag, auto out_tag) {
+            using D_ATTN = decltype(dtype_tag);
+            if(H <= 32)
+            {
+                using Traits =
+                    opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, D_ATTN, true>;
+                dim3 grid(N, ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M), num_splits);
+                opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel<Traits>
+                    <<<grid, Traits::BLOCK_SIZE, 0, stream>>>(split_kargs);
+            }
+            else
+            {
+                using Traits =
+                    opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits<16, 32, 512, 8, D_ATTN, true>;
+                dim3 grid(N, ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M), num_splits);
+                opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel<Traits>
+                    <<<grid, Traits::BLOCK_SIZE, 0, stream>>>(split_kargs);
+            }
+            HIP_CALL_LAUNCH(hipGetLastError());
+            opus_mla_prefill_split_reduce<decltype(out_tag)>(
+                split, kargs.attn_sink_ptr, out, N, H, stream);
+        };
+        if(q->dtype() == AITER_DTYPE_bf16)
+            launch(bf16_t{}, __hip_bfloat16{});
+        else
+            launch(fp16_t{}, _Float16{});
+        return;
+    }
 
 #define LAUNCH_OPUS_MLA_V4_PREFILL(KERNEL, TRAITS, KV_TILE, NUM_WARPS)               \
     do {                                                                             \
@@ -169,86 +281,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
-    opus_mla_v4_prefill_a16w16_gfx950_split_fwd,
-    (aiter_tensor_t* q,
-     aiter_tensor_t* unified_kv,
-     aiter_tensor_t* kv_indices_prefix,
-     aiter_tensor_t* kv_indptr_prefix,
-     aiter_tensor_t* kv,
-     aiter_tensor_t* kv_indices_extend,
-     aiter_tensor_t* kv_indptr_extend,
-     aiter_tensor_t* attn_sink,
-     aiter_tensor_t* partial_o,
-     aiter_tensor_t* partial_max,
-     aiter_tensor_t* partial_sum,
-     aiter_tensor_t* out,
-     float softmax_scale,
-     int num_splits,
-     hipStream_t stream),
-    (q, unified_kv, kv_indices_prefix, kv_indptr_prefix, kv, kv_indices_extend,
-     kv_indptr_extend, attn_sink, partial_o, partial_max, partial_sum, out, softmax_scale,
-     num_splits, stream))
-{
-    const opus_mla_v4_prefill_kargs kargs = opus_mla_v4_prefill_a16w16_kargs(
-        q, unified_kv, kv_indices_prefix, kv_indptr_prefix, kv, kv_indices_extend,
-        kv_indptr_extend, attn_sink, out, softmax_scale);
-    const int N = kargs.N;
-    const int H = kargs.H;
-    const int D = kargs.D;
-    AITER_CHECK(H <= 32, "split-K runs the 16mx1_16nx4 kernel only (H <= 32), got H=", H);
-    AITER_CHECK(num_splits == 2 || num_splits == 4 || num_splits == 8,
-                "split-K takes num_splits 2, 4 or 8, got ", num_splits);
-    for(aiter_tensor_t* t : {partial_o, partial_max, partial_sum})
-        AITER_CHECK(t->dtype() == AITER_DTYPE_fp32 && t->is_contiguous(),
-                    "partial_o / partial_max / partial_sum must be contiguous fp32");
-    AITER_CHECK(partial_o->numel() >= static_cast<int64_t>(N) * num_splits * H * D &&
-                    partial_max->numel() >= static_cast<int64_t>(N) * num_splits * H &&
-                    partial_sum->numel() >= static_cast<int64_t>(N) * num_splits * H,
-                "partial_o must hold [N, num_splits, H, D], partial_max / partial_sum [N, num_splits, H]");
-    if (N == 0) return;
-    const opus_mla_v4_prefill_split_kargs split_kargs{
-        kargs,
-        reinterpret_cast<float*>(partial_o->data_ptr()),
-        reinterpret_cast<float*>(partial_max->data_ptr()),
-        reinterpret_cast<float*>(partial_sum->data_ptr()),
-        num_splits};
-
-    HipDeviceGuard guard(q->device_id);
-    // The reduce: a token a batch row, a head a "kv head" of one query each,
-    // every thread one of the D columns. No sink: split 0 already counts it.
-    auto reduce = [&](auto out_tag, auto parts) {
-        using D_OUT = decltype(out_tag);
-        aiter::pa_decode_ps_reduce_hip_kernel<D_OUT, float, float, false, 512, 1, decltype(parts)::value>
-            <<<dim3(N, H, 1), 512, 0, stream>>>(
-                reinterpret_cast<D_OUT*>(out->data_ptr()),
-                split_kargs.partial_sum,
-                split_kargs.partial_max,
-                split_kargs.partial_o,
-                nullptr,
-                kargs.stride_qo_n, 0, kargs.stride_qo_h, 0,
-                num_splits * H, 1, H,
-                num_splits * H * D, D, H * D, 0);
-        HIP_CALL_LAUNCH(hipGetLastError());
-    };
-    auto launch = [&](auto dtype_tag, auto out_tag) {
-        using Traits = opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, decltype(dtype_tag), true>;
-        dim3 grid(N, ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M), num_splits);
-        opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel<Traits><<<grid, Traits::BLOCK_SIZE, 0, stream>>>(split_kargs);
-        HIP_CALL_LAUNCH(hipGetLastError());
-        if(num_splits == 2)
-            reduce(out_tag, std::integral_constant<int, 2>{});
-        else if(num_splits == 4)
-            reduce(out_tag, std::integral_constant<int, 4>{});
-        else
-            reduce(out_tag, std::integral_constant<int, 8>{});
-    };
-    if(q->dtype() == AITER_DTYPE_bf16)
-        launch(bf16_t{}, __hip_bfloat16{});
-    else
-        launch(fp16_t{}, _Float16{});
-}
-
-AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     opus_mla_v4_prefill_a8w8_gfx950_fwd,
     (aiter_tensor_t* q_nope,
      aiter_tensor_t* q_rope,
@@ -260,13 +292,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* kv_rope,
      aiter_tensor_t* kv_indices_extend,
      aiter_tensor_t* kv_indptr_extend,
-     aiter_tensor_t* attn_sink,
+     aiter_tensor_t* attn_sink, // [H] fp32 (nullable)
      aiter_tensor_t* out,
      float softmax_scale,
+     int num_splits,
+     aiter_tensor_t* partial_o,   // [N, num_splits, H, 512] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_max, // [N, num_splits, H] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_sum, // [N, num_splits, H] fp32 (nullable if num_splits 1)
      hipStream_t stream),
     (q_nope, q_rope, unified_kv_nope, unified_kv_rope, kv_indices_prefix, kv_indptr_prefix,
      kv_nope, kv_rope, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale,
-     stream))
+     num_splits, partial_o, partial_max, partial_sum, stream))
 {
     // Single compiled configuration: split NoPE fp8 (448 + 14 E8M0 scales + pad
     // = 512 fp8 slots/row) and RoPE bf16 (64), D_HEAD = 512.
@@ -287,7 +323,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(kv_rope->dim() == 2,
                 "kv_rope must be 2-D [total_tokens, 64], got ndim=", kv_rope->dim());
     AITER_CHECK(out->dim() == 3, "out must be 3-D [N, H, 512], got ndim=", out->dim());
-    AITER_CHECK(attn_sink->dim() == 1, "attn_sink must be 1-D [H]");
 
     AITER_CHECK(q_nope->dtype() == AITER_DTYPE_fp8 && unified_kv_nope->dtype() == AITER_DTYPE_fp8 &&
                     kv_nope->dtype() == AITER_DTYPE_fp8,
@@ -296,7 +331,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     kv_rope->dtype() == AITER_DTYPE_bf16,
                 "q_rope/unified_kv_rope/kv_rope must be bf16");
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, "out must be bf16");
-    AITER_CHECK(attn_sink->dtype() == AITER_DTYPE_fp32, "attn_sink must be fp32");
 
     AITER_CHECK(kv_indptr_prefix->dtype() == AITER_DTYPE_i32, "kv_indptr_prefix must be int32");
     AITER_CHECK(kv_indices_prefix->dtype() == AITER_DTYPE_i32, "kv_indices_prefix must be int32");
@@ -319,7 +353,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 "kv_nope and kv_rope must share total_tokens");
     AITER_CHECK(out->size(0) == N && out->size(1) == H && out->size(2) == D_HEAD,
                 "out shape must be [N, H, 512]");
-    AITER_CHECK(attn_sink->size(0) == H, "attn_sink length must equal H");
+    if(attn_sink)
+        AITER_CHECK(attn_sink->dim() == 1 && attn_sink->size(0) == H &&
+                        attn_sink->dtype() == AITER_DTYPE_fp32 && attn_sink->is_contiguous(),
+                    "attn_sink must be a contiguous fp32 [H]");
     AITER_CHECK(kv_indptr_prefix->size(0) == N + 1, "kv_indptr_prefix length must be N+1");
     AITER_CHECK(kv_indptr_extend->size(0) == N + 1, "kv_indptr_extend length must be N+1");
 
@@ -336,12 +373,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(out->stride(2) == 1, "out must be contiguous along the head-dim");
 
     AITER_CHECK(kv_indices_prefix->is_contiguous() && kv_indptr_prefix->is_contiguous() &&
-                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous() &&
-                    attn_sink->is_contiguous(),
-                "kv_indices/kv_indptr (prefix+extend) and attn_sink must be contiguous");
+                    kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous(),
+                "kv_indices/kv_indptr (prefix+extend) must be contiguous");
 
     const int total_pages  = static_cast<int>(unified_kv_nope->size(0));
     const int total_tokens = static_cast<int>(kv_nope->size(0));
+    const opus_mla_prefill_split_args split =
+        opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
 
     if(N == 0)
         return;
@@ -361,7 +399,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.unified_kv_rope_ptr = unified_kv_rope->data_ptr();
     kargs.kv_nope_ptr         = kv_nope->data_ptr();
     kargs.kv_rope_ptr         = kv_rope->data_ptr();
-    kargs.attn_sink_ptr       = attn_sink->data_ptr();
+    kargs.attn_sink_ptr       = attn_sink ? attn_sink->data_ptr() : nullptr;
     kargs.out_ptr             = out->data_ptr();
     kargs.kv_indptr_prefix    = reinterpret_cast<const int*>(kv_indptr_prefix->data_ptr());
     kargs.kv_indices_prefix   = reinterpret_cast<const int*>(kv_indices_prefix->data_ptr());
@@ -383,6 +421,31 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q_nope->device_id);
+
+    if(num_splits > 1)
+    {
+        const opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs> split_kargs{kargs, split};
+        if(H <= 32)
+        {
+            using KTraits =
+                opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t, true>;
+            dim3 grid(N, ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M), num_splits);
+            opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel<KTraits>
+                <<<grid, KTraits::BLOCK_SIZE, 0, stream>>>(split_kargs);
+        }
+        else
+        {
+            using KTraits =
+                opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t, true>;
+            dim3 grid(N, ceil_div(H, KTraits::Q_TILE_SIZE * KTraits::T_M), num_splits);
+            opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel<KTraits>
+                <<<grid, KTraits::BLOCK_SIZE, 0, stream>>>(split_kargs);
+        }
+        HIP_CALL_LAUNCH(hipGetLastError());
+        opus_mla_prefill_split_reduce<__hip_bfloat16>(
+            split, kargs.attn_sink_ptr, out, N, H, stream);
+        return;
+    }
 
 #define LAUNCH_OPUS_MLA_V4_PREFILL_FP8(KERNEL, TRAITS, KV_TILE, NUM_WARPS)         \
     do {                                                                          \
@@ -910,10 +973,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* attn_sink, // [H] fp32 (nullable)
      aiter_tensor_t* out,
      float softmax_scale,
-     aiter_tensor_t* lse, // [N, H] fp32 (nullable)
+     int num_splits,
+     aiter_tensor_t* partial_o,   // [N, num_splits, H, 512] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_max, // [N, num_splits, H] fp32 (nullable if num_splits 1)
+     aiter_tensor_t* partial_sum, // [N, num_splits, H] fp32 (nullable if num_splits 1)
      hipStream_t stream),
     (q, q_scale, unified_kv, unified_kv_scale, kv_indices_prefix, kv_indptr_prefix, kv,
-     kv_scale, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale, lse, stream))
+     kv_scale, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale, num_splits,
+     partial_o, partial_max, partial_sum, stream))
 {
     const std::string gfx = get_gpu_arch();
     AITER_CHECK(gfx == "gfx950", __func__, ": unsupported GPU arch '", gfx, "' (supported: gfx950).");
@@ -956,10 +1023,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         AITER_CHECK(attn_sink->dim() == 1 && attn_sink->size(0) == H &&
                         attn_sink->dtype() == AITER_DTYPE_fp32 && attn_sink->is_contiguous(),
                     "attn_sink must be a contiguous fp32 [H]");
-    if(lse)
-        AITER_CHECK(lse->dim() == 2 && lse->size(0) == N && lse->size(1) == H &&
-                        lse->dtype() == AITER_DTYPE_fp32 && lse->stride(1) == 1,
-                    "lse must be fp32 [N, H], contiguous along H");
     AITER_CHECK(kv_indptr_prefix->size(0) == N + 1, "kv_indptr_prefix length must be N+1");
     AITER_CHECK(kv_indptr_extend->size(0) == N + 1, "kv_indptr_extend length must be N+1");
 
@@ -970,6 +1033,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(kv_indices_prefix->is_contiguous() && kv_indptr_prefix->is_contiguous() &&
                     kv_indices_extend->is_contiguous() && kv_indptr_extend->is_contiguous(),
                 "kv_indices/kv_indptr (prefix+extend) must be contiguous");
+    const opus_mla_prefill_split_args split =
+        opus_mla_prefill_split_buffers(partial_o, partial_max, partial_sum, N, H, num_splits);
 
     if(N == 0)
         return;
@@ -998,7 +1063,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.kv_scale_ptr         = kv_scale->data_ptr();
     kargs.attn_sink_ptr        = attn_sink ? attn_sink->data_ptr() : nullptr;
     kargs.out_ptr              = out->data_ptr();
-    kargs.lse_ptr              = lse ? lse->data_ptr() : nullptr;
     kargs.kv_indptr_prefix     = reinterpret_cast<const int*>(kv_indptr_prefix->data_ptr());
     kargs.kv_indices_prefix    = reinterpret_cast<const int*>(kv_indices_prefix->data_ptr());
     kargs.kv_indptr_extend     = reinterpret_cast<const int*>(kv_indptr_extend->data_ptr());
@@ -1013,13 +1077,32 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.stride_q_scale_h     = static_cast<int>(q_scale->stride(1));
     kargs.stride_o_n           = static_cast<int>(out->stride(0));
     kargs.stride_o_h           = static_cast<int>(out->stride(1));
-    kargs.stride_lse_n         = lse ? static_cast<int>(lse->stride(0)) : 0;
     kargs.stride_kv_page       = static_cast<int>(stride_kv_page);
     kargs.stride_kv_scale_page = static_cast<int>(stride_kv_scale_page);
     kargs.softmax_scale        = softmax_scale;
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q->device_id);
+
+    if(num_splits > 1)
+    {
+        opus_mla_prefill_split_kargs<opus_mla_v41_prefill_kargs> split_kargs{kargs, split};
+        size_t arg_size = sizeof(split_kargs);
+        static AiterAsmKernel impl("opus_mla_v41_prefill_a8w8_16mx4_64nx1_split_kernel",
+                                   kV41A8W8Co);
+        impl.launch_kernel({&split_kargs,
+                            &arg_size,
+                            N,
+                            ceil_div(H, kV41HeadsPerBlk),
+                            num_splits,
+                            kV41BlockSize,
+                            1,
+                            1,
+                            stream});
+        opus_mla_prefill_split_reduce<__hip_bfloat16>(
+            split, kargs.attn_sink_ptr, out, N, H, stream);
+        return;
+    }
 
     size_t arg_size = sizeof(kargs);
     static AiterAsmKernel impl("opus_mla_v41_prefill_a8w8_16mx4_64nx1_kernel", kV41A8W8Co);

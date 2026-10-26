@@ -86,28 +86,13 @@ def opus_mla_v4_prefill_a16w16_gfx950_fwd(
     kv: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,  # [H] fp32
     out: torch.Tensor,
     softmax_scale: float,
-) -> None: ...
-
-
-@compile_ops(PREFILL_MD_NAME, ffi_type="ctypes")
-def opus_mla_v4_prefill_a16w16_gfx950_split_fwd(
-    q: torch.Tensor,
-    unified_kv: torch.Tensor,
-    kv_indices_prefix: torch.Tensor,
-    kv_indptr_prefix: torch.Tensor,
-    kv: torch.Tensor,
-    kv_indices_extend: torch.Tensor,
-    kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
-    partial_o: torch.Tensor,
-    partial_max: torch.Tensor,
-    partial_sum: torch.Tensor,
-    out: torch.Tensor,
-    softmax_scale: float,
-    num_splits: int,
+    num_splits: int = 1,
+    partial_o: torch.Tensor | None = None,  # [N, num_splits, H, 512] fp32
+    partial_max: torch.Tensor | None = None,  # [N, num_splits, H] fp32
+    partial_sum: torch.Tensor | None = None,  # [N, num_splits, H] fp32
 ) -> None: ...
 
 
@@ -138,9 +123,13 @@ def opus_mla_v4_prefill_a8w8_gfx950_fwd(
     kv_rope: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,  # [H] fp32
     out: torch.Tensor,
     softmax_scale: float,
+    num_splits: int = 1,
+    partial_o: torch.Tensor | None = None,  # [N, num_splits, H, 512] fp32
+    partial_max: torch.Tensor | None = None,  # [N, num_splits, H] fp32
+    partial_sum: torch.Tensor | None = None,  # [N, num_splits, H] fp32
 ) -> None: ...
 
 
@@ -177,5 +166,8 @@ def opus_mla_v41_prefill_a8w8_gfx950_fwd(
     attn_sink: torch.Tensor | None,  # [H] fp32
     out: torch.Tensor,
     softmax_scale: float,
-    lse: torch.Tensor | None = None,  # [N, H] fp32
+    num_splits: int = 1,
+    partial_o: torch.Tensor | None = None,  # [N, num_splits, H, 512] fp32
+    partial_max: torch.Tensor | None = None,  # [N, num_splits, H] fp32
+    partial_sum: torch.Tensor | None = None,  # [N, num_splits, H] fp32
 ) -> None: ...

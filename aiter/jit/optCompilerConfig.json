@@ -712,7 +712,8 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_global_load.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_kargs.h'",
             "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v4_prefill_traits.h'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v41_prefill_kargs.h'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_v41_prefill_kargs.h'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/opus/mla_prefill_split.h'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

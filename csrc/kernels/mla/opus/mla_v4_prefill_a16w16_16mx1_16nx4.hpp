@@ -423,10 +423,7 @@ template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::kargs_type args) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4;
-    const opus_mla_v4_prefill_kargs& kargs = [&]() -> const opus_mla_v4_prefill_kargs& {
-        if constexpr (Traits::SPLIT) return args.base;
-        else return args;
-    }();
+    const opus_mla_v4_prefill_kargs kargs = opus_mla_prefill_base(args);
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -460,15 +457,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
-    // Split-K: this split's share of the token's keys -- prefix, then extend
-    // -- in whole tiles.
-    [[maybe_unused]] int split_lo = 0, split_hi = 0, prefix_len = 0;
+    [[maybe_unused]] opus_mla_prefill_split_rows rows{};
     if constexpr (T::SPLIT) {
-        prefix_len = kargs.kv_indptr_prefix[q_token_idx + 1] - kargs.kv_indptr_prefix[q_token_idx];
-        const int extend_len = kargs.kv_indptr_extend[q_token_idx + 1] - kargs.kv_indptr_extend[q_token_idx];
-        const int chunk = ceil_div(ceil_div(prefix_len + extend_len, args.num_splits), T::KV_TILE_SIZE) * T::KV_TILE_SIZE;
-        split_lo = block_id_z() * chunk;
-        split_hi = split_lo + chunk;
+        rows = opus_mla_prefill_split_rows_of<T::KV_TILE_SIZE>(
+            kargs.kv_indptr_prefix[q_token_idx + 1] - kargs.kv_indptr_prefix[q_token_idx],
+            kargs.kv_indptr_extend[q_token_idx + 1] - kargs.kv_indptr_extend[q_token_idx],
+            args.split.num_splits, block_id_z());
     }
 
     // ──── Prefix segment ────
@@ -477,9 +471,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
         const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
         int valid_kv_len         = page_idx_end - page_idx_begin;
         if constexpr (T::SPLIT) {
-            const int begin = min(split_lo, valid_kv_len);
-            valid_kv_len    = max(min(split_hi, valid_kv_len) - begin, 0);
-            page_idx_begin += begin;
+            page_idx_begin += rows.prefix_begin;
+            valid_kv_len = rows.prefix_len;
         }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
@@ -494,9 +487,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
         const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
         int valid_kv_len         = page_idx_end - page_idx_begin;
         if constexpr (T::SPLIT) {
-            const int begin = min(max(split_lo - prefix_len, 0), valid_kv_len);
-            valid_kv_len    = min(max(split_hi - prefix_len, 0), valid_kv_len) - begin;
-            page_idx_begin += begin;
+            page_idx_begin += rows.extend_begin;
+            valid_kv_len = rows.extend_len;
         }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
@@ -504,37 +496,22 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     }
 
     if constexpr (T::SPLIT) {
-        // A split's normalized O, row max and sum, merged by a plain softmax
-        // reduce. The sink is a key whose value is zero: split 0 counts it in
-        // its sum, so the reduce never sees it. A split past the token's keys
-        // contributes nothing: sum 0, max -inf.
-        if (block_id_z() == 0) {
-            auto g_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
-            const D_ACC sink_log2 = load(g_sink, h_block_start + lane_id % T::W_M)[0] * LOG2_E;
-            const D_ACC m_sink = max(m_row, sink_log2);
-            const D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_sink);
-            l_row = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_sink);
-            m_row = m_sink;
-            scale_output_tile<T>(v_o, alpha);
-        }
-        const D_ACC inv_l = (l_row > D_ACC(0.0f)) ? D_ACC(1.0f) / l_row : D_ACC(0.0f);
-        scale_output_tile<T>(v_o, inv_l);
-        const int64_t part = (static_cast<int64_t>(q_token_idx) * args.num_splits + block_id_z()) * kargs.H + h_block_start;
-        auto g_po = make_gmem(args.partial_o + part * T::D_TILE_SIZE, (kargs.H - h_block_start) * T::D_TILE_SIZE * sizeof(D_ACC));
+        const auto& split = args.split;
+        scale_output_tile<T>(v_o, l_row > D_ACC(0.0f) ? D_ACC(1.0f) / l_row : D_ACC(0.0f));
+        const int64_t row = opus_mla_prefill_split_row(split, q_token_idx, block_id_z(), kargs.H, h_block_start);
+        auto g_po = make_gmem(split.partial_o + row * T::D_TILE_SIZE, (kargs.H - h_block_start) * T::D_TILE_SIZE * sizeof(D_ACC));
         int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
         store<T::VEC_O>(g_po, v_o, make_layout_o<T>(warp_id, lane_id, T::D_TILE_SIZE));
-        if (warp_id == 0 && lane_id < T::W_M && h_block_start + lane_id < kargs.H) {
-            // m_row is in log2 units (scores x scale x log2(e)); the reduce takes natural ones
-            args.partial_max[part + lane_id] = (l_row > D_ACC(0.0f)) ? m_row / LOG2_E : -opus::numeric_limits<D_ACC>::infinity();
-            args.partial_sum[part + lane_id] = l_row;
-        }
+        if (warp_id == 0 && lane_id < T::W_M && h_block_start + lane_id < kargs.H)
+            opus_mla_prefill_split_store_ml(split, row + lane_id, m_row, l_row);
         return;
     }
 
     // ──── Sink finalization, normalize O, and store to gmem ────
     const int sink_head_idx = h_block_start + lane_id % T::W_M;
-    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
-    D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
+    const bool has_sink = kargs.attn_sink_ptr != nullptr;
+    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), has_sink ? kargs.H * sizeof(D_ACC) : 0);
+    D_ACC sink_log2 = has_sink ? load(g_attn_sink, sink_head_idx)[0] * LOG2_E : -opus::numeric_limits<D_ACC>::infinity();
     D_ACC m_final = max(m_row, sink_log2);
     D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_final);
     D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);

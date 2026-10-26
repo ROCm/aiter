@@ -19,13 +19,18 @@ template <int Q_TILE_SIZE_  = 16,
           int KV_TILE_SIZE_ = 32,
           int D_TILE_SIZE_  = 512,
           int NUM_WARPS_    = 8,
-          typename D_ATTN_  = bf16_t>
+          typename D_ATTN_  = bf16_t,
+          bool SPLIT_       = false>
 struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE  = D_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
+    static constexpr bool SPLIT       = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_,
+                                          opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
+                                          opus_mla_v4_prefill_kargs>;
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -79,8 +84,8 @@ struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits
 
 // Compile-time tile/MFMA configuration for the 16mx1_16nx4 variant (T_M=1,
 // T_N=NUM_WARPS). Used when H <= 32. KV_TILE=64, NUM_WARPS=4, BLOCK_SIZE=256.
-// SPLIT: the split-K kernel (`opus_mla_v4_prefill_split_kargs`); without it
-// the kernel is the unsplit one, its arguments and code untouched.
+// SPLIT (all four variants): the split-K kernel, see mla_prefill_split.h; without it the
+// kernel's arguments and code are the unsplit ones.
 template <int Q_TILE_SIZE_  = 16,
           int KV_TILE_SIZE_ = 64,
           int D_TILE_SIZE_  = 512,
@@ -94,7 +99,8 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
     static constexpr int D_TILE_SIZE  = D_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool SPLIT       = SPLIT_;
-    using kargs_type = std::conditional_t<SPLIT_, opus_mla_v4_prefill_split_kargs,
+    using kargs_type = std::conditional_t<SPLIT_,
+                                          opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
                                           opus_mla_v4_prefill_kargs>;
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size
@@ -158,12 +164,18 @@ template <int Q_TILE_SIZE_  = 16,
           int NUM_WARPS_    = 8,
           typename D_NOPE_  = fp8_t,
           typename D_ROPE_  = bf16_t,
-          typename D_OUT_   = bf16_t>
+          typename D_OUT_   = bf16_t,
+          bool SPLIT_       = false>
 struct opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
+    static constexpr bool SPLIT       = SPLIT_;
+    using kargs_type =
+        std::conditional_t<SPLIT_,
+                           opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>,
+                           opus_mla_v4_prefill_fp8_kargs>;
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -257,12 +269,18 @@ template <int Q_TILE_SIZE_  = 16,
           int NUM_WARPS_    = 4,
           typename D_NOPE_  = fp8_t,
           typename D_ROPE_  = bf16_t,
-          typename D_OUT_   = bf16_t>
+          typename D_OUT_   = bf16_t,
+          bool SPLIT_       = false>
 struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
+    static constexpr bool SPLIT       = SPLIT_;
+    using kargs_type =
+        std::conditional_t<SPLIT_,
+                           opus_mla_prefill_split_kargs<opus_mla_v4_prefill_fp8_kargs>,
+                           opus_mla_v4_prefill_fp8_kargs>;
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;

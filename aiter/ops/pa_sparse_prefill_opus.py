@@ -21,11 +21,43 @@ from .opus.mla import (
     opus_mla_v4_prefill_a16w16_gfx950_fwd as pa_sparse_prefill_gfx950_opus_fwd,
 )
 from .opus.mla import (
-    opus_mla_v4_prefill_a16w16_gfx950_split_fwd as pa_sparse_prefill_gfx950_opus_split_fwd,
-)
-from .opus.mla import (
     opus_mla_v4_prefill_a16w16_gfx1250_fwd as pa_sparse_prefill_gfx1250_opus_fwd,
 )
+
+
+def pa_sparse_prefill_gfx950_opus_split_fwd(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    partial_o: torch.Tensor,
+    partial_max: torch.Tensor,
+    partial_sum: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    num_splits: int,
+) -> None:
+    """:func:`pa_sparse_prefill_gfx950_opus_fwd` with split-K, in the former argument order."""
+    pa_sparse_prefill_gfx950_opus_fwd(
+        q,
+        unified_kv,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        out,
+        softmax_scale,
+        num_splits,
+        partial_o,
+        partial_max,
+        partial_sum,
+    )
 
 
 def _pa_sparse_prefill_opus_fake(

@@ -26,14 +26,13 @@ import torch
 from .. import logger
 from ..jit.core import compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
-from ..jit.utils.chip_info import get_gfx_runtime
+from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .opus.mla import (
     opus_mla_v4_prefill_a8w8_gfx950_fwd,
     opus_mla_v4_prefill_a8w8_gfx1250_fwd,
     opus_mla_v4_prefill_a16w16_gfx950_fwd,
-    opus_mla_v4_prefill_a16w16_gfx950_split_fwd,
     opus_mla_v4_prefill_a16w16_gfx1250_fwd,
     opus_mla_v41_prefill_a8w8_gfx950_fwd,
 )
@@ -238,20 +237,50 @@ def _opus_fwd(gfx: str, op_gfx950, op_gfx1250):
     )
 
 
-# Split-K by the unsplit grid's blocks (a token per 16 heads): fewer than the
-# CUs leave them idle through each token's serial key loop. Measured on MI355X
-# (256 CUs; 640 keys a token, H=16, perftest): 4 splits are best up to 120
-# blocks, none beyond.
-_KV_SPLIT_STEPS = ((120, 4),)
+# Split-K (gfx950) cuts each token's keys over num_kv_splits workgroups and folds them in
+# a second launch. Auto picks the most splits (8, 4, 2) whose workgroups fit in cap x CUs
+# and that keep at least min_keys keys each. Keyed by the heads a workgroup covers; fit on
+# MI355X over topk 256-2048, N 8-768 and H 16-128 to lose nowhere.
+_KV_SPLIT_FIT = {16: (1.5, 192), 128: (0.75, 192), 64: (1.0, 384)}
 
 
-def _auto_kv_splits(gfx: str, n: int, h: int) -> int:
-    """The split count for ``n`` tokens of ``h`` heads: host scalars only, so
-    a captured graph's choice is its shape's."""
-    if gfx != "gfx950" or h > 32:
-        return 1
-    blocks = n * -(-h // 16)
-    return next((s for limit, s in _KV_SPLIT_STEPS if blocks <= limit), 1)
+def _kv_splits(
+    gfx: str, num_kv_splits: int | None, n: int, h: int, heads_per_wg: int, nnz: int
+) -> int:
+    """The split count. Auto reads host scalars only (``nnz``: all tokens' rows, from the
+    index tensors' sizes), so a captured graph's choice is its shape's."""
+    if num_kv_splits is None:
+        if gfx != "gfx950" or n == 0:
+            return 1
+        cap, min_keys = _KV_SPLIT_FIT[heads_per_wg]
+        wgs = n * -(-h // heads_per_wg)
+        keys = nnz / n
+        return next(
+            (
+                s
+                for s in (8, 4, 2)
+                if wgs * s <= cap * get_cu_num() and keys / s >= min_keys
+            ),
+            1,
+        )
+    if num_kv_splits not in (1, 2, 4, 8):
+        # ValueError, a caller's error; RuntimeError would read as a missing kernel.
+        raise ValueError(f"num_kv_splits must be 1, 2, 4 or 8, got {num_kv_splits}")
+    if num_kv_splits > 1 and gfx != "gfx950":
+        raise RuntimeError(f"num_kv_splits > 1 runs on gfx950, got {gfx}")
+    return num_kv_splits
+
+
+def _split_args(n: int, num_kv_splits: int, h: int, device) -> tuple:
+    """The gfx950 kernels' trailing split-K arguments, none without split-K: num_splits,
+    partial_o [N, S, H, 512], partial_max and partial_sum [N, S, H], fp32."""
+    if num_kv_splits == 1:
+        return ()
+    partial_o = torch.empty(
+        n, num_kv_splits, h, 512, dtype=torch.float32, device=device
+    )
+    partial_max = torch.empty(n, num_kv_splits, h, dtype=torch.float32, device=device)
+    return num_kv_splits, partial_o, partial_max, torch.empty_like(partial_max)
 
 
 def _opus_sparse_prefill(
@@ -299,43 +328,9 @@ def _opus_sparse_prefill(
             f"expected shape={tuple(q.shape)} dtype={q.dtype}"
         )
 
-    if num_kv_splits is None:
-        num_kv_splits = _auto_kv_splits(gfx, *q.shape[:2])
-    elif num_kv_splits not in (1, 2, 4, 8):
-        # here: past it the kernel's check aborts the process; and a
-        # ValueError, a caller's error, not a configuration this GPU lacks
-        # (RuntimeError, which callers take as their cue to fall back)
-        raise ValueError(f"num_kv_splits must be 1, 2, 4 or 8, got {num_kv_splits}")
-    if num_kv_splits > 1:
-        if gfx != "gfx950" or q.size(1) > 32:
-            raise RuntimeError(
-                f"num_kv_splits > 1 runs on gfx950 with H <= 32, got {gfx} H={q.size(1)}"
-            )
-        n, h, d = q.shape
-        partial_o = torch.empty(
-            n, num_kv_splits, h, d, dtype=torch.float32, device=q.device
-        )
-        partial_max = torch.empty(
-            n, num_kv_splits, h, dtype=torch.float32, device=q.device
-        )
-        partial_sum = torch.empty_like(partial_max)
-        opus_mla_v4_prefill_a16w16_gfx950_split_fwd(
-            q,
-            unified_kv,
-            kv_indices_prefix,
-            kv_indptr_prefix,
-            kv,
-            kv_indices_extend,
-            kv_indptr_extend,
-            attn_sink,
-            partial_o,
-            partial_max,
-            partial_sum,
-            out,
-            float(softmax_scale),
-            int(num_kv_splits),
-        )
-        return out
+    n, h, _ = q.shape
+    nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
+    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, 16 if h <= 32 else 128, nnz)
     fwd(
         q,
         unified_kv,
@@ -347,6 +342,7 @@ def _opus_sparse_prefill(
         attn_sink,
         out,
         float(softmax_scale),
+        *_split_args(n, num_kv_splits, h, q.device),
     )
     return out
 
@@ -374,6 +370,7 @@ def _opus_sparse_prefill_v4(
     attn_sink,
     softmax_scale,
     out,
+    num_kv_splits=None,
 ):
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(
@@ -386,12 +383,13 @@ def _opus_sparse_prefill_v4(
             f"opus v4 sparse prefill supports NoPE dtypes {list(_OPUS_V4_KERNELS)}, "
             f"got {q_nope.dtype}"
         )
-    fwd = _opus_fwd(get_gfx_runtime(), *kernels)
+    gfx = get_gfx_runtime()
+    fwd = _opus_fwd(gfx, *kernels)
     if q_rope.dtype != torch.bfloat16:
         raise RuntimeError(f"q_rope must be bf16, got {q_rope.dtype}")
-    out = _out_bf16(q_nope.shape[0], q_nope.shape[1], q_nope.device, out)
-
-    fwd(
+    n, h, _ = q_nope.shape
+    out = _out_bf16(n, h, q_nope.device, out)
+    args = (
         q_nope,
         q_rope,
         unified_kv_nope,
@@ -403,8 +401,14 @@ def _opus_sparse_prefill_v4(
         kv_indices_extend,
         kv_indptr_extend,
         attn_sink,
+    )
+    nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
+    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, 16 if h <= 32 else 128, nnz)
+    fwd(
+        *args,
         out,
         float(softmax_scale),
+        *_split_args(n, num_kv_splits, h, q_nope.device),
     )
     return out
 
@@ -429,7 +433,7 @@ def _opus_sparse_prefill_v41(
     attn_sink,
     softmax_scale,
     out,
-    lse,
+    num_kv_splits=None,
 ):
     gfx = get_gfx_runtime()
     if gfx != "gfx950":
@@ -452,9 +456,9 @@ def _opus_sparse_prefill_v41(
     ):
         if scale.dtype not in (torch.uint8, dtypes.fp8_e8m0):
             raise RuntimeError(f"{name} must be E8M0 (uint8), got {scale.dtype}")
-    out = _out_bf16(q.shape[0], q.shape[1], q.device, out)
-
-    fwd(
+    n, h, _ = q.shape
+    out = _out_bf16(n, h, q.device, out)
+    args = (
         q,
         q_scale,
         unified_kv,
@@ -466,10 +470,10 @@ def _opus_sparse_prefill_v41(
         kv_indices_extend,
         kv_indptr_extend,
         attn_sink,
-        out,
-        float(softmax_scale),
-        lse,
     )
+    nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
+    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, 64, nnz)
+    fwd(*args, out, float(softmax_scale), *_split_args(n, num_kv_splits, h, q.device))
     return out
 
 
@@ -493,7 +497,7 @@ def _mla_sparse_prefill_fake(
     kv: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
@@ -511,7 +515,7 @@ def mla_sparse_prefill(
     kv: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
@@ -530,13 +534,14 @@ def mla_sparse_prefill(
       kv_indices_extend: ``[total_extend]`` int32 row indices into ``kv``,
         concatenated per token.
       kv_indptr_extend:  ``[T+1]`` int32 CSR row pointers.
-      attn_sink:         ``[H]`` fp32 per-head softmax-denom bias.
+      attn_sink:         ``[H]`` fp32 per-head softmax-denom bias, or ``None``
+        for no sink (gfx950).
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, D]`` output (``q``'s dtype);
         allocated if ``None``.
-      num_kv_splits:     split each token's keys over this many blocks and fold
-        them in a second launch: 1, or 2, 4, 8 on gfx950 with H <= 32. ``None``
-        picks it from the token count.
+      num_kv_splits:     split each token's keys over this many workgroups and
+        fold them in a second launch: 1, or 2, 4, 8 on gfx950. ``None`` picks it
+        from the token and head counts.
       backend:           ``"opus"`` or ``None``.
 
     Returns:
@@ -569,9 +574,10 @@ def _mla_sparse_prefill_v4_fake(
     kv_rope: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
     if out is not None:
@@ -592,9 +598,10 @@ def mla_sparse_prefill_v4(
     kv_rope: torch.Tensor,
     kv_indices_extend: torch.Tensor,
     kv_indptr_extend: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
     """MLA sparse prefill over the v4 layout: NoPE rows holding their own E8M0
@@ -613,9 +620,11 @@ def mla_sparse_prefill_v4(
       kv_indices_extend: ``[total_extend]`` int32 row indices into the extend
         sources, concatenated per token.
       kv_indptr_extend:  ``[T+1]`` int32 CSR row pointers.
-      attn_sink:         ``[H]`` fp32 per-head softmax-denom bias.
+      attn_sink:         ``[H]`` fp32 per-head softmax-denom bias, or ``None``
+        for no sink (gfx950).
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, 512]`` bf16 output; allocated if ``None``.
+      num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only).
       backend:           ``"asm"``, ``"opus"`` or ``None``.
 
     Returns:
@@ -637,10 +646,14 @@ def mla_sparse_prefill_v4(
         softmax_scale,
         out,
     )
+    unsplit = num_kv_splits in (None, 1)
     if backend == "asm":
+        if not unsplit:
+            raise RuntimeError("the asm backend has no split-K")
         return _asm_sparse_prefill_v4(*args)
     if (
         backend is None
+        and unsplit
         and get_gfx_runtime() == "gfx1250"
         and q_nope.size(1) == _ASM_HEADS
     ):
@@ -648,7 +661,7 @@ def mla_sparse_prefill_v4(
             return _asm_sparse_prefill_v4(*args)
         except RuntimeError as e:  # asm is stricter about dtypes and shapes than opus
             _warn_asm_fallback(str(e))
-    return _opus_sparse_prefill_v4(*args)
+    return _opus_sparse_prefill_v4(*args, num_kv_splits)
 
 
 def _mla_sparse_prefill_v41_fake(
@@ -665,7 +678,7 @@ def _mla_sparse_prefill_v41_fake(
     attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
-    lse: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
     if out is not None:
@@ -674,7 +687,7 @@ def _mla_sparse_prefill_v41_fake(
     return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q.device)
 
 
-@torch_compile_guard(mutates_args=["out", "lse"], gen_fake=_mla_sparse_prefill_v41_fake)
+@torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_v41_fake)
 def mla_sparse_prefill_v41(
     q: torch.Tensor,
     q_scale: torch.Tensor,
@@ -689,7 +702,7 @@ def mla_sparse_prefill_v41(
     attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
-    lse: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
     """MLA v4.1 sparse prefill: rows of 512 values with separate E8M0 scales (uint8
@@ -717,8 +730,7 @@ def mla_sparse_prefill_v41(
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, 512]`` bf16 output buffer; allocated
         if ``None``.
-      lse:               Optional ``[T, H]`` fp32 output: natural-log LSE of the
-        scaled scores without the sink, ``+inf`` for a token without rows.
+      num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only).
       backend:           ``"opus"`` or ``None``.
 
     Returns:
@@ -739,7 +751,7 @@ def mla_sparse_prefill_v41(
         attn_sink,
         softmax_scale,
         out,
-        lse,
+        num_kv_splits,
     )
 
 
