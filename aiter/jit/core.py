@@ -282,6 +282,12 @@ AITER_CONFIG_PAGED_MQA_LOGITS = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/paged_mqa_logits_tuned.csv",
 )
 
+# Exact hardware/problem keyed MHA forward runtime dispatch.
+AITER_CONFIG_MHA_FWD = os.getenv(
+    "AITER_CONFIG_MHA_FWD",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mha_fwd.csv",
+)
+
 
 def _runtime_power_selection() -> bool:
     """True when a running ``import aiter`` asked for power tables (AITER_SELECT).
@@ -519,6 +525,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_PAGED_MQA_LOGITS",
             AITER_CONFIG_PAGED_MQA_LOGITS,
             "paged_mqa_logits_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_MHA_FWD_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MHA_FWD",
+            AITER_CONFIG_MHA_FWD,
+            "tuned_mha_fwd",
         )
 
     @property
