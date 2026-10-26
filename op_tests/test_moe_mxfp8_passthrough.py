@@ -39,6 +39,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import (
     _mxfp8_ep_quant,
+    _mxfp8_ep_quant_hip,
     dynamic_per_group_scaled_quant,
     per_1x32_f4_quant,
     per_1x32_mx_quant_hip,
@@ -353,6 +354,45 @@ def test_device_row_limited_mxfp8_quant_graph_replay(capacity, dtype):
         torch.cuda.synchronize()
         assert torch.equal(out[:live_rows], full_out[:live_rows])
         assert torch.equal(scale[:live_rows], full_scale[:live_rows])
+
+
+@_SKIP_GFX950_GPU
+def test_ep_quant_clamps_device_row_count():
+    """Malformed replay counts must not write past the logical tensor capacity."""
+    capacity, cols, padding = 8192, 512, 64
+    sentinel = 0xA5
+    # Extra backing storage keeps the test safe if the logical bound regresses.
+    storage = torch.ones(capacity + padding, cols, dtype=dtypes.bf16, device="cuda")
+    output = torch.empty_like(storage, dtype=dtypes.fp8)
+    scale_bytes = torch.empty(
+        capacity + padding, cols // 32, dtype=torch.uint8, device="cuda"
+    )
+    x, out = storage[:capacity], output[:capacity]
+    scales = scale_bytes[:capacity].view(dtypes.fp8_e8m0)
+    expected = torch.empty_like(out)
+    expected_scales = torch.empty_like(scales)
+    dynamic_per_group_scaled_quant(expected, x, expected_scales, 32, False)
+    count = torch.tensor([capacity], dtype=torch.int32, device="cuda")
+    _mxfp8_ep_quant_hip(out, x, scales, count)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _mxfp8_ep_quant_hip(out, x, scales, count)
+
+    for reported in (capacity, capacity + 1, -1, 0):
+        output.view(torch.uint8).fill_(sentinel)
+        scale_bytes.fill_(sentinel)
+        count.fill_(reported)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert bool((output[capacity:].view(torch.uint8) == sentinel).all())
+        assert bool((scale_bytes[capacity:] == sentinel).all())
+        if reported > 0:
+            assert torch.equal(out, expected)
+            assert torch.equal(scales, expected_scales)
+        else:
+            assert bool((out.view(torch.uint8) == sentinel).all())
+            assert bool((scale_bytes[:capacity] == sentinel).all())
 
 
 @_SKIP_GFX950_GPU
