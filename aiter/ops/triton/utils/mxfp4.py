@@ -42,7 +42,7 @@ def prepare_h16_sign(
     Tensors without a version counter (e.g. inference tensors) are checked on
     every call. Outside capture, the value check synchronizes via ``item()``.
 
-    For optional CUDA graph capture, validate or warm up the consuming wrapper
+    For optional GPU graph capture, validate or warm up the consuming wrapper
     before capture and keep the signs unchanged. An uncached check during
     capture uses ``torch._assert_async`` if available, otherwise raises.
     Graph replay does not rerun Python or the version-cache check; only checks
