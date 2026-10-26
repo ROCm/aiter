@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import math
 import multiprocessing as mp
+import os
 import time
 from multiprocessing import TimeoutError as MPTimeoutError
 
@@ -9,8 +10,25 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
+from aiter_worker_limits import configure_worker_subprocesses
 
 _TASK_START_TIMES = None
+_TASK_PIDS = None
+# rocprofiler-sdk exports these (setenv, so os.environ doesn't see them) when this
+# process initializes the GPU runtime. Spawned workers inherit them, and then the
+# torch profiler there records no GPU kernels, so every candidate times as 0 us.
+_ROCPROFILER_ENV = ("ROCPROFILER_REGISTER_LIBRARY", "HSA_TOOLS_ROCPROFILER_V1_TOOLS")
+
+
+def _new_pool(parallel_num, task_start_times, task_pids):
+    for name in _ROCPROFILER_ENV:
+        os.environ.pop(name, None)
+        os.unsetenv(name)
+    return mp.Pool(
+        processes=parallel_num,
+        initializer=_init_task_start_times,
+        initargs=(task_start_times, task_pids),
+    )
 
 
 def _is_mapping_error(exc: BaseException) -> bool:
@@ -21,16 +39,36 @@ def _is_accelerator_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "AcceleratorError"
 
 
-def _init_task_start_times(task_start_times):
-    global _TASK_START_TIMES
+def _init_task_start_times(task_start_times, task_pids=None):
+    global _TASK_START_TIMES, _TASK_PIDS
+    configure_worker_subprocesses()
     _TASK_START_TIMES = task_start_times
+    _TASK_PIDS = task_pids
 
 
 def _run_with_start_tracking(task_index, func, args):
     if _TASK_START_TIMES is None:
         raise RuntimeError("Task start-time storage is not initialized")
+    if _TASK_PIDS is not None:
+        _TASK_PIDS[task_index] = os.getpid()
     _TASK_START_TIMES[task_index] = time.monotonic()
     return func(*args)
+
+
+def _task_worker_exited(task_pids, task_index):
+    """True once the worker that started this task is gone. A worker killed by a
+    GPU memory fault never returns a result, so waiting on it only ends at the
+    task timeout (or never, without one)."""
+    pid = task_pids[task_index]
+    if pid == 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
 
 
 def _elapsed_since_task_start(task_start_times, task_index, now=None):
@@ -41,11 +79,13 @@ def _elapsed_since_task_start(task_start_times, task_index, now=None):
     return current_time - started_at
 
 
-def _reset_task_start_times(task_start_times, task_indices):
+def _reset_task_start_times(task_start_times, task_indices, task_pids=None):
     """Mark tasks as queued again, so a resubmit is not judged against the
-    timestamp its previous attempt left behind."""
+    timestamp (or worker) its previous attempt left behind."""
     for k in task_indices:
         task_start_times[k] = 0
+        if task_pids is not None:
+            task_pids[k] = 0
 
 
 def _merge_error_ratio(current, observed):
@@ -359,8 +399,9 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             return [(tasks[0] if tasks else "unknown", float("inf"), 1.0)]
 
 
-def get_pid():
-    time.sleep(3)
+def get_pid(delay=3):
+    if delay:
+        time.sleep(delay)
     return mp.current_process().pid
 
 
@@ -440,7 +481,7 @@ def mp_tuner(
     def submit_tasks(pool, gpu_map, task_indices):
         """Submit tasks to the pool and return async results as a dict"""
         task_indices = list(task_indices)
-        _reset_task_start_times(task_start_times, task_indices)
+        _reset_task_start_times(task_start_times, task_indices, task_pids)
         return {
             k: pool.apply_async(
                 _run_with_start_tracking,
@@ -462,12 +503,12 @@ def mp_tuner(
 
     # Create initial pool and submit all tasks
     task_start_times = mp.RawArray("d", len(task_group))
-    pool = mp.Pool(
-        processes=parallel_num,
-        initializer=_init_task_start_times,
-        initargs=(task_start_times,),
-    )
-    pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
+    task_pids = mp.RawArray("i", len(task_group))
+    pool = _new_pool(parallel_num, task_start_times, task_pids)
+    pid_delay = 0 if mp_num == 1 else 3
+    pids = [
+        pool.apply_async(get_pid, args=(pid_delay,)) for i in range(start_idx, mp_num)
+    ]
     gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
     rets_dict = submit_tasks(pool, gpu_map, range(len(task_group)))
     # Convert to list for compatibility with existing code
@@ -542,6 +583,20 @@ def mp_tuner(
                     )
 
             except MPTimeoutError:
+                if _task_worker_exited(task_pids, k):
+                    print(
+                        f"[!] Task {k} lost its worker (pid {task_pids[k]} exited) - likely a GPU fault",
+                        flush=True,
+                    )
+                    failed_tasks.append((k, "worker exited"))
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
+                    completed_this_round.append((k, async_result))
+                    pool_restart_needed = True
+                    break
                 # Check if this specific task has exceeded its timeout (only if timeout is set)
                 if timeout is not None:
                     elapsed = _elapsed_since_task_start(task_start_times, k)
@@ -640,11 +695,7 @@ def mp_tuner(
             except Exception as e:  # noqa: BLE001
                 print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
-            pool = mp.Pool(
-                processes=parallel_num,
-                initializer=_init_task_start_times,
-                initargs=(task_start_times,),
-            )
+            pool = _new_pool(parallel_num, task_start_times, task_pids)
 
             # Recreate gpu_map for new processes (new PIDs)
             pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]

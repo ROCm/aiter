@@ -8,23 +8,31 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Contiguous BF16 BSHD inputs with head dimension 128.
 - BF16 BSHD output.
 - Dense and sorted block-sparse inference.
+- GFX950 LDS-staged sparse recipes support up to 8,192 KV tiles per sequence.
 - Grouped-query ratios `1, 2, 4, 8, 16`.
-- No backward, dropout, RNG state, LSE, causal, or varlen support yet.
+- Per-batch key lengths via `seqlens_k`, on the dense GFX950 `BF16 Q/K` rows only. Every other
+  recipe, architecture, and the sorted-sparse path reject it.
+- Log-sum-exp via `return_lse`, on the dense GFX950 rows. Sorted sparse rejects it, and so does
+  GFX942 until its exported value is measured.
+- No backward, dropout, RNG state, causal, or Q-side varlen support yet.
 
-Supported dense recipes:
+Supported recipes. Every recipe is available in both dense and sorted-sparse mode with the same
+V packing and scale modes.
 
-| Q/K | V |
-|---|---|
-| BF16 | BF16 |
-| BF16 | FP8 |
-| INT8 | FP8 |
-| MXFP8 | FP8 |
-| FP8 | FP8 |
-| FP8 | MXFP6 |
-| MXFP6 | FP8 |
-| MXFP6 | MXFP6 (dense only) |
-| MXFP6 | MXFP4 |
-| MXFP4 | MXFP4 |
+| Q/K | V | Modes |
+|---|---|---|
+| BF16 | BF16 | dense, sparse |
+| BF16 | FP8 | dense, sparse |
+| INT8 | FP8 | dense, sparse |
+| MXFP8 | FP8 | dense, sparse |
+| FP8 | FP8 | dense, sparse |
+| FP8 | MXFP6 | dense, sparse |
+| MXFP6 | FP8 | dense, sparse |
+| MXFP6 | MXFP6 | dense, sparse |
+| MXFP6 | MXFP4 | dense, sparse |
+| MXFP4 | MXFP4 | dense, sparse |
+
+MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
 ## Ownership
 
@@ -60,10 +68,12 @@ Backend choice is private to `mha_v4_quant`; recipe selection does not branch on
 | Per-tensor INT8/FP8 | Triton |
 | Rotated FP8 and FP8 V | Triton |
 | Canonical MXFP6 V | Triton |
-| Canonical MXFP4 V | Triton |
 | MXFP8/MXFP6/MXFP4 Q and K | HIP `module_mha_v4_quant` |
 | FP6-P MXFP6 V | HIP `module_mha_v4_quant` |
 | FP6-P MXFP4 V | HIP `module_mha_v4_quant` |
+
+No manifest row consumes canonical MX V: every MXFP6-V and MXFP4-V row selects the FP6-P pack.
+`quantize_v_mxfp6` is retained only as the reference the FP6-P layout test permutes against.
 
 ## APIs
 
@@ -115,10 +125,10 @@ calling `mha_v4_packed`.
 MXFP4 V uses E2M1 values with one E8M0 scale per `(channel, 32-token)` block. Each 128-token tile
 contributes 8,192 data bytes and 512 scale bytes. The data buffer includes 64 bytes of launch slack.
 
-`AttentionPack.DEFAULT` is the canonical V token order used by sparse kernels and FP8-P rows.
-`AttentionPack.V_FOR_FP6_P` selects the shared dense V token order for FP6-P and FP4-P consumers.
-Numeric format and consumer pairing are separate dispatch contracts even when the physical V
-layout is identical.
+`AttentionPack.DEFAULT` is the canonical V token order. `AttentionPack.V_FOR_FP6_P` selects the V
+token order that FP6-P and FP4-P consumers require, and a row's packing no longer depends on the
+mode: dense and sparse rows for the same recipe select the same pack. Numeric format and consumer
+pairing remain separate dispatch contracts even when the physical V layout is identical.
 
 Changing a custom op's output shape or packed layout requires a versioned custom-op name.
 

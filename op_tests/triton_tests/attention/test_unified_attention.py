@@ -136,7 +136,7 @@ def dynamic_nvfp4_quant_kv_cache(
     return key_cache_quant_and_shuffled, value_cache_quant_and_shuffled
 
 
-def uniform_random(shape, start=0, end=1, dtype=None, device=None):
+def uniform_random(shape, start=0, end=1, dtype=torch.float32, device="cuda"):
     return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
 
 
@@ -145,6 +145,7 @@ def generate_data(
     num_blocks=32768,
     block_size=32,
     head_size=64,
+    v_head_size=None,
     num_heads=(16, 2),
     sliding_window=None,
     q_dtype=torch.bfloat16,
@@ -154,7 +155,7 @@ def generate_data(
     use_q_descale=None,
     use_kv_descale=None,
     use_out_scale=False,
-    device="cpu",
+    device="cuda",
 ):
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
@@ -163,6 +164,8 @@ def generate_data(
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
     assert num_query_heads % num_kv_heads == 0
+    if v_head_size is None:
+        v_head_size = head_size
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)
     if sliding_window is not None and sliding_window > 0:
@@ -204,7 +207,14 @@ def generate_data(
         dtype=torch.float32,
         device=device,
     )
-    value_cache = torch.randn_like(key_cache)
+    value_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        v_head_size,
+        dtype=torch.float32,
+        device=device,
+    )
     if kv_dtype == torch.uint8:
         key_cache_orig = key_cache.to(e4m3_dtype)
         value_cache_orig = value_cache.to(e4m3_dtype)
@@ -229,14 +239,14 @@ def generate_data(
         min(max_num_blocks_per_seq * num_seqs, num_blocks) // num_seqs
     )
     total_ind_count = num_seqs * max_num_blocks_per_seq
-    values = torch.arange(0, total_ind_count, dtype=torch.int)
-    values = values[torch.randperm(total_ind_count)]
-    block_tables = values.view(num_seqs, max_num_blocks_per_seq).contiguous().to(device)
+    values = torch.arange(0, total_ind_count, dtype=torch.int, device=device)
+    values = values[torch.randperm(total_ind_count, device=device)]
+    block_tables = values.view(num_seqs, max_num_blocks_per_seq).contiguous()
 
     sinks = torch.randn(num_query_heads, dtype=torch.float32, device=device)
 
     output = torch.empty(
-        sum(query_lens), num_query_heads, head_size, dtype=out_dtype, device=device
+        sum(query_lens), num_query_heads, v_head_size, dtype=out_dtype, device=device
     )
 
     # ---- descales / output scale ----
@@ -303,8 +313,8 @@ def ref_paged_attn(
     causal: int = 1,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
-    block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
+    v_head_size = value_cache.shape[-1]
     outputs: list[torch.Tensor] = []
     start_idx = 0
     query = query.to(torch.float32)
@@ -327,14 +337,14 @@ def ref_paged_attn(
 
         k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
         k = k[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
+        v = value_cache[block_indices].view(-1, num_kv_heads, v_head_size)
         v = v[:kv_len]
 
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
         attn = torch.einsum("qhd,khd->hqk", q, k).float()
-        empty_mask = torch.ones(query_len, kv_len, device=q.device)
+        empty_mask = torch.ones(query_len, kv_len, device=q.device, dtype=torch.float32)
         mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
         if sliding_window is not None:
             sliding_window_mask = (
@@ -611,6 +621,11 @@ def test_triton_unified_attn(
             softcap=soft_cap,
             use_qq_bias=False,
             use_alibi_slopes=False,
+            head_size=head_size,
+            head_size_v=head_size,
+            shuffled_kv_cache=shuffled_kv_cache,
+            block_size=block_size,
+            k_width=16 // kv_dtype.itemsize,
         ),
         backend,
     )
@@ -720,3 +735,279 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1328)],
+        [(1, 523), (1, 37), (1, 2011)],
+        [(256, 256)],
+        [(1, 137), (5, 1024), (1, 19)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
+@pytest.mark.parametrize(
+    "head_size, v_head_size",
+    [
+        # MiMo decode: qk head wider than the value head
+        (192, 128),
+        # symmetric, must stay identical to the single-mask path
+        (128, 128),
+        # value head wider than qk, the reverse ordering
+        (128, 192),
+    ],
+)
+@pytest.mark.parametrize("block_size", [16, 64])
+# fp8 prefill takes the SPLIT_UNMASKED_LOOP path on gfx950
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype",
+    [(torch.bfloat16, torch.bfloat16), (e4m3_dtype, e4m3_dtype)],
+)
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_triton_unified_attn_asym_head(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    v_head_size: int,
+    block_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    backend: str,
+) -> None:
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    torch.manual_seed(0)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        block_size=block_size,
+        head_size=head_size,
+        v_head_size=v_head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        backend=backend,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.bfloat16),
+            ref_output.to(torch.bfloat16),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg=f"unified_attn asym head qk={head_size} v={v_head_size}",
+        )
+        <= tol_err_ratio
+    )
+
+
+@pytest.mark.parametrize("case", ["shuffled_kv_cache", "out_qk_width"])
+@torch.inference_mode()
+def test_triton_unified_attn_asym_head_guards(case: str) -> None:
+    head_size, v_head_size = 192, 128
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        _q_descale,
+        _k_descale,
+        _v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=[(1, 523)],
+        num_blocks=64,
+        block_size=64,
+        head_size=head_size,
+        v_head_size=v_head_size,
+        num_heads=(8, 1),
+        device="cuda",
+    )
+    shuffled = case == "shuffled_kv_cache"
+    if shuffled:
+        # shuffle_kv_cache wants matching heads, so shuffle k and v on their own
+        key_cache = shuffle_kv_cache(key_cache, key_cache)[0]
+        value_cache = shuffle_kv_cache(value_cache, value_cache)[1]
+    else:
+        # the old convention: out sized by the qk head
+        output = output.new_empty((*output.shape[:-1], head_size))
+
+    with pytest.raises(AssertionError, match="value head size"):
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=sinks,
+            shuffled_kv_cache=shuffled,
+            backend="triton",
+        )
+
+
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
+    # vLLM passes k and v as strided views of one cache that packs k and v in
+    # the last dim. Each view has fewer than 2 GiB of elements, but the view
+    # spans more than 2 GiB, so blocks at the end need 64-bit offsets.
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    torch.manual_seed(0)
+    num_blocks, block_size, num_kv_heads, head_size = 40000, 16, 8, 128
+    num_query_heads = 64
+    dtype = torch.bfloat16
+    kv_cache = torch.empty(
+        num_blocks, num_kv_heads, block_size, 2 * head_size, dtype=dtype, device="cuda"
+    )
+    kv_cache.uniform_(-1, 1)
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    assert key_cache.nelement() * key_cache.element_size() < 2**31
+    assert key_cache[-1].data_ptr() - kv_cache.data_ptr() >= 2**31
+
+    seq_lens = [(1, 1328), (4, 2011), (1, 37), (16, 523)]
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    max_blocks = max((kv + block_size - 1) // block_size for kv in kv_lens_list)
+    # The blocks past 2 GiB, at the end of the cache.
+    block_tables = torch.arange(
+        num_blocks - len(seq_lens) * max_blocks,
+        num_blocks,
+        dtype=torch.int32,
+        device="cuda",
+    ).view(len(seq_lens), max_blocks)
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+    )
+    output = torch.empty_like(query)
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
+    scale = head_size**-0.5
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens_list),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        backend=backend,
+    )
+
+    # Give the reference only the blocks in use.
+    used = block_tables.flatten().long()
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache[used].contiguous(),
+        value_cache=value_cache[used].contiguous(),
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=torch.arange(used.numel(), device=block_tables.device).view(
+            block_tables.shape
+        ),
+        scale=scale,
+        out_dtype=dtype,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
