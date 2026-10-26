@@ -304,7 +304,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      kv_nope, kv_rope, kv_indices_extend, kv_indptr_extend, attn_sink, out, softmax_scale,
      num_splits, partial_o, partial_max, partial_sum, stream))
 {
-    // Single compiled configuration: split NoPE fp8 (448 + 14 E8M0 scales + pad
+    // The head layout every a8w8 variant shares: split NoPE fp8 (448 + 14 E8M0 scales + pad
     // = 512 fp8 slots/row) and RoPE bf16 (64), D_HEAD = 512.
     using Traits = opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits<16, 64, 4, fp8_t, bf16_t, bf16_t>;
     constexpr int D_NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE; // 512
@@ -473,8 +473,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 // ============================================================================
 
 // The code objects' kernel arguments are a field-for-field match of
-// opus_mla_v4_prefill_kargs and opus_mla_v4_prefill_fp8_kargs above, so those are
-// reused verbatim as the kernarg buffers.
+// opus_mla_v4_prefill_kargs and opus_mla_v4_prefill_fp8_kargs above, and of their
+// opus_mla_prefill_split_kargs for the split-K kernels, so those are reused verbatim as the
+// kernarg buffers.
 //
 // The catch is that nothing in this repo rebuilds the code objects: an edit made
 // for the gfx950 path would silently corrupt the gfx1250 launch. Pin every field

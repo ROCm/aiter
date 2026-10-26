@@ -634,12 +634,6 @@ def run_mla_sparse_prefill(
     assert prec in _PRECS, f"unknown prec {prec!r}"
     if _skip_if_unsupported(d=d):
         return None
-    # A forced split count runs where split-K is built: bf16 OPUS, H <= 32,
-    # gfx950. None is the op's own choice, which is split-K for a few tokens.
-    if num_kv_splits is not None and (
-        prec != "bf16" or h > 32 or _get_gpu_arch() != "gfx950"
-    ):
-        return None
 
     softmax_scale = 1.0 / math.sqrt(d)
     msg = (
@@ -669,7 +663,10 @@ def run_mla_sparse_prefill(
                 (
                     "opus",
                     lambda: mla_sparse_prefill_v41(
-                        **kernel_inputs, softmax_scale=softmax_scale, backend="opus"
+                        **kernel_inputs,
+                        softmax_scale=softmax_scale,
+                        num_kv_splits=num_kv_splits,
+                        backend="opus",
                     ),
                 )
             )
@@ -690,7 +687,10 @@ def run_mla_sparse_prefill(
                 (
                     "opus",
                     lambda: mla_sparse_prefill_v4(
-                        **kernel_inputs, softmax_scale=softmax_scale, backend="opus"
+                        **kernel_inputs,
+                        softmax_scale=softmax_scale,
+                        num_kv_splits=num_kv_splits,
+                        backend="opus",
                     ),
                 )
             )
@@ -964,8 +964,7 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=[64, 1024, 4096],
-    help="number of query tokens N (default: [64, 1024, 4096]; 64 is few enough "
-    "that bf16 OPUS splits each token's keys at H=16)",
+    help="number of query tokens N (default: [64, 1024, 4096])",
 )
 parser.add_argument(
     "--h_q",
@@ -1053,8 +1052,7 @@ parser.add_argument(
     type=lambda s: None if s == "auto" else int(s),
     nargs="+",
     default=[None],
-    help="bf16 OPUS split-K counts: auto (the op's own choice), 1, 2, 4 or 8; "
-    "a forced count runs on gfx950 with H <= 32 (default: auto)",
+    help="OPUS split-K counts: auto (the op's own choice), 1, 2, 4 or 8 (default: auto)",
 )
 
 

@@ -240,14 +240,11 @@ def _opus_fwd(gfx: str, op_gfx950, op_gfx1250):
 
 
 # Split-K cuts each token's keys over num_kv_splits workgroups and folds them in a second
-# launch. Auto picks the most splits (8, 4, 2) whose workgroups fit in cap x CUs and that
-# keep at least min_keys keys each. Keyed by arch and the heads a workgroup covers; fit
-# over topk 256-2048, N 8-768 and H 16-128 to lose nowhere, gfx950 on MI355X.
-_KV_SPLIT_FIT = {
-    ("gfx950", 16): (1.5, 192),
-    ("gfx950", 128): (0.75, 192),
-    ("gfx950", 64): (1.0, 384),
-}
+# launch. Auto takes, among the counts whose workgroups still fit in one wave of CUs (past
+# it a split loses), the one that minimizes the keys a workgroup walks plus _KV_SPLIT_COST
+# keys for the partials and their reduce. Fit on gfx1250 over topk 256-4096, N 8-768 and
+# H 16-128.
+_KV_SPLIT_COST = 1280
 
 
 def _opus_heads_per_wg(gfx: str, h: int) -> int:
@@ -258,25 +255,21 @@ def _opus_heads_per_wg(gfx: str, h: int) -> int:
 
 
 def _kv_splits(
-    gfx: str, num_kv_splits: int | None, n: int, h: int, heads_per_wg: int, nnz: int
+    num_kv_splits: int | None, n: int, h: int, heads_per_wg: int, nnz: int
 ) -> int:
     """The split count. Auto reads host scalars only (``nnz``: all tokens' rows, from the
     index tensors' sizes), so a captured graph's choice is its shape's."""
     if num_kv_splits is None:
-        fit = _KV_SPLIT_FIT.get((gfx, heads_per_wg))
-        if fit is None or n == 0:
+        if n == 0:
             return 1
-        cap, min_keys = fit
         wgs = n * -(-h // heads_per_wg)
         keys = nnz / n
-        return next(
-            (
-                s
-                for s in (8, 4, 2)
-                if wgs * s <= cap * get_cu_num() and keys / s >= min_keys
-            ),
-            1,
-        )
+        fits = [s for s in (2, 4, 8) if wgs * s <= get_cu_num()]
+
+        def cost(s: int) -> float:
+            return keys / s + (_KV_SPLIT_COST if s > 1 else 0)
+
+        return min([1, *fits], key=cost)
     if num_kv_splits not in (1, 2, 4, 8):
         # ValueError, a caller's error; RuntimeError would read as a missing kernel.
         raise ValueError(f"num_kv_splits must be 1, 2, 4 or 8, got {num_kv_splits}")
@@ -342,7 +335,7 @@ def _opus_sparse_prefill(
 
     n, h, _ = q.shape
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, _opus_heads_per_wg(gfx, h), nnz)
+    num_kv_splits = _kv_splits(num_kv_splits, n, h, _opus_heads_per_wg(gfx, h), nnz)
     fwd(
         q,
         unified_kv,
@@ -415,7 +408,7 @@ def _opus_sparse_prefill_v4(
         attn_sink,
     )
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, _opus_heads_per_wg(gfx, h), nnz)
+    num_kv_splits = _kv_splits(num_kv_splits, n, h, _opus_heads_per_wg(gfx, h), nnz)
     fwd(
         *args,
         out,
@@ -484,7 +477,7 @@ def _opus_sparse_prefill_v41(
         attn_sink,
     )
     nnz = kv_indices_prefix.numel() + kv_indices_extend.numel()
-    num_kv_splits = _kv_splits(gfx, num_kv_splits, n, h, 64, nnz)
+    num_kv_splits = _kv_splits(num_kv_splits, n, h, 64, nnz)
     fwd(*args, out, float(softmax_scale), *_split_args(n, num_kv_splits, h, q.device))
     return out
 
@@ -553,7 +546,7 @@ def mla_sparse_prefill(
         allocated if ``None``.
       num_kv_splits:     split each token's keys over this many workgroups and
         fold them in a second launch: 1, 2, 4 or 8. ``None`` picks it from the
-        token and head counts.
+        token, head and key counts.
       backend:           ``"opus"`` or ``None``.
 
     Returns:
