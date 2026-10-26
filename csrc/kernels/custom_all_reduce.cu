@@ -517,6 +517,69 @@ void all_gather_unreg(fptr_t _fa,
                 last_dim_size, dim);
 }
 
+void all_gatherv(fptr_t _fa,
+                 std::vector<aiter_tensor_t> const& inps,
+                 std::vector<aiter_tensor_t> const& outs,
+                 std::vector<int64_t> const& sizes,
+                 int64_t reg_buffer,
+                 int64_t reg_bytes)
+{
+    auto fa     = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const int n = static_cast<int>(inps.size());
+    AITER_CHECK(n == static_cast<int>(outs.size()), "all_gatherv needs one output per input");
+    AITER_CHECK(0 < n && n <= aiter::kAllGatherVMax,
+                "all_gatherv takes 1 to ",
+                aiter::kAllGatherVMax,
+                " tensors");
+    AITER_CHECK(static_cast<int>(sizes.size()) == fa->world_size_,
+                "all_gatherv needs one size per rank");
+    int64_t total_rows = 0, max_rows = 0;
+    for(int64_t s : sizes)
+    {
+        total_rows += s;
+        max_rows = std::max(max_rows, s);
+    }
+    AITER_CHECK(total_rows > 0, "all_gatherv needs at least one row");
+    HipDeviceGuard device_guard(outs[0].device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+
+    void* in_ptrs[aiter::kAllGatherVMax];
+    int64_t in_off[aiter::kAllGatherVMax];
+    void* out_ptrs[aiter::kAllGatherVMax];
+    int64_t row_bytes[aiter::kAllGatherVMax];
+    // reg_buffer != 0: the inputs are copied into that registered buffer, each
+    // at an offset every rank computes alike (16-byte aligned, `max_rows` rows
+    // apart) since peers read it there; otherwise each is read where it is.
+    int64_t staged = 0;
+    for(int i = 0; i < n; ++i)
+    {
+        AITER_CHECK(inps[i].size(0) == sizes[fa->rank_],
+                    "all_gatherv input rows differ from this rank's size");
+        row_bytes[i] = outs[i].numel() * outs[i].element_size() / total_rows;
+        out_ptrs[i]  = outs[i].data_ptr();
+        if(reg_buffer == 0)
+        {
+            in_ptrs[i] = inps[i].data_ptr();
+            in_off[i]  = 0;
+            continue;
+        }
+        const int64_t slot = (max_rows * row_bytes[i] + 15) / 16 * 16;
+        if(staged + slot > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the inputs");
+        const int64_t bytes = inps[i].numel() * inps[i].element_size();
+        if(bytes > 0)
+            HIP_CALL(hipMemcpyAsync(reinterpret_cast<uint8_t*>(reg_buffer) + staged,
+                                    inps[i].data_ptr(),
+                                    bytes,
+                                    hipMemcpyDeviceToDevice,
+                                    stream));
+        in_ptrs[i] = reinterpret_cast<void*>(reg_buffer);
+        in_off[i]  = staged;
+        staged += slot;
+    }
+    fa->dispatchAllGatherV(stream, n, in_ptrs, in_off, out_ptrs, row_bytes, sizes.data());
+}
+
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& inp,
                              const aiter_tensor_t& res_inp,
@@ -743,7 +806,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          double eps,
                                          int64_t reg_ptr, int64_t reg_bytes,
                                          bool use_1stage,
-                                         int64_t bf16_out_ptr)
+                                         int64_t bf16_out_ptr,
+                                         bool gemma_norm)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -780,7 +844,7 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
             reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
             (float)eps, m, n, use_1stage,
-            reinterpret_cast<opus::bf16_t*>(bf16_out));
+            reinterpret_cast<opus::bf16_t*>(bf16_out), gemma_norm);
         break;
     }
 #endif
@@ -794,7 +858,7 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
             reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
             (float)eps, m, n, use_1stage,
-            reinterpret_cast<opus::fp16_t*>(bf16_out));
+            reinterpret_cast<opus::fp16_t*>(bf16_out), gemma_norm);
         break;
     }
     default:

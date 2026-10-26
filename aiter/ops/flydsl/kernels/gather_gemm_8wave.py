@@ -6,7 +6,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-# Raw dialect, and the only one here. There IS an fx atom for global -> LDS,
+# The ROCDL operation below has no matching synchronous fx copy atom. There is
 # `cdna4.GlobalLoadAsyncLDS128b`, but only the async one: it completes through
 # asyncmark / wait_asyncmark, while this pipeline's `wait_barrier` is a
 # hand-counted `s_waitcnt vmcnt(N)` covering A and B together. Tracking A one
@@ -14,8 +14,7 @@ import flydsl.expr as fx
 # below. `rocdl.global.load.lds` is the synchronous form and counts in vmcnt,
 # so the existing barrier keeps covering it. Pointers still go through
 # `fx.to_llvm_ptr`, so no address space is hardcoded.
-from flydsl._mlir.dialects import rocdl as _rocdl_d
-from flydsl.expr import T, arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import T, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
 
@@ -125,7 +124,7 @@ class _WideG2SLoader:
             )
             src = fx.add_offset(self.kv_ptr, self.gl_offsets[step] + fx.Int64(k_offset))
             dst = fx.add_offset(lds_dst.ptr, fx.Int32(step_off) + self.lane_id * 16)
-            _rocdl_d.global_load_lds(
+            rocdl.global_load_lds(
                 _raw(fx.to_llvm_ptr(src)), _raw(fx.to_llvm_ptr(dst)), 16, 0
             )
 
@@ -173,8 +172,8 @@ class BlockScale:
 
     def rescale(self, frags_k0, frags_k1, frags_v0, frags_v1, kt):
         """Renormalise all four accumulator groups before tile ``kt`` (kt >= 1)."""
-        rk = Vec.filled(4, self.ratio_k[kt], fx.Float32)
-        rv = Vec.filled(4, self.ratio_v[kt], fx.Float32)
+        rk = fx.full(4, self.ratio_k[kt], fx.Float32)
+        rv = fx.full(4, self.ratio_v[kt], fx.Float32)
         out = []
         for frags, r in (
             (frags_k0, rk),
@@ -276,7 +275,7 @@ class StoreKV:
         ks_div = fx.logical_divide(gKS, fx.make_layout(1, 1))
         r1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
         fx.copy(self.scale_atom, fx.slice(ks_div, (None, 0)), r1)
-        self.k_scale = Vec(fx.memref_load_vec(r1))[0]
+        self.k_scale = fx.memref_load_vec(r1)[0]
         self.inv_k_out_scale = fx.Float32(1.0)
         self.inv_v_out_scale = fx.Float32(1.0)
         if output_fp8:
@@ -291,7 +290,7 @@ class StoreKV:
                     fx.slice(fx.logical_divide(buf, fx.make_layout(1, 1)), (None, 0)),
                     reg,
                 )
-                inv_scales.append(fx.Float32(1.0) / Vec(fx.memref_load_vec(reg))[0])
+                inv_scales.append(1.0 / fx.memref_load_vec(reg)[0])
             self.inv_k_out_scale, self.inv_v_out_scale = inv_scales
 
     def out_col(self, col):
@@ -340,7 +339,7 @@ class StoreKV:
         return out
 
     def _store(self, value, div, index):
-        fx.memref_store_vec(Vec.filled(1, value, self.out_dtype), self.reg_out)
+        fx.memref_store_vec(fx.full(1, value, self.out_dtype), self.reg_out)
         fx.copy(self.out_atom, self.reg_out, fx.slice(div, (None, index)))
 
     def _emit(
@@ -365,13 +364,13 @@ class StoreKV:
             for tj in range_constexpr(self.n_tiles_b):
                 col = self.out_col(col_base + tj * 16) + self.lane_id % 16
                 vec_f32 = Vec(c_frag[self.idx_fn(ti, tj)])
-                scaled = vec_f32 * Vec.filled(4, b_scales[tj], fx.Float32)
+                scaled = vec_f32 * fx.full(4, b_scales[tj], fx.Float32)
                 if self.output_fp8:
                     inv_scale = (
                         self.inv_k_out_scale if tag == "k" else self.inv_v_out_scale
                     )
-                    packed = _pack_fp8(scaled * Vec.filled(4, inv_scale, fx.Float32))
-                    vals = Vec.filled(1, fx.Int32(packed), fx.Int32).bitcast(fx.Int8)
+                    packed = _pack_fp8(scaled * fx.full(4, inv_scale, fx.Float32))
+                    vals = fx.full(1, fx.Int32(packed), fx.Int32).bitcast(fx.Int8)
                 else:
                     vals = scaled.to(fx.BFloat16)
                 for i in range_constexpr(4):
@@ -379,9 +378,7 @@ class StoreKV:
                     if const_expr(n_valid < self.lds_half):
                         # Dead columns of the widened part: an index past the
                         # descriptor's last record discards the store.
-                        index = arith.select(
-                            col < n_valid, index, self.m_rows * row_stride
-                        )
+                        index = (col < n_valid).select(index, self.m_rows * row_stride)
                     self._store(vals[i], div, index)
 
     def store_k(self, c_frag, base_row, head, col_base):
@@ -467,7 +464,7 @@ class _RopeCopy:
             fx.make_layout(16 if output_fp8 else 8, 1),
             fx.Int8 if output_fp8 else fx.BFloat16,
         )
-        self.ks4 = Vec.filled(
+        self.ks4 = fx.full(
             4, k_scale * inv_k_out_scale if output_fp8 else k_scale, fx.Float32
         )
 
@@ -540,9 +537,9 @@ class _RopeCopy:
                         _pack_fp8(scaled) if self.output_fp8 else scaled.to(fx.BFloat16)
                     )
                 if self.output_fp8:
-                    packed = fx.Vector.from_elements(
-                        [fx.Int32(x) for x in outs], dtype=fx.Int32
-                    ).bitcast(fx.Int8)
+                    packed = fx.Vector.from_elements(outs, dtype=fx.Int32).bitcast(
+                        fx.Int8
+                    )
                     fx.memref_store_vec(packed, self.dst_reg)
                     fx.copy(
                         self.st,
@@ -736,7 +733,7 @@ def compile_gather_kv_b_proj_8w(
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
         gKVI = fx.rocdl.make_buffer_tensor(
-            KV_indices, max_size=False, num_records_bytes=fx.Int64(m_rows) * fx.Int64(4)
+            KV_indices, max_size=False, num_records_bytes=fx.Int64(m_rows) * 4
         )
         kvi_div = fx.logical_divide(gKVI, fx.make_layout(1, 1))
 

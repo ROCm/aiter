@@ -77,6 +77,10 @@ FAMILIES = [
         "AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE",
         "a8w8_mxfp8_bpreshuffle_tuned_gemm",
     ),
+    (
+        "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+        "a4w4_mxscale_bpreshuffle_tuned_gemm",
+    ),
     ("AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm"),
     ("AITER_CONFIG_BF16_BATCHED_GEMM", "bf16_tuned_batched_gemm"),
     (
@@ -304,6 +308,12 @@ class TestConfigShapeCollision(unittest.TestCase):
     def test_a4w4_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")
 
+    def test_a4w4_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE",
+            "a4w4_mxscale_bpreshuffle_tuned_gemm",
+        )
+
     def test_a6w6_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm")
 
@@ -393,10 +403,73 @@ class TestConfigShapeCollision(unittest.TestCase):
         )
         with open(merged, newline="") as f:
             rows = list(csv.DictReader(f))
+        dsv4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "7168",
+                "384",
+                "385",
+                "7",
+                "384",
+                "torch.float4_e2m1fn_x2",
+            )
+        ]
+        hy4_rows = [
+            row
+            for row in rows
+            if (
+                row["model_dim"],
+                row["inter_dim"],
+                row["expert"],
+                row["topk"],
+                row["shared_expert_id"],
+                row["q_dtype_w"],
+            )
+            == (
+                "6144",
+                "256",
+                "257",
+                "9",
+                "256",
+                "torch.float8_e4m3fn",
+            )
+        ]
         self.assertEqual(
-            {int(row["token"]) for row in rows},
+            {int(row["token"]) for row in dsv4_rows},
             {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048},
         )
+        self.assertEqual(
+            {int(row["token"]) for row in hy4_rows},
+            {
+                1,
+                2,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+                32768,
+            },
+        )
+        self.assertEqual(len(dsv4_rows), 12)
+        self.assertEqual(len(hy4_rows), 16)
 
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")

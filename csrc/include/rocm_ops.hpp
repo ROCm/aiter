@@ -25,6 +25,7 @@ namespace py = pybind11;
         .value("per_128x128", QuantType::per_128x128)                                       \
         .value("per_256x128", QuantType::per_256x128)                                       \
         .value("per_1024x128", QuantType::per_1024x128)                                     \
+        .value("iq2r_2bit", QuantType::iq2r_2bit)                                           \
         .export_values();                                                                   \
     pybind11::enum_<ActivationType>(m, "ActivationType")                                    \
         .value("No", ActivationType::No)                                                    \
@@ -33,6 +34,7 @@ namespace py = pybind11;
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .value("Situv2", ActivationType::Situv2)                                            \
         .value("GeluTanh", ActivationType::GeluTanh)                                        \
+        .value("Relu2", ActivationType::Relu2)                                              \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -580,6 +582,14 @@ namespace py = pybind11;
           py::arg("out"),                                                            \
           py::arg("reg_bytes"),                                                      \
           py::arg("dim"));                                                           \
+    m.def("all_gatherv",                                                             \
+          &aiter::all_gatherv,                                                       \
+          py::arg("_fa"),                                                            \
+          py::arg("inps"),                                                           \
+          py::arg("outs"),                                                           \
+          py::arg("sizes"),                                                          \
+          py::arg("reg_buffer"),                                                     \
+          py::arg("reg_bytes"));                                                     \
     m.def("fused_allreduce_rmsnorm",                                                 \
           &aiter::fused_allreduce_rmsnorm,                                           \
           py::arg("_fa"),                                                            \
@@ -651,7 +661,8 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                        \
           py::arg("reg_bytes"),                                                      \
           py::arg("use_1stage"),                                                     \
-          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                        \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0),                         \
+          py::arg("gemma_norm")   = false);                                          \
     m.def("fused_qknorm_allreduce",                                                  \
           &aiter::fused_qknorm_allreduce,                                            \
           py::arg("_fa"),                                                            \
@@ -1379,6 +1390,7 @@ namespace py = pybind11;
           py::arg("need_renorm"),                                              \
           py::arg("num_shared_experts")         = 0,                           \
           py::arg("shared_expert_scoring_func") = "",                          \
+          py::arg("num_valid_rows")             = std::nullopt,                \
           "Apply topk softmax to the gating outputs.");                        \
     m.def("topk_softmax_fused_shared_gate",                                     \
           &aiter::topk_softmax_fused_shared_gate,                               \
@@ -1393,6 +1405,7 @@ namespace py = pybind11;
           py::arg("gate_weight"),                                              \
           py::arg("shared_expert_scale")        = 1.0f,                        \
           py::arg("shared_expert_base")         = -1,                          \
+          py::arg("num_valid_rows")             = std::nullopt,                \
           "Apply topk softmax with in-kernel shared-expert gate GEMV "         \
           "(Option A fuse-gate).");                                            \
     m.def("grouped_topk",                                                      \
@@ -1405,6 +1418,7 @@ namespace py = pybind11;
           py::arg("need_renorm"),                                              \
           py::arg("is_softmax")            = true,                             \
           py::arg("routed_scaling_factor") = 1.0f,                             \
+          py::arg("num_valid_rows")        = std::nullopt,                     \
           "Apply grouped topk softmax/sigmodd to the gating outputs.");        \
     m.def("biased_grouped_topk",                                               \
           &biased_grouped_topk,                                                \
@@ -1416,6 +1430,7 @@ namespace py = pybind11;
           py::arg("topk_grp"),                                                 \
           py::arg("need_renorm"),                                              \
           py::arg("routed_scaling_factor") = 1.0f,                             \
+          py::arg("num_valid_rows")        = std::nullopt,                     \
           "Apply biased grouped topk softmax to the gating outputs.");         \
     m.def("moe_fused_gate",                                                    \
           &moe_fused_gate,                                                     \
@@ -1428,6 +1443,7 @@ namespace py = pybind11;
           py::arg("topk"),                                                     \
           py::arg("n_share_experts_fusion"),                                   \
           py::arg("routed_scaling_factor") = 1.0,                              \
+          py::arg("num_valid_rows")        = std::nullopt,                     \
           "Apply biased grouped topk softmax to the gating outputs.");         \
     m.def("moe_align_block_size",                                              \
           &aiter::moe_align_block_size,                                        \
@@ -1446,6 +1462,7 @@ namespace py = pybind11;
           py::arg("routed_scaling_factor") = 1.0,            \
           py::arg("score_func")            = "sqrtsoftplus", \
           py::arg("num_shared_experts")    = 0,              \
+          py::arg("num_valid_rows")        = std::nullopt,   \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
 
 #define MOE_TOPK_CK_PYBIND          \
@@ -1781,6 +1798,7 @@ namespace py = pybind11;
           py::arg("num_valid_ids"),                                      \
           py::arg("token_num"),                                          \
           py::arg("block_m"),                                            \
+          py::arg("total_routes"),                                       \
           py::arg("group_size")     = 32,                                \
           py::arg("sorted_weights") = py::none());                       \
     m.def("fused_dynamic_mx_quant_moe_sort_hip_bounded",                 \
@@ -1909,8 +1927,13 @@ namespace py = pybind11;
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
           py::arg("world_size"),                                                           \
-          py::arg("qr_max_size") = std::nullopt);                                          \
+          py::arg("qr_max_size") = std::nullopt,                                           \
+          py::arg("quant_level") = std::nullopt);                                          \
     m.def("qr_destroy", &aiter::qr_destroy, "qr_destroy(int fa) -> ()", py::arg("fa"));    \
+    m.def("qr_uses_pull_q4",                                                               \
+          &aiter::qr_uses_pull_q4,                                                         \
+          "qr_uses_pull_q4(int fa) -> bool",                                               \
+          py::arg("fa"));                                                                  \
     m.def("qr_all_reduce",                                                                 \
           &aiter::qr_all_reduce,                                                           \
           "qr_all_reduce(int fa, Tensor inp, Tensor out,"                                  \
@@ -2421,6 +2444,44 @@ namespace py = pybind11;
 
 #define MLA_METADATA_PYBIND                              \
     AITER_SET_STREAM_PYBIND;                             \
+    m.def("get_mla_decode_head_plan_v1",                 \
+          &get_mla_decode_head_plan_v1,                  \
+          "get_mla_decode_head_plan_v1",                 \
+          py::arg("num_heads_k"),                        \
+          py::arg("num_heads_per_head_k"),               \
+          py::arg("max_seqlen_qo"),                      \
+          py::arg("uni_seqlen_qo"),                      \
+          py::arg("dtype_q_nope"),                       \
+          py::arg("dtype_kv_nope"),                      \
+          py::arg("fast_mode"),                          \
+          py::arg("intra_batch_mode"),                   \
+          py::arg("arch"),                               \
+          py::arg("enable_experimental"),                \
+          py::arg("flydsl_ps1"),                         \
+          py::arg("v_head_dim"),                         \
+          py::arg("page_size"),                          \
+          py::arg("cp_world_size"),                      \
+          py::arg("cp_round_robin"),                     \
+          py::arg("has_scales"),                         \
+          py::arg("use_opus"),                           \
+          py::arg("use_ps1_asm"));                       \
+    m.def("mla_reduce_v1_supports",                      \
+          &mla_reduce_v1_supports,                       \
+          "mla_reduce_v1_supports",                      \
+          py::arg("num_heads"),                          \
+          py::arg("head_dim"));                          \
+    m.def("mla_metadata_cluster_multiplier_v1",          \
+          &mla_metadata_cluster_multiplier_v1,           \
+          "mla_metadata_cluster_multiplier_v1",          \
+          py::arg("arch"),                               \
+          py::arg("enable_experimental"),                \
+          py::arg("num_heads"),                          \
+          py::arg("max_seqlen_qo"),                      \
+          py::arg("mla_version"),                        \
+          py::arg("dtype_q_nope"),                       \
+          py::arg("dtype_q_rope"),                       \
+          py::arg("dtype_kv_nope"),                      \
+          py::arg("dtype_kv_rope"));                     \
     m.def("get_mla_metadata_v1",                         \
           &get_mla_metadata_v1,                          \
           "get_mla_metadata_v1",                         \
