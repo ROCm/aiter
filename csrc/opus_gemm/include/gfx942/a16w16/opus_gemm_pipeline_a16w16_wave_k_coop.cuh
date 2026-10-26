@@ -3,9 +3,9 @@
 //
 // gfx942 wave-K-cooperative pipeline family.
 //
-// Deterministic WKC: one WG owns a small (M, N) output tile;
+// Deterministic WKC kids 10300-10303: one WG owns a small (M, N) output tile;
 // all waves within the WG split across K, then LDS-reduce partials and store Y.
-// Accum WKC: split K across 8 WGs and atomic-add bf16x2 Y.
+// Accum WKC kids 10310-10314: split K across 8 WGs and atomic-add bf16x2 Y.
 //
 // Geometry: B=(B_M, B_N, B_K), T=(1, 1, BLOCK_SIZE/wave_size),
 // W=(16, 16, 16), LDS_DEPTH=1.

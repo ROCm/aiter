@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-// gfx942 EM3EN4 LDS1/PGR2 splitK pipeline.
+// gfx942 EM3EN4 LDS1/PGR2 splitK pipeline (kid 10204).
 // Device geometry is 96x128x128; host tile is 128M x 96N via A/B swap.
 #pragma once
 

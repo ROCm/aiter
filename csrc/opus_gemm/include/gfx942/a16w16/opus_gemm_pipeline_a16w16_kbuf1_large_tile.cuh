@@ -12,7 +12,7 @@
 
 #endif // __HIP_DEVICE_COMPILE__
 
-// a16w16_kbuf1_large_tile: 4-phase / 2-barrier large-tile path
+// kid 10000 (a16w16_kbuf1_large_tile): 4-phase / 2-barrier large-tile path
 // (BS=512, B_M=B_N=128).
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kbuf1_large_tile_kernel(opus_gemm_noscale_kargs kargs) {
