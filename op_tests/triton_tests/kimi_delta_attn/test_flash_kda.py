@@ -102,6 +102,41 @@ def _route(k1: bool | None = None, k2: bool | None = None):
 
 
 @contextlib.contextmanager
+def _count_launches(module, names):
+    """Count the launches of ``module``'s fast launchers ``names``."""
+    calls = dict.fromkeys(names, 0)
+    saved = {name: getattr(module, name) for name in names}
+
+    class _Counting:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            inner = saved[self.name][grid]
+
+            def launch(**kw):
+                calls[self.name] += 1
+                return inner(**kw)
+
+            return launch
+
+    for name in names:
+        setattr(module, name, _Counting(name))
+    try:
+        yield calls
+    finally:
+        for name in names:
+            setattr(module, name, saved[name])
+
+
+def _gluon_k2_module():
+    return importlib.import_module(
+        "aiter.ops.triton._gluon_kernels."
+        f"{_flash_kda.DEVICE_ARCH}.kimi_delta_attn.flash_kda_k2"
+    )
+
+
+@contextlib.contextmanager
 def _k2_tuner_search_space():
     """Hand K2's autotuner the candidates a tuning build gives it.
 
@@ -446,36 +481,49 @@ def test_published_k2_schedules_can_split_their_tile():
                 reached.add((sched.kwargs["BW"], sched.num_warps))
     assert len(reached) > 1, f"only one schedule reachable: {reached}"
     # Pass C splits its tile the same way.
-    if _flash_kda._GLUON_K2C_ARCH_OK:
-        for segmented in (False, True):
-            sched = _flash_kda._k2c_gluon_schedule(segmented)
+    for segmented in (False, True):
+        sched = _flash_kda._k2c_gluon_schedule(segmented)
+        if sched is not None:
             reached.add((sched.kwargs["BW"], sched.num_warps))
     for bw, nw in sorted(reached):
         assert bw % 16 == 0, f"BW={bw} is not a whole number of MFMA tiles"
         assert nw <= bw // 16, f"BW={bw} cannot be split {nw} ways"
 
 
-def test_k1_schedule_comes_from_the_config(monkeypatch):
-    """K1's occupancy hint comes from the config; a wrong warp count is rejected."""
-    if _flash_kda.DEVICE_ARCH != "gfx950" or not _flash_kda._gluon_k1_usable(
-        FLASH_KDA_CHUNK, K_DIM
-    ):
-        pytest.skip("only the gfx950 Gluon K1 reads its schedule itself")
-    from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
-        flash_kda_k1 as _g1,
+def _patch_gluon_schedule(monkeypatch, replace):
+    """Make ``_published_gluon_schedule`` return ``replace[name]`` for those names."""
+    published = _flash_kda._published_gluon_schedule
+    monkeypatch.setattr(
+        _flash_kda,
+        "_published_gluon_schedule",
+        lambda name: replace[name] if name in replace else published(name),
     )
 
-    assert _g1._k1_schedule()[0] == _g1._NUM_WARPS
 
-    wrong = triton.Config({"waves_per_eu": 0}, num_warps=2 * _g1._NUM_WARPS)
-    monkeypatch.setattr(_g1, "chunk_delta_attn_tuned_config", lambda *a, **kw: wrong)
-    _g1._k1_schedule.cache_clear()
-    try:
-        with pytest.raises(ValueError, match="num_warps"):
-            _g1._k1_schedule()
-    finally:
-        monkeypatch.undo()
-        _g1._k1_schedule.cache_clear()
+def test_gluon_k1_rejects_a_wrong_warp_count(monkeypatch):
+    """K1's layouts fix its warp count, so a config with another one must fail."""
+    if not _flash_kda._gluon_k1_usable(FLASH_KDA_CHUNK, K_DIM):
+        pytest.skip("this arch never routes K1 to Gluon")
+    good = _flash_kda._published_gluon_schedule("k1_prepare_gluon")
+    wrong = triton.Config(dict(good.kwargs), num_warps=2 * good.num_warps)
+    _patch_gluon_schedule(monkeypatch, {"k1_prepare_gluon": wrong})
+    with _route(k1=True), pytest.raises(ValueError, match="num_warps"):
+        run_flash(*make_inputs(1, 64, 2))
+
+
+def test_unpublished_gluon_schedules_fall_back_to_triton(monkeypatch):
+    """Without a published schedule, K1 and pass C take their Triton kernels."""
+    unpublished = ("k1_prepare_gluon", "k2_c_gluon", "k2_c_gluon_segmented")
+    _patch_gluon_schedule(monkeypatch, dict.fromkeys(unpublished))
+    args = make_inputs(1, 1024, 4)
+    o_ref, _ = run_reference(*args)
+    with (
+        _route(k1=True, k2=True),
+        _count_launches(_flash_kda, ["_prepare_fast", "_segment_fast"]) as calls,
+    ):
+        o, _ = run_flash(*args, chunks_per_seg=4)
+    assert calls == {"_prepare_fast": 1, "_segment_fast": 1}
+    assert rel_err(o, o_ref) < 2e-2
 
 
 def _varlen(lens):
@@ -584,40 +632,19 @@ def test_cases_reach_the_gluon_k2():
     """The cases above have to exercise the route they are comparing."""
     if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
         pytest.skip("this arch or tile shape never routes K2 to Gluon")
-    _g2 = importlib.import_module(
-        "aiter.ops.triton._gluon_kernels."
-        f"{_flash_kda.DEVICE_ARCH}.kimi_delta_attn.flash_kda_k2"
-    )
-
     launchers = ["k2_ab_fused_fast"]
     if _flash_kda._GLUON_K2C_ARCH_OK:
         launchers.append("k2_c_fast")
     reached = {name: set() for name in launchers}
-    saved = {name: getattr(_g2, name) for name in launchers}
-
-    class _Counting:
-        def __init__(self, name):
-            self.name = name
-
-        def __getitem__(self, grid):
-            inner = saved[self.name][grid]
-
-            def launch(**kw):
-                reached[self.name].add(current)
-                return inner(**kw)
-
-            return launch
-
-    for name in launchers:
-        setattr(_g2, name, _Counting(name))
-    try:
+    with _count_launches(_gluon_k2_module(), launchers) as calls:
         for current, make in _CASES.items():
             args, kw = make()
+            before = dict(calls)
             with _route(k1=True, k2=True):
                 run_flash(*args, **kw)
-    finally:
-        for name in launchers:
-            setattr(_g2, name, saved[name])
+            for name in launchers:
+                if calls[name] > before[name]:
+                    reached[name].add(current)
 
     want = {name for name in _CASES if name.startswith("segmented")}
     missed = sorted(want - reached["k2_ab_fused_fast"])
@@ -627,19 +654,47 @@ def test_cases_reach_the_gluon_k2():
         assert not missed, f"never reached the Gluon pass C: {missed}"
 
 
-def test_small_unsegmented_pass_c_stays_on_triton():
+@pytest.mark.parametrize(
+    "B, H, chunks_per_seg, gluon",
+    [(1, 4, None, False), (4, 12, None, True), (1, 4, 4, True)],
+    ids=["small", "large", "segmented"],
+)
+def test_pass_c_route_follows_size(monkeypatch, B, H, chunks_per_seg, gluon):
     """The published floor sends few-pair unsegmented shapes to the Triton pass C."""
     if not (
         _flash_kda._GLUON_K2C_ARCH_OK
         and _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM)
     ):
         pytest.skip("this arch or tile shape never routes pass C to Gluon")
-    if not _flash_kda._k2c_gluon_schedule(False).kwargs.get("MIN_BLOCKS_PER_CU"):
+    sched = _flash_kda._k2c_gluon_schedule(False)
+    if sched is None or not sched.kwargs.get("MIN_BLOCKS_PER_CU"):
         pytest.skip("this arch publishes no pass C floor")
-    usable = _flash_kda._k2c_gluon_usable
-    assert not usable(False, K_DIM, 1, 12)
-    assert usable(False, K_DIM, 8, 16)
-    assert usable(True, K_DIM, 16, 4)
+    if chunks_per_seg is None:
+        assert _flash_kda._k2c_gluon_usable(False, K_DIM, B, H) == gluon
+    monkeypatch.setattr(_flash_kda, "AITER_FDA_USE_GLUON_K2", True)
+    monkeypatch.setattr(_flash_kda, "_K2C_ROUTE_BY_SIZE", True)
+    args = make_inputs(B, 1024 if chunks_per_seg else 64, H)
+    with (
+        _count_launches(_gluon_k2_module(), ["k2_c_fast"]) as gluon_calls,
+        _count_launches(_flash_kda, ["_segment_fast"]) as triton_calls,
+    ):
+        run_flash(*args, chunks_per_seg=chunks_per_seg)
+    assert gluon_calls["k2_c_fast"] == int(gluon)
+    assert triton_calls["_segment_fast"] == int(not gluon)
+
+
+def test_segment_length_cap(monkeypatch):
+    """A hard cap bounds every segment; the fallback's soft cap yields to the
+    segment-count cap on long sequences."""
+    monkeypatch.delenv("CHUNK_DELTA_ATTN_FLASH_KDA_SEG", raising=False)
+    choose = _flash_kda._choose_chunks_per_seg
+    long_seq = 64 * _flash_kda._SEG_MAX_SEGMENTS * 32
+    monkeypatch.setattr(_flash_kda, "_seg_limits", lambda: (64, True))
+    for n_chunks in (64, 512, 4096, long_seq):
+        for H in (1, 4, 12):
+            assert choose(n_chunks, 1, H, K_DIM) <= 64, (n_chunks, H)
+    monkeypatch.setattr(_flash_kda, "_seg_limits", lambda: (32, False))
+    assert choose(long_seq, 1, 1, K_DIM) == long_seq // _flash_kda._SEG_MAX_SEGMENTS
 
 
 # A weak gate is the only setting that exposes the intra-chunk inverse. At the

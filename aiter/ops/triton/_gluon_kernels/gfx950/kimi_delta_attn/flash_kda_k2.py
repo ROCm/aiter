@@ -58,6 +58,49 @@ def build_layouts(nw, kw=KW, kw_big=KW_BIG):
 
 
 @gluon.jit
+def _solve_u(
+    h,
+    kd_a,
+    inv_a,
+    beta,
+    v,
+    m_c,
+    C: gl.constexpr,
+    BW: gl.constexpr,
+    MMA: gl.constexpr,
+    B_OP: gl.constexpr,
+    MMA_B: gl.constexpr,
+    B_OP_B: gl.constexpr,
+    INV_TY: gl.constexpr,
+    HAS_V: gl.constexpr,
+):
+    """U = inv @ (beta * (v - kd @ h)), and h as a dot operand."""
+    h_op = gl.convert_layout(h.to(gl.bfloat16), B_OP_B)
+    tmp = gl.convert_layout(
+        gl.amd.cdna4.mfma(kd_a, h_op, gl.zeros([C, BW], gl.float32, MMA_B)), MMA
+    )
+    if HAS_V:
+        u = (v - tmp) * beta[:, None]
+    else:
+        u = (-tmp) * beta[:, None]
+    # Tail rows must stay zero: U feeds the state update, which sums over all C
+    # rows regardless of how many are real.
+    u = gl.where(m_c[:, None], u, 0.0)
+    big_u = gl.amd.cdna4.mfma(
+        inv_a, gl.convert_layout(u.to(INV_TY), B_OP), gl.zeros([C, BW], gl.float32, MMA)
+    )
+    return big_u, h_op
+
+
+@gluon.jit
+def _update(h, kr_a, big_u, gt, B_OP: gl.constexpr):
+    """The next state: diag(gt) h + kr^T U."""
+    return gl.amd.cdna4.mfma(
+        kr_a, gl.convert_layout(big_u.to(gl.bfloat16), B_OP), h * gt[:, None]
+    )
+
+
+@gluon.jit
 def _recur(
     h,
     kd_a,
@@ -76,24 +119,9 @@ def _recur(
     INV_TY: gl.constexpr,
     HAS_V: gl.constexpr,
 ):
-    h_op = gl.convert_layout(h.to(gl.bfloat16), B_OP_B)
-    tmp = gl.convert_layout(
-        gl.amd.cdna4.mfma(kd_a, h_op, gl.zeros([C, BW], gl.float32, MMA_B)), MMA
-    )
-    if HAS_V:
-        u = (v - tmp) * beta[:, None]
-    else:
-        u = (-tmp) * beta[:, None]
-    # Tail rows must stay zero: U feeds the state update, which sums over all C
-    # rows regardless of how many are real.
-    u = gl.where(m_c[:, None], u, 0.0)
-    big_u = gl.amd.cdna4.mfma(
-        inv_a, gl.convert_layout(u.to(INV_TY), B_OP), gl.zeros([C, BW], gl.float32, MMA)
-    )
-    h_next = gl.amd.cdna4.mfma(
-        kr_a, gl.convert_layout(big_u.to(gl.bfloat16), B_OP), h * gt[:, None]
-    )
-    return h_next, big_u, h_op
+    big_u, h_op = _solve_u(h, kd_a, inv_a, beta, v, m_c, C, BW, MMA, B_OP,
+                           MMA_B, B_OP_B, INV_TY, HAS_V)  # fmt: skip
+    return _update(h, kr_a, big_u, gt, B_OP), big_u, h_op
 
 
 @gluon.jit
@@ -494,16 +522,8 @@ def k2_c_gluon(
 
         # _recur's steps, with the state update moved after the output
         # projection to keep the next state and kr out of registers meanwhile.
-        h_op = gl.convert_layout(h.to(gl.bfloat16), B_OP_B)
-        tmp = gl.convert_layout(
-            gl.amd.cdna4.mfma(kd_a, h_op, gl.zeros([C, BW], gl.float32, MMA_B)), MMA
-        )
-        u = gl.where(m_c[:, None], (b_v - tmp) * beta[:, None], 0.0)
-        big_u = gl.amd.cdna4.mfma(
-            inv_a,
-            gl.convert_layout(u.to(inv_ty), B_OP),
-            gl.zeros([C, BW], gl.float32, MMA),
-        )
+        big_u, h_op = _solve_u(h, kd_a, inv_a, beta, b_v, m_c, C, BW, MMA, B_OP,
+                               MMA_B, B_OP_B, inv_ty, True)  # fmt: skip
 
         # o = qd @ h + Mqk @ U, h being the state entering the chunk.
         qd_a = gl.amd.cdna4.async_copy.load_shared_relaxed(s_qd.index(cur), A_OP_B)
@@ -518,9 +538,7 @@ def k2_c_gluon(
         kr_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
             s_kr.index(cur).permute((1, 0)), A_OP
         )
-        h = gl.amd.cdna4.mfma(
-            kr_a, gl.convert_layout(big_u.to(gl.bfloat16), B_OP), h * gt[:, None]
-        )
+        h = _update(h, kr_a, big_u, gt, B_OP)
 
     if STORE_FINAL:  # noqa: SIM102
         if is_last == 1:

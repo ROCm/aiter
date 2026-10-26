@@ -23,6 +23,7 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils imp
     IS_GATHER_SUPPORTED,
     IS_TF32_SUPPORTED,
     autotune_cache_kwargs,
+    chunk_delta_attn_tuned_config,
     exp2,
     input_guard,
 )
@@ -59,7 +60,6 @@ else:
     }
 )
 @triton.autotune(
-    # BH=1 idles most of a warp.
     configs=autotune_configs(
         "CHUNK_DELTA_ATTN",
         [
@@ -67,7 +67,11 @@ else:
             for BH in [1, 2, 4, 8]
             for nw in [1, 2, 4, 8]
         ],
-        default_config=triton.Config({"BH": 4}, num_warps=1, num_stages=3),
+        # The fallback is the untuned pre-gfx950 default.
+        default_config=chunk_delta_attn_tuned_config(
+            "chunk_delta_attn_fwd_kernel_intra_token_parallel",
+            triton.Config({"BH": 1}, num_warps=4, num_stages=3),
+        ),
     ),
     key=["K", "H", "HV"],
     **autotune_cache_kwargs,

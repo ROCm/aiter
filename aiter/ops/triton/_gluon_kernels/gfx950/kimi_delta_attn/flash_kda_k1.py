@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 import math
 
-import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -13,9 +11,6 @@ from aiter.ops.triton._gluon_kernels.common.utils import (
     l2norm,
     sigmoid_log2,
     sum_combine,
-)
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
-    chunk_delta_attn_tuned_config,
 )
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -320,24 +315,8 @@ def k1_prepare_gluon(
     )
 
 
-_NUM_WARPS = math.prod(_MMA_F16.warps_per_cta)
 # The warp count is fixed by the layouts above.
-_K1_FALLBACK = triton.Config({"waves_per_eu": 0}, num_warps=_NUM_WARPS)
-
-
-@functools.cache
-def _k1_schedule() -> tuple[int, int]:
-    """``(num_warps, waves_per_eu)`` for the Gluon K1. Only ``waves_per_eu`` is
-    tunable; a config naming another warp count is rejected."""
-    cfg = chunk_delta_attn_tuned_config(
-        "k1_prepare_gluon", _K1_FALLBACK, backend="gluon"
-    )
-    if cfg.num_warps != _NUM_WARPS:
-        raise ValueError(
-            f"k1_prepare_gluon is built for num_warps={_NUM_WARPS}, "
-            f"but the published config sets {cfg.num_warps}"
-        )
-    return cfg.num_warps, cfg.kwargs.get("waves_per_eu", 0)
+_NUM_WARPS = math.prod(_MMA_F16.warps_per_cta)
 
 
 _k1_fast = fast_launch(k1_prepare_gluon)
@@ -370,8 +349,13 @@ def gluon_k1_prepare(
     B,
     CM_WS="",
     CM_LOAD=".cg",
+    num_warps=_NUM_WARPS,
+    waves_per_eu=0,
 ):
-    num_warps, waves_per_eu = _k1_schedule()
+    if num_warps != _NUM_WARPS:
+        raise ValueError(
+            f"k1_prepare_gluon is built for num_warps={_NUM_WARPS}, got {num_warps}"
+        )
     return _k1_fast[(TOTAL_TILES if cu_seqlens is not None else NT, B * H)](
         q=q,
         k=k,
