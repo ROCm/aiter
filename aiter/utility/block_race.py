@@ -4,13 +4,17 @@
 
 The whole field is measured in one process as a randomized complete block
 design. Each block visits every surviving candidate once, in a fresh random
-order, timing a short run of calls per visit. Blocking pairs the comparison so
-drift cancels in the differences; reshuffling each block keeps position from
-being confounded with the candidate.
+order, timing a short run of calls per visit; the median of those calls is
+the visit's sample. Blocking pairs the comparison so drift cancels in the
+differences; reshuffling each block keeps position from being confounded with
+the candidate.
 
 The objective is selection rather than hypothesis testing, so candidates
-within ``delta`` are treated as settled. That keeps the block count a function
-of delta and the measurement noise, not of the size of the catalogue.
+within ``delta`` of the leader are treated as settled and the race stops once
+no survivor can be more than ``delta`` faster. The error budget is split with
+a Bonferroni bound over every candidate and every look, so the critical value
+grows slowly (about sqrt(log N)) with the field size N and with
+``max_blocks``.
 
 Two constraints on callers:
 
@@ -19,44 +23,80 @@ timing function, so nothing here sees kernel output and a candidate computing
 the wrong answer races like any other. Check it in the pass that compiles and
 warms each candidate, before any timed call.
 
+Timing is the caller's too: ``time_calls(entrant, count)`` returns ``count``
+latencies in microseconds, measured however the family measures everything
+else.
+
 It pays off where the field is large: Triton MHA tiles (1,440 on gfx950)
 tuned inside a cross-backend tuner, or FHMoE's FlyDSL kernel pairs. The
 MHA tuner on this branch measures one candidate per backend and does not
 use it.
 
-Nothing here imports torch at module scope, so the decision logic is testable
-on synthetic latencies. :func:`cuda_event_timer` is the GPU timing function.
+The decision logic only ever sees latencies, so it is tested on synthetic
+ones; nothing here touches a GPU.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
 import random
 import statistics
 import time
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 __all__ = [
-    "BlockJournal",
-    "BlockRecord",
     "JsonlBlockJournal",
     "RaceEntrant",
+    "RacePolicy",
     "RaceResult",
-    "Samples",
     "Verdict",
-    "critical_t",
-    "cuda_event_timer",
-    "measure_blocks",
     "race",
-    "rank",
-    "regularized_incomplete_beta",
-    "select_winner",
-    "student_t_sf",
 ]
+
+
+@dataclass(frozen=True)
+class RacePolicy:
+    """How an interleaved elimination race spends its measurements.
+
+    The race's indifference zone is not set here: ``race`` takes the
+    promotion bar (``min_improvement_pct``) and uses it, so the race and the
+    gate after it agree on what a tie is.
+    """
+
+    # Error budget, split between eliminating the true best and certifying a
+    # winner more than the indifference zone behind it.
+    alpha: float = 0.05
+    # Timed calls per candidate per visit; the visit's median is its sample.
+    block_calls: int = 10
+    # Untimed calls at the start of each visit. The previous visit ran a
+    # different kernel, so the first call is cold.
+    warmup_calls: int = 1
+    # Blocks before elimination may start, and at which the race stops
+    # without certifying a winner.
+    min_blocks: int = 3
+    max_blocks: int = 30
+
+    def __post_init__(self):
+        if not 0.0 < self.alpha < 1.0:
+            raise ValueError(f"alpha must be in (0, 1), got {self.alpha}")
+        if self.block_calls < 1:
+            raise ValueError("block_calls must be at least 1")
+        if self.warmup_calls < 0:
+            raise ValueError("warmup_calls cannot be negative")
+        if not 2 <= self.min_blocks <= self.max_blocks:
+            # One block gives no spread, so nothing could be eliminated.
+            raise ValueError("need 2 <= min_blocks <= max_blocks")
+
+
+DEFAULT_RACE = RacePolicy()
+
+# Seeds the race's block order, so a run is repeatable.
+SAMPLE_SEED = 20240917
 
 
 @dataclass(frozen=True)
@@ -76,7 +116,7 @@ class RaceEntrant:
 
 @dataclass
 class Samples:
-    """Per-call latencies, kept grouped by the block that produced them."""
+    """Per-call latencies, kept grouped by the visit that produced them."""
 
     blocks: list[list[float]] = field(default_factory=list)
 
@@ -86,21 +126,9 @@ class Samples:
 
     @property
     def estimate(self) -> float:
+        """Mean of the visit medians: the statistic the paired test is on."""
         medians = self.block_medians
-        return statistics.median(medians) if medians else float("inf")
-
-    @property
-    def relative_spread(self) -> float:
-        """Block-to-block standard deviation as a fraction of the estimate.
-
-        The tie-break statistic: among candidates equally fast in
-        expectation, prefer the one whose speed repeats.
-        """
-        medians = self.block_medians
-        estimate = self.estimate
-        if len(medians) < 2 or not math.isfinite(estimate) or estimate <= 0:
-            return float("inf")
-        return statistics.stdev(medians) / estimate
+        return statistics.fmean(medians) if medians else float("inf")
 
 
 @dataclass
@@ -112,7 +140,6 @@ class Verdict:
     estimate: float
     relative_gap: float
     blocks_used: int
-    relative_spread: float = float("inf")
     note: str = ""
 
 
@@ -129,43 +156,49 @@ class BlockRecord:
 
 @dataclass
 class RaceResult:
+    """The outcome of :func:`race`.
+
+    ``winner`` is the leader, or the protected incumbent when it passed the
+    same certification test. When ``certified`` is false the race ran out of
+    blocks with some survivor possibly more than ``delta`` faster than
+    ``winner``; ``winner`` is then only the current point-estimate leader, and
+    a caller should keep the incumbent or measure the survivors exhaustively.
+    """
+
     verdicts: list[Verdict]
     samples: dict[str, Samples]
     calls_spent: int
     history: list[BlockRecord]
     certified: bool
     winner: str
-    tie_break: str
+    # "leader" or "incumbent_retained"
+    rule: str
     survivors: list[str]
     blocks_run: int
+    delta: float
     blocks_replayed: int = 0
 
     def entrant(self, entrants: Sequence[RaceEntrant]) -> RaceEntrant | None:
         return next((e for e in entrants if e.label == self.winner), None)
 
 
-class BlockJournal:
-    """Append-only record of completed blocks, for resuming an interrupted race.
+class JsonlBlockJournal:
+    """Append-only record of a race, for resuming one that was interrupted.
+
+    The first line fingerprints the race (field, policy, delta, seed and the
+    caller's key), and a resume refuses a journal whose fingerprint differs.
+    After it come three kinds of line: ``visiting`` before each live visit,
+    ``crashed`` when an entrant leaves, and one line per completed block.
 
     The completed block is the unit of durable progress. Elimination is a pure
     function of the accumulated samples, so replaying whole blocks
-    reconstructs the state exactly and nothing is re-measured.
-    """
+    reconstructs the state exactly. A visit journaled as started but in no
+    completed block was running when the process died, so a resume treats
+    that entrant as crashed rather than run it again.
 
-    def append(self, record: dict) -> None:  # pragma: no cover - interface
-        raise NotImplementedError
-
-    def records(self) -> Iterable[dict]:  # pragma: no cover - interface
-        raise NotImplementedError
-
-
-class JsonlBlockJournal(BlockJournal):
-    """A journal backed by one JSON object per line.
-
-    A resume picks up from the last block written whole. A process killed
-    mid-write leaves an unterminated final line, which is dropped on open so
-    that appends cannot land after invalid JSON and hide every block written
-    since.
+    A process killed mid-write leaves an unterminated final line, which is
+    dropped on open so that appends cannot land after invalid JSON and hide
+    every line written since.
     """
 
     def __init__(self, path: str, resume: bool = False):
@@ -188,7 +221,7 @@ class JsonlBlockJournal(BlockJournal):
             handle.flush()
             os.fsync(handle.fileno())
 
-    def records(self) -> Iterable[dict]:
+    def records(self) -> list[dict]:
         if not os.path.isfile(self.path):
             return []
         kept = []
@@ -201,41 +234,18 @@ class JsonlBlockJournal(BlockJournal):
         return kept
 
 
-def cuda_event_timer(invoke: Callable[[RaceEntrant], Any]):
-    """Time ``invoke`` with CUDA events, returning microseconds per call.
-
-    torch is imported lazily so this module stays importable without it.
-    """
-    import torch
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    def time_calls(entrant: RaceEntrant, count: int) -> list[float]:
-        latencies = []
-        for _ in range(count):
-            start.record()
-            invoke(entrant)
-            end.record()
-            end.synchronize()
-            latencies.append(start.elapsed_time(end) * 1000.0)
-        return latencies
-
-    return time_calls
-
-
 def measure_blocks(
     entrants: Sequence[RaceEntrant],
     time_calls,
-    block_calls: int,
     blocks: int,
     seed: int,
-    discard_per_block: int = 0,
+    policy: RacePolicy = DEFAULT_RACE,
 ) -> dict[str, Samples]:
     """Run a randomized complete block design over the whole field.
 
-    No elimination: every entrant is measured in every block. This is the
-    reference the race is checked against.
+    No elimination: every entrant is measured in every block, with the same
+    per-visit warmup as :func:`race`. This is the reference the race is
+    checked against.
     """
     rng = random.Random(seed)
     samples = {entrant.label: Samples() for entrant in entrants}
@@ -243,14 +253,16 @@ def measure_blocks(
         order = list(entrants)
         rng.shuffle(order)
         for entrant in order:
-            if discard_per_block:
-                time_calls(entrant, discard_per_block)
-            samples[entrant.label].blocks.append(time_calls(entrant, block_calls))
+            if policy.warmup_calls:
+                time_calls(entrant, policy.warmup_calls)
+            samples[entrant.label].blocks.append(
+                time_calls(entrant, policy.block_calls)
+            )
     return samples
 
 
 def _usable_latencies(measured: Sequence[float]) -> bool:
-    """Reject a block that cannot be compared or divided by.
+    """Reject a visit that cannot be compared or divided by.
 
     A zero or negative reading is a broken measurement, not a fast one, and
     the leader's estimate is a denominator throughout the race.
@@ -261,38 +273,61 @@ def _usable_latencies(measured: Sequence[float]) -> bool:
     )
 
 
-def _lower_bound(differences: Sequence[float], per_decision: float) -> float:
-    """Lower confidence bound on the mean paired difference."""
+def _paired(samples: dict[str, Samples], label: str, against: str) -> list[float]:
+    """Per-visit differences ``label - against`` over the blocks both ran."""
+    mine, theirs = samples[label].block_medians, samples[against].block_medians
+    return [mine[i] - theirs[i] for i in range(min(len(mine), len(theirs)))]
+
+
+def _bounds(differences: Sequence[float], per_decision: float) -> tuple[float, float]:
+    """Confidence bounds on the mean paired difference."""
+    centre = statistics.fmean(differences)
     spread = statistics.stdev(differences) / math.sqrt(len(differences))
-    return (
-        statistics.mean(differences)
-        - critical_t(per_decision, len(differences) - 1) * spread
-    )
+    margin = critical_t(per_decision, len(differences) - 1) * spread
+    return centre - margin, centre + margin
+
+
+def _fingerprint(entrants, policy, delta, seed, key) -> dict:
+    return {
+        "key": key,
+        "labels": sorted(entrant.label for entrant in entrants),
+        "protected": sorted(e.label for e in entrants if e.protected),
+        "delta": delta,
+        "seed": seed,
+        "policy": asdict(policy),
+    }
 
 
 def race(
     entrants: Sequence[RaceEntrant],
     time_calls,
     *,
-    delta: float,
-    alpha: float,
-    block_calls: int,
-    min_blocks: int,
-    max_blocks: int,
-    seed: int,
-    journal: BlockJournal | None = None,
+    min_improvement_pct: float,
+    policy: RacePolicy = DEFAULT_RACE,
+    seed: int = SAMPLE_SEED,
+    journal: JsonlBlockJournal | None = None,
     resume: bool = False,
+    key: str = "",
     verbose: bool = True,
     report=print,
 ) -> RaceResult:
     """Eliminate candidates that are worse than the leader by more than delta.
 
-    Elimination and stopping read the same lower bound on the paired
-    difference against the leader, but ask opposite questions of it, which is
-    where the budget is saved. Dropping a candidate needs proof it is more
-    than delta *worse*. Stopping needs proof only that no survivor is more
-    than delta *better*, since that is the only way picking the leader could
-    be wrong.
+    ``delta`` is ``min_improvement_pct / 100``, the promotion bar, so a
+    candidate the race calls tied is one the gate after it would not promote.
+
+    Elimination and stopping read the same paired confidence bound against
+    the leader but ask opposite questions of it, which is where the budget is
+    saved. Dropping a candidate needs proof it is more than delta *worse*.
+    Stopping needs proof only that no survivor is more than delta *better*.
+
+    The guarantee, for near-Gaussian visit medians: with probability at least
+    ``1 - alpha``, a certified race returns a winner no more than delta slower
+    than the best entrant. Half the budget covers eliminating the true best,
+    half covers certifying while it is more than delta faster. The winner is
+    the leader, or a protected incumbent that passes the same stopping test
+    (no survivor proven more than delta faster than it), so the guarantee
+    holds for whichever is returned.
 
     Elimination is permanent and the leader is recomputed every block, so a
     comparison always uses the best evidence so far. Candidates are compared
@@ -300,13 +335,21 @@ def race(
     leave at different times.
 
     Protected entrants are measured but never removed. One the same test would
-    have dropped is reported ``protected_behind``, so being kept is not read
-    as being within delta.
+    have dropped is reported ``protected_behind``.
 
-    ``survivors`` is the set that may be published: the leader plus whatever
-    measured inside the indifference zone. Candidates that merely outlasted
-    the budget are reported ``undecided`` and are not eligible.
+    A visit that raises or returns a reading that is not positive and finite
+    is run once more; an entrant leaves the race as ``crashed`` only if the
+    retry fails too.
+
+    ``survivors`` lists the leader plus whatever measured inside the
+    indifference zone, for reporting. ``key`` names the problem being raced
+    (a shape key) in the journal's fingerprint.
     """
+    if not 0.0 < min_improvement_pct < 100.0:
+        raise ValueError(
+            f"min_improvement_pct must be in (0, 100), got {min_improvement_pct}"
+        )
+    delta = min_improvement_pct / 100.0
     rng = random.Random(seed)
     samples = {entrant.label: Samples() for entrant in entrants}
     by_label = {entrant.label: entrant for entrant in entrants}
@@ -317,73 +360,120 @@ def race(
     # taking the race down with it, and rather than winning on a bad number.
     crashed: dict[str, str] = {}
 
-    replay = list(journal.records()) if (journal is not None and resume) else []
+    replay: list[dict] = []
+    crash_after: dict[int, dict[str, str]] = {}
+    if journal is not None:
+        fingerprint = _fingerprint(entrants, policy, delta, seed, key)
+        records = journal.records() if resume else []
+        if not records:
+            journal.append({"race": fingerprint})
+        elif records[0].get("race") != fingerprint:
+            raise ValueError(
+                f"journal {journal.path} records a different race "
+                f"({records[0].get('race')}); refusing to resume from it"
+            )
+        replay = [record for record in records if "latencies" in record]
+        for record in records:
+            if "crashed" in record:
+                crash_after.setdefault(record["block"], {})[record["crashed"]] = record[
+                    "reason"
+                ]
+        visits = [record for record in records if "visiting" in record]
+        if visits and visits[-1]["block"] > len(replay):
+            label = visits[-1]["visiting"]
+            if not any(label in reasons for reasons in crash_after.values()):
+                reason = "the process died while timing it"
+                crash_after.setdefault(len(replay), {})[label] = reason
+                journal.append(
+                    {"crashed": label, "reason": reason, "block": len(replay)}
+                )
     replayed = 0
+
+    def leave(label: str, reason: str) -> None:
+        crashed[label] = reason
+        if label in active:
+            active.remove(label)
+            if verbose:
+                report(f"  {label} left the race: {reason}")
+
+    def visit(entrant: RaceEntrant) -> tuple[list[float] | None, str, int]:
+        """Time one visit, retrying once; returns (latencies, reason, calls)."""
+        calls, reason = 0, ""
+        for _ in range(2):
+            try:
+                if policy.warmup_calls:
+                    time_calls(entrant, policy.warmup_calls)
+                    calls += policy.warmup_calls
+                measured = time_calls(entrant, policy.block_calls)
+            except Exception as error:  # noqa: BLE001 - a fault is a verdict
+                reason = f"{type(error).__name__}: {error}"
+                continue
+            calls += len(measured)
+            if _usable_latencies(measured):
+                return measured, "", calls
+            reason = "timer returned a latency that is not positive and finite"
+        return None, reason, calls
+
+    for label, reason in crash_after.get(0, {}).items():
+        leave(label, reason)
 
     # Union bound over every candidate and every look, since peeking after
     # each block is repeated testing and an uncorrected alpha would drift.
-    per_decision = alpha / max(1, len(entrants) * max_blocks)
+    per_decision = policy.alpha / max(1, len(entrants) * policy.max_blocks)
 
     calls_spent = 0
     history: list[BlockRecord] = []
     certified = False
 
-    for block_index in range(max_blocks):
+    for block_index in range(policy.max_blocks):
+        block = block_index + 1
         block_started = time.perf_counter()
+        if not active:
+            raise RuntimeError(
+                "every entrant failed to time: "
+                + "; ".join(f"{k} ({v})" for k, v in crashed.items())
+            )
         order = [by_label[label] for label in active]
         rng.shuffle(order)
 
         # Replay and live measurement share this loop so a resumed race cannot
         # reach a different verdict than an uninterrupted one.
         record = replay[block_index] if block_index < len(replay) else None
+        if record is not None and set(record["order"]) != set(active):
+            # The journal has stopped describing this race; keep the blocks
+            # that matched and measure the rest.
+            if verbose:
+                report(f"  journal diverges at block {block}; measuring live")
+            replay = replay[:block_index]
+            record = None
         if record is not None:
-            journaled = [
-                label
-                for label in record["order"]
-                if label in by_label and label in record["latencies"]
-            ]
-            if set(journaled) != set(active):
-                # The journal has stopped describing this race: an entrant
-                # still active here was not measured in that block, so
-                # replaying it would pair blocks that never ran against each
-                # other. Keep the blocks that did match and measure the rest.
-                if verbose:
-                    report(
-                        f"  journal diverges at block {block_index + 1}; "
-                        f"measuring the remaining blocks live"
-                    )
-                replay = replay[:block_index]
-                record = None
-            elif [e.label for e in order] != journaled:
-                # The same field in a different order. The journal is the
-                # record of what actually ran, so it wins.
-                order = [by_label[label] for label in journaled]
-        if record is not None:
+            order = [by_label[label] for label in record["order"]]
             for entrant in order:
-                samples[entrant.label].blocks.append(record["latencies"][entrant.label])
-            calls_spent += sum(len(v) for v in record["latencies"].values())
+                if entrant.label in record["latencies"]:
+                    samples[entrant.label].blocks.append(
+                        record["latencies"][entrant.label]
+                    )
+            calls_spent += record.get("calls", 0)
             replayed += 1
+            for label, reason in crash_after.get(block, {}).items():
+                leave(label, reason)
         else:
-            latencies = {}
+            latencies, failures, block_calls = {}, {}, 0
             for entrant in order:
-                try:
-                    measured = time_calls(entrant, block_calls)
-                except Exception as error:  # noqa: BLE001 - a fault is a verdict
-                    crashed[entrant.label] = f"{type(error).__name__}: {error}"
-                    continue
-                if not _usable_latencies(measured):
-                    crashed[entrant.label] = (
-                        "timer returned a latency that is not positive and finite"
-                    )
+                if journal is not None:
+                    journal.append({"visiting": entrant.label, "block": block})
+                measured, reason, calls = visit(entrant)
+                block_calls += calls
+                if measured is None:
+                    failures[entrant.label] = reason
                     continue
                 samples[entrant.label].blocks.append(measured)
                 latencies[entrant.label] = measured
-                calls_spent += len(measured)
-            for label, reason in crashed.items():
-                if label in active:
-                    active.remove(label)
-                    if verbose:
-                        report(f"  {label} left the race: {reason}")
+            calls_spent += block_calls
+            for label, reason in failures.items():
+                if journal is not None:
+                    journal.append({"crashed": label, "reason": reason, "block": block})
+                leave(label, reason)
             if not active:
                 raise RuntimeError(
                     "every entrant failed to time: "
@@ -392,40 +482,40 @@ def race(
             if journal is not None:
                 journal.append(
                     {
-                        "block": block_index + 1,
+                        "block": block,
                         "order": [entrant.label for entrant in order],
                         "latencies": latencies,
+                        "calls": block_calls,
                     }
                 )
 
-        block_wall = time.perf_counter() - block_started
         history.append(
-            BlockRecord(block_index + 1, len(active), calls_spent, block_wall)
+            BlockRecord(
+                block, len(active), calls_spent, time.perf_counter() - block_started
+            )
         )
-        if block_index + 1 < min_blocks:
+        if block < policy.min_blocks:
             continue
 
         leader = min(active, key=lambda label: samples[label].estimate)
-        leader_blocks = samples[leader].block_medians
-        leader_estimate = samples[leader].estimate
-        tolerance = delta * leader_estimate
+        tolerance = delta * samples[leader].estimate
 
         undecided, dropped = [], []
         behind = {}
         for label in active:
             if label == leader:
                 continue
-            blocks = samples[label].block_medians
-            paired = min(len(leader_blocks), len(blocks))
-            differences = [blocks[i] - leader_blocks[i] for i in range(paired)]
+            differences = _paired(samples, label, leader)
             if len(differences) < 2:
                 undecided.append(label)
                 continue
-            lower = _lower_bound(differences, per_decision)
+            lower, _ = _bounds(differences, per_decision)
             if lower > tolerance:
                 if by_label[label].protected:
                     # Kept in the field, but the evidence says it is behind.
-                    behind[label] = samples[label].estimate / leader_estimate - 1.0
+                    behind[label] = (
+                        samples[label].estimate / samples[leader].estimate - 1.0
+                    )
                 else:
                     dropped.append(label)
             elif lower <= -tolerance:
@@ -433,17 +523,17 @@ def race(
 
         for label in dropped:
             eliminated[label] = (
-                block_index + 1,
-                samples[label].estimate / leader_estimate - 1.0,
+                block,
+                samples[label].estimate / samples[leader].estimate - 1.0,
             )
             active.remove(label)
         history[-1].eliminated = len(dropped)
 
         if verbose:
             report(
-                f"  block {block_index + 1:>3}: {len(active):>3} active, "
+                f"  block {block:>3}: {len(active):>3} active, "
                 f"{len(dropped):>2} eliminated, {len(undecided):>2} undecided, "
-                f"leader {leader_estimate:8.1f} us"
+                f"leader {samples[leader].estimate:8.1f} us"
             )
         if not undecided:
             certified = True
@@ -451,25 +541,41 @@ def race(
 
     leader = min(active, key=lambda label: samples[label].estimate)
     leader_estimate = samples[leader].estimate
+    tolerance = delta * leader_estimate
+
+    def certifies(label: str) -> bool:
+        """No other survivor is proven to be more than delta faster."""
+        for other in active:
+            if other == label:
+                continue
+            differences = _paired(samples, other, label)
+            if len(differences) < 2:
+                return False
+            lower, _ = _bounds(differences, per_decision)
+            if lower <= -tolerance:
+                return False
+        return True
+
+    winner, rule = leader, "leader"
+    if certified:
+        incumbents = sorted(
+            (
+                label
+                for label in active
+                if by_label[label].protected and label != leader
+            ),
+            key=lambda label: (samples[label].estimate, label),
+        )
+        for label in incumbents:
+            if label not in behind and certifies(label):
+                winner, rule = label, "incumbent_retained"
+                break
+    if by_label[leader].protected:
+        rule = "incumbent_retained"
 
     verdicts = [
-        Verdict(
-            leader,
-            "leader",
-            leader_estimate,
-            0.0,
-            len(samples[leader].blocks),
-            samples[leader].relative_spread,
-        )
+        Verdict(leader, "leader", leader_estimate, 0.0, len(samples[leader].blocks))
     ]
-    # Surviving elimination is not the same as being tied with the leader.
-    # Elimination needs *proof* of being more than delta worse, so a noisy
-    # candidate can outlast the race while its point estimate sits well behind.
-    # Only candidates whose measured latency is actually inside the
-    # indifference zone are eligible to be published, because the tie-break
-    # reasons about configurations believed to be equally fast; handing it one
-    # that is merely unproven would let steadiness outrank being much slower.
-    tolerance = delta * leader_estimate
     notes = {
         "protected_behind": "protected, but measured behind the leader",
         "undecided": "outlasted the budget without being separated from the leader",
@@ -493,7 +599,6 @@ def race(
                 samples[label].estimate,
                 samples[label].estimate / leader_estimate - 1.0,
                 len(samples[label].blocks),
-                samples[label].relative_spread,
                 notes[state],
             )
         )
@@ -505,7 +610,6 @@ def race(
                 samples[label].estimate,
                 gap,
                 len(samples[label].blocks),
-                samples[label].relative_spread,
                 f"dropped after block {block}",
             )
         )
@@ -517,12 +621,10 @@ def race(
                 float("inf"),
                 float("inf"),
                 len(samples[label].blocks),
-                samples[label].relative_spread,
                 reason,
             )
         )
 
-    winner, tie_break = select_winner(survivors, samples, by_label)
     return RaceResult(
         verdicts=verdicts,
         samples=samples,
@@ -530,52 +632,11 @@ def race(
         history=history,
         certified=certified,
         winner=winner,
-        tie_break=tie_break,
+        rule=rule,
         survivors=survivors,
         blocks_run=history[-1].block if history else 0,
+        delta=delta,
         blocks_replayed=replayed,
-    )
-
-
-def select_winner(
-    survivors: Sequence[str],
-    samples: dict[str, Samples],
-    by_label: dict[str, RaceEntrant],
-) -> tuple[str, str]:
-    """Pick one config from a set the race declared equally fast.
-
-    No survivor is meaningfully faster than another, so this rule is not about
-    speed. It exists to make a re-tune return the same answer and leave the
-    config file alone when nothing improved.
-
-    The incumbent wins first, then the steadiest survivor, then a stable sort
-    on the label so exactly tied spreads still resolve the same way every run.
-    """
-    if not survivors:
-        raise ValueError("a race cannot finish with no survivors")
-
-    protected = sorted(
-        (label for label in survivors if by_label[label].protected),
-        key=lambda label: (samples[label].estimate, label),
-    )
-    if protected:
-        return protected[0], "incumbent_retained"
-
-    ordered = sorted(
-        survivors, key=lambda label: (samples[label].relative_spread, label)
-    )
-    if len(ordered) == 1:
-        return ordered[0], "sole_survivor"
-    best, runner_up = ordered[0], ordered[1]
-    if samples[best].relative_spread == samples[runner_up].relative_spread:
-        return best, "stable_sort"
-    return best, "lowest_spread"
-
-
-def rank(samples: dict[str, Samples]) -> list[tuple[str, float]]:
-    return sorted(
-        ((label, sample.estimate) for label, sample in samples.items()),
-        key=lambda item: item[1],
     )
 
 
@@ -649,6 +710,7 @@ def student_t_sf(t: float, degrees: int) -> float:
     return tail if t > 0 else 1.0 - tail
 
 
+@functools.lru_cache(maxsize=4096)
 def critical_t(alpha_two_sided: float, degrees: int) -> float:
     """Two-sided critical value: t with P(|T| > t) == alpha_two_sided.
 
