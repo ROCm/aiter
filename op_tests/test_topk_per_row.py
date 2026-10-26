@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter.jit.utils import chip_info
 from aiter.jit.utils.chip_info import get_cu_num_device, get_gfx, get_gfx_runtime
 from aiter.ops import topk
 from aiter.ops.asm.asm_utils import load_hip
@@ -749,11 +750,10 @@ def test_decode_mixed_node():
     seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
     want = stable_reference(logits, top_k)
     mixed = AssertionError("GPUs on this node differ in CU count")
-    with (
-        mock.patch.object(topk, "get_cu_num", side_effect=mixed),
-        mock.patch.object(flydsl_decode_host, "get_cu_num", side_effect=mixed),
-    ):
-        for backend in (None, topk.BACKEND_ADAPTIVE):
+    # Every importer of `get_cu_num` shares its cache, so clear it to reach the probe.
+    chip_info.get_cu_num.cache_clear()
+    with mock.patch.object(chip_info, "get_cu_num_custom_op", side_effect=mixed):
+        for backend in (None, topk.BACKEND_SINGLE, topk.BACKEND_ADAPTIVE):
             out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
             flydsl_decode_host._decode_with_backend(
                 logits,

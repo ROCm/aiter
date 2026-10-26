@@ -8,7 +8,7 @@ from functools import lru_cache
 
 import torch
 
-from aiter.jit.utils.chip_info import get_cu_num, get_cu_num_device, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num_device, get_gfx_runtime
 from aiter.ops.asm.asm_utils import load_hip
 from aiter.ops.topk import (
     BACKEND_ADAPTIVE,
@@ -664,7 +664,7 @@ def _decode_with_backend(
         values=values,
         arch=arch,
         wave_size=wave_size,
-        num_cus=get_cu_num(),
+        num_cus=get_cu_num_device(logits.device.index),
         stream=stream,
         packed_rows=packed,
         full_rows=full_rows,
