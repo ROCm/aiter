@@ -447,7 +447,6 @@ def benchmark(args):
 
 def run_bench(args):
     torch.manual_seed(0)
-    torch.set_default_device(args.device)
     benchmark(args)
 
 
