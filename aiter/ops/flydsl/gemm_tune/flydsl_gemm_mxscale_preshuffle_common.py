@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from typing import Any
 
 _DTYPE_SHORT = {"fp8": "F8", "fp6": "F6", "fp4": "F4", "bf16": "B16", "fp16": "F16"}
 _SHORT_DTYPE = {v: k for k, v in _DTYPE_SHORT.items()}
@@ -32,6 +34,13 @@ _TILE_M = (32, 64, 96, 128, 256, 16)
 # workgroups (WG=N/tile_n) and fill the CUs; tile_n>=64 keeps 4 waves / block 256.
 _TILE_N = (16, 32, 64, 128, 256, 512)
 _TILE_K = (128, 256)
+# tile_k=512 (fp8/fp8, row-layout scales only): half the K-loop trips and twice
+# the bytes in flight per trip, for the latency-bound small-M tiles. Appended
+# after the rest of the catalog so the existing kernel ids keep their numbers.
+_TILE_K_512_TILE_M = (16, 32, 64)
+# The fp8/fp8/bf16 split-K tiles again with fused_split_k (_fsk), appended last
+# with their ids offset past the 8-wave range (dispatch is by kernelName).
+KERNEL_ID_BASE_FSK = 2_000_000
 # Occupancy hints, following the (0, 2, 4) selection
 # flydsl/kernels/small_m_hgemm.py already uses: 0 (no hint) is a distinct mode,
 # and the odd values in between duplicate their neighbours rather than adding
@@ -87,6 +96,7 @@ def make_kernel_name(
     xcd_swizzle: int = 0,
     split_k: int = 1,
     blockscale: str = "none",
+    fused_split_k: bool = False,
 ) -> str:
     """The one place the mxpsh kernelName is spelled.
 
@@ -97,12 +107,15 @@ def make_kernel_name(
     apart. The suffix is deliberately NOT part of the CSV grammar
     (`parse_kernel_name` returns None for it) and never reaches `kernelInstance.name`:
     the CSV keeps one spelling per launch config, so CSVs tuned before the suffix
-    existed keep working unchanged.
+    existed keep working unchanged. `_fsk` marks a split-K reduced in-kernel by
+    each tile's last-arriving block (fused_split_k, 1x32 row scales) instead of
+    by a separate reduce launch; it is part of the CSV grammar.
     """
     a, b, o = _DTYPE_SHORT[a_dtype], _DTYPE_SHORT[b_dtype], _DTYPE_SHORT[out_dtype]
     name = (
         f"flydsl_mxpsh_{tile_m}x{tile_n}x{tile_k}"
         f"_{a}_{b}_{o}_w{waves_per_eu}_x{xcd_swizzle}_sk{split_k}"
+        f"{'_fsk' if fused_split_k else ''}"
     )
     return name if blockscale == "none" else f"{name}_bs{blockscale}"
 
@@ -118,6 +131,7 @@ class kernelInstance:
     waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
     xcd_swizzle: int = 0  # 0=off, >0=XCD L2-rasterization group size
     split_k: int = 1  # 1=no split-K, >1=K-batch (partials reduced in fp32)
+    fused_split_k: bool = False  # split-K reduced in-kernel (1x32 row scales)
 
     @property
     def name(self) -> str:
@@ -131,12 +145,13 @@ class kernelInstance:
             self.waves_per_eu,
             self.xcd_swizzle,
             self.split_k,
+            fused_split_k=self.fused_split_k,
         )
 
 
 _NAME_RE = re.compile(
     r"^flydsl_mxpsh_(\d+)x(\d+)x(\d+)_([A-Z0-9]+)_([A-Z0-9]+)_([A-Z0-9]+)_w(\d+)"
-    r"(?:_x(\d+))?(?:_sk(\d+))?$"
+    r"(?:_x(\d+))?(?:_sk(\d+))?(_fsk)?$"
 )
 
 
@@ -144,12 +159,12 @@ def parse_kernel_name(name: str):
     """kernelName string -> dict of launch params (None if it isn't an mxpsh name).
 
     The _x{xcd} and _sk{split_k} suffixes are optional (older names without them
-    default to xcd_swizzle=0 / split_k=1).
+    default to xcd_swizzle=0 / split_k=1); a trailing _fsk sets fused_split_k.
     """
     m = _NAME_RE.match(name.strip())
     if not m:
         return None
-    tm, tn, tk, a, b, o, wpe, xcd, sk = m.groups()
+    tm, tn, tk, a, b, o, wpe, xcd, sk, fsk = m.groups()
     return {
         "tile_m": int(tm),
         "tile_n": int(tn),
@@ -160,12 +175,71 @@ def parse_kernel_name(name: str):
         "waves_per_eu": int(wpe),
         "xcd_swizzle": int(xcd) if xcd is not None else 0,
         "split_k": int(sk) if sk is not None else 1,
+        "fused_split_k": fsk is not None,
     }
 
 
-def estimated_lds_bytes(ki: kernelInstance) -> int:
-    """Double-buffered A tile in LDS (SharedA.a0/a1), row-major [tile_m][a_row_bytes]."""
-    return 2 * ki.tile_m * _a_row_bytes(ki.a_dtype, ki.tile_k)
+# Each operand's e8m0 scale is a block and a layout -- the kernel's
+# a_/b_scale_block and a_/b_scale_layout Constexprs. A block is "1x32", or the
+# coarse "1x128" (A) / "128x128" (B) broadcast to the 1x32 MFMA (a8w8 only).
+# A layout is "mfma_tile" (pre-shuffled by the caller) or "row" (the unshuffled
+# scale as quantized, a8w8, staged by the kernel: row-major [rows, K // 32] for
+# 1x32; B's "32x32" row-major [N // 32, K // 32], its panel DMA repeating each
+# scale row over its 32 N-rows; A's "1x128" the blockscale column-major
+# [K // 128, M] bytes; B's "128x128" [N // 128, K // 128] -- bmm's scales).
+SCALE_BLOCKS_A = ("1x32", "1x128")
+SCALE_BLOCKS_B = ("1x32", "128x128", "32x32")
+SCALE_LAYOUTS = ("mfma_tile", "row")
+
+# "row" layout: K-tiles per LDS scale-panel row.
+ROW_SCALE_CHUNK = 4
+
+
+def row_scale_panel(rows: int, tile_k: int, num_threads: int) -> tuple[int, int, int]:
+    """(rows per slice, DMA passes per slice, bytes) of one row-layout LDS panel.
+
+    A panel row holds ROW_SCALE_CHUNK K-tiles of one scale row; slice j of the
+    next chunk is DMA'd a dword per lane in iteration j, and a slice's spare
+    lanes run on past it, so the panel is padded to cover the last slice's tail.
+    """
+    crow = ROW_SCALE_CHUNK * tile_k // 32
+    rs = -(-rows // ROW_SCALE_CHUNK)
+    passes = -(-(rs * crow // 4) // num_threads)
+    size = max(
+        rows * crow, (ROW_SCALE_CHUNK - 1) * rs * crow + passes * num_threads * 4
+    )
+    return rs, passes, (size + 15) // 16 * 16
+
+
+def col_scale_panel(tile_m: int, tile_k: int, num_threads: int) -> int:
+    """Bytes of one 1x128 column-major A-scale LDS panel: a K-tile's scales a
+    byte per lane in dword slots of their own, word-major (E slots per pair word
+    and 16-row lane), padded to whole passes."""
+    k_halves = tile_k // 128
+    slots = max(1, tile_m // 32) * max(1, k_halves // 2) * 16 * 2 * min(2, k_halves)
+    return -(-slots // num_threads) * num_threads * 4
+
+
+def estimated_lds_bytes(
+    ki: kernelInstance,
+    a_scale_layout: str = "mfma_tile",
+    b_scale_layout: str = "mfma_tile",
+    a_scale_block: str = "1x32",
+    b_scale_block: str = "1x32",
+) -> int:
+    """Double-buffered A tile in LDS (SharedA.a0/a1), row-major [tile_m][a_row_bytes],
+    plus the double-buffered scale panel of each row-layout operand: a 1x32-row
+    panel, a 1x128 A's column panel, none for a 128x128 B (read from global)."""
+    lds = 2 * ki.tile_m * _a_row_bytes(ki.a_dtype, ki.tile_k)
+    threads = min(_WAVES_PER_WG, ki.tile_n // _MFMA_N) * 64
+    if a_scale_layout == "row":
+        if a_scale_block == "1x128":
+            lds += 2 * col_scale_panel(ki.tile_m, ki.tile_k, threads)
+        else:
+            lds += 2 * row_scale_panel(ki.tile_m, ki.tile_k, threads)[2]
+    if b_scale_layout == "row" and b_scale_block != "128x128":
+        lds += 2 * row_scale_panel(ki.tile_n, ki.tile_k, threads)[2]
+    return lds
 
 
 def _max_lds_bytes() -> int:
@@ -179,13 +253,16 @@ def _max_lds_bytes() -> int:
 
 def instance_valid(ki: kernelInstance) -> bool:
     """Shape-independent legality against the mxscale_preshuffle kernel constraints."""
-    if ki.tile_k not in (128, 256):
+    if ki.tile_k not in (128, 256) and not (
+        ki.tile_k == 512 and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
+    ):
         return False
     if ki.tile_m % 32 != 0 and not (
         ki.tile_m == 16 and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
     ):
-        # The per-1x32 MX path packs M chunks in pairs. The M=16 exception is
-        # reserved for the blockscale a8w8 path, where one A scale broadcasts.
+        # A pre-shuffled per-1x32 A scale packs M chunks in pairs. a8w8 may run
+        # one 16-row chunk: its raw (row) scales pack a lone chunk's word with
+        # itself, and a mfma_tile 1x128 scale broadcasts.
         return False
     if ki.tile_n % 16 != 0:  # MFMA emits 16 N-cols; tile_n must be a multiple of 16
         return False
@@ -204,7 +281,17 @@ def instance_valid(ki: kernelInstance) -> bool:
     return not estimated_lds_bytes(ki) > _max_lds_bytes()
 
 
-def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+def fits_shape(
+    ki: kernelInstance,
+    M: int,
+    N: int,
+    K: int,
+    *,
+    a_scale_block: str,
+    b_scale_block: str,
+    a_scale_layout: str,
+    b_scale_layout: str,
+) -> bool:
     """M is ragged (grid ceil + OOB clip). K must be a multiple of 128: each e8m0
     microscale half is 128-K, and tile_k=128 pairs two halves into one 256-K scale
     word (shuffle_scale rounds K up to a whole 256-K chunk). K%tile_k excludes
@@ -212,15 +299,37 @@ def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
 
     split-K legality (split_k>1): the per-split K length (K/split_k) must stay a
     whole number of tile_k K-tiles AND a whole number of 256-K e8m0 scale chunks,
-    so the split boundary never straddles a tile or a microscale word."""
+    so the split boundary never straddles a tile or a microscale word.
+
+    The scale blocks / layouts are the kernel's (see SCALE_LAYOUTS), always named
+    by the caller. A row-layout operand's scale panel must fit LDS next to A."""
     if K % 128 != 0:
+        return False
+    row_row = (a_scale_layout, b_scale_layout) == ("row", "row")
+    if ki.tile_k == 512 and not row_row:
+        return False  # a mfma_tile scale word spans 256 K: tile_k <= 256
+    if ki.fused_split_k and not row_row:
+        return False  # the in-kernel reduce reads row-layout scales' fp32 partials
+    if (
+        "row" in (a_scale_layout, b_scale_layout)
+        and estimated_lds_bytes(
+            ki, a_scale_layout, b_scale_layout, a_scale_block, b_scale_block
+        )
+        > _max_lds_bytes()
+    ):
         return False
     if ki.tile_m == 16 and M > 16:
         return False
-    # blockscale is a8w8-only and needs whole 128-N blocks: shuffle_scale_blockscale_b
-    # takes (N//128, K//128) and the kernel reads 4 dwords per 128-N block. fp4/fp6
-    # combos run the per-1x32 MX path (blockscale=False) and are exempt.
-    if (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8") and N % 128 != 0:
+    if b_scale_block == "32x32" and (b_scale_layout != "row" or N % 32 != 0):
+        return False  # read row-major, one scale row per whole 32-N block
+    # A 128x128 b_scale is a8w8-only and needs whole 128-N blocks: (N//128, K//128)
+    # scales, one per 128-N block. fp4/fp6 combos run the per-1x32 MX path and
+    # are exempt.
+    if (
+        (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
+        and b_scale_block == "128x128"
+        and N % 128 != 0
+    ):
         return False
     if (N % ki.tile_n != 0) or (K % ki.tile_k != 0):
         return False
@@ -258,16 +367,177 @@ def _build_kernels_list():
                                 if instance_valid(ki):
                                     out[idx] = ki
                                     idx += 1
+    for tm in _TILE_K_512_TILE_M:
+        for tn in _TILE_N:
+            for wpe in _WAVES_PER_EU:
+                for xcd in _XCD_SWIZZLE:
+                    for sk in _SPLIT_K:
+                        ki = kernelInstance(
+                            tm, tn, 512, "fp8", "fp8", "bf16", wpe, xcd, sk
+                        )
+                        if instance_valid(ki):
+                            out[idx] = ki
+                            idx += 1
+    for i, ki in list(out.items()):
+        if ki.split_k > 1 and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8"):
+            out[KERNEL_ID_BASE_FSK + i] = replace(ki, fused_split_k=True)
     return out
 
 
 kernels_list = _build_kernels_list()
 
 
-def candidates_for(a_dtype: str, b_dtype: str, M: int, N: int, K: int):
-    """(kernel_id, kernelInstance) that match the dtypes and fit the shape."""
+def candidates_for(a_dtype: str, b_dtype: str, M: int, N: int, K: int, **scales):
+    """(kernel_id, kernelInstance) that match the dtypes and fit the shape.
+    ``scales`` are fits_shape's a_/b_scale_block and a_/b_scale_layout."""
     return [
         (i, ki)
         for i, ki in kernels_list.items()
-        if ki.a_dtype == a_dtype and ki.b_dtype == b_dtype and fits_shape(ki, M, N, K)
+        if ki.a_dtype == a_dtype
+        and ki.b_dtype == b_dtype
+        and fits_shape(ki, M, N, K, **scales)
     ]
+
+
+# ===========================================================================
+# 8-wave mxfp8 (gemm_a8w8_mxfp8_8wave): a second a8w8 1x32 pipeline, row scales
+# ===========================================================================
+
+from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
+    K_ALIGN as K_ALIGN_8WAVE,
+)
+from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
+    make_mxfp8_8wave_kernel_name,
+)
+
+# 8-wave ids share the ``flydsl`` libtype with mxpsh in the same table, so they
+# are offset out of mxpsh's dense 0-based range. Dispatch is by kernelName
+# prefix, not by id range -- the offset only keeps CSV rows unambiguous.
+KERNEL_ID_BASE_8WAVE = 1_000_000
+# The kernel always emits rocdl.waves_per_eu, so 0 ("no hint") is not
+# expressible; its only tile is 256x256.
+_WAVES_PER_EU_8WAVE = (1, 2, 3, 4)
+_XCD_SWIZZLE_8WAVE = (0, 4, 8)
+_I32_MAX = 2**31
+
+
+@dataclass
+class EightWaveKernelInstance:
+    waves_per_eu: int
+    xcd_swizzle: int
+    split_k: int = 1
+
+    @property
+    def name(self) -> str:
+        return make_mxfp8_8wave_kernel_name(self.waves_per_eu, self.xcd_swizzle)
+
+
+def fits_shape_8wave(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
+    """M and N may be ragged (buffer-descriptor OOB + the kernel's column
+    guard); K must hold whole 256-K scale pairs; the buffer descriptors index
+    in 32 bits (C is bf16, so its byte count doubles)."""
+    del ki
+    if M <= 0 or N % 16 != 0 or K <= 0 or K % K_ALIGN_8WAVE != 0:
+        return False
+    return not (M * N * 2 >= _I32_MAX or M * K >= _I32_MAX or N * K >= _I32_MAX)
+
+
+kernels_list_8wave = {
+    KERNEL_ID_BASE_8WAVE + i: EightWaveKernelInstance(wpe, xcd)
+    for i, (wpe, xcd) in enumerate(
+        (w, x) for w in _WAVES_PER_EU_8WAVE for x in _XCD_SWIZZLE_8WAVE
+    )
+}
+
+
+# ===========================================================================
+# gemm_a8w8_mxfp8_bpreshuffle (gfx950): the pipelines its tuner iterates
+# ===========================================================================
+
+# Its scales: unshuffled row-major 1x32 on both operands, as sorted (name,
+# value) pairs (hashable, see mxscale_preshuffle_kernels._heuristic_tile).
+MXFP8_ROW_SCALES = (
+    ("a_scale_block", "1x32"),
+    ("a_scale_layout", "row"),
+    ("b_scale_block", "1x32"),
+    ("b_scale_layout", "row"),
+)
+# The same with bmm's 32x32 w_scale: row-major [N // 32, K // 32].
+MXFP8_ROW_SCALES_W32X32 = (
+    ("a_scale_block", "1x32"),
+    ("a_scale_layout", "row"),
+    ("b_scale_block", "32x32"),
+    ("b_scale_layout", "row"),
+)
+# The blockscale pair, unshuffled as bmm's: x_scale 1x128 column-major
+# [K // 128, M], w_scale 128x128 [N // 128, K // 128].
+MXFP8_ROW_SCALES_W128X128 = (
+    ("a_scale_block", "1x128"),
+    ("a_scale_layout", "row"),
+    ("b_scale_block", "128x128"),
+    ("b_scale_layout", "row"),
+)
+# gemm_a8w8_mxfp8_bpreshuffle's w_scale block -> its kernels' scales (the
+# x_scale block goes with it: 1x128 for 128x128, else 1x32).
+MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK = {
+    "1x32": MXFP8_ROW_SCALES,
+    "32x32": MXFP8_ROW_SCALES_W32X32,
+    "128x128": MXFP8_ROW_SCALES_W128X128,
+}
+
+
+@dataclass(frozen=True)
+class Pipeline:
+    """One tunable backend of gemm_a8w8_mxfp8_bpreshuffle on gfx950, as the
+    a8w8 bpreshuffle tuner's ``Pipeline``: its candidates and whether one fits
+    a shape. Dispatch is by kernelName prefix, so the tuner needs nothing else.
+    """
+
+    name: str
+    kernels_list: dict[int, Any]
+    fits: Callable[[Any, int, int, int], bool]
+
+
+def _fits_mxpsh_row(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+    return (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8") and fits_shape(
+        ki, M, N, K, **dict(MXFP8_ROW_SCALES)
+    )
+
+
+def _fits_mxpsh_row_w32x32(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+    return (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8") and fits_shape(
+        ki, M, N, K, **dict(MXFP8_ROW_SCALES_W32X32)
+    )
+
+
+def _fits_8wave_w32x32(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
+    return N % 32 == 0 and fits_shape_8wave(ki, M, N, K)
+
+
+def _fits_mxpsh_row_w128x128(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+    return (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8") and fits_shape(
+        ki, M, N, K, **dict(MXFP8_ROW_SCALES_W128X128)
+    )
+
+
+def _fits_8wave_w128x128(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
+    # A chunk stages a dword of each 128x128 scale row: K // 128 >= 4.
+    return N % 128 == 0 and K >= 512 and fits_shape_8wave(ki, M, N, K)
+
+
+# Order is the order candidates are emitted per shape. mxpsh's _fsk variants
+# are kernels_list entries (fused_split_k), not a pipeline of their own.
+MXFP8_ROW_PIPELINES: tuple[Pipeline, ...] = (
+    Pipeline("mxpsh", kernels_list, _fits_mxpsh_row),
+    Pipeline("8wave", kernels_list_8wave, fits_shape_8wave),
+)
+# The same kernels (and kernelNames) on a 32x32 w_scale, and on the blockscale
+# pair (1x128 column-major x_scale, 128x128 w_scale).
+MXFP8_ROW_W32X32_PIPELINES: tuple[Pipeline, ...] = (
+    Pipeline("mxpsh", kernels_list, _fits_mxpsh_row_w32x32),
+    Pipeline("8wave", kernels_list_8wave, _fits_8wave_w32x32),
+)
+MXFP8_ROW_W128X128_PIPELINES: tuple[Pipeline, ...] = (
+    Pipeline("mxpsh", kernels_list, _fits_mxpsh_row_w128x128),
+    Pipeline("8wave", kernels_list_8wave, _fits_8wave_w128x128),
+)
