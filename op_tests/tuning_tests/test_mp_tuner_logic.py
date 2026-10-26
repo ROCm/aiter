@@ -415,6 +415,17 @@ class TestTaskWorkerExit(unittest.TestCase):
             pool.join()
 
 
+class TestShapeGroupedContract(unittest.TestCase):
+
+    def test_declared_kernel_count_must_match_group_size(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+
+        with self.assertRaisesRegex(
+            ValueError, "declares 2 kernels but contains 1 tasks"
+        ):
+            tuner.work_group({}, False, 0.0, (2, (None,)), [("only-task",)])
+
+
 class TestWorkerErrorRatio(unittest.TestCase):
 
     def test_nonfinite_error_ratio_is_rejected(self):
@@ -436,6 +447,320 @@ class TestWorkerErrorRatio(unittest.TestCase):
         self.assertIsNotNone(merge_error_ratio)
         self.assertEqual(merge_error_ratio(0.1, 0.2), 0.2)
         self.assertEqual(merge_error_ratio(0.2, 0.1), 0.2)
+
+
+class TestTypedCandidateStatus(unittest.TestCase):
+
+    def setUp(self):
+        self.tuner = importlib.import_module("aiter.utility.mp_tuner")
+
+    def test_failure_classification_preserves_oom_and_unsupported(self):
+        classify = self.tuner._candidate_failure_status
+        self.assertEqual(classify(RuntimeError("HIP out of memory")), "oom_runtime")
+        self.assertEqual(classify(ValueError("unsupported layout")), "unsupported")
+        self.assertEqual(classify(RuntimeError("kernel launch failed")), "crash")
+
+    def test_status_extension_is_opt_in(self):
+        result = self.tuner._format_worker_result
+        self.assertEqual(result("shape", 1.0, 0.0, "ok", False), ("shape", 1.0, 0.0))
+        self.assertEqual(
+            result("shape", -1, 1.0, "unsupported", True, "why"),
+            ("shape", -1, 1.0, "unsupported", "why"),
+        )
+
+    def test_failure_detail_is_one_bounded_line_naming_the_exception(self):
+        detail = self.tuner._candidate_failure_detail
+        self.assertEqual(
+            detail(ValueError("window_size_right is not supported yet")),
+            "ValueError: window_size_right is not supported yet",
+        )
+        self.assertEqual(detail(KeyboardInterrupt()), "KeyboardInterrupt")
+        long = detail(RuntimeError("line one\n  line two   " + "x" * 500), limit=80)
+        self.assertEqual(len(long), len("RuntimeError: ") + 80)
+        self.assertNotIn("\n", long)
+        self.assertTrue(long.endswith("..."))
+
+
+def _accelerator_error(message="illegal memory access"):
+    return type("AcceleratorError", (RuntimeError,), {})(message)
+
+
+class TestResumeAfterFault(unittest.TestCase):
+    """A fault costs only the candidate that was running."""
+
+    GROUP = ((("s", "a"),), (("s", "b"),), (("s", "c"),))
+
+    def setUp(self):
+        self.tuner = importlib.import_module("aiter.utility.mp_tuner")
+
+    def test_measured_candidates_survive_and_the_rest_are_resubmitted(self):
+        for typed in (False, True):
+            with self.subTest(return_status=typed):
+                measured = {("s", "a"): (("s", "a"), 12.5, 0.0)}
+                done, rest = self.tuner._split_after_fault(
+                    self.GROUP, measured, "crash", "fault", typed
+                )
+                self.assertEqual(done[0], measured[("s", "a")])
+                failed = (("s", "b"), float("inf"), 1.0)
+                self.assertEqual(done[1], (*failed, "crash", "fault")[: len(done[1])])
+                self.assertEqual(len(done[1]), 5 if typed else 3)
+                self.assertEqual(rest, self.GROUP[2:])
+
+    def test_a_measured_prefix_needs_no_resubmission(self):
+        measured = {task[0]: (task[0], 1.0, 0.0) for task in self.GROUP}
+        done, rest = self.tuner._measured_prefix(self.GROUP, measured)
+        self.assertEqual([r[0] for r in done], [t[0] for t in self.GROUP])
+        self.assertEqual(rest, ())
+
+    def test_unhashable_info_is_keyed_by_repr(self):
+        group = [((["s"], "a"),), ((["s"], "b"),)]
+        measured = {self.tuner._info_key(group[0][0]): "a-result"}
+        done, rest = self.tuner._measured_prefix(group, measured)
+        self.assertEqual((done, rest), (["a-result"], group[1:]))
+
+
+def _fake_task(name, data=None):
+    gen = (lambda *a, device=None: data) if data is not None else None
+    return (("shape", name), gen, (), name, ((),), {}, None, None, {}, "ref")
+
+
+class TestWorkGroupCandidateFailure(unittest.TestCase):
+    """work_group records a candidate that fails before launch and goes on."""
+
+    def run_group(self, tasks, worker_side_effect=None, synchronize=None):
+        from unittest import mock
+
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        queue = []
+        worker = mock.Mock(
+            side_effect=worker_side_effect
+            or (lambda gpu, info, *rest: (info, 1.0, 0.0))
+        )
+        with (
+            mock.patch.object(tuner, "worker", worker),
+            mock.patch.object(tuner.torch.cuda, "set_device"),
+            mock.patch.object(tuner.torch.cuda, "empty_cache"),
+            mock.patch.object(tuner.torch.cuda, "is_initialized", return_value=True),
+            mock.patch.object(tuner.torch.cuda, "synchronize", side_effect=synchronize),
+        ):
+            rets = tuner.work_group(
+                {os.getpid(): 0},
+                False,
+                0.05,
+                (len(tasks), ()),
+                tasks,
+                progress_queue=mock.Mock(put=queue.append),
+            )
+        return rets, queue
+
+    def test_a_failing_input_costs_only_its_candidate(self):
+        def boom(*args, device=None):
+            raise ValueError("cannot build inputs")
+
+        tasks = [_fake_task("a"), _fake_task("b"), _fake_task("c")]
+        tasks[1] = (tasks[1][0], boom, *tasks[1][2:])
+        rets, queue = self.run_group(tasks)
+        self.assertEqual([us for _, us, _ in rets], [1.0, float("inf"), 1.0])
+        self.assertEqual(queue, rets)
+
+    def test_an_accelerator_fault_still_aborts_the_group(self):
+        def worker(gpu, info, *rest):
+            if info[1] == "b":
+                raise _accelerator_error()
+            return info, 1.0, 0.0
+
+        tasks = [_fake_task("a"), _fake_task("b"), _fake_task("c")]
+        with self.assertRaises(RuntimeError):
+            self.run_group(tasks, worker)
+
+    def test_an_input_failure_that_breaks_the_context_aborts_the_group(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+
+        def boom(*args, device=None):
+            raise RuntimeError("HIP error: unspecified launch failure")
+
+        tasks = [_fake_task("a"), _fake_task("b")]
+        tasks[0] = (tasks[0][0], boom, *tasks[0][2:])
+        with self.assertRaises(tuner.GpuContextLost):
+            self.run_group(tasks, synchronize=RuntimeError("sticky"))
+
+    def test_only_a_shape_group_collects_garbage_afterwards(self):
+        from unittest import mock
+
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        for tasks, collected in (([_fake_task("a")], True), (_fake_task("a"), False)):
+            with (
+                self.subTest(grouped=collected),
+                mock.patch.object(tuner, "worker", lambda gpu, info, *r: (info, 1, 0)),
+                mock.patch.object(tuner.torch.cuda, "set_device"),
+                mock.patch.object(tuner.torch.cuda, "empty_cache") as empty_cache,
+                mock.patch.object(tuner.gc, "collect") as collect,
+            ):
+                tuner.work_group({os.getpid(): 0}, False, 0.05, (1, ()), tasks)
+                self.assertEqual(collect.called, collected)
+                self.assertEqual(empty_cache.called, collected)
+
+
+class TestGpuFaultProbe(unittest.TestCase):
+    """A fault is recognised by type or a failing synchronize, not by text."""
+
+    def setUp(self):
+        self.tuner = importlib.import_module("aiter.utility.mp_tuner")
+
+    def probe(self, exc, synchronize=None):
+        from unittest import mock
+
+        with (
+            mock.patch.object(
+                self.tuner.torch.cuda, "is_initialized", return_value=True
+            ),
+            mock.patch.object(
+                self.tuner.torch.cuda, "synchronize", side_effect=synchronize
+            ),
+        ):
+            self.tuner._raise_if_gpu_fault(exc)
+
+    def test_a_healthy_context_is_not_a_fault_whatever_the_message(self):
+        self.probe(RuntimeError("illegal memory access"))
+
+    def test_a_failing_synchronize_or_an_accelerator_error_is_a_fault(self):
+        for exc, sync in (
+            (ValueError("anything"), RuntimeError("sticky")),
+            (_accelerator_error("x"), None),
+        ):
+            with self.subTest(exc=exc), self.assertRaises(self.tuner.GpuContextLost):
+                self.probe(exc, sync)
+
+    def test_the_parent_recognises_a_pickled_fault_by_type(self):
+        import pickle
+
+        lost = pickle.loads(pickle.dumps(self.tuner.GpuContextLost("boom")))
+        self.assertTrue(self.tuner._is_accelerator_error(lost))
+        self.assertFalse(
+            self.tuner._is_accelerator_error(RuntimeError("illegal memory access"))
+        )
+
+
+class _FakeAsync:
+    def __init__(self, func, args):
+        try:
+            self.value, self.error = func(*args), None
+        except Exception as error:  # noqa: BLE001
+            self.value, self.error = None, error
+
+    def ready(self):
+        return True
+
+    def get(self, timeout=None):
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+class _FakePool:
+    """Runs each submission synchronously in this process."""
+
+    def __init__(self, submissions):
+        self.submissions = submissions
+
+    def apply_async(self, func, args=()):
+        if func.__name__ == "_run_with_start_tracking":
+            self.submissions.append(args[2][4])
+        return _FakeAsync(func, args)
+
+    def close(self):
+        pass
+
+    terminate = join = close
+
+
+def _faulting_work_group(
+    gpu_map, fast_mode, err_ratio, in_data, tasks, verbose, return_status, queue
+):
+    """Measures candidates in order and faults on any named 'fault*'."""
+    assert in_data[0] == len(tasks)
+    tuner = importlib.import_module("aiter.utility.mp_tuner")
+    rets = []
+    for task in tasks:
+        if task[0][1].startswith("fault"):
+            raise _accelerator_error()
+        ret = tuner._format_worker_result(task[0], 2.0, 0.0, "ok", return_status)
+        rets.append(ret)
+        queue.put(ret)
+    return rets
+
+
+class TestMpTunerResubmission(unittest.TestCase):
+    """mp_tuner's parent loop with an in-process pool."""
+
+    def run_tuner(self, names, work_group=_faulting_work_group, **kwargs):
+        import queue as queue_module
+        from unittest import mock
+
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        submissions = []
+        manager = mock.Mock(Queue=queue_module.Queue)
+
+        def new_pool(parallel_num, start_times, pids):
+            tuner._TASK_START_TIMES, tuner._TASK_PIDS = start_times, pids
+            return _FakePool(submissions)
+
+        tasks = [(("shape", name),) for name in names]
+        with (
+            mock.patch.object(tuner.torch.cuda, "device_count", return_value=1),
+            mock.patch.object(tuner.mp, "set_start_method"),
+            mock.patch.object(tuner.mp, "Manager", return_value=manager) as start,
+            mock.patch.object(tuner, "_new_pool", new_pool),
+            mock.patch.object(tuner, "work_group", work_group),
+            mock.patch.object(tuner.time, "sleep"),
+        ):
+            results = tuner.mp_tuner(
+                tasks, [(len(tasks), None)], 1, False, True, **kwargs
+            )
+        self.managers_started = start.call_count
+        return results, [[t[0][1] for t in group] for group in submissions]
+
+    def test_a_manager_starts_only_for_a_multi_candidate_group(self):
+        for names, started in ((["a"], 0), (["a", "b"], 1)):
+            with self.subTest(names=names):
+                self.run_tuner(names)
+                self.assertEqual(self.managers_started, started)
+
+    def test_untyped_callers_keep_every_other_candidate(self):
+        results, submissions = self.run_tuner(["a", "fault", "c", "d"])
+        self.assertEqual(
+            [(info[1], us) for info, us, _ in results],
+            [("a", 2.0), ("fault", float("inf")), ("c", 2.0), ("d", 2.0)],
+        )
+        self.assertEqual(submissions, [["a", "fault", "c", "d"], ["c", "d"]])
+
+    def test_a_stale_pid_map_restarts_the_pool_and_resubmits_the_group(self):
+        attempts = []
+
+        def remapped_work_group(gpu_map, *args):
+            attempts.append(gpu_map)
+            if len(attempts) == 1:
+                raise KeyError("pid not in GPU map")
+            return _faulting_work_group(gpu_map, *args)
+
+        results, submissions = self.run_tuner(
+            ["a", "b"], work_group=remapped_work_group
+        )
+        self.assertEqual(
+            [(info[1], us) for info, us, _ in results], [("a", 2.0), ("b", 2.0)]
+        )
+        self.assertEqual(submissions, [["a", "b"], ["a", "b"]])
+
+    def test_each_fault_consumes_a_candidate_until_the_budget(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        names = [f"fault{i}" for i in range(tuner._MAX_FAULTS_WITHOUT_PROGRESS + 2)]
+        results, submissions = self.run_tuner(names, return_status=True)
+        budget = tuner._MAX_FAULTS_WITHOUT_PROGRESS
+        self.assertEqual(
+            [status for *_, status, _ in results], ["crash"] * budget + ["not_run"] * 2
+        )
+        self.assertEqual(len(submissions), budget)
+        self.assertIn("in a row", results[-1][4])
 
 
 if __name__ == "__main__":
