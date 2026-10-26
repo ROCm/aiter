@@ -256,7 +256,7 @@ class MqaLogitsScheduleBuffers:
 
     cfg: MqaLogitsConfig
     cta_info: torch.Tensor  # [num_ctas + scratch, 8] int32 records
-    cu_tiles: torch.Tensor  # the tile cut; empty at one row a CTA
+    cu_tiles: torch.Tensor  # tile cut, then tile sequences; empty at one row a CTA
     num_ctas: int  # the Table grid; pinned once a graph captures it
 
 
@@ -317,7 +317,7 @@ class MqaLogitsConfig:
             cu_tiles=(
                 self._empty_i32
                 if rpc == 1
-                else torch.empty(tiles + 1, dtype=torch.int32, device=self.device)
+                else torch.empty(2 * (tiles + 1), dtype=torch.int32, device=self.device)
             ),
             num_ctas=self._table_slots,
         )

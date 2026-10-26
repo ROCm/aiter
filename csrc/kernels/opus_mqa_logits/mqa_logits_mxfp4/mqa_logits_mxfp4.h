@@ -40,7 +40,7 @@ struct opus_mqa_cta_record {
     int local_start;  // 0: windows are prefixes
     int local_end;    // the group's union window end
     int group_rows;   // rows in the group, 1..rows_per_cta
-    int _pad;         // a one-round schedule's longest chunk (the H64 kernel's wave priority), else 0
+    int _pad;         // one-round schedules: a bound on the longest chunk (H64 wave priority), else 0
 };
 static_assert(sizeof(opus_mqa_cta_record) == 32, "the record must stay one s_load_dwordx8");
 static_assert(alignof(opus_mqa_cta_record) == 4);

@@ -138,9 +138,10 @@ void mqa_logits_mxfp4_build_schedule(aiter_tensor_t& query_start_loc,
                 "-record build scratch; need ", (int64_t)ol::sched_buffer_records(num_ctas) * 8,
                 ", got ", cta_info.numel(), ". Take it from cfg.schedule_buffers()");
     if (qpb > 1) {
+        // the cut [num_tiles + 1], then each tile's sequence [num_tiles + 1]
         AITER_CHECK(cu_tiles.dtype() == AITER_DTYPE_i32 && cu_tiles.is_contiguous() &&
-                        static_cast<int64_t>(cu_tiles.numel()) >= (int64_t)num_tiles + 1,
-                    "cu_tiles must be contiguous int32 with ", num_tiles + 1, " entries");
+                        static_cast<int64_t>(cu_tiles.numel()) >= 2 * ((int64_t)num_tiles + 1),
+                    "cu_tiles must be contiguous int32 with ", 2 * (num_tiles + 1), " entries");
         // The tile cut stages the sequences' tile offsets in one workgroup's LDS.
         AITER_CHECK(num_seqs <= ol::GROUPS_BUILD_MAX_BATCH, "the Table builder cuts at most ",
                     ol::GROUPS_BUILD_MAX_BATCH, " sequences into tiles, got ", num_seqs);
@@ -153,27 +154,30 @@ void mqa_logits_mxfp4_build_schedule(aiter_tensor_t& query_start_loc,
     const int* p_le  = reinterpret_cast<const int*>(row_ends.data_ptr());
     auto* p_cta      = reinterpret_cast<opus_mqa_cta_record*>(cta_info.data_ptr());
     const int* p_cut = nullptr;
+    const int* p_seq = nullptr;
     if (qpb > 1 && num_tiles > 0) {
+        int* cut = reinterpret_cast<int*>(cu_tiles.data_ptr());
         ol::mqa_logits_build_tiles<<<1, ol::GROUPS_BUILD_BLOCK, 0, stream>>>(
-            p_qsl, reinterpret_cast<int*>(cu_tiles.data_ptr()), num_seqs, num_tiles, qpb);
+            p_qsl, cut, cut + num_tiles + 1, num_seqs, num_tiles, qpb);
         HIP_CALL_LAUNCH(hipGetLastError());
-        p_cut = reinterpret_cast<const int*>(cu_tiles.data_ptr());
+        p_cut = cut;
+        p_seq = cut + num_tiles + 1;
     }
     const int block_k = in.tile_keys;
     const auto plan   = ol::sched_plan(num_tiles, num_ctas);
     if (plan.blocks == 1) {
         if (plan.block == ol::SCHED_BUILD_BLOCK)
             ol::mqa_logits_build_sched<ol::SCHED_BUILD_BLOCK><<<1, ol::SCHED_BUILD_BLOCK, 0, stream>>>(
-                p_cut, p_qsl, p_le, p_cta, num_seqs, num_tiles, num_ctas, block_k, cta_resident);
+                p_cut, p_seq, p_qsl, p_le, p_cta, num_seqs, num_tiles, num_ctas, block_k, cta_resident);
         else
             ol::mqa_logits_build_sched<ol::SCHED_BUILD_BLOCK_WIDE><<<1, ol::SCHED_BUILD_BLOCK_WIDE, 0, stream>>>(
-                p_cut, p_qsl, p_le, p_cta, num_seqs, num_tiles, num_ctas, block_k, cta_resident);
+                p_cut, p_seq, p_qsl, p_le, p_cta, num_seqs, num_tiles, num_ctas, block_k, cta_resident);
     } else {
         int* scratch = reinterpret_cast<int*>(p_cta + num_ctas);
         ol::mqa_logits_build_sched_emit<ol::SCHED_BUILD_BLOCK><<<plan.blocks, ol::SCHED_BUILD_BLOCK, 0, stream>>>(
-            p_cut, p_qsl, p_le, p_cta, scratch, num_seqs, num_tiles, num_ctas, block_k, plan.blocks);
+            p_cut, p_seq, p_qsl, p_le, p_cta, scratch, num_seqs, num_tiles, num_ctas, block_k, plan.blocks);
         ol::mqa_logits_build_sched_finish<ol::SCHED_BUILD_BLOCK_WIDE><<<1, ol::SCHED_BUILD_BLOCK_WIDE, 0, stream>>>(
-            p_cut, p_qsl, p_le, p_cta, scratch, num_seqs, num_tiles, num_ctas, block_k,
+            p_cut, p_seq, p_qsl, p_le, p_cta, scratch, num_seqs, num_tiles, num_ctas, block_k,
             cta_resident, plan.blocks);
     }
     HIP_CALL_LAUNCH(hipGetLastError());
