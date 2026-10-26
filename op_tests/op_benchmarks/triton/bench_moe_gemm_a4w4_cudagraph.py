@@ -85,6 +85,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # measurable layers, in report order; see the module docstring. "combine" only
 # exists under --multi-gpu, where there is a real mori combine to measure.
@@ -293,7 +294,7 @@ def pin_routed_experts(logits, n_routed, n_expts_act, balance=False):
         keep = pool[flat % n_pinned].view(n_tokens, n_expts_act)
     else:
         slot = torch.arange(n_pinned, device=dev)
-        score = torch.rand((n_tokens, n_pinned), device=dev)
+        score = torch.rand((n_tokens, n_pinned), dtype=torch.float32, device=dev)
         score[slot % n_tokens, slot] += 1.0
         keep = pool[score.topk(n_expts_act, dim=-1).indices]
 
@@ -439,7 +440,8 @@ def do_bench_cudagraph_synced(fn, rep, group):
         torch.cuda.synchronize()
         estimate_ms = start.elapsed_time(end) / 5
 
-        agreed = torch.tensor([estimate_ms], dtype=torch.float64)
+        # Keep on the CPU: the all-reduce uses the gloo (CPU) group.
+        agreed = torch.tensor([estimate_ms], dtype=torch.float64, device="cpu")
         dist.all_reduce(agreed, op=dist.ReduceOp.MAX, group=group)
         estimate_ms = float(agreed[0])
         n_repeat = 1000 if estimate_ms == 0 else max(1, int(rep / estimate_ms))
@@ -559,13 +561,15 @@ def bench_mlp_single_weight_init(
         torch.manual_seed(0)
     # The router scores every GLOBAL expert (that is what picks the tile
     # geometry), but the expert weights are only this rank's shard.
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
-    w1 = torch.randn((n_expts_local, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_local, dim2 // TP // 2, dim1), device=dev)
+    wg = torch.randn((dim1, n_expts_tot), dtype=torch.float32, device=dev)
+    w1 = torch.randn((n_expts_local, dim1, dim2 // TP), dtype=torch.float32, device=dev)
+    w2 = torch.randn(
+        (n_expts_local, dim2 // TP // 2, dim1), dtype=torch.float32, device=dev
+    )
     # biases
-    bg = torch.randn((n_expts_tot,), device=dev)
-    b1 = torch.randn((n_expts_local, dim2 // TP), device=dev)
-    b2 = torch.randn((n_expts_local, dim1), device=dev)
+    bg = torch.randn((n_expts_tot,), dtype=torch.float32, device=dev)
+    b1 = torch.randn((n_expts_local, dim2 // TP), dtype=torch.float32, device=dev)
+    b2 = torch.randn((n_expts_local, dim1), dtype=torch.float32, device=dev)
 
     # -- numerics --
     wg, _ = quantize(wg, "bf16")
@@ -899,7 +903,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",
@@ -947,13 +951,6 @@ def parse_args(args: list[str] | None = None):
         "expert count and the histogram from the LOCAL one, which no single "
         "routing() call can produce. DSV4 EP4 decode is '--M 2048 --experts 384 "
         "6 --ep 4 --routed-experts 384 --balance'. Default 1 (no sharding).",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["triton", "gluon"],
-        default=None,
-        help="Kernel backend for moe_gemm_a4w4. Default: unset, i.e. the arch "
-        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
     )
     parser.add_argument(
         "--preshuffle",
