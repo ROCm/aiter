@@ -657,8 +657,9 @@ struct __attribute__((aligned(16))) DecodeKArgs {
 };
 static_assert(sizeof(DecodeKArgs) == 128, "two s_load_dwordx16");
 
-// Kernarg preload (-mllvm -amdgpu-kernarg-preload-count=16, honoured by
-// hipcc >= 7.2 on gfx950): the first 14 dwords of the kernargs arrive in
+// Kernarg preload (the aiter JIT passes -mllvm --amdgpu-kernarg-preload-count=32
+// unless AITER_DISABLE_KERNARG_PRELOAD; honoured by hipcc >= 7.2 on gfx950,
+// ignored by 7.0): the first 14 dwords of the kernargs arrive in
 // user SGPRs with the wave, so the kernel issues its first loads without an
 // SMEM round trip. The pass preloads whole arguments only, so the standalone
 // decode kernel takes the fields needed before the first loads as scalars
