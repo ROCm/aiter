@@ -9,8 +9,9 @@ Each tuned CSV row becomes two conv jobs (``out_ndhwc`` True/False) plus the
 NCDHW->NDHWC pre-transpose. Input layout is not in the compile key.
 
 ``AITER_CONV3D_DYN_HW`` (default 1) is part of the compile key: one artifact
-per layer instead of per resolution. Build and runtime must agree, or the
-cache misses silently. Use ``run_only_env()`` to fail on a JIT.
+per layer instead of per resolution (gfx950; gfx1250 still needs one per row).
+Build and runtime must agree, or the cache misses silently. Use
+``run_only_env()`` to fail on a JIT.
 
 Usage::
 
@@ -113,13 +114,10 @@ def _conv_dedupe_key(job):
     of one layer that differ in e.g. ``row_chk`` are two artifacts.
     Falls back to the whole row if plans cannot be derived here.
     """
-    if not job["dyn_hw"]:
+    if not job["dyn_hw"] or str(job.get("gfx", "")).startswith("gfx1250"):
+        # gfx1250 dyn_hw launchers still close over the full param and launch
+        # args, so every resolution and batch size is its own artifact.
         return job_identity(job)
-    if str(job.get("gfx", "")).startswith("gfx1250"):
-        # gfx1250 dyn_hw: one artifact per layer (blank D/H/W/N).
-        return tuple(
-            sorted((k, v) for k, v in job.items() if k not in _RESOLUTION_COLS)
-        )
     tile = (job["tile_m"], job["tile_n"], job["wave_m"], job["wave_n"])
     try:
         param = _implicit_param_from_problem(
