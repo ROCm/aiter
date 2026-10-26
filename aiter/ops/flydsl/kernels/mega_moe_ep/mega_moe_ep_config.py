@@ -83,7 +83,10 @@ N_XCD = 8
 # waves (no aux band, no A-loader ring) -- a prototype of the "trade comm overlap for 2x
 # MFMA occupancy" direction.  Block stays 8 waves (NTT=512) either way.
 EP_NW8 = bool(int(os.environ.get("EP_NW8", "0")))
-NW = 8 if EP_NW8 else 4  # compute waves (NW8: all 8; else 4 + 4 aux)
+# Engine auto-selects the NW=8 (all-8-wave-MFMA, serial-comm) variant per launch once the
+# token count reaches this (GEMM-bound regime; crossover ~2048). EP_NW8=1 forces it always.
+EP_NW8_MIN = int(os.environ.get("EP_NW8_MIN", "2048"))
+NW = 8 if EP_NW8 else 4  # module default (compile path takes NW per-launch; see kernel_config)
 NT = NW * 64  # 512 (NW8) or 256 compute threads
 NTT = NT + (0 if EP_NW8 else 4 * 64)  # 512 threads (8 waves) in both modes
 
@@ -205,7 +208,7 @@ def ep_shape_supported(
 
 @functools.cache
 def mega_moe_ep_consts(
-    H: int, I: int, MT: int, EPR: int, TMAX: int, a8: bool = False
+    H: int, I: int, MT: int, EPR: int, TMAX: int, a8: bool = False, NW: int = NW
 ) -> dict:
     """Per-instance LDS layout (bytes): one row tile's activation + E8M0 scale +
     intermediate staging, plus the dynamic planner's tables (active-expert bitmap /
@@ -215,6 +218,9 @@ def mega_moe_ep_consts(
     ``mega_moe_tp_consts`` carries once the GEMM device code lands.
     """
     RG = MT * 16  # rows per GEMM tile (sort_block_m)
+    # GEMM1 output-col tile (local to the NW arg so one process can hold both variants;
+    # NW8 doubles it to 512 so each of the 8 compute waves still owns 32 cols = 1 MX group).
+    TILE_N = 512 if NW == 8 else 256
     a_row = H if a8 else H // 2  # activation bytes per row (FP8 vs packed FP4)
     a_scale = H // 32  # E8M0 scale bytes per row
     inter_row = I if a8 else I // 2
@@ -305,6 +311,7 @@ def kernel_config(
     swiglu_limit: float | None = None,
     a8: bool = False,
     indexed_payload: bool = False,
+    NW: int = NW,
 ):
     """Derived compile-time values of one ``compile_mega_moe_ep`` instance.
 
@@ -316,7 +323,17 @@ def kernel_config(
         raise ValueError(f"mega_moe_ep act must be one of {ACT_SET}, got {act!r}")
     if swiglu_limit is None:
         swiglu_limit = float("inf")
-    c = mega_moe_ep_consts(H, I, MT, EPR, TMAX, a8)
+    # Per-launch warp-specialization width (NW=4 default = 4 compute + 4 aux waves; NW=8
+    # all-8-wave MFMA with serial comm). Derive NT/NTT/TILE_N/role-bands HERE (not the
+    # module globals) so one process can compile both variants; they ride into KernelCtx
+    # via locals() and the builders / kernel roles read them from kc.
+    NT = NW * 64
+    NTT = NT + (0 if NW == 8 else 4 * 64)
+    TILE_N = 512 if NW == 8 else 256
+    B_DISPATCH = NT
+    B_LOADER = NT + 64
+    B_COMBINE = NT + 128
+    c = mega_moe_ep_consts(H, I, MT, EPR, TMAX, a8, NW)
     RG, LDS_BYTES, NBW = c["RG"], c["LDS_BYTES"], c["NBW"]
     L_A, L_AS = c["L_A"], c["L_AS"]
     L_DYN, L_DCNT, L_WSUM = c["L_DYN"], c["L_DCNT"], c["L_WSUM"]
@@ -336,7 +353,7 @@ def kernel_config(
     rch = RG  # dynamic row chunk = one row tile (16*mt)
     const_expr = fx.const_expr
     name = (
-        f"mega_moe_ep_h{H}_i{I}_e{E}_epr{EPR}_k{TOPK}_mt{MT}_t{TMAX}_np{NPES}_{act}"
+        f"mega_moe_ep_h{H}_i{I}_e{E}_epr{EPR}_k{TOPK}_mt{MT}_t{TMAX}_np{NPES}_nw{NW}_{act}"
         + ("_a8" if a8 else "_a4")
         + ("_ix" if indexed_payload else "")
         + (f"_lim{swiglu_limit:g}" if math.isfinite(swiglu_limit) else "")

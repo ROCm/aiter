@@ -60,9 +60,6 @@ from .mega_moe_ep_config import (
     GBAR_GEN,
     MAX_NPES,
     NCTA_MAX,
-    NT,
-    NTT,
-    NW,
     KernelCtx,
 )
 
@@ -122,6 +119,7 @@ def build_communication(kc: KernelCtx) -> dict:
     SCALE_I32 = H // 128  # i32 E8M0-scale units per row (H//32 bytes / 4)
     PART_RB = H + H // 8  # combine ``part`` row bytes: H fp8-e4m3 then H/8 per-8 E8M0 scale
     SENTINEL = EPR  # recv_le empty-slot marker (masked by the planner: >= EPR)
+    NW, NT, NTT = kc.get("NW NT NTT")  # per-launch warp-spec width (not the module globals)
 
     # --- arena addressing --------------------------------------------------------
     def ctrl_at(a, idx):

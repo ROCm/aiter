@@ -20,6 +20,7 @@ from ..tensor_shim import _run_compiled
 from .mega_moe_ep_config import (
     CTRL_INTS,
     EP_NW8,
+    EP_NW8_MIN,
     FLAG_INTS,
     MAX_NPES,
     NCHA,
@@ -142,6 +143,7 @@ class LaunchCfg:
     mt: int
     indexed_payload: bool = False
     a8: bool = False
+    nw: int = 4  # warp-spec width: 4 (comm-overlap) or 8 (all-MFMA, serial comm; large bs)
 
 
 class MegaMoeEPEngine:
@@ -306,7 +308,7 @@ class MegaMoeEPEngine:
     def set_weights(self, w1, w1_scale, w2, w2_scale):
         self._bind_weights(w1, w1_scale, w2, w2_scale)
 
-    def _fit_mt(self, m):
+    def _fit_mt(self, m, nw):
         # The V2 pipelined GEMM1 packs rows in pairs (MfmaScaleGU / AScaleLoader use
         # m_repeat//2 scale groups), so the row tile mt (=m_repeat) must be EVEN.
         # mt=2 (RG=32) for small/mid batches; mt=4 (RG=64) for large batches so the
@@ -316,11 +318,11 @@ class MegaMoeEPEngine:
         # NW=8 inline-A GEMM stages A with all NT=512 threads (16 B/thread), so the A tile
         # RG*A_K_STEP must be >= 512*16 = 8192 B, i.e. RG>=64 -> mt>=4.  Force mt=4 (the
         # high-bs value anyway; low bs just pads to 64 rows, still correct).
-        mt = 4 if EP_NW8 else (2 if m <= 512 else 4)
+        mt = 4 if nw == 8 else (2 if m <= 512 else 4)
         while mt > 2:
             if (
                 mega_moe_ep_consts(
-                    self.H, self.I, mt, self.epr, self.mtpr * self.world_size, self.a8
+                    self.H, self.I, mt, self.epr, self.mtpr * self.world_size, self.a8, nw
                 )["LDS_BYTES"]
                 <= LDS_LIMIT
             ):
@@ -331,10 +333,15 @@ class MegaMoeEPEngine:
     def config(self, m):
         cfg = self._cfgs.get(m)
         if cfg is None:
+            # Big-M occupancy: NW=8 (all 8 waves MFMA, serial comm) wins once the GEMM
+            # dominates (m >= EP_NW8_MIN, crossover ~2048); NW=4 (comm-overlap) below.
+            # EP_NW8=1 forces NW8 everywhere (back-compat / debugging).
+            nw = 8 if (EP_NW8 or m >= EP_NW8_MIN) else 4
             cfg = LaunchCfg(
-                mt=self._fit_mt(m),
+                mt=self._fit_mt(m, nw),
                 indexed_payload=self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
                 a8=self.a8,
+                nw=nw,
             )
             self._cfgs[m] = cfg
         return cfg
@@ -357,6 +364,7 @@ class MegaMoeEPEngine:
                 swiglu_limit=self.swiglu_limit,
                 a8=cfg.a8,
                 indexed_payload=cfg.indexed_payload,
+                NW=cfg.nw,
             )
             self._launchers[cfg] = fn
         return fn

@@ -63,18 +63,14 @@ from .common import (
     wait_vm,
 )
 from .mega_moe_ep_config import (
-    B_LOADER,
     C_BARCNT,
     C_BARGEN,
     MAX_NPES,
     NLOAD,
-    NT,
-    NW,
     RC_AFREE,
     RC_ASEQ,
     RC_G1GO,
     TILE_K,
-    TILE_N,
     KernelCtx,
 )
 
@@ -121,6 +117,8 @@ def build_gemm(kc: KernelCtx) -> dict:
     A_K_STEP, K_ITERS, A_LDS_I32, NAB = kc.get("A_K_STEP K_ITERS A_LDS_I32 NAB")
     L_C, L_RCTL = kc.get("L_C L_RCTL")
     combine_arrive = kc.get("combine_arrive")[0]  # fused-combine epilogue signals source
+    # NW-dependent geometry from kc (per-launch warp-spec width; not the module globals)
+    NW, NT, TILE_N, B_LOADER = kc.get("NW NT TILE_N B_LOADER")
 
     def _ring_off(q0, j):
         """i32-element LDS offset of A-ring bank ``(q0 + j) % NAB`` (runtime bank index),

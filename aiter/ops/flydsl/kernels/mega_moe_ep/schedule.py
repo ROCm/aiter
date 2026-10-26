@@ -55,8 +55,6 @@ from .common import (
 _PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
 _PROF_SLOTS = 9  # +7 post-gemm1, +8 post-gemm2 (per-unit; <=1 unit/CTA)
 from .mega_moe_ep_config import (
-    B_LOADER,
-    EP_NW8,
     C_BARCNT,
     C_BARGEN,
     C_CNT,
@@ -71,8 +69,6 @@ from .mega_moe_ep_config import (
     NAB,
     N_XCD,
     NLOAD,
-    NT,
-    NW,
     RC_AFREE,
     RC_ASEQ,
     RC_G1GO,
@@ -107,6 +103,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     dispatch_wait = kc.get("dispatch_wait")[0]
     dispatch_wait_meta = kc.get("dispatch_wait_meta")[0]
     grid_bar = kc.get("grid_bar")[0]
+    NW, NT, B_LOADER = kc.get("NW NT B_LOADER")  # per-launch warp-spec width (not globals)
     assert L_EOFF is not None and const_expr  # L_EOFF: gather offsets (future)
 
     @flyc.jit
@@ -359,7 +356,7 @@ def build_schedule(kc: KernelCtx) -> dict:
         ...); GEMM1/GEMM2 iterate (echunk, n-tile shard) units.  The gather pass publishes
         each row's recv-slot (``rowidx``) + payload-row (``rowmap``) to GLOBAL so the later
         passes -- on different CTAs once P>1 shards an echunk -- can read them."""
-        if const_expr(EP_NW8):
+        if const_expr(NW == 8):
             # NW=8 (all 8 waves compute MFMA): there is no concurrent dispatch band, so wave
             # 0 does this CTA's full a2a scatter HERE (serial), then all 8 waves proceed to
             # the planner + inline-A GEMM.  Trades the comm/compute overlap for 2 MFMA
@@ -427,7 +424,7 @@ def build_schedule(kc: KernelCtx) -> dict:
             gi = i32(gi_)
             eg = gi // P
             expert = lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF)
-            if EP_NW8:
+            if NW == 8:
                 gemm1_nw8(L, tid, a, expert, eg, gi - eg * P, P)
             else:
                 gemm1(L, tid, a, expert, eg, gi - eg * P, P, (gi - bid) // nblk)
@@ -461,7 +458,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                     lds_ld_i32(L, L_DCNT + (ec & i32(0xFFFF)) * i32(4)) - cc * i32(rch),
                     i32(rch),
                 )
-                if EP_NW8:
+                if NW == 8:
                     gemm2_combine_nw8(L, tid, a, ec & i32(0xFFFF), ei, rows)
                 else:
                     gemm2_combine(L, tid, a, ec & i32(0xFFFF), ei, rows, (ei - bid) // nblk)
@@ -475,7 +472,7 @@ def build_schedule(kc: KernelCtx) -> dict:
                 gi = i32(gi_)
                 eg = gi // P
                 expert = lds_ld_i32(L, L_DCH + eg * i32(4)) & i32(0xFFFF)
-                if EP_NW8:
+                if NW == 8:
                     gemm2_pipe_nw8(L, tid, a, expert, eg, gi - eg * P, P, rsrc(a["gout"]))
                 else:
                     gemm2(L, tid, a, expert, eg, gi - eg * P, P,

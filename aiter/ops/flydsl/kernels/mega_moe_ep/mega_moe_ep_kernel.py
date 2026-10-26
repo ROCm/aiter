@@ -41,14 +41,10 @@ _PROF_SLOTS = 9  # 0:entry 1:post-barrier_init 2:post-roles 3:post-combine_final
 from .communication import build_communication
 from .gemm import build_gemm
 from .mega_moe_ep_config import (
-    B_COMBINE,
-    B_LOADER,
     C_BARCNT,
     C_BARGEN,
     C_PLAN,
     NLOAD,
-    NT,
-    NTT,
     RC_INTS,
     kernel_config,
 )
@@ -74,6 +70,7 @@ def compile_mega_moe_ep(
     swiglu_limit: float | None = None,
     a8: bool = False,
     indexed_payload: bool = False,
+    NW: int = 4,
 ):
     """Build the launcher of one (shape, variant) EP instance (see the module docstring)."""
     kc = kernel_config(
@@ -91,6 +88,7 @@ def compile_mega_moe_ep(
         swiglu_limit=swiglu_limit,
         a8=a8,
         indexed_payload=indexed_payload,
+        NW=NW,
     )
     kc.add(build_communication(kc))
     kc.add(build_gemm(kc))
@@ -101,6 +99,7 @@ def compile_mega_moe_ep(
     compute_units, dispatch_send = kc.get("compute_units dispatch_send")
     a_loader_units = kc.get("a_loader_units")[0]
     combine_final, barrier_init = kc.get("combine_final barrier_init")
+    NT, NTT, B_LOADER = kc.get("NT NTT B_LOADER")  # per-launch warp-spec bands (not globals)
 
     @flyc.jit
     def init_lds(L, tid, a):
