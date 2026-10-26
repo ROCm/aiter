@@ -362,8 +362,8 @@ def _make_combine_fused_reduce(
             )
 
         def lds_scale_view(s):
-            # Flat 2-D: the scale plane stays on the old TDM atom (see the
-            # S_ROW_BYTES note at SC_TILE), whose fx.copy takes a plain view.
+            # Flat 2-D: the scale plane stays on the old TDM atom (see the note
+            # at S_ROW_BYTES), whose fx.copy takes a plain view.
             return lds_view(
                 fx.recast_iter(p8_shared, in_buf_ptr(s) + IN_SCALE_OFF),
                 (IN_ROWS, S_ROW_BYTES),
