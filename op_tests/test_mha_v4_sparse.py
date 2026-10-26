@@ -425,11 +425,41 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
     assert torch.equal(visited, torch.arange(total, device="cuda"))
 
 
+# KV tiles per pattern, so the head-promoted order sees promoted rows (counts of at least 90% of
+# it) mixed with ordinary ones, none, or ties on both sides.
+_WORK_TABLE_KV_TILES = {
+    "random": 64,
+    "wide_random": 8192,
+    "uniform": 8,
+    "two_values": 10,
+}
+
+
+def _expected_work_order(order, lengths, q_tiles, kv_tiles):
+    promote = (9 * kv_tiles + 9) // 10
+
+    def head_promoted(slot):
+        head = slot // q_tiles
+        if lengths[slot] >= promote:
+            return (0, head, slot)
+        return (1 + head, -lengths[slot], slot)
+
+    key = {
+        "lpt": lambda slot: (-lengths[slot], slot),
+        # (batch, head) groups in raster order, longest LUT first within each.
+        "head": lambda slot: (slot // q_tiles, -lengths[slot], slot),
+        # Nearly-full tiles first, head by head, then the head order above.
+        "head-promoted": head_promoted,
+        "raster": lambda slot: slot,
+    }[order]
+    return sorted(range(len(lengths)), key=key)
+
+
 # Either side of the 8192-entry hand-off to ATen, which builds each order separately.
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 @pytest.mark.parametrize(("batch", "nhead", "q_tiles"), [(2, 5, 7), (8, 32, 64)])
-@pytest.mark.parametrize("pattern", ["random", "wide_random", "uniform"])
-@pytest.mark.parametrize("order", ["lpt", "head", "raster"])
+@pytest.mark.parametrize("pattern", list(_WORK_TABLE_KV_TILES))
+@pytest.mark.parametrize("order", ["lpt", "head", "head-promoted", "raster"])
 def test_mha_v4_sparse_work_table_follows_the_work_order(
     monkeypatch, batch, nhead, q_tiles, pattern, order
 ):
@@ -437,26 +467,44 @@ def test_mha_v4_sparse_work_table_follows_the_work_order(
     torch.manual_seed(7)
     total = batch * nhead * q_tiles
     counts = _work_table_counts(total, pattern)
+    kv_tiles = _WORK_TABLE_KV_TILES[pattern]
     monkeypatch.setenv("AITER_MHA_V4_WORK_ORDER", order)
 
-    table = mha_v4_sparse_work_table(counts, batch, nhead, q_tiles)
+    table = mha_v4_sparse_work_table(
+        counts, batch, nhead, q_tiles, q_tile=256, kv_tiles=kv_tiles
+    )
 
-    lengths = counts.tolist()
-    key = {
-        "lpt": lambda slot: (-lengths[slot], slot),
-        # (batch, head) groups in raster order, longest LUT first within each.
-        "head": lambda slot: (slot // q_tiles, -lengths[slot], slot),
-        "raster": lambda slot: slot,
-    }[order]
     visited = _unpack_work_table(table, nhead, q_tiles).tolist()
-    assert visited == sorted(range(total), key=key)
+    assert visited == _expected_work_order(order, counts.tolist(), q_tiles, kv_tiles)
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.parametrize(("batch", "nhead", "q_tiles"), [(2, 5, 7), (8, 32, 64)])
+@pytest.mark.parametrize(("q_tile", "order"), [(64, "head-promoted"), (256, "lpt")])
+def test_mha_v4_sparse_work_table_defaults_by_query_tile(
+    monkeypatch, batch, nhead, q_tiles, q_tile, order
+):
+    """A 64-row tile leans on L2 sharing within a head, a 256-row one on load balance."""
+    torch.manual_seed(7)
+    total = batch * nhead * q_tiles
+    counts = _work_table_counts(total, "random")
+    monkeypatch.delenv("AITER_MHA_V4_WORK_ORDER", raising=False)
+
+    table = mha_v4_sparse_work_table(
+        counts, batch, nhead, q_tiles, q_tile=q_tile, kv_tiles=64
+    )
+
+    visited = _unpack_work_table(table, nhead, q_tiles).tolist()
+    assert visited == _expected_work_order(order, counts.tolist(), q_tiles, 64)
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
 def test_mha_v4_sparse_work_table_rejects_an_unknown_work_order(monkeypatch):
     monkeypatch.setenv("AITER_MHA_V4_WORK_ORDER", "fastest")
     counts = torch.ones(4, device="cuda", dtype=torch.int32)
-    with pytest.raises(RuntimeError, match="must be lpt, head or raster"):
+    with pytest.raises(
+        RuntimeError, match="must be lpt, head, head-promoted or raster"
+    ):
         mha_v4_sparse_work_table(counts, 1, 1, 4)
 
 

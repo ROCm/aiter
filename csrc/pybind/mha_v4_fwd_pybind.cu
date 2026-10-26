@@ -91,5 +91,7 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("lut_count"),
           py::arg("batch"),
           py::arg("nhead"),
-          py::arg("q_tiles"));
+          py::arg("q_tiles"),
+          py::arg("q_tile")   = 256,
+          py::arg("kv_tiles") = 0);
 }

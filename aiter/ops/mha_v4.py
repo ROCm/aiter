@@ -100,6 +100,8 @@ def _mha_v4_sparse_work_table_fake(
     batch: int,
     nhead: int,
     q_tiles: int,
+    q_tile: int = 256,
+    kv_tiles: int = 0,
 ) -> Tensor:
     return lut_count.new_empty(batch * nhead * q_tiles, dtype=torch.int32)
 
@@ -110,14 +112,20 @@ def mha_v4_sparse_work_table(
     batch: int,
     nhead: int,
     q_tiles: int,
+    q_tile: int = 256,
+    kv_tiles: int = 0,
 ) -> Tensor:
     """Return the tile visit order the sparse kernel would use for these LUT lengths.
 
     Exposed for testing. The sparse launcher builds this itself, and a wrong order only unbalances
     the waves rather than changing the result, so no test of the attention output can see it.
 
-    Each entry packs one tile as ``q_tile | head << 16 | batch << 24``, ordered by LUT length
-    descending with ties left in raster order.
+    Each entry packs one tile as ``q_tile | head << 16 | batch << 24``. ``q_tile`` is the row's
+    query tile, which picks the order as the launcher does: above 64 rows, LUT length descending
+    with ties left in raster order; at 64 rows or fewer, heads in raster order with each head's
+    tiles longest first, after every tile whose LUT holds at least 90% of ``kv_tiles``, these
+    themselves in raster order. ``AITER_MHA_V4_WORK_ORDER`` (``lpt``, ``head``,
+    ``head-promoted`` or ``raster``) overrides that choice.
     """
 
 
@@ -1448,10 +1456,13 @@ def mha_v4_packed(
     it, so there it is the dequantized variance quantized the way mean_k is, and
     mean_k_var_scale carries its scale in mean_k_scale's layout.
 
-    sorted_dispatch orders Sol-Attn's workgroups by lut_count, heaviest first in a few
-    coarse levels and raster order within each, so the query tiles that compute the most
-    blocks exactly (a forced sink row, say) start first instead of trailing the grid.
-    The output is identical either way. None sorts wherever the row declares sorted,
+    sorted_dispatch orders Sol-Attn's workgroups by lut_count so the query tiles that
+    compute the most blocks exactly (a forced sink row, say) start first instead of
+    trailing the grid. A 256-row query tile goes heaviest first in a few coarse levels,
+    raster order within each; a 64-row one, which leans on neighbouring tiles sharing a
+    head's K/V in L2, starts the tiles computing at least 90% of the blocks exactly and
+    then runs head by head, heaviest first within each. AITER_MHA_V4_WORK_ORDER overrides
+    the order, and the output is identical whichever it is. None sorts wherever the row declares sorted,
     False keeps raster order, True requires it.
 
     v_pack names V's layout within v_format, and mean_v's with it. An MXFP4 or MXFP6 V packed

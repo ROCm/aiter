@@ -492,35 +492,62 @@ constexpr int32_t kWorkTableSortThreads = 1024;
 // Host-side wave width, only used to size the grid. Device code reads warpSize directly, and the
 // grid-stride loop stays correct if the two disagree.
 constexpr int32_t kWorkTableWave = 64;
-// Sol-Attn sorts on lut_count in this many levels of the KV length rather than on the count
-// itself, raster order within a level. Its ordinary tiles spread over a range of counts, and an
-// exact sort scatters neighbouring query tiles across heads: on 64x64 rows over a 42k-token
-// sequence that lost the shared K/V reads and cost 15-38%. Coarse levels still start an all-exact
-// (sink) row first, which is the straggler the table is for; 2 to 8 levels measured alike.
+// Sol-Attn's LPT order sorts on lut_count in this many levels of the KV length rather than on the
+// count itself, raster order within a level. Coarse levels still start an all-exact (sink) row
+// first, which is the straggler the table is for, and at 256x128 measured within about 1% of an
+// exact sort.
 constexpr int64_t kSolSortLevels = 4;
 
 // Work-table order. LPT is the global longest-first order the table was built for. HEAD_LOCAL
 // keeps heads in raster order and sorts longest-first within each one, so the work items in
 // flight share a head's K/V in L2 while every head still starts its heavy tiles first. RASTER is
-// the identity. AITER_MHA_V4_WORK_ORDER=lpt|head|raster selects it per call.
+// the identity. HEAD_PROMOTED is HEAD_LOCAL after every row that computes at least
+// kPromoteNumerator / kPromoteDenominator of the KV tiles exactly: such a row runs about as long
+// as a whole shallow grid, so it has to start at once, and the promoted rows keep head order among
+// themselves so the first waves mix as few heads as they can.
+//
+// A 64-row query tile reuses each K/V tile a quarter as often as a 256-row one, so its rows lean
+// on the L2 sharing that LPT destroys. On synthetic 720p FP8 masks (uniform, skewed, local and
+// dense-row) an exact LPT ran 35% behind the best order on average at 64x64, and HEAD_PROMOTED 1%
+// (5% at worst). 256x128 is the reverse, LPT the best everywhere and head order up to 19% behind
+// it, so the default follows the tile: AITER_MHA_V4_WORK_ORDER=lpt|head|head-promoted|raster
+// overrides it per call.
 enum class WorkOrder : int32_t
 {
-    Lpt       = 0,
-    HeadLocal = 1,
-    Raster    = 2,
+    Lpt          = 0,
+    HeadLocal    = 1,
+    Raster       = 2,
+    HeadPromoted = 3,
 };
 
-WorkOrder work_order()
+constexpr int64_t kHeadPromotedMaxQueryTile = 64;
+constexpr int64_t kPromoteNumerator         = 9;
+constexpr int64_t kPromoteDenominator       = 10;
+
+WorkOrder work_order(int64_t q_tile)
 {
     const char* value = std::getenv("AITER_MHA_V4_WORK_ORDER");
-    if(value == nullptr || value[0] == '\0' || std::strcmp(value, "lpt") == 0)
+    if(value == nullptr || value[0] == '\0')
+        return q_tile <= kHeadPromotedMaxQueryTile ? WorkOrder::HeadPromoted : WorkOrder::Lpt;
+    if(std::strcmp(value, "lpt") == 0)
         return WorkOrder::Lpt;
     if(std::strcmp(value, "head") == 0)
         return WorkOrder::HeadLocal;
+    if(std::strcmp(value, "head-promoted") == 0)
+        return WorkOrder::HeadPromoted;
     if(std::strcmp(value, "raster") == 0)
         return WorkOrder::Raster;
-    TORCH_CHECK(false, "AITER_MHA_V4_WORK_ORDER must be lpt, head or raster, got ", value);
+    TORCH_CHECK(
+        false, "AITER_MHA_V4_WORK_ORDER must be lpt, head, head-promoted or raster, got ", value);
     return WorkOrder::Lpt;
+}
+
+// The lut_count from which HEAD_PROMOTED starts a row first, or 0 for no promotion.
+int64_t promote_count(WorkOrder order, int64_t kv_tiles)
+{
+    if(order != WorkOrder::HeadPromoted || kv_tiles <= 0)
+        return 0;
+    return (kPromoteNumerator * kv_tiles + kPromoteDenominator - 1) / kPromoteDenominator;
 }
 
 // Order and pack in a single launch, by counting each entry's rank rather than moving entries past
@@ -547,20 +574,26 @@ __global__ void rank_and_pack_work_table_kernel(int32_t* __restrict__ table,
                                                 const int32_t q_tiles,
                                                 const int32_t nhead,
                                                 const int32_t bucket,
-                                                const int32_t order)
+                                                const int32_t order,
+                                                const int32_t promote)
 {
     __shared__ uint64_t keys[kWorkTableFusedMax];
 
     for(int32_t slot = threadIdx.x; slot < total; slot += blockDim.x)
     {
         const uint32_t level = static_cast<uint32_t>(lut_count[slot] / bucket);
-        if(order == static_cast<int32_t>(WorkOrder::HeadLocal))
+        if(order == static_cast<int32_t>(WorkOrder::HeadLocal) ||
+           order == static_cast<int32_t>(WorkOrder::HeadPromoted))
         {
-            // (batch, head) in the top 16 bits, the complemented level below it; batch < 256 and
-            // heads < 256 keep the group in range, and a LUT is never longer than 65536.
-            const uint64_t group = static_cast<uint32_t>(slot / q_tiles);
-            const uint64_t rank  = 0xFFFFu - (level < 0xFFFFu ? level : 0xFFFFu);
-            keys[slot] = (group << 48) | (rank << 32) | static_cast<uint32_t>(slot);
+            // The group in the top 16 bits: 0 for a promoted row, else 1 + (batch, head), which
+            // batch < 256 and heads < 256 keep in range. Below it the complemented level, or for a
+            // promoted row its (batch, head), so promoted rows run head by head; a LUT is never
+            // longer than 65536.
+            const uint32_t head  = static_cast<uint32_t>(slot / q_tiles);
+            const bool promoted  = promote > 0 && lut_count[slot] >= promote;
+            const uint64_t group = promoted ? 0u : head + 1u;
+            const uint64_t rank  = promoted ? head : 0xFFFFu - (level < 0xFFFFu ? level : 0xFFFFu);
+            keys[slot]           = (group << 48) | (rank << 32) | static_cast<uint32_t>(slot);
         }
         else if(order == static_cast<int32_t>(WorkOrder::Raster))
             keys[slot] = static_cast<uint32_t>(slot);
@@ -593,7 +626,9 @@ build_sorted_work_table(const at::Tensor& lut_count,
                         int64_t batch,
                         int64_t nhead,
                         int64_t q_tiles,
-                        int64_t bucket = 1)
+                        WorkOrder order,
+                        int64_t bucket  = 1,
+                        int64_t promote = 0)
 {
     auto flat           = lut_count.reshape({-1}).contiguous();
     const int64_t total = batch * nhead * q_tiles;
@@ -613,9 +648,8 @@ build_sorted_work_table(const at::Tensor& lut_count,
     // ATen ops, whose launch overhead on a few hundred entries dwarfs the arithmetic.
     auto table               = at::empty({total}, flat.options().dtype(at::kInt));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    const WorkOrder order    = work_order();
     // Within one head the coarse levels only existed to stop the sort from scattering heads.
-    if(order == WorkOrder::HeadLocal)
+    if(order == WorkOrder::HeadLocal || order == WorkOrder::HeadPromoted)
         bucket = 1;
 
     if(total <= kWorkTableFusedMax)
@@ -631,7 +665,8 @@ build_sorted_work_table(const at::Tensor& lut_count,
             static_cast<int32_t>(q_tiles),
             static_cast<int32_t>(nhead),
             static_cast<int32_t>(bucket),
-            static_cast<int32_t>(order));
+            static_cast<int32_t>(order),
+            static_cast<int32_t>(promote));
         return table;
     }
 
@@ -640,11 +675,20 @@ build_sorted_work_table(const at::Tensor& lut_count,
     at::Tensor permutation;
     if(order == WorkOrder::Raster)
         permutation = at::arange(total, flat.options().dtype(at::kLong));
-    else if(order == WorkOrder::HeadLocal)
+    else if(order == WorkOrder::HeadLocal || order == WorkOrder::HeadPromoted)
     {
-        const auto group = at::floor_divide(at::arange(total, flat.options().dtype(at::kLong)), q_tiles);
-        const auto key   = group * 65536 + (65535 - flat.to(at::kLong).clamp_max(65535));
-        permutation      = at::argsort(key, /*stable=*/true, /*dim=*/0, /*descending=*/false);
+        const auto head =
+            at::floor_divide(at::arange(total, flat.options().dtype(at::kLong)), q_tiles);
+        auto group = head + 1;
+        auto rank  = 65535 - flat.to(at::kLong).clamp_max(65535);
+        if(promote > 0)
+        {
+            const auto promoted = flat >= promote;
+            group               = at::where(promoted, at::zeros_like(group), group);
+            rank                = at::where(promoted, head, rank);
+        }
+        permutation =
+            at::argsort(group * 65536 + rank, /*stable=*/true, /*dim=*/0, /*descending=*/false);
     }
     else
         permutation = at::argsort(bucket > 1 ? at::floor_divide(flat, bucket) : flat,
@@ -1074,12 +1118,18 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
 
 } // namespace
 
-at::Tensor
-mha_v4_sparse_work_table(const at::Tensor& lut_count, int64_t batch, int64_t nhead, int64_t q_tiles)
+at::Tensor mha_v4_sparse_work_table(const at::Tensor& lut_count,
+                                    int64_t batch,
+                                    int64_t nhead,
+                                    int64_t q_tiles,
+                                    int64_t q_tile,
+                                    int64_t kv_tiles)
 {
     TORCH_CHECK(lut_count.is_cuda(), "lut_count must be a GPU tensor");
     const HipDeviceGuard device_guard{lut_count.get_device()};
-    return build_sorted_work_table(lut_count, batch, nhead, q_tiles);
+    const WorkOrder order = work_order(q_tile);
+    return build_sorted_work_table(
+        lut_count, batch, nhead, q_tiles, order, 1, promote_count(order, kv_tiles));
 }
 
 void fmha_v4_fwd(const at::Tensor& q,
@@ -1269,7 +1319,9 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     {
         validate_lut_contents(kv_idx, start, count, lut_rows, kv_tiles);
     }
-    auto work_table = build_sorted_work_table(count, shapes.batch, shapes.nhead_q, q_tiles);
+    const WorkOrder order = work_order(cfg.ts_qo);
+    auto work_table       = build_sorted_work_table(
+        count, shapes.batch, shapes.nhead_q, q_tiles, order, 1, promote_count(order, kv_tiles));
 
     FmhaV4SparseSortedKernarg args{};
     populate_dense_kernarg(args.dense,
@@ -1583,8 +1635,15 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
     at::Tensor work_table;
     if(use_sorted)
     {
-        const int64_t bucket = (kv_tiles + kSolSortLevels - 1) / kSolSortLevels;
-        work_table = build_sorted_work_table(count, shapes.batch, shapes.nhead_q, q_tiles, bucket);
+        const WorkOrder order = work_order(cfg.ts_qo);
+        const int64_t bucket  = (kv_tiles + kSolSortLevels - 1) / kSolSortLevels;
+        work_table            = build_sorted_work_table(count,
+                                             shapes.batch,
+                                             shapes.nhead_q,
+                                             q_tiles,
+                                             order,
+                                             bucket,
+                                             promote_count(order, kv_tiles));
     }
 
     FmhaV4SolKernarg args{};

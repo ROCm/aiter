@@ -126,10 +126,14 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
 // The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.
 // Reordering a permutation costs only load balance, but the table must stay a permutation: each
 // entry names the tile one workgroup claims, so a duplicated entry leaves another tile unwritten.
+// q_tile picks the default order the launchers would (see AITER_MHA_V4_WORK_ORDER), and
+// kv_tiles the lut_count from which the head-promoted order starts a row first.
 at::Tensor mha_v4_sparse_work_table(const at::Tensor& lut_count,
                                     int64_t batch,
                                     int64_t nhead,
-                                    int64_t q_tiles);
+                                    int64_t q_tiles,
+                                    int64_t q_tile   = 256,
+                                    int64_t kv_tiles = 0);
 
 } // namespace torch_itfs
 } // namespace aiter

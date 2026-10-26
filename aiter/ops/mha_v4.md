@@ -201,9 +201,14 @@ pass the pre-quantization tensors as `k_source` / `v_source`; FP6-P V rows take 
 `mxfp6_fp6_p`, and MXFP6/FP8's FP8 V needs neither. A pooled V keeps V's 128-token packing
 whatever the KV tile, so at 64x64 its scale image covers the pooled rows rounded up to 128.
 
-Rows declaring `sorted` launch over a work table ordered by `lut_count` (`sorted_dispatch`); the
-order changes only scheduling, and the output is bitwise identical either way. `kv_range_tokens`
-splits the softmax into LSE-merged key ranges on rows declaring `kv_range`.
+Rows declaring `sorted` launch over a work table ordered by `lut_count` (`sorted_dispatch`), as
+sorted-sparse rows always do. A 256-row query tile reuses each K/V tile enough that load balance
+decides, so its table is longest first (Sol-Attn in four levels of the KV length). A 64-row tile
+leans on neighbouring tiles sharing a head's K/V in L2, so its table starts every tile with at
+least 90% of the KV tiles in its LUT, head by head, then runs the heads in raster order, longest
+first within each. `AITER_MHA_V4_WORK_ORDER=lpt|head|head-promoted|raster` overrides the order per
+call. The order changes only scheduling, and the output is bitwise identical either way.
+`kv_range_tokens` splits the softmax into LSE-merged key ranges on rows declaring `kv_range`.
 
 ## Compile And ABI Rules
 
