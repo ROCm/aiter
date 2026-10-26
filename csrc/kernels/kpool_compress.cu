@@ -431,6 +431,15 @@ struct TailArgs {
   int ring_shift;        // log2(ring)
 };
 
+// Wave-uniform `x >> 31` kept as an SALU shift: the compiler turns it into
+// s_cmp + s_cselect_b64 lane masks (and branches on them through a v_cndmask
+// / v_cmp round trip), which doubles the SALU chain in front of the ring loads.
+__device__ __forceinline__ uint32_t s_bit31(uint32_t x) {
+  uint32_t r;
+  asm("s_lshr_b32 %0, %1, 31" : "=s"(r) : "s"(x));
+  return r;
+}
+
 // ring is a power of two (AITER_CHECK in tail_args): shift / mask only, so the
 // metadata loads of a decode request are not split by a data-dependent branch.
 __device__ __forceinline__ int ring_div(int x, const TailArgs& ta) { return x >> ta.ring_shift; }
@@ -729,11 +738,11 @@ __device__ __forceinline__ void decode_request(
     int req,  // wave-uniform
     const DecodeKArgs& d,
     int sub,    // lane, 0..63
-    bool valid = true) {  // wave-uniform; false = padding wave (loads only, no stores)
+    uint32_t vmask = ~0u) {  // wave-uniform; 0 = padding wave (loads only, no stores)
   typedef typename Vec<NMAX>::i ivec;
   typedef typename Vec<NMAX>::u uvec;
-  const gptr<const int32_t> m_ts = (gptr<const int32_t>)d.tail_slot, m_loc = (gptr<const int32_t>)d.slot_map,
-                            m_pos = (gptr<const int32_t>)d.positions;
+  gptr<const int32_t> m_ts = (gptr<const int32_t>)d.tail_slot, m_loc = (gptr<const int32_t>)d.slot_map,
+                      m_pos = (gptr<const int32_t>)d.positions;
   const gptr<const float> ape_g = (gptr<const float>)d.ape;
   const gptr<uint16_t> tail = (gptr<uint16_t>)d.tail;
   const gptr<uint8_t> cache_g = (gptr<uint8_t>)d.cache;
@@ -754,8 +763,8 @@ __device__ __forceinline__ void decode_request(
   // The first loads "depend" on every other kernarg (empty asm): the compiler
   // fetches all kernargs in one SMEM batch with one wait, instead of one lazy
   // batch and one wait per first use along the chain.
-  asm("" : "+s"(kb), "+s"(sb)
-         : "s"(m_ts), "s"(m_loc), "s"(m_pos), "s"(ape_g), "s"(tail), "s"(ta.block_elems),
+  asm("" : "+s"(kb), "+s"(sb), "+s"(m_ts), "+s"(m_loc), "+s"(m_pos)
+         : "s"(ape_g), "s"(tail), "s"(ta.block_elems),
            "s"(ta.head_elems), "s"(ta.ring_mask), "s"(ta.ring_shift), "s"(cache_g), "s"(page_size), "s"(page_shift),
            "s"(page_bytes), "s"(flags), "s"(d.key_st), "s"(d.ss_st));
   const gptr<const uint16_t> kbase = (gptr<const uint16_t>)kb;
@@ -767,6 +776,7 @@ __device__ __forceinline__ void decode_request(
     rs[i] = load_dw<VEC>(sbase + (uint32_t)(j * d.ss_st), sub);
   }
   ivec loc, pos, ts;
+#ifdef KPOOL_META_SMEM
 #pragma unroll
   for (int i = 0; i < NMAX; ++i) {
     const uint32_t j = (uint32_t)(base + min(i, n - 1));
@@ -774,6 +784,27 @@ __device__ __forceinline__ void decode_request(
     pos[i] = m_pos[j];
     ts[i] = m_ts[j];
   }
+#else
+  {
+    // One vector load fetches the 3 * NMAX metadata words (lane l: array
+    // l / NMAX, token l % NMAX; the other lanes repeat the last one), then
+    // readlane. Three s_load_dword to three arrays cost ~1100 clocks on the
+    // ATT ledger (the scalar cache serves the three lines nearly serially);
+    // one VMEM load of three lines is one vector round trip (~700).
+    const int l = min(sub, 3 * NMAX - 1);
+    const int arr = l / NMAX;
+    const int tok = l - arr * NMAX;
+    const uint32_t j = (uint32_t)(base + min(tok, n - 1));
+    const gptr<const int32_t> p = arr == 0 ? m_ts : (arr == 1 ? m_loc : m_pos);
+    const int32_t v = p[j];
+#pragma unroll
+    for (int i = 0; i < NMAX; ++i) {
+      ts[i] = __builtin_amdgcn_readlane(v, i);
+      loc[i] = __builtin_amdgcn_readlane(v, NMAX + i);
+      pos[i] = __builtin_amdgcn_readlane(v, 2 * NMAX + i);
+    }
+  }
+#endif
   // APE rows: loaded only when a pool closes (one step in POOL), together
   // with the ring rows; the row pointer is pinned uniform so the lane offset
   // stays a 32-bit saddr offset.
@@ -793,18 +824,18 @@ __device__ __forceinline__ void decode_request(
   uint32_t smask = 0, cmask = 0;
 #pragma unroll
   for (int i = 0; i < NMAX; ++i) {
-    const uint32_t tok_ok = i < n ? 1u : 0u;  // token index inside the request
+    const uint32_t tok_ok = i == 0 ? 1u : s_bit31((uint32_t)(i - n));  // i < n: token i exists
     const int safe = max(pos[i], 0);
     phys[i] = ring_mod(safe, ta);
     blk[i] = ring_div(max(ts[i], 0), ta);
     // sign tricks instead of compare + select chains: bit 31 of ~(a | b) is
-    // set iff both are >= 0
-    const uint32_t stash_ok = (~(uint32_t)(pos[i] | ts[i])) >> 31;
-    const uint32_t close_ok = ((~(uint32_t)(pos[i] | loc[i])) >> 31) & ((safe % POOL == POOL - 1) ? 1u : 0u);
+    // set iff both are >= 0; bit 31 of (POOL-1 - safe % POOL) - 1 iff the
+    // token is the last slot of its pool
+    const uint32_t stash_ok = s_bit31(~(uint32_t)(pos[i] | ts[i]));
+    const uint32_t close_ok = s_bit31(~(uint32_t)(pos[i] | loc[i])) & s_bit31((uint32_t)(POOL - 1 - safe % POOL) - 1u);
     smask |= (tok_ok & stash_ok) << i;
     cmask |= (tok_ok & close_ok) << i;
   }
-  const uint32_t vmask = valid ? ~0u : 0u;
   smask &= vmask;
   cmask &= vmask;
 
@@ -941,7 +972,8 @@ __global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) kpool_decode_kernel(Deco
   const int req_raw = blockIdx.x * DEC_BLOCK_WAVES + wave;
   const bool valid = req_raw < d.num_requests;
   const int req = valid ? req_raw : d.num_requests - 1;
-  decode_request<POOL, NMAX, VEC>(req, d, lane, valid);
+  const uint32_t vmask = 0u - s_bit31((uint32_t)(req_raw - d.num_requests));  // ~0 iff valid
+  decode_request<POOL, NMAX, VEC>(req, d, lane, vmask);
 }
 
 // ===========================================================================
