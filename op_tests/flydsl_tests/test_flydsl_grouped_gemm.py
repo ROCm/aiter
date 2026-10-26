@@ -18,8 +18,8 @@ DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
 per-kernel bench that times gemm1 and gemm2 in isolation
 (``--scenario kernel``), a tiny correctness check
 (``--scenario verify``), or a full sweep of every setting in a tuned-config
-CSV (``--scenario csv``; defaults to ``aiter/configs/tuned_grouped_fmoe.csv``,
-one benched case per row, override the file with ``--csv-path``).
+CSV (``--scenario csv``; defaults to all tuned gfx1250 grouped-MoE TP CSVs,
+one benched case per TP row, select a single file with ``--csv-path``).
 """
 
 from __future__ import annotations
@@ -1013,17 +1013,15 @@ def set_data_format(data_format: str) -> None:
     logger.info("grouped GEMM data format: %s", data_format)
 
 
-# Default tuned-config CSV: <repo>/aiter/configs/tuned_grouped_fmoe.csv. Every
-# row is one grouped-MoE setting; the --scenario csv sweep runs them all.
-DEFAULT_CSV_PATH = os.path.normpath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "aiter",
-        "configs",
-        "tuned_grouped_fmoe.csv",
+DEFAULT_CSV_PATHS = [
+    os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "aiter", "configs", name)
     )
-)
+    for name in (
+        "tuned_grouped_fmoe.csv",
+        "model_configs/qwen3_5_397b_tuned_grouped_fmoe.csv",
+    )
+]
 
 
 def _csv_data_format(q_dtype_a: str) -> str:
@@ -1046,10 +1044,26 @@ def _csv_activation(act_type: str) -> ActivationType:
         return ActivationType.Swiglu
     if a == "ActivationType.Silu":
         return ActivationType.Silu
+    if a == "ActivationType.Situv2":
+        return ActivationType.Situv2
     raise ValueError(f"unsupported act_type in CSV: {act_type!r}")
 
 
 def run_csv_scenario(args) -> None:
+    """Sweep the requested CSV or all default tuned gfx1250 TP CSVs."""
+    csv_paths = [args.csv_path] if args.csv_path is not None else DEFAULT_CSV_PATHS
+    failures = []
+    for csv_path in csv_paths:
+        try:
+            _run_csv_file(args, csv_path)
+        except Exception as exc:  # Finish the other files before reporting failures.
+            failures.append((csv_path, str(exc)))
+            logger.exception("[csv] %s: FAILED", csv_path)
+    if failures:
+        raise AssertionError(f"CSV failures: {failures}")
+
+
+def _run_csv_file(args, csv_path: str) -> None:
     """Sweep every setting in a tuned_grouped_fmoe-style CSV.
 
     Each CSV row (token, model_dim, inter_dim, expert, topk, act_type,
@@ -1061,16 +1075,20 @@ def run_csv_scenario(args) -> None:
     correctness checked; one out-of-gate row is recorded rather than aborting
     the sweep.
     """
-    csv_path = args.csv_path or DEFAULT_CSV_PATH
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
     if not os.path.isfile(csv_path):
-        raise SystemExit(f"CSV not found: {csv_path}")
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    os.environ["AITER_CONFIG_GROUPED_FMOE"] = csv_path
+    # The lookup cache is keyed by workload, so invalidate it when switching CSVs.
+    grouped._find_grouped_config.cache_clear()
     print(f"[csv] sweeping settings from {csv_path}", flush=True)
 
     with open(csv_path, newline="") as fh:
         reader = csv.DictReader(fh)
         csv_rows = list(reader)
     if not csv_rows:
-        raise SystemExit(f"CSV has no data rows: {csv_path}")
+        raise ValueError(f"CSV has no data rows: {csv_path}")
 
     activation_override = None
     if args.act is not None:
@@ -1095,16 +1113,7 @@ def run_csv_scenario(args) -> None:
             print(f"[csv] row {idx}: skipped topk=-1 (EP row)", flush=True)
             continue
 
-        # The grouped kernels need K/inter >= 512 (tile_k=256 -> two K tiles).
-        if model_dim < 512 or inter_dim < 512:
-            print(
-                f"[csv] row {idx}: skipped model_dim={model_dim} "
-                f"inter_dim={inter_dim} (< 512 grouped-kernel floor)",
-                flush=True,
-            )
-            continue
-
-        act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+        act = next(name for name, value in _ACT_BY_NAME.items() if value == activation)
         print(
             f"\n===== csv row {idx}: {data_format} {act} "
             f"tokens={tokens} model_dim={model_dim} inter_dim={inter_dim} "
@@ -1190,6 +1199,7 @@ def run_csv_scenario(args) -> None:
 
     summarize(rows)
     failed = [r for r in rows if not r["pass"]]
+    print(f"[csv] {csv_path}: {len(rows) - len(failed)}/{len(rows)} cases passed")
     if failed:
         details = "; ".join(
             f"row={r['row']} {r['data_format']} {r['act']} "
@@ -1225,7 +1235,7 @@ def main() -> None:
         "--csv-path",
         default=None,
         help="CSV of grouped-MoE settings to sweep with --scenario csv "
-        f"(default: {DEFAULT_CSV_PATH}). Each row is one case.",
+        "(default: all tuned gfx1250 TP CSVs). Each TP row is one case.",
     )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument("--experts", type=int, default=256)
