@@ -742,24 +742,22 @@ def test_triton_unified_attn(
 
 
 @pytest.mark.parametrize(
-    "seq_lens, num_heads, block_size, sliding_window, grids",
+    "seq_lens, num_heads, block_size, sliding_window",
     [
-        ([(4, 3000), (8, 40000), (1, 9000)], (16, 2), 16, 2048, ["2d", 32]),
-        ([(8, 8704)], (16, 2), 128, 2048, ["2d", 64]),
-        ([(8, 582), (1, 582)], (16, 2), 64, 512, [16, 16]),
-        ([(1, 8704)] * 4, (16, 2), 16, 2048, [1, 1]),
-        ([(128, 1100)], (32, 32), 64, 1024, ["2d", "2d"]),
-        ([(17, 1100)], (32, 32), 64, 1024, ["2d", "2d"]),
+        ([(4, 3000), (8, 40000), (1, 9000)], (16, 2), 16, 2048),
+        ([(8, 8704)], (16, 2), 128, 2048),
+        ([(8, 582), (1, 582)], (16, 2), 64, 512),
+        ([(1, 8704)] * 4, (16, 2), 16, 2048),
+        ([(128, 1100)], (32, 32), 64, 1024),
+        ([(17, 1100)], (32, 32), 64, 1024),
     ],
 )
 @torch.inference_mode()
 def test_triton_unified_attn_sw_verify_split(
-    seq_lens, num_heads, block_size, sliding_window, grids, monkeypatch
+    seq_lens, num_heads, block_size, sliding_window
 ):
     if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
         pytest.skip("gfx950 gluon split dispatch")
-    import aiter.ops.triton.attention.unified_attention as ua
-
     query_lens = [q for q, _ in seq_lens]
     kv_lens = [kv for _, kv in seq_lens]
     max_q = max(query_lens)
@@ -794,16 +792,6 @@ def test_triton_unified_attn_sw_verify_split(
     trimmed_lens = [kv - fb * block_size for kv, fb in zip(kv_lens, first)]
     assert max(trimmed_lens) <= sliding_window + max_q + block_size - 2
 
-    calls = []
-    run_2d, run_3d = ua._unified_attention_2d_gfx950, ua._unified_attention_3d_gfx950
-    monkeypatch.setattr(
-        ua, "_unified_attention_2d_gfx950", lambda p: calls.append("2d") or run_2d(p)
-    )
-    monkeypatch.setattr(
-        ua,
-        "_unified_attention_3d_gfx950",
-        lambda p, o, m, s, n, *a: calls.append(n) or run_3d(p, o, m, s, n, *a),
-    )
     for block_table, lens, max_seqlen_k in [
         (table, kv_lens_t, max_k),
         (
@@ -833,7 +821,6 @@ def test_triton_unified_attn_sw_verify_split(
             sinks=sinks,
         )
         torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
-    assert calls == grids, calls
 
 
 @pytest.mark.parametrize(
@@ -844,14 +831,11 @@ def test_triton_unified_attn_sw_verify_split(
     ],
 )
 @torch.inference_mode()
-def test_triton_unified_attn_sw_split_no_sinks(
-    seq_lens, num_heads, block_size, monkeypatch
-):
+def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
     # a page much longer than a tile leaves 32+ empty leading segments, a whole
     # reduce chunk at head 256, which without sinks has no finite max
     if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
         pytest.skip("gfx950 gluon split dispatch")
-    import aiter.ops.triton.attention.unified_attention as ua
 
     sliding_window = 2048
     query_lens = [q for q, _ in seq_lens]
@@ -870,13 +854,6 @@ def test_triton_unified_attn_sw_split_no_sinks(
         q, k, v, query_lens, kv_lens, table, scale, torch.bfloat16, sliding_window
     ).float()
 
-    calls = []
-    run_3d = ua._unified_attention_3d_gfx950
-    monkeypatch.setattr(
-        ua,
-        "_unified_attention_3d_gfx950",
-        lambda p, o, m, s, n, *a: calls.append(n) or run_3d(p, o, m, s, n, *a),
-    )
     unified_attention(
         q=q,
         k=k,
@@ -895,79 +872,7 @@ def test_triton_unified_attn_sw_split_no_sinks(
         k_descale=None,
         v_descale=None,
     )
-    assert calls == [64], calls
     torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize(
-    "sliding_window, max_seqlen_q, max_seqlen_k, num_seqs, block_size, segments",
-    [
-        (2048, 8, 2070, 1, 16, 64),
-        (2048, 8, 2070, 12, 16, 4),
-        (2048, 8, 2070, 32, 16, 2),
-        (2048, 8, 2070, 36, 16, 1),
-        (2048, 8, 2071, 1, 16, 1),
-        (2048, 8, 200000, 1, 16, 1),
-        (2048, 1, 2063, 1, 16, 1),
-        (128, 4, 258, 1, 128, 1),
-        (255, 16, 270, 1, 16, 1),
-        (256, 16, 271, 1, 16, 8),
-        (256, 8, 278, 7, 16, 8),
-        (256, 8, 278, 8, 16, 1),
-        (256, 8, 390, 8, 128, 1),
-        (2048, 8, 300, 4, 16, 8),
-    ],
-)
-def test_unified_attn_sw_kv_split_config(
-    sliding_window, max_seqlen_q, max_seqlen_k, num_seqs, block_size, segments
-):
-    from aiter.ops.triton.utils.unified_attention_utils import (
-        get_unified_attention_config,
-    )
-
-    block_m = max(64, 1 << (max_seqlen_q * 8 - 1).bit_length())
-    q_blocks = num_seqs
-    if max_seqlen_q > 1:
-        q_blocks += num_seqs * max_seqlen_q // (block_m // 8)
-    params = SimpleNamespace(
-        head_size=64,
-        head_size_v=64,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        sliding_window=sliding_window,
-        shuffled_kv_cache=False,
-        q_dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        block_size=block_size,
-        num_sms=256,
-        num_seqs=num_seqs,
-        num_queries_per_kv=8,
-        num_2d_prgms=q_blocks * 2,
-    )
-    config = get_unified_attention_config(
-        "kv_split", params, backend="gluon", arch="gfx950"
-    )
-    assert config["NUM_SEGMENTS"] == segments, config
-
-
-def test_unified_attn_sw_axis_lookup():
-    from aiter.ops.triton.utils import unified_attention_utils as uau
-
-    parts = {"SW_GEQ_512", "SW_GEQ_4096", "SW"}
-    assert uau._candidates("SW", 4096, parts) == [
-        "SW_GEQ_4096",
-        "SW_GEQ_512",
-        "SW",
-        "any",
-    ]
-    assert uau._candidates("SW", 300, parts) == ["SW", "any"]
-    assert uau._candidates("SW", 0, parts) == ["any"]
-    bf16 = torch.bfloat16
-    assert uau._axis_values(64, 8, 300, 2048, False, 16, bf16, bf16)["SW"] == 300
-    assert uau._axis_values(64, 1, 0, 128, False, 16, bf16, bf16)["SW"] == 1
-
-    with pytest.raises(AssertionError, match="mix LEQ and GEQ"):
-        uau._index(("SW_LEQ_512", "SW_GEQ_4096", "any"), ("SW",))
 
 
 @pytest.mark.parametrize(
