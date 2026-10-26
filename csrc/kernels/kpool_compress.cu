@@ -886,7 +886,12 @@ __device__ __forceinline__ void decode_request(
       store_dw(dst, sub, k0);
       store_dw(dst + (uint32_t)ta.head_elems, sub, s0);
     };
-    if (cmask) {
+    // Layout: the non-closing path (3 steps in 4) is the fall-through right
+    // after the branch and the closing path is the out-of-line block. Without
+    // the hint the compiler puts the stash block behind the closing path, and
+    // every non-closing wave pays an instruction-cache miss (~550 clocks on
+    // the ATT ledger) to reach it.
+    if (__builtin_expect(cmask != 0, 0)) {
       const gptr<const uint16_t> krow = tail_row(blk[0], phys[0] - (POOL - 1));
       const gptr<const uint16_t> grow = krow + (uint32_t)ta.head_elems;
       uint32_t gw[POOL][1], kw[POOL][1];
