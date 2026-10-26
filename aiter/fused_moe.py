@@ -3062,11 +3062,6 @@ def _opus_stage2_fp8_enabled():
     return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
 
 
-def _size_class_rows(rows):
-    # Next power of two, so per-step token counts reuse cached allocator segments.
-    return 1 << max(rows - 1, 0).bit_length()
-
-
 def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
@@ -3180,8 +3175,9 @@ def _flydsl_v2_stage2_wrapper(
                 device=out.device,
             )
         else:
+            # Power-of-two rows so per-step token counts reuse cached segments.
             target = torch.empty(
-                (_size_class_rows(token_num), topk, model_dim_runtime),
+                (nextPow2(token_num), topk, model_dim_runtime),
                 dtype=out.dtype,
                 device=out.device,
             )[:token_num]
