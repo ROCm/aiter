@@ -5425,7 +5425,7 @@ static int mla_rope_heads_per_block(int64_t num_tokens, int num_heads)
 // hpt x 256 nope plus min(hpt, 4) x 64 pe elements.
 static size_t mla_rope_tdm_lds_bytes(int hpt, size_t elem_size)
 {
-    static const bool tdm_arch = get_gpu_arch() == "gfx1250";
+    static const bool tdm_arch = (get_gpu_arch() == "gfx1250" || get_gpu_arch() == "gfx1250-strict");
     if(!tdm_arch || ((AITER_MLA_SEG_TDM_HPT_MASK >> hpt) & 1) == 0)
         return 0;
     return size_t(2) * (hpt * 256 + std::min(hpt, 4) * 64) * elem_size;

@@ -128,7 +128,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      stream))
 {
     const std::string arch_id = get_gpu_arch();
-    AITER_CHECK(arch_id == "gfx1250",
+    AITER_CHECK((arch_id == "gfx1250" || arch_id == "gfx1250-strict"),
                 "mla_sparse_prefill_fp8_asm: only gfx1250 is supported, got ", arch_id);
 
     check_tensor(q_nope, "q_nope", AITER_DTYPE_fp8);

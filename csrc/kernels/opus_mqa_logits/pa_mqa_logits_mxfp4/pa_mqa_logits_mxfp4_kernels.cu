@@ -439,7 +439,7 @@ void pa_mqa_logits_mxfp4_fwd_sched(aiter_tensor_t& q,
             AITER_CHECK(false, "gfx950: block_k must be 256 (4-wave) or 64 (1-wave), got ",
                         block_k);
     }
-    else if(arch == "gfx1250")
+    else if((arch == "gfx1250" || arch == "gfx1250-strict"))
     {
         if(q_per_block == 4 && block_k == 64)
             PA_MQA_LOGITS_MXFP4_LAUNCH(mqa_logits_traits_qlen4_kv64);

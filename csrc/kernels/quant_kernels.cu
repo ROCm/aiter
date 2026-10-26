@@ -27,7 +27,7 @@ namespace aiter {
 // device properties, and this sits on the launch path of every quant call.
 static inline bool dyn_gq_tuned_arch()
 {
-    static const bool tuned = (get_gpu_arch() == "gfx1250");
+    static const bool tuned = ((get_gpu_arch() == "gfx1250" || get_gpu_arch() == "gfx1250-strict"));
     return tuned;
 }
 

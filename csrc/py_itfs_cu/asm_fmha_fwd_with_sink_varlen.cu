@@ -127,7 +127,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     // ---- arch + dtype validation ------------------------------------------
     const std::string arch_id = get_gpu_arch();
-    AITER_CHECK(arch_id == "gfx1250",
+    AITER_CHECK((arch_id == "gfx1250" || arch_id == "gfx1250-strict"),
                 "fmha_fwd_with_sink_varlen_asm: only supported on gfx1250, got ", arch_id);
 
     AITER_CHECK(q->dtype() == AITER_DTYPE_bf16 &&

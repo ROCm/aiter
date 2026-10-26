@@ -20,7 +20,7 @@ namespace aiter {
     static void check_mhc_res_preshuffle_arch(bool shuffled) {
         if (shuffled) {
             const auto arch = get_gpu_arch();
-            AITER_CHECK(arch == "gfx1250",
+            AITER_CHECK((arch == "gfx1250" || arch == "gfx1250-strict"),
                         "res_preshuffle=1 is only supported on gfx1250, got ", arch,
                         "; use res_preshuffle=0");
         }

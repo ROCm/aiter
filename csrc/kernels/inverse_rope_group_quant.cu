@@ -68,7 +68,7 @@ static inline bool is_cdna_arch()
 }
 
 // The tensor engine the payload staging below rides on is gfx1250-only.
-static inline bool has_tdm_arch() { return get_gpu_arch() == "gfx1250"; }
+static inline bool has_tdm_arch() { return (get_gpu_arch() == "gfx1250" || get_gpu_arch() == "gfx1250-strict"); }
 
 static constexpr MxDtype kHwFp8E4m3 =
 #if defined(__gfx942__)

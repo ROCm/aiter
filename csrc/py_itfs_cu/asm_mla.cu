@@ -565,7 +565,7 @@ MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
         return c;
     }
     const int gqa_ratio = num_heads / nhead_kv;
-    if(arch_id == "gfx1250")
+    if((arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
     {
         c = mla_asm_decode_remap_gfx1250(q_type,
                                          kv_type,
@@ -836,7 +836,7 @@ static void mla_decode_gfx1250_dispatch(
 {
     (void)lse;
     const std::string arch_id = get_gpu_arch();
-    AITER_CHECK(arch_id == "gfx1250", __func__, ": only supports gfx1250, got ", arch_id);
+    AITER_CHECK((arch_id == "gfx1250" || arch_id == "gfx1250-strict"), __func__, ": only supports gfx1250, got ", arch_id);
 
     AITER_CHECK(Q != nullptr && KV != nullptr && qo_indptr != nullptr && kv_indptr != nullptr &&
                     kv_page_indices != nullptr && kv_last_page_lens != nullptr &&
@@ -1297,7 +1297,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const HipDeviceGuard device_guard(Q->device_id);
 
     std::string arch_id = get_gpu_arch();
-    if(arch_id == "gfx1250")
+    if((arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
     {
         // The gfx1250 kernels have no global KV positions, so round-robin CP
         // would run unmasked; mla_asm_decode_config reports it as NoKernel.
@@ -1896,7 +1896,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     (split_data, split_lse, final_output, final_lse, q, kv_buffer, kv_page_indices, work_indptr, work_info_set, softmax_scale, q_scale, kv_scale, max_seqlen_q, causal, qo_indptr, kv_indptr, g_kv_indptr, cp_world_size, cp_rank, stream))
 {
     const std::string arch_id = get_gpu_arch();
-    AITER_CHECK(arch_id == "gfx1250", __func__, ": only supports gfx1250, got ", arch_id);
+    AITER_CHECK((arch_id == "gfx1250" || arch_id == "gfx1250-strict"), __func__, ": only supports gfx1250, got ", arch_id);
     const HipDeviceGuard device_guard(q->device_id);
 
     const int total_q   = q->size(0);
@@ -2048,7 +2048,7 @@ void launch_mla_qh128(MlaPs64Qh128Args& args, int device, int batch, hipStream_t
     static SynchronizedCache<int, AiterAsmKernel> kernels;
     auto& kernel = kernels.get_or_create(device, [&]() {
         const std::string arch_id = get_gpu_arch();
-        AITER_CHECK(arch_id == "gfx1250", "QH128 page64 MLA requires gfx1250");
+        AITER_CHECK((arch_id == "gfx1250" || arch_id == "gfx1250-strict"), "QH128 page64 MLA requires gfx1250");
         // The lse=0 row supports LSE through a nullable pointer.
         // This field describes the CO ABI, not the caller's choice.
         const auto name = get_heuristic_kernel_mla(

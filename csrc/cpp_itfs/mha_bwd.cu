@@ -292,7 +292,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     std::string arch_id = get_gpu_arch();
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
-       (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic && arch_id != "gfx1250") ||
+       (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic && (arch_id != "gfx1250" && arch_id != "gfx1250-strict")) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950") && (arch_id != "gfx1250")) ||
        (!is_gfx1250_asm_supported()))
     {
@@ -364,7 +364,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }();
 
     bool need_post_processing =
-        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1) || (arch_id == "gfx1250");
+        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1) || ((arch_id == "gfx1250" || arch_id == "gfx1250-strict"));
 
     int mt = asm_mask_type();
 
@@ -389,7 +389,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }
     // gfx1250 only has bottom-right causal kernels, so the same equivalence runs the other way.
     // Group mode is left out: there a batch's seqlen_q and seqlen_k can differ.
-    if(arch_id == "gfx1250" && mt == 1 && !a.is_group_mode && a.seqlen_q == a.seqlen_k)
+    if((arch_id == "gfx1250" || arch_id == "gfx1250-strict") && mt == 1 && !a.is_group_mode && a.seqlen_q == a.seqlen_k)
     {
         mt = 2;  // top-left → bottom-right (equivalent when sq == sk)
     }
@@ -416,7 +416,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     if(need_post_processing && (post_kernel == ""))
     {
         // gfx1250 dqdkdv only ever writes dq_acc, so dq is unusable without dq_convert.
-        if(arch_id == "gfx1250")
+        if((arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
         {
             return -1;
         }
@@ -509,7 +509,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto pre_kernel_launch = [&]() {
         arg_size = sizeof(odo_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : 256;
+        int bdx = ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
         int gdy = a.nhead_q;
         int gdz = a.batch;
@@ -538,7 +538,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     size_t dq_acc_plane        = 0; // bytes, also the stride between deterministic planes
     uint32_t nsplit            = 1;
 
-    if(need_post_processing && arch_id == "gfx1250")
+    if(need_post_processing && (arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
     {
         constexpr size_t kTileRows = 32;
         dq_acc_rows         = a.is_group_mode ? a.seqlen_q + kTileRows * a.batch
@@ -663,7 +663,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         dqdkdv_args.ptr_qseq_padded = a.seqstart_q_ptr;
     }
     dqdkdv_args.max_seqlen_dq = a.v3_atomic_fp32 ? a.max_seqlen_q : (a.max_seqlen_q + 15) / 16 * 16;
-    if(arch_id == "gfx1250")
+    if((arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
     {
         dqdkdv_args.max_seqlen_dq = dq_acc_rows;
         dqdkdv_args.nsplit        = a.is_deterministic ? nsplit : 0;
@@ -697,7 +697,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto dqdkdv_kernel_launch = [&]() {
         arg_size = sizeof(dqdkdv_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : (a.hdim_q == 256 ? 512 : 256);
+        int bdx = ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) ? 128 : (a.hdim_q == 256 ? 512 : 256);
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         if (a.hdim_q == 256) {
             int gdx_q = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
@@ -742,7 +742,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     post_args.ptr_qseq_padded = a.seqstart_q_ptr;
     post_args.ptr_qseq =
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
-    if(arch_id == "gfx1250")
+    if((arch_id == "gfx1250" || arch_id == "gfx1250-strict"))
     {
         post_args.max_seqlen_dq = a.max_seqlen_q;
         post_args.nsplit        = a.is_deterministic ? nsplit : 0;
@@ -751,7 +751,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto post_kernel_launch = [&]() {
         arg_size = sizeof(post_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : 256;
+        int bdx = ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
         int gdy = a.nhead_q;
         int gdz = a.batch;

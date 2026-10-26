@@ -6563,7 +6563,7 @@ void fused_qk_norm_rope_group_quant(
   //    also keys on H is the likely next refinement, but that needs more shapes
   //    than this change was measured against.
   const std::string gpu_arch = get_gpu_arch();
-  const bool has_tdm = gpu_arch == "gfx1250";
+  const bool has_tdm = (gpu_arch == "gfx1250" || gpu_arch == "gfx1250-strict");
   const int LARGE_PREFILL_THRESHOLD =
       has_tdm ? 16 : 48;  // med -> large (blocks/CU)
   // large -> xlarge at 64 blocks/CU, not 300.
