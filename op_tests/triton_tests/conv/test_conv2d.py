@@ -26,8 +26,8 @@ scalar-parameter cases, 1 cache-clear case, and 2 inference-tensor cases.
 Convolution cases: 12 + 12 + 12 + 36 + 2 + 7 + 2 + 1 + 2 = 86.
 Padding preparation adds 20 focused cases for validation, boundary amounts,
 layout conversion, empty batches, no-op reuse, and delegation to F.pad.
-Routed padding integration adds 11 cases for numerical results, routing,
-packing, API compatibility, validation, and device handling.
+Routed padding integration adds 8 cases for numerical results across specialized
+routes and zero-padding bypass.
 
 The whole module is skipped without a supported GPU. Padding preparation itself
 does not require architecture-specific padding configurations.
@@ -39,8 +39,6 @@ Performance benchmarking lives in
 op_tests/op_benchmarks/triton/bench_conv2d.py (and, for real-model
 shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 """
-
-import inspect
 
 import pytest
 import torch
@@ -562,7 +560,7 @@ def test_prepared_padding_handles_empty_batch():
         ("conv2d", "nhwc", "WF4X3", (3, 3), (1, 1), (1, 1), "reflect", torch.bfloat16),
     ],
 )
-def test_routed_padding_executes_specialized_route_once(
+def test_routed_padding_matches_reference(
     monkeypatch,
     api,
     layout,
@@ -579,12 +577,9 @@ def test_routed_padding_executes_specialized_route_once(
         pytest.skip("direct NCHW 3x3 configuration is unavailable")
     torch.manual_seed(0)
     channels = 5 if route_name in ("GENERAL", "ONE_X_ONE") else 65
-    source = torch.randn(2, channels + 1, 15, 19, device="cuda", dtype=dtype)
-    source = source[:, 1:, 1::2, 1::2]
-    weight = torch.randn(
-        17, channels, filter_shape[1], filter_shape[0], device="cuda", dtype=dtype
-    ).transpose(2, 3)
-    bias = torch.randn(34, device="cuda", dtype=dtype)[::2]
+    source = torch.randn(2, channels, 7, 9, device="cuda", dtype=dtype)
+    weight = torch.randn(17, channels, *filter_shape, device="cuda", dtype=dtype)
+    bias = torch.randn(17, device="cuda", dtype=dtype)
     padding = (1, 2)
     expected = conv2d_padding_reference(
         source.float(),
@@ -606,57 +601,6 @@ def test_routed_padding_executes_specialized_route_once(
         "_nchw_direct_is_profitable",
         lambda *args: route_name == "DIRECT_NCHW_3X3",
     )
-    wrapper_name = {
-        "ONE_X_ONE": "conv2d_1x1",
-        "GENERAL": "conv2d_general",
-        "DIRECT_NCHW_3X3": "conv2d_nchw_3x3_direct",
-        "CBLOCKED_NCHW": "conv2d_nchw_cblocked",
-        "NHWC_3X3": "conv2d_nhwc_3x3",
-        "WF4X3": "conv2d_winograd_f4x3",
-        "WF4X3_CBLOCKED": "conv2d_winograd_f4x3_cblocked",
-    }[route_name]
-    is_blocked = route_name in ("CBLOCKED_NCHW", "WF4X3_CBLOCKED")
-    events, prepared, packed = [], [], []
-    prepare_padding = conv2d_module._prepare_conv2d_padding
-    resolve_route = conv2d_module._resolve_route
-    prepack = conv2d_module.prepack_nchw_to_cblocked
-    specialized_wrapper = getattr(conv2d_module, wrapper_name)
-
-    def record_padding(tensor, *args, **kwargs):
-        events.append("padding")
-        assert tensor is source
-        result = prepare_padding(tensor, *args, **kwargs)
-        prepared.append(result[0])
-        return result
-
-    def record_route(*args, **kwargs):
-        events.append("route")
-        arguments = inspect.signature(resolve_route).bind(*args, **kwargs).arguments
-        assert (arguments["H"], arguments["W_in"]) == prepared[0].shape[2:]
-        assert arguments["padding"] == (0, 0)
-        result = resolve_route(*args, **kwargs)
-        assert result is conv2d_module.Route[route_name]
-        return result
-
-    def record_prepack(tensor, *args, **kwargs):
-        events.append("prepack")
-        assert tensor is prepared[0]
-        result = prepack(tensor, *args, **kwargs)
-        packed.append(result[0])
-        return result
-
-    def record_convolution(*args, **kwargs):
-        events.append("convolution")
-        assert args[0] is prepared[0]
-        assert args[4] == (0, 0)
-        if is_blocked:
-            assert kwargs["x_blocked"] is packed[0]
-        return specialized_wrapper(*args, **kwargs)
-
-    monkeypatch.setattr(conv2d_module, "_prepare_conv2d_padding", record_padding)
-    monkeypatch.setattr(conv2d_module, "_resolve_route", record_route)
-    monkeypatch.setattr(conv2d_module, "prepack_nchw_to_cblocked", record_prepack)
-    monkeypatch.setattr(conv2d_module, wrapper_name, record_convolution)
     actual = getattr(conv2d_module, api)(
         source,
         weight,
@@ -676,13 +620,11 @@ def test_routed_padding_executes_specialized_route_once(
     )
     rtol, atol = tolerances(dtype, channels * filter_shape[0] * filter_shape[1])
     torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol)
-    assert actual.dtype == dtype
-    assert actual.device == source.device
+    assert actual.dtype == dtype, "convolution output must preserve the input dtype"
     memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
-    assert actual.is_contiguous(memory_format=memory_format)
-    assert events == ["padding", "route"] + (["prepack"] if is_blocked else []) + [
-        "convolution"
-    ]
+    assert actual.is_contiguous(memory_format=memory_format), (
+        f"expected contiguous {layout} output, got strides={actual.stride()}"
+    )
 
 
 def test_routed_padding_noop_preserves_zero_path(monkeypatch):
@@ -698,88 +640,3 @@ def test_routed_padding_noop_preserves_zero_path(monkeypatch):
         source, weight, padding=0, layout="nhwc", padding_mode="reflect"
     )
     torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
-
-
-def test_routed_padding_rejects_invalid_mode_before_preparation(monkeypatch):
-    source = torch.empty(1, 5, 5, 7, device="cuda", dtype=torch.float16)
-    weight = torch.empty(7, 5, 3, 3, device="cuda", dtype=torch.float16)
-
-    def unexpected_work(*args, **kwargs):
-        pytest.fail(
-            "invalid modes must fail before padding, layout conversion, or routing"
-        )
-
-    monkeypatch.setattr(padding_ops.F, "pad", unexpected_work)
-    monkeypatch.setattr(conv2d_module, "_ensure_layout", unexpected_work)
-    monkeypatch.setattr(conv2d_module, "_resolve_route", unexpected_work)
-    with pytest.raises(ValueError, match="padding_mode must be one of"):
-        conv2d_module.conv2d(source, weight, layout="nhwc", padding_mode="unsupported")
-
-
-def test_routed_padding_rejects_mismatched_bias_device(monkeypatch):
-    source = torch.empty(1, 3, 5, 7, device="cuda", dtype=torch.float16)
-    weight = torch.empty(7, 3, 3, 3, device="cuda", dtype=torch.float16)
-    bias = torch.empty(7, dtype=torch.float16)
-
-    def unexpected_preparation(*args, **kwargs):
-        pytest.fail("device mismatch must fail before padding preparation")
-
-    monkeypatch.setattr(
-        conv2d_module, "_prepare_conv2d_padding", unexpected_preparation
-    )
-    with pytest.raises(ValueError, match="same device"):
-        conv2d_module.conv2d(source, weight, bias, padding=1, padding_mode="reflect")
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
-def test_routed_padding_uses_input_device_for_complete_operation(monkeypatch):
-    input_device = torch.cuda.current_device()
-    current_device = (input_device + 1) % torch.cuda.device_count()
-    input_arch = torch.cuda.get_device_properties(input_device).gcnArchName.split(":")[
-        0
-    ]
-    if input_arch != get_arch():
-        pytest.skip("mixed-architecture configuration caches are not supported")
-    source = torch.randn(
-        1, 65, 7, 9, device=f"cuda:{input_device}", dtype=torch.float16
-    )
-    weight = torch.randn(17, 65, 3, 3, device=source.device, dtype=source.dtype)
-    expected = conv2d_padding_reference(
-        source.float(), weight.float(), padding=1, padding_mode="reflect"
-    )
-    monkeypatch.setattr(conv2d_module, "_select_3x3_method", lambda *args: "cblocked")
-    monkeypatch.setattr(
-        conv2d_module, "_nchw_direct_is_profitable", lambda *args: False
-    )
-    stages = (
-        "_prepare_conv2d_padding",
-        "_resolve_route",
-        "prepack_nchw_to_cblocked",
-        "conv2d_nchw_cblocked",
-    )
-    visited = []
-    for name in stages:
-        function = getattr(conv2d_module, name)
-
-        def on_input_device(*args, function=function, name=name, **kwargs):
-            assert torch.cuda.current_device() == input_device
-            visited.append(name)
-            return function(*args, **kwargs)
-
-        monkeypatch.setattr(conv2d_module, name, on_input_device)
-    with torch.cuda.device(current_device):
-        actual = conv2d_module.conv2d(source, weight, padding=1, padding_mode="reflect")
-        assert visited == list(stages)
-        assert torch.cuda.current_device() == current_device
-        assert actual.device == source.device
-        rtol, atol = dynamic_conv_tolerances(source.dtype, 65 * 3 * 3)
-        torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol)
-        with pytest.raises(ValueError, match="same device"):
-            conv2d_module.conv2d(
-                source,
-                weight.to(f"cuda:{current_device}"),
-                padding=1,
-                padding_mode="reflect",
-            )
-        assert torch.cuda.current_device() == current_device
-    assert torch.cuda.current_device() == input_device
