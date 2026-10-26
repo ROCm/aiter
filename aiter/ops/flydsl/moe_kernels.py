@@ -3501,7 +3501,7 @@ def flydsl_moe_fused_quant_preshuffle(
                     "A-preshuffle tile quant requires rows remapped before launch"
                 )
             quant_scatter_fused = os.environ.get(
-                "AITER_FLYDSL_MOE_APRESHUFFLE_QUANT_SCATTER_FUSED", "1"
+                "AITER_FLYDSL_MOE_APRESHUFFLE_QUANT_SCATTER_FUSED", "0"
             ) in ("1", "true", "True")
 
             from aiter.jit.utils.chip_info import get_cu_num
