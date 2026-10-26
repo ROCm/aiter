@@ -1,0 +1,10 @@
+{
+    "dispatch": {
+        "bf16": {
+            "v1_min_programs": 256
+        },
+        "fp16": {
+            "v1_min_programs": 256
+        }
+    }
+}

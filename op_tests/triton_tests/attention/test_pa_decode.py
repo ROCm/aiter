@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import glob
 import itertools
+import json
 import random
 
 import pytest
@@ -548,6 +550,58 @@ def test_missing_config_gives_none(tmp_path, monkeypatch):
     try:
         assert pa_kernels._get_dispatch_config("fp16") is None
         assert pa_kernels._get_launch_config("v1_w_dot", _PAGES[0]) is None
+    finally:
+        load_config_json.cache_clear()
+
+
+def _cu_override_files(arch):
+    cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton", arch=arch)
+    return sorted(glob.glob(f"{cfg_dir}/PA-DECODE-CUS=*.json"))
+
+
+_CU_OVERRIDES = [
+    pytest.param(arch, path, id=f"{arch}-{path.rsplit('/', 1)[-1]}")
+    for arch in _ARCHS
+    for path in _cu_override_files(arch)
+]
+
+
+@pytest.mark.parametrize("arch,path", _CU_OVERRIDES)
+def test_cu_override_only_replaces_default_keys(arch, path):
+    assert int(path.rsplit("=", 1)[-1][: -len(".json")]) > 0
+    default, override = _config(arch), load_config_json(path)
+    assert set(override) <= {"dispatch", "launch"}
+    for dtype, rule in override.get("dispatch", {}).items():
+        assert set(rule) <= set(default["dispatch"][dtype])
+    for kernel, table in override.get("launch", {}).items():
+        assert set(table) <= set(default["launch"][kernel])
+        for entry in table.values():
+            assert entry.get("num_stages", 1) <= _MAX_NUM_STAGES
+
+
+def test_cu_override_applies_only_on_matching_cu_count(tmp_path, monkeypatch):
+    default = {
+        "dispatch": {"fp16": {"v1_min_programs": 2048, "split_max_programs": 1024}},
+        "launch": {"v1_w_dot": {"any": {"num_stages": 1}}},
+    }
+    override = {
+        "dispatch": {"fp16": {"v1_min_programs": 256}},
+        "launch": {"v1_w_dot": {"any": {"num_stages": 2}}},
+    }
+    (tmp_path / "DEFAULT.json").write_text(json.dumps(default))
+    (tmp_path / "PA-DECODE-CUS=96.json").write_text(json.dumps(override))
+    monkeypatch.setattr(pa_kernels, "resolve_config_dir", lambda *a, **k: str(tmp_path))
+    load_config_json.cache_clear()
+    try:
+        monkeypatch.setattr(pa_kernels, "get_num_sms", lambda: 96)
+        assert pa_kernels._get_dispatch_config("fp16") == {
+            "v1_min_programs": 256,
+            "split_max_programs": 1024,
+        }
+        assert pa_kernels._get_launch_config("v1_w_dot", _PAGES[0]) == {"num_stages": 2}
+        monkeypatch.setattr(pa_kernels, "get_num_sms", lambda: 256)
+        assert pa_kernels._get_dispatch_config("fp16") == default["dispatch"]["fp16"]
+        assert pa_kernels._get_launch_config("v1_w_dot", _PAGES[0]) == {"num_stages": 1}
     finally:
         load_config_json.cache_clear()
 
