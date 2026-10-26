@@ -885,7 +885,6 @@ def _store_cshuffle(
     param: GemmA16W16Gfx942Param,
     frag_C,
     thr_copy_C_lds,
-    sC_write,
     smem_c,
     out,
     out_buf,
@@ -927,11 +926,19 @@ def _store_cshuffle(
     # [c * chunk_reps, (c + 1) * chunk_reps).
     chunk_reps = block_m // (param.mma_m * param.m_waves) // c_chunks
     chunk_rows = block_m // c_chunks
+    c_lds_layout = fx.make_layout((chunk_rows, block_n), (block_n, 1))
+    out_layout = fx.make_layout((m, n), (n, 1))
     frag_src = thr_copy_C_lds.retile(frag_C_out)
-    sC_dst = thr_copy_C_lds.partition_D(sC_write)
+    sC_dst = thr_copy_C_lds.partition_D(fx.make_view(smem_c, c_lds_layout))
     cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
     cshuffle_vectors = chunk_rows * block_n // cshuffle_r2g_vec_size
     cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+
+    # Called inside each store branch: one offset hoisted above both branches
+    # schedules the epilogue worse (2-3% on small-M split-K shapes).
+    def c_lds_ptr(row, col):
+        return smem_c + fx.get_scalar(fx.crd2idx((row, col), c_lds_layout))
+
     for chunk in range_constexpr(c_chunks):
         gpu.barrier()
         if const_expr(gated):
@@ -966,11 +973,13 @@ def _store_cshuffle(
                 local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
                 global_row = block_m_offset + chunk * chunk_rows + local_row
                 global_col = block_n_offset + local_col
-                global_offset = global_row * n + global_col
+                global_offset = fx.get_scalar(
+                    fx.crd2idx((global_row, global_col), out_layout)
+                )
                 in_rows = (global_row < m) and is_last
                 if in_rows and (global_col + cshuffle_r2g_vec_size <= n):
                     c_vec = fx.ptr_load(
-                        smem_c + local_row * block_n + local_col,
+                        c_lds_ptr(local_row, local_col),
                         result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, c_dtype),
                     )
                     write_cshuffle_vec_to_global(
@@ -991,7 +1000,7 @@ def _store_cshuffle(
                     for e in range_constexpr(cshuffle_r2g_vec_size):
                         if global_col + e < n:
                             c_elem = fx.ptr_load(
-                                smem_c + local_row * block_n + local_col + e,
+                                c_lds_ptr(local_row, local_col) + e,
                                 result_type=fx.Vector.make_type(1, c_dtype),
                             )
                             write_cshuffle_vec_to_global(
@@ -1081,7 +1090,7 @@ def gemm_a16w16_gfx942_kernel(
     ks_idx = fx.block_idx.y
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
-    ks_end = (ks_end < k).select(ks_end, k)
+    ks_end = fx.min(ks_end, k)
     k_tiles = (ks_end - ks_begin) // block_k
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
@@ -1103,7 +1112,6 @@ def gemm_a16w16_gfx942_kernel(
         flag: fx.Array[fx.Int32, 4, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
-    # LDS stage s of the A/B tiles starts at s * tile size from these bases.
     smem_a = storage.ab.a.peek().ptr
     smem_b = storage.ab.b.peek().ptr
     smem_c = storage.c.peek().ptr
@@ -1139,26 +1147,33 @@ def gemm_a16w16_gfx942_kernel(
     )
     s2r_copy_atom = ctx.uni_copy_atom
 
-    # The LDS writers address the whole (rows, block_k) tile; each K wave reads
-    # its (rows, block_k_w) slice of the k_waves mode.
+    # The LDS writers address a stage's whole (rows, block_k) tile; each K wave
+    # reads its (rows, block_k_w) slice of the k_waves mode. A stage is a base
+    # pointer, not a layout mode: the swizzle would cover a runtime stage index
+    # too, and the compiler then emits an XOR per LDS access.
     a_lds_layout = make_k_sliced_lds_layout(block_m, block_k, k_waves)
     b_lds_layout = make_k_sliced_lds_layout(block_n, block_k, k_waves)
     k_slice = k_wave_idx if const_expr(k_waves > 1) else 0
 
-    def k_wave_view(base, lds_layout):
-        return fx.make_view(base, lds_layout)[None, (None, k_slice)]
+    def a_stage_base(stage):
+        return smem_a + stage * block_m * block_k
 
-    c_lds_layout = fx.make_layout((block_m // c_chunks, block_n), (block_n, 1))
+    def b_stage_base(stage):
+        return smem_b + stage * block_n * block_k
+
+    def k_wave_views(stage):
+        return (
+            fx.make_view(a_stage_base(stage), a_lds_layout)[None, (None, k_slice)],
+            fx.make_view(b_stage_base(stage), b_lds_layout)[None, (None, k_slice)],
+        )
 
     thr_mma = tiled_mma.thr_slice(tid_mn)
     thr_copy_A = fx.make_tiled_copy_A(ctx.buffer_copy_atom, tiled_mma).get_slice(tid_mn)
     thr_copy_B = fx.make_tiled_copy_B(ctx.buffer_copy_atom, tiled_mma).get_slice(tid_mn)
 
     gC = fx.flat_divide(out_buf, (block_m, block_n))[None, None, bid_m, bid_n]
-    sC_write = fx.make_view(smem_c, c_lds_layout)
 
-    sA0 = k_wave_view(smem_a, a_lds_layout)
-    sB0 = k_wave_view(smem_b, b_lds_layout)
+    sA0, sB0 = k_wave_views(0)
     frag_A = thr_mma.make_fragment_A(sA0)
     frag_B = thr_mma.make_fragment_B(sB0)
     frag_C = thr_mma.make_fragment_C(gC)
@@ -1242,10 +1257,10 @@ def gemm_a16w16_gfx942_kernel(
 
         def commit_ab_to_lds(lds_stage):
             sA_w = a_r2s.partition_D(
-                fx.make_view(smem_a + lds_stage * block_m * block_k, a_lds_layout)
+                fx.make_view(a_stage_base(lds_stage), a_lds_layout)
             )
             sB_w = b_r2s.partition_D(
-                fx.make_view(smem_b + lds_stage * block_n * block_k, b_lds_layout)
+                fx.make_view(b_stage_base(lds_stage), b_lds_layout)
             )
             fx.copy(uni_atom, a_cp_frag_ret, sA_w)
             fx.copy(uni_atom, b_cp_frag_ret, sB_w)
@@ -1265,7 +1280,7 @@ def gemm_a16w16_gfx942_kernel(
     def async_load_a_to_lds(k_tile, stage):
         async_load_to_lds(
             tile=AsyncLoadTile(
-                lds_base=smem_a + stage * block_m * block_k,
+                lds_base=a_stage_base(stage),
                 src_base=fx.get_iter(a_buf),
                 lds_layout=a_lds_layout,
                 outer_tile_size=block_m,
@@ -1282,7 +1297,7 @@ def gemm_a16w16_gfx942_kernel(
     def async_load_b_to_lds(k_tile, stage):
         async_load_to_lds(
             tile=AsyncLoadTile(
-                lds_base=smem_b + stage * block_n * block_k,
+                lds_base=b_stage_base(stage),
                 src_base=fx.get_iter(b_buf),
                 lds_layout=b_lds_layout,
                 outer_tile_size=block_n,
@@ -1311,12 +1326,9 @@ def gemm_a16w16_gfx942_kernel(
 
         Only 128-bit K chunks ``[c_begin, c_end)`` are read.
         """
-        thr_sA = thr_copy_A.partition_S(
-            k_wave_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
-        )
-        thr_sB = thr_copy_B.partition_S(
-            k_wave_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
-        )
+        sA_k, sB_k = k_wave_views(read_stage)
+        thr_sA = thr_copy_A.partition_S(sA_k)
+        thr_sB = thr_copy_B.partition_S(sB_k)
         for c in range_constexpr(c_begin, c_end):
             fx.copy(s2r_copy_atom, thr_sA[None, None, c], a_ret[None, None, c])
             fx.copy(s2r_copy_atom, thr_sB[None, None, c], b_ret[None, None, c])
@@ -1334,12 +1346,9 @@ def gemm_a16w16_gfx942_kernel(
 
     def compute_stage(read_stage):
         """Compute one LDS stage, issuing chunk c+1's ds_read before chunk c's MFMAs."""
-        thr_sA = thr_copy_A.partition_S(
-            k_wave_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
-        )
-        thr_sB = thr_copy_B.partition_S(
-            k_wave_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
-        )
+        sA_k, sB_k = k_wave_views(read_stage)
+        thr_sA = thr_copy_A.partition_S(sA_k)
+        thr_sB = thr_copy_B.partition_S(sB_k)
 
         def rd(c):
             fx.copy(s2r_copy_atom, thr_sA[None, None, c], frag_A_ret[None, None, c])
@@ -1444,7 +1453,6 @@ def gemm_a16w16_gfx942_kernel(
             param,
             frag_C,
             thr_copy_C_lds,
-            sC_write,
             smem_c,
             out,
             out_buf,
