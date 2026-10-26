@@ -5,6 +5,7 @@
 import glob
 import json
 import os
+import sys
 
 FINAL_STATUSES = ("ok", "error", "crashed", "hung")
 TOP_BUCKET_M = 8192  # --all-buckets sweeps the family's M_LEQ buckets up to here
@@ -24,7 +25,8 @@ def config_key(config):
 
 
 def shape_tag(shape):
-    return "-".join(f"{d}={shape[d]}" for d in ("B", "M", "N", "K") if d in shape)
+    gemm = [d for d in ("B", "M", "N", "K") if d in shape]
+    return "-".join(f"{d}={shape[d]}" for d in gemm + sorted(set(shape) - set(gemm)))
 
 
 def results_path(runs_dir, arch, backend, kernel, shape):
@@ -44,23 +46,25 @@ def final_results_path(out):
     return out[: -len(".jsonl")] + ".final.jsonl"
 
 
-def results_files(runs_dir, arch, backend, kernel, shape_nk):
+def results_files(runs_dir, arch, backend, kernel, shape_nk, bucket_dim="M"):
     """All per-M result files of one (kernel, backend, N, K[, B])."""
-    pattern = results_path(runs_dir, arch, backend, kernel, dict(shape_nk, M="*"))
+    pattern = results_path(
+        runs_dir, arch, backend, kernel, dict(shape_nk, **{bucket_dim: "*"})
+    )
     return sorted(glob.glob(pattern))
 
 
-def specialized_filename(config_name, shape):
+def specialized_filename(config_name, shape, file_dims=("B", "N", "K")):
     """<CONFIG>-[B=..-]N=..-K=..json, the file get_gemm_config() looks up for this shape."""
-    dims = "-".join(f"{d}={shape[d]}" for d in ("B", "N", "K") if d in shape)
+    dims = "-".join(f"{d}={shape[d]}" for d in file_dims if d in shape)
     return f"{config_name}-{dims}.json"
 
 
-def bucket_for(M, bounds):
+def bucket_for(M, bounds, bucket_dim="M"):
     """M_LEQ_<smallest bound >= M>, the bucket get_gemm_config() picks; None above the largest bound."""
     for bound in bounds:
         if M <= bound:
-            return f"M_LEQ_{bound}"
+            return f"{bucket_dim}_LEQ_{bound}"
     return None
 
 
@@ -105,30 +109,42 @@ def read_records(path):
     return records
 
 
-def add_shape_args(parser, with_m=True, multi_m=False):
-    parser.add_argument("--B", type=int, help="batch, batched kernels only")
-    if with_m:
-        parser.add_argument(
-            "--M", type=int, required=True, nargs="+" if multi_m else None
-        )
-    parser.add_argument("--N", type=int, required=True)
-    parser.add_argument(
-        "--K",
-        type=int,
-        required=True,
-        help="logical K, as the input generators take it",
+def add_shape_args(parser, specs, with_m=True, multi_m=False):
+    """--<dim> for every kernel's dims; M stands for the family's bucket dim (SK for MHA)."""
+    help_ = {
+        "B": "batch, batched kernels only",
+        "K": "logical K, as the input generators take it",
+    }
+    bucket_dims = {spec.bucket_dim for spec in specs}
+    for dim in dict.fromkeys(d for spec in specs for d in spec.dims):
+        if dim in bucket_dims and not with_m:
+            continue
+        nargs = "+" if dim in bucket_dims and multi_m else None
+        parser.add_argument(f"--{dim}", type=int, nargs=nargs, help=help_.get(dim))
+
+
+def shape_from_args(args, spec, M=None, with_m=True):
+    stray = sorted(
+        d
+        for d, v in vars(args).items()
+        if d.isupper() and v is not None and d not in spec.dims
     )
-
-
-def shape_from_args(args, dims, M=None):
-    if ("B" in dims) != (args.B is not None):
-        raise SystemExit(
-            "--B is required for batched kernels and not accepted otherwise"
+    if stray:
+        _usage_error(
+            f"{spec.name} takes --{' --'.join(spec.dims)}, not --{' --'.join(stray)}"
         )
-    shape = {"B": args.B} if "B" in dims else {}
-    if M is not None:
-        shape["M"] = M
-    elif getattr(args, "M", None) is not None:
-        shape["M"] = args.M
-    shape.update(N=args.N, K=args.K)
+    dims = [d for d in spec.dims if with_m or d != spec.bucket_dim]
+    shape = {
+        d: M if d == spec.bucket_dim and M is not None else getattr(args, d, None)
+        for d in dims
+    }
+    missing = [d for d, v in shape.items() if v is None]
+    if missing:
+        _usage_error(f"{spec.name} needs --{missing[0]}")
     return shape
+
+
+def _usage_error(message):
+    """Exit as argparse does on a usage error (status 2), which scripts check."""
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(2)
