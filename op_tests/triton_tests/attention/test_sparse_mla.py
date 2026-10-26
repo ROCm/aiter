@@ -451,29 +451,26 @@ def test_fp8_dots_keep_the_softmax_tail():
         pytest.skip(f"no fp8 dots on {arch}")
     C, H, topk, pool = 4, 16, 2048, 1 << 13
     sm = KV_LORA**-0.5
-    g = torch.Generator().manual_seed(0)
+    g = torch.Generator(device="cuda").manual_seed(0)
     # Head h reads axis h alone, where the dominant key is 1 (score 9) and the
     # tail keys are 0 (score 0). Elsewhere the tail keys share one direction.
-    q = torch.zeros(C, H, KV_LORA)
+    q = torch.zeros(C, H, KV_LORA, dtype=torch.bfloat16, device="cuda")
     q[:, range(H), range(H)] = 9.0 / sm
-    u = torch.randn(KV_LORA, generator=g)
-    kv = torch.nn.functional.normalize(
-        u + 0.3 * torch.randn(pool, KV_LORA, generator=g), dim=-1
-    )
+    u = torch.randn(KV_LORA, generator=g, dtype=torch.float32, device="cuda")
+    noise = torch.randn(pool, KV_LORA, generator=g, dtype=torch.float32, device="cuda")
+    kv = torch.nn.functional.normalize(u + 0.3 * noise, dim=-1)
     kv = kv * KV_LORA**0.5
     kv[:, :H] = 0
     kv[-1] = 0
     kv[-1, :H] = 1
-    idx = torch.stack(
-        [
-            torch.cat([torch.tensor([pool - 1]), torch.randperm(pool - 1, generator=g)])
-            for _ in range(C)
-        ]
-    )[:, :topk]
-    idx = idx.flatten().to(torch.int32).cuda()
+    idx = torch.full((C, topk), pool - 1, dtype=torch.int32, device="cuda")
+    for c in range(C):
+        idx[c, 1:] = torch.randperm(
+            pool - 1, generator=g, dtype=torch.int32, device="cuda"
+        )[: topk - 1]
+    idx = idx.flatten()
     ptr = torch.arange(0, (C + 1) * topk, topk, dtype=torch.int32, device="cuda")
-    q = q.to(torch.bfloat16).cuda()
-    cache, ks = quantize_flat_fp8(kv.cuda())
+    cache, ks = quantize_flat_fp8(kv)
     ref = reference(q, dequant_flat_fp8(cache, ks).to(torch.bfloat16), idx, ptr, sm)
     out, _ = sparse_mla_fwd(
         q,
