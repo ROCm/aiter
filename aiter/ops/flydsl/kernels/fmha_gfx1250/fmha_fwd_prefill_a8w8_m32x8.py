@@ -34,6 +34,7 @@ Target: gfx1250, wave32, 8 waves per threadgroup (256 threads).
 """
 
 import functools
+import math
 from enum import IntEnum
 
 import flydsl.compiler as flyc
@@ -180,6 +181,10 @@ _B8_DTYPES = (fx.Float8E4M3FN, fx.Float8E5M2)
 # exponent range (terms under e4m3's floor are negligible against a sum >= 1). The O
 # accumulator and store stay 16-bit.
 P_DTYPE = fx.Float8E4M3FN
+_TORCH_P_DTYPE = {
+    fx.Float8E4M3FN: torch.float8_e4m3fn,
+    fx.Float8E5M2: torch.float8_e5m2,
+}[P_DTYPE]
 O_DTYPE = fx.BFloat16
 TORCH_O_DTYPE = torch.bfloat16
 # Q/K/V inputs this kernel serves; 16-bit belongs to the a16w16 sibling.
@@ -225,7 +230,11 @@ N_KV_PP = 3
 # not move, so keep m STALE while the row max stays within RESCALE_THRESHOLD natural
 # logits of it and skip the full-width multiply. False (or threshold < 0) always rescales.
 ENABLE_DEFER_RESCALE = True
-RESCALE_THRESHOLD = 8.0
+# P = exp(S - m_stale) reaches exp(RESCALE_THRESHOLD), so the threshold is capped by
+# P_DTYPE's finite max: e4m3 tops out at 448 (exp 6.10), e5m2 at 57344 (exp 10.96).
+# Overflowing e4m3 converts to NaN while the denominator keeps the exact f32 sum, so
+# the cap is derived from P_DTYPE rather than written down -- retyping P re-derives it.
+RESCALE_THRESHOLD = min(8.0, math.log(torch.finfo(_TORCH_P_DTYPE).max) - 0.1)
 
 # Running-max seed: finite big-negative, not -inf, so a fully-masked row keeps m finite
 # and softmax's (m_prev - m_new) / fma(s, .., -m) never do -inf arithmetic (NaN).
