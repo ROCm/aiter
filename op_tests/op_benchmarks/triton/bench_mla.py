@@ -3,7 +3,6 @@
 # import hip
 # hip.hip.hipInit(0)
 
-import argparse
 import random
 
 import torch
@@ -12,6 +11,10 @@ import triton
 from aiter.ops.triton.attention.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -31,7 +34,8 @@ def benchmark(args):
     num_query_heads = args.num_query_heads
     num_kv_heads = args.num_kv_heads
     varlen = args.varlen
-    shuffled_kv_cache = args.shuffled_kv_cache
+    # Prefill only supports the unshuffled KV layout.
+    shuffled_kv_cache = args.shuffled_kv_cache if decode_qlen > 0 else False
     q_dtype = e4m3_dtype if args.q_dtype == "fp8" else torch.bfloat16
     kv_dtype = e4m3_dtype if args.kv_dtype == "fp8" else torch.bfloat16
     out_dtype = e4m3_dtype if args.out_dtype == "fp8" else torch.bfloat16
@@ -184,7 +188,9 @@ def benchmark(args):
             out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
 
         output = torch.empty(
-            (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
+            (total_num_query_tokens, num_query_heads, kv_lora_rank),
+            dtype=out_dtype,
+            device=args.device,
         )
 
         maybe_shuffled_kv_buffer = (
@@ -216,7 +222,7 @@ def benchmark(args):
             out = mla_prefill_fwd(
                 query,
                 kv_buffer,
-                out,
+                output,
                 cu_seqlens_q=cu_seqlens_q,
                 seqused_k=seq_lens_kv,
                 max_seqlen_kv=max_seqlen_kv,
@@ -256,7 +262,7 @@ def benchmark(args):
 
         def fn():
             if decode_qlen > 0:
-                out = mla_decode_fwd(
+                mla_decode_fwd(
                     query,
                     maybe_shuffled_kv_buffer,
                     output,
@@ -275,10 +281,10 @@ def benchmark(args):
                     skip_reduce=skip_reduce,
                 )
             else:
-                out = mla_prefill_fwd(
+                mla_prefill_fwd(
                     query,
                     kv_buffer,
-                    out,
+                    output,
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_k=seq_lens_kv,
                     max_seqlen_kv=max_seqlen_kv,
@@ -304,10 +310,7 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark MLA Decode/Prefill",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="MLA Decode/Prefill")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument(
         "--decode_qlen", type=int, default=1
@@ -323,17 +326,11 @@ def parse_args():
     parser.add_argument("--q_dtype", type=str, default="bf16")
     parser.add_argument("--kv_dtype", type=str, default="bf16")
     parser.add_argument("--out_dtype", type=str, default="bf16")
-    parser.add_argument("--backend", type=str, default="triton")
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="bandwidth"
+    )
     parser.add_argument("--skip_reduce", type=bool, default=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="bandwidth",
-        choices=["time", "bandwidth"],
-        default="bandwidth",
-        help="Metrics for the kernel benchmark.",
-    )
     parser.add_argument(
         "-o",
         action="store_true",
@@ -346,7 +343,6 @@ def parse_args():
 
 def run_bench(args):
     torch.manual_seed(0)
-    torch.set_default_device(args.device)
     benchmark(args)
 
 
