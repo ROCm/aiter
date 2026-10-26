@@ -43,8 +43,12 @@
 
 namespace {
 
+// global-address-space pointer (explicit, so pointers that went through an
+// asm pin still produce global_* instead of flat_* accesses)
+template <typename T> using gptr = T __attribute__((address_space(1)))*;
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
+typedef float f32x2 __attribute__((ext_vector_type(2)));
 
 constexpr int HEAD_DIM = 128;
 constexpr float FP8_MAX = 448.0f;
@@ -66,6 +70,23 @@ __device__ __forceinline__ float round_bf16(float x) {
   u += 0x7FFFu + ((u >> 16) & 1u);
   return __uint_as_float(u & 0xFFFF0000u);
 }
+// The same for a pair: one v_cvt_pk_bf16_f32 (RNE on gfx950, denormals
+// preserved) + 2 unpack ops instead of 2 x 4 integer ops. Bit-identical to
+// round_bf16 for every finite input (checked byte for byte against vLLM).
+#ifndef KPOOL_NO_CVT_BF16
+typedef __bf16 bf16x2_t __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ void round_bf16x2(float& a, float& b) {
+  const f32x2 v = {a, b};
+  const uint32_t w = __builtin_bit_cast(uint32_t, __builtin_convertvector(v, bf16x2_t));
+  a = __uint_as_float(w << 16);
+  b = __uint_as_float(w & 0xFFFF0000u);
+}
+#else
+__device__ __forceinline__ void round_bf16x2(float& a, float& b) {
+  a = round_bf16(a);
+  b = round_bf16(b);
+}
+#endif
 __device__ __forceinline__ float fast_exp2(float x) { return __builtin_amdgcn_exp2f(x); }
 __device__ __forceinline__ float fast_log2(float x) { return __builtin_amdgcn_logf(x); }
 
@@ -82,7 +103,7 @@ __device__ __forceinline__ float fast_log2(float x) { return __builtin_amdgcn_lo
 #define KPOOL_LDS_XCHG
 #endif
 template <int MASK>
-__device__ __forceinline__ float xor_lane(float v) {
+__device__ __forceinline__ float xor_lane(float v, int lane) {
   int iv = __float_as_int(v);
   int r;
   if constexpr (MASK == 1) {
@@ -93,15 +114,15 @@ __device__ __forceinline__ float xor_lane(float v) {
   } else if constexpr (MASK == 4) {
     const int up = __builtin_amdgcn_update_dpp(iv, iv, 0x104, 0xF, 0xF, false);  // row_shl:4
     const int dn = __builtin_amdgcn_update_dpp(iv, iv, 0x114, 0xF, 0xF, false);  // row_shr:4
-    r = (__lane_id() & 4) ? dn : up;
+    r = (lane & 4) ? dn : up;
   } else if constexpr (MASK == 8) {
     r = __builtin_amdgcn_update_dpp(iv, iv, 0x128, 0xF, 0xF, false);  // row_ror:8
   } else if constexpr (MASK == 16) {
     auto p = __builtin_amdgcn_permlane16_swap((unsigned)iv, (unsigned)iv, false, false);
-    r = (__lane_id() & 16) ? (int)p[0] : (int)p[1];
+    r = (lane & 16) ? (int)p[0] : (int)p[1];
   } else if constexpr (MASK == 32) {
     auto p = __builtin_amdgcn_permlane32_swap((unsigned)iv, (unsigned)iv, false, false);
-    r = (__lane_id() & 32) ? (int)p[0] : (int)p[1];
+    r = (lane & 32) ? (int)p[0] : (int)p[1];
 #else
   } else if constexpr (MASK < 32) {
     r = __builtin_amdgcn_ds_swizzle(iv, (MASK << 10) | 0x1F);  // bitmode xor MASK
@@ -112,6 +133,28 @@ __device__ __forceinline__ float xor_lane(float v) {
   return __int_as_float(r);
 }
 
+// v_permlane{16,32}_swap with both operands = v: returns {lo, hi} where, for
+// MASK 16, lo = v of the lower half of each 32-lane pair replicated to both
+// halves and hi = v of the upper half replicated (MASK 32: halves of the wave).
+// So in every lane {lo, hi} = {own, partner} below the mask bit and
+// {partner, own} above it: a stage can use both without keeping its own v.
+#if !defined(KPOOL_LDS_XCHG)
+template <int MASK>
+__device__ __forceinline__ void swap_pair(float v, float& lo, float& hi) {
+  static_assert(MASK == 16 || MASK == 32, "permlane swap stages");
+  const unsigned iv = (unsigned)__float_as_int(v);
+  if constexpr (MASK == 16) {
+    auto p = __builtin_amdgcn_permlane16_swap(iv, iv, false, false);
+    lo = __int_as_float((int)p[0]);
+    hi = __int_as_float((int)p[1]);
+  } else {
+    auto p = __builtin_amdgcn_permlane32_swap(iv, iv, false, false);
+    lo = __int_as_float((int)p[0]);
+    hi = __int_as_float((int)p[1]);
+  }
+}
+#endif
+
 // One cross-lane Hadamard stage: pair (lane, lane ^ MASK); the lower lane
 // keeps a + b, the upper one a - b (same op order as the Triton butterfly).
 template <int MASK, int DPL>
@@ -119,9 +162,36 @@ __device__ __forceinline__ void had_stage_xlane(float (&x)[DPL], int sub) {
   const bool upper = (sub & MASK) != 0;
 #pragma unroll
   for (int d = 0; d < DPL; ++d) {
-    float o = xor_lane<MASK>(x[d]);
+#if !defined(KPOOL_LDS_XCHG)
+    if constexpr (MASK >= 16) {
+      // lower lane: lo = x, hi = o -> x + o; upper lane: lo = o, hi = x -> o - x
+      float lo, hi;
+      swap_pair<MASK>(x[d], lo, hi);
+      x[d] = upper ? (lo - hi) : (lo + hi);
+      continue;
+    }
+#endif
+    float o = xor_lane<MASK>(x[d], sub);
     x[d] = upper ? (o - x[d]) : (x[d] + o);
   }
+}
+
+// max of two non-negative finite floats == unsigned max of their bit patterns;
+// skips the IEEE-mode canonicalization the compiler puts in front of v_max_f32
+__device__ __forceinline__ float max_nonneg(float a, float b) {
+  return __uint_as_float(max(__float_as_uint(a), __float_as_uint(b)));
+}
+// absmax stage over the pair (lane, lane ^ MASK) for non-negative values
+template <int MASK>
+__device__ __forceinline__ float absmax_xlane(float am, int sub) {
+#if !defined(KPOOL_LDS_XCHG)
+  if constexpr (MASK >= 16) {
+    float lo, hi;
+    swap_pair<MASK>(am, lo, hi);
+    return max_nonneg(lo, hi);
+  }
+#endif
+  return max_nonneg(am, xor_lane<MASK>(am, sub));
 }
 
 template <int DPL>
@@ -181,19 +251,21 @@ __device__ __forceinline__ void load_rows(
 // Pool math for one pool spread over LANES lanes; this lane holds dims
 // [sub*DPL, sub*DPL + DPL) of every row. Same instructions and op order as
 // the Triton kernel (bit-exact).
-template <int POOL, int LANES>
+struct NoMid {
+  __device__ __forceinline__ void operator()(float) const {}
+};
+template <int POOL, int LANES, typename Mid = NoMid>
 __device__ __forceinline__ void compress_pool(
     const uint32_t (&gw)[POOL][HEAD_DIM / LANES / 2],
     const uint32_t (&kw)[POOL][HEAD_DIM / LANES / 2],
     const float (&ape)[POOL][HEAD_DIM / LANES],
-    uint8_t* __restrict__ cache,
-    int64_t loc,
-    int page_size,
-    int page_shift,  // log2(page_size), or -1 when page_size is not a power of two
-    int64_t page_bytes,
+    gptr<uint8_t> pbase,          // page of the destination slot (cache + page * page_bytes)
+    int tok,                      // slot inside the page
+    uint32_t scale_off,           // byte offset of the fp32 scale inside the page: page_size * 128 + tok * 4
     bool preshuffle,
     bool round_scale,
-    int sub) {
+    int sub,
+    Mid mid = Mid{}) {  // mid(dep): called once every input row has been consumed, dep depends on all of them
   constexpr int DPL = HEAD_DIM / LANES;
   const int d0 = sub * DPL;
 
@@ -222,10 +294,14 @@ __device__ __forceinline__ void compress_pool(
     }
   }
 
+  mid(acc[0]);
+
   // --- pooled vector -> bf16 -> Hadamard-128 -> bf16 ---
   float x[DPL];
 #pragma unroll
-  for (int d = 0; d < DPL; ++d) x[d] = round_bf16(acc[d] / den[d]);
+  for (int d = 0; d < DPL; ++d) x[d] = acc[d] / den[d];  // exact division (rcp * mul is not bit-exact)
+#pragma unroll
+  for (int d = 0; d < DPL; d += 2) round_bf16x2(x[d], x[d + 1]);
 
   had_stages_inlane<DPL>(x);
   if constexpr (LANES >= 2) had_stage_xlane<1, DPL>(x, sub);
@@ -235,83 +311,99 @@ __device__ __forceinline__ void compress_pool(
   if constexpr (LANES >= 32) had_stage_xlane<16, DPL>(x, sub);
   if constexpr (LANES >= 64) had_stage_xlane<32, DPL>(x, sub);
 #pragma unroll
-  for (int d = 0; d < DPL; ++d) x[d] = round_bf16(x[d] * HAD_SCALE);
+  for (int d = 0; d < DPL; ++d) x[d] = x[d] * HAD_SCALE;
+#pragma unroll
+  for (int d = 0; d < DPL; d += 2) round_bf16x2(x[d], x[d + 1]);
 
-  // --- per-vector absmax fp8 quant ---
+  // --- per-vector absmax fp8 quant (all values finite and >= 0: unsigned
+  // integer max is the exact float max, without canonicalization) ---
   float am = 0.0f;
 #pragma unroll
-  for (int d = 0; d < DPL; ++d) am = fmaxf(am, fabsf(x[d]));
-  if constexpr (LANES >= 2) am = fmaxf(am, xor_lane<1>(am));
-  if constexpr (LANES >= 4) am = fmaxf(am, xor_lane<2>(am));
-  if constexpr (LANES >= 8) am = fmaxf(am, xor_lane<4>(am));
-  if constexpr (LANES >= 16) am = fmaxf(am, xor_lane<8>(am));
-  if constexpr (LANES >= 32) am = fmaxf(am, xor_lane<16>(am));
-  if constexpr (LANES >= 64) am = fmaxf(am, xor_lane<32>(am));
-  am = fmaxf(am, 1e-4f);
+  for (int d = 0; d < DPL; ++d) am = max_nonneg(am, fabsf(x[d]));
+  if constexpr (LANES >= 2) am = absmax_xlane<1>(am, sub);
+  if constexpr (LANES >= 4) am = absmax_xlane<2>(am, sub);
+  if constexpr (LANES >= 8) am = absmax_xlane<4>(am, sub);
+  if constexpr (LANES >= 16) am = absmax_xlane<8>(am, sub);
+  if constexpr (LANES >= 32) am = absmax_xlane<16>(am, sub);
+  if constexpr (LANES >= 64) am = absmax_xlane<32>(am, sub);
+  am = max_nonneg(am, 1e-4f);
+  // x / scale: under round_scale the scale is 2^e, so the division is the
+  // exact ldexp(x, -e) (no rcp, no division sequence); otherwise exact division.
   float scale;
+  float q[DPL];
   if (round_scale) {
-    scale = fast_exp2(__builtin_ceilf(fast_log2(am * FP8_MAX_INV)));
+    const float e = __builtin_ceilf(fast_log2(am * FP8_MAX_INV));
+    scale = fast_exp2(e);
+#ifndef KPOOL_NO_LDEXP
+    const int ne = -(int)e;
+#pragma unroll
+    for (int d = 0; d < DPL; ++d) q[d] = __builtin_amdgcn_ldexpf(x[d], ne);
+#else
+#pragma unroll
+    for (int d = 0; d < DPL; ++d) q[d] = x[d] / scale;
+#endif
   } else {
     scale = am * FP8_MAX_INV;
+#pragma unroll
+    for (int d = 0; d < DPL; ++d) q[d] = x[d] / scale;
   }
+#pragma unroll
+  for (int d = 0; d < DPL; ++d) q[d] = __builtin_amdgcn_fmed3f(q[d], -FP8_MAX, FP8_MAX);  // == min(max(q, -448), 448)
   constexpr int NQW = DPL >= 4 ? DPL / 4 : 1;
   uint32_t qw[NQW];
   if constexpr (DPL == 2) {
-    float q0 = fminf(fmaxf(x[0] / scale, -FP8_MAX), FP8_MAX);
-    float q1 = fminf(fmaxf(x[1] / scale, -FP8_MAX), FP8_MAX);
-    qw[0] = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(q0, q1, 0, false);
+    qw[0] = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(q[0], q[1], 0, false);
   }
 #pragma unroll
   for (int c = 0; c < DPL / 4; ++c) {
-    float q0 = fminf(fmaxf(x[c * 4 + 0] / scale, -FP8_MAX), FP8_MAX);
-    float q1 = fminf(fmaxf(x[c * 4 + 1] / scale, -FP8_MAX), FP8_MAX);
-    float q2 = fminf(fmaxf(x[c * 4 + 2] / scale, -FP8_MAX), FP8_MAX);
-    float q3 = fminf(fmaxf(x[c * 4 + 3] / scale, -FP8_MAX), FP8_MAX);
-    uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(q0, q1, 0, false);
-    w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(q2, q3, (int)w, true);
+    uint32_t w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(q[c * 4 + 0], q[c * 4 + 1], 0, false);
+    w = (uint32_t)__builtin_amdgcn_cvt_pk_fp8_f32(q[c * 4 + 2], q[c * 4 + 3], (int)w, true);
     qw[c] = w;
   }
 
-  // --- store ---
-  int64_t page;
-  int tok;
-  if (page_shift >= 0) {
-    page = loc >> page_shift;
-    tok = (int)(loc & (page_size - 1));
-  } else {
-    page = loc / page_size;
-    tok = (int)(loc % page_size);
-  }
-  uint8_t* pbase = cache + page * page_bytes;
+  // --- store: a 32-bit lane offset on the page base, so a wave-uniform page
+  // (decode) gives the saddr form (SGPR base + VGPR offset) ---
   if (preshuffle) {
     // byte offset of (tok, dim) = (tok/16)*16*128 + (dim/16)*256 + (tok%16)*16 + dim%16
-    uint8_t* kp = pbase + (int64_t)(tok >> 4) * (16 * HEAD_DIM) + (d0 >> 4) * 256 + (tok & 15) * 16 + (d0 & 15);
+    gptr<uint8_t> kp = pbase + (uint32_t)((tok >> 4) * (16 * HEAD_DIM) + (d0 >> 4) * 256 + (tok & 15) * 16 + (d0 & 15));
     if constexpr (DPL == 16) {
-      *reinterpret_cast<uint4*>(kp) = make_uint4(qw[0], qw[1], qw[2], qw[3]);
+      *(gptr<u32x4>)kp = u32x4{qw[0], qw[1], qw[2], qw[3]};
     } else if constexpr (DPL == 8) {
-      *reinterpret_cast<uint2*>(kp) = make_uint2(qw[0], qw[1]);
+      *(gptr<u32x2>)kp = u32x2{qw[0], qw[1]};
     } else if constexpr (DPL == 2) {
       // lane pairs (2k, 2k+1) hold dims 4k..4k+3: the even lane stores one
       // dword (2-byte stores per lane are far slower in the memory pipeline)
-      const uint32_t other = __float_as_uint(xor_lane<1>(__uint_as_float(qw[0])));
-      if ((sub & 1) == 0) *reinterpret_cast<uint32_t*>(kp) = (qw[0] & 0xFFFFu) | (other << 16);
+      const uint32_t other = __float_as_uint(xor_lane<1>(__uint_as_float(qw[0]), sub));
+      if ((sub & 1) == 0) *(gptr<uint32_t>)kp = (qw[0] & 0xFFFFu) | (other << 16);
     } else {
 #pragma unroll
-      for (int c = 0; c < DPL / 4; ++c) reinterpret_cast<uint32_t*>(kp)[c] = qw[c];
+      for (int c = 0; c < DPL / 4; ++c) ((gptr<uint32_t>)kp)[c] = qw[c];
     }
   } else {
-    uint8_t* kp = pbase + (int64_t)tok * HEAD_DIM + d0;
+    gptr<uint8_t> kp = pbase + (uint32_t)(tok * HEAD_DIM + d0);
     if constexpr (DPL == 2) {
-      const uint32_t other = __float_as_uint(xor_lane<1>(__uint_as_float(qw[0])));
-      if ((sub & 1) == 0) *reinterpret_cast<uint32_t*>(kp) = (qw[0] & 0xFFFFu) | (other << 16);
+      const uint32_t other = __float_as_uint(xor_lane<1>(__uint_as_float(qw[0]), sub));
+      if ((sub & 1) == 0) *(gptr<uint32_t>)kp = (qw[0] & 0xFFFFu) | (other << 16);
     } else {
 #pragma unroll
-      for (int c = 0; c < DPL / 4; ++c) reinterpret_cast<uint32_t*>(kp)[c] = qw[c];
+      for (int c = 0; c < DPL / 4; ++c) ((gptr<uint32_t>)kp)[c] = qw[c];
     }
   }
   if (sub == 0) {
-    *reinterpret_cast<float*>(pbase + (int64_t)page_size * HEAD_DIM + (int64_t)tok * 4) = scale;
+    *(gptr<float>)(pbase + scale_off) = scale;
   }
+}
+
+// page / token-in-page of a cache slot (page_shift = log2(page_size), or -1
+// when page_size is not a power of two)
+template <typename LocT>
+__device__ __forceinline__ LocT page_of(LocT loc, int page_size, int page_shift, int& tok) {
+  if (page_shift >= 0) {
+    tok = (int)(loc & (page_size - 1));
+    return loc >> page_shift;
+  }
+  tok = (int)(loc % page_size);
+  return loc / page_size;
 }
 
 // Workgroups are dispatched round-robin over the 8 XCDs (each with its own
@@ -333,18 +425,16 @@ __device__ __forceinline__ int xcd_remap(int b, int nb) {
 
 struct TailArgs {
   uint16_t* tail;        // [num_blocks, 2, ring, 128] bf16 (strides below, in elements)
-  int64_t block_elems;   // stride(0)
-  int64_t head_elems;    // stride(1)
-  int ring;              // shape[2]
-  int ring_shift;        // log2(ring) or -1
+  int block_elems;       // stride(0); the whole tail has < 2^31 elements (checked), so
+  int head_elems;        // stride(1)  every offset into it fits 32 bits
+  int ring_mask;         // ring - 1; ring = shape[2] is a power of two (checked by the entry points)
+  int ring_shift;        // log2(ring)
 };
 
-__device__ __forceinline__ int ring_div(int x, const TailArgs& ta) {
-  return ta.ring_shift >= 0 ? (x >> ta.ring_shift) : (x / ta.ring);
-}
-__device__ __forceinline__ int ring_mod(int x, const TailArgs& ta) {
-  return ta.ring_shift >= 0 ? (x & (ta.ring - 1)) : (x % ta.ring);
-}
+// ring is a power of two (AITER_CHECK in tail_args): shift / mask only, so the
+// metadata loads of a decode request are not split by a data-dependent branch.
+__device__ __forceinline__ int ring_div(int x, const TailArgs& ta) { return x >> ta.ring_shift; }
+__device__ __forceinline__ int ring_mod(int x, const TailArgs& ta) { return x & ta.ring_mask; }
 
 template <int POOL, int LANES, bool VEC, typename SlotT>
 __device__ __forceinline__ void insert_window(
@@ -441,8 +531,10 @@ __device__ __forceinline__ void insert_window(
       load_rows<POOL, DPL, VEC>(k, gate, last - (POOL - 1), k_stride, gate_stride, d0, gw, kw);
       have_window = false;
     }
-    compress_pool<POOL, LANES>(gw, kw, apev, cache, loc, page_size, page_shift, page_bytes, preshuffle,
-                               round_scale, sub);
+    int tok;
+    const int64_t page = page_of<int64_t>(loc, page_size, page_shift, tok);
+    compress_pool<POOL, LANES>(gw, kw, apev, (gptr<uint8_t>)(cache + page * page_bytes), tok,
+                               (uint32_t)(page_size * HEAD_DIM + tok * 4), preshuffle, round_scale, sub);
   }
 
   // Tail seeding (kpool_seed_tail_cache): token i is among its request's last
@@ -468,9 +560,9 @@ __device__ __forceinline__ void insert_window(
         load_row<DPL, VEC>(k + tok * k_stride + d0, rk);
         load_row<DPL, VEC>(gate + tok * gate_stride + d0, rs);
       }
-      const int64_t dst = (int64_t)blk * ta.block_elems + (int64_t)ring_mod(ts, ta) * HEAD_DIM + d0;
+      const uint32_t dst = (uint32_t)blk * (uint32_t)ta.block_elems + (uint32_t)ring_mod(ts, ta) * HEAD_DIM + d0;
       uint32_t* pk = reinterpret_cast<uint32_t*>(ta.tail + dst);
-      uint32_t* ps = reinterpret_cast<uint32_t*>(ta.tail + ta.head_elems + dst);
+      uint32_t* ps = reinterpret_cast<uint32_t*>(ta.tail + (uint32_t)ta.head_elems + dst);
 #pragma unroll
       for (int c = 0; c < DPL / 2; ++c) { pk[c] = rk[c]; ps[c] = rs[c]; }
     }
@@ -502,7 +594,7 @@ __global__ void __launch_bounds__(64) kpool_insert_kernel(
   const int grp = GROUPS_PER_WAVE == 1 ? 0 : lane / LANES;
   const int sub = lane % LANES;
   const int64_t win = (int64_t)xcd_remap<8>(blockIdx.x, gridDim.x) * GROUPS_PER_WAVE + grp;
-  TailArgs ta{nullptr, 0, 0, 1, 0};
+  TailArgs ta{nullptr, 0, 0, 0, 0};
   insert_window<POOL, LANES, VEC, SlotT>(win, k, gate, ape, slot_mapping, cache, n_tokens, n_windows, k_stride,
                                          gate_stride, ape_stride, page_size, page_shift, page_bytes, flags & 7,
                                          nullptr, ta, grp, sub);
@@ -513,44 +605,53 @@ __global__ void __launch_bounds__(64) kpool_insert_kernel(
 // ===========================================================================
 
 constexpr int DEC_LANES = 64;
-constexpr int DEC_DPL = HEAD_DIM / DEC_LANES;  // 2
-constexpr int DEC_W = DEC_DPL / 2;             // dwords per row per lane
+constexpr int DEC_DPL = HEAD_DIM / DEC_LANES;  // 2 dims = one dword per lane per row
 constexpr int DEC_BLOCK_WAVES = 4;             // requests per workgroup in the standalone decode kernel
 
 struct DecodeArgs {
-  const uint16_t* key;     // [B, next_n, 128] bf16
-  const uint16_t* score;   // [B, next_n, 128] bf16
-  int64_t key_sb, key_st, ss_sb, ss_st;
+  const uint16_t* key;       // [B, next_n, 128] bf16
+  const uint16_t* score;     // [B, next_n, 128] bf16
   const int32_t* tail_slot;  // [B, next_n]
   const int32_t* slot_map;   // [B, next_n]
   const int32_t* positions;  // [B, next_n]
+  int key_sb, key_st, ss_sb, ss_st;  // strides in elements (checked to fit int32)
   int next_n;
   int num_requests;
 };
 
-// DEC_DPL bf16 = DEC_W dwords per lane per row
-template <bool VEC>
-__device__ __forceinline__ void load_rowd(const uint16_t* __restrict__ p, uint32_t (&w)[DEC_W]) {
-  static_assert(DEC_W == 1, "decode lanes hold one dword per row");
-  if constexpr (VEC) {
-    w[0] = *reinterpret_cast<const uint32_t*>(p);
-  } else {
-#pragma unroll
-    for (int i = 0; i < DEC_W; ++i) w[i] = (uint32_t)p[2 * i] | ((uint32_t)p[2 * i + 1] << 16);
-  }
+// Empty asm that requires x in SGPRs: forces a wave-uniform value to be
+// materialized there (kernargs: fetched before this point; derived pointers:
+// kept apart from the per-lane offset, so loads take the saddr form).
+#define KPOOL_PIN_S(x) asm("" : "+s"(x))
+// Pointers are pinned as integers and come back in the global address space
+// (the asm hides their provenance; a generic pointer would turn every access
+// into a flat_load that also waits on lgkmcnt).
+template <typename T>
+__device__ __forceinline__ gptr<T> pin_global(T* p) {
+  uintptr_t v = reinterpret_cast<uintptr_t>(p);
+  KPOOL_PIN_S(v);
+  return (gptr<T>)v;
+}
+template <typename T>
+__device__ __forceinline__ gptr<T> pin_global(gptr<T> p) {
+  uintptr_t v = (uintptr_t)p;
+  KPOOL_PIN_S(v);
+  return (gptr<T>)v;
 }
 
-template <int NMAX>
-__device__ __forceinline__ void pick_row(const uint32_t (&arr)[NMAX][DEC_W], int idx, uint32_t (&out)[DEC_W]) {
-#pragma unroll
-  for (int c = 0; c < DEC_W; ++c) out[c] = arr[0][c];
-#pragma unroll
-  for (int i = 1; i < NMAX; ++i) {
-    if (i == idx) {
-#pragma unroll
-      for (int c = 0; c < DEC_W; ++c) out[c] = arr[i][c];
-    }
+// This lane's dword (2 bf16) of a 128-dim row whose address is wave-uniform:
+// SGPR base + 32-bit lane offset (saddr form, no 64-bit VALU address math).
+template <bool VEC>
+__device__ __forceinline__ uint32_t load_dw(gptr<const uint16_t> row, int sub) {
+  if constexpr (VEC) {
+    return ((gptr<const uint32_t>)row)[(uint32_t)sub];
+  } else {
+    gptr<const uint16_t> p = row + 2 * (uint32_t)sub;
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 16);
   }
+}
+__device__ __forceinline__ void store_dw(gptr<uint16_t> row, int sub, uint32_t v) {
+  ((gptr<uint32_t>)row)[(uint32_t)sub] = v;
 }
 
 // Per-token metadata lives in clang ext vectors (SSA values, never an
@@ -578,142 +679,221 @@ __device__ __forceinline__ auto vpick(const V& v, int idx) {
 // ring. One wave per request: the request's metadata (3 x NMAX int32) is
 // wave-uniform, so it lives in scalar registers and the completion / source
 // / stash logic runs on the scalar unit; each lane holds its 2 dims of every
-// K / gate row. Everything is fetched in ONE round trip; the ring rows of the
-// first completion are fetched before any pool math; later completions
-// normally read only this launch's tokens (registers). Completions and
-// stashes are issued in token order, so a later writer of the same cache /
-// ring slot wins as in the walk (same lane, same address: program order).
+// K / gate row. Memory chain: kernargs -> K / gate / APE / metadata (one
+// round trip) -> ring rows of the first completion -> math -> stores.
+// Completions and stashes are issued in token order, so a later writer of the
+// same cache / ring slot wins as in the walk (same lane, same address:
+// program order).
 template <int POOL, int NMAX, bool VEC>
 __device__ __forceinline__ void decode_request(
     int req,  // wave-uniform
     const DecodeArgs& da,
     const float* __restrict__ ape,
-    int64_t ape_stride,
+    int ape_stride,
     TailArgs ta,
     uint8_t* __restrict__ cache,
     int page_size,
     int page_shift,
-    int64_t page_bytes,
-    bool preshuffle,
-    bool round_scale,
-    int sub) {  // lane, 0..63
+    uint32_t page_bytes,
+    int flags,  // bit1: preshuffle, bit2: round_scale
+    int sub,    // lane, 0..63
+    bool valid = true) {  // wave-uniform; false = padding wave (loads only, no stores)
   typedef typename Vec<NMAX>::i ivec;
   typedef typename Vec<NMAX>::u uvec;
-  const int n = da.next_n;  // 1 <= n <= NMAX
-  const int64_t base = (int64_t)req * n;
-  const int d0 = sub * DEC_DPL;
+  // Every kernarg is consumed here, so the compiler fetches them all in one
+  // SMEM batch (one wait) instead of one lazy batch + wait per first use.
+  const DecodeArgs d = da;
+  const gptr<const int32_t> m_ts = (gptr<const int32_t>)d.tail_slot, m_loc = (gptr<const int32_t>)d.slot_map,
+                            m_pos = (gptr<const int32_t>)d.positions;
+  const gptr<const float> ape_g = (gptr<const float>)ape;
+  const gptr<uint16_t> tail = (gptr<uint16_t>)ta.tail;
+  const gptr<uint8_t> cache_g = (gptr<uint8_t>)cache;
+  const bool preshuffle = (flags & 2) != 0, round_scale = (flags & 4) != 0;
+  const int n = d.next_n;  // 1 <= n <= NMAX
+  __builtin_assume(n >= 1 && n <= NMAX);
+  const int base = req * n;
 
-  // --- one round trip: metadata (scalar), ape, all K / gate rows ---
-  ivec loc, pos, ts;
-  uvec rk[DEC_W], rs[DEC_W];
-  const uint16_t* kbase = da.key + (int64_t)req * da.key_sb + d0;
-  const uint16_t* sbase = da.score + (int64_t)req * da.ss_sb + d0;
-  const int32_t* mloc = da.slot_map + base;
-  const int32_t* mpos = da.positions + base;
-  const int32_t* mts = da.tail_slot + base;
-  const int kst = (int)da.key_st, sst = (int)da.ss_st;  // row strides fit in 32 bits
+  // --- phase 1: K / gate of the request's tokens (one dword per lane), then
+  // the metadata (scalar loads); no wait in between ---
+  uvec rk, rs;
+  // B * next_n * 128 < 2^31 (checked): element offsets fit in 32 bits
+  uintptr_t kb = reinterpret_cast<uintptr_t>(d.key + (uint32_t)(req * d.key_sb));
+  uintptr_t sb = reinterpret_cast<uintptr_t>(d.score + (uint32_t)(req * d.ss_sb));
+  // The first loads "depend" on every other kernarg (empty asm): the compiler
+  // fetches all kernargs in one SMEM batch with one wait, instead of one lazy
+  // batch and one wait per first use along the chain.
+  asm("" : "+s"(kb), "+s"(sb)
+         : "s"(m_ts), "s"(m_loc), "s"(m_pos), "s"(ape_g), "s"(ape_stride), "s"(tail), "s"(ta.block_elems),
+           "s"(ta.head_elems), "s"(ta.ring_mask), "s"(ta.ring_shift), "s"(cache_g), "s"(page_size), "s"(page_shift),
+           "s"(page_bytes), "s"(flags), "s"(d.key_st), "s"(d.ss_st));
+  const gptr<const uint16_t> kbase = (gptr<const uint16_t>)kb;
+  const gptr<const uint16_t> sbase = (gptr<const uint16_t>)sb;
 #pragma unroll
   for (int i = 0; i < NMAX; ++i) {
     const int j = min(i, n - 1);
-    loc[i] = mloc[j];
-    pos[i] = mpos[j];
-    ts[i] = mts[j];
-    uint32_t wk[DEC_W], ws[DEC_W];
-    load_rowd<VEC>(kbase + j * kst, wk);
-    load_rowd<VEC>(sbase + j * sst, ws);
-#pragma unroll
-    for (int c = 0; c < DEC_W; ++c) { rk[c][i] = wk[c]; rs[c][i] = ws[c]; }
+    rk[i] = load_dw<VEC>(kbase + (uint32_t)(j * d.key_st), sub);
+    rs[i] = load_dw<VEC>(sbase + (uint32_t)(j * d.ss_st), sub);
   }
+  ivec loc, pos, ts;
+#pragma unroll
+  for (int i = 0; i < NMAX; ++i) {
+    const uint32_t j = (uint32_t)(base + min(i, n - 1));
+    loc[i] = m_loc[j];
+    pos[i] = m_pos[j];
+    ts[i] = m_ts[j];
+  }
+  // APE rows: loaded only when a pool closes (one step in POOL), together
+  // with the ring rows; the row pointer is pinned uniform so the lane offset
+  // stays a 32-bit saddr offset.
   float apev[POOL][DEC_DPL];
+  auto load_ape = [&]() {
+    (void)ape_stride;  // == HEAD_DIM (ape contiguous, checked by the entry point): immediate row offsets
 #pragma unroll
-  for (int s = 0; s < POOL; ++s) {
-    if constexpr (DEC_DPL == 2) {
-      float2 a = *reinterpret_cast<const float2*>(ape + s * ape_stride + d0);
-      apev[s][0] = a.x; apev[s][1] = a.y;
-    } else {
-      float4 a = *reinterpret_cast<const float4*>(ape + s * ape_stride + d0);
-      apev[s][0] = a.x; apev[s][1] = a.y; apev[s][2] = a.z; apev[s][3] = a.w;
+    for (int s = 0; s < POOL; ++s) {
+      const f32x2 a = ((gptr<const f32x2>)(ape_g + s * HEAD_DIM))[(uint32_t)sub];
+      apev[s][0] = a[0];
+      apev[s][1] = a[1];
     }
-  }
+  };
 
   // --- derived per token (wave-uniform) ---
   ivec phys, blk;
   uint32_t smask = 0, cmask = 0;
 #pragma unroll
   for (int i = 0; i < NMAX; ++i) {
-    const bool valid = i < n;
+    const uint32_t tok_ok = i < n ? 1u : 0u;  // token index inside the request
     const int safe = max(pos[i], 0);
     phys[i] = ring_mod(safe, ta);
     blk[i] = ring_div(max(ts[i], 0), ta);
-    if (valid && pos[i] >= 0 && ts[i] >= 0) smask |= 1u << i;
-    if (valid && loc[i] >= 0 && pos[i] >= 0 && (safe % POOL == POOL - 1)) cmask |= 1u << i;
+    // sign tricks instead of compare + select chains: bit 31 of ~(a | b) is
+    // set iff both are >= 0
+    const uint32_t stash_ok = (~(uint32_t)(pos[i] | ts[i])) >> 31;
+    const uint32_t close_ok = ((~(uint32_t)(pos[i] | loc[i])) >> 31) & ((safe % POOL == POOL - 1) ? 1u : 0u);
+    smask |= (tok_ok & stash_ok) << i;
+    cmask |= (tok_ok & close_ok) << i;
   }
+  const uint32_t vmask = valid ? ~0u : 0u;
+  smask &= vmask;
+  cmask &= vmask;
 
-  // source token (or -1 = ring) of pool slot s of the completion at token i
-  auto src_of = [&](int i, int s, int& phys_s) {
-    const int safe = max(vpick<NMAX>(pos, i), 0);
-    const int slot = safe % POOL;
-    phys_s = ring_mod(safe - slot + s, ta);
-    if (s == slot) return i;
-    const int blk_i = vpick<NMAX>(blk, i);
-    int src = -1;
-#pragma unroll
-    for (int t2 = 0; t2 < NMAX; ++t2) {
-      if (t2 < i && ((smask >> t2) & 1u) && blk[t2] == blk_i && phys[t2] == phys_s) src = t2;
-    }
-    return src;
+  // K row (block b, ring slot ph) of the tail; the gate row is ta.head_elems further
+  auto tail_row = [&](int b, int ph) -> gptr<uint16_t> {
+    return tail + (uint32_t)(b * ta.block_elems + ph * HEAD_DIM);
+  };
+  auto write_pool = [&](const uint32_t (&gw)[POOL][1], const uint32_t (&kw)[POOL][1], int loc_i, auto mid) {
+    int tok;
+    const int page = page_of<int>(loc_i, page_size, page_shift, tok);
+    compress_pool<POOL, DEC_LANES>(gw, kw, apev, cache_g + (uint64_t)(uint32_t)page * page_bytes, tok,
+                                   (uint32_t)(page_size * HEAD_DIM + tok * 4), preshuffle, round_scale, sub, mid);
   };
 
-  // --- ring rows of the first completion, fetched before any pool math ---
-  const int first = cmask ? __builtin_ctz(cmask) : -1;
-  uint32_t fk[POOL][DEC_W], fs[POOL][DEC_W];
-  if (first >= 0) {
-    const int64_t bbase = (int64_t)vpick<NMAX>(blk, first) * ta.block_elems + d0;
+  if constexpr (NMAX == 1) {
+    // One token: it closes a pool only as slot POOL-1 (pos % POOL == POOL-1),
+    // so the other POOL-1 slots are the ring rows phys0 .. phys0 + POOL-2
+    // (ring is a multiple of POOL): no slot selects, no load of the token's
+    // own slot. Gate rows and APE first (the softmax needs only them), K rows
+    // after. The stash (its ring slot is never read in this step) is issued
+    // once the last K row has been consumed: earlier, the compiler's vmcnt
+    // waits for the K rows would also cover the store acks; later, after the
+    // pooled-key stores, its own drain would end the wave. Here the acks
+    // drain under the Hadamard and the quantization.
+    auto stash = [&](uint32_t k0, uint32_t s0) {
+      const gptr<uint16_t> dst = tail_row(blk[0], phys[0]);
+      store_dw(dst, sub, k0);
+      store_dw(dst + (uint32_t)ta.head_elems, sub, s0);
+    };
+    if (cmask) {
+      const gptr<const uint16_t> krow = tail_row(blk[0], phys[0] - (POOL - 1));
+      const gptr<const uint16_t> grow = krow + (uint32_t)ta.head_elems;
+      uint32_t gw[POOL][1], kw[POOL][1];
 #pragma unroll
-    for (int s = 0; s < POOL; ++s) {
-      int phys_s;
-      (void)src_of(first, s, phys_s);
-      const int64_t off = bbase + (int64_t)phys_s * HEAD_DIM;
-      load_rowd<VEC>(ta.tail + off, fk[s]);
-      load_rowd<VEC>(ta.tail + ta.head_elems + off, fs[s]);
+      for (int s = 0; s < POOL - 1; ++s) gw[s][0] = load_dw<VEC>(grow + s * HEAD_DIM, sub);
+      load_ape();
+      __builtin_amdgcn_sched_barrier(0);  // keep the gate / APE loads ahead of the K loads
+#pragma unroll
+      for (int s = 0; s < POOL - 1; ++s) kw[s][0] = load_dw<VEC>(krow + s * HEAD_DIM, sub);
+      gw[POOL - 1][0] = rs[0];
+      kw[POOL - 1][0] = rk[0];
+      const bool do_stash = smask != 0;
+      write_pool(gw, kw, loc[0], [&](float dep) {
+        // the stored words "depend" on the pooled accumulator, so the stores
+        // cannot be hoisted above the use of the last K row
+        uint32_t k0 = rk[0], s0 = rs[0];
+        asm volatile("" : "+v"(k0), "+v"(s0) : "v"(dep));
+        if (do_stash) stash(k0, s0);
+      });
+    } else if (smask) {
+      stash(rk[0], rs[0]);
     }
-  }
+    return;
+  } else {
+    // source token (or -1 = ring) of pool slot s of the completion at token i;
+    // the pool's ring rows are phys0 .. phys0 + POOL-1 with phys0 = ring_mod(pos - slot)
+    auto src_of = [&](int i, int s) {
+      const int safe = max(vpick<NMAX>(pos, i), 0);
+      const int slot = safe % POOL;
+      if (s == slot) return i;
+      const int phys_s = ring_mod(safe - slot + s, ta);
+      const int blk_i = vpick<NMAX>(blk, i);
+      int src = -1;
+#pragma unroll
+      for (int t2 = 0; t2 < NMAX; ++t2) {
+        if (t2 < i && ((smask >> t2) & 1u) && blk[t2] == blk_i && phys[t2] == phys_s) src = t2;
+      }
+      return src;
+    };
+    auto pool_krow = [&](int i) -> gptr<const uint16_t> {
+      const int safe = max(vpick<NMAX>(pos, i), 0);
+      return tail_row(vpick<NMAX>(blk, i), ring_mod(safe - safe % POOL, ta));
+    };
 
-  // --- completions, in token order: one compress body, runtime loop ---
-  while (cmask) {
-    const int i = __builtin_ctz(cmask);
-    cmask &= cmask - 1;
-    uint32_t gw[POOL][DEC_W], kw[POOL][DEC_W];
-    const int64_t bbase = (int64_t)vpick<NMAX>(blk, i) * ta.block_elems + d0;
+    // --- ring rows of the first completion, fetched before any pool math
+    // (only the slots that really come from the ring) ---
+    const int first = cmask ? __builtin_ctz(cmask) : -1;
+    uint32_t fk[POOL], fs[POOL];
+    if (first >= 0) {
+      const gptr<const uint16_t> krow = pool_krow(first);
 #pragma unroll
-    for (int s = 0; s < POOL; ++s) {
-      int phys_s;
-      const int src = src_of(i, s, phys_s);
-      if (src >= 0) {
+      for (int s = 0; s < POOL; ++s) {
+        if (src_of(first, s) < 0) fs[s] = load_dw<VEC>(krow + (uint32_t)ta.head_elems + s * HEAD_DIM, sub);
+      }
+      load_ape();
 #pragma unroll
-        for (int c = 0; c < DEC_W; ++c) { kw[s][c] = vpick<NMAX>(rk[c], src); gw[s][c] = vpick<NMAX>(rs[c], src); }
-      } else if (i == first) {
-#pragma unroll
-        for (int c = 0; c < DEC_W; ++c) { kw[s][c] = fk[s][c]; gw[s][c] = fs[s][c]; }
-      } else {
-        const int64_t off = bbase + (int64_t)phys_s * HEAD_DIM;
-        load_rowd<VEC>(ta.tail + off, kw[s]);
-        load_rowd<VEC>(ta.tail + ta.head_elems + off, gw[s]);
+      for (int s = 0; s < POOL; ++s) {
+        if (src_of(first, s) < 0) fk[s] = load_dw<VEC>(krow + s * HEAD_DIM, sub);
       }
     }
-    compress_pool<POOL, DEC_LANES>(gw, kw, apev, cache, (int64_t)vpick<NMAX>(loc, i), page_size, page_shift,
-                                   page_bytes, preshuffle, round_scale, sub);
-  }
 
-  // --- stash, in token order (every ring read above was consumed already) ---
+    // --- completions, in token order: one compress body, runtime loop ---
+    while (cmask) {
+      const int i = __builtin_ctz(cmask);
+      cmask &= cmask - 1;
+      uint32_t gw[POOL][1], kw[POOL][1];
+      const gptr<const uint16_t> krow = pool_krow(i);
 #pragma unroll
-  for (int i = 0; i < NMAX; ++i) {
-    if (!((smask >> i) & 1u)) continue;
-    const int64_t dst = (int64_t)blk[i] * ta.block_elems + (int64_t)phys[i] * HEAD_DIM + d0;
+      for (int s = 0; s < POOL; ++s) {
+        const int src = src_of(i, s);
+        if (src >= 0) {
+          kw[s][0] = vpick<NMAX>(rk, src);
+          gw[s][0] = vpick<NMAX>(rs, src);
+        } else if (i == first) {
+          kw[s][0] = fk[s];
+          gw[s][0] = fs[s];
+        } else {
+          gw[s][0] = load_dw<VEC>(krow + (uint32_t)ta.head_elems + s * HEAD_DIM, sub);
+          kw[s][0] = load_dw<VEC>(krow + s * HEAD_DIM, sub);
+        }
+      }
+      write_pool(gw, kw, vpick<NMAX>(loc, i), NoMid{});
+    }
+
+    // --- stash, in token order (every ring read above was consumed already) ---
 #pragma unroll
-    for (int c = 0; c < DEC_W; ++c) {
-      reinterpret_cast<uint32_t*>(ta.tail + dst)[c] = rk[c][i];
-      reinterpret_cast<uint32_t*>(ta.tail + ta.head_elems + dst)[c] = rs[c][i];
+    for (int i = 0; i < NMAX; ++i) {
+      if (!((smask >> i) & 1u)) continue;
+      const gptr<uint16_t> dst = tail_row(blk[i], phys[i]);
+      store_dw(dst, sub, rk[i]);
+      store_dw(dst + (uint32_t)ta.head_elems, sub, rs[i]);
     }
   }
 }
@@ -723,19 +903,23 @@ template <int POOL, int NMAX, bool VEC>
 __global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) kpool_decode_kernel(
     DecodeArgs da,
     const float* __restrict__ ape,
-    int64_t ape_stride,
+    int ape_stride,
     TailArgs ta,
     uint8_t* __restrict__ cache,
     int page_size,
     int page_shift,
-    int64_t page_bytes,
+    uint32_t page_bytes,
     int flags) {  // bit1: preshuffle, bit2: round_scale
   const int lane = threadIdx.x & 63;
   const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
-  const int req = blockIdx.x * DEC_BLOCK_WAVES + wave;
-  if (req >= da.num_requests) return;
-  decode_request<POOL, NMAX, VEC>(req, da, ape, ape_stride, ta, cache, page_size, page_shift, page_bytes,
-                                  (flags & 2) != 0, (flags & 4) != 0, lane);
+  // No early return: the padding waves of the last workgroup clamp to the
+  // last request (its loads are in bounds) and store nothing, so every
+  // kernarg is fetched in one SMEM batch instead of num_requests first.
+  const int req_raw = blockIdx.x * DEC_BLOCK_WAVES + wave;
+  const bool valid = req_raw < da.num_requests;
+  const int req = valid ? req_raw : da.num_requests - 1;
+  decode_request<POOL, NMAX, VEC>(req, da, ape, ape_stride, ta, cache, page_size, page_shift, page_bytes, flags,
+                                  lane, valid);
 }
 
 // ===========================================================================
@@ -766,8 +950,8 @@ __global__ void __launch_bounds__(64) kpool_mixed_kernel(
   const int lane = threadIdx.x;
   const int n_dec = da.num_requests;
   if ((int)blockIdx.x < n_dec) {
-    decode_request<POOL, NMAX, VEC>(blockIdx.x, da, ape, ape_stride, ta, cache, page_size, page_shift, page_bytes,
-                                    (flags & 2) != 0, (flags & 4) != 0, lane);
+    decode_request<POOL, NMAX, VEC>(blockIdx.x, da, ape, (int)ape_stride, ta, cache, page_size, page_shift,
+                                    (uint32_t)page_bytes, flags & 6, lane);
   } else {
     constexpr int GROUPS_PER_WAVE = 64 / LANES;
     const int grp = GROUPS_PER_WAVE == 1 ? 0 : lane / LANES;
@@ -825,7 +1009,11 @@ int launch_insert(int lanes, bool vec, bool i64, const void* k, const void* gate
   if (lanes == L)                                                                                               \
     return launch_insert_l<POOL, L>(vec, i64, k, gate, ape, slot, cache, n_tokens, k_stride, gate_stride,       \
                                     ape_stride, page_size, page_bytes, flags, stream);
+#ifdef KPOOL_ISA_QUICK
+  KPOOL_L(64)
+#else
   KPOOL_L(64) KPOOL_L(32) KPOOL_L(16)
+#endif
 #undef KPOOL_L
   return -2;
 }
@@ -837,12 +1025,12 @@ int launch_decode_n(bool vec, const DecodeArgs& da, const void* ape, int64_t ape
   if (grid == 0) return 0;
   if (vec)
     hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, true>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream,
-                       da, (const float*)ape, ape_stride, ta, (uint8_t*)cache, page_size, page_shift_of(page_size),
-                       page_bytes, flags);
+                       da, (const float*)ape, (int)ape_stride, ta, (uint8_t*)cache, page_size,
+                       page_shift_of(page_size), (uint32_t)page_bytes, flags);
   else
     hipLaunchKernelGGL((kpool_decode_kernel<POOL, NMAX, false>), dim3(grid), dim3(64 * DEC_BLOCK_WAVES), 0, stream,
-                       da, (const float*)ape, ape_stride, ta, (uint8_t*)cache, page_size, page_shift_of(page_size),
-                       page_bytes, flags);
+                       da, (const float*)ape, (int)ape_stride, ta, (uint8_t*)cache, page_size,
+                       page_shift_of(page_size), (uint32_t)page_bytes, flags);
   return (int)hipGetLastError();
 }
 
@@ -852,7 +1040,11 @@ int launch_decode(bool vec, const DecodeArgs& da, const void* ape, int64_t ape_s
   const int n = da.next_n;
 #define KPOOL_N(N)                                                                                            \
   if (n <= N) return launch_decode_n<POOL, N>(vec, da, ape, ape_stride, ta, cache, page_size, page_bytes, flags, stream);
+#ifdef KPOOL_ISA_QUICK
+  KPOOL_N(1) KPOOL_N(4)
+#else
   KPOOL_N(1) KPOOL_N(2) KPOOL_N(4) KPOOL_N(8) KPOOL_N(16)
+#endif
 #undef KPOOL_N
   return -4;
 }
@@ -898,7 +1090,11 @@ int launch_mixed_n(int lanes, bool vec, bool i64, const DecodeArgs& da, const vo
   if (lanes == L)                                                                                               \
     return launch_mixed_l<POOL, NMAX, L>(vec, i64, da, k, gate, slot, n_tokens, k_stride, gate_stride, seed_tslot, \
                                          ape, ape_stride, ta, cache, page_size, page_bytes, flags, stream);
+#ifdef KPOOL_ISA_QUICK
+  KPOOL_L(64)
+#else
   KPOOL_L(64) KPOOL_L(32) KPOOL_L(16)
+#endif
 #undef KPOOL_L
   return -2;
 }
@@ -913,7 +1109,11 @@ int launch_mixed(int lanes, bool vec, bool i64, const DecodeArgs& da, const void
   if (n <= N)                                                                                                 \
     return launch_mixed_n<POOL, N>(lanes, vec, i64, da, k, gate, slot, n_tokens, k_stride, gate_stride,       \
                                    seed_tslot, ape, ape_stride, ta, cache, page_size, page_bytes, flags, stream);
+#ifdef KPOOL_ISA_QUICK
+  KPOOL_N(1)
+#else
   KPOOL_N(1) KPOOL_N(2) KPOOL_N(4) KPOOL_N(8) KPOOL_N(16)
+#endif
 #undef KPOOL_N
   return -4;
 }
@@ -921,6 +1121,15 @@ int launch_mixed(int lanes, bool vec, bool i64, const DecodeArgs& da, const void
 }  // namespace
 
 // Launcher return codes: 0 ok, -2 bad lane count, -3 unsupported pool size, -4 next_n > 16, else hipError_t.
+#ifdef KPOOL_ISA_QUICK
+// -DKPOOL_ISA_QUICK: instantiate only the production shapes (pool 4, decode
+// next_n <= 1 / 4, 64 lanes) for fast ISA listings; never used for a real build.
+#define KPOOL_POOL_SWITCH(EXPR)                      \
+  switch (pool_size) {                               \
+    case 4: { constexpr int P = 4; EXPR }            \
+    default: rc = -3; break;                         \
+  }
+#else
 #define KPOOL_POOL_SWITCH(EXPR)                      \
   switch (pool_size) {                               \
     case 2: { constexpr int P = 2; EXPR }            \
@@ -930,6 +1139,7 @@ int launch_mixed(int lanes, bool vec, bool i64, const DecodeArgs& da, const void
     case 16: { constexpr int P = 16; EXPR }          \
     default: rc = -3; break;                         \
   }
+#endif
 
 // ===========================================================================
 // aiter entry points
@@ -978,13 +1188,14 @@ void check_cache(const aiter_tensor_t& kv_cache)
     const int page_size = static_cast<int>(kv_cache.size(1));
     AITER_CHECK(page_size == 1 || page_size % 16 == 0,
                 "page_size must be 1 or a multiple of 16 (preshuffled tiles), got ", page_size);
+    AITER_CHECK(page_size <= (1 << 20), "page_size too large, got ", page_size);
 }
 
 void check_ape(const aiter_tensor_t& ape, int pool_size)
 {
     AITER_CHECK(ape.dtype() == AITER_DTYPE_fp32 && ape.dim() == 2 && ape.size(0) == pool_size &&
-                    ape.size(1) == KPOOL_HEAD_DIM && ape.stride(1) == 1,
-                "ape must be fp32 [pool_size, 128] with unit inner stride");
+                    ape.size(1) == KPOOL_HEAD_DIM && ape.stride(1) == 1 && ape.stride(0) == KPOOL_HEAD_DIM,
+                "ape must be a contiguous fp32 [pool_size, 128] tensor");
 }
 
 void check_rows(const aiter_tensor_t& t, const char* name)
@@ -1042,16 +1253,19 @@ DecodeChecked check_decode(const aiter_tensor_t& tail_kv_cache,
     const int ring = static_cast<int>(tail_kv_cache.size(2));
     AITER_CHECK(ring >= pool_size && ring % pool_size == 0, "tail ring (", ring,
                 ") must be a multiple of pool_size (", pool_size, ")");
+    AITER_CHECK(B * key.stride(0) < (1LL << 31) && B * slot_score.stride(0) < (1LL << 31) &&
+                    B * next_n < (1LL << 31),
+                "decode key / slot_score must have < 2^31 elements");
     DecodeChecked r;
     r.da = DecodeArgs{static_cast<const uint16_t*>(key.data_ptr()),
                       static_cast<const uint16_t*>(slot_score.data_ptr()),
-                      key.stride(0),
-                      key.stride(1),
-                      slot_score.stride(0),
-                      slot_score.stride(1),
                       static_cast<const int32_t*>(tail_slot_mapping.data_ptr()),
                       static_cast<const int32_t*>(slot_mapping.data_ptr()),
                       static_cast<const int32_t*>(positions.data_ptr()),
+                      static_cast<int>(key.stride(0)),
+                      static_cast<int>(key.stride(1)),
+                      static_cast<int>(slot_score.stride(0)),
+                      static_cast<int>(slot_score.stride(1)),
                       static_cast<int>(next_n),
                       static_cast<int>(B)};
     r.vec = aligned(key.data_ptr(), key.stride(1), 2, 4) && aligned(slot_score.data_ptr(), slot_score.stride(1), 2, 4) &&
@@ -1063,11 +1277,13 @@ DecodeChecked check_decode(const aiter_tensor_t& tail_kv_cache,
 TailArgs tail_args(const aiter_tensor_t& tail_kv_cache)
 {
     const int ring = static_cast<int>(tail_kv_cache.size(2));
+    AITER_CHECK(ring > 0 && (ring & (ring - 1)) == 0, "tail ring (", ring, ") must be a power of two");
+    AITER_CHECK(tail_kv_cache.size(0) * tail_kv_cache.stride(0) < (1LL << 31), "tail_kv_cache too large");
     return TailArgs{static_cast<uint16_t*>(tail_kv_cache.data_ptr()),
-                    tail_kv_cache.stride(0),
-                    tail_kv_cache.stride(1),
-                    ring,
-                    (ring > 0 && (ring & (ring - 1)) == 0) ? __builtin_ctz(static_cast<unsigned>(ring)) : -1};
+                    static_cast<int>(tail_kv_cache.stride(0)),
+                    static_cast<int>(tail_kv_cache.stride(1)),
+                    ring - 1,
+                    __builtin_ctz(static_cast<unsigned>(ring))};
 }
 
 } // namespace
@@ -1175,7 +1391,7 @@ void kpool_mixed_write(aiter_tensor_t& kv_cache,
         }
     }
 
-    TailArgs ta{nullptr, 0, 0, pool_size, -1};
+    TailArgs ta{nullptr, 0, 0, 0, 0};  // unused when neither decode nor seeding runs
     bool tail_vec = true;
     if(has_decode || seed)
     {
@@ -1191,7 +1407,7 @@ void kpool_mixed_write(aiter_tensor_t& kv_cache,
                    aligned(tail_kv_cache->data_ptr(), tail_kv_cache->stride(1), 2, 4);
     }
 
-    DecodeArgs da{nullptr, nullptr, 0, 0, 0, 0, nullptr, nullptr, nullptr, 0, 0};
+    DecodeArgs da{nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0};
     bool dec_vec = true;
     if(has_decode)
     {
