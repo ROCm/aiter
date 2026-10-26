@@ -4,7 +4,6 @@
 
 import json
 import shutil
-import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +11,7 @@ import pytest
 import torch
 
 from aiter.ops.triton._triton_kernels.attention import mha as kernels
+from aiter.ops.triton.attention import mha as wrapper
 from aiter.ops.triton.utils.config_utils import load_config_json
 
 DEFAULT = (
@@ -25,51 +25,32 @@ SMALL, LARGE = dict(FWD["small_head"]), dict(FWD["pe"])
 SHAPE_FILE = "MHA-DQ=128-DV=128-CAUSAL=1.json"
 
 
+def clear_caches():
+    kernels._get_config.cache_clear()
+    load_config_json.cache_clear()
+
+
 @pytest.fixture
-def config_dir():
-    with tempfile.TemporaryDirectory() as directory:
-        shutil.copy(DEFAULT, directory)
-        (Path(directory) / SHAPE_FILE).write_text(
-            json.dumps(
-                {
-                    "DEFAULT_FALLBACK": True,
-                    "SK_LEQ_4096": LARGE,
-                    "SK_LEQ_1024": SMALL,
-                    "SK_LEQ_4k": SMALL,
-                }
-            )
-        )
-        kernels._get_config.cache_clear()
-        load_config_json.cache_clear()
-        with mock.patch.object(kernels, "resolve_config_dir", return_value=directory):
-            yield Path(directory)
-        kernels._get_config.cache_clear()
-        load_config_json.cache_clear()
+def config_dir(tmp_path):
+    shutil.copy(DEFAULT, tmp_path)
+    table = {"DEFAULT_FALLBACK": True, "SK_LEQ_4096": LARGE, "SK_LEQ_1024": SMALL}
+    table["SK_LEQ_4k"] = SMALL
+    (tmp_path / SHAPE_FILE).write_text(json.dumps(table))
+    clear_caches()
+    with mock.patch.object(kernels, "resolve_config_dir", return_value=str(tmp_path)):
+        yield tmp_path
+    clear_caches()
 
 
 def resolve(**overrides):
-    arguments = {
-        "enable_dropout": False,
-        "dtype": torch.bfloat16,
-        "has_pe": False,
-        "head_dim_v": 128,
-        "causal": True,
-        "max_seqlen_q": 2048,
-        "max_seqlen_k": 2048,
-        "batch_heads": 64,
-        "head_dim_qk": 128,
-    }
+    arguments = {"enable_dropout": False, "dtype": torch.bfloat16, "has_pe": False}
+    arguments |= {"head_dim_v": 128, "causal": True, "max_seqlen_q": 2048}
+    arguments |= {"max_seqlen_k": 2048, "batch_heads": 64, "head_dim_qk": 128}
     return kernels._get_config(**{**arguments, **overrides})
 
 
 def default_bucket(**overrides):
-    return resolve(**overrides, head_dim_qk=None)
-
-
-def test_the_tuned_tiles_are_not_what_default_json_serves(config_dir):
-    assert SMALL != LARGE
-    for max_seqlen_k in (1, 1024, 1025, 4096, 4097):
-        assert default_bucket(max_seqlen_k=max_seqlen_k) not in (SMALL, LARGE)
+    return resolve(**{**overrides, "head_dim_qk": None})
 
 
 @pytest.mark.parametrize(
@@ -79,6 +60,7 @@ def test_the_tuned_tiles_are_not_what_default_json_serves(config_dir):
 def test_the_smallest_bucket_that_holds_the_shape_serves_it(
     config_dir, max_seqlen_k, expected
 ):
+    assert default_bucket(max_seqlen_k=max_seqlen_k) != expected
     assert resolve(max_seqlen_k=max_seqlen_k) == expected
 
 
@@ -101,16 +83,82 @@ def test_a_bucket_whose_bound_is_not_an_integer_is_skipped(config_dir):
     assert "SK_LEQ_4k" in warning.call_args.args
 
 
-def test_another_head_dim_or_mask_has_no_file(config_dir):
-    assert resolve(causal=False) == default_bucket(causal=False)
-    assert resolve(head_dim_qk=192, has_pe=True) == default_bucket(has_pe=True)
+@pytest.mark.parametrize(
+    "overrides",
+    [{"causal": False}, {"head_dim_qk": 192, "has_pe": True}],
+)
+def test_another_head_dim_or_mask_has_no_file(config_dir, overrides):
+    assert resolve(**overrides) == default_bucket(**overrides)
 
 
-def test_only_bf16_reads_the_shape_file(config_dir):
-    # The harness tunes bf16; other dtypes keep the DEFAULT.json rules.
-    for dtype in (torch.float16, torch.float32):
-        assert resolve(dtype=dtype) == default_bucket(dtype=dtype)
+@pytest.mark.parametrize(
+    "overrides",
+    [{"dtype": torch.float16}, {"dtype": torch.float32}, {"enable_dropout": True}],
+)
+def test_only_bf16_without_dropout_reads_the_shape_file(config_dir, overrides):
+    assert resolve(**overrides) == default_bucket(**overrides)
 
 
-def test_dropout_keeps_its_default_json_bucket(config_dir):
-    assert resolve(enable_dropout=True) == default_bucket(enable_dropout=True)
+def test_the_public_resolver_serves_the_shape_file(config_dir):
+    tile = wrapper.get_mha_fwd_config(
+        torch.bfloat16, 128, 128, causal=True, max_seqlen_k=1024, batch_heads=64
+    )
+    assert tile == SMALL
+
+
+@pytest.mark.parametrize(
+    "dtype, head_dim_qk, is_fp8, has_pe",
+    [(torch.bfloat16, 192, False, True), (torch.float8_e4m3fn, 128, True, False)],
+)
+def test_the_public_resolver_asks_gluon_for_the_entrys_tile(
+    dtype, head_dim_qk, is_fp8, has_pe
+):
+    with (
+        mock.patch.object(wrapper.types.arch_info, "is_fp8_avail", return_value=True),
+        mock.patch.object(wrapper, "_get_gluon_config", return_value={"t": 1}) as get,
+    ):
+        tile = wrapper.get_mha_fwd_config(dtype, head_dim_qk, 128, backend="gluon")
+    assert tile == {"t": 1}
+    get.assert_called_once_with(is_fp8=is_fp8, has_pe=has_pe)
+
+
+def test_the_public_resolver_refuses_an_unknown_backend():
+    with pytest.raises(ValueError, match="Unknown MHA backend"):
+        wrapper.get_mha_fwd_config(torch.bfloat16, 128, 128, backend="Gluon")
+
+
+class _Resolved(Exception):
+    pass
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_the_varlen_forward_resolves_its_tile_through_the_public_resolver():
+    batch, nhead, seqlen, head_dim = 2, 4, 64, 128
+    q, k, v = (
+        torch.randn(
+            batch * seqlen, nhead, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        for _ in range(3)
+    )
+    cu_seqlens = torch.arange(
+        0, (batch + 1) * seqlen, seqlen, dtype=torch.int32, device="cuda"
+    )
+    with (
+        mock.patch.object(
+            wrapper, "get_mha_fwd_config", side_effect=_Resolved
+        ) as resolver,
+        pytest.raises(_Resolved),
+    ):
+        wrapper.flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, seqlen, seqlen, causal=True
+        )
+    resolver.assert_called_once_with(
+        torch.bfloat16,
+        head_dim,
+        head_dim,
+        causal=True,
+        dropout_p=0.0,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        batch_heads=batch * nhead,
+    )
