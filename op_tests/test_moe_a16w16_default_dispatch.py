@@ -5,8 +5,8 @@
 
 gfx942 A16W16 covers shards aligned to 64 but not 128 (for example 320).
 gfx950 fp8 stage2 covers shuffled inter_dim 384 (K=128) and 512 (K=256),
-rejects sizes that 128 does not divide, and rejects unshuffled plain fp8
-weights.
+rejects sizes that 128 does not divide, and rejects plain fp8 weights unless
+both w1 and w2 are shuffled. gfx950 int8 uses that same stage2 K selection.
 """
 
 import pytest
@@ -84,14 +84,14 @@ def test_qwen_mtp_tp2_ep1_default_dispatch(tokens):
     _check_moe(tokens, 2560, 320, 512, 10, None, torch.bfloat16)
 
 
-def _fp8_weight(weight, quant_type):
+def _quantized_weight(weight, quant_type, quant_dtype):
     # per_Tensor is one scale per expert. per_Token is one scale per row.
     source = (
         weight.view(weight.shape[0], -1)
         if quant_type == QuantType.per_Tensor
         else weight
     )
-    quantized, scale = pertoken_quant(source, quant_dtype=aiter_dtypes.fp8)
+    quantized, scale = pertoken_quant(source, quant_dtype=quant_dtype)
     return quantized.view(weight.shape), scale
 
 
@@ -104,7 +104,7 @@ def _rows(scale, rows):
     return scale.expand(-1, rows, 1).contiguous()
 
 
-def _gfx950_fp8_inputs(inter_dim, quant_type):
+def _gfx950_fp8_inputs(inter_dim, quant_type, quant_dtype=aiter_dtypes.fp8):
     torch.manual_seed(0)
     tokens, experts, topk, model_dim = 16, 8, 2, 896
     hidden = torch.randn(tokens, model_dim, device="cuda", dtype=torch.bfloat16)
@@ -122,8 +122,8 @@ def _gfx950_fp8_inputs(inter_dim, quant_type):
         torch.randn(tokens, experts, device="cuda"), dim=-1
     ).topk(topk, dim=-1)
     ids = ids.to(torch.int32)
-    w1q, w1_scale = _fp8_weight(w1, quant_type)
-    w2q, w2_scale = _fp8_weight(w2, quant_type)
+    w1q, w1_scale = _quantized_weight(w1, quant_type, quant_dtype)
+    w2q, w2_scale = _quantized_weight(w2, quant_type, quant_dtype)
     return hidden, w1q, w2q, w1_scale, w2_scale, weights, ids
 
 
@@ -150,8 +150,8 @@ def _call_gfx950_fp8(inter_dim, block_m, quant_type, *, shuffle, a1_scale, input
     )
 
 
-def _check_gfx950_fp8(inter_dim, block_m, quant_type):
-    inputs = _gfx950_fp8_inputs(inter_dim, quant_type)
+def _check_gfx950_fp8(inter_dim, block_m, quant_type, quant_dtype=aiter_dtypes.fp8):
+    inputs = _gfx950_fp8_inputs(inter_dim, quant_type, quant_dtype)
     hidden, w1q, w2q, w1_scale, w2_scale, weights, ids = inputs
     # This kernel reads the shuffled weight layout. The reference keeps the
     # original layout and the same scales.
@@ -212,3 +212,44 @@ def test_gfx950_fp8_rejects_unshuffled_weights(inter_dim, quant_type, static_sca
     )
     with pytest.raises(RuntimeError, match="shuffle_weight"):
         _call_gfx950_fp8(inter_dim, None, quant_type, shuffle=False, a1_scale=a1_scale)
+
+
+@pytest.mark.skipif(not _GFX950, reason="Exercises the gfx950 fp8 CK default dispatch")
+@pytest.mark.parametrize("shuffle_w1", [True, False])
+def test_gfx950_fp8_rejects_partially_shuffled_weights(shuffle_w1):
+    # Either mixed pair must fail. is_shuffled on only one weight used to
+    # satisfy the guard and let the other stage read the wrong layout.
+    hidden, w1q, w2q, w1_scale, w2_scale, weights, ids = _gfx950_fp8_inputs(
+        384, QuantType.per_Tensor
+    )
+    w1_in = shuffle_weight(w1q) if shuffle_w1 else w1q
+    w2_in = w2q if shuffle_w1 else shuffle_weight(w2q)
+    with pytest.raises(RuntimeError, match="both w1 and w2"):
+        fused_moe(
+            hidden,
+            w1_in,
+            w2_in,
+            weights,
+            ids,
+            quant_type=QuantType.per_Tensor,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            block_size_M=32,
+            dtype=torch.bfloat16,
+        )
+
+
+@pytest.mark.skipif(not _GFX950, reason="Exercises the gfx950 int8 CK default dispatch")
+@pytest.mark.parametrize("inter_dim", [384, 512])
+@pytest.mark.parametrize("block_m", [32, 64])
+def test_gfx950_int8_stage2_k_alignment(inter_dim, block_m):
+    # int8 shares a8w8_gfx950 with fp8. 384 selects K=128. 512 selects K=256.
+    _check_gfx950_fp8(
+        inter_dim, block_m, QuantType.per_Tensor, quant_dtype=aiter_dtypes.i8
+    )
+
+
+@pytest.mark.skipif(not _GFX950, reason="Exercises the gfx950 int8 CK default dispatch")
+def test_gfx950_int8_stage2_rejects_non_128():
+    with pytest.raises(RuntimeError, match="multiple of"):
+        _check_gfx950_fp8(192, 32, QuantType.per_Tensor, quant_dtype=aiter_dtypes.i8)

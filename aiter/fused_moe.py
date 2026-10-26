@@ -4481,18 +4481,22 @@ def get_2stage_cfgs(
                 activation=activation,
             )
         else:
-            # Plain fp8 CK instances read the shuffle_weight() layout. The
-            # preshuffle_off module name still selects those instances, so an
-            # unshuffled call would return a wrong tensor instead of failing.
+            # Plain fp8 CK instances read the shuffle_weight() layout on both
+            # w1 and w2. is_shuffled is true when either weight is tagged, so
+            # a mixed pair would skip this check and one stage would read the
+            # wrong layout. weights_shuffled is true only when both are tagged.
+            # gfx is the live device; get_gfx() follows GPU_ARCHS and can hide
+            # an actual gfx950 process from this guard.
             if (
-                get_gfx() == "gfx950"
+                gfx == "gfx950"
                 and q_dtype_w == dtypes.fp8
                 and q_type in (QuantType.per_Tensor, QuantType.per_Token)
-                and not is_shuffled
+                and not weights_shuffled
             ):
                 raise RuntimeError(
-                    "gfx950 fp8 CK MoE reads the shuffle_weight() layout; "
-                    "unshuffled per_Tensor and per_Token weights are unsupported"
+                    "gfx950 fp8 CK MoE reads the shuffle_weight() layout on "
+                    "both w1 and w2; unshuffled per_Tensor and per_Token "
+                    "weights are unsupported"
                 )
             stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
