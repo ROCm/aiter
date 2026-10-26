@@ -156,6 +156,12 @@ int32_t sm_attach_v3(uint32_t rank, void* comm, void* rwin, void* rlocal, void* 
         c->dgpeers = d; c->dgpeers_owned = true;
     }
     if (hipMalloc(reinterpret_cast<void**>(&c->P), sizeof(float) * SM_SK * SM_MP * SM_N) != hipSuccess) { sm_log("P", "hipMalloc rc=FAIL"); return E_HIP; }
+#ifdef SM_STAMPS_HOST
+    // SM_STAMPS diagnostic build only (default OFF: not compiled, the normal binary is unchanged): the fusion path attaches here, so it must allocate the rotating debug buffer like the harness sm_create_v1.
+    // Zero-initialised (dbg[0] = replay counter); SmDev.dbg (bind) and SmGemmArgsV1.dbg (launch) read c->dbg; sm_dbg_read_v1 returns it; sm_free_v1 frees it.
+    if (hipMalloc(reinterpret_cast<void**>(&c->dbg), sizeof(uint64_t) * SM_DBG_TOTAL_WORDS) != hipSuccess || hipMemset(c->dbg, 0, sizeof(uint64_t) * SM_DBG_TOTAL_WORDS) != hipSuccess) { sm_log("dbg", "rc=FAIL"); return E_HIP; }
+    sm_log("dbg", "rc=OK words=%u (attach_v3)", (unsigned)SM_DBG_TOTAL_WORDS);
+#endif
     if (!sm_image_matches(gemm_hsaco, SM_EXPECTED_GEMM_SHA256) || !sm_image_matches(ran_hsaco, SM_EXPECTED_RAN_SHA256)) { sm_log("bundle", "rc=FAIL image hash mismatch"); return E_HASH; }
     if (hipModuleLoad(&c->mg, gemm_hsaco) != hipSuccess || hipModuleLoad(&c->mr, ran_hsaco) != hipSuccess) { sm_log("module", "rc=FAIL"); return E_HIP; }
     if (hipModuleGetFunction(&c->fg, c->mg, "sm_gemm_v1") != hipSuccess || hipModuleGetFunction(&c->fr, c->mr, "sm_ran_v3") != hipSuccess) { sm_log("resolve", "rc=FAIL"); return E_HIP; }

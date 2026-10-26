@@ -75,7 +75,7 @@ def test_profile_rows_exact_and_distinct():
     prof = profmod.load_profile(PROFILE)
     small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
     assert (
-        len(small) == 24 == len(specs.small_exact_cells())
+        len(small) == 27 == len(specs.small_exact_cells())
     )  # 6 tuned + 15 P2 copies (m 1, 2, 4, 8, 12) + 3 r20 rows (m 64)
     for (mode, T), (vid, params) in specs.SMALL_CELLS.items():
         r = prof.lookup(specs.sp_qkv_spec(mode).signature(), "gfx950", 256, 4, T // 4)
@@ -258,11 +258,21 @@ def test_small_variant_registers_and_contract(monkeypatch):
         PROFILE,
     )
     assert n == 2 and plan.params["reuse_no_idx"] == 1
-    # not a validated cell -> native (m 1..64 all fuse: rows + the r19 / r20 rules; m 65..255 is native by design, incl. the default bucket m=128)
-    for m_native in (65, 100, 128, 255):
+    # not covered -> native (every local m 1..255 fuses: rows + the r19 / r20 / r22 / r23 rules; m 256..1023 is native by design, the large path starts at m=1024)
+    for m_native in (256, 300, 512, 1000):
         assert match_prefix(
             spec, MatchCtx("gfx950", 256, 4, m_native, frozenset({"mori_cco"})), PROFILE
         ) == (None, 0), m_native
+    # m 129..255 is the r23 (MP256) rule: it needs the bypass capability like every MP64 / 128 / 256 source, and resolves to an r23 plan with it
+    for m_r23 in (129, 200, 255):
+        with pytest.raises(ContractError, match="gfx950_sc_bypass"):
+            match_prefix(
+                spec,
+                MatchCtx("gfx950", 256, 4, m_r23, frozenset({"mori_cco"})),
+                PROFILE,
+            )
+        p23, n23 = match_prefix(spec, ok_ctx_for(m_r23), PROFILE)
+        assert n23 == 2 and (p23.src, p23.mp) == ("r23", 256), m_r23
     # the MP64 rule: m=48 resolves to the r20 plan, which needs the bypass capability (R2 is gfx950-only)
     with pytest.raises(ContractError, match="gfx950_sc_bypass"):
         match_prefix(
@@ -281,13 +291,13 @@ def test_small_variant_registers_and_contract(monkeypatch):
 
 
 # ======================================================================= large-M (S2-2b-iii)
-def test_profile_has_111_rows_and_large_prefix_signatures():
+def test_profile_has_114_rows_and_large_prefix_signatures():
     """24 small rows (see test_small_profile_rows...) + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep, src r12)."""
     from aiter.ops.gemm_fusion.sp_qkv import p1_sweep
 
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 111  # 24 small + 87 large
+    assert len(prof) == 114  # 27 small + 87 large
     assert (
         len(p1_sweep.P1_GRID) == 29
         and sum(len(v) for v in p1_sweep.P1_BEST.values()) == 87
@@ -927,10 +937,18 @@ def _plan_for(vid_mode, T, large):
             MatchCtx("gfx950", 256, 4, T // 4, caps),
         )
     cells = {(md, m): params for md, m, _vid, params in specs.small_exact_cells()}
-    return v.SpQkvSmall(  # the PROFILE's params of this cell (src r19 / r20), not the pre-R12 SMALL_CELLS ones
+    m_cell = T // 4
+    params = cells.get((vid_mode, m_cell))
+    if params is None:  # a cell only a RANGE RULE covers (r23: local m 129..255)
+        params = next(
+            r["params"]
+            for r in specs.small_range_rules()
+            if r["mode"] == vid_mode and r["m_min"] <= m_cell <= r["m_max"]
+        )
+    return v.SpQkvSmall(  # the PROFILE's params of this cell (src r19 / r20 / r22 / r23), not the pre-R12 SMALL_CELLS ones
         sp,
-        cells[(vid_mode, T // 4)],
-        MatchCtx("gfx950", 256, 4, T // 4, caps),
+        params,
+        MatchCtx("gfx950", 256, 4, m_cell, caps),
     )
 
 
@@ -942,6 +960,11 @@ def _small_owner_cells():
         if key not in seen:
             seen.add(key)
             out.append((mode, 4 * m))
+    for r in specs.small_range_rules():  # owners only a range rule implies (r23)
+        key = (r["mode"], tuple(sorted(r["params"].items())))
+        if key not in seen:
+            seen.add(key)
+            out.append((r["mode"], 4 * r["m_min"]))
     return out
 
 
@@ -1057,7 +1080,7 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
         )
         + 1  # every R12 plan requests the SAME per-comm global page: one window
     )
-    assert wb["max_windows"] == n_windows == 46
+    assert wb["max_windows"] == n_windows == 58
     assert wb["window_bytes"] % (4 << 20) == 0 and wb["window_bytes"] == max(
         r.bytes for v in reqs.values() for r in v
     )
@@ -1069,18 +1092,18 @@ def test_uniform_policy_reproduces_phase1_equal_layout(monkeypatch):
     r = make_res(
         dist=d, backend=be, profile=PROFILE, policy="uniform"
     )  # A-3: arena is the default; uniform stays selectable
-    assert r.window_bytes == wb["window_bytes"] and r.max_windows == 46
+    assert r.window_bytes == wb["window_bytes"] and r.max_windows == 58
     assert (
-        be.heap == heap_bytes_for(wb["window_bytes"], 46)
+        be.heap == heap_bytes_for(wb["window_bytes"], 58)
         and be.heap % (4 << 30) == 0
-        and be.heap >= 46 * wb["window_bytes"] + (256 << 20)
+        and be.heap >= 58 * wb["window_bytes"] + (256 << 20)
     )
     for (
         owner,
         rq,
     ) in reqs.items():  # register ALL 15 plans (the gate02 sequence), in any order
         r.ensure(owner, rq)
-    assert len(be.offsets) == 46 and set(be.sizes) == {
+    assert len(be.offsets) == 58 and set(be.sizes) == {
         wb["window_bytes"]
     }  # every window equal, 4 MiB multiple
     assert all(
@@ -1761,12 +1784,12 @@ def test_fusion_resources_budget_from_explicit_profile_with_env_unset(monkeypatc
         d, be = FakeDist(), FirstFitBackend(0)
         r = make_res(dist=d, backend=be, profile=prof, policy="uniform")
         assert (
-            r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 46
+            r.window_bytes == 171966464 == 164 << 20 and r.max_windows == 58
         )  # the shipped profile's own numbers
         assert r.profile is not None and r.profile.name == "minimax_m3_sp4_gfx950_v1"
         assert be.heap == heap_bytes_for(
-            171966464, 40
-        ) and be.heap >= 40 * 171966464 + (256 << 20)
+            171966464, 58
+        ) and be.heap >= 58 * 171966464 + (256 << 20)
         # the failing ATOM sequence: a 4 MiB small plan first, then a 40 MiB large plan: both fit the 164 MiB uniform window
         r.ensure(
             "small",
@@ -1790,7 +1813,7 @@ def test_profile_name_resolves_without_env(monkeypatch):
     r = make_res(
         dist=FakeDist(), backend=FirstFitBackend(0), profile="minimax_m3_sp4_gfx950_v1"
     )  # a bare name -> configs/gemm_fusion/<name>.json
-    assert r.window_bytes == 171966464 and r.max_windows == 46
+    assert r.window_bytes == 171966464 and r.max_windows == 58
 
 
 def test_env_profile_is_never_read_by_fusion_resources(monkeypatch):
@@ -2280,8 +2303,8 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     )  # ONE registration: the only size the comm ever sees
     A = r._arena
     assert (
-        A.bytes == 408 * MiB == r._arena_bytes and r.policy == "arena"
-    )  # 336 MiB shared S/R/C + page, 72 MiB of small windows (9 owners x 2 x 4 MiB: 6 r19/r18-family + 3 r20 MP64)
+        A.bytes == 468 * MiB == r._arena_bytes and r.policy == "arena"
+    )  # 336 MiB shared S/R/C + page, 132 MiB of small windows (15 owners: 27 x 4 MiB + 3 x 8 MiB, see the budget test)
     # views: inside the arena, 4 MiB aligned, pairwise disjoint (shared set once), local = arena.local + offset
     seen = {}
     for w in r._views:
@@ -2295,8 +2318,8 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     spans = sorted(seen.items())
     assert all(a + n <= b for (a, n), (b, _m) in pairwise(spans))  # disjoint
     assert (
-        sum(seen.values()) == 408 * MiB
-    )  # 12 small + shared S/R/C + the global page fill the arena exactly: the budget is exact
+        sum(seen.values()) == 468 * MiB
+    )  # 15 small + shared S/R/C + the global page fill the arena exactly: the budget is exact
     # every large owner got the SAME three views; the view struct reproduces arena + offset for local and peer addressing (stride/lsaRank unchanged)
     large = [o for o, _ in plans if o.startswith("sp_qkv.large/")]
     S0 = r.windows[large[0]][large[0] + "/S"]
@@ -2316,9 +2339,9 @@ def test_arena_registers_exactly_one_window_and_every_plan_window_is_a_view(
     n_views = len(r._views)
     be.log.clear()
     r.release()
-    assert n_views == 22 and len(be.freed) == 23 == len(
+    assert n_views == 34 and len(be.freed) == 35 == len(
         set(be.freed)
-    )  # 22 plan views (18 small + shared S/R/C + the global page) + the 1 view-self-test view, each freed exactly once
+    )  # 34 plan views (30 small + shared S/R/C + the global page) + the 1 view-self-test view, each freed exactly once
     assert (
         len([x for x in be.log if x[0] == "dereg"]) == 1 and r._views == []
     )  # the arena is the ONLY deregistered window
@@ -2790,7 +2813,7 @@ def test_A3_arena_is_the_default_and_only_uniform_stays_selectable(monkeypatch):
     assert (
         ru.policy == "uniform"
         and ru.policy_source == "explicit"
-        and ru._vmm == 8 << 30
+        and ru._vmm == 12 << 30
         and ru.policy_fallback_reason is None
     )  # 6.4 GiB: documented cost
     monkeypatch.delenv("AITER_GEMM_FUSION_WINDOW_POLICY")
@@ -2874,7 +2897,7 @@ def test_A1_abi_pin_mismatch_refuses_arena_at_construction_and_falls_back_to_uni
         undo()
     for r in (bad, explicit):
         assert (
-            r.policy == "uniform" and r._vmm == 8 << 30 and r.window_bytes == 171966464
+            r.policy == "uniform" and r._vmm == 12 << 30 and r.window_bytes == 171966464
         )  # uniform heap/budget from the profile
     assert (
         "MORI ABI pin mismatch" in bad.policy_fallback_reason
@@ -2943,8 +2966,8 @@ def test_A1_view_readback_mismatch_refuses_arena_and_rebuilds_the_comm_as_unifor
             be.creates == 2
         )  # the comm was destroyed and recreated: NO second window size on the arena's comm
         assert (
-            r._arena is None and r._views == [] and len(r._regs) == 46
-        )  # uniform: 40 equal windows (15 plans -> 39 windows + the global page)
+            r._arena is None and r._views == [] and len(r._regs) == 58
+        )  # uniform: 58 equal windows (15 small owners x 2 + 9 large x 3 + the global page)
         assert all(w.bytes == 171966464 for w in r._regs)
         assert any(
             "event=resources arena_refused" in m and "view read-back mismatch" in m
@@ -3227,7 +3250,7 @@ def test_init_images_written_before_finalize_survive_the_deferred_zeroing(monkey
     assert ev == ["init", "init", "init"]
 
 
-def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_408_mib_budget(
+def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_468_mib_budget(
     monkeypatch,
 ):
     for var in (
@@ -3246,10 +3269,10 @@ def test_policy_memory_log_lists_both_policies_and_the_arena_is_the_408_mib_budg
     assert (
         pm
         and "selected=arena" in pm[0]
-        and "uniform=7544MiB" in pm[0]
-        and "arena=408MiB" in pm[0]
+        and "uniform=9512MiB" in pm[0]
+        and "arena=468MiB" in pm[0]
     )
-    assert r._arena_size_from_budget() == 408 * MiB and r._vmm == 4 << 30
+    assert r._arena_size_from_budget() == 468 * MiB and r._vmm == 4 << 30
 
 
 # ---- test_utils: the aliasing assertion (C-S4) as free functions over a FusionResources
@@ -3372,9 +3395,9 @@ def test_test_utils_arena_probe_registers_once_checks_views_and_uses_rank_as_dev
     assert B.devs == [(0, 0), (1, 1), (2, 2), (3, 3)]  # HIP device = rank, NOT 0
     out = capsys.readouterr().out
     assert (
-        out.count("registrations=1 views=22") == 4
+        out.count("registrations=1 views=34") == 4
         and "result=FAIL" not in out
-        and out.count("view_winBase_ok=1") == 88
+        and out.count("view_winBase_ok=1") == 136
     )
     B.devs.clear()
     tu.run_arena(4 << 30, 2, 4, FakeDist(), B(), "x", device=5)
@@ -4087,22 +4110,30 @@ def test_inputs_small_accepts_pad_rows_staged_as_T_long_arrays_and_never_reads_v
 
 # ======================================================================= A1: R12 plumbing (jit/ABI tables, runtimes, abi 3 plans, profile, prebuild)
 def test_jit_abi_tables_sources_and_missing_source_error():
-    assert jit.SRCS == ("r17", "r18", "r19", "r20", "r21") and jit.LARGE_SRCS == (
+    assert jit.SRCS == (
+        "r17",
+        "r18",
+        "r19",
+        "r20",
+        "r21",
+        "r22",
+        "r23",
+    ) and jit.LARGE_SRCS == (
         "r11",
         "r12",
     )
-    assert [jit.src_abi("small", s) for s in jit.SRCS] == [2, 2, 3, 3, 3] and [
+    assert [jit.src_abi("small", s) for s in jit.SRCS] == [2, 2, 3, 3, 3, 3, 3] and [
         jit.src_abi("large", s) for s in jit.LARGE_SRCS
     ] == [2, 3]
     with pytest.raises(ValueError, match="not in"):
-        jit.src_abi("small", "r22")
+        jit.src_abi("small", "r24")
     # r19 is derived from r18: it accepts the r18-only flags; r17 still rejects them
     _d, h = jit.small_defs({"src": "r19", "b_rowsplit": 1, "rx_bypass": 1}, "dense")
     assert "-DSM_B_ROWSPLIT=1" in h and "-DSM_RX_BYPASS=1" in h
     with pytest.raises(ValueError, match="require src=r18 or r19"):
         jit.small_defs({"src": "r17", "b_rowsplit": 1}, "dense")
     with pytest.raises(ValueError, match="src"):
-        jit.small_defs({"src": "r22"}, "dense")
+        jit.small_defs({"src": "r24"}, "dense")
     # large: src is a parameter (default r11 for old profiles) and is validated
     assert jit.large_defs({"src": "r12", "n": 2}, "dense") == jit.large_defs(
         {"src": "r11", "n": 2}, "dense"
@@ -4876,19 +4907,20 @@ def test_profile_selects_r12_for_large_rows_and_rules_and_budgets_the_page():
         "r12"
     }  # 87 exact rows + the 9 fallback rules
     small = [e for e in prof.rows() if e.vid == "sp_qkv.small.v1"]
-    assert len(small) == 24 and {dict(e.params)["src"] for e in small} == {
+    assert len(small) == 27 and {dict(e.params)["src"] for e in small} == {
         "r19",
         "r20",
+        "r22",
     }  # r19 for local m <= 32, r20 (MP64) at m=64; r17/r18 stay selectable per row
     wb = prof.meta["window_budget"]
-    assert wb["shared"]["gf.global"] == 4 << 20 and wb["max_windows"] == 46
+    assert wb["shared"]["gf.global"] == 4 << 20 and wb["max_windows"] == 58
     assert (
         specs.large_cell_params("dense", 8192)
         == {**specs.LARGE_CELLS[("dense", 8192)][1], "src": "r12"}
         and specs.LARGE_PROFILE_SRC == "r12"
     )
-    # the arena is the sum of the shared set and the small windows: 384 MiB (336 shared + 72 small)
-    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 408 << 20
+    # the arena is the sum of the shared set and the small windows: 468 MiB (336 shared + 132 small)
+    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 468 << 20
 
 
 def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
@@ -4933,8 +4965,8 @@ def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
         _forget_sp_modules()  # a fresh import registers the variants (and their prebuild hooks) into this scratch catalog
         units, skipped = engine.plan_profile(PROFILE, recipe="aot1", tool=TOOL_SIM)
         assert (
-            skipped == [] and len(units) == 12
-        )  # 6 small (r19) + 3 small (r20) + 2 large (r12) + the comm
+            skipped == [] and len(units) == 18
+        )  # 6 small (r19) + 3 (r20) + 3 (r22) + 3 (r23) + 2 large (r12) + the comm
         assert {u.meta["src"] for u in units if u.kind == "sp_qkv.large.v1"} == {"r12"}
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -5050,7 +5082,7 @@ def test_profile_small_rows_run_r19_with_the_r18_family_flags_and_one_unit_each(
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
-    assert len(small) == 24
+    assert len(small) == 27
     for (mode, T), (_vid, legacy) in specs.SMALL_CELLS.items():
         row_params = dict(
             prof.lookup(
@@ -5076,9 +5108,9 @@ def test_profile_small_rows_run_r19_with_the_r18_family_flags_and_one_unit_each(
     assert (
         skipped == []
         and len(smalls)
-        == 9  # 6 r19 owners (the P2 rows add none) + 3 r20 (MP64) owners
-        and {u.meta["src"] for u in smalls} == {"r19", "r20"}
-        and len({u.key for u in smalls}) == 9
+        == 15  # 6 r19 owners (the P2 rows add none) + 3 r20 (MP64) + 3 r22 (MP128) + 3 r23 (MP256) owners
+        and {u.meta["src"] for u in smalls} == {"r19", "r20", "r22", "r23"}
+        and len({u.key for u in smalls}) == 15
     )
     u = next(x for x in smalls if x.meta["src"] == "r19")
     gemm_cmd = jit.device_cmd_one("r19", u.meta["dev"], tool, "/out", "sm_gemm")
@@ -5100,10 +5132,18 @@ R20_PARAMS = {"src": "r20", "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
 
 
 def test_r20_flag_validation_mp_table_and_the_removed_shapes():
-    assert jit.SMALL_MP == {"r17": 32, "r18": 32, "r19": 32, "r20": 64, "r21": 128}
-    assert [jit.src_mp(s) for s in jit.SRCS] == [32, 32, 32, 64, 128]
+    assert jit.SMALL_MP == {
+        "r17": 32,
+        "r18": 32,
+        "r19": 32,
+        "r20": 64,
+        "r21": 128,
+        "r22": 128,
+        "r23": 256,
+    }
+    assert [jit.src_mp(s) for s in jit.SRCS] == [32, 32, 32, 64, 128, 128, 256]
     with pytest.raises(ValueError, match="not in"):
-        jit.src_mp("r22")
+        jit.src_mp("r24")
     # r20 builds with the profile's params: the bypass loads are REQUIRED, B_HEADS=1, no credit slow path
     dev, host = jit.small_defs(dict(R20_PARAMS), "dense")
     assert (
@@ -5248,7 +5288,7 @@ def test_r20_owner_is_one_per_mode_and_the_p2_rows_share_the_m16_owner(monkeypat
         owners.setdefault(mode, {})[m] = p.build_key
         assert (
             p.src == params["src"]
-            and p.mp == (64 if params["src"] == "r20" else 32)
+            and p.mp == {"r20": 64, "r21": 128, "r22": 128}.get(params["src"], 32)
             and p.abi == 3
         )
     for mode in specs.MODES:
@@ -5260,27 +5300,27 @@ def test_r20_owner_is_one_per_mode_and_the_p2_rows_share_the_m16_owner(monkeypat
             o[16],
             o[32],
         )  # the tuned m32 cell and the r20 owner are their own
+        assert o[128] not in (o[16], o[32], o[64])  # the r21 (MP128) owner is its own
     assert (
-        len({k for o in owners.values() for k in o.values()}) == 9
-    )  # 3 modes x (m16 group, m32, r20)
+        len({k for o in owners.values() for k in o.values()}) == 12
+    )  # 3 modes x (m16 group, m32, r20, r21)
 
 
-def test_window_budget_counts_the_nine_small_owners_and_the_mp64_geometry():
+def test_window_budget_counts_the_fifteen_small_owners_and_the_8mib_r23_views():
+    from collections import Counter
+
     clear_profile_cache()
     wb = profmod.load_profile(PROFILE).meta["window_budget"]
-    assert wb["small_owners"] == 9 and wb["large_owners"] == 9
-    assert (
-        wb["small_window_sizes"] == [4 << 20] * 18
-    )  # 9 owners x (rx + ctl), each a 4 MiB view (r20's 2.36 / 2.62 MB Rx fits)
-    assert wb["max_windows"] == 2 * 9 + 3 * 9 + 1 == 46
-    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 408 << 20
+    assert wb["small_owners"] == 15 and wb["large_owners"] == 9
+    # 12 owners x (rx + ctl) at 4 MiB (r19 / r20 / r22: the r22 MP128 Rx is 3 slots = one 4 MiB view) + 3 r23 owners x (8 MiB Rx view: 3 slots at MP256 = 6.75 / 7.5 MiB, 4 MiB ctl)
+    assert Counter(wb["small_window_sizes"]) == {4 << 20: 12 * 2 + 3, 8 << 20: 3}
+    assert wb["max_windows"] == 2 * 15 + 3 * 9 + 1 == 58
+    assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 468 << 20
     with open(profmod._resolve(PROFILE), encoding="utf-8") as f:
         doc = json.load(f)
     assert (
-        doc["native_m_ranges"] == [dict(r) for r in specs.NATIVE_M_RANGES]
-        and doc["native_m_ranges"][0]["m_min"] == 65
-        and doc["native_m_ranges"][0]["m_max"] == 255
-    )
+        doc["native_m_ranges"] == [] == [dict(r) for r in specs.NATIVE_M_RANGES]
+    )  # every local m 1..255 fuses (r22 + r23); m 256..1023 is outside the small envelope
 
 
 # ======================================================================= small/r21 (R13 MP128): src r21 owner / variant, 8 MiB Rx view, B_HEADS A/B
@@ -5311,7 +5351,7 @@ def test_r21_flag_validation_and_the_b_heads_ab():
             jit.small_defs({**R21_PARAMS, **bad}, "dense")
     with pytest.raises(ValueError, match=r"r20 requires nh in \(1,\)"):
         jit.small_defs({**R20_PARAMS, "nh": 2}, "dense")  # r20 keeps NH1 only
-    # the profile's params for r21 are the NH1 default; nh=2 builds are a DIFFERENT unit key (an A/B is a different owner too)
+    # small_r21_params(mode) is the NH1 form (R21_PARAMS); the shipped profile selects nh=2 (specs.SMALL_R21_PROFILE_NH); the two are DIFFERENT builds (unit keys) and owners
     assert (
         specs.small_r21_params("dense") == R21_PARAMS
         and specs.small_r21_params("dense", 2)["nh"] == 2
@@ -5597,7 +5637,7 @@ def test_ran_kernarg_x1_signature_header_host_launch_and_the_python_mirror_agree
     )
     mirror = [n for n, _t in small_rt.SmRanArgsV3._fields_]
     assert mirror[0] == "blk"  # kept for layout compatibility (the kernel ignores it)
-    for src in ("r19", "r20", "r21"):
+    for src in ("r19", "r20", "r21", "r22", "r23"):
         base = os.path.join(jit.CSRC, "small", src)
         header = _slurp(
             os.path.join(base, "interface", "sm_abi_v3.h"), encoding="utf-8"
@@ -5663,3 +5703,926 @@ def test_no_python_module_builds_ran_kernargs():
         ):
             users.append(os.path.basename(path))
     assert users == [], users
+
+
+# ======================================================================= small/r22 (R14 tuned MP128): a selectable source, NOT in the shipped profile
+R22_PARAMS = {"src": "r22", "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
+R22_KNOBS = ("b_quad", "gemm_bn128", "rx3")
+
+
+def test_r22_flags_knobs_and_explicit_defs():
+    assert (
+        jit.src_mp("r22") == 128
+        and jit.src_abi("small", "r22") == 3
+        and "r22" in jit.R18_FAMILY
+    )
+    dev, host = jit.small_defs(dict(R22_PARAMS), "indexer")
+    for flag in (
+        "-DSM_B_QUAD=1",
+        "-DSM_GEMM_BN128=1",
+        "-DSM_RX3=1",
+        "-DSM_T1_B_HEADS=1",
+        "-DSM_RX_BYPASS=1",
+    ):
+        assert (
+            flag in dev and flag in host
+        ), flag  # grid / Rx size are compile-time: the HOST gets them too
+    assert "-DSM_NO_CREDIT=1" in dev
+    # nh in {1, 2}: passed explicitly, a different build each
+    d2, _h2 = jit.small_defs({**R22_PARAMS, "nh": 2}, "dense")
+    assert "-DSM_T1_B_HEADS=2" in d2 and "-DSM_T1_B_HEADS=1" not in d2
+    for bad in (0, 3, 4):
+        with pytest.raises(
+            ValueError, match=rf"r22 requires nh in \(1, 2\) \(B_HEADS\), got {bad}"
+        ):
+            jit.small_defs({**R22_PARAMS, "nh": bad}, "dense")
+    # the A/B knobs (0 = the r21 behaviour): explicit flags, a different cache key, validated
+    ab = {**R22_PARAMS, "b_quad": 0, "gemm_bn128": 0, "rx3": 0}
+    dev_ab, host_ab = jit.small_defs(ab, "dense")
+    for flag in ("-DSM_B_QUAD=0", "-DSM_GEMM_BN128=0", "-DSM_RX3=0"):
+        assert (
+            flag in dev_ab
+            and flag in host_ab
+            and flag.replace("=0", "=1") not in dev_ab
+        )
+    dev1, host1 = jit.small_defs(dict(R22_PARAMS), "dense")
+    tool = dict(TOOL_SIM)
+    assert jit.cache_key("r22", dev_ab, host_ab, tool) != jit.cache_key(
+        "r22", dev1, host1, tool
+    )
+    for k in R22_KNOBS:
+        with pytest.raises(ValueError, match=rf"r22 \['{k}'\] must be 0 or 1"):
+            jit.small_defs({**R22_PARAMS, k: 2}, "dense")
+        for src in ("r19", "r20", "r21"):
+            with pytest.raises(ValueError, match=rf"\['{k}'\] exist only in src r22"):
+                jit.small_defs(
+                    {
+                        "src": src,
+                        "sk": 3,
+                        "nh": 1,
+                        "no_credit": 1,
+                        "rx_bypass": 1,
+                        k: 1,
+                    },
+                    "dense",
+                )
+    # the same refusals as r20 / r21
+    for bad, match in (
+        ({"push8": 1}, r"r22 has no \['push8'\]"),
+        ({"push_halves": 1}, r"r22 has no \['push_halves'\]"),
+        ({"b_rowsplit": 1}, r"r22 has no \['b_rowsplit'\]"),
+        ({"rx_bypass": 0}, "r22 requires rx_bypass=1"),
+        ({"no_credit": 0}, "SM_NO_CREDIT must be 1"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            jit.small_defs({**R22_PARAMS, **bad}, "dense")
+    # the specs helper
+    # the PROFILE arm (GPU: BN64 is the best MP128 arm, BN128 a net loss): the options explicit at b_quad 1, gemm_bn128 0, rx3 1
+    prof_params = {
+        **R22_PARAMS,
+        "b_quad": 1,
+        "gemm_bn128": 0,
+        "rx3": 1,
+        "p_nt": 2,
+        "push_passtrip": 1,
+    }
+    assert (
+        specs.small_r22_params("dense") == prof_params
+        and specs.small_r22_params("reuse", 2)["nh"] == 2
+    )
+    dev_p, host_p = jit.small_defs(prof_params, "dense")
+    for flag in ("-DSM_B_QUAD=1", "-DSM_GEMM_BN128=0", "-DSM_RX3=1"):
+        assert flag in dev_p and flag in host_p, flag
+    # a row that does not set the knob keeps the source default (gemm_bn128 1): the profile is explicit, not implicit
+    assert "-DSM_GEMM_BN128=1" in jit.small_defs(dict(R22_PARAMS), "dense")[0]
+    with pytest.raises(ValueError, match="r22 supports nh in"):
+        specs.small_r22_params("dense", 3)
+    assert (
+        specs.SMALL_R22_IN_PROFILE is True
+        and specs.SMALL_R22_PROFILE_NH == 1
+        and specs.SMALL_R21_IN_PROFILE is False
+    )
+
+
+def test_r22_geometry_three_slot_rx_fits_one_4mib_view_and_the_ab_needs_8():
+    from aiter.ops.gemm_fusion.sp_qkv import variants as v
+
+    assert (
+        v.small_rx_slots(R22_PARAMS) == 3
+        and v.small_rx_slots({**R22_PARAMS, "rx3": 0}) == 4
+    )
+    assert (
+        v.small_rx_slots({"src": "r21"}) == 4
+        and v.small_rx_slots({"src": "r22", "rx3": 1}) == 3
+    )
+    assert v.small_window_bytes("dense", 128, 3)["rx"] == 3_538_944
+    assert (
+        v.small_window_bytes("indexer", 128, 3)["rx"]
+        == v.small_window_bytes("reuse", 128, 3)["rx"]
+        == 3_932_160
+    )
+    assert (
+        v.small_window_bytes("dense", 128)["rx"] == 4_718_592
+    )  # the 4-slot default of every other source is unchanged
+    for mode in specs.MODES:
+        assert v.small_window_caps(mode, 128, 3) == (
+            4 << 20,
+            4 << 20,
+        )  # ONE 4 MiB view (r21: 8 MiB + 4 MiB)
+        assert v.small_window_caps(mode, 128, 4) == (
+            8 << 20,
+            4 << 20,
+        )  # rx3=0: the r21 geometry
+        assert v.small_p_bytes(mode, 128) == v.small_p_bytes(
+            mode, 128, 3
+        )  # P is byte-identical to r21 (BN128 by construction)
+    assert (
+        v.small_p_bytes("dense", 128) == 14_155_776
+        and v.small_p_bytes("indexer", 128) == 15_138_816
+    )
+
+
+def _real_context(monkeypatch, src, T, extra, reported_rx, caps=None):
+    """A r22 plan whose REAL _context runs against fakes; `reported_rx` is what the fake driver's sm_info_v1[0] says. Patches the module obtained AFTER the rig (it re-imports)."""
+    plan, *_ = _binding_rig(
+        monkeypatch, "dense", T, src, {"rx_bypass": 1, **(extra or {})}
+    )
+    del plan._context
+    v = sys.modules["aiter.ops.gemm_fusion.sp_qkv.variants"]
+    from aiter.ops.gemm_fusion.sp_qkv import small_rt as srt
+
+    exp = v.small_window_bytes("dense", plan.mp, plan.rx_slots)
+    monkeypatch.setattr(
+        v,
+        "build_small",
+        lambda params, mode: types.SimpleNamespace(
+            driver_so="d.so", gemm_hsaco="g.hsaco", ran_hsaco="r.hsaco"
+        ),
+    )
+    lib = _FakeCDLL()
+    monkeypatch.setattr(srt, "load_driver", lambda path, abi=2: lib)
+    monkeypatch.setattr(
+        srt, "info", lambda lib_: {"rx_bytes": reported_rx, "ctl_bytes": exp["ctl"]}
+    )
+    if caps is not None:
+        monkeypatch.setattr(v, "small_window_caps", caps)
+    wins = {
+        plan.owner + "/rx": types.SimpleNamespace(handle=1, local=0x100),
+        plan.owner + "/ctl": types.SimpleNamespace(handle=2, local=0x200),
+    }
+    return plan, lib, _FakeRes(wins), exp
+
+
+def _r22_real_context(monkeypatch, extra, reported_rx, caps=None):
+    return _real_context(monkeypatch, "r22", 512, extra, reported_rx, caps)
+
+
+def test_r22_plan_requests_the_4mib_view_and_the_context_checks_sm_info_rx_bytes(
+    monkeypatch,
+):
+    for extra, slots, rx_bytes, cap, stale in (
+        (None, 3, 3_538_944, 4 << 20, 4_718_592),
+        ({"rx3": 0}, 4, 4_718_592, 8 << 20, 3_538_944),
+    ):
+        plan, lib, res, exp = _r22_real_context(monkeypatch, extra, rx_bytes)
+        assert (plan.src, plan.abi, plan.mp, plan.rx_slots) == (
+            "r22",
+            3,
+            128,
+            slots,
+        ) and exp["rx"] == rx_bytes
+        reqs = plan.resources()
+        assert (
+            reqs[0].bytes == cap and reqs[1].bytes == 4 << 20
+        )  # Rx view / control window
+        # sm_info_v1[0] is the compiled Rx size: equal to the analytic number -> attaches
+        plan._context(res)
+        assert lib.calls[-1][0] == "sm_attach_v3"
+        # a build whose Rx differs (the other slot count's size, a stale library) is refused before attach
+        plan2, lib2, res2, _exp2 = _r22_real_context(monkeypatch, extra, stale)
+        with pytest.raises(RuntimeError, match="compiled geometry"):
+            plan2._context(res2)
+        assert not any(c[0] == "sm_attach_v3" for c in lib2.calls)
+    # ... and the compiled Rx must FIT the view the owner requested
+    plan3, _lib3, res3, _exp3 = _r22_real_context(
+        monkeypatch,
+        None,
+        3_538_944,
+        caps=lambda mode, mp=None, rx_slots=4: (1 << 20, 4 << 20),
+    )
+    with pytest.raises(
+        RuntimeError, match=r"does not fit the requested 1048576 B view"
+    ):
+        plan3._context(res3)
+
+
+def test_r22_header_drift_guards_knob_defaults_geometry_and_sm_info_layout():
+    import re
+
+    base = os.path.join(jit.CSRC, "small", "r22")
+    header = _slurp(os.path.join(base, "interface", "sm_abi_v3.h"), encoding="utf-8")
+    driver = _slurp(
+        os.path.join(jit.CSRC, "host", "sm_fusion_driver.cpp"), encoding="utf-8"
+    )
+    notes = _slurp(os.path.join(base, "NOTES-r22.md"), encoding="utf-8")
+    # SM_MP, the three knob defaults (what Python passes explicitly), the slot count and Rx byte expressions
+    assert (
+        int(re.search(r"#define SM_MP\s+(\d+)u", header).group(1))
+        == jit.SMALL_MP["r22"]
+        == 128
+    )
+    defaults = {
+        n: int(v)
+        for n, v in re.findall(
+            r"#ifndef SM_(B_QUAD|GEMM_BN128|RX3)\s*\n\s*#define SM_\1 (\d+)", header
+        )
+    }
+    assert defaults == {"B_QUAD": 1, "GEMM_BN128": 1, "RX3": 1}
+    dev, host = jit.small_defs(dict(R22_PARAMS), "dense")
+    assert {f"-DSM_{k}={v}" for k, v in defaults.items()} <= set(dev) and {
+        f"-DSM_{k}={v}" for k, v in defaults.items()
+    } <= set(host)
+    assert (
+        "#define SM_RX_SLOTS         (SM_RX3 ? 3u : 4u)" in header
+        and "(2u*SM_RX_SLOTS*SM_MP*SM_F*2u)" in header
+    )
+    # the analytic Rx numbers appear in the notes (3 slots) and equal sm_info_v1[0] = RX_BYTES in the shared driver
+    from aiter.ops.gemm_fusion.sp_qkv import variants as v
+
+    for n in (
+        v.small_window_bytes("dense", 128, 3)["rx"],
+        v.small_window_bytes("indexer", 128, 3)["rx"],
+    ):
+        assert f"{n:,}" in notes, n
+    assert "out7[0] = RX_BYTES;" in driver and 'keys = ("rx_bytes"' in _slurp(
+        os.path.join(os.path.dirname(jit.__file__), "small_rt.py"), encoding="utf-8"
+    )
+    # the SM_PUSH_PAR / push shapes stay refused in the source and by Python
+    assert re.search(r"#if SM_PUSH_PAR\s*\n#error", header)
+
+
+# ======================================================================= small/r23 (R14 MP256 v1): a selectable source, NOT in the shipped profile
+R23_PARAMS = {"src": "r23", "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
+
+
+def test_r23_flags_requirements_and_explicit_defs():
+    assert (
+        jit.src_mp("r23") == 256
+        and jit.src_abi("small", "r23") == 3
+        and "r23" in jit.R18_FAMILY
+    )
+    dev, host = jit.small_defs(dict(R23_PARAMS), "indexer")
+    for flag in (
+        "-DSM_B_QUAD=1",
+        "-DSM_GEMM_BN128=0",  # the r23 default: BM256 x BN64 (BN128 measured a net loss)
+        "-DSM_GEMM_PFK=4",  # BN64: PFK4 = 4 x (32 + 8) KiB = 160 KiB, the default
+        "-DSM_RX3=1",
+        "-DSM_T1_B_HEADS=1",
+        "-DSM_RX_BYPASS=1",
+    ):
+        assert flag in dev and flag in host, flag
+    # nh in {1, 2}
+    d2, _h2 = jit.small_defs({**R23_PARAMS, "nh": 2}, "dense")
+    assert "-DSM_T1_B_HEADS=2" in d2
+    for bad in (0, 3):
+        with pytest.raises(
+            ValueError, match=rf"r23 requires nh in \(1, 2\) \(B_HEADS\), got {bad}"
+        ):
+            jit.small_defs({**R23_PARAMS, "nh": bad}, "dense")
+    # MP256 REQUIRES rx3 and b_quad (the header #errors): any 0 is refused before a compile, 1 is accepted explicitly; gemm_bn128 is OPTIONAL (0 = default)
+    for k in ("b_quad", "rx3"):
+        with pytest.raises(
+            ValueError, match=r"r23 \(MP256\) requires rx3=1 and b_quad=1"
+        ):
+            jit.small_defs({**R23_PARAMS, k: 0}, "dense")
+        same, _ = jit.small_defs({**R23_PARAMS, k: 1}, "dense")
+        assert same == jit.small_defs(dict(R23_PARAMS), "dense")[0]
+    for k in ("b_quad", "gemm_bn128", "rx3"):
+        with pytest.raises(ValueError, match=rf"r23 \['{k}'\] must be 0 or 1"):
+            jit.small_defs({**R23_PARAMS, k: 2}, "dense")
+    # gemm_bn128 in {0, 1} and the prefetch depth pfk in {3, 4}, each build explicit and distinct; BN128 x PFK4 does not fit the 160 KiB LDS
+    tool0 = dict(TOOL_SIM)
+    seen = {}
+    for bn, pfk, expect in (
+        (0, None, 4),
+        (0, 4, 4),
+        (0, 3, 3),
+        (1, None, 3),
+        (1, 3, 3),
+    ):
+        extra = {"gemm_bn128": bn, **({"pfk": pfk} if pfk else {})}
+        dv, hs = jit.small_defs({**R23_PARAMS, **extra}, "dense")
+        assert f"-DSM_GEMM_BN128={bn}" in dv and f"-DSM_GEMM_BN128={bn}" in hs
+        assert f"-DSM_GEMM_PFK={expect}" in dv and f"-DSM_GEMM_PFK={expect}" in hs
+        seen[(bn, expect)] = jit.cache_key("r23", dv, hs, tool0)
+    assert (
+        len(set(seen.values())) == 3
+    )  # (0, 4), (0, 3), (1, 3): three builds; the explicit default equals the implicit one
+    with pytest.raises(
+        ValueError, match=r"gemm_bn128=1 with pfk=4 needs 4 x 48 KiB = 192 KiB"
+    ):
+        jit.small_defs({**R23_PARAMS, "gemm_bn128": 1, "pfk": 4}, "dense")
+    for bad in (0, 2, 5):
+        with pytest.raises(ValueError, match=rf"r23 pfk must be 3 or 4, got {bad}"):
+            jit.small_defs({**R23_PARAMS, "pfk": bad}, "dense")
+    for src in ("r19", "r20", "r21", "r22"):
+        with pytest.raises(ValueError, match=r"\['pfk'\] exists only in src r23"):
+            jit.small_defs(
+                {
+                    "src": src,
+                    "sk": 3,
+                    "nh": 1,
+                    "no_credit": 1,
+                    "rx_bypass": 1,
+                    "pfk": 3,
+                },
+                "dense",
+            )
+    # the same refusals as r20 - r22
+    for bad, match in (
+        ({"push8": 1}, r"r23 has no \['push8'\]"),
+        ({"push_halves": 1}, r"r23 has no \['push_halves'\]"),
+        ({"b_rowsplit": 1}, r"r23 has no \['b_rowsplit'\]"),
+        ({"rx_bypass": 0}, "r23 requires rx_bypass=1"),
+        ({"no_credit": 0}, "SM_NO_CREDIT must be 1"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            jit.small_defs({**R23_PARAMS, **bad}, "dense")
+    # a different source is a different build; the knobs are still refused for r19 - r21
+    tool = dict(TOOL_SIM)
+    d22, h22 = jit.small_defs({**R23_PARAMS, "src": "r22", "gemm_bn128": 0}, "dense")
+    d23, h23 = jit.small_defs(dict(R23_PARAMS), "dense")
+    r23_only = (
+        "-DSM_GEMM_PFK=4",
+        "-DSM_IK_SEQ=0",
+        "-DSM_IK_RELOAD_P=0",
+    )  # r23's own explicit flags: prefetch depth + the indexer fallbacks (defaults); the push options are explicit for r22 too
+    drop = lambda xs: [x for x in xs if x not in r23_only]
+    assert (
+        "-DSM_GEMM_PFK=4" in d23 and "-DSM_GEMM_PFK=4" in h23 and "-DSM_IK_SEQ=0" in h23
+    )
+    assert (
+        drop(d23) == d22 and drop(h23) == h22
+    )  # r23 = r22's flags (BN64) + the explicit prefetch depth
+
+    assert jit.cache_key("r22", d22, h22, tool) != jit.cache_key("r23", d23, h23, tool)
+    with pytest.raises(ValueError, match=r"\['rx3'\] exist only in src r22 and r23"):
+        jit.small_defs(
+            {"src": "r21", "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1, "rx3": 1},
+            "dense",
+        )
+    # the specs helper
+    # the PREPARED PROFILE arm (SMALL_R23_IN_PROFILE still False): b_quad / rx3 required, BN64 PFK4, p_nt 2, push_passtrip 1, the same for every mode
+    r23_arm = {
+        **R23_PARAMS,
+        "b_quad": 1,
+        "rx3": 1,
+        "gemm_bn128": 0,
+        "pfk": 4,
+        "p_nt": 2,
+        "push_passtrip": 1,
+    }
+    assert all(specs.small_r23_params(m) == r23_arm for m in specs.MODES)
+    assert specs.small_r23_params("reuse", 2) == {**r23_arm, "nh": 2}
+    for mode in specs.MODES:
+        dev_arm, host_arm = jit.small_defs(specs.small_r23_params(mode), mode)
+        assert {
+            "-DSM_B_QUAD=1",
+            "-DSM_RX3=1",
+            "-DSM_GEMM_BN128=0",
+            "-DSM_GEMM_PFK=4",
+            "-DSM_P_NT=2",
+            "-DSM_PUSH_PASSTRIP=1",
+            "-DSM_PUSH_WS_LATE=0",
+        } <= set(dev_arm)
+        assert not any(
+            "P_NT" in x or "PUSH_PASSTRIP" in x for x in host_arm
+        )  # device-only options
+    with pytest.raises(ValueError, match="r23 supports nh in"):
+        specs.small_r23_params("dense", 3)
+    assert (
+        specs.SMALL_R23_IN_PROFILE is True
+        and specs.SMALL_R23_RULE_M == (129, 255)
+        and specs.SMALL_R23_PROFILE_NH == 1
+    )
+
+
+def test_r23_geometry_three_slot_rx_needs_the_8mib_view_and_p_is_28_30_mb():
+    from aiter.ops.gemm_fusion.sp_qkv import variants as v
+
+    assert (
+        v.small_rx_slots(R23_PARAMS) == 3
+        and v.small_rx_slots({**R23_PARAMS, "rx3": 1}) == 3
+    )
+    assert v.small_window_bytes("dense", 256, 3)["rx"] == 7_077_888
+    assert (
+        v.small_window_bytes("indexer", 256, 3)["rx"]
+        == v.small_window_bytes("reuse", 256, 3)["rx"]
+        == 7_864_320
+    )
+    assert (
+        v.small_window_bytes("dense", 256, 4)["rx"] == 9_437_184
+    )  # the 4-slot size the header refuses (> 8 MiB)
+    for mode in specs.MODES:
+        rx = v.small_window_bytes(mode, 256, 3)["rx"]
+        assert 4 << 20 < rx <= 8 << 20
+        assert v.small_window_caps(mode, 256, 3) == (
+            8 << 20,
+            4 << 20,
+        )  # ONE 8 MiB view + the 4 MiB control window
+    assert (
+        v.small_p_bytes("dense", 256) == 28_311_552
+        and v.small_p_bytes("indexer", 256)
+        == v.small_p_bytes("reuse", 256)
+        == 30_277_632
+    )
+
+
+def test_r23_plan_m_range_view_request_and_the_context_checks_sm_info_rx_bytes(
+    monkeypatch,
+):
+    from aiter.gemm_fusion import ContractError
+
+    plan, lib, res, exp = _real_context(monkeypatch, "r23", 1020, None, 7_077_888)
+    assert (plan.src, plan.abi, plan.mp, plan.rx_slots) == ("r23", 3, 256, 3) and exp[
+        "rx"
+    ] == 7_077_888
+    reqs = plan.resources()
+    assert (
+        reqs[0].bytes == 8 << 20 and reqs[1].bytes == 4 << 20
+    )  # Rx: the 8 MiB view; control: one granule
+    plan._context(res)
+    assert lib.calls[-1][0] == "sm_attach_v3"
+    # sm_info_v1[0] reporting the r22 (MP128) size for an MP256 plan: refused before attach
+    plan2, lib2, res2, _e = _real_context(monkeypatch, "r23", 1020, None, 3_538_944)
+    with pytest.raises(RuntimeError, match="compiled geometry"):
+        plan2._context(res2)
+    assert not any(c[0] == "sm_attach_v3" for c in lib2.calls)
+    # M range: 1..256 (m 129..256 is the target), 257 refused
+    caps = frozenset({"mori_cco", "gfx950_sc_bypass"})
+    v = sys.modules["aiter.ops.gemm_fusion.sp_qkv.variants"]
+    mk = lambda m: v.SpQkvSmall(
+        specs.sp_qkv_spec("dense"),
+        dict(R23_PARAMS),
+        MatchCtx("gfx950", 256, 4, m, caps),
+    )
+    assert mk(129).mp == 256 and mk(255).mp == 256 and mk(256).mp == 256
+    with pytest.raises(
+        ContractError, match=r"\(src r23\) supports local M 1\.\.256, got 257"
+    ):
+        mk(257)
+
+
+def test_r23_header_drift_guards_mp_iterations_requirements_and_geometry():
+    import re
+
+    base = os.path.join(jit.CSRC, "small", "r23")
+    header = _slurp(os.path.join(base, "interface", "sm_abi_v3.h"), encoding="utf-8")
+    notes = _slurp(os.path.join(base, "NOTES-r23.md"), encoding="utf-8")
+    assert (
+        int(re.search(r"#define SM_MP\s+(\d+)u", header).group(1))
+        == jit.SMALL_MP["r23"]
+        == 256
+    )
+    assert re.search(r"#define SM_ITERS\s+\(SM_MP / 128u\)", header)
+    defaults = {
+        n: int(v)
+        for n, v in re.findall(
+            r"#ifndef SM_(B_QUAD|GEMM_BN128|RX3)\s*\n\s*#define SM_\1 (\d+)", header
+        )
+    }
+    assert defaults == {"B_QUAD": 1, "GEMM_BN128": 0, "RX3": 1}  # r23: BN64 by default
+    assert "#define SM_GEMM_PFK (SM_GEMM_BN128 ? 3 : 4)" in header
+    for bn, pfk in (
+        (0, 4),
+        (1, 3),
+    ):  # the source's PFK default per BN == what Python passes explicitly
+        assert (
+            f"-DSM_GEMM_PFK={pfk}"
+            in jit.small_defs({**R23_PARAMS, "gemm_bn128": bn}, "dense")[0]
+        )
+    dev, host = jit.small_defs(dict(R23_PARAMS), "dense")
+    assert {f"-DSM_{k}={v}" for k, v in defaults.items()} <= set(dev) and {
+        f"-DSM_{k}={v}" for k, v in defaults.items()
+    } <= set(host)
+    # the MP256 #error and the knob combination Python refuses are the same set
+    assert re.search(
+        r'#if SM_MP > 128u && !\(SM_RX3 && SM_B_QUAD\)\s*\n#error "MP256 needs SM_RX3=1',
+        header,
+    )
+    assert (
+        "#define SM_RX_SLOTS         (SM_RX3 ? 3u : 4u)" in header
+        and "(2u*SM_RX_SLOTS*SM_MP*SM_F*2u)" in header
+    )
+    from aiter.ops.gemm_fusion.sp_qkv import variants as v
+
+    for n in (
+        v.small_window_bytes("dense", 256, 3)["rx"],
+        v.small_window_bytes("indexer", 256, 3)["rx"],
+    ):
+        assert f"{n:,}" in notes, n  # 7,077,888 / 7,864,320
+    assert "28.3 MB" in notes and "30.3 MB" in notes  # P, as analytic small_p_bytes
+
+
+# ======================================================================= r22 / r23: p_nt (P partial store flavour) and sk (split-K 2 | 3)
+def test_r22_r23_p_nt_and_sk_are_explicit_validated_and_refused_elsewhere():
+    from aiter.ops.gemm_fusion.sp_qkv import variants as v
+
+    tool = dict(TOOL_SIM)
+    for src in ("r22", "r23"):
+        base = {"src": src, "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
+        dev0, host0 = jit.small_defs(dict(base), "dense")
+        # defaults, passed EXPLICITLY: p_nt 0 (device only: the GEMM epilogue's store flavour), sk 3 (device AND host: P is [SK][MP][N])
+        assert (
+            "-DSM_P_NT=0" in dev0
+            and "-DSM_SK_CFG=3" in dev0
+            and "-DSM_SK_CFG=3" in host0
+        )
+        assert not any("P_NT" in x for x in host0)  # the host build never sees it
+        keys = {("p_nt", 0): jit.cache_key(src, dev0, host0, tool)}
+        for p_nt in (1, 2):
+            dev, host = jit.small_defs({**base, "p_nt": p_nt}, "dense")
+            assert (
+                f"-DSM_P_NT={p_nt}" in dev
+                and "-DSM_P_NT=0" not in dev
+                and not any("P_NT" in x for x in host)
+            )
+            keys[("p_nt", p_nt)] = jit.cache_key(src, dev, host, tool)
+        dev2, host2 = jit.small_defs({**base, "sk": 2}, "dense")
+        assert (
+            "-DSM_SK_CFG=2" in dev2
+            and "-DSM_SK_CFG=2" in host2
+            and "-DSM_SK_CFG=3" not in dev2
+        )
+        keys[("sk", 2)] = jit.cache_key(src, dev2, host2, tool)
+        assert len(set(keys.values())) == 4, keys  # every selection is its own build
+        for bad in (-1, 3, 4):
+            with pytest.raises(
+                ValueError, match=rf"{src} p_nt must be 0, 1 or 2, got {bad}"
+            ):
+                jit.small_defs({**base, "p_nt": bad}, "dense")
+        for bad in (0, 1, 4):
+            with pytest.raises(
+                ValueError, match=rf"{src} sk must be 2 or 3 \(SM_SK_CFG\), got {bad}"
+            ):
+                jit.small_defs({**base, "sk": bad}, "dense")
+    for src in ("r17", "r18", "r19", "r20", "r21"):
+        extra = (
+            {"rx_bypass": 1} if src not in ("r17", "r18") else {}
+        )  # r17 / r18 have no bypass loads: their own flag rule would fire first
+        with pytest.raises(
+            ValueError, match=r"\['p_nt'\] exists only in src r22 and r23"
+        ):
+            jit.small_defs(
+                {"src": src, "sk": 3, "nh": 1, "no_credit": 1, **extra, "p_nt": 1},
+                "dense",
+            )
+    # P is [SK][MP][N] fp32: split-K 2 is 2/3 of the 3-way bytes (the driver's allocation, not a window)
+    assert (
+        v.small_p_bytes("dense", 128, 2) == 9_437_184
+        and v.small_p_bytes("dense", 128, 3) == 14_155_776
+    )
+    assert (
+        v.small_p_bytes("indexer", 256, 2) == 20_185_088
+        and v.small_p_bytes("dense", 256, 2) == 18_874_368
+    )
+    # the profile arm: sk 3 (not set) and p_nt 2 (the GPU-measured better store flavour), device-only
+    dev_p, host_p = jit.small_defs(specs.small_r22_params("dense"), "dense")
+    assert (
+        "-DSM_P_NT=2" in dev_p
+        and "-DSM_P_NT=0" not in dev_p
+        and "-DSM_SK_CFG=3" in dev_p
+    )
+    assert not any("P_NT" in x for x in host_p)
+
+
+def test_p_nt_and_sk_drift_guards_for_the_r22_and_r23_headers_and_host():
+    import re
+
+    for src in ("r22", "r23"):
+        base = os.path.join(jit.CSRC, "small", src)
+        header = _slurp(
+            os.path.join(base, "interface", "sm_abi_v3.h"), encoding="utf-8"
+        )
+        assert (
+            int(
+                re.search(
+                    r"#ifndef SM_P_NT\s*\n\s*#define SM_P_NT (\d+)", header
+                ).group(1)
+            )
+            == 0
+        )  # == the explicit Python default
+        assert re.search(
+            r"#if SM_P_NT && SM_NT_STORES\s*\n#error", header
+        )  # Python never sets SM_NT_STORES (always 0), so P_NT cannot collide with it
+        assert (
+            "static_assert(SM_SK_CFG == 2 || SM_SK_CFG == 3" in header
+        )  # == the {2, 3} Python accepts
+        assert (
+            int(
+                re.search(
+                    r"#ifndef SM_SK_CFG\s*\n\s*#define SM_SK_CFG (\d+)", header
+                ).group(1)
+            )
+            == 3
+        )
+        # device-only: neither the per-source host driver nor the shared driver reads SM_P_NT
+        for host in (
+            os.path.join(base, "host", "driver_sm.cpp"),
+            os.path.join(jit.CSRC, "host", "sm_fusion_driver.cpp"),
+        ):
+            assert "SM_P_NT" not in _slurp(host, encoding="utf-8"), host
+        gemm = _slurp(os.path.join(base, "device", "sk_gemm_fp8.cu"), encoding="utf-8")
+        assert "SM_P_NT" in gemm  # the knob exists in the GEMM epilogue it controls
+
+
+def test_sm_diag_role_mask_is_an_evidence_only_macro_python_never_selects_it():
+    import re
+
+    # source: default 15 (every role compiled in), DIAGNOSTIC ONLY; r23 is the source that carries it
+    kernel = _slurp(
+        os.path.join(jit.CSRC, "small", "r23", "device", "ran_kernel.cu"),
+        encoding="utf-8",
+    )
+    assert re.search(
+        r"#ifndef SM_DIAG_ROLE_MASK\s*\n#define SM_DIAG_ROLE_MASK 15", kernel
+    )
+    assert "DIAGNOSTIC ONLY, never a candidate" in kernel
+    # Python: not a param (a profile row cannot select it) and never an emitted -D, for any source / mode / knob combination
+    for src in ("r19", "r20", "r21", "r22", "r23"):
+        base = {"src": src, "sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
+        for key in ("diag_role_mask", "SM_DIAG_ROLE_MASK", "role_mask"):
+            with pytest.raises(ValueError, match="unknown small-M params"):
+                jit.small_defs({**base, key: 0}, "dense")
+        for mode in specs.MODES:
+            dev, host = jit.small_defs(dict(base), mode)
+            assert not any("DIAG_ROLE_MASK" in x for x in dev + host), (src, mode)
+    # and no host source reads it (device-only, like SM_P_NT)
+    for host_src in (
+        os.path.join(jit.CSRC, "small", "r23", "host", "driver_sm.cpp"),
+        os.path.join(jit.CSRC, "host", "sm_fusion_driver.cpp"),
+    ):
+        assert "SM_DIAG_ROLE_MASK" not in _slurp(host_src, encoding="utf-8"), host_src
+
+
+# ======================================================================= r23 indexer RAN-spill fallbacks: ik_reload_p, ik_seq (opt-in, default 0)
+def test_r23_ik_reload_p_and_ik_seq_flags_routing_and_refusals():
+    tool = dict(TOOL_SIM)
+    ik = lambda xs: sorted(x for x in xs if "SM_IK_" in x)
+    dev0, host0 = jit.small_defs(dict(R23_PARAMS), "indexer")
+    # defaults, passed explicitly: SM_IK_SEQ to device AND host (the host computes the RAN grid), SM_IK_RELOAD_P to the device only
+    assert ik(dev0) == ["-DSM_IK_RELOAD_P=0", "-DSM_IK_SEQ=0"] and ik(host0) == [
+        "-DSM_IK_SEQ=0"
+    ]
+    keys = {(0, 0): jit.cache_key("r23", dev0, host0, tool)}
+    for seq, rel in ((1, 0), (0, 1), (1, 1)):
+        dev, host = jit.small_defs(
+            {**R23_PARAMS, "ik_seq": seq, "ik_reload_p": rel}, "indexer"
+        )
+        assert ik(dev) == sorted(
+            [f"-DSM_IK_RELOAD_P={rel}", f"-DSM_IK_SEQ={seq}"]
+        ) and ik(host) == [f"-DSM_IK_SEQ={seq}"]
+        keys[(seq, rel)] = jit.cache_key("r23", dev, host, tool)
+    assert len(set(keys.values())) == 4  # each combination is its own build
+    # the explicit default equals the implicit one
+    assert jit.small_defs({**R23_PARAMS, "ik_seq": 0, "ik_reload_p": 0}, "indexer") == (
+        dev0,
+        host0,
+    )
+    for k in ("ik_seq", "ik_reload_p"):
+        for bad in (2, -1):
+            with pytest.raises(ValueError, match=rf"r23 \['{k}'\] must be 0 or 1"):
+                jit.small_defs({**R23_PARAMS, k: bad}, "indexer")
+        for src in ("r19", "r20", "r21", "r22"):
+            with pytest.raises(ValueError, match=rf"\['{k}'\] exist only in src r23"):
+                jit.small_defs(
+                    {
+                        "src": src,
+                        "sk": 3,
+                        "nh": 1,
+                        "no_credit": 1,
+                        "rx_bypass": 1,
+                        k: 1,
+                    },
+                    "indexer",
+                )
+        # the IK owners exist only in the indexer build: 1 in dense / reuse would only duplicate a build, 0 is fine
+        for mode in ("dense", "reuse"):
+            with pytest.raises(
+                ValueError,
+                match=rf"r23 \['{k}'\] apply to the indexer build only \(IK owners\), not mode '{mode}'",
+            ):
+                jit.small_defs({**R23_PARAMS, k: 1}, mode)
+            jit.small_defs({**R23_PARAMS, k: 0}, mode)
+    # they compose with the other r23 knobs (bn128 / pfk / p_nt / nh)
+    dev, host = jit.small_defs(
+        {**R23_PARAMS, "ik_seq": 1, "gemm_bn128": 1, "p_nt": 2, "nh": 2}, "indexer"
+    )
+    assert (
+        "-DSM_IK_SEQ=1" in dev
+        and "-DSM_GEMM_BN128=1" in dev
+        and "-DSM_P_NT=2" in dev
+        and "-DSM_T1_B_HEADS=2" in host
+    )
+
+
+def test_r23_ik_header_drift_guards_and_the_host_hard_codes_no_ik_geometry():
+    import re
+
+    base = os.path.join(jit.CSRC, "small", "r23")
+    header = _slurp(os.path.join(base, "interface", "sm_abi_v3.h"), encoding="utf-8")
+    driver = _slurp(os.path.join(base, "host", "driver_sm.cpp"), encoding="utf-8")
+    shared = _slurp(
+        os.path.join(jit.CSRC, "host", "sm_fusion_driver.cpp"), encoding="utf-8"
+    )
+    kernel = _slurp(os.path.join(base, "device", "ran_kernel.cu"), encoding="utf-8")
+    # source defaults == the explicit Python defaults (0 / 0)
+    for macro in ("SM_IK_RELOAD_P", "SM_IK_SEQ"):
+        assert (
+            int(
+                re.search(
+                    rf"#ifndef {macro}\s*\n\s*#define {macro} (\d+)", header
+                ).group(1)
+            )
+            == 0
+        )
+    # the geometry the notes quote: IK owners = NPASS/2 x (SEQ ? ITERS : 1) = 4 / 8, indexer grid 248 / 252
+    assert (
+        "#define SM_T1_IK_WGS        ((SM_NPASS / 2u) * (SM_IK_SEQ ? SM_ITERS : 1u))"
+        in header
+    )
+    roles = _slurp(
+        os.path.join(base, "device", "layout", "t1_roles.hpp"), encoding="utf-8"
+    )
+    assert (
+        "248u + (SM_IK_SEQ ? 4u * (SM_ITERS - 1u) : 0u)" in roles
+    )  # the indexer B-quad grid static_assert: 248, 252 with SM_IK_SEQ
+    assert (
+        "grid 252" in header
+        and "SM_T1_IK_WGS = 8" in header
+        and "K = 16 + 8 = 24" in header
+    )  # the quoted ik_seq geometry
+    # the HOST takes the grid from the header macros at compile time: no literal IK_WGS / 228 / 248 / 252 in either driver, which is why SM_IK_SEQ must be in the HOST defs
+    assert "constexpr uint32_t RAN_GRID = SM_T1_GRID;" in driver
+    for text in (driver, shared):
+        assert not re.search(r"IK_WGS|\b(228|248|252)\b", text)
+    # SM_IK_RELOAD_P only changes the IK owner body (device); no header geometry and no host source reads it
+    assert (
+        "SM_IK_RELOAD_P" in kernel
+        and "SM_IK_RELOAD_P" not in driver
+        and "SM_IK_RELOAD_P" not in shared
+    )
+    # SM_IK_RELOAD_P appears in the header only as its default (#ifndef + #define): no geometry macro reads it
+    assert len(re.findall(r"SM_IK_RELOAD_P", re.sub(r"//[^\n]*", "", header))) == 2
+
+
+# ======================================================================= r23 push live-set options: push_passtrip, push_ws_late (opt-in, device only, any mode)
+def test_r23_push_options_flags_routing_modes_and_refusals():
+    tool = dict(TOOL_SIM)
+    pushf = lambda xs: sorted(x for x in xs if "PASSTRIP" in x or "WS_LATE" in x)
+    for (
+        mode
+    ) in specs.MODES:  # valid in every mode (the push role exists in all of them)
+        dev0, host0 = jit.small_defs(dict(R23_PARAMS), mode)
+        # defaults, passed EXPLICITLY, to the DEVICE build only (the push body changes, not the grid / K / windows)
+        assert (
+            pushf(dev0) == ["-DSM_PUSH_PASSTRIP=0", "-DSM_PUSH_WS_LATE=0"]
+            and pushf(host0) == []
+        )
+        keys = {(0, 0): jit.cache_key("r23", dev0, host0, tool)}
+        for trip, late in ((1, 0), (0, 1), (1, 1)):
+            dev, host = jit.small_defs(
+                {**R23_PARAMS, "push_passtrip": trip, "push_ws_late": late}, mode
+            )
+            assert (
+                pushf(dev)
+                == sorted([f"-DSM_PUSH_PASSTRIP={trip}", f"-DSM_PUSH_WS_LATE={late}"])
+                and pushf(host) == []
+            )
+            assert (
+                host == host0
+            )  # the host build is identical: nothing to rebuild there
+            keys[(trip, late)] = jit.cache_key("r23", dev, host, tool)
+        assert len(set(keys.values())) == 4  # each combination is its own device build
+        assert jit.small_defs(
+            {**R23_PARAMS, "push_passtrip": 0, "push_ws_late": 0}, mode
+        ) == (dev0, host0)
+    for k in ("push_passtrip", "push_ws_late"):
+        for bad in (2, -1):
+            with pytest.raises(ValueError, match=rf"r23 \['{k}'\] must be 0 or 1"):
+                jit.small_defs({**R23_PARAMS, k: bad}, "dense")
+        for src in ("r19", "r20", "r21"):
+            with pytest.raises(
+                ValueError, match=rf"\['{k}'\] exist only in src r22 and r23"
+            ):
+                jit.small_defs(
+                    {
+                        "src": src,
+                        "sk": 3,
+                        "nh": 1,
+                        "no_credit": 1,
+                        "rx_bypass": 1,
+                        k: 1,
+                    },
+                    "dense",
+                )
+    # they compose with the other r23 knobs
+    dev, host = jit.small_defs(
+        {
+            **R23_PARAMS,
+            "push_passtrip": 1,
+            "ik_seq": 1,
+            "gemm_bn128": 1,
+            "p_nt": 2,
+            "nh": 2,
+        },
+        "indexer",
+    )
+    assert {
+        "-DSM_PUSH_PASSTRIP=1",
+        "-DSM_IK_SEQ=1",
+        "-DSM_GEMM_BN128=1",
+        "-DSM_P_NT=2",
+    } <= set(dev) and "-DSM_IK_SEQ=1" in host
+
+
+def test_r23_push_options_header_drift_guards_and_device_only():
+    import re
+
+    base = os.path.join(jit.CSRC, "small", "r23")
+    header = _slurp(os.path.join(base, "interface", "sm_abi_v3.h"), encoding="utf-8")
+    kernel = _slurp(os.path.join(base, "device", "ran_kernel.cu"), encoding="utf-8")
+    for macro in ("SM_PUSH_PASSTRIP", "SM_PUSH_WS_LATE"):
+        assert (
+            int(
+                re.search(
+                    rf"#ifndef {macro}\s*\n\s*#define {macro} (\d+)", header
+                ).group(1)
+            )
+            == 0
+        )  # == the explicit Python defaults
+        assert macro in kernel  # the push body is what they change
+        # device-only: neither the host drivers, nor the role tables / grid / window geometry mention them
+        for path in (
+            os.path.join(base, "host", "driver_sm.cpp"),
+            os.path.join(jit.CSRC, "host", "sm_fusion_driver.cpp"),
+            os.path.join(base, "device", "layout", "t1_roles.hpp"),
+            os.path.join(base, "device", "layout", "ran_layouts.hpp"),
+        ):
+            assert macro not in _slurp(path, encoding="utf-8"), (macro, path)
+        assert (
+            len(re.findall(macro, re.sub(r"//[^\n]*", "", header))) == 2
+        )  # #ifndef + #define only: no geometry macro reads it
+
+
+def test_r22_push_options_flags_routing_modes_and_header_guards():
+    import re
+
+    tool = dict(TOOL_SIM)
+    pushf = lambda xs: sorted(x for x in xs if "PASSTRIP" in x or "WS_LATE" in x)
+    for mode in specs.MODES:
+        dev0, host0 = jit.small_defs(dict(R22_PARAMS), mode)
+        assert (
+            pushf(dev0) == ["-DSM_PUSH_PASSTRIP=0", "-DSM_PUSH_WS_LATE=0"]
+            and pushf(host0) == []
+        )  # explicit defaults, device only
+        keys = {(0, 0): jit.cache_key("r22", dev0, host0, tool)}
+        for trip, late in ((1, 0), (0, 1), (1, 1)):
+            dev, host = jit.small_defs(
+                {**R22_PARAMS, "push_passtrip": trip, "push_ws_late": late}, mode
+            )
+            assert (
+                pushf(dev)
+                == sorted([f"-DSM_PUSH_PASSTRIP={trip}", f"-DSM_PUSH_WS_LATE={late}"])
+                and host == host0
+            )
+            keys[(trip, late)] = jit.cache_key("r22", dev, host, tool)
+        assert len(set(keys.values())) == 4
+    for k in ("push_passtrip", "push_ws_late"):
+        with pytest.raises(ValueError, match=rf"r22 \['{k}'\] must be 0 or 1"):
+            jit.small_defs({**R22_PARAMS, k: 2}, "dense")
+    # the shipped r22 profile arm: push_passtrip 1 (all GPU gates passed), push_ws_late left at its default 0, both explicit and device-only
+    for mode in specs.MODES:
+        dev_p, host_p = jit.small_defs(specs.small_r22_params(mode), mode)
+        assert "-DSM_PUSH_PASSTRIP=1" in dev_p and "-DSM_PUSH_WS_LATE=0" in dev_p
+        assert not any("PASSTRIP" in x or "WS_LATE" in x for x in host_p)
+    base = os.path.join(jit.CSRC, "small", "r22")
+    header = _slurp(os.path.join(base, "interface", "sm_abi_v3.h"), encoding="utf-8")
+    kernel = _slurp(os.path.join(base, "device", "ran_kernel.cu"), encoding="utf-8")
+    for macro in ("SM_PUSH_PASSTRIP", "SM_PUSH_WS_LATE"):
+        assert (
+            int(
+                re.search(
+                    rf"#ifndef {macro}\s*\n\s*#define {macro} (\d+)", header
+                ).group(1)
+            )
+            == 0
+        )
+        assert macro in kernel
+        for path in (
+            os.path.join(base, "host", "driver_sm.cpp"),
+            os.path.join(jit.CSRC, "host", "sm_fusion_driver.cpp"),
+            os.path.join(base, "device", "layout", "t1_roles.hpp"),
+            os.path.join(base, "device", "layout", "ran_layouts.hpp"),
+        ):
+            assert macro not in _slurp(path, encoding="utf-8"), (macro, path)

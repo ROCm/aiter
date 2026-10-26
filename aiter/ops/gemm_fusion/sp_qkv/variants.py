@@ -42,6 +42,8 @@ SRC_SHA = {
     "r19": "33e0d60c5d9e4d37bd27aee2f9ae2d0351ecdac92d942c72b27966fbfe326b6e",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
     "r20": "0b00603865eaee674190de2e76c4dc5dd6985db0f36c57b70b6156a4bb1e39b3",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
     "r21": "c9cc70d9c5e3c9c52dc8bcf21ebf4cb82ff719f526de3fe5074f0b464151474b",  # R13 MP128 (abi 3, SM_MP 128, 8 MiB Rx view), derived from r20
+    "r22": "5e905fb651ff76e758f2af8007a0d10d7cec4732c140c38423ec3aa9e344a788",  # R14 tuned MP128 (abi 3, SM_MP 128, B-quad / BN128 / 3-slot Rx: 4 MiB view), derived from r21
+    "r23": "34f01b21955331648be3ef9562c68fe939ad62115c6eda64e0ae148ba89e681c",  # R14 MP256 v1 (abi 3, SM_MP 256, BM256 GEMM, 2 iterations per WG, 3-slot Rx 6.75 / 7.5 MiB: 8 MiB view), derived from r22
 }
 # analytic geometry (mirrors sm_abi_v2.h; cross-checked against sm_info_v1 after build)
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2560}
@@ -49,19 +51,34 @@ _NA = {"dense": 72, "indexer": 77, "reuse": 77}
 _MAX_BINDINGS = 64
 
 
-def small_window_bytes(mode: str, mp: int | None = None) -> dict[str, int]:
-    """Analytic window bytes of a small owner: Rx [2][4][MP][F] bf16 and the control window. mp = the source's SM_MP (32 for r17-r19, 64 for r20)."""
+def small_rx_slots(params: dict) -> int:
+    """Rx slots per (parity, row) of a small build: 4 (every source before r22: one slot per source rank, the self slot included), or 3 for r22 / r23 with SM_RX3 (default 1; r23 requires it: Rx is
+    indexed by the REMOTE ordinal, the never-used self slot is dropped)."""
+    if params.get("src") in ("r22", "r23") and int(params.get("rx3", 1)):
+        return 3
+    return 4
+
+
+def small_window_bytes(
+    mode: str, mp: int | None = None, rx_slots: int = 4
+) -> dict[str, int]:
+    """Analytic window bytes of a small owner: Rx [2][slots][MP][F] bf16 and the control window. mp = the source's SM_MP (32 for r17-r19, 64 for r20, 128 for r21 / r22);
+    rx_slots = 4, or 3 for r22 / r23 with SM_RX3 (3,538,944 B dense / 3,932,160 B indexer+reuse at MP128: inside ONE 4 MiB view; at MP256 7,077,888 / 7,864,320 B: one 8 MiB view).
+    """
     mp = rt.SM_MP if mp is None else mp
-    rx = 2 * 4 * mp * _F[mode] * 2
+    rx = 2 * rx_slots * mp * _F[mode] * 2
     ctl = 256 + 8 * 2 * 4 * _NA[mode]
     return {"rx": rx, "ctl": ctl}
 
 
-def small_window_caps(mode: str, mp: int | None = None) -> tuple[int, int]:
-    """(Rx, control) window capacities a small owner requests, each rounded up to the 4 MiB granule and sized SEPARATELY: 4 MiB each for MP <= 64 (Rx 1.1 / 2.4 / 2.6 MiB), but
-    MP128's Rx (4.5 MiB dense, 5.0 MiB indexer / reuse) needs an 8 MiB arena view while its control window stays one granule.
+def small_window_caps(
+    mode: str, mp: int | None = None, rx_slots: int = 4
+) -> tuple[int, int]:
+    """(Rx, control) window capacities a small owner requests, each rounded up to the 4 MiB granule and sized SEPARATELY: 4 MiB each for MP <= 64 (Rx 1.1 / 2.4 / 2.6 MiB), and for
+    r22's 3-slot MP128 Rx (3.4 / 3.8 MiB); a 4-slot MP128 Rx (r21, or r22 with rx3=0: 4.5 MiB dense, 5.0 MiB indexer / reuse) needs an 8 MiB arena view while its control
+    window stays one granule.
     """
-    b = small_window_bytes(mode, mp)
+    b = small_window_bytes(mode, mp, rx_slots)
     return round_up(max(b["rx"], 8192)), round_up(max(b["ctl"], 8192))
 
 
@@ -147,7 +164,11 @@ def check_cache_page(k_cache, v_cache, page: int):
     + ";r20="
     + SRC_SHA["r20"]
     + ";r21="
-    + SRC_SHA["r21"],
+    + SRC_SHA["r21"]
+    + ";r22="
+    + SRC_SHA["r22"]
+    + ";r23="
+    + SRC_SHA["r23"],
 )
 class SpQkvSmall(Plan):
     n_stages = 2
@@ -165,6 +186,7 @@ class SpQkvSmall(Plan):
             raise ContractError(
                 "sp_qkv.small.v1 rx_bypass=1 requires capability gfx950_sc_bypass (R2 is gfx950-only)"
             )
+        self.rx_slots = small_rx_slots(self.params)
         self.mp = src_mp(
             self.src
         )  # padded rows of this source: r17-r19 serve local m 1..32, r20 (MP64) 1..64
@@ -197,7 +219,7 @@ class SpQkvSmall(Plan):
         self._ctx = None
 
     def resources(self) -> list[WindowReq]:
-        rx_cap, ctl_cap = small_window_caps(self.mode, self.mp)
+        rx_cap, ctl_cap = small_window_caps(self.mode, self.mp, self.rx_slots)
         reqs = [
             WindowReq(self.owner + "/rx", rx_cap, "p2p_window"),
             WindowReq(self.owner + "/ctl", ctl_cap, "control"),
@@ -225,9 +247,15 @@ class SpQkvSmall(Plan):
             built = build_small(self.params, self.mode)
             lib = rt.load_driver(built.driver_so, abi=self.abi)
             geo = rt.info(lib)
-            exp = small_window_bytes(self.mode, self.mp)
+            exp = small_window_bytes(self.mode, self.mp, self.rx_slots)
             if geo["rx_bytes"] != exp["rx"] or geo["ctl_bytes"] != exp["ctl"]:
                 raise RuntimeError(f"compiled geometry {geo} != analytic {exp}")
+            # sm_info_v1[0] (rx_bytes) is the compiled truth: it must also FIT the Rx view this owner requested (r22: a 3-slot build inside 4 MiB; an rx3=0 build needs 8 MiB)
+            rx_cap = small_window_caps(self.mode, self.mp, self.rx_slots)[0]
+            if geo["rx_bytes"] > rx_cap:
+                raise RuntimeError(
+                    f"compiled Rx {geo['rx_bytes']} B (sm_info_v1[0]) does not fit the requested {rx_cap} B view"
+                )
             import ctypes as C
 
             h = C.c_void_p()

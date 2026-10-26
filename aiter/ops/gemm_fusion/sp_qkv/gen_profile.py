@@ -60,7 +60,9 @@ def build_rows():
         if (mode, m) not in tuned:
             row["note"] = {
                 specs.SMALL_R20_SRC: "R13 MP64 (src r20)",
-                specs.SMALL_R21_SRC: "R13 MP128 (src r21, 8 MiB Rx view)",
+                specs.SMALL_R21_SRC: f"R13 MP128 (src r21, nh={params['nh']}, 8 MiB Rx view)",
+                specs.SMALL_R23_SRC: f"R14 MP256 (src r23, nh={params['nh']}, 8 MiB Rx view)",
+                specs.SMALL_R22_SRC: f"R14 MP128 tuned (src r22, nh={params['nh']}, 4 MiB Rx view)",
             }.get(params["src"], "R13 P2: copy of the mode's m=16 params")
         rows.append(row)
     rows.extend(build_large_rows())
@@ -68,7 +70,7 @@ def build_rows():
 
 
 def build_small_rules():
-    """The small range rules per mode (specs.small_range_rules: r19 over m 1..16 and 17..32, r20 over 33..64, r21 over 65..128; every m): consulted only where no exact row exists. Every
+    """The small range rules per mode (specs.small_range_rules: r19 over m 1..16 and 17..32, r20 over 33..64, r21 / r22 over 65..128; every m): consulted only where no exact row exists. Every
     covered m is validated against the real plan constructor (push8 above 16, b_rowsplit at or below 16 and an r20 build without the bypass would be refused).
     """
     rules = []
@@ -218,7 +220,7 @@ def window_budget():
     small_cells += [(r["mode"], r["params"]) for r in specs.small_range_rules()]
     for mode, params in small_cells:
         small[(mode, tuple(sorted(params.items())))] = variants.small_window_caps(
-            mode, jit.src_mp(params["src"])
+            mode, jit.src_mp(params["src"]), variants.small_rx_slots(params)
         )
     large = {
         (mode, T // WORLD): variants_large.large_window_bytes(mode, T // WORLD)
@@ -229,7 +231,7 @@ def window_budget():
 
     small_sizes = sorted(
         [c for caps in small.values() for c in caps], reverse=True
-    )  # each owner: its Rx and its control window (MP128: 8 MiB + 4 MiB)
+    )  # each owner: its Rx and its control window (r21 MP128: 8 MiB + 4 MiB; r22: 4 MiB + 4 MiB)
     sr = max(large.values())
     shared = {
         vl.SHARE_S: sr,

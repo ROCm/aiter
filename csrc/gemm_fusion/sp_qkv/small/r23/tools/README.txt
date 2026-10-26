@@ -1,0 +1,1 @@
+# r23 from r22 (fresh copy minus SOURCE_SHA256.txt, NOTES-r22.md, tools/); apply derive_a (RAN role iteration loops), derive_b (B octo; later superseded by derive_d which moves the loop after the quad/else block), derive_c (ABI/roles/layouts/driver), derive_e (GEMM BM256 + traits), derive_f/g (static checker edits). The tests dir has the final checkers.

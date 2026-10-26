@@ -35,19 +35,29 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 CSRC = os.path.abspath(
     os.path.join(_HERE, "..", "..", "..", "..", "csrc", "gemm_fusion", "sp_qkv")
 )
-SRCS = ("r17", "r18", "r19", "r20", "r21")
+SRCS = ("r17", "r18", "r19", "r20", "r21", "r22", "r23")
 LARGE_SRCS = ("r11", "r12")
 R18_FAMILY = (
     "r18",
     "r19",
     "r20",
     "r21",
+    "r22",
+    "r23",
 )  # r19 is derived from r18 (design card r2 D-1 path A), r20 from r19: they accept the r18-only flags (r20: see small_defs for what it refuses)
 # kernel ABI generation of a source: 2 = the shipped drivers (poison words, pointers baked in the device block); 3 = R12 (per-launch kernargs, per-comm ERR/STEP page,
 # call_id tags). Plans of abi 3 take `call_id` in run(), carry the global page request and register no per-plan poison hooks.
-SMALL_ABI = {"r17": 2, "r18": 2, "r19": 3, "r20": 3, "r21": 3}
-# padded rows per source (SM_MP): r17-r19 cover local m 1..32 (T <= 128); r20 (R13 MP64) covers m 1..64 (decode T up to 256: the profile uses it for m 33..64)
-SMALL_MP = {"r17": 32, "r18": 32, "r19": 32, "r20": 64, "r21": 128}
+SMALL_ABI = {"r17": 2, "r18": 2, "r19": 3, "r20": 3, "r21": 3, "r22": 3, "r23": 3}
+# padded rows per source (SM_MP): r17-r19 cover local m 1..32 (T <= 128); r21 / r22 (MP128) cover m 1..128, r23 (MP256) m 1..256; r20 (R13 MP64) covers m 1..64 (decode T up to 256: the profile uses it for m 33..64)
+SMALL_MP = {
+    "r17": 32,
+    "r18": 32,
+    "r19": 32,
+    "r20": 64,
+    "r21": 128,
+    "r22": 128,
+    "r23": 256,
+}
 LARGE_ABI = {"r11": 2, "r12": 3}
 
 
@@ -126,6 +136,15 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
         "rx_bypass",
         "reuse_no_idx",
         "nt",
+        "b_quad",
+        "gemm_bn128",
+        "rx3",
+        "pfk",
+        "p_nt",
+        "ik_reload_p",
+        "ik_seq",
+        "push_passtrip",
+        "push_ws_late",
     }
     extra = set(params) - allowed
     if extra:
@@ -135,11 +154,14 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
     idx = 1 if mode == "indexer" else 0
     dense = 1 if mode == "dense" else 0
     nh = int(params.get("nh", 1))
-    if src in ("r19", "r20", "r21") and int(params.get("no_credit", 1)) != 1:
+    if (
+        src in ("r19", "r20", "r21", "r22", "r23")
+        and int(params.get("no_credit", 1)) != 1
+    ):
         raise ValueError(
             f"{src}: SM_NO_CREDIT must be 1 (the credit slow path used the retired poison word)"
         )
-    if src in ("r20", "r21"):
+    if src in ("r20", "r21", "r22", "r23"):
         # R13 MP64 / MP128: ONE push shape, the B row split is intrinsic, B_HEADS = 1 (the 216 / 240 B WG counts assume it) and the bypass loads are REQUIRED in every mode
         # (sm_abi_v3.h #errors on SM_PUSH8 / SM_PUSH_HALVES / SM_B_ROWSPLIT / !SM_RX_BYPASS): the flags that no longer exist are refused here, before a compile
         gone = [k for k in ("push8", "push_halves", "b_rowsplit") if params.get(k)]
@@ -153,7 +175,7 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
             )
         # B_HEADS: r20 supports NH1 only (its 216 / 240 B WG counts); r21 supports NH1 (default: 432 / 480 B WGs, grid 552 / 608) and NH2 (216 / 240 B WGs, grid 336 / 368:
         # the A/B for the occupancy caveat of the 1024-slot launch)
-        allowed_nh = (1, 2) if src == "r21" else (1,)
+        allowed_nh = (1, 2) if src in ("r21", "r22", "r23") else (1,)
         if nh not in allowed_nh:
             raise ValueError(f"{src} requires nh in {allowed_nh} (B_HEADS), got {nh}")
     abi = [
@@ -173,6 +195,90 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
         ]
     elif any(params.get(k) for k in ("b_rowsplit", "rx_bypass", "reuse_no_idx")):
         raise ValueError("b_rowsplit/rx_bypass/reuse_no_idx require src=r18 or r19")
+    # r22 (tuned MP128, R14 F1) / r23 (MP256) option switches. Source defaults: B_QUAD 1, RX3 1, GEMM_BN128 1 (r22) / 0 (r23: BN128 is a net loss on GPU, BM256 x BN64 PFK4 is the
+    # default). r22: 0 = the r21 behaviour for the A/B. r23: REQUIRES rx3=1 and b_quad=1 (`#error` otherwise); gemm_bn128 and the GEMM prefetch depth `pfk` are optional. They change
+    # the GRID (B-quad, BN) and the Rx size (RX3), all compile-time in sm_abi_v3.h, so they go to the host build too and are passed EXPLICITLY (a header default change cannot move a
+    # build silently).
+    knobs = [k for k in ("b_quad", "gemm_bn128", "rx3") if k in params]
+    if knobs and src not in ("r22", "r23"):
+        raise ValueError(f"{knobs} exist only in src r22 and r23")
+    if "pfk" in params and src != "r23":
+        raise ValueError("['pfk'] exists only in src r23")
+    if "p_nt" in params and src not in ("r22", "r23"):
+        raise ValueError("['p_nt'] exists only in src r22 and r23")
+    dev_extra: list[str] = []
+    ik_opts = [k for k in ("ik_reload_p", "ik_seq") if k in params]
+    if ik_opts and src != "r23":
+        raise ValueError(f"{ik_opts} exist only in src r23")
+    push_opts = [k for k in ("push_passtrip", "push_ws_late") if k in params]
+    if push_opts and src not in ("r22", "r23"):
+        raise ValueError(f"{push_opts} exist only in src r22 and r23")
+    if src == "r23":
+        # r23 indexer fallbacks for the RAN spill (opt-in, default 0): ik_reload_p = SM_IK_RELOAD_P (the IK owner re-loads P instead of holding the pushed values; a device body
+        # switch, no geometry), ik_seq = SM_IK_SEQ (the two IK iterations become two IK WGs per owner: SM_T1_IK_WGS 8, grid 252, K 24 per (src, dst)). ik_seq changes the RAN GRID,
+        # which the HOST computes at compile time from the same header macros (RAN_GRID = SM_T1_GRID: nothing hard-codes IK_WGS), so it goes to device AND host; ik_reload_p is device-only.
+        # Both act on the IK owners, which exist only in the INDEXER build: set to 1 in dense / reuse they would only duplicate a build, so they are refused there.
+        ik = {k: int(params.get(k, 0)) for k in ("ik_reload_p", "ik_seq")}
+        bad = [k for k, v in ik.items() if v not in (0, 1)]
+        if bad:
+            raise ValueError(f"r23 {bad} must be 0 or 1")
+        if mode != "indexer" and any(ik.values()):
+            raise ValueError(
+                f"r23 {[k for k, v in ik.items() if v]} apply to the indexer build only (IK owners), not mode {mode!r}"
+            )
+        dev_extra.append(f"-DSM_IK_RELOAD_P={ik['ik_reload_p']}")
+        ik_abi = [f"-DSM_IK_SEQ={ik['ik_seq']}"]
+    else:
+        ik_abi = []
+    if src in ("r22", "r23"):
+        # SM_SK_CFG (split-K factor, device AND host: P [SK][MP][N]) is 2 or 3 in the source (static_assert); SM_P_NT (device only: the GEMM epilogue's store flavour for the P
+        # partials, values and reduction order unchanged): 0 = default, 1 = non-temporal, 2 = sc0 sc1 nt (system write-through). Both passed explicitly.
+        sk = int(params.get("sk", 3))
+        if sk not in (2, 3):
+            raise ValueError(f"{src} sk must be 2 or 3 (SM_SK_CFG), got {sk}")
+        p_nt = int(params.get("p_nt", 0))
+        if p_nt not in (0, 1, 2):
+            raise ValueError(f"{src} p_nt must be 0, 1 or 2, got {p_nt}")
+        dev_extra.append(f"-DSM_P_NT={p_nt}")
+        # push live-set options (r22 and r23; opt-in, default 0, DEVICE only, push role only, valid in every mode): push_passtrip = SM_PUSH_PASSTRIP (two one-pass sub-trips: pk 72
+        # floats, +1 P-load round trip per iteration), push_ws_late = SM_PUSH_WS_LATE (Wscale loaded in its own short trip after the decision: -24 floats during the P loads). They
+        # change the push body only (no grid, K or window), so the host build never sees them; passed explicitly.
+        push = {k: int(params.get(k, 0)) for k in ("push_passtrip", "push_ws_late")}
+        bad_push = [k for k, v in push.items() if v not in (0, 1)]
+        if bad_push:
+            raise ValueError(f"{src} {bad_push} must be 0 or 1")
+        dev_extra.append(f"-DSM_PUSH_PASSTRIP={push['push_passtrip']}")
+        dev_extra.append(f"-DSM_PUSH_WS_LATE={push['push_ws_late']}")
+    if src in ("r22", "r23"):
+        bn_default = 0 if src == "r23" else 1
+        vals = {
+            "b_quad": int(params.get("b_quad", 1)),
+            "gemm_bn128": int(params.get("gemm_bn128", bn_default)),
+            "rx3": int(params.get("rx3", 1)),
+        }
+        bad = [k for k, v in vals.items() if v not in (0, 1)]
+        if bad:
+            raise ValueError(f"{src} {bad} must be 0 or 1")
+        if src == "r23" and (vals["rx3"] != 1 or vals["b_quad"] != 1):
+            raise ValueError(
+                "r23 (MP256) requires rx3=1 and b_quad=1 (4 Rx slots would need 9.4 MB > 8 MiB; sm_abi_v3.h #error); gemm_bn128 is optional (default 0)"
+            )
+        abi += [
+            f"-DSM_B_QUAD={vals['b_quad']}",
+            f"-DSM_GEMM_BN128={vals['gemm_bn128']}",
+            f"-DSM_RX3={vals['rx3']}",
+        ]
+        if src == "r23":
+            # BM256 GEMM prefetch depth: LDS = PFK x (A 32 KiB + B 8 KiB (BN64) / 16 KiB (BN128)) <= 160 KiB: BN64 PFK 3 (120 KiB) or 4 (160 KiB, the default), BN128 PFK 3 (144 KiB, default)
+            pfk = int(params.get("pfk", 3 if vals["gemm_bn128"] else 4))
+            if pfk not in (3, 4):
+                raise ValueError(f"r23 pfk must be 3 or 4, got {pfk}")
+            if vals["gemm_bn128"] and pfk == 4:
+                raise ValueError(
+                    "r23 gemm_bn128=1 with pfk=4 needs 4 x 48 KiB = 192 KiB of LDS > the 160 KiB per CU"
+                )
+            abi.append(f"-DSM_GEMM_PFK={pfk}")
+    abi += ik_abi  # r23 SM_IK_SEQ: device AND host (the RAN grid is a compile-time host constant)
     # device-only (Phase-1 build_device.sh defaults P0=1 P1=1 P2=0 STAMPS=0 R1=1 R2=0 R3=1 R4=1 U2=1)
     dev = abi + [
         "-DSM_U2_HOST_PTRS=1",
@@ -185,6 +291,7 @@ def small_defs(params: dict, mode: str) -> tuple[list[str], list[str]]:
         "-DSM_R3_SRC_CREDIT=1",
         "-DSM_R4_LAST_WG_FENCE=1",
         f"-DSM_NO_CREDIT={int(params.get('no_credit', 1))}",
+        *dev_extra,
     ]
     # host gets every ABI-affecting switch (grid / thread count / ntiles are compile-time in sm_abi_v2.h)
     return dev, abi
