@@ -62,7 +62,6 @@ fallback.
 - Run representative correctness suites on MI450 A0 hardware.
 - Generate strict-specific tuning rows where B0 tuning is not demonstrated to
   be valid. Reuse should be explicit and evidence-based, not a filename alias.
-- Compare fallback coverage and performance against the former hotswap path.
 - Verify that a strict code object is rejected on B0 and a regular gfx1250 code
   object is rejected on A0.
 

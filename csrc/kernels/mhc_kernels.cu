@@ -25,7 +25,7 @@ namespace aiter {
                         "; use res_preshuffle=0");
         }
     }
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     static constexpr bool mhc_async_load_oob_guard = true;
 #else
     static constexpr bool mhc_async_load_oob_guard = false;
@@ -42,7 +42,7 @@ namespace aiter {
 #else
 #define MHC_BF16_MFMA 0
 #endif
-#if MHC_BF16_MFMA || (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if MHC_BF16_MFMA || defined(__gfx1250__) || defined(__gfx1250_strict__)
     static constexpr bool mhc_bf16_mma_avail = true;
 #else
     static constexpr bool mhc_bf16_mma_avail = false;
@@ -53,7 +53,7 @@ namespace aiter {
     // TENSORcnt (separate from load/async/ds counters). KEEP1 leaves the next
     // prefetched stage in flight (<=2 inflight, within the <=3 budget); DRAIN
     // waits for all residual TDMs. No-ops off gfx1250 (residual uses async_load).
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
 // KEEP(N): drain this wave's TDMs down to N still in flight -- N = ring depth - 1,
 // i.e. every stage prefetched AFTER the one about to be consumed may stay
 // outstanding. DRAIN waits for all of them.
@@ -78,7 +78,7 @@ namespace aiter {
     //     which is what forced tile_k>=64 (and, before that, read the lo half past the
     //     end of the register tile). kb=8 makes tile_k=32 legal again.
     // Packer and consumer are compiled for the same arch, so they always agree.
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     static constexpr int mhc_fn_kb = 16;
 #else
     static constexpr int mhc_fn_kb = 8;
@@ -155,7 +155,7 @@ namespace aiter {
 #if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 #define MMA_F32_16X16X4(a, b, c) \
     __builtin_amdgcn_mfma_f32_16x16x4f32((a)[0], (b)[0], (c), 0, 0, 0)
-#elif (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#elif defined(__gfx1250__) || defined(__gfx1250_strict__)
 #define MMA_F32_16X16X4(a, b, c) \
     __builtin_amdgcn_wmma_f32_16x16x4_f32( \
         false, (a), false, (b), static_cast<short>(0), (c), false, false)
@@ -232,7 +232,7 @@ namespace aiter {
         static constexpr int x_lds_pitch = tile_k + x_pad_elems;
         static constexpr int x_tdm_lds_bytes =
             (int)sizeof(s_fn) + x_tdm_stages * tile_m * x_lds_pitch * (int)sizeof(DTYPE_I);
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // bf16-only by measurement, not by any data dependence: the fp32 fallback's live
         // set (v_af is vec_tile floats against x_bf's bf16 half) pays more for the LDS
         // round trip than it wins back (332.7 -> 337.1 us at 7168x8192).
@@ -385,7 +385,7 @@ namespace aiter {
         // rather than walked with move(): measured a wash, and move() would tie
         // correctness to the issue order staying exactly k order.
         [[maybe_unused]] auto lds_load_x_tile = [&](int k, int slot) {
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
             if constexpr (x_tdm) {
                 if (warp_id == 0) {
                     // padding<T, tile_k, 0> is not "no padding": a nonzero interval reads
@@ -639,7 +639,7 @@ namespace aiter {
         } while (0)
 #endif // MHC_BF16_MFMA (wave64 bf16 path)
 
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))   // wave32 WMMA bf16 (UNVERIFIED - no gfx1250 HW to validate)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)   // wave32 WMMA bf16 (UNVERIFIED - no gfx1250 HW to validate)
         // 16 bf16/lane WMMA fragment. On wave32 x's v_a index == the WMMA fragment K
         // position, so x_bf[c][i] = v_a[c*16+i]; fn is read at kk=c*16+i with the same
         // wave32 K_wanted the fp32 path uses, so fn_frag[i] and x_frag[i] share K.
@@ -837,7 +837,7 @@ namespace aiter {
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
         }
-#elif (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#elif defined(__gfx1250__) || defined(__gfx1250_strict__)
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
         if constexpr (w_preshuffle_bf16) {                                   \
             GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);       \
@@ -2572,7 +2572,7 @@ namespace aiter {
         static constexpr int n_stages = 2;
         __shared__ DTYPE_I s_x[n_stages * tile_m * tile_k];
         __shared__ DTYPE_I s_residual[n_stages * tile_m * hc_mult * tile_k];
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // num_warps > 2: the store must be issued by a warp that owns no TDM load
         // (warps 0/1 issue residual/x), or that warp would carry n_stages loads +
         // n_stages stores = 4 tensor ops in flight, over the per-wave limit of 3.
@@ -2581,7 +2581,7 @@ namespace aiter {
 #else
         static constexpr bool nres_tdm = false;
 #endif
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         static constexpr bool decode_pipeline = decode_direct_store && w_preshuffle_bf16 && res_preshuffle;
 #else
         static constexpr bool decode_pipeline = false;
@@ -2661,7 +2661,7 @@ namespace aiter {
 
         static constexpr int tile_mk = tile_m * tile_k;
         static_assert(tile_mk % warp_size == 0, "tile_mk must be divisible by block_size");
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // ---- gfx1250 x (layer_input) load via TDM: a plain 2D tile ----
         // x lands in LDS as row*tile_k + hidden (exactly what compute_store_tile
         // reads); in global x[row][h] = row*x_stride + h. So a 2D TDM tile
@@ -2722,7 +2722,7 @@ namespace aiter {
         };
 #endif
 
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // ---- gfx1250 residual load via TDM (Tensor Data Mover) ----
         // The residual tile is [head=hc_mult][row=tile_m][hidden=tile_k] and must
         // land in LDS as h*tile_mk + row*tile_k + hidden (exactly what
@@ -2865,7 +2865,7 @@ namespace aiter {
         using float_hc_mult = opus::vector_t<float, hc_mult>;
         float post_mix_v[m_repeat];
         float_hc_mult comb_mix[m_repeat];
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         // Keep coefficient loads in a shared EXEC region instead of waiting
         // after every scalar read. Full decode tiles can batch all row bands;
         // the per-band path avoids the prefill regression from that fast path.
@@ -2996,7 +2996,7 @@ namespace aiter {
                         }
                     }
                     if constexpr (!batch_lds) s_wait_all_dscnt(opus::number<hc_mult>{});
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                     if constexpr (decode_pipeline) {
                         // OPSEL_HI broadcasts the coefficient's low DWORD to
                         // both FP32 results without a duplicated coefficient VGPR.
@@ -3117,7 +3117,7 @@ namespace aiter {
                             v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi8, res_bf, v_cf[b][n]);
                             v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo8, res_bf, v_cf[b][n]);
                         }
-#elif (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#elif defined(__gfx1250__) || defined(__gfx1250_strict__)
                         // wave32 WMMA bf16 (validated on gfx1250). One
                         // wmma_f32_16x16x32_bf16 needs 16 K-elems/lane = two band_j steps
                         // combined (2 x ds_read_vec). fn and res are placed at the same
@@ -3189,7 +3189,7 @@ namespace aiter {
         // MHC_TDM_KEEP(n_stages - 1) on the TDM side.
         [[maybe_unused]] static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : (n_stages - 1) * (x_load_waitcnt + residual_load_waitcnt);
         [[maybe_unused]] static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : (n_stages - 1) * residual_load_waitcnt;
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         auto wait_load_cnt = [&]() {
             // x (warp 1) and residual (warp 0) are both TDM / TENSORcnt-tracked. Each
             // issuing wave drains its current stage down to the single prefetch left in
@@ -3241,7 +3241,7 @@ namespace aiter {
         // -> issue; slot reuse is held behind the store by MHC_TDM_KEEP(n_stages-1)
         // in wait_load_cnt.
         auto nres_deposit_fence = [&](){ if constexpr (nres_tdm) { s_wait_all_dscnt(0_I); } };
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
         auto tdm_store_nres_tile = [&](int k, int slot){
             if constexpr (nres_tdm) {
                 if (warp_id == 2) {

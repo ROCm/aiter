@@ -58,7 +58,7 @@ static constexpr int kFuseReduceRing = 3;
 // the cluster geometry from.
 template <typename UserTraits, int SplitK, typename DataWs, int MClusterWg, typename D_OUT>
 __global__ __launch_bounds__(128, 1)
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__)) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__) || !defined(__HIP_DEVICE_COMPILE__)
     __cluster_dims__(SplitK, MClusterWg, 1)
 #endif
     void gemm_a16w16_splitk_fuse_kernel_gfx1250(
@@ -66,7 +66,7 @@ __global__ __launch_bounds__(128, 1)
 {
     static_assert(SplitK * MClusterWg <= 16, "cluster WG count (SplitK*MClusterWg) must be <= 16");
 #ifdef __HIP_DEVICE_COMPILE__
-#if (defined(__gfx1250__) || defined(__gfx1250_strict__))
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     using T       = remove_cvref_t<UserTraits>;
     using DataA   = typename T::DataA;
     using DataB   = typename T::DataB;
