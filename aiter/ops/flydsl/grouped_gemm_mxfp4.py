@@ -159,7 +159,8 @@ def flydsl_grouped_gemm_a8w4_masked(
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
         if float(situ_linear_beta) <= 0.0:
             raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
-    num_buffers = min(num_buffers, max(1, K // tile_k))
+    k_tiles = (K + tile_k - 1) // tile_k
+    num_buffers = min(num_buffers, max(1, k_tiles))
     if bias is None:
         has_bias = 0
     elif bias.dtype in _BIAS_MODE:

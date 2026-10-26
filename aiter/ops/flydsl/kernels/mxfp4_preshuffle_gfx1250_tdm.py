@@ -10,7 +10,7 @@ from collections import namedtuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
@@ -108,7 +108,7 @@ def _pack_bytes_i32(byte_vals):
     assert 1 <= len(byte_vals) <= 4, len(byte_vals)
     packed = None
     for n, b in enumerate(byte_vals):
-        w = fx.Int32(arith.extui(T.i32, _raw(b)))
+        w = fx.Int32(fx.Uint8(b))
         if n:
             w = w << fx.Int32(8 * n)
         packed = w if packed is None else packed | w
@@ -224,6 +224,14 @@ def launch_gemm_a8w4_tdm(
     WAVE = 32
     PACK_TK = tile_k // 2
     KWS = tile_k // WMMA_K
+    if K % WMMA_K or tile_k % WMMA_K:
+        raise ValueError(f"K={K} and tile_k={tile_k} must be multiples of {WMMA_K}")
+    # A K that tile_k does not divide ends on a ragged tile of KWS_TAIL k128
+    # steps. Its TDM loads clamp the inner extent there, so the bytes past the
+    # row end are zero-filled instead of read, and its compute stops early.
+    K_TILES = ceildiv(K, tile_k)
+    KWS_TAIL = (K - (K_TILES - 1) * tile_k) // WMMA_K
+    HAS_K_TAIL = KWS_TAIL != KWS
     # Double buffering is sufficient: the carry reads the other LDS buffer
     # before the post-compute barrier permits reusing the current buffer.
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
@@ -479,7 +487,6 @@ def launch_gemm_a8w4_tdm(
         task_id: task_index_type,
         schedule_rows: task_index_type,
     ):
-        K_TILES = K // tile_k
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
         K4 = K // 4
@@ -718,7 +725,8 @@ def launch_gemm_a8w4_tdm(
         # collapses to one atom: ``wv`` is the smallest unit needing its own code.
         Job = namedtuple(
             "Job",
-            "atom gt on_i32 lds_off lds_stage lds_row inner outer k_adv waves",
+            "atom gt on_i32 lds_off lds_stage lds_row inner outer k_adv waves "
+            "tail_ext",
         )
         jobs = []
         as_prologue_jobs = []
@@ -780,6 +788,12 @@ def launch_gemm_a8w4_tdm(
                 # A runtime zero mask keeps a partial-M tail on the ordinary
                 # global-load path; nonzero masks select CLUSTER_LOAD_ASYNC.
                 atom = fx.atom_set_value(atom, "workgroup_mask", fx.Int32(wg_mask))
+            # Every K-advancing load lays a tile out k128-major, so the ragged
+            # last tile keeps the first KWS_TAIL/KWS of its inner extent. The
+            # extent is relative to this wave's base, which imm_offset bumps.
+            tail_ext = None
+            if const_expr(HAS_K_TAIL and k_adv):
+                tail_ext = inner * KWS_TAIL // KWS - wave_inner_off
             (jobs if target_jobs is None else target_jobs).append(
                 Job(
                     atom,
@@ -792,6 +806,7 @@ def launch_gemm_a8w4_tdm(
                     seg,
                     k_adv,
                     wv,
+                    tail_ext,
                 )
             )
 
@@ -924,6 +939,14 @@ def launch_gemm_a8w4_tdm(
 
         def issue(s, kt, my_jobs=None):
             base_i8 = fx.recast_iter(p8_shared, base_ptr)
+            # Only the last tile is ragged: a prologue kt picks its extent at
+            # compile time, a loop kt selects it with one scalar compare.
+            static_kt = isinstance(kt, int)
+            is_tail = None
+            if const_expr(HAS_K_TAIL):
+                is_tail = (
+                    kt == K_TILES - 1 if static_kt else fx.Int32(kt) == K_TILES - 1
+                )
 
             def emit(j):
                 base = base_i32 if j.on_i32 else base_i8
@@ -932,7 +955,14 @@ def launch_gemm_a8w4_tdm(
                     (j.outer, j.inner),
                     (j.lds_row, 1),
                 )
-                fx.copy(j.atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
+                atom = j.atom
+                if const_expr(j.tail_ext is not None and not static_kt):
+                    atom = fx.atom_set_value(
+                        atom, "extent_1", fx.Int32(is_tail.select(j.tail_ext, j.inner))
+                    )
+                elif const_expr(j.tail_ext is not None and is_tail):
+                    atom = fx.atom_set_value(atom, "extent_1", fx.Int32(j.tail_ext))
+                fx.copy(atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
 
             if const_expr(my_jobs is not None):
                 for j in my_jobs:
@@ -1263,10 +1293,12 @@ def launch_gemm_a8w4_tdm(
             next_stage_wait=None,
             next_stage_fence_fn=None,
             interleaved_lds_load=False,
+            kws=KWS,
         ):
             """Compute one k-tile, carrying one k128 of A/B/scales across tiles.
 
             ``kt`` selects the current tile's resident A-scale slice.
+            ``kws`` is the tile's k128 count, KWS_TAIL on a ragged last tile.
             ``rmem_preloaded`` says this tile's subtile-0 A/B/scales are already
             in rmem slot 0, put there by the previous tile's last k128, so the
             tile top skips loading them.
@@ -1302,8 +1334,8 @@ def launch_gemm_a8w4_tdm(
                 return counts
 
             def emit_hints(ksl, tail_mfma=0):
-                has_next = ksl + 1 < KWS or (
-                    ksl + 1 == KWS and next_stage_lds_addr is not None
+                has_next = ksl + 1 < kws or (
+                    ksl + 1 == kws and next_stage_lds_addr is not None
                 )
                 if const_expr(ksl == 0):
                     rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
@@ -1330,7 +1362,7 @@ def launch_gemm_a8w4_tdm(
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
                 tdm_schedule = spread(
-                    TDM_PER if (prefetch_kt is not None and ksl + 1 == KWS) else 0,
+                    TDM_PER if (prefetch_kt is not None and ksl + 1 == kws) else 0,
                     schedule_slots,
                 )
                 first_ds = min(DS_FIRST_N, future_schedule[0])
@@ -1350,8 +1382,8 @@ def launch_gemm_a8w4_tdm(
 
             if const_expr(not rmem_preloaded):
                 load_lds_data(rmem_slots[0], lds_addr, 0, kt, interleaved_lds_load)
-            for ksl in range_constexpr(KWS):
-                is_last = ksl + 1 == KWS
+            for ksl in range_constexpr(kws):
+                is_last = ksl + 1 == kws
                 carries = is_last and next_stage_lds_addr is not None
                 # At most one prefetch per k128: the next subtile of this tile,
                 # or -- on the last one -- the next tile's subtile 0, into slot 0.
@@ -1429,9 +1461,7 @@ def launch_gemm_a8w4_tdm(
                     _rm_dst_lanes.append(
                         fx.Int32(
                             fx.ptr_load(
-                                _rm_i32
-                                + blk_m64 * fx.Int64(2)
-                                + fx.Int64(_scatter_safe_row) * fx.Int64(2)
+                                _rm_i32 + blk_m64 * 2 + fx.Int64(_scatter_safe_row) * 2
                             )
                         )
                     )
@@ -1448,8 +1478,8 @@ def launch_gemm_a8w4_tdm(
                     _weight_bits = fx.Int32(
                         fx.ptr_load(
                             _rm_i32
-                            + blk_m64 * fx.Int64(2)
-                            + fx.Int64(_weight_safe_row) * fx.Int64(2)
+                            + blk_m64 * 2
+                            + fx.Int64(_weight_safe_row) * 2
                             + fx.Int64(1)
                         )
                     )
@@ -1539,6 +1569,7 @@ def launch_gemm_a8w4_tdm(
                             next_stage_on,
                             next_stage_buf,
                             interleaved_lds_load=interleaved_lds_load,
+                            kws=KWS_TAIL if kt == K_TILES - 1 else KWS,
                         )
                 else:
                     # Mid-compute prefetch: better for prefill. PRE is both the tiles
@@ -1611,7 +1642,7 @@ def launch_gemm_a8w4_tdm(
                     def drain_fence(j):
                         # Select only the immediate wait count. Both loop forms
                         # call this at the same point in the tile's pipeline.
-                        if const_expr(rolled_drain):
+                        if const_expr(rolled_drain and not isinstance(j, int)):
                             for wait_stage in range_constexpr(PRE):
                                 if j == wait_stage:
                                     pipeline_fence(
@@ -1623,7 +1654,7 @@ def launch_gemm_a8w4_tdm(
                                 outstanding=TDM_PER * max(0, num_buffers - 2 - j)
                             )
 
-                    def compute_drain_tile(j, has_next):
+                    def compute_drain_tile(j, has_next, kws=KWS):
                         kt = n_steady + j
                         if const_expr(not next_stage_on):
                             drain_fence(j)
@@ -1642,6 +1673,7 @@ def launch_gemm_a8w4_tdm(
                                 else None
                             ),
                             interleaved_lds_load=interleaved_lds_load,
+                            kws=kws,
                         )
 
                     # Keep carry and fence placement identical in both loop
@@ -1649,15 +1681,17 @@ def launch_gemm_a8w4_tdm(
                     # but must neither fence nor load a nonexistent next tile.
                     # Peel it to avoid a runtime branch around the full compute
                     # body, which causes VGPR spills with the carried rmem state.
-                    drain_tiles = PRE - 1 if next_stage_on else PRE
+                    # A ragged K tail is peeled too: it computes fewer k128s.
+                    peel_last = bool(next_stage_on or HAS_K_TAIL)
+                    drain_tiles = PRE - 1 if peel_last else PRE
                     if const_expr(rolled_drain):
                         for j in range(drain_tiles):
                             compute_drain_tile(j, bool(next_stage_on))
                     else:
                         for j in range_constexpr(drain_tiles):
                             compute_drain_tile(j, bool(next_stage_on))
-                    if const_expr(next_stage_on):
-                        compute_drain_tile(PRE - 1, False)
+                    if const_expr(peel_last):
+                        compute_drain_tile(PRE - 1, False, kws=KWS_TAIL)
 
             # This is a compile-time selection. The interleaved version has one
             # mainloop body and no wave-parity branch.
@@ -1714,7 +1748,7 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(has_bias):
                     bias_vals = Vec(
                         fx.ptr_load(
-                            bias_map + expert * i32_n + col_rel,
+                            bias_map + expert * i32_n + blk_n + col_rel,
                             result_type=T.vec(8, bias_elem),
                         )
                     )
@@ -1732,14 +1766,14 @@ def launch_gemm_a8w4_tdm(
                     alignment=1,
                 )
                 scale_ptr = fx.recast_iter(i32_ptr_g, arg_quant_scale)
-                is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
+                is_kgrp0 = fx.Int32(kgrp) == 0
                 # i32_n is the pre-activation gate+up width; the quantized
                 # output has half as many columns and one scale dword per K128.
                 q_dst_scale_dwpr = i32_n // 256
                 scale_rsrc = create_buffer_resource_from_addr(
                     fx.ptrtoint(scale_ptr),
                     num_records_bytes=(
-                        fx.Int64(i32_m) * fx.Int64(q_dst_scale_dwpr) * fx.Int64(4)
+                        fx.Int64(i32_m) * fx.Int64(q_dst_scale_dwpr) * 4
                     ).ir_value(),
                 )
 
@@ -1911,7 +1945,7 @@ def launch_gemm_a8w4_tdm(
                     # multiple of four starts mid-dword, and a wider store would
                     # reach into the next warp's scales.
                     _e8m0_pack_dwords = _n_mx_blks // 4 if _n_mx_blks % 4 == 0 else 0
-                    _is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
+                    _is_kgrp0 = fx.Int32(kgrp) == 0
                     _p8_scale = fx.PointerType.get(
                         elem_ty=fx.Int8.ir_type,
                         address_space=fx.AddressSpace.Shared,
