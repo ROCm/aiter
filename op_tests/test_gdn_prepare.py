@@ -75,6 +75,7 @@ class GDNShape:
 PREPARE_SHAPES = {
     "qwen35_35b_tp2": GDNShape(t=2500, hg=8, h=16),
     "qwen35_397b_tp8": GDNShape(t=1024, hg=2, h=8),
+    "qwen38_flash_next_tp2": GDNShape(t=12000, hg=8, h=24),
     # Non-aligned dense and packed lengths exercise tail guards.
     "dense_tail": GDNShape(t=300, hg=4, h=8),
     "varlen_ragged": GDNShape(t=600, hg=4, h=16, seq_lens=(128, 172, 300)),
