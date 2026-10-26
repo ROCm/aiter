@@ -43,10 +43,8 @@ CGP_ALIGN = TILE_K
 DEFAULT_TILE = (128, 128, 2, 2)  # tile_m, tile_n, m_warp, n_warp
 DEFAULT_BLOCK_ROWS = 8  # R such that R * C = tile_m with C % 16 == 0
 
-# Blocks of 8 or 16 waves return wrong results on gfx1250 (a different subset of
-# elements on every run, so most likely a cross-wave synchronization race); keep
-# them out of every path until the kernel is fixed.
-MAX_WAVES = 4
+# Architectural upper bound (wave32): 16 waves = 512 threads.
+MAX_WAVES = 16
 
 
 def validate_launch_config_gfx1250(tile_m, tile_n, wave_m, wave_n, block_rows):
@@ -344,14 +342,10 @@ def unit_divisors_gfx1250(grid, geom):
     return (grid.wb == 1, grid.hb == 1, geom.do == 1)
 
 
-def make_shared_storage_gfx1250(elem_ty, cfg, num_buffers, patch_elems=0):
-    """LDS: num_buffers A tiles + num_buffers B tiles; or patch double-buffer for A."""
-    if patch_elems:
-        a_elems = 2 * patch_elems
-        b_elems = num_buffers * cfg.lds_b_elems_per_buf
-    else:
-        a_elems = num_buffers * cfg.lds_a_elems_per_buf
-        b_elems = num_buffers * cfg.lds_b_elems_per_buf
+def make_shared_storage_gfx1250(elem_ty, cfg, num_buffers):
+    """LDS: num_buffers A tiles + num_buffers B tiles."""
+    a_elems = num_buffers * cfg.lds_a_elems_per_buf
+    b_elems = num_buffers * cfg.lds_b_elems_per_buf
 
     @fx.struct
     class SharedStorage:

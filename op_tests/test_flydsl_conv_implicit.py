@@ -478,21 +478,6 @@ KW_CASES = [
     ),
 ]
 
-# gfx1250 caps a block at 4 waves (conv3d_gfx1250_utils.MAX_WAVES), so the
-# gfx950-sized tiles pinned above map to the widest legal gfx1250 tiles.
-_GFX1250_TILES = {
-    (128, 128, 2, 4): (128, 128, 2, 2),
-    (256, 256, 2, 4): (256, 96, 4, 1),
-}
-
-
-def _arch_kwargs(kw):
-    if "tile" in kw and get_gfx().split(":", 1)[0] == "gfx1250":
-        tile = tuple(kw["tile"])
-        return {**kw, "tile": _GFX1250_TILES.get(tile, tile)}
-    return kw
-
-
 # -c labels, read back off the sweep builders so the choices cannot drift from the
 # shapes. Resolution and clip length scale extents and call counts, never names, so
 # any legal argument answers for all of them.
@@ -818,9 +803,7 @@ def main():
         name = str(dtype).split(".")[-1]
 
         rows = [
-            test_conv_implicit(
-                case, rank, xs, ws, dtype, _arch_kwargs(kw), ref_kw, bias
-            )
+            test_conv_implicit(case, rank, xs, ws, dtype, kw, ref_kw, bias)
             for case, rank, xs, ws, kw, ref_kw, bias in KW_CASES
             if case in args.cases
         ]

@@ -7,8 +7,10 @@
 Host pre-pads so the kernel always sees zeros padding. Input is NDHWC with
 C/groups aligned to 32. Dispatch lives in ``conv3d_gfx1250.py``.
 
-Supports BIG_OUT (64-bit stores), split-K (fp32 atomic staging), and dyn_hw
-(runtime extents via magic reciprocal divisors).
+The software pipeline matches ``compile_gemm_a16w16`` (prologue / scf.for main
+loop / drain, bandwidth_bound or compute_bound fragment prefetch). Supports
+BIG_OUT (64-bit stores), split-K (fp32 atomic staging), and dyn_hw (runtime
+extents via magic reciprocal divisors).
 """
 
 import functools
@@ -51,6 +53,9 @@ from .conv3d_gfx1250_utils import (
     unit_divisors_gfx1250,
 )
 
+_SCHED_ALLOW_SALU = 1 << 2
+_TDMS_PER_TILE = 2  # A + B
+
 
 class Conv3dImplicitParam1250(NamedTuple):
     n: int
@@ -74,9 +79,10 @@ class Conv3dImplicitParam1250(NamedTuple):
     out_ndhwc: bool
     block_rows: int
     num_buffers: int
-    patch_reuse: bool  # unit-stride kH×kW reuse when eligible
     splitk: int
     dyn_hw: bool
+    variant: str
+    main_loop_unroll: bool
 
 
 def make_conv3d_implicit_param_gfx1250(
@@ -101,10 +107,15 @@ def make_conv3d_implicit_param_gfx1250(
     out_ndhwc=False,
     block_rows=DEFAULT_BLOCK_ROWS,
     num_buffers=2,
-    patch_reuse=False,
     splitk=1,
     dyn_hw=False,
+    variant="bandwidth_bound",
+    main_loop_unroll=False,
+    **_ignored,
 ):
+    del _ignored  # e.g. legacy patch_reuse from older call sites
+    if variant not in ("bandwidth_bound", "compute_bound"):
+        raise ValueError(f"bad variant {variant!r}")
     return Conv3dImplicitParam1250(
         n=n,
         c=c,
@@ -127,23 +138,14 @@ def make_conv3d_implicit_param_gfx1250(
         out_ndhwc=out_ndhwc,
         block_rows=block_rows,
         num_buffers=num_buffers,
-        patch_reuse=patch_reuse,
         splitk=max(1, int(splitk)),
         dyn_hw=bool(dyn_hw),
+        variant=variant,
+        main_loop_unroll=bool(main_loop_unroll),
     )
 
 
-def _patch_reuse_eligible(param):
-    return (
-        param.patch_reuse
-        and param.st == param.sh == param.sw == 1
-        and (param.kh > 1 or param.kw > 1)
-        and param.groups == 1
-        and param.splitk == 1
-    )
-
-
-def _dyn_hw_closure_key_gfx1250(grid, unit, use_patch, out_ndhwc, has_bias, splitk):
+def _dyn_hw_closure_key_gfx1250(grid, unit, out_ndhwc, has_bias, splitk):
     """Compile-time constants a dyn_hw kernel closes over (booleans included)."""
     return (
         grid.tile_m,
@@ -162,14 +164,13 @@ def _dyn_hw_closure_key_gfx1250(grid, unit, use_patch, out_ndhwc, has_bias, spli
         grid.use_splitk,
         grid.big_out,
         unit,
-        use_patch,
         out_ndhwc,
         has_bias,
         splitk,
     )
 
 
-def _shape_agnostic_key_gfx1250(grid, unit, use_patch, out_ndhwc, has_bias, splitk):
+def _shape_agnostic_key_gfx1250(grid, unit, out_ndhwc, has_bias, splitk):
     """Closure key with booleans blanked — integers must not carry D/H/W."""
 
     def _blank(value):
@@ -181,13 +182,11 @@ def _shape_agnostic_key_gfx1250(grid, unit, use_patch, out_ndhwc, has_bias, spli
 
     return tuple(
         _blank(v)
-        for v in _dyn_hw_closure_key_gfx1250(
-            grid, unit, use_patch, out_ndhwc, has_bias, splitk
-        )
+        for v in _dyn_hw_closure_key_gfx1250(grid, unit, out_ndhwc, has_bias, splitk)
     )
 
 
-def _assert_shape_agnostic_gfx1250(param, cfg, kernel_grid, unit, use_patch):
+def _assert_shape_agnostic_gfx1250(param, cfg, kernel_grid, unit):
     """Probe one stride larger; integer (non-bool) closure must not move."""
     st, sh, sw = param.st, param.sh, param.sw
     probe = make_conv3d_implicit_param_gfx1250(
@@ -212,9 +211,10 @@ def _assert_shape_agnostic_gfx1250(param, cfg, kernel_grid, unit, use_patch):
         param.out_ndhwc,
         param.block_rows,
         param.num_buffers,
-        param.patch_reuse,
         param.splitk,
         True,
+        param.variant,
+        param.main_loop_unroll,
     )
     cgp = probe.c // probe.groups
     try:
@@ -246,12 +246,11 @@ def _assert_shape_agnostic_gfx1250(param, cfg, kernel_grid, unit, use_patch):
     blank = grid._replace(grid_m=0, hb=0, wb=0, do=0, ho=0, wo=0, n=0)
     probe_unit = unit_divisors_gfx1250(grid, geom)
     mine = _shape_agnostic_key_gfx1250(
-        kernel_grid, unit, use_patch, param.out_ndhwc, param.has_bias, param.splitk
+        kernel_grid, unit, param.out_ndhwc, param.has_bias, param.splitk
     )
     theirs = _shape_agnostic_key_gfx1250(
         blank,
         probe_unit,
-        use_patch,
         probe.out_ndhwc,
         probe.has_bias,
         probe.splitk,
@@ -298,25 +297,16 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
         param.n, geom, cfg, param.groups, param.k, splitk=param.splitk
     )
 
-    use_patch = _patch_reuse_eligible(param)
     R, C = cfg.block_rows, cfg.block_cols
     num_buffers = param.num_buffers
     assert 2 <= num_buffers <= 8
+    num_k_tiles = grid.tiles_per_split
+    assert num_k_tiles >= num_buffers - 1, (
+        f"num_k_tiles {num_k_tiles} < {num_buffers - 1} "
+        f"(crs={geom.crs}, tile_k={cfg.tile_k}, splitk={param.splitk})"
+    )
 
-    if use_patch:
-        patch_rows = R + (param.kh - 1) * param.dh
-        patch_cols = C + (param.kw - 1) * param.dw
-        patch_elems = patch_rows * patch_cols * cfg.lds_k_stride + LDS_PAD
-        patch_b_tiles = 2 * param.kh * param.kw
-        SharedStorage = make_shared_storage_gfx1250(
-            fx.BFloat16,
-            cfg,
-            patch_b_tiles,
-            patch_elems=patch_elems,
-        )
-    else:
-        patch_rows = patch_cols = patch_elems = 0
-        SharedStorage = make_shared_storage_gfx1250(fx.BFloat16, cfg, num_buffers)
+    SharedStorage = make_shared_storage_gfx1250(fx.BFloat16, cfg, num_buffers)
 
     smem_bytes = dsl_size_of(SharedStorage)
     lds_cap = get_lds_capacity_bytes(gpu_arch)
@@ -329,6 +319,8 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
     wmma_m_rep, wmma_n_rep = cfg.mi_m, cfg.mi_n
     k_wmma_steps = 1
     N_ACCS = wmma_m_rep * wmma_n_rep
+    N_A_FRAGS = wmma_m_rep * k_wmma_steps
+    N_B_FRAGS = wmma_n_rep * k_wmma_steps
     elem_ty = fx.BFloat16
     CRS = geom.crs
     Y_ELEMS = param.n * geom.do * geom.ho * geom.wo * param.k
@@ -341,14 +333,14 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
     N_CC = cgp // TILE_K
     assert N_CC * param.kt * param.kh * param.kw == grid.k_tiles
 
-    if use_patch:
-        PATCH_GROUPS = [(kt_i, cc) for kt_i in range(param.kt) for cc in range(N_CC)]
+    variant = param.variant
+    main_loop_unroll = param.main_loop_unroll
 
     if const_expr(param.dyn_hw):
         extra_args = dyn_shape_values_gfx1250(param, geom, grid)
         dyn_unit = unit_divisors_gfx1250(grid, geom)
         kernel_grid = grid._replace(grid_m=0, hb=0, wb=0, do=0, ho=0, wo=0, n=0)
-        _assert_shape_agnostic_gfx1250(param, cfg, kernel_grid, dyn_unit, use_patch)
+        _assert_shape_agnostic_gfx1250(param, cfg, kernel_grid, dyn_unit)
     else:
         extra_args = ()
         dyn_unit = None
@@ -494,7 +486,10 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
 
         return store_accs
 
-    def _body_tap(y, x, weight, bias, dyn=None):
+    # @flyc.jit so the AST rewriter lowers the yield-carrying main loop to scf.for;
+    # a plain helper with `yield` is a Python generator and traces nothing.
+    @flyc.jit
+    def _body(y, x, weight, bias, dyn=None):
         tid = fx.Int32(gpu.thread_id("x"))
         layout_thr = fx.make_layout(
             (cfg.wave_m, cfg.wave_n, 2, 16),
@@ -632,10 +627,16 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
             fx.rocdl.WMMA(WMMA_M, WMMA_N, WMMA_K, elem_ty, fx.Float32)
         )
 
-        def wmma_tile(accs_in, a_frags, b_frags):
+        def wmma_tile(accs_in, a_frags, b_frags, rotate_buf=None):
             a_ts = [rmem_vec(f, 16, elem_ty) for f in a_frags]
             b_ts = [rmem_vec(f, 16, elem_ty) for f in b_frags]
             acc_ts = [rmem_vec(a, 8, fx.Float32) for a in accs_in]
+            rotate = rotate_buf is not None
+            next_a = [None] * N_A_FRAGS if rotate else None
+            next_b = [None] * N_B_FRAGS if rotate else None
+            if const_expr(rotate):
+                a_off = slot_a(rotate_buf)
+                b_off = slot_b(rotate_buf)
             for ks in range_constexpr(k_wmma_steps):
                 for wm in range_constexpr(wmma_m_rep):
                     a_f = a_ts[ks * wmma_m_rep + wm]
@@ -648,7 +649,18 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                             a_f,
                             acc_ts[idx],
                         )
-            return [t.load() for t in acc_ts]
+                    if const_expr(rotate):
+                        rocdl.sched_barrier(_SCHED_ALLOW_SALU)
+                        next_a[ks * wmma_m_rep + wm] = load_wmma_frag(
+                            big_a_mem, None, a_off, ks, wm, a_bases, lds_k, elem_ty
+                        )
+                if const_expr(rotate):
+                    rocdl.sched_barrier(_SCHED_ALLOW_SALU)
+                    for wn in range_constexpr(wmma_n_rep):
+                        next_b[ks * wmma_n_rep + wn] = load_wmma_frag(
+                            big_b_mem, None, b_off, ks, wn, b_bases, lds_k, elem_ty
+                        )
+            return [t.load() for t in acc_ts], next_a, next_b
 
         store_accs = _make_store_accs(
             y,
@@ -671,219 +683,102 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
         rocdl.disable_xdl_arb_stall()
         acc_zero = fx.Vector.filled(8, fx.Float32(0.0), fx.Float32)
         accs = [acc_zero] * N_ACCS
-        num_k = kernel_grid.tiles_per_split
         k0 = k_off // TILE_K
 
-        if const_expr(num_k > 0):
-            issue_tdm(0, k0)
-        for k_idx in range_constexpr(num_k):
-            buf = k_idx % num_buffers
-            if const_expr(k_idx + 1 < num_k):
-                issue_tdm((k_idx + 1) % num_buffers, k0 + k_idx + 1)
-            tdm_ops.tensor_wait(0)
+        def _pack_state(accs_, a_, b_):
+            return list(accs_) + list(a_) + list(b_)
+
+        def _unpack_state(state):
+            out, i = [], 0
+            for n in (N_ACCS, N_A_FRAGS, N_B_FRAGS):
+                out.append(list(state[i : i + n]))
+                i += n
+            return out
+
+        def _run_tile(accs_, ca, cb, cidx, lidx):
+            # Absolute K-tile index = split-K base + local load index.
+            issue_tdm(lidx % num_buffers, k0 + lidx)
+            tdm_ops.tensor_wait(
+                0 if num_buffers == 2 else (num_buffers - 2) * _TDMS_PER_TILE
+            )
             gpu.barrier()
-            a_frags = load_a_frags(buf)
-            b_frags = load_b_frags(buf)
-            accs = wmma_tile(accs, a_frags, b_frags)
+            next_buf_i32 = (cidx + 1) % num_buffers
+            if const_expr(variant == "compute_bound"):
+                return wmma_tile(accs_, ca, cb, rotate_buf=next_buf_i32)
+            na = load_a_frags(next_buf_i32)
+            nb = load_b_frags(next_buf_i32)
+            accs_, _, _ = wmma_tile(accs_, ca, cb)
+            return accs_, na, nb
 
-        if const_expr(num_k > 0):
-            store_accs(accs)
+        # Prologue: issue B-1 tiles, wait for the oldest, load frags for tile 0.
+        for i in range_constexpr(num_buffers - 1):
+            issue_tdm(i, k0 + i)
+        tdm_ops.tensor_wait((num_buffers - 2) * _TDMS_PER_TILE)
+        gpu.barrier()
+        cur_a, cur_b = load_a_frags(0), load_b_frags(0)
 
-    def _body_patch(y, x, weight, bias, dyn=None):
-        """Unit-stride kH×kW reuse: one TDM patch per (kt, cc), tap frags from LDS."""
-        tid = fx.Int32(gpu.thread_id("x"))
-        layout_thr = fx.make_layout(
-            (cfg.wave_m, cfg.wave_n, 2, 16),
-            (cfg.wave_n * WAVE_SIZE, WAVE_SIZE, 16, 1),
-        )
-        thr = idx2crd(tid, layout_thr)
-        wave_m_idx = fx.Uint64(fx.get(thr, 0))
-        wave_n_idx = fx.Uint64(fx.get(thr, 1))
-        lane_kgrp = fx.Uint64(fx.get(thr, 2))
-        lane16 = fx.Uint64(fx.get(thr, 3))
-        warp_m_base = wave_m_idx * cfg.warp_tile_m
-        warp_n_base = wave_n_idx * cfg.warp_tile_n
+        main_loop_iters = num_k_tiles - (num_buffers - 1)
+        load_idx_init, compute_idx_init = fx.Uint32(num_buffers - 1), fx.Uint32(0)
 
-        n_idx, ot, oh0, ow0, n_offset, n_local, gi, _k_off = decode_block_2d(
-            kernel_grid, dyn
-        )
+        TILES_PER_TRIP = 2 if variant == "bandwidth_bound" and main_loop_unroll else 1
+        num_trips = main_loop_iters // TILES_PER_TRIP
+        load_idx_s, compute_idx_s = load_idx_init, compute_idx_init
 
-        if const_expr(dyn is not None):
-            Dp, Hp, Wp = dyn.d, dyn.h, dyn.w
-            do_v, ho_v, wo_v = dyn.do, dyn.ho, dyn.wo
+        if const_expr(num_trips > 0):
+            init_state = _pack_state(accs, cur_a, cur_b) + [
+                load_idx_init,
+                compute_idx_init,
+            ]
+            results = init_state
+            for trip, state in range(0, num_trips, 1, init=init_state):
+                cidx, lidx = fx.Uint32(state[-1]), fx.Uint32(state[-2])
+                p_accs, ca, cb = _unpack_state(state[:-2])
+                for _sub in range_constexpr(TILES_PER_TRIP):
+                    p_accs, ca, cb = _run_tile(p_accs, ca, cb, cidx, lidx)
+                    cidx, lidx = cidx + 1, lidx + 1
+                results = yield _pack_state(p_accs, ca, cb) + [lidx, cidx]
+
+            accs, cur_a, cur_b = _unpack_state(results[:-2])
+            # loop results come back untyped; re-wrap so % stays unsigned (remui)
+            load_idx_s = fx.Uint32(results[-2])
+            compute_idx_s = fx.Uint32(results[-1])
         else:
-            Dp, Hp, Wp = param.d, param.h, param.w
-            do_v, ho_v, wo_v = geom.do, geom.ho, geom.wo
-        Cp = param.c
+            accs = list(accs)
 
-        lds = fx.SharedAllocator(static=True).allocate(SharedStorage).peek()
-        big_a_mem, big_b_mem = lds.a.ptr, lds.b.ptr
-        lds_k = cfg.lds_k_stride
-        PR, PC = patch_rows, patch_cols
-
-        a_base = (((n_idx * Dp + ot * param.st) * Hp + oh0) * Wp + ow0) * Cp + fx.Int64(
-            gi
-        ) * cgp
-        gA = fx.Tensor(
-            fx.make_view(
-                fx.add_offset(fx.get_iter(x), a_base),
-                fx.make_layout((PR, PC, TILE_K), (Wp * Cp, Cp, 1)),
+        if const_expr(main_loop_iters % TILES_PER_TRIP == 1):
+            accs, cur_a, cur_b = _run_tile(
+                accs, cur_a, cur_b, compute_idx_s, load_idx_s
             )
+
+        # Drain the remaining in-flight tiles.
+        drain_count_d = (
+            num_buffers - 1
+            if main_loop_iters > 0
+            else min(num_buffers - 1, num_k_tiles)
         )
-        h_left = fx.Int32(fx.Int64(Hp) - oh0)
-        w_left = fx.Int32(fx.Int64(Wp) - ow0)
-        atom_a = fx.rocdl.make_tdm_atom(
-            gA,
-            [h_left, w_left, None],
-            strides=[Wp * Cp, Cp, None],
-            num_warps=num_warps,
-            pad_interval=TILE_K,
-            pad_amount=LDS_PAD,
-            early_timeout=True,
-        )
+        drain_base = max(0, main_loop_iters)
 
-        b_base = fx.Int64(n_offset) * CRS
-        gB = fx.Tensor(
-            fx.make_view(
-                fx.add_offset(fx.get_iter(weight), b_base),
-                fx.make_layout((cfg.tile_n, TILE_K), (CRS, 1)),
-            )
-        )
-        n_left = fx.Int32(fx.Int64(kernel_grid.kg) - fx.Int64(n_local))
-        atom_b = fx.rocdl.make_tdm_atom(
-            gB,
-            [n_left, None],
-            strides=[CRS, None],
-            num_warps=num_warps,
-            pad_interval=TILE_K,
-            pad_amount=LDS_PAD,
-            early_timeout=True,
-        )
-
-        def a_lane_bases_at_tap(kh_i, kw_i):
-            tap_r = kh_i * param.dh
-            tap_c = kw_i * param.dw
-            bases = []
-            for rep in range_constexpr(wmma_m_rep):
-                local_m = warp_m_base + rep * WMMA_M + lane16
-                pr = local_m // C + tap_r
-                pc = local_m % C + tap_c
-                bases.append(pr * PC * lds_k + pc * lds_k + lane_kgrp * 8)
-            return bases
-
-        b_bases = lane_bases_rowmajor(warp_n_base, wmma_n_rep, lds_k, lane16, lane_kgrp)
-
-        def slot_patch(gs):
-            return fx.Uint64(gs * patch_elems)
-
-        def slot_b(buf):
-            return fx.Uint64(buf * cfg.lds_b_elems_per_buf)
-
-        def load_patch(g, gs):
-            kt_i, cc = PATCH_GROUPS[g]
-            imm = fx.Int64((kt_i * param.dt * Hp * Wp * Cp + cc * TILE_K) * BF16_BYTES)
-            dst = fx.Tensor(
-                fx.make_view(
-                    fx.add_offset(big_a_mem, slot_patch(gs)),
-                    fx.make_layout((PR, PC, TILE_K), (PC * lds_k, lds_k, 1)),
+        accs = list(accs)
+        drain_a, drain_b = cur_a, cur_b
+        for j in range_constexpr(drain_count_d):
+            tile_idx = drain_base + j
+            if const_expr(j < drain_count_d - 1):
+                next_tile = tile_idx + 1
+                tdm_ops.tensor_wait(
+                    max(0, num_k_tiles - 1 - next_tile) * _TDMS_PER_TILE
                 )
-            )
-            fx.copy(atom_a, gA, dst, imm_offset=imm)
+                gpu.barrier()
+                next_a = load_a_frags(next_tile % num_buffers)
+                accs, _, _ = wmma_tile(accs, drain_a, drain_b)
+                next_b = load_b_frags(next_tile % num_buffers)
+                drain_a, drain_b = next_a, next_b
+            else:
+                accs, _, _ = wmma_tile(accs, drain_a, drain_b)
 
-        def read_a_tap(gs, kh_i, kw_i):
-            bases = a_lane_bases_at_tap(kh_i, kw_i)
-            off = slot_patch(gs)
-            return [
-                load_wmma_frag(big_a_mem, None, off, 0, rep, bases, lds_k, elem_ty)
-                for rep in range_constexpr(wmma_m_rep)
-            ]
-
-        def read_b(buf):
-            off = slot_b(buf)
-            return [
-                load_wmma_frag(big_b_mem, None, off, 0, rep, b_bases, lds_k, elem_ty)
-                for rep in range_constexpr(wmma_n_rep)
-            ]
-
-        wmma_atom = fx.make_mma_atom(
-            fx.rocdl.WMMA(WMMA_M, WMMA_N, WMMA_K, elem_ty, fx.Float32)
-        )
-
-        def wmma_tile(accs_in, a_frags, b_frags):
-            a_ts = [rmem_vec(f, 16, elem_ty) for f in a_frags]
-            b_ts = [rmem_vec(f, 16, elem_ty) for f in b_frags]
-            acc_ts = [rmem_vec(a, 8, fx.Float32) for a in accs_in]
-            for wm in range_constexpr(wmma_m_rep):
-                for wn in range_constexpr(wmma_n_rep):
-                    idx = wm * wmma_n_rep + wn
-                    fx.gemm(wmma_atom, acc_ts[idx], b_ts[wn], a_ts[wm], acc_ts[idx])
-            return [t.load() for t in acc_ts]
-
-        store_accs = _make_store_accs(
-            y,
-            bias,
-            warp_m_base,
-            warp_n_base,
-            lane16,
-            lane_kgrp,
-            n_idx,
-            ot,
-            oh0,
-            ow0,
-            n_offset,
-            n_local,
-            do_v,
-            ho_v,
-            wo_v,
-        )
-
-        rocdl.disable_xdl_arb_stall()
-        acc_zero = fx.Vector.filled(8, fx.Float32(0.0), fx.Float32)
-        accs = [acc_zero] * N_ACCS
-        KH, KW = param.kh, param.kw
-
-        def load_group(g, gs):
-            load_patch(g, gs)
-            kt_i, cc = PATCH_GROUPS[g]
-            for kh_i in range_constexpr(KH):
-                for kw_i in range_constexpr(KW):
-                    s_local = kh_i * KW + kw_i
-                    k_base = ((kt_i * KH + kh_i) * KW + kw_i) * cgp + cc * TILE_K
-                    dst = fx.Tensor(
-                        fx.make_view(
-                            fx.add_offset(
-                                big_b_mem,
-                                slot_b(gs * KH * KW + s_local),
-                            ),
-                            fx.make_layout((cfg.tile_n, TILE_K), (lds_k, 1)),
-                        )
-                    )
-                    fx.copy(
-                        atom_b,
-                        gB,
-                        dst,
-                        imm_offset=fx.Int64(k_base * BF16_BYTES),
-                    )
-
-        load_group(0, 0)
-        for g in range_constexpr(len(PATCH_GROUPS)):
-            gs = g % 2
-            tdm_ops.tensor_wait(0)
-            gpu.barrier()
-            pending_a = []
-            pending_b = []
-            for kh_i in range_constexpr(KH):
-                for kw_i in range_constexpr(KW):
-                    pending_a.append(read_a_tap(gs, kh_i, kw_i))
-                    pending_b.append(read_b(gs * KH * KW + kh_i * KW + kw_i))
-            if const_expr(g + 1 < len(PATCH_GROUPS)):
-                load_group(g + 1, (g + 1) % 2)
-            for j in range_constexpr(KH * KW):
-                accs = wmma_tile(accs, pending_a[j], pending_b[j])
-
-        store_accs(accs)
-
-    body = _body_patch if use_patch else _body_tap
+        if const_expr(num_buffers > 2):
+            rocdl.sched_barrier(0)
+        if const_expr(num_k_tiles > 0):
+            store_accs(accs)
 
     if const_expr(param.dyn_hw):
 
@@ -927,7 +822,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
                 grid_m,
                 unit=dyn_unit,
             )
-            body(y, x, weight, bias, dyn)
+            _body(y, x, weight, bias, dyn)
 
         @flyc.jit
         def launch(
@@ -984,7 +879,7 @@ def compile_conv3d_implicit_gfx1250(param: Conv3dImplicitParam1250):
         def conv3d_implicit_kernel(
             y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor
         ):
-            body(y, x, weight, bias, None)
+            _body(y, x, weight, bias, None)
 
         @flyc.jit
         def launch(

@@ -563,7 +563,6 @@ def _compile_conv3d_gfx1250_to_cache(
         out_ndhwc,
         block_rows,
         num_buffers=2,
-        patch_reuse=False,
         splitk=splitk,
         dyn_hw=dyn_hw,
     )

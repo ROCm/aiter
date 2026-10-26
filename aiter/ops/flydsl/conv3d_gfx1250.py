@@ -32,6 +32,7 @@ from aiter.ops.flydsl.kernels.conv.conv3d_implicit_gfx1250 import (
 
 # Heuristic ladder (tile_m, tile_n, m_warp, n_warp, block_rows).
 _TILE_LADDER = (
+    (128, 128, 2, 4, 8),
     (128, 128, 2, 2, 8),
     (128, 64, 2, 2, 8),
     (64, 64, 2, 2, 4),
@@ -164,23 +165,22 @@ def _warn_dropped_tile(tile):
     )
 
 
-def _patch_reuse_ok(st, sh, sw, kh, kw, groups, tile, block_rows, d, h, w, cgp):
-    if not (st == sh == sw == 1 and (kh > 1 or kw > 1) and groups == 1):
-        return False
+def _clamp_num_buffers(num_buffers, tiles_per_split, tile, block_rows):
+    """Drop to a legal B that fits LDS and leaves a nonempty prologue."""
     from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-    from aiter.ops.flydsl.kernels.conv.conv3d_gfx1250_utils import (
-        LDS_PAD,
-        make_tile_config_gfx1250,
-    )
+    from aiter.ops.flydsl.conv3d_policy_gfx1250 import lds_bytes_tap
 
-    cfg = make_tile_config_gfx1250(tile, block_rows)
-    pr = block_rows + (kh - 1)
-    pc = cfg.block_cols + (kw - 1)
-    patch_elems = pr * pc * cfg.lds_k_stride + LDS_PAD
-    b_elems = 2 * kh * kw * cfg.lds_b_elems_per_buf
-    a_elems = 2 * patch_elems
-    bytes_ = 2 * (a_elems + b_elems)
-    return bytes_ <= get_lds_capacity_bytes() // 2
+    b = max(2, min(8, int(num_buffers)))
+    lds_cap = get_lds_capacity_bytes()
+    while b > 2 and (
+        tiles_per_split < b - 1
+        or lds_bytes_tap(tile[0], tile[1], num_buffers=b) > lds_cap
+    ):
+        b -= 1
+    if tiles_per_split < b - 1:
+        b = max(2, tiles_per_split + 1)
+    del block_rows  # reserved for future LDS accounting that needs cfg
+    return b
 
 
 def _dyn_hw_ok_gfx1250(n, c_padded, d, h, w, k, npq, tile, block_rows, ho, wo):
@@ -223,13 +223,16 @@ def run_conv3d_gfx1250(
     block_rows=None,
     input_layout="NCDHW",
     output_layout="NCDHW",
-    patch_reuse=True,
+    patch_reuse=True,  # gfx950 API parity; ignored on gfx1250 (no patch path)
     splitk=None,
     wgm=None,  # accepted for API parity; unused on gfx1250
+    num_buffers=2,
+    variant="bandwidth_bound",
+    main_loop_unroll=False,
     **_ignored,
 ):
     """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile)."""
-    del _ignored
+    del _ignored, patch_reuse
     in_ndhwc = input_layout == "NDHWC"
     out_ndhwc = output_layout == "NDHWC"
     n, c, d, h, w = _shape_ncdhw(x, in_ndhwc)
@@ -377,19 +380,16 @@ def run_conv3d_gfx1250(
             )
         sk = 1
 
-    use_patch = (
-        bool(patch_reuse)
-        and sk == 1
-        and _patch_reuse_ok(
-            st, sh, sw, kh, kw, groups, chosen_tile, chosen_br, d, h, w, cgp
-        )
-    )
-
     dyn_hw = _dyn_hw_ok_gfx1250(
         n, c_padded, d, h, w, k, npq, chosen_tile, chosen_br, ho, wo
     )
     if dyn_hw and n_tail:
         dyn_hw = False
+
+    # Match GEMM: B-1 K-tiles must fill the prologue; clamp against LDS too.
+    k_tiles = crs // 32  # TILE_K == CGP_ALIGN == 32
+    tiles_per_split = k_tiles // max(1, sk)
+    nb = _clamp_num_buffers(num_buffers, tiles_per_split, chosen_tile, chosen_br)
 
     if sk > 1:
         y = torch.zeros((npq, k), device=x.device, dtype=torch.float32)
@@ -422,10 +422,11 @@ def run_conv3d_gfx1250(
         groups,
         out_ndhwc,
         chosen_br,
-        num_buffers=2,
-        patch_reuse=use_patch,
+        num_buffers=nb,
         splitk=sk,
         dyn_hw=dyn_hw,
+        variant=variant,
+        main_loop_unroll=main_loop_unroll,
     )
     exe = compile_conv3d_implicit_gfx1250(param)
     launch_stream = torch.cuda.current_stream() if stream is None else stream
