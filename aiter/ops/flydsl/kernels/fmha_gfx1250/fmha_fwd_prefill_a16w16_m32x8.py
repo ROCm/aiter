@@ -19,9 +19,10 @@ Both resolve their per-workgroup base offsets + sequence bounds, then call the
 layout-agnostic ``_core_attention`` helper.
 
 Scope — v1 (this file is intentionally config-agnostic in its name):
-  - ``qk_hdim in {64, 128, 192, 256}`` (D_qk), ``v_hdim in {64, 128}`` (D_v); they are
+  - ``qk_hdim in {64, 128, 192, 256}`` (D_qk), ``v_hdim in {64, 128, 256}`` (D_v); they are
     independent. ``n_block`` is picked by ``pick_n_block`` (128 at qk_hdim <= 128,
-    64 at 192/256)
+    64 at 192/256). v_hdim 256 runs at BLOCK_M 128 only: the BLOCK_M 256 O tile
+    does not fit its LDS staging chunk
   - dtype: bf16 for Q/K/V/O
   - grouped-query attention (GQA): ``gqa = nheads_q // nheads_k``
   - causal and non-causal
@@ -97,8 +98,10 @@ NUM_Q_TILES_CHOICES = (1, 2)
 # A wave owns WMMA_M * num_q_tiles contiguous packed (seq, q_head_in_group) rows, and Q/O
 # describe that tile with ONE rectangular TDM box. That only works when a head group is
 # never split across waves: either a wave holds whole groups, or it sits inside one.
-def supported_num_q_tiles(gqa_ratio):
-    """The num_q_tiles choices whose packed-row tile never splits a head group.
+def supported_num_q_tiles(gqa_ratio, v_hdim=None):
+    """The num_q_tiles choices whose packed-row tile never splits a head group and
+    whose O epilogue staging fits its LDS chunk at ``v_hdim`` (256 fits one tile
+    only). ``v_hdim=None`` skips the LDS check.
 
     ``_pick_num_q_tiles`` picks only from these, so a ratio is servable as long as ONE
     choice packs it -- gqa 48 straddles at rows_per_warp 32 but fits inside a group at 16.
@@ -106,13 +109,28 @@ def supported_num_q_tiles(gqa_ratio):
     return tuple(
         n
         for n in sorted(NUM_Q_TILES_CHOICES)
-        if gqa_ratio % (WMMA_M * n) == 0 or (WMMA_M * n) % gqa_ratio == 0
+        if (gqa_ratio % (WMMA_M * n) == 0 or (WMMA_M * n) % gqa_ratio == 0)
+        and (v_hdim is None or _o_fits(v_hdim, gqa_ratio, n))
     )
 
 
-def supports_gqa_ratio(gqa_ratio):
+@functools.cache
+def _o_fits(v_hdim, gqa_ratio, num_q_tiles_per_wave):
+    try:
+        _o_manager(
+            v_hdim=v_hdim,
+            gqa_ratio=gqa_ratio,
+            num_q_tiles_per_wave=num_q_tiles_per_wave,
+            elem_dtype=_DTYPE_MAP[DEFAULT_DTYPE],
+        )
+    except AssertionError:
+        return False
+    return True
+
+
+def supports_gqa_ratio(gqa_ratio, v_hdim=None):
     """True when some BLOCK_M can tile this ratio; the routers gate on it."""
-    return bool(supported_num_q_tiles(gqa_ratio))
+    return bool(supported_num_q_tiles(gqa_ratio, v_hdim))
 
 
 # Causal work grows with the M index, so dispatch the heavy tiles first.
@@ -153,7 +171,7 @@ DEFAULT_DTYPE = "bf16"
 _DTYPE_MAP = {"bf16": fx.BFloat16, "fp16": fx.Float16}
 _TORCH_DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
 SUPPORTED_QK_HDIM = (64, 128, 192, 256)
-SUPPORTED_V_HDIM = (64, 128)
+SUPPORTED_V_HDIM = (64, 128, 256)
 
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
 N_BLOCK_CHOICES = (32, 64, 128, 256)
@@ -2953,13 +2971,13 @@ def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, dtype_str):
     return int(max_seqlen_k) <= n_block
 
 
-def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio):
+def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio, v_hdim):
     """Smallest Q tile whose grid still fits one workgroup wave; the largest otherwise."""
     rows = int(max_seqlen_q) * int(gqa_ratio)
     per_tile = int(num_kv_heads) * int(batch)
     NUM_WGS_PER_CU = 1  # the >256 KB LDS footprint pins occupancy at one WG per CU
     resident = get_cu_num() * NUM_WGS_PER_CU
-    ok = supported_num_q_tiles(gqa_ratio)
+    ok = supported_num_q_tiles(gqa_ratio, v_hdim)
     for num_tiles in ok:
         block_m = _block_m(num_tiles)
         if ((rows + block_m - 1) // block_m) * per_tile <= resident:
@@ -3218,7 +3236,7 @@ def flash_attn_varlen_m32x8(
     lse=None,
     num_q_tiles_per_wave=None,
 ):
-    """Host entry — varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128}, bf16 or fp16.
+    """Host entry — varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
 
     ``window_size`` is ``(left, right)`` sliding-window bounds, ``-1`` meaning infinite
     on that side; ``causal`` forces ``right=0``. Only finiteness is baked into the kernel
@@ -3303,7 +3321,9 @@ def flash_attn_varlen_m32x8(
     stride_o_head = out.stride(1)
 
     if num_q_tiles_per_wave is None:
-        num_q_tiles_per_wave = _pick_num_q_tiles(nheads_k, batch, max_seqlen_q, gqa)
+        num_q_tiles_per_wave = _pick_num_q_tiles(
+            nheads_k, batch, max_seqlen_q, gqa, v_hdim
+        )
     num_q_tiles_per_wave = int(num_q_tiles_per_wave)
 
     one_kv_tile = _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, dtype_str)
@@ -3383,7 +3403,7 @@ def flash_attn_batch_m32x8(
     lse=None,
     num_q_tiles_per_wave=None,
 ):
-    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {64,128,192,256} / v_hdim in {64,128}, bf16 or fp16.
+    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
 
     Uses the dedicated BSHD kernel with a uniform ``seq_len`` scalar (no cu_seqlens), so
     there is nothing transient to bake into a CUDA graph. ``window_size``, ``causal``,
@@ -3483,7 +3503,9 @@ def flash_attn_batch_m32x8(
     stride_o_head = out.stride(2)
 
     if num_q_tiles_per_wave is None:
-        num_q_tiles_per_wave = _pick_num_q_tiles(nheads_k, batch, seq_len_q, gqa)
+        num_q_tiles_per_wave = _pick_num_q_tiles(
+            nheads_k, batch, seq_len_q, gqa, v_hdim
+        )
     num_q_tiles_per_wave = int(num_q_tiles_per_wave)
 
     one_kv_tile = _pick_one_kv_tile(seq_len_k, qk_hdim, v_hdim, dtype_str)
