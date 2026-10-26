@@ -2429,8 +2429,12 @@ def check_varlen_capable_objects(arch="gfx950"):
             text=True,
             check=True,
         ).stdout
-        # Drop the trailing "// address: encoding" first, or a code address matches 0x1c0.
-        if not re.search(r"\b0x1c0\b", re.sub(r"//.*", "", listing)):
+        # Match the load off the kernarg base, not a bare 0x1c0: the literal also shows up as an
+        # ordinary VALU immediate, which let an object that never reads seqlens_k pass this.
+        if not re.search(
+            r"s_load_dword(?:x2)?\s+s\[\d+:\d+\], s\[0:1\], 0x1c0\b",
+            re.sub(r"//.*", "", listing),
+        ):
             silent.append(name)
     assert not silent, (
         f"{arch} rows claimed in _VARLEN_CAPABLE_QV never load kernarg 0x1C0: {silent}; "
