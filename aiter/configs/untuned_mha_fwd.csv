@@ -1,0 +1,1 @@
+mode,batch,total_q,total_k,max_seqlen_q,max_seqlen_k,min_seqlen_q,nhead_q,nhead_k,hdim_q,hdim_v,dtype,causal,window_left,window_right,sink_size,dropout_p,logits_soft_cap,how_v3_bf16_cvt,return_lse,return_attn_probs,has_bias,has_alibi,has_sink,has_block_table,has_q_descale,has_physical_padding,is_grad
