@@ -1575,17 +1575,24 @@
             "f'{CK_DIR}/example/ck_tile/50_sparse_attn/generate.py -d fwd_vsa --receipt 600 --output_dir {{}}'"
         ]
     },
-    "module_pa_mqa_logits_mxfp4_opus": {
+    "module_mqa_logits_mxfp4_opus": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/pa_mqa_logits_mxfp4/pa_mqa_logits_mxfp4_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/pa_mqa_logits_mxfp4/pa_mqa_logits_mxfp4_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_logits_mxfp4/mqa_logits_mxfp4_launcher.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_logits_mxfp4/mqa_logits_mxfp4_gfx1250.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_logits_mxfp4/mqa_logits_mxfp4_pybind.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
             "'-fno-finite-math-only'",
-            "('-mllvm -enable-post-misched=1' if (get_gfx() == 'gfx950' or 'gfx950' in os.environ.get('GPU_ARCHS', '')) else '')"
+            "f'-DMQA_LOGITS_MXFP4_KNOCK={int(os.environ.get(\"MQA_LOGITS_MXFP4_KNOCK\", 0))}'"
         ],
+        "flags_extra_hip_per_source": {
+            "*mqa_logits_mxfp4_gfx1250.cu": [
+                "-fno-honor-nans",
+                "-mllvm -enable-post-misched=1"
+            ]
+        },
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

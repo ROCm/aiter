@@ -1,17 +1,24 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Device-side Table schedule builder (build_tiles + build_sched): arch-agnostic int-only code,
+// included by the launcher TU after the record ABI (mqa_logits_mxfp4.h); not standalone.
+//
+// A tile is up to rows_per_cta consecutive rows of ONE sequence (build_tiles cuts them from
+// query_start_loc; at one row a CTA a tile is a row). Its block-table row is its sequence:
+// the last b with query_start_loc[b] <= its first row, which skips empty sequences. Rows at or
+// past query_start_loc[num_seqs] belong to no sequence and get no work.
 #pragma once
-// Device-side schedule builder (build_tiles + build_sched), shared by gfx950 and gfx1250:
-// arch-agnostic int-only code. Included by pa_mqa_logits_mxfp4_opus.h under
-// PA_MQA_LOGITS_MXFP4_IMPL after the kargs/record ABI it uses; not standalone.
 
-// Keep this opening line and the two-space closing brace byte-identical: an out-of-tree check
-// locates the block by them.
 namespace opus_logits {
 
 constexpr int SCHED_BUILD_BLOCK      = 256;
 constexpr int SCHED_BUILD_BLOCK_WIDE = 1024;
+// Sequences whose bounds a builder workgroup stages in LDS (8 KB); past it, it searches global.
+constexpr int SCHED_QSL_LDS = 2048;
 
-// `resident` (CTAs the part holds at once) is per instance -- it follows the KV tile, hence
-// occupancy -- so it is always passed explicitly, never defaulted.
+// `resident` (CTAs the part holds at once) is per instance -- it follows occupancy -- so it is
+// always passed explicitly, never defaulted.
 
 // Split target: a whole number of rounds, so the last round is not left mostly empty.
 // 0 means do not split.
@@ -36,7 +43,6 @@ struct sched_build_plan {
     int blocks;  // workgroups for the emit; 1 means the single-workgroup kernel
 };
 
-// Launch policy, shared by both hosts.
 __host__ inline sched_build_plan sched_plan(int num_tiles, int num_ctas) {
     sched_build_plan p{SCHED_BUILD_BLOCK, 1};
     if (num_tiles < 512) return p;                 // narrow, one workgroup
@@ -51,8 +57,8 @@ __host__ inline sched_build_plan sched_plan(int num_tiles, int num_ctas) {
 namespace sched_detail {
 
 // Every barrier here must be a full __syncthreads(), not a bare s_barrier: threads hand values
-// through LDS (reductions, scan, general_emit staging) AND global memory (settle_safe reads back
-// cta_info records other threads' emit_fast stored). A bare s_barrier fences neither.
+// through LDS (reductions, scan, general_emit staging) AND global memory (settle_safe and the
+// priority pass read back cta_info records other threads stored). A bare s_barrier fences neither.
 
 template<int BLOCK, bool IS_MAX>
 __device__ inline int block_reduce(int v, int* s, int tid) {
@@ -108,32 +114,52 @@ __device__ inline int block_scan_excl(int v, int* s, int tid, int& total) {
     return incl - v;
 }
 
-// A tile's window is the union of its rows'; the caller guarantees a non-decreasing window rule,
-// so that is the first row's start and the last row's end. Not checked here.
-__device__ inline int tile_union_end(const int* __restrict__ local_ends, int r0, int r1) {
-    return r1 > r0 ? local_ends[r1 - 1] : 0;
-}
-__device__ inline int tile_union_start(const int* __restrict__ local_starts, int r0, int r1) {
-    return (local_starts && r1 > r0) ? local_starts[r0] : 0;
+// What a tile is cut from: the tile cut (null: a tile is a row), the sequences' bounds (in LDS
+// when they fit, else global) and the windows.
+struct sched_rows {
+    const int* cu_tiles;
+    const int* qsl;
+    int        num_seqs;
+    int        end_row;    // qsl[num_seqs]
+    const int* row_ends;
+};
+
+template<int BLOCK>
+__device__ inline sched_rows stage_rows(const int* cu_tiles, const int* qsl, int num_seqs,
+                                        const int* row_ends, int* s_qsl, int tid) {
+    sched_rows s{cu_tiles, qsl, num_seqs, 0, row_ends};
+    if (num_seqs <= SCHED_QSL_LDS) {   // uniform
+        for (int i = tid; i <= num_seqs; i += BLOCK) s_qsl[i] = qsl[i];
+        __syncthreads();
+        s.qsl = s_qsl;
+    }
+    s.end_row = s.qsl[num_seqs];
+    return s;
 }
 
-// Tile t's first row. NULL cu_tiles is the identity cut (q_per_block == 1: a tile is a row).
-__device__ inline int tile_row(const int* __restrict__ cu_tiles, int t) {
-    return cu_tiles ? cu_tiles[t] : t;
+// Tile t's first row. At one row a tile, rows past the sequences make empty tiles.
+__device__ inline int tile_row(const sched_rows& s, int t) {
+    return s.cu_tiles ? s.cu_tiles[t] : (t < s.end_row ? t : s.end_row);
 }
 
-// Branchless on purpose: callers are latency-bound strided walks, and a branch on the
-// just-loaded value serializes them.
-__device__ inline int tile_kv_tiles(const int* __restrict__ cu_tiles,
-                                    const int* __restrict__ local_starts,
-                                    const int* __restrict__ local_ends,
-                                    int t, int block_k) {
-    const int r0    = tile_row(cu_tiles, t);
-    const int r1    = tile_row(cu_tiles, t + 1);
-    const int e     = tile_union_end(local_ends, r0, r1);
-    const int first = tile_union_start(local_starts, r0, r1) / block_k;
-    const int end   = e > 0 ? ((e + block_k - 1) / block_k) : 0;
-    return end > first ? end - first : 0;
+// The sequence of row r < end_row: the last b with qsl[b] <= r (qsl[num_seqs] > r).
+__device__ inline int seq_of_row(const sched_rows& s, int r) {
+    int lo = 0, hi = s.num_seqs;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (s.qsl[mid] <= r) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+// A tile's window is its last row's: windows do not decrease along a sequence.
+__device__ inline int tile_union_end(const sched_rows& s, int r0, int r1) {
+    return r1 > r0 ? s.row_ends[r1 - 1] : 0;
+}
+
+__device__ inline int tile_kv_tiles(const sched_rows& s, int t, int block_k) {
+    const int e = tile_union_end(s, tile_row(s, t), tile_row(s, t + 1));
+    return e > 0 ? (e + block_k - 1) / block_k : 0;
 }
 
 // Reads the count emit_fast stored (recomputing needs a dependent global load). Valid only
@@ -145,10 +171,7 @@ __device__ inline int tile_kv_tiles_cached(const opus_mqa_cta_record* cta_info, 
 
 // Reduces and emits in one walk: the one-CTA-per-tile record is written speculatively and
 // overwritten only if splitting is needed.
-__device__ inline void emit_fast(const int* __restrict__ cu_tiles,
-                                 const int* __restrict__ local_starts,
-                                 const int* __restrict__ local_ends,
-                                 const int* __restrict__ row_to_batch,
+__device__ inline void emit_fast(const sched_rows& s,
                                  opus_mqa_cta_record* __restrict__ cta_info,
                                  int first_tile, int num_tiles, int stride, int block_k,
                                  int& part_max, int& part_sum, int& part_nz) {
@@ -156,24 +179,17 @@ __device__ inline void emit_fast(const int* __restrict__ cu_tiles,
     part_sum = 0;
     part_nz  = 0;
     for (int t = first_tile; t < num_tiles; t += stride) {
-        const int r0    = tile_row(cu_tiles, t);
-        const int r1    = tile_row(cu_tiles, t + 1);
-        const int e     = tile_union_end(local_ends, r0, r1);
-        const int s     = tile_union_start(local_starts, r0, r1);
-        // r1 > r0 guard: an empty surplus tile has r0 == cu_seq_q[batch], past row_to_batch.
-        const int b     = (row_to_batch && r1 > r0) ? row_to_batch[r0] : r0;
-        const int first = s / block_k;
-        const int end   = e > 0 ? ((e + block_k - 1) / block_k) : 0;
-        const int n     = end > first ? end - first : 0;
+        const int r0 = tile_row(s, t);
+        const int r1 = tile_row(s, t + 1);
+        const int e  = tile_union_end(s, r0, r1);
+        const int n  = e > 0 ? ((e + block_k - 1) / block_k) : 0;
         if (n > part_max) part_max = n;
         part_sum += n;
         part_nz  += (n > 0);
         opus_mqa_cta_record rec{};
         rec.row_id      = r0;
-        rec.batch_id    = b;
-        rec.chunk_start = first;
+        rec.batch_id    = r1 > r0 ? seq_of_row(s, r0) : 0;
         rec.chunk_count = n;
-        rec.local_start = s;
         rec.local_end   = e;
         rec.group_rows  = r1 - r0;
         cta_info[t]     = rec;
@@ -185,8 +201,7 @@ __device__ inline void mark_surplus(opus_mqa_cta_record* __restrict__ cta_info,
                                     int first_slot, int num_ctas, int stride) {
     for (int slot = first_slot; slot < num_ctas; slot += stride) {
         opus_mqa_cta_record rec{};
-        rec.chunk_count = 0;
-        cta_info[slot]  = rec;
+        cta_info[slot] = rec;
     }
 }
 
@@ -195,11 +210,11 @@ __device__ inline int settle_safe(const opus_mqa_cta_record* cta_info,
                                   int num_tiles, int num_ctas,
                                   int safe, int max_tiles, int nz_tiles, int* smem, int tid) {
     if (nz_tiles >= num_ctas) return max_tiles;
-    auto ctas_for = [&](int s) {
+    auto ctas_for = [&](int sf) {
         int part = 0;
         for (int t = tid; t < num_tiles; t += BLOCK) {
             const int n = tile_kv_tiles_cached(cta_info, t);
-            part += (n + s - 1) / s;
+            part += (n + sf - 1) / sf;
         }
         return block_reduce<BLOCK, false>(part, smem, tid);
     };
@@ -215,30 +230,27 @@ __device__ inline int settle_safe(const opus_mqa_cta_record* cta_info,
     return safe;
 }
 
+// Returns the slots used; `chunk_max` gets this thread's longest chunk.
 template<int BLOCK>
-__device__ inline int general_emit(const int* __restrict__ cu_tiles,
-                                   const int* __restrict__ local_starts,
-                                   const int* __restrict__ local_ends,
-                                   const int* __restrict__ row_to_batch,
+__device__ inline int general_emit(const sched_rows& s,
                                    opus_mqa_cta_record* __restrict__ cta_info,
                                    int num_tiles, int num_ctas, int block_k, int safe,
                                    int* smem, int* s_excl, int* s_tiles, int* s_batch,
-                                   int* s_end, int* s_ls, int* s_row, int* s_rows, int tid) {
+                                   int* s_end, int* s_row, int* s_rows, int tid, int& chunk_max) {
     int carry = 0;
+    chunk_max = 0;
     for (int base = 0; base < num_tiles; base += BLOCK) {
         const int t = base + tid;
-        const int tiles = (t < num_tiles)
-                            ? tile_kv_tiles(cu_tiles, local_starts, local_ends, t, block_k) : 0;
+        const int tiles = (t < num_tiles) ? tile_kv_tiles(s, t, block_k) : 0;
         const int nc = (tiles + safe - 1) / safe;
         int block_total = 0;
         const int excl = block_scan_excl<BLOCK>(nc, smem, tid, block_total);
-        const int r0 = (t < num_tiles) ? tile_row(cu_tiles, t)     : 0;
-        const int r1 = (t < num_tiles) ? tile_row(cu_tiles, t + 1) : 0;
+        const int r0 = (t < num_tiles) ? tile_row(s, t)     : 0;
+        const int r1 = (t < num_tiles) ? tile_row(s, t + 1) : 0;
         s_excl[tid]  = excl;
         s_tiles[tid] = tiles;
-        s_batch[tid] = (row_to_batch && r1 > r0) ? row_to_batch[r0] : r0;   // as in emit_fast
-        s_end[tid]   = tile_union_end(local_ends, r0, r1);
-        s_ls[tid]    = tile_union_start(local_starts, r0, r1);
+        s_batch[tid] = r1 > r0 ? seq_of_row(s, r0) : 0;   // as in emit_fast
+        s_end[tid]   = tile_union_end(s, r0, r1);
         s_row[tid]   = r0;
         s_rows[tid]  = r1 - r0;
         __syncthreads();
@@ -262,12 +274,12 @@ __device__ inline int general_emit(const int* __restrict__ cu_tiles,
                 opus_mqa_cta_record rec{};
                 rec.row_id      = s_row[tl];
                 rec.batch_id    = s_batch[tl];
-                rec.chunk_start = s_ls[tl] / block_k + i * q + (i < r ? i : r);
+                rec.chunk_start = i * q + (i < r ? i : r);
                 rec.chunk_count = q + (i < r ? 1 : 0);
-                rec.local_start = s_ls[tl];
                 rec.local_end   = s_end[tl];
                 rec.group_rows  = s_rows[tl];
                 cta_info[slot]  = rec;
+                if (rec.chunk_count > chunk_max) chunk_max = rec.chunk_count;
             }
         }
         carry += block_total;
@@ -281,30 +293,41 @@ __device__ inline int split_factor(int total_tiles, int cta_target) {
     return safe < 1 ? 1 : safe;
 }
 
+// A one-round schedule (every slot resident at once) carries its longest chunk in every
+// record's spare word: the H64 kernel measures its wave priority against it. Multi-round ones
+// keep 0, which leaves the priority alone (there the age order retires CTAs for the next round).
 template<int BLOCK>
-__device__ inline void settle_and_emit(const int* __restrict__ cu_tiles,
-                                       const int* __restrict__ local_starts,
-                                       const int* __restrict__ local_ends,
-                                       const int* __restrict__ row_to_batch,
+__device__ inline void mark_chunk_max(opus_mqa_cta_record* cta_info, int num_ctas, int resident,
+                                      int chunk_max, int tid) {
+    if (resident <= 0 || num_ctas > resident) return;
+    __syncthreads();
+    for (int slot = tid; slot < num_ctas; slot += BLOCK) cta_info[slot]._pad = chunk_max;
+}
+
+template<int BLOCK>
+__device__ inline void settle_and_emit(const sched_rows& s,
                                        opus_mqa_cta_record* __restrict__ cta_info,
                                        int num_tiles, int num_ctas, int block_k, int resident,
                                        int max_tiles, int total_tiles, int nz_tiles,
                                        bool surplus_done,
                                        int* smem, int* s_excl, int* s_tiles, int* s_batch,
-                                       int* s_end, int* s_ls, int* s_row, int* s_rows, int tid) {
+                                       int* s_end, int* s_row, int* s_rows, int tid) {
     const int aim   = (resident <= 0) ? 0 : sched_target(nz_tiles, resident);
     const int safe0 = (aim <= 0) ? max_tiles : split_factor(total_tiles, aim);
     if (max_tiles <= safe0) {
         if (!surplus_done) mark_surplus(cta_info, num_tiles + tid, num_ctas, BLOCK);
+        mark_chunk_max<BLOCK>(cta_info, num_ctas, resident, max_tiles, tid);
         return;
     }
     const int safe = settle_safe<BLOCK>(cta_info, num_tiles, num_ctas,
                                         safe0, max_tiles, nz_tiles, smem, tid);
-    const int carry = general_emit<BLOCK>(cu_tiles, local_starts, local_ends, row_to_batch,
-                                          cta_info, num_tiles, num_ctas, block_k, safe, smem,
-                                          s_excl, s_tiles, s_batch, s_end, s_ls, s_row, s_rows,
-                                          tid);
+    int part_max = 0;
+    const int carry = general_emit<BLOCK>(s, cta_info, num_tiles, num_ctas, block_k, safe, smem,
+                                          s_excl, s_tiles, s_batch, s_end, s_row, s_rows, tid,
+                                          part_max);
     mark_surplus(cta_info, carry + tid, num_ctas, BLOCK);
+    const int chunk_max = block_reduce<BLOCK, true>(part_max, smem, tid);
+    mark_chunk_max<BLOCK>(cta_info, num_ctas, resident, chunk_max, tid);
 }
 
 }  // namespace sched_detail
@@ -312,8 +335,8 @@ __device__ inline void settle_and_emit(const int* __restrict__ cu_tiles,
 constexpr int GROUPS_BUILD_BLOCK     = 256;
 constexpr int GROUPS_BUILD_MAX_BATCH = 2048;   // 8 KB of LDS for the per-batch offsets
 
-// Cut each batch's rows into tiles of at most qpb rows (unused at qpb == 1; see tile_row).
-// Contract: a tile is contiguous rows of ONE batch. Breaking it deadlocks: the CTA's waves
+// Cut each sequence's rows into tiles of at most qpb rows (unused at qpb == 1; see tile_row).
+// Contract: a tile is contiguous rows of ONE sequence. Breaking it deadlocks: the CTA's waves
 // disagree on the trip count at the phase barrier. One workgroup, so GROUPS_BUILD_MAX_BATCH
 // caps the batch.
 __global__ __launch_bounds__(GROUPS_BUILD_BLOCK)
@@ -351,52 +374,53 @@ void mqa_logits_build_tiles(const int* __restrict__ cu_seq_q,
 template<int BLOCK>
 __global__ __launch_bounds__(BLOCK)
 void mqa_logits_build_sched(const int* __restrict__ cu_tiles,
-                            const int* __restrict__ local_starts,
-                            const int* __restrict__ local_ends,
-                            const int* __restrict__ row_to_batch,
+                            const int* __restrict__ query_start_loc,
+                            const int* __restrict__ row_ends,
                             opus_mqa_cta_record* __restrict__ cta_info,
-                            int num_tiles, int num_ctas,
+                            int num_seqs, int num_tiles, int num_ctas,
                             int block_k, int resident) {
+    __shared__ int s_qsl[SCHED_QSL_LDS + 1];
     __shared__ int smem[3 * BLOCK];
     __shared__ int s_excl[BLOCK];
     __shared__ int s_tiles[BLOCK];
     __shared__ int s_batch[BLOCK];
     __shared__ int s_end[BLOCK];
-    __shared__ int s_ls[BLOCK];
     __shared__ int s_row[BLOCK];
     __shared__ int s_rows[BLOCK];
     const int tid = (int)__builtin_amdgcn_workitem_id_x();
+    const sched_detail::sched_rows s =
+        sched_detail::stage_rows<BLOCK>(cu_tiles, query_start_loc, num_seqs, row_ends, s_qsl, tid);
 
     int part_max = 0, part_sum = 0, part_nz = 0;
-    sched_detail::emit_fast(cu_tiles, local_starts, local_ends, row_to_batch, cta_info,
-                            tid, num_tiles, BLOCK, block_k, part_max, part_sum, part_nz);
+    sched_detail::emit_fast(s, cta_info, tid, num_tiles, BLOCK, block_k,
+                            part_max, part_sum, part_nz);
     int max_tiles = 0, total_tiles = 0, nz_tiles = 0;
     sched_detail::block_reduce_stats<BLOCK>(part_max, part_sum, part_nz, smem, tid,
                                             max_tiles, total_tiles, nz_tiles);
-    sched_detail::settle_and_emit<BLOCK>(cu_tiles, local_starts, local_ends, row_to_batch,
-                                         cta_info, num_tiles, num_ctas, block_k, resident,
+    sched_detail::settle_and_emit<BLOCK>(s, cta_info, num_tiles, num_ctas, block_k, resident,
                                          max_tiles, total_tiles, nz_tiles, /*surplus_done=*/false,
-                                         smem, s_excl, s_tiles, s_batch, s_end, s_ls,
-                                         s_row, s_rows, tid);
+                                         smem, s_excl, s_tiles, s_batch, s_end, s_row, s_rows, tid);
 }
 
 template<int BLOCK>
 __global__ __launch_bounds__(BLOCK)
 void mqa_logits_build_sched_emit(const int* __restrict__ cu_tiles,
-                                 const int* __restrict__ local_starts,
-                                 const int* __restrict__ local_ends,
-                                 const int* __restrict__ row_to_batch,
+                                 const int* __restrict__ query_start_loc,
+                                 const int* __restrict__ row_ends,
                                  opus_mqa_cta_record* __restrict__ cta_info,
                                  int* __restrict__ scratch,
-                                 int num_tiles, int num_ctas, int block_k, int blocks) {
+                                 int num_seqs, int num_tiles, int num_ctas, int block_k,
+                                 int blocks) {
+    __shared__ int s_qsl[SCHED_QSL_LDS + 1];
     __shared__ int smem[3 * BLOCK];
     const int tid    = (int)__builtin_amdgcn_workitem_id_x();
     const int bid    = (int)__builtin_amdgcn_workgroup_id_x();
     const int stride = BLOCK * blocks;
+    const sched_detail::sched_rows s =
+        sched_detail::stage_rows<BLOCK>(cu_tiles, query_start_loc, num_seqs, row_ends, s_qsl, tid);
 
     int part_max = 0, part_sum = 0, part_nz = 0;
-    sched_detail::emit_fast(cu_tiles, local_starts, local_ends, row_to_batch, cta_info,
-                            bid * BLOCK + tid, num_tiles, stride, block_k,
+    sched_detail::emit_fast(s, cta_info, bid * BLOCK + tid, num_tiles, stride, block_k,
                             part_max, part_sum, part_nz);
     sched_detail::mark_surplus(cta_info, num_tiles + bid * BLOCK + tid, num_ctas, stride);
 
@@ -413,22 +437,23 @@ void mqa_logits_build_sched_emit(const int* __restrict__ cu_tiles,
 template<int BLOCK>
 __global__ __launch_bounds__(BLOCK)
 void mqa_logits_build_sched_finish(const int* __restrict__ cu_tiles,
-                                   const int* __restrict__ local_starts,
-                                   const int* __restrict__ local_ends,
-                                   const int* __restrict__ row_to_batch,
+                                   const int* __restrict__ query_start_loc,
+                                   const int* __restrict__ row_ends,
                                    opus_mqa_cta_record* __restrict__ cta_info,
                                    const int* __restrict__ scratch,
-                                   int num_tiles, int num_ctas, int block_k, int resident,
-                                   int blocks) {
+                                   int num_seqs, int num_tiles, int num_ctas, int block_k,
+                                   int resident, int blocks) {
+    __shared__ int s_qsl[SCHED_QSL_LDS + 1];
     __shared__ int smem[3 * BLOCK];
     __shared__ int s_excl[BLOCK];
     __shared__ int s_tiles[BLOCK];
     __shared__ int s_batch[BLOCK];
     __shared__ int s_end[BLOCK];
-    __shared__ int s_ls[BLOCK];
     __shared__ int s_row[BLOCK];
     __shared__ int s_rows[BLOCK];
     const int tid = (int)__builtin_amdgcn_workitem_id_x();
+    const sched_detail::sched_rows s =
+        sched_detail::stage_rows<BLOCK>(cu_tiles, query_start_loc, num_seqs, row_ends, s_qsl, tid);
 
     int part_max = 0, part_sum = 0, part_nz = 0;
     for (int i = tid; i < blocks; i += BLOCK) {
@@ -440,11 +465,9 @@ void mqa_logits_build_sched_finish(const int* __restrict__ cu_tiles,
     int max_tiles = 0, total_tiles = 0, nz_tiles = 0;
     sched_detail::block_reduce_stats<BLOCK>(part_max, part_sum, part_nz, smem, tid,
                                             max_tiles, total_tiles, nz_tiles);
-    sched_detail::settle_and_emit<BLOCK>(cu_tiles, local_starts, local_ends, row_to_batch,
-                                         cta_info, num_tiles, num_ctas, block_k, resident,
+    sched_detail::settle_and_emit<BLOCK>(s, cta_info, num_tiles, num_ctas, block_k, resident,
                                          max_tiles, total_tiles, nz_tiles, /*surplus_done=*/true,
-                                         smem, s_excl, s_tiles, s_batch, s_end, s_ls,
-                                         s_row, s_rows, tid);
+                                         smem, s_excl, s_tiles, s_batch, s_end, s_row, s_rows, tid);
 }
 
 }  // namespace opus_logits

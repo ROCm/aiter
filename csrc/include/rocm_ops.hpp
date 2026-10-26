@@ -1601,46 +1601,40 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("softmax_scale"));
 
-#define PA_MQA_LOGITS_MXFP4_PYBIND                       \
-    m.def("pa_mqa_logits_mxfp4_build_tiles",             \
-          &pa_mqa_logits_mxfp4_build_tiles,              \
-          py::arg("cu_seq_q"),                           \
+#define MQA_LOGITS_MXFP4_PYBIND                          \
+    m.def("mqa_logits_mxfp4_instances",                  \
+          &mqa_logits_mxfp4_instances,                   \
+          py::arg("device_id"),                          \
+          py::arg("out"));                               \
+    m.def("mqa_logits_mxfp4_build_schedule",             \
+          &mqa_logits_mxfp4_build_schedule,              \
+          py::arg("query_start_loc"),                    \
+          py::arg("row_ends"),                           \
           py::arg("cu_tiles"),                           \
-          py::arg("total_q"),                            \
-          py::arg("max_tiles"),                          \
-          py::arg("q_per_block"));                       \
-    m.def("pa_mqa_logits_mxfp4_build_sched",             \
-          &pa_mqa_logits_mxfp4_build_sched,              \
-          py::arg("cu_tiles"),                           \
-          py::arg("local_starts"),                       \
-          py::arg("local_ends"),                         \
-          py::arg("row_to_batch"),                       \
           py::arg("cta_info"),                           \
-          py::arg("num_tiles"),                          \
-          py::arg("num_rows"),                           \
+          py::arg("instance"),                           \
           py::arg("num_ctas"),                           \
-          py::arg("cta_resident"),                       \
-          py::arg("block_k"),                            \
-          py::arg("q_per_block"));                       \
-    m.def("pa_mqa_logits_mxfp4_fwd_sched",               \
-          &pa_mqa_logits_mxfp4_fwd_sched,                \
+          py::arg("cta_resident"));                      \
+    m.def("mqa_logits_mxfp4_launch",                     \
+          &mqa_logits_mxfp4_launch,                      \
+          py::arg("instance"),                           \
+          py::arg("mode"),                               \
           py::arg("q"),                                  \
           py::arg("q_scale"),                            \
           py::arg("kv_cache"),                           \
           py::arg("kv_scale"),                           \
-          py::arg("block_tables"),                       \
           py::arg("weights"),                            \
-          py::arg("local_starts"),                       \
-          py::arg("local_ends"),                         \
+          py::arg("block_tables"),                       \
+          py::arg("query_start_loc"),                    \
+          py::arg("row_ends"),                           \
           py::arg("cta_info"),                           \
           py::arg("out"),                                \
-          py::arg("num_rows"),                           \
-          py::arg("num_ctas"),                           \
+          py::arg("out_offsets"),                        \
           py::arg("weight_scale"),                       \
-          py::arg("kv_block_size"),                      \
-          py::arg("max_seq_len"),                        \
-          py::arg("q_per_block"),                        \
-          py::arg("block_k"));
+          py::arg("tpb_shift"),                          \
+          py::arg("cta_target"),                         \
+          py::arg("prefill_parts"),                      \
+          py::arg("grid"));
 
 #define FMHA_FWD_BF16_OPUS_PYBIND                   \
     m.def("fmha_fwd_bf16_opus_fwd",                 \
