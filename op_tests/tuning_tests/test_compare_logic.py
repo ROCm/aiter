@@ -81,6 +81,13 @@ def _make_tuned_csv(path, rows):
 # ---------------------------------------------------------------------------
 class TestBuildCompareUpdatePlan(unittest.TestCase):
 
+    def test_cli_rejects_a_bar_outside_0_to_100(self):
+        parser = _StubTuner.get().parser
+        self.assertEqual(parser.parse_args([]).min_improvement_pct, 3.0)
+        for value in ("-1", "100"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                parser.parse_args(["--min_improvement_pct", value])
+
     def _build_plan(self, shapes, pre_results, post_results, threshold=3.0):
         tuner = _StubTuner.get()
         shapes_df = _make_shapes_df(shapes)
@@ -396,6 +403,151 @@ class TestMergeCompareFilteredResults(unittest.TestCase):
         row_64 = merged[merged["M"].astype(int) == 64]
         self.assertEqual(len(row_64), 1)
         self.assertEqual(float(row_64.iloc[0]["us"]), 300.0)
+
+    def test_a_row_auto_select_beats_is_removed(self):
+        base_path, candidate_path = self._write_base_and_candidate(
+            base_rows=[
+                self._make_row(1, 1024, 512, 0, 100.0),
+                self._make_row(64, 4096, 2048, 0, 300.0),
+            ],
+            candidate_rows=[self._make_row(1, 1024, 512, 1, 90.0)],
+        )
+        comparison = self._make_comparison(
+            [
+                {
+                    "M": 1,
+                    "N": 1024,
+                    "K": 512,
+                    "update": True,
+                    "update_reason": "autoselect",
+                }
+            ]
+        )
+        merged = _StubTuner.get()._merge_compare_filtered_results(
+            base_path, candidate_path, comparison
+        )
+        self.assertEqual(merged["M"].astype(int).tolist(), [64])
+
+
+def _bench(us):
+    if us is None or us > 0:
+        return _make_bench_result("s", "ok", us)
+    return _make_bench_result("s", "error: stale: retired", -1)
+
+
+class TestCompareAgainstAutoSelect(unittest.TestCase):
+    """With auto-select timings (COMPARE_AUTOSELECT), --compare also weighs
+    serving the shape with no row."""
+
+    def test_outcomes(self):
+        cases = {
+            # (tuned row, candidate, auto-select): update_reason
+            (9.0, 8.9, 10.0): "skip",  # the tuned row is defended by the bar
+            (9.0, 9.0, 8.0): "autoselect",  # auto-select beats the row: removed
+            (9.0, -1, 8.0): "autoselect",
+            (10.0, 9.0, 10.0): "threshold_met",  # the candidate beats both
+            (10.0, 9.6, 9.5): "autoselect",  # beats the row, not auto-select
+            (10.0, 9.7, 9.8): "skip",  # nothing beats the row by the bar
+            (-1, 8.0, 10.0): "no_baseline",  # a stale row is replaced
+            (-1, 9.9, 10.0): "autoselect",  # or removed
+            (-1, -1, 10.0): "autoselect",
+            (9.0, 9.0, -1): "skip",  # auto-select failed: plan as without it
+        }
+        tuner = _StubTuner.get()
+        shapes = _make_shapes_df([(1, 1024, 512)])
+        for (pre, post, auto), reason in cases.items():
+            with self.subTest(pre=pre, post=post, auto=auto):
+                plan = tuner._build_compare_update_plan(
+                    [_bench(pre)],
+                    [_bench(post)],
+                    3.0,
+                    shapes_df=shapes,
+                    autoselect_results=[_bench(auto)],
+                    autoselect_shapes=shapes,
+                )
+                self.assertEqual(plan.iloc[0]["update_reason"], reason)
+                self.assertEqual(plan.iloc[0]["update"], reason != "skip")
+
+    def test_shapes_without_a_row_keep_the_plain_plan(self):
+        tuner = _StubTuner.get()
+        shapes = _make_shapes_df([(1, 1024, 512), (32, 2048, 1024)])
+        plan = tuner._build_compare_update_plan(
+            [_bench(10.0), _bench(10.0)],
+            [_bench(9.0), _bench(9.0)],
+            3.0,
+            shapes_df=shapes,
+            autoselect_results=[_bench(8.0)],
+            autoselect_shapes=shapes.iloc[[1]],
+        )
+        self.assertEqual(
+            plan["update_reason"].tolist(), ["threshold_met", "autoselect"]
+        )
+
+    def test_auto_select_runs_tuned_shapes_with_an_empty_table(self):
+        from argparse import Namespace
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tuned = os.path.join(tmpdir, "tuned.csv")
+            _make_tuned_csv(
+                tuned,
+                [[TEST_GFX, TEST_CU, 1, 1024, 512, 0, 0, 9.0, "k0", 1.0, 1.0, 0.0]],
+            )
+            batch = _make_shapes_df([(1, 1024, 512), (32, 2048, 1024)])
+            tuner = _StubTuner.get()
+            seen = {}
+
+            def run(args, shapes, config_file=None):
+                seen["M"] = shapes["M"].tolist()
+                seen["table"] = pd.read_csv(config_file)
+                return [_bench(8.0)]
+
+            args = Namespace(verbose=False)
+            with mock.patch.object(tuner, "_run_config_for_shapes", run):
+                self.assertEqual(
+                    tuner._run_autoselect_benchmark(args, batch, tuned), (None, None)
+                )
+                tuner.COMPARE_AUTOSELECT = True
+                results, shapes = tuner._run_autoselect_benchmark(args, batch, tuned)
+        self.assertEqual(results, [_bench(8.0)])
+        self.assertEqual(shapes["M"].tolist(), [1])
+        self.assertEqual(seen["M"], [1])
+        self.assertTrue(seen["table"].empty)
+        self.assertIn("kernelId", seen["table"].columns)
+
+
+class TestStaleRows(unittest.TestCase):
+    def test_a_stale_row_does_not_count_as_tuned(self):
+        from argparse import Namespace
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            untuned = os.path.join(tmpdir, "untuned.csv")
+            tuned = os.path.join(tmpdir, "tuned.csv")
+            pd.DataFrame({"M": [1, 32], "N": [1024, 2048], "K": [512, 1024]}).to_csv(
+                untuned, index=False
+            )
+            _make_tuned_csv(
+                tuned,
+                [
+                    [TEST_GFX, TEST_CU, 1, 1024, 512, 0, 0, 9.0, "k0", 1.0, 1.0, 0.0],
+                    [TEST_GFX, TEST_CU, 32, 2048, 1024, 7, 0, 9.0, "k7", 1.0, 1.0, 0.0],
+                ],
+            )
+            args = Namespace(all=False, untune_file=untuned, tune_file=tuned)
+            args.verbose = False
+            for stale_kernel, left in ((None, []), (7, [32])):
+                with self.subTest(stale_kernel=stale_kernel):
+                    tuner = _StubTuner.get()
+                    tuner.stale_reason = lambda row, k=stale_kernel: (
+                        "retired" if row["kernelId"] == k else ""
+                    )
+                    with (
+                        mock.patch.object(tuner, "get_gfx", return_value=TEST_GFX),
+                        mock.patch.object(tuner, "get_cu_num", return_value=TEST_CU),
+                    ):
+                        tuner.pre_process(args)
+                    self.assertEqual(tuner.untunedf["M"].tolist(), left)
 
 
 if __name__ == "__main__":
