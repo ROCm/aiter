@@ -23,6 +23,8 @@ Supported kernel families:
   - ``flydsl_mxpsh_*``                        gfx950 MX-microscale preshuffle GEMM
   - ``flydsl_mxfp8_8w_*``                     gfx950 8-wave mxfp8 (1x32 row scales) GEMM
   - ``flydsl_bmm_mxfp8_mfma_*``               gfx950 mxscale batched GEMM kernels
+  - ``flydsl_a4w4_bpreshuffle_{,compute_}wmma_*`` gfx1250 MXFP4 GEMM kernels (every
+    cluster_m fallback and bounded-M variant, plus the untuned-M fallback)
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -59,6 +61,12 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+    COMPUTE_NAME_PREFIX as A4W4_COMPUTE_PREFIX,
+)
+from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+    GENERAL_NAME_PREFIX as A4W4_GENERAL_PREFIX,
+)
 from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
     BMM_MFMA_NAME_PREFIX,
     compile_bmm_a8w8_mxfp8_gfx950,
@@ -144,6 +152,7 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
     AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE,
 ]
 GEMM_AOT_ARCH_DEFAULT = "gfx950"
 
@@ -262,10 +271,74 @@ def _decode_served_ms(row_keys, gfx, cu_num, m, n, k):
     return served
 
 
+def _a4w4_jobs(rows: list[dict]) -> list[dict]:
+    """Every specialization an a4w4_mxscale_bpreshuffle table can launch: each FlyDSL
+    kernel it names or falls back to below a shape's smallest tuned M, at every cluster_m
+    the runtime may fit (an M of cluster_m whole tiles picks it), and both bounded-M
+    variants of the compute kernel."""
+    from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+        parse_a4w4_kernel_name,
+    )
+    from aiter.ops.gemm_op_a4w4 import flydsl_a4w4_fallback_kernel
+
+    kernels, min_m = {}, {}
+    for row in rows:
+        shape = (row["gfx"].strip(), int(row["cu_num"]), int(row["N"]), int(row["K"]))
+        min_m[shape] = min(min_m.get(shape, int(row["M"])), int(row["M"]))
+        if row["libtype"].strip() == "flydsl":
+            kernels.setdefault(row["kernelName"].strip(), shape)
+    for (gfx, cu_num, n, k), m0 in min_m.items():
+        for m in range(1, m0):
+            name = flydsl_a4w4_fallback_kernel(m, n, k, cu_num)
+            if name is not None:
+                kernels.setdefault(name, (gfx, cu_num, n, k))
+
+    jobs = []
+    for name, (gfx, cu_num, n, k) in kernels.items():
+        cfg = parse_a4w4_kernel_name(name)
+        if cfg is None:
+            print(f"  [WARN] Unknown FlyDSL a4w4 kernel name: {name}, skipping")
+            continue
+        compute = cfg["compute_bound"]
+        for cm in range(1, cfg["cluster_m"] + 1):
+            if compute and cm * cfg["cluster_n"] < 2:
+                continue
+            for bounded_m in (False, True) if compute else (None,):
+                jobs.append(
+                    {
+                        "kernel_name": name,
+                        "kind": "a4w4_wmma",
+                        "m": cfg["tile_m"] * cm,
+                        "n": n,
+                        "k": k,
+                        "cu_num": cu_num,
+                        "gfx": gfx,
+                        "bounded_m": bounded_m,
+                        "out_dtype": "bf16",
+                    }
+                )
+    return jobs
+
+
+def _is_a4w4_row(row: dict) -> bool:
+    name = row.get("kernelName", "").strip()
+    return name.startswith((A4W4_GENERAL_PREFIX, A4W4_COMPUTE_PREFIX)) or (
+        row.get("libtype", "").strip() == "asm"
+        and "f4gemm_bf16_mxfp4_BpreShuffle_" in name
+    )
+
+
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
-    jobs = []
-    seen = set()
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    # A mixed CSV may contain several families. Only a4w4 rows may contribute
+    # to its tuned kernels and fallback shapes; route the rest independently.
+    a4w4_rows, other_rows = [], []
+    for row in rows:
+        (a4w4_rows if _is_a4w4_row(row) else other_rows).append(row)
+    jobs = _a4w4_jobs(a4w4_rows) if a4w4_rows else []
+    seen = {job_identity(job) for job in jobs}
     batched_skipped = set()
     # The mxfp8 table's gfx950 rows, and the e8m0 blockscale table's kernelId
     # "mxfp8" rows, name mxpsh / 8-wave kernels that read the raw (unshuffled)
@@ -273,8 +346,6 @@ def parse_csv(csv_path: str):
     # mxpsh rows any other table may still hold.
     mxfp8_table = "a8w8_mxfp8_bpreshuffle" in os.path.basename(csv_path)
 
-    with open(csv_path, newline="") as f:
-        all_rows = list(csv.DictReader(f))
     # Keys of every row, not only FlyDSL ones: a non-FlyDSL row at the exact M
     # shadows a padded FlyDSL row at runtime.
     row_keys = {
@@ -285,11 +356,11 @@ def parse_csv(csv_path: str):
             int(r["N"]),
             int(r["K"]),
         ): True
-        for r in all_rows
-        if "b" not in r and r.get("M")
+        for r in rows
+        if not r.get("b", "").strip() and r.get("M")
     }
 
-    for row in all_rows:
+    for row in other_rows:
         kernel_name = row.get("kernelName", "").strip()
         libtype = row.get("libtype", "").strip()
         is_decode = kernel_name.startswith("flydsl_decode_")
@@ -298,7 +369,7 @@ def parse_csv(csv_path: str):
         ):
             continue
 
-        if "b" in row:  # a batched table
+        if row.get("b", "").strip():  # a batched row (may be in a mixed table)
             job = None
             if kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
                 job = _bmm_mfma_job(
@@ -1192,6 +1263,27 @@ def _compile_ptpc_wmma_to_cache(
             )
 
 
+def _compile_a4w4_to_cache(
+    *,
+    kernel_name: str,
+    m: int,
+    n: int,
+    k: int,
+    bounded_m: bool | None,
+    out_dtype: str,
+    **kwargs,
+):
+    del kwargs
+    import torch
+
+    from aiter.ops.flydsl.a4w4_mxscale_bpreshuffle_gemm_gfx1250 import (
+        preload_a4w4_kernel,
+    )
+
+    dtype = {"bf16": torch.bfloat16, "f16": torch.float16}[out_dtype]
+    preload_a4w4_kernel(kernel_name, m, n, k, dtype, bounded_m)
+
+
 def job_arch(cu_num: int = 0, gfx: str = "") -> str:
     """Target arch a job would compile for -- shared by dispatch and ARCH filtering."""
     return gfx or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
@@ -1261,6 +1353,8 @@ def compile_one_config(
                 )
             elif kind == "ptpc_wmma":
                 _compile_ptpc_wmma_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "a4w4_wmma":
+                _compile_a4w4_to_cache(kernel_name=kernel_name, m=m, n=n, k=k, **kwargs)
             elif kind == "bmm_mfma":
                 _compile_bmm_mfma_to_cache(kernel_name=kernel_name, n=n, k=k, **kwargs)
             else:

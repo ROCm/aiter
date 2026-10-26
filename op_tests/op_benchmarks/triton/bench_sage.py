@@ -312,13 +312,13 @@ def _generate_transformer_qkv(
     v = v / v.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
 
     q_channel_scale = torch.exp(
-        0.35 * torch.randn((1, hq, 1, d_head), device=device)
+        0.35 * torch.randn((1, hq, 1, d_head), device=device, dtype=torch.float32)
     ).clamp(0.35, 2.5)
     k_channel_scale = torch.exp(
-        0.35 * torch.randn((1, hk, 1, d_head), device=device)
+        0.35 * torch.randn((1, hk, 1, d_head), device=device, dtype=torch.float32)
     ).clamp(0.35, 2.5)
     v_channel_scale = torch.exp(
-        0.45 * torch.randn((1, hk, 1, d_head_v), device=device)
+        0.45 * torch.randn((1, hk, 1, d_head_v), device=device, dtype=torch.float32)
     ).clamp(0.25, 3.5)
     q = q * q_channel_scale
     k = k * k_channel_scale
@@ -859,6 +859,7 @@ def build_block_mask(
             num_q_blocks,
             num_kv_blocks,
             device=device,
+            dtype=torch.float32,
         )
         > args.block_sparsity
     ).to(torch.bool)
@@ -1963,7 +1964,8 @@ def load_captured_inputs(input_dir: str) -> list[dict[str, Any]]:
 
     inputs = []
     for file_path in input_files:
-        inputs.append(torch.load(file_path, weights_only=False))
+        # Keep captures in host memory. The full set can be larger than GPU memory.
+        inputs.append(torch.load(file_path, map_location="cpu", weights_only=False))
 
     logger.info("Loaded %d captured inputs", len(inputs))
     return inputs
@@ -2204,7 +2206,14 @@ def run_block_sparse_repetitions(
     num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
 
     warmup_mask = (
-        torch.rand(shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device)
+        torch.rand(
+            shape.batch,
+            shape.hq,
+            num_q_blocks,
+            num_kv_blocks,
+            device=device,
+            dtype=torch.float32,
+        )
         > args.block_sparsity
     ).to(torch.bool)
     warmup_lut = block_attn_mask_to_ragged_lut(warmup_mask, return_none_if_dense=True)
@@ -2229,7 +2238,12 @@ def run_block_sparse_repetitions(
     for _ in range(args.n_repetitions):
         mask = (
             torch.rand(
-                shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device
+                shape.batch,
+                shape.hq,
+                num_q_blocks,
+                num_kv_blocks,
+                device=device,
+                dtype=torch.float32,
             )
             > args.block_sparsity
         ).to(torch.bool)
@@ -2247,7 +2261,7 @@ def run_block_sparse_repetitions(
         tflops_effective.append(effective_tflops)
 
     def stats(x: list[float]) -> dict[str, float]:
-        t = torch.tensor(x)
+        t = torch.tensor(x, device=device, dtype=torch.float32)
         return {
             "median": torch.quantile(t, 0.5).item(),
             "q1": torch.quantile(t, 0.25).item(),
