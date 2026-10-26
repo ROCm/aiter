@@ -22,6 +22,20 @@ def run_host_scalar_ops_for_real(enabled: bool) -> bool:
     return previous
 
 
+_python_ops_real = False
+
+
+def run_python_ops_for_real(enabled: bool) -> bool:
+    """Make ops with a Python body (not bound C++ functions) run that body
+    instead of dispatching, so under FakeTensorMode the host code picking and
+    launching kernels runs while the C++ ops it calls still dispatch to their
+    fakes. Returns the previous setting."""
+    global _python_ops_real
+    previous = _python_ops_real
+    _python_ops_real = enabled
+    return previous
+
+
 def is_torch_equal_or_newer(target: str) -> bool:
     """Check if the installed torch version is >= the target version.
 
@@ -305,8 +319,12 @@ def torch_compile_guard(
         schema = f"{new_input} -> {output_part}".strip()
 
         loadName = calling_func.__name__
+        # A bound C++ function arrives through calling_func_; its func is a stub.
+        python_body = calling_func_ is None
 
         def wrapper_custom(*args, **kwargs):
+            if python_body and _python_ops_real:
+                return func(*args, **kwargs)
             result = (
                 getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
                 if input_is_tensor

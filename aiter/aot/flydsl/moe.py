@@ -75,6 +75,7 @@ from aiter.aot.flydsl.common import (
     replay_env,
     run_jobs_parallel,
 )
+from aiter.aot.flydsl.replay import requested_kernels
 from aiter.jit.core import AITER_CONFIGS
 from aiter_worker_limits import adopt_legacy_max_jobs
 
@@ -527,25 +528,8 @@ def _load_host_helpers(arch: str, cu_num: int) -> None:
         _mxfp4_moe_sort_internal_is_supported(256, 8, 7168, 32, True)
 
 
-@contextmanager
-def _requested_kernels():
-    """Collect the cache identity of every FlyDSL launch a replay reaches."""
-    from flydsl.compiler.jit_function import JitFunction
-
-    kernels = set()
-    build_key = JitFunction._build_full_cache_key
-
-    def record(self, *args, **kwargs):
-        key = build_key(self, *args, **kwargs)
-        kernels.add((self.manager_key, key))
-        return key
-
-    with mock.patch.object(JitFunction, "_build_full_cache_key", record):
-        yield kernels
-
-
 def _replay_recorded(job: dict) -> tuple[dict, frozenset | None]:
-    with _requested_kernels() as kernels:
+    with requested_kernels() as kernels:
         result = compile_one_config(**job)
     return result, (None if result["compile_time"] is None else frozenset(kernels))
 
