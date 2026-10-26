@@ -840,13 +840,31 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
 
 
 # Kimi-K3 at TP8 with every expert split 8 ways: inter_dim 3072 / 8 = 384 is a
-# multiple of 128 but not of 256. 32 is a token bucket of
-# model_configs/kimik3tp8_tuned_grouped_fmoe.csv; 2048, 20000 (padded to 32768)
-# and 131072 have no row, so the dispatch takes its default tiles. Nothing
-# forces a config. JIT, not run-only: the grouped-MoE AOT builds only the
-# auxiliary kernels (the TDM GEMM has no AOT wiring yet), so run-only cannot
-# load the GEMM for any shape.
-@pytest.mark.parametrize("tokens", [32, 2048, 20000, 131072])
+# multiple of 128 but not of 256.
+KIMI_K3_TP8_CSV_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "aiter",
+        "configs",
+        "model_configs",
+        "kimik3tp8_tuned_grouped_fmoe.csv",
+    )
+)
+
+
+def _kimi_k3_tp8_buckets() -> list[int]:
+    with open(KIMI_K3_TP8_CSV_PATH, newline="") as fh:
+        return sorted({int(row["token"]) for row in csv.DictReader(fh)})
+
+
+# Every token bucket of the Kimi-K3 TP8 table, so each row's tiles run once, then
+# 20000 (padded to 32768) and 131072, past the table: they take the default tiles,
+# and their routed buffers pass 2 GiB and 4 GiB. Nothing forces a config. JIT,
+# not run-only: the grouped-MoE AOT builds only the auxiliary kernels (the TDM
+# GEMM has no AOT wiring yet), so run-only cannot load the GEMM for any shape.
+@pytest.mark.parametrize("tokens", _kimi_k3_tp8_buckets() + [20000, 131072])
 def test_grouped_a4w4_situv2_kimi_k3_tp8_matches_torch_ref(tokens):
     run_moe(
         "a4w4",
@@ -863,15 +881,16 @@ def test_grouped_a4w4_situv2_kimi_k3_tp8_matches_torch_ref(tokens):
 
 # The same shape with a GEMM2 k-tile that 384 does not divide, as a tuned row or
 # AITER_TDM_TILE_K2 may pick: 256 runs one full tile and a 128-wide tail, 512 a
-# single ragged tile (K < tile_k). 2048 has no row, so the other tiles are the
-# defaults.
+# single ragged tile (K < tile_k). 20000 tokens are past the table, so the other
+# tiles are the defaults; an AITER_TDM_TILE_* override also sets num_buffers to 2
+# for both GEMMs, which GEMM2 clamps to its k-tile count anyway.
 @pytest.mark.parametrize("tile_k2", [256, 512])
 def test_grouped_a4w4_situv2_kimi_k3_tp8_k_tail_matches_torch_ref(tile_k2, monkeypatch):
     monkeypatch.setenv("AITER_TDM_TILE_K2", str(tile_k2))
     run_moe(
         "a4w4",
         experts=896,
-        tokens=2048,
+        tokens=20000,
         topk=16,
         model_dim=3584,
         inter_dim=384,
