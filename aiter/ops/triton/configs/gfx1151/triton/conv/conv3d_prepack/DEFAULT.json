@@ -1,0 +1,24 @@
+{
+    "any": {
+        "BLOCK_C": 64,
+        "BLOCK_M": 16,
+        "num_stages": 1,
+        "num_warps": 4
+    },
+    "shapes": {
+        "N=1,C=128,D=123,H=136,W=240,CB=64": {
+            "BLOCK_C": 32,
+            "BLOCK_M": 128,
+            "waves_per_eu": 2,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=160,D=3,H=354,W=642,CB=64": {
+            "BLOCK_C": 32,
+            "BLOCK_M": 128,
+            "waves_per_eu": 2,
+            "num_warps": 8,
+            "num_stages": 1
+        }
+    }
+}
