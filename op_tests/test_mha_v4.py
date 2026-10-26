@@ -602,6 +602,67 @@ def test_mha_v4_rotate_activation_hd128_accepts_empty_input():
     assert rotated.numel() == 0
 
 
+# Runs out-of-process: the regression is a GPU memory fault, which aborts the interpreter rather
+# than failing an assertion, and would take the rest of the session down with it.
+_K_MEAN_OOB_PROBE = """
+import os, sys
+os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+import torch
+from aiter.ops.mha_v4_quant import (
+    quantize_mxfp4_k,
+    quantize_mxfp6_k,
+    quantize_mxfp8_k,
+    rotate_activation_hd128,
+)
+
+seq, heads = {seq}, {heads}
+k = torch.randn(1, seq, heads, 128, device="cuda", dtype=torch.bfloat16)
+# Park the mean flush against the end of its own allocation so an over-read faults instead of
+# silently landing in a neighbour's memory.
+buf = torch.zeros(2 * 1024 * 1024 // 4, device="cuda")
+mean = buf[-heads * 128 :].view(1, heads, 128)
+
+if "{kernel}" == "hd128":
+    out = torch.empty_like(k)
+    rotate_activation_hd128(out, k, mean)
+else:
+    {{"mxfp8": quantize_mxfp8_k, "mxfp6": quantize_mxfp6_k, "mxfp4": quantize_mxfp4_k}}[
+        "{kernel}"
+    ](k, mean)
+torch.cuda.synchronize()
+"""
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 activation rotation",
+)
+@pytest.mark.parametrize("kernel", ["hd128", "mxfp8", "mxfp6", "mxfp4"])
+@pytest.mark.parametrize("seq,heads", [(3975, 3), (999, 3), (1001, 5)])
+def test_mha_v4_rotate_kernels_bound_the_k_mean_read(kernel, seq, heads):
+    """The rotate kernels work in blocks of 8 rows and subtract the K mean before the row < m
+    guard, so a row count that is not a multiple of 8 used to read a mean row past the end.
+    """
+    assert (
+        seq * heads
+    ) % 8, "shape must leave a partial 8-row block to exercise the bound"
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _K_MEAN_OOB_PROBE.format(seq=seq, heads=heads, kernel=kernel),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert probe.returncode == 0, (
+        f"{kernel} faulted at seq={seq} heads={heads} "
+        f"(rows={seq * heads}, rows%8={seq * heads % 8}): {probe.stderr[-400:]}"
+    )
+
+
 @pytest.mark.skipif(
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 FP8 recipe validation",
