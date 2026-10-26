@@ -11,7 +11,8 @@ Two layers:
     the table is wider than 20000 columns and ``M<=64``),
     ``bench_qsa_gluon_parity_indexer`` (H=8 emit; long-``L`` is H=8; the published
     page-size-8 point stays H=4),
-    ``bench_qsa_flash_next_paged_gqa`` (decode ``M<=8`` and a separate prefill table),
+    ``bench_qsa_flash_next_paged_gqa`` (decode ``M<=8`` and a separate prefill table;
+    ``--gqa`` is one rank: 24,2 / 12,1 / 6,1 / 3,1),
     ``bench_qsa_flash_next_e2e`` / ``bench_qsa_gluon_parity_e2e`` (indexer through
     GQA; Gluon-parity keeps both head counts),
     ``bench_qsa_flash_next_e2e_graph`` (HIP graph replay at decode).
@@ -74,6 +75,7 @@ from op_tests.qsa_ref import (
     GLUON_PARITY_GQA,
     GLUON_PARITY_INDEXER,
     GLUON_PARITY_INDEXER_H8,
+    QsaGqaSpec,
     gather_paged_cache,
     pack_paged_cache,
     qsa_expand_tail,
@@ -87,6 +89,9 @@ from op_tests.qsa_ref import (
 )
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+# One tensor-parallel rank of Flash-Next sparse GQA. The indexer stays at 4
+# heads on every rank; only the GQA query and KV heads split.
+_FLASH_NEXT_GQA_RANKS = ((24, 2), (12, 1), (6, 1), (3, 1))
 # Exactly 4 GiB still fits in a V# offset. The wide compile starts past that.
 _FOUR_GIB = 1 << 32
 
@@ -2624,20 +2629,51 @@ def bench_qsa_flash_next_indexer(
     return ret
 
 
+def _flash_next_gqa(n_heads: int, kv_heads: int) -> QsaGqaSpec:
+    """Flash-Next sparse GQA at one tensor-parallel rank.
+
+    TP1 is 24 query heads over 2 KV heads. TP2, TP4, and TP8 keep one KV
+    head and 12, 6, or 3 query heads. A group larger than 16 does not fit
+    the sparse-GQA MFMA tile.
+    """
+    if kv_heads < 1 or n_heads % kv_heads != 0:
+        raise ValueError(f"query heads {n_heads} do not group over {kv_heads} KV heads")
+    group = n_heads // kv_heads
+    if group > 16:
+        raise ValueError(f"group {group} does not fit one MFMA M dim")
+    if (n_heads, kv_heads) == (FLASH_NEXT_GQA.n_heads, FLASH_NEXT_GQA.kv_heads):
+        return FLASH_NEXT_GQA
+    return QsaGqaSpec(
+        n_heads=n_heads,
+        kv_heads=kv_heads,
+        head_dim=FLASH_NEXT_GQA.head_dim,
+        rope_dim=FLASH_NEXT_GQA.rope_dim,
+    )
+
+
 @benchmark()
 def bench_qsa_flash_next_paged_gqa(
-    m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
+    m,
+    seq_len,
+    page_size,
+    dtype,
+    n_heads,
+    kv_heads,
+    rotate=0,
+    cache_layout="packed",
 ):
     """Flash-Next FlyDSL sparse GQA vs the oracle.
 
     Live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
     log2 online softmax, direct output at one split, and a D-sliced merge.
     Expand and sigmoid stay unfused. Same ``rotate`` on every GQA column.
+    ``n_heads`` and ``kv_heads`` are one tensor-parallel rank. The indexer
+    that builds the oracle indices stays at 4 heads.
     ``cache_layout="wide"`` gives K and V the serving cache span. Sparse GQA
     reads V with K's strides, so the two views share one page stride.
     """
     idx = FLASH_NEXT_INDEXER
-    gqa = FLASH_NEXT_GQA
+    gqa = _flash_next_gqa(n_heads, kv_heads)
     device = torch.device("cuda")
     n_blocks = seq_len // idx.compress_ratio
     torch.manual_seed(0)
@@ -3362,16 +3398,26 @@ def _time_layer(case, idx, rotate):
 
 @benchmark()
 def bench_qsa_flash_next_e2e(
-    m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
+    m,
+    seq_len,
+    page_size,
+    dtype,
+    n_heads,
+    kv_heads,
+    rotate=0,
+    cache_layout="packed",
 ):
     """One Flash-Next QSA layer: FlyDSL indexer, expand, and sparse GQA.
 
     Expand is ``qsa_expand_block_indices``. Oracle is not timed. Same
     ``rotate`` on every column. HIP graph replay is a separate table.
+    ``n_heads`` and ``kv_heads`` are one tensor-parallel rank. The indexer
+    stays at 4 heads.
     ``cache_layout="wide"`` is the serving span on the indexer cache and
     on K and V.
     """
-    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
+    idx = FLASH_NEXT_INDEXER
+    gqa = _flash_next_gqa(n_heads, kv_heads)
     case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
@@ -3420,13 +3466,17 @@ def bench_qsa_gluon_parity_e2e(
 
 
 @benchmark()
-def bench_qsa_flash_next_e2e_graph(m, seq_len, page_size, dtype, cache_layout="packed"):
+def bench_qsa_flash_next_e2e_graph(
+    m, seq_len, page_size, dtype, n_heads, kv_heads, cache_layout="packed"
+):
     """HIP graph replay of one Flash-Next decode layer. Not combined with rotate.
 
     Each candidate is captured once, then ``replay`` is timed hot. The
-    output buffer after replay is the correctness check.
+    output buffer after replay is the correctness check. ``n_heads`` and
+    ``kv_heads`` are one tensor-parallel rank.
     """
-    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
+    idx = FLASH_NEXT_INDEXER
+    gqa = _flash_next_gqa(n_heads, kv_heads)
     case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     _w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
@@ -3608,6 +3658,18 @@ def main():
         "than L2. Pass both names to sweep them.",
     )
     parser.add_argument(
+        "--gqa",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=list(_FLASH_NEXT_GQA_RANKS),
+        help=(
+            "Flash-Next sparse GQA as query,kv head pairs for one\n"
+            "tensor-parallel rank. 24,2 is TP1, 12,1 is TP2, 6,1 is TP4,\n"
+            "and 3,1 is TP8. The indexer stays at 4 heads. Example:\n"
+            "--gqa 24,2 12,1"
+        ),
+    )
+    parser.add_argument(
         "--rotate",
         type=int,
         nargs="*",
@@ -3619,6 +3681,13 @@ def main():
         "Same value on every named backend in a row. Not combined with HIP graphs.",
     )
     args = parser.parse_args()
+    for spec in args.gqa:
+        if not isinstance(spec, tuple) or len(spec) != 2:
+            parser.error(f"--gqa expects query,kv pairs, got {spec!r}")
+        try:
+            _flash_next_gqa(*spec)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     if not torch.cuda.is_available():
         aiter.logger.warning("no CUDA; skipping QSA sweep")
@@ -3679,13 +3748,32 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate, cache_layout in itertools.product(
-            decode_m, args.seq, args.page_size, args.rotate, args.cache_layout
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            cache_layout,
+            (n_heads, kv_heads),
+        ) in itertools.product(
+            decode_m,
+            args.seq,
+            args.page_size,
+            args.rotate,
+            args.cache_layout,
+            args.gqa,
         ):
             if _skip_m_past_seq(m, seq_len, "Flash-Next sparse GQA decode"):
                 continue
             row = bench_qsa_flash_next_paged_gqa(
-                m, seq_len, page_size, dtype, rotate, cache_layout
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                n_heads,
+                kv_heads,
+                rotate,
+                cache_layout,
             )
             _raise_if_paged_gqa_above_tolerance(row["paged_gqa err"], m, seq_len)
             rows.append(row)
@@ -3745,13 +3833,32 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate, cache_layout in itertools.product(
-            prefill_m, args.seq, args.page_size, args.rotate, args.cache_layout
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            cache_layout,
+            (n_heads, kv_heads),
+        ) in itertools.product(
+            prefill_m,
+            args.seq,
+            args.page_size,
+            args.rotate,
+            args.cache_layout,
+            args.gqa,
         ):
             if _skip_m_past_seq(m, seq_len, "Flash-Next sparse GQA prefill"):
                 continue
             row = bench_qsa_flash_next_paged_gqa(
-                m, seq_len, page_size, dtype, rotate, cache_layout
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                n_heads,
+                kv_heads,
+                rotate,
+                cache_layout,
             )
             _raise_if_paged_gqa_above_tolerance(row["paged_gqa err"], m, seq_len)
             rows.append(row)
@@ -3873,13 +3980,32 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, rotate, cache_layout in itertools.product(
-            args.batch, args.seq, args.page_size, args.rotate, args.cache_layout
+        for (
+            m,
+            seq_len,
+            page_size,
+            rotate,
+            cache_layout,
+            (n_heads, kv_heads),
+        ) in itertools.product(
+            args.batch,
+            args.seq,
+            args.page_size,
+            args.rotate,
+            args.cache_layout,
+            args.gqa,
         ):
             if m > seq_len:
                 continue
             row = bench_qsa_flash_next_e2e(
-                m, seq_len, page_size, dtype, rotate, cache_layout
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                n_heads,
+                kv_heads,
+                rotate,
+                cache_layout,
             )
             _raise_if_row_mismatch(row, m, seq_len)
             rows.append(row)
@@ -3891,16 +4017,23 @@ def main():
             )
 
         rows = []
-        for m, seq_len, page_size, cache_layout in itertools.product(
+        for (
+            m,
+            seq_len,
+            page_size,
+            cache_layout,
+            (n_heads, kv_heads),
+        ) in itertools.product(
             [b for b in args.batch if b <= 8],
             args.seq,
             args.page_size,
             args.cache_layout,
+            args.gqa,
         ):
             if m > seq_len:
                 continue
             row = bench_qsa_flash_next_e2e_graph(
-                m, seq_len, page_size, dtype, cache_layout
+                m, seq_len, page_size, dtype, n_heads, kv_heads, cache_layout
             )
             _raise_if_row_mismatch(row, m, seq_len)
             rows.append(row)
