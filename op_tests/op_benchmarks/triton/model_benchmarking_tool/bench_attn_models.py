@@ -383,10 +383,12 @@ class BenchArgs:
 
         # Pass both bounds. An omitted window option in bench_mha.py runs its default
         # sweep (dense plus a representative causal sliding window).
+        # Leave -backend / -impl at bench_mha defaults (triton / default): native
+        # Triton supports a left window and a sink. A right window needs dao_ai,
+        # which rejects sinks; no model shape currently uses a right window.
         window_left: int
         window_right: int
         window_left, window_right = m.mha_window()
-        has_window: bool = window_left >= 0 or window_right >= 0
 
         args_dict: dict[str, str] = {
             "-fn": fn,
@@ -409,12 +411,6 @@ class BenchArgs:
             args_list.append("-equal_seqlens")
         if m.use_sink:
             args_list.append("-sink")
-        # Native bf16 Triton has no sliding window. dao_ai has the window but
-        # rejects a sink. Gluon has a sink and a left window, and is forward-only.
-        if has_window and m.use_sink and window_right < 0 and self.kernel == "fwd":
-            args_list.extend(("-backend", "gluon"))
-        elif has_window and not m.use_sink:
-            args_list.extend(("-impl", "dao_ai"))
         if self.kernel == "bwdf":
             args_list.append("-fused_bwd")
         args_str: str = " ".join(args_list)
@@ -1002,23 +998,16 @@ def get_bench_args(
         seq_range.to_range(),
     ):
         model = tp_model.model
-        # Fused backward has no sink and no sliding window. One-kernel backward
-        # has a sink, but the only sink-plus-window path is Gluon, which is forward-only.
-        skip_reason: str | None = None
+        # Fused backward has no sink and no sliding window. Native one-kernel
+        # backward (bwdo) supports sink with a left window.
         if kernel == "bwdf" and (model.use_sink or model.sliding_window_left > 0):
-            skip_reason = (
-                "fused backward doesn't support sink or sliding window attention."
-            )
-        elif kernel == "bwdo" and model.use_sink and model.sliding_window_left > 0:
-            skip_reason = "one-kernel backward doesn't support sink with sliding window attention."
-        if skip_reason is not None:
             skipped_key = (model.name, kernel)
             if skipped_key not in skipped_model_kernels:
                 logger.info(
-                    "Skipping %s for model '%s': %s",
+                    "Skipping %s for model '%s': fused backward doesn't support "
+                    "sink or sliding window attention.",
                     kernel,
                     model.name,
-                    skip_reason,
                 )
                 skipped_model_kernels.add(skipped_key)
             continue

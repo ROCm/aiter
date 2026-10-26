@@ -409,9 +409,11 @@ class MhaKernelHandler(KernelHandler):
         window_left = int(shape.get("sliding_window_left", -1))
         window_right = int(shape.get("sliding_window_right", -1))
         sink = shape.get("sink", None)
-        has_window = window_left >= 0 or window_right >= 0
         # Pass both window bounds. An omitted window option in bench_mha.py runs its default sweep
         # (dense plus a representative causal sliding window case).
+        # Leave -backend / -impl at bench_mha defaults (triton / default): native
+        # Triton supports a left window and a sink. A right window needs dao_ai,
+        # which rejects sinks; no model shape currently uses a right window.
         args = (
             f"-fn {fn} -causal true --dtype bf16 -b {self._batch_size} "
             f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
@@ -419,12 +421,6 @@ class MhaKernelHandler(KernelHandler):
             f"--window-size-left {window_left} --window-size-right {window_right} "
             f"-metric {self._metric}"
         )
-        # Native bf16 Triton has no sliding window. dao_ai has the window but
-        # rejects a sink. Gluon has a sink and a left window.
-        if has_window and sink and window_right < 0:
-            args += " -backend gluon"
-        elif has_window and not sink:
-            args += " -impl dao_ai"
         if fn == "fwd_varlen":
             args += " -equal_seqlens"
         if sink:
