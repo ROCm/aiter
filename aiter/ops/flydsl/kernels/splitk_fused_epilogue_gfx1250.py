@@ -227,8 +227,10 @@ def emit_fused_splitk_epilogue(
     if const_expr(not lean):
         workgroup_barrier(use_cluster=False)
         out_tile2 = (reduce_m, c_lds_row)
+        # The view carries the store's bounds, so the N clamp has to live here.
+        out_n = tile_n if n_oob is None else fx.max(0, fx.min(n_oob, tile_n))
         tile_out = fx.Tensor(
-            fx.make_view(output_base, fx.make_layout((valid_rows, tile_n), (ldc64, 1)))
+            fx.make_view(output_base, fx.make_layout((valid_rows, out_n), (ldc64, 1)))
         )
         store_atom, out_coord2 = fx.rocdl.cdna5.make_tiled_tdm_atom(
             fx.rocdl.TensorStore(),
