@@ -51,12 +51,14 @@ def _scaled_a_kernel(
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
+    ks_begin: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: GemmA16W16Gfx942Param,
 ):
-    """C = (A * S) @ B with S[r, c] = 2 where (r + c) % 3 == 0, else 1.
+    """C = (A * S)[:, ks_begin:] @ B[ks_begin:] with S[r, c] = 2 where
+    (r + c) % 3 == 0, else 1: one split-K slice of a fused kernel.
 
     Scaling by 2 is exact in bf16, so the oracle needs no rounding model.
     """
@@ -115,8 +117,8 @@ def _scaled_a_kernel(
         b_leading_stride=b_leading_stride,
         bid_m=bid_m,
         bid_n=bid_n,
-        ks_begin=fx.Int32(0),
-        k_tiles=k // param.block_k,
+        ks_begin=ks_begin,
+        k_tiles=(k - ks_begin) // param.block_k,
         c_tile=gC,
         smem_a=smem.ab.a.peek().ptr,
         smem_b=smem.ab.b.peek().ptr,
@@ -143,6 +145,7 @@ def _scaled_a_gemm(
     out: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
+    ks_begin: fx.Int32,
     param: GemmA16W16Gfx942Param,
     stream: fx.Stream = fx.Stream(None),  # noqa: B008
 ):
@@ -156,6 +159,7 @@ def _scaled_a_gemm(
         m,
         n,
         k,
+        ks_begin,
         fx.Int32(fx.get_scalar(a.stride[0])),
         fx.Int32(fx.get_scalar(b.stride[1])),
         make_gfx942_tiled_mma(param),
@@ -167,8 +171,11 @@ def _scaled_a_gemm(
     )
 
 
+# ks_begin > 0 checks that k_col is the absolute K column, as a fused split-K
+# consumer needs.
+@pytest.mark.parametrize("ks_begin", [0, 512])
 @pytest.mark.parametrize("pipeline", list(PIPELINES))
-def test_gfx942_mainloop_transform_a(pipeline):
+def test_gfx942_mainloop_transform_a(pipeline, ks_begin):
     if get_gfx() != "gfx942":
         pytest.skip(f"requires gfx942, got {get_gfx()!r}")
     # M is ragged; N stays a block_n multiple for the direct store.
@@ -178,12 +185,12 @@ def test_gfx942_mainloop_transform_a(pipeline):
     w = (torch.randn(n, k, device="cuda") * k**-0.5).to(torch.bfloat16)
     idx = torch.arange(m, device="cuda")[:, None] + torch.arange(k, device="cuda")
     scale = torch.where(idx % 3 == 0, 2.0, 1.0)
-    ref = (x.float() * scale) @ w.float().t()
+    ref = (x.float() * scale)[:, ks_begin:] @ w.float()[:, ks_begin:].t()
     out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
     param = make_gemm_a16w16_gfx942_param(
         block_m=64, block_n=64, direct_store=True, **PIPELINES[pipeline]
     )
-    _scaled_a_gemm(out, x, w.t(), param)
+    _scaled_a_gemm(out, x, w.t(), ks_begin, param)
     torch.cuda.synchronize()
     worst = error_ratio(out, ref)
     assert worst <= 1.0, f"{pipeline}: error is {worst:.2f}x the bf16 tolerance"
