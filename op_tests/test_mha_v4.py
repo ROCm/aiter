@@ -633,13 +633,11 @@ torch.cuda.synchronize()
 """
 
 
-@pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950"),
-    reason="gfx942/gfx950 activation rotation",
-)
-@pytest.mark.parametrize("kernel", ["hd128", "mxfp8", "mxfp6", "mxfp4"])
-@pytest.mark.parametrize("seq,heads", [(3975, 3), (999, 3), (1001, 5)])
-def test_mha_v4_rotate_kernels_bound_the_k_mean_read(kernel, seq, heads):
+_K_MEAN_OOB_SHAPES = [(3975, 3), (999, 3), (1001, 5)]
+_K_MEAN_OOB_KERNELS = ["hd128", "mxfp8", "mxfp6", "mxfp4"]
+
+
+def check_k_mean_bound(kernel, seq, heads):
     """The rotate kernels work in blocks of 8 rows and subtract the K mean before the row < m
     guard, so a row count that is not a multiple of 8 used to read a mean row past the end.
     """
@@ -661,6 +659,26 @@ def test_mha_v4_rotate_kernels_bound_the_k_mean_read(kernel, seq, heads):
         f"{kernel} faulted at seq={seq} heads={heads} "
         f"(rows={seq * heads}, rows%8={seq * heads % 8}): {probe.stderr[-400:]}"
     )
+
+
+def check_k_mean_bounds():
+    for kernel in _K_MEAN_OOB_KERNELS:
+        for seq, heads in _K_MEAN_OOB_SHAPES:
+            check_k_mean_bound(kernel, seq, heads)
+    aiter.logger.info(
+        "K-mean bound: %d rotate-kernel/shape combos stayed in bounds",
+        len(_K_MEAN_OOB_KERNELS) * len(_K_MEAN_OOB_SHAPES),
+    )
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 activation rotation",
+)
+@pytest.mark.parametrize("kernel", _K_MEAN_OOB_KERNELS)
+@pytest.mark.parametrize("seq,heads", _K_MEAN_OOB_SHAPES)
+def test_mha_v4_rotate_kernels_bound_the_k_mean_read(kernel, seq, heads):
+    check_k_mean_bound(kernel, seq, heads)
 
 
 @pytest.mark.skipif(
@@ -1963,6 +1981,15 @@ def run_torch_mha_v4(q, k, v, softmax_scale):
     ).transpose(1, 2)
 
 
+_TOL_ERR_RATIO = 0.05  # matches checkAllclose default tol_err_ratio
+
+
+def _verdict(err):
+    if err == 0:
+        return "pass"
+    return "warning" if err <= _TOL_ERR_RATIO else "failed"
+
+
 @benchmark()
 def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
     """Benchmark every dense MHA v4 recipe against one Torch reference.
@@ -2014,17 +2041,29 @@ def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
         output, us = run_perftest(candidate)
         # Quantized recipes are expected to land well outside a bitwise bound; the err column is
         # what carries their accuracy, so compare loosely and let the number speak.
-        err = checkAllclose(
-            reference,
-            output.to(dtypes.fp32),
-            rtol=1e-1,
-            atol=1e-1,
-            msg=f"{name}: dense",
-        )
+        # catastrophic_check turns NaN/Inf or delta > ref_max/2 into an AssertionError; catching it
+        # here marks the row failed instead of aborting, so the table still shows every recipe.
+        accuracy_error = None
+        try:
+            err = checkAllclose(
+                reference,
+                output.to(dtypes.fp32),
+                rtol=1e-1,
+                atol=1e-1,
+                msg=f"{name}: dense",
+                catastrophic_check=True,
+            )
+        except AssertionError as exc:
+            err = float("nan")
+            accuracy_error = str(exc)
+            aiter.logger.error("%s: dense: %s", name, accuracy_error)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+        ret[f"{name} result"] = (
+            "failed" if accuracy_error is not None else _verdict(err)
+        )
     return ret
 
 
@@ -2061,6 +2100,25 @@ def main():
         aiter.logger.info(
             "MHA v4 dense summary (markdown):\n%s",
             frame.to_markdown(index=False),
+        )
+
+    # Invariants a numeric sweep cannot reach: a row that ignores seqlens_k still returns the
+    # dense answer, and the K-mean over-read is a fault rather than a wrong number.
+    check_varlen_capable_objects()
+    check_k_mean_bounds()
+
+    # Raised after the table so every recipe is reported, not just the first bad one.
+    failed = sorted(
+        {
+            key.rsplit(" ", 1)[0]
+            for row in rows
+            for key, value in row.items()
+            if key.endswith(" result") and value == "failed"
+        }
+    )
+    if failed:
+        raise RuntimeError(
+            f"MHA v4 dense correctness failed for {failed}; see the summary above"
         )
 
 
@@ -2194,9 +2252,7 @@ def test_mha_v4_launch_rejects_off_device_lse():
         _launch_bf16_dense(q, out, lse=torch.empty((2, 4, 256), dtype=torch.float32))
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@pytest.mark.parametrize("arch", ["gfx950"])
-def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
+def check_varlen_capable_objects(arch="gfx950"):
     """Every dense row _VARLEN_CAPABLE_QV claims must really read the per-batch length.
 
     The gate is keyed on (q_format, v_format) alone, so a pair that gains a second object -- a
@@ -2244,6 +2300,15 @@ def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
         f"{arch} rows claimed in _VARLEN_CAPABLE_QV never load kernarg 0x1C0: {silent}; "
         "they would ignore seqlens_k and silently attend over the full padded key length"
     )
+    aiter.logger.info(
+        "varlen gate: all %d claimed %s rows load kernarg 0x1C0", len(claimed), arch
+    )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@pytest.mark.parametrize("arch", ["gfx950"])
+def test_mha_v4_varlen_capable_rows_load_the_seqlens_k_kernarg(arch):
+    check_varlen_capable_objects(arch)
 
 
 if __name__ == "__main__":

@@ -1559,6 +1559,15 @@ def run_torch_mha_v4_sparse(q, k, v, block_mask, softmax_scale, kv_tile):
     ).transpose(1, 2)
 
 
+_TOL_ERR_RATIO = 0.05  # matches checkAllclose default tol_err_ratio
+
+
+def _verdict(err):
+    if err == 0:
+        return "pass"
+    return "warning" if err <= _TOL_ERR_RATIO else "failed"
+
+
 @benchmark()
 def benchmark_mha_v4_sparse(batch, sequence_q, sequence_k, heads, density, dtype):
     """Benchmark the sorted block-sparse BF16 path against masked Torch attention."""
@@ -1602,17 +1611,29 @@ def benchmark_mha_v4_sparse(batch, sequence_q, sequence_k, heads, density, dtype
     ret = {"gfx": get_gfx(), "kv_tiles": kv_tiles, "kept": keep}
     for name, candidate in candidates.items():
         output, us = run_perftest(candidate)
-        err = checkAllclose(
-            reference,
-            output.to(dtypes.fp32),
-            rtol=2e-2,
-            atol=2e-2,
-            msg=f"{name}: block-sparse BF16",
-        )
+        # catastrophic_check turns NaN/Inf or delta > ref_max/2 into an AssertionError; catching it
+        # here marks the row failed instead of aborting, so the table still shows every recipe.
+        accuracy_error = None
+        try:
+            err = checkAllclose(
+                reference,
+                output.to(dtypes.fp32),
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"{name}: block-sparse BF16",
+                catastrophic_check=True,
+            )
+        except AssertionError as exc:
+            err = float("nan")
+            accuracy_error = str(exc)
+            aiter.logger.error("%s: block-sparse BF16: %s", name, accuracy_error)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+        ret[f"{name} result"] = (
+            "failed" if accuracy_error is not None else _verdict(err)
+        )
     return ret
 
 
@@ -1665,6 +1686,20 @@ def main():
         aiter.logger.info(
             "MHA v4 block-sparse BF16 summary (markdown):\n%s",
             frame.to_markdown(index=False),
+        )
+
+    # Raised after the table so every recipe is reported, not just the first bad one.
+    failed = sorted(
+        {
+            key.rsplit(" ", 1)[0]
+            for row in rows
+            for key, value in row.items()
+            if key.endswith(" result") and value == "failed"
+        }
+    )
+    if failed:
+        raise RuntimeError(
+            f"MHA v4 block-sparse correctness failed for {failed}; see the summary above"
         )
 
 
