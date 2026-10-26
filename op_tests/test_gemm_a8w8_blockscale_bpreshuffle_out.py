@@ -10,8 +10,8 @@ from aiter.ops import gemm_op_a8w8 as gemm_mod
 from aiter.ops.shuffle import shuffle_weight
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or gemm_mod.get_gfx() != "gfx950",
-    reason="the blockscale bpreshuffle asm kernels ship for gfx950",
+    not torch.cuda.is_available() or gemm_mod.get_gfx() not in ("gfx942", "gfx950"),
+    reason="the blockscale bpreshuffle asm kernels ship for gfx942 and gfx950",
 )
 
 N, K = 2560, 6144
@@ -130,3 +130,7 @@ def test_fp16_output_on_asm_row_uses_ck(monkeypatch):
     assert y.dtype == dtypes.fp16
     assert asm_calls == [4], "fp16 output must not reach the bf16-only asm kernel"
     torch.testing.assert_close(y.float(), ref.float(), atol=0.5, rtol=0.02)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
