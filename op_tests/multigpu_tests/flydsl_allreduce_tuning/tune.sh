@@ -89,6 +89,12 @@ export FLYDSL_EXTRA_SOURCE_DIRS=$KERNELS:$KERNELS/comm${FLYDSL_EXTRA_SOURCE_DIRS
 #   candidate at every shape of a width in one spawn, which on a cold JIT cache
 #   outlasts the tests' 600 s verify default.
 export FLYDSL_QR_TIMEOUT=${FLYDSL_QR_TIMEOUT:-3600}
+# TRITON_LIBHIP_PATH: the rocm/pytorch rocm10.0 image points it at a second copy of
+#   libamdhip64 (_rocm_sdk_devel) next to torch's (_rocm_sdk_core). Triton then maps
+#   both, CustomAllreduce's IPC check binds to the one that does not know torch's
+#   allocations, and every fused bench fails on its cdr baseline. Unset, Triton
+#   uses the runtime torch already loaded.
+unset TRITON_LIBHIP_PATH
 
 # --- candidates and sampling -----------------------------------------------------------
 # Sets of candidates.csv (see gen_candidates.py): `sweep` for the plain fit,
@@ -112,7 +118,12 @@ FAILED=()
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { echo "error: $*" >&2; exit 1; }
 
-ngpu_real() { $PY -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0; }
+# The tests' count (flydsl_allreduce_bench.gpu_count): torch's own reads 0 where amdsmi
+# sees no GPUs, as in the rocm/pytorch rocm10.0 image.
+ngpu_real() {
+  PYTHONPATH=$(dirname "$ONESHOT"):$PYTHONPATH \
+    $PY -c "import flydsl_allreduce_bench as fab; print(fab.gpu_count())" 2>/dev/null | tail -1 | grep -E '^[0-9]+$' || echo 0
+}
 # A dry run has no GPUs; it pretends the node is full so every chunk is enumerated.
 ngpu() { if [[ $DRY == 1 ]]; then echo 8; else ngpu_real; fi; }
 
