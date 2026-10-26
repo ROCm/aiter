@@ -903,14 +903,18 @@ class GemmA16W16Tuner(GemmCommonTuner):
         gemmobj.cleanup()
 
         result = []
-        for info, us, err_ratio in rets:
+        from aiter.utility.tune_result import TuneResult
+
+        for el in rets:
+            info, us, err_ratio = el
             shape_tuple, solidx, splitK, kernelName, libtype, bpreshuffle = info
             keys_10 = (gfx, cu_num) + shape_tuple
             result.append(
-                (
+                TuneResult(
                     (keys_10, solidx, splitK, kernelName, libtype, bpreshuffle),
                     us,
                     err_ratio,
+                    getattr(el, "watts", float("nan")),
                 )
             )
         return result
@@ -1024,13 +1028,17 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 else:
                     kernelName = "None"
             tflops, bw = self.calculate(el)
+            from aiter.utility.tune_result import power_columns
+
+            watts, tflops_per_w = power_columns(el, tflops)
             key_dict = dict(zip(self.keys, keys))
             if len(results) == self.topk:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is "
                     f"libtype={libtype} kernelId={kernelId} {kernelName} "
                     f"splitK={splitK}, {time}us, err_ratio={err_ratio}, "
-                    f"tflops={tflops} TFLOPS, bw={bw} GB/s"
+                    f"tflops={tflops} TFLOPS, bw={bw} GB/s, "
+                    f"watts={watts} W, tflops_per_w={tflops_per_w} TFLOPS/W"
                 )
             key_dict.update(
                 {
@@ -1042,6 +1050,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     "err_ratio": [err_ratio],
                     "tflops": [tflops],
                     "bw": [bw],
+                    "watts": [watts],
+                    "tflops_per_w": [tflops_per_w],
                 }
             )
             rows.append(key_dict)
@@ -1079,6 +1089,8 @@ if __name__ == "__main__":
         "err_ratio",
         "tflops",
         "bw",
+        "watts",
+        "tflops_per_w",
     ]
     tuner = GemmA16W16Tuner(
         "GemmA16W16Tuner",

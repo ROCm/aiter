@@ -110,12 +110,16 @@ def worker(
     output_keys=None,
     _arg_key_list=None,
     catastrophic_check=True,
+    measure_power=False,
 ):
     from aiter.test_common import run_perftest
+    from aiter.utility.tune_result import TuneResult
 
     pid = mp.current_process().pid
     device = torch.device(f"cuda:{gpu_id}")
     max_err_ratio = 0.0
+    watts = float("nan")
+    res = None
     try:
         torch.cuda.set_device(device)
         args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
@@ -225,10 +229,36 @@ def worker(
         us = -1  # float("inf")
         max_err_ratio = 1.0
 
-    return info, us, round(max_err_ratio, 4)
+    if (
+        measure_power
+        and us not in (-1, 0)
+        and us != float("inf")
+        and res is not None
+    ):
+        try:
+            from aiter.utility.package_power import measure_package_watts
+
+            def _replay():
+                return func(*args, **kwargs)
+
+            watts = measure_package_watts(_replay, device_index=gpu_id)
+        except Exception as e:  # noqa: BLE001
+            if printLog:
+                print(f"package power measurement failed info:{info}: {e}", flush=True)
+            watts = float("nan")
+
+    return TuneResult(info, us, round(max_err_ratio, 4), watts)
 
 
-def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
+def work_group(
+    GPUIDMap,
+    fast_mode,
+    err_ratio,
+    in_data,
+    tasks,
+    verbose=False,
+    measure_power=False,
+):
     """Work group that processes a batch of related tasks."""
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
@@ -378,6 +408,8 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 max_abs_delta,
                 output_keys,
                 arg_key_list,
+                True,
+                measure_power,
             )
 
             # Run worker with explicit GPU ID
@@ -414,6 +446,7 @@ def mp_tuner(
     err_ratio=0.05,
     timeout=None,
     verbose=False,  # print verbose log
+    measure_power=None,
 ):
     """Multi-process tuner with GPU fault isolation.
 
@@ -435,6 +468,14 @@ def mp_tuner(
     """
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
+    if measure_power is None:
+        from aiter.utility.tune_result import power_selection_enabled
+
+        # fast_mode is the hipblaslt latency screen. The MoE tuner also sets it,
+        # and passes measure_power explicitly because that call is its only timing pass.
+        measure_power = (not fast_mode) and power_selection_enabled()
+    else:
+        measure_power = bool(measure_power)
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
     parallel_num = mp_num
     start_idx = 0
@@ -495,6 +536,7 @@ def mp_tuner(
                         in_datas[ref_data_index[k]],
                         task_group[k],
                         verbose,
+                        measure_power,
                     ),
                 ),
             )

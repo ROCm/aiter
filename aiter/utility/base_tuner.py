@@ -245,11 +245,40 @@ class TunerCommon:
             default=defaults.get("min_improvement_pct", 3.0),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
+        self.parser.add_argument(
+            "--select",
+            default=os.environ.get("AITER_SELECT", "latency"),
+            help="How to pick the winner among kernels that pass errRatio. "
+            "'latency' (default) keeps the lowest us. "
+            "'power' (aliases: efficiency, power_efficiency) ranks by "
+            "TFLOP/s per package watt, measured from the GPU PPT sysfs node "
+            "(power1_input) over AITER_POWER_WINDOW_S seconds (default 0.4) "
+            "on the accurate pass only. Also set by AITER_SELECT. "
+            "PPT is the whole package, so the GPU should otherwise be idle. "
+            "Use --shape_grouped so every candidate for a shape is measured "
+            "on the same GPU. AITER_POWER_PATH overrides the hwmon file. "
+            "The fused-MoE tuner writes every surviving pair, ranked, to "
+            "--profile_file (-o2). In power mode that file is "
+            "<tune_file>.ranked.csv when -o2 is omitted.",
+        )
+
+    def _apply_select(self, args):
+        from aiter.utility.tune_result import normalize_select
+
+        select = normalize_select(getattr(args, "select", None))
+        if select not in ("latency", "power"):
+            self.parser.error(
+                f"unknown --select {getattr(args, 'select', None)!r}; use latency or power"
+            )
+        args.select = select
+        os.environ["AITER_SELECT"] = select
+        return select
 
     def parse_args(self):
         args = self.parser.parse_args()
         if args.update_improved and not args.compare:
             self.parser.error("--update_improved requires --compare")
+        self._apply_select(args)
         return args
 
     @abstractmethod
@@ -312,8 +341,10 @@ class TunerCommon:
         if "_tag" in merge_df.columns:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
             dedup_keys = self.keys + ["_tag"]
+        from aiter.utility.tune_result import sort_frame_for_selection
+
         merge_df = (
-            merge_df.sort_values("us")
+            sort_frame_for_selection(merge_df)
             .drop_duplicates(subset=dedup_keys, keep="first")
             .reset_index(drop=True)
         )
@@ -529,11 +560,22 @@ class TunerCommon:
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
+        from aiter.utility.tune_result import (
+            TuneResult,
+            attach_power_columns,
+            power_selection_enabled,
+            selection_rank,
+        )
+
         rets = list(rets)
+        select_power = power_selection_enabled(getattr(args, "select", None))
         if args.profile_file != "":
             if args.verbose:
                 logger.info(f"saving profile to {args.profile_file}")
-            profiledf = self.result_to_df(sorted(rets, key=itemgetter(0)))
+            profile_rets = sorted(rets, key=itemgetter(0))
+            profiledf = attach_power_columns(
+                self.result_to_df(profile_rets), profile_rets
+            )
             if os.path.exists(args.profile_file):
                 old_df = _read_csv(args.profile_file)
             else:
@@ -548,17 +590,22 @@ class TunerCommon:
         grouped_rets = defaultdict(list)
         bestConfigs = []
 
-        for info, us, max_err_ratio in rets:
-            grouped_rets[info[0]].append((info[1:], us, max_err_ratio))
+        for el in rets:
+            info, us, max_err_ratio = el
+            watts = getattr(el, "watts", float("nan"))
+            grouped_rets[info[0]].append((info[1:], us, max_err_ratio, watts))
 
         grouped_results = list(grouped_rets.items())
 
         for info_key, time_list in grouped_results:
             tol_err_ratio = args.errRatio
-            sorted_time = sorted(time_list, key=lambda x: x[1])
+            sorted_time = sorted(
+                time_list,
+                key=lambda x: selection_rank(x[1], x[3], select_power),
+            )
             filtered_time = [
-                (info_ex, round(us, 4), max_err_ratio)
-                for info_ex, us, max_err_ratio in sorted_time
+                (info_ex, round(us, 4), max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in sorted_time
                 if max_err_ratio <= tol_err_ratio
                 and us != self.INVALID_TIME
                 and us != self.INF_TIME
@@ -573,14 +620,18 @@ class TunerCommon:
                 print(f"choose {effective_topk} kernels")
             self.topk = effective_topk
             best_config = [
-                ((info_key, *info_ex), us, max_err_ratio)
-                for info_ex, us, max_err_ratio in filtered_time[0:effective_topk]
+                TuneResult((info_key, *info_ex), us, max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in filtered_time[0:effective_topk]
             ]
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
-                best_config = [((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)]
+                best_config = [
+                    TuneResult(
+                        (info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0
+                    )
+                ]
             bestConfigs.extend(best_config)
-        resultdf = self.result_to_df(bestConfigs)
+        resultdf = attach_power_columns(self.result_to_df(bestConfigs), bestConfigs)
         return resultdf
 
     def _summary_shape_keys(self) -> "list[str]":
@@ -1404,6 +1455,12 @@ class TunerCommon:
 
     def run(self, args, fast_mode=False):
         """tuner run function"""
+        select = self._apply_select(args)
+        if select == "power":
+            logger.info(
+                "select=power: ranking kernels that pass errRatio by "
+                "package TFLOP/s/W (us * PPT watts). Keep the GPU otherwise idle."
+            )
         self.pre_process(args)
 
         # Resolve --run_config: can be False, True (no file), or a file path string.
@@ -1617,6 +1674,8 @@ class GemmCommonTuner(TunerCommon):
                 "tflops",
                 "bw",
                 "errRatio",
+                "watts",
+                "tflops_per_w",
             ]
         if key is None:
             key = ["gfx", "cu_num", "M", "N", "K"]
@@ -1690,11 +1749,14 @@ class GemmCommonTuner(TunerCommon):
             else:
                 kernelName = str(resolved)
             tflops, bw = self.calculate(el)
+            from aiter.utility.tune_result import power_columns
+
+            watts, tflops_per_w = power_columns(el, tflops)
             key_dict = dict(zip(self.keys, keys))
 
             if len(results) == self.topk:
                 print(
-                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
+                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s, {watts=} W, {tflops_per_w=} TFLOPS/W"
                 )
             key_dict.update(
                 {
@@ -1705,6 +1767,8 @@ class GemmCommonTuner(TunerCommon):
                     "errRatio": [err_ratio],
                     "tflops": [tflops],
                     "bw": [bw],
+                    "watts": [watts],
+                    "tflops_per_w": [tflops_per_w],
                 }
             )
             rows.append(key_dict)
