@@ -1093,7 +1093,7 @@ class AttentionProgram:
     safe_tile_end: gl.tensor
     query_mask_qk: gl.tensor
     context_len_q_pos_qk: gl.tensor
-    kv_len: gl.tensor
+    seq_len: gl.tensor
     QK_scale: gl.tensor
     SM_scale: gl.tensor
     SOFTCAP: gl.tensor
@@ -1114,7 +1114,7 @@ class AttentionProgram:
         safe_tile_end,
         query_mask_qk,
         context_len_q_pos_qk,
-        kv_len,
+        seq_len,
         QK_scale,
         SM_scale,
         SOFTCAP,
@@ -1132,7 +1132,7 @@ class AttentionProgram:
         self.safe_tile_end = safe_tile_end
         self.query_mask_qk = query_mask_qk
         self.context_len_q_pos_qk = context_len_q_pos_qk
-        self.kv_len = kv_len
+        self.seq_len = seq_len
         self.QK_scale = QK_scale
         self.SM_scale = SM_scale
         self.SOFTCAP = SOFTCAP
@@ -1254,7 +1254,7 @@ class AttentionProgram:
             safe_tile_end,
             query_mask_qk,
             context_len_q_pos_qk,
-            max_seq_prefix_len,
+            context_len + cur_batch_query_len,
             QK_scale,
             SM_scale,
             SOFTCAP,
@@ -1556,7 +1556,7 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
     gl.amd.cdna4.async_copy.wait_group(0)
-    zero_v_tail(kv_loader, 0, pgm.kv_len - j * pgm.cfg.TILE_SIZE)
+    zero_v_tail(kv_loader, 0, pgm.seq_len - j * pgm.cfg.TILE_SIZE)
     _barrier()
     v = kv_loader.load_v_from_shared(
         wait_count=0, target_dtype=q.dtype, buffer_id=0, skip_wait=True
@@ -1672,7 +1672,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
             next_physical_block_idx = next2_physical_block_idx
 
     # Last tile is always masked
-    v_row_limit = pgm.kv_len - (pgm.tile_end - 1) * pgm.cfg.TILE_SIZE
+    v_row_limit = pgm.seq_len - (pgm.tile_end - 1) * pgm.cfg.TILE_SIZE
     if pgm.cfg.NUM_WARPS > 1:
         gl.amd.cdna4.async_copy.wait_group(0)
         _barrier()
