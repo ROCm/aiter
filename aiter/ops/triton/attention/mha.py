@@ -694,6 +694,7 @@ def _flash_attn_forward(
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
                 batch_heads=batch * num_q_heads,
+                head_dim_qk=qk_head_dim,
             )
 
         use_int64_strides = _USE_INT64_STRIDES

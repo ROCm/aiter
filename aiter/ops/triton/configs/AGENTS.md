@@ -209,6 +209,15 @@ in lowercase (`mhc_fused_sinkhorn`).
 
 `get_mhc_post_config(M, C)` reads `mhc_post/DEFAULT.json`.
 
+## MHA forward (proposal)
+
+For bf16 without dropout, `_triton_kernels/attention/mha.py::_get_config`
+first tries `<arch>/triton/attention/mha/MHA-DQ=<head_dim_qk>-DV=<head_dim_v>-CAUSAL=<0|1>.json`.
+It takes the smallest `SK_LEQ_<x>` with `max_seqlen_k <= x`. The file has
+`"DEFAULT_FALLBACK": true` and the `DEFAULT.json` `fwd` keys, and no
+`"any"`: a key past the largest bucket gets the `DEFAULT.json` rules. The
+name and the bucket axis are a proposal; the owners can change them.
+
 ## Autotune
 
 - Give every `@triton.autotune` its list through
