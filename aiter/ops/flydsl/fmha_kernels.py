@@ -402,7 +402,7 @@ def flydsl_flash_attn_varlen_func(
         and v.dtype == q.dtype
         and _nkv > 0
         and _nq % _nkv == 0
-        and supports_gqa_ratio(_nq // max(_nkv, 1))
+        and supports_gqa_ratio(_nq // max(_nkv, 1), _v_hdim)
         and dropout_p == 0.0
         and (len(window_size) < 3 or window_size[2] == 0)
         and block_table is None
@@ -525,7 +525,7 @@ def flydsl_flash_attn_batch_func(
         and v.dtype == q.dtype
         and _nkv > 0
         and _nq % _nkv == 0
-        and supports_gqa_ratio(_nq // max(_nkv, 1))
+        and supports_gqa_ratio(_nq // max(_nkv, 1), _v_hdim)
         and _sink_ok
         and dropout_p == 0.0
         and bias is None

@@ -7,8 +7,9 @@ Two modes:
   Bench one shape and emit a single key=value result line. Useful for
   ad-hoc one-off measurements or scripting around a specific shape.
 - Sweep (no --N). Iterates either the built-in default shape list or the
-  conv2d shapes for a model in conv_shapes.json (--model NAME), and
-  prints three box-drawn tables at the end:
+  conv2d shapes for a model in --model-configs (default
+  utils/conv_shapes.json; pick a model with --model NAME), and prints
+  three box-drawn tables at the end:
     1. LAYER-BY-LAYER BENCHMARK   (per-layer Tri vs Torch + correctness)
     2. MIOpen SOLVER SUMMARY      (only when --miopen-solvers is passed)
     3. OVERALL PERFORMANCE        (mean/median/aggregate TFLOPS, layer wins)
@@ -65,6 +66,11 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_winograd_f4x3,
     conv2d_winograd_f4x3_cblocked,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import BASE_DIR
 from op_tests.triton_tests.conv._helpers import (
     _winograd_tolerances,
     dynamic_conv_tolerances,
@@ -731,20 +737,16 @@ def _print_overall_perf_table(layers: list, has_any_repack: bool) -> None:
 # ----------------------------------------------------------------------------
 
 
-_MODEL_SHAPES_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "conv_shapes.json",
-)
-
-
-def _load_model_shapes(model_pattern: str) -> tuple[str, list]:
-    """Load conv2d shapes for a model from conv_shapes.json.
+def _load_model_shapes(model_pattern: str, config_path: str) -> tuple[str, list]:
+    """Load conv2d shapes for a model from --model-configs (conv_shapes.json).
 
     model_pattern: case-insensitive substring matched against model keys.
+    config_path: path to the shapes JSON, resolved relative to BASE_DIR
+        (same convention as --model-configs for the attention benchmarks).
     Returns (matched_model_name, list of shape tuples in the same form as
     EDGE_CASE_SHAPES — desc is "<model> L<i>").
     """
-    with open(_MODEL_SHAPES_PATH) as f:
+    with open(os.path.join(BASE_DIR, config_path)) as f:
         data = json.load(f)
 
     matches = [
@@ -797,11 +799,11 @@ def run_sweep(args) -> None:
         # Default: real-model sweep. --model picks one; absent → resnet50.
         model_name = args.model if args.model else "resnet50"
         try:
-            model, shapes = _load_model_shapes(model_name)
+            model, shapes = _load_model_shapes(model_name, args.model_configs)
             label = f":: {model} ({len(shapes)} layers)"
             if not args.model:
                 label += "  (default — pass --model X or --smoke to change)"
-            print(f"# Sweep source: conv_shapes.json {label}")
+            print(f"# Sweep source: {args.model_configs} {label}")
         except (FileNotFoundError, ValueError) as e:
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)
@@ -894,11 +896,12 @@ def run_sweep(args) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        prog="bench_conv2d",
-        description="Benchmark aiter.ops.triton.conv.conv2d (single shape or sweep).",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    p = get_parser(kernel_name="bench_conv2d")
+    override_parser_action(
+        p,
+        action="--model-configs",
+        default="utils/conv_shapes.json",
+        help="Conv2D shapes JSON file (sweep mode).",
     )
     p.add_argument(
         "--dtype",
@@ -923,11 +926,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["nchw", "nhwc"],
         default="nchw",
     )
-    p.add_argument(
-        "--metric",
-        type=str.lower,
-        choices=["time", "throughput"],
-        default="throughput",
+    override_parser_action(
+        p, action="--metric", choices=["time", "throughput"], default="throughput"
     )
     p.add_argument(
         "--no-bias",
@@ -947,14 +947,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="detect MIOpen solver names via a subprocess (sweep mode only; "
         "adds ~60-120s upfront cost)",
-    )
-    p.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="sweep mode: load conv2d shapes for this model from "
-        "conv_shapes.json (case-insensitive substring match). If omitted, "
-        "defaults to resnet50 unless --smoke is passed.",
     )
     p.add_argument(
         "--smoke",
