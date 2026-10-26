@@ -30,6 +30,8 @@ from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E, ceildiv
+
 HEAD_DIM = 256
 WAVE = 64
 NUM_WAVES = 4
@@ -37,13 +39,12 @@ BLOCK_THREADS = WAVE * NUM_WAVES
 TILE_TOKENS = 16
 # A KV split always covers whole wave rounds of 16-token tiles.
 SPLIT_TOKEN_ALIGN = NUM_WAVES * TILE_TOKENS
-LOG2E = 1.4426950408889634
 # [32 chunks of 8 bf16 dims][16 tokens][16 B]
 V_TILE_BYTES = (HEAD_DIM // 8) * TILE_TOKENS * 16
 
 
 def _round_up(x: int, align: int) -> int:
-    return (x + align - 1) // align * align
+    return ceildiv(x, align) * align
 
 
 @functools.cache
