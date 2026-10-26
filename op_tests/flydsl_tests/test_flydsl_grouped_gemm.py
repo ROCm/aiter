@@ -3,10 +3,11 @@
 
 """gfx1250 grouped MoE GEMM tests through ``aiter.fused_moe``.
 
-Two formats covered:
+Three formats covered:
 
 * **a4w4** -- MXFP4 activations × MXFP4 weights (``w1.dtype = fp4x2``).
 * **a8w4** -- MXFP8 activations × MXFP4 weights (``w1.dtype = uint8``).
+* **a8w8** -- MXFP8 activations × MXFP8 weights (``w1.dtype = fp8``).
 
 Both go through the public ``fused_moe`` API; we never call the underlying
 grouped GEMM launcher directly. The grouped path is opted-in via the
@@ -84,6 +85,7 @@ _ACT_BY_NAME = {
 
 VERIFY_TOL_A4W4 = 0.02
 VERIFY_TOL_A8W4 = 0.02
+VERIFY_TOL_A8W8 = 0.02
 # Production MoE accuracy gate (matches op_tests/test_moe_2stage.py calc_diff):
 # logits_diff = ||x-y||^2 / (||x||^2 + ||y||^2).  rel_l2 is kept as an
 # informational print only; logits_diff < 0.01 is the actual pass/fail gate.
@@ -151,8 +153,8 @@ def _torch_moe_ref(
     situ_linear_beta: float,
 ) -> torch.Tensor:
     """Two-stage MoE reference reusing ``aiter.fused_moe.torch_moe_stage{1,2}``."""
-    if data_format not in ("a4w4", "a8w4"):
-        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
+    if data_format not in ("a4w4", "a8w4", "a8w8"):
+        raise ValueError(f"data_format must be a4w4, a8w4 or a8w8, got {data_format!r}")
 
     def _per_1x32_fp8_dequant(x: torch.Tensor) -> torch.Tensor:
         """Mirror grouped a8w4's per-block-32 MXFP8 input quant, then dequant."""
@@ -254,6 +256,21 @@ def _pattern_packed(
     return packed.view(experts, rows, k_pack)
 
 
+def _pattern_fp8(
+    experts: int,
+    rows: int,
+    cols: int,
+    *,
+    data_init: str,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    if data_init == "zero":
+        return torch.zeros((experts, rows, cols), dtype=dtypes.fp8)
+    if data_init == "constant":
+        return torch.full((experts, rows, cols), 0.5, dtype=dtypes.fp8)
+    return bench_init.fill_fp8((experts, rows, cols), data_init, generator).contiguous()
+
+
 def init_weight_scales(
     experts: int,
     rows: int,
@@ -352,7 +369,7 @@ def _run_grouped_via_fused_moe(
     topk: int,
     model_dim: int,
     inter_dim: int,
-    data_format: str,  # "a4w4" | "a8w4"
+    data_format: str,  # "a4w4" | "a8w4" | "a8w8"
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
     situ_beta: float = 4.0,
@@ -366,7 +383,7 @@ def _run_grouped_via_fused_moe(
     data_init: str = "uniform",
     scale_init: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
-    """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
+    """Build MX weights + routing, dispatch through ``fused_moe``.
 
     Stage1 weights are always laid out GUGU (gate/up row-interleaved) paired
     with ``GateMode.INTERLEAVE``, which is the only layout the TDM grouped
@@ -381,30 +398,23 @@ def _run_grouped_via_fused_moe(
     (looping each launch alone) and returns their per-kernel us in ``kernel_us``.
     Returns ``(out, ref, us_or_None, kernel_us_or_None)``.
     """
-    if data_format not in ("a4w4", "a8w4"):
-        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
+    if data_format not in ("a4w4", "a8w4", "a8w8"):
+        raise ValueError(f"data_format must be a4w4, a8w4 or a8w8, got {data_format!r}")
 
     K = model_dim
     inter = inter_dim
-    K_pack = K // 2
-    inter_pack = inter // 2
+    K_pack = K if data_format == "a8w8" else K // 2
+    inter_pack = inter if data_format == "a8w8" else inter // 2
 
     # Logical weights/scale/bias: always GGUU (gate rows then up rows).
     torch.manual_seed(seed)
     generator = bench_init.make_generator(seed)
-    w1_logical = _pattern_packed(
-        experts,
-        2 * inter,
-        K_pack,
-        data_init=data_init,
-        generator=generator,
+    weight_init = _pattern_fp8 if data_format == "a8w8" else _pattern_packed
+    w1_logical = weight_init(
+        experts, 2 * inter, K_pack, data_init=data_init, generator=generator
     )
-    w2_logical = _pattern_packed(
-        experts,
-        K,
-        inter_pack,
-        data_init=data_init,
-        generator=generator,
+    w2_logical = weight_init(
+        experts, K, inter_pack, data_init=data_init, generator=generator
     )
     w1_scale_raw = init_weight_scales(
         experts,
@@ -469,7 +479,7 @@ def _run_grouped_via_fused_moe(
     if data_format == "a4w4":
         w1_arg = w1_grouped.view(dtypes.fp4x2)
         w2_arg = w2_grouped.view(dtypes.fp4x2)
-    else:  # a8w4
+    else:  # a8w4 / a8w8
         w1_arg = w1_grouped  # uint8 -> grouped helper sets q_dtype_a=fp8
         w2_arg = w2_grouped
 
@@ -591,7 +601,7 @@ def _gemm_work_metrics(
     bandwidth is effective bandwidth rather than measured HBM traffic.
     """
     input_bytes = 0.5 if data_format == "a4w4" else 1.0
-    weight_bytes = 0.5
+    weight_bytes = 1.0 if data_format == "a8w8" else 0.5
     output_bytes = 2.0
     stage1_n = 2 * inter_dim
     routed_rows = tokens * topk
@@ -839,6 +849,17 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
     )
 
 
+def test_grouped_a8w8_swiglu_matches_torch_ref():
+    run_moe(
+        "a8w8",
+        activation=ActivationType.Swiglu,
+        model_dim=512,
+        inter_dim=512,
+        tol=VERIFY_TOL_A8W8,
+        check_aot_cache=False,
+    )
+
+
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)
@@ -1002,9 +1023,8 @@ def set_data_format(data_format: str) -> None:
     """Select the grouped GEMM data format.
 
     a8w4 needs ``AITER_FORCE_A8W4=1`` so ``fused_moe`` routes the a8w4 path
-    (see fused_moe.py); a4w4 needs it unset so the fp4x2 activation path is
-    taken. Toggled per-row so a mixed-format CSV sweep routes each case
-    correctly.
+    (see fused_moe.py); a4w4 and a8w8 select their activation from the logical
+    weight dtype. Toggled per-row so a mixed-format CSV sweep routes each case.
     """
     if data_format == "a8w4":
         os.environ["AITER_FORCE_A8W4"] = "1"
@@ -1026,15 +1046,18 @@ DEFAULT_CSV_PATH = os.path.normpath(
 )
 
 
-def _csv_data_format(q_dtype_a: str) -> str:
-    """Map the CSV ``q_dtype_a`` column to this test's data_format tag.
+def _csv_data_format(q_dtype_a: str, q_dtype_w: str) -> str:
+    """Map the CSV logical dtypes to this test's data_format tag.
 
-    fp8 activations -> a8w4 (MXFP8 x MXFP4); fp4 activations -> a4w4
-    (MXFP4 x MXFP4). Weights are MXFP4 either way.
+    FP8 activations can pair with MXFP4 or MXFP8 weights; FP4 activations pair
+    with MXFP4 weights.
     """
     a = q_dtype_a.strip()
+    w = q_dtype_w.strip()
     if a in ("torch.float8_e4m3fn", "torch.float8_e4m3fnuz"):
-        return "a8w4"
+        return (
+            "a8w8" if w in ("torch.float8_e4m3fn", "torch.float8_e4m3fnuz") else "a8w4"
+        )
     if a in ("torch.float4_e2m1fn_x2",):
         return "a4w4"
     raise ValueError(f"unsupported q_dtype_a in CSV: {q_dtype_a!r}")
@@ -1084,7 +1107,7 @@ def run_csv_scenario(args) -> None:
             inter_dim = int(rec["inter_dim"])
             experts = int(rec["expert"])
             topk = int(rec["topk"])
-            data_format = _csv_data_format(rec["q_dtype_a"])
+            data_format = _csv_data_format(rec["q_dtype_a"], rec["q_dtype_w"])
             activation = activation_override or _csv_activation(rec["act_type"])
         except (KeyError, ValueError) as exc:
             print(f"[csv] row {idx}: skipped ({exc})", flush=True)
@@ -1113,7 +1136,11 @@ def run_csv_scenario(args) -> None:
         )
         # Route each row to its format (a8w4 needs AITER_FORCE_A8W4=1).
         set_data_format(data_format)
-        tol = VERIFY_TOL_A8W4 if data_format == "a8w4" else VERIFY_TOL_A4W4
+        tol = {
+            "a4w4": VERIFY_TOL_A4W4,
+            "a8w4": VERIFY_TOL_A8W4,
+            "a8w8": VERIFY_TOL_A8W8,
+        }[data_format]
         for data_init, scale_init in args.init_pairs:
             try:
                 metrics = run_moe(
@@ -1227,7 +1254,9 @@ def main() -> None:
         help="CSV of grouped-MoE settings to sweep with --scenario csv "
         f"(default: {DEFAULT_CSV_PATH}). Each row is one case.",
     )
-    parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
+    parser.add_argument(
+        "--data-format", choices=("a4w4", "a8w4", "a8w8"), default="a8w4"
+    )
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument(
         "--tokens",
@@ -1356,7 +1385,11 @@ def main() -> None:
             print(f"\n===== tokens={_tok} =====", flush=True)
 
         for data_init, scale_init in args.init_pairs:
-            tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
+            tol = {
+                "a4w4": VERIFY_TOL_A4W4,
+                "a8w4": VERIFY_TOL_A8W4,
+                "a8w8": VERIFY_TOL_A8W8,
+            }[args.data_format]
             # raise_on_fail=False so one out-of-gate token does not abort the
             # sweep; the failure is recorded and reported after the table.
             metrics = run_moe(

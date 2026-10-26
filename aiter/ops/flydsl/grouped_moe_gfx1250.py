@@ -899,6 +899,7 @@ def _grouped_a8w4_tdm_moe(
     _is_fp4 = data_format == "fp4"
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
+    _w_is_fp8 = 1 if data_format == "a8w8" else 0
 
     # Bound once, because the quant pass below rebinds a1_scale to the
     # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
@@ -1077,6 +1078,7 @@ def _grouped_a8w4_tdm_moe(
             n_warp=n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
+            w_is_fp8=_w_is_fp8,
             stage1_act=stage1_act,
             bias=_b1,
             swiglu_limit=sl,
@@ -1119,6 +1121,7 @@ def _grouped_a8w4_tdm_moe(
             n_warp=n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
+            w_is_fp8=_w_is_fp8,
             stage1_act=stage1_act,
             bias=_b1,
             swiglu_limit=sl,
@@ -1168,6 +1171,7 @@ def _grouped_a8w4_tdm_moe(
         n_warp=n_warp2,
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
+        w_is_fp8=_w_is_fp8,
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
@@ -1246,6 +1250,7 @@ def _grouped_a8w4_tdm_moe(
                         n_warp=n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
+                        w_is_fp8=_w_is_fp8,
                         stage1_act=stage1_act,
                         bias=_b1,
                         swiglu_limit=sl,
@@ -1290,6 +1295,7 @@ def _grouped_a8w4_tdm_moe(
                         n_warp=n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
+                        w_is_fp8=_w_is_fp8,
                         stage1_act=stage1_act,
                         bias=_b1,
                         swiglu_limit=sl,
@@ -1330,6 +1336,7 @@ def _grouped_a8w4_tdm_moe(
                     n_warp=n_warp2,
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
+                    w_is_fp8=_w_is_fp8,
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
@@ -1493,16 +1500,22 @@ def grouped_gemm_gfx1250_a8w4(
     ):
         _grouped_dbg("unsupported activation")
         return None
-    # mxfp4 weights arrive as fp4x2 or as the uint8 view of the same bytes --
-    # ATOM's loader keeps them uint8, and MegaMoE accepts both. Requiring the
-    # packed dtype on the a4w4 arm alone silently routed a4w4-with-uint8-weights
-    # to the 2-stage fallback.
-    w_is_mxfp4 = q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8
+    # Weight tensors can both arrive as uint8 storage. Distinguish that view by
+    # its complete two-GEMM byte count: packed FP4 occupies half the logical
+    # elements, while FP8 occupies one byte each. Treating every uint8 tensor as
+    # FP4 makes MXFP8 read half of each K row and return plausible garbage.
+    weight_nbytes = w1.numel() * w1.element_size() + w2.numel() * w2.element_size()
+    logical_elements = E * (3 * inter_dim * model_dim)
+    uint8_is_fp4 = q_dtype_w == torch.uint8 and weight_nbytes == logical_elements // 2
+    uint8_is_fp8 = q_dtype_w == torch.uint8 and weight_nbytes == logical_elements
+    w_is_mxfp4 = q_dtype_w == dtypes.fp4x2 or uint8_is_fp4
+    w_is_mxfp8 = q_dtype_w == dtypes.fp8 or uint8_is_fp8
     is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and w_is_mxfp4
     is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and w_is_mxfp4
-    if not (is_grouped_a4w4 or is_grouped_a8w4):
+    is_grouped_a8w8 = q_dtype_a == dtypes.fp8 and w_is_mxfp8
+    if not (is_grouped_a4w4 or is_grouped_a8w4 or is_grouped_a8w8):
         return None
-    data_format = "fp4" if is_grouped_a4w4 else "a8w4"
+    data_format = "fp4" if is_grouped_a4w4 else ("a8w8" if is_grouped_a8w8 else "a8w4")
     q_dtype_w_key = dtypes.fp4x2 if w_is_mxfp4 else q_dtype_w
     _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
@@ -1582,7 +1595,21 @@ def grouped_gemm_gfx1250_a8w4(
     # doweight_stage1 is not supported with EP here (the route kernel owns the
     # gather weights), so those calls return None for the generic fallback.
     if expert_mask is None or not doweight_stage1:
-        _tdm_kw = {}
+        # FP8 weights double B's staged bytes versus packed FP4. Keep tile_n=256
+        # so stage-1 fused requant owns a complete four-WMMA output group, but
+        # halve tile_k to 128 so two buffers fit gfx1250's LDS budget.
+        _tdm_kw = (
+            {
+                "tile_n": 256,
+                "tile_k": 128,
+                "tile_n2": 256,
+                "tile_k2": 128,
+                "num_buffers": 2,
+                "num_buffers2": 2,
+            }
+            if is_grouped_a8w8
+            else {}
+        )
         if cfg_row is not None:
             _tdm_kw["tile_m"] = _as_int(cfg_row.get("tile_m"), tile_m)
             _tdm_kw["tile_n"] = _as_int(cfg_row.get("tile_n"), int(n_warp) * 64)
