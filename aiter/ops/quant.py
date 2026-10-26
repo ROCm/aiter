@@ -954,6 +954,7 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     num_valid_ids: torch.Tensor,
     token_num: int,
     block_m: int,
+    total_routes: int,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
 ) -> None:
@@ -961,6 +962,10 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
     sorting. The output dtype of ``out`` selects the quant target: fp4x2/uint8
     for MXFP4, fp8 for MXFP8.
+
+    ``total_routes`` is ``token_num * topk``. A zero ``sorted_weights`` entry
+    zeroes its route's row only where each route owns an input row (as many
+    rows as routes); a row shared by a token's routes is always quantized.
     """
 
 
@@ -1191,12 +1196,14 @@ def fused_dynamic_mx_quant_moe_sort(
     )
     if use_fused:
         out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
+        # The routing top-k goes in explicitly: at stage1 ``input`` has only M
+        # rows, from which the HIP kernel would infer a top-k of 1.
         common = (out, scale, input, sorted_ids, num_valid_ids, token_num, block_size)
         if num_experts_upper_bound is None:
-            fused_dynamic_mx_quant_moe_sort_hip(*common, group_size, sorted_weights)
+            fused_dynamic_mx_quant_moe_sort_hip(
+                *common, token_num * topk, group_size, sorted_weights
+            )
         else:
-            # Pass the routing top-k explicitly: at stage1 ``input`` has only M
-            # rows, from which the HIP kernel would infer a top-k of 1.
             fused_dynamic_mx_quant_moe_sort_hip_bounded(
                 *common,
                 token_num * topk,
