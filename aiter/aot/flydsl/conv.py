@@ -369,7 +369,18 @@ def _resolve_dyn_hw_gfx1250(*, shape, tile, block_rows, c_padded):
     wo = out_extent(w_p, 0, shape["dil_w"], shape["kW"], shape["stride_w"])
     npq = n * do * ho * wo
     return _dyn_hw_ok_gfx1250(
-        n, c_padded, d_p, h_p, w_p, shape["K"], npq, tile, block_rows, ho, wo
+        n,
+        c_padded,
+        d_p,
+        h_p,
+        w_p,
+        shape["K"],
+        npq,
+        tile,
+        block_rows,
+        ho,
+        wo,
+        shape["groups"],
     )
 
 

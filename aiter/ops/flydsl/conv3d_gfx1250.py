@@ -183,7 +183,7 @@ def _clamp_num_buffers(num_buffers, tiles_per_split, tile, block_rows):
     return b
 
 
-def _dyn_hw_ok_gfx1250(n, c_padded, d, h, w, k, npq, tile, block_rows, ho, wo):
+def _dyn_hw_ok_gfx1250(n, c_padded, d, h, w, k, npq, tile, block_rows, ho, wo, groups):
     """Variable-resolution path: env on, no BIG_IN/OUT, no tile tails."""
     if not AITER_CONV3D_DYN_HW:
         return False
@@ -197,8 +197,7 @@ def _dyn_hw_ok_gfx1250(n, c_padded, d, h, w, k, npq, tile, block_rows, ho, wo):
     cols = tile[0] // rows
     if ho % rows or wo % cols:
         return False
-    kg_ok = True  # n_tail checked at grid build; dyn_hw also needs no n_tail
-    return kg_ok
+    return (k // groups) % tile[1] == 0
 
 
 def _dispatch(exe, *args, stream=None):
@@ -381,10 +380,8 @@ def run_conv3d_gfx1250(
         sk = 1
 
     dyn_hw = _dyn_hw_ok_gfx1250(
-        n, c_padded, d, h, w, k, npq, chosen_tile, chosen_br, ho, wo
+        n, c_padded, d, h, w, k, npq, chosen_tile, chosen_br, ho, wo, groups
     )
-    if dyn_hw and n_tail:
-        dyn_hw = False
 
     # Match GEMM: B-1 K-tiles must fill the prologue; clamp against LDS too.
     k_tiles = crs // 32  # TILE_K == CGP_ALIGN == 32
