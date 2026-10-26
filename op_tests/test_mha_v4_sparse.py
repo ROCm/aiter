@@ -1705,3 +1705,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # CI runs this file as a script, so the checks only execute if we invoke pytest here.
+    pytest_status = pytest.main([__file__, "-v"])
+    if pytest_status != pytest.ExitCode.OK:
+        raise SystemExit(pytest_status)
