@@ -718,9 +718,18 @@ class MegaMoEGfx1250:
         enough tokens on the wire to pay for it and leave the rest on bf16.
         Omitting it means bf16 -- naming a format at construction only builds
         it, each step still has to ask for it.
+
+        On an fp8 or fp4 dispatch wire, ``a1_scale`` marks ``hidden_states`` as
+        already quantized to the wire format: the packed payload (T, H // 2) for
+        fp4 or (T, H) for fp8, with ``a1_scale`` its (T, H // 32) e8m0 bytes, the
+        layout ``dynamic_per_group_scaled_quant(..., 32, shuffle_scale=False)``
+        writes. Dispatch then sends them as-is instead of quantizing.
         """
         combine_quant_bits = self._resolve_combine_quant(combine_quant)
-        if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
+        prequantized = self._config.is_quant_dispatch_wire and a1_scale is not None
+        if prequantized:
+            self._check_prequantized_input(hidden_states, a1_scale)
+        elif hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
         if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
             raise ValueError("topk_weights must be contiguous float32")
@@ -789,7 +798,10 @@ class MegaMoEGfx1250:
                 self._compact_recv_bound(token_count, recv_token_bound)
             )
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
-            hidden_states, topk_weights, topk_ids
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            dispatch_scales=a1_scale if prequantized else None,
         )
         if recv_token_bound is not None and not self._compact_plan:
             bound = int(recv_token_bound)
@@ -802,10 +814,6 @@ class MegaMoEGfx1250:
             recv_weights = recv_weights[:bound]
             recv_ids = recv_ids[:bound]
         if self._config.is_quant_dispatch_wire:
-            assert a1_scale is None, (
-                "a1_scale is produced by the quantizing dispatch wire itself; a "
-                "caller-supplied one would be silently discarded"
-            )
             a1_scale = self._recv_dispatch_scales()
             if recv_token_bound is not None and not self._compact_plan:
                 a1_scale = a1_scale[: int(recv_token_bound)]
@@ -1668,11 +1676,39 @@ class MegaMoEGfx1250:
             torch.int32,
         )
 
+    def _check_prequantized_input(
+        self, hidden_states: torch.Tensor, scales: torch.Tensor
+    ) -> None:
+        spec = self._config.dispatch_wire_spec
+        token_count = hidden_states.shape[0]
+        if (
+            hidden_states.dtype not in (spec.quant_dtype, torch.uint8)
+            or not hidden_states.is_contiguous()
+            or hidden_states.shape[-1] * hidden_states.element_size()
+            != self._config.dispatch_token_nbytes
+        ):
+            raise ValueError(
+                f"prequantized hidden_states must be contiguous {spec.quant_dtype} "
+                f"with {self._config.dispatch_token_nbytes} bytes per token, got "
+                f"{hidden_states.dtype} {tuple(hidden_states.shape)}"
+            )
+        expected_scales = (token_count, self._config.dispatch_scale_nbytes)
+        if (
+            scales.element_size() != 1
+            or not scales.is_contiguous()
+            or tuple(scales.shape) != expected_scales
+        ):
+            raise ValueError(
+                f"a1_scale must be contiguous e8m0 bytes of shape {expected_scales}, "
+                f"got {scales.dtype} {tuple(scales.shape)}"
+            )
+
     def _dispatch(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        dispatch_scales: torch.Tensor | None = None,
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
@@ -1680,7 +1716,10 @@ class MegaMoEGfx1250:
             self._launch_compact_plan_async(topk_ids, token_count)
         stream = fx.Stream(torch.cuda.current_stream())
         payload = hidden_states
-        if self._config.is_quant_dispatch_wire:
+        if dispatch_scales is not None:
+            # Already in the wire format (see forward), so straight onto it.
+            self._dispatch_sent_scales_ptr = dispatch_scales.data_ptr()
+        elif self._config.is_quant_dispatch_wire:
             # Quantize ONCE PER LOCAL TOKEN here, instead of once per received
             # copy on the far side. Destination-independent, so the bytes are the
             # same either way; the preshuffle cannot move with it, because its

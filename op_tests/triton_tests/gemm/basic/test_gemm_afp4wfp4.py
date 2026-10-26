@@ -6,6 +6,7 @@ import pytest
 import torch
 import triton
 
+from aiter.ops.quant import dynamic_per_group_scaled_quant
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _get_config as _get_afp4wfp4_config,
@@ -315,6 +316,45 @@ def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     triton.testing.assert_close(torch_out, triton_out)
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx1250", reason="gfx1250 gluon epilogue only")
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1, 3584, 7168),
+        (16, 3584, 7168),
+        (64, 3584, 7168),
+        (300, 7168, 3584),
+        (4096, 3584, 7168),
+    ],
+)
+def test_gemm_afp4_wfp4_preshuffle_mxfp4_out(M: int, N: int, K: int):
+    """The MXFP4 epilogue writes exactly what quantizing the bf16 output does."""
+    x, _, w_triton, _, _, x_scales_triton, w_scales_triton, _, _ = (
+        generate_gemm_afp4wfp4_inputs(
+            M,
+            N,
+            K,
+            torch.bfloat16,
+            output=False,
+            shuffle_scales_fg=True,
+            shuffle_weight_fg=True,
+        )
+    )
+    if M > 1:
+        x[0] = 0  # an all-zero output row
+    y = gemm_afp4wfp4_preshuffle(x, w_triton, x_scales_triton, w_scales_triton)
+    q_ref = torch.empty((M, N // 2), dtype=torch.uint8, device="cuda")
+    s_ref = torch.empty((M, N // 32), dtype=torch.uint8, device="cuda")
+    dynamic_per_group_scaled_quant(q_ref, y, s_ref, 32, shuffle_scale=False)
+
+    q, s = gemm_afp4wfp4_preshuffle(
+        x, w_triton, x_scales_triton, w_scales_triton, mxfp4_out=True
+    )
+
+    assert torch.equal(q, q_ref)
+    assert torch.equal(s, s_ref)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
