@@ -1061,6 +1061,7 @@ DEFAULT_CSV_PATH = os.path.normpath(
     os.path.join(
         os.path.dirname(__file__),
         "..",
+        "..",
         "aiter",
         "configs",
         "tuned_grouped_fmoe.csv",
@@ -1088,6 +1089,8 @@ def _csv_activation(act_type: str) -> ActivationType:
         return ActivationType.Swiglu
     if a == "ActivationType.Silu":
         return ActivationType.Silu
+    if a == "ActivationType.Situv2":
+        return ActivationType.Situv2
     raise ValueError(f"unsupported act_type in CSV: {act_type!r}")
 
 
@@ -1137,16 +1140,30 @@ def run_csv_scenario(args) -> None:
             print(f"[csv] row {idx}: skipped topk=-1 (EP row)", flush=True)
             continue
 
-        # The grouped kernels need K/inter >= 512 (tile_k=256 -> two K tiles).
-        if model_dim < 512 or inter_dim < 512:
+        # Both GEMMs need K to be a multiple of the 128-wide WMMA step; a tile_k
+        # that does not divide K runs a clamped last k-tile, so K needs no floor.
+        if model_dim % 128 or inter_dim % 128:
             print(
                 f"[csv] row {idx}: skipped model_dim={model_dim} "
-                f"inter_dim={inter_dim} (< 512 grouped-kernel floor)",
+                f"inter_dim={inter_dim} (not a multiple of 128)",
+                flush=True,
+            )
+            continue
+        # A gemm1 bias turns off gemm1's own requantization, and the stage-2
+        # quant that replaces it needs inter_dim % 256 == 0 (Kimi-K3 at TP8 has
+        # 384 and no bias).
+        if not args.no_bias and inter_dim % 256:
+            print(
+                f"[csv] row {idx}: skipped inter_dim={inter_dim} with a bias "
+                "(needs inter_dim % 256 == 0; pass --no-bias)",
                 flush=True,
             )
             continue
 
-        act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+        act = {
+            ActivationType.Swiglu: "swiglu",
+            ActivationType.Situv2: "situv2",
+        }.get(activation, "silu")
         print(
             f"\n===== csv row {idx}: {data_format} {act} "
             f"tokens={tokens} model_dim={model_dim} inter_dim={inter_dim} "
