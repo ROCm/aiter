@@ -53,6 +53,20 @@ def _build_targets_standalone(explicit_targets=()):
             gfx, cu = value.split("/")
             targets.append((gfx.split(":", 1)[0].strip().lower(), int(cu)))
         return sorted(set(targets))
+    explicit_arches = [
+        gfx.strip().lower()
+        for gfx in os.getenv("GPU_ARCHS", "native").split(";")
+        if gfx.strip() and gfx.strip().lower() != "native"
+    ]
+    if explicit_arches:
+        return sorted(
+            {
+                (gfx, cu)
+                for gfx in explicit_arches
+                for arches in KERNEL_REGISTRY.values()
+                for cu in arches.get(gfx, {})
+            }
+        )
     import importlib.util
 
     spec = importlib.util.find_spec("aiter")  # locates, does not execute
