@@ -244,6 +244,13 @@ def speedup(base_us: float | None, us: float | None) -> float | None:
     return base_us / us
 
 
+def gpu_count() -> int:
+    n = torch.cuda.device_count()
+    if n == 0 and torch.version.hip and torch.cuda.is_available():
+        n = torch._C._cuda_getDeviceCount()
+    return n
+
+
 def select_world_sizes(
     requested, *, explicit: bool, n_gpu: int, supported
 ) -> list[int]:
@@ -602,7 +609,7 @@ def _gpu_numa_map() -> str:
     """
     try:
         parts = []
-        for i in range(torch.cuda.device_count()):
+        for i in range(gpu_count()):
             p = torch.cuda.get_device_properties(i)
             bdf = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
             node = Path(f"/sys/bus/pci/devices/{bdf}/numa_node")

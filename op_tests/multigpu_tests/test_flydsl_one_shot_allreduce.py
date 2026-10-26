@@ -1754,7 +1754,7 @@ def _fused_spawn(
     """
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
-    n_gpu = torch.cuda.device_count()
+    n_gpu = fab.gpu_count()
     if n_gpu < world_size:
         raise RuntimeError(
             f"OneShotAllReduceRMSNorm needs {world_size} GPUs, have {n_gpu}"
@@ -3116,7 +3116,7 @@ def _bench_fused(args, tps, given, link) -> None:
 
 
 def main():
-    n_gpu = torch.cuda.device_count()
+    n_gpu = fab.gpu_count()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,

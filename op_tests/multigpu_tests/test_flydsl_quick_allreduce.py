@@ -4016,7 +4016,7 @@ def _write_json(path: str | None, rows: list[dict]) -> None:
 
 
 def main():
-    n_gpu = torch.cuda.device_count()
+    n_gpu = fab.gpu_count()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
