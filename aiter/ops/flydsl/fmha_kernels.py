@@ -416,6 +416,13 @@ def flydsl_flash_attn_varlen_fwd(
             return None
         if any(t.stride(-1) != 1 for t in (q, k, v)):
             return None
+        if (
+            sink is not None
+            and torch.is_tensor(sink)
+            and sink.dim() > 0
+            and sink.stride(-1) != 1
+        ):
+            return None
         if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
             return None
         _out_dtype = _A8W8_GFX1250_OUT_DTYPE if _is_b8 else q.dtype
@@ -538,6 +545,13 @@ def flydsl_flash_attn_batch_fwd(
         if _is_b8 and any(d is not None for d in (q_descale, k_descale, v_descale)):
             return None
         if any(t.stride(-1) != 1 for t in (q, k, v)):
+            return None
+        if (
+            sink is not None
+            and torch.is_tensor(sink)
+            and sink.dim() > 0
+            and sink.stride(-1) != 1
+        ):
             return None
         if softmax_scale is not None and not (0 < softmax_scale < float("inf")):
             return None
