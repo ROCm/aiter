@@ -14,9 +14,6 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
-| `test_mxfp4_tuner.py` | 1 | No (GPU-hidden process) | `--mxfp4-flydsl` tuner lifecycle, shared CSV rewrite, configuration snapshot, timeouts |
-| `test_mxfp4_staged.py` | 1 | No (GPU-hidden process) | `--mxfp4-search-mode staged`: CLI, planning, screening, worker supervision |
-| `test_mxfp4_aot_configuration.py` | 1 | No (GPU-hidden process) | MXFP4 AOT job generation from tuned CSVs (compiler stubbed) |
 
 ## CI coverage
 
@@ -77,22 +74,9 @@ python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v
 # Level 2: run_config validation (~20min, all tuned CSVs)
 python3 -m unittest op_tests.tuning_tests.test_run_config -v
 
-# MXFP4 tuner tests: their own pytest process, started with every GPU hidden
-ROCR_VISIBLE_DEVICES= HIP_VISIBLE_DEVICES= CUDA_VISIBLE_DEVICES= \
-  python3 -m pytest op_tests/tuning_tests/test_mxfp4_tuner.py \
-  op_tests/tuning_tests/test_mxfp4_staged.py \
-  op_tests/tuning_tests/test_mxfp4_aot_configuration.py -v
-
-# Everything else (the MXFP4 modules skip themselves here)
+# Everything else
 python3 -m pytest op_tests/tuning_tests -v
 ```
-
-The MXFP4 modules import the tuner with GPUs hidden. That state is
-process-wide and cannot be undone: HIP enumerates no device, `aiter.dtypes.fp8`
-becomes `uint8`, and FlyDSL caches a fallback arch, which breaks GPU tests
-collected in the same process. The modules therefore skip unless the process
-started with all three `*_VISIBLE_DEVICES` variables empty; do not run them
-together with GPU tests.
 
 ### Tuning HY4 heterogeneous MoE
 
