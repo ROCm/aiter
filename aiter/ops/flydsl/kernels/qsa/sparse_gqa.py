@@ -84,7 +84,7 @@ def _exp2(x):
 
     The running-max scale and the probabilities both use this intrinsic.
     """
-    return Float32(fx.rocdl.exp2(Float32.ir_type, Float32(x).ir_value()))
+    return Float32(fx.rocdl.exp2(Float32.ir_type, x.ir_value()))
 
 
 def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):

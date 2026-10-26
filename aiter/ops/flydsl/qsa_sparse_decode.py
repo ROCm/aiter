@@ -35,9 +35,9 @@ __all__ = [
 ]
 
 _MAX_GROUP_SIZE = 16
-# Measured on MI355X (Hkv in {1, 2}, batch 1-128): one CTA per CU beats two, since
-# every extra split adds a prologue and a partial to merge; and below two 16-token
-# tiles per wave the fixed per-CTA latency outweighs the extra parallelism.
+# One CTA per CU. An extra split adds a prologue and a partial to merge, and
+# below two 16-token tiles per wave the fixed per-CTA latency outweighs the
+# extra parallelism.
 _CTAS_PER_CU = 1
 _MIN_TOKENS_PER_SPLIT = 2 * SPLIT_TOKEN_ALIGN
 _KV_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)

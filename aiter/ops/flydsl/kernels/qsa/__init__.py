@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
 """FlyDSL kernels for Qwen sparse attention (QSA).
 
   ``sparse_decode_attn.py``    one CTA per (row, kv head, KV split), reading the

@@ -497,8 +497,8 @@ def qsa_indexer_score_and_select(
     # lets a padded allocation take the short-row selector: that dispatch
     # reads the tensor width, not row_lens. One workgroup per row is the
     # decode shape (at most 64 rows). A prefill takes the decode radix at any
-    # width: it stops at each row's row_lens, and on a padded 65856-column
-    # table it ran 1.3x to 1.8x faster than the streaming selector.
+    # width and stops at each row's row_lens. The streaming selector is the
+    # other path for a wide table.
     scored = (
         scores if select_columns == n_columns else scores.narrow(1, 0, select_columns)
     )
