@@ -53,15 +53,22 @@ def _build_targets_standalone(explicit_targets=()):
             gfx, cu = value.split("/")
             targets.append((gfx.split(":", 1)[0].strip().lower(), int(cu)))
         return sorted(set(targets))
-    root = Path(__file__).resolve().parents[2]
-    if root.name == "aiter_meta":
-        root = root.parent
-    utils = str(root / "aiter/jit/utils")
-    if utils not in sys.path:
-        sys.path.insert(0, utils)
-    from chip_info import get_build_targets
+    import importlib.util
 
-    targets = set(get_build_targets())
+    spec = importlib.util.find_spec("aiter")  # locates, does not execute
+    if spec is None or not spec.submodule_search_locations:
+        raise ImportError("aiter package not found")
+    utils_dir = os.path.join(
+        next(iter(spec.submodule_search_locations)), "jit", "utils"
+    )
+    if utils_dir not in sys.path:
+        sys.path.insert(0, utils_dir)
+    mod_spec = importlib.util.spec_from_file_location(
+        "_opus_chip_info", os.path.join(utils_dir, "chip_info.py")
+    )
+    mod = importlib.util.module_from_spec(mod_spec)
+    mod_spec.loader.exec_module(mod)
+    targets = set(mod.get_build_targets())
     for gfx, _cu in tuple(targets):
         targets.update(
             (gfx, cu)
