@@ -506,6 +506,60 @@ def test_fused_gdn_decode_correctness_flat_layout(
     )
 
 
+@pytest.mark.parametrize("batch", [2, 64])
+@pytest.mark.parametrize(
+    "num_k_heads,ratio,qkvz_layout", [(16, 3, "flat"), (4, 2, "interleaved")]
+)
+@pytest.mark.parametrize("state_dtype", _STATE_DTYPES)
+def test_fused_gdn_decode_row_strided_projections(
+    batch, num_k_heads, ratio, qkvz_layout, state_dtype
+):
+    """qkvz and ba as column views of one [T, qkvz + ba] buffer (one GEMM that
+    produces both) must match the reference; ratio 2 interleaved takes the
+    ratio-generic kernel here instead of the generated pair kernels."""
+    fused_gdn_decode_qkvz = _import_op()
+    _requires_gfx950()
+
+    inp = make_inputs(
+        batch, num_k_heads=num_k_heads, ratio=ratio, state_dtype=state_dtype
+    )
+    ref_inp = {
+        k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()
+    }
+    ref_norm, _, _ = ref_gdn_decode(**ref_inp, quant_dtype=None)
+    run = to_flat_layout(inp) if qkvz_layout == "flat" else inp
+    qkvz_dim = run["projected_qkvz"].shape[1]
+    fused = torch.cat([run["projected_qkvz"], run["projected_ba"]], dim=1)
+    qkvz, ba = fused.split([qkvz_dim, fused.shape[1] - qkvz_dim], dim=1)
+    assert not qkvz.is_contiguous() and not ba.is_contiguous()
+    out, _, _ = fused_gdn_decode_qkvz(
+        qkvz,
+        ba,
+        run["conv_state"],
+        run["ssm_state"],
+        run["ssm_state_indices"],
+        run["conv_weight"],
+        run["conv_bias"],
+        run["A_log"],
+        run["dt_bias"],
+        run["norm_weight"],
+        scale=run["scale"],
+        norm_eps=run["norm_eps"],
+        quant_dtype=None,
+        qkvz_layout=qkvz_layout,
+    )
+    torch.testing.assert_close(out.float(), ref_norm.float(), atol=ATOL, rtol=ATOL)
+    torch.testing.assert_close(
+        run["ssm_state"].float(), ref_inp["ssm_state"].float(), atol=ATOL, rtol=ATOL
+    )
+    torch.testing.assert_close(
+        run["conv_state"].float(),
+        ref_inp["conv_state"].float(),
+        atol=ATOL,
+        rtol=ATOL,
+    )
+
+
 @pytest.mark.parametrize("batch", [1, 64])
 @pytest.mark.parametrize("conv_layout", ["channel_major", "width_major"])
 @pytest.mark.parametrize(
