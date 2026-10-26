@@ -24,7 +24,6 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as _mlir_llvm
 from flydsl.expr import range_constexpr
 from flydsl.expr.primitive import const_expr
 
@@ -350,17 +349,13 @@ def _pack4_trunc(vals):
                 fx.rocdl.perm_b32(b.bitcast(fx.Int32), a.bitcast(fx.Int32), sel)
             )
 
-        packed = fx.Vector.from_elements(
-            [_pair(vals[0], vals[1]), _pair(vals[2], vals[3])], dtype=fx.Int32
-        )
-        return packed.bitcast(fx.BFloat16)
+    else:
+        c_mask = fx.Int32(0xFFFF0000)
 
-    c_mask = fx.Int32(0xFFFF0000)
-
-    def _pair(a, b):
-        a_bits = a.bitcast(fx.Int32)
-        b_bits = b.bitcast(fx.Int32)
-        return (b_bits & c_mask) | fx.arith.shrui(a_bits, fx.Int32(16))
+        def _pair(a, b):
+            a_bits = a.bitcast(fx.Int32)
+            b_bits = b.bitcast(fx.Int32)
+            return (b_bits & c_mask) | fx.arith.shrui(a_bits, fx.Int32(16))
 
     packed = fx.Vector.from_elements(
         [_pair(vals[0], vals[1]), _pair(vals[2], vals[3])], dtype=fx.Int32
@@ -434,18 +429,21 @@ def _global_bf16_ptr(tensor):
 def _atomic_pk_add_bf16(ptr, v2):
     """``global_atomic_pk_add_bf16`` of one bf16 pair at the align-4 global bf16 ``ptr``.
 
-    Raw ``llvm.atomicrmw``: gfx942 has no buffer form of this atomic (``BufferAtomicPkAdd`` is
+    gfx942 has no buffer form of this atomic (``BufferAtomicPkAdd`` is
     gfx950+), so it cannot go through a copy atom, and there is no out-of-range masking --
-    callers steer the address onto a valid slot and add +0.0 there.  Not ``fx.llvm.atomic_add``:
-    it takes the alignment from the pointer type, which ``base + idx`` weakens to 2 bytes.
+    callers steer the address onto a valid slot and add +0.0 there.  All destinations are
+    bf16-pair aligned; restore that alignment after ``base + idx`` weakens it to 2 bytes.
+    ``fx.atomic_add`` then emits the same align-4, agent-scope monotonic vector fadd.
     """
-    _mlir_llvm.atomicrmw(
-        _mlir_llvm.AtomicBinOp.fadd,
-        fx.to_llvm_ptr(ptr),
-        fx.Vector(v2).ir_value(),
-        _mlir_llvm.AtomicOrdering.monotonic,
+    ptr = fx.inttoptr(
+        fx.PointerType.get(fx.BFloat16.ir_type, fx.AddressSpace.Global, 4),
+        fx.ptrtoint(ptr),
+    )
+    fx.atomic_add(
+        ptr,
+        fx.Vector(v2),
         syncscope="agent",
-        alignment=4,
+        ordering=fx.AtomicOrdering.Monotonic,
     )
 
 
