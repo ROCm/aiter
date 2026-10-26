@@ -1,8 +1,0 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-
-MXFP4_SCALE_STRIPE = 32
-MXFP4_SCALE_KCHUNK = 8
-MXFP4_SHUFFLE_TILE_ROWS = 16
-MXFP4_SHUFFLE_UNIT_BYTES = 8
-MXFP4_SHUFFLE_GROUP_BYTES = 32

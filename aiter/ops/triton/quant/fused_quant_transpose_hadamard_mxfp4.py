@@ -7,15 +7,13 @@ from aiter.ops.triton._triton_kernels.quant.fused_quant_transpose_hadamard_mxfp4
     _fused_quant_transpose_hadamard_mxfp4_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils._triton.mxfp4 import (
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.mxfp4 import (
     MXFP4_SCALE_KCHUNK,
     MXFP4_SCALE_STRIPE,
     MXFP4_SHUFFLE_TILE_ROWS,
     MXFP4_SHUFFLE_UNIT_BYTES,
-)
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.mxfp4 import (
     mxfp4_data_shuffle_supported,
     mxfp4_scale_swizzle_supported,
     prepare_h16_sign,
