@@ -655,13 +655,11 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
             reinterpret_cast<P*>(residual_out)[idx] = sum;
         }
         const float inv_rms = rsqrtf(block_allreduce_f32<false>(square_sum) / hidden + eps);
-        float amax          = 0.f;
 #pragma unroll
         for(int j = 0; j < pack_size; j++)
         {
             const float wj = upcast_s(w[j]) + (GEMMA_NORM ? 1.f : 0.f);
             x[j] *= inv_rms * wj;
-            amax = fmaxf(amax, fabsf(x[j]));
         }
         if constexpr(std::is_same_v<T, OutT>)
         {
@@ -676,28 +674,33 @@ __global__ void __launch_bounds__(1024, 1) ar_rmsnorm_gfx1250(
         }
         else
         {
-            if(active && bf16_output != nullptr)
-            {
-                P o;
+            // Quantize the T-rounded output with the steps of the unfused
+            // dynamic_per_token_scaled_quant on gfx1250 (scale = amax / max,
+            // multiply by rcp(scale), clamp, cvt_pk), so both FP8 paths match
+            // bit for bit.
+            P o;
+            float amax = 0.f;
 #pragma unroll
-                for(int j = 0; j < pack_size; j++)
-                    o[j] = downcast_s<T>(x[j]);
-                reinterpret_cast<P*>(bf16_output)[idx] = o;
+            for(int j = 0; j < pack_size; j++)
+            {
+                o[j] = downcast_s<T>(x[j]);
+                amax = fmaxf(amax, fabsf(upcast_s(o[j])));
             }
-            amax                = block_allreduce_f32<true>(amax);
+            if(active && bf16_output != nullptr)
+                reinterpret_cast<P*>(bf16_output)[idx] = o;
             const float fp8_max = opus::cast<opus::fp32_t>(opus::numeric_limits<OutT>::max());
-            const float scale   = amax == 0.f ? 1.f : amax / fp8_max;
+            const float scale   = block_allreduce_f32<true>(amax) * (float)(1. / fp8_max);
+            const float inv     = __builtin_amdgcn_rcpf(scale);
             if(active)
             {
                 opus::vector_t<OutT, pack_size> q;
 #pragma unroll
-                for(int j = 0; j < pack_size / 4; j++)
+                for(int j = 0; j < pack_size; j += 2)
                 {
-                    opus::fp32x4_t f;
-#pragma unroll
-                    for(int k = 0; k < 4; k++)
-                        f[k] = x[j * 4 + k];
-                    *(reinterpret_cast<opus::fp8x4_t*>(&q) + j) = opus::cast<opus::fp8_t>(f / scale);
+                    const float a = __builtin_amdgcn_fmed3f(upcast_s(o[j]) * inv, -fp8_max, fp8_max);
+                    const float b = __builtin_amdgcn_fmed3f(upcast_s(o[j + 1]) * inv, -fp8_max, fp8_max);
+                    reinterpret_cast<uint16_t*>(&q)[j / 2] =
+                        __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
                 }
                 reinterpret_cast<opus::vector_t<OutT, pack_size>*>(output)[idx] = q;
             }
