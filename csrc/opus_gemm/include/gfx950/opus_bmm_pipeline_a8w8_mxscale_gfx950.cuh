@@ -146,7 +146,18 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
     int lane_id = opus::thread_id_x() % get_warp_size();
 
-    // Bound resources to valid tile rows and columns with 64-bit base offsets.
+    // Base offsets in 64-bit: with a batch-in-the-middle layout stride_*_batch is
+    // M*K (A) / M*N (C), which overflows int32 well before the 4 GiB buffer limit.
+    //
+    // OOB masking for partial M tiles: bound A / sfa / C to this tile's valid row
+    // window so lanes past M read 0 and their stores are dropped by num_records.
+    // Any M then runs on a B_M tile (N and K stay divisible, so B and sfb need no
+    // bound); the garbage accumulated for masked rows is never stored.
+    //
+    // Clamp to B_M rather than the full (M - row) span: stride_a = batch*K here,
+    // so rows_avail*stride_a would overflow the 32-bit num_records field and wrap
+    // on a large-M / high-batch shape. Each WG owns one B_M tile and the base is
+    // already at `row`, so the clamp still masks the tail.
     const int rows_left  = kargs.m - row;
     const int rows_avail = rows_left < T::B_M ? rows_left : T::B_M;
     const unsigned int a_bytes =
@@ -155,18 +166,13 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         (unsigned int)rows_avail * (unsigned int)kargs.stride_c * sizeof(D_C);
     const unsigned int sfa_bytes =
         (unsigned int)ceil_div(rows_avail, T::GROUP_M) * (unsigned int)kargs.stride_sfa * sizeof(D_SF);
-    const int cols_avail = min(kargs.n - col, T::B_N);
-    const unsigned int b_bytes =
-        (unsigned int)cols_avail * (unsigned int)kargs.stride_b * sizeof(D_B);
-    const unsigned int sfb_bytes =
-        (unsigned int)ceil_div(cols_avail, T::GROUP_N) * (unsigned int)kargs.stride_sfb * sizeof(D_SF);
 
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + (size_t)batch_id*kargs.stride_a_batch + (size_t)row*kargs.stride_a, a_bytes);
-    auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + (size_t)batch_id*kargs.stride_b_batch + (size_t)col*kargs.stride_b, b_bytes);
+    auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + (size_t)batch_id*kargs.stride_b_batch + (size_t)col*kargs.stride_b);
     auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_c) + (size_t)batch_id*kargs.stride_c_batch + (size_t)row*kargs.stride_c + col, c_bytes);
 
     auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + (size_t)batch_id*kargs.stride_sfa_batch + (size_t)(row/T::GROUP_M)*kargs.stride_sfa, sfa_bytes);
-    auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb) + (size_t)batch_id*kargs.stride_sfb_batch + (size_t)(col/T::GROUP_N)*kargs.stride_sfb, sfb_bytes);
+    auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb) + (size_t)batch_id*kargs.stride_sfb_batch + (size_t)(col/T::GROUP_N)*kargs.stride_sfb);
 
     int wave_id_m = wave_id % T::T_M;
     int wave_id_n = wave_id / T::T_M;
@@ -667,27 +673,10 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         return half_tile_m * T::HALF_B_M * kargs.stride_c + half_tile_n * T::HALF_B_N;
     };
 
-    if (cols_avail == T::B_N) {
-        store<T::VEC_C>(g_c, v_c[0][0], u_gc, c_offset(0, 0));
-        store<T::VEC_C>(g_c, v_c[0][1], u_gc, c_offset(0, 1));
-        store<T::VEC_C>(g_c, v_c[1][0], u_gc, c_offset(1, 0));
-        store<T::VEC_C>(g_c, v_c[1][1], u_gc, c_offset(1, 1));
-    } else {
-        // Mask logical columns; the C resource already masks invalid rows.
-        auto u_coord = partition_layout_c<T::VEC_C>(mma, opus::make_tuple(number<T::HALF_B_N>{}, 1_I), p_coord_c);
-        auto coords = layout_to_offsets<T::VEC_C>(u_coord);
-        using LT = layout_load_traits<decltype(u_coord), T::VEC_C>;
-        constexpr auto u_idx = make_layout<-1>(LT::issue_space_vec);
-        static_for<2>([&](auto hm) {
-            static_for<2>([&](auto hn) {
-                auto valid = [&](auto... ids) {
-                    int coord = coords[u_idx(ids...)];
-                    return hn * T::HALF_B_N + coord % T::HALF_B_N + T::VEC_C <= cols_avail;
-                };
-                g_c.template store_if<T::VEC_C>(valid, cast<D_C>(v_c[hm][hn]), u_gc, c_offset(hm, hn));
-            });
-        });
-    }
+    store<T::VEC_C>(g_c, v_c[0][0], u_gc, c_offset(0, 0));
+    store<T::VEC_C>(g_c, v_c[0][1], u_gc, c_offset(0, 1));
+    store<T::VEC_C>(g_c, v_c[1][0], u_gc, c_offset(1, 0));
+    store<T::VEC_C>(g_c, v_c[1][1], u_gc, c_offset(1, 1));
 #else
     // Non-gfx950 device pass: empty stub. a8w8 is gfx950-only; the host
     // launcher symbol must still exist for the unconditional dispatcher
