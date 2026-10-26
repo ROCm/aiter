@@ -60,6 +60,7 @@ from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
+from aiter.ops.quant import _mxfp8_ep_quant
 
 
 @functools.lru_cache(maxsize=1)
@@ -186,6 +187,52 @@ def _is_fused_decode_sort_quant_enabled(
         # activations (the kernel quantizes inline), so prequantizing here
         # would feed the wrong dtype.
         and ksplit <= 1
+    )
+
+
+def _use_ep_mxfp8_quant(
+    hidden_states,
+    metadata,
+    *,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    dtype,
+    q_dtype_w,
+    activation,
+    gate_mode,
+    is_g1u1,
+    doweight_stage1,
+    hidden_pad,
+    intermediate_pad,
+    expert_mask,
+    num_local_tokens,
+    ep_has_fake_route,
+):
+    """Select live-row quantization for the validated gfx950 MiMo EP geometry."""
+    return (
+        hidden_states.shape[0] >= 8192
+        and hidden_states.dtype == dtype == dtypes.bf16
+        and hidden_states.is_contiguous()
+        and (model_dim, inter_dim) == (6144, 2048)
+        and experts in (24, 48)
+        and topk - int(ep_has_fake_route) == 8
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and gate_mode == GateMode.INTERLEAVE
+        and is_g1u1
+        and not doweight_stage1
+        and not hidden_pad
+        and not intermediate_pad
+        and expert_mask is not None
+        and num_local_tokens is not None
+        and num_local_tokens.dtype == dtypes.i32
+        and num_local_tokens.numel() == 1
+        and num_local_tokens.device == hidden_states.device
+        and metadata.fuse_quant == "fp8"
+        and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
+        and get_gfx_runtime() == "gfx950"
     )
 
 
@@ -4760,6 +4807,33 @@ def fused_moe_2stages(
             # scales, so skip the quant and only sort the scale, exactly as the
             # fp4x2 pre-quantized branch below does.
             a1 = hidden_states
+            a1_scale = mxfp4_moe_sort_fwd(
+                a1_scale,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                cols=model_dim,
+            )
+        elif _use_ep_mxfp8_quant(
+            hidden_states,
+            metadata,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            dtype=dtype,
+            q_dtype_w=q_dtype_w,
+            activation=activation,
+            gate_mode=gate_mode,
+            is_g1u1=isG1U1,
+            doweight_stage1=doweight_stage1,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
+            ep_has_fake_route=ep_has_fake_route,
+        ):
+            a1, a1_scale = _mxfp8_ep_quant(hidden_states, num_local_tokens)
             a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
                 sorted_ids=sorted_ids,

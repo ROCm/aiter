@@ -623,6 +623,47 @@ def per_1x32_mx_quant_hip(
     return y, scale
 
 
+def _mxfp8_ep_quant(x: Tensor, num_rows: Tensor) -> tuple[Tensor, Tensor]:
+    """Internal quantizer for the live prefix of an EP receive buffer.
+
+    ``x`` must be contiguous BF16/FP16 ``[capacity, hidden]`` on a GPU, with
+    a positive hidden width divisible by 32. ``num_rows`` is one int32 value
+    on the same device and must lie in ``[0, capacity]``. It is read on the
+    GPU, so graph replay can change the live prefix without host synchronization.
+
+    Returns FP8 activations and unshuffled E8M0 group-32 scales. Only live
+    rows are defined; padding is not initialized.
+
+    This EP operation selects persistent quantization on gfx950
+    for capacity >= 8192; smaller buffers and other architectures use the
+    ordinary quantizer. ``fused_moe`` calls it after checking the supported
+    EP geometry, layout, and backend; generic quantization does not select it.
+    """
+    if x.ndim != 2 or x.shape[1] == 0 or x.shape[1] % 32:
+        raise ValueError(
+            "mxfp8_ep_quant requires [capacity, hidden] with hidden divisible by 32"
+        )
+    if (
+        not x.is_cuda
+        or x.dtype not in (dtypes.bf16, dtypes.fp16)
+        or not x.is_contiguous()
+    ):
+        raise ValueError("mxfp8_ep_quant requires contiguous BF16/FP16 GPU input")
+    if (
+        num_rows.dtype != torch.int32
+        or num_rows.numel() != 1
+        or num_rows.device != x.device
+    ):
+        raise ValueError(
+            "mxfp8_ep_quant requires one int32 row count on the input device"
+        )
+    rows, cols = x.shape
+    out = torch.empty((rows, cols), dtype=dtypes.fp8, device=x.device)
+    scales = torch.empty((rows, cols // 32), dtype=dtypes.fp8_e8m0, device=x.device)
+    _mxfp8_ep_quant_hip(out, x, scales, num_rows)
+    return out, scales
+
+
 def per_1x32_f4_quant_hip(
     x,
     scale=None,
@@ -824,6 +865,15 @@ def dynamic_per_group_scaled_quant(
     ``scales`` must hold ``(pad32(M), K // 32)`` bytes, the pad rows are written
     as 0x7F, and ``shuffle_scale`` is ignored.
     """
+
+
+@compile_ops("module_quant", fc_name="mxfp8_ep_quant", develop=True)
+def _mxfp8_ep_quant_hip(
+    out: Tensor,
+    input: Tensor,
+    scales: Tensor,
+    num_rows: Tensor,
+) -> None: ...
 
 
 @compile_ops("module_quant", develop=True)

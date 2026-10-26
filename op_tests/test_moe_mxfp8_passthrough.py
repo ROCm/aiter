@@ -38,6 +38,7 @@ from aiter.fused_moe import fused_moe, fused_topk, get_2stage_cfgs
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import (
+    _mxfp8_ep_quant,
     dynamic_per_group_scaled_quant,
     per_1x32_f4_quant,
     per_1x32_mx_quant_hip,
@@ -323,34 +324,164 @@ def test_routed_only_ep_topk_reaches_fused_moe():
 
 
 @_SKIP_GFX950_GPU
-def test_device_row_limited_mxfp8_quant_graph_replay():
-    """Persistent row-limited quantization must track the replay-time row count."""
+@pytest.mark.parametrize(
+    "capacity,dtype",
+    [(512, dtypes.bf16), (8192, dtypes.bf16), (8192, dtypes.fp16)],
+)
+def test_device_row_limited_mxfp8_quant_graph_replay(capacity, dtype):
+    """The dedicated EP op and its small-buffer fallback read replay-time rows."""
     torch.manual_seed(13)
-    capacity, cols = 8192, 512
-    x = torch.randn((capacity, cols), dtype=torch.bfloat16, device="cuda") / 8
+    cols = 512
+    x = torch.randn((capacity, cols), dtype=dtype, device="cuda") / 8
     full_out = torch.empty((capacity, cols), dtype=dtypes.fp8, device="cuda")
     full_scale = torch.empty(
         (capacity, cols // 32), dtype=dtypes.fp8_e8m0, device="cuda"
     )
     dynamic_per_group_scaled_quant(full_out, x, full_scale, 32, False)
 
-    out = torch.empty_like(full_out)
-    scale = torch.empty_like(full_scale)
     num_rows = torch.tensor([257], dtype=torch.int32, device="cuda")
-    dynamic_per_group_scaled_quant(
-        out, x, scale, 32, False, num_rows=num_rows, num_rows_factor=1
-    )
+    _mxfp8_ep_quant(x, num_rows)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        dynamic_per_group_scaled_quant(
-            out, x, scale, 32, False, num_rows=num_rows, num_rows_factor=1
-        )
+        out, scale = _mxfp8_ep_quant(x, num_rows)
 
-    for live_rows in (257, 1025):
+    for live_rows in (257, min(1025, capacity), 0):
         num_rows.fill_(live_rows)
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out[:live_rows], full_out[:live_rows])
         assert torch.equal(scale[:live_rows], full_scale[:live_rows])
+
+
+@_SKIP_GFX950_GPU
+def test_fused_moe_selects_mimo_ep_quant(monkeypatch):
+    """The normal public call selects the internal quantizer at MiMo EP16 geometry."""
+    module = importlib.import_module("aiter.fused_moe")
+    for name, value in {
+        "MODEL_DIM": 6144,
+        "INTER_DIM": 2048,
+        "EXPERTS": 24,
+        "TOPK": 8,
+    }.items():
+        monkeypatch.setitem(_build.__globals__, name, value)
+    x, w1, w2, kwargs = _build(8192)
+    kwargs["activation"] = ActivationType.Silu
+    mask = torch.zeros(384, dtype=torch.int32, device="cuda")
+    mask[-24:] = 1
+    kwargs["expert_mask"] = mask
+    kwargs["topk_ids"].add_(360)
+    live_rows = torch.tensor([257], dtype=torch.int32, device="cuda")
+    kwargs["num_local_tokens"] = live_rows
+    original = module._mxfp8_ep_quant
+    calls = []
+
+    def capture(hidden, count):
+        quantized, scales = original(hidden, count)
+        reference, reference_scales = per_1x32_mx_quant_hip(
+            hidden,
+            quant_dtype=dtypes.fp8,
+            scale_type=dtypes.fp8_e8m0,
+            shuffle=False,
+            num_rows=count,
+        )
+        assert torch.equal(quantized[:257], reference[:257])
+        assert torch.equal(scales[:257], reference_scales[:257])
+        calls.append(count)
+        return quantized, scales
+
+    monkeypatch.setattr(module, "_mxfp8_ep_quant", capture)
+    actual = fused_moe(x, w1, w2, **kwargs)
+    assert len(calls) == 1 and calls[0] is live_rows
+    assert torch.isfinite(actual[:257]).all()
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ({}, "ep"),
+        ({"experts": 48, "topk": 9, "fake": True}, "ep"),
+        ({"arch": "gfx942"}, "generic"),
+        ({"arch": "gfx1250"}, "generic"),
+        ({"model_dim": 2048, "inter_dim": 512, "experts": 8}, "generic"),
+        ({"ep": False}, "generic"),
+        ({"live": False}, "generic"),
+        ({"capacity": 4096}, "generic"),
+        ({"flydsl": False}, "generic"),
+    ],
+    ids=[
+        "ep16",
+        "ep8-legacy",
+        "gfx942",
+        "gfx1250",
+        "other-geometry",
+        "dense",
+        "no-live-count",
+        "small",
+        "other-backend",
+    ],
+)
+def test_fused_moe_ep_quant_dispatch_scope(monkeypatch, case, expected):
+    """Exercise real two-stage selection with metadata-only tensors, stopping at quantization."""
+    module = importlib.import_module("aiter.fused_moe")
+    model_dim, inter_dim = case.get("model_dim", 6144), case.get("inter_dim", 2048)
+    experts, topk = case.get("experts", 24), case.get("topk", 8)
+    capacity = case.get("capacity", 8192)
+    stage1 = (
+        module._flydsl_stage1_wrapper
+        if case.get("flydsl", True)
+        else module.ck_moe_stage1
+    )
+    metadata = module.MOEMetadata(stage1, None, 64, 0, fuse_quant="fp8")
+    monkeypatch.setattr(module, "get_2stage_cfgs", lambda *a, **kw: metadata)
+    monkeypatch.setattr(module, "get_gfx_runtime", lambda: case.get("arch", "gfx950"))
+    calls = []
+
+    class QuantSelected(Exception):
+        pass
+
+    def capture(name):
+        def call(*args, **kwargs):
+            calls.append(name)
+            raise QuantSelected
+
+        return call
+
+    monkeypatch.setattr(module, "_mxfp8_ep_quant", capture("ep"))
+    monkeypatch.setattr(
+        module, "fused_dynamic_mxfp8_quant_moe_sort", capture("generic")
+    )
+    x = torch.empty(capacity, model_dim, dtype=dtypes.bf16, device="meta")
+    ids = torch.empty(1, dtype=torch.int32, device="meta")
+    with pytest.raises(QuantSelected):
+        module.fused_moe_2stages(
+            x,
+            torch.empty(
+                experts,
+                inter_dim * 2,
+                model_dim // 2,
+                dtype=dtypes.fp4x2,
+                device="meta",
+            ),
+            torch.empty(
+                experts, model_dim, inter_dim // 2, dtype=dtypes.fp4x2, device="meta"
+            ),
+            topk,
+            ids,
+            torch.empty(1, device="meta"),
+            ids,
+            ids,
+            torch.empty_like(x),
+            True,
+            64,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.per_1x32,
+            q_dtype_a=dtypes.fp8,
+            q_dtype_w=dtypes.fp4x2,
+            gate_mode=GateMode.INTERLEAVE,
+            expert_mask=ids if case.get("ep", True) else None,
+            num_local_tokens=ids if case.get("live", True) else None,
+            ep_has_fake_route=case.get("fake", False),
+        )
+    assert calls == [expected]
