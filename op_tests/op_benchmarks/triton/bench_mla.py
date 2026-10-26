@@ -188,7 +188,9 @@ def benchmark(args):
             out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
 
         output = torch.empty(
-            (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
+            (total_num_query_tokens, num_query_heads, kv_lora_rank),
+            dtype=out_dtype,
+            device=args.device,
         )
 
         maybe_shuffled_kv_buffer = (
@@ -341,7 +343,6 @@ def parse_args():
 
 def run_bench(args):
     torch.manual_seed(0)
-    torch.set_default_device(args.device)
     benchmark(args)
 
 
