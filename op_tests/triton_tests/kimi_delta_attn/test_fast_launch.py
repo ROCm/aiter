@@ -132,6 +132,7 @@ def _wrapped():
         fk._prepare_fast,
         fk._segment_fast,
         fk._seg_scan_fast,
+        fk._seg_scan_prefetch_fast,
     ]
     if fk._GLUON_ARCH_OK:
         pkg = f"aiter.ops.triton._gluon_kernels.{fk.DEVICE_ARCH}.kimi_delta_attn"
