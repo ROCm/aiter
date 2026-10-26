@@ -498,6 +498,10 @@ def rows_shapes(model):
             (full_layer("v4 dec mtp1", [2048, 1500, 777], [1, 1, 1], 4), False),
             (full_layer("v4 dec mtp4 ragged", [9000, 1500, 777], [4, 3, 1], 4), False),
             (full_layer("v4 dec r2 6 rows", [3000, 2048], [6, 6], 2), False),
+            (
+                full_layer("v4 dec tiers", [2048, 1500, 777, 3000], [2, 4, 6, 8], 4),
+                False,
+            ),
             (full_layer("v4 dec r1 short", [70], [6], 1), False),
             (full_layer("v4 pre fresh 600", [600], [600], 4), False),
             (full_layer("v4 pre chunk 300@5000", [5300], [300], 4), False),

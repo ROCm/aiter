@@ -71,6 +71,10 @@ _SCHED_SCRATCH_RECORDS = 96
 _GROUPS_BUILD_MAX_BATCH = 2048
 # max_qlen above this is a prefill bucket (V4.1 decode is <= 6 rows a sequence, V4's <= 4).
 _DECODE_MAX_QLEN = 8
+# V4 (H64) decode: a tier (the smallest >= max_qlen) -> rows a CTA, one a wave. 2 and 6 rows: q2 /
+# q6 are 1.31 / 1.19x (Free) q4 on uniform rows; 7-8 rows run two four-row groups -- an
+# eight-wave CTA fits 2 a CU where q4 fits 5, and q8 is 0.94-0.98x q4 (opus-ops design §8).
+_H64_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 6, 8: 4}
 # V4.1 full-layer decode: the rows a CTA (a tier, the smallest >= max_qlen) -> (rows_per_wave,
 # waves, scale_tdm). Up to _DECODE_MAX_QLEN.
 _V41_DECODE_TIERS = {
@@ -213,8 +217,10 @@ def _rule(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
     """
     decode = max_qlen <= _DECODE_MAX_QLEN
     if heads == 64:
-        # one-row CTAs for MTP-1 decode, four-row ones otherwise
-        rpc = 1 if max_qlen == 1 else 4
+        # Decode: the rows a CTA by tier (smallest >= max_qlen); prefill: four-row CTAs.
+        rpc = 4
+        if decode:
+            rpc = _H64_DECODE_TIERS[min(t for t in _H64_DECODE_TIERS if t >= max_qlen)]
         want = {"rows_per_cta": rpc, "stages": 2, "scale_tdm": 1, "gather": 0}
         return want, FREE if decode else PREFILL
     if heads == 32 and entry_rows >= _TILE:

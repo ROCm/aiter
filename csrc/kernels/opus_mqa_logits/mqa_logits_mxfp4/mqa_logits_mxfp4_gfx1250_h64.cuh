@@ -41,7 +41,11 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
     constexpr int STAGES = T::STAGES;
     static_assert(MT == 2 && NT == 4 && T::PAGES_PER_TILE == 1,
                   "H = 64 is two m-tiles, and a 64-key tile is one page");
-    static_assert(T::TDM_ISSUE_WAVES == T::NUM_WAVES, "every wave issues one piece of the tile");
+    // The first TDM_ISSUE_WAVES waves each load one piece of the tile; the rest (6 waves: 2) only
+    // compute. A wave that issued nothing passes its tensorcnt wait at once, and the CTA barrier
+    // after the wait is what orders every piece before any wave's read.
+    static_assert(T::SCALE_TDM || T::TDM_ISSUE_WAVES == T::NUM_WAVES,
+                  "lane-loaded scales are per wave: every wave runs issue_tile");
 
     __shared__ __attribute__((aligned(16))) D_BYTE smem_buf[T::LDS_BYTES_H64];
 
@@ -108,6 +112,7 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
     auto issue_tile = [&](int t, auto slot_c, int pid) {
         constexpr int slot = decltype(slot_c)::value;
         if (t >= tile_count) return;
+        if (T::TDM_ISSUE_WAVES < T::NUM_WAVES && wave >= T::TDM_ISSUE_WAVES) return;   // uniform
         const opus::u32_t row0   = (opus::u32_t)pid * T::PAGE_SIZE;
         const opus::u32_t origin = row0 + tdm_piece * T::TDM_ROWS;
         const opus::u32_t stage  = (opus::u32_t)(slot * T::LDS_STAGE_BYTES);

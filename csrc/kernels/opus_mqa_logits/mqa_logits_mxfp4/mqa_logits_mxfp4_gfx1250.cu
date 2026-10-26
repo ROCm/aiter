@@ -32,8 +32,10 @@ namespace {
 
 // The shipped instances (opus-ops opus_logits/common/docs/MQA_LOGITS_INTERFACE_DESIGN.md §3.2
 // has the selection and the measurements behind it).
-using h64_q4s2T  = h64_traits<4, 2, 1>;           // V4 prefill, MTP > 1 decode
-using h64_q1s2T  = h64_traits<1, 2, 1>;           // V4 MTP-1 decode
+using h64_q4s2T  = h64_traits<4, 2, 1>;           // V4 prefill; decode, 3-4 and 7-8 rows a sequence
+using h64_q1s2T  = h64_traits<1, 2, 1>;           // V4 decode, 1 row a sequence
+using h64_q2s2T  = h64_traits<2, 2, 1>;           // V4 decode, 2 rows a sequence
+using h64_q6s2T  = h64_traits<6, 2, 1>;           // V4 decode, 5-6 rows (4 waves issue the TDM)
 using v41_r1w1s2L = v41_traits<1, 1, 2, 0, 0>;    // V4.1 full-layer decode, 1 row a sequence (Free)
 using v41_r1w2s2T = v41_traits<1, 2, 2, 1, 0>;    // ... 2 rows (Free)
 using v41_r3w1s2T = v41_traits<3, 1, 2, 1, 0>;    // ... 3 rows (Free)
@@ -114,6 +116,8 @@ const mqa_logits_instance* mqa_logits_gfx1250_instances(int* count) {
     static const mqa_logits_instance table[] = {
         h64_entry<h64_q4s2T>(),
         h64_entry<h64_q1s2T>(),
+        h64_entry<h64_q2s2T>(),
+        h64_entry<h64_q6s2T>(),
         v41_entry<v41_r1w1s2L>(),
         v41_entry<v41_r1w2s2T>(),
         v41_entry<v41_r3w1s2T>(),

@@ -202,8 +202,10 @@ struct mqa_logits_traits {
                   "the LDS padding policy leaves a bank conflict: the pad of one read vector per "
                   "128 B is what makes 8 lanes tile all 32 banks under the 64 B token stride");
 
-    // -- TDM: every wave issues one contiguous piece of the run (keeps the loop branch-free) --
-    static constexpr int TDM_ISSUE_WAVES       = NUM_WAVES;
+    // -- TDM: each issuing wave loads one contiguous piece of the run (keeps the loop
+    // branch-free). The issuing waves are the largest power of two <= NUM_WAVES, so a 64-row
+    // page splits evenly: all of them at 1 / 2 / 4 / 8 waves, the first 4 of 6. --
+    static constexpr int TDM_ISSUE_WAVES = NUM_WAVES >= 8 ? 8 : NUM_WAVES >= 4 ? 4 : NUM_WAVES >= 2 ? 2 : 1;
     static constexpr int TDM_PAGE_SPLIT        = TDM_ISSUE_WAVES / PAGES_PER_TILE;
     static constexpr int TDM_INFLIGHT_PER_WAVE = 3;   // hardware, per opus.hpp
     static constexpr int TDM_ROWS        = PAGE_SIZE / TDM_PAGE_SPLIT;
