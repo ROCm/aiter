@@ -342,6 +342,7 @@ overrides included.
 |---|---|
 | `AITER_FLY_AR_FUSED_HIDDENS` | Comma-separated hidden sizes to build at startup, for example `4096,7168`. |
 | `AITER_FLY_AR_FUSED_SPLIT` | `1` lets the fused one-shot split a token row over several workgroups, where its ladder has a split rung. Not set (the default): every rung runs unsplit. Set it the same on every rank. |
+| `AITER_FLY_AR_FUSED_LADDERS` | Path to a ladder file to read instead of `aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json`. Read once at import; a malformed file raises `ValueError` naming the bad entry. Set it to the same file on every rank, or the fused path declines. |
 | `AITER_FLY_AR_FUSED_ONESHOT_MIN_BYTES` | The minimum of the fused one-shot window. |
 | `AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES` | The maximum of the fused one-shot window. |
 | `AITER_FLY_AR_FUSED_MESH_MIN_BYTES` | The minimum of the fused mesh window. |
