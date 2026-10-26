@@ -22,6 +22,7 @@ from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 _LOGGER = AiterTritonLogger()
 
@@ -278,7 +279,7 @@ def _classify_flat(kv, width, slots, kv_scale, what):
     if kv.dtype == torch.bfloat16:
         return "bf16"  # kv_scale, if any, is ignored
     arch = arch_info.get_arch()
-    native = torch.float8_e4m3fnuz if arch in FNUZ_ARCHS else torch.float8_e4m3fn
+    native = get_fp8_e4m3_dtype()
     if kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) and kv.dtype != native:
         raise ValueError(
             f"{what}: {kv.dtype} is not {arch}'s fp8; the kernel reads {native}"
