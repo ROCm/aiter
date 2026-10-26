@@ -18,14 +18,17 @@ from csrc.opus_gemm.opus_gemm_common import (
 from . import gemm_op_a8w8 as _a8w8_family
 from . import gemm_op_a16w16 as _a16w16_family
 from . import launch_plan
-from ._arch import _device_arch_and_cu
+from ._arch import GFX950, _device_arch_and_cu
 
 
 def _validate_a16w16_public_contract(
     *,
     kid: int,
+    instance: OpusGemmInstance,
+    cu_num: int,
     input_dtype: torch.dtype,
     weight_dtype: torch.dtype,
+    output_dtype: torch.dtype,
     layout: str,
     has_x_scale: bool,
     has_w_scale: bool,
@@ -44,12 +47,14 @@ def _validate_a16w16_public_contract(
         )
     if has_x_scale or has_w_scale:
         raise ValueError("OPUS a16w16 does not accept x_scale/w_scale")
+    arch = (instance.arch_prefix or GFX950).lower()
+    if get_kernel_instance(arch, "a16w16", kid, output_dtype, cu_num=cu_num) is None:
+        raise ValueError(f"OPUS kid {kid} does not support Y.dtype={output_dtype}")
 
 
 @lru_cache(maxsize=4096)
 def _resolve_contract(
     key: KernelKey,
-    operation: str,
     input_dtype: torch.dtype,
     weight_dtype: torch.dtype,
     output_dtype: torch.dtype,
@@ -59,26 +64,29 @@ def _resolve_contract(
     has_bias: bool,
     has_workspace: bool,
     split_k: int,
-) -> OpusGemmInstance:
-    """Validate/cache the public contract and selected kernel instance."""
-    instance = get_kernel_instance(key.gfx, key.family, key.kid, cu_num=key.cu_num)
-    if instance is None:
-        raise ValueError(f"unknown OPUS kernel {key.encode()}")
+) -> tuple[str, object, object]:
+    """Validate/cache the public contract and its resolved family module."""
     kid = key.kid
+    instance = get_kernel_instance(key.gfx, key.family, kid, cu_num=key.cu_num)
+    if instance is None:
+        raise ValueError(f"unknown OPUS kid {kid}")
 
-    if key.family == "a16w16":
+    if instance.kernel_tag.startswith("a16w16"):
         _validate_a16w16_public_contract(
             kid=kid,
+            instance=instance,
+            cu_num=key.cu_num,
             input_dtype=input_dtype,
             weight_dtype=weight_dtype,
+            output_dtype=output_dtype,
             layout=layout,
             has_x_scale=has_x_scale,
             has_w_scale=has_w_scale,
         )
-        return instance
+        return "a16w16", instance, _a16w16_family
 
-    launch_plan._validate_a8w8_public_contract(
-        family=key.family,
+    family = launch_plan._validate_a8w8_public_contract(
+        kernel_tag=instance.kernel_tag,
         kid=kid,
         input_dtype=input_dtype,
         weight_dtype=weight_dtype,
@@ -90,12 +98,7 @@ def _resolve_contract(
         has_workspace=has_workspace,
         split_k=split_k,
     )
-    if key.family == "a8w8_mxscale_bmm":
-        if operation != "opus_bmm":
-            raise ValueError("OPUS a8w8_mxscale_bmm supports opus_bmm only")
-    elif operation != "opus_gemm":
-        raise ValueError(f"OPUS family {key.family} is GEMM-only; use opus_gemm")
-    return instance
+    return family, instance, _a8w8_family
 
 
 def _opus_dispatch(
@@ -149,18 +152,30 @@ def _opus_dispatch(
             "family must also support that operation"
         )
 
+    if type(kid) is not int:
+        raise ValueError(f"OPUS kid must be an integer id, got {kid!r}")
     if type(split_k) is not int:
         raise ValueError(f"OPUS split_k must be an integer, got {split_k!r}")
     if split_k < 0:
         raise ValueError(f"OPUS split_k must be non-negative, got {split_k}")
+    if layout not in (
+        "plain",
+        "bpreshuffle",
+        "mxscale_bmm",
+    ):
+        raise ValueError(
+            f"unsupported OPUS weight layout {layout!r}; expected "
+            "'plain', 'bpreshuffle' or 'mxscale_bmm'"
+        )
+    if operation == "opus_gemm" and layout == "mxscale_bmm":
+        raise ValueError("layout='mxscale_bmm' is only supported by opus_bmm")
 
     has_x_scale = x_scale is not None
     has_w_scale = w_scale is not None
     arch, cu_num = _device_arch_and_cu(XQ.device)
     key = KernelKey(family, arch, cu_num, kid)
-    instance = _resolve_contract(
+    family, instance, family_module = _resolve_contract(
         key,
-        operation,
         XQ.dtype,
         WQ.dtype,
         Y.dtype,
@@ -171,12 +186,13 @@ def _opus_dispatch(
         workspace is not None,
         split_k,
     )
-    family = key.family
+    route_arch = arch
+
     if family == "a16w16":
         launch = (
-            _a16w16_family._launch_a16w16_gemm
+            family_module._launch_a16w16_gemm
             if operation == "opus_gemm"
-            else _a16w16_family._launch_a16w16_bmm
+            else family_module._launch_a16w16_bmm
         )
         return launch(
             XQ,
@@ -186,13 +202,16 @@ def _opus_dispatch(
             kid=kid,
             split_k=split_k,
             workspace=workspace,
-            route_arch=key.gfx,
-            route_cu_num=key.cu_num,
+            route_arch=route_arch,
+            route_cu_num=cu_num,
             instance=instance,
         )
 
     if family == "a8w8_mxscale_bmm":
-        return _a8w8_family._launch_a8w8_mxscale_bmm(
+        if operation != "opus_bmm":
+            raise ValueError("OPUS a8w8_mxscale_bmm supports opus_bmm only")
+        assert x_scale is not None and w_scale is not None
+        return family_module._launch_a8w8_mxscale_bmm(
             XQ,
             WQ,
             Y,
@@ -201,35 +220,43 @@ def _opus_dispatch(
             kid=kid,
             split_k=split_k,
             workspace=workspace,
+            route_arch=route_arch,
             instance=instance,
         )
 
+    if operation != "opus_gemm":
+        raise ValueError(f"OPUS family {family} is GEMM-only; use opus_gemm")
+
     if family == "a8w8":
-        return _a8w8_family._launch_a8w8_gemm(
+        return family_module._launch_a8w8_gemm(
             XQ,
             WQ,
             Y,
             kid=kid,
+            route_arch=route_arch,
             instance=instance,
         )
+    assert x_scale is not None and w_scale is not None
     if family == "a8w8_blockscale":
-        return _a8w8_family._launch_a8w8_blockscale_gemm(
+        return family_module._launch_a8w8_blockscale_gemm(
             XQ,
             WQ,
             Y,
             x_scale,
             w_scale,
             kid=kid,
+            route_arch=route_arch,
             instance=instance,
         )
     if family == "a8w8_blockscale_bpreshuffle":
-        return _a8w8_family._launch_a8w8_blockscale_bpreshuffle_gemm(
+        return family_module._launch_a8w8_blockscale_bpreshuffle_gemm(
             XQ,
             WQ,
             x_scale,
             w_scale,
             Y,
             kid=kid,
+            route_arch=route_arch,
             instance=instance,
         )
     raise RuntimeError(f"unsupported canonical OPUS family {family!r}")

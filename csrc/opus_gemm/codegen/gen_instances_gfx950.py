@@ -776,7 +776,7 @@ void
 {k_check}
     AITER_CHECK(!bias.has_value(),
         "bias is not supported on a16w16_persistent kid; use a16w16 "
-        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
+        "split-barrier or a16w16_flatmm_splitk");
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a = XQ.data_ptr();
@@ -1265,7 +1265,7 @@ void
 {k_check}
     AITER_CHECK(!bias.has_value(),
         "bias is not supported on a16w16_mono_tile kid; use a16w16 "
-        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
+        "split-barrier or a16w16_flatmm_splitk");
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a = XQ.data_ptr();
@@ -1391,7 +1391,7 @@ void
 
     AITER_CHECK(!bias.has_value(),
         "bias is not yet supported on a16w16_flatmm kid; use a16w16 "
-        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
+        "split-barrier or a16w16_flatmm_splitk");
 
     using Traits = {k.name}_Traits<D_C>;
 {k_check}

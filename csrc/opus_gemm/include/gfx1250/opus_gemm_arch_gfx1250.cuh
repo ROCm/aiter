@@ -116,6 +116,9 @@ opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx1250<bf16_t>(int id)
         Entry,
         GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX1250_BF16_SIZE>
         kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX1250_BF16}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx1250 with bf16 Y");
     const auto* entry = opus_gfx1250_detail::find_kid(kKids, id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id, " for OPUS "
@@ -133,6 +136,9 @@ opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx1250<fp32_t>(int id)
         Entry,
         GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX1250_FP32_SIZE>
         kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX1250_FP32}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx1250 with fp32 Y");
     const auto* entry = opus_gfx1250_detail::find_kid(kKids, id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id, " for OPUS "

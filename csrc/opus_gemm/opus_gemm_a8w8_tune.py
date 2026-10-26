@@ -31,9 +31,9 @@ def candidate_kids_for_shape(gfx, m, n, k, scale_ab, outdtype="fp32", *, cu_num)
         return []
     family = "a8w8_blockscale" if scale_ab else "a8w8"
     candidates = []
-    output_dtype = canonical_output_dtype(outdtype)
-    for kid, instance in get_registry(family, gfx, cu_num).items():
-        if output_dtype is not None and output_dtype not in instance.output_dtypes:
+    for kid in sorted(get_registry(family, gfx, cu_num)):
+        instance = get_kernel_instance(gfx, family, kid, outdtype, cu_num=cu_num)
+        if instance is None:
             continue
         # These pipelines prime two K tiles and advance in pairs.
         loops = (k + instance.B_K - 1) // instance.B_K
@@ -188,11 +188,11 @@ class OpusA8W8Tuner(GemmCommonTuner):
         for column, default in defaults.items():
             if column not in df:
                 df[column] = default
-        for column in ("M", "N", "K", "cu_num", "splitK"):
+        for column in ("M", "N", "K", "cu_num", "kernelId", "splitK"):
             if column not in df:
                 continue
             values = pd.to_numeric(df[column], errors="raise")
-            minimum = 0 if column == "splitK" else 1
+            minimum = 0 if column in ("kernelId", "splitK") else 1
             if (values.isna() | (values < minimum) | (values % 1 != 0)).any():
                 raise ValueError(f"{column} must contain integers >= {minimum}")
             df[column] = values.astype("int64")

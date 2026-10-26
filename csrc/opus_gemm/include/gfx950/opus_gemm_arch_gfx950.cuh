@@ -109,6 +109,8 @@ inline OpusA8W8Kernel opus_a8w8_kid_dispatch_gfx950(int id)
     static constexpr std::array<
         Entry, GENERATE_A8W8_NOSCALE_KID_DISPATCH_GFX950_SIZE>
         kKids = {{GENERATE_A8W8_NOSCALE_KID_DISPATCH_GFX950}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS a8w8 on gfx950");
     const auto* entry = opus_gfx950_detail::find_kid(kKids, id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id, " for OPUS a8w8 on gfx950");
@@ -123,6 +125,8 @@ opus_a8w8_blockscale_kid_dispatch_gfx950(int id)
     static constexpr std::array<
         Entry, GENERATE_A8W8_BLOCKSCALE_KID_DISPATCH_GFX950_SIZE>
         kKids = {{GENERATE_A8W8_BLOCKSCALE_KID_DISPATCH_GFX950}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS a8w8_blockscale on gfx950");
     const auto* entry = opus_gfx950_detail::find_kid(kKids, id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id,
@@ -144,6 +148,9 @@ opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx950<bf16_t>(int id)
         Entry,
         GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_BF16_SIZE>
         kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_BF16}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx950 with bf16 Y");
     const auto* entry = opus_gfx950_detail::find_kid(kKids, id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id, " for OPUS "
@@ -161,6 +168,9 @@ opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx950<fp32_t>(int id)
         Entry,
         GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_FP32_SIZE>
         kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX950_FP32}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx950 with fp32 Y");
     const auto* entry = opus_gfx950_detail::find_kid(kKids, id);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", id, " for OPUS "

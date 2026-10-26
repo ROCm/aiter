@@ -28,8 +28,21 @@ from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
+    a8w8_kernels_list,
+    a8w8_scale_kernels_list,
+    a16w16_flatmm_kernels_list,
+    a16w16_flatmm_splitk_kernels_list,
+    a16w16_kernels_list,
+    a16w16_mono_tile_kernels_list,
     default_compiled_keys,
     get_registry,
+    gfx942_a8w8_kernels_list,
+    gfx942_nosplit_kernels_list,
+    gfx942_splitk_kernels_list,
+    gfx1250_4wave_co_kernels_list,
+    gfx1250_clusterlaunch_kernels_list,
+    gfx1250_kernels_list,
+    gfx1250_splitk_fuse_kernels_list,
 )
 
 
@@ -40,7 +53,10 @@ def _build_targets_standalone(explicit_targets=()):
             gfx, cu = value.split("/")
             targets.append((gfx.split(":", 1)[0].strip().lower(), int(cu)))
         return sorted(set(targets))
-    utils = str(Path(__file__).resolve().parents[2] / "aiter/jit/utils")
+    root = Path(__file__).resolve().parents[2]
+    if root.name == "aiter_meta":
+        root = root.parent
+    utils = str(root / "aiter/jit/utils")
     if utils not in sys.path:
         sys.path.insert(0, utils)
     from chip_info import get_build_targets
@@ -653,8 +669,7 @@ class opus_gemm_codegen:
             f.write(f"#define {macro_name}{macro_suffix} \\\n")
             for index, (kid, name) in enumerate(rows):
                 line = entry.format(
-                    kid=f"{{ {kid.cu_num}, {kid.kid} }}",
-                    kernel_name=name,
+                    kid=f"{{ {kid.cu_num}, {kid.kid} }}", kernel_name=name
                 )
                 if index == len(rows) - 1:
                     line = line.rstrip().rstrip("\\").rstrip() + "\n"
@@ -662,14 +677,21 @@ class opus_gemm_codegen:
             f.write("\n")
 
         def _emit_non_workspace_map(f, arch, ctype):
-            rows = sorted(
-                (kid, k.name)
-                for kid, k in kernels_dict.items()
-                if kid.family == "a16w16"
-                and kid.gfx == arch
-                and k.kernel_tag not in SPLITK_TAGS
-                and ctype in k.output_dtypes
-            )
+            rows = []
+            for kid, k in kernels_dict.items():
+                if not (
+                    isinstance(kid, KernelKey)
+                    and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
+                ):
+                    continue
+                if kid.gfx != arch or k.kernel_tag in SPLITK_TAGS:
+                    continue
+                if ctype not in k.output_dtypes:
+                    continue
+                if kid.gfx != arch:
+                    continue
+                rows.append((kid, k.name))
+            rows.sort(key=lambda r: r[0])
             dtype_suffix = "BF16" if ctype == "bf16_t" else "FP32"
             macro_name = (
                 "GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_"
@@ -681,10 +703,11 @@ class opus_gemm_codegen:
             rows = []
             for kid, k in kernels_dict.items():
                 if not (
-                    kid.family == "a16w16"
-                    and kid.gfx == arch
-                    and k.kernel_tag in SPLITK_TAGS
+                    isinstance(kid, KernelKey)
+                    and k.kernel_tag in A16W16_KID_DISPATCH_TAGS
                 ):
+                    continue
+                if kid.gfx != arch or k.kernel_tag not in SPLITK_TAGS:
                     continue
                 if "fp32_t" not in k.output_dtypes:
                     raise ValueError(
@@ -720,12 +743,16 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<{ctype}> }},  \\
 """
 
-        def _rows(arch, family, ctype):
-            return sorted(
-                (kid, k.name)
-                for kid, k in kernels_dict.items()
-                if kid.family == family and kid.gfx == arch and ctype in k.output_dtypes
-            )
+        def _rows(arch, tags, ctype):
+            rows = []
+            for kid, k in kernels_dict.items():
+                if not isinstance(kid, KernelKey) or k.kernel_tag not in tags:
+                    continue
+                if kid.gfx != arch or ctype not in k.output_dtypes:
+                    continue
+                rows.append((kid, k.name))
+            rows.sort(key=lambda row: row[0])
+            return rows
 
         def _emit_map(f, macro_name, rows, ctype):
             f.write(f"#define {macro_name}_SIZE {len(rows)}\n")
@@ -735,9 +762,7 @@ class opus_gemm_codegen:
             f.write(f"#define {macro_name} \\\n")
             for index, (kid, name) in enumerate(rows):
                 line = entry.format(
-                    kid=f"{{ {kid.cu_num}, {kid.kid} }}",
-                    kernel_name=name,
-                    ctype=ctype,
+                    kid=f"{{ {kid.cu_num}, {kid.kid} }}", kernel_name=name, ctype=ctype
                 )
                 if index == len(rows) - 1:
                     line = line.rstrip().rstrip("\\").rstrip() + "\n"
@@ -751,13 +776,13 @@ class opus_gemm_codegen:
             _emit_map(
                 f,
                 "GENERATE_A8W8_NOSCALE_KID_DISPATCH_GFX950",
-                _rows("gfx950", "a8w8", "fp32_t"),
+                _rows("gfx950", {"a8w8"}, "fp32_t"),
                 "fp32_t",
             )
             _emit_map(
                 f,
                 "GENERATE_A8W8_BLOCKSCALE_KID_DISPATCH_GFX950",
-                _rows("gfx950", "a8w8_blockscale", "fp32_t"),
+                _rows("gfx950", {"a8w8_scale"}, "fp32_t"),
                 "fp32_t",
             )
             for arch in SPLITK_REDUCE_ARCHES:
@@ -772,7 +797,7 @@ class opus_gemm_codegen:
                     _emit_map(
                         f,
                         macro_name,
-                        _rows(arch, "a8w8_blockscale_bpreshuffle", ctype),
+                        _rows(arch, A8W8_BPRESHUFFLE_TAGS, ctype),
                         ctype,
                     )
 
@@ -1228,14 +1253,31 @@ if __name__ == "__main__":
         "--tune_files",
         default=None,
         required=False,
-        help="Colon-separated tuning CSV paths or glob patterns.",
+        help=(
+            "Colon-separated list of glob patterns pointing at tuned BF16 "
+            "GEMM CSVs (e.g. aiter/configs/bf16_tuned_gemm.csv and "
+            "aiter/configs/model_configs/*_bf16_tuned_gemm.csv). Each "
+            "file is filtered by `libtype == 'opus'`; surviving rows "
+            "contribute their `solidx`/`kernelId` only to the subset-compile "
+            "set S. Runtime callers provide the final kid explicitly. "
+            "Without this flag the module is generated from the sidecar, "
+            "per-arch default compile floor, and mandatory family kids."
+        ),
     )
 
     parser.add_argument(
         "--compiled_kids_sidecar",
         default=None,
         required=False,
-        help="Compiled identity manifest, published by JIT after a successful build.",
+        help=(
+            "Path to the subset-compile sidecar (JSON list of family/gfx/CU/local-kid strings). "
+            "Defaults to {working_path}/compiled_kids.json. The sidecar "
+            "captures the union of CSV opus rows + previous sidecar "
+            "contents + extra kids + DEFAULT_COMPILED_KIDS and mandatory "
+            "family kids. JIT supplies a "
+            "staged copy and publishes it after successful compilation. "
+            "Tuners pass new candidates with --extra_kernel_keys."
+        ),
     )
 
     parser.add_argument(
@@ -1251,13 +1293,9 @@ if __name__ == "__main__":
         default=[],
         help="Explicit gfx/CU build targets, e.g. gfx950/128 gfx950/256.",
     )
-    parser.add_argument(
-        "--family",
-        default=None,
-        help="Restrict generated routes to one family.",
-    )
 
-    # Accept the existing single-file option.
+    # Legacy --tune_file alias kept for backward compat with any existing
+    # invocations / scripts. Treated as `--tune_files <path>`.
     parser.add_argument(
         "--tune_file",
         default=None,
@@ -1271,19 +1309,57 @@ if __name__ == "__main__":
     if args.tune_files is None and args.tune_file is not None:
         args.tune_files = args.tune_file
 
+    TAG_TO_LIST = {
+        "a8w8_scale": a8w8_scale_kernels_list,
+        "a8w8": a8w8_kernels_list,
+        "a16w16": a16w16_kernels_list,
+        "a16w16_flatmm": a16w16_flatmm_kernels_list,
+        "a16w16_flatmm_splitk": a16w16_flatmm_splitk_kernels_list,
+        "a16w16_mono_tile": a16w16_mono_tile_kernels_list,
+        "gfx942_nosplit": gfx942_nosplit_kernels_list,
+        "gfx942_splitk": gfx942_splitk_kernels_list,
+        "gfx942_a8w8": gfx942_a8w8_kernels_list,
+        "a16w16_cluster_tdm_splitk_ws": gfx1250_kernels_list,
+        "a16w16_clusterlaunch_tdm_splitk_ws": gfx1250_clusterlaunch_kernels_list,
+        "a16w16_clusterlaunch_tdm_splitk_fuse": gfx1250_splitk_fuse_kernels_list,
+        "a16w16_4wave_co": {
+            kid: instance
+            for kid, instance in gfx1250_4wave_co_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave_co"
+        },
+        "a16w16_4wave_wl_co": {
+            kid: instance
+            for kid, instance in gfx1250_4wave_co_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave_wl_co"
+        },
+        "a16w16_4wave_wlr_co": {
+            kid: instance
+            for kid, instance in gfx1250_4wave_co_kernels_list.items()
+            if instance.kernel_tag == "a16w16_4wave_wlr_co"
+        },
+    }
+
     def _expand_tune_paths(spec):
-        paths = set()
-        for pattern in str(spec or "").split(os.pathsep):
-            if not pattern:
+        out = []
+        seen = set()
+        if not spec:
+            return out
+        for pat in str(spec).split(os.pathsep):
+            pat = pat.strip()
+            if not pat:
                 continue
-            paths.update(glob.glob(pattern))
-        return sorted(paths)
+            for path in sorted(glob.glob(pat)):
+                if path in seen:
+                    continue
+                seen.add(path)
+                out.append(path)
+        return out
 
     available = {
         KernelKey(family, gfx, cu, kid): instance
         for gfx, cu in targets
         for family, arches in KERNEL_REGISTRY.items()
-        if gfx in arches and (args.family is None or family == args.family)
+        if gfx in arches
         for kid, instance in get_registry(family, gfx, cu).items()
     }
     csv_keys = set()
@@ -1307,13 +1383,11 @@ if __name__ == "__main__":
                         scale_ab = str(row["scaleAB"]).strip().lower() in ("true", "1")
                         family = "a8w8_blockscale" if scale_ab else "a8w8"
                     else:
-                        family = args.family or "a8w8_blockscale_bpreshuffle"
+                        family = "a8w8_blockscale_bpreshuffle"
                 key = KernelKey(family, str(row["gfx"]), int(row["cu_num"]), int(value))
             except (ValueError, KeyError, TypeError, OverflowError):
                 continue
-            if (key.gfx, key.cu_num) not in targets or (
-                args.family is not None and key.family != args.family
-            ):
+            if (key.gfx, key.cu_num) not in targets:
                 continue
             instance = available.get(key)
             name = str(row.get("kernelName", ""))
@@ -1344,11 +1418,14 @@ if __name__ == "__main__":
     if args.tune:
         selected = set(available)
     if args.kernel_tag:
-        selected = (
-            {key for key in selected if available[key].kernel_tag == args.kernel_tag}
-            | defaults
-            | mandatory
-        )
+        tag_list = TAG_TO_LIST.get(args.kernel_tag, {})
+        tag_keys = {
+            key
+            for key, instance in available.items()
+            if key.kid in tag_list and instance.name == tag_list[key.kid].name
+        }
+        if tag_keys:
+            selected = (selected & tag_keys) | defaults | mandatory
     missing = requested_keys - selected
     if missing:
         parser.error(
@@ -1358,7 +1435,9 @@ if __name__ == "__main__":
     Path(args.working_path).mkdir(parents=True, exist_ok=True)
     write_if_changed(
         os.path.join(args.working_path, "opus_build_archs.h"),
-        "// SPDX-License-Identifier: MIT\n#pragma once\n"
+        "// SPDX-License-Identifier: MIT\n"
+        "// Auto-generated. See gen_instances.py.\n"
+        "#pragma once\n"
         + "".join(
             f"#define OPUS_BUILD_HAS_{gfx.upper()} 1\n" for gfx in sorted(target_arches)
         ),

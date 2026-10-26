@@ -4,7 +4,7 @@
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
 
 _A16W16_CO_TAGS = frozenset(
@@ -782,7 +782,7 @@ def _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg_per_cu, prefetch_scale=
         16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
         16, 16, 4,      # VEC_A, VEC_B, VEC_C
         # GROUP_M=1 (per-token); GROUP_N=GROUP_K=quant_block, DSv4's 128 or MX's
-        # 1. The traits this family derives from carry the 32 path, so the only
+        # 32. The traits this family derives from carry the 32 path, so the only
         # thing that made these 128-only was the literal.
         1, quant_block, quant_block,
         ("a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen" if tilen
@@ -1905,7 +1905,7 @@ def _a16w16_persistent(bm, bn, bk, has_oob=True,
     return inst
 
 
-# 0-tile sweep, all B_K=64.
+# 4-tile sweep, all B_K=64.
 _PERSISTENT_TILES = [
     # (B_M, B_N, B_K)
     (256, 256, 64),  # tile 0: mouter default; 32Kx2Kx7K best 1208 TFLOPS
@@ -1914,13 +1914,13 @@ _PERSISTENT_TILES = [
     (128, 128, 64),  # tile 3: small
 ]
 
-# Legacy (30..33): cachectl == (0, 17).
+# Legacy (300..303): cachectl == (0, 17).
 a16w16_persistent_kernels_list = {
     30 + i: _a16w16_persistent(bm, bn, bk)
     for i, (bm, bn, bk) in enumerate(_PERSISTENT_TILES)
 }
 
-# Cpol variants (34..45): 3 groups x 4 tiles, mirroring _CACHECTL_CONFIGS but with a single
+# Cpol variants (304..315): 3 groups x 4 tiles, mirroring _CACHECTL_CONFIGS but with a single
 # compact base offset per cpol group.
 _PERSISTENT_CPOL_GROUPS = [
     # (base_kid, cachectl_a, cachectl_b)
@@ -1935,7 +1935,7 @@ for _base, _ca, _cb in _PERSISTENT_CPOL_GROUPS:
             bm, bn, bk, cachectl_a=_ca, cachectl_b=_cb
         )
 
-# Nooob mirrors at +46 for both legacy and cpol variants.
+# Nooob mirrors at +1000 for both legacy (1300..1303) and cpol (1304..1315).
 # Explicit cachectl inheritance keeps name() consistent with parents.
 a16w16_persistent_kernels_list_nooob = {
     kid + 46: _a16w16_persistent(
@@ -2006,7 +2006,7 @@ a16w16_mono_tile_kernels_list = {
     for i, (bm, bn, bk) in enumerate(_MONO_TILE_TILES)
 }
 
-# -- 4g_safe variants ---------------------------------------
+# -- 4g_safe variants (offset +5000) ---------------------------------------
 #
 # Per-WG-tight buffer-resource sizing pipelines that handle tensors whose
 # full extent exceeds 4 GiB without buffer_inst num_records wrap. Same
@@ -2016,6 +2016,8 @@ a16w16_mono_tile_kernels_list = {
 #   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_persistent_4g_safe_gfx950.cuh
 #   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_mono_tile_4g_safe_gfx950.cuh
 #
+# Offset choice: +5000 is reserved for legacy 4g_safe variants; cpol variants
+# use explicit disjoint offsets rather than an unconditional +1000 mirror.
 # 4g_safe kids carry HAS_OOB
 # from their parent (M/N tail is absorbed by the per-WG BR num_records, so
 # the per-thread predicate is structurally a no-op for valid in-tile threads;
@@ -2427,7 +2429,7 @@ _GFX1250_CTDM_TILES = [
     #    _ctdm_pick_configs() still drops any tile whose per-TDM direct-copy
     #    request hits the 256-request limit (those deadlock the no-cluster TDM
     #    engine -- they remain available only via the multicast clusterlaunch
-    #    variant). New kids are 20088+ (idx*8), clear of the clusterlaunch band.
+    #    variant).
     (16, 64, 256, "tileN"),
     (16, 128, 256, "tileN"),
     (16, 256, 128, "tileN"),
@@ -2892,6 +2894,28 @@ KERNEL_REGISTRY = {
 # fmt: on
 
 
+# Generated names must identify one configuration. Multiple IDs may alias
+# the same configuration, but distinct traits must not share a name.
+_name_owner = {}
+_name_clashes = []
+for _cat in (
+    *a8w8_mxscale_bmm_kernel_lists,
+    gfx950_a16w16_kernels_list,
+    gfx942_kernels_list,
+    gfx1250_a16w16_kernels_list,
+):
+    for _kid, _inst in _cat.items():
+        _sig = repr(asdict(_inst))
+        _owner = _name_owner.setdefault(_inst.name, (_kid, _sig))
+        if _owner[1] != _sig:
+            _name_clashes.append((_owner[0], _kid, _inst.name))
+assert not _name_clashes, (
+    "these kid pairs differ in configuration yet share one instance name, so only "
+    f"one of each pair can be emitted: {_name_clashes}. Whatever distinguishes them "
+    "has to appear in OpusGemmInstance.name for their kernel_tag."
+)
+
+
 @dataclass(frozen=True, order=True)
 class KernelKey:
     family: str
@@ -3010,6 +3034,19 @@ BMM_MXSCALE_WORKSPACE_KIDS = frozenset(
     for kid, instance in a8w8_mxscale_bmm_kernels_list.items()
     if instance.kernel_tag in BMM_MXSCALE_WORKSPACE_TAGS and not instance.direct_only
 )
+
+_SUPPORTED_SPLITK_WORKSPACE_DTYPES = frozenset({"bf16_t", "fp32_t"})
+for _tables in KERNEL_REGISTRY["a16w16"].values():
+    for _workspace_kid, _workspace_instance in next(iter(_tables.values())).items():
+        _workspace_dtype = _workspace_instance.splitk_workspace_dtype
+        if (
+            _workspace_dtype is not None
+            and _workspace_dtype not in _SUPPORTED_SPLITK_WORKSPACE_DTYPES
+        ):
+            raise ValueError(
+                f"workspace kid {_workspace_kid} must explicitly declare "
+                f"splitk_workspace_dtype, got {_workspace_dtype!r}"
+            )
 
 # Exact-id kernels kept in every default build.  The high-level A16 caller-side
 # heuristics below the tuned lookup are constrained to these ids; the unified
@@ -3215,36 +3252,73 @@ def canonical_output_dtype(output_dtype) -> str | None:
     return aliases.get(value, value)
 
 
-def get_kernel_instance(arch, family, kid, output_dtype=None, *, cu_num):
-    """Resolve a local id; runtime callers supply the actual device CU count."""
+def get_kernel_instance(
+    arch: str,
+    family: str,
+    kid: int,
+    output_dtype=None,
+    *,
+    cu_num: int,
+) -> OpusGemmInstance | None:
+    """Return a kernel registered for ``(arch, interface, kid, Y.dtype)``."""
     arch = str(arch).lower().split(":", 1)[0]
     family = str(family).lower()
-    if type(kid) is not int or kid < 0:
+    family_tags = OPUS_KERNEL_TAGS_BY_ARCH_FAMILY.get(arch, {}).get(family)
+    if family_tags is None:
         return None
+
+    try:
+        kid = int(kid)
+    except (TypeError, ValueError):
+        return None
+
     instance = get_registry(family, arch, cu_num).get(kid)
-    if instance is None:
+    if instance is None or instance.kernel_tag not in family_tags:
         return None
+    instance_arch = (instance.arch_prefix or "gfx950").lower()
+    if instance_arch != arch:
+        return None
+
     dtype = canonical_output_dtype(output_dtype)
     if dtype is not None:
+        # Workspace reducers own the final cast, so their host dispatch
+        # specialization in ``output_dtypes`` is not the Y dtype contract.
         if family == "a16w16" and instance.splitk_workspace_dtype is not None:
+            # The current gfx942 BF16-workspace reducer is exact-N and writes
+            # BF16 only.  Other A16 workspace reducers support BF16/FP32 Y.
             allowed = (
                 {"bf16_t"}
                 if arch == "gfx942" and instance.splitk_workspace_dtype == "bf16_t"
                 else {"bf16_t", "fp32_t"}
             )
+            output_compatible = dtype in allowed
         elif family == "a8w8_mxscale_bmm":
-            allowed = {"bf16_t", "fp32_t"}
+            output_compatible = dtype in {"bf16_t", "fp32_t"}
         else:
-            allowed = instance.output_dtypes
-        if dtype not in allowed:
+            output_compatible = dtype in instance.output_dtypes
+        if not output_compatible:
             return None
     return instance
 
 
-def kernel_needs_external_workspace(arch, family, kid, *, cu_num):
+def kernel_needs_external_workspace(
+    arch: str, family: str, kid: int, *, cu_num: int
+) -> bool:
+    """Return whether a registered kernel requires caller-owned workspace.
+
+    Unknown logical keys are errors rather than ``False``: treating an unknown
+    kid as a non-workspace kernel would let a caller launch it without the
+    allocation required for memory safety.  Capability comes from the existing
+    selected kernel instance, never from a numeric kid range or tag substring.
+    The registry includes all enabled two-stage reducers. If the experimental
+    gfx1250 fused family is re-enabled, its first SplitK-1 WGs also publish
+    external partial tiles and therefore enter this same capability set.
+    """
     instance = get_kernel_instance(arch, family, kid, cu_num=cu_num)
     if instance is None:
-        raise KeyError(f"unknown OPUS kernel {(family, arch, cu_num, kid)}")
+        raise KeyError(
+            f"unknown OPUS kernel (arch={arch!r}, family={family!r}, kid={kid!r})"
+        )
     return instance.splitk_workspace_dtype is not None and not instance.direct_only
 
 

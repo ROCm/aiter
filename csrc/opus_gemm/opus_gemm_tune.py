@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Debug OPUS A16W16 tuning and shared candidate helpers."""
+"""Debug-only single-shape OPUS A16W16 tuner.
 
+Production tuning uses ``gradlib/gemm_tuner.py``. This module keeps the
+single-kid runner and candidate helpers imported by Gradlib; output defaults
+to ``/tmp``.
+"""
+
+import json
 import logging
 import os
 import sys
@@ -56,6 +62,7 @@ from opus_gemm_common import (
     GFX1250_PLAIN_KID_OF,
     GFX1250_SPLITK_FUSE_ENABLED,
     GFX1250_SPLITK_FUSE_KID_OF,
+    GFX1250_SPLITK_FUSE_KIDS,
     _opus_sidecar_path,
     a16w16_flatmm_prefetch_k_iter,
     get_registry,
@@ -70,28 +77,6 @@ kernels_list = get_registry("a16w16", _tune_arch, _tune_cu)
 SPLITK_KIDS = group_kids("SPLITK_KIDS", _tune_arch, cu_num=_tune_cu)
 NON_SPLITK_KIDS = group_kids("NON_SPLITK_KIDS", _tune_arch, cu_num=_tune_cu)
 BIAS_AWARE_KIDS = group_kids("BIAS_AWARE_KIDS", _tune_arch, cu_num=_tune_cu)
-GFX1250_SPLITK_FUSE_KIDS = group_kids(
-    "GFX1250_SPLITK_FUSE_KIDS", _tune_arch, cu_num=_tune_cu
-)
-
-if _tune_arch == "gfx1250":
-    GFX1250_PLAIN_KID_OF = {
-        (instance.B_M, instance.B_N, instance.B_K): kid
-        for kid, instance in kernels_list.items()
-        if instance.kernel_tag == "a16w16_cluster_tdm_splitk_ws"
-    }
-    GFX1250_CLUSTERLAUNCH_KID_OF = {
-        (
-            instance.B_M,
-            instance.B_N,
-            instance.B_K,
-            instance.cluster_wg_m,
-            instance.cluster_wg_n,
-        ): kid
-        for kid, instance in kernels_list.items()
-        if instance.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_ws"
-    }
-
 from aiter.ops.opus import opus_bmm as _opus_bmm
 from aiter.utility.base_tuner import INVALID_TIME, GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
@@ -338,11 +323,7 @@ def _gfx1250_cluster_dims_for_grid(gx, gy, available, top_clusters, cu_num=0):
 # tile -> cluster dims -> all exact kids. Multiple wave-layout variants for one
 # geometry remain together because only measurement can rank them.
 _GFX1250_CO_BY_TILE: dict[tuple[int, int, int], dict[tuple[int, int], list[int]]] = {}
-from opus_gemm_common import gfx1250_4wave_co_kernels_list
-
-for _co_kid, _co_instance in (
-    kernels_list if _tune_arch == "gfx1250" else gfx1250_4wave_co_kernels_list
-).items():
+for _co_kid, _co_instance in kernels_list.items():
     if _co_instance.kernel_tag not in _A16W16_CO_TAGS:
         continue
     _GFX1250_CO_BY_TILE.setdefault(
@@ -605,7 +586,7 @@ def kid_rejects_shape(k_inst, M, N, K):
         "a16w16_kbuf2v_bk128",
     ):
         # Non-splitK a16w16 family all share the same K-dbuf parity +
-        # MFMA layout constraints as a16w16 (10000).
+        # MFMA layout constraints as a16w16.
         if loops < 2 or (loops % 2 != 0):
             return True
         if N % 16 != 0:
@@ -768,16 +749,20 @@ def kid_rejects_bias(k_inst, bias):
     """Reject candidates that cannot consume a non-empty bias.
 
     Bias support (mirrors opus_kid_supports_bias in opus_gemm.cu):
-      * gfx950 a16w16 split-barrier (kernel_tag=="a16w16", kid 4..9 + mirrors)
-      * gfx950 a16w16_flatmm_splitk (kid 200..299 + nooob mirror)
+      * gfx950 a16w16 split-barrier (kernel_tag=="a16w16")
+      * gfx950 a16w16_flatmm_splitk
     Rejected:
       * persistent / flatmm-non-splitk (HAS_BIAS=false hardcoded in pipelines)
-      * gfx942 SB kid 10000 (HAS_BIAS path removed 2026-06-02; was dead code)
-      * gfx942 splitk family (kid 10200+): silently ignored bias
+      * gfx942 SB (HAS_BIAS path removed 2026-06-02; was dead code)
+      * gfx942 splitk family: silently ignored bias
       * gfx942 P1 non-splitK variants: no bias path
     """
     if not bias:
         return False
+    # gfx1250 two-stage families fold the public fp32/bf16, [N]/[batch,N]
+    # contract in the shared reducer. #4246 fused round-1 accepts only bf16
+    # [N], which the boolean tuned key cannot represent, so exclude it from
+    # bias-bearing tuning rather than producing a row that is unsafe to replay.
     if k_inst.kernel_tag in (
         "a16w16_cluster_tdm_splitk_ws",
         "a16w16_clusterlaunch_tdm_splitk_ws",
@@ -785,6 +770,8 @@ def kid_rejects_bias(k_inst, bias):
         "a16w16_clusterlaunch_tdm_splitk_fuse",
     ):
         return False
+    if k_inst.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
+        return True
     if k_inst.kernel_tag not in ("a16w16", "a16w16_flatmm_splitk"):
         return True
     # arch_prefix distinguishes gfx942 (no bias) from gfx950 (has bias)
@@ -793,18 +780,57 @@ def kid_rejects_bias(k_inst, bias):
 
 
 def candidate_kids_for_shape(M, N, K, bias, cu_num):
-    """Select local candidates from the tuner device registry for one shape."""
+    """Decide which kids should be tuned for shape (M, N, K, bias).
+
+    Rules (all evaluated on a single instance B_M=B_N=128 occupancy proxy):
+
+    1) Structural fallback: if K is not friendly to non-splitk launchers
+       (need ``K % 64 == 0`` and ``(K // 64) % 2 == 0`` -- the
+       split-barrier prefetch double-buffer + persistent ceil-K
+       constraint), then non-splitk kids would all reject this shape at
+       runtime. Return SPLITK_KIDS to guarantee a viable candidate.
+
+    2) Otherwise compare ``ceil(M/128) * ceil(N/128)`` against ``2 *
+       cu_num``. If smaller, the problem can't fill the device twice
+       even with the smallest non-splitk tile; only splitk (which slices
+       K to widen the work-distribution dimension) is meaningful.
+
+    3) Otherwise both splitk and non-splitk kids are viable; tune both.
+
+    4) Bias post-filter: if bias is True, drop kids that are not in
+       BIAS_AWARE_KIDS. If that leaves the candidate set empty (corner
+       case: SPLITK_KIDS minus bias-aware ? SPLITK_KIDS is fully
+       bias-aware, so this should not fire in practice), fall back to
+       SPLITK_KIDS again.
+
+    Parameters
+    ----------
+    M, N, K : int
+    bias : bool
+    cu_num : int
+        Number of compute units on the device (e.g. 256 for MI350).
+
+    Returns
+    -------
+    frozenset[int]
+        Subset of ``kernels_list.keys()``; never empty.
+    """
     M = int(M)
     N = int(N)
     K = int(K)
     bias = bool(bias)
     cu_num = int(cu_num)
 
-    # Use gfx1250 tile/cluster candidates, omitting fused kernels when bias is present.
+    # gfx1250: dedicated candidate filter (top-N tiles by grid-occupancy fit x
+    # {plain + top-N round-up-capable cluster dims}). Bias-bearing tuning retains
+    # the two-stage kids but omits fused round-1 kids because their bf16 [N]-only
+    # bias contract cannot be encoded by the tuned CSV's boolean bias key.
     if _tune_arch == "gfx1250":
         return _gfx1250_select_candidates(M, N, K, cu_num, include_fused=not bias)
 
-    # Use non-split-K candidates only when K satisfies the pipeline alignment.
+    # Step 1: structural tile-align fallback for non-splitk pipelines.
+    # K % 64 == 0 and (K // 64) % 2 == 0 required for non-splitk pipeline's
+    # prefetch double-buffer + persistent ceil-K constraint.
     non_splitk_tile_align_ok = (K % 64 == 0) and ((K // 64) % 2 == 0)
     if not non_splitk_tile_align_ok:
         cands = SPLITK_KIDS
@@ -821,85 +847,264 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
         else:
             cands = narrowed
 
+    # Step 6: drop known-bad kids permanently.
+    cands = cands - _OPUS_PERMA_BAD_KIDS
     return cands
 
 
-def _ensure_kids_compiled(candidate_kids):
-    """Compile required local kernels before spawning tuning workers."""
+# Kids we never want tuner to probe.
+_OPUS_PERMA_BAD_KIDS = frozenset()
 
+
+def _ensure_kids_compiled(candidate_kids):
+    """Make sure every kid in ``candidate_kids`` is compiled into the
+    current module_deepgemm_opus.so.
+
+    Reads the subset-compile sidecar at ``_opus_sidecar_path()`` (lives in
+    ``$JIT_BUILD/`` so it survives clear_build). If any kid in
+    ``candidate_kids`` (or in ``DEFAULT_COMPILED_KIDS``) is missing, or its
+    receipt does not match the installed .so, this function:
+
+    1. Passes the new candidates as ``--extra_kernel_keys`` to codegen. The last
+       successful sidecar remains intact until the new binary is installed.
+    2. Clears the aiter.jit.core in-process module caches and requests a
+       synchronous rebuild, which removes the old .so and re-reads the
+       successful sidecar as a seed for codegen.
+    3. **Synchronously triggers the rebuild here** by calling
+       build_module() directly so subsequent ``mp_tuner`` spawn-ed
+       children inherit a .so on disk that already contains every
+       required kid. Without this synchronous step, children would race
+       against the parent's lazy build and the first to dlopen() would
+       get the stale subset .so and fail with
+       ``AITER_CHECK: unknown kid X for OPUS a16w16 in the launch table``.
+
+    Concurrency model
+    -----------------
+    Two race vectors are explicitly defended against:
+
+    A. **Concurrent GemmTuner / parent processes** (multi-GPU multi-script):
+       request + build + successful metadata publication is wrapped in a
+       ``FileBaton``
+       (`$JIT_BUILD/lock_ensure_kids_opus`). One parent runs the full
+       expand+build; the rest spin on the baton, then recheck the sidecar receipt
+       (it may already contain what they need, in which case they skip).
+
+    B. **mp_tuner spawn-ed children inheriting `AITER_REBUILD=1`**:
+       if the user launched the tuner with `AITER_REBUILD=1` in env
+       (the usual workflow after editing source), every spawn child
+       re-reads the env at import time and would `clear_build()` +
+       rebuild on its first `compile_ops("module_deepgemm_opus")` call.
+       The first child wins the FileBaton, deletes the .so we just
+       baked, and the rest then race against an in-flight build,
+       producing intermittent `FileNotFoundError` / partial ELF errors.
+       To shut this off we **also clear `os.environ["AITER_REBUILD"]`**
+       once our synchronous build succeeds or a current binary is reused,
+       so every spawn child
+       inherits a clean env (read: `AITER_REBUILD=0`) and goes straight
+       to `dlopen()` of the ready .so. On build failure the original env is
+       restored; on success only the parent's in-process flag is restored.
+       The parent itself does not need the rebuild flag past this
+       point because we already added ``module_deepgemm_opus`` to
+       ``rebuilded_list``.
+
+    Returns
+    -------
+    bool
+        True if a rebuild was triggered, False if every
+        required kid was already compiled.
+    """
     from opus_gemm_common import KERNEL_REGISTRY, KernelKey, default_compiled_keys
 
-    from aiter.jit import core
+    from aiter.jit import core as _jit_core
     from aiter.jit.utils.chip_info import get_build_targets
+    from aiter.jit.utils.file_baton import FileBaton
     from aiter.jit.utils.jit_cache import compiled_kids_are_current
 
-    if not candidate_kids:
-        return False
+    candidate_kids = frozenset(int(k) for k in candidate_kids)
     gfx, cu = _device_arch_and_cu(torch.cuda.current_device())
-    requests = {KernelKey("a16w16", gfx, cu, int(kid)) for kid in candidate_kids}
-    required = {key.encode() for key in default_compiled_keys(gfx, cu) | requests}
-    md_name = "module_deepgemm_opus"
+    requests = {KernelKey("a16w16", gfx, cu, kid) for kid in candidate_kids}
+    required = {key.encode() for key in requests | default_compiled_keys(gfx, cu)}
+
+    def _read_sidecar(path):
+        if not os.path.exists(path):
+            return set()
+        try:
+            with open(path) as f:
+                return set(json.load(f))
+        except (OSError, ValueError, TypeError):
+            return set()
+
     sidecar = _opus_sidecar_path()
-    artifact = os.path.join(core.get_user_jit_dir(), md_name + core.JIT_LIB_EXT)
-    rebuild = core.AITER_REBUILD or int(os.getenv("AITER_REBUILD", "0"))
-    force_rebuild = rebuild and md_name not in core.rebuilded_list
-    if not force_rebuild and compiled_kids_are_current(sidecar, artifact, required):
+    artifact = os.path.join(_jit_core.get_user_jit_dir(), "module_deepgemm_opus.so")
+    rebuild_requested = _jit_core.AITER_REBUILD or int(os.getenv("AITER_REBUILD", "0"))
+    force_rebuild = (
+        rebuild_requested and "module_deepgemm_opus" not in _jit_core.rebuilded_list
+    )
+
+    def _reuse_current_binary():
+        # A receipt proves kid membership, not that a user-requested source
+        # rebuild has run. Honor that request once in this parent before spawn.
+        if force_rebuild or not compiled_kids_are_current(sidecar, artifact, required):
+            return False
         os.environ["AITER_REBUILD"] = "0"
+        return True
+
+    # A bare sidecar may come from an old version or a failed build. Require
+    # successful metadata for the currently installed artifact, not membership alone.
+    if _reuse_current_binary():
         return False
 
-    build_args = core.get_args_of_build("module_deepgemm_opus")
-    build_args.pop("hip_clang_path", None)
-    build_args["md_name"] = md_name
-    target_arches = {gfx} | {arch for arch, _cu in get_build_targets()}
-    targets = sorted(
-        {
-            (arch, count)
-            for arches in KERNEL_REGISTRY.values()
-            for arch in target_arches
-            for count in arches.get(arch, {})
-        }
-    )
-    build_args["blob_gen_cmd"] += (
-        " --targets "
-        + " ".join(f"{arch}/{count}" for arch, count in targets)
-        + " --extra_kernel_keys "
-        + " ".join(sorted(key.encode() for key in requests))
-    )
-    build_args["flags_extra_hip"] = [
-        *build_args["flags_extra_hip"],
-        f"--offload-arch={gfx}",
-    ]
-    if "gfx1250" in target_arches:
-        build_args["flags_extra_hip"] += [
-            "-mllvm -amdgpu-expert-scheduling-mode",
-            "-mllvm -enable-post-misched=1",
-        ]
-        if core.parse(core.get_hip_version()) >= core.Version("7.0.0"):
-            build_args["flags_extra_hip"].append("-DAITER_ENABLE_CLUSTER_LAUNCH")
-    previous_rebuild = core.AITER_REBUILD
-    previous_env = os.environ.get("AITER_REBUILD")
-    succeeded = False
+    os.makedirs(_jit_core.bd_dir, exist_ok=True)
+    lock_path = f"{_jit_core.bd_dir}/lock_ensure_kids_opus"
+    baton = FileBaton(lock_path)
+
+    if not baton.try_acquire():
+        # A peer parent (multi-GPU / multi-process tune harness) is already extending the sidecar +
+        # rebuilding.
+        baton.wait()
+        if _reuse_current_binary():
+            return False
+        # Peer's expand didn't cover us (rare: peer's `required` set was
+        # disjoint from ours). Re-enter to extend further.
+        return _ensure_kids_compiled(candidate_kids)
+
     try:
-        core.AITER_REBUILD = 1
-        os.environ["AITER_REBUILD"] = str(core.AITER_REBUILD)
-        core.build_module(
-            **build_args,
-            build_after_wait=True,
+        compiled = _read_sidecar(sidecar)
+        missing = required - compiled
+        if _reuse_current_binary():
+            # Another writer beat us inside the critical section.
+            return False
+
+        sys.stderr.write(
+            f"[opus _ensure_kids_compiled] rebuilding with {len(missing)} new kids "
+            f"(existing={len(compiled)}, target={len(compiled | required)})\n"
         )
-        if not compiled_kids_are_current(sidecar, artifact, required):
-            raise RuntimeError("Opus build does not cover all tuning candidates")
-        if md_name not in core.rebuilded_list:
-            core.rebuilded_list.append(md_name)
-        succeeded = True
+
+        # Force a JIT rebuild scoped to JUST this build call.
+        _prev_rebuild = _jit_core.AITER_REBUILD
+        _prev_rebuild_env = os.environ.get("AITER_REBUILD")
+        _jit_core.AITER_REBUILD = 1
+        # Set env to "1" only for the synchronous build below; we reset
+        # to "0" once it succeeds so spawn-ed children don't redo it.
+        os.environ["AITER_REBUILD"] = "1"
+        _jit_core.get_module.cache_clear()
+        # __mds is name-mangled inside the module; access via private name.
+        _mds = getattr(_jit_core, "_core__mds", None) or getattr(
+            _jit_core, "__mds", None
+        )
+        if _mds is None:
+            _mds = _jit_core.__dict__.get("__mds")
+        if isinstance(_mds, dict):
+            _mds.clear()
+        # Reset rebuilded_list (used by compile_ops to track "we already rebuilt this once in this process").
+        _jit_core.rebuilded_list = ["module_aiter_enum"]
+        # build_module uses fixed target names and always enters incremental
+        # Ninja checks; no tuner-specific versioner reset is needed.
+
+        # Synchronously drive the rebuild in this (parent) process so that mp_tuner's spawn-ed children
+        # see a fully-baked .so on disk and...
+        _build_exc = None
+        _build_succeeded = False
+        try:
+            d_args = _jit_core.get_args_of_build("module_deepgemm_opus")
+            # Keep requests in this build invocation: clear_build cannot erase
+            # them, and a concurrent publisher cannot overwrite them. Codegen
+            # unions them with the current canonical seed under the build lock.
+            blob_gen_cmd = (
+                d_args["blob_gen_cmd"]
+                + " --extra_kernel_keys "
+                + " ".join(key.encode() for key in sorted(requests))
+            )
+            target_arches = {gfx} | {arch for arch, _cu in get_build_targets()}
+            targets = sorted(
+                (arch, count)
+                for arch in target_arches
+                for count in {
+                    cu
+                    for tables in KERNEL_REGISTRY.values()
+                    for cu in tables.get(arch, {})
+                }
+            )
+            blob_gen_cmd += " --targets " + " ".join(
+                f"{arch}/{count}" for arch, count in targets
+            )
+            flags_extra_hip = [*d_args["flags_extra_hip"], f"--offload-arch={gfx}"]
+            if "gfx1250" in target_arches:
+                flags_extra_hip += [
+                    "-mllvm -amdgpu-expert-scheduling-mode",
+                    "-mllvm -enable-post-misched=1",
+                ]
+                if _jit_core.parse(_jit_core.get_hip_version()) >= _jit_core.Version(
+                    "7.0.0"
+                ):
+                    flags_extra_hip.append("-DAITER_ENABLE_CLUSTER_LAUNCH")
+            _jit_core.build_module(
+                md_name="module_deepgemm_opus",
+                srcs=d_args["srcs"],
+                flags_extra_cc=d_args["flags_extra_cc"],
+                flags_extra_hip=flags_extra_hip,
+                blob_gen_cmd=blob_gen_cmd,
+                extra_include=d_args["extra_include"],
+                extra_ldflags=d_args["extra_ldflags"],
+                verbose=d_args.get("verbose", False),
+                is_python_module=d_args.get("is_python_module", True),
+                is_standalone=d_args.get("is_standalone", False),
+                torch_exclude=d_args.get("torch_exclude", False),
+                third_party=d_args.get("third_party", []),
+                hipify=d_args.get("hipify", False),
+                flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+                # A runtime builder may hold the module lock without our extra
+                # kids. Waiting for it is not evidence that our request ran.
+                build_after_wait=True,
+            )
+            if not compiled_kids_are_current(sidecar, artifact, required):
+                raise RuntimeError("Opus build does not cover all tuning candidates")
+            if "module_deepgemm_opus" not in _jit_core.rebuilded_list:
+                _jit_core.rebuilded_list.append("module_deepgemm_opus")
+            _build_succeeded = True
+        except Exception as exc:  # noqa: BLE001
+            _build_exc = exc
+            import traceback
+
+            sys.stderr.write(
+                f"[opus _ensure_kids_compiled] synchronous build_module FAILED:\n"
+                f"  {type(_build_exc).__name__}: {_build_exc}\n"
+            )
+            traceback.print_exc()
+            # Scrub the half-baked .so so workers don't dlopen a stale
+            # subset .so and silently mis-dispatch kids.
+            try:
+                _so = os.path.join(
+                    _jit_core.get_user_jit_dir(), "module_deepgemm_opus.so"
+                )
+                if os.path.exists(_so):
+                    os.remove(_so)
+            except Exception:  # noqa: BLE001,S110
+                pass
+        finally:
+            # Restore in-process flag for the parent (mp_tuner children
+            # spawn from os.environ, not from this in-process value).
+            _jit_core.AITER_REBUILD = _prev_rebuild
+            # Clear the child flag only after success. KeyboardInterrupt and
+            # SystemExit bypass the Exception handler but must restore it too.
+            if _build_succeeded:
+                os.environ["AITER_REBUILD"] = "0"
+            else:
+                if _prev_rebuild_env is None:
+                    os.environ.pop("AITER_REBUILD", None)
+                else:
+                    os.environ["AITER_REBUILD"] = _prev_rebuild_env
+
+        if _build_exc is not None:
+            raise RuntimeError(
+                "opus_gemm subset-compile rebuild failed; see hipcc / "
+                "codegen error in stderr above. The successful sidecar "
+                "has not been advanced; rerun to retry the requested kids."
+            ) from _build_exc
+
+        return True
     finally:
-        core.AITER_REBUILD = previous_rebuild
-        if succeeded:
-            os.environ["AITER_REBUILD"] = "0"
-        elif previous_env is None:
-            os.environ.pop("AITER_REBUILD", None)
-        else:
-            os.environ["AITER_REBUILD"] = previous_env
-    return True
+        baton.release()
 
 
 # Backwards-compat aliases for the old leading-underscore names.
@@ -920,9 +1125,28 @@ OPUS_DEBUG_TUNED_CSV = os.getenv(
 _AITER_VERBOSE = bool(int(os.environ.get("AITER_VERBOSE", "0")))
 
 
-# Reuse the current device's A16W16 registry as the tuner search space.
-a16w16_all_kernels = kernels_list
-a16w16_kernel_ids = sorted(a16w16_all_kernels)
+# Derive the tuner search space from the canonical registry.  Keeping a second
+# hand-maintained merge here previously omitted mono-tile and 4g-safe kids and
+# could retain stale metadata when a new family reused an existing numeric id.
+a16w16_all_kernels = {
+    kid: instance
+    for kid, instance in kernels_list.items()
+    if instance.kernel_tag.startswith("a16w16")
+}
+
+# Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a
+# non-empty implementation on the run...
+try:
+    _run_arch = _tune_arch
+    a16w16_kernel_ids = sorted(
+        kid
+        for kid, k in a16w16_all_kernels.items()
+        if (getattr(k, "arch_prefix", "") or "gfx950").lower() == _run_arch
+    )
+except Exception:  # noqa: BLE001
+    # rocminfo unavailable -> fall back to enumerating everything so the
+    # legacy multi-arch behaviour is preserved on build-only hosts.
+    a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
 
 
 # -- dtype handling ---------------------------------------------------------- CSV convention
@@ -1216,6 +1440,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         "profile_file": "",
     }
 
+    # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv exactly.
     OUT_COLUMNS: ClassVar[list[Any]] = [
         "gfx",
         "cu_num",
@@ -1236,6 +1461,18 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         "tflops",
         "bw",
     ]
+
+    def get_cu_num(self):
+        # base_tuner.get_cu_num() calls torch.cuda.get_device_properties(), which
+        # raises "Invalid device id" on this build's flaky device enumeration (see
+        # _patch_flaky_hip_device_count). Fall back to aiter's rocminfo-based CU
+        # probe when torch enumeration is broken. TEMPORARY.
+        try:
+            return super().get_cu_num()
+        except Exception:  # noqa: BLE001
+            from aiter.jit.utils.chip_info import get_cu_num as _cu
+
+            return _cu()
 
     def getKernelName(self, kernelId):
         k = a16w16_all_kernels.get(kernelId)
@@ -1349,7 +1586,10 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             action="store_true",
             default=False,
             dest="bias",
-            help="Bias default for single-shape tuning or CSVs without bias.",
+            help="Default 'bias' value when single-shape tuning (-m/-n/-k) "
+            "or when the untuned CSV lacks a 'bias' column. Tuner emits "
+            "bias=True / bias=False as a separate dedup key so the same "
+            "(M,N,K) can be tuned with and without bias independently.",
         )
 
         # Debug knob: restrict the kid sweep to a specific set.
@@ -1359,14 +1599,27 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             type=str,
             default=None,
             help="Comma-separated kid id(s) to restrict the sweep to "
-            "(e.g. --kid 6 or --kid 6,12). Kids must still pass "
+            "(e.g. --kid 5 or --kid 4,5). Kids must still pass "
             "the host-side shape / bias / outdtype filters; rejected kids "
             "are dropped with a log line. Compile sidecar is auto-expanded "
             "to cover the requested kids if needed.",
         )
 
     def pre_process(self, args):
-        """Load CLI/CSV shapes using the full gfx/CU, shape and mode key."""
+        """Override to:
+
+        * Support CLI-based single-shape tuning (-m / -n / -k).
+        * Treat (bias, dtype, outdtype) as part of the dedup / update key.
+          self.keys is now 7-wide; same (M,N,K,outdtype) tuned with and
+          without bias generates two distinct rows in the tuned CSV. We
+          still need to populate missing columns from the CLI defaults
+          (legacy CSVs without dtype/bias columns).
+        * Honor --retune: skip the "already tuned" dedup mask so every
+          shape in untunedf is re-measured, then rely on the existing
+          update_tunedf path (concat=False) to overwrite the old row
+          in-place when result_to_csv writes back. The actual replace-
+          if-better gate lives in our update_tunedf override below.
+        """
         if args.retune and args.all:
             self.parser.error(
                 "--retune and --all are mutually exclusive. Use --retune "
@@ -1382,11 +1635,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         cli_dtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.dtype])
         cli_outdtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.outdtype])
         cli_bias = bool(args.bias)
-
-        if isinstance(args.run_config, str):
-            self.untunedf = self.get_tuned_gemm_list(args.run_config)
-            self.tunedf = self.untunedf
-            return
 
         if (
             args.shape_m is not None
@@ -1457,6 +1705,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             self.untunedf = self.untunedf[self.keys]
 
             if len(self.tunedf) != 0:
+                # Dedup against the full 7-key.
                 key_cols = list(self.keys)
                 mask = (
                     self.untunedf[key_cols]
@@ -1490,12 +1739,29 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         return (in_bpe, in_bpe, out_bpe)
 
     def calculate(self, results, bpes=None):
-        """Compute TFLOPs and GB/s using the worker task's input/output dtypes."""
+        """Compute (TFLOPs, GB/s) for a tuner result row.
+
+        Per-shape (bias, dtype, outdtype) live in info[0] now. The 7-key
+        layout puts them at slots 4 (bias bool), 5 (dtype), 6 (outdtype).
+        Callers outside tune() that pre-compute bpes (e.g. update_tflops_bw
+        on a legacy 4/6-key CSV) can pass bpes=... explicitly to bypass.
+        """
         info, time, err = results
-        cu_num, M, N, K, _bias, dtype_str, outdtype_str, gfx = info[0]
+        row_key = info[0]
+        gfx = row_key[7] if len(row_key) >= 8 else self.get_gfx()
         if bpes is None:
+            info, _time, _err = results
+            row_key = info[0]
+            # Backwards compat: legacy 4-key / 6-key tuples have no bias
+            # slot; route to dtype/outdtype slots that match each layout.
+            if len(row_key) >= 7:
+                dtype_str, outdtype_str = str(row_key[5]), str(row_key[6])
+            elif len(row_key) >= 6:
+                dtype_str, outdtype_str = str(row_key[4]), str(row_key[5])
+            else:
+                dtype_str, outdtype_str = "torch.bfloat16", "torch.bfloat16"
             bpes = self._bpes_from_dtype_strs(dtype_str, outdtype_str)
-        info = ((gfx, cu_num, M, N, K), *info[1:])
+        info = ((gfx, *row_key[:4]), *info[1:])
         return super().calculate((info, time, err), bpes=bpes)
 
     def result_to_df(self, results):
@@ -1503,12 +1769,30 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
-            cu_num, M, N, K, bias_v, dtype_str, outdtype_str, gfx = keys
-            if time == self.INVALID_TIME or time == self.INF_TIME:
-                kernelName = "None"
-            elif kernelName == "" or pd.isna(kernelName):
-                instance = get_registry("a16w16", gfx, int(cu_num)).get(kernelId)
-                kernelName = instance.name if instance is not None else None
+            # 7-key tuple now; legacy 4/6-key tuples still work.
+            if len(keys) >= 7:
+                cu_num, M, N, K, bias_v, dtype_str, outdtype_str = keys[:7]
+            elif len(keys) >= 6:
+                cu_num, M, N, K, dtype_str, outdtype_str = keys[:6]
+                bias_v = False
+            else:
+                cu_num, M, N, K = keys[:4]
+                bias_v, dtype_str, outdtype_str = (
+                    False,
+                    "torch.bfloat16",
+                    "torch.bfloat16",
+                )
+            gfx = keys[7] if len(keys) >= 8 else self.get_gfx()
+            instance = get_registry("a16w16", gfx, int(cu_num)).get(kernelId)
+            kernelName = (
+                "None"
+                if time == self.INVALID_TIME or time == self.INF_TIME
+                else (
+                    (instance.name if instance is not None else None)
+                    if kernelName == ""
+                    else kernelName
+                )
+            )
             tflops, bw = self.calculate(el)
             rows.append(
                 {
@@ -1639,7 +1923,9 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
 
-        # Restrict gfx1250 sweeps to per-shape tile and cluster candidates.
+        # gfx1250: the benchmark sweep is restricted per-shape to the candidate
+        # filter (top-N tiles x {plain + top-N cluster dims}); other arches keep
+        # the full per-kid reject flow.
         _is_gfx1250 = _tune_arch == "gfx1250"
 
         # --kid filter (debug): parse the CSV list once.
@@ -1687,7 +1973,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             K = int(untunedf.loc[i, "K"])
             batch = int(untunedf.loc[i, "batch"]) if "batch" in untunedf.columns else 1
 
-            # Worker rows retain bias, dtype and output dtype.
+            # Per-row bias / dtype / outdtype: bias is part of self.keys now, so the column is guaranteed to
+            # exist by pre_process.
             bias_v = (
                 bool(untunedf.loc[i, "bias"])
                 if "bias" in untunedf.columns
@@ -1733,7 +2020,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             )
 
             total_kernel_nums = 0
-            # Keep execution attributes in the worker task.
+            # 7-tuple matches self.keys; result_to_df / calculate read
+            # bias / dtype / outdtype from slots 4 / 5 / 6.
             info_keys = (
                 cu_num,
                 M,

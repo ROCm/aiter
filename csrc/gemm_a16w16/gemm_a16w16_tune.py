@@ -571,10 +571,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return untunedf.drop_duplicates().reset_index(drop=True)
 
     def pre_process(self, args):
-        if isinstance(args.run_config, str):
-            self.untunedf = self.get_tuned_gemm_list(args.run_config)
-            self.tunedf = self.untunedf
-            return
         if args.all:
             self.get_retune_gemm_list(args)
         else:
