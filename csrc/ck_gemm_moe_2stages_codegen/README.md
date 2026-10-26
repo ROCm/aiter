@@ -120,47 +120,6 @@ Isolated stage times do not always rank pipelines the same way, so `staged`
 can select a slower winner than `prune`. Use `prune` or `full` to check
 shapes where the selected kernel matters.
 
-##### MXFP4 output and exit status
-
-The winner CSV writes the validated end-to-end kernel-duration sum to both
-`us1` and `us`, with `us2=0`. Ordinary fMoE retains its stage timings and
-profiling outputs.
-
-Without `--fast-scan`, timing rotates through copies of the timed function's
-arguments. `run_perftest` makes ceil(budget / input size) copies, where the
-budget is min(L2 size x 8192, about 32 GiB on gfx950; 90% of free device
-memory), capped at `--iters`. With the default `--iters 101`, input sets above
-about 328 MiB are reused within one measurement. `--fast-scan` times a single
-input set. The two modes use different input-reuse policies, so their `us`
-values are not directly comparable. How either compares with production cache
-behavior (MoE reads only routed experts) has not been measured.
-
-MXFP4 input rows may contain `gate_mode`; it is retained for support validation
-and removed from the winner CSV. An unsupported requested row is reported even
-if its shape key is already tuned. Later supported rows continue, valid old
-shared-CSV rows survive failed retuning, and any failed or unfinished requested
-row yields a nonzero command exit; a winner counts as tuned only once the CSV
-write succeeds. The tuner validates every
-scheduled runtime GPU before shape work and writes each result's assigned
-gfx/CU identity. Prune/full single-slot execution retains the caller's current
-GPU; multi-slot execution and staged search use the first selected visible
-logical GPUs. Build-time `GPU_ARCHS` and unused visible devices do not define
-the supported runtime set.
-
-When rewriting a shared tuned CSV, the tuner keeps `_tag` and other columns,
-drops only rows the runtime can never load (`_tag=flydsl_fallback`, and a
-later MXFP4 or CK 2-stage row whose key already has an earlier configured
-row), keeps configured rows without a timing, and drops kernel-less input rows
-only when `-i` and `-o` name the same file. A retuned winner replaces the
-first row of its key, the one the runtime loads.
-
-`AITER_MXFP4_TUNE_SWIGLU_LIMIT`, `AITER_FLYDSL_STAGE2_FP8` and
-`AITER_MXFP4_INTERMEDIATE` are captured once per invocation and are not part
-of the shape key. Results tuned under different settings collide on the same
-key: they are skipped without `--all` and overwritten with `--all`. Write each
-configuration to its own `-o` file, and run AOT and production with the same
-settings; see [the AOT notes](../../aiter/aot/flydsl/README.md).
-
 #### `--last`
 - **Type**: Flag (boolean)
 - **Default**: `False`
@@ -179,7 +138,7 @@ settings; see [the AOT notes](../../aiter/aot/flydsl/README.md).
 - **Description**: Optional output file to store **all** tuning results (not just the best ones). Useful for profiling and analyzing all kernel candidates.
 
 The dedicated `--mxfp4-flydsl` tuner does not write profile artifacts through
-this option; see [MXFP4 output and exit status](#mxfp4-output-and-exit-status).
+this option.
 
 **Example**:
 ```bash

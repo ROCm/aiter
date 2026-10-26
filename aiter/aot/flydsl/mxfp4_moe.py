@@ -20,7 +20,6 @@ import argparse
 import csv
 import glob
 import io
-import math
 import os
 import sys
 import time
@@ -41,6 +40,9 @@ DEFAULT_CSVS = sorted(
 _ACTIVE_FMOE_CSV = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
 if os.path.exists(_ACTIVE_FMOE_CSV) and _ACTIVE_FMOE_CSV not in DEFAULT_CSVS:
     DEFAULT_CSVS.append(_ACTIVE_FMOE_CSV)
+
+# Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
+_MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
 
 
 def _job_key(job: dict) -> tuple:
@@ -107,13 +109,12 @@ def _job_key(job: dict) -> tuple:
     )
 
 
-def parse_csv(
-    csv_path: "str | io.TextIOBase", swiglu_limit: float | None = None
-) -> "list[dict[str, object]]":
-    """Parse a tuned CSV path or text stream into deduplicated AOT jobs.
+def parse_csv(csv_path):
+    """Parse tuned CSV rows into unique MXMOE-port jobs for each stage and
+    layout.
 
-    ``swiglu_limit`` defaults to AITER_MXFP4_TUNE_SWIGLU_LIMIT, else the
-    activation default.
+    ``csv_path`` may be a filesystem path or an already-open text stream (used
+    by ``jobs_from_rows`` for in-memory tuner candidates).
     """
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
@@ -127,21 +128,6 @@ def parse_csv(
         native_scale_layout_for,
         parse_flydsl_v2_gemm2_kernel,
     )
-
-    limit_source = "swiglu_limit"
-    if swiglu_limit is None:
-        swiglu_limit = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT") or None
-        limit_source = "AITER_MXFP4_TUNE_SWIGLU_LIMIT"
-    # Same opt-in gates as production.
-    mxfp4_intermediate = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
-    stage2_fp8_route_out = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-    if swiglu_limit is not None:
-        try:
-            swiglu_limit = float(swiglu_limit)
-        except (TypeError, ValueError) as error:
-            raise ValueError("swiglu_limit must be a finite positive number") from error
-        if not math.isfinite(swiglu_limit) or swiglu_limit <= 0:
-            raise ValueError("swiglu_limit must be a finite positive number")
 
     jobs = []
     seen = set()
@@ -182,12 +168,6 @@ def parse_csv(
                 p1 = _parse_mxfp4_g1_kname(kn1)
                 situ_params = [(1.0, 1.0)]
                 if p1["act"] == "situv2":
-                    if swiglu_limit is not None:
-                        raise ValueError(
-                            f"swiglu_limit is not supported for situv2: "
-                            f"{getattr(f, 'name', '<in-memory rows>')} row {kn1} with "
-                            f"{limit_source}={swiglu_limit:g}"
-                        )
                     situ_params.append(
                         (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
                     )
@@ -222,11 +202,7 @@ def parse_csv(
                                 # MXMOE. +inf preserves historical unclamped
                                 # SiLU; SwiGLU retains its default limit of 7.
                                 "swiglu_limit": (
-                                    swiglu_limit
-                                    if swiglu_limit is not None
-                                    else (
-                                        7.0 if p1["act"] == "swiglu" else float("inf")
-                                    )
+                                    7.0 if p1["act"] == "swiglu" else float("inf")
                                 ),
                                 "enable_bias": p1["enable_bias"],
                                 "interleave": interleave,
@@ -240,11 +216,7 @@ def parse_csv(
 
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
-                out_dtype = (
-                    "fp8"
-                    if v2_g2["epilog"] == "reduce" and stage2_fp8_route_out
-                    else "bf16"
-                )
+                out_dtype = "bf16"
                 bias_supported = (
                     row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
                     and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
@@ -260,15 +232,6 @@ def parse_csv(
                     (False, True) if v2_g2["epilog"] == "atomic" else (False,)
                 )
                 for enable_bias in enable_bias_options:
-                    effective_out_dtype = out_dtype
-                    if (
-                        v2_g2["epilog"] == "scatter"
-                        and bm == 128
-                        and v2_g2["tile_n"] in (128, 256)
-                        and not enable_bias
-                        and mxfp4_intermediate
-                    ):
-                        effective_out_dtype = "fp4"
                     for use_valid_token_count in count_options:
                         _add(
                             {
@@ -290,7 +253,7 @@ def parse_csv(
                                 "cu_num": int(row.get("cu_num", "0") or "0"),
                                 "a_dtype": v2_g2["a_dtype"],
                                 "b_dtype": v2_g2["b_dtype"],
-                                "out_dtype": effective_out_dtype,
+                                "out_dtype": out_dtype,
                                 "enable_bias": enable_bias,
                                 "use_valid_token_count": use_valid_token_count,
                                 "g2_spart": v2_g2["spart"],
@@ -305,7 +268,7 @@ def parse_csv(
                 # fallback too, else RUN_ONLY has no cache entry for the kernel
                 # that actually launches.
                 mxfp4outs = [False]
-                if p2["mxfp4out"] and mxfp4_intermediate:
+                if p2["mxfp4out"] and _MXFP4_INTERMEDIATE:
                     mxfp4outs.append(True)
                 for mxfp4out in mxfp4outs:
                     _add(
@@ -444,19 +407,10 @@ def _compile_v2_stage2(job):
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
     is_fp8_route_out = job["epilog"] == "reduce" and job["out_dtype"] == "fp8"
     out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
-    target_scale = None
     if job["epilog"] == "scatter":
-        if job["out_dtype"] == "fp4":
-            target = torch.empty(
-                (max_sorted, job["N_OUT"] // 2), dtype=torch.uint8, device="cpu"
-            )
-            target_scale = torch.empty(
-                (max_sorted, job["N_OUT"] // 32), dtype=torch.uint8, device="cpu"
-            )
-        else:
-            target = torch.empty(
-                (max_sorted, job["N_OUT"]), dtype=torch.bfloat16, device="cpu"
-            )
+        target = torch.empty(
+            (max_sorted, job["N_OUT"]), dtype=torch.bfloat16, device="cpu"
+        )
     elif job["epilog"] == "reduce":
         if is_fp8_route_out:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
@@ -505,7 +459,6 @@ def _compile_v2_stage2(job):
         cu_num=job["cu_num"],
         n_sorted_padded=max_sorted,
         out_dtype=job["out_dtype"],
-        out_scale=target_scale,
         g2_spart=job.get("g2_spart"),
         g2_bf16_lds=job.get("g2_bf16_lds"),
         bias=bias if job.get("enable_bias", False) else None,
@@ -584,14 +537,6 @@ def main():
         help="Path(s) to tuned FMoE CSVs; default: fp4, fp8fp4, a4w4, and a8w4 "
         "model configs plus the active merged FMoE config",
     )
-    parser.add_argument(
-        "--swiglu-limit",
-        type=float,
-        default=None,
-        help="Positive finite SiLU/SwiGLU clamp limit; default: "
-        "AITER_MXFP4_TUNE_SWIGLU_LIMIT or activation defaults. "
-        "Use the same limit and stage2 environment as tuning and production.",
-    )
     args = parser.parse_args()
 
     csv_paths = [os.path.abspath(p) for p in args.csv]
@@ -603,12 +548,7 @@ def main():
         print("Error: no fp4 tuned CSVs found and none given via --csv")
         sys.exit(1)
 
-    try:
-        all_jobs = collect_aot_jobs(
-            csv_paths, lambda path: parse_csv(path, swiglu_limit=args.swiglu_limit)
-        )
-    except ValueError as error:
-        parser.error(str(error))
+    all_jobs = collect_aot_jobs(csv_paths, parse_csv)
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
 
