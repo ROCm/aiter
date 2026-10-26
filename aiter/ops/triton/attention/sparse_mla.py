@@ -204,8 +204,8 @@ _NO_OCCUPANCY_HINT = 0  # what Triton takes for "let the allocator decide"
 
 
 def _staged_launch(block_k, workgroups, use_buffer_load):
-    """The dequantizing families: block-scaled fp8, and per-tensor fp8 read with
-    bf16 dots. The copy cannot feed their dot, so only the tile hint is left."""
+    """Dequantizing families (block-scale fp8, bf16-dot tensor fp8): the copy
+    can't feed the dot, so only the tile hint is left."""
     waves = 1 if (use_buffer_load and workgroups <= get_num_sms()) else 2
     return _Launch(False, block_k, waves, False)
 
@@ -213,9 +213,8 @@ def _staged_launch(block_k, workgroups, use_buffer_load):
 def _fp8_scalar_launch(num_queries, num_heads, avg_topk, workgroups):
     """Per-tensor fp8 with fp8 dots. Pinned to 16 heads per program, so each key
     is re-gathered num_heads / 16 times. None means the staged walk instead."""
-    # Cold decode exposes the whole gather and the staged walk's register
-    # prefetch wins, except at 128 heads where the stock launch already runs
-    # narrow head blocks that re-gather the same keys.
+    # Cold decode: the staged walk's register prefetch wins, except at 128
+    # heads (narrow head blocks already re-gather the same keys there).
     if num_queries < _PREFILL_MIN_ROWS and num_heads < 128:
         return None
     # L2 only absorbs the re-reads while the top-k list keeps the pool resident.
@@ -230,9 +229,8 @@ def _bf16_launch(num_queries, num_heads, workgroups):
     if num_queries < _PREFILL_MIN_ROWS:
         if num_heads < 64:
             return None
-        # Decode cannot fill the SIMDs anyway, and clamping the allocator to four
-        # waves spills a bf16 tile's working set. Prefill keeps the hint below:
-        # its grid is large enough that waves beat registers.
+        # Decode can't fill the SIMDs anyway, and 4 waves would spill the tile;
+        # prefill's grid is large enough that waves beat registers.
         return _Launch(True, 64, _NO_OCCUPANCY_HINT, workgroups < 4 * get_num_sms())
     return _async_buffers(workgroups, 4)
 
@@ -259,13 +257,9 @@ def _async_launch_config(
     tiles_per_program: float = 1e9,
     num_heads: int = 0,
 ) -> _Launch:
-    """Pick how this launch walks its tiles.
-
-    Three families, split by what the copy can land in LDS. A bf16 cache, and a
-    per-tensor fp8 cache read with fp8 dots, already hold the dot operand, so the
-    copy can feed it; every other format dequantizes through registers and takes
-    the staged walk whatever the shape.
-    """
+    """Pick how this launch walks its tiles: bf16 and fp8-dot tensor-fp8 caches
+    hold the dot operand already, so the copy can feed it; everything else
+    dequantizes through registers and takes the staged walk."""
     workgroups = num_queries * heads_blocks * max(1, num_splits)
     staged = _staged_launch(block_k, workgroups, use_buffer_load)
     if (
@@ -859,9 +853,7 @@ def sparse_mla_fwd(
     nope_chunk = max(1, block_k // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
     bf16_async_ok = fmt == "bf16" and (not has_extra or extra_fmt == "bf16")
     if bf16_async_ok:
-        # 16 heads per program leaves too little work to cover the copy. The
-        # 64-head one only pays on decode, where the hint comes off below and
-        # the allocator can hold the wider tile.
+        # 16 heads/program doesn't cover the copy; 64 only pays on decode.
         bf16_async_ok = (
             arch == "gfx950"
             and num_heads >= 32
@@ -897,8 +889,7 @@ def sparse_mla_fwd(
 
     # The wide head programs and the decode XCD remap below are tuned on gfx950.
     staged = fmt == "fp8_scalar" or fmt == "bf16"
-    # The fp8 copy keeps the narrow tile below; the bf16 one stages no tile in
-    # registers, so it can afford the wide head program.
+    # fp8 keeps the narrow tile when async; bf16 stages nothing in registers.
     wide_ok = not (async_lds_on and fp8_dots)
     if arch == "gfx950" and staged and num_heads >= 32 and wide_ok:
         # 32- or 64-head programs (_staged_block_m).
@@ -912,18 +903,14 @@ def sparse_mla_fwd(
 
     if async_lds_on:
         if fp8_dots:
-            # acc is [BLOCK_M, kv_lora_rank] f32, so only 16-head programs leave
-            # room for the four waves/SIMD this walk needs to pay off.
+            # f32 acc leaves room for 4 waves/SIMD only at 16 heads/program.
             block_m, num_warps = 16, 4
             head_aligned = num_heads % block_m == 0
             heads_blocks = (num_heads + block_m - 1) // block_m
         grid_splits = num_splits if skip_reduce else _launch_splits(num_splits)
 
-    # Both only pay with enough rows in flight to cover what they move. The
-    # split is on rows, not prefill vs decode and not workgroups: the launcher
-    # holds the decode grid near one workgroup per CU by trading split-K
-    # against head blocks, so speculative decode clears the bar purely by
-    # multiplying the row count.
+    # Gated on rows/CU, not prefill-vs-decode or workgroup count, so spec
+    # decode clears the bar by row count alone.
     rows_per_cu = num_queries * num_heads / max(1, get_num_sms())
     softmax_fix = pv_order = rows_per_cu >= _LOOP_BOUND_ROWS_PER_CU
 
