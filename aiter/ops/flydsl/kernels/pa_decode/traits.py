@@ -773,6 +773,16 @@ class Gfx1250Traits:
     FP8_MAX = 448.0
 
     @property
+    def bf16_page16_packed(self):
+        # Four waves gather one vector-8 page each into a 64-token LDS tile.
+        return (
+            self.bf16
+            and self.trans_v
+            and self.block_size == 16
+            and self.head_dim in (64, 128, 256)
+        )
+
+    @property
     def bf16_packed(self):
         # Bound resident Q/accumulator registers and keep two pages within LDS.
         return (
@@ -848,7 +858,7 @@ class Gfx1250Traits:
         return (
             not self.bf16
             and self.head_dim in (128, 256)
-            and (self.block_size == 16 or self.block_size >= 64)
+            and self.block_size >= 16
             and self.trans_v
             and (
                 self.m_tiles == 1
@@ -864,7 +874,7 @@ class Gfx1250Traits:
 
     @property
     def k_bytes(self):
-        if self.bf16_packed:
+        if self.bf16_packed or self.bf16_page16_packed:
             return self.TOKENS * self.head_dim * self.elem_bytes
         return self.TOKENS * (self.head_dim if self.packed_lds else self.q_stride)
 
@@ -874,7 +884,7 @@ class Gfx1250Traits:
 
     @property
     def v_bytes(self):
-        if self.bf16_packed:
+        if self.bf16_packed or self.bf16_page16_packed:
             return self.TOKENS * self.head_dim * self.elem_bytes
         return self.head_dim * (self.TOKENS if self.packed_lds else self.v_stride)
 
@@ -883,7 +893,11 @@ class Gfx1250Traits:
         return (
             self.k_bytes
             + self.v_bytes
-            + (0 if self.bf16_packed else 2 * self.TOKENS * 4)
+            + (
+                0
+                if self.bf16_packed or self.bf16_page16_packed
+                else 2 * self.TOKENS * 4
+            )
         )
 
     @property

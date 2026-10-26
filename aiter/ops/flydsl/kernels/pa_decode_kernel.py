@@ -21,6 +21,8 @@ with two LDS buffers where capacity permits. One-partition plans can write
 final output directly; other plans use the shared partition reducer.
 BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
 with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
+Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
+using the 64-token pipeline.
 
 Logical layouts (not preshuffled):
 

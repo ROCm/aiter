@@ -999,6 +999,14 @@ class Gfx1250Pipeline:
                                     ctx.lane16,
                                     ctx.half,
                                 )
+                        elif const_expr(t.bf16_page16_packed):
+                            a = self.mem.bf16_k_operand(
+                                kv_off + ctx.warp * t.head_dim * 32,
+                                0,
+                                d * qk_k,
+                                ctx.lane16,
+                                ctx.half,
+                            )
                         else:
                             a = self.mem.operand(
                                 kv_off
@@ -1122,6 +1130,20 @@ class Gfx1250Pipeline:
                                 ctx.lane16,
                                 ctx.half,
                             )
+                        ]
+                        for vh in range_constexpr(vh_count)
+                    ]
+                elif const_expr(t.bf16_page16_packed):
+                    v_operands = [
+                        [
+                            self.mem.bf16_v_operand(
+                                kv_off + t.k_bytes,
+                                vh * 64 + ctx.warp * 16,
+                                d * pv_k,
+                                ctx.lane16,
+                                ctx.half,
+                            )
+                            for d in range_constexpr(t.TOKENS // pv_k)
                         ]
                         for vh in range_constexpr(vh_count)
                     ]
