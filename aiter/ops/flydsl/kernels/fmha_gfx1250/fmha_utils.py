@@ -1,35 +1,54 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Helpers shared verbatim by the gfx1250 m32x8 FMHA prefill kernels.
+"""Helpers shared by the two gfx1250 m32x8 FMHA prefill kernels.
 
 ``fmha_fwd_prefill_a16w16_m32x8`` (16-bit) and ``fmha_fwd_prefill_a8w8_m32x8``
 (8-bit) are deliberate siblings rather than one dtype-parameterized kernel, so
-most of each file is dtype-specific. What lives here is the subset that was
-byte-identical in both and whose whole dependency closure is identical too --
-lane/wave indexing, LDS allocation and barriers, fragment packing, the LDS->VGPR
-ring, and the reduction tree.
+most of each file is dtype-specific. What lives here is what was common to both:
+lane/wave indexing and tile ordering, LDS allocation and barriers, fragment
+packing, the LDS->VGPR ring, the reduction tree, the O staging manager and the
+Q-tile fit search, plus the geometry and LDS constants they read.
 
-Sharing is gated on the dependency closure, not on matching source text. Five
-more functions read identically but stay put for now: ``supported_num_q_tiles``,
-``supports_gqa_ratio`` and ``_pick_num_q_tiles`` reach ``_o_fits``, which probes
-the O manager with a different element type per kernel, and
-``_packed_tile_indices`` and ``_wg_kv_span`` reach ``_m_tile_idx``, which differs.
-Sharing those as-is would bind one sibling's behaviour into the other.
+Everything here was byte-identical in both siblings, or differed only in
+spelling of the same value -- ``_o_fits`` probed the O manager as
+``_DTYPE_MAP[DEFAULT_DTYPE]`` on one side and ``O_DTYPE`` on the other, both
+``fx.BFloat16``; ``_m_tile_idx`` wrote ``- 1`` against ``- fx.Int32(1)``.
+Generated code is byte-identical before and after the move.
 
-The buffer managers are already shared from ``fmha_buffer_managers``.
+Constants live here rather than in each sibling so a helper cannot drift from
+the kernel that calls it -- ``_block_m`` reading a stale ``NUM_WAVES`` would be
+the same class of bug as a rescale threshold that no longer matches its dtype.
+
+``DTYPE_MAP`` names EVERY dtype either sibling can express, 8-bit and 16-bit.
+It is a lookup table, not a permission list: each kernel validates against its
+own ``SUPPORTED_DTYPES``, because gating on ``in DTYPE_MAP`` would let the
+16-bit kernel accept ``"fp8"`` and build a kernel that reads its inputs at the
+wrong width.
+
+What is NOT here is the dtype-specific body of each kernel: the attention
+cores, softmax, the gemms, the prologue/epilogue and the host entry points.
+The buffer managers are shared separately, from ``fmha_buffer_managers``.
 """
 
+import functools
+
 import flydsl.expr as fx
+import torch
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
 
-from .fmha_buffer_managers import _ir
+from .fmha_buffer_managers import (
+    OManager16bV1,
+    OManager16bV2,
+    OManager16bV3,
+    _ir,
+)
 
 # m32x8 geometry. Defined here rather than in each sibling so ``_block_m`` cannot
 # drift from the kernel that calls it.
@@ -330,3 +349,162 @@ def schedule_bank(value, bank=0, soft=False, reason=None):
         except Exception:  # noqa: BLE001 - any binding failure degrades to identity
             schedule_bank.func = None
     return value
+
+
+# Q/K/V element types across both siblings. The map is shared so a dtype name means the
+# same thing in each; what a given kernel actually SERVES is its own SUPPORTED_DTYPES,
+# never this map's keys -- gating on `in DTYPE_MAP` would let the 16-bit kernel accept
+# "fp8" and build a kernel that reads its inputs at the wrong width.
+DTYPE_MAP = {
+    "bf16": fx.BFloat16,
+    "fp16": fx.Float16,
+    "fp8": fx.Float8E4M3FN,
+    "bf8": fx.Float8E5M2,
+}
+TORCH_DTYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp8": torch.float8_e4m3fn,
+    "bf8": torch.float8_e5m2,
+}
+
+# LDS budget for the 12-chunk map both siblings share.
+LDS_QO_BYTES = 17 * 1024
+LDS_CHUNK_BYTES = 26 * 1024
+O_VARIANT = "v2"
+NUM_Q_TILES_CHOICES = (1, 2)
+
+# O stages through LDS as a 2-byte element in both siblings -- a16w16's O follows its
+# bf16/fp16 input, a8w8 always writes bf16 -- and the staging size depends only on the
+# element width, so one probe type answers the fit question for both.
+_O_PROBE_DTYPE = fx.BFloat16
+
+
+def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype):
+    """The O epilogue's LDS staging manager, plus the clearance check both cores need.
+
+    Two waves share a chunk at 0 and LDS_QO_BYTES, and the upper one must stop short of
+    the next chunk -- that clearance is what keeps O off the V rows a dead carried ring
+    head may still be reading."""
+    _o_manager_cls = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[
+        O_VARIANT
+    ]
+    o_mgr = _o_manager_cls(
+        v_hdim=v_hdim,
+        gqa_ratio=gqa_ratio,
+        num_waves=NUM_WAVES,
+        q_tiles_per_wave=num_q_tiles_per_wave,
+        elem_dtype=elem_dtype,
+    )
+    assert LDS_QO_BYTES + o_mgr.warp_lds_size_in_byte() <= LDS_CHUNK_BYTES, (
+        f"O per-wave {o_mgr.warp_lds_size_in_byte()}B does not fit above the "
+        f"{LDS_QO_BYTES}B slice inside a {LDS_CHUNK_BYTES}B chunk"
+    )
+    return o_mgr
+
+
+@functools.cache
+def _o_fits(v_hdim, gqa_ratio, num_q_tiles_per_wave):
+    try:
+        _o_manager(
+            v_hdim=v_hdim,
+            gqa_ratio=gqa_ratio,
+            num_q_tiles_per_wave=num_q_tiles_per_wave,
+            elem_dtype=_O_PROBE_DTYPE,
+        )
+    except AssertionError:
+        return False
+    return True
+
+
+def supported_num_q_tiles(gqa_ratio, v_hdim=None):
+    """The num_q_tiles choices whose packed-row tile never splits a head group and
+    whose O epilogue staging fits its LDS chunk at ``v_hdim`` (256 fits one tile
+    only). ``v_hdim=None`` skips the LDS check.
+
+    ``_pick_num_q_tiles`` picks only from these, so a ratio is servable as long as ONE
+    choice packs it -- gqa 48 straddles at rows_per_warp 32 but fits inside a group at 16.
+    """
+    return tuple(
+        n
+        for n in sorted(NUM_Q_TILES_CHOICES)
+        if (gqa_ratio % (WMMA_M * n) == 0 or (WMMA_M * n) % gqa_ratio == 0)
+        and (v_hdim is None or _o_fits(v_hdim, gqa_ratio, n))
+    )
+
+
+def supports_gqa_ratio(gqa_ratio, v_hdim=None):
+    """True when some BLOCK_M can tile this ratio; the routers gate on it."""
+    return bool(supported_num_q_tiles(gqa_ratio, v_hdim))
+
+
+def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio, v_hdim):
+    """Smallest Q tile whose grid still fits one workgroup wave; the largest otherwise."""
+    rows = int(max_seqlen_q) * int(gqa_ratio)
+    per_tile = int(num_kv_heads) * int(batch)
+    NUM_WGS_PER_CU = 1  # the >256 KB LDS footprint pins occupancy at one WG per CU
+    resident = get_cu_num() * NUM_WGS_PER_CU
+    ok = supported_num_q_tiles(gqa_ratio, v_hdim)
+    for num_tiles in ok:
+        block_m = _block_m(num_tiles)
+        if ((rows + block_m - 1) // block_m) * per_tile <= resident:
+            return num_tiles
+    return max(ok)
+
+
+# Causal work grows with the M index, so dispatch the heavy tiles first.
+REVERSE_M_ORDER = True
+
+
+def _m_tile_idx():
+    x = fx.Int32(gpu.block_id("x"))
+    if REVERSE_M_ORDER:
+        x = fx.Int32(gpu.grid_dim.x) - 1 - x
+    return x
+
+
+def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave):
+    """Map this lane's rows in the packed ``(seq, q_head_in_group)`` tile to global
+    indices: ``(kv_head, q_head_idx, seq_idx)``, the latter two length-num_q_tiles lists (one per
+    q-WMMA-tile this wave owns, num_q_tiles = num_q_tiles_per_wave).
+
+    block_id y is the kv_head; block_id x tiles that head's ``(seq, q_head_in_group)``
+    plane, with ``q_head_in_group`` the fast axis so the ``% / //`` use the small (often
+    power-of-two) ``gqa_ratio``. The num_q_tiles tiles a wave owns are contiguous.
+    """
+    kv_head = fx.Int32(gpu.block_id("y"))
+    warp_row0 = _m_tile_idx() * _block_m(num_q_tiles_per_wave) + warp_idx * (
+        num_q_tiles_per_wave * WMMA_M
+    )
+    q_head_idx = []
+    seq_idx = []
+    for q_tile_idx in range(num_q_tiles_per_wave):
+        row_idx = warp_row0 + q_tile_idx * WMMA_M + lane_idx % WMMA_M
+        q_head_idx.append(kv_head * gqa_ratio + row_idx % gqa_ratio)
+        seq_idx.append(row_idx // gqa_ratio)
+    return kv_head, q_head_idx, seq_idx
+
+
+def _wg_kv_span(
+    *, n_block, mask_right, gqa_ratio, num_q_tiles_per_wave, q_len, kv_len, window_right
+):
+    """This WG's KV band: (m_tile_idx, causal_off, kv_len_wg, num_tiles).
+
+    A query at seq s attends [s+causal_off-window_left, s+causal_off+window_right] with
+    causal_off = kv_len-q_len; mask_right clips kv_len_wg to the WG's max query's
+    attend-limit so no tile runs fully past the band. num_tiles is also the one-KV-tile
+    dispatch predicate, so it is computed here once and shared with the kernel entry."""
+    BLOCK_M = _block_m(num_q_tiles_per_wave)
+    m_tile_idx = _m_tile_idx()
+    causal_off = kv_len - q_len
+    if mask_right:
+        wg_max_seq = (
+            m_tile_idx * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)
+        ) // fx.Int32(gqa_ratio)
+        wg_max_seq = fx.min(wg_max_seq, q_len - fx.Int32(1))
+        kv_len_wg = wg_max_seq + causal_off + window_right + fx.Int32(1)
+        kv_len_wg = fx.min(kv_len_wg, kv_len)
+        kv_len_wg = fx.max(kv_len_wg, fx.Int32(1))
+    else:
+        kv_len_wg = kv_len
+    return m_tile_idx, causal_off, kv_len_wg, fx.ceildiv(kv_len_wg, fx.Int32(n_block))

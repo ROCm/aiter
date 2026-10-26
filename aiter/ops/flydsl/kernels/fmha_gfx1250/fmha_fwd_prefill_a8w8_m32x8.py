@@ -49,7 +49,7 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import LOG2E
@@ -63,9 +63,6 @@ from .fmha_buffer_managers import (
     ENABLE_SCHED_MODE2,
     KManager16bV1,
     KManager16bV2,
-    OManager16bV1,
-    OManager16bV2,
-    OManager16bV3,
     ProducerCtx,
     QManager16bV1,
     QManager16bV2,
@@ -74,6 +71,10 @@ from .fmha_buffer_managers import (
     _ir,
 )
 from .fmha_utils import (
+    DTYPE_MAP,
+    LDS_CHUNK_BYTES,
+    LDS_QO_BYTES,
+    NUM_Q_TILES_CHOICES,
     NUM_WAVES,
     WMMA_M,
     _alloc_lds,
@@ -88,13 +89,19 @@ from .fmha_utils import (
     _lane_id,
     _load_seqlen_pair,
     _load_sink_logit,
+    _m_tile_idx,
+    _o_manager,
     _o_pack,
     _o_unpack,
+    _packed_tile_indices,
+    _pick_num_q_tiles,
     _ring_drive,
     _ring_num_prefetch,
     _tree_reduce_multi,
     _warp_id,
+    _wg_kv_span,
     schedule_bank,
+    supports_gqa_ratio,
 )
 
 # ============================================================================
@@ -115,56 +122,14 @@ WMMA_K_B8 = 64
 WMMA_ROW_PER_WAVE = 2  # Q WMMA tiles per wave (the "x2" step from m16x8 to m32x8)
 BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 256
 # 1 => BLOCK_M 128 ("m16x8"), 2 => BLOCK_M 256. Chosen per call by _pick_num_q_tiles.
-NUM_Q_TILES_CHOICES = (1, 2)
 
 
 # A wave owns WMMA_M * num_q_tiles contiguous packed (seq, q_head_in_group) rows, and Q/O
 # describe that tile with ONE rectangular TDM box. That only works when a head group is
 # never split across waves: either a wave holds whole groups, or it sits inside one.
-def supported_num_q_tiles(gqa_ratio, v_hdim=None):
-    """The num_q_tiles choices whose packed-row tile never splits a head group and
-    whose O epilogue staging fits its LDS chunk at ``v_hdim`` (256 fits one tile
-    only). ``v_hdim=None`` skips the LDS check.
-
-    ``_pick_num_q_tiles`` picks only from these, so a ratio is servable as long as ONE
-    choice packs it -- gqa 48 straddles at rows_per_warp 32 but fits inside a group at 16.
-    """
-    return tuple(
-        n
-        for n in sorted(NUM_Q_TILES_CHOICES)
-        if (gqa_ratio % (WMMA_M * n) == 0 or (WMMA_M * n) % gqa_ratio == 0)
-        and (v_hdim is None or _o_fits(v_hdim, gqa_ratio, n))
-    )
-
-
-@functools.cache
-def _o_fits(v_hdim, gqa_ratio, num_q_tiles_per_wave):
-    try:
-        _o_manager(
-            v_hdim=v_hdim,
-            gqa_ratio=gqa_ratio,
-            num_q_tiles_per_wave=num_q_tiles_per_wave,
-            elem_dtype=O_DTYPE,
-        )
-    except AssertionError:
-        return False
-    return True
-
-
-def supports_gqa_ratio(gqa_ratio, v_hdim=None):
-    """True when some BLOCK_M can tile this ratio; the routers gate on it."""
-    return bool(supported_num_q_tiles(gqa_ratio, v_hdim))
 
 
 # Causal work grows with the M index, so dispatch the heavy tiles first.
-REVERSE_M_ORDER = True
-
-
-def _m_tile_idx():
-    x = fx.Int32(gpu.block_id("x"))
-    if REVERSE_M_ORDER:
-        x = fx.Int32(gpu.grid_dim.x) - fx.Int32(1) - x
-    return x
 
 
 class WarpType(IntEnum):
@@ -187,8 +152,6 @@ class WarpType(IntEnum):
 DEFAULT_QK_HDIM = 128
 DEFAULT_V_HDIM = 128
 DEFAULT_DTYPE = "fp8"
-_DTYPE_MAP = {"fp8": fx.Float8E4M3FN, "bf8": fx.Float8E5M2}
-_TORCH_DTYPE_MAP = {"fp8": torch.float8_e4m3fn, "bf8": torch.float8_e5m2}
 _B8_DTYPES = (fx.Float8E4M3FN, fx.Float8E5M2)
 # ``q_dtype`` types Q, ``kv_dtype`` types K and V; the two are independent (the wmma
 # takes a per-operand type) so fp8 Q against bf8 KV, or the reverse, is a legal build.
@@ -205,6 +168,10 @@ O_DTYPE = fx.BFloat16
 TORCH_O_DTYPE = torch.bfloat16
 # Q/K/V inputs this kernel serves; 16-bit belongs to the a16w16 sibling.
 _TORCH_IN_DTYPES = {torch.float8_e4m3fn: "fp8", torch.float8_e5m2: "bf8"}
+# What THIS kernel serves. DTYPE_MAP is shared with the 16-bit sibling and names every
+# dtype, so validation must gate on these, never on the map's keys.
+SUPPORTED_DTYPES = tuple(_TORCH_IN_DTYPES.values())
+SUPPORTED_TORCH_DTYPES = tuple(_TORCH_IN_DTYPES)
 SUPPORTED_QK_HDIM = (64, 128, 192, 256)
 SUPPORTED_V_HDIM = (64, 128, 256)
 
@@ -222,10 +189,8 @@ N_BLOCK_CHOICES = (32, 64, 128, 256)
 #   V[2][0] 130..156 seg 2      V[2][1] 286..312  seg 4
 #
 # Q and O own no LDS -- they time-share KV chunks (see _q_wave_base / _o_wave_base).
-LDS_CHUNK_BYTES = 26 * 1024
 KV_LDS_SPLITS = 2  # halves one K (or V) tile is split into along n_block
 # Per-wave Q / O region inside a chunk pair. 17 KB covers 32 rows x 256 hdim + pad.
-LDS_QO_BYTES = 17 * 1024
 
 DEFAULT_N_BLOCK = 64
 # Auto-picked n_block, widest first: a wider tile must still fit one chunk per split half
@@ -274,7 +239,6 @@ KV_PRODUCER_WARPS = NUM_WAVES // 2
 # O writer variant (decoupled from USE_TDM_LOADER): "v1" swizzled LDS + buffer_store (fastest so
 # far), "v2" TDM store (padding ignored -> contiguous LDS -> bank conflict, slow), "v3" padded LDS +
 # global_store_async_from_lds_b128.
-O_VARIANT = "v2"
 
 # LDS->VGPR ring for the fused PV+QK WMMA stream (``_pv_qk_gemm``). Holds only RING loads
 # live at 4 VGPR each, num_prefetch = RING - 2*LAG in flight, instead of bursting a whole
@@ -295,28 +259,6 @@ PVQK_HEAD_CARRY = 20
 # ============================================================================
 # Small device helpers
 # ============================================================================
-
-
-def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave):
-    """Map this lane's rows in the packed ``(seq, q_head_in_group)`` tile to global
-    indices: ``(kv_head, q_head_idx, seq_idx)``, the latter two length-num_q_tiles lists (one per
-    q-WMMA-tile this wave owns, num_q_tiles = num_q_tiles_per_wave).
-
-    block_id y is the kv_head; block_id x tiles that head's ``(seq, q_head_in_group)``
-    plane, with ``q_head_in_group`` the fast axis so the ``% / //`` use the small (often
-    power-of-two) ``gqa_ratio``. The num_q_tiles tiles a wave owns are contiguous.
-    """
-    kv_head = fx.Int32(gpu.block_id("y"))
-    warp_row0 = _m_tile_idx() * _block_m(num_q_tiles_per_wave) + warp_idx * (
-        num_q_tiles_per_wave * WMMA_M
-    )
-    q_head_idx = []
-    seq_idx = []
-    for q_tile_idx in range(num_q_tiles_per_wave):
-        row_idx = warp_row0 + q_tile_idx * WMMA_M + lane_idx % WMMA_M
-        q_head_idx.append(kv_head * gqa_ratio + row_idx % gqa_ratio)
-        seq_idx.append(row_idx // gqa_ratio)
-    return kv_head, q_head_idx, seq_idx
 
 
 # ============================================================================
@@ -744,31 +686,6 @@ def _pv_qk_gemm(
 # ============================================================================
 # Shared, layout-agnostic compute core
 # ============================================================================
-
-
-def _wg_kv_span(
-    *, n_block, mask_right, gqa_ratio, num_q_tiles_per_wave, q_len, kv_len, window_right
-):
-    """This WG's KV band: (m_tile_idx, causal_off, kv_len_wg, num_tiles).
-
-    A query at seq s attends [s+causal_off-window_left, s+causal_off+window_right] with
-    causal_off = kv_len-q_len; mask_right clips kv_len_wg to the WG's max query's
-    attend-limit so no tile runs fully past the band. num_tiles is also the one-KV-tile
-    dispatch predicate, so it is computed here once and shared with the kernel entry."""
-    BLOCK_M = _block_m(num_q_tiles_per_wave)
-    m_tile_idx = _m_tile_idx()
-    causal_off = kv_len - q_len
-    if mask_right:
-        wg_max_seq = (
-            m_tile_idx * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)
-        ) // fx.Int32(gqa_ratio)
-        wg_max_seq = fx.min(wg_max_seq, q_len - fx.Int32(1))
-        kv_len_wg = wg_max_seq + causal_off + window_right + fx.Int32(1)
-        kv_len_wg = fx.min(kv_len_wg, kv_len)
-        kv_len_wg = fx.max(kv_len_wg, fx.Int32(1))
-    else:
-        kv_len_wg = kv_len
-    return m_tile_idx, causal_off, kv_len_wg, fx.ceildiv(kv_len_wg, fx.Int32(n_block))
 
 
 # Keys ``_attention_prologue`` shares with the compute cores' kwarg dict.
@@ -2121,29 +2038,6 @@ def _attention_core_one_kv_tile(
     )
 
 
-def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype=O_DTYPE):
-    """The O epilogue's LDS staging manager, plus the clearance check both cores need.
-
-    Two waves share a chunk at 0 and LDS_QO_BYTES, and the upper one must stop short of
-    the next chunk -- that clearance is what keeps O off the V rows a dead carried ring
-    head may still be reading."""
-    _o_manager_cls = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[
-        O_VARIANT
-    ]
-    o_mgr = _o_manager_cls(
-        v_hdim=v_hdim,
-        gqa_ratio=gqa_ratio,
-        num_waves=NUM_WAVES,
-        q_tiles_per_wave=num_q_tiles_per_wave,
-        elem_dtype=elem_dtype,
-    )
-    assert LDS_QO_BYTES + o_mgr.warp_lds_size_in_byte() <= LDS_CHUNK_BYTES, (
-        f"O per-wave {o_mgr.warp_lds_size_in_byte()}B does not fit above the "
-        f"{LDS_QO_BYTES}B slice inside a {LDS_CHUNK_BYTES}B chunk"
-    )
-    return o_mgr
-
-
 def _store_o_lse(
     *,
     o_mgr,
@@ -2313,6 +2207,7 @@ def _attention_epilogue(
             v_hdim=v_hdim,
             gqa_ratio=gqa_ratio,
             num_q_tiles_per_wave=num_q_tiles,
+            elem_dtype=O_DTYPE,
         ),
         m_list=[
             fx.Float32(epi_state[q_tile_idx * _q_epi_slots + 0])
@@ -2498,10 +2393,10 @@ def build_fmha_fwd_prefill_a8w8_m32x8(
         qk_hdim in SUPPORTED_QK_HDIM and v_hdim in SUPPORTED_V_HDIM
     ), f"supports qk_hdim in {SUPPORTED_QK_HDIM} x v_hdim in {SUPPORTED_V_HDIM}, got {qk_hdim}/{v_hdim}"
     assert (
-        q_dtype_str in _DTYPE_MAP and kv_dtype_str in _DTYPE_MAP
-    ), f"dtypes must be in {list(_DTYPE_MAP)}, got {q_dtype_str!r}/{kv_dtype_str!r}"
-    Q_ELEM_DTYPE = _DTYPE_MAP[q_dtype_str]
-    KV_ELEM_DTYPE = _DTYPE_MAP[kv_dtype_str]
+        q_dtype_str in SUPPORTED_DTYPES and kv_dtype_str in SUPPORTED_DTYPES
+    ), f"dtypes must be in {list(SUPPORTED_DTYPES)}, got {q_dtype_str!r}/{kv_dtype_str!r}"
+    Q_ELEM_DTYPE = DTYPE_MAP[q_dtype_str]
+    KV_ELEM_DTYPE = DTYPE_MAP[kv_dtype_str]
     assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
     assert (
         num_q_tiles_per_wave in NUM_Q_TILES_CHOICES
@@ -2810,22 +2705,8 @@ _launch_fns = (
 
 def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, kv_dtype_str):
     """True when the launch bounds every WG to a single KV tile."""
-    n_block = pick_n_block(qk_hdim, v_hdim, _DTYPE_MAP[kv_dtype_str])
+    n_block = pick_n_block(qk_hdim, v_hdim, DTYPE_MAP[kv_dtype_str])
     return int(max_seqlen_k) <= n_block
-
-
-def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio, v_hdim):
-    """Smallest Q tile whose grid still fits one workgroup wave; the largest otherwise."""
-    rows = int(max_seqlen_q) * int(gqa_ratio)
-    per_tile = int(num_kv_heads) * int(batch)
-    NUM_WGS_PER_CU = 1  # the >256 KB LDS footprint pins occupancy at one WG per CU
-    resident = get_cu_num() * NUM_WGS_PER_CU
-    ok = supported_num_q_tiles(gqa_ratio, v_hdim)
-    for num_tiles in ok:
-        block_m = _block_m(num_tiles)
-        if ((rows + block_m - 1) // block_m) * per_tile <= resident:
-            return num_tiles
-    return max(ok)
 
 
 def _ensure_thd_kernel(
@@ -3144,7 +3025,7 @@ def flash_attn_varlen_a8w8_m32x8(
     ``[nheads_q, total_q]`` fp32 buffer, allocated here when ``return_lse`` and None.
     """
     assert (
-        q.dtype in _TORCH_DTYPE_MAP.values() and k.dtype in _TORCH_DTYPE_MAP.values()
+        q.dtype in SUPPORTED_TORCH_DTYPES and k.dtype in SUPPORTED_TORCH_DTYPES
     ), f"Expected fp8 or bf8, got {q.dtype}/{k.dtype}"
     assert v.dtype == k.dtype, f"k/v dtype must match, got {k.dtype}/{v.dtype}"
     q_dtype_str = _TORCH_IN_DTYPES[q.dtype]
@@ -3314,7 +3195,7 @@ def flash_attn_batch_a8w8_m32x8(
     ``[B, nheads_q, S_q]`` here.
     """
     assert (
-        q.dtype in _TORCH_DTYPE_MAP.values() and k.dtype in _TORCH_DTYPE_MAP.values()
+        q.dtype in SUPPORTED_TORCH_DTYPES and k.dtype in SUPPORTED_TORCH_DTYPES
     ), f"Expected fp8 or bf8, got {q.dtype}/{k.dtype}"
     assert v.dtype == k.dtype, f"k/v dtype must match, got {k.dtype}/{v.dtype}"
     q_dtype_str = _TORCH_IN_DTYPES[q.dtype]
