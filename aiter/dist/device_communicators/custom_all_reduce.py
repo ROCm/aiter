@@ -1945,6 +1945,71 @@ class CustomAllreduce:
             out = out.view(orig_dtype)
         return out
 
+    # Tensors one `all_gatherv` launch takes (kAllGatherVMax).
+    _ALL_GATHERV_MAX: ClassVar[int] = 4
+    # Past this many bytes a rank per rank in the group, NCCL's grouped
+    # all-gather is the faster. Measured on MI355X gathering MoE routed rows
+    # in a replayed graph: the two cross near 4.5 / 9 / 21 MB a rank at
+    # 2 / 4 / 8 ranks.
+    _ALL_GATHERV_BYTES_PER_RANK: ClassVar[int] = 2 << 20
+
+    def custom_all_gatherv(
+        self, inps: list[torch.Tensor], sizes: list[int] | None = None
+    ) -> list[torch.Tensor] | None:
+        """First-dim all-gather of every tensor in `inps`, rank r holding
+        `sizes[r]` rows of each (every rank this one's count when None), in
+        one launch and one rank barrier. Each output is a contiguous
+        `[sum(sizes), ...]` of its input's dtype.
+
+        None where one launch cannot take them -- the gfx1250 path, too many
+        tensors, rows not a multiple of 4 bytes, a non-contiguous input, more
+        than the registered pool holds -- or where NCCL is the faster (more
+        than `_ALL_GATHERV_BYTES_PER_RANK` times the group's size a rank), so
+        the caller gathers another way.
+        Every condition reads only what all ranks share (row widths, `sizes`),
+        so all ranks decide alike.
+
+        Binds the inputs as `custom_all_gather` does: read in place while
+        capturing on the registered path, copied into the registered pool
+        otherwise.
+        """
+        if self._ops_all_gather is not None:
+            return None
+        if not 0 < len(inps) <= self._ALL_GATHERV_MAX:
+            return None
+        if sizes is None:
+            sizes = [inps[0].shape[0]] * self.world_size
+        # From the row shape, not a row: this rank may hold none.
+        row_bytes = [
+            t.shape[1:].numel() * t.element_size() if t.dim() else 0 for t in inps
+        ]
+        if any(
+            b == 0 or b % 4 or not t.is_contiguous() for b, t in zip(row_bytes, inps)
+        ):
+            return None
+        rank_bytes = max(sizes) * sum(row_bytes)
+        if rank_bytes > self._ALL_GATHERV_BYTES_PER_RANK * self.world_size:
+            return None
+        registered = (
+            self._IS_CAPTURING
+            and torch.cuda.is_current_stream_capturing()
+            and all(self._capture_registered(t) for t in inps)
+        )
+        pool = self._pool["input"]
+        if not registered and pool.max_size < sum(
+            (max(sizes) * b + 15) // 16 * 16 for b in row_bytes
+        ):
+            return None
+        total = sum(sizes)
+        outs = [
+            torch.empty((total, *t.shape[1:]), dtype=t.dtype, device=t.device)
+            for t in inps
+        ]
+        if total:
+            reg, reg_bytes = (0, 0) if registered else (pool.data_ptr, pool.max_size)
+            ops.all_gatherv(self._ptr, inps, outs, list(sizes), reg, reg_bytes)
+        return outs
+
     def fused_ar_rms(
         self,
         inp: torch.Tensor,
