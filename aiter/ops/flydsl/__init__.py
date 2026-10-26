@@ -68,12 +68,16 @@ _LAZY_IMPORTS = {
         "flydsl_gdr_decode",
     ),
     "flydsl_fp8_paged_mqa_logits": (
-        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        ".kernels.mqa_logits.fp8_paged_mqa_logits",
         "flydsl_fp8_paged_mqa_logits",
     ),
     "flydsl_fp8_paged_mqa_logits_gfx950": (
         ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
         "flydsl_fp8_paged_mqa_logits_gfx950",
+    ),
+    "flydsl_fp8_paged_mqa_logits_gfx1250": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250",
+        "flydsl_fp8_paged_mqa_logits_gfx1250",
     ),
     "flydsl_gemm_a16wfp4": (".gemm_a16wfp4", "flydsl_gemm_a16wfp4"),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
@@ -193,6 +197,7 @@ __all__ = [
     "flydsl_fp8_mqa_logits",
     "flydsl_fp8_paged_mqa_logits",
     "flydsl_fp8_paged_mqa_logits_gfx950",
+    "flydsl_fp8_paged_mqa_logits_gfx1250",
     "flydsl_gdr_decode",
     "flydsl_gemm_a16wfp4",
     "flydsl_hgemm",
