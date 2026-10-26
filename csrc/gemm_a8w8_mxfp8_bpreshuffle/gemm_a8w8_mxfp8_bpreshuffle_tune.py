@@ -101,7 +101,7 @@ MXSCALE_BMM_KERNEL_ID = "bmm"
 
 
 def _bmm_scale_args(w_scale_block):
-    from aiter.ops.opus.policy import mxscale_bmm_groups_of_block
+    from aiter.ops.gemm_op_common import mxscale_bmm_groups_of_block
 
     rows, cols = mxscale_bmm_groups_of_block(w_scale_block)
     # generate_data's x_scale is as wide as the w_scale block; a 1x128 one
@@ -121,24 +121,20 @@ def bmm_candidates(m, n, k, w_scale_block, seeds=()):
     padded M, so 128x128 candidates must run both layouts."""
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
         bmm_candidate_names,
+        bmm_config_runs,
         parse_bmm_kernel_name,
     )
-    from aiter.ops.flydsl.kernels.bmm_a8w8_mxscale_gfx950 import check_bmm_config
 
     scale_args = _bmm_scale_args(w_scale_block)
     names = bmm_candidate_names(1, m, n, k, seeds, **scale_args)
     if not scale_args["x_scale_transposed"]:
         return names
     row_major = {**scale_args, "x_scale_transposed": False}
-
-    def runs_row_major(name):
-        try:
-            check_bmm_config(n, k, 1, **parse_bmm_kernel_name(name), **row_major)
-        except ValueError:
-            return False
-        return True
-
-    return [name for name in names if runs_row_major(name)]
+    return [
+        name
+        for name in names
+        if bmm_config_runs(1, n, k, row_major, parse_bmm_kernel_name(name))
+    ]
 
 
 def run_bmm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_name):

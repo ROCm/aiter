@@ -38,7 +38,7 @@ _DATA_KID = opus_tune.BMM_BLOCK_DATA_KIDS
 def _scale_args(block):
     """check_bmm_config's scale arguments for a w_scale block, with the
     row-major x_scale of the block's width the operands are generated with."""
-    from aiter.ops.opus.policy import mxscale_bmm_groups_of_block
+    from aiter.ops.gemm_op_common import mxscale_bmm_groups_of_block
 
     rows, cols = mxscale_bmm_groups_of_block(block)
     return {"x_scale_k": cols, "w_scale_n": rows, "w_scale_k": cols}
@@ -58,16 +58,6 @@ def run_flydsl_bmm_bench(x, w, x_scale, w_scale, y, kernel_name):
     from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
 
     return run_bmm_a8w8_mxfp8(x, w, x_scale, w_scale, y, kernel_name=kernel_name)
-
-
-def _runs(b, n, k, block, cfg):
-    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import check_bmm_config
-
-    try:
-        check_bmm_config(n, k, b, **cfg, **_scale_args(block))
-    except ValueError:
-        return False
-    return True
 
 
 class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
@@ -157,13 +147,16 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
             return super()._saved_benchmark(row, seed)
         if str(row["libtype"]).lower() != "flydsl":
             raise ValueError(f"Unsupported BMM backend {row['libtype']!r}")
-        from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+        from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
+            bmm_config_runs,
+            parse_bmm_kernel_name,
+        )
 
         b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
         block = row["w_scale_block"]
         name = str(row["kernelName"])
         cfg = parse_bmm_kernel_name(name)
-        if cfg is None or not _runs(b, n, k, block, cfg):
+        if cfg is None or not bmm_config_runs(b, n, k, _scale_args(block), cfg):
             raise ValueError(f"FlyDSL config {name!r} cannot run this shape")
         if int(row["splitK"]) != cfg["splits"]:
             raise ValueError("FlyDSL splitK does not match kernelName")

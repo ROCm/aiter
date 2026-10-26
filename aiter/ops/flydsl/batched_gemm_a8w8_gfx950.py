@@ -112,7 +112,8 @@ _FALLBACK = [
 _SPLITS = (1, 2, 4, 8, 16)
 
 
-def _runs(b: int, n: int, k: int, scale_args: dict, cfg: dict) -> bool:
+def bmm_config_runs(b: int, n: int, k: int, scale_args: dict, cfg: dict) -> bool:
+    """Whether cfg runs the shape; ``scale_args`` are check_bmm_config's."""
     try:
         check_bmm_config(n, k, b, **cfg, **scale_args)
     except ValueError:
@@ -174,7 +175,7 @@ def pick_bmm_kernel_name(
         "w_scale_k": w_scale_k,
         "x_scale_transposed": x_scale_transposed,
     }
-    runs = functools.partial(_runs, b, n, k, scale_args)
+    runs = functools.partial(bmm_config_runs, b, n, k, scale_args)
     for cfg in _variants(dict(zip(_FALLBACK_FIELDS, tile)), b_direct):
         tiles = ceildiv(m, cfg["tile_m"]) * (n // cfg["tile_n"]) * b
         splits = _max_split(cfg, tiles, runs)
@@ -202,7 +203,7 @@ def bmm_candidate_names(
     it. ``scale_args`` are check_bmm_config's. Split K keeps its own tile
     order, so a split variant drops the seed's xcd_order and xcd_swizzle (a
     split ``_xcd`` name runs the same kernel as the plain one)."""
-    runs = functools.partial(_runs, b, n, k, scale_args)
+    runs = functools.partial(bmm_config_runs, b, n, k, scale_args)
     names = set(seeds)
     try:
         names.add(pick_bmm_kernel_name(b, m, n, k, **scale_args))

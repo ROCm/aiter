@@ -357,7 +357,7 @@ def launch_bmm_a8w8_mxscale(
     contiguous run of tiles so neighbours share its L2. x_scale_k and
     w_scale_n x w_scale_k are the e8m0 block edges, each 32 or 128.
     w_scale_n may also be 1 with w_scale_k 32 (1x32), a scale per B row.
-    xcd_swizzle > 0 re-tiles the xcd_order run M-major in groups of
+    xcd_swizzle >= 2 re-tiles the xcd_order run M-major in groups of
     xcd_swizzle M tiles, as xcd_remap_bx_by does.
     scale_preload loads a split's scales once instead of with every stage: no
     per-stage scale copies, but the panels take LDS for the whole K range.

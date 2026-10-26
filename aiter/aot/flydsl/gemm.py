@@ -129,6 +129,10 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
     MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK,
 )
+from aiter.ops.gemm_op_common import (
+    mxscale_bmm_groups_of_block,
+    mxscale_w_scale_block_cell,
+)
 from aiter_worker_limits import adopt_legacy_max_jobs
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -235,9 +239,9 @@ def _bmm_mfma_job(
         "cu_num": 0,  # the gfx column names the arch
         "gfx": row.get("gfx", "").strip(),
         "b": b,
-        # A table from before the column, or a blank cell, holds 128x128 rows
-        # (as the runtime loaders read it).
-        "w_scale_block": (row.get("w_scale_block") or "128x128").strip(),
+        # A table from before the column, or a blank / 0 cell, holds 128x128
+        # rows (as the runtime loaders read it).
+        "w_scale_block": mxscale_w_scale_block_cell(row.get("w_scale_block")),
         "x_scale_transposed": x_scale_transposed,
         **params,
     }
@@ -344,9 +348,12 @@ def parse_csv(csv_path: str):
         gfx = row.get("gfx", "").strip()
         # Their kernels read the row's raw w_scale block: the mxfp8 table is
         # 1x32 (a row from before the column is one), the blockscale table's
-        # "mxfp8" rows 32x32 / 128x128 too.
+        # "mxfp8" rows 32x32 / 128x128 too (128x128 for a blank cell, as the
+        # runtime loader reads it).
         raw_scales = mxfp8_table or row.get("kernelId", "").strip() == "mxfp8"
-        mxfp8_block = (row.get("w_scale_block") or "1x32").strip()
+        mxfp8_block = mxscale_w_scale_block_cell(
+            row.get("w_scale_block"), "1x32" if mxfp8_table else "128x128"
+        )
         if raw_scales and (
             mxfp8_block not in MXFP8_ROW_SCALES_BY_W_SCALE_BLOCK
             or (mxfp8_table and mxfp8_block != "1x32")
@@ -359,7 +366,7 @@ def parse_csv(csv_path: str):
             # by the transposed kernel except at M = 1), else 1x32.
             layouts = (
                 (False, True)
-                if (row.get("w_scale_block") or "128x128").strip() == "128x128"
+                if mxscale_w_scale_block_cell(row.get("w_scale_block")) == "128x128"
                 else (False,)
             )
             for transposed in layouts:
@@ -956,8 +963,6 @@ def _compile_bmm_mfma_to_cache(
     """Compile a gfx950 mxscale BMM through the runtime's own launch path, so
     run_bmm_a8w8_mxfp8_gfx950 hits this cache entry."""
     del kwargs
-    from aiter.ops.opus.policy import mxscale_bmm_groups_of_block
-
     rows, cols = mxscale_bmm_groups_of_block(w_scale_block)
     # Rows run with 1 x cols x_scale blocks (column-major only for 1x128).
     with compile_only_env():

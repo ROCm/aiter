@@ -18,7 +18,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
-from .gemm_op_common import mxscale_w_scale_block
+from .gemm_op_common import mxscale_bmm_groups_of_block, mxscale_w_scale_block
 from .opus.policy import (
     resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
 )
@@ -309,12 +309,17 @@ def batched_gemm_a8w8_mxscale(
 
 
 @functools.lru_cache(maxsize=1024)
-def _opus_1x32_bpreshuffle_kid(g: int, m: int, n: int, k: int, dtype) -> int | None:
-    """OPUS's preshuffled 1x32 kid for an untuned shape, or None if none runs it."""
+def _opus_bpreshuffle_kid(
+    g: int, m: int, n: int, k: int, w_scale_block: str, dtype
+) -> int | None:
+    """OPUS's preshuffled kid for a shape, or None if none runs it. The pick
+    depends on M, so each M is searched once; the kid is passed on, so OPUS
+    does not search again."""
     from .opus.policy import _heuristic_mxscale_bmm_bpreshuffle_kid
 
+    group_n, group_k = mxscale_bmm_groups_of_block(w_scale_block)
     return _heuristic_mxscale_bmm_bpreshuffle_kid(
-        g, m, n, k, group_size=32, group_n=1, output_dtype=dtype
+        g, m, n, k, group_size=group_k, group_n=group_n, output_dtype=dtype
     )
 
 
@@ -332,6 +337,7 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     faster of opus and flydsl for its shape and w_scale block -- so the row's
     libtype picks the backend. A shape without a row runs flydsl's heuristic,
     or for 1x32 on gfx950 OPUS's, when one of its kids runs the shape.
+    gfx950's flydsl writes bf16 only, so another output runs OPUS there too.
     """
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
@@ -342,23 +348,25 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     )
     libtype = cfg["libtype"] if cfg is not None else "flydsl"
     kid = None
-    if cfg is None and w_scale_block == "1x32" and get_gfx() == "gfx950":
-        # OPUS off the table where one of its kids runs the shape (N a
-        # multiple of 16, K of 128, bf16 or fp32 out), else flydsl's heuristic,
-        # which writes bf16 only.
-        kid = _opus_1x32_bpreshuffle_kid(g, m, n, k, dtype)
+    if (
+        libtype == "flydsl"
+        and get_gfx() == "gfx950"
+        and (dtype != dtypes.bf16 or (cfg is None and w_scale_block == "1x32"))
+    ):
+        # OPUS where one of its kids runs the shape (N a multiple of 16, K of
+        # 128, bf16 or fp32 out).
+        kid = _opus_bpreshuffle_kid(g, m, n, k, w_scale_block, dtype)
         if kid is not None:
-            libtype = "opus"
+            libtype, cfg = "opus", None
         elif dtype != dtypes.bf16:
             raise NotImplementedError(
-                f"no preshuffled 1x32 mxscale BMM writes {dtype} at B:{g}, M:{m}, "
-                f"N:{n}, K:{k} on gfx950: no OPUS kid runs it, and flydsl writes "
-                "bf16 only"
+                f"no preshuffled {w_scale_block} mxscale BMM writes {dtype} at "
+                f"B:{g}, M:{m}, N:{n}, K:{k} on gfx950: no OPUS kid runs it, and "
+                "flydsl writes bf16 only"
             )
 
     if libtype == "opus":
         from .opus.gemm_op_a8w8 import bmm_a8w8_mxscale_opus_bpreshuffle
-        from .opus.policy import mxscale_bmm_groups_of_block
 
         group_n, group_k = mxscale_bmm_groups_of_block(w_scale_block)
 

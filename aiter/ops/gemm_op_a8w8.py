@@ -896,7 +896,15 @@ def _load_mxscale_bpreshuffle_tuned() -> dict:
     """{(gfx, cu_num, M, N, K, w_scale_block): row} of the e8m0 block-scale
     table for preshuffled weights."""
     path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
-    df = with_mxscale_w_scale_block(pd.read_csv(path).drop_duplicates(), path)
+    df = with_mxscale_w_scale_block(pd.read_csv(path), path).drop_duplicates()
+    # A blank cell read as 128x128 can repeat a 128x128 row's shape.
+    repeated = df.duplicated(_MXSCALE_BPRESHUFFLE_KEYS)
+    if repeated.any():
+        logger.warning(
+            f"{path}: {int(repeated.sum())} rows repeat a tuned shape; "
+            f"using the first row of each."
+        )
+        df = df[~repeated]
     return df.set_index(_MXSCALE_BPRESHUFFLE_KEYS).to_dict("index")
 
 
@@ -942,7 +950,11 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     n = WQ.shape[0]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
     x_block = k // x_scale.shape[-1]
-    config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block)
+    # Rows are tuned with the x_scale block that goes with their w_scale's
+    # (1x128 with 128x128, else 1x32); bmm reads every other pairing too, its
+    # heuristic picks.
+    paired = x_block == (_BLOCKSCALE_X_BLOCK if w_scale_block == "128x128" else 32)
+    config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block) if paired else None
     backend = None if config is None else str(config["kernelId"])
     if config is not None and (
         config["libtype"] != "flydsl" or backend not in _MXSCALE_RAW_KERNEL_IDS
@@ -951,11 +963,6 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
             f"mxscale bpreshuffle row {config['libtype']}/{config['kernelId']} "
             f"has no implementation"
         )
-    # Rows are tuned with the x_scale block that goes with their w_scale's
-    # (1x128 with 128x128, else 1x32); bmm reads every other pairing too, its
-    # heuristic picks.
-    if x_block != (_BLOCKSCALE_X_BLOCK if w_scale_block == "128x128" else 32):
-        config = backend = None
     if backend == MXSCALE_MXFP8_KERNEL_ID:
         from .flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
 
