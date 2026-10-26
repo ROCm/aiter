@@ -861,6 +861,26 @@ def test_grouped_a4w4_situv2_kimi_k3_tp8_matches_torch_ref(tokens):
     )
 
 
+# The same shape with a GEMM2 k-tile that 384 does not divide, as a tuned row or
+# AITER_TDM_TILE_K2 may pick: 256 runs one full tile and a 128-wide tail, 512 a
+# single ragged tile (K < tile_k). 2048 has no row, so the other tiles are the
+# defaults.
+@pytest.mark.parametrize("tile_k2", [256, 512])
+def test_grouped_a4w4_situv2_kimi_k3_tp8_k_tail_matches_torch_ref(tile_k2, monkeypatch):
+    monkeypatch.setenv("AITER_TDM_TILE_K2", str(tile_k2))
+    run_moe(
+        "a4w4",
+        experts=896,
+        tokens=2048,
+        topk=16,
+        model_dim=3584,
+        inter_dim=384,
+        activation=ActivationType.Situv2,
+        use_bias=False,
+        check_aot_cache=False,
+    )
+
+
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)
