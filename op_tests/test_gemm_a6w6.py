@@ -224,7 +224,11 @@ def test_specialized_kernel_rejects_incompatible_physical_shape():
         gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, SPECIALIZED_SQUARE_KERNEL)
 
 
-def main():
+def main() -> int:
+    pytest_result = pytest.main([__file__, "-q"])
+    if pytest_result != pytest.ExitCode.OK:
+        return int(pytest_result)
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
@@ -280,7 +284,7 @@ def main():
 
         if get_gfx() != "gfx950":
             aiter.logger.info("--all-kernels requires gfx950; skipping")
-            return
+            return 0
     results = []
     for dtype in args.dtype:
         for m, n, k in args.shape:
@@ -295,7 +299,8 @@ def main():
     aiter.logger.info(
         "gemm_a6w6 summary (markdown):\n%s", frame.to_markdown(index=False)
     )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
