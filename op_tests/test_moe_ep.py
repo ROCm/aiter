@@ -4,11 +4,14 @@
 import argparse
 import csv
 import os
+from contextlib import nullcontext
 
 import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes, get_gfx, pertoken_quant
+from aiter.aot.flydsl.common import run_only_env
+from aiter.aot.flydsl.moe import DEFAULT_EP_PROFILES, read_ep_profiles
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -17,7 +20,12 @@ from aiter.fused_moe import (
     torch_moe_stage2,
 )
 from aiter.fused_moe_bf16_asm import asm_moe
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.jit.utils.chip_info import get_cu_num
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+)
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import (
     moe_shuffle_scale,
@@ -399,6 +407,71 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     return float(1 - 2 * (x * y).sum() / denom)
 
 
+def _ep_reference(
+    quant_label,
+    hidden,
+    topk_ids,
+    topk_weights,
+    expert_mask,
+    weights,
+    *,
+    activation,
+    beta,
+    linear_beta,
+    dtype,
+):
+    """fp32 reference of this rank's experts on the same MXFP4 weights. The
+    a4w4 kernels quantize both stages' activations to MXFP4 and so does the
+    reference; the a8w4 one keeps bf16 activations."""
+    w1_qt, w1_scale, w2_qt, w2_scale = weights
+    local_ids = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
+    local_ids[expert_mask == 0] = -1
+    local_ids = local_ids[topk_ids.long()]
+    situ = {}
+    if activation == ActivationType.Situv2:
+        situ = {"situ_beta": beta, "situ_linear_beta": linear_beta}
+    a1, a1_scale = hidden, None
+    if quant_label == "a4w4_mxfp4":
+        a1, a1_scale = per_1x32_f4_quant(
+            hidden, quant_dtype=dtypes.fp4x2, shuffle=False
+        )
+    a2 = torch_moe_stage1(
+        a1,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        local_ids,
+        dtype=dtype,
+        activation=activation,
+        quant_type=QuantType.per_1x32,
+        a1_scale=a1_scale,
+        w1_scale=w1_scale,
+        **situ,
+    )
+    a2_scale = None
+    if quant_label == "a4w4_mxfp4":
+        rows, topk = local_ids.shape
+        inter_dim = a2.shape[-1]
+        a2, a2_scale = per_1x32_f4_quant(
+            a2.contiguous().view(rows * topk, inter_dim),
+            quant_dtype=dtypes.fp4x2,
+            shuffle=False,
+        )
+        a2 = a2.view(rows, topk, inter_dim // 2)
+    return torch_moe_stage2(
+        a2,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        local_ids,
+        dtype=dtype,
+        quant_type=QuantType.per_1x32,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        doweight=True,
+    )
+
+
 summary_table = []
 
 DEFAULT_EP_CSV_PATHS = [
@@ -503,9 +576,16 @@ def test_fmoe_ep_mxfp4(
     fake_ep_rank=0,
     const_init=None,
     activation=ActivationType.Silu,
+    check_aot=False,
+    profile=None,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
-    quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
+    quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}; activation Silu or Situv2
+    (with the Kimi-K3 betas).
+
+    check_aot runs fused_moe in FlyDSL run-only mode, so a kernel missing from
+    the AOT cache fails the case, and holds the result to logits_diff < 0.01.
+    profile names the EP deployment profile the case reproduces.
 
     ep_mode selects how tokens/routing reach fused_moe:
       * "real" (default): simulate MORI dispatch. `token` is the GLOBAL token count;
@@ -762,78 +842,28 @@ def test_fmoe_ep_mxfp4(
     w1_qt, w1_scale = _per_1x32_mxfp4_quant(w1)
     w2_qt, w2_scale = _per_1x32_mxfp4_quant(w2)
 
-    # Reference uses the dequantized mxfp4 weights so the comparison is
-    # apples-to-apples (kernel sees the same quantized values). Mirrors the
-    # mxfp4_to_f32 + e8m0_to_f32 dequant in aiter/fused_moe.py:2018-2021 and
-    # the quantized-weight reference path in test_moe_2stage.py:333-345.
-    def _dequant(w_qt, w_scale, orig_shape):
-        wf = fp4_utils.mxfp4_to_f32(w_qt).view(*orig_shape)
-        sf = fp4_utils.e8m0_to_f32(w_scale).view(orig_shape[0], orig_shape[1], -1)
-        sf = sf.unsqueeze(-1).expand(-1, -1, -1, 32).reshape(*orig_shape)
-        return (wf * sf).to(dtype)
-
-    w1_deq = _dequant(w1_qt, w1_scale, w1.shape)
-    w2_deq = _dequant(w2_qt, w2_scale, w2.shape)
-    if _gfx == "gfx1250" and quant_label == "a4w4_mxfp4":
-        # Match both activation quantization points in the grouped A4W4 path.
-        # The generic BF16 reference above otherwise compares against A16W4
-        # and overstates the numerical error from the two MXFP4 round trips.
-        local_topk_ids = torch.where(
-            (ref_topk_ids >= local_expert_start) & (ref_topk_ids < local_expert_end),
-            ref_topk_ids - local_expert_start,
-            torch.where(
-                (ref_topk_ids >= E) & (ref_topk_ids < E + shared_E),
-                ref_topk_ids - E + local_E,
-                -1,
-            ),
-        )
-        a1_q, a1_scale = per_1x32_f4_quant(
-            ref_input, quant_dtype=dtypes.fp4x2, shuffle=False
-        )
-        a2 = torch_moe_stage1(
-            a1_q,
-            w1_qt,
-            w2_qt,
-            ref_topk_weights,
-            local_topk_ids,
-            dtype=dtype,
-            activation=activation,
-            quant_type=QuantType.per_1x32,
-            a1_scale=a1_scale,
-            w1_scale=w1_scale,
-        )
-        ref_rows, ref_topk = local_topk_ids.shape
-        a2_q, a2_scale = per_1x32_f4_quant(
-            a2.contiguous().view(ref_rows * ref_topk, inter_dim),
-            quant_dtype=dtypes.fp4x2,
-            shuffle=False,
-        )
-        ref = torch_moe_stage2(
-            a2_q.view(ref_rows, ref_topk, inter_dim // 2),
-            w1_qt,
-            w2_qt,
-            ref_topk_weights,
-            local_topk_ids,
-            dtype=dtype,
-            quant_type=QuantType.per_1x32,
-            w2_scale=w2_scale,
-            a2_scale=a2_scale,
-            doweight=True,
-        )
-    else:
-        ref, _ = torch_moe_test(
-            ref_input,
-            w1_deq,
-            w2_deq,
-            ref_topk_weights,
-            ref_topk_ids,
-            expert_mask=expert_mask,
-            activation=activation,
-        )
+    beta = linear_beta = None
+    if activation == ActivationType.Situv2:
+        beta, linear_beta = DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
+    ref = _ep_reference(
+        quant_label,
+        ref_input,
+        ref_topk_ids,
+        ref_topk_weights,
+        expert_mask,
+        (w1_qt, w1_scale, w2_qt, w2_scale),
+        activation=activation,
+        beta=beta,
+        linear_beta=linear_beta,
+        dtype=dtype,
+    )
+    # Pinned as serving and the AOT replay pin it. Left to fused_moe, gfx950
+    # takes bf16 activations at small M (at every M for SiTUv2), which expert
+    # masking refuses, and gfx1250 fp4 unless AITER_FORCE_A8W4 is set.
+    quant_dtype_a = dtypes.fp8 if quant_label == "a8w4_mxfp4" else dtypes.fp4x2
 
     if _gfx == "gfx1250":
-        # gfx1250 grouped GEMM path: FlyDSL grouped layout. Weights stay uint8;
-        # resolve_activation_dtype selects fp8 for a8w4 and fp4 for a4w4.
+        # gfx1250 grouped GEMM path: FlyDSL grouped layout. Weights stay uint8.
         w1_u8 = w1_qt.view(torch.uint8)
         w2_u8 = w2_qt.view(torch.uint8)
         # gugu (INTERLEAVE) stage1 layout so the EP path is routed through the
@@ -852,12 +882,6 @@ def test_fmoe_ep_mxfp4(
         )
         w2_s = moe_shuffle_scale(w2_scale.contiguous(), experts_cnt=total_local)
         gate_mode = GateMode.INTERLEAVE.value
-        act = activation
-        if quant_label == "a8w4_mxfp4":
-            os.environ["AITER_FORCE_A8W4"] = "1"
-        else:
-            os.environ.pop("AITER_FORCE_A8W4", None)
-        os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
     elif quant_label == "a8w4_mxfp4":
         # gfx950 a8w4 (fp8 activations, mxfp4 weights): use the CK a16w4 layout
         # — weights interleaved on N (gate/up) — paired with gate_mode=INTERLEAVE
@@ -867,12 +891,7 @@ def test_fmoe_ep_mxfp4(
         w1_s = shuffle_scale_a16w4(w1_scale, total_local, True)
         w2_a = shuffle_weight_a16w4(w2_qt, 16, False)
         w2_s = shuffle_scale_a16w4(w2_scale, total_local, False)
-        act = activation
         gate_mode = GateMode.INTERLEAVE.value
-        # Force the fp8 (a8w4) kernel regardless of token count. Below the
-        # default AITER_BF16_FP8_MOE_BOUND (256) the picker selects bf16/a16w4,
-        # which for Silu at ksplit<=1 has no kernel and dispatch-crashes.
-        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     elif quant_label == "a4w4_mxfp4":
         # gfx950 a4w4 (fp4 activations, mxfp4 weights): FlyDSL fp4/fp4 layout —
         # shuffle (16,16) + e8m0 scale shuffle, gate/up separated. Matches
@@ -883,10 +902,28 @@ def test_fmoe_ep_mxfp4(
         w2_s = fp4_utils.e8m0_shuffle(w2_scale)
         w1_a.is_shuffled = True
         w2_a.is_shuffled = True
-        act = activation
         gate_mode = GateMode.SEPARATED.value
     else:
         raise ValueError(f"unknown quant_label: {quant_label}")
+    moe_kwargs = {
+        "expert_mask": expert_mask,
+        "activation": activation,
+        "gate_mode": gate_mode,
+        "quant_type": QuantType.per_1x32,
+        "w1_scale": w1_s,
+        "w2_scale": w2_s,
+        "num_local_tokens": num_local_tokens,
+        "quant_dtype_a": quant_dtype_a,
+        "beta": beta,
+        "linear_beta": linear_beta,
+    }
+    _msg = (
+        f"{quant_label} {activation.name} ep={ep} token={token}"
+        f"(recv={total_recv}, trim_M={trim_M}) model_dim={model_dim} "
+        f"inter_dim={inter_dim} E={E} topk={topk} shared_E={shared_E}"
+    )
+    if profile:
+        _msg = f"[{profile}] {_msg}"
     # Optional per-kernel (gemm1/gemm2) timing, gated by AITER_EP_KERNEL_BENCH=1.
     # Mirrors the TP test's --scenario kernel: one eager fused_moe call with the
     # grouped kernel_bench hook set captures the gemm1/gemm2 launch callables,
@@ -899,68 +936,54 @@ def test_fmoe_ep_mxfp4(
     )
     gemm1_us = None
     gemm2_us = None
-    activation_params = (
-        {"beta": 4.0, "linear_beta": 25.0}
-        if activation == ActivationType.Situv2
-        else {}
-    )
-    if _ep_kernel_bench and _gfx == "gfx1250":
-        from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
+    try:
+        with run_only_env() if check_aot else nullcontext():
+            if _ep_kernel_bench and _gfx == "gfx1250":
+                from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
 
-        _cap: list = []
-        _grouped.kernel_bench_callable = _cap
-        try:
-            out = fused_moe(
-                input_,
-                w1_a,
-                w2_a,
-                topk_weights,
-                topk_ids,
-                expert_mask=expert_mask,
-                activation=act,
-                gate_mode=gate_mode,
-                quant_type=QuantType.per_1x32,
-                w1_scale=w1_s,
-                w2_scale=w2_s,
-                num_local_tokens=num_local_tokens,
-                **activation_params,
-            )
-        finally:
-            _grouped.kernel_bench_callable = None
-        _ku = {}
-        for _name, _callable in _cap:
-            _, _u = run_perftest(
-                _callable, num_warmup=50, num_iters=101, testGraph=False
-            )
-            _ku[_name] = _u
-        gemm1_us = _ku.get("gemm1")
-        gemm2_us = _ku.get("gemm2")
-        us = (gemm1_us or 0.0) + (gemm2_us or 0.0)
-        _g1s = "n/a" if gemm1_us is None else f"{gemm1_us:.2f}"
-        _g2s = "n/a" if gemm2_us is None else f"{gemm2_us:.2f}"
-        print(
-            f"[ep-kernel-bench] {quant_label} token={token}(local={total_recv}) "
-            f"gemm1 us = {_g1s} gemm2 us = {_g2s}"
-        )
-    else:
-        out, us = run_perftest(
-            fused_moe,
-            input_,
-            w1_a,
-            w2_a,
-            topk_weights,
-            topk_ids,
-            expert_mask=expert_mask,
-            activation=act,
-            gate_mode=gate_mode,
-            quant_type=QuantType.per_1x32,
-            w1_scale=w1_s,
-            w2_scale=w2_s,
-            num_local_tokens=num_local_tokens,
-            num_warmup=3,
-            num_iters=128,
-            **activation_params,
-        )
+                _cap: list = []
+                _grouped.kernel_bench_callable = _cap
+                try:
+                    out = fused_moe(
+                        input_, w1_a, w2_a, topk_weights, topk_ids, **moe_kwargs
+                    )
+                finally:
+                    _grouped.kernel_bench_callable = None
+                _ku = {}
+                for _name, _callable in _cap:
+                    _, _u = run_perftest(
+                        _callable, num_warmup=50, num_iters=101, testGraph=False
+                    )
+                    _ku[_name] = _u
+                gemm1_us = _ku.get("gemm1")
+                gemm2_us = _ku.get("gemm2")
+                us = (gemm1_us or 0.0) + (gemm2_us or 0.0)
+                _g1s = "n/a" if gemm1_us is None else f"{gemm1_us:.2f}"
+                _g2s = "n/a" if gemm2_us is None else f"{gemm2_us:.2f}"
+                print(
+                    f"[ep-kernel-bench] {quant_label} token={token}"
+                    f"(local={total_recv}) gemm1 us = {_g1s} gemm2 us = {_g2s}"
+                )
+            else:
+                out, us = run_perftest(
+                    fused_moe,
+                    input_,
+                    w1_a,
+                    w2_a,
+                    topk_weights,
+                    topk_ids,
+                    **moe_kwargs,
+                    num_warmup=3,
+                    num_iters=128,
+                )
+    except RuntimeError as error:
+        if check_aot and "FLYDSL_RUNTIME_RUN_ONLY" in str(error):
+            raise RuntimeError(
+                f"{_msg}: FlyDSL AOT cache miss. Build the EP profiles into the "
+                "same FLYDSL_RUNTIME_CACHE_DIR first: python -m "
+                "aiter.aot.flydsl.moe --ep-profile <profile csv>"
+            ) from error
+        raise
 
     # Trim to valid prefix (total_recv rows); the [total_recv, trim_M) tail is padding.
     out = out[:total_recv]
@@ -971,14 +994,10 @@ def test_fmoe_ep_mxfp4(
     rel_mean = (abs_err / (ref.float().abs() + 1e-6)).mean().item()
     logits_diff = _calc_diff(ref, out)
 
-    _msg = (
-        f"{quant_label} ep={ep} token={token}(recv={total_recv}, trim_M={trim_M}) "
-        f"model_dim={model_dim} inter_dim={inter_dim} E={E} topk={topk}"
-    )
-    if _gfx == "gfx1250":
-        # The grouped a8w4 path quantizes activations to fp8, so the reference
-        # (bf16 activations) differs elementwise by more than atol/rtol=5e-2
-        # even without EP. Use the grouped tests' cosine criterion instead
+    if check_aot or _gfx == "gfx1250":
+        # The a8w4 kernels quantize activations to fp8, so the reference (bf16
+        # activations) differs elementwise by more than atol/rtol=5e-2 even
+        # without EP. Use the grouped tests' cosine criterion instead
         # (flydsl_tests/test_flydsl_grouped_gemm.py: logits_diff < 0.01).
         _logits_diff_tol = 0.01
         err = logits_diff
@@ -995,9 +1014,11 @@ def test_fmoe_ep_mxfp4(
 
     summary_table.append(
         {
+            "profile": profile or "-",
+            "aot_check": check_aot,
             "quant": quant_label,
+            "act": activation.name,
             "ep_mode": ep_mode,
-            "activation": str(activation),
             "routing": routing,
             "global_token": token,
             "total_recv": total_recv,
@@ -1006,6 +1027,7 @@ def test_fmoe_ep_mxfp4(
             "inter_dim": inter_dim,
             "E": E,
             "topk": topk,
+            "shared_E": shared_E,
             "ep": ep,
             "us": round(us, 2),
             "gemm1_us": None if gemm1_us is None else round(gemm1_us, 2),
@@ -1019,6 +1041,70 @@ def test_fmoe_ep_mxfp4(
     )
 
 
+# Activation dtype of the MXFP4 profiles test_fmoe_ep_mxfp4 can build.
+_PROFILE_QUANTS = {"float8_e4m3fn": "a8w4_mxfp4", "float4_e2m1fn_x2": "a4w4_mxfp4"}
+
+
+def _name(value):
+    """``QuantType.per_1x32`` -> ``per_1x32``, ``torch.bfloat16`` -> ``bfloat16``."""
+    return str(value or "").strip().split(".")[-1]
+
+
+def _profile_ep_args(profile, ep_mode):
+    """test_fmoe_ep_mxfp4 arguments whose fused_moe call has the profile's
+    local expert count, routing columns and mask length. The mask holds E
+    routed experts, shared_E fused shared ones and a sentinel; a rank holds
+    E // ep routed experts plus the shared ones. Real mode routes topk columns
+    plus shared_E + 1 shared or masked ones, fake mode topk local ones."""
+    local, columns, mask = (
+        int(profile[key]) for key in ("expert", "topk", "expert_mask_size")
+    )
+    for shared_E in range(local):
+        E = mask - 1 - shared_E
+        if E % (local - shared_E):
+            continue
+        topk = columns - shared_E - 1 if ep_mode == "real" else columns
+        if 1 <= topk <= (E if ep_mode == "real" else local - shared_E):
+            return {
+                "E": E,
+                "topk": topk,
+                "shared_E": shared_E,
+                "ep": E // (local - shared_E),
+            }
+    raise ValueError(
+        f"no {ep_mode}-mode EP layout has {local} local experts, "
+        f"{columns} routing columns and a {mask}-entry expert mask"
+    )
+
+
+def _aot_ep_profiles(paths):
+    """(profile, quant label, activation) of each EP deployment profile in
+    ``paths`` that runs on this GPU and that test_fmoe_ep_mxfp4 can build."""
+    gfx, cu_num = get_gfx(), get_cu_num()
+    profiles = []
+    for path in paths:
+        for profile in read_ep_profiles(path):
+            if profile["gfx"] != gfx or int(profile["cu_num"]) != cu_num:
+                continue
+            quant = _PROFILE_QUANTS.get(_name(profile["q_dtype_a"]))
+            act = _name(profile["act_type"])
+            if (
+                quant is None
+                or _name(profile["q_type"]) != "per_1x32"
+                or _name(profile["q_dtype_w"]) != "float4_e2m1fn_x2"
+                or act not in ("Silu", "Situv2")
+                or (profile.get("use_g1u1") or "1") != "1"
+                or (profile.get("doweight_stage1") or "0") != "0"
+            ):
+                print(
+                    f"skip EP profile {profile.get('model')}: not an MXFP4 "
+                    "a8w4/a4w4 Silu/SiTUv2 g1u1 case"
+                )
+                continue
+            profiles.append((profile, quant, getattr(ActivationType, act)))
+    return profiles
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="select test",
@@ -1029,6 +1115,9 @@ parser.add_argument(
     type=str,
     nargs="*",
     default=[
+        # First, so kernels the other tests JIT-compile in this process cannot
+        # satisfy its cache check.
+        "aot_ep_profiles",
         "test_fmoe_16_bit",
         "g1u1_no_quant",
         "g1u1_int8quant",
@@ -1041,6 +1130,10 @@ parser.add_argument(
     ],
     help="""Select test to run.
     e.g.: -t g1u1_int8quant
+          or -t aot_ep_profiles          (EP deployment profiles of the AOT build,
+                                          per_1x32 mxfp4, FlyDSL run-only: fails on
+                                          any kernel missing from the AOT cache;
+                                          gfx950/gfx1250)
           or -t test_fmoe_16_bit
           or -t g1u1_no_quant
           or -t g1u1_int8quant
@@ -1121,7 +1214,8 @@ parser.add_argument(
     type=str,
     choices=["real", "fake"],
     default="real",
-    help="""Routing model for the mxfp4 EP tests (g1u1_a8w4_mxfp4/g1u1_a4w4_mxfp4):
+    help="""Routing model for the mxfp4 EP tests (aot_ep_profiles,
+    g1u1_a8w4_mxfp4, g1u1_a4w4_mxfp4):
     real = simulate MORI dispatch: -m is GLOBAL tokens, dedup + mask, only
            ~1/ep of routes land locally (total_recv <= token).
            AITER_MOE_EXPERT_BALANCE=true balances routing across global experts
@@ -1152,6 +1246,17 @@ parser.add_argument(
     Mirrors flydsl_tests/test_flydsl_grouped_gemm.py --const-init.""",
 )
 
+parser.add_argument(
+    "--ep-profile",
+    type=str,
+    nargs="*",
+    default=DEFAULT_EP_PROFILES,
+    help="""EP deployment profile table(s) aot_ep_profiles runs, each profile at
+    every -m token count up to its max_token (default: the AOT build's,
+    aiter/aot/flydsl/moe_ep_profiles.csv). Precompile the same tables into
+    FLYDSL_RUNTIME_CACHE_DIR first:
+      python -m aiter.aot.flydsl.moe --ep-profile <csv>""",
+)
 parser.add_argument(
     "--seed", type=int, default=0, help="Random input and routing seed."
 )
@@ -1187,7 +1292,32 @@ if "ep_csv" in args.test:
 
 for test in args.test:
     print(f"\nRunning test: {test}")
-    if test == "test_fmoe_16_bit":
+    if test == "aot_ep_profiles":
+        if gpu_arch not in ("gfx950", "gfx1250"):
+            print(f"skip {test}: mxfp4 requires gfx950/gfx1250, got {gpu_arch}")
+            continue
+        for profile, label, act in _aot_ep_profiles(args.ep_profile):
+            ep_args = _profile_ep_args(profile, args.ep_mode)
+            for m in args.token:
+                # Real mode needs token // ep >= 1 source tokens per rank.
+                if m > int(profile["max_token"]) or (
+                    args.ep_mode == "real" and m < ep_args["ep"]
+                ):
+                    continue
+                test_fmoe_ep_mxfp4(
+                    label,
+                    m,
+                    int(profile["model_dim"]),
+                    int(profile["inter_dim"]),
+                    **ep_args,
+                    ep_mode=args.ep_mode,
+                    fake_ep_rank=args.fake_ep_rank,
+                    const_init=args.const_init,
+                    activation=act,
+                    check_aot=True,
+                    profile=profile.get("model") or "-",
+                )
+    elif test == "test_fmoe_16_bit":
         print("test test_fmoe 16 bit")
         # print("\ng1u0 no quant")
         # for dtype in [dtypes.fp16, dtypes.bf16]:
