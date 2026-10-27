@@ -135,6 +135,14 @@ def get_gfx_runtime() -> str:
     return gfx_arch
 
 
+def _parse_asic_revision(value: str) -> int:
+    """Parse rocminfo/hipinfo decimal or hex ASIC Revision, not chip revision."""
+    token = value.split("(", 1)[0].strip()
+    if not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", token):
+        raise ValueError(f"invalid ASIC Revision {value!r}")
+    return int(token, 16 if token.lower().startswith("0x") else 10)
+
+
 @functools.lru_cache(maxsize=1)
 def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
     """(arch, asicRevision) of every GPU agent rocminfo reports.
@@ -161,7 +169,7 @@ def _rocminfo_gpu_agents() -> list[tuple[str, int]]:
         elif key == "Device Type":
             kind = value
         elif key == "ASIC Revision":
-            rev = int(value.split("(")[0])
+            rev = _parse_asic_revision(value)
         if kind == "GPU" and name is not None and rev is not None:
             agents.append((name.lower(), rev))
             name = kind = rev = None
@@ -177,9 +185,9 @@ def _hipinfo_gpu_agents() -> list[tuple[str, int]]:
         name = re.search(
             r"^gcnArchName:\s*(gfx\w+)", block, re.MULTILINE | re.IGNORECASE
         )
-        rev = re.search(r"^asicRevision:\s*(\d+)", block, re.MULTILINE)
+        rev = re.search(r"^asicRevision:\s*(0[xX][0-9a-fA-F]+|\d+)", block, re.MULTILINE)
         if name and rev:
-            agents.append((name.group(1).lower(), int(rev.group(1))))
+            agents.append((name.group(1).lower(), _parse_asic_revision(rev.group(1))))
     return agents
 
 

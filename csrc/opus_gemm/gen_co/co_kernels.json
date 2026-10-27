@@ -10,7 +10,7 @@
     "  tag            kernel_tag; selects the codegen emit branch and the traits/kargs names.",
     "  block_size     threads per workgroup. MUST equal launch_bounds[0].",
     "  tile           [B_M, B_N, B_K].",
-    "  num_slots      LDS prefetch ring depth P. The 4wave pipeline hardcodes 3.",
+    "  num_slots      LDS prefetch ring depth P: compute/wl use 3; wlr uses 4.",
     "  cluster        [cluster_wg_m, cluster_wg_n] -> __cluster_dims__(m, n, 1).",
     "  launch_bounds  [maxThreadsPerBlock, minWavesPerEU] -> __launch_bounds__.",
     "  num_vgpr       amdgpu_num_vgpr(N) on the entry point; 0 omits the attribute.",
