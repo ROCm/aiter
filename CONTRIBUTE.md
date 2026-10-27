@@ -453,40 +453,9 @@ Examples:
 
 ### PR Description Template
 
-```markdown
-## Summary
-Brief description of changes
-
-## Motivation
-Why is this change needed?
-
-## Changes
-- Detailed list of changes
-- Impact on existing code
-
-## Performance (if applicable)
-| Configuration | Before | After | Improvement |
-|---------------|--------|-------|-------------|
-| ...           | ...    | ...   | ...         |
-
-## Testing
-- [ ] Unit tests added/updated
-- [ ] Performance benchmarks run
-- [ ] Tested on MI250X
-- [ ] Tested on MI300X
-
-## Documentation
-- [ ] Docstrings updated
-- [ ] User guide updated
-- [ ] Performance guide updated
-
-## Dependencies
-- [ ] No new third-party dependencies added
-- [ ] If new dependencies added, justification provided
-
-## Breaking Changes
-List any breaking changes and migration guide
-```
+GitHub automatically loads `.github/pull_request_template.md`. Complete its
+summary and PR Self-Review sections, and add performance, documentation,
+dependency or migration details when they apply to the change.
 
 ### Code Review Process
 
@@ -502,7 +471,8 @@ A pull request is ready for human review only when:
 * Validation evidence and anything still unverified are stated.
 * The PR-specific question is answered.
 * Every changed `op_tests/` file has a stated, non-redundant purpose.
-* Current Copilot findings have a substantive author reply and are resolved.
+* Current Copilot findings have a substantive author reply. Resolving the
+  conversation is recommended but does not block readiness.
 * Black, Ruff, repository dependency and Aiter Test Gate checks pass.
 
 Any new push invalidates the previous self-review until the author updates the

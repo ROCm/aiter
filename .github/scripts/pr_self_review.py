@@ -12,7 +12,6 @@ the repository variable ``AITER_PR_SELF_REVIEW_MODE=enforce`` only after shadow 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -43,7 +42,7 @@ ARTIFACT_PATTERNS = (
 )
 CONFLICT_MARKER = re.compile(r"^(?:\+)(?:<<<<<<<|=======|>>>>>>>)", re.MULTILINE)
 DEBUG_LINE = re.compile(
-    r"^\+.*(?:\bprint\s*\(|\bpdb\.set_trace\s*\(|\bbreakpoint\s*\(|DEBUG_ONLY|debug_printf)",
+    r"^\+\s*(?:pdb\.set_trace\s*\(|breakpoint\s*\(|DEBUG_ONLY\b|debug_printf\s*\()",
     re.MULTILINE,
 )
 
@@ -55,7 +54,7 @@ REQUIRED_CHECKS = {
     "Repository dependency": {"Repository dependency", "Check Repository Dependency"},
     "Aiter Test Gate": {"Aiter Test Gate"},
 }
-PASS_CONCLUSIONS = {"success", "neutral", "skipped"}
+PASS_CONCLUSIONS = {"success"}
 
 
 class APIError(RuntimeError):
@@ -72,7 +71,6 @@ class GitHub:
         path: str,
         method: str = "GET",
         body: Any = None,
-        accept: str = "application/vnd.github+json",
     ) -> Any:
         url = (
             path
@@ -81,7 +79,7 @@ class GitHub:
         )
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Accept", accept)
+        req.add_header("Accept", "application/vnd.github+json")
         req.add_header("X-GitHub-Api-Version", "2022-11-28")
         req.add_header("User-Agent", "aiter-pr-self-review")
         if self.token:
@@ -130,6 +128,7 @@ class GitHub:
 @dataclass
 class Result:
     head_sha: str
+    pr_url: str
     mode: str
     question: str
     author_issues: list[str] = field(default_factory=list)
@@ -138,7 +137,7 @@ class Result:
     hygiene_issues: list[str] = field(default_factory=list)
     hygiene_advisories: list[str] = field(default_factory=list)
     ci: dict[str, str] = field(default_factory=dict)
-    telemetry: dict[str, Any] = field(default_factory=dict)
+    answers: dict[str, str] = field(default_factory=dict)
 
     @property
     def ci_pending(self) -> bool:
@@ -171,10 +170,12 @@ def strip_comments(text: str) -> str:
 
 def sections(body: str) -> dict[str, str]:
     found: dict[str, str] = {}
-    heading = re.compile(r"^###\s+(.+?)\s*$", re.MULTILINE)
+    heading = re.compile(r"^(#{1,3})\s+(.+?)\s*$", re.MULTILINE)
     matches = list(heading.finditer(body or ""))
     for index, match in enumerate(matches):
-        name = match.group(1).strip()
+        if match.group(1) != "###":
+            continue
+        name = match.group(2).strip()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
         found[name] = strip_comments(body[match.end() : end])
     return found
@@ -212,7 +213,7 @@ def select_question(paths: list[str]) -> str:
 
 def validate_author_answers(
     body: str, head_sha: str, changed_tests: list[str]
-) -> tuple[list[str], dict[str, Any]]:
+) -> tuple[list[str], dict[str, str]]:
     parsed = sections(body)
     issues: list[str] = []
     for name in SECTION_NAMES:
@@ -277,31 +278,8 @@ def validate_author_answers(
             issues.append(
                 "`Changed op tests` must explain why each changed op test is necessary and non-redundant"
             )
-    elif test_answer and not re.search(r"\bnone\b|没有|无", test_answer, re.IGNORECASE):
-        # Informational only; an author may mention tests outside op_tests/.
-        pass
-
-    combined = "\n".join(parsed.get(name, "") for name in SECTION_NAMES[1:])
-    telemetry = {
-        "answer_units": word_count(combined),
-        "code_tokens": len(re.findall(r"`[^`]+`", combined)),
-        "paths_named": len(
-            re.findall(r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+", combined)
-        ),
-        "fingerprint": hashlib.sha256(
-            re.sub(r"\s+", " ", combined.lower()).encode()
-        ).hexdigest()[:12],
-        "answers": {name: parsed.get(name, "").strip() for name in SECTION_NAMES[1:]},
-    }
-    if (
-        telemetry["answer_units"] >= 120
-        and telemetry["code_tokens"] == 0
-        and telemetry["paths_named"] == 0
-    ):
-        telemetry["generic_warning"] = (
-            "long answer contains no code token or path; audit for generic/AI-generated prose"
-        )
-    return issues, telemetry
+    answers = {name: parsed.get(name, "").strip() for name in SECTION_NAMES[1:]}
+    return issues, answers
 
 
 def inspect_hygiene(
@@ -346,7 +324,6 @@ query($owner:String!, $repo:String!, $number:Int!) {
         nodes {
           author { login }
           body
-          submittedAt
           commit { oid }
         }
       }
@@ -355,7 +332,7 @@ query($owner:String!, $repo:String!, $number:Int!) {
           isResolved
           isOutdated
           comments(first:100) {
-            nodes { author { login } body createdAt }
+            nodes { author { login } body }
           }
         }
       }
@@ -452,19 +429,20 @@ def inspect_ci(api: GitHub, head_sha: str) -> dict[str, str]:
     return states
 
 
-def evaluate(api: GitHub, number: int, mode: str) -> tuple[Result, dict[str, Any]]:
+def evaluate(api: GitHub, number: int, mode: str) -> Result:
     pr = api.request(f"pulls/{number}")
     files = api.pages(f"pulls/{number}/files")
     head_sha = ((pr.get("head") or {}).get("sha")) or ""
     paths = [item.get("filename") or "" for item in files]
     hard, advisory, changed_tests = inspect_hygiene(files)
     author = ((pr.get("user") or {}).get("login")) or ""
-    author_issues, telemetry = validate_author_answers(
+    author_issues, answers = validate_author_answers(
         pr.get("body") or "", head_sha, changed_tests
     )
     copilot_issues, copilot_advisories = inspect_copilot(api, number, author)
     result = Result(
         head_sha=head_sha,
+        pr_url=pr.get("html_url") or "",
         mode=mode,
         question=select_question(paths),
         author_issues=author_issues,
@@ -473,9 +451,9 @@ def evaluate(api: GitHub, number: int, mode: str) -> tuple[Result, dict[str, Any
         hygiene_issues=hard,
         hygiene_advisories=advisory,
         ci=inspect_ci(api, head_sha),
-        telemetry=telemetry,
+        answers=answers,
     )
-    return result, pr
+    return result
 
 
 def icon(state: str) -> str:
@@ -493,7 +471,7 @@ def fenced_text(value: str) -> str:
     return f"{fence}\n{value.strip()}\n{fence}"
 
 
-def render(result: Result, pr: dict[str, Any]) -> str:
+def render(result: Result) -> str:
     ready = not result.blocking and not result.ci_pending
     conclusion = "READY FOR HUMAN REVIEW" if ready else "NOT READY FOR HUMAN REVIEW"
 
@@ -538,13 +516,12 @@ def render(result: Result, pr: dict[str, Any]) -> str:
                 "",
             ]
         )
-        answers = result.telemetry.get("answers", {})
         for name in SECTION_NAMES[1:]:
             lines.extend(
                 [
                     f"#### {name}",
                     "",
-                    fenced_text(answers.get(name, "")),
+                    fenced_text(result.answers.get(name, "")),
                     "",
                 ]
             )
@@ -583,7 +560,7 @@ def render(result: Result, pr: dict[str, Any]) -> str:
                 "Set `AITER_PR_SELF_REVIEW_MODE=enforce` only after reviewing real false positives.</sub>"
             ),
             "",
-            f"<!-- state={result.state()} head={result.head_sha} answer={result.telemetry.get('fingerprint', '')} -->",
+            f"<!-- state={result.state()} head={result.head_sha} -->",
             MARKER,
         ]
     )
@@ -642,17 +619,7 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="update the sticky comment and commit status",
     )
-    parser.add_argument("--fixture", help="evaluate a local fixture instead of GitHub")
     args = parser.parse_args(argv)
-
-    if args.fixture:
-        with open(args.fixture, encoding="utf-8") as fixture_file:
-            data = json.load(fixture_file)
-        issues, telemetry = validate_author_answers(
-            data["body"], data["head_sha"], data.get("changed_tests", [])
-        )
-        print(json.dumps({"issues": issues, "telemetry": telemetry}, indent=2))
-        return 1 if issues else 0
 
     repo = os.environ.get("GITHUB_REPOSITORY", "ROCm/aiter")
     token = os.environ.get("GH_TOKEN", "")
@@ -662,14 +629,14 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"invalid SELF_REVIEW_MODE={mode!r}")
 
     api = GitHub(repo, token)
-    result, pr = evaluate(api, number, mode)
-    body = render(result, pr)
+    result = evaluate(api, number, mode)
+    body = render(result)
     print(body)
     if args.apply:
         url = upsert_comment(api, number, body)
         # PR checks and branch protection are attached to the PR head commit.
         try:
-            post_status(api, result.head_sha, result, url or pr.get("html_url") or "")
+            post_status(api, result.head_sha, result, url or result.pr_url)
         except APIError as exc:
             if mode == "enforce":
                 raise
