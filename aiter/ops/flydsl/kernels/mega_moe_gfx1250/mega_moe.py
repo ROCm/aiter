@@ -3,6 +3,7 @@
 
 """gfx1250 Stage2-fused MegaMoE host pipeline."""
 
+import functools
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -243,82 +244,175 @@ def _compact_gemm_align_m(
     return max(int(tile_m), int(tile_m2))
 
 
-def _mori_tuning(config, quant_type: str = "none") -> dict:
-    from mori.ops.dispatch_combine_v2.hip_tuning_configs import lookup
+@dataclass(frozen=True)
+class _MoriCapabilities:
+    """What the installed mori offers, found out once.
 
-    # Only named when quantizing: an older mori's lookup has no quant_type.
-    quant_kw = {} if quant_type == "none" else {"quant_type": quant_type}
-    return lookup(
-        config.world_size,
-        config.hidden_dim,
-        config.topk,
-        dtype=config.dispatch_wire_spec.mori_tuning_dtype,
-        experts_per_rank=config.experts_per_rank,
-        **quant_kw,
-    )
-
-
-def _mori_dispatch_schedule(config) -> tuple:
-    """mori's own tuned buckets, as this package's (bound, block, warp) triples.
-
-    Not `_select_dispatch_config`'s: that table asks for 32 warps above 256
-    tokens, and mori's gfx1250 dispatch stages a hidden-dim tile per warp in
-    dynamic LDS -- 32 * 7168 * 2 = 458 KB, past the 320 KB budget. EpCfgIsValid
-    does not check LDS, so the plan would build and then fail at launch.
+    MegaMoE drives mori's EpDispatchPlan / EpCombinePlan directly, past its op
+    layer, so it follows mori's version itself -- here, rather than in the
+    pipeline. Each optional field is a helper some mori PR added, None on a mori
+    from before it.
     """
-    tuned = _mori_tuning(config)
-    schedule = tuned["schedule"]
-    if schedule:
-        return tuple((bound, block, warp) for bound, block, warp, _, _ in schedule)
-    return ((None, tuned["dispatch_block_num"], tuned["warp_num_per_block"]),)
+
+    ep_plans: object
+    hip_backend: object
+    lookup: object
+    scale_stride_bytes: object  # ROCm/mori#593
+    push_wire_nbytes: object  # ROCm/mori#719
+    push_land_rows: object  # ROCm/mori#745
+    ep_staging_bytes: object  # ROCm/mori#703
+    tokoff_wanted: object  # ROCm/mori#726, TokOffExt.wanted
+    self_first_enabled: object  # a mori between #726 and #745
+
+    def tuning(self, config, quant_type: str = "none") -> dict:
+        # Only named when quantizing: an older mori's lookup has no quant_type.
+        quant_kw = {} if quant_type == "none" else {"quant_type": quant_type}
+        return self.lookup(
+            config.world_size,
+            config.hidden_dim,
+            config.topk,
+            dtype=config.dispatch_wire_spec.mori_tuning_dtype,
+            experts_per_rank=config.experts_per_rank,
+            **quant_kw,
+        )
+
+    def dispatch_schedule(self, config) -> tuple:
+        """mori's own tuned buckets, as this package's (bound, block, warp) triples.
+
+        Not `_select_dispatch_config`'s: that table asks for 32 warps above 256
+        tokens, and mori's gfx1250 dispatch stages a hidden-dim tile per warp in
+        dynamic LDS -- 32 * 7168 * 2 = 458 KB, past the 320 KB budget. EpCfgIsValid
+        does not check LDS, so the plan would build and then fail at launch.
+        """
+        tuned = self.tuning(config)
+        schedule = tuned["schedule"]
+        if schedule:
+            return tuple((bound, block, warp) for bound, block, warp, _, _ in schedule)
+        return ((None, tuned["dispatch_block_num"], tuned["warp_num_per_block"]),)
+
+    def combine_schedule(self, config, quant_bits: int = 0) -> tuple:
+        """The combine half of mori's tuned buckets for the ``quant_bits`` wire, as
+        (bound, block, warp)."""
+        tuned = self.tuning(config, _MORI_COMBINE_QUANT[quant_bits])
+        schedule = tuned["schedule"]
+        if schedule:
+            return tuple((bound, block, warp) for bound, _, _, block, warp in schedule)
+        return (
+            (None, tuned["combine_block_num"], tuned["combine_warp_num_per_block"]),
+        )
+
+    def scale_stride(self, config) -> int:
+        """The stride mori lays a forwarded scale row down at."""
+        if self.scale_stride_bytes is None:
+            raise RuntimeError(
+                f"dispatch_wire={config.dispatch_wire!r} needs a mori whose EP "
+                "dispatch carries a per-token scale row (ROCm/mori#593 or later); "
+                "the installed one has no scale_stride_bytes"
+            )
+        return self.scale_stride_bytes(config.dispatch_scale_nbytes)
+
+    def push_wire_bytes(self, config) -> int:
+        """Pitch of one landed row of mori's fp4 push combine.
+
+        Asked of mori rather than recomputed: it is the kernel's slot layout,
+        padded to the kernel's own alignment.
+        """
+        if self.push_wire_nbytes is None:
+            raise RuntimeError(
+                "combine_quant='mxfp4' with stage2_fused=False needs a mori with the "
+                "fp4 push combine (ROCm/mori#719 or later)"
+            )
+        return self.push_wire_nbytes(
+            SimpleNamespace(
+                hidden_dim=config.hidden_dim, quant_type=_MORI_COMBINE_QUANT[4]
+            )
+        )
+
+    def push_landing_rows(self, config) -> int | None:
+        """Landing rows of mori's push combine, one per (token, destination rank).
+
+        None for a mori from before ROCm/mori#745, whose push combine lands a row
+        per (source peer, recv slot) and does not read its offsets off the
+        dispatch.
+        """
+        if self.push_land_rows is None:
+            return None
+        return self.push_land_rows(
+            SimpleNamespace(
+                max_num_inp_token_per_rank=config.max_tokens_per_rank,
+                world_size=config.world_size,
+                num_experts_per_token=config.topk,
+            )
+        )
+
+    def staging_bytes(self, config, scale_bytes: int) -> int | None:
+        """The dispatch's staging buffer (ROCm/mori#703); None before it."""
+        if self.ep_staging_bytes is None:
+            return None
+        return self.ep_staging_bytes(
+            config.world_size,
+            config.max_recv,
+            scale_bytes,
+            config.max_tokens_per_rank,
+        )
+
+    def slot_word(self, config) -> tuple[bool, dict]:
+        """(tokoff_ext, the dispatch plan's kwargs for it).
+
+        Driving EpDispatchPlan directly bypasses mori's op layer
+        (EpDispatchCombineOpHip), so take its decisions from mori rather than
+        keep a copy that drifts: whether the slot allocator word moves out of the
+        cco window into tokoff-ext memory, and how the dispatch reserves slots,
+        which follows from where the word lives. Since ROCm/mori#726 the plan
+        takes where the word lives (tok_off_ext) and derives the rest itself
+        (selfFirst, since #745 the aggregated reservation). A mori from before
+        selfFirst has neither helper and rejects the kwarg; its op layer kept
+        tokoff-ext on unless MORI_EP_TOKOFF_EXT=0/false/no/off.
+
+        Collective when $MORI_EP_TOKOFF_EXT is on: TokOffExt.wanted checks that
+        every rank shares the host.
+        """
+        if self.tokoff_wanted is None:
+            env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
+            return env not in ("0", "false", "no", "off"), {}
+        tokoff_ext = self.tokoff_wanted(config.world_size)
+        if self.self_first_enabled is not None:
+            return tokoff_ext, {
+                "self_first": int(self.self_first_enabled(not tokoff_ext))
+            }
+        return tokoff_ext, {"tok_off_ext": int(tokoff_ext)}
 
 
-def _mori_fp4_push_wire_nbytes(config) -> int:
-    """Pitch of one landed row of mori's fp4 push combine.
-
-    Asked of mori rather than recomputed: it is the kernel's slot layout, padded
-    to the kernel's own alignment.
-    """
+@functools.cache
+def _mori_capabilities() -> _MoriCapabilities:
     try:
-        from mori.ops.dispatch_combine_v2.hip_backend import push_wire_nbytes
+        from mori.ops.dispatch_combine_v2 import ep_plans
     except ImportError as error:
         raise RuntimeError(
-            "combine_quant='mxfp4' with stage2_fused=False needs a mori with the "
-            "fp4 push combine (ROCm/mori#719 or later)"
+            "stage1_fused=False dispatches through mori, which needs a mori "
+            "with ops/dispatch_combine_v2 (JIT v2, PR #548 or later)"
         ) from error
+    except OSError as error:
+        raise RuntimeError(
+            "stage1_fused=False dispatches through mori, which needs mori's "
+            "libmori_ops_v2.so; it is built by mori's CMake and is not "
+            "shipped by every install"
+        ) from error
+    from mori.ops.dispatch_combine_v2 import hip_backend
+    from mori.ops.dispatch_combine_v2.hip_tuning_configs import lookup
 
-    return push_wire_nbytes(
-        SimpleNamespace(hidden_dim=config.hidden_dim, quant_type=_MORI_COMBINE_QUANT[4])
+    tokoff = getattr(hip_backend, "TokOffExt", None)
+    return _MoriCapabilities(
+        ep_plans=ep_plans,
+        hip_backend=hip_backend,
+        lookup=lookup,
+        scale_stride_bytes=getattr(hip_backend, "scale_stride_bytes", None),
+        push_wire_nbytes=getattr(hip_backend, "push_wire_nbytes", None),
+        push_land_rows=getattr(hip_backend, "push_land_rows", None),
+        ep_staging_bytes=getattr(hip_backend, "ep_staging_bytes", None),
+        tokoff_wanted=getattr(tokoff, "wanted", None),
+        self_first_enabled=getattr(ep_plans, "self_first_enabled", None),
     )
-
-
-def _mori_push_land_rows(config) -> int | None:
-    """Landing rows of mori's push combine, one per (token, destination rank).
-
-    None for a mori from before ROCm/mori#745, whose push combine lands a row per
-    (source peer, recv slot) and does not read its offsets off the dispatch.
-    """
-    try:
-        from mori.ops.dispatch_combine_v2.hip_backend import push_land_rows
-    except ImportError:
-        return None
-    return push_land_rows(
-        SimpleNamespace(
-            max_num_inp_token_per_rank=config.max_tokens_per_rank,
-            world_size=config.world_size,
-            num_experts_per_token=config.topk,
-        )
-    )
-
-
-def _mori_combine_schedule(config, quant_bits: int = 0) -> tuple:
-    """The combine half of mori's tuned buckets for the ``quant_bits`` wire, as
-    (bound, block, warp)."""
-    tuned = _mori_tuning(config, _MORI_COMBINE_QUANT[quant_bits])
-    schedule = tuned["schedule"]
-    if schedule:
-        return tuple((bound, block, warp) for bound, _, _, block, warp in schedule)
-    return ((None, tuned["combine_block_num"], tuned["combine_warp_num_per_block"]),)
 
 
 class SymmetricArena:
@@ -802,18 +896,9 @@ class MegaMoEConfig:
             return 0
         if self.stage1_fused:
             return _align_up(self.dispatch_scale_nbytes, 128)
-        try:
-            from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
-        except ImportError as e:
-            # Imported here, not at module scope: a bf16 wire needs none of this,
-            # so an older mori keeps working until someone asks for fp8/fp4.
-            raise RuntimeError(
-                f"dispatch_wire={self.dispatch_wire!r} needs a mori whose EP "
-                "dispatch carries a per-token scale row (ROCm/mori#593 or later); "
-                "the installed one has no scale_stride_bytes"
-            ) from e
-
-        return scale_stride_bytes(self.dispatch_scale_nbytes)
+        # Asked only here: a bf16 wire needs none of this, so an older mori keeps
+        # working until someone asks for fp8/fp4.
+        return _mori_capabilities().scale_stride(self)
 
     def combine_slot_stride_for(self, quant_bits: int) -> int:
         """Slot pitch on the ``quant_bits`` wire: the payload rounded up to a
@@ -1410,6 +1495,85 @@ class MegaMoEGfx1250:
             self._compact_cap,
         )
 
+    def _plan_transport(self, config: MegaMoEConfig) -> None:
+        """Schedules, and mori's version and decisions: pure, or at most
+        host-collective, so a configuration that cannot run fails here with
+        nothing allocated."""
+        self._mori = None if self._compact_plan else _mori_capabilities()
+        if self._compact_plan:
+            # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
+            blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
+            warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
+            if blocks_env is not None or warps_env is not None:
+                compact_blocks = int(blocks_env or "64")
+                compact_warps = int(warps_env or "8")
+                self._dispatch_schedule = ((None, compact_blocks, compact_warps),)
+            else:
+                self._dispatch_schedule = _DISPATCH_COMPACT
+        else:
+            mori = self._mori
+            # mori's geometry is a compile-time Cfg field, so it brings its own
+            # tuned buckets.
+            self._dispatch_schedule = mori.dispatch_schedule(config)
+            self._mori_tokoff_ext, self._mori_slot_word_kw = mori.slot_word(config)
+            # The push combine finds its landing offsets in the aggregated
+            # reservation's signal, which tok_off_ext turns off; mori's op layer
+            # refuses the pair the same way.
+            if (
+                self._mori_tokoff_ext
+                and not config.stage2_fused
+                and config.combine_quant_bits
+                and mori.push_landing_rows(config) is not None
+            ):
+                raise ValueError(
+                    f"combine_quant={config.combine_quant!r} with stage2_fused=False "
+                    "needs mori's aggregated dispatch reservation, which "
+                    "MORI_EP_TOKOFF_EXT=1 turns off"
+                )
+            # Passed only on a quantizing wire, matching dispatch_scale_dst_nbytes:
+            # mori grew scale_bytes in #593 and rejects UNKNOWN kwargs outright, so
+            # sending the bf16 wire's harmless 0 would make an older mori refuse
+            # the whole plan.
+            self._mori_scale_kw = (
+                {"scale_bytes": config.dispatch_scale_nbytes}
+                if config.is_quant_dispatch_wire
+                else {}
+            )
+            # Since ROCm/mori#703 the dispatch stages through a buffer its caller
+            # binds; one serves every plan, as only one launches at a time.
+            self._mori_staging_nbytes = mori.staging_bytes(
+                config, self._mori_scale_kw.get("scale_bytes", 0)
+            )
+        # A spec is (block, warp), plus route_parallel on the compact path.
+        self._dispatch_specs = sorted(
+            {tuple(entry[1:]) for entry in self._dispatch_schedule}
+        )
+        if config.stage2_fused:
+            self._combine_tiles = {
+                bits: _combine_tile(
+                    topk=config.topk, hidden_dim=config.hidden_dim, quant_bits=bits
+                )
+                for bits in config.combine_quant_bit_modes
+            }
+            return
+        self._combine_schedules = {
+            bits: self._mori.combine_schedule(config, bits)
+            for bits in config.combine_quant_bit_modes
+        }
+        self._mori_combine_specs = {
+            bits: sorted({tuple(entry[1:]) for entry in schedule})
+            for bits, schedule in self._combine_schedules.items()
+        }
+        self._mori_combine_max_blocks = max(
+            block for wire in self._mori_combine_specs.values() for block, _ in wire
+        )
+        slots = self._mori.hip_backend._XDB_FLAG_SLOTS
+        if self._mori_combine_max_blocks > slots:
+            raise ValueError(
+                f"mori combine block_num {self._mori_combine_max_blocks} exceeds the "
+                f"{slots} per-block epoch slots its entry barrier owns"
+            )
+
     def _initialize_pipeline(self, config: MegaMoEConfig, communicator):
         self._config = config
         self._closed = False
@@ -1422,6 +1586,9 @@ class MegaMoEGfx1250:
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
         self._compact_plan = config.stage1_fused
+        # Everything that can fail, and the host collectives, before the
+        # symmetric arena -- itself collective -- is allocated.
+        self._plan_transport(config)
         self._compact_tile_m = _compact_gemm_align_m(
             config,
             activation=self.activation,
@@ -1495,10 +1662,10 @@ class MegaMoEGfx1250:
             # same three parts mori's own out_tok sizes.
             comb_inp_nbytes = max_recv * config.hidden_dim * 2
             if config.combine_quant_bits:
-                landing_rows = _mori_push_land_rows(config)
+                landing_rows = self._mori.push_landing_rows(config)
                 if landing_rows is None:
                     landing_rows = config.world_size * max_recv
-                comb_inp_nbytes += landing_rows * _mori_fp4_push_wire_nbytes(config)
+                comb_inp_nbytes += landing_rows * self._mori.push_wire_bytes(config)
                 if config.world_size >= 4:
                     comb_inp_nbytes += landing_rows * 8
         arena_regions.append(("comb_inp", comb_inp_nbytes))
@@ -1611,25 +1778,6 @@ class MegaMoEGfx1250:
             device=device,
         )
 
-        if not self._compact_plan:
-            # mori's geometry is a compile-time Cfg field, so it brings its own
-            # tuned buckets.
-            self._dispatch_schedule = _mori_dispatch_schedule(config)
-        else:
-            # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
-            blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
-            warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
-            if blocks_env is not None or warps_env is not None:
-                compact_blocks = int(blocks_env or "64")
-                compact_warps = int(warps_env or "8")
-                self._dispatch_schedule = ((None, compact_blocks, compact_warps),)
-            else:
-                self._dispatch_schedule = _DISPATCH_COMPACT
-
-        # A spec is (block, warp), plus route_parallel on the compact path.
-        self._dispatch_specs = sorted(
-            {tuple(entry[1:]) for entry in self._dispatch_schedule}
-        )
         if self._compact_plan:
             self._dispatch_variants = self._build_tdm_dispatch(config, device)
         else:
@@ -1645,12 +1793,7 @@ class MegaMoEGfx1250:
         # grid is unconstrained. Both wires stage through LDS, so the block is
         # sized to the lane tile (T*C*256/16 lanes) -- which differs per wire,
         # hence one build per width rather than one shared spec.
-        for _bits in config.combine_quant_bit_modes:
-            _toks, _chunks = _combine_tile(
-                topk=config.topk,
-                hidden_dim=config.hidden_dim,
-                quant_bits=_bits,
-            )
+        for _bits, (_toks, _chunks) in self._combine_tiles.items():
             _lanes = _toks * _chunks * _COMBINE_CHUNK_ELEMS // 16
             self._combine_variants[_bits] = _make_combine_fused_reduce(
                 experts_per_token=config.topk,
@@ -1825,80 +1968,11 @@ class MegaMoEGfx1250:
         src_pe*max_tok+src_tok). mori never touches cross_device_barrier.
         Recv slots are reserved one atomic per block and handed out block-local.
         """
-        try:
-            from mori.ops.dispatch_combine_v2.ep_plans import EpDispatchPlan
-        except ImportError as error:
-            raise RuntimeError(
-                "stage1_fused=False dispatches through mori, which needs a mori "
-                "with ops/dispatch_combine_v2 (JIT v2, PR #548 or later)"
-            ) from error
-        except OSError as error:
-            raise RuntimeError(
-                "stage1_fused=False dispatches through mori, which needs mori's "
-                "libmori_ops_v2.so; it is built by mori's CMake and is not "
-                "shipped by every install"
-            ) from error
-
-        # Passed only on a quantizing wire, matching dispatch_scale_dst_nbytes: mori grew
-        # scale_bytes in #593 and rejects UNKNOWN kwargs outright, so sending the
-        # bf16 wire's harmless 0 would make an older mori refuse the whole plan.
-        scale_kw = (
-            {"scale_bytes": config.dispatch_scale_nbytes}
-            if config.is_quant_dispatch_wire
-            else {}
-        )
-        # Driving EpDispatchPlan directly bypasses mori's op layer
-        # (EpDispatchCombineOpHip), so take its decisions from mori rather than
-        # keep a copy that drifts: whether the slot allocator word moves out of
-        # the cco window into tokoff-ext memory, and how the dispatch reserves
-        # slots, which follows from where the word lives. Since ROCm/mori#726 the
-        # plan takes where the word lives (tok_off_ext) and derives the rest
-        # itself (selfFirst, since #745 the aggregated reservation). A mori from
-        # before selfFirst has neither helper and rejects the kwarg; its op layer
-        # kept tokoff-ext on unless MORI_EP_TOKOFF_EXT=0/false/no/off.
-        from mori.ops.dispatch_combine_v2 import ep_plans
-        from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt
-
-        if hasattr(TokOffExt, "wanted"):
-            tokoff_ext = TokOffExt.wanted(config.world_size)
-            if hasattr(ep_plans, "self_first_enabled"):
-                slot_word_kw = {
-                    "self_first": int(ep_plans.self_first_enabled(not tokoff_ext))
-                }
-            else:
-                slot_word_kw = {"tok_off_ext": int(tokoff_ext)}
-        else:
-            env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
-            tokoff_ext = env not in ("0", "false", "no", "off")
-            slot_word_kw = {}
-        # The push combine finds its landing offsets in the aggregated
-        # reservation's signal, which tok_off_ext turns off; mori's op layer
-        # refuses the pair the same way.
-        if (
-            tokoff_ext
-            and not config.stage2_fused
-            and config.combine_quant_bits
-            and _mori_push_land_rows(config) is not None
-        ):
-            raise ValueError(
-                f"combine_quant={config.combine_quant!r} with stage2_fused=False "
-                "needs mori's aggregated dispatch reservation, which "
-                "MORI_EP_TOKOFF_EXT=1 turns off"
-            )
-        # Since ROCm/mori#703 the dispatch stages through a buffer its caller
-        # binds; one serves every plan, as only one launches at a time.
-        try:
-            from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
-        except ImportError:
-            ep_staging_bytes = None
-        if ep_staging_bytes is not None:
+        mori = self._mori
+        EpDispatchPlan = mori.ep_plans.EpDispatchPlan
+        if self._mori_staging_nbytes is not None:
             self._mori_dispatch_staging = torch.zeros(
-                ep_staging_bytes(
-                    config.world_size,
-                    config.max_recv,
-                    scale_kw.get("scale_bytes", 0),
-                    config.max_tokens_per_rank,
-                ),
+                self._mori_staging_nbytes,
                 dtype=torch.uint8,
                 device=self._total_recv.device,
             )
@@ -1915,8 +1989,8 @@ class MegaMoEGfx1250:
                 max_recv=config.max_recv,
                 dtype=config.dispatch_wire_spec.mori_dtype,
                 use_weights=True,
-                **scale_kw,
-                **slot_word_kw,
+                **self._mori_scale_kw,
+                **self._mori_slot_word_kw,
                 block_num=spec[0],
                 warp_per_block=spec[1],
                 arena=self._arena,
@@ -1931,8 +2005,8 @@ class MegaMoEGfx1250:
 
         # Reuse mori's builder rather than duplicate its IPC handle protocol,
         # which must match the kernel byte for byte.
-        if tokoff_ext:
-            self._tokoff_ext = TokOffExt(
+        if self._mori_tokoff_ext:
+            self._tokoff_ext = mori.hip_backend.TokOffExt(
                 config.rank, config.world_size, self._total_recv.device
             )
 
@@ -1986,23 +2060,9 @@ class MegaMoEGfx1250:
         rows of the peer each came from, and after the barrier dequantizes and
         sums what landed for its own tokens. Both zero total_recv on the way out.
         """
-        from mori.ops.dispatch_combine_v2.ep_plans import EpCombinePlan
-        from mori.ops.dispatch_combine_v2.hip_backend import _XDB_FLAG_SLOTS
-
-        self._combine_schedules = {
-            bits: _mori_combine_schedule(config, bits)
-            for bits in config.combine_quant_bit_modes
-        }
-        specs = {
-            bits: sorted({tuple(entry[1:]) for entry in schedule})
-            for bits, schedule in self._combine_schedules.items()
-        }
-        max_blocks = max(block for wire in specs.values() for block, _ in wire)
-        if max_blocks > _XDB_FLAG_SLOTS:
-            raise ValueError(
-                f"mori combine block_num {max_blocks} exceeds the "
-                f"{_XDB_FLAG_SLOTS} per-block epoch slots its entry barrier owns"
-            )
+        EpCombinePlan = self._mori.ep_plans.EpCombinePlan
+        specs = self._mori_combine_specs
+        max_blocks = self._mori_combine_max_blocks
         plans = {}
         for bits, wire_specs in specs.items():
             # Named only on the fp4 wire: an older mori rejects unknown kwargs.
@@ -2030,7 +2090,7 @@ class MegaMoEGfx1250:
         # One epoch per block: each block is the only writer of its own slot.
         # Starts at 1 so the zeroed peer slots cannot alias the first launch.
         self._cross_device_flag = torch.ones(
-            _XDB_FLAG_SLOTS, dtype=torch.int64, device=device
+            self._mori.hip_backend._XDB_FLAG_SLOTS, dtype=torch.int64, device=device
         )
         self._combine_grid_barrier = torch.zeros(1, dtype=torch.uint32, device=device)
         # The entry barrier's intra-grid fan-out: 16 lines per block.
