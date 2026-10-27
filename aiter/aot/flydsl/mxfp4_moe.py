@@ -8,6 +8,10 @@ Parses flydsl_mxmoe_* and flydsl_moe2_layout_* rows from the existing model
 configs plus the active FMoE CSV, and warms the FlyDSL disk cache via the same
 runtime entry points, keyed identically so inference hits the cache.
 
+Not part of the AOT build, which replays these rows through ``fused_moe``
+itself (``moe.py``). The MXFP4 tuner's ``--fast-scan`` precompiles its
+candidates with ``jobs_from_rows`` and ``compile_job_batch``.
+
 Standalone:
     python -m aiter.aot.flydsl.mxfp4_moe [--csv /path/to/foo_fp4_tuned_fmoe.csv]
 """
@@ -25,8 +29,6 @@ from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
-# moe.py defers every ``flydsl_moe2_layout_`` name to this module, so a CSV the
-# glob misses gets no AOT job at all and JITs on the first inference call.
 DEFAULT_CSVS = sorted(
     set(
         glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv")
@@ -41,7 +43,6 @@ if os.path.exists(_ACTIVE_FMOE_CSV) and _ACTIVE_FMOE_CSV not in DEFAULT_CSVS:
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
-_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
 def _job_key(job: dict) -> tuple:
@@ -215,11 +216,7 @@ def parse_csv(csv_path):
 
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
-                out_dtype = (
-                    "fp8"
-                    if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
-                    else "bf16"
-                )
+                out_dtype = "bf16"
                 bias_supported = (
                     row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
                     and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
