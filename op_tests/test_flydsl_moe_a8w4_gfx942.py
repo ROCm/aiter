@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""gfx942 a8w4 (MXFP8 A x MXFP4 W) SiTUv2 MoE through the production fused_moe path.
+"""gfx942 a8w4 (MXFP8 A x MXFP4 W) SiTUv2 MoE.
+
+On every gfx942 (MI300X CI runners included) the stage-1 kernel is checked alone against
+torch, in a few seconds. On MI325X, where the path is enabled, it is also run through the
+production fused_moe path:
 
 ``AITER_SITUV2_A8W4=1`` makes fused_moe quantise x to MXFP8 (E4M3FNUZ) and dispatch the
 ``_g942`` stage-1 kernels (``moe_2stage_a16wmix/gemm1_a8w4_gfx942.py``) with the a16w4
@@ -23,15 +27,25 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import fused_moe, fused_topk, torch_moe_stage1, torch_moe_stage2
+from aiter.fused_moe import (
+    fused_moe,
+    fused_topk,
+    moe_sorting,
+    torch_moe_stage1,
+    torch_moe_stage2,
+)
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
+    flydsl_a8w4_gemm1_gfx942,
     mxfp8_quant_a8w4_gfx942_ref,
     shuffle_scale_a8w4_gfx942,
     shuffle_weight_a8w4_gfx942,
 )
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.flydsl.moe_kernels import a8w4_gfx942_supported
+from aiter.ops.flydsl.moe_kernels import (
+    a8w4_gfx942_supported,
+    get_flydsl_kernel_params,
+)
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -222,6 +236,126 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
     return ret
 
 
+def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
+    """The stage-1 kernel alone against torch on x rounded to MXFP8, on any gfx942.
+
+    The MI325X-only gate is about speed, so the numerics are checked on MI300X too (the
+    CI runners), bypassing it. Kept to a few seconds: 8 experts / top 4, one kernel per
+    x_layout, and model_dim 1536 instead of Kimi-K3's 3584 (the K loop is unrolled, so
+    compile time grows with it); like 3584 it leaves k_wave 4 an odd number of K tiles
+    per wave (3 vs 7), so the odd-tail path is still covered.
+    """
+    E, topk, tile_m = 8, 4, 16
+    p = get_flydsl_kernel_params(kernel_name)
+    assert p and p["in_dtype"] == "a8w4_gfx942" and p["tile_m"] == tile_m, kernel_name
+    torch.manual_seed(0)
+    x = torch.randn((token, model_dim), dtype=dtypes.bf16)
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16)
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16)
+    topk_weights, topk_ids = fused_topk(
+        x, torch.randn((token, E), dtype=dtypes.bf16), topk, True
+    )
+    tq = aiter.get_torch_quant(QuantType.per_1x32)
+    w1_qt, w1_scale = tq(w1, quant_dtype=dtypes.fp4x2)
+    w2_qt, _ = tq(w2, quant_dtype=dtypes.fp4x2)
+    w1_qt = w1_qt.view(E, inter_dim * 2, model_dim // 2)
+    w2_qt = w2_qt.view(E, model_dim, inter_dim // 2)
+    ref = torch_moe_stage1(
+        mxfp8_round(x),
+        w1_qt.view(dtypes.fp4x2),
+        w2_qt.view(dtypes.fp4x2),
+        topk_weights,
+        topk_ids,
+        dtype=dtypes.bf16,
+        activation=ActivationType.Situv2,
+        quant_type=QuantType.per_1x32,
+        a1_scale=None,
+        w1_scale=w1_scale.view(E, inter_dim * 2, model_dim // 32),
+        doweight=False,
+        situ_beta=BETA,
+        situ_linear_beta=LINEAR_BETA,
+    ).view(token, topk, inter_dim)
+
+    w1_s8 = shuffle_weight_a8w4_gfx942(shuffle_weight_a16w4(w1_qt, 16, False))
+    w1_sc8 = shuffle_scale_a8w4_gfx942(shuffle_scale_a16w4(w1_scale, E, False))
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weights, E, model_dim, dtypes.bf16, tile_m
+    )
+    if p["x_layout"] == "bf16":  # `_qi`: the kernel quantises x itself
+        a, a_scale = x, None
+    else:  # the HIP quant fused_moe runs, read in its sorted layout
+        a, a_scale = aiter.fused_dynamic_mxfp8_quant_moe_sort(
+            x,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            topk=topk,
+            block_size=tile_m,
+            sorted_weights=sorted_weights,
+            num_experts_upper_bound=E,
+        )
+        a_scale = a_scale.view(torch.uint8)
+    out = torch.empty(
+        (sorted_expert_ids.numel() * tile_m, inter_dim), dtype=dtypes.bf16
+    )
+    flydsl_a8w4_gemm1_gfx942(
+        a_fp8=a,
+        a_scale_u8=a_scale,
+        w1_u8=w1_s8.view(torch.uint8),
+        w1_scale_u8=w1_sc8.view(torch.uint8).view(-1),
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=num_valid_ids.to(torch.int32),
+        m_indices=sorted_ids.to(torch.int32),
+        inter_sorted_bf16=out,
+        n_tokens=token,
+        NE=E,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        tile_m=tile_m,
+        tile_n=p["tile_n"],
+        tile_k=p["tile_k"],
+        k_wave=p.get("k_wave", 1),
+        b_nt=p.get("b_nt"),
+        xcd_swizzle=p.get("xcd_swizzle", 0),
+        waves_per_eu=p.get("waves_per_eu"),
+        act="situv2",
+        situ_beta=BETA,
+        situ_linear_beta=LINEAR_BETA,
+        x_layout=p["x_layout"],
+    )
+    # the output is by sorted position: row i holds (token, slot) of sorted_ids[i]
+    ids = sorted_ids[: int(num_valid_ids[0])].to(torch.int64)
+    tok, slot = ids & 0xFFFFFF, ids >> 24
+    real = tok < token  # padding rows of each expert block
+    got = torch.empty_like(ref)
+    got[tok[real], slot[real]] = out[: ids.numel()][real]
+    assert int(real.sum()) == token * topk
+    cos = cos_diff(ref, got)
+    assert cos < 1e-3, (kernel_name, token, cos)
+    aiter.logger.info(
+        "a8w4 gfx942 stage 1 %s M=%d vs torch: cos diff %.2e", kernel_name, token, cos
+    )
+
+
+def test_gate_off_mi325x():
+    """Off MI325X the a8w4 stage 1 must refuse (it is slower than a16w4 at large M on
+    MI300X) rather than run; checked before any tensor is read."""
+    from aiter.fused_moe import _flydsl_stage1_wrapper
+
+    x = torch.zeros((1, 256), dtype=dtypes.bf16)
+    w1 = torch.zeros((4, 256, 128), dtype=torch.uint8)
+    ids = torch.zeros(32, dtype=torch.int32)
+    name = "flydsl_moe1_afp8_wfp4_bf16_t16x32x128_g942_kw4_qi"
+    try:
+        _flydsl_stage1_wrapper(
+            x, w1, None, ids, ids[:2], ids[:1], None, 1, kernelName=name
+        )
+    except NotImplementedError as e:
+        assert "MI325X only" in str(e), e
+    else:
+        raise AssertionError(f"{name} ran on {torch.cuda.get_device_name()}")
+
+
 def test_stage1_dispatch_by_name():
     """Stage 1 runs the gfx942 a8w4 kernel only for the `_g942` names: any other
     registered fp8 x fp4 stage-1 name (the gfx950 family is registered on every arch)
@@ -256,10 +390,16 @@ def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("a8w4 gfx942 MoE unsupported on %s; skipping", get_gfx())
         return
+    # Every gfx942, MI300X CI runners included: the kernel's numerics (one kernel per
+    # x_layout, the CSV's M = 1 and M = 16 picks) and the stage-1 dispatch by name.
+    test_stage1_kernel(1, "flydsl_moe1_afp8_wfp4_bf16_t16x32x128_g942_kw4_qi")
+    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x64x128_g942_kw2")
+    test_stage1_dispatch_by_name()
     if not a8w4_gfx942_supported():
+        test_gate_off_mi325x()
         aiter.logger.warning(
-            "a8w4 gfx942 MoE is enabled on MI325X only (on MI300X it is slower than "
-            "a16w4 at large M); skipping on %s",
+            "a8w4 gfx942 MoE through fused_moe is enabled on MI325X only (on MI300X "
+            "it is slower than a16w4 at large M); skipping it on %s",
             torch.cuda.get_device_name(),
         )
         return
@@ -294,8 +434,6 @@ def main():
         help="model_dim,inter_dim (Kimi-K3 latent MoE; inter 512 = TP6, 384 = TP8)",
     )
     args = parser.parse_args()
-
-    test_stage1_dispatch_by_name()
 
     for dtype in args.dtype:
         df = [
