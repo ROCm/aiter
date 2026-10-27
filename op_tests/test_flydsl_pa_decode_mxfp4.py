@@ -438,6 +438,152 @@ def test_pa_decode_mxfp4_direct_output_graph_replay():
     assert rel_l2(out.float(), ref) < 3e-3
 
 
+def run_free(q, kd, ks, vd, vs, bt, ctx, scale, out_dtype=torch.bfloat16, **kw):
+    out = torch.full(q.shape, 7.0, dtype=out_dtype, device=q.device)
+    pa_decode_mxfp4(out, q, kd, ks, vd, vs, ctx, bt, scale, work_plan=None, **kw)
+    return out
+
+
+@pytest.mark.parametrize("block_size", [16, 64, 128])
+@pytest.mark.parametrize("max_partitions", [None, 1, 2, 3, 8])
+@pytest.mark.parametrize("qmode", ["bf16", "fp8"])
+def test_pa_decode_mxfp4_plan_free_vs_reference(block_size, max_partitions, qmode):
+    """No plan: every shape the planned path handles, with tasks of several tiles
+    (max_partitions 3 on 5000 tokens), single tiles, and tails."""
+    _skip_unsupported()
+    ctx_lens = [1, 16, 255, 256, 257, 1000, 2048, 4097, 5000]
+    ctx, bt, k, v, q = make_case(ctx_lens, 16, block_size, seed=block_size + 3)
+    _, kd, ks, k_deq = quantize_pages(k, block_size)
+    _, vd, vs, v_deq = quantize_pages(v, block_size)
+    scale = HEAD_DIM**-0.5
+    q_in, q_ref = quantize_q_fp8(q) if qmode == "fp8" else (q, q.float())
+    out = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale, max_partitions=max_partitions)
+    ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, block_size)
+    torch.cuda.synchronize()
+    assert rel_l2(out.float(), ref) < 3e-3
+    for r, n in enumerate(ctx_lens):
+        assert rel_l2(out[r].float(), ref[r]) < 1e-2, f"ctx {n}"
+
+
+@pytest.mark.parametrize("rows", [1, 8, 64, 512])
+def test_pa_decode_mxfp4_plan_free_is_bitwise_the_planned_path(rows):
+    """Where the plan and the plan-free split coincide (one 256-token tile per
+    task: ctx 2048, 8 tasks; or one task per row) the outputs are the same bits."""
+    _skip_unsupported()
+    ctx, bt, k, v, q = make_case([2048] * rows, 16, 128, seed=rows + 40)
+    _, kd, ks, _ = quantize_pages(k, 128)
+    _, vd, vs, _ = quantize_pages(v, 128)
+    q_in, _ = quantize_q_fp8(q)
+    scale = HEAD_DIM**-0.5
+    for mp in (1, 8):
+        plan = plan_pa_decode(ctx, 1, max_partitions=mp)
+        if plan.capacity != rows * mp:  # the planner's task budget (2 * CUs) caps it
+            continue
+        planned = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale, plan=plan)
+        free = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale, max_partitions=mp)
+        torch.cuda.synchronize()
+        assert torch.equal(planned, free), f"rows {rows} max_partitions {mp}"
+    # the default split is the planner's budget: 8 tasks up to 64 rows, 1 from 512
+    default = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale)
+    want = 1 if rows >= 512 else 8
+    explicit = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale, max_partitions=want)
+    torch.cuda.synchronize()
+    assert torch.equal(default, explicit)
+
+
+@pytest.mark.parametrize("max_partitions", [None, 1, 4])
+def test_pa_decode_mxfp4_plan_free_empty_rows(max_partitions):
+    """A context-0 row has no work but is still written (zeros), with the reduce
+    kernel (>1 partition) and without it (1 partition)."""
+    _skip_unsupported()
+    ctx_lens = [300, 0, 2048, 0, 5]
+    ctx, bt, k, v, q = make_case([max(n, 1) for n in ctx_lens], 16, 128, seed=8)
+    ctx = torch.tensor(ctx_lens, dtype=torch.int32, device=q.device)
+    _, kd, ks, k_deq = quantize_pages(k, 128)
+    _, vd, vs, v_deq = quantize_pages(v, 128)
+    q_in, q_ref = quantize_q_fp8(q)
+    out = run_free(q_in, kd, ks, vd, vs, bt, ctx, HEAD_DIM**-0.5, max_partitions=max_partitions)
+    torch.cuda.synchronize()
+    ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
+    for r, n in enumerate(ctx_lens):
+        if n:
+            assert rel_l2(out[r].float(), ref[r]) < 3e-3
+        else:
+            assert (out[r] == 0).all(), f"row {r}"
+
+
+@pytest.mark.parametrize("rows", [255, 256, 257])
+def test_pa_decode_mxfp4_plan_free_default_split_boundaries(rows):
+    """The default split is max(1, 2 * 256 CUs // rows): 2 tasks at 255/256 rows, 1 at
+    257. Both sides of the switch agree with each other and with the reference."""
+    _skip_unsupported()
+    ctx, bt, k, v, q = make_case([600] * rows, 16, 128, seed=rows)
+    _, kd, ks, k_deq = quantize_pages(k, 128)
+    _, vd, vs, v_deq = quantize_pages(v, 128)
+    q_in, q_ref = quantize_q_fp8(q)
+    scale = HEAD_DIM**-0.5
+    out = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale)
+    out1 = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale, max_partitions=1)
+    torch.cuda.synchronize()
+    assert rel_l2(out.float(), out1.float()) < 1e-2
+    ref = ref_attention(q_ref[:8], k_deq, v_deq, bt[:8], ctx[:8], scale, 128)
+    assert rel_l2(out[:8].float(), ref) < 3e-3
+
+
+@pytest.mark.parametrize("max_partitions", [1, 8])
+def test_pa_decode_mxfp4_plan_free_graph_replay(max_partitions):
+    _skip_unsupported()
+    ctx, bt, k, v, q = make_case([2048, 700, 2048, 33], 16, 128, seed=14)
+    _, kd, ks, k_deq = quantize_pages(k, 128)
+    _, vd, vs, v_deq = quantize_pages(v, 128)
+    q_in, q_ref = quantize_q_fp8(q)
+    out = torch.empty_like(q)
+
+    def call():
+        pa_decode_mxfp4(
+            out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5,
+            max_partitions=max_partitions,
+        )  # fmt: skip
+
+    call()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+    first = out.clone()
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, first)
+    ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
+    assert rel_l2(out.float(), ref) < 3e-3
+
+
+def test_pa_decode_mxfp4_plan_free_argument_checks():
+    _skip_unsupported()
+    ctx, bt, k, v, q = make_case([2048], 16, 16, seed=2, extra_pages=0)
+    _, kd, ks, _ = quantize_pages(k, 16)
+    _, vd, vs, _ = quantize_pages(v, 16)
+    q_in, _ = quantize_q_fp8(q)
+    out = torch.empty_like(q)
+    with pytest.raises(ValueError, match="one task per sequence"):
+        pa_decode_mxfp4(
+            out, q_in, kd, ks, vd, vs, ctx, bt, 1.0,
+            max_partitions=2, direct_output=True,
+        )  # fmt: skip
+    with pytest.raises(ValueError, match="plan-free"):
+        pa_decode_mxfp4(
+            out, q_in, kd, ks, vd, vs, ctx, bt, 1.0,
+            work_plan=plan_pa_decode(ctx, 1), max_partitions=2,
+        )  # fmt: skip
+    ctx, bt, k, v, q = make_case([40000], 16, 16, seed=2, extra_pages=0)
+    _, kd, ks, _ = quantize_pages(k, 16)
+    _, vd, vs, _ = quantize_pages(v, 16)
+    q_in, _ = quantize_q_fp8(q)
+    with pytest.raises(NotImplementedError, match="max_partitions"):
+        run_free(q_in, kd, ks, vd, vs, bt, ctx, 1.0, max_partitions=1)
+
+
 def test_pa_decode_mxfp4_rejects_oversized_task():
     _skip_unsupported()
     ctx, bt, k, v, q = make_case([40000], 16, 16, seed=2, extra_pages=0)

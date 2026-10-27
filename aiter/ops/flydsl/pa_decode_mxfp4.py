@@ -71,10 +71,11 @@ def pa_decode_mxfp4(
     exp_sums: torch.Tensor | None = None,
     max_logits: torch.Tensor | None = None,
     temporary_output: torch.Tensor | None = None,
-    work_plan: PADecodePlan,
+    work_plan: PADecodePlan | None = None,
     max_context_length: int | None = None,
     tile_depth: int = DEFAULT_TILE_DEPTH,
     direct_output: bool | None = None,
+    max_partitions: int | None = None,
 ) -> None:
     """Decode one query token per sequence over an MXFP4 paged K/V cache.
 
@@ -94,8 +95,10 @@ def pa_decode_mxfp4(
     ``[kv_heads, capacity, group_size(, 128)]``. ``max_context_length`` bounds the
     scheduling, as in ``pa_decode``.
     """
-    if not isinstance(work_plan, PADecodePlan):
-        raise TypeError("work_plan must be a PADecodePlan")
+    if work_plan is not None and not isinstance(work_plan, PADecodePlan):
+        raise TypeError("work_plan must be a PADecodePlan or None")
+    if work_plan is not None and max_partitions is not None:
+        raise ValueError("max_partitions applies to the plan-free form only")
     arch = get_gfx_runtime()
     if arch != "gfx950":
         raise NotImplementedError(f"pa_decode_mxfp4 supports gfx950, got {arch}")
@@ -210,16 +213,34 @@ def pa_decode_mxfp4(
         schedule_context = (
             (max_context_length + block_size - 1) // block_size * block_size
         )
-    work_plan.validate(num_seqs, num_kv_heads, dev)
-    if work_plan.sliding_window != 0:
-        raise NotImplementedError("pa_decode_mxfp4 has no sliding window")
-    capacity = work_plan.capacity
+    if work_plan is not None:
+        work_plan.validate(num_seqs, num_kv_heads, dev)
+        if work_plan.sliding_window != 0:
+            raise NotImplementedError("pa_decode_mxfp4 has no sliding window")
+        capacity = work_plan.capacity
+        parts = work_plan.max_partitions
+        tile_bound = max_tiles_per_task(
+            num_seqs, capacity, work_plan.max_partitions, max(schedule_context, 1)
+        )
+        task_tiles = 0
+    else:
+        max_tiles = max(1, -(-schedule_context // KV_COMPUTE_BLOCK))
+        if max_partitions is None:
+            cus = torch.cuda.get_device_properties(dev).multi_processor_count
+            max_partitions = max(1, (2 * cus) // num_seqs)
+        if not 1 <= max_partitions:
+            raise ValueError("max_partitions must be positive")
+        max_partitions = min(max_partitions, max_tiles)
+        task_tiles = -(-max_tiles // max_partitions)
+        parts = -(-max_tiles // task_tiles)
+        capacity = num_seqs * parts
+        tile_bound = task_tiles
     if direct_output is None:
-        direct_output = work_plan.max_partitions == 1
-    elif direct_output and work_plan.max_partitions != 1:
+        direct_output = parts == 1
+    elif direct_output and parts != 1:
         raise ValueError(
-            "direct_output needs a plan with max_partitions == 1 (one task per "
-            f"sequence), got {work_plan.max_partitions}"
+            "direct_output needs one task per sequence (max_partitions == 1), "
+            f"got {parts}"
         )
     if direct_output and (
         (output.stride(0) * output.element_size()) % 16
@@ -227,18 +248,15 @@ def pa_decode_mxfp4(
     ):
         raise ValueError("direct_output needs output row/head strides of 16 bytes")
 
-    # Pages one planned task can own, staged in LDS in 256-entry units.
-    tiles = max_tiles_per_task(
-        num_seqs, capacity, work_plan.max_partitions, max(schedule_context, 1)
-    )
-    pages = max(tiles * (KV_COMPUTE_BLOCK // block_size), 1)
+    # Pages one task can own, staged in LDS in 256-entry units.
+    pages = max(tile_bound * (KV_COMPUTE_BLOCK // block_size), 1)
     stage_pages = max(
         PAGE_STAGE_ALIGN, -(-pages // PAGE_STAGE_ALIGN) * PAGE_STAGE_ALIGN
     )
     if stage_pages > MAX_STAGED_PAGES:
         raise NotImplementedError(
-            f"a task can own {pages} pages; raise the plan's max_partitions so a "
-            f"task owns at most {MAX_STAGED_PAGES} (block_size {block_size})"
+            f"a task can own {pages} pages; raise max_partitions so a task owns at "
+            f"most {MAX_STAGED_PAGES} (block_size {block_size})"
         )
 
     rows = group_size
@@ -271,7 +289,12 @@ def pa_decode_mxfp4(
         out_f16=output.dtype == torch.float16,
         tile_depth=tile_depth,
         direct=direct_output,
+        tiles_per_task=task_tiles,
+        parts=parts if work_plan is None else 0,
     )
+    reduce_info = None
+    if work_plan is None and not direct_output:
+        reduce_info = torch.empty((num_seqs, 2), dtype=torch.int32, device=dev)
     out_dt = fx.Float16 if output.dtype == torch.float16 else fx.BFloat16
     with torch.cuda.device(dev):
         stream = torch.cuda.current_stream(dev)
@@ -291,7 +314,9 @@ def pa_decode_mxfp4(
                 if query_scale is not None
                 else flyc.from_c_void_p(fx.Float32, 0)
             ),
-            ptr_arg(work_plan.work_info, fx.Int32),
+            ptr_arg(
+                block_tables if work_plan is None else work_plan.work_info, fx.Int32
+            ),
             max_blocks_per_seq,
             int(query.stride(0)),
             int(query.stride(1)),
@@ -307,6 +332,8 @@ def pa_decode_mxfp4(
             ptr_arg(output, out_dt),
             int(output.stride(0)),
             int(output.stride(1)),
+            ptr_arg(context_lengths, fx.Int32),
+            ptr_arg(block_tables if reduce_info is None else reduce_info, fx.Int32),
             capacity,
             num_kv_heads,
             stream,
@@ -315,7 +342,8 @@ def pa_decode_mxfp4(
             return
         output_5d = output.reshape(num_seqs, 1, num_kv_heads, group_size, HEAD_DIM)
         partition_bound = min(
-            capacity, max(1, -(-schedule_context // KV_COMPUTE_BLOCK))
+            capacity if work_plan is not None else parts,
+            max(1, -(-schedule_context // KV_COMPUTE_BLOCK)),
         )
         launch_pa_decode_ps_reduce(
             output_5d,
@@ -336,7 +364,9 @@ def pa_decode_mxfp4(
             query_group_size=group_size,
             head_size=HEAD_DIM,
             partition_bound=partition_bound,
-            max_partitions=work_plan.max_partitions,
+            max_partitions=parts,
             stream=stream,
-            reduce_info=work_plan.reduce_info,
+            reduce_info=(
+                work_plan.reduce_info if work_plan is not None else reduce_info
+            ),
         )

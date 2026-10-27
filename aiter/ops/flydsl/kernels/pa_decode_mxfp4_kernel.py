@@ -116,8 +116,19 @@ def build_pa_decode_mxfp4(
     out_f16: bool,
     tile_depth: int = DEFAULT_TILE_DEPTH,
     direct: bool = False,
+    tiles_per_task: int = 0,
+    parts: int = 0,
 ):
     """Compile-time specialization of the task kernel and its launcher.
+
+    ``tiles_per_task`` > 0 selects the plan-free form: CTA ``slot`` is part
+    ``slot % parts`` of sequence ``slot // parts`` and owns plan tiles
+    ``[part * tiles_per_task, (part + 1) * tiles_per_task)`` of it (clipped to the
+    context), so it needs neither ``PADecodePlan`` nor its ``work_info`` load: the
+    block-table row, the query and the context length are loaded in parallel. The
+    kernel also writes the ``[seq, 2]`` reduce info (first packed task, count) that
+    ``launch_pa_decode_ps_reduce`` reads, unless ``direct`` (``parts == 1``), where
+    a context-0 row is zero-filled too.
 
     ``direct``: every planned task is a whole sequence (the plan has at most one
     task per row), so the CTA writes the normalized output row itself and the
@@ -131,6 +142,10 @@ def build_pa_decode_mxfp4(
     assert block_size in (16, 64, 128), block_size
     assert stage_pages % PAGE_STAGE_ALIGN == 0 and 0 < stage_pages <= MAX_STAGED_PAGES
     assert tile_depth >= 1
+    PLAN_FREE = tiles_per_task > 0
+    TASK_TILES = tiles_per_task
+    PARTS = parts
+    assert not PLAN_FREE or (PARTS >= 1 and (not direct or PARTS == 1))
     G = group_size
     BS = block_size
     DEPTH = tile_depth
@@ -156,6 +171,7 @@ def build_pa_decode_mxfp4(
     name = (
         f"pa_decode_mxfp4_g{G}_bs{BS}_{'qfp8' if q_fp8 else 'qbf16'}_d{DEPTH}"
         f"{'_direct' if direct else ''}"
+        f"{f'_free{PARTS}x{TASK_TILES}' if PLAN_FREE else ''}"
     )
 
     @flyc.kernel(name=name, known_block_size=(BLOCK_THREADS, 1, 1))
@@ -186,6 +202,8 @@ def build_pa_decode_mxfp4(
         out_ptr: fx.Pointer,
         out_row_stride: fx.Int32,  # elements
         out_head_stride: fx.Int32,
+        ctx_ptr: fx.Pointer,  # plan-free: context lengths
+        reduce_info_ptr: fx.Pointer,  # plan-free: [seq, 2] written here
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         warp = tid // WAVE
@@ -196,15 +214,115 @@ def build_pa_decode_mxfp4(
         kvh = fx.Int32(gpu.block_id("y"))
         capacity = fx.Int32(gpu.grid_dim.x)
 
-        work = fx.recast_iter(fx.Int32, work_info_ptr)
-        task = fx.ptr_load(
-            fx.add_offset(work, slot * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
-        seq = fx.Int32(task[0])
-        start = fx.Int32(task[1])
-        end = fx.Int32(task[2])
-        ctx = fx.Int32(task[3])
+        zero_i32 = fx.Int32(0)
+        v4_i32 = fx.Vector.make_type(4, fx.Int32)
+
+        def _stage_loads(seq_i, first_page_i, bound_pages, num_pages_i):
+            """Global loads of this task's block-table entries (one per thread and
+            256-entry unit): (slot, in-task page index, valid, raw id)."""
+            bt = _gptr(block_tables_ptr, fx.Int32, 4)
+            bt_row = fx.Int64(seq_i) * fx.Int64(max_blocks_per_seq)
+            loads = []
+            for r in range_constexpr(stage_pages // BLOCK_THREADS):
+                idx = tid + r * BLOCK_THREADS
+                pg = first_page_i + idx
+                ok = (idx < bound_pages) & (pg < num_pages_i)
+                raw = fx.ptr_load(
+                    fx.add_offset(bt, bt_row + fx.Int64(ok.select(pg, zero_i32)))
+                )
+                loads.append((idx, ok, raw))
+            return loads
+
+        def _load_q(seq_i):
+            """Q operand, resident for the whole task (padding heads alias head 0)."""
+            head = (s < G).select(s, zero_i32)
+            q_row = fx.Int64(seq_i) * fx.Int64(stride_q_row) + fx.Int64(
+                kvh * G + head
+            ) * fx.Int64(stride_q_head)
+            if const_expr(q_fp8):
+                qd = _gptr(q_ptr, fx.Int32, 16)
+                q_lo = fx.ptr_load(
+                    fx.add_offset(qd, (q_row + fx.Int64(16 * g)) // 4),
+                    result_type=v4_i32,
+                )
+                q_hi = fx.ptr_load(
+                    fx.add_offset(qd, (q_row + fx.Int64(64 + 16 * g)) // 4),
+                    result_type=v4_i32,
+                )
+                return fx.Vector.from_elements(
+                    [q_lo[i] for i in range_constexpr(4)]
+                    + [q_hi[i] for i in range_constexpr(4)],
+                    dtype=fx.Int32,
+                )
+            qb = _gptr(q_ptr, fx.BFloat16, 16)
+            v8_bf16 = fx.Vector.make_type(8, fx.BFloat16)
+            return [
+                fx.ptr_load(
+                    fx.add_offset(qb, q_row + fx.Int64(32 * g + 8 * j)),
+                    result_type=v8_bf16,
+                )
+                for j in range_constexpr(4)
+            ]
+
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        lds_base = fx.recast_iter(fx.Uint8, lds.buf.ptr)
+
+        def _lds_ptr(byte_off, elem_ty):
+            p = fx.add_offset(lds_base, fx.make_int_tuple(byte_off))
+            ptr_ty = fx.PointerType.get(
+                elem_ty.ir_type, fx.AddressSpace.Shared, dsl_size_of(elem_ty)
+            )
+            return fx.recast_iter(ptr_ty, p)
+
+        def _lds_load(byte_off, elem_ty):
+            return fx.ptr_load(_lds_ptr(byte_off, elem_ty))
+
+        def _lds_store(byte_off, elem_ty, value):
+            fx.ptr_store(value, _lds_ptr(byte_off, elem_ty))
+
+        if const_expr(PLAN_FREE):
+            # Everything but the context length follows from the block index, so
+            # the context, block-table and Q loads are all in flight together
+            # (a plan makes the table read wait for the work_info read).
+            seq = slot // PARTS
+            part = slot - seq * PARTS
+            ctx_raw = fx.Int32(
+                fx.ptr_load(fx.add_offset(_gptr(ctx_ptr, fx.Int32, 4), seq))
+            )
+            start = part * TASK_TILES
+            # The block-table entries go to LDS before the branch on the context
+            # length (padding tasks stage garbage nobody reads): consuming the
+            # loads here keeps them issued ahead of the wait for the context.
+            for idx, ok, raw in _stage_loads(
+                seq,
+                part * (TASK_TILES * PLAN_TILE // BS),
+                TASK_TILES * PLAN_TILE // BS,
+                max_blocks_per_seq,
+            ):
+                _lds_store(page_off + idx * 4, fx.Int32, ok.select(raw, zero_i32))
+            pre = _load_q(seq)
+            ctx = fx.max(ctx_raw, zero_i32)
+            tiles = (ctx + (PLAN_TILE - 1)) // PLAN_TILE
+            end = fx.min(start + TASK_TILES, tiles)
+            if const_expr(not direct):  # noqa: SIM102
+                if (tid == 0) & (part == 0):
+                    ri = fx.recast_iter(fx.Int32, reduce_info_ptr)
+                    fx.ptr_store(seq * PARTS, fx.add_offset(ri, seq * 2))
+                    fx.ptr_store(
+                        fx.min((tiles + (TASK_TILES - 1)) // TASK_TILES, PARTS),
+                        fx.add_offset(ri, seq * 2 + 1),
+                    )
+        else:
+            pre = None
+            work = fx.recast_iter(fx.Int32, work_info_ptr)
+            task = fx.ptr_load(
+                fx.add_offset(work, slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            seq = fx.Int32(task[0])
+            start = fx.Int32(task[1])
+            end = fx.Int32(task[2])
+            ctx = fx.Int32(task[3])
         # Padding tasks of the plan have start == end: nothing to do, no barrier
         # below is reached by only part of the CTA.
         if start < end:
@@ -214,69 +332,19 @@ def build_pa_decode_mxfp4(
             n_tiles = (n_tokens + (TILE_TOKENS - 1)) // TILE_TOKENS
             n_iters = (n_tiles - warp + (NUM_WAVES - 1)) // NUM_WAVES
 
-            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-            lds_base = fx.recast_iter(fx.Uint8, lds.buf.ptr)
-
-            def _lds_ptr(byte_off, elem_ty):
-                p = fx.add_offset(lds_base, fx.make_int_tuple(byte_off))
-                ptr_ty = fx.PointerType.get(
-                    elem_ty.ir_type, fx.AddressSpace.Shared, dsl_size_of(elem_ty)
-                )
-                return fx.recast_iter(ptr_ty, p)
-
-            def _lds_load(byte_off, elem_ty):
-                return fx.ptr_load(_lds_ptr(byte_off, elem_ty))
-
-            def _lds_store(byte_off, elem_ty, value):
-                fx.ptr_store(value, _lds_ptr(byte_off, elem_ty))
-
             # ---- Stage this task's page ids in LDS (pages past the context -> 0).
-            bt = _gptr(block_tables_ptr, fx.Int32, 4)
             first_page = tok_begin // BS
-            n_task_pages = (n_tokens + (BS - 1)) // BS
-            num_pages = (ctx + (BS - 1)) // BS
-            bt_row = fx.Int64(seq) * fx.Int64(max_blocks_per_seq)
-            zero_i32 = fx.Int32(0)
-            for r in range_constexpr(stage_pages // BLOCK_THREADS):
-                idx = tid + r * BLOCK_THREADS
-                pg = first_page + idx
-                ok = (idx < n_task_pages) & (pg < num_pages)
-                raw = fx.ptr_load(
-                    fx.add_offset(bt, bt_row + fx.Int64(ok.select(pg, zero_i32)))
-                )
-                _lds_store(page_off + idx * 4, fx.Int32, ok.select(raw, zero_i32))
-
-            # ---- Q operand, resident for the whole task (padding heads alias head 0).
-            head = (s < G).select(s, zero_i32)
-            q_row = fx.Int64(seq) * fx.Int64(stride_q_row) + fx.Int64(
-                kvh * G + head
-            ) * fx.Int64(stride_q_head)
-            if const_expr(q_fp8):
-                qd = _gptr(q_ptr, fx.Int32, 16)
-                v4_i32 = fx.Vector.make_type(4, fx.Int32)
-                q_lo = fx.ptr_load(
-                    fx.add_offset(qd, (q_row + fx.Int64(16 * g)) // 4),
-                    result_type=v4_i32,
-                )
-                q_hi = fx.ptr_load(
-                    fx.add_offset(qd, (q_row + fx.Int64(64 + 16 * g)) // 4),
-                    result_type=v4_i32,
-                )
-                q_b = fx.Vector.from_elements(
-                    [q_lo[i] for i in range_constexpr(4)]
-                    + [q_hi[i] for i in range_constexpr(4)],
-                    dtype=fx.Int32,
-                )
+            if const_expr(PLAN_FREE):
+                q_b = pre
             else:
-                qb = _gptr(q_ptr, fx.BFloat16, 16)
-                v8_bf16 = fx.Vector.make_type(8, fx.BFloat16)
-                q_b = [
-                    fx.ptr_load(
-                        fx.add_offset(qb, q_row + fx.Int64(32 * g + 8 * j)),
-                        result_type=v8_bf16,
-                    )
-                    for j in range_constexpr(4)
-                ]
+                for idx, ok, raw in _stage_loads(
+                    seq,
+                    first_page,
+                    (n_tokens + (BS - 1)) // BS,
+                    (ctx + (BS - 1)) // BS,
+                ):
+                    _lds_store(page_off + idx * 4, fx.Int32, ok.select(raw, zero_i32))
+                q_b = _load_q(seq)
 
             scale_log2e = softmax_scale * fx.Float32(LOG2E)
             if const_expr(has_q_scale):
@@ -289,7 +357,6 @@ def build_pa_decode_mxfp4(
             vd = _gptr(vd_ptr, fx.Int32, 16)
             ks = _gptr(ks_ptr, fx.Uint8, 1)
             vs = _gptr(vs_ptr, fx.Uint8, 1)
-            v4_i32 = fx.Vector.make_type(4, fx.Int32)
 
             neg_inf = fx.Float32(float("-inf"))
             zero_f = fx.Float32(0.0)
@@ -566,6 +633,22 @@ def build_pa_decode_mxfp4(
                         )
                         fx.ptr_store(h_sum, fx.add_offset(psum, row))
 
+        if const_expr(PLAN_FREE and direct):  # noqa: SIM102
+            # One task per row and no reduce kernel to zero-fill: an empty row is
+            # written here.
+            if (start >= end) & (tid < G * (HEAD_DIM // 8)):
+                out = _gptr(out_ptr, out_dtype, 16)
+                fx.ptr_store(
+                    fx.Vector.filled(8, 0.0, fx.Float32).to(out_dtype),
+                    fx.add_offset(
+                        out,
+                        fx.Int64(seq) * fx.Int64(out_row_stride)
+                        + fx.Int64(kvh * G + tid // (HEAD_DIM // 8))
+                        * fx.Int64(out_head_stride)
+                        + fx.Int64((tid % (HEAD_DIM // 8)) * 8),
+                    ),
+                )
+
     @flyc.jit
     def launch(
         pmax_ptr: fx.Pointer,
@@ -594,6 +677,8 @@ def build_pa_decode_mxfp4(
         out_ptr: fx.Pointer,
         out_row_stride: fx.Int32,
         out_head_stride: fx.Int32,
+        ctx_ptr: fx.Pointer,
+        reduce_info_ptr: fx.Pointer,
         work_capacity: fx.Int32,
         num_kv_heads: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -626,6 +711,8 @@ def build_pa_decode_mxfp4(
                 out_ptr,
                 out_row_stride,
                 out_head_stride,
+                ctx_ptr,
+                reduce_info_ptr,
             ).launch(
                 grid=(work_capacity, num_kv_heads, 1),
                 block=(BLOCK_THREADS, 1, 1),
