@@ -104,6 +104,23 @@ def test_native_ragged_tails(ctx):
 
 
 @requires_gfx950
+def test_native_scale_extremes(qdt):
+    """Per-token magnitudes spread over 2^-3 .. 2^3, so the e8m0 bytes walk across
+    the window e4m3 can still hold exactly: the scale really is applied per lane
+    group and per token, not once."""
+    c = fp8_test.make_prefill_case(2, 256, 3000)
+    span = torch.randint(-3, 4, (c["cache"].shape[0], P, 1), device="cuda")
+    k = c["cache"].to(torch.bfloat16) * (2.0 ** span.to(torch.bfloat16))
+    kd, ks, deq = fp4_test.quantize_mxfp4(k)
+    as_fp8 = deq.to(dtypes.fp8)
+    assert torch.equal(as_fp8.to(torch.bfloat16), deq), "left e4m3's exact range"
+    assert ks.min() < ks.max() - 6
+    c = dict(c, cache=as_fp8)
+    ref, live = fp8_test.aiter_scores(c)
+    fp8_test.assert_matches_aiter(run_native(c, kd, ks, qdt), ref, live, "scales")
+
+
+@requires_gfx950
 def test_native_ragged_batch_and_garbage_tails(qdt):
     """Unequal lengths, and the bytes past each request's end overwritten with 0xFF
     (e8m0 255 and NaN-ish nibbles): live scores do not move."""
