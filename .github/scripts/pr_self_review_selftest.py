@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Deterministic regression checks for the PR Self-Review gate."""
 
 from __future__ import annotations
