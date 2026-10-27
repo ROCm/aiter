@@ -40,6 +40,12 @@ def silu_mul_batch(gs, us):
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
 
 
+def silu_clamped_mul_batch(gates, ups, neg_clamp_limit):
+    """Clamped SiLU with unit sigmoid slope and no offset on the up branch."""
+    clamped = [clamp_gate_up(gate, up, neg_clamp_limit) for gate, up in zip(gates, ups)]
+    return silu_mul_batch([gate for gate, _ in clamped], [up for _, up in clamped])
+
+
 def swiglu_mul_batch(gs, us, neg_clamp_limit):
     out = []
     for i in range(len(gs)):
@@ -126,9 +132,11 @@ def situ_params(beta, beta_rcp, linear_beta, linear_beta_rcp, swiglu_limit):
 def gate_up_act(act, gs, us, situ=None):
     """Fused gate+up epilogue activation: ``act(gate) * up``.
 
-    ``act`` is a compile-time string ("silu", "swiglu", or "situv2");
-    ``situ`` carries runtime activation parameters for the latter two modes.
+    ``act`` is "silu", "silu_clamped", "swiglu", or "situv2";
+    ``situ`` carries runtime parameters for every mode except plain "silu".
     """
+    if const_expr(act == "silu_clamped"):
+        return silu_clamped_mul_batch(gs, us, situ.neg_clamp_limit)
     if const_expr(act == "situv2"):
         return situ_mul_batch(gs, us, *situ)
     if const_expr(act == "swiglu"):

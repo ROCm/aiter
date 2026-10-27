@@ -72,6 +72,7 @@ def flydsl_a16w4_gemm1(
     swiglu_limit=float("inf"),
     w_dtype="fp4",
     w_layout="standard",
+    activation_bf16=False,
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
@@ -97,6 +98,11 @@ def flydsl_a16w4_gemm1(
     the W-load cache modifier (0=cached, 2=nt), taken as-is (nt when unset).
 
     ``situ_beta``/``situ_linear_beta`` (SiTUv2 only) are runtime f32 scalars (nothing baked).
+
+    ``act="silu_clamped"`` computes ``silu(min(gate, limit)) *
+    clamp(up, -limit, limit)`` with runtime ``swiglu_limit > 0``; +inf disables
+    the clamp. ``activation_bf16=True`` rounds both GEMM accumulators to bf16
+    before this activation. Plain ``silu`` and the default rounding are unchanged.
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
@@ -104,6 +110,8 @@ def flydsl_a16w4_gemm1(
         raise NotImplementedError(
             f"a16w4 gemm1 only supports gate_mode='separated', got {gate_mode!r}"
         )
+    if act == "silu_clamped" and not float(swiglu_limit) > 0.0:
+        raise ValueError("silu_clamped requires swiglu_limit > 0")
 
     BM = tile_m
     TILE_K = tile_k
@@ -139,6 +147,7 @@ def flydsl_a16w4_gemm1(
         w_dtype=w_dtype,
         w_layout=w_layout,
         k_wave=k_wave,
+        activation_bf16=activation_bf16,
         rocm_arch=str(get_rocm_arch()),
     )
     max_m_blocks = int(sorted_expert_ids.numel())

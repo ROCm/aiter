@@ -56,6 +56,7 @@ def _gemm1_body_a16w4(
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
+    activation_bf16=False,
     rocm_arch="",
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
@@ -363,6 +364,9 @@ def _gemm1_body_a16w4(
             for ni in range_constexpr(num_acc_n):
                 g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
                 u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
+                if const_expr(activation_bf16):
+                    g = g.to(fx.BFloat16).to(fx.Float32)
+                    u = u.to(fx.BFloat16).to(fx.Float32)
                 y = gate_up_act(act, [g], [u], situ)[0]
                 yb = y.to(fx.BFloat16)
                 out_idx = sorted_row * inter_i32 + col_g_list[ni]
@@ -392,6 +396,7 @@ def compile_gemm1_a16w4_port(
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
+    activation_bf16=False,
     rocm_arch,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
@@ -411,6 +416,11 @@ def compile_gemm1_a16w4_port(
     ``k_wave`` (aiter slice-K, default 1): repartition 4 waves into (4/k_wave) N-waves x
     k_wave K-waves; partials LDS-reduced. k_wave in {1,2,4}; requires 4 % k_wave == 0 and
     D_HIDDEN % (k_wave*TILE_K) == 0.
+
+    ``act="silu_clamped"`` uses the runtime clamp without the GPT-OSS slope
+    or up offset. ``activation_bf16=True`` rounds GEMM accumulators to bf16
+    before that activation, matching a separate bf16 gate/up GEMM. Defaults
+    preserve the existing fused f32 activation path.
     """
     assert w_dtype in (
         "fp4",
@@ -470,10 +480,15 @@ def compile_gemm1_a16w4_port(
 
     assert act in (
         "silu",
+        "silu_clamped",
         "swiglu",
         "situv2",
-    ), f"a16w4 gemm1 act must be 'silu', 'swiglu', or 'situv2', got {act!r}"
+    ), f"unsupported a16w4 gemm1 activation: {act!r}"
+    if activation_bf16 and act != "silu_clamped":
+        raise ValueError("activation_bf16 requires act='silu_clamped'")
     _act_tag = "" if act == "silu" else f"_{act}"
+    if activation_bf16:
+        _act_tag += "_abf16"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     _wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
@@ -538,7 +553,7 @@ def compile_gemm1_a16w4_port(
             else:
                 _tile = bx_i32
             # Runtime activation scalars; plain silu ignores them.
-            if const_expr(act in ("swiglu", "situv2")):
+            if const_expr(act in ("swiglu", "situv2", "silu_clamped")):
                 _situ = situ_params(
                     fx.Float32(f32_situ_beta),
                     fx.Float32(f32_situ_beta_rcp),
@@ -574,6 +589,7 @@ def compile_gemm1_a16w4_port(
                 w_dtype=w_dtype,
                 w_layout=w_layout,
                 k_wave=k_wave,
+                activation_bf16=activation_bf16,
                 rocm_arch=rocm_arch,
             )
 
