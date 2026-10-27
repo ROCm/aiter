@@ -178,6 +178,74 @@ def build_moe_topids_to_rows_module():
     return launch_topids_to_rows
 
 
+def build_moe_topids_to_rows_valid_module():
+    """TP routing with a device-side real-route count, including graph replay.
+
+    ATOM can write -1 expert IDs into graph padding. These rows must never
+    index the expert counter, even though the physical buffer covers them.
+    Keep the no-count launcher unchanged for its existing callers.
+    """
+
+    @flyc.kernel(name="moe_route_valid_rows")
+    def route_kernel(
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        numel: Int32,
+        max_m: Int32,
+        num_experts: Int32,
+    ):
+        c0 = fx.Int32(0)
+        c1 = fx.Int32(1)
+        route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
+        if route < fx.Uint32(numel):
+            out_p = ptr_buf_tensor(topids_to_rows)
+            out_p[route] = fx.Int32(DROPPED_ROUTE_ROW)
+            nvr = ptr_buf_tensor(num_valid_routes)[c0]
+            if fx.Int32(route) < nvr:
+                e = fx.Int32(ptr_buf_tensor(topk_ids)[route])
+                if (e >= c0) & (e < num_experts):
+                    ptr = _i32_ptr(atomic_buffer) + e
+                    slot = fx.atomic_add(ptr, c1, syncscope="agent")
+                    out_p[route] = fx.Int32(slot) + e * max_m
+
+    @flyc.jit
+    def launch_topids_to_rows(
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        numel: fx.Int32,
+        max_m: fx.Int32,
+        num_experts: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        launch = route_kernel(
+            topk_ids,
+            atomic_buffer,
+            topids_to_rows,
+            num_valid_routes,
+            numel,
+            max_m,
+            num_experts,
+        )
+        launch.launch(
+            grid=(fx.Int64(grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_topids_to_rows.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_topids_to_rows
+
+
 def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
     """topids_to_rows with a fused EP global->local expert remap.
 

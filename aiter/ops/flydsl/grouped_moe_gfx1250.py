@@ -789,7 +789,17 @@ def _grouped_a8w4_tdm_moe(
             )
     else:
         _fuse_ep_route_quant = False
-        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+        # A real-row count also applies to TP (expert_mask is None).
+        # Carry it through route, remap, quant and gather; the router writes
+        # -1 IDs into padding, which the unbounded TP route kernel cannot use.
+        if num_local_tokens is not None:
+            _ep_nvt = num_local_tokens.reshape(-1)[:1].to(
+                device=device, dtype=torch.int32
+            ).contiguous()
+            _ep_nvr = (_ep_nvt * int(topk)).contiguous()
+        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
+            topk_ids, E, max_m, num_valid_routes=_ep_nvr
+        )
         ep_rowmap = None
     # EP gemm2-fused scatter: the ep_rowmap was allocated (and sentinel-filled by
     # the route kernel) above; build the scatter params dict for contiguous_psum_remap.
@@ -1370,7 +1380,7 @@ def _grouped_a8w4_tdm_moe(
         topids_to_rows,
         gather_w,
         out=moe_out,
-        num_valid_tokens=(_ep_nvt if _is_ep else None),
+        num_valid_tokens=_ep_nvt,
     )
     return moe_out
 
