@@ -571,11 +571,7 @@ def _load_hip_runtime():
     import glob
 
     if not IS_WINDOWS:
-        try:
-            return ctypes.CDLL("libamdhip64.so")
-        except OSError:
-            # Python ROCm SDK packages expose only the versioned HIP 7 library.
-            return ctypes.CDLL("libamdhip64.so.7")
+        return ctypes.CDLL("libamdhip64.so")
 
     # Windows ROCm ships a version-suffixed DLL, e.g. `amdhip64_7.dll`.
     from cpp_extension import _find_rocm_home
@@ -610,44 +606,6 @@ def _get_pci_chip_id(device_id=0):
     if err != 0:
         raise RuntimeError(f"hipDeviceGetAttribute(PciChipId) failed with error {err}")
     return chip_id.value
-
-
-def get_num_xcds(device_id: int | None = None) -> int:
-    """Return the XCC count HIP reports for a device, defaulting to the current one."""
-    if device_id is None:
-        import torch
-
-        device_id = torch.cuda.current_device()
-    return _get_num_xcds(device_id)
-
-
-@functools.cache
-def _get_num_xcds(device_id: int) -> int:
-    import ctypes
-
-    libhip = _load_hip_runtime()
-    num_xccs = ctypes.c_int(0)
-    # Available since ROCm 7.0.
-    hipDeviceAttributeNumberOfXccs = 10018
-    err = libhip.hipDeviceGetAttribute(
-        ctypes.byref(num_xccs),
-        hipDeviceAttributeNumberOfXccs,
-        device_id,
-    )
-    if err != 0:
-        # Clear HIP's last error so PyTorch does not report it on a later call.
-        libhip.hipGetLastError()
-        libhip.hipGetErrorString.restype = ctypes.c_char_p
-        raise RuntimeError(
-            f"hipDeviceGetAttribute(NumberOfXccs) failed for device {device_id}: "
-            f"{libhip.hipGetErrorString(err).decode()} ({err})"
-        )
-    if num_xccs.value < 1:
-        raise RuntimeError(
-            f"hipDeviceGetAttribute(NumberOfXccs) returned {num_xccs.value} "
-            f"for device {device_id}"
-        )
-    return num_xccs.value
 
 
 MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
