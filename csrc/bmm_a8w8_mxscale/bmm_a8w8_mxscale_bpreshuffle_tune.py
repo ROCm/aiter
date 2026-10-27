@@ -117,8 +117,7 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
                 raise ValueError("--opus_candidates all requires --pool preb")
             self.opus_policy = {
                 kid: opus_tune._TUNE_POLICY.get(kid, [1])
-                for family in opus_tune.a8w8_mxscale_bmm_kernel_lists
-                for kid, inst in family.items()
+                for kid, inst in opus_tune._CODEGEN_BMM.items()
                 if inst.needs_preshuffled_b
                 and inst.needs_shuffle_scale is None
                 and inst.needs_mpacked_sfa is None
@@ -161,8 +160,6 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
     def _saved_benchmark(self, row, seed):
         if str(row["libtype"]).lower() == "opus":
             kid = int(row["kernelId"])
-            if kid not in opus_tune._CODEGEN_BMM:
-                kid = opus_tune.bmm_mxscale_global_kid(kid)
             inst = opus_tune._CODEGEN_BMM.get(kid)
             if inst is None or not inst.needs_preshuffled_b:
                 raise ValueError(f"Kid {kid} does not read preshuffled B")
