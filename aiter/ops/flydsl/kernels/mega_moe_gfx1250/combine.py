@@ -24,7 +24,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
-from flydsl.expr import arith, range_constexpr, tdm_ops
+from flydsl.expr import arith, const_expr, range_constexpr, tdm_ops
 from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp4, cvt_scale_pk8_f32_fp8
 from flydsl.expr.typing import Int32, Int64, T
 from flydsl.expr.typing import Vector as Vec

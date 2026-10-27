@@ -550,7 +550,7 @@ class Routing:
 class MegaMoEGfx1250:
     """A8W4 EP MoE with GEMM2 P2P scatter fused into combine.
 
-        Optional RMSNorm added to each slot.
+    Optional RMSNorm added to each slot.
     """
 
     def __init__(
@@ -756,13 +756,9 @@ class MegaMoEGfx1250:
                 post_gemm2_rms_weight.dtype != torch.bfloat16
                 or not post_gemm2_rms_weight.is_contiguous()
             ):
-                raise ValueError(
-                    "post_gemm2_rms_weight must be contiguous bfloat16"
-                )
+                raise ValueError("post_gemm2_rms_weight must be contiguous bfloat16")
             if post_gemm2_rms_weight.device != hidden_states.device:
-                raise ValueError(
-                    "post_gemm2_rms_weight must be on the input device"
-                )
+                raise ValueError("post_gemm2_rms_weight must be on the input device")
             if post_gemm2_rms_eps <= 0:
                 raise ValueError("post_gemm2_rms_eps must be positive")
         elif post_gemm2_rms_weight is not None:
@@ -1876,9 +1872,7 @@ class MegaMoEGfx1250:
 
             rows = routing.token_count * self._config.topk
             normalized = self._rms_slots[:rows]
-            slot_capacity = (
-                self._config.max_tokens_per_rank * self._config.topk
-            )
+            slot_capacity = self._config.max_tokens_per_rank * self._config.topk
             slot_stride = self._config.combine_slot_stride_for(0) // 2
             slot_storage = _from_gpu_ptr(
                 self._arena.local_ptr("comb_inp"),

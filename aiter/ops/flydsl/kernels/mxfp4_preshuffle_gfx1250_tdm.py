@@ -1958,7 +1958,7 @@ def launch_gemm_a8w4_tdm(
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
                         _wf = (
-                            fx.Float32(1.0) # scattered output is unweighted
+                            fx.Float32(1.0)  # scattered output is unweighted
                             if post_gemm2_rmsnorm
                             else _wf_rows[wm]
                         )

@@ -1351,7 +1351,7 @@ def _grouped_a8w4_tdm_moe(
 
     if enable_ep_scatter:
         # GEMM2 already P2P-wrote every route result into the peers' combine
-        # buffers, so this only satisfies the custom-op's return contract; 
+        # buffers, so this only satisfies the custom-op's return contract;
         # MegaMoE ignores its contents and consumes comb_inp instead.
         return torch.empty((token_num, model_dim), dtype=dtype, device=device)
 
