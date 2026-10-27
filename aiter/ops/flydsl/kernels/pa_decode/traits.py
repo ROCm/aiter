@@ -853,15 +853,17 @@ class Gfx1250Traits:
         return 0 if self.bf16_page128_packed else self.q_tiles * 16 * self.q_stride
 
     @property
-    def fp8_dense_multi_tile(self):
+    def fp8_multi_tile(self):
         # Bound resident Q/output fragments: D128 fits four query tiles,
-        # D256 fits two. Both share packed pages and K/V operands.
+        # D256 fits two. Both share packed chunks and K/V operands;
+        # page16 and windowed attention retain 64-token chunks.
+        # A one-token window does not amortize resident operand setup.
         return (
             not self.bf16
             and self.head_dim in (128, 256)
-            and self.block_size == 128
+            and self.block_size >= 16
             and self.trans_v
-            and self.sliding_window == 0
+            and self.sliding_window != 1
             and 2 <= self.m_tiles
             and self.m_tiles * self.head_dim <= 512
         )
@@ -870,14 +872,14 @@ class Gfx1250Traits:
     def packed_lds(self):
         # FP8 cache layout is independent of scalar or per-token scales.
         # Page16 tiles gather one page per wave without padded LDS rows.
-        # Multiple query tiles reuse packed pages and K128 WMMA without
+        # Multiple query tiles reuse packed chunks and K128 WMMA without
         # fetching K/V again for each query tile.
         return (
             not self.bf16
             and self.head_dim in (128, 256)
             and self.block_size >= 16
             and self.trans_v
-            and (self.m_tiles == 1 or self.fp8_dense_multi_tile)
+            and (self.m_tiles == 1 or self.fp8_multi_tile)
         )
 
     @property
@@ -914,7 +916,7 @@ class Gfx1250Traits:
         # measured specializations separate from windowed and single-M D128 tiles.
         return (
             self.packed_lds
-            and (self.head_dim == 256 or self.fp8_dense_multi_tile)
+            and (self.head_dim == 256 or self.fp8_multi_tile)
             and self.block_size == 128
             and self.sliding_window == 0
         )
@@ -922,8 +924,13 @@ class Gfx1250Traits:
     @property
     def buffers(self):
         if self.packed_lds:
-            # Page16 gathering can overlap the next four pages in a second buffer.
-            return 2 if self.async_page or self.block_size == 16 else 1
+            # Multi-tile 64-token chunks overlap gathered pages or windowed
+            # staging just like the 128-token asynchronous page path.
+            return (
+                2
+                if self.async_page or self.block_size == 16 or self.fp8_multi_tile
+                else 1
+            )
         return (
             2 if self.q_bytes + 2 * self.kv_stride + self.p_bytes + 576 <= 327680 else 1
         )

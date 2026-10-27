@@ -882,7 +882,7 @@ class Gfx1250Pipeline:
         resident_q = (
             not t.bf16
             and (t.head_dim == 128 or t.packed_lds)
-            and (t.m_tiles == 1 or t.fp8_dense_multi_tile)
+            and (t.m_tiles == 1 or t.fp8_multi_tile)
         )
         if const_expr(resident_q):
             gpu.barrier()
@@ -967,20 +967,15 @@ class Gfx1250Pipeline:
                     vnorm = fx.Float32(
                         rcp_f32((vfactor != 0.0).select(vfactor, fx.Float32(1.0)))
                     )
-            # All query tiles read the same page. Retain its WMMA
+            # All query tiles read the same chunk. Retain its WMMA
             # operands instead of reloading K/V from LDS for each tile.
-            if const_expr(t.fp8_dense_multi_tile):
-                page_k_operands = [
+            if const_expr(t.fp8_multi_tile):
+                packed_k_operands = [
                     [
-                        self.mem.page_k_operand(
-                            kv_off + d * 128 * 128,
-                            ctx.warp * 32 + n * 16,
-                            ctx.lane16,
-                            ctx.half,
-                        )
+                        self.mem.packed_k_operand(kv_off, n, d)
                         for d in range_constexpr(t.head_dim // 128)
                     ]
-                    for n in range_constexpr(2)
+                    for n in range_constexpr(t.TOKENS // 64)
                 ]
                 page_v_operands = self.mem.page_v_operands(kv_off)
             next_state = []
@@ -1016,24 +1011,10 @@ class Gfx1250Pipeline:
                 for n in range_constexpr(t.TOKENS // 64):
                     scores = fx.Vector.filled(8, 0.0, fx.Float32)
                     for d in range_constexpr(t.head_dim // qk_k):
-                        if const_expr(t.fp8_dense_multi_tile):
-                            a = page_k_operands[n][d]
+                        if const_expr(t.fp8_multi_tile):
+                            a = packed_k_operands[n][d]
                         elif const_expr(t.packed_lds):
-                            if const_expr(t.TOKENS == 128):
-                                a = self.mem.page_k_operand(
-                                    kv_off + d * 128 * 128,
-                                    ctx.warp * 32 + n * 16,
-                                    ctx.lane16,
-                                    ctx.half,
-                                )
-                            else:
-                                a = self.mem.packed_operand(
-                                    kv_off + ctx.warp * t.head_dim * 16 + d * qk_k * 16,
-                                    16,
-                                    qk_k,
-                                    ctx.lane16,
-                                    ctx.half,
-                                )
+                            a = self.mem.packed_k_operand(kv_off, n, d)
                         elif const_expr(t.bf16_page16_packed):
                             a = self.mem.bf16_k_operand(
                                 kv_off + ctx.warp * t.head_dim * 32,
@@ -1155,7 +1136,7 @@ class Gfx1250Pipeline:
                     )
                 # Prefetch V operands before waiting for cross-wave P stores.
                 pv_k = 32 if t.bf16 else t.TOKENS
-                if const_expr(t.fp8_dense_multi_tile):
+                if const_expr(t.fp8_multi_tile):
                     v_operands = page_v_operands
                 elif const_expr(t.packed_lds):
                     v_operands = self.mem.page_v_operands(kv_off)

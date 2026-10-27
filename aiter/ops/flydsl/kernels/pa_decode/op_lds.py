@@ -1014,6 +1014,23 @@ class Gfx1250Memory:
                     16,
                 )
 
+    def packed_k_operand(self, kv_off, token_tile, dim_tile):
+        ctx, t = self.ctx, self.t
+        if const_expr(t.TOKENS == 128):
+            return self.page_k_operand(
+                kv_off + dim_tile * 128 * 128,
+                ctx.warp * 32 + token_tile * 16,
+                ctx.lane16,
+                ctx.half,
+            )
+        return self.packed_operand(
+            kv_off + ctx.warp * t.head_dim * 16 + dim_tile * 128 * 16,
+            16,
+            128,
+            ctx.lane16,
+            ctx.half,
+        )
+
     def page_k_operand(self, offset, token, lane16, half):
         words = []
         for j in range_constexpr(4):
