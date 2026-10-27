@@ -22,7 +22,7 @@ final output directly; other plans use the shared partition reducer.
 BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
 with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
-using the 64-token pipeline.
+using the 64-token pipeline, optionally with a three- or four-buffer K/V ring.
 
 Logical layouts (not preshuffled):
 
@@ -46,6 +46,9 @@ and LDS movement, MFMA/WMMA, softmax and output operations.
 ``PaDecodePipeline`` and ``Gfx1250Pipeline`` own prefetch ordering and barriers;
 this module keeps the compilation API and launch wrappers.
 """
+
+import dataclasses
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -82,6 +85,8 @@ __all__ = [
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
 _GFX1250_PA_DECODE_CACHE = {}
+# Forces the gfx1250 BF16 page16 K/V ring depth (2, 3 or 4); 0 selects it.
+_KV_BUFFERS = int(os.environ.get("AITER_FLYDSL_PA_KV_BUFFERS", "0"))
 
 
 def _pa_decode_tile_kernel_name(
@@ -97,6 +102,7 @@ def _pa_decode_tile_kernel_name(
     sliding_window,
     query_splits,
     direct_output=False,
+    kv_buffers=0,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -113,6 +119,8 @@ def _pa_decode_tile_kernel_name(
         name += f"_qs{query_splits}"
     if direct_output:
         name += "_direct"
+    if kv_buffers:
+        name += f"_kvbuf{kv_buffers}"
     return name
 
 
@@ -140,6 +148,7 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     direct_output: bool = False,
     trans_k: bool = True,
+    kv_buffers: int | None = None,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -172,6 +181,12 @@ def compile_pa_decode_tile(
     A one-partition gfx1250 plan can write final output directly when sinks
     are absent and query/output strides match. Other tasks write packed partials
     for the shared reducer, which applies sinks once.
+    ``kv_buffers=None`` gives gfx1250 BF16 page16 CTAs with one 16-row query
+    tile a three-buffer K/V ring, so two tiles of page gathers stay in flight,
+    when the grid needs at most two CTAs per CU and the ring's LDS keeps them
+    all resident. ``AITER_FLYDSL_PA_KV_BUFFERS`` or an explicit 2, 3 or 4
+    overrides that; shapes whose LDS cannot hold the ring keep the default
+    staging.
 
     Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
     Pages past the sequence are pinned to block 0; callers must leave the
@@ -199,6 +214,9 @@ def compile_pa_decode_tile(
                 and sliding_window == 0
                 else 1
             )
+        if kv_buffers is None:
+            kv_buffers = _KV_BUFFERS or None
+        ctas = work_capacity * num_kv_heads * query_splits
         return compile_gfx1250_pa_decode(
             head_dim=head_dim,
             query_group_size=query_group_size,
@@ -212,6 +230,8 @@ def compile_pa_decode_tile(
             compute_dtype=kv_dtype,
             direct_output=direct_output,
             query_splits=query_splits,
+            kv_buffers=kv_buffers,
+            ctas_per_cu=(ctas + num_compute_units - 1) // num_compute_units,
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
@@ -442,6 +462,20 @@ def compile_pa_decode_tile(
     return _PA_DECODE_TILE_CACHE.setdefault(traits.cache_key, compiled)
 
 
+def _auto_kv_buffers(t, ctas_per_cu):
+    """Select a three-buffer ring for latency-bound gfx1250 BF16 page16 CTAs.
+
+    One 16-row query tile leaves the page gathers exposed; more query tiles
+    hide them behind compute, so a deeper ring would only cost occupancy.
+    Grids above two CTAs per CU, or above what the ring's LDS footprint keeps
+    resident, retain the double buffer.
+    """
+    if not t.bf16_page16_packed or t.m_tiles != 1:
+        return 0
+    resident = 327680 // dataclasses.replace(t, kv_buffers=3).total_bytes
+    return 3 if ctas_per_cu <= min(2, resident) else 0
+
+
 def compile_gfx1250_pa_decode(
     *,
     head_dim,
@@ -456,9 +490,13 @@ def compile_gfx1250_pa_decode(
     compute_dtype="fp8",
     direct_output=False,
     query_splits=1,
+    kv_buffers=0,
+    ctas_per_cu=1,
 ):
     if query_splits not in (1, 2, 4) or query_length % query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
+    if kv_buffers not in (None, 0, 2, 3, 4):
+        raise ValueError(f"kv_buffers must be None, 0, 2, 3 or 4, got {kv_buffers}")
     t = Gfx1250Traits(
         head_dim,
         query_group_size,
@@ -473,6 +511,13 @@ def compile_gfx1250_pa_decode(
         direct_output,
         query_splits,
     )
+    if kv_buffers is None:
+        kv_buffers = _auto_kv_buffers(t, ctas_per_cu)
+    if kv_buffers and t.bf16_page16_packed:
+        ring = dataclasses.replace(t, kv_buffers=kv_buffers)
+        # Keep the default staging when LDS cannot hold the requested ring.
+        if ring.buffers != t.buffers and ring.total_bytes <= 327680:
+            t = ring
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
     if t.bf16 and per_token_kv:
@@ -501,6 +546,7 @@ def compile_gfx1250_pa_decode(
         sliding_window=sliding_window,
         query_splits=query_splits,
         direct_output=direct_output,
+        kv_buffers=t.kv_buffers,
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=(128, 1, 1))

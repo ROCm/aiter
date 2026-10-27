@@ -767,6 +767,8 @@ class Gfx1250Traits:
     compute_dtype: str = "fp8"
     direct_output: bool = False
     query_splits: int = 1
+    # K/V ring depth for BF16 page16 tiles; 0 keeps the default staging.
+    kv_buffers: int = 0
 
     WAVE = 32
     NWARP = 4
@@ -939,6 +941,10 @@ class Gfx1250Traits:
 
     @property
     def buffers(self):
+        if self.kv_buffers and self.bf16_page16_packed:
+            # Deeper rings keep buffers - 1 tiles in flight ahead of the one
+            # being computed.
+            return self.kv_buffers
         if self.packed_lds:
             # Multi-tile 64-token chunks overlap gathered pages or windowed
             # staging just like the 128-token asynchronous page path.

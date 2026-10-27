@@ -847,6 +847,26 @@ class Gfx1250Pipeline:
         self.mem = Gfx1250Memory(ctx)
 
     @flyc.jit
+    def wait_oldest_tile(self, later):
+        """Retire the oldest staged tile while ``later`` staged tiles stay in flight.
+
+        TDM transfers complete in issue order, and each staged BF16 page16 tile
+        holds at least two per-wave transfers (K, then V in one or two chunks).
+        """
+        if const_expr(self.t.buffers == 3):
+            if later > 0:
+                tdm_ops.tensor_wait(2)
+            else:
+                tdm_ops.tensor_wait(0)
+        else:
+            if later > 1:
+                tdm_ops.tensor_wait(4)
+            elif later > 0:
+                tdm_ops.tensor_wait(2)
+            else:
+                tdm_ops.tensor_wait(0)
+
+    @flyc.jit
     def run(self):
         ctx, t = self.ctx, self.t
         ctx.tid = fx.Int32(gpu.thread_id("x"))
@@ -865,6 +885,10 @@ class Gfx1250Pipeline:
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
         self.mem.stage_kv(begin, fx.Int32(0))
+        # Rings deeper than two buffers stage buffers - 1 tiles ahead.
+        for ahead in range_constexpr(1, t.buffers - 1):
+            if begin + ahead * t.TOKENS < end:
+                self.mem.stage_kv(begin + ahead * t.TOKENS, fx.Int32(ahead))
         # Per-M-tile state: maximum, denominator, then wave-owned D fragments.
         vh_count = t.head_dim // 64
         initial = []
@@ -912,7 +936,10 @@ class Gfx1250Pipeline:
             token_base = fx.Int32(token_i)
             buffer = ((token_base - begin) // t.TOKENS) % t.buffers
             if const_expr(t.use_tdm):
-                tdm_ops.tensor_wait(0)
+                if const_expr(t.buffers > 2):
+                    self.wait_oldest_tile((end - token_base) // t.TOKENS - 1)
+                else:
+                    tdm_ops.tensor_wait(0)
                 if const_expr(t.async_page or t.page16_async_scales):
                     fx.rocdl.s_wait_asynccnt(0)
             else:
@@ -922,6 +949,14 @@ class Gfx1250Pipeline:
             if const_expr(t.buffers == 2):  # noqa: SIM102
                 if token_base + t.TOKENS < end:
                     self.mem.stage_kv(token_base + t.TOKENS, 1 - buffer)
+            if const_expr(t.buffers > 2):  # noqa: SIM102
+                # The barrier above retired the previous tile, whose buffer
+                # this refills.
+                if token_base + (t.buffers - 1) * t.TOKENS < end:
+                    self.mem.stage_kv(
+                        token_base + (t.buffers - 1) * t.TOKENS,
+                        (buffer + t.buffers - 1) % t.buffers,
+                    )
             vnorm = fx.Float32(1.0)
             vfactor = fx.Float32(1.0 if t.bf16 else 1.0 / t.FP8_MAX)
             if const_expr(t.per_token_kv):
