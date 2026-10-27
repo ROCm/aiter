@@ -92,20 +92,38 @@ depend on which row geometries the kernels can build -- and checked in; edit the
 | `sweep` | plain one-shot, mesh and ring grids | `sweep` |
 | `validate` | plain one-shot and mesh grids (the choices the shipped dispatcher has) | `validate` |
 | `fused` | fused one-shot: every legal block x grid cap, and every legal split x block x cap | `fused-sweep` (one-shot chunks) |
-| `fused_qr` | fused mesh/ring: atoms per row x super-tile x grid cap | `fused-sweep` (`qr_` chunks) |
-| `fused_ll` | the low-latency fused mesh (`fused_fly_mesh_ll_st1_g<cap>`) and its default-build twin (`fused_fly_mesh_b256_st1_g<cap>`) | `low-latency` |
+| `fused_qr` | fused mesh/ring: atoms per row x super-tile x grid cap, and the low-latency mesh build (`fused_fly_mesh_ll_a<atoms_per_row>_st1_g<cap>`) | `fused-sweep` (`qr_` chunks) |
 | `smoke` | a few rows of each | `--smoke` |
 
 A row is timed only where it builds exactly as named; elsewhere its cell is empty (n/a): a block or
 split the width does not have, an `atoms_per_row` the width or world size does not have, a fused grid
-cap above the CU count (a fused launch is held to one workgroup per CU), or a one-shot payload above
-`AITER_BENCH_FLY1S_MAX_KB` (default 64 MiB).
+cap above the CU count (a fused launch is held to one workgroup per CU; two for the low-latency build), a
+low-latency row at a width whose block is not 256 threads (`hidden != 2048 * atoms_per_row`), or a one-shot
+payload above `AITER_BENCH_FLY1S_MAX_KB` (default 64 MiB).
+
+To see every configuration a test can pin -- not only the tuning grid -- run it with `--list-candidates`. It
+prints a candidate file on stdout, for `--operation` (default `ar`), the quick test's `-a` schedules and, for
+the fused rows, the widths and world sizes of the run (`-s`/`--shape-csv`, `--tp`; default the bench's).
+Edit or filter it, then time it like `candidates.csv`:
+
+```bash
+python ../test_flydsl_quick_allreduce.py --list-candidates --operation ar_rmsnorm -a mesh --shape-csv fused/shapes/fused_w4096.csv > mine.csv
+python ../test_flydsl_quick_allreduce.py --scenario bench --operation ar_rmsnorm -a mesh --tp 8 --shape-csv fused/shapes/fused_w4096.csv --candidates mine.csv
+```
 
 The names are the column prefixes of the bench tables and the keys the fits report. The shipping
 engines and stock kernels are read under fixed keys (`bench_io.SHIPPING`): `fly_1stage`, `fly_int4`,
 `fly_int4_ring`, `qr_int4`, `cdr`, `cdr_naive`, `rccl` for the plain bench, and `fused_fly_1stage`,
 `fused_fly_mesh`, `fused_fly_ring`, `fused_cdr_{1,2}stage`, `separate_{cdr,rccl,qr_int4}`, `fused_qr_int4`
 for the fused one.
+
+Of the stock kernels, the tuning chunks (`sweep`, `validate`, `fused-sweep`) time only the reference that the
+policy windows are placed against (the tests' `--baselines reference`): what production runs where FlyDSL
+declines a payload. In the one-shot test that is `CustomAllreduce`'s `cross_device_reduce` (`cdr`), or its
+fused kernel at both stage counts (`cdr_fused_{1,2}stage`); in the quick test the HIP quick all-reduce at
+INT4 (`hip`), or its fused kernel (`hip_fused`). `cdr_naive`, RCCL, the two-launch `<all-reduce>+norm`
+paths and the unfused FlyDSL paths are then neither built nor timed, which saves the slowest columns at large
+payloads. `--all-baselines` times them all again; `report` always does.
 
 ## Step-by-step
 
@@ -126,9 +144,9 @@ chunk is reported at the end and retried by simply running the command again. `-
 ```
 
 For each world size and each shape set, runs both tests' bench with `--candidate-set sweep`: the
-one-shot test times the shipping one-shot, every pinned one-shot row, `cdr`, `cdr_naive` and RCCL; the
-quick test times the shipping mesh and ring, every pinned mesh and ring row and the HIP quick
-all-reduce at INT4. Outputs `out/<host>/sweep/{oneshot,quick}_tp<N>_<shapes>.{csv,md,log}`.
+one-shot test times the shipping one-shot, every pinned one-shot row and `cdr` (with `--all-baselines`,
+`cdr_naive` and RCCL too); the quick test times the shipping mesh and ring, every pinned mesh and ring row
+and the HIP quick all-reduce at INT4. Outputs `out/<host>/sweep/{oneshot,quick}_tp<N>_<shapes>.{csv,md,log}`.
 
 Shape sets (`shapes/*.csv`, columns `M,K,label`):
 
@@ -153,8 +171,9 @@ the report top to bottom:
 * `fast` row: the one-shot ceiling (one-shot -> quantized mesh) and the mesh ceiling (mesh -> ring).
 * `holdout K=...` lines: must be `worst 1.000x`-ish. If a holdout K is clearly worse, payload bytes is
   the wrong key for this fabric and the tables below it are not trustworthy -- stop and investigate.
-* `exact vs primary/robust`: the exact one-shot ceiling, where aiter `cdr`/RCCL overtakes the one-shot
-  (what exact mode falls through to).
+* `exact vs primary/robust`: the exact one-shot ceiling, where aiter `cdr` overtakes the one-shot
+  (what exact mode falls through to). `robust` adds `cdr_naive` and RCCL as a cross-check, so it is
+  only there for a sweep run with `--all-baselines`.
 * `ladder oneshot/mesh/ring`: the instance per size range (`[min_bytes: candidate]`), with the worst regret
   and how it improves with more rungs. `ladder ring -- not dispatched here` means the ring never won
   and the existing rows can stay.
@@ -174,12 +193,13 @@ The sweep runs both tests' bench with `--operation ar_rmsnorm`, two chunks per (
 M = 1..2048 at each width (`fused/shapes/fused_w*.csv`):
 
 * `tp<N>_w<H>`: the one-shot test with `--candidate-set fused`: the shipping fused one-shot, every pinned
-  fused one-shot row, and `CustomAllreduce`'s fused kernel (1-stage and 2-stage) and the two-launch
-  `cdr`/RCCL + RMSNorm baselines.
+  fused one-shot row, and `CustomAllreduce`'s fused kernel (1-stage and 2-stage) (with `--all-baselines`,
+  also the two-launch `cdr`/RCCL + RMSNorm).
 * `qr_tp<N>_w<H>`: the quick test with `--candidate-set fused_qr`: the shipping fused mesh and ring, every
-  pinned fused mesh/ring row, and the HIP quick all-reduce's fused kernel and its two-launch form. Being
-  its own chunk, an older sweep directory picks it up on a plain re-run of `fused-sweep` without redoing
-  the one-shot.
+  pinned fused mesh/ring row, the low-latency mesh rows among them, and the HIP quick all-reduce's fused
+  kernel at INT4 where its row constraint allows (with `--all-baselines`, also its two-launch form,
+  `CustomAllreduce`'s kernels and the unfused FlyDSL paths). Being its own chunk, an older sweep directory
+  picks it up on a plain re-run of `fused-sweep` without redoing the one-shot.
 
 Output: `out/<host>/fused/sweep/{,qr_}tp<N>_w<H>.{csv,md,log}`.
 
@@ -194,18 +214,25 @@ ladder file `out/<host>/fused/fused_allreduce_ladders.json`. Per world size it p
     nearest split the width has. The width keeps it only when it beats the default there by `--width-gain`
     (geomean, default 2%); `default/own` is that speedup. Otherwise the line says the width runs the default.
 * `mesh` / `ring`: the same, default and per width, for the quantized schedules: an `atoms_per_row` and a
-  ladder of `(min_bytes, super_tile, grid_cap)` rungs, super-tile and cap chosen together per rung. The
+  ladder of `(min_bytes, super_tile, grid_cap)` rungs, super-tile and cap chosen together per rung. On xGMI
+  a mesh rung of a width's own ladder may be the low-latency build (`"low_latency": true`), where its rows
+  won; it exists only at the width whose row is a 256-thread block at that `atoms_per_row`, so the default
+  ladder never takes it. The
   `atoms_per_row` is the outer choice -- the line `log-regret by atoms_per_row` shows the margin -- and each
   candidate gets its own super-tile ladder; a width without that `atoms_per_row` runs the nearest it has, as the
   engine does. `shipped/fitted` is the speedup over the ladders the policy reads now (default or per width)
   inside that family's window. Fitted above the quantized one-shot ceiling only, since nothing below it
   dispatches to the mesh or ring; a family no swept shape dispatches to is "not dispatched" and keeps its
   ladders. Needs the `qr_` chunks; without them the fit says so and fits the one-shot only.
-* the exact one-shot ceiling (vs cdr), the quantized one-shot ceiling (vs the fitted mesh/ring) and the
-  mesh ceiling (vs ring), combined into a paste-ready `FamilyPolicy(...)` row of `FUSED_FAMILY_POLICIES`.
-  The windows are fitted against what each width runs (its own ladder, or the default).
-  `mesh=None` means the ring won everywhere above the one-shot; `ring=None` that the mesh won up to the
-  top of the sweep.
+* the exact one-shot ceiling (vs cdr), the quantized one-shot ceiling (vs the fitted mesh/ring), the
+  mesh ceiling (vs ring) and the quantized ceiling (vs the fallback), combined into a paste-ready
+  `FamilyPolicy(...)` row of `FUSED_FAMILY_POLICIES`. The fallback is what production runs with
+  quantization on where FlyDSL declines: the HIP quick all-reduce's fused kernel at INT4 (`hip_fused`)
+  where `CudaCommunicator` dispatches it -- not at its `use_1stage` sizes, nor for rows that do not divide
+  its 32 KiB tile, nor below its size floor -- and `CustomAllreduce`'s fused kernel elsewhere. It also
+  scores the gap between the exact one-shot window and the start of the quantized ones. The windows are
+  fitted against what each width runs (its own ladder, or the default). `mesh=None` means the ring won
+  everywhere above the one-shot; an open-ended last window that FlyDSL won up to the top of the sweep.
 * a per-shape table and the in-window geomeans: `ladder/best` (how close the fitted ladders are to the
   per-shape best), `default/ladder` (what the per-width ladders gain over the default), `cdr/ladder` (the
   speedup over aiter) and `shipped/ladder` (how much the currently shipped ladders lose against the fitted
@@ -311,59 +338,6 @@ Writes the tests' own bench tables -- the shipping engines against the stock ker
 default shapes, for both operations, per world size -- to `out/<host>/report/`: the form used for
 performance write-ups.
 
-### 8. Optional: is the low-latency mesh build worth a rung?
-
-```bash
-./tune.sh low-latency                            # TP 8 4 2 x the widths that have the build
-TUNE_CMD=low-latency sbatch slurm_tune.sbatch    # the same under Slurm
-```
-
-The fused mesh has a low-latency build (`MeshRMSNormEpilogue(low_latency=True)`): the residual is
-loaded ahead of the exchanges and two workgroups share a CU. It exists only at block 256 and
-super-tile 1, so a row is `hidden / 2048` atoms, which must divide the tile's 8: the mesh normalizes the
-gathered tile, so the row may span several ranks' chunks (unlike the ring's). That is hidden 2048, 4096,
-8192 and 16384 at every TP -- all of PR #6369's shapes. The fused fit does not time it and cannot emit a
-low-latency rung, and the ladder loader accepts one on xGMI only. Its shapes are its own
-(`fused/shapes/ll/ll_w<H>.csv`, M up to PR #6369's 16384 tokens, at most 256 MiB), so `fused-sweep` does
-not pay for them.
-
-The command times, per (TP, width) that has the build, the `fused_ll` set next to the shipping engines,
-into `out/<host>/low_latency/sweep/ll_tp<N>_w<H>.csv`: the low-latency rows at grid caps up to 512 (two
-per CU; a cap above the device's is n/a) and their twins, the default build at the same block (256) and
-super-tile (1) at caps up to 256. It then writes `low_latency/compare.txt` (and `compare.csv`, tagged
-with arch and link, to put two hosts side by side). Per shape, as speedups of the low-latency build
-(> 1: it is faster):
-
-* `auto/ll`: against what the fused policy dispatches -- the shipping engine of the family it routes the
-  payload to (`route`: one-shot, mesh or ring; `fallback` reads `CustomAllreduce`'s fused kernel). This is
-  the production question.
-* `twin/ll`: against the default build at its geometry -- what the low-latency build itself changes, apart
-  from its block and grid cap.
-* `mesh/ll`: against the shipping mesh even where the policy does not route to it. Read it with care: a
-  mesh ladder is only fitted where the mesh dispatches, so outside its window it may be a placeholder
-  (on PCIe TP2 the ring takes every quantized size, and the mesh runs the base file's `g64`).
-
-The summary counts the shapes where `auto/ll` and `twin/ll` exceed `1 + --min-gain` (default 3%), and
-the routes those wins fall in. A low-latency column whose variant is not a `_low_lat` kernel is reported
-and left out.
-
-### 9. Optional: PR #6369's original low-latency build
-
-```bash
-./tune.sh pr6369                              # TP 8 4 2
-TUNE_CMD=pr6369 sbatch slurm_tune.sbatch      # the same under Slurm
-```
-
-The port above can build the low-latency mesh at few widths. PR #6369's own kernel (`QuickAllReduceInt4`,
-commit `3c10d34a4`) kept 256 threads at every width and normalized in the all-gather epilogue, so a row
-could span several atoms. `pr6369_low_latency.py` extracts the PR's files from that commit into
-`out/<host>/pr6369/src` (they are no longer in the tree), and times its `allreduce_rmsnorm` per shape with
-the low-latency build as shipped and with it switched off (`_latency_max_tiles = 0`: the occupancy-pinned
-build of the same ST=1 engine). The PR's host takes the low-latency build only while the payload is at most
-two tiles per CU (16 MiB on 256 CUs), so of its benchmark shapes only TP4 256x8192 and 1024x8192 engage it;
-the default shapes add a sweep of small payloads. `compare.txt` reports `pinned/ll` (> 1: the low-latency
-build is faster), whether it engaged (`ll`), and whether both builds wrote bitwise-equal outputs.
-
 ## Known pitfalls
 
 * **`cdr` is bimodal on xGMI**: its 1-stage/2-stage choice can flip between runs, so a single pass can score
@@ -385,8 +359,6 @@ fit_allreduce_policy.py     plain fit + --audit-auto
 shapes/                     plain sweep shape sets (M,K,label)
 fused/analyze_fused.py      per-shape summary of the fused sweep
 fused/fit_fused.py          fused ladders (one-shot, mesh, ring; default and per width), row width and window fit
-fused/compare_low_latency.py  the low-latency mesh build vs the dispatched engine and its twin (tune.sh low-latency)
-pr6369_low_latency.py       PR #6369's original low-latency build on vs off (tune.sh pr6369)
 fused/ladders_json.py       writes the fused ladder file (fused_allreduce_ladders.json) the fit emits
 fused/shapes/               fused sweep shape sets, one per hidden size
 out/                        sweep data, fits, logs (git-ignored; large)

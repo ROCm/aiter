@@ -36,12 +36,16 @@ def oneshot_rung(min_bytes, atoms, grid_cap, split, fanout="peer") -> dict:
     }
 
 
-def two_shot_rung(min_bytes, super_tile, grid_cap) -> dict:
-    return {
+def two_shot_rung(min_bytes, super_tile, grid_cap, low_latency=False) -> dict:
+    """A mesh or ring rung; ``low_latency`` is written only when set."""
+    rung = {
         "min_bytes": byte_value(min_bytes),
         "super_tile": int(super_tile),
         "grid_cap": int(grid_cap),
     }
+    if low_latency:
+        rung["low_latency"] = True
+    return rung
 
 
 def entry(rungs, **extra) -> dict:

@@ -1,7 +1,8 @@
 """Summarize the fused AR+RMSNorm one-shot sweep (<sweep_dir>/tp{tp}_w{h}.csv).
 
 Per (tp, width, M): incumbent cdr (min of fused 1stage/2stage), cdr with a
-separate norm, what the shipped fused dispatcher runs in exact mode, the
+separate norm (only a sweep with ``--all-baselines`` times it), what the
+shipped fused dispatcher runs in exact mode, the
 shipped fused one-shot ladder, best unsplit / best split pinned row, overall
 winner and its resolved knobs (atoms, grid cap, split) parsed from the variant.
 """
@@ -131,6 +132,9 @@ def main():
             out["cdr"] / out[["best_unsplit", "best_split"]].min(axis=1)
         ).round(3)
         out["fusion gain (cdr)"] = (out["sep_cdr"] / out["cdr"]).round(3)
+        if out["sep_cdr"].isna().all():
+            # A sweep with --baselines reference does not time cdr+norm.
+            out = out.drop(columns=["sep_cdr", "fusion gain (cdr)"])
         print(out.round(2).to_string(index=False))
 
 

@@ -420,8 +420,9 @@ def fit_families(samples, *, exact_slack: float | None):
 # ceiling with no refit. See `allreduce_policy.resolve_oneshot`.
 EXACT_FALLBACK_PRIMARY = ("cdr",)
 # cdr's own 1stage/2stage internal dispatch has occasional cliffs (see the
-# KB); cdr_naive and rccl are measured and reported alongside as a robustness
-# check on the same boundary, not folded into the shipped table.
+# KB); cdr_naive and rccl, where the sweep timed them (tune.sh
+# --all-baselines), are reported alongside as a robustness check on the same
+# boundary, not folded into the shipped table.
 EXACT_FALLBACK_ROBUST = ("cdr", "cdr_naive", "rccl")
 
 CDR_1STAGE_MAX_BYTES = {4: 160 << 10, 8: 80 << 10}
@@ -1121,11 +1122,14 @@ def main():
         # decline path actually reaches (see EXACT_FALLBACK_PRIMARY/ROBUST).
         # This -- not the fit_families exact(legacy) row above -- is what
         # feeds the shipped oneshot_max_exact.
+        # The robust oracle's extra kernels are timed only by a sweep with
+        # every baseline (tune.sh --all-baselines); without them it is skipped.
+        robust = tuple(k for k in EXACT_FALLBACK_ROBUST if any(k in s.us for s in sub))
+        oracles = [("primary", EXACT_FALLBACK_PRIMARY)]
+        if robust != EXACT_FALLBACK_PRIMARY:
+            oracles.append(("robust", robust))
         new_ceiling = {}
-        for elabel, oracle_keys in (
-            ("primary", EXACT_FALLBACK_PRIMARY),
-            ("robust", EXACT_FALLBACK_ROBUST),
-        ):
+        for elabel, oracle_keys in oracles:
             ceiling, worst, mean, detail, _sat = fit_oneshot_exact_ceiling(
                 sub, oneshot_keys, oracle_keys, extra=cdr_edge_thresholds(tp)
             )
@@ -1145,12 +1149,13 @@ def main():
                 for nbytes, ratio in detail:
                     if ratio > 1.001:
                         logger.info("      %-10s %.3fx", human(nbytes), ratio)
-        if new_ceiling["robust"] != new_ceiling["primary"]:
+        if new_ceiling.get("robust", new_ceiling["primary"]) != new_ceiling["primary"]:
             logger.warning(
                 "  exact ceiling: primary (cdr only, %s) differs from robust "
-                "(cdr/cdr_naive/rccl, %s) -- shipping primary, since cdr is\n"
+                "(%s, %s) -- shipping primary, since cdr is\n"
                 "  what production actually falls through to.",
                 human(new_ceiling["primary"]),
+                "/".join(robust),
                 human(new_ceiling["robust"]),
             )
         exact_ceiling[(args.link, tp)] = new_ceiling["primary"]

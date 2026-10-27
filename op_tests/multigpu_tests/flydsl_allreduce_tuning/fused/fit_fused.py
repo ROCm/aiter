@@ -16,10 +16,19 @@ the quantized mesh/ring grid), and fits the ``allreduce_policy`` tables:
   for every width (a width that lacks that ``atoms_per_row`` runs the nearest
   one it has, as the engine does), and one per swept width, from the
   ``fused_fly_<alg>_a<apr>_st<st>_g<cap>`` rows. Super-tile and grid cap are
-  chosen together, per rung.
+  chosen together, per rung. On xGMI a per-width mesh rung may also be the
+  low-latency build (``fused_fly_mesh_ll_a<apr>_st1_g<cap>``), which exists
+  only where the row's block is 256 threads -- one width per
+  ``atoms_per_row`` -- so the default ladder, which runs at every width,
+  never takes it (as the default one-shot ladder never splits).
 * ``FUSED_FAMILY_POLICIES`` -- the exact one-shot window against cdr, the
-  quantized one-shot window against the fitted quantized schedules, and the
-  mesh/ring boundary between the two. Windows are half-open, as in the policy.
+  start of the quantized windows against what runs below them with
+  quantization on (the one-shot inside its window, production's fallback
+  above it), the mesh/ring boundary between the two, and the top of the
+  quantized windows against production's fallback. That fallback is the HIP
+  quick all-reduce's fused kernel at INT4 (``hip_fused`` of the ``qr_`` CSVs)
+  where ``CudaCommunicator`` dispatches it, and ``CustomAllreduce``'s fused
+  kernel elsewhere. Windows are half-open, as in the policy.
 
 Ladders are chosen by DP over payload breakpoints minimizing the summed
 log-regret against the per-shape best measured row of that family. A width
@@ -69,6 +78,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ladders_json
 
 SQNR_FLOOR = 40.0
+# The HIP quick all-reduce's fused kernel at INT4, as the quick test grades it.
+HIP_SQNR_FLOOR = 14.0
 # The quantized rows' floors.
 QR_SQNR_FLOOR = {"mesh": 15.0, "ring": 10.0}
 QR_ALGOS = ("mesh", "ring")
@@ -78,7 +89,7 @@ _VAR = re.compile(
     r"(?:_k(?P<k>\d+))?/"
 )
 _QR_KEY = re.compile(
-    r"^fused_fly_(?P<alg>mesh|ring)_a(?P<a>\d+)_st(?P<st>\d+)_g(?P<g>\d+)$"
+    r"^fused_fly_(?P<alg>mesh|ring)(?P<ll>_ll)?_a(?P<a>\d+)_st(?P<st>\d+)_g(?P<g>\d+)$"
 )
 ATOMS = (1, 2, 4)
 # ``atoms_per_row`` a quantized schedule's row may take, and what it must divide:
@@ -152,9 +163,9 @@ def load(sweep_dir, metric):
     """``({tp: [shape dict]}, arch)`` with per-shape measured {knobs: us}, cdr
     and the shipping mesh/ring.
 
-    ``qr`` holds the quantized grid, ``{alg: {(atoms_per_row, st, cap): us}}``,
-    joined on (TP, K, M) from the ``qr_`` CSVs, as are the shipping mesh/ring
-    times; empty for a sweep that has none.
+    ``qr`` holds the quantized grid, ``{alg: {(atoms_per_row, st, cap,
+    low_latency): us}}``, joined on (TP, K, M) from the ``qr_`` CSVs, as are
+    the shipping mesh/ring times; empty for a sweep that has none.
     """
     qr = defaultdict(lambda: defaultdict(dict))
     ship = defaultdict(dict)
@@ -167,6 +178,12 @@ def load(sweep_dir, metric):
             shape = (int(r["TP"]), int(r["K"]), int(r["M"]))
             for k in ("fused_fly_mesh", "fused_fly_ring"):
                 ship[shape][k] = _time(r, k, metric, None)
+            # The HIP quick all-reduce's fused kernel, where production
+            # would run it on the payload (its size gate; the row gate is
+            # the cell being empty).
+            hip = _time(r, "fused_qr_int4", metric, HIP_SQNR_FLOOR)
+            hip_prod = str(r.get("hip_fused in prod")) == "True"
+            ship[shape]["hip"] = hip if hip_prod else math.inf
             for k in keys:
                 m = _QR_KEY.match(k)
                 if not m:
@@ -174,7 +191,7 @@ def load(sweep_dir, metric):
                 v = _time(r, k, metric, QR_SQNR_FLOOR[m["alg"]])
                 if v == math.inf:
                     continue
-                knobs = (int(m["a"]), int(m["st"]), int(m["g"]))
+                knobs = (int(m["a"]), int(m["st"]), int(m["g"]), bool(m["ll"]))
                 qr[shape][m["alg"]][knobs] = v
 
     data = defaultdict(list)
@@ -204,6 +221,7 @@ def load(sweep_dir, metric):
                         _time(r, "fused_cdr_1stage", metric, None),
                         _time(r, "fused_cdr_2stage", metric, None),
                     ),
+                    "hip": ship[shape].get("hip", math.inf),
                     "mesh": ship[shape].get("fused_fly_mesh", math.inf),
                     "shipped": _time(r, "fused_fly_1stage", metric, None),
                     "qr": {alg: dict(qr[shape].get(alg, {})) for alg in QR_ALGOS},
@@ -228,12 +246,12 @@ def cfg_time(shape, cfg):
 
 def qr_time(shape, alg, apr, cfg):
     """Measured time of a fused *alg* engine pinned to *apr* at *cfg* =
-    ``(super_tile, grid_cap)``."""
-    st, cap = cfg
+    ``(super_tile, grid_cap, low_latency)``."""
+    st, cap, ll = cfg
     got = qr_resolve(shape["h"], shape["tp"], alg, apr)
     meas = shape["qr"][alg]
-    caps = [g for a, t, g in meas if (a, t) == (got, st) and g <= cap]
-    return meas[(got, st, max(caps))] if caps else math.inf
+    caps = [g for a, t, g, l in meas if (a, t, l) == (got, st, ll) and g <= cap]
+    return meas[(got, st, max(caps), ll)] if caps else math.inf
 
 
 def fit_ladder(shapes, max_rungs, penalty, cfgs, time, best):
@@ -309,20 +327,28 @@ def qr_best(shape, alg):
     return min(meas.values()) if meas else math.inf
 
 
-def fit_qr(shapes, alg, max_rungs, penalty):
+def fit_qr(shapes, alg, max_rungs, penalty, low_latency=False):
     """``(atoms_per_row, rungs, cost by atoms_per_row)`` for one schedule, or
     None when the sweep has no rows for it.
 
     One ``atoms_per_row`` serves every width of *shapes*, so it is the outer
-    choice: each candidate gets its own ``(super_tile, grid_cap)`` ladder, and
-    the one with the least total log-regret wins (ties to the narrower row,
-    i.e. the wider block).
+    choice: each candidate gets its own ``(super_tile, grid_cap,
+    low_latency)`` ladder, and the one with the least total log-regret wins
+    (ties to the narrower row, i.e. the wider block). A rung may be the
+    low-latency build only with *low_latency*.
     """
     shapes = [s for s in shapes if s["qr"][alg]]
     if not shapes:
         return None
     tp = shapes[0]["tp"]
-    cfgs = sorted({(st, g) for s in shapes for _a, st, g in s["qr"][alg]})
+    cfgs = sorted(
+        {
+            (st, g, ll)
+            for s in shapes
+            for _a, st, g, ll in s["qr"][alg]
+            if low_latency or not ll
+        }
+    )
     fits = {}
     span = 8 if alg == "mesh" else 8 // tp
     for apr in QR_ROW_ATOMS[alg]:
@@ -367,6 +393,27 @@ def _below(nbytes, T):
     return T is None or nbytes < T
 
 
+def _lower(a, b):
+    """The lower of two thresholds, None being no limit."""
+    return b if a is None else a if b is None else min(a, b)
+
+
+def use_1stage(tp, nbytes):
+    """``use_1stage`` of ``CudaCommunicator.fused_allreduce_rmsnorm`` at its
+    defaults: where it is set, production skips the HIP fused kernel."""
+    return nbytes <= 128 * 7168 * 2 // tp
+
+
+def fallback(s):
+    """What production runs where FlyDSL declines a payload with quantization
+    on: the HIP quick all-reduce's fused kernel at INT4 where
+    ``CudaCommunicator`` dispatches it, else ``CustomAllreduce``'s fused
+    kernel."""
+    if not use_1stage(s["tp"], s["nbytes"]) and s["hip"] < math.inf:
+        return s["hip"]
+    return s["cdr"]
+
+
 def _kb(mb):
     """*mb* bytes as the policy tables write them: ``384 * KiB``, ``4 * MiB``."""
     if mb is None:
@@ -379,27 +426,33 @@ def _kb(mb):
     return str(mb)
 
 
-def policy_literal(arch, link, tp, fast_max, exact_max, mesh_max, have) -> str:
+def policy_literal(
+    arch, link, tp, fast_max, exact_max, mesh_max, have, quant_max=None
+) -> str:
     """The ``FUSED_FAMILY_POLICIES`` row, checked by building it.
 
     The one-shot window is the exact ceiling *exact_max*; the quantized ceiling
     *fast_max* only places the start of the mesh or the ring, which take their
-    payloads first in fast mode.
+    payloads first in fast mode. *quant_max* ends the quantized windows: above
+    it production's fallback (``fallback``) is faster.
     """
     from aiter.ops.flydsl.allreduce_policy import FamilyPolicy, Window
 
     one = Window(0, exact_max)
-    if fast_max is None:
-        mesh = ring = None
-    elif have == ["ring"]:
-        mesh, ring = None, Window(fast_max, None)
-    else:
-        mesh = None if mesh_max == fast_max else Window(fast_max, mesh_max)
-        ring = (
-            None if mesh_max is None or "ring" not in have else Window(mesh_max, None)
-        )
-        if mesh is not None and mesh.max is not None and ring is None:
-            mesh = Window(fast_max, None)
+    mesh = ring = None
+    if fast_max is not None and not (quant_max is not None and quant_max <= fast_max):
+        if have == ["ring"]:
+            ring = Window(fast_max, quant_max)
+        else:
+            mesh_end = _lower(mesh_max if "ring" in have else None, quant_max)
+            if mesh_end is None or mesh_end > fast_max:
+                mesh = Window(fast_max, mesh_end)
+            if (
+                "ring" in have
+                and mesh_max is not None
+                and (quant_max is None or quant_max > mesh_max)
+            ):
+                ring = Window(mesh_max, quant_max)
     try:
         FamilyPolicy(
             arch=arch,
@@ -494,15 +547,19 @@ def fit_oneshot(shapes, args):
 
 
 def fit_qr_widths(shapes, alg, args):
-    """The *alg* fits, ``atoms_per_row`` and ladder, default and per width."""
+    """The *alg* fits, ``atoms_per_row`` and ladder, default and per width.
+    Only a width's own ladder may take the low-latency build, and only on
+    xGMI, the one link the ladder file accepts it on."""
 
-    def fit(ss):
-        return fit_qr(ss, alg, args.rungs, args.rung_penalty)
+    def fit(low_latency):
+        return lambda ss: fit_qr(
+            ss, alg, args.rungs, args.rung_penalty, low_latency=low_latency
+        )
 
     return fit_by_width(
         shapes,
-        fit,
-        fit,
+        fit(False),
+        fit(args.link == "xgmi"),
         lambda s, f: qr_ladder_time(s, alg, f[0], f[1]),
         args.min_width_gain,
     )
@@ -520,7 +577,10 @@ def qr_entry(fit) -> dict:
     entry."""
     apr, rungs, _by_apr = fit
     return ladders_json.entry(
-        (ladders_json.two_shot_rung(mb, st, cap) for mb, (st, cap), _c in rungs),
+        (
+            ladders_json.two_shot_rung(mb, st, cap, low_latency=ll)
+            for mb, (st, cap, ll), _c in rungs
+        ),
         atoms_per_row=apr,
     )
 
@@ -562,7 +622,7 @@ def shipped_qr_time(shape, alg, args):
     }
     apr = fused_qr_row_atoms(algorithm=alg, **kw)
     ship = tuple(
-        (r.min_bytes, (r.super_tile, r.grid_cap), 0.0)
+        (r.min_bytes, (r.super_tile, r.grid_cap, r.low_latency), 0.0)
         for r in SHIPPED_QR_LADDER[alg](**kw)
     )
     return qr_ladder_time(shape, alg, apr, ship)
@@ -641,6 +701,11 @@ def fit_tp(tp, shapes, args):
         one = fit_oneshot(win, args)
         exact_max = best_threshold(shapes, one.time, lambda s: s["cdr"])
 
+    def below_quant(s):
+        # With quantization on, what runs below the quantized windows: the
+        # one-shot inside its (exact) window, production's fallback above it.
+        return one.time(s) if _below(s["nbytes"], exact_max) else fallback(s)
+
     # Quantized schedules: fit each on every shape, take the one-shot
     # boundary against the faster of the two, then refit each above it --
     # a rung below the boundary is an engine nothing dispatches to. Once the
@@ -653,7 +718,7 @@ def fit_tp(tp, shapes, args):
 
     if have:
         fast_max = best_threshold(
-            shapes, one.time, lambda s: min(qtime(s, alg) for alg in have)
+            shapes, below_quant, lambda s: min(qtime(s, alg) for alg in have)
         )
         above = [s for s in shapes if not _below(s["nbytes"], fast_max)]
         for alg in have:
@@ -674,24 +739,33 @@ def fit_tp(tp, shapes, args):
                 return qtime(s, "mesh")
             return qtime(s, "ring")
 
-        fast_max = best_threshold(shapes, one.time, quant)
+        fast_max = best_threshold(shapes, below_quant, quant)
         if fast_max is None:
             mesh_max = None  # the one-shot wins everywhere: no quantized window
         elif mesh_max is not None and mesh_max < fast_max:
             mesh_max = fast_max  # the mesh window is empty
+        # The top of the quantized windows: above it production's fallback,
+        # the HIP fused kernel where it dispatches it, is faster.
+        top = [s for s in shapes if not _below(s["nbytes"], fast_max)]
+        quant_max = best_threshold(top, quant, fallback) if top else None
     else:
         print(
             "(no qr_tp*_w*.csv rows: mesh/ring not fitted; oneshot_max is against fused_fly_mesh)"
         )
-        mesh_max = None
+        mesh_max = quant_max = None
         fast_max = best_threshold(shapes, one.time, lambda s: s["mesh"])
     windows = {
         "mesh": [
             s
             for s in shapes
-            if not _below(s["nbytes"], fast_max) and _below(s["nbytes"], mesh_max)
+            if not _below(s["nbytes"], fast_max)
+            and _below(s["nbytes"], _lower(mesh_max, quant_max))
         ],
-        "ring": [s for s in shapes if not _below(s["nbytes"], mesh_max)],
+        "ring": [
+            s
+            for s in shapes
+            if not _below(s["nbytes"], mesh_max) and _below(s["nbytes"], quant_max)
+        ],
     }
     if have:
         # A family's ladder only ever serves its own window, so fit it there:
@@ -731,10 +805,18 @@ def fit_tp(tp, shapes, args):
     print(f"quant one-shot  < {_kb(fast_max)}  (vs the quantized schedules)")
     if have:
         print(f"mesh            < {_kb(mesh_max)}  (vs ring)")
-    print(policy_literal(args.arch, args.link, tp, fast_max, exact_max, mesh_max, have))
+        print(
+            f"quantized       < {_kb(quant_max)}  (vs the fallback: the HIP fused "
+            "kernel where production dispatches it, else cdr)"
+        )
+    print(
+        policy_literal(
+            args.arch, args.link, tp, fast_max, exact_max, mesh_max, have, quant_max
+        )
+    )
     print(
         f"{'h':>5} {'M':>5} {'KiB':>6} {'best':>7} {'ladder':>7} {'regret':>6} "
-        f"{'default':>7} {'shipped':>8} {'cdr':>7} {'mesh':>7} {'ring':>7} "
+        f"{'default':>7} {'shipped':>8} {'cdr':>7} {'hip':>7} {'mesh':>7} {'ring':>7} "
         f"{'lad/cdr':>7}  win"
     )
     for s in sorted(shapes, key=lambda s: (s["h"], s["M"])):
@@ -746,7 +828,7 @@ def fit_tp(tp, shapes, args):
         print(
             f"{s['h']:>5} {s['M']:>5} {s['nbytes'] >> 10:>6} {s['best']:>7.2f} {lt:>7.2f} "
             f"{lt / s['best']:>6.3f} {dt:>7.2f} {s['shipped']:>8.2f} {s['cdr']:>7.2f} "
-            f"{mt:>7.2f} {rt:>7.2f} {s['cdr'] / lt:>7.3f}  {mark}"
+            f"{s['hip']:>7.2f} {mt:>7.2f} {rt:>7.2f} {s['cdr'] / lt:>7.3f}  {mark}"
         )
     inw = [s for s in shapes if _below(s["nbytes"], exact_max)]
     if inw:

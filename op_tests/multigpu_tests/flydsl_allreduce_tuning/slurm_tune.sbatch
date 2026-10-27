@@ -26,7 +26,7 @@
 #   DRY_GPU_ARCHS (arch aiter imports for on the GPU-less dry run; default gfx950),
 #   TUNE_ARGS (extra tune.sh options for the real run, e.g. TUNE_ARGS='--tp "8 4"'),
 #   TUNE_CMD (the tune.sh command of the smoke, real and dry runs; default all, e.g.
-#   TUNE_CMD=low-latency for the low-latency comparison alone).
+#   TUNE_CMD=fused-sweep for the fused sweep alone).
 #SBATCH --job-name=flydsl-ar-tune
 #SBATCH --nodes=1
 #SBATCH --exclusive

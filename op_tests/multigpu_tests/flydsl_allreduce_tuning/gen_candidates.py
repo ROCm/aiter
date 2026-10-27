@@ -20,8 +20,7 @@ report, so they stay stable: ``fly_1stage_b<block>_a<atoms>_g<cap>``,
 ``fly_int4[_ring]_b<block>_st<st>_g<cap>``,
 ``fused_fly_1stage[_k<split>]_b<block>_g<cap>``,
 ``fused_fly_<mesh|ring>_a<atoms_per_row>_st<st>_g<cap>`` and
-``fused_fly_mesh_ll_st1_g<cap>`` (the low-latency mesh build) and
-``fused_fly_mesh_b<block>_st1_g<cap>`` (its default-build twin).
+``fused_fly_mesh_ll_a<atoms_per_row>_st1_g<cap>`` (the low-latency mesh build).
 
 Sets (``--candidate-set``):
 
@@ -29,11 +28,8 @@ Sets (``--candidate-set``):
 * ``validate``  -- the plain rows the shipped dispatcher can choose between
   (one-shot and mesh; the ring is never dispatched on xGMI).
 * ``fused``     -- the fused one-shot grid, unsplit and split.
-* ``fused_qr``  -- the fused mesh/ring grid.
-* ``fused_ll``  -- the low-latency mesh rows and their twins (the default build
-  at the same block and super-tile), timed by ``tune.sh low-latency`` against
-  the shipping engines. Not fitted: the fused fit cannot emit a low-latency
-  rung.
+* ``fused_qr``  -- the fused mesh/ring grid, the low-latency mesh build
+  included.
 * ``smoke``     -- a handful of rows of each, for ``tune.sh --smoke``.
 """
 
@@ -100,9 +96,8 @@ FUSED_QR_ROW_ATOMS = {"mesh": (1, 2, 4, 8), "ring": (1, 2, 4)}
 FUSED_QR_CAPS = (32, 64, 128, 256)
 # The low-latency mesh build runs two workgroups per CU, so its cap goes to
 # twice the CU count; a cap above that on a device is n/a there. It exists only
-# at ``block=BLOCK`` and ``super_tile=1``, which fixes ``atoms_per_row`` to
-# ``hidden / 2048``: hidden 2048, 4096, 8192 and 16384, at every world size (the
-# mesh's rows may span several ranks' chunks).
+# at ``block=BLOCK`` and ``super_tile=1``, so a row of ``atoms_per_row`` builds
+# only at hidden ``2048 * atoms_per_row``, and is n/a at other widths.
 FUSED_LL_CAPS = (*FUSED_QR_CAPS, 512)
 
 SMOKE = {
@@ -110,8 +105,8 @@ SMOKE = {
     "fly_int4_b256_st1_g128",
     "fused_fly_mesh_a1_st1_g128",
     "fused_fly_ring_a1_st8_g128",
-    "fused_fly_mesh_b256_st1_g128",
-    "fused_fly_mesh_ll_st1_g128",
+    # The smoke width is 4096, where the low-latency build is two atoms a row.
+    "fused_fly_mesh_ll_a2_st1_g128",
 }
 
 
@@ -130,7 +125,6 @@ def rows() -> list[dict]:
         fused_block_options,
         fused_split_options,
     )
-    from aiter.ops.flydsl.kernels.comm.transport import BLOCK
     from aiter.ops.flydsl.quick_allreduce import ALGORITHMS
 
     out = []
@@ -229,35 +223,23 @@ def rows() -> list[dict]:
                             atoms_per_row=apr,
                         )
                     )
-    # The low-latency build's twin: the default build at the same geometry
-    # (BLOCK threads, super-tile 1), so a comparison separates what the
-    # low-latency build changes from what its block or grid cap does.
-    for g in FUSED_QR_CAPS:
-        out.append(
-            _row(
-                f"fused_fly_mesh_b{BLOCK}_st1_g{g}",
-                "ar_rmsnorm",
-                "mesh",
-                ("fused_ll",),
-                super_tile=1,
-                grid_cap=g,
-                block=BLOCK,
-            )
-        )
-    # Pinned by block, not atoms_per_row: the build exists only at BLOCK.
-    for g in FUSED_LL_CAPS:
-        out.append(
-            _row(
-                f"fused_fly_mesh_ll_st1_g{g}",
-                "ar_rmsnorm",
-                "mesh",
-                ("fused_ll",),
-                super_tile=1,
-                grid_cap=g,
-                block=BLOCK,
-                low_latency=1,
-            )
-        )
+        if algorithm != "mesh":
+            continue
+        # The low-latency build, a mesh rung like any other in the fit.
+        for apr in FUSED_QR_ROW_ATOMS[algorithm]:
+            for g in FUSED_LL_CAPS:
+                out.append(
+                    _row(
+                        f"fused_fly_mesh_ll_a{apr}_st1_g{g}",
+                        "ar_rmsnorm",
+                        "mesh",
+                        ("fused_qr",),
+                        super_tile=1,
+                        grid_cap=g,
+                        atoms_per_row=apr,
+                        low_latency=1,
+                    )
+                )
     return out
 
 

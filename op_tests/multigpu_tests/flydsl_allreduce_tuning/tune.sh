@@ -14,7 +14,8 @@
 #   sweep        plain all-reduce sweep (fitting data)                       -> $OUT/sweep
 #   fit          fit FAMILY_POLICIES rows + ladders from the sweep             -> $OUT/fit/fit.txt
 #   fused-sweep  fused all-reduce+RMSNorm sweep: one-shot (split-H) and
-#                quantized mesh/ring (atoms per row x super-tile)            -> $OUT/fused/sweep
+#                quantized mesh/ring (atoms per row x super-tile, and the
+#                low-latency mesh build)                                     -> $OUT/fused/sweep
 #   fused-fit    fit the fused ladders (default + per width) and
 #                FUSED_FAMILY_POLICIES                                       -> $OUT/fused/fit.txt
 #                                         + the ladder file $OUT/fused/fused_allreduce_ladders.json
@@ -24,23 +25,21 @@
 #   validate     re-sweep the shipping engines vs the pinned rows            -> $OUT/validate
 #   audit        grade the shipped dispatcher against the best pinned row    -> $OUT/audit
 #   report       reference bench tables: shipping engines vs stock kernels   -> $OUT/report
-#   low-latency  the low-latency fused mesh build vs what the policy dispatches and
-#                vs its default-build twin, at each (TP, width) that has it; sweep, then
-#                compare (not part of `all`)                    -> $OUT/low_latency/compare.txt
-#   pr6369       PR #6369's original low-latency build vs its default build, at the PR's
-#                shapes and small payloads (not part of `all`)       -> $OUT/pr6369/compare.txt
 #
 # Options (before the command):
 #   --out DIR       output root (default: <this dir>/out/<host>; "out/" is git-ignored)
 #   --tp "8 4 2"    world sizes (default "8 4 2"; sizes above the GPU count are skipped)
 #   --link L        pcie|xgmi|auto (default auto: read from the KFD topology)
 #   --widths "..."  hidden sizes for the fused sweep (default "2048 3072 4096 7168 8192")
-#                   and for low-latency (default "2048 4096 8192 16384", its only
-#                   widths; shapes up to PR #6369's in fused/shapes/ll)
 #   --width-gain G  speedup over the default fused ladder, minus 1, that a width needs
 #                   to keep a ladder of its own (default 0.02)
 #   --smoke         plumbing check: 3 shapes, the `smoke` candidates, few samples
 #   --force         redo chunks whose CSV already exists (default: skip = resumable)
+#   --all-baselines sweep / validate / fused-sweep: also time the stock kernels and
+#                   unfused paths the fits do not read (default: only the reference the
+#                   policy windows are placed against -- cross_device_reduce in the
+#                   one-shot chunks, the HIP quick all-reduce at INT4 in the mesh/ring
+#                   ones; their fused kernels in the fused sweep)
 #   --dry-run       GPU-free rehearsal: runs the checks (GPU count not required), lists every
 #                   chunk with its bench command and verifies its inputs exist, and only
 #                   loads (--help) the fit scripts. Benchmarks and fits never run.
@@ -54,17 +53,18 @@ QUICK="$REPO/op_tests/multigpu_tests/test_flydsl_quick_allreduce.py"
 CANDS="$HERE/candidates.csv"
 PY=${PYTHON:-python}
 
-OUT=""; TPS="8 4 2"; LINK="auto"; WIDTHS="2048 3072 4096 7168 8192"; LL_WIDTHS="2048 4096 8192 16384"
-WIDTH_GAIN=0.02; SMOKE=0; FORCE=0; DRY=0
+OUT=""; TPS="8 4 2"; LINK="auto"; WIDTHS="2048 3072 4096 7168 8192"
+WIDTH_GAIN=0.02; SMOKE=0; FORCE=0; DRY=0; ALL_BASELINES=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --out) OUT=$2; shift 2 ;;
     --tp) TPS=$2; shift 2 ;;
     --link) LINK=$2; shift 2 ;;
-    --widths) WIDTHS=$2; LL_WIDTHS=$2; shift 2 ;;
+    --widths) WIDTHS=$2; shift 2 ;;
     --width-gain) WIDTH_GAIN=$2; shift 2 ;;
     --smoke) SMOKE=1; shift ;;
     --force) FORCE=1; shift ;;
+    --all-baselines) ALL_BASELINES=1; shift ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown option $1 (see --help)" >&2; exit 2 ;;
@@ -102,19 +102,24 @@ unset TRITON_LIBHIP_PATH
 # --- candidates and sampling -----------------------------------------------------------
 # Sets of candidates.csv (see gen_candidates.py): `sweep` for the plain fit,
 # `validate` for the shipped dispatcher's choices, `fused` and `fused_qr` for the
-# fused fit, `fused_ll` for the low-latency comparison.
-SWEEP_SET=sweep; VAL_SET=validate; FUSED_SET=fused; FUSED_QR_SET=fused_qr; LL_SET=fused_ll
+# fused fit.
+SWEEP_SET=sweep; VAL_SET=validate; FUSED_SET=fused; FUSED_QR_SET=fused_qr
 REPS=10; ROUNDS=12
-SHAPES=$HERE/shapes; FUSED_SHAPES=$HERE/fused/shapes; LL_SHAPES=$HERE/fused/shapes/ll
+# --baselines of every tuning chunk: the tests' `reference` is the stock kernel
+# production runs where FlyDSL declines, which is what the fits place the policy
+# windows against; the other stock kernels and the unfused paths are report-only.
+# `report` always times them all.
+BASELINES=reference
+[[ $ALL_BASELINES == 1 ]] && BASELINES=all
+SHAPES=$HERE/shapes; FUSED_SHAPES=$HERE/fused/shapes
 if [[ $SMOKE == 1 ]]; then
-  SWEEP_SET=smoke; VAL_SET=smoke; FUSED_SET=smoke; FUSED_QR_SET=smoke; LL_SET=smoke
+  SWEEP_SET=smoke; VAL_SET=smoke; FUSED_SET=smoke; FUSED_QR_SET=smoke
   REPS=2; ROUNDS=3; TPS=${TPS_SMOKE:-2}
-  WIDTHS="4096"; LL_WIDTHS="4096"
-  SHAPES=$OUT/smoke_shapes; FUSED_SHAPES=$OUT/smoke_shapes_fused; LL_SHAPES=$OUT/smoke_shapes_ll
-  mkdir -p "$SHAPES" "$FUSED_SHAPES" "$LL_SHAPES"
+  WIDTHS="4096"
+  SHAPES=$OUT/smoke_shapes; FUSED_SHAPES=$OUT/smoke_shapes_fused
+  mkdir -p "$SHAPES" "$FUSED_SHAPES"
   for f in "$HERE"/shapes/*.csv; do head -4 "$f" > "$SHAPES/$(basename "$f")"; done
   for f in "$HERE"/fused/shapes/*.csv; do head -4 "$f" > "$FUSED_SHAPES/$(basename "$f")"; done
-  for f in "$HERE"/fused/shapes/ll/*.csv; do head -4 "$f" > "$LL_SHAPES/$(basename "$f")"; done
 fi
 FAILED=()
 
@@ -218,9 +223,11 @@ plain_chunks() {
   for tp in $TPS; do tp_ok "$tp" || continue
     for shape in a_small a_large b_ksens; do
       bench_chunk "${prefix}oneshot_tp${tp}_${shape}" "$dir" "$ONESHOT" --tp "$tp" \
-        --shape-csv "$SHAPES/ar_sweep_${shape}.csv" --candidates "$CANDS" --candidate-set "$set"
+        --shape-csv "$SHAPES/ar_sweep_${shape}.csv" --candidates "$CANDS" --candidate-set "$set" \
+        --baselines "$BASELINES"
       bench_chunk "${prefix}quick_tp${tp}_${shape}" "$dir" "$QUICK" --tp "$tp" \
-        --shape-csv "$SHAPES/ar_sweep_${shape}.csv" --candidates "$CANDS" --candidate-set "$set"
+        --shape-csv "$SHAPES/ar_sweep_${shape}.csv" --candidates "$CANDS" --candidate-set "$set" \
+        --baselines "$BASELINES"
     done
   done
 }
@@ -345,10 +352,10 @@ cmd_fused_sweep() {
       # picks up the quantized rows without re-running the one-shot.
       bench_chunk "tp${tp}_w${h}" "$OUT/fused/sweep" "$ONESHOT" --operation ar_rmsnorm \
         --tp "$tp" --shape-csv "$FUSED_SHAPES/fused_w${h}.csv" \
-        --candidates "$CANDS" --candidate-set "$FUSED_SET"
+        --candidates "$CANDS" --candidate-set "$FUSED_SET" --baselines "$BASELINES"
       bench_chunk "qr_tp${tp}_w${h}" "$OUT/fused/sweep" "$QUICK" --operation ar_rmsnorm \
         --tp "$tp" --shape-csv "$FUSED_SHAPES/fused_w${h}.csv" \
-        --candidates "$CANDS" --candidate-set "$FUSED_QR_SET"
+        --candidates "$CANDS" --candidate-set "$FUSED_QR_SET" --baselines "$BASELINES"
     done
   done
   finish
@@ -368,69 +375,8 @@ cmd_fused_fit() {
     "(per-shape summary: $OUT/fused/summary.txt); README step 5"
 }
 
-# ll_ok <tp> <hidden>: whether the low-latency mesh build exists there. It is a
-# 256-thread build, so a row is hidden/2048 atoms, which must divide the tile's 8:
-# the mesh normalizes the gathered tile, so a row may span several ranks' chunks
-# and <tp> does not matter (_low_latency_hidden_ok in the quick test).
-ll_ok() {
-  local apr=$(($2 / 2048))
-  [[ $(($2 % 2048)) == 0 && $apr -ge 1 && $((8 % apr)) == 0 ]]
-}
-
-cmd_low_latency() {
-  NGPU=$(ngpu); resolve_link; write_provenance
-  local tp h p pairs=()
-  for tp in $TPS; do tp_ok "$tp" || continue
-    for h in $LL_WIDTHS; do
-      if ll_ok "$tp" "$h"; then pairs+=("$tp:$h"); else log "skip tp$tp w$h: no low-latency build"; fi
-    done
-  done
-  [[ ${#pairs[@]} -gt 0 ]] || die "no low-latency build at tp=[$TPS] widths=[$LL_WIDTHS]"
-  log "low-latency sweep: candidate set $LL_SET, (tp:width) = ${pairs[*]}"
-  plan ${#pairs[@]}
-  # The low-latency rows and their twins next to the shipping engines -- mesh and ring,
-  # since the policy may route a size to either; the rest of the grid is the fused
-  # sweep's business.
-  for p in "${pairs[@]}"; do
-    tp=${p%:*}; h=${p#*:}
-    bench_chunk "ll_tp${tp}_w${h}" "$OUT/low_latency/sweep" "$QUICK" --operation ar_rmsnorm \
-      --tp "$tp" --shape-csv "$LL_SHAPES/ll_w${h}.csv" \
-      --candidates "$CANDS" --candidate-set "$LL_SET"
-  done
-  finish
-  if [[ $DRY == 1 ]]; then dry_fit_scripts fused/compare_low_latency.py; return; fi
-  $PY "$HERE/fused/compare_low_latency.py" "$OUT/low_latency/sweep" --link "$LINK" \
-    --csv "$OUT/low_latency/compare.csv" 2>&1 | tee "$OUT/low_latency/compare.txt"
-  [[ ${PIPESTATUS[0]} == 0 ]] || die "compare_low_latency failed"
-  log "low-latency comparison -> $OUT/low_latency/compare.txt (per shape: compare.csv)"
-}
-
-# pr6369: one spawn per world size, so it is not chunked or resumable; --force is moot.
-cmd_pr6369() {
-  NGPU=$(ngpu); resolve_link; write_provenance
-  local dir=$OUT/pr6369 tps=() tp args=()
-  for tp in $TPS; do tp_ok "$tp" && tps+=("$tp"); done
-  [[ ${#tps[@]} -gt 0 ]] || die "no world size in [$TPS] fits $NGPU GPU(s)"
-  args=(--tp "${tps[@]}" --link "$LINK" --work "$dir" --csv "$dir/compare.csv")
-  [[ $SMOKE == 1 ]] && args+=(--shapes 16,4096 1024,8192 --rounds 2 --iters 11)
-  if [[ $DRY == 1 ]]; then
-    log "dry  pr6369: pr6369_low_latency.py ${args[*]}"
-    dry_fit_scripts pr6369_low_latency.py; return
-  fi
-  mkdir -p "$dir"
-  log "run  pr6369 (tp=${tps[*]})"
-  $PY "$HERE/pr6369_low_latency.py" "${args[@]}" > "$dir/compare.log" 2>&1
-  local rc=$?
-  # The report is the tail of the log: everything from its title on.
-  sed -n '/^# PR #6369/,$p' "$dir/compare.log" | tee "$dir/compare.txt"
-  [[ $rc == 0 ]] || die "pr6369 failed (rc=$rc, see $dir/compare.log)"
-  log "pr6369 comparison -> $dir/compare.txt (per shape: compare.csv)"
-}
-
 case $CMD in
   setup) cmd_setup ;;
-  low-latency) cmd_low_latency ;;
-  pr6369) cmd_pr6369 ;;
   check) cmd_check ;;
   sweep) cmd_sweep ;;
   fit) cmd_fit ;;
