@@ -156,8 +156,7 @@ def build_moe_topids_to_rows_module():
                 slot = fx.atomic_add(ptr, c1_i32, syncscope="agent")
                 row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
                 out_p[route] = row
-            unrouted = fx.Int32(e) < 0
-            if unrouted:
+            else:
                 out_p[route] = fx.Int32(DROPPED_ROUTE_ROW)
 
     @flyc.jit
