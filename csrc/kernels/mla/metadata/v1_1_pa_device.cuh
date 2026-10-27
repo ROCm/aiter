@@ -4,6 +4,18 @@
 
 constexpr int32_t kPaMetadataSharedMaxBatches = 512;
 constexpr int32_t kPaMetadataSharedMaxWaves = kPaMetadataSharedMaxBatches / opus::get_warp_size();
+constexpr int32_t kPaMetadataMaxBatches = 32768;
+
+struct PaMetadataV1ChunkRecord
+{
+    int64_t cost;
+    int32_t tasks;
+    int32_t reductions;
+    int32_t partials;
+    int32_t reserved[3];
+};
+
+static_assert(sizeof(PaMetadataV1ChunkRecord) == sizeof(PaWorkInfo));
 
 __device__ __forceinline__ void pa_metadata_v1_1_finalize(PaMetadataV1KernelParameter params);
 
@@ -448,6 +460,134 @@ void kn_get_pa_metadata_v1_1(PaMetadataV1KernelParameter params)
     }
 }
 
+__device__ __forceinline__ PaMetadataV1ChunkRecord* pa_metadata_v1_1_scratch(
+    PaMetadataV1KernelParameter params)
+{
+    const int64_t capacity = min(
+        static_cast<int64_t>(params.num_batches) * params.num_splits,
+        static_cast<int64_t>(params.num_batches) + params.num_cu / params.num_heads_k - 1);
+    auto* works = reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw);
+    return reinterpret_cast<PaMetadataV1ChunkRecord*>(works + capacity * params.num_heads_k);
+}
+
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
+void kn_scan_pa_metadata_v1_1_chunks(PaMetadataV1KernelParameter params)
+{
+    __shared__ int64_t wave_totals[kPaMetadataSharedMaxWaves];
+    const int32_t sequence = blockIdx.x * kPaMetadataSharedMaxBatches + threadIdx.x;
+    const bool active = sequence < params.num_batches;
+    const int32_t qo_length = active ?
+        params.p_seqlens_qo_indptr[sequence + 1] - params.p_seqlens_qo_indptr[sequence] : 0;
+    const uint32_t context = active ? max(params.p_context_lens[sequence], 0) : 0;
+    const uint32_t pages = (context + params.block_size - 1) >> (__ffs(params.block_size) - 1);
+    const int64_t cost_prefix = pa_metadata_v1_1_block_prefix(
+        static_cast<int64_t>(pages) * qo_length, wave_totals, false);
+    auto* rows = pa_metadata_v1_1_scratch(params);
+    if(active)
+        rows[sequence].cost = cost_prefix;
+    if(threadIdx.x == blockDim.x - 1)
+        rows[params.num_batches + blockIdx.x].cost = cost_prefix;
+}
+
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
+void kn_plan_pa_metadata_v1_1_chunks(PaMetadataV1KernelParameter params)
+{
+    __shared__ int64_t wave_totals[kPaMetadataSharedMaxWaves];
+    const int32_t sequence = blockIdx.x * kPaMetadataSharedMaxBatches + threadIdx.x;
+    const bool active = sequence < params.num_batches;
+    const int32_t chunks = (params.num_batches + kPaMetadataSharedMaxBatches - 1) /
+                           kPaMetadataSharedMaxBatches;
+    auto* rows = pa_metadata_v1_1_scratch(params);
+    auto* costs = rows + params.num_batches;
+    auto* counts = costs + chunks;
+    int64_t total_cost = 0;
+    int64_t cost_base = 0;
+    for(int32_t chunk = 0; chunk < chunks; ++chunk)
+    {
+        total_cost += costs[chunk].cost;
+        if(chunk < blockIdx.x)
+            cost_base += costs[chunk].cost;
+    }
+    const int32_t qo_length = active ?
+        params.p_seqlens_qo_indptr[sequence + 1] - params.p_seqlens_qo_indptr[sequence] : 0;
+    const uint32_t context = active ? max(params.p_context_lens[sequence], 0) : 0;
+    const uint32_t pages = (context + params.block_size - 1) >> (__ffs(params.block_size) - 1);
+    const int64_t tiles = (context + params.kv_granularity - 1) >>
+                          (__ffs(params.kv_granularity) - 1);
+    const int64_t cost_before = active ?
+        cost_base + rows[sequence].cost - static_cast<int64_t>(pages) * qo_length : 0;
+    const int32_t parts = min(params.num_splits, pa_metadata_v1_1_fragments(
+        cost_before, tiles, static_cast<int64_t>(params.blocks_per_unit) * qo_length,
+        max(total_cost, int64_t{1}), params.num_cu / params.num_heads_k));
+    const int32_t reductions = parts > 1 ? parts : 0;
+    const int32_t task_prefix = static_cast<int32_t>(pa_metadata_v1_1_block_prefix(
+        parts, wave_totals, false));
+    const int32_t reduce_prefix = static_cast<int32_t>(pa_metadata_v1_1_block_prefix(
+        reductions, wave_totals, false));
+    const int32_t partial_prefix = static_cast<int32_t>(pa_metadata_v1_1_block_prefix(
+        reductions * qo_length, wave_totals, false));
+    if(active)
+    {
+        rows[sequence].cost = cost_before;
+        rows[sequence].tasks = task_prefix;
+        rows[sequence].reductions = reduce_prefix;
+        rows[sequence].partials = partial_prefix;
+    }
+    if(threadIdx.x == blockDim.x - 1)
+    {
+        counts[blockIdx.x].tasks = task_prefix;
+        counts[blockIdx.x].reductions = reduce_prefix;
+        counts[blockIdx.x].partials = partial_prefix;
+    }
+}
+
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
+void kn_emit_pa_metadata_v1_1_chunks(PaMetadataV1KernelParameter params)
+{
+    const int32_t sequence = blockIdx.x * kPaMetadataSharedMaxBatches + threadIdx.x;
+    if(sequence >= params.num_batches)
+        return;
+    const int32_t chunks = (params.num_batches + kPaMetadataSharedMaxBatches - 1) /
+                           kPaMetadataSharedMaxBatches;
+    auto* rows = pa_metadata_v1_1_scratch(params);
+    auto* costs = rows + params.num_batches;
+    auto* counts = costs + chunks;
+    int64_t total_cost = 0;
+    int32_t total_tasks = 0;
+    int32_t task_base = 0;
+    int32_t reduce_base = 0;
+    int32_t partial_base = 0;
+    for(int32_t chunk = 0; chunk < chunks; ++chunk)
+    {
+        total_cost += costs[chunk].cost;
+        total_tasks += counts[chunk].tasks;
+        if(chunk < blockIdx.x)
+        {
+            task_base += counts[chunk].tasks;
+            reduce_base += counts[chunk].reductions;
+            partial_base += counts[chunk].partials;
+        }
+    }
+    const int32_t local_task_base = threadIdx.x > 0 ? rows[sequence - 1].tasks : 0;
+    const int32_t local_reduce_base = threadIdx.x > 0 ? rows[sequence - 1].reductions : 0;
+    const int32_t local_partial_base = threadIdx.x > 0 ? rows[sequence - 1].partials : 0;
+    const int32_t parts = rows[sequence].tasks - local_task_base;
+    params.p_reduce_indptr[sequence + 1] = reduce_base + rows[sequence].reductions;
+    params.p_reduce_final_map[sequence * 2] = params.p_seqlens_qo_indptr[sequence];
+    params.p_reduce_final_map[sequence * 2 + 1] = params.p_seqlens_qo_indptr[sequence + 1];
+    if(sequence == 0)
+    {
+        params.p_reduce_indptr[0] = 0;
+        params.p_work_indptr[params.num_cu] = total_tasks * params.num_heads_k;
+        params.p_work_metadata_ptrs[0] = reinterpret_cast<uintptr_t>(params.p_work_indptr);
+        params.p_work_metadata_ptrs[1] = reinterpret_cast<uintptr_t>(params.p_work_info_set_raw);
+    }
+    for(int32_t part = 0; part < parts; ++part)
+        pa_metadata_v1_1_emit(params, sequence, part, parts, 0, rows[sequence].cost,
+            task_base + local_task_base, reduce_base + local_reduce_base,
+            partial_base + local_partial_base, total_tasks, false, max(total_cost, int64_t{1}));
+}
+
 __device__ __forceinline__ void pa_metadata_v1_1_finalize(PaMetadataV1KernelParameter params)
 {
     auto* works = reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw);
@@ -507,7 +647,8 @@ void get_pa_metadata_v1_1_device(
     HIP_CALL(hipGetDeviceProperties(&properties, device));
     const int32_t workers = properties.multiProcessorCount;
     const int32_t batches = context_lens.size(0);
-    AITER_CHECK(batches > 0 && batches <= 4096, "PA v1_1 supports batches in [1, 4096]");
+    AITER_CHECK(batches > 0 && batches <= kPaMetadataMaxBatches,
+                "PA v1_1 supports batches in [1, 32768]");
     AITER_CHECK(num_heads_k > 0 && num_heads_k <= workers, "invalid PA v1_1 KV head count");
     AITER_CHECK(topk < 0, "PA v1_1 supports dense attention only");
     AITER_CHECK(max_seqlen_qo > 0 && num_heads_per_head_k > 0 &&
@@ -528,10 +669,17 @@ void get_pa_metadata_v1_1_device(
     const int32_t capacity = static_cast<int32_t>(std::min(
         static_cast<int64_t>(batches) * max_partitions,
         static_cast<int64_t>(batches) + workers / num_heads_k - 1));
+    const int32_t reduce_capacity = max_partitions == 1 ? 0 :
+        std::min(capacity, 2 * (workers / num_heads_k - 1));
+    const int32_t chunks = (batches + kPaMetadataSharedMaxBatches - 1) /
+                           kPaMetadataSharedMaxBatches;
+    const int64_t scratch_rows = batches > kPaMetadataSharedMaxBatches ?
+        static_cast<int64_t>(batches) + 2 * chunks : 0;
     AITER_CHECK(work_metadata_ptrs.numel() >= 2 && work_indptr.numel() >= workers + 1 &&
-                work_info_set.numel() >= static_cast<int64_t>(capacity) * num_heads_k * 8 &&
+                work_info_set.numel() >= (static_cast<int64_t>(capacity) * num_heads_k +
+                                         scratch_rows) * 8 &&
                 reduce_indptr.numel() >= batches + 1 && reduce_final_map.numel() >= batches * 2 &&
-                reduce_partial_map.numel() >= capacity,
+                reduce_partial_map.numel() >= reduce_capacity,
                 "PA v1_1 buffers are too small; use get_pa_metadata_info_v1(..., fast_mode=False)");
 
     PaMetadataV1KernelParameter params{};
@@ -563,8 +711,20 @@ void get_pa_metadata_v1_1_device(
         HIP_CALL_LAUNCH(hipGetLastError());
         return;
     }
-    kn_get_pa_metadata_v1_1<<<batches, properties.warpSize, 0, stream>>>(params);
-    HIP_CALL_LAUNCH(hipGetLastError());
+    if(num_heads_k == 1 && ori_uni_seqlen_qo > 0 && batches < 2 * workers)
+    {
+        kn_get_pa_metadata_v1_1<<<batches, properties.warpSize, 0, stream>>>(params);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    }
+    else
+    {
+        kn_scan_pa_metadata_v1_1_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+        HIP_CALL_LAUNCH(hipGetLastError());
+        kn_plan_pa_metadata_v1_1_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+        HIP_CALL_LAUNCH(hipGetLastError());
+        kn_emit_pa_metadata_v1_1_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    }
     kn_finalize_pa_metadata_v1_1<<<1, properties.warpSize, 0, stream>>>(params);
     HIP_CALL_LAUNCH(hipGetLastError());
 }

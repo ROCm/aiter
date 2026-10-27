@@ -957,6 +957,8 @@ def get_pa_metadata_info_v1(
     """
     Pass the same fast_mode and max_split_per_batch to get_pa_metadata_v1.
     fast_mode=False reserves the prefix-budget planner's packed task capacity.
+    With fast_mode=False, reduction capacity excludes unsplit work and is zero
+    when splitting is disabled.
 
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
@@ -976,21 +978,26 @@ def get_pa_metadata_info_v1(
     max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
 
     if not fast_mode:
-        if not 1 <= batch_size <= 4096 or not 1 <= num_head_k <= cu_num:
+        if not 1 <= batch_size <= 32768 or not 1 <= num_head_k <= cu_num:
             raise ValueError(
-                "proportional PA planning requires 1 <= batch <= 4096 and 1 <= KV heads <= CUs"
+                "proportional PA planning requires 1 <= batch <= 32768 and 1 <= KV heads <= CUs"
             )
         if max_split_per_batch == 0 or max_split_per_batch < -1:
             raise ValueError("max_split_per_batch must be -1 or positive")
         max_partitions = (
             cu_num if max_split_per_batch < 0 else min(cu_num, max_split_per_batch)
         )
+        split_boundaries = cu_num // num_head_k - 1
         capacity = min(
             batch_size * max_partitions,
-            batch_size + cu_num // num_head_k - 1,
+            batch_size + split_boundaries,
         )
         max_work = capacity * num_head_k
-        max_split_tiles = capacity
+        if batch_size > 512:
+            max_work += batch_size + 2 * ((batch_size + 511) // 512)
+        max_split_tiles = (
+            0 if max_partitions == 1 else min(capacity, 2 * split_boundaries)
+        )
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs
@@ -1040,14 +1047,18 @@ def get_pa_metadata_v1(
             fast_mode: True keeps the existing PA v1_2 planner. False selects the PA v1_1
                        prefix-budget planner, not MLA's cost-sorted v1_1. Allocate buffers with
                        get_pa_metadata_info_v1 using the same fast_mode/max_split_per_batch.
-                       v1_1 supports dense batches up to 4096 with positive Q lengths and
+                       v1_1 supports dense batches up to 32768 with positive Q lengths and
                        max_seqlen_qo * num_heads_per_head_k <= 128 (one Q tile). KV granularity
                        is at least 256 tokens and must be a multiple of block_size. Inputs must provide consistent Q/page
                        indptrs and valid context lengths. Empty contexts receive no work; callers
                        remain responsible for their final output values.
                        Batches up to 512 share a block-wide prefix scan, write tasks in parallel,
-                       and finalize work_indptr in the same launch. Larger batches use per-request
-                       planning and a same-stream finalizer. No GPU-to-CPU length readback is needed.
+                       and finalize work_indptr in the same launch. Larger batches use chunked
+                       planning and a same-stream finalizer, retaining per-request planning only
+                       for eligible small proportional batches. No GPU-to-CPU readback is needed.
+                       The work-info allocation includes an internal scratch tail for large batches;
+                       only records before work_indptr[-1] are attention tasks. Reallocate buffers
+                       with get_pa_metadata_info_v1 when updating from the previous planner.
                        Prefix sums of page count times Q length divide work into persistent
                        worker budgets. Contiguous tiles of one request assigned to the same
                        worker form one partition, avoiding redundant partial outputs. Unlike
