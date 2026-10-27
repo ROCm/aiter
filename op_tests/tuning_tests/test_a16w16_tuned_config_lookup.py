@@ -259,6 +259,43 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
 
         assert any(config["block_n"] == 256 for config in configs)
 
+    def test_near_cu_rectangular_tile_survives_pruning(self):
+        from types import SimpleNamespace
+
+        import aiter.ops.flydsl.gemm_a16w16_policy as policy
+
+        props = SimpleNamespace(
+            multi_processor_count=256,
+            warp_size=64,
+            max_threads_per_multi_processor=2048,
+        )
+        with (
+            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(torch.cuda, "current_device", lambda: 0),
+            mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
+            mock.patch.object(
+                policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
+            ),
+        ):
+            configs = policy.get_flydsl_a16w16_configs(
+                2079,
+                6288,
+                7168,
+                torch.bfloat16,
+                torch.bfloat16,
+                False,
+            )
+
+        assert any(
+            config["block_m"] == 224
+            and config["block_n"] == 256
+            and config["block_k"] == 64
+            and config["stages"] == 2
+            and config["m_waves"] == 2
+            and config["n_waves"] == 4
+            for config in configs
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

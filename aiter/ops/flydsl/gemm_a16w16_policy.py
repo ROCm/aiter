@@ -103,13 +103,16 @@ class GemmConfigPruner:
         kept = []
         for config, iou in zip(configs, ious):
             tiles = self._tiles(config)
+            near_cu_rect = (
+                iou >= 0.90 and tiles * 4 >= num_cus * 3 and tiles * 4 <= num_cus * 5
+            )
             max_split_k = (
                 1
                 if tiles >= num_cus
                 else self._ceil_div(self.max_split_grid_rounds * num_cus, tiles)
             )
             if (
-                iou >= min_iou
+                (iou >= min_iou or near_cu_rect)
                 and tiles <= max_tiles
                 and config["split_k"] <= max_split_k
                 and (config["group_m"] == 0 or (tiles >= num_cus and tiles % 8 == 0))
@@ -227,7 +230,7 @@ def get_flydsl_a16w16_configs(
     split_k_candidates = [1]
     split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
     selections = {
-        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
+        "block_m": [16, 32, 48, 64, 80, 96, 128, 224, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
         "block_k": [64, 128, 256],
         "stages": list(range(2, 10)),
@@ -287,7 +290,7 @@ def get_flydsl_a16w16_configs(
         if not is_large_gemm and not config["use_half_tile_interleaved"]:
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
-            if mma_m_iters > 4 or mma_n_iters > 4:
+            if (mma_m_iters > 4 or mma_n_iters > 4) and config["block_m"] != 224:
                 continue
 
         validation_config = {

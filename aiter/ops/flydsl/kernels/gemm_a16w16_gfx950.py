@@ -196,8 +196,9 @@ def make_gemm_a16w16_gfx950_param(
             f"ldg_y_threads={ldg_y_threads}, ldg_x_threads={ldg_x_threads}, "
             f"block_threads={block_threads}"
         )
-    ldg_a_iters = (block_m * block_k) // (block_threads * async_load_vec_size)
-    ldg_b_iters = (block_n * block_k) // (block_threads * async_load_vec_size)
+    load_elems_per_iter = block_threads * async_load_vec_size
+    ldg_a_iters = (block_m * block_k + load_elems_per_iter - 1) // load_elems_per_iter
+    ldg_b_iters = (block_n * block_k + load_elems_per_iter - 1) // load_elems_per_iter
     if use_half_tile_interleaved:
         half_ldg_a_iters = ((block_m // 2) * block_k) // (
             block_threads * async_load_vec_size
@@ -225,22 +226,22 @@ def make_gemm_a16w16_gfx950_param(
                 f"block_threads={block_threads}, async_load_vec_size={async_load_vec_size}, "
                 f"half_ldg_b_iters={half_ldg_b_iters}"
             )
-    if ldg_a_iters * block_threads * async_load_vec_size != block_m * block_k:
+    if ldg_a_iters * load_elems_per_iter < block_m * block_k:
         raise ValueError(
-            "A async load tile must be exactly covered by whole-thread vector loads: "
+            "A async load tile is not covered by whole-thread vector loads: "
             f"block_m={block_m}, block_k={block_k}, "
             f"block_threads={block_threads}, async_load_vec_size={async_load_vec_size}, "
             f"ldg_a_iters={ldg_a_iters}, "
-            f"covered={ldg_a_iters * block_threads * async_load_vec_size}, "
+            f"covered={ldg_a_iters * load_elems_per_iter}, "
             f"required={block_m * block_k}"
         )
-    if ldg_b_iters * block_threads * async_load_vec_size != block_n * block_k:
+    if ldg_b_iters * load_elems_per_iter < block_n * block_k:
         raise ValueError(
-            "B async load tile must be exactly covered by whole-thread vector loads: "
+            "B async load tile is not covered by whole-thread vector loads: "
             f"block_n={block_n}, block_k={block_k}, "
             f"block_threads={block_threads}, async_load_vec_size={async_load_vec_size}, "
             f"ldg_b_iters={ldg_b_iters}, "
-            f"covered={ldg_b_iters * block_threads * async_load_vec_size}, "
+            f"covered={ldg_b_iters * load_elems_per_iter}, "
             f"required={block_n * block_k}"
         )
     assert (stages - 2) * (ldg_a_iters + ldg_b_iters) < 63
@@ -369,6 +370,7 @@ def make_gemm_ab_load_context(
     )
 
 
+@flyc.jit
 def async_load_to_lds(
     tile: AsyncLoadTile,
     context: GemmABLoadContext,
@@ -386,6 +388,9 @@ def async_load_to_lds(
     g2s_copy_layout = fx.make_layout(async_load_vec_size, 1)
     for i in range_constexpr(load_iters):
         global_tid = block_threads * i + tid
+        valid_local_load = (
+            global_tid * async_load_vec_size < tile.outer_tile_size * block_k
+        )
         if const_expr(is_k_major):
             outer_x_threads = tile.outer_tile_size // async_load_vec_size
             outer_lds_idx = global_tid % outer_x_threads * async_load_vec_size
@@ -420,9 +425,10 @@ def async_load_to_lds(
             global_offset = safe_global_outer_idx * tile.leading_stride + global_k_idx
         src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
-        rocdl.sched_barrier(0)
-        fx.copy_atom_call(context.async_g2s_copy_atom, src, dst)
-        rocdl.sched_barrier(0)
+        if valid_local_load:
+            rocdl.sched_barrier(0)
+            fx.copy_atom_call(context.async_g2s_copy_atom, src, dst)
+            rocdl.sched_barrier(0)
         if i < load_iters - 1:
             lds_ptr = lds_ptr + block_threads * async_load_vec_size
 
