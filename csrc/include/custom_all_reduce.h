@@ -64,6 +64,12 @@ void all_gather_unreg(fptr_t _fa,
                       const aiter_tensor_t& out,
                       int64_t reg_bytes,
                       int64_t dim);
+void all_gatherv(fptr_t _fa,
+                 std::vector<aiter_tensor_t> const& inps,
+                 std::vector<aiter_tensor_t> const& outs,
+                 std::vector<int64_t> const& sizes,
+                 int64_t reg_buffer,
+                 int64_t reg_bytes);
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& inp,
                              const aiter_tensor_t& res_inp,

@@ -134,7 +134,6 @@ def _is_fused_decode_sort_quant_enabled(
     activation: ActivationType,
     is_g1u1: bool,
     expert_mask: torch.Tensor | None,
-    num_local_tokens: torch.Tensor | None,
     need_local_topk_ids: bool,
     run_1stage: bool,
     stage1_is_flydsl: bool,
@@ -177,7 +176,6 @@ def _is_fused_decode_sort_quant_enabled(
         and activation == ActivationType.Silu
         and is_g1u1
         and expert_mask is None
-        and num_local_tokens is None
         and not need_local_topk_ids
         and not run_1stage
         and stage1_is_flydsl
@@ -200,6 +198,7 @@ def _fused_decode_sort_quant(
     moebuf_dtype: torch.dtype,
     accumulate: bool,
     compact_scale: bool = False,
+    num_local_tokens: torch.Tensor | None = None,
 ):
     """Return standard sorted metadata plus the pre-quantized stage-1 input."""
     device = hidden_states.device
@@ -239,6 +238,7 @@ def _fused_decode_sort_quant(
         activation_quant,
         activation_scale_token,
         global_experts,
+        num_local_tokens,
     )
     activation_scale = activation_scale_token
     if not compact_scale:
@@ -1805,7 +1805,6 @@ def _fused_moe_impl(
         activation=activation,
         is_g1u1=isG1U1,
         expert_mask=expert_mask,
-        num_local_tokens=num_local_tokens,
         need_local_topk_ids=need_local_topk_ids,
         run_1stage=metadata.run_1stage,
         stage1_is_flydsl=stage1_func is _flydsl_stage1_wrapper,
@@ -1876,6 +1875,7 @@ def _fused_moe_impl(
             moebuf_dtype=dtype,
             accumulate=not runtime_stage2_reduce,
             compact_scale=fused_compact_scale,
+            num_local_tokens=num_local_tokens,
         )
         local_topk_ids = None
     else:
@@ -3346,6 +3346,24 @@ def _can_reroute_mxfp4_to_flydsl(
     )
 
 
+def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
+    # is_shuffled is true when either weight is tagged. weights_shuffled is
+    # the both-weights flag when the caller passed opus_weights_shuffled,
+    # which fused_moe and fused_moe_2stages do. gfx is the live device;
+    # get_gfx() follows GPU_ARCHS and can hide an actual gfx950 process.
+    if (
+        gfx == "gfx950"
+        and q_dtype_w == dtypes.fp8
+        and q_type in (QuantType.per_Tensor, QuantType.per_Token)
+        and not weights_shuffled
+    ):
+        raise RuntimeError(
+            "gfx950 fp8 CK MoE reads the shuffle_weight() layout on "
+            "both w1 and w2; unshuffled per_Tensor and per_Token "
+            "weights are unsupported"
+        )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -3891,6 +3909,16 @@ def get_2stage_cfgs(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
     else:
+        # A tuned CK row does not use the heuristic above. is_shuffled is the
+        # OR, so one tagged weight used to skip the preshuffle warning too.
+        tuned_names = (
+            str(cfg.get("kernelName1", "") or ""),
+            str(cfg.get("kernelName2", "") or ""),
+        )
+        if not cfg.get("run_1stage", False) and any(
+            "moe_ck2stages" in name for name in tuned_names
+        ):
+            _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled)
         block_m = cfg["block_m"]
         nt_override = int(os.environ.get("AITER_USE_NT", "-1"))
         if nt_override != -1:
@@ -4491,6 +4519,8 @@ def get_2stage_cfgs(
                 activation=activation,
             )
         else:
+            # Plain fp8 CK instances read the shuffle_weight() layout.
+            _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled)
             stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
@@ -5770,6 +5800,7 @@ def fused_topk(
     renormalize: bool,
     topk_ids: torch.Tensor | None = None,
     topk_weights: torch.Tensor | None = None,
+    num_valid_rows: torch.Tensor | None = None,  # see aiter.topk_gating
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -5780,8 +5811,10 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
+    # The asm kernel takes no pad-row count.
     if (
-        get_gfx() in ["gfx942", "gfx950"]
+        num_valid_rows is None
+        and get_gfx() in ["gfx942", "gfx950"]
         and (expert, topk)
         in [
             (128, 4),
@@ -5827,6 +5860,7 @@ def fused_topk(
             token_expert_indicies,
             gating_output,
             renormalize,
+            num_valid_rows=num_valid_rows,
         )
 
     del token_expert_indicies  # Not used. Will be used in the future.

@@ -193,6 +193,9 @@ def chunk_delta_attn_fwd(
         )
         return o, final_state, None, None, None, None, None, None, None
 
+    # The kernels below index q, k, v and g with packed strides.
+    q, k, v, g = (t.contiguous() for t in (q, k, v, g))
+
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size, cu_seqlens_cpu)
 
