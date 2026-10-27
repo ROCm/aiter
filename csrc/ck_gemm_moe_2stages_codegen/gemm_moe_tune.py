@@ -6923,13 +6923,25 @@ class Mxfp4FlydslTuner(FmoeTuner):
         """Drop only rows the runtime can never load.
 
         get_cfg_2stages uses the first row per key, and a later one only as an
-        activation fallback, which skips MXFP4 and CK 2-stage kernels. Rows
-        without a kernel do not shadow later rows.
+        activation fallback, which skips MXFP4 and CK 2-stage kernels. A row
+        without a kernel is dropped when a configured row has its key, since the
+        runtime would otherwise serve whichever of the two comes first.
         """
         del dedup_keys
         configured = self._names_kernel(tunedf)
         keys = tunedf.loc[configured, self.keys].astype(str)
         later = keys.duplicated(keep="first").reindex(tunedf.index, fill_value=False)
+        configured_keys = set(keys.itertuples(index=False, name=None))
+        placeholder = ~configured & pd.Series(
+            [
+                key in configured_keys
+                for key in tunedf[self.keys]
+                .astype(str)
+                .itertuples(index=False, name=None)
+            ],
+            index=tunedf.index,
+            dtype=bool,
+        )
         kernel1 = tunedf.get("kernelName1", pd.Series("", index=tunedf.index))
         kernel2 = tunedf.get("kernelName2", pd.Series("", index=tunedf.index))
         no_fallback = (
@@ -6937,7 +6949,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             | kernel1.map(_is_mxfp4_kname)
             | kernel2.map(_is_mxfp4_kname)
         )
-        return tunedf[~(later & no_fallback)]
+        return tunedf[~(later & no_fallback) & ~placeholder]
 
     def _already_tuned_mask(self, dedup_cols: "list[str]") -> "pd.Series":
         configured = self.tunedf[self._names_kernel(self.tunedf)]
