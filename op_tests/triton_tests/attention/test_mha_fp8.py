@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from aiter import logger
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
+    FP8_ARCHS,
+)
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
