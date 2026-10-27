@@ -95,9 +95,14 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     k_stages=kStages,
+    dense=False,
+    arg_dense_out=None,
+    i32_dense_m=None,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
+    K_MFMA_HALVES = BK // 128
+    K_SCALE_CHUNKS = (K + 255) // 256
     K_HALF = k_half_for(K)
     # A row bytes: fp4 = K/2, fp8 = K (B is always mxfp4 -> keeps K_HALF).
     A_ROW_BYTES = K if a_dtype == "fp8" else K_HALF
@@ -145,7 +150,12 @@ def _gemm1_body(
 
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx)))
+    if const_expr(dense):
+        e = fx.Int32(0)
+    else:
+        e = rocdl.readfirstlane(
+            T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx))
+        )
     m_row = m_block_idx * fx.Int32(BM)
 
     lane_div_16 = lane // fx.Int32(16)
@@ -186,9 +196,22 @@ def _gemm1_body(
 
     cached_actual_row = []
     cached_row_inline = None
+    cached_rows_inline_bm64 = []
     if const_expr(inline_quant):
         rcls = wave_n * fx.Int32(4) + lane_div_16
-        cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
+        if const_expr(dense and BM == 64):
+            for sub16 in range_constexpr(4):
+                row = m_row + fx.Int32(sub16 * 16) + rcls
+                cached_rows_inline_bm64.append(
+                    (row < i32_dense_m).select(row, i32_dense_m - fx.Int32(1))
+                )
+        elif const_expr(dense):
+            row = m_row + rcls
+            cached_row_inline = (row < i32_dense_m).select(
+                row, i32_dense_m - fx.Int32(1)
+            )
+        else:
+            cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
     elif const_expr(num_waves == 2):
         for load_group in range_constexpr(2):
             idx = (
@@ -270,7 +293,7 @@ def _gemm1_body(
     for i in range_constexpr(kMChunks):
         for J in range_constexpr(N_REPS):
             accm[i][J].store(fx.full(4, 0.0, fx.Float32))
-    b = [[[None, None] for _ in range(N_REPS)] for _ in range(k_stages)]
+    b = [[[None] * K_MFMA_HALVES for _ in range(N_REPS)] for _ in range(k_stages)]
     b_scale_v = [[None, None] for _ in range(k_stages)]
 
     # s_aq as flat i32, divided into 4-element (128-bit) and 1-element tiles.
@@ -413,9 +436,9 @@ def _gemm1_body(
         return r
 
     def issue_a_ds_read(slot, khalf=None):
-        mask = _lds_swizzle_mask(lane_mod_16)
-        a = [[None, None] for _ in range(kMChunks)]
-        halves = range_constexpr(2) if khalf is None else (khalf,)
+        mask = _lds_swizzle_mask(lane_mod_16, KH_TILE if a_dtype == "fp4" else 128)
+        a = [[None] * K_MFMA_HALVES for _ in range(kMChunks)]
+        halves = range_constexpr(K_MFMA_HALVES) if khalf is None else (khalf,)
         if const_expr(kMChunks == 1):
             order = [(0, k) for k in halves]
         elif const_expr(not k_split):
@@ -627,17 +650,26 @@ def _gemm1_body(
             fx.Int32,
             fx.add_offset(lds_raw_ptr, k_wave * kAStages * BM * KH_TILE),
         ),
-        fx.make_layout(kSubBlocks * K_TILES_TOTAL * 64, 1),
+        fx.make_layout(kSubBlocks * K_SCALE_CHUNKS * 64, 1),
     )
     asc_i32_tiles = fx.logical_divide(s_asc_i32_flat, mem_1x1)
     asc_i32x4_tiles = fx.logical_divide(s_asc_i32_flat, mem_4x1)
+    if const_expr(BK == 128):
+        s_asc_i16_flat = fx.make_view(
+            fx.recast_iter(
+                fx.Int16, fx.add_offset(lds_raw_ptr, k_wave * kAStages * BM * KH_TILE)
+            ),
+            fx.make_layout(kSubBlocks * K_SCALE_CHUNKS * 128, 1),
+        )
+        asc_i16_tiles = fx.logical_divide(s_asc_i16_flat, mem_1x1)
 
     def issue_a_scale_ds_read(kt):
         out = []
+        scale_chunk = (kt * BK) // 256
         for sub in range_constexpr(kSubBlocks):
             lds_dw = (
                 fx.Int32(sub * kAS_per_chunk_dw)
-                + fx.Int32(kt * 64)
+                + fx.Int32(scale_chunk * 64)
                 + lane_div_16 * fx.Int32(16)
                 + lane_mod_16
             )
@@ -684,7 +716,7 @@ def _gemm1_body(
         # B128_IDX*8 + lsa3*2 + lib//2 and the byte within it is (lib%2)*8 (matches
         # the split-64 fp8 read).
         r = fx.Int32(SUB * 16) + r_in_chunk
-        mask_r = _lds_swizzle_mask(r)
+        mask_r = _lds_swizzle_mask(r, KH_TILE if a_dtype == "fp4" else 128)
         row_off = fx.Int32(slot * (BM * KH_TILE)) + r * fx.Int32(KH_TILE)
         if const_expr(a_dtype == "fp8"):
             blk_byte = (
@@ -771,7 +803,8 @@ def _gemm1_body(
             B128_IDX, SUB, _hv = specs[i]
             qs_raw = as_ir_value((e8[i] << fx.Int32(23)).bitcast(fx.Float32))
             _iq_pack_store(h_dw[i], qs_raw, B128_IDX, SUB, slot)
-            pack_byte = B128_IDX * 2 + SUB
+            scale_row = SUB % 2 if dense else SUB
+            pack_byte = B128_IDX * 2 + scale_row
             scale_accum = scale_accum | (e8[i] << fx.Int32(pack_byte * 8))
         return scale_accum
 
@@ -779,18 +812,31 @@ def _gemm1_body(
         h_v = inline_quant_load_kt(B128_IDX, kt, row_token)
         return _inline_quant_core_batch([(B128_IDX, SUB, h_v)], slot, scale_accum)
 
-    def inline_quant_pack_write(kt, scale_accum):
+    def inline_quant_pack_write(kt, scale_accum, scale_subblock=0):
         lane_tgt = lane_shr2_and3 * fx.Int32(16) + r_in_chunk
-        off = fx.Int32(kt * 256) + lane_tgt * fx.Int32(4)
-        _scalar_store(asc_i32_tiles, off // fx.Int32(4), scale_accum, fx.Int32)
+        subblock_off = fx.Int32(scale_subblock * kAS_per_chunk_dw * 4)
+        if const_expr(BK == 128):
+            # Two BK=128 tiles share one 256-K shuffled-scale dword.  Store
+            # each tile's scale in its low/high 16-bit half so either tile can
+            # load the same dword and select the corresponding MFMA scale byte.
+            off = (
+                subblock_off
+                + fx.Int32((kt // 2) * 256)
+                + lane_tgt * fx.Int32(4)
+                + fx.Int32((kt % 2) * 2)
+            )
+            _scalar_store(asc_i16_tiles, off // fx.Int32(2), scale_accum, fx.Int16)
+        else:
+            off = subblock_off + fx.Int32(kt * 256) + lane_tgt * fx.Int32(4)
+            _scalar_store(asc_i32_tiles, off // fx.Int32(4), scale_accum, fx.Int32)
 
     def issue_b_load_j(b_slot, K_C, j):
         v = (
             (lane_div_16 * fx.Int32(256))
             + (lane_mod_16 * fx.Int32(16))
-            + fx.Int32(K_C * 2048)
+            + fx.Int32(K_C * (BK * 8))
         )
-        for half in range_constexpr(2):
+        for half in range_constexpr(K_MFMA_HALVES):
             tile_idx = (v + fx.Int32(half * 1024)) // fx.Int32(16)
             r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
             fx.copy(
@@ -818,8 +864,9 @@ def _gemm1_body(
 
     def issue_b_scale_load(bs_slot, K_C):
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
-        K_C_HI = K_C // 16
-        imm = (K_C - K_C_HI * 16) * (kBS_stride_k0_dw * 4)
+        scale_chunk = (K_C * BK) // 256
+        K_C_HI = scale_chunk // 16
+        imm = (scale_chunk - K_C_HI * 16) * (kBS_stride_k0_dw * 4)
         # Interleaved BN64/BN128 have only one scale slot.
         for mw in range_constexpr(B_SCALE_REPS):
             s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
@@ -846,23 +893,34 @@ def _gemm1_body(
             scale_b=sb,
         )
 
-    def mfma_cluster(b_slot, a, a_scale, bs_slot, J, khalf=None):
+    def mfma_cluster(b_slot, a, a_scale, bs_slot, J, khalf=None, kt=0):
         if const_expr(interleave):
             mni = J // 2
         else:
             mni = J % 2
         if const_expr(khalf is None):
-            bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
+            bJ0 = b_slot[J][0]
+            if const_expr(K_MFMA_HALVES == 2):
+                bJ1 = b_slot[J][1]
         else:
             bJ0 = bJ1 = b_slot[J]
 
         def issue_cluster(scale_slot, in_b):
             sb = bs_slot[scale_slot]
+            scale_opsel = ((kt * BK) % 256) // 64
             if const_expr(kMChunks == 1):
                 sa = a_scale[0]
                 if const_expr(khalf is None or khalf == 0):
-                    _mma(accm[0][J], 0, 0 + in_b, a[0][0], bJ0, sa, sb)
-                if const_expr(khalf is None or khalf == 1):
+                    _mma(
+                        accm[0][J],
+                        scale_opsel,
+                        scale_opsel + in_b,
+                        a[0][0],
+                        bJ0,
+                        sa,
+                        sb,
+                    )
+                if const_expr(K_MFMA_HALVES == 2 and (khalf is None or khalf == 1)):
                     _mma(accm[0][J], 2, 2 + in_b, a[0][1], bJ1, sa, sb)
             else:
                 for sub in range_constexpr(kSubBlocks):
@@ -870,9 +928,25 @@ def _gemm1_body(
                     i1 = sub * 2 + 1
                     sa = a_scale[sub]
                     if const_expr(khalf is None or khalf == 0):
-                        _mma(accm[i0][J], 0, 0 + in_b, a[i0][0], bJ0, sa, sb)
-                        _mma(accm[i1][J], 1, 0 + in_b, a[i1][0], bJ0, sa, sb)
-                    if const_expr(khalf is None or khalf == 1):
+                        _mma(
+                            accm[i0][J],
+                            scale_opsel,
+                            scale_opsel + in_b,
+                            a[i0][0],
+                            bJ0,
+                            sa,
+                            sb,
+                        )
+                        _mma(
+                            accm[i1][J],
+                            scale_opsel + 1,
+                            scale_opsel + in_b,
+                            a[i1][0],
+                            bJ0,
+                            sa,
+                            sb,
+                        )
+                    if const_expr(K_MFMA_HALVES == 2 and (khalf is None or khalf == 1)):
                         _mma(accm[i0][J], 2, 2 + in_b, a[i0][1], bJ1, sa, sb)
                         _mma(accm[i1][J], 3, 2 + in_b, a[i1][1], bJ1, sa, sb)
 
@@ -904,6 +978,17 @@ def _gemm1_body(
                 issue_cluster(mni, 1)
         else:
             issue_cluster(mni, J % 2 if const_expr(interleave) else J // 2)
+
+    def inline_quant_dense_bm64(slot, kt):
+        for scale_subblock in range_constexpr(2):
+            scale_accum = fx.Int32(0)
+            for row16 in range_constexpr(2):
+                sub = scale_subblock * 2 + row16
+                for half in range_constexpr(K_MFMA_HALVES):
+                    scale_accum = inline_quant_kt(
+                        half, sub, slot, kt, cached_rows_inline_bm64[sub], scale_accum
+                    )
+            inline_quant_pack_write(kt, scale_accum, scale_subblock)
 
     def run_k_slice_ksplit(global_k_tile):
         bh = [[None] * N_REPS for _ in range(2)]
@@ -964,7 +1049,11 @@ def _gemm1_body(
             )
         for K_C_LOCAL in range_constexpr(k_stages):
             K_C = global_k_tile(K_C_LOCAL)
-            if const_expr(inline_quant):
+            if const_expr(dense and BM == 64):
+                inline_quant_dense_bm64(K_C_LOCAL, K_C)
+                for j in range_constexpr(N_REPS):
+                    issue_b_load_j(b[K_C_LOCAL], K_C, j)
+            elif const_expr(inline_quant):
                 scale_accum = fx.Int32(0)
                 if const_expr(prefetch_hidden):
                     h_v0, h_v1 = hidden_prefetch
@@ -981,17 +1070,17 @@ def _gemm1_body(
                     scale_accum = inline_quant_kt(
                         0, 0, K_C_LOCAL, K_C, cached_row_inline, scale_accum
                     )
-
                 issue_b_load_j(b[K_C_LOCAL], K_C, 0)
                 issue_b_load_j(b[K_C_LOCAL], K_C, 1)
-                if const_expr(prefetch_hidden):
-                    scale_accum = _inline_quant_core_batch(
-                        [(1, 0, h_v1)], K_C_LOCAL, scale_accum
-                    )
-                else:
-                    scale_accum = inline_quant_kt(
-                        1, 0, K_C_LOCAL, K_C, cached_row_inline, scale_accum
-                    )
+                if const_expr(K_MFMA_HALVES == 2):
+                    if const_expr(prefetch_hidden):
+                        scale_accum = _inline_quant_core_batch(
+                            [(1, 0, h_v1)], K_C_LOCAL, scale_accum
+                        )
+                    else:
+                        scale_accum = inline_quant_kt(
+                            1, 0, K_C_LOCAL, K_C, cached_row_inline, scale_accum
+                        )
                 if const_expr(N_REPS > 2):
                     issue_b_load_j(b[K_C_LOCAL], K_C, 2)
                     issue_b_load_j(b[K_C_LOCAL], K_C, 3)
@@ -1037,25 +1126,33 @@ def _gemm1_body(
                 # and drains every in-flight load (vmcnt(0)) before the reads.
                 rocdl.sched_barrier(0)
                 issue_a_load_lds(write_slot, K_C)
-            if const_expr(inline_quant and not prefetch_hidden):
+            if const_expr(
+                inline_quant and not prefetch_hidden and not (dense and BM == 64)
+            ):
                 h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
-                h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
+                if const_expr(K_MFMA_HALVES == 2):
+                    h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
                 rocdl.sched_barrier(0)
             for J in range_constexpr(N_REPS):
                 if const_expr(BM != 128):
                     rocdl.sched_barrier(0)
                     rocdl.s_setprio(1)
-                mfma_cluster(b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J)
+                mfma_cluster(
+                    b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, kt=K_C - k_stages
+                )
                 if const_expr(BM != 128):
                     rocdl.s_setprio(0)
                 rocdl.sched_barrier(0)
                 issue_b_load_j(b[slot_b], K_C, J)
                 rocdl.sched_barrier(0)
             issue_b_scale_load(b_scale_v[slot_b], K_C)
-            if const_expr(inline_quant):
-                scale_accum = _inline_quant_core_batch(
-                    [(0, 0, h_v0), (1, 0, h_v1)], write_slot, fx.Int32(0)
-                )
+            if const_expr(dense and BM == 64):
+                inline_quant_dense_bm64(write_slot, K_C)
+            elif const_expr(inline_quant):
+                specs = [(0, 0, h_v0)]
+                if const_expr(K_MFMA_HALVES == 2):
+                    specs.append((1, 0, h_v1))
+                scale_accum = _inline_quant_core_batch(specs, write_slot, fx.Int32(0))
                 inline_quant_pack_write(K_C, scale_accum)
 
         for S in range_constexpr(k_stages):
@@ -1075,6 +1172,7 @@ def _gemm1_body(
                     asc_cur,
                     b_scale_v[kt_local % k_stages],
                     J,
+                    kt=kt,
                 )
 
     if const_expr(k_wave == 1):
@@ -1095,6 +1193,29 @@ def _gemm1_body(
             run_k_slice(3 * K_TILES_PER_WAVE)
 
     gpu.barrier()
+
+    if const_expr(dense):
+        dense_out = _global_scalar_tiles(
+            arg_dense_out, fx.BFloat16, fx.Int64(i32_dense_m) * fx.Int64(N_OUT)
+        )
+        for i in range_constexpr(kMChunks):
+            row_base = m_row + fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
+            for J in range_constexpr(4):
+                tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(J)
+                g = tile_il & fx.Int32(1)
+                n0 = tile_il >> fx.Int32(1)
+                col = (g * fx.Int32(N_OUT // 32) + n0) * fx.Int32(16) + lane_mod_16
+                values = accm[i][J].load()
+                for v in range_constexpr(4):
+                    row = row_base + fx.Int32(v)
+                    if row < i32_dense_m:
+                        _scalar_store(
+                            dense_out,
+                            row * fx.Int32(N_OUT) + col,
+                            values[v],
+                            fx.BFloat16,
+                        )
+        return
 
     # lds_acc reuses the s_aq region (offset 0) as an f32 accumulator.
     # Four dwords of row padding rotate each four-row store group by 16 banks
@@ -1458,13 +1579,22 @@ def _gemm1_body(
 
 
 def _bm_constants(
-    BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1, k_stages=kStages
+    BM,
+    BN,
+    KH_TILE,
+    K_TILES_TOTAL,
+    k_wave=1,
+    epi_splits=1,
+    k_stages=kStages,
+    scale_chunks=None,
 ):
     kAStages = 2 if (BM == 128 and BN != 256) else k_stages + 1
     kSubBlocks = 1 if BM < 32 else BM // 32
     kMChunks = kmchunks_for(BM)
     s_aq_bytes = k_wave * kAStages * BM * KH_TILE
-    s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
+    s_asc_bytes = (
+        kSubBlocks * (K_TILES_TOTAL if scale_chunks is None else scale_chunks) * 256
+    )
     lds_acc_bytes = k_wave * lds_acc_bytes_for(BM // epi_splits, BN + ACC_LDS_PAD_DW)
     lds_bytes = max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
     return kAStages, kSubBlocks, kMChunks, lds_bytes

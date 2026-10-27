@@ -31,6 +31,7 @@ else
             {
                 find op_tests -maxdepth 1 -type f -name "test_*.py"
                 find tests -maxdepth 1 -type f -name "test_*.py"
+                printf '%s\n' op_tests/flydsl_tests/test_flydsl_gemm_a4w4.py
             } | LC_ALL=C sort
         )
     else
@@ -166,7 +167,7 @@ for file in "${sharded_files[@]}"; do
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
             ;;
-        op_tests/test_flydsl_pa_decode.py)
+        op_tests/test_flydsl_pa_decode.py|op_tests/flydsl_tests/test_flydsl_gemm_a4w4.py)
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
         op_tests/test_f4gemm.py)
