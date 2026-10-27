@@ -772,6 +772,14 @@ class Conv3dTuner(TunerCommon):
             allowed_err_ratio, allowed_err_ratio_desc = (
                 self._get_run_config_err_ratio_limit(row, args)
             )
+            # With --run_config <tuned_csv> the row carries its tuned `us`, the
+            # kernel alone on gfx1250; reported next to e2e as the MoE tuner does.
+            kernel_us = None
+            if "us" in row and pd.notna(row["us"]):
+                try:
+                    kernel_us = float(row["us"])
+                except (TypeError, ValueError):
+                    kernel_us = None
             try:
                 data = generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias)
                 # Best of a few, not a single reading: the gate's threshold is
@@ -804,10 +812,22 @@ class Conv3dTuner(TunerCommon):
                     else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append(
-                    {"shape": shape, "e2e_us": round(us, 4), "status": status}
+                    {
+                        "shape": shape,
+                        "e2e_us": round(us, 4),
+                        "kernel_us": kernel_us,
+                        "status": status,
+                    }
                 )
             except Exception as exc:  # noqa: BLE001
-                results.append({"shape": shape, "e2e_us": -1, "status": f"error:{exc}"})
+                results.append(
+                    {
+                        "shape": shape,
+                        "e2e_us": -1,
+                        "kernel_us": kernel_us,
+                        "status": f"error:{exc}",
+                    }
+                )
             finally:
                 torch.cuda.empty_cache()
         return results
