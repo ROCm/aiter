@@ -13,8 +13,9 @@ from .traits import MFMA_ACC_ELEMS
 
 
 class PaDecodeGemm:
-    def __init__(self, traits):
+    def __init__(self, traits, policy):
         self.traits = traits
+        self.policy = policy
 
     def mfma(self, a_ops, b_ops, a_base, b_base, k_packs, acc):
         if const_expr(self.traits.is_bf16_kv):
@@ -30,7 +31,9 @@ class PaDecodeGemm:
                 acc = fx.rocdl.mfma_f32_16x16x16bf16_1k(
                     T.f32x4, [a_pack, b_pack, acc, 0, 0, 0]
                 )
-        elif const_expr(self.traits.WIDE_FP8_MFMA):
+        elif const_expr(
+            self.traits.WIDE_FP8_MFMA and k_packs % self.traits.PACKS_PER_MFMA == 0
+        ):
             for inst in range_constexpr(k_packs // self.traits.PACKS_PER_MFMA):
                 a_pack = fx.Vector.from_elements(
                     [
@@ -79,24 +82,39 @@ class PaDecodeGemm:
             )
         return fx.Vector.from_elements(words, dtype=fx.Int32)
 
+    def fp8_residual(self, scaled, word):
+        # Retain the rounding error of FP8(448 * P) in a second FP8 term.
+        # The largest residual is 16; scaling by 16 still fits FP8's range.
+        lo = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, False))
+        hi = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, True))
+        rounded = fx.Vector.from_elements(
+            [lo[0], lo[1], hi[0], hi[1]], dtype=fx.Float32
+        )
+        return self.fp8_words((scaled - rounded) * fx.full(4, 16.0, fx.Float32))
+
     def qk(self, k_ops, q_ops, m):
         frag_Ss = []
         for a in range_constexpr(self.traits.NCHUNK):
             acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
-            acc = self.mfma(
-                k_ops,
-                q_ops,
-                a * self.traits.N_SUBCHUNKS,
-                m * self.traits.N_SUBCHUNKS,
-                self.traits.N_SUBCHUNKS,
-                acc,
-            )
+            if const_expr(a < self.policy.qk_chunks):
+                acc = self.mfma(
+                    k_ops,
+                    q_ops,
+                    a * self.traits.N_SUBCHUNKS,
+                    m * self.traits.N_SUBCHUNKS,
+                    self.traits.N_SUBCHUNKS,
+                    acc,
+                )
             frag_Ss.append(fx.Vector(acc))
         return frag_Ss
 
-    def pv(self, v_ops, p_ops):
+    def pv(self, v_ops, p_ops, residual_ops=None):
+        k_packs = self.policy.pv_packs
         acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
-        acc = self.mfma(v_ops, p_ops, 0, 0, self.traits.NVOPS, acc)
+        if const_expr(residual_ops is not None):
+            acc = self.mfma(v_ops, residual_ops, 0, 0, k_packs, acc)
+            acc = fx.Vector(acc) * fx.full(MFMA_ACC_ELEMS, 1.0 / 16, fx.Float32)
+        acc = self.mfma(v_ops, p_ops, 0, 0, k_packs, acc)
         return fx.Vector(acc)
 
 

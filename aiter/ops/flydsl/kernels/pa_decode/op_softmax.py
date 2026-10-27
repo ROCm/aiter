@@ -13,12 +13,13 @@ from .traits import MFMA_ACC_ELEMS, MFMA_MNK, WAVE
 
 
 class PaDecodeSoftmax:
-    def __init__(self, ctx, lds, kv, gemm):
+    def __init__(self, ctx, lds, kv, gemm, policy):
         self.ctx = ctx
         self.traits = ctx.traits
         self.lds = lds
         self.kv = kv
         self.gemm = gemm
+        self.policy = policy
 
     def init_mask(self):
         self._ct = [
@@ -254,6 +255,27 @@ class PaDecodeSoftmax:
         return masked_chunks, v_scale_vecs
 
     @flyc.jit
+    def stage_probability_residual(self, scaled, word, m, a):
+        # Short contexts reuse P-row padding. Small windows use a full second
+        # FP8 plane because their visible keys can occur anywhere in this tile.
+        if (
+            const_expr(self.policy.residual_tokens == self.traits.TILE_TOK)
+            or self.ctx.warp == 0
+        ):
+            offset = (
+                self.traits.sP_off
+                + (m % self.traits.P_BUFFERS) * MFMA_MNK * self.traits.SP_ROW_BYTES
+                + self.ctx.lane16 * self.traits.SP_ROW_BYTES
+                + self.traits.TILE_TOK
+                + self.ctx.rgroup * 4
+            )
+            if const_expr(self.policy.residual_tokens == self.traits.TILE_TOK):
+                offset = (
+                    offset + self.ctx.warp * self.traits.TOK_PER_WARP + a * MFMA_MNK
+                )
+            self.lds.store(offset, fx.Int32, self.gemm.fp8_residual(scaled, word))
+
+    @flyc.jit
     def pack_fused(self, masked_chunks_saved, ostate, cur_kv_buf, norm_factor_b):
         # Private P/Lsum slots share one barrier without overwrite races.
         m_new_saved = []
@@ -325,12 +347,13 @@ class PaDecodeSoftmax:
         cur_kv_buf,
         norm_factor_b,
     ):
+        single_tile = self.policy.single_tile
         tile_max = self.lds.load_wave(self.lmax_offset(m), self.ctx.lane16).reduce(
             ReductionOp.MAX, fastmath=self.ctx.fm_nnan
         )
         m_new = (
             tile_max
-            if const_expr(self.traits.single_tile_plan)
+            if const_expr(single_tile)
             else fx.maxnumf(m_prev, tile_max, fastmath=self.ctx.fm_nnan)
         )
         # Empty rows need exponent reference 0 to avoid -inf-(-inf).
@@ -357,6 +380,8 @@ class PaDecodeSoftmax:
                 if const_expr(self.traits.is_bf16_kv)
                 else self.gemm.fp8_words(p_scaled)[0]
             )
+            if const_expr(a * MFMA_MNK < self.policy.residual_tokens):
+                self.stage_probability_residual(p_scaled, words[-1], m, a)
 
         p_off0 = (
             p_base
@@ -380,7 +405,7 @@ class PaDecodeSoftmax:
         # replacing m_prev with 0 can overflow for negative logits.
         corr_reg = (
             self.ctx.ZERO_F
-            if const_expr(self.traits.single_tile_plan)
+            if const_expr(single_tile)
             else fx.Float32(fx.exp2(m_prev - safe_max, fastmath="fast"))
         )
         if self.ctx.rgroup == 0:
@@ -400,13 +425,14 @@ class PaDecodeSoftmax:
     ):
         # pass 2: global max over warps -> exp -> fp8 P pack (-> sP) -> sum.
         # M-tile m owns its Lmax, P and Lsum slots.
+        single_tile = self.policy.single_tile
         if const_expr(self.traits.M1_SCALE_BEFORE_MASK):
             tile_max = self.lds.load_wave(self.lmax_offset(m), self.ctx.lane16).reduce(
                 ReductionOp.MAX, fastmath=self.ctx.fm_nnan
             )
             m_new = (
                 tile_max
-                if const_expr(self.traits.single_tile_plan)
+                if const_expr(single_tile)
                 else fx.maxnumf(m_prev, tile_max, fastmath=self.ctx.fm_nnan)
             )
         else:
@@ -414,9 +440,7 @@ class PaDecodeSoftmax:
                 ReductionOp.MAX
             )
             m_new = (
-                tile_max
-                if const_expr(self.traits.single_tile_plan)
-                else fx.maxnumf(m_prev, tile_max)
+                tile_max if const_expr(single_tile) else fx.maxnumf(m_prev, tile_max)
             )
         # Keep empty partitions' persisted max at -inf, but exponentiate
         # relative to 0 to avoid -inf-(-inf) NaNs in P and corrections.
@@ -460,6 +484,8 @@ class PaDecodeSoftmax:
                 if const_expr(self.traits.is_bf16_kv)
                 else self.gemm.fp8_words(p_scaled)[0]
             )
+            if const_expr(a * MFMA_MNK < self.policy.residual_tokens):
+                self.stage_probability_residual(p_scaled, words[-1], m, a)
         p_off0 = (
             self.p_offset(m)
             + self.ctx.lane16 * self.traits.SP_ROW_BYTES
@@ -481,7 +507,7 @@ class PaDecodeSoftmax:
             ls = ls + ls.shuffle_xor(sh, WAVE)
         corr_reg = (
             self.ctx.ZERO_F
-            if const_expr(self.traits.single_tile_plan)
+            if const_expr(single_tile)
             else fx.Float32(fx.exp2(m_prev - softmax_max, fastmath="fast"))
         )
         if self.ctx.rgroup == 0:

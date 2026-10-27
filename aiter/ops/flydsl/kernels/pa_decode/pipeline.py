@@ -19,23 +19,64 @@ from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK
+from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, PaDecodeTilePolicy
 
 
 class PaDecodePipeline:
-    def __init__(self, ctx):
+    def __init__(self, ctx, token_bound=None, lds=None):
         self.ctx = ctx
         self.traits = ctx.traits
-        self.lds = PaDecodeLds(ctx.traits, ctx.shared_storage)
-        self.gemm = PaDecodeGemm(ctx.traits)
+        self.policy = PaDecodeTilePolicy.select(ctx.traits, token_bound)
+        self.lds = (
+            lds if lds is not None else PaDecodeLds(ctx.traits, ctx.shared_storage)
+        )
+        self.gemm = PaDecodeGemm(ctx.traits, self.policy)
         self.query = PaDecodeQueryLoader(ctx, self.lds, self.gemm)
         self.kv = PaDecodeKVLoader(ctx, self.lds)
-        self.softmax = PaDecodeSoftmax(ctx, self.lds, self.kv, self.gemm)
+        self.softmax = PaDecodeSoftmax(ctx, self.lds, self.kv, self.gemm, self.policy)
         self.epilogue = PaDecodeEpilogue(ctx)
 
     @flyc.jit
+    def pv(self, v_ops, p_ops, m):
+        residual = None
+        if const_expr(self.policy.residual_tokens > 0):
+            offset = (
+                self.traits.sP_off
+                + (m % self.traits.P_BUFFERS) * MFMA_MNK * self.traits.SP_ROW_BYTES
+                + self.ctx.lane16 * self.traits.SP_ROW_BYTES
+                + self.traits.TILE_TOK
+            )
+            if const_expr(self.policy.residual_tokens == MFMA_MNK):
+                # Only rgroup 0 owns the first 16 keys in the PV operand layout.
+                residual = fx.full(2, 0, fx.Int64)
+                if self.ctx.rgroup == 0:
+                    residual = self.lds.load(offset, fx.Int64, 2)
+            else:
+                residual = self.lds.load(
+                    offset + self.ctx.rgroup * 64, fx.Int64, self.traits.NVOPS
+                )
+        return self.gemm.pv(v_ops, p_ops, residual)
+
+    @flyc.jit
     def run(self):
-        """Initialize resources in load order, then compute and store one CTA."""
+        """Choose the short path before any operands become live."""
+        self.lds.allocate()
+        if const_expr(
+            self.traits.value_dim != self.traits.head_dim
+            and not self.traits.is_bf16_kv
+            and not self.traits.FP8_WINDOW_RESIDUAL
+        ):
+            # The caller skips empty plan records; active contexts are positive.
+            # The P-row padding holds one FP8 residual for each of the first 16 keys.
+            if self.ctx.planned_context > MFMA_MNK:
+                self.compute()
+            else:
+                PaDecodePipeline(self.ctx, token_bound=MFMA_MNK, lds=self.lds).compute()
+        else:
+            self.compute()
+
+    @flyc.jit
+    def compute(self):
         self.ctx.init_thread_mapping()
         self.epilogue.init_outputs()
         self.kv.init_loaders()
@@ -46,7 +87,6 @@ class PaDecodePipeline:
         self.ctx.init_context_length()
         self.kv.init_page_table()
         self.ctx.init_partition_bounds()
-        self.lds.allocate()
         self.kv.init_scale_loaders()
         if const_expr(self.traits.stage_page_capacity):
             self.kv.stage_page_ids()
@@ -59,12 +99,12 @@ class PaDecodePipeline:
         q_ops_all = self.query.load_operands()
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
-        o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all)
-        self.epilogue.store(o_final)
+        self.epilogue.store(self.mainloop(k_pf0, v_page_pf0, q_ops_all))
 
     @flyc.jit
     def mainloop(self, k_pf0, v_page_pf0, q_ops_all):
         """Carry prefetch operands and online-softmax state between KV tiles."""
+        single_tile = self.policy.single_tile
         o_zero = fx.full(self.traits.OP_ELEMS, 0.0, fx.Float32)
         init_state = [k_pf0, v_page_pf0]
         for _m in range_constexpr(self.traits.M_TILES):
@@ -82,10 +122,8 @@ class PaDecodePipeline:
             init_state.append(v_pf0)
         # Single-tile plans eliminate loop/history but keep absolute tt for
         # addressing and masks; the outer guard excludes padded tasks.
-        loop_start = (
-            0 if const_expr(self.traits.single_tile_plan) else self.ctx.part_start
-        )
-        loop_end = 1 if const_expr(self.traits.single_tile_plan) else self.ctx.part_end
+        loop_start = 0 if const_expr(single_tile) else self.ctx.part_start
+        loop_end = 1 if const_expr(single_tile) else self.ctx.part_end
         # The d256 pipe keeps its M-tiles on the single-tile schedule.
         multi_query = self.traits.M_TILES > 1 and not self.traits.D256_PIPE
         for loop_i, ostate in range(loop_start, loop_end, 1, init=init_state):
@@ -97,7 +135,7 @@ class PaDecodePipeline:
             ]  # this tile's V pages, as one PAGES_PER_CHUNK-wide i32 vector
             tt = (
                 fx.Int32(self.ctx.part_start)
-                if const_expr(self.traits.single_tile_plan)
+                if const_expr(single_tile)
                 else fx.Int32(loop_i)
             )
             tok0 = tt * self.traits.TILE_TOK
@@ -204,6 +242,7 @@ class PaDecodePipeline:
         q_ops_all,
     ):
         """Publish all query maxima together, then consume shared K/V per query."""
+        single_tile = self.policy.single_tile
         next_state = [None, None]
         masked_chunks_saved = [None] * self.traits.M_TILES
 
@@ -244,7 +283,7 @@ class PaDecodePipeline:
             if const_expr(self.traits.MTP4_FUSED)
             else k_cur
         )
-        if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+        if const_expr(not single_tile) and tt1 < self.ctx.part_end:
             if const_expr(self.traits.MTP4_FUSED):
                 # Defer K until P packing releases saved score registers.
                 phys_vec1 = self.kv.fetch_v_pages(tt1)
@@ -259,7 +298,7 @@ class PaDecodePipeline:
         gpu.barrier()
 
         v_page_next = v_page_cur
-        if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+        if const_expr(not single_tile) and tt1 < self.ctx.part_end:
             v_page_next = self.kv.read_v_pages()
         next_state[self.traits.V_SLOT] = v_page_next
 
@@ -291,7 +330,7 @@ class PaDecodePipeline:
                     self.kv.load_v(v_page_cur, vh)
                     for vh in range_constexpr(self.traits.VHE_CHUNKS)
                 ]
-            if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+            if const_expr(not single_tile) and tt1 < self.ctx.part_end:
                 # Saved scores are dead; next K can overlap the P barrier/PV.
                 k_next = self.kv.load_k_from_pages(self.kv.read_k_pages())
             next_state[self.traits.K_SLOT] = k_next
@@ -315,23 +354,19 @@ class PaDecodePipeline:
                 safe_max = (m_new > self.ctx.NEG_INF).select(m_new, self.ctx.ZERO_F)
                 corr_reg = (
                     self.ctx.ZERO_F
-                    if const_expr(self.traits.single_tile_plan)
+                    if const_expr(single_tile)
                     else fx.Float32(fx.exp2(m_prev - safe_max, fastmath="fast"))
                 )
                 gsum = self.lds.load_wave(lsum_base, self.ctx.lane16).reduce(
                     ReductionOp.ADD
                 )
-                l_new = (
-                    gsum
-                    if const_expr(self.traits.single_tile_plan)
-                    else l_prev * corr_reg + gsum
-                )
+                l_new = gsum if const_expr(single_tile) else l_prev * corr_reg + gsum
                 p_ops = self.lds.load(
                     p_base
                     + self.ctx.lane16 * self.traits.SP_ROW_BYTES
                     + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
                     fx.Int64,
-                    self.traits.NVOPS,
+                    self.policy.pv_packs,
                 )
                 corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
@@ -340,21 +375,16 @@ class PaDecodePipeline:
                         self.traits.OP_ELEMS, v_max_scaled, fx.Float32
                     )
                     o_acc[vh] = (
-                        op
-                        if const_expr(self.traits.single_tile_plan)
-                        else o_acc[vh] * corr_b + op
+                        op if const_expr(single_tile) else o_acc[vh] * corr_b + op
                     )
                     if const_expr(
                         self.traits.MTP4_PREFETCH_V
                         and m == self.traits.M_TILES - 1
-                        and not self.traits.single_tile_plan
+                        and not single_tile
                     ):
                         # Reuse the dead V chunk while the final PV finishes.
                         v_next_chunk = fx.full(self.traits.NVOPS, 0, fx.Int64)
-                        if (
-                            const_expr(not self.traits.single_tile_plan)
-                            and tt1 < self.ctx.part_end
-                        ):
+                        if const_expr(not single_tile) and tt1 < self.ctx.part_end:
                             v_next_chunk = fx.Vector.from_elements(
                                 self.kv.load_v(v_page_next, vh), dtype=fx.Int64
                             )
@@ -363,7 +393,7 @@ class PaDecodePipeline:
                 if const_expr(m < self.traits.M_TILES - 1):
                     fx.rocdl.sched_barrier(0)
             if const_expr(self.traits.MTP4_PREFETCH_V):
-                if const_expr(self.traits.single_tile_plan):
+                if const_expr(single_tile):
                     # Preserve the unused next-V slot in the loop state.
                     v_next = ostate[self.traits.V_DATA_SLOT]
                 else:
@@ -420,32 +450,26 @@ class PaDecodePipeline:
                 gsum = self.lds.load_wave(lsum_base, self.ctx.lane16).reduce(
                     ReductionOp.ADD
                 )
-                l_new = (
-                    gsum
-                    if const_expr(self.traits.single_tile_plan)
-                    else l_prev * corr_reg + gsum
-                )
+                l_new = gsum if const_expr(single_tile) else l_prev * corr_reg + gsum
 
                 p_ops = self.lds.load(
                     p_base
                     + self.ctx.lane16 * self.traits.SP_ROW_BYTES
                     + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
                     fx.Int64,
-                    self.traits.NVOPS,
+                    self.policy.pv_packs,
                 )
 
                 corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
                 for vh in range_constexpr(self.traits.VHE_CHUNKS):
                     v_vh = v_vh_shared[vh]
-                    op = self.gemm.pv(v_vh, p_ops)
+                    op = self.pv(v_vh, p_ops, m)
                     if const_expr(self.traits.per_token_kv):
                         op = op * fx.full(
                             self.traits.OP_ELEMS, v_max_scaled, fx.Float32
                         )
                     o_acc[vh] = (
-                        op
-                        if const_expr(self.traits.single_tile_plan)
-                        else o_acc[vh] * corr_b + op
+                        op if const_expr(single_tile) else o_acc[vh] * corr_b + op
                     )
                 next_state.extend([*o_acc, m_new, l_new])
                 # Single P/Lsum slots need a read-retirement barrier.
@@ -480,6 +504,7 @@ class PaDecodePipeline:
         slots, and keeps its own accumulator chain. The tile's memory-op sequence
         is independent of M_TILES, so the vmcnt counts below hold for any M.
         """
+        single_tile = self.policy.single_tile
         next_state = [None, None]
         o_acc = [
             [
@@ -500,7 +525,7 @@ class PaDecodePipeline:
             for m in range_constexpr(self.traits.M_TILES)
         ]
         k_next = k_cur
-        if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+        if const_expr(not single_tile) and tt1 < self.ctx.part_end:
             if const_expr(self.traits.REUSE_KV_PAGES):
                 # Stage scales before K so scale waits cannot drain K;
                 # page16 defers K until the P barrier.
@@ -539,7 +564,7 @@ class PaDecodePipeline:
             masked_chunks.append(chunks)
         gpu.barrier()
         v_page_next = v_page_cur
-        if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+        if const_expr(not single_tile) and tt1 < self.ctx.part_end:
             v_page_next = self.kv.read_v_pages()
         next_state[self.traits.V_SLOT] = v_page_next
         v_max_scaled = None
@@ -563,7 +588,7 @@ class PaDecodePipeline:
         gpu.barrier()
         if const_expr(self.traits.PAGE16_VPIPE):  # noqa: SIM102
             # Next K can now overlap P reads/PV.
-            if const_expr(not self.traits.single_tile_plan) and tt1 < self.ctx.part_end:
+            if const_expr(not single_tile) and tt1 < self.ctx.part_end:
                 k_next = self.kv.load_k_from_pages(self.kv.read_k_pages())
         next_state[self.traits.K_SLOT] = k_next
         l_new = []
@@ -574,9 +599,7 @@ class PaDecodePipeline:
                 self.softmax.lsum_offset(m), self.ctx.lane16
             ).reduce(ReductionOp.ADD)
             l_new.append(
-                gsum
-                if const_expr(self.traits.single_tile_plan)
-                else l_prev[m] * corr_reg[m] + gsum
+                gsum if const_expr(single_tile) else l_prev[m] * corr_reg[m] + gsum
             )
             p_ops.append(
                 self.lds.load(
@@ -584,7 +607,7 @@ class PaDecodePipeline:
                     + self.ctx.lane16 * self.traits.SP_ROW_BYTES
                     + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
                     fx.Int64,
-                    self.traits.NVOPS,
+                    self.policy.pv_packs,
                 )
             )
             corr_b.append(
@@ -602,13 +625,11 @@ class PaDecodePipeline:
         for vh in range_constexpr(self.traits.VHE_CHUNKS):
             v_vh = v_vh_batch[vh]
             for m in range_constexpr(self.traits.M_TILES):
-                op = self.gemm.pv(v_vh, p_ops[m])
+                op = self.pv(v_vh, p_ops[m], m)
                 if const_expr(self.traits.per_token_kv):
                     op = op * fx.full(self.traits.OP_ELEMS, v_max_scaled, fx.Float32)
                 o_acc[m][vh] = (
-                    op
-                    if const_expr(self.traits.single_tile_plan)
-                    else o_acc[m][vh] * corr_b[m] + op
+                    op if const_expr(single_tile) else o_acc[m][vh] * corr_b[m] + op
                 )
         for m in range_constexpr(self.traits.M_TILES):
             next_state.extend([*o_acc[m], m_new[m], l_new[m]])

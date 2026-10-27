@@ -160,18 +160,9 @@ def test_bf16_swa_query_split_schedule(
         ("bf16", "none", 0, 0),
         ("bf16", "none", -2, None),
         *[
-            ("bf16", "none", window, window)
-            for window in (1, 127, 1025, 4097, 2**31 + 1)
-        ],
-        *[
             (dtype, scale, window, window)
             for dtype, scale in (("fp8", "per-tensor"), ("bf16", "none"))
-            for window in (128, 129, 1024)
-        ],
-        *[
-            (dtype, scale, window, None)
-            for dtype, scale in (("fp8", "per-tensor"),)
-            for window in (127, 1025)
+            for window in (1, 16, 17, 127, 128, 129, 1024, 1025, 4097, 2**31 + 1)
         ],
     ],
 )
@@ -204,11 +195,14 @@ def test_asymmetric_tuning_cli_window(kv_dtype, scale_mode, window, expected_win
 
 @pytest.mark.parametrize(
     "kv_dtype,window,accepted",
-    [("fp8", 127, False), ("fp8", 1025, False), ("bf16", -1, False)]
-    + [("bf16", window, True) for window in (0, 1, 127, 1025, 4097, 2**31 + 1)],
+    [
+        (dtype, window, window >= 0)
+        for dtype in ("fp8", "bf16")
+        for window in (-1, 0, 1, 16, 17, 127, 1025, 4097, 2**31 + 1)
+    ],
 )
 def test_asymmetric_schedule_window_contract(monkeypatch, kv_dtype, window, accepted):
-    """BF16 generalizes positive windows; FP8 retains its qualified range."""
+    """Both KV dtypes accept normalized full attention and positive windows."""
     traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
     monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
     kwargs = {
@@ -425,10 +419,52 @@ _ASYMMETRIC_WINDOW_CASES = [
             "lengths": (0, 1, 7, 8, 63, 64, 65, 127, 128, 129, 257, 1027, 8192),
         },
     )
-    for window in (257, 1024)
+    for window in (1, 2, 4, 16, 17, 127, 257, 1024, 1025, 4097, 2**31 + 1)
 ]
 _FP8_CASES = _COMMON_CASES + [
     *_ASYMMETRIC_WINDOW_CASES,
+    (
+        "asymmetric-large-window-grid",
+        {
+            **_ASYMMETRIC_WINDOW_CASES[0][1],
+            "window": 1024,
+            "lengths": (0, 1, 8, 16, 17, 257, 1027, 8192) * 16,
+        },
+    ),
+    *[
+        (
+            f"asymmetric-probability-rounding-w{window}",
+            {
+                **_ASYMMETRIC_WINDOW_CASES[0][1],
+                "window": window,
+                "sink_dtype": sinks,
+                "lengths": (
+                    0,
+                    1,
+                    7,
+                    8,
+                    63,
+                    64,
+                    65,
+                    127,
+                    128,
+                    129,
+                    257,
+                    515,
+                    1027,
+                    2051,
+                    4096,
+                    8192,
+                ),
+            },
+        )
+        for window, sinks in (
+            (0, None),
+            (2, None),
+            (4, torch.float32),
+            (128, torch.float32),
+        )
+    ],
     (
         "qlen8-full-d192-v128",
         {
@@ -514,13 +550,6 @@ _FP8_CASES = _COMMON_CASES + [
 ]
 _BF16_CASES = _COMMON_CASES + [
     *_ASYMMETRIC_WINDOW_CASES,
-    *[
-        (
-            f"asymmetric-window-{window}",
-            {**_ASYMMETRIC_WINDOW_CASES[0][1], "window": window},
-        )
-        for window in (1, 127, 1025, 4097, 2**31 + 1)
-    ],
     (
         "asymmetric-full",
         {**_ASYMMETRIC_WINDOW_CASES[0][1], "window": 0},
@@ -832,27 +861,6 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         *[
             pytest.param(
                 {
-                    "invalid_input": "asymmetric-window",
-                    "error": NotImplementedError,
-                    "match": r"sliding window in \[128, 1024\]",
-                    "query_length": 8,
-                    "group_size": 16,
-                    "head_dim": 192,
-                    "value_dim": 128,
-                    "block_size": 64,
-                    "kv_dtype": dtype,
-                    "scale_mode": "per-tensor" if dtype == "fp8" else "none",
-                    "window": window,
-                    "lengths": (257,),
-                },
-                id=f"invalid-{dtype}-asymmetric-window-{window}",
-            )
-            for dtype in ("fp8",)
-            for window in (127, 1025)
-        ],
-        *[
-            pytest.param(
-                {
                     "invalid_input": invalid,
                     "error": error,
                     "match": match,
@@ -1083,7 +1091,16 @@ def test_pa_decode(case, device, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "kv_dtype,window", [("fp8", 128), ("bf16", 128), ("bf16", 1), ("bf16", 1025)]
+    "kv_dtype,window",
+    [
+        ("fp8", 4),
+        ("fp8", 17),
+        ("fp8", 128),
+        ("fp8", 1025),
+        ("bf16", 128),
+        ("bf16", 1),
+        ("bf16", 1025),
+    ],
 )
 def test_asymmetric_autotune_plan(kv_dtype, window, device, tmp_path):
     """Tuned and cached plans must decode with the physical V/output width."""
@@ -1145,3 +1162,33 @@ def test_asymmetric_autotune_plan(kv_dtype, window, device, tmp_path):
         output.fill_(float("nan"))
         pa.pa_decode(output, *arguments, **options, work_plan=selected_plan)
         _check_output(output, reference, 1e-2 if kv_dtype == "fp8" else 5e-3)
+
+    if kv_dtype == "fp8":
+        # A cached plan must switch between short and ordinary arithmetic as
+        # the device lengths change, without recompilation or stale outputs.
+        def launch():
+            pa.plan_pa_decode(
+                context, 1, query_length=8, sliding_window=window, plan=cached_plan
+            )
+            pa.pa_decode(output, *arguments, **options, work_plan=cached_plan)
+
+        launch()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        for length in (0, 8, 16, 17, 1027):
+            context.fill_(length)
+            query.neg_()
+            output.fill_(float("nan"))
+            graph.replay()
+            reference = _reference(
+                query,
+                key.float() * key_scale,
+                value.float() * value_scale,
+                table,
+                context,
+                8,
+                window,
+                None,
+            )
+            _check_output(output, reference, 1e-2)

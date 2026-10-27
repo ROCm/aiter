@@ -96,6 +96,33 @@ def _bf16_lds_bytes(head_dim, query_rows, block_size):
 
 
 @dataclass(frozen=True)
+class PaDecodeTilePolicy:
+    """Compile-time arithmetic and residual storage for one execution variant."""
+
+    single_tile: bool
+    qk_chunks: int
+    pv_packs: int
+    residual_tokens: int
+
+    @classmethod
+    def select(cls, traits, token_bound=None):
+        """Use token_bound only for the caller-guarded asymmetric FP8 path."""
+        # At most 16 keys fit the existing 16-byte P-row padding. Other
+        # corrected windows use a full plane because their keys may lie anywhere.
+        compact = token_bound is not None and token_bound <= MFMA_MNK
+        return cls(
+            single_tile=traits.single_tile_plan or compact,
+            qk_chunks=1 if compact else traits.NCHUNK,
+            pv_packs=2 if compact else traits.NVOPS,
+            residual_tokens=(
+                MFMA_MNK
+                if compact
+                else traits.TILE_TOK if traits.FP8_WINDOW_RESIDUAL else 0
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class PaDecodeSchedule:
     """Select the cache key without constructing the full kernel layout."""
 
@@ -165,16 +192,12 @@ class PaDecodeSchedule:
             and query_length == 8
             and trans_v
             and not per_token_kv
-            and (
-                (is_bf16_kv and sliding_window >= 0)
-                or sliding_window == 0
-                or 128 <= sliding_window <= 1024
-            )
+            and sliding_window >= 0
         ):
             raise ValueError(
                 "asymmetric V requires gfx950 BF16 Q/O, scalar FP8 or BF16 KV, "
                 "Qlen8/GQA16/page64 D192/V128, and full attention or a positive "
-                "sliding window (FP8 KV requires a sliding window in [128, 1024])"
+                "sliding window"
             )
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (
@@ -466,6 +489,7 @@ class PaDecodeTraits:
     QP_ELEM_BYTES: int
     Q_ABSMAX_F32: bool
     UNIQUE_SCALE_STAGING: bool
+    FP8_WINDOW_RESIDUAL: bool
     WIDE_FP8_MFMA: bool
     PACKS_PER_MFMA: int
     MTP4_FUSED: bool
@@ -571,9 +595,9 @@ class PaDecodeTraits:
         )
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
-        ASYMMETRIC_FP8 = (
-            value_dim != head_dim and not is_bf16_kv and sliding_window == 0
-        )
+        ASYMMETRIC_FP8 = value_dim != head_dim and not is_bf16_kv
+        # Very small windows need a second FP8 probability term even in long contexts.
+        FP8_WINDOW_RESIDUAL = ASYMMETRIC_FP8 and 0 < sliding_window <= MFMA_MNK
         QUERIES_PER_CTA = query_length // query_splits
         TOTAL_ROWS = query_length * query_group_size
 
@@ -730,6 +754,8 @@ class PaDecodeTraits:
         sP_off = 0
         # Padding avoids 32-bank conflicts while preserving ds_read_b128 alignment.
         SP_ROW_BYTES = TILE_TOK * QP_ELEM_BYTES + 16
+        if FP8_WINDOW_RESIDUAL:
+            SP_ROW_BYTES += TILE_TOK
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
         sQscale_off = max(sQ_bytes, sP_bytes)
         sQscale_bytes = 0 if is_bf16_kv else ROWS_PADDED * f32
@@ -785,6 +811,7 @@ class PaDecodeTraits:
             QP_ELEM_BYTES=QP_ELEM_BYTES,
             Q_ABSMAX_F32=Q_ABSMAX_F32,
             UNIQUE_SCALE_STAGING=UNIQUE_SCALE_STAGING,
+            FP8_WINDOW_RESIDUAL=FP8_WINDOW_RESIDUAL,
             WIDE_FP8_MFMA=WIDE_FP8_MFMA,
             PACKS_PER_MFMA=PACKS_PER_MFMA,
             MTP4_FUSED=MTP4_FUSED,
