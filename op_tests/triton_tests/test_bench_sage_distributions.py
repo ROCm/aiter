@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -98,3 +99,19 @@ def test_peaked_is_more_concentrated_than_diffusion(bench):
     diffusion = effective_keys("diffusion")
     peaked = effective_keys("peaked")
     assert peaked < diffusion / 4, f"peaked {peaked:.1f} vs diffusion {diffusion:.1f}"
+
+
+def test_tiebreak_keeps_its_own_reference_bound(bench):
+    """`tiebreak` leaves BF16 by construction, so it needs a looser bound than the sweep's.
+
+    A tie resolved differently moves a whole output row, so reusing a neighbouring distribution's
+    bound here would report breakage on the property the generator is built to create.
+    """
+    bound = bench.fp8_max_diff_percentage(
+        argparse.Namespace(input_distribution="tiebreak")
+    )
+    others = [
+        bench.fp8_max_diff_percentage(argparse.Namespace(input_distribution=name))
+        for name in ("normal", "diffusion", "peaked")
+    ]
+    assert bound > max(others), f"tiebreak {bound} vs {others}"
