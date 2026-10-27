@@ -175,12 +175,7 @@ def _align_up(value: int, alignment: int) -> int:
 
 
 def _compact_gemm_align_m(
-    config: "MegaMoEConfig",
-    *,
-    activation: ActivationType,
-    quant_type: QuantType,
-    inter_dim: int,
-    recv_bound: int | None = None,
+    config: "MegaMoEConfig", recv_bound: int | None = None
 ) -> int:
     """Tile alignment for compact dest rows; must match GEMM ``max(tile_m, tile_m2)``.
 
@@ -227,14 +222,14 @@ def _compact_gemm_align_m(
             config.max_recv if recv_bound is None else int(recv_bound)
         ),
         model_dim=config.hidden_dim,
-        inter_dim=int(inter_dim),
+        inter_dim=config.geometry.inter_dim,
         experts=config.experts_per_rank,
         topk=-1,
-        activation=activation,
+        activation=config.recipe.activation,
         dtype=dtypes.bf16,
         q_dtype_a=q_dtype_a,
         q_dtype_w=dtypes.fp4x2,
-        quant_type=quant_type,
+        quant_type=config.recipe.quant_type,
     )
     tile_m = 64
     tile_m2 = 64
@@ -416,21 +411,28 @@ def _mori_capabilities() -> _MoriCapabilities:
 
 
 class SymmetricArena:
+    """One cco symmetric allocation, registered as a window and cut into the
+    named regions of an ``_ArenaLayout`` (or a [(name, nbytes)] list, laid down
+    in its own order)."""
+
     _ALIGNMENT = 256
 
-    def __init__(self, communicator, regions):
+    def __init__(self, communicator, layout):
+        if not isinstance(layout, _ArenaLayout):
+            layout = _ArenaLayout.of(layout)
         self._communicator = communicator
-        self._offsets = {}
-        self._sizes = {}
-        offset = 0
-        for name, size in regions:
-            offset = _align_up(offset, self._ALIGNMENT)
-            self._offsets[name] = offset
-            self._sizes[name] = size
-            offset += size
-        self._total_bytes = max(_align_up(offset, self._ALIGNMENT), self._ALIGNMENT)
+        self.layout = layout
+        self._offsets = dict(layout.offsets)
+        self._sizes = dict(layout.regions)
+        self._total_bytes = layout.total_bytes
         self._memory = communicator.alloc_mem(self._total_bytes)
-        self._window = communicator.register_window(self._memory.ptr, self._total_bytes)
+        try:
+            self._window = communicator.register_window(
+                self._memory.ptr, self._total_bytes
+            )
+        except BaseException:
+            self._memory.close()
+            raise
 
     @property
     def handle(self) -> int:
@@ -927,6 +929,167 @@ class MegaMoEConfig:
         return self.combine_slot_stride_for(0)
 
 
+# The order the regions are laid down in. Kept to the order the pipeline always
+# appended them in, so every pairing keeps the offsets it always had.
+_ARENA_REGION_ORDER = (
+    "tok_off",
+    "recv_num",
+    "recv_to_src_token",
+    "out_idx",
+    "out_wts",
+    "disp_out",
+    "cross_device_barrier",
+    "disp_out_scales",
+    "ep_rowmap",
+    "compact_hist",
+    "compact_done",
+    "comb_inp",
+)
+# cco rounds each allocation up to its VMM granularity -- 2 MiB on the parts
+# MegaMoE runs on -- and, past 2 GiB, to 2 MiB again for the MR registration.
+_CCO_VMM_GRANULARITY = 2 << 20
+_CCO_MR_PAD_THRESHOLD = 2 << 30
+_CCO_MR_PAD_ALIGN = 2 << 20
+# The widest compact tile a grouped-GEMM CSV row names; bounds the compact
+# rows when the tile cannot be looked up (inter_dim unknown).
+_MAX_COMPACT_TILE_M = 256
+
+
+@dataclass(frozen=True)
+class _ArenaLayout:
+    """The arena's named regions, their offsets, and the bytes the whole takes."""
+
+    regions: tuple  # ((name, nbytes), ...), in layout order
+    offsets: dict
+    total_bytes: int
+
+    @classmethod
+    def of(cls, regions) -> "_ArenaLayout":
+        """Lay ``regions`` down in the order given, each 256 B aligned."""
+        offsets, offset = {}, 0
+        for name, size in regions:
+            offset = _align_up(offset, SymmetricArena._ALIGNMENT)
+            offsets[name] = offset
+            offset += size
+        total = max(
+            _align_up(offset, SymmetricArena._ALIGNMENT), SymmetricArena._ALIGNMENT
+        )
+        return cls(tuple((name, int(size)) for name, size in regions), offsets, total)
+
+    @classmethod
+    def merge(cls, *requests) -> "_ArenaLayout":
+        """The regions every request asks for, each at the largest size asked,
+        in _ARENA_REGION_ORDER."""
+        need = {}
+        for request in requests:
+            for name, size in request.items():
+                need[name] = max(need.get(name, 0), int(size))
+        unknown = sorted(set(need) - set(_ARENA_REGION_ORDER))
+        if unknown:
+            raise ValueError(f"unknown arena region(s) {unknown}")
+        return cls.of([(n, need[n]) for n in _ARENA_REGION_ORDER if need.get(n)])
+
+
+@dataclass(frozen=True)
+class _CompactGeometry:
+    """The compact dispatch's row geometry, sized for the arena's capacity bucket."""
+
+    tile_m: int  # the capacity bucket's GEMM tile; each step clamps to it
+    cap: int  # recv rows the arena holds
+    wire_row: int  # payload, then its e8m0 row, 128 B aligned
+    hist_stride: int
+    max_routes: int
+
+    @classmethod
+    def of(cls, config: MegaMoEConfig, tile_m: int | None = None):
+        from .compact_plan import compact_hist_stride
+
+        tile = _compact_gemm_align_m(config) if tile_m is None else tile_m
+        max_routes = config.max_tokens_per_rank * config.topk
+        return cls(
+            tile_m=tile,
+            cap=config.compact_row_cap(tile),
+            wire_row=_align_up(
+                config.dispatch_token_nbytes + config.dispatch_scale_nbytes, 128
+            ),
+            hist_stride=compact_hist_stride(
+                npes=config.world_size,
+                experts_per_rank=config.experts_per_rank,
+                max_routes=max_routes,
+            ),
+            max_routes=max_routes,
+        )
+
+
+def _dispatch_regions(config: MegaMoEConfig, mori, compact=None) -> dict:
+    """What the dispatch writes: the routing both kinds share, then its rows."""
+    max_recv, topk = config.max_recv, config.topk
+    regions = {
+        "tok_off": 4,
+        # mori's gfx1250 dispatch signals 8 bytes a source (ROCm/mori#745).
+        "recv_num": 2 * config.world_size * 4,
+        "recv_to_src_token": max_recv * 4,
+        "out_idx": max_recv * topk * 4,
+        "out_wts": max_recv * topk * 4,
+    }
+    if config.recipe.dispatch is DispatchKind.COMPACT:
+        from .compact_plan import compact_done_nbytes
+
+        geo = compact if compact is not None else _CompactGeometry.of(config)
+        regions["disp_out"] = geo.cap * geo.wire_row
+        regions["ep_rowmap"] = (geo.cap + 1) * 8
+        regions["compact_hist"] = 2 * geo.hist_stride * 4
+        regions["compact_done"] = compact_done_nbytes()
+    else:
+        regions["disp_out"] = max_recv * config.dispatch_token_nbytes
+        if config.is_quant_dispatch_wire:
+            regions["disp_out_scales"] = max_recv * mori.scale_stride(config)
+    return regions
+
+
+def _combine_regions(config: MegaMoEConfig, mori) -> dict:
+    """What the combine stages through: its barrier and its input rows."""
+    regions = {"cross_device_barrier": config.world_size * 8}
+    if config.recipe.combine is CombineKind.FUSED_SCATTER:
+        # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
+        # holds a step on any of them and a quantized one just packs into the
+        # front of it at its own pitch.
+        regions["comb_inp"] = (
+            config.max_tokens_per_rank * config.topk * config.combine_slot_stride_bytes
+        )
+        return regions
+    # mori's outTok: one bf16 staging row per recv slot, then, for the fp4 push
+    # combine, its landing rows and, from four ranks up, a u64 flag per landing
+    # row for the overlapped combine (EpFp4Ovl) -- the same three parts mori's
+    # own out_tok sizes.
+    nbytes = config.max_recv * config.hidden_dim * 2
+    if config.combine_quant_bits:
+        landing_rows = mori.push_landing_rows(config)
+        if landing_rows is None:
+            landing_rows = config.world_size * config.max_recv
+        nbytes += landing_rows * mori.push_wire_bytes(config)
+        if config.world_size >= 4:
+            nbytes += landing_rows * 8
+    regions["comb_inp"] = nbytes
+    return regions
+
+
+def _arena_layout(config: MegaMoEConfig, mori, compact=None) -> _ArenaLayout:
+    """The one arena formula: what the runtime allocates and what
+    ``required_vmm_bytes`` reports."""
+    return _ArenaLayout.merge(
+        _dispatch_regions(config, mori, compact), _combine_regions(config, mori)
+    )
+
+
+def _cco_alloc_bytes(nbytes: int, granularity: int) -> int:
+    """What ccoMemAlloc takes out of per_rank_vmm for an ``nbytes`` allocation."""
+    aligned = _align_up(nbytes, granularity)
+    if nbytes > _CCO_MR_PAD_THRESHOLD:
+        aligned = _align_up(aligned, _CCO_MR_PAD_ALIGN)
+    return aligned
+
+
 @dataclass
 class Routing:
     token_count: int
@@ -1030,6 +1193,87 @@ class MegaMoEGfx1250:
         self = cls.__new__(cls)
         self._build(recipe, geometry, communicator, situ_beta, situ_linear_beta)
         return self
+
+    @classmethod
+    def required_vmm_bytes(
+        cls,
+        recipe: MegaMoERecipe | None = None,
+        geometry: MegaMoEGeometry | None = None,
+        *,
+        granularity: int = _CCO_VMM_GRANULARITY,
+        **legacy,
+    ) -> int:
+        """The per-rank cco VMM (``per_rank_vmm``) this MegaMoE takes.
+
+        Its arena -- the one cco allocation it makes -- rounded up the way
+        ccoMemAlloc rounds it. The constructor allocates this same layout, so the
+        allocation never exceeds it. It needs no communicator, so it can size the
+        one about to be created; but it is MegaMoE's share only, and a
+        communicator that also carries other cco allocations (mori's own EP ops,
+        say) needs theirs added on top. ``granularity`` is the communicator's VMM
+        granularity, when known.
+
+        The keyword form ``required_vmm_bytes(world_size=, hidden_dim=,
+        max_tokens_per_rank=, experts=, topk=, stage1_fused=)`` names neither the
+        wires nor the combine nor inter_dim, so it returns the largest any recipe
+        with that dispatch could take.
+        """
+        if recipe is None:
+            return cls._legacy_vmm_bound(granularity, **legacy)
+        config = MegaMoEConfig(recipe=recipe, geometry=geometry)
+        mori = None if recipe.dispatch is DispatchKind.COMPACT else _mori_capabilities()
+        return _cco_alloc_bytes(_arena_layout(config, mori).total_bytes, granularity)
+
+    @classmethod
+    def _legacy_vmm_bound(
+        cls,
+        granularity,
+        *,
+        world_size,
+        hidden_dim,
+        max_tokens_per_rank,
+        experts,
+        topk,
+        stage1_fused=False,
+    ):
+        geometry = MegaMoEGeometry(
+            rank=0,
+            world_size=world_size,
+            model_dim=hidden_dim,
+            inter_dim=1,
+            experts=experts,
+            topk=topk,
+            max_tokens_per_rank=max_tokens_per_rank,
+        )
+        if stage1_fused:
+            candidates = [
+                MegaMoERecipe(dispatch=DispatchKind.COMPACT, dispatch_wire=wire)
+                for wire in ("fp8", "fp4")
+            ]
+        else:
+            candidates = [
+                MegaMoERecipe(dispatch_wire=wire, combine=combine, combine_wires=wires)
+                for wire in _DISPATCH_WIRES
+                for combine, wires in (
+                    (CombineKind.FUSED_SCATTER, ("bf16",)),
+                    (CombineKind.MORI, ("bf16", "fp4")),
+                )
+            ]
+        mori = None if stage1_fused else _mori_capabilities()
+        largest = 0
+        for recipe in candidates:
+            try:
+                config = MegaMoEConfig(recipe=recipe, geometry=geometry)
+            except ValueError:
+                continue  # e.g. mori's fp4 combine at a hidden it cannot tile
+            compact = (
+                _CompactGeometry.of(config, _MAX_COMPACT_TILE_M)
+                if stage1_fused
+                else None
+            )
+            layout = _arena_layout(config, mori, compact)
+            largest = max(largest, layout.total_bytes)
+        return _cco_alloc_bytes(largest, granularity)
 
     def _build(self, recipe, geometry, communicator, situ_beta, situ_linear_beta):
         config = MegaMoEConfig(recipe=recipe, geometry=geometry)
@@ -1473,13 +1717,7 @@ class MegaMoEGfx1250:
         config = self._config
         bound = config.max_recv if recv_token_bound is None else int(recv_token_bound)
         bound = max(1, min(bound, config.max_recv))
-        align_m = _compact_gemm_align_m(
-            config,
-            activation=self.activation,
-            quant_type=self.quant_type,
-            inter_dim=self.inter_dim,
-            recv_bound=bound,
-        )
+        align_m = _compact_gemm_align_m(config, recv_bound=bound)
         # The arena holds rows for _compact_tile_m, and the CSV tiles are not
         # monotonic in the token bucket, so a smaller bound can still name a
         # wider tile. Clamping keeps every step inside the allocated rows.
@@ -1589,18 +1827,12 @@ class MegaMoEGfx1250:
         # Everything that can fail, and the host collectives, before the
         # symmetric arena -- itself collective -- is allocated.
         self._plan_transport(config)
-        self._compact_tile_m = _compact_gemm_align_m(
-            config,
-            activation=self.activation,
-            quant_type=self.quant_type,
-            inter_dim=self.inter_dim,
-        )
+        self._compact_tile_m = _compact_gemm_align_m(config)
         self._compact_cap = (
             config.compact_row_cap(self._compact_tile_m)
             if self._compact_plan
             else max_recv
         )
-        recv_rows = self._compact_cap if self._compact_plan else max_recv
         self._compact_wire_row = (
             _align_up(
                 config.dispatch_token_nbytes + config.dispatch_scale_nbytes,
@@ -1609,67 +1841,14 @@ class MegaMoEGfx1250:
             if self._compact_plan
             else config.dispatch_token_nbytes
         )
-        from .compact_plan import (
-            PLAN_BLOCKS,
-            compact_done_nbytes,
-            compact_hist_stride,
-        )
+        from .compact_plan import PLAN_BLOCKS
 
         segs = config.world_size * config.experts_per_rank
-        max_routes = config.max_tokens_per_rank * config.topk
-        hist_stride = compact_hist_stride(
-            npes=config.world_size,
-            experts_per_rank=config.experts_per_rank,
-            max_routes=max_routes,
-        )
-        self._compact_hist_stride = hist_stride
-        self._compact_max_routes = max_routes
-        arena_regions = [
-            ("tok_off", 4),
-            # mori's gfx1250 dispatch signals 8 bytes a source (ROCm/mori#745).
-            ("recv_num", 2 * config.world_size * 4),
-            ("recv_to_src_token", max_recv * 4),
-            ("out_idx", max_recv * config.topk * 4),
-            ("out_wts", max_recv * config.topk * 4),
-            ("disp_out", recv_rows * self._compact_wire_row),
-            ("cross_device_barrier", config.world_size * 8),
-        ]
-        if config.dispatch_scale_dst_nbytes and not self._compact_plan:
-            arena_regions.append(
-                ("disp_out_scales", recv_rows * config.dispatch_scale_dst_nbytes)
-            )
-        if self._compact_plan:
-            arena_regions.extend(
-                [
-                    ("ep_rowmap", (recv_rows + 1) * 8),
-                    ("compact_hist", 2 * hist_stride * 4),
-                    ("compact_done", compact_done_nbytes()),
-                ]
-            )
-        if config.stage2_fused:
-            # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
-            # holds a step on any of them and a quantized one just packs into the
-            # front of it at its own pitch.
-            comb_inp_nbytes = (
-                config.max_tokens_per_rank
-                * config.topk
-                * config.combine_slot_stride_bytes
-            )
-        else:
-            # mori's outTok: one bf16 staging row per recv slot, then, for the
-            # fp4 push combine, its landing rows and, from four ranks up, a u64
-            # flag per landing row for the overlapped combine (EpFp4Ovl) -- the
-            # same three parts mori's own out_tok sizes.
-            comb_inp_nbytes = max_recv * config.hidden_dim * 2
-            if config.combine_quant_bits:
-                landing_rows = self._mori.push_landing_rows(config)
-                if landing_rows is None:
-                    landing_rows = config.world_size * max_recv
-                comb_inp_nbytes += landing_rows * self._mori.push_wire_bytes(config)
-                if config.world_size >= 4:
-                    comb_inp_nbytes += landing_rows * 8
-        arena_regions.append(("comb_inp", comb_inp_nbytes))
-        self._arena = SymmetricArena(communicator, arena_regions)
+        compact = _CompactGeometry.of(config, self._compact_tile_m)
+        self._compact_hist_stride = compact.hist_stride
+        self._compact_max_routes = compact.max_routes
+        self._layout = _arena_layout(config, self._mori, compact)
+        self._arena = SymmetricArena(communicator, self._layout)
         self._compact_scale_row = (
             config.dispatch_scale_nbytes
             if self._compact_plan

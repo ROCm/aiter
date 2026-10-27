@@ -15,7 +15,9 @@ Covered, on the a4w4 recipe (fp4 dispatch wire) plus a bf16 wire:
   * pairings MegaMoE cannot run fail before the symmetric arena is allocated;
   * mori's combine reads fused_moe's rows in place (zero-copy staging);
   * close() releases the plans before the window and the window before its memory;
-  * the members ATOM's Triton path reaches (_dispatch, _combine, _arena, _config).
+  * the members ATOM's Triton path reaches (_dispatch, _combine, _arena, _config);
+  * from_recipe builds what the keyword constructor builds, and
+    required_vmm_bytes covers exactly what the arena allocates.
 """
 
 from __future__ import annotations
@@ -97,6 +99,7 @@ class _CountingCommunicator:
     def __init__(self, inner):
         self._inner = inner
         self.allocs = 0
+        self.alloc_bytes = []
         self.close_log = []
 
     def __getattr__(self, attr):
@@ -104,6 +107,7 @@ class _CountingCommunicator:
 
     def alloc_mem(self, nbytes):
         self.allocs += 1
+        self.alloc_bytes.append(nbytes)
         return _LoggedClose(self._inner.alloc_mem(nbytes), "memory", self.close_log)
 
     def register_window(self, ptr, nbytes):
@@ -323,12 +327,79 @@ def _check_atom_surface(ctx):
         ctx.comm.barrier()
 
 
+def _check_recipe_entry(ctx):
+    """from_recipe with the recipe the flags resolve to runs bit for bit alike."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+
+    for label, s1, s2, wire, cq in PAIRINGS:
+        step_cq = None if cq == "none" else cq
+        outs = []
+        for entry in ("legacy", "recipe"):
+            if entry == "legacy":
+                mega = ctx.build(
+                    stage1_fused=s1,
+                    stage2_fused=s2,
+                    dispatch_wire=wire,
+                    combine_quant=cq,
+                )
+                recipe, geometry = mega.recipe, mega.geometry
+            else:
+                mega = MegaMoEGfx1250.from_recipe(
+                    recipe, geometry, communicator=ctx.comm
+                )
+                assert mega.recipe == recipe and mega._config.stage1_fused is s1
+            try:
+                outs.append(ctx.layer(mega, step_cq).clone())
+                torch.cuda.synchronize()
+            finally:
+                ctx.comm.barrier()
+                mega.close()
+                ctx.comm.barrier()
+        assert torch.equal(outs[0], outs[1]), f"{label}: from_recipe != legacy"
+
+
+def _check_vmm_bound(ctx):
+    """required_vmm_bytes is the arena's allocation as cco rounds it."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+
+    granularity = 2 << 20
+    for label, s1, s2, wire, cq in PAIRINGS:
+        counting = _CountingCommunicator(ctx.comm)
+        mega = ctx.build(
+            communicator=counting,
+            stage1_fused=s1,
+            stage2_fused=s2,
+            dispatch_wire=wire,
+            combine_quant=cq,
+        )
+        try:
+            (allocated,) = counting.alloc_bytes
+            need = MegaMoEGfx1250.required_vmm_bytes(mega.recipe, mega.geometry)
+            rounded = -(-allocated // granularity) * granularity
+            assert need == rounded, f"{label}: {need} != {rounded} ({allocated})"
+            bound = MegaMoEGfx1250.required_vmm_bytes(
+                world_size=ctx.world,
+                hidden_dim=HIDDEN,
+                max_tokens_per_rank=TOKENS,
+                experts=ctx.experts,
+                topk=TOPK,
+                stage1_fused=s1,
+            )
+            assert bound >= need, f"{label}: keyword bound {bound} < {need}"
+        finally:
+            ctx.comm.barrier()
+            mega.close()
+            ctx.comm.barrier()
+
+
 CHECKS = (
     _check_pairings,
     _check_rejected_before_alloc,
     _check_zero_copy,
     _check_close_order,
     _check_atom_surface,
+    _check_recipe_entry,
+    _check_vmm_bound,
 )
 
 
