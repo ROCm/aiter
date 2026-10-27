@@ -22,7 +22,7 @@ template <typename A0DataType,
           bool MulRoutedWeight,
           int ActOP,
           bool NT>
-void ck_moe_stage1_gemm(const hipStream_t& stream,
+void ck_moe_stage1_gemm_nt(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
                         int N,
@@ -197,7 +197,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          bool PadK>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -217,11 +218,12 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<int> splitk,     // splitk
                         std::optional<bool> nt)
 {
+    static_assert(!PadK, "This kernel does not implement K padding.");
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() <<
     // std::endl;
     if(nt.has_value() && nt.value())
     {
-        ck_moe_stage1_gemm<A0DataType,
+        ck_moe_stage1_gemm_nt<A0DataType,
                            B0DataType,
                            AccDataType,
                            EDataType,
@@ -257,7 +259,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     }
     else
     {
-        ck_moe_stage1_gemm<A0DataType,
+        ck_moe_stage1_gemm_nt<A0DataType,
                            B0DataType,
                            AccDataType,
                            EDataType,
@@ -346,7 +348,7 @@ template <typename A0DataType,
           bool MulRoutedWeight,
           int ActOP = 0,
           bool NT   = false>
-void ck_moe_stage2_gemm(const hipStream_t& stream,
+void ck_moe_stage2_gemm_nt(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
                         int N,
@@ -497,7 +499,8 @@ template <
     bool Nswizzle,
     bool PerTensorQuant,
     bool MulRoutedWeight,
-    int ActOP = 0>
+    int ActOP,
+    bool PadK>
 void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
                         int topk,
                         void *&inter_states,            // [max_num_tokens_padded, k], input token
@@ -513,9 +516,10 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         std::optional<int>   splitk,    // splitk
                         std::optional<bool>   nt)
 {
+    static_assert(!PadK, "This kernel does not implement K padding.");
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() << std::endl;
     if (nt.has_value() && nt.value()) {
-        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, true>(
+        ck_moe_stage2_gemm_nt<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, true>(
             stream,
             tokens,
             sorted_size,
@@ -534,7 +538,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
             a2_scale,
             splitk);
     } else {
-        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, false>(
+        ck_moe_stage2_gemm_nt<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, false>(
             stream,
             tokens,
             sorted_size,

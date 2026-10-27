@@ -421,7 +421,9 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          // Ask CK to pad K so a K that no KPerBlock divides still has a kernel.
+          bool PadK = false>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -456,7 +458,9 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          // Ask CK to pad K so a K that no KPerBlock divides still has a kernel.
+          bool PadK = false>
 void ck_moe_stage2_gemm(
     const hipStream_t& stream,
     int tokens,

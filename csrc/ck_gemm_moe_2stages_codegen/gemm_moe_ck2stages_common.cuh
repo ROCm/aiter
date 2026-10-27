@@ -21,7 +21,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          bool PadK>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -63,7 +64,11 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     using AElementOp  = PassThrough;
     using BElementOp  = PassThrough;
 
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
+    // Padding K lets CK run a K that no KPerBlock divides, at the cost of a bounds
+    // check on every load, so only the shapes that need it ask for it.
+    static constexpr auto GemmSpec = PadK
+                                         ? ck::tensor_operation::device::GemmSpecialization::KPadding
+                                         : ck::tensor_operation::device::GemmSpecialization::Default;
     static constexpr ck::index_t MNPerXDL    = 16;
     static constexpr ck::index_t WAVES       = BLOCKSIZE / 64;
     static constexpr ck::index_t MXDLPerWave = MPerBlock / (MNPerXDL * MWaves);
@@ -176,7 +181,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      Nswizzle,                                \
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
-                                     ActOP>(const hipStream_t& stream,        \
+                                     ActOP,                                   \
+                                     PadK>(const hipStream_t& stream,         \
                                             int tokens,                       \
                                             int sorted_size,                  \
                                             int N,                            \
@@ -210,7 +216,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP = 0>
+          int ActOP,
+          bool PadK>
 void ck_moe_stage2_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -252,7 +259,11 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     using AElementOp  = PassThrough;
     using BElementOp  = PassThrough;
 
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
+    // Padding K lets CK run a K that no KPerBlock divides, at the cost of a bounds
+    // check on every load, so only the shapes that need it ask for it.
+    static constexpr auto GemmSpec = PadK
+                                         ? ck::tensor_operation::device::GemmSpecialization::KPadding
+                                         : ck::tensor_operation::device::GemmSpecialization::Default;
     // static constexpr ck::index_t BLOCKSIZE = 256;
     static constexpr ck::index_t WAVES               = BLOCKSIZE / 64;
     static constexpr ck::index_t MNPerXDL            = 16;
@@ -346,7 +357,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
 }
 
 #define CK_MOE_STAGE2_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                    \
-    template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \
+    template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, PadK>( \
         const hipStream_t &stream,                                                                                                                                   \
         int tokens, int sorted_size, int N, int K,                                                                                                                   \
         int topk,                                                                                                                                                    \
