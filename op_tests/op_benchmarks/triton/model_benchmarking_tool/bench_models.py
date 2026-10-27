@@ -737,9 +737,9 @@ def run_benchmarks(
                 print(f"FP4 is not supported on this device. Skipping {kernel}.")
                 continue
 
-            # Default FP8xFP8 path. Verified on gfx950 and gfx1250. is_fp8_avail()
-            # also admits gfx942 / gfx1200 / gfx1201, but the wrapper leaves
-            # USE_FNUZ=False while gfx942 tensors are FNUZ, so keep those gated out.
+            # FP8xFP8 path, verified on gfx950 and gfx1250.
+            # gfx942: FNUZ tensors, USE_FNUZ=False.
+            # gfx1200/gfx1201: RDNA; this script is CDNA only.
             if kernel == "moe_op_gemm_a8w8" and arch_info.get_arch() not in (
                 "gfx950",
                 "gfx1250",
