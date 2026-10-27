@@ -1547,10 +1547,10 @@ def cmdGenFunc_mha_batch_prefill(
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None and sink_ptr is None:
         causal = False
-        if window_size_left >= max_seqlen_k:
-            window_size_left = -1
-        if window_size_right >= max_seqlen_k:
-            window_size_right = -1
+    if window_size_left >= max_seqlen_k:
+        window_size_left = -1
+    if window_size_right >= max_seqlen_k:
+        window_size_right = -1
     md_name = "mha_batch_prefill"
     filter_fwd = "*"  # get_fwd_blobs()
     if q.dtype == torch.float16:
@@ -1577,7 +1577,13 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_alibi"
         filter_fwd += "_alibi*"
-    if not causal and window_size_left == -1 and window_size_right == -1:
+    has_mask = (
+        causal
+        or window_size_left != -1
+        or window_size_right != -1
+        or sink_ptr is not None
+    )
+    if not has_mask:
         md_name += "_nmask"
         filter_fwd += "_nmask*"
     else:
@@ -1606,11 +1612,7 @@ def cmdGenFunc_mha_batch_prefill(
         # PERTENSOR: per-tensor quantization
         md_name += "_pertensor"
         filter_fwd += "_pertensor*"
-    # Sink only applies when there is a causal/window mask; full attention
-    # (window_size_left==-1 and window_size_right==-1) ignores sink_size.
-    has_effective_sink = (sink_size > 0 or sink_ptr is not None) and (
-        causal or not (window_size_left == -1 and window_size_right == -1)
-    )
+    has_effective_sink = sink_ptr is not None or (sink_size > 0 and has_mask)
     if has_effective_sink:
         md_name += "_sink"
         filter_fwd += "_sink*"
