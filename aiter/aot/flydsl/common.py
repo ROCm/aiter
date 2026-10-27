@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
-from aiter.jit.utils.build_targets import _parse_gpu_archs_env
 from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_for
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
@@ -61,19 +60,6 @@ def cu_num_to_arch(cu_num: int, default: str = "gfx950") -> str:
     return _CU_NUM_TO_ARCH.get(cu_num, default)
 
 
-def get_gfx_list_env() -> list[str] | None:
-    """Archs named by an explicit GPU_ARCHS, or None to keep every arch.
-
-    The list may be ';'- or ','-separated. ARCH is not read: build images export
-    it as a machine type such as x86_64, which would drop every job from a wheel
-    build.
-    """
-    gpu_archs = os.environ.get("GPU_ARCHS", "").strip()
-    if not gpu_archs or gpu_archs.lower() == "native":
-        return None
-    return _parse_gpu_archs_env(gpu_archs.replace(",", ";"))
-
-
 def job_identity(job: dict[str, Any]) -> tuple:
     return tuple(sorted(job.items()))
 
@@ -109,9 +95,14 @@ def collect_cli_jobs(
     parse_csv: Callable[[str], list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     """collect_aot_jobs for a python -m entry point, where ARCH replaces GPU_ARCHS."""
-    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
-    with override_env("GPU_ARCHS", arch):
+    with cli_arch_env():
         return collect_aot_jobs(csv_paths, parse_csv)
+
+
+def keeps_arch(arch: str) -> bool:
+    """Whether GPU_ARCHS keeps the jobs that compile for arch."""
+    keep_archs = aot_target_archs()
+    return keep_archs is None or arch in keep_archs
 
 
 @contextmanager
@@ -201,6 +192,14 @@ def check_replay_process(arch: str) -> None:
             f"aiter was imported for another arch: dtypes.fp8 is {dtypes.fp8}, "
             f"{arch} needs {expected}"
         )
+
+
+@contextmanager
+def cli_arch_env() -> Iterator[None]:
+    """Lets ARCH replace GPU_ARCHS, for a python -m entry point."""
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
+    with override_env("GPU_ARCHS", arch):
+        yield
 
 
 def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:

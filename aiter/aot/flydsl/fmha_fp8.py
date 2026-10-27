@@ -16,6 +16,9 @@ them.
 Usage:
     python -m aiter.aot.flydsl.fmha_fp8                          # DEFAULT_SHAPES
     python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128    # ad hoc
+
+Builds nothing unless GPU_ARCHS (or ARCH, for python -m only) is unset or lists
+gfx950.
 """
 
 from __future__ import annotations
@@ -25,8 +28,10 @@ import sys
 import time
 
 from aiter.aot.flydsl.common import (
+    cli_arch_env,
     compile_only_env,
     dedupe_jobs,
+    keeps_arch,
     override_env,
     run_jobs_parallel,
 )
@@ -129,6 +134,8 @@ def _variant_space(causal: bool, cross: bool) -> list[tuple[float, int, int, int
 
 
 def jobs_for_shape(h: int, hkv: int, d: int, dv: int, layout: str) -> list[dict]:
+    if not keeps_arch(AOT_ARCH):
+        return []
     varlen, cross = LAYOUTS[layout]
     jobs = []
     for causal in (True, False):
@@ -281,25 +288,28 @@ def main():
     )
     parser.add_argument("--list", action="store_true", help="print the jobs and exit")
     args = parser.parse_args()
-    if args.shape:
-        jobs = []
-        for spec in args.shape:
-            h, hkv, d, dv, layout = parse_shape(spec)
-            reason = unsupported_reason(h, hkv, d, dv)
-            if reason:
-                print(f"Error: {spec} is unsupported by the FP8 FMHA kernel: {reason}")
-                sys.exit(1)
-            jobs.extend(jobs_for_shape(h, hkv, d, dv, layout))
-        jobs = dedupe_jobs(jobs)
-    else:
-        jobs = default_jobs()
+    with cli_arch_env():
+        if args.shape:
+            jobs = []
+            for spec in args.shape:
+                h, hkv, d, dv, layout = parse_shape(spec)
+                reason = unsupported_reason(h, hkv, d, dv)
+                if reason:
+                    print(
+                        f"Error: {spec} is unsupported by the FP8 FMHA kernel: {reason}"
+                    )
+                    sys.exit(1)
+                jobs.extend(jobs_for_shape(h, hkv, d, dv, layout))
+            jobs = dedupe_jobs(jobs)
+        else:
+            jobs = default_jobs()
     if args.list:
         for job in jobs:
             print(job["kernel_name"])
         print(f"{len(jobs)} jobs")
         return
     if not jobs:
-        print("no head shapes configured; nothing to compile")
+        print("nothing to compile for these head shapes and GPU_ARCHS")
         return
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)

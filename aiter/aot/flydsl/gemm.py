@@ -54,10 +54,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
+    aot_target_archs,
     collect_cli_jobs,
     compile_only_env,
     cu_num_to_arch,
-    get_gfx_list_env,
     job_identity,
     override_env,
     run_jobs_parallel,
@@ -455,7 +455,7 @@ def parse_csv(csv_path: str):
             "have no AOT wiring, skipping"
         )
 
-    keep_archs = get_gfx_list_env()
+    keep_archs = aot_target_archs()
     if keep_archs is not None:
         jobs = [
             j for j in jobs if job_arch(j["cu_num"], j.get("gfx", "")) in keep_archs

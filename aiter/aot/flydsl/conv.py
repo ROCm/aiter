@@ -27,10 +27,10 @@ import sys
 import time
 
 from aiter.aot.flydsl.common import (
+    aot_target_archs,
     collect_cli_jobs,
     compile_only_env,
     cu_num_to_arch,
-    get_gfx_list_env,
     job_identity,
     override_env,
     run_jobs_parallel,
@@ -169,7 +169,7 @@ def parse_csv(csv_path: str):
     jobs = []
     seen = set()
     # Applied here so setup.py's run_aot sees it too.
-    keep_archs = get_gfx_list_env()
+    keep_archs = aot_target_archs()
 
     with open(csv_path, newline="") as f:
         for raw in csv.DictReader(f):
