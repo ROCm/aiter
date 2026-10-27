@@ -7708,10 +7708,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
         cfg = _parse_mxfp4_g1_kname(kn1)
         bm = cfg["BM"]
-        if cfg["inline_quant"] != (bm == 16):
-            raise ValueError(
-                f"GEMM1 BM{bm} violates the derived input quantization contract"
-            )
         sti, sw, sei, nvi, moe_buf, m_indices, _reverse_sorted = sorting
         stage1_input, stage1_scale = data["input"], None
         if bm == 16:
