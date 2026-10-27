@@ -19,6 +19,7 @@ from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
+    _Q256_KERNEL,
     _flydsl_route_output_nbytes,
     _is_flydsl_stage2,
     _stage2_runtime_uses_route_reduce,
@@ -38,14 +39,12 @@ from aiter.int4_utils import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops import moe_op
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
-from aiter.ops.moe_op import _Q256_KERNEL
 from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -333,7 +332,7 @@ def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
     ):
         metadata = _q256_metadata(**metadata_overrides)
         assert not metadata.run_1stage and metadata.stage2 is not None
-        assert not moe_op.is_q256_kernel(metadata.stage1.keywords.get("kernelName", ""))
+        assert metadata.stage1.keywords.get("kernelName", "") != _Q256_KERNEL
         if "quant_dtype_a2" in overrides:
             assert metadata.fuse_quant == "fp8"
             assert "_afp8_" in metadata.stage2.keywords["kernelName"]
@@ -860,7 +859,7 @@ def test_fmoe(
     # the 2-stage flydsl/torch path does via its bf16 a2 buffer).
     if ref_dtype == "fp32":
         stage1_ref_dtype = dtypes.fp32
-    if expected_kernel is not None and moe_op.is_q256_kernel(expected_kernel):
+    if expected_kernel == _Q256_KERNEL:
         # Q256 quantizes the FP32 SiLU*up result, without a BF16 round trip.
         stage1_ref_dtype = dtypes.fp32
 
@@ -913,7 +912,7 @@ def test_fmoe(
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
-    if expected_kernel is not None and moe_op.is_q256_kernel(expected_kernel):
+    if expected_kernel == _Q256_KERNEL:
         out2_ref = _torch_q256_stage2(out1_ref, w2_qt, w2_scale, topk_ids, topk_weights)
     else:
         out2_ref = torch_moe_stage2(
@@ -1038,7 +1037,7 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    if expected_kernel is not None and moe_op.is_q256_kernel(expected_kernel):
+    if expected_kernel == _Q256_KERNEL:
         ret = _check_q256_integration(
             (input, w1_qt_aiter, w2_qt_aiter, topk_weights, topk_ids),
             _fused_moe_kwargs,
@@ -1370,14 +1369,14 @@ def _iter_csv_cases():
             "flydsl_" not in kernel_name1
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
-            and not moe_op.is_q256_kernel(kernel_name1)
+            and kernel_name1 != _Q256_KERNEL
             and not (
                 kernel_name1.startswith("_ZN5aiter")
                 and str(row.get("q_type", "")) == "QuantType.per_1x32"
             )
         ):
             continue
-        if moe_op.is_q256_kernel(kernel_name1) and get_gfx() != "gfx950":
+        if kernel_name1 == _Q256_KERNEL and get_gfx() != "gfx950":
             continue
         if args.csv_filter:
             _kn = kernel_name1 + " " + kernel_name2
@@ -1441,7 +1440,7 @@ def _iter_csv_cases():
             args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
         )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
-        if moe_op.is_q256_kernel(kernel_name1):
+        if kernel_name1 == _Q256_KERNEL:
             kwargs["expected_kernel"] = kernel_name1
             kwargs["shared_expert_id"] = 512
             kwargs["check_aot_cache"] = False
@@ -1985,13 +1984,13 @@ def test_q256_token_boundaries():
 
     metadata = _q256_metadata()
     assert metadata.run_1stage and metadata.block_m == 256
-    assert moe_op.is_q256_kernel(metadata.stage1.keywords["kernelName"])
+    assert metadata.stage1.keywords["kernelName"] == _Q256_KERNEL
     for gate_up_interleave in (False, None):
         supported = _q256_metadata(
             opus_weights_shuffled=True, gate_up_interleave=gate_up_interleave
         )
         assert supported.run_1stage and supported.block_m == 256
-        assert moe_op.is_q256_kernel(supported.stage1.keywords["kernelName"])
+        assert supported.stage1.keywords["kernelName"] == _Q256_KERNEL
     for unsupported in (
         {"opus_weights_shuffled": False},
         {"is_shuffled": False},
@@ -2007,7 +2006,7 @@ def test_q256_token_boundaries():
     ):
         fallback = _q256_metadata(**unsupported)
         assert not fallback.run_1stage and fallback.stage2 is not None
-        assert not moe_op.is_q256_kernel(fallback.stage1.keywords.get("kernelName", ""))
+        assert fallback.stage1.keywords.get("kernelName", "") != _Q256_KERNEL
     stage1 = functools.partial(
         metadata.stage1.func,
         **{**metadata.stage1.keywords, "kernelName": _Q256_KERNEL},
@@ -2410,7 +2409,7 @@ def main():
     q256_selected = False
     for kwargs, extras in case_iter:
         seen += 1
-        q256_selected |= moe_op.is_q256_kernel(kwargs.get("expected_kernel", ""))
+        q256_selected |= kwargs.get("expected_kernel", "") == _Q256_KERNEL
         skip_reason = _moe_2stage_skip_reason(kwargs)
         if skip_reason is not None:
             aiter.logger.warning(

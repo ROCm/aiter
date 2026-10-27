@@ -734,12 +734,3 @@ def ck_moe_stage2_fwd(
         is_shuffled=getattr(w2, "is_shuffled", False),
     )
     return out
-
-
-_Q256_KERNEL = (
-    "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route"
-)
-
-
-def is_q256_kernel(kernel_name):
-    return kernel_name == _Q256_KERNEL

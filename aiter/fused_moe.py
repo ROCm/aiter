@@ -56,7 +56,6 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_g2_kname_any,
 )
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
-from aiter.ops.moe_op import is_q256_kernel
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
@@ -78,6 +77,10 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 
 AUX_SORT_OPUS = "opus"
+
+_Q256_KERNEL = (
+    "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route"
+)
 
 
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
@@ -1719,7 +1722,7 @@ def _fused_moe_impl(
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     if (
-        is_q256_kernel(getattr(metadata.stage1, "keywords", {}).get("kernelName", ""))
+        getattr(metadata.stage1, "keywords", {}).get("kernelName", "") == _Q256_KERNEL
         and block_size_M != 256
     ):
         raise ValueError(
@@ -2152,7 +2155,7 @@ def fused_moe_1stage(
             )
             return moe_buf
 
-        if isG1U1 and is_q256_kernel(kernelName):
+        if isG1U1 and kernelName == _Q256_KERNEL:
             if a2_scale is not None:
                 raise ValueError("Q256 does not support caller-provided hidden scales")
             # The ASM stores one weighted BF16 row per token/topk slot.
@@ -3786,7 +3789,7 @@ def get_2stage_cfgs(
                     "incomplete metadata"
                 )
 
-    if cfg is not None and is_q256_kernel(kn1):
+    if cfg is not None and kn1 == _Q256_KERNEL:
         q256_supported = (
             gfx == "gfx950"
             and dtype == dtypes.bf16
@@ -4158,7 +4161,7 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
             flat=cfg_flat,
-            output_aux=(AUX_SORT_OPUS if is_q256_kernel(kernelName1) else False),
+            output_aux=(AUX_SORT_OPUS if kernelName1 == _Q256_KERNEL else False),
             **route_bucket_metadata,
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
