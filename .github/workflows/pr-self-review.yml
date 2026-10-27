@@ -4,6 +4,10 @@ on:
   pull_request_target:
     branches: [main]
     types: [opened, reopened, edited, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
   workflow_run:
     workflows: [Checks, Aiter Test]
     types: [completed]
