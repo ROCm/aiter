@@ -95,10 +95,9 @@ RUN_CONFIG_REPS = 3
 # where make_im2col_plan takes the 2D block up.
 BLOCK_COLS = (32, 64, 128)
 
-# Same tolerance as op_tests/test_flydsl_conv_implicit.py. The reference is bf16
-# rather than fp32 on purpose: the tuner needs to catch a config that computes
-# the wrong thing, not to measure bf16 rounding, and a matching rounding regime
-# keeps err_ratio at ~0 for every correct candidate.
+# Same tolerance and reference as op_tests/test_flydsl_conv_implicit.py and the
+# GEMM tuners: computed in fp32 (bias included) and rounded to bf16 once, the
+# way the kernel accumulates and stores.
 RTOL = ATOL = 2e-2
 
 # The layout both sides of every timed call use; see the module docstring.
@@ -190,15 +189,19 @@ def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk, block_rows=1):
 
 
 def conv3d_ref(x, weight, bias, params):
-    """``F.conv3d`` on an NDHWC ``x``, returned NDHWC and contiguous.
+    """fp32 ``F.conv3d`` on an NDHWC ``x``, returned NDHWC, contiguous, in x's dtype.
 
     Contiguous and in the candidate's own shape: mp_tuner reshapes a result
     whose shape differs from the reference by a flat view, which would compare
     an NDHWC output against NCDHW memory without failing.
     """
-    ref_bias = bias.to(x.dtype) if bias is not None else None
-    y = F.conv3d(x.permute(0, 4, 1, 2, 3).contiguous(), weight, bias=ref_bias, **params)
-    return y.permute(0, 2, 3, 4, 1).contiguous()
+    y = F.conv3d(
+        x.permute(0, 4, 1, 2, 3).float(),
+        weight.float(),
+        bias=bias.float() if bias is not None else None,
+        **params,
+    )
+    return y.permute(0, 2, 3, 4, 1).to(x.dtype).contiguous()
 
 
 def strict_compare(ref, res, msg="", printLog=False):
@@ -392,7 +395,7 @@ class Conv3dTuner(TunerCommon):
     # Tuning
     # -------------------------------------------------------------------
 
-    def _shape_tasks(self, keys, max_configs):
+    def _shape_tasks(self, keys, max_configs, run_kwargs=None):
         from aiter.ops.flydsl.conv_kernels import _borrow_tuned_tile, _resolve_splitk
 
         kv = dict(zip(self.keys, keys))
@@ -540,7 +543,7 @@ class Conv3dTuner(TunerCommon):
                     gen_args,
                     fn,
                     (fn_keys, params, tile, wgm, sk, block_rows),
-                    {},
+                    dict(run_kwargs or {}),
                     conv3d_ref,
                     (["x", "weight", "bias"], params),
                     {},
@@ -555,11 +558,12 @@ class Conv3dTuner(TunerCommon):
         return tasks
 
     def tune(self, untunedf, tunedf, args):
+        run_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
         tasks = []
         in_datas = []
         for _, row in untunedf.iterrows():
             keys = tuple(row[k] for k in self.keys)
-            shape_tasks = self._shape_tasks(keys, args.max_configs)
+            shape_tasks = self._shape_tasks(keys, args.max_configs, run_kwargs)
             if not shape_tasks:
                 logger.warning(f"no legal candidate for {keys}")
                 continue
@@ -592,15 +596,16 @@ class Conv3dTuner(TunerCommon):
     def calculate(self, results, bpes=(2, 2, 2)):
         """TFLOPS from implicit GEMM dims; bandwidth from tensor bytes (im2col reuse).
 
-        Both are derived from an end-to-end time. NDHWC in and out leaves no
-        layout transpose in it, but the entry point still runs two steps outside
-        the kernel: the weight repack, which run_perftest redoes on every timed
-        call because it rotates as many weight copies as it runs iterations --
-        about 5.5us at the median on gfx950, and up to ~40% of us on the smallest
-        rows -- and, where C/groups is not a multiple of LDG_VEC, a channel pad
-        that copies the whole input on every call -- the C=3 input conv of both
-        VAEs. Neither depends on the tile, so the ranking holds, but both
-        figures are a floor on the kernel's own rather than close to it.
+        On gfx1250 the timed call gets prepared operands, so ``us`` is the
+        kernel alone. On gfx950 it is an end-to-end time: NDHWC in and out
+        leaves no layout transpose in it, but the entry point still runs two
+        steps outside the kernel: the weight repack, which run_perftest redoes
+        on every timed call because it rotates as many weight copies as it runs
+        iterations -- about 5.5us at the median, and up to ~40% of us on the
+        smallest rows -- and, where C/groups is not a multiple of LDG_VEC, a
+        channel pad that copies the whole input on every call -- the C=3 input
+        conv of both VAEs. Neither depends on the tile, so the ranking holds,
+        but there both figures are a floor on the kernel's own.
         """
         info, time, _err = results
         if time == self.INVALID_TIME or time in (0, self.INF_TIME):
@@ -764,6 +769,9 @@ class Conv3dTuner(TunerCommon):
             has_bias = _parse_tuned_bool(kv["bias"])
             params = _row_params(kv)
             shape = f"{n}x{c}x{d}x{h}x{w}->{k} {kt}x{kh}x{kw}"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
             try:
                 data = generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias)
                 # Best of a few, not a single reading: the gate's threshold is
@@ -778,25 +786,30 @@ class Conv3dTuner(TunerCommon):
                         bias=data["bias"],
                         input_layout=LAYOUT,
                         output_layout=LAYOUT,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
                         **params,
                     )
                     if us_i < us:
                         out, us = out_i, us_i
                 ref = conv3d_ref(data["x"], data["weight"], data["bias"], params)
-                ok = torch.allclose(out, ref, rtol=RTOL, atol=ATOL)
-                # e2e only: run_perftest includes the weight repack and, where
-                # C/groups is not a multiple of LDG_VEC, the channel pad.
+                # strict_compare, as in tuning: any element outside RTOL/ATOL
+                # reads as 1.0, over every limit the base class can return.
+                err_ratio = strict_compare(ref, out, msg=f"run_config {shape} ")
+                # e2e: run_perftest includes the host-side pads and the weight
+                # pack, which the gfx1250 tuned us leaves out.
+                status = (
+                    "ok"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
+                )
                 results.append(
-                    {
-                        "shape": shape,
-                        "e2e_us": round(us, 4),
-                        "status": "ok" if ok else "mismatch",
-                    }
+                    {"shape": shape, "e2e_us": round(us, 4), "status": status}
                 )
             except Exception as exc:  # noqa: BLE001
-                results.append(
-                    {"shape": shape, "e2e_us": -1, "status": f"error: {exc}"}
-                )
+                results.append({"shape": shape, "e2e_us": -1, "status": f"error:{exc}"})
+            finally:
+                torch.cuda.empty_cache()
         return results
 
 
