@@ -17,10 +17,7 @@ import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.moe.q256_schedule import q256_make_job_map
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from op_tests.triton_tests.moe.test_q256_schedule import (
-    make_inputs,
-    reference_job_map,
-)
+from op_tests.triton_tests.utils.q256_schedule import make_inputs, reference_job_map
 
 
 @benchmark()
