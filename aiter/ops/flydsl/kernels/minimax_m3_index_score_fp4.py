@@ -110,9 +110,12 @@ GROUP = 32  # elements one e8m0 scale covers
 assert KSTEPS * LANE_K == GROUP
 DATA_UNITS = DATA_BYTES // 16  # 16 B accesses per token row
 
-# K tiles kept in flight per wave. The fp8 scorer uses 3 at 2 KiB a tile; a tile
-# here is half the bytes, so it is a knob rather than a constant.
-TILE_DEPTH = 3
+# K tiles kept in flight per wave, at most TOK_TILES (8). The fp8 scorer uses 3
+# at 2 KiB a tile; a tile here is half the bytes, so it needs more of them to
+# keep the same bytes in flight. Swept 2/3/4/6/8 on S4H1, S4H4 CP4 and S8H4:
+# 6 is 15-35% faster than 3 where batch*context is small (the launch is latency
+# bound there) and within 2% of the best from 3 to 8 once it is not.
+TILE_DEPTH = 6
 # Cache policy of the K data stream (0 cached, 2 nt): every 128 B line is read
 # once, by one instruction, so there is no reuse for the L1 to keep.
 K_CACHE = 2
@@ -126,8 +129,7 @@ def _cache_policy(geom) -> int:
 
 def kernel_name(S: int, H: int, geom) -> str:
     name = f"m3_index_score_S{S}_H{H}_fp4_L{geom['pages_per_wave']}"
-    if TILE_DEPTH != 3:
-        name += f"_d{TILE_DEPTH}"
+    name += f"_d{TILE_DEPTH}"
     if geom["waves_per_tok"] > 1:
         name += f"_tw{geom['waves_per_tok']}"
     if _cache_policy(geom) != 2:
