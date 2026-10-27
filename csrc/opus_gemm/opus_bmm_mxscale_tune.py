@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """MXFP8 BMM tuning through the shared GEMM tuner framework.
 
-The CSV key is (gfx, b, m, n, k, w_scale_block); existing scale rows are
+The CSV key is (gfx, cu_num, b, m, n, k, w_scale_block); existing scale rows are
 preserved. Shape-only inputs may specify --w_scale_block 32x32,128x128. Tuning uses
 BF16 output, token-major contiguous activations/scales, and the per-kid
 weight layout. All operands are passed to mp_tuner for buffer rotation.
@@ -23,6 +23,7 @@ import pandas as pd
 import torch
 
 from aiter import dtypes, logger
+from aiter.ops.opus._arch import _device_arch_and_cu
 from aiter.ops.opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
@@ -42,32 +43,22 @@ for _p in (_HERE, _OPTESTS):
 # table here does not pull in the build.
 from opus_gemm_common import (
     _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF,
-    BMM_MXSCALE_KID_OFFSET,
     MX32_KID_STRIDE,
     _opus_sf_shuf_sub,
-    a8w8_mxscale_bmm_kernel_lists,
-    bmm_mxscale_global_kid,
+    get_registry,
+    parse_integer,
 )
 
 # The quantisation block is a property of the kid, not of the shape: a 32-block
 # kid needs 32-block scales and its tuned row is meaningless for a 128 one. So
 # it is read off the instance here rather than taken from the module constant.
-_KID_INSTANCE = {
-    kid: inst
-    for family in a8w8_mxscale_bmm_kernel_lists
-    for kid, inst in family.items()
-}
-# Resolve both local IDs and global codegen IDs when deriving scale groups.
-for _k, _v in list(_KID_INSTANCE.items()):
-    _loc = _k - BMM_MXSCALE_KID_OFFSET
-    if _loc >= 0 and _loc not in _KID_INSTANCE:
-        _KID_INSTANCE[_loc] = _v
+_tune_gfx, _tune_cu = _device_arch_and_cu(torch.cuda.current_device())
+_CODEGEN_BMM = get_registry("a8w8_mxscale_bmm", _tune_gfx, _tune_cu)
+_KID_INSTANCE = _CODEGEN_BMM
 
 
 def _kid_groups(kid):
-    # _TUNE_POLICY is keyed on global ids, so take the id as given and only fall
-    # back to globalising a local one.
-    inst = _KID_INSTANCE.get(kid) or _KID_INSTANCE[bmm_mxscale_global_kid(kid)]
+    inst = _KID_INSTANCE[kid]
     return inst.GROUP_N, inst.GROUP_K
 
 
@@ -86,23 +77,6 @@ from test_opus_a8w8_bmm import (
     run_torch,
 )
 
-# kid -> OpusGemmInstance. Kids are disjoint across the BMM families today;
-# assert so a future collision (which the codegen dedups by launcher name
-# downstream) is caught here instead of silently tuning one of the two.
-_CODEGEN_BMM = {}
-for _fam in a8w8_mxscale_bmm_kernel_lists:
-    for _kid, _inst in _fam.items():
-        assert (
-            _kid not in _CODEGEN_BMM
-        ), f"bmm kid {_kid} collides across codegen families; disambiguate by name"
-        _CODEGEN_BMM[_kid] = _inst
-
-# Accept local IDs while assembling policies; launchers use global IDs.
-for _kid, _inst in list(_CODEGEN_BMM.items()):
-    _local = _kid - BMM_MXSCALE_KID_OFFSET
-    if _local >= 0 and _local not in _CODEGEN_BMM:
-        _CODEGEN_BMM[_local] = _inst
-
 # Split-K factors considered for supported flatmm tiles.
 _SK = [1, 2, 4, 8]
 
@@ -111,142 +85,139 @@ _SK = [1, 2, 4, 8]
 _TUNE_POLICY = {
     # flatmm_splitk family: the M=16/32 last-mile tiles, the mid-M SFA/SFB-preload
     # tiles and the 64x* tiles. All are split-K capable via the fused reduce tail,
-    # except kid646 whose persistent DIRECT_ONLY schedule requires splitK == 1.
-    8032: _SK,
-    8064: _SK,
-    8138: _SK,
-    8139: _SK,
-    8256: _SK,
-    8311: _SK,
-    8312: _SK,
-    8313: _SK,
-    8314: _SK,
-    8316: _SK,
-    8317: _SK,
-    8318: _SK,
-    8319: _SK,
-    8320: _SK,
-    8321: _SK,
-    8322: _SK,
-    8323: _SK,
-    8324: _SK,
-    8326: _SK,
-    8327: _SK,
-    8640: _SK,
-    8642: _SK,
-    8646: [1],
-    8650: _SK,
-    8653: _SK,
+    # except kid142 whose persistent DIRECT_ONLY schedule requires splitK == 1.
+    1: _SK,
+    2: _SK,
+    9: _SK,
+    10: _SK,
+    62: _SK,
+    63: _SK,
+    64: _SK,
+    65: _SK,
+    66: _SK,
+    67: _SK,
+    68: _SK,
+    69: _SK,
+    70: _SK,
+    71: _SK,
+    72: _SK,
+    73: _SK,
+    74: _SK,
+    75: _SK,
+    77: _SK,
+    78: _SK,
+    140: _SK,
+    141: _SK,
+    142: [1],
+    143: _SK,
+    144: _SK,
     # fused single-tile launcher.
-    8100: [1],
-    # pipeline family; kid158 preloads both the per-token SFA and the block SFB
+    3: [1],
+    # pipeline family; kid16 preloads both the per-token SFA and the block SFB
     # panel into LDS.
-    8149: [1],
-    8150: [1],
-    8158: [1],
-    149: [1],
-    150: [1],
-    158: [1],
-    # kid158's scale preload at the two half tiles. Narrow-N wo_a (n1024) gives
+    14: [1],
+    15: [1],
+    16: [1],
+    # kid16's scale preload at the two half tiles. Narrow-N wo_a (n1024) gives
     # the 256x256 tile only 4 N-tiles, so mid-M shapes leave half the CUs idle;
-    # these fill them from the M side (159) and the N side (164). kid164 also
+    # these fill them from the M side (159) and the N side (164). kid22 also
     # covers n128, which the 256-wide tiles reject outright.
-    159: [1],
-    164: [1],
+    17: [1],
+    22: [1],
     # Preshuffled-B compute-wave candidates.
-    168: [1],
-    175: [1],
-    194: [1],
+    23: [1],
+    27: [1],
+    30: [1],
     # wave8n4 tiles with banded workgroup mapping.
-    346: [1],
+    82: [1],
     # 128x128 wave8n4 tiles at both K depths.
-    348: [1],
-    349: [1],
-    # wavetm1, the 1x8 / 1x4 grids. kid205 is kid203 plus the banded tile map.
-    202: [1],
-    203: [1],
-    205: [1],
-    # The banded wave8 tiles (kid401/402 = 175/348 + band 4; kid404 = 202 +
+    83: [1],
+    84: [1],
+    # wavetm1, the 1x8 / 1x4 grids. kid34 is kid33 plus the banded tile map.
+    32: [1],
+    33: [1],
+    34: [1],
+    # The banded wave8 tiles (kid90/402 = 175/348 + band 4; kid92 = 202 +
     # band 4); they only win at m512-2048.
-    401: [1],
-    402: [1],
-    404: [1],
-    # kid205's 1x4 grid on the mid-M tiles (see
+    90: [1],
+    91: [1],
+    92: [1],
+    # kid34's 1x4 grid on the mid-M tiles (see
     # _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_TILES).
-    405: [1],
-    406: [1],
-    407: [1],
-    408: [1],
-    409: [1],
-    410: [1],
-    411: [1],
+    93: [1],
+    94: [1],
+    95: [1],
+    96: [1],
+    97: [1],
+    98: [1],
+    99: [1],
     # All-compute 2x2 wave grids with A and B staged through LDS.
     # ID421 is not registered.
-    420: [1],
-    422: [1],
-    423: [1],
-    424: [1],
-    425: [1],
-    426: [1],
-    427: [1],
+    100: [1],
+    101: [1],
+    102: [1],
+    103: [1],
+    104: [1],
+    105: [1],
+    106: [1],
     # bdirect, B straight to registers with no LDS hop: the 16x32 and 64x32
     # last-mile tiles, and the 128x128 tile that owns the mid band.
-    171: [1],
-    172: [1],
-    173: [1],
-    179: [1],
-    184: [1],
+    24: [1],
+    25: [1],
+    26: [1],
+    28: [1],
+    29: [1],
     # Plain-scale panel variants paired with the shuffled-scale bdirect tiles.
     # The wider 64x128x256 variant is excluded because of register pressure.
-    336: [1],
-    338: [1],
-    342: [1],
+    79: [1],
+    80: [1],
+    81: [1],
     # bdirect_tilen variants remain registered outside the default policy.
-    196: [1],
+    31: [1],
     # monolithic mouter / wave pipelines.
-    8131: [1],
-    8132: [1],
-    8134: [1],
-    8142: [1],
-    8144: [1],
-    8148: [1],
-    8160: [1],
-    8161: [1],
+    5: [1],
+    6: [1],
+    7: [1],
+    11: [1],
+    12: [1],
+    13: [1],
+    18: [1],
+    19: [1],
     # minterleave only exists in split-K form.
-    8162: [1],
-    8163: [1],
+    20: [1],
+    21: [1],
     # 128x128x128 flatmm tiles use splitK=1 in the default policy.
-    8128: [1],
-    8137: [1],
-    8325: [1],
+    4: [1],
+    8: [1],
+    76: [1],
     # Single-wave decode kernels load operands directly into registers.
     # The default policy considers splitK=1 and splitK=4.
-    8440: [1, 4],
-    8441: [1, 4],
-    8442: [1, 4],
-    8443: [1, 4],
-    8444: [1, 4],
-    8445: [1, 4],
-    8446: [1, 4],
-    8447: [1, 4],
+    107: [1, 4],
+    108: [1, 4],
+    109: [1, 4],
+    110: [1, 4],
+    111: [1, 4],
+    112: [1, 4],
+    113: [1, 4],
+    114: [1, 4],
     # B_N=16 decode variants with additional split-K choices.
-    8448: [1, 2, 4],
-    8449: [1, 2, 4],
+    115: [1, 2, 4],
+    116: [1, 2, 4],
 }
 
 # Derive preshuffled-B/LDS counterparts from the plain flatmm policy.
 # Normalize IDs before membership checks and preserve each tile's split factors.
 _TUNE_POLICY.update(
     {
-        bmm_mxscale_global_kid(twin): [1]
+        twin: [1]
         for plain, twin in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF.items()
-        if bmm_mxscale_global_kid(plain) in _TUNE_POLICY
+        if plain in _TUNE_POLICY
     }
 )
 # Small-M plain-scale panels use COM_REP_M=1 so the source layout
 # matches the LDS panel without M packing.
-_TUNE_POLICY[398] = [1]
-_TUNE_POLICY[399] = [1]
+_TUNE_POLICY[88] = [1]
+_TUNE_POLICY[89] = [1]
 
 # The default policy consumes ordinary scales. M-packed and shuffled-scale
 # kernels require a matching scale producer and are handled by separate pools.
@@ -308,28 +279,17 @@ _TUNE_POLICY.update(
 )
 
 
-# Normalize every policy ID to the global codegen namespace.
-def _globalise_policy(policy):
-    return {
-        (bmm_mxscale_global_kid(k) if k < BMM_MXSCALE_KID_OFFSET else k): v
-        for k, v in policy.items()
-    }
-
-
 # All registered compact schedules enter both policy and exhaustive sweeps.
 _TUNE_POLICY.update(
     {
         kid: [1]
         for kid, inst in _CODEGEN_BMM.items()
-        if kid >= BMM_MXSCALE_KID_OFFSET
-        and inst.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact"
+        if inst.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact"
     }
 )
-_TUNE_POLICY = _globalise_policy(_TUNE_POLICY)
 _TUNE_POLICY.update(
     {kid: [1, 2, 4, 8] for kid in _CODEGEN_BMM if _kid_block(kid) == "1x32"}
 )
-_SHUF_POLICY = _globalise_policy(_SHUF_POLICY)
 _CANDIDATE_KIDS = tuple(_TUNE_POLICY) + tuple(_SHUF_POLICY)
 assert len(set(_CANDIDATE_KIDS)) == len(_CANDIDATE_KIDS), (
     "a kid is in both _TUNE_POLICY and _SHUF_POLICY; it would be benched twice "
@@ -393,7 +353,7 @@ SHUF_SUB = _opus_sf_shuf_sub()
 # --- host-side scale producers for the relaid-scale kids (disabled) ---------
 # These build the two layouts the shuffle_scale / mpacked-SFA kids read. They
 # are parked here rather than live because no such kid is currently built:
-# opus_gemm_common.BMM_BUILD_RELAID_SCALE_KIDS is False, so _globalize_bmm_kids
+# opus_gemm_common.BMM_BUILD_RELAID_SCALE_KIDS is False, so _bmm_kernel_table
 # drops all of them and _SHUF_POLICY above comes out empty. Keeping them as
 # code would mean shipping an untested, unlinted path with no caller.
 #
@@ -490,7 +450,7 @@ def _shuf_sub(inst):
     B_K clause is {1,2,4} rather than "any even" only because op_sel is two bits
     -- the index algebra itself generalises -- so the tight direction is here.
 
-    kid388/389/390 (bdirect_tilen, B_M=64 at T_M=1) are the one geometry this
+    kid85/389/390 (bdirect_tilen, B_M=64 at T_M=1) are the one geometry this
     admits that no *shuffled* kid exercises: A_SLOTS=2 on the flatmm pipeline.
     They are plain-scale, so returning a sub for them is correct -- that is what
     the subok pool is -- but a shuffled tilen kid would need the traits geometry
@@ -718,8 +678,7 @@ def _bmm_ref_passthrough(ref):
 # Tuner
 # ---------------------------------------------------------------------------
 BMM_BENCH_KEYS = (0, 1, 2, 3, 4, 5, 7)
-BMM_DATA_KIDS = {128: 8179, 32: 9179}
-BMM_BLOCK_DATA_KIDS = {"128x128": 8179, "32x32": 9179, "1x32": 9704}
+BMM_BLOCK_DATA_KIDS = {"128x128": 28, "32x32": 1028, "1x32": 235}
 
 
 def make_bmm_tuning_task(
@@ -757,7 +716,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
     }
 
-    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k", "w_scale_block"]
+    KEYS: ClassVar[list[str]] = ["gfx", "cu_num", "b", "m", "n", "k", "w_scale_block"]
     RESULTS: ClassVar[list[str]] = [
         "libtype",
         "kernelId",
@@ -782,7 +741,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         )
         # sort N before M like the GEMM tuners (cosmetic ordering of the CSV),
         # then w_scale_block, so a shape's 32x32 and 128x128 rows land together.
-        self.sort_keys = ["gfx", "b", "n", "m", "k", "w_scale_block"]
+        self.sort_keys = ["gfx", "cu_num", "b", "n", "m", "k", "w_scale_block"]
 
     # --- schema helpers -----------------------------------------------------
     def getKernelName(self, kernelId):
@@ -953,6 +912,8 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             df[name] = values.astype("int64")
         if "gfx" not in df:
             df["gfx"] = self.get_gfx()
+        if "cu_num" not in df:
+            df["cu_num"] = self.get_cu_num()
         if "w_scale_block" not in df:
             df = pd.concat(
                 [
@@ -1025,7 +986,10 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         if not self._bpreshuffle and self.untunedf["w_scale_block"].eq("1x32").any():
             raise ValueError("1x32 tuning requires --bpreshuffle")
         self.untunedf = (
-            self.untunedf[self.untunedf["gfx"] == gfx][self.keys]
+            self.untunedf[
+                (self.untunedf["gfx"] == gfx)
+                & (self.untunedf["cu_num"] == self.get_cu_num())
+            ][self.keys]
             .drop_duplicates()
             .reset_index(drop=True)
         )
@@ -1075,11 +1039,17 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             raise ValueError(
                 "The OPUS tuner requires libtype=opus; use the joint preshuffle tuner for FlyDSL"
             )
-        kid = int(row["kernelId"])
-        if kid not in _CODEGEN_BMM:
-            kid = bmm_mxscale_global_kid(kid)
-        if kid not in _CODEGEN_BMM:
-            raise ValueError(f"Unregistered MXFP8 BMM kid {row['kernelId']}")
+        gfx = str(row["gfx"]).lower().split(":", 1)[0]
+        cu_num = int(row["cu_num"])
+        if (gfx, cu_num) != (self.get_gfx(), self.get_cu_num()):
+            raise ValueError("saved kernel namespace does not match tuning device")
+        kid = parse_integer(row["kernelId"], name="saved kernel id")
+        instance = _CODEGEN_BMM.get(kid)
+        name = str(row.get("kernelName", ""))
+        if instance is None or (
+            name not in ("", "nan", "None") and name != instance.name
+        ):
+            raise ValueError(f"Saved symbol does not match kid {kid}")
         b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
         split = int(row["splitK"])
         if split not in _applicable(kid, b, m, n, k, split_ks=[split]):

@@ -4654,7 +4654,7 @@ def attention_backward_triton_impl(
     IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
         arch = get_arch()
-        if not arch.supports_fp8:
+        if not arch.supports_any_fp8:
             raise RuntimeError(f"{arch.name} does not support FP8")
         FP8_MAX = torch.finfo(q.dtype).max
 
