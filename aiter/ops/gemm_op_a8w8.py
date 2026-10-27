@@ -900,23 +900,50 @@ def _load_mxscale_bpreshuffle_tuned() -> dict:
     return df.set_index(_MXSCALE_BPRESHUFFLE_KEYS).to_dict("index")
 
 
+@functools.cache
+def _mxscale_bpreshuffle_tuned_nk() -> frozenset:
+    """(gfx, cu_num, N, K, w_scale_block) of every row of the table above. A
+    shape outside this set has no row at any M (padded or not), so its lookup
+    can answer None without walking the padded-M levels."""
+    return frozenset(
+        (key[0], key[1], key[3], key[4], key[5])
+        for key in _load_mxscale_bpreshuffle_tuned()
+    )
+
+
+# (gfx, N, K, w_scale_block) already reported as untuned. Prefill sees a new M
+# almost every step, and the per-M cache below cannot absorb that, so the miss
+# is logged once per weight shape instead of once per M (the kernel the
+# heuristic picks is unaffected).
+_MXSCALE_UNTUNED_REPORTED: set = set()
+
+
 @functools.lru_cache(maxsize=1024)
 def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
     """Tuned row of an e8m0 block-scale GEMM on preshuffled weights, at M or a
-    padded M; None when untuned. Cached per shape, so a miss is reported once."""
+    padded M; None when untuned. Cached per shape; a miss is reported once per
+    (N, K, w_scale_block)."""
     gfx, cu_num = get_gfx(), get_cu_num()
-    row, padded_m = find_padded_m_row(
-        _load_mxscale_bpreshuffle_tuned(),
-        lambda pm: (gfx, cu_num, pm, n, k, w_scale_block),
-        m,
-        n,
-        k,
-    )
-    if row is None:
-        logger.warning(
-            f"mxscale bpreshuffle M:{m}, N:{n}, K:{k}, w_scale {w_scale_block} is "
-            f"untuned on {gfx}; the flydsl batched GEMM heuristic picks its kernel."
+    if (gfx, cu_num, n, k, w_scale_block) not in _mxscale_bpreshuffle_tuned_nk():
+        # No row for this N/K at any M: same answer as the walk below.
+        row, padded_m = None, m
+    else:
+        row, padded_m = find_padded_m_row(
+            _load_mxscale_bpreshuffle_tuned(),
+            lambda pm: (gfx, cu_num, pm, n, k, w_scale_block),
+            m,
+            n,
+            k,
         )
+    if row is None:
+        report_key = (gfx, n, k, w_scale_block)
+        if report_key not in _MXSCALE_UNTUNED_REPORTED:
+            _MXSCALE_UNTUNED_REPORTED.add(report_key)
+            logger.warning(
+                f"mxscale bpreshuffle M:{m}, N:{n}, K:{k}, w_scale {w_scale_block} is "
+                f"untuned on {gfx}; the flydsl batched GEMM heuristic picks its kernel. "
+                f"(Reported once per N/K/w_scale; other untuned M are not logged.)"
+            )
     elif AITER_LOG_TUNED_CONFIG:
         logger.info(
             f"mxscale bpreshuffle M:{m}, N:{n}, K:{k}, w_scale {w_scale_block} is "
@@ -1019,9 +1046,14 @@ def gemm_a8w8_blockscale(
                 split_k is None
             ), "preshuffled group32 GEMM takes its split from the tuned table"
             e8m0 = dtypes.fp8_e8m0
-            return gemm_a8w8_blockscale_bpreshuffle(
-                XQ, WQ, x_scale.view(e8m0), w_scale.view(e8m0), dtype
-            )
+            # Already inside this op's custom-op body (always real, eager
+            # tensors: tracing uses gemm_a8w8_blockscale_fake), so the nested
+            # op's body is called directly instead of dispatching
+            # torch.ops.aiter.gemm_a8w8_blockscale_bpreshuffle a second time.
+            # A rebound module attribute (e.g. monkeypatched) is still called.
+            bpreshuffle = gemm_a8w8_blockscale_bpreshuffle
+            bpreshuffle = getattr(bpreshuffle, "_eager_body", bpreshuffle)
+            return bpreshuffle(XQ, WQ, x_scale.view(e8m0), w_scale.view(e8m0), dtype)
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
