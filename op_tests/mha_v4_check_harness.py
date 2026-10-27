@@ -10,6 +10,7 @@ collects every test_* in the module and runs it.
 import contextlib
 import itertools
 import re
+import traceback
 
 from aiter import logger
 
@@ -126,9 +127,10 @@ class CheckRegistry:
                     fn(**case)
                     ran += 1
                 # One bad check must not hide the rest; they are re-raised in aggregate.
-                except Exception as exc:  # noqa: BLE001
+                # The traceback is the whole report: a bare assert carries no message.
+                except Exception:  # noqa: BLE001
                     failures.append(label)
-                    logger.error("check %s failed: %s", label, exc)
+                    logger.error("check %s failed:\n%s", label, traceback.format_exc())
                 finally:
                     if self._teardown is not None:
                         self._teardown()

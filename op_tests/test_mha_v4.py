@@ -508,8 +508,8 @@ def test_mha_v4_rotation_matches_an_explicit_hadamard_matrix(dtype, sequence, he
     against another kernel would only pin the two against each other -- and the recipe test below
     cannot help, because it evaluates the same rotation on both sides.
 
-    The comparison is exact rather than toleranced: 128 values of one 16-bit dtype summed in fp32
-    lose nothing, so the only rounding is the final cast back to that dtype.
+    The comparison allows one output ULP: the matmul reduces in a different order than the
+    kernel's butterfly, and that only cancels when the 128 inputs share an exponent range.
     """
     torch.manual_seed(31)
     value = torch.randn((1, sequence, heads, 128), device="cuda", dtype=dtype)
@@ -527,7 +527,15 @@ def test_mha_v4_rotation_matches_an_explicit_hadamard_matrix(dtype, sequence, he
     ), "the reference matrix is not an orthonormal Hadamard matrix"
 
     expected = (value.float().reshape(-1, 128) @ hadamard) / math.sqrt(128)
-    assert torch.equal(rotated, expected.to(dtype).reshape(value.shape))
+    # One output ULP, not bitwise: an fp32 sum of 128 mixed-exponent 16-bit values is only exact
+    # when they share an exponent range, so the matmul's order and the butterfly's can land a bit
+    # apart. Demanding equality just pins the kernel to whatever order the installed torch picks.
+    torch.testing.assert_close(
+        rotated.float(),
+        expected.to(dtype).reshape(value.shape).float(),
+        rtol=torch.finfo(dtype).eps,
+        atol=torch.finfo(dtype).tiny,
+    )
 
 
 @skipif(
@@ -845,9 +853,12 @@ def test_mha_v4_mxfp8_q_matches_unfused_pipeline(case):
         value = powers.repeat((128 + powers.numel() - 1) // powers.numel())[:128]
         value = value.reshape(1, 1, 1, 128)
     else:
+        # The butterfly grows intermediates 128x before its final divide, and bf16 shares f32's
+        # exponent range, so bf16.max here rotates to inf/NaN and the two paths then only agree
+        # on an encoding neither of them promises. This is the largest input that stays finite.
         value = torch.full(
             (1, 1, 1, 128),
-            torch.finfo(torch.bfloat16).max,
+            torch.finfo(torch.bfloat16).max / 128,
             device="cuda",
             dtype=torch.bfloat16,
         )
@@ -876,9 +887,10 @@ def test_mha_v4_mxfp8_k_matches_unfused_pipeline(case):
     elif case == "zero":
         value = torch.zeros((1, 7, 5, 128), device="cuda", dtype=torch.bfloat16)
     else:
+        # Largest input the butterfly keeps finite; see the Q case above.
         value = torch.full(
             (1, 1, 1, 128),
-            torch.finfo(torch.bfloat16).max,
+            torch.finfo(torch.bfloat16).max / 128,
             device="cuda",
             dtype=torch.bfloat16,
         )
@@ -1131,6 +1143,8 @@ def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
     )
 
 
+# _check_lse_capable rejects every non-gfx950 arch before the recipe is looked at.
+@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
     # LSE ships for every measured format row, dense and sorted-sparse alike; a row outside that
@@ -1282,6 +1296,7 @@ def test_mha_v4_dense_lse_under_gqa(q_format, v_format, gqa_ratio):
     assert error < 0.25, error
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
 @parametrize(
     ("q_format", "v_format", "max_spread"),
     [
@@ -2114,6 +2129,7 @@ def _dense_reference(q, k, v, valid):
     ).permute(0, 2, 1, 3)
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
 @parametrize("lengths", [(300, 137), (512, 64), (1, 511), (65, 65)])
 def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
     torch.manual_seed(41)
@@ -2142,6 +2158,7 @@ def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
         assert cosine > 0.99, f"batch {b} of {lengths}"
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
 def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
     """A null slot and a slot naming the whole key length must run the same code path."""
     torch.manual_seed(41)
