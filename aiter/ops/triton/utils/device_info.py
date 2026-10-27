@@ -1,7 +1,5 @@
 import functools
 
-import torch
-
 
 @functools.lru_cache(maxsize=1)
 def get_num_sms():
@@ -24,45 +22,21 @@ def get_num_sms():
         return current_device.multi_processor_count
 
 
-def get_num_xcds(device_index: int | None = None) -> int:
-    """Return the XCC count for a HIP device, defaulting to the current device."""
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    return _get_num_xcds(device_index)
+# XCD count is not queryable in ROCm, but runtime architecture and CU count
+# identify supported parts. Kernels use it to keep workgroups sharing data on one L2.
+_XCDS_BY_GFX_AND_CU_NUM = {
+    ("gfx942", 304): 8,
+    ("gfx942", 228): 6,
+    ("gfx942", 80): 4,
+    ("gfx950", 256): 8,
+}
 
 
-@functools.cache
-@torch.compiler.assume_constant_result
-def _get_num_xcds(device_index: int) -> int:
-    import ctypes
-
+def get_num_xcds() -> int:
     try:
-        libhip = ctypes.CDLL("libamdhip64.so")
-    except OSError:
-        # Python ROCm SDK packages expose the versioned HIP 7 library.
-        libhip = ctypes.CDLL("libamdhip64.so.7")
-    get_attribute = libhip.hipDeviceGetAttribute
-    get_attribute.argtypes = [
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.c_int,
-        ctypes.c_int,
-    ]
-    get_attribute.restype = ctypes.c_int
-    # hipDeviceAttributeNumberOfXccs, available since ROCm 7.0.
-    num_xccs_attribute = 10018
-    num_xccs = ctypes.c_int()
-    error = get_attribute(ctypes.byref(num_xccs), num_xccs_attribute, device_index)
-    if error != 0:
-        # Clear HIP's last error so PyTorch does not report it on a later call.
-        libhip.hipGetLastError()
-        libhip.hipGetErrorString.restype = ctypes.c_char_p
-        raise RuntimeError(
-            "hipDeviceGetAttribute(NumberOfXccs) failed for device "
-            f"{device_index}: {libhip.hipGetErrorString(error).decode()} ({error})"
-        )
-    if num_xccs.value < 1:
-        raise RuntimeError(
-            "hipDeviceGetAttribute(NumberOfXccs) returned an invalid count "
-            f"{num_xccs.value} for device {device_index}"
-        )
-    return num_xccs.value
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+        part = (get_gfx_runtime(), get_cu_num())
+    except Exception:  # noqa: BLE001
+        return 8
+    return _XCDS_BY_GFX_AND_CU_NUM.get(part, 8)

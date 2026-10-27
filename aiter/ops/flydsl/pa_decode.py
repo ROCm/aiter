@@ -13,8 +13,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_num_xcds
 
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
