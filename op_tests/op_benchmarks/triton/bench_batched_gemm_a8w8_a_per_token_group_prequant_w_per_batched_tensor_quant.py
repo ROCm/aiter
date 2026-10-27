@@ -258,11 +258,11 @@ def main(args: list[str] | None = None) -> None:
         )
         return
     if parsed_args.y_per_token_quant and parsed_args.backend == "gluon":
-         print(
-             "--y-per-token-quant is not supported with --backend gluon; "
-             "nothing to benchmark."
-         )
-         return
+        print(
+            "--y-per-token-quant is not supported with --backend gluon; "
+            "nothing to benchmark."
+        )
+        return
     if parsed_args.y_per_token_quant and not parsed_args.no_bias:
         print("--y-per-token-quant needs --no-bias; nothing to benchmark.")
         return
