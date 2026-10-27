@@ -24,17 +24,16 @@ from aiter.ops.opus import (
 from aiter.ops.opus._arch import GFX1250, SUPPORTED_OPUS_ARCHES
 from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
 from csrc.opus_gemm.opus_gemm_common import (
-    BIAS_AWARE_KIDS,
     CO_KERNELS_JSON,
-    DEFAULT_COMPILED_KIDS_BY_ARCH,
+    DEFAULT_COMPILED_KIDS_BY_NAMESPACE,
     GFX1250_4WAVE_CO_KIDS,
-    NON_SPLITK_KIDS,
+    GFX1250_SPLITK_FUSE_KIDS,
     OPUS_KERNEL_TAGS_BY_ARCH_FAMILY,
-    SPLITK_KIDS,
     _load_co_kernels,
     co_image_path,
     get_kernel_instance,
     gfx1250_4wave_co_kernels_list,
+    group_kids,
     kernel_needs_external_workspace,
 )
 
@@ -46,7 +45,7 @@ def _co_plan(kid: int, **overrides):
         "N": 128,
         "K": 4096,
         "batch": 1,
-        "cu_num": 80,
+        "cu_num": 256,
         "has_bias": False,
         "input_dtype": torch.bfloat16,
         "output_dtype": torch.bfloat16,
@@ -72,8 +71,8 @@ def _representative_kids(kids) -> tuple[int, ...]:
 
 def _gfx1250_workspace_representatives() -> tuple[int, ...]:
     by_tag = {}
-    for kid in sorted(SPLITK_KIDS):
-        instance = get_kernel_instance(GFX1250, "a16w16", kid)
+    for kid in sorted(group_kids("SPLITK_KIDS", GFX1250, cu_num=256)):
+        instance = get_kernel_instance(GFX1250, "a16w16", kid, cu_num=256)
         if instance is not None:
             by_tag.setdefault(instance.kernel_tag, kid)
     return tuple(by_tag.values())
@@ -113,7 +112,7 @@ def _run_gfx1250_co_case(kid: int, device: torch.device | None = None) -> None:
     B = torch.randn((N, K), device=device, dtype=torch.bfloat16, generator=generator)
     Y = torch.full((M, N), float("nan"), device=device, dtype=torch.bfloat16)
 
-    actual = opus_gemm(A, B, Y, kid=kid, split_k=0)
+    actual = opus_gemm(A, B, Y, family="a16w16", kid=kid, split_k=0)
     torch.cuda.synchronize(device)
     assert actual is Y, context
     assert torch.isfinite(actual).all().item(), context
@@ -153,12 +152,16 @@ def test_co_manifest_uses_supported_architecture_keys():
 def test_gfx1250_co_registry_and_launch_contract():
     assert len(gfx1250_4wave_co_kernels_list) == 221
     assert GFX1250_4WAVE_CO_KIDS == frozenset(gfx1250_4wave_co_kernels_list)
-    assert min(GFX1250_4WAVE_CO_KIDS) == 21016
-    assert max(GFX1250_4WAVE_CO_KIDS) == 21317
-    assert GFX1250_4WAVE_CO_KIDS <= NON_SPLITK_KIDS
-    assert GFX1250_4WAVE_CO_KIDS <= DEFAULT_COMPILED_KIDS_BY_ARCH[GFX1250]
-    assert GFX1250_4WAVE_CO_KIDS.isdisjoint(SPLITK_KIDS)
-    assert GFX1250_4WAVE_CO_KIDS.isdisjoint(BIAS_AWARE_KIDS)
+    assert min(GFX1250_4WAVE_CO_KIDS) == 496
+    assert max(GFX1250_4WAVE_CO_KIDS) == 716
+    assert GFX1250_4WAVE_CO_KIDS <= group_kids("NON_SPLITK_KIDS", GFX1250, cu_num=256)
+    assert GFX1250_4WAVE_CO_KIDS <= DEFAULT_COMPILED_KIDS_BY_NAMESPACE[(GFX1250, 256)]
+    assert GFX1250_4WAVE_CO_KIDS.isdisjoint(
+        group_kids("SPLITK_KIDS", GFX1250, cu_num=256)
+    )
+    assert GFX1250_4WAVE_CO_KIDS.isdisjoint(
+        group_kids("BIAS_AWARE_KIDS", GFX1250, cu_num=256)
+    )
     assert {
         "a16w16_4wave_co",
         "a16w16_4wave_wl_co",
@@ -167,11 +170,13 @@ def test_gfx1250_co_registry_and_launch_contract():
 
     kid = min(GFX1250_4WAVE_CO_KIDS)
     assert (
-        get_kernel_instance(GFX1250, "a16w16", kid, torch.bfloat16)
-        is gfx1250_4wave_co_kernels_list[kid]
+        get_kernel_instance(GFX1250, "a16w16", kid, torch.bfloat16, cu_num=256)
+        == gfx1250_4wave_co_kernels_list[kid]
     )
-    assert get_kernel_instance(GFX1250, "a16w16", kid, torch.float32) is None
-    assert not kernel_needs_external_workspace(GFX1250, "a16w16", kid)
+    assert (
+        get_kernel_instance(GFX1250, "a16w16", kid, torch.float32, cu_num=256) is None
+    )
+    assert not kernel_needs_external_workspace(GFX1250, "a16w16", kid, cu_num=256)
 
     for split_k in (0, 1):
         plan = _co_plan(kid, split_k=split_k)
@@ -199,19 +204,22 @@ def test_gfx1250_co_registry_and_launch_contract():
     ),
 )
 def test_gfx1250_co_bmm_reaches_exact_launch(kid, split_k, entry, monkeypatch):
+    from aiter.ops.opus import dispatch
+
     calls = []
 
     def capture(XQ, WQ, Y, bias, workspace, launched_kid, launch_split_k):
         calls.append((XQ, WQ, Y, bias, workspace, launched_kid, launch_split_k))
 
-    monkeypatch.setattr(gemm_op_a16w16, "_device_arch_and_cu", lambda _: (GFX1250, 80))
+    monkeypatch.setattr(dispatch, "_device_arch_and_cu", lambda _: (GFX1250, 256))
+    monkeypatch.setattr(gemm_op_a16w16, "_device_arch_and_cu", lambda _: (GFX1250, 256))
     monkeypatch.setattr(gemm_op_a16w16, "_opus_gemm_a16w16_launch_raw", capture)
     A = torch.empty((2, 64, 512), device="meta", dtype=torch.bfloat16)
     B = torch.empty((2, 64, 512), device="meta", dtype=torch.bfloat16)
     Y = torch.empty((2, 64, 64), device="meta", dtype=torch.bfloat16)
 
     if entry == "opus_bmm":
-        actual = opus_bmm(A, B, Y, kid=kid, split_k=split_k)
+        actual = opus_bmm(A, B, Y, family="a16w16", kid=kid, split_k=split_k)
     else:
         actual = gemm_a16w16_opus(A, B, kernelId=kid, splitK=split_k, out=Y)
 
@@ -357,6 +365,12 @@ def test_gfx1250_co_loader_rejects_duplicate_identity(tmp_path, duplicate):
 
 
 def test_gfx1250_tuner_selects_co_without_split_k(monkeypatch):
+    from aiter.ops.opus import _arch
+
+    # Candidate selection needs gfx1250's local table, independent of the host.
+    monkeypatch.setattr(_arch, "_device_arch_and_cu", lambda _: (GFX1250, 256))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.syspath_prepend(
         str(Path(__file__).resolve().parents[1] / "csrc" / "opus_gemm")
     )
@@ -368,7 +382,7 @@ def test_gfx1250_tuner_selects_co_without_split_k(monkeypatch):
 
     selected = _gfx1250_select_candidates(64, 128, 4096, 256)
     assert selected & GFX1250_4WAVE_CO_KIDS
-    assert selected.isdisjoint(range(27000, 30000))
+    assert selected.isdisjoint(GFX1250_SPLITK_FUSE_KIDS)
 
     instance = gfx1250_4wave_co_kernels_list[min(GFX1250_4WAVE_CO_KIDS)]
     assert candidate_splitK(64, 128, 4096, 1, 256, instance) == [0]

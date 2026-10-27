@@ -1679,7 +1679,7 @@ class TestOpusRequestedKids(unittest.TestCase):
     def test_real_generator_accepts_valid_requests_and_rejects_filtered_requests(self):
         generator = JIT_CACHE_PATH.parents[3] / "csrc/opus_gemm/gen_instances.py"
         registry = runpy.run_path(str(generator.with_name("opus_gemm_common.py")))
-        bmm_kids = sorted(registry["BMM_MXSCALE_KIDS"])
+        bmm_kids = sorted(registry["get_registry"]("a8w8_mxscale_bmm", "gfx950", 256))
         co_kids = sorted(registry["GFX1250_4WAVE_CO_KIDS"])
         workspace_kid = min(registry["gfx1250_clusterlaunch_kernels_list"])
         runner = (
@@ -1690,20 +1690,42 @@ class TestOpusRequestedKids(unittest.TestCase):
             "cuda=types.SimpleNamespace(is_available=lambda: False)); "
             "runpy.run_path(sys.argv[0], run_name='__main__')"
         )
+        KernelKey = registry["KernelKey"]
+        bmm_keys = [
+            KernelKey("a8w8_mxscale_bmm", "gfx950", 256, kid) for kid in bmm_kids
+        ]
+        valid_key = KernelKey("a16w16", "gfx942", 80, 3)
+        invalid_key = KernelKey("a16w16", "gfx942", 80, 999999)
+        foreign_key = KernelKey("a16w16", "gfx950", 256, 6)
         cases = (
-            ("gfx942", [10006], [], True),
-            ("gfx942", [999999], [], False),
-            ("gfx942", [200], [], False),
-            ("gfx942", [200], ["--kernel_tag", "a16w16"], False),
-            ("gfx942", [10006], ["--kernel_tag", "a8w8"], False),
-            ("gfx950", bmm_kids, [], True),
-            ("gfx950", bmm_kids, ["--kernel_tag", "a8w8"], True),
-            ("gfx942", bmm_kids, [], False),
-            ("gfx1250", [workspace_kid, *co_kids], [], True),
+            ("gfx942/80", [valid_key], [], True),
+            ("gfx942/80", [invalid_key], [], False),
+            ("gfx942/80", [foreign_key], [], False),
+            ("gfx942/80", [foreign_key], ["--kernel_tag", "a16w16"], False),
+            # The default compile floor survives tag filtering. Select a valid
+            # non-default A16W16 kid to exercise request rejection instead.
+            (
+                "gfx950/256",
+                [KernelKey("a16w16", "gfx950", 256, 0)],
+                ["--kernel_tag", "a8w8"],
+                False,
+            ),
+            ("gfx950/256", bmm_keys, [], True),
+            ("gfx950/256", bmm_keys, ["--kernel_tag", "a8w8"], True),
+            ("gfx942/80", bmm_keys, [], False),
+            (
+                "gfx1250/256",
+                [
+                    KernelKey("a16w16", "gfx1250", 256, kid)
+                    for kid in [workspace_kid, *co_kids]
+                ],
+                [],
+                True,
+            ),
         )
-        for arch, kids, extra_args, accepted in cases:
+        for target, keys, extra_args, accepted in cases:
             with (
-                self.subTest(arch=arch, kids=kids, extra_args=extra_args),
+                self.subTest(target=target, keys=keys, extra_args=extra_args),
                 tempfile.TemporaryDirectory() as tmp,
             ):
                 sidecar = os.path.join(tmp, "compiled_kids.json")
@@ -1716,22 +1738,32 @@ class TestOpusRequestedKids(unittest.TestCase):
                         str(generator),
                         "--working_path",
                         tmp,
-                        "--extra_kids",
-                        *map(str, kids),
+                        "--targets",
+                        target,
+                        "--extra_kernel_keys",
+                        *(key.encode() for key in keys),
                         *extra_args,
                     ],
-                    env={**os.environ, "GPU_ARCHS": arch},
+                    env={**os.environ, "GPU_ARCHS": target.split("/")[0]},
                     capture_output=True,
                     text=True,
                     check=False,
                 )
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertTrue(set(kids) <= set(json.loads(_read(sidecar))))
+                    self.assertTrue(
+                        {key.encode() for key in keys}
+                        <= set(json.loads(_read(sidecar)))
+                    )
                     manifest = _read(os.path.join(tmp, "opus_gemm_manifest.h"))
-                    for name in {registry["kernels_list"][kid].name for kid in kids}:
+                    for name in {
+                        registry["get_registry"](key.family, key.gfx, key.cu_num)[
+                            key.kid
+                        ].name
+                        for key in keys
+                    }:
                         self.assertEqual(manifest.count(name + "("), 1, name)
-                    if arch == "gfx950":
+                    if target == "gfx950/256":
                         dispatch = _read(
                             os.path.join(tmp, "opus_bmm_mxscale_kid_dispatch.h")
                         )
@@ -1741,13 +1773,16 @@ class TestOpusRequestedKids(unittest.TestCase):
                         # pattern reads as kids and so reports 1 / 32 / 128 as
                         # spurious extras.
                         emitted = {
-                            int(kid) for kid in re.findall(r"\{\s*(\d+),\s*&", dispatch)
+                            (int(cu), int(kid))
+                            for cu, kid in re.findall(
+                                r"\{\s*\{\s*(\d+),\s*(\d+)\s*\},\s*&", dispatch
+                            )
                         }
-                        self.assertEqual(emitted, set(bmm_kids))
+                        self.assertEqual(emitted, {(256, kid) for kid in bmm_kids})
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(
-                        "cannot compile requested --extra_kids", result.stderr
+                        "requested local kernels are unavailable", result.stderr
                     )
                     self.assertEqual(_read(sidecar), "[]")
 
