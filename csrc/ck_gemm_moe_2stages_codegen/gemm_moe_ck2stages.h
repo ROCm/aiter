@@ -67,6 +67,44 @@ struct dtype_checker
     bool operator()(at::ScalarType t) { return t == getTypeValue<CK_Dtype>(); }
 };
 
+// All ck2stages instances are built with GemmSpecialization::Default, and
+// DeviceMoeGemm::IsSupportedArgument() rejects `N % NPerBlock != 0` /
+// `K % KPerBlock != 0` *outside* of the GemmSpec check, i.e. padding
+// specializations do not relax it. The A16W16 and A8W8 default heuristics
+// must never hand such a problem to CK, otherwise the only feedback is CK's
+// opaque "device_gemm with the specified compilation parameters does not
+// support this GEMM problem".
+//
+// Two dimensions show up:
+//   * stage1 N and stage2 K are inter_dim. A TP shard such as 320 or 448 is
+//     64- but not 128-aligned, so the wider tile is unusable and the
+//     heuristic falls back to N64/K64 (gfx950 fp8 stage2 has no K64 instance
+//     and reports the alignment instead).
+//   * stage2 N is model_dim (w2.size(1)). The same heuristics take an N64
+//     tile when one exists, and otherwise reject model_dim that the only
+//     available N128 tile cannot divide.
+// A4W4, A8W4, and blockscale heuristics are out of scope: they still return a
+// fixed tile and do not consult model_dim.
+static inline bool moe_tile_fits(int dim, int per_block) { return dim % per_block == 0; }
+
+// Same constraint, but for heuristics that have no narrower instance to fall
+// back to. Turns CK's opaque failure into an actionable message.
+static inline void
+moe_check_tile_fits(int dim, int per_block, const char* dim_name, const char* stage)
+{
+    TORCH_CHECK(moe_tile_fits(dim, per_block),
+                "ck2stages moe ",
+                stage,
+                " heuristic dispatch requires ",
+                dim_name,
+                " % ",
+                per_block,
+                " == 0 for this dtype/arch, got ",
+                dim_name,
+                "=",
+                dim);
+}
+
 struct TypeCast
 {
     template <typename E, typename C, typename D0, typename D1, typename D2>
