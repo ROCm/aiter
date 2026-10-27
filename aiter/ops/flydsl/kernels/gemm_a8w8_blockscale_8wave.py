@@ -167,9 +167,9 @@ def compile_gemm_fp8_8wave(
         b_rows_left = N - bid_y * TILE_N
         a_rows = (a_rows_left < TILE_M).select(a_rows_left, TILE_M)
         b_rows = (b_rows_left < TILE_N).select(b_rows_left, TILE_N)
-        A_2d = fx.Tensor(fx.make_view(a_iter, fx.make_layout((TILE_M, K), (K, 1))))
-        B_2d = fx.Tensor(fx.make_view(b_iter, fx.make_layout((TILE_N, K), (K, 1))))
-        C_2d = fx.Tensor(fx.make_view(c_iter, fx.make_layout((TILE_M, TILE_N), (N, 1))))
+        A_2d = fx.make_view(a_iter, fx.make_layout((TILE_M, K), (K, 1)))
+        B_2d = fx.make_view(b_iter, fx.make_layout((TILE_N, K), (K, 1)))
+        C_2d = fx.make_view(c_iter, fx.make_layout((TILE_M, TILE_N), (N, 1)))
 
         A = rocdl.make_buffer_tensor(A_2d, num_records_bytes=a_rows * K)
         B = rocdl.make_buffer_tensor(B_2d, num_records_bytes=b_rows * K)
@@ -423,21 +423,23 @@ def compile_gemm_fp8_8wave(
             # One P FIFO is reused across slices/quadrants. dq_scale_a has
             # two f32 values; dq_scale_b is one wave-uniform scalar.
 
-            # for mm in (Mrep):
-            #   dq_scale = dq_scale_a[mm] *dq_scale_b
-            #   m_slice_offset = dq_m_slice * PHASE_M_REP
-            #   for nn in (Nrep):
-            #       frag_C[0, nn, m_slice_offset + mm] += dq_scale * frag_P[0, nn, mm]
-            #       frag_C[1, nn, m_slice_offset + mm] += dq_scale * frag_P[1, nn, mm]
-            #       frag_C[2, nn, m_slice_offset + mm] += dq_scale * frag_P[2, nn, mm]
-            #       frag_C[3, nn, m_slice_offset + mm] += dq_scale * frag_P[3, nn, mm]
-            #       frag_P[0:3, nn, mm] = mfma_16x16x128(frag_A[:, mm], frag_B[:, nn], 0)
+            # frag_P holds the previous phase's unscaled K128 dot product.
+            # dq_scale_a/b and dq_m_slice describe that partial, not the current A/B.
+            # Retire it into frag_C with FP32 FMA before reusing frag_P for the
+            # current phase's MFMA, which starts from a zero accumulator.
 
-            #
             # Compiler-only sched_barrier fences preserve 4 scalar FMAs ->
             # 1 MFMA; the launch's -packed-fp32-ops disables FP32 packing.
             # This compute block uses fx.fma and the MFMA intrinsic, not
             # inline asm/early-clobber constraints. WG sync stays in the caller.
+
+            # Hide the v_fmac_f32_e32 with mfma
+            # v_mul_f32_e32 v18, s49, v18
+            # v_fmac_f32_e32 v28, v14, v18
+            # v_fmac_f32_e32 v29, v15, v18
+            # v_fmac_f32_e32 v30, v16, v18
+            # v_fmac_f32_e32 v31, v17, v18
+            # v_mfma_f32_16x16x128_f8f6f4 v[14:17], v[168:175], v[194:201], 0....
             for m0 in range_constexpr(PHASE_M_REP):
                 dq_scale = Vec(dq_scale_a)[m0] * dq_scale_b
                 rocdl.sched_barrier(0)

@@ -5,8 +5,7 @@
 
 The tile, half-M pipeline, raw DMA, PID swizzle and permlane epilogue are fixed.
 The preshuffle bit distinguishes the two weight layouts: ID 0 is plain B and
-ID 1 is preshuffled B. Kernel names stay stable; removed full-M/tiled-DMA names
-are not aliases for another kernel.
+ID 1 is preshuffled B. Kernel names omit the fixed pipeline and DMA flags.
 The historical B16 names also serve FP16 calls; the output tensor specializes
 the epilogue, with separate runtime/AOT cache entries for the two dtypes.
 No FlyDSL compiler imports are needed to read this table.
@@ -28,7 +27,7 @@ class kernelInstance:
     def name(self) -> str:
         return (
             f"{KERNEL_PREFIX}{TILE_M}x{TILE_N}x{TILE_K}_F8_F8_B16_"
-            f"ps{int(self.preshuffle_b)}_sm1_tdma0"
+            f"ps{int(self.preshuffle_b)}"
         )
 
 
