@@ -2662,6 +2662,7 @@ class FmoeTuner(TunerCommon):
         quant_type=QuantType.No,
         doweight_stage1=False,
         swiglu_limit=None,
+        quantize_fp32=False,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -2669,7 +2670,9 @@ class FmoeTuner(TunerCommon):
             w2,  # E, model_dim, inter_dim
             topk_weight,
             topk_ids,
-            dtype=dtype,
+            # Fused-quantization kernels quantize their fp32 stage-1 result; the
+            # unfused path quantizes it after rounding to dtype.
+            dtype=dtypes.fp32 if quantize_fp32 else dtype,
             activation=activation,
             quant_type=quant_type,
             a1_scale=a1_scale,
@@ -5030,7 +5033,8 @@ class FmoeTuner(TunerCommon):
                 if q_type == QuantType.per_1x32 and w1_qt.dtype == dtypes.i8:
                     w1_qt_ref = w1_qt.view(dtypes.i4x2)
                     w2_qt_ref = w2_qt.view(dtypes.i4x2)
-                ref = self.torch_moe_2stages(
+                reference = functools.partial(
+                    self.torch_moe_2stages,
                     a1_qt,
                     w1_qt_ref,
                     w2_qt_ref,
@@ -5045,6 +5049,7 @@ class FmoeTuner(TunerCommon):
                     doweight_stage1=doweight_stage1,
                     swiglu_limit=swiglu_limit,
                 )
+                ref = reference()
                 if not _all_finite(out) or not _all_finite(ref):
                     diag = tensor_compare_diagnostics(ref, out)
                     status = f"error:nonfinite output or reference; {diag}"
@@ -5057,7 +5062,16 @@ class FmoeTuner(TunerCommon):
                     )
                     err_ratio = 1.0
                 else:
-                    err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                    err_ratio = checkAllclose(out, ref, printLog=False)
+                    if err_ratio > allowed_err_ratio:
+                        # A fused-quantization pair quantizes the intermediate where
+                        # the reference above does not: rounding it to dtype first
+                        # moves fp4/fp8 codes on a rounding tie by a whole step.
+                        ref_fp32 = reference(quantize_fp32=True)
+                        err_fp32 = checkAllclose(out, ref_fp32, printLog=False)
+                        if err_fp32 < err_ratio:
+                            ref, err_ratio = ref_fp32, err_fp32
+                    checkAllclose(out, ref, msg=f"run_config {shape_str}")
                     # Element-wise err_ratio (atol/rtol) is overly strict for lossy
                     # fp4/fp8 MoE: even a correct kernel differs on most elements
                     # vs the higher-precision reference. op_tests/test_moe_2stage.py
