@@ -178,8 +178,8 @@ def build_hstu_attention_bwd_dq(
         hz_total: fx.Int32,
     ) -> None:
         elem_type = elem_dtype.ir_type
-        c_zero_qk_pack = Vec.filled(MFMA_QK_LANE_K, 0.0, elem_dtype).ir_value()
-        c_zero_da_pack = Vec.filled(MFMA_DA_LANE_K, 0.0, elem_dtype).ir_value()
+        c_zero_qk_pack = fx.full(MFMA_QK_LANE_K, 0.0, elem_dtype).ir_value()
+        c_zero_da_pack = fx.full(MFMA_DA_LANE_K, 0.0, elem_dtype).ir_value()
 
         # QK and V*dO use architecture-native dimension-axis MFMAs. The dQ
         # reduction stays 16-deep to reuse dS without lane shuffles.
@@ -224,7 +224,7 @@ def build_hstu_attention_bwd_dq(
         if has_contextual:
             max_id = seq_len - fx.Int32(contextual_seq_len) + fx.Int32(1)
         if has_targets:
-            max_id = (num_target > fx.Int32(0)).select(max_id - num_target, max_id)
+            max_id = (num_target > 0).select(max_id - num_target, max_id)
 
         def to_id(x):
             xid = x
@@ -247,7 +247,7 @@ def build_hstu_attention_bwd_dq(
         # ---- Streamed K DMA buffer resource ----
         k_base_byte_offset = (
             fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)
-        ) * fx.Int64(2)
+        ) * 2
 
         # The trailing layout axis carries packed MFMA operands. V also has a
         # VEC_V-grouped view for register-to-LDS stores.
@@ -324,7 +324,15 @@ def build_hstu_attention_bwd_dq(
         c_zero_f = fx.Float32(0.0)
 
         def silu_grad_batch(s_list):
+<<<<<<< HEAD
             """Compute silu'(alpha*s) with fast fp32 exp2 and reciprocal."""
+=======
+            """silu'(alpha*s) = sigma*(1 + alpha*s*(1-sigma)); same fast sigmoid as forward.
+
+            The fastmath context gives every add/mul the `fast` flag and turns the
+            reciprocal into v_rcp_f32; only exp2 stays on the amdgcn intrinsic. See the
+            dV/dK kernel for why exp2 needs the explicit `afn` flag."""
+>>>>>>> main
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
@@ -364,7 +372,7 @@ def build_hstu_attention_bwd_dq(
                 kv_tile_start = ctx_prefix_block.select(fx.Int32(0), win_tile_start)
 
         N_ACC = HC_CHUNKS * Q_SUBTILES
-        c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+        c_zero_v4f32 = fx.full(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
 
         # ---- Streamed K DMA: global -> LDS (dword, swizzled) ----
         c_dma_elems = fx.Int32(DMA_ELEMS)
@@ -438,7 +446,7 @@ def build_hstu_attention_bwd_dq(
                     fx.Int64(safe_tok), head_idx, v_load_col // fx.Int32(VEC_V)
                 ).ir_value()
                 vecs.append(
-                    in_bounds.select(raw, Vec.filled(VEC_V, 0.0, elem_dtype).ir_value())
+                    in_bounds.select(raw, fx.full(VEC_V, 0.0, elem_dtype).ir_value())
                 )
             return vecs
 
@@ -498,7 +506,7 @@ def build_hstu_attention_bwd_dq(
                     to_id(kv_raw[i]) for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                 ]
                 for qg in range_constexpr(Q_SUBTILES):
-                    cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+                    cur = fx.full(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(K_STEPS_K):
                         q_op = q_packs[ks][qg] if ks < K_STEPS else c_zero_qk_pack
                         cur = qk_mfma_acc(k_packs[ks].ir_value(), q_op, cur)
@@ -552,7 +560,7 @@ def build_hstu_attention_bwd_dq(
             for ng in range_constexpr(KV_SUBTILES):
                 v_a = read_v_a_packs(ng)
                 for qg in range_constexpr(Q_SUBTILES):
-                    cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+                    cur = fx.full(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(DK_STEPS):
                         cur = da_mfma_acc(v_a[ks].ir_value(), do_packs[ks][qg], cur)
                     grad_vals, keep = g_meta[ng][qg]

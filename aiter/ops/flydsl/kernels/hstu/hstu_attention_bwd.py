@@ -292,8 +292,8 @@ def build_hstu_attention_bwd_dvdk(
         hz_total: fx.Int32,
     ) -> None:
         elem_type = elem_dtype.ir_type
-        c_zero_qk_pack = Vec.filled(MFMA_QK_LANE_K, 0.0, elem_dtype).ir_value()
-        c_zero_da_pack = Vec.filled(MFMA_DA_LANE_K, 0.0, elem_dtype).ir_value()
+        c_zero_qk_pack = fx.full(MFMA_QK_LANE_K, 0.0, elem_dtype).ir_value()
+        c_zero_da_pack = fx.full(MFMA_DA_LANE_K, 0.0, elem_dtype).ir_value()
 
         # QK and V*dO use architecture-native dimension-axis MFMAs. The dV/dK
         # reductions stay 16-deep to reuse score fragments without lane shuffles.
@@ -341,7 +341,7 @@ def build_hstu_attention_bwd_dvdk(
         if has_contextual:
             max_id = seq_len - fx.Int32(contextual_seq_len) + fx.Int32(1)
         if has_targets:
-            max_id = (num_target > fx.Int32(0)).select(max_id - num_target, max_id)
+            max_id = (num_target > 0).select(max_id - num_target, max_id)
 
         def to_id(x):
             xid = x
@@ -358,7 +358,7 @@ def build_hstu_attention_bwd_dvdk(
         q_head_offset = head_idx * fx.Int32(head_dim)
         q_base_byte_offset = (
             fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)
-        ) * fx.Int64(2)
+        ) * 2
 
         # The trailing layout axis carries each row's packed MFMA operand.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -396,7 +396,7 @@ def build_hstu_attention_bwd_dvdk(
         do_base_byte_offset = (
             fx.Int64(seq_start) * fx.Int64(stride_do_n)
             + fx.Int64(head_idx) * fx.Int64(hidden_dim)
-        ) * fx.Int64(2)
+        ) * 2
         do_lds_byte_base = fx.ptrtoint(fx.get_iter(do_view))
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
@@ -493,7 +493,7 @@ def build_hstu_attention_bwd_dvdk(
         if has_contextual:
             q_tile_start = fx.Int32(0)
 
-        c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+        c_zero_v4f32 = fx.full(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
 
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row_q = fx.Int32(PAIRS_PER_ROW_Q)
@@ -674,7 +674,7 @@ def build_hstu_attention_bwd_dvdk(
                 ]
                 q_ids = [to_id(q_raw[i]) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                 for og in range_constexpr(KV_OWNED_SUBTILES):
-                    cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+                    cur = fx.full(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(K_STEPS_K):
                         k_op = k_packs[ks][og] if ks < K_STEPS else c_zero_qk_pack
                         cur = qk_mfma_acc(q_packs[ks].ir_value(), k_op, cur)
@@ -767,7 +767,7 @@ def build_hstu_attention_bwd_dvdk(
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 do_a = read_do_a_packs(ng)
                 for og in range_constexpr(KV_OWNED_SUBTILES):
-                    cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+                    cur = fx.full(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(DK_STEPS):
                         cur = da_mfma_acc(do_a[ks].ir_value(), v_packs[ks][og], cur)
                     da_vals = [

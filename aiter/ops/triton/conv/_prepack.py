@@ -7,10 +7,9 @@ Several conv kernels don't consume the raw OIHW weight (or NCHW input) layout
 directly — they need it reshaped into a kernel-local format for coalesced loads:
 K-major padded tiles for the 1x1/general GEMM, [K_out, 9, C_pad] for the 3x3
 kernels, channel-blocked NCHWc for the cblocked path, and the G·g·Gᵀ filter
-transform for Winograd F(4x4,3x3). These packs are pure functions of the weight
-tensor, so the results are LRU-cached keyed on (storage ptr, shape, dtype,
-block, version): a weight repacks once and every later call with the same
-weight is a cache hit, making the steady-state repack cost negligible.
+transform for Winograd F(4x4,3x3). For ordinary tensors, these pure transforms
+are LRU-cached by (storage ptr, shape, dtype, block, version). PyTorch inference
+tensors have no version counter, so they are repacked on every call.
 """
 
 import os
@@ -159,6 +158,9 @@ def _prepack_fixed_kernel(weight: torch.Tensor, taps: int, block: int):
 
 
 def _get_or_make_pack(cache, weight: torch.Tensor, block: int, packer):
+    if weight.is_inference():
+        return packer(weight, block)
+
     key = _pack_cache_key(weight, block)
     cached = cache.get(key)
     if cached is not None:
