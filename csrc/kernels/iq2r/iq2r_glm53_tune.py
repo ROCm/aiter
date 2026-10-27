@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+import math
 import os
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -359,9 +360,7 @@ class IQ2RGlm53Tuner(TunerCommon):
 
                     watts = record_package_watts(replay)
                 watt_text = (
-                    f", {watts:.1f} W"
-                    if watts == watts and watts > 0
-                    else ""
+                    f", {watts:.1f} W" if math.isfinite(watts) and watts > 0 else ""
                 )
                 print(
                     f"{label} {self.getKernelName(config)}: {us:.2f} us, "

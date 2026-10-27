@@ -955,7 +955,9 @@ class TestMoePowerRanking(unittest.TestCase):
         self.assertEqual(list(ranked["rank"]), [1, 2, 3])
         self.assertEqual(float(ranked.iloc[0]["energy"]), 27500.0)
         self.assertAlmostEqual(float(ranked.iloc[0]["watts"]), 500.0, places=3)
-        self.assertAlmostEqual(float(ranked.iloc[0]["tflops_per_w"]), 90 / 500, places=5)
+        self.assertAlmostEqual(
+            float(ranked.iloc[0]["tflops_per_w"]), 90 / 500, places=5
+        )
 
     def test_latency_rank_ignores_energy_order(self):
         import pandas as pd
@@ -1027,7 +1029,13 @@ class TestPowerSelectionGaps(unittest.TestCase):
         tuner = gemm_moe_tune.GroupedFmoeTuner.__new__(gemm_moe_tune.GroupedFmoeTuner)
         hot = {"tile_m": 128, "kernelName1": "hot"}
         cool = {"tile_m": 16, "kernelName1": "cool"}
-        args = SimpleNamespace(fast_scan=False, select="power", warmup=1, iters=1)
+        args = SimpleNamespace(
+            fast_scan=False,
+            select="power",
+            warmup=1,
+            iters=1,
+            tune_file="unused.csv",
+        )
         frame = pd.DataFrame(
             [{"token": 4, "inter_dim": 32, "q_dtype_a": "fp4", "expert": 2, "topk": 1}]
         )
@@ -1040,6 +1048,7 @@ class TestPowerSelectionGaps(unittest.TestCase):
             return 20.0
 
         with (
+            mock.patch.object(tuner, "_write_layout", return_value=([], [], set())),
             mock.patch.object(tuner, "_candidate_rows", return_value=[hot, cool]),
             mock.patch.object(tuner, "_run_candidate", side_effect=run_candidate),
             mock.patch("builtins.print"),
@@ -1050,6 +1059,7 @@ class TestPowerSelectionGaps(unittest.TestCase):
 
         args.select = "latency"
         with (
+            mock.patch.object(tuner, "_write_layout", return_value=([], [], set())),
             mock.patch.object(tuner, "_candidate_rows", return_value=[hot, cool]),
             mock.patch.object(tuner, "_run_candidate", side_effect=run_candidate),
             mock.patch("builtins.print"),

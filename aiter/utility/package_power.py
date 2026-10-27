@@ -4,9 +4,12 @@
 
 import ctypes
 import glob
+import logging
 import os
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 
 def _hip_pci_bus_id(device_index: int) -> str | None:
@@ -60,7 +63,8 @@ def power_input_path(device_index: int = 0) -> str | None:
 
 def _read_watts(path: str) -> float | None:
     try:
-        raw = open(path, encoding="ascii").read().strip()
+        with open(path, encoding="ascii") as handle:
+            raw = handle.read().strip()
         uw = int(raw)
     except (OSError, ValueError):
         return None
@@ -69,7 +73,9 @@ def _read_watts(path: str) -> float | None:
     return uw / 1e6
 
 
-def measure_package_watts(fn, seconds: float | None = None, device_index: int = 0) -> float:
+def measure_package_watts(
+    fn, seconds: float | None = None, device_index: int = 0
+) -> float:
     """Run fn until `seconds` elapse and return the mean package power in watts.
 
     The timed GEMM loop in the tuner is often shorter than the PPT update, so callers
@@ -92,12 +98,7 @@ def measure_package_watts(fn, seconds: float | None = None, device_index: int = 
             stop.wait(0.005)
 
     fn()
-    try:
-        import torch
-
-        torch.cuda.synchronize()
-    except Exception:  # noqa: BLE001
-        pass
+    _sync_cuda()
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
     deadline = time.perf_counter() + seconds
@@ -105,17 +106,21 @@ def measure_package_watts(fn, seconds: float | None = None, device_index: int = 
         while time.perf_counter() < deadline:
             fn()
     finally:
-        try:
-            import torch
-
-            torch.cuda.synchronize()
-        except Exception:  # noqa: BLE001
-            pass
+        _sync_cuda()
         stop.set()
         thread.join()
     if not samples:
         return float("nan")
     return sum(samples) / len(samples)
+
+
+def _sync_cuda() -> None:
+    try:
+        import torch
+
+        torch.cuda.synchronize()
+    except Exception:
+        logger.debug("CUDA synchronize skipped", exc_info=True)
 
 
 def record_package_watts(fn, device_index: int | None = None) -> float:

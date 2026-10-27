@@ -229,12 +229,7 @@ def worker(
         us = -1  # float("inf")
         max_err_ratio = 1.0
 
-    if (
-        measure_power
-        and us not in (-1, 0)
-        and us != float("inf")
-        and res is not None
-    ):
+    if measure_power and us not in (-1, 0) and us != float("inf") and res is not None:
         try:
             from aiter.utility.package_power import measure_package_watts
 
