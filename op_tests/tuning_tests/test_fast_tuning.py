@@ -3,8 +3,10 @@
 """CPU-only regression tests for lightweight tuning scans."""
 
 import csv
+import io
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,6 +83,133 @@ class TestFastScanCliSafety(unittest.TestCase):
                 self.assertRaises(SystemExit),
             ):
                 tuner.parse_args()
+
+
+class TestMxfp4InputOutputSafety(unittest.TestCase):
+    def assert_same_file_rejected(
+        self, input_file: "str | Path", output_file: "str | Path", *options: str
+    ) -> None:
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner("testMxfp4", [], [], "test parser")
+        argv = [
+            "gemm_moe_tune.py",
+            "--mxfp4-flydsl",
+            "-i",
+            str(input_file),
+            "-o",
+            str(output_file),
+            *options,
+        ]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(sys, "stderr", io.StringIO()) as stderr,
+            mock.patch.object(
+                tuner,
+                "_capture_configuration",
+                side_effect=AssertionError("configuration loaded before rejection"),
+            ) as capture,
+            self.assertRaises(SystemExit) as status,
+        ):
+            tuner.parse_args()
+        self.assertEqual(status.exception.code, 2)
+        self.assertIn("different input and output files", stderr.getvalue())
+        capture.assert_not_called()
+
+    def test_rejects_file_aliases_in_every_search_mode_before_configuration(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.csv"
+            source.write_text("pending input must survive\n")
+            symlink = Path(directory) / "symlink.csv"
+            symlink.symlink_to(source)
+            hardlink = Path(directory) / "hardlink.csv"
+            os.link(source, hardlink)
+            aliases = (source, os.path.relpath(source), symlink, hardlink)
+            for options in (
+                (),
+                ("--mxfp4-search-mode", "full", "--all"),
+                ("--fast-scan",),
+            ):
+                for alias in aliases:
+                    with self.subTest(options=options, alias=str(alias)):
+                        self.assert_same_file_rejected(source, alias, *options)
+                        self.assertEqual(
+                            source.read_text(), "pending input must survive\n"
+                        )
+
+    def test_checks_first_output_file_in_config_path_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.csv"
+            source.write_text("pending input\n")
+            output_files = os.pathsep.join(
+                (str(source), str(Path(directory) / "other.csv"))
+            )
+            self.assert_same_file_rejected(source, output_files)
+            self.assertEqual(source.read_text(), "pending input\n")
+
+    def test_pre_process_rejects_same_file_before_loading_configuration_or_inputs(
+        self,
+    ) -> None:
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.csv"
+            source.write_text("pending input\n")
+            tuner = gemm_moe_tune.Mxfp4FlydslTuner("testMxfp4", [], [], "test parser")
+            args = SimpleNamespace(untune_file=str(source), tune_file=str(source))
+            with (
+                mock.patch.object(sys, "stderr", io.StringIO()),
+                mock.patch.object(tuner, "_capture_configuration") as capture,
+                mock.patch.object(
+                    gemm_moe_tune.FmoeTuner, "pre_process"
+                ) as load_inputs,
+                self.assertRaises(SystemExit) as status,
+            ):
+                tuner.pre_process(args)
+            self.assertEqual(status.exception.code, 2)
+            capture.assert_not_called()
+            load_inputs.assert_not_called()
+            self.assertEqual(source.read_text(), "pending input\n")
+
+    def test_accepts_existing_and_new_separate_output_files(self) -> None:
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.csv"
+            source.write_text("pending input\n")
+            existing = Path(directory) / "existing-output.csv"
+            existing.write_text("old winner\n")
+            for output in (existing, Path(directory) / "new-output.csv"):
+                with self.subTest(output=str(output)):
+                    tuner = gemm_moe_tune.Mxfp4FlydslTuner(
+                        "testMxfp4", [], [], "test parser"
+                    )
+                    with (
+                        mock.patch.object(
+                            sys,
+                            "argv",
+                            [
+                                "gemm_moe_tune.py",
+                                "--mxfp4-flydsl",
+                                "-i",
+                                str(source),
+                                "-o",
+                                str(output),
+                            ],
+                        ),
+                        mock.patch.object(
+                            tuner,
+                            "_capture_configuration",
+                            return_value={"swiglu_limit": None},
+                        ),
+                    ):
+                        args = tuner.parse_args()
+                    self.assertEqual(args.untune_file, str(source))
+                    self.assertEqual(args.tune_file, str(output))
+                    self.assertEqual(source.read_text(), "pending input\n")
+                    self.assertEqual(existing.read_text(), "old winner\n")
 
 
 class TestMxfp4AccuracyFunnel(unittest.TestCase):

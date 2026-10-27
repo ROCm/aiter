@@ -6854,15 +6854,30 @@ class Mxfp4FlydslTuner(FmoeTuner):
             args.mxfp4_configuration = self._configuration
         return self._configuration
 
+    def _require_distinct_input_output(
+        self, args: "argparse.Namespace | SimpleNamespace"
+    ) -> "None":
+        input_file = args.untune_file
+        output_file = self.get_out_file(args.tune_file)
+        same_file = os.path.realpath(input_file) == os.path.realpath(output_file)
+        if not same_file and os.path.exists(input_file) and os.path.exists(output_file):
+            same_file = os.path.samefile(input_file, output_file)
+        if same_file:
+            self.parser.error(
+                "--mxfp4-flydsl requires different input and output files "
+                "(-i/--untune_file and -o/--tune_file)"
+            )
+
     def parse_args(self) -> "argparse.Namespace":
         args = super().parse_args()
+        self._require_distinct_input_output(args)
         self._configuration = self._capture_configuration()
         args.mxfp4_configuration = self._configuration
         return args
 
     def pre_process(self, args: "argparse.Namespace | SimpleNamespace") -> "None":
+        self._require_distinct_input_output(args)
         self._invocation_configuration(args)
-        self._input_file = args.untune_file
         return super().pre_process(args)
 
     def _unsupported_row_reason(
@@ -7029,16 +7044,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 tunedf[column] = pd.to_numeric(tunedf[column], errors="coerce").fillna(
                     0
                 )
-        # Input-only columns stay while an untuned row still carries a value.
-        untuned = tunedf[~self._names_kernel(tunedf)]
-        tunedf = tunedf.drop(
-            columns=[
-                column
-                for column in self.input_metadata
-                if column in untuned
-                and untuned[column].fillna("").astype(str).str.strip().eq("").all()
-            ]
-        )
+        tunedf = tunedf.drop(columns=list(self.input_metadata), errors="ignore")
         # Keep columns owned by other rows of shared files (nt, _tag, ...).
         return tunedf[
             self.columns + [column for column in tunedf if column not in self.columns]
@@ -8555,31 +8561,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         valid = results[(times > 0) & (times < self.INF_TIME)]
         invalid = results[~results.index.isin(valid.index)]
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
-        resultdf = self.update_tunedf(old_tunedf, valid)
-        input_file = getattr(self, "_input_file", None)
-        if input_file and os.path.realpath(input_file) == os.path.realpath(file):
-            # Same-file run: an untuned input row is done once its shape has a
-            # winner from this save or a configured row on this device; failed,
-            # pending and unsupported rows stay for a rerun.
-            shape = self._summary_shape_keys()
-            configured = self._names_kernel(resultdf)
-            here = (
-                configured
-                & resultdf["gfx"].astype(str).eq(str(self.get_gfx()))
-                & resultdf["cu_num"].eq(self.get_cu_num())
-            )
-            done = set(valid[shape].itertuples(index=False, name=None))
-            done |= set(resultdf.loc[here, shape].itertuples(index=False, name=None))
-            pending = pd.Series(
-                [
-                    key not in done
-                    for key in resultdf[shape].itertuples(index=False, name=None)
-                ],
-                index=resultdf.index,
-                dtype=bool,
-            )
-            resultdf = resultdf[configured | pending]
-        resultdf = self._normalize_tuned_csv(resultdf)
+        resultdf = self._normalize_tuned_csv(self.update_tunedf(old_tunedf, valid))
         # The updated row is the first per key; drop rows it made unreachable.
         self._drop_superseded_rows(resultdf, self.keys).to_csv(file, index=False)
         # Count winners only once saved; unsaved shapes report as untuned.

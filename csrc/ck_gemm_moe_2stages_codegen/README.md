@@ -55,6 +55,11 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
   -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode staged
 ```
 
+The MXFP4 tuner requires different input (`-i`) and output (`-o`) files.
+Paths that refer to the same file, including symbolic and hard links, are
+rejected before configuration loading. Keep the input CSV separate so failed
+and pending requests remain available for the next run.
+
 Switching the mode alone does not re-tune shapes already written to the output
 CSV: `pre_process` skips shapes that already have a configured row (one naming
 a kernel), and the search mode does not change that rule. To re-check tuned
