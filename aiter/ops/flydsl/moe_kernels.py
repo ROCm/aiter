@@ -3569,20 +3569,22 @@ def flydsl_moe_fused_quant_preshuffle(
                 compact_scale = torch.empty(
                     (token_num, Ws), dtype=torch.uint8, device=device
                 )
-                _get_compiled_apre_quant(feat_dim, wmma_rep)(
+                _dispatch_compiled(
+                    _get_compiled_apre_quant(feat_dim, wmma_rep),
                     ptr_arg(grouped_in.contiguous().view(-1)),
                     ptr_arg(compact_payload.view(-1)),
                     ptr_arg(compact_scale.view(-1)),
                     token_num,
                     apre_workers,
-                    stream=stream,
+                    stream,
                 )
             # Stream ordering makes compact rows visible to the scatter kernel.
-            _get_compiled_apre_scatter(
-                feat_dim,
-                wmma_rep,
-                src_scale_stride_bytes=int(compact_scale.shape[-1]),
-            )(
+            _dispatch_compiled(
+                _get_compiled_apre_scatter(
+                    feat_dim,
+                    wmma_rep,
+                    src_scale_stride_bytes=int(compact_scale.shape[-1]),
+                ),
                 ptr_arg(compact_payload.view(-1)),
                 ptr_arg(compact_scale.view(-1)),
                 ptr_arg(out_payload.view(-1)),
@@ -3591,7 +3593,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 token_num,
                 n_rows,
                 min(n_rows // 16, apre_workers),
-                stream=stream,
+                stream,
             )
             return out_payload, out_scale
         # Row-major stores are emitted only by the full-row prequant copy.
