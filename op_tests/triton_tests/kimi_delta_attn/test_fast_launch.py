@@ -138,7 +138,6 @@ def _wrapped():
         pkg = f"aiter.ops.triton._gluon_kernels.{fk.DEVICE_ARCH}.kimi_delta_attn"
         k1 = importlib.import_module(f"{pkg}.flash_kda_k1")
         k2 = importlib.import_module(f"{pkg}.flash_kda_k2")
-        # Pass C has a Gluon kernel on gfx1250 only.
         candidates += [k1._k1_fast, k2.k2_ab_fused_fast, getattr(k2, "k2_c_fast", None)]
     return [c for c in candidates if isinstance(c, fast_launch._FastLaunch)]
 

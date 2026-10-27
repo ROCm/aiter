@@ -808,32 +808,40 @@ class Gfx1250Memory:
         for size in reversed(shape):
             packed_strides.insert(0, stride)
             stride *= size
-        layout = fx.make_layout(shape, tuple(packed_strides))
         lds_strides = tuple(
             s // width * row_stride if s >= width else s for s in packed_strides
+        )
+        # The tile is the whole view on every unbounded mode; a runtime extent
+        # narrows the view and the tile clamps against it.
+        gshape = tuple(
+            shape[i] if extents[i] is None else extents[i] for i in range(len(shape))
         )
         src = fx.Tensor(
             fx.make_view(
                 fx.add_offset(fx.recast_iter(self.t.kv_dtype, ptr), offset),
-                layout,
+                fx.make_layout(gshape, tuple(strides)),
             )
         )
-        atom = fx.rocdl.make_tdm_atom(
+        atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
             src,
-            extents,
-            strides=strides,
+            fx.make_layout(shape, lds_strides),
+            shape,
             num_warps=1,
-            pad_interval=width if row_stride != width else 0,
-            pad_amount=row_stride - width,
-            early_timeout=True,
         )
+        # early_timeout has no tiled-atom equivalent; it is a multicast GL1 bit
+        # and these loads are single-warp with no mask.
+        # Keep one rest mode so the global side stays nested like the LDS box.
+        rest = None if len(shape) == 1 else tuple(0 for _ in shape[:-1]) + (None,)
+        blk = fx.zipped_divide(coord, shape)[None, rest]
         dst = fx.Tensor(
             fx.make_view(
                 self.pointer(shared_offset, self.t.kv_dtype),
-                fx.make_layout(shape, lds_strides),
+                fx.make_layout((shape, 1), (lds_strides, stride)),
             )
         )
-        fx.copy_atom_call(atom, src, dst)
+        ts, tg = fx.rocdl.cdna5.tdm_partition(atom, 0, fx.make_layout(1, 1), dst, blk)
+        fx.copy(atom, tg[None, 0], ts[None, 0])
 
     @flyc.jit
     def stage_tdm(self, token_base, kv_off, full_tile=False, cached_page=None):

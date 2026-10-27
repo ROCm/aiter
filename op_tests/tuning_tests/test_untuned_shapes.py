@@ -191,6 +191,41 @@ class TestCachedLookupMissRecording(unittest.TestCase):
             (1, 2, 3, "tuned.csv"),
         )
 
+    def test_a8w8_device_overrides_are_preserved_in_lookup_cache(self):
+        from aiter.ops import gemm_op_a8w8
+
+        tuned_file = "device-specific.csv"
+        first = {"kernelName": "first"}
+        second = {"kernelName": "second"}
+        rows = {
+            ("gfx942", 304, 1, 2, 3): first,
+            ("gfx950", 256, 1, 2, 3): second,
+        }
+        gemm_op_a8w8.get_CKGEMM_config.cache_clear()
+        self.addCleanup(gemm_op_a8w8.get_CKGEMM_config.cache_clear)
+        with (
+            mock.patch.dict(
+                gemm_op_a8w8._CKGEMM_CONFIG_CACHE, {tuned_file: rows}, clear=True
+            ),
+            mock.patch.dict(
+                gemm_op_a8w8._CKGEMM_HAS_GFX, {tuned_file: True}, clear=True
+            ),
+            mock.patch.object(gemm_op_a8w8, "get_gfx") as get_gfx,
+            mock.patch.object(gemm_op_a8w8, "get_cu_num") as get_cu_num,
+            mock.patch.object(gemm_op_a8w8, "get_padded_m", return_value=1),
+            mock.patch.object(gemm_op_a8w8, "_record_untuned_shape") as record,
+        ):
+            lookup = gemm_op_a8w8.get_CKGEMM_config
+            self.assertIs(lookup(1, 2, 3, tuned_file, gfx="gfx942", cu_num=304), first)
+            self.assertIs(lookup(1, 2, 3, tuned_file, gfx="gfx950", cu_num=256), second)
+            # A miss on another device must remain retryable outside the cache.
+            for _ in range(2):
+                self.assertIsNone(lookup(1, 2, 3, tuned_file, gfx="gfx950", cu_num=304))
+            self.assertEqual(record.call_count, 2)
+            get_gfx.assert_not_called()
+            get_cu_num.assert_not_called()
+            self.assertEqual(lookup.cache_info().hits, 1)
+
     def test_a8w8_default_miss_uses_the_tuned_file_schema(self):
         from aiter.ops import gemm_op_a8w8
 
