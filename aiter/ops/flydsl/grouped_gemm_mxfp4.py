@@ -134,6 +134,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
+    post_gemm2_rmsnorm=False,
     situ_beta=1.0,
     situ_linear_beta=1.0,
     row_major_ascale=0,
@@ -252,6 +253,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         ep_quant_bits=(
             int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
         ),
+        post_gemm2_rmsnorm=int(bool(post_gemm2_rmsnorm)),
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
