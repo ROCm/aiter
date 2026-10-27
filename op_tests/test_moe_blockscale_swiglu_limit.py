@@ -75,14 +75,14 @@ def weights():
     )
     w2_qt, w2_scale = _quant_128x128(w2)
     del w2
-    return dict(
-        w1_qt=w1_qt,
-        w2_qt=w2_qt,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        w1_sh=shuffle_weight(w1_qt, layout=(16, 16)),
-        w2_sh=shuffle_weight(w2_qt, layout=(16, 16)),
-    )
+    return {
+        "w1_qt": w1_qt,
+        "w2_qt": w2_qt,
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "w1_sh": shuffle_weight(w1_qt, layout=(16, 16)),
+        "w2_sh": shuffle_weight(w2_qt, layout=(16, 16)),
+    }
 
 
 def _calc_diff(x, y):
