@@ -591,19 +591,26 @@ class DeviceMoEPipeline:
             q1, gs1, q2, gs2, self.spec, self.EPR + self.n_shared
         )
 
-        # cco rendezvous + op (ONE op, reused by every layer; config is per-layer
-        # identical). max_tokens_per_rank = ct.
-        uid = Communicator.get_unique_id() if r == 0 else None
-        uid = self.dist_ctx.bcast_uid(uid)
-        self.comm = Communicator.init(
-            self.dist_ctx.world, r, uid, per_rank_vmm=16 * 1024**3
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
+            MegaMoEGeometry,
+            MegaMoEGfx1250,
+            MegaMoERecipe,
         )
-        from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
 
-        # Geometry + the expert-GEMM recipe are per-model, so they are fixed
-        # here; the weights are per-layer and go to each forward() call.
-        self.mega = MegaMoEGfx1250(
-            communicator=self.comm,
+        # The recipe + geometry are per-model, so they are fixed here; the
+        # weights are per-layer and go to each forward() call. ONE op, reused by
+        # every layer. max_tokens_per_rank = ct.
+        recipe = MegaMoERecipe.from_legacy(
+            stage1_fused=self.stage1_fused,
+            stage2_fused=self.stage2_fused,
+            # Explicit so a stale $MEGA_DISPATCH_WIRE cannot change what is measured.
+            dispatch_wire=self.spec["dispatch_wire"],
+            combine_quant=self.combine_quant,
+            activation=self.spec["activation"],
+            gate_mode=self.spec["gate_mode"].value,
+            quant_type=self.spec["aiter_qtype"],
+        )
+        geometry = MegaMoEGeometry(
             rank=r,
             world_size=self.dist_ctx.world,
             model_dim=self.hdim,
@@ -611,15 +618,17 @@ class DeviceMoEPipeline:
             experts=self.E + self.n_shared * self.dist_ctx.world,
             topk=self.topk + self.n_shared,
             max_tokens_per_rank=self.ct,
-            activation=self.spec["activation"],
-            gate_mode=self.spec["gate_mode"].value,
-            quant_type=self.spec["aiter_qtype"],
-            # Explicit so a stale $MEGA_DISPATCH_WIRE cannot change what is measured.
-            dispatch_wire=self.spec["dispatch_wire"],
-            stage1_fused=self.stage1_fused,
-            stage2_fused=self.stage2_fused,
-            combine_quant=self.combine_quant,
         )
+        # The communicator carries nothing but this op's arena.
+        uid = Communicator.get_unique_id() if r == 0 else None
+        uid = self.dist_ctx.bcast_uid(uid)
+        self.comm = Communicator.init(
+            self.dist_ctx.world,
+            r,
+            uid,
+            per_rank_vmm=MegaMoEGfx1250.required_vmm_bytes(recipe, geometry),
+        )
+        self.mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=self.comm)
         self.comm.barrier()
 
     # ---- one graph-capturable layer + full chain (calls grouped together) ---- #

@@ -168,6 +168,9 @@ _DISPATCH_WIRE_SPECS = {
     ),
 }
 _DISPATCH_WIRES = tuple(_DISPATCH_WIRE_SPECS)
+# What mori's describe() resolves a request against: MegaMoE runs only here, and
+# naming it keeps the sizing off the GPU.
+_MORI_ARCH = "gfx1250"
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -258,6 +261,7 @@ class _MoriCapabilities:
     ep_staging_bytes: object  # ROCm/mori#703
     tokoff_wanted: object  # ROCm/mori#726, TokOffExt.wanted
     self_first_enabled: object  # a mori between #726 and #745
+    plan_describe: bool  # ROCm/mori#844: Plan.describe() and arena_regions()
 
     def tuning(self, config, quant_type: str = "none") -> dict:
         # Only named when quantizing: an older mori's lookup has no quant_type.
@@ -340,6 +344,20 @@ class _MoriCapabilities:
             )
         )
 
+    def describe(self, plan_cls, requests) -> list[dict] | None:
+        """What mori reports for each plan request -- its arena regions, staging
+        -- without building or compiling one; None for a mori from before
+        ROCm/mori#844, which is sized from the formulas here instead."""
+        if not self.plan_describe:
+            return None
+        return [plan_cls.describe(arch=_MORI_ARCH, **request) for request in requests]
+
+    def region_sizes(self, infos) -> dict:
+        """The arena regions ``infos`` ask for, under this package's names."""
+        return dict(
+            self.ep_plans.arena_regions(*infos, region_names=_MORI_REGION_NAMES)
+        )
+
     def staging_bytes(self, config, scale_bytes: int) -> int | None:
         """The dispatch's staging buffer (ROCm/mori#703); None before it."""
         if self.ep_staging_bytes is None:
@@ -407,6 +425,8 @@ def _mori_capabilities() -> _MoriCapabilities:
         ep_staging_bytes=getattr(hip_backend, "ep_staging_bytes", None),
         tokoff_wanted=getattr(tokoff, "wanted", None),
         self_first_enabled=getattr(ep_plans, "self_first_enabled", None),
+        plan_describe=hasattr(ep_plans.EpDispatchPlan, "describe")
+        and hasattr(ep_plans, "arena_regions"),
     )
 
 
@@ -443,6 +463,10 @@ class SymmetricArena:
 
     def local_ptr(self, name: str) -> int:
         return self._window.local_ptr + self._offsets[name]
+
+    def size(self, name: str) -> int:
+        """A region's bytes; mori's plans check theirs against it at bind."""
+        return self._sizes[name]
 
     def zero(self, name: str | None = None):
         if name is None:
@@ -1128,6 +1152,11 @@ class _ComputeTarget:
     output: torch.Tensor | None = None
 
 
+def _schedule_specs(schedule) -> list:
+    """The launch specs a (bound, *spec) schedule names, one each."""
+    return sorted({tuple(entry[1:]) for entry in schedule})
+
+
 class _Dispatch:
     """Tokens out to their experts' ranks, into the arena's recv rows."""
 
@@ -1139,7 +1168,7 @@ class _Dispatch:
         self.mori = mori
         self.schedule = schedule
         # A spec is (block, warp), plus route_parallel on the compact path.
-        self.specs = sorted({tuple(entry[1:]) for entry in schedule})
+        self.specs = _schedule_specs(schedule)
         self.res = None
         self._quant_payload = None
         self._quant_scales = None
@@ -1257,25 +1286,67 @@ class _MoriDispatch(_Dispatch):
         # tuned buckets.
         super().__init__(config, mori, mori.dispatch_schedule(config))
         self.tokoff_ext, self._slot_word_kw = mori.slot_word(config)
-        # Passed only on a quantizing wire, matching dispatch_scale_dst_nbytes:
-        # mori grew scale_bytes in #593 and rejects UNKNOWN kwargs outright, so
-        # sending the bf16 wire's harmless 0 would make an older mori refuse
-        # the whole plan.
-        self._scale_kw = (
-            {"scale_bytes": config.dispatch_scale_nbytes}
-            if config.is_quant_dispatch_wire
-            else {}
-        )
         # Since ROCm/mori#703 the dispatch stages through a buffer its caller
         # binds; one serves every plan, as only one launches at a time.
-        self._staging_nbytes = mori.staging_bytes(
-            config, self._scale_kw.get("scale_bytes", 0)
-        )
+        infos = self.describe(config, mori, self.specs)
+        if infos is not None:
+            self._staging_nbytes = max(info["stagingBytes"] for info in infos)
+        else:
+            self._staging_nbytes = mori.staging_bytes(
+                config, config.dispatch_scale_nbytes
+            )
         self._staging = None
         self._plans = {}
 
     @staticmethod
+    def request(config: MegaMoEConfig, spec: tuple, slot_word_kw=None) -> dict:
+        """The plan request for ``spec``: what describe() reads, and what the
+        plan is built from once the arena is added."""
+        # Passed only on a quantizing wire, matching dispatch_scale_dst_nbytes:
+        # mori grew scale_bytes in #593 and rejects UNKNOWN kwargs outright, so
+        # sending the bf16 wire's harmless 0 would make an older mori refuse
+        # the whole plan.
+        scale_kw = (
+            {"scale_bytes": config.dispatch_scale_nbytes}
+            if config.is_quant_dispatch_wire
+            else {}
+        )
+        return dict(
+            world_size=config.world_size,
+            # see dispatch_wire_elem_count; mori's plan_api: "the caller halves
+            # hiddenDim"
+            hidden_dim=config.dispatch_wire_elem_count,
+            max_tok_per_rank=config.max_tokens_per_rank,
+            num_expert_per_rank=config.experts_per_rank,
+            num_expert_per_token=config.topk,
+            max_recv=config.max_recv,
+            dtype=config.dispatch_wire_spec.mori_dtype,
+            use_weights=True,
+            **scale_kw,
+            **(slot_word_kw or {}),
+            block_num=spec[0],
+            warp_per_block=spec[1],
+        )
+
+    @staticmethod
+    def describe(config: MegaMoEConfig, mori, specs=None) -> list[dict] | None:
+        """mori's info for every plan this dispatch builds, None before #844.
+
+        Without the slot word's kwargs: where that word lives sizes nothing, and
+        asking would be collective.
+        """
+        if not mori.plan_describe:
+            return None
+        if specs is None:
+            specs = _schedule_specs(mori.dispatch_schedule(config))
+        requests = [_MoriDispatch.request(config, spec) for spec in specs]
+        return mori.describe(mori.ep_plans.EpDispatchPlan, requests)
+
+    @staticmethod
     def regions(config: MegaMoEConfig, mori, compact=None) -> dict:
+        infos = _MoriDispatch.describe(config, mori)
+        if infos is not None:
+            return mori.region_sizes(infos)
         regions = _Dispatch.routing_regions(config)
         regions["disp_out"] = config.max_recv * config.dispatch_token_nbytes
         if config.is_quant_dispatch_wire:
@@ -1292,20 +1363,7 @@ class _MoriDispatch(_Dispatch):
         EpDispatchPlan = self.mori.ep_plans.EpDispatchPlan
         for spec in self.specs:
             plan = EpDispatchPlan(
-                world_size=config.world_size,
-                # see dispatch_wire_elem_count; mori's plan_api: "the caller halves
-                # hiddenDim"
-                hidden_dim=config.dispatch_wire_elem_count,
-                max_tok_per_rank=config.max_tokens_per_rank,
-                num_expert_per_rank=config.experts_per_rank,
-                num_expert_per_token=config.topk,
-                max_recv=config.max_recv,
-                dtype=config.dispatch_wire_spec.mori_dtype,
-                use_weights=True,
-                **self._scale_kw,
-                **self._slot_word_kw,
-                block_num=spec[0],
-                warp_per_block=spec[1],
+                **self.request(config, spec, self._slot_word_kw),
                 arena=arena,
                 region_names=_MORI_REGION_NAMES,
             )
@@ -1925,7 +1983,7 @@ class _MoriCombine(_Combine):
             for bits in config.combine_quant_bit_modes
         }
         self._specs = {
-            bits: sorted({tuple(entry[1:]) for entry in schedule})
+            bits: _schedule_specs(schedule)
             for bits, schedule in self._schedules.items()
         }
         self._max_blocks = max(
@@ -1943,7 +2001,34 @@ class _MoriCombine(_Combine):
         self._plans = {}
 
     @staticmethod
+    def request(config: MegaMoEConfig, quant_bits: int, spec: tuple) -> dict:
+        """The plan request for ``spec`` on the ``quant_bits`` wire."""
+        # Named only on the fp4 wire: an older mori rejects unknown kwargs.
+        fp4_kw = {"combine_fp4": True} if quant_bits else {}
+        return dict(
+            world_size=config.world_size,
+            hidden_dim=config.hidden_dim,
+            max_tok_per_rank=config.max_tokens_per_rank,
+            num_expert_per_rank=config.experts_per_rank,
+            num_expert_per_token=config.topk,
+            max_recv=config.max_recv,
+            dtype=torch.bfloat16,
+            use_weights=True,
+            **fp4_kw,
+            block_num=spec[0],
+            warp_per_block=spec[1],
+        )
+
+    @staticmethod
     def regions(config: MegaMoEConfig, mori) -> dict:
+        if mori.plan_describe:
+            requests = [
+                _MoriCombine.request(config, bits, spec)
+                for bits in config.combine_quant_bit_modes
+                for spec in _schedule_specs(mori.combine_schedule(config, bits))
+            ]
+            infos = mori.describe(mori.ep_plans.EpCombinePlan, requests)
+            return mori.region_sizes(infos)
         # mori's outTok: one bf16 staging row per recv slot, then, for the fp4
         # push combine, its landing rows and, from four ranks up, a u64 flag per
         # landing row for the overlapped combine (EpFp4Ovl) -- the same three
@@ -1964,21 +2049,9 @@ class _MoriCombine(_Combine):
         device = res.total_recv.device
         EpCombinePlan = self.mori.ep_plans.EpCombinePlan
         for bits, wire_specs in self._specs.items():
-            # Named only on the fp4 wire: an older mori rejects unknown kwargs.
-            fp4_kw = {"combine_fp4": True} if bits else {}
             for spec in wire_specs:
                 plan = EpCombinePlan(
-                    world_size=config.world_size,
-                    hidden_dim=config.hidden_dim,
-                    max_tok_per_rank=config.max_tokens_per_rank,
-                    num_expert_per_rank=config.experts_per_rank,
-                    num_expert_per_token=config.topk,
-                    max_recv=config.max_recv,
-                    dtype=torch.bfloat16,
-                    use_weights=True,
-                    **fp4_kw,
-                    block_num=spec[0],
-                    warp_per_block=spec[1],
+                    **self.request(config, bits, spec),
                     arena=res.arena,
                     region_names=_MORI_REGION_NAMES,
                 )
@@ -2229,9 +2302,10 @@ class MegaMoEGfx1250:
         ccoMemAlloc rounds it. The constructor allocates this same layout, so the
         allocation never exceeds it. It needs no communicator, so it can size the
         one about to be created; but it is MegaMoE's share only, and a
-        communicator that also carries other cco allocations (mori's own EP ops,
-        say) needs theirs added on top. ``granularity`` is the communicator's VMM
-        granularity, when known.
+        communicator that also carries other cco allocations -- mori's own EP
+        ops, or a DevComm's resource window (one granule each) -- needs theirs
+        added on top. ``granularity`` is the communicator's VMM granularity, when
+        known.
 
         The keyword form ``required_vmm_bytes(world_size=, hidden_dim=,
         max_tokens_per_rank=, experts=, topk=, stage1_fused=)`` names neither the
