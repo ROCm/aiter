@@ -13,16 +13,16 @@ from __future__ import annotations
 
 import json
 import os
-import weakref
 from pathlib import Path
 
+import flydsl.expr as fx
+import torch
 from flydsl.runtime.device import get_rocm_arch
 
 from .kernels.jagged_dense_bmm_gen import BLOCK_M, jagged_dense_bmm
 from .kernels.jdbba_skew_tile_map import build_tile_map_device_fused
 
 __all__ = [
-    "clear_skew_tile_map_cache",
     "jagged_dense_bmm_dispatched",
     "resolve_config",
     "shape_id",
@@ -35,7 +35,6 @@ SKEW_COMPACT_MAX_GROUPS = 4096
 SKEW_COMPACT_XCD_C = 32
 SKEW_COMPACT_XCD_W = 8
 _SKEW_COMPACT_ENV = "FLYDSL_JDBBA_SKEW_COMPACT"
-_TILE_MAP_CACHE: dict[int, tuple] = {}
 
 _SCHEMA_DEFAULTS = {
     "xcd_c": None,
@@ -106,8 +105,30 @@ def _coerce(v):
     return int(v)
 
 
-def clear_skew_tile_map_cache() -> None:
-    _TILE_MAP_CACHE.clear()
+def _packed_rows(jagged) -> int:
+    """Host upper bound on ``seq_offsets[-1]``.
+
+    ``A.shape[0]`` is the packed length, or larger when ``A`` is
+    over-allocated. Rows past the true end stay TILE_MAP sentinels.
+    """
+    rows = int(jagged.shape[0])
+    if rows <= 0:
+        raise ValueError(
+            f"packed jagged rows must be a positive host extent, got {rows}"
+        )
+    return rows
+
+
+def _as_torch_stream(stream, device):
+    """One torch stream for the prep fills, the prep kernel, and the GEMM."""
+    if stream is None:
+        return torch.cuda.current_stream(device)
+    raw = stream.value if isinstance(stream, fx.Stream) else stream
+    if raw is None:
+        return torch.cuda.current_stream(device)
+    if hasattr(raw, "cuda_stream"):
+        return raw
+    raise TypeError(f"unsupported stream {stream!r}")
 
 
 def _skew_compact_enabled(*, uniform_seqlen: bool, n_groups: int) -> bool:
@@ -126,30 +147,6 @@ def _skew_compact_xcd(n_groups: int, reduction_k: int) -> tuple[int | None, int 
     if n_groups > _SKEW_XCD_REMAP_SMALL_B_THRESHOLD or reduction_k >= 512:
         return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
     return None, None
-
-
-def _get_skew_tile_map(seq_offsets, n_groups: int, max_seq_len: int, block_m: int):
-    key = seq_offsets.data_ptr()
-    hit = _TILE_MAP_CACHE.get(key)
-    if (
-        hit is not None
-        and hit[0]() is seq_offsets
-        and hit[1] == block_m
-        and hit[4] == max_seq_len
-    ):
-        return hit[2], hit[3]
-    L = int(seq_offsets[-1].item())
-    tile_map, ub = build_tile_map_device_fused(
-        seq_offsets, n_groups, L, max_seq_len, block_m=block_m
-    )
-    _TILE_MAP_CACHE[key] = (
-        weakref.ref(seq_offsets),
-        block_m,
-        tile_map,
-        ub,
-        max_seq_len,
-    )
-    return tile_map, ub
 
 
 def _normalize_cfg(cfg: dict) -> dict:
@@ -248,13 +245,21 @@ def jagged_dense_bmm_dispatched(
         block_k=block_k,
     )
 
-    import flydsl.expr as fx
-
-    if stream is None:
-        stream = fx.Stream(None)
+    # Prep and the GEMM share this queue. A per-call TILE_MAP allocated on it
+    # stays live until that queue finishes, including after this function returns.
+    stream = _as_torch_stream(stream, SEQ_OFFSETS.device)
 
     if _skew_compact_enabled(uniform_seqlen=uniform_seqlen, n_groups=n_groups):
-        tile_map, ub = _get_skew_tile_map(SEQ_OFFSETS, n_groups, max_seq_len, BLOCK_M)
+        # Rebuild every call. The map bakes seq_start/seq_end, so an in-place
+        # rewrite of SEQ_OFFSETS must not reuse a previous map.
+        tile_map, ub = build_tile_map_device_fused(
+            SEQ_OFFSETS,
+            n_groups,
+            _packed_rows(A),
+            max_seq_len,
+            block_m=BLOCK_M,
+            stream=stream,
+        )
         sc_xcd_c, sc_xcd_w = _skew_compact_xcd(n_groups, reduction_k)
         return jagged_dense_bmm(
             C,

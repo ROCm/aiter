@@ -15,7 +15,6 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
     _load_dispatch_table,
-    clear_skew_tile_map_cache,
     jagged_dense_bmm_dispatched,
     resolve_config,
     shape_id,
@@ -118,8 +117,6 @@ def test_jdbba(B, D, Kout, Mi, regime, dtype):
     L, N, K = d["L"], d["N"], d["K"]
     uniform = regime == "uniform"
     st = torch.cuda.current_stream()
-    if not uniform:
-        clear_skew_tile_map_cache()
 
     ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], N, dtype)
 
@@ -208,7 +205,6 @@ def test_jdbba_block_k(B, D, Kout, Mi, block_k, dtype):
 
 @benchmark()
 def test_jdbba_skew_varying_L(B, D, Kout, Mi, seed, dtype):
-    clear_skew_tile_map_cache()
     d = _build_inputs(
         B,
         D,
@@ -308,6 +304,40 @@ def test_jdbba_dispatch(B, D, Kout, Mi):
         "flydsl TB/s": nbytes / us / 1e6,
         "flydsl err": err,
     }
+
+
+def _resegment_same_L(seq_offsets):
+    """Rewrite group bounds in place without changing the total length."""
+    ends = seq_offsets.detach().to("cpu")
+    lengths = ends[1:] - ends[:-1]
+    rev = torch.flip(lengths, dims=[0])
+    if torch.equal(rev, lengths):
+        rev = torch.roll(lengths, 1)
+    if torch.equal(rev, lengths):
+        raise AssertionError("could not build a distinct same-L segmentation")
+    out = torch.zeros_like(ends)
+    out[1:] = torch.cumsum(rev, 0)
+    if int(out[-1]) != int(ends[-1]):
+        raise AssertionError("same-L rewrite changed the total length")
+    seq_offsets.copy_(out.to(device=seq_offsets.device, dtype=seq_offsets.dtype))
+
+
+def _shorten_offsets(seq_offsets):
+    """Rewrite group bounds in place so the packed length shrinks."""
+    ends = seq_offsets.detach().to("cpu")
+    lengths = ends[1:] - ends[:-1]
+    short = torch.div(lengths, 2, rounding_mode="floor")
+    if int(short.sum()) >= int(lengths.sum()):
+        positive = (lengths > 0).nonzero()
+        if positive.numel() == 0:
+            raise AssertionError("skew offsets have no rows to shorten")
+        short = lengths.clone()
+        short[int(positive[-1])] = 0
+    if int(short.sum()) >= int(lengths.sum()):
+        raise AssertionError("shorter rewrite did not shrink L")
+    out = torch.zeros_like(ends)
+    out[1:] = torch.cumsum(short, 0)
+    seq_offsets.copy_(out.to(device=seq_offsets.device, dtype=seq_offsets.dtype))
 
 
 def _reuse_pair(B, Mi, regime):
@@ -444,6 +474,138 @@ def test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype):
         "flydsl TB/s": nbytes / us / 1e6,
         "flydsl err": err,
         "new_launchers": len(_LAUNCHER_CACHE) - n_launchers,
+    }
+
+
+def _skew_once(B, D, Kout, Mi, dtype, seq_offsets, stream, msg):
+    d = _build_inputs(
+        B, D, Kout, Mi, "skew", dtype, seq_offsets=seq_offsets, pad_rows=False
+    )
+    ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], d["N"], dtype)
+
+    def _flydsl():
+        jagged_dense_bmm_dispatched(
+            d["tC"],
+            d["tA"],
+            d["dense_tall"],
+            d["bias_flat"],
+            d["seq_offsets"],
+            B,
+            Mi,
+            stream=stream,
+            uniform_seqlen=False,
+        )
+        return d["out"]
+
+    got = _flydsl()
+    err = assertAllclose(
+        ref.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg=msg,
+    )
+    return d, ref, err
+
+
+@benchmark()
+def test_jdbba_tile_map_inplace(B, D, Kout, Mi, dtype):
+    """In-place seq_offsets updates must rebuild TILE_MAP.
+
+    The same storage is rewritten twice: once with a new segmentation of the
+    same packed length, then with a shorter length. C is exactly (L, N). A
+    side stream checks that the prep and the GEMM share the caller's queue.
+    """
+    seq = _make_seq_offsets(B, Mi, "skew")
+    st = torch.cuda.current_stream()
+    _skew_once(B, D, Kout, Mi, dtype, seq, st, "tile map initial")
+
+    _resegment_same_L(seq)
+    _, _, same_err = _skew_once(
+        B, D, Kout, Mi, dtype, seq, st, "tile map same-L rewrite"
+    )
+
+    _shorten_offsets(seq)
+    shorter, ref_short, _ = _skew_once(
+        B, D, Kout, Mi, dtype, seq, st, "tile map shorter L"
+    )
+    L2, N2, K2 = shorter["L"], shorter["N"], shorter["K"]
+
+    side = torch.cuda.Stream()
+    side_seq = _make_seq_offsets(B, Mi, "skew", seed=SEED + 7)
+    with torch.cuda.stream(side):
+        side_inputs = _build_inputs(
+            B,
+            D,
+            Kout,
+            Mi,
+            "skew",
+            dtype,
+            seq_offsets=side_seq,
+            pad_rows=False,
+        )
+        side_ref = run_torch(
+            side_inputs["jagged"],
+            side_inputs["dense"],
+            side_inputs["bias"],
+            side_inputs["seq_offsets"],
+            side_inputs["N"],
+            dtype,
+        )
+        jagged_dense_bmm_dispatched(
+            side_inputs["tC"],
+            side_inputs["tA"],
+            side_inputs["dense_tall"],
+            side_inputs["bias_flat"],
+            side_inputs["seq_offsets"],
+            B,
+            Mi,
+            stream=side,
+            uniform_seqlen=False,
+        )
+    side.synchronize()
+    assertAllclose(
+        side_ref.to(dtypes.fp32),
+        side_inputs["out"].to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="tile map side stream",
+    )
+
+    def _shorter():
+        jagged_dense_bmm_dispatched(
+            shorter["tC"],
+            shorter["tA"],
+            shorter["dense_tall"],
+            shorter["bias_flat"],
+            shorter["seq_offsets"],
+            B,
+            Mi,
+            stream=st,
+            uniform_seqlen=False,
+        )
+        return shorter["out"]
+
+    got, us = run_perftest(_shorter)
+    err = checkAllclose(
+        ref_short.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="tile map shorter L timed",
+    )
+    flops = 2 * L2 * K2 * N2
+    nbytes = (L2 * K2 + B * K2 * N2 + B * N2 + L2 * N2) * shorter[
+        "jagged"
+    ].element_size()
+    return {
+        "gfx": get_gfx(),
+        "L": L2,
+        "flydsl us": us,
+        "flydsl TFLOPS": flops / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": err,
+        "same_L err": same_err,
     }
 
 
@@ -603,6 +765,14 @@ def main():
     ):
         rows.append(test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype))
     _summarize("jagged_dense_bmm launcher reuse", rows)
+
+    rows = [
+        test_jdbba_tile_map_inplace(B, D, Kout, Mi, dtype)
+        for dtype, (B, D, Kout, Mi) in itertools.product(
+            args.dtype, args.regression_shapes
+        )
+    ]
+    _summarize("jagged_dense_bmm tile map inplace", rows)
 
 
 if __name__ == "__main__":

@@ -100,16 +100,22 @@ def _launch_fused(
 def build_tile_map_device_fused(
     seq_offsets, n_groups, L, max_seq_len, block_m=128, stream=None
 ):
-    """Build TILE_MAP on device. Returns ``(tile_map, upper_bound)``."""
+    """Build TILE_MAP on device. Returns ``(tile_map, upper_bound)``.
+
+    ``L`` is a host upper bound on ``seq_offsets[-1]`` (the packed row count).
+    Sentinel rows and the prep kernel run on ``stream`` so the caller can
+    launch the GEMM on that same queue without a host sync.
+    """
     bm_tiles = (max_seq_len + block_m - 1) // block_m
     ub = upper_bound_tiles(L, n_groups, block_m)
-    tile_map = torch.empty((ub, 4), dtype=torch.int32, device=seq_offsets.device)
-    tile_map[:, 0] = 0
-    tile_map[:, 1] = bm_tiles
-    tile_map[:, 2] = 0
-    tile_map[:, 3] = 0
-    st = torch.cuda.current_stream() if stream is None else stream
-    _launch_fused(seq_offsets, tile_map, int(n_groups), int(block_m), stream=st)
+    st = torch.cuda.current_stream(seq_offsets.device) if stream is None else stream
+    with torch.cuda.stream(st):
+        tile_map = torch.empty((ub, 4), dtype=torch.int32, device=seq_offsets.device)
+        tile_map[:, 0] = 0
+        tile_map[:, 1] = bm_tiles
+        tile_map[:, 2] = 0
+        tile_map[:, 3] = 0
+        _launch_fused(seq_offsets, tile_map, int(n_groups), int(block_m), stream=st)
     return tile_map, ub
 
 
