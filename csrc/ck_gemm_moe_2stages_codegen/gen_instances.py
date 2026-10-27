@@ -466,12 +466,23 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
+        // CK needs inter_dim to be a multiple of KPerBlock. Use KPerBlock=128
+        // when inter_dim is not a multiple of 256, such as 384.
+        constexpr int k_default = 256/sizeof({A0DataType});
+        constexpr int k_half    = 128/sizeof({A0DataType});
+        const bool use_k128 = inter_dim % k_default != 0;
+        TORCH_CHECK(
+            !use_k128 || inter_dim % k_half == 0,
+            "moe stage2: no CK instance for inter_dim=", inter_dim,
+            " (needs a multiple of ", k_half, ")");
         if (block_m == 32)
         {{
+            if (use_k128) return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
         else if (block_m == 64)
         {{
+            if (use_k128) return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
         else if (block_m == 128)
