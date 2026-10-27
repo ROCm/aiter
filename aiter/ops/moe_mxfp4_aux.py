@@ -128,18 +128,16 @@ class _MissingMxfp4MoeAuxInstances(RuntimeError):
             "module_moe_mxfp4_aux is missing generated instances: "
             + ", ".join(self.missing_keys)
             + ". Add support in moe_aux/codegen/gen_instances.py if needed, "
-            "then rerun this preparation in a fresh process with AITER_REBUILD=1 "
-            "before launching tuning workers."
+            "then rebuild the module in a fresh process with AITER_REBUILD=1."
         )
 
 
 def prepare_mxfp4_moe_aux(shapes: "Iterable[tuple[int, int, int, int]]") -> None:
-    """Load/build and verify the BM16 sort instances before tuning workers start.
+    """Load/build the module and verify the BM16 sort instances for ``shapes``.
 
     ``shapes`` contains (expert, model_dim, inter_dim, topk) tuples. Instances
-    depend on the auxiliary key, so a new inter_dim can reuse compiled support
-    without adding a model whitelist to the tuner. An existing stale module
-    must be regenerated and rebuilt in a fresh process before workers launch.
+    depend on the auxiliary key, so a new inter_dim can reuse compiled support.
+    An existing stale module must be regenerated and rebuilt in a fresh process.
     """
     keys = {(int(ne), int(h), int(topk)) for ne, h, _inter, topk in shapes}
     missing = []

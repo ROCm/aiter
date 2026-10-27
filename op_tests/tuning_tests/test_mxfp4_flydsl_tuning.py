@@ -3,10 +3,8 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -71,316 +69,62 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
         self.tuner.keys = KEYS
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.isolated = mock.patch.object(
-            self.module, "_run_shapes_isolated", side_effect=self.cpu_workers
-        )
-        self.isolated.start()
-        self.addCleanup(self.isolated.stop)
-
-    def cpu_workers(self, payloads, _mp_num, _ctx):
-        with mock.patch.object(torch.cuda, "set_device"):
-            return [
-                self.module._mxfp4_tune_shape_worker((*payload[:3], 0))
-                for payload in payloads
-            ]
 
     def read_rows(self, rows: list[dict[str, Any]]) -> pd.DataFrame:
         path = Path(self.directory.name) / "input.csv"
         pd.DataFrame(rows).to_csv(path, index=False)
         return self.tuner.get_untuned_gemm_list(str(path))
 
-    def test_parent_prepares_only_generated_sort_rows_before_shape_workers(
+    def test_tune_rejects_rows_that_are_not_a4w4_before_any_shape_work(
         self,
     ) -> None:
-        from aiter.ops import moe_mxfp4_aux
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
-
-        rows = pd.DataFrame(
-            [
-                shape_row(
-                    token=1,
-                    expert=128,
-                    model_dim=3072,
-                    inter_dim=512,
-                    topk=4,
-                    q_dtype_a="torch.float8_e4m3fn",
-                ),
-                shape_row(
-                    token=1,
-                    expert=128,
-                    model_dim=3072,
-                    inter_dim=1536,
-                    topk=4,
-                    q_dtype_a="torch.float8_e4m3fn",
-                ),
-                shape_row(
-                    token=64,
-                    expert=128,
-                    model_dim=3072,
-                    inter_dim=512,
-                    topk=4,
-                    q_dtype_a="torch.float8_e4m3fn",
-                ),
-            ]
-        )
-        args = SimpleNamespace(
-            run_config=False, compare=False, mxfp4_search_mode="full"
-        )
-        observed = []
-
-        def prepare(_self: Any, _args: argparse.Namespace) -> None:
-            _self.untunedf = rows
-
-        with mock.patch.object(FmoeTuner, "pre_process", prepare), mock.patch.object(
-            moe_mxfp4_aux,
-            "prepare_mxfp4_moe_aux",
-            lambda shapes: observed.extend(shapes),
-        ):
-            self.tuner.pre_process(args)
-        self.assertEqual(observed, [(128, 3072, 512, 4), (128, 3072, 1536, 4)])
-
-    def test_run_config_leaves_auxiliary_preparation_to_production(self) -> None:
-        from aiter.ops import moe_mxfp4_aux
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
-
-        with mock.patch.object(
-            FmoeTuner, "pre_process", lambda *_: None
-        ), mock.patch.object(
-            moe_mxfp4_aux,
-            "prepare_mxfp4_moe_aux",
-            side_effect=AssertionError("run_config must not prepare tune workers"),
-        ):
-            self.tuner.pre_process(SimpleNamespace(run_config=True, compare=False))
-
-    def test_fast_scan_rejects_a8w4_rows_before_auxiliary_preparation(
-        self,
-    ) -> None:
-        from aiter.ops import moe_mxfp4_aux
-        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
-
-        rows = self.read_rows([shape_row(), shape_row(q_dtype_a="torch.float8_e4m3fn")])
-        args = SimpleNamespace(
-            run_config=False,
-            compare=False,
-            fast_scan=True,
-            mxfp4_search_mode=None,
-            timeout=0,
-            mp=1,
-            errRatio=0.1,
-            profile_file="",
-        )
-
-        def prepare(_self: Any, _args: argparse.Namespace) -> None:
-            _self.untunedf = rows
-
-        rejected = r"row 3: --fast-scan supports A4W4 rows only, got A8W4"
-        with mock.patch.object(FmoeTuner, "pre_process", prepare), mock.patch.object(
-            moe_mxfp4_aux,
-            "prepare_mxfp4_moe_aux",
-            side_effect=AssertionError("A8W4 fast scan prepared auxiliary kernels"),
-        ), self.assertRaisesRegex(ValueError, rejected):
-            self.tuner.pre_process(args)
-        with mock.patch.object(
-            self.module,
-            "_run_shapes_isolated",
-            side_effect=AssertionError("A8W4 fast scan started a shape worker"),
-        ), self.assertRaisesRegex(ValueError, rejected):
-            self.tuner.tune(rows, pd.DataFrame(), args)
-        # A4W4 rows and ordinary A8W4 searches pass the guard.
-        a4_only = [row for _, row in rows.iloc[:1].iterrows()]
-        self.tuner._reject_fast_scan_a8w4(a4_only, args)
-        args.fast_scan = False
-        self.tuner._reject_fast_scan_a8w4([row for _, row in rows.iterrows()], args)
-
-    def test_mixed_rows_use_their_own_precision_and_default_search(self) -> None:
-        rows = self.read_rows([shape_row(), shape_row(q_dtype_a="torch.float8_e4m3fn")])
-        a4, a8 = [row.to_dict() for _, row in rows.iterrows()]
-        a4_default = self.tuner._candidate_rows(a4)
-        a8_default = self.tuner._candidate_rows(a8)
-        self.assertTrue(a4_default)
-        self.assertTrue(a8_default)
-        self.assertEqual({c["block_m"] for c in a4_default}, {16})
-        self.assertEqual({c["block_m"] for c in a8_default}, {16, 32, 64, 128})
-        self.assertLess(
-            len(a4_default), len(self.tuner._candidate_rows(a4, full_search=True))
-        )
-        self.assertEqual(a8_default, self.tuner._candidate_rows(a8, full_search=True))
-        for candidate in a8_default:
-            g1 = self.module._parse_mxfp4_g1_kname(candidate["kernelName1"])
-            g2 = self.module.parse_flydsl_v2_gemm2_kernel(candidate["kernelName2"])
-            self.assertEqual((g1["a_dtype"], g1["out_dtype"]), ("fp8", "fp8"))
-            self.assertEqual(
-                (g2["a_dtype"], g2["b_dtype"], g2["out_dtype"]),
-                ("fp8", "fp4", "bf16"),
+        args = SimpleNamespace(mp=1)
+        for column in ("q_dtype_a", "q_dtype_w"):
+            rows = self.read_rows(
+                [shape_row(), shape_row(token=2, **{column: "torch.float8_e4m3fn"})]
             )
-            self.assertEqual(g1["BM"], g2["tile_m"])
-            self.assertEqual(g1["BM"], g2["sort_block_m"])
-            self.assertEqual(g1["inline_quant"], g1["BM"] == 16)
-            self.assertNotEqual(g1["BN"], 64)
-            self.assertEqual(g1["num_waves"], 4)
-            self.assertFalse(g2["persist"])
-
-    def test_invalid_csv_reports_the_original_row_and_reason(self) -> None:
-        invalid = (
-            ({"dtype": "torch.float16"}, "dtype"),
-            ({"q_dtype_a": "torch.bfloat16"}, "activation dtype"),
-            ({"q_dtype_a": "torch.float8_e4m3fnuz"}, "activation dtype"),
-            ({"q_dtype_w": "torch.float8_e4m3fn"}, "weight dtype"),
-            ({"q_type": "QuantType.per_Token"}, "quantization"),
-            ({"act_type": "ActivationType.Gelu"}, "activation"),
-            ({"use_g1u1": False}, "use_g1u1"),
-            ({"doweight_stage1": True}, "doweight_stage1"),
-            ({"token": 0}, "token"),
-            ({"model_dim": 1024.5}, "model_dim"),
-            ({"inter_dim": -128}, "inter_dim"),
-            ({"expert": 0}, "expert"),
-            ({"topk": 5}, "topk"),
-            ({"gfx": "gfx942"}, "gfx"),
-        )
-        for changes, reason in invalid:
-            # A repeated first shape must not erase the source CSV line.
-            with self.subTest(changes=changes), self.assertRaisesRegex(
-                ValueError, rf"row 4.*{reason}"
-            ):
-                self.read_rows([shape_row(), shape_row(), shape_row(**changes)])
-
-    def test_missing_required_column_reports_the_input_file(self) -> None:
-        row = shape_row()
-        del row["q_dtype_a"]
-        with self.assertRaisesRegex(ValueError, r"input.csv.*q_dtype_a"):
-            self.read_rows([row])
-
-    def test_retune_filters_architecture_before_validating_target_rows(self) -> None:
-        foreign = shape_row(gfx="gfx942", cu_num=304, act_type="ActivationType.Gelu")
-        other_cu = shape_row(cu_num=128, dtype="torch.float16")
-        path = Path(self.directory.name) / "shared.csv"
-        original = pd.DataFrame([foreign, shape_row(), other_cu])
-        original.to_csv(path, index=False)
-        args = SimpleNamespace(
-            untune_file=str(path), tune_file=str(path), verbose=False
-        )
+            rejected = r"row 3 \(.*torch.float8_e4m3fn.*\): --mxfp4-flydsl tunes A4W4 rows only"
+            with self.subTest(column=column), mock.patch.object(
+                self.module.Mxfp4FlydslTuner,
+                "_tune_one_shape",
+                side_effect=AssertionError("a shape was tuned before the check"),
+            ), self.assertRaisesRegex(ValueError, rejected):
+                self.tuner.tune(rows, pd.DataFrame(), args)
+        rows = self.read_rows([shape_row(), shape_row(token=2)])
         with mock.patch.object(
-            self.tuner, "get_gfx", return_value="gfx950"
-        ), mock.patch.object(self.tuner, "get_cu_num", return_value=256):
-            self.tuner.get_retune_gemm_list(args)
-        self.assertEqual(self.tuner.untunedf["gfx"].tolist(), ["gfx950"])
-        self.assertEqual(self.tuner.untunedf["cu_num"].tolist(), [256])
-        pd.testing.assert_frame_equal(
-            self.tuner.tunedf.reset_index(drop=True),
-            original.iloc[[0, 2]].reset_index(drop=True),
-        )
-
-    def test_retune_validates_original_csv_line_for_target_rows(self) -> None:
-        for invalid, reason in (
-            ({"act_type": "ActivationType.Gelu"}, "activation"),
-            ({"q_dtype_a": "torch.float16"}, "activation dtype"),
+            self.module.Mxfp4FlydslTuner,
+            "_tune_one_shape",
+            side_effect=lambda row, _args: row["token"],
         ):
-            path = Path(self.directory.name) / "shared.csv"
-            pd.DataFrame(
-                [
-                    shape_row(gfx="gfx942", cu_num=304),
-                    shape_row(),
-                    shape_row(),
-                    shape_row(**invalid),
-                ]
-            ).to_csv(path, index=False)
-            args = SimpleNamespace(
-                untune_file=str(path), tune_file=str(path), verbose=False
-            )
-            with self.subTest(invalid=invalid), mock.patch.object(
-                self.tuner, "get_gfx", return_value="gfx950"
-            ), mock.patch.object(
-                self.tuner, "get_cu_num", return_value=256
-            ), self.assertRaisesRegex(
-                ValueError, rf"shared.csv: row 5.*{reason}"
-            ):
-                self.tuner.get_retune_gemm_list(args)
+            self.assertEqual(self.tuner.tune(rows, pd.DataFrame(), args), [1, 2])
 
-    def test_retune_separate_input_normalizes_keys_before_removing_old_results(
-        self,
-    ) -> None:
-        path = Path(self.directory.name) / "input.csv"
-        original = pd.DataFrame([shape_row(token=1), shape_row(token=2)])
-        pd.DataFrame(
-            [
-                shape_row(gfx="gfx942", cu_num=304),
-                shape_row(act_type="silu", q_dtype_a="fp4x2"),
-            ]
-        ).to_csv(path, index=False)
-        args = SimpleNamespace(
-            untune_file=str(path),
-            tune_file=str(Path(self.directory.name) / "output.csv"),
-            verbose=False,
-        )
-        with mock.patch.object(
-            self.tuner, "get_gfx", return_value="gfx950"
-        ), mock.patch.object(
-            self.tuner, "get_cu_num", return_value=256
-        ), mock.patch.object(
-            self.tuner, "get_tuned_gemm_list", return_value=original
+    def test_g1_names_carry_activation_and_output_precision(self) -> None:
+        kname = self.module.Mxfp4FlydslTuner._g1_kname
+        for kwargs, expected in (
+            ({}, "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt"),
+            (
+                {"a_dtype": "fp8", "out_dtype": "fp8"},
+                "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out",
+            ),
+            (
+                {"a_dtype": "fp8", "out_dtype": "fp4"},
+                "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt",
+            ),
         ):
-            self.tuner.get_retune_gemm_list(args)
-        self.assertEqual(self.tuner.tunedf["token"].tolist(), [2])
-        self.assertEqual(
-            self.tuner.untunedf["q_dtype_a"].tolist(), [shape_row()["q_dtype_a"]]
+            with self.subTest(**kwargs):
+                name = kname(16, True, True, bn=128, **kwargs)
+                self.assertEqual(name, expected)
+                parsed = self.module._parse_mxfp4_g1_kname(name)
+                self.assertEqual(
+                    (parsed["a_dtype"], parsed["out_dtype"]),
+                    (kwargs.get("a_dtype", "fp4"), kwargs.get("out_dtype", "fp4")),
+                )
+        name = kname(
+            32, False, False, act="swiglu", k_wave=2, a_dtype="fp8", out_dtype="fp8"
         )
-
-    def test_explicit_search_mode_is_used_in_serial_and_spawned_workers(self) -> None:
-        a8 = self.read_rows([shape_row(token=64, q_dtype_a="torch.float8_e4m3fn")])
-        for mode in (None, "prune", "full"):
-            args = SimpleNamespace(
-                mxfp4_search_mode=mode,
-                timeout=0,
-                mp=1,
-                errRatio=0.1,
-                profile_file="",
-            )
-
-            # Substitute only the GPU evaluation boundary. Real candidate
-            # generation and the shape worker still run in both paths.
-            def evaluate(
-                _self: Any,
-                row: dict[str, Any],
-                candidate: dict[str, Any],
-                _args: argparse.Namespace,
-            ) -> float:
-                candidate["us"] = 128.0 / candidate["block_m"]
-                candidate["error"] = 0.0
-                return candidate["us"]
-
-            with self.subTest(mode=mode), mock.patch.object(
-                self.module.Mxfp4FlydslTuner, "_run_candidate", evaluate
-            ), mock.patch.object(torch.cuda, "device_count", return_value=2):
-                serial = self.tuner.tune(a8, pd.DataFrame(), args)[0]
-                args.mp = 2
-                # Two distinct workloads exercise the shape worker branch.
-                mp_rows = pd.concat([a8, a8.assign(token=65)], ignore_index=True)
-
-                def isolated(
-                    payloads: list[tuple], _mp_num: int, _ctx: Any
-                ) -> list[dict[str, Any] | None]:
-                    with mock.patch.object(torch.cuda, "set_device"):
-                        return [
-                            self.module._mxfp4_tune_shape_worker((*payload[:3], 0))
-                            for payload in payloads
-                        ]
-
-                with mock.patch.object(self.module, "_run_shapes_isolated", isolated):
-                    spawned = self.tuner.tune(mp_rows, pd.DataFrame(), args)[0]
-                self.assertEqual(serial["kernelName1"], spawned["kernelName1"])
-                self.assertEqual(serial["kernelName2"], spawned["kernelName2"])
-                expected_bm = 64 if mode == "prune" else 128
-                self.assertEqual(serial["block_m"], expected_bm)
-
-    def test_cli_preserves_an_omitted_mode_and_explicit_overrides(self) -> None:
-        tuner = self.module.Mxfp4FlydslTuner("test", KEYS, [])
-        for mode in (None, "full", "staged"):
-            argv = ["gemm_moe_tune.py", "--mxfp4-flydsl", "--mp", "1"]
-            if mode is not None:
-                argv.extend(["--mxfp4-search-mode", mode])
-            with self.subTest(mode=mode), mock.patch.object(sys, "argv", argv):
-                args = tuner.parse_args()
-                self.assertEqual(args.mxfp4_search_mode, mode)
+        self.assertEqual(name, "flydsl_mxmoe_g1_a8w4_32x256x256_fp8out_swiglu_kw2")
+        parsed = self.module._parse_mxfp4_g1_kname(name)
+        self.assertEqual((parsed["act"], parsed["k_wave"]), ("swiglu", 2))
 
     def test_full_search_keeps_only_the_coupled_shape_support_domain(self) -> None:
         unsupported = (
@@ -390,7 +134,7 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
             {"inter_dim": 64},  # GEMM1 alone can emit this; GEMM2 cannot.
         )
         for changes in unsupported:
-            row = shape_row(q_dtype_a="torch.float8_e4m3fn", **changes)
+            row = shape_row(**changes)
             candidates = self.tuner._candidate_rows(row, full_search=True)
             if changes == {"model_dim": 768}:
                 self.assertTrue(candidates)
@@ -403,25 +147,6 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
                 )
             else:
                 self.assertFalse(candidates, changes)
-
-    def test_scatter_candidates_require_the_matching_generated_auxiliary_key(
-        self,
-    ) -> None:
-        for hidden, topk, expected in (
-            (1024, 2, {"atomic", "reduce"}),
-            (3072, 4, {"atomic", "reduce", "scatter"}),
-        ):
-            # Expert/inter_dim do not participate in the scatter aux key.
-            row = shape_row(
-                model_dim=hidden, topk=topk, q_dtype_a="torch.float8_e4m3fn"
-            )
-            candidates = self.tuner._candidate_rows(row, full_search=True)
-            epilogs = {
-                self.module.parse_flydsl_v2_gemm2_kernel(c["kernelName2"])["epilog"]
-                for c in candidates
-                if c["block_m"] == 128
-            }
-            self.assertEqual(epilogs, expected)
 
     def test_bm16_aot_jobs_use_the_same_native_scale_contract_for_both_precisions(
         self,
@@ -640,59 +365,6 @@ class TestMxfp4FlydslInputsAndCandidates(unittest.TestCase):
                     fm._flydsl_stage1_wrapper if has_bias else fm._mxfp4_a4w4_stage1_fw,
                 )
         fm.get_2stage_cfgs.cache_clear()
-
-    def test_bm16_a8_candidates_reach_the_persisted_winner_and_profile(self) -> None:
-        row = self.read_rows([shape_row(token=64, q_dtype_a="torch.float8_e4m3fn")])
-        result_columns = [
-            "block_m",
-            "ksplit",
-            "us1",
-            "kernelName1",
-            "err1",
-            "us2",
-            "kernelName2",
-            "err2",
-            "us",
-            "run_1stage",
-            "xbf16",
-            "flat",
-            "tflops",
-            "bw",
-        ]
-        tuner = self.module.Mxfp4FlydslTuner("test", KEYS, result_columns)
-        args = SimpleNamespace(
-            mxfp4_search_mode="full",
-            timeout=0,
-            mp=1,
-            errRatio=0.1,
-            profile_file=str(Path(self.directory.name) / "profile.csv"),
-            tune_file=str(Path(self.directory.name) / "winner.csv"),
-        )
-
-        def evaluate(
-            _self: Any, _row: Any, candidate: dict[str, Any], _args: argparse.Namespace
-        ) -> float:
-            candidate["error"] = 0.01
-            candidate["us"] = float(candidate["block_m"])
-            return candidate["us"]
-
-        with mock.patch.object(
-            self.module.Mxfp4FlydslTuner, "_run_candidate", evaluate
-        ), mock.patch.object(torch.cuda, "device_count", return_value=0):
-            results = tuner.tune(row, pd.DataFrame(), args)
-        processed = tuner.post_process(results, args)
-        path = Path(self.directory.name) / "winner.csv"
-        tuner.result_to_csv(processed, str(path))
-        saved = pd.read_csv(path)
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(saved.iloc[0]["block_m"], 16)
-        g1 = self.module._parse_mxfp4_g1_kname(saved.iloc[0]["kernelName1"])
-        self.assertEqual(
-            (g1["a_dtype"], g1["out_dtype"], g1["inline_quant"]), ("fp8", "fp8", True)
-        )
-        profile = pd.read_csv(args.profile_file)
-        self.assertTrue((profile["block_m"] == 16).any())
-        self.assertEqual(set(profile["precision"]), {"A8W4"})
 
 
 if __name__ == "__main__":

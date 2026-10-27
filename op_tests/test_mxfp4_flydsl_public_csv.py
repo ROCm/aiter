@@ -1,6 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Execute actual tuned CSV rows through public fused_moe with explicit A8W4."""
+r"""Execute actual tuned CSV rows through public fused_moe with explicit A8W4.
+
+Validate a tuned CSV on one GPU (pick it with ``HIP_VISIBLE_DEVICES``)::
+
+    AITER_CONFIG_FMOE=/absolute/path/to/tuned.csv \
+      AITER_ONLINE_TUNE=0 AITER_BYPASS_TUNE_CONFIG=0 \
+      AITER_FLYDSL_STAGE2_FP8=0 AITER_MXFP4_INTERMEDIATE=0 \
+      python op_tests/test_mxfp4_flydsl_public_csv.py \
+        --csv /absolute/path/to/tuned.csv --rows 0 1 2 \
+        --report /absolute/path/to/public_report.json
+
+The harness passes explicit FP8 activation/intermediate, INTERLEAVE W1, BF16
+output, Situv2 4/25 and the resolved Swiglu limit. It observes and delegates
+real stage calls, checks live FP8 payload plus E8M0 scales, output identity,
+finite values and amplitude-sensitive error. A skipped/fallback pair is
+reported separately and returns nonzero. ``--rows`` uses zero-based data rows.
+Each report preserves the requested row/pair, the same CSV's primary lookup
+row/token/pair and actual observed G1/G2. For M=3 the public key is M=4; a
+correct row4 execution is counted as padded token coverage and does not claim
+that an unused standalone row3 winner was executed. Large-token tiers follow
+the same runtime mapping, including smaller-tier lookup when applicable.
+"""
 
 from __future__ import annotations
 

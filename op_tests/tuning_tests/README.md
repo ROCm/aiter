@@ -11,7 +11,6 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
-| `test_mxfp4_flydsl_results.py` | 1 | No | Coupled CSV tuning: finite winner, candidate profile, failures, isolated worker exits, SIGALRM and resume |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
@@ -150,13 +149,12 @@ The MXMOE CPU tests use a scoped host environment and run without visible GPUs:
 ```bash
 HIP_VISIBLE_DEVICES='' ROCR_VISIBLE_DEVICES='' \
 python3 -m pytest -q op_tests/tuning_tests/test_mxfp4_flydsl_tuning.py \
-  op_tests/tuning_tests/test_mxfp4_flydsl_results.py \
   op_tests/tuning_tests/test_mxfp4_cpu_test_isolation.py \
   op_tests/tuning_tests/test_mxfp4_moe_aux_codegen.py \
   op_tests/tuning_tests/test_public_a8w4_csv_lookup.py
 ```
 
-Collection imports no aiter GPU modules for the input/results tests. Execution
+Collection imports no aiter GPU modules for these tests. Execution
 uses the installed aiter host extension for enum types and the installed Python
 dependencies (torch, Triton, FlyDSL). The scoped environment supplies gfx950
 metadata, permits older system Triton only for these host checks, and rejects
