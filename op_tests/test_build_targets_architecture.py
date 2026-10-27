@@ -34,6 +34,8 @@ class TestBuildTargetArchitecture(unittest.TestCase):
             "gfx1103": [12],
             "gfx1150": [16, 12],
             "gfx1151": [40],
+            "gfx1170": [4],
+            "gfx1171": [4],
             "gfx1200": [32, 28],
             "gfx1201": [64],
         }
