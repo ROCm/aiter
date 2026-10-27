@@ -74,6 +74,8 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "SPLIT_UNMASKED_LOOP",
         "K_WIDTH",
+        "HEAD_SIZE_LO",
+        "HEAD_SIZE_HI",
     ],
 )
 
@@ -132,10 +134,20 @@ def kernel_unified_attention_2d(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    HEAD_SIZE_LO: tl.constexpr = 0,  # int, first QK head chunk; 0 = one padded chunk
+    HEAD_SIZE_HI: tl.constexpr = 0,  # int, HEAD_SIZE - HEAD_SIZE_LO
 ):
     tl.static_assert(
         not (SPLIT_UNMASKED_LOOP and SHUFFLED_KV_CACHE),
         "SPLIT_UNMASKED_LOOP is incompatible with SHUFFLED_KV_CACHE",
+    )
+    tl.static_assert(
+        not (HEAD_SIZE_LO > 0 and SHUFFLED_KV_CACHE),
+        "HEAD_SIZE_LO is incompatible with SHUFFLED_KV_CACHE",
+    )
+    tl.static_assert(
+        HEAD_SIZE_LO == 0 or HEAD_SIZE_LO + HEAD_SIZE_HI == HEAD_SIZE,
+        "HEAD_SIZE_LO + HEAD_SIZE_HI must equal HEAD_SIZE",
     )
 
     kv_head_idx = tl.program_id(0)
@@ -201,12 +213,33 @@ def kernel_unified_attention_2d(
     else:
         Q_cache_modifier: tl.constexpr = ""
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
-    Q = tl.load(
-        query_ptr + query_offset,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-        other=0.0,
-        cache_modifier=Q_cache_modifier,
-    )
+    if HEAD_SIZE_LO > 0:
+        q_row = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+        )
+        q_mask = query_mask_0[:, None] & query_mask_1[:, None]
+        offs_d_lo = tl.arange(0, HEAD_SIZE_LO)
+        offs_d_hi = HEAD_SIZE_LO + tl.arange(0, HEAD_SIZE_HI)
+        Q = tl.load(
+            query_ptr + q_row + offs_d_lo[None, :],
+            mask=q_mask,
+            other=0.0,
+            cache_modifier=Q_cache_modifier,
+        )
+        Q_hi = tl.load(
+            query_ptr + q_row + offs_d_hi[None, :],
+            mask=q_mask,
+            other=0.0,
+            cache_modifier=Q_cache_modifier,
+        )
+    else:
+        Q = tl.load(
+            query_ptr + query_offset,
+            mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+            other=0.0,
+            cache_modifier=Q_cache_modifier,
+        )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -322,13 +355,28 @@ def kernel_unified_attention_2d(
                 + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
             )
 
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
-            )
-            K = K_load.to(Q.dtype)
+            if HEAD_SIZE_LO > 0:
+                k_base = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K = tl.load(
+                    key_cache_ptr + k_base + offs_d_lo[:, None] * stride_k_cache_3,
+                    cache_modifier=KV_cache_modifier,
+                ).to(Q.dtype)
+                K_hi = tl.load(
+                    key_cache_ptr + k_base + offs_d_hi[:, None] * stride_k_cache_3,
+                    cache_modifier=KV_cache_modifier,
+                ).to(Q.dtype)
+            else:
+                K_load = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None],
+                    other=0.0,
+                    cache_modifier=KV_cache_modifier,
+                )
+                K = K_load.to(Q.dtype)
 
             V_load = tl.load(
                 value_cache_ptr + v_offset,
@@ -338,7 +386,10 @@ def kernel_unified_attention_2d(
             )
             V = V_load.to(Q.dtype)
 
-            S = qk_scale * tl.dot(Q, K)
+            S = tl.dot(Q, K)
+            if HEAD_SIZE_LO > 0:
+                S = tl.dot(Q_hi, K_hi, acc=S)
+            S = qk_scale * S
 
             if USE_SOFTCAP:
                 S = apply_softcap(S, softcap) * RCP_LN2
@@ -416,15 +467,34 @@ def kernel_unified_attention_2d(
             k_mask = dim_mask[:, None] & tile_mask[None, :]
             other = 0.0
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=k_mask,
-            other=other,
-            cache_modifier=KV_cache_modifier,
-        )
+        # K : (HEAD_SIZE, TILE_SIZE), or two chunks of it when HEAD_SIZE_LO > 0
+        if HEAD_SIZE_LO > 0:
+            k_base = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+            K = tl.load(
+                key_cache_ptr + k_base + offs_d_lo[:, None] * stride_k_cache_3,
+                mask=tile_mask[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            ).to(Q.dtype)
+            K_hi = tl.load(
+                key_cache_ptr + k_base + offs_d_hi[:, None] * stride_k_cache_3,
+                mask=tile_mask[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            ).to(Q.dtype)
+        else:
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=k_mask,
+                other=other,
+                cache_modifier=KV_cache_modifier,
+            )
 
-        K = K_load.to(Q.dtype)
+            K = K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
@@ -459,7 +529,10 @@ def kernel_unified_attention_2d(
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        S = tl.dot(Q, K)
+        if HEAD_SIZE_LO > 0:
+            S = tl.dot(Q_hi, K_hi, acc=S)
+        S = qk_scale * S
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -565,6 +638,8 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "IS_Q_FP8",
         "IS_KV_FP8",
+        "HEAD_SIZE_LO",
+        "HEAD_SIZE_HI",
     ],
 )
 
@@ -627,7 +702,17 @@ def kernel_unified_attention_3d(
     K_WIDTH: tl.constexpr = 0,  # int
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    HEAD_SIZE_LO: tl.constexpr = 0,  # int, first QK head chunk; 0 = one padded chunk
+    HEAD_SIZE_HI: tl.constexpr = 0,  # int, HEAD_SIZE - HEAD_SIZE_LO
 ):
+    tl.static_assert(
+        not (HEAD_SIZE_LO > 0 and SHUFFLED_KV_CACHE),
+        "HEAD_SIZE_LO is incompatible with SHUFFLED_KV_CACHE",
+    )
+    tl.static_assert(
+        HEAD_SIZE_LO == 0 or HEAD_SIZE_LO + HEAD_SIZE_HI == HEAD_SIZE,
+        "HEAD_SIZE_LO + HEAD_SIZE_HI must equal HEAD_SIZE",
+    )
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
@@ -699,11 +784,22 @@ def kernel_unified_attention_3d(
     query_mask_1 = query_offset_1 < num_query_heads
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
-    Q = tl.load(
-        query_ptr + query_offset,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-        other=0.0,
-    )
+    if HEAD_SIZE_LO > 0:
+        q_row = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+        )
+        q_mask = query_mask_0[:, None] & query_mask_1[:, None]
+        offs_d_lo = tl.arange(0, HEAD_SIZE_LO)
+        offs_d_hi = HEAD_SIZE_LO + tl.arange(0, HEAD_SIZE_HI)
+        Q = tl.load(query_ptr + q_row + offs_d_lo[None, :], mask=q_mask, other=0.0)
+        Q_hi = tl.load(query_ptr + q_row + offs_d_hi[None, :], mask=q_mask, other=0.0)
+    else:
+        Q = tl.load(
+            query_ptr + query_offset,
+            mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+            other=0.0,
+        )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -830,15 +926,34 @@ def kernel_unified_attention_3d(
             k_mask = dim_mask[:, None] & tile_mask[None, :]
             other = 0.0
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=k_mask,
-            other=other,
-            cache_modifier=KV_cache_modifier,
-        )
+        # K : (HEAD_SIZE, TILE_SIZE), or two chunks of it when HEAD_SIZE_LO > 0
+        if HEAD_SIZE_LO > 0:
+            k_base = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+            K = tl.load(
+                key_cache_ptr + k_base + offs_d_lo[:, None] * stride_k_cache_3,
+                mask=tile_mask[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            ).to(Q.dtype)
+            K_hi = tl.load(
+                key_cache_ptr + k_base + offs_d_hi[:, None] * stride_k_cache_3,
+                mask=tile_mask[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            ).to(Q.dtype)
+        else:
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=k_mask,
+                other=other,
+                cache_modifier=KV_cache_modifier,
+            )
 
-        K = K_load.to(Q.dtype)
+            K = K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
             K = (
                 K.reshape(
@@ -875,7 +990,10 @@ def kernel_unified_attention_3d(
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        S = tl.dot(Q, K)
+        if HEAD_SIZE_LO > 0:
+            S = tl.dot(Q_hi, K_hi, acc=S)
+        S = qk_scale * S
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.

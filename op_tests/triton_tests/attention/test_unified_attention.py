@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
+    _head_split,
     _is_gluon_available,
     is_2d_gluon_available,
     unified_attention,
@@ -759,4 +760,68 @@ def test_triton_unified_attn_asymmetric_qk_v(sliding_window):
         shuffled_kv_cache=False,
         backend="triton",
         v_head_size=128,
+    )
+
+
+@pytest.mark.parametrize(
+    "head_size, sliding_window, shuffled_kv_cache, q_dtype, kv_dtype, split",
+    [
+        (192, 0, False, torch.bfloat16, torch.bfloat16, (128, 64)),
+        (192, 0, False, torch.float16, torch.float16, (128, 64)),
+        (128, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        (160, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        (96, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        (192, 128, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        (192, 0, True, torch.bfloat16, torch.bfloat16, (0, 0)),
+        (192, 0, False, torch.bfloat16, e4m3_dtype, (0, 0)),
+        (192, 0, False, e4m3_dtype, e4m3_dtype, (0, 0)),
+        (192, 0, False, torch.uint8, torch.uint8, (0, 0)),
+    ],
+)
+def test_head_split(
+    head_size, sliding_window, shuffled_kv_cache, q_dtype, kv_dtype, split
+):
+    params = SimpleNamespace(
+        head_size=head_size,
+        sliding_window=sliding_window,
+        shuffled_kv_cache=shuffled_kv_cache,
+        q_dtype=q_dtype,
+        kv_cache_dtype=kv_dtype,
+    )
+    assert _head_split(params) == split
+
+
+@pytest.mark.parametrize("v_head_size", [128, None])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # spec-decode verify (split-KV 3D) next to a decode row
+        [(8, 1031), (8, 517), (1, 2049), (8, 64)],
+        # a short extend on a prefix: 303 programs, still the 3D kernel
+        [(300, 1500), (1, 777)],
+        # a long prefill chunk: 2049 programs > 4 per CU, so the 2D kernel with
+        # the head-192 prefill config (max_seqlen_q >= 256)
+        [(2048, 4096)],
+    ],
+)
+@pytest.mark.parametrize("block_size", [1, 16])
+def test_triton_unified_attn_split_head(v_head_size, dtype, seq_lens, block_size):
+    test_triton_unified_attn(
+        seq_lens=seq_lens,
+        num_heads=(16, 1),
+        head_size=192,
+        sliding_window=None,
+        block_size=block_size,
+        soft_cap=None,
+        num_blocks=32768,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
+        use_q_descale=False,
+        use_kv_descale=False,
+        use_out_scale=False,
+        shuffled_kv_cache=False,
+        backend="triton",
+        v_head_size=v_head_size,
     )
