@@ -2038,6 +2038,7 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            deterministic=deterministic,
             output=output,
             _stage2_override=_stage2_override,
             routing_num_experts=global_E,
@@ -4787,6 +4788,7 @@ def fused_moe_2stages(
     routing_num_experts: int | None = None,
     prequantized_a1: torch.Tensor | None = None,
     prequantized_a1_scale: torch.Tensor | None = None,
+    deterministic: bool = False,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -4948,7 +4950,10 @@ def fused_moe_2stages(
                 topk=topk,
                 block_size=block_size_M,
                 num_rows=num_local_tokens,
-                sorted_weights=sorted_weights,
+                # A token's activation row is shared by its top-k routes; with
+                # routing weights, zero-weight routes write zeros into that shared
+                # row, so the result would depend on which route writes last.
+                sorted_weights=None if deterministic else sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
     elif hidden_states.dtype != q_dtype_a:

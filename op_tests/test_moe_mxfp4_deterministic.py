@@ -169,6 +169,25 @@ def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk):
 
 
 @_SKIP
+@pytest.mark.parametrize("M", [1, 8, 64, 300])
+def test_deterministic_zero_routing_weights(M):
+    """Routes with zero weight must not change a token's result: half the tokens
+    keep only their first route. Accuracy as with nonzero weights, and a token
+    alone matches the same token in the batch."""
+    shape = (3072, 3072, 128, 4)
+    p = _problem(M, *shape)
+    p["topk_weights"][::2, 1:] = 0
+    kw = {"swiglu_limit": 7.0}
+    out = _run(p, slice(None), ActivationType.Swiglu, True, **kw)
+    ref = _reference(p, M, *shape, ActivationType.Swiglu, **kw)
+    ld = _cos_diff(ref.float(), out.float())
+    assert ld < 2e-2, f"cos/logits_diff with zero routing weights: {ld:.3e}"
+    for i in range(min(M, 4)):
+        alone = _run(p, slice(i, i + 1), ActivationType.Swiglu, True, **kw)
+        assert torch.equal(alone, out[i : i + 1]), f"token {i} alone differs"
+
+
+@_SKIP
 @pytest.mark.parametrize("capacity,local", [(2, 1), (8, 3), (300, 129)])
 def test_deterministic_num_local_tokens(capacity, local):
     """With num_local_tokens below the batch capacity, the local tokens match the
