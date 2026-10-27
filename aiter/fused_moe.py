@@ -70,6 +70,8 @@ def _get_flydsl_moe_kernels():
 
 
 BLOCK_SIZE_M = 32
+# CK swiglustep_and_mul clamps gate/up at this value; it is a compile-time constant in CK.
+CK_SWIGLUSTEP_LIMIT = 7.0
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
@@ -1913,6 +1915,11 @@ def _fused_moe_impl(
     if metadata.run_1stage:
         if _stage2_override is not None:
             raise RuntimeError("_stage2_override requires a two-stage MoE config")
+        if swiglu_limit and quant_type == QuantType.per_1x128:
+            raise NotImplementedError(
+                f"1-stage MoE cannot apply swiglu_limit={swiglu_limit!r} for "
+                "per_1x128; the ASM blockscale kernel has no clamp."
+            )
         _stage1_call = functools.partial(
             metadata.stage1,
             hidden_states,
@@ -3827,6 +3834,29 @@ def get_2stage_cfgs(
             f"activation {activation}; using default heuristics"
         )
 
+    # per_1x128 SiLU clamps only on CK 2-stage: swiglustep_and_mul when the
+    # limit equals CK_SWIGLUSTEP_LIMIT, otherwise split-K + silu_and_mul(limit).
+    clamp_per_1x128 = (
+        bool(swiglu_limit)
+        and q_type == QuantType.per_1x128
+        and activation == ActivationType.Silu
+    )
+    clamp_needs_splitk = clamp_per_1x128 and swiglu_limit != CK_SWIGLUSTEP_LIMIT
+    if clamp_per_1x128 and cfg is not None:
+        cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
+        if (
+            cfg.get("run_1stage", False)
+            or "ck2stages" not in str(cfg.get("kernelName1", ""))
+            or (clamp_needs_splitk and cfg_ksplit <= 1)
+            or (cfg_ksplit > 1 and int(cfg.get("block_m", 0)) > 32)
+        ):
+            logger.warning(
+                f"[fused_moe] discarding tuned config {cfg.get('kernelName1')!r} "
+                f"for {keys}: it cannot apply swiglu_limit={swiglu_limit!r}; "
+                "using default heuristics"
+            )
+            cfg = None
+
     use_non_temporal_load = False
     if cfg is None or bypass_tuned_config:
         ksplit = 0
@@ -3852,7 +3882,8 @@ def get_2stage_cfgs(
                 )
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = (
-                    token > 32
+                    not clamp_per_1x128
+                    and token > 32
                     and inter_dim % 128 == 0
                     and aiter.fmoe_fp8_blockscale_g1u1_has_kernel(
                         activation.value, xbf16, BLOCK_SIZE_M, inter_dim, model_dim
@@ -3886,6 +3917,12 @@ def get_2stage_cfgs(
                 else ksplit
             )
         )
+        if q_type == QuantType.per_1x128 and not run_1stage:
+            if clamp_needs_splitk and ksplit <= 1:
+                ksplit = 2
+            if ksplit > 1:
+                # CK blockscale split-K at block_m 64 (pipeline V3) writes up as zeros.
+                block_m = min(block_m, 32)
         use_non_temporal_load = use_nt(token, topk, expert)
         aiter.logger.info(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
@@ -4831,6 +4868,10 @@ def fused_moe_2stages(
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
+    elif (
+        stage1_func in (ck_moe_stage1, asm_stage1) and quant_type == QuantType.per_1x128
+    ):
+        extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
     if stage1_func is _flydsl_stage1_wrapper:
@@ -5072,7 +5113,13 @@ def asm_stage1(
     a1_scale=None,
     w1_scale=None,
     sorted_weights=None,
+    swiglu_limit=None,
 ):
+    if swiglu_limit and activation == ActivationType.Silu and ksplit <= 0:
+        raise NotImplementedError(
+            f"ASM MoE stage1 cannot apply swiglu_limit={swiglu_limit!r} without "
+            "split-K; the fused SiLU epilogue does not clamp."
+        )
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
     if quant_type != QuantType.per_1x128:
         out = out.view(dtype)
@@ -5113,7 +5160,7 @@ def asm_stage1(
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
+            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32), swiglu_limit or 0.0)
         elif activation == ActivationType.Swiglu:
             aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
@@ -5513,9 +5560,21 @@ def ck_moe_stage1(
     splitk=1,
     use_non_temporal_load=False,
     dtype=None,
+    swiglu_limit=None,
 ):
     token_num = hidden_states.shape[0]
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
+    swiglustep = False
+    if swiglu_limit and activation == ActivationType.Silu and not is_splitk:
+        if quant_type != QuantType.per_1x128 or swiglu_limit != CK_SWIGLUSTEP_LIMIT:
+            raise NotImplementedError(
+                f"CK MoE stage1 cannot apply swiglu_limit={swiglu_limit!r} without "
+                f"split-K; only per_1x128 with limit {CK_SWIGLUSTEP_LIMIT} has a "
+                "clamped CK epilogue (swiglustep_and_mul)."
+            )
+        swiglustep = True
+        if kernelName:
+            kernelName = kernelName.replace("_silu_", "_swiglustep_")
     if is_splitk:
         # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
         sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
@@ -5543,11 +5602,12 @@ def ck_moe_stage1(
         splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
+        swiglustep=swiglustep,
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
+            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32), swiglu_limit or 0.0)
         elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         else:

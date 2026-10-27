@@ -14,14 +14,18 @@
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
 // Map aiter ActivationType (stage1) to the CK stage1 activation op value.
-// CK act values: gelu=0, silu=1, swiglu(OAI swiglu_oai)=3, gelu_tanh_and_mul=4.
-// Value 2 is reserved.
+// CK act values: gelu=0, silu=1, swiglustep_and_mul=2, swiglu(OAI swiglu_oai)=3,
+// gelu_tanh_and_mul=4. The swiglustep module (generated with -act swiglustep)
+// defines AITER_CK_MOE_STAGE1_SILU_ACT_OP=2 so Silu selects its clamped instances.
+#ifndef AITER_CK_MOE_STAGE1_SILU_ACT_OP
+#define AITER_CK_MOE_STAGE1_SILU_ACT_OP 1
+#endif
 static inline int map_activation_to_ck_stage1(int activation)
 {
     switch (static_cast<ActivationType>(activation))
     {
     case ActivationType::Silu:
-        return 1;
+        return AITER_CK_MOE_STAGE1_SILU_ACT_OP;
     case ActivationType::Gelu:
         return 0;
     case ActivationType::Swiglu:
