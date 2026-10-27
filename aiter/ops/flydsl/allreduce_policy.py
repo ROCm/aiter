@@ -1006,7 +1006,7 @@ FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx950",
         link="xgmi",
         world_size=2,
-        oneshot=Window(0, 1792 * KiB),
+        oneshot=Window(0, 2688 * KiB),
         mesh=None,
         ring=Window(768 * KiB, None),
     ),
@@ -1014,8 +1014,8 @@ FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx950",
         link="xgmi",
         world_size=4,
-        oneshot=Window(0, 256 * KiB),
-        mesh=Window(768 * KiB, None),
+        oneshot=Window(0, 384 * KiB),
+        mesh=Window(1536 * KiB, None),
         ring=None,
     ),
     FamilyPolicy(
@@ -1023,7 +1023,7 @@ FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="xgmi",
         world_size=8,
         oneshot=Window(0, 168 * KiB),
-        mesh=Window(576 * KiB, None),
+        mesh=Window(2 * MiB, None),
         ring=None,
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------

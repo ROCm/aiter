@@ -216,16 +216,10 @@
       "oneshot": {
         "default": {
           "rungs": [
-            {"min_bytes": 0, "atoms": 2, "grid_cap": 8, "fanout": "peer", "split": 1},
-            {"min_bytes": "64 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
+            {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
           ]
         },
         "hidden": {
-          "3072": {
-            "rungs": [
-              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
-            ]
-          },
           "7168": {
             "rungs": [
               {"min_bytes": 0, "atoms": 1, "grid_cap": 256, "fanout": "peer", "split": 16},
@@ -241,10 +235,24 @@
       },
       "mesh": {
         "default": {
-          "atoms_per_row": 2,
+          "atoms_per_row": 4,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 1, "grid_cap": 256}
+            {"min_bytes": 0, "super_tile": 8, "grid_cap": 256}
           ]
+        },
+        "hidden": {
+          "4096": {
+            "atoms_per_row": 2,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
+            ]
+          },
+          "8192": {
+            "atoms_per_row": 4,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
+            ]
+          }
         }
       },
       "ring": {
@@ -273,34 +281,39 @@
           "4096": {
             "rungs": [
               {"min_bytes": 0, "atoms": 1, "grid_cap": 64, "fanout": "peer", "split": 8},
-              {"min_bytes": "96 KiB", "atoms": 1, "grid_cap": 64, "fanout": "peer", "split": 1}
+              {"min_bytes": "96 KiB", "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 1}
             ]
           },
           "7168": {
             "rungs": [
-              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 16}
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 256, "fanout": "peer", "split": 16}
             ]
           },
           "8192": {
             "rungs": [
-              {"min_bytes": 0, "atoms": 1, "grid_cap": 128, "fanout": "peer", "split": 16}
+              {"min_bytes": 0, "atoms": 1, "grid_cap": 256, "fanout": "peer", "split": 16}
             ]
           }
         }
       },
       "mesh": {
         "default": {
-          "atoms_per_row": 1,
+          "atoms_per_row": 4,
           "rungs": [
             {"min_bytes": 0, "super_tile": 8, "grid_cap": 256}
           ]
         },
         "hidden": {
-          "7168": {
+          "2048": {
             "atoms_per_row": 1,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 32},
-              {"min_bytes": "5376 KiB", "super_tile": 8, "grid_cap": 256}
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
+            ]
+          },
+          "4096": {
+            "atoms_per_row": 2,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
             ]
           }
         }
