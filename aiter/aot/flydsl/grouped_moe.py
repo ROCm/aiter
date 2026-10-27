@@ -22,6 +22,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE]
 _WARP_TILE_N = 64
@@ -163,6 +164,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         build_moe_fused_quant_preshuffle_route_ksplit_module,
         build_moe_fused_route_quant_scatter_module,
         build_moe_fused_route_quant_scatter_st_ksplit_module,
+        quant_layout_supported,
     )
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
         build_moe_gather_reduce_module,
@@ -341,8 +343,18 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     # Runtime passes topids_to_rows whenever route rows fit the output capacity
     # (almost always), taking the route-ksplit path with source_topk=0; the
     # plain skip-padding path is the rare capacity-overflow fallback.
+    # The runtime launches this prep only when gemm1 cannot requantize its own
+    # output (a gemm1 bias, or AITER_FLYDSL_DISABLE_GEMM1_REQUANT=1). Its quant
+    # layout needs inter_dim % 256 == 0; a bias-free MoE whose inter_dim is not
+    # (Kimi-K3 at TP8: 3072 / 8 = 384) has gemm1 requantize instead and never
+    # launches it, so such a job has no a2 prep to build.
     capacity_rows = a2_out_e * a2_out_m
-    if numel < capacity_rows:
+    if not quant_layout_supported(inter_dim, quant_mode, wmma_rep):
+        print(
+            f"  [skip] stage2 quant+preshuffle: inter_dim={inter_dim} is not a "
+            "multiple of 256; gemm1 requantizes its output instead"
+        )
+    elif numel < capacity_rows:
         _route_ksplit(
             feat_dim=inter_dim,
             source_topk=0,
@@ -459,4 +471,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main(sys.argv[1:])

@@ -28,7 +28,9 @@ def generate_inputs(B, M, N, K, strided_x=False, transpose_bm=False, output=True
         x = buf[..., :K].transpose(0, 1)
     else:
         x = torch.randn((B, M, K), dtype=torch.bfloat16, device="cuda")
-    weight = (torch.randn((B, N, K), device="cuda") * 0.1).to(e4m3_type)
+    weight = (torch.randn((B, N, K), dtype=torch.float32, device="cuda") * 0.1).to(
+        e4m3_type
+    )
     w_scale = torch.tensor(0.02, dtype=torch.float32, device="cuda")
     y = None
     if output:
