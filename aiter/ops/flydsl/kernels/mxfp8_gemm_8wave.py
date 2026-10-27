@@ -277,7 +277,7 @@ class MxMfma:
             for osa in range(4)
             for osb in range(4)
         }
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+        self.zero_value = fx.full(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
 

@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
@@ -62,6 +63,14 @@ _GFX950_LDS_BUDGET = 160 * 1024
 
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
+
+
+def _split_launch_config(config):
+    # NUM_SEGMENTS inherits the caller's max_seqlen_k type when the context
+    # length bounds the split, so a numpy max_seqlen_k makes it a numpy scalar.
+    # Gluon constexpr arguments must be native Python scalars; numpy ones fail
+    # during TTIR lowering once a runtime shape selects the 3D path.
+    return int(config["NUM_SEGMENTS"]), int(config["TILE_SIZE"])
 
 
 class _UAParams(NamedTuple):
@@ -398,14 +407,14 @@ def unified_attention(
         config = get_unified_attention_config(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
-        NUM_SEGMENTS = config["NUM_SEGMENTS"]
+        NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
         if shuffled_kv_cache and not use_gluon_3d:
             TILE_SIZE = block_size
         else:
-            TILE_SIZE = config["TILE_SIZE"]
+            TILE_SIZE = CONFIG_TILE_SIZE
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
@@ -729,8 +738,12 @@ def _reduce_segments_triton(
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
+    v_head_size_padded = triton.next_power_of_2(params.head_size_v)
+    num_d_blocks = triton.cdiv(
+        v_head_size_padded, config.get("BLOCK_D") or v_head_size_padded
+    )
 
-    reduce_segments[(params.num_tokens, params.num_query_heads)](
+    reduce_segments[(params.num_tokens, params.num_query_heads, num_d_blocks)](
         output_ptr=params.out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -1060,9 +1073,13 @@ def _unified_attention_gfx950(
     if 4 * TILE_SIZE * params.head_size * params.k.element_size() > _GFX950_LDS_BUDGET:
         NUM_BUFFERS = 1
 
-    # buffer ops need the tensor to fit a 32-bit offset
+    # buffer ops need the tensor to fit a 32-bit offset. k and v can be strided
+    # views of one packed cache, so use the span of the view, not its size.
     MAX_INT32 = 2**31 - 1
-    USE_LOAD_BUFFER_OP = params.k.nelement() * params.k.element_size() <= MAX_INT32
+    USE_LOAD_BUFFER_OP = (
+        max(max_addressable_bytes(params.k), max_addressable_bytes(params.v))
+        <= MAX_INT32
+    )
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
 
     _unified_attention_kernel_gfx950[grid](

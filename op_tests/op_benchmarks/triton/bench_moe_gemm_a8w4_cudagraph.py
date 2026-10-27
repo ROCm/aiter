@@ -69,6 +69,7 @@ from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # measurable layers, in report order; see the module docstring
 LAYERS = ("moe1", "moe2", "total")
@@ -245,7 +246,7 @@ def pin_routed_experts(logits, n_routed, n_expts_act):
     pool = torch.randperm(n_expts_tot, device=dev)[:n_pinned]
 
     slot = torch.arange(n_pinned, device=dev)
-    score = torch.rand((n_tokens, n_pinned), device=dev)
+    score = torch.rand((n_tokens, n_pinned), dtype=torch.float32, device=dev)
     score[slot % n_tokens, slot] += 1.0
     keep = pool[score.topk(n_expts_act, dim=-1).indices]
 
@@ -321,14 +322,16 @@ def bench_mlp_single_weight_init(
 
     # -- init data --
     # weights
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
-    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_tot, dim2 // TP // 2, dim1), device=dev)
+    wg = torch.randn((dim1, n_expts_tot), dtype=torch.float32, device=dev)
+    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), dtype=torch.float32, device=dev)
+    w2 = torch.randn(
+        (n_expts_tot, dim2 // TP // 2, dim1), dtype=torch.float32, device=dev
+    )
     # biases
-    bg = torch.randn((n_expts_tot,), device=dev)
+    bg = torch.randn((n_expts_tot,), dtype=torch.float32, device=dev)
     if bias:
-        b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
-        b2 = torch.randn((n_expts_tot, dim1), device=dev)
+        b1 = torch.randn((n_expts_tot, dim2 // TP), dtype=torch.float32, device=dev)
+        b2 = torch.randn((n_expts_tot, dim1), dtype=torch.float32, device=dev)
     else:
         b1 = b2 = None
     # activation
@@ -644,7 +647,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",
@@ -686,13 +689,6 @@ def parse_args(args: list[str] | None = None):
         "layer 1 emitting layer 2's input directly) or mx8 (mxfp8, one ue8m0 "
         "scale per 32 values along K). Weights are mxfp4 either way. "
         "Default: fp8.",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["triton", "gluon"],
-        default=None,
-        help="Kernel backend for moe_gemm_a8w4. Default: unset, i.e. the arch "
-        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
     )
     parser.add_argument(
         "--preshuffle",
