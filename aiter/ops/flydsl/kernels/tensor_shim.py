@@ -17,6 +17,7 @@ from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.utils import env
 
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 
@@ -309,6 +310,11 @@ def _run_compiled(exe, *args, specialization_key=None):
     A specialization key gives a multi-constexpr JitFunction one compiled
     callable per configuration. Factory-style launchers should leave it unset.
     """
+    if env.compile.compile_only:
+        # A callable warmed during execution must not dispatch when a later
+        # preload switches to compile-only. Preserve it for execution to resume.
+        _compile_and_run(exe, *args)
+        return
     if specialization_key is None:
         cf = getattr(exe, "_cf", None)
     else:
