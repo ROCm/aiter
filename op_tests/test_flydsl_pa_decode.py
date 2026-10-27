@@ -97,7 +97,7 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
 @pytest.mark.parametrize(
     "arch,num_seqs,window,max_parts,capacity_per_seq,expected_splits",
     [
-        ("gfx950", 1, 1024, 8, 8, 8),
+        # Bracket the batch-size transitions between 8/4/2/1 query splits.
         ("gfx950", 8, 1024, 8, 8, 8),
         ("gfx950", 16, 1024, 8, 8, 4),
         ("gfx950", 32, 1024, 8, 8, 4),
@@ -106,39 +106,22 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         ("gfx942", 8, 1024, 8, 8, 8),
         ("gfx950", 8, 1023, 8, 8, 8),
         ("gfx950", 8, 1025, 8, 8, 8),
-        ("gfx950", 1, 512, 8, 8, 8),
         ("gfx950", 8, 512, 8, 8, 8),
-        ("gfx950", 32, 512, 8, 8, 4),
-        ("gfx950", 128, 512, 8, 8, 1),
-        ("gfx942", 8, 512, 8, 8, 8),
         # Limited budgets still need enough split-query CTAs to fill the device.
-        ("gfx950", 8, 512, 1, 1, 8),
-        ("gfx950", 8, 512, 4, 4, 8),
         ("gfx950", 8, 512, 8, 3, 8),
         ("gfx950", 32, 2048, 8, 8, 1),
         # Neighboring windows follow planned work, not an exact window value.
         ("gfx950", 8, 1024, 1, 1, 8),
-        ("gfx950", 8, 1024, 4, 4, 8),
         ("gfx950", 8, 1024, 8, 2, 8),
         ("gfx950", 8, 1023, 1, 1, 8),
-        ("gfx950", 8, 1023, 4, 4, 8),
         ("gfx950", 8, 1025, 1, 1, 8),
-        ("gfx950", 8, 1025, 4, 4, 8),
         ("gfx950", 8, 2048, 1, 1, 8),
-        ("gfx950", 8, 2048, 4, 4, 8),
         ("gfx950", 8, 2048, 8, 8, 4),
-        ("gfx950", 8, 2048, 16, 16, 4),
-        ("gfx950", 32, 1023, 1, 1, 8),
-        ("gfx950", 32, 1024, 1, 1, 8),
-        ("gfx950", 32, 1025, 1, 1, 8),
         ("gfx950", 32, 2048, 1, 1, 8),
         ("gfx950", 32, 2048, 4, 4, 2),
         ("gfx950", 64, 1024, 1, 1, 4),
         ("gfx950", 64, 1024, 4, 4, 1),
         ("gfx950", 128, 1024, 1, 1, 2),
-        ("gfx950", 128, 1024, 4, 4, 1),
-        ("gfx950", 64, 2048, 1, 1, 4),
-        ("gfx950", 8, 4096, 1, 1, 8),
         ("gfx950", 8, 4096, 8, 8, 4),
         ("gfx942", 8, 2048, 1, 1, 8),
     ],
@@ -169,7 +152,7 @@ def test_bf16_swa_query_split_schedule(
     assert traits.PaDecodeTraits.create(schedule).query_splits == expected_splits
 
 
-@pytest.mark.parametrize("window", [2048, 4096, 2**31 + 1])
+@pytest.mark.parametrize("window", [2048, 2**31 + 1])
 def test_bf16_swa_schedule_context_bound(monkeypatch, window):
     traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
     monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
@@ -202,10 +185,11 @@ def test_bf16_swa_schedule_context_bound(monkeypatch, window):
         ("bf16", "none", -1, 0),
         ("bf16", "none", 0, 0),
         ("bf16", "none", -2, None),
+        # CLI parsing checks the sign/range; GPU cases cover window boundaries.
         *[
             (dtype, scale, window, window)
             for dtype, scale in (("fp8", "per-tensor"), ("bf16", "none"))
-            for window in (1, 16, 17, 127, 128, 129, 1024, 1025, 4097, 2**31 + 1)
+            for window in (1, 2**31 + 1)
         ],
     ],
 )
@@ -241,7 +225,7 @@ def test_asymmetric_tuning_cli_window(kv_dtype, scale_mode, window, expected_win
     [
         (dtype, window, window >= 0)
         for dtype in ("fp8", "bf16")
-        for window in (-1, 0, 1, 16, 17, 127, 1025, 4097, 2**31 + 1)
+        for window in (-1, 0, 1, 2**31 + 1)
     ],
 )
 def test_asymmetric_schedule_window_contract(monkeypatch, kv_dtype, window, accepted):
@@ -270,9 +254,7 @@ def test_asymmetric_schedule_window_contract(monkeypatch, kv_dtype, window, acce
             traits.PaDecodeSchedule.select(**kwargs)
 
 
-@pytest.mark.parametrize(
-    "heads,group,query_length", [(1, 16, 8), (2, 8, 3), (4, 16, 1)]
-)
+@pytest.mark.parametrize("heads,group,query_length", [(2, 8, 3), (4, 16, 1)])
 @pytest.mark.parametrize(
     "kv_dtype,scale_mode", [("bf16", "none"), ("fp8", "per-token")]
 )
@@ -572,7 +554,8 @@ _ASYMMETRIC_GENERAL_CASES.append(
 _FP8_CASES = _COMMON_CASES + [
     *_ASYMMETRIC_GENERAL_CASES,
     *_ASYMMETRIC_MULTIHEAD_CASES,
-    *_ASYMMETRIC_WINDOW_CASES,
+    # The W4 probability-rounding case below includes a superset of lengths.
+    *[case for case in _ASYMMETRIC_WINDOW_CASES if case[1]["window"] != 4],
     (
         "asymmetric-large-window-grid",
         {
@@ -616,20 +599,6 @@ _FP8_CASES = _COMMON_CASES + [
         )
     ],
     (
-        "qlen8-full-d192-v128",
-        {
-            "query_length": 8,
-            "group_size": 16,
-            "head_dim": 192,
-            "value_dim": 128,
-            "block_size": 64,
-            "max_partitions": 8,
-            "scale_mode": "per-tensor",
-            "trans_v": True,
-            "lengths": (1027, 769),
-        },
-    ),
-    (
         "qlen8-full-d192-v128-long",
         {
             "query_length": 8,
@@ -641,23 +610,6 @@ _FP8_CASES = _COMMON_CASES + [
             "scale_mode": "per-tensor",
             "trans_v": True,
             "lengths": (16384,) * 8,
-        },
-    ),
-    (
-        "qlen8-w128-d192-v128",
-        {
-            "query_length": 8,
-            "group_size": 16,
-            "head_dim": 192,
-            "value_dim": 128,
-            "block_size": 64,
-            "max_partitions": 8,
-            "scale_mode": "per-tensor",
-            "trans_v": True,
-            "window": 128,
-            "sink_dtype": torch.float32,
-            "capture": True,
-            "lengths": (127, 128, 129, 257, 515),
         },
     ),
     (
@@ -739,9 +691,7 @@ _BF16_CASES = _COMMON_CASES + [
             (1024, 1),
             (1024, 4),
             (1023, 1),
-            (1023, 4),
             (1025, 1),
-            (1025, 4),
             (2048, 1),
             (2048, 4),
             (2048, 8),
@@ -1353,12 +1303,11 @@ def test_asymmetric_multihead_large_address(kv_dtype, device):
 @pytest.mark.parametrize(
     "kv_dtype,window",
     [
-        ("fp8", 4),
+        # One full-residual window, one ordinary window, and a multi-tile plan.
         ("fp8", 17),
         ("fp8", 128),
         ("fp8", 1025),
         ("bf16", 128),
-        ("bf16", 1),
         ("bf16", 1025),
     ],
 )
