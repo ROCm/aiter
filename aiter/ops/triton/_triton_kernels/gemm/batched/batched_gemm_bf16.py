@@ -25,6 +25,8 @@ _batched_gemm_bf16_repr = make_kernel_repr(
         "num_warps",
         "num_stages",
         "waves_per_eu",
+        "TILE_MAJOR",
+        "EVEN_MN",
     ],
 )
 
@@ -76,6 +78,8 @@ def _batched_gemm_bf16_kernel(
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
+    TILE_MAJOR: tl.constexpr,
+    EVEN_MN: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_bf16 function
@@ -93,6 +97,11 @@ def _batched_gemm_bf16_kernel(
     - C: Batch tensor C with shape (B, M, N), or partial sums with shape
          (NUM_KSPLIT, B, M, N) when NUM_KSPLIT > 1.
     - Bias: Bias batch tensor with shape (B, 1, N).
+
+    TILE_MAJOR: the grid is (tiles, B) instead of (B, tiles), so that
+    neighbouring programs write neighbouring tiles of one batch. The batch
+    offset goes into the base pointers and the tile offsets are int32 (the
+    wrapper checks that they fit), and an even M and N use an unmasked store.
     """
 
     tl.assume(stride_ab > 0)
@@ -108,10 +117,14 @@ def _batched_gemm_bf16_kernel(
 
     # -----------------------------------------------------------
     # Get batch program id
-    batch_id = tl.program_id(axis=0)
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
-    pid_unified = tl.program_id(axis=1)
+    if TILE_MAJOR:
+        batch_id = tl.program_id(axis=1)
+        pid_unified = tl.program_id(axis=0)
+    else:
+        batch_id = tl.program_id(axis=0)
+        # Map program ids `pid` to the block of C it should compute.
+        # This is done in a grouped ordering to promote L2 data reuse.
+        pid_unified = tl.program_id(axis=1)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -140,10 +153,16 @@ def _batched_gemm_bf16_kernel(
     # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
     # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
     # See https://github.com/ROCm/aiter/pull/597 for rationale
-    batch_id = tl.cast(batch_id, tl.int64)
-    stride_ab = tl.cast(stride_ab, tl.int64)
-    stride_bb = tl.cast(stride_bb, tl.int64)
-    stride_cb = tl.cast(stride_cb, tl.int64)
+    if TILE_MAJOR:
+        batch_off = tl.cast(batch_id, tl.int64)
+        a_ptr += batch_off * tl.cast(stride_ab, tl.int64)
+        b_ptr += batch_off * tl.cast(stride_bb, tl.int64)
+        c_ptr += batch_off * tl.cast(stride_cb, tl.int64)
+    else:
+        batch_id = tl.cast(batch_id, tl.int64)
+        stride_ab = tl.cast(stride_ab, tl.int64)
+        stride_bb = tl.cast(stride_bb, tl.int64)
+        stride_cb = tl.cast(stride_cb, tl.int64)
 
     split_k_start = pid_k * SPLITK_BLOCK_SIZE
     if split_k_start < K:
@@ -153,22 +172,32 @@ def _batched_gemm_bf16_kernel(
         # matrices (M*K or M*N > 2^31) overflow otherwise.
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_k_split = split_k_start + offs_k
-        offs_am = tl.cast(
-            (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M, tl.int64
-        )
-        offs_bn = tl.cast(
-            (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N, tl.int64
-        )
-        a_ptrs = a_ptr + (
-            batch_id * stride_ab
-            + offs_am[:, None] * stride_am
-            + offs_k_split[None, :] * stride_ak
-        )
-        b_ptrs = b_ptr + (
-            batch_id * stride_bb
-            + offs_k_split[:, None] * stride_bk
-            + offs_bn[None, :] * stride_bn
-        )
+        if TILE_MAJOR:
+            offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+            a_ptrs = a_ptr + (
+                offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            )
+        else:
+            offs_am = tl.cast(
+                (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M, tl.int64
+            )
+            offs_bn = tl.cast(
+                (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N, tl.int64
+            )
+            a_ptrs = a_ptr + (
+                batch_id * stride_ab
+                + offs_am[:, None] * stride_am
+                + offs_k_split[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                batch_id * stride_bb
+                + offs_k_split[:, None] * stride_bk
+                + offs_bn[None, :] * stride_bn
+            )
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
@@ -211,20 +240,39 @@ def _batched_gemm_bf16_kernel(
 
         c = accumulator.to(c_ptr.type.element_ty)
 
-        # Write back the block of the output matrix C with masks.
-        # int64 to avoid int32 overflow in offs_cm*stride_cm for large M*N.
-        offs_cm = tl.cast(pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M), tl.int64)
-        offs_cn = tl.cast(pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N), tl.int64)
-        c_ptrs = (
-            c_ptr
-            + pid_k.to(tl.int64) * stride_ck
-            + stride_cb * batch_id
-            + stride_cm * offs_cm[:, None]
-            + stride_cn * offs_cn[None, :]
-        )
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        if TILE_MAJOR:
+            offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            c_ptrs = (
+                c_ptr
+                + pid_k.to(tl.int64) * stride_ck
+                + stride_cm * offs_cm[:, None]
+                + stride_cn * offs_cn[None, :]
+            )
+            if EVEN_MN:
+                tl.store(c_ptrs, c)
+            else:
+                c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+                tl.store(c_ptrs, c, mask=c_mask)
+        else:
+            # Write back the block of the output matrix C with masks.
+            # int64 to avoid int32 overflow in offs_cm*stride_cm for large M*N.
+            offs_cm = tl.cast(
+                pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M), tl.int64
+            )
+            offs_cn = tl.cast(
+                pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N), tl.int64
+            )
+            c_ptrs = (
+                c_ptr
+                + pid_k.to(tl.int64) * stride_ck
+                + stride_cb * batch_id
+                + stride_cm * offs_cm[:, None]
+                + stride_cn * offs_cn[None, :]
+            )
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-        tl.store(c_ptrs, c, mask=c_mask)
+            tl.store(c_ptrs, c, mask=c_mask)
 
 
 def _get_config(
