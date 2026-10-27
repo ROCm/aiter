@@ -7,9 +7,8 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.mha_mxfp8 import mha_fwd
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 arch = get_arch()
