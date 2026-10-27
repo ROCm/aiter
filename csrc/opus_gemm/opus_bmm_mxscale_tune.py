@@ -327,8 +327,7 @@ _TUNE_POLICY.update(
             else [1]
         )
         for kid in _CODEGEN_BMM
-        if _kid_block(kid) == "1x32"
-        and kid not in _RELAYOUT_KIDS
+        if _kid_block(kid) == "1x32" and kid not in _RELAYOUT_KIDS
     }
 )
 _CANDIDATE_KIDS = tuple(_TUNE_POLICY) + tuple(_SHUF_POLICY)
