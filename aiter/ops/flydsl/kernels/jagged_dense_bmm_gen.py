@@ -81,7 +81,9 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
     return row, col
 
 
-_LAUNCHER_CACHE_MAX = 64  # skew compact keys include tot; bound growth
+# Per-call sizes (L, n_groups, max_seq_len) are launch-grid dimensions, not
+# part of this key, so a new length reuses the compiled launcher.
+_LAUNCHER_CACHE_MAX = 64
 _LAUNCHER_CACHE: OrderedDict = OrderedDict()
 
 
@@ -92,15 +94,11 @@ def _build_launcher(
     BLOCK_N,
     BLOCK_K,
     THREADS,
-    BM_TILES,
-    N_GROUPS,
     XCD_C,
     XCD_W,
     COMPACT=False,
 ):
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
-    XCD_NUM_ROWS = BM_TILES * N_GROUPS
-    XCD_NUM_COLS = N_BLOCKS
     smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -139,13 +137,20 @@ def _build_launcher(
             seq_start = fx.Int32(rec[2])
             seq_end = fx.Int32(rec[3])
         else:
-            raw_xy = fx.Int32(raw_b) * fx.Int32(BM_TILES * N_BLOCKS) + fx.Int32(pid_mn)
-            row, col = _xcd_remap(raw_xy, XCD_NUM_ROWS, XCD_NUM_COLS, XCD_C, XCD_W)
+            # Grid is (bm_tiles * N_BLOCKS, 1, n_groups). Recover both sizes
+            # here so a new batch or max_seq_len does not rebuild the launcher.
+            grid_x = fx.Int32(fx.grid_dim.x)
+            bm_tiles = fx.Int32(fx.Uint32(grid_x) // fx.Uint32(N_BLOCKS))
+            n_groups_rt = fx.Int32(fx.grid_dim.z)
+            raw_xy = fx.Int32(raw_b) * grid_x + fx.Int32(pid_mn)
+            row, col = _xcd_remap(
+                raw_xy, bm_tiles * n_groups_rt, N_BLOCKS, XCD_C, XCD_W
+            )
             row = fx.Int32(fx.rocdl.readfirstlane(T.i32, row))
             col = fx.Int32(fx.rocdl.readfirstlane(T.i32, col))
 
-            off_b = row // fx.Int32(BM_TILES)
-            block_m_idx = row % fx.Int32(BM_TILES)
+            off_b = fx.Int32(fx.Uint32(row) // fx.Uint32(bm_tiles))
+            block_m_idx = fx.Int32(fx.Uint32(row) % fx.Uint32(bm_tiles))
             block_n_idx = col
 
             seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
@@ -469,8 +474,11 @@ def jagged_dense_bmm(
     bnn = BLOCK_N if block_n is None else int(block_n)
     if bmn <= 0:
         raise ValueError(f"block_m must be positive, got {bmn}")
-    # No partial-tile path in N: N_BLOCKS floors, so a non-divisor block_n
-    # would silently drop the trailing N % block_n output columns.
+    if N <= 0:
+        raise ValueError(f"N must be positive, got {N}")
+    # No partial-tile path in N: N_BLOCKS floors, and the uniform kernel
+    # divides the grid by that count, so a non-divisor block_n would drop
+    # the trailing N % block_n output columns.
     if bnn <= 0 or N % bnn != 0:
         raise ValueError(f"block_n={bnn} must be a positive divisor of N={N}")
     if block_k is None:
@@ -503,13 +511,14 @@ def jagged_dense_bmm(
             xcd_c = XCD_C_SMALL_K
     if xcd_w is None:
         xcd_w = 1 if xcd_c == 1 else XCD_W
-    bm = (max_seq_len + bmn - 1) // bmn
     nthreads = THREADS if threads is None else threads
     compact = tile_map is not None
 
     tmap = SEQ_OFFSETS if tile_map is None else tile_map
     tot = 0 if total_occ_tiles is None else int(total_occ_tiles)
 
+    # n_groups, max_seq_len, and tot stay launch arguments. They size the grid
+    # inside _launch and must not specialize the kernel.
     key = (
         N,
         K,
@@ -517,9 +526,6 @@ def jagged_dense_bmm(
         bnn,
         block_k,
         nthreads,
-        bm,
-        n_groups,
-        tot,
         xcd_c,
         xcd_w,
         compact,
@@ -535,8 +541,6 @@ def jagged_dense_bmm(
             bnn,
             block_k,
             nthreads,
-            bm,
-            n_groups,
             xcd_c,
             xcd_w,
             compact,

@@ -21,12 +21,14 @@ from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
     shape_id,
 )
 from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import (
-    BLOCK_M as _BLOCK_M,
-)
-from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import (
+    _LAUNCHER_CACHE,
     jagged_dense_bmm,
 )
+from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import (
+    BLOCK_M as _BLOCK_M,
+)
 from aiter.test_common import (
+    assertAllclose,
     benchmark,
     checkAllclose,
     run_perftest,
@@ -76,7 +78,7 @@ def run_torch(jagged, dense, bias, seq_offsets, N, dtype=dtypes.bf16):
     return out
 
 
-def _build_inputs(B, D, Kout, Mi, regime, dtype, seq_offsets=None):
+def _build_inputs(B, D, Kout, Mi, regime, dtype, seq_offsets=None, pad_rows=True):
     N, K = Kout, D
     if seq_offsets is None:
         seq_offsets = _make_seq_offsets(B, Mi, regime)
@@ -88,7 +90,10 @@ def _build_inputs(B, D, Kout, Mi, regime, dtype, seq_offsets=None):
 
     dense_tall = dense.transpose(1, 2).reshape(B * N, K).contiguous()
     bias_flat = bias.reshape(B * N).contiguous()
-    out = torch.zeros(L + _BLOCK_M, N, dtype=dtype, device="cuda")
+    # The kernel writes exactly the packed rows. Padding is only for callers
+    # that still pass a tail; the reuse test uses the exact (L, N) buffer.
+    extra = _BLOCK_M if pad_rows else 0
+    out = torch.zeros(L + extra, N, dtype=dtype, device="cuda")
     tA = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
     tC = flyc.from_dlpack(out).mark_layout_dynamic(leading_dim=1, divisibility=8)
     return {
@@ -305,6 +310,143 @@ def test_jdbba_dispatch(B, D, Kout, Mi):
     }
 
 
+def _reuse_pair(B, Mi, regime):
+    if regime == "uniform":
+        # New group count and a partial M tile, same N/K/XCD/block.
+        return B + 16, Mi + _BLOCK_M // 2
+    # Same B keeps the skew XCD choice; a larger envelope changes L.
+    return B, Mi * 2
+
+
+def _occupied_tiles(L, n_groups):
+    return (L + _BLOCK_M - 1) // _BLOCK_M + n_groups
+
+
+@benchmark()
+def test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype):
+    """Second call keeps the compiled launcher and matches the reference.
+
+    Uniform varies n_groups and max_seq_len with the tile, XCD, and block
+    held fixed. Skew varies L (total_occ_tiles) at the same N, K, and batch,
+    so the XCD choice does not change.
+    """
+    B2, Mi2 = _reuse_pair(B, Mi, regime)
+    uniform = regime == "uniform"
+    st = torch.cuda.current_stream()
+    first = _build_inputs(B, D, Kout, Mi, regime, dtype, pad_rows=False)
+    second = _build_inputs(B2, D, Kout, Mi2, regime, dtype, pad_rows=False)
+    if uniform:
+        bm1 = (Mi + _BLOCK_M - 1) // _BLOCK_M
+        bm2 = (Mi2 + _BLOCK_M - 1) // _BLOCK_M
+        if (B2, bm2) == (B, bm1):
+            raise AssertionError("uniform reuse pair did not change the grid")
+    elif _occupied_tiles(second["L"], B2) == _occupied_tiles(first["L"], B):
+        raise AssertionError("skew reuse pair did not change occupied tiles")
+
+    def _call(inputs, n_groups, max_seq_len):
+        if uniform:
+            jagged_dense_bmm(
+                inputs["tC"],
+                inputs["tA"],
+                inputs["dense_tall"],
+                inputs["bias_flat"],
+                inputs["seq_offsets"],
+                n_groups=n_groups,
+                max_seq_len=max_seq_len,
+                stream=st,
+                uniform_seqlen=True,
+                xcd_c=32,
+                xcd_w=8,
+                block_k=64,
+                threads=256,
+            )
+        else:
+            jagged_dense_bmm_dispatched(
+                inputs["tC"],
+                inputs["tA"],
+                inputs["dense_tall"],
+                inputs["bias_flat"],
+                inputs["seq_offsets"],
+                n_groups,
+                max_seq_len,
+                stream=st,
+                uniform_seqlen=False,
+                block_k=64,
+            )
+        return inputs["out"]
+
+    def _check(inputs, n_groups, max_seq_len, msg):
+        ref = run_torch(
+            inputs["jagged"],
+            inputs["dense"],
+            inputs["bias"],
+            inputs["seq_offsets"],
+            inputs["N"],
+            dtype,
+        )
+        got = _call(inputs, n_groups, max_seq_len)
+        return assertAllclose(
+            ref.to(dtypes.fp32),
+            got.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=msg,
+        )
+
+    _check(first, B, Mi, f"launcher reuse prime ({regime})")
+    n_launchers = len(_LAUNCHER_CACHE)
+    ref2 = run_torch(
+        second["jagged"],
+        second["dense"],
+        second["bias"],
+        second["seq_offsets"],
+        second["N"],
+        dtype,
+    )
+    got = _call(second, B2, Mi2)
+    if len(_LAUNCHER_CACHE) != n_launchers:
+        raise AssertionError(
+            f"launcher cache grew {n_launchers} -> {len(_LAUNCHER_CACHE)} "
+            f"for a new {regime} length"
+        )
+    assertAllclose(
+        ref2.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"launcher reuse ({regime})",
+    )
+
+    L2, N2, K2 = second["L"], second["N"], second["K"]
+    flops = 2 * L2 * K2 * N2
+    nbytes = (L2 * K2 + B2 * K2 * N2 + B2 * N2 + L2 * N2) * second[
+        "jagged"
+    ].element_size()
+
+    def _second():
+        return _call(second, B2, Mi2)
+
+    got, us = run_perftest(_second)
+    err = checkAllclose(
+        ref2.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"launcher reuse timed ({regime})",
+    )
+    return {
+        "gfx": get_gfx(),
+        "B2": B2,
+        "Mi2": Mi2,
+        "L": L2,
+        "flydsl us": us,
+        "flydsl TFLOPS": flops / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": err,
+        "new_launchers": len(_LAUNCHER_CACHE) - n_launchers,
+    }
+
+
 def _summarize(name, rows):
     df = pd.DataFrame(rows)
     aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
@@ -454,6 +596,13 @@ def main():
     ):
         rows.append(test_jdbba_skew_varying_L(B, D, Kout, Mi, seed, dtype))
     _summarize("jagged_dense_bmm skew varying L", rows)
+
+    rows = []
+    for dtype, regime, (B, D, Kout, Mi) in itertools.product(
+        args.dtype, args.regime, args.regression_shapes
+    ):
+        rows.append(test_jdbba_launcher_reuse(B, D, Kout, Mi, regime, dtype))
+    _summarize("jagged_dense_bmm launcher reuse", rows)
 
 
 if __name__ == "__main__":
