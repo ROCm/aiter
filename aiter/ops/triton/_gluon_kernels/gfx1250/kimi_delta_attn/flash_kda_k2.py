@@ -14,10 +14,6 @@ from aiter.ops.triton.utils.device_info import get_num_xcds
 
 _SH_1D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
 
-# get_num_xcds imports aiter.jit on every call. Under AITER_TRITON_ONLY=1 that
-# import fails and is retried each time, about 2 ms per launch.
-_num_xcds = functools.cache(get_num_xcds)
-
 
 @functools.cache
 def build_layouts(num_warps):
@@ -686,7 +682,7 @@ def gluon_k2_ab_fused(
         BW=BW,
         CPL=CPL,
         MMA=build_layouts(num_warps)["MMA"],
-        NUM_XCDS=_num_xcds(),
+        NUM_XCDS=get_num_xcds(v_input.device.index),
         num_warps=num_warps,
     )
 
@@ -762,7 +758,7 @@ def gluon_k2_c(
         PAGED_CACHE=paged,
         PAGED_H_IN=paged and h_in is None,
         **build_layouts(num_warps),
-        NUM_XCDS=_num_xcds(),
+        NUM_XCDS=get_num_xcds(v_input.device.index),
         CM_OUT=CM_OUT,
         num_warps=num_warps,
     )

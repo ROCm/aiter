@@ -53,9 +53,12 @@ def _get_num_xcds(device_index: int) -> int:
     num_xccs = ctypes.c_int()
     error = get_attribute(ctypes.byref(num_xccs), num_xccs_attribute, device_index)
     if error != 0:
+        # Clear HIP's last error so PyTorch does not report it on a later call.
+        libhip.hipGetLastError()
+        libhip.hipGetErrorString.restype = ctypes.c_char_p
         raise RuntimeError(
             "hipDeviceGetAttribute(NumberOfXccs) failed for device "
-            f"{device_index} with error {error}"
+            f"{device_index}: {libhip.hipGetErrorString(error).decode()} ({error})"
         )
     if num_xccs.value < 1:
         raise RuntimeError(
