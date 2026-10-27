@@ -16,7 +16,12 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
-from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_kernel import (
+    KV_COMPUTE_BLOCK,
+    MERGE_HEAD_DIM,
+    MERGE_PARTITIONS,
+    compile_pa_decode_tile,
+)
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
@@ -229,9 +234,12 @@ def pa_decode(
     the device CU count for the gfx950 head-256 pipe shapes and twice that
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
-    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, a cap
-    of one writes output directly when sinks are absent and query/output strides
-    match. Other plans use packed scratch and reduction.
+    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, when
+    sinks are absent and query/output strides match, a cap of one writes output
+    directly. So do plans with one task slot per sequence (capacity equal to
+    the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
+    that still own several tasks merge them in the tile kernel using the plan's
+    arrival counters. Other plans use packed scratch and the separate reducer.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -604,12 +612,37 @@ def pa_decode(
     pmax = max_logits
     psum = exp_sums
     pout = temporary_output
+    # Bound the reducer without shrinking the reusable plan or scratch.
+    partition_bound = min(
+        work_plan.capacity,
+        max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
+    )
+    if sliding_window > 0:
+        # Bound the unaligned MTP window without shrinking the reusable plan.
+        window_tiles = (
+            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+        ) // KV_COMPUTE_BLOCK + 1
+        partition_bound = min(partition_bound, window_tiles)
+    # gfx1250 tile kernels write final output for one-partition plans and for
+    # plans with one task slot per sequence: single tasks store directly, and
+    # sequences given slots freed by empty ones merge in their last-arriving
+    # CTA. Merging costs two device-scope round trips (sparse decode 64 rows:
+    # 17.7 us vs 10.3 us for tile plus reducer), so wider plans keep the reducer.
     direct_output = (
         arch == "gfx1250"
-        and num_partitions == 1
         and sinks is None
         and output.stride() == query.stride()
+        and (
+            num_partitions == 1
+            or (
+                work_plan.capacity == num_seqs
+                and work_plan.arrival_counters is not None
+                and min(partition_bound, num_partitions) <= MERGE_PARTITIONS
+                and head_dim <= MERGE_HEAD_DIM
+            )
+        )
     )
+    one_partition_output = direct_output and num_partitions == 1
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -699,18 +732,31 @@ def pa_decode(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+    merge_args = ()
+    if arch == "gfx1250":
+        merged = direct_output and not one_partition_output
+        merge_args = (
+            ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
+            ptr_arg(work_plan.reduce_info, fx.Int32),
+            (
+                ptr_arg(work_plan.arrival_counters, fx.Int32)
+                if merged
+                else flyc.from_c_void_p(fx.Int32, 0)
+            ),
+        )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
         _run_compiled(
             compiled["launch"],
             (
                 ptr_arg(work_plan.reduce_info, fx.Float32)
-                if direct_output
+                if one_partition_output
                 else ptr_arg(pmax, fx.Float32)
             ),
             ptr_arg(psum, fx.Float32),
             ptr_arg(
-                output if direct_output else pout, _flydsl_pointer_dtype(pout.dtype)
+                output if one_partition_output else pout,
+                _flydsl_pointer_dtype(pout.dtype),
             ),
             ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
             ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
@@ -735,6 +781,7 @@ def pa_decode(
             int(query.stride(1)),
             ptr_arg(work_plan.work_info, fx.Int32),
             work_plan.capacity,
+            *merge_args,
             s,
         )
         if direct_output:
@@ -742,17 +789,6 @@ def pa_decode(
         output_5d = output.reshape(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
         )
-        # Bound the reducer without shrinking the reusable plan or scratch.
-        partition_bound = min(
-            work_plan.capacity,
-            max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
-        )
-        if sliding_window > 0:
-            # Bound the unaligned MTP window without shrinking the reusable plan.
-            window_tiles = (
-                sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
-            ) // KV_COMPUTE_BLOCK + 1
-            partition_bound = min(partition_bound, window_tiles)
         launch_pa_decode_ps_reduce(
             output_5d,
             psum,
