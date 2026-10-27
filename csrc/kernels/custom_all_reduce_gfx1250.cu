@@ -448,6 +448,53 @@ void all_gather(fptr_t _fa,
     _all_gather(_fa, actual_inp, actual_out, numel, dtype, last_dim_size, dim);
 }
 
+// The LL lane (allreduce_ll) reads the input only on the local rank and pushes
+// it into peer scratch, so for LL-eligible inputs (fa->use_ll) the staging copy
+// into the registered pool is redundant -- staging exists for the naive kernel,
+// which reads peers' inputs out of the registered pool.
+//
+// AITER_CUSTOM_AR_LL_ZERO_COPY selects when the copy is skipped:
+//   graph (default) = skip only while the stream is CAPTURING a CUDA graph.
+//                     Decode runs entirely inside a captured HIP graph, so the
+//                     skip decision is baked into the graph once and every
+//                     replay is copy-free; the producer->AR read ordering is
+//                     held by the captured stream dependency. Eager steps
+//                     (prefill / mixed batches) keep the copy as a correctness
+//                     margin, since the decision there is not graph-ordered.
+//   always          = skip for every LL-eligible input, eager and captured
+//                     alike (matches the plain use_ll() skip).
+//   0/off/false     = never skip (pre-zero-copy behavior; always stage).
+// The input must also be 16B-aligned because the LL kernel issues b128
+// loads/stores over it.
+static bool _ll_reads_input_locally(fptr_t _fa, hipStream_t stream,
+                                     int64_t bytes, const void* inp)
+{
+    enum Mode { OFF, GRAPH, ALWAYS };
+    static const Mode mode = []() {
+        const char* e = std::getenv("AITER_CUSTOM_AR_LL_ZERO_COPY");
+        if(!e)
+            return GRAPH;
+        if(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0 ||
+           std::strcmp(e, "false") == 0)
+            return OFF;
+        if(std::strcmp(e, "always") == 0)
+            return ALWAYS;
+        return GRAPH;
+    }();
+    if(mode == OFF)
+        return false;
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(!fa->use_ll((size_t)bytes))
+        return false;
+    if((reinterpret_cast<uintptr_t>(inp) & 15) != 0)
+        return false;
+    if(mode == ALWAYS)
+        return true;
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    HIP_CALL(hipStreamIsCapturing(stream, &status));
+    return status == hipStreamCaptureStatusActive;
+}
+
 void all_reduce(fptr_t _fa,
                 const aiter_tensor_t& inp,
                 const aiter_tensor_t& out,
@@ -465,8 +512,7 @@ void all_reduce(fptr_t _fa,
 
     bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
 
-    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    if(reg_inp_ptr != 0 && !fa->use_ll(data_bytes))
+    if(reg_inp_ptr != 0 && !_ll_reads_input_locally(_fa, stream, data_bytes, actual_inp))
     {
         if(data_bytes > reg_inp_bytes)
             throw std::runtime_error("registered buffer is too small to contain the input");
