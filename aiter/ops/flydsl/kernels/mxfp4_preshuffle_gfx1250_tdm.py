@@ -87,6 +87,27 @@ if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
+# AITER_FLYDSL_TDM_SCALE_WAVES=2 (with num_waves_per_tensor_tdm=4): A and B stay split
+# over all four waves, but the A-scale is loaded by waves 0-1 and the B-scale by waves
+# 2-3 (as with 2), so every wave issues 3 TDM loads per stage. Plain 4 splits the
+# A-scale (m_warp rows) along K when m_warp < 4, which gives wrong results.
+# The kernel name gets _sw2.
+TDM_SCALE_WAVES = int(os.environ.get("AITER_FLYDSL_TDM_SCALE_WAVES", "0"))
+
+
+def _tdm_wave_classes(job_owner_lists, num_waves):
+    """Group the waves by the exact list of TDM jobs they own: [(waves, job ids)].
+
+    Plain Python outside the kernel body, so FlyDSL does not turn the loop into a
+    device loop.
+    """
+    classes = {}
+    for w in range(num_waves):
+        key = tuple(i for i, owners in enumerate(job_owner_lists) if w in owners)
+        classes.setdefault(key, []).append(w)
+    return sorted((tuple(ws), key) for key, ws in classes.items())
+
+
 if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 if PLANAR_LDS not in (0, 1):
@@ -463,6 +484,13 @@ def launch_gemm_a8w4_tdm(
     _waves_per_tensor = (
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
+    _scale_waves_on = (
+        TDM_SCALE_WAVES == 2
+        and num_waves_per_tensor_tdm == 4
+        and not tdm_as_in_prologue
+    )
+    if _scale_waves_on:
+        _waves_per_tensor += "_sw2"
     _ep = "_epscatter" if enable_ep_scatter else ""
     _mma_group = (
         f"_mg{sched_mma_group}"
@@ -760,6 +788,10 @@ def launch_gemm_a8w4_tdm(
             waves = [wave_groups[i % len(wave_groups)] for i in range(4)]
             # Number of rotating A/B/A-scale/B-scale loads issued by each wave.
             TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
+            if const_expr(_scale_waves_on):
+                assert num_waves == 4, "TDM_SCALE_WAVES=2 needs a four-wave workgroup"
+                waves = [(0, 1, 2, 3), (0, 1, 2, 3), (0, 1), (2, 3)]
+                TDM_PER = 3
         nw = 1
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
@@ -1015,11 +1047,21 @@ def launch_gemm_a8w4_tdm(
                             if const_expr(j.waves == job_waves[g]):
                                 emit(j)
 
+        # With overlapping owner groups (TDM_SCALE_WAVES=2) a wave owns jobs of
+        # several groups; group the waves by the exact set of jobs they own, so
+        # ``fn`` (the whole main loop) runs once per wave with all of its jobs.
+        wave_class_list = _tdm_wave_classes([j.waves for j in jobs], num_waves)
+
         def dispatch_wave_job(fn):
             """Run ``fn`` with the current wave's jobs."""
-            for g in range_constexpr(len(job_waves)):
-                if owns(job_waves[g]):
-                    fn([j for j in jobs if j.waves == job_waves[g]])
+            if const_expr(_scale_waves_on):
+                for c in range_constexpr(len(wave_class_list)):
+                    if owns(wave_class_list[c][0]):
+                        fn([jobs[i] for i in wave_class_list[c][1]])
+            else:
+                for g in range_constexpr(len(job_waves)):
+                    if owns(job_waves[g]):
+                        fn([j for j in jobs if j.waves == job_waves[g]])
 
         def issue_as_prologue():
             """Loads the full A-scale K range into its resident LDS buffer."""
