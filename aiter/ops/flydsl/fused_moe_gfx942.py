@@ -328,6 +328,9 @@ def _run_prefill(
         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
     gemm1_out = _gateup_output(hidden_states, problem)
+    if quant_type == QuantType.per_Tensor:
+        # Gate/Up skips routes sorting drops, but the Down absmax reads every row.
+        gemm1_out.zero_()
     gateup_kernel = _get_compiled_kernel(
         N=problem.gateup_dim,
         K=problem.hidden_dim,

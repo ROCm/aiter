@@ -307,51 +307,53 @@ def compile_moe_gemm2(
         arg_p_topk_weights = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weights))
         expert_id = arg_p_topk_ids[route_idx]
         topk_weight = arg_p_topk_weights[route_idx]
-        arg_p_weight = _make_down_weight_view(p_weight, expert_id)
+        # Routing gives pad rows expert -1, which sorting would drop.
+        if expert_id >= 0:
+            arg_p_weight = _make_down_weight_view(p_weight, expert_id)
 
-        c_frag = gemm_splitk(
-            BLOCK_TILE_SIZE_M,
-            BLOCK_TILE_SIZE_N,
-            TILE_K,
-            blk_n,
-            arg_p_input,
-            arg_p_weight,
-            None,
-            splitk_waves=1,
-            a_with_index=False,
-        )
+            c_frag = gemm_splitk(
+                BLOCK_TILE_SIZE_M,
+                BLOCK_TILE_SIZE_N,
+                TILE_K,
+                blk_n,
+                arg_p_input,
+                arg_p_weight,
+                None,
+                splitk_waves=1,
+                a_with_index=False,
+            )
 
-        _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale)
+            _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale)
 
-        c_frag.store(c_frag.load() * topk_weight)
+            c_frag.store(c_frag.load() * topk_weight)
 
-        c_frag_bf16 = _cvt_f32_to_bf16(c_frag)
+            c_frag_bf16 = _cvt_f32_to_bf16(c_frag)
 
-        arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output) + fx.Int64(batch_idx) * N,
-            fx.make_layout((1, N), (N, 1)),
-        )
-        cp_atom_w = fx.make_copy_atom(
-            fx.UniversalAtomic(fx.AtomicOp.Add, fx.BFloat16), fx.BFloat16
-        )
-        c_tiled_g = fx.make_tiled_copy(
-            cp_atom_w,
-            fx.make_layout(((16, 4), 4), ((1, 64), 16)),
-            fx.make_tile(16, 16),
-        )
-        c_tile = fx.flat_divide(
-            arg_p_output, fx.make_tile(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)
-        )[None, None, None, blk_n]
-        c_dst = c_tiled_g.get_slice(tid).partition_S(c_tile)
-        c_src = c_tiled_g.get_slice(tid).retile(c_frag_bf16)
-        rep_m = fx.size(fx.get_shape(c_src)[1]).to_py_value()
-        rep_n = fx.size(fx.get_shape(c_src)[2]).to_py_value()
-        if tid % 16 == 0:
-            for m in range_constexpr(rep_m):
-                for n in range_constexpr(rep_n):
-                    reg_vec = c_src[None, m, n].load()
-                    ptr_base = fx.get_iter(c_dst[None, m, n, 0])
-                    fxh.atomic_add_bf16(ptr_base, reg_vec)
+            arg_p_output = fx.make_view(
+                fxh._as_ptr(p_output) + fx.Int64(batch_idx) * N,
+                fx.make_layout((1, N), (N, 1)),
+            )
+            cp_atom_w = fx.make_copy_atom(
+                fx.UniversalAtomic(fx.AtomicOp.Add, fx.BFloat16), fx.BFloat16
+            )
+            c_tiled_g = fx.make_tiled_copy(
+                cp_atom_w,
+                fx.make_layout(((16, 4), 4), ((1, 64), 16)),
+                fx.make_tile(16, 16),
+            )
+            c_tile = fx.flat_divide(
+                arg_p_output, fx.make_tile(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N)
+            )[None, None, None, blk_n]
+            c_dst = c_tiled_g.get_slice(tid).partition_S(c_tile)
+            c_src = c_tiled_g.get_slice(tid).retile(c_frag_bf16)
+            rep_m = fx.size(fx.get_shape(c_src)[1]).to_py_value()
+            rep_n = fx.size(fx.get_shape(c_src)[2]).to_py_value()
+            if tid % 16 == 0:
+                for m in range_constexpr(rep_m):
+                    for n in range_constexpr(rep_n):
+                        reg_vec = c_src[None, m, n].load()
+                        ptr_base = fx.get_iter(c_dst[None, m, n, 0])
+                        fxh.atomic_add_bf16(ptr_base, reg_vec)
 
     flyobj = fxh.FlyObjCache()
 

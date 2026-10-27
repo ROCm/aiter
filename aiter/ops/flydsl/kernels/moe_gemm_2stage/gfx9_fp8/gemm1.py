@@ -757,61 +757,63 @@ def compile_moe_gemm1(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         contiguous_n = min(64, BLOCK_TILE_SIZE_N // 2)
 
-        arg_p_weight = _make_gateup_weight_view(p_weight, expert_id, contiguous_n)
+        # Routing gives pad rows expert -1, which sorting would drop.
+        if expert_id >= 0:
+            arg_p_weight = _make_gateup_weight_view(p_weight, expert_id, contiguous_n)
 
-        c_frag = gemm_splitk(
-            BLOCK_TILE_SIZE_M,
-            BLOCK_TILE_SIZE_N,
-            TILE_K,
-            blk_n,
-            arg_p_input,
-            arg_p_weight,
-            lds,
-            splitk_waves=4,
-            a_with_index=False,
-        )
+            c_frag = gemm_splitk(
+                BLOCK_TILE_SIZE_M,
+                BLOCK_TILE_SIZE_N,
+                TILE_K,
+                blk_n,
+                arg_p_input,
+                arg_p_weight,
+                lds,
+                splitk_waves=4,
+                a_with_index=False,
+            )
 
-        c_frag_bf16 = _apply_scale_gateup_bf16(
-            c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale
-        )
+            c_frag_bf16 = _apply_scale_gateup_bf16(
+                c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale
+            )
 
-        arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output) + fx.Int64(batch_idx) * TOPK * (N // 2),
-            fx.make_layout((1, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
-        )
-        out_tensor = fx.rocdl.make_buffer_tensor(
-            arg_p_output,
-            max_size=False,
-            num_records_bytes=1 * TOPK * N // 2 * fx.BFloat16.width // 8,
-        )
-        cp_atom_w = fx.make_copy_atom(
-            (
-                fx.rocdl.BufferCopy64b()
-                if const_expr(BLOCK_TILE_SIZE_N % 128 == 0)
-                else (
-                    fx.rocdl.BufferCopy32b()
-                    if const_expr(BLOCK_TILE_SIZE_N >= 64)
-                    else fx.rocdl.BufferCopy16b()
-                )
-            ),
-            fx.BFloat16,
-        )
-        c_tiled_g = fx.make_tiled_copy(
-            cp_atom_w,
-            fx.make_layout(
-                ((16, 4, 4), max(1, contiguous_n // 16)),
-                ((max(1, contiguous_n), 1, 4), 16),
-            ),
-            fx.make_tile(16, max(16, contiguous_n)),
-        )
-        c_tile = fx.flat_divide(
-            out_tensor[None, e_idx, None],
-            fx.make_tile(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2),
-        )[None, None, None, blk_n]
-        c_dst = c_tiled_g.get_slice(tid).partition_S(c_tile)
-        c_src = c_tiled_g.get_slice(tid).retile(c_frag_bf16)
+            arg_p_output = fx.make_view(
+                fxh._as_ptr(p_output) + fx.Int64(batch_idx) * TOPK * (N // 2),
+                fx.make_layout((1, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
+            )
+            out_tensor = fx.rocdl.make_buffer_tensor(
+                arg_p_output,
+                max_size=False,
+                num_records_bytes=1 * TOPK * N // 2 * fx.BFloat16.width // 8,
+            )
+            cp_atom_w = fx.make_copy_atom(
+                (
+                    fx.rocdl.BufferCopy64b()
+                    if const_expr(BLOCK_TILE_SIZE_N % 128 == 0)
+                    else (
+                        fx.rocdl.BufferCopy32b()
+                        if const_expr(BLOCK_TILE_SIZE_N >= 64)
+                        else fx.rocdl.BufferCopy16b()
+                    )
+                ),
+                fx.BFloat16,
+            )
+            c_tiled_g = fx.make_tiled_copy(
+                cp_atom_w,
+                fx.make_layout(
+                    ((16, 4, 4), max(1, contiguous_n // 16)),
+                    ((max(1, contiguous_n), 1, 4), 16),
+                ),
+                fx.make_tile(16, max(16, contiguous_n)),
+            )
+            c_tile = fx.flat_divide(
+                out_tensor[None, e_idx, None],
+                fx.make_tile(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N // 2),
+            )[None, None, None, blk_n]
+            c_dst = c_tiled_g.get_slice(tid).partition_S(c_tile)
+            c_src = c_tiled_g.get_slice(tid).retile(c_frag_bf16)
 
-        fx.copy(cp_atom_w, c_src, c_dst[None, None, None, 0])
+            fx.copy(cp_atom_w, c_src, c_dst[None, None, None, 0])
 
         if const_expr(fused_down_clear):
             clear_blocks = (N + BLOCK_TILE_SIZE_N - 1) // BLOCK_TILE_SIZE_N
