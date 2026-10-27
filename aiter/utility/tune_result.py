@@ -37,6 +37,25 @@ def efficiency_cost(us, watts) -> float:
     return us_f * watts_f
 
 
+def sort_by_energy_then_latency(frame, us_col="us", watts_col="watts"):
+    """Order by package energy, then by latency.
+
+    Unmeasured watts sort as infinite cost, so they stay behind any measured
+    row and, among themselves, keep the lowest ``us``. Dedup must run after
+    this sort: a cost-only sort leaves every NaN row tied and a stable order
+    then keeps whichever candidate arrived first.
+    """
+    cost = [
+        efficiency_cost(us, watts)
+        for us, watts in zip(frame[us_col], frame[watts_col], strict=True)
+    ]
+    return (
+        frame.assign(_energy_cost=cost)
+        .sort_values(["_energy_cost", us_col], kind="mergesort")
+        .drop(columns="_energy_cost")
+    )
+
+
 def selection_rank(us, watts, select_power: bool):
     """Sort key. Latency mode is lowest us. Power mode is us*watts, with unmeasured rows last by us."""
     try:
