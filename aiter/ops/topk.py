@@ -1478,17 +1478,48 @@ def _top_k_per_row_decode_packed(
     # row of this view is the buffer itself, a row's start added in-kernel.
     view = flat.as_strided((num_rows, flat.numel()), (0, 1))
     if _should_use_flydsl_topk_decode(
-        view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
+        view,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        0,
+        1,
+        k,
+        stable,
+        values,
         width=plane_width,
-    ):  # fmt: skip
+    ):
         return flydsl_topk.flydsl_top_k_per_row_decode(
-            view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
-            row_starts=row_starts, plane_width=plane_width,
-        )  # fmt: skip
+            view,
+            next_n,
+            seq_lens,
+            indices,
+            num_rows,
+            0,
+            1,
+            k,
+            stable,
+            values,
+            row_starts=row_starts,
+            plane_width=plane_width,
+        )
     return flydsl_topk.flydsl_radix_topk_one_block(
-        view, row_starts, seq_lens, indices, values, num_rows, 0, 1, k, stable,
-        is_decode=True, next_n=next_n, plane_width=plane_width, packed_rows=True,
-    )  # fmt: skip
+        view,
+        row_starts,
+        seq_lens,
+        indices,
+        values,
+        num_rows,
+        0,
+        1,
+        k,
+        stable,
+        is_decode=True,
+        next_n=next_n,
+        plane_width=plane_width,
+        packed_rows=True,
+    )
 
 
 def flydsl_dcp_topk_merge(

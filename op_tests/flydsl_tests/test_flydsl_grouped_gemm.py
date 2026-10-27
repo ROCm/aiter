@@ -358,6 +358,8 @@ def _run_grouped_via_fused_moe(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     use_bias: bool = True,
+    bias_dtype: torch.dtype = torch.float32,
+    bias_column_pattern: bool = False,
     bench: bool = False,
     kernel_bench: bool = False,
     seed: int = 0,
@@ -421,7 +423,20 @@ def _run_grouped_via_fused_moe(
         generator=generator,
     )
     if use_bias:
-        if data_init == "constant":
+        if bias_column_pattern:
+            # Exact binary fractions vary across experts, lanes and N tiles.
+            # A missing tile offset or wrong bias dtype cannot hide behind a
+            # constant bias, and the reference uses these same logical values.
+            expert_bias = torch.arange(experts, dtype=torch.float32)[:, None] / 8
+            bias1 = (
+                expert_bias
+                + torch.arange(2 * inter, dtype=torch.float32)[None, :] / 512
+                + 0.25
+            )
+            bias2 = (
+                expert_bias + torch.arange(K, dtype=torch.float32)[None, :] / 256 + 0.5
+            )
+        elif data_init == "constant":
             bias1 = torch.full((experts, 2 * inter), 0.5)
             bias2 = torch.full((experts, K), 0.5)
         else:
@@ -429,6 +444,7 @@ def _run_grouped_via_fused_moe(
                 torch.randn((experts, 2 * inter), generator=generator) * 1e-3
             ).float()
             bias2 = (torch.randn((experts, K), generator=generator) * 1e-3).float()
+        bias1, bias2 = bias1.to(bias_dtype), bias2.to(bias_dtype)
     else:
         bias1 = torch.zeros((experts, 2 * inter))
         bias2 = torch.zeros((experts, K))
@@ -645,6 +661,8 @@ def run_moe(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     use_bias: bool = True,
+    bias_dtype: torch.dtype = torch.float32,
+    bias_column_pattern: bool = False,
     tol: float = VERIFY_TOL_A4W4,
     raise_on_fail: bool = True,
     bench: bool = False,
@@ -687,6 +705,8 @@ def run_moe(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             use_bias=use_bias,
+            bias_dtype=bias_dtype,
+            bias_column_pattern=bias_column_pattern,
             bench=bench,
             kernel_bench=kernel_bench,
             seed=seed,
@@ -1168,13 +1188,15 @@ def run_csv_scenario(args) -> None:
                 flush=True,
             )
             continue
-        # A gemm1 bias turns off gemm1's own requantization, and the stage-2
-        # quant that replaces it needs inter_dim % 256 == 0 (Kimi-K3 at TP8 has
-        # 384 and no bias).
-        if not args.no_bias and inter_dim % 256:
+        # Bias does not disable the fused requant epilogue. Only explicitly
+        # selecting the standalone quant path imposes its 256-column bound.
+        disable_requant = os.environ.get(
+            "AITER_FLYDSL_DISABLE_GEMM1_REQUANT", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        if disable_requant and inter_dim % 256:
             print(
-                f"[csv] row {idx}: skipped inter_dim={inter_dim} with a bias "
-                "(needs inter_dim % 256 == 0; pass --no-bias)",
+                f"[csv] row {idx}: skipped inter_dim={inter_dim} without fused "
+                "requant (needs inter_dim % 256 == 0)",
                 flush=True,
             )
             continue

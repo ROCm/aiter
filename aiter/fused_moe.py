@@ -1506,8 +1506,10 @@ def _fused_moe_impl(
     M, topk = topk_ids.shape
     herd_candidate_ids, herd_candidate_weights = topk_ids, topk_weight
     if herd_topk:
-        if get_gfx() not in ("gfx950", "gfx1250"):
-            raise ValueError("HERD MoE requires gfx950 or gfx1250")
+        # Only the gfx1250 integration passes K+1 candidates to MoE.
+        # Other architectures finish HERD in the router and pass K routes.
+        if get_gfx() != "gfx1250":
+            raise ValueError("herd_topk is supported only on gfx1250")
         if topk != herd_topk + 1 or topk_weight.shape != topk_ids.shape:
             raise ValueError(
                 "herd_topk requires K+1 candidate IDs and weights per token"

@@ -1697,17 +1697,40 @@ def launch_gemm_a8w4_tdm(
             # mainloop body and no wave-parity branch.
             run_mainloop(bool(interleaved_lds_load_on))
 
+            # Add bias once while preparing the fp32 accumulators. Every
+            # epilogue consumes these fragments, independently of activation,
+            # requantization, and the EP combine wire format.
+            if const_expr(has_bias):
+                bias_elem = {1: T.bf16, 2: T.f32, 3: T.f16}[has_bias]
+                bias_ptr_type = fx.PointerType.get(
+                    elem_ty=bias_elem,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=4 if has_bias == 2 else 2,
+                )
+                bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
+
             accs = []
             output_fragments_per_acc = WMMA_N // 16
             for idx in range_constexpr(n_acc):
                 acc = Vec(c_frags[idx].load())
                 for fragment in range_constexpr(output_fragments_per_acc):
-                    accs.append(
-                        Vec.from_elements(
-                            [acc[fragment * 8 + i] for i in range_constexpr(8)],
-                            fx.Float32,
-                        ).ir_value()
+                    out_acc = Vec.from_elements(
+                        [acc[fragment * 8 + i] for i in range_constexpr(8)],
+                        fx.Float32,
                     )
+                    if const_expr(has_bias):
+                        wn = (idx % wmma_n_rep) * output_fragments_per_acc + fragment
+                        bias_col = blk_n + wnb + wn * 16 + kgrp * 8
+                        bias_vals = Vec(
+                            fx.ptr_load(
+                                bias_map + expert * i32_n + bias_col,
+                                result_type=T.vec(8, bias_elem),
+                            )
+                        )
+                        if const_expr(has_bias != 2):
+                            bias_vals = bias_vals.to(fx.Float32)
+                        out_acc = out_acc + bias_vals
+                    accs.append(out_acc.ir_value())
             # The epilogue restages C in this arena. Draining our own tensorcnt
             # suffices: peer multicast loads are pairwise matched with ours.
             pipeline_fence(outstanding=0)
@@ -1733,29 +1756,6 @@ def launch_gemm_a8w4_tdm(
                 else None
             )
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
-
-            if const_expr(has_bias):
-                bias_elem = {1: T.bf16, 2: T.f32, 3: T.f16}[has_bias]
-                bias_ptr_type = fx.PointerType.get(
-                    elem_ty=bias_elem,
-                    address_space=fx.AddressSpace.Global,
-                    alignment=4 if has_bias == 2 else 2,
-                )
-                bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
-
-            def _biased_acc(wm, wn, col_rel):
-                acc = Vec(accs[wm * output_n_rep + wn])
-                if const_expr(has_bias):
-                    bias_vals = Vec(
-                        fx.ptr_load(
-                            bias_map + expert * i32_n + blk_n + col_rel,
-                            result_type=T.vec(8, bias_elem),
-                        )
-                    )
-                    if const_expr(has_bias != 2):
-                        bias_vals = bias_vals.to(fx.Float32)
-                    acc = acc + bias_vals
-                return acc
 
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
@@ -1812,7 +1812,7 @@ def launch_gemm_a8w4_tdm(
                             pairs = []
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                                 wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                acc = _biased_acc(wm, wn, wnb + wn * 16 + kgrp * 8)
+                                acc = Vec(accs[wm * output_n_rep + wn])
                                 for p in range_constexpr(4):
                                     pairs.append((acc[2 * p], acc[2 * p + 1]))
 
@@ -1962,7 +1962,7 @@ def launch_gemm_a8w4_tdm(
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
                                 wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
                                 col_rel = wnb + wn * 16 + kgrp * 8
-                                acc = _biased_acc(wm, wn, col_rel)
+                                acc = Vec(accs[wm * output_n_rep + wn])
                                 # Weight before quantizing: combine sums
                                 # unweighted. It cannot ride the cvt scale
                                 # operand instead -- v_cvt_scalef32 takes only
@@ -2046,7 +2046,7 @@ def launch_gemm_a8w4_tdm(
                         row_rel = wmb + wm * 16 + lane16
                         for wn in range_constexpr(output_n_rep):
                             col_rel = wnb + wn * 16 + kgrp * 8
-                            acc = _biased_acc(wm, wn, col_rel)
+                            acc = Vec(accs[wm * output_n_rep + wn])
                             if const_expr(stage1_act):
                                 if const_expr(is_situv2):
                                     act_vals = [
