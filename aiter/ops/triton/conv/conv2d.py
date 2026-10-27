@@ -176,7 +176,6 @@ def conv2d(
     dilation=(1, 1),
     activation="none",
     layout="nchw",
-    *,
     padding_mode="zeros",
 ):
     """Forward 2-D conv on AMD ROCm via Triton. Drop-in for the forward of
@@ -256,9 +255,15 @@ def conv2d_winograd_f4x3(
     activation="none",
     block_k=BLOCK_K,
     layout="nchw",
+    padding_mode="zeros",
 ):
-    """NCHW/NHWC conv2d using Winograd F(4x4,3x3). Raises ValueError for non-eligible convs."""
+    """NCHW/NHWC conv2d using Winograd F(4x4,3x3).
+
+    Supports the same padding modes as conv2d. Raises ValueError for
+    non-eligible convolutions.
+    """
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout=layout)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     _require_winograd_2d_eligible("conv2d_winograd_f4x3", R, S, stride, dilation, C)
 
@@ -295,13 +300,18 @@ def conv2d_winograd_f4x3_cblocked(
     activation="none",
     block_k=BLOCK_K,
     x_blocked=None,
+    padding_mode="zeros",
 ):
     """NCHW conv2d using Winograd F(4x4,3x3) with NCHWc input layout for coalesced loads.
     Raises ValueError for non-eligible convs.
 
     x_blocked: optional pre-packed NCHWc input. Routed execution supplies it
-    explicitly; direct method calls may leave it unset to include packing."""
+    explicitly; direct method calls may leave it unset to include packing.
+    Supports the same padding modes as conv2d. When a nonzero mode materializes
+    padding, x_blocked must be omitted so the padded input is packed instead.
+    """
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, x_blocked=x_blocked)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     _require_winograd_2d_eligible(
         "conv2d_winograd_f4x3_cblocked", R, S, stride, dilation, C
@@ -349,9 +359,14 @@ def conv2d_1x1(
     activation="none",
     block_k=BLOCK_K,
     layout="nchw",
+    padding_mode="zeros",
 ):
-    """NCHW/NHWC conv2d for 1x1 kernels. Raises ValueError for non-1x1."""
+    """NCHW/NHWC conv2d for 1x1 kernels. Raises ValueError for non-1x1.
+
+    Supports the same padding modes as conv2d.
+    """
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout=layout)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     if not _is_1x1_conv(R, S, dilation):
         raise ValueError(f"conv2d_1x1 requires 1x1 kernel, got {R}x{S}")
@@ -388,9 +403,14 @@ def conv2d_general(
     activation="none",
     block_k=BLOCK_K,
     layout="nchw",
+    padding_mode="zeros",
 ):
-    """NCHW/NHWC conv2d using general kernel with prepacked weights (5x5, 7x7, etc.)."""
+    """NCHW/NHWC conv2d using general kernel with prepacked weights (5x5, 7x7, etc.).
+
+    Supports the same padding modes as conv2d.
+    """
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout=layout)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
 
     y = _alloc_output(N, K_out, P, Q, x, layout)
@@ -430,9 +450,14 @@ def conv2d_nhwc_3x3(
     dilation=(1, 1),
     activation="none",
     block_k=BLOCK_K,
+    padding_mode="zeros",
 ):
-    """NHWC conv2d for 3x3 kernels. Raises ValueError for non-3x3."""
+    """NHWC conv2d for 3x3 kernels. Raises ValueError for non-3x3.
+
+    Supports the same padding modes as conv2d.
+    """
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, layout="nhwc")
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     if not _is_3x3_conv(R, S):
         raise ValueError(f"conv2d_nhwc_3x3 requires 3x3 kernel, got {R}x{S}")
@@ -575,7 +600,6 @@ def conv2d_nchw(
     dilation=(1, 1),
     activation="none",
     block_k=BLOCK_K,
-    *,
     padding_mode="zeros",
 ):
     """Route NCHW conv2d with zeros, reflect, replicate, or circular padding.
@@ -609,7 +633,6 @@ def conv2d_nhwc(
     dilation=(1, 1),
     activation="none",
     block_k=BLOCK_K,
-    *,
     padding_mode="zeros",
 ):
     """Conv2d with NHWC (channels-last) input and output.
@@ -647,10 +670,15 @@ def conv2d_nchw_3x3_direct(
     dilation=(1, 1),
     activation="none",
     block_k=BLOCK_K,
+    padding_mode="zeros",
 ):
-    """NCHW 3x3 convolution that reads the activation without repacking."""
+    """NCHW 3x3 convolution that reads the activation without repacking.
+
+    Supports the same padding modes as conv2d.
+    """
     assert x.is_cuda and w_oihw.is_cuda
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x, padding = _prepare_conv2d_padding(x, padding, padding_mode)
     x = _ensure_layout(x, "nchw")
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
     if not _is_3x3_conv(R, S):
@@ -690,13 +718,18 @@ def conv2d_nchw_cblocked(
     activation="none",
     block_k=BLOCK_K,
     x_blocked=None,
+    padding_mode="zeros",
 ):
     """NCHW conv2d with channel-blocked input packing for 3x3 kernels.
     Raises ValueError for non-3x3.
 
     x_blocked: optional pre-packed NCHWc input. Routed execution supplies it
-    explicitly; direct method calls may leave it unset to include packing."""
+    explicitly; direct method calls may leave it unset to include packing.
+    Supports the same padding modes as conv2d. When a nonzero mode materializes
+    padding, x_blocked must be omitted so the padded input is packed instead.
+    """
     stride, padding, dilation = _normalize_conv2d_params(stride, padding, dilation)
+    x, padding = _prepare_conv2d_padding(x, padding, padding_mode, x_blocked=x_blocked)
     N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
 
     if not _is_3x3_conv(R, S):

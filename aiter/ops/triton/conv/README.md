@@ -67,9 +67,9 @@ y = conv2d(
 
 ### Conv2D padding modes
 
-The routed APIs `conv2d`, `conv2d_nchw`, and `conv2d_nhwc` accept the
-keyword-only argument `padding_mode`, defaulting to `"zeros"`. Padding is
-symmetric on opposing sides and accepts an integer or `(pad_height, pad_width)`.
+All routed and specialized Conv2D APIs accept `padding_mode="zeros"` as a
+positional or keyword argument. Padding is symmetric on opposing sides and
+accepts an integer or `(pad_height, pad_width)`.
 
 | Mode | Border behavior | Padding limits per spatial axis |
 |---|---|---|
@@ -90,7 +90,10 @@ Input, weight, and bias must share a CUDA/ROCm device. Routed calls use that
 device and restore the caller's current device afterward. Mixed-architecture
 execution within one process is unsupported.
 
-Direct specialized Conv2D APIs and Conv3D support only implicit zero padding.
+External `x_blocked` requires `padding_mode="zeros"` or zero padding amounts.
+Otherwise, omit it to pack the padded input; passing it raises `ValueError`.
+
+Conv3D supports only implicit zero padding.
 
 ### Inference tensors
 

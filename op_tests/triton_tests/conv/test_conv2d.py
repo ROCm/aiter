@@ -28,6 +28,8 @@ Padding preparation adds 20 focused cases for validation, boundary amounts,
 layout conversion, empty batches, no-op reuse, and delegation to F.pad.
 Routed padding integration adds 8 cases for numerical results across specialized
 routes and zero-padding bypass.
+Specialized padding adds 9 cases: seven direct-API comparisons using the same
+matrix and two prepacked-input contracts.
 
 The whole module is skipped without a supported GPU. Padding preparation itself
 does not require architecture-specific padding configurations.
@@ -494,6 +496,7 @@ def test_prepared_padding_handles_empty_batch():
     assert conv_padding == (0, 0)
 
 
+@pytest.mark.parametrize("entry_point", ["routed", "specialized"])
 @pytest.mark.parametrize(
     "api,layout,route_name,filter_shape,stride,dilation,padding_mode,dtype",
     [
@@ -560,8 +563,9 @@ def test_prepared_padding_handles_empty_batch():
         ("conv2d", "nhwc", "WF4X3", (3, 3), (1, 1), (1, 1), "reflect", torch.bfloat16),
     ],
 )
-def test_routed_padding_matches_reference(
+def test_padding_matches_reference(
     monkeypatch,
+    entry_point,
     api,
     layout,
     route_name,
@@ -590,17 +594,35 @@ def test_routed_padding_matches_reference(
         dilation,
         padding_mode,
     ).relu()
-    method = {
-        "GENERAL": "general",
-        "WF4X3": "winograd_f4x3",
-        "WF4X3_CBLOCKED": "winograd_f4x3_cblocked",
-    }.get(route_name, "cblocked")
-    monkeypatch.setattr(conv2d_module, "_select_3x3_method", lambda *args: method)
-    monkeypatch.setattr(
-        conv2d_module,
-        "_nchw_direct_is_profitable",
-        lambda *args: route_name == "DIRECT_NCHW_3X3",
-    )
+    if entry_point == "routed":
+        method = {
+            "GENERAL": "general",
+            "WF4X3": "winograd_f4x3",
+            "WF4X3_CBLOCKED": "winograd_f4x3_cblocked",
+        }.get(route_name, "cblocked")
+        monkeypatch.setattr(conv2d_module, "_select_3x3_method", lambda *args: method)
+        monkeypatch.setattr(
+            conv2d_module,
+            "_nchw_direct_is_profitable",
+            lambda *args: route_name == "DIRECT_NCHW_3X3",
+        )
+        extra_args = (layout if api == "conv2d" else 64,)
+    else:
+        api = {
+            "ONE_X_ONE": "conv2d_1x1",
+            "GENERAL": "conv2d_general",
+            "DIRECT_NCHW_3X3": "conv2d_nchw_3x3_direct",
+            "CBLOCKED_NCHW": "conv2d_nchw_cblocked",
+            "NHWC_3X3": "conv2d_nhwc_3x3",
+            "WF4X3_CBLOCKED": "conv2d_winograd_f4x3_cblocked",
+            "WF4X3": "conv2d_winograd_f4x3",
+        }[route_name]
+        if route_name in ("ONE_X_ONE", "GENERAL", "WF4X3"):
+            extra_args = (64, layout)
+        elif route_name in ("CBLOCKED_NCHW", "WF4X3_CBLOCKED"):
+            extra_args = (64, None)
+        else:
+            extra_args = (64,)
     actual = getattr(conv2d_module, api)(
         source,
         weight,
@@ -609,8 +631,8 @@ def test_routed_padding_matches_reference(
         padding,
         dilation,
         "relu",
-        layout if api == "conv2d" else 64,
-        padding_mode=padding_mode,
+        *extra_args,
+        padding_mode,
     )
 
     tolerances = (
@@ -619,7 +641,15 @@ def test_routed_padding_matches_reference(
         else dynamic_conv_tolerances
     )
     rtol, atol = tolerances(dtype, channels * filter_shape[0] * filter_shape[1])
-    torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        actual.float(),
+        expected,
+        rtol=rtol,
+        atol=atol,
+        msg=lambda details: (
+            f"{api}, padding_mode={padding_mode!r}, layout={layout}:\n{details}"
+        ),
+    )
     assert actual.dtype == dtype, "convolution output must preserve the input dtype"
     memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
     assert actual.is_contiguous(
@@ -640,3 +670,47 @@ def test_routed_padding_noop_preserves_zero_path(monkeypatch):
         source, weight, padding=0, layout="nhwc", padding_mode="reflect"
     )
     torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "api", ["conv2d_nchw_cblocked", "conv2d_winograd_f4x3_cblocked"]
+)
+def test_specialized_padding_prepacked_input(api):
+    torch.manual_seed(0)
+    source = torch.randn(2, 65, 7, 9, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(17, 65, 3, 3, device="cuda", dtype=source.dtype)
+    x_blocked, _ = conv_prepack.prepack_nchw_to_cblocked(source)
+    convolution = getattr(conv2d_module, api)
+
+    with pytest.raises(ValueError, match="x_blocked.*materialized padding"):
+        convolution(
+            source,
+            weight,
+            padding=(0, 1),
+            padding_mode="reflect",
+            x_blocked=x_blocked,
+        )
+
+    tolerances = _winograd_tolerances if "winograd" in api else dynamic_conv_tolerances
+    rtol, atol = tolerances(source.dtype, 65 * 3 * 3)
+    for padding, padding_mode in [((1, 2), "zeros"), (0, "reflect")]:
+        actual = convolution(
+            source,
+            weight,
+            padding=padding,
+            padding_mode=padding_mode,
+            x_blocked=x_blocked,
+        )
+        expected = conv2d_padding_reference(
+            source.float(), weight.float(), padding=padding, padding_mode=padding_mode
+        )
+        torch.testing.assert_close(
+            actual.float(),
+            expected,
+            rtol=rtol,
+            atol=atol,
+            msg=lambda details, padding_mode=padding_mode, padding=padding: (
+                f"{api} with x_blocked, padding_mode={padding_mode!r}, "
+                f"padding={padding}:\n{details}"
+            ),
+        )
