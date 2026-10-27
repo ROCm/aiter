@@ -1163,6 +1163,14 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
+@functools.lru_cache(maxsize=1024)
+def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
+    logger.warning(
+        f"gemm_a8w8_blockscale_bpreshuffle N:{n}, K:{k} has asm-tuned rows, which "
+        f"only write bf16; {dtype} output uses the CK heuristic instead."
+    )
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
@@ -1366,10 +1374,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
             )
         elif libtype == "asm":
-            splitK = config["splitK"]
-            return gemm_a8w8_blockscale_bpreshuffle_asm(
-                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
-            )
+            if dtype == dtypes.bf16:
+                splitK = config["splitK"]
+                return gemm_a8w8_blockscale_bpreshuffle_asm(
+                    XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+                )
+            _warn_blockscale_asm_row_not_bf16(n, k, dtype)
         elif libtype == "opus":
             kernelId = int(config["kernelId"])
             from aiter.ops.opus import opus_gemm
