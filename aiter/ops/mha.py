@@ -1931,6 +1931,12 @@ def _flash_attn_forward(
         )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
+        # The fmha_v3_fwd ASM kernels take no sink arguments: dispatching a call
+        # with sink_ptr or sink_size to them would silently drop the sink term.
+        # `not swa` does not exclude sinks, since a window that covers the whole
+        # sequence is reset to -1 above, so route any sink request to CK
+        # (mha_fwd), which applies sinks under both causal and window masks.
+        ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
         # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
@@ -2997,6 +3003,13 @@ def _flash_attn_varlen_forward(
         )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
+        # The fmha_v3_varlen_fwd ASM kernels take no sink arguments: dispatching
+        # a call with sink_ptr or sink_size to them would silently drop the sink
+        # term. `not swa` does not exclude sinks, since a window that covers the
+        # whole sequence is reset to -1 above, so route any sink request to CK
+        # (mha_varlen_fwd), which applies sinks under both causal and window
+        # masks.
+        ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and logits_soft_cap == 0.0
         # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table

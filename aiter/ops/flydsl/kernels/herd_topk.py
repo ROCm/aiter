@@ -22,8 +22,13 @@ def build_herd_finalize_module(
     renormalize: bool,
     round_to_bf16: bool,
     block_threads: int = _FINALIZE_THREADS,
+    has_num_valid_rows: bool = False,
 ):
-    """Build the fused popularity, min-unique, and Top-K output launcher."""
+    """Build the fused popularity, min-unique, and Top-K output launcher.
+
+    `has_num_valid_rows`: rows at or past the device count `num_valid_rows[0]`
+    are padding -- left out of the batch popularity, written as ids -1 and
+    weights 0."""
     if topk < 1 or topk + 1 > num_experts:
         raise ValueError(
             f"invalid HERD geometry: topk={topk}, num_experts={num_experts}"
@@ -44,6 +49,7 @@ def build_herd_finalize_module(
             rn=renormalize,
             rb=round_to_bf16,
             blk=block_threads,
+            nv=has_num_valid_rows,
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -52,6 +58,7 @@ def build_herd_finalize_module(
         candidate_values: fx.Tensor,
         topk_weights: fx.Tensor,
         topk_ids: fx.Tensor,
+        num_valid_rows: fx.Tensor,
         topk_weights_stride: Int32,
         topk_ids_stride: Int32,
         rows: Int32,
@@ -62,12 +69,15 @@ def build_herd_finalize_module(
         popularity = storage.popularity.peek().view(fx.make_layout(num_experts, 1))
         topk_weights_flat = ptr_buf_tensor(topk_weights, elem=Float32)
         topk_ids_flat = ptr_buf_tensor(topk_ids, elem=Int32)
+        valid_rows = rows
+        if const_expr(has_num_valid_rows):
+            valid_rows = fx.min(rows, ptr_buf_tensor(num_valid_rows, elem=Int32)[0])
 
         for expert in range(tid, Int32(num_experts), Int32(block_threads)):
             popularity[expert] = Int32(0)
         gpu.barrier()
 
-        total = rows * Int32(kp1)
+        total = valid_rows * Int32(kp1)
         for idx in range(tid, total, Int32(block_threads)):
             candidate_row = idx // Int32(kp1)
             candidate_col = idx - candidate_row * Int32(kp1)
@@ -76,7 +86,13 @@ def build_herd_finalize_module(
         gpu.barrier()
 
         row = tid
-        if row < rows:
+        if const_expr(has_num_valid_rows):
+            pad_row = (row >= valid_rows) & (row < rows)
+            if pad_row:
+                for j in range_constexpr(topk):
+                    topk_ids_flat[row * topk_ids_stride + j] = Int32(-1)
+                    topk_weights_flat[row * topk_weights_stride + j] = Float32(0.0)
+        if row < valid_rows:
             ids = [candidate_ids[row, j] for j in range_constexpr(kp1)]
             values = [candidate_values[row, j] for j in range_constexpr(kp1)]
             pops = [popularity[ids[j]] for j in range_constexpr(kp1)]
@@ -125,6 +141,7 @@ def build_herd_finalize_module(
         candidate_values: fx.Tensor,
         topk_weights: fx.Tensor,
         topk_ids: fx.Tensor,
+        num_valid_rows: fx.Tensor,
         topk_weights_stride: fx.Int32,
         topk_ids_stride: fx.Int32,
         rows: Int32,
@@ -136,6 +153,7 @@ def build_herd_finalize_module(
             candidate_values,
             topk_weights,
             topk_ids,
+            num_valid_rows,
             topk_weights_stride,
             topk_ids_stride,
             rows,

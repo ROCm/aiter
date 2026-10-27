@@ -134,7 +134,6 @@ def _is_fused_decode_sort_quant_enabled(
     activation: ActivationType,
     is_g1u1: bool,
     expert_mask: torch.Tensor | None,
-    num_local_tokens: torch.Tensor | None,
     need_local_topk_ids: bool,
     run_1stage: bool,
     stage1_is_flydsl: bool,
@@ -177,7 +176,6 @@ def _is_fused_decode_sort_quant_enabled(
         and activation == ActivationType.Silu
         and is_g1u1
         and expert_mask is None
-        and num_local_tokens is None
         and not need_local_topk_ids
         and not run_1stage
         and stage1_is_flydsl
@@ -200,6 +198,7 @@ def _fused_decode_sort_quant(
     moebuf_dtype: torch.dtype,
     accumulate: bool,
     compact_scale: bool = False,
+    num_local_tokens: torch.Tensor | None = None,
 ):
     """Return standard sorted metadata plus the pre-quantized stage-1 input."""
     device = hidden_states.device
@@ -239,6 +238,7 @@ def _fused_decode_sort_quant(
         activation_quant,
         activation_scale_token,
         global_experts,
+        num_local_tokens,
     )
     activation_scale = activation_scale_token
     if not compact_scale:
@@ -1884,7 +1884,6 @@ def _fused_moe_impl(
         activation=activation,
         is_g1u1=isG1U1,
         expert_mask=expert_mask,
-        num_local_tokens=num_local_tokens,
         need_local_topk_ids=need_local_topk_ids,
         run_1stage=metadata.run_1stage,
         stage1_is_flydsl=stage1_func is _flydsl_stage1_wrapper,
@@ -1980,6 +1979,7 @@ def _fused_moe_impl(
             moebuf_dtype=dtype,
             accumulate=not runtime_stage2_reduce,
             compact_scale=fused_compact_scale,
+            num_local_tokens=num_local_tokens,
         )
         local_topk_ids = None
     else:

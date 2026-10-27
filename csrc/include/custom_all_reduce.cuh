@@ -4353,7 +4353,6 @@ class CustomAllreduce
                     rd.ptrs[j] = self_ptr;
                 }
             }
-            output_buffers_[self_ptr] = d_rank_data_end_ - 1 - i;
         }
 
         if(num_input_buffers > 0)
