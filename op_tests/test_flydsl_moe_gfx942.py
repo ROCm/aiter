@@ -257,6 +257,7 @@ def test_config_strings():
         "16_16_16_False_True_False:default:0",
         "16_16_16_True_True:default:0",
         "16_16_16_False_True:1x4_64x256:128",
+        "64_128_64_False_True:default:0",
     ):
         try:
             Config.from_string(invalid)

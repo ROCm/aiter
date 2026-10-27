@@ -45,6 +45,10 @@ class Config:
             raise ValueError(
                 "Direct decoding cannot use prefill or specialized Down paths"
             )
+        # The batch-1 kernels have a fixed tile, so any other tile would be misreported.
+        tile = (self.BLOCK_M, self.BLOCK_N, self.BLOCK_K)
+        if self.use_batch1_algorithm and tile != (16, 16, 16):
+            raise ValueError("Direct decoding uses the 16_16_16 tile")
 
     def to_string(self):
         # Only direct decoding adds the fifth tile field, so existing strings are unchanged.
