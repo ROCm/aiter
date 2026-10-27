@@ -128,6 +128,24 @@ def _prep_weight(w, k, kt, kh, kw, wc, cgp):
     return wk
 
 
+def prepare_operands_gfx1250(x_ndhwc, weight, padding, groups):
+    """Do run_conv3d_gfx1250's zeros pad, channel pad and weight pack up front.
+
+    Returns ``(x, weight, packed_weight)``. Calling run_conv3d_gfx1250 on them
+    with ``padding=0``, NDHWC input and ``packed_weight=packed_weight`` builds
+    the same kernel param as the unprepared call, minus the per-call prep.
+    """
+    pad = _as_tuple3(padding, "padding")
+    x = _host_pad_ndhwc(x_ndhwc.contiguous(), pad, pad, "zeros")
+    cgp = _pad_cgp(x.shape[-1] // groups)
+    x = _pad_channels_ndhwc(x, groups, cgp)
+    k, wc, kt, kh, kw = weight.shape
+    if cgp != wc:
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, cgp - wc))
+    weight = weight.contiguous()
+    return x, weight, _prep_weight(weight, k, kt, kh, kw, cgp, cgp)
+
+
 def _pick_tile(npq, k, groups, device, ho, wo):
     """Pick (tile, block_rows) that fills the device and fits Wo."""
     kg = k // groups
@@ -228,6 +246,7 @@ def run_conv3d_gfx1250(
     num_buffers=2,
     variant="bandwidth_bound",
     main_loop_unroll=False,
+    packed_weight=None,  # (K, kT*kH*kW*cgp) from prepare_operands_gfx1250
     **_ignored,
 ):
     """Run gfx1250 FlyDSL conv3d (TDM+WMMA; optional split-K / dyn_hw / tuned tile)."""
@@ -279,7 +298,14 @@ def run_conv3d_gfx1250(
         empty = (0, do, ho, wo, k) if out_ndhwc else (0, k, do, ho, wo)
         return torch.empty(empty, device=x.device, dtype=torch.bfloat16)
 
-    w_packed = _prep_weight(weight, k, kt, kh, kw, wc, cgp)
+    if packed_weight is None:
+        w_packed = _prep_weight(weight, k, kt, kh, kw, wc, cgp)
+    else:
+        assert tuple(packed_weight.shape) == (k, kt * kh * kw * cgp), (
+            f"packed_weight must be ({k}, {kt * kh * kw * cgp}), "
+            f"got {tuple(packed_weight.shape)}"
+        )
+        w_packed = packed_weight
     has_bias = bias is not None
     bias_arg = (
         bias.to(torch.float32).contiguous()

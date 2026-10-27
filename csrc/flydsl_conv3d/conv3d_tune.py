@@ -29,6 +29,10 @@ import torch.nn.functional as F
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_CONV3D_BF16
 from aiter.ops.flydsl import flydsl_conv_implicit
+from aiter.ops.flydsl.conv3d_gfx1250 import (
+    prepare_operands_gfx1250,
+    run_conv3d_gfx1250,
+)
 from aiter.ops.flydsl.conv3d_policy import (
     get_flydsl_conv3d_configs,
     max_lds_bytes,
@@ -125,6 +129,46 @@ def generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed=0, device
     weight = torch.randn((k, c // groups, kt, kh, kw), device=device, dtype=dtypes.bf16)
     bias = torch.randn((k,), device=device, dtype=dtypes.fp32) if has_bias else None
     return {"x": x, "weight": weight, "bias": bias}
+
+
+def generate_data_gfx1250(
+    n, c, d, h, w, k, kt, kh, kw, groups, has_bias, padding, seed=0, device=None
+):
+    """``generate_data`` plus the operands run_conv3d_gfx1250 prepares per call.
+
+    The timed call gets them ready-made, as the GEMM and MoE tuners get their
+    quantized and shuffled operands, so ``us`` leaves out the host-side pad,
+    channel pad and weight pack; ``x``/``weight`` stay raw for the reference.
+    """
+    data = generate_data(n, c, d, h, w, k, kt, kh, kw, groups, has_bias, seed, device)
+    x_tune, w_tune, w_packed = prepare_operands_gfx1250(
+        data["x"], data["weight"], padding, groups
+    )
+    data.update(x_tune=x_tune, w_tune=w_tune, w_packed=w_packed)
+    return data
+
+
+def run_flydsl_conv3d_gfx1250(
+    x_tune, w_tune, w_packed, bias, params, tile, wgm, splitk, block_rows
+):
+    # Same call flydsl_conv_implicit makes on gfx1250, which forwards neither
+    # wgm nor splitK: the dispatch derives splitK itself.
+    del wgm, splitk
+    return run_conv3d_gfx1250(
+        x_tune,
+        w_tune,
+        bias=bias,
+        stride=params["stride"],
+        padding=0,
+        dilation=params["dilation"],
+        groups=params["groups"],
+        padding_mode="zeros",
+        tile=tile,
+        block_rows=block_rows,
+        input_layout="NDHWC",
+        output_layout="NDHWC",
+        packed_weight=w_packed,
+    )
 
 
 def run_flydsl_conv3d(x, weight, bias, params, tile, wgm, splitk, block_rows=1):
@@ -481,13 +525,21 @@ class Conv3dTuner(TunerCommon):
                 block_rows,
                 kname,
             )
+            shape_args = (n, c, d, h, w, k, kt, kh, kw, groups, has_bias)
+            if is_1250:
+                gen, gen_args = generate_data_gfx1250, (*shape_args, params["padding"])
+                fn = run_flydsl_conv3d_gfx1250
+                fn_keys = ["x_tune", "w_tune", "w_packed", "bias"]
+            else:
+                gen, gen_args = generate_data, shape_args
+                fn, fn_keys = run_flydsl_conv3d, ["x", "weight", "bias"]
             tasks.append(
                 (
                     info,
-                    generate_data,
-                    (n, c, d, h, w, k, kt, kh, kw, groups, has_bias),
-                    run_flydsl_conv3d,
-                    (["x", "weight", "bias"], params, tile, wgm, sk, block_rows),
+                    gen,
+                    gen_args,
+                    fn,
+                    (fn_keys, params, tile, wgm, sk, block_rows),
                     {},
                     conv3d_ref,
                     (["x", "weight", "bias"], params),
