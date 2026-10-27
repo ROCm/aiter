@@ -796,6 +796,33 @@ def test_grouped_a4w4_swiglu_matches_torch_ref():
     )
 
 
+@pytest.mark.parametrize("valid", [64, 41, 0])
+def test_route_gives_minus_one_routes_no_row(valid):
+    """The TP route kernel indexes its per-expert counter through a raw
+    pointer: a route to expert -1 must not reach it, and takes
+    DROPPED_ROUTE_ROW."""
+    _require_gfx1250()
+    from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_topids_to_rows
+
+    experts, topk, tokens = 256, 6, 64
+    max_m = tokens * topk
+    ids = torch.rand(tokens, experts).topk(topk, dim=1).indices.to(torch.int32)
+    ids[valid:] = -1
+    # The counter starts one element into its buffer, so a -1 route reaching
+    # the atomic lands in guard[0] instead of in someone else's memory.
+    guard = torch.zeros(experts + 1, dtype=torch.int32)
+    counts, rows = flydsl_moe_topids_to_rows(ids, experts, max_m, counter=guard[1:])
+    assert int(guard[0]) == 0, "a -1 route reached the per-expert counter"
+    hist = torch.bincount(ids[:valid].flatten().long(), minlength=experts)
+    assert torch.equal(counts.long(), hist)
+    assert (rows[valid:] == DROPPED_ROUTE_ROW).all()
+    expert = ids[:valid].long()
+    slot = rows[:valid].long() - expert * max_m
+    assert ((slot >= 0) & (slot < hist[expert])).all()
+    assert rows[:valid].unique().numel() == valid * topk
+
+
 def test_situv2_activation_matches_torch():
     torch.manual_seed(0)
     gate = torch.randn(4, 32)
