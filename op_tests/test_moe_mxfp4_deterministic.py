@@ -139,10 +139,16 @@ def _check_batch_invariant(p, out, activation, **kwargs):
 @_SKIP
 @pytest.mark.parametrize(
     "model_dim,inter_dim,E,topk",
-    [(1024, 512, 32, 4), (3072, 3072, 32, 4), (3072, 3072, 128, 4)],
+    [
+        (1024, 512, 32, 4),
+        (3072, 3072, 32, 4),
+        (3072, 3072, 128, 4),
+        (6144, 768, 129, 6),
+    ],
 )
 def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk):
-    """gpt-oss style SwiGLU (clamp, per-expert biases)."""
+    """SwiGLU with clamp and per-expert biases; gpt-oss shapes, and MiniMax-M3's per
+    GPU at TP4 (128 routed experts plus a fused shared expert)."""
     limit = 7.0
     p = _problem(_M, model_dim, inter_dim, E, topk)
     out = _run(p, slice(None), ActivationType.Swiglu, True, swiglu_limit=limit)

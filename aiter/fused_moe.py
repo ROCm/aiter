@@ -1664,9 +1664,9 @@ def _fused_moe_impl(
         activation, beta, linear_beta, swiglu_limit
     )
 
-    def _resolve_metadata(disable_inline_sort=False, tokens=None):
+    def _resolve_metadata(disable_inline_sort=False):
         metadata = get_2stage_cfgs(
-            get_padded_M(M if tokens is None else tokens),
+            get_padded_M(M),
             model_dim,
             inter_dim,
             E,
@@ -1705,7 +1705,7 @@ def _fused_moe_impl(
 
     if deterministic:
         metadata = _deterministic_metadata(
-            _resolve_metadata(tokens=_DETERMINISTIC_TEMPLATE_TOKENS), M
+            M, activation, dtype, quant_type, hidden_pad, intermediate_pad
         )
     else:
         metadata = _resolve_metadata()
@@ -3465,47 +3465,52 @@ def _check_deterministic_supported(
         )
 
 
-# The tuned MXFP4 configurations change the stage-1 K waves, the fused fp4 output
-# and the stage-2 kernel family (v1 / v2 layout, tile_k 128 / 256) with the token
-# count, and each changes how a row's sums are split. Deterministic mode keeps the
-# configuration of this token count at every M and only grows the tile height,
-# which does not change a row's reduction.
-_DETERMINISTIC_TEMPLATE_TOKENS = 32
-
-
 def _deterministic_block_m(tokens: int) -> int:
     return 32 if tokens <= 1024 else (64 if tokens <= 2048 else 128)
 
 
-def _deterministic_metadata(template, tokens):
-    """The template configuration with a fixed K structure, made deterministic.
+def _deterministic_metadata(
+    tokens, activation, dtype, quant_type, hidden_pad, intermediate_pad
+):
+    """FlyDSL v1 MXFP4 kernels with one K structure for every token count.
 
-    Stage 1: FlyDSL a4w4 with two K waves and tile_k 256; stage 2: the
-    non-atomic reduce epilogue instead of atomic adds of the top-k partials; no
-    split-K. The tile height follows the token count.
+    The tuned MXFP4 configurations change the stage-1 K waves, the fused fp4
+    output and the stage-2 kernel family (v1 / v2 layout, tile_k 128 / 256) with
+    the token count, and each changes how a row's sums are split. Deterministic
+    mode always runs stage 1 with two K waves and tile_k 256, and stage 2 with
+    the non-atomic reduce epilogue instead of atomic adds of the top-k partials,
+    without split-K. Only the tile height grows with the token count, which does
+    not change a row's reduction.
     """
     from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
     block_m = _deterministic_block_m(tokens)
-    names = (
-        f"flydsl_moe1_afp4_wfp4_bf16_t{block_m}x128x256_w2",
-        f"flydsl_moe2_afp4_wfp4_bf16_t{block_m}x128x256_reduce",
-    )
-    stages = []
-    for stage, name in zip((template.stage1, template.stage2), names):
-        kw = getattr(stage, "keywords", None) or {}
-        tuned = kw.get("kernelName", "")
-        if not tuned.startswith("flydsl_moe") or "_layout_" in tuned:
-            raise NotImplementedError(
-                f"fused_moe(deterministic=True) needs the FlyDSL v1 MoE kernels, "
-                f"got {tuned or stage!r}"
-            )
-        params = get_flydsl_kernel_params(name)
+    kn1 = f"flydsl_moe1_afp4_wfp4_bf16_t{block_m}x128x256_w2"
+    kn2 = f"flydsl_moe2_afp4_wfp4_bf16_t{block_m}x128x256_reduce"
+    for kn in (kn1, kn2):
+        params = get_flydsl_kernel_params(kn)
         if params is None or params.get("k_batch", 1) != 1:
-            raise NotImplementedError(f"{name} is not registered without split-K")
-        stages.append(functools.partial(stage.func, **{**kw, "kernelName": name}))
-    return replace(
-        template, stage1=stages[0], stage2=stages[1], block_m=block_m, ksplit=-1
+            raise NotImplementedError(f"{kn} is not registered without split-K")
+    enable_bias = _needs_swiglu_bias_support(dtype, quant_type)
+    return MOEMetadata(
+        functools.partial(
+            _flydsl_stage1_wrapper,
+            kernelName=kn1,
+            activation=activation,
+            inter_dim_pad=intermediate_pad,
+            model_dim_pad=hidden_pad,
+        ),
+        functools.partial(
+            _flydsl_stage2_wrapper,
+            kernelName=kn2,
+            inter_dim_pad=intermediate_pad,
+            model_dim_pad=hidden_pad,
+        ),
+        block_m,
+        -1,  # no split-K
+        False,
+        has_bias=enable_bias,
+        stage2_has_bias=enable_bias,
     )
 
 
