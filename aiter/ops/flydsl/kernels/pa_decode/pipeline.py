@@ -18,6 +18,7 @@ from ..utils import rcp_f32
 from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
+from .op_merge import Gfx1250PartitionMerge
 from .op_softmax import PaDecodeSoftmax
 from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK
 
@@ -621,6 +622,7 @@ class Gfx1250Bf16Pipeline:
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
         self.mem = Gfx1250Memory(ctx)
+        self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
     @flyc.jit
     def run(self):
@@ -795,56 +797,72 @@ class Gfx1250Bf16Pipeline:
                     # Retire P reads before another query tile overwrites them.
                     gpu.barrier()
             final = yield next_state
-        pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
-        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
-        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
         slot = fx.Int64(ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
             gpu.block_id("x")
         )
-        for m in range_constexpr(t.m_tiles):
-            row = m * 16 + ctx.lane16
-            output_row = ctx.query_begin * t.query_group_size + row
-            partial_row = slot * (t.rows * t.query_splits) + output_row
-            denom = final[m * state_stride + 1]
-            inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
-            if row < t.rows:
-                for vh in range_constexpr(t.head_dim // 64):
-                    d = vh * 64 + ctx.warp * 16 + ctx.half * 8
-                    value = (
-                        final[m * state_stride + 2 + vh]
-                        * fx.Vector.from_elements(
-                            [inv],
-                            dtype=fx.Float32,
-                        ).broadcast_to(8)
-                    ).to(t.q_dtype)
-                    offset = (
-                        (
-                            fx.Int64(ctx.planned_seq) * t.query_length
-                            + output_row // t.query_group_size
+
+        def store(direct):
+            # Direct stores write final rows; other tasks store packed partials.
+            pout = fx.recast_iter(
+                t.q_dtype,
+                ctx.output_ptr if t.merge_partitions and direct else ctx.pout_ptr,
+            )
+            pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+            psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+            for m in range_constexpr(t.m_tiles):
+                row = m * 16 + ctx.lane16
+                output_row = ctx.query_begin * t.query_group_size + row
+                partial_row = slot * (t.rows * t.query_splits) + output_row
+                denom = final[m * state_stride + 1]
+                inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+                if row < t.rows:
+                    for vh in range_constexpr(t.head_dim // 64):
+                        d = vh * 64 + ctx.warp * 16 + ctx.half * 8
+                        value = (
+                            final[m * state_stride + 2 + vh]
+                            * fx.Vector.from_elements(
+                                [inv],
+                                dtype=fx.Float32,
+                            ).broadcast_to(8)
+                        ).to(t.q_dtype)
+                        offset = (
+                            self.merge.output_offset(output_row, d)
+                            if direct
+                            else partial_row * t.head_dim + d
                         )
-                        * ctx.stride_q_row
-                        + (
-                            ctx.kv_h * t.query_group_size
-                            + output_row % t.query_group_size
-                        )
-                        * ctx.stride_q_head
-                        + d
-                        if t.direct_output
-                        else partial_row * t.head_dim + d
-                    )
-                    fx.ptr_store(value, fx.add_offset(pout, offset))
-                if const_expr(not t.direct_output):  # noqa: SIM102
-                    if ctx.warp == 0 and ctx.half == 0:
-                        pmax[partial_row] = final[m * state_stride] * fx.Float32(
-                            1.0 / LOG2E
-                        )
-                        psum[partial_row] = denom
+                        if const_expr(t.merge_partitions and not direct):
+                            self.merge.publish(fx.add_offset(pout, offset), value)
+                        else:
+                            fx.ptr_store(value, fx.add_offset(pout, offset))
+                    if const_expr(not direct):  # noqa: SIM102
+                        if ctx.warp == 0 and ctx.half == 0:
+                            row_max = final[m * state_stride] * fx.Float32(1.0 / LOG2E)
+                            if const_expr(t.merge_partitions):
+                                self.merge.publish(
+                                    fx.add_offset(pmax, partial_row), row_max
+                                )
+                                self.merge.publish(
+                                    fx.add_offset(psum, partial_row), denom
+                                )
+                            else:
+                                pmax[partial_row] = row_max
+                                psum[partial_row] = denom
+
+        if const_expr(t.merge_partitions):
+            if ctx.task_count == 1:
+                store(True)
+            else:
+                store(False)
+                self.merge.arrive()
+        else:
+            store(t.direct_output)
 
 
 class Gfx1250Pipeline:
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
         self.mem = Gfx1250Memory(ctx)
+        self.merge = Gfx1250PartitionMerge(ctx, self.mem)
 
     @flyc.jit
     def run(self):
@@ -1225,52 +1243,65 @@ class Gfx1250Pipeline:
             if const_expr(t.packed_lds):
                 next_state.append(vfactor)
             final = yield next_state
-        pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
-        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
-        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
         slot = fx.Int64(ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
             gpu.block_id("x")
         )
-        for m in range_constexpr(t.m_tiles):
-            row = m * 16 + ctx.lane16
-            output_row = ctx.query_begin * t.query_group_size + row
-            partial_row = slot * (t.rows * t.query_splits) + output_row
-            denom = final[m * state_stride + 1]
-            inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
-            if row < t.rows:
-                for vh in range_constexpr(vh_count):
-                    d = vh * 64 + ctx.warp * 16 + ctx.half * 8
-                    value = (
-                        final[m * state_stride + 2 + vh]
-                        * fx.Vector.from_elements(
-                            [fx.Float32(inv * final[-1] if t.packed_lds else inv)],
-                            dtype=fx.Float32,
-                        ).broadcast_to(8)
-                    ).to(t.q_dtype)
-                    fx.ptr_store(
-                        value,
-                        fx.add_offset(
+
+        def store(direct):
+            # Direct stores write final rows; other tasks store packed partials.
+            pout = fx.recast_iter(
+                t.q_dtype,
+                ctx.output_ptr if t.merge_partitions and direct else ctx.pout_ptr,
+            )
+            pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+            psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+            for m in range_constexpr(t.m_tiles):
+                row = m * 16 + ctx.lane16
+                output_row = ctx.query_begin * t.query_group_size + row
+                partial_row = slot * (t.rows * t.query_splits) + output_row
+                denom = final[m * state_stride + 1]
+                inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+                if row < t.rows:
+                    for vh in range_constexpr(vh_count):
+                        d = vh * 64 + ctx.warp * 16 + ctx.half * 8
+                        value = (
+                            final[m * state_stride + 2 + vh]
+                            * fx.Vector.from_elements(
+                                [fx.Float32(inv * final[-1] if t.packed_lds else inv)],
+                                dtype=fx.Float32,
+                            ).broadcast_to(8)
+                        ).to(t.q_dtype)
+                        target = fx.add_offset(
                             pout,
                             (
-                                (
-                                    fx.Int64(ctx.planned_seq) * t.query_length
-                                    + output_row // t.query_group_size
-                                )
-                                * ctx.stride_q_row
-                                + (
-                                    ctx.kv_h * t.query_group_size
-                                    + output_row % t.query_group_size
-                                )
-                                * ctx.stride_q_head
-                                + d
-                                if t.direct_output
+                                self.merge.output_offset(output_row, d)
+                                if direct
                                 else partial_row * t.head_dim + d
                             ),
-                        ),
-                    )
-                if const_expr(not t.direct_output):  # noqa: SIM102
-                    if ctx.warp == 0 and ctx.half == 0:
-                        pmax[partial_row] = final[m * state_stride] * fx.Float32(
-                            1.0 / LOG2E
                         )
-                        psum[partial_row] = denom
+                        if const_expr(t.merge_partitions and not direct):
+                            self.merge.publish(target, value)
+                        else:
+                            fx.ptr_store(value, target)
+                    if const_expr(not direct):  # noqa: SIM102
+                        if ctx.warp == 0 and ctx.half == 0:
+                            row_max = final[m * state_stride] * fx.Float32(1.0 / LOG2E)
+                            if const_expr(t.merge_partitions):
+                                self.merge.publish(
+                                    fx.add_offset(pmax, partial_row), row_max
+                                )
+                                self.merge.publish(
+                                    fx.add_offset(psum, partial_row), denom
+                                )
+                            else:
+                                pmax[partial_row] = row_max
+                                psum[partial_row] = denom
+
+        if const_expr(t.merge_partitions):
+            if ctx.task_count == 1:
+                store(True)
+            else:
+                store(False)
+                self.merge.arrive()
+        else:
+            store(t.direct_output)
