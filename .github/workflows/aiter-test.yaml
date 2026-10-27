@@ -1208,6 +1208,9 @@ jobs:
             pip install tabulate
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
+            # nightly: amd-mori 1.2.4 lacks mori #751 (grpc-free import) and #786 (SDMA bitcode)
+            pip install 'amd-mori-nightly==1.2.5.dev20261025'
+            pip show amd-mori-nightly
           "
 
       - name: Sync prebuilt kernels into source tree
