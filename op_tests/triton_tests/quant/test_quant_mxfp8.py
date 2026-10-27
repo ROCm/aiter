@@ -27,10 +27,15 @@ LEGACY_BLOCK_SIZE = 128
 _E8M0_MASK_INT32 = -8388608
 
 
-def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
+def torch_mxfp8_quant_from_fp32(
+    x_fp32: torch.Tensor,
+    log2_dtype_max: int = 8,
+    out_dtype: torch.dtype = torch.float8_e4m3fn,
+):
     """Bit-faithful port of `_dynamic_mxfp8_quant_kernel` quant logic, taking fp32 input.
 
-    Computes per-1x32 e8m0 scale (uint8) and FP8 e4m3fn values.
+    Computes per-1x32 e8m0 scale (uint8) and FP8 e4m3 values. OCP e4m3fn
+    scales by 2**8; fnuz e4m3 (gfx942) by 2**7.
     """
     assert x_fp32.dim() == 2, f"x_fp32 must be 2D, got {x_fp32.dim()}"
     M, K = x_fp32.shape
@@ -44,14 +49,14 @@ def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
     amax_i32 = (amax_i32 + 0x200000) & _E8M0_MASK_INT32
     amax_p2 = amax_i32.view(torch.float32)
 
-    scale_unbiased = torch.log2(amax_p2).floor() - 8
+    scale_unbiased = torch.log2(amax_p2).floor() - log2_dtype_max
     scale_unbiased = torch.clamp(scale_unbiased, min=-127, max=127)
     scale_e8m0 = (scale_unbiased.to(torch.int32) + 127).to(torch.uint8)
     quant_scale = torch.exp2(-scale_unbiased)
 
     qx_2d = x_2d * quant_scale  # broadcast over inner-32
     qx = qx_2d.reshape(M, K)
-    y_fp8 = qx.to(torch.float8_e4m3fn)
+    y_fp8 = qx.to(out_dtype)
     s = scale_e8m0.reshape(M, Ng)
     return y_fp8, s
 
@@ -65,38 +70,57 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
 # -----------------------------------------------------------------------------
 
 
+_PER_1X32_MXFP8_SHAPES = [
+    # Shapes in different gfx1250 Gluon config buckets.
+    (1, 3072),
+    (4, 7168),
+    (40, 4096),
+    (4100, 4096),
+    (4100, 1024),
+    (1, 32),
+    (1, 64),
+    (1, 128),
+    (2, 32),
+    (8, 64),
+    (16, 128),
+    (32, 256),
+    (64, 512),
+    (128, 1024),
+    (137, 64),  # non-power-of-2 M
+    (256, 32),
+    # A few shapes spanning bench_quant_mxfp4_fp8.py's default range, plus
+    # non-power-of-2 shapes in between.
+    (8, 1024),
+    (2048, 3072),
+    (16384, 7168),
+    (6000, 5024),
+]
+
+
 @pytest.mark.parametrize(
-    "M, K",
+    "M, K, dtype, quant_dtype",
     [
-        # Shapes in different gfx1250 Gluon config buckets.
-        (1, 3072),
-        (4, 7168),
-        (40, 4096),
-        (4100, 4096),
-        (4100, 1024),
-        (1, 32),
-        (1, 64),
-        (1, 128),
-        (2, 32),
-        (8, 64),
-        (16, 128),
-        (32, 256),
-        (64, 512),
-        (128, 1024),
-        (137, 64),  # non-power-of-2 M
-        (256, 32),
-        # A few shapes spanning bench_quant_mxfp4_fp8.py's default range, plus
-        # non-power-of-2 shapes in between.
-        (8, 1024),
-        (2048, 3072),
-        (16384, 7168),
-        (6000, 5024),
+        pytest.param(M, K, dtype, torch.float8_e4m3fn)
+        for M, K in _PER_1X32_MXFP8_SHAPES
+        for dtype in (torch.bfloat16, torch.float16)
+    ]
+    + [
+        pytest.param(
+            137,
+            128,
+            torch.bfloat16,
+            torch.float8_e4m3fnuz,
+            id="gfx942-e4m3fnuz",
+        )
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
+def test_per_1x32_mxfp8_quant(
+    M: int, K: int, dtype: torch.dtype, quant_dtype: torch.dtype
+):
     if not arch_info.is_any_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
+    if quant_dtype == torch.float8_e4m3fnuz and arch_info.get_arch() != "gfx942":
+        pytest.skip("float8_e4m3fnuz is the gfx942 FP8 encoding")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -104,10 +128,13 @@ def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
 
     # Reference path: emulate the kernel in fp32 (matching its precision).
     x_fp32 = x.to(torch.float32)
-    y_ref, s_ref = torch_mxfp8_quant_from_fp32(x_fp32)
+    log2_dtype_max = 7 if quant_dtype == torch.float8_e4m3fnuz else 8
+    y_ref, s_ref = torch_mxfp8_quant_from_fp32(
+        x_fp32, log2_dtype_max=log2_dtype_max, out_dtype=quant_dtype
+    )
 
     # Triton path.
-    y_kern, s_kern = dynamic_mxfp8_quant(x)
+    y_kern, s_kern = dynamic_mxfp8_quant(x, quant_dtype=quant_dtype)
 
     # Scales must be bit-exact: the e8m0 derivation is integer-only after
     # the fp32 cast, and amax is order-independent.
@@ -121,6 +148,12 @@ def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
         atol=1,
         rtol=0,
     )
+
+    if quant_dtype == torch.float8_e4m3fnuz:
+        # This fails if the fnuz range regresses to the OCP 448.
+        s_f32 = e8m0_to_f32(s_kern).repeat_interleave(QUANT_BLOCK_SIZE, dim=-1)
+        y_dq = y_kern.float() * s_f32
+        torch.testing.assert_close(y_dq, x.float(), rtol=0.1, atol=1e-2)
 
 
 def test_per_1x32_mxfp8_quant_preallocated_scale():
