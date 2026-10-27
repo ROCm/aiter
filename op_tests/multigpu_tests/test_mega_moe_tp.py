@@ -18,6 +18,7 @@ import itertools
 import os
 import subprocess
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 
@@ -707,6 +708,36 @@ def case_checked(shape, wt, ctx, S):
         os.environ.pop("AITER_MEGAMOE_TP_CHECK", None)
 
 
+def _late_call(layer, c: Case, ctx, late_s: float) -> int:
+    """One call that rank 1 enters late_s seconds after the others; the watchdog code
+    (max over ranks)."""
+    layer.clear_errors()
+    if ctx.rank == 1:
+        time.sleep(late_s)
+    layer(c.x, c.w, c.ids)
+    torch.cuda.synchronize()
+    flags = torch.tensor([layer.poll_errors()], device=c.x.device)
+    dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+    return int(flags[0])
+
+
+def case_late_rank(shape, wt, ctx, S):
+    """Rank 1 enters a call late: within the wait timeout (AITER_MEGAMOE_TP_WAIT_TIMEOUT_MS,
+    default 2 s) the call succeeds, past it the watchdog fires; reset() recovers."""
+    limit = int(os.environ.get("AITER_MEGAMOE_TP_WAIT_TIMEOUT_MS", "2000")) / 1000
+    layer = new_layer(shape, wt, ctx, "ag_rs", max_local("ag_rs", shape, wt))
+    c = make_case(shape, wt, ctx, "ag_rs", 8 * ctx.world, "random", 16)
+    check(call(layer, c).clone(), c, RTOL, "call before the late rank")
+    if _late_call(layer, c, ctx, limit / 2):
+        raise CaseFailure(
+            f"watchdog error with rank 1 {limit / 2} s late (limit {limit} s)"
+        )
+    if not _late_call(layer, c, ctx, limit + 0.5):
+        raise CaseFailure(f"no watchdog error with rank 1 {limit + 0.5} s late")
+    layer.reset()
+    check(call(layer, c).clone(), c, RTOL, "call after reset()")
+
+
 # Distributed state lives here, out of the @benchmark signatures, so the summary
 # tables hold only the sweep axes.
 @dataclass
@@ -852,6 +883,7 @@ MODEL_CASES = {
     "fused tail": case_tail,
     "host validation": case_validation,
     "cross-rank checks": case_checked,
+    "late rank": case_late_rank,
 }
 
 

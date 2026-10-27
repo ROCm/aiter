@@ -18,10 +18,11 @@ Contract:
 * The kernel is persistent (one CTA per CU, CTAs and ranks spin on each other): it
   needs the whole GPU. Do not run it concurrently with other kernels (other streams,
   other processes, CU-masked / partitioned GPUs).
-* A wait that times out (2 s) sets a sticky bit and the launch's output is invalid.
-  ``error_flag()`` is that bit as a device tensor (copy it asynchronously, e.g. every N
-  steps); ``check_errors()`` synchronizes and raises; ``reset()`` (collective) restarts
-  the cross-rank state, which a timed-out launch leaves inconsistent.
+* A wait that times out (2 s; ``AITER_MEGAMOE_TP_WAIT_TIMEOUT_MS``, read at import) sets a
+  sticky bit and the launch's output is invalid. ``error_flag()`` is that bit as a device
+  tensor (copy it asynchronously, e.g. every N steps); ``check_errors()`` synchronizes and
+  raises; ``reset()`` (collective) restarts the cross-rank state, which a timed-out launch
+  leaves inconsistent.
 * The returned tensors (``out=None``, ar outputs, the fused tail's rows) are views of
   internal buffers, valid until the next forward of this instance; pass ``out=`` to keep
   the output.

@@ -20,7 +20,25 @@ from .. import buffer_ops
 from ..mxfp4_gemm_common import _e8m0_from_amax, _fabs_f32
 
 MAX_TP = 8
-DEADLINE = 200_000_000
+
+
+def _wait_timeout_ticks() -> int:
+    raw = os.environ.get("AITER_MEGAMOE_TP_WAIT_TIMEOUT_MS", "2000")
+    try:
+        ms = int(raw)
+    except ValueError:
+        ms = 0
+    if ms <= 0:
+        raise ValueError(
+            "AITER_MEGAMOE_TP_WAIT_TIMEOUT_MS must be a positive number of "
+            f"milliseconds, got {raw!r}"
+        )
+    return ms * 100_000  # s_memrealtime ticks (100 MHz)
+
+
+# How long a wait on a peer spins before the launch reports a timeout. Read once at
+# import and compiled into the kernels; the compile caches key on it.
+DEADLINE = _wait_timeout_ticks()
 AUX_SC1 = 16
 AUX_SYS = 1 | 16
 

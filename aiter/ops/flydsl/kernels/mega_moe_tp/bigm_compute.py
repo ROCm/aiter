@@ -612,8 +612,9 @@ class MegaMoeTPBigM:
 
     def _run(self, launch, args):
         if launch not in self._ready:
-            # compile (or load) on every rank first: the kernel's waits on peers have a 2 s
-            # watchdog, a launch must not start while a peer is still compiling
+            # compile (or load) on every rank first: the kernel's waits on peers have a
+            # watchdog (2 s by default), a launch must not start while a peer is still
+            # compiling
             _bigm_cached(launch, args)
             torch.cuda.synchronize()
             dist.barrier(group=self.sd.group)
