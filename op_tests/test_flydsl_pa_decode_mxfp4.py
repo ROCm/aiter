@@ -502,7 +502,9 @@ def test_pa_decode_mxfp4_plan_free_empty_rows(max_partitions):
     _, kd, ks, k_deq = quantize_pages(k, 128)
     _, vd, vs, v_deq = quantize_pages(v, 128)
     q_in, q_ref = quantize_q_fp8(q)
-    out = run_free(q_in, kd, ks, vd, vs, bt, ctx, HEAD_DIM**-0.5, max_partitions=max_partitions)
+    out = run_free(
+        q_in, kd, ks, vd, vs, bt, ctx, HEAD_DIM**-0.5, max_partitions=max_partitions
+    )
     torch.cuda.synchronize()
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
     for r, n in enumerate(ctx_lens):
