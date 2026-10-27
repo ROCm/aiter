@@ -13,11 +13,28 @@ the kernel; the facts intrinsic to the managed layout live below as private cons
 The ``16b`` suffix names the element width: every swizzle here assumes a ``b128 == 8``
 element chunk. An 8-bit (fp8) variant would need its own manager family.
 
-Contents: ``{Q,K,V,O}Manager16bV{1,2}`` plus ``OManager16bV3`` — V1 stages through
-``cluster_load_async_to_lds_b128``, V2 through TDM (hardware OOB), V3 writes O back with
-``global_store_async_from_lds_b128``. The K/V pairs are one class each plus a transport
-mixin: V2 *inherits* V1 and overrides only ``load_descriptor`` (see the K/V staging
-section). Q and O keep independent V1/V2. Each class's docstring has the details.
+Contents
+--------
+``QManager16bV1``  Q global->LDS->VGPR, ``cluster_load_async_to_lds_b128`` into a ring
+                   of ``lds_tiles`` slots shared by all waves.
+``QManager16bV2``  same fragments, but each wave TDM-copies its own rows into a private
+                   LDS region -- no ring and no cross-wave sync.
+``KManager16bV1``  K staging plus the ``ds_load_b128`` B-fragment read; the whole block's
+                   addresses collapse to 2 base pointers plus compile-time immediates.
+``KManager16bV2``  K with the TDM transport (hardware OOB, row-major padded LDS). Inherits
+                   V1 and overrides only ``load_descriptor``.
+``VManager16bV1``  V staging plus the **transpose** read: PV contracts over kv, so the
+                   fragment comes from ``ds_load_tr16_b128``, not K's natural load.
+``VManager16bV2``  V with the TDM transport; same inherit-and-override shape as K.
+``OManager16bV1``  O epilogue: fp32 accumulator -> bf16 -> LDS -> VGPR re-read ->
+                   ``buffer_store``.
+``OManager16bV2``  O staged padded in LDS and written with ONE TDM store descriptor.
+``OManager16bV3``  O staged the same way but written per-b128 with
+                   ``global_store_async_from_lds_b128``, so it addresses each packed row
+                   itself and serves any gqa.
+
+``_AsyncTransport`` / ``_TdmTransport`` are the two global->LDS transports the K/V pairs
+mix in. Each class's docstring has the details.
 
 Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 """
@@ -37,12 +54,24 @@ from ..tensor_shim import _to_raw as _ir
 # gqa_ratio, kv block width, wave count) arrives through a constructor argument.
 # ============================================================================
 
-# v_wmma_f32_16x16x32_bf16/f16 shape.
+# WMMA tile rows (16 for every v_wmma_f32_16x16xK shape).
 _WMMA_M = 16
-_WMMA_K = 32
-_BF16_BYTES = 2
-_CHUNK_ELEMS = 8  # b128 = 8 bf16
-_CHUNK_BYTES = _CHUNK_ELEMS * _BF16_BYTES  # 16
+
+
+def _width_params(elem_dtype):
+    """``(elem_bytes, wmma_k, chunk_elems)`` for a 16- or 8-bit element type.
+
+    The three tiling facts that scale with element width: 8-bit halves the bytes, so
+    one WMMA contracts twice as deep (16x16x64 vs 16x16x32) and a b128 chunk holds
+    twice the elements.
+    """
+    bits = elem_dtype.width
+    assert bits in (8, 16), f"managers handle 8/16-bit elements, got {bits}"
+    elem_bytes = bits // 8
+    return elem_bytes, 64 // elem_bytes, 16 // elem_bytes
+
+
+_CHUNK_BYTES = 16  # one b128, any element width
 
 # gfx1250 is wave32; every swizzle/reshape here assumes 32 lanes per wave. FlyDSL
 # exposes the wave size only compiler-side (GPUTarget.warp_size), not as a trace-time
@@ -160,10 +189,34 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 # ``async_load()`` and fenced against the counters it declares.
 # ============================================================================
 
-_K_PAD_ELEMS = 8  # 4 DW = 16 B per K row
-_V_PAD_ELEMS = 16  # 8 DW = 32 B per V row
-_Q_PAD_ELEMS = 8  # 4 DW = 16 B per Q row (matches K)
-_O_PAD_ELEMS = 8  # 4 DW = 16 B per O row (conflict-free ds_store_b128)
+# A WMMA AB operand is two GROUPS of 16 B per lane; group ``g`` holds K elements
+# ``[2*KPack*g + KPack*h, +KPack)`` for lane half ``h = lane//16``, KPack = 16/elem_bytes
+# (CK's gfx125 traits: 16x16x32 bf16 KPack 8, 16x16x64 fp8 KPack 16). K and Q read a group
+# with one b128 and sit at that logical k directly. V does NOT: PV sums over kv, so any kv
+# permutation is legal as long as P and V agree, and P's order is fixed by the QK
+# accumulator (lane half h holds kv 8h+0..7 of each 16-row frag). V therefore keeps the
+# 16-bit addressing at every width -- lane row base 8h, one 8-element transpose load per 16
+# kv rows -- and the wmma's own k order is permuted to match.
+_V_LANE_ELEMS = 8
+
+
+def _load_vec_type(elem_dtype, num_elems):
+    """Result type for an LDS load of ``num_elems`` elements.
+
+    8-bit fragments stay in i32 the whole way to the wmma, which takes integer operands
+    anyway. Materializing the f8 vector type instead costs a bitcast that only folds when
+    its single user is another bitcast -- feed one to a shuffle, as every fragment concat
+    does, and the lowering leaves an unlegalizable cast behind."""
+    if elem_dtype.width == 8:
+        return fx.Vector.make_type(num_elems // 4, fx.Int32)
+    return fx.Vector.make_type(num_elems, elem_dtype)
+
+
+# Row skew that keeps those fetches conflict-free: K/Q a fixed 16 B, V 16 ELEMENTS. Swept
+# against the bank model at both LDS service widths (16 and 32 lanes/cycle).
+_AB_PAD_BYTES = 16
+_V_PAD_ELEMS = 16
+_O_PAD_ELEMS = 8  # 4 DW = 16 B per O row (conflict-free ds_store_b128); O stays 16-bit
 
 
 class ProducerCtx:
@@ -268,6 +321,7 @@ def _async_band_descriptor(
     n_block,
     hdim,
     row_bytes,
+    elem_dtype,
     ptr_x,
     stride_seq,
     stride_head,
@@ -302,7 +356,8 @@ def _async_band_descriptor(
     # Write tile: 8(kv) x 32(hdim) per warp call, one b128 per lane -- lane ``l`` writes
     # row ``l // 4``, 8-element chunk ``l % 4``. K and V share it.
     _WR_TILE_KV = 8
-    _WR_TILE_HD = _WMMA_K
+    elem_bytes, wmma_k, chunk_elems = _width_params(elem_dtype)
+    _WR_TILE_HD = wmma_k
     _assert_multiple("producer band rows", num_rows, _WR_TILE_KV)
     _assert_multiple("hdim", hdim, _WR_TILE_HD)
     base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_x)))
@@ -314,8 +369,8 @@ def _async_band_descriptor(
         tile_row = band_r0 + band_row  # row within the tile (what ``valid`` bounds)
         safe_row = (tile_row < valid).select(tile_row, fx.Int32(0))  # clamp OOB
         g_base = (
-            (row0 + safe_row) * stride_seq + head * stride_head + chunk * _CHUNK_ELEMS
-        ) * _BF16_BYTES
+            (row0 + safe_row) * stride_seq + head * stride_head + chunk * chunk_elems
+        ) * elem_bytes
         gptr = create_llvm_ptr(base_i64 + fx.Int64(g_base), address_space=1)
         lds_ptr = create_llvm_ptr(
             lds_base + band_row * fx.Int32(row_bytes) + chunk * fx.Int32(_CHUNK_BYTES),
@@ -324,7 +379,7 @@ def _async_band_descriptor(
         for c in fx.range_constexpr(hdim // _WR_TILE_HD):
             gptrs.append(gptr)  # one source per row block; columns ride the immediate
             lds_ptrs.append(lds_ptr)
-            imm_offs.append(c * _WR_TILE_HD * _BF16_BYTES)
+            imm_offs.append(c * _WR_TILE_HD * elem_bytes)
     return AsyncCopyDescriptor(gptrs, lds_ptrs, imm_offs, cluster=True)
 
 
@@ -390,7 +445,9 @@ def _tdm_load_views(
             num_warps=num_warps,
         )
         blk = fx.zipped_divide(coord, tile)[None, (0, None)]
-        lds_iter = fx.inttoptr(lds_ptr_ty, lds_base + fx.Int32(c0 * _BF16_BYTES))
+        lds_iter = fx.inttoptr(
+            lds_ptr_ty, lds_base + fx.Int32(c0 * _width_params(elem_dtype)[0])
+        )
         lds_view = fx.Tensor(
             fx.make_view(
                 lds_iter,
@@ -479,6 +536,7 @@ class _AsyncTransport:
             n_block=self.n_block,
             hdim=self.hdim,
             row_bytes=self.row_bytes,
+            elem_dtype=self.elem_dtype,
             ptr_x=ptr_src,
             stride_seq=stride_seq,
             stride_head=stride_head,
@@ -541,8 +599,8 @@ class QManager16bV1:
     hands back the raw allocation base; the per-warp sub-offset and the swizzled staging
     layout stay the manager's business.
 
-    Staging layout (per warp, tile-major): each of ``qk_hdim // _WMMA_K`` K-tiles is 16
-    rows x _WMMA_K cols bf16 (1024 B), cut into 4x4 subtiles of 4 rows x 8 cols whose
+    Staging layout (per warp, tile-major): each of ``qk_hdim // wmma_k`` K-tiles is 16
+    rows x wmma_k cols (1024 B), cut into 4x4 subtiles of 4 rows x 8 cols whose
     b128 chunk index is XOR-swizzled with the subtile row to spread LDS banks. Waves
     stack their tiles contiguously.
     """
@@ -558,15 +616,18 @@ class QManager16bV1:
         elem_dtype=fx.BFloat16,
     ):
         self.elem_dtype = elem_dtype
-        if qk_hdim % _WMMA_K != 0:
-            raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
+        self.elem_bytes, self.wmma_k, self.chunk_elems = _width_params(elem_dtype)
+        if qk_hdim % self.wmma_k != 0:
+            raise ValueError(
+                f"qk_hdim must be a multiple of {self.wmma_k}; got {qk_hdim}"
+            )
         self.qk_hdim = qk_hdim  # compile-time
         self.gqa_ratio = gqa_ratio  # compile-time
         self.num_waves = num_waves  # compile-time (threadgroup wave count)
         # Each wave owns q_tiles_per_wave adjacent 16-row Q WMMA tiles (contiguous).
         self.q_tiles_per_wave = q_tiles_per_wave  # compile-time (R)
         self.block_m = _WMMA_M * q_tiles_per_wave * num_waves  # Q rows per threadgroup
-        self.k_tiles = qk_hdim // _WMMA_K
+        self.k_tiles = qk_hdim // self.wmma_k
 
         # Ring depth: how many of a wave's Q K-tiles live in LDS at once. Sets both the
         # LDS footprint and the inflight-async budget so they cannot drift. The default
@@ -586,7 +647,7 @@ class QManager16bV1:
             )
         self.lds_tiles = lds_tiles
         # Per-tile LDS span; a wave stacks its R tiles contiguously.
-        self._tile_stride = _WMMA_M * self.lds_tiles * _WMMA_K * _BF16_BYTES
+        self._tile_stride = _WMMA_M * self.lds_tiles * self.wmma_k * self.elem_bytes
         self._warp_stride = q_tiles_per_wave * self._tile_stride
 
     def get_lds_size_in_byte(self):
@@ -601,8 +662,8 @@ class QManager16bV1:
         """Swizzled LDS byte offset (within a warp region) for a 8-col b128 chunk."""
         sw = col_chunk ^ (row // 4)  # 4x4 subtile XOR swizzle
         return (
-            tile * (_WMMA_M * _WMMA_K * _BF16_BYTES)
-            + row * (_WMMA_K * _BF16_BYTES)
+            tile * (_WMMA_M * self.wmma_k * self.elem_bytes)
+            + row * (self.wmma_k * self.elem_bytes)
             + sw * _CHUNK_BYTES
         )
 
@@ -644,9 +705,9 @@ class QManager16bV1:
                 g_off = (
                     token * stride_q_seq
                     + q_head * stride_q_head
-                    + fx.Int32(tile * _WMMA_K)
-                    + col_chunk * _CHUNK_ELEMS
-                ) * fx.Int32(_BF16_BYTES)
+                    + fx.Int32(tile * self.wmma_k)
+                    + col_chunk * self.chunk_elems
+                ) * fx.Int32(self.elem_bytes)
                 gptrs.append(
                     create_llvm_ptr(q_base_i64 + fx.Int64(g_off), address_space=1)
                 )
@@ -730,12 +791,13 @@ class QManager16bV1:
         fragments, ``scale`` folded in (None leaves Q raw). The leading ``sched_barrier``
         keeps the waits and reads below the caller's SALU, inside the load shadow.
 
-        Returns one list of ``k_tiles`` v16-bf16 A fragments per q-tile."""
+        Returns one list of ``k_tiles`` B fragments per q-tile (two 16 B groups each).
+        """
         rocdl.sched_barrier(0)  # keep waits/reads below the caller's SALU
         R = self.q_tiles_per_wave
         k_tiles = self.k_tiles
         lds_tiles = self.lds_tiles
-        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
+        v8_ty = _load_vec_type(self.elem_dtype, self.chunk_elems)
         scale_bf16 = None if scale is None else scale.to(self.elem_dtype)
 
         def _scaled(v):  # scale=None: the caller scales S after the QK gemm instead
@@ -762,7 +824,7 @@ class QManager16bV1:
                     lo = _scaled(lo)
                     rocdl.s_wait_dscnt(0)  # hi landed
                     hi = _scaled(hi)
-                    q_frags_list[qt].append(lo.shuffle(hi, list(range(16))))
+                    q_frags_list[qt].append(lo.shuffle(hi, list(range(2 * lo.numel))))
             return q_frags_list
 
         # Non-fully-resident ring drain — R==1 only (guarded in __init__).
@@ -781,7 +843,7 @@ class QManager16bV1:
             lo, hi = _read_tile(ds_ptrs, i - lds_tiles)
             rocdl.s_wait_dscnt(0)  # slot free to overwrite
             _refill(i)
-            q_frags.append(_scaled(lo.shuffle(hi, list(range(16)))))
+            q_frags.append(_scaled(lo.shuffle(hi, list(range(2 * lo.numel)))))
         # Drain loop: read the last lds_tiles tiles, no refill; overlap lo scale w/ hi load.
         for i in fx.range_constexpr(0, lds_tiles):
             rocdl.s_wait_asynccnt((lds_tiles - 1 - i) * 2)
@@ -790,7 +852,7 @@ class QManager16bV1:
             lo = _scaled(lo)
             rocdl.s_wait_dscnt(0)  # hi landed
             hi = _scaled(hi)
-            q_frags.append(lo.shuffle(hi, list(range(16))))
+            q_frags.append(lo.shuffle(hi, list(range(2 * lo.numel))))
         return [q_frags]
 
 
@@ -807,7 +869,7 @@ class KManager16bV1(_AsyncTransport):
     many ping-pong buffers as it wants, splits each as it wants, and passes the chosen
     bases (``ptr_lds``) into every method. The block is shared by all waves.
 
-    LDS is row-major with a padded row stride (``qk_hdim + _K_PAD_ELEMS`` elements). The
+    LDS is row-major with a padded row stride (``qk_hdim + pad_elems`` elements). The
     pad keeps the ``ds_load_b128`` fetch bank-conflict-free without a swizzle, which also
     makes the LDS column step equal the global one -- see the K/V staging section for why
     that is what lets the two transports share this class.
@@ -825,8 +887,11 @@ class KManager16bV1(_AsyncTransport):
         elem_dtype=fx.BFloat16,
     ):
         self.elem_dtype = elem_dtype
-        if qk_hdim % _WMMA_K != 0:
-            raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
+        self.elem_bytes, self.wmma_k, self.chunk_elems = _width_params(elem_dtype)
+        if qk_hdim % self.wmma_k != 0:
+            raise ValueError(
+                f"qk_hdim must be a multiple of {self.wmma_k}; got {qk_hdim}"
+            )
         if n_block not in _N_BLOCK_CHOICES:
             raise ValueError(
                 f"n_block must be one of {_N_BLOCK_CHOICES}; got {n_block}"
@@ -834,9 +899,9 @@ class KManager16bV1(_AsyncTransport):
         self.qk_hdim = qk_hdim  # compile-time
         self.n_block = n_block  # compile-time
         self.num_waves = num_waves  # compile-time
-        self.pad_elems = _K_PAD_ELEMS
-        self.row_elems = qk_hdim + _K_PAD_ELEMS  # padded LDS row stride (elems)
-        self.row_bytes = self.row_elems * _BF16_BYTES
+        self.pad_elems = _AB_PAD_BYTES // self.elem_bytes
+        self.row_elems = qk_hdim + self.pad_elems  # padded LDS row stride (elems)
+        self.row_bytes = self.row_elems * self.elem_bytes
 
     @property
     def hdim(self):
@@ -863,13 +928,13 @@ class KManager16bV1(_AsyncTransport):
     # ------------------------------------------------------------------
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane ds_load base pointer per LDS split; lane ``l`` fetches at row
-        ``l%16``, d-byte ``(l//16)*16``. Every fragment ``(kv, dt, half)`` is its split's
+        ``l%16``, d-byte ``(l//16)*16``. Every fragment ``(kv, dt, group)`` is its split's
         base plus a lane-independent compile-time immediate."""
         return [
             _lds_ptr_b128(
                 base
                 + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
-                + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
+                + (lane_idx // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
             )
             for base in _as_bases(ptr_lds)
         ]
@@ -879,24 +944,33 @@ class KManager16bV1(_AsyncTransport):
         _assert_multiple("n_block", self.n_block, num_splits * _WMMA_M)
         return self.n_block // num_splits
 
+    @property
+    def loads_per_frag(self):
+        return 2  # one b128 per group, at either width
+
     def num_ds_loads(self):
-        return (self.n_block // _WMMA_M) * (self.qk_hdim // _WMMA_K) * 2
+        return (
+            (self.n_block // _WMMA_M)
+            * (self.qk_hdim // self.wmma_k)
+            * self.loads_per_frag
+        )
 
     def _ds_load_plan(self, num_splits, lds_imm_offset=0):
         """``[(base_idx, imm)]`` in ``_pv_qk_gemm``'s K order ``[(kv, dt, half)...]``, each
         immediate relative to the ``ds_load_ptrs`` base holding kv-tile ``kv``. Pure Python,
         so a ring driver can emit load ``j`` on demand."""
         NKV = self.n_block // _WMMA_M
-        NDT = self.qk_hdim // _WMMA_K
+        NDT = self.qk_hdim // self.wmma_k
         kv_per_split = self._rows_per_split(num_splits) // _WMMA_M
         plan = []
         for kv in range(NKV):
             split, kv_local = divmod(kv, kv_per_split)
             for dt in range(NDT):
-                for half in range(2):
+                for sub in range(self.loads_per_frag):
                     imm = (
                         kv_local * _WMMA_M * self.row_bytes
-                        + (dt * _WMMA_K + half * _WMMA_M) * _BF16_BYTES
+                        + (dt * self.wmma_k + sub * (self.wmma_k // 2))
+                        * self.elem_bytes
                         + lds_imm_offset
                     )
                     plan.append((split, imm))
@@ -904,12 +978,12 @@ class KManager16bV1(_AsyncTransport):
 
     def load_one_to_reg(self, base_ptrs, j, lds_imm_offset=0):
         """Emit the ``j``-th K ``ds_load_b128`` of the resident block."""
-        v8_ty = fx.Vector.make_type(8, self.elem_dtype)
+        ty = _load_vec_type(self.elem_dtype, self.chunk_elems)
         base_idx, imm = self._ds_load_plan(len(base_ptrs), lds_imm_offset)[j]
         p = base_ptrs[base_idx]
         if imm:
             p = fx.add_offset(p, imm)
-        return fx.ptr_load(p, result_type=v8_ty)
+        return fx.ptr_load(p, result_type=ty)
 
     def load_all_to_reg(self, base_ptrs, lds_imm_offset=0):
         """Burst all K ``ds_load_b128`` for the resident block, in ``_pv_qk_gemm``'s K
@@ -948,16 +1022,19 @@ class VManager16bV1(_AsyncTransport):
         elem_dtype=fx.BFloat16,
     ):
         self.elem_dtype = elem_dtype
+        self.elem_bytes, self.wmma_k, self.chunk_elems = _width_params(elem_dtype)
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
-        if n_block % _WMMA_K != 0:
-            raise ValueError(f"n_block must be a multiple of {_WMMA_K}; got {n_block}")
+        if n_block % self.wmma_k != 0:
+            raise ValueError(
+                f"n_block must be a multiple of {self.wmma_k}; got {n_block}"
+            )
         self.v_hdim = v_hdim  # compile-time
         self.n_block = n_block  # compile-time
         self.num_waves = num_waves  # compile-time
         self.pad_elems = _V_PAD_ELEMS
         self.row_elems = v_hdim + _V_PAD_ELEMS  # padded LDS row stride (elems)
-        self.row_bytes = self.row_elems * _BF16_BYTES
+        self.row_bytes = self.row_elems * self.elem_bytes
 
     @property
     def hdim(self):
@@ -972,15 +1049,30 @@ class VManager16bV1(_AsyncTransport):
     # argument contract (``ptr_src`` is the V tensor here).
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane transpose-load base pointer per LDS split; the crossbar fetch sits
-        at ``kv = (l//16)*8 + l%8``, ``d = ((l//8)%2)*8``. Every fragment ``(dt, kt, half)``
-        is its split's base plus a lane-independent compile-time immediate."""
-        lane_kv = (lane_idx // _WMMA_M) * fx.Int32(8) + lane_idx % fx.Int32(8)
-        lane_d = ((lane_idx // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
+        base plus a lane-independent compile-time immediate.
+
+        Both widths must land lane ``l`` on column ``l%16`` with 8 consecutive rows, but
+        the two transpose loads do NOT share a crossbar. tr16_b128 transposes over eight
+        CONSECUTIVE lanes; tr8_b64 uses the strided set {b..b+3, b+8..b+11} (HW-probed),
+        so its fetch formula differs. Get it wrong and each lane straddles two columns,
+        which the kv sum then blends."""
+        if self.elem_bytes == 2:
+            lane_kv = (lane_idx // _WMMA_M) * fx.Int32(
+                _V_LANE_ELEMS
+            ) + lane_idx % fx.Int32(8)
+            lane_d = ((lane_idx // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
+        else:
+            lane_kv = (
+                (lane_idx // _WMMA_M) * fx.Int32(_V_LANE_ELEMS)
+                + ((lane_idx % fx.Int32(_WMMA_M)) // fx.Int32(8)) * fx.Int32(4)
+                + lane_idx % fx.Int32(4)
+            )
+            lane_d = ((lane_idx // fx.Int32(4)) % fx.Int32(2)) * fx.Int32(8)
         return [
             create_llvm_ptr(
                 base
                 + lane_kv * fx.Int32(self.row_bytes)
-                + lane_d * fx.Int32(_BF16_BYTES),
+                + lane_d * fx.Int32(self.elem_bytes),
                 address_space=3,
             )
             for base in _as_bases(ptr_lds)
@@ -988,40 +1080,49 @@ class VManager16bV1(_AsyncTransport):
 
     def _rows_per_split(self, num_splits):
         """kv rows per LDS sub-buffer; each must hold whole 32-kv contraction tiles."""
-        _assert_multiple("n_block", self.n_block, num_splits * _WMMA_K)
+        _assert_multiple("n_block", self.n_block, num_splits * self.wmma_k)
         return self.n_block // num_splits
 
+    @property
+    def loads_per_frag(self):
+        return self.wmma_k // _WMMA_M  # one transpose load per 16 kv rows
+
     def num_ds_loads(self):
-        return (self.v_hdim // _WMMA_M) * (self.n_block // _WMMA_K) * 2
+        return (
+            (self.v_hdim // _WMMA_M)
+            * (self.n_block // self.wmma_k)
+            * self.loads_per_frag
+        )
 
     def _ds_load_plan(self, num_splits, lds_imm_offset=0):
         """``[(base_idx, imm)]`` in ``_pv_qk_gemm``'s V order ``[(dt, kt, half)...]``, each
         immediate relative to the ``ds_load_ptrs`` base holding contraction tile ``kt``. Pure
         Python, so a ring driver can emit load ``j`` on demand."""
         d_tiles = self.v_hdim // _WMMA_M
-        nkt = self.n_block // _WMMA_K
-        kt_per_split = self._rows_per_split(num_splits) // _WMMA_K
+        nkt = self.n_block // self.wmma_k
+        kt_per_split = self._rows_per_split(num_splits) // self.wmma_k
         plan = []
         for dt in range(d_tiles):
             for kt in range(nkt):
                 split, kt_local = divmod(kt, kt_per_split)
-                for half in range(2):
+                for sub in range(self.loads_per_frag):
                     imm = (
-                        (kt_local * _WMMA_K + half * _WMMA_M) * self.row_bytes
-                        + dt * _WMMA_M * _BF16_BYTES
+                        (kt_local * self.wmma_k + sub * _WMMA_M) * self.row_bytes
+                        + dt * _WMMA_M * self.elem_bytes
                         + lds_imm_offset
                     )
                     plan.append((split, imm))
         return plan
 
     def load_one_to_reg(self, base_ptrs, j, lds_imm_offset=0):
-        """Emit the ``j``-th V ``ds_load_tr16_b128`` of the resident block."""
-        v8_ty = fx.Vector.make_type(8, self.elem_dtype)
+        """Emit the ``j``-th V transpose load of the resident block."""
+        ty = _load_vec_type(self.elem_dtype, _V_LANE_ELEMS)
         base_idx, imm = self._ds_load_plan(len(base_ptrs), lds_imm_offset)[j]
         p = base_ptrs[base_idx]
         if imm:
             p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
-        return fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, p))
+        tr = rocdl.ds_load_tr16_b128 if self.elem_bytes == 2 else rocdl.ds_load_tr8_b64
+        return fx.Vector(tr(ty, p))
 
     def load_all_to_reg(self, base_ptrs, lds_imm_offset=0):
         """Burst all V ``ds_load_tr16_b128`` for the resident block, in ``_pv_qk_gemm``'s
@@ -1040,7 +1141,7 @@ class QManager16bV2:
 
     A 3-D ``[num_seq, gqa_ratio, hdim]`` descriptor carries the GQA row-packing (packed row
     ``pr`` -> seq ``pr//gqa``, head ``kv_head*gqa + pr%gqa``), degenerating to
-    ``[rows, 1, hdim]`` at gqa==1. LDS row stride matches K's (``hdim + _Q_PAD_ELEMS``).
+    ``[rows, 1, hdim]`` at gqa==1. LDS row stride matches K's.
     """
 
     def __init__(
@@ -1054,19 +1155,22 @@ class QManager16bV2:
         elem_dtype=fx.BFloat16,
     ):
         self.elem_dtype = elem_dtype
-        if qk_hdim % _WMMA_K != 0:
-            raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
+        self.elem_bytes, self.wmma_k, self.chunk_elems = _width_params(elem_dtype)
+        if qk_hdim % self.wmma_k != 0:
+            raise ValueError(
+                f"qk_hdim must be a multiple of {self.wmma_k}; got {qk_hdim}"
+            )
         if num_waves != _DEFAULT_NUM_WAVES:
             raise NotImplementedError("V2 TDM loader assumes 8 waves")
         self.qk_hdim = qk_hdim  # compile-time
         self.gqa_ratio = gqa_ratio  # compile-time
         self.num_waves = num_waves
         self.q_tiles_per_wave = q_tiles_per_wave
-        self.k_tiles = qk_hdim // _WMMA_K
+        self.k_tiles = qk_hdim // self.wmma_k
         self.rows_per_warp = _WMMA_M * q_tiles_per_wave  # this wave's Q rows (32)
         self.block_m = self.rows_per_warp * num_waves  # 256
-        self.row_elems = qk_hdim + _Q_PAD_ELEMS  # padded LDS row stride (elems)
-        self.row_bytes = self.row_elems * _BF16_BYTES
+        self.row_elems = qk_hdim + _AB_PAD_BYTES // self.elem_bytes
+        self.row_bytes = self.row_elems * self.elem_bytes
         # lds_tiles is accepted for signature-compat with V1; V2 has no ring.
 
     def get_lds_size_in_byte(self):
@@ -1147,7 +1251,9 @@ class QManager16bV2:
                 num_warps=1,
             )
             blk = fx.zipped_divide(coord, tile)[None, (0, 0, None)]
-            lds_iter = fx.inttoptr(lds_ptr_ty, warp_region + fx.Int32(c0 * _BF16_BYTES))
+            lds_iter = fx.inttoptr(
+                lds_ptr_ty, warp_region + fx.Int32(c0 * self.elem_bytes)
+            )
             lds_view = fx.Tensor(
                 fx.make_view(
                     lds_iter,
@@ -1173,25 +1279,27 @@ class QManager16bV2:
 
         The read collapses to 1 per-lane base + compile-time immediates (like K): lane ``l``
         reads row ``l%16``, d-byte ``(l//16)*16``."""
-        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
+        v8_ty = _load_vec_type(self.elem_dtype, self.chunk_elems)
         scale_bf16 = None if scale is None else scale.to(self.elem_dtype)
         lane = self._lane_idx
         lane_base = (
             self._warp_region
             + (lane % _WMMA_M) * fx.Int32(self.row_bytes)
-            + (lane // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
+            + (lane // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
         )
         base = _lds_ptr_b128(lane_base)
         q_frags_list = [[] for _ in range(self.q_tiles_per_wave)]
         for qt in range(self.q_tiles_per_wave):
             for tile in range(self.k_tiles):
-                imm_lo = qt * _WMMA_M * self.row_bytes + tile * _WMMA_K * _BF16_BYTES
-                imm_hi = imm_lo + _WMMA_M * _BF16_BYTES
+                imm_lo = (
+                    qt * _WMMA_M * self.row_bytes + tile * self.wmma_k * self.elem_bytes
+                )
+                imm_hi = imm_lo + 2 * _CHUNK_BYTES  # next group: 32 B either width
                 p_lo = base if imm_lo == 0 else fx.add_offset(base, imm_lo)
                 p_hi = fx.add_offset(base, imm_hi)
                 lo = fx.ptr_load(p_lo, result_type=v8_ty)
                 hi = fx.ptr_load(p_hi, result_type=v8_ty)
-                frag = lo.shuffle(hi, list(range(16)))
+                frag = lo.shuffle(hi, list(range(2 * lo.numel)))
                 q_frags_list[qt].append(
                     frag if scale_bf16 is None else frag * scale_bf16
                 )
@@ -1250,6 +1358,7 @@ class OManager16bV1:
         elem_dtype=fx.BFloat16,
     ):
         self.elem_dtype = elem_dtype
+        self.elem_bytes, self.wmma_k, self.chunk_elems = _width_params(elem_dtype)
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
         self.v_hdim = v_hdim
@@ -1276,10 +1385,10 @@ class OManager16bV1:
         self.inflight_units = min(inflight_units, self.num_units)
 
         # LDS geometry, per unit slot; the ring holds inflight_units slots.
-        self._row_bytes = cpt * _BF16_BYTES
+        self._row_bytes = cpt * self.elem_bytes
         self._slot_stride = _WMMA_M * self._row_bytes
         self._warp_stride = self.inflight_units * self._slot_stride
-        self._chunks_per_row = cpt // _CHUNK_ELEMS  # G, b128 chunks per slot row
+        self._chunks_per_row = cpt // self.chunk_elems  # G, b128 chunks per slot row
         # XOR swizzle: slot = chunk ^ (q // _sw_div), shift = max(0, 4 - log2(G)).
         shift = max(0, 4 - int(self._chunks_per_row).bit_length() + 1)
         self._sw_div = 1 << shift
@@ -1302,7 +1411,7 @@ class OManager16bV1:
     def _lds_byte(self, slot_idx, q_row, d_col):
         """Swizzled LDS byte offset (within a warp region) of ring-slot ``slot_idx``'s
         O(q_row, d_col) (``d_col`` is slot-local, in [0, cols_per_tile))."""
-        chunk = d_col // _CHUNK_ELEMS
+        chunk = d_col // self.chunk_elems
         sw = chunk ^ (q_row // self._sw_div)
         return (
             slot_idx * self._slot_stride
@@ -1342,15 +1451,17 @@ class OManager16bV1:
         # product can overflow negative, and the descriptor then sign-extends to a huge
         # bound that defeats the drop.
         o_num_records_bytes = (
-            fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(_BF16_BYTES)
+            fx.Int64(q_start + q_len)
+            * fx.Int64(stride_o_seq)
+            * fx.Int64(self.elem_bytes)
         )
         o_rsrc = buffer_ops.create_buffer_resource(
             ptr_O, num_records_bytes=_ir(o_num_records_bytes)
         )
         lds_warp = ptr_lds_warp
         q_st = lane_idx % _WMMA_M
-        d_half = (lane_idx // _WMMA_M) * _CHUNK_ELEMS  # 0 or 8
-        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
+        d_half = (lane_idx // _WMMA_M) * self.chunk_elems  # 0 or 8
+        v8_ty = fx.Vector.make_type(self.chunk_elems, self.elem_dtype)
         base_row = (
             block_x * self.block_m
             + warp_idx * (self.q_tiles_per_wave * _WMMA_M)
@@ -1400,7 +1511,7 @@ class OManager16bV1:
             for r in range(TPU):
                 f = fx.Int32(r * _WAVE_SIZE) + lane_idx  # 32 b128 chunks per round
                 q_out = f // G  # q-row within this warp [0,16)
-                d_local = (f % G) * _CHUNK_ELEMS
+                d_local = (f % G) * self.chunk_elems
                 addr = lds_warp + self._lds_byte(slot, q_out, d_local)
                 lds_ptr = _lds_ptr_b128(addr)
                 data = fx.ptr_load(lds_ptr, result_type=v8_ty)
@@ -1425,7 +1536,7 @@ class OManager16bV1:
                     + d_base
                     + d_local
                 )
-                off_bytes = off_elems * fx.Int32(_BF16_BYTES)
+                off_bytes = off_elems * fx.Int32(self.elem_bytes)
                 off_masked = valid.select(off_bytes, fx.Int32(0x7FFFFFFF))
                 buffer_ops.buffer_store(
                     data, o_rsrc, off_masked, mask=None, offset_is_bytes=True
@@ -1469,6 +1580,7 @@ class OManager16bV2:
         elem_dtype=fx.BFloat16,
     ):
         self.elem_dtype = elem_dtype
+        self.elem_bytes, self.wmma_k, self.chunk_elems = _width_params(elem_dtype)
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
         if num_waves != _DEFAULT_NUM_WAVES:
@@ -1483,7 +1595,7 @@ class OManager16bV2:
         self.row_elems = (
             v_hdim + _O_PAD_ELEMS
         )  # padded; the pad rides as dropped columns
-        self.row_bytes = self.row_elems * _BF16_BYTES
+        self.row_bytes = self.row_elems * self.elem_bytes
 
     def get_lds_size_in_byte(self):
         return self.num_waves * self.rows_per_warp * self.row_bytes
@@ -1524,12 +1636,12 @@ class OManager16bV2:
         lane_base = (
             tile_lds
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
-            + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
+            + (lane_idx // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
         )
         base_ptr = _lds_ptr_b128(lane_base)
         for k in range(self.d_tiles):
             bf = o_frags[k].to(self.elem_dtype)
-            imm = k * _WMMA_M * _BF16_BYTES
+            imm = k * _WMMA_M * self.elem_bytes
             p = base_ptr if imm == 0 else fx.add_offset(base_ptr, imm)
             fx.ptr_store(_ir(bf), p)
         rocdl.s_wait_dscnt(0)  # drain b128 stores so the TDM read sees coherent LDS
@@ -1657,6 +1769,7 @@ class OManager16bV3:
         elem_dtype=fx.BFloat16,
     ):
         self.elem_dtype = elem_dtype
+        self.elem_bytes, self.wmma_k, self.chunk_elems = _width_params(elem_dtype)
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
         if num_waves != _DEFAULT_NUM_WAVES:
@@ -1669,8 +1782,8 @@ class OManager16bV3:
         self.rows_per_warp = _WMMA_M * q_tiles_per_wave
         self.block_m = self.rows_per_warp * num_waves
         self.row_elems = v_hdim + _O_PAD_ELEMS  # PADDED (conflict-free ds_store)
-        self.row_bytes = self.row_elems * _BF16_BYTES
-        self.chunks_per_row = v_hdim // _CHUNK_ELEMS  # b128 chunks per row
+        self.row_bytes = self.row_elems * self.elem_bytes
+        self.chunks_per_row = v_hdim // self.chunk_elems  # b128 chunks per row
         self.num_rounds = (_WMMA_M * self.chunks_per_row) // _WAVE_SIZE
         self._pending = []  # per-qtile (tile_lds, base_row)
 
@@ -1714,13 +1827,13 @@ class OManager16bV3:
         lane_base = (
             tile_lds
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
-            + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
+            + (lane_idx // _WMMA_M) * fx.Int32(self.chunk_elems * self.elem_bytes)
         )
         base_ptr = _lds_ptr_b128(lane_base)
         ds_ops = []
         for k in range(self.d_tiles):
             bf = o_frags[k].to(self.elem_dtype)  # cvt
-            imm = k * _WMMA_M * _BF16_BYTES
+            imm = k * _WMMA_M * self.elem_bytes
             p = base_ptr if imm == 0 else fx.add_offset(base_ptr, imm)
             ds_ops.append((bf, p))
         self._pending.append(ds_ops)
@@ -1803,7 +1916,7 @@ class OManager16bV3:
             srow = fx.min(
                 row, last_valid
             )  # OOB rows -> warp's last valid row (idempotent redirect)
-            d = d_chunk * fx.Int32(_CHUNK_ELEMS)
+            d = d_chunk * fx.Int32(self.chunk_elems)
             lds_src = (
                 warp_region
                 + srow * fx.Int32(self.row_bytes)
@@ -1820,7 +1933,7 @@ class OManager16bV3:
                 + fx.Int64(d)
             )
             gdst = create_llvm_ptr(
-                ptr_O_i64 + off64 * fx.Int64(_BF16_BYTES), address_space=1
+                ptr_O_i64 + off64 * fx.Int64(self.elem_bytes), address_space=1
             )
             lsrc = create_llvm_ptr(lds_src, address_space=3)
             addrs.append((gdst, lsrc))
