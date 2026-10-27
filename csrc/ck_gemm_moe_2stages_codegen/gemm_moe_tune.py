@@ -6836,22 +6836,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
     )
 
     @staticmethod
-    def _capture_configuration() -> "dict[str, float | bool | None]":
+    def _capture_configuration() -> "dict[str, float | None]":
         value = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
         limit = None if value in (None, "") else float(value)
         if limit is not None and (not math.isfinite(limit) or limit <= 0):
             raise ValueError(
                 "AITER_MXFP4_TUNE_SWIGLU_LIMIT must be finite and positive"
             )
-        return {
-            "swiglu_limit": limit,
-            "stage2_fp8": os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1",
-            "fp4_scatter": os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1",
-        }
+        return {"swiglu_limit": limit}
 
     def _invocation_configuration(
         self, args: "argparse.Namespace | SimpleNamespace | None" = None
-    ) -> "dict[str, float | bool | None]":
+    ) -> "dict[str, float | None]":
         # Callers keep these variables unchanged for the whole run.
         if args is not None and hasattr(args, "mxfp4_configuration"):
             self._configuration = args.mxfp4_configuration
