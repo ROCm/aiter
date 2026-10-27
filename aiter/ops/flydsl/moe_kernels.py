@@ -2609,6 +2609,15 @@ def _get_compiled_topids_to_rows_lds(n_buckets: int):
 
 
 @functools.cache
+def _get_compiled_topids_to_rows_valid():
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_valid_module,
+    )
+
+    return build_moe_topids_to_rows_valid_module()
+
+
+@functools.cache
 def _get_compiled_topids_to_rows_g2l(weight_dtype: str):
     from aiter.ops.flydsl.kernels.moe_route_maps import (
         build_moe_topids_to_rows_g2l_module,
@@ -2685,6 +2694,7 @@ def flydsl_moe_topids_to_rows(
     # The caller can pass a precomputed ``num_valid_routes`` (the grouped path
     # already builds ``_ep_nvr = total_recv*topk`` for the psum-remap / quant
     # kernels); reusing it skips a redundant ``* topk`` elementwise launch here.
+    has_route_limit = num_valid_routes is not None or num_local_tokens is not None
     if num_valid_routes is not None:
         num_valid_routes = num_valid_routes.reshape(-1)[:1].to(
             device=device, dtype=torch.int32
@@ -2786,6 +2796,19 @@ def flydsl_moe_topids_to_rows(
             *route_args,
             *_ep_tail,
             current_stream_arg(),
+        )
+    elif has_route_limit:
+        _dispatch_compiled(
+            _get_compiled_topids_to_rows_valid(),
+            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+            ptr_arg(counter),
+            ptr_arg(topids_to_rows),
+            ptr_arg(num_valid_routes),
+            numel,
+            int(max_m),
+            int(E),
+            route_grid,
+            torch.cuda.current_stream(),
         )
     else:
         from aiter.jit.utils.build_targets import is_gfx1250_family
