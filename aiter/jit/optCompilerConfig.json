@@ -1879,19 +1879,6 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
-    "module_top_k_per_row_sampled": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/kernels/topk_per_row_sampled_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/topk_per_row_sampled_pybind.cu'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
-        "extra_ldflags": "None",
-        "extra_include": [],
-        "verbose": "False",
-        "torch_exclude": "True",
-        "blob_gen_cmd": "''"
-    },
     "module_mla_metadata": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_metadata_pybind.cu'",
@@ -1972,9 +1959,7 @@
             "f'{AITER_CSRC_DIR}/kernels/topk_per_row_kernels.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [
-            "'-DTOPK_PER_ROW_PLAIN_KERNELS=1'"
-        ],
+        "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
