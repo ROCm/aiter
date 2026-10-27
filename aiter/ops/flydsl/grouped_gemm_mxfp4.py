@@ -12,6 +12,20 @@ import torch
 from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 
+_I32_MAX = 2**31 - 1
+
+
+def _flat_base(t: torch.Tensor) -> torch.Tensor:
+    """Rank-1 view that supplies only ``t``'s base address to the launcher.
+
+    The FlyDSL C ABI packs a tensor argument's size as int32; a flattened prefill
+    output (contiguous_m x N) can exceed 2**31 elements. The kernel reads these
+    tensors through their base pointer only, so a shorter view is equivalent.
+    """
+    flat = t.view(-1)
+    return flat[:_I32_MAX] if flat.numel() > _I32_MAX else flat
+
+
 _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
 
@@ -162,9 +176,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
     # These tensor arguments only supply base addresses, so normalize their
     # ranks without specializing the compiled callable on buffer shapes.
-    quant_scale_tensor = (
+    quant_scale_tensor = _flat_base(
         out if quant_scale is None else quant_scale.view(torch.uint8)
-    ).view(-1)
+    )
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
@@ -209,7 +223,7 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"{stage2_scatter.combine_quant_bits} needs N % {n_align} == 0 to "
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
-    ep_row_map_tensor = (ep_row_map if ep_row_map is not None else out).view(-1)
+    ep_row_map_tensor = _flat_base(ep_row_map if ep_row_map is not None else out)
     gemm_spec = (
         K,
         tile_m,
@@ -250,11 +264,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
-        out.view(-1),
+        _flat_base(out),
         ptr_arg(a),
         ptr_arg(w),
-        a_scales.view(torch.int32).view(-1),
-        w_scales.view(torch.int32).view(-1),
+        _flat_base(a_scales.view(torch.int32)),
+        _flat_base(w_scales.view(torch.int32)),
         contiguous_m,
         stream,
         N,
