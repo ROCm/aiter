@@ -87,8 +87,14 @@ def flash_attn_fused_backward(
         torch.Tensor: Delta tensor (element-wise product of do and o) with shape matching softmax_lse.
     """
     _LOGGER.info(
-        f"FLASH_ATTN_FUSED_BKWD: do={tuple(do.shape)} q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} "
-        + f"dq={tuple(dq.shape)}  dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
+        "FLASH_ATTN_FUSED_BKWD: do=%s q=%s  k=%s  v=%s dq=%s  dk=%s  dv=%s",
+        tuple(do.shape),
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        tuple(dq.shape),
+        tuple(dk.shape),
+        tuple(dv.shape),
     )
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
@@ -191,6 +197,7 @@ def flash_attn_fused_backward(
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8,
+        enable_fp_fusion=True,
     )
     # dropout_mask
     use_dropout = dropout_p > 0.0
@@ -263,6 +270,7 @@ def flash_attn_fused_backward(
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             NUM_XCD=get_num_xcds(),
             **config_dkdvdq,
+            enable_fp_fusion=True,
         )
     else:
         # in non causal inner loop over grouped q heads
@@ -311,6 +319,7 @@ def flash_attn_fused_backward(
             FP8_MAX=FP8_MAX,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_dkdvdq,
+            enable_fp_fusion=True,
         )
 
     return delta

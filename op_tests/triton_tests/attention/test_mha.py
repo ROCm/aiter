@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import logging
 
 import pytest
 import torch
 
+from aiter import logger
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -26,9 +27,12 @@ from op_tests.triton_tests.attention.mha_test_utils import (
     skip_if_triton_padded_head_miscompiled,
 )
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-DEBUG_MODE = False
+
+@pytest.fixture(params=[False, True])
+def FUSED(request):
+    mha_set_use_fused_bwd_kernel(request.param)
+    yield request.param
+    mha_set_use_fused_bwd_kernel(False)
 
 
 def _test_mha_impl(
@@ -45,12 +49,7 @@ def _test_mha_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(
-        backend,
-        dropout_p=DROPOUT,
-        return_lse=RETURN_LSE,
-        return_attn_probs=RETURN_SOFTMAX,
-    )
+    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
     torch.manual_seed(20)
     torch.cuda.empty_cache()
@@ -70,42 +69,57 @@ def _test_mha_impl(
         backend=backend,
     )
 
-    if RETURN_LSE:
-        assert len(triton_out) > 1
-        lse = triton_out[1]
-        if DEBUG_MODE:
-            print(f"lse.shape={lse.shape}, lse={lse}")
+    lse = None
+    sd_mask = None
+    if RETURN_LSE or RETURN_SOFTMAX:
+        lse = triton_out[1] if RETURN_LSE else None
+        if RETURN_SOFTMAX:
+            sd_mask = triton_out[2] if RETURN_LSE else triton_out[1]
+        triton_out = triton_out[0]
+        if lse is not None:
+            logger.debug("lse.shape=%s, lse=%s", lse.shape, lse)
 
     if DROPOUT > 0.0 and RETURN_SOFTMAX:
-        if RETURN_LSE:
-            assert len(triton_out) == 3
-            sd_mask = triton_out[2]
-        else:
-            assert len(triton_out) == 2
-            sd_mask = triton_out[1]
         dropout_mask = sd_mask >= 0
-        if DEBUG_MODE:
-            print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
-            print(
-                f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
-            )
+        logger.debug("sd_mask.shape=%s, sd_mask=%s", sd_mask.shape, sd_mask)
+        logger.debug(
+            "dropout_mask.shape=%s, dropout_mask=%s",
+            dropout_mask.shape,
+            dropout_mask,
+        )
 
-    if RETURN_SOFTMAX or RETURN_LSE:
-        triton_out = triton_out[0]
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     torch_out = attention_ref(
         q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
     )
-    torch_out, attention_scores, _ = torch_out
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
+    torch_out, attention_scores, lse_ref = torch_out
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+    if RETURN_LSE:
+        # Fully-masked causal rows are -inf in the reference (and Triton) and 0
+        # in Gluon; compare only rows that attended at least one key.
+        finite = torch.isfinite(lse_ref)
+        torch.testing.assert_close(
+            lse[finite].float(), lse_ref[finite].float(), atol=1e-2, rtol=1e-2
+        )
+    if RETURN_SOFTMAX:
+        # Triton only writes S_dmask when dropout is on; Gluon fills it at
+        # dropout_p == 0 as well. The returned score is not the same as the reference because they
+        # are not adjusted as new maxes per block are found. So we just check the
+        # shape and dtype.
+        if sd_mask is None:
+            assert backend == "triton" and DROPOUT == 0.0
+        else:
+            assert sd_mask.dtype == torch.float32
+            assert sd_mask.shape == (BATCH, NUM_Q_HEADS, SEQLEN_Q, SEQLEN_K)
 
 
 @pytest.mark.parametrize("BATCH", [1, 30, 50])
@@ -320,6 +334,35 @@ def test_mha_with_dropout(
     )
 
 
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize(
+    "RETURN_LSE, RETURN_SOFTMAX",
+    [(True, False), (False, True), (True, True)],
+)
+def test_mha_return_lse_softmax(
+    backend: str,
+    CAUSAL: bool,
+    RETURN_LSE: bool,
+    RETURN_SOFTMAX: bool,
+    dtype=torch.bfloat16,
+):
+    _test_mha_impl(
+        BATCH=2,
+        SEQLEN_Q=128,
+        SEQLEN_K=64,
+        NUM_Q_HEADS=8,
+        NUM_K_HEADS=2,
+        HEAD_SZ=64,
+        DROPOUT=0.0,
+        RETURN_LSE=RETURN_LSE,
+        RETURN_SOFTMAX=RETURN_SOFTMAX,
+        CAUSAL=CAUSAL,
+        backend=backend,
+        dtype=dtype,
+    )
+
+
 # LLaMA 3 405B config
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_int64_strides(
@@ -336,15 +379,10 @@ def test_mha_int64_strides(
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
-    # The Gluon backend is forward-only and cannot return LSE, so drop both for it.
-    is_gluon = backend == "gluon"
-    return_lse = not is_gluon
-    test_backward = test_backward and not is_gluon
-    skip_if_gluon_unsupported(
-        backend,
-        dropout_p=DROPOUT,
-        return_lse=return_lse,
-    )
+    # The Gluon backend is forward-only.
+    return_lse = True
+    test_backward = test_backward and backend != "gluon"
+    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -356,13 +394,13 @@ def test_mha_int64_strides(
     def _generate_input(
         batch: int, seqlen: int, nheads: int, dim_size: int, large_stride: bool = False
     ) -> torch.Tensor:
-        seqlens = torch.full((batch,), seqlen)
+        seqlens = torch.full((batch,), seqlen, device="cuda")
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32, device="cuda"),
                 seqlens.cumsum(dim=0, dtype=torch.int32),
             ]
-        ).to(device="cuda")
+        )
         total_seqlen = cu_seqlens[-1].item()
 
         if large_stride:
@@ -386,13 +424,11 @@ def test_mha_int64_strides(
     v, _, _ = _generate_input(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ)
     do = torch.randn_like(q)
 
-    if DEBUG_MODE:
-        print()
-        print("q:", q.shape, q.stride())
-        print("k:", k.shape, k.stride())
-        print("v:", v.shape, v.stride())
-        print("cu_seqlens_q:", cu_seqlens_q.shape, cu_seqlens_q.stride())
-        print("cu_seqlens_k:", cu_seqlens_k.shape, cu_seqlens_k.stride())
+    logger.debug("q: %s %s", q.shape, q.stride())
+    logger.debug("k: %s %s", k.shape, k.stride())
+    logger.debug("v: %s %s", v.shape, v.stride())
+    logger.debug("cu_seqlens_q: %s %s", cu_seqlens_q.shape, cu_seqlens_q.stride())
+    logger.debug("cu_seqlens_k: %s %s", cu_seqlens_k.shape, cu_seqlens_k.stride())
 
     out = flash_attn_varlen_func(
         q,
@@ -407,18 +443,20 @@ def test_mha_int64_strides(
         return_lse=return_lse,
         backend=backend,
     )
-    triton_out = out[0] if return_lse else out
+    triton_out, lse = out
+    assert lse.dtype == torch.float32
+    assert lse.shape == (q.shape[0], NUM_Q_HEADS)
     if test_backward:
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(
             triton_out, (q, k, v), do.clone()
         )
 
     # NOTE: use fwd output to wait not exit program before kernel finishes
-    print("triton_out:", triton_out)
+    logger.info("triton_out: %s", triton_out)
     if test_backward:
-        print("triton_dq:", triton_dq.shape, triton_dq.stride())
-        print("triton_dk:", triton_dk.shape, triton_dk.stride())
-        print("triton_dv:", triton_dv.shape, triton_dv.stride())
+        logger.info("triton_dq: %s %s", triton_dq.shape, triton_dq.stride())
+        logger.info("triton_dk: %s %s", triton_dk.shape, triton_dk.stride())
+        logger.info("triton_dv: %s %s", triton_dv.shape, triton_dv.stride())
 
 
 def _test_mha_varlen_impl(
@@ -435,14 +473,8 @@ def _test_mha_varlen_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(
-        backend,
-        dropout_p=DROPOUT,
-        return_lse=RETURN_LSE,
-        return_attn_probs=RETURN_SOFTMAX,
-    )
+    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
-    torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -471,24 +503,26 @@ def _test_mha_varlen_impl(
         _,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
-    if DEBUG_MODE:
-        print(
-            f"query_padding_mask.shape={query_padding_mask.shape} query_padding_mask={query_padding_mask}"
-        )
-        print(
-            f"key_padding_mask.shape={key_padding_mask.shape} key_padding_mask={key_padding_mask}"
-        )
-
-        print(f"q.shape={q.shape} q={q}")
-        print(f"k.shape={k.shape} k={k}")
-        print(f"v.shape={v.shape} v={v}")
-        print(f"q_unpad.shape={q_unpad.shape} q_unpad={q_unpad}")
-        print(f"k_unpad.shape={k_unpad.shape} k_unpad={k_unpad}")
-        print(f"v_unpad.shape={v_unpad.shape} v_unpad={v_unpad}")
-        print(f"max_seqlens_q={max_seqlen_q }")
-        print(f"max_seqlens_k={max_seqlen_k }")
-        print(f"cu_seqlens_q={cu_seqlens_q }")
-        print(f"cu_seqlens_k={cu_seqlens_k }")
+    logger.debug(
+        "query_padding_mask.shape=%s query_padding_mask=%s",
+        query_padding_mask.shape,
+        query_padding_mask,
+    )
+    logger.debug(
+        "key_padding_mask.shape=%s key_padding_mask=%s",
+        key_padding_mask.shape,
+        key_padding_mask,
+    )
+    logger.debug("q.shape=%s q=%s", q.shape, q)
+    logger.debug("k.shape=%s k=%s", k.shape, k)
+    logger.debug("v.shape=%s v=%s", v.shape, v)
+    logger.debug("q_unpad.shape=%s q_unpad=%s", q_unpad.shape, q_unpad)
+    logger.debug("k_unpad.shape=%s k_unpad=%s", k_unpad.shape, k_unpad)
+    logger.debug("v_unpad.shape=%s v_unpad=%s", v_unpad.shape, v_unpad)
+    logger.debug("max_seqlens_q=%d", max_seqlen_q)
+    logger.debug("max_seqlens_k=%d", max_seqlen_k)
+    logger.debug("cu_seqlens_q=%s", cu_seqlens_q)
+    logger.debug("cu_seqlens_k=%s", cu_seqlens_k)
 
     triton_out = flash_attn_varlen_func(
         q_unpad,
@@ -505,20 +539,18 @@ def _test_mha_varlen_impl(
         backend=backend,
     )
 
-    if RETURN_LSE:
-        assert len(triton_out) > 1
-        lse = triton_out[1]
-        if DEBUG_MODE:
-            print(f"lse.shape={lse.shape}, lse={lse}")
+    lse = None
+    sd_mask = None
+    if RETURN_LSE or RETURN_SOFTMAX:
+        lse = triton_out[1] if RETURN_LSE else None
+        if RETURN_SOFTMAX:
+            sd_mask = triton_out[2] if RETURN_LSE else triton_out[1]
+        triton_out = triton_out[0]
+        if lse is not None:
+            logger.debug("lse.shape=%s, lse=%s", lse.shape, lse)
 
     dropout_mask = None
     if DROPOUT > 0.0 and RETURN_SOFTMAX:
-        if RETURN_LSE:
-            assert len(triton_out) == 3
-            sd_mask = triton_out[2]
-        else:
-            assert len(triton_out) == 2
-            sd_mask = triton_out[1]
         dropout_mask = sd_mask >= 0
         dropout_mask = pad_rearrange_dropout_mask(
             dropout_mask,
@@ -531,17 +563,13 @@ def _test_mha_varlen_impl(
             NUM_Q_HEADS,
         )
         dropout_mask = dropout_mask > 0
-        if DEBUG_MODE:
-            # print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
-            print(
-                f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
-            )
-    if RETURN_SOFTMAX or RETURN_LSE:
-        triton_out = output_pad_fn(triton_out[0])
-    else:
-        triton_out = output_pad_fn(triton_out)
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+        logger.debug(
+            "dropout_mask.shape=%s, dropout_mask=%s",
+            dropout_mask.shape,
+            dropout_mask,
+        )
+    triton_out = output_pad_fn(triton_out)
+    logger.debug("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     torch_out = attention_ref(
         q,
@@ -553,17 +581,37 @@ def _test_mha_varlen_impl(
         dropout_mask=dropout_mask,
         causal=CAUSAL,
     )
-    torch_out, attention_scores, _ = torch_out
+    torch_out, attention_scores, lse_ref = torch_out
 
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
+    logger.debug("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
+    logger.debug(
+        "attention_scores.shape=%s, attention_scores=%s",
+        attention_scores.shape,
+        attention_scores,
+    )
 
     torch.testing.assert_close(
         triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
     )
+
+    if RETURN_LSE:
+        lse_ref = torch.cat(
+            [
+                lse_ref[b, :, query_padding_mask[b]].transpose(0, 1)
+                for b in range(BATCH)
+            ],
+            dim=0,
+        )
+        finite = torch.isfinite(lse_ref)
+        torch.testing.assert_close(
+            lse[finite].float(), lse_ref[finite].float(), atol=1e-2, rtol=1e-2
+        )
+    if RETURN_SOFTMAX:
+        if sd_mask is None:
+            assert backend == "triton" and DROPOUT == 0.0
+        else:
+            assert sd_mask.dtype == torch.float32
+            assert sd_mask.shape == (BATCH, NUM_Q_HEADS, max_seqlen_q, max_seqlen_k)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 30, 50])
@@ -638,6 +686,35 @@ def test_mha_varlen_with_dropout(
     )
 
 
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize(
+    "RETURN_LSE, RETURN_SOFTMAX",
+    [(True, False), (False, True), (True, True)],
+)
+def test_mha_varlen_return_lse_softmax(
+    backend: str,
+    CAUSAL: bool,
+    RETURN_LSE: bool,
+    RETURN_SOFTMAX: bool,
+    dtype=torch.bfloat16,
+):
+    _test_mha_varlen_impl(
+        BATCH=2,
+        SEQLEN_Q=128,
+        SEQLEN_K=64,
+        NUM_Q_HEADS=8,
+        NUM_K_HEADS=2,
+        HEAD_SZ=64,
+        DROPOUT=0.0,
+        RETURN_LSE=RETURN_LSE,
+        RETURN_SOFTMAX=RETURN_SOFTMAX,
+        CAUSAL=CAUSAL,
+        backend=backend,
+        dtype=dtype,
+    )
+
+
 # Production shapes based on real models:
 #   HQ=32, HK=8:  Llama 3 8B (GQA 4:1)
 #   HQ=64, HK=8:  Llama 3 70B (GQA 8:1)
@@ -650,7 +727,6 @@ def test_mha_varlen_with_dropout(
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward(
     BATCH: int,
     SEQLEN_Q: int,
@@ -672,7 +748,6 @@ def test_mha_backward(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -723,6 +798,89 @@ def test_mha_backward(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("head_size", [33, 53, 64])
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(97, 113), (113, 97)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_mha_dao_ai_backward_head_size(
+    head_size, varlen, seqlen_q, seqlen_k, strided, monkeypatch
+):
+    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, interface_v2
+    from aiter.ops.triton.attention import mha
+
+    monkeypatch.setattr(interface_v2, "BWD_MODE", "fused")
+    kernel = bwd.bwd_kernel_fused_causal
+    original_run = kernel.run
+    launches = 0
+
+    def trace_run(*args, **kwargs):
+        nonlocal launches
+        result = original_run(*args, **kwargs)
+        launches += 1
+        return result
+
+    monkeypatch.setattr(kernel, "run", trace_run)
+
+    monkeypatch.setattr(mha, "_MHA_IMPL", "dao_ai")
+    torch.manual_seed(20)
+    batch = 2
+    q = torch.randn(
+        batch,
+        seqlen_q,
+        4,
+        head_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        batch,
+        seqlen_k,
+        2,
+        head_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    do = torch.randn_like(q)
+    inputs = (q, k, v)
+    if varlen:
+        inputs = tuple(x.flatten(0, 1) for x in inputs)
+    if strided:
+        # Change token/head strides after packing so flatten cannot undo them.
+        inputs = tuple(
+            x.transpose(-3, -2).contiguous().transpose(-3, -2).detach().requires_grad_()
+            for x in inputs
+        )
+        assert all(not x.is_contiguous() for x in inputs)
+    if varlen:
+        cu_q = torch.arange(
+            0, (batch + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+        )
+        cu_k = torch.arange(
+            0, (batch + 1) * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32
+        )
+        out = flash_attn_varlen_func(
+            *inputs, cu_q, cu_k, seqlen_q, seqlen_k, causal=True, backend="triton"
+        )
+    else:
+        out = flash_attn_func(*inputs, causal=True, backend="triton")
+    grads = torch.autograd.grad(out, inputs, do.reshape_as(out))
+    assert launches > 0, "Expected the Dao-AI fused causal backward kernel"
+    ref_out, ref_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
+        q, k, v, do, causal=True
+    )
+    torch.testing.assert_close(
+        out, ref_out.reshape_as(out).to(out.dtype), atol=fwd_tol[0], rtol=fwd_tol[1]
+    )
+    for inp, grad, ref, (atol, rtol) in zip(inputs, grads, ref_grads, bwd_tols):
+        assert grad.shape == inp.shape
+        torch.testing.assert_close(
+            grad, ref.reshape_as(grad).to(grad.dtype), atol=atol, rtol=rtol
+        )
+
+
 @pytest.mark.parametrize("BATCH", [2, 4])
 @pytest.mark.parametrize("SEQLEN_Q", [256, 512])
 @pytest.mark.parametrize("SEQLEN_K", [256, 512])
@@ -730,7 +888,6 @@ def test_mha_backward(
 @pytest.mark.parametrize("NUM_K_HEADS", [8])
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [False])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward_sbhd_do(
     BATCH: int,
     SEQLEN_Q: int,
@@ -754,7 +911,6 @@ def test_mha_backward_sbhd_do(
 
     torch.cuda.empty_cache()
     torch.manual_seed(42)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -800,7 +956,6 @@ def test_mha_backward_sbhd_do(
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward_varlen(
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -822,7 +977,6 @@ def test_mha_backward_varlen(
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    mha_set_use_fused_bwd_kernel(FUSED)
 
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -919,3 +1073,166 @@ def test_mha_backward_varlen(
     tols = [fwd_tol] + bwd_tols
     for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("bwd_mode", [None, "fused", "split"])
+def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
+    # Rows whose logits are all very negative (logsumexp < -88) used to overflow exp(0 - lse) to inf
+    # on the zero-loaded keys of the last partial key block of the unmasked dq loop, and inf * 0 put
+    # NaN in dq. Seen on real Qwen2.5-1.5B activations. The sequence lengths are not block multiples
+    # so that partial block exists.
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    mha_set_use_fused_bwd_kernel(False)
+    NUM_HEADS, HEAD_SZ = 4, 128
+    seqlens = [300, 250]
+    total = sum(seqlens)
+    u = torch.nn.functional.normalize(
+        torch.randn(HEAD_SZ, device="cuda", dtype=torch.float32), dim=0
+    )
+    a = 34.0  # q . k ~ -a^2, so logits ~ -a^2 / sqrt(HEAD_SZ) ~ -102
+    q = (
+        -a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    k = (
+        a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    v = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
+    do = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(seqlens, device="cuda").cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    if bwd_mode is None:
+        triton_out = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens), causal=True
+        )
+        triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
+    else:
+        # The flash_attn_2 backward has "fused" and "split" modes with different dq loops; monkeypatch restores the mode.
+        monkeypatch.setattr(flash_attn_2, "BWD_MODE", bwd_mode)
+        scale = HEAD_SZ**-0.5
+        out, lse, _, _ = flash_attn_2.varlen_fwd(
+            q,
+            k,
+            v,
+            None,
+            cu_seqlens,
+            cu_seqlens,
+            seqused_k=None,
+            leftpad_k=None,
+            block_table_=None,
+            alibi_slopes=None,
+            max_seqlen_q=max(seqlens),
+            max_seqlen_k=max(seqlens),
+            dropout_p=0.0,
+            softmax_scale=scale,
+            zero_tensors=False,
+            causal=True,
+            window_size_left=-1,
+            window_size_right=-1,
+            softcap=0.0,
+            return_softmax=False,
+        )
+        triton_dq, triton_dk, triton_dv, _ = flash_attn_2.varlen_bwd(
+            do,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            None,
+            None,
+            None,
+            cu_seqlens,
+            cu_seqlens,
+            None,
+            max_seqlen_q=max(seqlens),
+            max_seqlen_k=max(seqlens),
+            dropout_p=0.0,
+            softmax_scale=scale,
+            zero_tensors=False,
+            causal=True,
+            window_size_left=-1,
+            window_size_right=-1,
+            softcap=0.0,
+            deterministic=False,
+        )
+
+    # Reference: fp32 attention per sequence.
+    q_ref, k_ref, v_ref = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    ref_out = torch.cat(
+        [
+            attention_ref(
+                q_ref[s:e][None], k_ref[s:e][None], v_ref[s:e][None], causal=True
+            )[0][0]
+            for s, e in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
+        ]
+    )
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(
+        ref_out, (q_ref, k_ref, v_ref), do.float()
+    )
+
+    for tri, ref in zip(
+        (triton_dq, triton_dk, triton_dv), (torch_dq, torch_dk, torch_dv)
+    ):
+        assert torch.isfinite(tri).all()
+        # |q| and |k| are ~34 here, so bf16 rounding alone gives ~2% error (the fused backward matches it).
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected",
+    [
+        (True, 128, None, None, None, "mid_head"),  # no shape info
+        (True, 128, 128, 512, 512, "default"),  # causal rule, both at boundary
+        (True, 128, 128, 512, 511, "mid_head"),  # one program short
+        (True, 128, 128, 513, 512, "mid_head"),  # KV one token too long
+        (True, 96, 512, 512, 128, "default"),  # 128 * cdiv(512, 128) = 512
+        (False, 128, 128, 512, 4096, "mid_head"),  # causal rule only
+        (False, 97, 128, 256, 1024, "default"),  # non-causal wide-head rule
+        (False, 96, 128, 256, 1024, "mid_head"),  # head below min_head_dim_v
+        (False, 97, 128, 257, 1024, "mid_head"),
+        (False, 97, 128, 256, 1023, "mid_head"),
+        (False, 65, 128, 128, 1024, "default"),  # short-KV rule
+        (False, 65, 128, 128, 1023, "mid_head"),
+        (True, 64, 128, 128, 4096, "small_head"),  # outside mid_head range
+        (True, 160, 128, 128, 4096, "default"),
+    ],
+)
+def test_mha_fwd_mid_head_selection(
+    causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected
+):
+    from aiter.ops.triton._triton_kernels.attention.mha import _get_config
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from aiter.ops.triton.utils.config_utils import (
+        load_config_json,
+        resolve_config_dir,
+    )
+
+    fwd_cfg = load_config_json(
+        f"{resolve_config_dir('attention', 'MHA', backend='triton')}/DEFAULT.json"
+    )["fwd"]
+    if get_arch() != "gfx950":
+        # Arches without mid_head keep the pre-existing selection.
+        assert "mid_head_skip" not in fwd_cfg or "mid_head" in fwd_cfg
+        pytest.skip("mid_head_skip rules are only defined for gfx950")
+    cfg = _get_config(
+        False,
+        torch.bfloat16,
+        head_dim_v=head_dim_v,
+        causal=causal,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        batch_heads=batch_heads,
+    )
+    assert cfg == fwd_cfg[expected]

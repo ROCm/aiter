@@ -2,12 +2,23 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_tensor.h"
 #include "asm_mla_configs.hpp"
+
+#undef ADD_CFG
+namespace mla_dsl {
+#include "asm_mla_dsl_configs.hpp"
+} // namespace mla_dsl
+#include "aiter_ctypes_error.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <unordered_map>
+
+AITER_CTYPES_ERROR_DEF
 
 // Debug instrumentation (host prints + post-launch sync/error checks + raw
 // buffer dumps) for the gfx1250 gfx1250 MLA dispatch is compiled ONLY when
@@ -143,27 +154,39 @@ struct __attribute__((packed)) MlaGfx1250PackedKernelArgs
     unsigned int stride_page;     // dword 26
     unsigned int log2_page;       // dword 27
     unsigned int stride_Q;        // dword 28
-    unsigned int use_valid_split_count_reduce;  // dword 29
+    unsigned int decode_flags;   // dword 29: bit0 valid split count, bit1 causal, bit2 token CSR
 };
+static_assert(sizeof(MlaGfx1250PackedKernelArgs) == 120);
+static_assert(offsetof(MlaGfx1250PackedKernelArgs, decode_flags) == 116);
+constexpr unsigned int MLA_DECODE_VALID_SPLIT_COUNT = 1u;
+constexpr unsigned int MLA_DECODE_CAUSAL = 2u;
+constexpr unsigned int MLA_DECODE_TOKEN_CSR = 4u;
 
-std::string get_heuristic_kernel_mla(std::string q_type,
-                                     std::string kv_type,
-                                     int gqa,
-                                     int ps,
-                                     int prefill,
-                                     int causal,
-                                     int qseqlen,
-                                     std::string arch_id,
-                                     CFG* cfgs,
-                                     int lse = 0,
-                                     int cprr = 0)
+std::string try_get_heuristic_kernel_mla(std::string q_type,
+                                         std::string kv_type,
+                                         int gqa,
+                                         int ps,
+                                         int prefill,
+                                         int causal,
+                                         int qseqlen,
+                                         std::string arch_id,
+                                         CFG* cfgs,
+                                         int lse         = 0,
+                                         int cprr        = 0,
+                                         int page_size   = 0,
+                                         int kv_shuffled = 0)
 {
     for(const auto& el : *cfgs)
     {
         if (el.first.find(arch_id) != 0)
             continue;
         const auto& cfg = el.second;
-        
+
+        // Layout and GQA jointly select the ABI: shuffled QH64 uses packed CSR,
+        // while shuffled QH128 uses its dedicated dense-table launcher.
+        if (cfg.page_size != page_size || cfg.kv_shuffled != kv_shuffled)
+            continue;
+
         if (cfg.qType != q_type || cfg.kvType != kv_type)
             continue;
         if (cfg.Gqa != gqa || cfg.ps != ps || cfg.prefill != prefill)
@@ -178,7 +201,39 @@ std::string get_heuristic_kernel_mla(std::string q_type,
             continue;
         return el.first;
     }
-    
+    return "";
+}
+
+std::string get_heuristic_kernel_mla(std::string q_type,
+                                     std::string kv_type,
+                                     int gqa,
+                                     int ps,
+                                     int prefill,
+                                     int causal,
+                                     int qseqlen,
+                                     std::string arch_id,
+                                     CFG* cfgs,
+                                     int lse         = 0,
+                                     int cprr        = 0,
+                                     int page_size   = 0,
+                                     int kv_shuffled = 0)
+{
+    std::string kernel = try_get_heuristic_kernel_mla(q_type,
+                                                      kv_type,
+                                                      gqa,
+                                                      ps,
+                                                      prefill,
+                                                      causal,
+                                                      qseqlen,
+                                                      arch_id,
+                                                      cfgs,
+                                                      lse,
+                                                      cprr,
+                                                      page_size,
+                                                      kv_shuffled);
+    if(!kernel.empty())
+        return kernel;
+
     AITER_CHECK(false,
                 __func__,
                 ": cannot get heuristic kernel!"
@@ -190,8 +245,495 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                 " causal:", causal,
                 " qseqlen:", qseqlen,
                 " lse:", lse,
-                " cprr:", cprr);
+                " cprr:", cprr,
+                " page_size:", page_size,
+                " kv_shuffled:", kv_shuffled);
     return "";
+}
+
+enum class MlaAsmStatus : int
+{
+    Ok           = 0,
+    RemapReject  = 1,
+    NoKernel     = 2,
+    ArchNotBuilt = 3,
+};
+
+struct MlaAsmDecodeCfg
+{
+    int gqa;
+    int qseqlen;
+    int ps;
+    int causal;
+    int lse;
+    int cprr;
+    unsigned int s_mqa;
+    int sub_q;
+    int64_t max_q_x_kv_split;
+    MlaAsmStatus status;
+    const char* reason;
+    std::string kernel;
+};
+
+static MlaAsmDecodeCfg mla_asm_decode_remap(const std::string& arch_id,
+                                            const std::string& q_type,
+                                            const std::string& kv_type,
+                                            int gqa_ratio,
+                                            int max_seqlen_q,
+                                            bool persistent,
+                                            bool causal,
+                                            bool has_lse,
+                                            bool has_cprr)
+{
+    MlaAsmDecodeCfg c = {};
+    c.status          = MlaAsmStatus::Ok;
+    c.reason          = "";
+    auto reject       = [&c](const char* reason) {
+        c.status = MlaAsmStatus::RemapReject;
+        c.reason = reason;
+        return c;
+    };
+    unsigned int s_MQA = gqa_ratio * max_seqlen_q;
+
+    int ps = persistent ? 1 : 0;
+    int config_causal = causal;
+    // A single query token makes the causal mask a no-op, so both causal modes
+    // share the masked kernel instead of requiring an msk0 duplicate.
+    if(max_seqlen_q == 1)
+        config_causal = 1;
+    int config_max_seqlen_q = max_seqlen_q;
+    int config_gqa_ratio = gqa_ratio;
+    int sub_Q = 128; // default value
+    
+    if(gqa_ratio == 128){
+        config_max_seqlen_q = 0;
+        sub_Q = 128;
+        if (q_type == "bf16" && kv_type == "bf16" && arch_id == "gfx942"){
+            ps = 0; // not use ps
+        }
+    }
+    else if(gqa_ratio == 16){
+        sub_Q = 128;
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(persistent){
+                if (max_seqlen_q <= 4){
+                    config_max_seqlen_q = 4; // padding it
+                }
+            }else{
+                if(max_seqlen_q == 1){
+                    config_max_seqlen_q = 1;
+                    sub_Q = 16;
+                }else if(max_seqlen_q <= 4){
+                    config_max_seqlen_q = 4;
+                }else{
+                    config_max_seqlen_q = 8;
+                }
+            }
+        }else if ((q_type == "bf16" && kv_type == "fp8") || (q_type == "bf16" && kv_type == "byte")){
+            if(persistent){
+                if(max_seqlen_q <= 4){
+                    config_max_seqlen_q = 4;
+                }
+            }
+        }else if (q_type == "fp8"){
+            if(max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+            }else if(max_seqlen_q == 2){
+                config_max_seqlen_q = 2;
+            }else if(max_seqlen_q <= 4){
+                sub_Q = 64;
+                config_max_seqlen_q = 4;
+            }else if (max_seqlen_q > 4 && persistent && arch_id == "gfx950"){
+                config_max_seqlen_q = 4;
+                config_gqa_ratio = 32;
+                s_MQA = gqa_ratio;
+            }else {
+                return reject(":only support gqa_ratio=16 fp8 mla decoding with qo_len <= 4 and qo_len>4 in persistent mode on gfx950");
+            }
+        }
+    } else if (gqa_ratio == 32){
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(!persistent){
+                config_max_seqlen_q = 0;
+                sub_Q = 64;
+            }
+        }else if (q_type == "fp8" && kv_type == "fp8"){
+            if((max_seqlen_q == 1) && !persistent){
+                config_max_seqlen_q = 1;
+                sub_Q = 32;
+            } else if((max_seqlen_q >= 3) && persistent && arch_id == "gfx950"){
+                config_max_seqlen_q = 4;
+                sub_Q = 128;
+            } else if((max_seqlen_q == 2) && persistent){
+                config_max_seqlen_q = 2;
+                sub_Q = 128;
+            } else if((max_seqlen_q == 1) && persistent){
+                config_max_seqlen_q = 1;
+                sub_Q = 32;
+            } else {
+                return reject(
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1,2 in persistent mode and decode_qlen>=3 in persistent mode on gfx950");
+            }
+        }
+    } else if (gqa_ratio == 64){
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(!persistent){
+                if(max_seqlen_q == 1){
+                    config_max_seqlen_q = 1;
+                } else {
+                    config_max_seqlen_q = 0;
+                }
+                sub_Q = 64;
+            }
+        } else if (q_type == "fp8" && kv_type == "fp8"){
+            if (persistent){
+                if(max_seqlen_q == 1){
+                    config_max_seqlen_q = 1;
+                } else {
+                    config_max_seqlen_q = 4;
+                }
+            } else if (max_seqlen_q == 1 && arch_id == "gfx950"){
+                // qt64 kernel: one WG handles 1 token x 64 heads
+                config_max_seqlen_q = 1;
+                sub_Q = 64;
+                // fp32 split output [tokens, kv_split, 64, 512] is addressed with 32-bit offsets
+                c.max_q_x_kv_split = 32768;
+            } else {
+                return reject(
+                    ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 on gfx950 in non-persistent mode");
+            }
+        }
+    } else if (gqa_ratio == 8){
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(!persistent){
+                if(max_seqlen_q == 1){
+                    sub_Q = gqa_ratio;
+                } else if(max_seqlen_q == 2){
+                    sub_Q = gqa_ratio * max_seqlen_q;
+                    s_MQA = gqa_ratio;
+                }
+            }
+        } else if (q_type == "fp8" && kv_type == "fp8"){
+            if(!persistent && max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+                sub_Q = 8;
+            }
+        }
+    }
+
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent
+        && gqa_ratio == 96){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 96;
+        s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 32;
+        s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio >= 16)){
+        config_max_seqlen_q = 1;
+        config_gqa_ratio = 64;
+        s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
+               && ((gqa_ratio == 32 && max_seqlen_q >= 4)
+                   || (gqa_ratio == 64 && max_seqlen_q >= 2)
+                   || (gqa_ratio == 128)
+                   || (gqa_ratio == 96 && max_seqlen_q <= 6))){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 32;
+        s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
+        && ((gqa_ratio == 16 && (max_seqlen_q == 3 || max_seqlen_q == 4))
+            || (gqa_ratio == 32 && (max_seqlen_q == 2 || max_seqlen_q == 3))
+            || (gqa_ratio == 64 && max_seqlen_q == 1))){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 16;
+        s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
+               && (gqa_ratio == 12) && (gqa_ratio * max_seqlen_q <= 128)){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 32;
+        s_MQA = gqa_ratio;
+    }
+
+    c.gqa     = config_gqa_ratio;
+    c.qseqlen = config_max_seqlen_q;
+    c.ps      = ps;
+    c.causal  = config_causal;
+    c.lse     = (has_lse && persistent) ? 1 : 0;
+    c.cprr    = has_cprr ? 1 : 0;
+    c.s_mqa   = s_MQA;
+    c.sub_q   = sub_Q;
+    return c;
+}
+
+static MlaAsmDecodeCfg mla_asm_decode_remap_gfx1250(const std::string& q_type,
+                                                    const std::string& kv_type,
+                                                    int gqa_ratio,
+                                                    int max_seqlen_q,
+                                                    bool persistent,
+                                                    bool has_lse,
+                                                    bool has_cprr,
+                                                    bool kv_shuffled,
+                                                    int page_size)
+{
+    MlaAsmDecodeCfg c = {};
+    c.status          = MlaAsmStatus::NoKernel;
+    if(persistent)
+    {
+        c.reason = ": gfx1250 MLA minimal smoke only supports non-persistent decode";
+        return c;
+    }
+    // Only QH64 writes LSE for a single KV split (as fp32 partials). The other
+    // kernels' bf16 epilogue leaves it unwritten, so their LSE is valid only when
+    // the launch picks kv_split > 1.
+    if(has_lse && gqa_ratio != 64)
+    {
+        c.reason = ": gfx1250 MLA returns lse only for gqa64 or kv_split > 1 (chosen at launch)";
+        return c;
+    }
+    if(has_cprr)
+    {
+        c.reason = ": gfx1250 MLA does not support round-robin context parallel (g_kv_indptr)";
+        return c;
+    }
+    if(q_type != "fp8" || kv_type != "fp8")
+    {
+        c.reason = ": only supports fp8/fp8 for minimal smoke";
+        return c;
+    }
+    if(page_size != 64)
+    {
+        c.reason = ": gfx1250 MLA only supports page_size == 64";
+        return c;
+    }
+    // Supported gfx1250 gfx1250 variants, matching hsa/gfx1250/mla/mla_asm.csv and
+    // the poc_kl 1-threadgroup (`1tg`) kernels. Each kernel processes the full
+    // flattened extent M = gqa_ratio * max_seqlen_q in a single workgroup, so
+    // sub_Q == M and the grid is exactly one tile along the M (x) dimension
+    // (mirrors make_launch_geometry() in poc_kl/gfx1250/mla/mla_helper.h). The CSV
+    // heuristic lookup is keyed by (gqa_ratio, max_seqlen_q), so reject any combo
+    // that has no registered kernel before touching the dispatch path.
+    const bool supported_variant =
+        (gqa_ratio == 8 &&
+         (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 3 || max_seqlen_q == 4)) ||
+        (gqa_ratio == 16 && (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 4)) ||
+        (gqa_ratio == 32 && max_seqlen_q == 1) ||
+        (gqa_ratio == 64 && (max_seqlen_q == 1 || (kv_shuffled && max_seqlen_q > 0))) ||
+        (gqa_ratio == 128 && max_seqlen_q == 1);
+    if(!supported_variant)
+    {
+        c.status = MlaAsmStatus::RemapReject;
+        c.reason = ": unsupported (gqa_ratio, max_seqlen_q) combo for gfx1250 gfx1250 MLA";
+        return c;
+    }
+    if(kv_shuffled && gqa_ratio != 64)
+    {
+        c.status = MlaAsmStatus::RemapReject;
+        c.reason = ": kv_shuffled packed dispatch requires gqa64";
+        return c;
+    }
+    // Shuffled QH64 launches one workgroup per query token, so a single
+    // qSeqLen=1 entry serves every query count.
+    c.status  = MlaAsmStatus::Ok;
+    c.reason  = "";
+    c.gqa     = gqa_ratio;
+    c.qseqlen = kv_shuffled ? 1 : max_seqlen_q;
+    c.s_mqa   = kv_shuffled ? 64 : gqa_ratio * max_seqlen_q;
+    c.sub_q   = kv_shuffled ? 64 : gqa_ratio * max_seqlen_q;
+    return c;
+}
+
+MlaAsmDecodeCfg mla_asm_decode_config(const std::string& arch_id,
+                                      const std::string& q_type,
+                                      const std::string& kv_type,
+                                      int num_heads,
+                                      int nhead_kv,
+                                      int max_seqlen_q,
+                                      bool persistent,
+                                      bool causal,
+                                      bool has_lse,
+                                      bool has_cprr,
+                                      bool kv_shuffled = false,
+                                      int page_size    = 64)
+{
+    MlaAsmDecodeCfg c = {};
+    c.status          = MlaAsmStatus::NoKernel;
+    if(nhead_kv != 1)
+    {
+        c.reason = ":only support num_kv_heads==1 for now";
+        return c;
+    }
+    const int gqa_ratio = num_heads / nhead_kv;
+    if(arch_id == "gfx1250")
+    {
+        c = mla_asm_decode_remap_gfx1250(q_type,
+                                         kv_type,
+                                         gqa_ratio,
+                                         max_seqlen_q,
+                                         persistent,
+                                         has_lse,
+                                         has_cprr,
+                                         kv_shuffled,
+                                         page_size);
+    }
+    else if(kv_shuffled)
+    {
+        c.reason = ": kv_shuffled requires gfx1250";
+        return c;
+    }
+    else
+    {
+        if(q_type != "bf16" && q_type != "fp8")
+        {
+            c.reason = ": unsupport Q dtype";
+            return c;
+        }
+        c = mla_asm_decode_remap(arch_id,
+                                 q_type,
+                                 kv_type,
+                                 gqa_ratio,
+                                 max_seqlen_q,
+                                 persistent,
+                                 causal,
+                                 has_lse,
+                                 has_cprr);
+    }
+    if(c.status != MlaAsmStatus::Ok)
+        return c;
+
+    c.kernel = try_get_heuristic_kernel_mla(q_type,
+                                            kv_type,
+                                            c.gqa,
+                                            c.ps,
+                                            0,
+                                            c.causal,
+                                            c.qseqlen,
+                                            arch_id,
+                                            &cfg_mla_asm,
+                                            c.lse,
+                                            c.cprr,
+                                            kv_shuffled ? 64 : 0,
+                                            kv_shuffled ? 1 : 0);
+    if(!c.kernel.empty())
+        return c;
+    bool arch_built = false;
+    for(const auto& el : cfg_mla_asm)
+        arch_built = arch_built || el.first.find(arch_id) == 0;
+    c.status = arch_built ? MlaAsmStatus::NoKernel : MlaAsmStatus::ArchNotBuilt;
+    c.reason = arch_built ? ": cannot get heuristic kernel!"
+                          : ": no asm MLA kernels are built for this arch";
+    return c;
+}
+
+static const mla_dsl::CFG::value_type* mla_ps1_fp8_asm_config(const std::string& arch_id,
+                                                              int num_heads,
+                                                              int max_seqlen_q,
+                                                              int causal_flag,
+                                                              int lse_flag,
+                                                              int cprr)
+{
+    for(const auto& el : mla_dsl::cfg_mla_dsl)
+    {
+        const auto& c = el.second;
+        if(el.first.find(arch_id) == 0 && c.qType == "fp8" && c.kvType == "fp8" &&
+           c.Gqa == num_heads && (c.qSeqLen == 0 || c.qSeqLen == max_seqlen_q) &&
+           c.causal == causal_flag && c.lse == lse_flag && c.cprr == cprr)
+        {
+            return &el;
+        }
+    }
+    return nullptr;
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT(mla_decode_asm_query,
+                               (const char* arch,
+                                const char* q_type,
+                                const char* kv_type,
+                                int num_heads,
+                                int nhead_kv,
+                                int max_seqlen_q,
+                                int persistent,
+                                int causal,
+                                int has_lse,
+                                int has_cprr,
+                                int page_size,
+                                char* kernel_out,
+                                int kernel_out_len,
+                                hipStream_t stream),
+                               (arch,
+                                q_type,
+                                kv_type,
+                                num_heads,
+                                nhead_kv,
+                                max_seqlen_q,
+                                persistent,
+                                causal,
+                                has_lse,
+                                has_cprr,
+                                page_size,
+                                kernel_out,
+                                kernel_out_len,
+                                stream))
+{
+    (void)stream;
+    AITER_CHECK(
+        q_type != nullptr && kv_type != nullptr, __func__, ": q_type and kv_type are required");
+    const std::string arch_id = (arch == nullptr || arch[0] == '\0') ? get_gpu_arch() : arch;
+    const MlaAsmDecodeCfg c   = mla_asm_decode_config(arch_id,
+                                                    q_type,
+                                                    kv_type,
+                                                    num_heads,
+                                                    nhead_kv,
+                                                    max_seqlen_q,
+                                                    persistent != 0,
+                                                    causal != 0,
+                                                    has_lse != 0,
+                                                    has_cprr != 0,
+                                                    false,
+                                                    page_size);
+    if(kernel_out != nullptr && kernel_out_len > 0)
+    {
+        const size_t n = std::min(c.kernel.size(), static_cast<size_t>(kernel_out_len - 1));
+        c.kernel.copy(kernel_out, n);
+        kernel_out[n] = '\0';
+    }
+    return static_cast<int>(c.status) | ((c.gqa & 0xff) << 8) | ((c.qseqlen & 0xff) << 16);
+}
+
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    mla_ps1_fp8_asm_query,
+    (const char* arch,
+     int num_heads,
+     int max_seqlen_q,
+     int causal,
+     int has_lse,
+     int has_cprr,
+     char* kernel_out,
+     int kernel_out_len,
+     hipStream_t stream),
+    (arch, num_heads, max_seqlen_q, causal, has_lse, has_cprr, kernel_out, kernel_out_len, stream))
+{
+    (void)stream;
+    const std::string arch_id = (arch == nullptr || arch[0] == '\0') ? get_gpu_arch() : arch;
+    const int causal_flag     = causal != 0 ? 1 : 0;
+    const int cprr            = (has_cprr != 0 && causal_flag) ? 1 : 0;
+    const auto* cfg_entry     = mla_ps1_fp8_asm_config(
+        arch_id, num_heads, max_seqlen_q, causal_flag, has_lse != 0 ? 1 : 0, cprr);
+    bool arch_built = cfg_entry != nullptr;
+    for(const auto& el : mla_dsl::cfg_mla_dsl)
+        arch_built = arch_built || el.first.find(arch_id) == 0;
+    const std::string kernel = cfg_entry != nullptr ? cfg_entry->first : std::string();
+    if(kernel_out != nullptr && kernel_out_len > 0)
+    {
+        const size_t n = std::min(kernel.size(), static_cast<size_t>(kernel_out_len - 1));
+        kernel.copy(kernel_out, n);
+        kernel_out[n] = '\0';
+    }
+    const MlaAsmStatus status = cfg_entry != nullptr ? MlaAsmStatus::Ok
+                                : arch_built         ? MlaAsmStatus::NoKernel
+                                                     : MlaAsmStatus::ArchNotBuilt;
+    return static_cast<int>(status);
 }
 
 #ifdef ASM_DEBUG
@@ -287,6 +829,9 @@ static void mla_decode_gfx1250_dispatch(
     aiter_tensor_t* kv_scale,
     aiter_tensor_t* valid_split_count,
     int use_valid_split_count_reduce,
+    int causal,
+    int kv_shuffled,
+    int kv_indptr_is_token_level,
     hipStream_t stream)
 {
     (void)lse;
@@ -326,29 +871,29 @@ static void mla_decode_gfx1250_dispatch(
     constexpr int bdz      = 1;
 
     AITER_CHECK(nhead_kv == 1, __func__, ": only support nhead_kv == 1 for minimal smoke");
-    // Supported gfx1250 gfx1250 variants, matching hsa/gfx1250/mla/mla_asm.csv and
-    // the poc_kl 1-threadgroup (`1tg`) kernels. Each kernel processes the full
-    // flattened extent M = gqa_ratio * max_seqlen_q in a single workgroup, so
-    // sub_Q == M and the grid is exactly one tile along the M (x) dimension
-    // (mirrors make_launch_geometry() in poc_kl/gfx1250/mla/mla_helper.h). The CSV
-    // heuristic lookup is keyed by (gqa_ratio, max_seqlen_q), so reject any combo
-    // that has no registered kernel before touching the dispatch path.
-    const bool supported_variant =
-        (gqa_ratio == 8 &&
-         (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 3 || max_seqlen_q == 4)) ||
-        (gqa_ratio == 16 && (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 4)) ||
-        (gqa_ratio == 32 && max_seqlen_q == 1) ||
-        (gqa_ratio == 64 && max_seqlen_q == 1) ||
-        (gqa_ratio == 128 && max_seqlen_q == 1);
-    AITER_CHECK(supported_variant,
-                __func__,
-                ": unsupported (gqa_ratio, max_seqlen_q) combo for gfx1250 gfx1250 MLA; got gqa_ratio=",
-                gqa_ratio,
-                " max_seqlen_q=",
-                max_seqlen_q,
-                " (supported: gqa8 x qSeqLen{1,2,3,4}, gqa16 x qSeqLen{1,2,4}, gqa32 x qSeqLen1, gqa64 x qSeqLen1, "
-                "gqa128 x qSeqLen1)");
-    const int sub_Q = gqa_ratio * max_seqlen_q;
+    const MlaAsmDecodeCfg dcfg = mla_asm_decode_config(arch_id,
+                                                       "fp8",
+                                                       "fp8",
+                                                       num_heads,
+                                                       nhead_kv,
+                                                       max_seqlen_q,
+                                                       false,
+                                                       false,
+                                                       false,
+                                                       false,
+                                                       kv_shuffled != 0,
+                                                       page_size);
+    AITER_CHECK(
+        dcfg.status != MlaAsmStatus::RemapReject,
+        __func__,
+        ": unsupported (gqa_ratio, max_seqlen_q) combo for gfx1250 gfx1250 MLA; got gqa_ratio=",
+        gqa_ratio,
+        " max_seqlen_q=",
+        max_seqlen_q,
+        " (supported: gqa8 x qSeqLen{1,2,3,4}, gqa16 x qSeqLen{1,2,4}, gqa32 x qSeqLen1, gqa64 x "
+        "qSeqLen1 (shuffled accepts multiple queries), "
+        "gqa128 x qSeqLen1)");
+    const int sub_Q = kv_shuffled ? 64 : gqa_ratio * max_seqlen_q;
     AITER_CHECK(page_size == 64, __func__, ": only support page_size == 64 for minimal smoke");
     AITER_CHECK(Q->size(2) == 576, __func__, ": only support Q head dim 576 for minimal smoke");
     AITER_CHECK(output->size(2) == 512, __func__, ": only support output head dim 512 for minimal smoke");
@@ -372,8 +917,12 @@ static void mla_decode_gfx1250_dispatch(
     }
     // ABI contract with the gfx1250 .co: with out_16_nosplit==1 the passes==1
     // fast-path writes FINAL bf16 output directly into R. For passes>1, R holds
-    // fp32 split partials that Python reduces in stage2.
-    const auto expected_split_dtype = (kv_split == 1) ? AITER_DTYPE_bf16 : AITER_DTYPE_fp32;
+    // fp32 split partials that Python reduces in stage2. QH64 also uses this
+    // mode with one split when LSE is requested: its BF16 epilogue omits LSE.
+    const bool fp32_single_split_lse = kv_split == 1 && gqa_ratio == 64 &&
+                                       (max_seqlen_q == 1 || kv_shuffled) && lse != nullptr;
+    const auto expected_split_dtype = (kv_split == 1 && !fp32_single_split_lse)
+                                          ? AITER_DTYPE_bf16 : AITER_DTYPE_fp32;
     AITER_CHECK(splitData->dtype() == expected_split_dtype,
                 __func__,
                 ": gfx1250 gfx1250 MLA splitData (R) dtype mismatch; expected ",
@@ -387,9 +936,40 @@ static void mla_decode_gfx1250_dispatch(
                 ": gfx1250 gfx1250 MLA requires splitLse to be fp32; got ",
                 AiterDtype_to_str(splitLse->dtype()));
 
+    AITER_CHECK(kv_shuffled == 0 || kv_shuffled == 1, __func__, ": kv_shuffled must be 0 or 1");
+    if(kv_shuffled)
+    {
+        AITER_CHECK(gqa_ratio == 64 && max_seqlen_q > 0, __func__,
+                    ": kv_shuffled packed dispatch requires gqa64 and positive max_seqlen_q");
+        AITER_CHECK(causal == 0 || causal == 1, __func__, ": causal must be 0 or 1");
+        AITER_CHECK(Q->stride(1) == 768, __func__,
+                    ": kv_shuffled QH64 requires Q head stride 768");
+        AITER_CHECK(KV->dim() == 4 && KV->is_contiguous() &&
+                        KV->size(3) == 576 && KV->size(1) * KV->size(2) == 64 &&
+                        (KV->size(1) == 1 || KV->size(2) == 1) &&
+                        KV->stride(0) * KV->element_size() == 64 * 576,
+                    __func__, ": kv_shuffled KV requires contiguous page64 storage");
+    }
+
     CFG* config_map = &cfg_mla_asm;
+    // The config map is keyed by symbol: one canonical entry handles both
+    // runtime causal modes and every query count for shuffled QH64.
     std::string kernelName =
-        get_heuristic_kernel_mla("fp8", "fp8", gqa_ratio, 0, 0, 0, max_seqlen_q, arch_id, config_map, 0);
+        dcfg.status == MlaAsmStatus::Ok
+            ? dcfg.kernel
+            : get_heuristic_kernel_mla("fp8",
+                                       "fp8",
+                                       gqa_ratio,
+                                       0,
+                                       0,
+                                       0,
+                                       kv_shuffled ? 1 : max_seqlen_q,
+                                       arch_id,
+                                       config_map,
+                                       0,
+                                       0,
+                                       kv_shuffled ? 64 : 0,
+                                       kv_shuffled);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable gfx1250 kernel");
 
     static SynchronizedCache<std::string_view, AiterAsmKernel> gfx1250_impl_ptr_map;
@@ -413,12 +993,13 @@ static void mla_decode_gfx1250_dispatch(
     // below is kept only for kernels that have not been rebuilt from sp3 yet.
     const int q_elem_size = Q->element_size();
     const int qk_head_dim = Q->size(2);
-    const int q_seq_lens_kernel = max_seqlen_q * gqa_ratio;
+    // Shuffled QH64 launches a separate workgroup for each query token.
+    const int q_seq_lens_kernel = kv_shuffled ? 64 : max_seqlen_q * gqa_ratio;
     const unsigned int stride_Q =
         static_cast<unsigned int>(nhead_kv * q_seq_lens_kernel * qk_head_dim * q_elem_size);
     const unsigned int stride_page = static_cast<unsigned int>(KV->stride(0) * KV->element_size());
     const unsigned int log2_page = static_cast<unsigned int>(log2f(static_cast<float>(page_size)));
-    const unsigned int out_16_nosplit = (kv_split == 1) ? 1 : 0;
+    const unsigned int out_16_nosplit = (kv_split == 1 && !fp32_single_split_lse) ? 1 : 0;
 
     MlaGfx1250KernelArgs legacy_args = {};
     MlaGfx1250PackedKernelArgs packed_args = {};
@@ -468,8 +1049,10 @@ static void mla_decode_gfx1250_dispatch(
         packed_args.stride_page = stride_page;
         packed_args.log2_page = log2_page;
         packed_args.stride_Q = stride_Q;
-        packed_args.use_valid_split_count_reduce =
-            static_cast<unsigned int>(use_valid_split_count_reduce != 0);
+        packed_args.decode_flags =
+            (use_valid_split_count_reduce ? MLA_DECODE_VALID_SPLIT_COUNT : 0u) |
+            (kv_shuffled && causal ? MLA_DECODE_CAUSAL : 0u) |
+            (kv_indptr_is_token_level ? MLA_DECODE_TOKEN_CSR : 0u);
         kernarg_ptr = &packed_args;
         arg_size = sizeof(packed_args);
     }
@@ -478,7 +1061,8 @@ static void mla_decode_gfx1250_dispatch(
     // two workgroups along X: the kernel copies the X id into _s_tg_idx (guarded by
     // _s_MQA > 64) and shifts Q by Q_GROUP_PAD_SIZE * tg_idx. Z is the plain KV
     // split id in every case -- it must not carry the head half as well.
-    const int gdx = (gqa_ratio == 128) ? 2 : (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
+    const int gdx = kv_shuffled ? max_seqlen_q :
+        ((gqa_ratio == 128) ? 2 : (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q);
     const int gdy = batch;
     const int gdz = kv_split;
 
@@ -493,7 +1077,7 @@ static void mla_decode_gfx1250_dispatch(
     }
     std::printf("[aiter][gfx1250][debug] inputs: arch=%s batch=%d num_heads=%d nhead_kv=%d "
                 "gqa_ratio=%d max_seqlen_q=%d page_size=%d qk_head_dim=%d q_elem_size=%d "
-                "kv_split=%d softmax_scale=%g\n",
+                "kv_split=%d softmax_scale=%g kv_shuffled=%d\n",
                 arch_id.c_str(),
                 batch,
                 num_heads,
@@ -504,7 +1088,8 @@ static void mla_decode_gfx1250_dispatch(
                 qk_head_dim,
                 q_elem_size,
                 kv_split,
-                softmax_scale);
+                softmax_scale,
+                kv_shuffled);
     std::printf("[aiter][gfx1250][debug] tensor shapes: Q=(%ld,%ld,%ld) KV=(%ld,%ld,%ld,%ld) "
                 "splitData=(%ld,%ld,%ld,%ld) splitLse=(%ld,%ld,%ld,%ld) output=(%ld,%ld,%ld)\n",
                 Q->size(0),
@@ -565,7 +1150,7 @@ static void mla_decode_gfx1250_dispatch(
                 lse == nullptr ? nullptr : lse->data_ptr(),
                 stream);
     std::printf("[aiter][gfx1250][debug] kernargs: scalar=%g q_seq_lens=%u passes=%u "
-                "stride_Q=%u stride_page=%u log2_page=%u out_16_nosplit=%u use_valid_split_count_reduce=%u\n",
+                "stride_Q=%u stride_page=%u log2_page=%u out_16_nosplit=%u decode_flags=%u\n",
                 softmax_scale,
                 static_cast<unsigned int>(q_seq_lens_kernel),
                 static_cast<unsigned int>(kv_split),
@@ -573,7 +1158,7 @@ static void mla_decode_gfx1250_dispatch(
                 stride_page,
                 log2_page,
                 out_16_nosplit,
-                use_packed_gfx1250_args ? packed_args.use_valid_split_count_reduce : 0u);
+                use_packed_gfx1250_args ? packed_args.decode_flags : 0u);
     std::printf("[aiter][gfx1250][debug] launch: grid=(%d,%d,%d) block=(%d,%d,%d)\n",
                 gdx,
                 gdy,
@@ -645,9 +1230,10 @@ static void mla_decode_gfx1250_dispatch(
 #endif
 }
 
-AITER_C_ITFS
-void mla_decode_stage1_asm_fwd(
-    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_decode_stage1_asm_fwd,
+    (aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
     aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
     aiter_tensor_t* qo_indptr,            //   [batch_size+1]
     aiter_tensor_t* kv_indptr,            //   [batch_size+1]
@@ -674,8 +1260,31 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* valid_split_count,    //   [batch_size] scratch for packed gfx1250 kernels (nullable)
     int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
     int causal,                           //   apply the causal mask across the max_seqlen_q query tokens
-    hipStream_t stream)
-{    
+    int kv_shuffled,                      //   QH64 page64 shuffled storage (packed CSR ABI)
+    int kv_indptr_is_token_level,          //   QH64 shuffled token indptr and page64 slot IDs
+    hipStream_t stream),
+    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, num_kv_splits_indptr, work_meta_data, work_indptr, work_info_set, max_seqlen_q, page_size, nhead_kv, softmax_scale, splitData, splitLse, output, lse, q_scale, kv_scale, g_kv_indptr, cp_world_size, cp_rank, valid_split_count, use_valid_split_count_reduce, causal, kv_shuffled, kv_indptr_is_token_level, stream))
+{
+    AITER_CHECK(kv_indptr_is_token_level == 0 || kv_indptr_is_token_level == 1,
+                __func__, ": kv_indptr_is_token_level must be 0 or 1");
+    if(kv_indptr_is_token_level)
+    {
+        AITER_CHECK(kv_shuffled == 1 && Q != nullptr && Q->dim() == 3 &&
+                        Q->size(1) == 64 && nhead_kv == 1 && page_size == 64 &&
+                        max_seqlen_q > 0 && num_kv_splits_indptr != nullptr &&
+                        work_meta_data == nullptr && work_indptr == nullptr &&
+                        work_info_set == nullptr,
+                    __func__, ": token CSR requires non-persistent kv_shuffled QH64 page64");
+    }
+    if(kv_shuffled)
+    {
+        AITER_CHECK(Q != nullptr && Q->dim() == 3 && qo_indptr != nullptr &&
+                        kv_indptr != nullptr && kv_page_indices != nullptr &&
+                        kv_last_page_lens != nullptr && splitData != nullptr && nhead_kv == 1,
+                    __func__, ": kv_shuffled QH64 requires Q and CSR metadata");
+        AITER_CHECK(cp_world_size == 1 && cp_rank == 0 && g_kv_indptr == nullptr,
+                    __func__, ": kv_shuffled QH64 does not support context parallelism");
+    }
     int batch           = qo_indptr->size(0) - 1;
     int num_heads       = Q->size(1);
     int head_size       = Q->size(2);
@@ -690,6 +1299,11 @@ void mla_decode_stage1_asm_fwd(
     std::string arch_id = get_gpu_arch();
     if(arch_id == "gfx1250")
     {
+        // The gfx1250 kernels have no global KV positions, so round-robin CP
+        // would run unmasked; mla_asm_decode_config reports it as NoKernel.
+        AITER_CHECK(g_kv_indptr == nullptr || g_kv_indptr->data_ptr() == nullptr,
+                    __func__,
+                    ": gfx1250 MLA does not support round-robin context parallel (g_kv_indptr)");
         return mla_decode_gfx1250_dispatch(Q,
                                          KV,
                                          qo_indptr,
@@ -712,8 +1326,13 @@ void mla_decode_stage1_asm_fwd(
                                          kv_scale,
                                          valid_split_count,
                                          use_valid_split_count_reduce,
+                                         causal,
+                                         kv_shuffled,
+                                         kv_indptr_is_token_level,
                                          stream);
     }
+
+    AITER_CHECK(kv_shuffled == 0, __func__, ": kv_shuffled requires gfx1250");
 
     int stride_Q       = Q->stride(0) * Q->element_size() * max_seqlen_q;
     int stride_Page    = KV->stride(0) * KV->element_size();
@@ -730,7 +1349,6 @@ void mla_decode_stage1_asm_fwd(
     args.ptr_LTL     = kv_last_page_lens->data_ptr();
     args.ptr_QTP     = qo_indptr->data_ptr();
     args.scalar      = softmax_scale;
-    args.s_MQA       = gqa_ratio * max_seqlen_q;
     args.s_kv_split  = kv_split;
     args.s_Q_Bs      =  stride_Q;
     args.s_Bs        = stride_Page;
@@ -816,7 +1434,24 @@ void mla_decode_stage1_asm_fwd(
 
     if (kv_dtype != AITER_DTYPE_i8 && kv_dtype != AITER_DTYPE_u8) {
         AITER_CHECK(head_size == KV->size(3), __func__, ":only support head_size == KV.size(3) for now");
+    } else {
+        // The byte kernel is given the page stride but no inner stride, so each page's
+        // page_size * 656 bytes must be dense.
+        AITER_CHECK(KV->dim() == 2 && KV->size(1) == int64_t(page_size) * 656 && KV->stride(1) == 1,
+                    __func__,
+                    ": byte KV must be [num_page, page_size * 656] with contiguous pages (512 fp8 latent + "
+                    "4 fp32 scales + 64 bf16 RoPE per token), got a ", KV->dim(), "-D KV with size(1) ",
+                    KV->size(1), " and stride(1) ", KV->stride(1), " for page_size ", page_size);
     }
+    // The decode kernels are built for DeepSeek's MLA row (512 latent + 64 RoPE) and take
+    // no head size, so a narrower row is read past its end instead of being rejected.
+    AITER_CHECK(head_size == 576, __func__,
+                ": only support 576-element MLA rows (kv_lora_rank 512 + qk_rope_head_dim 64), got head_size ",
+                head_size);
+    AITER_CHECK(output->size(2) == 512, __func__,
+                ": only support v_head_dim 512, got ", output->size(2));
+    AITER_CHECK(splitData->size(3) == 512, __func__,
+                ": only support splitData with v_head_dim 512, got ", splitData->size(3));
     
     if(q_dtype == AITER_DTYPE_fp8)
     {
@@ -856,156 +1491,42 @@ void mla_decode_stage1_asm_fwd(
     CFG* config_map = &cfg_mla_asm;
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     
-    int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
-    int config_causal = causal;
-    // A single query token makes the causal mask a no-op, so both causal modes
-    // share the masked kernel instead of requiring an msk0 duplicate.
-    if(max_seqlen_q == 1)
-        config_causal = 1;
-    int config_max_seqlen_q = max_seqlen_q;
-    int config_gqa_ratio = gqa_ratio;
-    int sub_Q = 128; // default value
-    
-    if(gqa_ratio == 128){
-        config_max_seqlen_q = 0;
-        sub_Q = 128;
-        if (q_type == "bf16" && kv_type == "bf16" && arch_id == "gfx942"){
-            ps = 0; // not use ps
-        }
-    }
-    else if(gqa_ratio == 16){
-        sub_Q = 128;
-        if (q_type == "bf16" && kv_type == "bf16"){
-            if(persistent){
-                if (max_seqlen_q <= 4){
-                    config_max_seqlen_q = 4; // padding it
-                }
-            }else{
-                if(max_seqlen_q == 1){
-                    config_max_seqlen_q = 1;
-                    sub_Q = 16;
-                }else if(max_seqlen_q <= 4){
-                    config_max_seqlen_q = 4;
-                }else{
-                    config_max_seqlen_q = 8;
-                }
-            }
-        }else if ((q_type == "bf16" && kv_type == "fp8") || (q_type == "bf16" && kv_type == "byte")){
-            if(persistent){
-                if(max_seqlen_q <= 4){
-                    config_max_seqlen_q = 4;
-                }
-            }
-        }else if (q_type == "fp8"){
-            if(max_seqlen_q == 1){
-                config_max_seqlen_q = 1;
-            }else if(max_seqlen_q == 2){
-                config_max_seqlen_q = 2;
-            }else if(max_seqlen_q <= 4){
-                sub_Q = 64;
-                config_max_seqlen_q = 4;
-            }else if (max_seqlen_q > 4 && persistent && arch_id == "gfx950"){
-                config_max_seqlen_q = 4;
-                config_gqa_ratio = 32;
-                args.s_MQA = gqa_ratio;
-            }else {
-                AITER_CHECK(false, __func__, ":only support gqa_ratio=16 fp8 mla decoding with qo_len <= 4 and qo_len>4 in persistent mode on gfx950");
-            }
-        }
-    } else if (gqa_ratio == 32){
-        if (q_type == "bf16" && kv_type == "bf16"){
-            if(!persistent){
-                config_max_seqlen_q = 0;
-                sub_Q = 64;
-            }
-        }else if (q_type == "fp8" && kv_type == "fp8"){
-            if((max_seqlen_q == 1) && !persistent){
-                config_max_seqlen_q = 1;
-                sub_Q = 32;
-            } else if((max_seqlen_q >= 3) && persistent && arch_id == "gfx950"){
-                config_max_seqlen_q = 4;
-                sub_Q = 128;
-            } else if((max_seqlen_q == 2) && persistent){
-                config_max_seqlen_q = 2;
-                sub_Q = 128;
-            } else if((max_seqlen_q == 1) && persistent){
-                config_max_seqlen_q = 1;
-                sub_Q = 32;
-            } else {
-                AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1,2 in persistent mode and decode_qlen>=3 in persistent mode on gfx950");
-            }
-        }
-    } else if (gqa_ratio == 64){
-        if (q_type == "bf16" && kv_type == "bf16"){
-            if(!persistent){
-                if(max_seqlen_q == 1){
-                    config_max_seqlen_q = 1;
-                } else {
-                    config_max_seqlen_q = 0;
-                }
-                sub_Q = 64;
-            }
-        } else if (q_type == "fp8" && kv_type == "fp8"){
-            if (persistent){
-                if(max_seqlen_q == 1){
-                    config_max_seqlen_q = 1;
-                } else {
-                    config_max_seqlen_q = 4;
-                }
-            } else {
-                AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=64 only supports persistent mode");
-            }
-        }
-    } else if (gqa_ratio == 8){
-        if (q_type == "bf16" && kv_type == "bf16"){
-            if(!persistent){
-                if(max_seqlen_q == 1){
-                    sub_Q = gqa_ratio;
-                } else if(max_seqlen_q == 2){
-                    sub_Q = gqa_ratio * max_seqlen_q;
-                    args.s_MQA = gqa_ratio;
-                }
-            }
-        } else if (q_type == "fp8" && kv_type == "fp8"){
-            if(!persistent && max_seqlen_q == 1){
-                config_max_seqlen_q = 1;
-                sub_Q = 8;
-            }
-        }
-    }
-
-    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
-        config_max_seqlen_q = 4;
-        config_gqa_ratio = 32;
-        args.s_MQA = gqa_ratio;
-    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio >= 16)){
-        config_max_seqlen_q = 1;
-        config_gqa_ratio = 64;
-        args.s_MQA = gqa_ratio;
-    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
-               && ((gqa_ratio == 32 && max_seqlen_q >= 4)
-                   || (gqa_ratio == 64 && max_seqlen_q >= 2)
-                   || (gqa_ratio == 128)
-                   || (gqa_ratio == 96 && max_seqlen_q <= 6))){
-        config_max_seqlen_q = 4;
-        config_gqa_ratio = 32;
-        args.s_MQA = gqa_ratio;
-    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
-        && ((gqa_ratio == 16 && (max_seqlen_q == 3 || max_seqlen_q == 4))
-            || (gqa_ratio == 32 && (max_seqlen_q == 2 || max_seqlen_q == 3))
-            || (gqa_ratio == 64 && max_seqlen_q == 1))){
-        config_max_seqlen_q = 4;
-        config_gqa_ratio = 16;
-        args.s_MQA = gqa_ratio;
-    }
-    int lse_flag = (lse != nullptr && persistent) ? 1 : 0;
-
-    int cprr_flag = (g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr) ? 1 : 0;
-    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, config_causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
-    AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    const MlaAsmDecodeCfg dcfg =
+        mla_asm_decode_config(arch_id,
+                              q_type,
+                              kv_type,
+                              num_heads,
+                              num_kv_heads,
+                              max_seqlen_q,
+                              persistent,
+                              causal != 0,
+                              lse != nullptr,
+                              g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr);
+    AITER_CHECK(dcfg.status != MlaAsmStatus::RemapReject, __func__, dcfg.reason);
+    AITER_CHECK(
+        dcfg.max_q_x_kv_split == 0 || kv_split == 1 ||
+            (int64_t)Q->size(0) * kv_split <= dcfg.max_q_x_kv_split,
+        __func__,
+        ": fp8/fp8 gqa_ratio=64 with kv_split>1 requires total_q * kv_split <= 32768, got total_q=",
+        Q->size(0),
+        " kv_split=",
+        kv_split);
+    args.s_MQA             = dcfg.s_mqa;
+    const int sub_Q        = dcfg.sub_q;
+    std::string kernelName = dcfg.status == MlaAsmStatus::Ok
+                                 ? dcfg.kernel
+                                 : get_heuristic_kernel_mla(q_type,
+                                                            kv_type,
+                                                            dcfg.gqa,
+                                                            dcfg.ps,
+                                                            prefill,
+                                                            dcfg.causal,
+                                                            dcfg.qseqlen,
+                                                            arch_id,
+                                                            config_map,
+                                                            dcfg.lse,
+                                                            dcfg.cprr);
     
     AiterAsmKernel* impl_ptr = nullptr;
     
@@ -1091,9 +1612,10 @@ struct __attribute__((packed)) PsKernelArgs
 };
 
 
-AITER_C_ITFS
-void mla_prefill_ps_asm_fwd(
-    aiter_tensor_t* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_prefill_ps_asm_fwd,
+    (aiter_tensor_t* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
     aiter_tensor_t* K,                    //   [num_page, num_kv_heads, qk_head_size], fp8
     aiter_tensor_t* V,                    //   [num_page, num_kv_heads, v_head_size], fp8
     aiter_tensor_t* qo_indptr,            //   [batch_size+1], int
@@ -1110,7 +1632,8 @@ void mla_prefill_ps_asm_fwd(
     aiter_tensor_t* q_scale,              //   fp32, scalar (nullable)
     aiter_tensor_t* k_scale,              //   fp32, scalar (nullable)
     aiter_tensor_t* v_scale,              //   fp32, scalar (nullable)
-    hipStream_t stream)
+    hipStream_t stream),
+    (Q, K, V, qo_indptr, kv_indptr, kv_page_indices, work_indptr, work_info_set, max_seqlen_q, softmax_scale, is_causal, splitData, splitLse, output, q_scale, k_scale, v_scale, stream))
 {
     int num_q_tokens  = Q->size(0);
     int num_head_q    = Q->size(1);
@@ -1208,9 +1731,10 @@ void mla_prefill_ps_asm_fwd(
 }
 
 
-AITER_C_ITFS
-void mla_prefill_asm_fwd(
-    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_prefill_asm_fwd,
+    (aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
     aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size]
     aiter_tensor_t* qo_indptr,            //   [batch_size+1]
     aiter_tensor_t* kv_indptr,            //   [batch_size+1]
@@ -1220,7 +1744,8 @@ void mla_prefill_asm_fwd(
     float softmax_scale,
     aiter_tensor_t* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
     aiter_tensor_t* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
-    hipStream_t stream)
+    hipStream_t stream),
+    (Q, KV, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, max_seqlen_q, softmax_scale, splitData, splitLse, stream))
 {
     int sub_Q           = 128;
     int batch           = kv_indptr->size(0) - 1;
@@ -1312,4 +1837,298 @@ void mla_prefill_asm_fwd(
                              1,                                              // bdy
                              1,                                              // bdz
                              stream});
+}
+
+// Kernel arguments of the persistent page-size-1 FP8 decode stage 1 exported
+// from FlyDSL (hsa/gfx1250/mla_dsl/mla_dsl.csv). The layout is the code object's
+// amdhsa.kernels .args list; the offsets below pin it.
+struct __attribute__((packed)) MlaPs1Fp8KernelArgs
+{
+    void* ptr_r;
+    void* ptr_lse;
+    void* ptr_final;
+    void* ptr_final_lse;
+    void* ptr_q;
+    void* ptr_kv;
+    void* kv_page_indices;
+    void* work_indptr;
+    void* work_info_set;
+    void* q_scale;
+    void* kv_scale;
+    float softmax_scale;
+    int num_pages;
+    int num_page_indices;
+    unsigned int _pad0;
+    void* qo_indptr;
+    void* kv_indptr;
+    void* g_kv_indptr;
+    int cp_world_size;
+    int cp_rank;
+};
+static_assert(offsetof(MlaPs1Fp8KernelArgs, softmax_scale) == 88, "mla_ps1 kernarg layout");
+static_assert(offsetof(MlaPs1Fp8KernelArgs, qo_indptr) == 104, "mla_ps1 kernarg layout");
+static_assert(offsetof(MlaPs1Fp8KernelArgs, cp_rank) == 132, "mla_ps1 kernarg layout");
+static_assert(sizeof(MlaPs1Fp8KernelArgs) == 136, "mla_ps1 kernarg layout");
+
+// Bridged: an exception crossing extern "C" would terminate the process.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_ps1_fp8_asm_fwd,
+    (aiter_tensor_t* split_data,      //   [num_partials, num_heads, 512] fp32
+    aiter_tensor_t* split_lse,        //   [num_partials, num_heads] fp32
+    aiter_tensor_t* final_output,     //   [total_q, num_heads, 512] bf16
+    aiter_tensor_t* final_lse,        //   [total_q, num_heads] fp32 (nullable)
+    aiter_tensor_t* q,                //   [total_q, num_heads, 576] fp8
+    aiter_tensor_t* kv_buffer,        //   [num_pages, 1, 1, 576] fp8
+    aiter_tensor_t* kv_page_indices,  //   [num_page_indices] int32
+    aiter_tensor_t* work_indptr,      //   [num_workers + 1] int32
+    aiter_tensor_t* work_info_set,    //   [num_works, 8] int32
+    float softmax_scale,
+    aiter_tensor_t* q_scale,          //   [1] fp32
+    aiter_tensor_t* kv_scale,         //   [1] fp32
+    int max_seqlen_q,
+    int causal,
+    aiter_tensor_t* qo_indptr,        //   [batch + 1] int32, round-robin CP only (nullable)
+    aiter_tensor_t* kv_indptr,        //   [batch + 1] int32, round-robin CP only (nullable)
+    aiter_tensor_t* g_kv_indptr,      //   [batch + 1] int32, round-robin CP only (nullable)
+    int cp_world_size,
+    int cp_rank,
+    hipStream_t stream),
+    (split_data, split_lse, final_output, final_lse, q, kv_buffer, kv_page_indices, work_indptr, work_info_set, softmax_scale, q_scale, kv_scale, max_seqlen_q, causal, qo_indptr, kv_indptr, g_kv_indptr, cp_world_size, cp_rank, stream))
+{
+    const std::string arch_id = get_gpu_arch();
+    AITER_CHECK(arch_id == "gfx1250", __func__, ": only supports gfx1250, got ", arch_id);
+    const HipDeviceGuard device_guard(q->device_id);
+
+    const int total_q   = q->size(0);
+    const int num_heads = q->size(1);
+    auto require_i32 = [](const aiter_tensor_t* t, const char* name) {
+        AITER_CHECK(t != nullptr && t->dtype() == AITER_DTYPE_i32 && t->is_contiguous(),
+                    "mla_ps1_fp8_asm_fwd: ", name, " must be a contiguous int32 tensor");
+    };
+    AITER_CHECK(q->dim() == 3 && q->size(2) == 576 && q->dtype() == AITER_DTYPE_fp8 &&
+                    q->is_contiguous(),
+                __func__, ": q must be a contiguous fp8 [total_q, num_heads, 576] tensor");
+    AITER_CHECK(kv_buffer->size(-1) == 576 && kv_buffer->numel() == kv_buffer->size(0) * 576 &&
+                    kv_buffer->dtype() == AITER_DTYPE_fp8 && kv_buffer->is_contiguous(),
+                __func__, ": kv_buffer must be a contiguous fp8 [num_pages, 1, 1, 576] tensor");
+    AITER_CHECK(split_data->dtype() == AITER_DTYPE_fp32 && split_data->size(-2) == num_heads &&
+                    split_data->size(-1) == 512 && split_data->is_contiguous(),
+                __func__, ": split_data must be a contiguous fp32 [*, num_heads, 512] tensor");
+    AITER_CHECK(split_lse->dtype() == AITER_DTYPE_fp32 && split_lse->is_contiguous(),
+                __func__, ": split_lse must be a contiguous fp32 tensor");
+    AITER_CHECK(final_output->dtype() == AITER_DTYPE_bf16 && final_output->size(0) == total_q &&
+                    final_output->is_contiguous(),
+                __func__, ": final_output must be a contiguous bf16 [total_q, num_heads, 512] tensor");
+    AITER_CHECK(final_lse == nullptr ||
+                    (final_lse->dtype() == AITER_DTYPE_fp32 && final_lse->is_contiguous()),
+                __func__, ": final_lse must be a contiguous fp32 tensor");
+    AITER_CHECK(q_scale != nullptr && kv_scale != nullptr &&
+                    q_scale->dtype() == AITER_DTYPE_fp32 && kv_scale->dtype() == AITER_DTYPE_fp32,
+                __func__, ": q_scale and kv_scale must be fp32 scalar tensors");
+    require_i32(kv_page_indices, "kv_page_indices");
+    require_i32(work_indptr, "work_indptr");
+    require_i32(work_info_set, "work_info_set");
+
+    const int lse_flag  = final_lse != nullptr ? 1 : 0;
+    const int causal_flag = causal ? 1 : 0;
+    // Round-robin CP only exists with causal masking, matching the FlyDSL wrapper.
+    const int cprr = (cp_world_size > 1 && causal_flag) ? 1 : 0;
+    if(cprr)
+    {
+        AITER_CHECK(0 <= cp_rank && cp_rank < cp_world_size,
+                    __func__, ": cp_rank must be in [0, cp_world_size)");
+        require_i32(qo_indptr, "qo_indptr");
+        require_i32(kv_indptr, "kv_indptr");
+        require_i32(g_kv_indptr, "g_kv_indptr");
+    }
+
+    const auto* cfg_entry =
+        mla_ps1_fp8_asm_config(arch_id, num_heads, max_seqlen_q, causal_flag, lse_flag, cprr);
+    const mla_dsl::mla_dslConfig* cfg = cfg_entry != nullptr ? &cfg_entry->second : nullptr;
+    AITER_CHECK(cfg != nullptr, __func__, ": no mla_ps1 code object for num_heads=", num_heads,
+                " max_seqlen_q=", max_seqlen_q, " causal=", causal_flag, " lse=", lse_flag,
+                " cprr=", cprr);
+
+    // Compiler output, not shipped hand-written asm: the gfx1250 B0-only gate
+    // does not apply.
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    const char* name    = cfg->knl_name.c_str();
+    const char* co_name = cfg->co_name.c_str();
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
+        return AiterAsmKernel(name, co_name, AiterAsmKernel::SkipGfx1250Gate{});
+    });
+
+    MlaPs1Fp8KernelArgs args{};
+    args.ptr_r            = split_data->data_ptr();
+    args.ptr_lse          = split_lse->data_ptr();
+    args.ptr_final        = final_output->data_ptr();
+    args.ptr_final_lse    = lse_flag ? final_lse->data_ptr() : nullptr;
+    args.ptr_q            = q->data_ptr();
+    args.ptr_kv           = kv_buffer->data_ptr();
+    args.kv_page_indices  = kv_page_indices->data_ptr();
+    args.work_indptr      = work_indptr->data_ptr();
+    args.work_info_set    = work_info_set->data_ptr();
+    args.q_scale          = q_scale->data_ptr();
+    args.kv_scale         = kv_scale->data_ptr();
+    args.softmax_scale    = softmax_scale;
+    args.num_pages        = static_cast<int>(kv_buffer->size(0));
+    args.num_page_indices = static_cast<int>(kv_page_indices->numel());
+    args.qo_indptr        = cprr ? qo_indptr->data_ptr() : nullptr;
+    args.kv_indptr        = cprr ? kv_indptr->data_ptr() : nullptr;
+    args.g_kv_indptr      = cprr ? g_kv_indptr->data_ptr() : nullptr;
+    args.cp_world_size    = cprr ? cp_world_size : 1;
+    args.cp_rank          = cprr ? cp_rank : 0;
+    size_t arg_size       = sizeof(args);
+
+    // Persistent: one workgroup per worker slot of the metadata planner.
+    const int num_workers = static_cast<int>(work_indptr->numel()) - 1;
+    AITER_CHECK(num_workers > 0, __func__, ": work_indptr must hold at least one worker");
+    impl_ptr->launch_kernel({&args,
+                             &arg_size,
+                             num_workers, // gdx
+                             1,           // gdy
+                             1,           // gdz
+                             128,         // bdx: 4 wave32
+                             1,           // bdy
+                             1,           // bdz
+                             stream,
+                             1,           // cluster_x
+                             1,           // cluster_y
+                             1,           // cluster_z
+                             static_cast<unsigned int>(cfg->dyn_lds)});
+}
+
+// QH128 decode over kv-shuffled page64 FP8 caches.
+namespace {
+struct MlaPs64Qh128Args
+{
+    const void* q;
+    const void* kv;
+    const void* seq_lens;
+    const void* page_table;
+    void* out;
+    void* lse;
+    const void* q_scale;
+    const void* kv_scale;
+    float softmax_scale;
+    uint32_t q_stride;
+    uint32_t physical_pages;
+    uint32_t page_table_stride;
+    uint32_t page_table_width;
+    uint32_t reserved;
+};
+static_assert(sizeof(MlaPs64Qh128Args) == 88);
+static_assert(offsetof(MlaPs64Qh128Args, q) == 0 && offsetof(MlaPs64Qh128Args, kv) == 8);
+static_assert(offsetof(MlaPs64Qh128Args, seq_lens) == 16 &&
+              offsetof(MlaPs64Qh128Args, page_table) == 24);
+static_assert(offsetof(MlaPs64Qh128Args, out) == 32 && offsetof(MlaPs64Qh128Args, lse) == 40);
+static_assert(offsetof(MlaPs64Qh128Args, q_scale) == 48 &&
+              offsetof(MlaPs64Qh128Args, kv_scale) == 56);
+static_assert(offsetof(MlaPs64Qh128Args, softmax_scale) == 64);
+static_assert(offsetof(MlaPs64Qh128Args, q_stride) == 68);
+static_assert(offsetof(MlaPs64Qh128Args, physical_pages) == 72);
+static_assert(offsetof(MlaPs64Qh128Args, page_table_stride) == 76);
+static_assert(offsetof(MlaPs64Qh128Args, page_table_width) == 80);
+static_assert(offsetof(MlaPs64Qh128Args, reserved) == 84);
+
+void check_mla_qh128_tensor(
+    const aiter_tensor_t* t, const char* name, AiterDtype dtype, int device, bool contiguous = true)
+{
+    AITER_CHECK(
+        t != nullptr && t->is_gpu() && t->device_id == device, name, " must be on the Q device");
+    AITER_CHECK(t->dtype() == dtype, name, " has an unsupported dtype");
+    AITER_CHECK(t->data_ptr() != nullptr || t->numel() == 0, name, " has a NULL pointer");
+    AITER_CHECK(!contiguous || t->is_contiguous(), name, " must be contiguous");
+}
+
+// Cache one kernel per device. Architecture probing,
+// heuristic selection and string construction happen only on cache misses.
+void launch_mla_qh128(MlaPs64Qh128Args& args, int device, int batch, hipStream_t stream)
+{
+    static SynchronizedCache<int, AiterAsmKernel> kernels;
+    auto& kernel = kernels.get_or_create(device, [&]() {
+        const std::string arch_id = get_gpu_arch();
+        AITER_CHECK(arch_id == "gfx1250", "QH128 page64 MLA requires gfx1250");
+        // The lse=0 row supports LSE through a nullable pointer.
+        // This field describes the CO ABI, not the caller's choice.
+        const auto name = get_heuristic_kernel_mla(
+            "fp8", "fp8", 128, 0, 0, 0, 1, arch_id, &cfg_mla_asm, 0, 0, 64, 1);
+        const auto& config = cfg_mla_asm.at(name);
+        return AiterAsmKernel(config.knl_name.c_str(), config.co_name.c_str());
+    });
+    size_t size = sizeof(args);
+    kernel.launch_kernel({&args, &size, batch, 1, 1, 128, 1, 1, stream});
+}
+} // namespace
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_ps64_qh128_fp8_asm_fwd,
+    (aiter_tensor_t* q,
+     aiter_tensor_t* kv,
+     aiter_tensor_t* seq_lens,
+     aiter_tensor_t* page_table,
+     aiter_tensor_t* out,
+     aiter_tensor_t* lse,
+     aiter_tensor_t* q_scale,
+     aiter_tensor_t* kv_scale,
+     float softmax_scale,
+     hipStream_t stream),
+    (q, kv, seq_lens, page_table, out, lse, q_scale, kv_scale, softmax_scale, stream))
+{
+    AITER_CHECK(q != nullptr && q->is_gpu(), "Q must be a GPU tensor");
+    const HipDeviceGuard guard(q->device_id);
+    check_mla_qh128_tensor(q, "Q", AITER_DTYPE_fp8, q->device_id, false);
+    check_mla_qh128_tensor(kv, "KV", AITER_DTYPE_fp8, q->device_id);
+    check_mla_qh128_tensor(out, "out", AITER_DTYPE_bf16, q->device_id);
+    check_mla_qh128_tensor(q_scale, "q_scale", AITER_DTYPE_fp32, q->device_id);
+    check_mla_qh128_tensor(kv_scale, "kv_scale", AITER_DTYPE_fp32, q->device_id);
+    AITER_CHECK(q->dim() == 3 && q->size(1) == 128 && q->size(2) == 576, "Q must be [B,128,576]");
+    const int64_t batch = q->size(0);
+    // LSE uses a 32-bit byte offset. Q and O use full 64-bit addresses:
+    // Q multiplies with mul_hi_u32, O retains head_base >> 22 when shifting.
+    AITER_CHECK(batch < (int64_t{1} << 32) / (128 * 4), "batch exceeds kernel address range");
+    AITER_CHECK(q->stride(2) == 1 && (q->stride(1) == 576 || q->stride(1) == 768) &&
+                    q->stride(0) == 128 * q->stride(1),
+                "Q requires dense batches with head stride 576 or 768");
+    AITER_CHECK(kv->dim() == 4 && kv->size(1) == 1 && kv->size(2) == 64 &&
+                    kv->size(3) == 576 && kv->size(0) <= INT32_MAX,
+                "KV must be contiguous [physical_pages,1,64,576] with int32 page IDs");
+    // KV is not limited to 4 GiB: the kernel forms page * 36864 with both
+    // low and high product words.
+    AITER_CHECK(out->dim() == 3 && out->size(0) == batch && out->size(1) == 128 &&
+                    out->size(2) == 512,
+                "out must be [B,128,512]");
+    if(lse != nullptr)
+    {
+        check_mla_qh128_tensor(lse, "lse", AITER_DTYPE_fp32, q->device_id);
+        AITER_CHECK(lse->dim() == 2 && lse->size(0) == batch && lse->size(1) == 128,
+                    "lse must be [B,128]");
+    }
+    AITER_CHECK(q_scale->numel() == 1 && kv_scale->numel() == 1,
+                "q_scale and kv_scale must each contain one FP32 scalar");
+    AITER_CHECK(std::isfinite(softmax_scale), "softmax_scale must be finite");
+
+    AITER_CHECK(kv->size(0) > 0, "KV must contain at least one physical page");
+    check_mla_qh128_tensor(seq_lens, "seq_lens", AITER_DTYPE_i32, q->device_id);
+    check_mla_qh128_tensor(page_table, "page_table", AITER_DTYPE_i32, q->device_id, false);
+    AITER_CHECK(seq_lens->dim() == 1 && seq_lens->size(0) == batch, "seq_lens must be [B]");
+    // The row product is uint32 *elements*. Conversion to a byte address
+    // uses (row << 2, row >> 30) and a 64-bit add into the descriptor base.
+    AITER_CHECK(page_table->dim() == 2 && page_table->size(0) == batch &&
+                    page_table->stride(1) == 1 && page_table->stride(0) > 0 &&
+                    page_table->size(1) < (int64_t{1} << 25) &&
+                    page_table->stride(0) <= UINT32_MAX &&
+                    batch <= UINT32_MAX / page_table->stride(0),
+                "page_table requires [B,max_pages], unit inner stride, and uint32 element offsets");
+    if(batch == 0)
+        return;
+    MlaPs64Qh128Args args{q->data_ptr(), kv->data_ptr(), seq_lens->data_ptr(),
+                         page_table->data_ptr(), out->data_ptr(),
+                         lse == nullptr ? nullptr : lse->data_ptr(),
+                         q_scale->data_ptr(), kv_scale->data_ptr(), softmax_scale,
+                         static_cast<uint32_t>(q->stride(1)),
+                         static_cast<uint32_t>(kv->size(0)),
+                         static_cast<uint32_t>(page_table->stride(0)),
+                         static_cast<uint32_t>(page_table->size(1)), 0};
+    launch_mla_qh128(args, q->device_id, static_cast<int>(batch), stream);
 }

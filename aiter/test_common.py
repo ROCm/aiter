@@ -53,6 +53,7 @@ def perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    profile_warm_iters=1,
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -108,7 +109,7 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            avg = get_trace_perf(prof, num_iters)
+            avg = get_trace_perf(prof, num_iters, warm_iter=profile_warm_iters)
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -121,7 +122,7 @@ def perftest(
                     with_modules=True,
                 ) as prof:
                     run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
+                avg = get_trace_perf(prof, num_iters, warm_iter=profile_warm_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
 
             if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
@@ -248,6 +249,7 @@ def run_perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    profile_warm_iters=1,
     **kwargs,
 ):
     @perftest(
@@ -257,6 +259,7 @@ def run_perftest(
         num_rotate_args=num_rotate_args,
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
+        profile_warm_iters=profile_warm_iters,
     )
     @wraps(func)
     def worker(*args, **kwargs):
@@ -361,9 +364,8 @@ def post_process_data(df, num_iters, warm_iter=1):
     return list(indices), out_range_num + warm_iter + num_iters - act_iters
 
 
-def get_trace_perf(prof, num_iters):
+def get_trace_perf(prof, num_iters, warm_iter=1):
     assert num_iters > 1
-    warm_iter = 1
     num_iters -= warm_iter
     df = []
     cols = [
@@ -625,6 +627,21 @@ def checkAllclose(
                 f"{percent:.1%} ({num} of {denom}) elements mismatch"
             )
         return percent
+
+
+def assertAllclose(a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", **kwargs):
+    """checkAllclose only logs and returns the mismatch ratio; this variant fails
+    the test when the mismatch ratio exceeds tol_err_ratio, i.e. exactly the
+    cases checkAllclose already reports as failed."""
+    # Own the separator so no caller has to pad msg; checkAllclose interpolates it too.
+    prefix = f"{msg.strip()} " if msg.strip() else ""
+    ratio = checkAllclose(
+        a, b, rtol=rtol, atol=atol, tol_err_ratio=tol_err_ratio, msg=prefix, **kwargs
+    )
+    assert (
+        ratio <= tol_err_ratio
+    ), f"{prefix}{ratio:.3%} of elements exceed atol={atol} rtol={rtol}"
+    return ratio
 
 
 def tensor_dump(x: torch.Tensor, name: str, dir="./"):

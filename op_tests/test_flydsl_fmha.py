@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from itertools import pairwise
 
 import pytest
 import torch
@@ -21,6 +22,55 @@ def _arch() -> str:
         return torch.cuda.get_device_properties(0).gcnArchName.lower().split(":")[0]
     except Exception:  # noqa: BLE001
         return ""
+
+
+@pytest.mark.parametrize(
+    "arch,heads,kv_heads,dim,vdim,dtype,supported",
+    [
+        ("gfx950", 12, 12, 192, 128, torch.float8_e4m3fn, True),
+        ("gfx950", 12, 3, 128, 128, torch.float8_e4m3fn, True),
+        ("gfx950", 12, 12, 256, 160, torch.float8_e4m3fn, True),
+        ("gfx942", 12, 12, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx1201", 12, 12, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 192, 256, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 256, 192, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 384, 64, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 96, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 0, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 5, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 0, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 0, 12, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 192, 128, torch.float8_e4m3fnuz, False),
+        ("gfx950", 12, 12, 192, 128, torch.bfloat16, False),
+    ],
+)
+def test_fp8_supported_config(
+    monkeypatch, arch, heads, kv_heads, dim, vdim, dtype, supported
+):
+    """The pre-quantization capability query needs only metadata, even for gfx942."""
+    from aiter.ops.flydsl import flydsl_flash_attn_fp8_supported
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    monkeypatch.setattr(fa, "_gpu_arch", lambda device: arch)
+    monkeypatch.setattr(
+        fa, "_build_fp8", lambda **kw: pytest.fail("capability check compiled a kernel")
+    )
+    assert (
+        flydsl_flash_attn_fp8_supported(
+            torch.device("cuda:0"), heads, kv_heads, dim, vdim, dtype=dtype
+        )
+        is supported
+    )
+
+
+def test_fp8_supported_cpu_does_not_query_gpu(monkeypatch):
+    from aiter.ops.flydsl import flydsl_flash_attn_fp8_supported
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    monkeypatch.setattr(
+        fa, "_gpu_arch", lambda device: pytest.fail("queried GPU for CPU")
+    )
+    assert not flydsl_flash_attn_fp8_supported(torch.device("cpu"), 12, 12, 192, 128)
 
 
 _gfx1201_only = pytest.mark.skipif(
@@ -662,10 +712,25 @@ def test_fp8_split_kv_batched(causal, batch):
 
 
 @_gfx950_only
-@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
-    "seq_len,seqlen_kv,num_kv_splits",
-    [(512, 16384, 8), (2614, 16384, 8), (1024, 32768, 16)],
+    "causal,seq_len,seqlen_kv,num_kv_splits",
+    [
+        (causal, sq, skv, splits)
+        for causal in (False, True)
+        for sq, skv, splits in [(512, 16384, 8), (2614, 16384, 8), (1024, 32768, 16)]
+    ]
+    + [
+        # Short cached-prefix queries are eligible only without causal masking.
+        (False, 1, 257, 4),
+        (False, 70, 16384, 2),
+        (False, 70, 16384, 4),
+        (False, 70, 16384, 16),
+        (False, 70, 16384, None),
+        (False, 127, 11008, 4),
+        (False, 129, 257, 4),
+        (False, 255, 513, 4),
+        (False, 383, 11008, 4),
+    ],
 )
 def test_fp8_split_kv_cross_length(causal, seq_len, seqlen_kv, num_kv_splits):
     """Split-KV with short Q against long KV -- the shape split-KV exists for."""
@@ -676,6 +741,12 @@ def test_fp8_split_kv_cross_length(causal, seq_len, seqlen_kv, num_kv_splits):
         seqlen_kv=seqlen_kv,
         num_kv_splits=num_kv_splits,
     )
+
+
+@_gfx950_only
+def test_fp8_short_causal_split_kv_rejected():
+    with pytest.raises(ValueError, match="split-K requires seq_len>=384"):
+        _run_fp8_shape(True, seq_len=70, seqlen_kv=16384, num_kv_splits=4)
 
 
 @_gfx950_only
@@ -1043,19 +1114,20 @@ def test_fp8_split_result_survives_a_non_current_stream(monkeypatch):
     torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
 
 
-def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False):
+def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False, Skv=None):
     """Quantized inputs for the dispatch tests."""
     torch.manual_seed(0)
-    shape = (B * S, H, D) if varlen else (B, S, H, D)
+    Skv = S if Skv is None else Skv
 
-    def _t():
+    def _t(seq_len):
+        shape = (B * seq_len, H, D) if varlen else (B, seq_len, H, D)
         return torch.empty(shape, device="cuda", dtype=torch.bfloat16).uniform_(
             *FP8_UNIFORM_RANGE
         )
 
-    q, qs = _fp8_quant(_t())
-    k, ks = _fp8_quant(_t())
-    v, vs = _fp8_quant(_t())
+    q, qs = _fp8_quant(_t(S))
+    k, ks = _fp8_quant(_t(Skv))
+    v, vs = _fp8_quant(_t(Skv))
     return q, k, v, {"q_descale": qs, "k_descale": ks, "v_descale": vs}
 
 
@@ -1063,12 +1135,12 @@ def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("softmax_scale", [None, 0.37])
 def test_fp8_dispatch_batch_routes_to_gfx950(causal, softmax_scale):
-    """``flydsl_flash_attn_batch_func`` must route BSHD fp8 to the gfx950 kernel."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    """``flydsl_flash_attn_batch_fwd`` must route BSHD fp8 to the gfx950 kernel."""
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
     B, S, H, D = 2, 1024, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
-    out = flydsl_flash_attn_batch_func(
+    out = flydsl_flash_attn_batch_fwd(
         q, k, v, causal=causal, softmax_scale=softmax_scale, **d
     )
     assert out is not None, "gfx950 fp8 must not fall through to CK/Triton"
@@ -1091,13 +1163,13 @@ def test_fp8_dispatch_batch_routes_to_gfx950(causal, softmax_scale):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("softmax_scale", [None, 0.37])
 def test_fp8_dispatch_varlen_routes_to_gfx950(causal, softmax_scale):
-    """``flydsl_flash_attn_varlen_func`` must route packed THD fp8 to gfx950."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+    """``flydsl_flash_attn_varlen_fwd`` must route packed THD fp8 to gfx950."""
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
 
     B, S, H, D = 2, 1024, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D, varlen=True)
     cu = torch.tensor([0, 400, B * S], dtype=torch.int32, device="cuda")
-    out = flydsl_flash_attn_varlen_func(
+    out = flydsl_flash_attn_varlen_fwd(
         q,
         k,
         v,
@@ -1157,7 +1229,7 @@ def test_fp8_dispatch_rejects_unsupported(unsupported):
     Falling through is what lets the caller reach CK/Triton; raising or silently
     dropping the feature would both be wrong.
     """
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
     B, S, H, D = 2, 512, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
@@ -1172,7 +1244,7 @@ def test_fp8_dispatch_rejects_unsupported(unsupported):
     if not unsupported:  # the no_descales case
         kw = {}
 
-    assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **kw) is None
+    assert flydsl_flash_attn_batch_fwd(q, k, v, causal=True, **kw) is None
 
 
 @_gfx950_only
@@ -1240,12 +1312,12 @@ def test_fp8_dispatch_rejects_descale_on_another_device():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires >=2 visible GPUs")
 
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
     B, S, H, D = 2, 512, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
     d["q_descale"] = d["q_descale"].to("cuda:1")
-    assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **d) is None
+    assert flydsl_flash_attn_batch_fwd(q, k, v, causal=True, **d) is None
 
 
 @_gfx950_only
@@ -1260,6 +1332,8 @@ def test_fp8_dispatch_rejects_descale_on_another_device():
         (True, 1, 1024, 4096, 8, 1, 128, 128, 4),
         (False, 2, 512, 512, 8, 8, 128, 128, 2),
         (True, 1, 512, 2048, 12, 12, 192, 128, 4),
+        (False, 1, 70, 16384, 12, 12, 192, 128, 4),
+        (False, 1, 70, 16384, 12, 12, 192, 128, None),
         # Skv < Sq: bottom-right causal leaves the leading Sq-Skv rows with no
         # visible key, so their LSE must be -inf rather than NaN.
         (True, 1, 1024, 128, 8, 8, 128, 128, None),
@@ -1501,15 +1575,13 @@ def test_fp8_varlen_zero_length_kv_entry(causal, vl_q, vl_kv):
 def test_fp8_dispatch_return_lse(causal):
     """``return_lse`` now routes to gfx950 fp8 instead of falling through."""
     from aiter.ops.flydsl.fmha_kernels import (
-        flydsl_flash_attn_batch_func,
-        flydsl_flash_attn_varlen_func,
+        flydsl_flash_attn_batch_fwd,
+        flydsl_flash_attn_varlen_fwd,
     )
 
     B, S, H, D = 2, 1024, 8, 128
     q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
-    out, lse = flydsl_flash_attn_batch_func(
-        q, k, v, causal=causal, return_lse=True, **d
-    )
+    out, lse = flydsl_flash_attn_batch_fwd(q, k, v, causal=causal, return_lse=True, **d)
     assert out.shape == (B, S, H, D)
     assert lse.shape == (B, H, S)
     ref = _ref_lse(
@@ -1519,7 +1591,7 @@ def test_fp8_dispatch_return_lse(causal):
 
     qv, kv, vv, dv = _fp8_dispatch_inputs(B, S, H, D, varlen=True)
     cu = torch.tensor([0, 400, B * S], dtype=torch.int32, device="cuda")
-    out_v, lse_v = flydsl_flash_attn_varlen_func(
+    out_v, lse_v = flydsl_flash_attn_varlen_fwd(
         qv,
         kv,
         vv,
@@ -1538,22 +1610,22 @@ def test_fp8_dispatch_return_lse(causal):
 @_gfx950_only
 def test_fp8_dispatch_rejects_bf16_inputs():
     """bf16 on gfx950 has no FlyDSL kernel here and must fall through."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
     q = torch.randn(2, 512, 8, 128, device="cuda", dtype=torch.bfloat16)
-    assert flydsl_flash_attn_batch_func(q, q.clone(), q.clone(), causal=True) is None
+    assert flydsl_flash_attn_batch_fwd(q, q.clone(), q.clone(), causal=True) is None
 
 
 @_gfx950_only
 def test_fp8_dispatch_matches_direct_call():
     """The dispatch wrapper must not perturb the kernel it routes to."""
-    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         flydsl_flash_attn_fp8_func,
     )
 
     q, k, v, d = _fp8_dispatch_inputs()
-    via_dispatch = flydsl_flash_attn_batch_func(q, k, v, causal=True, **d)
+    via_dispatch = flydsl_flash_attn_batch_fwd(q, k, v, causal=True, **d)
     direct = flydsl_flash_attn_fp8_func(q, k, v, causal=True, **d)
     torch.cuda.synchronize()
     torch.testing.assert_close(via_dispatch.float(), direct.float(), rtol=0, atol=0)
@@ -1610,9 +1682,13 @@ def test_fp8_softmax_scale_dense(causal, S, Skv, H_KV, D, splits):
 
 
 @_gfx950_only
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("splits", [1, 4])
-def test_fp8_softmax_scale_varlen(causal, splits):
+@pytest.mark.parametrize(
+    "causal,cuq,cukv",
+    [(causal, [0, 512, 582, 838], [0, 2048, 2048, 2176]) for causal in (False, True)]
+    + [(False, [0, 70, 71, 198, 198], [0, 16384, 16384, 16641, 16769])],
+)
+@pytest.mark.parametrize("splits", [1, 4, None])
+def test_fp8_softmax_scale_varlen(causal, cuq, cukv, splits):
     """Custom scale survives packed varlen, split-K and a zero-length KV entry."""
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         flydsl_flash_attn_fp8_func,
@@ -1620,7 +1696,6 @@ def test_fp8_softmax_scale_varlen(causal, splits):
 
     torch.manual_seed(FP8_SEED)
     H, D, Dv = 12, 192, 128
-    cuq, cukv = [0, 512, 582, 838], [0, 2048, 2048, 2176]
 
     def _t(*shape):
         return torch.randn(*shape, dtype=torch.bfloat16, device="cuda")
@@ -1639,8 +1714,8 @@ def test_fp8_softmax_scale_varlen(causal, splits):
         "cross_seqlen": True,
         "cu_seqlens_q": torch.tensor(cuq, dtype=torch.int32, device="cuda"),
         "cu_seqlens_kv": torch.tensor(cukv, dtype=torch.int32, device="cuda"),
-        "max_seqlen_q": 512,
-        "max_seqlen_kv": 2048,
+        "max_seqlen_q": max(b - a for a, b in pairwise(cuq)),
+        "max_seqlen_kv": max(b - a for a, b in pairwise(cukv)),
     }
     for scale in (0.5 * D**-0.5, 1.8738542070926265 * D**-0.5, 0.37):
         out, lse = flydsl_flash_attn_fp8_func(q, k, v, softmax_scale=scale, **kw)
@@ -1658,14 +1733,23 @@ def test_fp8_softmax_scale_varlen(causal, splits):
 
 
 @_gfx950_only
-def test_fp8_softmax_scale_graph_replay():
+@pytest.mark.parametrize(
+    "S,Skv,causal,splits", [(512, 512, True, None), (70, 16384, False, 4)]
+)
+def test_fp8_softmax_scale_graph_replay(S, Skv, causal, splits):
     """A custom runtime scalar needs no scale-preparation kernel during capture."""
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         flydsl_flash_attn_fp8_func,
     )
 
-    q, k, v, descales = _fp8_dispatch_inputs(B=1, S=512, H=12, D=192)
-    kw = dict(softmax_scale=0.137, causal=True, return_lse=True, **descales)
+    q, k, v, descales = _fp8_dispatch_inputs(B=1, S=S, Skv=Skv, H=12, D=192)
+    kw = dict(
+        softmax_scale=0.137,
+        causal=causal,
+        num_kv_splits=splits,
+        return_lse=True,
+        **descales,
+    )
     flydsl_flash_attn_fp8_func(q, k, v, **kw)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -1715,7 +1799,7 @@ def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, val
     from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
 
     launches = []
-    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(fa, "_gpu_arch", lambda device: "gfx950")
     monkeypatch.setattr(fa, "_num_cu", lambda device: 256)
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
@@ -1751,9 +1835,9 @@ def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, val
                 "max_seqlen_kv": 70,
                 "cross_seqlen": False,
             }
-            out = dispatch.flydsl_flash_attn_varlen_func(q, k, v, cu, cu, 70, 70, **kw)
+            out = dispatch.flydsl_flash_attn_varlen_fwd(q, k, v, cu, cu, 70, 70, **kw)
         else:
-            out = dispatch.flydsl_flash_attn_batch_func(q, k, v, **kw)
+            out = dispatch.flydsl_flash_attn_batch_fwd(q, k, v, **kw)
         if not valid:
             assert out is None
             with pytest.raises(

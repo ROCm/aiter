@@ -24,9 +24,15 @@ from aiter.ops.triton.utils.config_utils import (
 )
 
 
-def autotune_enabled(family: str) -> bool:
-    """``<FAMILY>_TRITON_AUTOTUNE=1`` opts a kernel family into runtime tuning; off by default."""
-    return os.getenv(f"{family}_TRITON_AUTOTUNE", "0").strip().lower() in (
+def autotune_enabled(family: str, env: str | None = None, default: str = "0") -> bool:
+    """``<FAMILY>_TRITON_AUTOTUNE=1`` opts a kernel family into runtime tuning; off by default.
+
+    ``env`` names the variable instead, for a family that already had one before
+    this convention existed and whose name is published elsewhere. ``default``
+    is what an unset variable means, so such a family keeps whatever it did
+    before rather than changing behaviour by being routed through here.
+    """
+    return os.getenv(env or f"{family}_TRITON_AUTOTUNE", default).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -38,12 +44,14 @@ def autotune_configs(
     family: str,
     configs: list[triton.Config],
     default_config: triton.Config | None = None,
+    env: str | None = None,
+    default: str = "0",
 ) -> list[triton.Config]:
     """Config list for ``@triton.autotune``: every candidate while the family tunes, else
     only ``default_config`` (or ``configs[0]``) so nothing is benchmarked at launch."""
     # An empty list would hand Triton nothing to tune and make the configs[0] fallback raise.
     assert configs, f"{family}: autotune_configs called with an empty config list"
-    if autotune_enabled(family):
+    if autotune_enabled(family, env, default):
         return configs
     return [default_config if default_config is not None else configs[0]]
 
@@ -58,7 +66,7 @@ def _get_tuned_kernel_entry(
     ``get_tuned_kernel_config()`` copies it before handing it out.
     """
     arch = arch_info.get_arch()
-    # Nested layout of configs/CLAUDE.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json,
+    # Nested layout of configs/AGENTS.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json,
     # <d_type> being the config name lowercased with dashes folded to underscores.
     dtype_dir = _dtype_dir(config_name)
     config_path = (
@@ -74,6 +82,7 @@ def get_tuned_kernel_config(
     kernel_name: str,
     fallback: triton.Config,
     backend: str = "triton",
+    warn_on_miss: bool = True,
 ) -> triton.Config:
     """The tile pinned for this device, or ``fallback`` where none is published.
 
@@ -88,21 +97,32 @@ def get_tuned_kernel_config(
         kernel_name: Key of the kernel's entry within the config file.
         fallback: Config to register when this device has no published entry.
         backend: ``"triton"`` or ``"gluon"``.
+        warn_on_miss: Log a warning when no entry is published. Pass ``False``
+            where a miss is expected, e.g. a lookup keyed by shape.
     """
     try:
         config_path, entry = _get_tuned_kernel_entry(
             op, config_name, kernel_name, backend
         )
-    except BaseException as error:  # noqa: BLE001 -- no accelerator/unreadable file
-        logger.warning(
-            f"Unable to load tuned Triton config '{config_name}' for "
-            f"kernel '{kernel_name}'; using fallback {fallback}: {error}"
+    except BaseException:  # noqa: BLE001 -- no accelerator/unreadable file
+        # AiterTritonLogger forwards only *args, so exc_info goes to the
+        # underlying stdlib logger; it renders the traceback for us.
+        logger.get_logger().warning(
+            "Unable to load tuned Triton config '%s' for kernel '%s'; using fallback %s",
+            config_name,
+            kernel_name,
+            fallback,
+            exc_info=True,
         )
         return fallback
     if not entry:
+        if not warn_on_miss:
+            return fallback
         logger.warning(
-            f"No tuned Triton config for kernel '{kernel_name}' in "
-            f"'{config_path}'; using fallback {fallback}"
+            "No tuned Triton config for kernel '%s' in '%s'; using fallback %s",
+            kernel_name,
+            config_path,
+            fallback,
         )
         return fallback
     entry = dict(entry)

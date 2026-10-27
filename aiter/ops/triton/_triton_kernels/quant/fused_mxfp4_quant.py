@@ -1,8 +1,11 @@
+from functools import partial
+
 import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n as _even_m_n
 
 
 @triton.jit
@@ -40,10 +43,12 @@ _fused_rms_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
-        "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
+        ),
+        "EVEN_M_N2": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+        ),
     }
 )
 @triton.jit(repr=_fused_rms_mxfp4_quant_repr)
@@ -244,6 +249,128 @@ def _fused_rms_mxfp4_quant_kernel(
         )
 
 
+_fused_rms_gated_mxfp4_quant_repr = make_kernel_repr(
+    "_fused_rms_gated_mxfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "NORM_BEFORE_GATE",
+        "ACTIVATION",
+        "EVEN_M_N",
+    ],
+)
+
+
+@triton.heuristics(
+    {
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N", block_n="BLOCK_SIZE_N"
+        ),
+    }
+)
+@triton.jit(repr=_fused_rms_gated_mxfp4_quant_repr)
+def _fused_rms_gated_mxfp4_quant_kernel(
+    x_ptr,
+    z_ptr,
+    w_ptr,
+    out_fp4_ptr,
+    out_bs_ptr,
+    eps,
+    M,
+    N,
+    groups_per_row,
+    x_stride_m,
+    z_stride_m,
+    out_fp4_stride_m,
+    out_bs_stride_m,
+    out_bs_stride_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    NORM_BEFORE_GATE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    EVEN_M_N: tl.constexpr,
+):
+    """One norm group per row: RMSNorm over N, the act(z) gate, then MXFP4
+    quant. The gated activation is rounded to the input dtype before quant,
+    as it is when RMSNormGated and the quant run as separate ops.
+
+    Row r is group r % groups_per_row of input row r // groups_per_row; the
+    scale strides are those of the caller's (input rows, scale columns) view,
+    so that view can be row- or column-major."""
+    pid = tl.program_id(0)
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+
+    mask = None
+    other = None
+    if not EVEN_M_N:
+        mask = (offs_m < M)[:, None] & (offs_n < N)[None, :]
+        other = 0.0
+
+    x = tl.load(
+        x_ptr + offs_m[:, None] * x_stride_m + offs_n[None, :],
+        mask=mask,
+        other=other,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    z = tl.load(
+        z_ptr + offs_m[:, None] * z_stride_m + offs_n[None, :],
+        mask=mask,
+        other=other,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    gate = ACTIVATION(z)
+
+    w_mask = None
+    w_other = None
+    if not EVEN_M_N:
+        w_mask = offs_n < N
+        w_other = 0.0
+    w = tl.load(w_ptr + offs_n, mask=w_mask, other=w_other).to(tl.float32)
+
+    if not NORM_BEFORE_GATE:
+        x = x * gate
+    y = _rmsmorm_op(x, w, N, eps)
+    if NORM_BEFORE_GATE:
+        y = y * gate
+    y = y.to(x_ptr.type.element_ty).to(tl.float32)
+
+    y_fp4, bs_e8m0 = _mxfp4_quant_op(
+        y, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+    )
+
+    half_offs_n = tl.arange(0, BLOCK_SIZE_N // 2)
+    out_mask = None
+    if not EVEN_M_N:
+        out_mask = (offs_m < M)[:, None] & (half_offs_n < (N // 2))[None, :]
+    tl.store(
+        out_fp4_ptr + offs_m[:, None] * out_fp4_stride_m + half_offs_n[None, :],
+        y_fp4,
+        mask=out_mask,
+        cache_modifier=".cg",
+    )
+
+    bs_offs_n = tl.arange(0, NUM_QUANT_BLOCKS)
+    bs_mask = None
+    if not EVEN_M_N:
+        bs_mask = (offs_m < M)[:, None] & (bs_offs_n < (N // MXFP4_QUANT_BLOCK_SIZE))[
+            None, :
+        ]
+    bs_row = offs_m // groups_per_row
+    bs_col = (offs_m % groups_per_row) * (N // MXFP4_QUANT_BLOCK_SIZE)
+    tl.store(
+        out_bs_ptr
+        + bs_row[:, None] * out_bs_stride_m
+        + (bs_col[:, None] + bs_offs_n[None, :]) * out_bs_stride_n,
+        bs_e8m0.to(out_bs_ptr.type.element_ty),
+        mask=bs_mask,
+        cache_modifier=".cg",
+    )
+
+
 _fused_flatten_mxfp4_quant_repr = make_kernel_repr(
     "_fused_flatten_mxfp4_quant",
     [
@@ -312,7 +439,6 @@ _fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr = make_kernel_repr(
         "EVEN_M_N",
         "SCALING_MODE",
         "scaleN",
-        "scaleM_pad",
         "scaleN_pad",
         "SHUFFLE",
         "X_HAS_SPLITK",
@@ -326,8 +452,13 @@ _fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M1"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N1"] * args["NUM_ITER"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n,
+            block_m="BLOCK_SIZE_M1",
+            n="N1",
+            block_n="BLOCK_SIZE_N1",
+            num_iter="NUM_ITER",
+        ),
     }
 )
 @triton.jit(repr=_fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr)
@@ -363,7 +494,7 @@ def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
     SCALING_MODE: tl.constexpr,
     ACTIVATION: tl.constexpr,
     scaleN: tl.constexpr,
-    scaleM_pad: tl.constexpr,
+    scaleM_pad,
     scaleN_pad: tl.constexpr,
     SHUFFLE: tl.constexpr,
     X_HAS_SPLITK: tl.constexpr,
@@ -566,12 +697,15 @@ _fused_reduce_rms_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
-        "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,
-        "EVEN_M_N3": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N3"] % (args["BLOCK_SIZE_N3"]) == 0,
+        "EVEN_M_N": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
+        ),
+        "EVEN_M_N2": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+        ),
+        "EVEN_M_N3": partial(
+            _even_m_n, block_m="BLOCK_SIZE_M", n="N3", block_n="BLOCK_SIZE_N3"
+        ),
     }
 )
 @triton.jit(repr=_fused_reduce_rms_mxfp4_quant_repr)

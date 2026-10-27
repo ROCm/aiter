@@ -9,7 +9,7 @@ Two coverage modes:
 * CI smoke (default, ~2 min): runs ``CI_SHAPES`` (one shape per dispatch
   path -- 1-stage, 2-stage, fallback) at ``stage=auto`` /
   ``emit_bf16=False``, sweeping ``tp_size in [2, 4, 8]`` so every
-  production TP is covered. Picked up automatically by
+  production TP is covered. Every case runs with and without ``gemma_norm``. Picked up automatically by
   ``.github/scripts/aiter_test.sh`` which executes every multi-GPU test
   with no flags. Pass ``-t N`` to restrict to a single TP for debugging.
 * Local full sweep (~50 min across TP=2/4/8): ``--full`` runs
@@ -64,6 +64,21 @@ set_start_method("spawn", force=True)
 logger = logging.getLogger("aiter")
 
 
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
+
+
 def _shape_arg(value: str) -> tuple[int, int]:
     m, n = value.split(",")
     return int(m), int(n)
@@ -101,17 +116,132 @@ def test_mxfp4_hidden_dim_validation_python_check():
             )
 
 
-def _run_rank(
+def _run_mxfp4_case(
     tp_size: int,
     rank: int,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
+    case_idx: int,
+    shape: tuple[int, int],
+    dtype: torch.dtype,
+    eps: float,
+    emit_bf16: bool,
+    stage_override: str | None,
+    gemma_norm: bool,
+):
+    """Run one fused AR+RMSNorm+MXFP4 case on an initialized rank.
+
+    Every rank feeds the same ``x`` / ``residual`` / ``weight`` (seeded by
+    ``case_idx``), so the reduced sum is ``x * tp_size`` and the reference is
+    built here on the device. Only errors and shape tuples go back to the
+    parent, which asserts them.
+    """
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant,
+    )
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+    x = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
+    residual = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
+    weight = torch.randn((shape[-1],), dtype=dtype, device="cuda", generator=gen)
+    ref_residual = x * tp_size + residual
+    if gemma_norm:
+        # Gemma RMSNorm scales by (1 + w); the kernel adds the 1 after widening w.
+        ref = F.rms_norm(
+            ref_residual.float(), (shape[-1],), weight=weight.float() + 1.0, eps=eps
+        ).to(dtype)
+    else:
+        ref = F.rms_norm(ref_residual, (shape[-1],), weight=weight, eps=eps)
+    ref_fp4, ref_scale = dynamic_mxfp4_quant(ref)
+    ref_dequant = _dequant_mxfp4(ref_fp4, ref_scale)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+        x,
+        residual,
+        weight,
+        eps,
+        quant_type="mxfp4",
+        emit_bf16=emit_bf16,
+        gemma_norm=gemma_norm,
+    )
+    end.record()
+    torch.cuda.synchronize()
+    us = start.elapsed_time(end) * 1000.0
+    if emit_bf16:
+        out_fp4, res_out, scale, bf16_out = result
+    else:
+        out_fp4, res_out, scale = result
+        bf16_out = None
+
+    shapes_match = out_fp4.shape == ref_fp4.shape and scale.shape == ref_scale.shape
+    out_dequant = _dequant_mxfp4(out_fp4, scale) if shapes_match else None
+    dequant_err = (
+        checkAllclose(
+            ref_dequant,
+            out_dequant,
+            msg=f"mxfp4 dequant {shape=} {gemma_norm=} {emit_bf16=} "
+            f"{stage_override=} rank={rank} {us:.2f}us",
+            atol=1.5,
+            rtol=5e-1,
+        )
+        if shapes_match
+        else float("inf")
+    )
+    # The elementwise tolerance above has to absorb FP4 rounding flips, so it
+    # cannot tell a wrong norm weight apart; the mean error can.
+    dequant_rel_l1 = (
+        ((out_dequant - ref_dequant).abs().mean() / ref_dequant.abs().mean()).item()
+        if shapes_match
+        else float("inf")
+    )
+    residual_err = checkAllclose(
+        ref_residual,
+        res_out,
+        msg=f"residual output {shape=} {gemma_norm=} {emit_bf16=} "
+        f"{stage_override=} rank={rank} {us:.2f}us",
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    bf16_err = 0.0
+    if bf16_out is not None:
+        bf16_err = checkAllclose(
+            ref,
+            bf16_out,
+            msg=f"bf16 side output {shape=} {gemma_norm=} {stage_override=} "
+            f"rank={rank} {us:.2f}us",
+            atol=1e-2,
+            rtol=1e-2,
+        )
+    return {
+        "us": us,
+        "fp4_shape": (tuple(out_fp4.shape), tuple(ref_fp4.shape)),
+        "scale_shape": (tuple(scale.shape), tuple(ref_scale.shape)),
+        "has_bf16_out": bf16_out is not None,
+        "dequant_err": dequant_err,
+        "dequant_rel_l1": dequant_rel_l1,
+        "residual_err": residual_err,
+        "bf16_err": bf16_err,
+    }
+
+
+def _mxfp4_sweep(
+    tp_size: int,
+    rank: int,
+    cases: list[dict],
+    dtype: torch.dtype,
     eps: float,
     distributed_init_method: str,
-    emit_bf16: bool,
     stage_override: str | None = None,
 ):
+    """Run every case on one rank inside a single distributed init.
+
+    ``AITER_AR_1STAGE`` is read once when the communicator module is imported,
+    so all cases of one sweep share one ``stage_override``. Results are
+    returned rather than asserted here: every rank must walk the full case
+    list so the collectives stay aligned across ranks.
+    """
     if stage_override is not None:
         os.environ["AITER_AR_1STAGE"] = stage_override
     elif "AITER_AR_1STAGE" in os.environ:
@@ -126,42 +256,30 @@ def _run_rank(
     )
     ensure_model_parallel_initialized(tp_size, 1)
 
-    x = x.to(device)
-    residual = residual.to(device)
-    weight = weight.to(device)
     group = get_tp_group().device_group
     dist.all_reduce(torch.zeros(1, device=device), group=group)
     torch.cuda.synchronize()
 
-    from aiter.dist.communication_op import (
-        tensor_model_parallel_fused_allreduce_rmsnorm_quant,
-    )
+    results = [
+        _run_mxfp4_case(
+            tp_size,
+            rank,
+            case_idx,
+            case["shape"],
+            dtype,
+            eps,
+            case["emit_bf16"],
+            stage_override,
+            case["gemma_norm"],
+        )
+        for case_idx, case in enumerate(cases)
+    ]
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    result = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-        x, residual, weight, eps, quant_type="mxfp4", emit_bf16=emit_bf16
-    )
-    end.record()
-    torch.cuda.synchronize()
-    us = start.elapsed_time(end) * 1000.0
-    if emit_bf16:
-        out_fp4, res_out, scale, bf16_out = result
-    else:
-        out_fp4, res_out, scale = result
-        bf16_out = None
-
+    barrier_before_teardown()
     destroy_model_parallel()
     destroy_distributed_environment()
     torch.cuda.empty_cache()
-    return (
-        out_fp4.cpu(),
-        scale.cpu(),
-        res_out.cpu(),
-        None if bf16_out is None else bf16_out.cpu(),
-        us,
-    )
+    return results
 
 
 def _expected_path(
@@ -211,107 +329,71 @@ def _expected_path(
 
 def test_fused_ar_rmsnorm_mxfp4_quant(
     tp_size: int,
-    shape: tuple[int, int],
+    cases: list[dict],
     dtype: torch.dtype,
-    emit_bf16: bool,
-    distributed_init_method: str | None = None,
     stage_override: str | None = None,
 ):
+    """Run ``cases`` on one TP group and return one summary row per case."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49383"
-    if distributed_init_method is None:
-        distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
-
+    distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
     eps = 1e-6
-    x = torch.randn(shape, dtype=dtype)
-    residual = torch.randn(shape, dtype=dtype)
-    weight = torch.randn((shape[-1],), dtype=dtype)
-    ref_residual = x * tp_size + residual
-    ref = F.rms_norm(ref_residual, (shape[-1],), weight=weight, eps=eps)
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-
-    ref_fp4, ref_scale = dynamic_mxfp4_quant(ref.cuda())
-    ref_dequant = _dequant_mxfp4(ref_fp4, ref_scale).cpu()
-
     with Pool(processes=tp_size) as pool:
         futures = [
             pool.apply_async(
-                _run_rank,
+                _mxfp4_sweep,
                 args=(
                     tp_size,
                     rank,
-                    x,
-                    residual,
-                    weight,
+                    cases,
+                    dtype,
                     eps,
                     distributed_init_method,
-                    emit_bf16,
                     stage_override,
                 ),
             )
             for rank in range(tp_size)
         ]
-        results = [future.get() for future in futures]
+        per_rank = [future.get() for future in futures]
 
-    max_dequant_err = 0.0
-    max_bf16_err = 0.0
-    max_residual_err = 0.0
-    for rank, (out_fp4, scale, res_out, bf16_out, us) in enumerate(results):
-        assert out_fp4.shape == ref_fp4.shape
-        assert scale.shape == ref_scale.shape
-        out_dequant = _dequant_mxfp4(out_fp4.cuda(), scale.cuda()).cpu()
-        max_dequant_err = max(
-            max_dequant_err,
-            checkAllclose(
-                ref_dequant,
-                out_dequant,
-                msg=f"mxfp4 dequant {shape=} {emit_bf16=} {stage_override=} "
-                f"rank={rank} {us:.2f}us",
-                atol=1.5,
-                rtol=5e-1,
-            ),
-        )
-        max_residual_err = max(
-            max_residual_err,
-            checkAllclose(
-                ref_residual,
-                res_out,
-                msg=f"residual output {shape=} {emit_bf16=} {stage_override=} "
-                f"rank={rank} {us:.2f}us",
-                atol=1e-2,
-                rtol=1e-2,
-            ),
-        )
-        if emit_bf16:
-            assert bf16_out is not None
-            max_bf16_err = max(
-                max_bf16_err,
-                checkAllclose(
-                    ref,
-                    bf16_out,
-                    msg=f"bf16 side output {shape=} {stage_override=} "
-                    f"rank={rank} {us:.2f}us",
-                    atol=1e-2,
-                    rtol=1e-2,
-                ),
-            )
     element_size = torch.tensor([], dtype=dtype).element_size()
-    expected_path = _expected_path(
-        shape, tp_size, element_size, stage_override, emit_bf16
-    )
-    return {
-        "shape": shape,
-        "tp_size": tp_size,
-        "dtype": str(dtype).replace("torch.", ""),
-        "emit_bf16": emit_bf16,
-        "stage_override": stage_override or "auto",
-        "expected_path": expected_path,
-        "min_us": min(us for *_, us in results),
-        "max_us": max(us for *_, us in results),
-        "mxfp4_dequant_err": max_dequant_err,
-        "residual_err": max_residual_err,
-        "bf16_err": max_bf16_err,
-    }
+    rows = []
+    for i, case in enumerate(cases):
+        shape, emit_bf16 = case["shape"], case["emit_bf16"]
+        gemma_norm = case["gemma_norm"]
+        results = [rank_results[i] for rank_results in per_rank]
+        for r in results:
+            out_shape, ref_shape = r["fp4_shape"]
+            assert out_shape == ref_shape, f"{shape=}: {out_shape} != {ref_shape}"
+            out_shape, ref_shape = r["scale_shape"]
+            assert out_shape == ref_shape, f"{shape=}: {out_shape} != {ref_shape}"
+            assert r["dequant_rel_l1"] < 0.05, (
+                f"mxfp4 dequant rel L1 {r['dequant_rel_l1']:.4f} "
+                f"{shape=} {gemma_norm=} {emit_bf16=} {stage_override=}"
+            )
+            if emit_bf16:
+                assert r["has_bf16_out"]
+        expected_path = _expected_path(
+            shape, tp_size, element_size, stage_override, emit_bf16
+        )
+        rows.append(
+            {
+                "shape": shape,
+                "tp_size": tp_size,
+                "dtype": str(dtype).replace("torch.", ""),
+                "emit_bf16": emit_bf16,
+                "gemma_norm": gemma_norm,
+                "stage_override": stage_override or "auto",
+                "expected_path": expected_path,
+                "min_us": min(r["us"] for r in results),
+                "max_us": max(r["us"] for r in results),
+                "mxfp4_dequant_err": max(r["dequant_err"] for r in results),
+                "mxfp4_dequant_rel_l1": max(r["dequant_rel_l1"] for r in results),
+                "residual_err": max(r["residual_err"] for r in results),
+                "bf16_err": max(r["bf16_err"] for r in results),
+            }
+        )
+    return rows
 
 
 # Mix of decode-sized (1-stage), prefill-sized within the 512 KiB 2-stage
@@ -330,6 +412,7 @@ FULL_SHAPES = [
     (32, 7168),  # 2-stage at TP=8 (32*7168*2 = 448 KiB <= 512 KiB)
     (56, 7168),  # fallback at TP=8 (56*7168*2 = 784 KiB > 512 KiB)
     (16, 4096),  # 2-stage (block_size=512, 16*4096*2 = 128 KiB)
+    (8, 8192),  # 1-stage (K == 8192 -> M <= 8)
     (32, 8192),  # 2-stage at TP=8 (block_size=1024, 32*8192*2 = 512 KiB)
     (64, 7168),  # fallback (64*7168*2 = 896 KiB > 512 KiB)
     (128, 7168),  # fallback
@@ -394,7 +477,8 @@ def main():
             "Run the dense local coverage matrix: FULL_SHAPES x stage=both x "
             "emit_bf16=[False, True]. Intended for local validation; the CI "
             "lane keeps the smoke defaults (CI_SHAPES x stage=auto x "
-            "emit_bf16=False) to stay under ~1 minute."
+            "emit_bf16=False) to stay under ~1 minute. Both lanes run every "
+            "case with and without gemma_norm."
         ),
     )
     parser.add_argument(
@@ -422,33 +506,33 @@ def main():
         else:
             stage_overrides = [stage_to_env[args.stage]]
 
+    # Every lane covers the Gemma (1 + w) weight path as well as the plain one.
+    gemma_norm_values = [False, True]
     tp_sizes = [args.tp_size] if args.tp_size is not None else [2, 4, 8]
+    element_size = torch.tensor([], dtype=dtype).element_size()
 
+    # One TP group per (tp_size, stage_override): AITER_AR_1STAGE is fixed per
+    # process, while shapes and emit_bf16 are swept inside the group.
     rows = []
-    for tp_size, shape, emit_bf16, stage_override in itertools.product(
-        tp_sizes, shapes, emit_bf16_values, stage_overrides
-    ):
-        element_size = torch.tensor([], dtype=dtype).element_size()
-        expected = _expected_path(
-            shape, tp_size, element_size, stage_override, emit_bf16
-        )
-        if expected == "fallback" and stage_override in ("1", "0"):
+    for tp_size, stage_override in itertools.product(tp_sizes, stage_overrides):
+        cases = [
+            {"shape": shape, "emit_bf16": emit_bf16, "gemma_norm": gemma_norm}
+            for shape, emit_bf16, gemma_norm in itertools.product(
+                shapes, emit_bf16_values, gemma_norm_values
+            )
             # When forcing a specific kernel, only exercise shapes that the
             # kernel actually supports. Fallbacks under override would just
             # silently re-test the unfused reference path.
-            continue
-        rows.append(
-            test_fused_ar_rmsnorm_mxfp4_quant(
-                tp_size,
-                shape,
-                dtype,
-                emit_bf16,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
-                stage_override=stage_override,
+            if stage_override is None
+            or _expected_path(shape, tp_size, element_size, stage_override, emit_bf16)
+            != "fallback"
+        ]
+        if cases:
+            rows.extend(
+                test_fused_ar_rmsnorm_mxfp4_quant(
+                    tp_size, cases, dtype, stage_override=stage_override
+                )
             )
-        )
 
     for row in rows:
         logger.info("fused AR+RMSNorm+MXFP4 row: %s", row)
