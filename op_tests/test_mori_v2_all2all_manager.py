@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import gc
 import sys
+import weakref
 from types import ModuleType
 from typing import ClassVar
 
@@ -301,6 +303,27 @@ def test_get_handle_injects_group_geometry_and_caches_op(manager, monkeypatch):
     }
 
 
+def test_manager_keeps_created_handles_alive(manager, monkeypatch):
+    monkeypatch.setattr(
+        all2all.torch.distributed,
+        "broadcast_object_list",
+        lambda objects, **kwargs: None,
+    )
+    args = {
+        "per_rank_vmm": 4096,
+        "hidden_dim": 7168,
+    }
+
+    handle = manager.get_handle(args)
+    handle_ref = weakref.ref(handle)
+    del handle
+    gc.collect()
+
+    assert handle_ref() is not None
+    assert manager.get_handle(args) is handle_ref()
+    assert manager._live_handles == [handle_ref()]
+
+
 def test_get_handle_rejects_missing_capacity(manager):
     with pytest.raises(ValueError, match="must include per_rank_vmm"):
         manager.get_handle({"hidden_dim": 7168})
@@ -327,8 +350,15 @@ def test_destroy_closes_handles_before_communicator(manager, monkeypatch):
     events = []
 
     class OrderedOp(FakeOp):
+        next_id = 0
+
+        def __init__(self, config, comm):
+            super().__init__(config, comm)
+            type(self).next_id += 1
+            self.handle_id = type(self).next_id
+
         def close(self):
-            events.append("handle-close")
+            events.append(f"handle-{self.handle_id}-close")
 
     monkeypatch.setattr(manager, "_dispatch_op_cls", OrderedOp)
     monkeypatch.setattr(
@@ -337,15 +367,18 @@ def test_destroy_closes_handles_before_communicator(manager, monkeypatch):
         lambda objects, **kwargs: None,
     )
 
-    handle = manager.get_handle(
-        {
-            "per_rank_vmm": 4096,
-            "hidden_dim": 7168,
-            "max_num_inp_token_per_rank": 128,
-            "num_experts_per_rank": 8,
-            "num_experts_per_token": 2,
-        }
-    )
+    args = {
+        "per_rank_vmm": 4096,
+        "hidden_dim": 7168,
+        "max_num_inp_token_per_rank": 128,
+        "num_experts_per_rank": 8,
+        "num_experts_per_token": 2,
+    }
+    first = manager.get_handle(args)
+    second = manager.get_handle(args, index=1)
+    assert manager.get_handle(args) is first
+    assert manager._live_handles == [first, second]
+
     comm = manager._cco_communicator
     original_destroy = comm.destroy
 
@@ -356,13 +389,13 @@ def test_destroy_closes_handles_before_communicator(manager, monkeypatch):
     comm.destroy = destroy
     manager.destroy()
 
-    assert handle is not None  # Keep the weakly cached handle live through destroy.
-    assert events == ["handle-close", "comm-destroy"]
+    assert events == ["handle-2-close", "handle-1-close", "comm-destroy"]
+    assert manager._live_handles == []
     assert manager._cco_communicator is None
     assert manager._cco_per_rank_vmm == 0
 
     manager.destroy()
-    assert events == ["handle-close", "comm-destroy"]
+    assert events == ["handle-2-close", "handle-1-close", "comm-destroy"]
 
     with pytest.raises(RuntimeError, match="manager has been destroyed"):
         manager.get_or_create_cco_communicator(4096)

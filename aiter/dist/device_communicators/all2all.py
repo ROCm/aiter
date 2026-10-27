@@ -2,7 +2,6 @@ import importlib.util
 import os
 from functools import cache
 from typing import Any
-from weakref import WeakSet
 
 import torch
 
@@ -190,7 +189,9 @@ class MoriV2All2AllManager(All2AllManagerBase):
         self._dispatch_config_cls = config_cls
         self._dispatch_op_cls = op_cls
         self.handle_cache = Cache()
-        self._live_handles: WeakSet = WeakSet()
+        # CCO window registration/deregistration is collective, so every rank
+        # must keep the same handles alive and close them in the same order.
+        self._live_handles: list[Any] = []
         self._cco_communicator: Any | None = None
         self._cco_per_rank_vmm = 0
         self._destroyed = False
@@ -336,20 +337,20 @@ class MoriV2All2AllManager(All2AllManagerBase):
         comm = self.get_or_create_cco_communicator(per_rank_vmm)
 
         def create_handle(**config_kwargs):
-            return self._make_handle(comm, **config_kwargs)
+            handle = self._make_handle(comm, **config_kwargs)
+            self._live_handles.append(handle)
+            return handle
 
-        handle = self.handle_cache.get_or_create(
+        return self.handle_cache.get_or_create(
             op_kwargs,
             create_handle,
             index=index,
         )
-        self._live_handles.add(handle)
-        return handle
 
     def destroy(self):
         """Close live v2 ops before releasing their shared CCO communicator."""
         self._destroyed = True
-        for handle in list(self._live_handles):
+        for handle in reversed(self._live_handles):
             close = getattr(handle, "close", None)
             if close is None:
                 continue
