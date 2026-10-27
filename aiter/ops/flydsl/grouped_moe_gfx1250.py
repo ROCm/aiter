@@ -907,6 +907,10 @@ def _grouped_a8w4_tdm_moe(
     # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
     # shape, so nothing downstream could tell which one it was handed.
     src_a1_scale = a1_scale
+    if src_a1_scale is not None and src_a1_scale.dtype == torch.float8_e8m0fnu:
+        # MoRI preserves the typed E8M0 scale from the sender. FlyDSL reads
+        # exponent bytes; reinterpret their storage without converting values.
+        src_a1_scale = src_a1_scale.view(torch.uint8)
 
     # Pre-quantized activation: an MX payload plus its e8m0 row is what a
     # quantizing EP dispatch delivers, and it is also aiter's standing meaning
