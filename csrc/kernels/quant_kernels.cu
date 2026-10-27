@@ -635,8 +635,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                     store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT,
                                  kInterleavedChunks,
                                  kInterleavedChunks ? num_thread_per_group : WARP_SIZE,
-                                 kInterleavedChunks ? kChunks : 1, DTYPE_O, false, true>(
-                        buffer_o, thread_data, offset, 1.0f / row_scale);
+                                 kInterleavedChunks ? kChunks : 1, DTYPE_O, true, true>(
+                        buffer_o, thread_data, offset, row_scale);
                 }
                 else if constexpr(kInterleavedChunks)
                 {
@@ -1674,7 +1674,7 @@ dynamic_per_group_quant_m32k4_kernel(std::conditional_t<std::is_same_v<DTYPE_O, 
             if constexpr(kHwConvertDiv)
                 q = scaled_cast_div<opus::fp8_t>(thread_data, row_scale);
             else
-                q = scaled_cast_fp8_noclamp(thread_data, 1.0f / row_scale);
+                q = scaled_cast_fp8_noclamp_div(thread_data, row_scale);
             *reinterpret_cast<vec_o*>(out + (row0 + r) * cols + col) = q;
         }
     });
@@ -2887,7 +2887,7 @@ __device__ void store_mxfp8_row_chunk(opus::fp8_t* __restrict__ out,
     if constexpr(kHwConvertDiv)
         q = scaled_cast_div<opus::fp8_t>(data, row_scale);
     else
-        q = scaled_cast_fp8_noclamp(data, 1.0f / row_scale);
+        q = scaled_cast_fp8_noclamp_div(data, row_scale);
     auto buffer_o = opus::make_gmem<opus::fp8_t>(out + out_offset, (cols + 3) / 4 * 4);
     if(threadIdx.x < (cols + vec_size - 1) / vec_size)
         store_vector<opus::fp8_t, opus::fp8_t, vec_size, RT>(buffer_o, q, threadIdx.x * vec_size);

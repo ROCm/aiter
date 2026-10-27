@@ -66,18 +66,27 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 #endif
 }
 
-// fp32x2 -> fp8x2 with scale, no clamp: NaN and anything past +-max convert to NaN.
-// For MX scales, which keep finite values in range.
-OPUS_D fp8x2_t fp32_to_fp8_scaled_x2_noclamp(fp32x2_t s, float inverted_scale)
+// The power of two that divides by `scale`, a normal power of two, as an ldexp exponent.
+// Its reciprocal can be the fp32 denormal 2^-127 (scale 2^127, the MXFP8 Inf-group
+// scale), which -fgpu-flush-denormals-to-zero turns into 0; ldexp has no such step.
+OPUS_D int pow2_div_exponent(float scale)
 {
-    fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
+    return 127 - static_cast<int>(__builtin_bit_cast(uint32_t, scale) >> 23);
+}
+
+// fp32x2 / scale -> fp8x2, no clamp: NaN and anything past +-max convert to NaN.
+// For MX scales, which are powers of two and keep finite values in range.
+OPUS_D fp8x2_t fp32_to_fp8_div_x2_noclamp(fp32x2_t s, int div_exponent)
+{
+    const float a = __builtin_amdgcn_ldexpf(s[0], div_exponent);
+    const float b = __builtin_amdgcn_ldexpf(s[1], div_exponent);
 #if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
     defined(__gfx1201__) || defined(__gfx1250__)
     int w;
-    asm volatile("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(w) : "v"(tmp[0]), "v"(tmp[1]));
+    asm volatile("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(w) : "v"(a), "v"(b));
     return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
 #else
-    (void)tmp; return fp8x2_t{};
+    (void)a; (void)b; return fp8x2_t{};
 #endif
 }
 
@@ -652,7 +661,8 @@ OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
 }
 #endif
 
-// Fallback: no hardware divide-by-scale convert for this type/arch, so invert here.
+// Fallback: no hardware divide-by-scale convert for this type/arch. The division is an
+// ldexp, not a multiply by 1 / scale; see pow2_div_exponent.
 template <typename D,
           typename S,
 #if defined(__gfx1250__)
@@ -664,20 +674,28 @@ template <typename D,
 #endif
 OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
 {
-    return scaled_cast<D>(s, 1.0f / scale);
+    constexpr index_t N = size<S>();
+    const int e         = pow2_div_exponent(scale);
+    vector_t<fp32_t, N> divided;
+    static_for<N>([&](auto i) {
+        divided[i.value] = __builtin_amdgcn_ldexpf(static_cast<float>(s[i.value]), e);
+    });
+    return scaled_cast<D>(divided, 1.0f);
 }
 
-// fp8 scaled_cast without the +-max clamp; see fp32_to_fp8_scaled_x2_noclamp.
+// fp8 s / scale without the +-max clamp, `scale` a power of two; see
+// fp32_to_fp8_div_x2_noclamp.
 template <typename S>
-OPUS_D decltype(auto) scaled_cast_fp8_noclamp(const S& s, float inverted_scale)
+OPUS_D decltype(auto) scaled_cast_fp8_noclamp_div(const S& s, float scale)
 {
     constexpr index_t N = size<S>();
     static_assert(N % 2 == 0);
+    const int e = pow2_div_exponent(scale);
     vector_t<fp8_t, N> out;
     static_for<N / 2>([&](auto i) {
-        auto pair = fp32_to_fp8_scaled_x2_noclamp(
+        auto pair = fp32_to_fp8_div_x2_noclamp(
             fp32x2_t{static_cast<float>(s[i.value * 2]), static_cast<float>(s[i.value * 2 + 1])},
-            inverted_scale);
+            e);
         out[i.value * 2]     = pair[0];
         out[i.value * 2 + 1] = pair[1];
     });
@@ -918,8 +936,8 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                 opus::vector_t<T_R, chunk_size_elements> chunk_convert;
                 if constexpr(fp8_noclamp)
                 {
-                    static_assert(std::is_same_v<T_R, opus::fp8_t> && !scale_is_divisor);
-                    chunk_convert = scaled_cast_fp8_noclamp(*chunk_ptr, inverted_scale);
+                    static_assert(std::is_same_v<T_R, opus::fp8_t> && scale_is_divisor);
+                    chunk_convert = scaled_cast_fp8_noclamp_div(*chunk_ptr, inverted_scale);
                 }
                 else if constexpr(scale_is_divisor)
                     chunk_convert = scaled_cast_div<T_R>(*chunk_ptr, inverted_scale);

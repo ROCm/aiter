@@ -154,6 +154,12 @@ def _plant_nonfinite(x, G, pattern):
             x[r, g * G + 1] = 100.0
             x[r, g * G + 2 : g * G + 3].view(torch.int16).fill_(snan)
         return
+    if pattern == "inf_max":
+        # BF16 only: the Inf caps the group scale at 2^127, so 2^127 quantizes to 1.
+        for r, g in spots:
+            x[r, g * G + 1] = 2.0**127
+            x[r, g * G + 3] = float("inf")
+        return
     values = {
         "nan": [float("nan")],
         "posinf": [float("inf")],
@@ -581,10 +587,10 @@ e8m0_shapes = (
     if args.m or args.n
     else E8M0_SHAPES
 )
-_skip_fp4_e8m0 = get_gfx() == "gfx942"
+_skip_fp4_e8m0 = get_gfx() not in ("gfx950", "gfx1250")
 for key in [k for k in args.quant if k in d_quant_e8m0]:
     if _skip_fp4_e8m0 and d_quant_e8m0[key] == dtypes.fp4x2:
-        aiter.logger.info("Skipping %s on gfx942 (no HW fp4 convert)", key)
+        aiter.logger.info("Skipping %s on %s (no HW fp4 convert)", key, get_gfx())
         continue
     df = []
     for h_dtype, (m, n), shuffle, strided in itertools.product(
@@ -676,6 +682,15 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx942", "gfx950", "gfx12
         test_mx_quant_moe_sort_threshold(m, 7168, h_dtype, dtypes.fp8, pattern)
         if pattern in (None, "snan") and get_gfx() != "gfx942":
             test_mx_quant_moe_sort_threshold(m, 7168, h_dtype, dtypes.fp4x2, pattern)
+    # A BF16 Inf beside the finite 2^127 on the generic (group 32 and 128), m32k4 and
+    # fused-MoE paths: the scale is 2^127 and the finite value must come out as 1.
+    for (m, n), shuffle in itertools.product(((40, 256), (1024, 7168)), [True, False]):
+        test_quant_1x32_e8m0(m, n, dtypes.fp8, dtypes.bf16, shuffle, False, "inf_max")
+        test_mxfp8_nonfinite_g128(m, n, dtypes.bf16, shuffle, "inf_max")
+    for m, n in ((40, 256), (1024, 7168)):
+        test_mxfp8_m32k4(m, n, dtypes.bf16, "inf_max")
+    for m in (256, 288):
+        test_mx_quant_moe_sort_threshold(m, 7168, dtypes.bf16, dtypes.fp8, "inf_max")
     if get_gfx() != "gfx942":
         # A large value then an sNaN, on the generic kernel and the gfx1250 tile paths.
         for (m, n), q_dtype, h_dtype, shuffle in itertools.product(
