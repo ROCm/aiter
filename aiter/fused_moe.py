@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import csv
 import functools
 import os
 import re
@@ -32,7 +33,14 @@ from aiter.fused_moe_registry import (
     FusedMoeRequest,
     resolve_fused_moe_impl,
 )
-from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
+from aiter.jit.core import (
+    AITER_CONFIGS,
+    AITER_CSRC_DIR,
+    PY,
+    bd_dir,
+    get_asm_dir,
+    mp_lock,
+)
 from aiter.jit.utils.chip_info import (
     get_cu_num,
     get_gfx,
@@ -1994,6 +2002,20 @@ def _fused_moe_impl(
         return _return_output(ret, output)
 
 
+@functools.cache
+def _persistent_blockscale_kernels(activation, out_dtype):
+    """knl_name of the persistent per_1x128 asm kernels (`ps` in their csv)."""
+    act = "silu" if activation == ActivationType.Silu else "gelu"
+    dt = "fp16" if out_dtype == dtypes.fp16 else "bf16"
+    path = os.path.join(
+        get_asm_dir(), "fmoe", act, f"fmoe_{dt}_blockscaleFp8_g1u1_{act}.csv"
+    )
+    if not os.path.exists(path):
+        return frozenset()
+    with open(path) as f:
+        return frozenset(r["knl_name"] for r in csv.DictReader(f) if r["ps"] == "1")
+
+
 def fused_moe_1stage(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -2062,6 +2084,20 @@ def fused_moe_1stage(
             activation,
         )
     else:
+        if (
+            quant_type == QuantType.per_1x128
+            and num_local_tokens is not None
+            and not xbf16
+            and kernelName
+            and kernelName
+            not in _persistent_blockscale_kernels(
+                ActivationType(activation), moe_buf.dtype
+            )
+        ):
+            # Only a persistent kernel takes the row count from num_valid_ids; a
+            # tuned non-persistent one indexes the transposed scale by the
+            # tensor's rows. The heuristic picks persistent kernels.
+            num_local_tokens = None
         if xbf16:
             # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
@@ -2082,7 +2118,9 @@ def fused_moe_1stage(
                     a1_scale is not None or quant_type == QuantType.No
                 ), "a1_scale must be provided for quantized input for fused_moe"
                 a1 = hidden_states
-                if quant_type == QuantType.per_1x128:
+                if quant_type == QuantType.per_1x128 and num_local_tokens is None:
+                    a1_scale = a1_scale.reshape(-1, a1_scale.shape[-1]).t().contiguous()
+                elif quant_type == QuantType.per_1x128:
                     scale_t = torch.empty_like(a1_scale)
                     aiter.partial_transpose(
                         scale_t, a1_scale, num_rows=num_local_tokens
