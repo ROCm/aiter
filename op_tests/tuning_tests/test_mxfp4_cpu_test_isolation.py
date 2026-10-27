@@ -15,10 +15,7 @@ from op_tests.tuning_tests import mxfp4_cpu_test_utils as cpu_utils
 
 
 class TestMxfp4CpuIsolation(unittest.TestCase):
-    def test_input_and_result_cases_restore_state_in_either_order(self) -> None:
-        from op_tests.tuning_tests.test_mxfp4_flydsl_results import (
-            TestCoupledTuningResults,
-        )
+    def test_tuner_cases_restore_state_in_either_order(self) -> None:
         from op_tests.tuning_tests.test_mxfp4_flydsl_tuning import (
             TestMxfp4FlydslInputsAndCandidates,
         )
@@ -30,18 +27,16 @@ class TestMxfp4CpuIsolation(unittest.TestCase):
         cases = (
             (
                 TestMxfp4FlydslInputsAndCandidates,
-                "test_missing_required_column_reports_the_input_file",
+                "test_tune_rejects_rows_that_are_not_a4w4_before_any_shape_work",
             ),
             (
-                TestCoupledTuningResults,
-                "test_csv_saves_fastest_valid_winner_and_all_candidate_observations",
+                TestMxfp4FlydslInputsAndCandidates,
+                "test_full_search_keeps_only_the_coupled_shape_support_domain",
             ),
         )
         for device in ("cpu", "cuda", "cuda:3"):
             for order in (cases, tuple(reversed(cases))):
-                with self.subTest(
-                    device=device, order=[case[0].__name__ for case in order]
-                ):
+                with self.subTest(device=device, order=[method for _, method in order]):
                     torch.set_default_device(device)
                     suite = unittest.TestSuite(cls(method) for cls, method in order)
                     stream = io.StringIO()
