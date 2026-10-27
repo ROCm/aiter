@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 import aiter
+from aiter import logger
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.comms.all_reduce import (
@@ -25,10 +26,8 @@ NUMELS = [t * HIDDEN for t in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
 NUMELS += [3 * HIDDEN + 8, 600 * HIDDEN + 8]
 MIXED = [8, 1, 2048, 2, 64, 4, 512, 8, 16, 1024, 32, 128, 256, 1, 8]
 
-pytestmark = pytest.mark.skipif(
-    torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250",
-    reason="needs 4 gfx1250 GPUs",
-)
+SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250"
+pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx1250 GPUs")
 
 
 def _inputs(numel, seed, rank, device):
@@ -55,6 +54,18 @@ def _worker(rank, init_method):
     inboxes, calls = all_reduce_init(group, 2 * max(NUMELS))
     failures = []
     try:
+        # First, while the inboxes are empty: the call numbers wrap from 2^30 to 1.
+        calls[:-1].fill_(2**30 - 2)
+        for i in range(4):
+            x, ref = _inputs(64 * HIDDEN, 2000 + i, rank, device)
+            if _bad(all_reduce(x, group, inboxes, calls), ref):
+                failures.append(f"rank {rank}: call {i} at the counter wrap is wrong")
+
+        # A last dim that is odd in int32 words.
+        x, ref = _inputs(12, 3000, rank, device)
+        if _bad(all_reduce(x.view(4, 3), group, inboxes, calls), ref.view(4, 3)):
+            failures.append(f"rank {rank}: shape (4, 3) is wrong")
+
         for i, numel in enumerate(NUMELS):
             x, ref = _inputs(numel, i, rank, device)
             out = all_reduce(x, group, inboxes, calls)
@@ -100,3 +111,10 @@ def test_all_reduce():
         ]
         failures = [f for r in results for f in r.get(timeout=1800)]
     assert not failures, "\n".join(failures)
+
+
+if __name__ == "__main__":  # CI runs the multi-GPU tests as scripts
+    if SKIP:
+        logger.warning("test_all_reduce skipped: needs 4 gfx1250 GPUs")
+    else:
+        test_all_reduce()

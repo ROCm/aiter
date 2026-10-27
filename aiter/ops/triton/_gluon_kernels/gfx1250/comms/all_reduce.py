@@ -1,7 +1,9 @@
 """All-reduce of bf16 data over 4 GPUs. A sender writes a chunk of x into the inbox
 of each peer as 16-byte lines [word, call, word, call]. A receiver waits until its
 lines carry the current call number, then adds the 4 chunks. Even and odd calls
-use different banks, because a GPU can be one call ahead of a peer."""
+use different banks, because a GPU can be one call ahead of a peer. Call numbers
+go from 1 to 2^30, then start at 1 again: they are never 0 (an empty inbox) and
+never negative."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -42,7 +44,7 @@ def _send(
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     line = c * LINES + gl.arange(0, LINES, layout=gl.SliceLayout(1, WORDS))[:, None]
     word = 2 * line + gl.arange(0, 2, layout=gl.SliceLayout(0, WORDS))[None, :]
-    call = gl.load(calls + 2 * c) + 1
+    call = gl.load(calls + 2 * c) % (1 << 30) + 1
     data = gl.load(x + word, mask=2 * line < n_words)  # one mask for each line
     gl.barrier()  # all waves have read the old call number
     gl.store(calls + 2 * c, call)
@@ -80,7 +82,7 @@ def _receive(
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     line = c * LINES + gl.arange(0, LINES, layout=gl.SliceLayout(1, WORDS))[:, None]
     word = 2 * line + gl.arange(0, 2, layout=gl.SliceLayout(0, WORDS))[None, :]
-    call = gl.load(calls + 2 * c + 1) + 1
+    call = gl.load(calls + 2 * c + 1) % (1 << 30) + 1
     word_ok = 2 * line < n_words
     mine = gl.load(x + word, mask=word_ok)
     gl.barrier()  # all waves have read the old call number

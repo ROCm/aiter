@@ -29,12 +29,17 @@ def all_reduce_init(group, max_bytes):
     """
     Allocates the inbox of this rank and maps the inboxes of the 4 ranks of
     ``group``, for tensors of at most ``max_bytes``. All ranks must call it.
+    Needs ROCm 7.14 or later: the inboxes are shared with hipIpc.
 
     Returns:
         tuple: The inbox addresses of ranks 0 to 3, and the int32 call counters
         of this rank. calls[-1] counts the polls that timed out.
     """
+    from aiter.dist.device_communicators.custom_all_reduce import _should_use_vmm
+
     assert get_arch() == "gfx1250" and dist.get_world_size(group) == 4
+    # As in the custom all-reduce: on gfx1250, hipIpc works from ROCm 7.14.
+    assert not _should_use_vmm(True), "needs ROCm 7.14 or later for hipIpc"
     hip = ctypes.CDLL(find_loaded_library("libamdhip64"))
     chunks = triton.cdiv(max_bytes, 8 * _LINES)
     size = ctypes.c_size_t(2 * 4 * chunks * _LINES * 16)  # 2 banks x 4 senders
@@ -98,8 +103,8 @@ def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
 
     y = torch.empty_like(x)
     _all_reduce_kernel[(2 * triton.cdiv(n_words, 2 * _LINES),)](
-        x.view(torch.int32),
-        y.view(torch.int32),
+        x.view(-1).view(torch.int32),  # flat first: the last dim can be odd
+        y.view(-1).view(torch.int32),
         inboxes,
         calls,
         calls[-1:],
