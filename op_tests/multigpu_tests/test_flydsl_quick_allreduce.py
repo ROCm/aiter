@@ -100,7 +100,12 @@ schedules; ``-s`` or ``--shape-csv`` replace them, ``-a`` picks the schedules,
 and ``--grid-cap`` and ``--block`` pin their geometry. ``--candidates`` adds
 the pinned configurations of a candidate file
 (``flydsl_allreduce_bench.load_candidates``) as more columns of the same
-spawn, and ``--candidate-set`` selects its rows. ``--report``, ``--csv`` and
+spawn, and ``--candidate-set`` selects its rows. ``--list-candidates`` prints
+every configuration the ``-a`` schedules can pin as such a file.
+``--baselines reference`` times, of the stock paths, only the HIP quick
+all-reduce at INT4 the schedules replace: ``hip`` (``REFERENCE``, the plain
+bench's only stock kernel anyway), or for ``ar_rmsnorm`` ``hip_fused``
+(``FUSED_REFERENCE``), with no unfused paths. ``--report``, ``--csv`` and
 ``-o`` save the tables.
 
 Every rank is a ``multiprocessing`` spawn worker that builds its own engine.
@@ -220,11 +225,13 @@ GRAPH_INNER = fab.GRAPH_INNER
 # measures ~18.3 dB; the floor leaves ~4 dB of headroom.
 HIP_QR_REGIME = "INT4"
 HIP_SQNR_FLOOR_DB = 14.0
+REFERENCE = ("hip",)
 # bench, ar_rmsnorm: the stock quantized fused paths. ``hip_fused`` is the HIP
 # quick all-reduce's own fused kernel (``qr_all_reduce_rmsnorm``), which takes
 # rows that divide its 32 KiB tile; ``hip+norm`` is the HIP quick all-reduce,
 # then ``rmsnorm2d_fwd_with_add``.
 FUSED_STOCK = ("hip_fused", "hip+norm")
+FUSED_REFERENCE = ("hip_fused",)
 # bench, ar_rmsnorm: the exact stock fused paths -- ``CustomAllreduce``'s fused
 # kernel and ``<cdr|rccl>+norm`` -- and their accuracy floor. Shared with the
 # one-shot's bench, which owns the decode sizes they are fastest at.
@@ -1167,6 +1174,7 @@ _DISPATCH: dict[int, list] = {}
 _FAILURES: list[str] = []
 # ``(reps, rounds)`` for every timed graph; set by ``main()``.
 _TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
+_BASELINES = "all"
 
 
 def _key(tp: int, **engine_kw) -> tuple:
@@ -1186,7 +1194,11 @@ def _result(key: tuple, case: tuple) -> list[dict]:
         kw = dict(key[1])
         if "algorithms" in kw:
             op = kw.pop("op")
-            fused_kw = {} if op == "ar" else {"mxfp4": kw.pop("mxfp4", False)}
+            fused_kw = (
+                {}
+                if op == "ar"
+                else {"mxfp4": kw.pop("mxfp4", False), "baselines": _BASELINES}
+            )
             ranks = _spawn(
                 _bench_rank if op == "ar" else _bench_fused_rank,
                 key[0],
@@ -3560,6 +3572,7 @@ def _bench_fused_rank(
     timing: tuple[int, int],
     extra: tuple = (),
     mxfp4: bool = False,
+    baselines: str = "all",
 ) -> list[dict]:
     """One rank of one ``ar_rmsnorm`` bench spawn: every candidate on every case.
 
@@ -3573,6 +3586,11 @@ def _bench_fused_rank(
     ``<schedule>+norm+mxfp4``. A case is ``(tokens, hidden)``. Returns, per
     case, whether production would run the HIP fused kernel on it and each
     candidate's per-rank result.
+
+    At *baselines* ``reference`` (``--baselines``) the stock candidates are
+    ``FUSED_REFERENCE`` alone, and the unfused paths are not timed;
+    ``CustomAllreduce`` and the plain engines only those columns use are then
+    not built at all.
     """
     import torch.distributed as dist
 
@@ -3589,7 +3607,9 @@ def _bench_fused_rank(
     del engine_kw  # the knobs come per candidate
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-    tp_group = _init_dist(rank, tp, init_method, hip=True, custom=True)
+    every = baselines == "all"
+    # CustomAllreduce only for the exact stock columns.
+    tp_group = _init_dist(rank, tp, init_method, hip=True, custom=every)
     gloo = tp_group.cpu_group
     group = tp_group.device_group
     comm = tp_group.device_communicator
@@ -3621,9 +3641,9 @@ def _bench_fused_rank(
             **knobs,
         )
     # The all-reduce each schedule's fused kernel replaces, as production
-    # builds it.
+    # builds it, for the unfused columns.
     plains = {}
-    for algorithm in algorithms:
+    for algorithm in algorithms if every else ():
         plains[algorithm] = FlyQuickAllReduce(
             group=gloo,
             device=device,
@@ -3715,18 +3735,25 @@ def _bench_fused_rank(
                 _view("ar", m, hidden),
                 eps,
             )
-            thunks.update(
-                fab.exact_fused_thunks(
-                    ca,
-                    nccl,
-                    outs,
-                    x,
-                    residual,
-                    weight,
-                    _view("ar", m, hidden),
-                    eps,
+            if every:
+                thunks.update(
+                    fab.exact_fused_thunks(
+                        ca,
+                        nccl,
+                        outs,
+                        x,
+                        residual,
+                        weight,
+                        _view("ar", m, hidden),
+                        eps,
+                    )
                 )
-            )
+            else:
+                thunks = {
+                    n: t
+                    for n, t in thunks.items()
+                    if n not in FUSED_STOCK or n in FUSED_REFERENCE
+                }
             # MXFP4 needs an unpadded row.
             quant = {
                 a: (
@@ -3907,8 +3934,9 @@ def bench_quick_allreduce_rmsnorm(
     }
     for algorithm in algorithms:
         ret[f"{algorithm} vs quantized"] = fab.speedup(quant_us, got[algorithm]["us"])
+        unfused = got.get(f"{algorithm}+norm")
         ret[f"{algorithm} vs unfused"] = fab.speedup(
-            got[f"{algorithm}+norm"]["us"], got[algorithm]["us"]
+            unfused["us"] if unfused else None, got[algorithm]["us"]
         )
         if mxfp4:
             fused, unfused = got.get(f"{algorithm}_mxfp4"), got.get(
@@ -4018,6 +4046,7 @@ def _bench_fused(args, tps, algos, link) -> None:
                 )
             ),
             "- `n/a`: the candidate cannot run that payload, or is not timed there",
+            fab.baselines_line(args.baselines, FUSED_REFERENCE),
         ],
     )
     fab.write_outputs(
@@ -4031,6 +4060,88 @@ def _route(policy, nbytes: int) -> str:
     on, or ``fallback`` for ``cross_device_reduce`` and RCCL."""
     alg = policy.select(nbytes, quantized=True)
     return "fallback" if alg is None else alg.value
+
+
+def _list_candidates(args) -> list:
+    """``--list-candidates``: every configuration of the ``-a`` schedules that a
+    candidate row can pin for ``--operation``, as
+    ``flydsl_allreduce_bench.Candidate`` rows.
+
+    The plain schedules build every ``block`` x ``super_tile`` on a flat
+    payload; the engine clamps a grid cap to the resident workgroups. A fused
+    row pins ``atoms_per_row`` (the row geometry), ``super_tile`` and
+    ``grid_cap``, and on the mesh also the low-latency build
+    (``fused_fly_mesh_ll_*``), and is listed only where it builds as named at
+    one or more of the run's widths and world sizes (``_fused_applies``).
+    """
+    from aiter.ops.flydsl.quick_allreduce import ALGORITHMS as HOST_ALGORITHMS
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
+
+    algos = [a for a in ALGORITHMS if a in args.algorithm]
+    cus = torch.cuda.get_device_properties(0).multi_processor_count
+    out = []
+    if args.operation != "ar_rmsnorm":
+        prefix = {"mesh": "fly_int4", "ring": "fly_int4_ring"}
+        for a in algos:
+            for b, st in itertools.product(
+                SUPPORTED_BLOCKS, HOST_ALGORITHMS[a].super_tiles
+            ):
+                for g in fab.list_grid_caps(cus):
+                    out.append(
+                        fab.Candidate(
+                            f"{prefix[a]}_b{b}_st{st}_g{g}",
+                            "ar",
+                            a,
+                            {"super_tile": st, "grid_cap": g, "block": b},
+                            (),
+                        )
+                    )
+        return out
+    tps = args.tp or list(SUPPORTED_WORLDS)
+    hiddens = sorted({h for _m, h in (args.mnk or FUSED_BENCH_SHAPES)})
+
+    def _builds(a, knobs):
+        return any(_fused_applies(a, knobs, tp, h) for tp in tps for h in hiddens)
+
+    # A ring row fits a rank's chunk, so its widest row is at TP2.
+    row_atoms = {"mesh": (1, 2, 4, 8), "ring": (1, 2, 4)}
+    for a in algos:
+        for apr, st in itertools.product(row_atoms[a], HOST_ALGORITHMS[a].super_tiles):
+            for g in fab.list_grid_caps(FlyQuickAllReduceRMSNorm.WGS_PER_CU * cus):
+                knobs = {"super_tile": st, "grid_cap": g, "atoms_per_row": apr}
+                if _builds(a, knobs):
+                    out.append(
+                        fab.Candidate(
+                            f"fused_fly_{a}_a{apr}_st{st}_g{g}",
+                            "ar_rmsnorm",
+                            a,
+                            knobs,
+                            (),
+                        )
+                    )
+        if a != "mesh":
+            continue
+        # The low-latency build: super-tile 1 only.
+        ll_cus = FlyQuickAllReduceRMSNorm.LOW_LATENCY_WGS_PER_CU * cus
+        for apr in row_atoms[a]:
+            for g in fab.list_grid_caps(ll_cus):
+                knobs = {
+                    "super_tile": 1,
+                    "grid_cap": g,
+                    "atoms_per_row": apr,
+                    "low_latency": True,
+                }
+                if _builds(a, knobs):
+                    out.append(
+                        fab.Candidate(
+                            f"fused_fly_mesh_ll_a{apr}_st1_g{g}",
+                            "ar_rmsnorm",
+                            a,
+                            knobs,
+                            (),
+                        )
+                    )
+    return out
 
 
 def _candidates(args, operation: str, algos) -> tuple:
@@ -4101,6 +4212,7 @@ def _bench(args, tps, algos, link) -> None:
                 f"AITER_QUICK_REDUCE_CAST_BF16_TO_FP16={cast}"
             ),
             "- `X vs hip` is `hip us / X us`: above 1.0 the schedule is faster",
+            fab.baselines_line(args.baselines, REFERENCE),
         ],
     )
     fab.write_outputs(args, "FlyDSL quick all-reduce INT4 bench", header, tables, rows)
@@ -4222,10 +4334,17 @@ def main():
     fab.add_bench_args(parser)
     args = parser.parse_args()
     fab.check_bench_args(parser, args)
+    if args.mxfp4 and args.baselines != "all":
+        # Its columns come with the unfused ones, which only ``all`` builds.
+        parser.error("--mxfp4 needs --baselines all")
     if ARCH not in SUPPORTED_ARCHS:
         raise SystemExit(f"FlyQuickAllReduce is unsupported on {ARCH}")
-    global _TIMING
+    if args.list_candidates:
+        fab.write_candidates(_list_candidates(args))
+        return
+    global _TIMING, _BASELINES
     _TIMING = (args.reps, args.rounds)
+    _BASELINES = args.baselines
 
     tps = fab.select_world_sizes(
         args.tp or list(SUPPORTED_WORLDS),

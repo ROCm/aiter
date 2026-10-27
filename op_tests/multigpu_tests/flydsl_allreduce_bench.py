@@ -344,12 +344,34 @@ def add_bench_args(parser) -> None:
         help="bench: only the --candidates rows tagged NAME in their sets\n"
         "column. Default every row.",
     )
+    parser.add_argument(
+        "--baselines",
+        choices=BASELINES,
+        default="all",
+        help="bench: which stock columns to time next to the FlyDSL engines.\n"
+        "all (default): every stock kernel and unfused path.\n"
+        "reference: only the stock kernel production dispatch.",
+    )
+    parser.add_argument(
+        "--list-candidates",
+        action="store_true",
+        help="Print every FlyDSL configuration this test can pin for\n"
+        "--operation (default ar) as a --candidates file (CSV) on stdout.\n",
+    )
 
 
 def check_bench_args(parser, args) -> None:
     if args.reps < 1 or args.rounds < 1:
         parser.error("--reps and --rounds must be positive")
-    if args.scenario != "bench":
+    if args.list_candidates:
+        for flag, val in (
+            ("--candidates", args.candidates),
+            ("--report", args.report),
+            ("--csv", args.csv),
+        ):
+            if val is not None:
+                parser.error(f"{flag} and --list-candidates are mutually exclusive")
+    elif args.scenario != "bench":
         for flag, val in (
             ("--shape-csv", args.shape_csv),
             ("--report", args.report),
@@ -361,6 +383,8 @@ def check_bench_args(parser, args) -> None:
                 parser.error(f"{flag} needs --scenario bench")
     if args.candidate_set is not None and args.candidates is None:
         parser.error("--candidate-set needs --candidates")
+    if args.baselines != "all" and args.scenario != "bench":
+        parser.error("--baselines needs --scenario bench")
     if args.shape_csv is not None:
         if args.mnk is not None:
             parser.error("--shape-csv and -s/--mnk are mutually exclusive")
@@ -506,6 +530,48 @@ def load_candidates(
     return out
 
 
+def baselines_line(level: str, reference) -> str:
+    """The report header line that records the ``--baselines`` *level*, and
+    the *reference* columns it keeps."""
+    if level == "all":
+        return "- baselines: all"
+    return "- baselines: reference only, " + ", ".join(f"`{n}`" for n in reference)
+
+
+def list_grid_caps(limit: int, *, at_least: int = 1) -> tuple[int, ...]:
+    """``--list-candidates``: the grid caps listed for a launch that keeps at
+    most *limit* workgroups resident -- powers of two from
+    ``LIST_MIN_GRID_CAP`` (and from *at_least*) up to *limit*."""
+    caps, cap = [], LIST_MIN_GRID_CAP
+    while cap <= limit:
+        if cap >= at_least:
+            caps.append(cap)
+        cap *= 2
+    return tuple(caps)
+
+
+def write_candidates(cands, out=None) -> None:
+    """Write the ``Candidate``\\ s *cands* as a candidate file
+    (``load_candidates``) to *out*, default stdout."""
+    import csv
+
+    names = [c.name for c in cands]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise ValueError(f"duplicate candidate name(s) {dup}")
+    w = csv.DictWriter(
+        out or sys.stdout, fieldnames=_CANDIDATE_COLUMNS, lineterminator="\n"
+    )
+    w.writeheader()
+    for c in cands:
+        row = dict.fromkeys(_CANDIDATE_COLUMNS, "")
+        row.update(name=c.name, operation=c.operation, algorithm=c.algorithm)
+        for knob, value in c.knobs.items():
+            row[knob] = int(value) if isinstance(value, bool) else value
+        row["sets"] = ";".join(c.sets)
+        w.writerow(row)
+
+
 def fused_reference(total: torch.Tensor, residual, weight, eps: float = RMS_EPS):
     """``(out, residual_out)`` of all-reduce + residual add + RMSNorm in fp32,
     from the fp32 all-reduced *total*.
@@ -524,14 +590,22 @@ def fused_reference(total: torch.Tensor, residual, weight, eps: float = RMS_EPS)
 # them. ``cdr_fused_*`` is ``CustomAllreduce``'s fused kernel at both stage
 # counts; ``<ar>+norm`` is that all-reduce and then ``rmsnorm2d_fwd_with_add``.
 EXACT_FUSED_STOCK = ("cdr_fused_1stage", "cdr_fused_2stage", "cdr+norm", "rccl+norm")
+# ``--baselines``: every stock column, or only the test's ``REFERENCE`` --
+# what production runs where the FlyDSL kernel declines.
+BASELINES = ("all", "reference")
+# ``--list-candidates``: the smallest grid cap listed. Below it a persistent
+# launch leaves most of the device idle at any payload a sweep times.
+LIST_MIN_GRID_CAP = 8
 # ``ar_rmsnorm``: the accuracy floor of an exact candidate, on ``out`` and on
 # ``residual_out``. ``out`` goes through an approximate rsqrt, so it sits well
 # below the plain all-reduce's floor.
 EXACT_FUSED_SQNR_FLOOR_DB = 30.0
 
 
-def exact_fused_thunks(ca, nccl, outs, x, residual, weight, ar_buf, eps) -> dict:
-    """The ``EXACT_FUSED_STOCK`` thunks that can run on *x*, by name.
+def exact_fused_thunks(
+    ca, nccl, outs, x, residual, weight, ar_buf, eps, keep=EXACT_FUSED_STOCK
+) -> dict:
+    """The ``EXACT_FUSED_STOCK`` thunks of *keep* that can run on *x*, by name.
 
     *ca* is the group's ``CustomAllreduce`` and *nccl* its PyNccl, either None
     when absent. Each candidate is gated as ``CudaCommunicator`` gates it, and
@@ -580,7 +654,7 @@ def exact_fused_thunks(ca, nccl, outs, x, residual, weight, ar_buf, eps) -> dict
             rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
 
         thunks["rccl+norm"] = _rccl_norm
-    return thunks
+    return {n: t for n, t in thunks.items() if n in keep}
 
 
 def mark_staged(res: dict, ca) -> None:
