@@ -103,14 +103,14 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         ("gfx950", 32, 1024, 8, 8, 4),
         ("gfx950", 64, 1024, 8, 8, 2),
         ("gfx950", 128, 1024, 8, 8, 1),
-        ("gfx942", 8, 1024, 8, 8, 1),
+        ("gfx942", 8, 1024, 8, 8, 8),
         ("gfx950", 8, 1023, 8, 8, 8),
         ("gfx950", 8, 1025, 8, 8, 8),
         ("gfx950", 1, 512, 8, 8, 8),
         ("gfx950", 8, 512, 8, 8, 8),
         ("gfx950", 32, 512, 8, 8, 4),
         ("gfx950", 128, 512, 8, 8, 1),
-        ("gfx942", 8, 512, 8, 8, 1),
+        ("gfx942", 8, 512, 8, 8, 8),
         # Limited budgets still need enough split-query CTAs to fill the device.
         ("gfx950", 8, 512, 1, 1, 8),
         ("gfx950", 8, 512, 4, 4, 8),
@@ -140,7 +140,7 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         ("gfx950", 64, 2048, 1, 1, 4),
         ("gfx950", 8, 4096, 1, 1, 8),
         ("gfx950", 8, 4096, 8, 8, 4),
-        ("gfx942", 8, 2048, 1, 1, 1),
+        ("gfx942", 8, 2048, 1, 1, 8),
     ],
 )
 def test_bf16_swa_query_split_schedule(

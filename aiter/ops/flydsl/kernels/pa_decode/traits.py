@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 
+from ..kernels_common import ceildiv
+
 MFMA_MNK = 16  # M=N=16; query rows are padded to M-tiles.
 # One i64 operand pack/lane covers K32, including in K128 layouts.
 FP8_PACK_K = 32
@@ -262,7 +264,7 @@ class PaDecodeSchedule:
                     2 if sliding_window == 0 and kv_work >= 2 * num_compute_units else 1
                 )
                 queries_per_cta = max(1, target_rows // query_group_size)
-                query_splits = max(1, -(-query_length // queries_per_cta))
+                query_splits = max(1, ceildiv(query_length, queries_per_cta))
                 # Preserve CTA parallelism and choose only divisors of Qlen.
                 while query_length % query_splits or (
                     query_splits < query_length
@@ -278,12 +280,12 @@ class PaDecodeSchedule:
                 if max_context_length is not None:
                     kv_tiles = min(
                         kv_tiles,
-                        max(1, -(-max_context_length // KV_COMPUTE_BLOCK)),
+                        max(1, ceildiv(max_context_length, KV_COMPUTE_BLOCK)),
                     )
                 tasks_per_seq = min(
                     num_partitions, max(1, work_capacity // num_seqs), kv_tiles
                 )
-                tiles_per_task = -(-kv_tiles // tasks_per_seq)
+                tiles_per_task = ceildiv(kv_tiles, tasks_per_seq)
                 active_tasks = min(split_workgroups, num_seqs * tasks_per_seq)
                 tile_workgroups = active_tasks * tiles_per_task
                 # Splitting lowers the BF16 Q/P LDS and accumulator footprint;

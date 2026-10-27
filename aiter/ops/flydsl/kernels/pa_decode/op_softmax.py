@@ -254,6 +254,14 @@ class PaDecodeSoftmax:
             self.stage_v_scale_max(v_scale_vecs, bounds)
         return masked_chunks, v_scale_vecs
 
+    def residual_offset(self, m):
+        """Residual row shared by probability packing and PV operand loads."""
+        return (
+            self.p_offset(m % self.traits.P_BUFFERS)
+            + self.ctx.lane16 * self.traits.SP_ROW_BYTES
+            + self.traits.TILE_TOK
+        )
+
     @flyc.jit
     def stage_probability_residual(self, scaled, word, m, a):
         # Short contexts reuse P-row padding. Small windows use a full second
@@ -262,14 +270,7 @@ class PaDecodeSoftmax:
             const_expr(self.policy.residual_tokens == self.traits.TILE_TOK)
             or self.ctx.warp == 0
         ):
-            offset = (
-                self.traits.sP_off
-                + (m % self.traits.P_BUFFERS) * MFMA_MNK * self.traits.SP_ROW_BYTES
-                + self.ctx.lane16 * self.traits.SP_ROW_BYTES
-                + self.traits.TILE_TOK
-                + self.ctx.rgroup * 4
-                + a * MFMA_MNK
-            )
+            offset = self.residual_offset(m) + self.ctx.rgroup * 4 + a * MFMA_MNK
             if const_expr(self.policy.residual_tokens == self.traits.TILE_TOK):
                 offset += self.ctx.warp * self.traits.TOK_PER_WARP
             self.lds.store(offset, fx.Int32, self.gemm.fp8_residual(scaled, word))

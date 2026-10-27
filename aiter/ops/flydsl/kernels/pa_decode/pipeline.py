@@ -46,12 +46,7 @@ class PaDecodePipeline:
     def pv(self, v_ops, p_ops, m):
         residual = None
         if const_expr(self.policy.residual_tokens > 0):
-            offset = (
-                self.traits.sP_off
-                + (m % self.traits.P_BUFFERS) * MFMA_MNK * self.traits.SP_ROW_BYTES
-                + self.ctx.lane16 * self.traits.SP_ROW_BYTES
-                + self.traits.TILE_TOK
-            )
+            offset = self.softmax.residual_offset(m)
             if const_expr(self.policy.residual_tokens < self.traits.TILE_TOK):
                 # Only rgroup 0 owns the compact residual keys in the PV layout.
                 residual = fx.full(self.policy.pv_packs, 0, fx.Int64)
@@ -76,7 +71,7 @@ class PaDecodePipeline:
             # Bound the latest visible key across this CTA's query positions,
             # including early queries in long verification blocks.
             query_end = (
-                fx.Int32(gpu.block_id("y")) % self.traits.query_splits + 1
+                fx.block_idx.y % self.traits.query_splits + 1
             ) * self.traits.QUERIES_PER_CTA
             visible_end = self.ctx.planned_context - (
                 self.traits.query_length - query_end

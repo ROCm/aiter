@@ -90,6 +90,7 @@ class PaDecodeGemm:
         rounded = fx.Vector.from_elements(
             [lo[0], lo[1], hi[0], hi[1]], dtype=fx.Float32
         )
+        # gfx942 unpacks native FNUZ values; no transport-scale correction.
         return self.fp8_words((scaled - rounded) * fx.full(4, 16.0, fx.Float32))
 
     def qk(self, k_ops, q_ops, m):
