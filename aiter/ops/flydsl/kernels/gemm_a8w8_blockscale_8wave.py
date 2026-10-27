@@ -18,14 +18,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Float8E4M3FN, Float32, T
 from flydsl.expr.typing import Vector as Vec
 
-
-def div_up(x, y):
-    return (x + y - 1) // y
+from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 
 
 def _buffer_resource(tensor, num_records_bytes):
@@ -37,12 +34,6 @@ def _lds_byte_ptr(ptr, byte_offset):
     return fx.to_llvm_ptr(
         fx.add_offset(fx.recast_iter(fx.Uint8, ptr), fx.make_int_tuple(byte_offset))
     )
-
-
-# def encode_waitcnt_950(vmcnt=63, expcnt=7, lgkmcnt=63):
-#     vm_lo = vmcnt & 0xF
-#     vm_hi = (vmcnt >> 4) & 0x3
-#     return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
 
 
 def compile_gemm_fp8_8wave(
@@ -84,9 +75,10 @@ def compile_gemm_fp8_8wave(
     scaleB_rows = TILE_N // 128
     scaleB_elems = scaleB_rows * scaleA_stride
 
-    def _get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
+    @flyc.jit
+    def get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
         num_pid_m = (M + TILE_M - 1) // TILE_M
-        num_pid_n = div_up(N, TILE_N)
+        num_pid_n = ceildiv(N, TILE_N)
         if const_expr(NUM_XCDS != 1):
             pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
             tall_xcds = GRID_MN % NUM_XCDS
@@ -115,8 +107,6 @@ def compile_gemm_fp8_8wave(
             pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
             pid_n = (pid % num_pid_in_group) // group_size_m
         return pid_m, pid_n
-
-    get_pids_950 = ASTRewriter.transform(_get_pids_950)
 
     # Pad each eight rows by 16 bytes and each sixteen rows by another 32.
     A_GROUP = 8 * BLOCK_K + 16
@@ -149,10 +139,10 @@ def compile_gemm_fp8_8wave(
     ):
         tid = fx.thread_idx.x
         wave_id = tid // 64
-        num_pid_n = div_up(N, TILE_N)
+        num_pid_n = ceildiv(N, TILE_N)
         if const_expr(pid_swizzle):
             # Match launch grid; the restricted target prevents OCKL inlining.
-            grid_mn = div_up(M, TILE_M) * num_pid_n
+            grid_mn = ceildiv(M, TILE_M) * num_pid_n
             bid_x, bid_y = get_pids_950(fx.block_idx.x, M, grid_mn, 8, 4)
         else:
             bid_x = fx.block_idx.x // num_pid_n
@@ -200,9 +190,7 @@ def compile_gemm_fp8_8wave(
         # ScaleB still needs a global descriptor for the two scalar K-tile loads.
         scaleB_rsrc = _buffer_resource(
             argScaleB,
-            num_records_bytes=arith._to_raw(
-                fx.Int32(div_up(N, 128) * scaleA_stride * 4)
-            ),
+            num_records_bytes=ceildiv(N, 128) * scaleA_stride * 4,
         )
 
         ### read LDS layout and write LDS layout. AC copy tile
@@ -313,7 +301,7 @@ def compile_gemm_fp8_8wave(
         ### 256 A scales, so there are only 256 distinct scale values.
         scaleA_rsrc = _buffer_resource(
             argScaleA,
-            num_records_bytes=arith._to_raw(fx.Int32(M * scaleA_stride * 4)),
+            num_records_bytes=M * scaleA_stride * 4,
         )
         lane_id = tid % 64
         wave_m = wave_id // 4
@@ -322,16 +310,14 @@ def compile_gemm_fp8_8wave(
             fx.make_view(lds.scale_a1.ptr, fx.make_layout(512, 1)),
         ]
         scale_lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
-        scale_wave_dst_offset = rocdl.readfirstlane(
-            T.i32, arith._to_raw(fx.Int32(tid * 4))
-        )
+        scale_wave_dst_offset = rocdl.readfirstlane(T.i32, (tid * 4).ir_value())
 
         def _scale_dst_ptr(root_view, byte_offset):
             return _lds_byte_ptr(fx.get_iter(root_view), byte_offset)
 
         scale_row = tid % TILE_M
-        scale_lane_src_offset = fx.Int32(scale_row * 4)
-        scale_src_tile_base = fx.Int32(bid_x * TILE_M * 4)
+        scale_lane_src_offset = scale_row * 4
+        scale_src_tile_base = bid_x * TILE_M * 4
 
         def async_copy_scale_a(lds_idx, ki):
             scale_dst = _scale_dst_ptr(scale_a_lds[lds_idx], scale_wave_dst_offset)
@@ -340,20 +326,20 @@ def compile_gemm_fp8_8wave(
                 scale_dst,
                 fx.Int32(4),
                 scale_lane_src_offset,
-                fx.Int32(scale_src_tile_base + ki * M * 4),
+                scale_src_tile_base + ki * M * 4,
                 fx.Int32(0),
                 fx.Int32(0),
             )
 
         def load_scale_b_inline(ki):
-            addr = fx.Int32((bid_y * scaleB_elems + ki) * 4)
+            addr = (bid_y * scaleB_elems + ki) * 4
             result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
             result = _llvm.inline_asm(
                 result_type,
                 [
-                    arith._to_raw(scaleB_rsrc),
-                    arith._to_raw(addr),
-                    arith._to_raw(addr + scaleA_stride * 4),
+                    scaleB_rsrc,
+                    addr.ir_value(),
+                    (addr + scaleA_stride * 4).ir_value(),
                 ],
                 "s_buffer_load_dword $0, $2, $3\n" "s_buffer_load_dword $1, $2, $4",
                 "=&s,=&s,s,s,s,~{memory}",
@@ -370,7 +356,7 @@ def compile_gemm_fp8_8wave(
         from aiter.ops.flydsl.kernels import buffer_ops
 
         def load_scale_b_buffer(ki):
-            offset = fx.Int32(bid_y * scaleB_elems + ki)
+            offset = bid_y * scaleB_elems + ki
             scale_l = buffer_ops.buffer_load(
                 scaleB_rsrc, offset, vec_width=1, is_scalar=True
             )
@@ -541,7 +527,7 @@ def compile_gemm_fp8_8wave(
             2 * (8 * BLOCK_K + 16) + 32
         )
         _a_wave_off_bytes = rocdl.readfirstlane(
-            T.i32, arith._to_raw(fx.Int32(_a_wave_off_elems * _elem_bytes))
+            T.i32, (_a_wave_off_elems * _elem_bytes).ir_value()
         )
         _b_wave_off_bytes = _a_wave_off_bytes  # Unshuffled B uses the same layout as A.
 
@@ -569,7 +555,7 @@ def compile_gemm_fp8_8wave(
         # 8 lane-rows per wave would divide BM/BN into 8 groups. each group is 16m/16n(16 contineous rows/columns).
         # 2 contineous lane-rows would have load A/B with stride of 16m/16n.
         a_local_row = a_lane_row % 8 * (BLOCK_M // 8) + a_lane_row // 8
-        lane_src_offset = fx.Int32((a_local_row * K + a_lane_k) * _elem_bytes)
+        lane_src_offset = (a_local_row * K + a_lane_k) * _elem_bytes
         aT_src_wave_base = fx.Int32(0)
         bL_src_wave_base = fx.Int32(0)
 
@@ -599,12 +585,10 @@ def compile_gemm_fp8_8wave(
             # [2k2, 2k1, 16n0, 16k0] is tile for one  DWORDx4 copy per wave.
             # Global offset(n,k) = (n//16)*16*K + (k//16)*256
             #                       + (n%16)*16 + k%16.
-            src_voffset = fx.Int32(
+            src_voffset = (
                 (wave_id // 2) * 16 * K + (wave_id % 2) * 1024 + (tid % 64) * 16
             )
-            lds_wave_offset = rocdl.readfirstlane(
-                T.i32, arith._to_raw(fx.Int32(wave_id * 1024))
-            )
+            lds_wave_offset = rocdl.readfirstlane(T.i32, (wave_id * 1024).ir_value())
 
             def preshuffle_g2s(root_view, quadrant, ki):
                 for chunk in range_constexpr(2):
@@ -615,7 +599,7 @@ def compile_gemm_fp8_8wave(
                         quadrant * BLOCK_N + chunk * 64
                     ) * K + ki * BLOCK_K * 16
 
-                    src_soffset = fx.Int32(vmem_scalar_offset)
+                    src_soffset = vmem_scalar_offset
                     rocdl.raw_ptr_buffer_load_lds(
                         b_dma_rsrc,
                         dest_lds_m0,
@@ -863,44 +847,44 @@ def compile_gemm_fp8_8wave(
                         else:
                             packed_a = acc_a.to(fx.Float16).bitcast(fx.Int32)
                             packed_b = acc_b.to(fx.Float16).bitcast(fx.Int32)
-                            d0_a, d1_a = packed_a[0], packed_a[1]
-                            d0_b, d1_b = packed_b[0], packed_b[1]
+                            d0_a, d1_a = packed_a[0].ir_value(), packed_a[1].ir_value()
+                            d0_b, d1_b = packed_b[0].ir_value(), packed_b[1].ir_value()
 
                         # | lane | d0_a      | d1_a      | d0_b      | d1_b      |
                         # |------|-----------|-----------|-----------|-----------|
-                        # |    0 | [b0,b1]   | [b2,b3]   | [b32,b33] | [b34,b35] |
-                        # |   16 | [b4,b5]   | [b6,b7]   | [b36,b37] | [b38,b39] |
-                        # |   32 | [b8,b9]   | [b10,b11] | [b40,b41] | [b42,b43] |
-                        # |   48 | [b12,b13] | [b14,b15] | [b44,b45] | [b46,b47] |
+                        # |    0 | [b0,b1]   | [b2,b3]   | [b64,b65] | [b66,b67] |
+                        # |   16 | [b4,b5]   | [b6,b7]   | [b68,b69] | [b70,b71] |
+                        # |   32 | [b8,b9]   | [b10,b11] | [b72,b73] | [b74,b75] |
+                        # |   48 | [b12,b13] | [b14,b15] | [b76,b77] | [b78,b79] |
                         # Swap a's odd 16-lane groups with b's even groups
                         # (partner lane = lane_id ^ 16); keep the other values.
 
                         swap0 = rocdl.permlane16_swap(
                             pair_type,
-                            arith._to_raw(d0_a),
-                            arith._to_raw(d0_b),
+                            d0_a,
+                            d0_b,
                             False,
                             False,
                         )
                         # | lane | swap0[0]  | d1_a      | swap0[1]  | d1_b      |
                         # |------|-----------|-----------|-----------|-----------|
-                        # |    0 | [b0,b1]   | [b2,b3]   | [b4,b5]   | [b34,b35] |
-                        # |   16 | [b32,b33] | [b6,b7]   | [b36,b37] | [b38,b39] |
-                        # |   32 | [b8,b9]   | [b10,b11] | [b12,b13] | [b42,b43] |
-                        # |   48 | [b40,b41] | [b14,b15] | [b44,b45] | [b46,b47] |
+                        # |    0 | [b0,b1]   | [b2,b3]   | [b4,b5]   | [b66,b67] |
+                        # |   16 | [b64,b65] | [b6,b7]   | [b68,b69] | [b70,b71] |
+                        # |   32 | [b8,b9]   | [b10,b11] | [b12,b13] | [b74,b75] |
+                        # |   48 | [b72,b73] | [b14,b15] | [b76,b77] | [b78,b79] |
                         swap1 = rocdl.permlane16_swap(
                             pair_type,
-                            arith._to_raw(d1_a),
-                            arith._to_raw(d1_b),
+                            d1_a,
+                            d1_b,
                             False,
                             False,
                         )
                         # | lane | swap0[0]  | swap1[0]  | swap0[1]  | swap1[1]  | columns |
                         # |------|-----------|-----------|-----------|-----------|---------|
                         # |    0 | [b0,b1]   | [b2,b3]   | [b4,b5]   | [b6,b7]   | N0-N7   |
-                        # |   16 | [b32,b33] | [b34,b35] | [b36,b37] | [b38,b39] | N32-N39 |
+                        # |   16 | [b64,b65] | [b66,b67] | [b68,b69] | [b70,b71] | N64-N71 |
                         # |   32 | [b8,b9]   | [b10,b11] | [b12,b13] | [b14,b15] | N8-N15  |
-                        # |   48 | [b40,b41] | [b42,b43] | [b44,b45] | [b46,b47] | N40-N47 |
+                        # |   48 | [b72,b73] | [b74,b75] | [b76,b77] | [b78,b79] | N72-N79 |
                         # repack swap0[0] , swap1[0] , swap0[1]  | swap1[1]
                         packed = Vec.from_elements(
                             [
@@ -926,7 +910,7 @@ def compile_gemm_fp8_8wave(
                             + wave_n * 16
                             + lane_group // 2 * 8
                         )
-                        byte_offset = fx.Int32((row * N + col) * 2)
+                        byte_offset = (row * N + col) * 2
                         if const_expr(N_tail):
                             # N % 8 == 0: each eight-element store is fully in or out.
                             byte_offset = (col < b_rows_left).select(
@@ -977,7 +961,7 @@ def compile_gemm_fp8_8wave(
     ):
         value_attrs = {"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]}
         gemm_kernel(A, B, C, scaleA, scaleB, M, value_attrs=value_attrs).launch(
-            grid=(div_up(M, TILE_M) * div_up(N, TILE_N), 1, 1),
+            grid=(ceildiv(M, TILE_M) * ceildiv(N, TILE_N), 1, 1),
             block=(512, 1, 1),
             stream=stream,
         )
