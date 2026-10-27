@@ -96,12 +96,12 @@ quantization on and off. Its default shapes are ``FUSED_BENCH_SHAPES``.
 
 ``flydsl_allreduce_bench.py`` describes how the comparison is kept unbiased.
 The default payloads are the verify sweep's plus the DeepSeek-V4 decode
-shapes; ``-s`` or ``--shape-csv`` replace them, and the knob options pin the
-one-shot's configuration. ``--candidates`` adds the pinned configurations of
-a candidate file (``flydsl_allreduce_bench.load_candidates``) as more columns
-of the same spawn, and ``--candidate-set`` selects its rows; the tuning suite
-in ``flydsl_allreduce_tuning/`` drives the bench that way. ``--report`` and
-``--csv`` save the tables.
+shapes; ``-s`` or ``--shape-csv`` replace them.
+``--list-candidates`` prints every configuration the one-shot can pin as such
+a file. ``--baselines reference`` times only the stock kernel the one-shot
+replaces, ``cdr`` (``REFERENCE``), or for ``ar_rmsnorm`` ``cdr_fused_1stage``
+and ``cdr_fused_2stage`` (``FUSED_REFERENCE``).
+ ``--report`` and ``--csv`` save the tables.
 
 Every rank is a ``multiprocessing`` spawn worker; one spawn per engine
 configuration and world size runs every sweep. OneShotAllReduce runs on
@@ -201,6 +201,7 @@ GRAPH_INNER = fab.GRAPH_INNER
 CDR_KERNELS = {"cdr": True, "cdr_naive": False}
 # bench: every stock candidate, in the order each spawn captures and times them.
 STOCK = (*CDR_KERNELS, "rccl")
+REFERENCE = ("cdr",)
 # bench: the accuracy floor of the stock kernels. All are exact, at the bf16
 # rounding floor (~55 dB; RCCL a little lower, since it reduces in bf16).
 STOCK_SQNR_FLOOR_DB = 40.0
@@ -210,6 +211,7 @@ BENCH_SHAPES = [(m, HIDDEN) for m in (1, 2, 4, 8)]
 # every candidate. Shared with the quick all-reduce's bench.
 FUSED_STOCK = fab.EXACT_FUSED_STOCK
 FUSED_BENCH_SQNR_FLOOR_DB = fab.EXACT_FUSED_SQNR_FLOOR_DB
+FUSED_REFERENCE = ("cdr_fused_1stage", "cdr_fused_2stage")
 # bench, ar_rmsnorm: default shapes. The decode sizes of the fused one-shot's
 # published comparison (8-168 KiB at hidden 4096 and 7168), then a coarser
 # sweep out to where the quantized schedules take over, at three widths.
@@ -705,13 +707,17 @@ def _bench_rank(
     cases: list[tuple],
     timing: tuple[int, int],
     extra: tuple = (),
+    baselines: str = "all",
 ) -> list[dict]:
     """One rank of one bench spawn: every candidate on every case.
 
     A case is ``(tokens, hidden)``. *extra* is ``(name, knobs)`` per pinned
-    engine from ``--candidates``, timed next to ``flydsl``. Returns, per case,
-    the production candidate's name and each candidate's per-rank result.
+    engine from ``--candidates``, timed next to ``flydsl``. The stock
+    candidates are ``STOCK``, or ``REFERENCE`` at *baselines* ``reference``.
+    Returns, per case, the production candidate's name and each candidate's
+    per-rank result.
     """
+    stock = STOCK if baselines == "all" else REFERENCE
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     tp_group = _init_dist(rank, tp, init_method, stock=True)
@@ -776,8 +782,9 @@ def _bench_rank(
             custom = ca is not None and ca.should_custom_ar(x)
             if custom:
                 for name, use_new in CDR_KERNELS.items():
-                    thunks[name] = _cdr(x, outs[name], use_new)
-            if nccl is not None:
+                    if name in stock:
+                        thunks[name] = _cdr(x, outs[name], use_new)
+            if nccl is not None and "rccl" in stock:
                 # What CudaCommunicator.all_reduce falls back to: an
                 # out-of-place ncclAllReduce on the current stream.
                 thunks["rccl"] = lambda x=x, o=outs["rccl"]: nccl.all_reduce(x, o)
@@ -951,6 +958,8 @@ _DISPATCH: dict[int, list] = {}
 _FAILURES: list[str] = []
 # ``(reps, rounds)`` for every timed graph; set by ``main()``.
 _TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
+# ``--baselines`` of a bench; set by ``main()``.
+_BASELINES = "all"
 
 # Tuning knobs the command line can pin. They are test-function arguments, so
 # they select the engine, but not table columns: the ``variant`` column names
@@ -1006,6 +1015,7 @@ def _bench_ranks(key: tuple) -> list[list[dict]]:
             cases=_CASES[key],
             timing=_TIMING,
             extra=extra,
+            baselines=_BASELINES,
         )
     return _RESULTS[key]
 
@@ -2773,6 +2783,69 @@ def _verify_fused(tps) -> None:
     )
 
 
+def _list_candidates(args) -> list:
+    """``--list-candidates``: every configuration of the one-shot that a
+    candidate row can pin for ``--operation``, as
+    ``flydsl_allreduce_bench.Candidate`` rows.
+
+    The plain one-shot builds every ``block`` x ``atoms`` x ``fanout`` on a flat
+    payload. A fused build sizes its workgroup to the token row, so its rows
+    pin a ``block`` (and ``split``) that one or more of the run's widths has,
+    from the options ``_fused_applies`` checks. A split build rounds its grid
+    cap down to a multiple of ``split``, so no cap below ``split`` is listed.
+    """
+    from aiter.ops.flydsl.allreduce_policy import FANOUT_ORDERS, SUPPORTED_ATOMS
+    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce_rmsnorm import (
+        fused_block_options,
+        fused_padded_block_options,
+        fused_split_options,
+    )
+
+    cus = torch.cuda.get_device_properties(0).multi_processor_count
+
+    def _name(base: str, fanout: str) -> str:
+        return base if fanout == "peer" else f"{base}_{fanout}"
+
+    out = []
+    if args.operation != "ar_rmsnorm":
+        for b, a, f in itertools.product(
+            SUPPORTED_BLOCKS, SUPPORTED_ATOMS, FANOUT_ORDERS
+        ):
+            for g in fab.list_grid_caps(cus):
+                out.append(
+                    fab.Candidate(
+                        _name(f"fly_1stage_b{b}_a{a}_g{g}", f),
+                        "ar",
+                        "oneshot",
+                        {"atoms": a, "grid_cap": g, "fanout": f, "block": b},
+                        (),
+                    )
+                )
+        return out
+    geoms = set()
+    for h in sorted({h for _m, h in (args.mnk or FUSED_BENCH_SHAPES)}):
+        geoms |= {(1, b) for b, _a in fused_block_options(h)}
+        geoms |= {(1, b) for b, _a, _p in fused_padded_block_options(h)}
+        geoms |= {(k, b) for k, b, _a in fused_split_options(h) if k > 1}
+    for k, b in sorted(geoms, key=lambda kb: (kb[0], -kb[1])):
+        for f in FANOUT_ORDERS:
+            for g in fab.list_grid_caps(cus, at_least=k):
+                knobs = {"grid_cap": g, "fanout": f, "block": b}
+                if k > 1:
+                    knobs["split"] = k
+                split = "" if k == 1 else f"_k{k}"
+                out.append(
+                    fab.Candidate(
+                        _name(f"fused_fly_1stage{split}_b{b}_g{g}", f),
+                        "ar_rmsnorm",
+                        "oneshot",
+                        knobs,
+                        (),
+                    )
+                )
+    return out
+
+
 def _candidates(args, operation: str) -> tuple:
     """``(name, knobs)`` of every ``--candidates`` row for the one-shot."""
     if args.candidates is None:
@@ -2826,6 +2899,7 @@ def _bench(args, tps, configs, given, link) -> None:
                 "AITER_QUICK_REDUCE_QUANTIZATION=NONE"
             ),
             "- `flydsl vs X` is `X us / flydsl us`: above 1.0 the one-shot is faster",
+            fab.baselines_line(args.baselines, REFERENCE),
         ],
     )
     fab.write_outputs(args, "FlyDSL one-shot all-reduce bench", header, tables, rows)
@@ -2865,13 +2939,15 @@ def _bench_fused_rank(
     cases: list[tuple],
     timing: tuple[int, int],
     extra: tuple = (),
+    baselines: str = "all",
 ) -> list[dict]:
     """One rank of one ``ar_rmsnorm`` bench spawn: every candidate on every case.
 
     ``flydsl`` is ``OneShotAllReduceRMSNorm`` on the shipped ladder, and
     *extra* the ``--candidates`` engines; the stock candidates are
-    ``FUSED_STOCK``. A case is ``(tokens, hidden)``. Returns, per case, the
-    production candidate's name and each candidate's per-rank result.
+    ``FUSED_STOCK``, or ``FUSED_REFERENCE`` at *baselines* ``reference``. A
+    case is ``(tokens, hidden)``. Returns, per case, the production candidate's
+    name and each candidate's per-rank result.
     """
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
 
@@ -2954,7 +3030,16 @@ def _bench_fused_rank(
             for e in live.values():
                 e.preload(hidden)
             thunks = _fused_thunks(
-                live, ca, nccl, outs, x, residual, weight, ar_buf, eps
+                live,
+                ca,
+                nccl,
+                outs,
+                x,
+                residual,
+                weight,
+                ar_buf,
+                eps,
+                FUSED_STOCK if baselines == "all" else FUSED_REFERENCE,
             )
             graphs, res = {}, {}
             for name, thunk in thunks.items():
@@ -2981,11 +3066,13 @@ def _bench_fused_rank(
     return rows
 
 
-def _fused_thunks(fly, ca, nccl, outs, x, residual, weight, ar_buf, eps) -> dict:
+def _fused_thunks(
+    fly, ca, nccl, outs, x, residual, weight, ar_buf, eps, stock=FUSED_STOCK
+) -> dict:
     """The ``ar_rmsnorm`` bench thunks, by candidate name, for one case.
 
     Every thunk writes into its preallocated ``outs[name]``; the stock ones
-    are ``flydsl_allreduce_bench.exact_fused_thunks``.
+    are the *stock* thunks of ``flydsl_allreduce_bench.exact_fused_thunks``.
     """
     thunks = {}
     for name, e in fly.items():
@@ -2996,7 +3083,9 @@ def _fused_thunks(fly, ca, nccl, outs, x, residual, weight, ar_buf, eps) -> dict
         thunks[name] = _fly
 
     thunks.update(
-        fab.exact_fused_thunks(ca, nccl, outs, x, residual, weight, ar_buf, eps)
+        fab.exact_fused_thunks(
+            ca, nccl, outs, x, residual, weight, ar_buf, eps, keep=stock
+        )
     )
     return thunks
 
@@ -3108,6 +3197,7 @@ def _bench_fused(args, tps, given, link) -> None:
                 + f" at or above {FUSED_BENCH_SQNR_FLOOR_DB:g} dB"
             ),
             "- `n/a`: the candidate cannot run that payload (e.g. above its size gate)",
+            fab.baselines_line(args.baselines, FUSED_REFERENCE),
         ],
     )
     fab.write_outputs(
@@ -3184,8 +3274,12 @@ def main():
     fab.check_bench_args(parser, args)
     if ARCH not in SUPPORTED_ARCHS:
         raise SystemExit(f"OneShotAllReduce is unsupported on {ARCH}")
-    global _TIMING
+    if args.list_candidates:
+        fab.write_candidates(_list_candidates(args))
+        return
+    global _TIMING, _BASELINES
     _TIMING = (args.reps, args.rounds)
+    _BASELINES = args.baselines
 
     tps = fab.select_world_sizes(
         args.tp or list(SUPPORTED_WORLDS),
