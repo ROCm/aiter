@@ -8,6 +8,10 @@ Parses flydsl_mxmoe_* and flydsl_moe2_layout_* rows from the existing model
 configs plus the active FMoE CSV, and warms the FlyDSL disk cache via the same
 runtime entry points, keyed identically so inference hits the cache.
 
+Not part of the AOT build, which replays these rows through ``fused_moe``
+itself (``moe.py``). The MXFP4 tuner's ``--fast-scan`` precompiles its
+candidates with ``jobs_from_rows`` and ``compile_job_batch``.
+
 Standalone:
     python -m aiter.aot.flydsl.mxfp4_moe [--csv /path/to/foo_fp4_tuned_fmoe.csv]
 """
@@ -15,16 +19,16 @@ Standalone:
 import argparse
 import csv
 import glob
+import io
 import os
 import sys
 import time
+from contextlib import nullcontext
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
-# moe.py defers every ``flydsl_moe2_layout_`` name to this module, so a CSV the
-# glob misses gets no AOT job at all and JITs on the first inference call.
 DEFAULT_CSVS = sorted(
     set(
         glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv")
@@ -39,7 +43,6 @@ if os.path.exists(_ACTIVE_FMOE_CSV) and _ACTIVE_FMOE_CSV not in DEFAULT_CSVS:
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
-_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
 def _job_key(job: dict) -> tuple:
@@ -106,8 +109,13 @@ def _job_key(job: dict) -> tuple:
     )
 
 
-def parse_csv(csv_path: str):
-    """Parse a tuned CSV into unique MXMOE-port jobs for each stage and layout."""
+def parse_csv(csv_path):
+    """Parse tuned CSV rows into unique MXMOE-port jobs for each stage and
+    layout.
+
+    ``csv_path`` may be a filesystem path or an already-open text stream (used
+    by ``jobs_from_rows`` for in-memory tuner candidates).
+    """
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
@@ -131,7 +139,13 @@ def parse_csv(csv_path: str):
         seen.add(key)
         jobs.append(job)
 
-    with open(csv_path, newline="") as f:
+    # ``csv_path`` is either a filesystem path or an already-open stream (the
+    # in-memory tuner candidate path), so the context manager is chosen inline.
+    with (
+        nullcontext(csv_path)
+        if hasattr(csv_path, "read")
+        else open(csv_path, newline="")
+    ) as f:
         for row in csv.DictReader(f):
             token = int(row["token"])
             topk = int(row["topk"])
@@ -202,17 +216,18 @@ def parse_csv(csv_path: str):
 
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
-                out_dtype = (
-                    "fp8"
-                    if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
-                    else "bf16"
-                )
+                out_dtype = "bf16"
                 bias_supported = (
                     row.get("q_type", "").strip().split(".")[-1] == "per_1x32"
                     and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
                     and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
                 )
-                enable_bias_options = [False, True] if bias_supported else [False]
+                include_bias_variants = row.get("_include_bias_variants", "1") != "0"
+                enable_bias_options = (
+                    [False, True]
+                    if bias_supported and include_bias_variants
+                    else [False]
+                )
                 count_options = (
                     (False, True) if v2_g2["epilog"] == "atomic" else (False,)
                 )
@@ -277,6 +292,23 @@ def parse_csv(csv_path: str):
                     )
 
     return jobs
+
+
+def jobs_from_rows(rows, *, include_bias_variants=True):
+    """Build deduplicated AOT jobs from in-memory tuner candidate rows."""
+    rows = [
+        dict(row, _include_bias_variants="1" if include_bias_variants else "0")
+        for row in rows
+    ]
+    if not rows:
+        return []
+    stream = io.StringIO()
+    fieldnames = sorted({key for row in rows for key in row})
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    stream.seek(0)
+    return parse_csv(stream)
 
 
 def _dummy(nbytes=256):
@@ -479,6 +511,17 @@ def compile_one_config(**job):
         print(f"  [FAIL] compile  stage{stage}  {shape_str}: {e}")
 
     return result
+
+
+def compile_job_batch(jobs):
+    """Compile a batch in one worker process to amortize AITER import cost."""
+    started = time.monotonic()
+    results = [compile_one_config(**job) for job in jobs]
+    return {
+        "kernel_name": f"mxfp4 batch ({len(jobs)} jobs)",
+        "compile_time": time.monotonic() - started,
+        "results": results,
+    }
 
 
 def main():

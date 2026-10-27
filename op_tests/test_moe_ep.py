@@ -33,6 +33,8 @@ from aiter.test_common import (
 )
 from aiter.utility import fp4_utils
 
+logger = aiter.logger
+
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
 
@@ -399,25 +401,44 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 
 summary_table = []
 
-DEFAULT_EP_CSV_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    "aiter",
-    "configs",
-    "tuned_grouped_fmoe.csv",
-)
+DEFAULT_EP_CSV_PATHS = [
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "aiter", "configs", name)
+    for name in (
+        "tuned_grouped_fmoe.csv",
+        "model_configs/kimik3_gfx1250_tuned_grouped_fmoe.csv",
+    )
+]
 
 
 def run_ep_csv(args):
-    """Check every EP row in the grouped MoE tuning CSV."""
+    """Sweep the requested CSV or all default gfx1250 EP CSVs."""
     if gpu_arch != "gfx1250":
         raise RuntimeError(f"EP CSV requires gfx1250, got {gpu_arch}")
-    with open(args.csv_path, newline="") as csv_file:
+    csv_paths = [args.csv_path] if args.csv_path is not None else DEFAULT_EP_CSV_PATHS
+    failures = []
+    for csv_path in csv_paths:
+        try:
+            _run_ep_csv_file(args, csv_path)
+        except (AssertionError, OSError, ValueError) as exc:
+            failures.append((csv_path, str(exc)))
+            logger.exception("[ep-csv] %s: FAILED", csv_path)
+    if failures:
+        raise AssertionError(f"EP CSV failures: {failures}")
+
+
+def _run_ep_csv_file(args, csv_path):
+    """Check every EP row using this file's runtime tuning configuration."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    os.environ["AITER_CONFIG_GROUPED_FMOE"] = csv_path
+    # The lookup cache is keyed by workload, so invalidate it when switching CSVs.
+    grouped._find_grouped_config.cache_clear()
+    print(f"[ep-csv] sweeping settings from {csv_path}", flush=True)
+    with open(csv_path, newline="") as csv_file:
         rows = list(csv.DictReader(csv_file))
-    ep_rows = [
-        (index, row) for index, row in enumerate(rows) if row["topk"] == "-1"
-    ]
+    ep_rows = [(index, row) for index, row in enumerate(rows) if row["topk"] == "-1"]
     if not ep_rows:
-        raise ValueError(f"No EP rows (topk=-1) in {args.csv_path}")
+        raise ValueError(f"No EP rows (topk=-1) in {csv_path}")
 
     failures = []
     for index, row in ep_rows:
@@ -430,8 +451,11 @@ def run_ep_csv(args):
                 "torch.float8_e4m3fn": "a8w4_mxfp4",
                 "torch.float4_e2m1fn_x2": "a4w4_mxfp4",
             }[row["q_dtype_a"]]
-            if row["act_type"] != "ActivationType.Silu":
-                raise ValueError(f"Unsupported activation: {row['act_type']}")
+            activation = {
+                "ActivationType.Silu": ActivationType.Silu,
+                "ActivationType.Swiglu": ActivationType.Swiglu,
+                "ActivationType.Situv2": ActivationType.Situv2,
+            }[row["act_type"]]
             print(
                 f"\n[ep-csv] row {index}: {quant_label} token={row['token']} "
                 f"model_dim={row['model_dim']} inter_dim={row['inter_dim']} "
@@ -451,13 +475,15 @@ def run_ep_csv(args):
                 ep_mode=args.ep_mode,
                 fake_ep_rank=args.fake_ep_rank,
                 const_init=args.const_init,
+                activation=activation,
             )
         except Exception as exc:  # Keep checking the remaining CSV rows.
             failures.append((index, str(exc)))
-            print(f"[ep-csv] row {index}: FAILED: {exc}", flush=True)
+            logger.exception("[ep-csv] row %s: FAILED", index)
 
     print(
-        f"[ep-csv] {len(ep_rows) - len(failures)}/{len(ep_rows)} rows passed",
+        f"[ep-csv] {csv_path}: "
+        f"{len(ep_rows) - len(failures)}/{len(ep_rows)} rows passed",
         flush=True,
     )
     if failures:
@@ -476,6 +502,7 @@ def test_fmoe_ep_mxfp4(
     ep_mode="real",
     fake_ep_rank=0,
     const_init=None,
+    activation=ActivationType.Silu,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
@@ -770,7 +797,7 @@ def test_fmoe_ep_mxfp4(
             ref_topk_weights,
             local_topk_ids,
             dtype=dtype,
-            activation=ActivationType.Silu,
+            activation=activation,
             quant_type=QuantType.per_1x32,
             a1_scale=a1_scale,
             w1_scale=w1_scale,
@@ -801,6 +828,7 @@ def test_fmoe_ep_mxfp4(
             ref_topk_weights,
             ref_topk_ids,
             expert_mask=expert_mask,
+            activation=activation,
         )
 
     if _gfx == "gfx1250":
@@ -824,7 +852,7 @@ def test_fmoe_ep_mxfp4(
         )
         w2_s = moe_shuffle_scale(w2_scale.contiguous(), experts_cnt=total_local)
         gate_mode = GateMode.INTERLEAVE.value
-        act = ActivationType.Silu
+        act = activation
         if quant_label == "a8w4_mxfp4":
             os.environ["AITER_FORCE_A8W4"] = "1"
         else:
@@ -839,7 +867,7 @@ def test_fmoe_ep_mxfp4(
         w1_s = shuffle_scale_a16w4(w1_scale, total_local, True)
         w2_a = shuffle_weight_a16w4(w2_qt, 16, False)
         w2_s = shuffle_scale_a16w4(w2_scale, total_local, False)
-        act = ActivationType.Silu
+        act = activation
         gate_mode = GateMode.INTERLEAVE.value
         # Force the fp8 (a8w4) kernel regardless of token count. Below the
         # default AITER_BF16_FP8_MOE_BOUND (256) the picker selects bf16/a16w4,
@@ -855,7 +883,7 @@ def test_fmoe_ep_mxfp4(
         w2_s = fp4_utils.e8m0_shuffle(w2_scale)
         w1_a.is_shuffled = True
         w2_a.is_shuffled = True
-        act = ActivationType.Silu
+        act = activation
         gate_mode = GateMode.SEPARATED.value
     else:
         raise ValueError(f"unknown quant_label: {quant_label}")
@@ -871,6 +899,11 @@ def test_fmoe_ep_mxfp4(
     )
     gemm1_us = None
     gemm2_us = None
+    activation_params = (
+        {"beta": 4.0, "linear_beta": 25.0}
+        if activation == ActivationType.Situv2
+        else {}
+    )
     if _ep_kernel_bench and _gfx == "gfx1250":
         from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
 
@@ -890,6 +923,7 @@ def test_fmoe_ep_mxfp4(
                 w1_scale=w1_s,
                 w2_scale=w2_s,
                 num_local_tokens=num_local_tokens,
+                **activation_params,
             )
         finally:
             _grouped.kernel_bench_callable = None
@@ -925,6 +959,7 @@ def test_fmoe_ep_mxfp4(
             num_local_tokens=num_local_tokens,
             num_warmup=3,
             num_iters=128,
+            **activation_params,
         )
 
     # Trim to valid prefix (total_recv rows); the [total_recv, trim_M) tail is padding.
@@ -962,6 +997,7 @@ def test_fmoe_ep_mxfp4(
         {
             "quant": quant_label,
             "ep_mode": ep_mode,
+            "activation": str(activation),
             "routing": routing,
             "global_token": token,
             "total_recv": total_recv,
@@ -1121,8 +1157,9 @@ parser.add_argument(
 )
 parser.add_argument(
     "--csv-path",
-    default=DEFAULT_EP_CSV_PATH,
-    help="Grouped MoE tuning CSV to sweep with -t ep_csv.",
+    default=None,
+    help="Grouped MoE tuning CSV to sweep with -t ep_csv "
+    "(default: all gfx1250 EP CSVs).",
 )
 parser.add_argument(
     "--csv-ep",
@@ -1145,7 +1182,6 @@ if "ep_csv" in args.test:
         parser.error("ep_csv must be selected alone")
     if args.csv_ep < 1 or args.csv_topk < 1:
         parser.error("--csv-ep and --csv-topk must be positive")
-    os.environ["AITER_CONFIG_GROUPED_FMOE"] = args.csv_path
     run_ep_csv(args)
     raise SystemExit(0)
 
