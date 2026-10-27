@@ -3,61 +3,50 @@
 
 """Dispatch layer for jagged_dense_bmm_broadcast_add.
 
-Resolves per-shape kernel config from ``jagged_dense_bmm_dispatch.json``
-(explicit override -> table winner -> defaults). The public wrapper runs
-only on ``SUPPORTED_GFX``; the JSON section is the exact arch from
-``get_gfx_runtime()``. Uniform launches use the plain grid. Every skew
-launch builds a compact TILE_MAP and runs the compact kernel. Tuning
-rationale lives in the JSON; skew XCD remap is gated in
-``_skew_compact_xcd``.
+Uniform winners come from ``jagged_dense_bmm_tuned.csv`` through
+``AITER_CONFIG_JAGGED_DENSE_BMM``. The key is ``gfx``, ``cu_num``, K, N,
+and a power-of-two bucket of the uniform grid. A miss uses
+``analytic_config``. The public wrapper runs only on ``SUPPORTED_GFX``.
+Every skew launch builds a compact TILE_MAP and uses the analytic config;
+skew has no measured XCD rows.
 """
 
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
+import csv
 
 import flydsl.expr as fx
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
-from .kernels.jagged_dense_bmm_gen import BLOCK_M, jagged_dense_bmm
+from .kernels.jagged_dense_bmm_gen import BLOCK_M, BLOCK_N, jagged_dense_bmm
 from .kernels.jdbba_skew_tile_map import build_tile_map_device_fused
 
 __all__ = [
     "SUPPORTED_GFX",
+    "analytic_config",
     "jagged_dense_bmm_dispatched",
     "resolve_config",
-    "shape_id",
+    "tile_bucket",
 ]
 
 # Each entry has its own measured winners. gfx942 is MI300X; gfx950 is MI350.
 # An arch absent from this tuple gets an empty table.
 SUPPORTED_GFX = ("gfx942", "gfx950")
 
-_DISPATCH_TABLES: dict[str, dict] = {}
+_DISPATCH_TABLES: dict[tuple, dict] = {}
 _DISPATCH_CACHE: dict[tuple, dict] = {}
 
-SKEW_COMPACT_XCD_C = 32
-SKEW_COMPACT_XCD_W = 8
-
-_SCHEMA_DEFAULTS = {
-    "xcd_c": None,
-    "xcd_w": None,
-    "skew_xcd_c": None,
-    "skew_xcd_w": None,
-    "block_k": None,
-    "threads": None,
-}
-
-
-def _dispatch_json_paths() -> tuple[Path, ...]:
-    env = os.environ.get("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON")
-    if env:
-        return (Path(env),)
-    return (Path(__file__).resolve().parent / "jagged_dense_bmm_dispatch.json",)
+_XCD_C_SMALL_K = 32
+_XCD_C_LARGE_K = 120
+_XCD_W = 8
+_XCD_C_IDENTITY = 1
+_THREADS = 256
+_BLOCK_K = 64
+_SKEW_REMAP_MIN_GROUPS = 120
+_SKEW_REMAP_MIN_K = 512
 
 
 def _runtime_arch() -> str:
@@ -73,55 +62,59 @@ def _require_supported_arch() -> str:
     return arch
 
 
-def _select_arch_section(data: dict, arch: str | None) -> dict:
-    """Exact ``by_arch`` match. A missing section is an empty table.
+def tile_bucket(n_groups: int, max_seq_len: int, output_n: int) -> int:
+    """Largest power of two not above the uniform grid.
 
-    A flat file (no ``by_arch``) is an explicit override and is returned
-    as written. ``jagged_dense_bmm_dispatched`` checks ``SUPPORTED_GFX``
-    before a table is used to launch.
+    The grid is ``ceil(max_seq_len / BLOCK_M) * (N / BLOCK_N) * n_groups``.
+    Nearby batches that quantize to the same power share one tuned row.
     """
-    by_arch = data.get("by_arch")
-    if not isinstance(by_arch, dict):
-        return data
-    if arch and arch in by_arch:
-        return by_arch[arch]
-    if arch:
-        for sect in by_arch.values():
-            if sect.get("gfx") == arch:
-                return sect
-    return {}
+    bm_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
+    n_blocks = output_n // BLOCK_N
+    tiles = bm_tiles * n_blocks * n_groups
+    if tiles <= 1:
+        return 1
+    return 1 << (tiles.bit_length() - 1)
+
+
+def analytic_config(*, uniform_seqlen: bool, n_groups: int, reduction_k: int) -> dict:
+    """Config used when the tuned table has no row for this launch."""
+    cfg = {"threads": _THREADS, "block_k": _BLOCK_K, "xcd_w": _XCD_W}
+    if not uniform_seqlen:
+        if n_groups > _SKEW_REMAP_MIN_GROUPS or reduction_k >= _SKEW_REMAP_MIN_K:
+            cfg["xcd_c"] = _XCD_C_SMALL_K
+            return cfg
+        cfg["xcd_c"] = _XCD_C_IDENTITY
+        cfg["xcd_w"] = _XCD_C_IDENTITY
+        return cfg
+    cfg["xcd_c"] = _XCD_C_LARGE_K if reduction_k > 256 else _XCD_C_SMALL_K
+    return cfg
 
 
 def _load_dispatch_table() -> dict:
+    """Uniform winners for the live ``gfx`` and ``cu_num``."""
     arch = _runtime_arch()
-    cached = _DISPATCH_TABLES.get(arch)
+    cu = int(get_cu_num())
+    path = AITER_CONFIGS.AITER_CONFIG_JAGGED_DENSE_BMM_FILE
+    cache_key = (arch, cu, path)
+    cached = _DISPATCH_TABLES.get(cache_key)
     if cached is not None:
         return cached
-    for path in _dispatch_json_paths():
-        if path.is_file():
-            data = json.loads(path.read_text())
-            section = _select_arch_section(data, arch)
-            table = {
-                "gfx": section.get("gfx"),
-                "winners": dict(section.get("winners") or {}),
+    winners: dict[tuple[int, int, int], dict] = {}
+    with open(path, newline="") as fh:
+        for row in csv.DictReader(fh):
+            if row.get("gfx") != arch or int(float(row["cu_num"])) != cu:
+                continue
+            if row.get("regime") != "uniform":
+                continue
+            winners[(int(row["K"]), int(row["N"]), int(row["tile_bucket"]))] = {
+                "xcd_c": int(row["xcd_c"]),
+                "xcd_w": int(row["xcd_w"]),
+                "threads": int(row["threads"]),
+                "block_k": int(row["block_k"]),
             }
-            _DISPATCH_TABLES[arch] = table
-            return table
-    table = {"gfx": None, "winners": {}}
-    _DISPATCH_TABLES[arch] = table
+    table = {"gfx": arch if winners else None, "winners": winners}
+    _DISPATCH_TABLES[cache_key] = table
     return table
-
-
-def shape_id(
-    *, n_groups: int, reduction_k: int, output_n: int, max_seq_len: int
-) -> str:
-    return f"B{n_groups}D{reduction_k}K{output_n}N{max_seq_len}"
-
-
-def _coerce(v):
-    if v is None:
-        return None
-    return int(v)
 
 
 def _packed_rows(jagged) -> int:
@@ -150,30 +143,11 @@ def _as_torch_stream(stream, device):
     raise TypeError(f"unsupported stream {stream!r}")
 
 
-_SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
-
-
-def _skew_compact_xcd(n_groups: int, reduction_k: int) -> tuple[int | None, int | None]:
-    if n_groups > _SKEW_XCD_REMAP_SMALL_B_THRESHOLD or reduction_k >= 512:
-        return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
-    return None, None
-
-
-def _normalize_cfg(cfg: dict) -> dict:
-    return {
-        key: _coerce(cfg.get(key, default)) for key, default in _SCHEMA_DEFAULTS.items()
-    }
-
-
 def _config_valid(cfg: dict, *, reduction_k: int) -> bool:
     bk = cfg.get("block_k")
     if bk is None:
         bk = 64
     return not (reduction_k % bk != 0 or reduction_k // bk < 2)
-
-
-def _heuristic_dispatch() -> dict:
-    return _normalize_cfg({})
 
 
 def resolve_config(
@@ -182,17 +156,22 @@ def resolve_config(
     reduction_k: int,
     output_n: int,
     max_seq_len: int,
+    uniform_seqlen: bool = True,
     xcd_c: int | None = None,
     xcd_w: int | None = None,
     block_k: int | None = None,
 ) -> dict:
+    bucket = tile_bucket(n_groups, max_seq_len, output_n)
     arch = _runtime_arch()
+    cu = int(get_cu_num())
     key = (
         arch,
-        n_groups,
+        cu,
+        uniform_seqlen,
         reduction_k,
         output_n,
-        max_seq_len,
+        bucket,
+        n_groups > _SKEW_REMAP_MIN_GROUPS,
         xcd_c,
         xcd_w,
         block_k,
@@ -201,30 +180,22 @@ def resolve_config(
     if cached is not None:
         return cached
 
-    explicit = {
-        "xcd_c": xcd_c,
-        "xcd_w": xcd_w,
-        "block_k": block_k,
-    }
-
-    table = _load_dispatch_table()
-    sid = shape_id(
+    cfg = analytic_config(
+        uniform_seqlen=uniform_seqlen,
         n_groups=n_groups,
         reduction_k=reduction_k,
-        output_n=output_n,
-        max_seq_len=max_seq_len,
     )
-    entry = table["winners"].get(sid)
-    if entry is not None:
-        cfg = _normalize_cfg(entry)
-        if not _config_valid(cfg, reduction_k=reduction_k):
-            cfg = _heuristic_dispatch()
-    else:
-        cfg = _heuristic_dispatch()
+    if uniform_seqlen:
+        entry = _load_dispatch_table()["winners"].get((reduction_k, output_n, bucket))
+        if entry is not None and _config_valid(entry, reduction_k=reduction_k):
+            cfg = dict(entry)
 
-    for k, v in explicit.items():
-        if v is not None:
-            cfg[k] = int(v)
+    if xcd_c is not None:
+        cfg["xcd_c"] = int(xcd_c)
+    if xcd_w is not None:
+        cfg["xcd_w"] = int(xcd_w)
+    if block_k is not None:
+        cfg["block_k"] = int(block_k)
 
     _DISPATCH_CACHE[key] = cfg
     return cfg
@@ -240,7 +211,7 @@ def jagged_dense_bmm_dispatched(
     max_seq_len: int,
     stream=None,
     uniform_seqlen: bool = True,
-    # explicit overrides (None -> dispatch table / heuristic / kernel default)
+    # explicit overrides (None -> tuned row, else analytic_config)
     xcd_c: int | None = None,
     xcd_w: int | None = None,
     block_k: int | None = None,
@@ -253,6 +224,7 @@ def jagged_dense_bmm_dispatched(
         reduction_k=reduction_k,
         output_n=output_n,
         max_seq_len=max_seq_len,
+        uniform_seqlen=uniform_seqlen,
         xcd_c=xcd_c,
         xcd_w=xcd_w,
         block_k=block_k,
@@ -273,7 +245,6 @@ def jagged_dense_bmm_dispatched(
             block_m=BLOCK_M,
             stream=stream,
         )
-        sc_xcd_c, sc_xcd_w = _skew_compact_xcd(n_groups, reduction_k)
         return jagged_dense_bmm(
             C,
             A,
@@ -283,10 +254,11 @@ def jagged_dense_bmm_dispatched(
             n_groups,
             max_seq_len,
             stream=stream,
-            xcd_c=sc_xcd_c,
-            xcd_w=sc_xcd_w,
+            xcd_c=cfg["xcd_c"],
+            xcd_w=cfg["xcd_w"],
             uniform_seqlen=False,
-            block_k=cfg.get("block_k"),
+            block_k=cfg["block_k"],
+            threads=cfg["threads"],
             tile_map=tile_map,
             total_occ_tiles=ub,
         )
@@ -303,6 +275,6 @@ def jagged_dense_bmm_dispatched(
         xcd_c=cfg["xcd_c"],
         xcd_w=cfg["xcd_w"],
         uniform_seqlen=True,
-        block_k=cfg.get("block_k"),
-        threads=_coerce(cfg.get("threads")),
+        block_k=cfg["block_k"],
+        threads=cfg["threads"],
     )

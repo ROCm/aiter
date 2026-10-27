@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import json
 import os
 import tempfile
 from unittest import mock
@@ -16,14 +15,16 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl import jagged_dense_bmm_dispatch as jdbba_dispatch
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
     SUPPORTED_GFX,
     _load_dispatch_table,
+    analytic_config,
     jagged_dense_bmm_dispatched,
     resolve_config,
-    shape_id,
+    tile_bucket,
 )
 from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import (
     _LAUNCHER_CACHE,
@@ -46,6 +47,8 @@ SEED = 1234
 # on the live card and on SUPPORTED_GFX.
 _ARCH_SECTION_CASES = ("gfx942", "gfx950", "gfx1250", "unknown")
 _ARCH_SHAPE = (120, 256, 256, 7680)
+# cu_num stamped on the measuring part: full MI300X, and this MI350.
+_MEASURED_CU = {"gfx942": 304, "gfx950": 256}
 
 try:
     from generative_recommenders.ops.triton.triton_jagged import (
@@ -265,12 +268,17 @@ def test_jdbba_skew_varying_L(B, D, Kout, Mi, seed, dtype):
 @benchmark()
 def test_jdbba_dispatch(B, D, Kout, Mi):
     winners = _load_dispatch_table().get("winners") or {}
-    sid = shape_id(n_groups=B, reduction_k=D, output_n=Kout, max_seq_len=Mi)
+    key = (D, Kout, tile_bucket(B, Mi, Kout))
     cfg = resolve_config(n_groups=B, reduction_k=D, output_n=Kout, max_seq_len=Mi)
-    in_table = sid in winners
+    in_table = key in winners
     if in_table:
-        w = winners[sid]
-        routing_ok = cfg["xcd_c"] == w["xcd_c"] and cfg["xcd_w"] == w["xcd_w"]
+        w = winners[key]
+        routing_ok = (
+            cfg["xcd_c"] == w["xcd_c"]
+            and cfg["xcd_w"] == w["xcd_w"]
+            and cfg["threads"] == w["threads"]
+            and cfg["block_k"] == w["block_k"]
+        )
     else:
         routing_ok = True
 
@@ -299,7 +307,7 @@ def test_jdbba_dispatch(B, D, Kout, Mi):
         got.to(dtypes.fp32),
         rtol=1e-2,
         atol=1e-2,
-        msg=f"dispatch {sid}",
+        msg=f"dispatch B{B} D{D} K{Kout} Mi{Mi}",
     )
     flops = 2 * L * K * N
     nbytes = (L * K + B * K * N + B * N + L * N) * d["jagged"].element_size()
@@ -630,11 +638,12 @@ def test_jdbba_tile_map_inplace(B, D, Kout, Mi, dtype):
 def _clear_dispatch_cache():
     jdbba_dispatch._DISPATCH_TABLES.clear()
     jdbba_dispatch._DISPATCH_CACHE.clear()
+    AITER_CONFIGS.get_config_file.cache_clear()
 
 
-def _arch_shape_id():
+def _arch_winner_key():
     B, D, Kout, Mi = _ARCH_SHAPE
-    return shape_id(n_groups=B, reduction_k=D, output_n=Kout, max_seq_len=Mi)
+    return (D, Kout, tile_bucket(B, Mi, Kout))
 
 
 def _resolve_arch_shape():
@@ -660,9 +669,24 @@ def _check_shipped_section(arch):
         if selected != arch:
             raise AssertionError(f"{arch} loaded section {selected!r}")
         cfg = _resolve_arch_shape()
-        winner = table["winners"][_arch_shape_id()]
-        if cfg["xcd_c"] != winner["xcd_c"] or cfg["xcd_w"] != winner["xcd_w"]:
+        winner = table["winners"][_arch_winner_key()]
+        if (
+            cfg["xcd_c"] != winner["xcd_c"]
+            or cfg["xcd_w"] != winner["xcd_w"]
+            or cfg["threads"] != winner["threads"]
+            or cfg["block_k"] != winner["block_k"]
+        ):
             raise AssertionError(f"{arch} config {cfg} diverged from {winner}")
+        B, D, Kout, Mi = _ARCH_SHAPE
+        near = resolve_config(
+            n_groups=128, reduction_k=D, output_n=Kout, max_seq_len=Mi
+        )
+        if near["xcd_c"] != winner["xcd_c"] or near["threads"] != winner["threads"]:
+            raise AssertionError(f"{arch} B=128 missed the B={B} tile bucket")
+        miss = resolve_config(n_groups=4, reduction_k=D, output_n=Kout, max_seq_len=128)
+        expect = analytic_config(uniform_seqlen=True, n_groups=4, reduction_k=D)
+        if miss["xcd_w"] != expect["xcd_w"] or miss["threads"] != expect["threads"]:
+            raise AssertionError(f"{arch} empty bucket used {miss}")
         jdbba_dispatch._require_supported_arch()
         return selected, 0
     if selected or table["winners"]:
@@ -673,66 +697,76 @@ def _check_shipped_section(arch):
 
 
 def _check_multisection_override(arch):
-    """A file with two sections yields the runtime arch's section only."""
-    sid = _arch_shape_id()
-    payload = {
-        "schema": "arch-keyed-v1",
-        "by_arch": {
-            "gfx942": {
-                "gfx": "gfx942",
-                "winners": {sid: {"xcd_c": 32, "xcd_w": 16}},
-            },
-            "gfx950": {
-                "gfx": "gfx950",
-                "winners": {sid: {"xcd_c": 7, "xcd_w": 3}},
-            },
-        },
+    """A CSV with two archs yields the runtime arch's row only."""
+    _k, _n, bucket = _arch_winner_key()
+    rows = {
+        "gfx942": {"xcd_c": 32, "xcd_w": 16, "threads": 512},
+        "gfx950": {"xcd_c": 7, "xcd_w": 3, "threads": 128},
     }
     with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "dispatch.json")
+        path = os.path.join(tmp, "jagged_dense_bmm_tuned.csv")
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
+            lines = [
+                "gfx,cu_num,regime,K,N,tile_bucket,xcd_c,xcd_w,threads,block_k,us\n"
+            ]
+            lines.extend(
+                f"{gfx},{_MEASURED_CU[gfx]},uniform,{_k},{_n},{bucket},"
+                f"{cfg['xcd_c']},{cfg['xcd_w']},{cfg['threads']},64,1\n"
+                for gfx, cfg in rows.items()
+            )
+            fh.writelines(lines)
+        os.environ["AITER_CONFIG_JAGGED_DENSE_BMM"] = path
+        # The retired env must not select a table.
         os.environ["FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON"] = path
         _clear_dispatch_cache()
         table = _load_dispatch_table()
-    selected = table.get("gfx") or ""
-    if arch in payload["by_arch"]:
-        expect = payload["by_arch"][arch]["winners"][sid]
-        cfg = _resolve_arch_shape()
-        if (
-            selected != arch
-            or cfg["xcd_c"] != expect["xcd_c"]
-            or cfg["xcd_w"] != expect["xcd_w"]
-        ):
-            raise AssertionError(
-                f"{arch} override selected {selected!r} "
-                f"xcd_c={cfg['xcd_c']} xcd_w={cfg['xcd_w']}"
-            )
-    elif selected or table["winners"]:
-        raise AssertionError(f"{arch} override loaded section {selected!r}")
+        selected = table.get("gfx") or ""
+        if arch in rows:
+            expect = rows[arch]
+            cfg = _resolve_arch_shape()
+            if (
+                selected != arch
+                or cfg["xcd_c"] != expect["xcd_c"]
+                or cfg["xcd_w"] != expect["xcd_w"]
+                or cfg["threads"] != expect["threads"]
+            ):
+                raise AssertionError(
+                    f"{arch} override selected {selected!r} "
+                    f"xcd_c={cfg['xcd_c']} xcd_w={cfg['xcd_w']} threads={cfg['threads']}"
+                )
+        elif selected or table["winners"]:
+            raise AssertionError(f"{arch} override loaded section {selected!r}")
     return selected
 
 
 @benchmark()
 def test_jdbba_arch_section(arch):
-    """Which JSON section the runtime arch owns, and whether launch is refused.
+    """Which tuned rows the runtime arch owns, and whether launch is refused.
 
     Host selection only: the row records the section and the pre-compile refusal.
     """
     spoof = "gfx950" if arch == "gfx942" else "gfx942"
     os.environ["FLYDSL_JAGGED_DENSE_BMM_ARCH"] = spoof
-    prev_json = os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON", None)
+    prev_config = os.environ.pop("AITER_CONFIG_JAGGED_DENSE_BMM", None)
     try:
-        with mock.patch.object(jdbba_dispatch, "get_gfx_runtime", return_value=arch):
+        with (
+            mock.patch.object(jdbba_dispatch, "get_gfx_runtime", return_value=arch),
+            mock.patch.object(
+                jdbba_dispatch, "get_cu_num", return_value=_MEASURED_CU.get(arch, 0)
+            ),
+        ):
             selected, raised = _check_shipped_section(arch)
             override = _check_multisection_override(arch)
-        if prev_json is None:
-            os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON", None)
-        else:
-            os.environ["FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON"] = prev_json
+        os.environ.pop("AITER_CONFIG_JAGGED_DENSE_BMM", None)
+        if prev_config is not None:
+            os.environ["AITER_CONFIG_JAGGED_DENSE_BMM"] = prev_config
         if arch == get_gfx():
             _clear_dispatch_cache()
             if arch in SUPPORTED_GFX:
+                if get_cu_num() != _MEASURED_CU[arch]:
+                    raise AssertionError(
+                        f"live cu_num {get_cu_num()} has no {arch} winners"
+                    )
                 live = _load_dispatch_table().get("gfx") or ""
                 if live != arch:
                     raise AssertionError(f"live {get_gfx()} loaded section {live!r}")
@@ -741,10 +775,11 @@ def test_jdbba_arch_section(arch):
                 raise AssertionError(f"live {get_gfx()} did not raise before compile")
     finally:
         os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_ARCH", None)
-        if prev_json is None:
-            os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON", None)
+        os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON", None)
+        if prev_config is None:
+            os.environ.pop("AITER_CONFIG_JAGGED_DENSE_BMM", None)
         else:
-            os.environ["FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON"] = prev_json
+            os.environ["AITER_CONFIG_JAGGED_DENSE_BMM"] = prev_config
         _clear_dispatch_cache()
     return {
         "gfx": get_gfx(),

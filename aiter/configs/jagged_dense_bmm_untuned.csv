@@ -1,0 +1,6 @@
+regime,K,N,tile_bucket
+uniform,256,256,8192
+uniform,512,512,16384
+uniform,256,256,65536
+uniform,512,512,131072
+uniform,512,1024,32768

@@ -36,9 +36,6 @@ K_TILE_GRAN = 32  # MFMA K-tile loop uses BLOCK_K // 32 stages
 _DEFAULT_STREAM = fx.Stream(None)
 
 NXCD = 8
-XCD_W = 8
-XCD_C_SMALL_K = 32
-XCD_C_LARGE_K = 120
 
 
 def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
@@ -505,15 +502,18 @@ def jagged_dense_bmm(
             f"block_k={block_k} needs {epi_smem} bytes LDS (max {LDS_BYTES}); "
             f"A-stage staging is {a_smem} bytes"
         )
-    if xcd_c is None:
-        if not uniform_seqlen:
-            xcd_c = 1
-        elif K > 256:
-            xcd_c = XCD_C_LARGE_K
-        else:
-            xcd_c = XCD_C_SMALL_K
-    if xcd_w is None:
-        xcd_w = 1 if xcd_c == 1 else XCD_W
+    if xcd_c is None or xcd_w is None:
+        # One owner for the analytic XCD choice. Imported here so this module
+        # can load without the dispatch table.
+        from aiter.ops.flydsl.jagged_dense_bmm_dispatch import analytic_config
+
+        filled = analytic_config(
+            uniform_seqlen=uniform_seqlen, n_groups=n_groups, reduction_k=K
+        )
+        if xcd_c is None:
+            xcd_c = filled["xcd_c"]
+        if xcd_w is None:
+            xcd_w = filled["xcd_w"]
     nthreads = THREADS if threads is None else threads
     compact = tile_map is not None
 

@@ -227,6 +227,11 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+AITER_CONFIG_JAGGED_DENSE_BMM = os.getenv(
+    "AITER_CONFIG_JAGGED_DENSE_BMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/jagged_dense_bmm_tuned.csv",
+)
+
 # Per-model tuned rows live under model_configs/
 # (qwenimage_vae_bf16_tuned_conv3d.csv, wan21_vae_bf16_tuned_conv3d.csv) and
 # get merged into this canonical file by get_config_file. It ships header-only.
@@ -411,6 +416,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_JAGGED_DENSE_BMM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_JAGGED_DENSE_BMM",
+            AITER_CONFIG_JAGGED_DENSE_BMM,
+            "jagged_dense_bmm_tuned",
         )
 
     @property
