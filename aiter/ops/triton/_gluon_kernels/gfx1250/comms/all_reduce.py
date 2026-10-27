@@ -132,7 +132,7 @@ def _receive(
 _all_reduce_repr = make_kernel_repr("_all_reduce_kernel", ["RANK", "LINES"])
 
 
-@gluon.jit(repr=_all_reduce_repr, do_not_specialize=["n_words"])
+@gluon.jit(repr=_all_reduce_repr, do_not_specialize=["n_words", "programs"])
 def _all_reduce_kernel(
     x,
     y,
@@ -140,23 +140,27 @@ def _all_reduce_kernel(
     calls,
     err,
     n_words,
+    programs,
     RANK: gl.constexpr,
     LINES: gl.constexpr,
     SLOT: gl.constexpr,
     MAXIT: gl.constexpr,
 ):
     """y = the sum of x over 4 ranks, as n_words words of two bf16 values.
-    Programs 0 to C-1 send the C chunks and programs C to 2C-1 receive them: the
-    GPU starts programs in order, so a waiting receiver cannot block a sender."""
+    Programs 0 to C-1 send the C chunks, one each: a load after a remote store
+    waits for its ack. Programs C to C+P-1 receive chunks p, p + P, ...
+    (P = programs), so at most P receivers poll and other kernels can still start.
+    The GPU starts programs in order, so a waiting receiver cannot block a sender."""
     num_chunks = gl.cdiv(n_words, 2 * LINES)
     pid = gl.program_id(0)
     if pid < num_chunks:
         _send(x, inboxes, calls, pid, n_words, RANK, LINES, SLOT)
     else:
-        w0, w1, w2, w3, word, word_ok = _receive(
-            x, inboxes, calls, err, pid - num_chunks, n_words, RANK, LINES, SLOT, MAXIT
-        )
-        # Rank order in fp32, so that all ranks get the same bits.
-        lo = _lo(w0) + _lo(w1) + _lo(w2) + _lo(w3)
-        hi = _hi(w0) + _hi(w1) + _hi(w2) + _hi(w3)
-        gl.store(y + word, _pack(lo, hi), mask=word_ok)
+        for c in range(pid - num_chunks, num_chunks, programs):
+            w0, w1, w2, w3, word, word_ok = _receive(
+                x, inboxes, calls, err, c, n_words, RANK, LINES, SLOT, MAXIT
+            )
+            # Rank order in fp32, so that all ranks get the same bits.
+            lo = _lo(w0) + _lo(w1) + _lo(w2) + _lo(w3)
+            hi = _hi(w0) + _hi(w1) + _hi(w2) + _hi(w3)
+            gl.store(y + word, _pack(lo, hi), mask=word_ok)

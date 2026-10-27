@@ -12,6 +12,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 _HIDDEN = {}  # the hidden size of each state, by the address of its calls tensor
+_ROW_PROGRAMS = 512  # receivers: more polling receivers can fill the GPU
 
 
 def all_reduce_rmsnorm_quant(
@@ -61,7 +62,8 @@ def all_reduce_rmsnorm_quant(
             (tokens, hidden // 128), dtype=torch.float32, device=x.device
         )
     lines = hidden // 4  # a row is hidden / 4 lines of 16 bytes
-    _all_reduce_rmsnorm_kernel[(2 * tokens,)](
+    programs = min(tokens, _ROW_PROGRAMS)
+    _all_reduce_rmsnorm_kernel[(tokens + programs,)](
         x.view(torch.int32),
         residual.view(torch.int32),
         weight.view(torch.int32),
@@ -73,6 +75,7 @@ def all_reduce_rmsnorm_quant(
         calls,
         calls[-1:],
         tokens,
+        programs,
         eps,
         RANK=dist.get_rank(group),
         LINES=lines,

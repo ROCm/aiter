@@ -13,8 +13,9 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-_LINES = 64  # lines of one program: 2 for each lane of one wave
+_LINES = 64  # lines of one chunk: 2 for each lane of one wave
 _MAXIT = 20_000_000  # poll limit, some seconds: a peer can still be compiling
+_PROGRAMS = 2048  # receivers: more polling receivers can fill the GPU
 
 
 class _IpcHandle(ctypes.Structure):  # hipIpcMemHandle_t
@@ -102,13 +103,16 @@ def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
     _LOGGER.info("ALL_REDUCE [gluon]: x=%s", x.shape)
 
     y = torch.empty_like(x)
-    _all_reduce_kernel[(2 * triton.cdiv(n_words, 2 * _LINES),)](
+    num_chunks = triton.cdiv(n_words, 2 * _LINES)
+    programs = min(num_chunks, _PROGRAMS)
+    _all_reduce_kernel[(num_chunks + programs,)](
         x.view(-1).view(torch.int32),  # flat first: the last dim can be odd
         y.view(-1).view(torch.int32),
         inboxes,
         calls,
         calls[-1:],
         n_words,
+        programs,
         RANK=dist.get_rank(group),
         LINES=_LINES,
         SLOT=4 * _LINES * chunks,
