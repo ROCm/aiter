@@ -20,7 +20,6 @@ import argparse
 import csv
 import glob
 import io
-import math
 import os
 import sys
 import time
@@ -107,29 +106,6 @@ def _job_key(job: dict) -> tuple:
     )
 
 
-def resolve_swiglu_limit(
-    swiglu_limit: "object" = None,
-) -> "tuple[float | None, str]":
-    """Return the validated SiLU/SwiGLU clamp limit and the name it came from.
-
-    ``None`` falls back to AITER_MXFP4_TUNE_SWIGLU_LIMIT; an unset or empty
-    variable keeps the activation default (``None``).
-    """
-    source = "swiglu_limit"
-    if swiglu_limit is None:
-        swiglu_limit = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT") or None
-        source = "AITER_MXFP4_TUNE_SWIGLU_LIMIT"
-    if swiglu_limit is None:
-        return None, source
-    try:
-        limit = float(swiglu_limit)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{source} must be a finite positive number") from error
-    if not math.isfinite(limit) or limit <= 0:
-        raise ValueError(f"{source} must be a finite positive number")
-    return limit, source
-
-
 def parse_csv(
     csv_path: "str | io.TextIOBase", swiglu_limit: float | None = None
 ) -> "list[dict[str, object]]":
@@ -145,6 +121,7 @@ def parse_csv(
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
+        resolve_swiglu_limit,
     )
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (

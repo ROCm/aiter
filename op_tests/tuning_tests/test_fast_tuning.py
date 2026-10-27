@@ -18,6 +18,49 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 class TestFastScanCliSafety(unittest.TestCase):
+    def test_mxfp4_parse_args_does_not_import_aot_module(self) -> None:
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        for options in ((), ("--mxfp4-search-mode", "full"), ("--fast-scan",)):
+            with self.subTest(options=options):
+                tuner = gemm_moe_tune.Mxfp4FlydslTuner(
+                    "testMxfp4", [], [], "test parser"
+                )
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        ["gemm_moe_tune.py", "--mxfp4-flydsl", *options],
+                    ),
+                    mock.patch.dict(sys.modules, {"aiter.aot.flydsl.mxfp4_moe": None}),
+                    mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "5"}),
+                ):
+                    args = tuner.parse_args()
+                self.assertEqual(args.mxfp4_configuration, {"swiglu_limit": 5.0})
+
+    def test_mxfp4_parse_args_validates_limit_without_importing_aot(self) -> None:
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        for limit in ("abc", "0", "-1", "nan", "inf"):
+            with self.subTest(limit=limit):
+                tuner = gemm_moe_tune.Mxfp4FlydslTuner(
+                    "testMxfp4", [], [], "test parser"
+                )
+                with (
+                    mock.patch.object(
+                        sys, "argv", ["gemm_moe_tune.py", "--mxfp4-flydsl"]
+                    ),
+                    mock.patch.dict(sys.modules, {"aiter.aot.flydsl.mxfp4_moe": None}),
+                    mock.patch.dict(
+                        os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": limit}
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "AITER_MXFP4_TUNE_SWIGLU_LIMIT must be a finite positive number",
+                    ),
+                ):
+                    tuner.parse_args()
+
     def test_generic_fmoe_rejects_fast_scan_before_dispatch(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
@@ -884,6 +927,27 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
 
 
 class TestGlm53TunedArtifact(unittest.TestCase):
+    def test_aot_stage1_jobs_use_shared_limit_resolution(self) -> None:
+        from aiter.aot.flydsl.mxfp4_moe import parse_csv
+
+        row = (
+            "token,model_dim,inter_dim,expert,topk,kernelName1\n"
+            "64,3072,512,128,4,flydsl_mxmoe_g1_a4w4_16x256x256_f16in_swiglu\n"
+        )
+        for environment, explicit, expected in (
+            ("", None, 7.0),
+            ("5", None, 5.0),
+            ("5", 3.0, 3.0),
+        ):
+            with (
+                self.subTest(environment=environment, explicit=explicit),
+                mock.patch.dict(
+                    os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": environment}
+                ),
+            ):
+                jobs = parse_csv(io.StringIO(row), swiglu_limit=explicit)
+                self.assertEqual({job["swiglu_limit"] for job in jobs}, {expected})
+
     def test_token_one_row_matches_validated_coupled_winner(self):
         config = REPO_ROOT / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
         with config.open(newline="") as handle:

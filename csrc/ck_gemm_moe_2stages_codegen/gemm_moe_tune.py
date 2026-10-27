@@ -62,6 +62,7 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
     get_flydsl_activation_name,
+    resolve_swiglu_limit,
 )
 from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage1,
@@ -6837,8 +6838,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     @staticmethod
     def _capture_configuration() -> "dict[str, float | None]":
-        from aiter.aot.flydsl.mxfp4_moe import resolve_swiglu_limit
-
         limit, _source = resolve_swiglu_limit()
         return {"swiglu_limit": limit}
 
