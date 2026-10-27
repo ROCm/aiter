@@ -129,7 +129,11 @@ def fused_recurrent_kda(
     use_rms_gate = out_gate is not None
     W = conv_weight.shape[1] if use_conv else 4
     if use_conv:
-        assert conv_weight.shape == (3, W, H * K) and conv_weight.is_contiguous()
+        # [3, W, H*K] with any strides, or [3*H*K, W] (e.g. a [3*H*K, 1, W]
+        # conv1d weight viewed as 2-D), read as its transposed [3, W, H*K] view
+        if conv_weight.dim() == 2:
+            conv_weight = conv_weight.view(3, H * K, W).transpose(1, 2)
+        assert conv_weight.shape == (3, W, H * K)
         assert conv_state.shape[1] == 3 * H * K and HV * V == H * K
         if num_accepted_tokens is None:
             assert conv_state.shape[2] >= W - 1
@@ -359,6 +363,9 @@ def fused_recurrent_kda(
         stride_cs_slot=conv_state.stride(0) if use_conv else 0,
         stride_cs_dim=conv_state.stride(1) if use_conv else 0,
         stride_cs_pos=conv_state.stride(2) if use_conv else 0,
+        stride_cw_group=conv_weight.stride(0) if use_conv else 0,
+        stride_cw_width=conv_weight.stride(1) if use_conv else 0,
+        stride_cw_ch=conv_weight.stride(2) if use_conv else 0,
         scale=scale,
         H=H,
         HV=HV,
