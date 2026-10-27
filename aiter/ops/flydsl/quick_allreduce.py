@@ -826,14 +826,20 @@ class FlyQuickAllReduceRMSNorm:
         """
         hidden = int(hidden)
         want = self._row_atoms(hidden)
-        if self._native_opts(hidden):
-            block, apr = quick_reduce_row_block_for(
-                hidden,
-                self.world_size,
-                block=self.block,
-                atoms_per_row=want,
-                wide_rows=self._wide_rows(hidden),
-            )
+        native = self._native_opts(hidden)
+        if native:
+            if want is not None and self.block is None:
+                # Pick among the options this schedule can build, not every
+                # legal one: a block the fanout cannot fill is not a candidate.
+                block, apr = min(native, key=lambda ba: (abs(ba[1] - want), ba[1]))
+            else:
+                block, apr = quick_reduce_row_block_for(
+                    hidden,
+                    self.world_size,
+                    block=self.block,
+                    atoms_per_row=want,
+                    wide_rows=self._wide_rows(hidden),
+                )
             if want is not None and apr != want and hidden not in self._apr_substituted:
                 # The width has no block for the requested atoms_per_row,
                 # so it takes the earest it has.
