@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from aiter import per_tensor_quant, pertoken_quant
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 
 @pytest.fixture
@@ -637,6 +637,13 @@ _FP8_CASES = _COMMON_CASES + [
 ]
 _BF16_CASES = _COMMON_CASES + [
     *_ASYMMETRIC_MULTIHEAD_CASES,
+    *[
+        (
+            f"asymmetric-gqa8-kv2-w{geometry['window']}",
+            dict(geometry, group_size=8, kv_heads=2),
+        )
+        for _, geometry in _ASYMMETRIC_MULTIHEAD_CASES
+    ],
     *_ASYMMETRIC_WINDOW_CASES,
     (
         "asymmetric-full",
@@ -1064,8 +1071,10 @@ def test_pa_decode(case, device, monkeypatch):
         )
     )
     value_dim = head_dim if case["value_dim"] is None else case["value_dim"]
-    if value_dim != head_dim and get_gfx() != "gfx950":
-        pytest.skip("asymmetric Q/K and V widths require gfx950")
+    if value_dim != head_dim and not (
+        arch == "gfx950" or (arch == "gfx942" and case["kv_dtype"] == "bf16")
+    ):
+        pytest.skip("asymmetric Q/K and V widths require gfx950 or gfx942 BF16")
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
         query_length,
@@ -1241,8 +1250,9 @@ def test_pa_decode(case, device, monkeypatch):
 )
 def test_asymmetric_autotune_plan(kv_dtype, window, device, tmp_path):
     """Tuned and cached plans must decode with the physical V/output width."""
-    if get_gfx() != "gfx950":
-        pytest.skip("asymmetric Q/K and V widths require gfx950")
+    arch = get_gfx_runtime()
+    if arch != "gfx950" and not (arch == "gfx942" and kv_dtype == "bf16"):
+        pytest.skip("asymmetric Q/K and V widths require gfx950 or gfx942 BF16")
     tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     torch.manual_seed(0)
@@ -1287,9 +1297,9 @@ def test_asymmetric_autotune_plan(kv_dtype, window, device, tmp_path):
     plan = tuning.prepare_pa_decode_plan(
         *arguments, **options, max_partitions=8, tune=True, config_dir=tmp_path
     )
-    assert (tmp_path / "gfx950" / "_pa_decode_autotuner.json").is_file()
+    assert (tmp_path / arch / "_pa_decode_autotuner.json").is_file()
     tuning._get_pa_decode_autotuner.cache_clear()
-    assert tuning._get_pa_decode_autotuner("gfx950", tmp_path).cache
+    assert tuning._get_pa_decode_autotuner(arch, tmp_path).cache
     cached_plan = tuning.prepare_pa_decode_plan(
         *arguments, **options, max_partitions=8, config_dir=tmp_path
     )

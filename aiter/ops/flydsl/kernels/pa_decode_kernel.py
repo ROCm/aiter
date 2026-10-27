@@ -151,7 +151,7 @@ def compile_pa_decode_tile(
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture == "gfx1250":
         if value_dim not in (None, head_dim):
-            raise NotImplementedError("asymmetric value width requires gfx950")
+            raise NotImplementedError("asymmetric value width requires gfx942/gfx950")
         if direct_output and num_partitions != 1:
             raise ValueError("direct_output requires a one-partition plan")
         if query_splits is None:

@@ -182,20 +182,21 @@ class PaDecodeSchedule:
                 raise ValueError("BF16 KV requires a vectorized-5D value cache")
         asymmetric_value = value_dim != head_dim
         if asymmetric_value and not (
-            is_gfx950
+            (is_gfx950 or (arch == "gfx942" and is_bf16_kv))
             and query_dtype == "bf16"
             and head_dim == 192
             and value_dim == 128
             and block_size == 64
-            and query_group_size == 16
+            and (is_bf16_kv or query_group_size == 16)
             and query_length == 8
             and trans_v
             and not per_token_kv
             and sliding_window >= 0
         ):
             raise ValueError(
-                "asymmetric V requires gfx950 BF16 Q/O, scalar FP8 or BF16 KV, "
-                "Qlen8/GQA16/page64 D192/V128, and full attention or a positive "
+                "asymmetric V requires BF16 Q/O, gfx942/gfx950 BF16 KV or "
+                "gfx950 scalar FP8 KV with GQA16, Qlen8/page64 D192/V128, "
+                "and full attention or a positive "
                 "sliding window"
             )
         IS_BF16 = query_dtype == "bf16"

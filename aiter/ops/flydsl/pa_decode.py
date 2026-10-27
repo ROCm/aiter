@@ -215,8 +215,9 @@ def pa_decode(
     within 64 KiB of LDS; a single query's GQA rows must fit that limit. gfx1250
     splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
     into separate query CTAs. Q/K and V/output head dimensions normally match.
-    The qualified gfx950 Qlen8/GQA16/page64 path also supports Q/K192-V128
-    with scalar FP8 or BF16 KV for full attention or any positive sliding window.
+    The Qlen8/page64 D192/V128 path supports native BF16 KV on gfx942/gfx950
+    and scalar FP8 KV with GQA16 on gfx950, for full attention
+    or any positive sliding window.
     ALiBi and externally quantized queries are unsupported.
 
     MTP lengths include the query tokens and use dense causal masking.
@@ -616,19 +617,19 @@ def pa_decode(
     if sliding_window > 0 and work_plan.query_length != query_length:
         raise ValueError("query_length must match work_plan.query_length")
     if asymmetric_value and not (
-        arch == "gfx950"
+        (arch == "gfx950" or (arch == "gfx942" and is_bf16_kv))
         and query.dtype == torch.bfloat16
         and query_length == 8
         and head_dim == 192
         and value_dim == 128
         and block_size == 64
-        and query_group_size == 16
+        and (is_bf16_kv or query_group_size == 16)
         and trans_v
         and not per_token_kv
     ):
         raise NotImplementedError(
-            "asymmetric value width requires gfx950 BF16 Q/O, scalar FP8 or "
-            "BF16 KV, Qlen8, GQA16, page64, Q/K192-V128, "
+            "asymmetric value width requires BF16 Q/O, gfx942/gfx950 BF16 KV "
+            "or gfx950 scalar FP8 KV with GQA16, Qlen8, page64, Q/K192-V128, "
             "vectorized V, and full attention or a positive sliding window"
         )
     num_partitions = work_plan.max_partitions
