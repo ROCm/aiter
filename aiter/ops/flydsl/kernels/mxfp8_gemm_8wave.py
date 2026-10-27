@@ -191,7 +191,7 @@ class ScaleRawLds:
             ),
         ]
 
-    def _soffset(self, op, chunk):
+    def _chunk_off(self, op, chunk):
         if const_expr(op == 0 and self.a_col):
             return fx.Int32(chunk * self.CHUNK) * self.c_m
         if const_expr(op == 1 and self.b_blk):
@@ -200,7 +200,13 @@ class ScaleRawLds:
         return fx.Int32(chunk * 16)
 
     def dma(self, chunk):
-        """Stage chunk ``chunk``; the last chunk may run past K (those bytes are never read)."""
+        """Stage chunk ``chunk``; past the tensor's end it reads zero, never consumed.
+
+        The chunk offset goes in the per-lane offset: the raw-buffer range check
+        covers the VGPR and immediate offsets but not ``soffset``, so through
+        ``soffset`` the last chunk would read beyond the tensor. Not the
+        immediate either: on an LDS-direct load it also moves the destination.
+        """
         base_i32 = fx.Int32(fx.ptrtoint(self.lds.ptr))
         for op in range_constexpr(2):
             src, offs = self.srcs[op]
@@ -216,17 +222,17 @@ class ScaleRawLds:
                     rocdl.buffer_load_to_lds(
                         src,
                         fx.to_llvm_ptr(lds_dst),
-                        fx.Int32(offs[step]).ir_value(),
+                        (fx.Int32(offs[step]) + self._chunk_off(op, chunk)).ir_value(),
                         size_bytes=1,
-                        soffset=self._soffset(op, chunk).ir_value(),
                     )
                     continue
                 dst = fx.make_view(lds_dst, fx.make_layout(1, 1))
                 fx.copy(
                     self.atom,
-                    fx.slice(src, (None, fx.Int32(offs[step]))),
+                    fx.slice(
+                        src, (None, fx.Int32(offs[step]) + self._chunk_off(op, chunk))
+                    ),
                     dst,
-                    soffset=self._soffset(op, chunk),
                 )
 
     def _byte(self, op, off):
