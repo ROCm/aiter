@@ -760,21 +760,9 @@ _paged_attention_kernel(const int* block_table_seq,
 #if defined(__gfx950__)
                 if constexpr(sizeof(cache_t) == 2)
                 {
-                    // ds_read_b64_tr_b16 transposes a 4-token x 16-head-element tile across each
-                    // 16-lane row: lane16id / 4 selects the token and lane16id % 4 the 4 head
-                    // elements a lane addresses; each lane gets 4 tokens of head element lane16id.
-                    using i16x4_t     = __attribute__((__vector_size__(4 * sizeof(short)))) short;
-                    using lds_i16x4_t = __attribute__((address_space(3))) i16x4_t;
-                    const int tr_head_elem = warpid * 16 + (lane16id % 4) * 4;
-                    for(int i = 0; i < 2; i++)
-                    {
-                        const int tr_token_idx = vlocal_token_idx + i * 4 + lane16id / 4;
-                        auto* tr_ptr =
-                            (lds_i16x4_t*)(vlds_ptr + tr_token_idx * n_thread_per_block * 16 +
-                                           tr_head_elem * sizeof(cache_t));
-                        Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i] = __builtin_bit_cast(
-                            _B16x4, __builtin_amdgcn_ds_read_tr16_b64_v4i16(tr_ptr));
-                    }
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        lds_read_transposed_b16x8<n_thread_per_block * 16>(
+                            vlds_ptr, vlocal_token_idx, warpid * 16, lane16id);
                     continue;
                 }
 #endif
@@ -2112,6 +2100,15 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                 const int vlocal_token_idx =
                     rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
+#if defined(__gfx950__)
+                if constexpr(sizeof(cache_t) == 2)
+                {
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        lds_read_transposed_b16x8<n_thread_per_block * 16>(
+                            vlds_ptr, vlocal_token_idx, warpid * 16, lane16id);
+                    continue;
+                }
+#endif
                 // read data points individually and save them into array
                 cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
                 for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
