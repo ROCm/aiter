@@ -51,7 +51,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]  # the a8w4 port decodes FP4 -> FP8 for the gfx942 fp8 MFMA
+SUPPORTED_GFX = ["gfx942"]  # the a8w4 kernel decodes FP4 -> FP8 for the gfx942 fp8 MFMA
 EXPERT, TOPK = 896, 16  # Kimi-K3 routed experts
 BETA, LINEAR_BETA = 4.0, 25.0  # Kimi-K3 SiTUv2
 

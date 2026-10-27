@@ -4703,10 +4703,11 @@ def fused_moe_2stages(
         # Main's fused prequant already writes the E8M0 scale layout consumed by
         # replacement GEMM1 on the default Opus auxiliary path.
         metadata = replace(metadata, prequant=True)
-    # gfx942 a8w4 (fp8 A x mxfp4 W, `_g942` stage-1 names): stage 1 is the a16w-mix
-    # port that also returns its own sorted bf16 intermediate, consumed by the a16w4
-    # stage 2 as is -- no out buffer, no inter-stage requant. Its `_qi` names quantise
-    # x in-kernel, so they take the bf16 x and skip the separate quant launch.
+    # gfx942 a8w4 (fp8 A x mxfp4 W, `_g942` stage-1 names): stage 1 is
+    # compile_gemm1_a8w4_gfx942 (moe_2stage_a16wmix), which also returns its own
+    # sorted bf16 intermediate, consumed by the a16w4 stage 2 as is -- no out buffer,
+    # no inter-stage requant. Its `_qi` names quantise x in-kernel, so they take the
+    # bf16 x and skip the separate quant launch.
     _s1_params = None
     if getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper:
         _s1_params = _get_flydsl_moe_kernels().get_flydsl_kernel_params(

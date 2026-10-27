@@ -1691,7 +1691,7 @@ def _flydsl_moe_stage1_impl(
         return inter_sorted
     # gfx942 a8w4 (MXFP8 A x MXFP4 W), the `_g942` names (in_dtype="a8w4_gfx942"). The
     # gfx950 mixed_moe a8w4 kernels need the gfx950-only scaled f8f6f4 MFMA; on gfx942
-    # this port decodes FP4 -> FP8 and runs the fp8 MFMA. `a` / `a1_scale` are
+    # this kernel decodes FP4 -> FP8 and runs the fp8 MFMA. `a` / `a1_scale` are
     # fused_dynamic_mxfp8_quant_moe_sort's outputs (x_layout="moe_sort"), or, for the
     # `_qi` names, the bf16 x with no scale, which the kernel quantises itself
     # (x_layout="bf16"); w1 / w1_scale must be the a16w4 preshuffle relaid by

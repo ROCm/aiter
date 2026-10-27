@@ -3,10 +3,11 @@
 
 """gfx942 a8w4 stage1: MXFP8 A x MXFP4 W -> fp8 MFMA, MX scales applied after the MFMA.
 
-gfx942 has no FP4 MFMA, so the a16w4 port decodes every weight to bf16 (FP4 -> f32 ->
-x scale -> bf16) and runs bf16 MFMA 16x16x16. This kernel instead decodes FP4 straight
-to an E4M3FNUZ byte (one v_perm per 4 weights, no scale) and runs the fp8 MFMA
-16x16x32; the per-1x32 E8M0 scales of A and W are applied once per MFMA result:
+gfx942 has no FP4 MFMA, so the a16w4 stage 1 (``compile_gemm1_a16w4_port`` in gemm1.py)
+decodes every weight to bf16 (FP4 -> f32 -> x scale -> bf16) and runs bf16 MFMA
+16x16x16. This kernel instead decodes FP4 straight to an E4M3FNUZ byte (one v_perm per
+4 weights, no scale) and runs the fp8 MFMA 16x16x32; the per-1x32 E8M0 scales of A and
+W are applied once per MFMA result:
 
     acc[m, n] += s_x[m, blk] * s_w[n, blk] * mfma(x_fp8[m, blk], w_fp8[blk, n])
 
@@ -19,9 +20,10 @@ consecutive K. ``shuffle_scale_a8w4_gfx942`` likewise packs a column's four bloc
 into one dword. Both are one-time host relayouts of the a16w4 preshuffle.
 
 A is MXFP8 E4M3FNUZ, either from aiter's ``fused_dynamic_mxfp8_quant_moe_sort``
-(``x_layout="moe_sort"``) or quantised from bf16 x inside the kernel (``x_layout="bf16"``,
-the ``_qi`` names). Same sorting / cumsum / m_indices contract and the same bf16 intermediate
-``[sorted_size, inter_dim]`` (by sorted position) as the a16w4 port, so stage2 is unchanged.
+(``x_layout="moe_sort"``) or quantised from bf16 x inside the kernel
+(``x_layout="bf16"``, the ``_qi`` names). Same sorting / cumsum / m_indices contract and
+the same bf16 intermediate ``[sorted_size, inter_dim]`` (by sorted position) as the
+a16w4 stage 1, so stage 2 is unchanged.
 """
 
 import functools
@@ -73,8 +75,9 @@ def _fp4x8_to_fp8x8(raw_i32):
     """8 E2M1 nibbles (bits[4e+3:4e] = element e) -> 8 E4M3FNUZ bytes as one i64.
 
     Byte p of the result is element ``A8W4_K8_ORDER[p]``. The magnitude comes from one
-    v_perm per 4 nibbles (the #6144 table); the sign is kept only for non-zero
-    magnitudes, since 0x80 is NaN in FNUZ (E2M1 -0 must become +0).
+    v_perm per 4 nibbles (``_FP4_E2M1_FP8_LUT_LO`` / ``_HI`` in utils.py); the sign is
+    kept only for non-zero magnitudes, since 0x80 is NaN in FNUZ (E2M1 -0 must
+    become +0).
     """
     raw = fx.Int32(raw_i32)
     mag_e = raw & fx.Int32(0x07070707)  # elements 0,2,4,6 (low nibbles)
