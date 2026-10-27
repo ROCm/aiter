@@ -868,6 +868,7 @@ def validate_and_update_archs():
         "gfx940",
         "gfx941",
         "gfx942",
+        "gfx950",
         "gfx1100",
         "gfx1101",
         "gfx1102",
@@ -879,8 +880,6 @@ def validate_and_update_archs():
         "gfx1200",
         "gfx1201",
         "gfx1250",
-        "gfx950",
-        "gfx1250",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -888,6 +887,46 @@ def validate_and_update_archs():
         arch in allowed_archs for arch in archs
     ), f"One of GPU archs of {archs} is invalid or not supported"
     return archs
+
+
+def get_ck_gpu_target_ids():
+    """Value CK's CMake would give CK_CMAKE_GPU_TARGET_IDS for GPU_ARCHS.
+
+    Without it ck_tile resolves the target from the current compiler pass, so
+    the host pass sees HOST while the device pass sees the real arch, and the
+    two instantiate different MMA types. Unknown targets are skipped, as CK's
+    CMake does.
+    """
+    archs = validate_and_update_archs()
+    if archs == ["native"]:
+        archs = _detect_native()
+
+    # amdgcn_target_id values from ck_tile/core/arch/arch.hpp, mirroring
+    # _ck_gpu_target_string_to_id in CK's CMakeLists.txt.
+    # with only arch known by validate_and_update_archs()
+    ck_gpu_target_ids = {
+        "gfx90a": "0x090A",
+        "gfx942": "0x0942",
+        "gfx950": "0x0950",
+        "gfx1100": "0x1100",
+        "gfx1101": "0x1101",
+        "gfx1102": "0x1102",
+        "gfx1103": "0x1103",
+        "gfx1150": "0x1150",
+        "gfx1151": "0x1151",
+        "gfx1152": "0x1152",
+        "gfx1153": "0x1153",
+        "gfx1200": "0x1200",
+        "gfx1201": "0x1201",
+        "gfx1250": "0x1250",
+    }
+
+    ids = []
+    for arch in archs:
+        target_id = ck_gpu_target_ids.get(arch.lower().split(":")[0])
+        if target_id and target_id not in ids:
+            ids.append(target_id)
+    return ",".join(ids)
 
 
 @functools.lru_cache
@@ -1419,6 +1458,10 @@ def build_module(
             get_gfx() == "gfx1250" or "gfx1250" in os.environ.get("GPU_ARCHS", "")
         ) and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
+
+        ck_gpu_target_ids = get_ck_gpu_target_ids()
+        if ck_gpu_target_ids:
+            flags_hip += [f"-DCK_CMAKE_GPU_TARGET_IDS={ck_gpu_target_ids}"]
 
         if not torch_exclude:
             import torch
