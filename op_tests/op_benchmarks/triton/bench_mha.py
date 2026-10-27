@@ -663,8 +663,6 @@ def run_benchmark(run: BenchRun):
         return_lse = True
         return_attn_probs = False
         has_pe = D_HEAD > D_HEAD_V
-        # Dense iff BOTH bounds are off (-1); either set = a window (matches the kernel's
-        # `LEFT < 0 and RIGHT < 0` dense test -- neither side is privileged).
         window_size = (window_size_left, window_size_right)
         mha_set_impl(impl)
         # Native Triton and Gluon support a left window (and a sink on the native

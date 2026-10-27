@@ -76,6 +76,7 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 | `comment`| string | Optional label (e.g. `"Prefill"`, `"Text"`, `"Vision"`). |
 | `sink`   | bool   | Optional. When true, enables attention sink in the MHA benchmark. |
 | `sliding_window_left` | int | Optional. Left sliding-window size (`--window-size-left`); omit for no window. |
+| `sliding_window_right` | int | Optional. Right sliding-window size (`--window-size-right`); omit for no window. Default Triton skips a right window unless `-impl dao_ai` or an fp8 dtype. |
 
 ### MLA — Multi-head Latent Attention (`mla`)
 
