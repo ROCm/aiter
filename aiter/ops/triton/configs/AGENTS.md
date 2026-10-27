@@ -232,7 +232,7 @@ an arch that runs the GQA decode kernel needs the `v1_w_dot` entry.
 - A `split_*` key is optional. Without `split_target_programs` the kernel does
   not split.
 - A part with another CU count can have its own file next to `DEFAULT.json`:
-  `PA-DECODE-CUS=<n>.json`. `<n>` is `get_num_sms()`. The file lists only the
+  `PA-DECODE-CU=<n>.json`. `<n>` is `get_num_sms()`. The file lists only the
   keys that differ, under `dispatch.<dtype>` and `launch.<kernel>`. A key in
   `dispatch.<dtype>` replaces the key of `DEFAULT.json`. A key in
   `launch.<kernel>` (`BLK_LEQ_<x>` or `any`) replaces the whole entry. It can

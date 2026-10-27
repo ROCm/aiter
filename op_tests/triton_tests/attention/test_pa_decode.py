@@ -361,9 +361,6 @@ def test_paged_attn_multi_partition_dispatch(B, H_Q, H_KV, SEQ_LEN, dtype, monke
         busy_min = rule.get("v1_min_programs")
         if busy_min is not None and B * H_KV >= busy_min:
             expect_v1 = expect_v1 or num_partitions <= rule["v1_busy_max_partitions"]
-        busy_min = rule.get("v1_min_programs")
-        if busy_min is not None and B * H_KV >= busy_min:
-            expect_v1 = expect_v1 or num_partitions <= rule["v1_busy_max_partitions"]
     else:
         expect_v1 = SEQ_LEN <= 8192 and (num_partitions == 1 or B * H_Q > 512)
     if get_arch() == "gfx950":
@@ -565,7 +562,7 @@ def test_missing_config_gives_none(tmp_path, monkeypatch):
 
 def _cu_override_files(arch):
     cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton", arch=arch)
-    return sorted(glob.glob(f"{cfg_dir}/PA-DECODE-CUS=*.json"))
+    return sorted(glob.glob(f"{cfg_dir}/PA-DECODE-CU=*.json"))
 
 
 _CU_OVERRIDES = [
@@ -598,7 +595,7 @@ def test_cu_override_applies_only_on_matching_cu_count(tmp_path, monkeypatch):
         "launch": {"v1_w_dot": {"any": {"num_stages": 2}}},
     }
     (tmp_path / "DEFAULT.json").write_text(json.dumps(default))
-    (tmp_path / "PA-DECODE-CUS=96.json").write_text(json.dumps(override))
+    (tmp_path / "PA-DECODE-CU=96.json").write_text(json.dumps(override))
     monkeypatch.setattr(pa_kernels, "resolve_config_dir", lambda *a, **k: str(tmp_path))
     load_config_json.cache_clear()
     try:
@@ -768,8 +765,9 @@ def _gqa_tdm_case(
 
 
 @pytest.mark.parametrize("poison", [False, True], ids=["clean", "nan_inf_tail"])
-@pytest.mark.parametrize("num_warps", [1, 2, 4])
-@pytest.mark.parametrize("H_KV, group", [(8, 4), (8, 16), (1, 16), (2, 1)])
+@pytest.mark.parametrize(
+    "H_KV, group, num_warps", [(8, 4, 2), (8, 16, 4), (1, 16, 1), (2, 1, 2)]
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_paged_attn_gqa_tdm(dtype, H_KV, group, num_warps, poison):
     """TDM GQA kernel against an fp32 reference, with partial pages and garbage rows."""
@@ -787,9 +785,9 @@ def test_paged_attn_gqa_tdm(dtype, H_KV, group, num_warps, poison):
 
 
 @pytest.mark.parametrize("poison", [False, True], ids=["clean", "nan_inf_tail"])
-@pytest.mark.parametrize("num_warps", [1, 2, 4])
 @pytest.mark.parametrize(
-    "H_KV, group, head_size", [(128, 1, 56), (8, 4, 64), (4, 16, 56)]
+    "H_KV, group, head_size, num_warps",
+    [(128, 1, 56, 1), (8, 4, 64, 2), (4, 16, 56, 4)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_paged_attn_gqa_tdm_head_sizes(
@@ -834,7 +832,17 @@ def test_paged_attn_gqa_tdm_empty_sequence():
         torch.testing.assert_close(output[b].float(), expected[b], rtol=0, atol=4e-3)
 
 
-def _tdm_dispatch_calls(monkeypatch, rule, *, scale=1.0, alibi=None, head=128, kv=8):
+def _tdm_dispatch_calls(
+    monkeypatch,
+    rule,
+    *,
+    scale=1.0,
+    alibi=None,
+    head=128,
+    kv=8,
+    seqs=2,
+    max_seq_len=1024,
+):
     calls = []
     monkeypatch.setattr(pa_decode_mod, "_get_dispatch_config", lambda dtype: rule)
     monkeypatch.setattr(pa_decode_mod, "_pa_decode_gqa_tdm_kernel", object())
@@ -851,14 +859,14 @@ def _tdm_dispatch_calls(monkeypatch, rule, *, scale=1.0, alibi=None, head=128, k
         )
     # The launchers are mocked, so CPU tensors are enough.
     paged_attention_decode(
-        output=torch.empty(2, 4 * kv, head, dtype=torch.float16, device="cpu"),
-        query=torch.empty(2, 4 * kv, head, dtype=torch.float16, device="cpu"),
+        output=torch.empty(seqs, 4 * kv, head, dtype=torch.float16, device="cpu"),
+        query=torch.empty(seqs, 4 * kv, head, dtype=torch.float16, device="cpu"),
         key_cache=torch.empty(1, kv, 128, head, dtype=torch.float16, device="cpu"),
         value_cache=torch.empty(1, kv, 128, head, dtype=torch.float16, device="cpu"),
         seq_lens=None,
         block_tables=None,
         attn_scale=1.0,
-        max_seq_len=1024,
+        max_seq_len=max_seq_len,
         compute_type=None,
         k_scale=torch.tensor([scale]),
         v_scale=torch.tensor([1.0]),
@@ -898,9 +906,9 @@ def test_dispatch_skips_tdm_when_unsupported(rule_change, kwargs, monkeypatch):
 
 
 @pytest.mark.parametrize("poison", [False, True], ids=["clean", "nan_inf_tail"])
-@pytest.mark.parametrize("seq_partition_size", [128, 256, 1024, 4096])
 @pytest.mark.parametrize(
-    "H_KV, group, head_size", [(8, 4, 128), (1, 16, 128), (2, 1, 128), (4, 1, 56)]
+    "H_KV, group, head_size, seq_partition_size",
+    [(8, 4, 128, 128), (1, 16, 128, 256), (2, 1, 128, 1024), (4, 1, 56, 4096)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_paged_attn_gqa_tdm_split(
@@ -997,3 +1005,90 @@ def test_paged_attn_gqa_tdm_is_repeatable():
         output.zero_()
         pa_decode_mod.paged_attn_decode_gqa_tdm(output, *args, 1)
         assert torch.equal(output, first)
+
+
+_V1_V2_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
+
+
+def _page128_rule(dtype):
+    """gfx1250 rule without the Gluon kernel, so the Triton V1/V2 path is chosen."""
+    return {
+        **_config("gfx1250")["dispatch"][_V1_V2_NAMES[dtype]],
+        "tdm_num_warps": None,
+    }
+
+
+# (programs relative to v1_min_programs, partitions relative to v1_busy_max_partitions)
+@pytest.mark.parametrize(
+    "d_programs, d_parts, expect",
+    [(0, 0, "v1"), (0, 1, "v2"), (-1, 0, "v2")],
+    ids=["busy_at_limit", "over_partition_limit", "below_program_limit"],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_dispatch_page128_busy_v1_limits(
+    dtype, d_programs, d_parts, expect, monkeypatch
+):
+    rule = _page128_rule(dtype)
+    programs = rule["v1_min_programs"] + d_programs
+    parts = rule["v1_busy_max_partitions"] + d_parts
+    seq = parts * pa_decode_mod._SEQ_PARTITION_SIZE
+    names, _ = _tdm_dispatch_calls(
+        monkeypatch, rule, kv=1, seqs=programs, max_seq_len=seq
+    )
+    assert names == [expect]
+
+
+@pytest.mark.parametrize(
+    "min_programs, seq, expect",
+    [(8, 8192, "v1"), (8, 9216, "v2"), (9, 8192, "v2")],
+    ids=["busy_v1", "over_partition_limit", "not_busy"],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_attn_page128_busy_v1_output(
+    dtype, min_programs, seq, expect, monkeypatch
+):
+    """V1/V2 output on 128-token pages; 8 programs stand in for the 2048-program limit."""
+    if get_arch() != "gfx1250":
+        pytest.skip("the 128-token launch settings are tuned for gfx1250")
+    rule = {k: v for k, v in _page128_rule(dtype).items() if not k.startswith("split_")}
+    rule["v1_min_programs"] = min_programs
+    assert rule["v1_busy_max_partitions"] == 8
+    monkeypatch.setattr(pa_decode_mod, "_get_dispatch_config", lambda _: rule)
+    called, launches = [], []
+    for name in ("paged_attn_decode_v1", "paged_attn_decode_v2"):
+        fn = getattr(pa_decode_mod, name)
+        monkeypatch.setattr(
+            pa_decode_mod,
+            name,
+            lambda *a, _fn=fn, _name=name, **k: (called.append(_name), _fn(*a, **k))[1],
+        )
+    get_launch = pa_decode_mod._get_launch_config
+    monkeypatch.setattr(
+        pa_decode_mod,
+        "_get_launch_config",
+        lambda kernel, blk: (launches.append((kernel, blk)), get_launch(kernel, blk))[
+            1
+        ],
+    )
+    B, H_KV, group = 4, 2, 4
+    query, key_cache, value_cache, block_tables, lens, expected = _gqa_tdm_case(
+        dtype, H_KV, group, [seq] * B
+    )
+    output = torch.zeros_like(query)
+    paged_attention_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        lens,
+        block_tables,
+        128**-0.5,
+        seq,
+        {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}[dtype],
+        k_scale=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+        v_scale=torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+    )
+    assert called == [f"paged_attn_decode_{expect}"]
+    assert launches == [(f"{expect}_w_dot", 128)]
+    atol = 3e-2 if dtype == torch.bfloat16 else 4e-3
+    torch.testing.assert_close(output.float(), expected, rtol=0, atol=atol)

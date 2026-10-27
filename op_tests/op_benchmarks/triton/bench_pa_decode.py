@@ -225,6 +225,17 @@ def triton_max_blocks(HK, KV_BLK_SZ, HEAD_DIM):
     return (1 << 31) // (HK * KV_BLK_SZ * HEAD_DIM)
 
 
+def kv_pool_pages(HK, KV_BLK_SZ, HEAD_DIM, kv_cache_dtype, free_bytes):
+    """Pages for the KV pool: at most 4 GB per cache, and input_helper's peak in half the free memory."""
+    page_elems = HK * KV_BLK_SZ * HEAD_DIM
+    kv = get_dtype_bytes(kv_cache_dtype)
+    # 8-bit caches are built from fp16 tensors.
+    src = kv if kv_cache_dtype in (torch.bfloat16, torch.float16, torch.float32) else 2
+    # Live bytes per element at the clamp, at the conversion and with the Triton copies.
+    peak = max(3 * src, 2 * src + kv, src + 2 * kv, 4 * kv)
+    return min((4 << 30) // (page_elems * kv), free_bytes // 2 // (page_elems * peak))
+
+
 def bench_ms(fn, flush_cache=True):
     """Time of one fn call in ms, with the caches flushed before each call by default."""
     if not flush_cache:
@@ -274,21 +285,33 @@ def run_benchmark(args):
         args={},
     )
 
+    pools = {}  # One pool size per row, so every metric of a row reads the same cache.
+
     @triton.testing.perf_report([benchmark])
     def bench_paged_attn_decode(BS, HQ, HK, SEQ_LEN, HEAD_DIM, metric, model=None):
         kv_bytes = get_dtype_bytes(kv_cache_dtype)
         pages_needed = BS * triton.cdiv(SEQ_LEN, KV_BLK_SZ)
-        if args.num_blocks:
-            num_blocks = args.num_blocks
-        else:
-            # One page per (sequence, block slot), capped at 4 GB per cache tensor.
-            # input_helper holds four cache tensors at once, so also cap each at a
-            # fifth of the free memory.
-            page_bytes = HK * KV_BLK_SZ * HEAD_DIM * kv_bytes
-            free_bytes, _ = torch.cuda.mem_get_info()
-            num_blocks = min(pages_needed, min(4 << 30, free_bytes // 5) // page_bytes)
-        if args.backend == "triton":
-            num_blocks = min(num_blocks, triton_max_blocks(HK, KV_BLK_SZ, HEAD_DIM))
+        row = (BS, HQ, HK, SEQ_LEN, HEAD_DIM)
+        if row not in pools:
+            if args.num_blocks:
+                num_blocks = args.num_blocks
+            else:
+                # One page per (sequence, block slot), as far as memory allows.
+                torch.cuda.empty_cache()  # Cached blocks of earlier rows are not free.
+                free_bytes, _ = torch.cuda.mem_get_info()
+                num_blocks = min(
+                    pages_needed,
+                    kv_pool_pages(HK, KV_BLK_SZ, HEAD_DIM, kv_cache_dtype, free_bytes),
+                )
+            if args.backend == "triton":
+                num_blocks = min(num_blocks, triton_max_blocks(HK, KV_BLK_SZ, HEAD_DIM))
+            if num_blocks < 1:
+                raise ValueError(
+                    f"{model}: not enough free GPU memory for one KV page. "
+                    "Free memory or reduce the batch size or sequence length."
+                )
+            pools[row] = num_blocks
+        num_blocks = pools[row]
         if num_blocks < pages_needed and metric == "time":  # once per row
             print(
                 f"{model}: KV pool is {num_blocks} pages for {pages_needed} needed, "
@@ -359,7 +382,7 @@ def parse_args():
         "-num_blocks",
         type=int,
         default=0,
-        help="Physical KV pages. 0 = one page per sequence block slot (capped at 4 GB per cache tensor and a fifth of free memory).",
+        help="Physical KV pages. 0 = one page per sequence block slot (capped at 4 GB per cache tensor and by half of the free memory, counting the peak buffers of input creation).",
     )
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-kv_cache_dtype", default="fp16")

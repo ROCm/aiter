@@ -22,9 +22,9 @@ def _load_config() -> dict:
 
 
 def _load_cu_overrides() -> dict:
-    """Keys of `PA-DECODE-CUS=<n>.json` that replace DEFAULT.json keys on an n-CU part."""
+    """Keys of `PA-DECODE-CU=<n>.json` that replace DEFAULT.json keys on an n-CU part."""
     cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton")
-    path = f"{cfg_dir}/PA-DECODE-CUS={get_num_sms()}.json"
+    path = f"{cfg_dir}/PA-DECODE-CU={get_num_sms()}.json"
     return load_config_json(path, required=False) or {}
 
 

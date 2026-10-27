@@ -45,6 +45,26 @@ _TDM_PAGE_SIZE = 128
 _TDM_NO_SPLIT = 1 << 30
 
 
+def _pick_partition_size(
+    num_programs: int,
+    max_seq_len: int,
+    sizes: list[int],
+    max_partitions: int,
+    target: int,
+    default: int,
+) -> int:
+    """Largest size that reaches `target` programs; else the smallest within the cap."""
+    allowed = [
+        (s, triton.cdiv(max_seq_len, s))
+        for s in sorted(sizes, reverse=True)
+        if triton.cdiv(max_seq_len, s) <= max_partitions
+    ]
+    for s, num_parts in allowed:
+        if num_programs * num_parts >= target:
+            return s
+    return allowed[-1][0] if allowed else default
+
+
 def _select_tdm_partition_size(
     num_programs: int, max_seq_len: int, dispatch: dict
 ) -> int:
@@ -52,17 +72,14 @@ def _select_tdm_partition_size(
     target = dispatch.get("tdm_split_target_programs")
     if target is None or num_programs >= target:
         return _TDM_NO_SPLIT
-    sizes = [
-        s
-        for s in sorted(dispatch["tdm_split_sizes"], reverse=True)
-        if s < max_seq_len
-        and triton.cdiv(max_seq_len, s) <= dispatch["tdm_split_max_partitions"]
-    ]
-    # Largest size that reaches the target; else the smallest allowed.
-    for s in sizes:
-        if num_programs * triton.cdiv(max_seq_len, s) >= target:
-            return s
-    return sizes[-1] if sizes else _TDM_NO_SPLIT
+    return _pick_partition_size(
+        num_programs,
+        max_seq_len,
+        [s for s in dispatch["tdm_split_sizes"] if s < max_seq_len],
+        dispatch["tdm_split_max_partitions"],
+        target,
+        _TDM_NO_SPLIT,
+    )
 
 
 def _select_seq_partition_size(
@@ -79,21 +96,18 @@ def _select_seq_partition_size(
     ) and num_programs >= dispatch.get("split_short_min_programs", 1 << 62)
     if target is None or busy or short:
         return _SEQ_PARTITION_SIZE
-    sizes = [
-        p
-        for p in sorted(dispatch["split_sizes"], reverse=True)
-        if p % kv_blk_sz == 0 and (p == _SEQ_PARTITION_SIZE or p <= max_seq_len)
-    ]
-    # Largest size that reaches the target; else the smallest size within the cap.
-    allowed = [
-        (p, triton.cdiv(max_seq_len, p))
-        for p in sizes
-        if triton.cdiv(max_seq_len, p) <= dispatch["split_max_partitions"]
-    ]
-    for p, num_parts in allowed:
-        if num_programs * num_parts >= target:
-            return p
-    return allowed[-1][0] if allowed else _SEQ_PARTITION_SIZE
+    return _pick_partition_size(
+        num_programs,
+        max_seq_len,
+        [
+            p
+            for p in dispatch["split_sizes"]
+            if p % kv_blk_sz == 0 and (p == _SEQ_PARTITION_SIZE or p <= max_seq_len)
+        ],
+        dispatch["split_max_partitions"],
+        target,
+        _SEQ_PARTITION_SIZE,
+    )
 
 
 def _gqa_tdm_supported(
