@@ -1,4 +1,10 @@
 {
+  "M_BOUNDS": [
+    64,
+    255,
+    256,
+    512
+  ],
   "M_LEQ_64": {
     "BLOCK_SIZE_M": 32,
     "BLOCK_SIZE_N": 32,
@@ -11,7 +17,7 @@
     "cache_modifier": null,
     "NUM_KSPLIT": 1
   },
-  "M_LEQ_256": {
+  "M_LEQ_255": {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 64,
     "BLOCK_SIZE_K": 128,
@@ -21,6 +27,18 @@
     "waves_per_eu": 0,
     "matrix_instr_nonkdim": 16,
     "cache_modifier": null,
+    "NUM_KSPLIT": 1
+  },
+  "M_LEQ_256": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 4,
+    "num_warps": 8,
+    "num_stages": 3,
+    "waves_per_eu": 6,
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": ".cg",
     "NUM_KSPLIT": 1
   },
   "M_LEQ_512": {
