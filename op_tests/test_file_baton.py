@@ -58,9 +58,8 @@ class TestFileBaton(unittest.TestCase):
             with mock.patch(
                 "aiter.jit.utils.file_baton.os.replace",
                 side_effect=OSError("simulated death before publication"),
-            ):
-                with self.assertRaises(OSError):
-                    breaker.wait()
+            ), self.assertRaises(OSError):
+                breaker.wait()
 
             # The stale pathname was never removed. A subsequent waiter sees
             # unfinished work, replaces it, and reports that the build must be

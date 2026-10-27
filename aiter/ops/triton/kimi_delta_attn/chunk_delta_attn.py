@@ -26,8 +26,9 @@ Notes on the fla-compatible surface:
     * ``allow_neg_eigval`` / ``return_intermediate_states`` / ``cp_context`` /
       ``cu_seqlens_cpu`` have no counterpart yet and are rejected rather than
       silently ignored.
-    * Tensor arguments are made contiguous here, as fla's ``@input_guard``
-      does, because some kernels below assume contiguous strides.
+    * Tensor arguments are made contiguous, as fla's ``@input_guard`` does,
+      because some kernels below assume contiguous strides. On gfx1250 the
+      FlashKDA kernels read q, k, v and g at their own token stride instead.
     * This path is forward-only, so the output carries no ``grad_fn`` even
       when the inputs require grad, whereas fla returns a differentiable
       tensor.
@@ -35,7 +36,7 @@ Notes on the fla-compatible surface:
 
 import torch
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -61,6 +62,10 @@ def chunk_kimi_delta_attn(
     disable_recompute: bool = False,
     chunk_size: int | None = None,
     cu_seqlens: torch.LongTensor | None = None,
+    out: torch.Tensor | None = None,
+    state_cache: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Chunked Kimi Delta Attention forward pass using Triton (Forward only).
@@ -140,12 +145,30 @@ def chunk_kimi_delta_attn(
         cu_seqlens (torch.LongTensor, optional):
             Cumulative sequence lengths of shape `[N+1]` for variable-length
             inputs, consistent with the FlashAttention API. Default: `None`.
+        out (torch.Tensor, optional):
+            Caller-owned output buffer, same shape as `v`, and contiguous.
+            Written in place rather than allocated and copied. Required with
+            `state_cache`. FlashKDA-only; the default pipeline rejects this
+            argument rather than ignoring it.
+        state_cache (torch.Tensor, optional):
+            Paged fp32 V-first cache `[slots, H, V, K]`. Replaces
+            `initial_state`: sequence `n` is row `state_indices[n]`. Each
+            slot's `[H, V, K]` plane must be dense; `stride(0)` may be padded.
+            FlashKDA-only; the default pipeline rejects this argument rather
+            than ignoring it.
+        state_indices (torch.Tensor, optional):
+            Int32 `[N]` cache row per sequence, each in `[0, slots)`. Required
+            with `state_cache`. Trusted as given, not range-checked.
+        has_initial_state (torch.Tensor, optional):
+            Bool `[N]`. False starts that sequence from zero. Required with
+            `state_cache`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
             - o (torch.Tensor): Outputs of shape `[B, T, HV, V]`.
             - final_state (torch.Tensor | None): Final state if
-              `output_final_state=True` else `None`.
+              `output_final_state=True` else `None`. `None` when
+              `state_cache` is given, because the cache already holds it.
 
     Examples:
         >>> import torch
@@ -232,13 +255,10 @@ def chunk_kimi_delta_attn(
         cu_seqlens is not None,
     )
 
-    # Match fla, which puts `@input_guard` on its autograd Function. Several
-    # kernels below index their operands with contiguous strides rather than
-    # reading the tensor's own, so a view would be read as garbage instead of
-    # raising: `q`/`k` reach the unguarded l2norm, `initial_state` the
-    # unguarded state kernel. No-op for the contiguous inputs serving stacks
-    # normally pass.
-    q, k, v, g, beta = (t.contiguous() for t in (q, k, v, g, beta))
+    # Match fla's `@input_guard`: several kernels below index their operands
+    # with contiguous strides, so a view would be read as garbage. q, k, v and
+    # g are left to `chunk_delta_attn_fwd`, which packs them where needed.
+    beta = beta.contiguous()
     if A_log is not None:
         A_log = A_log.contiguous()
     if dt_bias is not None:
@@ -247,6 +267,12 @@ def chunk_kimi_delta_attn(
         initial_state = initial_state.contiguous()
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.contiguous()
+    if state_indices is not None:
+        state_indices = state_indices.contiguous()
+    if has_initial_state is not None:
+        has_initial_state = has_initial_state.contiguous()
+    # state_cache is not packed: stride(0) may be padded. Packing it would
+    # copy the pool and write a clone.
 
     o, final_state, *_ = chunk_delta_attn_fwd(
         q=q,
@@ -270,5 +296,9 @@ def chunk_kimi_delta_attn(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
         state_v_first=state_v_first,
+        out=out,
+        state_cache=state_cache,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
     )
     return o.to(q.dtype), final_state

@@ -14,6 +14,7 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
+from ..tensor_shim import _run_compiled
 from .combine import (
     CHUNK_ELEMS as _COMBINE_CHUNK_ELEMS,
 )
@@ -697,6 +698,7 @@ class MegaMoEGfx1250:
         next_topk_ids: torch.Tensor | None = None,
         next_recv_token_bound: int | None = None,
         combine_quant: str | None = None,
+        recv_counter_is_zero: bool = False,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
@@ -789,7 +791,7 @@ class MegaMoEGfx1250:
                 self._compact_recv_bound(token_count, recv_token_bound)
             )
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
-            hidden_states, topk_weights, topk_ids
+            hidden_states, topk_weights, topk_ids, recv_counter_is_zero
         )
         if recv_token_bound is not None and not self._compact_plan:
             bound = int(recv_token_bound)
@@ -1023,7 +1025,8 @@ class MegaMoEGfx1250:
         plan_stream = self._compact_plan_stream
         plan_stream.wait_stream(cur)
         with torch.cuda.stream(plan_stream):
-            self._compact_plan_for(self._compact_step_align_m, slot)(
+            _run_compiled(
+                self._compact_plan_for(self._compact_step_align_m, slot),
                 self._arena.handle,
                 topk_ids.data_ptr(),
                 bufs["tok_map"].data_ptr(),
@@ -1091,6 +1094,9 @@ class MegaMoEGfx1250:
     def _initialize_pipeline(self, config: MegaMoEConfig, communicator):
         self._config = config
         self._closed = False
+        # tokoff-ext slot allocator (built in _build_mori_dispatch when the
+        # mori dispatch backend is on); None otherwise so close() is uniform.
+        self._tokoff_ext = None
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
         self._compact_plan = config.stage1_fused
@@ -1399,7 +1405,8 @@ class MegaMoEGfx1250:
                 inp_cur_tok,
                 stream,
             ):
-                kern(
+                _run_compiled(
+                    kern,
                     arena_handle,
                     addr_inp_tok,
                     addr_inp_idx,
@@ -1529,6 +1536,25 @@ class MegaMoEGfx1250:
         # The kernels dereference the window, so the plans have to outlive them.
         self._mori_plans = plans
 
+        # mori's op layer builds the tokoff-ext slot allocator in
+        # EpDispatchCombineOpHip.__init__; driving EpDispatchPlan directly
+        # bypasses that, leaving EpArgs.tokOffPeers null and dispatch on the
+        # serializing cco-window atomic. Mirror mori's gate (default on;
+        # MORI_EP_TOKOFF_EXT=0/false/no/off opts out) so the env var is not
+        # dead on this path. Reuse mori's builder rather than duplicate its
+        # IPC handle protocol, which must match the kernel byte for byte.
+        if os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt
+
+            self._tokoff_ext = TokOffExt(
+                config.rank, config.world_size, self._total_recv.device
+            )
+
         def make_variant(plan):
             def launch(
                 arena_handle,
@@ -1542,10 +1568,12 @@ class MegaMoEGfx1250:
                 my_lsa_rank,
                 inp_cur_tok,
                 stream,
+                reset_recv=True,
             ):
                 # mori's dispatch only accumulates into total_recv (this package's
                 # zeroes it in Phase 2), so without this it grows every forward.
-                self._total_recv.zero_()
+                if reset_recv:
+                    self._total_recv.zero_()
                 plan.launch(
                     stream=torch.cuda.current_stream().cuda_stream,
                     token_indices=addr_inp_idx,
@@ -1555,6 +1583,9 @@ class MegaMoEGfx1250:
                     dest_pe_token_counter=addr_dest_ctr,
                     total_recv_token_num=addr_total_recv,
                     grid_barrier=addr_disp_bar,
+                    tok_off_peers=(
+                        None if self._tokoff_ext is None else self._tokoff_ext.peers
+                    ),
                     num_tokens=inp_cur_tok,
                     # Read off self rather than through the variant's argument
                     # list: the list is shared with the FlyDSL dispatch, whose
@@ -1648,6 +1679,7 @@ class MegaMoEGfx1250:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        recv_counter_is_zero: bool = False,
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
@@ -1682,6 +1714,10 @@ class MegaMoEGfx1250:
             self._compact_psum = self._psums[self._compact_slot]
         else:
             tok_map = self._token_destination_map
+        reset_args = {}
+        if recv_counter_is_zero:
+            assert self._config.dispatch_backend == "mori"
+            reset_args["reset_recv"] = False
         self._dispatch_variants[spec](
             self._arena.handle,
             payload.data_ptr(),
@@ -1694,6 +1730,7 @@ class MegaMoEGfx1250:
             self._config.rank,
             token_count,
             stream,
+            **reset_args,
         )
         reverse_source_view = _from_gpu_ptr(
             self._arena.local_ptr("recv_to_src_token"),
@@ -1755,13 +1792,15 @@ class MegaMoEGfx1250:
         stream = fx.Stream(torch.cuda.current_stream())
         # 1-block cross-device barrier, then the barrier-free reduce on the same
         # stream; the kernel boundary gives the reduce its visibility.
-        self._combine_sync(
+        _run_compiled(
+            self._combine_sync,
             self._arena.handle,
             self._cross_device_flag.data_ptr(),
             self._config.rank,
             stream,
         )
-        self._combine_variants[combine_quant_bits](
+        _run_compiled(
+            self._combine_variants[combine_quant_bits],
             self._arena.local_ptr("comb_inp"),
             self._combine_output.data_ptr(),
             routing.token_count,
@@ -1779,3 +1818,6 @@ class MegaMoEGfx1250:
             return
         self._closed = True
         self._arena.close()
+        if self._tokoff_ext is not None:
+            self._tokoff_ext.close()
+            self._tokoff_ext = None
