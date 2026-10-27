@@ -14,12 +14,13 @@ import functools
 import os
 import threading
 
+import flydsl.expr as fx
 import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
@@ -481,14 +482,16 @@ def _build_g2l_lut(
                 else torch.zeros(1, dtype=torch.int32, device=device)
             )
             nvr = torch.empty(1, dtype=torch.int32, device=device)
-            _get_compiled_g2l_lut(
+            lut_launcher = _get_compiled_g2l_lut(
                 max_experts=512 if n <= 512 else 1024,
                 clear_counter=not (
                     _flydsl_dispatch_context() is not None
                     and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
                 ),
-            )(
+            )
+            _run_compiled(
+                lut_launcher,
                 ptr_arg(mask),
                 ptr_arg(lut),
                 ptr_arg(counter),
@@ -497,7 +500,7 @@ def _build_g2l_lut(
                 int(n),
                 int(E),
                 int(topk) if _want_nvr else 0,
-                stream=torch.cuda.current_stream(),
+                torch.cuda.current_stream(),
             )
             return lut, counter, (nvr if _want_nvr else None)
         except Exception as exc:  # noqa: BLE001  # pragma: no cover
@@ -1861,7 +1864,8 @@ def fused_route_psum_remap(
     starts = torch.empty(experts, dtype=torch.int32, device=device)
     psum = torch.empty(experts, dtype=torch.int32, device=device)
     launch = _get_compiled_route_psum_fused()
-    launch(
+    _run_compiled(
+        launch,
         ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
         ptr_arg(topids_to_rows),
         ptr_arg(masked_m),
@@ -1871,7 +1875,7 @@ def fused_route_psum_remap(
         experts,
         int(max_m),
         int(tile_m),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
 
@@ -1885,14 +1889,15 @@ def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
     psum = torch.empty(experts, dtype=torch.int32, device=device)
     contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
     launch = _get_compiled_contiguous_psum()
-    launch(
+    _run_compiled(
+        launch,
         ptr_arg(masked_m_i32),
         ptr_arg(starts),
         ptr_arg(psum),
         ptr_arg(contiguous_m_t),
         experts,
         int(tile_m),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return starts, psum, contiguous_m_t
 
@@ -1952,7 +1957,8 @@ def contiguous_psum_remap(
         launch = _get_compiled_contiguous_psum_remap_ep()
         # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
         # interleaved with route work for free.  No host .fill_() needed.
-        launch(
+        _run_compiled(
+            launch,
             ptr_arg(masked_m_i32),
             ptr_arg(topids_flat),
             ptr_arg(starts),
@@ -1969,7 +1975,7 @@ def contiguous_psum_remap(
             int(ep_scatter_params["max_tok"]),
             int(ep_scatter_params["slot_stride"]),
             ptr_arg(row_to_token_i32),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return starts, psum, contiguous_m_t
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import MAX_REMAP_EXPERTS
@@ -1979,7 +1985,8 @@ def contiguous_psum_remap(
         f"experts={experts} exceeds MAX_REMAP_EXPERTS={MAX_REMAP_EXPERTS}"
     )
     launch = _get_compiled_contiguous_psum_remap()
-    launch(
+    _run_compiled(
+        launch,
         ptr_arg(masked_m_i32),
         ptr_arg(topids_flat),
         ptr_arg(starts),
@@ -1992,7 +1999,7 @@ def contiguous_psum_remap(
         ptr_arg(num_valid_routes_i32),
         ptr_arg(row_to_token_i32),
         int(topk),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return starts, psum, contiguous_m_t
 
@@ -2008,16 +2015,17 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
     rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
     grid_blocks = (numel + 255) // 256
     launch = _get_compiled_route_maps()
-    launch(
-        topk_ids_i32,
-        atomic_buffer,
-        topids_to_rows,
-        rows_to_tokens,
+    _run_compiled(
+        launch,
+        ptr_arg(topk_ids_i32, fx.Int32),
+        ptr_arg(atomic_buffer, fx.Int32),
+        ptr_arg(topids_to_rows, fx.Int32),
+        ptr_arg(rows_to_tokens, fx.Int32),
         numel,
         topk,
         max_m,
         grid_blocks,
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     masked_m = atomic_buffer
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
@@ -2086,7 +2094,8 @@ def flydsl_moe_gather_reduce(
             .to(device=device, dtype=torch.int32)
             .contiguous()
         )
-    launch(
+    _run_compiled(
+        launch,
         ptr_arg(grouped_out_flat),
         ptr_arg(topids_to_rows),
         ptr_arg(gather_w),
@@ -2094,7 +2103,7 @@ def flydsl_moe_gather_reduce(
         token_num,
         slice_stride_dw,
         ptr_arg(num_valid_tokens_i32),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return out
 
@@ -2133,12 +2142,15 @@ def flydsl_moe_scatter_copy_token(
             (E, max_m, payload_w), dtype=torch.uint8, device=device
         )
     launch_p = _get_compiled_scatter_copy(payload_w)
-    launch_p(
-        a1_payload.contiguous().view(-1, payload_w),
-        grouped_a1.view(num_dst, payload_w),
-        rows_to_tokens,
+    payload_src = a1_payload.contiguous().view(-1, payload_w)
+    payload_dst = grouped_a1.view(num_dst, payload_w)
+    _run_compiled(
+        launch_p,
+        ptr_arg(payload_src, fx.Uint8),
+        ptr_arg(payload_dst, fx.Uint8),
+        ptr_arg(rows_to_tokens, fx.Int32),
         num_dst,
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
 
     if a1_scale_token_u8 is not None:
@@ -2148,12 +2160,15 @@ def flydsl_moe_scatter_copy_token(
                 (E, max_m, scale_w), dtype=torch.uint8, device=device
             )
         launch_s = _get_compiled_scatter_copy(scale_w)
-        launch_s(
-            a1_scale_token_u8.contiguous().view(-1, scale_w),
-            a1_scale_raw.view(num_dst, scale_w),
-            rows_to_tokens,
+        scale_src = a1_scale_token_u8.contiguous().view(-1, scale_w)
+        scale_dst = a1_scale_raw.view(num_dst, scale_w)
+        _run_compiled(
+            launch_s,
+            ptr_arg(scale_src, fx.Uint8),
+            ptr_arg(scale_dst, fx.Uint8),
+            ptr_arg(rows_to_tokens, fx.Int32),
             num_dst,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
 
     return grouped_a1, a1_scale_raw
@@ -2205,14 +2220,17 @@ def flydsl_moe_scatter_preshuffle_scale(
     launch = _get_compiled_scatter_preshuffle_scale(
         scale_w, wmma_rep, scale_k_per_tile, True
     )
-    launch(
-        a1_scale_token_u8.contiguous().view(-1, scale_w),
-        grouped_a1_scale.view(E * (max_m // wmma_rep), scale_w * wmma_rep),
-        rows_to_tokens,
+    scale_src = a1_scale_token_u8.contiguous().view(-1, scale_w)
+    scale_dst = grouped_a1_scale.view(E * (max_m // wmma_rep), scale_w * wmma_rep)
+    _run_compiled(
+        launch,
+        ptr_arg(scale_src, fx.Uint8),
+        ptr_arg(scale_dst, fx.Uint8),
+        ptr_arg(rows_to_tokens, fx.Int32),
         max_m,
         E,
         tiles_per_expert,
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return grouped_a1_scale
 
@@ -2243,12 +2261,15 @@ def flydsl_moe_preshuffle_scale(
     launch = _get_compiled_scatter_preshuffle_scale(
         scale_w, wmma_rep, scale_k_per_tile, False
     )
-    launch(
-        scale_grouped_u8.contiguous().view(E * max_m, scale_w),
-        out.view(E * (max_m // wmma_rep), scale_w * wmma_rep),
+    scale_src = scale_grouped_u8.contiguous().view(E * max_m, scale_w)
+    scale_dst = out.view(E * (max_m // wmma_rep), scale_w * wmma_rep)
+    _run_compiled(
+        launch,
+        ptr_arg(scale_src, fx.Uint8),
+        ptr_arg(scale_dst, fx.Uint8),
         max_m,
         E,
         tiles_per_expert,
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return out

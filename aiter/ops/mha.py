@@ -1545,7 +1545,7 @@ def cmdGenFunc_mha_batch_prefill(
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
-    if max_seqlen_q == 1 and alibi_slopes is None:
+    if max_seqlen_q == 1 and alibi_slopes is None and sink_ptr is None:
         causal = False
         if window_size_left >= max_seqlen_k:
             window_size_left = -1
@@ -2852,9 +2852,9 @@ def flash_attn_func(
         and num_splits <= 1
         and (len(window_size) < 3 or window_size[2] == 0)
     ):
-        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_fwd
 
-        _flydsl_result = flydsl_flash_attn_batch_func(
+        _flydsl_result = flydsl_flash_attn_batch_fwd(
             q,
             k,
             v,
@@ -3863,9 +3863,9 @@ def flash_attn_varlen_func(
         and cu_seqlens_k_padded is None
         and logits_soft_cap == 0.0
     ):
-        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_fwd
 
-        _flydsl_result = flydsl_flash_attn_varlen_func(
+        _flydsl_result = flydsl_flash_attn_varlen_fwd(
             q,
             k,
             v,
