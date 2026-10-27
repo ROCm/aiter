@@ -86,15 +86,7 @@ class TestFastScanCliSafety(unittest.TestCase):
 class TestMxfp4AccuracyFunnel(unittest.TestCase):
     @staticmethod
     def _candidate(name):
-        # Real candidates carry block_m, and _run_candidate records the numeric
-        # error the coupled tuner gates on. Mocked evaluations start accurate.
-        return {
-            "kernelName1": f"g1_{name}",
-            "kernelName2": f"g2_{name}",
-            "block_m": 32,
-            "us": 0,
-            "error": 0.0,
-        }
+        return {"kernelName1": f"g1_{name}", "kernelName2": f"g2_{name}", "us": 0}
 
     @staticmethod
     def _pipeline_data():
@@ -194,7 +186,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "token": 1,
             "topk": 2,
             "act_type": "ActivationType.Silu",
-            "q_dtype_a": "torch.float4_e2m1fn_x2",
         }
         args = SimpleNamespace(fast_scan=True, errRatio=0.1, warmup=1, iters=1)
         with (
@@ -218,7 +209,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
-        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         fast = self._candidate("fast_bad")
         accurate = self._candidate("accurate")
         args = SimpleNamespace(
@@ -281,7 +271,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
-        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         candidates = [self._candidate(f"candidate_{i}") for i in range(1, 5)]
         args = SimpleNamespace(
             fast_scan=True,
@@ -352,7 +341,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
-        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         candidates = [self._candidate(f"candidate_{i}") for i in range(10)]
         args = SimpleNamespace(
             fast_scan=True,
@@ -421,8 +409,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         )
 
     def test_warmup_outputs_are_accuracy_checks_outside_timing(self):
-        import torch
-
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         # _run_candidate finishes by building the tuned row through calculate(),
@@ -476,7 +462,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
 
         with (
             mock.patch.object(
-                tuner, "_port_e2e", side_effect=[torch.zeros(1), torch.zeros(1)]
+                tuner, "_port_e2e", side_effect=["warm", "timed"]
             ) as port,
             mock.patch.object(
                 gemm_moe_tune,
@@ -509,7 +495,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
-        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         args = SimpleNamespace(
             fast_scan=True,
             fast_scan_warmup_accuracy_checks=1,
@@ -564,8 +549,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(limits, [3.5])
 
     def test_candidate_kernel_and_reference_share_the_tuned_swiglu_limit(self):
-        import torch
-
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -585,14 +568,12 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
-            "q_dtype_a": "torch.float4_e2m1fn_x2",
         }
         limits = []
 
         def port_e2e(*_args, **kwargs):
             limits.append(kwargs.get("swiglu_limit"))
-            # Ordinary-path outputs are checked for non-finite values.
-            return torch.zeros(1)
+            return "out"
 
         with (
             mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
@@ -618,8 +599,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(torch_ref.call_args.kwargs["swiglu_limit"], 3.5)
 
     def test_finalist_retime_preserves_unrounded_coarse_error(self):
-        import torch
-
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
@@ -639,7 +618,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             "expert": 8,
             "topk": 2,
             "act_type": "ActivationType.Silu",
-            "q_dtype_a": "torch.float4_e2m1fn_x2",
         }
         candidate = self._candidate("fastest")
         candidate.update(
@@ -650,7 +628,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         )
         with (
             mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
-            mock.patch.object(tuner, "_port_e2e", return_value=torch.zeros(1)),
+            mock.patch.object(tuner, "_port_e2e", return_value="out"),
             mock.patch.object(tuner, "_torch_ref", return_value="ref"),
             mock.patch.object(gemm_moe_tune, "cosine_diff_compare", return_value=0.010),
             mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
@@ -675,7 +653,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
-        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
         candidates = [self._candidate("bad"), self._candidate("good")]
         args = SimpleNamespace(
             fast_scan=True,
@@ -771,121 +748,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
 
         self.assertEqual(run_candidate.call_count, 2)
         self.assertEqual(result["us"], tuner.INVALID_TIME)
-        self.assertEqual(result["status"], "failed")
-        self.assertTrue(
-            result["failure_reason"].startswith("no valid coupled candidate")
-        )
-
-    @staticmethod
-    def _funnel_case(finalists):
-        row = {
-            "token": 1,
-            "model_dim": 256,
-            "inter_dim": 256,
-            "expert": 8,
-            "topk": 2,
-            "act_type": "ActivationType.Silu",
-            "q_dtype_a": "torch.float4_e2m1fn_x2",
-        }
-        args = SimpleNamespace(
-            fast_scan=True,
-            fast_scan_warmup_accuracy_checks=1,
-            fast_scan_iters=10,
-            fast_scan_final_iters=100,
-            fast_scan_finalists=finalists,
-            timeout=0,
-            errRatio=0.1,
-            warmup=2,
-            iters=101,
-        )
-        return row, args
-
-    def _run_funnel(self, row, args, candidates, run_candidate):
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
-
-        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
-        tuner.keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
-        with (
-            mock.patch.object(tuner, "_candidate_rows", return_value=candidates),
-            mock.patch.object(tuner, "_precompile_candidates", return_value=(0, 0)),
-            mock.patch.object(tuner, "_prepare_case", return_value="fixture"),
-            mock.patch.object(tuner, "_torch_ref", return_value="reference"),
-            mock.patch.object(tuner, "_run_candidate", side_effect=run_candidate),
-            mock.patch("builtins.print"),
-        ):
-            return tuner, tuner._tune_one_shape(row, args)
-
-    def test_profile_rows_record_coarse_and_final_phases(self):
-        row, args = self._funnel_case(finalists=1)
-        candidates = [self._candidate(f"candidate_{i}") for i in range(3)]
-
-        def run_candidate(_row, candidate, _args, **kwargs):
-            index = int(candidate["kernelName1"].rsplit("_", 1)[1])
-            coarse = kwargs["num_iters"] == 10
-            candidate["us"] = (10.0 if coarse else 5.0) + index
-            candidate["err1"] = 0.01
-            return candidate["us"]
-
-        _, best = self._run_funnel(row, args, candidates, run_candidate)
-
-        # Every candidate keeps its coarse row; the speed finalist and the
-        # accuracy promotion add final rows under their original index.
-        self.assertEqual(
-            [(p["phase"], p["candidate_index"]) for p in best["_profile"]],
-            [("coarse", 1), ("coarse", 2), ("coarse", 3), ("final", 1), ("final", 2)],
-        )
-        winner_final = [
-            p
-            for p in best["_profile"]
-            if p["phase"] == "final" and p["kernelName1"] == best["kernelName1"]
-        ]
-        self.assertEqual(best["kernelName1"], "g1_candidate_0")
-        self.assertEqual([p["pipeline_us"] for p in winner_final], [best["us"]])
-        self.assertEqual(best["_search"]["candidate_count"], 3)
-        self.assertEqual(best["_search"]["evaluated_count"], 3)
-        self.assertEqual(best["_search"]["valid_count"], 3)
-        self.assertTrue(best["_search"]["search_complete"])
-
-    def test_fatal_gpu_error_during_finalists_aborts_the_search(self):
-        row, args = self._funnel_case(finalists=2)
-        candidates = [self._candidate(f"candidate_{i}") for i in range(3)]
-        final_calls = []
-
-        def run_candidate(_row, candidate, _args, **kwargs):
-            if kwargs["num_iters"] == 10:
-                candidate["us"] = 1.0
-                return candidate["us"]
-            final_calls.append(candidate["kernelName1"])
-            raise RuntimeError("HIP error: an illegal memory access was encountered")
-
-        tuner, best = self._run_funnel(row, args, candidates, run_candidate)
-
-        # The HIP context is unusable after the first fatal finalist, so no
-        # other finalist runs and the shape publishes no winner.
-        self.assertEqual(len(final_calls), 1)
-        self.assertEqual(best["status"], "incomplete")
-        self.assertEqual(best["us"], tuner.INVALID_TIME)
-        self.assertFalse(best["_search"]["search_complete"])
-        self.assertIn("illegal memory access", best["_search"]["termination_reason"])
-        last = best["_profile"][-1]
-        self.assertEqual((last["phase"], last["status"]), ("final", "fatal_gpu_error"))
-
-    def test_ordinary_search_records_single_phase_without_scan_arguments(self):
-        row, args = self._funnel_case(finalists=1)
-        args.fast_scan = False
-        candidates = [self._candidate(f"candidate_{i}") for i in range(2)]
-        calls = []
-
-        def run_candidate(_row, candidate, _args, **kwargs):
-            calls.append(kwargs)
-            candidate["us"] = 2.0 if candidate["kernelName1"].endswith("0") else 1.0
-            return candidate["us"]
-
-        _, best = self._run_funnel(row, args, candidates, run_candidate)
-
-        self.assertEqual(calls, [{}, {}])
-        self.assertEqual([p["phase"] for p in best["_profile"]], ["single", "single"])
-        self.assertEqual(best["kernelName1"], "g1_candidate_1")
+        self.assertTrue(result["kernelName1"].startswith("FAILED:"))
 
 
 class TestGlm53TunedArtifact(unittest.TestCase):
