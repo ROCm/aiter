@@ -15,6 +15,7 @@ generated (`quantize_mxfp4` clamps amax, as `indexer_fp4_scale_e8m0` does).
 """
 
 import argparse
+import functools
 import itertools
 import sys
 
@@ -39,6 +40,9 @@ try:
 except ImportError:  # run as a script from op_tests/
     import test_flydsl_minimax_m3_index_score as fp8_test
 
+# These tests pin the STAGED prefill path (dequantize, then the fp8 kernel); the
+# default native path has its own file, test_..._prefill_fp4_native.py.
+staged_prefill = functools.partial(prefill_kernel.score_prefill_flydsl_fp4, staged=True)
 P, D = fp8_test.P, fp8_test.D
 ATOL, RTOL = fp8_test.ATOL, fp8_test.RTOL
 requires_gfx950 = fp8_test.requires_gfx950
@@ -518,6 +522,7 @@ def run_prefill_fp4(c, kd, ks, qdt="bf16", **kw):
     heads = c["q8"].shape[1]
     out = fp8_test.prefill_alloc_score(c["q8"].shape[0], heads, c["mb"], "cuda")
     out.fill_(SENTINEL)
+    kw.setdefault("staged", True)
     prefill_kernel.score_prefill_flydsl_fp4(
         c["q_bf16"] if qdt == "bf16" else c["q8"],
         kd,
@@ -623,7 +628,7 @@ def test_prefill_mixed_query_lengths_and_trailing_empty_request(qdt):
     live = torch.isfinite(ref)
     out = fp8_test.prefill_alloc_score(q_a + 1, 1, mb, dev)
     out.fill_(SENTINEL)
-    prefill_kernel.score_prefill_flydsl_fp4(
+    staged_prefill(
         q8.float().bfloat16() if qdt == "bf16" else q8,
         kd,
         ks,
@@ -658,24 +663,20 @@ def test_prefill_e4m3_q_strided_and_scaled():
     out = fp8_test.prefill_alloc_score(rows, heads, c["mb"], "cuda")
     out.fill_(SENTINEL)
     args = (c["cu"], c["seq"], c["prefix"], c["max_q"], c["max_seq"], 1.0 / LOG2E)
-    prefill_kernel.score_prefill_flydsl_fp4(
-        c["q8"], kd, ks, c["bt"], *args, out=out, q_scale=0.5
-    )
+    staged_prefill(c["q8"], kd, ks, c["bt"], *args, out=out, q_scale=0.5)
     got = out.reshape(plain.shape)
     live = plain != SENTINEL
     assert torch.equal(got[live], plain[live] * 0.5)
     for bad in (0.0, -1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="q_scale"):
-            prefill_kernel.score_prefill_flydsl_fp4(
-                c["q8"], kd, ks, c["bt"], *args, q_scale=bad
-            )
+            staged_prefill(c["q8"], kd, ks, c["bt"], *args, q_scale=bad)
 
 
 @requires_gfx950
 def test_prefill_e4m3_q_rejections():
     c, kd, ks = fp4_prefill_case(1, 128, 1000)
     args = (c["cu"], c["seq"], c["prefix"], c["max_q"], c["max_seq"], 1.0 / LOG2E)
-    f = prefill_kernel.score_prefill_flydsl_fp4
+    f = staged_prefill
     bad_rows = torch.zeros(128, 1, D + 8, dtype=dtypes.fp8, device="cuda")[:, :, :D]
     with pytest.raises(ValueError, match="16-byte aligned"):
         f(bad_rows, kd, ks, c["bt"], *args)
@@ -687,7 +688,7 @@ def test_prefill_e4m3_q_rejections():
 def test_prefill_rejections():
     c, kd, ks = fp4_prefill_case(1, 128, 1000)
     args = (c["cu"], c["seq"], c["prefix"], c["max_q"], c["max_seq"], 1.0 / LOG2E)
-    f = prefill_kernel.score_prefill_flydsl_fp4
+    f = staged_prefill
     with pytest.raises(ValueError):
         f(c["q_bf16"], kd.view(torch.int8), ks, c["bt"], *args)
     with pytest.raises(ValueError):

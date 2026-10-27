@@ -210,6 +210,21 @@ def test_native_strided_views_and_q_scale():
 
 
 @requires_gfx950
+def test_default_entry_is_native_and_staged_is_opt_in(qdt):
+    """`score_prefill_flydsl_fp4` reads the cache natively unless `staged=True`; the
+    two routes agree, and `workspace` belongs to the staged one only."""
+    c, kd, ks = fp4_test.fp4_prefill_case(2, 300, 5000)
+    default = fp4_test.run_prefill_fp4(c, kd, ks, qdt, staged=False)
+    live = default != SENTINEL
+    assert torch.equal(default[live], run_native(c, kd, ks, qdt)[live])
+    assert torch.equal(default[live], fp4_test.run_prefill_fp4(c, kd, ks, qdt)[live])
+    with pytest.raises(ValueError, match="workspace"):
+        fp4_test.run_prefill_fp4(
+            c, kd, ks, qdt, staged=False, workspace=torch.empty(1, P, D, device="cuda")
+        )
+
+
+@requires_gfx950
 def test_native_rejections():
     c, kd, ks = fp4_test.fp4_prefill_case(1, 128, 1000)
     args = (c["cu"], c["seq"], c["prefix"], c["max_q"], c["max_seq"], 1.0 / LOG2E)

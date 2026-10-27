@@ -44,6 +44,9 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     alloc_score,
     score_prefill_flydsl,
 )
+from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill_fp4_native import (
+    score_prefill_flydsl_fp4_native,
+)
 
 __all__ = ["alloc_score", "dequant_pages_fp8", "score_prefill_flydsl_fp4"]
 
@@ -228,13 +231,19 @@ def score_prefill_flydsl_fp4(
     out=None,
     workspace=None,
     q_scale: float = 1.0,
+    staged: bool = False,
 ):
     """Block scores for a ragged prefill batch over an MXFP4 index cache.
 
     `score_prefill_flydsl` with the cache replaced by `k_data`/`k_scale`; every
-    argument it shares keeps its contract. `workspace` optionally supplies the
-    fp8 staging buffer (see `dequant_pages_fp8`); otherwise one is allocated.
-    The staged pages are consumed by this call, not kept.
+    argument it shares keeps its contract. By default the cache is read natively
+    (`minimax_m3_index_score_prefill_fp4_native`: fp4 pages straight into the scaled
+    MFMA, no staging, faster than the fp8 kernel). `staged=True` takes the older
+    route instead -- dequantize the referenced pages into an fp8 staging buffer and
+    run the fp8 kernel -- and `workspace` optionally supplies that buffer (see
+    `dequant_pages_fp8`); otherwise one is allocated. The staged pages are consumed
+    by this call, not kept. Both give the same scores wherever the staged path is
+    exact (e8m0 in [119, 133]).
 
     `idx_q` is bf16 (rounded to e4m3 inside the scorer, as for an fp8 cache) or
     already e4m3 (`dtypes.fp8`, what the index-Q writer emits for q8kv4), in which
@@ -243,6 +252,23 @@ def score_prefill_flydsl_fp4(
     bytes, so the scores are those of the e4m3 query as stored. `q_scale` (default
     1.0, positive) multiplies the scores, folded into `sm_scale`.
     """
+    if not staged:
+        if workspace is not None:
+            raise ValueError("workspace is the staged path's buffer; pass staged=True")
+        return score_prefill_flydsl_fp4_native(
+            idx_q,
+            k_data,
+            k_scale,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            max_query_len,
+            max_seq_len,
+            sm_scale,
+            out=out,
+            q_scale=q_scale,
+        )
     dev = idx_q.device
     _validate_arch(dev)
     q_fp8 = idx_q.dtype == dtypes.fp8
