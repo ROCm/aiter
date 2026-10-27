@@ -270,11 +270,13 @@ def test_asymmetric_schedule_window_contract(monkeypatch, kv_dtype, window, acce
             traits.PaDecodeSchedule.select(**kwargs)
 
 
-@pytest.mark.parametrize("heads", [1, 2, 4])
 @pytest.mark.parametrize(
-    "kv_dtype,scale_mode", [("bf16", "none"), ("fp8", "per-tensor")]
+    "heads,group,query_length", [(1, 16, 8), (2, 8, 3), (4, 16, 1)]
 )
-def test_asymmetric_tuning_cli_heads(heads, kv_dtype, scale_mode):
+@pytest.mark.parametrize(
+    "kv_dtype,scale_mode", [("bf16", "none"), ("fp8", "per-token")]
+)
+def test_asymmetric_tuning_cli_heads(heads, group, query_length, kv_dtype, scale_mode):
     tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
     args = tuning._parse_args(
         [
@@ -283,9 +285,9 @@ def test_asymmetric_tuning_cli_heads(heads, kv_dtype, scale_mode):
             "--value-dim",
             "128",
             "--query-length",
-            "8",
+            str(query_length),
             "--num-query-heads",
-            str(16 * heads),
+            str(group * heads),
             "--num-kv-heads",
             str(heads),
             "--block-size",
@@ -296,7 +298,43 @@ def test_asymmetric_tuning_cli_heads(heads, kv_dtype, scale_mode):
             scale_mode,
         ]
     )
-    assert args.num_query_heads // args.num_kv_heads == 16
+    assert args.num_query_heads // args.num_kv_heads == group
+    assert args.query_length == query_length
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("query_length", [1, 3, 8, 12])
+def test_asymmetric_architecture_and_query_splits(
+    monkeypatch, arch, kv_dtype, query_length
+):
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
+    layout = traits.PaDecodeTraits.create(
+        traits.PaDecodeSchedule.select(
+            head_dim=192,
+            value_dim=128,
+            query_group_size=8,
+            block_size=64,
+            num_seqs=16,
+            num_kv_heads=2,
+            num_compute_units=304 if arch == "gfx942" else 256,
+            work_capacity=512,
+            num_partitions=32,
+            max_context_length=8192,
+            query_dtype="bf16",
+            kv_dtype=kv_dtype,
+            per_token_kv=kv_dtype == "fp8",
+            query_length=query_length,
+        )
+    )
+    assert query_length % layout.query_splits == 0
+    assert layout.QUERIES_PER_CTA * layout.query_splits == query_length
+    assert layout.WIDE_FP8_MFMA == (arch == "gfx950" and kv_dtype == "fp8")
+    assert layout.N_SUBCHUNKS == (
+        12 if kv_dtype == "bf16" else 8 if arch == "gfx950" else 6
+    )
+    assert layout.FP8_MAX == (240 if arch == "gfx942" else 448)
 
 
 @pytest.mark.parametrize("value_dim", [None, 128, 64])
@@ -507,7 +545,32 @@ _ASYMMETRIC_MULTIHEAD_CASES = [
     )
     for heads, window in ((2, 0), (2, 4), (4, 128), (4, 2048))
 ]
+_ASYMMETRIC_GENERAL_CASES = [
+    (
+        name,
+        dict(
+            _ASYMMETRIC_MULTIHEAD_CASES[0][1],
+            query_length=qlen,
+            group_size=group,
+            block_size=page,
+            window=window,
+        ),
+    )
+    for name, qlen, group, page, window in (
+        ("asymmetric-qlen1-page16", 1, 8, 16, 0),
+        ("asymmetric-qlen3-page128", 3, 8, 128, 33),
+        ("asymmetric-qlen12-gqa32", 12, 32, 64, 2048),
+        ("asymmetric-qlen64", 64, 8, 64, 0),
+    )
+]
+_ASYMMETRIC_GENERAL_CASES.append(
+    (
+        "asymmetric-qlen1-large-grid",
+        dict(_ASYMMETRIC_GENERAL_CASES[0][1], lengths=(1027,) * 128),
+    )
+)
 _FP8_CASES = _COMMON_CASES + [
+    *_ASYMMETRIC_GENERAL_CASES,
     *_ASYMMETRIC_MULTIHEAD_CASES,
     *_ASYMMETRIC_WINDOW_CASES,
     (
@@ -636,6 +699,7 @@ _FP8_CASES = _COMMON_CASES + [
     ),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *_ASYMMETRIC_GENERAL_CASES,
     *_ASYMMETRIC_MULTIHEAD_CASES,
     *[
         (
@@ -1005,6 +1069,16 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
             )
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
+        pytest.param(
+            dict(
+                _ASYMMETRIC_GENERAL_CASES[1][1],
+                kv_dtype="fp8",
+                query_dtype=torch.float16,
+                scale_mode="per-token",
+                trans_v=False,
+            ),
+            id="fp8-asymmetric-fp16-plain-v",
+        ),
         *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
         *[
             pytest.param(
@@ -1075,10 +1149,8 @@ def test_pa_decode(case, device, monkeypatch):
         )
     )
     value_dim = head_dim if case["value_dim"] is None else case["value_dim"]
-    if value_dim != head_dim and not (
-        arch == "gfx950" or (arch == "gfx942" and case["kv_dtype"] == "bf16")
-    ):
-        pytest.skip("asymmetric Q/K and V widths require gfx950 or gfx942 BF16")
+    if value_dim != head_dim and arch not in ("gfx942", "gfx950"):
+        pytest.skip("asymmetric Q/K and V widths require gfx942/gfx950")
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
         query_length,
@@ -1240,6 +1312,44 @@ def test_pa_decode(case, device, monkeypatch):
             check()
 
 
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+def test_asymmetric_multihead_large_address(kv_dtype, device):
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        pytest.skip("asymmetric Q/K and V widths require gfx942/gfx950")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    fp8 = (
+        torch.float8_e4m3fnuz if get_gfx_runtime() == "gfx942" else torch.float8_e4m3fn
+    )
+    dtype = torch.bfloat16 if kv_dtype == "bf16" else fp8
+    vector = 8 if kv_dtype == "bf16" else 16
+    element_bytes = 2 if kv_dtype == "bf16" else 1
+    # Both referenced K and V pages lie above a 2 GiB byte offset.
+    page = 2**31 // (2 * 128 * 64 * element_bytes) + 1
+    key = torch.empty(
+        (page + 1, 2, 192 // vector, 64, vector), dtype=dtype, device=device
+    )
+    value = torch.empty(
+        (page + 1, 2, 64 // vector, 128, vector), dtype=dtype, device=device
+    )
+    key[0].zero_()
+    value[0].zero_()
+    key[page].zero_()
+    value[page, 0].fill_(2)
+    value[page, 1].fill_(4)
+    query = torch.zeros((8, 16, 192), dtype=torch.bfloat16, device=device)
+    output = torch.empty((8, 16, 128), dtype=query.dtype, device=device)
+    context = torch.tensor([64], dtype=torch.int32, device=device)
+    table = torch.tensor([[page]], dtype=torch.int32, device=device)
+    plan = pa.plan_pa_decode(context, 2, query_length=8, max_partitions=4)
+    pa.pa_decode(
+        output, query, key, value, context, table, 192**-0.5, 8, work_plan=plan
+    )
+    expected = torch.empty_like(output)
+    expected[:, :8].fill_(2)
+    expected[:, 8:].fill_(4)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "kv_dtype,window",
     [
@@ -1255,8 +1365,8 @@ def test_pa_decode(case, device, monkeypatch):
 def test_asymmetric_autotune_plan(kv_dtype, window, device, tmp_path):
     """Tuned and cached plans must decode with the physical V/output width."""
     arch = get_gfx_runtime()
-    if arch != "gfx950" and not (arch == "gfx942" and kv_dtype == "bf16"):
-        pytest.skip("asymmetric Q/K and V widths require gfx950 or gfx942 BF16")
+    if arch not in ("gfx942", "gfx950"):
+        pytest.skip("asymmetric Q/K and V widths require gfx942/gfx950")
     tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     torch.manual_seed(0)
@@ -1267,8 +1377,9 @@ def test_asymmetric_autotune_plan(kv_dtype, window, device, tmp_path):
     key_scale = value_scale = None
     vector = 8
     if kv_dtype == "fp8":
-        key, key_scale = per_tensor_quant(key, quant_dtype=torch.float8_e4m3fn)
-        value, value_scale = per_tensor_quant(value, quant_dtype=torch.float8_e4m3fn)
+        fp8_dtype = torch.float8_e4m3fnuz if arch == "gfx942" else torch.float8_e4m3fn
+        key, key_scale = per_tensor_quant(key, quant_dtype=fp8_dtype)
+        value, value_scale = per_tensor_quant(value, quant_dtype=fp8_dtype)
         vector = 16
     reference = _reference(
         query,

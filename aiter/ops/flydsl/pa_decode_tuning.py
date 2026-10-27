@@ -480,20 +480,8 @@ def _parse_args(argv=None):
     if args.sliding_window < -1:
         parser.error("--sliding-window must be -1, 0 or positive")
     args.sliding_window = max(args.sliding_window, 0)
-    if asymmetric and not (
-        args.head_dim == 192
-        and args.value_dim == 128
-        and args.query_dtype == "bf16"
-        and args.query_length == 8
-        and (args.kv_dtype == "bf16" or args.num_query_heads // args.num_kv_heads == 16)
-        and args.block_size == 64
-        and args.trans_v
-    ):
-        parser.error(
-            "asymmetric dimensions require BF16 Q/O, Qlen8, page64, "
-            "Q/K192-V128, --trans-v 1, FP8 KV with GQA16, "
-            "and full attention or a positive sliding window"
-        )
+    if asymmetric and (args.head_dim, args.value_dim) != (192, 128):
+        parser.error("asymmetric dimensions require Q/K192-V128")
     if args.device < 0:
         parser.error("--device must be nonnegative")
     return args
@@ -600,10 +588,8 @@ def main(argv=None):
         raise RuntimeError(
             f"PA decode tuning only supports gfx942/gfx950/gfx1250, got {arch}"
         )
-    if args.value_dim != args.head_dim and not (
-        arch == "gfx950" or (arch == "gfx942" and args.kv_dtype == "bf16")
-    ):
-        raise ValueError("asymmetric PA decode tuning requires gfx950 or gfx942 BF16")
+    if args.value_dim != args.head_dim and arch not in ("gfx942", "gfx950"):
+        raise ValueError("asymmetric PA decode tuning requires gfx942/gfx950")
     if args.kv_dtype == "bf16":
         if arch == "gfx1250":
             if args.head_dim != 64 and args.head_dim % 128:

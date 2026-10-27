@@ -183,21 +183,14 @@ class PaDecodeSchedule:
                 raise ValueError("BF16 KV requires a vectorized-5D value cache")
         asymmetric_value = value_dim != head_dim
         if asymmetric_value and not (
-            (is_gfx950 or (arch == "gfx942" and is_bf16_kv))
-            and query_dtype == "bf16"
+            arch in ("gfx942", "gfx950")
             and head_dim == 192
             and value_dim == 128
-            and block_size == 64
-            and (is_bf16_kv or query_group_size == 16)
-            and query_length == 8
-            and trans_v
             and sliding_window >= 0
         ):
             raise ValueError(
-                "asymmetric V requires BF16 Q/O, gfx942/gfx950 BF16 KV or "
-                "gfx950 FP8 KV with GQA16, Qlen8/page64 D192/V128, "
-                "and full attention or a positive "
-                "sliding window"
+                "asymmetric V requires gfx942/gfx950 D192/V128 and a normalized "
+                "nonnegative sliding window"
             )
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (
@@ -260,18 +253,22 @@ class PaDecodeSchedule:
             )
             query_splits = 1
             if asymmetric_value:
-                # W128 and small full-attention grids need one query position
-                # per CTA for occupancy. Larger full-attention grids use four
-                # splits to reduce duplicated KV work.
-                large_full_grid = sliding_window == 0 and (
-                    num_seqs >= 16
-                    or (
-                        num_seqs >= 8
-                        and max_context_length is not None
-                        and max_context_length >= 16384
-                    )
+                # Include serial KV work when a small partition budget gives
+                # each task many tiles. Two M-tiles then amortize K/V loads.
+                kv_work = split_workgroups
+                if sliding_window == 0 and max_context_length is not None:
+                    kv_work = num_seqs * num_kv_heads * max(1, context_tiles)
+                target_rows = MFMA_MNK * (
+                    2 if sliding_window == 0 and kv_work >= 2 * num_compute_units else 1
                 )
-                query_splits = 4 if large_full_grid else query_length
+                queries_per_cta = max(1, target_rows // query_group_size)
+                query_splits = max(1, -(-query_length // queries_per_cta))
+                # Preserve CTA parallelism and choose only divisors of Qlen.
+                while query_length % query_splits or (
+                    query_splits < query_length
+                    and query_splits * split_workgroups < num_compute_units
+                ):
+                    query_splits += 1
             elif TUNED_BF16_SWA:
                 # Estimate the planned KV work, including multiple tiles per
                 # task when the partition cap or work budget is small.
@@ -340,7 +337,7 @@ class PaDecodeSchedule:
                         f"even with one query position per CTA: head_dim={head_dim}, "
                         f"query_group_size={query_group_size}"
                     )
-        if is_bf16_kv:
+        if is_bf16_kv or asymmetric_value:
             assert query_splits >= 1, "query_splits must be positive"
         else:
             assert query_splits in (
@@ -675,7 +672,7 @@ class PaDecodeTraits:
         PER_TOKEN_WIDE = (
             TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
         )
-        WIDE_FP8_MFMA = PER_TOKEN_WIDE or D256_PIPE or ASYMMETRIC_FP8
+        WIDE_FP8_MFMA = PER_TOKEN_WIDE or D256_PIPE or (is_gfx950 and ASYMMETRIC_FP8)
         PACK_K = BF16_PACK_K if is_bf16_kv else FP8_PACK_K
         MFMA_K = 128 if WIDE_FP8_MFMA else PACK_K
         PACKS_PER_MFMA = MFMA_K // PACK_K

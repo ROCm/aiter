@@ -83,8 +83,8 @@ class PaDecodeGemm:
         return fx.Vector.from_elements(words, dtype=fx.Int32)
 
     def fp8_residual(self, scaled, word):
-        # Retain the rounding error of FP8(448 * P) in a second FP8 term.
-        # The largest residual is 16; scaling by 16 still fits FP8's range.
+        # Retain probability-packing error in a second FP8 term. Its magnitude
+        # is at most 16 (OCP) or 8 (FNUZ); scaling by 16 fits either format.
         lo = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, False))
         hi = fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, True))
         rounded = fx.Vector.from_elements(

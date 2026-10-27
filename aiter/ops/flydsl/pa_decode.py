@@ -215,9 +215,8 @@ def pa_decode(
     within 64 KiB of LDS; a single query's GQA rows must fit that limit. gfx1250
     splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
     into separate query CTAs. Q/K and V/output head dimensions normally match.
-    The Qlen8/page64 D192/V128 path supports native BF16 KV on gfx942/gfx950
-    and scalar or per-token FP8 KV with GQA16 on gfx950, for full attention
-    or any positive sliding window.
+    gfx942/gfx950 also support Q/K192-V128 with scalar or per-token FP8 KV
+    or native BF16 KV for full attention or any positive sliding window.
     ALiBi and externally quantized queries are unsupported.
 
     MTP lengths include the query tokens and use dense causal masking.
@@ -373,7 +372,7 @@ def pa_decode(
             (is_bf16_kv and arch != "gfx1250")
             or q_chunk <= 8
             or q_chunk % 8 == 0
-            or (asymmetric_value and arch == "gfx950" and q_chunk == 12)
+            or (asymmetric_value and arch in ("gfx942", "gfx950") and q_chunk == 12)
         )
     ):
         raise NotImplementedError(
@@ -386,7 +385,7 @@ def pa_decode(
                     if is_bf16_kv
                     else (
                         "are 64, multiples of 128 in [128, 1024], and qualified "
-                        "gfx950 asymmetric D192/V128 for FP8 KV"
+                        "gfx942/gfx950 asymmetric D192/V128 for FP8 KV"
                     )
                 )
             )
@@ -617,19 +616,10 @@ def pa_decode(
     if sliding_window > 0 and work_plan.query_length != query_length:
         raise ValueError("query_length must match work_plan.query_length")
     if asymmetric_value and not (
-        (arch == "gfx950" or (arch == "gfx942" and is_bf16_kv))
-        and query.dtype == torch.bfloat16
-        and query_length == 8
-        and head_dim == 192
-        and value_dim == 128
-        and block_size == 64
-        and (is_bf16_kv or query_group_size == 16)
-        and trans_v
+        arch in ("gfx942", "gfx950") and head_dim == 192 and value_dim == 128
     ):
         raise NotImplementedError(
-            "asymmetric value width requires BF16 Q/O, gfx942/gfx950 BF16 KV "
-            "or gfx950 FP8 KV with GQA16, Qlen8, page64, Q/K192-V128, "
-            "vectorized V, and full attention or a positive sliding window"
+            "asymmetric value width requires gfx942/gfx950 Q/K192-V128"
         )
     num_partitions = work_plan.max_partitions
     pmax = max_logits
