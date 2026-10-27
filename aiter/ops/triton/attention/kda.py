@@ -2,13 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import math
 
 import torch
 import triton
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -17,54 +15,17 @@ _LOG_INFO = _LOGGER._logger.isEnabledFor(logging.INFO)
 _ARCH = arch_info.get_arch()
 
 fused_recurrent_kda_packed_decode_kernel = None
+get_kda_config = None
 if _ARCH == "gfx1250":
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.kda_decode import (
         fused_recurrent_kda_packed_decode_kernel,
+        get_kda_config,
     )
 elif _ARCH == "gfx950":
     from aiter.ops.triton._gluon_kernels.gfx950.attention.kda_decode import (
         fused_recurrent_kda_packed_decode_kernel,
+        get_kda_config,
     )
-
-
-def get_kda_config(
-    avg_T: int,
-    num_seqs: int,
-    HV: int,
-    K: int,
-    V: int,
-    overrides: dict | None = None,
-    fused: bool = False,
-) -> dict:
-    cfg_dir = resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
-    tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
-    num_seq_heads = num_seqs * HV
-    aligned = K % 32 == 0 and V % 32 == 0
-    if fused:
-        bucket = "fused"
-    elif avg_T > 1:
-        if aligned and num_seq_heads >= 3072 and V % 128 == 0:
-            bucket = "t_gt1_seq_heads_geq_3072"
-        elif aligned and num_seq_heads >= 384:
-            bucket = "t_gt1_seq_heads_geq_384"
-        elif K % 16 == 0:
-            bucket = "t_gt1_default"
-        else:
-            bucket = "default"
-    elif aligned and 256 <= num_seq_heads <= 512:
-        bucket = "t1_seq_heads_256_to_512"
-    else:
-        bucket = "default"
-    config = dict(tuned[bucket])
-    overrides = overrides or {}
-    config.update(overrides)
-    if "SK" not in overrides:
-        config["SK"] = min(config["SK"], math.gcd(32, K))
-        if "num_warps" not in overrides:
-            config["num_warps"] = max(
-                1, min(config["num_warps"], config["BV"] * config["SK"] // 32)
-            )
-    return config
 
 
 def fused_recurrent_kda(
@@ -112,7 +73,7 @@ def fused_recurrent_kda(
         beta: [B, T, HV] scalar or [B, T, HV, V] headwise write strengths.
         A_log: [HV] gate parameter
         dt_bias: [HV, K] optional bias added to g inside the gate chain.
-        initial_state: fp32 state slabs, [slots, HV, V, K] when
+        initial_state: fp32 (or bf16 on gfx950) state slabs, [slots, HV, V, K] when
             ``state_v_first`` (default) else [slots, HV, K, V]
         scale: q scale factor; defaults to K**-0.5.
         output_final_state: return the post-recurrence state
@@ -132,7 +93,8 @@ def fused_recurrent_kda(
             state eigenvalues may go negative.
         lower_bound: bound for the lower-bounded gate chain
         out: optional output buffer, v's shape and dtype.
-        state_out: optional final-state destination when not in-place
+        state_out: optional final-state destination when not in-place. Its dtype
+            must match initial_state when initial_state is provided.
         cache_state_updates: paged + in-place + v-first only: store the
             full slab only for a sequence's first token, then compact
             (a, k, err) records per token for replay after verification.
@@ -144,9 +106,10 @@ def fused_recurrent_kda(
 
     Returns:
         (o, final_state): o is [B, T, HV, V] in v's dtype. final_state is
-        the fp32 state tensor (initial_state itself when in-place, else
+        the state tensor (initial_state itself when in-place, else
         state_out or a fresh [N, HV, ., .] tensor), or None when
         neither ``output_final_state`` nor ``inplace_final_state`` is set.
+        A fresh state uses initial_state's dtype, or fp32 without initial_state.
     """
 
     if fused_recurrent_kda_packed_decode_kernel is None:
@@ -167,7 +130,9 @@ def fused_recurrent_kda(
     W = conv_weight.shape[1] if use_conv else 4
     if use_conv:
         assert conv_weight.shape == (3, W, H * K) and conv_weight.is_contiguous()
-        assert conv_state.shape[1:] == (3 * H * K, W - 1) and HV * V == H * K
+        assert conv_state.shape[1] == 3 * H * K and HV * V == H * K
+        if num_accepted_tokens is None:
+            assert conv_state.shape[2] >= W - 1
     if use_rms_gate:
         assert out_gate.shape == v.shape and out_gate.stride()[2:] == (V, 1)
         assert B == 1 or out_gate.stride(0) == T * out_gate.stride(1)
@@ -240,6 +205,9 @@ def fused_recurrent_kda(
     use_tdm_fused_load = config.get("use_tdm_fused_load", False)
     tdm_store_bufs = config.get("tdm_store_bufs", 2)
     sched_strategy = config.get("sched_strategy")
+    resident_state = config.get(
+        "resident_state", avg_T > 1 or num_accepted_tokens is not None
+    )
     assert V % BV == 0, f"BV={BV} must divide V={V}"
     assert 32 % SK == 0 and K % SK == 0, f"SK={SK} must divide 32 and K={K}"
     assert (BV * SK) % (
@@ -266,8 +234,19 @@ def fused_recurrent_kda(
         stride_indices_seq = 1
         assert num_accepted_tokens is None, "spec decoding requires ssm_state_indices"
 
+    if use_conv and num_accepted_tokens is not None:
+        # spec window: taps read from num_accepted-1 (< T); token t lands at W-2+t
+        max_tok = ssm_state_indices.shape[1] if ssm_state_indices.ndim > 1 else 1
+        assert (
+            conv_state.shape[2] >= W - 2 + max_tok
+        ), f"spec conv_state needs {W - 2 + max_tok} taps, got {conv_state.shape[2]}"
+
+    state_dtypes = (
+        (torch.float32, torch.bfloat16) if _ARCH == "gfx950" else (torch.float32,)
+    )
+    state_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if initial_state is not None:
-        assert initial_state.dtype == torch.float32
+        assert initial_state.dtype in state_dtypes
         assert (
             initial_state.shape[1:] == state_shape
         ), f"state must be [slots, HV, {state_shape[1]}, {state_shape[2]}]"
@@ -284,12 +263,14 @@ def fused_recurrent_kda(
                 "[total_T, HV, V, K] -- snapshots are indexed by token, not by slot"
             )
         else:
-            final_state = q.new_empty(N, *state_shape, dtype=torch.float32)
+            final_state = q.new_empty(N, *state_shape, dtype=state_dtype)
     else:
         final_state = None
 
     if final_state is not None:
-        assert final_state.dtype == torch.float32
+        assert final_state.dtype in state_dtypes
+        if initial_state is not None:
+            assert final_state.dtype == initial_state.dtype, "state dtypes must match"
         assert (
             final_state.shape[1:] == state_shape
         ), "final state layout must match initial_state"
@@ -320,7 +301,10 @@ def fused_recurrent_kda(
     state_dst = final_state
     if state_dst is None and _ARCH == "gfx950":
         n_dst = B * T if is_paged else N
-        state_dst = q.new_empty(n_dst, *state_shape, dtype=torch.float32)
+        state_dst = q.new_empty(n_dst, *state_shape, dtype=state_dtype)
+    # BF16 storage must not round the recurrent state between tokens.
+    if state_dst is not None and state_dst.dtype == torch.bfloat16 and T > 1:
+        resident_state = True
     slot_rows_in, rows_in = _rows(initial_state)
     slot_rows_out, rows_out = (
         (slot_rows_in, rows_in) if state_dst is initial_state else _rows(state_dst)
@@ -407,7 +391,9 @@ def fused_recurrent_kda(
         W=W,
         USE_CONV=use_conv,
         USE_RMS_GATE=use_rms_gate,
+        **({"RESIDENT_STATE": bool(resident_state)} if _ARCH == "gfx950" else {}),
         num_warps=num_warps,
+        enable_fp_fusion=True,
         **(
             {"llvm_fn_attrs": f"amdgpu-sched-strategy={sched_strategy}"}
             if sched_strategy

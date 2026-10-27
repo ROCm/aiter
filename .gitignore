@@ -17,14 +17,19 @@ aiter/install_mode
 *.gch
 *.pch
 
-# Local Claude Code settings (per-user, not for VCS)
-.claude/
+# Local Claude Code settings (per-user, not for VCS). Scoped to everything BUT the skills:
+# `.claude/` ignored wholesale also silences `git add` for NEW files under
+# .claude/skills/, which are version-controlled -- a file could be written, committed and
+# pushed without ever entering the repository, in silence.
+.claude/*
+!.claude/skills/
 
 # Compiled Dynamic libraries
 *.so
 *.so.*
 *.dylib
 *.dll
+*.pyd
 build
 blob
 
@@ -96,3 +101,13 @@ aiter/ops/opus/configs/
 # Debug assembly dumps from csrc/opus_gemm/gen_co/build_co.py. The .co files
 # next to them ARE tracked (the wheel needs them); these are just for analysis.
 csrc/opus_gemm/gen_co/*/asm/
+
+# Backstop for local runs of .github/scripts/update_split_test_times.py, whose
+# --summary-path still defaults to the working directory. The workflow itself
+# now writes both files to the runner temp dir and limits what its bot may
+# commit, after copies of them reached the repo root in #5131.
+/pr-body.md
+/split-tests-update-summary.md
+
+# Merge-conflict backups, which git writes next to the file being merged.
+*.orig
