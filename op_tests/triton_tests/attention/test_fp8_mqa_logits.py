@@ -1,7 +1,10 @@
 # tests are adapted from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py
+from collections import defaultdict
+
 import pytest
 import torch
 
+import aiter.ops.triton.attention.fp8_mqa_logits as fp8_mqa_logits_launcher
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 
@@ -250,3 +253,39 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     logits = logits.masked_fill(neginf_mask, 0)
     diff = calc_diff(logits, ref_logits)
     assert diff < 1e-4, f"{diff=}"
+
+
+@pytest.mark.skipif(
+    fp8_mqa_logits_launcher.arch != "gfx950"
+    or not fp8_mqa_logits_launcher.TRITON_GE_36
+    or fp8_mqa_logits_launcher._gluon_fp8_mqa_logits_kernel is None,
+    reason="gfx950 Gluon kernel only",
+)
+@torch.inference_mode()
+def test_fp8_mqa_logits_query_rows_do_not_add_specializations(monkeypatch) -> None:
+    # Query row counts 16, 17, 1 and 33 fall in different Triton integer
+    # specialization classes; 64 heads and 1024 KV rows fix every launch constexpr.
+    kernel = fp8_mqa_logits_launcher._gluon_fp8_mqa_logits_kernel
+    monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+    cache = kernel.device_caches[torch.cuda.current_device()][0]
+    s_k, num_heads, head_dim = 1024, 64, 128
+    for s_q in (16, 17, 1, 33):
+        torch.manual_seed(0)
+        q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+        kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+        kv = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
+        weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+        ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
+        ke = torch.arange(s_q, dtype=torch.int, device="cuda") + (s_k - s_q)
+        q_fp8 = q.to(e4m3_type)
+        ref_logits, _ = ref_fp8_mqa_logits(
+            q=q_fp8.to(torch.float32),
+            kv=kv,
+            weights=weights,
+            cu_seqlen_ks=ks,
+            cu_seqlen_ke=ke,
+        )
+        logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, True)
+        check_logits(logits, ref_logits, where=f"{s_q=}: ", tol=1e-4)
+    assert len(cache) == 1
