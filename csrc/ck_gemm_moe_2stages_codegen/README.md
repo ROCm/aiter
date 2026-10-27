@@ -116,9 +116,8 @@ end-to-end validation:
   `--mxfp4-search-mode staged` cannot be combined with `--fast-scan`.
 
 Isolated stage times do not always rank pipelines the same way, so `staged`
-can select a slower winner than timing every pruned pair. Use `--fast-scan`
-or `--mxfp4-search-mode full` to check shapes where the selected kernel
-matters.
+can select a slower winner than timing every pruned pair. Use
+`--mxfp4-search-mode full` to check shapes where the selected kernel matters.
 
 #### `--last`
 - **Type**: Flag (boolean)

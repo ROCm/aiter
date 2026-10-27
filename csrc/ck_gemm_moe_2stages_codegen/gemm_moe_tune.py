@@ -8163,7 +8163,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         small_batch = m_est < self._STAGED_SMALL_BATCH_M_EST
         if small_batch:
             # Isolated stage time does not predict pipeline time at this scale,
-            # so time every pruned pair end to end, as --fast-scan does.
+            # so time every pruned pair end to end.
             print(
                 f"[mxfp4-staged] small batch M_est={m_est}: validating all "
                 f"{len(plan.pairs)} pruned pairs without screening",
