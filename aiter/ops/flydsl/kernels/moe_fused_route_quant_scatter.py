@@ -301,17 +301,6 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
     )
 
 
-def quant_layout_supported(feat_dim: int, quant_mode: str, wmma_rep: int) -> bool:
-    """Whether the per-block quant + scale-preshuffle builders accept ``feat_dim``
-    on the current arch: ``_quant_layout``'s geometry, nothing more (unlike
-    ``fused_quant_preshuffle_supported``, which adds the compact path's limits)."""
-    try:
-        _quant_layout(feat_dim, quant_mode, wmma_rep)
-    except (AssertionError, NotImplementedError):
-        return False
-    return True
-
-
 def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     """Emit one warp's per-MX-block quant + e8m0 scale-preshuffle loop.
 
