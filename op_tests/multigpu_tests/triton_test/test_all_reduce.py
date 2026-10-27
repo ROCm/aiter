@@ -49,18 +49,18 @@ def _bad(out, ref):
 
 
 def _stale_tail(rank, group, inboxes, calls, call):
-    """After an odd call on 3.1 chunks: does a line of chunk 3 that a peer sent into
-    bank 1 of this rank's inbox carry another call number?"""
+    """After an odd call on 3.1 chunks: does a unit of chunk 3 that a peer sent into
+    bank 1 of this rank's inbox carry another tag?"""
     torch.cuda.synchronize()
     dist.barrier(group=group)  # the peers have finished the call
     hip = ctypes.CDLL(find_loaded_library("libamdhip64"))
     slot = 4 * _LINES * ((calls.numel() - 1) // 2)  # int32 words, as in all_reduce
-    lines = (ctypes.c_int32 * (4 * _LINES))()  # [word, call, word, call] a line
+    units = (ctypes.c_uint16 * (8 * _LINES))()  # 3 values and the tag a unit
     for peer in range(WORLD_SIZE):
         if peer != rank:
             src = inboxes[rank] + 4 * ((4 + peer) * slot + 4 * 3 * _LINES)
-            assert hip.hipMemcpy(lines, ctypes.c_void_p(src), 16 * _LINES, 2) == 0
-            if any(tag != call for tag in lines[1::2]):
+            assert hip.hipMemcpy(units, ctypes.c_void_p(src), 16 * _LINES, 2) == 0
+            if any(tag != call % 32768 + 1 for tag in units[3::4]):
                 return True
     return False
 
@@ -117,8 +117,9 @@ def _worker(rank, init_method):
 
         # Last, with full inboxes: 4 chunks at call 1, then 3.1 chunks across the
         # counter wrap, then 4 chunks at call 1 again. Chunk 3 must not keep call 1.
+        full, part = 4 * 6 * _LINES, 3 * 6 * _LINES + 20  # 6 values a line
         for step, (numel, start) in enumerate(
-            [(1024, 0), (788, 2**30 - 2), (788, None), (1024, None)]
+            [(full, 0), (part, 2**30 - 2), (part, None), (full, None)]
         ):
             if start is not None:
                 calls[:-1].fill_(start)

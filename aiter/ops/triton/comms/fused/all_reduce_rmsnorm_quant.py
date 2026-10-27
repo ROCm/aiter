@@ -61,14 +61,13 @@ def all_reduce_rmsnorm_quant(
         scale = torch.empty(
             (tokens, hidden // 128), dtype=torch.float32, device=x.device
         )
-    lines = hidden // 4  # a row is hidden / 4 lines of 16 bytes
     programs = min(tokens, _ROW_PROGRAMS)
     _all_reduce_rmsnorm_kernel[(tokens + programs,)](
-        x.view(torch.int32),
-        residual.view(torch.int32),
-        weight.view(torch.int32),
-        out.view(torch.int32),
-        residual_out.view(torch.int32),
+        x,
+        residual,
+        weight,
+        out,
+        residual_out,
         q,
         scale,
         inboxes,
@@ -78,12 +77,12 @@ def all_reduce_rmsnorm_quant(
         programs,
         eps,
         RANK=dist.get_rank(group),
-        LINES=lines,
+        HIDDEN=hidden,
         SLOT=slot,
         MAXIT=_MAXIT,
         GEMMA=gemma,
         QUANT=quant,
-        num_warps=min(16, lines // 32),  # one line for each lane
+        num_warps=min(16, hidden // 128),  # one group of 128 values a wave
     )
     if quant:
         return out, residual_out, q, scale
