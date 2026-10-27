@@ -97,6 +97,16 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
     return num_waves
 
 
+def _base_view(t: torch.Tensor) -> torch.Tensor:
+    """``t`` as one dimension over the same base address. A strided scale view
+    (MegaMoE's compact rows) cannot ``.view(-1)``; the kernel walks it by its
+    own row stride, so only the base and a covering extent matter."""
+    if t.is_contiguous():
+        return t.view(-1)
+    span = 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+    return torch.as_strided(t, (span,), (1,))
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -253,8 +263,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         out.view(-1),
         ptr_arg(a),
         ptr_arg(w),
-        a_scales.view(torch.int32).view(-1),
-        w_scales.view(torch.int32).view(-1),
+        _base_view(a_scales.view(torch.int32)),
+        _base_view(w_scales.view(torch.int32)),
         contiguous_m,
         stream,
         N,
