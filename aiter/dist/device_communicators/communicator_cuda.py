@@ -989,6 +989,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         if dim != 0:
             raise NotImplementedError("only dim 0 all-gatherv is supported")
+        ca_comm = self.ca_comm
+        if ca_comm is not None and not ca_comm.disabled:
+            single = isinstance(input_, torch.Tensor)
+            outs = ca_comm.custom_all_gatherv(
+                [input_] if single else list(input_), sizes
+            )
+            if outs is not None:
+                return outs[0] if single else outs
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None and not pynccl_comm.disabled

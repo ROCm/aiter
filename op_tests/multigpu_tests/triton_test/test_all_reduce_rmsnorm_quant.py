@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 import aiter
+from aiter import logger
 from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
@@ -24,10 +25,8 @@ HIDDEN = 2048
 EPS = 1e-6
 TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
-pytestmark = pytest.mark.skipif(
-    torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250",
-    reason="needs 4 gfx1250 GPUs",
-)
+SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250"
+pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx1250 GPUs")
 
 
 def _inputs(tokens, rank, device):
@@ -152,3 +151,10 @@ def test_fused_allreduce_rmsnorm_dispatch():
         ]
         failures = [f for r in results for f in r.get(timeout=1800)]
     assert not failures, "\n".join(failures[:20])
+
+
+if __name__ == "__main__":  # CI runs the multi-GPU tests as scripts
+    if SKIP:
+        logger.warning("test_all_reduce_rmsnorm_quant skipped: needs 4 gfx1250 GPUs")
+    else:
+        test_all_reduce_rmsnorm_quant()

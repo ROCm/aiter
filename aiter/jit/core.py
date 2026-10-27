@@ -2170,6 +2170,16 @@ def _pybind_develop_hooks():
     return _pybind_develop_hooks_cache
 
 
+def _develop_arg(a, convert, tensor_cls):
+    """`a` as a develop=True pybind op takes it: a tensor converted, and so is
+    every tensor of a list (a std::vector<aiter_tensor_t> argument)."""
+    if isinstance(a, tensor_cls):
+        return convert(a)
+    if isinstance(a, (list, tuple)) and any(isinstance(x, tensor_cls) for x in a):
+        return [convert(x) if isinstance(x, tensor_cls) else x for x in a]
+    return a
+
+
 def compile_ops(
     _md_name: str,
     fc_name: str | None = None,
@@ -2475,12 +2485,10 @@ def compile_ops(
                             ),
                         )
 
-                    args = tuple(
-                        convert(a) if isinstance(a, tensor_cls) else a for a in args
-                    )
+                    args = tuple(_develop_arg(a, convert, tensor_cls) for a in args)
                     if kwargs:
                         kwargs = {
-                            k: convert(v) if isinstance(v, tensor_cls) else v
+                            k: _develop_arg(v, convert, tensor_cls)
                             for k, v in kwargs.items()
                         }
 
