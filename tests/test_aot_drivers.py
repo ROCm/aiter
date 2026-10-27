@@ -135,3 +135,50 @@ class PaGluonProcessLimitTest(unittest.TestCase):
             ):
                 self.assertEqual(cpp_itfs_utils._build_command(3), [*command, "-j1"])
         self.assertEqual(worker_count.call_args_list, [call(3), call(3)])
+
+
+class FlyDSLMoeEpProfileTest(unittest.TestCase):
+    def test_buckets_follow_get_padded_m(self):
+        from aiter.aot.flydsl import moe
+        from aiter.fused_moe import get_padded_M
+
+        for max_token in (1, 3, 1000, 16384, 16385, 40000, 131071, 131072, 200000):
+            buckets = moe._buckets(max_token)
+            starts = [low for _, low, _ in buckets[1:]] + [max_token + 1]
+            self.assertEqual(buckets[0][1], 1)
+            for (bucket, low, high), next_low in zip(buckets, starts):
+                with self.subTest(max_token=max_token, bucket=bucket):
+                    self.assertEqual(next_low, high + 1)
+                    self.assertEqual(get_padded_M(low), bucket)
+                    self.assertEqual(get_padded_M(high), bucket)
+
+    def test_default_profiles_replay_masked_callers(self):
+        from aiter.aot.flydsl import moe
+
+        profiles = moe.read_ep_profiles(moe.DEFAULT_EP_PROFILES[0])
+        jobs = moe.parse_ep_profiles(moe.DEFAULT_EP_PROFILES[0])
+        self.assertTrue(profiles)
+        self.assertTrue(all(job["expert_mask_size"] for job in jobs))
+        callers = {
+            (job["kernel_name"], job["expert"], job["local_tokens"]) for job in jobs
+        }
+        for profile in profiles:
+            for local_tokens in (False, True):
+                key = (f"EP {profile['model']}", profile["expert"], local_tokens)
+                self.assertIn(key, callers)
+
+    def test_profile_mask_must_exceed_local_experts(self):
+        import tempfile
+
+        from aiter.aot.flydsl import moe
+
+        with open(moe.DEFAULT_EP_PROFILES[0]) as f:
+            header, row = f.readline(), f.readline().split(",")
+        row[header.split(",").index("expert_mask_size")] = row[
+            header.split(",").index("expert")
+        ]
+        with tempfile.NamedTemporaryFile("w", suffix=".csv") as f:
+            f.write(header + ",".join(row))
+            f.flush()
+            with self.assertRaisesRegex(ValueError, "expert_mask_size"):
+                moe.read_ep_profiles(f.name)

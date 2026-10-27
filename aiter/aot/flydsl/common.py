@@ -430,10 +430,14 @@ def run_aot(cache_dir: str) -> None:
     # imported for the target arch, so they run in processes of their own.
     from .mega_moe import run as run_mega_moe_replay
     from .moe import DEFAULT_CSVS as MOE_CSVS
+    from .moe import DEFAULT_EP_PROFILES as MOE_EP_PROFILES
     from .moe import run as run_moe_replay
 
     replay_errors = []
-    moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
+    moe_failed_archs = run_moe_replay(
+        [p for p in MOE_CSVS if os.path.isfile(p)],
+        ep_profiles=[p for p in MOE_EP_PROFILES if os.path.isfile(p)],
+    )
     if moe_failed_archs:
         replay_errors.append(
             f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)"

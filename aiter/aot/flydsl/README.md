@@ -7,7 +7,7 @@ compiles them up front so the runtime JIT path hits the cache.
 
 | Module | OpKind | Description |
 | --- | --- | --- |
-| `moe.py` | `MOE` | Every FlyDSL kernel the tuned fused-MoE / FHMoE / gfx1250 grouped rows reach, by replaying `fused_moe` itself (see below) |
+| `moe.py` | `MOE` | Every FlyDSL kernel the tuned fused-MoE / FHMoE / gfx1250 grouped rows and the EP deployment profiles (`moe_ep_profiles.csv`) reach, by replaying `fused_moe` itself (see below) |
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
@@ -55,9 +55,11 @@ need no AOT change.
 - Rows of the gfx1250 grouped table replay with the gate/up-interleaved
   weights and n32k4 scales gfx1250 callers pass; `_fused_moe_impl` hands them
   to FlyDSL's grouped GEMM. Grouped rows tuned for EP only (`topk` -1, or
-  `ep_fused`) are skipped: the runtime picks them only under a caller's expert
-  mask or MegaMoE's stage-2 scatter, and the table records neither the global
-  expert count nor the real topk.
+  `ep_fused`) are not replayed as rows: the runtime picks them only under a
+  caller's expert mask or MegaMoE's stage-2 scatter, and the table records
+  neither the global expert count nor the real topk. The EP deployment
+  profiles below reach the `topk` -1 rows; MegaMoE's stage-2 scatter
+  (`ep_fused`) is not replayed.
 - Each row compiles for the arch its `gfx` column names. When `GPU_ARCHS`
   names targets, as `setup.py`'s wheel build has it, only rows of those archs
   are replayed; unset or `native`, rows of every arch are.
@@ -77,6 +79,49 @@ need no AOT change.
   compile once. `AITER_FLYDSL_AOT_TIMEOUT` applies to the worker's whole batch.
 - `--check` compiles nothing and fails on any kernel the replay would need but
   the cache lacks; it is the CPU-side counterpart of the step-2 test below.
+
+#### EP deployment profiles
+
+A caller behind an expert-parallel dispatch passes `fused_moe` an
+`expert_mask`, and the launches it masks compile for the mask's length: the
+gfx950 stage-2 reduction (`moe_reduction_..._m1e<len>`) and its route-guarded
+GEMM2, and the gfx1250 route (`moe_g2l_lut`, `moe_route_g2l_lds`) and bf16
+gather-reduce. No tuned row records that length, so these callers are listed
+in `moe_ep_profiles.csv`, one row per rank's call:
+
+| Column | What one rank passes `fused_moe` |
+| --- | --- |
+| `expert` | local experts, `w1.shape[0]` |
+| `topk` | routing columns, `topk_ids.shape[1]` |
+| `expert_mask_size` | `expert_mask.numel()` |
+| `max_token` | the largest M (rows of `hidden_states`) |
+| `gfx`, `cu_num`, `model_dim`, `inter_dim`, `act_type`, `dtype`, `q_type`, `q_dtype_a`, `q_dtype_w`, `use_g1u1`, `doweight_stage1` | as in a tuned table |
+| `model` | a label |
+
+ATOM and vLLM build the mask from the physical expert count (routed experts
+plus EPLB redundant ones), the fused shared experts and a sentinel. A rank
+then passes:
+
+- `expert` = physical experts / EP size + fused shared experts
+- `expert_mask_size` = physical experts + fused shared experts + 1
+- `topk` = top-k, or top-k + fused shared experts + 1 when shared experts are
+  fused (ATOM's `init_aiter_topK_meta_data`)
+
+For example DeepSeek-V4-Pro at EP8 with 64 EPLB redundant experts passes 56
+local experts, top-k 6 and a 449-entry mask.
+
+Each profile replays with that mask at the smallest and largest M of every
+`get_padded_M` bucket up to `max_token`, bisected as for rows, with and
+without `num_local_tokens` (MORI dispatch passes it, the all-gather path does
+not), the caller's default gate/up layout, and the SiTUv2 betas a row would
+get. It reads the tuned tables serving reads (`AITER_CONFIG_FMOE`,
+`AITER_CONFIG_GROUPED_FMOE`, or the merged defaults), so a profile needs no
+tuned row and picks one up where the table has it. The activation dtype is
+pinned to `q_dtype_a`, as serving pins it: left to `fused_moe`, gfx950 takes
+bf16 activations at small M (at every M for SiTUv2), which expert masking
+refuses, and gfx1250 fp4 unless `AITER_FORCE_A8W4` is set. `--csv` or
+`--ep-profile` alone replays only what it names; with neither, both defaults
+are replayed.
 
 ### How `mega_moe.py` works
 
@@ -181,6 +226,9 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 
 # MoE: verify an existing cache on CPU instead of compiling
 python -m aiter.aot.flydsl.moe --csv /path/to/config.csv --check
+
+# MoE: only EP deployment profiles (default table or your own)
+python -m aiter.aot.flydsl.moe --ep-profile aiter/aot/flydsl/moe_ep_profiles.csv
 ```
 
 ### Environment variables
@@ -220,10 +268,19 @@ selection is fully automatic.
 ## 2. Run the "AOT cache hit" test
 
 Compiling successfully is not enough — you also want to verify that the **runtime
-actually hits the AOT cache** (no cache miss). That is done by
-`op_tests/test_moe_2stage.py`, which wraps test cases with
-`aiter.aot.flydsl.common.fail_on_aot_cache_miss`: if the runtime falls back to
-JIT compilation, the case fails.
+actually hits the AOT cache** (no cache miss). The MoE tests do that by running
+cases in FlyDSL run-only mode (`aiter.aot.flydsl.common.run_only_env`,
+`FLYDSL_RUNTIME_RUN_ONLY=1`): a kernel missing from the cache raises instead of
+compiling, and the case fails.
+
+- `op_tests/test_moe_2stage.py` runs every FlyDSL row of the tuned tables
+  (cases with `check_aot_cache=True`).
+- `op_tests/test_moe_ep.py -t aot_ep_profiles` runs every EP deployment profile
+  of this GPU's arch through the expert-parallel `fused_moe` call (MXFP4 a8w4 /
+  a4w4, Silu / SiTUv2), at each `-m` token count up to the profile's
+  `max_token`. `--ep-profile` points it at other profile tables, `--ep-mode
+  fake` routes every token locally. It runs first among the test's defaults,
+  before the other tests JIT-compile in the same process.
 
 Full flow:
 
@@ -233,15 +290,16 @@ source /path/to/venv/bin/activate
 # (1) First compile the kernels into the cache
 python -m aiter.aot.flydsl.moe
 
-# (2) Then run the MoE 2stage test with cache checking.
-#     When a case has check_aot_cache=True it routes through
-#     test_fmoe_with_aot_cache_check, which raises AssertionError on a cache miss.
+# (2) Then run the tests with cache checking.
 python op_tests/test_moe_2stage.py
+python op_tests/test_moe_ep.py -t aot_ep_profiles -m 16 128 1024 8192
 ```
 
 > Note: both steps must use the **same** `FLYDSL_RUNTIME_CACHE_DIR` and run on
 > (or target) the **same GPU arch**, otherwise step 2 will be treated as a miss
-> because the cache dir / arch don't line up.
+> because the cache dir / arch don't line up. EP profiles replay against the
+> tuned tables the environment selects, so keep `AITER_CONFIG_FMOE` /
+> `AITER_CONFIG_GROUPED_FMOE` the same in both steps too.
 
 ---
 
