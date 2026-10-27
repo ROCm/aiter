@@ -8,6 +8,17 @@ import os
 _POWER_ALIASES = {"power", "efficiency", "power_efficiency"}
 _LATENCY_ALIASES = {"latency", "perf", "us", "performance"}
 
+# Written on every row of a power tune. A row without ``select`` is a latency
+# row; the other columns record the power-management state the watts came from.
+SELECT_COLUMN = "select"
+POWER_CONDITION_COLUMNS = ("perf_level", "power_cap_w", "sclk_max_mhz")
+POWER_ROW_COLUMNS = (SELECT_COLUMN,) + POWER_CONDITION_COLUMNS
+UNKNOWN_CONDITION = "unknown"
+MIXED_CONDITION = "mixed"
+# Power-tuned tables live here so the model_configs/ shape merge never ranks a
+# power row against a latency row.
+POWER_CONFIG_DIRNAME = "power_configs"
+
 
 def normalize_select(value) -> str:
     raw = str(value if value is not None else "latency").strip().lower()
@@ -23,6 +34,21 @@ def power_selection_enabled(explicit=None) -> bool:
         explicit if explicit is not None else os.environ.get("AITER_SELECT", "latency")
     )
     return normalize_select(raw) == "power"
+
+
+def row_select_mode(value) -> str:
+    """``power`` for a power-tuned row. Blank, NaN, or a merge fill of 0 is latency."""
+    if value is None:
+        return "latency"
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return "latency"
+    except TypeError:
+        pass
+    text = str(value).strip()
+    if text in ("", "0", "nan", "None"):
+        return "latency"
+    return normalize_select(text)
 
 
 def efficiency_cost(us, watts) -> float:

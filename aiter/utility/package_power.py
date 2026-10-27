@@ -48,13 +48,22 @@ def power_input_path(device_index: int = 0) -> str | None:
         if "{device}" in override:
             return override.replace("{device}", str(int(device_index)))
         return override
+    device_dir = _device_sysfs_dir(device_index)
+    if device_dir is None:
+        return None
+    hits = glob.glob(f"{device_dir}/hwmon/hwmon*/power1_input")
+    return hits[0] if hits else None
+
+
+def _device_sysfs_dir(device_index: int) -> str | None:
+    """PCI sysfs directory that has the hwmon node for a HIP device ordinal."""
     bdf = _hip_pci_bus_id(device_index)
     if not bdf:
         return None
     bdf = bdf.lower()
-    matches = glob.glob(f"/sys/bus/pci/devices/{bdf}/hwmon/hwmon*/power1_input")
-    if matches:
-        return matches[0]
+    direct = f"/sys/bus/pci/devices/{bdf}"
+    if glob.glob(f"{direct}/hwmon/hwmon*/power1_input"):
+        return direct
     for dev in glob.glob("/sys/class/drm/card*/device"):
         try:
             real = os.path.realpath(dev)
@@ -62,10 +71,79 @@ def power_input_path(device_index: int = 0) -> str | None:
             continue
         if os.path.basename(real).lower() != bdf:
             continue
-        hits = glob.glob(dev + "/hwmon/hwmon*/power1_input")
-        if hits:
-            return hits[0]
+        if glob.glob(dev + "/hwmon/hwmon*/power1_input"):
+            return dev
     return None
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="ascii") as handle:
+            return handle.read()
+    except (OSError, UnicodeError):
+        return None
+
+
+def _device_conditions(device_index: int) -> dict[str, str]:
+    """Power-management state a power tune ran under, as strings for a CSV row.
+
+    Reads only: the DPM performance level, the package power cap, and the top
+    of the overdrive SCLK range. A perf-determinism clock clamp is not always
+    visible in sysfs, so ``perf_level`` is the record of that mode.
+    """
+    from aiter.utility.tune_result import UNKNOWN_CONDITION
+
+    conditions = {
+        "perf_level": UNKNOWN_CONDITION,
+        "power_cap_w": UNKNOWN_CONDITION,
+        "sclk_max_mhz": UNKNOWN_CONDITION,
+    }
+    device_dir = _device_sysfs_dir(device_index)
+    if device_dir is None:
+        return conditions
+    level = _read_text(f"{device_dir}/power_dpm_force_performance_level")
+    if level and level.strip():
+        conditions["perf_level"] = level.strip()
+    caps = glob.glob(f"{device_dir}/hwmon/hwmon*/power1_cap")
+    cap = _read_text(caps[0]) if caps else None
+    try:
+        conditions["power_cap_w"] = str(round(int(cap.strip()) / 1e6))
+    except (AttributeError, ValueError):
+        pass
+    od = _read_text(f"{device_dir}/pp_od_clk_voltage")
+    if od:
+        in_sclk = False
+        top = None
+        for line in od.splitlines():
+            stripped = line.strip()
+            if stripped.endswith(":"):
+                in_sclk = stripped.upper().startswith("OD_SCLK")
+                continue
+            if in_sclk and ":" in stripped:
+                value = stripped.split(":", 1)[1].strip().lower()
+                if value.endswith("mhz"):
+                    top = value[: -len("mhz")].strip()
+        if top:
+            conditions["sclk_max_mhz"] = top
+    return conditions
+
+
+def tune_conditions(device_indices) -> dict[str, str]:
+    """Conditions shared by every tuning device, or ``mixed`` where they differ."""
+    from aiter.utility.tune_result import MIXED_CONDITION, UNKNOWN_CONDITION
+
+    per_device = [_device_conditions(int(index)) for index in device_indices]
+    if not per_device:
+        return {
+            "perf_level": UNKNOWN_CONDITION,
+            "power_cap_w": UNKNOWN_CONDITION,
+            "sclk_max_mhz": UNKNOWN_CONDITION,
+        }
+    merged = {}
+    for name in per_device[0]:
+        values = {device[name] for device in per_device}
+        merged[name] = values.pop() if len(values) == 1 else MIXED_CONDITION
+    return merged
 
 
 def _read_watts(path: str) -> float | None:

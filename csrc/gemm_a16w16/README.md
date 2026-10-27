@@ -75,13 +75,25 @@ If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with n
 ```
 
 ### `--select`
-- **Choices**: `latency` (default), `power` (`efficiency` and `power_efficiency` are aliases)
+- **Choices**: `latency` (default), `power` (experimental; `efficiency` and `power_efficiency` are aliases)
 - **Also**: `AITER_SELECT`
 - **Description**: Rank kernels that pass `errRatio`. `latency` keeps the lowest `us`. `power` ranks by TFLOP/s per package watt (`us * PPT watts`) and writes `watts` and `tflops_per_w`. This applies to every backend that uses the shared tuner, including asm, opus, flydsl, triton, skinny, torch, and hipblaslt. Runtime dispatch is unchanged: the one CSV row per shape is the kernel that runs.
 
+Power mode is experimental. It minimizes `us * package watts` among kernels that pass `errRatio` and adds no latency or throughput bound, so a slower kernel can win when it uses less energy. The score is an isolated replay of each kernel under the clock, power cap, and thermal state in effect during the tune. The winner can change in another model, under another power-management setting, or next to other kernels. Latency remains the default.
+
 PPT is the whole package (`power1_input`). Keep that GPU otherwise idle, and pass `--shape_grouped` so every candidate for a shape is measured on the same GPU. The sample window defaults to 0.4s (`AITER_POWER_WINDOW_S`) and runs only on the accurate pass. With `--select power`, hipblaslt times every heuristic on that pass instead of only the 20 fastest. `AITER_POWER_PATH` overrides the hwmon file. In a multi-process tune the path must contain `{device}` (the HIP ordinal); a single file is rejected unless `--mp 1`.
 
-Power mode minimizes `us * package watts` among kernels that pass `errRatio`. It does not add a latency bound. The measurement is an isolated package replay, so the winner can change under a different clock, power cap, or neighboring workload. Latency remains the default.
+Every row a power tune writes records the conditions its watts came from: `select=power`, `perf_level` (DPM performance level), `power_cap_w`, and `sclk_max_mhz` (top of the overdrive SCLK range). A value is `mixed` when the tuning GPUs differ and `unknown` when sysfs does not expose it. A perf-determinism clock clamp may not appear in `sclk_max_mhz`; `perf_level` records that mode.
+
+#### Where power rows are stored and how they load
+
+Power rows are kept apart from latency rows, because the default config load merges tables by shape key:
+
+- **Default output.** When `-o` is a shipped table under `aiter/configs/` (including `model_configs/`), a power tune writes to `aiter/configs/power_configs/<same file name>` instead. An `-o` outside the shipped tables is written as given.
+- **`AITER_SELECT=power`, no `AITER_CONFIG_*` set.** The latency tables load and merge as usual. Then every shape that has a row in `power_configs/` uses that power row, and every other shape keeps its latency row. No source file is rewritten for this overlay. Without `AITER_SELECT=power`, `power_configs/` is ignored.
+- **One model's table.** To load exactly one model's power table, point that op's variable at it, for example `AITER_CONFIG_FMOE=/path/model_power_tuned_fmoe.csv`. That skips both the `model_configs/` scan and the `power_configs/` overlay, so no other model's rows are merged in. Shapes not in that file have no tuned row unless the canonical table is also listed (separated by `:`), and listed tables are merged by shape again.
+- **Conflicting rows.** If a merge finds a power row and a latency row for the same shape, or power rows for one shape tuned under different `perf_level`, `power_cap_w`, or `sclk_max_mhz`, it raises without rewriting any file. Power rows for one shape tuned under the same conditions auto-resolve by highest `tflops_per_w`.
+- **CK and other compiled tables.** Families whose tuned CSV is compiled into the JIT module read the table at build time. Changing `AITER_SELECT` for them needs `AITER_REBUILD=1`.
 
 ```bash
 python3 csrc/gemm_a16w16/gemm_tuner.py \

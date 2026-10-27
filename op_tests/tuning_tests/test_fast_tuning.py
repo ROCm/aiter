@@ -1183,5 +1183,164 @@ class TestPowerSelectionGaps(unittest.TestCase):
                 os.environ[override] = previous
 
 
+class TestPowerTableSeparation(unittest.TestCase):
+    def test_device_conditions_read_level_cap_and_sclk(self):
+        import tempfile
+
+        from aiter.utility import package_power
+
+        with tempfile.TemporaryDirectory() as device_dir:
+            os.makedirs(f"{device_dir}/hwmon/hwmon3")
+            with open(f"{device_dir}/power_dpm_force_performance_level", "w") as f:
+                f.write("perf_determinism\n")
+            with open(f"{device_dir}/hwmon/hwmon3/power1_cap", "w") as f:
+                f.write("1000000000\n")
+            with open(f"{device_dir}/pp_od_clk_voltage", "w") as f:
+                f.write("OD_SCLK:\n0: 500Mhz\n1: 2100Mhz\nOD_MCLK:\n0: 900Mhz\n")
+            with mock.patch.object(
+                package_power, "_device_sysfs_dir", return_value=device_dir
+            ):
+                conditions = package_power._device_conditions(0)
+        self.assertEqual(
+            conditions,
+            {
+                "perf_level": "perf_determinism",
+                "power_cap_w": "1000",
+                "sclk_max_mhz": "2100",
+            },
+        )
+
+    def test_tune_conditions_mark_devices_that_differ(self):
+        from aiter.utility import package_power
+
+        states = [
+            {"perf_level": "auto", "power_cap_w": "1400", "sclk_max_mhz": "2400"},
+            {"perf_level": "auto", "power_cap_w": "1000", "sclk_max_mhz": "2400"},
+        ]
+        with mock.patch.object(package_power, "_device_conditions", side_effect=states):
+            merged = package_power.tune_conditions([0, 1])
+        self.assertEqual(merged["perf_level"], "auto")
+        self.assertEqual(merged["power_cap_w"], "mixed")
+
+    def test_power_rows_are_stamped_and_columns_extended(self):
+        import pandas as pd
+
+        from aiter.utility.base_tuner import TunerCommon
+
+        stub = SimpleNamespace(columns=["M", "us"])
+        args = SimpleNamespace(select="power", mp=1)
+        frame = pd.DataFrame([{"M": 1, "us": 2.0}])
+        conditions = {
+            "perf_level": "auto",
+            "power_cap_w": "1400",
+            "sclk_max_mhz": "2400",
+        }
+        with mock.patch(
+            "aiter.utility.package_power.tune_conditions", return_value=conditions
+        ):
+            stamped = TunerCommon._stamp_power_rows(stub, frame, args)
+        self.assertEqual(stamped.iloc[0]["select"], "power")
+        self.assertEqual(stamped.iloc[0]["power_cap_w"], "1400")
+        self.assertEqual(
+            stub.columns,
+            ["M", "us", "select", "perf_level", "power_cap_w", "sclk_max_mhz"],
+        )
+        latency = TunerCommon._stamp_power_rows(
+            SimpleNamespace(columns=["M", "us"]),
+            frame,
+            SimpleNamespace(select="latency"),
+        )
+        self.assertNotIn("select", latency.columns)
+
+    def test_power_tune_of_shipped_table_writes_to_power_configs(self):
+        import argparse
+        import tempfile
+
+        from aiter.utility.base_tuner import TunerCommon
+
+        with tempfile.TemporaryDirectory() as root:
+            shipped = f"{root}/aiter/configs/tuned_fmoe.csv"
+            parser = argparse.ArgumentParser()
+            parser.add_argument("-o", dest="tune_file", default=shipped)
+            stub = SimpleNamespace(
+                parser=parser, get_out_file=lambda path: path.split(os.pathsep)[0]
+            )
+            with mock.patch("aiter.jit.core.AITER_ROOT_DIR", root):
+                args = SimpleNamespace(tune_file=shipped)
+                TunerCommon._redirect_power_output(stub, args)
+                self.assertEqual(
+                    args.tune_file,
+                    f"{root}/aiter/configs/power_configs/tuned_fmoe.csv",
+                )
+                chosen = SimpleNamespace(tune_file="/tmp/my_model_power.csv")
+                TunerCommon._redirect_power_output(stub, chosen)
+                self.assertEqual(chosen.tune_file, "/tmp/my_model_power.csv")
+
+    def test_merge_refuses_power_and_latency_rows_for_one_shape(self):
+        import pandas as pd
+
+        from aiter.jit.core import AITER_CONFIG
+
+        mixed = pd.DataFrame(
+            [
+                {"M": 1, "us": 5.0, "select": 0, "power_cap_w": 0},
+                {"M": 1, "us": 9.0, "select": "power", "power_cap_w": "1400"},
+            ]
+        )
+        self.assertIn("latency row", AITER_CONFIG._power_merge_conflict(mixed, ["M"]))
+        caps = pd.DataFrame(
+            [
+                {"M": 1, "us": 5.0, "select": "power", "power_cap_w": "1400"},
+                {"M": 1, "us": 9.0, "select": "power", "power_cap_w": "1000"},
+            ]
+        )
+        self.assertIn("power_cap_w", AITER_CONFIG._power_merge_conflict(caps, ["M"]))
+        same = caps.assign(power_cap_w="1400")
+        self.assertIsNone(AITER_CONFIG._power_merge_conflict(same, ["M"]))
+        latency_only = pd.DataFrame([{"M": 1, "us": 5.0}, {"M": 1, "us": 6.0}])
+        self.assertIsNone(AITER_CONFIG._power_merge_conflict(latency_only, ["M"]))
+
+    def test_power_overlay_replaces_only_covered_shapes(self):
+        import tempfile
+
+        import pandas as pd
+
+        from aiter.jit.core import AITER_CONFIG, AITER_CONFIGS
+
+        with tempfile.TemporaryDirectory() as tmp:
+            latency_file = f"{tmp}/latency.csv"
+            power_file = f"{tmp}/tuned_demo.csv"
+            pd.DataFrame(
+                [
+                    {"M": 1, "us": 5.0, "kernel": "fast", "xbf16": 0},
+                    {"M": 2, "us": 7.0, "kernel": "only_latency", "xbf16": 0},
+                ]
+            ).to_csv(latency_file, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "M": 1.0,
+                        "us": 9.0,
+                        "kernel": "cool",
+                        "watts": 300.0,
+                        "select": "power",
+                    }
+                ]
+            ).to_csv(power_file, index=False)
+            with (
+                mock.patch.object(
+                    AITER_CONFIG, "_shape_dedup_keys", return_value=["M"]
+                ),
+                mock.patch("tempfile.gettempdir", return_value=tmp),
+            ):
+                merged_path = AITER_CONFIGS._overlay_power_tables(
+                    latency_file, [power_file], "tuned_demo", None
+                )
+            merged = pd.read_csv(merged_path).sort_values("M")
+        self.assertEqual(list(merged["kernel"]), ["cool", "only_latency"])
+        self.assertEqual(list(merged["select"]), ["power", "latency"])
+        self.assertEqual(list(merged["xbf16"]), [0, 0])
+
+
 if __name__ == "__main__":
     unittest.main()
