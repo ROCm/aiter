@@ -729,7 +729,16 @@ def test_mha_v4_fp8_raw_recipe_matches_rotated_packed():
     get_gfx() not in ("gfx942", "gfx950"),
     reason="gfx942/gfx950 FP8 recipe validation",
 )
-@parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
+# The FP8 arm is real gfx942 coverage; the MX arms would reach quantizers that AITER_CHECK on
+# gfx950, and that check aborts the process rather than raising.
+@parametrize(
+    "recipe",
+    [
+        "fp8",
+        param("mxfp8", skip=get_gfx() != "gfx950"),
+        param("mxfp4", skip=get_gfx() != "gfx950"),
+    ],
+)
 def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     """A direction shared by every key must not cost accuracy.
 
