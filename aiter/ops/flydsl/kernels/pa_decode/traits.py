@@ -165,12 +165,16 @@ class PaDecodeSchedule:
             and query_length == 8
             and trans_v
             and not per_token_kv
-            and (sliding_window == 0 or 128 <= sliding_window <= 1024)
+            and (
+                (is_bf16_kv and sliding_window >= 0)
+                or sliding_window == 0
+                or 128 <= sliding_window <= 1024
+            )
         ):
             raise ValueError(
                 "asymmetric V requires gfx950 BF16 Q/O, scalar FP8 or BF16 KV, "
-                "Qlen8/GQA16/page64 D192/V128, and full attention or a sliding "
-                "window in [128, 1024]"
+                "Qlen8/GQA16/page64 D192/V128, and full attention or a positive "
+                "sliding window (FP8 KV requires a sliding window in [128, 1024])"
             )
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (

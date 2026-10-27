@@ -158,6 +158,11 @@ def test_bf16_swa_query_split_schedule(
         ("fp8", "per-tensor", -2, None),
         ("bf16", "none", -1, 0),
         ("bf16", "none", 0, 0),
+        ("bf16", "none", -2, None),
+        *[
+            ("bf16", "none", window, window)
+            for window in (1, 127, 1025, 4097, 2**31 + 1)
+        ],
         *[
             (dtype, scale, window, window)
             for dtype, scale in (("fp8", "per-tensor"), ("bf16", "none"))
@@ -165,7 +170,7 @@ def test_bf16_swa_query_split_schedule(
         ],
         *[
             (dtype, scale, window, None)
-            for dtype, scale in (("fp8", "per-tensor"), ("bf16", "none"))
+            for dtype, scale in (("fp8", "per-tensor"),)
             for window in (127, 1025)
         ],
     ],
@@ -197,10 +202,13 @@ def test_asymmetric_tuning_cli_window(kv_dtype, scale_mode, window, expected_win
         assert tuning._parse_args(argv).sliding_window == expected_window
 
 
-@pytest.mark.parametrize("kv_dtype", ["fp8", "bf16"])
-@pytest.mark.parametrize("window", [127, 1025])
-def test_asymmetric_schedule_rejects_window(monkeypatch, kv_dtype, window):
-    """Direct scheduler calls must enforce the asymmetric window bounds."""
+@pytest.mark.parametrize(
+    "kv_dtype,window,accepted",
+    [("fp8", 127, False), ("fp8", 1025, False), ("bf16", -1, False)]
+    + [("bf16", window, True) for window in (0, 1, 127, 1025, 4097, 2**31 + 1)],
+)
+def test_asymmetric_schedule_window_contract(monkeypatch, kv_dtype, window, accepted):
+    """BF16 generalizes positive windows; FP8 retains its qualified range."""
     traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
     monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
     kwargs = {
@@ -218,8 +226,11 @@ def test_asymmetric_schedule_rejects_window(monkeypatch, kv_dtype, window):
         "query_length": 8,
         "sliding_window": window,
     }
-    with pytest.raises(ValueError, match=r"sliding window in \[128, 1024\]"):
+    if accepted:
         traits.PaDecodeSchedule.select(**kwargs)
+    else:
+        with pytest.raises(ValueError, match="sliding window"):
+            traits.PaDecodeSchedule.select(**kwargs)
 
 
 @pytest.mark.parametrize("value_dim", [None, 128, 64])
@@ -503,6 +514,13 @@ _FP8_CASES = _COMMON_CASES + [
 ]
 _BF16_CASES = _COMMON_CASES + [
     *_ASYMMETRIC_WINDOW_CASES,
+    *[
+        (
+            f"asymmetric-window-{window}",
+            {**_ASYMMETRIC_WINDOW_CASES[0][1], "window": window},
+        )
+        for window in (1, 127, 1025, 4097, 2**31 + 1)
+    ],
     (
         "asymmetric-full",
         {**_ASYMMETRIC_WINDOW_CASES[0][1], "window": 0},
@@ -829,7 +847,7 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
                 },
                 id=f"invalid-{dtype}-asymmetric-window-{window}",
             )
-            for dtype in ("fp8", "bf16")
+            for dtype in ("fp8",)
             for window in (127, 1025)
         ],
         *[
@@ -1064,8 +1082,10 @@ def test_pa_decode(case, device, monkeypatch):
             check()
 
 
-@pytest.mark.parametrize("kv_dtype", ["fp8", "bf16"])
-def test_asymmetric_autotune_plan(kv_dtype, device, tmp_path):
+@pytest.mark.parametrize(
+    "kv_dtype,window", [("fp8", 128), ("bf16", 128), ("bf16", 1), ("bf16", 1025)]
+)
+def test_asymmetric_autotune_plan(kv_dtype, window, device, tmp_path):
     """Tuned and cached plans must decode with the physical V/output width."""
     if get_gfx() != "gfx950":
         pytest.skip("asymmetric Q/K and V widths require gfx950")
@@ -1089,7 +1109,7 @@ def test_asymmetric_autotune_plan(kv_dtype, device, tmp_path):
         table,
         context,
         8,
-        128,
+        window,
         None,
     )
     pages = key.shape[0]
@@ -1107,7 +1127,7 @@ def test_asymmetric_autotune_plan(kv_dtype, device, tmp_path):
     options = {
         "key_scale": key_scale,
         "value_scale": value_scale,
-        "sliding_window": 128,
+        "sliding_window": window,
         "max_context_length": 1027,
     }
     plan = tuning.prepare_pa_decode_plan(

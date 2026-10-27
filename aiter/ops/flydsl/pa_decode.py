@@ -216,7 +216,8 @@ def pa_decode(
     splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
     into separate query CTAs. Q/K and V/output head dimensions normally match.
     The qualified gfx950 Qlen8/GQA16/page64 path also supports Q/K192-V128
-    with scalar FP8 or BF16 KV for full attention or sliding windows in [128, 1024].
+    with scalar FP8 or BF16 KV. Both support full attention; BF16 KV supports
+    any positive sliding window, while FP8 KV is limited to [128, 1024].
     ALiBi and externally quantized queries are unsupported.
 
     MTP lengths include the query tokens and use dense causal masking.
@@ -616,7 +617,7 @@ def pa_decode(
         and query.dtype == torch.bfloat16
         and key_cache.dtype in (torch.float8_e4m3fn, torch.bfloat16)
         and query_length == 8
-        and (sliding_window == 0 or 128 <= sliding_window <= 1024)
+        and (is_bf16_kv or sliding_window == 0 or 128 <= sliding_window <= 1024)
         and head_dim == 192
         and value_dim == 128
         and block_size == 64
@@ -628,7 +629,8 @@ def pa_decode(
         raise NotImplementedError(
             "asymmetric value width requires gfx950 BF16 Q/O, scalar FP8 or "
             "BF16 KV, Qlen8, GQA16, one KV head, page64, Q/K192-V128, "
-            "vectorized V, and full attention or a sliding window in [128, 1024]"
+            "vectorized V, and full attention or a positive sliding window "
+            "(FP8 KV requires a sliding window in [128, 1024])"
         )
     num_partitions = work_plan.max_partitions
     pmax = max_logits
