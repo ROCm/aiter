@@ -158,6 +158,16 @@ def _token_points(token: int, edges: bool) -> list[int]:
     return [token // 2 + 1, token]
 
 
+def _is_a8w4_gfx942(row: dict) -> bool:
+    """A gfx942 a8w4 row: its `_g942` stage 1 reads separated gate/up W1 and W1
+    scale relaid by shuffle_{weight,scale}_a8w4_gfx942 on top of the a16w4
+    preshuffle."""
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    params = get_flydsl_kernel_params(_name(row.get("kernelName1"))) or {}
+    return params.get("in_dtype") == "a8w4_gfx942"
+
+
 def _caller_gate_mode(row: dict):
     """Gate/up weight layout serving uses for a quant family (gu-interleaved
     for fp8 activations, as with ATOM_MOE_GU_ITLV=1). gfx1250 takes only the
@@ -166,6 +176,8 @@ def _caller_gate_mode(row: dict):
 
     if job_arch(row) == "gfx1250":
         return GateMode.INTERLEAVE
+    if _is_a8w4_gfx942(row):
+        return GateMode.SEPARATED
     q_dtype_a, q_dtype_w = _name(row["q_dtype_a"]), _name(row["q_dtype_w"])
     mxfp8 = q_dtype_w in _FP8 and _name(row["q_type"]) == "per_1x32"
     if q_dtype_a in _FP8 and (q_dtype_w == _FP4 or mxfp8):
@@ -327,11 +339,20 @@ def _caller_inputs(job: dict) -> dict:
         w1_scale = empty(experts * w1_rows, model_dim // 32, dtype=dtypes.fp8_e8m0)
         w2_scale = empty(experts * model_dim, inter_dim // 32, dtype=dtypes.fp8_e8m0)
         if q_dtype_a in (dtypes.bf16, dtypes.fp16, dtypes.fp8):
-            gate_up = q_dtype_a == dtypes.fp8
+            a8w4_gfx942 = _is_a8w4_gfx942(job)
+            gate_up = q_dtype_a == dtypes.fp8 and not a8w4_gfx942
             w1 = shuffle_weight_a16w4(w1, 16, gate_up)
             w1_scale = shuffle_scale_a16w4(w1_scale, experts, gate_up)
             w2 = shuffle_weight_a16w4(w2, 16, False)
             w2_scale = shuffle_scale_a16w4(w2_scale, experts, False)
+            if a8w4_gfx942:
+                from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
+                    shuffle_scale_a8w4_gfx942,
+                    shuffle_weight_a8w4_gfx942,
+                )
+
+                w1 = shuffle_weight_a8w4_gfx942(w1)
+                w1_scale = shuffle_scale_a8w4_gfx942(w1_scale)
         else:
             w1 = shuffle_weight(w1, layout=(16, 16))
             w2 = shuffle_weight(w2, layout=(16, 16))

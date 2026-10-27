@@ -610,6 +610,10 @@ def _a8w4_gfx942_chip_id(device: int) -> int:
 
 def a8w4_gfx942_supported(device=None) -> bool:
     """True on the gfx942 parts the a8w4 stage1 is enabled on (MI325X)."""
+    if os.getenv("AITER_AOT_REPLAY") == "1":
+        # An AOT replay has no device and compiles for the arch GPU_ARCHS names; the
+        # device check applies when serving.
+        return True
     idx = device.index if isinstance(device, torch.device) else device
     if idx is None:
         idx = torch.cuda.current_device()
