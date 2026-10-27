@@ -223,12 +223,13 @@ def get_moe_a4w4_layouts_prefill(
 
     GATHER_IDX_LAYOUT = None
     if has_GatherIndx:
+        gather_spt_dim0 = max(1, BLOCK_M // (32 * num_warps))
         GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(
-                size_per_thread=[1, 256 // gather_idx_bitwidth],
+                size_per_thread=[gather_spt_dim0, 256 // gather_idx_bitwidth],
                 threads_per_warp=[32, 1],
-                warps_per_cta=[1, num_warps],
+                warps_per_cta=[num_warps, 1],
                 order=[0, 1],
                 cga_layout=CGA_A_T,
             ),
@@ -421,12 +422,13 @@ def get_moe_a4w4_layouts_decode(
 
     GATHER_IDX_LAYOUT = None
     if has_GatherIndx:
+        gather_spt_dim0 = max(1, BLOCK_M // (32 * num_warps))
         GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(
-                size_per_thread=[1, 256 // gather_idx_bitwidth],
+                size_per_thread=[gather_spt_dim0, 256 // gather_idx_bitwidth],
                 threads_per_warp=[32, 1],
-                warps_per_cta=[1, num_warps],
+                warps_per_cta=[num_warps, 1],
                 order=[0, 1],
             ),
         )

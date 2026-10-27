@@ -189,19 +189,38 @@ def _find_rocm_home() -> str | None:
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm_home is None:
-        # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
-        # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
+        # Guess #2: rocm-sdk-devel or rocm-sdk-core pip packages ship a
+        # self-contained ROCm tree under site-packages/. Prefer this over a
         # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
         # wrapper, not a real binary — realpath() can't recover the SDK
         # root from it.
-        try:
-            spec = importlib.util.find_spec("_rocm_sdk_devel")
-        except (ImportError, ValueError):
-            spec = None
-        if spec is not None and spec.submodule_search_locations:
-            candidate = spec.submodule_search_locations[0]
-            if _find_executable(os.path.join(candidate, "bin"), "hipconfig"):
-                rocm_home = candidate
+        #
+        # Use importlib first, then fall back to scanning site-packages
+        # directories directly — PEP 517 build isolation may hide these
+        # packages from the import machinery even though they are installed.
+        for _sdk_pkg in ("_rocm_sdk_devel", "_rocm_sdk_core"):
+            try:
+                spec = importlib.util.find_spec(_sdk_pkg)
+            except (ImportError, ValueError):
+                spec = None
+            if spec is not None and spec.submodule_search_locations:
+                candidate = spec.submodule_search_locations[0]
+                if _find_executable(os.path.join(candidate, "bin"), "hipconfig"):
+                    rocm_home = candidate
+                    break
+        else:
+            import site
+
+            for sp_dir in site.getsitepackages():
+                for _sdk_pkg in ("_rocm_sdk_devel", "_rocm_sdk_core"):
+                    candidate = os.path.join(sp_dir, _sdk_pkg)
+                    if os.path.isdir(candidate) and _find_executable(
+                        os.path.join(candidate, "bin"), "hipconfig"
+                    ):
+                        rocm_home = candidate
+                        break
+                if rocm_home is not None:
+                    break
     if rocm_home is None:
         # Guess #3
         hipcc_path = shutil.which("hipcc")

@@ -239,16 +239,16 @@ def log2_power_of_two(x):
     assert x > 0 and (x & (x - 1)) == 0, "x must be a power of two"
     return x.bit_length() - 1
 
-
+#                                 128      , 8192   ,  16
 def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
-    BLOCK = triton.next_power_of_2(n_expts_tot)
+    BLOCK = triton.next_power_of_2(n_expts_tot)  # 128
     cdiv = triton.cdiv
-    block_m_log2 = log2_power_of_two(block_m)
+    block_m_log2 = log2_power_of_two(block_m)    # 4
     if n_gates <= n_expts_tot:
         max_n_tiles = n_gates
     else:
         max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // block_m)
-
+        #                 128     - 1 - ((128 - 8192 - 1) // 16)
     # allocate memory
     def pad(x):
         return cdiv(x, BLOCK) * BLOCK
@@ -258,7 +258,6 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
     token_offs_combined = torch.empty(
         (2, pad(n_expts_tot + 1)), dtype=dtype, device=device
     )
-
     token_offs_raw = token_offs_combined[0][: n_expts_tot + 1]
     token_offs_pad = token_offs_combined[1][: n_expts_tot + 1]
 
