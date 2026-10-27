@@ -139,20 +139,25 @@ def run_torch_gemm_afp8wfp8(
 
 # (x_scale_group_size, transpose_x_scale). 128/True is what ATOM's per_1x128
 # quant emits; 32/False is MX activations.
-# SCALE_MODES = [(128, False), (128, True), (32, False), (32, True)]
-SCALE_MODES = [
-    (128, True),
-]
+SCALE_MODES = [(128, False), (128, True), (32, False), (32, True)]
 
 
 def get_shapes():
     # (M, N, K), with N % 128 == 0 and K % 128 == 0 to fit the 128x128 W-scale layout.
     return [
         (m, n, k)
-        # for m in [1, 8, 16, 32, 64, 512, 16384]
-        for m in [512, 16384]
+        for m in [16, 32, 64, 512]
         for n, k in [
+            (2048, 7168),
             (65536, 1536),
+            (16384, 1536),
+            (8192, 1536),
+            (7168, 16384),
+            (7168, 4096),
+            (6144, 7168),
+            (7168, 3072),
+            (1536, 7168),
+            (7168, 768),
         ]
     ]
 
@@ -431,8 +436,8 @@ def _execution_config(packed=False, fused=False, splits=3, n_first=False):
 
 def _compact_scale_inputs(m, n, k, a_group, b_group):
     torch.manual_seed(m + n + k)
-    x = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
-    w = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    w = torch.randn(n, k, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
     xs = torch.randint(124, 131, (m, k // a_group), device="cuda", dtype=torch.uint8)
     ws = torch.randint(
         124,
@@ -612,8 +617,10 @@ def test_compact_scale_partial_k_tile(a_group, b_group, fused):
 
 def generate_group32_inputs(m, n, k, weight_group_rows=32):
     torch.manual_seed(m + n + k)
-    x = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
-    weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
     xs = torch.randint(122, 131, (m, k // 32), device="cuda", dtype=torch.uint8)
     ws = torch.randint(
         122,
@@ -698,8 +705,10 @@ def test_tuned_variants_use_production_config(m, packed, dtype):
 )
 @pytest.mark.usefixtures("_require_gfx950")
 def test_group32_projection_extreme_scale_codes(a_code, b_code):
-    x = torch.ones(3, 1280, device="cuda").to(torch.float8_e4m3fn)
-    weight = torch.ones(2048, 1280, device="cuda").to(torch.float8_e4m3fn)
+    x = torch.ones(3, 1280, device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    weight = torch.ones(2048, 1280, device="cuda", dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
     xs = torch.full((3, 40), a_code, device="cuda", dtype=torch.uint8).view(
         torch.float8_e8m0fnu
     )

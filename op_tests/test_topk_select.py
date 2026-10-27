@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""`aiter.topk_select`: the dispatched per-row top-k, against its four backends.
+"""`aiter.topk_select`: the dispatched per-row top-k, against its five backends.
 
 Two halves. The sweep times `topk_select` beside every backend that can serve
 the shape, so the dispatch can be read off the table rather than trusted; a row
@@ -18,6 +18,7 @@ and all three returned plausible tensors. Each has an assertion here.
 
 import argparse
 import itertools
+from contextlib import contextmanager
 
 import pandas as pd
 import torch
@@ -37,7 +38,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 
 def run_torch(x, row_lens, k):
@@ -124,6 +125,69 @@ def test_topk_argmax_half(m, n, dtype):
     return ret
 
 
+def test_zero_rows():
+    """An empty batch selects nothing and leaves no launch error behind.
+
+    Every backend puts rows on a grid dimension, so a zero-row call used to
+    launch a zero-sized grid: HIP rejected it, and the next kernel on the
+    stream raised. The probe after each call is that next kernel. Each shape is
+    first run at one row, so the empty call takes the cached launch a server
+    hits rather than the first-call compile.
+    """
+    i32 = torch.int32
+    cases = [
+        # (name, dtype, width, k, kwargs)
+        *(
+            (f"argmax {dt} n={n}", dt, n, 1, {"tie": "low"})
+            for dt in (dtypes.fp32, dtypes.bf16, dtypes.fp16)
+            # 2048 takes the single-pass launch, 129280 the split one.
+            for n in (2048, 129280)
+        ),
+        ("small_k", dtypes.fp32, 2048, 16, {}),
+        ("stream", dtypes.fp32, 32768, 512, {}),
+        # The form a relaxed-acceptance rejection sampler asks for.
+        (
+            "decode sorted+values",
+            dtypes.fp32,
+            129280,
+            10,
+            {"sorted": True, "tie": "low", "return_value": True},
+        ),
+        (
+            "output_idx+offset+end",
+            dtypes.fp32,
+            2048,
+            16,
+            {
+                "output_idx": torch.empty(0, 16, dtype=i32),
+                "output_idx_offset": torch.empty(0, dtype=i32),
+                "end": torch.empty(0, dtype=i32),
+                "sorted_index": True,
+            },
+        ),
+    ]
+    failures = []
+    for name, dtype, n, k, kwargs in cases:
+        try:
+            warm = {kk: v for kk, v in kwargs.items() if not torch.is_tensor(v)}
+            topk_select(torch.randn(1, n, dtype=dtype), k, **warm)
+            torch.cuda.synchronize()
+            vals, idx = topk_select(torch.empty(0, n, dtype=dtype), k, **kwargs)
+            torch.ones(1).add_(1)
+            torch.cuda.synchronize()
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{name}: {e!r}"[:200])
+            continue
+        if idx.shape != (0, k):
+            failures.append(f"{name}: idx shape {tuple(idx.shape)}")
+        if "output_idx" in kwargs and idx.data_ptr() != kwargs["output_idx"].data_ptr():
+            failures.append(f"{name}: output_idx not returned")
+        if kwargs.get("return_value") and (vals is None or vals.shape != (0, k)):
+            got = None if vals is None else tuple(vals.shape)
+            failures.append(f"{name}: values {got}")
+    return failures
+
+
 def test_half_invariants(m, n):
     """What the half-format reduction promises beyond agreeing on random rows.
 
@@ -191,14 +255,9 @@ def test_half_invariants(m, n):
     return failures
 
 
-def _run_single_backend(x, row_lens, k, backend):
-    """Call one backend through the entry by hiding the others from it.
-
-    Asserts that the entry really used it. It did not, once: the dispatch tail
-    could name a backend outside the set it was given, so hiding the others made
-    `small_k` fall through to decode and this function timed decode under the
-    small-k column -- 210.7us for a selector that runs in 40.2.
-    """
+@contextmanager
+def _only_backend(backend):
+    """Hide every backend but `backend` from the entry's untied dispatch."""
     import aiter.ops.topk_select as ts
 
     keep = ts._BACKENDS_BY_TIE
@@ -210,16 +269,148 @@ def _run_single_backend(x, row_lens, k, backend):
     # the answers taken while it was visible -- both on the way in and out.
     ts._choose.cache_clear()
     try:
-        rows, width = x.shape
-        wave = wave_size_of(x.device.index)
-        served = ts._available(width, k, wave, False) & {backend}
-        picked = ts.topk_select_backend(rows, width, k, served)
-        if picked != backend:
-            raise AssertionError(f"asked for {backend}, the dispatch chose {picked}")
-        return topk_select(x, k)[1]
+        yield
     finally:
         ts._BACKENDS_BY_TIE = keep
         ts._choose.cache_clear()
+
+
+def _serves(backend, rows, width, k, ragged):
+    """Would the entry, with only `backend` visible, really dispatch to it?"""
+    served = _available(width, k, wave_size_of(None), ragged) & {backend}
+    return bool(served) and topk_select_backend(rows, width, k, served) == backend
+
+
+def _run_single_backend(x, row_lens, k, backend):
+    """Call one backend through the entry by hiding the others from it.
+
+    Asserts that the entry really used it. It did not, once: the dispatch tail
+    could name a backend outside the set it was given, so hiding the others made
+    `small_k` fall through to decode and this function timed decode under the
+    small-k column -- 210.7us for a selector that runs in 40.2.
+    """
+    rows, width = x.shape
+    if not _serves(backend, rows, width, k, False):
+        raise AssertionError(f"asked for {backend}, the dispatch chose another")
+    with _only_backend(backend):
+        return topk_select(x, k)[1]
+
+
+# One case per launch shape a backend has, as (backend, width, k).
+_LAUNCH_SHAPES = (
+    ("argmax", 2048, 1),  # one workgroup per row
+    ("argmax", 129280, 1),  # split, then fold
+    # Widths off the vector and off the bucket: the only ones with columns past
+    # the row inside the last load, which is what an `end` past the row reaches.
+    ("argmax", 2050, 1),
+    ("small_k", 2048, 16),
+    ("small_k", 3000, 16),
+    ("plain", 32768, 1024),
+    ("decode", 8192, 512),  # one workgroup, persistent
+    ("decode", 8190, 512),  # the same, off the vector
+    ("decode", 32768, 512),  # one block
+    ("decode", 262144, 512),  # split into parts
+    ("stream", 32768, 512),
+    ("stream", 262144, 16),  # split, then merge
+)
+# More row counts than the 8-entry cache `end=None` used to read from.
+_GRAPH_ROWS = tuple(range(1, 11))
+
+
+def _capture_at_row_counts(n, k, capture):
+    """One graph per row count in `_GRAPH_ROWS`, each over its own buffers.
+
+    Every call is warmed on the capture stream first: the first one compiles,
+    and the split decode allocates its stream-local counter there.
+    """
+    graphs = []
+    for m in _GRAPH_ROWS:
+        x = torch.randn(m, n, dtype=dtypes.fp32)
+        out = torch.empty(m, k, dtype=dtypes.i32)
+        capture.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture):
+            topk_select(x, k, output_idx=out)
+        torch.cuda.current_stream().wait_stream(capture)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture):
+            topk_select(x, k, output_idx=out)
+        graphs.append((graph, x, out))
+    return graphs
+
+
+def test_full_rows_graphs():
+    """`end=None` reads no length tensor, so a graph at any row count holds.
+
+    It used to read one from an 8-entry LRU keyed on the row count. Capturing a
+    ninth count evicted -- and freed -- the tensor an earlier graph had baked
+    in, and replaying that graph read whatever had reused the memory: wrong
+    draft tokens, then a memory fault (ROCm/ATOM#2663). Each launch shape is
+    captured at more counts than that cache held, and every graph is replayed on
+    fresh scores only once all are captured.
+    """
+    failures = []
+    capture = torch.cuda.Stream()
+    for backend, n, k in _LAUNCH_SHAPES:
+        tag = f"{backend} n={n} k={k}"
+        missed = [m for m in _GRAPH_ROWS if not _serves(backend, m, n, k, False)]
+        if missed:
+            failures.append(f"{tag}: not dispatched to {backend} at m={missed}")
+            continue
+        with _only_backend(backend):
+            graphs = _capture_at_row_counts(n, k, capture)
+        for graph, x, out in graphs:
+            x.copy_(torch.randn_like(x))
+            out.fill_(-2)
+            graph.replay()
+            full = torch.full((x.shape[0],), n, dtype=dtypes.i32)
+            if not torch.equal(_sorted_values(x, out), run_torch(x, full, k)):
+                failures.append(f"{tag} m={x.shape[0]}: graph replay")
+        torch.cuda.synchronize()
+
+    for label in failures:
+        aiter.logger.error("FULL-ROWS GRAPH FAILED: %s", label)
+    return failures
+
+
+# The backends that bound a row's length by the row width in the kernel.
+_CLAMPS_END = frozenset({"argmax", "small_k", "decode", "stream"})
+
+
+def test_ragged_end_per_backend():
+    """An explicit `end` on every launch shape that takes ragged rows.
+
+    The sweep passes no `end`, so it only reaches the full-rows builds; these
+    are the builds that read a length per row. Where the kernel bounds a length
+    by the width, an `end` past the row must select as the full row does rather
+    than read the zeros past it: all-negative rows are where those would win.
+    """
+    failures = []
+    for backend, n, k in _LAUNCH_SHAPES:
+        with _only_backend(backend):
+            for m in _GRAPH_ROWS:
+                if not _serves(backend, m, n, k, True):
+                    continue
+                x = torch.randn(m, n, dtype=dtypes.fp32)
+                end = torch.randint(k, n + 1, (m,), dtype=dtypes.i32)
+                got = topk_select(x, k, end=end)[1]
+                if not torch.equal(_sorted_values(x, got), run_torch(x, end, k)):
+                    failures.append(f"{backend} n={n} k={k} m={m}: ragged end")
+                if backend not in _CLAMPS_END:
+                    continue
+                x = -x.abs() - 1
+                past = torch.full((m,), n + 64, dtype=dtypes.i32)
+                got = topk_select(x, k, end=past)[1]
+                full = torch.full((m,), n, dtype=dtypes.i32)
+                # Checked before the gather, which would fault on such a column.
+                if bool((got >= n).any()) or not torch.equal(
+                    _sorted_values(x, got), run_torch(x, full, k)
+                ):
+                    failures.append(f"{backend} n={n} k={k} m={m}: end past row")
+        torch.cuda.synchronize()
+
+    for label in failures:
+        aiter.logger.error("RAGGED END FAILED: %s", label)
+    return failures
 
 
 def test_lds_sizing():
@@ -458,10 +649,22 @@ def main():
     aiter.logger.info(
         "invariants: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
+    bad = test_zero_rows()
+    aiter.logger.info(
+        "zero rows: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
     bad = test_half_invariants(64, 32768)
     aiter.logger.info(
         "half-format invariants: %s",
         "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
+    )
+    bad = test_full_rows_graphs()
+    aiter.logger.info(
+        "full-rows graphs: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    bad = test_ragged_end_per_backend()
+    aiter.logger.info(
+        "ragged end: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
 
     df = [
