@@ -980,7 +980,7 @@ def get_pa_metadata_info_v1(
     if not fast_mode:
         if not 1 <= batch_size <= 32768 or not 1 <= num_head_k <= cu_num:
             raise ValueError(
-                "proportional PA planning requires 1 <= batch <= 32768 and 1 <= KV heads <= CUs"
+                "parallel PA planning requires 1 <= batch <= 32768 and 1 <= KV heads <= CUs"
             )
         if max_split_per_batch == 0 or max_split_per_batch < -1:
             raise ValueError("max_split_per_batch must be -1 or positive")
@@ -1049,27 +1049,28 @@ def get_pa_metadata_v1(
                        get_pa_metadata_info_v1 using the same fast_mode/max_split_per_batch.
                        v1_1 supports dense batches up to 32768 with positive Q lengths and
                        max_seqlen_qo * num_heads_per_head_k <= 128 (one Q tile). KV granularity
-                       is at least 256 tokens and must be a multiple of block_size. Inputs must provide consistent Q/page
+                       must be a multiple of block_size; no larger minimum tile is imposed.
+                       Inputs must provide consistent Q/page
                        indptrs and valid context lengths. Empty contexts receive no work; callers
                        remain responsible for their final output values.
                        Batches up to 512 share a block-wide prefix scan, write tasks in parallel,
                        and finalize work_indptr in the same launch. Larger batches use chunked
-                       planning and a same-stream finalizer, retaining per-request planning only
-                       for eligible small proportional batches. No GPU-to-CPU readback is needed.
+                       planning and a same-stream finalizer. No GPU-to-CPU readback is needed.
                        The work-info allocation includes an internal scratch tail for large batches;
                        only records before work_indptr[-1] are attention tasks. Reallocate buffers
                        with get_pa_metadata_info_v1 when updating from the previous planner.
-                       Prefix sums of page count times Q length divide work into persistent
-                       worker budgets. Contiguous tiles of one request assigned to the same
-                       worker form one partition, avoiding redundant partial outputs. Unlike
-                       a fixed task budget, long requests can still split in large batches.
-                       Small single-KV-head batches with uniform Q and highly uneven contexts
-                       retain proportional subdivision, coalesced within each worker.
+                       Prefix sums of KV units reproduce v1_2's worker budgets: the first
+                       remainder workers receive one extra unit. With the default split budget,
+                       nonempty dense inputs, page-sized KV granularity, and CU count divisible
+                       by the KV head count, the effective attention work layout matches v1_2.
+                       Positive Q lengths affect partial-output offsets, not partition weights.
+                       No length-dependent proportional scheduling strategy is selected.
                        All KV heads share the partition and reduction layout; persistent workers
                        may process multiple works. A restrictive max_split_per_batch limits
                        partitions and can reduce load balance.
-                       More partitions can increase attention/reduction overhead; benchmark the
-                       whole operation before selecting this mode.
+                       Validate attention separately from metadata; planning-time savings do not
+                       establish a compute speedup. Restricted caps and unsupported v1_2 inputs
+                       retain v1_1's own safety and allocation semantics.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
             max_split_per_batch: v1_1 caps partitions per request; -1 uses the device CU count.
                        v1_2 retains its existing global split-budget behavior.

@@ -40,8 +40,13 @@ __device__ __forceinline__ int64_t pa_metadata_v1_1_divide(int64_t numerator, in
 __device__ __forceinline__ int32_t pa_metadata_v1_1_worker(
     int64_t cost, int64_t total_cost, int32_t workers)
 {
-    return static_cast<int32_t>(min(pa_metadata_v1_1_divide((cost + 1) * workers - 1, total_cost),
-                                     static_cast<int64_t>(workers - 1)));
+    const int64_t average = pa_metadata_v1_1_divide(total_cost, workers);
+    const int64_t remainder = total_cost - average * workers;
+    const int64_t larger_payload = (average + 1) * remainder;
+    const int64_t worker = cost < larger_payload
+        ? pa_metadata_v1_1_divide(cost, average + 1)
+        : remainder + pa_metadata_v1_1_divide(cost - larger_payload, max(average, int64_t{1}));
+    return static_cast<int32_t>(min(worker, static_cast<int64_t>(workers - 1)));
 }
 
 __device__ __forceinline__ int32_t pa_metadata_v1_1_fragments(
@@ -67,18 +72,20 @@ __device__ __forceinline__ int64_t pa_metadata_v1_1_boundary(
     if(fragments == tiles)
         return fragment;
     const int32_t first = pa_metadata_v1_1_worker(cost_begin, total_cost, workers);
-    const int64_t boundary = pa_metadata_v1_1_divide(
-        static_cast<int64_t>(first + fragment) * total_cost, workers);
+    const int64_t average = pa_metadata_v1_1_divide(total_cost, workers);
+    const int64_t remainder = total_cost - average * workers;
+    const int64_t worker = first + fragment;
+    const int64_t boundary = worker * average + min(worker, remainder);
     return min(tiles, max(int64_t{0}, pa_metadata_v1_1_divide(
         boundary - cost_begin + tile_cost - 1, tile_cost)));
 }
 
 __device__ __forceinline__ void pa_metadata_v1_1_emit(
     PaMetadataV1KernelParameter params, int32_t sequence, int32_t part,
-    int32_t sequence_parts, int32_t sequence_units, int64_t sequence_cost_before,
+    int32_t sequence_parts, int64_t sequence_cost_before,
     int32_t sequence_tasks_before, int32_t sequence_reduce_before,
     int32_t sequence_partial_before, int32_t total_tasks,
-    bool proportional, int64_t denominator)
+    int64_t denominator)
 {
     const int32_t workers_per_head = params.num_cu / params.num_heads_k;
     const int32_t qo_start = params.p_seqlens_qo_indptr[sequence];
@@ -94,28 +101,17 @@ __device__ __forceinline__ void pa_metadata_v1_1_emit(
               params.block_size - 1) >> page_shift)));
     const int64_t tiles = (static_cast<uint32_t>(max(params.p_context_lens[sequence], 0)) +
                            params.kv_granularity - 1) >> (page_shift + unit_shift);
-    const int64_t tile_cost = proportional ? 2 * tiles :
-        static_cast<int64_t>(params.blocks_per_unit) * qo_length;
-    const int64_t schedule_begin = proportional ?
-        2 * sequence_units * sequence_cost_before + tiles : sequence_cost_before;
-    const int64_t schedule_total = proportional ?
-        2 * max(sequence_units, 1) * denominator : denominator;
-    const int64_t schedule_units = proportional ? sequence_units : tiles;
-    const int32_t fragments = proportional || params.num_splits >= workers_per_head
+    const int32_t fragments = params.num_splits >= workers_per_head
         ? sequence_parts : pa_metadata_v1_1_fragments(
-            schedule_begin, schedule_units, tile_cost, schedule_total, workers_per_head);
-    const int64_t unit_begin = pa_metadata_v1_1_boundary(
-        part * fragments / sequence_parts, fragments, schedule_units, schedule_begin,
-        tile_cost, schedule_total, workers_per_head);
-    const int64_t unit_end = pa_metadata_v1_1_boundary(
-        (part + 1) * fragments / sequence_parts, fragments, schedule_units, schedule_begin,
-        tile_cost, schedule_total, workers_per_head);
-    const int64_t tile_begin = proportional ?
-        pa_metadata_v1_1_divide(unit_begin * tiles, sequence_units) : unit_begin;
-    const int64_t tile_end = proportional ?
-        pa_metadata_v1_1_divide(unit_end * tiles, sequence_units) : unit_end;
+            sequence_cost_before, tiles, 1, denominator, workers_per_head);
+    const int64_t tile_begin = pa_metadata_v1_1_boundary(
+        part * fragments / sequence_parts, fragments, tiles, sequence_cost_before,
+        1, denominator, workers_per_head);
+    const int64_t tile_end = pa_metadata_v1_1_boundary(
+        (part + 1) * fragments / sequence_parts, fragments, tiles, sequence_cost_before,
+        1, denominator, workers_per_head);
     const int32_t local_worker = pa_metadata_v1_1_worker(
-        schedule_begin + unit_begin * tile_cost, schedule_total, workers_per_head);
+        sequence_cost_before + tile_begin, denominator, workers_per_head);
     const int32_t partial = sequence_parts > 1
         ? sequence_partial_before + part * qo_length : -1;
     if(sequence_parts > 1)
@@ -173,14 +169,11 @@ __launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
 void kn_get_pa_metadata_v1_1_shared(PaMetadataV1KernelParameter params)
 {
     __shared__ int64_t wave_totals[kPaMetadataSharedMaxWaves];
-    __shared__ int64_t maxima[kPaMetadataSharedMaxWaves];
     __shared__ int64_t cost_prefixes[kPaMetadataSharedMaxBatches];
     __shared__ int32_t task_prefixes[kPaMetadataSharedMaxBatches];
     __shared__ int32_t partial_prefixes[kPaMetadataSharedMaxBatches];
-    __shared__ int32_t sequence_units[kPaMetadataSharedMaxBatches];
     __shared__ int64_t total_weight;
     __shared__ int32_t task_count;
-    __shared__ bool use_proportional;
     const int32_t sequence = threadIdx.x;
     const int32_t lane = opus::lane_id();
     const int32_t wave_size = opus::get_warp_size();
@@ -195,74 +188,17 @@ void kn_get_pa_metadata_v1_1_shared(PaMetadataV1KernelParameter params)
         const int32_t qo_end = active ? params.p_seqlens_qo_indptr[sequence + 1] : 0;
         const int32_t qo_length = qo_end - qo_start;
         const uint32_t context = active ? max(params.p_context_lens[sequence], 0) : 0;
-        const uint32_t pages = (context + params.block_size - 1) >> (__ffs(params.block_size) - 1);
         const int64_t tiles = (context + params.kv_granularity - 1) >>
                               (__ffs(params.kv_granularity) - 1);
-        const int64_t cost = static_cast<int64_t>(pages) * qo_length;
-        const int64_t cost_prefix = pa_metadata_v1_1_block_prefix(cost, wave_totals, wave_only);
+        const int64_t cost_prefix = pa_metadata_v1_1_block_prefix(tiles, wave_totals, wave_only);
         const int64_t total_cost = wave_only ?
             __shfl(static_cast<long long>(cost_prefix), wave_size - 1) : wave_totals[waves - 1];
         if(!wave_only)
             __syncthreads();
-        const bool consider_proportional = params.num_heads_k == 1 &&
-            params.uni_seqlen_qo > 0 && params.num_batches > 1 &&
-            params.num_batches < 2 * workers_per_head;
-        int64_t prefix = cost_prefix;
-        int64_t denominator = max(total_cost, int64_t{1});
-        int32_t nonempty = 0;
-        bool proportional = false;
-        if(consider_proportional)
-        {
-            int64_t max_cost = cost;
-            for(int32_t offset = wave_size / 2; offset > 0; offset >>= 1)
-                max_cost = max(max_cost, static_cast<int64_t>(__shfl_xor(
-                    static_cast<long long>(max_cost), offset)));
-            if(!wave_only)
-            {
-                if(lane == 0)
-                    maxima[wave] = max_cost;
-                __syncthreads();
-                max_cost = 0;
-                for(int32_t index = 0; index < waves; ++index)
-                    max_cost = max(max_cost, maxima[index]);
-            }
-            proportional = max_cost * params.num_batches > 4 * total_cost;
-            if(proportional)
-            {
-                prefix = pa_metadata_v1_1_block_prefix(tiles, wave_totals, wave_only);
-                denominator = max(wave_only ?
-                    static_cast<int64_t>(__shfl(static_cast<long long>(prefix), wave_size - 1)) :
-                    wave_totals[waves - 1], int64_t{1});
-                if(!wave_only)
-                    __syncthreads();
-                const int64_t nonempty_prefix = pa_metadata_v1_1_block_prefix(
-                    pages > 0, wave_totals, wave_only);
-                nonempty = static_cast<int32_t>(wave_only ?
-                    __shfl(static_cast<long long>(nonempty_prefix), wave_size - 1) :
-                    wave_totals[waves - 1]);
-                if(!wave_only)
-                    __syncthreads();
-            }
-        }
-        const int64_t sequence_cost_before = prefix - (proportional ? tiles : cost);
-        int32_t units = 0;
-        int32_t parts;
-        if(proportional)
-        {
-            const int32_t remaining = min(params.num_batches * params.num_splits,
-                                         2 * workers_per_head) - nonempty;
-            units = static_cast<int32_t>(min(static_cast<int64_t>(params.num_splits),
-                min(tiles, static_cast<int64_t>(tiles > 0) +
-                    pa_metadata_v1_1_divide(prefix * remaining, denominator) -
-                    pa_metadata_v1_1_divide(sequence_cost_before * remaining, denominator))));
-            parts = pa_metadata_v1_1_fragments(
-                2 * units * sequence_cost_before + tiles, units, 2 * tiles,
-                2 * max(units, 1) * denominator, workers_per_head);
-        }
-        else
-            parts = min(params.num_splits, pa_metadata_v1_1_fragments(
-                sequence_cost_before, tiles, static_cast<int64_t>(params.blocks_per_unit) * qo_length,
-                denominator, workers_per_head));
+        const int64_t denominator = max(total_cost, int64_t{1});
+        const int64_t sequence_cost_before = cost_prefix - tiles;
+        const int32_t parts = min(params.num_splits, pa_metadata_v1_1_fragments(
+            sequence_cost_before, tiles, 1, denominator, workers_per_head));
         const int32_t reduce_count = parts > 1 ? parts : 0;
         const int32_t task_prefix = static_cast<int32_t>(pa_metadata_v1_1_block_prefix(
             parts, wave_totals, wave_only));
@@ -276,10 +212,9 @@ void kn_get_pa_metadata_v1_1_shared(PaMetadataV1KernelParameter params)
             reduce_count * qo_length, wave_totals, wave_only));
         if(active)
         {
-            cost_prefixes[sequence] = prefix;
+            cost_prefixes[sequence] = cost_prefix;
             task_prefixes[sequence] = task_prefix;
             partial_prefixes[sequence] = partial_prefix;
-            sequence_units[sequence] = units;
             params.p_reduce_indptr[sequence + 1] = reduce_prefix;
             params.p_reduce_final_map[sequence * 2] = qo_start;
             params.p_reduce_final_map[sequence * 2 + 1] = qo_end;
@@ -292,13 +227,11 @@ void kn_get_pa_metadata_v1_1_shared(PaMetadataV1KernelParameter params)
             params.p_work_metadata_ptrs[1] = reinterpret_cast<uintptr_t>(params.p_work_info_set_raw);
             total_weight = denominator;
             task_count = total_tasks;
-            use_proportional = proportional;
         }
     }
     __syncthreads();
     const int64_t denominator = total_weight;
     const int32_t total_tasks = task_count;
-    const bool proportional = use_proportional;
     for(int32_t task = threadIdx.x; task < total_tasks; task += blockDim.x)
     {
         int32_t begin = 0;
@@ -313,151 +246,13 @@ void kn_get_pa_metadata_v1_1_shared(PaMetadataV1KernelParameter params)
         }
         const int32_t tasks_before = begin > 0 ? task_prefixes[begin - 1] : 0;
         pa_metadata_v1_1_emit(params, begin, task - tasks_before,
-            task_prefixes[begin] - tasks_before, sequence_units[begin],
+            task_prefixes[begin] - tasks_before,
             begin > 0 ? cost_prefixes[begin - 1] : 0, tasks_before,
             params.p_reduce_indptr[begin], begin > 0 ? partial_prefixes[begin - 1] : 0,
-            total_tasks, proportional, denominator);
+            total_tasks, denominator);
     }
     __syncthreads();
     pa_metadata_v1_1_finalize(params);
-}
-
-__launch_bounds__(opus::get_warp_size(), 1) __global__
-void kn_get_pa_metadata_v1_1(PaMetadataV1KernelParameter params)
-{
-    const int32_t lane = opus::lane_id();
-    const int32_t wave_size = opus::get_warp_size();
-    const int32_t sequence = blockIdx.x;
-    const int32_t workers_per_head = params.num_cu / params.num_heads_k;
-    const int32_t page_shift = __ffs(params.block_size) - 1;
-    const int32_t unit_shift = __ffs(params.blocks_per_unit) - 1;
-    auto* works = reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw);
-    int64_t total_cost = 0;
-    int64_t total_tiles = 0;
-    int64_t max_cost = 0;
-    int32_t nonempty = 0;
-    const bool consider_proportional = params.num_heads_k == 1 &&
-        params.uni_seqlen_qo > 0 && params.num_batches > 1 &&
-        params.num_batches < 2 * workers_per_head;
-    for(int32_t batch = lane; batch < params.num_batches; batch += wave_size)
-    {
-        const int32_t qo_length = params.p_seqlens_qo_indptr[batch + 1] -
-                                  params.p_seqlens_qo_indptr[batch];
-        const uint32_t pages =
-            (static_cast<uint32_t>(max(params.p_context_lens[batch], 0)) +
-             params.block_size - 1) >> page_shift;
-        const int64_t cost = static_cast<int64_t>(pages) * qo_length;
-        total_cost += cost;
-        if(consider_proportional)
-        {
-            total_tiles += (pages + params.blocks_per_unit - 1) >> unit_shift;
-            max_cost = max(max_cost, cost);
-            nonempty += pages > 0;
-        }
-    }
-    total_cost = __shfl(pa_metadata_v1_1_prefix_sum(total_cost), wave_size - 1);
-    if(consider_proportional)
-    {
-        total_tiles = __shfl(pa_metadata_v1_1_prefix_sum(total_tiles), wave_size - 1);
-        nonempty = __shfl(warp_prefix_sum(nonempty, wave_size), wave_size - 1);
-        for(int32_t offset = wave_size / 2; offset > 0; offset >>= 1)
-            max_cost = max(max_cost, static_cast<int64_t>(__shfl_xor(
-                static_cast<long long>(max_cost), offset)));
-    }
-    const bool proportional = consider_proportional &&
-        max_cost * params.num_batches > 4 * total_cost;
-    const int64_t denominator = max(proportional ? total_tiles : total_cost, int64_t{1});
-    const int32_t remaining = min(params.num_batches * params.num_splits,
-                                 2 * workers_per_head) - nonempty;
-    int64_t cost_base = 0;
-    int32_t task_base = 0;
-    int32_t reduce_base = 0;
-    int32_t partial_base = 0;
-    int64_t sequence_cost_before = 0;
-    int32_t sequence_tasks_before = 0;
-    int32_t sequence_reduce_before = 0;
-    int32_t sequence_partial_before = 0;
-    int32_t sequence_parts = 0;
-    int32_t sequence_units = 0;
-
-    for(int32_t chunk = 0; chunk < params.num_batches; chunk += wave_size)
-    {
-        const int32_t batch = chunk + lane;
-        const int32_t qo_length = batch < params.num_batches
-            ? params.p_seqlens_qo_indptr[batch + 1] - params.p_seqlens_qo_indptr[batch] : 0;
-        const uint32_t pages = batch < params.num_batches
-            ? (static_cast<uint32_t>(max(params.p_context_lens[batch], 0)) +
-             params.block_size - 1) >> page_shift : 0;
-         const uint32_t tiles = (pages + params.blocks_per_unit - 1) >> unit_shift;
-        const int64_t cost = proportional ? static_cast<int64_t>(tiles) :
-                                           static_cast<int64_t>(pages) * qo_length;
-        const int64_t tile_cost = static_cast<int64_t>(params.blocks_per_unit) * qo_length;
-        const int64_t cost_prefix = cost_base + pa_metadata_v1_1_prefix_sum(cost);
-        int32_t units = 0;
-        int32_t parts;
-        if(proportional)
-        {
-            units = static_cast<int32_t>(min(static_cast<int64_t>(params.num_splits),
-                min(static_cast<int64_t>(tiles), static_cast<int64_t>(tiles > 0) +
-                    pa_metadata_v1_1_divide(cost_prefix * remaining, denominator) -
-                    pa_metadata_v1_1_divide((cost_prefix - tiles) * remaining, denominator))));
-            parts = pa_metadata_v1_1_fragments(
-                2 * units * (cost_prefix - tiles) + tiles, units, 2 * tiles,
-                2 * max(units, 1) * denominator, workers_per_head);
-        }
-        else
-            parts = min(params.num_splits, pa_metadata_v1_1_fragments(
-                cost_prefix - cost, tiles, tile_cost, denominator, workers_per_head));
-        const int32_t reduce_count = parts > 1 ? parts : 0;
-        const int32_t partial_count = reduce_count * qo_length;
-        const int32_t task_prefix = task_base + warp_prefix_sum(parts, wave_size);
-        const int32_t reduce_prefix = reduce_base + warp_prefix_sum(reduce_count, wave_size);
-        const int32_t partial_prefix = partial_base + warp_prefix_sum(partial_count, wave_size);
-        if(batch == sequence)
-        {
-            sequence_cost_before = cost_prefix - cost;
-            sequence_tasks_before = task_prefix - parts;
-            sequence_reduce_before = reduce_prefix - reduce_count;
-            sequence_partial_before = partial_prefix - partial_count;
-            sequence_parts = parts;
-            sequence_units = units;
-        }
-        cost_base = __shfl(cost_prefix, wave_size - 1);
-        task_base = __shfl(task_prefix, wave_size - 1);
-        reduce_base = __shfl(reduce_prefix, wave_size - 1);
-        partial_base = __shfl(partial_prefix, wave_size - 1);
-    }
-
-    const int32_t owner_lane = sequence % wave_size;
-    sequence_cost_before = __shfl(sequence_cost_before, owner_lane);
-    sequence_tasks_before = __shfl(sequence_tasks_before, owner_lane);
-    sequence_reduce_before = __shfl(sequence_reduce_before, owner_lane);
-    sequence_partial_before = __shfl(sequence_partial_before, owner_lane);
-    sequence_parts = __shfl(sequence_parts, owner_lane);
-    sequence_units = __shfl(sequence_units, owner_lane);
-    const int32_t qo_start = params.p_seqlens_qo_indptr[sequence];
-    const int32_t qo_end = params.p_seqlens_qo_indptr[sequence + 1];
-
-    if(lane == 0)
-    {
-        params.p_reduce_indptr[sequence + 1] = sequence_reduce_before +
-                                             (sequence_parts > 1 ? sequence_parts : 0);
-        params.p_reduce_final_map[sequence * 2] = qo_start;
-        params.p_reduce_final_map[sequence * 2 + 1] = qo_end;
-        if(sequence == 0)
-        {
-            params.p_reduce_indptr[0] = 0;
-            params.p_work_indptr[params.num_cu] = task_base * params.num_heads_k;
-            params.p_work_metadata_ptrs[0] = reinterpret_cast<uintptr_t>(params.p_work_indptr);
-            params.p_work_metadata_ptrs[1] = reinterpret_cast<uintptr_t>(works);
-        }
-    }
-    for(int32_t part = lane; part < sequence_parts; part += wave_size)
-    {
-        pa_metadata_v1_1_emit(params, sequence, part, sequence_parts, sequence_units,
-            sequence_cost_before, sequence_tasks_before, sequence_reduce_before,
-            sequence_partial_before, task_base, proportional, denominator);
-    }
 }
 
 __device__ __forceinline__ PaMetadataV1ChunkRecord* pa_metadata_v1_1_scratch(
@@ -476,12 +271,11 @@ void kn_scan_pa_metadata_v1_1_chunks(PaMetadataV1KernelParameter params)
     __shared__ int64_t wave_totals[kPaMetadataSharedMaxWaves];
     const int32_t sequence = blockIdx.x * kPaMetadataSharedMaxBatches + threadIdx.x;
     const bool active = sequence < params.num_batches;
-    const int32_t qo_length = active ?
-        params.p_seqlens_qo_indptr[sequence + 1] - params.p_seqlens_qo_indptr[sequence] : 0;
     const uint32_t context = active ? max(params.p_context_lens[sequence], 0) : 0;
-    const uint32_t pages = (context + params.block_size - 1) >> (__ffs(params.block_size) - 1);
+    const int64_t tiles = (context + params.kv_granularity - 1) >>
+                          (__ffs(params.kv_granularity) - 1);
     const int64_t cost_prefix = pa_metadata_v1_1_block_prefix(
-        static_cast<int64_t>(pages) * qo_length, wave_totals, false);
+        tiles, wave_totals, false);
     auto* rows = pa_metadata_v1_1_scratch(params);
     if(active)
         rows[sequence].cost = cost_prefix;
@@ -511,13 +305,12 @@ void kn_plan_pa_metadata_v1_1_chunks(PaMetadataV1KernelParameter params)
     const int32_t qo_length = active ?
         params.p_seqlens_qo_indptr[sequence + 1] - params.p_seqlens_qo_indptr[sequence] : 0;
     const uint32_t context = active ? max(params.p_context_lens[sequence], 0) : 0;
-    const uint32_t pages = (context + params.block_size - 1) >> (__ffs(params.block_size) - 1);
     const int64_t tiles = (context + params.kv_granularity - 1) >>
                           (__ffs(params.kv_granularity) - 1);
     const int64_t cost_before = active ?
-        cost_base + rows[sequence].cost - static_cast<int64_t>(pages) * qo_length : 0;
+        cost_base + rows[sequence].cost - tiles : 0;
     const int32_t parts = min(params.num_splits, pa_metadata_v1_1_fragments(
-        cost_before, tiles, static_cast<int64_t>(params.blocks_per_unit) * qo_length,
+        cost_before, tiles, 1,
         max(total_cost, int64_t{1}), params.num_cu / params.num_heads_k));
     const int32_t reductions = parts > 1 ? parts : 0;
     const int32_t task_prefix = static_cast<int32_t>(pa_metadata_v1_1_block_prefix(
@@ -583,9 +376,9 @@ void kn_emit_pa_metadata_v1_1_chunks(PaMetadataV1KernelParameter params)
         params.p_work_metadata_ptrs[1] = reinterpret_cast<uintptr_t>(params.p_work_info_set_raw);
     }
     for(int32_t part = 0; part < parts; ++part)
-        pa_metadata_v1_1_emit(params, sequence, part, parts, 0, rows[sequence].cost,
+        pa_metadata_v1_1_emit(params, sequence, part, parts, rows[sequence].cost,
             task_base + local_task_base, reduce_base + local_reduce_base,
-            partial_base + local_partial_base, total_tasks, false, max(total_cost, int64_t{1}));
+            partial_base + local_partial_base, total_tasks, max(total_cost, int64_t{1}));
 }
 
 __device__ __forceinline__ void pa_metadata_v1_1_finalize(PaMetadataV1KernelParameter params)
@@ -610,12 +403,42 @@ __device__ __forceinline__ void pa_metadata_v1_1_finalize(PaMetadataV1KernelPara
     for(int32_t task = threadIdx.x; task < total_tasks; task += blockDim.x)
         works[task].kv_offset = 0;
     const int32_t total_reduce = params.p_reduce_indptr[params.num_batches];
-    for(int32_t tile = params.num_batches + 1 + threadIdx.x;
+    __shared__ int64_t reduce_wave_totals[kPaMetadataSharedMaxWaves];
+    int32_t groups = 0;
+    if(total_reduce > 0)
+    {
+        const int32_t wave_size = opus::get_warp_size();
+        const bool wave_only = blockDim.x == wave_size;
+        for(int32_t begin = 0; begin < params.num_batches; begin += blockDim.x)
+        {
+            const int32_t sequence = begin + threadIdx.x;
+            const bool active = sequence < params.num_batches;
+            const int32_t reduce_begin = active ? params.p_reduce_indptr[sequence] : 0;
+            const int32_t reduce_end = active ? params.p_reduce_indptr[sequence + 1] : 0;
+            const bool split = reduce_end > reduce_begin;
+            const int32_t prefix = static_cast<int32_t>(pa_metadata_v1_1_block_prefix(
+                split, reduce_wave_totals, wave_only));
+            const int32_t count = wave_only ? __shfl(prefix, wave_size - 1) :
+                static_cast<int32_t>(reduce_wave_totals[blockDim.x / wave_size - 1]);
+            __syncthreads();
+            if(split)
+            {
+                const int32_t group = groups + prefix - 1;
+                params.p_reduce_indptr[group + 1] = reduce_end;
+                params.p_reduce_final_map[group * 2] = params.p_seqlens_qo_indptr[sequence];
+                params.p_reduce_final_map[group * 2 + 1] =
+                    params.p_seqlens_qo_indptr[sequence + 1];
+            }
+            groups += count;
+            __syncthreads();
+        }
+    }
+    for(int32_t tile = groups + 1 + threadIdx.x;
         tile < params.reduce_indptr_size; tile += blockDim.x)
         params.p_reduce_indptr[tile] = total_reduce;
 }
 
-__launch_bounds__(opus::get_warp_size(), 1) __global__
+__launch_bounds__(kPaMetadataSharedMaxBatches, 1) __global__
 void kn_finalize_pa_metadata_v1_1(PaMetadataV1KernelParameter params)
 {
     pa_metadata_v1_1_finalize(params);
@@ -700,7 +523,7 @@ void get_pa_metadata_v1_1_device(
     params.qhead_granularity = num_heads_per_head_k;
     params.uni_seqlen_qo = ori_uni_seqlen_qo;
     params.block_size = block_size;
-    params.kv_granularity = std::max(256, kv_granularity);
+    params.kv_granularity = kv_granularity;
     params.blocks_per_unit = params.kv_granularity / block_size;
     const hipStream_t stream = aiter::getCurrentHIPStream();
     if(batches <= kPaMetadataSharedMaxBatches)
@@ -711,20 +534,12 @@ void get_pa_metadata_v1_1_device(
         HIP_CALL_LAUNCH(hipGetLastError());
         return;
     }
-    if(num_heads_k == 1 && ori_uni_seqlen_qo > 0 && batches < 2 * workers)
-    {
-        kn_get_pa_metadata_v1_1<<<batches, properties.warpSize, 0, stream>>>(params);
-        HIP_CALL_LAUNCH(hipGetLastError());
-    }
-    else
-    {
-        kn_scan_pa_metadata_v1_1_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
-        HIP_CALL_LAUNCH(hipGetLastError());
-        kn_plan_pa_metadata_v1_1_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
-        HIP_CALL_LAUNCH(hipGetLastError());
-        kn_emit_pa_metadata_v1_1_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
-        HIP_CALL_LAUNCH(hipGetLastError());
-    }
-    kn_finalize_pa_metadata_v1_1<<<1, properties.warpSize, 0, stream>>>(params);
+    kn_scan_pa_metadata_v1_1_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+    HIP_CALL_LAUNCH(hipGetLastError());
+    kn_plan_pa_metadata_v1_1_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+    HIP_CALL_LAUNCH(hipGetLastError());
+    kn_emit_pa_metadata_v1_1_chunks<<<chunks, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
+    HIP_CALL_LAUNCH(hipGetLastError());
+    kn_finalize_pa_metadata_v1_1<<<1, kPaMetadataSharedMaxBatches, 0, stream>>>(params);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
