@@ -3,9 +3,9 @@
 import json
 
 import pytest
-from aiter.jit.utils.chip_info import get_gfx
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.grouped_moe_gfx1250 import flydsl_moe_gather_reduce
 from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_fused_quant_preshuffle,
@@ -13,7 +13,9 @@ from aiter.ops.flydsl.moe_kernels import (
 )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or get_gfx() != "gfx1250", reason="Requires gfx1250")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx() != "gfx1250", reason="Requires gfx1250"
+)
 def test_tp_valid_rows_route_quant_and_graph_replay():
     torch.manual_seed(7)
     M, K, E, TOPK, MAX_M, REP = 80, 5120, 8, 3, 256, 4
@@ -188,9 +190,9 @@ def test_grouped_tp_propagates_count_before_quant(monkeypatch, valid):
             bias2=None,
             swiglu_limit=0,
             doweight_stage1=False,
-            num_local_tokens=None
-            if valid is None
-            else torch.tensor([valid], dtype=torch.int32),
+            num_local_tokens=(
+                None if valid is None else torch.tensor([valid], dtype=torch.int32)
+            ),
         )
     assert len(calls) == 2
     if valid is None:

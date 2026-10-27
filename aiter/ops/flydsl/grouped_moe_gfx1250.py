@@ -793,9 +793,11 @@ def _grouped_a8w4_tdm_moe(
         # Carry it through route, remap, quant and gather; the router writes
         # -1 IDs into padding, which the unbounded TP route kernel cannot use.
         if num_local_tokens is not None:
-            _ep_nvt = num_local_tokens.reshape(-1)[:1].to(
-                device=device, dtype=torch.int32
-            ).contiguous()
+            _ep_nvt = (
+                num_local_tokens.reshape(-1)[:1]
+                .to(device=device, dtype=torch.int32)
+                .contiguous()
+            )
             _ep_nvr = (_ep_nvt * int(topk)).contiguous()
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
             topk_ids, E, max_m, num_valid_routes=_ep_nvr
