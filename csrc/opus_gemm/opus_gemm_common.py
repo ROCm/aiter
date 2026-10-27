@@ -3063,6 +3063,9 @@ DEFAULT_COMPILED_KIDS_GFX950 = frozenset(
         # persistent fallback (large M, tile-aligned)
         30,
         76,  # persistent (256, 256, 64)
+        # Batch-invariant indexer target-prefill tiles.
+        137,
+        138,
     }
 )
 
