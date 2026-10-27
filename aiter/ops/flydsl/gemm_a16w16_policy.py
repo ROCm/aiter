@@ -230,7 +230,7 @@ def get_flydsl_a16w16_configs(
     split_k_candidates = [1]
     split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
     selections = {
-        "block_m": [16, 32, 48, 64, 80, 96, 128, 192, 224, 256],
+        "block_m": [16, 32, 48, 64, 80, 96, 128, 192, 208, 224, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
         "block_k": [64, 128, 256],
         "stages": list(range(2, 10)),
@@ -290,7 +290,10 @@ def get_flydsl_a16w16_configs(
         if not is_large_gemm and not config["use_half_tile_interleaved"]:
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
-            if (mma_m_iters > 4 or mma_n_iters > 4) and config["block_m"] != 224:
+            if (mma_m_iters > 4 or mma_n_iters > 4) and config["block_m"] not in (
+                208,
+                224,
+            ):
                 continue
 
         validation_config = {

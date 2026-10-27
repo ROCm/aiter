@@ -278,8 +278,10 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             ),
         ):
             for shape, tile in (
+                ((2078, 6288, 7168), (208, 256, 2, 4)),
                 ((2079, 6288, 7168), (224, 256, 2, 4)),
                 ((576, 20480, 7168), (192, 256, 4, 4)),
+                ((4032, 2880, 7168), (192, 256, 4, 4)),
             ):
                 configs = policy.get_flydsl_a16w16_configs(
                     *shape,
