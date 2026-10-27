@@ -294,6 +294,7 @@ def main():
     report_result.ci = {"Black": "pending"}
     report = MODULE.render(report_result, {})
     check("answered comment reports required CI", "### Required CI" in report)
+    check("answered comment hides shadow audit metrics", "Shadow audit" not in report)
     check(
         "answered comment hides question prompt",
         "### Questions to answer" not in report,

@@ -544,15 +544,6 @@ def render(result: Result, pr: dict[str, Any]) -> str:
         if result.ci_failed:
             lines.append("- Required CI failed; fix it before requesting human review.")
 
-        lines.extend(["", "### Shadow audit signals"])
-        lines.append(
-            f"- Answer size: `{result.telemetry.get('answer_units', 0)}` units"
-        )
-        lines.append(
-            f"- Code tokens: `{result.telemetry.get('code_tokens', 0)}` · paths named: `{result.telemetry.get('paths_named', 0)}`"
-        )
-        if result.telemetry.get("generic_warning"):
-            lines.append(f"- ADVISORY — {result.telemetry['generic_warning']}")
     lines.extend(
         [
             "",
