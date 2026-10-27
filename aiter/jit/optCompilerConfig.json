@@ -1577,7 +1577,7 @@
     },
     "module_pa_mqa_logits_mxfp4_opus": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/pa_mqa_logits_mxfp4/pa_mqa_logits_mxfp4_launcher.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/pa_mqa_logits_mxfp4/pa_mqa_logits_mxfp4.cu'",
             "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/pa_mqa_logits_mxfp4/pa_mqa_logits_mxfp4_gfx950.cu'",
             "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/pa_mqa_logits_mxfp4/pa_mqa_logits_mxfp4_gfx1250.cu'",
             "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/pa_mqa_logits_mxfp4/pa_mqa_logits_mxfp4_pybind.cu'"
@@ -1585,8 +1585,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
-            "'-fno-finite-math-only'",
-            "f'-DMQA_LOGITS_MXFP4_KNOCK={int(os.environ.get(\"MQA_LOGITS_MXFP4_KNOCK\", 0))}'"
+            "'-fno-finite-math-only'"
         ],
         "flags_extra_hip_per_source": {
             "*pa_mqa_logits_mxfp4_gfx950.cu": [

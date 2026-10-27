@@ -26,10 +26,7 @@ config's own choice. Prefill shapes are 16384 rows (ATOM's batched-token budget)
   edges    rows carrying one source of NaN / Inf each (0xFF scales, a NaN or Inf weight, products
            that overflow, a NaN key behind a zero q block): NaN / +-Inf masks equal the
            reference's IEEE ones. The kernels compute relu as max_num and put NaN back from the
-           scales; a module built with ``MQA_LOGITS_MXFP4_KNOCK=8`` drops that restore, so
-           ``MQA_LOGITS_MXFP4_KNOCK=8 AITER_REBUILD=1 ... --modes semantics --checks edges``
-           must report every edges row failing (its result then reads PASS). Rebuild without
-           the variable afterwards.
+           scales.
   bands    a forward scored in slices of rows (``query_start_loc`` clamped) equals it whole
   padding  rows past ``query_start_loc[-1]`` and empty sequences untouched, the rest right
   graph    schedule + launch captured in a CUDA graph and replayed on new data
@@ -39,7 +36,6 @@ config's own choice. Prefill shapes are 16384 rows (ATOM's batched-token budget)
 import argparse
 import bisect
 import itertools
-import os
 from dataclasses import dataclass
 
 import pandas as pd
@@ -68,27 +64,11 @@ PREFILL_ROWS = 16384
 SAMPLE_ROWS = 16  # rows checked against the reference in a perf shape
 REL_TOL = 1e-5  # of the largest finite |logit|; a misrouted E8M0 moves cells by 2x
 MODEL_HEADS = {"v4": 64, "v41": 32, "cand": 32}
-# Rows a MQA_LOGITS_MXFP4_KNOCK=8 build gets wrong: the NaN restore is gone.
-KNOCK_NAN = int(os.environ.get("MQA_LOGITS_MXFP4_KNOCK", "0")) & 8
 
-E2M1 = (
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-)
+_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E2M1 = _E2M1_MAGNITUDES + tuple(
+    -x for x in _E2M1_MAGNITUDES
+)  # code -> value; bit 3 the sign
 
 
 # == workloads: ATOM's rows, tables and natural FP4 data ===========================================
@@ -100,9 +80,8 @@ class Rows:
     kind: str  # "full" | "candidate"
     query_start_loc: torch.Tensor  # [seqs + 1] i32
     row_ends: torch.Tensor  # [rows] i32
-    block_tables: (
-        torch.Tensor
-    )  # full: [seqs, entries] of ppb pages; candidate: [rows, 2048] pages
+    # full: [seqs, entries] of ppb pages; candidate: [rows, 2048] pages
+    block_tables: torch.Tensor
     pages_per_block: int
     width: int  # logits columns
     num_pages: int  # 8-row pages in the pool
@@ -205,12 +184,10 @@ def candidate_layer(label, ctx, rows_per_seq, *, seed=0):
 
 @dataclass
 class Fp4Data:
-    values: (
-        torch.Tensor
-    )  # [num_pages * 8, 64] u8: a key's 64 bytes, even element in the low nibble
-    scales: (
-        torch.Tensor
-    )  # [num_pages * 8, 4]  u8: its four E8M0 bytes, block c = dims [32c, 32c+32)
+    # [num_pages * 8, 64] u8: a key's 64 bytes, even element in the low nibble
+    values: torch.Tensor
+    # [num_pages * 8, 4] u8: its four E8M0 bytes, block c = dims [32c, 32c+32)
+    scales: torch.Tensor
     q: torch.Tensor  # [rows, H, 64] u8
     q_scale: torch.Tensor  # [rows, H, 4] u8
     weights: torch.Tensor  # [rows, H] bf16
@@ -244,11 +221,10 @@ def dequant(values, scales):
 
 def run_torch(rows: Rows, data, r):
     """Row r's logits over [0, row_end): sum_h relu(q_h . k) * w_h * weight_scale. The dot product
-    in f64 (this image's fp32 GEMMs return wrong products in a few percent of processes), rounded
-    to f32 as the WMMA's is; relu and the sum IEEE, so NaN / Inf land where the kernel's do.
-    gfx950's MFMA rounds after each 32-element block instead: it adds the block's exact product to
-    its fp32 accumulator, so an Inf from one block sticks where the f64 sum would not overflow
-    (measured on the edges rows: every one matches only this order).
+    in f64, rounded to f32 as the WMMA's is; relu and the sum IEEE, so NaN / Inf land where the
+    kernel's do. gfx950's MFMA rounds after each 32-element block instead: it adds the block's
+    exact product to its fp32 accumulator, so an Inf from one block sticks where the f64 sum would
+    not overflow.
     """
     kr = rows.key_rows(r)
     k = dequant(data.values[kr], data.scales[kr])
@@ -372,8 +348,6 @@ def make_case(rows: Rows, heads, *, page64=False, nan=False, seed=1):
     table = ((rows.block_tables[:, t >> s].long() << s) + (t & (tpb - 1))).to(
         torch.int32
     )
-    # Whole 256-key tiles (gfx950's kv256 reads its last tile's four entries): page 0 past the end.
-    table = torch.nn.functional.pad(table, (0, -table.shape[1] % (256 // TILE)))
     return Case(rows, heads, data, TILE, 1, table.contiguous())
 
 
@@ -459,12 +433,13 @@ def serves(model):
 
 
 def default_way(case: Case):
-    """The config's own choice for the case, or why there is none."""
+    """The config's own choice for the case, or "none"."""
     try:
         cfg = config(case)
     except ValueError:
         return "none"
-    return f"{cfg.instance_name}:{ {None: 'internal', M.FREE: 'free', M.PREFILL: 'prefill'}[cfg._mode] }"
+    mode = {None: "internal", M.FREE: "free", M.PREFILL: "prefill"}[cfg._mode]
+    return f"{cfg.instance_name}:{mode}"
 
 
 def schedule_for(cfg, case, build, qsl=None, ends=None):
@@ -530,13 +505,11 @@ def run_ways(model, rows: Rows):
     )
 
     ret = {"gfx": get_gfx(), "rows": n, "default": default_way(case)}
-    out = torch.empty(
-        n, rows.width, dtype=torch.float32
-    )  # preallocated, as the model passes it
+    # Preallocated, as the model passes it.
+    out = torch.empty(n, rows.width, dtype=torch.float32)
     for name, (cfg, build) in ways(case).items():
-        schedule = schedule_for(
-            cfg, case, build
-        )  # V4 builds it once a forward, outside the layers
+        # V4 builds the schedule once a forward, outside the layers.
+        schedule = schedule_for(cfg, case, build)
         out.fill_(float("-inf"))
         # Positional, so run_perftest's per-rotation deepcopy of the arguments keeps the schedule
         # bound to the very query_start_loc / row_ends tensors of its copy of the case.
@@ -598,9 +571,8 @@ def rows_shapes(model):
         out = []
         for rows, nan in shapes:
             out.append((rows, True, nan))
-            if (
-                rows.pages_per_block * PAGE_ROWS == TILE
-            ):  # ratio 4: also 8-row pages, 8 an entry
+            # ratio 4: also 8-row pages, 8 an entry
+            if rows.pages_per_block * PAGE_ROWS == TILE:
                 out.append((rows, False, nan))
         return out
     if model == "v41":
@@ -666,19 +638,19 @@ def check_rows(model):
         before = [x.clone() for x in inputs]
         refs = [run_torch(rows, case.data, r) for r in range(rows.rows)]
         tag = f"{rows.label} page{case.page_size}x{case.pages_per_block}"
-        table_out = (
-            {}
-        )  # an instance's Table logits: its other modes must equal them bit for bit
+        # An instance's Table logits: its other modes must equal them bit for bit.
+        table_out = {}
         for name, (cfg, build) in ways(case).items():
-            r = rows
-            guard = r.width * 4
-            store = torch.full((r.rows * r.width + 2 * guard,), float("-inf"))
-            out = store[guard : guard + r.rows * r.width].view(r.rows, r.width)
+            guard = rows.width * 4
+            store = torch.full((rows.rows * rows.width + 2 * guard,), float("-inf"))
+            out = store[guard : guard + rows.rows * rows.width].view(
+                rows.rows, rows.width
+            )
             schedule = schedule_for(cfg, case, build)
             launch(case, cfg, out, schedule=schedule)
             flat = None
             if cfg._instance.flat_out:
-                ends = r.row_ends.long()
+                ends = rows.row_ends.long()
                 offs = torch.cumsum(ends, 0) - ends
                 total = int(ends.sum())
                 flat = torch.full((total + 256,), float("nan"))  # the tail is a guard
@@ -1028,15 +1000,11 @@ def test_semantics(model, check):
     failed = [(label, bad) for label, bad in results if bad]
     for label, bad in failed:
         aiter.logger.error("%s %s: %s", check, label, "; ".join(bad[:3]))
-    # A build without the NaN restore must get NaN rows wrong: there, failing IS the check.
-    expect_fail = KNOCK_NAN and check == "edges"
-    ok = bool(failed) if expect_fail else not failed
     return {
         "gfx": get_gfx(),
         "cases": len(results),
         "failed": len(failed),
-        "result": ("PASS" if ok else "FAIL")
-        + (" (KNOCK=8 build: failures expected)" if expect_fail else ""),
+        "result": "FAIL" if failed else "PASS",
         "first failure": f"{failed[0][0]}: {failed[0][1][0]}" if failed else "",
     }
 

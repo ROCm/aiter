@@ -57,7 +57,6 @@ scales; the gfx1250 TU is built with -fno-honor-nans).
 from __future__ import annotations
 
 import functools
-import os
 from dataclasses import dataclass
 
 import torch
@@ -71,20 +70,20 @@ _MD_NAME = "module_pa_mqa_logits_mxfp4_opus"
 TABLE, FREE, PREFILL = 0, 1, 2
 _MODE_NAMES = {"table": TABLE, "free": FREE, "prefill": PREFILL}
 
-_TILE = 64  # keys a KV tile, every gfx1250 instance's (gfx1250's rule tells V4.1 layers by it)
-# Mirrors of the C++ builder's constants (pa_mqa_logits_mxfp4_sched.cuh).
+_TILE = 64  # keys a KV tile, every instance's (gfx1250's rule tells V4.1 layers by it)
+# Mirrors of the C++ builder's constants (pa_mqa_logits_mxfp4.cu).
 _SCHED_RECORD_INTS = 8
 _SCHED_SCRATCH_RECORDS = 96
-_GROUPS_BUILD_MAX_BATCH = 2048
-# max_qlen above this is a prefill bucket (V4.1 decode is <= 6 rows a sequence, V4's <= 4).
+_GROUPS_BUILD_MAX_SEQS = 2048
+# max_qlen above this is a prefill bucket.
 _DECODE_MAX_QLEN = 8
-# V4 (H64) decode: a tier (the smallest >= max_qlen) -> rows a CTA, one a wave. 2 and 6 rows: q2 /
-# q6 are 1.31 / 1.19x (Free) q4 on uniform rows; 7-8 rows run two four-row groups -- an
-# eight-wave CTA fits 2 a CU where q4 fits 5, and q8 is 0.94-0.98x q4 (opus-ops design §8).
-_H64_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 6, 8: 4}
-# V4.1 full-layer decode: the rows a CTA (a tier, the smallest >= max_qlen) -> (rows_per_wave,
-# waves, scale_tdm). Up to _DECODE_MAX_QLEN.
-_V41_DECODE_TIERS = {
+# Decode tiers: the smallest tier >= max_qlen picks the instance. 64 heads (V4): rows a CTA, one a
+# wave; a tier above the CTA's rows runs two or three groups a sequence (a CTA that fills a CU
+# stalls every SIMD at its per-phase barrier at once).
+_GFX1250_H64_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 6, 8: 4}
+_GFX950_H64_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 2, 8: 4}
+# 32 heads (V4.1 full layers): (rows_per_wave, waves, scale_tdm), a sequence's rows a CTA.
+_GFX1250_H32_DECODE_TIERS = {
     1: (1, 1, 0),
     2: (1, 2, 1),
     3: (3, 1, 1),
@@ -92,16 +91,11 @@ _V41_DECODE_TIERS = {
     6: (3, 2, 1),
     8: (4, 2, 1),
 }
-# gfx950 V4 decode: a tier (the smallest >= max_qlen) -> rows a CTA (1: the one-row kernel, else
-# qshare: a sequence's rows share each KV tile through LDS). 5-6 rows run three two-row groups and
-# 7-8 two four-row ones: a six- or eight-row CTA fills a CU and its barrier stalls every SIMD at
-# once (cold, Table, 23 shapes a tier: 0.80 / 0.86 of the best, against 0.97 / 0.99).
-_GFX950_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 2, 8: 4}
 # V4.1 candidate layers switch to the shallower ring at prefill size (ATOM's 16384-token batch).
 _CANDIDATE_PREFILL_ROWS = 16384
 # The Prefill split, from static shapes only. Full layers: PREFILL_ROUNDS rounds of resident CTAs
 # so the dispatcher balances the tail, no piece under PREFILL_MIN_WALK tiles. Candidate rows: the
-# fewest rounds that keep every CTA's walk within CAND_MAX_WALK tiles (opus-ops V4.1 plan §P, §X).
+# fewest rounds that keep every CTA's walk within CAND_MAX_WALK tiles.
 _PREFILL_ROUNDS = 8
 _PREFILL_MIN_WALK = 16
 _CAND_MAX_WALK = 32
@@ -127,7 +121,7 @@ def _instances_raw(device_id: int, out: torch.Tensor) -> int: ...
 def _build_schedule_raw(
     query_start_loc: torch.Tensor,
     row_ends: torch.Tensor,
-    cu_tiles: torch.Tensor,
+    cu_groups: torch.Tensor,
     cta_info: torch.Tensor,
     instance: int,
     num_ctas: int,
@@ -168,7 +162,7 @@ class _Instance:
     rows_per_wave: int
     waves: int
     stages: int
-    scale_tdm: int  # 1: key scales by TDM, 0: per-lane loads
+    scale_tdm: int  # 1: the key scales are copied with the tile, 0: loaded per lane
     gather: int  # 1: a 64-key tile gathers 8-row table entries (V4.1 candidate layers)
     entry_rows_min: int  # rows a table entry may name: page_size * pages_per_block
     entry_rows_max: int
@@ -185,9 +179,8 @@ class _Instance:
     def name(self) -> str:
         g = "g" if self.gather else ""
         s = "T" if self.scale_tdm else "L"
-        k = f"k{self.tile_keys}" if self.tile_keys != _TILE else ""
         shape = f"r{self.rows_per_wave}w{self.waves}s{self.stages}"
-        return f"h{self.heads}{g}_{shape}{s}{k}"
+        return f"h{self.heads}{g}_{shape}{s}"
 
     def has(self, mode: int) -> bool:
         return bool(self.modes >> mode & 1)
@@ -207,7 +200,7 @@ class _Instance:
 
 @functools.cache
 def _instances(device: torch.device) -> tuple[_Instance, ...]:
-    """The instances compiled for `device`'s arch, with their measured residency."""
+    """The instances compiled for `device`'s arch, with their resident CTAs a mode."""
     buf = torch.empty(1024, dtype=torch.int32, device="cpu")
     need = _instances_raw(device.index, buf)
     if need > buf.numel():
@@ -234,68 +227,52 @@ def _describe(insts) -> str:
     )
 
 
+def _tier(tiers: dict, max_qlen: int):
+    return tiers[min(t for t in tiers if t >= max_qlen)]
+
+
 def _rule_gfx1250(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
-    """§3.2's selection on gfx1250: the wanted attributes and the schedule-free mode, from
-    static bounds. Mixed batches run the prefill choice. None: no rule covers the request.
+    """V4 decode by tier, prefill four rows a CTA; V4.1 full layers decode by tier, prefill
+    eight rows a CTA; V4.1 candidate layers one row a CTA, a deeper ring below prefill size.
     """
     decode = max_qlen <= _DECODE_MAX_QLEN
     if heads == 64:
-        # Decode: the rows a CTA by tier (smallest >= max_qlen); prefill: four-row CTAs.
-        rpc = 4
-        if decode:
-            rpc = _H64_DECODE_TIERS[min(t for t in _H64_DECODE_TIERS if t >= max_qlen)]
+        rpc = _tier(_GFX1250_H64_DECODE_TIERS, max_qlen) if decode else 4
         want = {"rows_per_cta": rpc, "stages": 2, "scale_tdm": 1, "gather": 0}
         return want, FREE if decode else PREFILL
     if heads == 32 and entry_rows >= _TILE:
-        if decode:
-            # A sequence's rows a CTA, the smallest group that holds max_qlen: a bigger one idles
-            # row slots, a smaller one re-reads the keys. 1 row (no DSpark speculation): ~1.5x
-            # R3W2, S2L the best worst case of the R1W1 rings. 2 / 3 / 4 rows: 1.37 / 1.28 /
-            # 1.17x R3W2, 7-8: 1.31x (fixed + random sets, ratio 2 and 1); 6 (DSpark): R3W2.
-            rows_per_wave, waves, scale_tdm = _V41_DECODE_TIERS[
-                min(t for t in _V41_DECODE_TIERS if t >= max_qlen)
-            ]
-            return {
-                "rows_per_wave": rows_per_wave,
-                "waves": waves,
-                "stages": 2,
-                "scale_tdm": scale_tdm,
-                "gather": 0,
-            }, FREE
-        return {
-            "rows_per_wave": 4,
-            "waves": 2,
+        rpw, waves, tdm = (
+            _tier(_GFX1250_H32_DECODE_TIERS, max_qlen) if decode else (4, 2, 1)
+        )
+        want = {
+            "rows_per_wave": rpw,
+            "waves": waves,
             "stages": 2,
-            "scale_tdm": 1,
+            "scale_tdm": tdm,
             "gather": 0,
-        }, PREFILL
+        }
+        return want, FREE if decode else PREFILL
     if heads == 32:
         stages = 3 if max_rows >= _CANDIDATE_PREFILL_ROWS else 4
-        return {
-            "rows_per_cta": 1,
-            "stages": stages,
-            "scale_tdm": 0,
-            "gather": 1,
-        }, PREFILL
+        want = {"rows_per_cta": 1, "stages": stages, "scale_tdm": 0, "gather": 1}
+        return want, PREFILL
     return None
 
 
 def _rule_gfx950(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
-    """gfx950 (V4: 64 heads, 64-row pages; V4.1 runs FlyDSL, _ELSEWHERE): decode by tier, Free;
-    prefill one row a CTA, Prefill (the four-row CTA ties it on long windows and loses up to 8%
-    (Table) / 22% (Prefill) on fresh ones)."""
+    """V4 decode by tier (qshare above one row a sequence), prefill one row a CTA. V4.1 runs
+    FlyDSL's kernel (_ELSEWHERE)."""
     if heads != 64:
         return None
-    if max_qlen <= _DECODE_MAX_QLEN:
-        rpc = _GFX950_DECODE_TIERS[
-            min(t for t in _GFX950_DECODE_TIERS if t >= max_qlen)
-        ]
-        return {"rows_per_cta": rpc, "tile_keys": _TILE}, FREE
-    return {"rows_per_cta": 1, "tile_keys": _TILE}, PREFILL
+    decode = max_qlen <= _DECODE_MAX_QLEN
+    rpc = _tier(_GFX950_H64_DECODE_TIERS, max_qlen) if decode else 1
+    want = {"rows_per_cta": rpc, "tile_keys": _TILE}
+    return want, FREE if decode else PREFILL
 
 
-# Each arch's selection, (heads, entry_rows, max_rows, max_qlen) -> (wanted attributes, the
-# schedule-free mode) or None. Its constants are the arch's own measurements.
+# Each arch's selection: (heads, entry_rows, max_rows, max_qlen) -> (wanted attributes, the
+# schedule-free mode), or None when no rule covers the request. Mixed batches run the prefill
+# choice.
 _RULES = {GFX1250: _rule_gfx1250, GFX950: _rule_gfx950}
 
 
@@ -310,7 +287,9 @@ class MqaLogitsScheduleBuffers:
 
     cfg: MqaLogitsConfig
     cta_info: torch.Tensor  # [num_ctas + scratch, 8] int32 records
-    cu_tiles: torch.Tensor  # tile cut, then tile sequences; empty at one row a CTA
+    cu_groups: (
+        torch.Tensor
+    )  # the group cut, then each group's sequence; empty at one row a CTA
     num_ctas: int  # the Table grid; pinned once a graph captures it
 
 
@@ -345,9 +324,8 @@ class MqaLogitsConfig:
     max_seq_len: int
     block_table_width: int
     _instance: _Instance
-    _mode: (
-        int | None
-    )  # the schedule-free mode, or None: no schedule means an internal one
+    # The schedule-free mode, or None: no schedule means an internal one.
+    _mode: int | None
     _tpb_shift: int  # log2(tiles a table entry); 0 where a tile spans entries
     _table_slots: int  # the Table grid at the bounds
     _empty_i32: torch.Tensor
@@ -358,9 +336,8 @@ class MqaLogitsConfig:
         """Buffers for one live schedule, sized from the bounds. Hold one set per micro-batch or
         captured graph and pass it to every forward's :func:`mqa_logits_mxfp4_schedule`.
         """
-        inst = self._instance
-        rpc = inst.rows_per_cta
-        tiles = _max_tiles(self.max_rows, self.max_seqs, rpc)
+        rpc = self._instance.rows_per_cta
+        groups = _max_groups(self.max_rows, self.max_seqs, rpc)
         return MqaLogitsScheduleBuffers(
             cfg=self,
             cta_info=torch.empty(
@@ -368,10 +345,12 @@ class MqaLogitsConfig:
                 dtype=torch.int32,
                 device=self.device,
             ),
-            cu_tiles=(
+            cu_groups=(
                 self._empty_i32
                 if rpc == 1
-                else torch.empty(2 * (tiles + 1), dtype=torch.int32, device=self.device)
+                else torch.empty(
+                    2 * (groups + 1), dtype=torch.int32, device=self.device
+                )
             ),
             num_ctas=self._table_slots,
         )
@@ -382,7 +361,7 @@ class MqaLogitsConfig:
         return self._instance.name
 
 
-def _max_tiles(rows: int, seqs: int, rows_per_cta: int) -> int:
+def _max_groups(rows: int, seqs: int, rows_per_cta: int) -> int:
     """Groups of at most `rows_per_cta` rows of one sequence that `rows` rows in `seqs`
     sequences cut into, at most (each sequence's last group may be short)."""
     if rows_per_cta == 1:
@@ -392,7 +371,7 @@ def _max_tiles(rows: int, seqs: int, rows_per_cta: int) -> int:
 
 def _resolve_instance(insts, override) -> _Instance:
     for i in insts:
-        if override in (i.id, i.name, str(i.id)):
+        if override in (i.id, i.name):
             return i
     raise ValueError(
         f"no MXFP4 MQA-logits instance {override!r} on this device; it has {_describe(insts)}"
@@ -426,7 +405,7 @@ def mqa_logits_mxfp4_config(
     Cached: equal arguments give the same object. Building one asks HIP for each instance's
     occupancy once a device. Raises if no instance compiled for the device's arch supports the
     request. ``_instance`` (an id or name) and ``_mode`` ("table" / "free" / "prefill") override
-    the choice, for tuning and tests; so does ``AITER_MQA_LOGITS_INSTANCE``.
+    the choice, for tuning and tests.
     """
     dev = (
         torch.device(device)
@@ -435,8 +414,6 @@ def mqa_logits_mxfp4_config(
     )
     if dev.index is None:
         dev = torch.device(dev.type, torch.cuda.current_device())
-    if _instance is None:
-        _instance = os.environ.get("AITER_MQA_LOGITS_INSTANCE") or None
     return _config(
         dev,
         int(heads),
@@ -464,12 +441,16 @@ def _config(
     override,
     mode_name,
 ):
-    if (
-        min(
-            heads, page_size, pages_per_block, max_rows, max_seqs, max_qlen, max_seq_len
-        )
-        < 1
-    ):
+    bounds = (
+        heads,
+        page_size,
+        pages_per_block,
+        max_rows,
+        max_seqs,
+        max_qlen,
+        max_seq_len,
+    )
+    if min(bounds) < 1:
         raise ValueError("every bound must be >= 1")
     arch = _device_arch(dev)
     if (arch, heads) in _ELSEWHERE:
@@ -510,11 +491,11 @@ def _config(
         free_mode = None
     if (
         inst.rows_per_cta > 1
-        and max_seqs > _GROUPS_BUILD_MAX_BATCH
+        and max_seqs > _GROUPS_BUILD_MAX_SEQS
         and free_mode is None
     ):
         raise ValueError(
-            f"the Table schedule cuts at most {_GROUPS_BUILD_MAX_BATCH} sequences into "
+            f"the Table schedule cuts at most {_GROUPS_BUILD_MAX_SEQS} sequences into "
             f"{inst.rows_per_cta}-row tiles; max_seqs={max_seqs}"
         )
 
@@ -522,7 +503,7 @@ def _config(
     width = -(-tiles * inst.tile_keys // entry_rows)
     tpb = max(1, entry_rows // inst.tile_keys)
     resident = inst.resident[TABLE]
-    slots = max(_max_tiles(max_rows, max_seqs, inst.rows_per_cta), resident)
+    slots = max(_max_groups(max_rows, max_seqs, inst.rows_per_cta), resident)
     slots = -(-slots // resident) * resident
     return MqaLogitsConfig(
         device=dev,
@@ -566,7 +547,7 @@ def _build(cfg, buf, query_start_loc, row_ends) -> None:
     _build_schedule_raw(
         query_start_loc,
         row_ends,
-        buf.cu_tiles,
+        buf.cu_groups,
         buf.cta_info,
         inst.id,
         buf.num_ctas,
@@ -709,7 +690,7 @@ def mqa_logits_mxfp4(
         mode, cta_info, grid = TABLE, schedule.cta_info, schedule.num_ctas
     elif cfg._mode is not None:
         mode, cta_info = cfg._mode, cfg._empty_i32
-        groups = _max_tiles(rows, seqs, inst.rows_per_cta)
+        groups = _max_groups(rows, seqs, inst.rows_per_cta)
         if mode == FREE:
             cta_target = inst.resident[FREE]
             grid = groups + cta_target

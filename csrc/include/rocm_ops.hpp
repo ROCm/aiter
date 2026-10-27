@@ -1610,7 +1610,7 @@ namespace py = pybind11;
           &mqa_logits_mxfp4_build_schedule,              \
           py::arg("query_start_loc"),                    \
           py::arg("row_ends"),                           \
-          py::arg("cu_tiles"),                           \
+          py::arg("cu_groups"),                          \
           py::arg("cta_info"),                           \
           py::arg("instance"),                           \
           py::arg("num_ctas"),                           \

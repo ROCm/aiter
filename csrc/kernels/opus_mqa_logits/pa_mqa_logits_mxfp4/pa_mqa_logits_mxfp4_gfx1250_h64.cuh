@@ -3,9 +3,8 @@
 //
 // The n_heads = 64 (DeepSeek-V4) kernel on gfx1250: 64-row pages, one table entry a 64-key tile.
 // Device pass on gfx1250 only (pa_mqa_logits_mxfp4_gfx1250.cu). Where a CTA's work comes from:
-// template SCHED, pa_mqa_logits_mxfp4_gfx1250_assign.cuh.
+// template SCHED, pa_mqa_logits_mxfp4_gfx1250_common.cuh.
 //
-// The structure (opus-ops opus_logits/gfx1250/docs/H64_PORT.md):
 //   * A tile's accumulators are pipelined by n-tile -- n-tile m's two WMMAs (one an m-tile), then
 //     n-tile m-1's two epilogues -- so four are live, not two whole tiles': under 256 VGPRs.
 //   * The pair finish: n-tiles 2u and 2u+1 share one permlane16_swap and one add, and all 32
@@ -14,11 +13,11 @@
 //     one-row CTAs the row's Q ahead of the first tiles' TDM, in four-row CTAs behind it; the
 //     block-table word one tile ahead; the TDM descriptors built once, a tile patching its
 //     address and stage.
-//   * Wave priority by progress in one-round launches: a Table schedule's (the record's `_pad`,
-//     see the builder) and Free's, never Prefill's (there the age order retires CTAs early for
-//     the next round).
+//   * Wave priority by progress in one-round launches: a Table schedule's (the record's
+//     chunk_max, see the builder) and Free's, never Prefill's (there the age order retires CTAs
+//     early for the next round).
 #pragma once
-#include "pa_mqa_logits_mxfp4_gfx1250_assign.cuh"
+#include "pa_mqa_logits_mxfp4_gfx1250_common.cuh"
 
 namespace opus_logits::gfx1250 {
 
@@ -28,7 +27,8 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
     using D_BYTE   = opus::u8_t;
     using D_SCALE  = typename T::D_SCALE;
     using D_WEIGHT = typename T::D_WEIGHT;
-    using Mma = opus::wmma<opus::fp4_t, opus::fp4_t, float, T::MMA_M, T::MMA_N, T::MMA_K, T::WAVE_SIZE>;
+    using Mma =
+        opus::wmma<opus::fp4_t, opus::fp4_t, float, T::MMA_M, T::MMA_N, T::MMA_K, T::WAVE_SIZE>;
     Mma mma;
     constexpr int MT     = T::M_TILES;            // 2
     constexpr int NT     = T::N_TILES;            // 4
@@ -47,7 +47,7 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
     static_assert(T::SCALE_TDM || T::TDM_ISSUE_WAVES == T::NUM_WAVES,
                   "lane-loaded scales are per wave: every wave runs issue_tile");
 
-    __shared__ __attribute__((aligned(16))) D_BYTE smem_buf[T::LDS_BYTES_H64];
+    __shared__ __attribute__((aligned(16))) D_BYTE smem_buf[T::LDS_BYTES];
 
     const int tid     = opus::thread_id_x();
     const int wave    = __builtin_amdgcn_readfirstlane(tid / WAVE);
@@ -65,7 +65,7 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
     // own window only masks its stores. A wave past a short group runs with an empty window, so it
     // stores nothing and the barrier count stays uniform.
     mqa_work wk;
-    if (!mqa_assign<T::NUM_WAVES, T::KV_TILE_SIZE, false, SCHED, true>(k, lane, wk)) return;   // CTA-uniform
+    if (!mqa_assign<T::NUM_WAVES, TK, false, SCHED, true>(k, lane, wk)) return;   // CTA-uniform
     const bool slot_ok     = wave < wk.group_rows && wk.row_id + wave < num_rows;
     const int  row_id      = wk.row_id + (slot_ok ? wave : 0);
     int        batch_id    = wk.batch_id;
@@ -87,10 +87,10 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
     constexpr int TDM_CACHE = opus::tdm_traits::make_cache_policy(
         opus::tdm_traits::load_temporal_hint::regular, opus::tdm_traits::scope::cu);
     using Cache  = opus::tdm_traits::cache<TDM_CACHE>;
-    using KvWin  = opus::tdm<fp4x2, opus::seq<T::TOKEN_BYTES, T::TDM_ROWS>,
-                             opus::tdm_traits::padding<fp4x2, T::LDS_PAD_INTERVAL, T::LDS_PAD_AMOUNT>, Cache>;
+    using Pad    = opus::tdm_traits::padding<fp4x2, T::LDS_PAD_INTERVAL, T::LDS_PAD_AMOUNT>;
+    using KvWin  = opus::tdm<fp4x2, opus::seq<T::TOKEN_BYTES, T::TDM_ROWS>, Pad, Cache>;
     using KvsWin = opus::tdm<opus::u8_t, opus::seq<T::SCALE_BYTES_PER_DWORD, T::TDM_ROWS>, Cache>;
-    constexpr opus::u32_t TDM_EXTENT = 1u << 30;   // rows; the address moves, the extent only clamps
+    constexpr opus::u32_t TDM_EXTENT = 1u << 30;   // rows; the address moves, the extent clamps
     const int tdm_piece    = wave;                 // one piece of the 64-row page a wave
     const int kv_lds_base  = tdm_piece * T::LDS_PIECE_BYTES;
     const int kvs_lds_base = T::lds_scale_byte(tdm_piece * T::TDM_ROWS);
@@ -99,7 +99,8 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
         (opus::u32_t)T::TOKEN_BYTES, TDM_EXTENT, (opus::u64_t)T::TOKEN_BYTES, 0u, 0u);
     auto kvs_win = opus::make_tdm<KvsWin>(
         (opus::u32_t)kvs_lds_base, reinterpret_cast<const D_BYTE*>(k.ptr_kv_scale),
-        (opus::u32_t)T::SCALE_BYTES_PER_DWORD, TDM_EXTENT, (opus::u64_t)T::SCALE_BYTES_PER_DWORD, 0u, 0u);
+        (opus::u32_t)T::SCALE_BYTES_PER_DWORD, TDM_EXTENT,
+        (opus::u64_t)T::SCALE_BYTES_PER_DWORD, 0u, 0u);
     // Each window's D# at origin 0, built once; a tile's issue patches the global address and
     // the LDS stage (rebuilding the D# costs ~25 dependent SALU an op).
     const typename KvWin::descriptor  kv_d0  = kv_win.make_descriptor();
@@ -146,7 +147,8 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
         opus::static_for<NT / 2>([&](auto uc) {
             constexpr int u = uc.value;
             if constexpr (T::SCALE_TDM)
-                kvs[u] = opus::load<1>(s_dw, stage_dw + T::lds_scale_byte(u * 2 * T::MMA_N) / DW + lane)[0];
+                kvs[u] = opus::load<1>(
+                    s_dw, stage_dw + T::lds_scale_byte(u * 2 * T::MMA_N) / DW + lane)[0];
             else
                 kvs[u] = kvs_ring[slot][u];
         });
@@ -157,23 +159,25 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
                 constexpr int v   = vc.value;
                 constexpr int imm = v * 2 * T::LDS_BLOCK_BYTES / DW;
                 auto x = opus::load<GRP_DW>(s_dw, stage_dw + base + imm + lds_lane_dw);
-                opus::set_slice(kv[nt], x, opus::number<v * GRP_DW>{}, opus::number<(v + 1) * GRP_DW>{});
+                opus::set_slice(kv[nt], x, opus::number<v * GRP_DW>{},
+                                opus::number<(v + 1) * GRP_DW>{});
             });
         });
     };
 
-    // relu x weight over the lane's 16 heads of one m-tile, as TWO pk_fma chains (one chain of 8
-    // dependent steps stalls); returned unjoined, (even heads, odd heads). Under the NaN restore,
-    // one head of m-tile 0 goes through the IEEE maximum, so a NaN key's NaN (every head of its
-    // column) rides the relu and no per-tile test of the key scales is needed. asm, or
-    // -fno-honor-nans lets the compiler pick max_num; a VGPR operand (this kernel is <= 256 VGPRs).
-    auto head_sum = [&](const typename Mma::vtype_c& c, const opus::vector_t<float, EC>& wr, auto with_nan_c) {
+    // relu x weight over the lane's 16 heads of one m-tile, as two pk_fma chains (one chain of 8
+    // dependent steps stalls); returned unjoined, (even heads, odd heads). One head of m-tile 0
+    // goes through the IEEE maximum, so a NaN key's NaN (every head of its column) rides the relu
+    // and no per-tile test of the key scales is needed. asm, or -fno-honor-nans lets the compiler
+    // pick max_num; a VGPR operand (this kernel is <= 256 VGPRs).
+    auto head_sum = [&](const typename Mma::vtype_c& c, const opus::vector_t<float, EC>& wr,
+                        auto with_nan_c) {
         constexpr bool WITH_NAN = decltype(with_nan_c)::value;
         opus::vector_t<float, 2> s2[2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
         opus::static_for<EC / 2>([&](auto pc) {
             constexpr int p = pc.value;
             opus::vector_t<float, 2> wv{wr[2 * p], wr[2 * p + 1]};
-            opus::vector_t<float, 2> rv{MQA_LOGITS_RELU(c[2 * p]), MQA_LOGITS_RELU(c[2 * p + 1])};
+            opus::vector_t<float, 2> rv{relu_num(c[2 * p]), relu_num(c[2 * p + 1])};
             if constexpr (WITH_NAN && p == 0) {
                 float x = c[0];
                 asm volatile("v_maximum_f32 %0, %0, 0" : "+v"(x));
@@ -194,8 +198,8 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
         if (LEAD < tile_count) pf = bt_c[LEAD];
         __builtin_amdgcn_sched_barrier(0);
     };
-    // Q is 4 KB a row and every chunk-CTA of a row reads it; issuing it before the TDM gains
-    // 2-7% in one-row CTAs and nothing in four-row ones.
+    // Q is 4 KB a row and every chunk-CTA of a row reads it: one-row CTAs issue it before the
+    // TDM, multi-row ones behind it.
     constexpr bool Q_FIRST = T::NUM_WAVES == 1;
     if constexpr (!Q_FIRST) issue_first();
 
@@ -211,14 +215,17 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
             const int head  = mi * T::MMA_M + lane_m0 + (v >= 2 ? 16 : 0);
             const int block = lane_g + (v % 2 ? 2 : 0);
             auto x = opus::load<GRP_DW>(g_q, T::q_byte(head, block) / DW);
-            opus::set_slice(q_a[mi], x, opus::number<v * GRP_DW>{}, opus::number<(v + 1) * GRP_DW>{});
+            opus::set_slice(q_a[mi], x, opus::number<v * GRP_DW>{},
+                            opus::number<(v + 1) * GRP_DW>{});
         });
     });
-    auto g_qs = opus::make_gmem(reinterpret_cast<const D_SCALE*>(k.ptr_q_scale) + (size_t)row_id * T::N_HEADS);
+    auto g_qs = opus::make_gmem(reinterpret_cast<const D_SCALE*>(k.ptr_q_scale) +
+                                (size_t)row_id * T::N_HEADS);
     opus::static_for<MT>([&](auto mic) {
         q_sc[mic.value] = opus::load<1>(g_qs, mic.value * T::MMA_M + lane)[0];
     });
-    auto g_w = opus::make_gmem(reinterpret_cast<const D_WEIGHT*>(k.ptr_weights) + (size_t)row_id * T::W_ROW_ELEMS);
+    auto g_w = opus::make_gmem(reinterpret_cast<const D_WEIGHT*>(k.ptr_weights) +
+                               (size_t)row_id * T::W_ROW_ELEMS);
     opus::static_for<MT>([&](auto mic) {
         constexpr int mi = mic.value;
         opus::static_for<T::REPT_C>([&](auto hc) {
@@ -240,13 +247,10 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
     const unsigned out_bytes = (unsigned)(own_end > 0 ? own_end : 0) * (unsigned)sizeof(float);
     auto g_out = opus::make_gmem(k.ptr_out + (size_t)row_id * stride_out, out_bytes);
 
-    bool q_nan = false;   // the row's q scales hold a NaN (uniform)
-#if MQA_LOGITS_NAN_RESTORE
-    // After every prologue load is out: a branch on a scale per load serialises the round trips.
-    q_nan = __builtin_amdgcn_ballot_w32(e8m0x4_has_nan((unsigned)q_sc[0]) ||
-                                        e8m0x4_has_nan((unsigned)q_sc[1])) != 0;
-#endif
-    (void)q_nan;
+    // The row's q scales hold a NaN (uniform). Tested after every prologue load is out: a branch
+    // on a scale per load serialises the round trips.
+    const bool q_nan = __builtin_amdgcn_ballot_w32(e8m0x4_has_nan((unsigned)q_sc[0]) ||
+                                                   e8m0x4_has_nan((unsigned)q_sc[1])) != 0;
 
     typename Mma::vtype_b kv_b[NT];
     int kvs[NT / 2];
@@ -259,7 +263,7 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
             if (chunk_max > 0) set_prio_by_progress(tile_count - t, chunk_max);   // uniform
             // Tile t has landed once at most the tiles issued after it are outstanding; near the
             // end fewer were issued, and the constant would no longer cover t: drain instead.
-            if (tile_count - 1 - t >= LEAD - 1) opus::s_wait_tensorcnt<T::TENSORCNT_KEEP_H64>();
+            if (tile_count - 1 - t >= LEAD - 1) opus::s_wait_tensorcnt<T::TENSORCNT_KEEP>();
             else                                opus::s_wait_tensorcnt<0>();
             cta_sync();
             issue_tile(t + LEAD, opus::number<(S + LEAD) % STAGES>{}, pf);
@@ -274,11 +278,12 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
             opus::vector_t<float, 2> hs[MT * NT];
             auto wmma_j = [&](auto jc) {
                 constexpr int j = decltype(jc)::value, nt = j / MT, mi = j % MT;
-                return mma(q_a[mi], kv_b[nt], q_sc[mi], kvs[nt / 2], opus::number<0>{}, opus::number<nt % 2>{});
+                return mma(q_a[mi], kv_b[nt], q_sc[mi], kvs[nt / 2], opus::number<0>{},
+                           opus::number<nt % 2>{});
             };
             auto epilogue_j = [&](auto jc, const typename Mma::vtype_c& c) {
                 constexpr int j = decltype(jc)::value, nt = j / MT, mi = j % MT;
-                hs[j] = head_sum(c, w[mi], opus::bool_constant<MQA_LOGITS_NAN_RESTORE && mi == 0>{});
+                hs[j] = head_sum(c, w[mi], opus::bool_constant<mi == 0>{});
                 if constexpr (mi == MT - 1 && nt % 2 == 1) {
                     out[nt / 2] = pair_head_reduce(pair_sum<true>(hs[j - 3] + hs[j - 2]),
                                                    pair_sum<true>(hs[j - 1] + hs[j]));
@@ -291,7 +296,8 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
             opus::static_for<A / 2 - 1>([&](auto mc) {
                 constexpr int m = mc.value + 1;
                 __builtin_amdgcn_sched_barrier(0);
-                typename Mma::vtype_c n0 = wmma_j(opus::number<2 * m>{}), n1 = wmma_j(opus::number<2 * m + 1>{});
+                typename Mma::vtype_c n0 = wmma_j(opus::number<2 * m>{});
+                typename Mma::vtype_c n1 = wmma_j(opus::number<2 * m + 1>{});
                 __builtin_amdgcn_sched_barrier(0);
                 epilogue_j(opus::number<2 * m - 2>{}, c0);
                 epilogue_j(opus::number<2 * m - 1>{}, c1);
@@ -301,12 +307,12 @@ void h64_kernel(mqa_logits_mxfp4_kargs k) {
             __builtin_amdgcn_sched_barrier(0);
             epilogue_j(opus::number<A - 2>{}, c0);
             epilogue_j(opus::number<A - 1>{}, c1);
-#if MQA_LOGITS_NAN_RESTORE
             // The keys' NaN rides the relu (the IEEE element); a NaN q row is put back here.
             if (q_nan) {
-                opus::static_for<NT / 2>([&](auto uc) { out[uc.value] = std::bit_cast<float>(0x7fc00000u); });
+                opus::static_for<NT / 2>([&](auto uc) {
+                    out[uc.value] = std::bit_cast<float>(0x7fc00000u);
+                });
             }
-#endif
             // The stores after the tile's compute: a store's data registers are the accumulators',
             // and a WMMA rewriting them waits for the store to read them out (s_wait_xcnt).
             __builtin_amdgcn_sched_barrier(0);
