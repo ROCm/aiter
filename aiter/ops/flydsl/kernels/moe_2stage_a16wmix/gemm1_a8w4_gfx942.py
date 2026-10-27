@@ -48,7 +48,6 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
     lds_vec_load,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 from .utils import (
     _FP4_E2M1_FP8_LUT_HI,
@@ -83,14 +82,15 @@ def _fp4x8_to_fp8x8(raw_i32):
     """
     raw = fx.Int32(raw_i32)
     mag_e = raw & fx.Int32(0x07070707)  # elements 0,2,4,6 (low nibbles)
-    mag_o = raw.shrui(fx.Int32(4)) & fx.Int32(0x07070707)  # elements 1,3,5,7
+    mag_o = (raw >> fx.Int32(4)) & fx.Int32(0x07070707)  # elements 1,3,5,7
 
     def _lut(mag):
+        # v_perm_b32: no stable FlyDSL API (rocdl.perm_b32 is not in rocdl.__all__)
         return fx.Int32(
             rocdl.perm_b32(
-                _raw(fx.Int32(_FP4_E2M1_FP8_LUT_HI)),
-                _raw(fx.Int32(_FP4_E2M1_FP8_LUT_LO)),
-                _raw(mag),
+                fx.Int32(_FP4_E2M1_FP8_LUT_HI).ir_value(),
+                fx.Int32(_FP4_E2M1_FP8_LUT_LO).ir_value(),
+                mag.ir_value(),
             )
         )
 
@@ -101,15 +101,18 @@ def _fp4x8_to_fp8x8(raw_i32):
     sign_o = raw & fx.Int32(0x80808080)
     ev = _lut(mag_e) | (sign_e & _nz(mag_e))
     od = _lut(mag_o) | (sign_o & _nz(mag_o))
-    return fx.Vector.from_elements([_raw(ev), _raw(od)], fx.Int32).bitcast(fx.Int64)[0]
+    return fx.Vector.from_elements([ev.ir_value(), od.ir_value()], fx.Int32).bitcast(
+        fx.Int64
+    )[0]
 
 
 def _to_k8_order(v_i64):
     """8 fp8 bytes in natural K order -> A8W4_K8_ORDER (x0,x2,x4,x6, x1,x3,x5,x7)."""
-    w = fx.Vector.from_elements([_raw(v_i64)], fx.Int64).bitcast(fx.Int32)
-    lo, hi = _raw(fx.Int32(w[0])), _raw(fx.Int32(w[1]))
-    ev = rocdl.perm_b32(hi, lo, _raw(fx.Int32(0x06040200)))
-    od = rocdl.perm_b32(hi, lo, _raw(fx.Int32(0x07050301)))
+    w = fx.Vector.from_elements([v_i64.ir_value()], fx.Int64).bitcast(fx.Int32)
+    lo, hi = fx.Int32(w[0]).ir_value(), fx.Int32(w[1]).ir_value()
+    # v_perm_b32: no stable FlyDSL API (rocdl.perm_b32 is not in rocdl.__all__)
+    ev = rocdl.perm_b32(hi, lo, fx.Int32(0x06040200).ir_value())
+    od = rocdl.perm_b32(hi, lo, fx.Int32(0x07050301).ir_value())
     return fx.Vector.from_elements([ev, od], fx.Int32).bitcast(fx.Int64)[0]
 
 
@@ -162,6 +165,7 @@ def _gemm1_body_a8w4(
     num_n_waves = 4 // k_wave
     if const_expr(k_wave > 1):
         wave_n_id = wave % fx.Int32(num_n_waves)
+        # v_readfirstlane: no stable FlyDSL API (not in rocdl.__all__); also below
         wave_k_id = rocdl.readfirstlane(T.i32, wave // fx.Int32(num_n_waves))
     else:
         wave_n_id = wave
@@ -184,15 +188,15 @@ def _gemm1_body_a8w4(
 
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    e = rocdl.readfirstlane(T.i32, _global_i32_at(arg_eids, m_block_idx).ir_value())
     bx_m = m_block_idx * fx.Int32(BM)
     by_n = n_block_idx * fx.Int32(TILE_N)
     inter_i32 = fx.Int32(INTER)
     # bf16 intermediate [sorted_size, inter]; padding-row stores are masked (see gemm1).
     _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
     out_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_out)),
-        num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(INTER * 2)),
+        fx.Int64(arg_out).ir_value(),
+        num_records_bytes=(fx.Int64(_cumsum0) * fx.Int64(INTER * 2)).ir_value(),
     )
 
     # ---- W addressing: reuse the a16w4 column descriptors (same preshuffle) ------
@@ -358,7 +362,7 @@ def _gemm1_body_a8w4(
             amax = fx.maxnumf(amax, dpp_xor_f32(amax, 2))
             # _mxfp8_exponent on the float bits: E - 7, +1 if the mantissa > 1.875
             bits = amax.bitcast(fx.Int32)
-            ex = (bits.shrui(fx.Int32(23)) & fx.Int32(0xFF)) - fx.Int32(134)
+            ex = ((bits >> fx.Int32(23)) & fx.Int32(0xFF)) - fx.Int32(134)
             ex = ex + ((bits & fx.Int32(0x7FFFFF)) > fx.Int32(0x700000)).select(
                 fx.Int32(1), fx.Int32(0)
             )
@@ -368,10 +372,11 @@ def _gemm1_body_a8w4(
             for xv in xf:
                 # |v| <= 2^-11 rounds to 0, and -0 is NaN (0x80) in FNUZ -> force +0
                 sv = xv * inv
-                q.append(_raw((fmath.absf(sv) <= _half_sub).select(_f0, sv)))
+                q.append(((fmath.absf(sv) <= _half_sub).select(_f0, sv)).ir_value())
 
             def _pk(a0, a1, a2, a3):
-                pk = rocdl.cvt_pk_fp8_f32(T.i32, a0, a1, _raw(fx.Int32(0)), 0)
+                # v_cvt_pk_fp8_f32: no stable FlyDSL API (not in rocdl.__all__)
+                pk = rocdl.cvt_pk_fp8_f32(T.i32, a0, a1, fx.Int32(0).ir_value(), 0)
                 return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, a2, a3, pk, 1))
 
             # A8W4_K8_ORDER: (x0, x2, x4, x6) then (x1, x3, x5, x7)
@@ -530,17 +535,25 @@ def _gemm1_body_a8w4(
             return frags, load_xs_lds(slot)
         return frags
 
-    zero4 = _raw(fx.Vector.filled(4, 0.0, fx.Float32))
+    zero4 = fx.Vector.filled(4, 0.0, fx.Float32).ir_value()
     acc_gate = [[zero4 for _ in range(num_acc_n)] for _ in range(m_repeat)]
     acc_up = [[zero4 for _ in range(num_acc_n)] for _ in range(m_repeat)]
 
+    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
+
+    def _fp8x8_frag(v_i64):
+        t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Float8E4M3FNUZ)
+        t.store(fx.Vector.from_elements([v_i64], fx.Int64).bitcast(fx.Float8E4M3FNUZ))
+        return t
+
     def _mfma(a_i64, b_i64):
-        return rocdl.mfma_f32_16x16x32_fp8_fp8(
-            T.f32x4, [_raw(a_i64), _raw(b_i64), zero4, 0, 0, 0]
-        )
+        acc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+        acc.store(fx.Vector.filled(4, 0.0, fx.Float32))
+        fx.gemm(mma_atom, acc, _fp8x8_frag(a_i64), _fp8x8_frag(b_i64), acc)
+        return fx.memref_load_vec(acc).ir_value()
 
     def _splat4(v):
-        return Vec.from_elements([_raw(v)] * 4, fx.Float32)
+        return Vec.from_elements([v.ir_value()] * 4, fx.Float32)
 
     def compute_tile(tile, a_frags):
         g_raw, u_raw, g_sc, u_sc, x_sc = tile
@@ -576,11 +589,9 @@ def _gemm1_body_a8w4(
                         xs4.append(
                             Vec.from_elements(
                                 [
-                                    _raw(
-                                        _e8m0_byte_to_f32(
-                                            fx.Int32(xs_v[mi][b % 4][ii]), byte
-                                        )
-                                    )
+                                    _e8m0_byte_to_f32(
+                                        fx.Int32(xs_v[mi][b % 4][ii]), byte
+                                    ).ir_value()
                                     for ii in range_constexpr(4)
                                 ],
                                 fx.Float32,
@@ -590,20 +601,16 @@ def _gemm1_body_a8w4(
                     sg4 = _splat4(g_sc[ni][b])
                     su4 = _splat4(u_sc[ni][b])
                     for mi in range_constexpr(m_repeat):
-                        acc_gate[mi][ni] = _raw(
-                            fx.math.fma(
-                                Vec(t_g[(b, ni, mi)]),
-                                xs4[mi] * sg4,
-                                Vec(acc_gate[mi][ni]),
-                            )
-                        )
-                        acc_up[mi][ni] = _raw(
-                            fx.math.fma(
-                                Vec(t_u[(b, ni, mi)]),
-                                xs4[mi] * su4,
-                                Vec(acc_up[mi][ni]),
-                            )
-                        )
+                        acc_gate[mi][ni] = fx.math.fma(
+                            Vec(t_g[(b, ni, mi)]),
+                            xs4[mi] * sg4,
+                            Vec(acc_gate[mi][ni]),
+                        ).ir_value()
+                        acc_up[mi][ni] = fx.math.fma(
+                            Vec(t_u[(b, ni, mi)]),
+                            xs4[mi] * su4,
+                            Vec(acc_up[mi][ni]),
+                        ).ir_value()
 
     # ---- main K loop: A-LDS double buffer, W + scales for kt+1 in flight ---------
     def _a_store(base_k, slot):
@@ -677,7 +684,7 @@ def _gemm1_body_a8w4(
                         )
                     )
                     sv = sv + pv
-                accs[mi_][ni_] = _raw(sv)
+                accs[mi_][ni_] = sv.ir_value()
 
         _reduce_round(acc_gate)
         _reduce_round(acc_up)
@@ -699,7 +706,10 @@ def _gemm1_body_a8w4(
                 y = gate_up_act(act, [g], [u], situ)[0]
                 out_idx = sorted_row * inter_i32 + col_g_list[ni]
                 buffer_ops.buffer_store(
-                    y.to(fx.BFloat16), _raw(out_rsrc), _raw(out_idx), mask=valid
+                    y.to(fx.BFloat16),
+                    out_rsrc,
+                    out_idx.ir_value(),
+                    mask=valid,
                 )
 
 
@@ -889,9 +899,10 @@ def compile_gemm1_a8w4_gfx942(
     ):
         _ = _a8w4_src_tag
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
-        tx_i32 = fx.Int32(gpu.thread_id("x"))
-        bx_i32 = fx.Int32(gpu.block_id("x"))
+        tx_i32 = fx.thread_idx.x
+        bx_i32 = fx.block_idx.x
         lane = tx_i32 % fx.Int32(64)
+        # v_readfirstlane: no stable FlyDSL API (not in rocdl.__all__)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
