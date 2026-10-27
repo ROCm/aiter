@@ -1,0 +1,42 @@
+name: PR Self-Review Selftest
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/scripts/pr_self_review.py'
+      - '.github/scripts/pr_self_review_test.py'
+      - '.github/workflows/pr-self-review.yml'
+      - '.github/workflows/pr-self-review-selftest.yml'
+      - '.github/pull_request_template.md'
+  push:
+    branches: [main]
+    paths:
+      - '.github/scripts/pr_self_review.py'
+      - '.github/scripts/pr_self_review_test.py'
+      - '.github/workflows/pr-self-review.yml'
+      - '.github/workflows/pr-self-review-selftest.yml'
+      - '.github/pull_request_template.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Unit tests
+        run: python3 .github/scripts/pr_self_review_test.py
+
+      - name: Lint for runtime errors
+        run: |
+          pip3 install --quiet ruff==0.16.0
+          ruff check --no-cache --select F,E9 \
+            .github/scripts/pr_self_review.py \
+            .github/scripts/pr_self_review_test.py

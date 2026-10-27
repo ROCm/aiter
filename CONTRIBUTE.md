@@ -490,10 +490,29 @@ List any breaking changes and migration guide
 
 ### Code Review Process
 
-1. **Initial Review**: A maintainer will review within 3-5 business days
-2. **Feedback**: Address comments and push updates
-3. **Approval**: After approval, CI will run full test suite
-4. **Merge**: Once CI passes, a maintainer will merge
+Before requesting a human review, complete the **PR Self-Review** section in the
+pull request description for the current head revision. The automated comment
+asks one question selected from the files changed by the pull request. It also
+reports current Copilot findings, obvious code/test hygiene issues and the
+required baseline CI state.
+
+A pull request is ready for human review only when:
+
+* The behavior, reason for the change and current revision are stated.
+* Validation evidence and anything still unverified are stated.
+* The PR-specific question is answered.
+* Every changed `op_tests/` file has a stated, non-redundant purpose.
+* Current Copilot findings have a substantive author reply and are resolved.
+* Black, Ruff, repository dependency and Aiter Test Gate checks pass.
+
+Any new push invalidates the previous self-review until the author updates the
+reviewed revision and answers for the new head.
+
+1. **Self-review**: Complete PR Self-Review and required baseline CI
+2. **Initial Review**: A maintainer reviews a prepared pull request
+3. **Feedback**: Address comments and update the self-review after new pushes
+4. **Approval**: Obtain the required approval for the latest revision
+5. **Merge**: Once all required checks pass, a maintainer will merge
 
 If your PR is urgent or hasn't been reviewed, ping maintainers on the issue or PR.
 
