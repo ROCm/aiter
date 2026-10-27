@@ -4,8 +4,8 @@
 
 The compact-plan alignment lookup and fused_moe both ask
 ``_find_grouped_config`` for the same shape. Rows with ``ep_fused=1`` must
-win only when that flag is set; a lookup that leaves it false keeps the
-64-tile default and the plan alignment disagrees with the GEMM.
+win only when that flag is set. A lookup that leaves it false stays on the
+generic row, and the plan alignment would disagree with the fused GEMM.
 
 Requires torch (importing aiter pulls it in). No GPU: ``GPU_ARCHS`` and
 ``CU_NUM`` stand in for the device.
@@ -80,12 +80,15 @@ class GroupedEpFusedLookupTest(unittest.TestCase):
                 # The merged CSV stores the flag as "1.0"; lookup normalizes it.
                 self.assertIn(str(row.get("ep_fused")), ("1", "1.0"))
 
-    def test_plain_lookup_misses_ep_fused_rows(self):
-        # These buckets have no blank-ep_fused row, so ep_fused=False must
-        # miss and leave the caller on the 64 default.
+    def test_plain_lookup_keeps_generic_rows(self):
+        # Upstream rows leave ep_fused blank, so they match both paths and
+        # the explicit fused rows must not be selected when ep_fused is false.
         for token, experts in ((1024, 65), (4096, 64), (4096, 65), (32768, 65)):
             with self.subTest(token=token, experts=experts):
-                self.assertIsNone(_row(token, experts, False))
+                row = _row(token, experts, False)
+                self.assertIsNotNone(row)
+                self.assertNotEqual(str(row.get("tile_m")), "128")
+                self.assertNotIn(str(row.get("ep_fused")), ("1", "1.0"))
 
     def test_token_512_stays_default(self):
         self.assertIsNone(_row(512, 65, True))
