@@ -130,7 +130,6 @@ class GitHub:
 @dataclass
 class Result:
     head_sha: str
-    merge_sha: str
     mode: str
     question: str
     author_issues: list[str] = field(default_factory=list)
@@ -422,10 +421,10 @@ def inspect_copilot(api: GitHub, number: int, author: str) -> list[str]:
     return issues[:20]
 
 
-def inspect_ci(api: GitHub, merge_sha: str) -> dict[str, str]:
-    if not merge_sha:
+def inspect_ci(api: GitHub, head_sha: str) -> dict[str, str]:
+    if not head_sha:
         return {name: "missing" for name in REQUIRED_CHECKS}
-    result = api.request(f"commits/{merge_sha}/check-runs?filter=latest&per_page=100")
+    result = api.request(f"commits/{head_sha}/check-runs?filter=latest&per_page=100")
     runs = result.get("check_runs") if isinstance(result, dict) else []
     states: dict[str, str] = {}
     for label, aliases in REQUIRED_CHECKS.items():
@@ -450,7 +449,6 @@ def evaluate(api: GitHub, number: int, mode: str) -> tuple[Result, dict[str, Any
     pr = api.request(f"pulls/{number}")
     files = api.pages(f"pulls/{number}/files")
     head_sha = ((pr.get("head") or {}).get("sha")) or ""
-    merge_sha = pr.get("merge_commit_sha") or head_sha
     paths = [item.get("filename") or "" for item in files]
     hard, advisory, changed_tests = inspect_hygiene(files)
     author = ((pr.get("user") or {}).get("login")) or ""
@@ -459,14 +457,13 @@ def evaluate(api: GitHub, number: int, mode: str) -> tuple[Result, dict[str, Any
     )
     result = Result(
         head_sha=head_sha,
-        merge_sha=merge_sha,
         mode=mode,
         question=select_question(paths),
         author_issues=author_issues,
         copilot_issues=inspect_copilot(api, number, author),
         hygiene_issues=hard,
         hygiene_advisories=advisory,
-        ci=inspect_ci(api, merge_sha),
+        ci=inspect_ci(api, head_sha),
         telemetry=telemetry,
     )
     return result, pr
@@ -634,9 +631,9 @@ def main(argv: list[str]) -> int:
     print(body)
     if args.apply:
         url = upsert_comment(api, number, body)
-        # Status the synthetic merge commit used by pull_request workflows and branch rules.
+        # PR checks and branch protection are attached to the PR head commit.
         try:
-            post_status(api, result.merge_sha, result, url or pr.get("html_url") or "")
+            post_status(api, result.head_sha, result, url or pr.get("html_url") or "")
         except APIError as exc:
             if mode == "enforce":
                 raise

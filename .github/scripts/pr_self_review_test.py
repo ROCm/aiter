@@ -199,8 +199,11 @@ def main():
     )
 
     class CheckAPI:
+        def __init__(self):
+            self.path = None
+
         def request(self, path):
-            del path
+            self.path = path
             return {
                 "check_runs": [
                     {
@@ -230,7 +233,12 @@ def main():
                 ]
             }
 
-    ci = MODULE.inspect_ci(CheckAPI(), HEAD)
+    check_api = CheckAPI()
+    ci = MODULE.inspect_ci(check_api, HEAD)
+    check(
+        "CI aggregator reads the PR head SHA",
+        check_api.path == f"commits/{HEAD}/check-runs?filter=latest&per_page=100",
+    )
     check("CI aggregator recognizes pass", ci["Black"] == "passed")
     check("CI aggregator recognizes pending", ci["Ruff"] == "pending")
     check("CI aggregator recognizes failure", ci["Repository dependency"] == "failed")
@@ -264,10 +272,10 @@ def main():
     MODULE.upsert_comment(comment_api, 7, "updated")
     check("spoofed sticky marker is ignored", comment_api.path == "issues/comments/2")
 
-    shadow = MODULE.Result(head_sha=HEAD, merge_sha=HEAD, mode="shadow", question="q")
+    shadow = MODULE.Result(head_sha=HEAD, mode="shadow", question="q")
     shadow.author_issues.append("missing answer")
     check("shadow stays successful", shadow.state() == "success")
-    enforce = MODULE.Result(head_sha=HEAD, merge_sha=HEAD, mode="enforce", question="q")
+    enforce = MODULE.Result(head_sha=HEAD, mode="enforce", question="q")
     enforce.ci = {"Black": "pending"}
     check("enforce waits for CI", enforce.state() == "pending")
     enforce.author_issues.append("missing answer")
