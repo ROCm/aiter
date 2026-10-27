@@ -57,10 +57,10 @@ from .utils import (
     _buffer_i32_scalar_read,
     _e8m0_byte_to_f32,
     _global_i32_at,
-    _udiv,
-    _umod,
+    gemm1_grid,
     make_a_loader,
     make_b_loader,
+    xcd_tile_map,
 )
 
 MX_BLOCK = 32  # E8M0 scale group == one fp8 MFMA K step
@@ -775,10 +775,6 @@ def shuffle_scale_a8w4_gfx942(s_a16w4_u8):
     return _mark_a8w4_gfx942(out, s_a16w4_u8)
 
 
-def gemm1_a8w4_grid(BM, *, INTER, TILE_N, max_m_blocks):
-    return int(max_m_blocks) * (INTER // TILE_N)
-
-
 @functools.cache
 def _source_tag():
     """Hash of the sources this kernel's device code comes from, put in its name.
@@ -901,23 +897,8 @@ def compile_gemm1_a8w4_gfx942(
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
 
-        _NXCD = 8
-        _xq = _udiv(bound, _NXCD)
-        _xr = _umod(bound, _NXCD)
         _SW = xcd_swizzle
-
-        def _xcd(pid):
-            xc = _umod(pid, _NXCD)
-            wgid = xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
-            _ng = fx.Int32(_SW * NUM_N_BLOCKS)
-            group_id = wgid // _ng
-            first_pid_m = group_id * fx.Int32(_SW)
-            remaining_m = total_m_blocks - first_pid_m
-            group_size_m = fx.min(remaining_m, fx.Int32(_SW))
-            wig = wgid % _ng
-            m_block = first_pid_m + (wig % group_size_m)
-            n_block = wig // group_size_m
-            return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
+        _xcd = xcd_tile_map(bound, total_m_blocks, NUM_N_BLOCKS, _SW)
 
         if bx_i32 < bound:
             _tile = _xcd(bx_i32) if const_expr(_SW > 0) else bx_i32
@@ -1050,7 +1031,7 @@ def flydsl_a8w4_gemm1_gfx942(
         x_layout=x_layout,
         rocm_arch=str(get_rocm_arch()),
     )
-    grid = gemm1_a8w4_grid(
+    grid = gemm1_grid(
         tile_m, INTER=D_INTER, TILE_N=tile_n, max_m_blocks=sorted_expert_ids.numel()
     )
     _beta, _lbeta = float(situ_beta), float(situ_linear_beta)
