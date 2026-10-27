@@ -1047,7 +1047,11 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        if kparams.get("mode", "atomic") == "atomic":
+        # a16w4 (bf16 A x mxfp4 W) stage2 always atomic-scatters into moe_buf,
+        # whatever the kernelName's mode (same rule as fused_moe's
+        # stage2_uses_route_reduce), so it needs the zeroed buffer too.
+        is_a16w4 = kparams["a_dtype"] == "bf16" and kparams["b_dtype"] == "fp4"
+        if kparams.get("mode", "atomic") == "atomic" or is_a16w4:
             moe_buf.zero_()
 
         sort_block_m = kparams.get("sort_block_m", 0)
@@ -3914,6 +3918,15 @@ class FmoeTuner(TunerCommon):
                     or inter_dim % kparams["tile_k"] != 0
                 ):
                     continue
+                # a16w4 (fp4 W) stage2 always atomic-scatters and ignores persist,
+                # so its reduce/persist names launch the same kernel as the plain
+                # atomic one: tune only that.
+                if (
+                    a_dtype_str == "bf16"
+                    and b_dtype_str == "fp4"
+                    and (kparams["mode"] == "reduce" or kparams.get("persist"))
+                ):
+                    continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
 
@@ -4884,9 +4897,12 @@ class FmoeTuner(TunerCommon):
                 ):
                     # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
                     # weight layout follows the *config* activation dtype, not the
-                    # runtime-effective one (mirror op_tests/test_moe_2stage.py).
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    # runtime-effective one (mirror op_tests/test_moe_2stage.py):
+                    # a16w4 takes the standard GGUU W1, a8w4 the gate/up-
+                    # interleaved GUGU one, as in the tuning path.
+                    w1_gu = q_dtype_a == dtypes.fp8
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, w1_gu)
+                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, w1_gu)
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
                 elif (
@@ -5736,8 +5752,9 @@ class FmoeTuner(TunerCommon):
                     profileDF.loc[non_xbf16, "us1"] + us_quant
                 )
 
-            # moe_sorting fairness: flat=1 kernels sort internally; add host sort cost to others.
-            has_flat = "flat" in profileDF.columns and (profileDF["flat"] == 1).any()
+            # moe_sorting fairness: nonzero flat sorts internally (flat=1 one-token
+            # grid, flat=2 EMSORT). Add the host sort cost to flat=0 rows only.
+            has_flat = "flat" in profileDF.columns and (profileDF["flat"] != 0).any()
             if has_flat:
                 from aiter.fused_moe import moe_sorting
                 from aiter.test_common import run_perftest
@@ -5785,7 +5802,7 @@ class FmoeTuner(TunerCommon):
             # (additive fairness + idxmin) stays exactly as it was.
             if has_flat:
                 try:
-                    flat_mask = profileDF["flat"] == 1
+                    flat_mask = profileDF["flat"] != 0
                     nf_mask = profileDF["flat"] == 0
                     if not (flat_mask.any() and nf_mask.any()):
                         raise RuntimeError("missing FLAT or non-FLAT class")

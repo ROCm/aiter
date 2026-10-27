@@ -43,20 +43,28 @@ def make_inputs(B, T, H, device):
         "v": dense(),
         "g": dense(),
         "beta": in_proj[..., 4 * H * D + D : 4 * H * D + D + H],
-        "A_log": torch.log(torch.empty(H, device=device).uniform_(1, 16)),
-        "dt_bias": torch.randn(H * D, device=device),
+        "A_log": torch.log(
+            torch.empty(H, dtype=torch.float32, device=device).uniform_(1, 16)
+        ),
+        "dt_bias": torch.randn(H * D, dtype=torch.float32, device=device),
         "cu_seqlens": torch.arange(0, total + 1, T, dtype=torch.int32, device=device),
     }
 
 
-def traffic_bytes(B, T, H, stage, state_dtype=torch.float32):
+def traffic_bytes(B, T, H, stage, device, state_dtype=torch.float32):
     D = K3_HEAD_DIM
     tok = B * T * H * D * 2  # one [T, H, 128] bf16 tensor
     nt = B * triton.cdiv(T, CHUNK_SIZE) * H
     ws = (
         3 * tok + tok // 2 + nt * D * (CHUNK_SIZE * 2 + 4)
     )  # qg, w, u, aqk, kg_t, decay
-    state = B * H * D * D * torch.tensor([], dtype=state_dtype).element_size()
+    state = (
+        B
+        * H
+        * D
+        * D
+        * torch.tensor([], dtype=state_dtype, device=device).element_size()
+    )
     prepare = 4 * tok + B * T * H * 2 + ws
     walk = ws + tok + 2 * state
     return {"prepare": prepare, "walk": walk, "total": prepare + walk}[stage]
@@ -209,7 +217,7 @@ def benchmark(args):
         ms = _time(fn, args)
         if args.metric == "time":
             return ms * 1e3
-        return traffic_bytes(B, T, H, stage, state_dtype) / ms * 1e-9
+        return traffic_bytes(B, T, H, stage, args.device, state_dtype) / ms * 1e-9
 
     bench_chunk_kda.run(
         save_path="." if args.o else None, print_data=True, show_plots=False

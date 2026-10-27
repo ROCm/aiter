@@ -12,7 +12,7 @@ the shipped shape lists tunable on gfx942.
 
 Covers:
   - chip_info.get_device_name()       SKU mapping by PCI device id
-  - chip_info._get_pci_chip_id()      degrades to None instead of raising
+  - chip_info._get_pci_chip_id()      version-gated PciChipId attribute
   - chip_info.gfx_from_cu_num()       legacy cu_num -> arch backfill
   - chip_info.get_build_targets()     CU resolution on the GPU_ARCHS path
   - dtypes.normalize_fp8_dtype()      e4m3 flavor resolution
@@ -20,9 +20,11 @@ Covers:
 """
 
 import collections
+import ctypes
 import glob
 import os
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 MI300A_CHIP_ID = 0x74A0
@@ -58,12 +60,19 @@ class _EnvGuard:
 class TestDeviceName(unittest.TestCase):
     """get_device_name() must distinguish the three gfx942 SKUs."""
 
-    def _name_for(self, gfx, chip_id):
+    def _name_for(self, gfx, chip_id, num_xcds=8):
         from aiter.jit.utils import chip_info
 
+        props = SimpleNamespace(gcnArchName=f"{gfx}:sramecc+:xnack-")
         with mock.patch.object(
-            chip_info, "get_gfx", return_value=gfx
-        ), mock.patch.object(chip_info, "_get_pci_chip_id", return_value=chip_id):
+            chip_info, "get_current_hip_device", return_value=0
+        ), mock.patch.object(
+            chip_info, "_get_pci_chip_id", return_value=chip_id
+        ), mock.patch.object(
+            chip_info, "_num_xcds_for_device", return_value=num_xcds
+        ), mock.patch(
+            "torch.cuda.get_device_properties", return_value=props
+        ):
             return chip_info.get_device_name()
 
     def test_mi300a_chip_id(self):
@@ -79,7 +88,7 @@ class TestDeviceName(unittest.TestCase):
         self.assertEqual(self._name_for("gfx942", MI300X_CHIP_ID), "MI300")
 
     def test_unknown_chip_id_falls_back_to_mi300(self):
-        # An unreadable id must not crash dispatch; MI300 is the safe default.
+        # An id outside the binned SKU sets is the generic gfx942 part.
         self.assertEqual(self._name_for("gfx942", None), "MI300")
 
     def test_other_arches_unaffected(self):
@@ -94,78 +103,60 @@ class TestDeviceName(unittest.TestCase):
 
 
 class TestPciChipId(unittest.TestCase):
-    """The id is resolved without hardcoding a HIP enum ordinal.
+    """MI300A is PCI id 0x74A0, read from the version-gated PciChipId attribute.
 
-    The AMD block of hipDeviceAttribute_t is an unnumbered enum, so ordinals
-    shift between ROCm releases; on ROCm 7.2 the previously hardcoded 10019 is
-    MaxAvailableVgprsPerThread and returns 512 on every device.
+    ROCm 7.1 inserted MaxAvailableVgprsPerThread ahead of PciChipId, so the
+    ordinal is 10019 before 7.1 and 10020 after. A missing runtime version must
+    raise rather than query a shifted ordinal.
     """
 
-    # _load_hip_runtime() is lru_cached, so patching ctypes.CDLL underneath it
-    # does nothing once the real library has been loaded by any earlier call.
-    # Patch the loader itself, which is also the contract these tests care about.
-    LOADER = "aiter.jit.utils.chip_info._load_hip_runtime"
-
-    def test_returns_none_when_hip_cannot_be_loaded(self):
+    def _device_name(self, chip_id, version):
         from aiter.jit.utils import chip_info
 
-        # OSError on Linux (missing .so); RuntimeError is how _load_hip_runtime
-        # reports "no amdhip64*.dll found" on Windows. Both must degrade, not raise.
-        for exc in (OSError("no libamdhip64"), RuntimeError("no HIP runtime")):
-            with self.subTest(exc=type(exc).__name__), mock.patch(
-                self.LOADER, side_effect=exc
-            ):
-                self.assertIsNone(chip_info._get_pci_chip_id())
+        lib = mock.Mock()
 
-    def test_returns_none_when_symbol_is_missing(self):
-        from aiter.jit.utils import chip_info
+        def query(output, attribute, device):
+            expected = 10019 if version[:2] < (7, 1) else 10020
+            self.assertEqual((attribute, device), (expected, 0))
+            ctypes.cast(output, ctypes.POINTER(ctypes.c_int))[0] = chip_id
+            return 0
 
-        lib = mock.MagicMock()
-        del lib.hipDeviceGetPCIBusId  # attribute lookup raises AttributeError
-        with mock.patch(self.LOADER, return_value=lib):
-            self.assertIsNone(chip_info._get_pci_chip_id())
-
-    def test_returns_none_when_query_fails(self):
-        from aiter.jit.utils import chip_info
-
-        lib = mock.MagicMock()
-        lib.hipDeviceGetPCIBusId.return_value = 1  # non-zero == failure
-        with mock.patch(self.LOADER, return_value=lib):
-            self.assertIsNone(chip_info._get_pci_chip_id())
-
-    def test_returns_none_when_sysfs_is_absent(self):
-        # Windows has no /sys/bus/pci; the id is simply unknown there.
-        from aiter.jit.utils import chip_info
-
-        lib = mock.MagicMock()
-        lib.hipDeviceGetPCIBusId.side_effect = self._fill_bus_id
-        with mock.patch(self.LOADER, return_value=lib), mock.patch(
-            "builtins.open", side_effect=FileNotFoundError
+        lib.hipDeviceGetAttribute.side_effect = query
+        props = SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-")
+        with mock.patch.object(
+            chip_info, "get_current_hip_device", return_value=0
+        ), mock.patch.object(
+            chip_info, "get_hip_runtime_version", return_value=version
+        ), mock.patch.object(
+            chip_info, "load_hip_runtime", return_value=lib
+        ), mock.patch(
+            "torch.cuda.get_device_properties", return_value=props
         ):
-            self.assertIsNone(chip_info._get_pci_chip_id())
+            return chip_info.get_device_name()
 
-    @staticmethod
-    def _fill_bus_id(buf, size, device_id):
-        buf.value = b"0000:01:00.0"
-        return 0
+    def test_mi300a_follows_the_runtime_ordinal(self):
+        self.assertEqual(self._device_name(MI300A_CHIP_ID, (7, 0, 0)), "MI300A")
+        self.assertEqual(self._device_name(MI300A_CHIP_ID, (7, 1, 0)), "MI300A")
+        self.assertEqual(self._device_name(MI308X_CHIP_ID, (7, 2, 0)), "MI308")
 
-    def test_reads_the_id_from_sysfs_via_the_bus_id(self):
+    def test_unknown_runtime_version_does_not_query_the_attribute(self):
         from aiter.jit.utils import chip_info
 
-        lib = mock.MagicMock()
-        lib.hipDeviceGetPCIBusId.side_effect = self._fill_bus_id
-        opener = mock.mock_open(read_data="0x74a0\n")
-
-        with mock.patch(self.LOADER, return_value=lib), mock.patch(
-            "builtins.open", opener
+        lib = mock.Mock()
+        props = SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-")
+        with mock.patch.object(
+            chip_info, "get_current_hip_device", return_value=0
+        ), mock.patch.object(
+            chip_info, "get_hip_runtime_version", return_value=None
+        ), mock.patch.object(
+            chip_info, "load_hip_runtime", return_value=lib
+        ), mock.patch(
+            "torch.cuda.get_device_properties", return_value=props
+        ), self.assertRaisesRegex(
+            RuntimeError, "PciChipId attribute"
         ):
-            self.assertEqual(chip_info._get_pci_chip_id(), MI300A_CHIP_ID)
-
-        opener.assert_called_once_with("/sys/bus/pci/devices/0000:01:00.0/device")
-        # hipDeviceGetAttribute takes an ordinal from an unnumbered enum, which
-        # is exactly what shifted between ROCm releases. It must not be used.
+            chip_info.get_device_name()
         lib.hipDeviceGetAttribute.assert_not_called()
-        lib.hipDeviceGetPCIBusId.assert_called_once()
 
 
 class TestLegacyCuNumBackfill(unittest.TestCase):

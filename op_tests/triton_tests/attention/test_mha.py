@@ -394,13 +394,13 @@ def test_mha_int64_strides(
     def _generate_input(
         batch: int, seqlen: int, nheads: int, dim_size: int, large_stride: bool = False
     ) -> torch.Tensor:
-        seqlens = torch.full((batch,), seqlen)
+        seqlens = torch.full((batch,), seqlen, device="cuda")
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32, device="cuda"),
                 seqlens.cumsum(dim=0, dtype=torch.int32),
             ]
-        ).to(device="cuda")
+        )
         total_seqlen = cu_seqlens[-1].item()
 
         if large_stride:
@@ -1087,21 +1087,29 @@ def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
     NUM_HEADS, HEAD_SZ = 4, 128
     seqlens = [300, 250]
     total = sum(seqlens)
-    u = torch.nn.functional.normalize(torch.randn(HEAD_SZ, device="cuda"), dim=0)
+    u = torch.nn.functional.normalize(
+        torch.randn(HEAD_SZ, device="cuda", dtype=torch.float32), dim=0
+    )
     a = 34.0  # q . k ~ -a^2, so logits ~ -a^2 / sqrt(HEAD_SZ) ~ -102
-    q = (-a * u + 0.5 * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda")).to(
-        torch.bfloat16
-    )
-    k = (a * u + 0.5 * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda")).to(
-        torch.bfloat16
-    )
+    q = (
+        -a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
+    k = (
+        a * u
+        + 0.5
+        * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.float32)
+    ).to(torch.bfloat16)
     v = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
     do = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
     q.requires_grad = True
     k.requires_grad = True
     v.requires_grad = True
     cu_seqlens = torch.tensor(
-        [0, *torch.tensor(seqlens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+        [0, *torch.tensor(seqlens, device="cuda").cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
     )
 
     if bwd_mode is None:
