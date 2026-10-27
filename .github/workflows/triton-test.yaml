@@ -7,10 +7,11 @@ name: Triton Test
 #     selection existed. DRY_RUN: 'false' applies the selection; setting it
 #     back to 'true' is the revert for every PR.
 #   - PR label ci:triton-355: that PR runs the full suite.
-# Main runs the full suite once a night, on MI35X and MI300X. Pushes to main
-# do not run this workflow. The nightly result goes on the open "Triton nightly
-# status" issue, with a mention of each user in
-# .github/triton-nightly-watchers.txt. GitHub emails the users that it mentions.
+# Main runs the full suite once a night, on MI35X and MI300X. A manual run does
+# the same, on any branch. Pushes to main do not run this workflow. The nightly
+# result goes on the open "Triton nightly status" issue, with a mention of each
+# user in .github/triton-nightly-watchers.txt. GitHub emails the users that it
+# mentions.
 
 on:
   schedule:
@@ -66,8 +67,9 @@ jobs:
       shard_count: 8
       shards: ${{ steps.split.outputs.shards }}
       selected_count: ${{ steps.select.outputs.selected_count }}
-      # main always; a PR for gfx942-specific changes or the ci:triton-300x label.
-      needs_mi300x: ${{ github.ref == 'refs/heads/main' || steps.select.outputs.needs_mi300x == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:triton-300x') }}
+      # The nightly and every manual run, on any branch; a PR only for
+      # gfx942-specific changes or the ci:triton-300x label.
+      needs_mi300x: ${{ github.event_name != 'pull_request' || steps.select.outputs.needs_mi300x == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:triton-300x') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
