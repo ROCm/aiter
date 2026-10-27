@@ -26,6 +26,7 @@ capture-time allocation, stable pointers) is a correctness property.
 import argparse
 import itertools
 
+import flydsl.expr as fx
 import pandas as pd
 import torch
 
@@ -58,6 +59,7 @@ from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
     build_moe_scatter_copy_token_module,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.rmsnorm import rms_norm_opus
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -679,6 +681,97 @@ def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype):
 
 
 @benchmark()
+def test_mega_combine_post_rmsnorm(tokens, model_dim, topk):
+    """Post-GEMM2 RMSNorm followed by MegaMoE's weighted slot reduction."""
+    # Deferred because these gfx1250 modules import MORI
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.combine import (
+        _make_combine_fused_reduce,
+    )
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe import (
+        _COMBINE_CHUNK_ELEMS,
+        _WAVE_SIZE,
+        _combine_tile,
+    )
+
+    eps = 1e-6
+    slots = (
+        torch.randn(tokens, topk, model_dim, dtype=torch.bfloat16) * 0.5
+    ).contiguous()
+    route_weights = torch.rand(tokens, topk, dtype=torch.float32)
+    route_weights /= route_weights.sum(dim=1, keepdim=True)
+    rms_weight = torch.linspace(
+        0.5, 1.5, model_dim, dtype=torch.bfloat16, device=slots.device
+    )
+
+    slots_f32 = slots.float()
+    ref_slots = slots_f32 * torch.rsqrt(
+        slots_f32.square().mean(dim=-1, keepdim=True) + eps
+    )
+    ref_slots *= rms_weight.float().view(1, 1, model_dim)
+    ref = (ref_slots * route_weights[..., None]).sum(dim=1).to(torch.bfloat16)
+
+    normalized = torch.empty_like(slots).view(tokens * topk, model_dim)
+    out = torch.empty((tokens, model_dim), dtype=torch.bfloat16)
+    toks_per_block, chunks_per_iter = _combine_tile(
+        topk=topk,
+        hidden_dim=model_dim,
+        quant_bits=0,
+    )
+    lanes = toks_per_block * chunks_per_iter * _COMBINE_CHUNK_ELEMS // 16
+    combine = _make_combine_fused_reduce(
+        experts_per_token=topk,
+        hidden_dim=model_dim,
+        block_num=512,
+        warp_num_per_block=lanes // _WAVE_SIZE,
+        slot_stride_nbytes=model_dim * 2,
+        quant_bits=0,
+        tokens_per_block=toks_per_block,
+        chunks_per_iter=chunks_per_iter,
+        apply_route_weight=True,
+    )
+
+    def fn():
+        rms_norm_opus(
+            normalized,
+            slots.view(tokens * topk, model_dim),
+            rms_weight,
+            eps,
+        )
+        combine(
+            normalized.data_ptr(),
+            out.data_ptr(),
+            route_weights.data_ptr(),
+            tokens,
+            fx.Stream(torch.cuda.current_stream()),
+        )
+        return out
+
+    nbytes = (
+        slots.nbytes
+        + normalized.nbytes * 2
+        + route_weights.nbytes
+        + rms_weight.nbytes
+        + out.nbytes
+    )
+    ret = {"gfx": get_gfx()}
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        out.fill_(-99.0)
+        _, us = run_perftest(run)
+        err = checkAllclose(
+            ref.float(),
+            out.float(),
+            rtol=3e-2,
+            atol=3e-2,
+            msg=f"{name}: MegaMoE post-GEMM2 RMSNorm combine",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
 def test_topids_to_rows(numel, E, max_m):
     """Atomic-scatter argsort. Intra-bucket order is unspecified by design, so the
     check is on the invariants (counts, own-expert band, bijection), not values."""
@@ -1120,6 +1213,19 @@ def main():
             for t, tk, v in itertools.product(args.tokens, args.topk, args.vec)
         ],
     )
+    if get_gfx() == "gfx1250":
+        summarize(
+            "MegaMoE post-GEMM2 RMSNorm combine",
+            [
+                test_mega_combine_post_rmsnorm(t, d, k)
+                for t, d, k in ((8, 512, 2), (24, 1024, 4))
+            ],
+        )
+    else:
+        aiter.logger.warning(
+            "MegaMoE post-GEMM2 RMSNorm combine requires gfx1250; skipping on %s",
+            get_gfx(),
+        )
     summarize(
         "moe_psum_remap_ep",
         [
