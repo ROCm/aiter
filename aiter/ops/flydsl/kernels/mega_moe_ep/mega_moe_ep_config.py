@@ -94,7 +94,7 @@ NTT = NT + (0 if EP_NW8 else 4 * 64)  # 512 threads (8 waves) in both modes
 #   [0, NT)                   compute_units (local-expert GEMM1 + act + GEMM2)
 #   [NT, NT+64)               dispatch_send (a2a scatter tokens to expert-owner ranks)
 #   [B_LOADER, B_LOADER+NLOAD) a_loader (TP-style: stage A K-tiles into the NAB-bank ring)
-#   [B_LOADER+NLOAD, NTT)     idle
+#   [B_LOADER+NLOAD, NTT)     W-loader (EP_WLDS: stage W + B-scale into the NWB-bank W ring), else idle
 B_DISPATCH = NT
 B_LOADER = NT + 64
 B_COMBINE = NT + 128
@@ -102,6 +102,10 @@ B_COMBINE = NT + 128
 # NAB-bank A-ring the compute waves consume); more waves = more A-staging throughput.
 NLOAD_W = 1
 NLOAD = NLOAD_W * 64
+# NW=4 only: the two waves past the A-loader LDS-DMA each K-step's W + B-scale into an
+# NWB-bank LDS ring (NWB = what the free LDS fits, >= 2) that the compute waves read
+# instead of HBM -- deepens the weight stream past the compute waves' 2-step registers.
+EP_WLDS = int(os.environ.get("EP_WLDS", "0"))
 
 # GEMM geometry (the compute waves reuse the mega_moe stage1/stage2 MFMA atoms; see
 # gemm.py). The GEMM runs on the NW=4 compute waves (NT=256 threads). TILE_K is the
@@ -165,14 +169,33 @@ ERR_DISPATCH, ERR_COMPUTE, ERR_COMBINE = 1, 2, 4
 # the LDS cbar: the last arriver zeroes the counter and bumps the generation. Zeroed
 # once at engine init; the generation grows monotonically (wrap-safe == compare).
 GBAR_CNT, GBAR_GEN = 16, 17
-CTRL_INTS = 64
+# Per-echunk pass-completion counters (P>1, EP_ESYNC): each GEMM1 / GEMM2 n-tile shard
+# release-adds 1 when its slice of inter / gout is written, so a consumer waits only
+# for its own echunk's P shards instead of a grid barrier.  The last GEMM2 shard of an
+# echunk combines it and zeroes both counters (every waiter has passed by then).
+ECNT1 = 64  # [ECNT1, ECNT1 + NCHA): GEMM1 shards done per echunk
+ECNT2 = ECNT1 + NCHA  # [ECNT2, ECNT2 + NCHA): GEMM2 shards done per echunk
+CTRL_INTS = ECNT2 + NCHA
+ESYNC = int(os.environ.get("EP_ESYNC", "1"))
+# GEMM unit walk in XCD-major CTA order (workgroups land on XCDs round-robin): the
+# consecutive echunks of one expert -- same n-tile shard, same pace -- then run on the
+# same XCD, so their identical weight stream is fetched from HBM once and L2-shared.
+XCDMAP = int(os.environ.get("EP_XCDMAP", "1"))
+# NW=4 GEMM pass split (needs EP_ESYNC): shard size S = the smallest that fits the grid
+# with the NTn%S remainder shards packed several per CTA (vs the P = nblk//nch even
+# split, which leaves nblk - nch*P CTAs idle and caps every CTA at ceil(NTn/P)).
+# Off by default: the packed-remainder CTAs (all on the last XCD) lose the per-expert L2
+# reuse and, finishing last, serially combine_send all K of their echunks.
+BAL = int(os.environ.get("EP_BAL", "0")) and ESYNC
 
 # LDS control slots (ints at ``L_CTL``; see schedule.py). The cbar generation barrier,
 # the dynamic plan's bookkeeping and the per-CTA unit list live here.
 C_BARCNT, C_BARGEN = 0, 1  # 4-compute-wave LDS generation barrier
 C_NACT, C_NCH, C_PLAN, C_DYNP = 2, 3, 4, 5  # #active experts, #units, plan-ready, P
 C_UROWS, C_USEQ, C_GEXP, C_CNT = 6, 7, 8, 9  # current unit rows / seq / gather cache
-# slots 10-11 free (were the comm-band overlap's C_GREADY/C_COMM, now that combine is
+C_S1, C_K1, C_S2, C_K2 = 6, 7, 8, 9  # NW=4 pass split: shard size / packed remainders
+C_ELAST = 10  # EP_ESYNC: old value of this CTA's last echunk-counter add (tid0 -> waves)
+# slot 11 free (slots 10-11 were the comm-band overlap's C_GREADY/C_COMM, now that combine is
 # fused into the GEMM2 epilogue -- gemm2_combine -- at P==1).
 C_UNIT = 12  # [C_UNIT, C_UNIT+1): this CTA's unit range [lo, hi)
 C_UL = 16  # per-CTA unit list base (records of 4 ints: expert_chunk, i0, icnt, kind)
@@ -188,7 +211,11 @@ RC_ASEQ = 0  # [RC_ASEQ, RC_ASEQ + NAB): produced seq (monotonic tile count) per
 RC_AFREE = NAB  # [RC_AFREE, RC_AFREE + NAB): consumer release count per ring bank
 RC_G1GO = 2 * NAB  # GEMM1 A-stream go (compute sets it after dispatch_wait + gather)
 RC_G2GO = 2 * NAB + 1  # GEMM2 A-stream go (Stage 2)
-RC_INTS = 2 * NAB + 8  # ints in L_RCTL (headroom for future loader bookkeeping)
+# W ring (EP_WLDS): RC_WSEQ[bank] = W-loader wave publishes (2 per staged tile),
+# RC_WFREE[bank] = compute-wave releases (NW per consumed tile); up to 4 banks.
+RC_WSEQ = 2 * NAB + 8
+RC_WFREE = RC_WSEQ + 4
+RC_INTS = RC_WFREE + 4  # ints in L_RCTL
 
 ACT_SET = ("silu", "situv2")
 
@@ -293,6 +320,7 @@ def mega_moe_ep_consts(
         RG * 4
     )  # gathered source_key (payload row) list of one unit chunk
     c["L_CTL"] = take(128 * 4)  # control slots (C_* above)
+    c["L_PF"] = take(64 * 4)  # EP_PROF_DEV scratch (gemm.py _pmark tick sums)
     c["LDS_BYTES"] = ceildiv(off, 128) * 128
     return c
 
@@ -340,7 +368,16 @@ def kernel_config(
     L_A, L_AS = c["L_A"], c["L_AS"]
     L_DYN, L_DCNT, L_WSUM = c["L_DYN"], c["L_DCNT"], c["L_WSUM"]
     L_DCH, L_EOFF, L_RIX, L_CTL = c["L_DCH"], c["L_EOFF"], c["L_RIX"], c["L_CTL"]
-    L_C, L_RCTL = c["L_C"], c["L_RCTL"]
+    L_C, L_RCTL, L_PF = c["L_C"], c["L_RCTL"], c["L_PF"]
+    # W ring (EP_WLDS, NW=4): one bank = one K-step of the CTA's W (TILE_N cols x TILE_K
+    # fp4) + its B-scale (TILE_N/32 groups x 256 B); as many banks as the free LDS fits.
+    WB = TILE_N * TILE_K // 2 + (TILE_N // 32) * 256
+    NWB = min(4, (160 * 1024 - LDS_BYTES) // WB) if (NW == 4 and EP_WLDS) else 0
+    NWB = NWB if NWB >= 2 else 0
+    WL = NWB > 0
+    L_W = ceildiv(LDS_BYTES, 128) * 128
+    if WL:
+        LDS_BYTES = L_W + NWB * WB
     KS1, KS2, G2 = c["KS1"], c["KS2"], c["G2"]
     CH1, CH2, M_REPEAT = c["CH1"], c["CH2"], c["M_REPEAT"]
     N_TILES, NUM_ACC_N = c["N_TILES"], c["NUM_ACC_N"]
@@ -358,6 +395,10 @@ def kernel_config(
         f"mega_moe_ep_h{H}_i{I}_e{E}_epr{EPR}_k{TOPK}_mt{MT}_t{TMAX}_np{NPES}_nw{NW}_{act}"
         + ("_a8" if a8 else "_a4")
         + ("_ix" if indexed_payload else "")
+        + (f"_wl{NWB}" if WL else "")
+        + ("" if ESYNC else "_noes")
+        + ("" if XCDMAP else "_nx")
+        + ("_bal" if BAL and NW == 4 else "")
         + (f"_lim{swiglu_limit:g}" if math.isfinite(swiglu_limit) else "")
     )
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"

@@ -36,8 +36,11 @@ from .common import bst, i32, lds_st, now, rsrc, uni
 # / post-roles / post-combine_final). Off by default (zero runtime cost -- the writes
 # are compile-time gated and the `dbg` arg is just an unused pointer).
 _PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
-_PROF_SLOTS = 9  # 0:entry 1:post-barrier_init 2:post-roles 3:post-combine_final
+_PROF_SLOTS = 19  # 0:entry 1:post-barrier_init 2:post-roles 3:post-combine_final
 #   4:post-dispatch_wait 5:post-dyn_plan 6:unit-count 7:post-gemm1 8:post-gemm2 (schedule)
+#   9:post-dispatch_send(NW8) 10:post-gather 11:post-payload-wait (schedule)
+#   12:post-combine_wait (communication.combine_final)
+#   13..18: gemm1 {kloop, pre-epi cbar, epi}, gemm2 {..} tick sums (gemm.py _pmark)
 from .communication import build_communication
 from .gemm import build_gemm
 from .mega_moe_ep_config import (
@@ -95,9 +98,10 @@ def compile_mega_moe_ep(
     kc.add(build_schedule(kc))
     name, LDS_BYTES = kc.get("name LDS_BYTES")
     NBW, L_DYN, L_DCNT, L_CTL = kc.get("NBW L_DYN L_DCNT L_CTL")
-    L_RCTL = kc.get("L_RCTL")[0]
+    L_RCTL, L_PF = kc.get("L_RCTL L_PF")
     compute_units, dispatch_send = kc.get("compute_units dispatch_send")
-    a_loader_units = kc.get("a_loader_units")[0]
+    a_loader_units, w_lds_units = kc.get("a_loader_units w_lds_units")
+    WL = kc.get("WL")[0]
     combine_final, barrier_init = kc.get("combine_final barrier_init")
     NT, NTT, B_LOADER = kc.get("NT NTT B_LOADER")  # per-launch warp-spec bands (not globals)
 
@@ -112,6 +116,9 @@ def compile_mega_moe_ep(
         # zero the A-loader ring counters (RC_ASEQ / RC_AFREE per bank + the go flags)
         for s_ in range(tid, i32(RC_INTS), i32(NTT)):
             lds_st(L, L_RCTL + i32(s_) * i32(4), i32(0))
+        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid < i32(8):  # gemm.py _pmark tick sums + last mark
+                lds_st(L, L_PF + tid * i32(4), i32(0))
         if tid == i32(0):
             lds_st(L, L_CTL + C_BARCNT * 4, i32(0))
             lds_st(L, L_CTL + C_BARGEN * 4, i32(0))
@@ -131,7 +138,9 @@ def compile_mega_moe_ep(
             dispatch_send(L, tid % i32(64), a)
         elif tid < i32(B_LOADER + NLOAD):  # A-loader: stage GEMM1 A into the NAB-bank ring
             a_loader_units(L, tid, a)
-        # [B_LOADER+NLOAD, NTT): idle
+        else:  # [B_LOADER+NLOAD, NTT): W-loader into the LDS W ring (EP_WLDS), else idle
+            if const_expr(WL):  # noqa: SIM102 - compile-time gate, not dynamic
+                w_lds_units(L, tid, a)
 
     Shared = fx.struct(
         type(
@@ -169,7 +178,7 @@ def compile_mega_moe_ep(
         gout: fx.Int64,
         rowmap: fx.Int64,
         rowidx: fx.Int64,
-        rowpos: fx.Int64,
+        rowlist: fx.Int64,
         ecnt: fx.Int64,
         dbg: fx.Int64,
         rank: fx.Int32,
@@ -256,7 +265,7 @@ def compile_mega_moe_ep(
         gout: fx.Int64,
         rowmap: fx.Int64,
         rowidx: fx.Int64,
-        rowpos: fx.Int64,
+        rowlist: fx.Int64,
         ecnt: fx.Int64,
         dbg: fx.Int64,
         rank: fx.Int32,
@@ -269,7 +278,9 @@ def compile_mega_moe_ep(
         stream: fx.Stream,
     ):
         loc = locals()
-        mega_moe_ep_kernel(*[loc[k] for k in kargs]).launch(
+        _wpe = int(os.environ.get("EP_WPE", "0"))
+        _va = {"value_attrs": {"rocdl.waves_per_eu": _wpe}} if _wpe else {}
+        mega_moe_ep_kernel(*[loc[k] for k in kargs], **_va).launch(
             grid=(fx.Int64(i32_grid), 1, 1), block=(NTT, 1, 1), stream=stream
         )
 

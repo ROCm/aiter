@@ -5,6 +5,7 @@ pure-torch reference oracle used to validate the kernel (对拍)."""
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 
@@ -272,18 +273,19 @@ class MegaMoeEPEngine:
         # per-CTA LDS L_RIX). Indexed echunk*RG + r.
         self._rowmap = torch.empty(NCHA * rg_max, dtype=torch.int32, device=self.device)
         self._rowidx = torch.empty(NCHA * rg_max, dtype=torch.int32, device=self.device)
-        # Balanced-gather tables: each received (token,route) pair's GLOBAL per-local-
-        # expert position (0..R_e-1 rank, assigned by the planner's pre-pass via _ecnt
-        # atomics). The planner chunks an expert's rows by position//RG, so every chunk is
-        # a full RG-row tile (no M-padding waste) and -- since that halves the chunk count
-        # vs the sk%ce margin -- more chunks can be N-sharded across CUs (higher P). _ecnt
-        # is the per-expert position counter, zeroed each forward.
-        n_slots = self.world_size * self.mtpr * self.K
-        self._rowpos = torch.empty(n_slots, dtype=torch.int32, device=self.device)
+        # Balanced-gather tables: the planner's pre-pass assigns each received
+        # (token,route) pair a GLOBAL per-local-expert position (0..R_e-1 rank via _ecnt
+        # atomics) and buckets its recv slot at _rowlist[le*cap + pos] (cap = world*mtpr:
+        # a token routes to an expert at most once). The planner chunks an expert's rows
+        # by position//RG, so every chunk is a full RG-row tile (no M-padding waste) and
+        # the gather reads it by position. _ecnt is zeroed each forward.
+        self._rowlist = torch.empty(
+            self.epr * self.world_size * self.mtpr, dtype=torch.int32, device=self.device
+        )
         self._ecnt = torch.zeros(self.epr, dtype=torch.int32, device=self.device)
         # Per-CTA device-phase timestamps (now() at kernel phase boundaries), only
         # written when EP_PROF_DEV=1; see mega_moe_ep_kernel._PROF.
-        self._dbg = torch.zeros(self.n_cta * 9, dtype=torch.int64, device=self.device)
+        self._dbg = torch.zeros(self.n_cta * 19, dtype=torch.int64, device=self.device)
 
     def _bind_weights(self, w1, w1_scale, w2, w2_scale):
         # GEMM1 is the V2 pipelined path: its BWeightLoader / BScaleLoader read W1 and
@@ -319,6 +321,7 @@ class MegaMoeEPEngine:
         # RG*A_K_STEP must be >= 512*16 = 8192 B, i.e. RG>=64 -> mt>=4.  Force mt=4 (the
         # high-bs value anyway; low bs just pads to 64 rows, still correct).
         mt = 4 if nw == 8 else (2 if m <= 512 else 4)
+        mt = int(os.environ.get("EP_MT", mt))
         while mt > 2:
             if (
                 mega_moe_ep_consts(
@@ -420,7 +423,7 @@ class MegaMoeEPEngine:
             self._gout.data_ptr(),
             self._rowmap.data_ptr(),
             self._rowidx.data_ptr(),
-            self._rowpos.data_ptr(),
+            self._rowlist.data_ptr(),
             self._ecnt.data_ptr(),
             self._dbg.data_ptr(),
             self.rank,

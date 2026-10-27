@@ -18,6 +18,8 @@ resources at ``peer_base + off_region``) exactly like the TP kernel.
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
@@ -64,6 +66,14 @@ from .mega_moe_ep_config import (
 )
 
 __all__ = ["build_communication"]
+
+# Device-phase profiling (matches mega_moe_ep_kernel._PROF): slot 12 = post combine_wait.
+_PROF = bool(int(os.environ.get("EP_PROF_DEV", "0")))
+_PROF_SLOTS = 19  # 13..18: per-n-tile GEMM split (gemm.py _pmark)
+
+# dispatch_send PASS B: tokens per wave step whose loads are all issued before the
+# step's remote stores (see the batching note there).
+DISP_TB = 4
 
 
 # --- fp8 per-8 blockwise P2P codec for the combine send (halves the combine a2a traffic) ---
@@ -299,30 +309,27 @@ def build_communication(kc: KernelCtx) -> dict:
         rx = rsrc(a["x"])
         rxs = rsrc(a["xs"])
         bid = i32(gpu.block_id("x"))
-        # PASS A -- routing only (recv_le). Tiny (lane 0, 1 int/route) so it lands fast;
-        # block-strided over (token, route) for a disjoint a2a slice per CTA.
-        for wk_ in range(bid, m * i32(TOPK), nblk):
+        # PASS A -- routing only (recv_le, 1 int/route): one (token, route) per LANE, so a
+        # wave keeps 64 remote stores in flight per step.  The buffer resource must be
+        # wave-uniform (rsrc readfirstlanes the base), so each lane's store is issued under
+        # the static owner loop ``owner == p``.
+        r_recv = [peer_rs(a, i32(p), "off_recv") for p in range(MAX_NPES)]
+        for wk_ in range(bid * i32(64) + lane, m * i32(TOPK), nblk * i32(64)):
             wk = i32(wk_)
             t = wk // i32(TOPK)
             r = wk - t * i32(TOPK)
             e = fx.Int32(bld(rids, wk * i32(4), 0, T.i32, 0))
-            if (e >= i32(0)) & (e < i32(E)):
-                owner = e // epr
-                source_key = rank * mtpr + t
-                if lane == i32(0):
-                    bst(
-                        e - owner * epr,
-                        peer_rs(a, owner, "off_recv"),
-                        (source_key * i32(TOPK) + r) * i32(4),
-                        0,
-                        AUX_SYS,
-                    )
-            else:
+            valid = (e >= i32(0)) & (e < i32(E))
+            owner = e // epr
+            slot = ((rank * mtpr + t) * i32(TOPK) + r) * i32(4)
+            for p in range_constexpr(MAX_NPES):
+                if valid & (owner == i32(p)):
+                    bst(e - owner * epr, r_recv[p], slot, 0, AUX_SYS)
+            if valid == fx.Boolean(False):
                 # dropped/invalid route: this rank is the source, so pre-count it into
                 # this rank's single combine counter now -- combine_send only arrives for
                 # valid routes later, and combine_wait expects m*TOPK total.
-                if lane == i32(0):
-                    combine_arrive(a, rank, parity, i32(0), i32(1), m * i32(TOPK))
+                combine_arrive(a, rank, parity, i32(0), i32(1), m * i32(TOPK))
         wait_vm(0)  # drain routing stores before signalling META-ready
         if lane == i32(0):
             for p in range_constexpr(MAX_NPES):
@@ -336,42 +343,65 @@ def build_communication(kc: KernelCtx) -> dict:
         # ~45% (TOPK=6 routes -> ~3.3 unique owners @ world=4).  ``seen`` is a per-token
         # npes-bit mask; it is updated UNCONDITIONALLY (bit=0 for invalid routes, so no
         # pollution) to avoid a conditional-reassignment scf tangle.
-        for t_ in range(bid, m, nblk):
-            t = i32(t_)
-            source_key = rank * mtpr + t
-            seen = i32(0)
-            for r in range_constexpr(TOPK):
-                e = fx.Int32(bld(rids, (t * i32(TOPK) + i32(r)) * i32(4), 0, T.i32, 0))
-                valid = (e >= i32(0)) & (e < i32(E))
-                owner = e // epr
-                bit = valid.select(i32(1) << (owner & i32(7)), i32(0))  # &7: shift-safe
-                do_send = valid & ((seen & bit) == i32(0))  # valid AND owner not yet sent
-                seen = seen | bit
-                if do_send:
-                    dpay = peer_rs(a, owner, "off_payload")
-                    dsc = peer_rs(a, owner, "off_pscale")
-                    for j in range_constexpr((N_VEC + 63) // 64):
-                        u = lane + i32(j * 64)
-                        if u < i32(N_VEC):
-                            v = bld(rx, t * i32(ROW_BYTES) + u * i32(16), 0, V4I, 0)
-                            bst(
-                                v,
-                                dpay,
-                                source_key * i32(ROW_BYTES) + u * i32(16),
-                                0,
-                                AUX_SYS,
-                            )
-                    for j in range_constexpr((SCALE_I32 + 63) // 64):
-                        u = lane + i32(j * 64)
-                        if u < i32(SCALE_I32):
-                            s = bld(rxs, (t * i32(SCALE_I32) + u) * i32(4), 0, T.i32, 0)
-                            bst(
-                                s,
-                                dsc,
-                                (source_key * i32(SCALE_I32) + u) * i32(4),
-                                0,
-                                AUX_SYS,
-                            )
+        #
+        # Load/store batching: gfx9's vmcnt counts loads AND stores in issue order, so a
+        # load issued after a remote (sc0 sc1) store waits for that store's xGMI round
+        # trip.  Each step therefore issues ALL loads of DISP_TB tokens (ids, payload row,
+        # scale; out-of-range tokens load a clamped row and skip the stores) up front,
+        # waits once, then issues the stores to every owner with no wait in between --
+        # one round-trip wait per step instead of one per 16-B chunk per owner.
+        NJ = (N_VEC + 63) // 64
+        NS = (SCALE_I32 + 63) // 64
+        for t0_ in range(bid, m, nblk * i32(DISP_TB)):
+            t0 = i32(t0_)
+            toks, ids, rows, scs = [], [], [], []
+            for k in range_constexpr(DISP_TB):
+                t = t0 + i32(k) * nblk
+                tc = fx.min(t, m - i32(1))
+                toks.append(t)
+                ids.append([
+                    fx.Int32(bld(rids, (tc * i32(TOPK) + i32(r)) * i32(4), 0, T.i32, 0))
+                    for r in range(TOPK)
+                ])
+                rows.append([
+                    bld(rx, tc * i32(ROW_BYTES)
+                        + fx.min(lane + i32(j * 64), i32(N_VEC - 1)) * i32(16), 0, V4I, 0)
+                    for j in range(NJ)
+                ])
+                scs.append([
+                    bld(rxs, (tc * i32(SCALE_I32)
+                              + fx.min(lane + i32(j * 64), i32(SCALE_I32 - 1))) * i32(4),
+                        0, T.i32, 0)
+                    for j in range(NS)
+                ])
+            # explicit drain: past the per-owner branches the waitcnt pass can't count the
+            # stores issued and would insert partial waits that block on remote stores.
+            wait_vm(0)
+            for k in range_constexpr(DISP_TB):
+                t = toks[k]
+                if t < m:
+                    source_key = rank * mtpr + t
+                    seen = i32(0)
+                    for r in range_constexpr(TOPK):
+                        e = ids[k][r]
+                        valid = (e >= i32(0)) & (e < i32(E))
+                        owner = e // epr
+                        bit = valid.select(i32(1) << (owner & i32(7)), i32(0))  # &7: shift-safe
+                        do_send = valid & ((seen & bit) == i32(0))  # valid, owner not yet sent
+                        seen = seen | bit
+                        if do_send:
+                            dpay = peer_rs(a, owner, "off_payload")
+                            dsc = peer_rs(a, owner, "off_pscale")
+                            for j in range_constexpr(NJ):
+                                u = lane + i32(j * 64)
+                                if u < i32(N_VEC):
+                                    bst(rows[k][j], dpay,
+                                        source_key * i32(ROW_BYTES) + u * i32(16), 0, AUX_SYS)
+                            for j in range_constexpr(NS):
+                                u = lane + i32(j * 64)
+                                if u < i32(SCALE_I32):
+                                    bst(scs[k][j], dsc,
+                                        (source_key * i32(SCALE_I32) + u) * i32(4), 0, AUX_SYS)
         wait_vm(0)
         if lane == i32(0):
             for p in range_constexpr(MAX_NPES):
@@ -442,6 +472,10 @@ def build_communication(kc: KernelCtx) -> dict:
         if tid == i32(0):
             combine_wait(a, parity, i32(0))
         gpu.barrier()
+        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid == i32(0):  # post combine_wait (slot 12)
+                bst(now(), rsrc(a["dbg"]),
+                    (i32(gpu.block_id("x")) * i32(_PROF_SLOTS) + i32(12)) * i32(8), 0, 0)
         for t_ in range(i32(gpu.block_id("x")), m, nblk):
             t = i32(t_)
             for g_ in range(tid, i32(HV), i32(NTT)):

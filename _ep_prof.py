@@ -66,36 +66,48 @@ for bs in [int(b) for b in os.environ.get("EP_BS", "8,512").split(",")]:
     # combine_final. report worst-CTA (max) per phase.
     # slots: 0 entry, 1 post-barrier_init, 2 post-roles, 3 post-combine_final,
     #        4 post-dispatch_wait, 5 post-dyn_plan
-    ts = eng._dbg.view(-1, 9).to(torch.int64).cpu().numpy()
-    # for the single active unit per CTA, isolate gemm1/gemm2/combine_send using the
-    # per-unit stamps (slots 7,8); only CTAs that ran a unit (slot7>slot5) count.
-    act = ts[:, 7] > ts[:, 5]
-    bi = (ts[:, 1] - ts[:, 0]) / 1e5  # barrier_init (cross-rank init)
-    dw = (ts[:, 4] - ts[:, 1]) / 1e5  # dispatch_wait (compute idle until a2a done)
-    dp = (ts[:, 5] - ts[:, 4]) / 1e5  # dyn_plan
-    g1 = ((ts[:, 7] - ts[:, 5]) / 1e5)[act]  # gather + GEMM1
-    g2 = ((ts[:, 8] - ts[:, 7]) / 1e5)[act]  # GEMM2
-    cs = ((ts[:, 2] - ts[:, 8]) / 1e5)[act]  # combine_send + loop tail
-    cf = (ts[:, 3] - ts[:, 2]) / 1e5  # combine_final
-    tot = (ts[:, 3] - ts[:, 0]) / 1e5
-
-    def mx(a):
-        return float(a.max()) if a.size else 0.0
-
-    dev = torch.tensor(
-        [prep, ker, bi.max(), dw.max(), dp.max(), mx(g1), mx(g2), mx(cs),
-         cf.max(), tot.max()], device=DEV)
+    ts = eng._dbg.view(-1, 19).to(torch.int64).cpu().numpy()
+    nw8 = bool((ts[:, 9] > 0).all())
+    s9 = ts[:, 9] if nw8 else ts[:, 1]
+    # (name, from-slot, to-slot, is_comm); s_memrealtime is 100 MHz -> /1e5 = ms
+    PH = [
+        ("barrier_init", ts[:, 0], ts[:, 1], 1),
+        ("disp_send", ts[:, 1], s9, 1),
+        ("disp_meta_wait", s9, ts[:, 4], 1),
+        ("plan", ts[:, 4], ts[:, 5], 0),
+        ("gather", ts[:, 5], ts[:, 10], 0),
+        ("payload_wait", ts[:, 10], ts[:, 11], 1),
+        ("gemm1", ts[:, 11], ts[:, 7], 0),
+        ("gemm2+comb_send", ts[:, 7], ts[:, 8], 0),
+        ("tail", ts[:, 8], ts[:, 2], 0),
+        ("comb_wait", ts[:, 2], ts[:, 12], 1),
+        ("comb_reduce", ts[:, 12], ts[:, 3], 0),
+    ]
+    vals = [prep, ker, (ts[:, 3].max() - ts[:, 0].min()) / 1e5]
+    for _, a0, a1, _c in PH:
+        d = (a1 - a0) / 1e5
+        vals += [float(d.mean()), float(d.max())]
+    SPL = ["g1 kloop", "g1 pre-epi cbar", "g1 epilogue", "g2 kloop", "g2 pre-epi cbar", "g2 epilogue"]
+    for k in range(6):
+        d = (ts[:, 13 + k] & 0xFFFFFFFF) / 1e5
+        vals += [float(d.mean()), float(d.max())]
+    dev = torch.tensor(vals, device=DEV, dtype=torch.float64)
     gath = [torch.empty_like(dev) for _ in range(WORLD)]
     dist.all_gather(gath, dev)
     if RANK == 0:
-        g = np.array([v.cpu().numpy() for v in gath])
-        print(
-            f"[PROF] bs={bs:<5d} prep={g[:, 0].max():.3f} kernel={g[:, 1].max():.3f}ms || "
-            f"barrier_init={g[:, 2].max():.3f} dispatch_wait={g[:, 3].max():.3f} "
-            f"dyn_plan={g[:, 4].max():.3f} | gemm1={g[:, 5].max():.3f} gemm2={g[:, 6].max():.3f} "
-            f"combine_send={g[:, 7].max():.3f} combine_final={g[:, 8].max():.3f} "
-            f"|| dev_total={g[:, 9].max():.3f}",
-            flush=True,
-        )
+        g = np.array([v.cpu().numpy() for v in gath]).max(0)
+        print(f"[PROF] bs={bs} nw8={nw8} prep={g[0]:.3f} kernel={g[1]:.3f} "
+              f"dev_span={g[2]:.3f} ms  (per phase: mean / max over CTAs, max over ranks)",
+              flush=True)
+        comm = 0.0
+        for i, (n, _a0, _a1, c) in enumerate(PH):
+            mean, mxv = g[3 + 2 * i], g[4 + 2 * i]
+            comm += mean if c else 0.0
+            print(f"[PROF]   {'*' if c else ' '} {n:16s} {mean:7.3f} / {mxv:7.3f}", flush=True)
+        o = 3 + 2 * len(PH)
+        for k, n in enumerate(SPL):
+            print(f"[PROF]   # {n:16s} {g[o + 2 * k]:7.3f} / {g[o + 2 * k + 1]:7.3f}", flush=True)
+        print(f"[PROF]   comm(*) sum of means = {comm:.3f} ms = "
+              f"{100 * comm / g[2]:.1f}% of dev_span", flush=True)
     dist.barrier()
 dist.destroy_process_group()

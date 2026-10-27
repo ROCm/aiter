@@ -24,8 +24,11 @@ straight from global, W2 natural-layout) -> model_dim bf16 rows into ``gout`` fo
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -39,7 +42,7 @@ from ..mega_moe.gemm_util import (
 )
 from ..mxfp4_gemm_common import _activation_mul_batch
 from ..tensor_shim import ptr_buf_tensor
-from .communication import _quantize_group8  # per-8 fp8 combine codec (P==1 fused scatter)
+from .communication import _PROF, _quantize_group8  # per-8 fp8 combine codec (P==1 fused scatter)
 from .common import (
     ACQ_REL,
     AUX_SYS,
@@ -55,6 +58,7 @@ from .common import (
     lds_st,
     lds_st_rel,
     mfma,
+    now,
     rsrc,
     spin0,
     spin_lds_ge,
@@ -70,6 +74,8 @@ from .mega_moe_ep_config import (
     RC_AFREE,
     RC_ASEQ,
     RC_G1GO,
+    RC_WFREE,
+    RC_WSEQ,
     TILE_K,
     KernelCtx,
 )
@@ -99,6 +105,20 @@ def _lds_f32_ptr(L, off):
     return fx.inttoptr(pt, uni(i32(L) + i32(off)))
 
 
+_FRESH_TID = int(os.environ.get("EP_FRESH_TID", "1"))
+
+
+def _fresh_tid():
+    """thread_idx.x re-read through a side-effecting copy: the A-scale stage's lane
+    offsets derived from it can't be hoisted out of the unit loop (they'd otherwise stay
+    live across the 256-VGPR K-loop and get spilled to scratch)."""
+    tx = i32(fx.thread_idx.x)
+    if not _FRESH_TID:
+        return tx
+    return i32(llvm.inline_asm(T.i32, [tx.ir_value()], "v_mov_b32 $0, $1", "=v,v",
+                               has_side_effects=True))
+
+
 def _global_byte_tensor(addr_i64, nbytes):
     """An ``fx.Tensor`` byte-view over a raw global address (for ``ATileLoader``)."""
     pt = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=16)
@@ -115,7 +135,8 @@ def build_gemm(kc: KernelCtx) -> dict:
     L_A, L_AS, L_CTL, TMAX = kc.get("L_A L_AS L_CTL TMAX")
     N_TILES, NUM_ACC_N, M_REPEAT = kc.get("N_TILES NUM_ACC_N M_REPEAT")
     A_K_STEP, K_ITERS, A_LDS_I32, NAB = kc.get("A_K_STEP K_ITERS A_LDS_I32 NAB")
-    L_C, L_RCTL = kc.get("L_C L_RCTL")
+    L_C, L_RCTL, L_PF = kc.get("L_C L_RCTL L_PF")
+    WL, NWB, L_W, WB = kc.get("WL NWB L_W WB")
     combine_arrive = kc.get("combine_arrive")[0]  # fused-combine epilogue signals source
     # NW-dependent geometry from kc (per-launch warp-spec width; not the module globals)
     NW, NT, TILE_N, B_LOADER = kc.get("NW NT TILE_N B_LOADER")
@@ -144,6 +165,55 @@ def build_gemm(kc: KernelCtx) -> dict:
             lds_atomic_add(
                 L, L_RCTL + (i32(RC_AFREE) + i32(q) % i32(NAB)) * i32(4), 1, REL
             )
+
+    # ---- W ring (EP_WLDS): compute side of schedule.py's W-loader ------------------
+    # Bank q % NWB holds K-step tile q's W in BWeightLoader lane order (1 KB chunk per
+    # (n-block, ksub), lane*16 B within) followed by the B-scale (256 B per 32-col group,
+    # lane*4 B within); the two loader waves publish (+1 each) once their DMAs landed.
+    WB_W = (TILE_N // 16) * 2048
+    assert not WL or (TILE_N // 16 == NW * NUM_ACC_N and NUM_ACC_N % 2 == 0)
+
+    @flyc.jit
+    def _wl_wait(L, tid, q):
+        """Compute: block until both loader waves staged W tile ``q``."""
+        if (tid % i32(64)) == i32(0):
+            spin_lds_ge(L, L_RCTL + (i32(RC_WSEQ) + i32(q) % i32(NWB)) * i32(4),
+                        i32(2) * (i32(q) // i32(NWB) + i32(1)))
+        rocdl.sched_barrier(0)
+
+    @flyc.jit
+    def _wl_release(L, tid, q):
+        """Compute: this wave's reads of W tile ``q`` completed (caller waited lgkm)."""
+        rocdl.sched_barrier(0)
+        if (tid % i32(64)) == i32(0):
+            lds_atomic_add(L, L_RCTL + (i32(RC_WFREE) + i32(q) % i32(NWB)) * i32(4), 1, REL)
+
+    def _wl_bank(q):
+        return uni((i32(q) % i32(NWB)) * i32(WB))
+
+    def _wl_ni(wv, wb, wave_id, ni, nacc):
+        """[ksub0, ksub1] i32x4 W packs of n-group ``ni`` (== BWeightLoader.load_ni)."""
+        lane16 = i32(fx.thread_idx.x % 64) * i32(16)
+        out = []
+        for ks in range_constexpr(2):
+            off = wb + ((wave_id * i32(nacc) + i32(ni)) * i32(2) + i32(ks)) * i32(1024) + lane16
+            ptr = fx.add_offset(wv.ptr, fx.make_int_tuple(off))
+            v = fx.make_view(fx.recast_iter(fx.Uint8, ptr), fx.make_layout(16, 1)).load()
+            out.append(fx.Vector(v).bitcast(fx.Int32))
+        return out
+
+    def _wl_scale(L, wb, wave_id, nacc):
+        """Per-group packed E8M0 B-scales (== BScaleLoader.load_step)."""
+        lane4 = i32(fx.thread_idx.x % 64) * i32(4)
+        return [
+            lds_ld_i32(L, i32(L_W + WB_W) + wb + (wave_id * i32(nacc // 2) + i32(g)) * i32(256) + lane4)
+            for g in range_constexpr(nacc // 2)
+        ]
+
+    def _wl_step(L, wv, q, wave_id, nacc):
+        wb = _wl_bank(q)
+        return [_wl_ni(wv, wb, wave_id, ni, nacc) for ni in range_constexpr(nacc)], \
+            _wl_scale(L, wb, wave_id, nacc)
 
     @flyc.jit
     def _loader_wait_free(L, lane, q):
@@ -215,6 +285,20 @@ def build_gemm(kc: KernelCtx) -> dict:
             swiglu_limit=swiglu_limit,
         )
 
+    # ---- EP_PROF_DEV per-n-tile split: wave-0 tick sums in L_PF ints 0..5 (6 = scratch,
+    # 7 = last mark); _pmark(k) adds now - last mark to int k.  Dumped to dbg 13..18.
+    PM_G1K, PM_G1B, PM_G1E, PM_G2K, PM_G2B, PM_G2E, PM_NONE = range(7)
+
+    @flyc.jit
+    def _pmark(L, tid, k):
+        if const_expr(_PROF):  # noqa: SIM102 - compile-time gate, not dynamic
+            if tid == i32(0):
+                t = fx.Int32(now())
+                prev = lds_ld_i32(L, L_PF + 7 * 4)
+                lds_st(L, L_PF + 7 * 4, t)
+                off = i32(L_PF) + k * i32(4)
+                lds_st(L, off, lds_ld_i32(L, off) + (t - prev))
+
     # ---- compute-wave (NW) LDS generation barrier (mirror schedule.cbar) ---------
     @flyc.jit
     def cbar(L, tid):
@@ -268,13 +352,14 @@ def build_gemm(kc: KernelCtx) -> dict:
         return fx.Int32(bld(rws, off, 0, T.i8, 0)) & i32(0xFF)
 
     @flyc.jit
-    def a_loader_g1(L, lane, a, expert, e, s, P, uord):
+    def a_loader_g1(L, lane, a, expert, e, nt_lo, nt_hi, qb):
         """Dedicated A-loader wave producer for one GEMM1 unit: stage the A K-tiles of
         echunk ``e``'s n-tile shard into the NAB-bank LDS ring (the identical swizzle the
         compute side reads back via ``AS2RLoader``), paced by the RC_AFREE back-pressure.
         ``lane`` is loader-local (0..NLOAD-1 = ``tid - B_LOADER``, also the ATileLoader
         ``tid_override``).  Mirrors ``gemm1``'s unit / n-tile / K walk so the running ring
-        tile index ``q`` matches the consumer."""
+        tile index ``q`` matches the consumer (``qb`` = n-tiles this CTA ran earlier in
+        the pass)."""
         payload = _global_byte_tensor(
             fx.Int64(a["mine"]) + fx.Int64(a["off_payload"]), TMAX * a_row_bytes
         )
@@ -296,9 +381,6 @@ def build_gemm(kc: KernelCtx) -> dict:
         a_buf = _LdsView(_lds_byte_ptr(L, L_A))
         tib = e * i32(RG)
         a_gather.for_tile(tib)
-        nt_lo = s * i32(N_TILES) // P
-        nt_hi = (s + i32(1)) * i32(N_TILES) // P
-        ntpu = nt_hi - nt_lo
 
         # Plain closure (as in gemm1): the runtime n-tile loop body is only a plain call so
         # a_gather isn't treated as scf.for loop-carried state.
@@ -306,7 +388,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         # issuing the current LDS store, so the next tile's HBM latency overlaps the current
         # store drain + publish instead of serialising one HBM round-trip per tile.
         def _produce_nt(nt):
-            q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS))
+            q0 = uni((qb + (nt - nt_lo)) * i32(K_ITERS))
             regs = a_gather.load_regs(i32(0))  # prefetch K-step 0
             for sp in range_constexpr(K_ITERS):
                 q = q0 + i32(sp)
@@ -402,17 +484,15 @@ def build_gemm(kc: KernelCtx) -> dict:
                         )
 
     @flyc.jit
-    def gemm1(L, tid, a, expert, e, s, P, uord):
+    def gemm1(L, tid, a, expert, e, nt_lo, nt_hi, qb):
         """GEMM1 (A x W1 gate|up) + activation -> E8M0-quantized global intermediate of
-        echunk ``e`` (inter[e*RG..]).  ``s``/``P`` select this CTA's n-tile shard
-        ``[s*N_TILES//P, (s+1)*N_TILES//P)`` of the 2*I gate|up cols (P-way CU split).
+        echunk ``e`` (inter[e*RG..]), n-tiles ``[nt_lo, nt_hi)`` of the 2*I gate|up cols.
 
         TP-style A path: the dedicated A-loader wave (``a_loader_g1``) stages each A K-tile
         into the LDS NAB-bank ring; the compute waves read them back via ``AS2RLoader`` and
         synchronise through the RC_ASEQ (produced) / RC_AFREE (released) ring counters, so
-        the HBM A-load latency is off the compute critical path.  ``uord`` is this CTA's
-        unit ordinal in its stride-#CU walk, so the running ring-tile index matches the
-        loader.  The A-scale + W1 weights are still staged by the compute wave."""
+        the HBM A-load latency is off the compute critical path.  ``qb`` = n-tiles this
+        CTA ran earlier in the pass, so the running ring-tile index matches the loader.  The A-scale + W1 weights are still staged by the compute wave."""
         rm_rsrc = ptr_buf_tensor(fx.Int64(a["rowmap"]), fx.Int32)
         a_s2r = AS2RLoader(k_step_bytes=A_K_STEP, swizzle=True, a_dtype=a_dtype)
         # Fold the per-expert weight offset into the 64-bit resource BASE (not b_row): the
@@ -446,13 +526,11 @@ def build_gemm(kc: KernelCtx) -> dict:
         a_buf = _LdsView(_lds_byte_ptr(L, L_A))
         a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
         cptr = _lds_f32_ptr(L, L_C)  # cshuffle C tile (own region; the A-ring runs ahead)
+        w_ring = _LdsView(_lds_byte_ptr(L, L_W))
         r_inter = rsrc(a["inter"])
         r_inters = rsrc(a["inters"])
         wave_id = tid // i32(64)
         tib = e * i32(RG)
-        nt_lo = s * i32(N_TILES) // P  # this CTA's n-tile shard (P-way CU split)
-        nt_hi = (s + i32(1)) * i32(N_TILES) // P
-        ntpu = nt_hi - nt_lo  # n-tiles this unit runs (matches a_loader_g1's walk)
 
         # The per-n-tile body is a plain closure: a runtime ``range`` loop that invokes
         # a *method* on an atom treats that atom as scf.for loop-carried state (and
@@ -462,6 +540,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         # off the per-n-tile critical path, one cbar instead of N_TILES, and it lets the
         # waves keep drifting across n-tiles without a cooperative re-stage each time.
         cbar(L, tid)  # sync waves entering the unit before the cooperative stage
+        a_scale._tx = _fresh_tid()
         a_scale.stage(a_scale_lds, tib)
         cbar(L, tid)  # A-scale staged + visible to all compute waves
 
@@ -470,8 +549,9 @@ def build_gemm(kc: KernelCtx) -> dict:
         # cbar -- the previous n-tile's epilogue (or the per-unit stage above) already
         # re-synced the waves, and the A-scale is staged once above.
         def _run_ntile(nt):
+            _pmark(L, tid, i32(PM_NONE))
             b_row = wave_id * i32(n_per_wave) + nt * i32(TILE_N)
-            q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS))  # running ring-tile base
+            q0 = uni((qb + (nt - nt_lo)) * i32(K_ITERS))  # running ring-tile base
             _ring_wait(L, tid, q0)  # wait the loader staged A K-step 0
             # Deep (2-step) weight prefetch: prime W for K-steps 0,1, then each steady step
             # MFMAs W[sp] (loaded 2 steps earlier) while prefetching W[sp+2] -> hides 2 MFMA
@@ -513,11 +593,75 @@ def build_gemm(kc: KernelCtx) -> dict:
                 if ts < K_ITERS - 1:
                     _ring_wait(L, tid, q0 + i32(ts + 1))
                     b_a = b_b  # advance to the last primed W
+            _pmark(L, tid, i32(PM_G1K))
             cbar(L, tid)
+            _pmark(L, tid, i32(PM_G1B))
             _epilogue(L, tid, acc, nt, cptr, r_inter, r_inters, e)
+            _pmark(L, tid, i32(PM_G1E))
 
-        for nt_ in range(nt_lo, nt_hi, i32(1)):
-            _run_ntile(i32(nt_))
+        def _run_ntile_wl(nt):
+            # W-ring variant: W / B-scale come from the LDS W ring (staged by the W-loader
+            # waves NWB K-steps deep) instead of HBM; same 2-deep register pipe (W[sp+2]
+            # ds_reads interleave with the MFMAs of step sp).
+            _pmark(L, tid, i32(PM_NONE))
+            q0 = uni((qb + (nt - nt_lo)) * i32(K_ITERS))
+            _ring_wait(L, tid, q0)
+            _wl_wait(L, tid, q0)
+            b_a, s_a = _wl_step(L, w_ring, q0, wave_id, NUM_ACC_N)
+            wait_lgkm0()
+            _wl_release(L, tid, q0)  # before waiting q0+1: the loader publishes tile t
+            _wl_wait(L, tid, q0 + i32(1))  # only after issuing t+NWB-1 (needs t-1 freed)
+            b_b, s_b = _wl_step(L, w_ring, q0 + i32(1), wave_id, NUM_ACC_N)
+            wait_lgkm0()
+            _wl_release(L, tid, q0 + i32(1))
+            acc = [mfma_gu.zero_value for _ in range(N_ACC)]
+            for sp in range_constexpr(K_ITERS - 2):
+                cur_off = _ring_off(q0, sp)
+                qn = q0 + i32(sp + 2)
+                _wl_wait(L, tid, qn)
+                wbn = _wl_bank(qn)
+                s_new = _wl_scale(L, wbn, wave_id, NUM_ACC_N)
+                sa = a_scale.load_step(a_scale_lds, i32(sp))
+
+                def _al(mi, ks, _b=cur_off):
+                    return a_s2r.load_operand(a_buf, mi, ks, _b)
+
+                def _ln(ni, _wb=wbn):
+                    return _wl_ni(w_ring, _wb, wave_id, ni, NUM_ACC_N)
+
+                rocdl.s_setprio(1)
+                acc, b_new = mfma_gu.call_pipe_am(_al, b_a, acc, sa, s_a, _ln)
+                rocdl.s_setprio(0)
+                wait_lgkm0()
+                _wl_release(L, tid, qn)
+                _ring_release(L, tid, q0 + i32(sp))
+                _ring_wait(L, tid, q0 + i32(sp + 1))
+                b_a, b_b = b_b, b_new
+                s_a, s_b = s_b, s_new
+            for ts in range_constexpr(K_ITERS - 2, K_ITERS):
+                t_off = _ring_off(q0, ts)
+
+                def _alt(mi, ks, _b=t_off):
+                    return a_s2r.load_operand(a_buf, mi, ks, _b)
+
+                acc = mfma_gu.call(_alt, b_a, acc, a_scale.load_step(a_scale_lds, i32(ts)), s_a)
+                _ring_release(L, tid, q0 + i32(ts))
+                if ts < K_ITERS - 1:
+                    _ring_wait(L, tid, q0 + i32(ts + 1))
+                    b_a = b_b
+                    s_a = s_b
+            _pmark(L, tid, i32(PM_G1K))
+            cbar(L, tid)
+            _pmark(L, tid, i32(PM_G1B))
+            _epilogue(L, tid, acc, nt, cptr, r_inter, r_inters, e)
+            _pmark(L, tid, i32(PM_G1E))
+
+        if const_expr(WL):
+            for nt_ in range(nt_lo, nt_hi, i32(1)):
+                _run_ntile_wl(i32(nt_))
+        else:
+            for nt_ in range(nt_lo, nt_hi, i32(1)):
+                _run_ntile(i32(nt_))
 
     # ===================== NW=8 inline-A GEMM1 (serial-comm path) =================
     @flyc.jit
@@ -652,7 +796,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             wait_lgkm0()
             cbar(L, tid)
 
-    def _gemm2_core(L, tid, a, expert, e, epi, uord, nt_lo, ntpu):
+    def _gemm2_core(L, tid, a, expert, e, epi, qb, nt_lo):
         """Shared GEMM2 pipeline body for echunk ``e``: A = inter[e*RG..] (non-indexed,
         A-scale ``inters``), B = W2, cshuffle the accumulators to the LDS C-tile, then
         ``epi(acc, nt, cptr)`` consumes it (gout store or fused part scatter).
@@ -660,8 +804,8 @@ def build_gemm(kc: KernelCtx) -> dict:
         TP-style A path: the dedicated A-loader wave (``a_loader_g2``) stages each inter
         K-tile into the LDS NAB-bank ring; this reads them back via ``AS2RLoader`` + the
         RC_ASEQ/RC_AFREE ring sync (same mechanism as GEMM1), so the HBM inter-load latency
-        is off the compute critical path.  ``uord``/``nt_lo``/``ntpu`` give the running ring
-        tile index (matches the loader).  Returns ``_run_ntile(nt)``; the @flyc.jit caller
+        is off the compute critical path.  ``qb`` (n-tiles this CTA ran earlier in the
+        pass) / ``nt_lo`` give the running ring tile index (matches the loader).  Returns ``_run_ntile(nt)``; the @flyc.jit caller
         drives the dynamic n-tile loop.  A plain def so both wrappers share the identical
         GEMM.  The A-scale + W2 weights are still staged by the compute wave."""
         a_s2r = AS2RLoader(k_step_bytes=A_K_STEP, swizzle=True, a_dtype=a_dtype)
@@ -688,20 +832,23 @@ def build_gemm(kc: KernelCtx) -> dict:
         a_buf = _LdsView(_lds_byte_ptr(L, L_A))
         a_scale_lds = _LdsView(_lds_byte_ptr(L, L_AS))
         cptr = _lds_f32_ptr(L, L_C)  # cshuffle C tile (own region; the A-ring runs ahead)
+        w_ring = _LdsView(_lds_byte_ptr(L, L_W))
         wave_id = tid // i32(64)
         tib = e * i32(RG)
         # Stage the A-scale ONCE per unit (same per-echunk block for every n-tile) -- off
         # the per-n-tile critical path (see gemm1).  Runs when the @flyc.jit wrapper calls
         # _gemm2_core, before its n-tile loop.
         cbar(L, tid)  # sync waves entering the unit before the cooperative stage
+        a_scale._tx = _fresh_tid()
         a_scale.stage(a_scale_lds, tib)
         cbar(L, tid)  # A-scale staged + visible to all compute waves
 
         # No nt-boundary cbar (see gemm1): prev n-tile's epilogue / the per-unit stage
         # already re-synced the waves; A-scale is staged once above.
         def _run_ntile(nt):
+            _pmark(L, tid, i32(PM_NONE))
             b_row = wave_id * i32(n_per_wave2) + nt * i32(TILE_N2)
-            q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS2))  # running ring-tile base
+            q0 = uni((qb + (nt - nt_lo)) * i32(K_ITERS2))  # running ring-tile base
             _ring_wait(L, tid, q0)  # wait the loader staged inter K-step 0
             # Deep (2-step) weight prefetch (see gemm1): prime W[0],W[1], steady MFMAs W[sp]
             # while prefetching W[sp+2]; the tail 2 K-steps consume the primed W (no W loads).
@@ -740,13 +887,73 @@ def build_gemm(kc: KernelCtx) -> dict:
                 if ts < K_ITERS2 - 1:
                     _ring_wait(L, tid, q0 + i32(ts + 1))
                     b_a = b_b  # advance to the last primed W
+            _pmark(L, tid, i32(PM_G2K))
             cbar(L, tid)
+            _pmark(L, tid, i32(PM_G2B))
             epi(acc, nt, cptr)
+            _pmark(L, tid, i32(PM_G2E))
 
-        return _run_ntile  # caller (an @flyc.jit wrapper) drives the dynamic n-tile loop
+        def _run_ntile_wl(nt):
+            # W-ring variant: W / B-scale come from the LDS W ring (staged by the W-loader
+            # waves NWB K-steps deep) instead of HBM; same 2-deep register pipe (W[sp+2]
+            # ds_reads interleave with the MFMAs of step sp).
+            _pmark(L, tid, i32(PM_NONE))
+            q0 = uni((qb + (nt - nt_lo)) * i32(K_ITERS2))
+            _ring_wait(L, tid, q0)
+            _wl_wait(L, tid, q0)
+            b_a, s_a = _wl_step(L, w_ring, q0, wave_id, NUM_ACC_N2)
+            wait_lgkm0()
+            _wl_release(L, tid, q0)  # before waiting q0+1: the loader publishes tile t
+            _wl_wait(L, tid, q0 + i32(1))  # only after issuing t+NWB-1 (needs t-1 freed)
+            b_b, s_b = _wl_step(L, w_ring, q0 + i32(1), wave_id, NUM_ACC_N2)
+            wait_lgkm0()
+            _wl_release(L, tid, q0 + i32(1))
+            acc = [mfma_gu.zero_value for _ in range(N_ACC2)]
+            for sp in range_constexpr(K_ITERS2 - 2):
+                cur_off = _ring_off(q0, sp)
+                qn = q0 + i32(sp + 2)
+                _wl_wait(L, tid, qn)
+                wbn = _wl_bank(qn)
+                s_new = _wl_scale(L, wbn, wave_id, NUM_ACC_N2)
+                sa = a_scale.load_step(a_scale_lds, i32(sp))
+
+                def _al(mi, ks, _b=cur_off):
+                    return a_s2r.load_operand(a_buf, mi, ks, _b)
+
+                def _ln(ni, _wb=wbn):
+                    return _wl_ni(w_ring, _wb, wave_id, ni, NUM_ACC_N2)
+
+                rocdl.s_setprio(1)
+                acc, b_new = mfma_gu.call_pipe_am(_al, b_a, acc, sa, s_a, _ln)
+                rocdl.s_setprio(0)
+                wait_lgkm0()
+                _wl_release(L, tid, qn)
+                _ring_release(L, tid, q0 + i32(sp))
+                _ring_wait(L, tid, q0 + i32(sp + 1))
+                b_a, b_b = b_b, b_new
+                s_a, s_b = s_b, s_new
+            for ts in range_constexpr(K_ITERS2 - 2, K_ITERS2):
+                t_off = _ring_off(q0, ts)
+
+                def _alt(mi, ks, _b=t_off):
+                    return a_s2r.load_operand(a_buf, mi, ks, _b)
+
+                acc = mfma_gu.call(_alt, b_a, acc, a_scale.load_step(a_scale_lds, i32(ts)), s_a)
+                _ring_release(L, tid, q0 + i32(ts))
+                if ts < K_ITERS2 - 1:
+                    _ring_wait(L, tid, q0 + i32(ts + 1))
+                    b_a = b_b
+                    s_a = s_b
+            _pmark(L, tid, i32(PM_G2K))
+            cbar(L, tid)
+            _pmark(L, tid, i32(PM_G2B))
+            epi(acc, nt, cptr)
+            _pmark(L, tid, i32(PM_G2E))
+
+        return _run_ntile_wl if const_expr(WL) else _run_ntile  # caller (an @flyc.jit wrapper) drives the dynamic n-tile loop
 
     @flyc.jit
-    def a_loader_g2(L, lane, a, e, nt_lo, ntpu, uord):
+    def a_loader_g2(L, lane, a, e, nt_lo, ntpu, qb):
         """Dedicated A-loader producer for one GEMM2 unit: stage inter[e*RG..] K-tiles
         (GEMM1's output, non-indexed) into the NAB-bank LDS ring for the compute waves,
         paced by the RC_AFREE back-pressure.  ``lane`` is loader-local (= ``tid-B_LOADER``,
@@ -771,7 +978,7 @@ def build_gemm(kc: KernelCtx) -> dict:
 
         # Depth-2 loader pipeline (see a_loader_g1): prefetch next K-step while current drains.
         def _produce_nt(nt):
-            q0 = uni((uord * ntpu + (nt - nt_lo)) * i32(K_ITERS2))
+            q0 = uni((qb + (nt - nt_lo)) * i32(K_ITERS2))
             regs = a_gather.load_regs(i32(0))  # prefetch K-step 0
             for sp in range_constexpr(K_ITERS2):
                 q = q0 + i32(sp)
@@ -785,16 +992,13 @@ def build_gemm(kc: KernelCtx) -> dict:
             _produce_nt(i32(nt_))
 
     @flyc.jit
-    def gemm2_pipe(L, tid, a, expert, e, s, P, src_out, uord):
-        """GEMM2 -> bf16 ``gout[e*RG..]`` for echunk ``e`` (n-tile shard
-        ``[s*N_TILES2//P, (s+1)*N_TILES2//P)``; P-way CU split).  Thin @flyc.jit wrapper
-        over ``_gemm2_core`` with the gout epilogue.  ``uord`` = this CTA's unit ordinal."""
-        nt_lo = s * i32(N_TILES2) // P  # this CTA's n-tile shard (P-way CU split)
-        nt_hi = (s + i32(1)) * i32(N_TILES2) // P
+    def gemm2_pipe(L, tid, a, expert, e, nt_lo, nt_hi, src_out, qb):
+        """GEMM2 -> bf16 ``gout[e*RG..]`` for echunk ``e``, n-tiles ``[nt_lo, nt_hi)``.
+        Thin @flyc.jit wrapper over ``_gemm2_core`` with the gout epilogue."""
         run_ntile = _gemm2_core(
             L, tid, a, expert, e,
             lambda acc, nt, cptr: _epilogue_g2(L, tid, acc, nt, cptr, src_out, e),
-            uord, nt_lo, nt_hi - nt_lo,
+            qb, nt_lo,
         )
         for nt_ in range(nt_lo, nt_hi, i32(1)):
             run_ntile(i32(nt_))
@@ -872,18 +1076,18 @@ def build_gemm(kc: KernelCtx) -> dict:
             _scatter_combine(L, tid, a, e, rows, n_tile, cptr, i32(mi * 16))
 
     @flyc.jit
-    def gemm2_combine(L, tid, a, expert, e, rows, uord):
+    def gemm2_combine(L, tid, a, expert, e, rows, qb):
         """GEMM2 (P==1) that FUSES combine into the cshuffle epilogue: the bf16 output
         scatters straight to each row's source ``part`` (no gout), the cross-rank P2P
         overlapping the next n-tile's MFMA; after the loop one wait_vm drains the scatters
         and a per-row combine_arrive signals the sources.  Thin @flyc.jit wrapper over
         ``_gemm2_core`` (the *same* GEMM as ``gemm2_pipe``) with the fused epilogue.
-        ``rows`` = the echunk's valid row count (padding rows are skipped); ``uord`` = this
-        CTA's unit ordinal (P==1 -> nt_lo=0, ntpu=N_TILES2)."""
+        ``rows`` = the echunk's valid row count (padding rows are skipped); ``qb`` = n-tiles
+        this CTA ran earlier in the pass (all N_TILES2 n-tiles of the echunk run here)."""
         run_ntile = _gemm2_core(
             L, tid, a, expert, e,
             lambda acc, nt, cptr: _epilogue_g2_combine(L, tid, acc, nt, cptr, a, e, rows),
-            uord, i32(0), i32(N_TILES2),
+            qb, i32(0),
         )
         for nt_ in range(i32(0), i32(N_TILES2), i32(1)):
             run_ntile(i32(nt_))

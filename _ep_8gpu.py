@@ -68,10 +68,7 @@ def run(bs):
     err = engine.poll_errors()
     recv = engine._recv.local
     nrecv = recv.ge(0).logical_and(recv.lt(EPR)).sum().item()
-    partv = engine._part.local.view(MTPR, K, H)[:bs]
-    routes_nz = partv.float().abs().sum(-1).gt(1e-6)  # [bs, K]
-    complete = routes_nz.all(-1).sum().item()
-    print(f"[r{RANK}] bs={bs} err={err} recv_valid={nrecv} complete_tok={complete}/{bs}", flush=True)
+    print(f"[r{RANK}] bs={bs} err={err} recv_valid={nrecv}", flush=True)
     ref = engine.reference_forward(x, wts, ids, (w1_q, w1_s, w2_q, w2_s))
     o, r = out.float(), ref.float()
     rel = ((o - r).norm() / r.norm().clamp_min(1e-9)).item()
