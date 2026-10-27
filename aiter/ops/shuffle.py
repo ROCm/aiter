@@ -195,6 +195,15 @@ def shuffle_weight(
     BK = IK * 2
     K = 16 // x.element_size() if not use_int4 else 32
     BN = IN
+    if x.shape[-1] % BK != 0 and x.shape[-1] % K == 0:
+        # The layout is [N/BN][K/K-vector][BN][K-vector] whatever BK is, so a K that is a
+        # whole number of K-vectors gives the same bytes with BK = one K-vector.
+        BK = K
+    elif x.shape[-1] % K != 0 and not use_int4 and x.shape[-1] % (K // 2) == 0:
+        # A K that is a multiple of half a K-vector (e.g. 8 FP8 elements) is laid out in half-width
+        # vectors, which the 8-element-vector (KVec8) MoE kernels read.
+        K //= 2
+        BK = K
     assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
     assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
 

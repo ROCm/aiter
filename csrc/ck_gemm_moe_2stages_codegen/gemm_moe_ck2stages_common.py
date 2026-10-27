@@ -3,7 +3,7 @@
 import copy
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -38,6 +38,10 @@ class kernelInstanceGEMM1:
     ActOP: int = 0
     CDEElementOp: str = "TypeCast"
     QuantType: int = 1
+    # Ask CK to pad K so a K that no KPerBlock divides still has a kernel.
+    PadK: bool = False
+    # Weights in 8-element K vectors (K % 16 == 8); FP8 stage 2 only, implies PadK.
+    KVec8: bool = False
     stage: int = 1
     Adtype: str = ""
     Bdtype: str = ""
@@ -68,6 +72,10 @@ class kernelInstanceGEMM1:
                 self.Bdtype.upper(),
                 self.Cdtype.upper(),
             ]
+            # Only padded instances take a suffix, so existing kernel names and the
+            # tuned CSV rows keyed on them do not change.
+            + (["PadK"] if self.PadK else [])
+            + (["KVec8"] if self.KVec8 else [])
         )
 
 
@@ -84,6 +92,10 @@ class kernelInstanceGEMM2:
     MulRoutedWeight: bool = True
     CDEElementOp: str = "TypeCast"
     QuantType: int = 1
+    # Ask CK to pad K so a K that no KPerBlock divides still has a kernel.
+    PadK: bool = False
+    # Weights in 8-element K vectors (K % 16 == 8); FP8 stage 2 only, implies PadK.
+    KVec8: bool = False
     stage: int = 2
 
     @property
@@ -110,6 +122,10 @@ class kernelInstanceGEMM2:
                 self.Bdtype.upper(),
                 self.Cdtype.upper(),
             ]
+            # Only padded instances take a suffix, so existing kernel names and the
+            # tuned CSV rows keyed on them do not change.
+            + (["PadK"] if self.PadK else [])
+            + (["KVec8"] if self.KVec8 else [])
         )
 
 
@@ -131,6 +147,18 @@ a16w16_gemm1_kernels_list_gfx950= {
     10: kernelInstanceGEMM1(       256,       256,       128,        64,     1,       4,        3,),
     11: kernelInstanceGEMM1(       256,       256,        64,        64,     1,       4,        1,),
 }
+
+# CK needs K to be a multiple of KPerBlock. These twins ask CK to pad K instead, so a K
+# that no KPerBlock divides still has a kernel. The heuristic dispatch picks them only
+# when K is not a multiple, because padding costs a bounds check on every load.
+a16w16_gemm1_kernels_list_gfx950.update(
+    {
+        key + 100: replace(kernel, PadK=True)
+        for key, kernel in a16w16_gemm1_kernels_list_gfx950.items()
+        if key in (1, 3, 4, 9, 10, 11)
+    }
+)
+
 
 a16w16_gemm1_kernels_list= {
 #   id: kernel:             BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| MWaves| NWaves|GemmPipelineVersion
@@ -162,7 +190,29 @@ a8w8_gemm1_kernels_list_gfx950= {
      9: kernelInstanceGEMM1(       256,       128,       128,       128,     1,       4,        3,),
     10: kernelInstanceGEMM1(       256,       256,       128,       128,     1,       4,        3,),
     11: kernelInstanceGEMM1(       256,       256,        64,       128,     1,       4,        1,),
+    # NPerBlock 32, for an inter_dim (N) that isn't a multiple of 64.
+    21: kernelInstanceGEMM1(       128,        32,        32,       128,     2,       1,        1,),
+    22: kernelInstanceGEMM1(       128,        64,        32,       128,     2,       1,        1,),
+    23: kernelInstanceGEMM1(       128,       128,        32,       128,     2,       1,        1,),
+    24: kernelInstanceGEMM1(       128,       256,        32,       128,     2,       1,        1,),
+    # NPerBlock 16, for an inter_dim (N) that isn't a multiple of 32.
+    31: kernelInstanceGEMM1(        64,        32,        16,       128,     1,       1,        1,),
+    32: kernelInstanceGEMM1(        64,        64,        16,       128,     1,       1,        1,),
+    33: kernelInstanceGEMM1(        64,       128,        16,       128,     1,       1,        1,),
+    34: kernelInstanceGEMM1(        64,       256,        16,       128,     1,       1,        1,),
 }
+
+# CK needs K to be a multiple of KPerBlock. These twins ask CK to pad K instead, so a K
+# that no KPerBlock divides still has a kernel. The heuristic dispatch picks them only
+# when K is not a multiple, because padding costs a bounds check on every load.
+a8w8_gemm1_kernels_list_gfx950.update(
+    {
+        key + 100: replace(kernel, PadK=True)
+        for key, kernel in a8w8_gemm1_kernels_list_gfx950.items()
+        if key in (1, 3, 4, 9, 10, 11, 21, 22, 23, 24, 31, 32, 33, 34)
+    }
+)
+
 
 a8w8_gemm1_kernels_list= {
     12: kernelInstanceGEMM1(       128,       16,         64,       128,     1,       2,        1,),
@@ -186,7 +236,26 @@ a8w8_gemm1_kernels_list= {
     16: kernelInstanceGEMM1(       256,        64,        64,        64,     1,       4,        1,),
     17: kernelInstanceGEMM1(       256,       128,        64,        64,     1,       4,        1,),
     18: kernelInstanceGEMM1(       256,       256,        64,        64,     1,       4,        1,),
+    # NPerBlock 32, for an inter_dim (N) that isn't a multiple of 64.
+    20: kernelInstanceGEMM1(        64,        16,        32,        64,     1,       1,        1,),
+    21: kernelInstanceGEMM1(       128,        32,        32,        64,     2,       1,        1,),
+    22: kernelInstanceGEMM1(       128,        64,        32,        64,     2,       1,        1,),
+    # NPerBlock 16, for an inter_dim (N) that isn't a multiple of 32.
+    25: kernelInstanceGEMM1(        64,        16,        16,        64,     1,       1,        1,),
+    26: kernelInstanceGEMM1(        64,        32,        16,        64,     1,       1,        1,),
+    27: kernelInstanceGEMM1(        64,        64,        16,        64,     1,       1,        1,),
 }
+
+# N-and-K-padding twins, for an inter_dim (N) that isn't a multiple of 16 (NPerBlock 16) or that
+# the 64-wide tiles of block_m 128/256 don't divide (needs the element-exact preshuffled-B rows
+# in CK). Picked only for those shapes.
+a8w8_gemm1_kernels_list.update(
+    {
+        key + 100: replace(kernel, PadK=True)
+        for key, kernel in a8w8_gemm1_kernels_list.items()
+        if key in (4, 10, 17, 18, 25, 26, 27)
+    }
+)
 # gemm1 blockscale out:bf16/fp16 AB:fp8/i8
 a8w8_gemm1_blockscale_kernels_list= {
      0: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
@@ -281,11 +350,15 @@ a8w8_gemm2_kernels_list_gfx950= {
     #  4: kernelInstanceGEMM2(       256,        64,       128,       256,     1,       4,         3,),
      5: kernelInstanceGEMM2(       256,       128,       128,       128,     1,       4,         3,),
      6: kernelInstanceGEMM2(       256,       256,       128,       128,     1,       4,         3,),
-    # KPerBlock=128 small-M instances. Stage 2 runs K = inter_dim under
-    # GemmSpecialization::Default, so an inter_dim that is a multiple of 128 but
-    # not of 256 (e.g. the 384 of a TP4 shard) has no KPerBlock=256 instance.
+    # KPerBlock=128 small-M instances. An inter_dim that is a multiple of 128 but not of 256,
+    # such as the 384 of a TP4 shard, divides these exactly and so needs no padding.
      7: kernelInstanceGEMM2(       256,        32,       128,       128,     1,       4,         1,),
      8: kernelInstanceGEMM2(       256,        64,       128,       128,     1,       4,         1,),
+    # NPerBlock 64, for a model_dim (N) that isn't a multiple of 128.
+    20: kernelInstanceGEMM2(       256,        32,        64,       128,     1,       4,         1,),
+    21: kernelInstanceGEMM2(       256,        64,        64,       128,     1,       4,         1,),
+    22: kernelInstanceGEMM2(       256,       128,        64,       128,     1,       4,         3,),
+    23: kernelInstanceGEMM2(       256,       256,        64,       128,     1,       4,         3,),
     # inter_dim=192 default instances with KPerBlock=64
     # disabled currently due to gfx950 fp8 mfma instruction used in CK not supporting these cases
     #  10: kernelInstanceGEMM2(       256,        32,        64,       64,     1,       4,         1,),
@@ -293,6 +366,29 @@ a8w8_gemm2_kernels_list_gfx950= {
     #  12: kernelInstanceGEMM2(       256,       128,       128,       64,     1,       4,         3,),
     #  13: kernelInstanceGEMM2(       256,       256,       128,       64,     1,       4,         3,),
 }
+
+# CK needs K to be a multiple of KPerBlock. These twins ask CK to pad K instead, so a K
+# that no KPerBlock divides still has a kernel. The heuristic dispatch picks them only
+# when K is not a multiple, because padding costs a bounds check on every load.
+a8w8_gemm2_kernels_list_gfx950.update(
+    {
+        key + 100: replace(kernel, PadK=True)
+        for key, kernel in a8w8_gemm2_kernels_list_gfx950.items()
+        if key in (5, 6, 7, 8, 20, 21, 22, 23)
+    }
+)
+
+# K that isn't a multiple of 16 (8-element-vector weights): KPerBlock 32, padded. On gfx950 the
+# 8-element vectors select the single-rate FP8 MFMA.
+a8w8_gemm2_kernels_list_gfx950.update(
+    {
+        141: kernelInstanceGEMM2(64, 32, 64, 32, 1, 1, 1, PadK=True, KVec8=True),
+        142: kernelInstanceGEMM2(64, 64, 64, 32, 1, 1, 1, PadK=True, KVec8=True),
+        143: kernelInstanceGEMM2(256, 128, 64, 32, 4, 1, 1, PadK=True, KVec8=True),
+        144: kernelInstanceGEMM2(256, 256, 64, 32, 4, 1, 1, PadK=True, KVec8=True),
+    }
+)
+
 
 a8w8_gemm2_kernels_list= {
     17: kernelInstanceGEMM2(       256,        16,       128,       256,     1,       4,         1,),
@@ -316,6 +412,29 @@ a8w8_gemm2_kernels_list= {
      16: kernelInstanceGEMM2(       256,       256,        64,       64,     1,       4,         3,),
      19: kernelInstanceGEMM2(        64,        16,        64,       64,     1,       1,         1,),
 }
+
+# 8-element K vectors (padded), for an inter_dim (K) that is a multiple of 8 but not of 16; its
+# weights are shuffled in 8-element vectors.
+a8w8_gemm2_kernels_list.update(
+    {
+        140: kernelInstanceGEMM2(64, 16, 64, 32, 1, 1, 1, PadK=True, KVec8=True),
+        141: kernelInstanceGEMM2(64, 32, 64, 32, 1, 1, 1, PadK=True, KVec8=True),
+        142: kernelInstanceGEMM2(64, 64, 64, 32, 1, 1, 1, PadK=True, KVec8=True),
+        # block_m 128/256: KPerBlock 64 (CK reads each lane's 16 K elements as two vectors).
+        145: kernelInstanceGEMM2(256, 128, 64, 64, 1, 4, 3, PadK=True, KVec8=True),
+        146: kernelInstanceGEMM2(256, 256, 64, 64, 1, 4, 3, PadK=True, KVec8=True),
+    }
+)
+
+# K-padding twins of the KPerBlock 64 instances, for an inter_dim (K) that isn't a multiple of 64
+# (needs the element-exact preshuffled-B descriptor in CK). Picked only for those shapes.
+a8w8_gemm2_kernels_list.update(
+    {
+        key + 100: replace(kernel, PadK=True)
+        for key, kernel in a8w8_gemm2_kernels_list.items()
+        if key in (10, 12, 14, 16, 19)
+    }
+)
 
 # gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8
 a8w8_gemm2_blockscale_kernels_list= {

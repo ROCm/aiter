@@ -21,7 +21,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          bool PadK>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -63,7 +64,11 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     using AElementOp  = PassThrough;
     using BElementOp  = PassThrough;
 
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
+    // Padding N and K lets CK run an N or K that no tile divides (N, K multiples of 8), at the
+    // cost of bounds checks on every load, so only the shapes that need it ask for it.
+    static constexpr auto GemmSpec =
+        PadK ? ck::tensor_operation::device::GemmSpecialization::NKPadding
+             : ck::tensor_operation::device::GemmSpecialization::Default;
     static constexpr ck::index_t MNPerXDL    = 16;
     static constexpr ck::index_t WAVES       = BLOCKSIZE / 64;
     static constexpr ck::index_t MXDLPerWave = MPerBlock / (MNPerXDL * MWaves);
@@ -83,7 +88,14 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
             : 16;
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 = ck::is_same_v<B0DataType, I4> ? 32 : K1 / sizeof(B0DataType);
-    static constexpr ck::index_t EVec   = MPerBlock == 16 ? 4 : 16 / sizeof(EDataType);
+    static constexpr ck::index_t EVec = MPerBlock == 16 ? 4 : 16 / sizeof(EDataType);
+    // NPerBlock 16/32 tiles (for an inter_dim that isn't a multiple of 64): the formulas above
+    // assume NPerBlock >= 64, so size the CShuffle lanes from the narrow shuffle tile instead.
+    static constexpr ck::index_t CShuffleNLaneNarrow =
+        CShuffleNXDLPerWave * MNPerXDL * NWaves / EVec;
+    static constexpr ck::index_t CMLane =
+        NPerBlock < 64 ? BLOCKSIZE / CShuffleNLaneNarrow : CShuffleMLane;
+    static constexpr ck::index_t CNLane = NPerBlock < 64 ? CShuffleNLaneNarrow : CShuffleNLane;
     static constexpr ck::index_t K0_A   = KPerBlock / AK1;
     static constexpr ck::index_t K0_B   = KPerBlock / BK1;
     static constexpr ck::index_t K0_M_A = BLOCKSIZE / K0_A;
@@ -107,7 +119,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                MXDLPerWave,    NXDLPerWave,
                S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
-               CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec>,
+               CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CMLane, 1, CNLane>, S<EVec, D0Vec, D1Vec>,
                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType>;
     // clang-format on
 
@@ -176,24 +188,25 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      Nswizzle,                                \
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
-                                     ActOP>(const hipStream_t& stream,        \
-                                            int tokens,                       \
-                                            int sorted_size,                  \
-                                            int N,                            \
-                                            int K,                            \
-                                            int topk,                         \
-                                            void*& hidden_states,             \
-                                            void*& w1,                        \
-                                            void*& w2,                        \
-                                            void*& sorted_token_ids,          \
-                                            void*& sorted_expert_ids,         \
-                                            void*& sorted_weights,            \
-                                            void*& num_valid_ids,             \
-                                            void*& out,                       \
-                                            std::optional<void*> w1_scale,    \
-                                            std::optional<void*> a1_scale,    \
-                                            std::optional<int> splitk,        \
-                                            std::optional<bool> nt);
+                                     ActOP,                                   \
+                                     PadK>(const hipStream_t& stream,         \
+                                           int tokens,                        \
+                                           int sorted_size,                   \
+                                           int N,                             \
+                                           int K,                             \
+                                           int topk,                          \
+                                           void*& hidden_states,              \
+                                           void*& w1,                         \
+                                           void*& w2,                         \
+                                           void*& sorted_token_ids,           \
+                                           void*& sorted_expert_ids,          \
+                                           void*& sorted_weights,             \
+                                           void*& num_valid_ids,              \
+                                           void*& out,                        \
+                                           std::optional<void*> w1_scale,     \
+                                           std::optional<void*> a1_scale,     \
+                                           std::optional<int> splitk,         \
+                                           std::optional<bool> nt);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -210,7 +223,9 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP = 0>
+          int ActOP,
+          bool PadK,
+          bool KVec8>
 void ck_moe_stage2_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -252,7 +267,11 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     using AElementOp  = PassThrough;
     using BElementOp  = PassThrough;
 
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
+    // Padding N and K lets CK run an N or K that no tile divides (N, K multiples of 8), at the
+    // cost of bounds checks on every load, so only the shapes that need it ask for it.
+    static constexpr auto GemmSpec =
+        PadK ? ck::tensor_operation::device::GemmSpecialization::NKPadding
+             : ck::tensor_operation::device::GemmSpecialization::Default;
     // static constexpr ck::index_t BLOCKSIZE = 256;
     static constexpr ck::index_t WAVES               = BLOCKSIZE / 64;
     static constexpr ck::index_t MNPerXDL            = 16;
@@ -265,12 +284,19 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         ck::is_same_v<B0DataType, I4> ? 32 : NPerBlock / 2 / NXDLPerWave; // 64
     static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
     // Note: some fp8 instances didn't compile with AK1/BK1=16
-    static constexpr ck::index_t K1 =
-        (BLOCKSIZE == 256 && KPerBlock == 64 && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1) ? 8 : 16;
+    // KVec8 instances read 8-element K vectors (for an inter_dim that is a multiple of 8 but not of
+    // 16; its weights are shuffled in 8-element vectors).
+    static_assert(!KVec8 || (PadK && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1),
+                  "KVec8 is for padded FP8 instances");
+    static constexpr ck::index_t K1  = KVec8 || (BLOCKSIZE == 256 && KPerBlock == 64 &&
+                                                sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1)
+                                           ? 8
+                                           : 16;
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
-    // EXPERIMENT: the preshuffled B layout is in 16-byte K vectors; keep BK1 at 16 bytes.
-    static constexpr ck::index_t BK1 =
-        ck::is_same_v<B0DataType, I4> ? 32 / sizeof(B0DataType) : 16 / sizeof(B0DataType);
+    // The preshuffled B layout is in 16-byte K vectors (8-byte for KVec8); BK1 matches it.
+    static constexpr ck::index_t BK1   = ck::is_same_v<B0DataType, I4>
+                                             ? 32 / sizeof(B0DataType)
+                                             : (KVec8 ? 8 : 16) / sizeof(B0DataType);
     static constexpr ck::index_t EVec  = 2;
     static constexpr ck::index_t D0Vec = 1;
     static constexpr ck::index_t D1Vec = PerTensorQuant ? 1 : EVec;
@@ -347,7 +373,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
 }
 
 #define CK_MOE_STAGE2_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                    \
-    template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \
+    template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, PadK, KVec8>( \
         const hipStream_t &stream,                                                                                                                                   \
         int tokens, int sorted_size, int N, int K,                                                                                                                   \
         int topk,                                                                                                                                                    \
