@@ -1430,24 +1430,24 @@ def launch_gemm_a8w4_tdm(
                 future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
-                tdm_schedule = spread(
-                    TDM_PER if (prefetch_kt is not None and ksl + 1 == kws) else 0,
-                    schedule_slots,
-                )
-                first_ds = min(sched_ds_first, future_schedule[0])
-                for i in range_constexpr(schedule_slots):
-                    if const_expr(tdm_schedule[i] > 0):
-                        rocdl.sched_vmem(tdm_schedule[i])
-                    if const_expr(i == 0 and first_ds > 0):
-                        rocdl.sched_dsrd(first_ds)
-                    rocdl.sched_mfma(mma_groups[i])
-                    remaining_ds = future_schedule[i] - (first_ds if i == 0 else 0)
-                    if const_expr(remaining_ds > 0):
-                        rocdl.sched_dsrd(remaining_ds)
-                # Closing on an MFMA group is what covers the next k128's fence,
-                # so it must come out of mma_total; reordering slots does not.
-                if const_expr(tail_mfma > 0):
-                    rocdl.sched_mfma(tail_mfma)
+                # tdm_schedule = spread(
+                #     TDM_PER if (prefetch_kt is not None and ksl + 1 == kws) else 0,
+                #     schedule_slots,
+                # )
+                # first_ds = min(sched_ds_first, future_schedule[0])
+                # for i in range_constexpr(schedule_slots):
+                #     if const_expr(tdm_schedule[i] > 0):
+                #         rocdl.sched_vmem(tdm_schedule[i])
+                #     if const_expr(i == 0 and first_ds > 0):
+                #         rocdl.sched_dsrd(first_ds)
+                #     rocdl.sched_mfma(mma_groups[i])
+                #     remaining_ds = future_schedule[i] - (first_ds if i == 0 else 0)
+                #     if const_expr(remaining_ds > 0):
+                #         rocdl.sched_dsrd(remaining_ds)
+                # # Closing on an MFMA group is what covers the next k128's fence,
+                # # so it must come out of mma_total; reordering slots does not.
+                # if const_expr(tail_mfma > 0):
+                #     rocdl.sched_mfma(tail_mfma)
 
             if const_expr(not rmem_preloaded):
                 load_lds_data(rmem_slots[0], lds_addr, 0, kt, interleaved_lds_load)
@@ -1484,18 +1484,52 @@ def launch_gemm_a8w4_tdm(
                 )
                 # One region per k128: sched_group_barrier only partitions
                 # within a region, and only sched_barrier delimits one.
-                emit_hints(
-                    ksl,
-                    (
-                        FENCE_COVER_MMA
-                        if (
-                            tile_m > 32
-                            and not is_last
-                            and next_stage_lds_addr is not None
-                        )
-                        else 0
-                    ),
+                # emit_hints(
+                #     ksl,
+                #     (
+                #         FENCE_COVER_MMA
+                #         if (
+                #             tile_m > 32
+                #             and not is_last
+                #             and next_stage_lds_addr is not None
+                #         )
+                #         else 0
+                #     ),
+                # )
+                # rocdl.s_wait_dscnt(0)
+
+                # rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(2)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(2)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(4)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(4)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(4)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(4)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(4)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(4)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(4)
+                # The k128 issues 36 DS reads (16 A + 16 B b128 + 4 scale); an
+                # unclaimed read is hoisted ahead of every group.
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(4)
+                rocdl.sched_mfma(9)
+
+                rocdl.sched_barrier(0)
+                next_fenced = (
+                    ksl + 2 == kws
+                    and next_stage_lds_addr is not None
+                    and (next_stage_fence_fn is not None or next_stage_wait is not None)
                 )
+                if const_expr(not next_fenced):
+                    rocdl.s_wait_dscnt(0)
                 rocdl.sched_barrier(0)
 
         # Skip padding tiles; uniform across every workgroup and cluster.

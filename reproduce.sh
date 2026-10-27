@@ -66,15 +66,13 @@ done
 exec python3 -u op_tests/flydsl_tests/test_flydsl_grouped_gemm.py \
   --scenario kernel \
   --data-format a4w4 \
-  --experts 96 \
+  --experts 1 \
   --tokens 16384 \
-  --topk 6 \
-  --model-dim 7168 \
-  --inter-dim 3072 \
+  --topk 1 \
+  --model-dim 16384 \
+  --inter-dim 8192 \
   --act silu \
   --no-bias \
   --iters 64 \
   --no-check-aot-cache \
-  --data-init zero \
-  --scale-init zero \
   "$@"
