@@ -393,6 +393,9 @@ def _make_combine_fused_reduce(
         total_work = n_groups * iters_per_tok
         last_work = total_work - 1
 
+        # Wave id is loop-invariant; read it once instead of per tile.
+        wave = fx.rocdl.wave_id()
+
         def tile_origin(work):
             grp = work // iters_per_tok
             it = work % iters_per_tok
@@ -438,7 +441,7 @@ def _make_combine_fused_reduce(
             blk_in = fx.zipped_divide(coord_in, IN_TILE)[None, (0, None)]
             tIs, tIg = fx.rocdl.cdna5.tdm_partition(
                 atom_in,
-                fx.rocdl.wave_id(),
+                wave,
                 fx.make_layout(warp_num_per_block, 1),
                 lds_in_view(buf),
                 blk_in,
@@ -547,7 +550,7 @@ def _make_combine_fused_reduce(
             blk_out = fx.zipped_divide(coord_out, OUT_TILE)[None, (0, None)]
             tOs, tOg = fx.rocdl.cdna5.tdm_partition(
                 atom_out,
-                fx.rocdl.wave_id(),
+                wave,
                 fx.make_layout(warp_num_per_block, 1),
                 lds_out_view(buf),
                 blk_out,

@@ -410,9 +410,10 @@ def _tdm_load_views(
     elem_dtype,
     num_warps=1,
 ):
-    """Build a LIST of ``(atom, g_view, lds_view)`` TDM global->LDS copies for one
+    """Build a LIST of ``(atom, g_tensor, lds_tensor)`` TDM global->LDS copies for one
     ``[num_rows, hdim]`` tile into row-major padded LDS -- PURE (no memory op); issue each with
-    ``fx.copy(*view)``, then drain with ``tensor_wait(0)``.
+    ``fx.copy(*view)``, then drain with ``tensor_wait(0)``. The two tensors are the
+    post-``tdm_partition`` global/LDS shares for this wave, not the raw views.
 
     One copy per ``_pow2_segments`` column segment ``(c0, w)``, carrying ``pad_interval=w`` and
     ``pad_amount=(hdim + pad_elems - w)`` so the LDS row still advances by the padded stride.

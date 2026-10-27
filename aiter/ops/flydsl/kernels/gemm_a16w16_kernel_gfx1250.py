@@ -342,6 +342,9 @@ def compile_gemm_a16w16(
             b_tile_shape,
         )
 
+        # Wave id is loop-invariant; read it once instead of per call per side.
+        wave = fx.rocdl.wave_id()
+
         def issue_tdm_loads(buf_idx, k_tile):
             for sd in (A_SIDE, B_SIDE):
                 atom = sd[ATOM]
@@ -356,7 +359,7 @@ def compile_gemm_a16w16(
                 )
                 ts, tg = fx.rocdl.cdna5.tdm_partition(
                     atom,
-                    fx.rocdl.wave_id(),
+                    wave,
                     fx.make_layout(num_warps, 1),
                     lds_box,
                     sd[BLK],
