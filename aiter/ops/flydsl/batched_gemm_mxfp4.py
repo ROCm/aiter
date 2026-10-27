@@ -439,11 +439,11 @@ def flydsl_batched_gemm_a8w4_v2(
     a_c = a.contiguous()
     _run_compiled(
         _launch_v2,
-        out_phys,
+        out_phys.view(-1),
         ptr_arg(a_c),
         ptr_arg(w),
-        a_scales.view(torch.int32),
-        w_scales.view(torch.int32),
+        a_scales.view(torch.int32).view(-1),
+        w_scales.view(torch.int32).view(-1),
         M,
         torch.cuda.current_stream(),
         N,

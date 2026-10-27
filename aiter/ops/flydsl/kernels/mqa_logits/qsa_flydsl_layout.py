@@ -509,21 +509,21 @@ def qsa_paged_mqa_logits_flydsl(
         row_starts = torch.empty(rows, dtype=torch.int32, device=q.device)
     # The kernel reads int32 indices and uses `width` as the page-table row stride.
     page_table = page_table.to(torch.int32).contiguous()
-    token_to_request = token_to_request.to(torch.int32)
-    query_positions = query_positions.to(torch.int32)
-    context_lens = context_lens.to(torch.int32)
+    token_to_request = token_to_request.to(torch.int32).contiguous().view(-1)
+    query_positions = query_positions.to(torch.int32).contiguous().view(-1)
+    context_lens = context_lens.to(torch.int32).contiguous().view(-1)
     inv_divisor = 1.0 / divisor
     _run_compiled(
         _qsa_logits_layout_launch,
         q,
         compressed_k_cache,
-        page_table,
+        page_table.view(-1),
         token_to_request,
         query_positions,
         context_lens,
         logits,
-        visible_groups,
-        row_starts,
+        visible_groups.view(-1),
+        row_starts.view(-1),
         rows,
         columns,
         compressed_k_cache.shape[0],

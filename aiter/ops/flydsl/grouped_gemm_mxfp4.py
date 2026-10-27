@@ -160,7 +160,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     num_buffers = min(num_buffers, max(1, k_tiles))
     has_bias = 1 if bias is not None else 0
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
-    quant_scale_tensor = out if quant_scale is None else quant_scale.view(torch.uint8)
+    # These tensor arguments only supply base addresses, so normalize their
+    # ranks without specializing the compiled callable on buffer shapes.
+    quant_scale_tensor = (
+        out if quant_scale is None else quant_scale.view(torch.uint8)
+    ).view(-1)
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage1_act)
@@ -205,7 +209,7 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"{stage2_scatter.combine_quant_bits} needs N % {n_align} == 0 to "
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
-    ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+    ep_row_map_tensor = (ep_row_map if ep_row_map is not None else out).view(-1)
     gemm_spec = (
         K,
         tile_m,
@@ -246,11 +250,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
-        out,
+        out.view(-1),
         ptr_arg(a),
         ptr_arg(w),
-        a_scales.view(torch.int32),
-        w_scales.view(torch.int32),
+        a_scales.view(torch.int32).view(-1),
+        w_scales.view(torch.int32).view(-1),
         contiguous_m,
         stream,
         N,
