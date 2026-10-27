@@ -18,29 +18,29 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.ops.flydsl.dcp_mailbox.combine import TAG_SLOTS, _finish
-from aiter.ops.flydsl.dcp_mailbox.ops import (
+from aiter.ops.flydsl.dcp_mailbox.common import (
+    KernelAbi,
     bf2_f32,
     fp8_pack4,
+    key_tuple,
     ld_dev,
     load_ptr64,
+    pair_layout,
+    peer_bases,
     rsrc,
     uniform,
 )
 from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
-from aiter.ops.flydsl.dcp_mailbox.plan import (
-    KernelAbi,
-    key_tuple,
-    pair_layout,
-    source_digest,
-)
-from aiter.ops.flydsl.dcp_mailbox.ranks import peer_bases
-from aiter.ops.flydsl.dcp_mailbox.sync import Mailbox, preg, shift
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.communication_ops_utils import (
+    TaggedMailbox,
+    tagged_peer_address,
+    tagged_shift,
+)
 
 THREADS = 128
 FP8_MAX = 448.0
 
-_SOURCES = source_digest(".")
 _STREAM = fx.Stream(None)
 _BUILDS: dict = {}
 
@@ -95,7 +95,7 @@ def build(key: GatherBuild):
     nblk = key.tokens * hl
     lay = peer_layout(n, mt, hl, w)
     half = peer_bytes(n, mt, hl, w) // 2
-    keyed = key_tuple(key, _SOURCES)
+    keyed = key_tuple(key)
     name = (
         f"aiter_dcp_qgather_t{key.tokens}_n{n}_h{hl}_w{w}_p{key.pad_heads}"
         f"_m{mt}_q{key.nope}_f{key.fold}x{key.qlen}_s{key.phase}"
@@ -121,13 +121,15 @@ def build(key: GatherBuild):
         b = bid // hl
         lh = bid % hl
         e = uniform(fx.Int32(ld_dev(state, 0)))
-        mb = Mailbox((e % (1 << 22)) * TAG_SLOTS)
+        mb = TaggedMailbox((e % (1 << 22)) * TAG_SLOTS)
         put_words, poll = mb.put_words, mb.poll
         flip = fx.Int64(e % 2) * half
         bases = peer_bases(peers, n)
         own = load_ptr64(peers, rank)
-        to = [shift(preg(p, lay["q"][0], "q"), flip) for p in bases]
-        mine = shift(preg(own, lay["q"][0], "q"), flip)
+        to = [
+            tagged_shift(tagged_peer_address(peer, lay["q"][0]), flip) for peer in bases
+        ]
+        mine = tagged_shift(tagged_peer_address(own, lay["q"][0]), flip)
         slot = (rank * mt + b) * hl + lh
         j = fx.min(tid, w // 2 - 1) * 2
         push = key.phase != 2
