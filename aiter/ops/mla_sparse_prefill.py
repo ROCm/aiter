@@ -266,6 +266,7 @@ _KV_SPLIT_FIT = {
     ("gfx950", "v4_a16w16_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.012),
     ("gfx950", "v4_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 55, 0.022),
     ("gfx950", "v4_a8w8_16mx8_32nx1"): _SplitFit(128, 32, 1, _ANY_COUNT, 0, 0.0095),
+    ("gfx950", "v41_a8w8_16mx1_16nx4"): _SplitFit(16, 64, 2, _ANY_COUNT, 80, 0.046),
     ("gfx950", "v41_a8w8_16mx4_64nx1"): _SplitFit(64, 64, 1, _ANY_COUNT, 90, 0.025),
     ("gfx1250", "v4_a16w16_16mx1_16nx4"): _SplitFit(16, 64, 1, _ANY_COUNT, 0, 0.10),
     ("gfx1250", "v4_a16w16_32mx1_16nx4"): _SplitFit(32, 64, 1, _ANY_COUNT, 200, 0.06),
@@ -282,7 +283,7 @@ def _opus_split_fit(gfx: str, kernel: str, h: int) -> _SplitFit:
     if gfx == "gfx1250":
         tile = "16mx1_16nx4" if h <= 16 else "32mx1_16nx4" if h <= 32 else "16mx4_64nx1"
     elif kernel == "v41_a8w8":
-        tile = "16mx4_64nx1"
+        tile = "16mx1_16nx4" if h <= 16 else "16mx4_64nx1"
     else:
         tile = "16mx1_16nx4" if h <= 32 else "16mx8_32nx1"
     return _KV_SPLIT_FIT[(gfx, f"{kernel}_{tile}")]
