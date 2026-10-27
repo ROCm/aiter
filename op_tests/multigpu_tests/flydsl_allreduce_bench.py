@@ -585,6 +585,61 @@ def fused_reference(total: torch.Tensor, residual, weight, eps: float = RMS_EPS)
     out = (acc * rstd * weight.float()).to(torch.bfloat16)
     return out, res_out
 
+FUSED_DEFAULT_LADDER_HIDDENS = (2048, 4096, 5120, 7168, 8192)
+# The payload an unbounded dispatch window is cut at.
+FUSED_WALK_TOP_BYTES = 64 << 20
+
+
+@dataclass(frozen=True)
+class FusedCase:
+    """One shape of the fused verify walk, and the shipped rung it runs."""
+
+    hidden: int
+    tokens: int
+    rung: object
+    top: bool
+
+
+def fused_ladder_cases(
+    family: str, world_size: int, link: str, *, top_bytes: int = FUSED_WALK_TOP_BYTES
+) -> list[FusedCase]:
+    """Get the shapes and corresponding rungs from the shipped policy.
+    
+    For a given algorithm, the FamilyPolicy gives the windows inside which the 
+    algorithm is applied. From the policy ladders, we get what instance is applied on 
+    a given slice of this window.
+    """
+    from aiter.ops.flydsl import allreduce_policy as fp
+
+    alg = fp.AllReduceAlgorithm(family)
+    window = fp.resolve_fused_policy(world_size=world_size, link=link).window(
+        alg, quantized=family != "oneshot"
+    )
+    if window is None:
+        return []
+    lo, hi = window.inclusive_range()
+    hi = min(hi, top_bytes)
+    kw = {"world_size": world_size, "link": link}
+    ladder_of = {
+        "oneshot": fp.fused_oneshot_ladder,
+        "mesh": fp.fused_mesh_st_ladder,
+        "ring": fp.fused_ring_st_ladder,
+    }[family]
+    hiddens = sorted({*fp.fused_ladder_hiddens(**kw), *FUSED_DEFAULT_LADDER_HIDDENS})
+    cases = []
+    for hidden in hiddens:
+        row = hidden * 2
+        ladder = ladder_of(**kw, hidden=hidden)
+        ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi]
+        for rung, end in zip(ladder, ends):
+            first = -(-max(lo, rung.min_bytes, 1) // row) * row
+            last = min(hi, end) // row * row
+            if first > last:
+                continue
+            for nbytes in sorted({first, last}):
+                cases.append(FusedCase(hidden, nbytes // row, rung, nbytes == last))
+    return cases
+
 
 # ``ar_rmsnorm``: the exact stock fused paths, in the order each spawn captures
 # them. ``cdr_fused_*`` is ``CustomAllreduce``'s fused kernel at both stage

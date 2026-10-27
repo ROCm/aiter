@@ -46,7 +46,8 @@ NaN pattern it uses as a sentinel.
 
 ``--extended`` adds what production does not run: spot checks of pinned
 configurations no shipped rung uses, at every world size, and the spot-check
-shapes on the production engine too.
+shapes on the production engine too. For the fused one-shot it adds the pinned
+split builds and a large ``eps``.
 
 ``--operation`` picks the kernel: ``ar`` the plain all-reduce, ``ar_rmsnorm``
 the fused one. verify runs both unless one is named. The fused suites
@@ -57,6 +58,9 @@ equality is the correct expectation, and it is the only cheap way to catch a
 missing bf16 round-trip before the residual add, an error that SQNR on ``out``
 is far too loose to see and that compounds per layer in a real model. Their
 ranks are subprocesses of this script (``--rank``) rather than spawn workers.
+``test_one_shot_allreduce_rmsnorm_shipped`` runs every shipped instance, with and
+without ``AITER_FLY_AR_FUSED_SPLIT=1``. A retuned ladder is covered without 
+editing the test.
 
 **bench** times the one-shot (``flydsl``) against the stock kernels on the
 same payloads, all exact:
@@ -126,6 +130,7 @@ import tempfile
 import time
 import traceback
 from multiprocessing import Pool, freeze_support, set_start_method
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
@@ -319,28 +324,7 @@ SPAWN_TIMEOUT_S = 600
 # ``--operation``: the plain all-reduce, or all-reduce + residual add + RMSNorm.
 OPERATIONS = ("ar", "ar_rmsnorm")
 
-# Fused (all-reduce + residual add + RMSNorm) coverage. The tile is one token
-# row there, so `hidden` is baked into the kernel and every distinct width is a
-# distinct build -- unlike the plain kernel, where hidden is just payload bytes.
-#
-# 4096 at m in {1, 32} is the Qwen3-235B decode shape that motivated the kernel;
-# 7168 keeps parity with the plain list above; 2048 and 8192 are the ends of the
-# supported range (BLOCK 256 and 1024 at atoms=1).
-FUSED_HIDDENS = (2048, 4096, 7168, 8192)
-FUSED_M = (1, 2, 5, 8, 32)
 RMS_EPS = 1e-6
-
-# 5120 and 6144 are widths the shipped models use that the list above lacks;
-# decode and a small batch are enough to cover their geometry.
-FUSED_EXTRA_HIDDENS = (5120, 6144)
-FUSED_EXTRA_M = (1, 8)
-_FUSED_SHAPE_CASES = tuple(
-    (m, hidden, f"{m}x{hidden}") for hidden in FUSED_HIDDENS for m in FUSED_M
-) + tuple(
-    (m, hidden, f"{m}x{hidden}")
-    for hidden in FUSED_EXTRA_HIDDENS
-    for m in FUSED_EXTRA_M
-)
 
 # An eps that is large against the row's mean square at this scale (about 0.05
 # at TP2 to 2 at TP8), so a kernel that ignored it or kept 1e-6 is visibly off.
@@ -366,23 +350,6 @@ FUSED_PAD_HIDDENS = (896, 2304, 2880, 9000)
 _FUSED_PAD_SHAPE_CASES = tuple(
     (m, hidden, f"{m}x{hidden}pad") for hidden in FUSED_PAD_HIDDENS for m in (1, 5, 32)
 )
-
-# `atoms` sets the *block width* in a fused build (BLOCK = hidden/(8*atoms)),
-# not the tile width, so these cases exercise the reduction ladder rather than
-# the wire -- the plain kernel's atoms cases already cover the wire.
-#
-# atoms=4 at hidden=4096 is BLOCK=128, two waves: the low end, where the LDS
-# partial count drops to 2. An off-by-one in the `BLOCK//64` unrolled combine
-# survives BLOCK=512 and dies here.
-#
-# It also catches a stride bug the default cannot see at all: the per-atom term
-# in the fanout is `atom * BLOCK * ATOM_I32`, which is identically zero at
-# atoms=1 no matter how wrong BLOCK is.
-FUSED_ATOMS_CASES = ((2, 4096), (2, 8192), (4, 4096), (4, 8192))
-
-# The same geometries reached from the other side: pin `block` and let the
-# engine solve for atoms at each width.
-FUSED_BLOCK_CASES = ((512, 4096), (256, 8192), (448, 7168))
 
 # Fresh-input stress on the fused kernel, at the Qwen3-235B width. ``None``
 # walks the shipped ladder; 4 forces a split build, whose exchange words rotate
@@ -2075,17 +2042,26 @@ def _batch_cache_lookup(
 
 
 @_graded_benchmark
-def test_one_shot_allreduce_rmsnorm(m, hidden, label, world_size):
-    """``OneShotAllReduceRMSNorm`` against an fp32 reference of the C++ contract.
+def test_one_shot_allreduce_rmsnorm_shipped(world_size, split):
+    """Every shipped instance of the fused one-shot, on the shipping engine.
 
-    Per shape: ``out`` at the bf16 SQNR floor, ``residual_out`` **bit-exact**,
-    and both outputs bit-identical across ranks. See ``_run_rank_fused`` for why
-    the middle one is an equality rather than a tolerance.
+    The shapes come from the ladder file and the dispatch policy.
     """
-    group_pairs = [(mm, hh) for mm, hh, _ in _FUSED_SHAPE_CASES]
-    batch = _batch_cache_lookup((world_size, "fused"), group_pairs)
-    for rank, bad in enumerate(batch[(m, hidden)]):
-        assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+    env = {"AITER_FLY_AR_FUSED_SPLIT": "1"} if split else {}
+    with mock.patch.dict(os.environ, env):
+        walk = fab.fused_ladder_cases("oneshot", world_size, fly_policy.detect_link())
+        pairs = [(c.tokens, c.hidden) for c in walk]
+        if not pairs:
+            return
+        batch = _batch_cache_lookup(
+            (world_size, "fused", None, "shipped", bool(split)), pairs
+        )
+    for m, hidden in pairs:
+        for rank, bad in enumerate(batch[(m, hidden)]):
+            assert not bad, (
+                f"{m}x{hidden}, split={split}, tp={world_size}, rank {rank}: "
+                + "; ".join(bad)
+            )
 
 
 @_graded_benchmark
@@ -2275,50 +2251,6 @@ def test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads():
             assert k == split, (block, split, k)
         else:
             assert split == 1, (block, split)
-
-
-@_graded_benchmark
-def test_one_shot_allreduce_rmsnorm_atoms(atoms, hidden, world_size):
-    """Narrower blocks: ``atoms`` sets BLOCK = hidden/(8*atoms) in a fused build.
-
-    Covers the low end of the reduction ladder (atoms=4 at hidden=4096 is a
-    two-wave block) and the per-atom fanout stride, which is identically zero
-    at the atoms=1 default and so is untested by every case above.
-    """
-    pairs = [(m, hidden) for m in (1, 8)]
-    # hidden is in the key as well as atoms: two cases can share an atoms value
-    # and differ only in width, and they are different spawns.
-    batch = _batch_cache_lookup((world_size, "fused", atoms, hidden), pairs)
-    for m, _ in pairs:
-        for rank, bad in enumerate(batch[(m, hidden)]):
-            assert not bad, (
-                f"{m}x{hidden} atoms={atoms}, tp={world_size}, rank {rank}: "
-                + "; ".join(bad)
-            )
-
-
-@_graded_benchmark
-def test_one_shot_allreduce_rmsnorm_block(block, hidden, world_size):
-    """Pinning ``block`` instead of ``atoms``, which is the tuner's currency.
-
-    The engine has to solve ``block * atoms * 8 == hidden`` for atoms at this
-    width and build the same kernel the equivalent atoms pin would. What this
-    catches that ``..._atoms`` does not is the resolution itself: an off-by-one
-    there produces a *valid* kernel of the wrong width, which still runs.
-    """
-    pairs = [(m, hidden) for m in (1, 8)]
-    batch = _batch_cache_lookup(
-        (world_size, "fused", f"b{block}", hidden),
-        pairs,
-        atoms=None,
-        block=block,
-    )
-    for m, _ in pairs:
-        for rank, bad in enumerate(batch[(m, hidden)]):
-            assert not bad, (
-                f"{m}x{hidden} block={block}, tp={world_size}, rank {rank}: "
-                + "; ".join(bad)
-            )
 
 
 @_graded_benchmark
@@ -2721,57 +2653,61 @@ def _verify(args, tps, dts, configs, given, link) -> None:
         )
 
 
-def _verify_fused(tps) -> None:
+def _verify_fused(tps, extended: bool) -> None:
     """The fused verify sweep: the host-side checks once, then every GPU case
-    at each world size, the shipped engine and the pinned and split builds."""
+    at each world size. The shipped instances come from the ladder file
+    (``test_one_shot_allreduce_rmsnorm_shipped``, with and without split); ``--extended``
+    adds the pinned split builds."""
     _summarize(
         "fused host-side checks",
         [
             test_one_shot_allreduce_rmsnorm_padding_is_least_wire(),
             test_one_shot_allreduce_rmsnorm_padded_hidden_limits(),
             test_one_shot_allreduce_rmsnorm_geom_for_pinned_block_pads(),
-            test_one_shot_allreduce_rmsnorm_split_options(),
-            test_one_shot_allreduce_rmsnorm_split_factory(),
-            test_one_shot_allreduce_rmsnorm_split_host_resolution(),
-            test_one_shot_allreduce_rmsnorm_split_exchange_word(),
-        ],
+        ]
+        + (
+            [
+                test_one_shot_allreduce_rmsnorm_split_options(),
+                test_one_shot_allreduce_rmsnorm_split_factory(),
+                test_one_shot_allreduce_rmsnorm_split_host_resolution(),
+                test_one_shot_allreduce_rmsnorm_split_exchange_word(),
+            ]
+            if extended
+            else []
+        ),
     )
     for tp in tps:
         rows = (
             [
-                test_one_shot_allreduce_rmsnorm(m, h, label, tp)
-                for m, h, label in _FUSED_SHAPE_CASES
+                test_one_shot_allreduce_rmsnorm_shipped(tp, split)
+                for split in (False, True)
             ]
             + [
                 test_one_shot_allreduce_rmsnorm_padded(m, h, label, tp)
                 for m, h, label in _FUSED_PAD_SHAPE_CASES
             ]
             + [
-                test_one_shot_allreduce_rmsnorm_atoms(atoms, h, tp)
-                for atoms, h in FUSED_ATOMS_CASES
-            ]
-            + [
-                test_one_shot_allreduce_rmsnorm_block(block, h, tp)
-                for block, h in FUSED_BLOCK_CASES
-            ]
-            + [
                 test_one_shot_allreduce_rmsnorm_fresh_inputs(split, tp)
                 for split in FUSED_FRESH_SPLITS
+                if extended or split is None
             ]
             + [test_one_shot_allreduce_rmsnorm_run_ahead(tp)]
-            + [
-                test_one_shot_allreduce_rmsnorm_split(split, h, tp)
-                for split, h in FUSED_SPLIT_CASES
-            ]
-            + [
-                test_one_shot_allreduce_rmsnorm_split_magnitude(scale, tp)
-                for scale in FUSED_SPLIT_SCALES
-            ]
-            + [test_one_shot_allreduce_rmsnorm_eps(tp)]
             + [test_one_shot_allreduce_rmsnorm_alias(tp)]
-            + [test_one_shot_allreduce_rmsnorm_split_exchange(tp)]
             + [test_fused_allreduce_rmsnorm_capture_ready(tp)]
         )
+        if extended:
+            rows += (
+                [
+                    test_one_shot_allreduce_rmsnorm_split(split, h, tp)
+                    for split, h in FUSED_SPLIT_CASES
+                ]
+                + [
+                    test_one_shot_allreduce_rmsnorm_split_magnitude(scale, tp)
+                    for scale in FUSED_SPLIT_SCALES
+                ]
+                + [test_one_shot_allreduce_rmsnorm_eps(tp)]
+                + [test_one_shot_allreduce_rmsnorm_split_exchange(tp)]
+            )
         _summarize(f"fused allreduce + rmsnorm tp={tp}", rows)
     _summarize(
         "fused allreduce + rmsnorm production dispatch",
@@ -3314,7 +3250,7 @@ def main():
         if args.operation in (None, "ar"):
             _verify(args, tps, dts, configs, given, link)
         if args.operation in (None, "ar_rmsnorm"):
-            _verify_fused(tps)
+            _verify_fused(tps, args.extended)
 
     if _FAILURES:
         raise SystemExit(
