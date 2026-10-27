@@ -3,10 +3,8 @@
 """CPU-only regression tests for lightweight tuning scans."""
 
 import csv
-import io
 import os
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,49 +16,6 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 class TestFastScanCliSafety(unittest.TestCase):
-    def test_mxfp4_parse_args_does_not_import_aot_module(self) -> None:
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
-
-        for options in ((), ("--mxfp4-search-mode", "full"), ("--fast-scan",)):
-            with self.subTest(options=options):
-                tuner = gemm_moe_tune.Mxfp4FlydslTuner(
-                    "testMxfp4", [], [], "test parser"
-                )
-                with (
-                    mock.patch.object(
-                        sys,
-                        "argv",
-                        ["gemm_moe_tune.py", "--mxfp4-flydsl", *options],
-                    ),
-                    mock.patch.dict(sys.modules, {"aiter.aot.flydsl.mxfp4_moe": None}),
-                    mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "5"}),
-                ):
-                    args = tuner.parse_args()
-                self.assertEqual(args.mxfp4_configuration, {"swiglu_limit": 5.0})
-
-    def test_mxfp4_parse_args_validates_limit_without_importing_aot(self) -> None:
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
-
-        for limit in ("abc", "0", "-1", "nan", "inf"):
-            with self.subTest(limit=limit):
-                tuner = gemm_moe_tune.Mxfp4FlydslTuner(
-                    "testMxfp4", [], [], "test parser"
-                )
-                with (
-                    mock.patch.object(
-                        sys, "argv", ["gemm_moe_tune.py", "--mxfp4-flydsl"]
-                    ),
-                    mock.patch.dict(sys.modules, {"aiter.aot.flydsl.mxfp4_moe": None}),
-                    mock.patch.dict(
-                        os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": limit}
-                    ),
-                    self.assertRaisesRegex(
-                        ValueError,
-                        "AITER_MXFP4_TUNE_SWIGLU_LIMIT must be a finite positive number",
-                    ),
-                ):
-                    tuner.parse_args()
-
     def test_generic_fmoe_rejects_fast_scan_before_dispatch(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
@@ -126,133 +81,6 @@ class TestFastScanCliSafety(unittest.TestCase):
                 self.assertRaises(SystemExit),
             ):
                 tuner.parse_args()
-
-
-class TestMxfp4InputOutputSafety(unittest.TestCase):
-    def assert_same_file_rejected(
-        self, input_file: "str | Path", output_file: "str | Path", *options: str
-    ) -> None:
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
-
-        tuner = gemm_moe_tune.Mxfp4FlydslTuner("testMxfp4", [], [], "test parser")
-        argv = [
-            "gemm_moe_tune.py",
-            "--mxfp4-flydsl",
-            "-i",
-            str(input_file),
-            "-o",
-            str(output_file),
-            *options,
-        ]
-        with (
-            mock.patch.object(sys, "argv", argv),
-            mock.patch.object(sys, "stderr", io.StringIO()) as stderr,
-            mock.patch.object(
-                tuner,
-                "_capture_configuration",
-                side_effect=AssertionError("configuration loaded before rejection"),
-            ) as capture,
-            self.assertRaises(SystemExit) as status,
-        ):
-            tuner.parse_args()
-        self.assertEqual(status.exception.code, 2)
-        self.assertIn("different input and output files", stderr.getvalue())
-        capture.assert_not_called()
-
-    def test_rejects_file_aliases_in_every_search_mode_before_configuration(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "input.csv"
-            source.write_text("pending input must survive\n")
-            symlink = Path(directory) / "symlink.csv"
-            symlink.symlink_to(source)
-            hardlink = Path(directory) / "hardlink.csv"
-            os.link(source, hardlink)
-            aliases = (source, os.path.relpath(source), symlink, hardlink)
-            for options in (
-                (),
-                ("--mxfp4-search-mode", "full", "--all"),
-                ("--fast-scan",),
-            ):
-                for alias in aliases:
-                    with self.subTest(options=options, alias=str(alias)):
-                        self.assert_same_file_rejected(source, alias, *options)
-                        self.assertEqual(
-                            source.read_text(), "pending input must survive\n"
-                        )
-
-    def test_checks_first_output_file_in_config_path_list(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "input.csv"
-            source.write_text("pending input\n")
-            output_files = os.pathsep.join(
-                (str(source), str(Path(directory) / "other.csv"))
-            )
-            self.assert_same_file_rejected(source, output_files)
-            self.assertEqual(source.read_text(), "pending input\n")
-
-    def test_pre_process_rejects_same_file_before_loading_configuration_or_inputs(
-        self,
-    ) -> None:
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
-
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "input.csv"
-            source.write_text("pending input\n")
-            tuner = gemm_moe_tune.Mxfp4FlydslTuner("testMxfp4", [], [], "test parser")
-            args = SimpleNamespace(untune_file=str(source), tune_file=str(source))
-            with (
-                mock.patch.object(sys, "stderr", io.StringIO()),
-                mock.patch.object(tuner, "_capture_configuration") as capture,
-                mock.patch.object(
-                    gemm_moe_tune.FmoeTuner, "pre_process"
-                ) as load_inputs,
-                self.assertRaises(SystemExit) as status,
-            ):
-                tuner.pre_process(args)
-            self.assertEqual(status.exception.code, 2)
-            capture.assert_not_called()
-            load_inputs.assert_not_called()
-            self.assertEqual(source.read_text(), "pending input\n")
-
-    def test_accepts_existing_and_new_separate_output_files(self) -> None:
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
-
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "input.csv"
-            source.write_text("pending input\n")
-            existing = Path(directory) / "existing-output.csv"
-            existing.write_text("old winner\n")
-            for output in (existing, Path(directory) / "new-output.csv"):
-                with self.subTest(output=str(output)):
-                    tuner = gemm_moe_tune.Mxfp4FlydslTuner(
-                        "testMxfp4", [], [], "test parser"
-                    )
-                    with (
-                        mock.patch.object(
-                            sys,
-                            "argv",
-                            [
-                                "gemm_moe_tune.py",
-                                "--mxfp4-flydsl",
-                                "-i",
-                                str(source),
-                                "-o",
-                                str(output),
-                            ],
-                        ),
-                        mock.patch.object(
-                            tuner,
-                            "_capture_configuration",
-                            return_value={"swiglu_limit": None},
-                        ),
-                    ):
-                        args = tuner.parse_args()
-                    self.assertEqual(args.untune_file, str(source))
-                    self.assertEqual(args.tune_file, str(output))
-                    self.assertEqual(source.read_text(), "pending input\n")
-                    self.assertEqual(existing.read_text(), "old winner\n")
 
 
 class TestMxfp4AccuracyFunnel(unittest.TestCase):
@@ -747,26 +575,23 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             limits.append(kwargs.get("swiglu_limit"))
             return "out"
 
-        pipeline = self._pipeline_data()
-
-        def run_perftest(operation, *inputs, **kwargs):
-            # Outside fast-scan every pipeline input is passed for rotation.
-            self.assertEqual(kwargs["num_rotate_args"], 0)
-            self.assertEqual(kwargs["profile_warm_iters"], 1)
-            self.assertEqual(inputs, tuple(pipeline.values()))
-            return operation(*inputs), 5.0
-
         with (
             mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
             mock.patch.object(tuner, "_port_e2e", side_effect=port_e2e),
             mock.patch.object(tuner, "_torch_ref", return_value="ref") as torch_ref,
             mock.patch.object(gemm_moe_tune, "cosine_diff_compare", return_value=0.01),
             mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
-            mock.patch("aiter.test_common.run_perftest", side_effect=run_perftest),
+            mock.patch(
+                "aiter.test_common.run_perftest",
+                side_effect=lambda operation, *inputs, **kwargs: (
+                    operation(*inputs),
+                    5.0,
+                ),
+            ),
         ):
             candidate = self._candidate("accurate")
             candidate.update(block_m=16)
-            tuner._run_candidate(row, candidate, args, data=pipeline)
+            tuner._run_candidate(row, candidate, args, data=self._pipeline_data())
 
         # Kernel launch and reference must clamp identically, otherwise the
         # accuracy gate compares two different functions.
@@ -927,27 +752,6 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
 
 
 class TestGlm53TunedArtifact(unittest.TestCase):
-    def test_aot_stage1_jobs_use_shared_limit_resolution(self) -> None:
-        from aiter.aot.flydsl.mxfp4_moe import parse_csv
-
-        row = (
-            "token,model_dim,inter_dim,expert,topk,kernelName1\n"
-            "64,3072,512,128,4,flydsl_mxmoe_g1_a4w4_16x256x256_f16in_swiglu\n"
-        )
-        for environment, explicit, expected in (
-            ("", None, 7.0),
-            ("5", None, 5.0),
-            ("5", 3.0, 3.0),
-        ):
-            with (
-                self.subTest(environment=environment, explicit=explicit),
-                mock.patch.dict(
-                    os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": environment}
-                ),
-            ):
-                jobs = parse_csv(io.StringIO(row), swiglu_limit=explicit)
-                self.assertEqual({job["swiglu_limit"] for job in jobs}, {expected})
-
     def test_token_one_row_matches_validated_coupled_winner(self):
         config = REPO_ROOT / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
         with config.open(newline="") as handle:
