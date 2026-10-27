@@ -1,18 +1,44 @@
 """Prefill causal conv1d (fused split q/k/v) — Triton ``@triton.jit`` kernels.
 
-Two interchangeable kernels: a 1D per-token kernel (serial token loop, any conv
-width) and a 2D-tiled kernel (vectorized over feature/token, conv width in
-{2, 3, 4}). Host-side launch wrappers live in the public namespace
+Three kernels: a 1D per-token kernel (serial token loop, any conv
+width), a 2D-tiled kernel (vectorized over feature/token, conv width in
+{2, 3, 4}) and a sliding-window kernel for x with unit channel stride (conv width 4).
+Host-side launch wrappers live in the public namespace
 ``aiter.ops.triton.gated_delta_net.causal_conv1d_prefill``.
 """
 
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.activation import (
+    _silu_exp2,
+    _silu_exp2_fast,
+)
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
+from aiter.ops.triton._triton_kernels.common.segment_tile import _lower_bound
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 PAD_SLOT_ID = -1
 
+_causal_conv1d_fwd_split_qkv_repr = make_kernel_repr(
+    "_causal_conv1d_fwd_split_qkv_kernel",
+    ["KERNEL_WIDTH", "BLOCK_M", "BLOCK_N", "HAS_BIAS", "SILU_ACTIVATION"],
+)
+_causal_conv1d_fwd_split_qkv_tile_repr = make_kernel_repr(
+    "_causal_conv1d_fwd_split_qkv_tile_kernel",
+    [
+        "KERNEL_WIDTH",
+        "BLOCK_M",
+        "BLOCK_N",
+        "HAS_BIAS",
+        "SILU_ACTIVATION",
+        "IS_APC_ENABLED",
+        "QKV_ALIGNED",
+    ],
+)
 
-@triton.jit()
+
+@triton.jit(repr=_causal_conv1d_fwd_split_qkv_repr)
 def _causal_conv1d_fwd_split_qkv_kernel(
     x_ptr,
     w_ptr,
@@ -282,7 +308,7 @@ def _causal_conv1d_fwd_split_qkv_kernel(
             col2 = matrix_x
 
         if SILU_ACTIVATION:
-            acc = acc / (1 + tl.exp(-acc))
+            acc = _silu_exp2(acc)
 
         global_token_idx = sequence_start_index + token_offset + idx_token
         mask_feat = (idx_token < segment_len) & (idx_feats < dim)
@@ -313,7 +339,7 @@ def _causal_conv1d_fwd_split_qkv_kernel(
 # batch_ptr / token_chunk_offset_ptr; grid.y is the feature block.
 
 
-@triton.jit()
+@triton.jit(repr=_causal_conv1d_fwd_split_qkv_tile_repr)
 def _causal_conv1d_fwd_split_qkv_tile_kernel(
     x_ptr,
     w_ptr,
@@ -360,6 +386,7 @@ def _causal_conv1d_fwd_split_qkv_tile_kernel(
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    QKV_ALIGNED: tl.constexpr,
 ):
     """2D vectorized causal conv1d with conv state update and APC support."""
     k_start_dim = k_dim_size
@@ -702,19 +729,39 @@ def _causal_conv1d_fwd_split_qkv_tile_kernel(
         acc += w0[:, None] * x_s1 + w1[:, None] * x_t
 
     if SILU_ACTIVATION:
-        exp_neg = tl.math.exp2(acc * (-1.4426950408889634))
-        rcp = tl.inline_asm_elementwise(
-            "v_rcp_f32 $0, $1",
-            "=v,v",
-            args=[1.0 + exp_neg],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-        acc = acc * rcp
+        acc = _silu_exp2_fast(acc)
 
     token_pos = sequence_start_index + token_global
     valid_token_2d = valid_token[None, :]
+
+    if QKV_ALIGNED:
+        # Block is inside one of q, k or v: one store
+        block_start = tl.program_id(1) * BLOCK_N
+        if block_start < k_start_dim:
+            tl.store(
+                query_ptr
+                + token_pos[None, :] * query_token_stride
+                + idx_feats[:, None] * query_dim_stride,
+                acc,
+                mask=valid_token_2d,
+            )
+        elif block_start < v_start_dim:
+            tl.store(
+                key_ptr
+                + token_pos[None, :] * key_token_stride
+                + (idx_feats - k_start_dim)[:, None] * key_dim_stride,
+                acc,
+                mask=valid_token_2d,
+            )
+        else:
+            tl.store(
+                value_ptr
+                + token_pos[None, :] * value_token_stride
+                + (idx_feats - v_start_dim)[:, None] * value_dim_stride,
+                acc,
+                mask=valid_token_2d,
+            )
+        return
 
     q_feat_idx = idx_feats
     is_q_block = idx_feats < k_start_dim
@@ -742,3 +789,275 @@ def _causal_conv1d_fwd_split_qkv_tile_kernel(
         + v_feat_idx[:, None] * value_dim_stride
     )
     tl.store(v_ptrs, acc, mask=valid_token_2d & is_v_block[:, None])
+
+
+@triton.jit
+def _conv_taps(w_ptr, c0, BD: tl.constexpr):
+    # 4 taps of channels c0 .. c0 + BD - 1 as [1, BD] fp32 rows
+    wt = tl.load(
+        w_ptr + (c0 + tl.arange(0, BD))[:, None] * 4 + tl.arange(0, 4)[None, :]
+    ).to(tl.float32)
+    even, odd = tl.split(tl.reshape(wt, [BD, 2, 2]))
+    w0, w2 = tl.split(even)
+    w1, w3 = tl.split(odd)
+    return w0[None, :], w1[None, :], w2[None, :], w3[None, :]
+
+
+@triton.jit
+def _window_row(
+    xs,
+    i: tl.constexpr,
+    w0,
+    w1,
+    w2,
+    w3,
+    bias,
+    HAS_BIAS: tl.constexpr,
+    SILU: tl.constexpr,
+):
+    # Output i of each run from window rows i .. i + 3
+    y = tl.fma(
+        w3,
+        xs[i + 3].to(tl.float32),
+        tl.fma(
+            w2,
+            xs[i + 2].to(tl.float32),
+            tl.fma(w1, xs[i + 1].to(tl.float32), w0 * xs[i].to(tl.float32)),
+        ),
+    )
+    if HAS_BIAS:
+        y += bias
+    if SILU:
+        y = _silu_exp2_fast(y)
+    return y
+
+
+@triton.jit
+def _window_sequence_heads(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    st_ptr,
+    ci_ptr,
+    hi_ptr,
+    qsl_ptr,
+    out_ptr,
+    s0,
+    n_seq,
+    stride_x,
+    s_seq,
+    s_dim,
+    s_tok,
+    pad_slot_id,
+    c0,
+    o_seg,
+    W,
+    cs,
+    SB: tl.constexpr,
+    BD: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    SILU: tl.constexpr,
+):
+    """First 3 outputs and new conv state of sequences s0 .. s0 + SB - 1"""
+    seq = s0 + tl.arange(0, SB)
+    in_range = seq < n_seq
+    # Load sequence scalars first, then state and x rows
+    a = tl.load(qsl_ptr + seq, mask=in_range, other=0)
+    L = tl.load(qsl_ptr + seq + 1, mask=in_range, other=0) - a
+    slot = tl.load(ci_ptr + seq, mask=in_range, other=pad_slot_id)
+    init = tl.load(hi_ptr + seq, mask=in_range, other=0).to(tl.int1)
+    live = in_range & (L > 0) & (slot != pad_slot_id)
+    cl = tl.arange(0, BD)
+    cv = (c0 + cl)[None, :]
+    st_b = st_ptr + slot.to(tl.int64)[:, None] * s_seq + cv * s_dim
+    # Read old state before any store: short sequences shift it
+    mh = (init & live)[:, None]
+    h0 = tl.load(st_b, mask=mh, other=0.0)
+    h1 = tl.load(st_b + s_tok, mask=mh, other=0.0)
+    h2 = tl.load(st_b + 2 * s_tok, mask=mh, other=0.0)
+    xr = x_ptr + a.to(tl.int64)[:, None] * stride_x + cv
+    m0 = live[:, None]
+    m1 = (live & (L > 1))[:, None]
+    m2 = (live & (L > 2))[:, None]
+    m3 = (live & (L >= 3))[:, None]
+    x0 = tl.load(xr, mask=m0, other=0.0)
+    x1 = tl.load(xr + stride_x, mask=m1, other=0.0)
+    x2 = tl.load(xr + 2 * stride_x, mask=m2, other=0.0)
+    tail = xr + (L - 3)[:, None] * stride_x
+    t0 = tl.load(tail, mask=m3, other=0.0)
+    t1 = tl.load(tail + stride_x, mask=m3, other=0.0)
+    t2 = tl.load(tail + 2 * stride_x, mask=m3, other=0.0)
+    a0, a1, a2, a3 = _conv_taps(w_ptr, c0, BD)
+    f0 = h0.to(tl.float32)
+    f1 = h1.to(tl.float32)
+    f2 = h2.to(tl.float32)
+    g0 = x0.to(tl.float32)
+    g1 = x1.to(tl.float32)
+    g2 = x2.to(tl.float32)
+    o0 = a0 * f0 + a1 * f1 + a2 * f2 + a3 * g0
+    o1 = a0 * f1 + a1 * f2 + a2 * g0 + a3 * g1
+    o2 = a0 * f2 + a1 * g0 + a2 * g1 + a3 * g2
+    if HAS_BIAS:
+        bb = tl.load(b_ptr + c0 + cl).to(tl.float32)[None, :]
+        o0 += bb
+        o1 += bb
+        o2 += bb
+    if SILU:
+        o0 = _silu_exp2_fast(o0)
+        o1 = _silu_exp2_fast(o1)
+        o2 = _silu_exp2_fast(o2)
+    odt = out_ptr.dtype.element_ty
+    ob = out_ptr + o_seg + a.to(tl.int64)[:, None] * W + cs + cl[None, :]
+    tl.store(ob, o0.to(odt), mask=m0)
+    tl.store(ob + W, o1.to(odt), mask=m1)
+    tl.store(ob + 2 * W, o2.to(odt), mask=m2)
+    # New state: last 3 entries of [old state | x]
+    l2 = (L == 2)[:, None]
+    n0 = tl.where(m3, t0, tl.where(l2, h2, h1))
+    n1 = tl.where(m3, t1, tl.where(l2, x0, h2))
+    n2 = tl.where(m3, t2, tl.where(l2, x1, x0))
+    tl.debug_barrier()
+    sdt = st_ptr.dtype.element_ty
+    tl.store(st_b, n0.to(sdt), mask=m0)
+    tl.store(st_b + s_tok, n1.to(sdt), mask=m0)
+    tl.store(st_b + 2 * s_tok, n2.to(sdt), mask=m0)
+
+
+_causal_conv1d_fwd_split_qkv_window_repr = make_kernel_repr(
+    "_causal_conv1d_fwd_split_qkv_window_kernel",
+    ["KD", "VD", "R", "BC", "BD", "ORDER", "SEQ_VEC", "NUM_XCDS", "HAS_BIAS", "SILU"],
+)
+
+
+@triton.jit(repr=_causal_conv1d_fwd_split_qkv_window_repr)
+def _causal_conv1d_fwd_split_qkv_window_kernel(
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    st_ptr,
+    ci_ptr,
+    hi_ptr,
+    qsl_ptr,
+    out_ptr,
+    n_seq,
+    T,
+    stride_x,
+    s_seq,
+    s_dim,
+    s_tok,
+    pad_slot_id,
+    n_tiles,
+    n_head_programs,
+    KD: tl.constexpr,
+    VD: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    SILU: tl.constexpr,
+    R: tl.constexpr,
+    BC: tl.constexpr,
+    BD: tl.constexpr,
+    ORDER: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    SEQ_VEC: tl.constexpr,
+):
+    """Width-4 causal conv1d with split q/k/v for channel-contiguous x, window kept in registers"""
+    BT: tl.constexpr = R * BC
+    NCB: tl.constexpr = (2 * KD + VD) // BD
+    pid = tl.program_id(0)
+    if pid < n_head_programs:
+        # Head programs: first 3 tokens and conv state of R sequences
+        if pid < tl.cdiv(n_seq, R) * NCB:
+            c0 = (pid % NCB) * BD
+            seg = tl.minimum(c0 // KD, 2)
+            _window_sequence_heads(
+                x_ptr,
+                w_ptr,
+                b_ptr,
+                st_ptr,
+                ci_ptr,
+                hi_ptr,
+                qsl_ptr,
+                out_ptr,
+                (pid // NCB) * R,
+                n_seq,
+                stride_x,
+                s_seq,
+                s_dim,
+                s_tok,
+                pad_slot_id,
+                c0,
+                (seg * T).to(tl.int64) * KD,
+                KD + (seg // 2) * (VD - KD),
+                c0 - seg * KD,
+                R,
+                BD,
+                HAS_BIAS,
+                SILU,
+            )
+        return
+    pid -= n_head_programs
+    if ORDER == 2:
+        # Contiguous tiles per XCD so halo rows stay in one L2
+        pid = remap_xcd(pid, n_tiles * NCB, NUM_XCDS)
+    pid_c = pid % NCB
+    pid_t = pid // NCB
+    tl.assume(stride_x > 0)
+    tl.assume(T > 0)
+
+    t0 = pid_t * BT
+    c0 = pid_c * BD
+    cl = tl.arange(0, BD)
+    rows = tl.arange(0, R) * BC
+
+    sidx = tl.arange(0, SEQ_VEC)
+    starts = tl.load(qsl_ptr + sidx, mask=sidx < n_seq, other=0x3FFFFFFF)
+
+    # Rows clamped to [0, T) so x loads are unmasked
+    xb = x_ptr + c0
+    roff = (t0 + rows - 3) * stride_x
+    last = (T - 1) * stride_x
+    xs = ()
+    for i in tl.static_range(BC + 3):
+        off = tl.minimum(tl.maximum(roff + i * stride_x, 0), last)
+        xs += (tl.load(xb + off[:, None] + cl[None, :]),)
+
+    w0, w1, w2, w3 = _conv_taps(w_ptr, c0, BD)
+    if HAS_BIAS:
+        bias = tl.load(b_ptr + c0 + cl).to(tl.float32)[None, :]
+    else:
+        bias = 0.0
+
+    # Sequences starting in [t0 - 2, t0 + BT) touch this tile
+    if n_seq <= SEQ_VEC:
+        s_lm = tl.sum((starts < t0 - 2).to(tl.int32), 0)
+        s_hi = tl.sum((starts < t0 + BT).to(tl.int32), 0)
+    else:
+        s_lm = _lower_bound(qsl_ptr, n_seq, t0 - 2)
+        s_hi = _lower_bound(qsl_ptr, n_seq, t0 + BT)
+
+    # q, k, v are consecutive [T, KD], [T, KD], [T, VD] blocks of one buffer
+    seg = tl.minimum(c0 // KD, 2)
+    W = KD + (seg // 2) * (VD - KD)
+    o_base = (
+        out_ptr + (seg * T).to(tl.int64) * KD + t0.to(tl.int64) * W + (c0 - seg * KD)
+    )
+    odt = out_ptr.dtype.element_ty
+
+    if (s_hi == s_lm) & (t0 + BT <= T):
+        for i in tl.static_range(BC):
+            y = _window_row(xs, i, w0, w1, w2, w3, bias, HAS_BIAS, SILU)
+            tl.store(o_base + ((rows + i) * W)[:, None] + cl[None, :], y.to(odt))
+    else:
+        # Bit i of run r marks a head token (done by the head programs)
+        bits = tl.zeros([R], dtype=tl.int32)
+        for s in range(s_lm, s_hi):
+            d = tl.load(qsl_ptr + s) - (t0 + rows)
+            m = tl.where(d >= 0, 7 << tl.minimum(d, 31), 7 >> tl.minimum(-d, 31))
+            bits = bits | tl.where((d > -3) & (d < BC), m, 0)
+        for i in tl.static_range(BC):
+            y = _window_row(xs, i, w0, w1, w2, w3, bias, HAS_BIAS, SILU)
+            ok = ((t0 + rows + i) < T) & (((bits >> i) & 1) == 0)
+            tl.store(
+                o_base + ((rows + i) * W)[:, None] + cl[None, :],
+                y.to(odt),
+                mask=ok[:, None],
+            )
