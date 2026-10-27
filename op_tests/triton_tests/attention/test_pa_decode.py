@@ -358,6 +358,12 @@ def test_paged_attn_multi_partition_dispatch(B, H_Q, H_KV, SEQ_LEN, dtype, monke
     )
     if rule is not None:
         expect_v1 = num_partitions <= rule["v1_max_partitions"]
+        busy_min = rule.get("v1_min_programs")
+        if busy_min is not None and B * H_KV >= busy_min:
+            expect_v1 = expect_v1 or num_partitions <= rule["v1_busy_max_partitions"]
+        busy_min = rule.get("v1_min_programs")
+        if busy_min is not None and B * H_KV >= busy_min:
+            expect_v1 = expect_v1 or num_partitions <= rule["v1_busy_max_partitions"]
     else:
         expect_v1 = SEQ_LEN <= 8192 and (num_partitions == 1 or B * H_Q > 512)
     if get_arch() == "gfx950":
