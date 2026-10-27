@@ -855,5 +855,127 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
         self.assertNotIn("swiglu_limit", precompiled[2])
 
 
+class TestFusedStage1QuantizedCompare(unittest.TestCase):
+    """The fused fp4 stage-1 check: codes and e8m0 scales against the reference
+    quantizer."""
+
+    def _quantized(self, x):
+        from aiter import dtypes
+        from aiter.ops.quant import per_1x32_f4_quant
+
+        codes, scales = per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2)
+        return codes, scales
+
+    def _compare(self, ref, res):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        return gemm_moe_tune.quantized_output_compare(ref, res, printLog=False)
+
+    def test_identical_output_passes(self):
+        import torch
+
+        codes, scales = self._quantized(torch.randn(64, 4, 256))
+        self.assertEqual(self._compare(codes, codes.clone()), 0.0)
+        self.assertEqual(self._compare(scales, scales.clone()), 0.0)
+
+    def test_a_few_rounding_flips_pass(self):
+        import torch
+
+        codes, _ = self._quantized(torch.randn(64, 4, 256))
+        flipped = codes.view(torch.uint8).clone()
+        flipped.view(-1)[:50] ^= 0x1
+        err = self._compare(codes, flipped.view(codes.dtype))
+        self.assertGreater(err, 0.0)
+        self.assertLess(err, 1.0)
+
+    def test_systematic_bias_fails(self):
+        import torch
+
+        x = torch.randn(64, 4, 256)
+        codes, scales = self._quantized(x)
+        biased_codes, biased_scales = self._quantized(x * 1.03)
+        self.assertEqual(self._compare(codes, biased_codes), 1.0)
+        self.assertEqual(self._compare(scales, biased_scales), 1.0)
+
+    def test_misplaced_scales_fail(self):
+        import torch
+
+        _, scales = self._quantized(torch.randn(64, 4, 256))
+        flat = scales.view(torch.uint8).reshape(-1)
+        permuted = flat[torch.randperm(flat.numel())].view(scales.dtype)
+        self.assertEqual(self._compare(scales, permuted), 1.0)
+
+    def test_scale_off_by_two_exponents_fails(self):
+        import torch
+
+        _, scales = self._quantized(torch.randn(64, 4, 256))
+        off = scales.view(torch.uint8).clone()
+        off.view(-1)[0] += 2
+        self.assertEqual(self._compare(scales, off.view(scales.dtype)), 1.0)
+
+    def test_unmapped_scale_positions_are_skipped(self):
+        import torch
+
+        from aiter import dtypes
+
+        ref = torch.full((256,), 0xFF, dtype=torch.uint8)
+        ref[:128] = 127
+        res = torch.randint(0, 255, (256,), dtype=torch.uint8)
+        res[:128] = 127
+        self.assertEqual(
+            self._compare(ref.view(dtypes.fp8_e8m0), res.view(dtypes.fp8_e8m0)), 0.0
+        )
+
+    def test_sorted_codes_skip_padding_rows(self):
+        import torch
+
+        from aiter import dtypes
+
+        codes = torch.randint(0, 256, (1000, 64), dtype=torch.uint8)
+        ref = torch.full((1000, 64), float("nan"), dtype=dtypes.fp16)
+        ref[:8] = codes[:8].to(dtypes.fp16)
+        wrong = codes.clone()
+        wrong[:8] = torch.randint(0, 256, (8, 64), dtype=torch.uint8)
+        self.assertEqual(self._compare(ref, wrong), 1.0)
+        padding_garbage = codes.clone()
+        padding_garbage[8:] = 0xAA
+        self.assertEqual(self._compare(ref, padding_garbage), 0.0)
+
+    def test_scale_layout_matches_moe_mxfp4_sort(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("moe_mxfp4_sort needs a GPU")
+        from aiter import dtypes
+        from aiter.utility.fp4_utils import moe_mxfp4_sort
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        token_num, topk, cols = 37, 3, 12
+        routes = [t | (s << 24) for t in range(token_num) for s in range(topk)]
+        routes = torch.tensor(routes, dtype=torch.int32)[torch.randperm(len(routes))]
+        sorted_ids = torch.full((192,), token_num, dtype=torch.int32)
+        sorted_ids[: routes.numel()] = routes
+        sorted_ids = sorted_ids.cuda()
+        num_valid_ids = torch.tensor([routes.numel()], dtype=torch.int32).cuda()
+        scales = torch.randint(
+            0, 255, (token_num * topk, cols), dtype=torch.uint8, device="cuda"
+        ).view(dtypes.fp8_e8m0)
+
+        ours = gemm_moe_tune._sorted_route_scales(
+            scales, sorted_ids, num_valid_ids, token_num, topk
+        ).view(torch.uint8)
+        theirs = moe_mxfp4_sort(
+            scales.view(token_num, topk, cols),
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            block_size=32,
+        ).view(torch.uint8)
+
+        mapped = ours != 0xFF
+        self.assertEqual(int(mapped.sum()), token_num * topk * cols)
+        self.assertTrue(torch.equal(ours[mapped], theirs.reshape(-1)[mapped]))
+
+
 if __name__ == "__main__":
     unittest.main()

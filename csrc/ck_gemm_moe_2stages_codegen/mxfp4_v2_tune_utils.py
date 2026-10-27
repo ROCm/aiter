@@ -282,19 +282,20 @@ def gen(
         .view(E, model_dim, inter_dim)
         .to(dtypes.bf16)
     )
-    ref1 = torch_moe_stage1(
+    ref1_fp32 = torch_moe_stage1(
         a_deq,
         w1_deq,
         w2_deq,
         topk_weights,
         topk_ids,
-        dtype=dtypes.bf16,
+        dtype=dtypes.fp32,
         activation=activation,
         quant_type=QuantType.No,
         doweight=False,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )  # [token, topk, inter]
+    ref1 = ref1_fp32.to(dtypes.bf16)
     ref2 = torch_moe_stage2(
         ref1,
         w1_deq,
@@ -305,24 +306,23 @@ def gen(
         quant_type=QuantType.No,
         doweight=True,
     )  # [token, hidden]
-    ref2_quantized = None
-    if b_dtype == "fp8":
-        a2_ref_q, a2_ref_scale = quant_a(
-            ref1.contiguous().view(token * topk, inter_dim), adtype
-        )
-        a2_ref_deq = _a_deq(
-            a2_ref_q, a2_ref_scale, token * topk, inter_dim, adtype
-        ).view(token, topk, inter_dim)
-        ref2_quantized = torch_moe_stage2(
-            a2_ref_deq,
-            w1_deq,
-            w2_deq,
-            topk_weights,
-            topk_ids,
-            dtype=dtypes.bf16,
-            quant_type=QuantType.No,
-            doweight=True,
-        )
+    # Stage 2 reads the quantized intermediate (populate_v2_intermediate_from_ref).
+    a2_ref_q, a2_ref_scale = quant_a(
+        ref1.contiguous().view(token * topk, inter_dim), adtype
+    )
+    a2_ref_deq = _a_deq(a2_ref_q, a2_ref_scale, token * topk, inter_dim, adtype).view(
+        token, topk, inter_dim
+    )
+    ref2_quantized = torch_moe_stage2(
+        a2_ref_deq,
+        w1_deq,
+        w2_deq,
+        topk_weights,
+        topk_ids,
+        dtype=dtypes.bf16,
+        quant_type=QuantType.No,
+        doweight=True,
+    )
 
     # ---- baseline (aiter mixed_moe stage1) prep ----
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
@@ -377,6 +377,7 @@ def gen(
 
     return {
         "ref1": ref1,
+        "ref1_fp32": ref1_fp32 if adtype == "fp4" else None,
         "ref2": ref2,
         "ref2_quantized": ref2_quantized,
         "topk_ids": topk_ids,
