@@ -18,6 +18,8 @@ from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 # gfx1250, 4 ranks: the Gluon all-reduce + RMSNorm takes decode sizes. RCCL is
 # faster above them (prefill).
 _GLUON_AR_MAX_BYTES = 2 << 20
+# The plain Gluon all-reduce is faster than the custom all-reduce up to 512 KiB.
+_GLUON_PLAIN_AR_MAX_BYTES = 512 << 10
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori")
@@ -83,6 +85,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.qr_comm = reuse_from.qr_comm
             self.symm_mem_comm = reuse_from.symm_mem_comm
             self.gluon_ar = reuse_from.gluon_ar
+            self.gluon_ar_plain = reuse_from.gluon_ar_plain
             return
 
         # lazy import to avoid documentation build error
@@ -130,10 +133,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # ),
             )
 
-        # Inboxes and call counters of the Gluon fused all-reduce + RMSNorm (gfx1250,
-        # 4 ranks). They live as long as the process: destroy() runs after the groups
-        # are gone.
+        # Inboxes and call counters of the Gluon fused all-reduce + RMSNorm and of the
+        # plain Gluon all-reduce (gfx1250, 4 ranks), one set for each op. They live as
+        # long as the process: destroy() runs after the groups are gone.
         self.gluon_ar = None
+        self.gluon_ar_plain = None
         if (
             os.environ.get("AITER_GLUON_FUSED_AR") == "1"
             and self.world_size == 4
@@ -142,6 +146,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from aiter.ops.triton.comms.all_reduce import all_reduce_init
 
             self.gluon_ar = all_reduce_init(self.cpu_group, _GLUON_AR_MAX_BYTES)
+            self.gluon_ar_plain = all_reduce_init(
+                self.cpu_group, _GLUON_PLAIN_AR_MAX_BYTES
+            )
 
         if self.world_size > 1:
             from aiter.dist.device_communicators.quick_all_reduce import (
@@ -229,6 +236,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
+        if (
+            self.gluon_ar_plain is not None
+            and input_.dtype == torch.bfloat16
+            and input_.is_contiguous()
+            and input_.numel() % 4 == 0
+            and input_.data_ptr() % 16 == 0
+            and input_.numel() * 2 <= _GLUON_PLAIN_AR_MAX_BYTES
+        ):
+            from aiter.ops.triton.comms.all_reduce import all_reduce as gluon_all_reduce
+
+            return gluon_all_reduce(input_, self.cpu_group, *self.gluon_ar_plain)
+
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm

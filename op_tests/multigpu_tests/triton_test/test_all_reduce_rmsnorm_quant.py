@@ -10,7 +10,10 @@ import torch.distributed as dist
 
 import aiter
 from aiter import logger
-from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_fused_allreduce_rmsnorm,
+)
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.comms.all_reduce import all_reduce_free, all_reduce_init
@@ -136,6 +139,22 @@ def _dispatch_worker(rank, init_method):
             )
             name = f"rank {rank} dispatch tokens {tokens}"
             failures += _compare(name, outs, *ref, tp.device_group)
+
+        # The plain all-reduce, up to 512 KiB. Bit-exact only on the Gluon path.
+        if tp.device_communicator.gluon_ar_plain is None:
+            failures.append(f"rank {rank}: no Gluon inboxes for the plain all-reduce")
+        for tokens in (1, 8, 128):  # 128 rows at hidden 2048 are 512 KiB
+            gen = torch.Generator(device=device).manual_seed(1000 + tokens)
+            shape = (tokens, HIDDEN)
+            xs = [
+                torch.randn(shape, generator=gen, dtype=torch.bfloat16, device=device)
+                for _ in range(WORLD_SIZE)
+            ]
+            ref = xs[0].float() + xs[1].float() + xs[2].float() + xs[3].float()
+            out = tensor_model_parallel_all_reduce(xs[rank])
+            bad = out.view(torch.int16) != ref.to(torch.bfloat16).view(torch.int16)
+            if bool(bad.any()):
+                failures.append(f"rank {rank} plain dispatch tokens {tokens}: wrong")
     finally:
         aiter.destroy_dist_env()
     return failures
