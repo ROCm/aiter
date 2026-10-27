@@ -945,3 +945,113 @@ if _running_on_gfx950():
     for E, topk in _FUSED_ROUTES:
         _check_fused_cuda_graph_replay_safe(E, topk, 32)
         _check_fused_num_local_tokens(E, topk, 32)
+
+
+def _aux_sort_routes(topk_ids, topk_weights, num_local_tokens=None):
+    """BM16 aux sort (the tuned inline-sort path's sort) at the kimi-k3 shape."""
+    sorted_ids, sorted_weights, sorted_experts, num_valid, moe_buf, _, rev = (
+        fused_moe._adaptive_moe_sort(
+            topk_ids,
+            topk_weights,
+            896,
+            topk_ids.shape[1],
+            16,
+            3584,
+            atomic=True,
+            emit_aux=True,
+            num_local_tokens=num_local_tokens,
+        )
+    )
+    tokens, topk = topk_ids.shape
+    entries = []
+    for block, expert in enumerate(sorted_experts[: int(num_valid[0]) // 16].tolist()):
+        for row in range(block * 16, block * 16 + 16):
+            packed = int(sorted_ids[row])
+            if packed & 0x00FFFFFF != tokens:  # padding slot
+                entries.append(
+                    (
+                        expert,
+                        packed & 0xFFFFFF,
+                        packed >> 24,
+                        float(sorted_weights[row]),
+                    )
+                )
+    for i, slot in enumerate(rev.tolist()):
+        if slot >= 0:
+            assert int(sorted_ids[slot]) == (i // topk) | ((i % topk) << 24)
+    return sorted(entries), num_valid.tolist(), moe_buf, rev
+
+
+def _check_aux_sort_pad_rows_and_num_local_tokens(tokens=32, valid=29, topk=16):
+    """Pad rows routed to -1 and/or past num_local_tokens are not routes: the
+    sort equals one over the valid rows alone, reverse_sorted is -1 for them
+    and the whole output is zeroed (as moe_sorting_opus_fwd does)."""
+    torch.manual_seed(valid)
+    topk_ids = torch.stack(
+        [torch.randperm(896, dtype=torch.int32)[:topk] for _ in range(tokens)]
+    )
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32)
+    ref, ref_valid, _, _ = _aux_sort_routes(
+        topk_ids[:valid].contiguous(), topk_weights[:valid].contiguous()
+    )
+    pad_ids = topk_ids.clone()
+    pad_ids[valid:] = -1
+    count = torch.tensor([valid], dtype=torch.int32)
+    for ids, nlt in ((pad_ids, None), (topk_ids, count), (pad_ids, count)):
+        got, got_valid, moe_buf, rev = _aux_sort_routes(ids, topk_weights, nlt)
+        assert got == ref
+        assert got_valid[0] == ref_valid[0]
+        assert got_valid[1] == (valid if nlt is not None else tokens)
+        assert (rev[valid * topk :] == -1).all()
+        assert (moe_buf == 0).all()
+
+
+def _check_inline_sort_accepts_num_local_tokens():
+    """num_local_tokens is not a reason to discard a tuned inline-sort row."""
+    from types import SimpleNamespace
+
+    kn2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_nt_sbm16"
+    metadata = SimpleNamespace(
+        block_m=16,
+        has_bias=False,
+        stage2_has_bias=False,
+        stage2=SimpleNamespace(keywords={"kernelName2": kn2}),
+    )
+    experts, hidden, inter, topk = 896, 3584, 384, 16
+    w1 = torch.empty((experts, 2 * inter, hidden // 2), dtype=torch.uint8)
+    w2 = torch.empty((experts, hidden, inter // 2), dtype=torch.uint8)
+    w1.is_shuffled = w2.is_shuffled = True
+    w1_scale = torch.empty(
+        experts * 2 * inter * fused_moe._padded_scale_cols(hidden),
+        dtype=dtypes.fp8_e8m0,
+    )
+    w2_scale = torch.empty(
+        experts * hidden * fused_moe._padded_scale_cols(inter), dtype=dtypes.fp8_e8m0
+    )
+    reason = fused_moe._mxfp4_inline_sort_unsupported(
+        metadata,
+        torch.empty((4, hidden), dtype=dtypes.bf16),
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        torch.empty((4, topk), dtype=torch.int32),
+        gate_mode=fused_moe.GateMode.SEPARATED,
+        expert_mask=None,
+        bias1=None,
+        bias2=None,
+        a1_scale=None,
+        a2_scale=None,
+        stage2_scatter=None,
+        block_size_M=None,
+        hidden_pad=0,
+        intermediate_pad=0,
+    )
+    assert reason == "", reason
+
+
+if _running_on_gfx950():
+    _check_aux_sort_pad_rows_and_num_local_tokens()
+    _check_aux_sort_pad_rows_and_num_local_tokens(tokens=4, valid=3)
+    _check_inline_sort_accepts_num_local_tokens()
+    aiter.logger.info("aux sort pad-row / num_local_tokens checks passed")
