@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import ctypes
 import multiprocessing as mp
 
 import pytest
@@ -9,9 +10,11 @@ import torch.distributed as dist
 
 import aiter
 from aiter import logger
+from aiter.dist.cuda_wrapper import find_loaded_library
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.comms.all_reduce import (
+    _LINES,
     all_reduce,
     all_reduce_free,
     all_reduce_init,
@@ -43,6 +46,23 @@ def _inputs(numel, seed, rank, device):
 
 def _bad(out, ref):
     return int((out.view(torch.int16) != ref.view(torch.int16)).sum())
+
+
+def _stale_tail(rank, group, inboxes, calls, call):
+    """After an odd call on 3.1 chunks: does a line of chunk 3 that a peer sent into
+    bank 1 of this rank's inbox carry another call number?"""
+    torch.cuda.synchronize()
+    dist.barrier(group=group)  # the peers have finished the call
+    hip = ctypes.CDLL(find_loaded_library("libamdhip64"))
+    slot = 4 * _LINES * ((calls.numel() - 1) // 2)  # int32 words, as in all_reduce
+    lines = (ctypes.c_int32 * (4 * _LINES))()  # [word, call, word, call] a line
+    for peer in range(WORLD_SIZE):
+        if peer != rank:
+            src = inboxes[rank] + 4 * ((4 + peer) * slot + 4 * 3 * _LINES)
+            assert hip.hipMemcpy(lines, ctypes.c_void_p(src), 16 * _LINES, 2) == 0
+            if any(tag != call for tag in lines[1::2]):
+                return True
+    return False
 
 
 def _worker(rank, init_method):
@@ -94,6 +114,19 @@ def _worker(rank, init_method):
             graph.replay()
             if sum(_bad(o, ref) for o, ref in zip(outs, refs)):
                 failures.append(f"rank {rank}: graph replay {rep} is wrong")
+
+        # Last, with full inboxes: 4 chunks at call 1, then 3.1 chunks across the
+        # counter wrap, then 4 chunks at call 1 again. Chunk 3 must not keep call 1.
+        for step, (numel, start) in enumerate(
+            [(1024, 0), (788, 2**30 - 2), (788, None), (1024, None)]
+        ):
+            if start is not None:
+                calls[:-1].fill_(start)
+            x, ref = _inputs(numel, 4000 + step, rank, device)
+            if _bad(all_reduce(x, group, inboxes, calls), ref):
+                failures.append(f"rank {rank}: full-partial-full step {step} is wrong")
+            if step == 1 and _stale_tail(rank, group, inboxes, calls, 2**30 - 1):
+                failures.append(f"rank {rank}: the tail of chunk 3 kept an old call")
         if calls[-1].item():
             failures.append(f"rank {rank}: {calls[-1].item()} polls timed out")
         return failures

@@ -45,7 +45,7 @@ def _send(
     line = c * LINES + gl.arange(0, LINES, layout=gl.SliceLayout(1, WORDS))[:, None]
     word = 2 * line + gl.arange(0, 2, layout=gl.SliceLayout(0, WORDS))[None, :]
     call = gl.load(calls + 2 * c) % (1 << 30) + 1
-    data = gl.load(x + word, mask=2 * line < n_words)  # one mask for each line
+    data = gl.load(x + word, mask=2 * line < n_words, other=0)  # one mask a line
     gl.barrier()  # all waves have read the old call number
     gl.store(calls + 2 * c, call)
     lines = gl.reshape(gl.join(data, gl.full_like(data, call)), [LINES, 4])
@@ -56,11 +56,10 @@ def _send(
     slot = (call % 2 * 4 + RANK) * SLOT  # this rank's slot in the bank of the call
     for peer in gl.static_range(4):
         if peer != RANK:
-            # 16-byte aligned, so that a line moves in one store
+            # 16-byte aligned, so that a line moves in one store. All lines of the
+            # chunk get the call number, also the tail: no old tag can stay.
             inbox = gl.multiple_of(inboxes[peer].to(gl.pointer_type(gl.int32)), 16)
-            gl.amd.cdna5.buffer_store(
-                lines, inbox, slot + pos, mask=2 * line < n_words, cache=".wt"
-            )
+            gl.amd.cdna5.buffer_store(lines, inbox, slot + pos, cache=".wt")
 
 
 @gluon.jit
@@ -125,7 +124,7 @@ def _receive(
         late = gl.sum(gl.sum(old, axis=1), axis=0)
         it += 1
 
-    if it >= MAXIT:
+    if late > 0:  # the poll timed out
         gl.atomic_add(err, 1)
     return w0, w1, w2, w3, word, word_ok
 

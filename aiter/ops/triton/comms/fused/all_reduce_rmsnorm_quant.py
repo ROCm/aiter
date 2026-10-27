@@ -11,6 +11,7 @@ from aiter.ops.triton.comms.all_reduce import _LINES, _MAXIT
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+_HIDDEN = {}  # the hidden size of each state, by the address of its calls tensor
 
 
 def all_reduce_rmsnorm_quant(
@@ -35,12 +36,17 @@ def all_reduce_rmsnorm_quant(
         weight (torch.Tensor): bf16 (hidden,). With gemma, the norm uses 1 + weight.
         quant (bool): Also return q, out as fp8, and scale, one fp32 value for
             each 128 values.
-        inboxes, calls: The result of ``all_reduce_init``, for this op only.
+        inboxes, calls: The result of ``all_reduce_init``, for this op and one
+            hidden size only.
     """
     tokens, hidden = x.shape
     assert x.dtype == residual.dtype == weight.dtype == torch.bfloat16
     assert residual.shape == x.shape and weight.shape == (hidden,)
+    assert x.is_contiguous() and residual.is_contiguous() and weight.is_contiguous()
     assert hidden >= 256 and hidden & (hidden - 1) == 0
+    # A row is one chunk, so rows of another hidden size would meet old call numbers.
+    first = _HIDDEN.setdefault(calls.data_ptr(), hidden)
+    assert first == hidden, f"these inboxes serve hidden {first}, not {hidden}"
     slot = 4 * _LINES * ((calls.numel() - 1) // 2)  # as in all_reduce_init
     assert tokens * hidden <= slot, "x is larger than max_bytes"
 
