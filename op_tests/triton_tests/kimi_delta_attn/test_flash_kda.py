@@ -14,6 +14,8 @@ error rather than allclose.
 """
 
 import contextlib
+import importlib
+import inspect
 import math
 
 import pytest
@@ -23,6 +25,9 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fw
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_fwd as _chunk_fwd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import fast_launch as _fast_launch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda as _flash_kda
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
+    input_guard,
+)
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
@@ -430,15 +435,20 @@ def test_published_k2_schedules_can_split_their_tile():
         is _flash_kda._K2_GLUON_FALLBACK
     ):
         pytest.skip("this arch publishes no Gluon K2 schedules")
-    reached = set()
-    for W in (64, 128, 256):
-        for num_segs in (1, 2, 8, 64, 512):
-            for H in (1, 4, 12, 64):
-                reached.add(_flash_kda._k2_gluon_schedule(W, num_segs, H))
-    assert len(reached) > 1, f"only one schedule reachable: {reached}"
-    for bw, nw in sorted(reached):
-        assert bw % 16 == 0, f"BW={bw} is not a whole number of MFMA tiles"
-        assert nw <= bw // 16, f"BW={bw} cannot be split {nw} ways"
+    kernels = ["k2_ab_fused_gluon"]
+    if _flash_kda._GLUON_K2C_ARCH_OK:
+        kernels.append("k2_c_gluon")
+    for kernel in kernels:
+        reached = set()
+        for W in (64, 128, 256):
+            for num_segs in (1, 2, 8, 64, 512):
+                for H in (1, 4, 12, 64):
+                    sched = _flash_kda._k2_gluon_schedule(W, num_segs, H, kernel)
+                    reached.add((sched.kwargs["BW"], sched.num_warps))
+        assert len(reached) > 1, f"{kernel}: only one schedule reachable: {reached}"
+        for bw, nw in sorted(reached):
+            assert bw % 16 == 0, f"{kernel}: BW={bw} is not a whole number of tiles"
+            assert nw <= bw // 16, f"{kernel}: BW={bw} cannot be split {nw} ways"
 
 
 def _varlen(lens):
@@ -475,9 +485,7 @@ _CASES = {
         },
     ),
     "weak gate": lambda: (make_inputs(1, 512, 4), {"lower_bound": -0.01}),
-    # Only a segmented schedule has a pass A, and pass A is the only thing the
-    # Gluon K2 is routed to, so these are the cases where K2's route is visible
-    # at all -- see test_cases_reach_the_gluon_k2.
+    # Only a segmented shape has a pass A, the only Gluon K2 pass on gfx950.
     "segmented": lambda: (
         make_inputs(1, 1024, 4),
         {"output_final_state": True, "chunks_per_seg": 4},
@@ -532,9 +540,7 @@ def test_routes_agree(case):
 
     Both sides write the same ABI and nothing downstream is told which one ran,
     so a divergence here is a bug in whichever kernel moved rather than a
-    tolerance to widen. Measured across these cases: K2's two implementations
-    agree to the bit, and K1's differ at 3e-4 to 1e-3 on the output and under
-    3e-5 on the state, so the bounds are really about K1.
+    tolerance to widen.
     """
     args, kw = _CASES[case]()
     with _route(k1=False, k2=False):
@@ -548,43 +554,50 @@ def test_routes_agree(case):
 
 
 def test_cases_reach_the_gluon_k2():
-    """The cases above have to exercise the route they are comparing.
-
-    ``use_gluon_k2`` is tested inside ``max_segs > 1``, so an unsegmented shape
-    runs the Triton K2 whichever way the flag is set and test_routes_agree is
-    comparing it against itself. Every non-segmented case here was in exactly
-    that position, and nothing in the assertions would have said so.
-    """
+    """The cases above have to exercise the route they are comparing."""
     if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
         pytest.skip("this arch or tile shape never routes K2 to Gluon")
-    from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
-        flash_kda_k2 as _g2,
+    _g2 = importlib.import_module(
+        "aiter.ops.triton._gluon_kernels."
+        f"{_flash_kda.DEVICE_ARCH}.kimi_delta_attn.flash_kda_k2"
     )
 
-    reached = set()
-    saved = _g2.k2_ab_fused_fast
+    launchers = ["k2_ab_fused_fast"]
+    if _flash_kda._GLUON_K2C_ARCH_OK:
+        launchers.append("k2_c_fast")
+    reached = {name: set() for name in launchers}
+    saved = {name: getattr(_g2, name) for name in launchers}
 
     class _Counting:
+        def __init__(self, name):
+            self.name = name
+
         def __getitem__(self, grid):
-            inner = saved[grid]
+            inner = saved[self.name][grid]
 
             def launch(**kw):
-                reached.add(current)
+                reached[self.name].add(current)
                 return inner(**kw)
 
             return launch
 
-    _g2.k2_ab_fused_fast = _Counting()
+    for name in launchers:
+        setattr(_g2, name, _Counting(name))
     try:
         for current, make in _CASES.items():
             args, kw = make()
             with _route(k1=True, k2=True):
                 run_flash(*args, **kw)
     finally:
-        _g2.k2_ab_fused_fast = saved
+        for name in launchers:
+            setattr(_g2, name, saved[name])
 
     want = {name for name in _CASES if name.startswith("segmented")}
-    assert want <= reached, f"never reached the Gluon K2: {sorted(want - reached)}"
+    missed = sorted(want - reached["k2_ab_fused_fast"])
+    assert not missed, f"never reached the Gluon pass A: {missed}"
+    if "k2_c_fast" in reached:
+        missed = sorted(set(_CASES) - reached["k2_c_fast"])
+        assert not missed, f"never reached the Gluon pass C: {missed}"
 
 
 # A weak gate is the only setting that exposes the intra-chunk inverse. At the
@@ -1026,3 +1039,197 @@ def test_paged_cache_rejected_on_default_pipeline():
                 has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
             )
         )
+
+
+def _bands(*xs, skew=0):
+    """``xs`` as the bands of one fused tensor, as a fused input projection
+    gives them. ``skew`` leading pad elements break the 16-byte alignment."""
+    shape = xs[0].shape[-2:]
+    pad = [xs[0].new_zeros(*xs[0].shape[:2], skew)] if skew else []
+    fused = torch.cat(pad + [x.flatten(-2) for x in xs], dim=-1)[..., skew:]
+    return tuple(b.unflatten(-1, shape) for b in fused.split(shape.numel(), dim=-1))
+
+
+def _head_major(*xs):
+    """``xs`` stored head by head, so no token's heads are adjacent."""
+    return tuple(x.transpose(1, 2).contiguous().transpose(1, 2) for x in xs)
+
+
+def _record_tdm_operands(monkeypatch):
+    """Have the gfx1250 Gluon launchers note the storage they are handed for
+    each operand they read by TDM, as ``{(launcher, argument): {data_ptr}}``."""
+    g1, g2 = (
+        importlib.import_module(
+            f"aiter.ops.triton._gluon_kernels.gfx1250.kimi_delta_attn.{name}"
+        )
+        for name in ("flash_kda_k1", "flash_kda_k2")
+    )
+    seen = {}
+
+    class _Recording:
+        def __init__(self, real, name, operands):
+            self.real, self.name, self.operands = real, name, operands
+
+        def __getitem__(self, grid):
+            launch = self.real[grid]
+
+            def record(**kw):
+                for op in self.operands:
+                    seen.setdefault((self.name, op), set()).add(kw[op].data_ptr())
+                return launch(**kw)
+
+            return record
+
+    for module, name, operands in (
+        (g1, "_k1_fast", ("q", "k", "g_raw")),
+        (g2, "k2_ab_fused_fast", ("v_input",)),
+        (g2, "k2_c_fast", ("v_input",)),
+    ):
+        real = getattr(module, name)
+        monkeypatch.setattr(module, name, _Recording(real, name, operands))
+    return seen
+
+
+_LAYOUTS = {
+    "bands": _bands,
+    "skewed bands": lambda *xs: _bands(*xs, skew=1),
+    "batched bands": _bands,
+    "head-major": _head_major,
+}
+
+
+@pytest.mark.parametrize("chunks_per_seg", [0, 4])
+@pytest.mark.parametrize("layout", list(_LAYOUTS))
+def test_strided_operands_match_packed(layout, chunks_per_seg, monkeypatch):
+    """Strided q, k, v and g give the packed answer, to the bit."""
+    if layout == "batched bands":
+        args, kw = make_inputs(2, 512, 4), {}
+    else:
+        args, kw = make_inputs(1, 1024, 4), {"cu_seqlens": _varlen([300, 200, 524])}
+    kw.update(
+        output_final_state=True, state_v_first=True, chunks_per_seg=chunks_per_seg
+    )
+    views = _LAYOUTS[layout](*args[:4])
+    assert not any(x.is_contiguous() for x in views)
+
+    on_tdm = _flash_kda.DEVICE_ARCH == "gfx1250"
+    with _route(k1=True, k2=True):
+        o_ref, ht_ref = run_flash(*args, **kw)
+        seen = _record_tdm_operands(monkeypatch) if on_tdm else None
+        o, ht = run_flash(*views, *args[4:], **kw)
+    assert torch.equal(o, o_ref)
+    assert torch.equal(ht, ht_ref)
+    if not on_tdm:
+        return
+
+    q, k, v, g = views
+    handed = {
+        ("_k1_fast", "q"): q,
+        ("_k1_fast", "k"): k,
+        ("_k1_fast", "g_raw"): g,
+        ("k2_c_fast", "v_input"): v,
+    }
+    if chunks_per_seg:
+        handed[("k2_ab_fused_fast", "v_input")] = v
+    assert seen.keys() == handed.keys()
+    for key, view in handed.items():
+        in_place = seen[key] == {view.data_ptr()}
+        assert in_place == (layout in ("bands", "skewed bands")), key
+
+
+@pytest.mark.parametrize("pipeline", ["flash_kda", "default"])
+def test_public_wrapper_passes_projection_bands(pipeline, monkeypatch):
+    """``chunk_kimi_delta_attn`` passes q, k, v and g on unpacked, and both
+    pipelines give the packed answer from bands."""
+    args = make_inputs(1, 1024, 4)
+    bands = _bands(*args[:4])
+    extra = {"cu_seqlens": _varlen([300, 200, 524]), "output_final_state": True}
+    monkeypatch.setattr(_chunk_fwd, "AITER_FDA_ENABLE", pipeline == "flash_kda")
+    o_ref, ht_ref = chunk_kimi_delta_attn(**_kimi_kwargs(*args, **extra))
+
+    received = []
+    real = _chunk_fwd.flash_kda_fwd
+
+    def recording(**kw):
+        received.append([kw[name].data_ptr() for name in "qkvg"])
+        return real(**kw)
+
+    monkeypatch.setattr(_chunk_fwd, "flash_kda_fwd", recording)
+    o, ht = chunk_kimi_delta_attn(**_kimi_kwargs(*bands, *args[4:], **extra))
+    assert torch.equal(o, o_ref)
+    assert torch.equal(ht, ht_ref)
+    want = [[b.data_ptr() for b in bands]] if pipeline == "flash_kda" else []
+    assert received == want
+
+
+def test_input_guard_skips_by_position_too():
+    """A name in ``skip`` keeps its storage whether it is passed by keyword or
+    by position, and every other tensor is packed either way."""
+
+    @input_guard(skip=("kept",))
+    def f(packed, kept):
+        return packed, kept
+
+    base = torch.randn(4, 8, device=device)
+    packed, kept = base[:, ::2], base[:, 1::2]
+    for got_packed, got_kept in (f(packed, kept), f(packed=packed, kept=kept)):
+        assert got_packed.is_contiguous()
+        assert got_kept.data_ptr() == kept.data_ptr()
+        assert not got_kept.is_contiguous()
+
+
+def test_positional_call_keeps_skipped_storage(monkeypatch):
+    """Passed by position, a padded ``state_cache`` still gets the final state
+    in place, and on gfx1250 the bands are still read in place."""
+    H = 4
+    q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(1, 256, H)
+    h0 = torch.randn(1, H, K_DIM, K_DIM, device=device, dtype=torch.float32) * 0.1
+    o_ref, ht_ref = run_flash(
+        q, k, v, g, beta, A_log, dt_bias, scale,
+        initial_state=h0, output_final_state=True, state_v_first=True,
+        chunks_per_seg=0,
+    )  # fmt: skip
+    cache, indices, storage = _paged_pool(1, H, h0, pad_floats=128)
+    ptr = storage.data_ptr()
+    bands = _bands(q, k, v, g)
+    out = torch.empty_like(v)
+    by_name = {
+        **dict(zip("qkvg", bands)),
+        "beta": beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "scale": scale,
+        "lower_bound": LOWER_BOUND,
+        "initial_state": None,
+        "output_final_state": False,
+        "state_v_first": True,
+        "cu_seqlens": None,
+        "chunk_indices": None,
+        "chunks_per_seg": 0,
+        "out": out,
+        "state_cache": cache,
+        "state_indices": indices,
+        "has_initial_state": torch.ones(1, device=device, dtype=torch.bool),
+    }
+    params = inspect.signature(flash_kda_fwd).parameters
+    assert by_name.keys() == params.keys()
+
+    on_tdm = _flash_kda.DEVICE_ARCH == "gfx1250"
+    seen = _record_tdm_operands(monkeypatch) if on_tdm else None
+    o, ht = flash_kda_fwd(*(by_name[name] for name in params))
+    assert ht is None
+    assert o.data_ptr() == out.data_ptr()
+    assert torch.equal(o, o_ref)
+    assert storage.data_ptr() == ptr
+    assert torch.equal(cache[indices], ht_ref), "final state went to a packed clone"
+    if on_tdm:
+        q, k, v, g = bands
+        handed = {
+            ("_k1_fast", "q"): q,
+            ("_k1_fast", "k"): k,
+            ("_k1_fast", "g_raw"): g,
+            ("k2_c_fast", "v_input"): v,
+        }
+        assert seen.keys() == handed.keys()
+        for key, band in handed.items():
+            assert seen[key] == {band.data_ptr()}, key
