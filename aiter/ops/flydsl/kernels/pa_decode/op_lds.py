@@ -940,16 +940,29 @@ class Gfx1250Memory:
             16,
             16,
         )
-        self.tdm_copy(
-            ctx.value_cache_ptr,
-            off + (wave_token // 16) * t.head_dim * 16,
-            kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
-            (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
-            (1,) if full_tile else (16, 1),
-            (None,) if full_tile else (None, valid),
-            16,
-            16,
-        )
+        if const_expr(t.trans_v or t.block_size == 16):
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + (wave_token // 16) * t.head_dim * 16,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
+                (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
+                (1,) if full_tile else (16, 1),
+                (None,) if full_tile else (None, valid),
+                16,
+                16,
+            )
+        else:
+            # Gather plain [D, page] rows into packed [D, 16] wave slices.
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + wave_token,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
+                (t.head_dim, 16),
+                (t.block_size, 1),
+                (None, None) if full_tile else (None, valid),
+                16,
+                16,
+            )
 
     @flyc.jit
     def stage_page_tdm(self, token_base, kv_off, full_tile, cached_page=None):
@@ -985,7 +998,7 @@ class Gfx1250Memory:
             16,
             16,
         )
-        if const_expr(full_tile):
+        if const_expr(full_tile and t.trans_v):
             self.tdm_copy(
                 ctx.value_cache_ptr,
                 off + (pt // 16 + ctx.warp * 2) * t.head_dim * 16,
@@ -1005,14 +1018,18 @@ class Gfx1250Memory:
                 )
                 self.tdm_copy(
                     ctx.value_cache_ptr,
-                    off + (pt // 16 + ctx.warp * 2 + chunk) * t.head_dim * 16,
+                    (
+                        off + (pt // 16 + ctx.warp * 2 + chunk) * t.head_dim * 16
+                        if t.trans_v
+                        else off + pt + ctx.warp * 32 + chunk * 16
+                    ),
                     kv_off
                     + t.k_bytes
                     + ctx.warp * t.head_dim * 32
                     + chunk * t.head_dim * 16,
                     (t.head_dim, 16),
-                    (16, 1),
-                    (None, count),
+                    (16, 1) if t.trans_v else (t.block_size, 1),
+                    (None, None) if full_tile else (None, count),
                     16,
                     16,
                 )

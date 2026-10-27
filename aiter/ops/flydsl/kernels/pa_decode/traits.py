@@ -855,14 +855,13 @@ class Gfx1250Traits:
     @property
     def fp8_multi_tile(self):
         # Bound resident Q/output fragments: D128 fits four query tiles,
-        # D256 fits two. Both share packed chunks and K/V operands;
+        # D256 fits two. Both reuse K/V operands in their staged LDS layout;
         # page16 and windowed attention retain 64-token chunks.
         # A one-token window does not amortize resident operand setup.
         return (
             not self.bf16
             and self.head_dim in (128, 256)
             and self.block_size >= 16
-            and self.trans_v
             and self.sliding_window != 1
             and 2 <= self.m_tiles
             and self.m_tiles * self.head_dim <= 512
@@ -871,15 +870,22 @@ class Gfx1250Traits:
     @property
     def packed_lds(self):
         # FP8 cache layout is independent of scalar or per-token scales.
-        # Page16 tiles gather one page per wave without padded LDS rows.
+        # Each wave gathers 16-token V chunks from either cache layout;
+        # page16 has the same byte order with or without the singleton axis.
+        # Plain D128/page64 single-M tiles retain the faster padded pipeline.
         # Multiple query tiles reuse packed chunks and K128 WMMA without
         # fetching K/V again for each query tile.
         return (
             not self.bf16
             and self.head_dim in (128, 256)
             and self.block_size >= 16
-            and self.trans_v
             and (self.m_tiles == 1 or self.fp8_multi_tile)
+            and (
+                self.trans_v
+                or self.head_dim != 128
+                or self.block_size != 64
+                or self.m_tiles != 1
+            )
         )
 
     @property
