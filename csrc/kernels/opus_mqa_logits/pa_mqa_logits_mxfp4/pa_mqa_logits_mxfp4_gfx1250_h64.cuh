@@ -2,8 +2,8 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // The n_heads = 64 (DeepSeek-V4) kernel on gfx1250: 64-row pages, one table entry a 64-key tile.
-// Device pass on gfx1250 only (mqa_logits_mxfp4_gfx1250.cu). Where a CTA's work comes from:
-// template SCHED, mqa_logits_mxfp4_gfx1250_assign.cuh.
+// Device pass on gfx1250 only (pa_mqa_logits_mxfp4_gfx1250.cu). Where a CTA's work comes from:
+// template SCHED, pa_mqa_logits_mxfp4_gfx1250_assign.cuh.
 //
 // The structure (opus-ops opus_logits/gfx1250/docs/H64_PORT.md):
 //   * A tile's accumulators are pipelined by n-tile -- n-tile m's two WMMAs (one an m-tile), then
@@ -18,7 +18,7 @@
 //     see the builder) and Free's, never Prefill's (there the age order retires CTAs early for
 //     the next round).
 #pragma once
-#include "mqa_logits_mxfp4_gfx1250_assign.cuh"
+#include "pa_mqa_logits_mxfp4_gfx1250_assign.cuh"
 
 namespace opus_logits::gfx1250 {
 

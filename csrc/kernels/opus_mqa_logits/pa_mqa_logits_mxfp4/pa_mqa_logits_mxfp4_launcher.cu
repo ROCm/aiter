@@ -2,10 +2,10 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // MXFP4 paged MQA logits (OPUS): the registry's host side, the Table schedule builder and the
-// launch. ABI: mqa_logits_mxfp4.h. The kernels live in their arch's TU (mqa_logits_mxfp4_<arch>.cu)
-// and are reached only through their registry entries.
-#include "mqa_logits_mxfp4.h"
-#include "mqa_logits_mxfp4_sched.cuh"
+// launch. ABI: pa_mqa_logits_mxfp4.h. The kernels live in their arch's TU
+// (pa_mqa_logits_mxfp4_<arch>.cu) and are reached only through their registry entries.
+#include "pa_mqa_logits_mxfp4.h"
+#include "pa_mqa_logits_mxfp4_sched.cuh"
 
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
@@ -55,7 +55,7 @@ void check_i32_vector(const aiter_tensor_t& t, const char* name) {
 
 }  // namespace
 
-// The record layout of mqa_logits_mxfp4_instances (aiter/ops/opus/mqa_logits_mxfp4.py reads it
+// The record layout of mqa_logits_mxfp4_instances (aiter/ops/opus/pa_mqa_logits_mxfp4.py reads it
 // by the leading field count).
 #define MQA_LOGITS_INSTANCE_FIELDS                                                              \
     X(id) X(heads) X(rows_per_wave) X(waves) X(stages) X(scale_tdm) X(gather) X(entry_rows_min) \

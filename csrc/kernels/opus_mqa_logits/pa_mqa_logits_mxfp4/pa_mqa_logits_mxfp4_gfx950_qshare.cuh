@@ -17,13 +17,13 @@
 //   3. ONE s_barrier A PHASE. It publishes the tile the pipe landed AND separates the previous
 //      phase's ds_read from the copy that recycles its stage (the traits derive the depth).
 //
-// The contract (the caller's, mqa_logits_mxfp4.h): a group's windows do not decrease along its
+// The contract (the caller's, pa_mqa_logits_mxfp4.h): a group's windows do not decrease along its
 // rows, so the loop runs the union -- the last row's window, CTA-uniform -- and each wave masks
 // its stores by its own row's. A slot past a short group runs the loop with an empty window and
 // stores nothing. NOTHING IN THE LOOP MAY DEPEND ON q_slot but which copies a wave issues: every
 // wave must take the same trips and barriers, or the CTA deadlocks.
 #pragma once
-#include "mqa_logits_mxfp4_gfx950_common.cuh"
+#include "pa_mqa_logits_mxfp4_gfx950_common.cuh"
 
 namespace opus_logits::gfx950 {
 

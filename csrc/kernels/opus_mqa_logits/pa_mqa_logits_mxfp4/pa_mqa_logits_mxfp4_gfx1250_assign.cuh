@@ -4,7 +4,7 @@
 // Where a gfx1250 MQA-logits CTA's work comes from (the kernels' template SCHED), shared by the
 // H = 64 and H = 32 kernels. Device pass on gfx1250 only.
 //
-//   SCHED_TABLE    a record a CTA slot (the builder's, mqa_logits_mxfp4_sched.cuh);
+//   SCHED_TABLE    a record a CTA slot (the builder's, pa_mqa_logits_mxfp4_sched.cuh);
 //   SCHED_FREE     no records: every CTA works out its own slot of the same kind of split the
 //                  builder emits; every CTA reads every sequence's bounds (decode sizes);
 //   SCHED_PREFILL  no records: a group is cut into a static `prefill_parts` pieces and
@@ -13,7 +13,7 @@
 // (windows do not decrease along a sequence). Every CTA computes each of its tiles the same way
 // whatever cut it, so the three modes write bit-identical logits.
 #pragma once
-#include "mqa_logits_mxfp4_gfx1250_common.cuh"
+#include "pa_mqa_logits_mxfp4_gfx1250_common.cuh"
 
 namespace opus_logits::gfx1250 {
 

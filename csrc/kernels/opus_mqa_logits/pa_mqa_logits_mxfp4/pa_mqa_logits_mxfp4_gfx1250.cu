@@ -5,21 +5,21 @@
 //
 // The ONLY translation unit built with -fno-honor-nans (optCompilerConfig.json's per-source
 // flags): the kernels' relu is max_num with the NaN put back from the scales
-// (MQA_LOGITS_MXFP4_NUM_RELU, mqa_logits_mxfp4_gfx1250_common.cuh), and the flag cannot be scoped
-// to the relu. Rerun the op test's NaN / Inf rows after every compiler upgrade: the flag lets the
-// compiler assume no NaN.
+// (MQA_LOGITS_MXFP4_NUM_RELU, pa_mqa_logits_mxfp4_gfx1250_common.cuh), and the flag cannot be
+// scoped to the relu. Rerun the op test's NaN / Inf rows after every compiler upgrade: the flag
+// lets the compiler assume no NaN.
 //
 // Also built with `-mllvm -enable-post-misched=1`, overriding aiter's default of 0: without the
 // post-RA scheduler the V4.1 prefill kernel ran 2.3% slower and the candidate decode kernel up to
 // 0.5 us slower than the same source built standalone (cold A/B; V4 and V4.1 decode unaffected).
-#include "mqa_logits_mxfp4.h"
-#include "mqa_logits_mxfp4_gfx1250_traits.h"
+#include "pa_mqa_logits_mxfp4.h"
+#include "pa_mqa_logits_mxfp4_gfx1250_traits.h"
 
 // The device pass on gfx1250 gets the kernels; every other pass gets empty stubs so the launch
 // symbols resolve. Both halves of the guard are load-bearing: the host pass reports warp size 64.
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__)
-#include "mqa_logits_mxfp4_gfx1250_h64.cuh"
-#include "mqa_logits_mxfp4_gfx1250_v41.cuh"
+#include "pa_mqa_logits_mxfp4_gfx1250_h64.cuh"
+#include "pa_mqa_logits_mxfp4_gfx1250_v41.cuh"
 #else
 namespace opus_logits::gfx1250 {
 template<class T, int SCHED> __global__ void h64_kernel(mqa_logits_mxfp4_kargs) {}

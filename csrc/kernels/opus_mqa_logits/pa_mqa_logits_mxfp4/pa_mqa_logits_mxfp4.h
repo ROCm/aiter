@@ -9,7 +9,7 @@
 // [query_start_loc[b], query_start_loc[b + 1]) and reads keys through block_tables[b]. Every
 // window is a prefix [0, row_ends[r]). A table entry names `pages_per_block` consecutive pages.
 //
-// The caller never names an instance: aiter.ops.opus.mqa_logits_mxfp4 picks one from the
+// The caller never names an instance: aiter.ops.opus.pa_mqa_logits_mxfp4 picks one from the
 // attributes the registry exports (`mqa_logits_mxfp4_instances`). An instance runs in one of
 // three schedule modes:
 //   Table    a 32-byte record a CTA slot, built on device once per forward (build_schedule);
@@ -99,7 +99,7 @@ struct mqa_logits_instance {
     hipError_t (*occupancy)(int mode, int* ctas_per_cu);
 };
 
-// Each arch's instances (mqa_logits_mxfp4_<arch>.cu).
+// Each arch's instances (pa_mqa_logits_mxfp4_<arch>.cu).
 const mqa_logits_instance* mqa_logits_gfx950_instances(int* count);
 const mqa_logits_instance* mqa_logits_gfx1250_instances(int* count);
 
@@ -108,7 +108,7 @@ const mqa_logits_instance* mqa_logits_gfx1250_instances(int* count);
 // -- the three ops ---------------------------------------------------------------------------
 // The device's instances as fixed-size int records, [ints a record, then the records], into a
 // host int32 tensor; returns how many ints that takes (written only if `out` holds them all). See
-// MQA_LOGITS_INSTANCE_FIELDS in mqa_logits_mxfp4_launcher.cu for the order.
+// MQA_LOGITS_INSTANCE_FIELDS in pa_mqa_logits_mxfp4_launcher.cu for the order.
 int mqa_logits_mxfp4_instances(int device_id, aiter_tensor_t& out);
 
 // A Table schedule for `instance`'s rows_per_cta into caller-held buffers, on device, no sync.

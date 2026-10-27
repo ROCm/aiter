@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "rocm_ops.hpp"
 #include "aiter_stream.h"
-#include "mqa_logits_mxfp4.h"
+#include "pa_mqa_logits_mxfp4.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {

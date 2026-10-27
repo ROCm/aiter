@@ -3,9 +3,9 @@
 //
 // gfx950 wave64 (MFMA 32x32x64) one-row kernel: one query row a CTA, its T::NUM_WARPS waves
 // splitting a T::KV_TILE_SIZE-key tile, two 32-key n-tiles a wave, the KV read straight from
-// global into a register double buffer. Device pass on gfx950 only (mqa_logits_mxfp4_gfx950.cu).
+// global into a register double buffer. Device pass on gfx950 only (pa_mqa_logits_mxfp4_gfx950.cu).
 #pragma once
-#include "mqa_logits_mxfp4_gfx950_common.cuh"
+#include "pa_mqa_logits_mxfp4_gfx950_common.cuh"
 
 namespace opus_logits::gfx950 {
 
@@ -50,7 +50,7 @@ __device__ inline auto make_layout_bt(int warp_id) {
 
 // ─── kernel ────────────────────────────────────────────────────────────────
 // Grid: SCHED_TABLE one CTA a record; SCHED_FREE groups + cta_target; SCHED_PREFILL groups x
-// prefill_parts (mqa_logits_mxfp4.py sizes them). A group is one row here.
+// prefill_parts (pa_mqa_logits_mxfp4.py sizes them). A group is one row here.
 template<class T, int SCHED>
 __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES)
 void kv_kernel(mqa_logits_mxfp4_kargs kargs) {

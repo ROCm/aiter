@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Device-side Table schedule builder (build_tiles + build_sched): arch-agnostic int-only code,
-// included by the launcher TU after the record ABI (mqa_logits_mxfp4.h); not standalone.
+// included by the launcher TU after the record ABI (pa_mqa_logits_mxfp4.h); not standalone.
 //
 // A tile is up to rows_per_cta consecutive rows of ONE sequence (build_tiles cuts them from
 // query_start_loc; at one row a CTA a tile is a row). Its block-table row is its sequence: the

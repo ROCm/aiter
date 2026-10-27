@@ -7,7 +7,7 @@
 #include <opus/opus.hpp>
 #include <bit>   // std::bit_cast, required by permlane_head_reduce2
 
-#include "mqa_logits_mxfp4_gfx950_assign.cuh"
+#include "pa_mqa_logits_mxfp4_gfx950_assign.cuh"
 
 // __launch_bounds__ min waves/SIMD; raising it only constrains the register allocator.
 #ifndef OPUS_LOGITS_MIN_WAVES

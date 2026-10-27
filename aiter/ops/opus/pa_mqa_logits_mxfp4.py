@@ -65,14 +65,14 @@ import torch
 from ...jit.core import compile_ops
 from ._arch import GFX950, GFX1250, _device_arch
 
-_MD_NAME = "module_mqa_logits_mxfp4_opus"
+_MD_NAME = "module_pa_mqa_logits_mxfp4_opus"
 
 # Schedule modes (opus_logits::mqa_logits_mode).
 TABLE, FREE, PREFILL = 0, 1, 2
 _MODE_NAMES = {"table": TABLE, "free": FREE, "prefill": PREFILL}
 
 _TILE = 64  # keys a KV tile, every gfx1250 instance's (gfx1250's rule tells V4.1 layers by it)
-# Mirrors of the C++ builder's constants (mqa_logits_mxfp4_sched.cuh).
+# Mirrors of the C++ builder's constants (pa_mqa_logits_mxfp4_sched.cuh).
 _SCHED_RECORD_INTS = 8
 _SCHED_SCRATCH_RECORDS = 96
 _GROUPS_BUILD_MAX_BATCH = 2048

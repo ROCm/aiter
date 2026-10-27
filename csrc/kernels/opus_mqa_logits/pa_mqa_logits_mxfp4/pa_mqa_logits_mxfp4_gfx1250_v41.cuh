@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // The n_heads = 32 (DeepSeek-V4.1) kernel on gfx1250, full layers and candidate layers. Device
-// pass on gfx1250 only (mqa_logits_mxfp4_gfx1250.cu). opus-ops opus_logits/gfx1250/docs/
+// pass on gfx1250 only (pa_mqa_logits_mxfp4_gfx1250.cu). opus-ops opus_logits/gfx1250/docs/
 // V41_DEV_PLAN_DRAFT.md has the measurements behind each choice.
 //
 //   * R rows a wave. A tile's keys reach HBM -> LDS once per CTA (TDM, one piece a wave) and
@@ -16,9 +16,9 @@
 //     Candidate layers (GATHER): an entry is one 8-row page and a tile is one TDM gather of 8.
 //   * Output [rows, out_stride], or flat: row r's logits at out_offsets[r].
 //
-// Where a CTA's work comes from: template SCHED, mqa_logits_mxfp4_gfx1250_assign.cuh.
+// Where a CTA's work comes from: template SCHED, pa_mqa_logits_mxfp4_gfx1250_assign.cuh.
 #pragma once
-#include "mqa_logits_mxfp4_gfx1250_assign.cuh"
+#include "pa_mqa_logits_mxfp4_gfx1250_assign.cuh"
 
 namespace opus_logits::gfx1250 {
 

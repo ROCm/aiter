@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MXFP4 paged MQA logits (OPUS) through ``aiter.ops.opus.mqa_logits_mxfp4``: perf and correctness.
+"""MXFP4 paged MQA logits (OPUS) through ``aiter.ops.opus.pa_mqa_logits_mxfp4``: perf and
+correctness.
 
-    python3 op_tests/test_mqa_logits_mxfp4_opus.py                    # every table
-    python3 op_tests/test_mqa_logits_mxfp4_opus.py --modes decode -m v41 -b 1 64 --mtp 6
-    python3 op_tests/test_mqa_logits_mxfp4_opus.py --modes semantics --checks edges graph
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py                    # every table
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes decode -m v41 -b 1 64 --mtp 6
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes semantics --checks edges graph
 
 Models (``-m``): ``v4`` (DeepSeek-V4, 64 index heads, compression ratio 4, 64-row pages, one a
 table entry), ``v41`` (V4.1 full layers, 32 heads, 8-row pages, a table entry a 256-token PAGE
@@ -46,8 +47,8 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.opus import mqa_logits_mxfp4 as M
-from aiter.ops.opus.mqa_logits_mxfp4 import (
+from aiter.ops.opus import pa_mqa_logits_mxfp4 as M
+from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
     mqa_logits_mxfp4,
     mqa_logits_mxfp4_config,
     mqa_logits_mxfp4_schedule,

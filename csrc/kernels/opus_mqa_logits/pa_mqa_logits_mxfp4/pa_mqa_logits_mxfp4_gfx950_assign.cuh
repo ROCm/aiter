@@ -3,9 +3,9 @@
 //
 // Where a gfx950 MQA-logits CTA's work comes from (the kernels' template SCHED), shared by the
 // one-row and qshare kernels. Device pass on gfx950 only. gfx1250's mqa_assign
-// (mqa_logits_mxfp4_gfx1250_assign.cuh) on wave64:
+// (pa_mqa_logits_mxfp4_gfx1250_assign.cuh) on wave64:
 //
-//   SCHED_TABLE    a record a CTA slot (the builder's, mqa_logits_mxfp4_sched.cuh);
+//   SCHED_TABLE    a record a CTA slot (the builder's, pa_mqa_logits_mxfp4_sched.cuh);
 //   SCHED_FREE     no records: every CTA works out its own slot of the same kind of split the
 //                  builder emits; every CTA reads every sequence's bounds (decode sizes);
 //   SCHED_PREFILL  no records: a group is cut into a static `prefill_parts` pieces and

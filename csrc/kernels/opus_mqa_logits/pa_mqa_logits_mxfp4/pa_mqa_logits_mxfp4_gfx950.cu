@@ -6,14 +6,14 @@
 //
 // Built with `-mllvm -enable-post-misched=1` (optCompilerConfig.json's per-source flags),
 // overriding aiter's default of 0: the one-row kernel's MFMA / VALU interleave depends on it.
-#include "mqa_logits_mxfp4.h"
-#include "mqa_logits_mxfp4_gfx950_traits.h"
+#include "pa_mqa_logits_mxfp4.h"
+#include "pa_mqa_logits_mxfp4_gfx950_traits.h"
 
 // The device pass on gfx950 gets the kernels; every other pass gets empty stubs so the launch
 // symbols resolve.
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
-#include "mqa_logits_mxfp4_gfx950_kv.cuh"
-#include "mqa_logits_mxfp4_gfx950_qshare.cuh"
+#include "pa_mqa_logits_mxfp4_gfx950_kv.cuh"
+#include "pa_mqa_logits_mxfp4_gfx950_qshare.cuh"
 #else
 namespace opus_logits::gfx950 {
 template<class T, int SCHED> __global__ void kv_kernel(mqa_logits_mxfp4_kargs) {}
