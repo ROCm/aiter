@@ -798,6 +798,18 @@ def _grouped_a8w4_tdm_moe(
     else:
         _fuse_ep_route_quant = False
         ep_rowmap = None
+        # TP with a per-pass real row count (ATOM's `Context.scheduled_tokens_gpu`):
+        # the rows past it are a graph bucket's padding, routed to expert -1 by
+        # the top-k. The route kernels drop those routes; the same bounds the EP
+        # path derives make the quant gather, the remap and the gather/reduce
+        # skip the tail instead of reading rows that were never allocated.
+        if num_local_tokens is not None:
+            _ep_nvt = (
+                num_local_tokens.reshape(-1)[:1]
+                .to(device=device, dtype=torch.int32)
+                .contiguous()
+            )
+            _ep_nvr = (_ep_nvt * int(topk)).contiguous()
         # Small batches (decode): one workgroup routes, scans and remaps, in place
         # of the counter fill, moe_route and contiguous_psum_remap (same outputs).
         _route_psum_fused = (
@@ -1390,7 +1402,8 @@ def _grouped_a8w4_tdm_moe(
         topids_to_rows,
         gather_w,
         out=moe_out,
-        num_valid_tokens=(_ep_nvt if _is_ep else None),
+        # EP's dead tail and TP's pad rows alike; None when no count was given.
+        num_valid_tokens=_ep_nvt,
     )
     return moe_out
 

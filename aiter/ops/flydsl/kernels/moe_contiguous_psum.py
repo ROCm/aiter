@@ -24,6 +24,10 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 MAX_EXPERTS_PER_BLOCK = 512
+# `moe_route_maps.DROPPED_ROUTE_ROW`: the row of a route that claims no slot (a
+# negative expert id, which the top-k writes past `num_valid_rows`). Spelled out
+# here rather than imported so the two kernel modules stay independent.
+_DROPPED_ROUTE_ROW = -1
 
 # The row remap is grid-strided across this many blocks. Each block re-derives the
 # tiny per-expert prefix sum in LDS (barrier-free across blocks), so no cross-block
@@ -630,13 +634,23 @@ def build_moe_route_psum_fused_module():
 
         # Phase B: route + workgroup-scope LDS atomic -> masked-layout rows.
         # The allocator's typed pointer keeps the counter in shared memory.
+        # A negative expert id (the top-k's -1 for a row past `num_valid_rows`)
+        # is a dropped route: it adds 0 to counter 0 and keeps the sentinel, as
+        # the g2l route kernels do, so it costs no GEMM row and the gather
+        # skips it. Indexing LDS with the raw -1 corrupted the counter block.
+        c0_i32 = fx.Int32(0)
+        c1_i32 = fx.Int32(1)
+        dropped_row = fx.Int32(_DROPPED_ROUTE_ROW)
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
             e = topk_p[route_i32]
-            ptr = lds_cnt + e
-            slot = fx.atomic_add(ptr, fx.Int32(1), syncscope="workgroup")
-            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-            rows_p[route_i32] = row
+            is_drop = e < c0_i32
+            eff_e = is_drop.select(c0_i32, e)
+            incr = is_drop.select(c0_i32, c1_i32)
+            ptr = lds_cnt + eff_e
+            slot = fx.atomic_add(ptr, incr, syncscope="workgroup")
+            row = fx.Uint32(slot) + fx.Uint32(eff_e) * fx.Uint32(max_m)
+            rows_p[route_i32] = is_drop.select(dropped_row, row)
         gpu.barrier()
 
         # Phase C: tile-aligned inclusive scan of per-expert counts.
@@ -671,14 +685,18 @@ def build_moe_route_psum_fused_module():
             p_p[tid] = start + m_tid
         gpu.barrier()
 
-        # Phase D: in-place masked -> contiguous row remap.
+        # Phase D: in-place masked -> contiguous row remap. A dropped route's
+        # sentinel stays a sentinel (its expert would index past `starts`).
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
-            row = fx.Uint32(rows_p[route_i32])
+            row_i32 = rows_p[route_i32]
+            is_drop = row_i32 < c0_i32
+            row = fx.Uint32(row_i32)
             m = fx.Uint32(max_m)
             expert = row // m
             slot = row - expert * m
-            start = fx.Uint32(s_p[expert])
-            rows_p[route_i32] = start + slot
+            eff_expert = is_drop.select(fx.Uint32(0), expert)
+            start = fx.Uint32(s_p[eff_expert])
+            rows_p[route_i32] = is_drop.select(dropped_row, start + slot)
 
     @flyc.jit
     def launch_route_psum_fused(

@@ -129,7 +129,14 @@ def build_moe_route_maps_module():
 
 
 def build_moe_topids_to_rows_module():
-    """JIT launcher: builds topids_to_rows only (no rows_to_tokens inverse)."""
+    """JIT launcher: builds topids_to_rows only (no rows_to_tokens inverse).
+
+    A route whose expert id is negative -- the top-k writes -1 for every slot of
+    a row past ``num_valid_rows`` (a graph bucket's pad rows) -- claims no slot
+    and gets ``DROPPED_ROUTE_ROW``, as the g2l kernels do for a dropped route;
+    every consumer of the row map skips that sentinel. Indexing the counter
+    with the raw -1 wrote past it and sent the gather a garbage row.
+    """
 
     @flyc.kernel(name="moe_route")
     def route_kernel(
@@ -139,7 +146,9 @@ def build_moe_topids_to_rows_module():
         numel: Int32,
         max_m: Int32,
     ):
+        c0_i32 = fx.Int32(0)
         c1_i32 = fx.Int32(1)
+        dropped_row = fx.Int32(DROPPED_ROUTE_ROW)
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         in_range = route < fx.Uint32(numel)
         if in_range:
@@ -147,10 +156,15 @@ def build_moe_topids_to_rows_module():
             out_p = ptr_buf_tensor(topids_to_rows)
 
             e = topk_p[route]
-            ptr = _i32_ptr(atomic_buffer) + e
-            slot = fx.atomic_add(ptr, c1_i32, syncscope="agent")
-            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-            out_p[route] = row
+            is_drop = e < c0_i32
+            # Dropped routes address bucket 0 to keep the atomic in bounds, but
+            # add 0 to it and keep the sentinel instead of the row.
+            eff_e = is_drop.select(c0_i32, e)
+            incr = is_drop.select(c0_i32, c1_i32)
+            ptr = _i32_ptr(atomic_buffer) + eff_e
+            slot = fx.atomic_add(ptr, incr, syncscope="agent")
+            row = fx.Uint32(slot) + fx.Uint32(eff_e) * fx.Uint32(max_m)
+            out_p[route] = is_drop.select(dropped_row, row)
 
     @flyc.jit
     def launch_topids_to_rows(
