@@ -70,6 +70,17 @@ def all_gather_unreg(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_gatherv(
+    _fa: int,
+    inps: list[torch.Tensor],
+    outs: list[torch.Tensor],
+    sizes: list[int],
+    reg_buffer: int,
+    reg_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm(
     _fa: int,
     inp: torch.Tensor,
@@ -153,6 +164,7 @@ def fused_allreduce_rmsnorm_mxfp4_quant(
     reg_bytes: int,
     use_1stage: bool,
     bf16_out_ptr: int = 0,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
