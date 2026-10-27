@@ -69,7 +69,8 @@ def _co_test_profile_dirs(root: Path) -> list[tuple[Path, str]]:
     if (root / "build_info.json").is_file():
         return [(root, "")]
     return [
-        (root / name, name) for name in (GFX1250, f"{GFX1250}-a0")
+        (root / name, name)
+        for name in (GFX1250, f"{GFX1250}-a0")
         if (root / name / "build_info.json").is_file()
     ]
 
@@ -131,8 +132,12 @@ def _run_gfx1250_co_case(kid: int, device: torch.device | None = None) -> None:
     cpu_reference = os.environ.get("OPUS_CO_CPU_REFERENCE") == "1"
     random_device = "cpu" if cpu_reference else device
     generator = torch.Generator(device=random_device).manual_seed(kid)
-    A_source = torch.randn((M, K), device=random_device, dtype=torch.bfloat16, generator=generator)
-    B_source = torch.randn((N, K), device=random_device, dtype=torch.bfloat16, generator=generator)
+    A_source = torch.randn(
+        (M, K), device=random_device, dtype=torch.bfloat16, generator=generator
+    )
+    B_source = torch.randn(
+        (N, K), device=random_device, dtype=torch.bfloat16, generator=generator
+    )
     A, B = A_source.to(device), B_source.to(device)
     Y = torch.full((M, N), float("nan"), device=device, dtype=torch.bfloat16)
 
@@ -164,7 +169,9 @@ def _run_gfx1250_co_override_case(available_kid: int, missing_kid: int) -> None:
                 f"override lookup did not report a selected missing-image path {missing_images}: {error}"
             ) from error
     else:
-        raise AssertionError(f"override lookup unexpectedly found a missing image {missing_images}")
+        raise AssertionError(
+            f"override lookup unexpectedly found a missing image {missing_images}"
+        )
 
     _run_gfx1250_co_case(available_kid)
 
@@ -314,13 +321,19 @@ def test_gfx1250_co_assets_and_host_only_codegen(tmp_path, monkeypatch):
 
 
 def test_gfx1250_named_co_assets_and_placement():
-    root = _co_test_root() if os.environ.get("OPUS_TEST_CO_ROOT") else Path(CO_KERNELS_JSON).parent / "named_reg"
+    root = (
+        _co_test_root()
+        if os.environ.get("OPUS_TEST_CO_ROOT")
+        else Path(CO_KERNELS_JSON).parent / "named_reg"
+    )
     profiles = _co_test_profile_dirs(root)
     assert profiles, f"no CO build_info found under combined/direct root {root}"
     symbols = {kid: k.name for kid, k in gfx1250_4wave_co_kernels_list.items()}
     for image_dir, _ in profiles:
         build_info = json.loads((image_dir / "build_info.json").read_text())
-        assert {entry["kid"]: entry["symbol"] for entry in build_info["kernels"]} == symbols
+        assert {
+            entry["kid"]: entry["symbol"] for entry in build_info["kernels"]
+        } == symbols
         for entry in build_info["kernels"]:
             assert entry["pinning_mode"] == "named-register"
             assert entry["kernarg_segment_size"] == 64
@@ -329,9 +342,12 @@ def test_gfx1250_named_co_assets_and_placement():
             assert entry["wmma_placement_checked"]
             assert entry["wmma_dst_in_named_bank"] == entry["dis_wmma"] > 0
             assert entry["vgpr_spill_count"] == entry["sgpr_spill_count"] == 0
-            assert entry["co_sha256"] == hashlib.sha256(
-                (image_dir / f"{entry['symbol']}.co").read_bytes()
-            ).hexdigest()
+            assert (
+                entry["co_sha256"]
+                == hashlib.sha256(
+                    (image_dir / f"{entry['symbol']}.co").read_bytes()
+                ).hexdigest()
+            )
 
 
 @pytest.mark.parametrize(
@@ -374,16 +390,24 @@ def test_gfx1250_named_co_bmm_and_graph(
     random_device = "cpu" if cpu_reference else _gfx1250_device
     generator = torch.Generator(device=random_device).manual_seed(kid + K)
     A_source = torch.randn(
-        (2, M, K + pad), device=random_device, dtype=torch.bfloat16, generator=generator,
+        (2, M, K + pad),
+        device=random_device,
+        dtype=torch.bfloat16,
+        generator=generator,
     )
     B_source = torch.randn(
-        (2, N, K + pad), device=random_device, dtype=torch.bfloat16, generator=generator,
+        (2, N, K + pad),
+        device=random_device,
+        dtype=torch.bfloat16,
+        generator=generator,
     )
     # Transfer the complete padded buffers before slicing, preserving source
     # row and batch strides even in CPU-golden mode.
     A = A_source.to(_gfx1250_device)[..., :K]
     B = B_source.to(_gfx1250_device)[..., :K]
-    Y = torch.full((2, M, N), float("nan"), device=_gfx1250_device, dtype=torch.bfloat16)
+    Y = torch.full(
+        (2, M, N), float("nan"), device=_gfx1250_device, dtype=torch.bfloat16
+    )
     reference = A_source[..., :K].float() @ B_source[..., :K].float().transpose(-1, -2)
 
     for _ in range(3):
@@ -392,7 +416,9 @@ def test_gfx1250_named_co_bmm_and_graph(
     assert actual is Y, context
     checked = Y.cpu() if cpu_reference else Y
     assert torch.isfinite(checked).all().item(), context
-    torch.testing.assert_close(checked.float(), reference, rtol=0.03, atol=0.5, msg=context)
+    torch.testing.assert_close(
+        checked.float(), reference, rtol=0.03, atol=0.5, msg=context
+    )
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -403,7 +429,9 @@ def test_gfx1250_named_co_bmm_and_graph(
         torch.cuda.synchronize(_gfx1250_device)
         checked = Y.cpu() if cpu_reference else Y
         assert torch.isfinite(checked).all().item(), context
-        torch.testing.assert_close(checked.float(), reference, rtol=0.03, atol=0.5, msg=context)
+        torch.testing.assert_close(
+            checked.float(), reference, rtol=0.03, atol=0.5, msg=context
+        )
 
 
 def test_gfx1250_co_dir_override_matches_torch(_gfx1250_device, tmp_path):
@@ -416,7 +444,10 @@ def test_gfx1250_co_dir_override_matches_torch(_gfx1250_device, tmp_path):
     for source_dir, relative in profiles:
         override_image_dir = override_root / relative
         override_image_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_dir / f"{instance.name}.co", override_image_dir / f"{instance.name}.co")
+        shutil.copy2(
+            source_dir / f"{instance.name}.co",
+            override_image_dir / f"{instance.name}.co",
+        )
 
     environment = os.environ.copy()
     environment["OPUS_GEN_CO_DIR"] = str(override_root)

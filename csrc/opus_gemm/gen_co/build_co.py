@@ -212,13 +212,19 @@ def _elf_target_metadata(path, offload_arch):
             f"build_co: {path} target mismatch: machine={machine}, "
             f"processor=0x{processor:02x}, expected {offload_arch}/0x{expected:02x}"
         )
-    return {"offload_arch": offload_arch, "elf_machine": machine,
-            "elf_flags": flags, "elf_processor_id": processor}
+    return {
+        "offload_arch": offload_arch,
+        "elf_machine": machine,
+        "elf_flags": flags,
+        "elf_processor_id": processor,
+    }
 
 
 def _device_link_metadata(readelf, path):
     symbols = _run([readelf, "--symbols", path]).stdout
-    undefined = re.findall(r"^[ \t]*\d+:[^\n]*[ \t]UND[ \t]+(\S[^\n]*)$", symbols, re.MULTILINE)
+    undefined = re.findall(
+        r"^[ \t]*\d+:[^\n]*[ \t]UND[ \t]+(\S[^\n]*)$", symbols, re.MULTILINE
+    )
     if undefined:
         raise SystemExit(f"build_co: {path} has unresolved device symbols: {undefined}")
     return {"undefined_symbols": []}
@@ -333,9 +339,17 @@ def _check_wmma_placement(text, k, flags):
 
 def _named_register_stats(text, require_pin=True, expected_tuples=None):
     """Verify named reads AND writes for every expected physical tuple."""
-    names = dict(re.findall(r'^\s*!(\d+)\s*=\s*!\{!"(v(?:\d+|\[\d+:\d+\]))"\}', text, re.MULTILINE))
-    read_ids = re.findall(r"\bcall\b[^\n]*@llvm\.read_register\.[^\n]*?metadata !(\d+)", text)
-    write_ids = re.findall(r"\bcall\b[^\n]*@llvm\.write_register\.[^\n]*?metadata !(\d+)", text)
+    names = dict(
+        re.findall(
+            r'^\s*!(\d+)\s*=\s*!\{!"(v(?:\d+|\[\d+:\d+\]))"\}', text, re.MULTILINE
+        )
+    )
+    read_ids = re.findall(
+        r"\bcall\b[^\n]*@llvm\.read_register\.[^\n]*?metadata !(\d+)", text
+    )
+    write_ids = re.findall(
+        r"\bcall\b[^\n]*@llvm\.write_register\.[^\n]*?metadata !(\d+)", text
+    )
     read_tuples = {names[i] for i in read_ids if i in names}
     write_tuples = {names[i] for i in write_ids if i in names}
     tuples = sorted(read_tuples | write_tuples)
@@ -372,11 +386,19 @@ def _integer_macro(flags, name, default):
             if literal in ("false", "true"):
                 value = int(literal == "true")
                 continue
-            number = re.fullmatch(r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)([uUlL]*)", literal)
+            number = re.fullmatch(
+                r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)([uUlL]*)", literal
+            )
             if not number:
-                raise SystemExit(f"build_co: {name} must be an integer literal, got {literal!r}")
+                raise SystemExit(
+                    f"build_co: {name} must be an integer literal, got {literal!r}"
+                )
             digits = number.group(1)
-            base = 16 if digits.lower().startswith("0x") else 8 if digits.startswith("0") else 10
+            base = (
+                16
+                if digits.lower().startswith("0x")
+                else 8 if digits.startswith("0") else 10
+            )
             value = int(digits, base)
     return value
 
@@ -409,7 +431,9 @@ def _expected_named_tuples(k, flags):
         raise SystemExit("build_co: named A and bf16 C banks overlap; disable one")
 
     def bank(base, width, count):
-        return {f"v[{base + i * width}:{base + (i + 1) * width - 1}]" for i in range(count)}
+        return {
+            f"v[{base + i * width}:{base + (i + 1) * width - 1}]" for i in range(count)
+        }
 
     tuples = bank(acc_base, 8, num_acc) | bank(b_base, 8, 2 * b_frags)
     if pin_a:
@@ -549,15 +573,20 @@ def build_one(k, args, llvm_bin, workdir):
     asm_dir = os.path.join(args.out_dir, "asm")
     if not args.no_asm:
         os.makedirs(asm_dir, exist_ok=True)
-    ir_path = os.path.join(
-        workdir if args.no_asm else asm_dir, f"{symbol}.ll"
-    )
+    ir_path = os.path.join(workdir if args.no_asm else asm_dir, f"{symbol}.ll")
     run_compile(["-S", "--cuda-device-only", "-emit-llvm"], ir_path, "device IR")
     with open(ir_path) as f:
-        info.update(_named_register_stats(
-            f.read(), require_pin=not _no_pin(device_flags),
-            expected_tuples=None if _no_pin(device_flags) else _expected_named_tuples(k, device_flags),
-        ))
+        info.update(
+            _named_register_stats(
+                f.read(),
+                require_pin=not _no_pin(device_flags),
+                expected_tuples=(
+                    None
+                    if _no_pin(device_flags)
+                    else _expected_named_tuples(k, device_flags)
+                ),
+            )
+        )
 
     # Check the actual ELF even when --no-asm disables debug file retention.
     objdump = _tool(llvm_bin, "llvm-objdump")
@@ -621,12 +650,18 @@ def main():
         "was used is recorded in build_info.json. "
         "Defaults to $OPUS_CO_LLVM_BIN, then $PIN.",
     )
-    p.add_argument("--arch", default="gfx1250", choices=("gfx1250",),
-                   help="logical runtime architecture (A0 images use an -a0 storage suffix)")
     p.add_argument(
-        "--offload-arch", choices=("gfx1250", "gfx1250-strict"), default=None,
+        "--arch",
+        default="gfx1250",
+        choices=("gfx1250",),
+        help="logical runtime architecture (A0 images use an -a0 storage suffix)",
+    )
+    p.add_argument(
+        "--offload-arch",
+        choices=("gfx1250", "gfx1250-strict"),
+        default=None,
         help="actual device target; gfx1250-strict builds independent A0 images "
-             "while retaining gfx1250 runtime routing and kernel identities",
+        "while retaining gfx1250 runtime routing and kernel identities",
     )
     p.add_argument(
         "--device-flag",
@@ -643,7 +678,7 @@ def main():
         "--out-dir",
         default="",
         help="default: <this dir>/named_reg/<arch>; with gfx1250-strict: "
-             "<this dir>/<arch>-a0. Pass an explicit output for production rebuilds",
+        "<this dir>/<arch>-a0. Pass an explicit output for production rebuilds",
     )
     p.add_argument(
         "--no-asm",
@@ -695,7 +730,8 @@ def main():
         if unknown:
             p.error(f"unknown CO kids: {sorted(unknown)}")
         instances = [
-            k for kid, k in gfx1250_4wave_co_kernels_declared.items()
+            k
+            for kid, k in gfx1250_4wave_co_kernels_declared.items()
             if kid in selected and k.kernel_tag in _PIPELINE_HEADERS
         ]
     if not instances:
@@ -739,13 +775,18 @@ def main():
     info = {
         "arch": args.arch,
         "offload_arch": args.offload_arch,
-        "target_profile": "a0-strict" if args.offload_arch == "gfx1250-strict" else "regular",
+        "target_profile": (
+            "a0-strict" if args.offload_arch == "gfx1250-strict" else "regular"
+        ),
         "hipcc": args.hipcc,
         "device_clang": ver,
         "hip_clang_path": llvm_bin,
         # Shared by every entry; the per-entry -mllvm flags are in kernels[].
         "common_flags": [
-            "-D__HIPCC_RTC__", "-O3", "-std=c++20", "-Werror=ignored-attributes"
+            "-D__HIPCC_RTC__",
+            "-O3",
+            "-std=c++20",
+            "-Werror=ignored-attributes",
         ],
         "kernels": built,
     }

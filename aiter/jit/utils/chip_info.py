@@ -185,7 +185,9 @@ def _hipinfo_gpu_agents() -> list[tuple[str, int]]:
         name = re.search(
             r"^gcnArchName:\s*(gfx\w+)", block, re.MULTILINE | re.IGNORECASE
         )
-        rev = re.search(r"^asicRevision:\s*(0[xX][0-9a-fA-F]+|\d+)", block, re.MULTILINE)
+        rev = re.search(
+            r"^asicRevision:\s*(0[xX][0-9a-fA-F]+|\d+)", block, re.MULTILINE
+        )
         if name and rev:
             agents.append((name.group(1).lower(), _parse_asic_revision(rev.group(1))))
     return agents
