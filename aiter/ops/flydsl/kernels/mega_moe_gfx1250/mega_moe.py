@@ -1021,73 +1021,22 @@ class _CompactGeometry:
         )
 
 
-def _dispatch_regions(config: MegaMoEConfig, mori, compact=None) -> dict:
-    """What the dispatch writes: the routing both kinds share, then its rows."""
-    max_recv, topk = config.max_recv, config.topk
-    regions = {
-        "tok_off": 4,
-        # mori's gfx1250 dispatch signals 8 bytes a source (ROCm/mori#745).
-        "recv_num": 2 * config.world_size * 4,
-        "recv_to_src_token": max_recv * 4,
-        "out_idx": max_recv * topk * 4,
-        "out_wts": max_recv * topk * 4,
-    }
-    if config.recipe.dispatch is DispatchKind.COMPACT:
-        from .compact_plan import compact_done_nbytes
-
-        geo = compact if compact is not None else _CompactGeometry.of(config)
-        regions["disp_out"] = geo.cap * geo.wire_row
-        regions["ep_rowmap"] = (geo.cap + 1) * 8
-        regions["compact_hist"] = 2 * geo.hist_stride * 4
-        regions["compact_done"] = compact_done_nbytes()
-    else:
-        regions["disp_out"] = max_recv * config.dispatch_token_nbytes
-        if config.is_quant_dispatch_wire:
-            regions["disp_out_scales"] = max_recv * mori.scale_stride(config)
-    return regions
-
-
-def _combine_regions(config: MegaMoEConfig, mori) -> dict:
-    """What the combine stages through: its barrier and its input rows."""
-    regions = {"cross_device_barrier": config.world_size * 8}
-    if config.recipe.combine is CombineKind.FUSED_SCATTER:
-        # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
-        # holds a step on any of them and a quantized one just packs into the
-        # front of it at its own pitch.
-        regions["comb_inp"] = (
-            config.max_tokens_per_rank * config.topk * config.combine_slot_stride_bytes
-        )
-        return regions
-    # mori's outTok: one bf16 staging row per recv slot, then, for the fp4 push
-    # combine, its landing rows and, from four ranks up, a u64 flag per landing
-    # row for the overlapped combine (EpFp4Ovl) -- the same three parts mori's
-    # own out_tok sizes.
-    nbytes = config.max_recv * config.hidden_dim * 2
-    if config.combine_quant_bits:
-        landing_rows = mori.push_landing_rows(config)
-        if landing_rows is None:
-            landing_rows = config.world_size * config.max_recv
-        nbytes += landing_rows * mori.push_wire_bytes(config)
-        if config.world_size >= 4:
-            nbytes += landing_rows * 8
-    regions["comb_inp"] = nbytes
-    return regions
-
-
-def _arena_layout(config: MegaMoEConfig, mori, compact=None) -> _ArenaLayout:
-    """The one arena formula: what the runtime allocates and what
-    ``required_vmm_bytes`` reports."""
-    return _ArenaLayout.merge(
-        _dispatch_regions(config, mori, compact), _combine_regions(config, mori)
-    )
-
-
 def _cco_alloc_bytes(nbytes: int, granularity: int) -> int:
     """What ccoMemAlloc takes out of per_rank_vmm for an ``nbytes`` allocation."""
     aligned = _align_up(nbytes, granularity)
     if nbytes > _CCO_MR_PAD_THRESHOLD:
         aligned = _align_up(aligned, _CCO_MR_PAD_ALIGN)
     return aligned
+
+
+# -- the transport ---------------------------------------------------------------
+#
+# A dispatch stage and a combine stage, picked by the recipe, over one arena.
+# Each stage declares the regions it needs (``regions``, pure, so the arena can be
+# sized before any communicator exists), plans in ``__init__`` with nothing
+# allocated, then allocates in ``build``. They meet only through the shared
+# ``_EpResources``, the ``_DispatchBatch`` the dispatch hands the expert GEMM, and
+# the ``_ComputeTarget`` the combine has the GEMM write into.
 
 
 @dataclass
@@ -1101,6 +1050,1077 @@ class Routing:
         # and no peer reaches one until every rank clears _combine_sync, which
         # is stream-ordered after the gemm2 that reads it.
         return self.reverse_source_view
+
+
+class _EpResources:
+    """What the dispatch and the combine share: the arena, the per-step routing
+    state both ends read, and the collective allocations, which go last."""
+
+    def __init__(self, arena: SymmetricArena):
+        self.arena = arena
+        # mori's slot allocator word, when it lives outside the window.
+        self.tokoff_ext = None
+
+    def allocate(self, config: MegaMoEConfig, device) -> None:
+        self.arena.zero()
+        self._hidden_dim = config.hidden_dim
+        # Shared with grouped_moe_gfx1250. TDM dispatch clears this at its tail,
+        # before the following route kernel starts issuing slot atomics.
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import route_counter_buffer
+
+        self.route_counter = route_counter_buffer(config.experts_per_rank, device)
+        self.token_destination_map = torch.full(
+            (config.max_tokens_per_rank * config.topk,),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        # Send counts, then per destination mori's reservation base and push
+        # landing offset (ROCm/mori#745).
+        self.destination_peer_counter = torch.zeros(
+            2 * config.world_size, dtype=torch.int32, device=device
+        )
+        self.dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
+        self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
+        self.combine_output = torch.zeros(
+            config.max_tokens_per_rank * config.hidden_dim,
+            dtype=torch.int16,
+            device=device,
+        )
+
+    def output(self, token_count: int) -> torch.Tensor:
+        """The combine's result for this step's ``token_count`` tokens."""
+        return (
+            self.combine_output[: token_count * self._hidden_dim]
+            .view(torch.bfloat16)
+            .view(token_count, self._hidden_dim)
+        )
+
+    def close(self):
+        self.arena.close()
+        if self.tokoff_ext is not None:
+            self.tokoff_ext.close()
+            self.tokoff_ext = None
+
+
+@dataclass
+class _DispatchBatch:
+    """One step's dispatched rows as the expert GEMM reads them, and the routing
+    the combine sends the results home by."""
+
+    x: torch.Tensor
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    scales: torch.Tensor | None  # the wire's e8m0 rows; None on bf16
+    num_local_tokens: torch.Tensor | None
+    routing: Routing
+    # The compact plan's per-expert grouping, as Stage2ScatterContext's compact_*
+    # fields; None for token-major rows.
+    compact_rows: dict | None = None
+
+
+@dataclass
+class _ComputeTarget:
+    """Where the expert GEMM leaves its rows: scattered into the peers' slots by
+    its gemm2 epilogue, or written to ``output``."""
+
+    scatter: Stage2ScatterContext | None = None
+    output: torch.Tensor | None = None
+
+
+class _Dispatch:
+    """Tokens out to their experts' ranks, into the arena's recv rows."""
+
+    compact = None  # the compact row geometry, on the compact plan
+    tokoff_ext = False  # mori's slot word lives outside the window
+
+    def __init__(self, config: MegaMoEConfig, mori, schedule: tuple):
+        self.config = config
+        self.mori = mori
+        self.schedule = schedule
+        # A spec is (block, warp), plus route_parallel on the compact path.
+        self.specs = sorted({tuple(entry[1:]) for entry in schedule})
+        self.res = None
+        self._quant_payload = None
+        self._quant_scales = None
+        # Points at the persistent scale rows, set per dispatch on a quantizing
+        # wire; 0 (and unread) on bf16.
+        self._sent_scales_ptr = 0
+
+    @staticmethod
+    def routing_regions(config: MegaMoEConfig) -> dict:
+        """The routing both dispatches write and the combine reads back."""
+        max_recv, topk = config.max_recv, config.topk
+        return {
+            "tok_off": 4,
+            # mori's gfx1250 dispatch signals 8 bytes a source (ROCm/mori#745).
+            "recv_num": 2 * config.world_size * 4,
+            "recv_to_src_token": max_recv * 4,
+            "out_idx": max_recv * topk * 4,
+            "out_wts": max_recv * topk * 4,
+        }
+
+    def build(self, res: _EpResources) -> None:
+        self.res = res
+        config, arena = self.config, res.arena
+        device = res.total_recv.device
+        # Quantized dispatch reuses fixed buffers across layers and graph
+        # replays. The public quant wrapper allocates both tensors on every call;
+        # keeping them here removes allocator/capture nodes from the stage-1
+        # critical path without changing the quant kernel or wire format.
+        if config.is_quant_dispatch_wire:
+            payload_cols = (
+                config.dispatch_token_nbytes
+                // config.dispatch_wire_spec.quant_dtype.itemsize
+            )
+            self._quant_payload = torch.empty(
+                (config.max_tokens_per_rank, payload_cols),
+                dtype=config.dispatch_wire_spec.quant_dtype,
+                device=device,
+            )
+            self._quant_scales = torch.empty(
+                (config.max_tokens_per_rank, config.dispatch_scale_nbytes),
+                dtype=torch.uint8,
+                device=device,
+            ).view(dtypes.fp8_e8m0)
+        self.recv_weights = _from_gpu_ptr(
+            arena.local_ptr("out_wts"), (config.max_recv, config.topk), torch.float32
+        )
+        self.recv_ids = _from_gpu_ptr(
+            arena.local_ptr("out_idx"), (config.max_recv, config.topk), torch.int32
+        )
+        self._reverse_source = _from_gpu_ptr(
+            arena.local_ptr("recv_to_src_token"), (config.max_recv,), torch.int32
+        )
+
+    def recv_views(self) -> tuple:
+        """(recv_x, recv_weights, recv_ids) over the whole arena."""
+        return self.recv_x, self.recv_weights, self.recv_ids
+
+    def select(self, token_count: int) -> tuple:
+        for upper_bound, *spec in self.schedule:
+            if upper_bound is None or token_count <= upper_bound:
+                spec = tuple(spec)
+                return spec if spec in self.specs else self.specs[-1]
+        return self.specs[-1]
+
+    def _quantize(self, hidden_states: torch.Tensor, token_count: int):
+        """What goes on the wire: hidden_states on bf16, else its MX rows."""
+        if self._quant_payload is None:
+            return hidden_states
+        # Quantize ONCE PER LOCAL TOKEN here, instead of once per received
+        # copy on the far side. Destination-independent, so the bytes are the
+        # same either way; the preshuffle cannot move with it, because its
+        # destination is the grouped row the receiver assigns.
+        from aiter.ops.quant import dynamic_per_group_scaled_quant
+
+        payload = self._quant_payload[:token_count]
+        scale_rows = self._quant_scales[:token_count]
+        dynamic_per_group_scaled_quant(
+            payload,
+            hidden_states,
+            scale_rows,
+            32,
+            shuffle_scale=False,
+        )
+        # Straight onto the wire; mori restrides these packed rows while it
+        # stages them, so there is no repack here.
+        self._sent_scales_ptr = scale_rows.data_ptr()
+        return payload
+
+    def _routing(self, token_count: int) -> Routing:
+        return Routing(
+            token_count=token_count, reverse_source_view=self._reverse_source
+        )
+
+    def prefetch(self, topk_ids, recv_token_bound=None) -> None:
+        """Nothing to run ahead off the compact plan."""
+
+    def warmup(self, recv_token_bound=None, token_count=None) -> None:
+        """Nothing to compile ahead off the compact plan."""
+
+    def close(self) -> None:
+        pass
+
+
+class _MoriDispatch(_Dispatch):
+    """mori's EpDispatchPlan: token-major recv rows.
+
+    The routing regions are laid out as on the compact path (out_idx/out_wts at
+    slot*topk+k, recv_to_src_token as src_pe*max_tok+src_tok), and mori never
+    touches cross_device_barrier. Recv slots are reserved one atomic per block
+    and handed out block-local.
+    """
+
+    def __init__(self, config: MegaMoEConfig, mori):
+        # mori's geometry is a compile-time Cfg field, so it brings its own
+        # tuned buckets.
+        super().__init__(config, mori, mori.dispatch_schedule(config))
+        self.tokoff_ext, self._slot_word_kw = mori.slot_word(config)
+        # Passed only on a quantizing wire, matching dispatch_scale_dst_nbytes:
+        # mori grew scale_bytes in #593 and rejects UNKNOWN kwargs outright, so
+        # sending the bf16 wire's harmless 0 would make an older mori refuse
+        # the whole plan.
+        self._scale_kw = (
+            {"scale_bytes": config.dispatch_scale_nbytes}
+            if config.is_quant_dispatch_wire
+            else {}
+        )
+        # Since ROCm/mori#703 the dispatch stages through a buffer its caller
+        # binds; one serves every plan, as only one launches at a time.
+        self._staging_nbytes = mori.staging_bytes(
+            config, self._scale_kw.get("scale_bytes", 0)
+        )
+        self._staging = None
+        self._plans = {}
+
+    @staticmethod
+    def regions(config: MegaMoEConfig, mori, compact=None) -> dict:
+        regions = _Dispatch.routing_regions(config)
+        regions["disp_out"] = config.max_recv * config.dispatch_token_nbytes
+        if config.is_quant_dispatch_wire:
+            regions["disp_out_scales"] = config.max_recv * mori.scale_stride(config)
+        return regions
+
+    def build(self, res: _EpResources) -> None:
+        super().build(res)
+        config, arena = self.config, res.arena
+        if self._staging_nbytes is not None:
+            self._staging = torch.zeros(
+                self._staging_nbytes, dtype=torch.uint8, device=res.total_recv.device
+            )
+        EpDispatchPlan = self.mori.ep_plans.EpDispatchPlan
+        for spec in self.specs:
+            plan = EpDispatchPlan(
+                world_size=config.world_size,
+                # see dispatch_wire_elem_count; mori's plan_api: "the caller halves
+                # hiddenDim"
+                hidden_dim=config.dispatch_wire_elem_count,
+                max_tok_per_rank=config.max_tokens_per_rank,
+                num_expert_per_rank=config.experts_per_rank,
+                num_expert_per_token=config.topk,
+                max_recv=config.max_recv,
+                dtype=config.dispatch_wire_spec.mori_dtype,
+                use_weights=True,
+                **self._scale_kw,
+                **self._slot_word_kw,
+                block_num=spec[0],
+                warp_per_block=spec[1],
+                arena=arena,
+                region_names=_MORI_REGION_NAMES,
+            )
+            # The kernels dereference the window, so the plans have to outlive
+            # them; held from here so a failed bind still closes it.
+            self._plans[spec] = plan
+            plan.bind(rank=config.rank)
+            if self._staging is not None:
+                plan.bind(staging_base=self._staging.data_ptr())
+        self._tok_off_peers = None if res.tokoff_ext is None else res.tokoff_ext.peers
+        # Width in whatever recv_dtype counts: features for bf16/fp8, bytes for
+        # fp4 -- see _DispatchWire.recv_dtype.
+        width = (
+            config.dispatch_token_nbytes
+            // config.dispatch_wire_spec.recv_dtype.itemsize
+        )
+        self.recv_x = _from_gpu_ptr(
+            arena.local_ptr("disp_out"),
+            (config.max_recv, width),
+            config.dispatch_wire_spec.recv_dtype,
+        )
+        self.recv_scales = (
+            _from_gpu_ptr(
+                arena.local_ptr("disp_out_scales"),
+                (config.max_recv, config.dispatch_scale_dst_nbytes),
+                torch.uint8,
+            )
+            if config.is_quant_dispatch_wire
+            else None
+        )
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        recv_token_bound: int | None = None,
+        next_topk_ids: torch.Tensor | None = None,
+        next_recv_token_bound: int | None = None,
+        begin_step: bool = True,
+    ) -> _DispatchBatch:
+        """``recv_token_bound`` cuts the recv rows the GEMM is shown. There is no
+        plan to run ahead, so the next layer's ids go unused."""
+        config, res = self.config, self.res
+        token_count = hidden_states.shape[0]
+        if recv_token_bound is not None:
+            bound = int(recv_token_bound)
+            if bound <= 0 or bound > config.max_recv:
+                raise ValueError(
+                    f"recv_token_bound must be in (0, {config.max_recv}], "
+                    f"got {recv_token_bound}"
+                )
+        plan = self._plans[self.select(token_count)]
+        payload = self._quantize(hidden_states, token_count)
+        # No total_recv.zero_(): mori's gfx1250 dispatch overwrites it.
+        plan.launch(
+            stream=torch.cuda.current_stream().cuda_stream,
+            token_indices=topk_ids.data_ptr(),
+            inp_token_buf=payload.data_ptr(),
+            weights_buf=topk_weights.data_ptr(),
+            disp_dest_tok_id_map=res.token_destination_map.data_ptr(),
+            dest_pe_token_counter=res.destination_peer_counter.data_ptr(),
+            total_recv_token_num=res.total_recv.data_ptr(),
+            grid_barrier=res.dispatch_barrier.data_ptr(),
+            tok_off_peers=self._tok_off_peers,
+            num_tokens=token_count,
+            scales_buf=self._sent_scales_ptr,
+        )
+        x, weights, ids, scales = (
+            self.recv_x,
+            self.recv_weights,
+            self.recv_ids,
+            self.recv_scales,
+        )
+        if recv_token_bound is not None:
+            x, weights, ids = x[:bound], weights[:bound], ids[:bound]
+            if scales is not None:
+                scales = scales[:bound]
+        return _DispatchBatch(
+            x=x,
+            topk_weights=weights,
+            topk_ids=ids,
+            scales=scales,
+            num_local_tokens=res.total_recv,
+            routing=self._routing(token_count),
+        )
+
+    def close(self) -> None:
+        for plan in self._plans.values():
+            plan.close()
+        self._plans = {}
+        # After the plans, which hold its address.
+        self._staging = None
+
+
+@dataclass(frozen=True)
+class _CompactStep:
+    """One step's compact geometry, fixed from the caller's recv bound. Python
+    ints, so a captured graph keeps a static grid and each captured batch size
+    gets the geometry tuned for its own bucket."""
+
+    recv_bound: int  # the CSV token bucket
+    align_m: int  # per-expert row alignment the plan writes
+    rows: int  # row upper bound, bounding the GEMM grid
+
+
+class _CompactDispatch(_Dispatch):
+    """The FlyDSL compact plan, then its TDM dispatch: recv rows grouped per
+    expert and padded to the GEMM tile, the layout the grouped GEMM reads in
+    place.
+
+    The plan needs only topk_ids, so it runs on a side stream ahead of the
+    dispatch. Two hist/done slots and local tok_map/psum buffers let the next
+    layer's plan overlap this layer's expert GEMM.
+
+    Recv slots are reserved one atomic per (block, peer) and handed out
+    block-local. The TDM staging arrays stand in for the HIP kernel's
+    ``__device__`` BSS: FINALIZE gathers idx / weights / srcmap into a peer-major
+    destTokId SoA so META can ship each block's reserved run as contiguous TDM
+    copies.
+    """
+
+    _PLAN_SLOTS = 2
+
+    def __init__(self, config: MegaMoEConfig, mori=None):
+        # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
+        blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
+        warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
+        if blocks_env is not None or warps_env is not None:
+            schedule = ((None, int(blocks_env or "64"), int(warps_env or "8")),)
+        else:
+            schedule = _DISPATCH_COMPACT
+        super().__init__(config, mori, schedule)
+        self.compact = _CompactGeometry.of(config)
+        self._step = _CompactStep(
+            recv_bound=config.max_recv,
+            align_m=self.compact.tile_m,
+            rows=self.compact.cap,
+        )
+        self._slot = 0
+        self._plan_pending = False
+        self._plan_launches = {}
+
+    @staticmethod
+    def regions(config: MegaMoEConfig, mori=None, compact=None) -> dict:
+        from .compact_plan import compact_done_nbytes
+
+        geo = compact if compact is not None else _CompactGeometry.of(config)
+        regions = _Dispatch.routing_regions(config)
+        regions["disp_out"] = geo.cap * geo.wire_row
+        regions["ep_rowmap"] = (geo.cap + 1) * 8
+        regions["compact_hist"] = 2 * geo.hist_stride * 4
+        regions["compact_done"] = compact_done_nbytes()
+        return regions
+
+    def build(self, res: _EpResources) -> None:
+        super().build(res)
+        from .compact_plan import PLAN_BLOCKS
+
+        config, geo, arena = self.config, self.compact, res.arena
+        device = res.total_recv.device
+        epr = config.experts_per_rank
+        segs = config.world_size * epr
+        slots = range(self._PLAN_SLOTS)
+        # Slot 0 writes the shared map, slot 1 its own.
+        self._tok_maps = [res.token_destination_map] + [
+            torch.full_like(res.token_destination_map, -1) for _ in slots[1:]
+        ]
+        self._masked_ms = [
+            torch.zeros(epr, dtype=torch.int32, device=device) for _ in slots
+        ]
+        self._psums = [
+            torch.zeros(epr, dtype=torch.int32, device=device) for _ in slots
+        ]
+        self._block_hists = [
+            torch.empty(PLAN_BLOCKS * segs, dtype=torch.int32, device=device)
+            for _ in slots
+        ]
+        self._send_bases = [
+            torch.empty(segs, dtype=torch.int32, device=device) for _ in slots
+        ]
+        self._barriers = [
+            torch.zeros(4, dtype=torch.int32, device=device) for _ in slots
+        ]
+        # The grouped GEMM reads the compact rows' experts off the plan, so it
+        # is handed placeholders for the per-row routing.
+        self._dummy_ids = torch.zeros(
+            (1, config.topk), dtype=torch.int32, device=device
+        )
+        self._dummy_wts = torch.zeros(
+            (1, config.topk), dtype=torch.float32, device=device
+        )
+        self._plan_stream = torch.cuda.Stream()
+        self._plan_event = torch.cuda.Event()
+        # Warm both hist/done slots and the capacity bucket: compiling inside
+        # graph capture is not allowed.
+        for slot in slots:
+            self._plan_for(geo.tile_m, slot)
+        self._kernels = self._build_kernels()
+        # Width in whatever recv_dtype counts: bytes on both quantizing wires.
+        width = (
+            config.dispatch_token_nbytes
+            // config.dispatch_wire_spec.recv_dtype.itemsize
+        )
+        storage = _from_gpu_ptr(
+            arena.local_ptr("disp_out"),
+            (geo.cap * geo.wire_row,),
+            config.dispatch_wire_spec.recv_dtype,
+        )
+        self.recv_x = torch.as_strided(storage, (geo.cap, width), (geo.wire_row, 1))
+        # Each row's e8m0 scales follow its payload inside the wire row.
+        scale_row = config.dispatch_scale_nbytes
+        storage = _from_gpu_ptr(
+            arena.local_ptr("disp_out") + config.dispatch_token_nbytes,
+            ((geo.cap - 1) * geo.wire_row + scale_row,),
+            torch.uint8,
+        )
+        self.recv_scales = torch.as_strided(
+            storage, (geo.cap, scale_row), (geo.wire_row, 1)
+        )
+        self._ep_rowmap = _from_gpu_ptr(
+            arena.local_ptr("ep_rowmap"), (geo.cap + 1, 2), torch.int32
+        )
+
+    def _build_kernels(self) -> dict:
+        """The TDM dispatch kernels, keyed by (block, warp, route_parallel) spec."""
+        config, geo, arena = self.config, self.compact, self.res.arena
+        device = self.res.total_recv.device
+        payload_dim = config.dispatch_wire_elem_count
+        elem_size = config.dispatch_wire_spec.recv_dtype.itemsize
+        _, slots = tdm_stage_capacity(npes=config.world_size, max_recv=config.max_recv)
+        self._stage = (
+            torch.empty(slots * config.topk, dtype=torch.int32, device=device),
+            torch.empty(slots * config.topk, dtype=torch.int32, device=device),
+            torch.empty(slots, dtype=torch.int32, device=device),
+            torch.empty(
+                slots * config.dispatch_scale_dst_nbytes,
+                dtype=torch.uint8,
+                device=device,
+            ),
+        )
+        for buf in self._stage:
+            if buf.data_ptr() % 128:
+                raise RuntimeError(
+                    "TDM staging allocations must be 128-byte aligned, got "
+                    f"0x{buf.data_ptr():x}"
+                )
+        self._stage_ptrs = tuple(buf.data_ptr() for buf in self._stage)
+        # Compact compiles the metadata batch away, so its LDS tile is one wire
+        # row.
+        slab_bytes = geo.wire_row
+        # Clamp warp count to the LDS tile budget but keep the tuned block
+        # count, which is what paces the grid barrier, and keep the caller's
+        # spec as the key so the runtime pick still resolves.
+        max_warps = tdm_max_warps(
+            hidden_dim=payload_dim,
+            hidden_elem_size=elem_size,
+            npes=config.world_size,
+            slab_bytes=slab_bytes,
+        )
+        built = {}
+        kernels = {}
+        for spec in self.specs:
+            route_parallel = len(spec) > 2 and bool(spec[2])
+            geom = (spec[0], min(spec[1], max_warps), route_parallel)
+            if geom not in built:
+                built[geom] = _make_dispatch_tdm(
+                    rank=config.rank,
+                    npes=config.world_size,
+                    experts_per_rank=config.experts_per_rank,
+                    experts_per_token=config.topk,
+                    hidden_dim=payload_dim,
+                    hidden_elem_size=elem_size,
+                    slab_bytes=slab_bytes,
+                    max_tok_per_rank=config.max_tokens_per_rank,
+                    max_recv=geo.cap,
+                    compact_row_stride=geo.wire_row,
+                    enable_signal=True,
+                    off_tok_off=arena.offset("tok_off"),
+                    off_recv_num=arena.offset("recv_num"),
+                    off_tis=arena.offset("recv_to_src_token"),
+                    off_out_idx=arena.offset("out_idx"),
+                    off_out_wts=arena.offset("out_wts"),
+                    off_out_tok=arena.offset("disp_out"),
+                    off_out_scales=(
+                        arena.offset("disp_out") + config.dispatch_token_nbytes
+                    ),
+                    scale_bytes=config.dispatch_scale_nbytes,
+                    scale_stride=config.dispatch_scale_dst_nbytes,
+                    block_num=geom[0],
+                    warp_num_per_block=geom[1],
+                    clear_route_counter=False,
+                    compact_plan=True,
+                    off_ep_rowmap=arena.offset("ep_rowmap"),
+                    max_tok_slot_stride=config.max_tokens_per_rank * config.topk,
+                    route_parallel=route_parallel,
+                )
+            kernels[spec] = built[geom]
+        return kernels
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        recv_token_bound: int | None = None,
+        next_topk_ids: torch.Tensor | None = None,
+        next_recv_token_bound: int | None = None,
+        begin_step: bool = True,
+    ) -> _DispatchBatch:
+        """Compact cannot slice recv_x -- the rows are grouped per expert, not
+        token-major -- so ``recv_token_bound`` is spent on the step's geometry
+        instead: it picks the plan's alignment, the GEMM's tile and the GEMM's
+        grid. ``next_topk_ids`` starts the next layer's plan once this dispatch
+        is issued."""
+        config, res = self.config, self.res
+        token_count = int(hidden_states.shape[0])
+        if begin_step:
+            self._step = self._step_for(self._recv_bound(token_count, recv_token_bound))
+        kernel = self._kernels[self.select(token_count)]
+        if not self._plan_pending:
+            self._launch_plan(topk_ids, token_count, self._slot, self._step.align_m)
+        stream = fx.Stream(torch.cuda.current_stream())
+        payload = self._quantize(hidden_states, token_count)
+        self._wait_plan()
+        slot, step = self._slot, self._step
+        _run_compiled(
+            kernel,
+            res.arena.handle,
+            payload.data_ptr(),
+            topk_ids.data_ptr(),
+            topk_weights.data_ptr(),
+            self._tok_maps[slot].data_ptr(),
+            res.destination_peer_counter.data_ptr(),
+            res.dispatch_barrier.data_ptr(),
+            res.total_recv.data_ptr(),
+            *self._stage_ptrs,
+            self._sent_scales_ptr,
+            res.route_counter.data_ptr(),
+            config.rank,
+            token_count,
+            stream,
+        )
+        batch = _DispatchBatch(
+            x=self.recv_x,
+            topk_weights=self._dummy_wts,
+            topk_ids=self._dummy_ids,
+            scales=self.recv_scales,
+            num_local_tokens=None,
+            routing=self._routing(token_count),
+            compact_rows={
+                "compact_layout": True,
+                "compact_masked_m": self._masked_ms[slot],
+                "compact_psum": self._psums[slot],
+                "compact_ep_rowmap": self._ep_rowmap,
+                "compact_wire_row_stride": self.compact.wire_row,
+                "compact_recv_bound": step.recv_bound,
+                "compact_align_m": step.align_m,
+                "compact_rows": step.rows,
+            },
+        )
+        if next_topk_ids is not None and int(next_topk_ids.shape[0]) > 0:
+            # Dispatch of this layer is done, so tok_map[slot] is free. GEMM
+            # still reads psum/masked_m of this slot; the next plan writes the
+            # other slot and overlaps the expert GEMM (and later combine/RMS).
+            nxt = 1 - slot
+            count = int(next_topk_ids.shape[0])
+            ahead = self._step_for(self._recv_bound(count, next_recv_token_bound))
+            self._launch_plan(next_topk_ids, count, nxt, ahead.align_m)
+            self._slot = nxt
+        return batch
+
+    def prefetch(self, topk_ids, recv_token_bound=None) -> None:
+        """Launch the plan for ``topk_ids`` on the side stream, into this step."""
+        token_count = int(topk_ids.shape[0])
+        self._step = self._step_for(self._recv_bound(token_count, recv_token_bound))
+        self._launch_plan(topk_ids, token_count, self._slot, self._step.align_m)
+
+    def warmup(self, recv_token_bound=None, token_count=None) -> None:
+        """Compile the plan this bound's tile needs, in both slots."""
+        tok = (
+            int(self.config.max_tokens_per_rank)
+            if token_count is None
+            else int(token_count)
+        )
+        self._step = self._step_for(self._recv_bound(tok, recv_token_bound))
+        for slot in range(self._PLAN_SLOTS):
+            self._plan_for(self._step.align_m, slot)
+
+    def _recv_bound(self, token_count: int, recv_token_bound: int | None) -> int:
+        """Static safe recv bound for this step.
+
+        Dispatch deduplicates a token's routes to the same peer, so one rank can
+        receive at most ``world_size * token_count`` rows. Use that exact bound
+        when the caller did not provide a tighter graph bucket.
+        """
+        inferred = int(self.config.world_size) * max(1, int(token_count))
+        bound = inferred if recv_token_bound is None else int(recv_token_bound)
+        return max(1, min(bound, int(self.config.max_recv)))
+
+    def _step_for(self, recv_bound: int) -> _CompactStep:
+        from .compact_plan import compact_row_capacity
+
+        config, geo = self.config, self.compact
+        bound = max(1, min(int(recv_bound), config.max_recv))
+        align_m = _compact_gemm_align_m(config, recv_bound=bound)
+        # The arena holds rows for the capacity tile, and the CSV tiles are not
+        # monotonic in the token bucket, so a smaller bound can still name a
+        # wider tile. Clamping keeps every step inside the allocated rows.
+        align_m = min(int(align_m), geo.tile_m)
+        rows = compact_row_capacity(
+            max_recv=bound,
+            topk=config.topk,
+            experts_per_rank=config.experts_per_rank,
+            tile_m=align_m,
+        )
+        return _CompactStep(recv_bound=bound, align_m=align_m, rows=min(rows, geo.cap))
+
+    def _plan_for(self, align_m: int, slot: int):
+        """The compact-plan launch that aligns each expert's rows to ``align_m``.
+
+        Compiled per alignment and hist/done slot, because the plan and the
+        expert GEMM must agree on the tile, and double-buffered plans must not
+        share a done counter.
+        """
+        from .compact_plan import compile_tdm_compact_plan
+
+        key = (int(align_m), int(slot))
+        launch = self._plan_launches.get(key)
+        if launch is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"compact plan for align_m={key[0]} slot={key[1]} was not "
+                    "compiled before graph capture; warm this token bucket "
+                    "eagerly first"
+                )
+            config, geo, arena = self.config, self.compact, self.res.arena
+            launch = compile_tdm_compact_plan(
+                rank=config.rank,
+                npes=config.world_size,
+                experts_per_rank=config.experts_per_rank,
+                topk=config.topk,
+                tile_m=key[0],
+                # The arena's row count, not this step's: the plan bounds what it
+                # may write against the region it writes into.
+                compact_cap=geo.cap,
+                off_hist=arena.offset("compact_hist") + key[1] * geo.hist_stride * 4,
+                off_done=arena.offset("compact_done") + key[1] * 4,
+                hist_stride=geo.hist_stride,
+                max_routes=geo.max_routes,
+                hist_pingpong=False,
+            )
+            self._plan_launches[key] = launch
+        return launch
+
+    def _launch_plan(
+        self, topk_ids: torch.Tensor, token_count: int, slot: int, align_m: int
+    ) -> None:
+        plan_stream = self._plan_stream
+        plan_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(plan_stream):
+            _run_compiled(
+                self._plan_for(align_m, slot),
+                self.res.arena.handle,
+                topk_ids.data_ptr(),
+                self._tok_maps[slot].data_ptr(),
+                self._block_hists[slot].data_ptr(),
+                self._send_bases[slot].data_ptr(),
+                self._masked_ms[slot].data_ptr(),
+                self._psums[slot].data_ptr(),
+                self._barriers[slot].data_ptr(),
+                self.config.rank,
+                token_count,
+                fx.Stream(plan_stream),
+            )
+        self._plan_event.record(plan_stream)
+        self._plan_pending = True
+
+    def _wait_plan(self) -> None:
+        if not self._plan_pending:
+            return
+        torch.cuda.current_stream().wait_event(self._plan_event)
+        self._plan_pending = False
+
+
+class _Combine:
+    """Expert results back to their tokens' ranks, summed per token."""
+
+    # Whether the combine reads its landing offsets off mori's aggregated
+    # dispatch reservation.
+    needs_aggregated_reservation = False
+
+    def __init__(self, config: MegaMoEConfig, mori):
+        self.config = config
+        self.mori = mori
+        self.res = None
+
+    def close(self) -> None:
+        pass
+
+
+class _FusedScatterCombine(_Combine):
+    """The gemm2 epilogue P2P-scatters each row into the slot of the peer its
+    token came from, packed as the step's wire; after a cross-device barrier a
+    FlyDSL reduce sums each token's slots."""
+
+    def __init__(self, config: MegaMoEConfig, mori=None):
+        super().__init__(config, mori)
+        self._tiles = {
+            bits: _combine_tile(
+                topk=config.topk, hidden_dim=config.hidden_dim, quant_bits=bits
+            )
+            for bits in config.combine_quant_bit_modes
+        }
+
+    @staticmethod
+    def regions(config: MegaMoEConfig, mori=None) -> dict:
+        return {
+            "cross_device_barrier": config.world_size * 8,
+            # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
+            # holds a step on any of them and a quantized one just packs into the
+            # front of it at its own pitch.
+            "comb_inp": (
+                config.max_tokens_per_rank
+                * config.topk
+                * config.combine_slot_stride_bytes
+            ),
+        }
+
+    def build(self, res: _EpResources) -> None:
+        self.res = res
+        config = self.config
+        self._cross_device_flag = torch.ones(
+            1, dtype=torch.int64, device=res.total_recv.device
+        )
+        # Keep the cross-device barrier in its own 1-block kernel so the reduce
+        # grid is unconstrained. Both wires stage through LDS, so the block is
+        # sized to the lane tile (T*C*256/16 lanes) -- which differs per wire,
+        # hence one build per width rather than one shared spec.
+        self._reduces = {}
+        for bits, (toks, chunks) in self._tiles.items():
+            lanes = toks * chunks * _COMBINE_CHUNK_ELEMS // 16
+            self._reduces[bits] = _make_combine_fused_reduce(
+                experts_per_token=config.topk,
+                hidden_dim=config.hidden_dim,
+                block_num=512,
+                warp_num_per_block=lanes // _WAVE_SIZE,
+                slot_stride_nbytes=config.combine_slot_stride_for(bits),
+                quant_bits=bits,
+                tokens_per_block=toks,
+                chunks_per_iter=chunks,
+            )
+        self._sync = _make_combine_fused_sync(
+            rank=config.rank,
+            npes=config.world_size,
+            off_xdb_mem=res.arena.offset("cross_device_barrier"),
+        )
+
+    def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
+        config, arena = self.config, self.res.arena
+        return _ComputeTarget(
+            scatter=Stage2ScatterContext(
+                arena_handle=arena.handle,
+                combine_input_offset=arena.offset("comb_inp"),
+                slot_stride_bytes=config.combine_slot_stride_for(quant_bits),
+                max_tokens_per_rank=config.max_tokens_per_rank,
+                world_size=config.world_size,
+                source_token_map=batch.routing.source_token_map,
+                **(batch.compact_rows or {}),
+                combine_quant_bits=quant_bits,
+            )
+        )
+
+    def finish(
+        self, routing: Routing, quant_bits: int, expert_out=None
+    ) -> torch.Tensor:
+        """The gemm2 epilogue has already scattered the results into the peers'
+        slots, packed as the ``quant_bits`` wire; reduce them."""
+        res = self.res
+        stream = fx.Stream(torch.cuda.current_stream())
+        # 1-block cross-device barrier, then the barrier-free reduce on the
+        # same stream; the kernel boundary gives the reduce its visibility.
+        _run_compiled(
+            self._sync,
+            res.arena.handle,
+            self._cross_device_flag.data_ptr(),
+            self.config.rank,
+            stream,
+        )
+        _run_compiled(
+            self._reduces[quant_bits],
+            res.arena.local_ptr("comb_inp"),
+            res.combine_output.data_ptr(),
+            routing.token_count,
+            stream,
+        )
+        return res.output(routing.token_count)
+
+
+class _MoriCombine(_Combine):
+    """mori's EpCombinePlan over fused_moe's per-recv-row output.
+
+    bf16 gathers: fused_moe writes its rows straight into this rank's comb_inp
+    staging rows, the combine meets every peer on cross_device_barrier, then
+    pulls each token's rows back from the peers the dispatch's tok_map names and
+    sums them. MXFP4 pushes instead: each rank quantizes its rows into the
+    landing rows of the peer each came from, and after the barrier dequantizes
+    and sums what landed for its own tokens. Both zero total_recv on the way out.
+    """
+
+    def __init__(self, config: MegaMoEConfig, mori):
+        super().__init__(config, mori)
+        self._schedules = {
+            bits: mori.combine_schedule(config, bits)
+            for bits in config.combine_quant_bit_modes
+        }
+        self._specs = {
+            bits: sorted({tuple(entry[1:]) for entry in schedule})
+            for bits, schedule in self._schedules.items()
+        }
+        self._max_blocks = max(
+            block for wire in self._specs.values() for block, _ in wire
+        )
+        slots = mori.hip_backend._XDB_FLAG_SLOTS
+        if self._max_blocks > slots:
+            raise ValueError(
+                f"mori combine block_num {self._max_blocks} exceeds the "
+                f"{slots} per-block epoch slots its entry barrier owns"
+            )
+        self.needs_aggregated_reservation = bool(
+            config.combine_quant_bits and mori.push_landing_rows(config) is not None
+        )
+        self._plans = {}
+
+    @staticmethod
+    def regions(config: MegaMoEConfig, mori) -> dict:
+        # mori's outTok: one bf16 staging row per recv slot, then, for the fp4
+        # push combine, its landing rows and, from four ranks up, a u64 flag per
+        # landing row for the overlapped combine (EpFp4Ovl) -- the same three
+        # parts mori's own out_tok sizes.
+        nbytes = config.max_recv * config.hidden_dim * 2
+        if config.combine_quant_bits:
+            landing_rows = mori.push_landing_rows(config)
+            if landing_rows is None:
+                landing_rows = config.world_size * config.max_recv
+            nbytes += landing_rows * mori.push_wire_bytes(config)
+            if config.world_size >= 4:
+                nbytes += landing_rows * 8
+        return {"cross_device_barrier": config.world_size * 8, "comb_inp": nbytes}
+
+    def build(self, res: _EpResources) -> None:
+        self.res = res
+        config = self.config
+        device = res.total_recv.device
+        EpCombinePlan = self.mori.ep_plans.EpCombinePlan
+        for bits, wire_specs in self._specs.items():
+            # Named only on the fp4 wire: an older mori rejects unknown kwargs.
+            fp4_kw = {"combine_fp4": True} if bits else {}
+            for spec in wire_specs:
+                plan = EpCombinePlan(
+                    world_size=config.world_size,
+                    hidden_dim=config.hidden_dim,
+                    max_tok_per_rank=config.max_tokens_per_rank,
+                    num_expert_per_rank=config.experts_per_rank,
+                    num_expert_per_token=config.topk,
+                    max_recv=config.max_recv,
+                    dtype=torch.bfloat16,
+                    use_weights=True,
+                    **fp4_kw,
+                    block_num=spec[0],
+                    warp_per_block=spec[1],
+                    arena=res.arena,
+                    region_names=_MORI_REGION_NAMES,
+                )
+                self._plans[bits, spec] = plan
+                plan.bind(rank=config.rank)
+
+        # One epoch per block: each block is the only writer of its own slot.
+        # Starts at 1 so the zeroed peer slots cannot alias the first launch.
+        self._cross_device_flag = torch.ones(
+            self.mori.hip_backend._XDB_FLAG_SLOTS, dtype=torch.int64, device=device
+        )
+        self._grid_barrier = torch.zeros(1, dtype=torch.uint32, device=device)
+        # The entry barrier's intra-grid fan-out: 16 lines per block.
+        self._barrier_fan = torch.zeros(
+            self._max_blocks * 16, dtype=torch.int32, device=device
+        )
+        self._static_args = {
+            "out_token_buf": res.combine_output.data_ptr(),
+            "out_weights_buf": None,
+            "disp_dest_tok_id_map": res.token_destination_map.data_ptr(),
+            # The push combine's landing offsets, which the dispatch wrote.
+            "dest_pe_token_counter": res.destination_peer_counter.data_ptr(),
+            "total_recv_token_num": res.total_recv.data_ptr(),
+            "grid_barrier": self._grid_barrier.data_ptr(),
+            "xdb_flag": self._cross_device_flag.data_ptr(),
+            "combine_barrier_fan": self._barrier_fan.data_ptr(),
+        }
+        # The bf16 staging rows at the front of comb_inp. fused_moe writes its
+        # rows straight into them, so the bf16 combine finds its input already
+        # staged and skips its copy, and the fp4 send, which reads ahead as far
+        # as row max_recv-1, stays inside the arena.
+        self._stage = _from_gpu_ptr(
+            res.arena.local_ptr("comb_inp"),
+            (config.max_recv, config.hidden_dim),
+            torch.bfloat16,
+        )
+
+    def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
+        return _ComputeTarget(output=self._stage[: batch.x.shape[0]])
+
+    def finish(
+        self, routing: Routing, quant_bits: int, expert_out: torch.Tensor
+    ) -> torch.Tensor:
+        """``expert_out`` is fused_moe's per-recv-slot output, already in the
+        staging rows; mori moves it from there."""
+        count = routing.token_count
+        plan = self._plans[quant_bits, self._select(quant_bits, count)]
+        plan.launch(
+            stream=torch.cuda.current_stream().cuda_stream,
+            inp_token_buf=expert_out,
+            num_tokens=count,
+            **self._static_args,
+        )
+        return self.res.output(count)
+
+    def _select(self, quant_bits: int, token_count: int) -> tuple:
+        schedule = self._schedules[quant_bits]
+        for upper_bound, *spec in schedule:
+            if upper_bound is None or token_count <= upper_bound:
+                return tuple(spec)
+        return tuple(schedule[-1][1:])
+
+    def close(self) -> None:
+        for plan in self._plans.values():
+            plan.close()
+        self._plans = {}
+
+
+_DISPATCH_STAGES = {
+    DispatchKind.MORI: _MoriDispatch,
+    DispatchKind.COMPACT: _CompactDispatch,
+}
+_COMBINE_STAGES = {
+    CombineKind.MORI: _MoriCombine,
+    CombineKind.FUSED_SCATTER: _FusedScatterCombine,
+}
+
+
+def _arena_layout(config: MegaMoEConfig, mori, compact=None) -> _ArenaLayout:
+    """The one arena formula: what the runtime allocates and what
+    ``required_vmm_bytes`` reports."""
+    return _ArenaLayout.merge(
+        _DISPATCH_STAGES[config.recipe.dispatch].regions(config, mori, compact),
+        _COMBINE_STAGES[config.recipe.combine].regions(config, mori),
+    )
+
+
+class _EpDispatcher:
+    """The recipe's dispatch and combine over one shared arena.
+
+    Everything that can fail, and the host collectives, run before the arena --
+    itself collective -- is allocated; a failure after it frees what was built.
+    """
+
+    def __init__(self, config: MegaMoEConfig, communicator):
+        self.config = config
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        self._closed = False
+        recipe = config.recipe
+        uses_mori = (
+            recipe.dispatch is DispatchKind.MORI or recipe.combine is CombineKind.MORI
+        )
+        self.mori = _mori_capabilities() if uses_mori else None
+        self.dispatch = _DISPATCH_STAGES[recipe.dispatch](config, self.mori)
+        self.combine = _COMBINE_STAGES[recipe.combine](config, self.mori)
+        # The push combine finds its landing offsets in the aggregated
+        # reservation's signal, which tok_off_ext turns off; mori's op layer
+        # refuses the pair the same way.
+        if self.dispatch.tokoff_ext and self.combine.needs_aggregated_reservation:
+            raise ValueError(
+                f"combine_quant={config.combine_quant!r} with stage2_fused=False "
+                "needs mori's aggregated dispatch reservation, which "
+                "MORI_EP_TOKOFF_EXT=1 turns off"
+            )
+        self.layout = _arena_layout(config, self.mori, self.dispatch.compact)
+        self.res = _EpResources(SymmetricArena(communicator, self.layout))
+        try:
+            self.res.allocate(config, self.device)
+            if self.dispatch.tokoff_ext:
+                # Reuse mori's builder rather than duplicate its IPC handle
+                # protocol, which must match the kernel byte for byte.
+                self.res.tokoff_ext = self.mori.hip_backend.TokOffExt(
+                    config.rank, config.world_size, self.device
+                )
+            self.dispatch.build(self.res)
+            self.combine.build(self.res)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        # A launch still in flight (a graph replay, say) reads the window: let it
+        # finish before anything it reads is freed.
+        torch.cuda.synchronize(self.device)
+        # The plans hold the window and their kernels dereference it, so they
+        # go before the arena does.
+        self.combine.close()
+        self.dispatch.close()
+        self.res.close()
 
 
 def _require_gfx1250():
@@ -1298,8 +2318,8 @@ class MegaMoEGfx1250:
         self.expert_mask = torch.zeros(self.experts, dtype=torch.int32, device=device)
         first_expert = geometry.rank * self.experts_per_rank
         self.expert_mask[first_expert : first_expert + self.experts_per_rank] = 1
-
-        self._initialize_pipeline(config, communicator)
+        self._config = config
+        self._ep = _EpDispatcher(config, communicator)
 
     def forward(
         self,
@@ -1356,7 +2376,47 @@ class MegaMoEGfx1250:
                     f"got {combine_wire!r}"
                 )
             combine_quant = _COMBINE_WIRE_QUANT[combine_wire]
-        combine_quant_bits = self._resolve_combine_quant(combine_quant)
+        quant_bits = self._resolve_combine_quant(combine_quant)
+        self._check_inputs(
+            hidden_states, topk_weights, topk_ids, w1, w2, w1_scale, w2_scale, a1_scale
+        )
+        ep = self._ep
+        batch = ep.dispatch.dispatch(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            recv_token_bound=recv_token_bound,
+            next_topk_ids=next_topk_ids,
+            next_recv_token_bound=next_recv_token_bound,
+        )
+        target = ep.combine.prepare(batch, quant_bits)
+        expert_out = self._compute(
+            batch,
+            target,
+            w1=w1,
+            w2=w2,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            bias1=bias1,
+            bias2=bias2,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+        )
+        return ep.combine.finish(batch.routing, quant_bits, expert_out)
+
+    __call__ = forward
+
+    def _check_inputs(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+    ) -> None:
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
         if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
@@ -1418,93 +2478,69 @@ class MegaMoEGfx1250:
                 f"topk_ids must have shape {expected_shape}, "
                 f"got {tuple(topk_ids.shape)}"
             )
-        if self._compact_plan:
-            # Compact cannot slice recv_x -- the rows are grouped per expert, not
-            # token-major -- so the bound is spent on the geometry instead: it
-            # picks the plan's alignment, the GEMM's tile and the GEMM's grid.
-            self._begin_compact_step(
-                self._compact_recv_bound(token_count, recv_token_bound)
-            )
-        recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
-            hidden_states, topk_weights, topk_ids, recv_counter_is_zero
-        )
-        if recv_token_bound is not None and not self._compact_plan:
-            bound = int(recv_token_bound)
-            if bound <= 0 or bound > recv_x.shape[0]:
-                raise ValueError(
-                    f"recv_token_bound must be in (0, {recv_x.shape[0]}], "
-                    f"got {recv_token_bound}"
-                )
-            recv_x = recv_x[:bound]
-            recv_weights = recv_weights[:bound]
-            recv_ids = recv_ids[:bound]
         if self._config.is_quant_dispatch_wire:
             assert a1_scale is None, (
                 "a1_scale is produced by the quantizing dispatch wire itself; a "
                 "caller-supplied one would be silently discarded"
             )
-            a1_scale = self._recv_dispatch_scales()
-            if recv_token_bound is not None and not self._compact_plan:
-                a1_scale = a1_scale[: int(recv_token_bound)]
-        extra = {}
-        if self.activation == ActivationType.Situv2:
-            extra["beta"] = self.situ_beta
-            extra["linear_beta"] = self.situ_linear_beta
-        scatter = (
-            self._scatter_context(routing, combine_quant_bits)
-            if self._config.stage2_fused
-            else None
-        )
+
+    def _compute(
+        self,
+        batch: _DispatchBatch,
+        target: _ComputeTarget,
+        *,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        bias1,
+        bias2,
+        a1_scale,
+        a2_scale,
+    ) -> torch.Tensor:
+        """The expert GEMM over one dispatched batch, leaving its rows where
+        ``target`` says. Knows nothing of the transport beyond those two."""
         from aiter.ops.flydsl.grouped_moe_gfx1250 import (
             set_flydsl_dispatch_context,
         )
 
-        set_flydsl_dispatch_context(scatter if self._compact_plan else None)
-        moe_ids = self._compact_dummy_ids if self._compact_plan else recv_ids
-        moe_wts = self._compact_dummy_wts if self._compact_plan else recv_weights
-        if (
-            self._compact_plan
-            and next_topk_ids is not None
-            and int(next_topk_ids.shape[0]) > 0
-        ):
-            # Dispatch of this layer is done, so tok_map[slot] is free. GEMM
-            # still reads psum/masked_m of this slot; the next plan writes the
-            # other slot and overlaps the expert GEMM (and later combine/RMS).
-            self._prefetch_next_compact_plan(next_topk_ids, next_recv_token_bound)
-        # Without the fused combine, fused_moe writes straight into mori's staging
-        # rows: the combine reads them in place instead of copying them in.
-        moe_output = (
-            None if self._config.stage2_fused else self._mori_stage[: recv_x.shape[0]]
+        extra = {}
+        if self.activation == ActivationType.Situv2:
+            extra["beta"] = self.situ_beta
+            extra["linear_beta"] = self.situ_linear_beta
+        # The grouped GEMM finds the compact rows' scatter here, not in its
+        # arguments.
+        set_flydsl_dispatch_context(
+            target.scatter if batch.compact_rows is not None else None
         )
         try:
-            expert_out = fused_moe(
-                recv_x,
+            return fused_moe(
+                batch.x,
                 w1,
                 w2,
-                moe_wts,
-                moe_ids,
+                batch.topk_weights,
+                batch.topk_ids,
                 expert_mask=self.expert_mask,
                 activation=self.activation,
                 gate_mode=self.gate_mode,
                 quant_type=self.quant_type,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
-                a1_scale=a1_scale,
+                a1_scale=a1_scale if batch.scales is None else batch.scales,
                 a2_scale=a2_scale,
                 bias1=bias1,
                 bias2=bias2,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
                 dtype=dtypes.bf16,
-                num_local_tokens=None if self._compact_plan else total_recv,
+                num_local_tokens=batch.num_local_tokens,
                 swiglu_limit=self.swiglu_limit,
-                stage2_scatter=scatter,
-                output=moe_output,
+                stage2_scatter=target.scatter,
+                output=target.output,
                 **extra,
             )
         finally:
             set_flydsl_dispatch_context(None)
-        return self._combine(routing, combine_quant_bits, expert_out)
 
     def _resolve_combine_quant(self, combine_quant: str | None) -> int:
         """This step's combine payload width, checked against what was built.
@@ -1522,11 +2558,7 @@ class MegaMoEGfx1250:
                 f"got {combine_quant!r}"
             )
         bits = _COMBINE_QUANT_BITS[combine_quant]
-        built = (
-            self._combine_variants
-            if self._config.stage2_fused
-            else self._mori_combine_variants
-        )
+        built = self._config.combine_quant_bit_modes
         if bits not in built:
             raise ValueError(
                 f"combine_quant={combine_quant!r} was not built: this MegaMoE "
@@ -1537,67 +2569,6 @@ class MegaMoEGfx1250:
             )
         return bits
 
-    __call__ = forward
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
-    def _compact_recv_bound(
-        self, token_count: int, recv_token_bound: int | None
-    ) -> int:
-        """Static safe recv bound for this step.
-
-        Dispatch deduplicates a token's routes to the same peer, so one rank can
-        receive at most ``world_size * token_count`` rows. Use that exact bound
-        when the caller did not provide a tighter graph bucket.
-        """
-        inferred = int(self._config.world_size) * max(1, int(token_count))
-        bound = inferred if recv_token_bound is None else int(recv_token_bound)
-        return max(1, min(bound, int(self._config.max_recv)))
-
-    def _compact_plan_for(self, align_m: int, slot: int | None = None):
-        """The compact-plan launch that aligns each expert's rows to ``align_m``.
-
-        Compiled per alignment and hist/done slot, because the plan and the
-        expert GEMM must agree on the tile, and double-buffered plans must not
-        share a done counter.
-        """
-        from .compact_plan import compile_tdm_compact_plan
-
-        align_m = int(align_m)
-        slot = int(self._compact_slot if slot is None else slot)
-        key = (align_m, slot)
-        launch = self._compact_plan_launches.get(key)
-        if launch is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"compact plan for align_m={align_m} slot={slot} was not "
-                    "compiled before graph capture; warm this token bucket "
-                    "eagerly first"
-                )
-            hist0 = self._arena.offset("compact_hist")
-            done0 = self._arena.offset("compact_done")
-            launch = compile_tdm_compact_plan(
-                rank=self._config.rank,
-                npes=self._config.world_size,
-                experts_per_rank=self._config.experts_per_rank,
-                topk=self._config.topk,
-                tile_m=align_m,
-                # The arena's row count, not this step's: the plan bounds what it
-                # may write against the region it writes into.
-                compact_cap=self._compact_cap,
-                off_hist=hist0 + slot * self._compact_hist_stride * 4,
-                off_done=done0 + slot * 4,
-                hist_stride=self._compact_hist_stride,
-                max_routes=self._compact_max_routes,
-                hist_pingpong=False,
-            )
-            self._compact_plan_launches[key] = launch
-        return launch
-
     def warmup_compact_plan(
         self,
         recv_token_bound: int | None = None,
@@ -1607,20 +2578,11 @@ class MegaMoEGfx1250:
 
         The plan is compiled per tile alignment and the alignment follows the
         bound's token bucket, so a captured batch whose bucket never ran eagerly
-        would reach the JIT inside the capture -- which _compact_plan_for
-        refuses. A caller that captures a ladder of batch sizes warms every rung
-        through here first. A no-op off the compact path.
+        would reach the JIT inside the capture -- which the plan refuses. A
+        caller that captures a ladder of batch sizes warms every rung through
+        here first. A no-op off the compact path.
         """
-        if not self._compact_plan:
-            return
-        tok = (
-            int(self._config.max_tokens_per_rank)
-            if token_count is None
-            else int(token_count)
-        )
-        self._begin_compact_step(self._compact_recv_bound(tok, recv_token_bound))
-        for slot in range(self._COMPACT_PLAN_SLOTS):
-            self._compact_plan_for(self._compact_step_align_m, slot)
+        self._ep.dispatch.warmup(recv_token_bound, token_count)
 
     def prefetch_compact_plan(
         self,
@@ -1632,767 +2594,14 @@ class MegaMoEGfx1250:
         The plan only needs ``topk_ids``, so the caller can hide the first
         layer's plan behind RMSNorm. Later layers should pass ``next_topk_ids``
         to ``forward`` so the plan overlaps the previous expert GEMM instead.
+        A no-op off the compact path.
         """
-        if not self._compact_plan:
-            return
-        token_count = int(topk_ids.shape[0])
-        self._begin_compact_step(
-            self._compact_recv_bound(token_count, recv_token_bound)
-        )
-        self._launch_compact_plan_async(topk_ids, token_count, self._compact_slot)
+        self._ep.dispatch.prefetch(topk_ids, recv_token_bound)
 
-    def _prefetch_next_compact_plan(
-        self,
-        topk_ids: torch.Tensor,
-        recv_token_bound: int | None,
-    ) -> None:
-        nxt = 1 - self._compact_slot
-        saved = (
-            self._compact_step_align_m,
-            self._compact_step_rows,
-            self._compact_step_recv_bound,
-        )
-        token_count = int(topk_ids.shape[0])
-        self._begin_compact_step(
-            self._compact_recv_bound(token_count, recv_token_bound)
-        )
-        self._launch_compact_plan_async(topk_ids, token_count, nxt)
-        (
-            self._compact_step_align_m,
-            self._compact_step_rows,
-            self._compact_step_recv_bound,
-        ) = saved
-        self._compact_slot = nxt
-
-    def _launch_compact_plan_async(
-        self, topk_ids: torch.Tensor, token_count: int, slot: int | None = None
-    ) -> None:
-        slot = int(self._compact_slot if slot is None else slot)
-        bufs = self._compact_slot_bufs(slot)
-        cur = torch.cuda.current_stream()
-        plan_stream = self._compact_plan_stream
-        plan_stream.wait_stream(cur)
-        with torch.cuda.stream(plan_stream):
-            _run_compiled(
-                self._compact_plan_for(self._compact_step_align_m, slot),
-                self._arena.handle,
-                topk_ids.data_ptr(),
-                bufs["tok_map"].data_ptr(),
-                bufs["block_hist"].data_ptr(),
-                bufs["send_base"].data_ptr(),
-                bufs["masked_m"].data_ptr(),
-                bufs["psum"].data_ptr(),
-                bufs["barrier"].data_ptr(),
-                self._config.rank,
-                token_count,
-                fx.Stream(plan_stream),
-            )
-        self._compact_plan_event.record(plan_stream)
-        self._compact_plan_pending = True
-
-    def _wait_compact_plan(self) -> None:
-        if not self._compact_plan_pending:
-            return
-        torch.cuda.current_stream().wait_event(self._compact_plan_event)
-        self._compact_plan_pending = False
-
-    def _compact_slot_bufs(self, slot: int) -> dict:
-        return {
-            "tok_map": self._tok_maps[slot],
-            "block_hist": self._block_hists[slot],
-            "send_base": self._send_bases[slot],
-            "masked_m": self._masked_ms[slot],
-            "psum": self._psums[slot],
-            "barrier": self._barriers[slot],
-        }
-
-    def _begin_compact_step(self, recv_token_bound: int | None) -> None:
-        """Fix this step's compact geometry from the caller's recv bound.
-
-        Everything here is a python int, so a captured graph keeps a static grid
-        and each captured batch size gets the geometry tuned for its own bucket.
-        """
-        from .compact_plan import compact_row_capacity
-
-        config = self._config
-        bound = config.max_recv if recv_token_bound is None else int(recv_token_bound)
-        bound = max(1, min(bound, config.max_recv))
-        align_m = _compact_gemm_align_m(config, recv_bound=bound)
-        # The arena holds rows for _compact_tile_m, and the CSV tiles are not
-        # monotonic in the token bucket, so a smaller bound can still name a
-        # wider tile. Clamping keeps every step inside the allocated rows.
-        self._compact_step_align_m = min(int(align_m), self._compact_tile_m)
-        self._compact_step_recv_bound = bound
-        self._compact_step_rows = min(
-            compact_row_capacity(
-                max_recv=bound,
-                topk=config.topk,
-                experts_per_rank=config.experts_per_rank,
-                tile_m=self._compact_step_align_m,
-            ),
-            self._compact_cap,
-        )
-
-    def _plan_transport(self, config: MegaMoEConfig) -> None:
-        """Schedules, and mori's version and decisions: pure, or at most
-        host-collective, so a configuration that cannot run fails here with
-        nothing allocated."""
-        self._mori = None if self._compact_plan else _mori_capabilities()
-        if self._compact_plan:
-            # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
-            blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
-            warps_env = os.environ.get("AITER_TDM_COMPACT_WARPS")
-            if blocks_env is not None or warps_env is not None:
-                compact_blocks = int(blocks_env or "64")
-                compact_warps = int(warps_env or "8")
-                self._dispatch_schedule = ((None, compact_blocks, compact_warps),)
-            else:
-                self._dispatch_schedule = _DISPATCH_COMPACT
-        else:
-            mori = self._mori
-            # mori's geometry is a compile-time Cfg field, so it brings its own
-            # tuned buckets.
-            self._dispatch_schedule = mori.dispatch_schedule(config)
-            self._mori_tokoff_ext, self._mori_slot_word_kw = mori.slot_word(config)
-            # The push combine finds its landing offsets in the aggregated
-            # reservation's signal, which tok_off_ext turns off; mori's op layer
-            # refuses the pair the same way.
-            if (
-                self._mori_tokoff_ext
-                and not config.stage2_fused
-                and config.combine_quant_bits
-                and mori.push_landing_rows(config) is not None
-            ):
-                raise ValueError(
-                    f"combine_quant={config.combine_quant!r} with stage2_fused=False "
-                    "needs mori's aggregated dispatch reservation, which "
-                    "MORI_EP_TOKOFF_EXT=1 turns off"
-                )
-            # Passed only on a quantizing wire, matching dispatch_scale_dst_nbytes:
-            # mori grew scale_bytes in #593 and rejects UNKNOWN kwargs outright, so
-            # sending the bf16 wire's harmless 0 would make an older mori refuse
-            # the whole plan.
-            self._mori_scale_kw = (
-                {"scale_bytes": config.dispatch_scale_nbytes}
-                if config.is_quant_dispatch_wire
-                else {}
-            )
-            # Since ROCm/mori#703 the dispatch stages through a buffer its caller
-            # binds; one serves every plan, as only one launches at a time.
-            self._mori_staging_nbytes = mori.staging_bytes(
-                config, self._mori_scale_kw.get("scale_bytes", 0)
-            )
-        # A spec is (block, warp), plus route_parallel on the compact path.
-        self._dispatch_specs = sorted(
-            {tuple(entry[1:]) for entry in self._dispatch_schedule}
-        )
-        if config.stage2_fused:
-            self._combine_tiles = {
-                bits: _combine_tile(
-                    topk=config.topk, hidden_dim=config.hidden_dim, quant_bits=bits
-                )
-                for bits in config.combine_quant_bit_modes
-            }
-            return
-        self._combine_schedules = {
-            bits: self._mori.combine_schedule(config, bits)
-            for bits in config.combine_quant_bit_modes
-        }
-        self._mori_combine_specs = {
-            bits: sorted({tuple(entry[1:]) for entry in schedule})
-            for bits, schedule in self._combine_schedules.items()
-        }
-        self._mori_combine_max_blocks = max(
-            block for wire in self._mori_combine_specs.values() for block, _ in wire
-        )
-        slots = self._mori.hip_backend._XDB_FLAG_SLOTS
-        if self._mori_combine_max_blocks > slots:
-            raise ValueError(
-                f"mori combine block_num {self._mori_combine_max_blocks} exceeds the "
-                f"{slots} per-block epoch slots its entry barrier owns"
-            )
-
-    def _initialize_pipeline(self, config: MegaMoEConfig, communicator):
-        self._config = config
-        self._closed = False
-        # tokoff-ext slot allocator (built in _build_mori_dispatch when dispatch
-        # runs through mori); None otherwise so close() is uniform.
-        self._tokoff_ext = None
-        self._mori_dispatch_staging = None
-        self._mori_plans = {}
-        self._mori_combine_plans = {}
-        device = torch.device("cuda", torch.cuda.current_device())
-        max_recv = config.max_recv
-        self._compact_plan = config.stage1_fused
-        # Everything that can fail, and the host collectives, before the
-        # symmetric arena -- itself collective -- is allocated.
-        self._plan_transport(config)
-        self._compact_tile_m = _compact_gemm_align_m(config)
-        self._compact_cap = (
-            config.compact_row_cap(self._compact_tile_m)
-            if self._compact_plan
-            else max_recv
-        )
-        self._compact_wire_row = (
-            _align_up(
-                config.dispatch_token_nbytes + config.dispatch_scale_nbytes,
-                128,
-            )
-            if self._compact_plan
-            else config.dispatch_token_nbytes
-        )
-        from .compact_plan import PLAN_BLOCKS
-
-        segs = config.world_size * config.experts_per_rank
-        compact = _CompactGeometry.of(config, self._compact_tile_m)
-        self._compact_hist_stride = compact.hist_stride
-        self._compact_max_routes = compact.max_routes
-        self._layout = _arena_layout(config, self._mori, compact)
-        self._arena = SymmetricArena(communicator, self._layout)
-        self._compact_scale_row = (
-            config.dispatch_scale_nbytes
-            if self._compact_plan
-            else config.dispatch_scale_dst_nbytes
-        )
-        self._arena.zero()
-        # Shared with grouped_moe_gfx1250. TDM dispatch clears this at its tail,
-        # before the following route kernel starts issuing slot atomics.
-        from aiter.ops.flydsl.grouped_moe_gfx1250 import route_counter_buffer
-
-        self._route_counter = route_counter_buffer(config.experts_per_rank, device)
-
-        self._COMPACT_PLAN_SLOTS = 2
-        self._compact_slot = 0
-        self._token_destination_map = torch.full(
-            (config.max_tokens_per_rank * config.topk,),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        )
-        self._compact_masked_m = None
-        self._compact_psum = None
-        self._compact_plan_launches = {}
-        self._compact_step_align_m = self._compact_tile_m
-        self._compact_step_rows = self._compact_cap
-        self._compact_step_recv_bound = max_recv
-        if self._compact_plan:
-            n_tok = config.max_tokens_per_rank * config.topk
-            self._tok_maps = [
-                torch.full((n_tok,), -1, dtype=torch.int32, device=device)
-                for _ in range(self._COMPACT_PLAN_SLOTS)
-            ]
-            self._token_destination_map = self._tok_maps[0]
-            self._masked_ms = [
-                torch.zeros(config.experts_per_rank, dtype=torch.int32, device=device)
-                for _ in range(self._COMPACT_PLAN_SLOTS)
-            ]
-            self._psums = [
-                torch.zeros(config.experts_per_rank, dtype=torch.int32, device=device)
-                for _ in range(self._COMPACT_PLAN_SLOTS)
-            ]
-            self._block_hists = [
-                torch.empty(PLAN_BLOCKS * segs, dtype=torch.int32, device=device)
-                for _ in range(self._COMPACT_PLAN_SLOTS)
-            ]
-            self._send_bases = [
-                torch.empty(segs, dtype=torch.int32, device=device)
-                for _ in range(self._COMPACT_PLAN_SLOTS)
-            ]
-            self._barriers = [
-                torch.zeros(4, dtype=torch.int32, device=device)
-                for _ in range(self._COMPACT_PLAN_SLOTS)
-            ]
-            self._compact_masked_m = self._masked_ms[0]
-            self._compact_psum = self._psums[0]
-            self._compact_dummy_ids = torch.zeros(
-                (1, config.topk), dtype=torch.int32, device=device
-            )
-            self._compact_dummy_wts = torch.zeros(
-                (1, config.topk), dtype=torch.float32, device=device
-            )
-            self._compact_plan_stream = torch.cuda.Stream()
-            self._compact_plan_event = torch.cuda.Event()
-            self._compact_plan_pending = False
-            # Warm both hist/done slots and the capacity bucket: compiling
-            # inside graph capture is not allowed.
-            for slot in range(self._COMPACT_PLAN_SLOTS):
-                self._compact_plan_for(self._compact_tile_m, slot)
-        # Send counts, then per destination mori's reservation base and push
-        # landing offset (ROCm/mori#745).
-        self._destination_peer_counter = torch.zeros(
-            2 * config.world_size, dtype=torch.int32, device=device
-        )
-        self._dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        # Quantized dispatch reuses fixed buffers across layers and graph
-        # replays. The public quant wrapper allocates both tensors on every call;
-        # keeping them here removes allocator/capture nodes from the stage-1
-        # critical path without changing the quant kernel or wire format.
-        self._dispatch_quant_payload = None
-        self._dispatch_quant_scales = None
-        if config.is_quant_dispatch_wire:
-            payload_cols = (
-                config.dispatch_token_nbytes
-                // config.dispatch_wire_spec.quant_dtype.itemsize
-            )
-            self._dispatch_quant_payload = torch.empty(
-                (config.max_tokens_per_rank, payload_cols),
-                dtype=config.dispatch_wire_spec.quant_dtype,
-                device=device,
-            )
-            self._dispatch_quant_scales = torch.empty(
-                (
-                    config.max_tokens_per_rank,
-                    config.dispatch_scale_nbytes,
-                ),
-                dtype=torch.uint8,
-                device=device,
-            ).view(dtypes.fp8_e8m0)
-        # Points at the persistent scale rows, set per dispatch on a quantizing
-        # wire; 0 (and unread) on bf16.
-        self._dispatch_sent_scales_ptr = 0
-        self._total_recv = torch.zeros(1, dtype=torch.int32, device=device)
-        self._combine_output = torch.zeros(
-            config.max_tokens_per_rank * config.hidden_dim,
-            dtype=torch.int16,
-            device=device,
-        )
-
-        if self._compact_plan:
-            self._dispatch_variants = self._build_tdm_dispatch(config, device)
-        else:
-            self._dispatch_variants = self._build_mori_dispatch(config)
-
-        self._combine_variants = {}
-        if not config.stage2_fused:
-            self._mori_combine_variants = self._build_mori_combine(config, device)
-            return
-
-        self._cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
-        # Keep the cross-device barrier in its own 1-block kernel so the reduce
-        # grid is unconstrained. Both wires stage through LDS, so the block is
-        # sized to the lane tile (T*C*256/16 lanes) -- which differs per wire,
-        # hence one build per width rather than one shared spec.
-        for _bits, (_toks, _chunks) in self._combine_tiles.items():
-            _lanes = _toks * _chunks * _COMBINE_CHUNK_ELEMS // 16
-            self._combine_variants[_bits] = _make_combine_fused_reduce(
-                experts_per_token=config.topk,
-                hidden_dim=config.hidden_dim,
-                block_num=512,
-                warp_num_per_block=_lanes // _WAVE_SIZE,
-                slot_stride_nbytes=config.combine_slot_stride_for(_bits),
-                quant_bits=_bits,
-                tokens_per_block=_toks,
-                chunks_per_iter=_chunks,
-            )
-        self._combine_sync = _make_combine_fused_sync(
-            rank=config.rank,
-            npes=config.world_size,
-            off_xdb_mem=self._arena.offset("cross_device_barrier"),
-        )
-
-    def _build_tdm_dispatch(self, config: MegaMoEConfig, device) -> dict:
-        """Build FlyDSL TDM dispatch launchers keyed by (block, warp) spec.
-
-        Arena layout is disp_out rows at slot*hidden, out_idx/out_wts at
-        slot*topk+k, recv_to_src_token as src_pe*max_tok+src_tok. Recv slots are
-        reserved one atomic per (block, peer) and handed out block-local.
-
-        The staging arrays stand in for the HIP kernel's ``__device__`` BSS:
-        FINALIZE gathers idx / weights / srcmap into a peer-major destTokId SoA
-        so META can ship each block's reserved run as contiguous TDM copies.
-        """
-        payload_dim = config.dispatch_wire_elem_count
-        elem_size = config.dispatch_wire_spec.recv_dtype.itemsize
-        stg_cap, slots = tdm_stage_capacity(
-            npes=config.world_size, max_recv=config.max_recv
-        )
-        stage = [
-            torch.empty(slots * config.topk, dtype=torch.int32, device=device),
-            torch.empty(slots * config.topk, dtype=torch.int32, device=device),
-            torch.empty(slots, dtype=torch.int32, device=device),
-        ]
-        if config.dispatch_scale_dst_nbytes:
-            stage.append(
-                torch.empty(
-                    slots * config.dispatch_scale_dst_nbytes,
-                    dtype=torch.uint8,
-                    device=device,
-                )
-            )
-        self._tdm_stage = tuple(stage)
-        for buf in self._tdm_stage:
-            if buf.data_ptr() % 128:
-                raise RuntimeError(
-                    "TDM staging allocations must be 128-byte aligned, got "
-                    f"0x{buf.data_ptr():x}"
-                )
-        # On a quantized wire the metadata batch grew by a scale row while the
-        # payload shrank, so the shared LDS tile is floored at the bf16 width.
-        # Compact compiles the metadata batch away, so its tile is one wire row.
-        if self._compact_plan:
-            slab_bytes = self._compact_wire_row
-        elif config.is_quant_dispatch_wire:
-            slab_bytes = config.hidden_dim * 2
-        else:
-            slab_bytes = 0
-        # Clamp warp count to the LDS tile budget but keep the tuned block
-        # count, which is what paces the grid barrier, and keep the caller's
-        # spec as the variant key so the runtime pick still resolves.
-        max_warps = tdm_max_warps(
-            hidden_dim=payload_dim,
-            hidden_elem_size=elem_size,
-            npes=config.world_size,
-            slab_bytes=slab_bytes,
-        )
-        stg_idx, stg_wt, stg_src = self._tdm_stage[:3]
-        stg_scale = self._tdm_stage[3] if len(self._tdm_stage) > 3 else None
-
-        def make_variant(kern):
-            def launch(
-                arena_handle,
-                addr_inp_tok,
-                addr_inp_idx,
-                addr_inp_wts,
-                addr_tok_map,
-                addr_dest_ctr,
-                addr_disp_bar,
-                addr_total_recv,
-                my_lsa_rank,
-                inp_cur_tok,
-                stream,
-            ):
-                _run_compiled(
-                    kern,
-                    arena_handle,
-                    addr_inp_tok,
-                    addr_inp_idx,
-                    addr_inp_wts,
-                    addr_tok_map,
-                    addr_dest_ctr,
-                    addr_disp_bar,
-                    addr_total_recv,
-                    stg_idx.data_ptr(),
-                    stg_wt.data_ptr(),
-                    stg_src.data_ptr(),
-                    stg_scale.data_ptr() if stg_scale is not None else 0,
-                    self._dispatch_sent_scales_ptr,
-                    self._route_counter.data_ptr(),
-                    my_lsa_rank,
-                    inp_cur_tok,
-                    stream,
-                )
-
-            return launch
-
-        built = {}
-        variants = {}
-        for spec in self._dispatch_specs:
-            route_parallel = len(spec) > 2 and bool(spec[2])
-            geom = (spec[0], min(spec[1], max_warps), route_parallel)
-            if geom not in built:
-                built[geom] = _make_dispatch_tdm(
-                    rank=config.rank,
-                    npes=config.world_size,
-                    experts_per_rank=config.experts_per_rank,
-                    experts_per_token=config.topk,
-                    hidden_dim=payload_dim,
-                    hidden_elem_size=elem_size,
-                    slab_bytes=slab_bytes,
-                    max_tok_per_rank=config.max_tokens_per_rank,
-                    max_recv=(
-                        self._compact_cap if self._compact_plan else config.max_recv
-                    ),
-                    compact_row_stride=(
-                        self._compact_wire_row if self._compact_plan else 0
-                    ),
-                    enable_signal=True,
-                    off_tok_off=self._arena.offset("tok_off"),
-                    off_recv_num=self._arena.offset("recv_num"),
-                    off_tis=self._arena.offset("recv_to_src_token"),
-                    off_out_idx=self._arena.offset("out_idx"),
-                    off_out_wts=self._arena.offset("out_wts"),
-                    off_out_tok=self._arena.offset("disp_out"),
-                    off_out_scales=(
-                        (self._arena.offset("disp_out") + config.dispatch_token_nbytes)
-                        if self._compact_plan
-                        else (
-                            self._arena.offset("disp_out_scales")
-                            if config.dispatch_scale_dst_nbytes
-                            else 0
-                        )
-                    ),
-                    scale_bytes=config.dispatch_scale_nbytes,
-                    scale_stride=config.dispatch_scale_dst_nbytes,
-                    block_num=geom[0],
-                    warp_num_per_block=geom[1],
-                    clear_route_counter=os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
-                    in ("1", "true", "True")
-                    and not self._compact_plan,
-                    compact_plan=self._compact_plan,
-                    off_ep_rowmap=(
-                        self._arena.offset("ep_rowmap") if self._compact_plan else 0
-                    ),
-                    max_tok_slot_stride=config.max_tokens_per_rank * config.topk,
-                    route_parallel=route_parallel,
-                )
-            variants[spec] = make_variant(built[geom])
-        self._tdm_stage_capacity = stg_cap
-        return variants
-
-    def _build_mori_dispatch(self, config: MegaMoEConfig) -> dict:
-        """Build mori HIP/JIT dispatch launchers keyed by (block, warp) spec.
-
-        Arena layout matches the FlyDSL TDM path (disp_out rows at slot*hidden,
-        out_idx/out_wts at slot*topk+k, recv_to_src_token as
-        src_pe*max_tok+src_tok). mori never touches cross_device_barrier.
-        Recv slots are reserved one atomic per block and handed out block-local.
-        """
-        mori = self._mori
-        EpDispatchPlan = mori.ep_plans.EpDispatchPlan
-        if self._mori_staging_nbytes is not None:
-            self._mori_dispatch_staging = torch.zeros(
-                self._mori_staging_nbytes,
-                dtype=torch.uint8,
-                device=self._total_recv.device,
-            )
-        plans = {}
-        for spec in self._dispatch_specs:
-            plan = EpDispatchPlan(
-                world_size=config.world_size,
-                # see dispatch_wire_elem_count; mori's plan_api: "the caller halves
-                # hiddenDim"
-                hidden_dim=config.dispatch_wire_elem_count,
-                max_tok_per_rank=config.max_tokens_per_rank,
-                num_expert_per_rank=config.experts_per_rank,
-                num_expert_per_token=config.topk,
-                max_recv=config.max_recv,
-                dtype=config.dispatch_wire_spec.mori_dtype,
-                use_weights=True,
-                **self._mori_scale_kw,
-                **self._mori_slot_word_kw,
-                block_num=spec[0],
-                warp_per_block=spec[1],
-                arena=self._arena,
-                region_names=_MORI_REGION_NAMES,
-            )
-            plan.bind(rank=config.rank)
-            if self._mori_dispatch_staging is not None:
-                plan.bind(staging_base=self._mori_dispatch_staging.data_ptr())
-            plans[spec] = plan
-        # The kernels dereference the window, so the plans have to outlive them.
-        self._mori_plans = plans
-
-        # Reuse mori's builder rather than duplicate its IPC handle protocol,
-        # which must match the kernel byte for byte.
-        if self._mori_tokoff_ext:
-            self._tokoff_ext = mori.hip_backend.TokOffExt(
-                config.rank, config.world_size, self._total_recv.device
-            )
-
-        def make_variant(plan):
-            def launch(
-                arena_handle,
-                addr_inp_tok,
-                addr_inp_idx,
-                addr_inp_wts,
-                addr_tok_map,
-                addr_dest_ctr,
-                addr_disp_bar,
-                addr_total_recv,
-                my_lsa_rank,
-                inp_cur_tok,
-                stream,
-            ):
-                # No total_recv.zero_(): mori's gfx1250 dispatch overwrites it.
-                plan.launch(
-                    stream=torch.cuda.current_stream().cuda_stream,
-                    token_indices=addr_inp_idx,
-                    inp_token_buf=addr_inp_tok,
-                    weights_buf=addr_inp_wts,
-                    disp_dest_tok_id_map=addr_tok_map,
-                    dest_pe_token_counter=addr_dest_ctr,
-                    total_recv_token_num=addr_total_recv,
-                    grid_barrier=addr_disp_bar,
-                    tok_off_peers=(
-                        None if self._tokoff_ext is None else self._tokoff_ext.peers
-                    ),
-                    num_tokens=inp_cur_tok,
-                    # Read off self rather than through the variant's argument
-                    # list: the list is shared with the FlyDSL dispatch, whose
-                    # launcher is a traced @flyc.jit signature, and widening it
-                    # would put a dead kernarg on the bf16-only launcher path.
-                    scales_buf=self._dispatch_sent_scales_ptr,
-                )
-
-            return launch
-
-        return {spec: make_variant(plan) for spec, plan in plans.items()}
-
-    def _build_mori_combine(self, config: MegaMoEConfig, device) -> dict:
-        """Build mori HIP/JIT combine launchers, {quant_bits: {(block, warp): launch}}.
-
-        bf16 gathers: the combine stages fused_moe's per-recv-slot rows into this
-        rank's comb_inp, meets every peer on cross_device_barrier, then pulls
-        each token's rows back from the peers the dispatch's tok_map names and
-        sums them into _combine_output. MXFP4 pushes instead: each rank
-        quantizes its rows straight out of fused_moe's output into the landing
-        rows of the peer each came from, and after the barrier dequantizes and
-        sums what landed for its own tokens. Both zero total_recv on the way out.
-        """
-        EpCombinePlan = self._mori.ep_plans.EpCombinePlan
-        specs = self._mori_combine_specs
-        max_blocks = self._mori_combine_max_blocks
-        plans = {}
-        for bits, wire_specs in specs.items():
-            # Named only on the fp4 wire: an older mori rejects unknown kwargs.
-            fp4_kw = {"combine_fp4": True} if bits else {}
-            for spec in wire_specs:
-                plan = EpCombinePlan(
-                    world_size=config.world_size,
-                    hidden_dim=config.hidden_dim,
-                    max_tok_per_rank=config.max_tokens_per_rank,
-                    num_expert_per_rank=config.experts_per_rank,
-                    num_expert_per_token=config.topk,
-                    max_recv=config.max_recv,
-                    dtype=torch.bfloat16,
-                    use_weights=True,
-                    **fp4_kw,
-                    block_num=spec[0],
-                    warp_per_block=spec[1],
-                    arena=self._arena,
-                    region_names=_MORI_REGION_NAMES,
-                )
-                plan.bind(rank=config.rank)
-                plans[bits, spec] = plan
-        self._mori_combine_plans = plans
-
-        # One epoch per block: each block is the only writer of its own slot.
-        # Starts at 1 so the zeroed peer slots cannot alias the first launch.
-        self._cross_device_flag = torch.ones(
-            self._mori.hip_backend._XDB_FLAG_SLOTS, dtype=torch.int64, device=device
-        )
-        self._combine_grid_barrier = torch.zeros(1, dtype=torch.uint32, device=device)
-        # The entry barrier's intra-grid fan-out: 16 lines per block.
-        self._combine_barrier_fan = torch.zeros(
-            max_blocks * 16, dtype=torch.int32, device=device
-        )
-        static_args = {
-            "out_token_buf": self._combine_output.data_ptr(),
-            "out_weights_buf": None,
-            "disp_dest_tok_id_map": self._token_destination_map.data_ptr(),
-            # The push combine's landing offsets, which the dispatch wrote.
-            "dest_pe_token_counter": self._destination_peer_counter.data_ptr(),
-            "total_recv_token_num": self._total_recv.data_ptr(),
-            "grid_barrier": self._combine_grid_barrier.data_ptr(),
-            "xdb_flag": self._cross_device_flag.data_ptr(),
-            "combine_barrier_fan": self._combine_barrier_fan.data_ptr(),
-        }
-        # The bf16 staging rows at the front of comb_inp. forward() has fused_moe
-        # write its rows straight into them, so the bf16 combine finds its input
-        # already staged and skips its copy, and the fp4 send, which reads ahead
-        # as far as row max_recv-1, stays inside the arena.
-        self._mori_stage = _from_gpu_ptr(
-            self._arena.local_ptr("comb_inp"),
-            (config.max_recv, config.hidden_dim),
-            torch.bfloat16,
-        )
-
-        def make_variant(plan):
-            def launch(expert_out: torch.Tensor, token_count: int):
-                plan.launch(
-                    stream=torch.cuda.current_stream().cuda_stream,
-                    inp_token_buf=expert_out,
-                    num_tokens=token_count,
-                    **static_args,
-                )
-
-            return launch
-
-        variants = {bits: {} for bits in specs}
-        for (bits, spec), plan in plans.items():
-            variants[bits][spec] = make_variant(plan)
-        return variants
-
-    def _select_mori_combine(self, quant_bits: int, token_count: int) -> tuple:
-        schedule = self._combine_schedules[quant_bits]
-        for upper_bound, *spec in schedule:
-            if upper_bound is None or token_count <= upper_bound:
-                return tuple(spec)
-        return tuple(schedule[-1][1:])
-
-    def _select_dispatch(self, token_count: int) -> tuple:
-        for upper_bound, *spec in self._dispatch_schedule:
-            if upper_bound is None or token_count <= upper_bound:
-                spec = tuple(spec)
-                return (
-                    spec
-                    if spec in self._dispatch_variants
-                    else self._dispatch_specs[-1]
-                )
-        return self._dispatch_specs[-1]
-
-    def _recv_tokens(self) -> torch.Tensor:
-        config = self._config
-        # Width in whatever recv_dtype counts: features for bf16/fp8, bytes for
-        # fp4 -- see _DispatchWire.recv_dtype.
-        width = (
-            config.dispatch_token_nbytes
-            // config.dispatch_wire_spec.recv_dtype.itemsize
-        )
-        rows = self._compact_cap if self._compact_plan else config.max_recv
-        if self._compact_plan:
-            storage = _from_gpu_ptr(
-                self._arena.local_ptr("disp_out"),
-                (rows * self._compact_wire_row,),
-                config.dispatch_wire_spec.recv_dtype,
-            )
-            return torch.as_strided(
-                storage,
-                (rows, width),
-                (self._compact_wire_row, 1),
-            )
-        return _from_gpu_ptr(
-            self._arena.local_ptr("disp_out"),
-            (rows, width),
-            config.dispatch_wire_spec.recv_dtype,
-        )
-
-    def _recv_dispatch_scales(self) -> torch.Tensor | None:
-        """The forwarded e8m0 rows, or None on the bf16 wire."""
-        if not self._config.is_quant_dispatch_wire:
-            return None
-        rows = self._compact_cap if self._compact_plan else self._config.max_recv
-        if self._compact_plan:
-            span = (rows - 1) * self._compact_wire_row + self._compact_scale_row
-            storage = _from_gpu_ptr(
-                self._arena.local_ptr("disp_out") + self._config.dispatch_token_nbytes,
-                (span,),
-                torch.uint8,
-            )
-            return torch.as_strided(
-                storage,
-                (rows, self._compact_scale_row),
-                (self._compact_wire_row, 1),
-            )
-        return _from_gpu_ptr(
-            self._arena.local_ptr("disp_out_scales"),
-            (rows, self._compact_scale_row),
-            torch.uint8,
-        )
-
-    def _recv_weights(self) -> torch.Tensor:
-        return _from_gpu_ptr(
-            self._arena.local_ptr("out_wts"),
-            (self._config.max_recv, self._config.topk),
-            torch.float32,
-        )
-
-    def _recv_indices(self) -> torch.Tensor:
-        return _from_gpu_ptr(
-            self._arena.local_ptr("out_idx"),
-            (self._config.max_recv, self._config.topk),
-            torch.int32,
-        )
+    # -- for callers that drive the transport themselves (ATOM's Triton experts)
+    @property
+    def _arena(self) -> SymmetricArena:
+        return self._ep.res.arena
 
     def _dispatch(
         self,
@@ -2401,101 +2610,15 @@ class MegaMoEGfx1250:
         topk_ids: torch.Tensor,
         recv_counter_is_zero: bool = False,
     ):
-        token_count = hidden_states.shape[0]
-        spec = self._select_dispatch(token_count)
-        if self._compact_plan and not self._compact_plan_pending:
-            self._launch_compact_plan_async(topk_ids, token_count)
-        stream = fx.Stream(torch.cuda.current_stream())
-        payload = hidden_states
-        if self._config.is_quant_dispatch_wire:
-            # Quantize ONCE PER LOCAL TOKEN here, instead of once per received
-            # copy on the far side. Destination-independent, so the bytes are the
-            # same either way; the preshuffle cannot move with it, because its
-            # destination is the grouped row the receiver assigns.
-            from aiter.ops.quant import dynamic_per_group_scaled_quant
+        """Dispatch alone: (recv_x, recv_weights, recv_indices, total_recv,
+        routing), each over the arena's full recv rows."""
+        stage = self._ep.dispatch
+        batch = stage.dispatch(hidden_states, topk_weights, topk_ids, begin_step=False)
+        return (*stage.recv_views(), self._ep.res.total_recv, batch.routing)
 
-            payload = self._dispatch_quant_payload[:token_count]
-            scale_rows = self._dispatch_quant_scales[:token_count]
-            dynamic_per_group_scaled_quant(
-                payload,
-                hidden_states,
-                scale_rows,
-                32,
-                shuffle_scale=False,
-            )
-            # Straight onto the wire; mori restrides these packed rows while it
-            # stages them, so there is no repack here.
-            self._dispatch_sent_scales_ptr = scale_rows.data_ptr()
-        if self._compact_plan:
-            self._wait_compact_plan()
-            tok_map = self._tok_maps[self._compact_slot]
-            self._token_destination_map = tok_map
-            self._compact_masked_m = self._masked_ms[self._compact_slot]
-            self._compact_psum = self._psums[self._compact_slot]
-        else:
-            tok_map = self._token_destination_map
-        self._dispatch_variants[spec](
-            self._arena.handle,
-            payload.data_ptr(),
-            topk_ids.data_ptr(),
-            topk_weights.data_ptr(),
-            tok_map.data_ptr(),
-            self._destination_peer_counter.data_ptr(),
-            self._dispatch_barrier.data_ptr(),
-            self._total_recv.data_ptr(),
-            self._config.rank,
-            token_count,
-            stream,
-        )
-        reverse_source_view = _from_gpu_ptr(
-            self._arena.local_ptr("recv_to_src_token"),
-            (self._config.max_recv,),
-            torch.int32,
-        )
-        routing = Routing(
-            token_count=token_count,
-            reverse_source_view=reverse_source_view,
-        )
-        return (
-            self._recv_tokens(),
-            self._recv_weights(),
-            self._recv_indices(),
-            self._total_recv,
-            routing,
-        )
-
-    def _scatter_context(
-        self, routing: Routing, combine_quant_bits: int
-    ) -> Stage2ScatterContext:
-        return Stage2ScatterContext(
-            arena_handle=self._arena.handle,
-            combine_input_offset=self._arena.offset("comb_inp"),
-            slot_stride_bytes=self._config.combine_slot_stride_for(combine_quant_bits),
-            max_tokens_per_rank=self._config.max_tokens_per_rank,
-            world_size=self._config.world_size,
-            source_token_map=routing.source_token_map,
-            compact_layout=self._compact_plan,
-            compact_masked_m=self._compact_masked_m,
-            compact_psum=self._compact_psum,
-            compact_ep_rowmap=(
-                _from_gpu_ptr(
-                    self._arena.local_ptr("ep_rowmap"),
-                    (self._compact_cap + 1, 2),
-                    torch.int32,
-                )
-                if self._compact_plan
-                else None
-            ),
-            compact_wire_row_stride=(
-                self._compact_wire_row if self._compact_plan else 0
-            ),
-            compact_recv_bound=(
-                self._compact_step_recv_bound if self._compact_plan else 0
-            ),
-            compact_align_m=(self._compact_step_align_m if self._compact_plan else 0),
-            compact_rows=(self._compact_step_rows if self._compact_plan else 0),
-            combine_quant_bits=combine_quant_bits,
-        )
+    def _recv_dispatch_scales(self) -> torch.Tensor | None:
+        """The forwarded e8m0 rows, or None on the bf16 wire."""
+        return self._ep.dispatch.recv_scales
 
     def _combine(
         self,
@@ -2503,57 +2626,16 @@ class MegaMoEGfx1250:
         combine_quant_bits: int = 0,
         expert_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Reduce the expert results into this rank's tokens.
+        """Combine alone, on the ``combine_quant_bits`` wire (bf16 by default).
+        On the fused path the results are already in the peers' slots; on
+        mori's, ``expert_out`` is fused_moe's output in its staging rows."""
+        return self._ep.combine.finish(routing, combine_quant_bits, expert_out)
 
-        ``combine_quant_bits`` is the wire; it defaults to bf16, the one a
-        caller gets unless it asked forward() for another. With
-        ``stage2_fused`` the gemm2 epilogue has already scattered the results
-        into the peers' slots, packed as that wire. Without it, ``expert_out``
-        is fused_moe's per-recv-slot output, already in mori's staging rows
-        (``_mori_stage``), and mori moves it from there.
-        """
-        count = routing.token_count
-        if not self._config.stage2_fused:
-            spec = self._select_mori_combine(combine_quant_bits, count)
-            self._mori_combine_variants[combine_quant_bits][spec](expert_out, count)
-        else:
-            stream = fx.Stream(torch.cuda.current_stream())
-            # 1-block cross-device barrier, then the barrier-free reduce on the
-            # same stream; the kernel boundary gives the reduce its visibility.
-            _run_compiled(
-                self._combine_sync,
-                self._arena.handle,
-                self._cross_device_flag.data_ptr(),
-                self._config.rank,
-                stream,
-            )
-            _run_compiled(
-                self._combine_variants[combine_quant_bits],
-                self._arena.local_ptr("comb_inp"),
-                self._combine_output.data_ptr(),
-                count,
-                stream,
-            )
-        return (
-            self._combine_output[: count * self._config.hidden_dim]
-            .view(torch.bfloat16)
-            .view(count, self._config.hidden_dim)
-        )
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        # A launch still in flight (a graph replay, say) reads the window: let it
-        # finish before anything it reads is freed.
-        torch.cuda.synchronize(self._total_recv.device)
-        # The plans hold the window and their kernels dereference it, so they
-        # go before the arena does.
-        for plan in (*self._mori_plans.values(), *self._mori_combine_plans.values()):
-            plan.close()
-        # After the plans, which hold its address.
-        self._mori_dispatch_staging = None
-        self._arena.close()
-        if self._tokoff_ext is not None:
-            self._tokoff_ext.close()
-            self._tokoff_ext = None
+        self._ep.close()

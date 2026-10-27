@@ -12,7 +12,8 @@ MULTIGPU job runs every file in this directory on its gfx950 runners.
 Covered, on the a4w4 recipe (fp4 dispatch wire) plus a bf16 wire:
   * every dispatch/combine pairing against the fp32 reference, and a captured
     graph's replay against the eager result, bit for bit;
-  * pairings MegaMoE cannot run fail before the symmetric arena is allocated;
+  * pairings MegaMoE cannot run fail before the symmetric arena is allocated,
+    and a failure after it frees what was built;
   * mori's combine reads fused_moe's rows in place (zero-copy staging);
   * close() releases the plans before the window and the window before its memory;
   * the members ATOM's Triton path reaches (_dispatch, _combine, _arena, _config);
@@ -229,6 +230,31 @@ def _check_rejected_before_alloc(ctx):
         assert counting.allocs == 0, f"{overrides}: allocated before failing"
 
 
+def _check_unwind(ctx):
+    """A failure after the arena is allocated releases the arena and the plans."""
+    from mori.ops.dispatch_combine_v2 import ep_plans
+
+    counting = _CountingCommunicator(ctx.comm)
+    original = ep_plans.EpCombinePlan.bind
+
+    def bind(self, **kwargs):
+        raise RuntimeError("injected bind failure")
+
+    ep_plans.EpCombinePlan.bind = bind
+    try:
+        ctx.build(communicator=counting, stage2_fused=False).close()
+    except RuntimeError as error:
+        assert "injected" in str(error), error
+    else:
+        raise AssertionError("the injected failure did not surface")
+    finally:
+        ep_plans.EpCombinePlan.bind = original
+        ctx.comm.barrier()
+    log = counting.close_log
+    assert counting.allocs == 1, counting.allocs
+    assert log == ["window", "memory"], log
+
+
 def _check_zero_copy(ctx):
     """With mori's combine, fused_moe writes its rows straight into comb_inp."""
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import mega_moe as mm
@@ -395,6 +421,7 @@ def _check_vmm_bound(ctx):
 CHECKS = (
     _check_pairings,
     _check_rejected_before_alloc,
+    _check_unwind,
     _check_zero_copy,
     _check_close_order,
     _check_atom_surface,
