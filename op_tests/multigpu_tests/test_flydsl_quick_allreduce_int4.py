@@ -1431,10 +1431,12 @@ def test_quick_allreduce_int4_divisor(tokens, hidden, tp, fill, divisor):
             _check(
                 label,
                 [
-                    f"SQNR {ret['sqnr_db']:.2f} dB is only "
-                    f"{ret['sqnr_vs_divisor1_db']:.2f} dB above divisor 1; "
-                    f"expected the E4M3 clip to be recovered by "
-                    f"{DIVISOR_RECOVERY_DB} dB"
+                    (
+                        f"SQNR {ret['sqnr_db']:.2f} dB is only "
+                        f"{ret['sqnr_vs_divisor1_db']:.2f} dB above divisor 1; "
+                        f"expected the E4M3 clip to be recovered by "
+                        f"{DIVISOR_RECOVERY_DB} dB"
+                    )
                 ],
             )
     # CLOSE_ATOL is calibrated to the 0.1-std fill, not to the outlier's 100.

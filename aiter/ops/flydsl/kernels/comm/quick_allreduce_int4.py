@@ -948,9 +948,7 @@ def make_quick_allreduce_int4_kernel(
                         words, scale = _recv_quantized(
                             PHASE_ALL_GATHER, fx.Int32(src), sub, k
                         )
-                        gathered.append(
-                            _codec_dequant(c, words, _ag_scale(scale), tid)
-                        )
+                        gathered.append(_codec_dequant(c, words, _ag_scale(scale), tid))
             return gathered
 
         # Stride by the *launched* grid, not the compile-time cap. The host
