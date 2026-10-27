@@ -250,13 +250,20 @@ class TunerCommon:
             default=os.environ.get("AITER_SELECT", "latency"),
             help="How to pick the winner among kernels that pass errRatio. "
             "'latency' (default) keeps the lowest us. "
-            "'power' (aliases: efficiency, power_efficiency) ranks by "
-            "TFLOP/s per package watt, measured from the GPU PPT sysfs node "
-            "(power1_input) over AITER_POWER_WINDOW_S seconds (default 0.4) "
-            "on the accurate pass only. Also set by AITER_SELECT. "
+            "'power' (experimental; aliases: efficiency, power_efficiency) "
+            "ranks by TFLOP/s per package watt, measured from the GPU PPT "
+            "sysfs node (power1_input) over AITER_POWER_WINDOW_S seconds "
+            "(default 0.4) on the accurate pass only. It adds no latency "
+            "bound, and the score is an isolated replay under the clock and "
+            "power cap in effect, so the winner can change in another model "
+            "or power-management state. Also set by AITER_SELECT. "
             "PPT is the whole package, so the GPU should otherwise be idle. "
             "Use --shape_grouped so every candidate for a shape is measured "
-            "on the same GPU. AITER_POWER_PATH overrides the hwmon file. "
+            "on the same GPU. AITER_POWER_PATH overrides the hwmon file; "
+            "with more than one process it must contain {device}. "
+            "Each power row records select, perf_level, power_cap_w, and "
+            "sclk_max_mhz. When -o is a shipped table under aiter/configs/, "
+            "a power tune writes to aiter/configs/power_configs/ instead. "
             "The fused-MoE tuner writes every surviving pair, ranked, to "
             "--profile_file (-o2). In power mode that file is "
             "<tune_file>.ranked.csv when -o2 is omitted.",
@@ -272,7 +279,71 @@ class TunerCommon:
             )
         args.select = select
         os.environ["AITER_SELECT"] = select
+        if select == "power":
+            self._redirect_power_output(args)
         return select
+
+    def _redirect_power_output(self, args):
+        """Send a power tune of a shipped table to aiter/configs/power_configs/.
+
+        Writing power rows into a shipped latency table would make the
+        model_configs/ shape merge rank one against the other. A ``-o`` the
+        user chose outside the shipped tables is left alone.
+        """
+        from aiter.jit.core import AITER_ROOT_DIR
+        from aiter.utility.tune_result import POWER_CONFIG_DIRNAME
+
+        tune_file = getattr(args, "tune_file", None)
+        if not tune_file or tune_file != self.parser.get_default("tune_file"):
+            return
+        first = os.path.abspath(self.get_out_file(tune_file))
+        configs_dir = os.path.abspath(os.path.join(AITER_ROOT_DIR, "aiter", "configs"))
+        power_dir = os.path.join(configs_dir, POWER_CONFIG_DIRNAME)
+        try:
+            shipped = os.path.commonpath([first, configs_dir]) == configs_dir
+        except ValueError:
+            shipped = False
+        if not shipped or os.path.dirname(first) == power_dir:
+            return
+        os.makedirs(power_dir, exist_ok=True)
+        args.tune_file = os.path.join(power_dir, os.path.basename(first))
+        logger.info(
+            f"select=power: writing to {args.tune_file} instead of the shipped "
+            f"table {first}. Load it with AITER_SELECT=power or the op's "
+            "AITER_CONFIG_* variable."
+        )
+
+    def _stamp_power_rows(self, results, args):
+        """Record the power-management state on every row a power tune writes."""
+        from aiter.utility.tune_result import (
+            POWER_ROW_COLUMNS,
+            SELECT_COLUMN,
+            power_selection_enabled,
+        )
+
+        if not isinstance(results, pd.DataFrame) or not power_selection_enabled(
+            getattr(args, "select", None)
+        ):
+            return results
+        conditions = getattr(self, "_power_conditions", None)
+        if conditions is None:
+            from aiter.utility.package_power import tune_conditions
+
+            gpu_num = torch.cuda.device_count()
+            mp_num = int(getattr(args, "mp", gpu_num) or gpu_num)
+            if mp_num < 1 or mp_num > gpu_num:
+                mp_num = gpu_num
+            conditions = tune_conditions(range(mp_num))
+            self._power_conditions = conditions
+            logger.info(f"select=power: tune conditions {conditions}")
+        results = results.copy()
+        results[SELECT_COLUMN] = "power"
+        for name, value in conditions.items():
+            results[name] = value
+        missing = [c for c in POWER_ROW_COLUMNS if c not in self.columns]
+        if missing:
+            self.columns = list(self.columns) + missing
+        return results
 
     def parse_args(self):
         args = self.parser.parse_args()
@@ -468,6 +539,16 @@ class TunerCommon:
         if df_updates.empty:
             return df_old
         key_columns = self.keys
+        from aiter.utility.tune_result import POWER_ROW_COLUMNS
+
+        # Power columns exist only on power-tuned rows; a latency result frame
+        # without them stays valid.
+        optional = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS
+        missing = [
+            c for c in self.columns if c in optional and c not in df_updates.columns
+        ]
+        if missing:
+            df_updates = df_updates.assign(**{c: pd.NA for c in missing})
         df_updates = df_updates.loc[:, self.columns]
         # Backfill columns present in the new results but missing from a legacy
         # tuned CSV (for example a newly added gfx key column), so that the
@@ -1455,9 +1536,10 @@ class TunerCommon:
         """tuner run function"""
         select = self._apply_select(args)
         if select == "power":
-            logger.info(
-                "select=power: ranking kernels that pass errRatio by "
-                "package TFLOP/s/W (us * PPT watts). Keep the GPU otherwise idle."
+            logger.warning(
+                "select=power is experimental: ranking kernels that pass "
+                "errRatio by package energy (us * PPT watts) with no latency "
+                "bound. Keep the GPU otherwise idle."
             )
         self.pre_process(args)
 
@@ -1569,6 +1651,7 @@ class TunerCommon:
                 all_results = self.tune(batch, self.tunedf, args)
                 if all_results:
                     results = self.post_process(all_results, args, topk)
+                    results = self._stamp_power_rows(results, args)
                     if args.compare:
                         batch_post_tune_results, batch_compare_plan = (
                             self._apply_compare_batch_results(

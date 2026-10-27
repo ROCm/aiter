@@ -486,37 +486,11 @@ class AITER_CONFIG:
         Shared by the multi-file merge and the single-file path: one CSV on its
         own can carry duplicate shapes too (e.g. a retune appended instead of
         replacing), and no other check looks at it."""
-        import pandas as pd
-
         has_tag = "_tag" in merge_df.columns
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
 
-        ## get keys from untuned file to drop_duplicates
-        # Turn the tuned-file base name into its untuned sibling by rewriting the
-        # LAST "tuned" token (handles both mid-string names like
-        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
-        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
-        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
-        if not os.path.exists(untuned_path):
-            logger.warning(
-                f"Untuned config file not found: {untuned_path}. "
-                "Skipping duplicate-shape check."
-            )
-            return
-
-        untunedf = pd.read_csv(untuned_path)
-        keys = untunedf.columns.to_list()
-        if "cu_num" not in keys:
-            keys.append("cu_num")
-        if "gfx" in merge_df.columns and "gfx" not in keys:
-            keys.append("gfx")
-        dedup_keys = keys + ["_tag"] if has_tag else keys
-        # Only key on columns actually present in the merged frame. Most
-        # families carry cu_num, but some (e.g. the mxscale batched-GEMM
-        # table) key on gfx and never carry cu_num; keeping a missing column
-        # in the subset would raise inside pandas' duplicated().
-        dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
+        dedup_keys = self._shape_dedup_keys(merge_df, merge_name)
         if not dedup_keys:
             return
 
@@ -542,6 +516,18 @@ class AITER_CONFIG:
             f"to their paths, separated by '{os.pathsep}'; this also skips the "
             f"model_configs/ scan.\n"
         )
+        conflict = self._power_merge_conflict(dup_rows, dedup_keys)
+        if conflict:
+            # Ranking these rows against each other would compare watts from
+            # different clocks or caps, or energy against latency. Keep every
+            # source file as it is and let the user choose the table.
+            raise RuntimeError(
+                dup_header
+                + conflict
+                + "No config file was rewritten.\n"
+                + env_hint
+                + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+            )
         if "us" not in merge_df.columns:
             raise RuntimeError(
                 dup_header + "No 'us' column to determine best performing entry. "
@@ -588,14 +574,21 @@ class AITER_CONFIG:
                 saved_files.append(
                     f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
                 )
+        from aiter.utility.tune_result import power_selection_enabled
+
+        kept = (
+            "highest 'tflops_per_w'"
+            if power_selection_enabled() and "tflops_per_w" in merge_df.columns
+            else "lowest 'us'"
+        )
         if failed_files:
             outcome = (
-                "Resolved by keeping best performing (lowest 'us') for each key, "
+                f"Resolved by keeping best performing ({kept}) for each key, "
                 "but not every source config file could be rewritten.\n"
             )
         else:
             outcome = (
-                "Auto-resolved by keeping best performing (lowest 'us') for each "
+                f"Auto-resolved by keeping best performing ({kept}) for each "
                 "key and saved back to source config files.\n"
             )
         saved_info = "\n".join(saved_files) if saved_files else "  (no files updated)"
@@ -612,6 +605,165 @@ class AITER_CONFIG:
             + f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
             f"Updated files:\n{saved_info}" + failed_info
         )
+
+    @staticmethod
+    def _shape_dedup_keys(merge_df, merge_name: str):
+        """Shape key columns for a tuned family, or None if they cannot be found."""
+        import pandas as pd
+
+        ## get keys from untuned file to drop_duplicates
+        # Turn the tuned-file base name into its untuned sibling by rewriting the
+        # LAST "tuned" token (handles both mid-string names like
+        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
+        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
+        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+        if not os.path.exists(untuned_path):
+            logger.warning(
+                f"Untuned config file not found: {untuned_path}. "
+                "Skipping duplicate-shape check."
+            )
+            return None
+
+        untunedf = pd.read_csv(untuned_path)
+        keys = untunedf.columns.to_list()
+        if "cu_num" not in keys:
+            keys.append("cu_num")
+        if "gfx" in merge_df.columns and "gfx" not in keys:
+            keys.append("gfx")
+        if "_tag" in merge_df.columns:
+            keys.append("_tag")
+        # Only key on columns actually present in the merged frame. Most
+        # families carry cu_num, but some (e.g. the mxscale batched-GEMM
+        # table) key on gfx and never carry cu_num; keeping a missing column
+        # in the subset would raise inside pandas' duplicated().
+        return [k for k in keys if k in merge_df.columns] or None
+
+    @staticmethod
+    def _power_merge_conflict(dup_rows, dedup_keys) -> str | None:
+        """Why duplicate shapes must not be auto-resolved, or None.
+
+        A power row and a latency row for one shape measure different things.
+        Two power rows tuned under different perf levels, caps, or clocks have
+        watts that cannot be compared.
+        """
+        from aiter.utility.tune_result import (
+            POWER_CONDITION_COLUMNS,
+            SELECT_COLUMN,
+            row_select_mode,
+        )
+
+        if SELECT_COLUMN not in dup_rows.columns:
+            return None
+        modes = dup_rows[SELECT_COLUMN].map(row_select_mode)
+        condition_cols = [c for c in POWER_CONDITION_COLUMNS if c in dup_rows.columns]
+        reasons = []
+        for _, group in dup_rows.assign(_mode=modes).groupby(
+            dedup_keys, dropna=False, sort=False
+        ):
+            group_modes = set(group["_mode"])
+            if len(group_modes) > 1:
+                reasons.append("a power-tuned row and a latency row share a shape")
+                continue
+            if group_modes == {"power"} and condition_cols:
+                states = {
+                    tuple(str(v) for v in row)
+                    for row in group[condition_cols].itertuples(index=False)
+                }
+                if len(states) > 1:
+                    reasons.append(
+                        "power-tuned rows for one shape were tuned under "
+                        f"different {', '.join(condition_cols)}"
+                    )
+        if not reasons:
+            return None
+        return (
+            "Not auto-resolved: "
+            + "; ".join(sorted(set(reasons)))
+            + ". Keep power tables in aiter/configs/power_configs/, or load "
+            "one model's table through its AITER_CONFIG_* variable.\n"
+        )
+
+    @staticmethod
+    def _shape_key_strings(frame, keys):
+        """Shape keys as comparable strings; integral floats read back from a merge match ints."""
+        import pandas as pd
+
+        normalized = {}
+        for key in keys:
+            column = frame[key]
+            numeric = pd.to_numeric(column, errors="coerce")
+            if numeric.notna().all() and (numeric == numeric.round()).all():
+                normalized[key] = numeric.astype("int64").astype(str)
+            else:
+                normalized[key] = column.astype(str)
+        return pd.DataFrame(normalized).apply(tuple, axis=1)
+
+    def _overlay_power_tables(
+        self, latency_file: str, power_files, merge_name: str, env_name: str | None
+    ) -> str:
+        """Latency table with each power-tuned shape replaced by its power row.
+
+        Shapes without a power row keep their latency row, so AITER_SELECT=power
+        never leaves a shape untuned. No source file is rewritten for a
+        power/latency overlap.
+        """
+        import tempfile
+        from pathlib import Path
+
+        import pandas as pd
+
+        from aiter.utility.tune_result import SELECT_COLUMN
+
+        pairs = []
+        for path in power_files:
+            df = pd.read_csv(path)
+            if not df.empty:
+                pairs.append((str(path), df))
+        if not pairs:
+            return latency_file
+        power_df = pd.concat([df for _, df in pairs], ignore_index=True)
+        # Same-condition duplicates inside power_configs/ auto-resolve like any
+        # other merge; different conditions raise.
+        self._raise_on_duplicate_shapes(power_df, pairs, merge_name, env_name)
+        keys = self._shape_dedup_keys(power_df, merge_name)
+        if not keys or not os.path.exists(latency_file):
+            return latency_file
+        latency_df = pd.read_csv(latency_file)
+        if not all(k in latency_df.columns for k in keys):
+            return latency_file
+        columns = list(latency_df.columns) + [
+            c for c in power_df.columns if c not in latency_df.columns
+        ]
+        # Fill a column one side lacks the way the model_configs/ merge does:
+        # a blank cell turns an int column into floats, which the AOT parser
+        # rejects.
+        fill = {"xbf16": 0, "run_1stage": 0, "ksplit": 0, SELECT_COLUMN: "latency"}
+        for frame in (latency_df, power_df):
+            for column in columns:
+                if column not in frame.columns:
+                    frame[column] = fill.get(column, 0)
+        latency_df = latency_df[columns]
+        power_df = power_df[columns]
+        covered = set(self._shape_key_strings(power_df, keys))
+        keep = ~self._shape_key_strings(latency_df, keys).isin(covered)
+        merged = pd.concat([latency_df[keep], power_df], ignore_index=True)
+
+        config_path = Path(tempfile.gettempdir()) / "aiter_configs"
+        config_path.mkdir(parents=True, exist_ok=True)
+        new_file_path = str(config_path / f"{merge_name}.power.csv")
+        lock_path = f"{new_file_path}.lock"
+        tmp_file_path = f"{new_file_path}.tmp"
+
+        def write_config():
+            merged.to_csv(tmp_file_path, index=False)
+            os.replace(tmp_file_path, new_file_path)
+
+        mp_lock(lock_path, write_config)
+        logger.info(
+            f"AITER_SELECT=power: {int((~keep).sum())} shapes of '{merge_name}' "
+            f"use power rows from {[p for p, _ in pairs]}"
+        )
+        return new_file_path
 
     def update_config_files(
         self, file_path: str, merge_name: str, env_name: str | None = None
@@ -754,12 +906,42 @@ class AITER_CONFIG:
                 config_file = self.update_config_files(
                     tuned_files, tuned_file_name, env_name
                 )
+            config_file = self._apply_power_configs(
+                config_file, tuned_file_name, env_name
+            )
         else:
             config_file = self.update_config_files(
                 config_env_file, tuned_file_name, env_name
             )
             # print(f"get config file from environment ", config_file)
         return config_file
+
+    def _apply_power_configs(self, config_file, tuned_file_name, env_name):
+        """With AITER_SELECT=power, overlay aiter/configs/power_configs/ tables.
+
+        An explicit AITER_CONFIG_* variable skips this, so a model's own table
+        loads exactly as given.
+        """
+        from pathlib import Path
+
+        from aiter.utility.tune_result import (
+            POWER_CONFIG_DIRNAME,
+            power_selection_enabled,
+        )
+
+        if not power_selection_enabled():
+            return config_file
+        power_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/{POWER_CONFIG_DIRNAME}/")
+        power_files = sorted(
+            p
+            for p in power_dir.glob(f"*{tuned_file_name}*.csv")
+            if p.is_file() and "untuned" not in p.name
+        )
+        if not power_files:
+            return config_file
+        return self._overlay_power_tables(
+            config_file, power_files, tuned_file_name, env_name
+        )
 
 
 AITER_CONFIGS = AITER_CONFIG()
