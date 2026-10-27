@@ -545,8 +545,10 @@ def render(result: Result, pr: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "<sub>Shadow mode reports what would block but keeps the status successful. "
-            "Set `AITER_PR_SELF_REVIEW_MODE=enforce` only after reviewing real false positives.</sub>",
+            (
+                "<sub>Shadow mode reports what would block but keeps the status successful. "
+                "Set `AITER_PR_SELF_REVIEW_MODE=enforce` only after reviewing real false positives.</sub>"
+            ),
             "",
             f"<!-- state={result.state()} head={result.head_sha} answer={result.telemetry.get('fingerprint', '')} -->",
             MARKER,
@@ -611,7 +613,8 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     if args.fixture:
-        data = json.load(open(args.fixture, encoding="utf-8"))
+        with open(args.fixture, encoding="utf-8") as fixture_file:
+            data = json.load(fixture_file)
         issues, telemetry = validate_author_answers(
             data["body"], data["head_sha"], data.get("changed_tests", [])
         )
