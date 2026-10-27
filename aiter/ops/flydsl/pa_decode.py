@@ -381,8 +381,12 @@ def pa_decode(
                 "are multiples of 64 in [64, 1024] for BF16 KV"
                 if is_bf16_kv and arch != "gfx1250"
                 else (
-                    "are 64, multiples of 128 in [128, 1024], and qualified "
-                    "gfx950 asymmetric D192/V128 for FP8 KV"
+                    "are 64 and multiples of 128 in [128, 1024] for BF16 KV on gfx1250"
+                    if is_bf16_kv
+                    else (
+                        "are 64, multiples of 128 in [128, 1024], and qualified "
+                        "gfx950 asymmetric D192/V128 for FP8 KV"
+                    )
                 )
             )
         )
