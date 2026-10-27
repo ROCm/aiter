@@ -15,12 +15,17 @@ skewed sequence lengths.
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T
 
-from aiter.jit.utils.chip_info import get_num_xcds
+from aiter.jit.utils.chip_info import (
+    get_gfx_runtime,
+    get_lds_capacity_bytes,
+    get_num_xcds,
+)
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from .tensor_shim import _run_compiled
@@ -31,10 +36,93 @@ BLOCK_K = 64
 STAGES_A = 2
 B_STAGES = 3
 THREADS = 256
-LDS_BYTES = 65536
-K_TILE_GRAN = 32  # MFMA K-tile loop uses BLOCK_K // 32 stages
 
 _DEFAULT_STREAM = fx.Stream(None)
+
+# K16 bf16 atom. The permutation covers two K16 steps behind one 128-bit load,
+# so the tiled GEMM advances 32 K per step.
+_K16_PERM_SHAPE = (4, 4, 2)
+_K16_PERM_STRIDE = (1, 8, 4)
+_K16_STEP = 32
+_K16_SWIZZLE = (3, 3, 3)
+_K16_MIN_BLOCK_K = 64
+
+# CDNA4's K32 atom consumes one 32-wide step. Its flat K mode needs direct
+# per-step slicing, unlike the nested K mode of the K16 record.
+_K32_PERM_SHAPE = (8, 4)
+_K32_PERM_STRIDE = (1, 8)
+_K32_STEP = 32
+_K32_SWIZZLE = (3, 3, 3)
+_K32_MIN_BLOCK_K = 64
+
+
+@dataclass(frozen=True)
+class JdbbaArchTraits:
+    """Compile-time MFMA, K permutation, LDS swizzle, and LDS budget."""
+
+    arch: str
+    mfma_k: int
+    k_perm_shape: tuple[int, ...]
+    k_perm_stride: tuple[int, ...]
+    k_step: int
+    k_slice_nested: bool
+    swizzle: tuple[int, int, int]
+    lds_bytes: int
+    min_block_k: int
+
+    @property
+    def key(self) -> tuple:
+        return (
+            self.arch,
+            self.mfma_k,
+            self.k_perm_shape,
+            self.k_perm_stride,
+            self.k_step,
+            self.k_slice_nested,
+            self.swizzle,
+            self.lds_bytes,
+            self.min_block_k,
+        )
+
+
+def _runtime_arch() -> str:
+    return get_gfx_runtime().split(":", 1)[0]
+
+
+def jdbba_arch_traits(arch: str) -> JdbbaArchTraits:
+    """Traits for a dispatch arch. The LDS budget comes from ``chip_info``."""
+    arch = arch.split(":", 1)[0]
+    if arch not in ("gfx942", "gfx950"):
+        raise ValueError(f"jagged_dense_bmm has no arch traits for {arch}")
+    if arch == "gfx950":
+        return JdbbaArchTraits(
+            arch=arch,
+            mfma_k=32,
+            k_perm_shape=_K32_PERM_SHAPE,
+            k_perm_stride=_K32_PERM_STRIDE,
+            k_step=_K32_STEP,
+            k_slice_nested=False,
+            swizzle=_K32_SWIZZLE,
+            lds_bytes=get_lds_capacity_bytes(arch),
+            min_block_k=_K32_MIN_BLOCK_K,
+        )
+    return JdbbaArchTraits(
+        arch=arch,
+        mfma_k=16,
+        k_perm_shape=_K16_PERM_SHAPE,
+        k_perm_stride=_K16_PERM_STRIDE,
+        k_step=_K16_STEP,
+        k_slice_nested=True,
+        swizzle=_K16_SWIZZLE,
+        lds_bytes=get_lds_capacity_bytes(arch),
+        min_block_k=_K16_MIN_BLOCK_K,
+    )
+
+
+def smem_bytes(block_m: int, block_n: int, block_k: int) -> int:
+    """LDS bytes for the double-buffered A tile and the epilogue C tile."""
+    a_smem = block_m * block_k * STAGES_A * 2
+    return max(a_smem, block_m * block_n * 2)
 
 
 def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD):
@@ -92,10 +180,17 @@ def _build_launcher(
     XCD_C,
     XCD_W,
     NUM_XCDS,
+    traits: JdbbaArchTraits,
     COMPACT=False,
 ):
+    mfma_k = traits.mfma_k
+    k_step = traits.k_step
+    k_perm_shape = traits.k_perm_shape
+    k_perm_stride = traits.k_perm_stride
+    k_slice_nested = traits.k_slice_nested
+    swizzle = traits.swizzle
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
-    smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
+    a_smem = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def jdbba_kernel(
@@ -233,7 +328,7 @@ def _build_launcher(
             ).get_slice(tid)
 
             composed_layout_A = fx.make_composed_layout(
-                fx.static(fx.SwizzleType.get(3, 3, 3)),
+                fx.static(fx.SwizzleType.get(swizzle[0], swizzle[1], swizzle[2])),
                 fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2)),
             )
             sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)
@@ -275,14 +370,20 @@ def _build_launcher(
                         soffset=fx.Int32(b_next_k) * gB_k_stride,
                     )
 
-                for block_k_iter in fx.range_constexpr(BLOCK_K // 32):
+                for block_k_iter in fx.range_constexpr(BLOCK_K // k_step):
                     fx.copy(
                         uni_copy_128b,
                         thr_sA_s2r[None, None, block_k_iter, a_read_stage],
                         mma_frag_A_retile[None, None, block_k_iter],
                     )
-                    frag_A_k = mma_frag_A[None, None, (None, block_k_iter)]
-                    frag_B_k = mma_frag_B[None, None, (None, block_k_iter), b_read_slot]
+                    if fx.const_expr(k_slice_nested):
+                        frag_A_k = mma_frag_A[None, None, (None, block_k_iter)]
+                        frag_B_k = mma_frag_B[
+                            None, None, (None, block_k_iter), b_read_slot
+                        ]
+                    else:
+                        frag_A_k = mma_frag_A[None, None, block_k_iter]
+                        frag_B_k = mma_frag_B[None, None, block_k_iter, b_read_slot]
                     fx.gemm(
                         tiled_mma,
                         mma_frag_C,
@@ -393,9 +494,9 @@ def _build_launcher(
         n_warps = min(n_warps_total, BLOCK_N // 16)
         m_warps = n_warps_total // n_warps
         tiled_mma = fx.make_tiled_mma(
-            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, mfma_k, fx.BFloat16)),
             fx.make_layout((m_warps, n_warps, 1), (1, m_warps, 0)),
-            fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
+            fx.make_tile(None, None, fx.make_layout(k_perm_shape, k_perm_stride)),
         )
         val_per_thr = 8  # 16B / bf16
         thrs_col = BLOCK_K // val_per_thr
@@ -421,7 +522,7 @@ def _build_launcher(
             fx.make_tile(c_thrs_m, BLOCK_N),
         )
 
-        epi_smem_bytes = max(smem_bytes, BLOCK_M * BLOCK_N * 2)
+        epi_smem_bytes = max(a_smem, BLOCK_M * BLOCK_N * 2)
 
         bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
         if fx.const_expr(COMPACT):
@@ -490,26 +591,29 @@ def jagged_dense_bmm(
     # the trailing N % block_n output columns.
     if bnn <= 0 or N % bnn != 0:
         raise ValueError(f"block_n={bnn} must be a positive divisor of N={N}")
+    traits = jdbba_arch_traits(_runtime_arch())
     if block_k is None:
         block_k = BLOCK_K
     else:
         block_k = int(block_k)
-        if block_k <= 0 or block_k % K_TILE_GRAN != 0:
+        if block_k <= 0 or block_k % traits.k_step != 0:
             raise ValueError(
-                f"block_k must be a positive multiple of {K_TILE_GRAN}, got {block_k}"
+                f"block_k must be a positive multiple of {traits.k_step}, got {block_k}"
             )
-        if block_k < 64:
-            raise ValueError(f"block_k must be >= 64 for MFMA 16x16x16, got {block_k}")
+        if block_k < traits.min_block_k:
+            raise ValueError(
+                f"block_k must be >= {traits.min_block_k} for MFMA 16x16x{traits.mfma_k}, "
+                f"got {block_k}"
+            )
     # These depend on block_m / block_n too, so they run for the default block_k
     # as well: n_tiles = K // block_k floors, silently dropping the K tail.
     if K % block_k != 0:
         raise ValueError(f"block_k={block_k} must divide K={K}")
-    a_smem = bmn * block_k * STAGES_A * 2
-    epi_smem = max(a_smem, bmn * bnn * 2)
-    if epi_smem > LDS_BYTES:
+    epi_smem = smem_bytes(bmn, bnn, block_k)
+    if epi_smem > traits.lds_bytes:
         raise ValueError(
-            f"block_k={block_k} needs {epi_smem} bytes LDS (max {LDS_BYTES}); "
-            f"A-stage staging is {a_smem} bytes"
+            f"block_k={block_k} needs {epi_smem} bytes LDS "
+            f"(max {traits.lds_bytes} on {traits.arch})"
         )
     if num_xcds is None:
         num_xcds = int(get_num_xcds())
@@ -550,6 +654,7 @@ def jagged_dense_bmm(
         xcd_c,
         xcd_w,
         num_xcds,
+        traits.key,
         compact,
     )
     launch_args = (C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream)
@@ -566,6 +671,7 @@ def jagged_dense_bmm(
             xcd_c,
             xcd_w,
             num_xcds,
+            traits,
             compact,
         )
         _cache_put(key, launch)

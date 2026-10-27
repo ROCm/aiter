@@ -29,6 +29,8 @@ from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
 from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import (
     _LAUNCHER_CACHE,
     jagged_dense_bmm,
+    jdbba_arch_traits,
+    smem_bytes,
 )
 from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import (
     BLOCK_M as _BLOCK_M,
@@ -51,6 +53,20 @@ _ARCH_SHAPE = (120, 256, 256, 7680)
 # Both parts expose 8 XCDs. A 4-XCD or 1-XCD partition has no row.
 _MEASURED_CU = {"gfx942": 304, "gfx950": 256}
 _MEASURED_XCDS = 8
+_TRAITS = {
+    "gfx942": {
+        "mfma_k": 16,
+        "lds_bytes": 64 * 1024,
+        "k_perm_shape": (4, 4, 2),
+        "k_slice_nested": True,
+    },
+    "gfx950": {
+        "mfma_k": 32,
+        "lds_bytes": 160 * 1024,
+        "k_perm_shape": (8, 4),
+        "k_slice_nested": False,
+    },
+}
 
 try:
     from generative_recommenders.ops.triton.triton_jagged import (
@@ -663,6 +679,28 @@ def _wrapper_refuses(arch):
     return False
 
 
+def _check_arch_traits(arch):
+    """The arch record owns the measured MFMA, K mode, and LDS budget."""
+    traits = jdbba_arch_traits(arch)
+    expect = _TRAITS[arch]
+    if (
+        traits.mfma_k != expect["mfma_k"]
+        or traits.lds_bytes != expect["lds_bytes"]
+        or traits.k_perm_shape != expect["k_perm_shape"]
+        or traits.k_slice_nested != expect["k_slice_nested"]
+        or traits.swizzle != (3, 3, 3)
+    ):
+        raise AssertionError(f"{arch} traits {traits} diverged from {expect}")
+    # 128x256 bf16, two A stages: 128*256*2*2 = 131072 bytes.
+    wide = smem_bytes(128, 128, 256)
+    if arch == "gfx942" and wide <= traits.lds_bytes:
+        raise AssertionError(f"{arch} accepted a {wide}-byte tile")
+    if arch == "gfx950" and wide > traits.lds_bytes:
+        raise AssertionError(f"{arch} rejected a {wide}-byte tile")
+    if smem_bytes(128, 128, 128) > traits.lds_bytes:
+        raise AssertionError(f"{arch} rejected the measured block_k 128 tile")
+
+
 def _check_shipped_section(arch):
     _clear_dispatch_cache()
     table = _load_dispatch_table()
@@ -803,6 +841,13 @@ def test_jdbba_arch_section(arch):
     """
     spoof = "gfx950" if arch == "gfx942" else "gfx942"
     os.environ["FLYDSL_JAGGED_DENSE_BMM_ARCH"] = spoof
+    mfma_k = ""
+    lds_kb = ""
+    if arch in SUPPORTED_GFX:
+        _check_arch_traits(arch)
+        traits = jdbba_arch_traits(arch)
+        mfma_k = traits.mfma_k
+        lds_kb = traits.lds_bytes // 1024
     prev_config = os.environ.pop("AITER_CONFIG_JAGGED_DENSE_BMM", None)
     try:
         with (
@@ -832,6 +877,12 @@ def test_jdbba_arch_section(arch):
                     raise AssertionError(
                         f"live num_xcds {get_num_xcds()} has no {arch} winners"
                     )
+                live_traits = jdbba_arch_traits(get_gfx())
+                if (
+                    live_traits.arch != arch
+                    or live_traits.mfma_k != _TRAITS[arch]["mfma_k"]
+                ):
+                    raise AssertionError(f"live traits {live_traits}")
                 live = _load_dispatch_table().get("gfx") or ""
                 if live != arch:
                     raise AssertionError(f"live {get_gfx()} loaded section {live!r}")
@@ -853,6 +904,8 @@ def test_jdbba_arch_section(arch):
         "raised": raised,
         "xcd4": "analytic",
         "xcd1": "identity",
+        "mfma_k": mfma_k,
+        "lds_kb": lds_kb,
         "err": 0,
     }
 
