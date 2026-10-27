@@ -19,7 +19,8 @@ namespace ol = opus_logits;
 
 using registry_fn = const ol::mqa_logits_instance* (*)(int*);
 // Every arch's instances; an instance's id is its index in this concatenation.
-constexpr registry_fn REGISTRIES[] = {ol::mqa_logits_gfx1250_instances};
+constexpr registry_fn REGISTRIES[] = {ol::mqa_logits_gfx950_instances,
+                                       ol::mqa_logits_gfx1250_instances};
 
 const ol::mqa_logits_instance& instance_at(int id) {
     AITER_CHECK(id >= 0, "no MXFP4 MQA-logits instance ", id);

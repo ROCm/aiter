@@ -99,7 +99,8 @@ struct mqa_logits_instance {
     hipError_t (*occupancy)(int mode, int* ctas_per_cu);
 };
 
-// gfx1250's instances (mqa_logits_mxfp4_gfx1250.cu).
+// Each arch's instances (mqa_logits_mxfp4_<arch>.cu).
+const mqa_logits_instance* mqa_logits_gfx950_instances(int* count);
 const mqa_logits_instance* mqa_logits_gfx1250_instances(int* count);
 
 }  // namespace opus_logits

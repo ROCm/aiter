@@ -1578,6 +1578,7 @@
     "module_mqa_logits_mxfp4_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_logits_mxfp4/mqa_logits_mxfp4_launcher.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_logits_mxfp4/mqa_logits_mxfp4_gfx950.cu'",
             "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_logits_mxfp4/mqa_logits_mxfp4_gfx1250.cu'",
             "f'{AITER_CSRC_DIR}/kernels/opus_mqa_logits/mqa_logits_mxfp4/mqa_logits_mxfp4_pybind.cu'"
         ],
@@ -1588,6 +1589,9 @@
             "f'-DMQA_LOGITS_MXFP4_KNOCK={int(os.environ.get(\"MQA_LOGITS_MXFP4_KNOCK\", 0))}'"
         ],
         "flags_extra_hip_per_source": {
+            "*mqa_logits_mxfp4_gfx950.cu": [
+                "-mllvm -enable-post-misched=1"
+            ],
             "*mqa_logits_mxfp4_gfx1250.cu": [
                 "-fno-honor-nans",
                 "-mllvm -enable-post-misched=1"

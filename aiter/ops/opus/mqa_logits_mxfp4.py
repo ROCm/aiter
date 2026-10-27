@@ -92,6 +92,11 @@ _V41_DECODE_TIERS = {
     6: (3, 2, 1),
     8: (4, 2, 1),
 }
+# gfx950 V4 decode: a tier (the smallest >= max_qlen) -> rows a CTA (1: the one-row kernel, else
+# qshare: a sequence's rows share each KV tile through LDS). 5-6 rows run three two-row groups and
+# 7-8 two four-row ones: a six- or eight-row CTA fills a CU and its barrier stalls every SIMD at
+# once (cold, Table, 23 shapes a tier: 0.80 / 0.86 of the best, against 0.97 / 0.99).
+_GFX950_DECODE_TIERS = {1: 1, 2: 2, 4: 4, 6: 2, 8: 4}
 # V4.1 candidate layers switch to the shallower ring at prefill size (ATOM's 16384-token batch).
 _CANDIDATE_PREFILL_ROWS = 16384
 # The Prefill split, from static shapes only. Full layers: PREFILL_ROUNDS rounds of resident CTAs
@@ -104,6 +109,8 @@ _CAND_MAX_WALK = 32
 # Per arch: the ndim of q_scale / kv_scale / kv_cache, and kv_cache's page-rows dim. gfx950's are
 # MFMA-permuted (4-D, kv_cache [pages, 4, page_size, 16]); gfx1250's natural (3-D).
 _LAYOUT = {GFX950: (4, 2), GFX1250: (3, 1)}
+# Arches whose KV layout is defined for one page size only: gfx950 permutes a 64-row page at a time.
+_PAGE_SIZE = {GFX950: 64}
 # Requests an arch serves through another op, not this one.
 _ELSEWHERE = {
     (GFX950, 32): "V4.1 (heads=32) on gfx950 runs FlyDSL's row-group kernel "
@@ -178,7 +185,9 @@ class _Instance:
     def name(self) -> str:
         g = "g" if self.gather else ""
         s = "T" if self.scale_tdm else "L"
-        return f"h{self.heads}{g}_r{self.rows_per_wave}w{self.waves}s{self.stages}{s}"
+        k = f"k{self.tile_keys}" if self.tile_keys != _TILE else ""
+        shape = f"r{self.rows_per_wave}w{self.waves}s{self.stages}"
+        return f"h{self.heads}{g}_{shape}{s}{k}"
 
     def has(self, mode: int) -> bool:
         return bool(self.modes >> mode & 1)
@@ -272,9 +281,17 @@ def _rule_gfx1250(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
 
 
 def _rule_gfx950(heads: int, entry_rows: int, max_rows: int, max_qlen: int):
-    """gfx950: no instance is registered under this interface yet (design §7 step 3); its rule
-    lands here with the measurements that pick its instances. V4.1 runs FlyDSL (_ELSEWHERE).
-    """
+    """gfx950 (V4: 64 heads, 64-row pages; V4.1 runs FlyDSL, _ELSEWHERE): decode by tier, Free;
+    prefill one row a CTA, Prefill (the four-row CTA ties it on long windows and loses up to 8%
+    (Table) / 22% (Prefill) on fresh ones)."""
+    if heads != 64:
+        return None
+    if max_qlen <= _DECODE_MAX_QLEN:
+        rpc = _GFX950_DECODE_TIERS[
+            min(t for t in _GFX950_DECODE_TIERS if t >= max_qlen)
+        ]
+        return {"rows_per_cta": rpc, "tile_keys": _TILE}, FREE
+    return {"rows_per_cta": 1, "tile_keys": _TILE}, PREFILL
 
 
 # Each arch's selection, (heads, entry_rows, max_rows, max_qlen) -> (wanted attributes, the
@@ -457,6 +474,11 @@ def _config(
     arch = _device_arch(dev)
     if (arch, heads) in _ELSEWHERE:
         raise ValueError(_ELSEWHERE[arch, heads])
+    if _PAGE_SIZE.get(arch, page_size) != page_size:
+        raise ValueError(
+            f"{arch}'s KV layout is permuted a {_PAGE_SIZE[arch]}-row page at a time; "
+            f"page_size={page_size}"
+        )
     insts = _instances(dev)
     entry_rows = page_size * pages_per_block
     supported = [i for i in insts if i.heads == heads and i.reads(entry_rows)]

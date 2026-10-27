@@ -56,8 +56,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-# gfx950's instances are registered under this interface later (MQA_LOGITS_INTERFACE_DESIGN §7).
-SUPPORTED_GFX = ["gfx1250"]
+SUPPORTED_GFX = ["gfx950", "gfx1250"]
 
 D = 128
 PAGE_ROWS = 8  # the index plane's page
@@ -246,11 +245,23 @@ def run_torch(rows: Rows, data, r):
     """Row r's logits over [0, row_end): sum_h relu(q_h . k) * w_h * weight_scale. The dot product
     in f64 (this image's fp32 GEMMs return wrong products in a few percent of processes), rounded
     to f32 as the WMMA's is; relu and the sum IEEE, so NaN / Inf land where the kernel's do.
+    gfx950's MFMA rounds after each 32-element block instead: it adds the block's exact product to
+    its fp32 accumulator, so an Inf from one block sticks where the f64 sum would not overflow
+    (measured on the edges rows: every one matches only this order).
     """
     kr = rows.key_rows(r)
     k = dequant(data.values[kr], data.scales[kr])
     q = dequant(data.q[r], data.q_scale[r])
-    s = torch.relu((q @ k.T).float())  # [H, end]
+    if _permuted():
+        blk = torch.einsum(
+            "hbk,ebk->heb", q.unflatten(-1, (4, 32)), k.unflatten(-1, (4, 32))
+        )
+        dot = blk[..., 0].float()
+        for b in range(1, 4):
+            dot = (dot.double() + blk[..., b]).float()
+    else:
+        dot = (q @ k.T).float()
+    s = torch.relu(dot)  # [H, end]
     w = data.weights[r].float() * data.weight_scale
     return (w[:, None] * s).sum(0)
 
@@ -268,6 +279,24 @@ def inject_nans(rows: Rows, data):
 
 
 # == a call as the model makes it, every way the interface can run it ===============================
+def _permuted():
+    """gfx950 reads MFMA-permuted q_scale / kv_cache / kv_scale; gfx1250 the natural ones."""
+    return get_gfx() == "gfx950"
+
+
+def _scale_to_gfx950(e8, rows_per_group):
+    """[rows, 4] natural E8M0 -> gfx950's [rows / 64, 2 (g), 32 (m), 4 (kt, tile)], a lane's four
+    bytes in one dword: byte kt * 2 + tile of dword (g, m) is row tile * 32 + m's block
+    kt * 2 + g. ``rows_per_group``: 64 heads (q_scale) or a 64-row page (kv_scale)."""
+    groups = e8.shape[0] // rows_per_group
+    return (
+        e8.reshape(groups, rows_per_group // 32, 32, 2, 2)
+        .permute(0, 4, 2, 3, 1)
+        .reshape(groups, 2, 32, 4)
+        .contiguous()
+    )
+
+
 @dataclass
 class Case:
     rows: Rows
@@ -276,14 +305,55 @@ class Case:
     page_size: int  # the plane as kv_cache [pages, page_size, 64]
     pages_per_block: int
     block_tables: torch.Tensor
+    # gfx950's permuted (q_scale, kv, kv_scale), made on first use
+    _arch: tuple | None = None
+
+    def _layout(self):
+        d = self.data
+        if not _permuted():
+            return (
+                d.q_scale,
+                d.values.view(-1, self.page_size, D // 2),
+                d.scales.view(-1, self.page_size, D // 32),
+            )
+        # kv_cache[page, b, o, :] holds key o's 32-element block b, 16 packed bytes
+        kv = (
+            d.values.view(-1, self.page_size, D // 32, 16)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        return (
+            _scale_to_gfx950(d.q_scale.reshape(-1, D // 32), self.heads),
+            kv,
+            _scale_to_gfx950(d.scales, self.page_size),
+        )
+
+    def arch_inputs(self):
+        """(q_scale, kv_cache, kv_scale) in the device's layout. gfx950's are permuted copies of
+        the data as it was at the first call: after editing the data in place, refresh().
+        """
+        if self._arch is None or not _permuted():
+            self._arch = self._layout()
+        return self._arch
+
+    def refresh(self):
+        """Copy edited data into the permuted tensors already handed out (a captured graph
+        reads those)."""
+        if self._arch is not None:
+            for dst, src in zip(self._arch, self._layout()):
+                dst.copy_(src)
+
+    @property
+    def q_scale(self):
+        return self.arch_inputs()[0]
 
     @property
     def kv(self):
-        return self.data.values.view(-1, self.page_size, D // 2)
+        return self.arch_inputs()[1]
 
     @property
     def kv_scale(self):
-        return self.data.scales.view(-1, self.page_size, D // 32)
+        return self.arch_inputs()[2]
 
 
 def make_case(rows: Rows, heads, *, page64=False, nan=False, seed=1):
@@ -301,6 +371,8 @@ def make_case(rows: Rows, heads, *, page64=False, nan=False, seed=1):
     table = ((rows.block_tables[:, t >> s].long() << s) + (t & (tpb - 1))).to(
         torch.int32
     )
+    # Whole 256-key tiles (gfx950's kv256 reads its last tile's four entries): page 0 past the end.
+    table = torch.nn.functional.pad(table, (0, -table.shape[1] % (256 // TILE)))
     return Case(rows, heads, data, TILE, 1, table.contiguous())
 
 
@@ -335,7 +407,7 @@ def launch(
     sl = slice(None) if rows is None else rows
     return mqa_logits_mxfp4(
         d.q[sl],
-        d.q_scale[sl],
+        case.q_scale[sl],
         case.kv,
         case.kv_scale,
         d.weights[sl],
@@ -360,6 +432,8 @@ def ways(case: Case):
     without a schedule-free mode), Free, Prefill."""
     entry_rows = case.page_size * case.pages_per_block
     out = {}
+    if not takes(case):
+        return out
     for inst in M._instances(torch.device("cuda", torch.cuda.current_device())):
         if inst.heads != case.heads or not inst.reads(entry_rows):
             continue
@@ -371,6 +445,16 @@ def ways(case: Case):
         for m in modes:
             out[f"{inst.name}:{m}"] = (config(case, _instance=inst.id, _mode=m), False)
     return out
+
+
+def takes(case: Case):
+    """Whether this arch's KV layout exists at the case's page size (gfx950: 64 rows only)."""
+    return M._PAGE_SIZE.get(get_gfx(), case.page_size) == case.page_size
+
+
+def serves(model):
+    """Whether this op serves `model` on this arch (gfx950 sends V4.1 to FlyDSL)."""
+    return (get_gfx(), MODEL_HEADS[model]) not in M._ELSEWHERE
 
 
 def default_way(case: Case):
@@ -422,6 +506,7 @@ def run_ways(model, rows: Rows):
     """Time and check every way of `model` on `rows`; the @benchmark tests' common body."""
     heads = MODEL_HEADS[model]
     case = make_case(rows, heads, page64=model == "v4")
+    case.arch_inputs()  # gfx950's permuted copies, made outside the timing
     n = rows.rows
     sample = sorted(
         {int(x) for x in torch.linspace(0, n - 1, min(n, SAMPLE_ROWS)).round()}
@@ -565,6 +650,8 @@ def check_rows(model):
     results = []
     for rows, page64, nan in rows_shapes(model):
         case = make_case(rows, MODEL_HEADS[model], page64=page64, nan=nan)
+        if not takes(case):
+            continue
         inputs = (
             case.data.values,
             case.data.scales,
@@ -831,6 +918,7 @@ def check_graph(model):
             (case.data.q, case.data.q_scale, case.data.weights),
         ):
             dst.copy_(src)
+        case.refresh()
         ends.copy_((rows.row_ends - 5).clamp_min(0))
         out.fill_(float("-inf"))
         g.replay()
@@ -860,7 +948,7 @@ def check_errors(model):
     def call(**kw):
         a = {
             "q": d.q,
-            "q_scale": d.q_scale,
+            "q_scale": case.q_scale,
             "kv_cache": case.kv,
             "kv_scale": case.kv_scale,
             "weights": d.weights,
@@ -873,9 +961,15 @@ def check_errors(model):
         return lambda: mqa_logits_mxfp4(*a.values(), cfg=cfg, **extra)
 
     tries = {
-        "4-D (gfx950) kv_scale": call(kv_scale=case.kv_scale.view(-1, 2, 32, 4)),
+        **(
+            {"3-D (gfx1250) kv_scale": call(kv_scale=case.kv_scale.view(-1, 64, 4))}
+            if _permuted()
+            else {
+                "4-D (gfx950) kv_scale": call(kv_scale=case.kv_scale.view(-1, 2, 32, 4))
+            }
+        ),
         "heads != cfg.heads": call(
-            q=d.q[:, :16], q_scale=d.q_scale[:, :16], weights=d.weights[:, :16]
+            q=d.q[:, :16], q_scale=case.q_scale[:, :16], weights=d.weights[:, :16]
         ),
         "table narrower than cfg.block_table_width": call(
             block_tables=case.block_tables[:, :1].contiguous()
@@ -885,7 +979,7 @@ def check_errors(model):
         ),
         "rows over max_rows": call(
             q=torch.cat([d.q, d.q]),
-            q_scale=torch.cat([d.q_scale, d.q_scale]),
+            q_scale=torch.cat([case.q_scale, case.q_scale]),
             weights=torch.cat([d.weights, d.weights]),
             row_ends=torch.cat([ends, ends]),
         ),
@@ -1022,6 +1116,11 @@ def main():
         help="semantics: which checks",
     )
     args = parser.parse_args()
+    for model in [m for m in args.model if not serves(m)]:
+        aiter.logger.warning(
+            "%s: %s", model, M._ELSEWHERE[get_gfx(), MODEL_HEADS[model]]
+        )
+    args.model = [m for m in args.model if serves(m)]
 
     def ratios(model):
         return [4] if model == "v4" else [1] if model == "cand" else args.ratio
