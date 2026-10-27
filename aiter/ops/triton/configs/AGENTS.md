@@ -221,6 +221,8 @@ an arch that runs the GQA decode kernel needs the `v1_w_dot` entry.
 | | `split_max_partitions` | Largest number of partitions for one sequence. |
 | | `split_max_programs` | A grid with this many programs or more is not split. |
 | | `split_short_seq`, `split_short_min_programs` | A sequence shorter than the first value on a grid with at least the second value is not split. |
+| | `tdm_num_warps` | gfx1250 only. A call with unit K/V scales, no ALiBi, page 128, head size 56, 64 or 128 and a group of at most 16 runs the Gluon TDM kernel with this many warps. `null` or no key turns it off. |
+| | `tdm_split_target_programs`, `tdm_split_sizes`, `tdm_split_max_partitions` | The Gluon kernel cuts a sequence into partitions when the grid has fewer programs than the first value. It takes the largest size in the list (tokens, a multiple of 128) that reaches the target within the partition cap, else the smallest size. Partials go through the v2 reduce kernel. `null` or no key keeps sequences whole. |
 | `launch.<v1_w_dot, v2_w_dot, v1_wo_dot or v2_wo_dot>` | `BLK_LEQ_<x>`, `any` | `num_warps`, `num_stages` and `waves_per_eu` for page sizes up to `<x>`, else `any`. `w_dot` kernels run GQA, `wo_dot` kernels run MHA. |
 
 - A `split_*` key is optional. Without `split_target_programs` the kernel does

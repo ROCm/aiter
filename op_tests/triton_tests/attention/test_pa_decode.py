@@ -713,3 +713,278 @@ def test_paged_attn_gqa_split_output(B, KV_BLK_SZ, SEQ_LEN, dtype):
         torch_output, query, key_cache, value_cache, block_tables, context_lens
     )
     torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
+
+
+_TDM_LENS = [8192, 1, 127, 128, 129, 255, 257, 4000, 7777, 12345]
+
+
+def _gqa_tdm_case(
+    dtype, H_KV, group, lens_list, poison=False, reference=True, head_size=128
+):
+    """Random paged cache, an fp32 reference and optional NaN/Inf in unused rows."""
+    page = 128
+    B = len(lens_list)
+    max_pages = triton.cdiv(max(lens_list), page)
+    num_blocks = B * max_pages + 3
+    query = torch.randn(B, H_KV * group, head_size, device="cuda").to(dtype)
+    key_cache = torch.randn(num_blocks, H_KV, page, head_size, device="cuda").to(dtype)
+    value_cache = torch.randn(num_blocks, H_KV, page, head_size, device="cuda").to(
+        dtype
+    )
+    perm = torch.randperm(num_blocks, device="cuda").to(torch.int32)
+    block_tables = perm[: B * max_pages].view(B, max_pages)
+    lens = torch.tensor(lens_list, device="cuda")
+    expected = None
+    if reference:
+        expected = torch.empty(
+            B, H_KV * group, head_size, dtype=torch.float32, device="cuda"
+        )
+        for b, n in enumerate(lens_list):
+            blocks = block_tables[b, : triton.cdiv(n, page)].long()
+            k = key_cache[blocks].permute(1, 0, 2, 3).reshape(H_KV, -1, head_size)
+            v = value_cache[blocks].permute(1, 0, 2, 3).reshape(H_KV, -1, head_size)
+            q = query[b].float().view(H_KV, group, head_size)
+            scores = torch.einsum("hgd,hld->hgl", q, k[:, :n].float())
+            probs = (scores / head_size**0.5).softmax(-1)
+            expected[b] = torch.einsum("hgl,hld->hgd", probs, v[:, :n].float()).reshape(
+                H_KV * group, head_size
+            )
+    if poison:
+        for b, n in enumerate(lens_list):
+            if n % page:
+                blk = int(block_tables[b, n // page])
+                key_cache[blk, :, n % page :] = float("nan")
+                value_cache[blk, :, n % page :] = float("inf")
+    return query, key_cache, value_cache, block_tables, lens, expected
+
+
+@pytest.mark.parametrize("poison", [False, True], ids=["clean", "nan_inf_tail"])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize("H_KV, group", [(8, 4), (8, 16), (1, 16), (2, 1)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_attn_gqa_tdm(dtype, H_KV, group, num_warps, poison):
+    """TDM GQA kernel against an fp32 reference, with partial pages and garbage rows."""
+    if get_arch() != "gfx1250":
+        pytest.skip("the TDM kernel needs gfx1250")
+    query, key_cache, value_cache, block_tables, lens, expected = _gqa_tdm_case(
+        dtype, H_KV, group, _TDM_LENS, poison
+    )
+    output = torch.zeros_like(query)
+    pa_decode_mod.paged_attn_decode_gqa_tdm(
+        output, query, key_cache, value_cache, block_tables, lens, 128**-0.5, num_warps
+    )
+    atol = 3e-2 if dtype == torch.bfloat16 else 4e-3
+    torch.testing.assert_close(output.float(), expected, rtol=0, atol=atol)
+
+
+@pytest.mark.parametrize("poison", [False, True], ids=["clean", "nan_inf_tail"])
+@pytest.mark.parametrize("num_warps", [1, 2, 4])
+@pytest.mark.parametrize(
+    "H_KV, group, head_size", [(128, 1, 56), (8, 4, 64), (4, 16, 56)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_attn_gqa_tdm_head_sizes(
+    dtype, H_KV, group, head_size, num_warps, poison
+):
+    """Head sizes below the padded tile (56) and 64, including MHA-like groups of 1."""
+    if get_arch() != "gfx1250":
+        pytest.skip("the TDM kernel needs gfx1250")
+    query, key_cache, value_cache, block_tables, lens, expected = _gqa_tdm_case(
+        dtype, H_KV, group, _TDM_LENS[:6], poison, head_size=head_size
+    )
+    output = torch.zeros_like(query)
+    pa_decode_mod.paged_attn_decode_gqa_tdm(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        lens,
+        head_size**-0.5,
+        num_warps,
+    )
+    atol = 3e-2 if dtype == torch.bfloat16 else 4e-3
+    torch.testing.assert_close(output.float(), expected, rtol=0, atol=atol)
+
+
+def test_paged_attn_gqa_tdm_empty_sequence():
+    """A sequence of length 0 writes zeros and does not disturb its neighbours."""
+    if get_arch() != "gfx1250":
+        pytest.skip("the TDM kernel needs gfx1250")
+    lens_list = [300, 0, 129]
+    query, key_cache, value_cache, block_tables, lens, expected = _gqa_tdm_case(
+        torch.float16, 8, 4, [300, 1, 129]
+    )
+    lens = torch.tensor(lens_list, device="cuda")
+    output = torch.full_like(query, 7.0)
+    pa_decode_mod.paged_attn_decode_gqa_tdm(
+        output, query, key_cache, value_cache, block_tables, lens, 128**-0.5, 2
+    )
+    assert torch.count_nonzero(output[1]) == 0
+    for b in (0, 2):
+        torch.testing.assert_close(output[b].float(), expected[b], rtol=0, atol=4e-3)
+
+
+def _tdm_dispatch_calls(monkeypatch, rule, *, scale=1.0, alibi=None, head=128, kv=8):
+    calls = []
+    monkeypatch.setattr(pa_decode_mod, "_get_dispatch_config", lambda dtype: rule)
+    monkeypatch.setattr(pa_decode_mod, "_pa_decode_gqa_tdm_kernel", object())
+    monkeypatch.setattr(
+        pa_decode_mod,
+        "paged_attn_decode_gqa_tdm",
+        lambda *a, **k: calls.append(("tdm", k)),
+    )
+    for name in ("v1", "v2"):
+        monkeypatch.setattr(
+            pa_decode_mod,
+            f"paged_attn_decode_{name}",
+            lambda *a, _name=name, **k: calls.append((_name, k)),
+        )
+    paged_attention_decode(
+        output=torch.empty(2, 4 * kv, head, dtype=torch.float16),
+        query=torch.empty(2, 4 * kv, head, dtype=torch.float16),
+        key_cache=torch.empty(1, kv, 128, head, dtype=torch.float16),
+        value_cache=torch.empty(1, kv, 128, head, dtype=torch.float16),
+        seq_lens=None,
+        block_tables=None,
+        attn_scale=1.0,
+        max_seq_len=1024,
+        compute_type=None,
+        k_scale=torch.tensor([scale]),
+        v_scale=torch.tensor([1.0]),
+        alibi_slopes=alibi,
+    )
+    return [name for name, _ in calls], calls
+
+
+_TDM_RULE = {
+    "v1_max_partitions": 1,
+    "tdm_num_warps": 4,
+}
+
+
+def test_dispatch_uses_tdm_when_enabled(monkeypatch):
+    names, calls = _tdm_dispatch_calls(monkeypatch, _TDM_RULE)
+    assert names == ["tdm"] and calls[0][1] == {
+        "num_warps": 4,
+        "seq_partition_size": pa_decode_mod._TDM_NO_SPLIT,
+        "max_seq_len": 1024,
+    }
+
+
+@pytest.mark.parametrize(
+    "rule_change, kwargs",
+    [
+        ({"tdm_num_warps": None}, {}),
+        ({}, {"scale": 2.0}),
+        ({}, {"alibi": torch.ones(32)}),
+        ({}, {"head": 80}),
+    ],
+    ids=["disabled", "k_scale", "alibi", "head_size"],
+)
+def test_dispatch_skips_tdm_when_unsupported(rule_change, kwargs, monkeypatch):
+    names, _ = _tdm_dispatch_calls(monkeypatch, {**_TDM_RULE, **rule_change}, **kwargs)
+    assert "tdm" not in names
+
+
+@pytest.mark.parametrize("poison", [False, True], ids=["clean", "nan_inf_tail"])
+@pytest.mark.parametrize("seq_partition_size", [128, 256, 1024, 4096])
+@pytest.mark.parametrize(
+    "H_KV, group, head_size", [(8, 4, 128), (1, 16, 128), (2, 1, 128), (4, 1, 56)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_attn_gqa_tdm_split(
+    dtype, H_KV, group, head_size, seq_partition_size, poison
+):
+    """Split TDM kernel plus the v2 reduce kernel, with partitions past short sequences."""
+    if get_arch() != "gfx1250":
+        pytest.skip("the TDM kernel needs gfx1250")
+    query, key_cache, value_cache, block_tables, lens, expected = _gqa_tdm_case(
+        dtype, H_KV, group, _TDM_LENS, poison, head_size=head_size
+    )
+    output = torch.zeros_like(query)
+    pa_decode_mod.paged_attn_decode_gqa_tdm(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        lens,
+        head_size**-0.5,
+        2,
+        seq_partition_size,
+        max(_TDM_LENS),
+    )
+    atol = 3e-2 if dtype == torch.bfloat16 else 4e-3
+    torch.testing.assert_close(output.float(), expected, rtol=0, atol=atol)
+
+
+@pytest.mark.parametrize("arch", _ARCHS)
+def test_tdm_split_config_is_valid(arch):
+    for rule in _config(arch).get("dispatch", {}).values():
+        if rule.get("tdm_split_target_programs") is None:
+            continue
+        assert rule["tdm_split_max_partitions"] >= 1
+        assert all(s % 128 == 0 for s in rule["tdm_split_sizes"])
+
+
+_TDM_SPLIT_RULE = {
+    "tdm_split_target_programs": 1024,
+    "tdm_split_sizes": [4096, 2048, 1024, 512, 256],
+    "tdm_split_max_partitions": 64,
+}
+
+
+@pytest.mark.parametrize("max_seq_len", [1, 256, 4000, 8192, 100000])
+@pytest.mark.parametrize("programs", [1, 8, 100, 512, 1023, 1024, 5000])
+def test_tdm_partition_size_follows_rule(programs, max_seq_len):
+    no_split = pa_decode_mod._TDM_NO_SPLIT
+    rule = _TDM_SPLIT_RULE
+    size = pa_decode_mod._select_tdm_partition_size(programs, max_seq_len, rule)
+    info = f"programs={programs} seq={max_seq_len} size={size}"
+    if programs >= rule["tdm_split_target_programs"]:
+        assert size == no_split, info
+    if size == no_split:
+        return
+    assert size in rule["tdm_split_sizes"] and size < max_seq_len, info
+    parts = triton.cdiv(max_seq_len, size)
+    assert parts <= rule["tdm_split_max_partitions"], info
+    # No larger allowed size would also reach the target.
+    for larger in (s for s in rule["tdm_split_sizes"] if size < s < max_seq_len):
+        reaches = programs * triton.cdiv(max_seq_len, larger) >= 1024
+        assert not reaches, info
+
+
+def test_tdm_partition_size_is_off_without_target():
+    rule = {
+        k: v for k, v in _TDM_SPLIT_RULE.items() if k != "tdm_split_target_programs"
+    }
+    assert pa_decode_mod._select_tdm_partition_size(1, 8192, rule) == (
+        pa_decode_mod._TDM_NO_SPLIT
+    )
+
+
+def test_dispatch_passes_tdm_partition_size(monkeypatch):
+    # 16 programs on a 1024-token sequence: the largest size below it that reaches 1024 programs
+    # does not exist, so the smallest size (256) is used.
+    rule = {**_TDM_RULE, **_TDM_SPLIT_RULE}
+    _, calls = _tdm_dispatch_calls(monkeypatch, rule)
+    assert calls[0][1]["seq_partition_size"] == 256
+    assert calls[0][1]["max_seq_len"] == 1024
+
+
+def test_paged_attn_gqa_tdm_is_repeatable():
+    """A race in the LDS ring would make repeated runs differ."""
+    if get_arch() != "gfx1250":
+        pytest.skip("the TDM kernel needs gfx1250")
+    query, key_cache, value_cache, block_tables, lens, _ = _gqa_tdm_case(
+        torch.float16, 8, 4, [8192] * 128, reference=False
+    )
+    first = torch.zeros_like(query)
+    args = (query, key_cache, value_cache, block_tables, lens, 128**-0.5)
+    pa_decode_mod.paged_attn_decode_gqa_tdm(first, *args, 1)
+    output = torch.zeros_like(query)
+    for _ in range(20):
+        output.zero_()
+        pa_decode_mod.paged_attn_decode_gqa_tdm(output, *args, 1)
+        assert torch.equal(output, first)
