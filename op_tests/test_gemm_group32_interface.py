@@ -437,8 +437,8 @@ def test_batched_untuned_1x32_runs_flydsl_where_opus_cannot(monkeypatch, k, back
     OPUS kid runs the shape (K not a multiple of 128)."""
     from aiter.ops import batched_gemm_op_a8w8 as batched
     from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
+    from aiter.ops.opus import _arch, policy
     from aiter.ops.opus import gemm_op_a8w8 as opus
-    from aiter.ops.opus import policy
 
     calls = []
 
@@ -458,6 +458,7 @@ def test_batched_untuned_1x32_runs_flydsl_where_opus_cannot(monkeypatch, k, back
 
     for module in (batched, bmm, policy):
         monkeypatch.setattr(module, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_arch, "_device_arch_and_cu", lambda _: ("gfx950", 256))
     monkeypatch.setattr(batched, "lookup_mxscale_bmm_config", lambda *a, **kw: None)
     monkeypatch.setattr(bmm, "run_bmm_a8w8_mxfp8", flydsl)
     monkeypatch.setattr(opus, "bmm_a8w8_mxscale_opus_bpreshuffle", opus_bmm)
@@ -501,8 +502,8 @@ def test_batched_tuned_flydsl_row_non_bf16_out(monkeypatch, block, k, dtype, bac
     output runs OPUS's kid where one runs the shape, else raises."""
     from aiter.ops import batched_gemm_op_a8w8 as batched
     from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
+    from aiter.ops.opus import _arch, policy
     from aiter.ops.opus import gemm_op_a8w8 as opus
-    from aiter.ops.opus import policy
 
     calls = []
     row = {**BMM_ROW, "kernelId": 0, "splitK": 1}
@@ -516,6 +517,7 @@ def test_batched_tuned_flydsl_row_non_bf16_out(monkeypatch, block, k, dtype, bac
 
     for module in (batched, bmm, policy):
         monkeypatch.setattr(module, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_arch, "_device_arch_and_cu", lambda _: ("gfx950", 256))
     monkeypatch.setattr(batched, "lookup_mxscale_bmm_config", lambda *a, **kw: row)
     monkeypatch.setattr(bmm, "run_bmm_a8w8_mxfp8", flydsl)
     monkeypatch.setattr(opus, "bmm_a8w8_mxscale_opus_bpreshuffle", opus_bmm)

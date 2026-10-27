@@ -198,6 +198,8 @@ def lookup_mxscale_bmm_config(
     w_scale_block: str = "128x128",
     libtype: str | None = None,
     bpreshuffle: bool = False,
+    gfx: str | None = None,
+    cu_num: int | None = None,
 ):
     """Exact tuned row for this shape and weight-scale block, else one at a
     padded M; None when no level hits. The row is shared: treat it as read-only."""
@@ -211,6 +213,8 @@ def lookup_mxscale_bmm_config(
         w_scale_block=w_scale_block,
         libtype=libtype,
         bpreshuffle=bpreshuffle,
+        gfx=gfx,
+        cu_num=cu_num,
     )
 
 
@@ -226,8 +230,12 @@ def _get_mxscale_bmm_launch_plan(
     n: int,
     k: int,
     w_scale_block: str = "128x128",
+    gfx: str | None = None,
+    cu_num: int | None = None,
 ) -> tuple[int, int]:
-    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k, w_scale_block=w_scale_block)
+    return _resolve_a8w8_mxscale_bmm_plan(
+        g, m, n, k, w_scale_block=w_scale_block, gfx=gfx, cu_num=cu_num
+    )
 
 
 def _batched_gemm_a8w8_mxscale_impl(
@@ -244,11 +252,14 @@ def _batched_gemm_a8w8_mxscale_impl(
     n = wo_a.shape[1]
     raw_launch, opus_bmm = _get_mxscale_bmm_launchers()
     w_scale_block = _w_scale_block_of(tuple(w_scale.shape), n, k)
-    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k, w_scale_block)
+    from .opus._arch import _device_arch_and_cu
+
+    gfx, cu = _device_arch_and_cu(x.device)
+    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k, w_scale_block, gfx, cu)
 
     Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
     if split_k <= 1:
-        # The shape resolver already returns a final canonical global kid.
+        # The shape resolver already returns a final local kid.
         # Enter the checked C++ launcher directly for the common no-workspace
         # path instead of repeating the unified public routing contract.  The
         # C++ boundary still validates dtype, shape, device, stride, arch and
@@ -273,6 +284,7 @@ def _batched_gemm_a8w8_mxscale_impl(
         x_scale=x_scale.transpose(0, 1),
         w_scale=w_scale,
         split_k=split_k,
+        family="a8w8_mxscale_bmm",
     )
     return Y
 
@@ -310,7 +322,7 @@ def batched_gemm_a8w8_mxscale(
 
 @functools.lru_cache(maxsize=1024)
 def _opus_bpreshuffle_kid(
-    g: int, m: int, n: int, k: int, w_scale_block: str, dtype
+    g: int, m: int, n: int, k: int, w_scale_block: str, dtype, gfx: str, cu_num: int
 ) -> int | None:
     """OPUS's preshuffled kid for a shape, or None if none runs it. The pick
     depends on M, so each M is searched once; the kid is passed on, so OPUS
@@ -319,7 +331,15 @@ def _opus_bpreshuffle_kid(
 
     group_n, group_k = mxscale_bmm_groups_of_block(w_scale_block)
     return _heuristic_mxscale_bmm_bpreshuffle_kid(
-        g, m, n, k, group_size=group_k, group_n=group_n, output_dtype=dtype
+        g,
+        m,
+        n,
+        k,
+        group_size=group_k,
+        group_n=group_n,
+        output_dtype=dtype,
+        gfx=gfx,
+        cu_num=cu_num,
     )
 
 
@@ -342,20 +362,30 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
     w_scale_block = _w_scale_block_of(tuple(w_scale.shape), n, k)
+    from .opus._arch import _device_arch_and_cu
+
+    gfx, cu_num = _device_arch_and_cu(x.device)
 
     cfg = lookup_mxscale_bmm_config(
-        g, m, n, k, w_scale_block=w_scale_block, bpreshuffle=True
+        g,
+        m,
+        n,
+        k,
+        w_scale_block=w_scale_block,
+        bpreshuffle=True,
+        gfx=gfx,
+        cu_num=cu_num,
     )
     libtype = cfg["libtype"] if cfg is not None else "flydsl"
     kid = None
     if (
         libtype == "flydsl"
-        and get_gfx() == "gfx950"
+        and gfx == "gfx950"
         and (dtype != dtypes.bf16 or (cfg is None and w_scale_block == "1x32"))
     ):
         # OPUS where one of its kids runs the shape (N a multiple of 16, K of
         # 128, bf16 or fp32 out).
-        kid = _opus_bpreshuffle_kid(g, m, n, k, w_scale_block, dtype)
+        kid = _opus_bpreshuffle_kid(g, m, n, k, w_scale_block, dtype, gfx, cu_num)
         if kid is not None:
             libtype, cfg = "opus", None
         elif dtype != dtypes.bf16:
