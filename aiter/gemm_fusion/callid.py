@@ -8,6 +8,10 @@ call_id = ``decision_key(site, tokens, vid, n_fused)``: the process-independent,
 registered keys of one profile must map to DISTINCT ids, checked statically (`check_call_ids` / `check_profile_call_ids`) before any launch; on a collision the colliding
 sites must run natively (refuse fusion) and the collision is logged.
 
+R16 / large r13: the tag is E = (STEP << 32) | ((m_real - 1) << 19) | (call_id & 0x7FFFF): only the LOW 19 bits of call_id reach the tag, next to the real rows. Two launches that can
+meet in one handshake share STEP and the token count (one forward pass), so for r13 the ids must be distinct on those 19 bits WITHIN one token count (``tag_bits=19``: grouped by
+tokens; keys of different token counts differ in the m_real field of the tag). A zero low field is refused as well (m_real = 1 at STEP 0 would give the expected tag 0).
+
 call_id 0 is also refused: a zero call_id at STEP 0 makes the expected tag 0, which equals the content of a freshly zeroed window (a peer that never wrote its tag would
 "match").
 """
@@ -41,6 +45,12 @@ class CallIdReport:
         default_factory=dict
     )  # call_id -> the >= 2 distinct keys that share it
     zero_id: list[CallKey] = field(default_factory=list)  # keys whose call_id is 0
+    # R16 (tag_bits): low-bits value -> the >= 2 distinct keys of ONE token count that share it; and the keys whose low field is 0
+    low_collisions: dict[tuple[int, int], list[CallKey]] = field(
+        default_factory=dict
+    )  # (tokens, call_id & mask) -> keys
+    zero_low: list[CallKey] = field(default_factory=list)
+    tag_bits: int | None = None
     unresolved: list[str] = field(
         default_factory=list
     )  # profile entries the check could not expand (unknown variant)
@@ -49,6 +59,8 @@ class CallIdReport:
     def refused_keys(self) -> frozenset[CallKey]:
         out = {k for ks in self.collisions.values() for k in ks}
         out.update(self.zero_id)
+        out.update(k for ks in self.low_collisions.values() for k in ks)
+        out.update(self.zero_low)
         return frozenset(out)
 
     @property
@@ -57,30 +69,84 @@ class CallIdReport:
 
     @property
     def ok(self) -> bool:
-        return not self.collisions and not self.zero_id
+        return (
+            not self.collisions
+            and not self.zero_id
+            and not self.low_collisions
+            and not self.zero_low
+        )
 
 
 def check_call_ids(
-    keys: Iterable[CallKey], key_fn: KeyFn = decision_key
+    keys: Iterable[CallKey],
+    key_fn: KeyFn = decision_key,
+    tag_bits: int | None = None,
+    tag_vids: Iterable[str] | None = None,
+    per_tokens: bool = False,
 ) -> CallIdReport:
-    """Static uniqueness check over a set of keys (duplicates of the SAME key are one key, never a collision)."""
+    """Static uniqueness check over a set of keys (duplicates of the SAME key are one key, never a collision).
+    per_tokens (R16): only keys of ONE token count can meet in a handshake (one forward pass), so require distinct ids within each token count instead of across the whole set (over the
+    pad-M universe of every real m, global 31-bit uniqueness is impossible: ~480k keys collide ~50 times by the birthday bound, and was never needed).
+    tag_bits (R16, large r13: 19): ALSO require the low tag_bits of the ids of the keys whose variant is in tag_vids (default: all) to be distinct per token count and non-zero: the r13
+    tag carries only those bits of call_id next to the real rows."""
     distinct = sorted({tuple(k) for k in keys})
     by_id: dict[int, list[CallKey]] = {}
     for k in distinct:
         by_id.setdefault(key_fn(*k), []).append(k)
-    rep = CallIdReport(keys=len(distinct))
+    rep = CallIdReport(keys=len(distinct), tag_bits=tag_bits)
     for cid, ks in sorted(by_id.items()):
+        if per_tokens:
+            by_tok: dict[int, list[CallKey]] = {}
+            for k in ks:
+                by_tok.setdefault(k[1], []).append(k)
+            ks = [k for g in by_tok.values() if len(g) > 1 for k in g]
         if len(ks) > 1:
             rep.collisions[cid] = ks
     rep.zero_id = list(by_id.get(0, []))
+    if tag_bits is not None:
+        mask = (1 << tag_bits) - 1
+        vids = None if tag_vids is None else set(tag_vids)
+        by_low: dict[tuple[int, int], list[CallKey]] = {}
+        for cid, ks in by_id.items():
+            for k in ks:
+                if vids is None or k[2] in vids:
+                    by_low.setdefault((k[1], cid & mask), []).append(k)
+        for (tokens, low), ks in sorted(by_low.items()):
+            if low == 0:
+                rep.zero_low.extend(ks)
+            if len(ks) > 1:
+                rep.low_collisions[(tokens, low)] = ks
     return rep
 
 
+def tag_unique_ids(
+    keys: Iterable[CallKey], key_fn: KeyFn = decision_key, tag_bits: int = 19
+) -> dict[CallKey, int]:
+    """call_ids whose LOW tag_bits are distinct and non-zero within every token count BY CONSTRUCTION (R16, large r13): low = 1 + the ordinal of (site, vid, n_fused) in the sorted
+    set of distinct triples, the high bits from key_fn (so the id stays a 31-bit key with the hash's entropy above the tag field). Rank-uniform (a pure function of the key set,
+    which every rank builds identically). Raises if there are not enough ordinals for the sites.
+    """
+    distinct = sorted({tuple(k) for k in keys})
+    triples = sorted({(k[0], k[2], k[3]) for k in distinct})
+    if len(triples) >= (1 << tag_bits):
+        raise ValueError(
+            f"{len(triples)} (site, vid, n_fused) triples do not fit {tag_bits} tag bits"
+        )
+    ordinal = {t: i + 1 for i, t in enumerate(triples)}
+    mask = (1 << tag_bits) - 1
+    return {
+        k: ((key_fn(*k) & ~mask) & 0x7FFFFFFF) | ordinal[(k[0], k[2], k[3])]
+        for k in distinct
+    }
+
+
 def profile_call_id_keys(
-    profile, sites: Iterable[str], world: int | None = None
+    profile, sites: Iterable[str], world: int | None = None, pad_m: bool = False
 ) -> tuple[list[CallKey], list[str]]:
     """Every (site, tokens, vid, n_fused) the profile can dispatch for these sites: each exact row (tokens = m * world) and every m an m-range rule covers.
     n_fused = the stage count of the row's variant. -> (keys, unresolved): entries whose variant could not be loaded are reported, not guessed.
+    pad_m (R16): ALSO every REAL local m a prepared bucket can serve (match.bucket_in_band over every m of the band: the key carries the real token count, the bucket's variant and its
+    stage count), e.g. every m 1025..1280 for the r13 bucket 1280.
     """
     from . import catalog
     from .match import _load_builtin
@@ -109,6 +175,22 @@ def profile_call_id_keys(
         )
         for m in ms:
             entries[(e.vid, int(m) * int(e.world), n_fused)] = None
+    if pad_m:
+        from .match import bucket_in_band
+
+        bands = {}
+        for r in profile.rows():
+            if world is None or int(r.world) == int(world):
+                bands.setdefault((r.sig, r.arch, r.cu, r.world), []).append(r.m)
+        for (sig, arch, cu, wd), ms_ in bands.items():
+            for m in range(1, max(ms_) + 1):
+                got = bucket_in_band(profile, sig, arch, cu, wd, m)
+                if got is None:
+                    continue
+                vid = got[1]
+                info = catalog._CATALOG.get(vid)
+                if info is not None:
+                    entries[(vid, m * int(wd), len(info.stage_kinds))] = None
     keys = [(s, tokens, vid, n) for s in sites for (vid, tokens, n) in entries]
     return keys, sorted(set(unresolved))
 
@@ -118,11 +200,33 @@ def check_profile_call_ids(
     sites: Iterable[str],
     world: int | None = None,
     key_fn: KeyFn = decision_key,
+    tag_bits: int | None = None,
+    pad_m: bool = False,
+    tag_vids: Iterable[str] | None = None,
+    per_tokens: bool | None = None,
 ) -> CallIdReport:
-    """The KEY gate: all keys of one profile x the model's fused sites map to distinct non-zero call_ids. Logs every collision."""
-    keys, unresolved = profile_call_id_keys(profile, sites, world)
-    rep = check_call_ids(keys, key_fn)
+    """The KEY gate: all keys of one profile x the model's fused sites map to distinct non-zero call_ids. Logs every collision. R16: tag_bits=19 also checks the low bits per token
+    count (large r13 tags); pad_m=True covers every real m a bucket can serve."""
+    keys, unresolved = profile_call_id_keys(profile, sites, world, pad_m=pad_m)
+    rep = check_call_ids(
+        keys,
+        key_fn,
+        tag_bits=tag_bits,
+        tag_vids=tag_vids,
+        per_tokens=(
+            pad_m if per_tokens is None else per_tokens
+        ),  # the pad-M universe is checked per token count
+    )
     rep.unresolved = unresolved
+    for (tokens, low), ks in rep.low_collisions.items():
+        log.error(
+            "event=call_id low_collision tokens=%d low%d=%d keys=%s: fusion refused for sites %s",
+            tokens,
+            tag_bits,
+            low,
+            ks,
+            sorted({k[0] for k in ks}),
+        )
     for cid, ks in rep.collisions.items():
         log.error(
             "event=call_id collision call_id=%d keys=%s: fusion refused for sites %s",
@@ -142,8 +246,17 @@ class CallIdRegistry:
     id of an accepted key and raises for a refused one (the caller then runs that site natively, on every rank: the keys and the check are rank-uniform).
     """
 
-    def __init__(self, key_fn: KeyFn = decision_key):
+    def __init__(
+        self,
+        key_fn: KeyFn = decision_key,
+        tag_bits: int | None = None,
+        tag_vids: Iterable[str] | None = None,
+        per_tokens: bool = False,
+    ):
         self._key_fn = key_fn
+        self._tag_bits = tag_bits  # R16 (large r13): also check the low tag bits per token count (for the variants in tag_vids)
+        self._tag_vids = None if tag_vids is None else tuple(tag_vids)
+        self._per_tokens = per_tokens
         self._keys: set[CallKey] = set()
         self.report: CallIdReport | None = None
 
@@ -156,7 +269,13 @@ class CallIdRegistry:
 
     def freeze(self) -> CallIdReport:
         if self.report is None:
-            self.report = check_call_ids(self._keys, self._key_fn)
+            self.report = check_call_ids(
+                self._keys,
+                self._key_fn,
+                tag_bits=self._tag_bits,
+                tag_vids=self._tag_vids,
+                per_tokens=self._per_tokens,
+            )
             for cid, ks in self.report.collisions.items():
                 log.error(
                     "event=call_id collision call_id=%d keys=%s: fusion refused for sites %s",

@@ -37,6 +37,16 @@ class _Va:  # raw device pointer -> torch via __cuda_array_interface__ (no copy,
 # lg_gpage_attach_v1; Python passes call_id per launch. LgGfPeers = {u32* err[4]}: device-resident table of the 4 ranks' ERR addresses (own entry ignored).
 LG_COMM_ARGS_V3_BYTES = 352
 LG_COMM_ABI_VERSION_V3 = 4
+# R16 (r13): LgCommArgsV4 = V3 + {m_real @352, pad4 @356}: 360 bytes, LG_COMM_ABI_VERSION 5; the tag is E = (STEP << 32) | ((m_real - 1) << 19) | (call_id & 0x7FFFF)
+LG_COMM_ARGS_V4_BYTES = 360
+LG_COMM_ABI_VERSION_V4 = 5
+LG_TAG_CALL_BITS = 19  # the low bits of call_id that reach the tag (lg_comm_abi_v4.h LG_TAG_*): the static call_id uniqueness check must hold on these
+LG_TAG_M_SHIFT = 19
+LG_M_REAL_MAX = 8192  # (m_real - 1) must fit the 13 bits above the call_id field
+_LG_ABI_BY_GEN = {
+    3: (LG_COMM_ABI_VERSION_V3, LG_COMM_ARGS_V3_BYTES),
+    4: (LG_COMM_ABI_VERSION_V4, LG_COMM_ARGS_V4_BYTES),
+}  # python ABI generation (jit.LARGE_ABI) -> (LG_COMM_ABI_VERSION, sizeof(LgCommArgs))
 LG_GF_PEERS_BYTES = 32
 LG_CTAG_OFF, LG_ATAG_OFF = (
     3072,
@@ -51,7 +61,7 @@ def load_driver(path: str, abi: int = 2):
     build's LG_QR_WGS) for the runtime's static checks."""
     lib = C.CDLL(path)
     vp, u32, u64, i32 = C.c_void_p, C.c_uint32, C.c_uint64, C.c_int32
-    if abi == 3:
+    if abi in (3, 4):
         lib.lg_attach_v1.restype = vp
         lib.lg_attach_v1.argtypes = [
             u32,
@@ -102,6 +112,25 @@ def load_driver(path: str, abi: int = 2):
         lib.lg_report_v1.argtypes = [vp, C.POINTER(u64)]
         lib.lg_drain_v1.restype = i32
         lib.lg_drain_v1.argtypes = [vp, vp]
+        if (
+            abi == 4
+        ):  # r13 (LG_COMM_ABI_VERSION 5): lg_launch_v2 is kept (m_real = M); lg_launch_v3 adds the real rows right before the stream
+            lib.lg_launch_v3.restype = i32
+            lib.lg_launch_v3.argtypes = [
+                vp,
+                vp,
+                vp,
+                vp,
+                vp,
+                u32,
+                u64,
+                u64,
+                u32,
+                u32,
+                u32,
+                u32,
+                vp,
+            ]
         return lib
     lib.lg_attach_v1.restype = vp
     lib.lg_attach_v1.argtypes = [
@@ -217,16 +246,17 @@ def abi_info(lib) -> dict:
     )
 
 
-def check_abi_info(got: dict, qr_wgs: int) -> None:
+def check_abi_info(got: dict, qr_wgs: int, gen: int = 3) -> None:
     """The runtime's static check of the driver against this module's layout constants and the global page layout (errpage.py), and of the host library's LG_QR_WGS
     against `qr_wgs`, the value the DEVICE image was built with: the launcher starts the quiet_ready workgroups, the image's fill / reset logic assumes the count, and the
     device refuses a mismatching launch (CONFIG), so a stale or hand-built pair is refused here, at attach, with both numbers.
     """
     from aiter.gemm_fusion import errpage
 
+    abi_version, args_bytes = _LG_ABI_BY_GEN[gen]
     want = {
-        "abi": LG_COMM_ABI_VERSION_V3,
-        "args_bytes": LG_COMM_ARGS_V3_BYTES,
+        "abi": abi_version,
+        "args_bytes": args_bytes,
         "err_off": errpage.ERR_OFF,
         "step_off": errpage.STEP_OFF,
         "diag_off": errpage.DIAG_OFF,
@@ -296,12 +326,36 @@ class LargeContext:
         call_id,
         stream,
         budget_us=None,
+        m_real=None,
     ):
         """R12 launch = GEMM + quiet_ready (all in the driver, 2 graph nodes; quiet_ready includes the best-effort NaN fill under ERR; capturable, no sync/alloc). call_id is the 31-bit decision key of the tag
         E = (STEP << 32) | call_id; the driver refuses call_id >= 2^31 (-104) and a launch without an attached page (-110).
         """
         if not 0 <= call_id < CALL_ID_LIMIT:
             raise ValueError(f"call_id {call_id} must be in [0, 2^31)")
+        if (
+            m_real is not None
+        ):  # R16 pad-M (r13): the real rows of this launch; 1 <= m_real <= the bucket M the plan was built for (the driver refuses others with -105)
+            if not 1 <= m_real <= min(self.M, LG_M_REAL_MAX):
+                raise ValueError(f"m_real {m_real} must be in [1, M={self.M}]")
+            rc = self.lib.lg_launch_v3(
+                self.h,
+                C.c_void_p(A),
+                C.c_void_p(W),
+                C.c_void_p(As),
+                C.c_void_p(Ws),
+                strideA,
+                POLL_ITERATIONS,
+                self.budget_us if budget_us is None else budget_us,
+                puts_per_peer,
+                half_first,
+                call_id,
+                m_real,
+                stream,
+            )
+            if rc != 0:
+                raise RuntimeError(f"lg_launch_v3 rc={rc} (m_real={m_real})")
+            return
         rc = self.lib.lg_launch_v2(
             self.h,
             C.c_void_p(A),

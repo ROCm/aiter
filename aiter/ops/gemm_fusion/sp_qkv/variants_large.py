@@ -28,7 +28,7 @@ from aiter.gemm_fusion.resources import SHARED_KEY, round_up
 
 from . import large_rt as lrt
 from . import specs
-from .jit import LARGE_SRC, _sha, build_large, large_defs, src_abi
+from .jit import LARGE_SRC, _sha, build_large, large_defs, src_abi, src_pad_m
 from .small_rt import stream_handle
 
 log = logging.getLogger("aiter.gemm_fusion")
@@ -134,6 +134,7 @@ def _mode_from_owner(owner: str) -> str:  # owner = "sp_qkv.large/<mode>/M<M>"
 LARGE_SRC_SHA = {
     "r11": "9874fe1ecb3b6a997523c96210a960434179c8eab84fffc00537170d49836643",
     "r12": "6b47263546d9189457b3d584fe8219e542a0cd32b19d1a32306c2fda015a7f38",  # R12 (abi 3) + LG_TAG_EARLY / LG_POLL_BATCH (r12b) + the NaN fill folded into quiet_ready, LG_QR_WGS (r12c) + qr_wgs in the launch args / lg_abi_info_v2 (r12d), derived from r11
+    "r13": "03d6c758c75665d26f8f3928e6e31520c816ed701efb8b2e09cdc2ea3dfb2b3a",  # R16 (abi 4 = LG_COMM_ABI_VERSION 5): per-launch m_real (lg_launch_v3, tag with m_real), derived from r12; r13g = r13 with the item-epilogue data flow of r12 untouched (ISA clean, byte-identical to r12 at m == M)
 }
 
 
@@ -154,6 +155,10 @@ LARGE_SRC_SHA = {
 )
 class SpQkvLarge(Plan):
     n_stages = 1
+    # R16 bucket selection (match.bucket_for_m): a real local m is padded into a larger bucket only from this m on (profile field m_pad_min_large; default 896: native wins below m_real ~ 896 at the 1024 bucket (dense; ~768 for indexer / reuse), the large path's
+    # first multiple: m 256..1023 stays native until measurements say otherwise)
+    pad_m_min_field = "m_pad_min_large"
+    pad_m_min_default = 896
 
     def __init__(self, spec, params, ctx):
         self.spec, self.params = spec, dict(params)
@@ -185,7 +190,15 @@ class SpQkvLarge(Plan):
         )  # 2 = r11 (per-plan poison word); 3 = r12 (per-comm ERR/STEP page, call_id tags; the best-effort NaN fill is folded into quiet_ready, no separate node)
         # the quiet_ready workgroup count the DEVICE image is built with (r12c / r12d: LG_QR_WGS, 64 by default); the host library reports its own through lg_abi_info_v2 and the
         # attach refuses a mismatch. r11 has no such knob.
-        self.qr_wgs = int(self.params.get("qr_wgs", 64)) if self.src == "r12" else None
+        self.qr_wgs = (
+            int(self.params.get("qr_wgs", 64)) if self.src in ("r12", "r13") else None
+        )
+        self.pad_m = src_pad_m(
+            "large", self.src
+        )  # R16: launches the real m_real <= the bucket M (self.M) of this plan
+        self.last_m_real = (
+            self.M
+        )  # the rows of the latest launch: the default row count of recv_view / reuse_view
         self.F = _F[self.mode]
         self.owner = f"sp_qkv.large/{self.mode}/M{self.M}"
         self.build_key = (
@@ -247,7 +260,7 @@ class SpQkvLarge(Plan):
             lib = lrt.load_driver(built.driver_so, abi=self.abi)
             if self.abi >= 3:
                 lrt.check_abi_info(
-                    lrt.abi_info(lib), self.qr_wgs
+                    lrt.abi_info(lib), self.qr_wgs, gen=self.abi
                 )  # args size, page/tag offsets, and the host build's LG_QR_WGS vs the device image's: a mismatch names the field instead of corrupting a launch
             geo = lrt.info(lib)
             if (
@@ -353,12 +366,23 @@ class SpQkvLarge(Plan):
         self._ctx = got
         return got
 
-    def _check_inputs(self, x, x_scale, w_scale, w=None):
-        """Reject, with ContractError, tensors the kernels cannot handle (see inputs.py). Dense/reuse builds read the first 9216 rows of w / w_scale, indexer 9856."""
+    @staticmethod
+    def accepts_launch_m(params, bucket_m: int, m: int) -> bool:
+        """R16 pad-M, a pure function: can a plan built for the bucket M `bucket_m` with these params launch the real local m? m == bucket always; below it only r13 (lg_launch_v3
+        with m_real), for 1 <= m < bucket_m (the profile decides from which m on a bucket is used: m_pad_min_large).
+        """
+        src = dict(params).get("src", LARGE_SRC)
+        if m == bucket_m:
+            return True
+        return bool(src_pad_m("large", src) and 1 <= m < bucket_m)
+
+    def _check_inputs(self, x, x_scale, w_scale, w=None, M=None):
+        """Reject, with ContractError, tensors the kernels cannot handle (see inputs.py). Dense/reuse builds read the first 9216 rows of w / w_scale, indexer 9856. M = the REAL rows of
+        the launch (R16: x / x_scale carry m_real rows, not the bucket's)."""
         from . import inputs
 
         N = 9856 if self.mode == "indexer" else 9216
-        inputs.check_activation(self.owner, x, x_scale, M=self.M)
+        inputs.check_activation(self.owner, x, x_scale, M=self.M if M is None else M)
         inputs.check_weight_scale(self.owner, w_scale, N=N)
         if w is not None:
             inputs.check_weight(self.owner, w, N=N)
@@ -389,10 +413,18 @@ class SpQkvLarge(Plan):
         _check_launch_gate(res, self.owner)
         _require_zeroed(res, self.owner)
         c = self._context(res)
-        if x.shape[0] != self.M:
+        m_real = int(x.shape[0])
+        if (
+            self.pad_m
+        ):  # R16: the kernel gets the valid rows only; the bucket M only selected this plan (geometry)
+            if not 1 <= m_real <= self.M:
+                raise ValueError(
+                    f"x rows {m_real} not in 1..{self.M} (the bucket M of plan {self.owner})"
+                )
+        elif m_real != self.M:
             raise ValueError(f"x rows {x.shape[0]} != plan local M {self.M}")
         self._check_inputs(
-            x, x_scale, w_scale, w
+            x, x_scale, w_scale, w, M=m_real
         )  # at capture once, in eager every call; a graph replay runs no Python
         if (
             self.abi >= 3
@@ -411,6 +443,7 @@ class SpQkvLarge(Plan):
                 self.half_first,
                 int(call_id),
                 stream_handle(stream),
+                m_real=m_real if self.pad_m else None,
             )
         else:
             c.launch(
@@ -424,30 +457,44 @@ class SpQkvLarge(Plan):
                 stream_handle(stream),
             )
         self._epochs += 1
+        self.last_m_real = m_real
         packed = (outs or {}).get("packed")
         if packed is not None:
-            packed.copy_(self.recv_view(res))
+            packed.copy_(self.recv_view(res, m_real))
 
-    def recv_view(self, res):
+    def _view_rows(self, m_real):
+        """Rows of the receive view: 4 * m_real (R16: R is contiguous [:4 * m_real]); default = the rows of this plan's latest launch (the bucket M until a pad-M launch).
+        A graph replay runs no Python, so the caller (ATOM) passes the m_real it captured with.
+        """
+        m = self.last_m_real if m_real is None else int(m_real)
+        if not 1 <= m <= self.M:
+            raise ValueError(
+                f"m_real {m} not in 1..{self.M} (the bucket M of plan {self.owner})"
+            )
+        return 4 * m
+
+    def recv_view(self, res, m_real=None):
         import torch
 
+        rows = self._view_rows(m_real)
         c = self._context(res)
         t = torch.as_tensor(
-            lrt._Va(c.recv_ptr(), (4 * self.M, self.F)), device=f"cuda:{res.device}"
+            lrt._Va(c.recv_ptr(), (rows, self.F)), device=f"cuda:{res.device}"
         )
         return t.view(torch.bfloat16)
 
-    def reuse_view(self, res):
+    def reuse_view(self, res, m_real=None):
         import torch
 
         if self.mode != "reuse":
             raise RuntimeError("reuse_view is only valid for the reuse mode")
+        rows = self._view_rows(m_real)
         c = self._context(res)
         base = torch.as_tensor(
-            lrt._Va(c.recv_ptr(), (4 * self.M * 2304 + 2048,)),
+            lrt._Va(c.recv_ptr(), (rows * 2304 + 2048,)),
             device=f"cuda:{res.device}",
         ).view(torch.bfloat16)
-        return torch.as_strided(base, (4 * self.M, 2560), (2304, 1))
+        return torch.as_strided(base, (rows, 2560), (2304, 1))
 
     def poison(self, res) -> int:
         """Cheap host read of the device poison word (4-byte D2H on the current torch stream + that stream sync). Outside capture only; all-reduce MAX across ranks, then res.quiesce_and_reset()."""

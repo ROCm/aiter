@@ -126,6 +126,10 @@ def small_cell_params(mode: str, T: int) -> dict:
 # p_nt 2, push_passtrip 1} (SMALL_R23_IN_PROFILE). So every local m 1..255 fuses; local m 256..1023 has no fused path (deliberately native: no row, no rule) and the large path
 # starts at m=1024.
 SMALL_P2_M = (1, 2, 4, 8, 12)
+# R16 pad-M: the smallest real local m the LARGE plans are padded into a bucket for (the profile field m_pad_min_large, read by match.bucket_for_m); below it only exact rows. From the
+# Evidence m0 study of large/r13g at the 1024 bucket (same-window ratios vs native): native wins below m_real ~ 896 for dense (~768 for indexer / reuse), the pad path wins from there up
+# (B/C 1.07-1.23 at every m_real >= 1024), so m_real 896..1023 is served by the 1024 bucket and local m 257..895 stays native (outside the small envelope, below the large band).
+M_PAD_MIN_LARGE = 896
 SMALL_R20_ROW_M = (64,)
 SMALL_R20_RULE_M = (33, 64)  # (m_min, m_max), every m (m_multiple 1)
 SMALL_R20_SRC = "r20"
@@ -160,11 +164,14 @@ SMALL_R23_RULE_M = (
     255,
 )  # (m_min, m_max), every m (m_multiple 1); the plan itself takes local M 1..256
 SMALL_R23_PROFILE_NH = 1
+# R16 pad-M: ONE exact r23 row per mode at the top of its accepted range (SM_MP 256, local m 1..256, T=1024): the BUCKET that real local m 129..256 are padded into (bucket_for_m).
+# The rule over 129..255 keeps serving exact m; the row adds no owner / unit / window (same params as the rule).
+SMALL_R23_ROW_M = (256,)
 _NATIVE_NOTE_R23_ONLY = "no fused path (T 260..512): native by design in this layout (r23 MP256 serves T 516..1020; no MP128 source is selected)"
 _NATIVE_NOTE_R21_ON = "no fused path (T 516..1020): native by design; the small kernels end at m=128 (r21 MP128, nh=2: 1.10-1.42x of native over T 260..512, GPU58 tick-free X1 timing), the large path starts at m=1024"
 _NATIVE_NOTE_R22_ON = "no fused path (T 516..1020): native by design; the small kernels end at m=128 (r22 MP128 {nh 1, BN64, p_nt 2, push_passtrip 1}: T512 B/C 1.28-1.33x of native (55.7 / 56.5 / 55.6 us; 1.23-1.28x before passtrip, 1.19-1.23x before p_nt) vs r21 nh=2 at 1.09-1.16x, GPU58 timing, all gates passed), the large path starts at m=1024"
 _NATIVE_NOTE_R21_OFF = "no fused path (T 260..1020, incl. the default capture bucket T=512): native by design; the small kernels end at m=64, the large path starts at m=1024 (r21 MP128 is not selected in this layout)"
-NATIVE_M_RANGES = ()  # the SHIPPED layout (r22 + r23 on): every local m 1..255 fuses (m 256..1023 is outside the small envelope: native, the large path starts at 1024)
+NATIVE_M_RANGES = ()  # the SHIPPED layout (r22 + r23 on): every local m 1..255 fuses (local m 257..895 is outside the small envelope and below the large band: native; m 896..1023 pads into the 1024 bucket, the large rows start at 1024)
 
 
 def native_m_ranges() -> tuple[dict, ...]:
@@ -294,6 +301,8 @@ def small_exact_cells() -> list[tuple[str, int, str, dict]]:
         mp128 = _mp128_params(mode)
         for m in SMALL_R21_ROW_M if mp128 else ():
             cells[m] = (vid16, mp128)
+        for m in SMALL_R23_ROW_M if SMALL_R23_IN_PROFILE else ():
+            cells[m] = (vid16, small_r23_params(mode, SMALL_R23_PROFILE_NH))
         for m in sorted(cells):
             out.append((mode, m, cells[m][0], cells[m][1]))
     return out
@@ -416,8 +425,19 @@ LARGE_CELLS = {
 }
 
 LARGE_PROFILE_SRC = "r12"  # the large rows/rules of the shipped profile run the R12 kernels; "r11" stays selectable per row/rule for the A/B
+# R16 pad-M: the large rows / rules run src r13 (lg_launch_v3: the kernel gets the valid m_real, the bucket M only selects the plan). Evidence on r13g (Triton 3.8 env, same-window
+# ratios): ISA clean (0 spills); G1 byte-identical to r12 at m == M; odd m_real 1025..4351 byte-exact vs native; the m_real disagreement fault is detected as 0x31 with abort / reset /
+# recovery working; timing r13g = r12 within +-1 % at the anchors and the pad path beats native at every m_real >= 1024 (B/C 1.07-1.23). False = the r12 layout (A/B, rollback);
+# gen_profile reads it at CALL time.
+LARGE_R13_IN_PROFILE = True
+LARGE_R13_SRC = "r13"
+
+
+def large_profile_src() -> str:
+    """The kernel source of the large rows / rules of the profile being generated: r13 when LARGE_R13_IN_PROFILE, else LARGE_PROFILE_SRC (r12)."""
+    return LARGE_R13_SRC if LARGE_R13_IN_PROFILE else LARGE_PROFILE_SRC
 
 
 def large_cell_params(mode: str, T: int) -> dict:
     """The profile params of a large cell: the tuned plan params plus the kernel source the profile selects."""
-    return {**LARGE_CELLS[(mode, T)][1], "src": LARGE_PROFILE_SRC}
+    return {**LARGE_CELLS[(mode, T)][1], "src": large_profile_src()}

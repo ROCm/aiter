@@ -75,8 +75,8 @@ def test_profile_rows_exact_and_distinct():
     prof = profmod.load_profile(PROFILE)
     small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
     assert (
-        len(small) == 27 == len(specs.small_exact_cells())
-    )  # 6 tuned + 15 P2 copies (m 1, 2, 4, 8, 12) + 3 r20 rows (m 64)
+        len(small) == 30 == len(specs.small_exact_cells())
+    )  # 6 tuned + 15 P2 copies (m 1, 2, 4, 8, 12) + 3 r20 rows (m 64) + 3 r22 rows (m 128) + 3 r23 bucket rows (m 256)
     for (mode, T), (vid, params) in specs.SMALL_CELLS.items():
         r = prof.lookup(specs.sp_qkv_spec(mode).signature(), "gfx950", 256, 4, T // 4)
         # the profile runs every small cell on r19 (R12); SMALL_CELLS keeps the per-cell r17/r18 sources of the pre-R12 build for the A/B
@@ -259,12 +259,12 @@ def test_small_variant_registers_and_contract(monkeypatch):
     )
     assert n == 2 and plan.params["reuse_no_idx"] == 1
     # not covered -> native (every local m 1..255 fuses: rows + the r19 / r20 / r22 / r23 rules; m 256..1023 is native by design, the large path starts at m=1024)
-    for m_native in (256, 300, 512, 1000):
+    for m_native in (257, 300, 512, 1000):
         assert match_prefix(
             spec, MatchCtx("gfx950", 256, 4, m_native, frozenset({"mori_cco"})), PROFILE
         ) == (None, 0), m_native
     # m 129..255 is the r23 (MP256) rule: it needs the bypass capability like every MP64 / 128 / 256 source, and resolves to an r23 plan with it
-    for m_r23 in (129, 200, 255):
+    for m_r23 in (129, 200, 255, 256):
         with pytest.raises(ContractError, match="gfx950_sc_bypass"):
             match_prefix(
                 spec,
@@ -291,13 +291,13 @@ def test_small_variant_registers_and_contract(monkeypatch):
 
 
 # ======================================================================= large-M (S2-2b-iii)
-def test_profile_has_114_rows_and_large_prefix_signatures():
+def test_profile_has_117_rows_and_large_prefix_signatures():
     """24 small rows (see test_small_profile_rows...) + 87 EXACT large rows (one per mode x local m = 1024..8192 step 256, each cell's best (n, half_first) from the P1 sweep, src r12)."""
     from aiter.ops.gemm_fusion.sp_qkv import p1_sweep
 
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 114  # 27 small + 87 large
+    assert len(prof) == 117  # 30 small + 87 large
     assert (
         len(p1_sweep.P1_GRID) == 29
         and sum(len(v) for v in p1_sweep.P1_BEST.values()) == 87
@@ -307,12 +307,12 @@ def test_profile_has_114_rows_and_large_prefix_signatures():
         for m in p1_sweep.P1_GRID:
             n, hf = p1_sweep.P1_BEST[mode][m]
             r = prof.lookup(sig, "gfx950", 256, 4, m)
-            # the large rows select the R12 kernels explicitly (src r12); r11 stays selectable per row for the A/B; F0 only (no_gridread)
+            # the large rows select the r13 kernels explicitly (src r13: R16 per-launch m_real); r11 / r12 stay selectable per row for the A/B; F0 only (no_gridread)
             assert (
                 r is not None
                 and r.vid == "sp_qkv.large.v1"
                 and dict(r.params)
-                == {"n": n, "half_first": hf, "no_gridread": 1, "src": "r12"}
+                == {"n": n, "half_first": hf, "no_gridread": 1, "src": "r13"}
             ), (mode, m)
     # the r11-era tuned rows (specs.LARGE_CELLS): kept where the sweep agrees, replaced (and noted in the file) where it differs
     with open(profmod._resolve(PROFILE), encoding="utf-8") as f:
@@ -3608,10 +3608,11 @@ def _small_ready(monkeypatch, mode="dense", T=64, src=None, extra=None):
         monkeypatch, mode, T, src, extra
     )
     launches = []
+    plan._launch_kw = kws = []  # the keyword arguments of every launch_v3 (R16: m=)
     plan._context = lambda r: NS(
         bind=lambda sb: binds.append(sb) or object(),
         launch=lambda *a: launches.append(a),
-        launch_v3=lambda *a: launches.append(("v3",) + a),
+        launch_v3=lambda *a, **k: (launches.append(("v3",) + a), kws.append(k)),
     )
     sys.modules["torch"].cuda = NS(is_current_stream_capturing=lambda: False)
     monkeypatch.setattr(
@@ -3902,6 +3903,9 @@ def _large_ready(monkeypatch, mode="dense", T=8192):
     from aiter.gemm_fusion import catalog
 
     monkeypatch.setattr(catalog, "_CATALOG", {})
+    monkeypatch.setattr(
+        specs, "LARGE_R13_IN_PROFILE", False
+    )  # the r12 plan contract (the shipped profile runs r13: see the r13 tests)
     plan = _plan_for(mode, T, True)
     M = T // 4
     launches = []
@@ -4029,9 +4033,9 @@ def test_inputs_checks_are_pure_python_and_only_run_where_python_runs():
     assert small_run.index("self._check_inputs") < small_run.index(
         "self._binding("
     )  # rejected before any binding
-    assert _sq("self._check_inputs(x, x_scale, w_scale, w)") in _sq(
+    assert _sq("self._check_inputs(x, x_scale, w_scale, w, M=m_real)") in _sq(
         method_src("variants_large.py", "SpQkvLarge", "run")
-    )
+    )  # R16: the checks use the REAL rows
     assert _sq("self._check_inputs(x, x_scale, w_scale)") in _sq(
         method_src("variants_large.py", "SpQkvLarge", "prepare")
     )
@@ -4121,10 +4125,11 @@ def test_jit_abi_tables_sources_and_missing_source_error():
     ) and jit.LARGE_SRCS == (
         "r11",
         "r12",
+        "r13",
     )
     assert [jit.src_abi("small", s) for s in jit.SRCS] == [2, 2, 3, 3, 3, 3, 3] and [
         jit.src_abi("large", s) for s in jit.LARGE_SRCS
-    ] == [2, 3]
+    ] == [2, 3, 4]
     with pytest.raises(ValueError, match="not in"):
         jit.src_abi("small", "r24")
     # r19 is derived from r18: it accepts the r18-only flags; r17 still rejects them
@@ -4142,8 +4147,12 @@ def test_jit_abi_tables_sources_and_missing_source_error():
         "-DLG_POLL_BATCH=1",
         "-DLG_QR_WGS=64",
     ]  # r12 = r11's flags + the r12b / r12c knobs (passed explicitly, defaults 1 / 1 / 64)
-    with pytest.raises(ValueError, match="large src 'r13'"):
-        jit.large_defs({"src": "r13"}, "dense")
+    # r13 (R16, per-launch m_real) is r12's build flags: the same knobs, passed explicitly
+    assert jit.large_defs({"src": "r13", "n": 2}, "dense") == jit.large_defs(
+        {"src": "r12", "n": 2}, "dense"
+    )
+    with pytest.raises(ValueError, match="large src 'r14'"):
+        jit.large_defs({"src": "r14"}, "dense")
     tool = dict(TOOL_SIM)
     # the r19 sources are delivered by the implementor later: a clear error, not a FileNotFoundError
     dev, host = jit.small_defs({"src": "r19"}, "dense")
@@ -4286,6 +4295,7 @@ def test_small_rt_v3_struct_layout_loader_and_launch_argument_order(monkeypatch)
     assert {
         "sm_attach_v3",
         "sm_launch_blk_v3",
+        "sm_launch_blk_v3m",  # R16 pad-M: + the real m before the stream
         "sm_bind_new_v1",
         "sm_blk_free_v1",
         "sm_free_v1",
@@ -4294,6 +4304,7 @@ def test_small_rt_v3_struct_layout_loader_and_launch_argument_order(monkeypatch)
     assert (
         len(fake3.sm_attach_v3.argtypes) == 11
         and len(fake3.sm_launch_blk_v3.argtypes) == 11
+        and len(fake3.sm_launch_blk_v3m.argtypes) == 12
     )
     fake2 = _FakeCDLL()
     monkeypatch.setattr(srt.C, "CDLL", lambda path: fake2)
@@ -4317,6 +4328,33 @@ def test_small_rt_v3_struct_layout_loader_and_launch_argument_order(monkeypatch)
     fake3.returns = {"sm_launch_blk_v3": -5}
     with pytest.raises(RuntimeError, match="sm_launch_blk_v3 rc=-5"):
         ctx.launch_v3("blk", 1, 2, 3, 4, 5, 6, 7, 8, "s")
+    # R16: m= goes through sm_launch_blk_v3m, the real m right before the stream
+    fake3.returns = {}
+    ctx.launch_v3("blk", 0xA, 0xB, 6144, 0xE, 0xF, 0x10, 61, 777, "stream", m=37)
+    name, a = fake3.calls[-1]
+    assert (
+        name == "sm_launch_blk_v3m"
+        and [x.value for x in a[2:9]] == [0xA, 0xB, 6144, 0xE, 0xF, 0x10, 61]
+        and a[9].value == 777
+        and a[10].value == 37
+        and a[11] == "stream"
+        and len(a) == 12
+    )
+    fake3.returns = {"sm_launch_blk_v3m": -7}
+    with pytest.raises(RuntimeError, match=r"sm_launch_blk_v3m rc=-7 \(m=3\)"):
+        ctx.launch_v3("blk", 1, 2, 3, 4, 5, 6, 7, 8, "s", m=3)
+
+    # a library without the entry (r21 / pre-R16 build) refuses m= loudly instead of launching the bound M
+    class _NoV3m:
+        def __getattr__(self, k):
+            if k == "sm_launch_blk_v3m":
+                raise AttributeError(k)
+            return getattr(fake3, k)
+
+    with pytest.raises(RuntimeError, match="no sm_launch_blk_v3m"):
+        srt.SmallContext(_NoV3m(), 0xC7).launch_v3(
+            "blk", 1, 2, 3, 4, 5, 6, 7, 8, "s", m=3
+        )
 
 
 def test_large_rt_r12_loader_abi_check_and_launch(monkeypatch):
@@ -4899,26 +4937,30 @@ def test_large_r12_run_needs_call_id_and_calls_launch_v3_r11_ignores_it(monkeypa
         plan.poison(res)
 
 
-def test_profile_selects_r12_for_large_rows_and_rules_and_budgets_the_page():
+def test_profile_selects_r13_for_large_rows_and_rules_and_budgets_the_page():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     large = [e for e in prof.entries() if e.vid == "sp_qkv.large.v1"]
     assert len(large) == 87 + 9 and {dict(e.params)["src"] for e in large} == {
-        "r12"
+        "r13"
     }  # 87 exact rows + the 9 fallback rules
     small = [e for e in prof.rows() if e.vid == "sp_qkv.small.v1"]
-    assert len(small) == 27 and {dict(e.params)["src"] for e in small} == {
+    assert len(small) == 30 and {dict(e.params)["src"] for e in small} == {
         "r19",
         "r20",
         "r22",
+        "r23",
     }  # r19 for local m <= 32, r20 (MP64) at m=64; r17/r18 stay selectable per row
     wb = prof.meta["window_budget"]
     assert wb["shared"]["gf.global"] == 4 << 20 and wb["max_windows"] == 58
     assert (
         specs.large_cell_params("dense", 8192)
-        == {**specs.LARGE_CELLS[("dense", 8192)][1], "src": "r12"}
-        and specs.LARGE_PROFILE_SRC == "r12"
+        == {**specs.LARGE_CELLS[("dense", 8192)][1], "src": "r13"}
+        and specs.LARGE_PROFILE_SRC == "r12"  # the r12 fallback source
+        and specs.LARGE_R13_IN_PROFILE is True
+        and specs.large_profile_src() == "r13"
     )
+    assert prof.meta["m_pad_min_large"] == specs.M_PAD_MIN_LARGE == 896
     # the arena is the sum of the shared set and the small windows: 468 MiB (336 shared + 132 small)
     assert sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) == 468 << 20
 
@@ -4966,8 +5008,8 @@ def test_prebuild_large_units_follow_the_profile_source(monkeypatch):
         units, skipped = engine.plan_profile(PROFILE, recipe="aot1", tool=TOOL_SIM)
         assert (
             skipped == [] and len(units) == 18
-        )  # 6 small (r19) + 3 (r20) + 3 (r22) + 3 (r23) + 2 large (r12) + the comm
-        assert {u.meta["src"] for u in units if u.kind == "sp_qkv.large.v1"} == {"r12"}
+        )  # 6 small (r19) + 3 (r20) + 3 (r22) + 3 (r23) + 2 large (r13) + the comm
+        assert {u.meta["src"] for u in units if u.kind == "sp_qkv.large.v1"} == {"r13"}
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -5028,10 +5070,13 @@ def test_every_r12_binding_matches_the_c_declaration_it_binds(monkeypatch):
     monkeypatch.setattr(srt.C, "CDLL", lambda path: fake_s)
     srt.load_driver("x", abi=3)
     monkeypatch.setattr(lrt.C, "CDLL", lambda path: fake_l)
-    lrt.load_driver("x", abi=3)
+    lrt.load_driver(
+        "x", abi=4
+    )  # r13 (LG_COMM_ABI_VERSION 5): the r12 table + lg_launch_v3
     for fn in (
         "sm_attach_v3",
         "sm_launch_blk_v3",
+        "sm_launch_blk_v3m",
         "sm_bind_new_v1",
         "sm_blk_free_v1",
         "sm_free_v1",
@@ -5042,6 +5087,7 @@ def test_every_r12_binding_matches_the_c_declaration_it_binds(monkeypatch):
         "lg_attach_v1",
         "lg_gpage_attach_v1",
         "lg_launch_v2",
+        "lg_launch_v3",
         "lg_abi_info_v2",
         "lg_report_v1",
         "lg_drain_v1",
@@ -5082,7 +5128,7 @@ def test_profile_small_rows_run_r19_with_the_r18_family_flags_and_one_unit_each(
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
     small = [r for r in prof.rows() if r.vid == "sp_qkv.small.v1"]
-    assert len(small) == 27
+    assert len(small) == 30
     for (mode, T), (_vid, legacy) in specs.SMALL_CELLS.items():
         row_params = dict(
             prof.lookup(
@@ -5288,7 +5334,8 @@ def test_r20_owner_is_one_per_mode_and_the_p2_rows_share_the_m16_owner(monkeypat
         owners.setdefault(mode, {})[m] = p.build_key
         assert (
             p.src == params["src"]
-            and p.mp == {"r20": 64, "r21": 128, "r22": 128}.get(params["src"], 32)
+            and p.mp
+            == {"r20": 64, "r21": 128, "r22": 128, "r23": 256}.get(params["src"], 32)
             and p.abi == 3
         )
     for mode in specs.MODES:
@@ -5300,10 +5347,16 @@ def test_r20_owner_is_one_per_mode_and_the_p2_rows_share_the_m16_owner(monkeypat
             o[16],
             o[32],
         )  # the tuned m32 cell and the r20 owner are their own
-        assert o[128] not in (o[16], o[32], o[64])  # the r21 (MP128) owner is its own
+        assert o[128] not in (o[16], o[32], o[64])  # the r22 (MP128) owner is its own
+        assert o[256] not in (
+            o[16],
+            o[32],
+            o[64],
+            o[128],
+        )  # and so is the r23 (MP256) owner (the m=256 bucket row)
     assert (
-        len({k for o in owners.values() for k in o.values()}) == 12
-    )  # 3 modes x (m16 group, m32, r20, r21)
+        len({k for o in owners.values() for k in o.values()}) == 15
+    )  # 3 modes x (m16 group, m32, r20, r22, r23)
 
 
 def test_window_budget_counts_the_fifteen_small_owners_and_the_8mib_r23_views():
@@ -6626,3 +6679,367 @@ def test_r22_push_options_flags_routing_modes_and_header_guards():
             os.path.join(base, "device", "layout", "ran_layouts.hpp"),
         ):
             assert macro not in _slurp(path, encoding="utf-8"), (macro, path)
+
+
+# ======================================================================= R16 pad-M (small): run with m_real <= the bucket M
+def test_accepts_launch_m_is_a_pure_function_of_params_bucket_and_m():
+    from aiter.ops.gemm_fusion.sp_qkv import variants as v
+
+    acc = v.SpQkvSmall.accepts_launch_m
+    base = {"sk": 3, "nh": 1, "no_credit": 1, "rx_bypass": 1}
+    for src, bucket, ok, no in (
+        ("r19", 32, (1, 17, 31, 32), (0, 33)),
+        ("r20", 64, (33, 48, 63, 64), (0, 65)),
+        ("r22", 128, (65, 100, 127, 128), (129,)),
+        ("r23", 256, (129, 200, 255, 256), (257,)),
+    ):
+        for m in ok:
+            assert acc({**base, "src": src}, bucket, m), (src, bucket, m)
+        for m in no:
+            assert not acc({**base, "src": src}, bucket, m), (src, bucket, m)
+    # m == bucket always (every source, incl. the ones without pad-M); below it only pad-M sources
+    assert acc({**base, "src": "r21"}, 128, 128) and not acc(
+        {**base, "src": "r21"}, 128, 100
+    )
+    assert acc({"src": "r18", "sk": 3}, 32, 32) and not acc(
+        {"src": "r18", "sk": 3}, 32, 8
+    )
+    # the shape switches follow the REAL m: push8 builds take M <= 16, b_rowsplit builds M > 16
+    assert acc({**base, "src": "r19", "push8": 1}, 16, 8) and not acc(
+        {**base, "src": "r19", "push8": 1}, 32, 20
+    )
+    assert acc({**base, "src": "r19", "b_rowsplit": 1}, 32, 20) and not acc(
+        {**base, "src": "r19", "b_rowsplit": 1}, 32, 16
+    )
+    # the source table
+    assert [src for src in jit.SRCS if jit.src_pad_m("small", src)] == [
+        "r19",
+        "r20",
+        "r22",
+        "r23",
+    ]
+    assert [src for src in jit.LARGE_SRCS if jit.src_pad_m("large", src)] == ["r13"]
+    assert jit.src_pad_m("large", "r13") and not jit.src_pad_m("large", "r12")
+
+
+def test_pad_m_run_launches_the_real_m_in_the_buckets_binding(monkeypatch):
+    plan, st, meta, outs, res, launches, binds = _small_ready(
+        monkeypatch, "dense", T=64, src="r19"
+    )
+    assert plan.pad_m and plan.bucket_m == 16
+    _run_small(
+        plan, st, meta, outs, res, call_id=5
+    )  # M == bucket: m=16 (== the bound M)
+    assert plan._launch_kw[-1] == {"m": 16} and binds[-1].M == 16 and binds[-1].T == 64
+    for real in (
+        8,
+        5,
+        1,
+        16,
+    ):  # every real m <= the bucket reuses the ONE binding; the kernel gets the valid m
+        x, xs = _T((real, 6144), (6144, 1), "fp8"), _T((real, 1), (1, 1))
+        _run_small(plan, st, meta, outs, res, x=x, x_scale=xs, call_id=5)
+        assert plan._launch_kw[-1] == {"m": real}
+        t_valid = launches[-1][8]  # (..., t_valid, call_id, stream)
+        assert (
+            t_valid == 4 * real
+        )  # positions / slot_mapping are bucket-long (64): only the valid 4 * m_real rows are declared valid
+    assert len(binds) == 1
+    # the checks use m_real: an x_scale of the BUCKET length does not describe 8 rows
+    with pytest.raises(
+        ContractError, match="x_scale must be contiguous with exactly 8 elements"
+    ):
+        _run_small(
+            plan, st, meta, outs, res, x=_T((8, 6144), (6144, 1), "fp8"), call_id=5
+        )
+    # short arrays: t_valid = min(numel, 4 m_real)
+    short = {
+        "positions": _T((12,), (1,), "i64"),
+        "slot_mapping": _T((20,), (1,), "i64"),
+    }
+    _run_small(
+        plan,
+        st,
+        {**meta, **short},
+        outs,
+        res,
+        x=_T((8, 6144), (6144, 1), "fp8"),
+        x_scale=_T((8, 1), (1, 1)),
+        call_id=5,
+    )
+    assert launches[-1][8] == 12
+    # above the bucket (still within the source's padded rows): the pre-R16 per-M binding, launched with m = M
+    big_outs = {"q": _T((96, 16, 128)), "k": _T((96, 1, 128)), "v": _T((96, 1, 128))}
+    big_meta = {
+        **meta,
+        "positions": _T((96,), (1,), "i64"),
+        "slot_mapping": _T((96,), (1,), "i64"),
+    }
+    _run_small(
+        plan,
+        st,
+        big_meta,
+        big_outs,
+        res,
+        x=_T((24, 6144), (6144, 1), "fp8"),
+        x_scale=_T((24, 1), (1, 1)),
+        call_id=5,
+    )
+    assert plan._launch_kw[-1] == {"m": 24} and binds[-1].M == 24 and len(binds) == 2
+    with pytest.raises(ContractError, match=r"takes local M 1\.\.32"):
+        _run_small(
+            plan,
+            st,
+            meta,
+            outs,
+            res,
+            x=_T((33, 6144), (6144, 1), "fp8"),
+            x_scale=_T((33, 1), (1, 1)),
+            call_id=5,
+        )
+
+
+def test_pad_m_is_not_used_by_sources_without_it_and_follows_the_shape_switches(
+    monkeypatch,
+):
+    # r21 (abi 3, no pad-M): launches the bound M through sm_launch_blk_v3 (no m=), and a smaller x is its own binding as before
+    plan, st, meta, outs, res, _launches, binds = _small_ready(
+        monkeypatch, "dense", T=64, src="r21", extra={"rx_bypass": 1}
+    )
+    assert not plan.pad_m
+    _run_small(plan, st, meta, outs, res, call_id=5)
+    assert plan._launch_kw[-1] == {"m": None} or plan._launch_kw[-1] == {}
+    _run_small(
+        plan,
+        st,
+        meta,
+        outs,
+        res,
+        x=_T((8, 6144), (6144, 1), "fp8"),
+        x_scale=_T((8, 1), (1, 1)),
+        call_id=5,
+    )
+    assert binds[-1].M == 8 and len(binds) == 2
+    # push8 (M <= 16) and b_rowsplit (M > 16) are checked against the REAL m of a pad-M launch
+    plan, st, meta, outs, res, _launches, binds = _small_ready(
+        monkeypatch, "dense", T=64, src="r19", extra={"push8": 1}
+    )
+    with pytest.raises(ContractError, match=r"push8 build supports M<=16, got 20"):
+        _run_small(
+            plan,
+            st,
+            meta,
+            outs,
+            res,
+            x=_T((20, 6144), (6144, 1), "fp8"),
+            x_scale=_T((20, 1), (1, 1)),
+            call_id=5,
+        )
+
+
+# ======================================================================= R16 pad-M (large, r13): run with m_real <= the bucket M
+_LARGE_CELL_PARAMS = specs.large_cell_params  # the unpatched function (r12 params)
+
+
+def _large_r13(monkeypatch, mode="dense", T=8192):
+    """The _large_ready rig with src r13 params and a recording context (positional + keyword arguments of launch_v3, a fake torch for the views)."""
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setattr(
+        specs,
+        "large_cell_params",
+        lambda md, t: {**_LARGE_CELL_PARAMS(md, t), "src": "r13"},
+    )
+    plan, st, res, _launches = _large_ready(monkeypatch, mode, T)
+    calls = []
+    plan._context = lambda r: NS(
+        launch_v3=lambda *a, **k: calls.append((a, k)),
+        recv_ptr=lambda: 0x1000,
+    )
+    tm = sys.modules["torch"]
+    tm.bfloat16 = "bf16"
+    tm.as_tensor = lambda va, device=None: NS(va=va, view=lambda dt: NS(va=va))
+    tm.as_strided = lambda base, size, stride: ("strided", base.va, size, stride)
+    monkeypatch.setattr(
+        "aiter.ops.gemm_fusion.sp_qkv.large_rt._Va",
+        lambda ptr, shape, typestr="<u2": ("va", ptr, shape),
+    )
+    res.device = 0
+    return plan, st, res, calls
+
+
+def test_large_r13_registers_with_abi_gen_4_and_accepts_launch_m():
+    from aiter.ops.gemm_fusion.sp_qkv import variants_large as vl
+
+    assert (
+        jit.LARGE_ABI["r13"] == 4
+        and jit.src_abi("large", "r13") == 4
+        and "r13" in vl.LARGE_SRC_SHA
+    )
+    acc = vl.SpQkvLarge.accepts_launch_m
+    assert (
+        acc({"src": "r13"}, 2048, 2048)
+        and acc({"src": "r13"}, 2048, 1100)
+        and acc({"src": "r13"}, 2048, 1)
+    )
+    assert not acc({"src": "r13"}, 2048, 2049) and not acc({"src": "r13"}, 2048, 0)
+    assert acc({"src": "r12"}, 2048, 2048) and not acc(
+        {"src": "r12"}, 2048, 1100
+    )  # r12 / r11: the bucket M only
+    assert acc({}, 1024, 1024) and not acc({}, 1024, 1000)
+
+
+def test_large_r13_run_passes_m_real_checks_on_it_and_sizes_the_views(monkeypatch):
+    from aiter.gemm_fusion import ContractError
+
+    plan, st, res, calls = _large_r13(monkeypatch)
+    M = 2048
+    assert plan.abi == 4 and plan.pad_m and plan.M == M and plan.last_m_real == M
+    _run_large(plan, st, res, call_id=31337)
+    a, k = calls[-1]
+    assert (
+        k == {"m_real": M} and a[-2] == 31337 and a[-1] == "S"
+    )  # (..., half_first, call_id, stream), m_real= by keyword
+    for real in (1100, 1025, 1279, 1, M):
+        x, xs = _T((real, 6144), (6144, 1), "fp8"), _T((real, 1), (1, 1))
+        _run_large(plan, st, res, x=x, x_scale=xs, call_id=9)
+        assert calls[-1][1] == {"m_real": real} and plan.last_m_real == real
+    # the checks are on m_real: the bucket-length x_scale does not describe 1100 rows; more rows than the bucket / none are refused
+    with pytest.raises(ContractError, match="exactly 1100 elements"):
+        _run_large(plan, st, res, x=_T((1100, 6144), (6144, 1), "fp8"))
+    with pytest.raises(ValueError, match=r"x rows 2049 not in 1\.\.2048"):
+        _run_large(
+            plan,
+            st,
+            res,
+            x=_T((2049, 6144), (6144, 1), "fp8"),
+            x_scale=_T((2049, 1), (1, 1)),
+        )
+    # the receive view is R[:4 * m_real]: by argument (a graph replay runs no Python) or by the latest launch
+    F = plan.F
+    assert plan.recv_view(res, 1100).va == ("va", 0x1000, (4400, F))
+    _run_large(
+        plan,
+        st,
+        res,
+        x=_T((1279, 6144), (6144, 1), "fp8"),
+        x_scale=_T((1279, 1), (1, 1)),
+        call_id=9,
+    )
+    assert plan.recv_view(res).va == ("va", 0x1000, (4 * 1279, F))
+    for bad in (0, M + 1):
+        with pytest.raises(ValueError, match=rf"m_real {bad} not in 1\.\.{M}"):
+            plan.recv_view(res, bad)
+    # r12 and the exact rows keep the pre-R16 contract: x rows == the plan's M, the view is [4 * M, F]
+    monkeypatch.setattr(specs, "large_cell_params", _LARGE_CELL_PARAMS)
+    r12, st12, res12, _launches12 = _large_ready(monkeypatch)  # pins the r12 layout
+    assert not r12.pad_m
+    with pytest.raises(ValueError, match="!= plan local M 2048"):
+        _run_large(
+            r12,
+            st12,
+            res12,
+            x=_T((1100, 6144), (6144, 1), "fp8"),
+            x_scale=_T((1100, 1), (1, 1)),
+        )
+
+
+def test_large_r13_reuse_view_is_strided_over_m_real_rows(monkeypatch):
+    plan, _st, res, _calls = _large_r13(monkeypatch, "reuse")
+    view = plan.reuse_view(res, 1100)
+    assert view == (
+        "strided",
+        ("va", 0x1000, (4400 * 2304 + 2048,)),
+        (4400, 2560),
+        (2304, 1),
+    )
+    full = plan.reuse_view(res)  # no launch yet: the bucket
+    assert full[2] == (4 * 2048, 2560)
+    with pytest.raises(RuntimeError, match="only valid for the reuse mode"):
+        _large_r13(monkeypatch, "dense")[0].reuse_view(res)
+
+
+def test_large_rt_r13_driver_launch_v3_abi_check_and_header_drift(monkeypatch):
+    import re
+
+    from aiter.ops.gemm_fusion.sp_qkv import large_rt as lrt
+
+    fake3, fake4 = _FakeCDLL(), _FakeCDLL()
+    monkeypatch.setattr(lrt.C, "CDLL", lambda path: fake3)
+    lrt.load_driver("x", abi=3)
+    assert "lg_launch_v3" not in {
+        n for n, f in fake3._fn.items() if f.argtypes is not None
+    }  # r12 builds do not export it
+    monkeypatch.setattr(lrt.C, "CDLL", lambda path: fake4)
+    lrt.load_driver("x", abi=4)
+    assert (
+        len(fake4.lg_launch_v3.argtypes) == 13
+        and len(fake4.lg_launch_v2.argtypes) == 12
+    )
+    # launch: m_real goes right before the stream; v2 without it
+    ctx = lrt.LargeContext(fake4, 0x77, 2048, 2304, 0)
+    ctx.budget_us = 5
+    ctx.launch_v3(1, 2, 3, 4, 6144, 2, 1, 777, "stream", m_real=1100)
+    name, a = fake4.calls[-1]
+    assert name == "lg_launch_v3" and a[0] == 0x77 and len(a) == 13
+    assert (
+        getattr(a[-2], "value", a[-2]) == 1100 and a[-1] == "stream"
+    )  # m_real right before the stream
+    ctx.launch_v3(1, 2, 3, 4, 6144, 2, 1, 777, "stream")
+    assert fake4.calls[-1][0] == "lg_launch_v2"
+    for bad in (0, 2049):
+        with pytest.raises(ValueError, match=rf"m_real {bad} must be in \[1, M=2048\]"):
+            ctx.launch_v3(1, 2, 3, 4, 6144, 2, 1, 777, "stream", m_real=bad)
+    fake4.returns = {"lg_launch_v3": -105}
+    with pytest.raises(RuntimeError, match=r"lg_launch_v3 rc=-105 \(m_real=5\)"):
+        ctx.launch_v3(1, 2, 3, 4, 6144, 2, 1, 777, "stream", m_real=5)
+    # abi info: gen 4 = LG_COMM_ABI_VERSION 5 and a 360 B LgCommArgsV4; a gen 3 (r12) library is refused by a gen 4 plan and vice versa
+    r13 = {
+        "abi": 5,
+        "args_bytes": 360,
+        "err_off": 0,
+        "step_off": 8,
+        "diag_off": 64,
+        "ctag_off": 3072,
+        "atag_off": 3104,
+        "peers_bytes": 32,
+        "qr_wgs": 64,
+    }
+    lrt.check_abi_info(r13, 64, gen=4)
+    with pytest.raises(RuntimeError, match="ABI mismatch"):
+        lrt.check_abi_info(r13, 64, gen=3)
+    with pytest.raises(RuntimeError, match="ABI mismatch"):
+        lrt.check_abi_info({**r13, "abi": 4, "args_bytes": 352}, 64, gen=4)
+    lrt.check_abi_info(
+        {**r13, "abi": 4, "args_bytes": 352}, 64
+    )  # gen 3 default: unchanged
+    # the constants mirror the r13 ABI header (a header change is a test failure here, not a silent mismatch)
+    h = _slurp(
+        os.path.join(jit.CSRC, "large", "r13", "interface", "lg_comm_abi_v4.h"),
+        encoding="utf-8",
+    )
+    assert (
+        int(re.search(r"#define LG_COMM_ABI_VERSION (\d+)u", h).group(1))
+        == lrt.LG_COMM_ABI_VERSION_V4
+        == 5
+    )
+    assert (
+        int(re.search(r"sizeof\(LgCommArgsV4\) == (\d+)", h).group(1))
+        == lrt.LG_COMM_ARGS_V4_BYTES
+        == 360
+    )
+    assert (
+        int(re.search(r"#define LG_TAG_CALLID_BITS (\d+)u", h).group(1))
+        == lrt.LG_TAG_CALL_BITS
+        == 19
+    )
+    assert (
+        int(re.search(r"#define LG_TAG_M_SHIFT (\d+)u", h).group(1))
+        == lrt.LG_TAG_M_SHIFT
+        == 19
+    )
+    assert (
+        int(re.search(r"#define LG_TAG_CALLID_MASK (0x[0-9A-Fa-f]+)u", h).group(1), 16)
+        == (1 << 19) - 1
+    )
+    assert re.search(r"uint32_t m_real;\s+/\* 352 r13", h)  # m_real @352

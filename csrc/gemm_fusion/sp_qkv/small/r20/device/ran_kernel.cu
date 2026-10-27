@@ -764,7 +764,7 @@ SM_INL float qnan() { return __builtin_bit_cast(float, 0x7FC00000u); }      // r
 SM_INL uint32_t decide(const SmDev& a, uint32_t M, uint32_t G, uint64_t e, uint32_t pz) {
     if (pz != 0u) return 0xFFFFFFFFu;                                                // ERR already set: NANMODE (r19: outputs become NaN; the r18 silent skip is gone)
     if (e == 0ull) return 0x42u;                                                     // GEMM did not run / wrong pairing
-    if (M == 0u || M > SM_MP || a.T != 4u * M) return 0x40u;
+    if (M == 0u || M > SM_MP || 4u * M > a.T) return 0x40u;   // R16 pad-M: M is the per-launch (real) local rows; SmDev.T = 4 * M_bucket of the binding bounds it (a launch with M < M_bucket is legal; M > M_bucket is rejected)
     if (G != SM_T1_GRID) return 0x41u;                                               // static roles need exactly SM_T1_GRID WGs
     return 0u;
 }

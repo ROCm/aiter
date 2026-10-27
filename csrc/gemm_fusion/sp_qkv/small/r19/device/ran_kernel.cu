@@ -764,7 +764,7 @@ SM_INL float qnan() { return __builtin_bit_cast(float, 0x7FC00000u); }      // r
 SM_INL uint32_t decide(const SmDev& a, uint32_t M, uint32_t G, uint64_t e, uint32_t pz) {
     if (pz != 0u) return 0xFFFFFFFFu;                                                // ERR already set: NANMODE (r19: outputs become NaN; the r18 silent skip is gone)
     if (e == 0ull) return 0x42u;                                                     // GEMM did not run / wrong pairing
-    if (M == 0u || M > SM_MP || a.T != 4u * M) return 0x40u;
+    if (M == 0u || M > SM_MP || 4u * M > a.T) return 0x40u;   // R16 pad-M: M is the per-launch (real) local rows; SmDev.T = 4 * M_bucket of the binding bounds it (a launch with M < M_bucket is legal; M > M_bucket is rejected)
 #if SM_B_ROWSPLIT
     if (M <= 16u) return 0x40u;                                                      // r18 R4: the row-split B WGs (row pass 1 = rows 16..31) need M > 16 (T128 builds); device-side guard besides the host refusal
 #endif

@@ -12,7 +12,7 @@ depends only on (spec, arch, cu, world, m, available capabilities, graph_mode) a
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import catalog
 from .profile import Profile, load_profile
@@ -118,3 +118,85 @@ def match_prefix(
         ctx.m,
     )
     return None, 0
+
+
+def _variant_info(vid: str):
+    if vid not in catalog._CATALOG:
+        _load_builtin(vid)
+    info = catalog.get_variant(vid) if vid in catalog._CATALOG else None
+    if info is None:
+        raise ContractError(f"profile row references unregistered variant {vid!r}")
+    return info
+
+
+def bucket_for_m(
+    spec: FusionSpec, ctx: MatchCtx, profile: str | Profile | None = None
+) -> int | None:
+    """R16 pad-M, bucket selection ("the padded m only selects the kernel / plan; the kernel only gets the valid m"): the prepared bucket M a real local m = ctx.m runs in, or None (native).
+
+    Per prefix (longest first, like match_prefix) the candidates are the profile's EXACT rows of (sig, arch, cu, world), ascending in m: the smallest row with m_row >= m whose variant
+    accepts the launch (``Plan.accepts_launch_m(params, m_row, m)``: m == m_row always; below it only pad-M sources, within their padded rows and shape switches) wins, so m == an
+    exact row is that row, and e.g. m 129..256 lands on the MP256 row, m 65..128 on the MP128 row, m 896..1023 on the 1024 row, m 1025..1280 on the 1280 row. A variant that declares ``pad_m_min_field``
+    (the large plans: profile field ``m_pad_min_large``, default 896 = where the pad path starts to beat native at the 1024 bucket) is padded only from that m on: below it only an exact row is used. When no row can take m, a range rule covering
+    m resolves it exactly (the bucket is m itself); otherwise the next shorter prefix, else None. A pure function of (spec, arch, cu, world, m) and the immutable profile, so every
+    rank chooses the same bucket. Capabilities / graph mode are not consulted here (they are checked when the plan is built for the bucket).
+    """
+    prof = profile if isinstance(profile, Profile) else load_profile(profile)
+    for n in range(len(spec.stages), 0, -1):
+        got = bucket_in_band(
+            prof, spec.prefix(n).signature(), ctx.arch, ctx.cu, ctx.world, ctx.m
+        )
+        if got is not None:
+            return got[0]
+    return None
+
+
+def bucket_in_band(
+    prof: Profile, sig: str, arch: str, cu: int, world: int, m: int
+) -> tuple[int, str] | None:
+    """The bucket of ONE (sig, arch, cu, world) band for the real local m: (bucket_m, vid), or None (see bucket_for_m for the rule). Shared with the call_id universe."""
+    m = int(m)
+    for row in prof.bucket_rows(sig, arch, cu, world):
+        if row.m < m:
+            continue
+        if row.m == m:
+            return m, row.vid
+        cls = _variant_info(row.vid).factory
+        field = getattr(cls, "pad_m_min_field", None)
+        if field is not None and m < int(
+            prof.meta.get(field, getattr(cls, "pad_m_min_default", 1))
+        ):
+            continue
+        accepts = getattr(cls, "accepts_launch_m", None)
+        if accepts is not None and accepts(dict(row.params), row.m, m):
+            return row.m, row.vid
+    rule = prof.lookup_rule(sig, arch, cu, world, m)
+    return (m, rule.vid) if rule is not None else None
+
+
+def match_padded(
+    spec: FusionSpec, ctx: MatchCtx, profile: str | Profile | None = None
+) -> tuple[object | None, int, int | None]:
+    """R16 pad-M: (plan, n_stages, bucket_m) for the REAL local m = ctx.m: the plan is the one prepared for the bucket (bucket_for_m); run it with x holding exactly the real
+    m rows (the plan's launch gets m_real = x.shape[0]). (None, 0, None) = native. m == an exact row gives that row's plan, bucket == m.
+    """
+    prof = profile if isinstance(profile, Profile) else load_profile(profile)
+    bucket = bucket_for_m(spec, ctx, prof)
+    if bucket is None:
+        log.info(
+            "event=dispatch_padded sig=%s m=%d vid=native source=none",
+            spec.signature(),
+            ctx.m,
+        )
+        return None, 0, None
+    plan, n = match_prefix(spec, replace(ctx, m=bucket), prof)
+    if plan is not None:
+        log.info(
+            "event=dispatch_padded sig=%s m=%d bucket=%d vid=%s n_stages=%d",
+            spec.signature(),
+            ctx.m,
+            bucket,
+            plan.vid,
+            n,
+        )
+    return plan, n, bucket

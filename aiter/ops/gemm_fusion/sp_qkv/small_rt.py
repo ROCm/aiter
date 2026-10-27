@@ -129,6 +129,11 @@ def load_driver(path: str, abi: int = 2):
             f = getattr(lib, n)
             f.restype = i32
             f.argtypes = a
+        # R16 pad-M (r19 / r20 / r22 / r23 builds only; r21 and pre-R16 libraries lack it): the same launch with the REAL local rows m (1 <= m <= the bucket M the binding was made for)
+        v3m = getattr(lib, "sm_launch_blk_v3m", None)
+        if v3m is not None:
+            v3m.restype = i32
+            v3m.argtypes = [vp, vp, vp, vp, u32, vp, vp, vp, u32, u32, u32, vp]
         return lib
     sig = [
         (
@@ -212,9 +217,35 @@ class SmallContext:
         t_valid: int,
         call_id: int,
         stream,
+        m: int | None = None,
     ):
         """R12 launch (card D2.6): x_scale / positions / slot_mapping / t_valid / call_id are PER-LAUNCH kernargs (they are no longer part of the binding), err and step
-        come from the global page the driver was attached with."""
+        come from the global page the driver was attached with. R16 pad-M: m = the real local rows (1 <= m <= the bucket M of the binding, t_valid <= 4 m) through
+        sm_launch_blk_v3m; M is a by-value kernarg of both kernels, so a captured graph bakes it (one graph per (binding, m)). m=None = the bound M (sm_launch_blk_v3).
+        """
+        if m is not None:
+            v3m = getattr(self.lib, "sm_launch_blk_v3m", None)
+            if v3m is None:
+                raise RuntimeError(
+                    "this small driver build has no sm_launch_blk_v3m (pad-M exists in src r19 / r20 / r22 / r23 builds from R16 on)"
+                )
+            rc = v3m(
+                self.ctx,
+                blk,
+                C.c_void_p(A_ptr),
+                C.c_void_p(W_ptr),
+                C.c_uint32(strideA),
+                C.c_void_p(Ascale_ptr),
+                C.c_void_p(positions_ptr),
+                C.c_void_p(slot_ptr),
+                C.c_uint32(t_valid),
+                C.c_uint32(call_id),
+                C.c_uint32(m),
+                stream,
+            )
+            if rc != OK:
+                raise RuntimeError(f"sm_launch_blk_v3m rc={rc} (m={m})")
+            return
         rc = self.lib.sm_launch_blk_v3(
             self.ctx,
             blk,

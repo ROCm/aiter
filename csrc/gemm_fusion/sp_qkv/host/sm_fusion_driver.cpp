@@ -17,6 +17,7 @@
 #define hipSetDevice(x) gf::set_device(x)
 #include "driver_sm.cpp"
 #undef hipSetDevice
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -171,18 +172,56 @@ int32_t sm_attach_v3(uint32_t rank, void* comm, void* rwin, void* rlocal, void* 
 }
 // launch(ctx, blk, A, W, strideA, Ascale, positions, slot_mapping, t_valid, call_id, stream): per-launch tensors are kernel arguments (staging removed); rows t >= t_valid are padded in-kernel (pos 0, slot -1).
 // positions / slot_mapping must hold at least t_valid int64 elements, Ascale at least M floats (the kernel never reads beyond them).
-int32_t sm_launch_blk_v3(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, const float* Ascale, const int64_t* positions, const int64_t* slot_mapping,
-                         uint32_t t_valid, uint32_t call_id, void* stream) {
+static int32_t sm_launch_impl(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, const float* Ascale, const int64_t* positions, const int64_t* slot_mapping,
+                              uint32_t t_valid, uint32_t call_id, uint32_t m_launch, void* stream) {
     auto* c = static_cast<Ctx*>(ctx); auto* blk = static_cast<Blk*>(blk_); if (!c || !blk || !blk->dblk) return E_STATE;
     if (!own_ctx(c)) return E_STATE;
-    if (!A || !W || !Ascale || !positions || !slot_mapping || t_valid > blk->b.T) return E_ARG;
+    const uint32_t m_use = m_launch ? m_launch : blk->b.M;                    // R16 pad-M: the REAL local rows of this launch (0 = the bound bucket M)
+    if (!A || !W || !Ascale || !positions || !slot_mapping || m_use < 1u || m_use > blk->b.M || t_valid > 4u * m_use) return E_ARG;
+#if SM_B_ROWSPLIT
+    if (m_use <= 16u) return E_ARG;                                            // r18 row-split variant: M > 16 only (device decide() would poison it)
+#endif
+#if SM_PUSH8
+    if (m_use > 16u) return E_ARG;
+#endif
     gf::DeviceScope scope(dev_of(c));
     std::lock_guard<std::mutex> swap_lk(g_swap_mu);
     SmBindingV1 saved_b = c->b; SmDev* saved_dblk = c->dblk;
-    c->b = blk->b; c->b.A = A; c->b.W = W; c->b.strideA = strideA; c->dblk = blk->dblk;
+    c->b = blk->b; c->b.M = m_use; c->b.A = A; c->b.W = W; c->b.strideA = strideA; c->dblk = blk->dblk;
     const hipError_t e = enqueue_v3(c, static_cast<hipStream_t>(stream), Ascale, positions, slot_mapping, t_valid, call_id);
     c->b = saved_b; c->dblk = saved_dblk;
     if (e != hipSuccess) { c->last_hip = static_cast<int>(e); std::fprintf(stderr, "SM_LAUNCH stage=enqueue err=%d (%s)\n", (int)e, hipGetErrorString(e)); return E_HIP; }
+    return OK;
+}
+
+// R16 pad-M: launch with the REAL local rows m (1 <= m <= the bucket M the binding was made for; all 4 ranks must pass the same m). x holds m rows, A/Ascale are read for rows < m only, tokens are t = s*m + row,
+// t_valid <= 4*m. Outputs may be sized for the bucket (4*M_bucket rows): only rows t < 4*m are written. m = 0 behaves exactly like sm_launch_blk_v3 (the bound M). NOTE: M is a by-value kernarg of both kernels,
+// so a captured graph bakes it: capture one graph per (binding, m).
+int32_t sm_launch_blk_v3m(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, const float* Ascale, const int64_t* positions, const int64_t* slot_mapping,
+                          uint32_t t_valid, uint32_t call_id, uint32_t m, void* stream) {
+    return sm_launch_impl(ctx, blk_, A, W, strideA, Ascale, positions, slot_mapping, t_valid, call_id, m, stream);
+}
+int32_t sm_launch_blk_v3(void* ctx, void* blk_, const void* A, const void* W, uint32_t strideA, const float* Ascale, const int64_t* positions, const int64_t* slot_mapping,
+                         uint32_t t_valid, uint32_t call_id, void* stream) {
+    return sm_launch_impl(ctx, blk_, A, W, strideA, Ascale, positions, slot_mapping, t_valid, call_id, 0u, stream);
+}
+// Host-only diagnostic snapshot of the per-OWNER control state (synchronous D2H copies: call after a device sync / quiesce; nothing on the device changes).
+// out16[0] = ep_r (SM_C_EPOCH, RAN-written), [1] = ep_g (SM_C_EPOCH_G, GEMM-written), [2..5] = flag[src 0..3] (release-sequence counters in THIS rank's ctl window),
+// [6..13] = tag[par][src] at index par*4 + src, [14] = sticky ERR word of the per-comm page (u32), [15] = STEP (u64). Invariant: flag[src] == K * (ok launches released by src) and ep_g == ep_r + 1 right after a launch started.
+int32_t sm_ctl_read_v1(void* ctx, uint64_t* out16) {
+    auto* c = static_cast<Ctx*>(ctx); if (!c || !out16 || !c->clocal || !c->gpage) return E_STATE;
+    if (!own_ctx(c)) return E_STATE;
+    gf::DeviceScope scope(dev_of(c));
+    uint8_t ctl[SM_C_BYTES];
+    if (hipMemcpy(ctl, c->clocal, SM_C_BYTES, hipMemcpyDeviceToHost) != hipSuccess) return E_HIP;
+    uint8_t pg[16];
+    if (hipMemcpy(pg, c->gpage, sizeof(pg), hipMemcpyDeviceToHost) != hipSuccess) return E_HIP;
+    auto rd64 = [&](size_t off) { uint64_t v; std::memcpy(&v, ctl + off, 8); return v; };
+    out16[0] = rd64(SM_C_EPOCH); out16[1] = rd64(SM_C_EPOCH_G);
+    for (uint32_t s = 0; s < 4u; ++s) out16[2u + s] = rd64(SM_T1_FLAG(s));
+    for (uint32_t par = 0; par < 2u; ++par) for (uint32_t s = 0; s < 4u; ++s) out16[6u + par * 4u + s] = rd64(SM_C_TAG(par, s));
+    uint32_t err; std::memcpy(&err, pg, 4); uint64_t step; std::memcpy(&step, pg + 8, 8);
+    out16[14] = err; out16[15] = step;
     return OK;
 }
 #endif

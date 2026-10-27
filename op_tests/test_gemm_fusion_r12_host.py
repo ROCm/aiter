@@ -4,6 +4,7 @@
 uniqueness check (KEY gate). A fake backend / fake torch stand in for the device. Run: python -m pytest op_tests/test_gemm_fusion_r12_host.py
 """
 
+import json
 import logging
 import os
 import re
@@ -426,8 +427,8 @@ def test_KEY_every_profile_key_of_the_shipped_profile_has_a_distinct_nonzero_cal
         1020,
     } <= tokens  # ... the r20 (MP64) rule over local m 33..64 (tokens 4 m = 132..256), the r22 (MP128) rule over 65..128 (260..512), the r23 (MP256) rule over 129..255 (516..1020) ...
     assert not (
-        {1024, 2048, 3072, 3076} & tokens
-    )  # ... and nothing between the small envelope (m <= 255) and the large path (m >= 1024): T 1024..4092 is native
+        {1028, 2048, 3072, 3076, 4092} & tokens
+    )  # ... and nothing between the small envelope (m <= 256) and the large path (m >= 1024): T 1028..4092 is native
     assert {
         4096,
         5120,
@@ -435,11 +436,11 @@ def test_KEY_every_profile_key_of_the_shipped_profile_has_a_distinct_nonzero_cal
         28672,
     } <= tokens  # ... and the m values the range rules add (m = 1024..8192 step 256, tokens = 4 m)
     n_entries = len({(k[2], k[1], k[3]) for k in keys})
-    # the key has no mode: dense and indexer at the same token count are the same key (a site is one mode). 255 small token counts (every local m 1..255: the exact rows plus
-    # the r19 rules over 1..16 / 17..32, the MP64 rule over 33..64, the MP128 rule over 65..128 and the MP256 rule over 129..255) + 29 large (m = 1024..8192 step 256)
+    # the key has no mode: dense and indexer at the same token count are the same key (a site is one mode). 256 small token counts (every local m 1..256: the exact rows plus
+    # the r19 rules over 1..16 / 17..32, the MP64 rule over 33..64, the MP128 rule over 65..128, the MP256 rule over 129..255 and its bucket row at 256) + 29 large (m = 1024..8192 step 256)
     assert (
         len(keys) == n_entries * len(MODEL_SITES + DRAFT_SITES)
-        and n_entries == 255 + 29
+        and n_entries == 256 + 29
     )
     rep = callid.check_profile_call_ids(prof, MODEL_SITES + DRAFT_SITES, world=4)
     assert (
@@ -1389,3 +1390,166 @@ def test_devzero_fill_chunks_the_window_aligns_and_syncs(monkeypatch):
         sys.modules, "torch", types.ModuleType("torch")
     )  # a fake torch without .cuda
     assert devzero.torch_available() is False
+
+
+# ======================================================================= R16: the call_id check on the low 19 bits (large r13 tags), per token count, over the pad-M universe
+LG_VID, SM_VID = "sp_qkv.large.v1", "sp_qkv.small.v1"
+
+
+def test_check_call_ids_low_bits_are_checked_per_token_count_and_only_for_the_tagged_variants():
+    fixed = {
+        ("a", 4096, LG_VID, 1): 0x1000_0005,
+        (
+            "b",
+            4096,
+            LG_VID,
+            1,
+        ): 0x2000_0005,  # same low 19 bits as "a", same tokens, both large -> collide on the tag
+        (
+            "c",
+            4100,
+            LG_VID,
+            1,
+        ): 0x3000_0005,  # same low bits, ANOTHER token count (m_real differs in the tag): fine
+        (
+            "d",
+            4096,
+            SM_VID,
+            2,
+        ): 0x4000_0005,  # the small plans' tag has no low-19 field: not checked
+        ("e", 4096, LG_VID, 1): 0x5000_0000,  # low field 0
+    }
+    key_fn = lambda *k: fixed[k]
+    rep = callid.check_call_ids(fixed, key_fn)  # the 31-bit check alone: all distinct
+    assert rep.ok and rep.low_collisions == {} and rep.tag_bits is None
+    rep = callid.check_call_ids(fixed, key_fn, tag_bits=19, tag_vids=(LG_VID,))
+    assert not rep.ok and rep.tag_bits == 19
+    assert (
+        set(rep.low_collisions) == {(4096, 5)}
+        and len(rep.low_collisions[(4096, 5)]) == 2
+    )
+    assert {k[0] for k in rep.low_collisions[(4096, 5)]} == {"a", "b"}
+    assert [k[0] for k in rep.zero_low] == ["e"] and rep.collisions == {}
+    assert {k[0] for k in rep.refused_keys} == {
+        "a",
+        "b",
+        "e",
+    }  # c (another token count) and d (small) stay fused
+    # without the variant filter the small key counts too
+    rep = callid.check_call_ids(fixed, key_fn, tag_bits=19)
+    assert {k[0] for k in rep.low_collisions[(4096, 5)]} == {"a", "b", "d"}
+    # per_tokens: the SAME 31-bit id in two token counts is not a collision (they never meet), inside one it is
+    dup = {
+        ("a", 4096, LG_VID, 1): 7,
+        ("b", 4100, LG_VID, 1): 7,
+        ("c", 4096, LG_VID, 1): 8,
+        ("d", 4096, LG_VID, 1): 8,
+    }
+    kf = lambda *k: dup[k]
+    assert set(callid.check_call_ids(dup, kf).collisions) == {7, 8}
+    rep = callid.check_call_ids(dup, kf, per_tokens=True)
+    assert set(rep.collisions) == {8} and {k[0] for k in rep.collisions[8]} == {
+        "c",
+        "d",
+    }
+
+
+def test_tag_unique_ids_are_distinct_nonzero_on_the_low_bits_by_construction_and_rank_uniform():
+    sites = MODEL_SITES + DRAFT_SITES
+    keys = [(s, 4 * m, LG_VID, 1) for s in sites for m in range(1024, 1400)]
+    ids = callid.tag_unique_ids(keys)
+    assert set(ids) == set(keys) and all(0 < v < (1 << 31) for v in ids.values())
+    mask = (1 << 19) - 1
+    for m in (1024, 1100, 1399):
+        low = [ids[(s, 4 * m, LG_VID, 1)] & mask for s in sites]
+        assert (
+            len(set(low)) == len(sites) and 0 not in low
+        )  # distinct and non-zero within one token count
+    rep = callid.check_call_ids(
+        keys, lambda *k: ids[k], tag_bits=19, tag_vids=(LG_VID,), per_tokens=True
+    )
+    assert rep.ok
+    # a pure function of the key set: the same on every rank, whatever the order they were registered in
+    assert callid.tag_unique_ids(list(reversed(keys))) == ids
+    # the high bits keep the hash's entropy (two token counts of one site differ above the tag field)
+    assert (ids[(sites[0], 4096, LG_VID, 1)] >> 19) != (
+        ids[(sites[0], 4100, LG_VID, 1)] >> 19
+    )
+    with pytest.raises(ValueError, match="do not fit 1 tag bits"):
+        callid.tag_unique_ids([("a", 4, LG_VID, 1), ("b", 4, LG_VID, 1)], tag_bits=1)
+
+
+def test_registry_with_tag_bits_refuses_low_collisions_and_zero_low_fields():
+    reg = callid.CallIdRegistry(
+        lambda *k: {
+            "a": 0x1000_0005,
+            "b": 0x2000_0005,
+            "c": 0x3000_0000,
+            "d": 0x4000_0009,
+        }[k[0]],
+        tag_bits=19,
+        tag_vids=(LG_VID,),
+        per_tokens=True,
+    )
+    for site in "abcd":
+        reg.add(site, 4096, LG_VID, 1)
+    rep = reg.freeze()
+    assert (
+        reg.is_refused("a", 4096, LG_VID, 1)
+        and reg.is_refused("b", 4096, LG_VID, 1)
+        and reg.is_refused("c", 4096, LG_VID, 1)
+    )
+    assert (
+        not reg.is_refused("d", 4096, LG_VID, 1)
+        and reg.call_id("d", 4096, LG_VID, 1) == 0x4000_0009
+    )
+    with pytest.raises(ValueError, match="refused"):
+        reg.call_id("a", 4096, LG_VID, 1)
+    assert rep.tag_bits == 19
+
+
+def test_the_pad_m_key_universe_covers_every_real_m_a_bucket_can_serve(monkeypatch):
+    clear_profile_cache()
+    prof = profmod.load_profile(
+        PROFILE
+    )  # the shipped layout: r13 large (pad-M from m_pad_min_large = 896)
+    sites = MODEL_SITES + DRAFT_SITES
+    keys, unresolved = callid.profile_call_id_keys(prof, sites, world=4, pad_m=True)
+    assert unresolved == []
+    tokens = {k[1] for k in keys}
+    assert tokens == {4 * m for m in range(1, 257)} | {
+        4 * m for m in range(896, 8193)
+    }  # small: every m 1..256 (buckets); large: every real m 896..8192
+    assert len(tokens) == 256 + (8192 - 896 + 1)  # 7553 token counts
+    assert {k[2] for k in keys if k[1] >= 4 * 896} == {LG_VID} and {
+        k[3] for k in keys if k[1] >= 4 * 896
+    } == {1}
+    assert {k[2] for k in keys if k[1] <= 1024} == {SM_VID} and {
+        k[3] for k in keys if k[1] <= 1024
+    } == {2}
+    # per token count the 31-bit ids are distinct with the hash ids (the global check is impossible over ~480k keys and was never needed) ...
+    rep = callid.check_profile_call_ids(prof, sites, world=4, pad_m=True)
+    assert rep.ok and rep.keys == len(keys) == (256 + 8192 - 896 + 1) * len(sites)
+    # ... but the HASH ids collide on the 19 tag bits of the r13 launches (~ n_tokens x pairs / 2^19 expected) and one has a zero low field: r13 needs tag-unique ids
+    rep = callid.check_profile_call_ids(
+        prof, sites, world=4, pad_m=True, tag_bits=19, tag_vids=(LG_VID,)
+    )
+    assert rep.collisions == {} and len(rep.low_collisions) > 0 and rep.refused_sites
+    assert all(k[2] == LG_VID for ks in rep.low_collisions.values() for k in ks)
+    # the assigned ordinal ids (what ATOM passes as call_id for the large launches) are clean for the whole universe; small launches keep decision_key
+    ids = callid.tag_unique_ids(keys)
+    rep = callid.check_call_ids(
+        keys, lambda *k: ids[k], tag_bits=19, tag_vids=(LG_VID,), per_tokens=True
+    )
+    assert rep.ok and rep.keys == len(keys)
+    # the r12 layout (rollback / A/B): exact large rows only, and the hash ids pass the same checks (r12 tags carry the whole call_id)
+    monkeypatch.setattr(specs, "LARGE_R13_IN_PROFILE", False)
+    from aiter.ops.gemm_fusion.sp_qkv import gen_profile
+
+    p12 = profmod.parse_profile(json.loads(json.dumps(gen_profile.build_profile())))
+    keys12, _u = callid.profile_call_id_keys(p12, sites, world=4, pad_m=True)
+    assert {k[1] for k in keys12} == {4 * m for m in range(1, 257)} | {
+        4 * m for m in range(1024, 8193, 256)
+    }
+    rep = callid.check_profile_call_ids(p12, sites, world=4, pad_m=True)
+    assert rep.ok and rep.keys == 285 * len(sites)

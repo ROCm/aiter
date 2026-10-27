@@ -162,11 +162,11 @@ def test_row_mode_recovery_and_unknown_rows_are_skipped_not_errors(jit_root):
     modes = sorted((r.vid.split(".")[1], pb.row_mode(r)) for r in prof.rows())
     from collections import Counter
 
-    # 24 small rows (6 tuned + 15 P2 + 3 r20, 8 per mode) and 87 large rows (29 per mode): the mode is recovered from the signature for rows AND rules
+    # 30 small rows (6 tuned + 15 P2 + 3 r20 + 3 r22 + 3 r23 bucket rows, 10 per mode) and 87 large rows (29 per mode): the mode is recovered from the signature for rows AND rules
     assert Counter(m for v, m in modes if v == "small") == {
-        "dense": 9,
-        "indexer": 9,
-        "reuse": 9,
+        "dense": 10,
+        "indexer": 10,
+        "reuse": 10,
     }
     assert Counter(m for v, m in modes if v == "large") == {
         "dense": 29,

@@ -125,6 +125,11 @@ int32_t lg_launch_v1(void* h, const void* A, const void* W, const float* Ascale,
     return lg_comm_launch(h, A, W, Ascale, Wscale, strideA, poll_iterations, poll_budget_us, puts_per_peer, half_first, stream);
 }
 #else
+#if LG_COMM_ABI_VERSION >= 5
+using LgCommArgsCurrent = LgCommArgsV4;   // r13+: the ABI-current launch-args struct
+#else
+using LgCommArgsCurrent = LgCommArgsV3;   // r12 (ABI 4)
+#endif
 // r12: attach the per-comm ERR/STEP page. err/step/gpeers are DEVICE pointers owned by the runtime (page base, page base + 8, LgGfPeers table or null). Call once after lg_attach_v1, before the first launch.
 int32_t lg_gpage_attach_v1(void* h, void* err, const void* step, const void* gpeers) {
     auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
@@ -135,14 +140,27 @@ int32_t lg_launch_v2(void* h, const void* A, const void* W, const float* Ascale,
                      uint64_t poll_budget_us, uint32_t puts_per_peer, uint32_t half_first, uint32_t call_id, void* stream) {
     auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
     gf::DeviceScope scope(lg_dev(c)); if (!scope.ok()) return -2;
+#if LG_COMM_ABI_VERSION >= 5
+    return lg_comm_launch(h, A, W, Ascale, Wscale, strideA, poll_iterations, poll_budget_us, puts_per_peer, half_first, call_id, c->M, stream);   // v2 contract: every row of the bucket is valid (m_real = M)
+#else
     return lg_comm_launch(h, A, W, Ascale, Wscale, strideA, poll_iterations, poll_budget_us, puts_per_peer, half_first, call_id, stream);
+#endif
 }
+#if LG_COMM_ABI_VERSION >= 5
+// r13: per-launch m_real (1..M). A/Ascale hold only m_real rows; geometry (tiles, chunks, n/half_first, grid, windows) stays that of the plan's bucket M; R = [4*m_real, F] contiguous (R row base = src*m_real).
+int32_t lg_launch_v3(void* h, const void* A, const void* W, const float* Ascale, const float* Wscale, uint32_t strideA, uint64_t poll_iterations,
+                     uint64_t poll_budget_us, uint32_t puts_per_peer, uint32_t half_first, uint32_t call_id, uint32_t m_real, void* stream) {
+    auto* c = static_cast<LgCommCtx*>(h); if (!c) return -1;
+    gf::DeviceScope scope(lg_dev(c)); if (!scope.ok()) return -2;
+    return lg_comm_launch(h, A, W, Ascale, Wscale, strideA, poll_iterations, poll_budget_us, puts_per_peer, half_first, call_id, m_real, stream);
+}
+#endif
 // lg_abi_info_v2 (r12c): lg_abi_info_v1's 8 words + out[8] = LG_QR_WGS of THIS host build (quiet_ready workgroups the launcher starts); the device image enforces the same value at launch (args.qr_wgs), so a mismatch is a CONFIG error; the runtime may also
 // compare out[8] with the qr_wgs it built the image with and refuse at attach.
-// out[0] = LG_COMM_ABI_VERSION, out[1] = sizeof(LgCommArgsV3), out[2] = ERR off, out[3] = STEP off, out[4] = DIAG off (relative to the page base), out[5] = ctag off, out[6] = atag off (C window), out[7] = sizeof(LgGfPeers)
+// out[0] = LG_COMM_ABI_VERSION, out[1] = sizeof(the ABI-current args struct: LgCommArgsV3 for ABI 4, LgCommArgsV4 for ABI >= 5), out[2] = ERR off, out[3] = STEP off, out[4] = DIAG off (relative to the page base), out[5] = ctag off, out[6] = atag off (C window), out[7] = sizeof(LgGfPeers)
 int32_t lg_abi_info_v1(uint64_t* out8) {
     if (!out8) return -1;
-    out8[0] = LG_COMM_ABI_VERSION; out8[1] = sizeof(LgCommArgsV3); out8[2] = LG_GF_ERR_OFF; out8[3] = LG_GF_STEP_OFF; out8[4] = LG_GF_DIAG_OFF; out8[5] = LGC_CTAG_OFF; out8[6] = LGC_ATAG_OFF; out8[7] = sizeof(LgGfPeers);
+    out8[0] = LG_COMM_ABI_VERSION; out8[1] = sizeof(LgCommArgsCurrent); out8[2] = LG_GF_ERR_OFF; out8[3] = LG_GF_STEP_OFF; out8[4] = LG_GF_DIAG_OFF; out8[5] = LGC_CTAG_OFF; out8[6] = LGC_ATAG_OFF; out8[7] = sizeof(LgGfPeers);
     return 0;
 }
 

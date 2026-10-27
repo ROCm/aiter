@@ -101,6 +101,12 @@ class Profile:
         self._rules_by_key = types.MappingProxyType(
             {k: tuple(v) for k, v in by_key.items()}
         )
+        rows_by_key: dict[tuple, list[Row]] = {}
+        for key, row in self._rows.items():
+            rows_by_key.setdefault(key[:4], []).append(row)
+        self._rows_by_key = types.MappingProxyType(
+            {k: tuple(sorted(v, key=lambda r: r.m)) for k, v in rows_by_key.items()}
+        )  # R16 pad-M: the exact rows of one (sig, arch, cu, world) band, ascending in m (the candidate buckets)
 
     def lookup(self, sig, arch, cu, world, m) -> Row | None:
         """The EXACT row for (sig, arch, cu, world, m), or None (rules are not consulted: see resolve)."""
@@ -134,6 +140,10 @@ class Profile:
         if rule is not None:
             return rule, "rule"
         return None, "none"
+
+    def bucket_rows(self, sig, arch, cu, world) -> tuple[Row, ...]:
+        """The exact rows of (sig, arch, cu, world) ascending in m: the prepared BUCKETS a real local m can be padded into (see match.bucket_for_m)."""
+        return self._rows_by_key.get((sig, arch, int(cu), int(world)), ())
 
     def rows(self):
         return tuple(self._rows.values())
@@ -186,6 +196,13 @@ def parse_profile(doc: dict, path: str = "<memory>") -> Profile:
         )
     rules = _parse_rules(doc.get("rules", []), path)
     meta = {k: v for k, v in doc.items() if k not in ("rows", "rules")}
+    mp = meta.get(
+        "m_pad_min_large"
+    )  # R16: the smallest real local m a LARGE plan is padded into a bucket for (below it: exact rows only, i.e. native between the small and large paths)
+    if mp is not None and (isinstance(mp, bool) or not isinstance(mp, int) or mp < 1):
+        raise ProfileError(
+            f"{path}: m_pad_min_large must be a positive int, got {mp!r}"
+        )
     return Profile(str(doc.get("profile", "")), rows, meta, path, rules)
 
 

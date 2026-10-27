@@ -2,7 +2,13 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 from .capabilities import detect_arch, detect_capabilities, detect_cu
 from .catalog import Contract, VariantInfo, get_variant, register_variant
-from .match import ContractError, MatchCtx, match_prefix
+from .match import (
+    ContractError,
+    MatchCtx,
+    bucket_for_m,
+    match_padded,
+    match_prefix,
+)
 from .plan import Plan, WindowReq
 from .prebuild import prebuild_profile
 from .profile import Profile, ProfileError, Rule, load_profile, parse_profile
@@ -48,12 +54,14 @@ __all__ = [
     "VariantInfo",
     "Window",
     "WindowReq",
+    "bucket_for_m",
     "canonical",
     "detect_arch",
     "detect_capabilities",
     "detect_cu",
     "get_variant",
     "load_profile",
+    "match_padded",
     "match_prefix",
     "parse_profile",
     "prebuild_profile",

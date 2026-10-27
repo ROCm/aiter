@@ -19,9 +19,6 @@ from aiter.gemm_fusion.errpage import GLOBAL_PAGE_BYTES, SHARE_GLOBAL
 from . import p1_sweep, specs
 
 ARCH, CU, WORLD = "gfx950", 256, 4
-LARGE_PROFILE_SRC = (
-    specs.LARGE_PROFILE_SRC
-)  # the large rows and rules run the R12 kernels (ERR page, call_id tags, NaN fill folded into quiet_ready); "r11" to A/B
 
 
 SMALL_CAPS = frozenset({"mori_cco", "gfx950_sc_bypass"})
@@ -134,7 +131,7 @@ def build_large_rows():
                 "n": n,
                 "half_first": half_first,
                 "no_gridread": 1,
-                "src": LARGE_PROFILE_SRC,
+                "src": specs.large_profile_src(),
             }
             assert _plan_valid(mode, params, m), (
                 mode,
@@ -182,7 +179,7 @@ def build_large_rules():
                 "n": n,
                 "half_first": 0,
                 "no_gridread": 1,
-                "src": LARGE_PROFILE_SRC,
+                "src": specs.large_profile_src(),
             }
             for m in range(RULE_M_MIN, RULE_M_MAX + 1, step):
                 assert _plan_valid(mode, params, m), (mode, step, m, params)
@@ -262,6 +259,8 @@ def build_profile():
         # engine (a clean first call poisoned at the natural ~213 ms cold-start skew; Evidence 05055ac9); keep the PG timeout > ~3 x budget + recover; the cost of a large value is only failure-detection latency (a dead peer holds the stream for up to ~2-3 budgets). AITER_GEMM_FUSION_WAIT_BUDGET_US
         # overrides it for tuning only. Small-M uses an iteration count (20,000,000) instead and is not affected.
         "wait_budget_us": WAIT_BUDGET_US,
+        # R16 pad-M: the smallest real local m a large plan is padded into a bucket for (aiter.gemm_fusion.match.bucket_for_m): 896 (m 896..1023 -> the 1024 bucket); below it: exact rows only (m 257..895 native)
+        "m_pad_min_large": specs.M_PAD_MIN_LARGE,
         "generated_by": {
             "tool": "aiter.ops.gemm_fusion.sp_qkv.gen_profile",
             "ledger": "sp4-opus-mori-playground records/branch-ledger.md r165 (small), r152 (large)",

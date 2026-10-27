@@ -34,16 +34,16 @@ from . import (
     specs,
 )
 from . import small_rt as rt
-from .jit import build_small, small_defs, src_abi, src_mp
+from .jit import build_small, small_defs, src_abi, src_mp, src_pad_m
 
 SRC_SHA = {
     "r17": "3f597cdb6141c39dd4450a1ea635785ffe44867006434157478f7822357d8ee3",
     "r18": "0e48e3f01e917c9c5209c71efd90748e83eacf59d0e92cd10e5549955a450c29",
-    "r19": "33e0d60c5d9e4d37bd27aee2f9ae2d0351ecdac92d942c72b27966fbfe326b6e",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
-    "r20": "0b00603865eaee674190de2e76c4dc5dd6985db0f36c57b70b6156a4bb1e39b3",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
+    "r19": "4acb8e0fbea89ddd8f78fbb175bb9f9b887e69aea41a1409ab2b4a461b7ec093",  # R12 (abi 3), derived from r18; sha256 of small/r19/SOURCE_SHA256.txt
+    "r20": "447ac3ff8700ad20430bd961faadcc7b2299c1956cb57ff0baa44f0e8d216174",  # R13 MP64 (abi 3, SM_MP 64), derived from r19
     "r21": "c9cc70d9c5e3c9c52dc8bcf21ebf4cb82ff719f526de3fe5074f0b464151474b",  # R13 MP128 (abi 3, SM_MP 128, 8 MiB Rx view), derived from r20
-    "r22": "5e905fb651ff76e758f2af8007a0d10d7cec4732c140c38423ec3aa9e344a788",  # R14 tuned MP128 (abi 3, SM_MP 128, B-quad / BN128 / 3-slot Rx: 4 MiB view), derived from r21
-    "r23": "34f01b21955331648be3ef9562c68fe939ad62115c6eda64e0ae148ba89e681c",  # R14 MP256 v1 (abi 3, SM_MP 256, BM256 GEMM, 2 iterations per WG, 3-slot Rx 6.75 / 7.5 MiB: 8 MiB view), derived from r22
+    "r22": "39ef475a36e0ef2a676f7c6262a0f194b48ca29d26864f0a5f8ae26461984a10",  # R14 tuned MP128 (abi 3, SM_MP 128, B-quad / BN128 / 3-slot Rx: 4 MiB view), derived from r21
+    "r23": "b6f49374a8d26e4b1dea81ca08c8abf6beab97ff49a96fc5b54ff15a859a827b",  # R14 MP256 v1 (abi 3, SM_MP 256, BM256 GEMM, 2 iterations per WG, 3-slot Rx 6.75 / 7.5 MiB: 8 MiB view), derived from r22
 }
 # analytic geometry (mirrors sm_abi_v2.h; cross-checked against sm_info_v1 after build)
 _F = {"dense": 2304, "indexer": 2560, "reuse": 2560}
@@ -187,6 +187,10 @@ class SpQkvSmall(Plan):
                 "sp_qkv.small.v1 rx_bypass=1 requires capability gfx950_sc_bypass (R2 is gfx950-only)"
             )
         self.rx_slots = small_rx_slots(self.params)
+        self.pad_m = src_pad_m(
+            "small", self.src
+        )  # R16: launches the real m <= the bucket M this plan was made for (ctx.m)
+        self.bucket_m = ctx.m
         self.mp = src_mp(
             self.src
         )  # padded rows of this source: r17-r19 serve local m 1..32, r20 (MP64) 1..64
@@ -355,7 +359,10 @@ class SpQkvSmall(Plan):
             named["index_cache"] = meta["index_cache"]
         parts = {n: t.data_ptr() for n, t in named.items()}
         # everything else the device block bakes in from these tensors (strides) or from x (rows): a change must be a NEW binding, not stale reuse
-        parts["x.rows"] = x.shape[0]
+        mb = self._bucket_of(int(x.shape[0]))
+        parts["x.rows"] = (
+            mb  # the BUCKET M (R16: a launch with a smaller real m reuses the bucket's binding)
+        )
         parts["cos.stride0"] = meta["cos_cache"].stride(0)
         parts["k_cache.strides"] = tuple(caches["k_cache"].stride())
         parts["v_cache.strides"] = tuple(caches["v_cache"].stride())
@@ -438,8 +445,8 @@ class SpQkvSmall(Plan):
             None if self.abi >= 3 else meta["slot_mapping"].data_ptr()
         )
         sb.M, sb.T, sb.block_size, sb.x_size = (
-            x.shape[0],
-            4 * x.shape[0],
+            mb,
+            4 * mb,
             self.block,
             16,
         )
@@ -452,6 +459,24 @@ class SpQkvSmall(Plan):
         self._parts[key] = parts
         return blk
 
+    @staticmethod
+    def accepts_launch_m(params, bucket_m: int, m: int) -> bool:
+        """R16 pad-M, a pure function: can a plan built for the bucket M `bucket_m` with these params launch the real local m? m == bucket always; below it only the pad-M sources
+        (r19 / r20 / r22 / r23), within their padded rows and the shape switches (push8 = M <= 16, b_rowsplit = M > 16).
+        """
+        src = dict(params).get("src", "r17")
+        if m == bucket_m:
+            return True
+        if not (src_pad_m("small", src) and 1 <= m < bucket_m <= src_mp(src)):
+            return False
+        if dict(params).get("push8") and m > 16:
+            return False
+        return not (dict(params).get("b_rowsplit") and m <= 16)
+
+    def _bucket_of(self, M: int) -> int:
+        """The bucket M of the binding a launch of M real rows uses: the plan's own bucket when M fits it (pad-M sources), else M itself (the pre-R16 per-M binding)."""
+        return self.bucket_m if (self.pad_m and M <= self.bucket_m) else M
+
     def _check_inputs(self, x, x_scale, w_scale, outs, meta, w=None):
         """Reject, with ContractError, tensors the kernels cannot handle (see inputs.py) BEFORE any binding or launch. prepare() has no weight, run() passes it."""
         M = int(x.shape[0])
@@ -459,6 +484,17 @@ class SpQkvSmall(Plan):
             raise ContractError(
                 f"{self.owner}: x has {M} rows, a src {self.src} small plan takes local M 1..{self.mp}"
             )
+        if (
+            self.pad_m
+        ):  # R16: the shape switches follow the REAL m (the kernel checks them too)
+            if self.params.get("push8") and M > 16:
+                raise ContractError(
+                    f"{self.owner}: push8 build supports M<=16, got {M}"
+                )
+            if self.params.get("b_rowsplit") and M <= 16:
+                raise ContractError(
+                    f"{self.owner}: b_rowsplit build supports M>16, got {M}"
+                )
         inputs.check_activation(self.owner, x, x_scale, M=M)
         inputs.check_weight_scale(self.owner, w_scale, N=_NA[self.mode] * 128)
         if w is not None:
@@ -538,6 +574,7 @@ class SpQkvSmall(Plan):
                 t_valid,
                 call_id,
                 rt.stream_handle(stream),
+                m=int(x.shape[0]) if self.pad_m else None,
             )
             return
         sc.launch(

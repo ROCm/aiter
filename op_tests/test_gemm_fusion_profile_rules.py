@@ -506,7 +506,7 @@ CAPS = frozenset({"mori_cco", "sdma"})
 def test_shipped_profile_rules_are_signature_checked_and_match_the_generator():
     clear_profile_cache()
     prof = profmod.load_profile(PROFILE)
-    assert len(prof) == 27 + 87 and len(prof.rules()) == 24
+    assert len(prof) == 30 + 87 and len(prof.rules()) == 24
     large_rules = [r for r in prof.rules() if r.vid == "sp_qkv.large.v1"]
     small_rules = [r for r in prof.rules() if r.vid == "sp_qkv.small.v1"]
     assert (
@@ -643,7 +643,7 @@ def test_fallback_rules_are_the_chunks_mod4_classes_and_valid_on_the_whole_grid(
 def test_off_grid_and_out_of_range_m_stay_native_and_small_m_is_unaffected(
     sp_qkv_catalog,
 ):
-    for m in (256, 512, 768, 1000, 1100, 1281, 8448, 9216, 16384):
+    for m in (257, 512, 768, 1000, 1100, 1281, 8448, 9216, 16384):
         for mode in specs.MODES:
             assert match_prefix(
                 specs.sp_qkv_spec(mode), MatchCtx("gfx950", 256, 4, m, CAPS), PROFILE
@@ -710,16 +710,9 @@ def test_the_shipped_rules_imply_no_extra_builds(jit_root):
         {"profile": "rows", "rows": [_row_doc(r) for r in prof.rows()]}
     )
     units_rows, _ = _units(rows_only)
-    # builds are keyed by mode + build params (no_gridread), never by m, n or half_first. The rules imply no build beyond the rows' EXCEPT the r23 (MP256) owners, which
-    # exist only as rules (no exact row): exactly 3 more small units, one per mode
-    assert skipped == [] and len(units) == 18 and len(units_rows) == 15
-    extra = [u for u in units if u.dirname not in {x.dirname for x in units_rows}]
-    assert (
-        len(extra) == 3
-        and {u.kind for u in extra} == {"sp_qkv.small.v1"}
-        and {u.meta["src"] for u in extra} == {"r23"}
-    )
-    assert {u.dirname for u in units_rows} <= {u.dirname for u in units}
+    # builds are keyed by mode + build params (no_gridread), never by m, n or half_first: the rules imply no build beyond the rows' (the r23 owners have their bucket rows at m=256)
+    assert skipped == [] and len(units) == 18 == len(units_rows)
+    assert {u.dirname for u in units} == {u.dirname for u in units_rows}
 
 
 def _row_doc(r):
@@ -751,7 +744,7 @@ def test_a_rule_with_a_new_build_param_adds_exactly_the_units_it_implies(jit_roo
     )  # a different -DLG_NO_GRIDREAD: a different build
     doc = {"profile": "x", "rows": [_row_doc(r) for r in prof.rows()], "rules": [extra]}
     units, skipped = _units(parse_profile(doc))
-    assert skipped == [] and len(units) == 16
+    assert skipped == [] and len(units) == 19
     lg = [u for u in units if u.kind == "sp_qkv.large.v1"]
     assert len(lg) == 3 and {u.label.split()[0] for u in lg} == {"dense", "indexer"}
     # a profile made of rules ONLY still enumerates its builds (and the comm library)
@@ -800,7 +793,7 @@ def test_87_exact_large_rows_still_collapse_into_the_same_few_build_units():
     assert skipped == [] and len(units) == 18
     large = [u for u in units if u.kind == "sp_qkv.large.v1"]
     assert len(large) == 2 and {u.meta["src"] for u in large} == {
-        "r12"
+        "r13"
     }  # the dense and the indexer build (reuse shares the dense build)
     assert len({u.key for u in large}) == len(large)
     # the same enumeration without ANY large row (rules only) yields the same large builds: rules and rows imply identical units
@@ -857,10 +850,16 @@ def test_every_default_capture_bucket_resolves_as_designed(sp_qkv_catalog):
                 ("r22", 128) if m == 128 else ("r20", 64) if m == 64 else ("r19", 32)
             )
             assert (plan.src, plan.mp) == (src, mp), (mode, m)
-        assert _small_at(mode, 256) == (
+        plan256, _n = _small_at(mode, 256)
+        assert (plan256.src, plan256.mp, plan256.profile_source) == (
+            "r23",
+            256,
+            "row",
+        )  # the r23 bucket row (T=1024); m 129..255 is the r23 rule
+        assert _small_at(mode, 257) == (
             None,
             0,
-        )  # T=1024: above MP256, below the large path's first multiple: native (m 129..255 is the r23 rule)
+        )  # above MP256, below the large path: native
 
 
 def test_p2_rows_copy_the_mode_m16_params_and_r20_r22_rows_use_the_mp_params(
@@ -909,6 +908,7 @@ def test_p2_rows_copy_the_mode_m16_params_and_r20_r22_rows_use_the_mp_params(
             32,
             64,
             128,
+            256,
         ]
 
 
@@ -958,15 +958,15 @@ def test_everything_else_is_explicitly_native(sp_qkv_catalog):
         prof.meta["native_m_ranges"] == []
     )  # nothing inside the small envelope is native
     for mode in specs.MODES:
-        for m in range(1, 256):
+        for m in range(1, 257):
             assert _small_at(mode, m)[0] is not None, (mode, m)
-        for m in [256, 257, 300, 512, 768, 1000, 1023, 1025, 8193]:
+        for m in [257, 300, 512, 768, 1000, 1023, 1025, 8193]:
             assert _small_at(mode, m) == (None, 0), (
                 mode,
                 m,
             )  # the full spec: neither the 2-stage nor the 1-stage (large) prefix has an entry
-    # the small rows and rules end at m=255 (the large rules start at 1024)
-    assert all(r.m <= 255 for r in prof.rows() if r.vid == "sp_qkv.small.v1")
+    # the small rows end at m=256 (the r23 bucket row), the small rules at m=255 (the large rules start at 1024)
+    assert all(r.m <= 256 for r in prof.rows() if r.vid == "sp_qkv.small.v1")
     assert all(r.m_max <= 255 for r in prof.rules() if r.vid == "sp_qkv.small.v1")
     assert all(r.m_min >= 1024 for r in prof.rules() if r.vid == "sp_qkv.large.v1")
 
@@ -1443,9 +1443,12 @@ def test_the_shipped_profile_has_the_r23_rule_over_m129_to_255_and_no_native_ran
     prof = profmod.load_profile(PROFILE)
     assert specs.SMALL_R23_IN_PROFILE is True and specs.SMALL_R22_IN_PROFILE is True
     r23 = [e for e in prof.entries() if dict(e.params).get("src") == "r23"]
-    assert len(r23) == 3 and all(
-        e.m_min == 129 and e.m_max == 255 for e in r23
-    )  # one RULE per mode, no exact row
+    rules = [e for e in r23 if hasattr(e, "m_min")]
+    rows = [e for e in r23 if not hasattr(e, "m_min")]
+    assert len(rules) == 3 and all(e.m_min == 129 and e.m_max == 255 for e in rules)
+    assert len(rows) == 3 and all(
+        e.m == 256 for e in rows
+    )  # one RULE per mode over 129..255 + one BUCKET ROW per mode at 256
     for mode in specs.MODES:
         for m in (129, 200, 255):
             plan, _n = _small_at(mode, m)
@@ -1459,10 +1462,11 @@ def test_the_shipped_profile_has_the_r23_rule_over_m129_to_255_and_no_native_ran
                 mode, specs.SMALL_R23_PROFILE_NH
             )
             assert plan.resources()[0].bytes == 8 << 20  # the 8 MiB Rx view
-        assert _small_at(mode, 256) == (
+        assert _small_at(mode, 256)[0].profile_source == "row"  # the r23 bucket row
+        assert _small_at(mode, 257) == (
             None,
             0,
-        )  # m 256..1023 stays native; the large path starts at 1024
+        )  # m 257..1023 stays native; the large path starts at 1024
     assert prof.meta["native_m_ranges"] == []
 
 
@@ -1477,8 +1481,8 @@ def test_with_the_r23_flag_on_a_rule_covers_129_to_255_with_8mib_views_units_and
     doc = json.loads(json.dumps(gen_profile.build_profile()))
     prof = parse_profile(doc)
     assert (
-        len(prof) == 27 + 87 and len(prof.rules()) == 21 + 3
-    )  # one more rule per mode, no exact row
+        len(prof) == 30 + 87 and len(prof.rules()) == 21 + 3
+    )  # one more rule per mode + one bucket row (m=256) per mode
     r23_rules = [r for r in doc["rules"] if r["params"].get("src") == "r23"]
     mode_of = {specs.sp_qkv_spec(m).signature(): m for m in specs.MODES}
     assert sorted(mode_of[r["sig"]] for r in r23_rules) == sorted(specs.MODES)
@@ -1513,9 +1517,10 @@ def test_with_the_r23_flag_on_a_rule_covers_129_to_255_with_8mib_views_units_and
             ), (mode, m)
             assert plan.resources()[0].bytes == 8 << 20
         assert (
-            _small_at(mode, 256, prof) == (None, 0)
+            _small_at(mode, 257, prof) == (None, 0)
+            and _small_at(mode, 256, prof)[0].src == "r23"
             and _small_at(mode, 128, prof)[0].src == "r22"
-        )  # the MP128 slot is untouched; m 256 is not covered
+        )  # the MP128 slot is untouched; m 256 is the r23 bucket row, m 257 is not covered
     units, skipped = _units(prof)
     smalls = [u for u in units if u.kind == "sp_qkv.small.v1"]
     assert (
@@ -1541,10 +1546,10 @@ def test_with_the_r23_flag_on_a_rule_covers_129_to_255_with_8mib_views_units_and
             for a in jit.device_cmd_one("r23", u.meta["dev"], TOOL, "/out", "sm_ran")
         ]
         assert any(a.endswith("small/r23/device/ran_kernel.cu") for a in cmd)
-    # the KEY gate: 157 + 127 token counts (every local m 1..255) x 65 sites, all distinct non-zero 31-bit ids
+    # the KEY gate: 157 + 128 token counts (every local m 1..256) x 65 sites, all distinct non-zero 31-bit ids
     rep = callid.check_profile_call_ids(prof, R23_KEY_SITES, world=4)
     assert (
-        rep.unresolved == [] and rep.keys == (157 + 127) * len(R23_KEY_SITES) and rep.ok
+        rep.unresolved == [] and rep.keys == (157 + 128) * len(R23_KEY_SITES) and rep.ok
     )
     # nh=2 is another build; r23 without an MP128 source leaves m 65..128 native
     monkeypatch.setattr(specs, "SMALL_R23_PROFILE_NH", 2)
@@ -1613,3 +1618,259 @@ def test_a_row_can_select_r23_directly(monkeypatch, jit_root, sp_qkv_catalog):
                 }
             )
         )
+
+
+# ======================================================================= R16 pad-M: bucket selection (match.bucket_for_m / match_padded)
+SMALL_BUCKETS = (
+    1,
+    2,
+    4,
+    8,
+    12,
+    16,
+    32,
+    64,
+    128,
+    256,
+)  # the exact small rows of the shipped profile (r19 / r20 / r22 / r23)
+
+
+def _bucket(mode, m, prof=PROFILE, caps=CAPS, **kw):
+    from aiter.gemm_fusion import bucket_for_m
+
+    return bucket_for_m(
+        specs.sp_qkv_spec(mode), MatchCtx("gfx950", 256, 4, m, caps, **kw), prof
+    )
+
+
+def test_bucket_for_m_small_pads_into_the_smallest_exact_row_within_its_band(
+    sp_qkv_catalog,
+):
+    clear_profile_cache()
+    prof = profmod.load_profile(PROFILE)
+    for mode in specs.MODES:
+        for m in range(1, 257):
+            want = next(b for b in SMALL_BUCKETS if b >= m)
+            assert _bucket(mode, m, prof) == want, (mode, m)
+            if m in SMALL_BUCKETS:
+                assert _bucket(mode, m, prof) == m  # exact-row behaviour is kept
+        # every bucket's plan accepts the real m it was chosen for (the same pure predicate the selection used)
+        from aiter.gemm_fusion import catalog
+
+        sig = specs.sp_qkv_spec(mode).signature()
+        for m in (3, 5, 9, 13, 20, 31, 33, 63, 65, 100, 129, 200, 255):
+            row = prof.lookup(sig, "gfx950", 256, 4, _bucket(mode, m, prof))
+            cls = catalog.get_variant(row.vid).factory
+            assert cls.accepts_launch_m(dict(row.params), row.m, m), (mode, m)
+        # the bands: r19 <= 32, r20 33..64, r22 65..128, r23 129..256
+        for m, src in (
+            (7, "r19"),
+            (32, "r19"),
+            (33, "r20"),
+            (64, "r20"),
+            (65, "r22"),
+            (128, "r22"),
+            (129, "r23"),
+            (256, "r23"),
+        ):
+            row = prof.lookup(sig, "gfx950", 256, 4, _bucket(mode, m, prof))
+            assert dict(row.params)["src"] == src, (mode, m)
+        # above the envelope: native (m 257..895); the shipped large rows are r13 (pad-M from m_pad_min_large = 896): m 896..1023 -> the 1024 bucket, then ceil 256
+        for m in (257, 300, 512, 895, 8193, 20000):
+            assert _bucket(mode, m, prof) is None, (mode, m)
+        for m in (896, 1000, 1023, 1024):
+            assert _bucket(mode, m, prof) == 1024, (mode, m)
+        for m in (1025, 1100, 1280):
+            assert _bucket(mode, m, prof) == 1280, (mode, m)
+        for m in (4096, 8191, 8192):
+            assert _bucket(mode, m, prof) == (m if m != 8191 else 8192), (mode, m)
+
+
+def test_bucket_for_m_is_a_pure_function_of_the_real_m(sp_qkv_catalog):
+    for mode in specs.MODES:
+        for m in (5, 100, 200, 1100, 1280):
+            ref = _bucket(mode, m)
+            assert (
+                _bucket(mode, m, caps=SMALL_CAPS, graph_mode="capture")
+                == ref
+                == _bucket(mode, m, caps=frozenset())
+            )  # capabilities / graph mode never change the choice
+
+
+def test_bucket_for_m_large_pads_to_ceil_256_with_r13_and_honours_m_pad_min_large(
+    jit_root, sp_qkv_catalog
+):
+    doc = json.loads(json.dumps(gen_profile.build_profile()))
+    assert doc["m_pad_min_large"] == specs.M_PAD_MIN_LARGE == 896
+    assert {
+        r["params"]["src"]
+        for r in doc["rows"] + doc["rules"]
+        if r["vid"] == "sp_qkv.large.v1"
+    } == {"r13"}
+    prof = parse_profile(doc)
+    for mode in specs.MODES:
+        for m, want in (
+            (896, 1024),
+            (1000, 1024),
+            (1023, 1024),
+            (1024, 1024),
+            (1025, 1280),
+            (1100, 1280),
+            (1279, 1280),
+            (1280, 1280),
+            (2049, 2304),
+            (4097, 4352),
+            (8191, 8192),
+            (8192, 8192),
+        ):
+            assert _bucket(mode, m, prof) == want, (mode, m)
+        assert _bucket(mode, 8193, prof) is None  # above the largest row
+        for m in (
+            257,
+            300,
+            512,
+            768,
+            895,
+        ):  # below m_pad_min_large: native (native wins there)
+            assert _bucket(mode, m, prof) is None, (mode, m)
+        assert _bucket(mode, 129, prof) == 256  # the small band is unchanged
+    # the profile field moves the threshold: 512 pads m >= 512 into the 1024 bucket, 300 stays native; 1024 pads nothing below 1024
+    prof512 = parse_profile({**doc, "m_pad_min_large": 512})
+    assert (
+        _bucket("dense", 600, prof512) == 1024
+        and _bucket("dense", 300, prof512) is None
+        and _bucket("dense", 511, prof512) is None
+    )
+    prof1024 = parse_profile({**doc, "m_pad_min_large": 1024})
+    assert (
+        _bucket("dense", 1023, prof1024) is None
+        and _bucket("dense", 1025, prof1024) == 1280
+    )
+    # an exact row is never padded away: m == a row is that row even below the threshold
+    assert (
+        _bucket("dense", 1024, parse_profile({**doc, "m_pad_min_large": 4096})) == 1024
+    )
+    # without the field the class default (896) applies
+    nofield = {k: v for k, v in doc.items() if k != "m_pad_min_large"}
+    assert (
+        _bucket("dense", 896, parse_profile(nofield)) == 1024
+        and _bucket("dense", 895, parse_profile(nofield)) is None
+    )
+    for bad in (0, -1, "1024", True, 1.5):
+        with pytest.raises(
+            ProfileError, match="m_pad_min_large must be a positive int"
+        ):
+            parse_profile({**doc, "m_pad_min_large": bad})
+
+
+def test_the_r12_layout_has_no_pad_m_for_the_large_band_only_exact_rows(
+    monkeypatch, jit_root, sp_qkv_catalog
+):
+    monkeypatch.setattr(
+        specs, "LARGE_R13_IN_PROFILE", False
+    )  # the rollback / A/B layout
+    prof = parse_profile(json.loads(json.dumps(gen_profile.build_profile())))
+    for mode in specs.MODES:
+        for m in (896, 1000, 1023, 1025, 1100, 8191):
+            assert _bucket(mode, m, prof) is None, (
+                mode,
+                m,
+            )  # r12 launches its bound M only
+        for m in (1024, 1280, 8192):
+            assert _bucket(mode, m, prof) == m, (mode, m)
+        assert _bucket(mode, 129, prof) == 256  # the small band keeps padding
+
+
+def test_match_padded_returns_the_bucket_plan_and_native_none(
+    monkeypatch, jit_root, sp_qkv_catalog
+):
+    from aiter.gemm_fusion import match_padded
+
+    caps = SMALL_CAPS
+    plan, n, bucket = match_padded(
+        specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 100, caps), PROFILE
+    )
+    assert (n, bucket, plan.src, plan.bucket_m, plan.pad_m, plan.profile_source) == (
+        2,
+        128,
+        "r22",
+        128,
+        True,
+        "row",
+    )
+    plan, n, bucket = match_padded(
+        specs.sp_qkv_spec("indexer"), MatchCtx("gfx950", 256, 4, 200, caps), PROFILE
+    )
+    assert (n, bucket, plan.src, plan.mp, plan.bucket_m) == (2, 256, "r23", 256, 256)
+    plan, n, bucket = match_padded(
+        specs.sp_qkv_spec("reuse"), MatchCtx("gfx950", 256, 4, 16, caps), PROFILE
+    )
+    assert (bucket, plan.bucket_m) == (16, 16)  # m == an exact row
+    assert match_padded(
+        specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 500, caps), PROFILE
+    ) == (
+        None,
+        0,
+        None,
+    )  # m 257..1023: native
+    # the large plan (the shipped r13 layout): built for the BUCKET M, run with the real rows
+    prof = parse_profile(json.loads(json.dumps(gen_profile.build_profile())))
+    plan900, n900, bucket900 = match_padded(
+        specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 900, CAPS), prof
+    )
+    assert (n900, bucket900, plan900.src, plan900.M) == (
+        1,
+        1024,
+        "r13",
+        1024,
+    )  # m_pad_min_large = 896
+    plan, n, bucket = match_padded(
+        specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 1100, CAPS), prof
+    )
+    assert (n, bucket, plan.src, plan.M, plan.pad_m, plan.abi) == (
+        1,
+        1280,
+        "r13",
+        1280,
+        True,
+        4,
+    )
+    # a rank asking with another real m of the same bucket gets the same plan parameters (the choice depends on m alone)
+    plan2, _n2, bucket2 = match_padded(
+        specs.sp_qkv_spec("dense"), MatchCtx("gfx950", 256, 4, 1279, CAPS), prof
+    )
+    assert (
+        bucket2 == 1280
+        and dict(plan2.params) == dict(plan.params)
+        and plan2.owner == plan.owner
+    )
+
+
+def test_the_r12_layout_keeps_the_budget_and_swaps_only_the_large_source(
+    monkeypatch, jit_root, sp_qkv_catalog
+):
+    r13 = json.loads(json.dumps(gen_profile.build_profile()))  # the shipped layout
+    monkeypatch.setattr(specs, "LARGE_R13_IN_PROFILE", False)
+    shipped = json.loads(json.dumps(gen_profile.build_profile()))  # the r12 layout
+    assert (
+        shipped["window_budget"] == r13["window_budget"]
+        and len(shipped["rows"]) == len(r13["rows"])
+        and len(shipped["rules"]) == len(r13["rules"])
+    )
+    for a, b in zip(shipped["rows"] + shipped["rules"], r13["rows"] + r13["rules"]):
+        if a["vid"] == "sp_qkv.large.v1":
+            assert a["params"]["src"] == "r12" and b["params"] == {
+                **a["params"],
+                "src": "r13",
+            }
+        else:
+            assert a == b
+    monkeypatch.setattr(specs, "LARGE_R13_IN_PROFILE", True)
+    units, skipped = _units(parse_profile(r13))
+    large = [u for u in units if u.kind == "sp_qkv.large.v1"]
+    assert (
+        skipped == []
+        and len(units) == 18
+        and {u.meta["src"] for u in large} == {"r13"}
+        and len(large) == 2
+    )

@@ -36,7 +36,7 @@ CSRC = os.path.abspath(
     os.path.join(_HERE, "..", "..", "..", "..", "csrc", "gemm_fusion", "sp_qkv")
 )
 SRCS = ("r17", "r18", "r19", "r20", "r21", "r22", "r23")
-LARGE_SRCS = ("r11", "r12")
+LARGE_SRCS = ("r11", "r12", "r13")
 R18_FAMILY = (
     "r18",
     "r19",
@@ -58,7 +58,19 @@ SMALL_MP = {
     "r22": 128,
     "r23": 256,
 }
-LARGE_ABI = {"r11": 2, "r12": 3}
+# large: 2 = r11 (per-plan poison word), 3 = r12 (LG_COMM_ABI_VERSION 4: per-comm ERR/STEP page, call_id tags), 4 = r13 (LG_COMM_ABI_VERSION 5: + the real m_real per launch, lg_launch_v3)
+LARGE_ABI = {"r11": 2, "r12": 3, "r13": 4}
+# R16 pad-M (scheme 2: "the kernel only gets the valid m; the padded m only selects the kernel / plan"): sources whose LAUNCH accepts any real local m <= the bucket M the
+# binding / plan was made for. small: sm_launch_blk_v3m(..., m, ...) (r19 / r20 / r22 / r23; r21 and the abi 2 sources only launch their bound M); large: lg_launch_v3(..., m_real, ...) (r13, ABI 5)
+SMALL_PAD_M = ("r19", "r20", "r22", "r23")
+LARGE_PAD_M = ("r13",)
+
+
+def src_pad_m(kind: str, src: str) -> bool:
+    """True when a plan of this source can launch with a real local m below its bucket M (R16 pad-M)."""
+    if kind not in ("small", "large"):
+        raise ValueError(kind)
+    return src in (SMALL_PAD_M if kind == "small" else LARGE_PAD_M)
 
 
 def src_abi(kind: str, src: str) -> int:
@@ -731,8 +743,8 @@ def large_defs(params: dict, mode: str) -> list[str]:
     # poll_batch = LG_POLL_BATCH (0|1|2: target + ERR loaded back-to-back; 2 = ERR every 8th iteration), qr_wgs = LG_QR_WGS (1|64: quiet_ready workgroups, the NaN fill folded in). Passed EXPLICITLY for r12 so an A/B is a different build key and a
     # header default change cannot move a build silently; r11 has no such knobs.
     knobs = [k for k in ("tag_early", "poll_batch", "qr_wgs") if k in params]
-    if knobs and params.get("src", LARGE_SRC) != "r12":
-        raise ValueError(f"{knobs} exist only in large/r12 (src=r12)")
+    if knobs and params.get("src", LARGE_SRC) not in ("r12", "r13"):
+        raise ValueError(f"{knobs} exist only in large/r12 and r13 (src=r12 | r13)")
     tag_early, poll_batch = int(params.get("tag_early", 1)), int(
         params.get("poll_batch", 1)
     )
@@ -768,7 +780,7 @@ def large_defs(params: dict, mode: str) -> list[str]:
         "-DLG_NEGCTRL_ISO=0",
         "-DLG_ISO_DELAY_ITERS=0",
     ]
-    if params.get("src", LARGE_SRC) == "r12":
+    if params.get("src", LARGE_SRC) in ("r12", "r13"):
         defs += [
             f"-DLG_TAG_EARLY={tag_early}",
             f"-DLG_POLL_BATCH={poll_batch}",
