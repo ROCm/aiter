@@ -286,8 +286,18 @@ def main():
         "comment leads with review readiness",
         rendered.startswith("# NOT READY FOR HUMAN REVIEW\n"),
     )
-    check("comment reports required CI", "### Required CI" in rendered)
+    check("unanswered comment asks questions", "### Questions to answer" in rendered)
+    check("unanswered comment defers report", "### Required CI" not in rendered)
     check("comment says not ready", "NOT READY FOR HUMAN REVIEW" in rendered)
+
+    report_result = MODULE.Result(head_sha=HEAD, mode="enforce", question="q")
+    report_result.ci = {"Black": "pending"}
+    report = MODULE.render(report_result, {})
+    check("answered comment reports required CI", "### Required CI" in report)
+    check(
+        "answered comment hides question prompt",
+        "### Questions to answer" not in report,
+    )
 
     print("All PR Self-Review tests passed.")
     return 0

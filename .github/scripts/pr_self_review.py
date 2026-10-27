@@ -488,56 +488,71 @@ def render(result: Result, pr: dict[str, Any]) -> str:
         "## PR Self-Review",
         "",
         f"Revision `{result.head_sha[:12]}` · mode `{result.mode}`",
-        "",
-        "Edit the `PR Self-Review` section in the PR description. The check refreshes automatically.",
-        "",
-        "### Questions",
-        "",
-        "1. What behavior does this PR change, and why is the existing behavior insufficient?",
-        "2. What did you validate, and what remains unverified? Include commands, hardware/configuration and results.",
-        f"3. {result.question}",
-        "",
-        "### Author answers",
     ]
     if result.author_issues:
+        lines.extend(
+            [
+                "",
+                "**Waiting for the PR author.** The readiness report will appear after the self-review answers are complete for this revision.",
+                "",
+                "### Questions to answer in the PR description",
+                "",
+                "1. What behavior does this PR change, and why is the existing behavior insufficient?",
+                "2. What did you validate, and what remains unverified? Include commands, hardware/configuration and results.",
+                f"3. {result.question}",
+                "4. For every changed `op_tests/` file, what behavior does it cover and why is it not redundant? Write `None` if no op test changed.",
+                "",
+                "Edit the `PR Self-Review` section in the PR description. Include the current revision SHA; this comment refreshes automatically.",
+                "",
+                "### Missing or invalid answers",
+            ]
+        )
         lines.extend(f"- FAIL — {issue}" for issue in result.author_issues)
     else:
-        lines.append(
-            "- PASS — current-SHA answers are present and structurally specific"
+        lines.extend(
+            [
+                "",
+                "**Author self-review accepted. Readiness report:**",
+                "",
+                "### Author answers",
+                "",
+                "- PASS — current-SHA answers are present and structurally specific",
+            ]
         )
+        lines.extend(["", "### Copilot findings"])
+        if result.copilot_issues:
+            lines.extend(f"- FAIL — {issue}" for issue in result.copilot_issues)
+        else:
+            lines.append(
+                "- PASS — no active Copilot thread lacks an author reply and resolution"
+            )
 
-    lines.extend(["", "### Copilot findings"])
-    if result.copilot_issues:
-        lines.extend(f"- FAIL — {issue}" for issue in result.copilot_issues)
-    else:
+        lines.extend(["", "### Code and op-test hygiene"])
+        if result.hygiene_issues:
+            lines.extend(f"- FAIL — {issue}" for issue in result.hygiene_issues)
+        else:
+            lines.append("- PASS — no committed artifact or conflict marker detected")
+        lines.extend(f"- ADVISORY — {issue}" for issue in result.hygiene_advisories)
+
+        lines.extend(["", "### Required CI"])
+        for name, state in result.ci.items():
+            lines.append(f"- {icon(state)} — {name}: `{state}`")
+        if result.ci_pending:
+            lines.append(
+                "- Required CI is incomplete; this PR is not ready for human review."
+            )
+        if result.ci_failed:
+            lines.append("- Required CI failed; fix it before requesting human review.")
+
+        lines.extend(["", "### Shadow audit signals"])
         lines.append(
-            "- PASS — no active Copilot thread lacks an author reply and resolution"
+            f"- Answer size: `{result.telemetry.get('answer_units', 0)}` units"
         )
-
-    lines.extend(["", "### Code and op-test hygiene"])
-    if result.hygiene_issues:
-        lines.extend(f"- FAIL — {issue}" for issue in result.hygiene_issues)
-    else:
-        lines.append("- PASS — no committed artifact or conflict marker detected")
-    lines.extend(f"- ADVISORY — {issue}" for issue in result.hygiene_advisories)
-
-    lines.extend(["", "### Required CI"])
-    for name, state in result.ci.items():
-        lines.append(f"- {icon(state)} — {name}: `{state}`")
-    if result.ci_pending:
         lines.append(
-            "- Required CI is incomplete; this PR is not ready for human review."
+            f"- Code tokens: `{result.telemetry.get('code_tokens', 0)}` · paths named: `{result.telemetry.get('paths_named', 0)}`"
         )
-    if result.ci_failed:
-        lines.append("- Required CI failed; fix it before requesting human review.")
-
-    lines.extend(["", "### Shadow audit signals"])
-    lines.append(f"- Answer size: `{result.telemetry.get('answer_units', 0)}` units")
-    lines.append(
-        f"- Code tokens: `{result.telemetry.get('code_tokens', 0)}` · paths named: `{result.telemetry.get('paths_named', 0)}`"
-    )
-    if result.telemetry.get("generic_warning"):
-        lines.append(f"- ADVISORY — {result.telemetry['generic_warning']}")
+        if result.telemetry.get("generic_warning"):
+            lines.append(f"- ADVISORY — {result.telemetry['generic_warning']}")
     lines.extend(
         [
             "",
