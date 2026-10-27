@@ -62,15 +62,15 @@ whether production would run it on the payload.
 ``--operation ar_rmsnorm`` runs the fused epilogue instead
 (``FlyQuickAllReduceRMSNorm``: all-reduce + residual add + RMSNorm), and verify
 runs both unless one is named. Its ``test_quick_allreduce_rmsnorm_*`` sweeps
-end in one table each: SQNR against an fp32 oracle, the fused kernel against
-the unfused ``FlyQuickAllReduce`` + add + RMSNorm on the same block,
+end in one table each. ``test_quick_allreduce_rmsnorm_shipped`` runs every
+shipped instance on the shipping engine: the shapes come from the ladder file
+and the payload regime from the fused dispatch policy (the schedule's window).
+A retuned ladder is covered without editing the test. Each shape is graded on 
+SQNR against an fp32 oracle. The transport is guarded by the
 bit-exactness of ``residual_out`` on the lossless wire (native, padded-width
-and pinned-super-tile geometries), padded widths on the INT4 wire (SQNR), mesh
-rank agreement, and ``test_quick_allreduce_host_checks``.
-``test_quick_allreduce_rmsnorm_options`` covers the epilogue options: Gemma's
-``1 + weight`` gain, an in-place ``residual_out``, and on gfx950 the MXFP4
-output of ``allreduce_rmsnorm_mxfp4``, bit for bit against
-``per_1x32_f4_quant_hip``. ``--extended`` adds
+and pinned-super-tile geometries), a run-ahead and graph-replay check, and
+``test_quick_allreduce_host_checks``. ``--extended`` adds padded widths on the INT4
+wire (SQNR),
 ``test_quick_allreduce_rmsnorm_low_latency``, the mesh with the low-latency
 build pinned on every rung, and ``test_quick_allreduce_rmsnorm_wide_rows``, the
 default mesh build at the same 256-thread block where its row spans several
@@ -2073,22 +2073,6 @@ def _fused_batch(key: tuple, cases: list[tuple], **spawn_kwargs) -> dict:
     return _FUSED_BATCH_CACHE[key]
 
 
-_FUSED_CASES = (
-    # (tp, tokens, hidden, label). Widths chosen for what they exercise:
-    # 4096 is an 8-wave block, 7168 a 14-wave one (the only non-power-of-two
-    # width, and DeepSeek's), 5120 exercises rows_per_chunk > 1 at TP4, and
-    # 2048 is the narrowest block the mesh fanout accepts. The last case of
-    # each world size is the co-residency stress: the payload is far larger
-    # than the grid, so every block loops over many tiles.
-    (2, 512, 4096, "tp2-4096"),
-    (2, 256, 2048, "tp2-2048-narrow-block"),
-    (2, 4096, 8192, "tp2-8192-wide-block-many-tiles"),
-    (4, 1024, 5120, "tp4-5120"),
-    (8, 1024, 7168, "tp8-7168"),
-    (8, 512, 8192, "tp8-8192-wide-block"),
-)
-
-
 #: The fused mesh is tested at both super-tile paths it has: ST=1 carries the
 #: own share and chunk in registers across the waits, ST>1 reloads the share
 #: from the input and parks the chunk in ``out`` between its three loops.
@@ -2119,17 +2103,9 @@ _FUSED_PAD_CASES = (
 # (tp, tokens, hidden) of the lossless one-live-rank residual equality.
 _FUSED_EXACT_CASES = ((2, 512, 4096),)
 
-# (tp, tokens, hidden) of the cross-rank bit-identity check, run for each of
-# the mesh and the ring.
-_FUSED_AGREE_CASES = ((4, 1024, 5120),)
-
 #: ``tokens`` is large enough that a pinned ST=8 really runs ST=8 at every
 #: world size and inbox type here; the test checks it.
 _FUSED_MESH_ST_EXACT_CASES = ((2, 4096, 4096), (4, 4096, 4096), (2, 4096, 1536))
-
-#: (tokens, hidden) with more tiles than the persistent grid at every world
-#: size and inbox type, for the ST=8 coverage check.
-_ST_COVERAGE_CASE = (4096, 4096)
 
 # Off the row-sized-block grid: 2560 and 640 are not multiples of 128 threads
 # per block, 12288 is wider than 1024.
@@ -2139,21 +2115,6 @@ _FUSED_REJECTED_HIDDENS = (2560, 640, 12288)
 # differs from the oracle only by rsqrt's hardware approximation.
 FUSED_EXACT_OUT_SQNR_MIN_DB = 60.0
 
-
-#: (tokens, hidden, gemma_norm, inplace) of the epilogue-option sweep, run at
-#: every world size on each schedule, with the MXFP4 output on gfx950 and the
-#: unfused comparison. A single token at 2048 is one partial tile; 37 rows leave
-#: a partial last tile at every width; 6144 is a block that is not a power of
-#: two; the large ones reach the higher super-tile rungs.
-_FUSED_OPTION_CASES = (
-    (1, 2048, False, False),
-    (37, 4096, True, False),
-    (37, 8192, False, True),
-    (37, 6144, True, True),
-    (1536, 8192, False, True),
-    (3072, 4096, True, False),
-    (4096, 8192, True, True),
-)
 
 #: Cases of the pinned low-latency build and of the default mesh build at the
 #: same block (``--extended``), kept at the widths that have one
@@ -2191,20 +2152,13 @@ def _low_latency_hidden_ok(hidden: int, tp: int) -> bool:
 
 
 def _pinned_st_kw(super_tile: int) -> dict:
-    return {"super_tile": super_tile}
-
-
-def _sqnr_batch(tp: int, algorithm: str, cases: list[tuple]) -> dict:
-    """The shipping-engine batch of ``_FUSED_CASES``, with the unfused
-    comparison. The SQNR, rank-agreement, production-geometry and unfused
-    tables all read it."""
-    return _fused_batch(
-        (tp, "sqnr", algorithm), cases, algorithm=algorithm, unfused=True
-    )
+    # The low-latency build is ST=1 only. Where the ladder ships it (a mesh
+    # width tuned to it), an ST>1 pin means the default build at that ST.
+    return {"super_tile": super_tile} | ({"low_latency": False} if super_tile > 1 else {})
 
 
 def _fused_sqnr_fails(rows: list[dict]) -> list[str]:
-    """The SQNR gates of ``test_quick_allreduce_rmsnorm_sqnr``, per rank."""
+    """The SQNR gates of the fused cases, per rank."""
     fails = []
     for row in rows:
         if not row["finite"]:
@@ -2312,73 +2266,91 @@ def _option_summary(rows: list[dict]) -> dict:
     }
 
 
+def _shipped_cases(tp: int, algorithm: str) -> list[tuple]:
+    """``(tokens, hidden, gemma_norm, inplace, case)`` of the shipped walk: the
+    shapes of ``fab.fused_ladder_cases`` with the epilogue options alternated over
+    them. Both are runtime flags rather than instances, so every width sees both
+    without a sweep of their own."""
+    walk = fab.fused_ladder_cases(algorithm, tp, fly_policy.detect_link())
+    return [
+        (c.tokens, c.hidden, bool(i % 2), bool(i // 2 % 2), c)
+        for i, c in enumerate(walk)
+    ]
+
+
+def _run_ahead_case(tp: int, algorithm: str) -> tuple[int, int] | None:
+    """``(tokens, hidden)`` of the fused run-ahead check: the smallest payload the
+    shipped walk runs at hidden 4096 (any width if it has none), so the schedule
+    runs a kernel that production dispatches; None where it is not dispatched."""
+    walk = _shipped_cases(tp, algorithm)
+    pick = [w for w in walk if w[1] == 4096] or walk
+    return (pick[0][0], pick[0][1]) if pick else None
+
+
+def _fused_rung_fails(rows: list[dict], case: "fab.FusedCase") -> list[str]:
+    """The run took the instance of the rung the shape is meant to reach: its
+    low-latency build, and its super-tile where the rung is ST=1, or where the
+    payload is the end of its slice (an ST>1 rung falls back to ST=1 below the
+    tile count that fills the grid)."""
+    rung, fails = case.rung, []
+    want_st = f"_st{rung.super_tile}_"
+    for r in rows:
+        if r["low_latency"] != rung.low_latency:
+            fails.append(
+                f"rank {r['rank']}: low_latency={r['low_latency']}, the rung has "
+                f"{rung.low_latency}"
+            )
+        if (rung.super_tile == 1 or case.top) and want_st not in r["variant"]:
+            fails.append(
+                f"rank {r['rank']}: ran {r['variant']}, not {want_st} of the rung "
+                f"{rung}"
+            )
+    return fails
+
+
 @benchmark()
-def test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm):
-    """The fused epilogue against an fp32 oracle, plus its own self-consistency.
+def test_quick_allreduce_rmsnorm_shipped(tp, algorithm):
+    """Every shipped instance of the fused mesh or ring, on the shipping engine.
 
-    Three gates per rank: ``out`` and ``residual_out`` against the oracle, and
-    ``out`` against a norm recomputed from the kernel's own ``residual_out``.
-    The third is the one that isolates the epilogue -- it is blind to codec
-    noise, so a row-grouping or weight-indexing bug cannot hide behind it.
-
-    Every case sharing (tp, algorithm) rides one spawn; see ``_fused_batch``.
+    The shapes come from the ladder file and the dispatch policy.
     """
-    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
-    rows = _sqnr_batch(tp, algorithm, cases)[(tokens, hidden)]
-    _check(f"{label}/{algorithm}", _fused_sqnr_fails(rows))
-    return _fused_summary(rows)
-
-
-@benchmark()
-def test_quick_allreduce_rmsnorm_matches_unfused(tp, tokens, hidden, label, algorithm):
-    """The fused kernel against ``FlyQuickAllReduce`` + an fp32 add + RMSNorm.
-
-    Tight where both run the same block: the codec noise is the same, so this
-    sees an epilogue error far below what the SQNR floor can. Where the blocks
-    differ (``unfused_out_err`` is None) only the oracle applies.
-    """
-    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
-    rows = _sqnr_batch(tp, algorithm, cases)[(tokens, hidden)]
-    _check(f"{label}/{algorithm}", _fused_unfused_fails(rows))
-    return _option_summary(rows)
-
-
-@benchmark()
-def test_quick_allreduce_rmsnorm_options(
-    tp, tokens, hidden, gemma_norm, inplace, algorithm
-):
-    """The epilogue options: Gemma's ``1 + weight`` gain, ``residual_out``
-    written in place over ``residual_in``, and, on gfx950, the MXFP4 output.
-
-    Each case is graded like ``test_quick_allreduce_rmsnorm_sqnr``, plus rank
-    agreement, the unfused comparison, and the MXFP4 call against the bf16 call
-    followed by ``per_1x32_f4_quant_hip``.
-    """
+    walk = _shipped_cases(tp, algorithm)
+    if not walk:
+        return {"gfx": ARCH, "skipped": True}
     batch = _fused_batch(
-        (tp, "options", algorithm),
-        list(_FUSED_OPTION_CASES),
+        (tp, "shipped", algorithm),
+        [w[:4] for w in walk],
         algorithm=algorithm,
         unfused=True,
         mxfp4=True,
     )
-    rows = batch[(tokens, hidden, gemma_norm, inplace)]
-    fails = (
-        _fused_sqnr_fails(rows)
-        + _fused_disagree_fails(rows)
-        + _fused_unfused_fails(rows)
-        + _fused_mxfp4_fails(rows)
-    )
-    _check(
-        f"tp{tp} {tokens}x{hidden} gemma={gemma_norm} inplace={inplace} {algorithm}",
-        fails,
-    )
-    return _option_summary(rows)
+    fails, rows_all = [], []
+    for *case, c in walk:
+        rows = batch[tuple(case)]
+        rows_all.append(rows[0])
+        fails += [
+            f"{c.hidden}x{c.tokens}: {m}"
+            for m in (
+                _fused_sqnr_fails(rows)
+                + _fused_disagree_fails(rows)
+                + _fused_unfused_fails(rows)
+                + _fused_mxfp4_fails(rows)
+                + _fused_rung_fails(rows, c)
+            )
+        ]
+    _check(f"tp{tp} {algorithm}", fails)
+    return {
+        "gfx": ARCH,
+        "cases": len(walk),
+        "failed": bool(fails),
+        "variants": len({r["variant"] for r in rows_all}),
+    }
 
 
 @benchmark()
 def test_quick_allreduce_rmsnorm_low_latency(tp, tokens, hidden, gemma_norm, inplace):
     """The mesh with the low-latency build pinned on every rung, graded like
-    ``test_quick_allreduce_rmsnorm_options``.
+    ``test_quick_allreduce_rmsnorm_shipped``.
 
     Production takes it only where a ladder says so, and none does on some
     links, so this is the one place it is checked everywhere.
@@ -2518,88 +2490,6 @@ def test_quick_allreduce_rmsnorm_residual_is_bit_exact(tp, tokens, hidden, algor
     return _fused_summary(rows)
 
 
-@benchmark()
-def test_quick_allreduce_rmsnorm_ranks_agree(tp, tokens, hidden, algorithm):
-    """Every rank must compute the same bits, in the mesh and in the ring.
-
-    A rank's own share never goes through the codec on its way out, and in the
-    ring its own chunk is stored from the accumulator at the seam op -- but the
-    value is the dequant of the very packet its peers receive, so the output is
-    still a pure function of what went over the wire. A rank that used its
-    unquantized accumulator instead would disagree, and this is what catches it.
-    """
-    rows = _sqnr_batch(tp, algorithm, [(tokens, hidden)])[(tokens, hidden)]
-    _check(f"tp{tp} {tokens}x{hidden} {algorithm}", _fused_disagree_fails(rows))
-    return _fused_summary(rows)
-
-
-#: Large next to the oracle's mean square (about 0.3 to 0.5 here), so a kernel
-#: that dropped ``eps`` or kept 1e-6 has an rstd that is off by tens of percent.
-#: ``1e-6`` is invisible to every other test in this file.
-_FUSED_LARGE_EPS = 0.5
-
-#: (tokens, hidden) with a partial last tile on a native width: a tile holds up
-#: to ATOMS (8) rows, and none of ``_FUSED_CASES`` leaves a remainder.
-_FUSED_PARTIAL_TILE_CASES = ((1001, 4096), (37, 7168))
-
-
-@benchmark()
-def test_quick_allreduce_rmsnorm_eps(tp, tokens, hidden, label, algorithm):
-    """The fused epilogue with a large ``eps``, against the fp32 oracle."""
-    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
-    batch = _fused_batch(
-        (tp, "eps", algorithm), cases, algorithm=algorithm, eps=_FUSED_LARGE_EPS
-    )
-    rows = batch[(tokens, hidden)]
-    _check(f"{label}/{algorithm}/eps={_FUSED_LARGE_EPS}", _fused_sqnr_fails(rows))
-    return _fused_summary(rows)
-
-
-@benchmark()
-def test_quick_allreduce_rmsnorm_production_geometry(
-    tp, tokens, hidden, label, algorithm
-):
-    """The fused epilogue on the geometry ``FlyDSLAllReduceRMSNorm`` builds.
-
-    Production leaves ``atoms_per_row`` to the engine, which takes it per width
-    from ``FUSED_QR_ROW_ATOMS``; a policy entry other than None is a
-    different build from the widest block at most widths. Skipped (``skipped``
-    in the row) where the policy has no ``atoms_per_row`` for this (arch,
-    link, tp, algorithm, hidden).
-    """
-    apr = fly_policy.fused_qr_row_atoms(
-        world_size=tp,
-        algorithm=algorithm,
-        link=fly_policy.detect_link(),
-        hidden=hidden,
-    )
-    if apr is None:
-        return {"gfx": ARCH, "skipped": True}
-    # The shipping engine is the production one: the SQNR table's batch.
-    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
-    rows = _sqnr_batch(tp, algorithm, cases)[(tokens, hidden)]
-    fails = _fused_sqnr_fails(rows) + _fused_disagree_fails(rows)
-    _check(f"{label}/{algorithm}/atoms_per_row={apr}", fails)
-    return _fused_summary(rows)
-
-
-@benchmark()
-def test_quick_allreduce_rmsnorm_partial_tile(tp, tokens, hidden, algorithm):
-    """A native width whose last tile is partial: the dead rows must not store
-    (the guard rows after each output) and the live ones must be right."""
-    batch = _fused_batch(
-        (tp, "partial", algorithm),
-        list(_FUSED_PARTIAL_TILE_CASES),
-        algorithm=algorithm,
-    )
-    rows = batch[(tokens, hidden)]
-    _check(
-        f"tp{tp} {tokens}x{hidden} {algorithm}",
-        _fused_sqnr_fails(rows) + _fused_disagree_fails(rows),
-    )
-    return _fused_summary(rows)
-
-
 #: Calls in the run-ahead loop, and how often a call's bits are checked.
 _FUSED_RUN_AHEAD_ITERS = 300
 _FUSED_RUN_AHEAD_CHECK = 25
@@ -2704,57 +2594,6 @@ def test_quick_allreduce_rmsnorm_run_ahead(tp, tokens, hidden, algorithm):
     fails = [f"rank {r['rank']}: {m}" for r in ranks for m in r["fails"]]
     _check(f"tp{tp} {tokens}x{hidden} {algorithm}", fails)
     return {"gfx": ARCH, "failed": bool(fails)}
-
-
-@benchmark()
-def test_quick_allreduce_rmsnorm_mesh_pinned_st(tp, tokens, hidden, label, super_tile):
-    """The fused mesh at a pinned super-tile: the SQNR gates, and every rank
-    agreeing.
-
-    A rank's own share never goes through its codec on the reduce-scatter lap,
-    and its own reduced chunk never goes through its inbox on the all-gather
-    lap. That chunk is the dequant of the very packet its peers receive, so the
-    ranks must still agree bit for bit; a rank that used its unquantized
-    accumulator instead would not.
-
-    A pinned ST=8 still falls back to ST=1 on payloads with too few tiles, so
-    only the variant says which path a case took.
-    """
-    cases = [(t, h) for w, t, h, _ in _FUSED_CASES if w == tp]
-    batch = _fused_batch(
-        (tp, "st", "mesh", super_tile),
-        cases,
-        algorithm="mesh",
-        engine_kw=_pinned_st_kw(super_tile),
-    )
-    rows = batch[(tokens, hidden)]
-    fails = _fused_sqnr_fails(rows) + _fused_disagree_fails(rows)
-    _check(f"{label}/mesh/st{super_tile}", fails)
-    return _fused_summary(rows)
-
-
-@benchmark()
-def test_quick_allreduce_rmsnorm_mesh_st8_is_exercised(tp):
-    """Each world size really takes the ST>1 path at a payload that reaches it,
-    so the pinned-ST=8 rows above are not all silently ST=1.
-
-    ST>1 needs more tiles than the persistent grid. On an uncached inbox (xGMI)
-    there is no publish batching to make up for it, so ``_FUSED_CASES`` -- sized
-    for the batched case, with 64 to 128 tiles against a grid of 128 -- do not
-    qualify; the payload here is 33 MiB, a few hundred tiles at every world size.
-    """
-    batch = _fused_batch(
-        (tp, "st-coverage", "mesh", 8),
-        [_ST_COVERAGE_CASE],
-        algorithm="mesh",
-        engine_kw=_pinned_st_kw(8),
-    )
-    variants = sorted({r["variant"] for rows in batch.values() for r in rows})
-    fails = []
-    if not any("_st8_" in v for v in variants):
-        fails.append(f"no ST=8 variant: {variants}")
-    _check(f"tp{tp} mesh ST=8 coverage", fails)
-    return {"gfx": ARCH, "variants": variants}
 
 
 @benchmark()
@@ -3313,36 +3152,13 @@ def _verify(args, tps, algos, dts, link) -> None:
 def _verify_fused(tps, algos, extended: bool) -> None:
     """The fused (all-reduce + residual add + RMSNorm) verify sweeps. The
     mesh-only rows need the mesh among the requested schedules."""
-    fused = [c for c in _FUSED_CASES if c[0] in tps]
     pad = [c for c in _FUSED_PAD_CASES if c[0] in tps]
     mesh = "mesh" in algos
     _summarize(
-        "flydsl quick allreduce rmsnorm sqnr",
+        "flydsl quick allreduce rmsnorm shipped instances",
         [
-            test_quick_allreduce_rmsnorm_sqnr(tp, tokens, hidden, label, algorithm)
-            for (tp, tokens, hidden, label), algorithm in itertools.product(
-                fused, algos
-            )
-        ],
-    )
-    _summarize(
-        "flydsl quick allreduce rmsnorm vs unfused",
-        [
-            test_quick_allreduce_rmsnorm_matches_unfused(
-                tp, tokens, hidden, label, algorithm
-            )
-            for (tp, tokens, hidden, label), algorithm in itertools.product(
-                fused, algos
-            )
-        ],
-    )
-    _summarize(
-        "flydsl quick allreduce rmsnorm epilogue options (gemma, in-place, MXFP4)",
-        [
-            test_quick_allreduce_rmsnorm_options(tp, *case, algorithm)
-            for tp, algorithm, case in itertools.product(
-                sorted({c[0] for c in fused}), algos, _FUSED_OPTION_CASES
-            )
+            test_quick_allreduce_rmsnorm_shipped(tp, algorithm)
+            for tp, algorithm in itertools.product(tps, algos)
         ],
     )
     _summarize(
@@ -3361,6 +3177,7 @@ def _verify_fused(tps, algos, extended: bool) -> None:
                 tp, tokens, hidden, label, algorithm
             )
             for (tp, tokens, hidden, label), algorithm in itertools.product(pad, algos)
+            if extended
         ],
     )
     _summarize(
@@ -3375,66 +3192,11 @@ def _verify_fused(tps, algos, extended: bool) -> None:
         ],
     )
     _summarize(
-        "flydsl quick allreduce rmsnorm rank agreement",
-        [
-            test_quick_allreduce_rmsnorm_ranks_agree(tp, tokens, hidden, algorithm)
-            for (tp, tokens, hidden), algorithm in itertools.product(
-                [c for c in _FUSED_AGREE_CASES if c[0] in tps], algos
-            )
-        ],
-    )
-    _summarize(
-        f"flydsl quick allreduce rmsnorm eps={_FUSED_LARGE_EPS}",
-        [
-            test_quick_allreduce_rmsnorm_eps(tp, tokens, hidden, label, algorithm)
-            for (tp, tokens, hidden, label), algorithm in itertools.product(
-                fused, algos
-            )
-        ],
-    )
-    _summarize(
-        "flydsl quick allreduce rmsnorm production geometry (atoms_per_row)",
-        [
-            test_quick_allreduce_rmsnorm_production_geometry(
-                tp, tokens, hidden, label, algorithm
-            )
-            for (tp, tokens, hidden, label), algorithm in itertools.product(
-                fused, algos
-            )
-        ],
-    )
-    _summarize(
-        "flydsl quick allreduce rmsnorm partial last tile",
-        [
-            test_quick_allreduce_rmsnorm_partial_tile(tp, tokens, hidden, algorithm)
-            for tp, algorithm in itertools.product(sorted({c[0] for c in fused}), algos)
-            for tokens, hidden in _FUSED_PARTIAL_TILE_CASES
-        ],
-    )
-    _summarize(
         "flydsl quick allreduce rmsnorm run-ahead and graph replay",
         [
-            test_quick_allreduce_rmsnorm_run_ahead(tp, 512, 4096, algorithm)
-            for tp, algorithm in itertools.product(sorted({c[0] for c in fused}), algos)
-        ],
-    )
-    _summarize(
-        "flydsl quick allreduce rmsnorm mesh pinned super-tile",
-        [
-            test_quick_allreduce_rmsnorm_mesh_pinned_st(
-                tp, tokens, hidden, label, super_tile
-            )
-            for (tp, tokens, hidden, label), super_tile in itertools.product(
-                fused if mesh else [], _FUSED_MESH_STS
-            )
-        ],
-    )
-    _summarize(
-        "flydsl quick allreduce rmsnorm mesh ST=8 coverage",
-        [
-            test_quick_allreduce_rmsnorm_mesh_st8_is_exercised(tp)
-            for tp in sorted({c[0] for c in fused})
-            if mesh
+            test_quick_allreduce_rmsnorm_run_ahead(tp, *case, algorithm)
+            for tp, algorithm in itertools.product(tps, algos)
+            if (case := _run_ahead_case(tp, algorithm))
         ],
     )
     _summarize(
@@ -3453,7 +3215,7 @@ def _verify_fused(tps, algos, extended: bool) -> None:
         "flydsl quick allreduce rmsnorm mesh pinned low-latency build",
         [
             test_quick_allreduce_rmsnorm_low_latency(tp, *case)
-            for tp in sorted({c[0] for c in fused})
+            for tp in tps
             if extended and mesh
             for case in _FUSED_LOW_LATENCY_CASES
             if _low_latency_hidden_ok(case[1], tp)
@@ -3463,7 +3225,7 @@ def _verify_fused(tps, algos, extended: bool) -> None:
         "flydsl quick allreduce rmsnorm mesh rows wider than a chunk",
         [
             test_quick_allreduce_rmsnorm_wide_rows(tp, *case)
-            for tp in sorted({c[0] for c in fused})
+            for tp in tps
             if extended and mesh
             for case in _FUSED_LOW_LATENCY_CASES
             if _wide_row_case(case[1], tp)
