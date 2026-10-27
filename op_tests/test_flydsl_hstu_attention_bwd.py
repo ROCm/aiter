@@ -25,6 +25,7 @@ fp32 scores, so it is skipped (``err`` empty) for cases where that would not fit
 import argparse
 import csv
 import itertools
+import weakref
 
 import pandas as pd
 import pytest
@@ -40,6 +41,9 @@ from aiter.ops.flydsl.hstu_attention import (
     flydsl_hstu_attention_bwd,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import validate_hstu_attention_bwd
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fused_pp import (
+    validate_hstu_attention_bwd_fused_pp,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 # Reuse the forward test's self-contained input generator and torch-reference
@@ -181,10 +185,10 @@ def assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref):
 # Shared input construction
 #
 # Used by the fused correctness cases, the perf sweep below, and
-# op_tests/op_benchmarks/flydsl/bench_hstu_bwd.py. The pytest suite's own
-# generator (generate_hstu_attn_inputs) applies aggressive length sampling that
-# collapses sequences to ~2 tokens -- great for mask edge-cases, useless when the
-# point is to span several kv tiles.
+# op_tests/op_benchmarks/flydsl/bench_hstu_bwd.py. Unlike the forward suite's
+# generate_hstu_attn_inputs, it draws lengths AND data from one seeded
+# generator, so inputs are reproducible across processes, and it can give
+# every sequence the same target count.
 # --------------------------------------------------------------------------- #
 
 # Realistic jagged length distribution (uniform[1,N]*SPARSITY).
@@ -434,10 +438,9 @@ def test_flydsl_bwd_dense_causal_shapes(
 # the shipping kernels SILENTLY when the gate rejects a shape, which would make
 # these cases pass while testing something else entirely.
 #
-# Inputs come from `build_bwd_inputs` at sparsity 0.95, not the suite's usual
-# generator: the fused kernel's BLOCK_M is 256, and the generator's ~2-token
-# sequences would leave every sequence inside kv tile 0, exercising neither the
-# split-K accumulation nor the kv-chunking.
+# Inputs come from `build_bwd_inputs` at sparsity 0.95, so most sequences span
+# several of the fused kernel's 256-row kv tiles, which is what exercises the
+# split-K accumulation and the kv-chunking.
 # --------------------------------------------------------------------------- #
 
 requires_fused = pytest.mark.skipif(
@@ -461,7 +464,7 @@ def _fused_inputs(b=32, h=4, n=1024, d=64, target_size=300):
 
 
 @requires_fused
-@pytest.mark.parametrize("groups", [1, 2])
+@pytest.mark.parametrize("groups", [1, 2, 3])
 @pytest.mark.parametrize("target_size", [0, 300])
 def test_flydsl_bwd_fused_matches_oracle(target_size, groups):
     """All three fused gradients match the fp32 autograd oracle.
@@ -501,7 +504,7 @@ def test_flydsl_bwd_fused_identity_perm():
 
 @requires_fused
 def test_flydsl_bwd_fused_group_invariance():
-    """G=1 and G=2 must agree EXACTLY, not merely to tolerance.
+    """G=1, G=2 and G=4 must agree EXACTLY, not merely to tolerance.
 
     kv-chunking changes only WHEN partials are summed, never the order within a
     q row, so any difference at all means the tile-group split or the per-pass
@@ -514,15 +517,18 @@ def test_flydsl_bwd_fused_group_invariance():
 
     args = (n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0)
     dq1, dk1, dv1 = flydsl_hstu_attention_bwd(*args, fused=True, fused_groups=1)
-    dq2, dk2, dv2 = flydsl_hstu_attention_bwd(*args, fused=True, fused_groups=2)
-
-    assert torch.equal(
-        dq1, dq2
-    ), f"G=1 vs G=2 differ in {int((dq1 != dq2).sum()):,}/{dq1.numel():,} dq elems"
-    # dV/dK are not split across passes at all, so they are the control: a
-    # difference there means a pass perturbed state it does not own.
-    assert torch.equal(dk1, dk2)
-    assert torch.equal(dv1, dv2)
+    for groups in (2, 4):
+        dq2, dk2, dv2 = flydsl_hstu_attention_bwd(
+            *args, fused=True, fused_groups=groups
+        )
+        assert torch.equal(dq1, dq2), (
+            f"G=1 vs G={groups} differ in "
+            f"{int((dq1 != dq2).sum()):,}/{dq1.numel():,} dq elems"
+        )
+        # dV/dK are not split across passes at all, so they are the control: a
+        # difference there means a pass perturbed state it does not own.
+        assert torch.equal(dk1, dk2)
+        assert torch.equal(dv1, dv2)
 
 
 @requires_fused
@@ -551,14 +557,14 @@ def test_flydsl_bwd_fused_rejects_unsupported_shape():
 @pytest.mark.parametrize("max_attn_len", [64, 256])
 @pytest.mark.parametrize("target_size", [0, 300])
 def test_flydsl_bwd_fused_sliding_window(max_attn_len, target_size):
-    """A windowed mask leaves dQ partials unwritten; the reduction skips them.
+    """A windowed mask sizes each scratch slot to its window; the reduction
+    reads a slot row exactly when the tile serves it.
 
-    The split-K scratch is allocated with `empty`, so a window is only safe
-    because the reduction reads an element exactly when the fused pass served
-    it. Both halves of that predicate are exercised here: without targets the
-    served tiles form a contiguous span below the row, and with targets the
-    clamped rows are served by tiles arbitrarily far below, which is the case
-    that a span-only bound silently drops.
+    The split-K scratch is allocated with `empty`, so a read outside a slot is
+    garbage (or another tile's partial). Both halves of the predicate are
+    exercised here: without targets the served tiles form a contiguous span
+    below the row, and with targets the clamped rows are served by tiles
+    arbitrarily far below, which is the case that a span-only bound drops.
     """
     b, h, n, d = 32, 4, 1024, 64
     alpha = 1.0 / d * 10000
@@ -576,9 +582,8 @@ def test_flydsl_bwd_fused_sliding_window(max_attn_len, target_size):
 def test_flydsl_bwd_fused_rejects_contextual():
     """A contextual prefix must RAISE, not return wrong gradients.
 
-    It was silently accepted once and was wrong by 0.85 relative against a 0.03
-    tolerance -- with a ZEROED scratch, so it is the mask arithmetic rather
-    than uninitialised partials, and unrelated to the window handling above.
+    The prefix needs dQ from kv tiles above the causal diagonal, which the
+    compact scratch does not store, so the fused path cannot be correct here.
     """
     b, h, n, d = 32, 4, 1024, 64
     alpha = 1.0 / d * 10000
@@ -594,6 +599,184 @@ def test_flydsl_bwd_fused_rejects_contextual():
     )
     dq, dk, dv = flydsl_hstu_attention_bwd(*args, fused=None)
     assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+@requires_fused
+def test_flydsl_bwd_fused_custom_stream():
+    """`stream=` waits for the caller's stream and keeps its inputs alive.
+
+    The inputs are produced on the caller's stream behind a long sleep, so a
+    launch stream that did not wait for it would read them before they exist.
+    The caller then drops them while the launch stream is still busy: without
+    `record_stream` the allocator would hand their blocks straight to the
+    caller's next allocations.
+    """
+    b, h, n, d = (_FUSED_CASE[key] for key in ("b", "h", "n", "d"))
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    # Compile outside the stream juggling below.
+    flydsl_hstu_attention_bwd(
+        n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0, fused=True
+    )
+    torch.cuda.synchronize()
+
+    caller, side = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(caller):
+        torch.cuda._sleep(100_000_000)
+        inputs = [t.clone() for t in (q, k, v, dout)]
+        input_ptrs = {t.data_ptr() for t in inputs}
+        dq, dk, dv = flydsl_hstu_attention_bwd(
+            n, alpha, *inputs, seq_offsets, True, num_targets, 0, 0,
+            fused=True, stream=side,
+        )  # fmt: skip
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(100_000_000)
+        del inputs
+        reused = [torch.full_like(t, float("nan")) for t in (q, k, v, dout)]
+        assert not input_ptrs & {t.data_ptr() for t in reused}
+    torch.cuda.synchronize()
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+def _inputs_with_lengths(lengths, h=4, d=64, seed=7):
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    lengths = torch.tensor(lengths, dtype=torch.int64, device=dev)
+    seq_offsets = torch.zeros(len(lengths) + 1, dtype=torch.int64, device=dev)
+    seq_offsets[1:] = torch.cumsum(lengths, 0)
+    total = int(seq_offsets[-1])
+    x = torch.empty((total, h, 4 * d), dtype=torch.bfloat16, device=dev)
+    x.uniform_(-0.01, 0.01, generator=g)
+    q, k, v, dout = (t.contiguous() for t in torch.split(x, [d] * 4, dim=-1))
+    return q, k, v, dout * 100, seq_offsets
+
+
+@requires_fused
+def test_flydsl_bwd_fused_empty_sequences():
+    """Empty sequences -- leading, interior and trailing -- contribute nothing.
+
+    A trailing empty sequence starts one past the last token, so any load
+    anchored at its start is out of bounds.
+    """
+    n, d = 1024, 64
+    alpha = 1.0 / d * 10000
+    lengths = [0, 700, 0, 1, 300, 1024, 0, 0]
+    q, k, v, dout, seq_offsets = _inputs_with_lengths(lengths, d=d)
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, None, 0, 0, dout
+    )
+    dq, dk, dv = flydsl_hstu_attention_bwd(
+        n, alpha, q, k, v, dout, seq_offsets, True, None, 0, 0, fused=True
+    )
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+@requires_fused
+def test_flydsl_bwd_fused_all_empty():
+    """A batch without a single token returns empty gradients, launching nothing."""
+    q, k, v, dout, seq_offsets = _inputs_with_lengths([0, 0, 0, 0])
+    dq, dk, dv = flydsl_hstu_attention_bwd(
+        512, 1.0, q, k, v, dout, seq_offsets, True, None, 0, 0, fused=True
+    )
+    assert dq.shape == q.shape and dk.shape == k.shape and dv.shape == v.shape
+
+
+@requires_fused
+@pytest.mark.parametrize("h", [17, 32])
+def test_flydsl_bwd_fused_many_heads(h):
+    """Past 16 heads a reduction row no longer fits one 1024-thread workgroup
+    pass, so the reduction narrows its row group; 17 also makes it partial-wave.
+    """
+    b, n, d = 4, 1024, 64
+    alpha = 1.0 / d * 10000
+    q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    dq, dk, dv = flydsl_hstu_attention_bwd(
+        n, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0, fused=True
+    )
+    assert_grads_close(dq, dk, dv, dq_ref, dk_ref, dv_ref)
+
+
+def test_bwd_fused_gate_rejects_too_many_heads():
+    """A head count whose reduction row exceeds a workgroup is gated out."""
+    with pytest.raises(ValueError, match="dq_reduce needs"):
+        validate_hstu_attention_bwd_fused_pp(
+            80, 64, 64, True, 0, 0, False, 1.0, "bf16", 1024,
+            block_m=256, block_n=16, num_waves=8, waves_per_eu=2, arch="gfx942",
+        )  # fmt: skip
+
+
+@requires_fused
+def test_bwd_fused_oom_retry_releases_failed_attempt(monkeypatch):
+    """An OOM on the carry steps G up WITHOUT keeping the failed scratch alive."""
+    real_empty, real_zeros = torch.empty, torch.zeros
+    scratch_refs = []
+    zeros_calls = []
+
+    def fake_empty(*args, **kwargs):
+        for ref in scratch_refs:
+            assert ref() is None, "the failed attempt's scratch is still alive"
+        out = real_empty(*args, **kwargs)
+        scratch_refs.append(weakref.ref(out))
+        return out
+
+    def fake_zeros(*args, **kwargs):
+        zeros_calls.append(args)
+        if len(zeros_calls) == 1:
+            raise torch.cuda.OutOfMemoryError("synthetic carry OOM")
+        return real_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 << 40,) * 2)
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(torch, "zeros", fake_zeros)
+    groups, spans, _dq_part, dq_carry = hstu_kernels._plan_fused_groups(
+        [300, 200, 100],
+        block_m=256,
+        num_heads=1,
+        head_dim=64,
+        max_seq_len=768,
+        total_tokens=600,
+        groups="auto",
+        device=torch.device("cuda"),
+    )
+    assert groups == 2 and len(spans) == 2
+    assert dq_carry.shape == (600, 64)
+
+
+@requires_fused
+def test_flydsl_bwd_fused_env_dispatch(monkeypatch):
+    """AITER_HSTU_BWD_FUSED=1 routes autograd's backward to the fused kernel,
+    and a shape outside its gate falls back to the (correct) split pair."""
+    calls = []
+    real = hstu_kernels._make_bwd_fused_runners
+
+    def spy(*args, **kwargs):
+        calls.append(args[2].shape)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(hstu_kernels, "_make_bwd_fused_runners", spy)
+    monkeypatch.setenv("AITER_HSTU_BWD_FUSED", "1")
+
+    for d, expect_fused in ((64, True), (128, False)):
+        b, h, n = 8, 2, 512
+        alpha = 1.0 / d * 10000
+        q, k, v, dout, seq_offsets, num_targets = _fused_inputs(b, h, n, d)
+        dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+            n, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+        )
+        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v)]
+        out = flydsl_hstu_attention(
+            n, alpha, *leaves, seq_offsets, True, num_targets, 0, 0
+        )
+        calls.clear()
+        out.backward(dout)
+        assert bool(calls) == expect_fused, f"head_dim={d}: fused calls {calls}"
+        assert_grads_close(*(t.grad for t in leaves), dq_ref, dk_ref, dv_ref)
 
 
 def test_bwd_tuned_csv_accepts_fused_discriminator(tmp_path):

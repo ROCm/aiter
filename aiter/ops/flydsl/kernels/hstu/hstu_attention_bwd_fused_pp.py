@@ -3,26 +3,15 @@
 
 """Fused dV/dK/dQ HSTU backward kernel (gfx942, ping-pong, split-K dQ).
 
-Built from `hstu_attention_bwd_dvdk_pp.py`. On top of the dV/dK ping-pong
-schedule it also produces dQ = dS.K as a PARTIAL over this workgroup's KV
-range, written to an HBM scratch that `hstu_attention_bwd_dq_reduce.py` sums.
-Split-K and not atomics because fp atomics are a 0.40 TB/s wall while plain
-stores run at 3.56 TB/s -- 8.8x, measured.
+One KV-owned pass computes dV and dK, and also dQ = dS.K as a PARTIAL over the
+workgroup's KV range. The partials go to a compact fp32 HBM scratch that the
+reduction kernel at the bottom of this module sums. Split-K rather than
+atomics because fp32 atomics are bandwidth-bound far below plain stores on
+gfx942.
 
-Geometry is (256, 16, 8), NOT the twin's 384. 384 spills 21 registers --
-KV_OWNED_SUBTILES=3 costs 74 VGPR over KV=2 and the dQ state adds ~46 more --
-and measures 503.7 ms against 461.0 at 256, even though it removes the
-geometry penalty entirely (nodq 220.4 vs dvdk_pp's 219.2) and cuts the
-reduction pass by a third (36.9 vs 52.0 ms). The spills cost +58 ms on the
-kernel, more than both gains together. BLOCK_M quantises to 128 (8 waves x
-MFMA_M 16), so 256 and 384 are the only candidates; there is nothing between.
-
-(256, 16, 8) is only trustworthy as of e2a81264d, which fixed a prologue
-publish-ordering bug that made every geometry except 384 nondeterministic.
-
-Everything below this line is inherited from the twin.
-
-Ping-pong-pipelined variant of the KV-owned HSTU backward dV/dK kernel.
+The tile is (256, 16, 8). BLOCK_M quantises to 128 (8 waves x MFMA_M 16), and
+384 -- the only other candidate -- spills: the dQ state on top of three owned
+KV subtiles exceeds the register budget.
 
 Same mathematics as `hstu_attention_bwd.py` -- see that module's docstring --
 but scheduled so the two waves resident on each SIMD are held in *opposite*
@@ -34,12 +23,8 @@ phases:
 
 One wave group is in M while the other is in V, so the matrix core and the VALU
 pipe are both busy continuously.  Without this, the two resident waves sit in
-*lockstep* on the shared `gpu.barrier()`: they idle together and they burst MFMA
-together, contending for the one matrix core (measured: 27.9% matrix-core busy,
-50.7% of all stall in `s_waitcnt`).
-
-The schedule is ported from the gfx950 fp8 FMHA ping-pong kernel.  Only the
-schedule -- no CDNA4 instruction is used here.
+*lockstep* on a shared barrier: they idle together and they burst MFMA
+together, contending for the one matrix core.
 
 Three structural points, each load-bearing:
 
@@ -53,13 +38,13 @@ Three structural points, each load-bearing:
   barrier, but the partner's consuming M phase overlaps that very V phase -- an
   unsynchronised cross-group RAW race.  Building in M puts one barrier between
   the write and the earliest partner read.
-* **Row-major Q/dO are 3-deep and fired two tiles ahead.**  At depth 2 the load
-  gets only the tail of one MFMA phase to return, which reinstates the very
-  `vmcnt` stall this kernel exists to remove.
+* **Row-major Q/dO are double-buffered and fired one tile ahead,** early in
+  phase M, so the load has most of an MFMA burst to return before the mid-trip
+  barrier needs it.
 
 `validate_hstu_attention_bwd_fused_pp` hard-gates the supported shape: this
-kernel is specialized for gfx942 / bf16 / head_dim == hidden_dim == 64 and the
-`(256, 16, 8)` tile, and raises for anything else.
+kernel is specialized for gfx942 / bf16 / head_dim == hidden_dim == 64, the
+`(256, 16, 8)` tile and no contextual prefix, and raises for anything else.
 
 The second half of this module is the host side of the same contract: the
 split-K reduction kernel that sums the dQ partials, and the scratch-offset and
@@ -74,7 +59,6 @@ import math as host_math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -116,55 +100,27 @@ def phase_barrier():
 
 # NOTE: these are read inside the traced kernel body. FlyDSL's disk cache keys
 # on the kernel function's source text and its closure values -- a module global
-# is NEITHER, so editing one here does NOT invalidate a cached binary and the
-# next run silently measures the old schedule. When tuning them, either
-# `rm -rf ~/.flydsl/cache` or set FLYDSL_RUNTIME_ENABLE_CACHE=0.
+# is NEITHER, so editing one here does NOT invalidate a cached binary. When
+# tuning them, either `rm -rf ~/.flydsl/cache` or set
+# FLYDSL_RUNTIME_ENABLE_CACHE=0.
 #
 # Depth of the rolling LDS operand window, in operand groups.  The MFMA at group
 # `g` consumes the pack read at `g - PREFETCH_W`, so each read has
-# PREFETCH_W * KV_OWNED_SUBTILES MFMAs of cover.  The fp8 reference uses depth 2
-# against a 32-cycle `32x32x64`; `16x16x16_bf16` is only ~16 cycles, so the
-# depth has to be larger here to hide the same ~130-cycle ds_read.
-#
-# But NOT as large as it will go. At W = NUM_OPERAND_GROUPS - 1 the priming
-# loop issues every read but one before the burst, and they queue on the LDS
-# pipe -- 8 cycles of bank time each, times eight waves sharing the unit, with
-# no MFMA between them to absorb it. Lower W scatters them INTO the burst.
-# Swept on the benchmark shape (fused kernel, median of 3):
-#
-#     W = 15   360.2 ms        W = 6    351.4 ms   <- best
-#     W = 11   354.0 ms        W = 4    353.1 ms
-#     W =  8   352.0 ms
-#
-# The curve is flat between 6 and 8 and turns back up by 4, where the cover
-# per read gets too short. An earlier sweep of this constant looked only at
-# VGPR (flat at every value) and concluded it was not a lever; it is one for
-# TIME.
+# PREFETCH_W * KV_OWNED_SUBTILES MFMAs of cover against the ~130-cycle
+# ds_read. Deeper is not better: near NUM_OPERAND_GROUPS the priming loop issues
+# almost every read before the burst and they queue on the shared LDS pipe with
+# no MFMA to absorb them. Latency is flat for depths 6-8 and rises on either
+# side.
 PREFETCH_W = 6
 
 # Compile hints for this kernel's binary, applied through `flyc.compile[...]`
 # so FlyDSL scopes the LLVM cl::opt around this pipeline run only.
 #
-# SLP vectorization is what forms the `<2 x float>` ops the backend lowers to
+# SLP vectorization forms the `<2 x float>` ops the backend lowers to
 # `v_pk_*_f32`. A packed op is a JOIN -- it cannot issue until BOTH halves'
 # producers retire -- and this kernel's gate is latency-bound, so packing halves
-# the independent chains the scheduler can interleave.
-#
-# Measured at B=1024/H=4/N=16384/d=64 targets=300, fused kernel only, with the
-# split arm resident so the memory pressure matches the benchmark:
-#
-#     SLP on (default)        375.7 / 378.3 ms
-#     slp-max-reg-size=32     378.2 ms        (capping width does not help)
-#     vectorize-slp=false     342.9 / 340.3 / 342.8 ms   <- this
-#
-# 340 ms also matches what hand-pinned inline asm achieved (339.3) before the
-# gate was rewritten in plain arithmetic, so the knob buys back the whole
-# difference without any instruction pinning.
-#
-# NOTE: this must be measured by LATENCY, not by reading the dumped ISA. The
-# pinned and plain builds have identical opcode histograms -- under this
-# kernel's `unsafe-fp-math` the backend already selects `v_mul_legacy_f32` for
-# a plain `fmul` -- and differ only in scheduling.
+# the independent chains the scheduler can interleave (about 10% kernel time).
+# Judge changes here by latency: the opcode mix barely moves, only the schedule.
 _FUSED_COMPILE_HINTS = {"llvm_options": {"vectorize-slp": False}}
 # Operand groups per MFMA phase: 4 GEMMs x (head_dim / MFMA_M) chunks.
 NUM_OPERAND_GROUPS = 16
@@ -231,14 +187,13 @@ def validate_hstu_attention_bwd_fused_pp(
         raise ValueError(
             "hstu bwd fused requires (block_m, block_n, num_waves) = "
             f"(256, 16, 8), got ({block_m}, {block_n}, {num_waves}). 8 waves give "
-            "2 per SIMD inside one barrier domain. BLOCK_M quantises to 128 "
-            "(8 waves x MFMA_M 16), so 256 and 384 are the only candidates. "
-            "384 is the dV/dK twin's shape and removes this kernel's 15 ms "
-            "geometry penalty, but it spills 21 registers and measures "
-            "503.7 ms against 461.0 at 256 (214 VGPR, 0 spills)."
+            "2 per SIMD inside one barrier domain, and 384 rows spill."
         )
     if num_heads <= 0:
         raise ValueError(f"num_heads must be positive, got {num_heads}")
+    validate_hstu_attention_bwd_dq_reduce(
+        num_heads, head_dim, block_m, dtype_str, arch=arch
+    )
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
     if waves_per_eu < 0:
@@ -246,10 +201,8 @@ def validate_hstu_attention_bwd_fused_pp(
     if not host_math.isfinite(alpha):
         raise ValueError(f"alpha must be finite, got {alpha}")
     if contextual_seq_len != 0:
-        # Measured wrong, not merely untested: at B=32/H=4/N=1024 with
-        # contextual_seq_len=64 the fused dQ misses the fp32 oracle by 0.85
-        # relative against a 0.03 tolerance, with a ZEROED scratch so it is the
-        # mask arithmetic, not uninitialised partials.
+        # The contextual mask also needs dQ from rows above the causal
+        # diagonal, which the compact scratch (and its reducer) never store.
         raise ValueError(
             "hstu bwd fused does not support a contextual prefix, got "
             f"contextual_seq_len={contextual_seq_len}. The dvdk + dq pair does."
@@ -308,7 +261,6 @@ def build_hstu_attention_bwd_fused_pp(
     elem_dtype = _dtype_to_elem_type(dtype_str)
     ELEM_BYTES = DMA_BYTES // DMA_ELEMS
     has_window = max_attn_len > 0
-    has_contextual = contextual_seq_len > 0
 
     # head_dim == hidden_dim == 64 (gated above), so every per-dimension count
     # collapses to one value and the Q and dO tiles are structurally identical.
@@ -349,30 +301,17 @@ def build_hstu_attention_bwd_fused_pp(
     # PER-WAVE PRIVATE -- a wave transposes only its own kv rows -- so it
     # needs no barrier, only `s_waitcnt lgkmcnt`, and it does not rotate, so
     # it does not force UNROLL to lcm(...).
-    # dQ reduction buffer: one BLOCK_N x head_dim fp32 tile per UNROLL slot.
-    # The row stride is padded by 4 dwords. Unpadded, the four quarter-waves of
-    # a `ds_add_f32` sit 4*head_dim = 256 dwords apart, which is 0 mod 64 banks
-    # -- a 4-way conflict on every one of the 16 adds per lane. +4 shifts each
-    # quarter by 4 banks so all 64 lanes land on distinct ones.
+    # dQ staging: one BLOCK_N x head_dim fp32 tile per wave. The row stride is
+    # padded by 4 dwords so the four quarter-waves of a b128 access land 4
+    # banks apart instead of 0 mod 64.
     DQ_PAD = head_dim + 4
-    # One PRIVATE slot per wave, written with ds_write. `ds_add_f32` into a
-    # shared slot is 55x a ds_write_b32 on gfx942 -- 737 vs 13 ns per op per
-    # wave, measured in tmp/hstu_repro/bench_lds_fadd.py, and unchanged by
-    # giving the waves private addresses or by the bank padding, so it is the
-    # instruction and not contention. It cost 1520 ms of a 1915 ms kernel.
+    # One PRIVATE slot per wave, written with ds_write and summed by the
+    # flush. `ds_add_f32` into a shared slot is roughly 50x slower per op on
+    # gfx942, independent of contention.
     DQW_ELEMS = NUM_WAVES * BLOCK_N * DQ_PAD
-    # Group-exchange buffer. Past the tile sit BLOCK_N sink rows for g0's
-    # discarded write and one permanently-zero row for g1's read, which is how
-    # the exchange stays branch-free.
-    #
-    # A SINGLE sink row would be a 4-way bank conflict for half the workgroup:
-    # the row index is then constant across lanes, so all four quarter-waves
-    # address the same 64 dwords (measured 64 of 256 distinct). One sink row
-    # per flush row restores g1's spread -- consecutive rows are DQ_PAD apart,
-    # which is 4 banks.
-    # One row past the tile: a permanently-zero source for g1's read. The 16
-    # SINK rows are gone -- g0 no longer writes a dead row, it simply does not
-    # write, now that the two tails are a uniform `if is_g0:` branch.
+    # Group-exchange buffer: g1 publishes its group sum here for g0. One row
+    # past the tile is permanently zero, the source of g1's own read, so the
+    # read stays unconditional.
     DQG_ZERO = BLOCK_N
     DQG_ROWS = BLOCK_N + 1
     DQG_ELEMS = DQG_ROWS * DQ_PAD
@@ -436,8 +375,7 @@ def build_hstu_attention_bwd_fused_pp(
     #
     # With one fused array and a runtime slot offset the accesses are only
     # provably inside "the q array", so every read may-alias the in-flight DMA
-    # and the backend serializes them. Measured: that cost ~8% here, on top of
-    # the separate `inttoptr` provenance bug (see the LDS views below).
+    # and the backend serializes them.
     @fx.struct
     class SharedStorage:
         q0: fx.Array[elem_dtype, RM_TILE_ELEMS, 16]
@@ -462,7 +400,7 @@ def build_hstu_attention_bwd_fused_pp(
         perm: fx.Tensor,
         out_dv: fx.Tensor,
         out_dk: fx.Tensor,
-        # ---- split-K dQ. Plumbed now, consumed once the dQ GEMM lands. -----
+        # ---- split-K dQ ----------------------------------------------------
         # `dq_part` is the fp32 partial scratch; `part_off` holds the
         # per-(batch, kv_tile) base offsets into it for THIS pass.
         # `kv_tile_lo/hi` bound the pass's kv tiles for kv-chunking.
@@ -489,7 +427,8 @@ def build_hstu_attention_bwd_fused_pp(
 
         # The group predicate must be provably uniform or the backend will not
         # select `buffer_load_lds` on a selected descriptor. readfirstlane makes
-        # the divergence analysis treat it as scalar.
+        # the divergence analysis treat it as scalar; FlyDSL has no stable
+        # uniformity hint, so this uses the `rocdl` wrapper directly.
         tid_u = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, tid))
         is_g0 = tid_u < fx.Int32(GRP_THREADS)
         grp_tid = tid - is_g0.select(fx.Int32(0), fx.Int32(GRP_THREADS))
@@ -525,16 +464,11 @@ def build_hstu_attention_bwd_fused_pp(
         if has_targets:
             num_target = fx.Int32(num_targets[batch_idx])
         max_id = seq_len
-        if has_contextual:
-            max_id = seq_len - fx.Int32(contextual_seq_len) + fx.Int32(1)
         if has_targets:
             max_id = (num_target > fx.Int32(0)).select(max_id - num_target, max_id)
 
         def to_id(x):
             xid = x
-            if has_contextual:
-                xid = xid - fx.Int32(contextual_seq_len - 1)
-                xid = (xid < fx.Int32(0)).select(fx.Int32(0), xid)
             if has_targets:
                 xid = (xid > max_id).select(max_id, xid)
             return xid
@@ -562,8 +496,7 @@ def build_hstu_attention_bwd_fused_pp(
         # address with `fx.inttoptr` or a `select` between two pointers: both
         # break the provenance walk, after which SIInsertWaitcnts cannot prove a
         # `ds_read` misses the in-flight `buffer_load_lds` and plants a
-        # `vmcnt(0)` in front of every operand read (measured: 19.8 M stall
-        # cycles, matrix-core duty down to 22%).
+        # `vmcnt(0)` in front of every operand read.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         rm_layout = fx.make_layout(
             (BLOCK_N, STRIDE // MFMA_LANE_K, MFMA_LANE_K),
@@ -590,8 +523,7 @@ def build_hstu_attention_bwd_fused_pp(
         # 4-D, not 3-D: a lane's DQ_PER_LANE-wide run must be one `None` slice
         # so the flush reads it as a single `ds_read_b128`. Indexed per element
         # it comes out as DQ_PER_LANE/2 `ds_read2_b32` instead -- twice the LDS
-        # instructions for the same bytes, which the trace put at 9.6 M cycles
-        # (10.3% of all stall) once the scalar adds stopped it fusing wider.
+        # instructions for the same bytes.
         dqw = lds.dqw.view(
             fx.make_layout(
                 (NUM_WAVES, BLOCK_N, head_dim // DQ_PER_LANE, DQ_PER_LANE),
@@ -619,33 +551,26 @@ def build_hstu_attention_bwd_fused_pp(
         )
         kv_rows = []
         kv_in_bounds = []
+        # Out-of-bounds lanes load global row 0 and discard it. `seq_start`
+        # would not do: for a trailing empty sequence it is one past the end.
+        kv_safe_rows = []
         for og in range_constexpr(KV_OWNED_SUBTILES):
             local = kv_wave_base + fx.Int32(og * MFMA_M) + lane_mod_16
             kv_rows.append(local)
             kv_in_bounds.append(local < seq_len)
+            kv_safe_rows.append(
+                fx.Int64(kv_in_bounds[og].select(seq_start + local, fx.Int32(0)))
+            )
 
         k_packs = []
         for ks in range_constexpr(K_STEPS):
             k_col = fx.Int32(ks * MFMA_QK_K) + lane_div_16 * fx.Int32(MFMA_QK_LANE_K)
             per_og = []
             for og in range_constexpr(KV_OWNED_SUBTILES):
-                safe = kv_in_bounds[og].select(seq_start + kv_rows[og], seq_start)
                 raw = k_load(
-                    fx.Int64(safe), head_idx, k_col // fx.Int32(MFMA_QK_LANE_K)
+                    kv_safe_rows[og], head_idx, k_col // fx.Int32(MFMA_QK_LANE_K)
                 ).ir_value()
-                # Fold `alpha` into K once, here, so GEMM0 yields the SCALED
-                # score and the gate's `sc = s * alpha` disappears -- 12
-                # element-multiplies per gate phase, 6 v_pk_mul. Only GEMM0
-                # reads k_packs, and dK's chain rule is unchanged: sc =
-                # Q.(aK)^T still gives d(sc)/dK = a.Q, which the epilogue's
-                # `c_dk_scale = alpha/N` already applies.
-                #
-                # The cost is that K is bf16, so bf16(alpha*K) rounds a second
-                # time -- an error the fp32 reference does not have.
-                scaled = (Vec(raw).to(fx.Float32) * fx.Float32(alpha)).to(elem_dtype)
-                per_og.append(
-                    kv_in_bounds[og].select(scaled.ir_value(), c_zero_qk_pack)
-                )
+                per_og.append(kv_in_bounds[og].select(raw, c_zero_qk_pack))
             k_packs.append(per_og)
 
         v_packs = []
@@ -653,19 +578,21 @@ def build_hstu_attention_bwd_fused_pp(
             v_col = fx.Int32(ks * MFMA_DA_K) + lane_div_16 * fx.Int32(MFMA_DA_LANE_K)
             per_og = []
             for og in range_constexpr(KV_OWNED_SUBTILES):
-                safe = kv_in_bounds[og].select(seq_start + kv_rows[og], seq_start)
                 raw = v_load(
-                    fx.Int64(safe), head_idx, v_col // fx.Int32(MFMA_DA_LANE_K)
+                    kv_safe_rows[og], head_idx, v_col // fx.Int32(MFMA_DA_LANE_K)
                 ).ir_value()
                 per_og.append(kv_in_bounds[og].select(raw, c_zero_da_pack))
             v_packs.append(per_og)
 
-        c_inv_n = fx.Float32(1.0 / max_seq_len)
-        c_neg_log2e = fx.Float32(-_LOG2E)
+        # K stays unscaled, so GEMM0 yields the raw score `s` and the gate works
+        # on `z = alpha*s` symbolically (see gate_phase). P and dS are then
+        # missing a factor of alpha and 1/N respectively; all three outputs
+        # recover it in the one multiply their stores already do.
+        c_out_scale = fx.Float32(alpha / max_seq_len)
+        c_neg_alpha_log2e = fx.Float32(-alpha * _LOG2E)
+        c_alpha = fx.Float32(alpha)
+        c_neg_alpha = fx.Float32(-alpha)
         c_zero_f = fx.Float32(0.0)
-        # dS no longer carries 1/N (see gate_phase), so the dK store applies
-        # alpha/N in the one multiply it was already doing.
-        c_dk_scale = fx.Float32(alpha / max_seq_len)
         c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
         c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
@@ -676,7 +603,7 @@ def build_hstu_attention_bwd_fused_pp(
         active = kv_start_row < seq_len
 
         q_upper = seq_len
-        if has_window and not has_contextual:
+        if has_window:
             win_upper = kv_end_row + fx.Int32(max_attn_len)
             if has_targets:
                 win_upper = (win_upper <= max_id).select(win_upper, seq_len)
@@ -684,8 +611,6 @@ def build_hstu_attention_bwd_fused_pp(
         q_upper = active.select(q_upper, fx.Int32(0))
         n_q_tiles = (q_upper + fx.Int32(BLOCK_N - 1)) // fx.Int32(BLOCK_N)
         q_tile_start = kv_start_row // fx.Int32(BLOCK_N)
-        if has_contextual:
-            q_tile_start = fx.Int32(0)
 
         # ---- staging duty: global -> LDS ----------------------------------
         # g0 stages Q, g1 stages dO. The two duties are built as separate
@@ -802,19 +727,19 @@ def build_hstu_attention_bwd_fused_pp(
 
             With the buffer descriptor sized to the sequence, a `buffer_load
             ... lds` whose row is past the end does not write LDS at all -- it
-            does NOT deposit zero (measured: dropping the gate's
-            `q_raw < seq_len` on that assumption gave 13-35% mismatch). So the
+            does NOT deposit zero, which is why the gate keeps its
+            `q_raw < seq_len` term. So the
             tail rows of the last tile are simply left as they were. That is
             fine from the second tile on, where they hold an earlier tile's
             finite data and the gate masks them -- but on the first tile they
             would be whatever the previous dispatch left, and a NaN there meets
             a masked zero in GEMM1/GEMM3 and poisons dV/dK for the whole sweep.
-            Same hazard, and same fix, as `transpose_zero` above.
+            Same hazard, and same fix, as `transpose_zero` below.
 
             Each group zeroes ONLY the tensor it DMAs. Zeroing both would be
             a cross-group race: `lgkmcnt` is per-wave, so g1's `ds_write` to
             the Q tile can retire after g0's `buffer_load ... lds` has filled
-            it, erasing the tile. Measured as 0.7-1.4% mismatch.
+            it, erasing the tile.
             """
             z = Vec(c_zero_pack)
             row = grp_tid // fx.Int32(STRIDE // MFMA_LANE_K)
@@ -876,27 +801,10 @@ def build_hstu_attention_bwd_fused_pp(
             )
 
         # ---- gate arithmetic ------------------------------------------------
-        # Plain operators, deliberately. These six were inline `v_mul_f32` /
-        # `v_add_f32` / `v_fma_f32` asm blocks plus `llvm.amdgcn.fmul.legacy`
-        # and `llvm.amdgcn.rcp.f32`, pinned to keep the gate off the packed
-        # datapath -- the gate is latency-bound and a packed op is a JOIN, so
-        # it cannot issue until BOTH halves' producers retire.
-        #
-        # An ATT capture of the executed code object says that rationale no
-        # longer holds for THIS kernel. Pinned and plain compile to the same
-        # opcode mix -- 48 `v_mul_legacy_f32`, 16 `v_pk_mul_f32`, 16
-        # `v_fma_f32`, 114 `s_nop` in both -- because under the kernel's
-        # `unsafe-fp-math` attribute the backend already selects legacy
-        # multiply for a plain `fmul`. The code objects differ only in
-        # scheduling and register assignment.
-        #
-        # That residual is worth 0.85% over the ten benchmark shapes (+2.2% at
-        # the worst, B=1024/H=4 causal), measured. Traded away on purpose: six
-        # escapes into MLIR internals -- including a function-local
-        # `from flydsl._mlir import ir` and an `s_nop` hand-placed because the
-        # hazard recognizer cannot see into `INLINEASM` -- are a standing
-        # maintenance cost against a rationale the hardware no longer agrees
-        # with. Kept as named seams so re-pinning one is a local change.
+        # Plain operators, kept as named seams so pinning one to a specific
+        # instruction is a local change. Under the kernel's `unsafe-fp-math`
+        # attribute the backend already selects legacy multiply and `v_rcp_f32`,
+        # and `_FUSED_COMPILE_HINTS` keeps the chain off the packed datapath.
         def fmul_scalar(a, b):
             return fx.Float32(a) * fx.Float32(b)
 
@@ -907,13 +815,9 @@ def build_hstu_attention_bwd_fused_pp(
         def addone_scalar(x):
             """`1 + x`, where `x` is always a `v_exp_f32` result.
 
-            The pinned form needed an explicit `s_nop 0` here: a VALU trans op
-            requires one software wait state before a consumer reads it, and
-            the compiler inserts that automatically EXCEPT into inline asm,
-            which its hazard recognizer treats as opaque. Reading the stale
-            register showed up as dv/dk max|err|/peak 0.33 on ~0.3% of elements
-            under the causal mask while the hstu mask still passed. Plain
-            arithmetic hands that duty back to the compiler.
+            A VALU trans result needs one wait state before its consumer. The
+            hazard recognizer inserts it for plain arithmetic but not into
+            inline asm, so pinning this one would need an explicit `s_nop 0`.
             """
             return fx.Float32(1.0) + fx.Float32(x)
 
@@ -937,23 +841,14 @@ def build_hstu_attention_bwd_fused_pp(
             high halves of the two f32s, i.e. bytes 7,6 and 3,2. Bit-for-bit the
             same result as the shift/mask path -- gfx942 has no
             `v_cvt_pk_bf16_f32` (CDNA4 only), so this is the cheapest form.
+            The stable API has no byte-permute, hence the `rocdl` wrapper.
             """
             sel = fx.Int32(0x07060302)
             words = []
             for i in range_constexpr(MFMA_ELEMS_PER_LANE // 2):
                 lo = fx.Float32(vals[2 * i]).bitcast(fx.Int32)
                 hi = fx.Float32(vals[2 * i + 1]).bitcast(fx.Int32)
-                words.append(
-                    fx.Int32(
-                        llvm.call_intrinsic(
-                            fx.Int32.ir_type,
-                            "llvm.amdgcn.perm",
-                            [hi.ir_value(), lo.ir_value(), sel.ir_value()],
-                            [],
-                            [],
-                        )
-                    )
-                )
+                words.append(fx.Int32(rocdl.perm_b32(hi, lo, sel)))
             return Vec.from_elements(words, fx.Int32).bitcast(elem_dtype).ir_value()
 
         # Identity in B-operand layout: lane l element i is 1.0 exactly when
@@ -981,13 +876,9 @@ def build_hstu_attention_bwd_fused_pp(
             is exact, and the pack back to bf16 is exact.
 
             This replaces an LDS round trip -- `ds_write`, fence, four strided
-            `ds_read_u16`, fence, per subtile. Done inside one phase that cost
-            16.4 M cycles, 16.7% of all stall in the dispatch-150 trace, since
-            a wave cannot see its own LDS write without draining `lgkmcnt`.
-            Splitting the write into the previous gate phase removed those
-            waits and was still SLOWER (+28 ms): `lgkmcnt` is in-order, so
-            reads issued before the operand window join the first MFMA's wait.
-            The matrix core sidesteps the counter altogether.
+            `ds_read_u16`, fence, per subtile -- whose `lgkmcnt` drains are
+            expensive wherever they are placed, because the counter retires in
+            order. The matrix core sidesteps the counter altogether.
             """
             _c = mfma_acc(frag, c_ident, c_zero_v4f32)
             return pack_bf16_perm(
@@ -1004,14 +895,10 @@ def build_hstu_attention_bwd_fused_pp(
                 # is a VALU op whose only consumer is the comparison, and the
                 # comparison can take both operands directly. Materialise
                 # `dist` only when the window actually needs its value.
-                # Measured: 12 x `v_sub_u32` per gate phase, 48 of 1045 cy.
                 keep = (q_raw == kv_rows[og]) | (kv_owned_ids[og] < q_id)
                 if has_window:
                     dist = q_id - kv_owned_ids[og]
                     keep = keep & (dist <= fx.Int32(max_attn_len))
-                if has_contextual:
-                    ctx = (q_id == fx.Int32(0)) & (kv_owned_ids[og] < max_id)
-                    keep = keep | ctx
                 out.append(keep & (q_raw < seq_len) & kv_in_bounds[og])
             return out
 
@@ -1026,9 +913,8 @@ def build_hstu_attention_bwd_fused_pp(
         dq_fvec = dq_gtid % fx.Int32(DQ_LANES_PER_ROW)
         dq_fcol = dq_fvec * fx.Int32(DQ_PER_LANE)
         dq_wbase = is_g0.select(fx.Int32(0), fx.Int32(NUM_WAVES // 2))
-        # g1 writes its group sum to the row g0 will read; g0 writes to the
-        # sink row and reads the real one. g1 reads the permanently-zero row,
-        # so it adds nothing. No branch, and neither group idles.
+        # g1 publishes its group sum to the row g0 will read; g0 reads it. g1
+        # reads the permanently-zero row, so its read adds nothing.
         dq_rrow = is_g0.select(dq_frow, fx.Int32(DQG_ZERO))
 
         def dq_flush_issue():
@@ -1073,62 +959,32 @@ def build_hstu_attention_bwd_fused_pp(
 
             Each group reads its OWN slots one interval after writing them and
             one interval before overwriting them, so ONE set of eight slots is
-            enough -- two sets would be 65,536 B and would not fit beside the
-            16,640 B the dV/dK schedule already holds.
+            enough; two sets would not fit in LDS beside the dV/dK schedule.
 
-            g1 stores too, to the trash row. Its 256 lanes collapse onto the 64
-            dwords of this workgroup's single head there, so the wasted HBM
-            traffic is 256 B per tile; only the issue slot is paid.
+            Only g0 stores to HBM; g1 instead publishes its group sum to `dqg`.
+            The four per-wave slots were already folded in by `dq_absorb`,
+            interleaved with the gate, so only the group exchange is left here.
+            The exchange read was issued with the slot reads at the head of the
+            phase and reads a row the partner published a barrier ago, disjoint
+            from the row written below.
+
+            Rows with no slot in the scratch -- below this tile's diagonal, or
+            at or past `q_upper` -- are steered to the shared trash row 0.
             """
-            # One `ds_read_b128` per source wave, then SCALAR adds: the wide
-            # load and the unpacked arithmetic are independent wins and the
-            # naive form gives up one to get the other.
-            # ALL four reads first, then the adds. Interleaved, the compiler
-            # rotates only two destination buffers, so read 3 cannot issue
-            # until the adds have drained read 1 -- a read/wait/add chain with
-            # ILP 2. The trace charged 4.87 M cycles to that third
-            # `ds_read_b128` alone (5.7% of all stall, 239/exec). Four live
-            # buffers cost 16 VGPR against 46 spare, and push every `lgkmcnt`
-            # further from the read it covers.
-            # The four per-wave slots were already folded in by `dq_absorb`,
-            # interleaved with the gate. Only the group exchange is left.
-            #
-            # That fifth read was issued with the other four and depends on
-            # nothing computed here -- the other group published its row a full
-            # barrier ago -- and the two rows are disjoint, so it is safe ahead
-            # of the write below. g1 writes `dq_frow` and reads the
-            # permanently-zero row; g0 writes a sink row and reads the one g1
-            # published last interval. Neither group reads what it wrote.
             acc, _g = _issued
-            # The own-group sum is kept aside so the exchange write can be
-            # issued LAST, after the HBM store -- as far from the five reads as
-            # this phase allows. Next to them it stalled 3.06 M cycles (3.8% of
-            # all stall, 142/exec) with no dependency to explain it: its inputs
-            # are two VALU adds old. That is LDS-pipe contention, both with its
-            # own reads and with the partner group's phase M, so distance is
-            # the only lever. Costs 4 VGPR to hold the pre-exchange sum.
-            # The two tails are now an `if is_g0:` branch, not two writes to
-            # dead destinations. `is_g0` is wave-UNIFORM, so this is a scalar
-            # branch, and the kernel already branches on it for transpose_q vs
-            # transpose_do.
-            #
-            # What this removes: g1's HBM store to the trash row, and g0's
-            # `dqg` write to a sink row. The 16 sink rows go with them.
+            # The own-group sum is kept aside so g1's exchange write issues
+            # LAST, as far from the phase's LDS reads as possible: next to them
+            # it contends for the LDS pipe with its own reads and with the
+            # partner group's phase M.
             #
             # The HBM store has to be `fx.generic_store`, not
             # `dq_part[...] = v`. A subscript ASSIGNMENT inside a dynamic `if`
             # makes the AST rewriter treat `dq_part` as branch-assigned and
             # demand an scf.if result for it; a call has no assignment target.
-            # That restriction is what forced the trash rows originally.
-            #
-            # The `dqg` READ stays unconditional at the head of the phase: g1
-            # reads the permanently-zero row and adds nothing. Moving it in
-            # here would cost it the gate's latency cover, which is worth far
-            # more than the one read.
             _own = list(acc)
             _qa = (q_tile_v - fx.Int32(1)) * fx.Int32(BLOCK_N) + dq_frow
             _r = fx.Int64(dq_poff) + fx.Int64(_qa - kv_start_row)
-            _r = (_qa < seq_len).select(_r, fx.Int64(0))
+            _r = (_qa < q_upper).select(_r, fx.Int64(0))
             _r = (_qa >= kv_start_row).select(_r, fx.Int64(0))
             _hc = head_idx * fx.Int32(head_dim) + dq_fcol
             if is_g0:
@@ -1138,7 +994,7 @@ def build_hstu_attention_bwd_fused_pp(
                         + _r * fx.Int64(num_heads * head_dim)
                         + fx.Int64(_hc + fx.Int32(j)),
                         fmul_const_scalar(
-                            fadd_scalar(_own[j], _g[j]), c_inv_n
+                            fadd_scalar(_own[j], _g[j]), c_out_scale
                         ),
                     )  # fmt: skip
             else:
@@ -1164,6 +1020,9 @@ def build_hstu_attention_bwd_fused_pp(
                 transpose_frag(ds_prev[og]) for og in range_constexpr(KV_OWNED_SUBTILES)
             ]
 
+            # The MFMA burst outranks the SIMD partner's gate for issue slots.
+            # Wave priority, like the sched/barrier fences in `phase_barrier`,
+            # has no stable FlyDSL API, so these use the `rocdl` wrappers.
             rocdl.s_setprio(1)
             q_start = fx.Int32(q_tile) * fx.Int32(BLOCK_N)
             s_accs = [c_zero_v4f32 for _ in range_constexpr(KV_OWNED_SUBTILES)]
@@ -1232,37 +1091,18 @@ def build_hstu_attention_bwd_fused_pp(
             # Build this tile's transpose AFTER every operand read has been
             # issued, never in the middle of the burst.
             #
-            # `lgkmcnt` retires IN ORDER, so these 5 ops (4 scalar ds_read_u16 +
-            # 1 ds_write_b64) sitting at group 3 put themselves on the critical
-            # path of all ten operand reads issued behind them: each of those
-            # could only retire once a 2-byte strided gather had. That is what
-            # produced lgkmcnt(0)/(1) in front of MFMAs that needed only
-            # lgkmcnt(3), and it is why deepening PREFETCH_W did nothing -- the
-            # window was never the constraint, queue position was.
+            # `lgkmcnt` retires IN ORDER, so the transpose's strided gather
+            # placed mid-burst would sit on the critical path of every operand
+            # read issued behind it. Here it exposes only its own latency, and
+            # slot lifetimes are untouched (write t_cur, read t_prev, both
+            # within phase M), so it adds no cross-group hazard.
             #
-            # Placing it here exposes its own latency instead of everyone
-            # else's, and leaves slot lifetimes untouched (still: write t_cur,
-            # read t_prev, both within phase M), so it adds no cross-group
-            # hazard.
-            # The dQ GEMM runs BEFORE the q_t/do_t transpose build, not after.
-            #
-            # That build reads an LDS tile `buffer_load ... lds` fills, and the
-            # backend cannot tell which bytes the outstanding DMAs will touch,
-            # so it guards the read with `vmcnt(0)`. The trace charged 2.57 M
-            # cycles to that one wait (3.1% of stall, 61/exec) -- the largest
-            # non-barrier item inside phase M. Two things follow:
-            #
-            #  - the eight dQ MFMAs now run BEFORE it, giving this phase's DMA
-            #    ~128 more cycles to land before anything has to wait on it;
-            #  - the forced `vmcnt(0)` ends up adjacent to the phase's own
-            #    closing `vmcnt(0)`, so the second one is free instead of
-            #    being a second full drain.
-            #
-            # Nothing about the transpose's placement rules changes: it is
-            # still inside phase M (phase V would be an unsynchronised
-            # cross-group RAW on the tile), still after every operand read has
-            # issued, and the slot lifetimes are untouched -- write t_cur, read
-            # t_prev, both within this phase.
+            # The dQ GEMM runs BEFORE the transpose build. That build reads an
+            # LDS tile `buffer_load ... lds` fills, and the backend cannot tell
+            # which bytes the outstanding DMAs will touch, so it guards the read
+            # with `vmcnt(0)`. Running the dQ MFMAs first gives the DMA longer
+            # to land, and puts that forced wait next to the phase's own
+            # closing `vmcnt(0)`, so the second is free.
             def _dq_stage_chunk(ks):
                 # q = l%16, d = ks*MFMA_M + MFMA_LANE_K*(l/16) + e, so the four
                 # elements are one contiguous run of the
@@ -1277,9 +1117,7 @@ def build_hstu_attention_bwd_fused_pp(
             # ---- dQ: partial over THIS workgroup's KV range ----------------
             # dQ[q][d] = sum_kv dS[q][kv].K[kv][d]. Both operands are
             # register-resident (transposed dS, kt_packs), so this needs no
-            # operand-window group -- at PREFETCH_W=15 every window slot is
-            # live at once and an LDS-fed group would add live registers
-            # one-for-one.
+            # operand-window group and adds no window registers.
             #
             # C[m=q][n=d] over 4 d-chunks x KV_OWNED_SUBTILES kv steps.
             rocdl.sched_barrier(0)
@@ -1310,9 +1148,8 @@ def build_hstu_attention_bwd_fused_pp(
                     _dq_stage_chunk(ks - 1)
 
             # Source order alone does NOT produce the interleave: the
-            # scheduler is free to sink all three stores together, and the
-            # trace showed it doing exactly that -- nine MFMAs, then three
-            # `ds_write_b128` back to back, then the last MFMA.
+            # scheduler is free to sink all three stores together behind the
+            # MFMAs.
             #
             # `sched_group_barrier` states the pattern the scheduler must
             # form instead: KV_OWNED_SUBTILES MFMAs, one DS write, repeat.
@@ -1337,10 +1174,8 @@ def build_hstu_attention_bwd_fused_pp(
             # closing `lgkmcnt(0)` with nothing to cover their own retirement;
             # here the transpose's own wait and store do it.
             #
-            # Neither side has a bank conflict to fix: both are 64-lane b128,
-            # 256 dwords over 32 banks, and both measure exactly 8 accesses on
-            # the busiest bank -- the floor. T_GPAD and DQ_PAD=68 are what buy
-            # that; removing either doubles the busiest bank to 16.
+            # Both sides are conflict-free 64-lane b128 accesses (8 accesses on
+            # the busiest bank, the floor) because of T_GPAD and DQ_PAD.
             def _dq_stage():
                 # Only the last chunk is left: the other three went out
                 # interleaved with the dQ GEMM above. This one has no following
@@ -1383,9 +1218,8 @@ def build_hstu_attention_bwd_fused_pp(
             # PINNED at the very head of phase V by the `sched_barrier`
             # below. Source placement alone does not hold: the scheduler sinks
             # these loads toward their use to shorten the live range of the 20
-            # VGPRs they fill, and it did so from every position tried --
-            # measured at 54 VALU ops deep even when written right after the
-            # exp2 batch. The fence is the only way to choose the issue cycle.
+            # VGPRs they fill. The fence is the only way to choose the issue
+            # cycle.
             _dq_vs, _dq_g = dq_flush_issue()
             _dq_acc = [fx.Float32(0.0) for _ in range_constexpr(DQ_PER_LANE)]
             rocdl.sched_barrier(0)
@@ -1395,14 +1229,13 @@ def build_hstu_attention_bwd_fused_pp(
             # is a ~10-deep serial dependency chain per element with two
             # quarter-rate transcendentals in it, so the only way to fill the
             # VALU pipe is to give the scheduler every independent chain at
-            # once. Measured 10 cy per VALU op when this was written per
-            # element -- latency-bound, not throughput-bound.
+            # once.
             n = KV_OWNED_SUBTILES * MFMA_ELEMS_PER_LANE
             rng = range_constexpr(n)
             # The mask needs no GEMM result, so it can sit in either phase --
             # but it must NOT go inside the fenced MFMA burst. Interleaved
             # between the groups, these ~33 VALU ops are pinned by the
-            # sched_barriers and stretch the MFMA stream: measured +9%.
+            # sched_barriers and stretch the MFMA stream.
             keep = [
                 keep_masks(q_start, og) for og in range_constexpr(KV_OWNED_SUBTILES)
             ]
@@ -1418,35 +1251,33 @@ def build_hstu_attention_bwd_fused_pp(
                     Vec(da_accs[j // MFMA_ELEMS_PER_LANE])[j % MFMA_ELEMS_PER_LANE]
                     for j in rng
                 ]
-                # Both derived straight from `s`, not `emu` from `sc`: that
-                # serialised two multiplies at the head of a chain whose next
-                # link is a 16-cycle transcendental. Same op count, one less
-                # link, and the two multiplies now issue in parallel.
-                # `sc` arrives already scaled from GEMM0 (alpha is folded into
-                # k_packs), so only the exp2 argument needs a multiply.
-                sc = s
-                emu = [exp2_f32(fmul_const_scalar(sc[j], c_neg_log2e)) for j in rng]
+                # With z = alpha*s, sig = sigmoid(z) and u = s*sig, so that
+                # silu(z) = alpha*u:
+                #
+                #     P  = alpha*u                      (alpha -> dV's store)
+                #     silu'(z) = sig*(1 + z*(1 - sig)) = sig + u*(alpha - alpha*sig)
+                #
+                # z is never formed: alpha rides in the exp2 constant, the FMA
+                # forming `alpha - alpha*sig`, and the output scale. That is the
+                # same op count as scaling `s` first, and the score is never
+                # rounded to bf16 after scaling.
+                emu = [
+                    exp2_f32(fmul_const_scalar(s[j], c_neg_alpha_log2e)) for j in rng
+                ]
                 _dq_acc = dq_absorb(_dq_acc, _dq_vs[0])
                 sig = [rcp_scalar(addone_scalar(emu[j])) for j in rng]
                 _dq_acc = dq_absorb(_dq_acc, _dq_vs[1])
-                silu = [fmul_scalar(sc[j], sig[j]) for j in rng]
+                u = [fmul_scalar(s[j], sig[j]) for j in rng]
                 _dq_acc = dq_absorb(_dq_acc, _dq_vs[2])
-                # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
-                # The second form is a subtract plus an FMA, against the first
-                # form's sub/mul/add/mul -- 2 VALU per element instead of 4, and
-                # it reuses `silu`, which is already live.
-                # 1 - sig == emu * sig exactly, since sig = 1/(1+emu). Using
-                # the product keeps this off the packed add datapath too.
                 grad = [
-                    fma_scalar(silu[j], fmul_scalar(emu[j], sig[j]), sig[j])
+                    fma_scalar(u[j], fma_scalar(c_neg_alpha, sig[j], c_alpha), sig[j])
                     for j in rng
                 ]
-                # No `c_inv_n` here: dS is linear in it, so it rides along to the
-                # dK epilogue and is folded into that store's existing scale.
-                # Saves one multiply per element.
+                # dS still lacks the chain rule's dz/ds = alpha and the 1/N;
+                # both are linear, so they fold into the dK and dQ stores.
                 _dq_acc = dq_absorb(_dq_acc, _dq_vs[3])
                 gated = [fmul_scalar(grad[j], da[j]) for j in rng]
-                p_vals = [flat_keep[j].select(silu[j], c_zero_f) for j in rng]
+                p_vals = [flat_keep[j].select(u[j], c_zero_f) for j in rng]
                 ds_vals = [flat_keep[j].select(gated[j], c_zero_f) for j in rng]
             e = MFMA_ELEMS_PER_LANE
             p_packs = [
@@ -1497,11 +1328,6 @@ def build_hstu_attention_bwd_fused_pp(
             # skew barrier, and g0's trip-0 GEMM2 reads a dO tile that g1 staged
             # without an intervening publish -- nondeterministic dA, hence dV
             # and dK, confined to the q rows g1's waves 2-3 wrote.
-            #
-            # Invisible at the tuned (384,16,8) shape, which is why this
-            # survived: measured 0/63 runs there, against 36/63 at
-            # (256,16,8) and 10/27 at (512,16,8). Output is bitwise unchanged
-            # at every shape -- this reorders publication, not arithmetic.
             if is_g0:
                 phase_barrier()
             rocdl.s_waitcnt(vmcnt=0)
@@ -1510,16 +1336,12 @@ def build_hstu_attention_bwd_fused_pp(
 
             # K in the kv-as-reduction layout, for the dQ GEMM's B operand.
             # Loop-invariant, so paid ONCE per workgroup -- and it avoids
-            # re-reading K from HBM in a second layout. Transposed from the
-            # ALPHA-SCALED k_packs so alpha rides along: ds.(aK) = a.(ds.K) is
-            # exactly the chain rule, leaving only 1/N for the flush. Do NOT
-            # also apply dq_pp's `alpha/max_seq_len`; that kernel folds alpha
-            # into Q, not K.
+            # re-reading K from HBM in a second layout. The flush applies the
+            # chain rule's alpha together with 1/N.
             #
             # Placed AFTER the prologue fence, not beside k_packs: up there it
-            # runs while the zeroing and the staging DMA are still being set
-            # up, and it corrupted dv/dk (5.4k elements). Here nothing is in
-            # flight.
+            # runs while the zeroing and the staging DMA are still in flight,
+            # and that corrupts dV/dK.
             # Only `dqg` needs clearing, and only its permanently-zero row --
             # but zero the whole thing, it is one short loop and leaves no
             # assumption about which rows g1 reads. `dqw` is fully overwritten
@@ -1564,15 +1386,10 @@ def build_hstu_attention_bwd_fused_pp(
                 # issued at the TOP of the next sub-trip rather than the bottom
                 # of this one. The scf.for back edge -- increment, 64-bit trip
                 # compare, branch -- therefore lands in the tail of the gate
-                # phase instead of at the head of the MFMA phase.
-                #
-                # It was costing 184 cy/exec there: the trip test needs the
-                # bound in a VGPR (v_cmp takes only one SGPR operand) and the
-                # allocator chose v[108:109], the registers `ds_read2_b64`
-                # overwrites a few instructions later, so the copy stalled on a
-                # WAR hazard. Ahead of the barrier that hazard resolves during
-                # the rendezvous wait, which is time the wave was spending
-                # anyway.
+                # phase instead of at the head of the MFMA phase, where the
+                # trip test's VGPR copy can stall on a WAR hazard against the
+                # first operand reads. Ahead of the barrier it resolves during
+                # the rendezvous wait instead.
                 for u in range_constexpr(UNROLL):
                     if const_expr(u == 0):
                         phase_barrier()
@@ -1598,9 +1415,9 @@ def build_hstu_attention_bwd_fused_pp(
             # without a trailing barrier inside the loop.
             phase_barrier()
 
-            # No drain: every tile's partial is flushed by g0's gate phase in
-            # the same trip that produced it, and the last gate phase is inside
-            # the loop.
+            # No epilogue drain: `n_trips` counts one extra trip, whose phase M
+            # runs GEMM1/GEMM3 and the dQ GEMM for the last tile and whose gate
+            # phase flushes that tile's dQ.
 
             if not is_g0:
                 phase_barrier()
@@ -1623,14 +1440,14 @@ def build_hstu_attention_bwd_fused_pp(
                             for c in range_constexpr(D_CHUNKS):
                                 ov = results[c * KV_OWNED_SUBTILES + og]
                                 col = fx.Int32(c * MFMA_M) + lane_mod_16
-                                val = (Vec(ov)[e] * c_inv_n).to(elem_dtype)
+                                val = (Vec(ov)[e] * c_out_scale).to(elem_dtype)
                                 out_dv[
                                     fx.Int64(seq_start + kv_row_e), head_idx, col
                                 ] = val
                             for c in range_constexpr(HC_CHUNKS):
                                 ov = results[N_ACC_DV + c * KV_OWNED_SUBTILES + og]
                                 col = fx.Int32(c * MFMA_M) + lane_mod_16
-                                val = (Vec(ov)[e] * c_dk_scale).to(elem_dtype)
+                                val = (Vec(ov)[e] * c_out_scale).to(elem_dtype)
                                 out_dk[
                                     fx.Int64(seq_start + kv_row_e), head_idx, col
                                 ] = val
@@ -1694,33 +1511,27 @@ def build_hstu_attention_bwd_fused_pp(
 # there owns a KV range and `dQ[q][d] = sum_kv dS[q][kv].K[kv][d]` reduces over
 # kv. This half sums those partials.
 #
-# Split-K rather than atomics: `global_atomic_add_f32` is a hard 0.40 TB/s wall
-# on gfx942 while `global_store_dwordx2` runs at 3.56 TB/s -- 8.8x, measured,
-# and independent of contention, atomic width and instruction count. The atomic
-# design needed 337 GB of traffic, about twice the entire backward pass.
+# Scratch layout, built by `slot_rows` and `build_partial_offsets` below:
 #
-# Scratch layout, built by `build_partial_offsets` below and compact by
-# necessity -- the dense `[max_tiles][L][H][D]` alternative is 331 GB at the
-# production shape:
-#
-#     offset[b][t]  prefix sum over (b, t) of (S_b - t*BLOCK_M)   -- in ROWS
+#     offset[b][t]  prefix sum over (b, t) of slot_rows[b][t]   -- in ROWS
 #     dq_part[offset[b][t] + (q_row - t*BLOCK_M)][h * D + d]
 #
 # `dq_part` is 2-D rather than a flat element array only because the launch ABI
-# packs dynamic extents as i32 and the per-pass scratch is 21e9 fp32 at the
-# production shape. The bytes are identical.
+# packs dynamic extents as i32 and the per-pass scratch can exceed 2^31 fp32
+# elements. The bytes are identical.
 #
-# kv tile `t` only serves q rows `[t*BLOCK_M, S_b)` -- under the causal mask
+# kv tile `t` only serves q rows from `t*BLOCK_M` up -- under the causal mask
 # nothing above the diagonal contributes -- so q row `r` sums tiles
 # `0 ..= r // BLOCK_M`. All `ROWS_PER_BLOCK` rows of a workgroup share that
 # count because `BLOCK_M % ROWS_PER_BLOCK == 0`, which is what lets one runtime
-# loop cover the whole workgroup.
+# loop cover the whole workgroup. A sliding window also bounds each slot from
+# above; rows past it are skipped by predicate.
 #
 # The scale is already applied by the fused kernel's flush, so this kernel only
 # sums and converts.
 # --------------------------------------------------------------------------- #
 
-# 16 q rows per workgroup, 16 fp32 accumulators per thread.
+# 16 q rows per workgroup.
 ROWS_PER_BLOCK = 16
 # Elements per thread per access. A thread-per-(h, d) mapping is coalesced but
 # issues a separate `global_load_dword` for every row, because consecutive rows
@@ -1730,14 +1541,35 @@ ROWS_PER_BLOCK = 16
 # bytes. VEC must divide head_dim so a thread never straddles two heads.
 VEC = 4
 # One reserved row at the head of the scratch. The fused kernel sends q rows
-# beyond seq_len there instead of branching around the store.
+# without a slot there instead of branching around the store.
 TRASH_ROWS = 1
+# Hardware limit on gfx942 workgroup size.
+MAX_REDUCE_THREADS = 1024
 
 
-def validate_hstu_attention_bwd_dq_reduce(num_heads, head_dim, block_m, dtype_str):
+def _reduce_geometry(hd):
+    """`(threads, lanes_per_row, row_group)` for a row of `hd` elements.
+
+    LANES_PER_ROW threads cover one row's VEC-element runs, and the workgroup
+    spans ROW_GROUP rows at a time. ROW_GROUP is as large as possible up to
+    VEC, so a workgroup keeps `hd` threads (several waves, VEC accumulators per
+    row slice) until that would pass the workgroup limit, and shrinks after.
+    Returns None when a single row needs more lanes than a workgroup has.
+    """
+    lanes = hd // VEC
+    for row_group in (VEC, 2, 1):
+        if lanes * row_group <= MAX_REDUCE_THREADS:
+            return lanes * row_group, lanes, row_group
+    return None
+
+
+def validate_hstu_attention_bwd_dq_reduce(
+    num_heads, head_dim, block_m, dtype_str, *, arch=None
+):
     """Gate the supported shape, as the fused kernel's own validator does."""
-    arch = get_rocm_arch()
-    if arch != "gfx942":
+    if arch is None:
+        arch = get_rocm_arch()
+    if not (arch or "").startswith("gfx942"):
         raise ValueError(f"hstu bwd dq_reduce is specialized for gfx942, got {arch}")
     if dtype_str != "bf16":
         raise ValueError(f"hstu bwd dq_reduce is specialized for bf16, got {dtype_str}")
@@ -1757,11 +1589,11 @@ def validate_hstu_attention_bwd_dq_reduce(num_heads, head_dim, block_m, dtype_st
             f"thread's run of columns stays inside one head"
         )
     hd = num_heads * head_dim
-    row_group = max(hd // (hd // VEC), 1)
-    if ROWS_PER_BLOCK % row_group != 0:
+    if _reduce_geometry(hd) is None:
         raise ValueError(
-            f"ROWS_PER_BLOCK ({ROWS_PER_BLOCK}) must be a multiple of the "
-            f"{row_group} rows a workgroup spans at VEC={VEC}"
+            f"hstu bwd dq_reduce needs num_heads*head_dim/{VEC} <= "
+            f"{MAX_REDUCE_THREADS} threads for one row, got "
+            f"num_heads={num_heads}, head_dim={head_dim}"
         )
 
 
@@ -1789,14 +1621,10 @@ def build_hstu_attention_bwd_dq_reduce(
     elem_dtype = _dtype_to_elem_type(dtype_str)
     HD = num_heads * head_dim
     ROWS = ROWS_PER_BLOCK
-    # Threads tile the (row, column-run) grid: LANES_PER_ROW threads cover one
-    # row's VEC-element runs, so the workgroup spans ROW_GROUP rows at a time
-    # and sweeps its block in SLICES steps. THREADS stays HD -- making it
-    # HD//VEC would be a single wave per workgroup carrying ROWS*VEC
-    # accumulators.
-    THREADS = HD
-    LANES_PER_ROW = HD // VEC
-    ROW_GROUP = max(THREADS // LANES_PER_ROW, 1)
+    # Threads tile the (row, column-run) grid and sweep the block in SLICES
+    # steps of ROW_GROUP rows; see `_reduce_geometry`.
+    THREADS, LANES_PER_ROW, ROW_GROUP = _reduce_geometry(HD)
+    assert ROWS % ROW_GROUP == 0
     SLICES = ROWS // ROW_GROUP
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -1811,8 +1639,8 @@ def build_hstu_attention_bwd_dq_reduce(
         tile_lo: fx.Int32,
         tile_hi: fx.Int32,
     ) -> None:
-        tid = fx.Int32(gpu.thread_id("x"))
-        bid = fx.Int32(gpu.block_id("x"))
+        tid = fx.Int32(gpu.thread_idx.x)
+        bid = fx.Int32(gpu.block_idx.x)
 
         # (batch, row block) comes from a host table rather than
         # `bid // max_blocks`. The sequences are jagged -- mean length is about
@@ -1832,10 +1660,18 @@ def build_hstu_attention_bwd_dq_reduce(
             _nt = fx.Int32(num_targets[fx.Int32(b)])
             max_id = (_nt > fx.Int32(0)).select(seq_len - _nt, seq_len)
 
-        row_sub = tid // fx.Int32(LANES_PER_ROW)
-        col = (tid % fx.Int32(LANES_PER_ROW)) * fx.Int32(VEC)
-        h = col // fx.Int32(head_dim)
-        d0 = col % fx.Int32(head_dim)
+        # tid -> (row within the row group, head, VEC-run within the head).
+        thr = fx.idx2crd(
+            tid,
+            fx.make_layout(
+                (ROW_GROUP, num_heads, head_dim // VEC),
+                (LANES_PER_ROW, head_dim // VEC, 1),
+            ),
+        )
+        row_sub = fx.Int32(fx.get_scalar(fx.get_(thr, 0)))
+        h = fx.Int32(fx.get_scalar(fx.get_(thr, 1)))
+        d0 = fx.Int32(fx.get_scalar(fx.get_(thr, 2))) * fx.Int32(VEC)
+        col = h * fx.Int32(head_dim) + d0
 
         # The tail rows of the last block are clamped onto the last real row,
         # so they read (and later rewrite) a valid element with the value that
@@ -1853,10 +1689,10 @@ def build_hstu_attention_bwd_dq_reduce(
         n_t = (n_t < tile_hi).select(n_t, tile_hi)
 
         # Under a sliding window a q row is served by a CONTIGUOUS span of kv
-        # tiles, not by every tile below it, and the fused kernel writes a
-        # partial only for the tiles it serves. Both bounds matter: this one
-        # skips tiles that contribute nothing, and the per-row predicate below
-        # keeps the sum off elements that were never written.
+        # tiles, not by every tile below it, and the scratch has a slot row
+        # only for the tiles that serve it. Both bounds matter: this one skips
+        # tiles that contribute nothing, and the per-row predicate below keeps
+        # the read inside the slot.
         #
         # `row0` is the workgroup's FIRST row, so this bound is the loosest any
         # of its rows needs -- correctness comes from the predicate, this is
@@ -1867,10 +1703,8 @@ def build_hstu_attention_bwd_dq_reduce(
             # Anchor the span on the CLAMPED id, not the raw row. A target row
             # has id == max_id, so it is served from (max_id - window) upward --
             # still one contiguous span, just anchored lower down than the row
-            # itself. Taking the raw row would skip the tiles it actually needs;
-            # giving up and starting at tile_lo (as this did) reads the whole
-            # causal span and throws most of it away, which cost 50.4 ms of
-            # reduction against 12.6 for the same window without targets.
+            # itself. Taking the raw row would skip the tiles it actually needs,
+            # and starting at tile_lo would read the whole causal span.
             _idr = row0
             if const_expr(has_targets):
                 _idr = (row0 < max_id).select(row0, max_id)
@@ -1902,20 +1736,20 @@ def build_hstu_attention_bwd_dq_reduce(
             for s in range_constexpr(SLICES):
                 _ri = row_in_slot + (rr[s] - row0)
                 if const_expr(max_attn_len > 0):
-                    # Written iff this tile serves the row. Measured, not
-                    # assumed: NaN-poisoning the scratch found every unwritten
-                    # element inside what this excludes (3,826 unwritten, all
-                    # within the 4,034 excluded). A `select`, not a multiply --
-                    # an unwritten slot may hold a NaN and 0 * NaN is NaN.
+                    # The row has a slot iff this tile serves it, i.e. it lies
+                    # below the tile's `q_upper` (see `slot_rows`). Otherwise
+                    # read the slot's first row, which always exists, and drop
+                    # the value with a `select` -- a multiply by 0 would let a
+                    # non-finite neighbour through.
                     _hi = (t_i + fx.Int32(1)) * fx.Int32(block_m) + fx.Int32(
                         max_attn_len
                     )
                     _served = rr[s] < _hi
                     if const_expr(has_targets):
-                        # Mirrors the fused kernel's `q_upper` reopening: once
-                        # a tile's window reaches past max_id it serves EVERY
-                        # row, because the clamped target rows land there.
+                        # Once a tile's window reaches past max_id it serves
+                        # EVERY row, because the clamped target ids land there.
                         _served = _served | (_hi > max_id)
+                    _ri = _served.select(_ri, fx.Int32(0))
                 for j in range_constexpr(VEC):
                     _val = dq_part[base + fx.Int64(_ri), col + fx.Int32(j)]
                     if const_expr(max_attn_len > 0):
@@ -1970,82 +1804,78 @@ def build_hstu_attention_bwd_dq_reduce(
 # --------------------------------------------------------------------------- #
 # Host-side scratch tables
 #
-# All three are pure functions of the sequence lengths and the tile geometry,
-# and all three are built on the input's own device: these tables are indexed
-# by the kernels above, so a CPU round-trip would cost a sync per call for no
-# benefit. The two unavoidable syncs are the scratch element count and the
-# reduction's grid size, both of which the host needs in order to allocate.
+# Pure functions of the sequence lengths, targets and tile geometry, built on
+# the input's own device because the kernels above index them. None of them
+# synchronises: the caller copies the few scalars it needs to plan and allocate
+# (per-tile row counts and the reduction's grid size) to the host in ONE copy.
 # --------------------------------------------------------------------------- #
 
 
-def build_partial_offsets(
-    seq_offsets, block_m, *, max_seq_len, tile_lo=0, tile_hi=None
-):
-    """Compact scratch offsets, one slot per (batch, kv_tile).
+def slot_rows(seq_offsets, block_m, *, max_seq_len, max_attn_len=0, num_targets=None):
+    """Scratch rows per (batch, kv_tile): the q rows that tile serves.
 
-    kv tile `t` of a sequence of length S serves q rows [t*block_m, S), so its
-    slot is `S - t*block_m` rows. A DENSE [max_tiles][L][H][D] layout is 331 GB
-    at the production shape and does not fit -- the compactness is load-bearing.
+    kv tile `t` of a sequence of length S serves q rows [t*block_m, q_upper),
+    where q_upper is S under a plain causal mask and the end of the sliding
+    window otherwise -- the fused kernel stores exactly those rows. With
+    targets, a window that reaches past the last non-target id serves every
+    row, because target ids are clamped there.
 
-    Returns `(offsets, total_rows)` with `offsets` a flat int64 table indexed
-    `b * max_tiles + t`, and -1 where tile t does not exist for sequence b (so
-    an out-of-range read is a visible fault, not silent corruption).
-
-    Only the kv tiles of THIS pass get a slot; the rest are -1. The table keeps
-    the full `max_tiles` stride because the kernel indexes it with its own
-    `num_kv_tiles`, but the offsets PACK from the start of the buffer so each
-    pass reuses the same scratch.
+    Returns a `[B, ceil(max_seq_len / block_m)]` int64 tensor; 0 where the tile
+    does not exist for that sequence.
     """
     device = seq_offsets.device
-    lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.int64)
+    lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.int64)[:, None]
     # Stride is ceil(max_seq_len/block_m), NOT the max over actual lengths: the
-    # kernel indexes this table with its own `num_kv_tiles`, which is derived
-    # from max_seq_len. Deriving it from the realised lengths instead makes the
-    # two disagree whenever no sequence reaches max_seq_len, and every batch
-    # beyond the first reads the wrong slot.
+    # kernels index the offset table with their own `num_kv_tiles`, which is
+    # derived from max_seq_len.
     max_tiles = (max_seq_len + block_m - 1) // block_m
-    t_idx = torch.arange(max_tiles, dtype=torch.int64, device=device)
-    rows = (lengths[:, None] - t_idx[None, :] * block_m).clamp(min=0)
+    start = torch.arange(max_tiles, dtype=torch.int64, device=device)[None, :]
+    start = start * block_m
+    q_upper = lengths.expand(-1, max_tiles)
+    if max_attn_len > 0:
+        win_upper = start + (block_m + max_attn_len)
+        if num_targets is not None:
+            nt = num_targets.to(torch.int64)[:, None]
+            max_id = torch.where(nt > 0, lengths - nt, lengths)
+            win_upper = torch.where(win_upper <= max_id, win_upper, lengths)
+        q_upper = torch.minimum(win_upper, lengths)
+    return (q_upper - start).clamp(min=0)
 
+
+def build_partial_offsets(rows, *, tile_lo=0, tile_hi=None):
+    """Compact scratch offsets for the kv tiles [tile_lo, tile_hi) of one pass.
+
+    `rows` comes from `slot_rows`. The scratch is compact by necessity -- a
+    DENSE [max_tiles][L][H][D] layout does not fit at production shapes.
+
+    Returns a flat int64 table indexed `b * max_tiles + t`, with -1 where tile
+    t has no slot in this pass (so an out-of-range read is a visible fault, not
+    silent corruption). The table keeps the full `max_tiles` stride, but the
+    offsets PACK from the start of the buffer so every pass reuses the same
+    scratch. Slot sizes sum to `span_scratch_rows` for the same span.
+    """
+    max_tiles = rows.shape[1]
     if tile_hi is None:
         tile_hi = max_tiles
+    t_idx = torch.arange(max_tiles, dtype=torch.int64, device=rows.device)
     in_pass = (t_idx >= tile_lo) & (t_idx < tile_hi)
     flat = torch.where(in_pass[None, :], rows, torch.zeros_like(rows)).reshape(-1)
 
-    off = torch.zeros_like(flat)
-    off[1:] = torch.cumsum(flat, 0)[:-1]
+    off = torch.cumsum(flat, 0) - flat
     # Every offset is shifted past the reserved trash row at the head.
     off = off + TRASH_ROWS
-    off = torch.where(flat > 0, off, torch.full_like(off, -1))
-    return off, int(flat.sum()) + TRASH_ROWS
-
-
-def tile_partial_counts(seq_offsets, block_m, max_seq_len):
-    """Partial ROWS each kv tile contributes, as host ints.
-
-    Costs ONE device sync, and is the only thing the kv-chunking search needs:
-    a span's scratch is just the sum of its tiles' counts. Computing this once
-    lets every candidate G be priced in host arithmetic, instead of building a
-    full offset table per candidate to discover it does not fit.
-    """
-    device = seq_offsets.device
-    lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.int64)
-    max_tiles = (max_seq_len + block_m - 1) // block_m
-    t_idx = torch.arange(max_tiles, dtype=torch.int64, device=device)
-    counts = (lengths[:, None] - t_idx[None, :] * block_m).clamp(min=0).sum(0)
-    return counts.tolist()
+    return torch.where(flat > 0, off, torch.full_like(off, -1))
 
 
 def balanced_tile_groups(counts, groups):
     """Split the kv tiles into `groups` spans of roughly equal PARTIAL COUNT.
 
-    kv tile t serves `S_b - t*block_m` q rows, so low tiles produce far more
-    partials than high ones. Splitting the tile INDEX range evenly overflows
-    group 0's scratch while the last group sits half empty; at the production
-    shape the equal-count split puts only about the first 29% of tiles in
-    group 0.
+    Low kv tiles serve far more q rows than high ones, so splitting the tile
+    INDEX range evenly overflows group 0's scratch while the last group sits
+    half empty.
 
-    `counts` comes from `tile_partial_counts`; this is pure host arithmetic.
+    `counts` is the host list of per-tile row counts (`slot_rows(...).sum(0)`);
+    this is pure host arithmetic.
     """
     max_tiles = len(counts)
     cum, running = [], 0
@@ -2073,21 +1903,29 @@ def span_scratch_rows(counts, spans):
     return max(sum(counts[lo:hi]) for lo, hi in spans) + TRASH_ROWS
 
 
-def build_reduce_map(seq_offsets, device):
-    """Host table: one (batch, row_block) pair per REAL row block.
-
-    Returns a flat int32 tensor of `2 * n_blocks` and `n_blocks`.
-    """
+def reduce_blocks_per_seq(seq_offsets):
+    """Reduction workgroups per sequence: one per ROWS_PER_BLOCK q rows."""
     lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.int64)
-    nb = torch.div(lengths + ROWS_PER_BLOCK - 1, ROWS_PER_BLOCK, rounding_mode="floor")
-    n_blocks = int(nb.sum())
+    return torch.div(
+        lengths + ROWS_PER_BLOCK - 1, ROWS_PER_BLOCK, rounding_mode="floor"
+    )
+
+
+def build_reduce_map(blocks_per_seq, n_blocks):
+    """Device table: one (batch, row_block) pair per REAL row block.
+
+    `blocks_per_seq` comes from `reduce_blocks_per_seq` and `n_blocks` is its
+    sum, already on the host. Returns a flat int32 tensor of `2 * n_blocks`.
+    """
+    nb = blocks_per_seq
+    device = nb.device
     b = torch.repeat_interleave(
-        torch.arange(len(nb), dtype=torch.int64, device=nb.device), nb
+        torch.arange(len(nb), dtype=torch.int64, device=device),
+        nb,
+        output_size=n_blocks,
     )
     # per-batch block index: a ramp restarted at each sequence boundary
     starts = torch.cumsum(nb, 0) - nb
-    blk = torch.arange(
-        n_blocks, dtype=torch.int64, device=nb.device
-    ) - torch.repeat_interleave(starts, nb)
-    m = torch.stack([b, blk], dim=1).reshape(-1).to(torch.int32)
-    return m.to(device), n_blocks
+    blk = torch.arange(n_blocks, dtype=torch.int64, device=device)
+    blk = blk - torch.repeat_interleave(starts, nb, output_size=n_blocks)
+    return torch.stack([b, blk], dim=1).reshape(-1).to(torch.int32)

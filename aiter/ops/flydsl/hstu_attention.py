@@ -30,8 +30,9 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fused_pp import (
     build_hstu_attention_bwd_fused_pp,
     build_partial_offsets,
     build_reduce_map,
+    reduce_blocks_per_seq,
+    slot_rows,
     span_scratch_rows,
-    tile_partial_counts,
     validate_hstu_attention_bwd_fused_pp,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd import (
@@ -520,9 +521,7 @@ _BWD_KERNELS = (
 )
 # The only tile the fused kernel is built for: 8 waves give 2 per SIMD inside
 # one barrier domain, and BLOCK_M quantises to 128 (8 waves x MFMA_M 16), so 256
-# and 384 are the only candidates. 384 is the dV/dK-only shape and removes this
-# kernel's geometry penalty, but the added dQ state spills 21 registers there
-# and measures 503.7 ms against 461.0 at 256 (214 VGPR, 0 spills).
+# and 384 are the only candidates -- and 384 spills.
 _BWD_FUSED_TILES = {
     "block_m": 256,
     "block_n": 16,
@@ -897,7 +896,7 @@ def _resolve_bwd_fused_config(
 
 
 def _plan_fused_groups(
-    seq_offsets: torch.Tensor,
+    counts: list[int],
     *,
     block_m: int,
     num_heads: int,
@@ -909,30 +908,25 @@ def _plan_fused_groups(
 ) -> tuple[int, list, torch.Tensor, torch.Tensor]:
     """Chunk the kv tiles into passes that fit, and allocate the scratch.
 
-    Returns `(G, spans, dq_part, dq_carry)`.
+    `counts` holds each kv tile's scratch rows on the host. Returns
+    `(G, spans, dq_part, dq_carry)`.
 
-    The fp32 partials dominate the fused path -- 168 GB in one pass at
-    B=1024/H=8/N=16384 -- so the kv tiles are chunked into G passes over ONE
-    reused buffer. `groups="auto"` takes the SMALLEST G that fits: every extra
-    pass adds a fully serialised reduction (reduce(g) must finish before
-    fused(g+1) overwrites the scratch) plus carry traffic, which exists only at
-    G > 1 and costs 2*(G-1) passes over L*H*D fp32.
+    The fp32 partials dominate the fused path's memory, so the kv tiles are
+    chunked into G passes over ONE reused buffer. `groups="auto"` takes the
+    SMALLEST G that fits: every extra pass adds a fully serialised reduction
+    (reduce(g) must finish before fused(g+1) overwrites the scratch) plus carry
+    traffic, which exists only at G > 1 and costs 2*(G-1) passes over L*H*D
+    fp32.
 
-    Memory is settled by ATTEMPTING, not by predicting. Two predictions were
-    tried and both failed: `mem_get_info` alone sees only driver-free memory
-    and over-chunks (G=12 instead of 4 once a caller had cycled tensors), while
-    adding `memory_reserved - memory_allocated` back counts the right bytes but
-    not their LAYOUT -- the scratch is one contiguous tens-of-GB block and
-    cached blocks are fragmented, so it planned a size torch then failed to
-    allocate, dependent on allocator history and reproducible only sometimes.
-    So: estimate, try, and on OOM release the cache and step G up.
+    Memory is settled by ATTEMPTING, not by predicting: `mem_get_info` misses
+    the caching allocator's free blocks, and counting those back still misses
+    their fragmentation, while the scratch is one large contiguous block. So:
+    estimate, try, and on OOM release the cache and step G up.
 
     `empty_cache()` is deliberately NOT on the fast path. It hands the scratch
-    back to the driver, so the next call cannot reuse it and must re-enter
-    hipMalloc -- which was itself the largest component of this function's
-    per-call cost.
+    back to the driver, so the next call could not reuse it.
     """
-    n_kv_tiles = (max_seq_len + block_m - 1) // block_m
+    n_kv_tiles = len(counts)
     elems = num_heads * head_dim
     if groups != "auto" and not 1 <= int(groups) <= n_kv_tiles:
         # Past n_kv_tiles the split cannot give every group a tile, and the
@@ -942,9 +936,6 @@ def _plan_fused_groups(
             f"fused_groups must be in 1..{n_kv_tiles} (kv tiles at "
             f"max_seq_len={max_seq_len}, block_m={block_m}), got {groups}"
         )
-
-    # One sync; every candidate G is then priced in host arithmetic.
-    counts = tile_partial_counts(seq_offsets, block_m, max_seq_len)
 
     def _plan(g):
         spans = balanced_tile_groups(counts, g)
@@ -969,19 +960,13 @@ def _plan_fused_groups(
     last_error = None
     for g in candidates:
         spans, rows, _nbytes = _plan(g)
+        dq_part = dq_carry = None
         try:
-            # `empty`, not `zeros`: for the masks this kernel accepts, the
-            # reduction reads only elements the fused kernel wrote -- slots are
-            # sized to exactly the q rows their tile serves and row indices are
-            # clamped to seq_len-1 -- so the memset is pure cost (~17 ms per
-            # call at 86 GB). Verified by poisoning the scratch with NaN at the
-            # production shape: dq came back bitwise identical at G=2 and G=5
-            # with zero NaNs.
-            #
-            # A WINDOWED mask does leave partials unwritten -- the fused pass
-            # only serves the tiles inside the window -- so the reduction
-            # carries a per-row predicate that skips exactly those. Keep the
-            # two in step: dropping that predicate means restoring the memset.
+            # `empty`, not `zeros`: the reduction reads only rows the fused
+            # kernel wrote. Each slot is sized to exactly the q rows its tile
+            # serves and the kernel stores every one of them; the reduction
+            # clamps row indices to seq_len-1 and, under a window, never
+            # reads past a slot. Keep the two in step or restore the memset.
             dq_part = torch.empty(rows, elems, dtype=torch.float32, device=device)
             dq_carry = (
                 torch.zeros(1, 1, dtype=torch.float32, device=device)
@@ -991,8 +976,10 @@ def _plan_fused_groups(
                 )
             )
         except torch.cuda.OutOfMemoryError as exc:
-            last_error = exc
-            # Only now is it worth handing fragmented blocks back to the driver.
+            last_error = str(exc)
+            # Drop a scratch that did fit before the carry did not, then hand
+            # the fragmented cached blocks back to the driver.
+            dq_part = dq_carry = None
             torch.cuda.empty_cache()
             continue
         return g, spans, dq_part, dq_carry
@@ -1024,19 +1011,24 @@ def _make_bwd_fused_runners(
 ) -> dict:
     """Build the fused kernel's phase runners, for the dispatch and for tuning.
 
-    Returns ``{"fused": fn, "dq_reduce": fn, "all": fn, "outputs": (dq, dk, dv),
-    "groups": G, "spans": [(lo, hi), ...], "reduce_bytes": int}``.
+    Returns ``{"fused": fn, "dq_reduce": fn, "all": fn, "fused_pass": fn(g),
+    "reduce_pass": fn(g), "outputs": (dq, dk, dv), "groups": G,
+    "spans": [(lo, hi), ...], "scratch": tensor, "offsets": [tensor, ...],
+    "scratch_bytes": int, "carry_bytes": int, "reduce_bytes": int}``.
 
-    `fused` and `dq_reduce` each run every kv-tile group of their own phase, so
-    timing them apart is meaningful: the reduction is fully EXPOSED --
-    reduce(g) must finish before fused(g+1) overwrites the scratch -- so it is a
-    standing cost to tune independently, not something hiding under the next
-    pass. `all` interleaves them, which is the only correct order.
+    `all` interleaves the passes -- fused(0), reduce(0), fused(1), ... -- which
+    is the only order that produces correct gradients: reduce(g) must finish
+    before fused(g+1) overwrites the shared scratch. `fused` and `dq_reduce`
+    run every pass of ONE phase back to back. At G > 1 that is only meaningful
+    for timing, and leaves `outputs` wrong until `all` runs again.
+
+    All work, including this function's own preparation, is queued on `stream`
+    (default: the current stream), after the work already queued on the
+    current stream. The outputs and temporaries are allocated on `stream`; a
+    caller consuming the outputs on another stream must synchronise first.
 
     dV/dK come straight out of the fused kernel. dQ is accumulated over each
-    workgroup's KV range into an fp32 HBM scratch and summed by the reduction:
-    split-K rather than atomics because `global_atomic_add_f32` is a hard
-    0.40 TB/s wall on gfx942 while plain stores run at 3.56 TB/s.
+    workgroup's KV range into an fp32 HBM scratch and summed by the reduction.
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q,
@@ -1068,25 +1060,8 @@ def _make_bwd_fused_runners(
         )
 
     device = q.device
-    block_m = config["block_m"]
-    elems = num_heads * head_dim
-
-    nt = num_targets
-    if nt is None:
-        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=device)
-    q_c = q.contiguous()
-    k_c = k.contiguous()
-    v_c = v.contiguous()
-    do_c = dout.contiguous()
-    so_c = seq_offsets.contiguous()
-    nt_c = nt.contiguous()
-    if sort_by_length:
-        perm_c = _build_balance_perm(so_c).contiguous()
-    else:
-        perm_c = torch.zeros(1, dtype=torch.int32, device=device)
-    total_tokens = q_c.shape[0]
-
-    launch_stream = torch.cuda.current_stream(device) if stream is None else stream
+    current_stream = torch.cuda.current_stream(device)
+    launch_stream = current_stream if stream is None else stream
     if launch_stream.device != device:
         raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
 
@@ -1105,32 +1080,129 @@ def _make_bwd_fused_runners(
         **config,
     )
 
-    n_groups, spans, dq_part, dq_carry = _plan_fused_groups(
-        so_c,
-        block_m=block_m,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        max_seq_len=N,
-        total_tokens=total_tokens,
-        groups=groups,
-        device=device,
-    )
-    max_tiles = (N + block_m - 1) // block_m
-    # Offset tables for the CHOSEN spans only. These genuinely depend on the
-    # sequence lengths, which change every training step, so they are rebuilt
-    # per call -- but only once, not once per candidate G.
-    planned = [
-        build_partial_offsets(so_c, block_m, max_seq_len=N, tile_lo=lo, tile_hi=hi)
-        for lo, hi in spans
-    ]
-    offs = [p[0] for p in planned]
-    totals = [p[1] for p in planned]
+    if launch_stream != current_stream:
+        # The inputs may still be being produced on the caller's stream, and
+        # the caller may free them while `launch_stream` still reads them.
+        launch_stream.wait_stream(current_stream)
+        for t in (q, k, v, dout, seq_offsets, num_targets):
+            if t is not None:
+                t.record_stream(launch_stream)
+
+    with torch.cuda.stream(launch_stream):
+        return _prepare_bwd_fused_runners(
+            fused_launcher,
+            q,
+            k,
+            v,
+            dout,
+            seq_offsets,
+            num_targets,
+            batch=batch,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype_str=dtype_str,
+            max_seq_len=N,
+            max_attn_len=max_attn_len,
+            block_m=config["block_m"],
+            sort_by_length=sort_by_length,
+            groups=groups,
+            launch_stream=launch_stream,
+        )
+
+
+def _prepare_bwd_fused_runners(
+    fused_launcher,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: torch.Tensor | None,
+    *,
+    batch: int,
+    num_heads: int,
+    head_dim: int,
+    dtype_str: str,
+    max_seq_len: int,
+    max_attn_len: int,
+    block_m: int,
+    sort_by_length: bool,
+    groups: int | str,
+    launch_stream: torch.cuda.Stream,
+) -> dict:
+    """Body of `_make_bwd_fused_runners`, run with `launch_stream` current."""
+    device = q.device
+    elems = num_heads * head_dim
+    has_targets = num_targets is not None
+
+    nt = num_targets
+    if nt is None:
+        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=device)
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    do_c = dout.contiguous()
+    so_c = seq_offsets.contiguous()
+    nt_c = nt.contiguous()
+    if sort_by_length:
+        perm_c = _build_balance_perm(so_c).contiguous()
+    else:
+        perm_c = torch.zeros(1, dtype=torch.int32, device=device)
+    total_tokens = q_c.shape[0]
 
     dv = torch.empty_like(v_c)
     dk = torch.empty_like(k_c)
     dq = torch.empty_like(q_c)
 
-    red_map, n_blocks = build_reduce_map(so_c, device)
+    # The tables depend on the sequence lengths, which change every training
+    # step, so they are rebuilt per call. The planner needs only the per-tile
+    # row counts and the reduction grid, copied to the host together.
+    rows = slot_rows(
+        so_c,
+        block_m,
+        max_seq_len=max_seq_len,
+        max_attn_len=max_attn_len,
+        num_targets=num_targets,
+    )
+    blocks_per_seq = reduce_blocks_per_seq(so_c)
+    host = torch.cat([rows.sum(0), blocks_per_seq.sum().reshape(1)]).tolist()
+    counts, n_blocks = host[:-1], host[-1]
+
+    if n_blocks == 0:
+        # No tokens at all: nothing to compute, and a zero-size grid is not
+        # launchable.
+        def _noop(*_args) -> None:
+            return None
+
+        return {
+            "fused": _noop,
+            "dq_reduce": _noop,
+            "all": _noop,
+            "fused_pass": _noop,
+            "reduce_pass": _noop,
+            "outputs": (dq, dk, dv),
+            "groups": 0,
+            "spans": [],
+            "scratch": None,
+            "offsets": [],
+            "scratch_bytes": 0,
+            "carry_bytes": 0,
+            "reduce_bytes": 0,
+        }
+
+    n_groups, spans, dq_part, dq_carry = _plan_fused_groups(
+        counts,
+        block_m=block_m,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        max_seq_len=max_seq_len,
+        total_tokens=total_tokens,
+        groups=groups,
+        device=device,
+    )
+    max_tiles = len(counts)
+    offs = [build_partial_offsets(rows, tile_lo=lo, tile_hi=hi) for lo, hi in spans]
+    red_map = build_reduce_map(blocks_per_seq, n_blocks)
 
     reduce_launchers = [
         build_hstu_attention_bwd_dq_reduce(
@@ -1175,36 +1247,27 @@ def _make_bwd_fused_runners(
 
     # Bytes the reduction must move: every partial read once, dq written once,
     # PLUS the fp32 carry, which only exists at G > 1 -- every pass but the
-    # first reads it and every pass but the last writes it. Omitting the carry
-    # made the reported rate at G=4 look like 2.88 TB/s when the kernel was
-    # really moving 442 GB at 3.69.
+    # first reads it and every pass but the last writes it.
     carry_bytes = 2 * (n_groups - 1) * total_tokens * elems * 4
     return {
         "fused": lambda: [run_fused(g) for g in range(n_groups)],
         "dq_reduce": lambda: [run_reduce(g) for g in range(n_groups)],
         "all": run_all,
-        # Single-pass variants, for a profiler that has to pin ONE dispatch.
-        # The passes have different grids (the equal-partial-count split gives
-        # 13 of 64 kv tiles to pass 0 and 51 to pass 1 at the production
-        # shape), so a capture that cannot choose a pass lands on whichever
-        # happened to be Nth and two traces of the "same" profile are not
-        # comparable.
+        # Single-pass variants, for a profiler that has to pin ONE dispatch:
+        # the passes have different grids, so their traces are not comparable.
         "fused_pass": run_fused,
         "reduce_pass": run_reduce,
         "outputs": (dq, dk, dv),
         "groups": n_groups,
         "spans": spans,
-        # The scratch is allocated ONCE and reused by every pass, so this is
-        # the footprint at any instant, not the sum over passes.
-        # The scratch and its per-pass offset tables, for inspection: which
-        # elements a pass leaves unwritten is a property worth being able to
-        # measure rather than derive.
+        # The scratch is allocated ONCE and reused by every pass, so its size
+        # is the footprint at any instant, not the sum over passes.
         "scratch": dq_part,
         "offsets": offs,
         "scratch_bytes": dq_part.numel() * dq_part.element_size(),
         "carry_bytes": dq_carry.numel() * dq_carry.element_size(),
         "reduce_bytes": (
-            sum(totals) * elems * 4 + q_c.numel() * q_c.element_size() + carry_bytes
+            sum(counts) * elems * 4 + q_c.numel() * q_c.element_size() + carry_bytes
         ),
     }
 

@@ -324,15 +324,7 @@ def build_hstu_attention_bwd_dq(
         c_zero_f = fx.Float32(0.0)
 
         def silu_grad_batch(s_list):
-<<<<<<< HEAD
             """Compute silu'(alpha*s) with fast fp32 exp2 and reciprocal."""
-=======
-            """silu'(alpha*s) = sigma*(1 + alpha*s*(1-sigma)); same fast sigmoid as forward.
-
-            The fastmath context gives every add/mul the `fast` flag and turns the
-            reciprocal into v_rcp_f32; only exp2 stays on the amdgcn intrinsic. See the
-            dV/dK kernel for why exp2 needs the explicit `afn` flag."""
->>>>>>> main
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]

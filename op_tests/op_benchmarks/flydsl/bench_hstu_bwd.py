@@ -1,29 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark the FlyDSL HSTU backward on gfx942, at the SILOTIGER-1197 shapes.
+"""Benchmark the FlyDSL HSTU backward on gfx942 at production-like shapes.
 
 Times two backends on identical bf16 inputs and reports the speedup of one
 over the other:
 
-  ``split``   today's pair -- the KV-owned dV/dK kernel, then a second pass for
+  ``split``   the pair -- the KV-owned dV/dK kernel, then a second pass for
               dQ. The only path that covers fp16, head_dim != 64 and gfx950, so
               it is the baseline and the fallback.
   ``fused``   the single-pass dV/dK/dQ kernel, which emits dQ as a split-K
               partial per KV tile and sums it with a reduction kernel. Gated to
               gfx942 / bf16 / head_dim == hidden_dim == 64.
 
-The fused arm is reported as ``fused`` + ``dq_reduce`` as well as a total: the
-reduction is fully EXPOSED -- reduce(g) must finish before fused(g+1) overwrites
-the scratch -- so it is a standing cost to tune independently, not something
-hiding under the next pass.
+Before timing, every cell checks that the two backends' gradients agree.
+
+The ``total`` rows time each backend's whole backward in its real launch order:
+dV/dK then dQ for split, and fused(0), reduce(0), fused(1), ... for fused. The
+phase rows (``dvdk``/``dq``, ``fused``/``dq_reduce``) time each phase's launches
+back to back on their own. The reduction is fully EXPOSED -- reduce(g) must
+finish before fused(g+1) overwrites the scratch -- so it is a standing cost to
+tune independently, not something hiding under the next pass.
 
 Each arm runs ONE pass of per-iteration event-timed launches on one GPU, and
-the median of those iterations is reported. A single pass is enough here: the
-spread between an arm's median and its minimum is 0.1-1.5% on a locked idle
-GPU, well under any difference this table is read for. Run it on an idle card
-(tmp/pick_idle_gpu.sh) -- a neighbour on the package moves these far more than
-the sampling does.
+the median of those iterations is reported. Run it on an idle card: a neighbour
+on the package moves these far more than the sampling does.
 
 ``--meta`` additionally prints, per cell, the compiled-kernel resources (VGPR /
 LDS / spills, and the occupancy they imply) and the device footprint -- the fp32
@@ -32,10 +33,10 @@ all. The resources come from a forked worker, because the ISA dump needs
 ``FLYDSL_DUMP_IR`` set before FlyDSL is imported and would otherwise dump on
 every compile in the timed run.
 
-A note on the regime labels: ``Training`` and ``Inference`` are the ticket's
-names for **B=1024 and B=120**. Both are BACKWARD measurements -- neither
-denotes a forward path. The B=120 cells are cheap and are the only ones where
-the scratch fits in a single pass (G=1), which is a distinct code path.
+A note on the regime labels: ``Training`` and ``Inference`` name **B=1024 and
+B=120**. Both are BACKWARD measurements -- neither denotes a forward path. The
+B=120 cells are cheap and are the only ones where the scratch fits in a single
+pass (G=1), which is a distinct code path.
 
 Usage -- run from the repo root, which has to be on ``sys.path`` for the
 ``op_tests`` import below to resolve (``-m`` does that; a plain script path
@@ -78,6 +79,8 @@ from aiter.ops.flydsl.hstu_attention import (
 )
 from op_tests.test_flydsl_hstu_attention_bwd import (
     SUPPORTED_GFX,
+    TOL_DQK,
+    TOL_DV,
     build_bwd_inputs,
 )
 
@@ -85,21 +88,13 @@ from op_tests.test_flydsl_hstu_attention_bwd import (
 SEQ_LEN = 16384
 HEAD_DIM = 64
 DTYPE = torch.bfloat16
-# Length-distribution knob, NOT model sparsity: `length = uniform[1, N] * 0.95`,
-# which is what reproduces the ticket's token counts (L = 7,885,787 at B=1024
-# and 925,531 at B=120). 0.949 or 0.951 miss by ~8,000 tokens.
+# Length-distribution knob, NOT model sparsity: `length = uniform[1, N] * 0.95`
+# (L = 7,885,787 tokens at B=1024 and 925,531 at B=120).
 SPARSITY = 0.95
 
 # (regime, batch, heads, mask, target_size, iters). One pass of `iters` timed
-# iterations per arm; the median is reported.
-#
-# Only the SHAPES come from the ticket -- no reference latency is recorded
-# here. A number measured on another machine, at another time, by another
-# build is not something this table can honestly compare against; `split` is
-# measured right beside `fused` and is the baseline.
-#
-# Training hstu appears at BOTH target counts because the ticket's two tables
-# disagree -- one says targets=10, the other targets=300.
+# iterations per arm; the median is reported. No reference latency is recorded
+# here: `split` is measured right beside `fused` and is the baseline.
 CELLS = [
     ("Training", 1024, 4, "causal", 0, 11),
     ("Training", 1024, 4, "hstu", 300, 11),
@@ -156,10 +151,8 @@ def time_arm(fn, iters, warmup=2) -> np.ndarray:
     iteration would drain the queue each time and bill the drain to a kernel
     that in practice never pays it.
 
-    One pass, not several: on a locked idle GPU the spread between the median
-    and the minimum of these iterations is 0.1-1.5%, so repeating the pass
-    buys resolution the comparison does not need. The warmup absorbs the
-    first-call JIT compile, which is therefore never timed.
+    The warmup absorbs the first-call JIT compile, which is therefore never
+    timed.
     """
     for _ in range(warmup):
         fn()
@@ -173,6 +166,34 @@ def time_arm(fn, iters, warmup=2) -> np.ndarray:
         ends[i].record()
     torch.cuda.synchronize()
     return np.array([s.elapsed_time(e) for s, e in zip(starts, ends)])
+
+
+def check_grads_agree(fused_outputs, split_runners, rows=1 << 16):
+    """Fail the cell if the fused and split gradients disagree.
+
+    Each backend is held to the fp32 oracle by the test suite at TOL_DV /
+    TOL_DQK, so two correct backends differ by at most the sum. The dense
+    oracle does not fit at these shapes, and neither does an fp32 copy of a
+    whole gradient, so the comparison runs on a random sample of rows.
+    """
+    dq, dk, dv = fused_outputs
+    ref_dv, ref_dk = split_runners["dvdk"][1]
+    (ref_dq,) = split_runners["dq"][1]
+    g = torch.Generator(device=dq.device).manual_seed(0)
+    idx = torch.randint(0, dq.shape[0], (min(rows, dq.shape[0]),), generator=g)
+    for name, got, ref, tol in (
+        ("dv", dv, ref_dv, TOL_DV),
+        ("dk", dk, ref_dk, TOL_DQK),
+        ("dq", dq, ref_dq, TOL_DQK),
+    ):
+        got_s, ref_s = got[idx].float(), ref[idx].float()
+        err = float((got_s - ref_s).abs().max())
+        peak = float(ref_s.abs().max())
+        if not err <= 2 * tol * peak:
+            raise AssertionError(
+                f"fused vs split {name}: max|diff| {err:.3e} exceeds "
+                f"{2 * tol:.0%} of peak {peak:.3e}"
+            )
 
 
 def bench_cell(regime, b, h, mask, target_size, iters, names, max_attn_len=0):
@@ -196,13 +217,26 @@ def bench_cell(regime, b, h, mask, target_size, iters, names, max_attn_len=0):
     # time the caching allocator, and hoisting only one arm's setup (the
     # balance permutation included) would hand that arm the difference.
     arms, meta = {}, {"L": total_tokens}
+    split_runners = runners = None
     if "split" in names:
         split_runners = _make_bwd_kernel_runners(*args)
-        arms["dvdk"] = split_runners["dvdk"][0]
-        arms["dq"] = split_runners["dq"][0]
+        run_dvdk = split_runners["dvdk"][0]
+        run_dq = split_runners["dq"][0]
+
+        def run_split():
+            run_dvdk()
+            run_dq()
+
+        arms["split total"] = run_split
+        arms["dvdk"] = run_dvdk
+        arms["dq"] = run_dq
         arms["split e2e"] = lambda: flydsl_hstu_attention_bwd(*args, fused=False)
     if "fused" in names:
         runners = _make_bwd_fused_runners(*args)
+        # `all` interleaves fused(g) and reduce(g); it is the backward. The
+        # two phase arms run each phase's G launches back to back instead,
+        # which times the phase but leaves dq stale at G > 1.
+        arms["fused total"] = runners["all"]
         arms["fused"] = runners["fused"]
         arms["dq_reduce"] = runners["dq_reduce"]
         meta["G"] = runners["groups"]
@@ -214,8 +248,13 @@ def bench_cell(regime, b, h, mask, target_size, iters, names, max_attn_len=0):
         # autograd actually calls. The arms above time launch closures built
         # once outside the loop, which is right for comparing kernels but is
         # not what a caller pays. Keeping both makes the per-call planning cost
-        # visible; it was 6.8% and went unnoticed because nothing measured it.
+        # visible.
         arms["fused e2e"] = lambda: flydsl_hstu_attention_bwd(*args, fused=True)
+
+    if split_runners is not None and runners is not None:
+        run_split()
+        runners["all"]()
+        check_grads_agree(runners["outputs"], split_runners)
 
     # One pass per arm. `time_arm`'s warmup absorbs the JIT compile, so no
     # separate compile pass is needed to keep it out of the timed window.
@@ -224,17 +263,13 @@ def bench_cell(regime, b, h, mask, target_size, iters, names, max_attn_len=0):
 
     if e2e_arms:
         # Time the public entry point only AFTER releasing the phase runners.
-        # They hold the fp32 scratch alive, so otherwise each public call
-        # allocates a SECOND one beside it -- tens of GB of pure measurement
-        # artifact, which showed up as 18 ms of phantom overhead against a real
-        # 6.8 ms. The warmup inside `time_arm` absorbs the one-time allocation,
-        # which is correct: a training loop pays it once, not per step.
-        # Drop every reference the phase arms hold. The fused runner owns the
-        # fp32 scratch, so otherwise each public call allocates a SECOND one
-        # beside it -- tens of GB of pure measurement artifact, which showed up
-        # as 18 ms of phantom overhead against a real 6.8 ms.
+        # The fused runner owns the fp32 scratch, so otherwise each public call
+        # allocates a SECOND one beside it -- tens of GB of measurement
+        # artifact. The warmup inside `time_arm` absorbs the one-time
+        # allocation, which is correct: a training loop pays it once, not per
+        # step.
         arms.clear()
-        runners = split_runners = None
+        runners = split_runners = run_split = run_dvdk = run_dq = None
         gc.collect()
         torch.cuda.empty_cache()
         for name, fn in e2e_arms.items():
@@ -255,34 +290,16 @@ def bench_cell(regime, b, h, mask, target_size, iters, names, max_attn_len=0):
     rows = []
     for name, times in results.items():
         median = float(np.median(times))
+        whole = name.endswith((" e2e", " total"))
         rows.append({
             "regime": regime, "B": b, "H": h, "mask": mask,
             "targets": target_size, "backend": name,
             "median_ms": median, "min_ms": float(times.min()),
             # `flops` counts the WHOLE backward, so dividing it by one phase's
-            # time would overstate that phase. Phases get no roofline; the e2e
-            # arms are complete backwards, so they do.
-            "TFLOPS": (
-                flops / median / 1e9 if name.endswith(" e2e") else float("nan")
-            ),
+            # time would overstate that phase. Phases get no roofline.
+            "TFLOPS": flops / median / 1e9 if whole else float("nan"),
             "L": total_tokens,
             "G": meta.get("G", float("nan")),
-        })  # fmt: skip
-
-    # Each arm's two phases run back to back and are both exposed, so the whole
-    # backward is their sum. Reported as its own row so the table carries the
-    # phases and the result a caller actually sees.
-    for label, phases in (("split", ("dvdk", "dq")), ("fused", ("fused", "dq_reduce"))):
-        if not all(p in results for p in phases):
-            continue
-        total = sum(float(np.median(results[p])) for p in phases)
-        rows.append({
-            "regime": regime, "B": b, "H": h, "mask": mask,
-            "targets": target_size, "backend": f"{label} total",
-            "median_ms": total,
-            "min_ms": sum(float(results[p].min()) for p in phases),
-            "TFLOPS": flops / total / 1e9,
-            "L": total_tokens, "G": meta.get("G", float("nan")),
         })  # fmt: skip
     if "dq_reduce" in results:
         meta["reduce_TBs"] = meta["reduce_GB"] / float(np.median(results["dq_reduce"]))
@@ -479,7 +496,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         prog="bench_hstu_bwd",
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Benchmark the FlyDSL HSTU backward at the SILOTIGER-1197 "
+        description="Benchmark the FlyDSL HSTU backward at production-like "
         "shapes (N=16384, d=64, bf16, causal).",
     )
     parser.add_argument(
@@ -490,7 +507,7 @@ def parse_args():
     parser.add_argument(
         "--regime", nargs="*", default=["Training", "Inference"],
         choices=["Training", "Inference"],
-        help="""Ticket regimes to run. These name B=1024 and B=120; both are
+        help="""Regimes to run. These name B=1024 and B=120; both are
         backward measurements.
         e.g.: --regime Inference""",
     )  # fmt: skip
@@ -506,9 +523,7 @@ def parse_args():
     )  # fmt: skip
     parser.add_argument(
         "--max-attn-len", type=int, default=0,
-        help="""Sliding-window width. 0 (default) is the unwindowed mask.
-        No tuned row exists for windowed shapes, so BOTH paths fall back to
-        default tiles -- see the note the run prints.""",
+        help="""Sliding-window width. 0 (default) is the unwindowed mask.""",
     )  # fmt: skip
     parser.add_argument(
         "-v", "--verbose", action="store_true",
@@ -548,13 +563,6 @@ def main():
     if not names:
         return
 
-    if args.max_attn_len:
-        aiter.logger.warning(
-            "max_attn_len=%d: no tuned CSV row exists for a windowed shape, so "
-            "the split arm runs DEFAULT tiles rather than its tuned ones. The "
-            "comparison is not tuned-vs-tuned.",
-            args.max_attn_len,
-        )
     cells = [
         c for c in CELLS
         if c[0] in args.regime and c[2] in args.heads and c[3] in args.mask
