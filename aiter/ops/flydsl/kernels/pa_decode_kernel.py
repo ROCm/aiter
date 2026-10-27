@@ -65,6 +65,7 @@ from .pa_decode.traits import (
     Gfx1250Traits,
     PaDecodeSchedule,
     PaDecodeTraits,
+    select_gfx1250_query_splits,
 )
 
 __all__ = [
@@ -152,18 +153,14 @@ def compile_pa_decode_tile(
         if direct_output and num_partitions != 1:
             raise ValueError("direct_output requires a one-partition plan")
         if query_splits is None:
-            # Split the measured spilling BF16 specialization into one Q tile
-            # per CTA. Other shapes retain fused queries and their KV reuse.
-            query_splits = (
-                4
-                if kv_dtype == "bf16"
-                and head_dim == 1024
-                and query_group_size == 16
-                and query_length == 4
-                and block_size == 128
-                and trans_v
-                and sliding_window == 0
-                else 1
+            query_splits = select_gfx1250_query_splits(
+                kv_dtype=kv_dtype,
+                head_dim=head_dim,
+                query_group_size=query_group_size,
+                query_length=query_length,
+                block_size=block_size,
+                trans_v=trans_v,
+                sliding_window=sliding_window,
             )
         return compile_gfx1250_pa_decode(
             head_dim=head_dim,
@@ -430,7 +427,7 @@ def compile_gfx1250_pa_decode(
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
     if t.bf16 and per_token_kv:
         raise ValueError("BF16 PA decode does not use quantization scales")
-    if t.total_bytes > 327680:
+    if t.total_bytes > Gfx1250Traits.LDS_LIMIT_BYTES:
         raise NotImplementedError(
             "gfx1250 PA decode query/KV tiles exceed LDS capacity"
         )

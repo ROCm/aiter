@@ -15,7 +15,7 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import ReductionOp
 
 from ..utils import rcp_f32
-from .op_epilog import PaDecodeEpilogue
+from .op_epilog import Gfx1250Epilogue, PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_softmax import PaDecodeSoftmax
@@ -621,18 +621,12 @@ class Gfx1250Bf16Pipeline:
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
         self.mem = Gfx1250Memory(ctx)
+        self.epilogue = Gfx1250Epilogue(ctx)
 
     @flyc.jit
     def run(self):
         ctx, t = self.ctx, self.t
-        ctx.tid = fx.Int32(gpu.thread_id("x"))
-        ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
-        ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
-        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
-        ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
-            t.query_length // t.query_splits
-        )
-        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
+        ctx.init_gfx1250_mapping()
         self.mem.allocate()
         query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
         q_operands = []
@@ -749,7 +743,7 @@ class Gfx1250Bf16Pipeline:
                 tile_sum = tile_sum + tile_sum.shuffle_xor(16, t.WAVE)
                 if ctx.half == 0:
                     self.mem.store(
-                        t.stats_offset + 256 + (ctx.lane16 * 4 + ctx.warp) * 4,
+                        t.stats_sum_offset + (ctx.lane16 * 4 + ctx.warp) * 4,
                         tile_sum,
                         fx.Float32,
                     )
@@ -766,7 +760,7 @@ class Gfx1250Bf16Pipeline:
                     )
                 gpu.barrier()
                 denom = state[m * state_stride + 1] * corr + self.mem.load(
-                    t.stats_offset + 256 + ctx.lane16 * 16, fx.Float32, 4
+                    t.stats_sum_offset + ctx.lane16 * 16, fx.Float32, 4
                 ).reduce(ReductionOp.ADD)
                 next_state.extend([new_max, denom])
                 p_operands = [
@@ -795,68 +789,19 @@ class Gfx1250Bf16Pipeline:
                     # Retire P reads before another query tile overwrites them.
                     gpu.barrier()
             final = yield next_state
-        pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
-        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
-        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
-        slot = fx.Int64(ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
-            gpu.block_id("x")
-        )
-        for m in range_constexpr(t.m_tiles):
-            row = m * 16 + ctx.lane16
-            output_row = ctx.query_begin * t.query_group_size + row
-            partial_row = slot * (t.rows * t.query_splits) + output_row
-            denom = final[m * state_stride + 1]
-            inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
-            if row < t.rows:
-                for vh in range_constexpr(t.head_dim // 64):
-                    d = vh * 64 + ctx.warp * 16 + ctx.half * 8
-                    value = (
-                        final[m * state_stride + 2 + vh]
-                        * fx.Vector.from_elements(
-                            [inv],
-                            dtype=fx.Float32,
-                        ).broadcast_to(8)
-                    ).to(t.q_dtype)
-                    offset = (
-                        (
-                            fx.Int64(ctx.planned_seq) * t.query_length
-                            + output_row // t.query_group_size
-                        )
-                        * ctx.stride_q_row
-                        + (
-                            ctx.kv_h * t.query_group_size
-                            + output_row % t.query_group_size
-                        )
-                        * ctx.stride_q_head
-                        + d
-                        if t.direct_output
-                        else partial_row * t.head_dim + d
-                    )
-                    fx.ptr_store(value, fx.add_offset(pout, offset))
-                if const_expr(not t.direct_output):  # noqa: SIM102
-                    if ctx.warp == 0 and ctx.half == 0:
-                        pmax[partial_row] = final[m * state_stride] * fx.Float32(
-                            1.0 / LOG2E
-                        )
-                        psum[partial_row] = denom
+        self.epilogue.store(final, state_stride)
 
 
 class Gfx1250Pipeline:
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
         self.mem = Gfx1250Memory(ctx)
+        self.epilogue = Gfx1250Epilogue(ctx)
 
     @flyc.jit
     def run(self):
         ctx, t = self.ctx, self.t
-        ctx.tid = fx.Int32(gpu.thread_id("x"))
-        ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
-        ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
-        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
-        ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
-            t.query_length // t.query_splits
-        )
-        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
+        ctx.init_gfx1250_mapping()
         self.mem.allocate()
         if const_expr(t.q_tiles == t.m_tiles):
             self.mem.stage_query()
@@ -1106,7 +1051,7 @@ class Gfx1250Pipeline:
                     )
                 if ctx.half == 0:
                     self.mem.store(
-                        t.stats_offset + 256 + (ctx.lane16 * t.NWARP + ctx.warp) * 4,
+                        t.stats_sum_offset + (ctx.lane16 * t.NWARP + ctx.warp) * 4,
                         local_sum,
                         fx.Float32,
                     )
@@ -1144,7 +1089,7 @@ class Gfx1250Pipeline:
                     ]
                 gpu.barrier()
                 denom = state[m * state_stride + 1] * corr + self.mem.load(
-                    t.stats_offset + 256 + ctx.lane16 * t.NWARP * 4, fx.Float32, t.NWARP
+                    t.stats_sum_offset + ctx.lane16 * t.NWARP * 4, fx.Float32, t.NWARP
                 ).reduce(ReductionOp.ADD)
                 next_state.extend([new_max, denom])
                 p_operands = [
@@ -1196,52 +1141,4 @@ class Gfx1250Pipeline:
             if const_expr(t.packed_lds):
                 next_state.append(vfactor)
             final = yield next_state
-        pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
-        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
-        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
-        slot = fx.Int64(ctx.kv_h) * fx.Int64(gpu.grid_dim.x) + fx.Int64(
-            gpu.block_id("x")
-        )
-        for m in range_constexpr(t.m_tiles):
-            row = m * 16 + ctx.lane16
-            output_row = ctx.query_begin * t.query_group_size + row
-            partial_row = slot * (t.rows * t.query_splits) + output_row
-            denom = final[m * state_stride + 1]
-            inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
-            if row < t.rows:
-                for vh in range_constexpr(vh_count):
-                    d = vh * 64 + ctx.warp * 16 + ctx.half * 8
-                    value = (
-                        final[m * state_stride + 2 + vh]
-                        * fx.Vector.from_elements(
-                            [fx.Float32(inv * final[-1] if t.packed_lds else inv)],
-                            dtype=fx.Float32,
-                        ).broadcast_to(8)
-                    ).to(t.q_dtype)
-                    fx.ptr_store(
-                        value,
-                        fx.add_offset(
-                            pout,
-                            (
-                                (
-                                    fx.Int64(ctx.planned_seq) * t.query_length
-                                    + output_row // t.query_group_size
-                                )
-                                * ctx.stride_q_row
-                                + (
-                                    ctx.kv_h * t.query_group_size
-                                    + output_row % t.query_group_size
-                                )
-                                * ctx.stride_q_head
-                                + d
-                                if t.direct_output
-                                else partial_row * t.head_dim + d
-                            ),
-                        ),
-                    )
-                if const_expr(not t.direct_output):  # noqa: SIM102
-                    if ctx.warp == 0 and ctx.half == 0:
-                        pmax[partial_row] = final[m * state_stride] * fx.Float32(
-                            1.0 / LOG2E
-                        )
-                        psum[partial_row] = denom
+        self.epilogue.store(final, state_stride)

@@ -95,6 +95,23 @@ class PaDecodeContext:
             self.warp * 4 + self.rgroup
         )  # 0..15: this thread's query row within an M-tile
 
+    def init_gfx1250_mapping(self):
+        """Resolve the wave32 grid to a KV head, query split and lane role.
+
+        Kept apart from the wave64 pair above: gfx9 derives its lane from the
+        warp quotient while gfx1250 takes the remainder directly, so folding
+        the two would re-emit one of the tuned paths.
+        """
+        t = self.traits
+        self.tid = fx.Int32(gpu.thread_id("x"))
+        self.warp, self.lane = self.tid // t.WAVE, self.tid % t.WAVE
+        self.lane16, self.half = self.lane % 16, self.lane // 16
+        self.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        self.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
+            t.query_length // t.query_splits
+        )
+        self.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
+
     def init_context_length(self):
         self.context_len = self.planned_context
 

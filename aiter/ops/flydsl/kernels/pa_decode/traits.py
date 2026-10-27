@@ -753,6 +753,34 @@ class PaDecodeTraits:
         )
 
 
+def select_gfx1250_query_splits(
+    *,
+    kv_dtype,
+    head_dim,
+    query_group_size,
+    query_length,
+    block_size,
+    trans_v,
+    sliding_window,
+) -> int:
+    """Query CTAs per KV head when the caller does not pin a split.
+
+    Split the measured spilling BF16 specialization into one Q tile per CTA.
+    Other shapes retain fused queries and their KV reuse.
+    """
+    return (
+        4
+        if kv_dtype == "bf16"
+        and head_dim == 1024
+        and query_group_size == 16
+        and query_length == 4
+        and block_size == 128
+        and trans_v
+        and sliding_window == 0
+        else 1
+    )
+
+
 @dataclass(frozen=True)
 class Gfx1250Traits:
     head_dim: int
@@ -771,6 +799,11 @@ class Gfx1250Traits:
     WAVE = 32
     NWARP = 4
     FP8_MAX = 448.0
+    # Cross-wave softmax exchange: 16 rows x NWARP waves x f32 for the running
+    # max, the same again for the denominator, padded to a 64-byte multiple.
+    STATS_MAX_BYTES = 256
+    STATS_BYTES = 576
+    LDS_LIMIT_BYTES = 320 * 1024
 
     @property
     def bf16_packed(self):
@@ -832,7 +865,10 @@ class Gfx1250Traits:
         # The widest BF16 MTP tile fits by staging one query tile at a time.
         full = self.m_tiles * 16 * self.q_stride
         return (
-            1 if full + self.kv_stride + self.p_bytes + 576 > 327680 else self.m_tiles
+            1
+            if full + self.kv_stride + self.p_bytes + self.STATS_BYTES
+            > self.LDS_LIMIT_BYTES
+            else self.m_tiles
         )
 
     @property
@@ -907,7 +943,10 @@ class Gfx1250Traits:
             # Page16 gathering can overlap the next four pages in a second buffer.
             return 2 if self.async_page or self.block_size == 16 else 1
         return (
-            2 if self.q_bytes + 2 * self.kv_stride + self.p_bytes + 576 <= 327680 else 1
+            2
+            if self.q_bytes + 2 * self.kv_stride + self.p_bytes + self.STATS_BYTES
+            <= self.LDS_LIMIT_BYTES
+            else 1
         )
 
     @property
@@ -919,8 +958,12 @@ class Gfx1250Traits:
         return self.p_offset + self.p_bytes
 
     @property
+    def stats_sum_offset(self):
+        return self.stats_offset + self.STATS_MAX_BYTES
+
+    @property
     def total_bytes(self):
-        return self.stats_offset + 576
+        return self.stats_offset + self.STATS_BYTES
 
     @property
     def use_tdm(self):
