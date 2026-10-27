@@ -913,7 +913,7 @@ class Gfx1250Pipeline:
             buffer = ((token_base - begin) // t.TOKENS) % t.buffers
             if const_expr(t.use_tdm):
                 tdm_ops.tensor_wait(0)
-                if const_expr(t.async_page):
+                if const_expr(t.async_page or t.page16_async_scales):
                     fx.rocdl.s_wait_asynccnt(0)
             else:
                 fx.rocdl.s_wait_asynccnt(0)

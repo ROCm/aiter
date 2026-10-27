@@ -914,12 +914,15 @@ class Gfx1250Memory:
             if full_tile
             else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
         )
-        page = fx.Int32(
-            table[
-                ctx.planned_seq * ctx.max_blocks_per_seq
-                + fx.Uint32(safe) // t.block_size
-            ]
-        )
+        if const_expr(cached_page is not None):
+            page = cached_page
+        else:
+            page = fx.Int32(
+                table[
+                    ctx.planned_seq * ctx.max_blocks_per_seq
+                    + fx.Uint32(safe) // t.block_size
+                ]
+            )
         off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
         pt = fx.Uint32(safe) % t.block_size
         wave_token = pt + (ctx.warp * 16 if t.block_size != 16 else 0)
@@ -1278,18 +1281,24 @@ class Gfx1250Memory:
         kv_off = t.q_bytes + buffer * t.kv_stride
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         page = fx.Int32(0)
-        if const_expr(t.async_page):
+        if const_expr(t.async_page or t.page16_async_scales):
+            page_absolute = token_base + (ctx.warp * 16 if t.page16_async_scales else 0)
             safe = (
-                token_base
+                page_absolute
                 if full_tile
-                else (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
+                else (page_absolute < ctx.planned_context).select(
+                    page_absolute, fx.Int32(0)
+                )
             )
             page = fx.Int32(
                 table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // t.block_size]
             )
         if const_expr(t.use_tdm):
             self.stage_tdm(
-                token_base, kv_off, full_tile, page if t.async_page else None
+                token_base,
+                kv_off,
+                full_tile,
+                page if t.async_page or t.page16_async_scales else None,
             )
         else:
             self.stage_vector_dma(token_base, kv_off)
@@ -1309,6 +1318,20 @@ class Gfx1250Memory:
                     fx.Int64(fx.ptrtoint(ctx.value_scale_ptr)),
                     (index + ctx.tid * 4) * 4,
                     kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4 + ctx.tid * 16,
+                )
+        elif const_expr(t.page16_async_scales and full_tile):
+            index = fx.Int64(page) * ctx.stride_ks_block + ctx.kv_h * ctx.stride_ks_head
+            if ctx.lane < 4:
+                token = ctx.warp * 16 + ctx.lane * 4
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.key_scale_ptr)),
+                    (index + ctx.lane * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + token * 4,
+                )
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.value_scale_ptr)),
+                    (index + ctx.lane * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + token) * 4,
                 )
         else:
             if const_expr(t.per_token_kv):

@@ -922,6 +922,16 @@ class Gfx1250Traits:
         )
 
     @property
+    def page16_async_scales(self):
+        # Each wave copies one page's contiguous FP32 token scales into LDS.
+        return (
+            self.packed_lds
+            and self.block_size == 16
+            and self.per_token_kv
+            and self.sliding_window == 0
+        )
+
+    @property
     def buffers(self):
         if self.packed_lds:
             # Multi-tile 64-token chunks overlap gathered pages or windowed
