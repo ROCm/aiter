@@ -56,6 +56,8 @@ def _fused_qknorm_idxrqknorm_hip(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    q_fp8_out: Tensor | None = None,
+    q_scale: Tensor | None = None,
 ) -> None:
     pass
 
@@ -87,12 +89,23 @@ def fused_qknorm_idxrqknorm(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    q_fp8_out: Tensor | None = None,
+    q_scale: Tensor | None = None,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
     # (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k /
     # kv_cache_v are typically the key/value slices of a fused
     # [num_blocks, 2, block_size, num_kv_heads, head_dim] cache).
+    # kv_cache_dtype="mxfp4" (sparse insert only: needs the index slots in qkv; pass
+    # skip_index_branch=True for a layer that reuses another layer's top-k) writes the main K
+    # and V rows as MXFP4 into uint8 [num_pages, num_kv_heads, 8704] caches, one 128-token
+    # page per (page, head): [128 x 64 B e2m1][128 x 4 B e8m0], the same page as the MXFP4
+    # index cache and the layout pa_decode_mxfp4 reads (block_size must be 128; the caches'
+    # own page/head strides are used; no k_scale/v_scale).
+    # q_fp8_out [T, num_heads * 128] float8_e4m3fn (insert mode): the post norm+RoPE main q as
+    # e4m3(bf16(q) / q_scale) with q_scale a [1] float32 device tensor (None = 1.0). With
+    # q_out None the bf16 row is not written back.
     # index_cache_dtype: "auto" (qkv dtype), "fp8", or "mxfp4". "mxfp4" needs a contiguous
     # uint8 index_cache of whole 8704 B pages, [128 tokens x 64 B e2m1][128 x 4 B e8m0],
     # the layout minimax_m3_index_score_fp4 reads; it only changes the index-K write.
@@ -157,4 +170,6 @@ def fused_qknorm_idxrqknorm(
         v_scale,
         asm_layout,
         skip_index_branch,
+        q_fp8_out,
+        q_scale,
     )
