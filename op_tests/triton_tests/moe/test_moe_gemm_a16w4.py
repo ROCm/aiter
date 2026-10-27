@@ -124,6 +124,15 @@ class Case:
             # gfx942 tuned table: m=256 -> block_m=128, m=128 -> block_m=64
             Case(256, 1536, 5120, 2, 1),
             Case(128, 1536, 5120, 2, 1),
+            # w2 rows: m=256 reaches bm128_n5120_k768, m=128 reaches bm64_n5120_k768
+            Case(256, 5120, 768, 2, 1),
+            Case(128, 5120, 768, 2, 1),
+            # gfx942 tuned table, gpt-oss (vLLM pads 2880 -> 3072):
+            # m=1 -> block_m=16, m=256 -> block_m=32
+            Case(1, 6144, 3072, 32, 4),
+            Case(1, 3072, 3072, 32, 4),
+            Case(256, 6144, 3072, 32, 4),
+            Case(256, 3072, 3072, 32, 4),
             Case(16, 32, 256, 2, 1, hbm_swizzling=True),
             Case(16, 256, 256, 8, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
