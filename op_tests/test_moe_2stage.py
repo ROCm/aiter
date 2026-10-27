@@ -151,7 +151,7 @@ def _profile_q256(call, kernel_name):
     ]
     assert (
         kernel_name in names
-    ), f"Q256 producer {kernel_name!r} did not execute: {names}"
+    ), f"Q256 expert kernel {kernel_name!r} did not execute: {names}"
     reductions = [name for name in names if name.startswith("moe_reduction_")]
     assert reductions, f"Q256 reduction did not execute: {names}"
     expected_streaming = out.shape == (8192, 8192)
@@ -175,17 +175,17 @@ def _check_q256_integration(
     shared_expert_id=None,
     check_dispatch_regressions=True,
 ):
-    """Check real dispatch, compact producer parity, and model call contracts."""
+    """Check real dispatch, expert-kernel parity, and model call contracts."""
     hidden, w1, _w2, _weights, ids = call_args
     tokens, model = hidden.shape
     topk = ids.shape[1]
     weighted = expected_kernel.endswith("_route_weighted") and tokens == 8192
-    actual_kernel = _Q256_KERNEL + ("_route_weighted" if weighted else "_route")
-    native = moe_op.fmoe_q256_producer
+    actual_kernel = _Q256_KERNEL + ("_weighted" if weighted else "")
+    native = moe_op.fmoe_q256_fused_experts
     captured = []
 
-    def producer(*args, **kw):
-        assert not kw, "update this test if the producer ABI changes"
+    def fused_experts(*args, **kw):
+        assert not kw, "update this test if the fused expert entry point changes"
         out, partials = args[:2]
         assert out.shape == (tokens, model)
         assert partials.shape == (tokens, topk, model)
@@ -199,12 +199,12 @@ def _check_q256_integration(
     def call():
         return fused_moe(*call_args, **kwargs)
 
-    with patch.object(moe_op, "fmoe_q256_producer", producer):
+    with patch.object(moe_op, "fmoe_q256_fused_experts", fused_experts):
         out = _profile_q256(call, actual_kernel)
-    assert captured, "fused_moe did not call fmoe_q256_producer"
+    assert captured, "fused_moe did not call fmoe_q256_fused_experts"
     nrms = _check_q256_reference(reference, out, "Q256 torch reference")
 
-    # Compare weighted scheduling against the ordinary compact producer, then
+    # Compare weighted scheduling against the ordinary compact kernel, then
     # reduce with torch independently of the production FlyDSL reducer.
     args = captured[0]
     if weighted and shared_expert_id is not None:
@@ -246,15 +246,13 @@ def _check_q256_integration(
     baseline_args[0] = torch.empty_like(out)
     baseline_args[1] = compact_partials
     native(*baseline_args)
-    assert torch.equal(partials, compact_partials), "weighted/compact producer mismatch"
-    producer_ref = compact_partials.float().sum(1)
-    assert torch.equal(
-        producer_ref.to(out.dtype), out
-    ), "Q256 compact producer reduction"
-    del compact_partials, producer_ref, baseline_args
+    assert torch.equal(partials, compact_partials), "weighted/compact expert mismatch"
+    expert_sum = compact_partials.float().sum(1)
+    assert torch.equal(expert_sum.to(out.dtype), out), "Q256 compact expert reduction"
+    del compact_partials, expert_sum, baseline_args
 
     output = torch.full_like(out, float("nan"))
-    with patch.object(moe_op, "fmoe_q256_producer", producer):
+    with patch.object(moe_op, "fmoe_q256_fused_experts", fused_experts):
         returned = fused_moe(*call_args, output=output, block_size_M=256, **kwargs)
         assert returned is output, "Q256 did not return the caller's output buffer"
         assert torch.equal(output, out), "Q256 output buffer was not overwritten"
@@ -291,14 +289,14 @@ def _check_q256_integration(
             with (
                 patch.object(
                     moe_op,
-                    "fmoe_q256_producer",
-                    side_effect=AssertionError("invalid config reached producer"),
+                    "fmoe_q256_fused_experts",
+                    side_effect=AssertionError("invalid config reached fused experts"),
                 ),
                 pytest.raises((RuntimeError, ValueError), match=r"(?s).+"),
             ):
                 fused_moe(*call_args, **kwargs, **invalid_kwargs)
     return {
-        "Q256 producer compared": True,
+        "Q256 fused experts compared": True,
         "Q256 executed kernel": actual_kernel,
         "Q256 NRMS": nrms,
     }
@@ -477,7 +475,7 @@ def _check_q256_dynamic_routes(
         returned = call()
     assert returned is output
     boundaries = []
-    native = moe_op.fmoe_q256_producer
+    native = moe_op.fmoe_q256_fused_experts
 
     def observe(*args, **kw):
         boundaries.append(int(args[8][0].item()) // 256 - 32)
@@ -506,7 +504,7 @@ def _check_q256_dynamic_routes(
         )
         if zero:
             assert torch.count_nonzero(output).item() == 0
-        with patch.object(moe_op, "fmoe_q256_producer", observe):
+        with patch.object(moe_op, "fmoe_q256_fused_experts", observe):
             eager = call().clone()
         _check_q256_reference(expected, eager, "Q256 changed routes eager")
     assert (
@@ -1924,7 +1922,7 @@ def _q256_case(token, model_dim, shared_expert_id=512):
         "check_aot_cache": False,
         "disable_stage2_bias": True,
         "expected_kernel": _Q256_KERNEL
-        + ("_route_weighted" if (token, model_dim) == (8192, 8192) else ""),
+        + ("_weighted" if (token, model_dim) == (8192, 8192) else ""),
     }
 
 
@@ -2032,13 +2030,13 @@ def test_q256_token_boundaries():
         assert not moe_op.is_q256_kernel(fallback.stage1.keywords.get("kernelName", ""))
     stage1 = functools.partial(
         metadata.stage1.func,
-        **{**metadata.stage1.keywords, "kernelName": _Q256_KERNEL + "_route_weighted"},
+        **{**metadata.stage1.keywords, "kernelName": _Q256_KERNEL + "_weighted"},
     )
     forced = dataclasses.replace(metadata, stage1=stage1)
     rows = []
     for token in (4096, 4097, 8191, 8192, 8193):
         case = _q256_case(token, 8192)
-        case["expected_kernel"] = _Q256_KERNEL + "_route_weighted"
+        case["expected_kernel"] = _Q256_KERNEL + "_weighted"
         # Public-dispatch regressions run with the prepared inputs in the normal
         # sweep; this boundary sweep deliberately binds patched metadata.
         case["q256_dispatch_regressions"] = False

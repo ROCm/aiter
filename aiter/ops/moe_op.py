@@ -736,8 +736,8 @@ def ck_moe_stage2_fwd(
     return out
 
 
-@compile_ops("module_moe_q256_asm", ffi_type="ctypes")
-def fmoe_q256_producer(
+@compile_ops("module_moe_q256_fused_experts_asm", ffi_type="ctypes")
+def fmoe_q256_fused_experts(
     out: Tensor,
     partials: Tensor,
     input: Tensor,
@@ -752,14 +752,24 @@ def fmoe_q256_producer(
     down_scale: Tensor,
     topk: int,
     job_map: Tensor | None = None,
-) -> None: ...
+) -> None:
+    """Compute weighted expert outputs; reduction produces the final MoE output."""
 
 
-_Q256_KERNEL = "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate"
+_Q256_KERNEL = (
+    "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route"
+)
+_Q256_LEGACY_KERNEL = "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate"
 
 
 def is_q256_kernel(kernel_name):
-    return kernel_name in (_Q256_KERNEL, _Q256_KERNEL + "_route_weighted")
+    # Retain selectors from existing AITER_CONFIG_FMOE overrides.
+    return kernel_name in (
+        _Q256_KERNEL,
+        _Q256_KERNEL + "_weighted",
+        _Q256_LEGACY_KERNEL,
+        _Q256_LEGACY_KERNEL + "_route_weighted",
+    )
 
 
 def fmoe_q256(
@@ -778,29 +788,37 @@ def fmoe_q256(
     *,
     kernelName: str = "",
 ) -> None:
-    """Run both projections, SiLU, hidden MXFP4 quantization and route weighting.
+    """Compute the fused expert network and sum the selected expert outputs.
 
-    The ASM producer writes BF16 contributions in token/top-k order. FlyDSL
-    sums those contributions in FP32 and writes the final caller output.
-    The compact producer requires gfx950, separated shuffled MXFP4 weights,
+    The fused expert kernel performs both projections, SiLU, hidden MXFP4
+    quantization and route weighting. It writes weighted BF16 expert outputs
+    in token/top-k order. FlyDSL sums them in FP32 and writes the final output.
+    The compact kernel requires gfx950, separated shuffled MXFP4 weights,
     intermediate width 256, model width >=512 divisible by 256, BF16 output
     and 256-row sorting. Token IDs fit in 24 bits and top-k is at most 127.
 
     Weighted scheduling additionally requires exactly 8192 tokens, model width
     8192, 513 experts and top-k 11. It adds a planner launch; other token counts
-    in that tuning bucket use the compact producer.
+    in that tuning bucket use the compact kernel.
     """
 
     tokens, model = out.shape
     partials = torch.empty((tokens, topk, model), dtype=dtypes.bf16, device=out.device)
     job_map = None
-    if kernelName == _Q256_KERNEL + "_route_weighted" and tokens == 8192:
+    if (
+        kernelName
+        in (
+            _Q256_KERNEL + "_weighted",
+            _Q256_LEGACY_KERNEL + "_route_weighted",
+        )
+        and tokens == 8192
+    ):
         from aiter.ops.triton.moe.q256_schedule import q256_make_job_map
 
         job_map = torch.empty(1024, dtype=torch.int32, device=out.device)
         q256_make_job_map(sorted_ids, sorted_experts, counts, job_map)
 
-    fmoe_q256_producer(
+    fmoe_q256_fused_experts(
         out,
         partials,
         input,
