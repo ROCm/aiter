@@ -3,9 +3,9 @@
 
 """Benchmark the fused Qwen3-Next attention prologue (Q/K norm + partial RoPE).
 
-The op routes by token count to three schedules (decode m64, m128_m256,
-prefill); the defaults sweep across every band so the crossovers show. Outputs
-are preallocated inside the wrapper, matching the graph-captured integration.
+The op launches one token-persistent kernel for every token count; the
+defaults sweep decode and prefill sizes. Outputs are preallocated inside the
+wrapper, matching the graph-captured integration.
 
 Usage:
     python bench_fused_attention_qk_norm_rope.py \

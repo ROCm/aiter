@@ -21,8 +21,8 @@ requires_gfx950 = pytest.mark.skipif(
     reason="requires gfx950",
 )
 
-# One row count per schedule band: decode (<=12288), m128_m256 (<=24576),
-# prefill (>24576). The crossovers are covered at their edges.
+# A spread of decode and prefill row counts; the shared token-persistent
+# kernel covers every size in one launch.
 ROWS = [1, 64, 1024, 12288, 14336, 16384, 24576, 28672, 32768]
 
 
@@ -96,8 +96,7 @@ def test_matches_reference(rows):
     inputs = _make_inputs(rows)
     ok, reason = fused_attention_qk_norm_rope_supported(*inputs)
     if not ok:
-        # The mid/large bands need the Gluon dialect (Triton 3.8); without it
-        # the call is unsupported and the native path runs instead.
+        # Fail closed: an unsupported call means the native path runs instead.
         pytest.skip(reason)
     query, gate, key, value = fused_attention_qk_norm_rope(*inputs)
     ref_query, ref_gate, ref_key, ref_value = _reference(*inputs)
