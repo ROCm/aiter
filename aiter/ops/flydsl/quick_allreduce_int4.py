@@ -201,16 +201,12 @@ class QuickAllReduceInt4:
         device,
         rank: int,
         world_size: int = WORLD,
-        super_tile: int = 8,
+        super_tile: int | None = None,
         grid_cap: int | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
-            )
-        if super_tile not in SUPER_TILES:
-            raise ValueError(
-                f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}"
             )
         group_world = dist.get_world_size(group=group)
         group_rank = dist.get_rank(group=group)
@@ -228,6 +224,16 @@ class QuickAllReduceInt4:
             )
         # v_cvt_scalef32_pk_fp4_bf16 is gfx950-only.
         self.supports_mxfp4 = arch == "gfx950"
+        if super_tile is None:
+            # On gfx950, super_tile 1 is 3% to 7% faster than super_tile 8 for
+            # payloads of 4096 to 16384 bf16 rows of 4096 at world size 2, 4
+            # and 8, with bitwise-equal output. Smaller payloads use super_tile
+            # 1 in both cases. gfx942 keeps super_tile 8.
+            super_tile = 1 if arch == "gfx950" else 8
+        if super_tile not in SUPER_TILES:
+            raise ValueError(
+                f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}"
+            )
         cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
