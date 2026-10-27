@@ -61,16 +61,35 @@ def test_legacy_topk_and_atom_candidates(monkeypatch, gfx, wave):
     weights = torch.empty(16, 6, device="cuda", dtype=torch.float32)
     ids = torch.empty_like(weights, dtype=torch.int32)
     calls = []
-    monkeypatch.setattr(herd, "herd_topk_gating", lambda *args: calls.append(args))
+    support_calls = []
+    original_supported = herd.herd_topk_gating_supported
+
+    def supported(*args):
+        support_calls.append(args)
+        return original_supported(*args)
+
+    monkeypatch.setattr(herd, "herd_topk_gating_supported", supported)
+    monkeypatch.setattr(
+        herd, "herd_topk_gating", lambda *args: calls.append(("herd", args))
+    )
+    monkeypatch.setattr(
+        topk, "topk_gating_fwd", lambda *args: calls.append(("standard", args))
+    )
     valid = torch.tensor([13], device="cuda", dtype=torch.int32)
     topk.topk_gating(weights, ids, logits, bias, num_valid_rows=valid)
-    assert len(calls) == 1 and calls[0][-1] is valid
+    # Automatic router drop is only for gfx950. gfx1250 bypasses even the
+    # HERD profile check and enters the ordinary candidate-selection binding.
+    assert len(calls) == 1
+    assert calls[0][0] == ("herd" if gfx == "gfx950" else "standard")
+    assert calls[0][1][-1] is valid
+    assert len(support_calls) == (1 if gfx == "gfx950" else 0)
     # ATOM #2713 selects K+1 without a drop, renormalization or routed scale.
-    monkeypatch.setattr(topk, "topk_gating_fwd", lambda *args: calls.append(args))
     weights = torch.empty(16, 7, device="cuda", dtype=torch.float32)
     ids = torch.empty_like(weights, dtype=torch.int32)
     topk.topk_gating(weights, ids, logits, bias, False, 1.0)
-    assert len(calls) == 2 and calls[-1][4:6] == (False, 1.0)
+    assert len(calls) == 2 and calls[-1][0] == "standard"
+    assert calls[-1][1][4:6] == (False, 1.0)
+    assert len(support_calls) == (2 if gfx == "gfx950" else 0)
 
 
 @pytest.mark.parametrize("experts,topk", [(128, 4), (256, 6), (512, 16)])
@@ -151,8 +170,8 @@ def test_candidate_scoring(score_func, dtype):
 
 
 def test_legacy_herd_valid_rows_follow_graph_replay(monkeypatch):
-    if get_gfx_runtime() not in ("gfx950", "gfx1250"):
-        pytest.skip("requires gfx950 or gfx1250")
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("automatic HERD router drop requires gfx950")
     topk_module = importlib.import_module("aiter.ops.topk")
     monkeypatch.setattr(topk_module, "_FLYDSL_USE_HERD", True)
     monkeypatch.setattr(topk_module, "_FLYDSL_HERD_MIN_M", 16)

@@ -241,8 +241,8 @@ def _unsupported_reason(
         return "every tensor must be on the GPU"
     if len({t.device for t in tensors}) != 1:
         return "every tensor must be on the same GPU"
-    if wave_size_of(gating_output.device.index) not in (32, 64):
-        return "the FlyDSL HERD kernels require a wave32 or wave64 GPU"
+    if wave_size_of(gating_output.device.index) != 64:
+        return "the FlyDSL HERD kernels require a wave64 GPU"
     return None
 
 
