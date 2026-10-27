@@ -124,10 +124,13 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
     w2_s = shuffle_weight_a16w4(w2_qt, 16, False)
     w1_sc = shuffle_scale_a16w4(w1_scale, E, False)
     w2_sc = shuffle_scale_a16w4(w2_scale, E, False)
-    w1_s8 = shuffle_weight_a8w4_gfx942(w1_s).view(w1_s.dtype)
-    w1_sc8 = shuffle_scale_a8w4_gfx942(w1_sc).view(w1_sc.dtype)
+    w1_s8 = shuffle_weight_a8w4_gfx942(w1_s)
+    w1_sc8 = shuffle_scale_a8w4_gfx942(w1_sc)
 
-    def moe(a8w4, x=x, a1_scale=None):
+    def moe(a8w4, x=x, a1_scale=None, relaid=None):
+        # relaid: W1 / W1-scale layout, by default the one the path reads
+        relaid = a8w4 if relaid is None else relaid
+
         def f():
             # fused_moe reads the opt-in flag per call. Set it either way, so a flag
             # the caller already exported cannot turn the a16w4 candidate into a8w4,
@@ -137,11 +140,11 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
             try:
                 return fused_moe(
                     x,
-                    w1_s8 if a8w4 else w1_s,
+                    w1_s8 if relaid else w1_s,
                     w2_s,
                     topk_weights,
                     topk_ids,
-                    w1_scale=w1_sc8 if a8w4 else w1_sc,
+                    w1_scale=w1_sc8 if relaid else w1_sc,
                     w2_scale=w2_sc,
                     quant_type=QuantType.per_1x32,
                     activation=ActivationType.Situv2,
@@ -202,6 +205,15 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
     else:
         ret["a8w4 fp8 x"] = cos_diff(outs["a8w4"], out_q)
         assert ret["a8w4 fp8 x"] < 1e-4, ret
+    # W1 in the layout the other path reads (same shape and dtype) must raise, not give
+    # wrong output: the a8w4 relayout is told apart only by its a8w4_gfx942_layout tag.
+    for a8w4 in (True, False):
+        try:
+            moe(a8w4, relaid=not a8w4)()
+        except ValueError as e:
+            assert "a8w4_gfx942_layout" in str(e), e
+        else:
+            raise AssertionError(f"a8w4={a8w4} ran on the other W1 layout")
     # the precision cost of the opt-in path: a8w4 vs the bf16-activation reference
     ret["a8w4 bf16 cos"] = cos_diff(ref_bf16, outs["a8w4"])
     assert ret["a16w4 cos"] < 1e-2, ret

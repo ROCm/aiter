@@ -729,6 +729,21 @@ def mxfp8_quant_a8w4_gfx942_ref(x):
     return q, (e + 127).to(torch.uint8).view(M, K // 32).contiguous()
 
 
+def _mark_a8w4_gfx942(out_u8, src):
+    """`out_u8` viewed as `src` (dtype, shape), tagged ``a8w4_gfx942_layout = True``.
+
+    The relayout keeps shape and dtype, so the tag is the only way to tell it from the
+    a16w4 preshuffle; fused_moe checks it against the stage-1 kernel. Like
+    ``is_shuffled`` (carried over from `src`) it is a Python attribute of this tensor
+    object: views, copies and ``nn.Parameter`` wrapping drop it, so a caller that wraps
+    the result must set it on the final tensor again.
+    """
+    out = out_u8.view(src.dtype).view(src.shape)
+    out.a8w4_gfx942_layout = True
+    out.is_shuffled = getattr(src, "is_shuffled", False)
+    return out
+
+
 def shuffle_weight_a8w4_gfx942(w_a16w4_u8):
     """Relayout a16w4-preshuffled MXFP4 W (``shuffle_weight_a16w4(w, 16, False)``).
 
@@ -739,7 +754,7 @@ def shuffle_weight_a8w4_gfx942(w_a16w4_u8):
     w = w_a16w4_u8.view(torch.uint8)
     assert w.numel() % 1024 == 0, "W bytes must be a multiple of 1 KB"
     out = w.reshape(-1, 4, 16, 4, 4).permute(0, 3, 2, 1, 4).contiguous()
-    return out.view(w_a16w4_u8.shape)
+    return _mark_a8w4_gfx942(out, w_a16w4_u8)
 
 
 def shuffle_scale_a8w4_gfx942(s_a16w4_u8):
@@ -752,7 +767,7 @@ def shuffle_scale_a8w4_gfx942(s_a16w4_u8):
     s = s_a16w4_u8.view(torch.uint8)
     assert s.numel() % 256 == 0, "scale bytes must be a multiple of 256"
     out = s.reshape(-1, 4, 16, 2, 2).permute(0, 3, 4, 2, 1).contiguous()
-    return out.view(s_a16w4_u8.shape)
+    return _mark_a8w4_gfx942(out, s_a16w4_u8)
 
 
 def gemm1_a8w4_grid(BM, *, INTER, TILE_N, max_m_blocks):

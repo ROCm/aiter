@@ -4371,6 +4371,29 @@ def fused_moe_2stages(
             metadata.stage1.keywords.get("kernelName", "")
         )
     _is_a8w4_g942 = bool(_s1_params) and _s1_params.get("in_dtype") == "a8w4_gfx942"
+    # shuffle_{weight,scale}_a8w4_gfx942 keep shape and dtype, so only their
+    # `a8w4_gfx942_layout` tag tells the relaid W1 from the a16w4 preshuffle; a kernel
+    # reading the other layout gives wrong output without an error.
+    _w1_relaid = [
+        getattr(t, "a8w4_gfx942_layout", False) for t in (w1, w1_scale) if t is not None
+    ]
+    if _is_a8w4_g942 and not (len(_w1_relaid) == 2 and all(_w1_relaid)):
+        raise ValueError(
+            "the gfx942 a8w4 stage 1 kernel "
+            f"{metadata.stage1.keywords.get('kernelName', '')} reads W1 and W1 scale "
+            "relaid by shuffle_weight_a8w4_gfx942 / shuffle_scale_a8w4_gfx942 "
+            "(tagged a8w4_gfx942_layout); got tags (w1, w1_scale) = "
+            f"{tuple(_w1_relaid)}"
+        )
+    if not _is_a8w4_g942 and any(_w1_relaid):
+        _s1_name = getattr(metadata.stage1, "keywords", {}).get(
+            "kernelName", getattr(metadata.stage1, "func", metadata.stage1)
+        )
+        raise ValueError(
+            "W1 / W1 scale are relaid for the gfx942 a8w4 stage 1 "
+            "(a8w4_gfx942_layout), which only the `_g942` kernels read, but stage 1 "
+            f"is {_s1_name}; is AITER_SITUV2_A8W4=1 set?"
+        )
     if prequantized_a1 is not None:
         if quant_type != QuantType.per_1x32:
             raise ValueError(
