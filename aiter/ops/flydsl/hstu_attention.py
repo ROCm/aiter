@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import functools
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -22,6 +23,16 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_dq import (
     build_hstu_attention_bwd_dq,
+)
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_fused_pp import (
+    balanced_tile_groups,
+    build_hstu_attention_bwd_dq_reduce,
+    build_hstu_attention_bwd_fused_pp,
+    build_partial_offsets,
+    build_reduce_map,
+    span_scratch_rows,
+    tile_partial_counts,
+    validate_hstu_attention_bwd_fused_pp,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd import (
     build_hstu_attention_fwd,
@@ -493,7 +504,34 @@ def _validate_bwd_inputs(
 # CSV tags identify the fused dV+dK kernel and the dQ kernel.
 _BWD_KERNEL_DVDK = "dvdk"
 _BWD_KERNEL_DQ = "dq"
-_BWD_KERNELS = (_BWD_KERNEL_DVDK, _BWD_KERNEL_DQ)
+# The fused dV/dK/dQ ping-pong kernel. It produces all three gradients in one
+# KV-owned pass, with dQ as a split-K partial that `dq_reduce` then sums, so it
+# replaces BOTH kernels above rather than either one.
+#
+# Opt-in only: reached when a tuned CSV row carries this discriminator, via
+# AITER_HSTU_BWD_FUSED=1, or via an explicit `fused=True`. It is never a
+# fallback -- a shape with no such row keeps the `dvdk` + `dq` pair, which is
+# the only path that covers fp16, head_dim != 64 and gfx950.
+_BWD_KERNEL_FUSED = "fused"
+_BWD_KERNELS = (
+    _BWD_KERNEL_DVDK,
+    _BWD_KERNEL_DQ,
+    _BWD_KERNEL_FUSED,
+)
+# The only tile the fused kernel is built for: 8 waves give 2 per SIMD inside
+# one barrier domain, and BLOCK_M quantises to 128 (8 waves x MFMA_M 16), so 256
+# and 384 are the only candidates. 384 is the dV/dK-only shape and removes this
+# kernel's geometry penalty, but the added dQ state spills 21 registers there
+# and measures 503.7 ms against 461.0 at 256 (214 VGPR, 0 spills).
+_BWD_FUSED_TILES = {
+    "block_m": 256,
+    "block_n": 16,
+    "num_waves": 8,
+    "waves_per_eu": 2,
+}
+# Fraction of free device memory the fp32 split-K scratch may claim. The
+# remainder has to cover the reduction's carry and torch's own allocator slack.
+_BWD_FUSED_MEM_BUDGET = 0.8
 
 _BWD_CSV_COLUMNS: list[str] = [
     "arch",
@@ -777,12 +815,398 @@ def _compile_bwd_launcher(
         "max_seq_len": max_seq_len,
         "has_perm": has_perm,
     }
-    dvdk_config = _resolve(_BWD_KERNEL_DVDK)
-    dq_config = _resolve(_BWD_KERNEL_DQ)
-
-    dvdk_launcher = build_hstu_attention_bwd_dvdk(**common_kwargs, **dvdk_config)
-    dq_launcher = build_hstu_attention_bwd_dq(**common_kwargs, **dq_config)
+    dvdk_launcher = build_hstu_attention_bwd_dvdk(
+        **common_kwargs, **_resolve(_BWD_KERNEL_DVDK)
+    )
+    dq_launcher = build_hstu_attention_bwd_dq(
+        **common_kwargs, **_resolve(_BWD_KERNEL_DQ)
+    )
     return dvdk_launcher, dq_launcher
+
+
+def _resolve_bwd_fused_config(
+    *,
+    dtype_str: str,
+    num_heads: int,
+    head_dim: int,
+    hidden_dim: int,
+    batch: int,
+    max_seq_len: int,
+    causal: bool,
+    has_targets: bool,
+    alpha: float,
+    max_attn_len: int,
+    contextual_seq_len: int,
+    custom_config: dict,
+    fused: bool | None,
+) -> dict | None:
+    """The fused kernel's config for this problem, or None to use dvdk + dq.
+
+    `fused` is the caller's explicit request: None defers to the tuned CSV and
+    AITER_HSTU_BWD_FUSED, True *requires* the fused path and re-raises the gate's
+    error rather than falling back, False never uses it. True exists because the
+    CSV/env paths degrade to the shipping kernels silently, which is how a
+    benchmark ends up timing a kernel it did not ask for.
+    """
+    if fused is False:
+        return None
+
+    tuned_config = _get_bwd_tuned_config(
+        kernel=_BWD_KERNEL_FUSED,
+        dtype_str=dtype_str,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        batch=batch,
+        max_seq_len=max_seq_len,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        has_targets=has_targets,
+    )
+    requested = (
+        fused is True
+        or bool(tuned_config)
+        or os.environ.get("AITER_HSTU_BWD_FUSED", "") in ("1", "true")
+    )
+    if not requested:
+        return None
+
+    # The env/explicit paths supply the one tile this kernel is specialized for;
+    # a tuned row brings its own and has to match the gate anyway.
+    config = {**_BWD_FUSED_TILES, **tuned_config, **custom_config}
+    try:
+        validate_hstu_attention_bwd_fused_pp(
+            num_heads,
+            head_dim,
+            hidden_dim,
+            causal,
+            max_attn_len,
+            contextual_seq_len,
+            has_targets,
+            alpha,
+            dtype_str,
+            max_seq_len,
+            **config,
+        )
+    except ValueError as exc:
+        if fused is True:
+            raise
+        logger.warning("hstu bwd fused not applicable, using dvdk + dq: %s", exc)
+        return None
+    return config
+
+
+def _plan_fused_groups(
+    seq_offsets: torch.Tensor,
+    *,
+    block_m: int,
+    num_heads: int,
+    head_dim: int,
+    max_seq_len: int,
+    total_tokens: int,
+    groups: int | str,
+    device: torch.device,
+) -> tuple[int, list, torch.Tensor, torch.Tensor]:
+    """Chunk the kv tiles into passes that fit, and allocate the scratch.
+
+    Returns `(G, spans, dq_part, dq_carry)`.
+
+    The fp32 partials dominate the fused path -- 168 GB in one pass at
+    B=1024/H=8/N=16384 -- so the kv tiles are chunked into G passes over ONE
+    reused buffer. `groups="auto"` takes the SMALLEST G that fits: every extra
+    pass adds a fully serialised reduction (reduce(g) must finish before
+    fused(g+1) overwrites the scratch) plus carry traffic, which exists only at
+    G > 1 and costs 2*(G-1) passes over L*H*D fp32.
+
+    Memory is settled by ATTEMPTING, not by predicting. Two predictions were
+    tried and both failed: `mem_get_info` alone sees only driver-free memory
+    and over-chunks (G=12 instead of 4 once a caller had cycled tensors), while
+    adding `memory_reserved - memory_allocated` back counts the right bytes but
+    not their LAYOUT -- the scratch is one contiguous tens-of-GB block and
+    cached blocks are fragmented, so it planned a size torch then failed to
+    allocate, dependent on allocator history and reproducible only sometimes.
+    So: estimate, try, and on OOM release the cache and step G up.
+
+    `empty_cache()` is deliberately NOT on the fast path. It hands the scratch
+    back to the driver, so the next call cannot reuse it and must re-enter
+    hipMalloc -- which was itself the largest component of this function's
+    per-call cost.
+    """
+    n_kv_tiles = (max_seq_len + block_m - 1) // block_m
+    elems = num_heads * head_dim
+    if groups != "auto" and not 1 <= int(groups) <= n_kv_tiles:
+        # Past n_kv_tiles the split cannot give every group a tile, and the
+        # spans come back overlapping rather than empty -- a silently wrong
+        # reduction instead of a failed one.
+        raise ValueError(
+            f"fused_groups must be in 1..{n_kv_tiles} (kv tiles at "
+            f"max_seq_len={max_seq_len}, block_m={block_m}), got {groups}"
+        )
+
+    # One sync; every candidate G is then priced in host arithmetic.
+    counts = tile_partial_counts(seq_offsets, block_m, max_seq_len)
+
+    def _plan(g):
+        spans = balanced_tile_groups(counts, g)
+        rows = span_scratch_rows(counts, spans)
+        carry_rows = 0 if g == 1 else total_tokens
+        return spans, rows, (rows + carry_rows) * elems * 4
+
+    if groups != "auto":
+        candidates = [int(groups)]
+    else:
+        free, _total = torch.cuda.mem_get_info(device)
+        cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(
+            device
+        )
+        budget = (free + cached) * _BWD_FUSED_MEM_BUDGET
+        first = next(
+            (g for g in range(1, n_kv_tiles + 1) if _plan(g)[2] <= budget),
+            n_kv_tiles,
+        )
+        candidates = list(range(first, n_kv_tiles + 1))
+
+    last_error = None
+    for g in candidates:
+        spans, rows, _nbytes = _plan(g)
+        try:
+            # `empty`, not `zeros`: for the masks this kernel accepts, the
+            # reduction reads only elements the fused kernel wrote -- slots are
+            # sized to exactly the q rows their tile serves and row indices are
+            # clamped to seq_len-1 -- so the memset is pure cost (~17 ms per
+            # call at 86 GB). Verified by poisoning the scratch with NaN at the
+            # production shape: dq came back bitwise identical at G=2 and G=5
+            # with zero NaNs.
+            #
+            # A WINDOWED mask does leave partials unwritten -- the fused pass
+            # only serves the tiles inside the window -- so the reduction
+            # carries a per-row predicate that skips exactly those. Keep the
+            # two in step: dropping that predicate means restoring the memset.
+            dq_part = torch.empty(rows, elems, dtype=torch.float32, device=device)
+            dq_carry = (
+                torch.zeros(1, 1, dtype=torch.float32, device=device)
+                if g == 1
+                else torch.zeros(
+                    total_tokens, elems, dtype=torch.float32, device=device
+                )
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            last_error = exc
+            # Only now is it worth handing fragmented blocks back to the driver.
+            torch.cuda.empty_cache()
+            continue
+        return g, spans, dq_part, dq_carry
+
+    raise MemoryError(
+        f"hstu bwd fused: no kv-chunking in 1..{n_kv_tiles} fits -- the "
+        f"smallest pass still needs {_plan(n_kv_tiles)[2] / 1e9:.1f} GB "
+        f"({last_error})"
+    )
+
+
+def _make_bwd_fused_runners(
+    N: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    causal: bool,
+    num_targets: torch.Tensor | None,
+    max_attn_len: int,
+    contextual_seq_len: int,
+    *,
+    config: dict | None = None,
+    sort_by_length: bool = True,
+    groups: int | str = "auto",
+    stream: torch.cuda.Stream | None = None,
+) -> dict:
+    """Build the fused kernel's phase runners, for the dispatch and for tuning.
+
+    Returns ``{"fused": fn, "dq_reduce": fn, "all": fn, "outputs": (dq, dk, dv),
+    "groups": G, "spans": [(lo, hi), ...], "reduce_bytes": int}``.
+
+    `fused` and `dq_reduce` each run every kv-tile group of their own phase, so
+    timing them apart is meaningful: the reduction is fully EXPOSED --
+    reduce(g) must finish before fused(g+1) overwrites the scratch -- so it is a
+    standing cost to tune independently, not something hiding under the next
+    pass. `all` interleaves them, which is the only correct order.
+
+    dV/dK come straight out of the fused kernel. dQ is accumulated over each
+    workgroup's KV range into an fp32 HBM scratch and summed by the reduction:
+    split-K rather than atomics because `global_atomic_add_f32` is a hard
+    0.40 TB/s wall on gfx942 while plain stores run at 3.56 TB/s.
+    """
+    batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
+        q=q,
+        k=k,
+        v=v,
+        dout=dout,
+        seq_offsets=seq_offsets,
+        num_targets=num_targets,
+        max_seq_len=N,
+    )
+    has_targets = num_targets is not None
+    if config is None:
+        # A direct caller asked for this kernel by name, so the gate raises
+        # rather than silently handing back the dvdk + dq pair.
+        config = _resolve_bwd_fused_config(
+            dtype_str=dtype_str,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            hidden_dim=hidden_dim,
+            batch=batch,
+            max_seq_len=N,
+            causal=causal,
+            has_targets=has_targets,
+            alpha=alpha,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            custom_config={},
+            fused=True,
+        )
+
+    device = q.device
+    block_m = config["block_m"]
+    elems = num_heads * head_dim
+
+    nt = num_targets
+    if nt is None:
+        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=device)
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    do_c = dout.contiguous()
+    so_c = seq_offsets.contiguous()
+    nt_c = nt.contiguous()
+    if sort_by_length:
+        perm_c = _build_balance_perm(so_c).contiguous()
+    else:
+        perm_c = torch.zeros(1, dtype=torch.int32, device=device)
+    total_tokens = q_c.shape[0]
+
+    launch_stream = torch.cuda.current_stream(device) if stream is None else stream
+    if launch_stream.device != device:
+        raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
+
+    fused_launcher = build_hstu_attention_bwd_fused_pp(
+        num_heads,
+        head_dim,
+        hidden_dim,
+        causal,
+        max_attn_len,
+        contextual_seq_len,
+        has_targets,
+        alpha,
+        dtype_str,
+        max_seq_len=N,
+        has_perm=sort_by_length,
+        **config,
+    )
+
+    n_groups, spans, dq_part, dq_carry = _plan_fused_groups(
+        so_c,
+        block_m=block_m,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        max_seq_len=N,
+        total_tokens=total_tokens,
+        groups=groups,
+        device=device,
+    )
+    max_tiles = (N + block_m - 1) // block_m
+    # Offset tables for the CHOSEN spans only. These genuinely depend on the
+    # sequence lengths, which change every training step, so they are rebuilt
+    # per call -- but only once, not once per candidate G.
+    planned = [
+        build_partial_offsets(so_c, block_m, max_seq_len=N, tile_lo=lo, tile_hi=hi)
+        for lo, hi in spans
+    ]
+    offs = [p[0] for p in planned]
+    totals = [p[1] for p in planned]
+
+    dv = torch.empty_like(v_c)
+    dk = torch.empty_like(k_c)
+    dq = torch.empty_like(q_c)
+
+    red_map, n_blocks = build_reduce_map(so_c, device)
+
+    reduce_launchers = [
+        build_hstu_attention_bwd_dq_reduce(
+            num_heads,
+            head_dim,
+            block_m,
+            max_tiles,
+            dtype_str,
+            max_attn_len=max_attn_len,
+            has_targets=has_targets,
+            first_pass=(g == 0),
+            last_pass=(g == n_groups - 1),
+        )
+        for g in range(n_groups)
+    ]
+
+    def run_fused(g: int) -> None:
+        lo, hi = spans[g]
+        with torch.cuda.device(device.index):
+            _run_compiled(
+                fused_launcher, batch, q_c, k_c, v_c, do_c, so_c, nt_c, perm_c,
+                dv, dk, dq_part, offs[g],
+                fx.Int32(lo), fx.Int32(hi), fx.Stream(launch_stream),
+            )  # fmt: skip
+
+    def run_reduce(g: int) -> None:
+        lo, hi = spans[g]
+        with torch.cuda.device(device.index):
+            _run_compiled(
+                reduce_launchers[g], fx.Int32(n_blocks), dq_part, offs[g],
+                red_map, so_c, nt_c, dq_carry, dq,
+                fx.Int32(lo), fx.Int32(hi), fx.Stream(launch_stream),
+            )  # fmt: skip
+
+    def run_all() -> None:
+        # Serialised by construction: reduce(g) must finish before fused(g+1)
+        # overwrites the scratch. Double-buffering would overlap them but
+        # restores the footprint chunking exists to avoid.
+        for g in range(n_groups):
+            run_fused(g)
+            run_reduce(g)
+
+    # Bytes the reduction must move: every partial read once, dq written once,
+    # PLUS the fp32 carry, which only exists at G > 1 -- every pass but the
+    # first reads it and every pass but the last writes it. Omitting the carry
+    # made the reported rate at G=4 look like 2.88 TB/s when the kernel was
+    # really moving 442 GB at 3.69.
+    carry_bytes = 2 * (n_groups - 1) * total_tokens * elems * 4
+    return {
+        "fused": lambda: [run_fused(g) for g in range(n_groups)],
+        "dq_reduce": lambda: [run_reduce(g) for g in range(n_groups)],
+        "all": run_all,
+        # Single-pass variants, for a profiler that has to pin ONE dispatch.
+        # The passes have different grids (the equal-partial-count split gives
+        # 13 of 64 kv tiles to pass 0 and 51 to pass 1 at the production
+        # shape), so a capture that cannot choose a pass lands on whichever
+        # happened to be Nth and two traces of the "same" profile are not
+        # comparable.
+        "fused_pass": run_fused,
+        "reduce_pass": run_reduce,
+        "outputs": (dq, dk, dv),
+        "groups": n_groups,
+        "spans": spans,
+        # The scratch is allocated ONCE and reused by every pass, so this is
+        # the footprint at any instant, not the sum over passes.
+        # The scratch and its per-pass offset tables, for inspection: which
+        # elements a pass leaves unwritten is a property worth being able to
+        # measure rather than derive.
+        "scratch": dq_part,
+        "offsets": offs,
+        "scratch_bytes": dq_part.numel() * dq_part.element_size(),
+        "carry_bytes": dq_carry.numel() * dq_carry.element_size(),
+        "reduce_bytes": (
+            sum(totals) * elems * 4 + q_c.numel() * q_c.element_size() + carry_bytes
+        ),
+    }
 
 
 def flydsl_hstu_attention_bwd(
@@ -803,12 +1227,21 @@ def flydsl_hstu_attention_bwd(
     num_waves: int | None = None,
     waves_per_eu: int | None = None,
     sort_by_length: bool = True,
+    fused: bool | None = None,
+    fused_groups: int | str = "auto",
     stream: torch.cuda.Stream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """HSTU attention backward: returns (dq, dk, dv).
 
     Recomputes `Z = alpha * Q * K^T`, then applies the mask, SiLU derivative,
     and `1/N` normalization. dV/dK share one score pass; dQ uses a second pass.
+
+    `fused` opts into the single-pass dV/dK/dQ kernel, which is gated to
+    gfx942 / bf16 / head_dim == hidden_dim == 64. None defers to the tuned CSV
+    and AITER_HSTU_BWD_FUSED; True requires it and raises if the shape is
+    outside the gate; False never uses it. The fused path trades a large fp32
+    split-K scratch for the latency win, so `fused_groups` chunks the kv tiles
+    into passes over one reused buffer ("auto" picks the smallest G that fits).
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q,
@@ -819,6 +1252,84 @@ def flydsl_hstu_attention_bwd(
         num_targets=num_targets,
         max_seq_len=N,
     )
+
+    custom_config = {
+        key: value
+        for key, value in (
+            ("block_m", block_m),
+            ("block_n", block_n),
+            ("num_waves", num_waves),
+            ("waves_per_eu", waves_per_eu),
+        )
+        if value is not None
+    }
+    fused_config = _resolve_bwd_fused_config(
+        dtype_str=dtype_str,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        batch=batch,
+        max_seq_len=N,
+        causal=causal,
+        has_targets=num_targets is not None,
+        alpha=alpha,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        custom_config=custom_config,
+        fused=fused,
+    )
+
+    if fused_config is not None:
+        try:
+            runners = _make_bwd_fused_runners(
+                N,
+                alpha,
+                q,
+                k,
+                v,
+                dout,
+                seq_offsets,
+                causal,
+                num_targets,
+                max_attn_len,
+                contextual_seq_len,
+                config=fused_config,
+                sort_by_length=sort_by_length,
+                groups=fused_groups,
+                stream=stream,
+            )
+            runners["all"]()
+            return runners["outputs"]
+        except (MemoryError, torch.cuda.OutOfMemoryError) as exc:
+            # An explicit `fused=True` asked for this kernel specifically, so a
+            # scratch that does not fit is an error, not a reason to quietly
+            # run something else. Otherwise the pair below is always correct.
+            if fused is True:
+                raise
+            logger.warning(
+                "hstu bwd fused scratch does not fit, using dvdk + dq: %s", exc
+            )
+
+    nt = num_targets
+    if nt is None:
+        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
+
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    do_c = dout.contiguous()
+    so_c = seq_offsets.contiguous()
+    nt_c = nt.contiguous()
+
+    # Disabled kernels receive a dummy permutation that compile-time guards never read.
+    if sort_by_length:
+        perm_c = _build_balance_perm(so_c).contiguous()
+    else:
+        perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
+
+    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
+    if launch_stream.device != q.device:
+        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
 
     dvdk_launcher, dq_launcher = _compile_bwd_launcher(
         batch=batch,
@@ -843,26 +1354,6 @@ def flydsl_hstu_attention_bwd(
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
-    nt = num_targets
-    if nt is None:
-        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
-
-    q_c = q.contiguous()
-    k_c = k.contiguous()
-    v_c = v.contiguous()
-    do_c = dout.contiguous()
-    so_c = seq_offsets.contiguous()
-    nt_c = nt.contiguous()
-
-    # Disabled kernels receive a dummy permutation that compile-time guards never read.
-    if sort_by_length:
-        perm_c = _build_balance_perm(so_c).contiguous()
-    else:
-        perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
-
-    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
-    if launch_stream.device != q.device:
-        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
     with torch.cuda.device(q.device.index):
         _run_compiled(
             dvdk_launcher,
