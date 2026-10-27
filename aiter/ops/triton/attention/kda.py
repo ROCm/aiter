@@ -193,8 +193,13 @@ def fused_recurrent_kda(
         avg_T = max(1, T // max(1, N))
     else:
         avg_T = T
+    state_ref = initial_state if initial_state is not None else state_out
+    bf16_resident = (
+        state_ref is not None and state_ref.dtype == torch.bfloat16 and T > 1
+    )
+    bucket_T = max(avg_T, 2) if bf16_resident else avg_T
     config = get_kda_config(
-        avg_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
+        bucket_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
     )
     BV = config["BV"]
     SK = config["SK"]
@@ -206,8 +211,11 @@ def fused_recurrent_kda(
     tdm_store_bufs = config.get("tdm_store_bufs", 2)
     sched_strategy = config.get("sched_strategy")
     resident_state = config.get(
-        "resident_state", avg_T > 1 or num_accepted_tokens is not None
+        "resident_state", bucket_T > 1 or num_accepted_tokens is not None
     )
+    assert (
+        resident_state or not bf16_resident
+    ), "bf16 state with T > 1 needs resident_state"
     assert V % BV == 0, f"BV={BV} must divide V={V}"
     assert 32 % SK == 0 and K % SK == 0, f"SK={SK} must divide 32 and K={K}"
     assert (BV * SK) % (
@@ -246,7 +254,9 @@ def fused_recurrent_kda(
     )
     state_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if initial_state is not None:
-        assert initial_state.dtype in state_dtypes
+        assert (
+            initial_state.dtype in state_dtypes
+        ), f"state dtype must be one of {state_dtypes} on {_ARCH}"
         assert (
             initial_state.shape[1:] == state_shape
         ), f"state must be [slots, HV, {state_shape[1]}, {state_shape[2]}]"
@@ -268,7 +278,9 @@ def fused_recurrent_kda(
         final_state = None
 
     if final_state is not None:
-        assert final_state.dtype in state_dtypes
+        assert (
+            final_state.dtype in state_dtypes
+        ), f"state dtype must be one of {state_dtypes} on {_ARCH}"
         if initial_state is not None:
             assert final_state.dtype == initial_state.dtype, "state dtypes must match"
         assert (
@@ -302,9 +314,6 @@ def fused_recurrent_kda(
     if state_dst is None and _ARCH == "gfx950":
         n_dst = B * T if is_paged else N
         state_dst = q.new_empty(n_dst, *state_shape, dtype=state_dtype)
-    # BF16 storage must not round the recurrent state between tokens.
-    if state_dst is not None and state_dst.dtype == torch.bfloat16 and T > 1:
-        resident_state = True
     slot_rows_in, rows_in = _rows(initial_state)
     slot_rows_out, rows_out = (
         (slot_rows_in, rows_in) if state_dst is initial_state else _rows(state_dst)
