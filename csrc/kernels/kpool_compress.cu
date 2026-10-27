@@ -729,12 +729,10 @@ __device__ __forceinline__ void store_dw(gptr<uint16_t> row, int sub, uint32_t v
 // Per-token metadata lives in clang ext vectors (SSA values, never an
 // alloca): a select chain over array elements would be folded by LLVM into a
 // dynamically indexed load, and the array would then land in LDS or scratch.
-template <int N> struct Vec;
-template <> struct Vec<1> { typedef int i __attribute__((ext_vector_type(1))); typedef unsigned u __attribute__((ext_vector_type(1))); };
-template <> struct Vec<2> { typedef int i __attribute__((ext_vector_type(2))); typedef unsigned u __attribute__((ext_vector_type(2))); };
-template <> struct Vec<4> { typedef int i __attribute__((ext_vector_type(4))); typedef unsigned u __attribute__((ext_vector_type(4))); };
-template <> struct Vec<8> { typedef int i __attribute__((ext_vector_type(8))); typedef unsigned u __attribute__((ext_vector_type(8))); };
-template <> struct Vec<16> { typedef int i __attribute__((ext_vector_type(16))); typedef unsigned u __attribute__((ext_vector_type(16))); };
+template <int N> struct Vec {
+  typedef int i __attribute__((ext_vector_type(N)));
+  typedef unsigned u __attribute__((ext_vector_type(N)));
+};
 
 // v[idx] for a runtime idx as a flat chain of constant-index selects
 template <int N, typename V>
@@ -778,7 +776,10 @@ __device__ __forceinline__ void decode_request(
   const int base = req * n;
 
   // --- phase 1: K / gate of the request's tokens (one dword per lane), then
-  // the metadata (scalar loads); no wait in between ---
+  // the metadata (scalar loads); no wait in between. With NMAX >= POOL the
+  // regular path below reads the token rows through the virtual rows
+  // instead, so the early loads would be duplicates ---
+  constexpr bool EARLY_ROWS = NMAX < POOL;
   uvec rk, rs;
   // B * next_n * 128 < 2^31 (checked): element offsets fit in 32 bits
   uintptr_t kb = reinterpret_cast<uintptr_t>(d.key + (uint32_t)(req * d.key_sb));
@@ -794,12 +795,17 @@ __device__ __forceinline__ void decode_request(
 #endif
   const gptr<const uint16_t> kbase = (gptr<const uint16_t>)kb;
   const gptr<const uint16_t> sbase = (gptr<const uint16_t>)sb;
+  auto load_rows = [&]() {
 #pragma unroll
-  for (int i = 0; i < NMAX; ++i) {
-    const int j = min(i, n - 1);
-    rk[i] = load_dw<VEC>(kbase + (uint32_t)(j * d.key_st), sub);
-    rs[i] = load_dw<VEC>(sbase + (uint32_t)(j * d.ss_st), sub);
-  }
+    for (int i = 0; i < NMAX; ++i) {
+      // (NMAX == 1: a literal 0, or the compiler keeps n - 1 and fetches the
+      // stride before the first load)
+      const int j = NMAX == 1 ? 0 : min(i, n - 1);
+      rk[i] = load_dw<VEC>(kbase + (uint32_t)(j * d.key_st), sub);
+      rs[i] = load_dw<VEC>(sbase + (uint32_t)(j * d.ss_st), sub);
+    }
+  };
+  if constexpr (EARLY_ROWS) load_rows();
   ivec loc, pos, ts;
   // Metadata: the three words per token wait ~1100 clocks on the ATT ledger
   // either way (three s_load_dword in one batch, or one global_load_dword
@@ -816,6 +822,9 @@ __device__ __forceinline__ void decode_request(
 #else
   constexpr bool META_SMEM = NMAX == 1;
 #endif
+  // vector-load path: this lane's metadata word (array m_arr, token m_tok)
+  int32_t mv = 0;
+  int m_arr = 0, m_tok = 0;
   if constexpr (META_SMEM) {
 #pragma unroll
     for (int i = 0; i < NMAX; ++i) {
@@ -829,18 +838,23 @@ __device__ __forceinline__ void decode_request(
     // l / NMAX, token l % NMAX; the other lanes repeat the last one), then
     // readlane.
     const int l = min(sub, 3 * NMAX - 1);
-    const int arr = l / NMAX;
-    const int tok = l - arr * NMAX;
-    const uint32_t j = (uint32_t)(base + min(tok, n - 1));
-    const gptr<const int32_t> p = arr == 0 ? m_ts : (arr == 1 ? m_loc : m_pos);
-    const int32_t v = p[j];
-#pragma unroll
-    for (int i = 0; i < NMAX; ++i) {
-      ts[i] = __builtin_amdgcn_readlane(v, i);
-      loc[i] = __builtin_amdgcn_readlane(v, NMAX + i);
-      pos[i] = __builtin_amdgcn_readlane(v, 2 * NMAX + i);
-    }
+    m_arr = l / NMAX;
+    m_tok = l - m_arr * NMAX;
+    const uint32_t j = (uint32_t)(base + min(m_tok, n - 1));
+    const gptr<const int32_t> p = m_arr == 0 ? m_ts : (m_arr == 1 ? m_loc : m_pos);
+    mv = p[j];
   }
+  // every token's metadata as scalars (the generic paths)
+  auto read_meta = [&]() {
+    if constexpr (!META_SMEM) {
+#pragma unroll
+      for (int i = 0; i < NMAX; ++i) {
+        ts[i] = __builtin_amdgcn_readlane(mv, i);
+        loc[i] = __builtin_amdgcn_readlane(mv, NMAX + i);
+        pos[i] = __builtin_amdgcn_readlane(mv, 2 * NMAX + i);
+      }
+    }
+  };
   // APE rows: loaded only when a pool closes (one step in POOL), together
   // with the ring rows; the row pointer is pinned uniform so the lane offset
   // stays a 32-bit saddr offset.
@@ -854,7 +868,260 @@ __device__ __forceinline__ void decode_request(
       apev[s][1] = a[1];
     }
   };
+  // K row (block b, ring slot ph) of the tail; the gate row is ta.head_elems further
+  auto tail_row = [&](int b, int ph) -> gptr<uint16_t> {
+    return tail + (uint32_t)(b * ta.block_elems + ph * HEAD_DIM);
+  };
+  auto write_pool = [&](const uint32_t (&gw)[POOL][1], const uint32_t (&kw)[POOL][1], int loc_i, auto mid) {
+    int tok;
+    const int page = page_of<int>(loc_i, page_size, page_shift, tok);
+    compress_pool<POOL, DEC_LANES>(gw, kw, apev, cache_g + (uint64_t)(uint32_t)page * page_bytes, tok,
+                                   (uint32_t)(page_size * HEAD_DIM + tok * 4), preshuffle, round_scale, sub, mid);
+  };
 
+  if constexpr (NMAX > 1) {
+    // ===== regular request (the production shape): next_n == NMAX tokens
+    // with contiguous rows, every token stashes, the positions are
+    // consecutive, all in one tail block, and the tokens do not wrap onto
+    // the ring rows a pool still reads (r + NMAX <= ring). Then the pools
+    // have a static layout over the "virtual rows"
+    //   V[j], j = 0 .. NMAX + POOL - 2:  ring row pstart + j  (j < r),
+    //                                    token j - r          (r <= j < r + NMAX),
+    // with r = pos0 % POOL and pstart the ring row of slot 0 of token 0's
+    // pool: pool c is V[c*POOL .. c*POOL + POOL-1] and closes at its last row
+    // when that token exists and has a cache slot. No per-slot source search
+    // (the ordered walk's "latest earlier stash" is always the token itself,
+    // because a token's ring row is never read by a later pool here), no
+    // runtime register indexing: the shift by r is absorbed in two row
+    // bases (ring rows from pstart, token rows from token -r), every row is
+    // base + j * 256 B (an immediate), the rest is straight-line code. =====
+    constexpr int NV = NMAX + POOL - 1;
+    constexpr int NC = NV / POOL;  // pools that can close
+    int ts0, pos0;
+    if constexpr (META_SMEM) {
+      ts0 = ts[0];
+      pos0 = pos[0];
+    } else {
+      ts0 = __builtin_amdgcn_readlane(mv, 0);
+      pos0 = __builtin_amdgcn_readlane(mv, 2 * NMAX);
+    }
+    const int safe0 = max(pos0, 0);
+    const int r = safe0 % POOL;  // pool slot of token 0
+    // one flag, no short-circuit: a single branch, so the fast path is laid
+    // out as the fall-through
+    uint32_t regular;
+    if constexpr (META_SMEM) {
+      regular = 1u;
+#pragma unroll
+      for (int i = 1; i < NMAX; ++i) {
+        const int e_ts = (ts0 & ~ta.ring_mask) | ((ts0 + i) & ta.ring_mask);
+        regular &= (uint32_t)(pos[i] == pos0 + i) & (uint32_t)(ts[i] == e_ts);
+      }
+    } else {
+      // one compare per lane: lane (array, token) holds its expected value?
+      const int tokc = min(m_tok, n - 1);
+      const int e_ts = (ts0 & ~ta.ring_mask) | ((ts0 + tokc) & ta.ring_mask);
+      const int e_pos = pos0 + tokc;
+      const int expect = m_arr == 0 ? e_ts : (m_arr == 2 ? e_pos : mv);
+      regular = (uint32_t)(__builtin_amdgcn_ballot_w64(mv == expect) == ~0ull);
+    }
+    regular &= s_bit31(~(uint32_t)(pos0 | ts0)) & (uint32_t)(r + NMAX <= ta.ring_mask + 1) & (uint32_t)(n == NMAX) &
+               (uint32_t)(d.key_st == HEAD_DIM) & (uint32_t)(d.ss_st == HEAD_DIM);
+    if (__builtin_expect(regular != 0u, 1)) {
+      const int blk0 = ring_div(ts0, ta);
+      const int pstart = ring_mod(safe0, ta) - r;  // >= 0: ring % POOL == 0
+      // row bases: virtual row j is ring row tkp + j (K; the gate row is
+      // head_elems further) and, when live, token row kbr + j. The ring
+      // rows read (j < r) never wrap; the token rows stash into
+      // (pstart + j) mod ring: rows j >= wrap use the base one ring lower.
+      const gptr<uint16_t> tkp = tail + (uint32_t)(blk0 * ta.block_elems + pstart * HEAD_DIM);
+      const gptr<uint16_t> tgp = tkp + (uint32_t)ta.head_elems;
+      const int ring = ta.ring_mask + 1;
+      const int wrap = ring - pstart;
+      const gptr<uint16_t> tkw = tkp + (ring * -HEAD_DIM);
+      const gptr<uint16_t> tgw = tgp + (ring * -HEAD_DIM);
+      const gptr<const uint16_t> kbr = kbase + (r * -HEAD_DIM);
+      const gptr<const uint16_t> sbr = sbase + (r * -HEAD_DIM);
+      // pools that close: pool c at token POOL-1 + c*POOL - r
+      uint32_t amask = 0;
+      int cloc[NC];
+#pragma unroll
+      for (int c = 0; c < NC; ++c) {
+        const int tj = POOL - 1 + c * POOL - r;  // >= 0
+        if constexpr (META_SMEM) {
+          cloc[c] = vpick<NMAX>(loc, tj);
+        } else {
+          cloc[c] = __builtin_amdgcn_readlane(mv, NMAX + min(tj, NMAX - 1));
+        }
+        const bool exists = (POOL - 1 + c * POOL - NMAX) < r;  // token tj < NMAX
+        amask |= ((uint32_t)exists & s_bit31(~(uint32_t)cloc[c])) << c;
+      }
+      amask &= vmask;
+      const bool do_stash = vmask != 0;  // padding wave: no stores at all
+      // the stash: with early token rows by token, else by live virtual row;
+      // the stored words "depend" on dep (the pooled accumulator) so the
+      // stores cannot be hoisted above the use of the last pool row
+      uint32_t vk[NV], vg[NV];
+      auto stash_all = [&](float dep) {
+        if constexpr (EARLY_ROWS) {
+          // token t is virtual row r + t
+          const gptr<uint16_t> k0 = tkp + (uint32_t)(r * HEAD_DIM), k0w = tkw + (uint32_t)(r * HEAD_DIM);
+          const gptr<uint16_t> g0 = tgp + (uint32_t)(r * HEAD_DIM), g0w = tgw + (uint32_t)(r * HEAD_DIM);
+#pragma unroll
+          for (int t = 0; t < NMAX; ++t) {
+            uint32_t k = rk[t], g = rs[t];
+            asm volatile("" : "+v"(k), "+v"(g) : "v"(dep));
+            // the selected bases are pinned to SGPRs: otherwise the compiler
+            // builds one 64-bit VGPR address per row (and spills them)
+            gptr<uint16_t> bk = r + t >= wrap ? k0w : k0, bg = r + t >= wrap ? g0w : g0;
+            KPOOL_PIN_S(bk);
+            KPOOL_PIN_S(bg);
+            store_dw(bk + t * HEAD_DIM, sub, k);
+            store_dw(bg + t * HEAD_DIM, sub, g);
+          }
+        } else {
+          // pstart and wrap are multiples of POOL: the rows of one pool group
+          // share a base (one select per group, pinned to SGPRs: otherwise the
+          // compiler builds a 64-bit VGPR address per row and spills them)
+#pragma unroll
+          for (int c = 0; c < (NV + POOL - 1) / POOL; ++c) {
+            gptr<uint16_t> bk = c * POOL >= wrap ? tkw : tkp, bg = c * POOL >= wrap ? tgw : tgp;
+            KPOOL_PIN_S(bk);
+            KPOOL_PIN_S(bg);
+#pragma unroll
+            for (int j = c * POOL; j < min(c * POOL + POOL, NV); ++j) {
+              // live: r <= j < r + NMAX; rows POOL-1 .. NMAX-1 always are
+              const bool live = j < POOL - 1 ? j >= r : (j < NMAX ? true : (j - NMAX) < r);
+              if (live) {
+                uint32_t k = vk[j], g = vg[j];
+                asm volatile("" : "+v"(k), "+v"(g) : "v"(dep));
+                store_dw(bk + j * HEAD_DIM, sub, k);
+                store_dw(bg + j * HEAD_DIM, sub, g);
+              }
+            }
+          }
+        }
+      };
+      auto load_virtual = [&]() {
+        // gate rows and APE first (the softmax needs only them), K rows after.
+        // Rows j >= NMAX are dead unless j - NMAX < r: a dead one re-reads row
+        // j - NMAX (always a token row then) instead of running past the
+        // request's rows.
+        gptr<const uint16_t> gsrc[NV], ksrc[NV];
+#pragma unroll
+        for (int j = 0; j < NV; ++j) {
+          if (j < POOL - 1) {
+            const bool from_ring = j < r;
+            gsrc[j] = (from_ring ? (gptr<const uint16_t>)tgp : sbr) + j * HEAD_DIM;
+            ksrc[j] = (from_ring ? (gptr<const uint16_t>)tkp : kbr) + j * HEAD_DIM;
+          } else if (j < NMAX) {
+            gsrc[j] = sbr + j * HEAD_DIM;
+            ksrc[j] = kbr + j * HEAD_DIM;
+          } else {
+            const uint32_t off = (uint32_t)(((j - NMAX) < r ? j : j - NMAX) * HEAD_DIM);
+            gsrc[j] = sbr + off;
+            ksrc[j] = kbr + off;
+          }
+        }
+#pragma unroll
+        for (int j = 0; j < NV; ++j) vg[j] = load_dw<VEC>(gsrc[j], sub);
+        if (amask) load_ape();
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int j = 0; j < NV; ++j) vk[j] = load_dw<VEC>(ksrc[j], sub);
+      };
+      if constexpr (EARLY_ROWS) {
+        if (amask == 0) {
+          if (do_stash) stash_all(0.0f);
+          return;
+        }
+      }
+      load_virtual();
+      // completions in token order; the stash is issued inside the last one
+      // (its store acks drain under the Hadamard and the quantization)
+#pragma unroll
+      for (int c = 0; c < NC; ++c) {
+        if ((amask >> c) & 1u) {
+          const bool last = (amask >> (c + 1)) == 0u;
+          uint32_t gw[POOL][1], kw[POOL][1];
+#pragma unroll
+          for (int s = 0; s < POOL; ++s) {
+            gw[s][0] = vg[c * POOL + s];
+            kw[s][0] = vk[c * POOL + s];
+          }
+          write_pool(gw, kw, cloc[c], [&](float dep) {
+            if (last && do_stash) stash_all(dep);
+          });
+        }
+      }
+      if (amask == 0 && do_stash) stash_all(0.0f);
+      return;
+    }
+    // ===== irregular request (padding, negative slots, gaps, a ring equal
+    // to the pool, ...): the ordered walk, one completion at a time. Token
+    // t's metadata lives in lane t; the source of a pool slot (the latest
+    // earlier token that stashed into the same ring row, else the ring) is
+    // a ballot over the lanes; each completion loads its own rows (one
+    // round trip each). Correctness matters here, not speed. =====
+    if (vmask == 0) return;
+    const int lt = min(sub, n - 1);  // this lane's token
+    const uint32_t jm = (uint32_t)(base + lt);
+    const int l_ts = m_ts[jm], l_loc = m_loc[jm], l_pos = m_pos[jm];
+    load_rows();  // rk / rs by token, for the stash
+    const int l_safe = max(l_pos, 0);
+    const int l_phys = ring_mod(l_safe, ta);
+    const int l_blk = ring_div(max(l_ts, 0), ta);
+    const bool l_ok = sub < n;
+    const bool l_stash = l_ok && l_pos >= 0 && l_ts >= 0;
+    const bool l_close = l_ok && l_pos >= 0 && l_loc >= 0 && l_safe % POOL == POOL - 1;
+    const uint64_t smask = __builtin_amdgcn_ballot_w64(l_stash);
+    uint64_t cmask = __builtin_amdgcn_ballot_w64(l_close);
+    if (cmask) load_ape();
+    while (cmask) {
+      const int i = __builtin_ctzll(cmask);
+      cmask &= cmask - 1;
+      const int pos_i = __builtin_amdgcn_readlane(l_pos, i);
+      const int loc_i = __builtin_amdgcn_readlane(l_loc, i);
+      const int blk_i = __builtin_amdgcn_readlane(l_blk, i);
+      const int slot = pos_i % POOL;
+      const int pbase = pos_i - slot;  // position of pool slot 0
+      const uint64_t earlier = smask & ((1ull << i) - 1ull);  // tokens before i that stash
+      const bool blk_same = l_blk == blk_i;
+      uint32_t gw[POOL][1], kw[POOL][1];
+#pragma unroll
+      for (int s = 0; s < POOL; ++s) {
+        const int phys_s = ring_mod(pbase + s, ta);
+        const uint64_t cand = __builtin_amdgcn_ballot_w64(blk_same && l_phys == phys_s) & earlier;
+        const int latest = cand ? 63 - __builtin_clzll(cand) : -1;
+        const int src = s == slot ? i : latest;  // the token itself for its own slot
+        gptr<const uint16_t> krow, grow;
+        if (src >= 0) {
+          krow = kbase + (uint32_t)(src * d.key_st);
+          grow = sbase + (uint32_t)(src * d.ss_st);
+        } else {
+          krow = tail_row(blk_i, phys_s);
+          grow = krow + (uint32_t)ta.head_elems;
+        }
+        gw[s][0] = load_dw<VEC>(grow, sub);
+        kw[s][0] = load_dw<VEC>(krow, sub);
+      }
+      write_pool(gw, kw, loc_i, NoMid{});
+    }
+    // stash in token order (every ring read above was consumed already)
+#pragma unroll
+    for (int t = 0; t < NMAX; ++t) {
+      if ((smask >> t) & 1ull) {
+        const gptr<uint16_t> dst =
+            tail_row(__builtin_amdgcn_readlane(l_blk, t), __builtin_amdgcn_readlane(l_phys, t));
+        store_dw(dst, sub, rk[t]);
+        store_dw(dst + (uint32_t)ta.head_elems, sub, rs[t]);
+      }
+    }
+    return;
+  }
+
+  // ===== one token (NMAX == 1) =====
+  read_meta();
   // --- derived per token (wave-uniform) ---
   ivec phys, blk;
   uint32_t smask = 0, cmask = 0;
@@ -874,18 +1141,6 @@ __device__ __forceinline__ void decode_request(
   }
   smask &= vmask;
   cmask &= vmask;
-
-  // K row (block b, ring slot ph) of the tail; the gate row is ta.head_elems further
-  auto tail_row = [&](int b, int ph) -> gptr<uint16_t> {
-    return tail + (uint32_t)(b * ta.block_elems + ph * HEAD_DIM);
-  };
-  auto write_pool = [&](const uint32_t (&gw)[POOL][1], const uint32_t (&kw)[POOL][1], int loc_i, auto mid) {
-    int tok;
-    const int page = page_of<int>(loc_i, page_size, page_shift, tok);
-    compress_pool<POOL, DEC_LANES>(gw, kw, apev, cache_g + (uint64_t)(uint32_t)page * page_bytes, tok,
-                                   (uint32_t)(page_size * HEAD_DIM + tok * 4), preshuffle, round_scale, sub, mid);
-  };
-
   if constexpr (NMAX == 1) {
     // One token: it closes a pool only as slot POOL-1 (pos % POOL == POOL-1),
     // so the other POOL-1 slots are the ring rows phys0 .. phys0 + POOL-2
@@ -929,82 +1184,13 @@ __device__ __forceinline__ void decode_request(
     } else if (smask) {
       stash(rk[0], rs[0]);
     }
-    return;
-  } else {
-    // source token (or -1 = ring) of pool slot s of the completion at token i;
-    // the pool's ring rows are phys0 .. phys0 + POOL-1 with phys0 = ring_mod(pos - slot)
-    auto src_of = [&](int i, int s) {
-      const int safe = max(vpick<NMAX>(pos, i), 0);
-      const int slot = safe % POOL;
-      if (s == slot) return i;
-      const int phys_s = ring_mod(safe - slot + s, ta);
-      const int blk_i = vpick<NMAX>(blk, i);
-      int src = -1;
-#pragma unroll
-      for (int t2 = 0; t2 < NMAX; ++t2) {
-        if (t2 < i && ((smask >> t2) & 1u) && blk[t2] == blk_i && phys[t2] == phys_s) src = t2;
-      }
-      return src;
-    };
-    auto pool_krow = [&](int i) -> gptr<const uint16_t> {
-      const int safe = max(vpick<NMAX>(pos, i), 0);
-      return tail_row(vpick<NMAX>(blk, i), ring_mod(safe - safe % POOL, ta));
-    };
-
-    // --- ring rows of the first completion, fetched before any pool math
-    // (only the slots that really come from the ring) ---
-    const int first = cmask ? __builtin_ctz(cmask) : -1;
-    uint32_t fk[POOL], fs[POOL];
-    if (first >= 0) {
-      const gptr<const uint16_t> krow = pool_krow(first);
-#pragma unroll
-      for (int s = 0; s < POOL; ++s) {
-        if (src_of(first, s) < 0) fs[s] = load_dw<VEC>(krow + (uint32_t)ta.head_elems + s * HEAD_DIM, sub);
-      }
-      load_ape();
-#pragma unroll
-      for (int s = 0; s < POOL; ++s) {
-        if (src_of(first, s) < 0) fk[s] = load_dw<VEC>(krow + s * HEAD_DIM, sub);
-      }
-    }
-
-    // --- completions, in token order: one compress body, runtime loop ---
-    while (cmask) {
-      const int i = __builtin_ctz(cmask);
-      cmask &= cmask - 1;
-      uint32_t gw[POOL][1], kw[POOL][1];
-      const gptr<const uint16_t> krow = pool_krow(i);
-#pragma unroll
-      for (int s = 0; s < POOL; ++s) {
-        const int src = src_of(i, s);
-        if (src >= 0) {
-          kw[s][0] = vpick<NMAX>(rk, src);
-          gw[s][0] = vpick<NMAX>(rs, src);
-        } else if (i == first) {
-          kw[s][0] = fk[s];
-          gw[s][0] = fs[s];
-        } else {
-          gw[s][0] = load_dw<VEC>(krow + (uint32_t)ta.head_elems + s * HEAD_DIM, sub);
-          kw[s][0] = load_dw<VEC>(krow + s * HEAD_DIM, sub);
-        }
-      }
-      write_pool(gw, kw, vpick<NMAX>(loc, i), NoMid{});
-    }
-
-    // --- stash, in token order (every ring read above was consumed already) ---
-#pragma unroll
-    for (int i = 0; i < NMAX; ++i) {
-      if (!((smask >> i) & 1u)) continue;
-      const gptr<uint16_t> dst = tail_row(blk[i], phys[i]);
-      store_dw(dst, sub, rk[i]);
-      store_dw(dst + (uint32_t)ta.head_elems, sub, rs[i]);
-    }
   }
 }
 
 
 template <int POOL, int NMAX, bool VEC>
-__global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) kpool_decode_kernel(
+// waves_per_eu(8, 8): keep occupancy 8 (<= 64 VGPRs) for every NMAX
+__global__ void __launch_bounds__(64 * DEC_BLOCK_WAVES) __attribute__((amdgpu_waves_per_eu(8, 8))) kpool_decode_kernel(
     const uint16_t* key, const uint16_t* score, const int32_t* tail_slot, const int32_t* slot_map,
     const int32_t* positions, int key_sb, int ss_sb, int next_n, int num_requests, DecodeKRest r) {
   DecodeKArgs d;
@@ -1150,9 +1336,9 @@ int launch_decode(bool vec, const DecodeArgs& da, const void* ape, int64_t ape_s
 #define KPOOL_N(N)                                                                                            \
   if (n <= N) return launch_decode_n<POOL, N>(vec, da, ape, ape_stride, ta, cache, page_size, page_bytes, flags, stream);
 #ifdef KPOOL_ISA_QUICK
-  KPOOL_N(1) KPOOL_N(4)
+  KPOOL_N(1) KPOOL_N(2) KPOOL_N(4) KPOOL_N(8)
 #else
-  KPOOL_N(1) KPOOL_N(2) KPOOL_N(4) KPOOL_N(8) KPOOL_N(16)
+  KPOOL_N(1) KPOOL_N(2) KPOOL_N(3) KPOOL_N(4) KPOOL_N(5) KPOOL_N(6) KPOOL_N(7) KPOOL_N(8) KPOOL_N(16)
 #endif
 #undef KPOOL_N
   return -4;
@@ -1221,7 +1407,7 @@ int launch_mixed(int lanes, bool vec, bool i64, const DecodeArgs& da, const void
 #ifdef KPOOL_ISA_QUICK
   KPOOL_N(1)
 #else
-  KPOOL_N(1) KPOOL_N(2) KPOOL_N(4) KPOOL_N(8) KPOOL_N(16)
+  KPOOL_N(1) KPOOL_N(2) KPOOL_N(3) KPOOL_N(4) KPOOL_N(5) KPOOL_N(6) KPOOL_N(7) KPOOL_N(8) KPOOL_N(16)
 #endif
 #undef KPOOL_N
   return -4;

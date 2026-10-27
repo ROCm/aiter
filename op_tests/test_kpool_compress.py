@@ -285,8 +285,8 @@ def test_insert(lens, pool, page, slot_dtype=torch.int64, lanes=0, round_scale=T
 
 
 @benchmark()
-def test_decode(B, next_n, pool, page=64, round_scale=True):
-    d = make_decode(B, next_n, pool, page, seed=B * 100 + next_n)
+def test_decode(B, next_n, pool, page=64, round_scale=True, ring=None):
+    d = make_decode(B, next_n, pool, page, seed=B * 100 + next_n, ring=ring)
     kv_ref, tail_ref = d["kv"].clone(), d["tail"].clone()
     ref_decode(kv_ref, tail_ref, d["tail_slot"], d["key"], d["score"], d["ape"],
                d["slot_map"], d["pos"], pool, round_scale)
@@ -303,13 +303,20 @@ def test_decode(B, next_n, pool, page=64, round_scale=True):
         aiter.kpool_decode_update, d["kv"].clone(), d["tail"].clone(), d["tail_slot"], d["key"],
         d["score"], d["ape"], d["slot_map"], d["pos"], pool, round_scale, num_iters=20, num_warmup=2,
     )
-    ret = {"err": err, "scale err": err_s, "diff bytes": diff_bytes, "tail exact": tail_ok, "us": us}
+    ret = {"ring": d["tail"].shape[2], "err": err, "scale err": err_s, "diff bytes": diff_bytes,
+           "tail exact": tail_ok, "us": us}
     assert tail_ok, "tail ring mismatch"
     if _VLLM is not None:
-        kv_e, tail_e = d["kv"].clone(), d["tail"].clone()
-        vllm_decode(kv_e, tail_e, d["tail_slot"], d["key"], d["score"], d["ape"],
-                    d["slot_map"], d["pos"], pool, round_scale)
-        ret["vllm diff bytes"] = int((kv_e != kv_got).sum()) + int((tail_e != tail_got).sum())
+        if d["tail"].shape[2] == pool:
+            kv_e, tail_e = d["kv"].clone(), d["tail"].clone()
+            vllm_decode(kv_e, tail_e, d["tail_slot"], d["key"], d["score"], d["ape"],
+                        d["slot_map"], d["pos"], pool, round_scale)
+            ret["vllm diff bytes"] = int((kv_e != kv_got).sum()) + int((tail_e != tail_got).sum())
+        else:
+            # the vendored vLLM walk asserts ring == pool; production rings are
+            # checked byte for byte against Anh Cao's kpool_decode_update_parallel
+            # (tools / cmp_cao.py) instead
+            ret["vllm diff bytes"] = -1
     return ret
 
 
@@ -381,6 +388,10 @@ if args.only in (None, "decode"):
     rows = []
     for B, next_n, pool in ((4, 1, 4), (3, 4, 4), (8, 2, 4), (5, 8, 4), (2, 4, 16), (16, 3, 8)):
         rows.append(test_decode(B, next_n, pool))
+    # production rings (vLLM: pool * pow2(ceil((pool + next_n - 1) / pool))): the
+    # regular decode path; ring == pool above exercises the generic one
+    for B, next_n, ring in ((8, 2, 8), (6, 3, 8), (5, 4, 8), (4, 5, 8), (4, 6, 16), (4, 7, 16), (5, 8, 16), (3, 16, 32)):
+        rows.append(test_decode(B, next_n, 4, ring=ring))
     if not args.quick:
         rows.append(test_decode(64, 4, 4))
         rows.append(test_decode(32, 16, 4))
