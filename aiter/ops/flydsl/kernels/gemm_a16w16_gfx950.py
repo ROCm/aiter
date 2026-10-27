@@ -1434,18 +1434,22 @@ def assert_no_k_tail(k: int, kwargs: dict):
         )
 
 
+def make_split_k_buffers(device):
+    # Their dtypes are part of the FlyDSL cache key, so the AOT build
+    # (aiter.aot.flydsl.gemm) passes these buffers too.
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int64, device=device
+    )
+    signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
+    return semaphore, signal
+
+
 @functools.lru_cache(maxsize=128)
 def get_split_k_buffers(stream, device, split_k):
     # Keyed by split_k: a semaphore word only ever advances by split_k per launch,
     # which is what lets the kernel derive the launch index from its ticket.
     with persistent_alloc(torch.device(device)):
-        semaphore = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int64, device=device
-        )
-        signal = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
-        )
-    return semaphore, signal
+        return make_split_k_buffers(device)
 
 
 def _dynamic_tensor_arg(tensor, leading_dim):
