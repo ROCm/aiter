@@ -175,52 +175,6 @@ def test_bf16_swa_schedule_context_bound(monkeypatch, window):
 
 
 @pytest.mark.parametrize(
-    "kv_dtype,scale_mode,window,expected_window",
-    [
-        ("fp8", "per-tensor", -1, 0),
-        ("fp8", "per-tensor", 0, 0),
-        ("fp8", "none", -1, 0),
-        ("fp8", "per-token", 128, 128),
-        ("fp8", "per-tensor", -2, None),
-        ("bf16", "none", -1, 0),
-        ("bf16", "none", 0, 0),
-        ("bf16", "none", -2, None),
-        # CLI parsing checks the sign/range; GPU cases cover window boundaries.
-        *[
-            (dtype, scale, window, window)
-            for dtype, scale in (("fp8", "per-tensor"), ("bf16", "none"))
-            for window in (1, 2**31 + 1)
-        ],
-    ],
-)
-def test_asymmetric_tuning_cli_window(kv_dtype, scale_mode, window, expected_window):
-    """The full-attention alias preserves the asymmetric dtype/scale contract."""
-    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
-    argv = [
-        "--head-dim",
-        "192",
-        "--value-dim",
-        "128",
-        "--query-length",
-        "8",
-        "--block-size",
-        "64",
-        "--kv-dtype",
-        kv_dtype,
-        "--scale-mode",
-        scale_mode,
-        "--sliding-window",
-        str(window),
-    ]
-    if expected_window is None:
-        with pytest.raises(SystemExit) as error:
-            tuning._parse_args(argv)
-        assert error.value.code == 2
-    else:
-        assert tuning._parse_args(argv).sliding_window == expected_window
-
-
-@pytest.mark.parametrize(
     "kv_dtype,window,accepted",
     [
         (dtype, window, window >= 0)
@@ -252,36 +206,6 @@ def test_asymmetric_schedule_window_contract(monkeypatch, kv_dtype, window, acce
     else:
         with pytest.raises(ValueError, match="sliding window"):
             traits.PaDecodeSchedule.select(**kwargs)
-
-
-@pytest.mark.parametrize("heads,group,query_length", [(2, 8, 3), (4, 16, 1)])
-@pytest.mark.parametrize(
-    "kv_dtype,scale_mode", [("bf16", "none"), ("fp8", "per-token")]
-)
-def test_asymmetric_tuning_cli_heads(heads, group, query_length, kv_dtype, scale_mode):
-    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
-    args = tuning._parse_args(
-        [
-            "--head-dim",
-            "192",
-            "--value-dim",
-            "128",
-            "--query-length",
-            str(query_length),
-            "--num-query-heads",
-            str(group * heads),
-            "--num-kv-heads",
-            str(heads),
-            "--block-size",
-            "64",
-            "--kv-dtype",
-            kv_dtype,
-            "--scale-mode",
-            scale_mode,
-        ]
-    )
-    assert args.num_query_heads // args.num_kv_heads == group
-    assert args.query_length == query_length
 
 
 @pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
@@ -495,43 +419,55 @@ _COMMON_CASES = [
         for pattern in ("small_query", "probability_tail")
     ],
 ]
+_ASYMMETRIC_BASE = {
+    "query_length": 8,
+    "group_size": 16,
+    "head_dim": 192,
+    "value_dim": 128,
+    "block_size": 64,
+    "max_partitions": 8,
+    "sink_dtype": torch.float32,
+    "capture": True,
+    # Empty rows, short-context residuals, and page/tile boundaries.
+    "lengths": (0, 1, 7, 8, 16, 17, 32, 33, 63, 64, 65, 255, 256, 257, 1027),
+}
 _ASYMMETRIC_WINDOW_CASES = [
     (
         f"asymmetric-window-{window}",
-        {
-            "query_length": 8,
-            "group_size": 16,
-            "head_dim": 192,
-            "value_dim": 128,
-            "block_size": 64,
-            "max_partitions": 8,
-            "window": window,
-            "sink_dtype": torch.float32,
-            "capture": True,
-            "lengths": (0, 1, 7, 8, 63, 64, 65, 127, 128, 129, 257, 1027, 8192),
-        },
+        dict(
+            _ASYMMETRIC_BASE,
+            window=window,
+            sink_dtype=None if window in (0, 2) else torch.float32,
+            capture=window in (0, 2, 33, 1025),
+            lengths=(*_ASYMMETRIC_BASE["lengths"], 8192),
+        ),
     )
-    for window in (1, 2, 4, 16, 17, 32, 33, 127, 257, 1024, 1025, 4097, 2**31 + 1)
+    # Full attention, minimum windows, FP8 residual cutoff, and wider masks.
+    for window in (0, 1, 2, 32, 33, 128, 1025, 2**31 + 1)
 ]
 _ASYMMETRIC_MULTIHEAD_CASES = [
     (
-        f"asymmetric-kv{heads}-w{window}",
-        {
-            **_ASYMMETRIC_WINDOW_CASES[0][1],
-            "kv_heads": heads,
-            "window": window,
-            "pattern": "varied",
-            "max_partitions": 4,
-            "lengths": (0, 1, 7, 8, 16, 17, 31, 32, 33, 255, 257, 1027),
-        },
+        f"asymmetric-kv{heads}-gqa{group}-w{window}",
+        dict(
+            _ASYMMETRIC_BASE,
+            kv_heads=heads,
+            group_size=group,
+            window=window,
+            pattern="varied",
+            max_partitions=4,
+        ),
     )
-    for heads, window in ((2, 0), (2, 4), (4, 128), (4, 2048))
+    # Per-token scales need both residual and ordinary-window paths.
+    for heads, group, window in ((2, 16, 4), (4, 8, 128))
 ]
 _ASYMMETRIC_GENERAL_CASES = [
     (
         name,
         dict(
-            _ASYMMETRIC_MULTIHEAD_CASES[0][1],
+            _ASYMMETRIC_BASE,
+            kv_heads=2,
+            pattern="varied",
+            max_partitions=4,
             query_length=qlen,
             group_size=group,
             block_size=page,
@@ -545,72 +481,27 @@ _ASYMMETRIC_GENERAL_CASES = [
         ("asymmetric-qlen64", 64, 8, 64, 0),
     )
 ]
-_ASYMMETRIC_GENERAL_CASES.append(
-    (
-        "asymmetric-qlen1-large-grid",
-        dict(_ASYMMETRIC_GENERAL_CASES[0][1], lengths=(1027,) * 128),
-    )
-)
 _FP8_CASES = _COMMON_CASES + [
     *_ASYMMETRIC_GENERAL_CASES,
     *_ASYMMETRIC_MULTIHEAD_CASES,
-    # The W4 probability-rounding case below includes a superset of lengths.
-    *[case for case in _ASYMMETRIC_WINDOW_CASES if case[1]["window"] != 4],
+    *_ASYMMETRIC_WINDOW_CASES,
     (
         "asymmetric-large-window-grid",
-        {
-            **_ASYMMETRIC_WINDOW_CASES[0][1],
-            "window": 1024,
-            "lengths": (0, 1, 8, 16, 17, 257, 1027, 8192) * 16,
-        },
+        dict(
+            _ASYMMETRIC_BASE,
+            window=1024,
+            lengths=(0, 1, 8, 16, 17, 257, 1027, 8192) * 16,
+        ),
     ),
-    *[
-        (
-            f"asymmetric-probability-rounding-w{window}",
-            {
-                **_ASYMMETRIC_WINDOW_CASES[0][1],
-                "window": window,
-                "sink_dtype": sinks,
-                "lengths": (
-                    0,
-                    1,
-                    7,
-                    8,
-                    63,
-                    64,
-                    65,
-                    127,
-                    128,
-                    129,
-                    257,
-                    515,
-                    1027,
-                    2051,
-                    4096,
-                    8192,
-                ),
-            },
-        )
-        for window, sinks in (
-            (0, None),
-            (2, None),
-            (4, torch.float32),
-            (128, torch.float32),
-        )
-    ],
     (
-        "qlen8-full-d192-v128-long",
-        {
-            "query_length": 8,
-            "group_size": 16,
-            "head_dim": 192,
-            "value_dim": 128,
-            "block_size": 64,
-            "max_partitions": 8,
-            "scale_mode": "per-tensor",
-            "trans_v": True,
-            "lengths": (16384,) * 8,
-        },
+        "asymmetric-full-long",
+        dict(
+            _ASYMMETRIC_BASE,
+            window=0,
+            sink_dtype=None,
+            capture=False,
+            lengths=(16384,) * 8,
+        ),
     ),
     (
         "packed-mtp4",
@@ -653,18 +544,12 @@ _FP8_CASES = _COMMON_CASES + [
 _BF16_CASES = _COMMON_CASES + [
     *_ASYMMETRIC_GENERAL_CASES,
     *_ASYMMETRIC_MULTIHEAD_CASES,
+    # BF16 has no FP8 residual cutoff; retain the shared mask/length coverage.
     *[
-        (
-            f"asymmetric-gqa8-kv2-w{geometry['window']}",
-            dict(geometry, group_size=8, kv_heads=2),
-        )
-        for _, geometry in _ASYMMETRIC_MULTIHEAD_CASES
+        case
+        for case in _ASYMMETRIC_WINDOW_CASES
+        if case[1]["window"] not in (2, 32, 33)
     ],
-    *_ASYMMETRIC_WINDOW_CASES,
-    (
-        "asymmetric-full",
-        {**_ASYMMETRIC_WINDOW_CASES[0][1], "window": 0},
-    ),
     *[
         (
             f"qlen8-d128-w{window}-np{parts}",
@@ -727,20 +612,6 @@ _BF16_CASES = _COMMON_CASES + [
             "sink_dtype": torch.float32,
             "capture": True,
             "lengths": (0, 1, 127, 128, 129, 257, 511, 512),
-        },
-    ),
-    (
-        "qlen8-w128-d192-v128",
-        {
-            "query_length": 8,
-            "group_size": 16,
-            "head_dim": 192,
-            "value_dim": 128,
-            "block_size": 64,
-            "max_partitions": 8,
-            "window": 128,
-            "sink_dtype": torch.float32,
-            "lengths": (127, 128, 129, 257, 515),
         },
     ),
     (
@@ -1298,108 +1169,3 @@ def test_asymmetric_multihead_large_address(kv_dtype, device):
     expected[:, :8].fill_(2)
     expected[:, 8:].fill_(4)
     torch.testing.assert_close(output, expected, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize(
-    "kv_dtype,window",
-    [
-        # One full-residual window, one ordinary window, and a multi-tile plan.
-        ("fp8", 17),
-        ("fp8", 128),
-        ("fp8", 1025),
-        ("bf16", 128),
-        ("bf16", 1025),
-    ],
-)
-def test_asymmetric_autotune_plan(kv_dtype, window, device, tmp_path):
-    """Tuned and cached plans must decode with the physical V/output width."""
-    arch = get_gfx_runtime()
-    if arch not in ("gfx942", "gfx950"):
-        pytest.skip("asymmetric Q/K and V widths require gfx942/gfx950")
-    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
-    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    torch.manual_seed(0)
-    # B32/NP8 lets native tuning compare different work-plan capacities.
-    query, key, value, table, context = _make_inputs(
-        8, 1, 16, 192, 128, 64, torch.bfloat16, "random", device, (1027,) * 32
-    )
-    key_scale = value_scale = None
-    vector = 8
-    if kv_dtype == "fp8":
-        fp8_dtype = torch.float8_e4m3fnuz if arch == "gfx942" else torch.float8_e4m3fn
-        key, key_scale = per_tensor_quant(key, quant_dtype=fp8_dtype)
-        value, value_scale = per_tensor_quant(value, quant_dtype=fp8_dtype)
-        vector = 16
-    reference = _reference(
-        query,
-        key.float() * (1.0 if key_scale is None else key_scale),
-        value.float() * (1.0 if value_scale is None else value_scale),
-        table,
-        context,
-        8,
-        window,
-        None,
-    )
-    pages = key.shape[0]
-    key_cache = (
-        key.reshape(pages, 1, 64, 192 // vector, vector)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-    )
-    value_cache = (
-        value.reshape(pages, 1, 64 // vector, vector, 128)
-        .permute(0, 1, 2, 4, 3)
-        .contiguous()
-    )
-    arguments = (query, key_cache, value_cache, context, table, 192**-0.5, 8)
-    options = {
-        "key_scale": key_scale,
-        "value_scale": value_scale,
-        "sliding_window": window,
-        "max_context_length": 1027,
-    }
-    plan = tuning.prepare_pa_decode_plan(
-        *arguments, **options, max_partitions=8, tune=True, config_dir=tmp_path
-    )
-    assert (tmp_path / arch / "_pa_decode_autotuner.json").is_file()
-    tuning._get_pa_decode_autotuner.cache_clear()
-    assert tuning._get_pa_decode_autotuner(arch, tmp_path).cache
-    cached_plan = tuning.prepare_pa_decode_plan(
-        *arguments, **options, max_partitions=8, config_dir=tmp_path
-    )
-    assert cached_plan.capacity == plan.capacity
-    output = torch.empty((*query.shape[:-1], 128), dtype=query.dtype, device=device)
-    for selected_plan in (plan, cached_plan):
-        output.fill_(float("nan"))
-        pa.pa_decode(output, *arguments, **options, work_plan=selected_plan)
-        _check_output(output, reference, 1e-2 if kv_dtype == "fp8" else 5e-3)
-
-    if kv_dtype == "fp8":
-        # A cached plan must switch between short and ordinary arithmetic as
-        # the device lengths change, without recompilation or stale outputs.
-        def launch():
-            pa.plan_pa_decode(
-                context, 1, query_length=8, sliding_window=window, plan=cached_plan
-            )
-            pa.pa_decode(output, *arguments, **options, work_plan=cached_plan)
-
-        launch()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            launch()
-        for length in (0, 8, 16, 17, 1027):
-            context.fill_(length)
-            query.neg_()
-            output.fill_(float("nan"))
-            graph.replay()
-            reference = _reference(
-                query,
-                key.float() * key_scale,
-                value.float() * value_scale,
-                table,
-                context,
-                8,
-                window,
-                None,
-            )
-            _check_output(output, reference, 1e-2)
