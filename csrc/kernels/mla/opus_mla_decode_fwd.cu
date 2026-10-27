@@ -83,7 +83,7 @@ inline bool opus_env_flag(const char* name)
 // (csrc/py_itfs_cu/asm_mla.cu): what asm runs on its qh32 / qseqlen4 kernel (128 packed rows
 // per workgroup) goes to 32mx4, what it runs on qh16 / qseqlen4 (64 rows) to 32mx2. nhead
 // here is nhead per KV head (MLA has one), after mla.py's fold of the non-native head counts.
-// aiter/mla.py keeps the same table so a shape with no build stays on the asm path.
+// aiter/mla.py asks opus_mla_decode_supported, so a shape with no build stays on the asm path.
 enum class OpusA8W8Route
 {
     k32mx4,
@@ -385,6 +385,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             kargs, q_scale, kv_scale, max_seqlen_q, causal, num_workers, stream);
     else
         AITER_CHECK(false, __func__, ": q/kv must be bf16 or fp8.");
+}
+
+// 1 if opus_mla_decode_fwd has a build for this shape (nhead as it will see it); bf16 has one
+// for every head count.
+AITER_CTYPES_DEFINE_ENTRYPOINT(opus_mla_decode_supported,
+                               (bool fp8, int nhead, int max_seqlen_q, hipStream_t stream),
+                               (fp8, nhead, max_seqlen_q, stream))
+{
+    return !fp8 || opus_a8w8_route(nhead, max_seqlen_q) != OpusA8W8Route::kNone;
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
