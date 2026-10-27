@@ -14,11 +14,8 @@ from typing import TypeAlias
 
 import matplotlib.pyplot as plt
 import pandas as pd
-import triton.profiler  # noqa: F401
 from triton.runtime.errors import OutOfResources
 
-# Keep this import above every AITER import. ROCProfiler only times HSA queues
-# created after Proton is imported, and arch_info probes the GPU at import time.
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
     main as bench_batched_gemm_a8w8_main,
