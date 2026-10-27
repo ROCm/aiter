@@ -193,6 +193,6 @@ if __name__ == "__main__":
         print(f"Skipping: requires {TP_SIZE} ROCm GPUs")
         sys.exit(0)
     failures = run_rank_order_test()
-    assert not failures, (
-        "results differ from the rank-order 0..n-1 sum:\n  " + "\n  ".join(failures)
-    )
+    assert (
+        not failures
+    ), "results differ from the rank-order 0..n-1 sum:\n  " + "\n  ".join(failures)
