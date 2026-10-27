@@ -907,6 +907,7 @@ def test_mla_gluon_regime_select(batch, qlen=8, nhead=12):
 
     torch.manual_seed(0)
     lens = torch.randint(qlen, 2048, (batch,), dtype=torch.int32, device="cuda")
+    lens[0] = 256  # short enough to leave some stage-1 splits unwritten
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
     kv_indptr[1:] = torch.cumsum(lens, 0)
     total = int(kv_indptr[-1])
@@ -936,6 +937,14 @@ def test_mla_gluon_regime_select(batch, qlen=8, nhead=12):
 
     sel = torch.full((batch + 2,), -1, dtype=torch.int32, device="cuda")
     out, _ = run(sel, eff + 1)
+    if ref.dim() == 5:
+        # Stage 1 never writes splits past a sequence's end (logits_buf is
+        # torch.empty), so compare only the splits the stage-2 reduce reads.
+        splits = ref.shape[3]
+        per_split = torch.clamp(lens // splits, min=128)  # fp8 KV: BLOCK_N=128
+        active = torch.clamp((lens + per_split - 1) // per_split, max=splits)
+        written = torch.arange(splits, device="cuda") < active[:, None]
+        out, ref = out.transpose(1, 3)[written], ref.transpose(1, 3)[written]
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
     assert (sel == 0).all()
 
