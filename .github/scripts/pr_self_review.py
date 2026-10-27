@@ -24,6 +24,10 @@ from typing import Any
 
 MARKER = "<!-- aiter-pr-self-review -->"
 STATUS_CONTEXT = "PR Self-Review"
+MAX_PAGES = 30
+MAX_RENDERED_ANSWER_CHARS = 4_000
+MAX_RENDERED_FINDING_CHARS = 500
+MAX_RENDERED_FINDINGS = 20
 SECTION_NAMES = (
     "Reviewed revision",
     "Behavior and intent",
@@ -115,7 +119,7 @@ class GitHub:
     def pages(self, path: str) -> list[Any]:
         values: list[Any] = []
         separator = "&" if "?" in path else "?"
-        for page in range(1, 11):
+        for page in range(1, MAX_PAGES + 1):
             batch = self.request(f"{path}{separator}per_page=100&page={page}")
             if not isinstance(batch, list):
                 raise APIError(f"expected list from {path}")
@@ -129,6 +133,7 @@ class GitHub:
 class Result:
     head_sha: str
     pr_url: str
+    draft: bool
     mode: str
     question: str
     author_issues: list[str] = field(default_factory=list)
@@ -150,6 +155,8 @@ class Result:
     @property
     def blocking(self) -> list[str]:
         failures = self.author_issues + self.copilot_issues + self.hygiene_issues
+        if self.draft:
+            failures.append("pull request is still a draft")
         if self.ci_failed:
             failures.append("one or more required CI checks failed")
         return failures
@@ -443,6 +450,7 @@ def evaluate(api: GitHub, number: int, mode: str) -> Result:
     result = Result(
         head_sha=head_sha,
         pr_url=pr.get("html_url") or "",
+        draft=bool(pr.get("draft")),
         mode=mode,
         question=select_question(paths),
         author_issues=author_issues,
@@ -466,9 +474,24 @@ def icon(state: str) -> str:
 
 
 def fenced_text(value: str) -> str:
+    if len(value) > MAX_RENDERED_ANSWER_CHARS:
+        value = (
+            value[:MAX_RENDERED_ANSWER_CHARS].rstrip()
+            + "\n\n[truncated in readiness report; see the PR description for the full answer]"
+        )
     longest = max((len(match) for match in re.findall(r"`+", value)), default=0)
     fence = "`" * max(3, longest + 1)
     return f"{fence}\n{value.strip()}\n{fence}"
+
+
+def append_findings(lines: list[str], level: str, findings: list[str]) -> None:
+    for finding in findings[:MAX_RENDERED_FINDINGS]:
+        if len(finding) > MAX_RENDERED_FINDING_CHARS:
+            finding = finding[:MAX_RENDERED_FINDING_CHARS].rstrip() + "…"
+        lines.append(f"- {level} — {finding}")
+    remaining = len(findings) - MAX_RENDERED_FINDINGS
+    if remaining > 0:
+        lines.append(f"- {level} — {remaining} additional finding(s) omitted")
 
 
 def render(result: Result) -> str:
@@ -500,7 +523,7 @@ def render(result: Result) -> str:
                 "### Missing or invalid answers",
             ]
         )
-        lines.extend(f"- FAIL — {issue}" for issue in result.author_issues)
+        append_findings(lines, "FAIL", result.author_issues)
     else:
         lines.extend(
             [
@@ -526,21 +549,32 @@ def render(result: Result) -> str:
                 ]
             )
         lines.append("</details>")
+        lines.extend(
+            [
+                "",
+                "### PR state",
+                (
+                    "- WAIT — pull request is still a draft"
+                    if result.draft
+                    else "- PASS — pull request is marked ready for review"
+                ),
+            ]
+        )
         lines.extend(["", "### Copilot findings"])
         if result.copilot_issues:
-            lines.extend(f"- FAIL — {issue}" for issue in result.copilot_issues)
+            append_findings(lines, "FAIL", result.copilot_issues)
         else:
             lines.append(
                 "- PASS — no active Copilot finding lacks a substantive author reply"
             )
-        lines.extend(f"- ADVISORY — {issue}" for issue in result.copilot_advisories)
+        append_findings(lines, "ADVISORY", result.copilot_advisories)
 
         lines.extend(["", "### Code and op-test hygiene"])
         if result.hygiene_issues:
-            lines.extend(f"- FAIL — {issue}" for issue in result.hygiene_issues)
+            append_findings(lines, "FAIL", result.hygiene_issues)
         else:
             lines.append("- PASS — no committed artifact or conflict marker detected")
-        lines.extend(f"- ADVISORY — {issue}" for issue in result.hygiene_advisories)
+        append_findings(lines, "ADVISORY", result.hygiene_advisories)
 
         lines.extend(["", "### Required CI"])
         for name, state in result.ci.items():
@@ -580,6 +614,8 @@ def upsert_comment(api: GitHub, number: int, body: str) -> str:
         None,
     )
     if existing:
+        if existing.get("body") == body:
+            return existing.get("html_url") or ""
         response = api.request(
             f"issues/comments/{existing['id']}", method="PATCH", body={"body": body}
         )
@@ -600,6 +636,24 @@ def post_status(api: GitHub, sha: str, result: Result, url: str) -> None:
         description = "waiting for required CI"
     else:
         description = f"not ready: {len(result.blocking)} blocker(s)"
+    statuses = api.request(f"commits/{sha}/statuses?per_page=100")
+    existing = next(
+        (
+            status
+            for status in statuses
+            if status.get("context") == STATUS_CONTEXT
+            and ((status.get("creator") or {}).get("login") or "").lower()
+            == "github-actions[bot]"
+        ),
+        None,
+    )
+    if (
+        existing
+        and existing.get("state") == state
+        and existing.get("description") == description[:140]
+        and existing.get("target_url") == url
+    ):
+        return
     api.request(
         f"statuses/{sha}",
         method="POST",

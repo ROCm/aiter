@@ -467,6 +467,7 @@ required baseline CI state.
 
 A pull request is ready for human review only when:
 
+* The pull request is no longer a draft.
 * The behavior, reason for the change and current revision are stated.
 * Validation evidence and anything still unverified are stated.
 * The PR-specific question is answered.

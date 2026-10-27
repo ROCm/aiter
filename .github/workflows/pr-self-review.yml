@@ -3,7 +3,7 @@ name: PR Self-Review
 on:
   pull_request_target:
     branches: [main]
-    types: [opened, reopened, edited, synchronize, ready_for_review]
+    types: [opened, reopened, edited, synchronize, ready_for_review, converted_to_draft]
   pull_request_review:
     types: [submitted, edited, dismissed]
   pull_request_review_comment:
@@ -31,7 +31,11 @@ concurrency:
 jobs:
   evaluate:
     # workflow_run may describe a main/scheduled run rather than a pull request.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.pull_requests[0].number
+    # Review events do not support a branches filter, so constrain their base here.
+    if: >-
+      (github.event_name != 'workflow_run' || github.event.workflow_run.pull_requests[0].number) &&
+      (github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch' ||
+       github.event.pull_request.base.ref == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
