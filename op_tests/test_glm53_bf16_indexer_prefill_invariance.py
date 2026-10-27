@@ -95,5 +95,6 @@ def test_glm53_bf16_indexer_prefill_invariance(seed, wide_values):
     # Replay after context exit still uses the captured prefill kernel.
     for graph, _, graph_out, graph_expected in captures:
         for _ in range(2):
+            graph_out.fill_(float("nan"))
             graph.replay()
             torch.testing.assert_close(graph_out, graph_expected, rtol=0, atol=0)
