@@ -161,5 +161,6 @@ def test_glm53_qb_batch_invariance(seed, wide_scales):
                 x[:m], w, xs[:m], ws, dtype=torch.bfloat16, y=graph_out
             )
         for _ in range(2):
+            graph_out.fill_(float("nan"))
             graph.replay()
             torch.testing.assert_close(graph_out, full[:m], rtol=0, atol=0)
