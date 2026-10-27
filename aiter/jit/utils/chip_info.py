@@ -118,19 +118,32 @@ def get_gfx_runtime() -> str:
     GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
     code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
     csrc module-level arch selection) where no GPU may be available.
-    """
-    try:
-        gfx_arch = _detect_native()[0]
-    except RuntimeError:
-        if not IS_WINDOWS:
-            raise
-        import torch
 
-        if torch.version.hip is None or not torch.cuda.is_available():
-            raise
-        gfx_arch = (
-            torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
-        )
+    The exception is an AOT replay process (AITER_AOT_REPLAY=1, started by
+    aiter.aot.flydsl.common.replay_env): it runs the runtime without a GPU for
+    the one arch GPU_ARCHS names, which stands in for the live GPU there.
+    """
+    if os.getenv("AITER_AOT_REPLAY") == "1":
+        targets = _parse_gpu_archs_env(os.getenv("GPU_ARCHS", ""))
+        if len(targets) != 1:
+            raise RuntimeError(
+                "AITER_AOT_REPLAY=1 needs GPU_ARCHS to name the one arch the "
+                f"process compiles for, got {os.getenv('GPU_ARCHS')!r}"
+            )
+        gfx_arch = targets[0]
+    else:
+        try:
+            gfx_arch = _detect_native()[0]
+        except RuntimeError:
+            if not IS_WINDOWS:
+                raise
+            import torch
+
+            if torch.version.hip is None or not torch.cuda.is_available():
+                raise
+            gfx_arch = (
+                torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0].lower()
+            )
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
         raise KeyError(
