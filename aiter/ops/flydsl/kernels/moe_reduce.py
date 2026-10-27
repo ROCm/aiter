@@ -56,12 +56,14 @@ def _moe_reduction_body(
     # (uniform soffset = k*row_stride) and truncating store. row_stride differs:
     # an fp8 row is padded with its scale bytes ([N fp8 | N/scale_blk e8m0]).
     is_fp8 = dtype_str == "fp8"
-    load_cache = 2 if streaming_loads else 0
     if const_expr(is_fp8):
         in_elem, in_bytes, V = fx.Int8, 1, FP8_VEC
         row_stride = fp8_row_stride
         out_numeric = fx.Float16 if (out_dtype_str or "bf16") == "f16" else fx.BFloat16
-        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(load_cache), fx.Int8)
+        load_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy64b(2) if streaming_loads else fx.rocdl.BufferCopy64b(),
+            fx.Int8,
+        )
     else:
         in_elem = (
             fx.Float32
@@ -71,7 +73,14 @@ def _moe_reduction_body(
         in_bytes = 4 if dtype_str == "f32" else 2
         row_stride, out_numeric = model_dim, in_elem
         V = 128 // (8 * in_bytes)  # 4 (f32), 8 (16b)
-        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(load_cache), in_elem)
+        load_atom = fx.make_copy_atom(
+            (
+                fx.rocdl.BufferCopy128b(2)
+                if streaming_loads
+                else fx.rocdl.BufferCopy128b()
+            ),
+            in_elem,
+        )
     out_bytes = out_numeric.width // 8
     TILE = NTHREADS * V
     store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
