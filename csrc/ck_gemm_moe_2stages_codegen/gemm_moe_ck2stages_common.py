@@ -180,6 +180,12 @@ a8w8_gemm1_kernels_list= {
      8: kernelInstanceGEMM1(       256,       128,       128,       128,     1,       4,        3,),
      9: kernelInstanceGEMM1(       256,       256,       128,       128,     1,       4,        3,),
     13: kernelInstanceGEMM1(       256,        16,        64,       256,     1,       4,        1,),
+    # KPerBlock 64, for a model_dim (K) that isn't a multiple of 128.
+    14: kernelInstanceGEMM1(        64,        16,        64,        64,     1,       1,        1,),
+    15: kernelInstanceGEMM1(       128,        32,        64,        64,     1,       2,        1,),
+    16: kernelInstanceGEMM1(       256,        64,        64,        64,     1,       4,        1,),
+    17: kernelInstanceGEMM1(       256,       128,        64,        64,     1,       4,        1,),
+    18: kernelInstanceGEMM1(       256,       256,        64,        64,     1,       4,        1,),
 }
 # gemm1 blockscale out:bf16/fp16 AB:fp8/i8
 a8w8_gemm1_blockscale_kernels_list= {
