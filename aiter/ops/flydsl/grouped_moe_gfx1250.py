@@ -274,6 +274,71 @@ def _find_grouped_config(
     return chosen
 
 
+@functools.lru_cache(maxsize=1024)
+def _widest_grouped_tile(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    quant_type,
+    ep_fused: bool = False,
+) -> int | None:
+    """Largest ``max(tile_m, tile_m2)`` tuned for this shape, any token bucket.
+
+    The compact arena is allocated once, but a step looks its tile up from its
+    own recv-token bucket. Those tiles are not monotonic, and the full-arena
+    bucket often has no row of its own; sizing the arena from that miss (the
+    tile_m=64 default) then clamps every larger tuned tile down to 64.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    keys = {
+        "gfx": str(get_gfx()),
+        "cu_num": str(get_cu_num()),
+        "model_dim": str(int(model_dim)),
+        "inter_dim": str(int(inter_dim)),
+        "expert": str(int(experts)),
+        "topk": str(int(topk)),
+        "act_type": _enum_name(activation),
+        "dtype": _dtype_name(dtype),
+        "q_dtype_a": str(q_dtype_a),
+        "q_dtype_w": str(q_dtype_w),
+        "q_type": _enum_name(quant_type),
+        "ep_fused": "1" if ep_fused else "0",
+    }
+
+    def _cell(row, k):
+        value = str(row.get(k) or "").strip()
+        return "" if value.lower() in ("nan", "none") else value
+
+    def _matches(row, *, require_cu_num: bool):
+        for k, v in keys.items():
+            if k == "cu_num" and not require_cu_num:
+                continue
+            cell = _cell(row, k)
+            if cell and cell != v:
+                return False
+        return True
+
+    rows = _load_grouped_config_rows()
+    matches = [row for row in rows if _matches(row, require_cu_num=True)]
+    if not matches:
+        matches = [row for row in rows if _matches(row, require_cu_num=False)]
+    widest = 0
+    for row in matches:
+        for column in ("tile_m", "tile_m2"):
+            try:
+                widest = max(widest, int(float(_cell(row, column) or 0)))
+            except ValueError:
+                continue
+    return widest or None
+
+
 def _use_grouped_gemm_enabled() -> bool:
     env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
     is_gfx1250 = get_gfx() == "gfx1250"
@@ -1015,6 +1080,17 @@ def _grouped_a8w4_tdm_moe(
         torch.uint8,
         dtypes.fp4x2,
     )
+    if (
+        _compact
+        and _prequantized
+        and int(tile_m) == 256
+        and int(m_warp) * int(n_warp) == 4
+    ):
+        # Only A's owner waves issue its row gathers, which at four waves left
+        # two of them 128 rows each per K tile. Eight waves with A on four
+        # (1536 tok decode: GEMM1 182 -> 147 us, 515 -> 488 us/layer).
+        m_warp, n_warp, waves_per_tensor_tdm = 2, 4, 4
+        wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
         assert hidden_states.dtype == dtype, (
@@ -1202,6 +1278,18 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            a_row_index=(
+                stage2_scatter.compact_ep_rowmap
+                if _compact and _prequantized
+                else None
+            ),
+            a_index_bound=(
+                int(stage2_scatter.world_size) * int(stage2_scatter.max_tokens_per_rank)
+                if _compact and _prequantized
+                else 0
+            ),
+            a_index_stride=2 if _compact and _prequantized else 1,
+            a_index_divisor=int(topk) if _compact and _prequantized else 1,
             **_situ_kw,
         )
     else:
@@ -1242,6 +1330,18 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            a_row_index=(
+                stage2_scatter.compact_ep_rowmap
+                if _compact and _prequantized
+                else None
+            ),
+            a_index_bound=(
+                int(stage2_scatter.world_size) * int(stage2_scatter.max_tokens_per_rank)
+                if _compact and _prequantized
+                else 0
+            ),
+            a_index_stride=2 if _compact and _prequantized else 1,
+            a_index_divisor=int(topk) if _compact and _prequantized else 1,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(

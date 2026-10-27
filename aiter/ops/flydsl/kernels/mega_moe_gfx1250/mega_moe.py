@@ -24,7 +24,7 @@ from .combine import (
     _make_combine_fused_sync,
     combine_reduce_lds_bytes,
 )
-from .config import _DISPATCH_COMPACT, _WAVE_SIZE, _select_dispatch_config
+from .config import _WAVE_SIZE, _compact_dispatch_schedule, _select_dispatch_config
 from .dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from .types import COMBINE_SCALE_BLOCK as _COMBINE_SCALE_BLOCK
 from .types import Stage2ScatterContext, _from_gpu_ptr
@@ -221,6 +221,7 @@ def _compact_gemm_align_m(
         _as_int,
         _find_grouped_config,
         _get_padded_m,
+        _widest_grouped_tile,
     )
 
     if config.dispatch_wire == "fp4":
@@ -250,7 +251,25 @@ def _compact_gemm_align_m(
     if row is not None:
         tile_m = _as_int(row.get("tile_m"), tile_m) or tile_m
         tile_m2 = _as_int(row.get("tile_m2"), tile_m) or tile_m
-    return max(int(tile_m), int(tile_m2))
+    align_m = max(int(tile_m), int(tile_m2))
+    if recv_bound is None:
+        # The arena is fixed at init. A full-capacity token bucket with no CSV
+        # row must still leave room for the widest tile a smaller step selects,
+        # or that step's GEMM is clamped down to this default.
+        widest = _widest_grouped_tile(
+            model_dim=config.hidden_dim,
+            inter_dim=int(inter_dim),
+            experts=config.experts_per_rank,
+            topk=-1,
+            activation=activation,
+            dtype=dtypes.bf16,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=dtypes.fp4x2,
+            quant_type=quant_type,
+        )
+        if widest:
+            align_m = max(align_m, int(widest))
+    return align_m
 
 
 def _mori_dispatch_schedule(config) -> tuple:
@@ -686,6 +705,7 @@ def _arena_bound_nbytes(
         npes=world_size,
         experts_per_rank=experts_per_rank,
         max_routes=max_tokens_per_rank * topk,
+        topk=topk,
     )
     return _arena_nbytes(
         _arena_regions(
@@ -1299,8 +1319,13 @@ class MegaMoEGfx1250:
             )
         self._compact_plan_event.record(plan_stream)
         self._compact_plan_pending = True
+        self._compact_plan_ready = (slot, int(token_count), self._compact_step_align_m)
 
     def _wait_compact_plan(self) -> None:
+        # Joins the side stream only. Whether the plan is still the one to
+        # dispatch on is _compact_plan_ready's call: a graph capture joins
+        # every prefetch inside its layer, and dropping the plan there made the
+        # next layer re-plan on the critical path.
         if not self._compact_plan_pending:
             return
         torch.cuda.current_stream().wait_event(self._compact_plan_event)
@@ -1386,6 +1411,7 @@ class MegaMoEGfx1250:
             npes=config.world_size,
             experts_per_rank=config.experts_per_rank,
             max_routes=max_routes,
+            topk=config.topk,
         )
         self._compact_hist_stride = hist_stride
         self._compact_max_routes = max_routes
@@ -1489,6 +1515,9 @@ class MegaMoEGfx1250:
             self._compact_plan_stream = torch.cuda.Stream()
             self._compact_plan_event = torch.cuda.Event()
             self._compact_plan_pending = False
+            # (slot, token_count, align_m) of the last plan launched and not
+            # yet dispatched on, or None.
+            self._compact_plan_ready = None
             self._compact_prefetch_events = [
                 torch.cuda.Event() for _ in range(self._COMPACT_PLAN_SLOTS)
             ]
@@ -1499,6 +1528,7 @@ class MegaMoEGfx1250:
         self._destination_peer_counter = torch.zeros(
             config.world_size, dtype=torch.int32, device=device
         )
+        # Compact dispatch uses word 0 as its epilogue arrival counter.
         self._dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         # Quantized dispatch reuses fixed buffers across layers and graph
         # replays. The public quant wrapper allocates both tensors on every call;
@@ -1548,7 +1578,9 @@ class MegaMoEGfx1250:
                 compact_warps = int(warps_env or "8")
                 config.schedule = ((None, compact_blocks, compact_warps),)
             else:
-                config.schedule = _DISPATCH_COMPACT
+                config.schedule = _compact_dispatch_schedule(
+                    config.world_size, config.topk
+                )
 
         # A spec is (block, warp), plus route_parallel on the compact path.
         if config.schedule:
@@ -1736,6 +1768,7 @@ class MegaMoEGfx1250:
                     off_ep_rowmap=(
                         self._arena.offset("ep_rowmap") if self._compact_plan else 0
                     ),
+                    row_gather=self._compact_plan and config.is_quant_dispatch_wire,
                     max_tok_slot_stride=config.max_tokens_per_rank * config.topk,
                     route_parallel=route_parallel,
                 )
@@ -1943,7 +1976,11 @@ class MegaMoEGfx1250:
     ):
         token_count = hidden_states.shape[0]
         spec = self._select_dispatch(token_count)
-        if self._compact_plan and not self._compact_plan_pending:
+        if self._compact_plan and self._compact_plan_ready != (
+            self._compact_slot,
+            int(token_count),
+            self._compact_step_align_m,
+        ):
             self._launch_compact_plan_async(topk_ids, token_count)
         stream = fx.Stream(torch.cuda.current_stream())
         payload = hidden_states
@@ -1968,6 +2005,7 @@ class MegaMoEGfx1250:
             self._dispatch_sent_scales_ptr = scale_rows.data_ptr()
         if self._compact_plan:
             self._wait_compact_plan()
+            self._compact_plan_ready = None
             tok_map = self._tok_maps[self._compact_slot]
             self._token_destination_map = tok_map
             self._compact_masked_m = self._masked_ms[self._compact_slot]

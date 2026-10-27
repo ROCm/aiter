@@ -77,26 +77,42 @@ def _align32(n: int) -> int:
     return (int(n) + 31) // 32 * 32
 
 
-def compact_hist_layout(*, npes: int, experts_per_rank: int, max_routes: int):
+def _tag_fits(max_routes: int, topk: int | None) -> bool:
+    """Whether one source's count toward an expert fits a tagged dword's 16 bits."""
+    tokens = int(max_routes) if topk is None else int(max_routes) // max(1, int(topk))
+    return tokens < (1 << 16)
+
+
+def compact_hist_layout(
+    *, npes: int, experts_per_rank: int, max_routes: int, topk: int | None = None
+):
     """Per-parity histogram row layout for the symmetric arena.
 
     Returns ``(row_dwords, sparse_cap, use_sparse)``. Dense rows are ``npes*epr``
-    dwords. Sparse rows pack ``nnz`` plus ``(seg, cnt)`` pairs when local routes
-    cannot fill the dense table; they are only the fallback for a row TDM cannot
-    ship whole, since a dense row carries its own arrival tags and even at one
-    token that beats the sparse row's separate arrival counter.
+    dwords, padded to a whole TDM row when the counts fit a tagged dword so the
+    row ships as one TDM store that carries its own arrival tags (no system
+    fence, no arrival counter). Sparse rows pack ``nnz`` plus ``(seg, cnt)``
+    pairs when local routes cannot fill the dense table; they are only the
+    fallback for a row TDM cannot ship whole.
     """
     segs = int(npes) * int(experts_per_rank)
     max_routes = max(1, int(max_routes))
     sparse_cap = min(segs, _align32(max_routes))
     use_sparse = sparse_cap < segs and segs % 32 != 0
-    row_dwords = _align32(1 + sparse_cap) if use_sparse else segs
+    if use_sparse:
+        row_dwords = _align32(1 + sparse_cap)
+    elif _tag_fits(max_routes, topk):
+        row_dwords = _align32(segs)
+    else:
+        row_dwords = segs
     return row_dwords, sparse_cap, use_sparse
 
 
-def compact_hist_stride(*, npes: int, experts_per_rank: int, max_routes: int) -> int:
+def compact_hist_stride(
+    *, npes: int, experts_per_rank: int, max_routes: int, topk: int | None = None
+) -> int:
     row_dwords, _, _ = compact_hist_layout(
-        npes=npes, experts_per_rank=experts_per_rank, max_routes=max_routes
+        npes=npes, experts_per_rank=experts_per_rank, max_routes=max_routes, topk=topk
     )
     return int(npes) * int(row_dwords)
 
@@ -106,7 +122,7 @@ def compact_done_nbytes() -> int:
     return 8
 
 
-@comm_ops.traced
+@flyc.jit
 def _spin_until_tag(addr_i64, tag):
     """Spin until the upper half of an i32 slot is ``tag`` or newer; return it.
 
@@ -218,7 +234,7 @@ def compile_tdm_compact_plan(
         )
     hist_stride = int(hist_stride)
     row_dwords, _sparse_cap, use_sparse = compact_hist_layout(
-        npes=npes, experts_per_rank=epr, max_routes=max_routes
+        npes=npes, experts_per_rank=epr, max_routes=max_routes, topk=topk
     )
     if hist_stride != npes * row_dwords:
         raise ValueError(
@@ -227,10 +243,10 @@ def compile_tdm_compact_plan(
     # Dense rows ship (gen16 << 16) | count, so a count must fit 16 bits; one
     # source's count toward an expert is at most its token count.
     use_tag = (
-        not use_sparse
-        and segs % 32 == 0
-        and max_routes // max(1, int(topk)) < (1 << 16)
+        not use_sparse and row_dwords % 32 == 0 and _tag_fits(max_routes, topk)
     )
+    if not use_sparse and not use_tag and row_dwords != segs:
+        raise ValueError(f"padded hist row {row_dwords} needs the tagged protocol")
     if max_routes % 4 == 0:
         route_vec = 4
     elif max_routes % 2 == 0:
@@ -272,7 +288,7 @@ def compile_tdm_compact_plan(
         rsrc_bar = create_buffer_resource_from_addr(addr_barrier)
 
         smem = fx.SharedAllocator(static=False)
-        hist_ptr = smem.allocate(segs * 4, 128)._ptr
+        hist_ptr = smem.allocate(max(segs, row_dwords) * 4, 128)._ptr
         total_ptr = smem.allocate(segs * 4, 16)._ptr
         pref_ptr = smem.allocate(segs * 4, 16)._ptr
         matrix_ptr = smem.allocate(npes * segs * 4, 128)._ptr
@@ -425,7 +441,7 @@ def compile_tdm_compact_plan(
                     )
                 fx.barrier()
                 TDM.tdm_wait(0)
-            elif const_expr(segs % 32 == 0):
+            elif const_expr(row_dwords % 32 == 0):
                 if const_expr(use_tag):
                     for s in range(tid, segs, plan_threads):
                         slot_addr = lds_hist + fx.Int64(s) * fx.Int64(4)
@@ -435,13 +451,13 @@ def compile_tdm_compact_plan(
                     fx.barrier()
                 if warp < npes:
                     peer_hist = fx.Int64(window.lsa_ptr(warp, hist_off)) + fx.Int64(
-                        rank * segs * 4
+                        rank * row_dwords * 4
                     )
                     TDM.tdm_store(
                         TDM.tdm_group0(
                             arith.trunci(T.i32, arith.unwrap(lds_hist)), peer_hist
                         ),
-                        TDM.tdm_group1(32, segs // 32, 4),
+                        TDM.tdm_group1(32, row_dwords // 32, 4),
                     )
                 if const_expr(not use_tag):
                     fx.barrier()
@@ -527,8 +543,10 @@ def compile_tdm_compact_plan(
                     # final once its tag matches: no separate arrival counter.
                     local_hist = fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off))
                     for s in range(tid, matrix_n, plan_threads):
+                        src_row = s // fx.Int32(segs)
+                        hist_slot = s + src_row * fx.Int32(row_dwords - segs)
                         packed = _spin_until_tag(
-                            local_hist + fx.Int64(s) * fx.Int64(4), tag
+                            local_hist + fx.Int64(hist_slot) * fx.Int64(4), tag
                         )
                         comm_ops.store_i32_lds(
                             lds_matrix + fx.Int64(s) * fx.Int64(4),
