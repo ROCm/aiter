@@ -5,6 +5,7 @@
 
 import os
 from dataclasses import dataclass
+from enum import Enum
 from types import SimpleNamespace
 
 import flydsl.expr as fx
@@ -25,12 +26,18 @@ from .combine import (
     _make_combine_fused_sync,
     combine_reduce_lds_bytes,
 )
-from .config import _DISPATCH_COMPACT, _WAVE_SIZE, _select_dispatch_config
+from .config import _DISPATCH_COMPACT, _WAVE_SIZE
 from .dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from .types import COMBINE_SCALE_BLOCK as _COMBINE_SCALE_BLOCK
 from .types import Stage2ScatterContext, _from_gpu_ptr
 
-__all__ = ["MegaMoEGfx1250"]
+__all__ = [
+    "CombineKind",
+    "DispatchKind",
+    "MegaMoEGeometry",
+    "MegaMoEGfx1250",
+    "MegaMoERecipe",
+]
 
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
@@ -354,77 +361,87 @@ class SymmetricArena:
         self._memory.close()
 
 
-@dataclass
-class MegaMoEConfig:
-    """Op-level config: geometry, the dispatch knobs, and which path each stage
-    takes.
+class DispatchKind(str, Enum):
+    """How tokens reach their experts' rank."""
 
-    ``stage1_fused`` picks dispatch: the FlyDSL compact plan when set, mori's
-    EpDispatchPlan otherwise. ``stage2_fused`` picks combine: the gemm2 epilogue
-    P2P-scatters into the peers' staging slots and a FlyDSL reduce sums them
-    when set; otherwise fused_moe returns its rows and mori's EpCombinePlan
-    gathers them.
+    # mori's EpDispatchPlan: token-major recv rows (the old stage1_fused=False).
+    MORI = "mori"
+    # The FlyDSL compact plan: recv rows grouped per expert, the layout the
+    # grouped GEMM reads directly (the old stage1_fused=True).
+    COMPACT = "compact"
+
+
+class CombineKind(str, Enum):
+    """How expert results return to their tokens."""
+
+    # mori's EpCombinePlan over fused_moe's per-recv-row output (the old
+    # stage2_fused=False).
+    MORI = "mori"
+    # The gemm2 epilogue P2P-scatters into the peers' slots and a FlyDSL reduce
+    # sums them (the old stage2_fused=True).
+    FUSED_SCATTER = "fused_scatter"
+
+
+# The combine's wire names, as the legacy combine_quant spells them.
+_COMBINE_WIRE_QUANT = {"bf16": "none", "fp8": "mxfp8", "fp4": "mxfp4"}
+_COMBINE_QUANT_WIRE = {quant: wire for wire, quant in _COMBINE_WIRE_QUANT.items()}
+
+
+@dataclass(frozen=True)
+class MegaMoERecipe:
+    """What a MegaMoE runs: its transport and its expert GEMM.
+
+    Policy only -- the model's shape is a ``MegaMoEGeometry``. A caller picks a
+    recipe and hands it to ``MegaMoEGfx1250.from_recipe``; everything built from
+    it is fixed there, so forward() never chooses a path. Hashable, so it can key
+    a cache of instances.
+
+    ``combine_wires`` are the formats a combine is BUILT for. bf16 is always one
+    of them, and each step names the one it runs on (forward's ``combine_wire``);
+    a quantized wire only pays off on steps with enough tokens.
     """
 
-    rank: int
-    world_size: int
-    hidden_dim: int
-    max_tokens_per_rank: int
-    experts_per_rank: int
-    topk: int
-    # Dispatch (stage1) knobs.
-    dispatch_block_num: int | None = None
-    dispatch_warp_num_per_block: int | None = None
-    schedule: tuple | None = None
-    # What dispatch puts on the wire. fp8 halves the payload and fp4 quarters it,
-    # each sending a per-token e8m0 row along; the receiver then skips its own
-    # quant. Combine is unaffected -- it moves post-expert tokens, which are bf16
-    # whatever the wire carried.
-    #
-    # The wire must MATCH what the expert GEMM wants for its A operand (a8w4 ->
-    # fp8, a4w4 -> fp4). It is not a free choice: the receiver hands the payload
-    # to the grouped GEMM as-is, so a mismatch is a width error, not a slow path.
+    dispatch: DispatchKind = DispatchKind.MORI
+    combine: CombineKind = CombineKind.FUSED_SCATTER
+    # Must MATCH the expert GEMM's A operand (a8w4 -> fp8, a4w4 -> fp4): the
+    # receiver hands the payload to the GEMM as-is, so a mismatch is a width
+    # error, not a slow path. bf16 has the GEMM quantize on arrival.
     dispatch_wire: str = "bf16"
-    # Fuse stage-1 routing/layout planning with dispatch through the compact
-    # expert-row plan consumed directly by the grouped GEMM. Off, dispatch runs
-    # through mori.
-    stage1_fused: bool = False
-    # Fuse the combine scatter into the gemm2 epilogue. Off, combine runs
-    # through mori, which moves fused_moe's per-recv-token rows: a bf16 gather,
-    # or an MXFP4 push when the step asks for "mxfp4".
-    stage2_fused: bool = True
-    # What the combine puts on the wire. Independent of dispatch_wire: combine
-    # moves post-expert tokens, so it picks its own payload format.
-    combine_quant: str = "none"
+    combine_wires: tuple = ("bf16",)
+    activation: ActivationType = ActivationType.Silu
+    gate_mode: GateMode = GateMode.INTERLEAVE
+    quant_type: QuantType = QuantType.per_1x32
+    hidden_pad: int = 0
+    intermediate_pad: int = 0
+    swiglu_limit: float = 0.0
 
     def __post_init__(self):
+        def coerce(name, value):
+            object.__setattr__(self, name, value)
+
+        coerce("dispatch", DispatchKind(self.dispatch))
+        coerce("combine", CombineKind(self.combine))
+        coerce("activation", ActivationType(self.activation))
+        coerce("gate_mode", GateMode(self.gate_mode))
+        coerce("quant_type", QuantType(self.quant_type))
+        wires = tuple(self.combine_wires)
+        unknown = [w for w in wires if w not in _COMBINE_WIRE_QUANT]
+        if unknown or "bf16" not in wires or len(set(wires) - {"bf16"}) > 1:
+            raise ValueError(
+                "combine_wires must be ('bf16',) or bf16 plus one of fp8/fp4, "
+                f"got {self.combine_wires!r}"
+            )
+        # Canonical order, so equal recipes hash equal.
+        coerce("combine_wires", tuple(w for w in _COMBINE_WIRE_QUANT if w in wires))
         if self.dispatch_wire not in _DISPATCH_WIRES:
             raise ValueError(
                 f"dispatch_wire must be one of {_DISPATCH_WIRES}, "
                 f"got {self.dispatch_wire!r}"
             )
-        if self.is_quant_dispatch_wire and self.hidden_dim % 32:
-            raise ValueError(
-                "one e8m0 scale covers 32 features, so a quantizing dispatch "
-                f"wire needs hidden_dim % 32 == 0, got {self.hidden_dim}"
-            )
-        if self.combine_quant not in _COMBINE_QUANT_MODES:
-            raise ValueError(
-                f"combine_quant must be one of {_COMBINE_QUANT_MODES}, "
-                f"got {self.combine_quant!r}"
-            )
-        # Every wire, not just the quantized ones: the reduce tiles hidden in
-        # whole chunks and has no tail path.
-        if self.stage2_fused and self.hidden_dim % _COMBINE_CHUNK_ELEMS:
-            raise ValueError(
-                f"the combine reduce tiles hidden in {_COMBINE_CHUNK_ELEMS}-"
-                f"element chunks with no tail path, so it needs hidden_dim % "
-                f"{_COMBINE_CHUNK_ELEMS} == 0, got {self.hidden_dim}"
-            )
-        if self.stage1_fused and not self.is_quant_dispatch_wire:
+        if self.dispatch is DispatchKind.COMPACT and not self.is_quant_dispatch_wire:
             raise ValueError("stage1_fused requires an fp8 or fp4 dispatch wire")
-        if not self.stage2_fused:
-            if self.stage1_fused:
+        if self.combine is CombineKind.MORI:
+            if self.dispatch is DispatchKind.COMPACT:
                 raise ValueError(
                     "stage1_fused requires stage2_fused: the compact plan "
                     "groups recv rows per expert, and only the gemm2 scatter "
@@ -440,14 +457,184 @@ class MegaMoEConfig:
                     "stage2_fused=False combines through mori, whose wires are "
                     f"{mori_modes}; got combine_quant={self.combine_quant!r}"
                 )
-            if (
-                self.combine_quant_bits
-                and self.hidden_dim % _MORI_FP4_COMBINE_HIDDEN_ALIGN
-            ):
+        if self.hidden_pad < 0 or self.intermediate_pad < 0:
+            raise ValueError(
+                "padding must be non-negative, got "
+                f"{self.hidden_pad}, {self.intermediate_pad}"
+            )
+        if self.swiglu_limit < 0:
+            raise ValueError(
+                f"swiglu_limit must be non-negative, got {self.swiglu_limit}"
+            )
+        if self.gate_mode != GateMode.INTERLEAVE:
+            raise ValueError(
+                "MegaMoE fused stage2 scatter requires gate_mode=INTERLEAVE"
+            )
+        if self.quant_type != QuantType.per_1x32:
+            raise ValueError(
+                "MegaMoE fused stage2 scatter requires quant_type=per_1x32"
+            )
+        if self.activation not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
+            raise ValueError(
+                "MegaMoE fused stage2 scatter does not support "
+                f"activation={self.activation}"
+            )
+
+    @classmethod
+    def from_legacy(
+        cls,
+        *,
+        stage1_fused: bool = False,
+        stage2_fused: bool = True,
+        dispatch_backend: str | None = None,
+        dispatch_wire: str | None = None,
+        combine_quant: str | None = None,
+        activation: ActivationType = ActivationType.Silu,
+        gate_mode: int = GateMode.INTERLEAVE.value,
+        quant_type: QuantType = QuantType.per_1x32,
+        hidden_pad: int = 0,
+        intermediate_pad: int = 0,
+        swiglu_limit: float = 0.0,
+    ) -> "MegaMoERecipe":
+        """The recipe the old constructor flags describe.
+
+        The only reader of stage1_fused, stage2_fused and dispatch_backend, and of
+        the $MEGA_DISPATCH_WIRE / $MEGA_COMBINE_QUANT defaults.
+        """
+        # Accepted for callers that still name the dispatch; stage1_fused decides.
+        if dispatch_backend is not None:
+            if dispatch_backend not in ("flydsl", "mori"):
                 raise ValueError(
-                    "mori's fp4 combine needs hidden_dim % "
-                    f"{_MORI_FP4_COMBINE_HIDDEN_ALIGN} == 0, got {self.hidden_dim}"
+                    "dispatch_backend must be 'flydsl' or 'mori', "
+                    f"got {dispatch_backend!r}"
                 )
+            if (dispatch_backend == "flydsl") != bool(stage1_fused):
+                raise ValueError(
+                    f"dispatch_backend={dispatch_backend!r} does not match "
+                    f"stage1_fused={bool(stage1_fused)}: the flydsl dispatch runs "
+                    "only as the compact plan (stage1_fused=True), and "
+                    "stage1_fused=False dispatches through mori"
+                )
+        if combine_quant is None:
+            combine_quant = os.environ.get("MEGA_COMBINE_QUANT", "none")
+        if combine_quant not in _COMBINE_QUANT_MODES:
+            raise ValueError(
+                f"combine_quant must be one of {_COMBINE_QUANT_MODES}, "
+                f"got {combine_quant!r}"
+            )
+        wire = _COMBINE_QUANT_WIRE[combine_quant]
+        return cls(
+            dispatch=DispatchKind.COMPACT if stage1_fused else DispatchKind.MORI,
+            combine=CombineKind.FUSED_SCATTER if stage2_fused else CombineKind.MORI,
+            dispatch_wire=(
+                dispatch_wire if dispatch_wire is not None else read_dispatch_wire_env()
+            ),
+            combine_wires=("bf16",) if wire == "bf16" else ("bf16", wire),
+            activation=activation,
+            gate_mode=gate_mode,
+            quant_type=quant_type,
+            hidden_pad=int(hidden_pad),
+            intermediate_pad=int(intermediate_pad),
+            swiglu_limit=float(swiglu_limit),
+        )
+
+    @property
+    def is_quant_dispatch_wire(self) -> bool:
+        """The wire carries an MX payload plus its e8m0 row, not bf16."""
+        return self.dispatch_wire in ("fp8", "fp4")
+
+    @property
+    def combine_quant(self) -> str:
+        """The quantized combine format built, in the legacy spelling."""
+        return _COMBINE_WIRE_QUANT[self.combine_wires[-1]]
+
+
+@dataclass(frozen=True)
+class MegaMoEGeometry:
+    """The model and EP shape one MegaMoE serves; one per EP rank."""
+
+    rank: int
+    world_size: int
+    model_dim: int
+    inter_dim: int
+    experts: int
+    topk: int
+    max_tokens_per_rank: int
+
+    def __post_init__(self):
+        for name in self.__dataclass_fields__:
+            object.__setattr__(self, name, int(getattr(self, name)))
+        if self.world_size <= 0:
+            raise ValueError(f"world_size must be positive, got {self.world_size}")
+        if self.experts <= 0:
+            raise ValueError(f"experts must be positive, got {self.experts}")
+        if self.experts % self.world_size:
+            raise ValueError(
+                f"experts={self.experts} must be divisible by "
+                f"world_size={self.world_size}"
+            )
+        if self.max_tokens_per_rank <= 0:
+            raise ValueError(
+                "max_tokens_per_rank must be positive, got "
+                f"{self.max_tokens_per_rank}"
+            )
+        if self.topk <= 0:
+            raise ValueError(f"topk must be positive, got {self.topk}")
+        if self.topk > self.experts:
+            raise ValueError(f"topk={self.topk} cannot exceed experts={self.experts}")
+        if self.model_dim <= 0 or self.inter_dim <= 0:
+            raise ValueError(
+                f"model_dim and inter_dim must be positive, got "
+                f"{self.model_dim}, {self.inter_dim}"
+            )
+
+    @property
+    def experts_per_rank(self) -> int:
+        return self.experts // self.world_size
+
+
+@dataclass(frozen=True)
+class MegaMoEConfig:
+    """A recipe resolved against a geometry: everything the pipeline sizes and
+    builds from, checked once.
+
+    ``stage1_fused``, ``stage2_fused`` and ``dispatch_backend`` are kept for
+    callers that read them; nothing here consults them.
+    """
+
+    recipe: MegaMoERecipe
+    geometry: MegaMoEGeometry
+
+    def __post_init__(self):
+        if self.is_quant_dispatch_wire and self.hidden_dim % 32:
+            raise ValueError(
+                "one e8m0 scale covers 32 features, so a quantizing dispatch "
+                f"wire needs hidden_dim % 32 == 0, got {self.hidden_dim}"
+            )
+        # Every wire, not just the quantized ones: the reduce tiles hidden in
+        # whole chunks and has no tail path.
+        if (
+            self.recipe.combine is CombineKind.FUSED_SCATTER
+            and self.hidden_dim % _COMBINE_CHUNK_ELEMS
+        ):
+            raise ValueError(
+                f"the combine reduce tiles hidden in {_COMBINE_CHUNK_ELEMS}-"
+                f"element chunks with no tail path, so it needs hidden_dim % "
+                f"{_COMBINE_CHUNK_ELEMS} == 0, got {self.hidden_dim}"
+            )
+        if (
+            self.recipe.combine is CombineKind.MORI
+            and self.combine_quant_bits
+            and self.hidden_dim % _MORI_FP4_COMBINE_HIDDEN_ALIGN
+        ):
+            raise ValueError(
+                "mori's fp4 combine needs hidden_dim % "
+                f"{_MORI_FP4_COMBINE_HIDDEN_ALIGN} == 0, got {self.hidden_dim}"
+            )
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank={self.rank} must be in [0, {self.world_size})")
         if self.world_size > _MAX_WORLD_SIZE:
@@ -469,22 +656,31 @@ class MegaMoEConfig:
                 f"bf16 token bytes must be 16-byte aligned, "
                 f"got hidden_dim={self.hidden_dim}"
             )
-        tuned = _select_dispatch_config(
-            self.world_size,
-            self.hidden_dim,
-            self.topk,
-        )
-        if self.dispatch_block_num is None:
-            self.dispatch_block_num = tuned["dispatch_block_num"]
-        if self.dispatch_warp_num_per_block is None:
-            self.dispatch_warp_num_per_block = tuned["dispatch_warp_num_per_block"]
-        if self.schedule is None:
-            self.schedule = tuned["schedule"]
+
+    # -- geometry --------------------------------------------------------------
+    @property
+    def rank(self) -> int:
+        return self.geometry.rank
 
     @property
-    def dispatch_backend(self) -> str:
-        """The dispatch stage1_fused picks, under the name callers used to pass."""
-        return "flydsl" if self.stage1_fused else "mori"
+    def world_size(self) -> int:
+        return self.geometry.world_size
+
+    @property
+    def hidden_dim(self) -> int:
+        return self.geometry.model_dim
+
+    @property
+    def max_tokens_per_rank(self) -> int:
+        return self.geometry.max_tokens_per_rank
+
+    @property
+    def experts_per_rank(self) -> int:
+        return self.geometry.experts_per_rank
+
+    @property
+    def topk(self) -> int:
+        return self.geometry.topk
 
     @property
     def max_recv(self) -> int:
@@ -500,10 +696,33 @@ class MegaMoEConfig:
             tile_m=tile_m,
         )
 
+    # -- the recipe, under the names callers read --------------------------------
+    @property
+    def dispatch_wire(self) -> str:
+        return self.recipe.dispatch_wire
+
+    @property
+    def combine_quant(self) -> str:
+        return self.recipe.combine_quant
+
+    @property
+    def stage1_fused(self) -> bool:
+        return self.recipe.dispatch is DispatchKind.COMPACT
+
+    @property
+    def stage2_fused(self) -> bool:
+        return self.recipe.combine is CombineKind.FUSED_SCATTER
+
+    @property
+    def dispatch_backend(self) -> str:
+        """The dispatch stage1_fused picks, under the name callers used to pass."""
+        return "flydsl" if self.stage1_fused else "mori"
+
+    # -- wires -----------------------------------------------------------------
     @property
     def is_quant_dispatch_wire(self) -> bool:
         """The wire carries an MX payload plus its e8m0 row, not bf16."""
-        return self.dispatch_wire in ("fp8", "fp4")
+        return self.recipe.is_quant_dispatch_wire
 
     @property
     def dispatch_wire_spec(self) -> "_DispatchWire":
@@ -532,8 +751,8 @@ class MegaMoEConfig:
     def combine_quant_bits(self) -> int:
         """Payload width of the quantized wire this instance OFFERS; 0 is none.
 
-        What a step actually runs on is forward()'s own ``combine_quant``; this
-        only says which format it may name.
+        What a step actually runs on is forward()'s own choice; this only says
+        which format it may name.
         """
         return _COMBINE_QUANT_BITS[self.combine_quant]
 
@@ -636,11 +855,18 @@ class Routing:
         return self.reverse_source_view
 
 
+def _require_gfx1250():
+    gfx = get_gfx()
+    if gfx != "gfx1250":
+        raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
+
+
 class MegaMoEGfx1250:
     """A8W4 EP MoE: dispatch, the grouped expert GEMM, combine.
 
-    ``stage1_fused`` and ``stage2_fused`` pick each stage's path; see
-    MegaMoEConfig.
+    Built from a ``MegaMoERecipe`` (what runs) and a ``MegaMoEGeometry`` (the
+    shape it runs at): ``from_recipe``. The keyword constructor takes the older
+    stage1_fused / stage2_fused flags and turns them into a recipe first.
     """
 
     def __init__(
@@ -675,113 +901,76 @@ class MegaMoEGfx1250:
         serves every layer (weights are forward() arguments) and the model keeps a
         single cco symmetric arena instead of one per layer.
         """
-        gfx = get_gfx()
-        if gfx != "gfx1250":
-            raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
-        if world_size <= 0:
-            raise ValueError(f"world_size must be positive, got {world_size}")
-        if experts <= 0:
-            raise ValueError(f"experts must be positive, got {experts}")
-        if experts % world_size:
-            raise ValueError(
-                f"experts={experts} must be divisible by world_size={world_size}"
-            )
-        if max_tokens_per_rank <= 0:
-            raise ValueError(
-                f"max_tokens_per_rank must be positive, got {max_tokens_per_rank}"
-            )
-        if topk <= 0:
-            raise ValueError(f"topk must be positive, got {topk}")
-        if topk > experts:
-            raise ValueError(f"topk={topk} cannot exceed experts={experts}")
-        if model_dim <= 0 or inter_dim <= 0:
-            raise ValueError(
-                f"model_dim and inter_dim must be positive, got "
-                f"{model_dim}, {inter_dim}"
-            )
-        if swiglu_limit < 0:
-            raise ValueError(f"swiglu_limit must be non-negative, got {swiglu_limit}")
-        # Accepted for callers that still name the dispatch; stage1_fused decides.
-        if dispatch_backend is not None:
-            if dispatch_backend not in ("flydsl", "mori"):
-                raise ValueError(
-                    "dispatch_backend must be 'flydsl' or 'mori', "
-                    f"got {dispatch_backend!r}"
-                )
-            if (dispatch_backend == "flydsl") != bool(stage1_fused):
-                raise ValueError(
-                    f"dispatch_backend={dispatch_backend!r} does not match "
-                    f"stage1_fused={bool(stage1_fused)}: the flydsl dispatch runs "
-                    "only as the compact plan (stage1_fused=True), and "
-                    "stage1_fused=False dispatches through mori"
-                )
-        if hidden_pad < 0 or intermediate_pad < 0:
-            raise ValueError(
-                f"padding must be non-negative, got {hidden_pad}, {intermediate_pad}"
-            )
-        activation = ActivationType(activation)
-        gate_mode = GateMode(gate_mode)
-        quant_type = QuantType(quant_type)
-        if gate_mode != GateMode.INTERLEAVE:
-            raise ValueError(
-                "MegaMoE fused stage2 scatter requires gate_mode=INTERLEAVE"
-            )
-        if quant_type != QuantType.per_1x32:
-            raise ValueError(
-                "MegaMoE fused stage2 scatter requires quant_type=per_1x32"
-            )
-        if activation not in (
-            ActivationType.Silu,
-            ActivationType.Swiglu,
-            ActivationType.Situv2,
-        ):
-            raise ValueError(
-                f"MegaMoE fused stage2 scatter does not support activation={activation}"
-            )
+        _require_gfx1250()
+        geometry = MegaMoEGeometry(
+            rank=rank,
+            world_size=world_size,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            max_tokens_per_rank=max_tokens_per_rank,
+        )
+        recipe = MegaMoERecipe.from_legacy(
+            stage1_fused=stage1_fused,
+            stage2_fused=stage2_fused,
+            dispatch_backend=dispatch_backend,
+            dispatch_wire=dispatch_wire,
+            combine_quant=combine_quant,
+            activation=activation,
+            gate_mode=gate_mode,
+            quant_type=quant_type,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            swiglu_limit=swiglu_limit,
+        )
+        self._build(recipe, geometry, communicator, situ_beta, situ_linear_beta)
 
-        self.model_dim = int(model_dim)
-        self.inter_dim = int(inter_dim)
-        self.experts = int(experts)
-        self.experts_per_rank = self.experts // world_size
-        self.topk = int(topk)
-        self.max_tokens_per_rank = int(max_tokens_per_rank)
-        self.activation = activation
-        self.gate_mode = gate_mode
-        self.quant_type = quant_type
-        self.hidden_pad = int(hidden_pad)
-        self.intermediate_pad = int(intermediate_pad)
-        self.swiglu_limit = float(swiglu_limit)
+    @classmethod
+    def from_recipe(
+        cls,
+        recipe: MegaMoERecipe,
+        geometry: MegaMoEGeometry,
+        *,
+        communicator,
+        situ_beta: torch.Tensor | None = None,
+        situ_linear_beta: torch.Tensor | None = None,
+    ) -> "MegaMoEGfx1250":
+        """Build the MegaMoE ``recipe`` describes at ``geometry``.
+
+        ``situ_beta`` / ``situ_linear_beta`` are the Situv2 activation's tensors,
+        model-wide and needed only for that activation.
+        """
+        _require_gfx1250()
+        self = cls.__new__(cls)
+        self._build(recipe, geometry, communicator, situ_beta, situ_linear_beta)
+        return self
+
+    def _build(self, recipe, geometry, communicator, situ_beta, situ_linear_beta):
+        config = MegaMoEConfig(recipe=recipe, geometry=geometry)
+        self.recipe = recipe
+        self.geometry = geometry
+        self.model_dim = geometry.model_dim
+        self.inter_dim = geometry.inter_dim
+        self.experts = geometry.experts
+        self.experts_per_rank = geometry.experts_per_rank
+        self.topk = geometry.topk
+        self.max_tokens_per_rank = geometry.max_tokens_per_rank
+        self.activation = recipe.activation
+        self.gate_mode = recipe.gate_mode
+        self.quant_type = recipe.quant_type
+        self.hidden_pad = recipe.hidden_pad
+        self.intermediate_pad = recipe.intermediate_pad
+        self.swiglu_limit = recipe.swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
 
         device = torch.device("cuda", torch.cuda.current_device())
         self.expert_mask = torch.zeros(self.experts, dtype=torch.int32, device=device)
-        first_expert = rank * self.experts_per_rank
+        first_expert = geometry.rank * self.experts_per_rank
         self.expert_mask[first_expert : first_expert + self.experts_per_rank] = 1
 
-        self._initialize_pipeline(
-            MegaMoEConfig(
-                rank=int(rank),
-                world_size=int(world_size),
-                hidden_dim=self.model_dim,
-                max_tokens_per_rank=self.max_tokens_per_rank,
-                experts_per_rank=self.experts_per_rank,
-                topk=self.topk,
-                dispatch_wire=(
-                    dispatch_wire
-                    if dispatch_wire is not None
-                    else read_dispatch_wire_env()
-                ),
-                stage1_fused=bool(stage1_fused),
-                stage2_fused=bool(stage2_fused),
-                combine_quant=(
-                    combine_quant
-                    if combine_quant is not None
-                    else os.environ.get("MEGA_COMBINE_QUANT", "none")
-                ),
-            ),
-            communicator,
-        )
+        self._initialize_pipeline(config, communicator)
 
     def forward(
         self,
@@ -801,6 +990,7 @@ class MegaMoEGfx1250:
         next_topk_ids: torch.Tensor | None = None,
         next_recv_token_bound: int | None = None,
         combine_quant: str | None = None,
+        combine_wire: str | None = None,
         recv_counter_is_zero: bool = False,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then combine.
@@ -818,16 +1008,25 @@ class MegaMoEGfx1250:
         the expert GEMM. The two plans use independent hist/done slots and local
         tok_map/psum buffers. Omit them to keep the plan sequential.
 
-        ``combine_quant`` picks this step's combine wire out of the formats the
-        constructor built a combine for, so a caller can quantize the steps with
-        enough tokens on the wire to pay for it and leave the rest on bf16.
-        Omitting it means bf16 -- naming a format at construction only builds
-        it, each step still has to ask for it. With ``stage2_fused=False`` the
-        mori combine offers bf16 and mxfp4.
+        ``combine_wire`` picks this step's combine wire out of the recipe's
+        ``combine_wires``, so a caller can quantize the steps with enough tokens
+        on the wire to pay for it and leave the rest on bf16. Omitting it means
+        bf16 -- building a format only makes it available, each step still has to
+        ask for it. ``combine_quant`` is the same choice in the older spelling
+        (none / mxfp8 / mxfp4).
 
         ``recv_counter_is_zero`` is accepted and ignored: the dispatch
         overwrites the received count, so there is no reset to skip.
         """
+        if combine_wire is not None:
+            if combine_quant is not None:
+                raise ValueError("pass combine_wire or combine_quant, not both")
+            if combine_wire not in _COMBINE_WIRE_QUANT:
+                raise ValueError(
+                    f"combine_wire must be one of {tuple(_COMBINE_WIRE_QUANT)}, "
+                    f"got {combine_wire!r}"
+                )
+            combine_quant = _COMBINE_WIRE_QUANT[combine_wire]
         combine_quant_bits = self._resolve_combine_quant(combine_quant)
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
@@ -1415,7 +1614,7 @@ class MegaMoEGfx1250:
         if not self._compact_plan:
             # mori's geometry is a compile-time Cfg field, so it brings its own
             # tuned buckets.
-            config.schedule = _mori_dispatch_schedule(config)
+            self._dispatch_schedule = _mori_dispatch_schedule(config)
         else:
             # Decode walks routes, prefill tokens (see _DISPATCH_COMPACT).
             blocks_env = os.environ.get("AITER_TDM_COMPACT_BLOCKS")
@@ -1423,21 +1622,14 @@ class MegaMoEGfx1250:
             if blocks_env is not None or warps_env is not None:
                 compact_blocks = int(blocks_env or "64")
                 compact_warps = int(warps_env or "8")
-                config.schedule = ((None, compact_blocks, compact_warps),)
+                self._dispatch_schedule = ((None, compact_blocks, compact_warps),)
             else:
-                config.schedule = _DISPATCH_COMPACT
+                self._dispatch_schedule = _DISPATCH_COMPACT
 
         # A spec is (block, warp), plus route_parallel on the compact path.
-        if config.schedule:
-            dispatch_specs = sorted({tuple(entry[1:]) for entry in config.schedule})
-        else:
-            dispatch_specs = [
-                (
-                    config.dispatch_block_num,
-                    config.dispatch_warp_num_per_block,
-                )
-            ]
-        self._dispatch_specs = dispatch_specs
+        self._dispatch_specs = sorted(
+            {tuple(entry[1:]) for entry in self._dispatch_schedule}
+        )
         if self._compact_plan:
             self._dispatch_variants = self._build_tdm_dispatch(config, device)
         else:
@@ -1890,9 +2082,7 @@ class MegaMoEGfx1250:
         return tuple(schedule[-1][1:])
 
     def _select_dispatch(self, token_count: int) -> tuple:
-        if not self._config.schedule:
-            return self._dispatch_specs[0]
-        for upper_bound, *spec in self._config.schedule:
+        for upper_bound, *spec in self._dispatch_schedule:
             if upper_bound is None or token_count <= upper_bound:
                 spec = tuple(spec)
                 return (
