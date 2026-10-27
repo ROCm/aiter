@@ -4,9 +4,10 @@
 """Dispatch layer for jagged_dense_bmm_broadcast_add.
 
 Resolves per-shape kernel config from ``jagged_dense_bmm_dispatch.json``
-(explicit override -> table winner -> defaults) and routes uniform vs skew
-launches. Tuning rationale and benchmark notes live in the JSON; skew XCD
-remap is gated in ``_skew_compact_xcd``.
+(explicit override -> table winner -> defaults). Uniform launches use the
+plain grid. Every skew launch builds a compact TILE_MAP and runs the
+compact kernel. Tuning rationale lives in the JSON; skew XCD remap is
+gated in ``_skew_compact_xcd``.
 """
 
 from __future__ import annotations
@@ -31,10 +32,8 @@ __all__ = [
 _DISPATCH_TABLE: dict | None = None
 _DISPATCH_CACHE: dict[tuple, dict] = {}
 
-SKEW_COMPACT_MAX_GROUPS = 4096
 SKEW_COMPACT_XCD_C = 32
 SKEW_COMPACT_XCD_W = 8
-_SKEW_COMPACT_ENV = "FLYDSL_JDBBA_SKEW_COMPACT"
 
 _SCHEMA_DEFAULTS = {
     "xcd_c": None,
@@ -120,7 +119,7 @@ def _packed_rows(jagged) -> int:
 
 
 def _as_torch_stream(stream, device):
-    """One torch stream for the prep fills, the prep kernel, and the GEMM."""
+    """One torch stream for the TILE_MAP prep and the GEMM."""
     if stream is None:
         return torch.cuda.current_stream(device)
     raw = stream.value if isinstance(stream, fx.Stream) else stream
@@ -129,15 +128,6 @@ def _as_torch_stream(stream, device):
     if hasattr(raw, "cuda_stream"):
         return raw
     raise TypeError(f"unsupported stream {stream!r}")
-
-
-def _skew_compact_enabled(*, uniform_seqlen: bool, n_groups: int) -> bool:
-    if uniform_seqlen or n_groups > SKEW_COMPACT_MAX_GROUPS:
-        return False
-    env = os.environ.get(_SKEW_COMPACT_ENV)
-    if env is None:
-        return True
-    return env.strip().lower() not in ("0", "false", "off", "no")
 
 
 _SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
@@ -249,7 +239,7 @@ def jagged_dense_bmm_dispatched(
     # stays live until that queue finishes, including after this function returns.
     stream = _as_torch_stream(stream, SEQ_OFFSETS.device)
 
-    if _skew_compact_enabled(uniform_seqlen=uniform_seqlen, n_groups=n_groups):
+    if not uniform_seqlen:
         # Rebuild every call. The map bakes seq_start/seq_end, so an in-place
         # rewrite of SEQ_OFFSETS must not reuse a previous map.
         tile_map, ub = build_tile_map_device_fused(
@@ -278,23 +268,6 @@ def jagged_dense_bmm_dispatched(
             total_occ_tiles=ub,
         )
 
-    skew_remap_on = (not uniform_seqlen) and output_n <= 256 and n_groups >= 1024
-    if skew_remap_on:
-        return jagged_dense_bmm(
-            C,
-            A,
-            B,
-            BIAS,
-            SEQ_OFFSETS,
-            n_groups,
-            max_seq_len,
-            stream=stream,
-            xcd_c=32,
-            xcd_w=8,
-            uniform_seqlen=False,
-            block_k=cfg.get("block_k"),
-        )
-
     return jagged_dense_bmm(
         C,
         A,
@@ -304,9 +277,9 @@ def jagged_dense_bmm_dispatched(
         n_groups,
         max_seq_len,
         stream=stream,
-        xcd_c=cfg["xcd_c"] if uniform_seqlen else _coerce(cfg.get("skew_xcd_c")),
-        xcd_w=cfg["xcd_w"] if uniform_seqlen else _coerce(cfg.get("skew_xcd_w")),
-        uniform_seqlen=uniform_seqlen,
+        xcd_c=cfg["xcd_c"],
+        xcd_w=cfg["xcd_w"],
+        uniform_seqlen=True,
         block_k=cfg.get("block_k"),
-        threads=_coerce(cfg.get("threads")) if uniform_seqlen else None,
+        threads=_coerce(cfg.get("threads")),
     )

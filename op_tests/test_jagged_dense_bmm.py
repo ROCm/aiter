@@ -120,6 +120,7 @@ def test_jdbba(B, D, Kout, Mi, regime, dtype):
 
     ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], N, dtype)
 
+    # Skew rebuilds TILE_MAP inside the timed call, so the row includes prep.
     def _flydsl():
         jagged_dense_bmm_dispatched(
             d["tC"],

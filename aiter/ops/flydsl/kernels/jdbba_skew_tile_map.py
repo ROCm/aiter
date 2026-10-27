@@ -1,124 +1,177 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Device-side TILE_MAP prep for skew jdbba launches.
+"""Device TILE_MAP for the skew-compact jagged_dense_bmm kernel.
 
-Builds a group-major list of ``(group_id, m_tile_idx, seq_start, seq_end)``
-for every occupied M-tile, padded to a host-known upper bound. Slack rows
-hold a sentinel so the compact kernel early-exits without a device->host
-tile-count readback. Baking the offsets lets the main kernel skip the
-``SEQ_OFFSETS`` pointer chase.
-
-Pattern mirrors ``aiter/ops/flydsl/kernels/moe_m_tile_map.py``:
-
-  1. Prefix: exclusive scan of occupied M-tiles per group from ``SEQ_OFFSETS``.
-  2. Sentinel prefill: unused rows get ``(off_b=0, m_idx=BM_TILES, 0, 0)``.
-  3. Scatter: one block per group writes its occupied 4-int32 rows.
+One workgroup writes the map. It fills every row with the sentinel
+``(0, bm_tiles, 0, 0)``, then walks groups in chunks of ``_CHUNK``. Each
+chunk loads tile counts, runs an exclusive Hillis-Steele scan in LDS, and
+scatters ``(group, local_m, seq_start, seq_end)`` at the scanned row.
+``_CHUNK`` is a compile-time LDS bound; ``n_groups`` is a launch argument,
+so a new batch does not rebuild the kernel.
 """
-
-from __future__ import annotations
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-BLOCK_THREADS = 256
+_THREADS = 256
+_CHUNK = 256
+_SCAN_SHIFTS = _CHUNK.bit_length() - 1
 
 _DEFAULT_STREAM = fx.Stream(None)
 
 
-@flyc.jit
-def _emit_prefix_sum_seq(seq_rsrc, group, block_m):
-    # Intentional O(n_groups) per-block scan; tiny prep kernel.
-    c_one = fx.Int32(1)
-    for _cur, state in range(fx.Int32(0), group, fx.Int32(1), init=[fx.Int32(0)]):
-        acc = state[0]
-        cur = fx.Int32(_cur)
-        s = buffer_ops.buffer_load(seq_rsrc, cur, vec_width=1, dtype=T.i32)
-        s1 = buffer_ops.buffer_load(seq_rsrc, cur + c_one, vec_width=1, dtype=T.i32)
-        tiles = (s1 - s + (block_m - c_one)) // block_m
-        results = yield [acc + tiles]
-    return results
-
-
-@flyc.jit
-def _scatter_group_rows(map_rsrc, grp, tid, prefix, tiles, seq_start, seq_end):
-    c_threads = fx.Int32(BLOCK_THREADS)
-    c_one = fx.Int32(1)
-    c_two = fx.Int32(2)
-    c_three = fx.Int32(3)
-    c_four = fx.Int32(4)
-    trips = (tiles + fx.Int32(BLOCK_THREADS - 1)) // c_threads
-    for _it in range(fx.Int32(0), trips, fx.Int32(1)):
-        local_tile = fx.Int32(_it) * c_threads + tid
-        if local_tile < tiles:
-            base = (prefix + local_tile) * c_four
-            buffer_ops.buffer_store(grp, map_rsrc, base)
-            buffer_ops.buffer_store(local_tile, map_rsrc, base + c_one)
-            buffer_ops.buffer_store(seq_start, map_rsrc, base + c_two)
-            buffer_ops.buffer_store(seq_end, map_rsrc, base + c_three)
-
-
-@flyc.kernel(name="skew_tile_map_fused", known_block_size=[BLOCK_THREADS, 1, 1])
-def _fused_kernel(
-    SEQ_OFFSETS: fx.Tensor,  # (n_groups+1,) int32
-    TILE_MAP: fx.Tensor,  # (upper_bound, 4) int32 -> flat 4*upper_bound
-    n_groups: fx.Int32,
-    block_m: fx.Int32,
-):
-    grp = fx.block_idx.x
-    tid = fx.thread_idx.x
-    seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-    map_rsrc = buffer_ops.create_buffer_resource(TILE_MAP, max_size=True)
-
-    if grp < n_groups:
-        prefix = _emit_prefix_sum_seq(seq_rsrc, grp, block_m)
-        s = buffer_ops.buffer_load(seq_rsrc, grp, vec_width=1, dtype=T.i32)
-        s1 = buffer_ops.buffer_load(
-            seq_rsrc, grp + fx.Int32(1), vec_width=1, dtype=T.i32
+def upper_bound_tiles(total_rows: int, n_groups: int, block_m: int) -> int:
+    """Host upper bound on occupied M-tiles: ``ceil(L / BLOCK_M) + n_groups``."""
+    if total_rows <= 0 or block_m <= 0 or n_groups < 0:
+        raise ValueError(
+            f"bad tile-map bound rows={total_rows} block_m={block_m} groups={n_groups}"
         )
-        tiles = (s1 - s + (block_m - fx.Int32(1))) // block_m
-        _scatter_group_rows(map_rsrc, grp, tid, prefix, tiles, s, s1)
+    return (int(total_rows) + int(block_m) - 1) // int(block_m) + int(n_groups)
+
+
+def _as_torch_stream(stream, device):
+    if stream is None or (isinstance(stream, fx.Stream) and stream.value is None):
+        return torch.cuda.current_stream(device)
+    if isinstance(stream, fx.Stream):
+        raw = stream.value
+        if hasattr(raw, "cuda_stream"):
+            return raw
+        raise TypeError(f"unsupported stream {stream!r}")
+    return stream
+
+
+@flyc.kernel(name="skew_tile_map_scan", known_block_size=[_THREADS, 1, 1])
+def _scan_kernel(
+    seq_offsets: fx.Tensor,
+    tile_map: fx.Tensor,
+    n_groups: fx.Int32,
+    block_m: fx.Int32,
+    bm_tiles: fx.Int32,
+    upper_bound: fx.Int32,
+):
+    tid = fx.Int32(gpu.thread_idx.x)
+    seq_rsrc = buffer_ops.create_buffer_resource(seq_offsets, max_size=True)
+    map_rsrc = buffer_ops.create_buffer_resource(tile_map, max_size=True)
+    storage = fx.SharedAllocator().allocate(fx.Array[fx.Int32, _CHUNK * 3, 16])
+    shared = storage.peek().view(fx.make_layout(_CHUNK * 3, 1))
+    tiles_base = fx.Int32(0)
+    scan_base = fx.Int32(_CHUNK)
+    start_base = fx.Int32(2 * _CHUNK)
+
+    steps = (upper_bound + fx.Int32(_THREADS - 1)) // fx.Int32(_THREADS)
+    for step in range(fx.Int32(0), steps, fx.Int32(1)):
+        row = step * fx.Int32(_THREADS) + tid
+        if row < upper_bound:
+            base = row * fx.Int32(4)
+            buffer_ops.buffer_store(fx.Int32(0), map_rsrc, base)
+            buffer_ops.buffer_store(bm_tiles, map_rsrc, base + fx.Int32(1))
+            buffer_ops.buffer_store(fx.Int32(0), map_rsrc, base + fx.Int32(2))
+            buffer_ops.buffer_store(fx.Int32(0), map_rsrc, base + fx.Int32(3))
+    gpu.barrier()
+
+    n_chunks = (n_groups + fx.Int32(_CHUNK - 1)) // fx.Int32(_CHUNK)
+    for chunk_i, state in range(fx.Int32(0), n_chunks, fx.Int32(1), init=[fx.Int32(0)]):
+        running = state[0]
+        chunk_base = fx.Int32(chunk_i) * fx.Int32(_CHUNK)
+        remain = n_groups - chunk_base
+        n_this = (remain < fx.Int32(_CHUNK)).select(remain, fx.Int32(_CHUNK))
+
+        shared[tiles_base + tid] = fx.Int32(0)
+        shared[start_base + tid] = fx.Int32(0)
+        gpu.barrier()
+        if tid < n_this:
+            group = chunk_base + tid
+            seq_start = buffer_ops.buffer_load(
+                seq_rsrc, group, vec_width=1, dtype=T.i32
+            )
+            seq_end = buffer_ops.buffer_load(
+                seq_rsrc, group + fx.Int32(1), vec_width=1, dtype=T.i32
+            )
+            length = fx.Int32(seq_end) - fx.Int32(seq_start)
+            shared[tiles_base + tid] = (length + block_m - fx.Int32(1)) // block_m
+            shared[start_base + tid] = fx.Int32(seq_start)
+        gpu.barrier()
+
+        shared[scan_base + tid] = shared[tiles_base + tid]
+        gpu.barrier()
+        for shift in range_constexpr(_SCAN_SHIFTS):
+            distance = fx.Int32(1 << shift)
+            take = tid >= distance
+            peer = take.select(tid - distance, tid)
+            added = take.select(shared[scan_base + peer], fx.Int32(0))
+            updated = shared[scan_base + tid] + added
+            gpu.barrier()
+            shared[scan_base + tid] = updated
+            gpu.barrier()
+
+        count = shared[tiles_base + tid]
+        seq_start = shared[start_base + tid]
+        inclusive = shared[scan_base + tid]
+        chunk_total = shared[scan_base + n_this - fx.Int32(1)]
+        gpu.barrier()
+
+        if tid < n_this:
+            group = chunk_base + tid
+            seq_end = buffer_ops.buffer_load(
+                seq_rsrc, group + fx.Int32(1), vec_width=1, dtype=T.i32
+            )
+            row0 = running + inclusive - count
+            for local in range(fx.Int32(0), count, fx.Int32(1)):
+                base = (row0 + local) * fx.Int32(4)
+                buffer_ops.buffer_store(group, map_rsrc, base)
+                buffer_ops.buffer_store(local, map_rsrc, base + fx.Int32(1))
+                buffer_ops.buffer_store(seq_start, map_rsrc, base + fx.Int32(2))
+                buffer_ops.buffer_store(fx.Int32(seq_end), map_rsrc, base + fx.Int32(3))
+        gpu.barrier()
+        _running = yield [running + chunk_total]
 
 
 @flyc.jit
-def _launch_fused(
-    SEQ_OFFSETS: fx.Tensor,
-    TILE_MAP: fx.Tensor,
+def _launch_scan(
+    seq_offsets: fx.Tensor,
+    tile_map: fx.Tensor,
     n_groups: fx.Int32,
     block_m: fx.Int32,
+    bm_tiles: fx.Int32,
+    upper_bound: fx.Int32,
     stream: fx.Stream = _DEFAULT_STREAM,
 ):
-    _fused_kernel(SEQ_OFFSETS, TILE_MAP, n_groups, block_m).launch(
-        grid=(n_groups, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
-    )
+    _scan_kernel(
+        seq_offsets, tile_map, n_groups, block_m, bm_tiles, upper_bound
+    ).launch(grid=(1, 1, 1), block=(_THREADS, 1, 1), stream=stream)
 
 
 def build_tile_map_device_fused(
-    seq_offsets, n_groups, L, max_seq_len, block_m=128, stream=None
-):
-    """Build TILE_MAP on device. Returns ``(tile_map, upper_bound)``.
+    seq_offsets: torch.Tensor,
+    n_groups: int,
+    total_rows: int,
+    max_seq_len: int,
+    block_m: int = 128,
+    stream=None,
+) -> tuple[torch.Tensor, int]:
+    """Allocate and fill ``(ub, 4)`` int32 ``(off_b, m_idx, seq_start, seq_end)``.
 
-    ``L`` is a host upper bound on ``seq_offsets[-1]`` (the packed row count).
-    Sentinel rows and the prep kernel run on ``stream`` so the caller can
-    launch the GEMM on that same queue without a host sync.
+    The map is new every call and is filled on ``stream``. Occupied rows
+    overwrite the sentinel prefix; rows past the packed tiles stay sentinels.
     """
-    bm_tiles = (max_seq_len + block_m - 1) // block_m
-    ub = upper_bound_tiles(L, n_groups, block_m)
-    st = torch.cuda.current_stream(seq_offsets.device) if stream is None else stream
+    ub = upper_bound_tiles(total_rows, n_groups, block_m)
+    bm_tiles = (int(max_seq_len) + int(block_m) - 1) // int(block_m)
+    st = _as_torch_stream(stream, seq_offsets.device)
     with torch.cuda.stream(st):
         tile_map = torch.empty((ub, 4), dtype=torch.int32, device=seq_offsets.device)
-        tile_map[:, 0] = 0
-        tile_map[:, 1] = bm_tiles
-        tile_map[:, 2] = 0
-        tile_map[:, 3] = 0
-        _launch_fused(seq_offsets, tile_map, int(n_groups), int(block_m), stream=st)
+        _launch_scan(
+            seq_offsets,
+            tile_map,
+            n_groups,
+            block_m,
+            bm_tiles,
+            ub,
+            stream=st,
+        )
     return tile_map, ub
-
-
-def upper_bound_tiles(L, n_groups, block_m):
-    """Host-known upper bound on occupied M-tiles."""
-    return (L + block_m - 1) // block_m + n_groups
