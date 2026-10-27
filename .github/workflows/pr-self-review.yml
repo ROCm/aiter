@@ -4,12 +4,8 @@ on:
   pull_request_target:
     branches: [main]
     types: [opened, reopened, edited, synchronize, ready_for_review, converted_to_draft]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
-  pull_request_review_comment:
-    types: [created, edited, deleted]
   workflow_run:
-    workflows: [Checks, Aiter Test]
+    workflows: [Checks, Aiter Test, PR Self-Review Signal]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -32,18 +28,20 @@ concurrency:
 jobs:
   evaluate:
     # workflow_run may describe a main/scheduled run rather than a pull request.
-    # Review events do not support a branches filter, so constrain their base here.
     if: >-
-      (github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request') &&
+      (github.event_name != 'workflow_run' ||
+       contains(fromJSON('["pull_request","pull_request_review","pull_request_review_comment"]'),
+                github.event.workflow_run.event)) &&
       (github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch' ||
        github.event.pull_request.base.ref == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # pull_request_target and workflow_run both check out the trusted default branch.
-      # Never change this to the pull request head: this job has write permission.
+      # This job has write permission. Pin checkout explicitly because review events and
+      # workflow_run metadata may otherwise select a pull request merge ref.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
       - name: Evaluate author self-review, Copilot findings, hygiene and required CI

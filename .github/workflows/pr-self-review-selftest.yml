@@ -7,6 +7,7 @@ on:
       - '.github/scripts/pr_self_review.py'
       - '.github/scripts/pr_self_review_selftest.py'
       - '.github/workflows/pr-self-review.yml'
+      - '.github/workflows/pr-self-review-signal.yml'
       - '.github/workflows/pr-self-review-selftest.yml'
       - '.github/pull_request_template.md'
   push:
@@ -15,6 +16,7 @@ on:
       - '.github/scripts/pr_self_review.py'
       - '.github/scripts/pr_self_review_selftest.py'
       - '.github/workflows/pr-self-review.yml'
+      - '.github/workflows/pr-self-review-signal.yml'
       - '.github/workflows/pr-self-review-selftest.yml'
       - '.github/pull_request_template.md'
   workflow_dispatch:

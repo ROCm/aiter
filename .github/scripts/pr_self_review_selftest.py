@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 SCRIPT = Path(__file__).with_name("pr_self_review.py")
+WORKFLOWS = SCRIPT.parent.parent / "workflows"
 SPEC = importlib.util.spec_from_file_location("pr_self_review", SCRIPT)
 assert SPEC and SPEC.loader
 gate = importlib.util.module_from_spec(SPEC)
@@ -56,6 +57,21 @@ class RequestAPI:
 
 
 class PRSelfReviewSelftest(unittest.TestCase):
+    def test_review_events_use_read_only_signal_workflow(self) -> None:
+        privileged = (WORKFLOWS / "pr-self-review.yml").read_text()
+        signal = (WORKFLOWS / "pr-self-review-signal.yml").read_text()
+
+        self.assertNotRegex(privileged, r"(?m)^  pull_request_review(?:_comment)?:")
+        self.assertIn("PR Self-Review Signal", privileged)
+        self.assertIn("ref: ${{ github.event.repository.default_branch }}", privileged)
+        self.assertRegex(signal, r"(?m)^  pull_request_review:")
+        self.assertRegex(signal, r"(?m)^  pull_request_review_comment:")
+        self.assertRegex(signal, r"(?ms)^permissions:\s+contents: read\s*$")
+        self.assertNotIn("actions/checkout", signal)
+        self.assertNotRegex(
+            signal, r"(?m)^\s+(?:issues|pull-requests|statuses): write$"
+        )
+
     def test_sections_stop_at_next_parent_heading(self) -> None:
         issues, answers = gate.validate_author_answers(
             valid_body(), "abcdef1234567890", []
