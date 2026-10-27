@@ -97,6 +97,7 @@ FAMILIES = [
     ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
     ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
+    ("AITER_CONFIG_JAGGED_DENSE_BMM", "jagged_dense_bmm_tuned"),
 ]
 
 
@@ -548,6 +549,9 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_gdn_k5_opt(self):
         self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
+
+    def test_jagged_dense_bmm(self):
+        self._check_family("AITER_CONFIG_JAGGED_DENSE_BMM", "jagged_dense_bmm_tuned")
 
 
 def _fix_real_tree():

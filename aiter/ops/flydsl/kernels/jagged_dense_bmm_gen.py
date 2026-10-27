@@ -20,6 +20,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_num_xcds
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from .tensor_shim import _run_compiled
@@ -35,10 +36,8 @@ K_TILE_GRAN = 32  # MFMA K-tile loop uses BLOCK_K // 32 stages
 
 _DEFAULT_STREAM = fx.Stream(None)
 
-NXCD = 8
 
-
-def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
+def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD):
     xy = fx.Int32(xy)
     cnXCD = fx.Int32(nXCD)
     cC = fx.Int32(C)
@@ -92,6 +91,7 @@ def _build_launcher(
     THREADS,
     XCD_C,
     XCD_W,
+    NUM_XCDS,
     COMPACT=False,
 ):
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
@@ -116,10 +116,14 @@ def _build_launcher(
             # Scalar int32 record. The offset is an element index, so this stays
             # on buffer_ops.
             tile_rsrc = buffer_ops.create_buffer_resource(TILE_MAP, max_size=True)
-            if fx.const_expr(XCD_C > 1):
+            # One XCD has nothing to spread across, so the grid coordinate is
+            # the tile. A larger count remaps with that count, not a fixed 8.
+            if fx.const_expr(NUM_XCDS > 1 and XCD_C > 1):
                 total_occ = fx.grid_dim.x
                 raw_xy = raw_b * total_occ + pid_mn
-                tile_row, n_col = _xcd_remap(raw_xy, total_occ, N_BLOCKS, XCD_C, XCD_W)
+                tile_row, n_col = _xcd_remap(
+                    raw_xy, total_occ, N_BLOCKS, XCD_C, XCD_W, NUM_XCDS
+                )
                 tile_row = fx.Int32(fx.rocdl.readfirstlane(T.i32, tile_row))
                 block_n_idx = fx.Int32(fx.rocdl.readfirstlane(T.i32, n_col))
             else:
@@ -139,17 +143,21 @@ def _build_launcher(
             # here so a new batch or max_seq_len does not rebuild the launcher.
             grid_x = fx.grid_dim.x
             bm_tiles = fx.Int32(fx.Uint32(grid_x) // fx.Uint32(N_BLOCKS))
-            n_groups_rt = fx.grid_dim.z
-            raw_xy = raw_b * grid_x + pid_mn
-            row, col = _xcd_remap(
-                raw_xy, bm_tiles * n_groups_rt, N_BLOCKS, XCD_C, XCD_W
-            )
-            row = fx.Int32(fx.rocdl.readfirstlane(T.i32, row))
-            col = fx.Int32(fx.rocdl.readfirstlane(T.i32, col))
-
-            off_b = fx.Int32(fx.Uint32(row) // fx.Uint32(bm_tiles))
-            block_m_idx = fx.Int32(fx.Uint32(row) % fx.Uint32(bm_tiles))
-            block_n_idx = col
+            if fx.const_expr(NUM_XCDS > 1 and XCD_C > 1):
+                n_groups_rt = fx.grid_dim.z
+                raw_xy = raw_b * grid_x + pid_mn
+                row, col = _xcd_remap(
+                    raw_xy, bm_tiles * n_groups_rt, N_BLOCKS, XCD_C, XCD_W, NUM_XCDS
+                )
+                row = fx.Int32(fx.rocdl.readfirstlane(T.i32, row))
+                col = fx.Int32(fx.rocdl.readfirstlane(T.i32, col))
+                off_b = fx.Int32(fx.Uint32(row) // fx.Uint32(bm_tiles))
+                block_m_idx = fx.Int32(fx.Uint32(row) % fx.Uint32(bm_tiles))
+                block_n_idx = col
+            else:
+                off_b = raw_b
+                block_m_idx = fx.Int32(fx.Uint32(pid_mn) // fx.Uint32(N_BLOCKS))
+                block_n_idx = fx.Int32(fx.Uint32(pid_mn) % fx.Uint32(N_BLOCKS))
 
             # Scalar int32 metadata. The offset is an element index, so this stays
             # on buffer_ops.
@@ -460,6 +468,7 @@ def jagged_dense_bmm(
     stream: fx.Stream = _DEFAULT_STREAM,
     xcd_c: int | None = None,
     xcd_w: int | None = None,
+    num_xcds: int | None = None,
     uniform_seqlen: bool = True,
     block_m: int | None = None,
     block_n: int | None = None,
@@ -502,13 +511,22 @@ def jagged_dense_bmm(
             f"block_k={block_k} needs {epi_smem} bytes LDS (max {LDS_BYTES}); "
             f"A-stage staging is {a_smem} bytes"
         )
+    if num_xcds is None:
+        num_xcds = int(get_num_xcds())
+    else:
+        num_xcds = int(num_xcds)
+    if num_xcds < 1:
+        raise ValueError(f"num_xcds must be positive, got {num_xcds}")
     if xcd_c is None or xcd_w is None:
         # One owner for the analytic XCD choice. Imported here so this module
         # can load without the dispatch table.
         from aiter.ops.flydsl.jagged_dense_bmm_dispatch import analytic_config
 
         filled = analytic_config(
-            uniform_seqlen=uniform_seqlen, n_groups=n_groups, reduction_k=K
+            uniform_seqlen=uniform_seqlen,
+            n_groups=n_groups,
+            reduction_k=K,
+            num_xcds=num_xcds,
         )
         if xcd_c is None:
             xcd_c = filled["xcd_c"]
@@ -531,6 +549,7 @@ def jagged_dense_bmm(
         nthreads,
         xcd_c,
         xcd_w,
+        num_xcds,
         compact,
     )
     launch_args = (C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream)
@@ -546,6 +565,7 @@ def jagged_dense_bmm(
             nthreads,
             xcd_c,
             xcd_w,
+            num_xcds,
             compact,
         )
         _cache_put(key, launch)

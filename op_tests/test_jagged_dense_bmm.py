@@ -16,7 +16,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_num_xcds
 from aiter.ops.flydsl import jagged_dense_bmm_dispatch as jdbba_dispatch
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
     SUPPORTED_GFX,
@@ -48,7 +48,9 @@ SEED = 1234
 _ARCH_SECTION_CASES = ("gfx942", "gfx950", "gfx1250", "unknown")
 _ARCH_SHAPE = (120, 256, 256, 7680)
 # cu_num stamped on the measuring part: full MI300X, and this MI350.
+# Both parts expose 8 XCDs. A 4-XCD or 1-XCD partition has no row.
 _MEASURED_CU = {"gfx942": 304, "gfx950": 256}
+_MEASURED_XCDS = 8
 
 try:
     from generative_recommenders.ops.triton.triton_jagged import (
@@ -684,7 +686,12 @@ def _check_shipped_section(arch):
         if near["xcd_c"] != winner["xcd_c"] or near["threads"] != winner["threads"]:
             raise AssertionError(f"{arch} B=128 missed the B={B} tile bucket")
         miss = resolve_config(n_groups=4, reduction_k=D, output_n=Kout, max_seq_len=128)
-        expect = analytic_config(uniform_seqlen=True, n_groups=4, reduction_k=D)
+        expect = analytic_config(
+            uniform_seqlen=True,
+            n_groups=4,
+            reduction_k=D,
+            num_xcds=int(jdbba_dispatch.get_num_xcds()),
+        )
         if miss["xcd_w"] != expect["xcd_w"] or miss["threads"] != expect["threads"]:
             raise AssertionError(f"{arch} empty bucket used {miss}")
         jdbba_dispatch._require_supported_arch()
@@ -707,11 +714,20 @@ def _check_multisection_override(arch):
         path = os.path.join(tmp, "jagged_dense_bmm_tuned.csv")
         with open(path, "w", encoding="utf-8") as fh:
             lines = [
-                "gfx,cu_num,regime,K,N,tile_bucket,xcd_c,xcd_w,threads,block_k,us\n"
+                (
+                    "gfx,cu_num,num_xcds,regime,K,N,tile_bucket,"
+                    "xcd_c,xcd_w,threads,block_k,us\n"
+                )
             ]
             lines.extend(
-                f"{gfx},{_MEASURED_CU[gfx]},uniform,{_k},{_n},{bucket},"
+                f"{gfx},{_MEASURED_CU[gfx]},{_MEASURED_XCDS},uniform,{_k},{_n},{bucket},"
                 f"{cfg['xcd_c']},{cfg['xcd_w']},{cfg['threads']},64,1\n"
+                for gfx, cfg in rows.items()
+            )
+            # Same shape on another XCD count must not replace the live row.
+            lines.extend(
+                f"{gfx},{_MEASURED_CU[gfx]},4,uniform,{_k},{_n},{bucket},9,9,"
+                f"{cfg['threads']},64,1\n"
                 for gfx, cfg in rows.items()
             )
             fh.writelines(lines)
@@ -736,7 +752,47 @@ def _check_multisection_override(arch):
                 )
         elif selected or table["winners"]:
             raise AssertionError(f"{arch} override loaded section {selected!r}")
+        os.environ.pop("AITER_CONFIG_JAGGED_DENSE_BMM", None)
+        os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON", None)
+        _clear_dispatch_cache()
     return selected
+
+
+def _check_xcd_partition(arch, num_xcds):
+    """A partition without its own row uses analytic_config, not the 8-XCD winner."""
+    with mock.patch.object(jdbba_dispatch, "get_num_xcds", return_value=num_xcds):
+        _clear_dispatch_cache()
+        table = _load_dispatch_table()
+        if table["winners"]:
+            raise AssertionError(
+                f"{arch} num_xcds={num_xcds} loaded {len(table['winners'])} rows"
+            )
+        B, D, Kout, Mi = _ARCH_SHAPE
+        cfg = resolve_config(n_groups=B, reduction_k=D, output_n=Kout, max_seq_len=Mi)
+        expect = analytic_config(
+            uniform_seqlen=True, n_groups=B, reduction_k=D, num_xcds=num_xcds
+        )
+        if cfg["xcd_c"] != expect["xcd_c"] or cfg["xcd_w"] != expect["xcd_w"]:
+            raise AssertionError(f"{arch} num_xcds={num_xcds} config {cfg} != {expect}")
+        if num_xcds == 1 and (cfg["xcd_c"] != 1 or cfg["xcd_w"] != 1):
+            raise AssertionError(f"{arch} 1 XCD did not use identity {cfg}")
+        skew = resolve_config(
+            n_groups=B,
+            reduction_k=D,
+            output_n=Kout,
+            max_seq_len=Mi,
+            uniform_seqlen=False,
+        )
+        skew_expect = analytic_config(
+            uniform_seqlen=False, n_groups=B, reduction_k=D, num_xcds=num_xcds
+        )
+        if (
+            skew["xcd_c"] != skew_expect["xcd_c"]
+            or skew["xcd_w"] != skew_expect["xcd_w"]
+            or skew["block_k"] != skew_expect["block_k"]
+        ):
+            raise AssertionError(f"{arch} num_xcds={num_xcds} skew {skew}")
+    _clear_dispatch_cache()
 
 
 @benchmark()
@@ -754,9 +810,14 @@ def test_jdbba_arch_section(arch):
             mock.patch.object(
                 jdbba_dispatch, "get_cu_num", return_value=_MEASURED_CU.get(arch, 0)
             ),
+            mock.patch.object(
+                jdbba_dispatch, "get_num_xcds", return_value=_MEASURED_XCDS
+            ),
         ):
             selected, raised = _check_shipped_section(arch)
             override = _check_multisection_override(arch)
+            _check_xcd_partition(arch, 4)
+            _check_xcd_partition(arch, 1)
         os.environ.pop("AITER_CONFIG_JAGGED_DENSE_BMM", None)
         if prev_config is not None:
             os.environ["AITER_CONFIG_JAGGED_DENSE_BMM"] = prev_config
@@ -766,6 +827,10 @@ def test_jdbba_arch_section(arch):
                 if get_cu_num() != _MEASURED_CU[arch]:
                     raise AssertionError(
                         f"live cu_num {get_cu_num()} has no {arch} winners"
+                    )
+                if get_num_xcds() != _MEASURED_XCDS:
+                    raise AssertionError(
+                        f"live num_xcds {get_num_xcds()} has no {arch} winners"
                     )
                 live = _load_dispatch_table().get("gfx") or ""
                 if live != arch:
@@ -786,6 +851,8 @@ def test_jdbba_arch_section(arch):
         "selected": selected,
         "override": override,
         "raised": raised,
+        "xcd4": "analytic",
+        "xcd1": "identity",
         "err": 0,
     }
 

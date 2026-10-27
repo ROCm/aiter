@@ -4,11 +4,12 @@
 """Dispatch layer for jagged_dense_bmm_broadcast_add.
 
 Uniform winners come from ``jagged_dense_bmm_tuned.csv`` through
-``AITER_CONFIG_JAGGED_DENSE_BMM``. The key is ``gfx``, ``cu_num``, K, N,
-and a power-of-two bucket of the uniform grid. A miss uses
-``analytic_config``. The public wrapper runs only on ``SUPPORTED_GFX``.
-Every skew launch builds a compact TILE_MAP and uses the analytic config;
-skew has no measured XCD rows.
+``AITER_CONFIG_JAGGED_DENSE_BMM``. The key is ``gfx``, ``cu_num``,
+``num_xcds``, K, N, and a power-of-two bucket of the uniform grid. A miss
+uses ``analytic_config``. One XCD resolves to an identity mapping. The
+public wrapper runs only on ``SUPPORTED_GFX``. Every skew launch builds a
+compact TILE_MAP and uses the analytic config; skew has no measured XCD
+rows.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import flydsl.expr as fx
 import torch
 
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime, get_num_xcds
 
 from .kernels.jagged_dense_bmm_gen import BLOCK_M, BLOCK_N, jagged_dense_bmm
 from .kernels.jdbba_skew_tile_map import build_tile_map_device_fused
@@ -76,8 +77,17 @@ def tile_bucket(n_groups: int, max_seq_len: int, output_n: int) -> int:
     return 1 << (tiles.bit_length() - 1)
 
 
-def analytic_config(*, uniform_seqlen: bool, n_groups: int, reduction_k: int) -> dict:
+def analytic_config(
+    *, uniform_seqlen: bool, n_groups: int, reduction_k: int, num_xcds: int
+) -> dict:
     """Config used when the tuned table has no row for this launch."""
+    if num_xcds <= 1:
+        return {
+            "threads": _THREADS,
+            "block_k": _BLOCK_K,
+            "xcd_c": _XCD_C_IDENTITY,
+            "xcd_w": _XCD_C_IDENTITY,
+        }
     cfg = {"threads": _THREADS, "block_k": _BLOCK_K, "xcd_w": _XCD_W}
     if not uniform_seqlen:
         if n_groups > _SKEW_REMAP_MIN_GROUPS or reduction_k >= _SKEW_REMAP_MIN_K:
@@ -91,11 +101,12 @@ def analytic_config(*, uniform_seqlen: bool, n_groups: int, reduction_k: int) ->
 
 
 def _load_dispatch_table() -> dict:
-    """Uniform winners for the live ``gfx`` and ``cu_num``."""
+    """Uniform winners for the live ``gfx``, ``cu_num``, and XCD count."""
     arch = _runtime_arch()
     cu = int(get_cu_num())
+    n_xcds = int(get_num_xcds())
     path = AITER_CONFIGS.AITER_CONFIG_JAGGED_DENSE_BMM_FILE
-    cache_key = (arch, cu, path)
+    cache_key = (arch, cu, n_xcds, path)
     cached = _DISPATCH_TABLES.get(cache_key)
     if cached is not None:
         return cached
@@ -103,6 +114,8 @@ def _load_dispatch_table() -> dict:
     with open(path, newline="") as fh:
         for row in csv.DictReader(fh):
             if row.get("gfx") != arch or int(float(row["cu_num"])) != cu:
+                continue
+            if int(float(row["num_xcds"])) != n_xcds:
                 continue
             if row.get("regime") != "uniform":
                 continue
@@ -164,9 +177,11 @@ def resolve_config(
     bucket = tile_bucket(n_groups, max_seq_len, output_n)
     arch = _runtime_arch()
     cu = int(get_cu_num())
+    n_xcds = int(get_num_xcds())
     key = (
         arch,
         cu,
+        n_xcds,
         uniform_seqlen,
         reduction_k,
         output_n,
@@ -184,6 +199,7 @@ def resolve_config(
         uniform_seqlen=uniform_seqlen,
         n_groups=n_groups,
         reduction_k=reduction_k,
+        num_xcds=n_xcds,
     )
     if uniform_seqlen:
         entry = _load_dispatch_table()["winners"].get((reduction_k, output_n, bucket))
@@ -230,6 +246,9 @@ def jagged_dense_bmm_dispatched(
         block_k=block_k,
     )
 
+    # The lookup and the launcher share this count. get_num_xcds is cached
+    # per device, so this matches the value resolve_config just used.
+    n_xcds = int(get_num_xcds())
     # Prep and the GEMM share this queue. A per-call TILE_MAP allocated on it
     # stays live until that queue finishes, including after this function returns.
     stream = _as_torch_stream(stream, SEQ_OFFSETS.device)
@@ -256,6 +275,7 @@ def jagged_dense_bmm_dispatched(
             stream=stream,
             xcd_c=cfg["xcd_c"],
             xcd_w=cfg["xcd_w"],
+            num_xcds=n_xcds,
             uniform_seqlen=False,
             block_k=cfg["block_k"],
             threads=cfg["threads"],
@@ -274,6 +294,7 @@ def jagged_dense_bmm_dispatched(
         stream=stream,
         xcd_c=cfg["xcd_c"],
         xcd_w=cfg["xcd_w"],
+        num_xcds=n_xcds,
         uniform_seqlen=True,
         block_k=cfg["block_k"],
         threads=cfg["threads"],
