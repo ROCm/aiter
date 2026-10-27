@@ -517,7 +517,7 @@ def qsa_paged_mqa_logits_flydsl(
         _qsa_logits_layout_launch,
         q,
         compressed_k_cache,
-        page_table.view(-1),
+        page_table,
         token_to_request,
         query_positions,
         context_lens,

@@ -938,7 +938,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         q_scale,
         kv_cache.view(-1),
         kv_scale.view(-1),
-        block_tables.view(-1),
+        block_tables,
         weights,
         cta_info,
         out.stride(0),
