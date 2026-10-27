@@ -61,8 +61,10 @@ class TestBatchInvariantConfig(unittest.TestCase):
         for m, expected in (
             (1, 1),
             (2, 64),
+            (63, 64),
             (64, 64),
             (65, 96),
+            (95, 96),
             (96, 96),
             (97, 96),
             (8192, 96),
