@@ -261,11 +261,11 @@ def test_flydsl_fmha_rejects_descales_for_bf16():
     _check_descales_for_bf16_are_rejected()
 
 
-def _check_fp8_softmax_normalizes_v_ones(zero_row):
+def _check_fp8_softmax_normalizes_v_ones(zero_row, *, seq_len=4096, tail_score=-7.5):
     q = torch.zeros((1, 1, 1, 64), dtype=FP8_DTYPE, device="cuda")
     q[..., 0] = 1.0
-    k = torch.zeros((1, 4096, 1, 64), dtype=FP8_DTYPE, device="cuda")
-    k[..., 0] = -7.5
+    k = torch.zeros((1, seq_len, 1, 64), dtype=FP8_DTYPE, device="cuda")
+    k[..., 0] = tail_score
     k[:, zero_row, :, 0] = 0.0
     v = torch.ones_like(k)
     scale = torch.ones(1, dtype=torch.float32, device="cuda")
@@ -287,6 +287,12 @@ def _check_fp8_softmax_normalizes_v_ones(zero_row):
 @pytest.mark.parametrize("zero_row", [0, -1])
 def test_flydsl_fmha_fp8_softmax_normalizes_v_ones(zero_row):
     _check_fp8_softmax_normalizes_v_ones(zero_row)
+
+
+@_gfx1201_only
+@pytest.mark.parametrize("tail_score", [-12.0, -13.0])
+def test_flydsl_fmha_fp8_long_softmax_normalizes_v_ones(tail_score):
+    _check_fp8_softmax_normalizes_v_ones(0, seq_len=32768, tail_score=tail_score)
 
 
 def _check_bf16_v_ones_bias_is_bounded():
@@ -2106,6 +2112,8 @@ def _optest_gfx1201_contracts():
     _check_descales_for_bf16_are_rejected()
     for zero_row in (0, -1):
         _check_fp8_softmax_normalizes_v_ones(zero_row)
+    for tail_score in (-12.0, -13.0):
+        _check_fp8_softmax_normalizes_v_ones(0, seq_len=32768, tail_score=tail_score)
     _check_bf16_v_ones_bias_is_bounded()
 
     q, k, v = _optest_make_gfx1201_qkv(1, 97, 97, 2, 128)

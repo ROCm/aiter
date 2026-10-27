@@ -33,6 +33,7 @@ from flydsl.expr import (
     gpu,
     range_constexpr,
 )
+from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
@@ -82,6 +83,39 @@ def _next_kv_tile_start(kv_block_start, kv_upper, block_n, zero):
     return (next_start < kv_upper).select(next_start, zero)
 
 
+def _pack_probabilities_fp8(probabilities, quantized_sum):
+    """Pack eight probabilities and add their quantized values to the sum."""
+    i32_ty = fx.Int32.ir_type
+    zero_i32 = fx.Int32(0).ir_value()
+    packed0 = fx.rocdl.cvt_pk_fp8_f32(
+        i32_ty, probabilities[0], probabilities[1], zero_i32, 0
+    )
+    packed0 = fx.rocdl.cvt_pk_fp8_f32(
+        i32_ty, probabilities[2], probabilities[3], packed0, 1
+    )
+    packed1 = fx.rocdl.cvt_pk_fp8_f32(
+        i32_ty, probabilities[4], probabilities[5], zero_i32, 0
+    )
+    packed1 = fx.rocdl.cvt_pk_fp8_f32(
+        i32_ty, probabilities[6], probabilities[7], packed1, 1
+    )
+
+    packed_ones = fx.Int32(0x38383838).ir_value()  # Four E4M3 1.0 values.
+    quantized_sum = fx.rocdl.dot4_f32_fp8_fp8_(
+        T.f32,
+        packed0,
+        packed_ones,
+        quantized_sum,
+    )
+    quantized_sum = fx.rocdl.dot4_f32_fp8_fp8_(
+        T.f32,
+        packed1,
+        packed_ones,
+        quantized_sum,
+    )
+    return [packed0, packed1], quantized_sum
+
+
 def _update_online_softmax(
     scores,
     m_running,
@@ -108,20 +142,23 @@ def _update_online_softmax(
         probability_log2_scale,
     )
 
-    probabilities = []
+    packed_probabilities = []
     local_sum = _raw(c_zero_f)
-    for idx in range_constexpr(num_scores):
-        diff = fx.math.fma(scores[idx], _raw(sm_scale_log2e), neg_scaled_max)
-        probability = fx.exp2(diff, fastmath="fast")
-        probabilities.append(probability)
-        local_sum = _fadd_scalar(local_sum, probability)
+    for pack_idx in range_constexpr(num_scores // 8):
+        base = pack_idx * 8
+        probabilities = []
+        for idx in range(8):
+            diff = fx.math.fma(scores[base + idx], _raw(sm_scale_log2e), neg_scaled_max)
+            probabilities.append(fx.exp2(diff, fastmath="fast"))
+        packed, local_sum = _pack_probabilities_fp8(probabilities, local_sum)
+        packed_probabilities.append(packed)
 
     tile_sum = _fadd_scalar(local_sum, _wave32_peer(local_sum))
     l_new = _fadd_scalar(_fmul_scalar(corr, l_running), tile_sum)
     corr_vec = fx.Vector.from_elements([corr], fx.Float32).broadcast_to(8).ir_value()
     for chunk in range_constexpr(d_chunks):
         o_accs[chunk] = _fmul_vec(o_accs[chunk], corr_vec)
-    return probabilities, m_new, l_new, o_accs
+    return packed_probabilities, m_new, l_new, o_accs
 
 
 def get_flash_attn_fp8_lds_bytes(head_dim: int, block_n: int) -> int:
@@ -290,19 +327,6 @@ def build_flash_attn_func_module(
             c_frag.store(Vec(c_v8))
             fx.gemm(wmma_atom, c_frag, a_frag, b_frag, c_frag)
             return c_frag.load().ir_value()
-
-        def _pack_probabilities_fp8(p8):
-            # FlyDSL 0.3.4.1 cannot lower the typed vector f32->fp8 cast:
-            # it emits vector arith.truncf with no LLVM translation. Keep
-            # this target packing intrinsic localized until that lowering
-            # exists; it also produces the two i32 words required by WMMA.
-            _i32ty = fx.Int32.ir_type
-            _c0 = fx.Int32(0).ir_value()
-            pk0 = fx.rocdl.cvt_pk_fp8_f32(_i32ty, p8[0], p8[1], _c0, 0)
-            pk0 = fx.rocdl.cvt_pk_fp8_f32(_i32ty, p8[2], p8[3], pk0, 1)
-            pk1 = fx.rocdl.cvt_pk_fp8_f32(_i32ty, p8[4], p8[5], _c0, 0)
-            pk1 = fx.rocdl.cvt_pk_fp8_f32(_i32ty, p8[6], p8[7], pk1, 1)
-            return [pk0, pk1]
 
         # Logical coordinates and HBM element offsets are explicit u64 values.
         # V# helpers narrow at their intrinsic boundary; the public wrapper
@@ -630,7 +654,7 @@ def build_flash_attn_func_module(
                     num_s_accs=NUM_S_ACCS,
                     causal=CAUSAL,
                 )
-            p_vals, m_new_raw, l_new, o_accs = _update_online_softmax(
+            p_packs, m_new_raw, l_new, o_accs = _update_online_softmax(
                 s_raw,
                 m_running,
                 l_running,
@@ -652,9 +676,7 @@ def build_flash_attn_func_module(
                 p_packs_st = []
                 for pks in range_constexpr(PV_K_STEPS):
                     acc_idx = st_idx * 2 + pks
-                    p_base = acc_idx * 8
-                    p_slice = [p_vals[p_base + j] for j in range(8)]
-                    p_packs_st.append(_pack_probabilities_fp8(p_slice))
+                    p_packs_st.append(p_packs[acc_idx])
                 p_packs_all.append(p_packs_st)
 
             # ==== GEMM2: O += V^T @ P (software pipelined, transposed LDS V) ====
