@@ -290,6 +290,7 @@ def validate_author_answers(
         "fingerprint": hashlib.sha256(
             re.sub(r"\s+", " ", combined.lower()).encode()
         ).hexdigest()[:12],
+        "answers": {name: parsed.get(name, "").strip() for name in SECTION_NAMES[1:]},
     }
     if (
         telemetry["answer_units"] >= 120
@@ -478,6 +479,12 @@ def icon(state: str) -> str:
     }.get(state, state.upper())
 
 
+def fenced_text(value: str) -> str:
+    longest = max((len(match) for match in re.findall(r"`+", value)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{value.strip()}\n{fence}"
+
+
 def render(result: Result, pr: dict[str, Any]) -> str:
     ready = not result.blocking and not result.ci_pending
     conclusion = "READY FOR HUMAN REVIEW" if ready else "NOT READY FOR HUMAN REVIEW"
@@ -517,8 +524,23 @@ def render(result: Result, pr: dict[str, Any]) -> str:
                 "### Author answers",
                 "",
                 "- PASS — current-SHA answers are present and structurally specific",
+                "",
+                "<details>",
+                "<summary>Show the author's self-review answers</summary>",
+                "",
             ]
         )
+        answers = result.telemetry.get("answers", {})
+        for name in SECTION_NAMES[1:]:
+            lines.extend(
+                [
+                    f"#### {name}",
+                    "",
+                    fenced_text(answers.get(name, "")),
+                    "",
+                ]
+            )
+        lines.append("</details>")
         lines.extend(["", "### Copilot findings"])
         if result.copilot_issues:
             lines.extend(f"- FAIL — {issue}" for issue in result.copilot_issues)

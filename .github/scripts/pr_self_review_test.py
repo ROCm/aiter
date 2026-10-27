@@ -292,9 +292,15 @@ def main():
 
     report_result = MODULE.Result(head_sha=HEAD, mode="enforce", question="q")
     report_result.ci = {"Black": "pending"}
+    report_result.telemetry = MODULE.validate_author_answers(body(), HEAD, [])[1]
     report = MODULE.render(report_result, {})
     check("answered comment reports required CI", "### Required CI" in report)
     check("answered comment hides shadow audit metrics", "Shadow audit" not in report)
+    check(
+        "answered comment exposes author answers",
+        "Show the author's self-review answers" in report
+        and "This changes the gfx950 dispatch boundary" in report,
+    )
     check(
         "answered comment hides question prompt",
         "### Questions to answer" not in report,
