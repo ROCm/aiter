@@ -45,6 +45,7 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
+from aiter.ops.moe_op import _Q256_KERNEL
 from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -67,8 +68,6 @@ from aiter.ops.shuffle import (
 )
 
 logger = logging.getLogger(__name__)
-
-_Q256_KERNEL = "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate"
 
 
 @contextmanager
@@ -191,7 +190,7 @@ def _check_q256_integration(
         assert out.shape == (tokens, model)
         assert partials.shape == (tokens, topk, model)
         assert partials.dtype == dtypes.bf16
-        job_map = args[14] if len(args) > 14 else None
+        job_map = args[13] if len(args) > 13 else None
         assert (job_map is not None) == weighted, "wrong Q256 scheduling path"
         if not captured:
             captured.append(args)
@@ -229,13 +228,21 @@ def _check_q256_integration(
         assert (
             experts[boundary - 1].item() != 512
         ), "Q256 shared suffix exceeds 32 tiles"
-        job_map = args[14].cpu()
+        job_map = args[13].cpu()
         identity = torch.arange(job_map.numel(), dtype=job_map.dtype, device="cpu")
         identity[identity >= jobs] = -1
         assert not torch.equal(job_map, identity), "Q256 weighted job map is identity"
+    elif weighted:
+        physical_tiles = int(args[8][0].item()) // 256
+        job_map = args[13].cpu()
+        identity = torch.arange(job_map.numel(), dtype=job_map.dtype, device="cpu")
+        identity[identity >= physical_tiles] = -1
+        assert torch.equal(
+            job_map, identity
+        ), "random routes must use identity scheduling"
     partials = args[1]
     compact_partials = torch.empty_like(partials)
-    baseline_args = list(args[:14])
+    baseline_args = list(args[:13])
     baseline_args[0] = torch.empty_like(out)
     baseline_args[1] = compact_partials
     native(*baseline_args)
@@ -270,9 +277,9 @@ def _check_q256_integration(
             (1, torch.empty((tokens, topk - 1, model), dtype=dtypes.bf16)),
             (2, torch.empty((tokens, model // 2), dtype=dtypes.fp32)),
             (3, torch.empty((w1.shape[0], 256, model // 2), dtype=w1.dtype)),
-            (13, 128),
+            (12, 128),
         ):
-            invalid = list(args[:14])
+            invalid = list(args[:13])
             invalid[index] = bad
             with pytest.raises((RuntimeError, ValueError), match="Q256"):
                 native(*invalid)
@@ -1929,7 +1936,7 @@ def test_q256_prefill():
     cases = [
         _q256_case(token, model_dim)
         for model_dim, token in itertools.product((4096, 8192), (8192, 16384, 32768))
-    ] + [_q256_case(8192, 8192, shared_expert_id=None)]
+    ]
     rows = []
     for case in cases:
         with _with_default_device("cpu"):
@@ -1939,12 +1946,28 @@ def test_q256_prefill():
         gc.collect()
         torch.cuda.empty_cache()
     aiter.logger.info(
-        "Q256 shared/random-route summary (markdown):\n%s",
+        "Q256 shared-route summary (markdown):\n%s",
         pd.DataFrame(rows)
         .fillna({"shared_expert_id": "None"})
         .to_markdown(index=False),
     )
+    test_q256_random_routes()
     test_q256_token_boundaries()
+
+
+def test_q256_random_routes():
+    """Exercise weighted scheduling's identity fallback without a shared suffix."""
+    if get_gfx() != "gfx950":
+        return
+    with _with_default_device("cpu"):
+        result = test_fmoe(**_q256_case(8192, 8192, shared_expert_id=None))
+        assert torch.get_default_device() == torch.device("cpu")
+    gc.collect()
+    torch.cuda.empty_cache()
+    aiter.logger.info(
+        "Q256 random-route summary (markdown):\n%s",
+        pd.DataFrame([result]).to_markdown(index=False),
+    )
 
 
 def _q256_metadata(**overrides):
@@ -2467,6 +2490,7 @@ def main():
     df_md = df.to_markdown(index=False)
     aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
     if q256_selected:
+        test_q256_random_routes()
         test_q256_token_boundaries()
 
 
@@ -2474,7 +2498,19 @@ def test_moe_default_device_state():
     """GPU entry points restore a CPU caller's allocation state, including errors."""
     with _with_default_device("cpu"):
         with pytest.raises(RuntimeError, match="negative dimension"):
-            test_fmoe(**_q256_case(-1, 4096))
+            test_fmoe(
+                dtype=dtypes.bf16,
+                token=-1,
+                model_dim=256,
+                inter_dim=256,
+                E=8,
+                topk=2,
+                actType=aiter.ActivationType.Silu,
+                gateMode=GateMode.SEPARATED.value,
+                qType=aiter.QuantType.No,
+                AQDType=None,
+                WQDType=None,
+            )
         assert torch.get_default_device() == torch.device("cpu")
         assert torch.empty(0).device.type == "cpu"
         with (
@@ -2497,3 +2533,4 @@ def test_moe_default_device_state():
 
 if __name__ == "__main__":
     main()
+    test_moe_default_device_state()

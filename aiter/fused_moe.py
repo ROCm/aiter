@@ -1837,7 +1837,9 @@ def _fused_moe_impl(
                 "(only the layout-v2 scatter GEMM2 handles the masked aux sort)."
             )
         if metadata.run_1stage:
-            _atomic = True  # Allocate the final output for producer + reduction.
+            # The sort's accumulate contract allocates the final [M, D] buffer.
+            # Q256 writes partials; its reducer overwrites that buffer, not atomics.
+            _atomic = True
         else:
             _stage2_kwargs = metadata.stage2.keywords
             _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get(
@@ -1951,10 +1953,6 @@ def _fused_moe_impl(
             device=topk_ids.device,
             doweight_stage1=doweight_stage1,
         )
-        if metadata.output_aux:
-            _stage1_call = functools.partial(
-                _stage1_call, reverse_sorted=sort_reverse_sorted
-            )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
         return _return_output(_stage1_call(), output)
@@ -2040,7 +2038,6 @@ def fused_moe_1stage(
     device=None,
     doweight_stage1: bool | None = None,
     flat: int = 0,
-    reverse_sorted=None,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -2168,7 +2165,6 @@ def fused_moe_1stage(
                 sorted_weights,
                 sorted_expert_ids,
                 num_valid_ids,
-                reverse_sorted,
                 a1_scale,
                 w1_scale,
                 w2_scale,
@@ -3748,6 +3744,7 @@ def get_2stage_cfgs(
                 or has_stage2_bias
                 or has_stage2_scatter
                 or has_num_local_tokens
+                # A2 scales only exclude Q256; legacy scale handling is unchanged.
                 or has_a2_scale
                 or swiglu_limit
             )
