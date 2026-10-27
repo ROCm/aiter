@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import sys
 from contextlib import nullcontext
@@ -623,7 +624,7 @@ def _rates(
     work: tuple[float, float], us: float | None
 ) -> tuple[float | None, float | None]:
     """Convert a (FLOPs, bytes) work estimate and microseconds to rates."""
-    if us is None or us <= 0:
+    if us is None or not math.isfinite(us) or us <= 0:
         return None, None
     flops, data_bytes = work
     return flops / us / 1e6, data_bytes / us / 1e3
@@ -727,6 +728,9 @@ def run_moe(
             data_format=data_format,
         )
         tflops, bandwidth = _rates(work["total"], us)
+        if tflops is None:
+            logger.warning("[bench %s] timing unavailable: %r us", tag, us)
+            us = tflops = bandwidth = float("nan")
         print(
             f"[bench {tag}] fused_moe end-to-end us = {us:.2f}, "
             f"FLOPS = {work['total'][0]:.0f}, TFLOPS = {tflops:.2f}, "
@@ -758,10 +762,19 @@ def run_moe(
             )
         else:
             for name, elapsed_us in (("gemm1", g1), ("gemm2", g2)):
-                if elapsed_us is None:
-                    print(f"[kernel-bench {tag}] {name}: n/a", flush=True)
-                    continue
                 tflops, bandwidth = _rates(work[name], elapsed_us)
+                if tflops is None:
+                    logger.warning(
+                        "[kernel-bench %s] %s timing unavailable: %r us",
+                        tag,
+                        name,
+                        elapsed_us,
+                    )
+                    elapsed_us = tflops = bandwidth = float("nan")
+                    if name == "gemm1":
+                        g1 = elapsed_us
+                    else:
+                        g2 = elapsed_us
                 print(
                     f"[kernel-bench {tag}] {name}: us = {elapsed_us:.2f}, "
                     f"FLOPS = {work[name][0]:.0f}, TFLOPS = {tflops:.2f}, "
