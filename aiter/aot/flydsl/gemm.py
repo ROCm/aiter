@@ -558,23 +558,28 @@ def _compile_hgemm_to_cache(
         out = torch.empty((1, representative_extent), device=dev, dtype=torch_out_dtype)
         bias = torch.empty((representative_extent,), device=dev, dtype=torch_dtype)
         semaphore = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int32
-        )
-        signal = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int32
+            (2 * SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int32
         )
         stream = fx.Stream(0)
         a_arg = _dynamic_tensor_arg(a, 1)
         b_arg = _dynamic_tensor_arg(b, 0)
         out_arg = _dynamic_tensor_arg(out, 1)
         bias_arg = a_arg if not has_bias else _dynamic_tensor_arg(bias, 0)
+        workspace_arg = (
+            _dynamic_tensor_arg(
+                torch.empty((representative_extent,), device=dev, dtype=torch.float32),
+                0,
+            )
+            if split_k > 1
+            else out_arg
+        )
         dispatch_args = (
             out_arg,
             a_arg,
             b_arg,
             bias_arg,
             semaphore,
-            signal,
+            workspace_arg,
             split_k,
             param,
             stream,

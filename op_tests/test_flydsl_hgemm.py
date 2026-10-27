@@ -72,6 +72,21 @@ _TUNED = [
     (800, 384, 7168, 64, 96, 64, 4, 4, 2, 2, 1, 0, False),
     (32, 7168, 2048, 32, 32, 64, 8, 1, 2, 1, 1, 0, False),
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
+    (8, 1536, 7168, 16, 32, 128, 8, 4, 1, 2, 1, 0, False),
+    (8, 3584, 7168, 16, 16, 256, 4, 1, 1, 1, 2, 0, False),
+    (4, 4480, 7168, 16, 128, 128, 3, 7, 1, 2, 2, 0, False),
+    (256, 8192, 7168, 128, 128, 128, 2, 2, 2, 4, 1, 0, True),
+]
+
+# Rows whose partial sums cross waves or workgroups, also run with bias and with
+# fp32 output: (m, n, k, policy, split_k, has_bias, out_dtype).
+_PARTIAL_SUM_VARIANTS = [
+    (8, 1536, 7168, "ft", 4, True, dtypes.bf16),
+    (8, 1536, 7168, "ft", 4, False, dtypes.fp32),
+    (8, 3584, 7168, "ft", 1, True, dtypes.bf16),
+    (4, 4480, 7168, "ft", 7, True, dtypes.bf16),
+    (256, 8192, 7168, "hti", 2, True, dtypes.bf16),
+    (256, 8192, 7168, "hti", 2, False, dtypes.fp32),
 ]
 
 
@@ -209,6 +224,54 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     return ret
 
 
+def test_hgemm_partial_sums(m, n, k, policy, split_k, has_bias, out_dtype):
+    """Split-K and slice-K partial sums must be added in fp32, deterministically.
+
+    Small-integer inputs keep every fp32 partial sum exact in any order, so the
+    output must be the exact product rounded once, bit for bit. Repeated runs on
+    Gaussian inputs must be bitwise identical.
+    """
+    tile = _tile_for(m, n, k, policy, split_k)
+    assert tile is not None, f"no tuned tile for {(m, n, k, policy, split_k)}"
+    gen = torch.Generator(device="cuda").manual_seed(SEED)
+
+    def ints(shape, bound):
+        return torch.randint(-bound, bound + 1, shape, generator=gen, device="cuda").to(
+            dtypes.bf16
+        )
+
+    kwargs = {key: v for key, v in tile.items() if key != "use_half_tile_interleaved"}
+
+    def run(a, w, bias):
+        out = torch.randn((m, n), dtype=out_dtype, device="cuda")
+        return flydsl_hgemm(
+            a, w, out=out, bias=bias, policy=policy, out_dtype=out_dtype, **kwargs
+        )
+
+    a, w = ints((m, k), 16), ints((n, k), 16)
+    bias = ints((n,), 256) if has_bias else None
+    exact = a.double() @ w.double().t()
+    if has_bias:
+        exact += bias.double()
+    assert exact.abs().max() < 2**24
+    y = run(a, w, bias)
+    bad = int((y != exact.to(out_dtype)).sum())
+    tag = f"{m}x{n}x{k} {policy} ks{split_k} kw{tile['k_waves']} bias{int(has_bias)} {out_dtype}"
+    assert bad == 0, f"{tag}: {bad}/{y.numel()} outputs differ from the exact product"
+
+    a = torch.randn((m, k), generator=gen, device="cuda").to(dtypes.bf16)
+    w = torch.randn((n, k), generator=gen, device="cuda").to(dtypes.bf16)
+    bias = (
+        torch.randn((n,), generator=gen, device="cuda").to(dtypes.bf16)
+        if has_bias
+        else None
+    )
+    first = run(a, w, bias).clone()
+    for _ in range(9):
+        assert torch.equal(run(a, w, bias), first), f"{tag}: run-to-run mismatch"
+    aiter.logger.info("partial sums exact and deterministic: %s", tag)
+
+
 def summarize(title, rows):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -257,6 +320,14 @@ def main():
                 continue
             rows.append(test_hgemm(m, n, k, dtype, policy, split_k))
         summarize(f"flydsl_hgemm {dtype}", rows)
+
+    for row in _TUNED:
+        m, n, k, policy, split_k, tile = _unpack(row)
+        if (m, n, k) in wanted and (split_k > 1 or tile["k_waves"] > 1):
+            test_hgemm_partial_sums(m, n, k, policy, split_k, False, dtypes.bf16)
+    for m, n, k, policy, split_k, has_bias, out_dtype in _PARTIAL_SUM_VARIANTS:
+        if (m, n, k) in wanted:
+            test_hgemm_partial_sums(m, n, k, policy, split_k, has_bias, out_dtype)
 
 
 if __name__ == "__main__":

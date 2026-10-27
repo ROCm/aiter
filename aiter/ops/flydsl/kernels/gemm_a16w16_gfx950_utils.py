@@ -3,7 +3,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
     const_expr,
     gpu,
@@ -23,38 +22,12 @@ def wait_vmcnt_and_barrier(vmcnt=0):
     rocdl.s_barrier()
 
 
-def get_llvm_ptr(ptr, offset, dtype_bytes):
-    byte_offset = fx.Int64(offset) * dtype_bytes
-    address = buf_base_i64(ptr) + byte_offset
-    ptr_type = fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Global, 1)
-    return fx.to_llvm_ptr(fx.inttoptr(ptr_type, address))
-
-
 def _global_sync_ptr(ptr, offset, dtype):
     """Naturally aligned global pointer for split-K tickets and signals."""
     size = dtype.width // 8
     address = buf_base_i64(ptr) + fx.Int64(offset) * size
     ptr_type = fx.PointerType.get(dtype.ir_type, fx.AddressSpace.Global, size)
     return fx.inttoptr(ptr_type, address)
-
-
-def store_global_f32_vec(c_ptr, global_offset, vec, vec_size):
-    vec_v = fx.Vector(vec)
-    for vec_idx in range_constexpr(vec_size // 4):
-        vals = [vec_v[vec_idx * 4 + elem_idx] for elem_idx in range_constexpr(4)]
-        chunk = fx.Vector.from_elements(vals, fx.Float32)
-        chunk_ptr = get_llvm_ptr(
-            c_ptr,
-            global_offset + vec_idx * 4,
-            4,
-        )
-        llvm.InlineAsmOp(
-            None,
-            [chunk_ptr, chunk.ir_value()],
-            "global_store_dwordx4 $0, $1, off sc0 sc1",
-            "v,v",
-            has_side_effects=True,
-        )
 
 
 class BlockSwizzle:
@@ -92,158 +65,118 @@ class BlockSwizzle:
         )
 
 
-class SplitKProtocol:
-    def __init__(
-        self,
-        BLOCK_M,
-        BLOCK_N,
-        STG_VEC_SIZE,
-        C_DTYPE_BYTES,
-        BLOCK_THREADS,
-        HAS_BIAS,
-    ):
-        self.BLOCK_M = BLOCK_M
-        self.BLOCK_N = BLOCK_N
-        self.STG_VEC_SIZE = STG_VEC_SIZE
-        self.C_DTYPE_BYTES = C_DTYPE_BYTES
-        self.BLOCK_THREADS = BLOCK_THREADS
-        self.HAS_BIAS = HAS_BIAS
-        self.STG_C_X_THREADS = BLOCK_N // STG_VEC_SIZE
-        assert self.STG_C_X_THREADS * STG_VEC_SIZE == BLOCK_N
-        self.STG_C_ITERS = BLOCK_M * BLOCK_N // BLOCK_THREADS // STG_VEC_SIZE
-        assert self.STG_C_ITERS * BLOCK_THREADS * STG_VEC_SIZE == BLOCK_M * BLOCK_N
+class SplitKReduction:
+    """Deterministic fp32 split-K reduction.
+
+    Every workgroup takes a ticket when it starts and stores its fp32 partial. The
+    tile's last workgroup to start reduces: the others count themselves done once
+    their stores have landed, the reducer waits for that count and adds every
+    split's partial in split order, so the sum does not depend on arrival order.
+    Waiting only on workgroups that took a ticket earlier, and so are already
+    running, cannot deadlock. Partials use sc1 buffer stores and loads, which are
+    coherent at agent scope (what LLVM emits for monotonic agent-scope accesses),
+    so no cache-wide fence is needed. Per launch a tile's ticket word advances by
+    SPLIT_K and its done word by SPLIT_K - 1 (buffers are keyed by split_k and never
+    reset), so ticket // SPLIT_K is the launch index. Partials are thread-major
+    float4 groups of the MMA fragments; ``tid`` and ``THREADS`` index the threads
+    that hold the tile (k-wave 0 under slice-K).
+    """
+
+    SC1 = 16  # buffer cache policy: coherent at agent scope
+
+    def __init__(self, SPLIT_K, TILE_ELEMS, THREADS):
+        self.SPLIT_K = SPLIT_K
+        self.TILE_ELEMS = TILE_ELEMS
+        self.THREADS = THREADS
 
     @flyc.jit
-    def init(
-        self,
-        semaphore_ptr,
-        signal_ptr,
-        c_ptr,
-        bias_buf,
-        tid,
-        ks_idx,
-        m,
-        n,
-        block_m_offset,
-        block_n_offset,
-        out_dtype_,
-        signal_idx,
-        c_stride,
-    ):
-        self.semaphore_ptr = semaphore_ptr
-        self.signal_ptr = signal_ptr
-        self.c_ptr = c_ptr
-        self.bias_buf = bias_buf
+    def init(self, semaphore, workspace, flag_ptr, tid, tile_idx, ks_idx):
+        self.ticket_ptr = _global_sync_ptr(semaphore, tile_idx, fx.Int64)
+        self.done_ptr = _global_sync_ptr(
+            semaphore, SPLIT_K_SEMAPHORE_MAX_LEN + tile_idx, fx.Int64
+        )
+        self.slots = fx.logical_divide(
+            fx.rocdl.make_buffer_tensor(workspace, max_size=True),
+            fx.make_layout(1, 1),
+        )
+        self.flag_ptr = flag_ptr
         self.tid = tid
         self.ks_idx = ks_idx
-        self.m = m
-        self.n = n
-        self.block_m_offset = block_m_offset
-        self.block_n_offset = block_n_offset
-        self.out_dtype_ = out_dtype_
-        self.signal_idx = signal_idx
-        self.c_stride = c_stride
-        if const_expr(self.HAS_BIAS):
-            self.bias_vecs = fx.logical_divide(
-                self.bias_buf, fx.make_layout(self.STG_VEC_SIZE, 1)
-            )
+        self.tile_base = tile_idx * (self.SPLIT_K * self.TILE_ELEMS)
+        self.copy_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(self.SC1), fx.Float32
+        )
 
     @flyc.jit
-    def zero_c(self):
-        if self.ks_idx == 0:
-            zero_vec = fx.full(self.STG_VEC_SIZE, 0.0, self.out_dtype_)
-            for i in range_constexpr(self.STG_C_ITERS):
-                global_tid = self.BLOCK_THREADS * i + self.tid
-                m_local_idx = global_tid // self.STG_C_X_THREADS
-                n_local_idx = global_tid % self.STG_C_X_THREADS * self.STG_VEC_SIZE
-                global_m_idx = self.block_m_offset + m_local_idx
-                global_n_idx = self.block_n_offset + n_local_idx
-                safe_global_n_idx = (global_n_idx < self.n).select(global_n_idx, 0)
-                if const_expr(self.HAS_BIAS):
-                    init_vec = self.bias_vecs[
-                        None, safe_global_n_idx // self.STG_VEC_SIZE
-                    ].load()
-                    if const_expr(self.C_DTYPE_BYTES == 4):
-                        init_vec = init_vec.to(self.out_dtype_)
-                else:
-                    init_vec = zero_vec
-                if global_m_idx < self.m and global_n_idx < self.n:
-                    c_offset = global_m_idx * self.c_stride + global_n_idx
-                    if const_expr(self.C_DTYPE_BYTES == 4):
-                        store_global_f32_vec(
-                            self.c_ptr,
-                            c_offset,
-                            fx.as_ir_value(init_vec),
-                            self.STG_VEC_SIZE,
-                        )
-                    else:
-                        if const_expr(self.STG_VEC_SIZE == 4):
-                            store_asm = "global_store_dwordx2 $0, $1, off sc0 sc1"
-                        elif const_expr(self.STG_VEC_SIZE == 8):
-                            store_asm = "global_store_dwordx4 $0, $1, off sc0 sc1"
-                        else:
-                            raise NotImplementedError(
-                                f"STG_VEC_SIZE={self.STG_VEC_SIZE}"
-                            )
-                        c_ptr = get_llvm_ptr(
-                            self.c_ptr,
-                            c_offset,
-                            self.C_DTYPE_BYTES,
-                        )
-                        llvm.InlineAsmOp(
-                            None,
-                            [c_ptr, init_vec],
-                            store_asm,
-                            "v,v",
-                            has_side_effects=True,
-                        )
+    def take_ticket(self):
+        # Issued early so the round trip hides under the K loop; only thread 0
+        # holds the ticket.
+        ticket = fx.Int64(0)
+        if fx.thread_idx.x == 0:
+            ticket = fx.atomic_add(self.ticket_ptr, fx.Int64(1), syncscope="agent")
+        return ticket
 
     @flyc.jit
-    def take_ticket(self, split_k):
-        # One agent-scope RMW per workgroup, issued early so its latency hides under
-        # the K loop. The semaphore word of a tile only ever advances by split_k per
-        # launch (buffers are keyed by split_k and never reset), so ticket // split_k
-        # is the launch index; the owner tags the signal with it and the other splits
-        # wait for that tag. No end-of-kernel round trip, no reset. Only thread 0
-        # ever uses the tag (it publishes and it spins), so it stays in a register.
-        expected = fx.Int32(0)
-        if self.tid == 0:
-            ticket = fx.atomic_add(
-                _global_sync_ptr(self.semaphore_ptr, self.signal_idx, fx.Int64),
-                fx.Int64(1),
-                syncscope="agent",
-            )
-            expected = (ticket // split_k.to(fx.Int64) + 1).to(fx.Int32)
-        return expected
-
-    @flyc.jit
-    def publish(self, expected):
-        # Owner: the zero (or bias) stores have landed, publish the launch tag.
-        if self.ks_idx == 0:
-            rocdl.s_waitcnt(vmcnt=0)
-            gpu.barrier()
-            if self.tid == 0:
-                fx.generic_store(
-                    _global_sync_ptr(self.signal_ptr, self.signal_idx, fx.Int32),
-                    expected,
-                    memory_order=fx.AtomicOrdering.Monotonic,
-                    syncscope="agent",
-                )
-
-    @flyc.jit
-    def wait_until_initialized(self, expected):
-        if self.tid == 0:
-            # Spin on the agent-scoped monotonic signal until it carries this
-            # launch's tag. cur starts off the tag to force at least one load.
-            cur = expected + 1
-            while cur != expected:
-                cur = fx.generic_load(
-                    _global_sync_ptr(self.signal_ptr, self.signal_idx, fx.Int32),
-                    memory_order=fx.AtomicOrdering.Monotonic,
-                    syncscope="agent",
-                )
-        rocdl.sched_barrier(0)
+    def is_reducer(self, ticket):
+        # The flag sits in shared C, which aliases the A/B stages: wait for the
+        # K loop of every wave before writing it.
         gpu.barrier()
+        if fx.thread_idx.x == 0:
+            last = (ticket % self.SPLIT_K) == (self.SPLIT_K - 1)
+            fx.ptr_store(last.select(fx.Int32(1), fx.Int32(0)), self.flag_ptr)
+        gpu.barrier()
+        return fx.ptr_load(self.flag_ptr) != 0
+
+    def _slot(self, ks, group):
+        offset = self.tile_base + ks * self.TILE_ELEMS
+        return fx.slice(
+            self.slots, (None, offset + (group * self.THREADS + self.tid) * 4)
+        )
+
+    def store_partial(self, frags):
+        group = 0
+        for frag in frags:
+            for i in range_constexpr(fx.size(frag.shape).unpack() // 4):
+                vec = fx.make_rmem_tensor(4, fx.Float32)
+                vec.store(
+                    fx.Vector.from_elements(
+                        [frag[i * 4 + e] for e in range_constexpr(4)], fx.Float32
+                    )
+                )
+                fx.copy(self.copy_atom, vec, self._slot(self.ks_idx, group))
+                group += 1
+
+    @flyc.jit
+    def signal_done(self):
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+        if fx.thread_idx.x == 0:
+            fx.atomic_add(self.done_ptr, fx.Int64(1), syncscope="agent")
+
+    @flyc.jit
+    def wait_for_partials(self, ticket):
+        rocdl.s_waitcnt(vmcnt=0)  # this workgroup reads its own partial back too
+        if fx.thread_idx.x == 0:
+            target = (ticket // self.SPLIT_K + 1) * (self.SPLIT_K - 1)
+            done = target - 1
+            while done < target:
+                done = fx.generic_load(
+                    self.done_ptr,
+                    memory_order=fx.AtomicOrdering.Monotonic,
+                    syncscope="agent",
+                )
+        gpu.barrier()
+
+    def accumulate(self, frag, first_group, init_frag):
+        """Set ``frag`` to init + every split's partial, in split order;
+        ``init_frag`` writes the bias (or zero) into ``frag``."""
+        init_frag()
+        for ks in range_constexpr(self.SPLIT_K):
+            for i in range_constexpr(fx.size(frag.shape).unpack() // 4):
+                partial = fx.make_rmem_tensor(4, fx.Float32)
+                fx.copy(self.copy_atom, self._slot(ks, first_group + i), partial)
+                for e in range_constexpr(4):
+                    frag[i * 4 + e] = frag[i * 4 + e] + partial[e]
 
 
 def make_lds_layout(rows, block_k):
