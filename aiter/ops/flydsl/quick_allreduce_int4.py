@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from flydsl.expr.typing import Int32, Int64, Stream
+from flydsl.expr.typing import Float32, Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
@@ -59,6 +59,7 @@ from .kernels.comm.allreduce_shared import (
     select_rung,
 )
 from .kernels.comm.quick_allreduce_int4 import (
+    DEFAULT_DIVISOR,
     MESH_CODECS,
     SUPER_TILES,
     clamp_grid_cap,
@@ -77,6 +78,28 @@ from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")
 
+# The sum is restored in fp16 before the bf16 store, by scaling each group's
+# dequant scale (at least 2**-10) by the divisor; restored values reach
+# 480 * divisor. Both must stay normal fp16: 2**-10 * divisor >= 2**-14 and
+# 480 * divisor < 65504.
+DIVISOR_MIN = 2.0**-4
+DIVISOR_MAX = 128.0
+
+
+def _check_divisor(divisor: float) -> float:
+    """One shared positive divisor. ``1`` disables the scaling."""
+    msg = (
+        f"QuickAllReduceInt4 divisor must be a finite float in "
+        f"[{DIVISOR_MIN:g}, {DIVISOR_MAX:g}], got {divisor!r}"
+    )
+    try:
+        value = float(divisor)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(msg) from exc
+    if not math.isfinite(value) or not DIVISOR_MIN <= value <= DIVISOR_MAX:
+        raise ValueError(msg)
+    return value
+
 
 @dataclass(frozen=True)
 class _Algorithm:
@@ -93,6 +116,8 @@ class _Algorithm:
     # RMSNorm's residual, residual_out, weight, MXFP4 out and scale pointers.
     # Plain launches pass zeros.
     norm_ptr_args: int = 0
+    # Whether the kernel takes the shared ``divisor`` as its last argument.
+    has_divisor: bool = False
 
 
 def _build_mesh(
@@ -135,6 +160,7 @@ ALGORITHMS = {
         ag_codecs=MESH_CODECS,
         st_ladder=mesh_st_ladder,
         norm_ptr_args=NORM_PTR_ARGS,
+        has_divisor=True,
     ),
     "ring": _Algorithm(
         name="ring",
@@ -469,6 +495,7 @@ class QuickAllReduceInt4:
         live_bytes,
         num_tiles,
         norm_ptrs=None,
+        divisor: float = DEFAULT_DIVISOR,
     ):
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
@@ -484,6 +511,7 @@ class QuickAllReduceInt4:
             Int64(int(eng._colors)),
             *(Int64(p) for p in self._norm_ptrs(norm_ptrs)),
             Int32(self._grid_x(num_tiles, eng.super_tile, eng.grid)),
+            *((Float32(divisor),) if self._algo.has_divisor else ()),
             stream,
         )
 
@@ -503,6 +531,7 @@ class QuickAllReduceInt4:
         live_bytes: int,
         launch=None,
         norm_ptrs=None,
+        divisor: float = DEFAULT_DIVISOR,
     ) -> None:
         num_tiles = max(1, (live_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
         args = self._launch_args(
@@ -513,6 +542,7 @@ class QuickAllReduceInt4:
             live_bytes=live_bytes,
             num_tiles=num_tiles,
             norm_ptrs=norm_ptrs,
+            divisor=divisor,
         )
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
@@ -871,11 +901,30 @@ class QuickAllReduceInt4:
         """
         return int(nbytes) >= self.min_bytes
 
-    def allreduce(self, inp, out, stream=None):
+    def _check_divisor_supported(self, divisor: float) -> None:
+        """A divisor other than 1 needs the mesh schedule's INT4 wire format."""
+        if divisor != DEFAULT_DIVISOR and (
+            not self._algo.has_divisor or "int4" not in (self.rs_codec, self.ag_codec)
+        ):
+            raise ValueError(
+                "QuickAllReduceInt4 divisor is only supported by the mesh "
+                f"algorithm with the int4 codec, got algorithm={self.algorithm!r}, "
+                f"rs_codec={self.rs_codec!r}, ag_codec={self.ag_codec!r}"
+            )
+
+    def allreduce(self, inp, out, stream=None, divisor: float = DEFAULT_DIVISOR):
         """Two-shot INT4 all-reduce into ``out``.
 
         ``stream=None`` uses the current PyTorch stream on this device.
+        ``divisor`` defaults to 1, which keeps the previous INT4 result.
+        Loaded values are divided by it before the first pack, and the
+        finished sum is multiplied by it once. Every rank must pass the same
+        divisor; this is not checked, and a mismatch silently gives each rank
+        a different result. Only the mesh schedule with the INT4 codec takes
+        a divisor other than 1.
         """
+        divisor = _check_divisor(divisor)
+        self._check_divisor_supported(divisor)
         live_bytes = check_payload(
             inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
         )
@@ -889,4 +938,11 @@ class QuickAllReduceInt4:
                 "to override."
             )
         cfg, _num_tiles = self._pick_cfg(live_bytes)
-        self._launch_eng(self._by_cfg[cfg], inp, out, stream, live_bytes=live_bytes)
+        self._launch_eng(
+            self._by_cfg[cfg],
+            inp,
+            out,
+            stream,
+            live_bytes=live_bytes,
+            divisor=divisor,
+        )

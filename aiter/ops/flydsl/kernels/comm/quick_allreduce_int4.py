@@ -22,13 +22,26 @@ and how many flags it costs.
 A rank never round-trips through its own inbox: its reduce-scatter share is
 added from registers, and its reduced chunk is decoded from the same packet it
 sends. That needs the rank at trace time, which costs one binary per rank.
+
+``divisor`` defaults to ``DEFAULT_DIVISOR``. Loaded fp16 is divided by it
+before the first pack; the gathered sum is multiplied by it once, through
+the all-gather dequant scale, before the bf16 store. The second pack is
+left unchanged. Only a codec with a scale plane (INT4) uses it.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import Int32, Int64, ReductionOp, Stream, T, as_ir_value
+from flydsl.expr.typing import (
+    Float32,
+    Int32,
+    Int64,
+    ReductionOp,
+    Stream,
+    T,
+    as_ir_value,
+)
 
 from .. import buffer_ops
 from ..quant_utils import emit_mx_e8m0_scale
@@ -73,13 +86,18 @@ from .quick_allreduce_codec import (
     _f16x2,
     _i32,
     _scale_from_word,
+    _splat_f16x2,
     codecs_for_block,
     scale_slot_of,
     thread_lane,
 )
 
+# 1 keeps the undivided INT4 result; larger divisors are opt-in.
+DEFAULT_DIVISOR = 1.0
+
 # Re-exported for the host, which imports its tile math from this module.
 __all__ = [
+    "DEFAULT_DIVISOR",
     "DEFAULT_GRID_CAP",
     "MESH_CODECS",
     "SUPER_TILES",
@@ -345,6 +363,7 @@ def make_quick_allreduce_int4_kernel(
         mxfp4_ptr: Int64,
         mxfp4_scale_ptr: Int64,
         n_blocks: Int32,
+        divisor: Float32 = Float32(DEFAULT_DIVISOR),  # noqa: B008
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -387,7 +406,7 @@ def make_quick_allreduce_int4_kernel(
                 base = (j == fx.Int32(i)).select(peers[push_peers[i]], base)
             return base
 
-        _load_atom, _store_atom = _payload_io(
+        _load_atom_raw, _store_atom = _payload_io(
             inp_ptr,
             out_ptr,
             nbytes,
@@ -440,6 +459,29 @@ def make_quick_allreduce_int4_kernel(
 
         def _load_tile_atoms(tile):
             return [_load_atom(tile, atom) for atom in range_constexpr(ATOMS)]
+
+        # One shared divisor. Every read of the input is scaled, so the group
+        # max and E4M3 byte of the first pack see the scaled values, and so
+        # does our own share, which stays in registers or is reloaded. The
+        # second pack's input is already a scaled sum, so _codec_quant must
+        # not scale. A packed fp16 divide expands per element, so multiply by
+        # a reciprocal taken once.
+        inv_div_h = _splat_f16x2((fx.Float32(1.0) / divisor).to(fx.Float16))
+        div_h = _splat_f16x2(divisor.to(fx.Float16))
+
+        def _load_atom(tile, atom):
+            raw = _load_atom_raw(tile, atom)
+            if const_expr(not c.has_scale):
+                return raw
+            return fx.Vector.from_elements(
+                [_i32(_f16x2(raw[j]) * inv_div_h) for j in range_constexpr(4)],
+                fx.Int32,
+            )
+
+        def _ag_scale(scale):
+            """The all-gather dequant scale, with the divisor multiply folded in:
+            one packed multiply per packet instead of one per fp16 pair."""
+            return scale * div_h if const_expr(c.has_scale) else scale
 
         def _store_tile_atoms(tile, atoms):
             """Store a gathered tile; ``None`` marks atoms already stored."""
@@ -599,7 +641,7 @@ def make_quick_allreduce_int4_kernel(
                     if const_expr(atom // rank_atoms != self_rank):
                         words, scale = ars[i]
                         ar = (
-                            fx.Vector(_codec_dequant(c, words, scale, tid))
+                            fx.Vector(_codec_dequant(c, words, _ag_scale(scale), tid))
                             .bitcast(fx.Float16)
                             .to(fx.Float32)
                         )
@@ -720,9 +762,14 @@ def make_quick_allreduce_int4_kernel(
                     _lds_write_packet(
                         fx.Int32(j * rank_atoms + k), words, scale, is_leader
                     )
+                # The same scale arithmetic as a peer's decode of this packet,
+                # so every rank writes identical bits.
                 own.append(
                     _codec_dequant(
-                        c, words, _scale_from_word(c, scale, pair_in_slot), tid
+                        c,
+                        words,
+                        _ag_scale(_scale_from_word(c, scale, pair_in_slot)),
+                        tid,
                     )
                 )
             return own
@@ -889,6 +936,8 @@ def make_quick_allreduce_int4_kernel(
             """Dequantize every peer's all-gather packet back into full-tile atoms.
 
             Our own chunk is *own*, or ``None`` where it has been stored already.
+            Both are already multiplied back by the divisor, which is folded into
+            each packet's group scale.
             """
             gathered = []
             for src in range_constexpr(world_size):
@@ -899,7 +948,9 @@ def make_quick_allreduce_int4_kernel(
                         words, scale = _recv_quantized(
                             PHASE_ALL_GATHER, fx.Int32(src), sub, k
                         )
-                        gathered.append(_codec_dequant(c, words, scale, tid))
+                        gathered.append(
+                            _codec_dequant(c, words, _ag_scale(scale), tid)
+                        )
             return gathered
 
         # Stride by the *launched* grid, not the compile-time cap. The host
@@ -1022,6 +1073,7 @@ def make_quick_allreduce_int4_kernel(
         mxfp4_ptr: Int64,
         mxfp4_scale_ptr: Int64,
         grid_x: Int32,
+        divisor: Float32 = DEFAULT_DIVISOR,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         quick_allreduce_int4(
@@ -1038,6 +1090,7 @@ def make_quick_allreduce_int4_kernel(
             mxfp4_ptr,
             mxfp4_scale_ptr,
             grid_x,
+            divisor,
             value_attrs=value_attrs,
         ).launch(
             grid=(grid_x, 1, 1),

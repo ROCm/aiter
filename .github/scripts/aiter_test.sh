@@ -41,6 +41,7 @@ fi
 
 skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_mega_moe_tp.py"
     "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
@@ -168,6 +169,9 @@ for file in "${sharded_files[@]}"; do
             ;;
         op_tests/test_flydsl_pa_decode.py)
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
+            ;;
+        op_tests/test_f4gemm.py)
+            test_cmd=(timeout 60m python3 "$file" --mode func)
             ;;
         op_tests/test_gemm_a6w6.py)
             {

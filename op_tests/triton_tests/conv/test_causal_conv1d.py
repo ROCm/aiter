@@ -219,8 +219,8 @@ def test_causal_conv1d_update_with_batch_gather(
 
     x_ref = x.clone()
 
-    conv_state_indices = torch.randperm(total_entries)[:batch_size].to(
-        dtype=torch.int32, device=device
+    conv_state_indices = torch.randperm(total_entries, device=device)[:batch_size].to(
+        dtype=torch.int32
     )
     unused_states_bool = torch.ones(total_entries, dtype=torch.bool, device=device)
     unused_states_bool[conv_state_indices] = False
@@ -289,19 +289,29 @@ def test_causal_conv1d_varlen(
     padded_batch_size = batch_size + padding
     nsplits = padded_batch_size - 1
 
-    eos_pos = torch.randperm(seqlen - 1)[:nsplits].sort().values
+    eos_pos = torch.randperm(seqlen - 1, device=device)[:nsplits].sort().values
 
     seqlens.append(
         torch.diff(
-            torch.cat([torch.tensor([-1]), eos_pos, torch.tensor([seqlen - 1])])
+            torch.cat(
+                [
+                    torch.tensor([-1], device=device),
+                    eos_pos,
+                    torch.tensor([seqlen - 1], device=device),
+                ]
+            )
         ).tolist()
     )
     assert sum(seqlens[-1]) == seqlen
     assert all(s > 0 for s in seqlens[-1])
 
     total_entries = batch_size * 10
-    cumsum = torch.cumsum(torch.tensor(seqlens[0]), dim=0).to(torch.int32)
-    cumsum = torch.concat([torch.tensor([0], dtype=torch.int32), cumsum], dim=0)
+    cumsum = torch.cumsum(torch.tensor(seqlens[0], device=device), dim=0).to(
+        torch.int32
+    )
+    cumsum = torch.concat(
+        [torch.tensor([0], dtype=torch.int32, device=device), cumsum], dim=0
+    )
     x = rearrange(
         torch.randn(1, seqlen, 4096 + dim + 64, device=device, dtype=itype),
         "b s d -> b d s",
@@ -336,7 +346,7 @@ def test_causal_conv1d_varlen(
         weight,
         bias=bias,
         conv_states=final_states,
-        query_start_loc=cumsum.cuda(),
+        query_start_loc=cumsum,
         seq_lens_cpu=seqlens[0],
         cache_indices=padded_state_indices,
         has_initial_state=has_initial_states,

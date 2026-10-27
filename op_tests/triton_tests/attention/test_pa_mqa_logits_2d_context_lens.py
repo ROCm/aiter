@@ -84,9 +84,11 @@ def test_paged_mqa_logits_2d_context_lens(entry: str, monkeypatch) -> None:
     if preshuffle:
         kv = shuffle_weight(kv, layout=(16, 16))
     scales = 0.25 + torch.rand(
-        num_blocks, block_size, generator=generator, device=device
+        num_blocks, block_size, generator=generator, device=device, dtype=torch.float32
     )
-    weights = torch.randn(batch * next_n, heads, generator=generator, device=device)
+    weights = torch.randn(
+        batch * next_n, heads, generator=generator, device=device, dtype=torch.float32
+    )
     packed = torch.empty(
         num_blocks, block_size * (hidden_dim + 4), dtype=torch.uint8, device=device
     )
@@ -110,7 +112,10 @@ def test_paged_mqa_logits_2d_context_lens(entry: str, monkeypatch) -> None:
     def run(context_lens):
         if entry == "stage1":
             out = torch.full(
-                (heads, batch * next_n, max_model_len), float("-inf"), device=device
+                (heads, batch * next_n, max_model_len),
+                float("-inf"),
+                device=device,
+                dtype=torch.float32,
             )
             # ChunkQ is the head count here, not a tuning choice: the default
             # (64) is wider than the 32 heads of this shape.
@@ -134,7 +139,12 @@ def test_paged_mqa_logits_2d_context_lens(entry: str, monkeypatch) -> None:
             persistent = deepgemm_fp8_paged_mqa_logits_persistent_schedule(
                 batch, next_n, context_lens, max_model_len
             )
-        out = torch.full((batch * next_n, max_model_len), float("-inf"), device=device)
+        out = torch.full(
+            (batch * next_n, max_model_len),
+            float("-inf"),
+            device=device,
+            dtype=torch.float32,
+        )
         deepgemm_fp8_paged_mqa_logits(
             q,
             cache,

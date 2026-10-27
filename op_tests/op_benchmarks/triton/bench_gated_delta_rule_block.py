@@ -140,7 +140,7 @@ def _build_inputs(case, seed, with_state_pool=False):
         batch = 1
         num_states = len(context_lens)
         cu_seqlens = torch.tensor(
-            [0] + torch.tensor(context_lens).cumsum(0).tolist(),
+            [0] + torch.tensor(context_lens, device=device).cumsum(0).tolist(),
             dtype=torch.int32,
             device=device,
         )
@@ -154,14 +154,33 @@ def _build_inputs(case, seed, with_state_pool=False):
         metadata = None
 
     q = F.normalize(
-        torch.randn(batch, total_tokens, num_kv_heads, case.K, device=device), dim=-1
+        torch.randn(
+            batch,
+            total_tokens,
+            num_kv_heads,
+            case.K,
+            device=device,
+            dtype=torch.float32,
+        ),
+        dim=-1,
     ).to(case.dtype)
     k = F.normalize(
-        torch.randn(batch, total_tokens, num_kv_heads, case.K, device=device), dim=-1
+        torch.randn(
+            batch,
+            total_tokens,
+            num_kv_heads,
+            case.K,
+            device=device,
+            dtype=torch.float32,
+        ),
+        dim=-1,
     ).to(case.dtype)
-    v = (torch.randn(batch, total_tokens, num_heads, case.V, device=device) * 0.1).to(
-        case.dtype
-    )
+    v = (
+        torch.randn(
+            batch, total_tokens, num_heads, case.V, device=device, dtype=torch.float32
+        )
+        * 0.1
+    ).to(case.dtype)
     beta = torch.sigmoid(
         torch.randn(batch, total_tokens, num_heads, device=device, dtype=torch.float32)
     ).to(case.dtype)
@@ -180,7 +199,7 @@ def _build_inputs(case, seed, with_state_pool=False):
     initial_state = make_states(num_states)
     state_pool = make_states(2 * num_states) if with_state_pool else None
     state_indices = (
-        torch.randperm(2 * num_states).to(device=device, dtype=torch.int32)[:num_states]
+        torch.randperm(2 * num_states, device=device).to(dtype=torch.int32)[:num_states]
         if with_state_pool
         else None
     )
