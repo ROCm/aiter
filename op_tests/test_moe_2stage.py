@@ -154,10 +154,9 @@ def _profile_q256(call, kernel_name):
     ), f"Q256 expert kernel {kernel_name!r} did not execute: {names}"
     reductions = [name for name in names if name.startswith("moe_reduction_")]
     assert reductions, f"Q256 reduction did not execute: {names}"
-    expected_streaming = out.shape == (8192, 8192)
     assert all(
-        name.endswith("_nt") == expected_streaming for name in reductions
-    ), f"Q256 reduction cache policy mismatch: {reductions}, {expected_streaming=}"
+        name.endswith("_nt") for name in reductions
+    ), f"Q256 reduction must use streaming loads: {reductions}"
     return out
 
 
@@ -176,83 +175,66 @@ def _check_q256_integration(
     check_dispatch_regressions=True,
 ):
     """Check real dispatch, expert-kernel parity, and model call contracts."""
-    hidden, w1, _w2, _weights, ids = call_args
+    hidden, _w1, _w2, _weights, ids = call_args
     tokens, model = hidden.shape
     topk = ids.shape[1]
-    weighted = expected_kernel.endswith("_route_weighted") and tokens == 8192
-    actual_kernel = _Q256_KERNEL + ("_weighted" if weighted else "")
-    native = moe_op.fmoe_q256_fused_experts
+    actual_kernel = expected_kernel
+    native = aiter.fmoe_g1u1
     captured = []
 
     def fused_experts(*args, **kw):
-        assert not kw, "update this test if the fused expert entry point changes"
-        out, partials = args[:2]
-        assert out.shape == (tokens, model)
-        assert partials.shape == (tokens, topk, model)
+        partials = args[0]
+        assert partials.shape == (tokens, topk * model)
         assert partials.dtype == dtypes.bf16
-        job_map = args[13] if len(args) > 13 else None
-        assert (job_map is not None) == weighted, "wrong Q256 scheduling path"
+        assert partials.is_contiguous()
+        assert args[8] == topk and args[12] == actual_kernel
+        assert kw["fc2_smooth_scale"] is None
+        assert kw["activation"] == aiter.ActivationType.Silu
         if not captured:
-            captured.append(args)
-        return native(*args)
+            captured.append((args, kw))
+        return native(*args, **kw)
 
     def call():
         return fused_moe(*call_args, **kwargs)
 
-    with patch.object(moe_op, "fmoe_q256_fused_experts", fused_experts):
+    with patch.object(aiter, "fmoe_g1u1", fused_experts):
         out = _profile_q256(call, actual_kernel)
-    assert captured, "fused_moe did not call fmoe_q256_fused_experts"
+    assert captured, "fused_moe did not call fmoe_g1u1"
     nrms = _check_q256_reference(reference, out, "Q256 torch reference")
 
-    # Compare weighted scheduling against the ordinary compact kernel, then
-    # reduce with torch independently of the production FlyDSL reducer.
-    args = captured[0]
-    if weighted and shared_expert_id is not None:
-        # Inspect actual eager sorting/planner outputs on the host, never inside
-        # the producer hook (which is also used during graph capture).
-        assert shared_expert_id == 512, "Q256 weighted scheduling requires expert 512"
+    # Inspect the real sorted routes outside the hook used during graph capture.
+    args, _ = captured[0]
+    if shared_expert_id is not None:
         assert bool((ids[:, -1] == shared_expert_id).all())
         assert bool((ids[:, :-1] != shared_expert_id).all())
-        counts = args[8].cpu().tolist()
-        assert counts[1] == tokens == 8192
-        assert counts[0] % 256 == 0
-        physical_tiles = counts[0] // 256
-        assert physical_tiles <= args[7].numel()
-        boundary = physical_tiles - 32
-        jobs = boundary + 64
-        assert boundary >= 1 and jobs <= 1024, "Q256 shared geometry does not qualify"
-        experts = args[7][:physical_tiles].cpu()
-        assert bool(
-            (experts[boundary:] == 512).all()
-        ), "Q256 shared suffix is not 32 tiles"
-        assert (
-            experts[boundary - 1].item() != 512
-        ), "Q256 shared suffix exceeds 32 tiles"
-        job_map = args[13].cpu()
-        identity = torch.arange(job_map.numel(), dtype=job_map.dtype, device="cpu")
-        identity[identity >= jobs] = -1
-        assert not torch.equal(job_map, identity), "Q256 weighted job map is identity"
-    elif weighted:
-        physical_tiles = int(args[8][0].item()) // 256
-        job_map = args[13].cpu()
-        identity = torch.arange(job_map.numel(), dtype=job_map.dtype, device="cpu")
-        identity[identity >= physical_tiles] = -1
-        assert torch.equal(
-            job_map, identity
-        ), "random routes must use identity scheduling"
-    partials = args[1]
-    compact_partials = torch.empty_like(partials)
-    baseline_args = list(args[:13])
-    baseline_args[0] = torch.empty_like(out)
-    baseline_args[1] = compact_partials
-    native(*baseline_args)
-    assert torch.equal(partials, compact_partials), "weighted/compact expert mismatch"
-    expert_sum = compact_partials.float().sum(1)
+    counts = args[7].cpu().tolist()
+    assert counts[1] == tokens and counts[0] % 256 == 0
+    assert counts[0] // 256 <= args[6].numel()
+    packed_ids = args[4][: counts[0]].long()
+    token_ids = packed_ids & 0xFFFFFF
+    slots = packed_ids >> 24
+    valid = token_ids < tokens
+    assert bool(((slots[valid] >= 0) & (slots[valid] < topk)).all())
+    route_ids = token_ids[valid] * topk + slots[valid]
+    assert torch.equal(
+        route_ids.sort().values, torch.arange(tokens * topk, device=ids.device)
+    ), "Q256 sorting must cover each token/topk slot exactly once"
+    experts = args[6][: counts[0] // 256].repeat_interleave(256)
+    assert torch.equal(
+        experts[valid].long(), ids[token_ids[valid], slots[valid]].long()
+    ), "Q256 sorted expert does not match the route"
+    assert torch.equal(
+        args[5][: counts[0]][valid], _weights[token_ids[valid], slots[valid]]
+    ), "Q256 sorted routing weight mismatch"
+
+    # Reduce the actual producer partials independently of FlyDSL.
+    partials = args[0].view(tokens, topk, model)
+    expert_sum = partials.float().sum(1)
     assert torch.equal(expert_sum.to(out.dtype), out), "Q256 compact expert reduction"
-    del compact_partials, expert_sum, baseline_args
+    del expert_sum
 
     output = torch.full_like(out, float("nan"))
-    with patch.object(moe_op, "fmoe_q256_fused_experts", fused_experts):
+    with patch.object(aiter, "fmoe_g1u1", fused_experts):
         returned = fused_moe(*call_args, output=output, block_size_M=256, **kwargs)
         assert returned is output, "Q256 did not return the caller's output buffer"
         assert torch.equal(output, out), "Q256 output buffer was not overwritten"
@@ -271,16 +253,6 @@ def _check_q256_integration(
         _check_q256_dynamic_routes(
             call_args, kwargs, a1_qt, a1_scale, w1_qt, w2_qt, w1_scale, w2_scale
         )
-        for index, bad in (
-            (1, torch.empty((tokens, topk - 1, model), dtype=dtypes.bf16)),
-            (2, torch.empty((tokens, model // 2), dtype=dtypes.fp32)),
-            (3, torch.empty((w1.shape[0], 256, model // 2), dtype=w1.dtype)),
-            (12, 128),
-        ):
-            invalid = list(args[:13])
-            invalid[index] = bad
-            with pytest.raises((RuntimeError, ValueError), match="Q256"):
-                native(*invalid)
         for invalid_kwargs in (
             {"output": torch.empty((tokens, model + 1), dtype=dtypes.bf16)},
             {"output": torch.empty((tokens, model), dtype=dtypes.fp32)},
@@ -288,8 +260,8 @@ def _check_q256_integration(
         ):
             with (
                 patch.object(
-                    moe_op,
-                    "fmoe_q256_fused_experts",
+                    aiter,
+                    "fmoe_g1u1",
                     side_effect=AssertionError("invalid config reached fused experts"),
                 ),
                 pytest.raises((RuntimeError, ValueError), match=r"(?s).+"),
@@ -475,10 +447,10 @@ def _check_q256_dynamic_routes(
         returned = call()
     assert returned is output
     boundaries = []
-    native = moe_op.fmoe_q256_fused_experts
+    native = aiter.fmoe_g1u1
 
     def observe(*args, **kw):
-        boundaries.append(int(args[8][0].item()) // 256 - 32)
+        boundaries.append(int(args[7][0].item()) // 256)
         return native(*args, **kw)
 
     for active, shared, zero in (
@@ -504,12 +476,12 @@ def _check_q256_dynamic_routes(
         )
         if zero:
             assert torch.count_nonzero(output).item() == 0
-        with patch.object(moe_op, "fmoe_q256_fused_experts", observe):
+        with patch.object(aiter, "fmoe_g1u1", observe):
             eager = call().clone()
         _check_q256_reference(expected, eager, "Q256 changed routes eager")
     assert (
         boundaries[0] != boundaries[1]
-    ), "route changes did not shift the shared expert boundary"
+    ), "route changes did not change the sorted tile count"
 
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
@@ -1930,13 +1902,12 @@ def _q256_case(token, model_dim, shared_expert_id=512):
         "use_g1u1": True,
         "check_aot_cache": False,
         "disable_stage2_bias": True,
-        "expected_kernel": _Q256_KERNEL
-        + ("_weighted" if (token, model_dim) == (8192, 8192) else ""),
+        "expected_kernel": _Q256_KERNEL,
     }
 
 
 def test_q256_prefill():
-    """Six shared-route shapes, random control, and scheduling boundaries on gfx950."""
+    """Six shared-route shapes, random control, and token boundaries on gfx950."""
     if get_gfx() != "gfx950":
         aiter.logger.info("skip Q256 prefill on %s", get_gfx())
         return
@@ -1963,7 +1934,7 @@ def test_q256_prefill():
 
 
 def test_q256_random_routes():
-    """Exercise weighted scheduling's identity fallback without a shared suffix."""
+    """Exercise the tuned producer without a shared expert suffix."""
     if get_gfx() != "gfx950":
         return
     with _with_default_device("cpu"):
@@ -2001,11 +1972,11 @@ def _q256_metadata(**overrides):
 
 
 def test_q256_token_boundaries():
-    """Keep the weighted tuned selector while varying the *actual* token count.
+    """Keep the compact tuned selector while varying the *actual* token count.
 
     Explicitly bind the existing 8K metadata so untuned boundary shapes cannot
-    pass by silently selecting a different backend. Production scheduling must
-    choose the ordinary producer at every token count other than exactly 8192.
+    pass by silently selecting a different backend. The standard launcher must
+    retain that selector at each token count without a host-side planner.
     """
     if get_gfx() != "gfx950":
         aiter.logger.info("skip Q256 boundaries on %s", get_gfx())
@@ -2039,13 +2010,13 @@ def test_q256_token_boundaries():
         assert not moe_op.is_q256_kernel(fallback.stage1.keywords.get("kernelName", ""))
     stage1 = functools.partial(
         metadata.stage1.func,
-        **{**metadata.stage1.keywords, "kernelName": _Q256_KERNEL + "_weighted"},
+        **{**metadata.stage1.keywords, "kernelName": _Q256_KERNEL},
     )
     forced = dataclasses.replace(metadata, stage1=stage1)
     rows = []
     for token in (4096, 4097, 8191, 8192, 8193):
         case = _q256_case(token, 8192)
-        case["expected_kernel"] = _Q256_KERNEL + "_weighted"
+        case["expected_kernel"] = _Q256_KERNEL
         # Public-dispatch regressions run with the prepared inputs in the normal
         # sweep; this boundary sweep deliberately binds patched metadata.
         case["q256_dispatch_regressions"] = False
