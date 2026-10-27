@@ -149,6 +149,8 @@ def _torch_moe_ref(
     swiglu_limit: float,
     situ_beta: float,
     situ_linear_beta: float,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
 ) -> torch.Tensor:
     """Two-stage MoE reference reusing ``aiter.fused_moe.torch_moe_stage{1,2}``."""
     if data_format not in ("a4w4", "a8w4"):
@@ -230,6 +232,8 @@ def _torch_moe_ref(
         a2_scale=a2_scale,
         w2_bias=w2_bias,
         doweight=True,
+        post_gemm2_rms_weight=post_gemm2_rms_weight,
+        post_gemm2_rms_eps=post_gemm2_rms_eps,
     )
     return out
 
@@ -365,6 +369,8 @@ def _run_grouped_via_fused_moe(
     iters: int = 101,
     data_init: str = "uniform",
     scale_init: str = "auto",
+    post_gemm2_rmsnorm: bool = False,
+    post_gemm2_rms_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -438,6 +444,11 @@ def _run_grouped_via_fused_moe(
     # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
     topk_id, topk_w = _make_topk(hidden, experts, topk)
     topk_w = topk_w.to(torch.bfloat16)
+    post_gemm2_rms_weight = (
+        torch.linspace(0.5, 1.5, model_dim, dtype=torch.bfloat16)
+        if post_gemm2_rmsnorm
+        else None
+    )
 
     # ---- prep grouped GEMM inputs ----
     # Stage1 weight/scale/bias are rearranged to the physical GUGU layout;
@@ -491,6 +502,8 @@ def _run_grouped_via_fused_moe(
             swiglu_limit=swiglu_limit,
             beta=situ_beta,
             linear_beta=situ_linear_beta,
+            post_gemm2_rms_weight=post_gemm2_rms_weight,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
         )
 
     torch.cuda.synchronize()
@@ -548,6 +561,8 @@ def _run_grouped_via_fused_moe(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        post_gemm2_rms_weight=post_gemm2_rms_weight,
+        post_gemm2_rms_eps=post_gemm2_rms_eps,
     ).to(out.dtype)
     return out, ref, us, kernel_us
 
@@ -655,6 +670,8 @@ def run_moe(
     data_init: str = "uniform",
     scale_init: str = "auto",
     check_aot_cache: bool = True,
+    post_gemm2_rmsnorm: bool = False,
+    post_gemm2_rms_eps: float = 1e-6,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
     validated path: bench checks (and times) the CUDA-graph production path;
@@ -694,6 +711,8 @@ def run_moe(
             iters=iters,
             data_init=data_init,
             scale_init=scale_init,
+            post_gemm2_rmsnorm=post_gemm2_rmsnorm,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
         )
     mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
     ld = _logits_diff(out, ref)
@@ -784,6 +803,16 @@ def test_grouped_a4w4_silu_matches_torch_ref():
         activation=ActivationType.Silu,
         model_dim=512,
         inter_dim=512,
+    )
+
+
+def test_grouped_a4w4_post_gemm2_rmsnorm_matches_torch_ref():
+    run_moe(
+        "a4w4",
+        activation=ActivationType.Silu,
+        model_dim=512,
+        inter_dim=512,
+        post_gemm2_rmsnorm=True,
     )
 
 

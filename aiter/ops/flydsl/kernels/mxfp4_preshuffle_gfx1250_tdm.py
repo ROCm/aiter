@@ -162,6 +162,7 @@ def launch_gemm_a8w4_tdm(
     ep_destination_stride: Constexpr[int] = 0,
     ep_world_size: Constexpr[int] = 0,
     ep_quant_bits: Constexpr[int] = 0,
+    post_gemm2_rmsnorm: Constexpr[int] = 0,
     arg_ep_row_map: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
@@ -279,6 +280,7 @@ def launch_gemm_a8w4_tdm(
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
         ep_quant_bits,
+        post_gemm2_rmsnorm,
         persistent_workers,
         rolled_drain,
     )
@@ -293,6 +295,11 @@ def launch_gemm_a8w4_tdm(
     if ep_quant_bits:
         if not enable_ep_scatter:
             raise ValueError("ep_quant_bits requires enable_ep_scatter")
+        if post_gemm2_rmsnorm:
+            raise ValueError(
+                "deferred route weighting is initially supported only on the "
+                "unquantized BF16 combine"
+            )
         # A tile row must hold whole scale blocks, else its slice of the scale
         # plane is not a whole number of bytes. 256 rather than EP_SCALE_BLOCK so
         # each plane's slice also starts on a cache line: on the fp4 wire the
@@ -1950,7 +1957,11 @@ def launch_gemm_a8w4_tdm(
                     _scale_lds = fx.recast_iter(_p8_scale, base_ptr)
                     for wm in range_constexpr(wmma_m_rep):
                         row_rel = wmb + wm * 16 + lane16
-                        _wf = _wf_rows[wm]
+                        _wf = (
+                            fx.Float32(1.0) # scattered output is unweighted
+                            if post_gemm2_rmsnorm
+                            else _wf_rows[wm]
+                        )
                         _row_byte = row_rel * _lds_row_bytes
                         _e8m0_blks = []
                         for mx_blk in range_constexpr(_n_mx_blks):
@@ -1959,8 +1970,10 @@ def launch_gemm_a8w4_tdm(
                                 wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
                                 col_rel = wnb + wn * 16 + kgrp * 8
                                 acc = _biased_acc(wm, wn, col_rel)
-                                # Weight before quantizing: combine sums
-                                # unweighted. It cannot ride the cvt scale
+                                # Normally weight before quantizing because combine
+                                # sums are unweighted. The post-GEMM2 RMSNorm variant
+                                # defers this multiply to its combine.
+                                # The weight cannot ride the cvt scale
                                 # operand instead -- v_cvt_scalef32 takes only
                                 # the exponent of that f32, so a weight that is
                                 # not a power of two would be rounded to one.
@@ -2072,9 +2085,15 @@ def launch_gemm_a8w4_tdm(
                                 )
                             else:
                                 if const_expr(enable_ep_scatter):
-                                    # Weight the row BEFORE truncating to bf16; the
-                                    # combine kernel does an unweighted sum.
-                                    _wf = _wf_rows[wm]
+                                    # Normally weight before truncating to bf16.
+                                    # Post-GEMM2 RMSNorm instead scatters the
+                                    # unweighted row and applies the weight after
+                                    # normalization in combine.
+                                    _wf = (
+                                        fx.Float32(1.0)
+                                        if post_gemm2_rmsnorm
+                                        else _wf_rows[wm]
+                                    )
                                     hv = Vec.from_elements(
                                         [acc[i] * _wf for i in range_constexpr(8)],
                                         fx.Float32,

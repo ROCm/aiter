@@ -1126,6 +1126,8 @@ def fused_moe(
     quant_dtype_a2: torch.dtype | None = None,
     # False explicitly selects unclamped shared-expert SiLU semantics.
     clamp_shared: bool = True,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1140,6 +1142,9 @@ def fused_moe(
     cache identities, so deployments changing this setting must rebuild their
     FlyDSL AOT cache.
 
+    ``post_gemm2_rms_weight`` enables GEMM2 -> per-route RMSNorm ->
+    route-weighted reduction on the gfx1250 grouped and MegaMoE paths.
+
     """
     has_shared_expert = (
         any(
@@ -1153,6 +1158,8 @@ def fused_moe(
     if has_shared_expert:
         routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
         unsupported = []
+        if post_gemm2_rms_weight is not None:
+            unsupported.append("post_gemm2_rms_weight")
         if stage2_scatter is not None:
             unsupported.append("stage2_scatter")
         if quant_type_a is not None:
@@ -1268,6 +1275,8 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        post_gemm2_rms_weight=post_gemm2_rms_weight,
+        post_gemm2_rms_eps=post_gemm2_rms_eps,
     )
 
 
@@ -1310,6 +1319,8 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1318,7 +1329,7 @@ def fused_moe_fake(
     if ep_source_token_map is not None and output is not None:
         raise RuntimeError(
             "output= is incompatible with stage2_scatter: GEMM2 P2P-writes the "
-            "route-weighted results into the peers' combine buffers and returns an "
+            "route results into the peers' combine buffers and returns an "
             "uninitialized placeholder"
         )
     # Unconditional: the runtime returns `output` on every path, and which kernel
@@ -1371,6 +1382,8 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1414,6 +1427,8 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        post_gemm2_rms_weight=post_gemm2_rms_weight,
+        post_gemm2_rms_eps=post_gemm2_rms_eps,
     )
 
 
@@ -1448,6 +1463,8 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1493,10 +1510,37 @@ def _fused_moe_impl(
         dtypes.fp16,
         dtypes.bf16,
     ], f"Fused_moe unsupported out dtype: {dtype}"
+    if post_gemm2_rms_weight is not None:
+        # route weights cannot be applied in stage1 or during scatter before normalization
+        # if enabled
+        if doweight_stage1:
+            raise ValueError(
+                "post-GEMM2 RMSNorm requires doweight_stage1=False so route "
+                "weights remain after the normalization"
+            )
+        if post_gemm2_rms_eps <= 0:
+            raise ValueError("post_gemm2_rms_eps must be positive")
+        if (
+            post_gemm2_rms_weight.ndim != 1
+            or post_gemm2_rms_weight.numel() != model_dim
+        ):
+            raise ValueError(
+                "post_gemm2_rms_weight must have shape "
+                f"({model_dim},), got {tuple(post_gemm2_rms_weight.shape)}"
+            )
+        if post_gemm2_rms_weight.dtype != dtype:
+            raise TypeError(
+                "post_gemm2_rms_weight must match the MoE output dtype "
+                f"{dtype}, got {post_gemm2_rms_weight.dtype}"
+            )
+        if post_gemm2_rms_weight.device != hidden_states.device:
+            raise ValueError("post_gemm2_rms_weight must be on the input device")
+        if not post_gemm2_rms_weight.is_contiguous():
+            raise ValueError("post_gemm2_rms_weight must be contiguous")
     if stage2_scatter is not None and output is not None:
         raise RuntimeError(
             "output= is incompatible with stage2_scatter: GEMM2 P2P-writes the "
-            "route-weighted results into the peers' combine buffers and returns an "
+            "route results into the peers' combine buffers and returns an "
             "uninitialized placeholder"
         )
     _validate_output_buffer_metadata(
@@ -1559,10 +1603,17 @@ def _fused_moe_impl(
             situ_beta=1.0 if beta is None else float(beta),
             situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             stage2_scatter=stage2_scatter,
+            post_gemm2_rms_weight=post_gemm2_rms_weight,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
         )
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    if post_gemm2_rms_weight is not None:
+        raise NotImplementedError(
+            "post-GEMM2 RMSNorm is currently drafted only for the gfx1250 "
+            "grouped FlyDSL MoE path"
+        )
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
@@ -5376,6 +5427,8 @@ def torch_moe_stage2(
     a2_scale=None,  # [expert]]'
     w2_bias=None,
     doweight=True,
+    post_gemm2_rms_weight=None,
+    post_gemm2_rms_eps=1e-6,
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -5484,6 +5537,11 @@ def torch_moe_stage2(
             out[mask] = act_input
             if w2_bias is not None:
                 out[mask] = out[mask] + w2_bias[E_id].view(1, -1)
+    if post_gemm2_rms_weight is not None:
+        out = out * torch.rsqrt(
+            out.square().mean(dim=-1, keepdim=True) + float(post_gemm2_rms_eps)
+        )
+        out = out * post_gemm2_rms_weight.view(1, 1, model_dim).to(ctype)
     if doweight:
         # In-place: out and topk_weights are both fp32 (ctype), so this is
         # numerically identical to `out = out * ...` but avoids allocating a

@@ -548,7 +548,10 @@ class Routing:
 
 
 class MegaMoEGfx1250:
-    """A8W4 EP MoE with GEMM2 P2P scatter fused into combine."""
+    """A8W4 EP MoE with GEMM2 P2P scatter fused into combine.
+
+        Optional RMSNorm added to each slot.
+    """
 
     def __init__(
         self,
@@ -573,6 +576,7 @@ class MegaMoEGfx1250:
         dispatch_wire: str | None = None,
         stage1_fused: bool = False,
         combine_quant: str | None = None,
+        post_gemm2_rmsnorm: bool = False,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -645,6 +649,17 @@ class MegaMoEGfx1250:
         self.swiglu_limit = float(swiglu_limit)
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.post_gemm2_rmsnorm = bool(post_gemm2_rmsnorm)
+        combine_quant_value = (
+            combine_quant
+            if combine_quant is not None
+            else os.environ.get("MEGA_COMBINE_QUANT", "none")
+        )
+        if self.post_gemm2_rmsnorm and combine_quant_value != "none":
+            raise ValueError(
+                "the post-GEMM2 RMSNorm draft initially supports only the "
+                "unquantized BF16 combine"
+            )
 
         device = torch.device("cuda", torch.cuda.current_device())
         self.expert_mask = torch.zeros(self.experts, dtype=torch.int32, device=device)
@@ -670,11 +685,7 @@ class MegaMoEGfx1250:
                     else read_dispatch_wire_env()
                 ),
                 stage1_fused=bool(stage1_fused),
-                combine_quant=(
-                    combine_quant
-                    if combine_quant is not None
-                    else os.environ.get("MEGA_COMBINE_QUANT", "none")
-                ),
+                combine_quant=combine_quant_value,
             ),
             communicator,
         )
@@ -697,6 +708,8 @@ class MegaMoEGfx1250:
         next_topk_ids: torch.Tensor | None = None,
         next_recv_token_bound: int | None = None,
         combine_quant: str | None = None,
+        post_gemm2_rms_weight: torch.Tensor | None = None,
+        post_gemm2_rms_eps: float = 1e-6,
     ) -> torch.Tensor:
         """Run one MoE layer: dispatch, its expert GEMM, then the fused combine.
 
@@ -718,8 +731,45 @@ class MegaMoEGfx1250:
         enough tokens on the wire to pay for it and leave the rest on bf16.
         Omitting it means bf16 -- naming a format at construction only builds
         it, each step still has to ask for it.
+
+        When ``post_gemm2_rmsnorm`` is enabled,
+        ``post_gemm2_rms_weight`` contains the shared ``[model_dim]`` for
+        this layer. RMSNorm is applied to every route before ``topk_weights``.
         """
         combine_quant_bits = self._resolve_combine_quant(combine_quant)
+        if self.post_gemm2_rmsnorm:
+            if post_gemm2_rms_weight is None:
+                raise ValueError(
+                    "post_gemm2_rms_weight is required when MegaMoE was "
+                    "constructed with post_gemm2_rmsnorm=True"
+                )
+            if (
+                post_gemm2_rms_weight.ndim != 1
+                or post_gemm2_rms_weight.numel() != self.model_dim
+            ):
+                raise ValueError(
+                    "post_gemm2_rms_weight must have shape "
+                    f"({self.model_dim},), got "
+                    f"{tuple(post_gemm2_rms_weight.shape)}"
+                )
+            if (
+                post_gemm2_rms_weight.dtype != torch.bfloat16
+                or not post_gemm2_rms_weight.is_contiguous()
+            ):
+                raise ValueError(
+                    "post_gemm2_rms_weight must be contiguous bfloat16"
+                )
+            if post_gemm2_rms_weight.device != hidden_states.device:
+                raise ValueError(
+                    "post_gemm2_rms_weight must be on the input device"
+                )
+            if post_gemm2_rms_eps <= 0:
+                raise ValueError("post_gemm2_rms_eps must be positive")
+        elif post_gemm2_rms_weight is not None:
+            raise ValueError(
+                "post_gemm2_rms_weight requires constructing MegaMoE with "
+                "post_gemm2_rmsnorm=True"
+            )
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
         if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
@@ -855,11 +905,19 @@ class MegaMoEGfx1250:
                 num_local_tokens=None if self._compact_plan else total_recv,
                 swiglu_limit=self.swiglu_limit,
                 stage2_scatter=scatter,
+                post_gemm2_rms_weight=post_gemm2_rms_weight,
+                post_gemm2_rms_eps=post_gemm2_rms_eps,
                 **extra,
             )
         finally:
             set_flydsl_dispatch_context(None)
-        return self._combine(routing, combine_quant_bits)
+        return self._combine(
+            routing,
+            combine_quant_bits,
+            topk_weights=topk_weights,
+            post_gemm2_rms_weight=post_gemm2_rms_weight,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
+        )
 
     def _resolve_combine_quant(self, combine_quant: str | None) -> int:
         """This step's combine payload width, checked against what was built.
@@ -1271,6 +1329,18 @@ class MegaMoEGfx1250:
             dtype=torch.int16,
             device=device,
         )
+        self._rms_slots = (
+            torch.empty(
+                (
+                    config.max_tokens_per_rank * config.topk,
+                    config.hidden_dim,
+                ),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            if self.post_gemm2_rmsnorm
+            else None
+        )
 
         if config.dispatch_backend == "mori":
             # mori's geometry is a compile-time Cfg field, so it brings its own
@@ -1320,10 +1390,15 @@ class MegaMoEGfx1250:
                 hidden_dim=config.hidden_dim,
                 block_num=512,
                 warp_num_per_block=_lanes // _WAVE_SIZE,
-                slot_stride_nbytes=config.combine_slot_stride_for(_bits),
+                slot_stride_nbytes=(
+                    config.hidden_dim * 2
+                    if self.post_gemm2_rmsnorm
+                    else config.combine_slot_stride_for(_bits)
+                ),
                 quant_bits=_bits,
                 tokens_per_block=_toks,
                 chunks_per_iter=_chunks,
+                apply_route_weight=self.post_gemm2_rmsnorm,
             )
         self._combine_sync = _make_combine_fused_sync(
             rank=config.rank,
@@ -1770,8 +1845,16 @@ class MegaMoEGfx1250:
             combine_quant_bits=combine_quant_bits,
         )
 
-    def _combine(self, routing: Routing, combine_quant_bits: int = 0) -> torch.Tensor:
-        """Reduce the staged slots into this rank's tokens.
+    def _combine(
+        self,
+        routing: Routing,
+        combine_quant_bits: int = 0,
+        *,
+        topk_weights: torch.Tensor,
+        post_gemm2_rms_weight: torch.Tensor | None,
+        post_gemm2_rms_eps: float,
+    ) -> torch.Tensor:
+        """Maybe normalize, then gather slots into outputted final matrix.
 
         ``combine_quant_bits`` must match what the gemm2 epilogue packed the
         slots as; it defaults to bf16, the wire a caller gets unless it asked
@@ -1786,9 +1869,39 @@ class MegaMoEGfx1250:
             self._config.rank,
             stream,
         )
+        combine_input = self._arena.local_ptr("comb_inp")
+        route_weights = 0
+        if self.post_gemm2_rmsnorm:
+            from aiter.ops.rmsnorm import rms_norm_opus
+
+            rows = routing.token_count * self._config.topk
+            normalized = self._rms_slots[:rows]
+            slot_capacity = (
+                self._config.max_tokens_per_rank * self._config.topk
+            )
+            slot_stride = self._config.combine_slot_stride_for(0) // 2
+            slot_storage = _from_gpu_ptr(
+                self._arena.local_ptr("comb_inp"),
+                (slot_capacity * slot_stride,),
+                torch.bfloat16,
+            )
+            strided_slots = torch.as_strided(
+                slot_storage,
+                (slot_capacity, self._config.hidden_dim),
+                (slot_stride, 1),
+            )
+            rms_norm_opus(
+                normalized,
+                strided_slots[:rows],
+                post_gemm2_rms_weight,
+                float(post_gemm2_rms_eps),
+            )
+            combine_input = normalized.data_ptr()
+            route_weights = topk_weights.data_ptr()
         self._combine_variants[combine_quant_bits](
-            self._arena.local_ptr("comb_inp"),
+            combine_input,
             self._combine_output.data_ptr(),
+            route_weights,
             routing.token_count,
             stream,
         )

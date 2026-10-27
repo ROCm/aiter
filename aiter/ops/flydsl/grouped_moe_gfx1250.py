@@ -602,6 +602,8 @@ def _grouped_a8w4_tdm_moe(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     a1_scale=None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
 ):
     import functools
 
@@ -863,6 +865,7 @@ def _grouped_a8w4_tdm_moe(
                 int(stage2_scatter.max_tokens_per_rank) * int(topk)
             ),
             "ep_row_map": ep_rowmap,
+            "post_gemm2_rmsnorm": post_gemm2_rms_weight is not None,
         }
         if enable_ep_scatter
         else {}
@@ -1347,10 +1350,22 @@ def _grouped_a8w4_tdm_moe(
         )
 
     if enable_ep_scatter:
-        # GEMM2 already P2P-wrote every route-weighted result into the peers'
-        # combine buffers, so this only satisfies the custom-op's return contract;
+        # GEMM2 already P2P-wrote every route result into the peers' combine
+        # buffers, so this only satisfies the custom-op's return contract; 
         # MegaMoE ignores its contents and consumes comb_inp instead.
         return torch.empty((token_num, model_dim), dtype=dtype, device=device)
+
+    norm_out = grouped_out
+    if post_gemm2_rms_weight is not None:
+        from aiter.ops.rmsnorm import rms_norm_opus
+
+        norm_out = torch.empty_like(grouped_out)
+        rms_norm_opus(
+            norm_out.view(-1, model_dim),
+            grouped_out.view(-1, model_dim),
+            post_gemm2_rms_weight,
+            float(post_gemm2_rms_eps),
+        )
 
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     if _is_ep:
@@ -1366,7 +1381,7 @@ def _grouped_a8w4_tdm_moe(
             else topk_weight.contiguous()
         )
     flydsl_moe_gather_reduce(
-        grouped_out,
+        norm_out,
         topids_to_rows,
         gather_w,
         out=moe_out,
@@ -1405,6 +1420,8 @@ def grouped_gemm_gfx1250_a8w4(
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
     a1_scale: torch.Tensor | None = None,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1713,6 +1730,8 @@ def grouped_gemm_gfx1250_a8w4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             a1_scale=a1_scale,
+            post_gemm2_rms_weight=post_gemm2_rms_weight,
+            post_gemm2_rms_eps=post_gemm2_rms_eps,
             **_tdm_kw,
         )
 
