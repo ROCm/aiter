@@ -205,7 +205,7 @@ class PaDecodeSchedule:
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
         TUNED_BF16_SWA = (
             is_bf16_kv
-            and is_gfx950
+            and arch in BF16_KV_SUPPORTED_ARCHS
             and not asymmetric_value
             and head_dim == 128
             and query_length == 8
@@ -270,6 +270,8 @@ class PaDecodeSchedule:
                 ):
                     query_splits += 1
             elif TUNED_BF16_SWA:
+                # Share the CDNA policy: the device CU count scales its
+                # parallelism thresholds on both gfx942 and gfx950.
                 # Estimate the planned KV work, including multiple tiles per
                 # task when the partition cap or work budget is small.
                 kv_tiles = window_tiles
@@ -299,6 +301,15 @@ class PaDecodeSchedule:
                     query_splits < query_length
                     and query_splits * active_tasks < num_compute_units
                 ):
+                    # On gfx942, duplicating KV work loses to a near-full
+                    # unsplit grid. Allow a quarter of the CUs to be idle
+                    # before promoting one split solely to fill the device.
+                    if (
+                        arch == "gfx942"
+                        and query_splits == 1
+                        and 4 * active_tasks >= 3 * num_compute_units
+                    ):
+                        break
                     query_splits *= 2
             elif (
                 TUNED_PER_TOKEN
