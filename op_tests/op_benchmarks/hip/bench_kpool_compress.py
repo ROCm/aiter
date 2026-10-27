@@ -50,7 +50,8 @@ def make_prefill(n_tokens, pool, page, seed=0):
 
 def make_decode(B, next_n, pool, page, seed=0):
     g = torch.Generator(device=DEVICE).manual_seed(seed)
-    ring = pool
+    # production tail ring (vLLM GLM-5.3 MTP): pool * pow2(ceil((pool + next_n - 1) / pool)), == pool for next_n = 1
+    ring = pool * (1 << (-(-(pool + next_n - 1) // pool) - 1).bit_length())
     tail = torch.randn(B + 2, 2, ring, HEAD_DIM, generator=g, device=DEVICE).bfloat16()
     ctx = torch.randint(pool, 100000, (B,), generator=g, device=DEVICE)
     pos = (ctx[:, None] + torch.arange(next_n, device=DEVICE)[None]).to(torch.int32)

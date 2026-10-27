@@ -363,6 +363,28 @@ __device__ __forceinline__ void compress_pool(
 
   // --- store: a 32-bit lane offset on the page base, so a wave-uniform page
   // (decode) gives the saddr form (SGPR base + VGPR offset) ---
+  if constexpr (DPL == 2) {
+    // Branch-free (every taken branch on this one-shot path costs an
+    // instruction-cache miss, ~500 clocks on the ATT ledger): the layout is
+    // a select, lane pairs (2k, 2k+1) hold dims 4k..4k+3 and both lanes
+    // store the same dword to the same address (2-byte stores per lane are
+    // far slower in the memory pipeline), and every lane stores the
+    // wave-uniform scale to its one address.
+    const int d0e = d0 & ~3;  // first dim of the pair
+    const uint32_t ps = (uint32_t)((tok >> 4) * (16 * HEAD_DIM) + (d0e >> 4) * 256 + (tok & 15) * 16 + (d0e & 15));
+    const uint32_t lin = (uint32_t)(tok * HEAD_DIM + d0e);
+    const uint32_t other = __float_as_uint(xor_lane<1>(__uint_as_float(qw[0]), sub));
+#ifdef KPOOL_MASKED_STORE
+    if ((sub & 1) == 0) *(gptr<uint32_t>)(pbase + (preshuffle ? ps : lin)) = (qw[0] & 0xFFFFu) | (other << 16);
+    if (sub == 0) *(gptr<float>)(pbase + scale_off) = scale;
+#else
+    const bool odd = (sub & 1) != 0;
+    const uint32_t lo = odd ? other : qw[0], hi = odd ? qw[0] : other;
+    *(gptr<uint32_t>)(pbase + (preshuffle ? ps : lin)) = (lo & 0xFFFFu) | (hi << 16);
+    *(gptr<float>)(pbase + scale_off) = scale;
+#endif
+    return;
+  }
   if (preshuffle) {
     // byte offset of (tok, dim) = (tok/16)*16*128 + (dim/16)*256 + (tok%16)*16 + dim%16
     gptr<uint8_t> kp = pbase + (uint32_t)((tok >> 4) * (16 * HEAD_DIM) + (d0 >> 4) * 256 + (tok & 15) * 16 + (d0 & 15));
@@ -398,7 +420,9 @@ __device__ __forceinline__ void compress_pool(
 // when page_size is not a power of two)
 template <typename LocT>
 __device__ __forceinline__ LocT page_of(LocT loc, int page_size, int page_shift, int& tok) {
-  if (page_shift >= 0) {
+  // (the power-of-two case is the fall-through: a taken branch over the
+  // division sequence costs a one-shot wave an instruction-cache miss)
+  if (__builtin_expect(page_shift >= 0, 1)) {
     tok = (int)(loc & (page_size - 1));
     return loc >> page_shift;
   }
@@ -441,6 +465,27 @@ __device__ __forceinline__ uint32_t s_bit31(uint32_t x) {
   // KPOOL_META_SMEM it handed the asm a VGPR and failed to assemble)
   asm("s_lshr_b32 %0, %1, 31" : "=s"(r) : "s"(__builtin_amdgcn_readfirstlane(x)));
   return r;
+}
+
+// (a < b) ? x : y for wave-uniform pointers in two SALU instructions
+// (s_cmp + s_cselect_b64). Written as C, the compiler materializes the
+// condition as a 64-bit lane mask and spends ~5 instructions per select.
+// (readfirstlane on the inputs: free for values already in SGPRs, and keeps
+// the "s" constraints satisfiable when the compiler cannot prove uniformity)
+__device__ __forceinline__ uint64_t s_uniform64(uint64_t v) {
+  const uint32_t lo = __builtin_amdgcn_readfirstlane((uint32_t)v);
+  const uint32_t hi = __builtin_amdgcn_readfirstlane((uint32_t)(v >> 32));
+  return ((uint64_t)hi << 32) | lo;
+}
+template <typename T>
+__device__ __forceinline__ gptr<T> s_sel_lt(int a, int b, gptr<T> x, gptr<T> y) {
+  uintptr_t r;
+  const uint64_t xv = s_uniform64((uint64_t)(uintptr_t)x), yv = s_uniform64((uint64_t)(uintptr_t)y);
+  asm("s_cmp_lt_i32 %1, %2\n\ts_cselect_b64 %0, %3, %4"
+      : "=s"(r)
+      : "s"(__builtin_amdgcn_readfirstlane(a)), "s"(__builtin_amdgcn_readfirstlane(b)), "s"(xv), "s"(yv)
+      : "scc");
+  return (gptr<T>)r;
 }
 
 // ring is a power of two (AITER_CHECK in tail_args): shift / mask only, so the
@@ -822,36 +867,40 @@ __device__ __forceinline__ void decode_request(
 #else
   constexpr bool META_SMEM = NMAX == 1;
 #endif
-  // vector-load path: this lane's metadata word (array m_arr, token m_tok)
-  int32_t mv = 0;
-  int m_arr = 0, m_tok = 0;
-  if constexpr (META_SMEM) {
+  // vector-load path: lane l holds the three words of token min(l, n - 1)
+  // (three loads, SGPR base + lane offset: issued a few instructions after
+  // the wave starts; a lane-wise pointer select would cost ~20 VALU first)
+  int32_t v_ts = 0, v_loc = 0, v_pos = 0;
+  const int v_tok = min(sub, n - 1);
+  if constexpr (META_SMEM && NMAX > 1 && NMAX <= 8) {
+    // next_n == NMAX (exact instantiations up to 8): the request's NMAX words
+    // of each array are contiguous, one s_load_dwordxN per array (scalar
+    // loads need dword alignment only)
+    loc = *(gptr<const ivec>)(m_loc + (uint32_t)base);
+    pos = *(gptr<const ivec>)(m_pos + (uint32_t)base);
+    ts = *(gptr<const ivec>)(m_ts + (uint32_t)base);
+  } else if constexpr (META_SMEM) {
 #pragma unroll
     for (int i = 0; i < NMAX; ++i) {
-      const uint32_t j = (uint32_t)(base + min(i, n - 1));
+      const uint32_t j = (uint32_t)(base + (NMAX == 1 ? 0 : min(i, n - 1)));
       loc[i] = m_loc[j];
       pos[i] = m_pos[j];
       ts[i] = m_ts[j];
     }
   } else {
-    // One vector load fetches the 3 * NMAX metadata words (lane l: array
-    // l / NMAX, token l % NMAX; the other lanes repeat the last one), then
-    // readlane.
-    const int l = min(sub, 3 * NMAX - 1);
-    m_arr = l / NMAX;
-    m_tok = l - m_arr * NMAX;
-    const uint32_t j = (uint32_t)(base + min(m_tok, n - 1));
-    const gptr<const int32_t> p = m_arr == 0 ? m_ts : (m_arr == 1 ? m_loc : m_pos);
-    mv = p[j];
+    const uint32_t jl = (uint32_t)(base + v_tok);
+    v_ts = m_ts[jl];
+    v_loc = m_loc[jl];
+    v_pos = m_pos[jl];
   }
-  // every token's metadata as scalars (the generic paths)
+  // every token's metadata as scalars (the one-token path)
   auto read_meta = [&]() {
     if constexpr (!META_SMEM) {
 #pragma unroll
       for (int i = 0; i < NMAX; ++i) {
-        ts[i] = __builtin_amdgcn_readlane(mv, i);
-        loc[i] = __builtin_amdgcn_readlane(mv, NMAX + i);
-        pos[i] = __builtin_amdgcn_readlane(mv, 2 * NMAX + i);
+        ts[i] = __builtin_amdgcn_readlane(v_ts, i);
+        loc[i] = __builtin_amdgcn_readlane(v_loc, i);
+        pos[i] = __builtin_amdgcn_readlane(v_pos, i);
       }
     }
   };
@@ -902,8 +951,8 @@ __device__ __forceinline__ void decode_request(
       ts0 = ts[0];
       pos0 = pos[0];
     } else {
-      ts0 = __builtin_amdgcn_readlane(mv, 0);
-      pos0 = __builtin_amdgcn_readlane(mv, 2 * NMAX);
+      ts0 = __builtin_amdgcn_readlane(v_ts, 0);
+      pos0 = __builtin_amdgcn_readlane(v_pos, 0);
     }
     const int safe0 = max(pos0, 0);
     const int r = safe0 % POOL;  // pool slot of token 0
@@ -918,12 +967,10 @@ __device__ __forceinline__ void decode_request(
         regular &= (uint32_t)(pos[i] == pos0 + i) & (uint32_t)(ts[i] == e_ts);
       }
     } else {
-      // one compare per lane: lane (array, token) holds its expected value?
-      const int tokc = min(m_tok, n - 1);
-      const int e_ts = (ts0 & ~ta.ring_mask) | ((ts0 + tokc) & ta.ring_mask);
-      const int e_pos = pos0 + tokc;
-      const int expect = m_arr == 0 ? e_ts : (m_arr == 2 ? e_pos : mv);
-      regular = (uint32_t)(__builtin_amdgcn_ballot_w64(mv == expect) == ~0ull);
+      // one compare per lane: does lane (token) hold the expected words?
+      const int e_ts = (ts0 & ~ta.ring_mask) | ((ts0 + v_tok) & ta.ring_mask);
+      const int e_pos = pos0 + v_tok;
+      regular = (uint32_t)(__builtin_amdgcn_ballot_w64((v_ts == e_ts) & (v_pos == e_pos)) == ~0ull);
     }
     regular &= s_bit31(~(uint32_t)(pos0 | ts0)) & (uint32_t)(r + NMAX <= ta.ring_mask + 1) & (uint32_t)(n == NMAX) &
                (uint32_t)(d.key_st == HEAD_DIM) & (uint32_t)(d.ss_st == HEAD_DIM);
@@ -951,7 +998,7 @@ __device__ __forceinline__ void decode_request(
         if constexpr (META_SMEM) {
           cloc[c] = vpick<NMAX>(loc, tj);
         } else {
-          cloc[c] = __builtin_amdgcn_readlane(mv, NMAX + min(tj, NMAX - 1));
+          cloc[c] = __builtin_amdgcn_readlane(v_loc, min(tj, NMAX - 1));
         }
         const bool exists = (POOL - 1 + c * POOL - NMAX) < r;  // token tj < NMAX
         amask |= ((uint32_t)exists & s_bit31(~(uint32_t)cloc[c])) << c;
@@ -973,21 +1020,17 @@ __device__ __forceinline__ void decode_request(
             asm volatile("" : "+v"(k), "+v"(g) : "v"(dep));
             // the selected bases are pinned to SGPRs: otherwise the compiler
             // builds one 64-bit VGPR address per row (and spills them)
-            gptr<uint16_t> bk = r + t >= wrap ? k0w : k0, bg = r + t >= wrap ? g0w : g0;
-            KPOOL_PIN_S(bk);
-            KPOOL_PIN_S(bg);
+            const gptr<uint16_t> bk = s_sel_lt(r + t, wrap, k0, k0w), bg = s_sel_lt(r + t, wrap, g0, g0w);
             store_dw(bk + t * HEAD_DIM, sub, k);
             store_dw(bg + t * HEAD_DIM, sub, g);
           }
         } else {
           // pstart and wrap are multiples of POOL: the rows of one pool group
-          // share a base (one select per group, pinned to SGPRs: otherwise the
-          // compiler builds a 64-bit VGPR address per row and spills them)
+          // share a base (one SALU select per group; a C select here became a
+          // 64-bit VGPR address per row, spilled)
 #pragma unroll
           for (int c = 0; c < (NV + POOL - 1) / POOL; ++c) {
-            gptr<uint16_t> bk = c * POOL >= wrap ? tkw : tkp, bg = c * POOL >= wrap ? tgw : tgp;
-            KPOOL_PIN_S(bk);
-            KPOOL_PIN_S(bg);
+            const gptr<uint16_t> bk = s_sel_lt(c * POOL, wrap, tkp, tkw), bg = s_sel_lt(c * POOL, wrap, tgp, tgw);
 #pragma unroll
             for (int j = c * POOL; j < min(c * POOL + POOL, NV); ++j) {
               // live: r <= j < r + NMAX; rows POOL-1 .. NMAX-1 always are
@@ -1008,19 +1051,21 @@ __device__ __forceinline__ void decode_request(
         // j - NMAX (always a token row then) instead of running past the
         // request's rows.
         gptr<const uint16_t> gsrc[NV], ksrc[NV];
+        // row NMAX + i is live iff i < r (then token row kbr + NMAX + i); a dead
+        // one re-reads token row i through the base kbr: same immediate, one
+        // base select
+        const gptr<const uint16_t> kbr2 = kbr + NMAX * HEAD_DIM, sbr2 = sbr + NMAX * HEAD_DIM;
 #pragma unroll
         for (int j = 0; j < NV; ++j) {
           if (j < POOL - 1) {
-            const bool from_ring = j < r;
-            gsrc[j] = (from_ring ? (gptr<const uint16_t>)tgp : sbr) + j * HEAD_DIM;
-            ksrc[j] = (from_ring ? (gptr<const uint16_t>)tkp : kbr) + j * HEAD_DIM;
+            gsrc[j] = s_sel_lt(j, r, (gptr<const uint16_t>)tgp, sbr) + j * HEAD_DIM;
+            ksrc[j] = s_sel_lt(j, r, (gptr<const uint16_t>)tkp, kbr) + j * HEAD_DIM;
           } else if (j < NMAX) {
             gsrc[j] = sbr + j * HEAD_DIM;
             ksrc[j] = kbr + j * HEAD_DIM;
           } else {
-            const uint32_t off = (uint32_t)(((j - NMAX) < r ? j : j - NMAX) * HEAD_DIM);
-            gsrc[j] = sbr + off;
-            ksrc[j] = kbr + off;
+            gsrc[j] = s_sel_lt(j - NMAX, r, sbr2, sbr) + (j - NMAX) * HEAD_DIM;
+            ksrc[j] = s_sel_lt(j - NMAX, r, kbr2, kbr) + (j - NMAX) * HEAD_DIM;
           }
         }
 #pragma unroll
@@ -1064,9 +1109,17 @@ __device__ __forceinline__ void decode_request(
     // a ballot over the lanes; each completion loads its own rows (one
     // round trip each). Correctness matters here, not speed. =====
     if (vmask == 0) return;
-    const int lt = min(sub, n - 1);  // this lane's token
-    const uint32_t jm = (uint32_t)(base + lt);
-    const int l_ts = m_ts[jm], l_loc = m_loc[jm], l_pos = m_pos[jm];
+    int l_ts, l_loc, l_pos;  // this lane's token (min(sub, n - 1))
+    if constexpr (META_SMEM) {
+      const uint32_t jm = (uint32_t)(base + v_tok);
+      l_ts = m_ts[jm];
+      l_loc = m_loc[jm];
+      l_pos = m_pos[jm];
+    } else {
+      l_ts = v_ts;
+      l_loc = v_loc;
+      l_pos = v_pos;
+    }
     load_rows();  // rk / rs by token, for the stash
     const int l_safe = max(l_pos, 0);
     const int l_phys = ring_mod(l_safe, ta);
