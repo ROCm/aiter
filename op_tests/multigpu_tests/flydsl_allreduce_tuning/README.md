@@ -4,7 +4,7 @@ Turn-key tooling that measures the FlyDSL all-reduce kernels on the machine at h
 dispatch tables that decide, per message size, *which* kernel runs. One driver script, `tune.sh`,
 runs every measurement and fit; the only manual step is pasting the fitted values into
 `aiter/ops/flydsl/allreduce_policy.py` and copying the fitted fused ladder file over
-`aiter/ops/flydsl/fused_allreduce_ladders.json` (step 5).
+`aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json` (step 5).
 
 Every measurement is the `bench` scenario of the two multi-GPU tests, so tuning and the tests time
 kernels the same way (`flydsl_allreduce_bench.py` describes the method):
@@ -39,7 +39,7 @@ cd op_tests/multigpu_tests/flydsl_allreduce_tuning
 ./tune.sh --smoke all      # a few minutes of plumbing check: tiny sweep + fit, results are NOT meaningful
 ./tune.sh all              # the real thing: check, sweep, fit, fused-sweep, fused-fit
 # -> paste fitted values into allreduce_policy.py and copy out/<host>/fused/fused_allreduce_ladders.json
-#    over aiter/ops/flydsl/fused_allreduce_ladders.json (step 5), then
+#    over aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json (step 5), then
 ./tune.sh test && ./tune.sh validate && ./tune.sh audit
 ```
 
@@ -244,7 +244,7 @@ none. A width the sweep did not cover keeps its entry, and the fit says so. Plat
 
 ### Fused ladder file
 
-The fused ladders are data, not code: `aiter/ops/flydsl/fused_allreduce_ladders.json`, read when
+The fused ladders are data, not code: `aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json`, read when
 `allreduce_policy` is imported (the format is described there, under "Level 2: configuration ladders").
 Per platform and family it has a `default` ladder and, under `hidden`, ladders for single widths:
 
@@ -273,7 +273,7 @@ Per platform and family it has a `default` ladder and, under `hidden`, ladders f
 |---|---|
 | `FamilyPolicy(...)` rows of `FAMILY_POLICIES` | `FAMILY_POLICIES` |
 | `ONESHOT_LADDER` / `MESH_ST_LADDER` / `RING_ST_LADDER` rows | the table of the same name (leave the ring unchanged if it is "not dispatched here") |
-| fused `fused_allreduce_ladders.json` (one-shot, mesh and ring ladders, default and per width, with `atoms_per_row`) | copy over `aiter/ops/flydsl/fused_allreduce_ladders.json` |
+| fused `fused_allreduce_ladders.json` (one-shot, mesh and ring ladders, default and per width, with `atoms_per_row`) | copy over `aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json` |
 | fused `FUSED_FAMILY_POLICIES row` | `FUSED_FAMILY_POLICIES` |
 
 Things the fit does **not** decide, which you should set by hand from the sweep tables (`sweep/*.md`):

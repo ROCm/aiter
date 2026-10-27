@@ -38,7 +38,7 @@ by ``--min-width-gain`` (geomean); elsewhere the width runs the default.
 The ladders are written as a ladder file (``--out-json``): the base file
 (``--base``, by default the one the policy reads) with the fitted families of
 the swept platforms replaced. Try it with ``AITER_FLY_AR_FUSED_LADDERS=<file>``,
-then copy it over ``aiter/ops/flydsl/fused_allreduce_ladders.json``.
+then copy it over ``aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json``.
 
 usage: fit_fused.py SWEEP_DIR [--link xgmi] [--rungs N] [--rung-penalty X]
                     [--min-width-gain G] [--base FILE] [--out-json FILE]
@@ -681,7 +681,7 @@ def main():
         print(
             f"\nladder file -> {args.out_json} (merged into {base}). Try it with "
             f"AITER_FLY_AR_FUSED_LADDERS={args.out_json}, then copy it over "
-            "aiter/ops/flydsl/fused_allreduce_ladders.json."
+            "aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json."
         )
 
 

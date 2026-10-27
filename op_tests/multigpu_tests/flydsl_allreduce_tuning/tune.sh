@@ -20,7 +20,7 @@
 #                FUSED_FAMILY_POLICIES                                       -> $OUT/fused/fit.txt
 #                                         + the ladder file $OUT/fused/fused_allreduce_ladders.json
 #   ---- paste the fitted values into allreduce_policy.py and copy the ladder file
-#        over aiter/ops/flydsl/fused_allreduce_ladders.json (README step 5), then: ----
+#        over aiter/ops/flydsl/configs/comm/fused_allreduce_ladders.json (README step 5), then: ----
 #   test         run the table-invariant unit tests (after pasting, before validate)
 #   validate     re-sweep the shipping engines vs the pinned rows            -> $OUT/validate
 #   audit        grade the shipped dispatcher against the best pinned row    -> $OUT/audit
