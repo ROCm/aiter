@@ -272,19 +272,37 @@ class PaDecodeSchedule:
                     )
                 )
                 query_splits = 4 if large_full_grid else query_length
-            elif TUNED_BF16_SWA and (sliding_window == 1024 or single_tile_plan):
-                # Preserve W1024 at every budget. Extend to other windows only
-                # when the plan guarantees one KV tile per active task.
-                # Splitting reduces the eight-M-tile BF16 CTA's LDS and VGPR
-                # footprint. Bound the duplicated KV work by the active
-                # task grid: small grids use one query per CTA, while larger
-                # batches taper to four, two, or one query split.
-                if query_length * split_workgroups <= 2 * num_compute_units:
+            elif TUNED_BF16_SWA:
+                # Estimate the planned KV work, including multiple tiles per
+                # task when the partition cap or work budget is small.
+                kv_tiles = window_tiles
+                if max_context_length is not None:
+                    kv_tiles = min(
+                        kv_tiles,
+                        max(1, -(-max_context_length // KV_COMPUTE_BLOCK)),
+                    )
+                tasks_per_seq = min(
+                    num_partitions, max(1, work_capacity // num_seqs), kv_tiles
+                )
+                tiles_per_task = -(-kv_tiles // tasks_per_seq)
+                active_tasks = min(split_workgroups, num_seqs * tasks_per_seq)
+                tile_workgroups = active_tasks * tiles_per_task
+                # Splitting lowers the BF16 Q/P LDS and accumulator footprint;
+                # taper it as duplicated KV work grows. The common LDS check
+                # below enforces the selected CTA's resource limit.
+                if query_length * tile_workgroups <= 2 * num_compute_units:
                     query_splits = query_length
-                elif 4 * split_workgroups <= 3 * num_compute_units:
+                elif 4 * tile_workgroups <= 3 * num_compute_units:
                     query_splits = 4
-                elif 2 * split_workgroups <= 3 * num_compute_units:
+                elif 2 * tile_workgroups <= 3 * num_compute_units:
                     query_splits = 2
+                # Do not trade away the only available CTA parallelism merely
+                # because a small work budget gives each task a longer KV loop.
+                while (
+                    query_splits < query_length
+                    and query_splits * active_tasks < num_compute_units
+                ):
+                    query_splits *= 2
             elif (
                 TUNED_PER_TOKEN
                 and (num_kv_heads == 1 or sliding_window == 0)

@@ -111,21 +111,42 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         ("gfx950", 32, 512, 8, 8, 4),
         ("gfx950", 128, 512, 8, 8, 1),
         ("gfx942", 8, 512, 8, 8, 1),
-        # Other windows require a budget that guarantees one tile per task.
-        ("gfx950", 8, 512, 1, 1, 1),
+        # Limited budgets still need enough split-query CTAs to fill the device.
+        ("gfx950", 8, 512, 1, 1, 8),
         ("gfx950", 8, 512, 4, 4, 8),
-        ("gfx950", 8, 512, 8, 3, 1),
+        ("gfx950", 8, 512, 8, 3, 8),
         ("gfx950", 32, 2048, 8, 8, 1),
-        # W1024 keeps its existing split even with multiple tiles per task.
+        # Neighboring windows follow planned work, not an exact window value.
         ("gfx950", 8, 1024, 1, 1, 8),
         ("gfx950", 8, 1024, 4, 4, 8),
         ("gfx950", 8, 1024, 8, 2, 8),
+        ("gfx950", 8, 1023, 1, 1, 8),
+        ("gfx950", 8, 1023, 4, 4, 8),
+        ("gfx950", 8, 1025, 1, 1, 8),
+        ("gfx950", 8, 1025, 4, 4, 8),
+        ("gfx950", 8, 2048, 1, 1, 8),
+        ("gfx950", 8, 2048, 4, 4, 8),
+        ("gfx950", 8, 2048, 8, 8, 4),
+        ("gfx950", 8, 2048, 16, 16, 4),
+        ("gfx950", 32, 1023, 1, 1, 8),
+        ("gfx950", 32, 1024, 1, 1, 8),
+        ("gfx950", 32, 1025, 1, 1, 8),
+        ("gfx950", 32, 2048, 1, 1, 8),
+        ("gfx950", 32, 2048, 4, 4, 2),
+        ("gfx950", 64, 1024, 1, 1, 4),
+        ("gfx950", 64, 1024, 4, 4, 1),
+        ("gfx950", 128, 1024, 1, 1, 2),
+        ("gfx950", 128, 1024, 4, 4, 1),
+        ("gfx950", 64, 2048, 1, 1, 4),
+        ("gfx950", 8, 4096, 1, 1, 8),
+        ("gfx950", 8, 4096, 8, 8, 4),
+        ("gfx942", 8, 2048, 1, 1, 1),
     ],
 )
 def test_bf16_swa_query_split_schedule(
     monkeypatch, arch, num_seqs, window, max_parts, capacity_per_seq, expected_splits
 ):
-    """Window and budget boundaries preserve the tuned W1024 behavior."""
+    """KV work and grid size select splits consistently across window sizes."""
     traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
     monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
     schedule = traits.PaDecodeSchedule.select(
@@ -146,6 +167,28 @@ def test_bf16_swa_query_split_schedule(
         sliding_window=window,
     )
     assert traits.PaDecodeTraits.create(schedule).query_splits == expected_splits
+
+
+@pytest.mark.parametrize("window", [2048, 4096, 2**31 + 1])
+def test_bf16_swa_schedule_context_bound(monkeypatch, window):
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
+    schedule = traits.PaDecodeSchedule.select(
+        head_dim=128,
+        query_group_size=16,
+        block_size=64,
+        num_seqs=8,
+        num_kv_heads=1,
+        num_compute_units=256,
+        work_capacity=64,
+        num_partitions=8,
+        query_dtype="bf16",
+        kv_dtype="bf16",
+        query_length=8,
+        max_context_length=512,
+        sliding_window=window,
+    )
+    assert traits.PaDecodeTraits.create(schedule).query_splits == 8
 
 
 @pytest.mark.parametrize(
@@ -565,12 +608,61 @@ _BF16_CASES = _COMMON_CASES + [
                 "max_partitions": parts,
                 "window": window,
                 "sink_dtype": torch.float32,
-                "capture": window == 1023,
-                "lengths": (0, 1, 127, 128, 129, 257, 515, 1027),
+                "capture": window in (1023, 2048),
+                "lengths": (
+                    (0, 1, 127, 2047, 2048, 2049, 4097, 8192)
+                    if window == 2048
+                    else (0, 1, 127, 128, 129, 257, 515, 1027)
+                ),
             },
         )
-        for window, parts in ((512, 4), (1023, 8), (1025, 8), (1024, 1), (1024, 4))
+        for window, parts in (
+            (512, 4),
+            (1023, 8),
+            (1025, 8),
+            (1024, 1),
+            (1024, 4),
+            (1023, 1),
+            (1023, 4),
+            (1025, 1),
+            (1025, 4),
+            (2048, 1),
+            (2048, 4),
+            (2048, 8),
+            (2048, 16),
+        )
     ],
+    *[
+        (
+            f"qlen8-d128-w2048-b32-np{parts}",
+            {
+                "query_length": 8,
+                "group_size": 16,
+                "head_dim": 128,
+                "block_size": 64,
+                "max_partitions": parts,
+                "window": 2048,
+                "sink_dtype": torch.float32,
+                "capture": True,
+                "lengths": (0, 1, 127, 2047, 2048, 2049, 4097, 8192) * 4,
+            },
+        )
+        for parts in (4, 8)
+    ],
+    (
+        "qlen8-d128-w2048-context-bound",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "window": 2048,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "lengths": (0, 1, 127, 128, 129, 257, 511, 512),
+        },
+    ),
     (
         "qlen8-w128-d192-v128",
         {
