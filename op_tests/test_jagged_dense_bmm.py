@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
+import os
+import tempfile
+from unittest import mock
 
 import flydsl.compiler as flyc
 import pandas as pd
@@ -13,7 +17,9 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import jagged_dense_bmm_dispatch as jdbba_dispatch
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
+    SUPPORTED_GFX,
     _load_dispatch_table,
     jagged_dense_bmm_dispatched,
     resolve_config,
@@ -35,8 +41,11 @@ from aiter.test_common import (
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]
 SEED = 1234
+# Host selection sweep. These names are mocked; the GPU sweep below stays
+# on the live card and on SUPPORTED_GFX.
+_ARCH_SECTION_CASES = ("gfx942", "gfx950", "gfx1250", "unknown")
+_ARCH_SHAPE = (120, 256, 256, 7680)
 
 try:
     from generative_recommenders.ops.triton.triton_jagged import (
@@ -618,6 +627,125 @@ def test_jdbba_tile_map_inplace(B, D, Kout, Mi, dtype):
     }
 
 
+def _clear_dispatch_cache():
+    jdbba_dispatch._DISPATCH_TABLES.clear()
+    jdbba_dispatch._DISPATCH_CACHE.clear()
+
+
+def _arch_shape_id():
+    B, D, Kout, Mi = _ARCH_SHAPE
+    return shape_id(n_groups=B, reduction_k=D, output_n=Kout, max_seq_len=Mi)
+
+
+def _resolve_arch_shape():
+    B, D, Kout, Mi = _ARCH_SHAPE
+    return resolve_config(n_groups=B, reduction_k=D, output_n=Kout, max_seq_len=Mi)
+
+
+def _wrapper_refuses(arch):
+    """Public entry raises before it reads tensors or compiles."""
+    try:
+        jagged_dense_bmm_dispatched(None, None, None, None, None, 1, 1)
+    except RuntimeError as exc:
+        text = str(exc)
+        return arch in text and "supports" in text
+    return False
+
+
+def _check_shipped_section(arch):
+    _clear_dispatch_cache()
+    table = _load_dispatch_table()
+    selected = table.get("gfx") or ""
+    if arch in SUPPORTED_GFX:
+        if selected != arch:
+            raise AssertionError(f"{arch} loaded section {selected!r}")
+        cfg = _resolve_arch_shape()
+        winner = table["winners"][_arch_shape_id()]
+        if cfg["xcd_c"] != winner["xcd_c"] or cfg["xcd_w"] != winner["xcd_w"]:
+            raise AssertionError(f"{arch} config {cfg} diverged from {winner}")
+        jdbba_dispatch._require_supported_arch()
+        return selected, 0
+    if selected or table["winners"]:
+        raise AssertionError(f"{arch} loaded section {selected!r}")
+    if not _wrapper_refuses(arch):
+        raise AssertionError(f"{arch} did not raise before compile")
+    return selected, 1
+
+
+def _check_multisection_override(arch):
+    """A file with two sections yields the runtime arch's section only."""
+    sid = _arch_shape_id()
+    payload = {
+        "schema": "arch-keyed-v1",
+        "by_arch": {
+            "gfx942": {
+                "gfx": "gfx942",
+                "winners": {sid: {"xcd_c": 32, "xcd_w": 16}},
+            },
+            "gfx950": {
+                "gfx": "gfx950",
+                "winners": {sid: {"xcd_c": 7, "xcd_w": 3}},
+            },
+        },
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "dispatch.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.environ["FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON"] = path
+        _clear_dispatch_cache()
+        table = _load_dispatch_table()
+    selected = table.get("gfx") or ""
+    if arch in payload["by_arch"]:
+        expect = payload["by_arch"][arch]["winners"][sid]
+        cfg = _resolve_arch_shape()
+        if (
+            selected != arch
+            or cfg["xcd_c"] != expect["xcd_c"]
+            or cfg["xcd_w"] != expect["xcd_w"]
+        ):
+            raise AssertionError(
+                f"{arch} override selected {selected!r} "
+                f"xcd_c={cfg['xcd_c']} xcd_w={cfg['xcd_w']}"
+            )
+    elif selected or table["winners"]:
+        raise AssertionError(f"{arch} override loaded section {selected!r}")
+    return selected
+
+
+@benchmark()
+def test_jdbba_arch_section(arch):
+    """Which JSON section the runtime arch owns, and whether launch is refused.
+
+    Host selection only: the row records the section and the pre-compile refusal.
+    """
+    spoof = "gfx950" if arch == "gfx942" else "gfx942"
+    os.environ["FLYDSL_JAGGED_DENSE_BMM_ARCH"] = spoof
+    prev_json = os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON", None)
+    try:
+        with mock.patch.object(jdbba_dispatch, "get_gfx_runtime", return_value=arch):
+            selected, raised = _check_shipped_section(arch)
+            override = _check_multisection_override(arch)
+        if arch == get_gfx() and arch not in SUPPORTED_GFX:
+            _clear_dispatch_cache()
+            if not _wrapper_refuses(get_gfx()):
+                raise AssertionError(f"live {get_gfx()} did not raise before compile")
+    finally:
+        os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_ARCH", None)
+        if prev_json is None:
+            os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON", None)
+        else:
+            os.environ["FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON"] = prev_json
+        _clear_dispatch_cache()
+    return {
+        "gfx": get_gfx(),
+        "selected": selected,
+        "override": override,
+        "raised": raised,
+        "err": 0,
+    }
+
+
 def _summarize(name, rows):
     df = pd.DataFrame(rows)
     aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
@@ -645,6 +773,13 @@ def _expand_shapes(shapes, batch, parser):
 
 
 def main():
+    # Runs on every card, including ones the GPU sweep skips. Selection is
+    # mocked, so this does not compile the gfx942 kernel on the live GPU.
+    rows = []
+    for (arch,) in itertools.product(_ARCH_SECTION_CASES):
+        rows.append(test_jdbba_arch_section(arch))
+    _summarize("jagged_dense_bmm arch section", rows)
+
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("jagged_dense_bmm unsupported on %s; skipping", get_gfx())
         return

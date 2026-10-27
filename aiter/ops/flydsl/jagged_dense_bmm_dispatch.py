@@ -4,10 +4,12 @@
 """Dispatch layer for jagged_dense_bmm_broadcast_add.
 
 Resolves per-shape kernel config from ``jagged_dense_bmm_dispatch.json``
-(explicit override -> table winner -> defaults). Uniform launches use the
-plain grid. Every skew launch builds a compact TILE_MAP and runs the
-compact kernel. Tuning rationale lives in the JSON; skew XCD remap is
-gated in ``_skew_compact_xcd``.
+(explicit override -> table winner -> defaults). The public wrapper runs
+only on ``SUPPORTED_GFX``; the JSON section is the exact arch from
+``get_gfx_runtime()``. Uniform launches use the plain grid. Every skew
+launch builds a compact TILE_MAP and runs the compact kernel. Tuning
+rationale lives in the JSON; skew XCD remap is gated in
+``_skew_compact_xcd``.
 """
 
 from __future__ import annotations
@@ -18,18 +20,24 @@ from pathlib import Path
 
 import flydsl.expr as fx
 import torch
-from flydsl.runtime.device import get_rocm_arch
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.jagged_dense_bmm_gen import BLOCK_M, jagged_dense_bmm
 from .kernels.jdbba_skew_tile_map import build_tile_map_device_fused
 
 __all__ = [
+    "SUPPORTED_GFX",
     "jagged_dense_bmm_dispatched",
     "resolve_config",
     "shape_id",
 ]
 
-_DISPATCH_TABLE: dict | None = None
+# gfx942 winners are measured on MI300X. Another arch gets an empty table
+# until it has its own section and is added here.
+SUPPORTED_GFX = ("gfx942",)
+
+_DISPATCH_TABLES: dict[str, dict] = {}
 _DISPATCH_CACHE: dict[tuple, dict] = {}
 
 SKEW_COMPACT_XCD_C = 32
@@ -52,44 +60,56 @@ def _dispatch_json_paths() -> tuple[Path, ...]:
     return (Path(__file__).resolve().parent / "jagged_dense_bmm_dispatch.json",)
 
 
-def _detect_arch() -> str | None:
-    env = os.environ.get("FLYDSL_JAGGED_DENSE_BMM_ARCH")
-    if env:
-        return env
-    return get_rocm_arch()
+def _runtime_arch() -> str:
+    """Live GPU name. ``get_gfx_runtime`` ignores ``GPU_ARCHS``."""
+    return get_gfx_runtime().split(":", 1)[0]
+
+
+def _require_supported_arch() -> str:
+    arch = _runtime_arch()
+    if arch not in SUPPORTED_GFX:
+        supported = ", ".join(SUPPORTED_GFX)
+        raise RuntimeError(f"jagged_dense_bmm supports {supported}; got {arch}")
+    return arch
 
 
 def _select_arch_section(data: dict, arch: str | None) -> dict:
+    """Exact ``by_arch`` match. A missing section is an empty table.
+
+    A flat file (no ``by_arch``) is an explicit override and is returned
+    as written. ``jagged_dense_bmm_dispatched`` checks ``SUPPORTED_GFX``
+    before a table is used to launch.
+    """
     by_arch = data.get("by_arch")
     if not isinstance(by_arch, dict):
-        return data  # legacy flat schema (e.g. an env-var override file)
+        return data
     if arch and arch in by_arch:
         return by_arch[arch]
     if arch:
         for sect in by_arch.values():
             if sect.get("gfx") == arch:
                 return sect
-    if len(by_arch) == 1:
-        return next(iter(by_arch.values()))
     return {}
 
 
 def _load_dispatch_table() -> dict:
-    global _DISPATCH_TABLE
-    if _DISPATCH_TABLE is not None:
-        return _DISPATCH_TABLE
-    arch = _detect_arch()
+    arch = _runtime_arch()
+    cached = _DISPATCH_TABLES.get(arch)
+    if cached is not None:
+        return cached
     for path in _dispatch_json_paths():
         if path.is_file():
             data = json.loads(path.read_text())
             section = _select_arch_section(data, arch)
-            _DISPATCH_TABLE = {
+            table = {
                 "gfx": section.get("gfx"),
                 "winners": dict(section.get("winners") or {}),
             }
-            return _DISPATCH_TABLE
-    _DISPATCH_TABLE = {"gfx": None, "winners": {}}
-    return _DISPATCH_TABLE
+            _DISPATCH_TABLES[arch] = table
+            return table
+    table = {"gfx": None, "winners": {}}
+    _DISPATCH_TABLES[arch] = table
+    return table
 
 
 def shape_id(
@@ -166,7 +186,9 @@ def resolve_config(
     xcd_w: int | None = None,
     block_k: int | None = None,
 ) -> dict:
+    arch = _runtime_arch()
     key = (
+        arch,
         n_groups,
         reduction_k,
         output_n,
@@ -223,6 +245,7 @@ def jagged_dense_bmm_dispatched(
     xcd_w: int | None = None,
     block_k: int | None = None,
 ):
+    _require_supported_arch()
     output_n = B.shape[0] // n_groups
     reduction_k = B.shape[1]
     cfg = resolve_config(
