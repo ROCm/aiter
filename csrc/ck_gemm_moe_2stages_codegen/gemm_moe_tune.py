@@ -53,6 +53,11 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
+from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
+    _mxfp8_exponent,
+    shuffle_scale_a8w4_gfx942,
+    shuffle_weight_a8w4_gfx942,
+)
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
@@ -62,6 +67,7 @@ from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_stage1_kernels,
+    get_flydsl_stage1_kernels_a8w4_gfx942,
     get_flydsl_stage1_kernels_int4_bf16,
     get_flydsl_stage2_kernels,
     get_flydsl_stage2_kernels_int4_bf16,
@@ -72,7 +78,11 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
-from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
+from aiter.ops.quant import (
+    fused_dynamic_mxfp8_quant_moe_sort,
+    per_1x32_f8_scale_f8_quant,
+    per_1x32_i4_quant,
+)
 from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
     shuffle_scale,
@@ -157,6 +167,16 @@ def _parse_tuning_type(value):
     if not isinstance(parsed, (torch.dtype, ActivationType, QuantType)):
         raise ValueError(f"unsupported tuning type: {value!r}")  # noqa: TRY004
     return parsed
+
+
+def _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w) -> bool:
+    """gfx942 a8w4 (MXFP8 A x MXFP4 W): `_g942` stage 1 + a16w4 stage 2."""
+    return (
+        get_gfx() == "gfx942"
+        and q_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp4x2
+    )
 
 
 def _a16w_sorted_cos(ref, res, msg="", printLog=True):
@@ -948,8 +968,11 @@ class FmoeTuner(TunerCommon):
         _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
+        # gfx942 a8w4 x is already MXFP8 (moe_sort) or the bf16 x its `_qi` kernels
+        # quantise themselves
+        _g942 = kparams.get("in_dtype") == "a8w4_gfx942"
         result = flydsl_moe_stage1(
-            a=a1_qt.to(dtypes.fp8) if q_dtype_a == dtypes.fp8 else a1_qt,
+            a=a1_qt.to(dtypes.fp8) if q_dtype_a == dtypes.fp8 and not _g942 else a1_qt,
             w1=w1_qt_shffle_ck,
             sorted_token_ids=sorted_ids,
             sorted_expert_ids=sorted_expert_ids,
@@ -976,6 +999,8 @@ class FmoeTuner(TunerCommon):
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
             k_wave=kparams.get("k_wave", 1),
+            in_dtype=kparams.get("in_dtype"),
+            x_layout=kparams.get("x_layout"),
         )
         if isinstance(result, tuple):
             out_raw = result[0]
@@ -1939,6 +1964,13 @@ class FmoeTuner(TunerCommon):
         elif q_dtype_w == dtypes.fp4x2 and q_dtype_a == dtypes.fp4x2:
             w1_qt_shffle_ck = shuffle_weight(w1_qt, (16, 16))
             w2_qt_shffle_ck = shuffle_weight(w2_qt, (16, 16))
+        elif _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w):
+            w1_a16w4 = shuffle_weight_a16w4(w1_qt, 16, False)
+            w1_qt_shffle_ck = shuffle_weight_a8w4_gfx942(w1_a16w4)
+            w1_sc_a16w4 = shuffle_scale_a16w4(w1_scale, expert, False)
+            w1_scale_aiter = shuffle_scale_a8w4_gfx942(w1_sc_a16w4)
+            w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         elif q_dtype_w == dtypes.fp4x2 and q_dtype_a == dtypes.fp8:
             # a8w4 per_1x32 stage1 just support tune a1_cast now.
             w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
@@ -2052,7 +2084,33 @@ class FmoeTuner(TunerCommon):
                         block_size=max(32, blockM),
                     )
 
+            a1_qt_mxfp8_ms = a1_scale_mxfp8_ms = a1_qt_mxfp8_deq = None
+            if _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w):
+                a1_qt_mxfp8_ms, a1_scale_mxfp8_ms = fused_dynamic_mxfp8_quant_moe_sort(
+                    input,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token,
+                    topk=topk,
+                    block_size=blockM,
+                    sorted_weights=_data["sorted_weights"],
+                    num_experts_upper_bound=expert,
+                )
+                xb = input.float().view(token, model_dim // 32, 32)
+                e = _mxfp8_exponent(xb.abs().amax(-1, keepdim=True)).float()
+                a1_qt_mxfp8_deq = (
+                    ((xb * torch.exp2(-e)).to(dtypes.fp8).float() * torch.exp2(e))
+                    .view(token, model_dim)
+                    .to(dtype)
+                )
+
             return {
+                # gfx942 a8w4: `moe_sort` kernels read the HIP quant's sorted MXFP8 x,
+                # `_qi` kernels the bf16 x (quantised in-kernel, no scale)
+                "a1_qt_mxfp8_ms": a1_qt_mxfp8_ms,
+                "a1_x_bf16": input,
+                "a1_scale_mxfp8_ms": a1_scale_mxfp8_ms,
+                "a1_qt_mxfp8_deq": a1_qt_mxfp8_deq,
                 "a1_qt": a1_qt,
                 "w1_qt_shffle_ck": w1_qt_shffle_ck,
                 "w2_qt_shffle_ck": w2_qt_shffle_ck,
@@ -2142,7 +2200,7 @@ class FmoeTuner(TunerCommon):
                 q_type == QuantType.per_1x32
                 and q_dtype_a in (dtypes.bf16, dtypes.fp16)
                 and q_dtype_w in (dtypes.fp4x2, dtypes.i4x2)
-            ):
+            ) or _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w):
                 # a16w-mix (mxfp4 a16w4 / int4 a16wi4): the abf16 stage2 consumes the
                 # bf16 intermediate directly -- no inter-stage activation quant
                 # (a2_scale=None). The kernel wants it in SORTED [max_sorted, inter]
@@ -3699,12 +3757,16 @@ class FmoeTuner(TunerCommon):
         a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
         b_dtype_str = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
-
-        flydsl_s1_kernels = get_flydsl_stage1_kernels(
-            a_dtype_str, b_dtype_str, out_dtype_str
-        )
+        g942 = _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w)
+        s2_a_dtype_str = "bf16" if g942 else a_dtype_str
+        if g942:
+            flydsl_s1_kernels = get_flydsl_stage1_kernels_a8w4_gfx942()
+        else:
+            flydsl_s1_kernels = get_flydsl_stage1_kernels(
+                a_dtype_str, b_dtype_str, out_dtype_str
+            )
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
-            a_dtype_str, b_dtype_str, out_dtype_str
+            s2_a_dtype_str, b_dtype_str, out_dtype_str
         )
 
         for blockM in blockMs:
@@ -3750,7 +3812,10 @@ class FmoeTuner(TunerCommon):
                 s1_tile_m = kparams["tile_m"]
                 if s1_tile_m != blockM:
                     continue
-                if a_dtype_str == "fp8":
+                if g942:
+                    # bf16 output only (no fused requant, no k_batch split).
+                    s1_variants = [(kname, kparams, False, False)]
+                elif a_dtype_str == "fp8":
                     fp8_params = {
                         **kparams,
                         "out_dtype": "fp8",
@@ -3784,7 +3849,7 @@ class FmoeTuner(TunerCommon):
 
                 for s1_name, s1_params, is_fp4, is_fp8 in s1_variants:
                     s1_compare_fn = None
-                    if is_fp8 or is_fp4 or a_dtype_str in ("fp8", "fp4"):
+                    if (is_fp8 or is_fp4 or a_dtype_str in ("fp8", "fp4")) and not g942:
                         # Fused stage1 emits packed mx values; the default
                         # comparison reads fp4x2 as raw bytes (two e2m1 codes
                         # each), which rejects >99% code-identical candidates.
@@ -3815,14 +3880,14 @@ class FmoeTuner(TunerCommon):
                         ref_args_extra = ref_args_extra + (False, True)
                     s1_ref_func = FmoeTuner.run_torch_moe_stage1
                     s1_ref_args = ref_args_extra
-                    if a_dtype_str == "bf16":
+                    if a_dtype_str == "bf16" or g942:
                         # a16w-mix: kernel returns SORTED output; compare against a
                         # SORTED torch ref (sorting done here in the untimed ref, not
                         # in run_flydsl_stage1_out) so the tuned latency is kernel-only.
                         s1_ref_func = FmoeTuner.run_a16w_stage1_sorted_ref
                         s1_ref_args = (
                             [
-                                "a1_qt",
+                                "a1_qt_mxfp8_deq" if g942 else "a1_qt",
                                 "w1_qt",
                                 "w2_qt",
                                 "topk_weights",
@@ -3845,6 +3910,11 @@ class FmoeTuner(TunerCommon):
                     s1_ref = None
 
                     a1_key = "a1_qt_fp8_cast" if is_fp8 else "a1_qt"
+                    a1_scale_key = "a1_scale_fp4_sort"
+                    if g942 and s1_params.get("x_layout") == "bf16":
+                        a1_key, a1_scale_key = "a1_x_bf16", "a1_scale_none"
+                    elif g942:
+                        a1_key, a1_scale_key = "a1_qt_mxfp8_ms", "a1_scale_mxfp8_ms"
                     tasks_flydsl.append(
                         (
                             (info, "stage1", s1_name, blockM),
@@ -3875,7 +3945,7 @@ class FmoeTuner(TunerCommon):
                                     "sorted_weights",
                                     "num_valid_ids",
                                     "w1_scale_aiter",
-                                    "a1_scale_fp4_sort",
+                                    a1_scale_key,
                                     "bias",
                                 ],
                                 dtype,
@@ -3911,7 +3981,7 @@ class FmoeTuner(TunerCommon):
                 #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
                 #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out.
                 _s2_lds = s2_tile_m * (kparams["tile_k"] * 2 + kparams["tile_n"] * 4)
-                if a_dtype_str == "bf16" and (
+                if s2_a_dtype_str == "bf16" and (
                     s2_tile_m != blockM
                     or _s2_lds > 160 * 1024
                     or inter_dim % kparams["tile_k"] != 0
@@ -3931,7 +4001,7 @@ class FmoeTuner(TunerCommon):
 
                 s2_ref_kwargs = {}
                 s2_compare_fn = None
-                if a_dtype_str == "fp8":
+                if s2_a_dtype_str == "fp8":
                     s2_compare_fn = cosine_diff_compare
                     s2_ref_args = (
                         [
@@ -3991,7 +4061,7 @@ class FmoeTuner(TunerCommon):
                             [
                                 (
                                     "a2_a16w_sorted"
-                                    if a_dtype_str == "bf16"
+                                    if s2_a_dtype_str == "bf16"
                                     else "a2_qt"
                                 ),
                                 "w2_qt_shffle_flydsl",
@@ -5183,7 +5253,11 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
-            if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
+            if (
+                get_gfx() not in ["gfx950"]
+                and q_type in [aiter.QuantType.per_1x32]
+                and not _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w)
+            ):
                 print(f"{q_type} is not supported on {get_gfx()}")
                 return []
             if not use_g1u1:
@@ -5221,6 +5295,12 @@ class FmoeTuner(TunerCommon):
                     return name == "opus"
                 return True
 
+            if _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w):
+                # gfx942 a8w4 has FlyDSL `_g942` stage-1 kernels only (TUNE_ONLY=flydsl
+                # or empty); the other sources are gfx950-only.
+                if _want("flydsl"):
+                    tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+                continue
             if _want("asm"):
                 tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
             if _want("cktile") and os.environ.get("OPUS_SKIP_CKTILE", "0") != "1":
@@ -5700,6 +5780,48 @@ class FmoeTuner(TunerCommon):
                         + profileDF.loc[add_qs, "us_quant_sort"]
                     )
                     profileDF.drop(columns=["us_quant_sort"], inplace=True)
+                elif _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w):
+                    # gfx942 a8w4: stage 2 reads the bf16 intermediate, so there is no
+                    # inter-stage cast; instead x is quantised to MXFP8 before stage 1,
+                    # by a separate fused_moe launch for the moe_sort kernels and inside
+                    # stage 1 for the `_qi` ones. Add that launch to the former and mark
+                    # the latter xbf16, as the per_1x128 xbf16 branch below does.
+                    from aiter.fused_moe import moe_sorting
+                    from aiter.test_common import run_perftest
+
+                    dummy_x = torch.randn(token, model_dim, dtype=dtype, device="cuda")
+                    dummy_ids = torch.randint(
+                        0, expert, (token, topk), dtype=torch.int32, device="cuda"
+                    )
+                    dummy_w = torch.rand(
+                        token, topk, dtype=torch.float32, device="cuda"
+                    )
+                    us_xq_cache = {}
+                    for bm in profileDF["block_m"].unique():
+                        s_ids, s_w, _, s_valid, _ = moe_sorting(
+                            dummy_ids, dummy_w, expert, model_dim, dtype, int(bm)
+                        )
+                        _, us_xq = run_perftest(
+                            fused_dynamic_mxfp8_quant_moe_sort,
+                            dummy_x,
+                            sorted_ids=s_ids,
+                            num_valid_ids=s_valid,
+                            token_num=token,
+                            topk=topk,
+                            block_size=int(bm),
+                            sorted_weights=s_w,
+                            num_experts_upper_bound=expert,
+                        )
+                        us_xq_cache[bm] = round(us_xq, 4)
+                        print(
+                            f"  mxfp8 x quant benchmark: blockM={int(bm)}, "
+                            f"us={us_xq_cache[bm]}"
+                        )
+                    is_qi = profileDF["kernelName1"].astype(str).str.endswith("_qi")
+                    profileDF.loc[is_qi, "xbf16"] = 1
+                    profileDF.loc[~is_qi, "us1"] = profileDF.loc[
+                        ~is_qi, "us1"
+                    ] + profileDF.loc[~is_qi, "block_m"].map(us_xq_cache)
                 elif q_dtype_a == dtypes.fp8:
                     from aiter.test_common import run_perftest
 
