@@ -37,9 +37,16 @@ def _hip_pci_bus_id(device_index: int) -> str | None:
 
 
 def power_input_path(device_index: int = 0) -> str | None:
-    """hwmon power1_input for a HIP device ordinal in this process."""
+    """hwmon power1_input for a HIP device ordinal in this process.
+
+    ``AITER_POWER_PATH`` replaces ``{device}`` with that ordinal. A path
+    without ``{device}`` is one file and is only safe for a single tuner
+    process.
+    """
     override = os.environ.get("AITER_POWER_PATH", "").strip()
     if override:
+        if "{device}" in override:
+            return override.replace("{device}", str(int(device_index)))
         return override
     bdf = _hip_pci_bus_id(device_index)
     if not bdf:
@@ -121,6 +128,18 @@ def _sync_cuda() -> None:
         torch.cuda.synchronize()
     except Exception:
         logger.debug("CUDA synchronize skipped", exc_info=True)
+
+
+def shared_power_override_rejected() -> str | None:
+    """Why a multi-process tune must not use this AITER_POWER_PATH, or None."""
+    override = os.environ.get("AITER_POWER_PATH", "").strip()
+    if override and "{device}" not in override:
+        return (
+            "AITER_POWER_PATH points at one hwmon file. With more than one "
+            "tuner process that file would be read for every GPU. Put "
+            "'{device}' in the path for the HIP ordinal, or run with --mp 1."
+        )
+    return None
 
 
 def record_package_watts(fn, device_index: int | None = None) -> float:

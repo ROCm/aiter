@@ -545,7 +545,10 @@ class K5BvTuner(TunerCommon):
         return frame.loc[:, columns].to_dict("records")
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
-        from aiter.utility.tune_result import efficiency_cost, power_selection_enabled
+        from aiter.utility.tune_result import (
+            power_selection_enabled,
+            sort_by_energy_then_latency,
+        )
 
         if isinstance(results, list):
             frame = pd.DataFrame(results)
@@ -565,16 +568,8 @@ class K5BvTuner(TunerCommon):
             if (
                 power_selection_enabled(getattr(args, "select", None))
                 and watts is not None
-                and watts.notna().any()
             ):
-                cost = [
-                    efficiency_cost(us, watt)
-                    for us, watt in zip(results["us"], watts, strict=True)
-                ]
-                results = results.assign(_select_cost=cost).sort_values(
-                    "_select_cost", kind="mergesort"
-                )
-                results = results.drop(columns="_select_cost")
+                results = sort_by_energy_then_latency(results)
             else:
                 results = results.sort_values("us")
             return results.drop_duplicates(subset=self.keys, keep="first").reset_index(

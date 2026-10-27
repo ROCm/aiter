@@ -79,7 +79,9 @@ If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with n
 - **Also**: `AITER_SELECT`
 - **Description**: Rank kernels that pass `errRatio`. `latency` keeps the lowest `us`. `power` ranks by TFLOP/s per package watt (`us * PPT watts`) and writes `watts` and `tflops_per_w`. This applies to every backend that uses the shared tuner, including asm, opus, flydsl, triton, skinny, torch, and hipblaslt. Runtime dispatch is unchanged: the one CSV row per shape is the kernel that runs.
 
-PPT is the whole package (`power1_input`). Keep that GPU otherwise idle, and pass `--shape_grouped` so every candidate for a shape is measured on the same GPU. The sample window defaults to 0.4s (`AITER_POWER_WINDOW_S`) and runs only on the accurate pass. With `--select power`, hipblaslt times every heuristic on that pass instead of only the 20 fastest. `AITER_POWER_PATH` overrides the hwmon file.
+PPT is the whole package (`power1_input`). Keep that GPU otherwise idle, and pass `--shape_grouped` so every candidate for a shape is measured on the same GPU. The sample window defaults to 0.4s (`AITER_POWER_WINDOW_S`) and runs only on the accurate pass. With `--select power`, hipblaslt times every heuristic on that pass instead of only the 20 fastest. `AITER_POWER_PATH` overrides the hwmon file. In a multi-process tune the path must contain `{device}` (the HIP ordinal); a single file is rejected unless `--mp 1`.
+
+Power mode minimizes `us * package watts` among kernels that pass `errRatio`. It does not add a latency bound. The measurement is an isolated package replay, so the winner can change under a different clock, power cap, or neighboring workload. Latency remains the default.
 
 ```bash
 python3 csrc/gemm_a16w16/gemm_tuner.py \

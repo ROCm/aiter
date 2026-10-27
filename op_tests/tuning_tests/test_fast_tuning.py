@@ -1144,6 +1144,44 @@ class TestPowerSelectionGaps(unittest.TestCase):
         self.assertEqual(int(power.iloc[0]["BV"]), 16)
         self.assertEqual(int(latency.iloc[0]["BV"]), 64)
 
+    def test_unmeasured_power_dedup_keeps_lowest_latency(self):
+        import pandas as pd
+
+        from aiter.utility.tune_result import sort_by_energy_then_latency
+
+        frame = pd.DataFrame(
+            [
+                {"name": "slow", "us": 20.0, "watts": float("nan"), "key": 1},
+                {"name": "fast", "us": 10.0, "watts": float("nan"), "key": 1},
+                {"name": "cool", "us": 30.0, "watts": 100.0, "key": 2},
+            ]
+        )
+        ordered = sort_by_energy_then_latency(frame)
+        same_key = ordered[ordered["key"] == 1]
+        self.assertEqual(list(same_key["name"]), ["fast", "slow"])
+        self.assertEqual(ordered.iloc[0]["name"], "cool")
+
+    def test_power_path_expands_per_device_and_rejects_one_file(self):
+        from aiter.utility.package_power import (
+            power_input_path,
+            shared_power_override_rejected,
+        )
+
+        override = "AITER_POWER_PATH"
+        previous = os.environ.get(override)
+        try:
+            os.environ[override] = "/sys/class/drm/card{device}/power1_input"
+            self.assertEqual(power_input_path(3), "/sys/class/drm/card3/power1_input")
+            self.assertIsNone(shared_power_override_rejected())
+            os.environ[override] = "/sys/class/drm/card0/power1_input"
+            self.assertEqual(power_input_path(2), "/sys/class/drm/card0/power1_input")
+            self.assertIn("{device}", shared_power_override_rejected())
+        finally:
+            if previous is None:
+                os.environ.pop(override, None)
+            else:
+                os.environ[override] = previous
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5636,28 +5636,20 @@ class FmoeTuner(TunerCommon):
                 profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
             )
             from aiter.utility.tune_result import (
-                efficiency_cost,
                 power_selection_enabled,
+                sort_by_energy_then_latency,
             )
 
             select_power = power_selection_enabled(getattr(args, "select", None))
             if select_power and "watts" in profileDF.columns:
-                profileDF["_cost"] = [
-                    efficiency_cost(us_i, watts_i)
-                    for us_i, watts_i in zip(profileDF["us"], profileDF["watts"])
-                ]
-                sort_col = "_cost"
+                # Cost alone ties every unread sensor at infinity, and the
+                # following dedup would then keep arrival order.
+                profileDF = sort_by_energy_then_latency(profileDF)
             else:
-                sort_col = "us"
-            profileDF = (
-                profileDF.sort_values(sort_col)
-                .drop_duplicates(
-                    ["stage", "block_m", "flat", "nt", "v2", "_is_fused"], keep="first"
-                )
-                .drop(
-                    columns=["_is_fused"] + (["_cost"] if sort_col == "_cost" else [])
-                )
-            )
+                profileDF = profileDF.sort_values("us")
+            profileDF = profileDF.drop_duplicates(
+                ["stage", "block_m", "flat", "nt", "v2", "_is_fused"], keep="first"
+            ).drop(columns=["_is_fused"])
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage", "flat"]
             )

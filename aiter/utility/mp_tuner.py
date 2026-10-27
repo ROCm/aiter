@@ -472,6 +472,12 @@ def mp_tuner(
     else:
         measure_power = bool(measure_power)
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
+    if measure_power and mp_num > 1:
+        from aiter.utility.package_power import shared_power_override_rejected
+
+        rejected = shared_power_override_rejected()
+        if rejected:
+            raise ValueError(rejected)
     parallel_num = mp_num
     start_idx = 0
     if not tasks:
