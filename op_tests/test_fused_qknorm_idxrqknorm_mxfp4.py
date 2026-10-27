@@ -239,6 +239,58 @@ def test_end_to_end_with_the_fp4_decode_scorer():
     assert torch.allclose(got.reshape(-1), ref, atol=3e-5, rtol=3e-5)
 
 
+@requires_gfx950
+def test_writer_fp8_index_q_is_the_scorers_e4m3_query():
+    """The index-Q the op writes as e4m3 is exactly the bf16 row rounded to e4m3 with
+    saturation, and `score_flydsl_fp4` consumes that buffer as is: the scores are
+    those of the dequantized index K against that e4m3 query."""
+    from aiter.ops.flydsl.kernels.minimax_m3_index_score_fp4 import score_flydsl_fp4
+
+    T, dtype = 300, torch.bfloat16
+    slots = torch.arange(T, dtype=torch.int64, device="cuda")
+    qkv, w, cs, pos = make_inputs(T, dtype)
+    nb = -(-T // 16)
+    kc = torch.zeros(nb, NKV, HD // 8, 16, 8, dtype=dtype, device="cuda")
+    vc = torch.zeros(nb, NKV, 16 // 8, HD, 8, dtype=dtype, device="cuda")
+    ic = torch.full(
+        (-(-T // 128), PAGE_BYTES), SENTINEL, dtype=torch.uint8, device="cuda"
+    )
+    iq_bf16 = torch.empty(T, NIQ * HD, dtype=dtype, device="cuda")
+    iq_e4m3 = torch.empty(T, NIQ * HD, dtype=dtypes.fp8, device="cuda")
+    qo = torch.empty(T, NQ * HD, dtype=dtype, device="cuda")
+    for iq in (iq_bf16, iq_e4m3):
+        aiter.fused_qknorm_idxrqknorm(
+            qkv.clone(), w, w, cs, pos, NQ, NKV, ROT, 1e-6, w, w, NIQ,
+            slots, kc, vc, ic, 16, qo, iq, slots,
+            kv_cache_dtype="auto", index_cache_dtype="mxfp4", asm_layout=True,
+        )  # fmt: skip
+    want = iq_bf16.float().clamp(-448, 448).to(dtypes.fp8)
+    assert torch.equal(iq_e4m3.view(torch.uint8), want.view(torch.uint8))
+    # ...and the decode scorer reads it: row t of request 0 is token t's query.
+    pages = ic.shape[0]
+    kd = torch.as_strided(ic, (pages, 128, 64), (PAGE_BYTES, 64, 1))
+    ks = torch.as_strided(ic, (pages, 128, 4), (PAGE_BYTES, 4, 1), 128 * 64)
+    bt = torch.arange(pages, dtype=torch.int32, device="cuda")[None]
+    seq = torch.tensor([T], dtype=torch.int32, device="cuda")
+    q8 = iq_e4m3[T - 1 : T].view(1, 1, HD)
+    got = score_flydsl_fp4(q8, kd, ks, bt, seq, 1, 1, HD**-0.5, pages)
+    keys = torch.empty(pages * 128, HD, dtype=dtype, device="cuda")
+    ic_auto, _ = run_op((qkv, w, cs, pos), slots, slots, "auto", "auto", dtype)
+    qz, s = per_1x32_f4_quant(ic_auto.reshape(-1, HD))
+    f = fp4_utils.mxfp4_to_f32(qz.view(torch.uint8).reshape(-1, 64).clone())
+    e = fp4_utils.e8m0_to_f32(s.view(torch.uint8).reshape(-1, 4)).repeat_interleave(
+        32, -1
+    )
+    keys.copy_((f * e).to(dtype))
+    z = (keys[:T].float() @ q8.reshape(HD).to(dtype).float()) * (
+        HD**-0.5 * 1.4426950409
+    )
+    z = torch.cat([z, torch.full((pages * 128 - T,), float("-inf"), device="cuda")])
+    assert torch.allclose(
+        got.reshape(-1), z.reshape(pages, 128).amax(-1), atol=3e-5, rtol=3e-5
+    )
+
+
 def test_reference_scale_rule_is_the_hip_rule():
     """The e8m0 rule copied into the op (mxfp4ScaleE8m0) is the one in
     cache_kernels.cu's indexer_fp4_scale_e8m0; this pins the torch quantizer, which

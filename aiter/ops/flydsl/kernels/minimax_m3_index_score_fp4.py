@@ -30,9 +30,16 @@ load and one 4 B scale load, widens each of the four dwords with four
 `v_cvt_scalef32_pk_bf16_fp4`, and feeds the unchanged bf16 MFMA. The 64 lanes of
 a tile read 1 KiB of contiguous data.
 
-Numerics contract, unchanged from the fp8 scorer: K is LIFTED to Q's precision
-(bf16), Q is never rounded down. e2m1 x 2^e is exact in bf16, so the scores are
-those of `dequantize(K)` scored with bf16 arithmetic and an fp32 accumulator.
+Numerics contract for a bf16 Q, unchanged from the fp8 scorer: K is LIFTED to
+Q's precision (bf16), Q is never rounded down. e2m1 x 2^e is exact in bf16, so
+the scores are those of `dequantize(K)` scored with bf16 arithmetic and an fp32
+accumulator.
+
+A Q that is already e4m3 (`idx_q.dtype == dtypes.fp8`, what the index-Q writer
+emits for q8kv4) takes a different, cheaper K path: no widening at all, one
+`v_mfma_scale_f32_16x16x128_f8f6f4` per tile with A = K as fp4 plus its e8m0
+scale and B = Q as e4m3. The products are exact in fp32 (e2m1 x e4m3 x 2^e), so
+the scores are those of `dequantize(K)` against `Q` read as stored.
 
 e8m0 values 0 and 255 are not supported: the hardware takes the scale as the
 float whose exponent field is the byte, so 0 scales by 0.0 (not 2^-127) and 255
@@ -52,9 +59,10 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from aiter import dtypes
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     HEAD_DIM,
     KSTEPS,
@@ -127,8 +135,9 @@ def _cache_policy(geom) -> int:
     return K_CACHE
 
 
-def kernel_name(S: int, H: int, geom) -> str:
-    name = f"m3_index_score_S{S}_H{H}_fp4_L{geom['pages_per_wave']}"
+def kernel_name(S: int, H: int, geom, q_fp8: bool = False) -> str:
+    name = f"m3_index_score_S{S}_H{H}_fp4{'_qf8' if q_fp8 else ''}"
+    name += f"_L{geom['pages_per_wave']}"
     name += f"_d{TILE_DEPTH}"
     if geom["waves_per_tok"] > 1:
         name += f"_tw{geom['waves_per_tok']}"
@@ -172,9 +181,11 @@ def fp4_dword_to_bf16(word, scale_f32):
     return elems
 
 
-def build_index_score_fp4(S: int, H: int, geom):
-    """Compile a score kernel specialised on (S, H, geometry); see the fp8
-    scorer's `build_index_score` for what every knob in `geom` means."""
+def build_index_score_fp4(S: int, H: int, geom, q_fp8: bool = False):
+    """Compile a score kernel specialised on (S, H, geometry, Q dtype); see the
+    fp8 scorer's `build_index_score` for what every knob in `geom` means.
+
+    `q_fp8` swaps the K path for one scaled MFMA per tile with Q held as e4m3."""
     pages_per_wave = geom["pages_per_wave"]
     nt_k = _cache_policy(geom)
     CP_WORLD = geom["cp_world"]
@@ -200,7 +211,7 @@ def build_index_score_fp4(S: int, H: int, geom):
     )
 
     @flyc.kernel(
-        name=kernel_name(S, H, geom),
+        name=kernel_name(S, H, geom, q_fp8),
         known_block_size=[THREADS, 1, 1],
     )
     def score_kernel(
@@ -223,7 +234,7 @@ def build_index_score_fp4(S: int, H: int, geom):
     ):
         """One CTA scores CHUNK pages of request b.
 
-        arg_q      [batch*S, H, 128] bf16 query
+        arg_q      [batch*S, H, 128] bf16 or e4m3 query
         arg_kd     [pages, 128, 64] uint8 packed e2m1, page stride in bytes
         arg_ks     [pages, 128, 4] uint8 e8m0, page stride in bytes
         arg_score  [H, batch*S, max_block] fp32, one per (feature, page)
@@ -301,20 +312,48 @@ def build_index_score_fp4(S: int, H: int, geom):
             t.store(raw16.bitcast(fx.BFloat16))
             return t
 
+        def load_q8(i):
+            """One lane's e4m3 B operand of the scaled MFMA for feature tile i: 32
+            bytes, Q[16g .. 16g+15] then Q[64+16g .. 64+16g+15] of its column.
+            That is how the hardware lays an fp8 operand out against an fp4 A (the
+            tests pin it), NOT the contiguous 32g.. run the fp4 K fragment holds."""
+            tok, head = tok_head_of(i)
+            row = b * fx.Int32(S) + tok
+            f = feature_of(i)
+            in_range = f < fx.Int32(F)
+            row = in_range.select(row, fx.Int32(0))
+            head = in_range.select(head, fx.Int32(0))
+            base = row * i32_stride_q_n + head * i32_stride_q_h + g * fx.Int32(16)
+            halves = [
+                fx.add_offset(
+                    fx.get_iter(q_buf), (base + fx.Int32(64 * h)) >> fx.Int32(2)
+                ).load(T.vec(4, T.i32))
+                for h in range_constexpr(2)
+            ]
+            return fx.Vector.from_elements(
+                [halves[h][k] for h in range_constexpr(2) for k in range_constexpr(4)],
+                dtype=fx.Int32,
+            )
+
         lds = (
             fx.SharedAllocator().allocate(SharedStorage).peek()
             if const_expr(SharedStorage is not None)
             else None
         )
-        q_raw = [
-            [load_q_frag(i, j) for j in range_constexpr(Q_LOADS)]
-            for i in range_constexpr(FEAT_TILES_PER_WAVE)
-        ]
-        q_frag = [
-            [as_bf16_frag(q_raw[i][ks]) for ks in range_constexpr(KSTEPS)]
-            for i in range_constexpr(FEAT_TILES_PER_WAVE)
-        ]
-        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.BFloat16))
+        if const_expr(q_fp8):
+            q_b = [load_q8(i) for i in range_constexpr(FEAT_TILES_PER_WAVE)]
+        else:
+            q_raw = [
+                [load_q_frag(i, j) for j in range_constexpr(Q_LOADS)]
+                for i in range_constexpr(FEAT_TILES_PER_WAVE)
+            ]
+            q_frag = [
+                [as_bf16_frag(q_raw[i][ks]) for ks in range_constexpr(KSTEPS)]
+                for i in range_constexpr(FEAT_TILES_PER_WAVE)
+            ]
+            mma_atom = fx.make_mma_atom(
+                fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.BFloat16)
+            )
         zero4 = fx.full(4, 0.0, fx.Float32)
         neg_inf = fx.Float32(NEG_INF)
         if const_expr(SPREAD):
@@ -395,16 +434,46 @@ def build_index_score_fp4(S: int, H: int, geom):
         # ==================== MAIN LOOP ====================
         def score_tok_tile(p, tok_tile, loaded, run_max):
             data, scale_word = loaded
-            scale_f32 = e8m0_to_f32(fx.Int32(scale_word), g_shift)
-            accs = []
-            for i in range_constexpr(FEAT_TILES_PER_WAVE):
-                acc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
-                acc.store(zero4)
-                accs.append(acc)
-            for ks in range_constexpr(KSTEPS):
-                kf = convert_k(data, scale_f32, ks)
+            if const_expr(q_fp8):
+                # A = K as fp4 (4 dwords; the other 4 are unused by cbsz=4), scaled by
+                # this lane group's e8m0 byte (scaleA, byte 0 of the shifted word);
+                # B = Q as e4m3 with unit scale (0x7F = 2^0 in all four bytes).
+                a_k = fx.Vector.from_elements(
+                    [data[k] for k in range_constexpr(4)]
+                    + [fx.Int32(0) for _ in range_constexpr(4)],
+                    dtype=fx.Int32,
+                )
+                scale_a = fx.Int32(scale_word).shrui(g * fx.Int32(8))
+                accs = [
+                    fx.Vector(
+                        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            T.f32x4,
+                            [
+                                a_k,
+                                q_b[i],
+                                zero4,
+                                4,
+                                0,
+                                0,
+                                scale_a,
+                                0,
+                                fx.Int32(0x7F7F7F7F),
+                            ],
+                        )
+                    )
+                    for i in range_constexpr(FEAT_TILES_PER_WAVE)
+                ]
+            else:
+                scale_f32 = e8m0_to_f32(fx.Int32(scale_word), g_shift)
+                accs = []
                 for i in range_constexpr(FEAT_TILES_PER_WAVE):
-                    fx.gemm(mma_atom, accs[i], kf, q_frag[i][ks], accs[i])
+                    acc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+                    acc.store(zero4)
+                    accs.append(acc)
+                for ks in range_constexpr(KSTEPS):
+                    kf = convert_k(data, scale_f32, ks)
+                    for i in range_constexpr(FEAT_TILES_PER_WAVE):
+                        fx.gemm(mma_atom, accs[i], kf, q_frag[i][ks], accs[i])
             tok_base = (
                 global_block(p) * fx.Int32(PAGE)
                 + fx.Int32(MFMA_M * tok_tile)
@@ -414,7 +483,11 @@ def build_index_score_fp4(S: int, H: int, geom):
             for i in range_constexpr(FEAT_TILES_PER_WAVE):
                 tok, _ = tok_head_of(i)
                 causal_len = seq_len - fx.Int32(S) + tok + fx.Int32(1)
-                v = fx.Vector(fx.memref_load_vec(accs[i]))
+                v = (
+                    accs[i]
+                    if const_expr(q_fp8)
+                    else fx.Vector(fx.memref_load_vec(accs[i]))
+                )
                 for r in range_constexpr(4):
                     ok = (tok_base + fx.Int32(r)) < causal_len
                     run_max[i] = run_max[i].maximumf(
@@ -553,10 +626,10 @@ def build_index_score_fp4(S: int, H: int, geom):
 _CACHE = {}
 
 
-def _get(S, H, geom, device):
-    key = (S, H, tuple(sorted(geom.items())), TILE_DEPTH, device)
+def _get(S, H, geom, device, q_fp8=False):
+    key = (S, H, tuple(sorted(geom.items())), TILE_DEPTH, q_fp8, device)
     if key not in _CACHE:
-        _CACHE[key] = build_index_score_fp4(S, H, geom)
+        _CACHE[key] = build_index_score_fp4(S, H, geom, q_fp8)
     return _CACHE[key]
 
 
@@ -615,7 +688,7 @@ def _validate_metadata(
         raise ValueError("S and H must be positive integers")
     device = idx_q.device
     _validate_arch(device)
-    _validate_tensor(idx_q, "idx_q", (torch.bfloat16,), 3, device, 16)
+    _validate_tensor(idx_q, "idx_q", (torch.bfloat16, dtypes.fp8), 3, device, 16)
     _validate_cache(k_data, k_scale, device)
     if idx_q.shape[1:] != (H, HEAD_DIM) or idx_q.shape[0] % S:
         raise ValueError("idx_q: expected [batch*S, H, 128]")
@@ -663,6 +736,7 @@ def index_score_supported_fp4(
     *,
     seq_lens,
     sm_scale=1.0,
+    q_scale=1.0,
     out=None,
     work_map=None,
     **cp,
@@ -684,7 +758,7 @@ def index_score_supported_fp4(
             work_map,
             **cp,
         )
-        scaled = sm_scale * LOG2E
+        scaled = sm_scale * q_scale * LOG2E
         return math.isfinite(scaled) and 2**-149 <= scaled <= (2 - 2**-23) * 2**127
     except (AttributeError, IndexError, TypeError, ValueError, ZeroDivisionError):
         return False
@@ -704,12 +778,18 @@ def score_flydsl_fp4(
     work_map=None,
     cp_world: int = 1,
     cp_rank: int = 0,
+    q_scale: float = 1.0,
 ):
     """Host entry point: `score_flydsl` for an MXFP4 index cache.
 
     `k_data`/`k_scale` are the two views described in the module docstring;
     everything else, including the CP shard, the work map and the score layout,
     is as in `score_flydsl`.
+
+    `idx_q` is bf16 or e4m3 (`dtypes.fp8`), dispatched on its dtype. An e4m3 Q is
+    used as stored times `q_scale` (default 1.0: the plain cast the writer
+    produces, i.e. an unscaled q8kv4 query); `q_scale` must be positive and is
+    folded into the score multiplier, like `sm_scale`.
     """
     import torch
 
@@ -729,19 +809,22 @@ def score_flydsl_fp4(
     )
     if block_table is None or seq_lens is None:
         raise ValueError("block_table and seq_lens are required")
-    scaled = sm_scale * LOG2E
+    scaled = sm_scale * q_scale * LOG2E
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
-        raise ValueError("sm_scale * LOG2E must be finite and positive in FP32")
+        raise ValueError(
+            "sm_scale * q_scale * LOG2E must be finite and positive in FP32"
+        )
+    q_fp8 = idx_q.dtype == dtypes.fp8
     if out is None:
         out = alloc_score(batch, S, H, max_block, idx_q.device)
-    launch, _chunk = _get(S, H, geom, idx_q.device.index)
+    launch, _chunk = _get(S, H, geom, idx_q.device.index, q_fp8)
     chunks = _grid_chunks(max_block, geom)
     if work_map is None:
         work_map = _make_map(seq_lens, max_block, geom, batch * chunks)
     with torch.cuda.device(idx_q.device):
         _run_compiled(
             launch,
-            ptr_arg(idx_q, fx.BFloat16),
+            ptr_arg(idx_q, fx.Float8E4M3FN if q_fp8 else fx.BFloat16),
             ptr_arg(k_data, fx.Uint8),
             ptr_arg(k_scale, fx.Uint8),
             ptr_arg(out, fx.Float32),

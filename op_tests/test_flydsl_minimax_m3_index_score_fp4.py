@@ -121,6 +121,23 @@ def assert_topk_agrees(got, ref):
     assert bool((err <= ATOL + RTOL * b[fin].abs()).all())
 
 
+@pytest.fixture(params=["bf16", "e4m3"], ids=["qbf16", "qe4m3"])
+def qdt(request):
+    """The dtype the query reaches the scorer in."""
+    return request.param
+
+
+def q_for(q, qdt):
+    """(the Q the kernel is given, the bf16 Q the oracle scores). For e4m3 that is
+    the index-Q writer's rule: the value is already rounded to bf16, then RNE and
+    saturating to e4m3 (torch's own cast would turn an overflow into NaN). e4m3 is a
+    subset of bf16, so the oracle's bf16 view of it is exact."""
+    if qdt == "bf16":
+        return q, q
+    q8 = q.float().clamp(-448, 448).to(dtypes.fp8)
+    return q8, q8.to(torch.bfloat16)
+
+
 def run_fp4(q, kd, ks, bt, seq, S, H, mb, **kw):
     return kernel.score_flydsl_fp4(q, kd, ks, bt, seq, S, H, D**-0.5, mb, **kw)
 
@@ -134,11 +151,12 @@ def run_fp4(q, kd, ks, bt, seq, S, H, mb, **kw):
     fp8_test.build_matrix(),
     ids=[c[0].replace("fp8", "fp4") for c in fp8_test.build_matrix()],
 )
-def test_matches_oracle(case):
+def test_matches_oracle(case, qdt):
     _, B, S, H, lens, kw = case
     q, cache8, bt, seq, mb = make_case(B, S, H, lens, **kw)
+    q, q_ref = q_for(q, qdt)
     kd, ks, deq = fp4_cache_of(cache8)
-    ref = score_oracle(q, deq, bt, seq, S, H, D**-0.5, mb)
+    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, mb)
     got = run_fp4(q, kd, ks, bt, seq, S, H, mb)
     ok, why = compare(got, ref)
     assert ok, why
@@ -147,7 +165,7 @@ def test_matches_oracle(case):
 
 @requires_gfx950
 @pytest.mark.parametrize("point", GEOM_POINTS, ids=geom_id)
-def test_every_geometry_matches_oracle(point):
+def test_every_geometry_matches_oracle(point, qdt):
     """Every launch geometry the selector can reach (work-chunk depth, token
     split, spread, CP shard) against the oracle. Negative scores expose
     accidental zero-initialised maxima, as in the fp8 test."""
@@ -159,9 +177,10 @@ def test_every_geometry_matches_oracle(point):
     assert mb == glob
     local = -(-(mb - rank) // world)
     q.copy_(q.abs() + 0.25)
+    q, q_ref = q_for(q, qdt)
     kd, ks, deq = fp4_cache_of(cache8, lambda b: -(b.abs() + 0.25))
     del cache8
-    ref = score_oracle(q, deq, bt, seq, S, H, D**-0.5, local, world, rank)
+    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, local, world, rank)
     out = fp8_kernel.alloc_score(batch, S, H, local, q.device)
     out.fill_(float("nan"))
     got = run_fp4(
@@ -178,10 +197,11 @@ def test_every_geometry_matches_oracle(point):
 @pytest.mark.parametrize("S,H", [(1, 4), (4, 2), (8, 4)])
 @pytest.mark.parametrize("layout", ["contiguous", "feature"])
 @pytest.mark.parametrize("map_in_graph", [False, True])
-def test_graph_buffers(world, rank, S, H, layout, map_in_graph):
+def test_graph_buffers(world, rank, S, H, layout, map_in_graph, qdt):
     """Captured once, replayed with different lengths and block tables."""
     B, mb = 3, 9
     q, cache8, _, seq, _ = make_case(B, S, H, [0, 513, 1])
+    q, q_ref = q_for(q, qdt)
     kd, ks, deq = fp4_cache_of(cache8)
     bt = torch.zeros((B, mb * world), dtype=torch.int32, device="cuda")
     bt[:, :5] = torch.arange(5, device="cuda", dtype=torch.int32)
@@ -224,14 +244,17 @@ def test_graph_buffers(world, rank, S, H, layout, map_in_graph):
         if not map_in_graph:
             kernel.build_work_map(seq, mb, S, H, out=buf, **cp)
         graph.replay()
-        check_scores(out, score_oracle(q, deq, bt, seq, S, H, D**-0.5, mb, world, rank))
+        check_scores(
+            out, score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, mb, world, rank)
+        )
 
 
 @requires_gfx950
-def test_split_and_single_region_views_agree_bitwise():
+def test_split_and_single_region_views_agree_bitwise(qdt):
     """Two separate tensors and two views of one `[pages, 8704]` page are the
     same input to the kernel, down to the bit."""
     q, cache8, bt, seq, mb = make_case(3, 4, 4, [130, 4096, 513])
+    q, _ = q_for(q, qdt)
     kd, ks, _ = fp4_cache_of(cache8)
     _buf, kd1, ks1 = single_region_views(kd, ks)
     assert kd1.stride(0) == ks1.stride(0) == 8704
@@ -241,23 +264,24 @@ def test_split_and_single_region_views_agree_bitwise():
 
 
 @requires_gfx950
-def test_agrees_with_the_fp8_kernel_on_the_same_values():
+def test_agrees_with_the_fp8_kernel_on_the_same_values(qdt):
     """The dequantized K is exactly representable in fp8 (for scales inside
     e4m3's range), so the fp8 scorer and this one score the SAME numbers. Not
     bitwise: the two read different k permutations, so the fp32 sums associate
     differently."""
     B, S, H = 2, 4, 4
     q, cache8, bt, seq, mb = make_case(B, S, H, [4096, 1000])
+    q, q_ref = q_for(q, qdt)
     kd, ks, deq = fp4_cache_of(cache8)
     as_fp8 = deq.to(dtypes.fp8)
     assert torch.equal(as_fp8.to(torch.bfloat16), deq), "dequantized K left fp8's range"
     a = run_fp4(q, kd, ks, bt, seq, S, H, mb)
-    b = fp8_kernel.score_flydsl(q, as_fp8, bt, seq, S, H, D**-0.5, mb)
+    b = fp8_kernel.score_flydsl(q_ref, as_fp8, bt, seq, S, H, D**-0.5, mb)
     check_scores(a, b)
 
 
 @requires_gfx950
-def test_wide_scale_range():
+def test_wide_scale_range(qdt):
     """Per-token magnitudes over 2^+-20 give e8m0 bytes spread over the range a
     real cache uses; every lane group must pick its own byte."""
     B, S, H = 2, 4, 4
@@ -274,7 +298,8 @@ def test_wide_scale_range():
     kd, ks, deq = quantize_mxfp4(k.to(torch.bfloat16))
     assert int(ks.min()) < 110 and int(ks.max()) > 140
     q2 = (q.float() * 2**-8).to(torch.bfloat16)  # keep scores inside fp32 comfortably
-    ref = score_oracle(q2, deq, bt, seq, S, H, D**-0.5, mb)
+    q2, q2_ref = q_for(q2, qdt)
+    ref = score_oracle(q2_ref, deq, bt, seq, S, H, D**-0.5, mb)
     got = run_fp4(q2, kd, ks, bt, seq, S, H, mb)
     ok, why = compare(got, ref)
     assert ok, why
@@ -307,6 +332,68 @@ def test_default_score_buffer_reads_as_minus_inf():
     out = run_fp4(q, kd, ks, bt, seq, 1, 1, mb)
     assert (out == float("-inf")).any()
     assert torch.isfinite(out[out != float("-inf")]).all()
+
+
+@requires_gfx950
+def test_e4m3_q_scale_and_dtype_dispatch():
+    """`q_scale` multiplies the scores of an e4m3 query (default 1.0 = the plain cast),
+    a non-positive one is refused, and the dtype alone picks the variant."""
+    B, S, H = 2, 4, 4
+    q, cache8, bt, seq, mb = make_case(B, S, H, [513, 4096])
+    q8, q_ref = q_for(q, "e4m3")
+    kd, ks, deq = fp4_cache_of(cache8)
+    ref = score_oracle(q_ref, deq, bt, seq, S, H, D**-0.5, mb)
+    base = run_fp4(q8, kd, ks, bt, seq, S, H, mb)
+    check_scores(base, ref)
+    half = run_fp4(q8, kd, ks, bt, seq, S, H, mb, q_scale=0.5)
+    fin = torch.isfinite(base)
+    assert torch.equal(torch.isneginf(half), torch.isneginf(base))
+    assert torch.allclose(half[fin], 0.5 * base[fin], rtol=1e-6, atol=1e-6)
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="q_scale"):
+            run_fp4(q8, kd, ks, bt, seq, S, H, mb, q_scale=bad)
+        assert not kernel.index_score_supported_fp4(
+            q8, kd, ks, S, H, mb, bt, seq_lens=seq, q_scale=bad
+        )
+    assert kernel.index_score_supported_fp4(q8, kd, ks, S, H, mb, bt, seq_lens=seq)
+
+
+@requires_gfx950
+def test_e4m3_q_against_bf16_q_is_only_the_q_rounding():
+    """What taking the query as e4m3 costs, isolated: the same cache scored with the
+    bf16 query and with that query rounded to e4m3. The gap is bounded by e4m3's
+    2^-4 relative step per element, and the top-16 block set moves only through
+    near ties."""
+    B, S, H = 2, 4, 4
+    q, cache8, bt, seq, mb = make_case(B, S, H, [8192, 6000])
+    q8, _ = q_for(q, "e4m3")
+    kd, ks, _ = fp4_cache_of(cache8)
+    a = run_fp4(q, kd, ks, bt, seq, S, H, mb)
+    b = run_fp4(q8, kd, ks, bt, seq, S, H, mb)
+    fin = torch.isfinite(a)
+    assert torch.equal(fin, torch.isfinite(b))
+    gap = (a[fin] - b[fin]).abs().max().item()
+    assert gap <= 0.0625 * a[fin].abs().max().item(), gap
+    ta = a.masked_fill(~fin, float("-inf")).topk(16, dim=-1).indices
+    tb = b.masked_fill(~fin, float("-inf")).topk(16, dim=-1).indices
+    same = torch.tensor(
+        [
+            len(set(x.tolist()) & set(y.tolist())) / 16
+            for x, y in zip(ta.reshape(-1, 16), tb.reshape(-1, 16))
+        ]
+    )
+    assert same.mean() > 0.8, same.mean()
+
+
+@requires_gfx950
+def test_e4m3_q_rows_must_be_16_byte_aligned():
+    _, cache8, bt, seq, mb = make_case(2, 4, 2, [513, 513])
+    kd, ks, _ = fp4_cache_of(cache8)
+    flat = torch.empty(8 * 2 * D + 64, dtype=dtypes.fp8, device="cuda")
+    bad = torch.as_strided(flat, (8, 2, D), (2 * D + 8, D, 1), 0)  # row stride 264 B
+    assert not kernel.index_score_supported_fp4(bad, kd, ks, 4, 2, mb, bt, seq_lens=seq)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        run_fp4(bad, kd, ks, bt, seq, 4, 2, mb)
 
 
 # ---------------------------------------------------------------------------
