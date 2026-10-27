@@ -219,10 +219,15 @@ def _load_tuning_kernels(monkeypatch):
 def test_gemm_a16w4_tuning_entry(M, N, K, monkeypatch):
     _skip_if_unsupported_arch()
     spec = _load_tuning_kernels(monkeypatch).KERNELS["gemm_a16w4"]
-    call, (x, w, w_scales, y), _ = spec.setup({"M": M, "N": N, "K": K}, "triton")
+    make_case, _ = spec.setup({"M": M, "N": N, "K": K}, "triton")
+    launch, rot_bufs, _, _, _ = make_case(
+        {"target_mb": 1, "min_pool_len": 1, "print_info": False}
+    )
+    bufs = rot_bufs[0]
 
-    out = call(None, x, w, w_scales, y)
+    out = launch(None, **bufs)
 
+    x, w, w_scales = bufs["x"], bufs["w"], bufs["w_scales"]
     q = torch.stack((w & 0xF, w >> 4), dim=-1).reshape(N, K)
     _check(out, run_torch(x, q, w_scales, dtype=x.dtype), x.dtype)
 

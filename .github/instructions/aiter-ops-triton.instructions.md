@@ -323,6 +323,13 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
   belongs in the tuning scripts and benchmarks.
 - Benchmarks are `op_tests/op_benchmarks/triton/bench_<op>.py` and look like
   the existing files. The config and shuffle rules also apply to them.
+- The GEMM tuning scripts in `utils/_triton/tuning/` time configs only
+  through the benchmarks. Flag a timer, a CUDA graph, input generation or a
+  kernel launch in `utils/_triton/tuning/`. They go in the benchmark's
+  `make_bench_case` and in `benchmark_utils.py`.
+- Flag a GEMM benchmark that a `kernels.py` entry uses when its
+  `make_bench_case` does not take a config, or when its CLI times the kernel
+  with other code than `make_bench_case`.
 
 ## Keep the docs current
 

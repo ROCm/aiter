@@ -3,14 +3,20 @@
 """Driver: sweep the full search space for one kernel and shape, then install the winners.
 
 Per M:   plan            harness.py --plan: load defaults, generate combinations, prune
-         check_settings  records can only be resumed when they were timed the same way
          sweep           harness.py --configs ...: the candidates are dealt round-robin to the
-                         GPUs, one serial worker per GPU, with crash and hang recovery
-         final_round     with several GPUs: re-time the baseline and the ten fastest on the first
-                         GPU into <results>.final.jsonl, the only file the installer uses for
-                         that M, so the winner comes from same-device numbers
+                         GPUs, one serial worker per GPU, with crash and hang recovery; each
+                         GPU times the baseline first, then each candidate once with the
+                         benchmark's TUNE_SCREEN settings
+         final_round     rank the candidates by time / baseline time of their own GPU; re-time
+                         the baseline, the ten best and every candidate within 3% of the best
+                         ratio on the first GPU, FINAL_PASSES times in turn, with
+                         TUNE_CONFIRM and the output check (harness.py --confirm), into
+                         <results>.final<p>.jsonl: the only files the installer uses for that M
          summarize
 Then:    install         write_best_configs.py: select winners, merge buckets, validate, write
+
+The timing settings live in the benchmark (benchmark_utils.TUNE_*), not on this command line. A
+worker refuses to resume a results file that was timed with other settings; use --fresh.
 
 --all-buckets sweeps every M bucket of the family up to TOP_BUCKET_M (8192); the installer
 sets "any" to a copy of DEFAULT.json's "any". The driver never imports torch or aiter: every
@@ -34,9 +40,9 @@ from _utils import (
     TOP_BUCKET_M,
     add_shape_args,
     append_record,
+    candidate_key,
     config_key,
-    final_results_path,
-    iter_records,
+    final_results_paths,
     plan_path,
     read_records,
     results_path,
@@ -46,6 +52,9 @@ from kernels import get_spec
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FINAL_ROUND_SIZE = 10
+FINAL_ROUND_WINDOW = (
+    0.03  # candidates this close to the fastest also go to the final round
+)
 STOP = (
     threading.Event()
 )  # set on Ctrl-C or a fatal shard error: every running worker is terminated
@@ -91,9 +100,6 @@ def parse_args(argv=None):
         default=600,
         help="seconds allowed for planning and for a worker to become ready",
     )
-    parser.add_argument("--replays", type=int, default=25)
-    parser.add_argument("--calls", type=int, default=24)
-    parser.add_argument("--cold-mb", type=int, default=1024)
     parser.add_argument(
         "--fresh", action="store_true", help="discard existing records for these shapes"
     )
@@ -184,23 +190,11 @@ def print_plan(plan_, shape):
     )
 
 
-def check_settings(out, args):
-    """Records can only be resumed when they were timed the same way."""
-    ready = next((r for r in iter_records(out) if r["status"] == "ready"), None)
-    if ready is None:
-        return
-    recorded = (ready["calls"], ready["replays"], ready.get("cold_mb"))
-    if recorded != (args.calls, args.replays, args.cold_mb):
-        sys.exit(
-            f"{out} was timed with calls={recorded[0]} replays={recorded[1]} cold_mb={recorded[2]}; "
-            "rerun with the same settings or --fresh"
-        )
-
-
 def discard(out):
     """Remove this shape's results, final round, logs and todo files (and no other shape's)."""
-    final_out = final_results_path(out)
-    paths = [out, final_out] + glob.glob(out + ".*") + glob.glob(final_out + ".*")
+    paths = [out] + glob.glob(out + ".*")
+    for final_out in final_results_paths(out):
+        paths += [final_out] + glob.glob(final_out + ".*")
     for path in paths:
         if os.path.isfile(path):
             os.remove(path)
@@ -260,29 +254,14 @@ def run_worker(command, env, log_path, stall, setup_timeout):
     return "failed" if ready or became_ready() else "setup_failed"
 
 
-def run_batch(spec, shape, backend, batch, out, gpu, args):
+def run_batch(spec, shape, backend, batch, out, gpu, args, confirm):
     """One worker process on one GPU for these candidates; marks the candidate it died on."""
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
     todo_file, log_path = f"{out}.gpu{gpu}.todo.json", f"{out}.gpu{gpu}.log"
     with open(todo_file, "w") as f:
         json.dump(batch, f)
-    command = worker_command(
-        spec,
-        shape,
-        backend,
-        [
-            "--replays",
-            str(args.replays),
-            "--calls",
-            str(args.calls),
-            "--cold-mb",
-            str(args.cold_mb),
-            "--configs",
-            todo_file,
-            "--out",
-            out,
-        ],
-    )
+    extra = ["--configs", todo_file, "--out", out] + (["--confirm"] if confirm else [])
+    command = worker_command(spec, shape, backend, extra)
     outcome = run_worker(command, env, log_path, args.stall, args.setup_timeout)
     if outcome in ("finished", "cancelled"):
         return  # a cancelled worker's candidate keeps its start marker and is resumed next time
@@ -293,27 +272,29 @@ def run_batch(spec, shape, backend, batch, out, gpu, args):
     for (
         candidate
     ) in batch:  # the start marker without a final record is the one it died on
-        if records.get(config_key(candidate), {}).get("status") == "start":
+        if records.get(candidate_key(candidate, gpu), {}).get("status") == "start":
             append_record(
                 out,
                 {
                     "status": status,
                     "baseline": candidate is None,
                     "config": candidate,
+                    "gpu": str(gpu),
                     "error": f"worker {outcome}",
                 },
             )
             print(f"  gpu {gpu}: {status}: {json.dumps(candidate)}", flush=True)
 
 
-def sweep_shard(spec, shape, backend, candidates, out, gpu, args):
+def sweep_shard(spec, shape, backend, candidates, out, gpu, args, confirm):
     """Run every candidate of this shard that has no final record yet, in batches, on one GPU."""
     while not STOP.is_set():
         records = read_records(out)
         todo = [
             c
             for c in candidates
-            if records.get(config_key(c), {}).get("status") not in FINAL_STATUSES
+            if records.get(candidate_key(c, gpu), {}).get("status")
+            not in FINAL_STATUSES
         ]
         if not todo:
             return
@@ -322,15 +303,19 @@ def sweep_shard(spec, shape, backend, candidates, out, gpu, args):
             f"running {min(len(todo), args.batch)}",
             flush=True,
         )
-        run_batch(spec, shape, backend, todo[: args.batch], out, gpu, args)
+        run_batch(spec, shape, backend, todo[: args.batch], out, gpu, args, confirm)
 
 
 def sweep(spec, shape, backend, candidates, out, gpus, args):
-    """Deal the candidates to the GPUs, one serial worker each; a failing shard stops the others."""
-    shards = [candidates[i :: len(gpus)] for i in range(len(gpus))]
+    """Deal the candidates to the GPUs, one serial worker each; a failing shard stops the others.
+
+    Every shard starts with the baseline, so each GPU has its own reference to rank against.
+    """
+    others = [c for c in candidates if c is not None]
+    shards = [[None] + others[i :: len(gpus)] for i in range(len(gpus))]
     with ThreadPoolExecutor(len(gpus)) as pool:
         futures = [
-            pool.submit(sweep_shard, spec, shape, backend, shard, out, gpu, args)
+            pool.submit(sweep_shard, spec, shape, backend, shard, out, gpu, args, False)
             for shard, gpu in zip(shards, gpus)
         ]
         try:
@@ -342,43 +327,72 @@ def sweep(spec, shape, backend, candidates, out, gpus, args):
 
 
 def final_round(spec, shape, backend, candidates, out, gpu, args):
-    """Re-time the baseline and the fastest current candidates on one GPU into the final-round file."""
+    """Re-time the baseline and the fastest current candidates on one GPU, FINAL_PASSES times.
+
+    The finalists are picked by their time relative to the baseline of the GPU that timed them,
+    so a GPU that runs faster or slower than the others does not decide who gets in. Each pass
+    times every finalist once, in the same order (baseline first), into its own file, so the
+    passes interleave the candidates in time.
+    """
     records = read_records(out)
     current = {config_key(c) for c in candidates}  # records of an older plan stay out
-    ok = sorted(
-        (
-            r
-            for key, r in records.items()
-            if key in current and r["status"] == "ok" and not r.get("baseline")
-        ),
-        key=lambda r: r["us"],
-    )
-    fastest = [r["config"] for r in ok[:FINAL_ROUND_SIZE]]
-    final_out = final_results_path(out)
-    if os.path.exists(final_out):
-        os.remove(final_out)
+    ok = [
+        r
+        for key, r in records.items()
+        if key in current and r["status"] == "ok" and not r.get("baseline")
+    ]
+    baseline_us = {
+        r["gpu"]: r["us"]
+        for r in records.values()
+        if r.get("baseline") and r["status"] == "ok"
+    }
+    if all(r["gpu"] in baseline_us for r in ok):
+        relative = {id(r): r["us"] / baseline_us[r["gpu"]] for r in ok}
+    else:
+        missing = sorted({r["gpu"] for r in ok} - set(baseline_us))
+        print(
+            f"  no ok baseline on gpu {missing}: ranking by absolute time", flush=True
+        )
+        relative = {id(r): r["us"] for r in ok}
+    ok.sort(key=lambda r: relative[id(r)])
+    limit = relative[id(ok[0])] * (1 + FINAL_ROUND_WINDOW) if ok else 0
+    finalists = [
+        r["config"]
+        for i, r in enumerate(ok)
+        if i < FINAL_ROUND_SIZE or relative[id(r)] <= limit
+    ]
+    final_outs = final_results_paths(out)
     print(
-        f"  final round on gpu {gpu}: re-timing the baseline and the {len(fastest)} fastest",
+        f"  final round on gpu {gpu}: the baseline and {len(finalists)} candidates, "
+        f"{len(final_outs)} passes",
         flush=True,
     )
-    sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args)
+    for final_out in final_outs:
+        if os.path.exists(final_out):
+            os.remove(final_out)
+        sweep_shard(
+            spec, shape, backend, [None] + finalists, final_out, gpu, args, True
+        )
 
 
 def summarize(out, candidates):
     records = read_records(out)
     counts = {}
+    baselines = [r["status"] for r in records.values() if r.get("baseline")]
     for candidate in candidates:
-        status = records.get(config_key(candidate), {}).get("status", "missing")
-        counts[status] = counts.get(status, 0) + 1
-    if os.path.exists(final_results_path(out)):
-        records = read_records(final_results_path(out))
-        print("  final round (same-device numbers the installer uses):")
-    baseline = records.get("baseline", {})
-    if baseline.get("status") == "ok":
-        print(
-            f"  baseline (installed, is_tuned={baseline.get('is_tuned')}): "
-            f"{baseline['us']:.3f} us  {json.dumps(baseline['config'])}"
-        )
+        if candidate is not None:
+            status = records.get(config_key(candidate), {}).get("status", "missing")
+            counts[status] = counts.get(status, 0) + 1
+    first_pass = final_results_paths(out)[0]
+    if os.path.exists(first_pass):
+        records = read_records(first_pass)
+        print("  final round, pass 1 (the installer compares every pass):")
+    for baseline in records.values():
+        if baseline.get("baseline") and baseline["status"] == "ok":
+            print(
+                f"  baseline on gpu {baseline['gpu']} (installed, is_tuned={baseline.get('is_tuned')}): "
+                f"{baseline['us']:.3f} us  {json.dumps(baseline['config'])}"
+            )
     ok = sorted(
         (r for r in records.values() if r["status"] == "ok" and not r.get("baseline")),
         key=lambda r: r["us"],
@@ -387,7 +401,7 @@ def summarize(out, candidates):
         print(
             f"  {record['us']:10.3f} us  {record['tflops']:8.1f} TFLOPS  {json.dumps(record['config'])}"
         )
-    print(f"  {counts}", flush=True)
+    print(f"  {counts}, baselines {baselines}", flush=True)
 
 
 def install(spec, args, backend, gpu):
@@ -424,13 +438,10 @@ def main(argv=None):
         out = results_path(args.runs_dir, plan_["arch"], backend, spec.name, shape)
         if args.fresh:
             discard(out)
-        check_settings(out, args)
         print(f"  results: {out}", flush=True)
         candidates = [None] + plan_["configs"]  # None is the installed baseline
         sweep(spec, shape, backend, candidates, out, gpus, args)
-        # the installer prefers a final-round file, so an existing one is always refreshed
-        if len(gpus) > 1 or os.path.exists(final_results_path(out)):
-            final_round(spec, shape, backend, candidates, out, gpus[0], args)
+        final_round(spec, shape, backend, candidates, out, gpus[0], args)
         summarize(out, candidates)
 
     return install(spec, args, backend, gpus[0])

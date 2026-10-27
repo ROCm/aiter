@@ -2,44 +2,34 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """One function per tunable kernel, registered with @kernel(...), which only carries metadata.
 
-Every kernel function has the same layout: imports -> inputs -> call -> optional should_skip
--> return (call, inputs, should_skip).
+The tuning scripts only make, prune and select configs. Everything about running and timing a
+kernel (inputs, the launch with a config, derived keys, the output check) is in its benchmark,
+op_tests/op_benchmarks/triton/bench_<op>.py, as make_bench_case(). Every kernel function has the
+same layout: shape values -> make_case -> optional should_skip -> return (make_case, should_skip).
 
-  call(config, *inputs)  one launch of the public wrapper. config is a fresh deep copy per
-                         launch (the wrappers mutate it), or None, which makes the wrapper use
-                         the installed config (that is the baseline). Output resets and derived
-                         keys belong here. The tensors are explicit arguments because the
-                         benchmark rotates cold copies of them.
-  inputs                 the tensors call takes; outputs are preallocated so nothing is
-                         allocated per launch.
-  should_skip(config)    True for a candidate the kernel would reject: its own asserts, or a
-                         buffer count its wrapper clamps so the candidate only repeats another
-                         one. None when the kernel has no rule of its own.
+  make_case(kwargs_rot_bufs)  the benchmark's make_bench_case for this shape and backend. It
+                              returns (launch, rot_bufs, flops, mem, check); harness.py times
+                              launch over rot_bufs and runs check before a config can win.
+  should_skip(config)         True for a candidate the kernel would reject: its own asserts, or a
+                              buffer count its wrapper clamps so the candidate only repeats another
+                              one. None when the kernel has no rule of its own.
 
 K is the logical element count everywhere, as the input generators take it: fp4 tensors hold
 K // 2 bytes and the config files of fp4 families are named by the logical K.
 torch / aiter / op_tests are imported inside the functions only.
 
-To add a kernel, copy the nearest function below, change its inputs and launch, and register
-it with its config family and where its gluon path exists:
+To add a kernel, give its benchmark a make_bench_case (see bench_gemm_a16w16.py), copy the
+nearest function below, and register it with its config family and where its gluon path exists:
 
     @kernel("GEMM-FOO", gluon_archs=("gfx1250",), gluon_default_archs=("gfx1250",))
     def gemm_foo(shape, backend):
-        import torch
-
-        from aiter.ops.triton.gemm.basic.gemm_foo import gemm_foo as gemm
-        from op_tests.triton_tests.gemm.basic.test_gemm_foo import generate_gemm_foo_inputs
-
         M, N, K = shape["M"], shape["N"], shape["K"]
-        x, w, y = generate_gemm_foo_inputs(M, N, K, torch.bfloat16, output=True)
-
-        def call(config, x, w, y):
-            return gemm(x, w, dtype=torch.bfloat16, y=y, config=config, backend=backend)
+        make_case = bench_case("bench_gemm_foo", M, N, K, "TN", backend)
 
         def should_skip(config):
             return config["BLOCK_SIZE_K"] % 64 != 0  # whatever the kernel asserts
 
-        return call, (x, w, y), should_skip
+        return make_case, should_skip
 """
 
 import argparse
@@ -57,7 +47,7 @@ KERNELS = {}
 @dataclass(frozen=True)
 class KernelSpec:
     name: str
-    # the kernel function: (shape, backend) -> (call, inputs, should_skip)
+    # the kernel function: (shape, backend) -> (make_case, should_skip)
     setup: Callable
     # the config family, exactly as the kernel's _get_config passes it
     config_name: str
@@ -119,10 +109,6 @@ def check_backend(spec, arch, backend):
         raise SystemExit(f"{spec.name}: backend '{backend}' is not available on {arch}")
 
 
-def flops(shape):
-    return 2.0 * shape.get("B", 1) * shape["M"] * shape["N"] * shape["K"]
-
-
 def resolve_installed(spec, shape, backend):
     """The installed config for this shape (raw JSON bucket) and is_tuned, through the real loader."""
     from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
@@ -169,14 +155,16 @@ def family_bounds(spec, backend, shape_nk):
     )
 
 
-def add_splitk_block_size(config, K):
-    """Mutates config: the triton a16w16-style kernels read SPLITK_BLOCK_SIZE, which the JSON lacks.
+def bench_case(bench, *args, **kwargs):
+    """make_case of a kernel: make_bench_case of op_tests/op_benchmarks/triton/<bench>.py."""
 
-    Nothing to add for the baseline (config is None: the wrapper loads the installed config).
-    """
-    if config is not None and "NUM_KSPLIT" in config:
-        config["SPLITK_BLOCK_SIZE"] = cdiv(K, config["NUM_KSPLIT"])
-    return config
+    def make_case(kwargs_rot_bufs):
+        import importlib
+
+        module = importlib.import_module(f"op_tests.op_benchmarks.triton.{bench}")
+        return module.make_bench_case(kwargs_rot_bufs, *args, **kwargs)
+
+    return make_case
 
 
 @kernel(
@@ -187,26 +175,8 @@ def add_splitk_block_size(config, K):
     gluon_ignored_keys=("GROUP_SIZE_M", "matrix_instr_nonkdim"),
 )
 def batched_gemm_bf16(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
-        batched_gemm_bf16 as gemm,
-    )
-    from op_tests.triton_tests.gemm.batched.test_batched_gemm_bf16 import (
-        generate_batched_gemm_a16w16_inputs,
-    )
-
     B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
-    x, w, bias, y = generate_batched_gemm_a16w16_inputs(
-        B, M, N, K, torch.bfloat16, output=True
-    )
-
-    def call(config, x, w, bias, y):
-        if backend == "triton":
-            add_splitk_block_size(config, K)
-        return gemm(
-            x, w, bias=bias, dtype=torch.bfloat16, YQ=y, config=config, backend=backend
-        )
+    make_case = bench_case("bench_batched_gemm_bf16", B, M, N, K, "TN", backend)
 
     def should_skip(config):
         if backend != "gluon":
@@ -222,7 +192,7 @@ def batched_gemm_bf16(shape, backend):
             return num_buffers > k_tiles - 2  # the wrapper clamps it there anyway
         return num_buffers > k_tiles  # the wrapper clamps it there anyway
 
-    return call, (x, w, bias, y), should_skip
+    return make_case, should_skip
 
 
 @kernel(
@@ -232,24 +202,8 @@ def batched_gemm_bf16(shape, backend):
     gluon_ignored_keys=("persistent",),
 )
 def gemm_a16w16(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as gemm
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
-        generate_gemm_a16w16_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, w, bias, _, y = generate_gemm_a16w16_inputs(
-        M, N, K, torch.bfloat16, output=True, bias=True
-    )
-
-    def call(config, x, w, bias, y):
-        if backend == "triton":
-            add_splitk_block_size(config, K)
-        return gemm(
-            x, w, bias=bias, dtype=torch.bfloat16, y=y, config=config, backend=backend
-        )
+    make_case = bench_case("bench_gemm_a16w16", M, N, K, "TN", backend)
 
     def should_skip(config):
         if backend != "gluon":
@@ -265,38 +219,15 @@ def gemm_a16w16(shape, backend):
             return num_buffers > k_tiles - 2  # the wrapper clamps it there anyway
         return num_buffers > k_tiles  # the wrapper clamps it there anyway
 
-    return call, (x, w, bias, y), should_skip
+    return make_case, should_skip
 
 
 @kernel(
     "GEMM-A16W16-PERSISTENT", gluon_archs=("gfx1250",), gluon_default_archs=("gfx1250",)
 )
 def gemm_a16w16_persistent(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as gemm
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
-        generate_gemm_a16w16_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, w, bias, _, y = generate_gemm_a16w16_inputs(
-        M, N, K, torch.bfloat16, output=True, bias=True
-    )
-
-    def call(config, x, w, bias, y):
-        if backend == "triton":
-            add_splitk_block_size(config, K)
-        return gemm(
-            x,
-            w,
-            bias=bias,
-            dtype=torch.bfloat16,
-            y=y,
-            config=config,
-            backend=backend,
-            persistent=True,
-        )
+    make_case = bench_case("bench_gemm_a16w16", M, N, K, "TN", backend, persistent=True)
 
     def should_skip(config):
         if backend == "triton":
@@ -310,195 +241,76 @@ def gemm_a16w16_persistent(shape, backend):
             return True  # the wrapper raises it to 2 anyway
         return num_buffers > k_tiles + 1  # the wrapper clamps it there anyway
 
-    return call, (x, w, bias, y), should_skip
+    return make_case, should_skip
 
 
 @kernel("GEMM-A16W16-ATOMIC", backend_kwarg=False)
 def gemm_a16w16_atomic(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import (
-        gemm_a16w16_atomic as gemm,
-    )
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
-        generate_gemm_a16w16_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, w, _, _, y = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16, output=True)
-
-    def call(config, x, w, y):
-        y.zero_()  # the kernel adds its split-K partials into y with atomics
-        add_splitk_block_size(config, K)
-        return gemm(x, w, dtype=torch.bfloat16, y=y, config=config)
-
-    return call, (x, w, y), None
+    return bench_case("bench_gemm_a16w16", M, N, K, "TN", backend, atomic=True), None
 
 
 @kernel("GEMM-A16W16-gated", backend_kwarg=False, bounds=(64, 128, 256, 512, 2048))
 def gemm_a16w16_gated(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated as gemm
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16w16_gated import (
-        generate_gemm_a16w16_gated_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, w, _, y = generate_gemm_a16w16_gated_inputs(M, N, K, torch.bfloat16, output=True)
-
-    def call(config, x, w, y):
-        return gemm(x, w, dtype=torch.bfloat16, y=y, config=config)
-
-    return call, (x, w, y), None
+    return bench_case("bench_gemm_a16w16_gated", M, N, K, "TN"), None
 
 
 @kernel("GEMM-A16W8_BLOCKSCALE", bits=(16, 8), backend_kwarg=False)
 def gemm_a16w8_blockscale(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
-        gemm_a16w8_blockscale as gemm,
-    )
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16w8_blockscale import (
-        generate_gemm_a16w8_blockscale_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, _, w, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
-        M, N, K, 128, 128, dtype=torch.bfloat16, output=True, shuffle=False
-    )
-
-    def call(config, x, w, w_scale, y):
-        return gemm(
-            x, w, w_scale, dtype=torch.bfloat16, y=y, prequant=False, config=config
-        )
+    make_case = bench_case("bench_gemm_a16w8_blockscale", M, N, K, "TN")
 
     def should_skip(config):
         return config["BLOCK_SIZE_K"] != 128  # the scale block is 128 wide
 
-    return call, (x, w, w_scale, y), should_skip
+    return make_case, should_skip
 
 
 @kernel("GEMM-A16W8_BLOCKSCALE_PRESHUFFLED", bits=(16, 8), backend_kwarg=False)
 def gemm_a16w8_blockscale_preshuffle(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
-        gemm_a16w8_blockscale_preshuffle as gemm,
-    )
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16w8_blockscale import (
-        generate_gemm_a16w8_blockscale_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, _, w, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
-        M, N, K, 128, 128, dtype=torch.bfloat16, output=True, shuffle=True
+    make_case = bench_case(
+        "bench_gemm_a16w8_blockscale", M, N, K, "TN", preshuffle=True
     )
-
-    def call(config, x, w, w_scale, y):
-        return gemm(
-            x, w, w_scale, dtype=torch.bfloat16, y=y, prequant=False, config=config
-        )
 
     def should_skip(config):
         return config["BLOCK_SIZE_K"] != 128  # the scale block is 128 wide
 
-    return call, (x, w, w_scale, y), should_skip
+    return make_case, should_skip
 
 
 @kernel("GEMM-A16WFP4", bits=(16, 4), backend_kwarg=False)
 def gemm_a16wfp4(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4 as gemm
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16wfp4 import (
-        generate_gemm_a16wfp4_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
-        M,
-        N,
-        K,
-        output=True,
-        atomic_add=False,
-        dtype=torch.bfloat16,
-        layout="TN",
-        shuffle=False,
-    )
-
-    def call(config, x, w, w_scales, y):
-        return gemm(
-            x, w, w_scales, atomic_add=False, dtype=torch.bfloat16, y=y, config=config
-        )
-
-    return call, (x, w, w_scales, y), None
+    return bench_case("bench_gemm_a16wfp4", M, N, K, "TN", False), None
 
 
 # The kernel dequantizes the int4 weight tile to 16 bits before it goes to LDS.
 @kernel("GEMM-A16W4", bits=(16, 16), backend_kwarg=False)
 def gemm_a16w4(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a16w4 import gemm_a16w4 as gemm
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16w4 import (
-        generate_gemm_a16w4_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    # Per-channel scales when K is not a multiple of the group size, as the benchmark does.
-    group_size = 128 if K % 128 == 0 else -1
-    x, w, w_scales, _, _, _, y, _ = generate_gemm_a16w4_inputs(
-        M, N, K, group_size=group_size, dtype=torch.bfloat16, output=True
-    )
 
-    def call(config, x, w, w_scales, y):
-        return gemm(x, w, w_scales, y=y, config=config)
+    def make_case(kwargs_rot_bufs):
+        import torch
+
+        from op_tests.op_benchmarks.triton.bench_gemm_a16w4 import make_bench_case
+
+        # Group 128; a K that is not a multiple of 128 gets per-channel scales.
+        return make_bench_case(kwargs_rot_bufs, M, N, K, torch.bfloat16, 128)
 
     def should_skip(config):
         # tl.dot needs blocks of 16 or more in each dimension.
         block = ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
         return min(config[key] for key in block) < 16
 
-    return call, (x, w, w_scales, y), should_skip
+    return make_case, should_skip
 
 
 @kernel("GEMM-A8W8", bits=(8, 8), gluon_archs=("gfx950",))
 def gemm_a8w8(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as gemm
-    from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
-    from aiter.ops.triton.utils.types import get_fp8_dtypes
-    from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
-        generate_gemm_a8w8_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    _, fp8 = get_fp8_dtypes()
-    x, _, w, x_scale, w_scale, _, y = generate_gemm_a8w8_inputs(
-        M, N, K, in_dtype=fp8, out_dtype=torch.bfloat16, layout="TN", output=True
-    )
-
-    def call(config, x, w, x_scale, w_scale, y):
-        if config is not None and backend == "triton":
-            compute_splitk_params(
-                config, K
-            )  # mutates: derives SPLITK_BLOCK_SIZE, may shrink BK
-        return gemm(
-            x,
-            w,
-            x_scale,
-            w_scale,
-            bias=None,
-            dtype=torch.bfloat16,
-            y=y,
-            config=config,
-            backend=backend,
-        )
-
-    return call, (x, w, x_scale, w_scale, y), None
+    return bench_case("bench_gemm_a8w8", M, N, K, "TN", False, backend), None
 
 
 @kernel(
@@ -511,33 +323,11 @@ def gemm_a8w8(shape, backend):
     },  # gfx950 gluon reads it as NUM_STAGES, at least 2
 )
 def gemm_a8w8_blockscale(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-        gemm_a8w8_blockscale as gemm,
-    )
     from aiter.ops.triton.utils._triton import arch_info
-    from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
-        generate_gemm_a8w8_blockscale_inputs,
-    )
 
     arch = arch_info.get_arch()
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, _, w, _, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
-        M, N, K, 128, 128, dtype=torch.bfloat16, layout="TN", output=True, shuffle=False
-    )
-
-    def call(config, x, w, x_scale, w_scale, y):
-        return gemm(
-            x,
-            w,
-            x_scale,
-            w_scale,
-            dtype=torch.bfloat16,
-            y=y,
-            config=config,
-            backend=backend,
-        )
+    make_case = bench_case("bench_gemm_a8w8_blockscale", M, N, K, "TN", False, backend)
 
     def should_skip(config):
         if config["BLOCK_SIZE_K"] != 128:
@@ -552,7 +342,7 @@ def gemm_a8w8_blockscale(shape, backend):
             )
         return False
 
-    return call, (x, w, x_scale, w_scale, y), should_skip
+    return make_case, should_skip
 
 
 @kernel(
@@ -562,114 +352,31 @@ def gemm_a8w8_blockscale(shape, backend):
     gluon_default_archs=("gfx1250",),
 )
 def gemm_a8w8_blockscale_preshuffle(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-        gemm_a8w8_blockscale_preshuffle as gemm,
-    )
-    from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
-        generate_gemm_a8w8_blockscale_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, _, w, _, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
-        M, N, K, 128, 128, dtype=torch.bfloat16, layout="TN", output=True, shuffle=True
-    )
-
-    def call(config, x, w, x_scale, w_scale, y):
-        return gemm(
-            x,
-            w,
-            x_scale,
-            w_scale,
-            dtype=torch.bfloat16,
-            y=y,
-            config=config,
-            backend=backend,
-        )
+    make_case = bench_case("bench_gemm_a8w8_blockscale", M, N, K, "TN", True, backend)
 
     def should_skip(config):
         return config["BLOCK_SIZE_K"] != 128  # the scale block is 128 wide
 
-    return call, (x, w, x_scale, w_scale, y), should_skip
+    return make_case, should_skip
 
 
 @kernel("GEMM-A8W8_PER_TOKEN_SCALE", bits=(8, 8), backend_kwarg=False)
 def gemm_a8w8_per_token_scale(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a8w8_per_token_scale import (
-        gemm_a8w8_per_token_scale as gemm,
-    )
-    from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_per_token_scale import (
-        generate_gemm_a8w8_per_token_scale_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, w, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
-        M, N, K, dtype=torch.bfloat16, layout="TN", output=True
-    )
-
-    def call(config, x, w, x_scale, w_scale, y):
-        return gemm(x, w, x_scale, w_scale, dtype=torch.bfloat16, y=y, config=config)
-
-    return call, (x, w, x_scale, w_scale, y), None
+    return bench_case("bench_gemm_a8w8_per_token_scale", M, N, K, "TN"), None
 
 
 @kernel("GEMM-A8WFP4", bits=(8, 4), backend_kwarg=False)
 def gemm_a8wfp4(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4 as gemm
-    from aiter.ops.triton.utils.types import get_fp8_dtypes
-    from op_tests.triton_tests.gemm.basic.test_gemm_a8wfp4 import (
-        generate_gemm_a8wfp4_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    _, fp8 = get_fp8_dtypes()
-    x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
-        M, N, K, fp8, torch.float16, layout="TN", output=True
-    )
-
-    def call(config, x, w, x_scales, w_scales, y):
-        add_splitk_block_size(config, K)
-        return gemm(x, w, y, x_scales, w_scales, dtype=torch.float16, config=config)
-
-    return call, (x, w, x_scales, w_scales, y), None
+    return bench_case("bench_gemm_a8wfp4", M, N, K, "TN"), None
 
 
 @kernel("GEMM-AFP4WFP4", bits=(4, 4), gluon_archs=("gfx950",))
 def gemm_afp4wfp4(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4 as gemm
-    from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-        generate_gemm_afp4wfp4_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, _, w, _, _, x_scales, w_scales, _, y = generate_gemm_afp4wfp4_inputs(
-        M,
-        N,
-        K,
-        torch.bfloat16,
-        output=True,
-        shuffle_scales_fg=False,
-        shuffle_weight_fg=False,
-    )
-
-    def call(config, x, w, x_scales, w_scales, y):
-        return gemm(
-            x,
-            w,
-            x_scales,
-            w_scales,
-            dtype=torch.bfloat16,
-            y=y,
-            config=config,
-            backend=backend,
-        )
+    make_case = bench_case("bench_gemm_afp4wfp4", M, N, K, "TN", False, backend)
 
     def should_skip(config):
         if backend != "triton":
@@ -678,37 +385,14 @@ def gemm_afp4wfp4(shape, backend):
             config["BLOCK_SIZE_K"] < 128
         )  # the triton wrapper raises it to 128 anyway
 
-    return call, (x, w, x_scales, w_scales, y), should_skip
+    return make_case, should_skip
 
 
+# gemm_afp4wfp4_pre_quant is gemm_a16wfp4 with atomic_add=True, so it reads GEMM-A16WFP4 too.
 @kernel("GEMM-A16WFP4", bits=(16, 4), backend_kwarg=False)
 def gemm_afp4wfp4_pre_quant_atomic(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4_pre_quant_atomic import (
-        gemm_afp4wfp4_pre_quant as gemm,
-    )
-    from op_tests.triton_tests.gemm.basic.test_gemm_a16wfp4 import (
-        generate_gemm_a16wfp4_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
-        M,
-        N,
-        K,
-        output=True,
-        atomic_add=True,
-        dtype=torch.float32,
-        layout="TN",
-        shuffle=False,
-    )
-
-    def call(config, x, w, w_scales, y):
-        y.zero_()  # the kernel adds its split-K partials into y with atomics
-        return gemm(x, w, w_scales, dtype=torch.float32, y=y, config=config)
-
-    return call, (x, w, w_scales, y), None
+    return bench_case("bench_gemm_a16wfp4", M, N, K, "TN", True), None
 
 
 def mxfp4_cta_split(config):
@@ -734,28 +418,9 @@ def mxfp4_cta_split(config):
     bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
 )
 def gemm_afp4wfp4_preshuffle(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
-        gemm_afp4wfp4_preshuffle as gemm,
-    )
-    from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-        generate_gemm_afp4wfp4_inputs,
-    )
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, _, w, _, _, x_scales, w_scales, _, y = generate_gemm_afp4wfp4_inputs(
-        M,
-        N,
-        K,
-        torch.bfloat16,
-        output=True,
-        shuffle_scales_fg=True,
-        shuffle_weight_fg=True,
-    )
-
-    def call(config, x, w, x_scales, w_scales, y):
-        return gemm(x, w, x_scales, w_scales, dtype=torch.bfloat16, y=y, config=config)
+    # the preshuffle wrapper takes no backend: it picks it by arch
+    make_case = bench_case("bench_gemm_afp4wfp4", M, N, K, "TN", True, None)
 
     def should_skip(config):
         block_m, block_n, block_k = (
@@ -783,7 +448,7 @@ def gemm_afp4wfp4_preshuffle(shape, backend):
         k_tiles = K // block_k
         return config["NUM_BUFFERS"] > k_tiles  # the wrapper clamps it there anyway
 
-    return call, (x, w, x_scales, w_scales, y), should_skip
+    return make_case, should_skip
 
 
 @kernel(
@@ -793,35 +458,16 @@ def gemm_afp4wfp4_preshuffle(shape, backend):
     gluon_default_archs=("gfx1250",),
 )
 def gemm_afp8wfp8_preshuffle(shape, backend):
-    import torch
-
-    from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
-        gemm_afp8wfp8_preshuffle as gemm,
-    )
-    from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
-    from op_tests.triton_tests.gemm.basic.test_gemm_afp8wfp8 import generate_inputs
-
     M, N, K = shape["M"], shape["N"], shape["K"]
-    x, _, w_kernel, _, x_scales_kernel, w_scales = generate_inputs(
-        M, N, K, shuffle=True, x_scale_group_size=128
-    )
-    y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
 
-    def call(config, x, w_kernel, x_scales_kernel, w_scales, y):
-        if config is not None and backend == "triton":
-            compute_splitk_params(
-                config, K
-            )  # mutates: derives SPLITK_BLOCK_SIZE, may shrink BK
-        return gemm(
-            x,
-            w_kernel,
-            x_scales_kernel,
-            w_scales,
-            dtype=torch.bfloat16,
-            y=y,
-            config=config,
-            x_scale_group_size=128,
-            backend=backend,
+    def make_case(kwargs_rot_bufs):
+        import torch
+
+        from op_tests.op_benchmarks.triton.bench_gemm_afp8wfp8 import make_bench_case
+
+        # 1x128 x scales, transposed as per_group_quant_hip(transpose_scale=True) makes them
+        return make_bench_case(
+            kwargs_rot_bufs, M, N, K, torch.bfloat16, True, backend, 128, True
         )
 
     def should_skip(config):
@@ -843,4 +489,4 @@ def gemm_afp8wfp8_preshuffle(shape, backend):
             clusters and config.get("kernel_type") != "bandwidth_bound"
         )  # clusters only there
 
-    return call, (x, w_kernel, x_scales_kernel, w_scales, y), should_skip
+    return make_case, should_skip

@@ -8,6 +8,8 @@ import os
 
 FINAL_STATUSES = ("ok", "error", "crashed", "hung")
 TOP_BUCKET_M = 8192  # --all-buckets sweeps the family's M_LEQ buckets up to here
+FINAL_PASSES = 3  # the final round times its candidates this many times, in turn
+MIN_GAIN = 0.02  # a candidate replaces the installed config only when it is this much faster in every pass
 
 
 def cdiv(a, b):
@@ -21,6 +23,12 @@ def next_pow2(n):
 def config_key(config):
     """Identity of a candidate in plans, result files and the installer (None is the baseline)."""
     return "baseline" if config is None else json.dumps(config, sort_keys=True)
+
+
+def candidate_key(candidate, gpu):
+    """Key of a candidate's record. Every GPU times the baseline, so each has its own baseline
+    record, baseline@<gpu>, and its candidates are ranked against it."""
+    return f"baseline@{gpu}" if candidate is None else config_key(candidate)
 
 
 def shape_tag(shape):
@@ -39,9 +47,10 @@ def plan_path(runs_dir, arch, backend, kernel, shape):
     )
 
 
-def final_results_path(out):
-    """Same-device re-timing of the fastest candidates when several GPUs swept an M."""
-    return out[: -len(".jsonl")] + ".final.jsonl"
+def final_results_paths(out):
+    """One file per final-round pass: the fastest candidates re-timed on one GPU."""
+    base = out[: -len(".jsonl")]
+    return [f"{base}.final{p}.jsonl" for p in range(1, FINAL_PASSES + 1)]
 
 
 def results_files(runs_dir, arch, backend, kernel, shape_nk):
@@ -98,7 +107,8 @@ def read_records(path):
     for record in iter_records(path):
         if record["status"] == "ready":
             continue
-        key = "baseline" if record.get("baseline") else config_key(record["config"])
+        candidate = None if record.get("baseline") else record["config"]
+        key = candidate_key(candidate, record.get("gpu"))
         is_final = record["status"] != "start"
         if is_final or records.get(key, {}).get("status") in (None, "start"):
             records[key] = record

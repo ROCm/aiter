@@ -15,27 +15,35 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    config_launch,
     do_bench_aiter_triton,
     generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
+    metric_value,
+    output_check,
     print_vgpr,
+    run_input_generator,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_per_token_scale import (
     generate_gemm_a8w8_per_token_scale_inputs,
+    run_torch,
 )
 
 
-def bench_gemm_fn(
+def make_bench_case(
     kwargs_rot_bufs: dict,
-    kwargs_do_bench_graph: dict,
     M: int,
     N: int,
     K: int,
-    metric: str,
     layout: str,
 ):
+    """(launch, rot_bufs, flops, mem, check) of one shape.
+
+    ``launch(config, **bufs)`` and ``check(config)`` take a config; None is the installed one.
+    The tuning scripts in aiter/ops/triton/utils/_triton/tuning use this function.
+    """
     c_dtype = torch.bfloat16
 
     _p_gen = functools.partial(
@@ -47,7 +55,7 @@ def bench_gemm_fn(
         [_p_gen], [_out_vals_keys], **kwargs_rot_bufs
     )
 
-    kernel_fn = functools.partial(gemm_a8w8_per_token_scale, dtype=c_dtype)
+    launch = config_launch(functools.partial(gemm_a8w8_per_token_scale, dtype=c_dtype))
 
     # flops
     flops = 2.0 * M * N * K
@@ -58,19 +66,31 @@ def bench_gemm_fn(
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
-    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+    def reference():
+        bufs = run_input_generator(_p_gen, _out_vals_keys)
+        expected = run_torch(
+            bufs["x"], bufs["w"], bufs["x_scale"], bufs["w_scale"], torch.float32
+        )
+        return bufs, expected
 
-    # Return exactly one scalar depending on which metric is active
-    if metric == "time":
-        return ms
-    elif metric == "throughput":
-        tflops = flops / ms * 1e-9
-        return tflops
-    elif metric == "bandwidth":
-        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        return bandwidth
-    else:
-        raise ValueError("Unknown metric: " + metric)
+    check = output_check(launch, reference, "y", atol=0.01, rtol=1e-2)
+    return launch, rot_bufs, flops, mem, check
+
+
+def bench_gemm_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+):
+    launch, rot_bufs, flops, mem, _ = make_bench_case(kwargs_rot_bufs, M, N, K, layout)
+    ms = do_bench_aiter_triton(
+        functools.partial(launch, None), rot_bufs, **kwargs_do_bench_graph
+    )
+    return metric_value(metric, ms, flops, mem)
 
 
 def run_model_benchmark(args):

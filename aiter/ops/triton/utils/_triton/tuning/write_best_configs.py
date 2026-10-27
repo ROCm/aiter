@@ -2,7 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Install step: pick the fastest config per swept M and write the family's config file.
 
-Flow:  load_winners    fastest ok record per M; the installed baseline competes too
+Flow:  load_winners    per M, from the final-round passes: the fastest finalist with a correct
+                       output, if it is MIN_GAIN faster than the installed baseline in every
+                       pass; else the baseline
        assign_buckets  M -> M_LEQ_<smallest family bound >= M>; the largest M wins a shared bucket;
                        an M above the largest bound is not written
        build_table     seeded with this shape's file if it exists, else a new file marked
@@ -18,15 +20,17 @@ import argparse
 import copy
 import json
 import os
+import statistics
 import sys
 from collections import namedtuple
 from pathlib import Path
 
 from _utils import (
+    MIN_GAIN,
     add_shape_args,
     bucket_for,
     config_key,
-    final_results_path,
+    final_results_paths,
     plan_path,
     read_records,
     results_files,
@@ -43,46 +47,75 @@ Winner = namedtuple(
 )  # baseline: the installed config's record or None
 
 
-def load_winners(runs_dir, arch, backend, spec, shape_nk):
-    """M -> Winner from every per-M result file of this (kernel, backend, N, K[, B]).
+def final_scores(path):
+    """key -> (record, us per pass) for the finalists that are ok, with a correct output, in
+    every final-round pass of this results file; None when a pass file is missing."""
+    paths = final_results_paths(path)
+    if not all(os.path.exists(p) for p in paths):
+        return None
+    passes = [read_records(p) for p in paths]
+    scores = {}
+    for key, record in passes[0].items():
+        runs = [records.get(key, {}) for records in passes]
+        if all(r.get("status") == "ok" and r.get("output_ok") for r in runs):
+            scores[key] = (record, [r["us"] for r in runs])
+    return scores
 
-    When several GPUs swept an M, only the final round (<results>.final.jsonl, timed on one
-    GPU) counts. When the M's plan file is present only its candidates (and the baseline) can win,
-    so records of candidates that are no longer in the search space are ignored.
+
+def scored(record, times):
+    """The pass-1 record with us set to the median over the passes."""
+    return dict(record, us=round(statistics.median(times), 3), pass_us=times)
+
+
+def load_winners(runs_dir, arch, backend, spec, shape_nk):
+    """M -> Winner from the final round of every per-M result file of this (kernel, backend, N, K[, B]).
+
+    Only the final-round passes (<results>.final<p>.jsonl, timed on one GPU) count, and only
+    finalists with a correct output in every pass. The fastest by the median over the passes
+    replaces the installed baseline only if it is MIN_GAIN faster in every pass; otherwise the
+    baseline wins and its bucket keeps the installed config. When the M's plan file is present
+    only its candidates (and the baseline) can win.
     """
     winners = {}
     for path in results_files(runs_dir, arch, backend, spec.name, shape_nk):
-        records = read_records(path)
-        ok = [r for r in records.values() if r["status"] == "ok"]
+        ok = [r for r in read_records(path).values() if r["status"] == "ok"]
         if not ok:
             continue
         M = ok[0]["shape"]["M"]
-        if os.path.exists(final_results_path(path)):
-            records = read_records(final_results_path(path))
-            ok = [r for r in records.values() if r["status"] == "ok"]
-        elif (
-            len({r.get("gpu") for r in ok} - {None}) > 1
-        ):  # records without a gpu are from one worker
-            print(
-                f"  M={M}: timed on several GPUs but the final round is missing; rerun the sweep. Skipped."
-            )
+        scores = final_scores(path)
+        if scores is None:
+            print(f"  M={M}: the final round is missing; rerun the sweep. Skipped.")
             continue
         plan_file = plan_path(runs_dir, arch, backend, spec.name, dict(shape_nk, M=M))
         if os.path.exists(plan_file):
             with open(plan_file) as f:
                 current = {config_key(c) for c in json.load(f)["configs"]}
-            ok = [
-                r for r in ok if r.get("baseline") or config_key(r["config"]) in current
-            ]
+            scores = {
+                k: v for k, v in scores.items() if v[0].get("baseline") or k in current
+            }
         else:
             print(f"  M={M}: no plan file, every recorded candidate may win")
-        if not ok:
-            print(f"  M={M}: no successful record of a current candidate; skipped")
+        # the final round runs on one GPU, so there is one baseline record
+        baseline_keys = [k for k, v in scores.items() if v[0].get("baseline")]
+        baseline = scores.pop(baseline_keys[0]) if baseline_keys else None
+        if not scores and baseline is None:
+            print(f"  M={M}: no finalist is ok in every pass; skipped")
             continue
-        baseline = records.get("baseline")
-        if baseline is not None and baseline["status"] != "ok":
-            baseline = None
-        winners[M] = Winner(M, min(ok, key=lambda r: r["us"]), baseline)
+        best = min(scores.values(), key=lambda v: statistics.median(v[1]), default=None)
+        if baseline is not None and (
+            best is None
+            or any(c > b * (1 - MIN_GAIN) for c, b in zip(best[1], baseline[1]))
+        ):
+            print(
+                f"  M={M}: no finalist is {MIN_GAIN:.0%} faster than the installed config "
+                "in every pass; keeping it"
+            )
+            best = baseline
+        winners[M] = Winner(
+            M,
+            scored(*best),
+            None if baseline is None else scored(*baseline),
+        )
     return winners
 
 

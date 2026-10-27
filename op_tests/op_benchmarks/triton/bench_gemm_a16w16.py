@@ -2,6 +2,7 @@ import functools
 import math
 
 import torch
+import torch.nn.functional as F
 import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
@@ -14,12 +15,17 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_rot_bufs_kwargs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    config_launch,
     do_bench_aiter_triton,
     generate_rotating_buffers_pool,
     get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
+    metric_value,
+    output_check,
     print_vgpr,
+    run_input_generator,
+    splitk_block_size,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
@@ -35,21 +41,23 @@ def _generate_atomic_inputs(M, N, K, c_dtype, layout):
     return x, w, y
 
 
-def bench_gemm_fn(
+def make_bench_case(
     kwargs_rot_bufs: dict,
-    kwargs_do_bench_graph: dict,
     M: int,
     N: int,
     K: int,
-    metric: str,
     layout: str,
     backend: str,
     atomic: bool = False,
     activation: str | None = None,
     persistent: bool = False,
     kernel_type: str = "bandwidth_bound",
-    **kwargs,
 ):
+    """(launch, rot_bufs, flops, mem, check) of one shape.
+
+    ``launch(config, **bufs)`` and ``check(config)`` take a config; None is the installed one.
+    The tuning scripts in aiter/ops/triton/utils/_triton/tuning use this function.
+    """
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
 
@@ -61,7 +69,10 @@ def bench_gemm_fn(
         ), "Atomic kernel does not currently support fused activation"
         _p_gen = functools.partial(_generate_atomic_inputs, M, N, K, c_dtype, layout)
         _out_vals_keys = ["x", "w", "y"]  # matches gemm_a16w16_atomic's kwargs
-        kernel_fn = functools.partial(gemm_a16w16_atomic, dtype=torch.float32)
+        launch = config_launch(
+            functools.partial(gemm_a16w16_atomic, dtype=torch.float32),
+            splitk_block_size(K),
+        )
     else:
         if persistent:
             assert not (backend == "gluon" and layout not in ("TN", "TT")), (
@@ -85,12 +96,15 @@ def bench_gemm_fn(
             "dtype",
             "y",
         ]  # matches gemm_a16w16's kwargs
-        kernel_fn = functools.partial(
-            gemm_a16w16,
-            activation=activation,
-            kernel_type=kernel_type,
-            backend=backend,
-            persistent=persistent,
+        launch = config_launch(
+            functools.partial(
+                gemm_a16w16,
+                activation=activation,
+                kernel_type=kernel_type,
+                backend=backend,
+                persistent=persistent,
+            ),
+            splitk_block_size(K) if backend == "triton" else None,
         )
 
     # create rotating buffers pool
@@ -109,19 +123,49 @@ def bench_gemm_fn(
     mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
-    ms = do_bench_aiter_triton(kernel_fn, rot_bufs, **kwargs_do_bench_graph)
+    def reference():
+        assert activation is None, "the output check covers activation=None"
+        bufs = run_input_generator(_p_gen, _out_vals_keys)
+        bias = bufs.get("bias")
+        if bias is not None:
+            bias = bias.normal_().float()  # the generator leaves the bias uninitialized
+        return bufs, F.linear(bufs["x"].float(), bufs["w"].float(), bias)
 
-    # Return exactly one scalar depending on which metric is active
-    if metric == "time":
-        return ms
-    elif metric == "throughput":
-        tflops = flops / ms * 1e-9
-        return tflops
-    elif metric == "bandwidth":
-        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        return bandwidth
-    else:
-        raise ValueError("Unknown metric: " + metric)
+    check = output_check(launch, reference, "y", atol=1e-1, rtol=1e-2)
+    return launch, rot_bufs, flops, mem, check
+
+
+def bench_gemm_fn(
+    kwargs_rot_bufs: dict,
+    kwargs_do_bench_graph: dict,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    backend: str,
+    atomic: bool = False,
+    activation: str | None = None,
+    persistent: bool = False,
+    kernel_type: str = "bandwidth_bound",
+    **kwargs,
+):
+    launch, rot_bufs, flops, mem, _ = make_bench_case(
+        kwargs_rot_bufs,
+        M,
+        N,
+        K,
+        layout,
+        backend,
+        atomic=atomic,
+        activation=activation,
+        persistent=persistent,
+        kernel_type=kernel_type,
+    )
+    ms = do_bench_aiter_triton(
+        functools.partial(launch, None), rot_bufs, **kwargs_do_bench_graph
+    )
+    return metric_value(metric, ms, flops, mem)
 
 
 def run_model_benchmark(args, backend):
