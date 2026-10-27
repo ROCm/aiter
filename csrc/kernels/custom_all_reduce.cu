@@ -480,8 +480,10 @@ void all_reduce_add(fptr_t _fa,
                     int64_t reg_inp_ptr, int64_t reg_inp_bytes)
 {
     HipDeviceGuard device_guard(inp.device_id);
-    if(addend.dtype() != inp.dtype() || addend.numel() != inp.numel())
-        throw std::runtime_error("all_reduce_add: addend must match inp dtype and numel");
+    if(addend.dtype() != inp.dtype() || addend.numel() != inp.numel() ||
+       out.dtype() != inp.dtype() || out.numel() != inp.numel())
+        throw std::runtime_error(
+            "all_reduce_add: addend and out must match inp dtype and numel");
     if(reinterpret_cast<uintptr_t>(inp.data_ptr()) % 16 != 0 ||
        reinterpret_cast<uintptr_t>(addend.data_ptr()) % 16 != 0)
         throw std::runtime_error("all_reduce_add: inp and addend must be 16-byte aligned");

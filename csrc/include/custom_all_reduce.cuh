@@ -4737,16 +4737,16 @@ class CustomAllreduce
                 size_t ll_cap_kb = 0, ll128_cap_kb = 0;
                 if(world_size_ == 2)
                 {
-                    ll_cap_kb    = has_addend ? 96 : (aligned ? 64 : 80);
-                    ll128_cap_kb = has_addend ? (aligned ? 384 : 768) : 0;
+                    ll_cap_kb    = has_addend ? 80 : (aligned ? 64 : 72);
+                    ll128_cap_kb = has_addend ? (aligned ? 208 : 384) : (aligned ? 0 : 96);
                 }
                 else if(world_size_ == 4)
                 {
-                    ll_cap_kb    = has_addend ? (aligned ? 80 : 112) : (aligned ? 40 : 80);
-                    ll128_cap_kb = has_addend && !aligned ? 160 : 0;
+                    ll_cap_kb    = has_addend ? (aligned ? 64 : 96) : (aligned ? 40 : 56);
+                    ll128_cap_kb = has_addend && !aligned ? 128 : 0;
                 }
                 else if(world_size_ == 8)
-                    ll_cap_kb = has_addend ? (aligned ? 64 : 112) : (aligned ? 40 : 64);
+                    ll_cap_kb = has_addend ? (aligned ? 64 : 96) : (aligned ? 40 : 48);
                 if(nbytes <= ll_cap_kb * 1024)
                     ll_bs = 256;
                 else if(nbytes <= ll128_cap_kb * 1024)
@@ -4834,15 +4834,16 @@ class CustomAllreduce
         }
         // gfx950 (bf16/fp16/fp32, TP2/4/8, broadcast and non-broadcast, 16KB to
         // 16MB): 2-stage beats 1-stage at every aligned size. Unaligned sizes
-        // run the naive 2-stage kernel, which only wins from 96KB at TP4 and
+        // run the naive 2-stage kernel, which only wins from 104KB at TP4 and
         // 256KB at TP8, and at every size at TP2.
         if(is_gfx950_ &&
            (world_size_ == 2 || ((world_size_ == 4 || world_size_ == 8) && full_nvlink_)))
         {
             size_t max_1stage_bytes = 0;
             if(bytes % (world_size_ * 16) != 0)
-                max_1stage_bytes = world_size_ == 4 ? 96 * 1024 : world_size_ == 8 ? 256 * 1024 : 0;
-            call_1stage = bytes < max_1stage_bytes;
+                max_1stage_bytes = world_size_ == 4 ? 104 * 1024 : world_size_ == 8 ? 256 * 1024 : 0;
+            // 2-stage needs at least one pack per rank, else it launches 0 blocks.
+            call_1stage = bytes < max_1stage_bytes || size < world_size_;
             call_2stage = !call_1stage;
         }
         if(call_1stage)

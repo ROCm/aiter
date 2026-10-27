@@ -1785,12 +1785,15 @@ class CustomAllreduce:
         return self._ops_all_reduce_add is not None
 
     def should_custom_ar_add(self, inp: torch.Tensor, addend: torch.Tensor) -> bool:
+        # The kernels index both inputs by flat offset, so their layouts must
+        # match; weak contiguity would admit e.g. a transposed addend.
         return (
             self.supports_all_reduce_add
             and self.should_custom_ar(inp)
             and addend.shape == inp.shape
             and addend.dtype == inp.dtype
-            and is_weak_contiguous(addend)
+            and inp.is_contiguous()
+            and addend.is_contiguous()
             and inp.data_ptr() % 16 == 0
             and addend.data_ptr() % 16 == 0
         )
@@ -1808,11 +1811,17 @@ class CustomAllreduce:
 
         Neither input needs to be IPC-registered: the small-message kernels
         read them locally, and the other paths stage the sum into the
-        pre-registered input buffer.
+        pre-registered input buffer. inp, addend and out must be contiguous.
         """
         if out is None:
-            out = torch.empty_like(inp)
-        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+            out = torch.empty_like(inp, memory_format=torch.contiguous_format)
+        for name, t in (("inp", inp), ("addend", addend), ("out", out)):
+            if not t.is_contiguous():
+                raise ValueError(f"all_reduce_add: {name} must be contiguous")
+        if any(t.shape != inp.shape or t.dtype != inp.dtype for t in (addend, out)):
+            raise ValueError(
+                "all_reduce_add: inp, addend and out shapes and dtypes must match"
+            )
         self._ops_all_reduce_add(
             self._ptr,
             inp,
