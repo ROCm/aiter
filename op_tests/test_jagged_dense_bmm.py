@@ -513,8 +513,9 @@ def test_jdbba_tile_map_inplace(B, D, Kout, Mi, dtype):
     """In-place seq_offsets updates must rebuild TILE_MAP.
 
     The same storage is rewritten twice: once with a new segmentation of the
-    same packed length, then with a shorter length. C is exactly (L, N). A
-    side stream checks that the prep and the GEMM share the caller's queue.
+    same packed length, then with a shorter length. C is exactly (L, N). An
+    explicit side stream, distinct from the current one, must still see the
+    TILE_MAP prep before the GEMM.
     """
     seq = _make_seq_offsets(B, Mi, "skew")
     st = torch.cuda.current_stream()
@@ -531,38 +532,44 @@ def test_jdbba_tile_map_inplace(B, D, Kout, Mi, dtype):
     )
     L2, N2, K2 = shorter["L"], shorter["N"], shorter["K"]
 
-    side = torch.cuda.Stream()
+    # Inputs are ready on the current stream. A large fill then occupies that
+    # stream. The op is launched on a different stream, and only that stream
+    # is synchronized before the check. Prep queued on the current stream
+    # would still be behind the fill, and the GEMM would read an unfinished map.
     side_seq = _make_seq_offsets(B, Mi, "skew", seed=SEED + 7)
-    with torch.cuda.stream(side):
-        side_inputs = _build_inputs(
-            B,
-            D,
-            Kout,
-            Mi,
-            "skew",
-            dtype,
-            seq_offsets=side_seq,
-            pad_rows=False,
-        )
-        side_ref = run_torch(
-            side_inputs["jagged"],
-            side_inputs["dense"],
-            side_inputs["bias"],
-            side_inputs["seq_offsets"],
-            side_inputs["N"],
-            dtype,
-        )
-        jagged_dense_bmm_dispatched(
-            side_inputs["tC"],
-            side_inputs["tA"],
-            side_inputs["dense_tall"],
-            side_inputs["bias_flat"],
-            side_inputs["seq_offsets"],
-            B,
-            Mi,
-            stream=side,
-            uniform_seqlen=False,
-        )
+    side_inputs = _build_inputs(
+        B,
+        D,
+        Kout,
+        Mi,
+        "skew",
+        dtype,
+        seq_offsets=side_seq,
+        pad_rows=False,
+    )
+    side_ref = run_torch(
+        side_inputs["jagged"],
+        side_inputs["dense"],
+        side_inputs["bias"],
+        side_inputs["seq_offsets"],
+        side_inputs["N"],
+        dtype,
+    )
+    torch.cuda.current_stream().synchronize()
+    stall = torch.empty(16 * 1024 * 1024, dtype=torch.int32, device="cuda")
+    stall.fill_(1)
+    side = torch.cuda.Stream()
+    jagged_dense_bmm_dispatched(
+        side_inputs["tC"],
+        side_inputs["tA"],
+        side_inputs["dense_tall"],
+        side_inputs["bias_flat"],
+        side_inputs["seq_offsets"],
+        B,
+        Mi,
+        stream=side,
+        uniform_seqlen=False,
+    )
     side.synchronize()
     assertAllclose(
         side_ref.to(dtypes.fp32),
@@ -571,6 +578,7 @@ def test_jdbba_tile_map_inplace(B, D, Kout, Mi, dtype):
         atol=1e-2,
         msg="tile map side stream",
     )
+    torch.cuda.current_stream().synchronize()
 
     def _shorter():
         jagged_dense_bmm_dispatched(
