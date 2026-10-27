@@ -768,8 +768,9 @@ parser.add_argument(
     "--hidden_intermediate_pad",
     type=dtypes.str2tuple,
     nargs="*",
-    default=[(192, 128)],
-    help="""Hidden intermediate pad.
+    default=None,
+    help="""Hidden intermediate pad. Default is [(192, 128)] for bf16/fp8
+    activations and [(0, 0)] for a4w4.
     e.g.: -hip 0,0""",
 )
 parser.add_argument(
@@ -1189,7 +1190,9 @@ def _iter_legacy_cases():
         triple = (quant_type, aq_dtype, wq_dtype)
 
         if triple == _PER1X32_BF16_FP4:
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad or [
+                (192, 128)
+            ]:
                 for m in args.tokenNum:
                     yield _kw(
                         dtype,
@@ -1205,7 +1208,9 @@ def _iter_legacy_cases():
                         intermediate_pad=intermediate_pad,
                     ), extras
         elif triple == _PER1X32_FP8_FP4:
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad or [
+                (192, 128)
+            ]:
                 for act_type in args.act:
                     for m in args.tokenNum:
                         yield _kw(
@@ -1223,7 +1228,9 @@ def _iter_legacy_cases():
                             **_situv2_beta_kwargs(act_type),
                         ), extras
         elif triple == _PER1X32_FP4_FP4:
-            for preshuffle in args.preshuffle:
+            for (hidden_pad, intermediate_pad), preshuffle in itertools.product(
+                args.hidden_intermediate_pad or [(0, 0)], args.preshuffle
+            ):
                 for act_type in args.act:
                     for m in args.tokenNum:
                         yield _kw(
@@ -1237,8 +1244,8 @@ def _iter_legacy_cases():
                             doweight_stage1,
                             act_type,
                             preshuffle=preshuffle,
-                            hidden_pad=0,
-                            intermediate_pad=0,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
                             **_situv2_beta_kwargs(act_type),
                         ), extras
         elif triple == _PER1X32_BF16_I4:
