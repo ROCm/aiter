@@ -635,17 +635,18 @@ def test_scatter_copy_token(num_dst, row_bytes):
 
 
 @benchmark()
-def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype):
+def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype, w_dtype):
     """Weighted gather-reduce epilogue: out[t] = sum_k w(t,k) * grouped[row(t,k)]."""
     out_dtype = "bf16" if dtype == torch.bfloat16 else "f16"
     launch = build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, 1, vec_dwords, "f32"
+        model_dim, topk, out_dtype, 1, vec_dwords, w_dtype
     )
+    wdt = {"f32": torch.float32, "bf16": torch.bfloat16, "f16": torch.float16}[w_dtype]
     rows_total = max(64, tokens * topk)
     grouped = (torch.randn(rows_total, model_dim) * 0.5).to(dtype)
     rmap = torch.randint(0, rows_total, (tokens, topk), dtype=I32)
     rmap[0, 0] = -1  # DROPPED_ROUTE_ROW must contribute nothing
-    w = torch.rand(tokens, topk, dtype=torch.float32)
+    w = torch.rand(tokens, topk, dtype=torch.float32).to(wdt)
     nvt = torch.tensor([tokens], dtype=I32)
     ref = run_torch_gather_reduce(grouped, rmap, w, dtype)
     out = torch.full((tokens, model_dim), 7.0, dtype=dtype)
@@ -664,7 +665,9 @@ def test_gather_reduce(tokens, model_dim, topk, vec_dwords, dtype):
 
     esz = grouped.element_size()
     # topk source rows read + one row written per token, plus the (t,k) maps
-    nbytes = tokens * (topk * model_dim + model_dim) * esz + tokens * topk * 8
+    nbytes = tokens * (topk * model_dim + model_dim) * esz + tokens * topk * (
+        rmap.element_size() + w.element_size()
+    )
     flops = tokens * topk * model_dim * 2  # one multiply-add per contribution
     ret = {"gfx": get_gfx()}
     # eager vs graph replay are the two candidates: on the decode path these
@@ -1110,10 +1113,18 @@ def main():
     summarize(
         "moe_gather_reduce",
         [
-            test_gather_reduce(t, md, tk, v, dmap[d])
-            for d, t, md, tk, v in itertools.product(
-                args.dtype, args.tokens, args.model_dim, args.topk, args.vec
+            test_gather_reduce(t, md, tk, v, dmap[d], wd)
+            for d, wd, t, md, tk, v in itertools.product(
+                args.dtype,
+                ("f32", "bf16", "f16"),
+                args.tokens,
+                args.model_dim,
+                args.topk,
+                args.vec,
             )
+            # Route weights arrive as native f32, or already cast to the output
+            # dtype by the EP route kernel.
+            if wd in ("f32", d)
         ],
     )
     # Real decode shape (model_dim=7168) at both vector widths -- swept apart from
@@ -1121,8 +1132,10 @@ def main():
     summarize(
         "moe_gather_reduce (model_dim=7168)",
         [
-            test_gather_reduce(t, 7168, tk, v, dmap[args.dtype[0]])
-            for t, tk, v in itertools.product(args.tokens, args.topk, args.vec)
+            test_gather_reduce(t, 7168, tk, v, dmap[args.dtype[0]], wd)
+            for wd, t, tk, v in itertools.product(
+                ("f32", args.dtype[0]), args.tokens, args.topk, args.vec
+            )
         ],
     )
     summarize(

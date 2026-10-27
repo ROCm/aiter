@@ -142,7 +142,7 @@ def _torch_moe_ref(
     w2_packed: torch.Tensor,  # (E, K, I_pack) uint8
     w2_scale_raw: torch.Tensor,  # (E, K, I//32) uint8
     w2_bias: torch.Tensor,  # (E, K) fp32
-    topk_w: torch.Tensor,  # (T, topk) bf16
+    topk_w: torch.Tensor,  # (T, topk) fp32
     topk_id: torch.Tensor,  # (T, topk) int32
     *,
     data_format: str,
@@ -438,7 +438,6 @@ def _run_grouped_via_fused_moe(
 
     # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
     topk_id, topk_w = _make_topk(hidden, experts, topk)
-    topk_w = topk_w.to(torch.bfloat16)
 
     # ---- prep grouped GEMM inputs ----
     # Stage1 weight/scale/bias are rearranged to the physical GUGU layout;
