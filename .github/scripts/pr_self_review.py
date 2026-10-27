@@ -134,6 +134,7 @@ class Result:
     question: str
     author_issues: list[str] = field(default_factory=list)
     copilot_issues: list[str] = field(default_factory=list)
+    copilot_advisories: list[str] = field(default_factory=list)
     hygiene_issues: list[str] = field(default_factory=list)
     hygiene_advisories: list[str] = field(default_factory=list)
     ci: dict[str, str] = field(default_factory=dict)
@@ -364,7 +365,9 @@ query($owner:String!, $repo:String!, $number:Int!) {
 """
 
 
-def inspect_copilot(api: GitHub, number: int, author: str) -> list[str]:
+def inspect_copilot(
+    api: GitHub, number: int, author: str
+) -> tuple[list[str], list[str]]:
     owner, repo = api.repo.split("/", 1)
     try:
         data = api.graphql(
@@ -375,9 +378,10 @@ def inspect_copilot(api: GitHub, number: int, author: str) -> list[str]:
         reviews = (pull.get("reviews") or {}).get("nodes") or []
         head_sha = pull.get("headRefOid") or ""
     except APIError as exc:
-        return [f"Copilot review threads could not be read: {exc}"]
+        return [], [f"Copilot review threads could not be read: {exc}"]
 
     issues: list[str] = []
+    advisories: list[str] = []
     current_reviews = []
     for review in reviews:
         login = (((review.get("author") or {}).get("login")) or "").lower()
@@ -385,7 +389,7 @@ def inspect_copilot(api: GitHub, number: int, author: str) -> list[str]:
         if "copilot" in login and commit_sha == head_sha:
             current_reviews.append(review)
     if not current_reviews:
-        issues.append("Copilot review has not completed for the current head SHA")
+        advisories.append("Copilot did not review the current head SHA")
     elif any(
         re.search(
             r"unable to review|insufficient.*quota|remaining quota|could not review",
@@ -394,7 +398,7 @@ def inspect_copilot(api: GitHub, number: int, author: str) -> list[str]:
         )
         for review in current_reviews
     ):
-        issues.append(
+        advisories.append(
             "Copilot could not review the current head (for example, quota or service failure)"
         )
 
@@ -418,8 +422,10 @@ def inspect_copilot(api: GitHub, number: int, author: str) -> list[str]:
                 "an active Copilot finding has no substantive reply from the PR author"
             )
         elif not thread.get("isResolved"):
-            issues.append("an author-replied Copilot finding is still unresolved")
-    return issues[:20]
+            advisories.append(
+                "an author-replied Copilot finding is still unresolved; confirm the disposition during human review"
+            )
+    return issues[:20], advisories[:20]
 
 
 def inspect_ci(api: GitHub, head_sha: str) -> dict[str, str]:
@@ -456,12 +462,14 @@ def evaluate(api: GitHub, number: int, mode: str) -> tuple[Result, dict[str, Any
     author_issues, telemetry = validate_author_answers(
         pr.get("body") or "", head_sha, changed_tests
     )
+    copilot_issues, copilot_advisories = inspect_copilot(api, number, author)
     result = Result(
         head_sha=head_sha,
         mode=mode,
         question=select_question(paths),
         author_issues=author_issues,
-        copilot_issues=inspect_copilot(api, number, author),
+        copilot_issues=copilot_issues,
+        copilot_advisories=copilot_advisories,
         hygiene_issues=hard,
         hygiene_advisories=advisory,
         ci=inspect_ci(api, head_sha),
@@ -546,8 +554,9 @@ def render(result: Result, pr: dict[str, Any]) -> str:
             lines.extend(f"- FAIL — {issue}" for issue in result.copilot_issues)
         else:
             lines.append(
-                "- PASS — no active Copilot thread lacks an author reply and resolution"
+                "- PASS — no active Copilot finding lacks a substantive author reply"
             )
+        lines.extend(f"- ADVISORY — {issue}" for issue in result.copilot_advisories)
 
         lines.extend(["", "### Code and op-test hygiene"])
         if result.hygiene_issues:
