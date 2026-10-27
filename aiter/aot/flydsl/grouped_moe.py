@@ -168,6 +168,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         build_moe_fused_quant_preshuffle_route_ksplit_module,
         build_moe_fused_route_quant_scatter_module,
         build_moe_fused_route_quant_scatter_st_ksplit_module,
+        quant_layout_supported,
     )
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
         build_moe_gather_reduce_module,
@@ -415,31 +416,42 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     # Runtime passes topids_to_rows whenever route rows fit the output capacity
     # (almost always), taking the route-ksplit path with source_topk=0; the
     # plain skip-padding path is the rare capacity-overflow fallback.
+    # The runtime launches this prep only when gemm1 cannot requantize its own
+    # output (a gemm1 bias, or AITER_FLYDSL_DISABLE_GEMM1_REQUANT=1). Its quant
+    # layout needs inter_dim % 256 == 0; a bias-free MoE whose inter_dim is not
+    # (Kimi-K3 at TP8: 3072 / 8 = 384) has gemm1 requantize instead and never
+    # launches it, so such a job has no a2 prep to build.
     capacity_rows = a2_out_e * a2_out_m
-    if payload_preshuffled:
-        # Runtime's separate stage2 quantizer has no route map, even when
-        # stage1 has one. Cover it in addition to the route-indexed variant.
-        _plain_preshuffle(
-            inter_dim, a2_out_e, a2_out_m, not contiguous, wmma_rep=wmma_rep2
+    if not quant_layout_supported(inter_dim, quant_mode, wmma_rep2):
+        print(
+            f"  [skip] stage2 quant+preshuffle: inter_dim={inter_dim} is not a "
+            "multiple of 256; gemm1 requantizes its output instead"
         )
-    if numel < capacity_rows:
-        _route_ksplit(
-            feat_dim=inter_dim,
-            source_topk=0,
-            out_e=a2_out_e,
-            out_m=a2_out_m,
-            wmma_rep=wmma_rep2,
-        )
-    elif not payload_preshuffled:
-        # masked_m is None on the contiguous path -> skip_padding=False;
-        # passed on the dense path -> skip_padding=True.
-        _plain_preshuffle(
-            feat_dim=inter_dim,
-            out_e=a2_out_e,
-            out_m=a2_out_m,
-            skip_padding=not contiguous,
-            wmma_rep=wmma_rep2,
-        )
+    else:
+        if payload_preshuffled:
+            # Runtime's separate stage2 quantizer has no route map, even when
+            # stage1 has one. Cover it in addition to the route-indexed variant.
+            _plain_preshuffle(
+                inter_dim, a2_out_e, a2_out_m, not contiguous, wmma_rep=wmma_rep2
+            )
+        if numel < capacity_rows:
+            _route_ksplit(
+                feat_dim=inter_dim,
+                source_topk=0,
+                out_e=a2_out_e,
+                out_m=a2_out_m,
+                wmma_rep=wmma_rep2,
+            )
+        elif not payload_preshuffled:
+            # masked_m is None on the contiguous path -> skip_padding=False;
+            # passed on the dense path -> skip_padding=True.
+            _plain_preshuffle(
+                feat_dim=inter_dim,
+                out_e=a2_out_e,
+                out_m=a2_out_m,
+                skip_padding=not contiguous,
+                wmma_rep=wmma_rep2,
+            )
 
     # --- Epilogue: token-order gather-reduce (bf16/f16 fast path only) ---
     # split_k mirrors stage2's split_k2: when split_k2 > 1 the GEMM emits an
