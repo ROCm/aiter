@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
+# Tagged mailbox adapted from ROCm/ATOM at a526f0d under the MIT License.
 
 """Cross-card (P2P) communication primitives for communication kernels.
 
@@ -17,11 +18,15 @@ from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith
+from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import buffer_ops as bo
 
 __all__ = [
     "GeometryTuningTable",
+    "TaggedMailbox",
     "atomic_add_agent",
     "atomic_add_agent_one_as",
     "atomic_add_global_at",
@@ -54,12 +59,108 @@ __all__ = [
     "store_i32_lds",
     "store_i32_system",
     "store_i64_global_system",
+    "tagged_peer_address",
+    "tagged_shift",
     "wait_i32_until_equals",
     "wait_i32_until_greater_than",
     "wait_i64_until_equals",
     "waitcnt_all",
     "waitcnt_stores",
 ]
+
+_SYSTEM_CACHE = 17
+_TAGGED_POLL_MAX = 12
+
+
+def _buffer_resource(address):
+    return bo.create_buffer_resource_from_addr(address)
+
+
+def tagged_peer_address(base, byte_offset):
+    """Return a byte address in an IPC-mapped peer buffer."""
+    return base + fx.Int64(byte_offset)
+
+
+def tagged_shift(address, byte_offset):
+    return address + byte_offset
+
+
+@ASTRewriter.transform
+def _spin_tagged(load_all, pending):
+    values = load_all()
+    while pending(values):
+        fx.rocdl.s_sleep(1)
+        values = load_all()
+    return values
+
+
+class TaggedMailbox:
+    """Transfer 32-bit values with an adjacent launch tag."""
+
+    def __init__(self, tag):
+        self.tag = tag + 1
+
+    def put(self, address, index, value):
+        bits = (
+            value.bitcast(fx.Int32)
+            if isinstance(value, fx.Float32)
+            else fx.Int32(value)
+        )
+        bo.buffer_store(
+            fx.Vector.from_elements([bits, self.tag], fx.Int32),
+            _buffer_resource(address),
+            index * 2,
+            cache_modifier=_SYSTEM_CACHE,
+        )
+
+    def put_words(self, address, index, words):
+        values = []
+        for word in words:
+            values += [fx.Int32(word), self.tag]
+        bo.buffer_store(
+            fx.Vector.from_elements(values, fx.Int32),
+            _buffer_resource(address),
+            index * 2,
+            cache_modifier=_SYSTEM_CACHE,
+        )
+
+    def poll(self, specs, batch=_TAGGED_POLL_MAX):
+        """Poll ``(address, pair index, pair count)`` specifications."""
+        if const_expr(len(specs) == 0):
+            return []
+        if const_expr(len(specs) > batch):
+            return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
+        tag = self.tag
+
+        def load_all():
+            words = []
+            for address, index, count in specs:
+                loaded = fx.Vector(
+                    bo.buffer_load(
+                        _buffer_resource(address),
+                        fx.Int32(index) * 2,
+                        vec_width=2 * count,
+                        dtype=T.i32,
+                        cache_modifier=_SYSTEM_CACHE,
+                    )
+                )
+                words += [loaded[item] for item in range(2 * count)]
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        word_count = sum(2 * count for _, _, count in specs)
+
+        def pending(values):
+            stale = values[1] != tag
+            for index in range_constexpr(3, word_count, 2):
+                stale = stale | (values[index] != tag)
+            return stale
+
+        values = _spin_tagged(load_all, pending)
+        out, index = [], 0
+        for _, _, count in specs:
+            out.append([values[index + 2 * item] for item in range(count)])
+            index += 2 * count
+        return out
 
 
 def _to_ptr_global(v, dtype=fx.Int32, alignment=4):
