@@ -707,6 +707,11 @@ def _should_use_sampled_prefill(
     range. Its other terms were measured against topk_select's backends, not
     against the per-row kernels this entry falls back to, so it does not take
     them.
+
+    stable=True stays on the per-row kernels although `sampled` has a stable
+    mode: against FlyDSL's stable one-block kernel, at 1..64 rows of 131072..1M
+    and k=512..2048, it ran 0.11x-0.64x on rows reaching the pitch and 1.9x-3.4x
+    on rows ending in [k, 4k], and this entry cannot tell the two apart.
     """
     if stable or stride1 != 1 or not _SAMPLED_MIN_K <= k <= _SAMPLED_MAX_K:
         return False
@@ -809,6 +814,7 @@ def top_k_per_row_prefill(
             None,
             True,
             False,
+            False,
         )
 
     use_mulblocks = not stable and _use_mulblocks(numRows, stride0)
@@ -881,6 +887,7 @@ def _top_k_per_row_prefill_sampled(
     workspace: torch.Tensor | None = None,
     ragged: bool = True,
     nan_high: bool = False,
+    stable: bool = False,
 ) -> None: ...
 
 
@@ -1008,6 +1015,7 @@ def _sampled_run(
     workspace: torch.Tensor | None,
     ragged: bool,
     nan_high: bool,
+    stable: bool,
 ) -> None:
     """The sampled launch on arguments already validated."""
     if workspace is None:
@@ -1032,6 +1040,7 @@ def _sampled_run(
         workspace,
         ragged,
         nan_high,
+        stable,
     )
 
 
@@ -1057,6 +1066,11 @@ def top_k_per_row_prefill_sampled(
     # as top_k_per_row_prefill's other paths do. True ranks every NaN above
     # +inf, topk_select's contract. Indices only: values must be None.
     nan_high: bool = False,
+    # Ascending column order, a tie going to the smaller column: what
+    # top_k_per_row_prefill's HIP one-block kernel gives under stable=True,
+    # and with nan_high what topk_select gives under tie='low', where every
+    # NaN is one value.
+    stable: bool = False,
 ) -> None:
     """Per-row top-k (prefill) via the sampled kernels.
 
@@ -1154,6 +1168,7 @@ def top_k_per_row_prefill_sampled(
         workspace,
         ragged,
         nan_high,
+        stable,
     )
 
 

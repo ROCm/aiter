@@ -95,11 +95,9 @@ _PLAIN_ARCHES = ("gfx942", "gfx950")
 # ...] against a canonical [128, 132, 136, ...]. Serving "low" needs the chunk
 # tie-break made column-aware first.
 _BACKENDS_BY_TIE = {
-    # `sampled` is listed under no promise only. Its tie direction has not been
-    # measured, and `topk_select_backend` below records what happens when a
-    # backend is declared for a tie mode it does not honour: `tie='high'` once
-    # fell through to `decode`, which ties the opposite way, silently. Declaring
-    # it for `low` or `high` on a guess would repeat that.
+    # `sampled` serves "low" through its stable mode, which `_dispatch` turns on
+    # for it as it does for `decode`; without it its ties follow wave timing.
+    # `_choose` lets it stand in for `decode` only: see there.
     #
     # `stream_reject` and `whole_row` select the set `stream` does wherever they
     # serve, with its tie order, so they sit where it does.
@@ -113,20 +111,29 @@ _BACKENDS_BY_TIE = {
         "stream_reject",
         "whole_row",
     ),
-    "low": ("argmax", "decode", "stream", "stream_reject", "whole_row"),
+    "low": ("argmax", "decode", "stream", "sampled", "stream_reject", "whole_row"),
     "high": ("small_k",),
 }
 # `plain` selects a different set of tied columns from one call to the next:
 # measured, 2 of 512 slots differed on a repeat, 18 for one row across a batch of
-# 100. Every other backend is a pure function of the row -- the property a
-# tensor-parallel caller needs, and weaker than promising a direction.
-# `sampled` is in here because its repeat-stability has NOT been measured, not
-# because it was found unstable. The conservative direction: a caller asking
-# for `deterministic` never reaches it. Measure it and remove it from this set
-# -- `op_tests/test_topk_per_row_stable.py` is the model, and `decode` is the
-# cautionary tale, since a radix select being a pure function of the row is
-# the obvious guess and it is wrong.
-_NONDETERMINISTIC = frozenset({"plain", "sampled"})
+# 100. Every other backend is a pure function of the row once `_dispatch` asks
+# for it -- the property a tensor-parallel caller needs, and weaker than
+# promising a direction. `decode` and `sampled` are that only in their stable
+# mode: without it `decode` selects a different set of tied columns from one
+# call to the next, and `sampled` places tied keys by atomic counters, so its
+# pick among them follows wave timing.
+_NONDETERMINISTIC = frozenset({"plain"})
+# Under `tie` or `deterministic`, `sampled` serves pitches up to this one. Past
+# it its time depends on the data, and on some inputs it lost to the `decode`
+# and `stream` those calls had: 32 rows of 2M at k=2048 took 401us on one
+# torch.randn seed of four and 65us on the others, against decode's 126us, and
+# 8 rows of 4M took 706us on every seed against 122us (MI355X). The stable emit
+# adds 17-20us on top. Up to it, over the 267 shapes of 1..4096 rows, 131072..1M
+# columns and k=512..2048 that change hands, three seeds each, it ran 0.71x of
+# them under tie='low' and 0.68x under `deterministic` (geomean); the closest
+# cells, 1..16 rows of 524288 at k=512, re-timed one process per run at
+# 0.99x-1.02x.
+_SAMPLED_STABLE_MAX_PITCH = 1 << 20
 # Order to fall back in when the shape rules name nothing that is available.
 # Streaming first because it takes a row length natively and scales with rows;
 # `plain` last for the reasons below.
@@ -665,6 +672,8 @@ def _choose(
     if deterministic:
         allowed -= _NONDETERMINISTIC
     sampled_ok = allow_sampled and _sampled_on_device(device)
+    if (tie is not None or deterministic) and stride0 > _SAMPLED_STABLE_MAX_PITCH:
+        sampled_ok = False
     arch = _device_arch(device)
     available = (
         _available(width, k, wave_size, ragged, fp32, sampled_ok, arch) & allowed
@@ -674,7 +683,7 @@ def _choose(
             f"no backend serves rows={rows} width={width} topk={k} "
             f"tie={tie!r} deterministic={deterministic} fp32={fp32}"
         )
-    return topk_select_backend(
+    backend = topk_select_backend(
         rows,
         width,
         k,
@@ -684,6 +693,26 @@ def _choose(
         stride0=stride0,
         with_values=with_values,
     )
+    # Under `tie`, `sampled` ranks -0.0 below +0.0, as `decode` does, where
+    # `stream` takes them as one value. It stands in for `decode` only.
+    if backend == "sampled" and tie is not None:
+        other = _choose(
+            rows,
+            width,
+            stride0,
+            k,
+            wave_size,
+            ragged,
+            tie,
+            deterministic,
+            fp32,
+            device,
+            False,
+            with_values=with_values,
+        )
+        if other != "decode":
+            return other
+    return backend
 
 
 @lru_cache(maxsize=1024)
@@ -1248,13 +1277,11 @@ def topk_select(
             ``sorted=True`` or ``sorted_index=True`` if the returned tensor
             itself has to be reproducible, not just its contents.
 
-            Weaker than ``tie`` and cheaper than it: it excludes ``plain`` and
-            ``sampled`` (`_NONDETERMINISTIC`), keeping the small-k selector that
-            ``tie='low'`` has to give up. Measured on gfx950, it costs up to 3.4x
-            where ``plain`` would have won (k=2048, m=4096 n=16384: 75 against
-            258us on ``stream``) and up to 3.7x on the wide rows where
-            ``sampled`` would have (k=2048, m=64 n=1M: 57 against 210us on
-            ``decode``).
+            Weaker than ``tie`` and cheaper than it: it excludes ``plain``
+            (`_NONDETERMINISTIC`) and runs ``sampled`` in its stable mode,
+            keeping the small-k selector that ``tie='low'`` has to give up.
+            Measured on gfx950, it costs up to 3.4x where ``plain`` would have
+            won (k=2048, m=4096 n=16384: 75 against 258us on ``stream``).
 
     Returns:
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.
@@ -1461,7 +1488,11 @@ def _dispatch(
         # pitch, so the entry's validation would only repeat it. The one thing
         # not checked is the device of a caller's `end` (the default one is
         # built on input's); the entry reports that one.
+        #
+        # `stable` for the same reason as decode's below: smallest-column ties
+        # and a set that is a function of the row, with every NaN one value.
         pitch = input.stride(0) if rows > 1 else input.shape[1]
+        stable = tie == "low" or deterministic
         if not ragged or ends.get_device() == input.get_device():
             _sampled_run(
                 input,
@@ -1476,6 +1507,7 @@ def _dispatch(
                 None,
                 ragged,
                 True,
+                stable,
             )
         else:
             top_k_per_row_prefill_sampled(
@@ -1490,6 +1522,7 @@ def _dispatch(
                 k=topk,
                 ragged=ragged,
                 nan_high=True,
+                stable=stable,
             )
     elif backend == "small_k":
         topk_per_row_small_k(input, row_lens, idx, topk)

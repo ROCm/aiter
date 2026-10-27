@@ -746,7 +746,7 @@ band_clear(uint32_t* __restrict__ s_hist, uint32_t* __restrict__ s_x, uint32_t* 
 // or level 3 has pinned the k-th key, block_gather_stream emits the row
 // (returns -1). Every level drops only keys that cannot be among the top k_out,
 // so the row is exact on every exit; at most four reads of the row.
-template <bool LR, bool WRITE_VALUES, bool NAN_HIGH>
+template <bool LR, bool WRITE_VALUES, bool NAN_HIGH, bool STABLE>
 __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
                                                   int n4,
                                                   int len,
@@ -872,8 +872,14 @@ __device__ __forceinline__ int radix_fallback_row(const float* __restrict__ row,
             *s_weq = 0u;
         }
         __syncthreads();
-        block_gather_stream<WRITE_VALUES, NAN_HIGH>(
-            row, len, row_start, pivot, ngt, k_out - ngt, out, out_val, s_wgt, s_weq);
+        if constexpr(STABLE)
+            block_gather_in_order<WRITE_VALUES, NAN_HIGH>(
+                len, row_start, pivot, ngt, k_out - ngt, out, out_val, s_amm, [&](int j) {
+                    return row_keys4<NAN_HIGH>(row, j, len);
+                });
+        else
+            block_gather_stream<WRITE_VALUES, NAN_HIGH>(
+                row, len, row_start, pivot, ngt, k_out - ngt, out, out_val, s_wgt, s_weq);
         return -1;
     }
 
@@ -1209,7 +1215,7 @@ RowExtents<true> make_row_extents<true>(const int* d_starts, const int* d_ends)
     return RowExtents<true>{d_starts, d_ends};
 }
 
-template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false>
+template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false, bool STABLE = false>
 static void topk_small_n(const float* d_in,
                          int M,
                          int pitch,
@@ -1220,7 +1226,7 @@ static void topk_small_n(const float* d_in,
                          float* d_val,
                          hipStream_t s)
 {
-    phase_small_n_topk<RAGGED, WRITE_VALUES, NAN_HIGH>
+    phase_small_n_topk<RAGGED, WRITE_VALUES, NAN_HIGH, STABLE>
         <<<M, small_n_block(M, pitch), (size_t)pitch * sizeof(uint32_t), s>>>(
             d_in,
             pitch,
@@ -1357,7 +1363,7 @@ static void launch_phase_b(const float* d_in,
                                                           lp.cap);
 }
 
-template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false>
+template <bool RAGGED, bool WRITE_VALUES, bool NAN_HIGH = false, bool STABLE = false>
 static void topk_fused_impl(const float* d_in,
                             int M,
                             int pitch,
@@ -1414,22 +1420,28 @@ static void topk_fused_impl(const float* d_in,
     else
         launch_phase_b<RAGGED, false, false, 0>(d_in, M, pitch, ext, b, lp, s);
 
+    // The stable emit's own LDS lives past everything else phase_c holds.
+    const size_t c_dyn_bytes =
+        lp.c_dyn_bytes +
+        (STABLE ? sizeof(uint32_t) * (size_t)stable_region_words(
+                                         M, K, lp.cap, lp.keys_only_c, lp.nwide_c, lp.reuse_wide_c)
+                : 0);
     auto launch_phase_c = [&](auto reuse_tag) {
         constexpr bool REUSE = decltype(reuse_tag)::value;
-        phase_c_select_contig<RAGGED, WRITE_VALUES, REUSE, NAN_HIGH>
-            <<<M, lp.c_block, lp.c_dyn_bytes, s>>>(d_in,
-                                                   pitch,
-                                                   ext,
-                                                   b.cand_pack,
-                                                   b.cand_reserved,
-                                                   b.cand_bad,
-                                                   lp.cap,
-                                                   K,
-                                                   dst,
-                                                   RADIX_PASSES,
-                                                   lp.keys_only_c,
-                                                   lp.nwide_c,
-                                                   b.threshold);
+        phase_c_select_contig<RAGGED, WRITE_VALUES, REUSE, NAN_HIGH, STABLE>
+            <<<M, lp.c_block, c_dyn_bytes, s>>>(d_in,
+                                                pitch,
+                                                ext,
+                                                b.cand_pack,
+                                                b.cand_reserved,
+                                                b.cand_bad,
+                                                lp.cap,
+                                                K,
+                                                dst,
+                                                RADIX_PASSES,
+                                                lp.keys_only_c,
+                                                lp.nwide_c,
+                                                b.threshold);
     };
     if(lp.reuse_wide_c)
         launch_phase_c(std::true_type{});
@@ -1505,6 +1517,92 @@ static inline Bufs bind_bufs(void* ws, const WsLayout& L, int cap)
     return b;
 }
 
+template <bool STABLE>
+static void launch_small_n(const float* in,
+                           int M,
+                           int N,
+                           const int* row_starts,
+                           const int* row_ends,
+                           int K,
+                           int* idx,
+                           float* val,
+                           bool ragged,
+                           bool nan_high,
+                           hipStream_t stream)
+{
+    if(nan_high)
+    {
+        if(ragged)
+            topk_small_n<true, false, true, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+        else
+            topk_small_n<false, false, true, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+    }
+    else if(ragged)
+    {
+        if(val)
+            topk_small_n<true, true, false, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, val, stream);
+        else
+            topk_small_n<true, false, false, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+    }
+    else
+    {
+        if(val)
+            topk_small_n<false, true, false, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, val, stream);
+        else
+            topk_small_n<false, false, false, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
+    }
+}
+
+template <bool STABLE>
+static void launch_fused(const float* in,
+                         int M,
+                         int N,
+                         const int* row_starts,
+                         const int* row_ends,
+                         int K,
+                         int* idx,
+                         float* val,
+                         bool ragged,
+                         bool nan_high,
+                         Bufs& b,
+                         const LaunchPlan& lp,
+                         hipStream_t stream)
+{
+    if(nan_high)
+    {
+        if(ragged)
+            topk_fused_impl<true, false, true, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
+        else
+            topk_fused_impl<false, false, true, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
+    }
+    else if(ragged)
+    {
+        if(val)
+            topk_fused_impl<true, true, false, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, val, b, lp, stream);
+        else
+            topk_fused_impl<true, false, false, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
+    }
+    else
+    {
+        if(val)
+            topk_fused_impl<false, true, false, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, val, b, lp, stream);
+        else
+            topk_fused_impl<false, false, false, STABLE>(
+                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
+    }
+}
+
 } // namespace sampled
 
 // Published to Python so the caller allocates the scratch (aiter's rule: host
@@ -1566,7 +1664,12 @@ static bool sampled_args_ok(int64_t numRows, int64_t stride0, int64_t k, int64_t
         return false;
     // The launch plan and the kernels index rows and columns as int: refuse what
     // would not survive the narrowing below rather than serve a truncated shape.
-    if(numRows > INT32_MAX || stride0 > INT32_MAX)
+    // The row pitch also keeps headroom under INT32_MAX, because the kernels
+    // round a row length up to whole vectors (n4_cover) and to whole windows of
+    // columns in int: at stride0 = 2^31 - 64 the stable emit's window count
+    // wrapped negative and faulted.
+    constexpr int64_t kStride0Headroom = 1 << 20;
+    if(numRows > INT32_MAX || stride0 > INT32_MAX - kStride0Headroom)
         return false;
     return k <= PHASE_C_CAP_MAX;
 }
@@ -1623,7 +1726,11 @@ void top_k_per_row_prefill_sampled(
     // top_k_per_row_prefill's radix paths do; true ranks every NaN above
     // +inf, topk_select's contract. Indices only: topk_select gathers its
     // values itself.
-    bool nan_high = false)
+    bool nan_high = false,
+    // Ascending column order, ties to the smaller column: the output
+    // top_k_per_row_prefill's stable=True gives, and with nan_high the
+    // one topk_select's tie='low' gives (every NaN one value there).
+    bool stable = false)
 {
     if(numRows <= 0)
         return;
@@ -1690,29 +1797,12 @@ void top_k_per_row_prefill_sampled(
 
     if(sp.path == PATH_SMALL_N)
     {
-        if(nan_high)
-        {
-            if(ragged_small)
-                topk_small_n<true, false, true>(
-                    in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
-            else
-                topk_small_n<false, false, true>(
-                    in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
-        }
-        else if(ragged_small)
-        {
-            if(val)
-                topk_small_n<true, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
-            else
-                topk_small_n<true, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
-        }
+        if(stable)
+            sampled::launch_small_n<true>(
+                in, M, N, row_starts, row_ends, K, idx, val, ragged_small, nan_high, stream);
         else
-        {
-            if(val)
-                topk_small_n<false, true>(in, M, N, row_starts, row_ends, K, idx, val, stream);
-            else
-                topk_small_n<false, false>(in, M, N, row_starts, row_ends, K, idx, nullptr, stream);
-        }
+            sampled::launch_small_n<false>(
+                in, M, N, row_starts, row_ends, K, idx, val, ragged_small, nan_high, stream);
         HIP_CALL_LAUNCH(hipGetLastError());
         return;
     }
@@ -1726,32 +1816,12 @@ void top_k_per_row_prefill_sampled(
                 " B");
     Bufs b              = sampled::bind_bufs(workspace.value().data_ptr(), L, sp.cap);
     const LaunchPlan lp = plan_launch(M, N, sp);
-    if(nan_high)
-    {
-        if(ragged)
-            topk_fused_impl<true, false, true>(
-                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
-        else
-            topk_fused_impl<false, false, true>(
-                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
-    }
-    else if(ragged)
-    {
-        if(val)
-            topk_fused_impl<true, true>(in, M, N, row_starts, row_ends, K, idx, val, b, lp, stream);
-        else
-            topk_fused_impl<true, false>(
-                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
-    }
+    if(stable)
+        sampled::launch_fused<true>(
+            in, M, N, row_starts, row_ends, K, idx, val, ragged, nan_high, b, lp, stream);
     else
-    {
-        if(val)
-            topk_fused_impl<false, true>(
-                in, M, N, row_starts, row_ends, K, idx, val, b, lp, stream);
-        else
-            topk_fused_impl<false, false>(
-                in, M, N, row_starts, row_ends, K, idx, nullptr, b, lp, stream);
-    }
+        sampled::launch_fused<false>(
+            in, M, N, row_starts, row_ends, K, idx, val, ragged, nan_high, b, lp, stream);
     // A refused launch (too much LDS, a bad grid) is otherwise silent: the
     // `<<<>>>` launches only record it, and the output keeps whatever it held.
     HIP_CALL_LAUNCH(hipGetLastError());

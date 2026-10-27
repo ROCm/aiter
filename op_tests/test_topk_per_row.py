@@ -994,6 +994,129 @@ def test_prefill_sampled_routing():
     print("[prefill_sampled_routing] PASS: by stride0 / rows / k / stable / env")
 
 
+def _stable_ref(x, starts, ends, k, key):
+    """The stable contract (op_tests/test_topk_per_row_stable.py): rank by key, a
+    tie to the smaller column, the selected columns ascending; a window of at most
+    k columns whole, -1 padded."""
+    cols = torch.arange(x.shape[1], device=x.device)
+    live = (cols >= starts[:, None].long()) & (cols < ends[:, None].long())
+    kk = key(x).masked_fill(~live, -1)
+    top = torch.sort(-kk, dim=1, stable=True).indices[:, :k]
+    out = torch.sort(top, dim=1).values.to(torch.int32)
+    n = (ends - starts).long()
+    pad = torch.arange(k, device=x.device)[None] >= n[:, None]
+    ident = (starts[:, None].long() + torch.arange(k, device=x.device)).to(torch.int32)
+    out = torch.where((n <= k)[:, None], ident, out)
+    return torch.where(pad, torch.full_like(out, -1), out)
+
+
+def _tie_heavy(rows, width, g):
+    """bf16-rounded scores with +-0 and NaNs of either sign mixed in."""
+    x = torch.randn(rows, width, generator=g, device="cuda").to(torch.bfloat16).float()
+    z = torch.rand(rows, width, generator=g, device="cuda")
+    x = torch.where(z < 0.02, torch.zeros_like(x), x)
+    x = torch.where((z >= 0.02) & (z < 0.04), -torch.zeros_like(x), x)
+    nan = torch.full_like(x, float("nan"))
+    x = torch.where((z >= 0.04) & (z < 0.042), nan, x)
+    return torch.where((z >= 0.042) & (z < 0.044), -nan, x)
+
+
+def _sampled_stable(x, rs, re, k, values=False, nan_high=False):
+    rows, width = x.shape
+    idx = torch.empty(rows, k, dtype=torch.int32, device="cuda")
+    val = torch.empty(rows, k, device="cuda") if values else None
+    aiter.top_k_per_row_prefill_sampled(
+        x, rs, re, idx, val, rows, width, 1, k, nan_high=nan_high, stable=True
+    )
+    return idx, val
+
+
+def _per_row_stable(x, rs, re, k, flydsl):
+    rows, width = x.shape
+    idx = torch.empty(rows, k, dtype=torch.int32, device="cuda")
+    with mock.patch.object(T, "_FLYDSL_TOPK_PREFILL_DISABLED", not flydsl):
+        T.top_k_per_row_prefill(x, rs, re, idx, None, rows, width, 1, k, stable=True)
+    return idx
+
+
+def test_sampled_stable_contract():
+    """`sampled`'s stable mode gives exactly what the stable paths give:
+    smallest-column ties, ascending columns, and the same answer for a row
+    wherever it sits in a batch. By sign it is the HIP one-block kernel's NaN
+    order, and with nan_high FlyDSL's and topk_select's tie='low': every NaN one
+    value."""
+    rows, N = 8, _SAMPLED_N
+    if not aiter.topk_sampled_supports(rows, N, _SAMPLED_K):
+        print("[sampled_stable] SKIP: `sampled` does not serve this shape here")
+        return
+    g = torch.Generator(device="cuda").manual_seed(3)
+    for k in (T._SAMPLED_MIN_K, _SAMPLED_K):
+        x = _tie_heavy(rows, N, g)
+        lens = torch.tensor([N, N - 3, k, k - 5, 70001, 4099, N // 2, 1], device="cuda")
+        rs = (torch.rand(rows, generator=g, device="cuda") * (N - lens + 1)).int()
+        re = (rs + lens).int()
+
+        idx, val = _sampled_stable(x, rs, re, k, values=True)
+        assert torch.equal(idx, _stable_ref(x, rs, re, k, _sign_key)), f"k={k}: sign"
+        assert torch.equal(idx, _per_row_stable(x, rs, re, k, False)), f"k={k}: HIP"
+        want = torch.where(idx >= 0, x.gather(1, idx.clamp(min=0).long()), -torch.inf)
+        assert torch.equal(val.view(torch.int32), want.view(torch.int32)), "values"
+        idx = _sampled_stable(x, rs, re, k, nan_high=True)[0]
+        ref = _stable_ref(x, rs, re, k, _nan_high_key)
+        assert torch.equal(idx, ref), f"k={k}: nan_high"
+        assert torch.equal(idx, _per_row_stable(x, rs, re, k, True)), f"k={k}: FlyDSL"
+
+        with _use_sampled(True):
+            assert (
+                S._choose(rows, N, N, k, 64, False, "low", False, True, 0, True)
+                == "sampled"
+            ), f"k={k}: tie='low' must exercise `sampled`"
+            got = aiter.topk_select(x, k, tie="low")[1]
+        full = _bounds(rows, N)
+        assert torch.equal(
+            got, _stable_ref(x, *full, k, _nan_high_key)
+        ), f"k={k}: tie='low'"
+
+        # One row, three batch sizes, first and last place: one answer.
+        probe = x[3:4]
+        outs = []
+        with _use_sampled(True):
+            for m in (1, 5, 33):
+                for pos in (0, m - 1):
+                    b = torch.randn(m, N, generator=g, device="cuda")
+                    b[pos] = probe[0]
+                    s, e = _bounds(m, N)
+                    idx = _sampled_stable(b, s, e, k)[0]
+                    sel = aiter.topk_select(b, k, tie="low")[1]
+                    outs.append((idx[pos], sel[pos]))
+        for a, b in outs[1:]:
+            assert torch.equal(a, outs[0][0]) and torch.equal(
+                b, outs[0][1]
+            ), f"k={k}: a row's answer moved with its batch"
+
+    # tie='low' takes -0.0 and +0.0 as one value on `stream`, and `sampled`
+    # does not, so it stands in for `decode` only; `deterministic` promises no
+    # direction and takes it on both. Neither takes it past
+    # _SAMPLED_STABLE_MAX_PITCH.
+    wide = 2 * S._SAMPLED_STABLE_MAX_PITCH
+    with _use_sampled(True):
+        for m, n, other in ((8, N, "decode"), (128, N, "stream"), (8, wide, None)):
+            args = (m, n, n, T._SAMPLED_MIN_K, 64, False)
+            low = S._choose(*args, "low", False, True, 0, True)
+            det = S._choose(*args, None, True, True, 0, True)
+            main_low = S._choose(*args, "low", False, True, 0, False)
+            main_det = S._choose(*args, None, True, True, 0, False)
+            tag = f"{m}x{n}"
+            if other is None:
+                assert S._choose(*args, None, False, True, 0, True) == "sampled", tag
+                assert (low, det) == (main_low, main_det), f"{tag}: past the pitch"
+                continue
+            assert main_low == other, f"{tag}: tie='low' without `sampled`"
+            assert low == ("sampled" if other == "decode" else other), f"{tag}: low"
+            assert det == "sampled", f"{tag}: deterministic"
+    print("[sampled_stable] PASS")
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1080,6 +1203,7 @@ _REGRESSIONS = {
     "sampled-nan": test_sampled_nan_order,
     "sampled-overflow": test_sampled_overflow_all_equal,
     "sampled-per-device": test_sampled_eligibility_per_device,
+    "sampled-stable": test_sampled_stable_contract,
 }
 
 parser.add_argument(
