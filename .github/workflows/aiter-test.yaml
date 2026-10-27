@@ -1213,6 +1213,15 @@ jobs:
             pip show amd-mori-nightly
           "
 
+      - name: Mori smoke test
+        timeout-minutes: 30
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "set -o pipefail; timeout 25m python3 op_tests/multigpu_tests/test_mori_smoke.py 2>&1 | tee -a latest_test.log"
+
       - name: Sync prebuilt kernels into source tree
         run: |
           set -euo pipefail
