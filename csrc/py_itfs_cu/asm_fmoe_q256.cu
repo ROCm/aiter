@@ -6,12 +6,12 @@
 
 AITER_CTYPES_ERROR_DEF
 
-// This producer has its own kernarg layout, separate from the shared fmoe ABI.
+// The fused expert kernel has its own kernarg layout, separate from the shared fmoe ABI.
 // Performs gate/up projection, SiLU, in-register hidden MXFP4 quantization,
 // down projection and routing-weight multiplication. The compact contributions
 // are reduced separately in FP32 to produce the final output tensor.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
-    fmoe_q256_producer,
+    fmoe_q256_fused_experts,
     (aiter_tensor_t* out, aiter_tensor_t* partials, aiter_tensor_t* input,
      aiter_tensor_t* gate, aiter_tensor_t* down, aiter_tensor_t* sorted_ids,
      aiter_tensor_t* sorted_weights, aiter_tensor_t* sorted_experts,
@@ -99,19 +99,19 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.top_k = topk;
     args.total_workgroups = 256;
     args.hidden_tiles = 1;
-    const auto select_producer = [job_map]() -> AiterAsmKernel& {
+    const auto select_kernel = [job_map]() -> AiterAsmKernel& {
         if(job_map) {
-            static AiterAsmKernel weighted_producer(
-                "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route_weighted",
-                "fmoe/silu/fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route_weighted.co");
-            return weighted_producer;
+            static AiterAsmKernel weighted_kernel(
+                "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route_weighted",
+                "fmoe/silu/fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route_weighted.co");
+            return weighted_kernel;
         }
-        static AiterAsmKernel compact_producer(
-            "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route",
-            "fmoe/silu/fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route.co");
-        return compact_producer;
+        static AiterAsmKernel compact_kernel(
+            "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route",
+            "fmoe/silu/fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route.co");
+        return compact_kernel;
     };
     size_t arg_size = sizeof(args);
-    auto& producer = select_producer();
-    producer.launch_kernel({&args, &arg_size, 256, 1, 1, 256, 1, 1, stream});
+    auto& kernel = select_kernel();
+    kernel.launch_kernel({&args, &arg_size, 256, 1, 1, 256, 1, 1, stream});
 }
