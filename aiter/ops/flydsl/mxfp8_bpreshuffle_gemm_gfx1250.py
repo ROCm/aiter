@@ -177,6 +177,12 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         )
     if XQ.element_size() != 1 or WQ.element_size() != 1:
         raise RuntimeError("[FlyDSL gfx1250 mxfp8] A/B must be 1-byte fp8 storage")
+    if XQ.stride(1) != 1 or Out.stride(1) != 1 or not WQ.is_contiguous():
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] A and Out need unit inner strides and B must "
+            f"be contiguous, got A strides {tuple(XQ.stride())}, B strides "
+            f"{tuple(WQ.stride())}, Out strides {tuple(Out.stride())}"
+        )
 
     a_rows, K = XQ.shape
     M = Out.shape[0] if a_preshuffle else a_rows
@@ -272,20 +278,14 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             "[FlyDSL gfx1250 mxfp8] partial N tiles need split_k=1 and a 128x128 or "
             "32x32 weight scale"
         )
-    if split_k > 1:
-        if Out.stride(1) != 1:
-            raise RuntimeError(
-                "[FlyDSL gfx1250 mxfp8] split_k>1 needs contiguous Out rows, "
-                f"got strides={tuple(Out.stride())} for {M}x{N}"
-            )
-        # A padded row stride is reduced row-by-row, so each row start must keep
-        # the 16B alignment the vectorised copy needs.
-        if Out.stride(0) != N and (Out.stride(0) & 7 or N & 7):
-            raise RuntimeError(
-                f"[FlyDSL gfx1250 mxfp8] split_k>1 with padded Out rows needs "
-                f"N and stride(0) to be multiples of 8, got N={N}, "
-                f"stride(0)={Out.stride(0)}"
-            )
+    # Split-K reduces a padded Out row stride row-by-row, so each row start must
+    # keep the 16B alignment the vectorised copy needs.
+    if split_k > 1 and Out.stride(0) != N and (Out.stride(0) & 7 or N & 7):
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 mxfp8] split_k>1 with padded Out rows needs "
+            f"N and stride(0) to be multiples of 8, got N={N}, "
+            f"stride(0)={Out.stride(0)}"
+        )
 
     if a_preshuffle and a_rows != M + (M & 1):
         raise RuntimeError(

@@ -238,6 +238,13 @@ def uses_cluster(ki: WmmaKernelInstance) -> bool:
     return ki.cluster_m * ki.cluster_n * k_splits > 1
 
 
+def serves_padded_m(ki: WmmaKernelInstance, M: int) -> bool:
+    """Whether a table row tuned at ``M`` may hold ``ki``. The row also serves the M
+    below its own (down to about half), and a clustered compute kernel must not
+    launch below its tile_m, so it needs M >= 2 * tile_m."""
+    return not (uses_cluster(ki) and M < 2 * ki.tile_m)
+
+
 def kernel_fits_shape(
     ki: WmmaKernelInstance,
     M: int,
@@ -461,9 +468,8 @@ def _tuning_candidates(N: int):
 def tuning_kernels(
     M: int, N: int, K: int, *, scale_block: int, w_scale_32x32: bool
 ) -> list[WmmaKernelInstance]:
-    """Every kernel of the tuner's space that can run ``(M, N, K)``. A table row also
-    serves the M below its own (down to about half), and a clustered compute kernel
-    must not launch below its tile_m, so it needs M >= 2 * tile_m."""
+    """Every kernel of the tuner's space that can run ``(M, N, K)`` and may hold a
+    table row tuned at ``M`` (serves_padded_m)."""
     return [
         ki
         for ki in _tuning_candidates(N)
@@ -476,5 +482,5 @@ def tuning_kernels(
             w_scale_32x32=w_scale_32x32,
             allow_n_tail=True,
         )
-        and not (uses_cluster(ki) and M < 2 * ki.tile_m)
+        and serves_padded_m(ki, M)
     ]

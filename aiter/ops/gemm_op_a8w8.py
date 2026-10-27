@@ -1254,6 +1254,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
             config = _mxscale_tuned_config(m, n, k, x_scale, w_scale_block)
             if not _has_tuned_mxfp8_row(config, m, n, k, w_scale_block):
                 return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y, config)
+            if m == 0:
+                return Y
 
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         get_gfx() == "gfx1250"

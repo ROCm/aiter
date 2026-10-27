@@ -181,6 +181,7 @@ def gfx1250_candidates(m, n, k, w_scale_block):
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
         kernel_fits_shape,
         kernels_list,
+        serves_padded_m,
         tuning_kernels,
     )
     from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import mxfp8_32_kernel_name
@@ -193,6 +194,7 @@ def gfx1250_candidates(m, n, k, w_scale_block):
             (kid, ki)
             for kid, ki in kernels_list.items()
             if kernel_fits_shape(ki, m, n, k, allow_n_tail=True)
+            and serves_padded_m(ki, m)
         )
     return [
         (kid, ki.split_k, mxfp8_32_kernel_name(ki.name) if w32 else ki.name)
