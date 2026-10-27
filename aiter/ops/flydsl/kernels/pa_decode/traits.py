@@ -13,6 +13,7 @@ from flydsl.runtime.device import get_rocm_arch
 MFMA_MNK = 16  # M=N=16; query rows are padded to M-tiles.
 # One i64 operand pack/lane covers K32, including in K128 layouts.
 FP8_PACK_K = 32
+FP8_RESIDUAL_TOKENS = 2 * MFMA_MNK
 BF16_PACK_K = 16
 BF16_KV_SUPPORTED_ARCHS = ("gfx942", "gfx950")
 WAVE = 64
@@ -107,15 +108,15 @@ class PaDecodeTilePolicy:
     @classmethod
     def select(cls, traits, token_bound=None):
         """Use token_bound only for the caller-guarded asymmetric FP8 path."""
-        # At most 16 keys fit the existing 16-byte P-row padding. Other
-        # corrected windows use a full plane because their keys may lie anywhere.
-        compact = token_bound is not None and token_bound <= MFMA_MNK
+        # Compact residuals cover the first 16 or 32 keys. Windowed keys
+        # can occur anywhere, so small windows use a full residual plane.
+        compact = token_bound is not None and token_bound <= FP8_RESIDUAL_TOKENS
         return cls(
             single_tile=traits.single_tile_plan or compact,
-            qk_chunks=1 if compact else traits.NCHUNK,
-            pv_packs=2 if compact else traits.NVOPS,
+            qk_chunks=token_bound // MFMA_MNK if compact else traits.NCHUNK,
+            pv_packs=token_bound // 8 if compact else traits.NVOPS,
             residual_tokens=(
-                MFMA_MNK
+                token_bound
                 if compact
                 else traits.TILE_TOK if traits.FP8_WINDOW_RESIDUAL else 0
             ),
@@ -190,12 +191,11 @@ class PaDecodeSchedule:
             and (is_bf16_kv or query_group_size == 16)
             and query_length == 8
             and trans_v
-            and not per_token_kv
             and sliding_window >= 0
         ):
             raise ValueError(
                 "asymmetric V requires BF16 Q/O, gfx942/gfx950 BF16 KV or "
-                "gfx950 scalar FP8 KV with GQA16, Qlen8/page64 D192/V128, "
+                "gfx950 FP8 KV with GQA16, Qlen8/page64 D192/V128, "
                 "and full attention or a positive "
                 "sliding window"
             )
@@ -615,7 +615,9 @@ class PaDecodeTraits:
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
         ASYMMETRIC_FP8 = value_dim != head_dim and not is_bf16_kv
         # Very small windows need a second FP8 probability term even in long contexts.
-        FP8_WINDOW_RESIDUAL = ASYMMETRIC_FP8 and 0 < sliding_window <= MFMA_MNK
+        FP8_WINDOW_RESIDUAL = (
+            ASYMMETRIC_FP8 and 0 < sliding_window <= FP8_RESIDUAL_TOKENS
+        )
         QUERIES_PER_CTA = query_length // query_splits
         TOTAL_ROWS = query_length * query_group_size
 
@@ -774,6 +776,9 @@ class PaDecodeTraits:
         SP_ROW_BYTES = TILE_TOK * QP_ELEM_BYTES + 16
         if FP8_WINDOW_RESIDUAL:
             SP_ROW_BYTES += TILE_TOK
+        elif ASYMMETRIC_FP8:
+            # Keep 16 bytes of bank padding after the compact residual range.
+            SP_ROW_BYTES += FP8_RESIDUAL_TOKENS
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
         sQscale_off = max(sQ_bytes, sP_bytes)
         sQscale_bytes = 0 if is_bf16_kv else ROWS_PADDED * f32

@@ -197,7 +197,7 @@ def test_bf16_swa_schedule_context_bound(monkeypatch, window):
         ("fp8", "per-tensor", -1, 0),
         ("fp8", "per-tensor", 0, 0),
         ("fp8", "none", -1, 0),
-        ("fp8", "per-token", 128, None),
+        ("fp8", "per-token", 128, 128),
         ("fp8", "per-tensor", -2, None),
         ("bf16", "none", -1, 0),
         ("bf16", "none", 0, 0),
@@ -491,7 +491,7 @@ _ASYMMETRIC_WINDOW_CASES = [
             "lengths": (0, 1, 7, 8, 63, 64, 65, 127, 128, 129, 257, 1027, 8192),
         },
     )
-    for window in (1, 2, 4, 16, 17, 127, 257, 1024, 1025, 4097, 2**31 + 1)
+    for window in (1, 2, 4, 16, 17, 32, 33, 127, 257, 1024, 1025, 4097, 2**31 + 1)
 ]
 _ASYMMETRIC_MULTIHEAD_CASES = [
     (
@@ -502,7 +502,7 @@ _ASYMMETRIC_MULTIHEAD_CASES = [
             "window": window,
             "pattern": "varied",
             "max_partitions": 4,
-            "lengths": (0, 1, 7, 8, 16, 17, 255, 257, 1027),
+            "lengths": (0, 1, 7, 8, 16, 17, 31, 32, 33, 255, 257, 1027),
         },
     )
     for heads, window in ((2, 0), (2, 4), (4, 128), (4, 2048))
@@ -998,7 +998,11 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
                 (False, True),
             )
             if geometry.get("value_dim") is None
-            or (dtype == torch.bfloat16 and scale_mode == "per-tensor" and trans_v)
+            or (
+                dtype == torch.bfloat16
+                and trans_v
+                and (scale_mode == "per-tensor" or geometry.get("kv_heads", 1) > 1)
+            )
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
         *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],

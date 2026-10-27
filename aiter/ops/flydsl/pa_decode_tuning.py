@@ -488,11 +488,10 @@ def _parse_args(argv=None):
         and (args.kv_dtype == "bf16" or args.num_query_heads // args.num_kv_heads == 16)
         and args.block_size == 64
         and args.trans_v
-        and args.scale_mode != "per-token"
     ):
         parser.error(
             "asymmetric dimensions require BF16 Q/O, Qlen8, page64, "
-            "Q/K192-V128, --trans-v 1, and scalar FP8 scales with GQA16, "
+            "Q/K192-V128, --trans-v 1, FP8 KV with GQA16, "
             "and full attention or a positive sliding window"
         )
     if args.device < 0:

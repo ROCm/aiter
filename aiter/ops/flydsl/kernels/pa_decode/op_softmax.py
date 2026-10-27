@@ -268,11 +268,10 @@ class PaDecodeSoftmax:
                 + self.ctx.lane16 * self.traits.SP_ROW_BYTES
                 + self.traits.TILE_TOK
                 + self.ctx.rgroup * 4
+                + a * MFMA_MNK
             )
             if const_expr(self.policy.residual_tokens == self.traits.TILE_TOK):
-                offset = (
-                    offset + self.ctx.warp * self.traits.TOK_PER_WARP + a * MFMA_MNK
-                )
+                offset += self.ctx.warp * self.traits.TOK_PER_WARP
             self.lds.store(offset, fx.Int32, self.gemm.fp8_residual(scaled, word))
 
     @flyc.jit

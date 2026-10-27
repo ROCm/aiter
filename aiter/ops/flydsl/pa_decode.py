@@ -216,7 +216,7 @@ def pa_decode(
     splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
     into separate query CTAs. Q/K and V/output head dimensions normally match.
     The Qlen8/page64 D192/V128 path supports native BF16 KV on gfx942/gfx950
-    and scalar FP8 KV with GQA16 on gfx950, for full attention
+    and scalar or per-token FP8 KV with GQA16 on gfx950, for full attention
     or any positive sliding window.
     ALiBi and externally quantized queries are unsupported.
 
@@ -625,11 +625,10 @@ def pa_decode(
         and block_size == 64
         and (is_bf16_kv or query_group_size == 16)
         and trans_v
-        and not per_token_kv
     ):
         raise NotImplementedError(
             "asymmetric value width requires BF16 Q/O, gfx942/gfx950 BF16 KV "
-            "or gfx950 scalar FP8 KV with GQA16, Qlen8, page64, Q/K192-V128, "
+            "or gfx950 FP8 KV with GQA16, Qlen8, page64, Q/K192-V128, "
             "vectorized V, and full attention or a positive sliding window"
         )
     num_partitions = work_plan.max_partitions

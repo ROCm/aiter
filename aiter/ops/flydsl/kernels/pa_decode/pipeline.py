@@ -19,7 +19,13 @@ from .op_epilog import PaDecodeEpilogue
 from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, PaDecodeTilePolicy
+from .traits import (
+    FP8_RESIDUAL_TOKENS,
+    KV_COMPUTE_BLOCK,
+    LOG2E,
+    MFMA_MNK,
+    PaDecodeTilePolicy,
+)
 
 
 class PaDecodePipeline:
@@ -46,11 +52,11 @@ class PaDecodePipeline:
                 + self.ctx.lane16 * self.traits.SP_ROW_BYTES
                 + self.traits.TILE_TOK
             )
-            if const_expr(self.policy.residual_tokens == MFMA_MNK):
-                # Only rgroup 0 owns the first 16 keys in the PV operand layout.
-                residual = fx.full(2, 0, fx.Int64)
+            if const_expr(self.policy.residual_tokens < self.traits.TILE_TOK):
+                # Only rgroup 0 owns the compact residual keys in the PV layout.
+                residual = fx.full(self.policy.pv_packs, 0, fx.Int64)
                 if self.ctx.rgroup == 0:
-                    residual = self.lds.load(offset, fx.Int64, 2)
+                    residual = self.lds.load(offset, fx.Int64, self.policy.pv_packs)
             else:
                 residual = self.lds.load(
                     offset + self.ctx.rgroup * 64, fx.Int64, self.traits.NVOPS
@@ -67,9 +73,20 @@ class PaDecodePipeline:
             and not self.traits.FP8_WINDOW_RESIDUAL
         ):
             # The caller skips empty plan records; active contexts are positive.
-            # The P-row padding holds one FP8 residual for each of the first 16 keys.
-            if self.ctx.planned_context > MFMA_MNK:
+            # Bound the latest visible key across this CTA's query positions,
+            # including early queries in long verification blocks.
+            query_end = (
+                fx.Int32(gpu.block_id("y")) % self.traits.query_splits + 1
+            ) * self.traits.QUERIES_PER_CTA
+            visible_end = self.ctx.planned_context - (
+                self.traits.query_length - query_end
+            )
+            if visible_end > FP8_RESIDUAL_TOKENS:
                 self.compute()
+            elif visible_end > MFMA_MNK:
+                PaDecodePipeline(
+                    self.ctx, token_bound=FP8_RESIDUAL_TOKENS, lds=self.lds
+                ).compute()
             else:
                 PaDecodePipeline(self.ctx, token_bound=MFMA_MNK, lds=self.lds).compute()
         else:
