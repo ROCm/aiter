@@ -26,8 +26,8 @@ MARKER = "<!-- aiter-pr-self-review -->"
 STATUS_CONTEXT = "PR Self-Review"
 MAX_PAGES = 30
 MAX_RENDERED_ANSWER_CHARS = 4_000
-MAX_RENDERED_FINDING_CHARS = 500
 MAX_RENDERED_FINDINGS = 20
+MAX_RENDERED_INLINE_CHARS = 320
 SECTION_NAMES = (
     "Reviewed revision",
     "Behavior and intent",
@@ -142,11 +142,14 @@ class Result:
     hygiene_issues: list[str] = field(default_factory=list)
     hygiene_advisories: list[str] = field(default_factory=list)
     ci: dict[str, str] = field(default_factory=dict)
+    ci_unavailable: bool = False
     answers: dict[str, str] = field(default_factory=dict)
 
     @property
     def ci_pending(self) -> bool:
-        return any(value in {"pending", "missing"} for value in self.ci.values())
+        return any(
+            value in {"pending", "missing", "unavailable"} for value in self.ci.values()
+        )
 
     @property
     def ci_failed(self) -> bool:
@@ -173,6 +176,15 @@ class Result:
 
 def strip_comments(text: str) -> str:
     return re.sub(r"<!--[\s\S]*?-->", "", text).strip()
+
+
+def inline_code(value: str) -> str:
+    value = value.replace("\r", r"\r").replace("\n", r"\n")
+    if len(value) > MAX_RENDERED_INLINE_CHARS:
+        value = value[:MAX_RENDERED_INLINE_CHARS].rstrip() + "…"
+    longest = max((len(match) for match in re.findall(r"`+", value)), default=0)
+    fence = "`" * max(1, longest + 1)
+    return f"{fence} {value} {fence}"
 
 
 def sections(body: str) -> dict[str, str]:
@@ -277,10 +289,15 @@ def validate_author_answers(
             if path not in test_answer and path.rsplit("/", 1)[-1] not in test_answer
         ]
         if missing:
-            issues.append(
-                "changed op tests not explained in `Changed op tests`: "
-                + ", ".join(missing[:8])
+            issues.extend(
+                "changed op test not explained in `Changed op tests`: "
+                + inline_code(path)
+                for path in missing[:8]
             )
+            if len(missing) > 8:
+                issues.append(
+                    f"{len(missing) - 8} additional changed op test(s) are not explained"
+                )
         if answer_is_empty(test_answer):
             issues.append(
                 "`Changed op tests` must explain why each changed op test is necessary and non-redundant"
@@ -301,12 +318,12 @@ def inspect_hygiene(
         if path.startswith("op_tests/"):
             changed_tests.append(path)
         if any(pattern.search(path) for pattern in ARTIFACT_PATTERNS):
-            hard.append(f"generated/debug artifact is committed: `{path}`")
+            hard.append(f"generated/debug artifact is committed: {inline_code(path)}")
         if CONFLICT_MARKER.search(patch):
-            hard.append(f"merge-conflict marker appears in `{path}`")
+            hard.append(f"merge-conflict marker appears in {inline_code(path)}")
         if DEBUG_LINE.search(patch):
             advisory.append(
-                f"new debug-looking statement in `{path}`; confirm it is intentional"
+                f"new debug-looking statement in {inline_code(path)}; confirm it is intentional"
             )
         if (
             item.get("status") == "added"
@@ -317,7 +334,7 @@ def inspect_hygiene(
             )
         ):
             advisory.append(
-                f"new op test `{path}` has no obvious assertion/check in the available patch"
+                f"new op test {inline_code(path)} has no obvious assertion/check in the available patch"
             )
     return hard, advisory, changed_tests
 
@@ -361,8 +378,10 @@ def inspect_copilot(
         threads = (pull.get("reviewThreads") or {}).get("nodes") or []
         reviews = (pull.get("reviews") or {}).get("nodes") or []
         head_sha = pull.get("headRefOid") or ""
-    except APIError as exc:
-        return [], [f"Copilot review threads could not be read: {exc}"]
+    except APIError:
+        return [], [
+            "Copilot review threads could not be read; availability is advisory"
+        ]
 
     issues: list[str] = []
     advisories: list[str] = []
@@ -436,6 +455,30 @@ def inspect_ci(api: GitHub, head_sha: str) -> dict[str, str]:
     return states
 
 
+def find_workflow_pr(
+    api: GitHub, head_owner: str, head_branch: str, head_sha: str
+) -> int | None:
+    if not head_owner or not head_branch or not head_sha:
+        return None
+    query = urllib.parse.urlencode(
+        {
+            "state": "open",
+            "base": "main",
+            "head": f"{head_owner}:{head_branch}",
+            "per_page": 100,
+        }
+    )
+    pulls = api.request(f"pulls?{query}")
+    matches = [
+        pull
+        for pull in pulls
+        if ((pull.get("head") or {}).get("sha") or "") == head_sha
+    ]
+    if len(matches) != 1:
+        return None
+    return int(matches[0]["number"])
+
+
 def evaluate(api: GitHub, number: int, mode: str) -> Result:
     pr = api.request(f"pulls/{number}")
     files = api.pages(f"pulls/{number}/files")
@@ -447,6 +490,12 @@ def evaluate(api: GitHub, number: int, mode: str) -> Result:
         pr.get("body") or "", head_sha, changed_tests
     )
     copilot_issues, copilot_advisories = inspect_copilot(api, number, author)
+    ci_unavailable = False
+    try:
+        ci = inspect_ci(api, head_sha)
+    except APIError:
+        ci = {name: "unavailable" for name in REQUIRED_CHECKS}
+        ci_unavailable = True
     result = Result(
         head_sha=head_sha,
         pr_url=pr.get("html_url") or "",
@@ -458,7 +507,8 @@ def evaluate(api: GitHub, number: int, mode: str) -> Result:
         copilot_advisories=copilot_advisories,
         hygiene_issues=hard,
         hygiene_advisories=advisory,
-        ci=inspect_ci(api, head_sha),
+        ci=ci,
+        ci_unavailable=ci_unavailable,
         answers=answers,
     )
     return result
@@ -469,6 +519,7 @@ def icon(state: str) -> str:
         "passed": "PASS",
         "pending": "WAIT",
         "missing": "WAIT",
+        "unavailable": "WAIT",
         "failed": "FAIL",
     }.get(state, state.upper())
 
@@ -486,8 +537,6 @@ def fenced_text(value: str) -> str:
 
 def append_findings(lines: list[str], level: str, findings: list[str]) -> None:
     for finding in findings[:MAX_RENDERED_FINDINGS]:
-        if len(finding) > MAX_RENDERED_FINDING_CHARS:
-            finding = finding[:MAX_RENDERED_FINDING_CHARS].rstrip() + "…"
         lines.append(f"- {level} — {finding}")
     remaining = len(findings) - MAX_RENDERED_FINDINGS
     if remaining > 0:
@@ -579,6 +628,10 @@ def render(result: Result) -> str:
         lines.extend(["", "### Required CI"])
         for name, state in result.ci.items():
             lines.append(f"- {icon(state)} — {name}: `{state}`")
+        if result.ci_unavailable:
+            lines.append(
+                "- ADVISORY — GitHub check runs could not be read; this PR remains not ready."
+            )
         if result.ci_pending:
             lines.append(
                 "- Required CI is incomplete; this PR is not ready for human review."
@@ -677,12 +730,25 @@ def main(argv: list[str]) -> int:
 
     repo = os.environ.get("GITHUB_REPOSITORY", "ROCm/aiter")
     token = os.environ.get("GH_TOKEN", "")
-    number = int(os.environ["PR_NUMBER"])
     mode = os.environ.get("SELF_REVIEW_MODE", "shadow").strip().lower()
     if mode not in {"shadow", "enforce"}:
         raise SystemExit(f"invalid SELF_REVIEW_MODE={mode!r}")
 
     api = GitHub(repo, token)
+    raw_number = os.environ.get("PR_NUMBER", "").strip()
+    number = (
+        int(raw_number)
+        if raw_number
+        else find_workflow_pr(
+            api,
+            os.environ.get("WORKFLOW_HEAD_OWNER", ""),
+            os.environ.get("WORKFLOW_HEAD_BRANCH", ""),
+            os.environ.get("WORKFLOW_HEAD_SHA", ""),
+        )
+    )
+    if number is None:
+        print("No open main-targeting pull request matched this workflow run.")
+        return 0
     result = evaluate(api, number, mode)
     body = render(result)
     print(body)

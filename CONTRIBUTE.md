@@ -470,6 +470,7 @@ A pull request is ready for human review only when:
 * The pull request is no longer a draft.
 * The behavior, reason for the change and current revision are stated.
 * Validation evidence and anything still unverified are stated.
+* Kernel or performance changes include hardware, workload and before/after results.
 * The PR-specific question is answered.
 * Every changed `op_tests/` file has a stated, non-redundant purpose.
 * Current Copilot findings have a substantive author reply. Resolving the

@@ -19,13 +19,14 @@ on:
         type: number
 
 permissions:
+  checks: read
   contents: read
   issues: write
   pull-requests: read
   statuses: write
 
 concurrency:
-  group: pr-self-review-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr || github.run_id }}
+  group: pr-self-review-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha || inputs.pr || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -33,7 +34,7 @@ jobs:
     # workflow_run may describe a main/scheduled run rather than a pull request.
     # Review events do not support a branches filter, so constrain their base here.
     if: >-
-      (github.event_name != 'workflow_run' || github.event.workflow_run.pull_requests[0].number) &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request') &&
       (github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch' ||
        github.event.pull_request.base.ref == 'main')
     runs-on: ubuntu-latest
@@ -49,5 +50,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || inputs.pr }}
+          WORKFLOW_HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           SELF_REVIEW_MODE: ${{ vars.AITER_PR_SELF_REVIEW_MODE || 'shadow' }}
         run: python3 .github/scripts/pr_self_review.py --apply

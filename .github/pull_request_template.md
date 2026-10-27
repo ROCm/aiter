@@ -2,6 +2,14 @@
 
 <!-- What does this pull request change? -->
 
+## Performance (if applicable)
+
+<!-- Required for kernel/performance changes. State the hardware and exact workload/configuration. Delete this section only when performance is not applicable. -->
+
+| Hardware | Workload/configuration | Before | After | Change |
+|----------|------------------------|--------|-------|--------|
+|          |                        |        |       |        |
+
 ## PR Self-Review
 
 ### Reviewed revision
