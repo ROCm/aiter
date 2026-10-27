@@ -34,6 +34,8 @@ MFMA32_SMALL_KERNEL = "_ZN5aiter40f4f6gemm_bf16_per1x32Fp4Fp6_m32_s0_a5_ntE"
 MFMA32_SWZ0_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s0_a4_tE"
 MFMA32_GROUPED_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s3_a5_tE"
 MFMA32_LONG_K_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s3_a6_tE"
+DMABIG_SWZ0_KERNEL = "_ZN5aiter44f4f6gemm_bf16_per1x32Fp4Fp6_dmabig_m82_s0_ntE"
+DMABIG_GROUPED_KERNEL = "_ZN5aiter44f4f6gemm_bf16_per1x32Fp4Fp6_dmabig_m82_s3_ntE"
 SPECIALIZED_UP_KERNEL = "_ZN5aiter50f4f6gemm_bf16_per1x32Fp4Fp6_m9472_n13824_k5120_m82E"
 SPECIALIZED_DOWN_KERNEL = (
     "_ZN5aiter50f4f6gemm_bf16_per1x32Fp4Fp6_m9472_n5120_k13824_m82E"
@@ -171,6 +173,8 @@ test_gemm_a4w6_benchmark.__test__ = False
         ((513, 769, 257), MFMA32_SMALL_KERNEL, MX_DEFAULT_ROUND_MODE),
         ((257, 513, 129), MFMA32_SMALL_KERNEL, MX_DEFAULT_ROUND_MODE),
         ((257, 513, 513), MFMA32_SMALL_KERNEL, MX_DEFAULT_ROUND_MODE),
+        ((257, 513, 129), DMABIG_SWZ0_KERNEL, MX_DEFAULT_ROUND_MODE),
+        ((513, 769, 257), DMABIG_GROUPED_KERNEL, MX_DEFAULT_ROUND_MODE),
         ((2048, 512, 256), None, MX_DEFAULT_ROUND_MODE),
         ((2048, 256, 512), None, MX_DEFAULT_ROUND_MODE),
         ((9450, 5120, 5120), None, MX_DEFAULT_ROUND_MODE),
@@ -248,6 +252,8 @@ def test_a4w6_mfma32_variants_match_swizzle0_bitwise():
         MFMA32_SMALL_KERNEL,
         MFMA32_GROUPED_KERNEL,
         MFMA32_LONG_K_KERNEL,
+        DMABIG_SWZ0_KERNEL,
+        DMABIG_GROUPED_KERNEL,
     ):
         actual = torch.empty_like(baseline)
         gemm_a4w6_asm(
