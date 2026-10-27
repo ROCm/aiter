@@ -97,6 +97,18 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4",
     ),
+    "flydsl_pa_mqa_logits_fp4_gfx942": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_gfx942",
+        "flydsl_pa_mqa_logits_fp4_gfx942",
+    ),
+    "flydsl_pa_mqa_logits_fp4_gfx942_longctx": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_gfx942_longctx",
+        "flydsl_pa_mqa_logits_fp4_gfx942_longctx",
+    ),
+    "recommended_gfx942_fp4_longctx_config": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_gfx942_longctx",
+        "recommended_gfx942_fp4_longctx_config",
+    ),
     "flydsl_pa_mqa_logits_fp4_rowgroup": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup",
         "flydsl_pa_mqa_logits_fp4_rowgroup",
@@ -110,9 +122,25 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_prefill",
     ),
+    "flydsl_pa_mqa_logits_fp4_prefill_gfx942": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill_gfx942",
+        "flydsl_pa_mqa_logits_fp4_prefill_gfx942",
+    ),
     "flydsl_pa_mqa_logits_fp4_varqlen": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",
+    ),
+    "flydsl_pa_mqa_logits_fp4_varqlen_gfx942": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill_gfx942",
+        "flydsl_pa_mqa_logits_fp4_varqlen_gfx942",
+    ),
+    "flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942": (
+        ".kernels.mqa_logits.pa_mqa_page_max_fp4_rowpack_prefill_gfx942",
+        "flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942",
+    ),
+    "rowpack_prefill_inputs_gfx942": (
+        ".kernels.mqa_logits.pa_mqa_page_max_fp4_rowpack_prefill_gfx942",
+        "rowpack_prefill_inputs_gfx942",
     ),
     "flydsl_preshuffle_gemm_a8": (
         ".gemm_kernels",
@@ -204,9 +232,14 @@ __all__ = [
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
     "flydsl_pa_mqa_logits_fp4",
+    "flydsl_pa_mqa_logits_fp4_gfx942",
+    "flydsl_pa_mqa_logits_fp4_gfx942_longctx",
     "flydsl_pa_mqa_logits_fp4_prefill",
+    "flydsl_pa_mqa_logits_fp4_prefill_gfx942",
     "flydsl_pa_mqa_logits_fp4_rowgroup",
     "flydsl_pa_mqa_logits_fp4_varqlen",
+    "flydsl_pa_mqa_logits_fp4_varqlen_gfx942",
+    "flydsl_pa_mqa_page_max_fp4_rowpack_prefill_gfx942",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
@@ -224,6 +257,8 @@ __all__ = [
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "recommended_gfx942_fp4_longctx_config",
+    "rowpack_prefill_inputs_gfx942",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
