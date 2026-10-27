@@ -323,10 +323,12 @@ KW_CASES = [
         {"padding": 1},
         False,
     ),
+    # 33x33 under a 2x2x2 filter with no padding gives Ho = Wo = 32, so
+    # npq = 3 * 32 * 32 is a multiple of tile_m and 32 divides by (4, 16).
     (
         "3d_splitk2",
         3,
-        (1, 32, 4, 32, 32),
+        (1, 32, 4, 33, 33),
         (64, 32, 2, 2, 2),
         {
             "padding": 0,
