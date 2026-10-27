@@ -480,15 +480,14 @@ def icon(state: str) -> str:
 
 def render(result: Result, pr: dict[str, Any]) -> str:
     ready = not result.blocking and not result.ci_pending
-    if result.mode == "shadow":
-        headline = "SHADOW — ready" if ready else "SHADOW — not ready"
-    else:
-        headline = "Ready for human review" if ready else "Not ready for human review"
+    conclusion = "READY FOR HUMAN REVIEW" if ready else "NOT READY FOR HUMAN REVIEW"
 
     lines = [
+        f"# {conclusion}",
+        "",
         "## PR Self-Review",
         "",
-        f"**{headline}** · revision `{result.head_sha[:12]}` · mode `{result.mode}`",
+        f"Revision `{result.head_sha[:12]}` · mode `{result.mode}`",
         "",
         "Edit the `PR Self-Review` section in the PR description. The check refreshes automatically.",
         "",

@@ -282,8 +282,12 @@ def main():
     check("author blocker fails", enforce.state() == "failure")
 
     rendered = MODULE.render(enforce, {})
+    check(
+        "comment leads with review readiness",
+        rendered.startswith("# NOT READY FOR HUMAN REVIEW\n"),
+    )
     check("comment reports required CI", "### Required CI" in rendered)
-    check("comment says not ready", "Not ready for human review" in rendered)
+    check("comment says not ready", "NOT READY FOR HUMAN REVIEW" in rendered)
 
     print("All PR Self-Review tests passed.")
     return 0
