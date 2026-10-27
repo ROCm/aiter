@@ -6837,12 +6837,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     @staticmethod
     def _capture_configuration() -> "dict[str, float | None]":
-        value = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
-        limit = None if value in (None, "") else float(value)
-        if limit is not None and (not math.isfinite(limit) or limit <= 0):
-            raise ValueError(
-                "AITER_MXFP4_TUNE_SWIGLU_LIMIT must be finite and positive"
-            )
+        from aiter.aot.flydsl.mxfp4_moe import resolve_swiglu_limit
+
+        limit, _source = resolve_swiglu_limit()
         return {"swiglu_limit": limit}
 
     def _invocation_configuration(

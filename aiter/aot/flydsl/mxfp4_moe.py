@@ -107,6 +107,29 @@ def _job_key(job: dict) -> tuple:
     )
 
 
+def resolve_swiglu_limit(
+    swiglu_limit: "object" = None,
+) -> "tuple[float | None, str]":
+    """Return the validated SiLU/SwiGLU clamp limit and the name it came from.
+
+    ``None`` falls back to AITER_MXFP4_TUNE_SWIGLU_LIMIT; an unset or empty
+    variable keeps the activation default (``None``).
+    """
+    source = "swiglu_limit"
+    if swiglu_limit is None:
+        swiglu_limit = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT") or None
+        source = "AITER_MXFP4_TUNE_SWIGLU_LIMIT"
+    if swiglu_limit is None:
+        return None, source
+    try:
+        limit = float(swiglu_limit)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{source} must be a finite positive number") from error
+    if not math.isfinite(limit) or limit <= 0:
+        raise ValueError(f"{source} must be a finite positive number")
+    return limit, source
+
+
 def parse_csv(
     csv_path: "str | io.TextIOBase", swiglu_limit: float | None = None
 ) -> "list[dict[str, object]]":
@@ -115,6 +138,10 @@ def parse_csv(
     ``swiglu_limit`` defaults to AITER_MXFP4_TUNE_SWIGLU_LIMIT, else the
     activation default.
     """
+    from aiter.fused_moe import (
+        _flydsl_stage2_fp8_enabled,
+        _mxfp4_intermediate_enabled,
+    )
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
@@ -128,20 +155,9 @@ def parse_csv(
         parse_flydsl_v2_gemm2_kernel,
     )
 
-    limit_source = "swiglu_limit"
-    if swiglu_limit is None:
-        swiglu_limit = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT") or None
-        limit_source = "AITER_MXFP4_TUNE_SWIGLU_LIMIT"
-    # Same opt-in gates as production.
-    mxfp4_intermediate = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
-    stage2_fp8_route_out = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-    if swiglu_limit is not None:
-        try:
-            swiglu_limit = float(swiglu_limit)
-        except (TypeError, ValueError) as error:
-            raise ValueError("swiglu_limit must be a finite positive number") from error
-        if not math.isfinite(swiglu_limit) or swiglu_limit <= 0:
-            raise ValueError("swiglu_limit must be a finite positive number")
+    swiglu_limit, limit_source = resolve_swiglu_limit(swiglu_limit)
+    mxfp4_intermediate = _mxfp4_intermediate_enabled()
+    stage2_fp8_route_out = _flydsl_stage2_fp8_enabled()
 
     jobs = []
     seen = set()
