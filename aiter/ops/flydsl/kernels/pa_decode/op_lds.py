@@ -1023,6 +1023,21 @@ class Gfx1250Memory:
             words.extend([frag[i] for i in range_constexpr(4)])
         return fx.Vector.from_elements(words, dtype=fx.Int32)
 
+    def page_v_operands(self, kv_off):
+        ctx, t = self.ctx, self.t
+        return [
+            [
+                self.packed_operand(
+                    kv_off + t.k_bytes + (vh * 64 + ctx.warp * 16) * 16,
+                    t.head_dim,
+                    t.TOKENS,
+                    ctx.lane16,
+                    ctx.half,
+                )
+            ]
+            for vh in range_constexpr(t.head_dim // 64)
+        ]
+
     def bf16_k_operand(self, offset, token, dim, lane16, half):
         # Retain vector-8 cache packing: each half-wave reads alternate chunks.
         words = []

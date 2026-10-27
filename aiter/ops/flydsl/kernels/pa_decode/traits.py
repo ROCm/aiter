@@ -853,11 +853,25 @@ class Gfx1250Traits:
         return 0 if self.bf16_page128_packed else self.q_tiles * 16 * self.q_stride
 
     @property
+    def fp8_dense_mtp4(self):
+        # Four D128 query tiles share one packed page and resident operands.
+        return (
+            not self.bf16
+            and self.head_dim == 128
+            and self.block_size == 128
+            and self.query_length == 4
+            and self.query_group_size == 16
+            and self.trans_v
+            and self.sliding_window == 0
+            and self.m_tiles == 4
+        )
+
+    @property
     def packed_lds(self):
         # FP8 cache layout is independent of scalar or per-token scales.
         # Page16 tiles gather one page per wave without padded LDS rows.
-        # Two fused query tiles reuse the packed page and K128 WMMA path for
-        # measured D256/G8/MTP4 full attention, without extra KV fetches.
+        # Fused MTP4 queries reuse packed pages and K128 WMMA without
+        # fetching K/V again for each query tile.
         return (
             not self.bf16
             and self.head_dim in (128, 256)
@@ -865,6 +879,7 @@ class Gfx1250Traits:
             and self.trans_v
             and (
                 self.m_tiles == 1
+                or self.fp8_dense_mtp4
                 or (
                     self.head_dim == 256
                     and self.block_size == 128
@@ -905,11 +920,11 @@ class Gfx1250Traits:
 
     @property
     def async_page(self):
-        # Two packed buffers overlap page DMA with QK/softmax/PV. Keep this
-        # measured specialization separate from windowed and smaller-D tiles.
+        # Two packed buffers overlap page DMA with QK/softmax/PV. Keep these
+        # measured specializations separate from windowed and single-M D128 tiles.
         return (
             self.packed_lds
-            and self.head_dim == 256
+            and (self.head_dim == 256 or self.fp8_dense_mtp4)
             and self.block_size == 128
             and self.sliding_window == 0
         )
