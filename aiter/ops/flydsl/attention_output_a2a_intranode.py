@@ -18,6 +18,7 @@ from .communication_ops_host_utils import build_p2p_table
 from .kernels.attention_a2a_intranode_kernel import make_attention_a2a_reuse_jit
 from .kernels.attention_output_a2a_intranode_kernel import (
     make_attention_output_a2a_jit,
+    make_attention_output_packed_copy_jit,
 )
 from .kernels.tensor_shim import _run_compiled
 
@@ -70,7 +71,7 @@ class AttentionOutputA2AIntraNodeOp:
         if group is None:
             raise ValueError("group is required for cross-rank configuration checks")
         codec = codec.strip().lower()
-        if codec not in {"e4m3", "mxfp4", "mxfp6"}:
+        if codec not in {"e4m3", "e4m3_tensor", "mxfp4", "mxfp6"}:
             raise ValueError(f"unsupported attention output codec {codec!r}")
         if world_size not in (2, 4, 8):
             raise ValueError(f"world_size must be one of 2, 4, 8; got {world_size}")
@@ -111,7 +112,7 @@ class AttentionOutputA2AIntraNodeOp:
                 f"attention output A2A requires gfx942 or gfx950, got {arch}"
             )
         self.fp8_fnuz = arch == "gfx942"
-        if codec != "e4m3" and arch != "gfx950":
+        if codec in {"e4m3_tensor", "mxfp4", "mxfp6"} and arch != "gfx950":
             raise RuntimeError(f"{codec} attention output requires gfx950")
         self.codec = codec
         self.rank = rank
@@ -132,12 +133,16 @@ class AttentionOutputA2AIntraNodeOp:
         self.scale_shape = self.output_shape[:-1]
         rows = self.seq_local
         features = self.heads_total * shape[3]
-        if codec == "e4m3":
+        if codec in {"e4m3", "e4m3_tensor"}:
             payload_size = math_prod(self.output_shape)
-            scale_size = math_prod(self.scale_shape)
             scale_dtype = torch.float32
             result_payload_shape = self.output_shape
-            result_scale_shape = self.scale_shape
+            if codec == "e4m3_tensor":
+                scale_size = 1
+                result_scale_shape = (1, 1)
+            else:
+                scale_size = math_prod(self.scale_shape)
+                result_scale_shape = self.scale_shape
         elif codec == "mxfp4":
             padded_rows = (rows + 255) // 256 * 256
             padded_scale_columns = (features // 32 + 7) // 8 * 8
@@ -188,6 +193,71 @@ class AttentionOutputA2AIntraNodeOp:
                 self.payload_storage_sets, self.scale_storage_sets
             )
         )
+        self._canonical_pack = codec in {"mxfp4", "mxfp6"}
+        self._pack_per_destination = False
+        self._local_payload_segment_size = None
+        self._local_scale_segment_size = None
+        self.local_payload_sets = ()
+        self.local_scale_sets = ()
+        self._pack_local = None
+        if self._canonical_pack and codec == "mxfp4":
+            import aiter
+            from aiter.ops.quant import dynamic_per_group_scaled_quant
+
+            local_features = self.heads_local * shape[3]
+            self.local_payload_sets = tuple(
+                torch.empty(
+                    shape[1],
+                    local_features // 2,
+                    dtype=aiter.dtypes.fp4x2,
+                    device=device,
+                )
+                for _ in range(2)
+            )
+            self.local_scale_sets = tuple(
+                torch.empty(
+                    shape[1],
+                    local_features // 32,
+                    dtype=aiter.dtypes.fp8_e8m0,
+                    device=device,
+                )
+                for _ in range(2)
+            )
+            self._pack_local = dynamic_per_group_scaled_quant
+        elif self._canonical_pack and codec == "mxfp6":
+            from aiter.ops.gemm_op_a6w6 import (
+                mxfp6_gemm_pack_size,
+                quant_mxfp6_gemm_out,
+            )
+
+            local_features = self.heads_local * shape[3]
+            self._pack_per_destination = self.seq_local % 256 != 0
+            pack_rows = self.seq_local if self._pack_per_destination else shape[1]
+            segment_payload_size, segment_scale_size = mxfp6_gemm_pack_size(
+                pack_rows, local_features
+            )
+            segments = world_size if self._pack_per_destination else 1
+            local_payload_size = segment_payload_size * segments
+            local_scale_size = segment_scale_size * segments
+            self._local_payload_segment_size = segment_payload_size
+            self._local_scale_segment_size = segment_scale_size
+            self.local_payload_sets = tuple(
+                torch.empty(
+                    local_payload_size,
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                for _ in range(2)
+            )
+            self.local_scale_sets = tuple(
+                torch.empty(
+                    local_scale_size,
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                for _ in range(2)
+            )
+            self._pack_local = quant_mxfp6_gemm_out
         self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
         self.reuse_mem_sets = tuple(
             mori_shmem_create_tensor((world_size,), torch.int64) for _ in range(2)
@@ -198,10 +268,11 @@ class AttentionOutputA2AIntraNodeOp:
         for payload in self.payload_storage_sets:
             payload.zero_()
         for scale in self.scale_storage_sets:
-            if codec == "mxfp4":
-                scale.fill_(0x7F)
-            else:
-                scale.zero_()
+            scale.view(torch.uint8).zero_()
+        for payload in self.local_payload_sets:
+            payload.view(torch.uint8).zero_()
+        for scale in self.local_scale_sets:
+            scale.view(torch.uint8).zero_()
         self.xdb_mem.zero_()
         for reuse_mem in self.reuse_mem_sets:
             reuse_mem.zero_()
@@ -245,20 +316,27 @@ class AttentionOutputA2AIntraNodeOp:
         ms.shmem_barrier_all()
 
         self._reuse_launch = make_attention_a2a_reuse_jit(rank=rank, npes=world_size)
-        self._launch = make_attention_output_a2a_jit(
-            rank=rank,
-            npes=world_size,
-            seq_local=self.seq_local,
-            heads_local=self.heads_local,
-            head_dim=shape[3],
-            block_num=block_num,
-            warp_num_per_block=warp_num_per_block,
-            fp8_fnuz=self.fp8_fnuz,
-            codec=codec,
+        launch_factory = (
+            make_attention_output_packed_copy_jit
+            if self._canonical_pack
+            else make_attention_output_a2a_jit
         )
+        launch_kwargs = {
+            "rank": rank,
+            "npes": world_size,
+            "seq_local": self.seq_local,
+            "heads_local": self.heads_local,
+            "head_dim": shape[3],
+            "block_num": block_num,
+            "warp_num_per_block": warp_num_per_block,
+            "codec": codec,
+        }
+        if not self._canonical_pack:
+            launch_kwargs["fp8_fnuz"] = self.fp8_fnuz
+        self._launch = launch_factory(**launch_kwargs)
         self._epoch = 0
 
-    def __call__(self, input, stream=None):
+    def __call__(self, input, stream=None, tensorwise_scales=None):
         if input.dtype != self.dtype or tuple(input.shape) != self.shape:
             raise ValueError(
                 f"expected contiguous {self.dtype} input with shape {self.shape}, "
@@ -269,9 +347,52 @@ class AttentionOutputA2AIntraNodeOp:
         torch_stream = torch.cuda.current_stream() if stream is None else stream
         if input.device != self.device or torch_stream.device != self.device:
             raise ValueError("input and stream must use the owning device")
+        if self.codec == "e4m3_tensor":
+            if (
+                tensorwise_scales is None
+                or tensorwise_scales.dtype != torch.float32
+                or tuple(tensorwise_scales.shape) != (self.world_size,)
+                or tensorwise_scales.device != self.device
+                or not tensorwise_scales.is_contiguous()
+            ):
+                raise ValueError(
+                    "e4m3_tensor requires contiguous FP32 destination scales "
+                    f"with shape ({self.world_size},) on {self.device}"
+                )
+            tensorwise_scales.record_stream(torch_stream)
+        elif tensorwise_scales is not None:
+            raise ValueError(f"{self.codec} does not accept tensorwise_scales")
 
         parity = self._epoch % 2
         stream = Stream(torch_stream)
+        if self._canonical_pack:
+            matrix = input.view(self.shape[1], -1)
+            local_payload = self.local_payload_sets[parity]
+            local_scale = self.local_scale_sets[parity]
+            with torch.cuda.stream(torch_stream):
+                if self.codec == "mxfp4":
+                    self._pack_local(
+                        local_payload,
+                        matrix,
+                        local_scale,
+                        32,
+                        shuffle_scale=False,
+                    )
+                elif self._pack_per_destination:
+                    for peer in range(self.world_size):
+                        row_start = peer * self.seq_local
+                        row_end = row_start + self.seq_local
+                        payload_start = peer * self._local_payload_segment_size
+                        payload_end = payload_start + self._local_payload_segment_size
+                        scale_start = peer * self._local_scale_segment_size
+                        scale_end = scale_start + self._local_scale_segment_size
+                        self._pack_local(
+                            matrix[row_start:row_end],
+                            local_payload[payload_start:payload_end],
+                            local_scale[scale_start:scale_end],
+                        )
+                else:
+                    self._pack_local(matrix, local_payload, local_scale)
         reuse_args = (
             self.reuse_mem_sets[parity].data_ptr(),
             self.p2p_reuse_mem_sets[parity].data_ptr(),
@@ -283,15 +404,28 @@ class AttentionOutputA2AIntraNodeOp:
             *(fx.Int64(arg) for arg in reuse_args[:-1]),
             reuse_args[-1],
         )
-        args = (
-            input.data_ptr(),
-            self.p2p_payload_sets[parity].data_ptr(),
-            self.p2p_scale_sets[parity].data_ptr(),
-            self.xdb_mem.data_ptr(),
-            self.p2p_xdb_mem.data_ptr(),
-            self.xdb_flag.data_ptr(),
-            stream,
-        )
+        if self._canonical_pack:
+            args = (
+                self.local_payload_sets[parity].data_ptr(),
+                self.local_scale_sets[parity].data_ptr(),
+                self.p2p_payload_sets[parity].data_ptr(),
+                self.p2p_scale_sets[parity].data_ptr(),
+                self.xdb_mem.data_ptr(),
+                self.p2p_xdb_mem.data_ptr(),
+                self.xdb_flag.data_ptr(),
+                stream,
+            )
+        else:
+            args = (
+                input.data_ptr(),
+                tensorwise_scales.data_ptr() if tensorwise_scales is not None else 0,
+                self.p2p_payload_sets[parity].data_ptr(),
+                self.p2p_scale_sets[parity].data_ptr(),
+                self.xdb_mem.data_ptr(),
+                self.p2p_xdb_mem.data_ptr(),
+                self.xdb_flag.data_ptr(),
+                stream,
+            )
         _run_compiled(
             self._launch,
             *(fx.Int64(arg) for arg in args[:-1]),

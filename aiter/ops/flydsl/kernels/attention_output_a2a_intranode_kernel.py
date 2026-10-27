@@ -24,7 +24,7 @@ from .quant_utils import (
 )
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
-_JIT_CACHE_TAG = "attention_output_a2a_intranode_v10"
+_JIT_CACHE_TAG = "attention_output_a2a_intranode_v13"
 _ROWS_PER_WAVE = 4
 _LANES_PER_ROW = 16
 _VALUES_PER_LANE = 8
@@ -104,9 +104,9 @@ def make_attention_output_a2a_kernel(
     """Build the BF16 BSHD -> prequantized inverse-Ulysses push kernel."""
     if head_dim != _LANES_PER_ROW * _VALUES_PER_LANE:
         raise ValueError(f"expected head_dim=128, got {head_dim}")
-    if codec not in {"e4m3", "mxfp4", "mxfp6"}:
+    if codec not in {"e4m3", "e4m3_tensor", "mxfp4", "mxfp6"}:
         raise ValueError(f"unsupported attention output codec {codec!r}")
-    if codec != "e4m3" and current_target().arch != "gfx950":
+    if codec in {"e4m3_tensor", "mxfp4", "mxfp6"} and current_target().arch != "gfx950":
         raise RuntimeError(f"{codec} attention output requires gfx950")
 
     seq_full = seq_local * npes
@@ -119,9 +119,9 @@ def make_attention_output_a2a_kernel(
     pad_rows = _ceil(seq_local, _MX_TILE_ROWS)
     pad_k = _ceil(gemm_k, _MX_K_TILE)
     nk_pad = pad_k // _MX_K_TILE + _MX_K_GUARD_TILES
-    if codec == "e4m3":
+    if codec in {"e4m3", "e4m3_tensor"}:
         output_bytes = output_rows * head_dim
-        scale_bytes = output_rows * 4
+        scale_bytes = (1 if codec == "e4m3_tensor" else output_rows) * 4
     elif codec == "mxfp4":
         output_bytes = seq_local * gemm_k // 2
         scale_columns = _ceil(gemm_k // _MX_GROUP_SIZE, 8)
@@ -147,6 +147,7 @@ def make_attention_output_a2a_kernel(
     @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
     def attention_output_a2a_push(
         addr_input: fx.Int64,
+        addr_input_scale: fx.Int64,
         addr_p2p_payload: fx.Int64,
         addr_p2p_scale: fx.Int64,
     ):
@@ -194,14 +195,19 @@ def make_attention_output_a2a_kernel(
         destination = ptr_buf_tensor(
             payload_base,
             fx.Int32,
-            unit_elems=2 if codec == "e4m3" else 1,
+            unit_elems=2 if codec in {"e4m3", "e4m3_tensor"} else 1,
             unit_stride=1,
             num_records_bytes=output_bytes,
         )
         scales = ptr_buf_tensor(
             scale_base,
-            fx.Float32 if codec == "e4m3" else fx.Int8,
+            fx.Float32 if codec in {"e4m3", "e4m3_tensor"} else fx.Int8,
             num_records_bytes=scale_bytes,
+        )
+        input_scales = ptr_buf_tensor(
+            addr_input_scale,
+            fx.Float32,
+            num_records_bytes=npes * 4,
         )
 
         row_step = peer_warps * _ROWS_PER_WAVE
@@ -223,25 +229,39 @@ def make_attention_output_a2a_kernel(
             ).to(fx.Float32)
 
             destination_head = rank * heads_local + local_head
-            if const_expr(codec == "e4m3"):
-                amax = fx.Float32(0.0)
-                for index in range_constexpr(_VALUES_PER_LANE):
-                    amax = amax.maximumf(fmath.absf(values[index]))
-                for shift in (1, 2, 4, 8):
-                    amax = amax.maximumf(amax.shuffle_xor(shift, 64))
+            if const_expr(codec in {"e4m3", "e4m3_tensor"}):
+                if const_expr(codec == "e4m3_tensor"):
+                    scale = buf_copy_load(
+                        input_scales,
+                        dest_pe,
+                        fx.Float32,
+                    )
+                else:
+                    amax = fx.Float32(0.0)
+                    for index in range_constexpr(_VALUES_PER_LANE):
+                        amax = amax.maximumf(fmath.absf(values[index]))
+                    for shift in (1, 2, 4, 8):
+                        amax = amax.maximumf(amax.shuffle_xor(shift, 64))
 
-                # Match dynamic_per_group_scaled_quant_kernel's nonzero floor
-                # so zero/subnormal rows get the canonical FP32 descale.
-                amax = amax.maximumf(fx.Float32(1e-10))
-                scale = amax * fx.Float32(1.0 / fp8_max)
-                reciprocal = fx.Float32(1.0) / scale
+                    # Match dynamic_per_group_scaled_quant_kernel's nonzero floor
+                    # so zero/subnormal rows get the canonical FP32 descale.
+                    amax = amax.maximumf(fx.Float32(1e-10))
+                    scale = amax * fx.Float32(1.0 / fp8_max)
+                scaled = [
+                    (
+                        values[index] / scale
+                        if const_expr(codec == "e4m3_tensor")
+                        else values[index] * (fx.Float32(1.0) / scale)
+                    )
+                    for index in range_constexpr(_VALUES_PER_LANE)
+                ]
                 pairs = [
                     fx.Uint32(
                         emit_f32_to_fp8(
-                            (values[2 * pair] * reciprocal)
+                            scaled[2 * pair]
                             .maximumf(fx.Float32(-fp8_max))
                             .minimumf(fx.Float32(fp8_max)),
-                            (values[2 * pair + 1] * reciprocal)
+                            scaled[2 * pair + 1]
                             .maximumf(fx.Float32(-fp8_max))
                             .minimumf(fx.Float32(fp8_max)),
                         )
@@ -265,7 +285,7 @@ def make_attention_output_a2a_kernel(
                         fx.Int32,
                         2,
                     )
-                    if row_lane == 0:
+                    if const_expr(codec == "e4m3") and row_lane == 0:
                         buf_copy_store(
                             scales,
                             destination_row,
@@ -449,6 +469,335 @@ def make_attention_output_a2a_kernel(
     return attention_output_a2a_push
 
 
+def make_attention_output_packed_copy_kernel(
+    *,
+    rank,
+    npes,
+    seq_local,
+    heads_local,
+    head_dim,
+    block_num,
+    warp_num_per_block,
+    codec,
+):
+    """Copy canonical local MX packs into peer final-GEMM layouts."""
+    heads_total = heads_local * npes
+    local_k = heads_local * head_dim
+    global_k = heads_total * head_dim
+    global_warps = block_num * warp_num_per_block
+    peer_warps = global_warps // npes
+    if codec == "mxfp6":
+        row_tiles = _ceil(seq_local, _MX_TILE_ROWS) // _MX_TILE_ROWS
+        local_k_tiles = local_k // _MX_K_TILE
+        local_nk_pad = local_k_tiles + _MX_K_GUARD_TILES
+        global_nk_pad = global_k // _MX_K_TILE + _MX_K_GUARD_TILES
+        source_row_tiles = _ceil(seq_local, _MX_TILE_ROWS) // _MX_TILE_ROWS * npes
+        source_payload_bytes = source_row_tiles * local_nk_pad * _MXFP6_TILE_BYTES
+        source_scale_bytes = source_row_tiles * local_nk_pad * _MX_SCALE_TILE_BYTES
+        output_payload_bytes = row_tiles * global_nk_pad * _MXFP6_TILE_BYTES
+        output_scale_bytes = row_tiles * global_nk_pad * _MX_SCALE_TILE_BYTES
+        payload_chunks_per_tile = _MXFP6_TILE_BYTES // 16
+        scale_chunks_per_tile = _MX_SCALE_TILE_BYTES // 16
+    else:
+        local_payload_row_bytes = local_k // 2
+        global_payload_row_bytes = global_k // 2
+        local_scale_columns = local_k // _MX_GROUP_SIZE
+        global_scale_columns = global_k // _MX_GROUP_SIZE
+        global_scale_columns_padded = _ceil(global_scale_columns, 8)
+        source_payload_bytes = seq_local * npes * local_payload_row_bytes
+        source_scale_bytes = seq_local * npes * local_scale_columns
+        output_payload_bytes = seq_local * global_payload_row_bytes
+        output_scale_bytes = (
+            _ceil(seq_local, _MX_TILE_ROWS) * global_scale_columns_padded
+        )
+
+    shared_storage = fx.struct(
+        type(
+            "_AttentionOutputPackedCopySharedStorage",
+            (),
+            {
+                "__annotations__": {
+                    "p2p_payload": fx.Array[fx.Int64, npes, 16],
+                    "p2p_scale": fx.Array[fx.Int64, npes, 16],
+                }
+            },
+        )
+    )
+
+    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    def attention_output_packed_copy(
+        addr_source_payload: fx.Int64,
+        addr_source_scale: fx.Int64,
+        addr_p2p_payload: fx.Int64,
+        addr_p2p_scale: fx.Int64,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        warp = tid >> 6
+        lane = tid & 63
+        global_warp = bid * warp_num_per_block + warp
+        dest_pe = global_warp % npes
+        peer_warp = global_warp // npes
+
+        payload_table = ptr_buf_tensor(
+            addr_p2p_payload, fx.Int64, num_records_bytes=npes * 8
+        )
+        scale_table = ptr_buf_tensor(
+            addr_p2p_scale, fx.Int64, num_records_bytes=npes * 8
+        )
+        shared = fx.SharedAllocator().allocate(shared_storage).peek()
+        payload_bases = shared.p2p_payload.view(fx.make_layout(npes, 1))
+        scale_bases = shared.p2p_scale.view(fx.make_layout(npes, 1))
+        if lane < npes:
+            fx.memref_store(
+                buf_copy_load(payload_table, lane, fx.Int64),
+                payload_bases,
+                lane,
+            )
+            fx.memref_store(
+                buf_copy_load(scale_table, lane, fx.Int64),
+                scale_bases,
+                lane,
+            )
+        fx.barrier()
+
+        payload_base = wave_uniform_i64(
+            fx.Uint64(fx.memref_load(payload_bases, dest_pe))
+        )
+        scale_base = wave_uniform_i64(fx.Uint64(fx.memref_load(scale_bases, dest_pe)))
+        source_payload = ptr_buf_tensor(
+            addr_source_payload,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
+            num_records_bytes=source_payload_bytes,
+        )
+        destination_payload = ptr_buf_tensor(
+            payload_base,
+            fx.Int32,
+            unit_elems=4,
+            unit_stride=1,
+            num_records_bytes=output_payload_bytes,
+        )
+
+        if const_expr(codec == "mxfp6"):
+            source_scale = ptr_buf_tensor(
+                addr_source_scale,
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=source_scale_bytes,
+            )
+            destination_scale = ptr_buf_tensor(
+                scale_base,
+                fx.Int32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=output_scale_bytes,
+            )
+            payload_chunks_per_dest = (
+                row_tiles * local_k_tiles * payload_chunks_per_tile
+            )
+            payload_groups = (payload_chunks_per_dest + 63) // 64
+            for group in range(peer_warp, payload_groups, peer_warps):
+                item = group * 64 + lane
+                if item < payload_chunks_per_dest:
+                    chunk = item % payload_chunks_per_tile
+                    tile_item = item // payload_chunks_per_tile
+                    local_k_tile = tile_item % local_k_tiles
+                    local_row_tile = tile_item // local_k_tiles
+                    source_row_tile = dest_pe * row_tiles + local_row_tile
+                    source_tile = source_row_tile * local_nk_pad + local_k_tile
+                    destination_tile = (
+                        local_row_tile * global_nk_pad
+                        + rank * local_k_tiles
+                        + local_k_tile
+                    )
+                    value = buf_copy_load(
+                        source_payload,
+                        source_tile * payload_chunks_per_tile * 4 + chunk * 4,
+                        fx.Int32,
+                        4,
+                    )
+                    buf_copy_store(
+                        destination_payload,
+                        destination_tile * payload_chunks_per_tile * 4 + chunk * 4,
+                        value,
+                        fx.Int32,
+                        4,
+                    )
+
+            scale_chunks_per_dest = row_tiles * local_k_tiles * scale_chunks_per_tile
+            scale_groups = (scale_chunks_per_dest + 63) // 64
+            for group in range(peer_warp, scale_groups, peer_warps):
+                item = group * 64 + lane
+                if item < scale_chunks_per_dest:
+                    chunk = item % scale_chunks_per_tile
+                    tile_item = item // scale_chunks_per_tile
+                    local_k_tile = tile_item % local_k_tiles
+                    local_row_tile = tile_item // local_k_tiles
+                    source_row_tile = dest_pe * row_tiles + local_row_tile
+                    source_tile = source_row_tile * local_nk_pad + local_k_tile
+                    destination_tile = (
+                        local_row_tile * global_nk_pad
+                        + rank * local_k_tiles
+                        + local_k_tile
+                    )
+                    value = buf_copy_load(
+                        source_scale,
+                        source_tile * scale_chunks_per_tile * 4 + chunk * 4,
+                        fx.Int32,
+                        4,
+                    )
+                    buf_copy_store(
+                        destination_scale,
+                        destination_tile * scale_chunks_per_tile * 4 + chunk * 4,
+                        value,
+                        fx.Int32,
+                        4,
+                    )
+        else:
+            source_scale = ptr_buf_tensor(
+                addr_source_scale,
+                fx.Int8,
+                num_records_bytes=source_scale_bytes,
+            )
+            destination_scale = ptr_buf_tensor(
+                scale_base,
+                fx.Int8,
+                num_records_bytes=output_scale_bytes,
+            )
+            payload_chunks_per_row = local_payload_row_bytes // 16
+            payload_chunks_per_dest = seq_local * payload_chunks_per_row
+            payload_groups = (payload_chunks_per_dest + 63) // 64
+            for group in range(peer_warp, payload_groups, peer_warps):
+                item = group * 64 + lane
+                if item < payload_chunks_per_dest:
+                    local_row = item // payload_chunks_per_row
+                    chunk = item % payload_chunks_per_row
+                    source_row = dest_pe * seq_local + local_row
+                    source_chunk = source_row * payload_chunks_per_row + chunk
+                    destination_chunk = (
+                        local_row * (global_payload_row_bytes // 16)
+                        + rank * payload_chunks_per_row
+                        + chunk
+                    )
+                    value = buf_copy_load(
+                        source_payload,
+                        source_chunk * 4,
+                        fx.Int32,
+                        4,
+                    )
+                    buf_copy_store(
+                        destination_payload,
+                        destination_chunk * 4,
+                        value,
+                        fx.Int32,
+                        4,
+                    )
+
+            scale_items_per_dest = seq_local * local_scale_columns
+            scale_groups = (scale_items_per_dest + 63) // 64
+            for group in range(peer_warp, scale_groups, peer_warps):
+                item = group * 64 + lane
+                if item < scale_items_per_dest:
+                    local_row = item // local_scale_columns
+                    local_group = item % local_scale_columns
+                    source_row = dest_pe * seq_local + local_row
+                    global_group = rank * local_scale_columns + local_group
+                    source_index = source_row * local_scale_columns + local_group
+                    destination_index = (
+                        (local_row // 32 * global_scale_columns_padded) * 32
+                        + (global_group // 8) * 256
+                        + (global_group % 4) * 64
+                        + (local_row % 16) * 4
+                        + (global_group % 8) // 4 * 2
+                        + (local_row % 32) // 16
+                    )
+                    value = buf_copy_load(
+                        source_scale,
+                        source_index,
+                        fx.Int8,
+                    )
+                    buf_copy_store(
+                        destination_scale,
+                        destination_index,
+                        value,
+                        fx.Int8,
+                    )
+
+    return attention_output_packed_copy
+
+
+def make_attention_output_packed_copy_jit(
+    *,
+    rank,
+    npes,
+    seq_local,
+    heads_local,
+    head_dim,
+    block_num,
+    warp_num_per_block,
+    codec,
+):
+    payload = make_attention_output_packed_copy_kernel(
+        rank=rank,
+        npes=npes,
+        seq_local=seq_local,
+        heads_local=heads_local,
+        head_dim=head_dim,
+        block_num=block_num,
+        warp_num_per_block=warp_num_per_block,
+        codec=codec,
+    )
+    completion = make_attention_a2a_completion_kernel(rank=rank, npes=npes)
+    key = (
+        "packed_copy",
+        rank,
+        npes,
+        seq_local,
+        heads_local,
+        head_dim,
+        block_num,
+        warp_num_per_block,
+        codec,
+        current_target().arch,
+        _JIT_CACHE_TAG,
+    )
+
+    @flyc.jit
+    def launch(
+        addr_source_payload: fx.Int64,
+        addr_source_scale: fx.Int64,
+        addr_p2p_payload: fx.Int64,
+        addr_p2p_scale: fx.Int64,
+        addr_xdb_mem: fx.Int64,
+        addr_p2p_xdb_mem: fx.Int64,
+        addr_xdb_flag: fx.Int64,
+        stream: Stream = Stream(None),  # noqa: B008
+    ):
+        _ = key
+        payload(
+            addr_source_payload,
+            addr_source_scale,
+            addr_p2p_payload,
+            addr_p2p_scale,
+        ).launch(
+            grid=(block_num, 1, 1),
+            block=(warp_num_per_block * 64, 1, 1),
+            stream=stream,
+        )
+        for phase in range_constexpr(2):
+            completion(
+                addr_xdb_mem,
+                addr_p2p_xdb_mem,
+                addr_xdb_flag,
+                phase == 0,
+            ).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+
+    return launch
+
+
 def make_attention_output_a2a_jit(
     *,
     rank,
@@ -490,6 +839,7 @@ def make_attention_output_a2a_jit(
     @flyc.jit
     def launch(
         addr_input: fx.Int64,
+        addr_input_scale: fx.Int64,
         addr_p2p_payload: fx.Int64,
         addr_p2p_scale: fx.Int64,
         addr_xdb_mem: fx.Int64,
@@ -500,6 +850,7 @@ def make_attention_output_a2a_jit(
         _ = key
         payload(
             addr_input,
+            addr_input_scale,
             addr_p2p_payload,
             addr_p2p_scale,
         ).launch(
