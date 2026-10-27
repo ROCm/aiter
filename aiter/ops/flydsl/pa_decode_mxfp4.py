@@ -74,6 +74,7 @@ def pa_decode_mxfp4(
     work_plan: PADecodePlan,
     max_context_length: int | None = None,
     tile_depth: int = DEFAULT_TILE_DEPTH,
+    direct_output: bool | None = None,
 ) -> None:
     """Decode one query token per sequence over an MXFP4 paged K/V cache.
 
@@ -213,6 +214,18 @@ def pa_decode_mxfp4(
     if work_plan.sliding_window != 0:
         raise NotImplementedError("pa_decode_mxfp4 has no sliding window")
     capacity = work_plan.capacity
+    if direct_output is None:
+        direct_output = work_plan.max_partitions == 1
+    elif direct_output and work_plan.max_partitions != 1:
+        raise ValueError(
+            "direct_output needs a plan with max_partitions == 1 (one task per "
+            f"sequence), got {work_plan.max_partitions}"
+        )
+    if direct_output and (
+        (output.stride(0) * output.element_size()) % 16
+        or (output.stride(1) * output.element_size()) % 16
+    ):
+        raise ValueError("direct_output needs output row/head strides of 16 bytes")
 
     # Pages one planned task can own, staged in LDS in 256-entry units.
     tiles = max_tiles_per_task(
@@ -230,23 +243,24 @@ def pa_decode_mxfp4(
 
     rows = group_size
     expected = (num_kv_heads, capacity, rows)
-    if max_logits is None:
-        max_logits = torch.empty(*expected, dtype=torch.float32, device=dev)
-    if exp_sums is None:
-        exp_sums = torch.empty(*expected, dtype=torch.float32, device=dev)
-    if temporary_output is None:
-        temporary_output = torch.empty(
-            *expected, HEAD_DIM, dtype=output.dtype, device=dev
-        )
-    for name, t, shape, dtype in (
-        ("max_logits", max_logits, expected, torch.float32),
-        ("exp_sums", exp_sums, expected, torch.float32),
-        ("temporary_output", temporary_output, (*expected, HEAD_DIM), output.dtype),
-    ):
-        if tuple(t.shape) != shape:
-            raise ValueError(f"{name} shape {tuple(t.shape)} != {shape}")
-        if t.dtype != dtype or t.device != dev or not t.is_contiguous():
-            raise ValueError(f"{name} must be contiguous {dtype} on {dev}")
+    if not direct_output:  # the direct path has no partials, hence no scratch
+        if max_logits is None:
+            max_logits = torch.empty(*expected, dtype=torch.float32, device=dev)
+        if exp_sums is None:
+            exp_sums = torch.empty(*expected, dtype=torch.float32, device=dev)
+        if temporary_output is None:
+            temporary_output = torch.empty(
+                *expected, HEAD_DIM, dtype=output.dtype, device=dev
+            )
+        for name, t, shape, dtype in (
+            ("max_logits", max_logits, expected, torch.float32),
+            ("exp_sums", exp_sums, expected, torch.float32),
+            ("temporary_output", temporary_output, (*expected, HEAD_DIM), output.dtype),
+        ):
+            if tuple(t.shape) != shape:
+                raise ValueError(f"{name} shape {tuple(t.shape)} != {shape}")
+            if t.dtype != dtype or t.device != dev or not t.is_contiguous():
+                raise ValueError(f"{name} must be contiguous {dtype} on {dev}")
 
     kernel = build_pa_decode_mxfp4(
         group_size=group_size,
@@ -256,15 +270,16 @@ def pa_decode_mxfp4(
         has_q_scale=query_scale is not None,
         out_f16=output.dtype == torch.float16,
         tile_depth=tile_depth,
+        direct=direct_output,
     )
     out_dt = fx.Float16 if output.dtype == torch.float16 else fx.BFloat16
     with torch.cuda.device(dev):
         stream = torch.cuda.current_stream(dev)
         _run_compiled(
             kernel,
-            ptr_arg(max_logits, fx.Float32),
-            ptr_arg(exp_sums, fx.Float32),
-            ptr_arg(temporary_output, out_dt),
+            ptr_arg(output if direct_output else max_logits, fx.Float32),
+            ptr_arg(output if direct_output else exp_sums, fx.Float32),
+            ptr_arg(output if direct_output else temporary_output, out_dt),
             ptr_arg(query.view(torch.uint8) if q_fp8 else query, fx.Uint8),
             ptr_arg(k_data, fx.Uint8),
             ptr_arg(k_scale, fx.Uint8),
@@ -289,10 +304,15 @@ def pa_decode_mxfp4(
             int(v_scale.stride(0)),
             int(v_scale.stride(1)),
             float(softmax_scale),
+            ptr_arg(output, out_dt),
+            int(output.stride(0)),
+            int(output.stride(1)),
             capacity,
             num_kv_heads,
             stream,
         )
+        if direct_output:
+            return
         output_5d = output.reshape(num_seqs, 1, num_kv_heads, group_size, HEAD_DIM)
         partition_bound = min(
             capacity, max(1, -(-schedule_context // KV_COMPUTE_BLOCK))
