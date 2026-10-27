@@ -2585,7 +2585,8 @@ def flydsl_moe_topids_to_rows(
         wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
         counter = torch.empty(E, dtype=torch.int32, device=device)
         mask_i32 = expert_mask.to(torch.int32).reshape(-1)
-        _get_compiled_route_g2l_fused(wdt)(
+        _dispatch_compiled(
+            _get_compiled_route_g2l_fused(wdt),
             ptr_arg(mask_i32),
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
             ptr_arg(weight_in.to(torch.float32).reshape(-1)),
@@ -2597,7 +2598,7 @@ def flydsl_moe_topids_to_rows(
             numel,
             int(max_m),
             int(E),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return counter, topids_to_rows.view(token_num, topk)
 
@@ -2659,21 +2660,23 @@ def flydsl_moe_topids_to_rows(
             route_args.extend([numel, int(max_m), int(E), int(topk), route_grid])
         else:
             route_args.extend([numel, int(max_m), int(E), route_grid])
-        topids_to_rows_kernel(
+        _dispatch_compiled(
+            topids_to_rows_kernel,
             *route_args,
             *_ep_tail,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
     else:
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
-        topids_to_rows_kernel(
+        _dispatch_compiled(
+            topids_to_rows_kernel,
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
             ptr_arg(counter),
             ptr_arg(topids_to_rows),
             numel,
             int(max_m),
             route_grid,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
     return counter, topids_to_rows.view(token_num, topk)
 
@@ -2790,14 +2793,15 @@ def flydsl_moe_fused_route_quant_scatter(
             not use_g2l
         ), "EP g2l fusion is not implemented on the routeks stage1 path"
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
-        topids_to_rows_kernel(
+        _dispatch_compiled(
+            topids_to_rows_kernel,
             ptr_arg(topk_ids_i32),
             ptr_arg(counter),
             ptr_arg(topids_to_rows),
             numel,
             max_m,
             route_grid,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         use_ksplit_s1 = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch_routeks = _get_compiled_fused_quant_preshuffle_route_ksplit(
@@ -2809,7 +2813,8 @@ def flydsl_moe_fused_route_quant_scatter(
         )
         _null_i32 = torch.empty(0, dtype=torch.int32, device=device)
         assert _null_i32.data_ptr() == 0, "expected a null data_ptr"
-        launch_routeks(
+        _dispatch_compiled(
+            launch_routeks,
             ptr_arg(hidden_flat),
             ptr_arg(grouped_a1.view(-1)),
             ptr_arg(grouped_a1_scale.view(-1)),
@@ -2825,7 +2830,7 @@ def flydsl_moe_fused_route_quant_scatter(
             ptr_arg(grouped_a1_scale.view(-1)),
             *_routeks_ep_psum_args(device, None),
             grid_blocks,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return (
             grouped_a1,
@@ -2851,7 +2856,8 @@ def flydsl_moe_fused_route_quant_scatter(
             max_m=max_m,
         )
         # st_ksplit keeps the original ABI (no g2l params).
-        launch(
+        _dispatch_compiled(
+            launch,
             ptr_arg(topk_ids_i32),
             ptr_arg(counter),
             ptr_arg(topids_to_rows),
@@ -2861,7 +2867,7 @@ def flydsl_moe_fused_route_quant_scatter(
             ptr_arg(expert_row_base_arg),
             numel,
             grid_blocks,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
     else:
         launch = _get_compiled_fused_route_quant_scatter(
@@ -2882,7 +2888,8 @@ def flydsl_moe_fused_route_quant_scatter(
         wi_arg = weight_in.to(torch.float32).reshape(-1) if use_g2l else counter
         gw_arg = gather_w.reshape(-1) if use_g2l else counter
         n_buckets_arg = int(E) if use_g2l else 0
-        launch(
+        _dispatch_compiled(
+            launch,
             ptr_arg(topk_ids_i32),
             ptr_arg(counter),
             ptr_arg(topids_to_rows),
@@ -2896,7 +2903,7 @@ def flydsl_moe_fused_route_quant_scatter(
             ptr_arg(gw_arg),
             n_buckets_arg,
             grid_blocks,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
     return (
         grouped_a1,
@@ -3005,7 +3012,8 @@ def flydsl_moe_fused_route_psum_quant_scatter(
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
     )
-    launch(
+    _dispatch_compiled(
+        launch,
         ptr_arg(topk_ids_i32),
         ptr_arg(count),
         ptr_arg(slot_counter),
@@ -3030,7 +3038,7 @@ def flydsl_moe_fused_route_psum_quant_scatter(
         1,
         1,
         num_workers,
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return (
         grouped_a1,
@@ -3090,7 +3098,8 @@ def flydsl_moe_fused_ep_route_quant_compact(
         prequantized=True,
         src_scale_bytes_per_row=int(src_scale.shape[-1]),
     )
-    launch(
+    _dispatch_compiled(
+        launch,
         ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
         ptr_arg(count),
         ptr_arg(slots),
@@ -3115,7 +3124,7 @@ def flydsl_moe_fused_ep_route_quant_compact(
         int(max_tok),
         int(slot_stride),
         route_workers + quant_workers,
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return grouped_payload, grouped_scale, count, topids_to_rows, starts, psum
 
@@ -3427,7 +3436,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 token_multidest_tdm_chunks,
             )
 
-            _get_compiled_token_multidest_compact_quant(
+            compact_launcher = _get_compiled_token_multidest_compact_quant(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
                 topk=int(source_topk),
@@ -3435,7 +3444,9 @@ def flydsl_moe_fused_quant_preshuffle(
                 tdm_hidden_chunks=token_multidest_tdm_chunks(
                     feat_dim, wmma_rep, quant_mode, 1
                 ),
-            )(
+            )
+            _dispatch_compiled(
+                compact_launcher,
                 ptr_arg(grouped_in.contiguous().view(-1)),
                 ptr_arg(out_payload.view(-1)),
                 ptr_arg(out_scale.view(-1)),
@@ -3443,7 +3454,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 ptr_arg(row_to_token.reshape(-1)),
                 token_num,
                 (token_num + warps_per_block - 1) // warps_per_block,
-                stream=torch.cuda.current_stream(),
+                torch.cuda.current_stream(),
             )
             return out_payload, out_scale
         if use_token_multidest:
@@ -3466,14 +3477,15 @@ def flydsl_moe_fused_quant_preshuffle(
                 ksplit=md_ksplit,
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
-            launch(
+            _dispatch_compiled(
+                launch,
                 ptr_arg(grouped_in.contiguous().view(-1)),
                 ptr_arg(out_payload.view(-1)),
                 ptr_arg(out_scale.view(-1)),
                 ptr_arg(topids_to_rows_i32),
                 token_num,
                 token_grid,
-                stream=torch.cuda.current_stream(),
+                torch.cuda.current_stream(),
             )
             return out_payload, out_scale
         # Row-major stores are emitted only by the full-row prequant copy.
@@ -3504,7 +3516,8 @@ def flydsl_moe_fused_quant_preshuffle(
             num_valid_routes_i32 = (
                 num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
             ).contiguous()
-        launch(
+        _dispatch_compiled(
+            launch,
             ptr_arg(grouped_in.contiguous().view(-1)),
             ptr_arg(out_payload.view(-1)),
             ptr_arg(out_scale.view(-1)),
@@ -3520,7 +3533,7 @@ def flydsl_moe_fused_quant_preshuffle(
             ),
             *_routeks_ep_psum_args(device, ep_psum_params),
             grid_blocks,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return out_payload, out_scale
 
@@ -3532,7 +3545,8 @@ def flydsl_moe_fused_quant_preshuffle(
         quant_mode=quant_mode,
         skip_padding=skip_padding,
     )
-    launch(
+    _dispatch_compiled(
+        launch,
         ptr_arg(grouped_in.contiguous().view(-1)),
         ptr_arg(out_payload.view(-1)),
         ptr_arg(out_scale.view(-1)),
@@ -3540,6 +3554,6 @@ def flydsl_moe_fused_quant_preshuffle(
         n_rows,
         max_m,
         grid_blocks,
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
     return out_payload, out_scale

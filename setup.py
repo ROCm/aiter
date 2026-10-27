@@ -184,7 +184,7 @@ def prepare_packaging():
     # nothing here: this is a filesystem copy, so a tree that has ever run
     # build_co.py would otherwise ship them.
     shutil.copytree("csrc", "aiter_meta/csrc")
-    for asm_dir in glob.glob("aiter_meta/csrc/opus_gemm/gen_co/*/asm"):
+    for asm_dir in glob.glob("aiter_meta/csrc/opus_gemm/gen_co/**/asm", recursive=True):
         shutil.rmtree(asm_dir, ignore_errors=True)
     open("aiter_meta/__init__.py", "w").close()
     write_install_mode()
