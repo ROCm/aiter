@@ -7,6 +7,9 @@ Supports optional DeepGEMM-style contiguous-M scheduler
 For A4W4, the matched tuned CSV row's ``a_preshuffle`` field selects packed
 (M/16, K/128, 4, 16, 16-byte) A for both grouped GEMMs. The field defaults to
 zero and follows the same token-bucket lookup as the other kernel parameters.
+Set AITER_GROUPED_A4W4_A_PRESHUFFLE=1/0 to override the CSV selection.
+Set AITER_FLYDSL_DISABLE_GEMM1_ACT=1 to move gate/up activation out of GEMM1
+into the separate quant/preshuffle kernel (also disables GEMM1 requantization).
 """
 
 import csv
@@ -901,6 +904,17 @@ def _grouped_a8w4_tdm_moe(
         else (7.0 if activation == ActivationType.Swiglu else float("inf"))
     )
     _situ_kw = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
+    disable_gemm1_act = _as_bool(
+        os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_ACT"), False
+    )
+    _a2_activation_kw = {}
+    if disable_gemm1_act:
+        _a2_activation_kw = {
+            "activation": stage1_act,
+            "swiglu_limit": sl,
+            **_situ_kw,
+        }
+        stage1_act = 0
     _b1 = (
         bias1.to(dtype).contiguous()
         if (bias1 is not None and bias1.numel() > 0)
@@ -1057,7 +1071,7 @@ def _grouped_a8w4_tdm_moe(
     disable_gemm1_requant = _as_bool(
         os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
     )
-    _fuse_quant = _b1 is None and not disable_gemm1_requant
+    _fuse_quant = _b1 is None and not disable_gemm1_requant and not disable_gemm1_act
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -1118,8 +1132,12 @@ def _grouped_a8w4_tdm_moe(
             **_situ_kw,
         )
     else:
-        # Original path: bf16 intermediate + separate quant kernel.
-        y = torch.empty((1, contiguous_m, inter_dim), dtype=dtype, device=device)
+        # Raw GEMM1 writes both gate/up columns when activation moves to quant.
+        y = torch.empty(
+            (1, contiguous_m, two_inter if disable_gemm1_act else inter_dim),
+            dtype=dtype,
+            device=device,
+        )
         flydsl_grouped_gemm_a8w4_masked(
             y,
             a1_payload,
@@ -1144,6 +1162,7 @@ def _grouped_a8w4_tdm_moe(
             swiglu_limit=sl,
             num_buffers=num_buffers,
             persistent_workers=persistent_workers,
+            gemm_stage=1,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1166,6 +1185,7 @@ def _grouped_a8w4_tdm_moe(
             masked_m=None,
             topids_to_rows=None,
             payload_preshuffled=a_preshuffled,
+            **_a2_activation_kw,
         )
 
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
@@ -1245,6 +1265,7 @@ def _grouped_a8w4_tdm_moe(
                         out_payload=a2_payload,
                         out_scale=a2_scale,
                         payload_preshuffled=a_preshuffled,
+                        **_a2_activation_kw,
                     ),
                 )
             )
@@ -1322,6 +1343,7 @@ def _grouped_a8w4_tdm_moe(
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
                         persistent_workers=persistent_workers,
+                        gemm_stage=1,
                         cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
@@ -1673,6 +1695,11 @@ def grouped_gemm_gfx1250_a8w4(
         def _tdm_env(name):
             v = os.environ.get(name)
             return int(v) if (v is not None and v != "") else None
+
+        if is_grouped_a4w4:
+            _ov_apre = _tdm_env("AITER_GROUPED_A4W4_A_PRESHUFFLE")
+            if _ov_apre is not None:
+                _tdm_kw["a_preshuffle"] = _ov_apre
 
         _ov_m = _tdm_env("AITER_TDM_TILE_M")
         _ov_n = _tdm_env("AITER_TDM_TILE_N")

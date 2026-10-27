@@ -238,13 +238,21 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 stream=0,
             )
 
-    def _plain_preshuffle(feat_dim, out_e, out_m, skip_padding, *, wmma_rep=wmma_rep):
+    def _plain_preshuffle(
+        feat_dim, out_e, out_m, skip_padding, *, wmma_rep=wmma_rep, activation=0
+    ):
         launch = build_moe_fused_quant_preshuffle_module(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
             skip_padding=skip_padding,
             payload_preshuffled=payload_preshuffled,
+            activation=activation,
+            swiglu_limit=(7.0 if activation == 2 else float("inf")),
+            situ_beta=job.get("situ_beta", 1.0) if activation == 3 else 1.0,
+            situ_linear_beta=(
+                job.get("situ_linear_beta", 1.0) if activation == 3 else 1.0
+            ),
         )
         n_rows = out_e * out_m
         launch(
@@ -416,6 +424,16 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     # (almost always), taking the route-ksplit path with source_topk=0; the
     # plain skip-padding path is the rare capacity-overflow fallback.
     capacity_rows = a2_out_e * a2_out_m
+    # DISABLE_GEMM1_ACT emits raw GUGU BF16 and always uses the plain grouped
+    # activation+quant kernel, with or without A-preshuffled payloads.
+    _plain_preshuffle(
+        inter_dim,
+        a2_out_e,
+        a2_out_m,
+        not contiguous,
+        wmma_rep=wmma_rep2,
+        activation={"silu": 1, "swiglu": 2, "situv2": 3}[job.get("act", "silu")],
+    )
     if payload_preshuffled:
         # Runtime's separate stage2 quantizer has no route map, even when
         # stage1 has one. Cover it in addition to the route-indexed variant.

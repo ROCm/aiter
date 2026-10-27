@@ -167,6 +167,24 @@ class GroupedMoeAotTest(unittest.TestCase):
             ):
                 self.compile_aux(job)
 
+    def test_standalone_activation_quant_coverage(self):
+        for act, code in (("silu", 1), ("swiglu", 2), ("situv2", 3)):
+            with self.subTest(act=act):
+                self.calls.clear()
+                self.compile_aux(self.job(act=act, situ_beta=2.0, situ_linear_beta=3.0))
+                variants = [
+                    config
+                    for name, config, _ in self.calls
+                    if name == "build_moe_fused_quant_preshuffle_module"
+                    and config["activation"] == code
+                ]
+                self.assertEqual(len(variants), 1)
+                self.assertEqual(variants[0]["feat_dim"], 2048)
+                self.assertTrue(variants[0]["payload_preshuffled"])
+                if code == 3:
+                    self.assertEqual(variants[0]["situ_beta"], 2.0)
+                    self.assertEqual(variants[0]["situ_linear_beta"], 3.0)
+
     def test_aux_test_callers_match_remap_signatures(self):
         module = importlib.import_module("aiter.ops.flydsl.kernels.moe_contiguous_psum")
         source = Path(__file__).resolve().parents[1] / "op_tests/test_flydsl_moe_aux.py"
