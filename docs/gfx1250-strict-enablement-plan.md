@@ -29,8 +29,16 @@ configs, and prebuilt binaries still need an explicit compatibility decision.
 
 ### 1. Architecture identity and safety — AITER Infra
 
-- Preserve the complete `gfx1250-strict` name from `rocminfo`, `hipinfo`, and
-  Torch device properties.
+- Keep the complete `gfx1250-strict` spelling where identity matters -- the
+  build target (`GPU_ARCHS`), AOT replay, and code-object coverage -- rather
+  than silently truncating it to gfx1250. (`rocminfo`, `hipinfo`, and Torch
+  device properties continue to surface the full strict name from the runtime.)
+
+- Normalize `gfx1250-strict` to `gfx1250` for runtime kernel-family dispatch at
+  the single detection source (`_detect_native`): A0 and B0 select the same
+  kernel family, and B0-only artifacts are rejected on A0 by the ASIC-revision
+  asm gate and the Opus ELF mach-id check, not by the dispatch name. Build-time
+  targeting (`GPU_ARCHS=gfx1250-strict`) and AOT replay keep the strict identity.
 - Accept the target in offline and JIT builds and keep it distinct in cache and
   code-object coverage checks.
 - Give strict its own tuned-config key instead of implicitly consuming B0
@@ -48,8 +56,13 @@ regular gfx1250 artifacts are never accepted as substitutes for each other.
 - Build every HIP, CK, Opus, FlyDSL, and Triton/JIT module selected for strict.
 - Classify each gfx1250 path as A0-compatible, B0-only, or unsupported pending
   owner work.
-- Rebuild `csrc/opus_gemm/gen_co/gfx1250-strict` with the strict-capable LLVM
-  toolchain only after the Opus owner confirms that each kernel is A0-safe.
+- Opus A0 code objects: done in #6988 (merged). The Opus owner rebuilt all 221
+  variants and added A0 `--offload-arch=gfx1250-strict` images under
+  `csrc/opus_gemm/gen_co/gfx1250-a0/`, selected at runtime by the device's ASIC
+  revision (0 -> A0 strict, 1+ -> regular) and validated by ELF processor id
+  (0xeb strict vs 0x49 regular), with no cross-profile fallback. A0 numerical
+  certification is still partial: a 6-case CPU-golden smoke passed on real A0;
+  the all-221 rerun hung (kid 21316) and is pending investigation.
 - Do not copy or alias `hsa/gfx1250` into a strict directory; the current ASM
   inventory is B0-only.
 

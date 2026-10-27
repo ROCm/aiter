@@ -82,6 +82,38 @@ _PA_DECODE_TILE_CACHE = {}
 _GFX1250_PA_DECODE_CACHE = {}
 
 
+def _pa_decode_tile_kernel_name(
+    *,
+    kv_dtype,
+    query_dtype,
+    head_dim,
+    block_size,
+    query_group_size,
+    query_length,
+    per_token_kv,
+    trans_v,
+    sliding_window,
+    query_splits,
+    direct_output=False,
+):
+    """Trace-visible symbol carrying the main compile-time constants."""
+    name = (
+        f"pa_decode_tile_kernel_kv{kv_dtype}_q{query_dtype}_d{head_dim}"
+        f"_bs{block_size}_gqa{query_group_size}_mtp{query_length}"
+    )
+    if per_token_kv:
+        name += "_pertoken"
+    if not trans_v:
+        name += "_vplain"
+    if sliding_window:
+        name += f"_sw{sliding_window}"
+    if query_splits > 1:
+        name += f"_qs{query_splits}"
+    if direct_output:
+        name += "_direct"
+    return name
+
+
 def compile_pa_decode_tile(
     *,
     architecture: str | None = None,
@@ -267,7 +299,20 @@ def compile_pa_decode_tile(
         )
         PaDecodePipeline(ctx).run()
 
-    @flyc.kernel(known_block_size=(traits.BLOCK_THREADS, 1, 1))
+    kernel_name = _pa_decode_tile_kernel_name(
+        kv_dtype=kv_dtype,
+        query_dtype=query_dtype,
+        head_dim=traits.head_dim,
+        block_size=traits.block_size,
+        query_group_size=traits.query_group_size,
+        query_length=traits.query_length,
+        per_token_kv=traits.per_token_kv,
+        trans_v=traits.trans_v,
+        sliding_window=traits.sliding_window,
+        query_splits=traits.query_splits,
+    )
+
+    @flyc.kernel(name=kernel_name, known_block_size=(traits.BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
         pmax_ptr: fx.Pointer,
         psum_ptr: fx.Pointer,
@@ -442,8 +487,22 @@ def compile_gfx1250_pa_decode(
     class SharedStorage:
         buf: fx.Array[fx.Int32, t.total_bytes // 4, 16]
 
-    @flyc.kernel(known_block_size=(128, 1, 1))
-    def kernel(
+    kernel_name = _pa_decode_tile_kernel_name(
+        kv_dtype=compute_dtype,
+        query_dtype=query_dtype,
+        head_dim=head_dim,
+        block_size=block_size,
+        query_group_size=query_group_size,
+        query_length=query_length,
+        per_token_kv=per_token_kv,
+        trans_v=trans_v,
+        sliding_window=sliding_window,
+        query_splits=query_splits,
+        direct_output=direct_output,
+    )
+
+    @flyc.kernel(name=kernel_name, known_block_size=(128, 1, 1))
+    def pa_decode_tile_kernel(
         pmax: fx.Pointer,
         psum: fx.Pointer,
         pout: fx.Pointer,
@@ -552,7 +611,7 @@ def compile_gfx1250_pa_decode(
         stream: fx.Stream,
     ):
         _ = tag
-        kernel(
+        pa_decode_tile_kernel(
             pmax,
             psum,
             pout,
@@ -579,5 +638,5 @@ def compile_gfx1250_pa_decode(
             stream=stream,
         )
 
-    compiled = {"launch": launch, "kernel": kernel}
+    compiled = {"launch": launch, "kernel": pa_decode_tile_kernel}
     return _GFX1250_PA_DECODE_CACHE.setdefault(t, compiled)

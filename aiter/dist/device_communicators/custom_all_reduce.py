@@ -102,6 +102,39 @@ def _expandable_segments_enabled() -> bool:
     return False
 
 
+def _ipc_base_ptr(data_ptr: int) -> int:
+    """Base address of the device allocation containing *data_ptr*.
+
+    ``hipIpcGetMemHandle`` always returns a handle for the whole allocation
+    that contains the pointer, never for the pointer itself, and the importing
+    rank maps that allocation at its own base address. A buffer that is a
+    sub-block of a larger allocation therefore has to travel with its
+    ``data_ptr - base`` offset, or peers address the wrong region -- silently
+    reading whatever else lives at the base of that allocation.
+
+    The C++ graph path already does exactly this (``get_graph_buffer_ipc_meta``
+    in ``csrc/include/custom_all_reduce.cuh``); this is the Python-side
+    equivalent for the named pool buffers.
+
+    Raw ``hipMalloc``/``hipExtMallocWithFlags`` buffers are their own base, so
+    this returns *data_ptr* unchanged for them.
+    """
+    from .vmm_allocator import load_hip_runtime
+
+    hip = load_hip_runtime()
+    base = ctypes.c_void_p()
+    size = ctypes.c_size_t()
+    err = hip.hipMemGetAddressRange(
+        ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(data_ptr)
+    )
+    if err != 0 or not base.value:
+        raise RuntimeError(
+            f"hipMemGetAddressRange failed (err={err}) for pointer "
+            f"0x{data_ptr:x}; cannot compute the IPC handle offset"
+        )
+    return base.value
+
+
 # hip/driver_types.h: hipPointer_attribute
 _HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR = 11
 
@@ -661,6 +694,14 @@ class IPCBufferPool:
         their IPC handles across all ranks and completes registration.
         """
         count = self._graph_count_fn(ar_ptr)
+        counts = self.all_gather_object(count)
+        if any(c != count for c in counts):
+            raise RuntimeError(
+                "custom allreduce: ranks recorded different numbers of CUDA "
+                f"graph buffers during capture (per rank: {counts}). They are "
+                "registered by position, so every rank must capture the same "
+                "collectives in the same order."
+            )
         if count == 0:
             return
         handle_sz = 64  # sizeof(hipIpcMemHandle_t)
@@ -681,11 +722,16 @@ class IPCBufferPool:
     # ---- Private IPC primitives ----
 
     def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
-        """Get IPC handle for *data_ptr* and broadcast across all ranks."""
+        """Get IPC handle + offset for *data_ptr* and broadcast across ranks.
+
+        The handle covers the whole allocation containing *data_ptr*, so the
+        buffer's offset within it travels alongside; see _ipc_base_ptr.
+        """
+        base_ptr = _ipc_base_ptr(data_ptr)
         # sizeof(hipIpcMemHandle_t); host memory, as in flush_graph_buffers
         handle = torch.empty(64, dtype=torch.uint8, device="cpu")
-        self._ipc_handle_fn(data_ptr, handle.data_ptr())
-        return self._gather_ipc_meta((handle, 0))
+        self._ipc_handle_fn(base_ptr, handle.data_ptr())
+        return self._gather_ipc_meta((handle, data_ptr - base_ptr))
 
     def all_gather_object(self, obj) -> list:
         """Gather a picklable *obj* from every rank via the TCP store.
@@ -1430,12 +1476,9 @@ class CustomAllreduce:
         # PyTorch caching allocator (its memory accounting is what downstream
         # consumers profile against). Gated on the same condition as the
         # capture copy-in path above; _init_ipc only runs for non-VMM.
-        # AITER_CUSTOM_AR_RAW_INPUT_POOL forces the raw pool without
-        # expandable segments. Its use case is co-resident engines on one node
-        # (#4921): a second engine's torch.empty input pool can fail
-        # hipIpcGetMemHandle outright, and the raw pool sidesteps that while
-        # everything else (meta pool, capture-time outputs) stays exportable
-        # under the default allocator.
+        # AITER_CUSTOM_AR_RAW_INPUT_POOL also permits opting into a raw pool.
+        # It is not needed for ordinary caching-allocator sub-blocks: their
+        # allocation offsets are included in _broadcast_ipc.
         raw_cached = _expandable_segments_enabled() or env_flag(
             "AITER_CUSTOM_AR_RAW_INPUT_POOL"
         )
@@ -1947,8 +1990,8 @@ class CustomAllreduce:
 
     # Tensors one `all_gatherv` launch takes (kAllGatherVMax).
     _ALL_GATHERV_MAX: ClassVar[int] = 4
-    # Past this many bytes a rank per rank in the group, NCCL's grouped
-    # all-gather is the faster. Measured on MI355X gathering MoE routed rows
+    # Past this many bytes per rank, times the group size, NCCL's grouped
+    # all-gather is faster. Measured on MI355X gathering MoE routed rows
     # in a replayed graph: the two cross near 4.5 / 9 / 21 MB a rank at
     # 2 / 4 / 8 ranks.
     _ALL_GATHERV_BYTES_PER_RANK: ClassVar[int] = 2 << 20

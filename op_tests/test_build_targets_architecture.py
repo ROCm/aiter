@@ -294,6 +294,30 @@ asicRevision: 0
                     self.chip_info.get_gfx_runtime()
                 get_properties.assert_not_called()
 
+    def test_aot_replay_answers_its_gpu_archs_target_without_detection(self):
+        with (
+            mock.patch.dict(
+                os.environ, {"AITER_AOT_REPLAY": "1", "GPU_ARCHS": "gfx942"}
+            ),
+            mock.patch.object(
+                self.chip_info, "_detect_native", return_value=["gfx950"]
+            ) as detect,
+        ):
+            self.assertEqual(self.chip_info.get_gfx_runtime(), "gfx942")
+        detect.assert_not_called()
+
+    def test_aot_replay_needs_exactly_one_gpu_archs_target(self):
+        for gpu_archs in ("gfx942;gfx950", ""):
+            with (
+                self.subTest(gpu_archs=gpu_archs),
+                mock.patch.dict(
+                    os.environ, {"AITER_AOT_REPLAY": "1", "GPU_ARCHS": gpu_archs}
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                self.chip_info.get_gfx_runtime.cache_clear()
+                self.chip_info.get_gfx_runtime()
+
     def test_unsupported_architectures_still_raise(self):
         properties = type("Properties", (), {"gcnArchName": "gfx9999"})()
         for detector_result in (["gfx9999"], RuntimeError("hipinfo missing")):

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
+import os
 
 import torch
 
@@ -24,7 +25,10 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    if torch.version.hip is None or not torch.cuda.is_available():
+    # An AOT replay process hides the GPUs yet compiles for one arch, which
+    # get_gfx_runtime() returns there.
+    aot_replay = os.getenv("AITER_AOT_REPLAY") == "1"
+    if not aot_replay and (torch.version.hip is None or not torch.cuda.is_available()):
         return _8bit_fallback
     from ..jit.utils.chip_info import get_gfx_runtime
 

@@ -2632,8 +2632,9 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     // a padded token has already returned, and a per-row descriptor keeps the
     // row offset scalar (~2% at H=128 T=1536).
     int64_t pos = positions[token_idx];
-    // A padded token whose Q is kept may carry a stale position: clamp it.
-    if(compute_all_q_rope)
+    // Clamp pos into the cos/sin cache. Padded tokens can carry stale positions.
+    // Per-entry callers may pass a short cache, like a NoPE model's one identity row.
+    if(PAGE_SIZE == 0 || compute_all_q_rope)
         pos = pos < 0 ? 0 : (pos >= max_position ? max_position - 1 : pos);
     const scalar_t* cos_base = cos_cache;
     const scalar_t* sin_base = sin_cache;

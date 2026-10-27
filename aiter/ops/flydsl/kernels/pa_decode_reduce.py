@@ -145,8 +145,21 @@ def compile_pa_decode_ps_reduce(
         weights: fx.Array[fx.Float32, weight_chunks * wave, 16]
         partials: fx.Array[fx.Float32, max(1, (groups - 1) * head_size), 16]
 
-    @flyc.kernel(known_block_size=block)
-    def pa_decode_ps_reduce_kernel(
+    kernel_name = (
+        f"pa_decode_reduce_kernel_o{output_dtype_str}_d{head_size}"
+        f"_np{partitions}_gqa{query_group_size}"
+    )
+    if use_sinks:
+        kernel_name += "_sinks"
+    if pairs:
+        kernel_name += "_pairs"
+    if groups > 1:
+        kernel_name += f"_g{groups}"
+    if num_xcds:
+        kernel_name += f"_xcd{num_xcds}"
+
+    @flyc.kernel(name=kernel_name, known_block_size=block)
+    def pa_decode_reduce_kernel(
         output_ptr: fx.Pointer,
         exp_sums_ptr: fx.Pointer,
         max_logits_ptr: fx.Pointer,
@@ -477,7 +490,7 @@ def compile_pa_decode_ps_reduce(
     ):
         query_rows = query_seq_len * fx.Int32(query_group_size)
         num_ctas = batch_size * num_kv_heads * query_rows
-        pa_decode_ps_reduce_kernel(
+        pa_decode_reduce_kernel(
             output,
             exp_sums,
             max_logits,
@@ -510,5 +523,5 @@ def compile_pa_decode_ps_reduce(
 
     return {
         "launch": launch_pa_decode_ps_reduce_kernel,
-        "kernel": pa_decode_ps_reduce_kernel,
+        "kernel": pa_decode_reduce_kernel,
     }

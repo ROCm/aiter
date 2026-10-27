@@ -29,6 +29,7 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 from ..jit.core import _atoi_flag, compile_ops, env_flag_atoi, is_experimental_enabled
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from .opus.mla import opus_mla_decode_fwd, opus_mla_decode_mxfp8_fwd  # noqa: F401
 
 MD_NAME = "module_attention"
 
@@ -2875,50 +2876,3 @@ def hk_mla_v40_decode_fwd(
         raise NotImplementedError(
             f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
         )
-
-
-@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
-def opus_mla_decode_mxfp8_fwd(
-    q_nope: torch.Tensor,  # [total_q, H, D_NOPE]      fp8
-    q_scale: torch.Tensor,  # [total_q, H, D_SCALE]     uint8 (E8M0)
-    q_rope: torch.Tensor,  # [total_q, H, D_ROPE]      bf16
-    kv_nope: torch.Tensor,  # [total_tokens, D_NOPE]    fp8
-    kv_scale: torch.Tensor,  # [total_tokens, D_SCALE]   uint8 (E8M0)
-    kv_rope: torch.Tensor,  # [total_tokens, D_ROPE]    bf16
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    work_indptr: torch.Tensor,
-    work_info_set: torch.Tensor,
-    page_size: int,
-    softmax_scale: float,
-    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,D_NOPE] fp32
-    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]      fp32
-    out: torch.Tensor,  # final [total_q, H, D_NOPE] bf16
-    final_lse: torch.Tensor | None = None,
-) -> None: ...
-
-
-@compile_ops("module_mla_decode_opus", ffi_type="ctypes")
-def opus_mla_decode_fwd(
-    q: torch.Tensor,  # [total_q, H, 576] bf16 or fp8 (merged nope+rope)
-    kv: torch.Tensor,  # [total_tokens, ..., 576] same dtype as q, page_size == 1
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    work_indptr: torch.Tensor,
-    work_info_set: torch.Tensor,
-    page_size: int,
-    softmax_scale: float,
-    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
-    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
-    out: torch.Tensor,  # final [total_q, H, 512] bf16
-    final_lse: torch.Tensor | None = None,  # [total_q, H] fp32
-    q_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
-    kv_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
-    max_seqlen_q: int = -1,  # fp8: required, picks the kernel; bf16: unused
-    causal: bool = True,  # fp8: mask across the max_seqlen_q query tokens
-    g_kv_indptr: torch.Tensor | None = None,  # fp8 round-robin CP: GLOBAL kv_indptr
-    cp_world_size: int = 1,  # fp8 round-robin CP: number of ranks, 1 = no CP
-    cp_rank: int = 0,  # fp8 round-robin CP: this rank
-) -> None: ...
