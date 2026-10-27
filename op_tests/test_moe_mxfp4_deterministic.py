@@ -144,11 +144,12 @@ def _check_batch_invariant(p, out, activation, **kwargs):
         (3072, 3072, 32, 4),
         (3072, 3072, 128, 4),
         (6144, 768, 129, 6),
+        (6144, 1536, 129, 5),
     ],
 )
 def test_deterministic_swiglu_bias(model_dim, inter_dim, E, topk):
     """SwiGLU with clamp and per-expert biases; gpt-oss shapes, and MiniMax-M3's per
-    GPU at TP4 (128 routed experts plus a fused shared expert)."""
+    GPU at TP4 and TP2 (128 routed experts plus a fused shared expert)."""
     limit = 7.0
     p = _problem(_M, model_dim, inter_dim, E, topk)
     out = _run(p, slice(None), ActivationType.Swiglu, True, swiglu_limit=limit)
@@ -214,6 +215,22 @@ def test_deterministic_rejects_unsupported():
         call(interleaved=True)
     with pytest.raises(NotImplementedError, match="block_size_M"):
         call(block_size_M=128)
+
+    q = _problem(8, 384, 512, E, 4, bias=False)
+    with pytest.raises(NotImplementedError, match="hidden size 384"):
+        fused_moe(
+            q["inp"],
+            q["w1"],
+            q["w2"],
+            q["topk_weights"],
+            q["topk_ids"],
+            w1_scale=q["w1_scale_s"],
+            w2_scale=q["w2_scale_s"],
+            quant_type=QuantType.per_1x32,
+            activation=ActivationType.Swiglu,
+            gate_mode=GateMode.SEPARATED.value,
+            deterministic=True,
+        )
 
 
 if __name__ == "__main__":

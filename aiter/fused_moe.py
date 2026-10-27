@@ -1557,6 +1557,7 @@ def _fused_moe_impl(
             a2_scale=a2_scale,
             block_size_M=block_size_M,
             tokens=M,
+            model_dim=model_dim,
         )
         # The default picks the activation dtype by token count (bf16, then
         # fp4 above a bound), which would make results depend on the batch.
@@ -3413,6 +3414,7 @@ def _check_deterministic_supported(
     a2_scale,
     block_size_M,
     tokens,
+    model_dim,
 ):
     """Raise NotImplementedError naming what fused_moe(deterministic=True) cannot run."""
     unsupported = [
@@ -3454,6 +3456,12 @@ def _check_deterministic_supported(
                 block_size_M is not None
                 and int(block_size_M) != _deterministic_block_m(tokens),
                 f"block_size_M={block_size_M} (uses {_deterministic_block_m(tokens)})",
+            ),
+            (
+                # Stage 1 splits the hidden dimension into two K waves of 256-wide
+                # tiles.
+                model_dim % 512 != 0,
+                f"hidden size {model_dim} (a multiple of 512 only)",
             ),
             (get_gfx_runtime() != "gfx950", f"gfx={get_gfx_runtime()!r}"),
         )
