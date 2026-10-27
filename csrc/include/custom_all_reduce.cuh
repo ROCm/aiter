@@ -889,8 +889,8 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
@@ -922,8 +922,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const T*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const T*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -962,8 +962,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const P*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -993,8 +993,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const T*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const T*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1034,8 +1034,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const P*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1286,7 +1286,8 @@ __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
     for(int i = 0; i < ngpus; i++)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const inp_pack*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i]    = (const inp_pack*)_dp->ptrs[i];
         tmps[i]    = get_tmp_buf<fp8_pack>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
@@ -2729,22 +2730,22 @@ __global__ void __launch_bounds__(1024, 1)
 
             float sum2 = 0.0f;
             if (is_q_t0) {
-                sum2 = *reinterpret_cast<float*>(&tmps[rank][tidx * 2 + 0]);
+                // Sum in rank order so every rank gets the same denominator.
+                sum2 = *reinterpret_cast<float*>(&tmps[0][tidx * 2 + 0]);
 #pragma unroll
                 for(int r = 1; r < ngpus; ++r)
                 {
-                    int target = (rank + r) % ngpus;
-                    auto peer_vec = tmps[target][tidx * 2 + 0];
+                    auto peer_vec = tmps[r][tidx * 2 + 0];
                     sum2 += *reinterpret_cast<float*>(&peer_vec);
                 }
                 smem[0] = sum2;
             } else if (is_k_t0) {
-                sum2 = *reinterpret_cast<float*>(&tmps[rank][tidx * 2 + 1]);
+                // Sum in rank order so every rank gets the same denominator.
+                sum2 = *reinterpret_cast<float*>(&tmps[0][tidx * 2 + 1]);
 #pragma unroll
                 for(int r = 1; r < ngpus; ++r)
                 {
-                    int target = (rank + r) % ngpus;
-                    auto peer_vec = tmps[target][tidx * 2 + 1];
+                    auto peer_vec = tmps[r][tidx * 2 + 1];
                     sum2 += *reinterpret_cast<float*>(&peer_vec);
                 }
                 smem[1] = sum2;
