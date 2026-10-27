@@ -114,5 +114,53 @@ def main():
  
  
  
+_bench_weights = {}
+
+
+def _get_bench_weights():
+    if not _bench_weights:
+        w1k, s1k, w1r = mx_weight(2 * I, D, 1)
+        w2k, s2k, w2r = mx_weight(D, I, 2)
+        _bench_weights["w1"] = (w1k, s1k)
+        _bench_weights["w2"] = (w2k, s2k)
+    return _bench_weights["w1"], _bench_weights["w2"]
+
+
+configs = [
+    triton.testing.Benchmark(
+        x_names=["M"],
+        x_vals=[1024, 2048, 4096, 8192],
+        line_arg="provider",
+        line_vals=["in_kernel_gather", "pre_gathered"],
+        line_names=["In-Kernel Gather", "Pre-Gathered"],
+        styles=[("green", "-"), ("blue", "-")],
+        ylabel="ms",
+        plot_name="moe-gather-performance",
+        args={"block_m_cap": 128},
+    ),
+]
+
+
+@triton.testing.perf_report(configs)
+def bench_moe_gather(M, provider, block_m_cap):
+    w1, w2 = _get_bench_weights()
+    g = torch.Generator(device=dev).manual_seed(M)
+    x = torch.randn(M, D, generator=g, device=dev, dtype=torch.bfloat16)
+    vals, ids = torch.topk(torch.randn(M, E, generator=g, device=dev), TOPK, dim=-1)
+    ids = ids.to(torch.int32).contiguous()
+    wts = torch.softmax(vals, -1).contiguous()
+    in_kernel_gather = provider == "in_kernel_gather"
+    quantiles = [0.5, 0.2, 0.8]
+    ms, min_ms, max_ms = triton.testing.do_bench(
+        lambda: moe(x, ids, wts, w1, w2, block_m_cap, in_kernel_gather),
+        quantiles=quantiles, warmup=50, rep=100,
+    )
+    return ms, max_ms, min_ms
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--benchmark" in sys.argv:
+        bench_moe_gather.run(show_plots=False, print_data=True)
+    else:
+        main()
