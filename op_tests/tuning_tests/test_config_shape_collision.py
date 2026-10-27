@@ -105,6 +105,36 @@ def _cache_clear():
     type(core.AITER_CONFIGS).get_config_file.cache_clear()
 
 
+# Grouped-MoE CSV columns that grouped_moe_gfx1250 reads with _as_int.
+_GROUPED_INT_COLUMNS = (
+    "tile_m",
+    "tile_n",
+    "tile_k",
+    "m_warp",
+    "n_warp",
+    "num_buffers",
+    "tile_m2",
+    "tile_n2",
+    "tile_k2",
+    "m_warp2",
+    "n_warp2",
+    "num_buffer_stage2",
+    "cluster_m",
+    "cluster_n",
+    "cluster_m2",
+    "cluster_n2",
+    "waves_per_tensor_tdm",
+    "waves_per_tensor_tdm2",
+    "next_stage_prefetch",
+    "tdm_as_in_prologue",
+    "tdm_b_th",
+    "lds_soa_load_interleave",
+    "rolled_drain",
+    "persistent_workers",
+    "persistent_workers2",
+)
+
+
 @unittest.skipUnless(core is not None, f"aiter.jit.core not importable: {_IMPORT_ERR}")
 class TestConfigShapeCollision(unittest.TestCase):
     """Drive the real runtime merge against a temp copy; fail on collisions."""
@@ -473,6 +503,103 @@ class TestConfigShapeCollision(unittest.TestCase):
 
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
+
+    def test_grouped_fmoe_merged_cells_parse(self):
+        """The merge writes the integers of a column that has a blank cell as
+        floats ("16.0"); the runtime lookup and the AOT parser read that file."""
+        try:
+            from aiter.aot.flydsl.grouped_moe import parse_csv
+            from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"grouped MoE modules not importable: {e}")
+        merged = self._resolve(
+            self._tmp, "AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"
+        )
+        self.assertTrue(parse_csv(merged))
+        with open(merged, newline="") as f:
+            rows = list(csv.DictReader(f))
+        for line, row in enumerate(rows, start=2):
+            for col in _GROUPED_INT_COLUMNS:
+                with self.subTest(line=line, column=col):
+                    grouped._as_int(row.get(col), None)
+
+    def test_grouped_int_cells_parse_exactly(self):
+        """Only an all-zero fraction is dropped from an integer cell, so a value
+        is kept digit for digit or rejected, never rounded through a float."""
+        try:
+            from aiter.aot.flydsl.grouped_moe import _as_int as aot_as_int
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import _as_int as runtime_as_int
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"grouped MoE modules not importable: {e}")
+        for as_int in (aot_as_int, runtime_as_int):
+            with self.subTest(module=as_int.__module__):
+                self.assertEqual(as_int("16.0", None), 16)
+                self.assertEqual(as_int("9007199254740993.0", None), 9007199254740993)
+                with self.assertRaises(ValueError):
+                    as_int("1.0000000000000001", None)
+
+    def test_grouped_fmoe_merged_ep_row_matches(self):
+        """An ep_fused row must still win the EP lookup once the merge has
+        written its ep_fused = 1 as "1.0"."""
+        try:
+            import torch
+
+            from aiter import ActivationType, QuantType, dtypes
+            from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"grouped MoE modules not importable: {e}")
+        # dtypes.fp8 is e4m3fnuz on gfx942, so name the dtypes the rows use.
+        q_dtype_a, q_dtype_w = torch.float8_e4m3fn, dtypes.fp4x2
+        env_name, name = "AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"
+        tmp = tempfile.mkdtemp(prefix="aiter_cfg_grouped_ep_")
+        old_env = os.environ.get(env_name)
+        try:
+            cfg = os.path.join(tmp, "aiter", "configs")
+            os.makedirs(os.path.join(cfg, "model_configs"))
+            key = "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,ep_fused"
+            with open(os.path.join(cfg, "untuned_grouped_fmoe.csv"), "w") as f:
+                f.write(key + "\n")
+            shape = (
+                "7168,768,384,6,ActivationType.Silu,torch.bfloat16,"
+                f"{q_dtype_a},{q_dtype_w},QuantType.per_1x32"
+            )
+            with open(os.path.join(cfg, f"{name}.csv"), "w") as f:
+                f.write(f"gfx,cu_num,{key},tile_m,us\n")
+                f.write(f",,4096,{shape},,16,2.0\n")
+                f.write(f",,4096,{shape},1,64,3.0\n")
+            with open(
+                os.path.join(cfg, "model_configs", f"selfcheck_{name}.csv"), "w"
+            ) as f:
+                f.write(f"gfx,cu_num,{key},tile_m,us\n")
+                f.write(f",,8192,{shape},,32,4.0\n")
+            os.environ[env_name] = self._resolve(tmp, env_name, name)
+            grouped._GROUPED_CONFIG_CACHE.clear()
+            grouped._find_grouped_config.cache_clear()
+            row = grouped._find_grouped_config(
+                token_num=4096,
+                model_dim=7168,
+                inter_dim=768,
+                experts=384,
+                topk=6,
+                activation=ActivationType.Silu,
+                dtype=torch.bfloat16,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                quant_type=QuantType.per_1x32,
+                ep_fused=True,
+            )
+            self.assertIsNotNone(row)
+            self.assertEqual(grouped._as_int(row["tile_m"], None), 64)
+        finally:
+            if old_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = old_env
+            grouped._GROUPED_CONFIG_CACHE.clear()
+            grouped._find_grouped_config.cache_clear()
+            core.AITER_ROOT_DIR = self._tmp
+            _cache_clear()
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_gdn_k5_opt(self):
         self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
