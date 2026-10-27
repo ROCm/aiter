@@ -839,6 +839,67 @@ def test_grouped_a8w4_situv2_matches_torch_ref():
     )
 
 
+# Kimi-K3 at TP8 with every expert split 8 ways: inter_dim 3072 / 8 = 384 is a
+# multiple of 128 but not of 256.
+KIMI_K3_TP8_CSV_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "aiter",
+        "configs",
+        "model_configs",
+        "kimik3tp8_tuned_grouped_fmoe.csv",
+    )
+)
+
+
+def _kimi_k3_tp8_buckets() -> list[int]:
+    with open(KIMI_K3_TP8_CSV_PATH, newline="") as fh:
+        return sorted({int(row["token"]) for row in csv.DictReader(fh)})
+
+
+# Every token bucket of the Kimi-K3 TP8 table, so each row's tiles run once, then
+# 20000 (padded to 32768) and 131072, past the table: they take the default tiles,
+# and their routed buffers pass 2 GiB and 4 GiB. Nothing forces a config. JIT,
+# not run-only: the grouped-MoE AOT builds only the auxiliary kernels (the TDM
+# GEMM has no AOT wiring yet), so run-only cannot load the GEMM for any shape.
+@pytest.mark.parametrize("tokens", _kimi_k3_tp8_buckets() + [20000, 131072])
+def test_grouped_a4w4_situv2_kimi_k3_tp8_matches_torch_ref(tokens):
+    run_moe(
+        "a4w4",
+        experts=896,
+        tokens=tokens,
+        topk=16,
+        model_dim=3584,
+        inter_dim=384,
+        activation=ActivationType.Situv2,
+        use_bias=False,
+        check_aot_cache=False,
+    )
+
+
+# The same shape with a GEMM2 k-tile that 384 does not divide, as a tuned row or
+# AITER_TDM_TILE_K2 may pick: 256 runs one full tile and a 128-wide tail, 512 a
+# single ragged tile (K < tile_k). 20000 tokens are past the table, so the other
+# tiles are the defaults; an AITER_TDM_TILE_* override also sets num_buffers to 2
+# for both GEMMs, which GEMM2 clamps to its k-tile count anyway.
+@pytest.mark.parametrize("tile_k2", [256, 512])
+def test_grouped_a4w4_situv2_kimi_k3_tp8_k_tail_matches_torch_ref(tile_k2, monkeypatch):
+    monkeypatch.setenv("AITER_TDM_TILE_K2", str(tile_k2))
+    run_moe(
+        "a4w4",
+        experts=896,
+        tokens=20000,
+        topk=16,
+        model_dim=3584,
+        inter_dim=384,
+        activation=ActivationType.Situv2,
+        use_bias=False,
+        check_aot_cache=False,
+    )
+
+
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)
@@ -1019,6 +1080,7 @@ DEFAULT_CSV_PATH = os.path.normpath(
     os.path.join(
         os.path.dirname(__file__),
         "..",
+        "..",
         "aiter",
         "configs",
         "tuned_grouped_fmoe.csv",
@@ -1046,6 +1108,8 @@ def _csv_activation(act_type: str) -> ActivationType:
         return ActivationType.Swiglu
     if a == "ActivationType.Silu":
         return ActivationType.Silu
+    if a == "ActivationType.Situv2":
+        return ActivationType.Situv2
     raise ValueError(f"unsupported act_type in CSV: {act_type!r}")
 
 
@@ -1095,16 +1159,30 @@ def run_csv_scenario(args) -> None:
             print(f"[csv] row {idx}: skipped topk=-1 (EP row)", flush=True)
             continue
 
-        # The grouped kernels need K/inter >= 512 (tile_k=256 -> two K tiles).
-        if model_dim < 512 or inter_dim < 512:
+        # Both GEMMs need K to be a multiple of the 128-wide WMMA step; a tile_k
+        # that does not divide K runs a clamped last k-tile, so K needs no floor.
+        if model_dim % 128 or inter_dim % 128:
             print(
                 f"[csv] row {idx}: skipped model_dim={model_dim} "
-                f"inter_dim={inter_dim} (< 512 grouped-kernel floor)",
+                f"inter_dim={inter_dim} (not a multiple of 128)",
+                flush=True,
+            )
+            continue
+        # A gemm1 bias turns off gemm1's own requantization, and the stage-2
+        # quant that replaces it needs inter_dim % 256 == 0 (Kimi-K3 at TP8 has
+        # 384 and no bias).
+        if not args.no_bias and inter_dim % 256:
+            print(
+                f"[csv] row {idx}: skipped inter_dim={inter_dim} with a bias "
+                "(needs inter_dim % 256 == 0; pass --no-bias)",
                 flush=True,
             )
             continue
 
-        act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+        act = {
+            ActivationType.Swiglu: "swiglu",
+            ActivationType.Situv2: "situv2",
+        }.get(activation, "silu")
         print(
             f"\n===== csv row {idx}: {data_format} {act} "
             f"tokens={tokens} model_dim={model_dim} inter_dim={inter_dim} "
