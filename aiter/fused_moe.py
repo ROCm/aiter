@@ -73,6 +73,12 @@ BLOCK_SIZE_M = 32
 # CK swiglustep_and_mul clamps gate/up at this value; it is a compile-time constant in CK.
 CK_SWIGLUSTEP_LIMIT = 7.0
 
+
+def swiglu_limit_tag(swiglu_limit):
+    """`_tag` value of tuned fmoe rows that were tuned with this swiglu_limit."""
+    return f"swiglu_limit={float(swiglu_limit):g}" if swiglu_limit else ""
+
+
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
 # Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
@@ -2216,6 +2222,7 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 cfg_2stages = None
 cfg_2stages_by_file = {}
+cfg_2stages_by_limit_tag = {}
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -3467,12 +3474,15 @@ def get_2stage_cfgs(
             df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
         return df
 
-    def get_cfg_2stages(tune_file):
+    def get_cfg_2stages(tune_file, tag=None):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
         df = _ensure_gfx_column(df)
-        if "_tag" in df.columns:
+        if tag is not None:
+            tags = df["_tag"] if "_tag" in df.columns else pd.Series("", index=df.index)
+            df = df[tags.fillna("").astype(str) == tag]
+        elif "_tag" in df.columns:
             df = df[df["_tag"].fillna("") != "flydsl_fallback"]
 
         # Primary dict: keep original act_type for exact-match lookup.
@@ -3617,6 +3627,23 @@ def get_2stage_cfgs(
         return result
 
     cfg = _lookup_cfg(active_cfg_2stages)
+    limit_tag = swiglu_limit_tag(swiglu_limit)
+    limit_tune_file = os.environ.get("AITER_CONFIG_FMOE_SWIGLU_LIMIT", "")
+    if (
+        limit_tag
+        and limit_tune_file
+        and config_file is None
+        and q_type == QuantType.per_1x128
+        and activation == ActivationType.Silu
+    ):
+        # Rows tuned by gemm_moe_tune.py --swiglu_limit, tagged with the limit.
+        limit_cfgs = cfg_2stages_by_limit_tag.get((limit_tune_file, limit_tag))
+        if limit_cfgs is None:
+            limit_cfgs = get_cfg_2stages(limit_tune_file, tag=limit_tag)
+            cfg_2stages_by_limit_tag[(limit_tune_file, limit_tag)] = limit_cfgs
+        limit_cfg = _lookup_cfg(limit_cfgs)
+        if limit_cfg is not None:
+            cfg = limit_cfg
     if (
         cfg is None
         and config_file is None
