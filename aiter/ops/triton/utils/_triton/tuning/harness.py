@@ -105,7 +105,7 @@ def gpu_alive():
 
     try:
         torch.cuda.synchronize()
-        (torch.ones(1, device="cuda") + 1).item()
+        (torch.ones(1, device="cuda", dtype=torch.float32) + 1).item()
         return True
     except Exception:  # noqa: BLE001
         return False
