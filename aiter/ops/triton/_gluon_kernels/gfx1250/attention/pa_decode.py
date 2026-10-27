@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Gluon (gfx1250) GQA paged-attention decode with TDM page loads.
+"""Gluon GQA paged-attention decode for gfx1250.
 
-One program handles one (sequence, KV head). K and V pages are copied by TDM into a
-2-deep LDS ring, so the next page is in flight while the current page is computed.
-Page tiles are [BLOCK_K, BLOCK_D] and contiguous in a [blocks, kv_heads, BLOCK_K,
-BLOCK_D] cache, so one TDM load fetches a whole page and no gather is needed.
+TDM copies each K/V page into a 2-deep LDS ring, so the next page loads while the
+current page is computed.
 """
 
 import triton.language as tl
@@ -26,6 +24,7 @@ _pa_decode_gqa_tdm_repr = make_kernel_repr(
         "BLOCK_K",
         "SEQ_PARTITION_SZ",
         "SPLIT",
+        "num_warps",
     ],
 )
 

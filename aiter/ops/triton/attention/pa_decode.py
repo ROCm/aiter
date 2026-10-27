@@ -28,7 +28,7 @@ try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode import (
         _pa_decode_gqa_tdm_kernel,
     )
-except:  # noqa: E722
+except ImportError:
     _pa_decode_gqa_tdm_kernel = None
 
 _LOGGER = AiterTritonLogger()
@@ -610,16 +610,14 @@ def paged_attn_decode_gqa_tdm(
     block_tables: torch.Tensor,  # [num_seqs, max_num_blks_per_seq], int32
     seq_lens: torch.Tensor,  # [num_seqs], at least 1
     scale: float,
-    num_warps: int = 2,
+    num_warps: int,
     seq_partition_size: int = _TDM_NO_SPLIT,
     max_seq_len: int | None = None,
 ):
-    """GQA decode on gfx1250 with TDM page loads into LDS.
+    """GQA decode on gfx1250 with TDM page loads into LDS. The result goes to `output`.
 
-    Needs unit K/V scales and no ALiBi. A sequence of length 0 writes zeros unless
-    it is split. With `seq_partition_size` below `_TDM_NO_SPLIT`, each sequence is
-    cut into partitions of that many tokens (a multiple of the page size) and
-    combined by the v2 reduce kernel; `max_seq_len` is then required.
+    Needs unit K/V scales and no ALiBi. A `seq_partition_size` below `_TDM_NO_SPLIT`
+    cuts each sequence into partitions that the v2 reduce kernel combines.
     """
     assert _pa_decode_gqa_tdm_kernel is not None, "needs the gfx1250 Gluon kernel"
     assert _gqa_tdm_supported(query, key_cache, value_cache, output), (

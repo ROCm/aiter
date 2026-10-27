@@ -843,11 +843,12 @@ def _tdm_dispatch_calls(monkeypatch, rule, *, scale=1.0, alibi=None, head=128, k
             f"paged_attn_decode_{name}",
             lambda *a, _name=name, **k: calls.append((_name, k)),
         )
+    # The launchers are mocked, so CPU tensors are enough.
     paged_attention_decode(
-        output=torch.empty(2, 4 * kv, head, dtype=torch.float16),
-        query=torch.empty(2, 4 * kv, head, dtype=torch.float16),
-        key_cache=torch.empty(1, kv, 128, head, dtype=torch.float16),
-        value_cache=torch.empty(1, kv, 128, head, dtype=torch.float16),
+        output=torch.empty(2, 4 * kv, head, dtype=torch.float16, device="cpu"),
+        query=torch.empty(2, 4 * kv, head, dtype=torch.float16, device="cpu"),
+        key_cache=torch.empty(1, kv, 128, head, dtype=torch.float16, device="cpu"),
+        value_cache=torch.empty(1, kv, 128, head, dtype=torch.float16, device="cpu"),
         seq_lens=None,
         block_tables=None,
         attn_scale=1.0,
@@ -968,8 +969,7 @@ def test_tdm_partition_size_is_off_without_target():
 
 
 def test_dispatch_passes_tdm_partition_size(monkeypatch):
-    # 16 programs on a 1024-token sequence: the largest size below it that reaches 1024 programs
-    # does not exist, so the smallest size (256) is used.
+    # No size reaches the target for 16 programs and 1024 tokens, so the smallest size is used.
     rule = {**_TDM_RULE, **_TDM_SPLIT_RULE}
     _, calls = _tdm_dispatch_calls(monkeypatch, rule)
     assert calls[0][1]["seq_partition_size"] == 256
