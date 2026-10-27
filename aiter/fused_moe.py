@@ -1545,6 +1545,7 @@ def _fused_moe_impl(
             quant_type=quant_type,
             q_dtype_w=q_dtype_w,
             q_dtype_a=q_dtype_a if quant_dtype_a is not None else None,
+            q_dtype_a2=quant_dtype_a2,
             activation=activation,
             gate_mode=gate_mode,
             gate_up_interleave=getattr(w1, "gate_up_interleave", None),
@@ -1558,6 +1559,8 @@ def _fused_moe_impl(
             block_size_M=block_size_M,
             tokens=M,
             model_dim=model_dim,
+            hidden_pad=hidden_pad,
+            has_bias2=bias2 is not None,
         )
         # The default picks the activation dtype by token count (bf16, then
         # fp4 above a bound), which would make results depend on the batch.
@@ -3402,6 +3405,7 @@ def _check_deterministic_supported(
     quant_type,
     q_dtype_w,
     q_dtype_a,
+    q_dtype_a2,
     activation,
     gate_mode,
     gate_up_interleave,
@@ -3415,6 +3419,8 @@ def _check_deterministic_supported(
     block_size_M,
     tokens,
     model_dim,
+    hidden_pad,
+    has_bias2,
 ):
     """Raise NotImplementedError naming what fused_moe(deterministic=True) cannot run."""
     unsupported = [
@@ -3427,6 +3433,10 @@ def _check_deterministic_supported(
             (
                 q_dtype_a is not None and q_dtype_a != dtypes.fp4x2,
                 f"activation dtype {q_dtype_a} (MXFP4 only)",
+            ),
+            (
+                q_dtype_a2 is not None and q_dtype_a2 != dtypes.fp4x2,
+                f"stage-2 activation dtype {q_dtype_a2} (MXFP4 only)",
             ),
             (dtype != dtypes.bf16, f"output dtype {dtype} (bf16 only)"),
             (
@@ -3462,6 +3472,12 @@ def _check_deterministic_supported(
                 # tiles.
                 model_dim % 512 != 0,
                 f"hidden size {model_dim} (a multiple of 512 only)",
+            ),
+            (
+                # Without a stage-2 bias the padded output columns are not stored
+                # before the top-k reduction reads them.
+                hidden_pad > 0 and not has_bias2,
+                "hidden padding without a stage-2 bias",
             ),
             (get_gfx_runtime() != "gfx950", f"gfx={get_gfx_runtime()!r}"),
         )

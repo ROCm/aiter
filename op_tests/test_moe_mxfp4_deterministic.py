@@ -215,6 +215,10 @@ def test_deterministic_rejects_unsupported():
         call(interleaved=True)
     with pytest.raises(NotImplementedError, match="block_size_M"):
         call(block_size_M=128)
+    with pytest.raises(NotImplementedError, match="stage-2 activation dtype"):
+        call(quant_dtype_a2=dtypes.fp8)
+    with pytest.raises(NotImplementedError, match="hidden padding"):
+        call(hidden_pad=256)
 
     q = _problem(8, 384, 512, E, 4, bias=False)
     with pytest.raises(NotImplementedError, match="hidden size 384"):
