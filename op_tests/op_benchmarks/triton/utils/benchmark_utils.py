@@ -1,3 +1,5 @@
+import copy
+import functools
 import inspect
 import json
 import math
@@ -461,11 +463,29 @@ def do_bench_aiter_triton(
 ) -> float:
     """Rotating-buffer CUDA graph benchmark, single process.
 
+    Returns the mean per-kernel latency in ms of :func:`do_bench_aiter_triton_times`.
+    """
+    times_ms = do_bench_aiter_triton_times(
+        fn, rot_bufs, warmup_iters, kernels_per_graph, num_replays, warmup_replays
+    )
+    return sum(times_ms) / len(times_ms)
+
+
+def do_bench_aiter_triton_times(
+    fn: Callable,
+    rot_bufs: list[dict[str, torch.Tensor]],
+    warmup_iters: int,
+    kernels_per_graph: int,
+    num_replays: int,
+    warmup_replays: int,
+) -> list[float]:
+    """Rotating-buffer CUDA graph benchmark, single process.
+
     Captures ``max(kernels_per_graph, len(rot_bufs))`` calls to ``fn`` into
     one CUDA graph, rotating through ``rot_bufs`` so the whole pool is
     covered -- a CUDA graph replays the exact calls captured, so a pool
     bigger than ``kernels_per_graph`` would otherwise leave entries unused.
-    Returns the mean per-kernel latency in ms.
+    Returns the per-kernel latency in ms of each timed replay.
     """
 
     # warmup
@@ -509,11 +529,7 @@ def do_bench_aiter_triton(
     torch.cuda.synchronize()
 
     times_ms = [se.elapsed_time(ee) for se, ee in zip(start_events, end_events)]
-    per_kernel_ms = [t / actual_kernels_per_graph for t in times_ms]
-
-    ms = sum(per_kernel_ms) / len(per_kernel_ms)
-
-    return ms
+    return [t / actual_kernels_per_graph for t in times_ms]
 
 
 def do_bench_aiter_triton_synced(
@@ -609,3 +625,102 @@ def do_bench_aiter_triton_synced(
     ms = sum(per_kernel_ms) / len(per_kernel_ms)
 
     return ms
+
+
+# The GEMM tuner (aiter/ops/triton/utils/_triton/tuning) times its candidates with these
+# settings. The pool is twice the 256 MB MI355X Infinity Cache, so every launch reads cold
+# inputs. SCREEN ranks every candidate; CONFIRM re-times the fastest ones in the final round.
+TUNE_ROT_BUFS = {"target_mb": 512, "min_pool_len": 4, "print_info": False}
+TUNE_SCREEN = {
+    "warmup_iters": 1,
+    "kernels_per_graph": 50,
+    "num_replays": 20,
+    "warmup_replays": 3,
+}
+TUNE_CONFIRM = {
+    "warmup_iters": 1,
+    "kernels_per_graph": 1000,
+    "num_replays": 10,
+    "warmup_replays": 3,
+}
+
+
+def config_launch(kernel_fn: Callable, derive_keys: Callable | None = None) -> Callable:
+    """``launch(config, **bufs)``: ``kernel_fn`` with ``config=``; None is the installed config.
+
+    Each launch gets a deep copy of the config, because the wrappers change it.
+    ``derive_keys(config)`` adds the keys that the wrapper derives from the JSON keys.
+    """
+
+    def launch(config, **bufs):
+        if config is not None:
+            config = copy.deepcopy(config)
+            if derive_keys is not None:
+                derive_keys(config)
+        return kernel_fn(config=config, **bufs)
+
+    return launch
+
+
+def splitk_block_size(K: int) -> Callable:
+    """``derive_keys`` for the wrappers that read SPLITK_BLOCK_SIZE, which the JSON does not have."""
+
+    def derive_keys(config):
+        if "NUM_KSPLIT" in config:
+            config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+
+    return derive_keys
+
+
+def output_check(
+    launch: Callable,
+    reference: Callable,
+    out_key: str,
+    atol: float,
+    rtol: float,
+) -> Callable:
+    """``check(config)``: one launch, compared with the torch reference.
+
+    ``reference()`` returns ``(bufs, expected)``: one input set and the expected output. It
+    runs once, at the first check. The output is zeroed before each launch, so a split-K
+    kernel that adds with atomics starts from 0. Raises AssertionError on a mismatch.
+    """
+    cache = []
+
+    def check(config):
+        if not cache:
+            cache.append(reference())
+        bufs, expected = cache[0]
+        bufs[out_key].zero_()
+        launch(config, **bufs)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            bufs[out_key].float(), expected.float(), atol=atol, rtol=rtol
+        )
+
+    return check
+
+
+def metric_value(metric: str, ms: float, flops: float, mem: float) -> float:
+    """The value that the benchmark reports for ``--metric``."""
+    if metric == "time":
+        return ms
+    if metric == "throughput":
+        return flops / ms * 1e-9  # TFLOPS
+    if metric == "bandwidth":
+        return mem / (ms * 1e-3) * 1e-9  # GB/s
+    raise ValueError("Unknown metric: " + metric)
+
+
+def bench_config(launch: Callable, rot_bufs: list[dict], config, settings: dict):
+    """Median, min and max per-kernel latency in us of one config, timed with ``settings``."""
+    times_ms = sorted(
+        do_bench_aiter_triton_times(
+            functools.partial(launch, config), rot_bufs, **settings
+        )
+    )
+    return (
+        times_ms[len(times_ms) // 2] * 1e3,
+        times_ms[0] * 1e3,
+        times_ms[-1] * 1e3,
+    )
