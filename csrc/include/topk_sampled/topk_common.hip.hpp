@@ -660,3 +660,489 @@ block_find_pivot_wide_wave0(const uint32_t* __restrict__ s_w, uint32_t* __restri
 {
     block_find_pivot_wide_wave0(s_w, s_w + WIDE_COARSE_SLOTS, s_scan, ek);
 }
+
+// The stable emit: the top k_out in ascending column order, a tie at the pivot
+// going to the smaller column. That is top_k_per_row_prefill's stable=True
+// contract, and topk_select's for tie='low' and deterministic=True; both make
+// every tensor-parallel rank select and order the same set. block_gather_topk
+// places by atomic counters, so its order and its pick among tied keys follow
+// wave timing; the two emitters below place by counting instead.
+//
+// Both apply one rule. An element above the pivot is always selected; one equal
+// to it is selected while fewer than eq_needed equal keys lie to its left. A
+// selected element's slot is the number of selected elements to its left: the
+// keys above the pivot there, plus the equal ones there capped at eq_needed.
+//
+// NAN_ONE is topk_select's order for tie='low', where every NaN is one value
+// above +inf (its decode selector ranks them so). The NAN_HIGH key ranks NaNs
+// by payload instead, which changes the answer only when the pivot itself is a
+// NaN -- otherwise every NaN is above it under both -- so that is the one case
+// remapped: no key above the NaN class, and k_out of its members taken by
+// column. The caller has to show the emitter every NaN of the row then.
+constexpr uint32_t NAN_ONE_KEY = 0xFF000002u; // the lowest positive NaN; +inf is 0xFF000001
+
+template <bool NAN_ONE>
+__device__ __forceinline__ void nan_one_remap(uint32_t& pivot, int& ngt, int& eq_needed)
+{
+    if(NAN_ONE && pivot >= NAN_ONE_KEY)
+    {
+        pivot = NAN_ONE_KEY;
+        eq_needed += ngt;
+        ngt = 0;
+    }
+}
+
+template <bool NAN_ONE>
+__device__ __forceinline__ uint32_t nan_one_key(uint32_t k)
+{
+    return NAN_ONE ? min(k, NAN_ONE_KEY) : k;
+}
+
+// One element at its slot, given the counts of selected-class keys to its left.
+template <bool WRITE_VALUES>
+__device__ __forceinline__ void stable_place(uint32_t k,
+                                             uint32_t pivot,
+                                             unsigned g,
+                                             unsigned q,
+                                             int eq_needed,
+                                             int col,
+                                             int* __restrict__ out,
+                                             float* __restrict__ out_val)
+{
+    int pos = -1;
+    if(k > pivot)
+        pos = (int)(g + min(q, (unsigned)eq_needed));
+    else if(k == pivot && q < (unsigned)eq_needed)
+        pos = (int)(g + q);
+    if(pos >= 0)
+    {
+        out[pos] = col;
+        if(WRITE_VALUES)
+            out_val[pos] = sortable_to_fp32(k);
+    }
+}
+
+// Rows read in column order: small_n's keys in LDS and the fallback's row in
+// global memory. Each wave owns one contiguous run of the row in whole 64-vector
+// steps; a counting pass gives every run its base, and an emit pass walks the
+// run again, one wave scan per step placing each lane's four columns.
+// keys4(j) returns the keys of columns 4j..4j+3 and is asked only for j < n4;
+// columns at or past len are masked here. s_wtot is 2 * MAX_WAVES_PER_BLOCK
+// words of scratch. All threads must call.
+// Two vectors in flight per lane: phase_c inlines this twice next to its other
+// emitters, and four put one instantiation past its 64-VGPR budget into scratch.
+constexpr int STABLE_ROW_LOADS = 2;
+
+// keys4 for a row in global memory, bounds-checked like block_gather_stream's
+// loads so a row of any width is read whole.
+template <bool NAN_HIGH>
+__device__ __forceinline__ opus::u32x4_t row_keys4(const float* __restrict__ row, int j, int len)
+{
+    const vfloat4 v = load_row_f4<true>(row, j, len);
+    return opus::u32x4_t{sortable_key<NAN_HIGH>(v[0]),
+                         sortable_key<NAN_HIGH>(v[1]),
+                         sortable_key<NAN_HIGH>(v[2]),
+                         sortable_key<NAN_HIGH>(v[3])};
+}
+
+template <bool WRITE_VALUES, bool NAN_ONE, typename Keys4Fn>
+__device__ __forceinline__ void block_gather_in_order(int len,
+                                                      int idx_base,
+                                                      uint32_t pivot,
+                                                      int ngt,
+                                                      int eq_needed,
+                                                      int* __restrict__ out,
+                                                      float* __restrict__ out_val,
+                                                      uint32_t* __restrict__ s_wtot,
+                                                      Keys4Fn keys4)
+{
+    static_assert(!(NAN_ONE && WRITE_VALUES), "NAN_ONE is instantiated for indices only");
+    nan_one_remap<NAN_ONE>(pivot, ngt, eq_needed);
+    const int lane     = threadIdx.x & (WAVE_SIZE - 1);
+    const int wid      = threadIdx.x / WAVE_SIZE;
+    const int nwaves   = blockDim.x / WAVE_SIZE;
+    const int n4       = n4_cover(len);
+    const int steps    = (n4 + WAVE_SIZE - 1) / WAVE_SIZE;
+    const int run      = (steps + nwaves - 1) / nwaves * WAVE_SIZE;
+    const int v0       = min(wid * run, n4);
+    const int v1       = min(v0 + run, n4);
+    constexpr int SPAN = STABLE_ROW_LOADS * WAVE_SIZE;
+
+    unsigned cg = 0, ce = 0;
+    for(int jb = v0; jb < v1; jb += SPAN)
+    {
+        opus::u32x4_t kv[STABLE_ROW_LOADS];
+#pragma unroll
+        for(int u = 0; u < STABLE_ROW_LOADS; u++)
+        {
+            const int j = jb + u * WAVE_SIZE + lane;
+            kv[u]       = j < v1 ? keys4(j) : opus::u32x4_t{0u, 0u, 0u, 0u};
+        }
+#pragma unroll
+        for(int u = 0; u < STABLE_ROW_LOADS; u++)
+        {
+            const int j = jb + u * WAVE_SIZE + lane;
+#pragma unroll
+            for(int e = 0; e < FP32_EPT; e++)
+            {
+                const bool has   = j < v1 && j * FP32_EPT + e < len;
+                const uint32_t k = nan_one_key<NAN_ONE>(kv[u][e]);
+                cg += (has && k > pivot) ? 1u : 0u;
+                ce += (has && k == pivot) ? 1u : 0u;
+            }
+        }
+    }
+    // Lane 0's inclusive suffix is the wave's total.
+    const uint32_t tg = wave_suffix_sum(cg);
+    const uint32_t te = wave_suffix_sum(ce);
+    if(lane == 0)
+    {
+        s_wtot[wid]                       = tg;
+        s_wtot[MAX_WAVES_PER_BLOCK + wid] = te;
+    }
+    __syncthreads();
+    unsigned bg = 0, be = 0;
+    for(int w = 0; w < wid; w++)
+    {
+        bg += s_wtot[w];
+        be += s_wtot[MAX_WAVES_PER_BLOCK + w];
+    }
+    __syncthreads(); // s_wtot is the caller's again
+
+    for(int jb = v0; jb < v1; jb += SPAN)
+    {
+        // Wave-uniform: every selected element of this run is placed.
+        if(bg >= (unsigned)ngt && be >= (unsigned)eq_needed)
+            break;
+        opus::u32x4_t kv[STABLE_ROW_LOADS];
+#pragma unroll
+        for(int u = 0; u < STABLE_ROW_LOADS; u++)
+        {
+            const int j = jb + u * WAVE_SIZE + lane;
+            kv[u]       = j < v1 ? keys4(j) : opus::u32x4_t{0u, 0u, 0u, 0u};
+        }
+#pragma unroll
+        for(int u = 0; u < STABLE_ROW_LOADS; u++)
+        {
+            const int j = jb + u * WAVE_SIZE + lane;
+            uint32_t k[FP32_EPT];
+            bool has[FP32_EPT];
+            uint32_t lg = 0, le = 0;
+#pragma unroll
+            for(int e = 0; e < FP32_EPT; e++)
+            {
+                has[e] = j < v1 && j * FP32_EPT + e < len;
+                k[e]   = nan_one_key<NAN_ONE>(kv[u][e]);
+                lg += (has[e] && k[e] > pivot) ? 1u : 0u;
+                le += (has[e] && k[e] == pivot) ? 1u : 0u;
+            }
+            // At most 4 per lane, 256 per step: both counts fit a half each. Lane 0's
+            // inclusive suffix is the step's total, so total minus a lane's own suffix
+            // is what the lanes to its left hold.
+            const uint32_t s    = wave_suffix_sum(lg | (le << 16));
+            const uint32_t tot  = (uint32_t)__builtin_amdgcn_readfirstlane((int)s);
+            const uint32_t left = tot - s;
+            unsigned g          = bg + (left & 0xFFFFu);
+            unsigned q          = be + (left >> 16);
+#pragma unroll
+            for(int e = 0; e < FP32_EPT; e++)
+            {
+                if(!has[e])
+                    continue;
+                stable_place<WRITE_VALUES>(
+                    k[e], pivot, g, q, eq_needed, idx_base + j * FP32_EPT + e, out, out_val);
+                g += k[e] > pivot ? 1u : 0u;
+                q += k[e] == pivot ? 1u : 0u;
+            }
+            bg += tot & 0xFFFFu;
+            be += tot >> 16;
+        }
+    }
+}
+
+// phase_c's candidates arrive in reservation order, so they are placed from a
+// sort. An entry is column << 1 with the low bit set for a key equal to the
+// pivot; 0xFFFFFFFF marks one below it and sorts last. With no more equal keys
+// than eq_needed an entry's slot is its sorted index; otherwise a scan of the
+// equal flags drops the equal keys past the first eq_needed and closes the
+// gaps. A bitonic sort costs log2(n) (log2(n) + 1) / 2 stages whatever the
+// row's width; ranking against a column bitmap cost a pass over the candidates
+// per window of columns, 3x the default emit at N=1M.
+constexpr uint32_t STABLE_NONE   = 0xFFFFFFFFu;
+constexpr int STABLE_RANK_DIRECT = 128;
+
+// The list the selected keys are gathered into: s_hist's HIST_SLOTS words for
+// k up to half of them, which leaves the other half for ties at the pivot, and
+// `cap` words of its own above that, which no row outgrows (c <= cap). Host and
+// kernel both ask, so the launch and the carve agree.
+__host__ __device__ constexpr int stable_list_words(int K, int cap)
+{
+    return K <= HIST_SLOTS / 2 ? 0 : cap;
+}
+
+// Rows spanning few windows of columns rank their candidates through bitmaps
+// instead of sorting: per window of 32 * nw columns, one bit per column above
+// the pivot and one per column equal to it, then a block scan of the words'
+// popcounts gives every candidate the count to its left. Two passes over the
+// candidates per window against a sort's stages: 1.04x-1.94x faster than the
+// sort at 2 windows, about even at 8, 0.57x-0.92x at 16 (N=1M).
+// s_bm is 3 * nw words, s_wtot MAX_WAVES_PER_BLOCK words; blockDim.x must
+// divide nw. A window holds at most c <= PHASE_C_CAP_MAX keys, so each count
+// fits a 16-bit half. All threads must call.
+constexpr int STABLE_BM_WORDS       = 2048;
+constexpr int STABLE_BM_WORDS_WIDE  = 4096;
+constexpr int STABLE_BM_MAX_WINDOWS = 4;
+
+template <bool WRITE_VALUES, bool NAN_ONE, typename KeyFn, typename ColFn>
+__device__ __forceinline__ void block_gather_by_column(int c,
+                                                       int len,
+                                                       int idx_base,
+                                                       uint32_t pivot,
+                                                       int eq_needed,
+                                                       int* __restrict__ out,
+                                                       float* __restrict__ out_val,
+                                                       uint32_t* __restrict__ s_bm,
+                                                       int nw,
+                                                       uint32_t* __restrict__ s_wtot,
+                                                       KeyFn key_at,
+                                                       ColFn col_at)
+{
+    static_assert(!(NAN_ONE && WRITE_VALUES), "NAN_ONE is instantiated for indices only");
+    uint32_t* s_gt   = s_bm;
+    uint32_t* s_eq   = s_bm + nw;
+    uint32_t* s_pre  = s_bm + 2 * nw;
+    const int cols   = nw * 32;
+    const int lane   = threadIdx.x & (WAVE_SIZE - 1);
+    const int wid    = threadIdx.x / WAVE_SIZE;
+    const int nwaves = blockDim.x / WAVE_SIZE;
+    const int wpt    = nw / (int)blockDim.x;
+    const int wb     = (int)threadIdx.x * wpt;
+    auto word_counts = [&](int w) {
+        return (uint32_t)__popc(s_gt[w]) | ((uint32_t)__popc(s_eq[w]) << 16);
+    };
+    unsigned carry_g = 0, carry_e = 0;
+    // By window number: stepping a column offset past the last window would
+    // overflow an int row length within `cols` of INT32_MAX.
+    const int nwin = len / cols + (len % cols != 0 ? 1 : 0);
+    for(int w = 0; w < nwin; w++)
+    {
+        const int w0 = w * cols;
+        for(int i = threadIdx.x; i < 2 * nw; i += blockDim.x)
+            s_bm[i] = 0u;
+        __syncthreads();
+        for(int i = threadIdx.x; i < c; i += blockDim.x)
+        {
+            const int col = col_at(i) - w0;
+            if((unsigned)col < (unsigned)cols)
+            {
+                const uint32_t k = nan_one_key<NAN_ONE>(key_at(i));
+                if(k > pivot)
+                    atomicOr(&s_gt[col >> 5], 1u << (col & 31));
+                else if(k == pivot)
+                    atomicOr(&s_eq[col >> 5], 1u << (col & 31));
+            }
+        }
+        __syncthreads();
+        uint32_t loc = 0;
+        for(int t = 0; t < wpt; t++)
+            loc += word_counts(wb + t);
+        const uint32_t s = wave_suffix_sum(loc);
+        if(lane == 0)
+            s_wtot[wid] = s;
+        __syncthreads();
+        uint32_t run = (uint32_t)__builtin_amdgcn_readfirstlane((int)s) - s;
+        uint32_t tot = 0;
+        for(int w = 0; w < nwaves; w++)
+        {
+            const uint32_t v = s_wtot[w];
+            run += w < wid ? v : 0u;
+            tot += v;
+        }
+        for(int t = 0; t < wpt; t++)
+        {
+            s_pre[wb + t] = run;
+            run += word_counts(wb + t);
+        }
+        __syncthreads();
+        for(int i = threadIdx.x; i < c; i += blockDim.x)
+        {
+            const int col = col_at(i) - w0;
+            if((unsigned)col < (unsigned)cols)
+            {
+                const uint32_t k = nan_one_key<NAN_ONE>(key_at(i));
+                if(k >= pivot)
+                {
+                    const int wd         = col >> 5;
+                    const uint32_t below = (1u << (col & 31)) - 1u;
+                    const uint32_t pw    = s_pre[wd];
+                    const unsigned g =
+                        carry_g + (pw & 0xFFFFu) + (unsigned)__popc(s_gt[wd] & below);
+                    const unsigned q = carry_e + (pw >> 16) + (unsigned)__popc(s_eq[wd] & below);
+                    stable_place<WRITE_VALUES>(
+                        k, pivot, g, q, eq_needed, idx_base + w0 + col, out, out_val);
+                }
+            }
+        }
+        carry_g += tot & 0xFFFFu;
+        carry_e += tot >> 16;
+        __syncthreads(); // the next window clears what this one read
+    }
+}
+
+// Gathers the entries at or above the pivot into s_list, up to list_cap of
+// them; *s_cnt ends as their number and *s_ceq as that of the equal ones, both
+// zeroed by the caller and published by the barrier at the end.
+template <bool NAN_ONE, typename KeyFn, typename ColFn>
+__device__ __forceinline__ void stable_collect(int c,
+                                               uint32_t pivot,
+                                               uint32_t* __restrict__ s_list,
+                                               int list_cap,
+                                               unsigned* __restrict__ s_cnt,
+                                               unsigned* __restrict__ s_ceq,
+                                               KeyFn key_at,
+                                               ColFn col_at)
+{
+    const int lane    = threadIdx.x & (WAVE_SIZE - 1);
+    const uint64_t lt = (1ull << lane) - 1ull;
+    for(int i0 = 0; i0 < c; i0 += blockDim.x)
+    {
+        const int i       = i0 + threadIdx.x;
+        const uint32_t k  = i < c ? nan_one_key<NAN_ONE>(key_at(i)) : 0u;
+        const bool sel    = i < c && k >= pivot;
+        const uint64_t bs = __ballot(sel);
+        if(bs == 0ull)
+            continue;
+        const uint64_t be = __ballot(sel && k == pivot);
+        unsigned base     = 0;
+        if(lane == 0)
+        {
+            base = atomicAdd(s_cnt, (unsigned)__popcll(bs));
+            if(be)
+                atomicAdd(s_ceq, (unsigned)__popcll(be));
+        }
+        base                = wave_bcast(base, 0);
+        const unsigned slot = base + (unsigned)__popcll(bs & lt);
+        if(sel && slot < (unsigned)list_cap)
+            s_list[slot] = ((uint32_t)col_at(i) << 1) | (k == pivot ? 1u : 0u);
+    }
+    __syncthreads();
+}
+
+// Sorts s[0, n) -- p entries and n - p STABLE_NONE -- and places the p, e_all of
+// them equal to the pivot. s has room for n rounded up to a power of two;
+// s_wtot is MAX_WAVES_PER_BLOCK words. All threads must call.
+template <bool WRITE_VALUES>
+__device__ __forceinline__ void stable_sort_place(uint32_t* __restrict__ s,
+                                                  int n,
+                                                  int p,
+                                                  int e_all,
+                                                  int eq_needed,
+                                                  int idx_base,
+                                                  const float* __restrict__ row,
+                                                  int* __restrict__ out,
+                                                  float* __restrict__ out_val,
+                                                  uint32_t* __restrict__ s_wtot)
+{
+    const int lane          = threadIdx.x & (WAVE_SIZE - 1);
+    const int wid           = threadIdx.x / WAVE_SIZE;
+    const bool all_eq_taken = e_all <= eq_needed;
+    // Entry v at sorted index i with eq_before equal keys left of it.
+    auto place = [&](int i, uint32_t v, unsigned eq_before) {
+        const bool is_eq = v & 1u;
+        if(all_eq_taken || !is_eq || eq_before < (unsigned)eq_needed)
+        {
+            const int pos =
+                all_eq_taken
+                    ? i
+                    : i - (int)(eq_before > (unsigned)eq_needed ? eq_before - eq_needed : 0u);
+            out[pos] = idx_base + (int)(v >> 1);
+            if(WRITE_VALUES)
+                out_val[pos] = row[v >> 1];
+        }
+    };
+    if(n <= STABLE_RANK_DIRECT)
+    {
+        // A short list ranks by comparison, n reads per entry and no barrier: a
+        // sort's stages cost more here.
+        for(int j = threadIdx.x; j < n; j += blockDim.x)
+        {
+            const uint32_t v = s[j];
+            if(v == STABLE_NONE)
+                continue;
+            unsigned left = 0, eq_left = 0;
+            for(int m = 0; m < n; m++)
+            {
+                const uint32_t w = s[m];
+                left += w < v ? 1u : 0u;
+                eq_left += (w < v && (w & 1u)) ? 1u : 0u;
+            }
+            place((int)left, v, eq_left);
+        }
+        return;
+    }
+    int n2 = 1;
+    while(n2 < n)
+        n2 <<= 1;
+    for(int i = n + (int)threadIdx.x; i < n2; i += blockDim.x)
+        s[i] = STABLE_NONE;
+    __syncthreads();
+    // A stage of stride <= WAVE_SIZE pairs entries inside one 2 * WAVE_SIZE run,
+    // and every run belongs to one wave (pair t of the stage is thread t mod
+    // blockDim), so between two such stages the wave only has to see its own
+    // writes; any other boundary needs the block.
+    for(int size = 2; size <= n2; size <<= 1)
+    {
+        for(int stride = size >> 1; stride > 0; stride >>= 1)
+        {
+            for(int t = threadIdx.x; t < n2 / 2; t += blockDim.x)
+            {
+                const int a      = 2 * t - (t & (stride - 1));
+                const uint32_t x = s[a], y = s[a + stride];
+                if((x > y) == ((a & size) == 0))
+                {
+                    s[a]          = y;
+                    s[a + stride] = x;
+                }
+            }
+            const int next = stride > 1 ? stride >> 1 : size;
+            if(stride <= WAVE_SIZE && next <= WAVE_SIZE && next < n2)
+            {
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+            }
+            else
+            {
+                __syncthreads();
+            }
+        }
+    }
+    if(all_eq_taken)
+    {
+        // Every entry is selected, and the first p are in column order.
+        for(int i = threadIdx.x; i < p; i += blockDim.x)
+            place(i, s[i], 0u);
+        return;
+    }
+    // More equal keys than places: each thread walks one contiguous run of the
+    // sorted entries with the count of equal keys before it.
+    const int run  = (p + (int)blockDim.x - 1) / (int)blockDim.x;
+    const int r0   = min((int)threadIdx.x * run, p);
+    const int r1   = min(r0 + run, p);
+    uint32_t local = 0;
+    for(int i = r0; i < r1; i++)
+        local += s[i] & 1u;
+    const uint32_t sw = wave_suffix_sum(local);
+    if(lane == 0)
+        s_wtot[wid] = sw;
+    __syncthreads();
+    unsigned eq_before = (uint32_t)__builtin_amdgcn_readfirstlane((int)sw) - sw;
+    for(int w = 0; w < wid; w++)
+        eq_before += s_wtot[w];
+    for(int i = r0; i < r1; i++)
+    {
+        const uint32_t v = s[i];
+        place(i, v, eq_before);
+        eq_before += v & 1u;
+    }
+}
