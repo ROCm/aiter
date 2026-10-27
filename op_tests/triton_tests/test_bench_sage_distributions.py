@@ -20,7 +20,13 @@ identity either way.
 @pytest.fixture(scope="module")
 def bench():
     path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "bench_sage.py")
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "op_benchmarks",
+            "triton",
+            "bench_sage.py",
+        )
     )
     spec = importlib.util.spec_from_file_location("bench_sage", path)
     module = importlib.util.module_from_spec(spec)
