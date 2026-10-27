@@ -465,7 +465,9 @@ _CKGEMM_HAS_GFX: dict = {}
 
 
 @functools.lru_cache(maxsize=1024)
-def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
+def get_CKGEMM_config(
+    M: int, N: int, K: int, tuned_file=None, *, gfx=None, cu_num=None
+):
     if tuned_file is None:
         tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
     if tuned_file not in _CKGEMM_CONFIG_CACHE:
@@ -487,8 +489,8 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
             ).to_dict("index")
             _CKGEMM_HAS_GFX[tuned_file] = False
 
-    gfx = get_gfx()
-    cu_num = get_cu_num()
+    gfx = get_gfx() if gfx is None else gfx
+    cu_num = get_cu_num() if cu_num is None else cu_num
     has_gfx = _CKGEMM_HAS_GFX[tuned_file]
     padded_M = M
     config = None
@@ -896,7 +898,19 @@ def _load_mxscale_bpreshuffle_tuned() -> dict:
     """{(gfx, cu_num, M, N, K, w_scale_block): row} of the e8m0 block-scale
     table for preshuffled weights."""
     path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
-    df = pd.read_csv(path).drop_duplicates()
+    df = with_mxscale_w_scale_block(pd.read_csv(path), path).drop_duplicates()
+    # A blank cell read as 128x128 can repeat a 128x128 row's shape. Keep the
+    # fastest, as the merge does.
+    timed = "us" in df
+    if timed:
+        df = df.sort_values("us", kind="stable")
+    repeated = df.duplicated(_MXSCALE_BPRESHUFFLE_KEYS)
+    if repeated.any():
+        logger.warning(
+            f"{path}: {int(repeated.sum())} rows repeat a tuned shape; "
+            f"using the {'fastest' if timed else 'first'} row of each."
+        )
+        df = df[~repeated]
     return df.set_index(_MXSCALE_BPRESHUFFLE_KEYS).to_dict("index")
 
 
@@ -929,16 +943,27 @@ def get_mxscale_bpreshuffle_config(m: int, n: int, k: int, w_scale_block: str):
 _BLOCKSCALE_X_BLOCK = 128
 
 
+def _mxscale_tuned_config(m: int, n: int, k: int, x_scale, w_scale_block: str):
+    """The shape's tuned mxscale bpreshuffle row for _gemm_mxscale_bpreshuffle.
+    Rows are tuned with the x_scale block that goes with their w_scale's (1x128
+    with 128x128, else 1x32); bmm reads every other pairing too, its heuristic
+    picks, so another x_scale block does not read the table."""
+    x_block = k // x_scale.shape[-1]
+    if x_block != (_BLOCKSCALE_X_BLOCK if w_scale_block == "128x128" else 32):
+        return None
+    return get_mxscale_bpreshuffle_config(m, n, k, w_scale_block)
+
+
 def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y, config):
     """E8M0 block-scale GEMM on (16, 16)-preshuffled weights, scales raw (as
     quantized): a 128-wide x_scale has column-major bytes (blockscale), a
     32-wide one is row-major (group32/MX). A tuned row's kernelId names the
-    backend: "mxfp8" is gfx950's mxpsh / 8-wave GEMM (run_gemm_a8w8_mxfp8_gfx950;
-    its x_scale block goes with the w_scale's: 1x128 with 128x128, else 1x32),
-    "bmm" the flydsl batched
-    GEMM (flydsl.batched_gemm_a8w8) run with B = 1, which also serves untuned
-    shapes. ``config`` is the shape's tuned row (get_mxscale_bpreshuffle_config),
-    or None."""
+    backend: "mxfp8" is gfx950's mxpsh / 8-wave GEMM (run_gemm_a8w8_mxfp8_gfx950),
+    "bmm" the flydsl batched GEMM (flydsl.batched_gemm_a8w8) run with B = 1.
+    Both are tuned with the x_scale block that goes with the w_scale's (1x128
+    with 128x128, else 1x32); untuned shapes and other x_scale blocks run bmm
+    under its heuristic. ``config`` is the shape's tuned row for this x_scale
+    block (_mxscale_tuned_config), or None."""
     m, k = XQ.shape
     n = WQ.shape[0]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
@@ -952,15 +977,11 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y, config):
             f"has no implementation"
         )
     if backend == MXSCALE_MXFP8_KERNEL_ID:
-        if x_block == (128 if w_scale_block == "128x128" else 32):
-            from .flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
+        from .flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
 
-            return run_gemm_a8w8_mxfp8_gfx950(
-                XQ, WQ, x_scale, w_scale, Y, str(config["kernelName"]), w_scale_block
-            )
-        # An x_scale block the mxfp8 kernels do not pair with this w_scale:
-        # bmm reads every pairing, its heuristic picks.
-        config = None
+        return run_gemm_a8w8_mxfp8_gfx950(
+            XQ, WQ, x_scale, w_scale, Y, str(config["kernelName"]), w_scale_block
+        )
     from .flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
 
     run_bmm_a8w8_mxfp8(
@@ -1178,6 +1199,14 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
+@functools.lru_cache(maxsize=1024)
+def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
+    logger.warning(
+        f"gemm_a8w8_blockscale_bpreshuffle N:{n}, K:{k} has asm-tuned rows, which "
+        f"only write bf16; {dtype} output uses the CK heuristic instead."
+    )
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
@@ -1222,7 +1251,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
 
         w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
         if bmm_a8w8_mxfp8_supported(w_scale_block):
-            config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block)
+            config = _mxscale_tuned_config(m, n, k, x_scale, w_scale_block)
             if not _has_tuned_mxfp8_row(config, m, n, k, w_scale_block):
                 return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y, config)
 
@@ -1319,7 +1348,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
         and w_scale.dtype == dtypes.fp8_e8m0
     ):
         w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
-        config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block)
+        config = _mxscale_tuned_config(m, n, k, x_scale, w_scale_block)
         return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y, config)
 
     # temporarily guard scale that are not fp32.
@@ -1365,15 +1394,20 @@ def gemm_a8w8_blockscale_bpreshuffle(
             is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
 
+    from aiter.ops.opus._arch import _device_arch_and_cu
+
+    gfx, cu = _device_arch_and_cu(XQ.device)
     config = get_CKGEMM_config(
         m,
         n,
         k,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+        gfx=gfx,
+        cu_num=cu,
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.
-    if (config is not None and config["libtype"] == "triton") or get_gfx() == "gfx1250":
+    if (config is not None and config["libtype"] == "triton") or gfx == "gfx1250":
         # kernelName optionally carries the backend hint ("triton"/"gluon");
         # anything else -> None (auto gluon->triton detection). config=None lets
         # the triton impl load its own tuned config internally. WQ is already
@@ -1411,22 +1445,37 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
             )
         elif libtype == "asm":
-            splitK = config["splitK"]
-            return gemm_a8w8_blockscale_bpreshuffle_asm(
-                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
-            )
+            if dtype == dtypes.bf16:
+                splitK = config["splitK"]
+                return gemm_a8w8_blockscale_bpreshuffle_asm(
+                    XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+                )
+            _warn_blockscale_asm_row_not_bf16(n, k, dtype)
         elif libtype == "opus":
-            kernelId = int(config["kernelId"])
             from aiter.ops.opus import opus_gemm
+            from csrc.opus_gemm.opus_gemm_common import (
+                get_kernel_instance,
+                parse_integer,
+            )
+
+            kid = parse_integer(config["kernelId"], name="saved kernel id")
+            instance = get_kernel_instance(
+                gfx, "a8w8_blockscale_bpreshuffle", kid, cu_num=cu
+            )
+            if instance is None or (
+                kernelName not in ("", "nan", "None") and kernelName != instance.name
+            ):
+                raise ValueError(f"Invalid tuned OPUS kernel {kid}")
 
             return opus_gemm(
                 XQ,
                 WQ,
                 Y,
-                kid=kernelId,
+                kid=kid,
                 layout="bpreshuffle",
                 x_scale=x_scale,
                 w_scale=w_scale,
+                family="a8w8_blockscale_bpreshuffle",
             )
         elif libtype == "flydsl":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(

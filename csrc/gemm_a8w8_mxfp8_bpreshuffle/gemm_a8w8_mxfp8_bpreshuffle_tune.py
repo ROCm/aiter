@@ -14,11 +14,11 @@ w_scale_block (1x32: a shape list without the column is one):
 
 --mxscale_table tunes gemm_a8w8_blockscale_bpreshuffle's e8m0 table instead,
 the only one the 32x32 (w_scale [N/32, K/32], as bmm's) and 128x128 blocks
-(w_scale [N/128, K/128], x_scale 1x128 as its column-major bytes) have: the
-batched GEMM at B = 1 (bmm) joins as a third backend on them (its candidates:
-the table's tuned bmm kernels for M/2..2M, its heuristic pick, and their
-split-K neighbours), and a row's kernelId names the backend that runs it,
-"mxfp8" or "bmm":
+(w_scale [N/128, K/128], x_scale 1x128 as its column-major bytes) have, and
+the one its 1x32 calls read: the batched GEMM at B = 1 (bmm) joins the mxfp8
+pipelines on every block (its candidates: the table's tuned bmm kernels for
+M/2..2M, its heuristic pick, and their split-K neighbours), and a row's
+kernelId names the backend that runs it, "mxfp8" or "bmm":
 
     python3 csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py \\
         --mxscale_table \\
@@ -106,59 +106,47 @@ def run_torch(x_deq, w_deq, dtype=dtypes.bf16):
 
 
 # The batched GEMM at B = 1 in --mxscale_table mode: its ids follow mxfp8's
-# (kernelId records the backend in that table), its split-K variants the
-# batched tuner's.
+# (kernelId records the backend in that table).
 KERNEL_ID_BASE_BMM = 3_000_000
-_BMM_SPLITS = (1, 2, 4, 8, 16)
 MXSCALE_KERNEL_ID = "mxfp8"
 MXSCALE_BMM_KERNEL_ID = "bmm"
 
 
 def _bmm_scale_args(w_scale_block):
-    g = int(w_scale_block.split("x")[1])
-    # The blockscale x_scale (1x128) is passed as its column-major bytes.
+    from aiter.ops.gemm_op_common import mxscale_bmm_groups_of_block
+
+    rows, cols = mxscale_bmm_groups_of_block(w_scale_block)
+    # generate_data's x_scale is as wide as the w_scale block; a 1x128 one
+    # (blockscale) is passed as its column-major bytes.
     return {
-        "x_scale_k": g,
-        "w_scale_n": g,
-        "w_scale_k": g,
-        "x_scale_transposed": g == 128,
+        "x_scale_k": cols,
+        "w_scale_n": rows,
+        "w_scale_k": cols,
+        "x_scale_transposed": cols == 128,
     }
 
 
 def bmm_candidates(m, n, k, w_scale_block, seeds=()):
     """bmm kernelNames to time for a shape: ``seeds`` (tuned bmm rows of nearby
-    M), the heuristic pick, and their split-K neighbours that run it."""
-    if w_scale_block not in ("32x32", "128x128"):
-        return []
+    M), the heuristic pick, and their split-K neighbours that run it. A
+    1x128 x_scale is read row-major at M = 1, which a row may serve through
+    padded M, so 128x128 candidates must run both layouts."""
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
-        bmm_kernel_name,
-        check_bmm_config,
+        bmm_candidate_names,
+        bmm_config_runs,
         parse_bmm_kernel_name,
-        pick_bmm_kernel_name,
     )
 
     scale_args = _bmm_scale_args(w_scale_block)
-    names = set(seeds)
-    try:
-        names.add(pick_bmm_kernel_name(1, m, n, k, **scale_args))
-    except ValueError:
-        pass
-    out = set()
-    for name in names:
-        cfg = parse_bmm_kernel_name(name)
-        if cfg is None:
-            continue
-        base = cfg["splits"]
-        for sp in _BMM_SPLITS:
-            if sp != base and not base / 2 <= sp <= base * 2:
-                continue
-            c = {**cfg, "splits": sp}
-            try:
-                check_bmm_config(n, k, 1, **c, **scale_args)
-            except ValueError:
-                continue
-            out.add(bmm_kernel_name(**c))
-    return sorted(out)
+    names = bmm_candidate_names(1, m, n, k, seeds, **scale_args)
+    if not scale_args["x_scale_transposed"]:
+        return names
+    row_major = {**scale_args, "x_scale_transposed": False}
+    return [
+        name
+        for name in names
+        if bmm_config_runs(1, n, k, row_major, parse_bmm_kernel_name(name))
+    ]
 
 
 def run_bmm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
@@ -275,8 +263,8 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             "--mxscale_table",
             action="store_true",
             help="Tune gemm_a8w8_blockscale_bpreshuffle's e8m0 table: bmm (the "
-            "batched GEMM at B = 1) joins on 32x32 / 128x128, and kernelId names "
-            "the backend, mxfp8 or bmm.",
+            "batched GEMM at B = 1) joins on 1x32 / 32x32 / 128x128, and "
+            "kernelId names the backend, mxfp8 or bmm.",
         )
 
     def _bmm_seeds(self):
