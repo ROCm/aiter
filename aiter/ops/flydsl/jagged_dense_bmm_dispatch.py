@@ -33,9 +33,9 @@ __all__ = [
     "shape_id",
 ]
 
-# gfx942 winners are measured on MI300X. Another arch gets an empty table
-# until it has its own section and is added here.
-SUPPORTED_GFX = ("gfx942",)
+# Each entry has its own measured winners. gfx942 is MI300X; gfx950 is MI350.
+# An arch absent from this tuple gets an empty table.
+SUPPORTED_GFX = ("gfx942", "gfx950")
 
 _DISPATCH_TABLES: dict[str, dict] = {}
 _DISPATCH_CACHE: dict[tuple, dict] = {}

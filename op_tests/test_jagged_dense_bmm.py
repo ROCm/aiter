@@ -726,9 +726,18 @@ def test_jdbba_arch_section(arch):
         with mock.patch.object(jdbba_dispatch, "get_gfx_runtime", return_value=arch):
             selected, raised = _check_shipped_section(arch)
             override = _check_multisection_override(arch)
-        if arch == get_gfx() and arch not in SUPPORTED_GFX:
+        if prev_json is None:
+            os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON", None)
+        else:
+            os.environ["FLYDSL_JAGGED_DENSE_BMM_DISPATCH_JSON"] = prev_json
+        if arch == get_gfx():
             _clear_dispatch_cache()
-            if not _wrapper_refuses(get_gfx()):
+            if arch in SUPPORTED_GFX:
+                live = _load_dispatch_table().get("gfx") or ""
+                if live != arch:
+                    raise AssertionError(f"live {get_gfx()} loaded section {live!r}")
+                jdbba_dispatch._require_supported_arch()
+            elif not _wrapper_refuses(get_gfx()):
                 raise AssertionError(f"live {get_gfx()} did not raise before compile")
     finally:
         os.environ.pop("FLYDSL_JAGGED_DENSE_BMM_ARCH", None)
