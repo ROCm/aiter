@@ -135,6 +135,72 @@ def _all_finite(tensor: torch.Tensor) -> bool:
     return bool(torch.isfinite(tensor).all().item())
 
 
+def select_best_candidate(profileDF):
+    """Pick the winning row of a profile frame, and say what ranked it.
+
+    ``_us_ep``, when present, is the production-op time under EP geometry for
+    the top few dense candidates (see ``_ep_rescore_topn``), so it decides the
+    winner. ``us`` stays the dense stage1+stage2 sum the CSV has always
+    carried; under EP the two can disagree badly, so ranking on ``us`` would
+    throw away the measurement that was just taken.
+    """
+    rank_col = "_us_ep" if "_us_ep" in profileDF.columns else "us"
+    return profileDF.loc[profileDF[rank_col].idxmin()].copy(), rank_col
+
+
+def build_ep_routing(token, topk, expert, ep_size, device="cuda", seed=0):
+    """Routing for one rank of an EP-``ep_size`` deployment.
+
+    The tuner's usual routing is dense: ``token`` rows, every one of them live,
+    each picking ``topk`` of this rank's ``expert`` experts. An EP rank sees
+    something quite different. The all2all leaves a receive buffer padded to
+    ``token`` rows (the shape CUDA graphs captured), tokens route over
+    ``expert * ep_size`` *global* experts, and a token only lands here if at
+    least one of its picks is one of ours -- so most rows carry no work and the
+    live ones carry ~``topk / ep_size`` pairs instead of ``topk``.
+
+    That is not a smaller version of the dense batch, it is a differently
+    shaped one, and it selects different kernels: a non-None ``expert_mask``
+    puts stage2 on the atomic-accumulate path and disqualifies the fused
+    ``_adaptive_moe_sort`` shortcut, while ``num_local_tokens`` truncates the
+    launch so blocks covering the padded tail exit immediately.
+
+    Delivered rows are packed to the front and the tail is filled with the
+    sentinel id ``expert * ep_size``, because ``num_local_tokens`` is a prefix
+    length rather than a mask. ``recv`` is counted from the sampled routing
+    rather than predicted from its expected value, so the two can never
+    disagree.
+
+    Routing is uniform and independent across tokens, which reproduces the
+    right average occupancy but no expert imbalance. ``seed`` makes a given
+    shape always produce the same draw, so two runs stay comparable.
+
+    Mask convention follows vLLM's ``determine_expert_map``: 0/1 over the
+    global ids plus a trailing 0 for the sentinel slot.
+
+    Returns ``(topk_ids, topk_weights, expert_mask, num_local_tokens, recv)``.
+    """
+    g_experts = expert * ep_size
+    gen = torch.Generator(device=device).manual_seed(seed)
+    # argsort of uniform noise is a uniform permutation, so the first topk
+    # columns are a uniform random topk-subset of the global experts.
+    glob = torch.argsort(
+        torch.rand((token, g_experts), generator=gen, device=device),
+        dim=1,
+    )[:, :topk].to(dtypes.i32)
+    delivered = (glob < expert).any(dim=1)
+    recv = int(delivered.sum())
+    topk_ids = torch.full((token, topk), g_experts, dtype=dtypes.i32, device=device)
+    topk_ids[:recv] = glob[delivered]
+    topk_weights = torch.full(
+        (token, topk), 1.0 / topk, dtype=dtypes.fp32, device=device
+    )
+    expert_mask = torch.zeros(g_experts + 1, dtype=dtypes.i32, device=device)
+    expert_mask[:expert] = 1
+    num_local_tokens = torch.tensor([recv], dtype=dtypes.i32, device=device)
+    return topk_ids, topk_weights, expert_mask, num_local_tokens, recv
+
+
 def _parse_tuning_type(value):
     if isinstance(value, (torch.dtype, ActivationType, QuantType)):
         return value
@@ -2813,7 +2879,9 @@ class FmoeTuner(TunerCommon):
             use_g1u1,
             _doweight_stage1,
         ) = key
-        if us == self.INVALID_TIME or us == self.INF_TIME:
+        if us == self.INVALID_TIME or us == self.INF_TIME or not us > 0:
+            # post_process sums us1+us2, and INVALID_TIME is -1, so a pair with
+            # one invalid stage lands on <=0 rather than on either sentinel.
             return 0, 0
         flop = 0
         data_bytes = 0
@@ -4939,8 +5007,34 @@ class FmoeTuner(TunerCommon):
                 w1_qt_fmoe.is_shuffled = True
                 w2_qt_fmoe.is_shuffled = True
 
-                score = torch.randn((token, expert), dtype=dtype, device="cuda")
-                topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
+                # TUNE_MOE_EP_SIZE=N benchmarks the shape the way an EP-N server
+                # runs it instead of as a dense batch. Unset (the default) keeps
+                # the dense path every other model tunes against.
+                #
+                # Under EP the all2all leaves a receive buffer padded to `token`
+                # rows, of which only the ones whose global route hit one of this
+                # rank's `expert` experts are delivered; those are packed first and
+                # num_local_tokens marks where they end. Passing expert_mask is what
+                # puts stage2 on the EP accumulate path and keeps the sort off the
+                # fused _adaptive_moe_sort shortcut, so without it the benchmark
+                # resolves to a different kernel pair than production runs.
+                # Mask convention is vLLM's: 0/1 over globals plus a 0 sentinel
+                # (expert_map_manager.determine_expert_map).
+                ep_size = int(os.environ.get("TUNE_MOE_EP_SIZE", "0"))
+                expert_mask = None
+                num_local_tokens = None
+                if ep_size > 1:
+                    topk_ids, topk_weights, expert_mask, num_local_tokens, ep_recv = (
+                        build_ep_routing(token, topk, expert, ep_size)
+                    )
+                    # torch_moe_2stages needs no EP handling for the routing: its
+                    # expert loop runs over range(w1.shape[0]), so remote globals
+                    # and the sentinel never match and contribute zero, which is
+                    # the semantics the masked kernel implements.
+                else:
+                    ep_recv = None
+                    score = torch.randn((token, expert), dtype=dtype, device="cuda")
+                    topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
                 if q_type == QuantType.per_1x128:
                     a1_qt, a1_scale = aiter.pertoken_quant(
                         hidden.view(token, -1, 128), quant_dtype=q_dtype_a
@@ -4982,6 +5076,9 @@ class FmoeTuner(TunerCommon):
                     w2_qt_fmoe,
                     topk_weights,
                     topk_ids,
+                    expert_mask,
+                    num_local_tokens=num_local_tokens,
+                    moe_sorting_dispatch_policy=0,
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
@@ -5029,6 +5126,14 @@ class FmoeTuner(TunerCommon):
                     doweight_stage1=doweight_stage1,
                     swiglu_limit=swiglu_limit,
                 )
+                if ep_recv is not None:
+                    # num_local_tokens truncates the kernel at the delivered rows,
+                    # so the padded tail of the output buffer is never written and
+                    # holds whatever was in the allocation. The server never reads
+                    # it either (combine only gathers delivered rows), so compare
+                    # the live rows only.
+                    out = out[:ep_recv]
+                    ref = ref[:ep_recv]
                 if not _all_finite(out) or not _all_finite(ref):
                     diag = tensor_compare_diagnostics(ref, out)
                     status = f"error:nonfinite output or reference; {diag}"
@@ -5346,6 +5451,172 @@ class FmoeTuner(TunerCommon):
         if agnostic.empty:
             return profileDF
         return pd.concat([profileDF, agnostic.assign(nt=1)], ignore_index=True)
+
+    def _write_fmoe_candidate_config(self, row):
+        """One-row tuned CSV so fused_moe dispatches exactly this candidate."""
+        rec = {c: row[c] for c in self.columns if c in row.index}
+        for c in ("act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type"):
+            if c in rec:
+                rec[c] = str(rec[c])
+        # delete=False on purpose: the path outlives the handle.
+        tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w",
+            suffix=".csv",
+            prefix="aiter_fmoe_candidate_",
+            delete=False,
+            newline="",
+        )
+        try:
+            pd.DataFrame([rec], columns=self.columns).to_csv(tmp.name, index=False)
+            return tmp.name
+        finally:
+            tmp.close()
+
+    def _ep_rescore_topn(self, profileDF, key, args):
+        """Settle the best dense candidates on the production op under EP.
+
+        Candidate timing is dense and stage-isolated: every row routed, no
+        expert_mask, no num_local_tokens, stage1 and stage2 clocked apart. An
+        EP-N server instead delivers ~N times fewer (token, expert) pairs into a
+        buffer padded to the full token count, accumulates stage2 atomically
+        because expert_mask is set, and truncates at num_local_tokens. That
+        reorders the field rather than scaling it: the 10/23 DEP8 CSV won the
+        dense ranking while understating its own cost by 1.7-2.8x, and was 2x
+        slower than the heuristic in the server
+        (results/10_26/moe_tuning/retune/README.md).
+
+        Shrinking `token` to match the pairs per expert is not a fix -- that is
+        what 10/23 did. Only the real geometry is the real geometry, and
+        run_config already builds it under TUNE_MOE_EP_SIZE, so reuse it: the
+        rescoring and the accept gate then measure the same thing by
+        construction.
+
+        Scoring all ~1200 candidates this way would take hours, so the dense
+        pass stays as a prefilter and only the top TUNE_MOE_EP_RESCORE_TOPN are
+        settled honestly. That assumes the true winner survives the prefilter,
+        which is the one assumption left in this design -- widen N if a shape
+        looks suspicious.
+
+        Adds a `_us_ep` column (NaN for rows not rescored). Returns profileDF
+        unchanged when disabled or when nothing could be measured.
+        """
+        topn = int(os.environ.get("TUNE_MOE_EP_RESCORE_TOPN", "0"))
+        ep_size = int(os.environ.get("TUNE_MOE_EP_SIZE", "0"))
+        if topn <= 0 or ep_size <= 1 or len(profileDF) == 0:
+            return profileDF
+
+        from aiter.jit import core as jit_core
+
+        env_name = self.get_arg_defaults().get("config_env_name")
+        if not env_name:
+            return profileDF
+        (
+            _gfx,
+            _cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = key
+        one_shape = pd.DataFrame(
+            [
+                {
+                    "token": int(token),
+                    "model_dim": int(model_dim),
+                    "inter_dim": int(inter_dim),
+                    "expert": int(expert),
+                    "topk": int(topk),
+                    "act_type": str(act_type),
+                    "dtype": str(dtype),
+                    "q_dtype_a": str(q_dtype_a),
+                    "q_dtype_w": str(q_dtype_w),
+                    "q_type": str(q_type),
+                    "use_g1u1": int(use_g1u1),
+                    "doweight_stage1": int(doweight_stage1),
+                }
+            ]
+        )
+        cand = profileDF.nsmallest(topn, "us")
+        print(
+            f"  EP rescore: settling top {len(cand)} of {len(profileDF)} candidates"
+            f" on the production op at EP{ep_size}"
+        )
+        saved_untunedf = getattr(self, "untunedf", None)
+        saved_env = os.environ.get(env_name)
+        measured = {}
+        try:
+            self.untunedf = one_shape
+            for idx, row in cand.iterrows():
+                cfg_path = self._write_fmoe_candidate_config(row)
+                try:
+                    os.environ[env_name] = cfg_path
+                    # No AITER_REBUILD here: kernels are cached per kernelName and
+                    # only the config lookup has to see the new file, so clearing
+                    # these two caches is enough and keeps a rescore to seconds.
+                    self._clear_op_caches()
+                    jit_core.AITER_CONFIGS.get_config_file.cache_clear()
+                    resolved = jit_core.AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+                    if os.path.abspath(resolved) != os.path.abspath(cfg_path):
+                        raise RuntimeError(
+                            "candidate config did not take effect, fused_moe"
+                            f" resolved {resolved}"
+                        )
+                    res = self.run_config(args)
+                except Exception as e:  # noqa: BLE001
+                    print(f"    {row['kernelName2']}: rescore failed: {e}")
+                    continue
+                finally:
+                    os.remove(cfg_path)
+                if not res:
+                    continue
+                status = str(res[0].get("status", ""))
+                us_ep = float(res[0].get("e2e_us", -1))
+                if status != "ok" or not us_ep > 0:
+                    print(f"    {row['kernelName2']}: rejected ({status})")
+                    continue
+                measured[idx] = round(us_ep, 4)
+                print(
+                    f"    {row['kernelName1']} + {row['kernelName2']}"
+                    f" blockM={row['block_m']}: dense {row['us']} us"
+                    f" -> EP e2e {measured[idx]} us"
+                )
+        finally:
+            self.untunedf = saved_untunedf
+            if saved_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = saved_env
+            self._clear_op_caches()
+            jit_core.AITER_CONFIGS.get_config_file.cache_clear()
+
+        if not measured:
+            print(
+                "  EP rescore: no candidate measured cleanly, falling back to the"
+                " dense ranking"
+            )
+            return profileDF
+        # A candidate row whose key does not match the lookup makes fused_moe
+        # fall back to the heuristic, which would score every candidate
+        # identically and quietly turn this into a no-op. Distinct kernels on a
+        # real op do not land within 1% of each other.
+        vals = list(measured.values())
+        if len(vals) > 2 and (max(vals) - min(vals)) < 0.01 * (sum(vals) / len(vals)):
+            print(
+                "  EP rescore WARNING: all candidates measured within 1%"
+                f" ({min(vals)}-{max(vals)} us). The per-candidate config is"
+                " probably not being dispatched; treat this ranking as suspect."
+            )
+        profileDF = profileDF.copy()
+        profileDF["_us_ep"] = pd.Series(measured, dtype="float64")
+        return profileDF
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         profileDF = []
@@ -5992,6 +6263,7 @@ class FmoeTuner(TunerCommon):
             if "v2" in profileDF.columns:
                 profileDF = profileDF.drop(columns=["v2"])
             profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
+            profileDF = self._ep_rescore_topn(profileDF, key, args)
             results = profileDF.apply(
                 lambda row: self.calculate(
                     (
@@ -6018,10 +6290,15 @@ class FmoeTuner(TunerCommon):
                     old_df = pd.DataFrame(columns=self.columns)
                 tmpprofileDF = pd.concat([old_df, profileDF], ignore_index=True)
                 tmpprofileDF.to_csv(args.profile_file, index=False)
-            best_one = profileDF.loc[profileDF["us"].idxmin()].copy()
-            print(
-                f"Tuning result for {key} is {best_one['block_m'], best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'], best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
+            best_one, rank_col = select_best_candidate(profileDF)
+            ep_note = (
+                f", EP e2e {best_one['_us_ep']} us" if rank_col == "_us_ep" else ""
             )
+            print(
+                f"Tuning result for {key} is {best_one['block_m'], best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'], best_one['run_1stage']} {best_one['us']} us{ep_note}, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
+            )
+            if "_us_ep" in best_one.index:
+                best_one = best_one.drop(labels=["_us_ep"])
             best_one["act_type"] = str(best_one["act_type"])
             best_one["q_type"] = str(best_one["q_type"])
             best_one["dtype"] = str(best_one["dtype"])
