@@ -87,6 +87,7 @@ if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
+TDM_EARLY_TIMEOUT = int(os.environ.get("AITER_FLYDSL_TDM_EARLY_TIMEOUT", "1"))
 if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 if PLANAR_LDS not in (0, 1):
@@ -99,6 +100,8 @@ if FORCE_1X4_CLUSTER not in (0, 1):
     raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
 if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
+if TDM_EARLY_TIMEOUT not in (0, 1):
+    raise ValueError("AITER_FLYDSL_TDM_EARLY_TIMEOUT must be 0 or 1")
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
@@ -278,6 +281,7 @@ def launch_gemm_a8w4_tdm(
         stage1_act,
         has_bias,
         TDM_DESCRIPTOR_VERSION,
+        TDM_EARLY_TIMEOUT,
         stage1_quant_out,
         quant_wmma_rep,
         cluster_n,
@@ -472,6 +476,7 @@ def launch_gemm_a8w4_tdm(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
+    _early_timeout = "_et0" if not TDM_EARLY_TIMEOUT else ""
     _kname = (
         f"a8w4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -481,7 +486,7 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_early_timeout}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -806,7 +811,7 @@ def launch_gemm_a8w4_tdm(
                 num_warps=nw,
                 # Descriptor bit 21: release to the peers already present and
                 # re-broadcast later, so early arrivals are not held for a merge.
-                early_timeout=bool(wg_mask is not None),
+                early_timeout=bool(wg_mask is not None and TDM_EARLY_TIMEOUT),
                 cache_modifier=cache_modifier,
                 **pad_kw,
             )
