@@ -3,6 +3,7 @@
 
 import torch
 import torch.distributed as dist
+import triton
 
 from aiter.ops.triton._gluon_kernels.gfx1250.comms.fused.all_reduce_rmsnorm_quant import (
     _all_reduce_rmsnorm_kernel,
@@ -38,7 +39,7 @@ def all_reduce_rmsnorm_quant(
         quant (bool): Also return q, out as fp8, and scale, one fp32 value for
             each 128 values.
         inboxes, calls: The result of ``all_reduce_init``, for this op and one
-            hidden size only.
+            hidden size only, with max_bytes of 2 rows or more.
     """
     tokens, hidden = x.shape
     assert x.dtype == residual.dtype == weight.dtype == torch.bfloat16
@@ -49,7 +50,9 @@ def all_reduce_rmsnorm_quant(
     first = _HIDDEN.setdefault(calls.data_ptr(), hidden)
     assert first == hidden, f"these inboxes serve hidden {first}, not {hidden}"
     slot = 4 * _LINES * ((calls.numel() - 1) // 2)  # as in all_reduce_init
-    assert tokens * hidden <= slot, "x is larger than max_bytes"
+    triples = triton.cdiv(tokens, 3)  # a program sends or receives 3 rows
+    # A triple is 2 * hidden int32 words of inbox.
+    assert 2 * hidden * triples <= slot, "x is larger than max_bytes"
 
     _LOGGER.info("ALL_REDUCE_RMSNORM_QUANT [gluon]: x=%s quant=%s", x.shape, quant)
 
@@ -61,8 +64,8 @@ def all_reduce_rmsnorm_quant(
         scale = torch.empty(
             (tokens, hidden // 128), dtype=torch.float32, device=x.device
         )
-    programs = min(tokens, _ROW_PROGRAMS)
-    _all_reduce_rmsnorm_kernel[(tokens + programs,)](
+    programs = min(triples, _ROW_PROGRAMS)
+    _all_reduce_rmsnorm_kernel[(triples + programs,)](
         x,
         residual,
         weight,

@@ -28,7 +28,8 @@ def _hi(word):
 @gluon.jit
 def _lines(x, value, mask0, mask1, mask2, PLANE: gl.constexpr, counter):
     """Advances the call counter. Returns the call and the lines of 2 units [x[value],
-    x[value + PLANE], x[value + 2 PLANE], tag], with 0 for the values out of a mask."""
+    x[value + PLANE], x[value + 2 PLANE], tag], with 0 for the values out of a mask.
+    For value [n, c], line h * n + i has the units of columns 2h and 2h + 1 of row i."""
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     call = gl.load(counter) % (1 << 30) + 1
     # Buffer loads: a mask does not make a branch.
@@ -41,7 +42,10 @@ def _lines(x, value, mask0, mask1, mask2, PLANE: gl.constexpr, counter):
     b1 = v1.to(gl.int16, bitcast=True).to(gl.int32) << 16
     b2 = v2.to(gl.int16, bitcast=True).to(gl.int32) & 65535
     tag = call % 32768 + 1
-    lines = gl.reshape(gl.join(b1 | b0, tag << 16 | b2), [value.shape[0], 4])
+    N: gl.constexpr = value.shape[0]
+    H: gl.constexpr = value.shape[1] // 2  # lines of a row
+    lines = gl.reshape(gl.join(b1 | b0, tag << 16 | b2), [N, H, 4])
+    lines = gl.reshape(gl.permute(lines, (1, 0, 2)), [H * N, 4])
     return call, gl.convert_layout(lines, LINE, assert_trivial=True)
 
 
@@ -95,14 +99,12 @@ def _poll(
     late = 1
     it = 0
     while (late > 0) & (it < MAXIT):
-        old = gl.zeros([pos.shape[0], 2], gl.int32, WORDS)
+        # All loads first, then the checks: the loads of the 3 peers overlap.
         for r in gl.static_range(4):
             if r != RANK:
                 lines = gl.amd.cdna5.buffer_load(
                     inbox, bank + r * SLOT + pos, mask=mask, other=empty, cache=".cv"
                 )
-                _, hi = _unit_words(lines)
-                old += (hi & -65536) != tag << 16
                 if r == 0:
                     l0 = lines
                 elif r == 1:
@@ -111,6 +113,11 @@ def _poll(
                     l2 = lines
                 else:
                     l3 = lines
+        old = gl.zeros([pos.shape[0], 2], gl.int32, WORDS)
+        for r in gl.static_range(4):
+            if r != RANK:
+                _, hi = _unit_words((l0, l1, l2, l3)[r])
+                old += (hi & -65536) != tag << 16
         # Keeps the loads in the loop.
         gl.inline_asm("", "~{memory}", [], [], is_pure=False)
         late = gl.sum(gl.sum(old, axis=1), axis=0)
