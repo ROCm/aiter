@@ -14,35 +14,35 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import Int32, Int64, T, as_ir_value
+from flydsl.expr.typing import Int32, Int64, T
 
-from aiter.ops.flydsl.dcp_mailbox.ops import (
+from aiter.ops.flydsl.dcp_mailbox.common import (
     CM_DEV,
-    _hw_f32,
+    KernelAbi,
     bf2_f32,
     bf16_pair,
     hw_exp2,
+    hw_f32,
+    key_tuple,
     ld_dev,
     ld_i32,
     load_ptr64,
+    pair_layout,
+    peer_bases,
     rsrc,
     traced,
     uniform,
 )
 from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
-from aiter.ops.flydsl.dcp_mailbox.plan import (
-    KernelAbi,
-    key_tuple,
-    pair_layout,
-    source_digest,
-)
-from aiter.ops.flydsl.dcp_mailbox.ranks import peer_bases
-from aiter.ops.flydsl.dcp_mailbox.sync import Mailbox, preg, shift
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.communication_ops_utils import (
+    TaggedMailbox,
+    atomic_add_agent,
+    tagged_peer_address,
+    tagged_shift,
+)
 
 MAX_THREADS = 1024
 TAG_SLOTS = 256
@@ -51,7 +51,6 @@ NEG_INF = float("-inf")
 POS_INF = float("inf")
 LN2 = 0.6931471805599453
 
-_SOURCES = source_digest(".")
 _STREAM = fx.Stream(None)
 _BUILDS: dict = {}
 
@@ -100,30 +99,14 @@ ABI = KernelAbi(
 )
 
 
-def _atomic_add_agent(addr, v):
-    """Agent-scope atomic add of the i32 at ``addr``. Returns the old value."""
-    ptr = llvm.IntToPtrOp(
-        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr))
-    ).result
-    return fx.Int32(
-        llvm.AtomicRMWOp(
-            llvm.AtomicBinOp.add,
-            ptr,
-            as_ir_value(fx.Int32(v)),
-            llvm.AtomicOrdering.monotonic,
-            syncscope="agent",
-        ).result
-    )
-
-
 def _log(x):
     f = getattr(fmath, "log", None)
-    return f(x) if f is not None else _hw_f32("llvm.amdgcn.log.f32", x) * LN2
+    return f(x) if f is not None else hw_f32("llvm.amdgcn.log.f32", x) * LN2
 
 
 def _log2(x):
     f = getattr(fmath, "log2", None)
-    return f(x) if f is not None else _hw_f32("llvm.amdgcn.log.f32", x)
+    return f(x) if f is not None else hw_f32("llvm.amdgcn.log.f32", x)
 
 
 def _row_empty(b, seqs, seq_lens, qsl):
@@ -213,7 +196,7 @@ def _finish(tid, state, e, nblk):
     """The last CTA advances the epoch for the next launch."""
     gpu.barrier()
     if tid == 0:
-        old = _atomic_add_agent(state + fx.Int64(4), 1)
+        old = atomic_add_agent(state + fx.Int64(4), 1)
         if old == nblk - 1:
             bo.buffer_store(fx.Int32(0), rsrc(state), 1, cache_modifier=CM_DEV)
             bo.buffer_store(e + 1, rsrc(state), 0, cache_modifier=CM_DEV)
@@ -228,7 +211,7 @@ def build(key: CombineBuild):
     nblk = key.tokens * hl
     lay = peer_layout(n, mt, hl, d)
     half = peer_bytes(n, mt, hl, d) // 2
-    keyed = key_tuple(key, _SOURCES)
+    keyed = key_tuple(key)
     name = (
         f"aiter_dcp_lse_combine_t{key.tokens}_n{n}_h{hl}_d{d}_m{mt}"
         f"_s{key.seqs}_e{int(key.base_e)}_l{int(key.ret_lse)}"
@@ -258,15 +241,19 @@ def build(key: CombineBuild):
         b = bid // hl
         lh = bid % hl
         e = uniform(fx.Int32(ld_dev(state, 0)))
-        mb = Mailbox((e % (1 << 22)) * TAG_SLOTS)
+        mb = TaggedMailbox((e % (1 << 22)) * TAG_SLOTS)
         put, put_words, poll = mb.put, mb.put_words, mb.poll
         flip = fx.Int64(e % 2) * half
         bases = peer_bases(peers, n)
         own = load_ptr64(peers, rank)
-        data = [shift(preg(p, lay["data"][0], "data"), flip) for p in bases]
-        lsep = [shift(preg(p, lay["lse"][0], "lse"), flip) for p in bases]
-        own_data = shift(preg(own, lay["data"][0], "data"), flip)
-        own_lse = shift(preg(own, lay["lse"][0], "lse"), flip)
+        data = [
+            tagged_shift(tagged_peer_address(p, lay["data"][0]), flip) for p in bases
+        ]
+        lsep = [
+            tagged_shift(tagged_peer_address(p, lay["lse"][0]), flip) for p in bases
+        ]
+        own_data = tagged_shift(tagged_peer_address(own, lay["data"][0]), flip)
+        own_lse = tagged_shift(tagged_peer_address(own, lay["lse"][0]), flip)
         slot = (rank * mt + b) * hl + lh
         j = tid * 2
         ws = [
