@@ -7,7 +7,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .kernels.tensor_shim import ptr_arg
+from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 __all__ = [
     "flydsl_mla_decode_reduce",
@@ -231,7 +231,8 @@ def _run_pagesize1(
         cp_world_size if cp_round_robin else 1,
         cp_rank if cp_round_robin else 0,
     )
-    launch(
+    _run_compiled(
+        launch,
         *buffers,
         num_q_heads,
         max_seqlen_q,
@@ -240,7 +241,16 @@ def _run_pagesize1(
         write_final_lse,
         num_cus,
         lds_size,
-        stream=stream,
+        stream,
+        specialization_key=(
+            num_q_heads,
+            max_seqlen_q,
+            causal,
+            cp_round_robin,
+            write_final_lse,
+            num_cus,
+            lds_size,
+        ),
     )
 
 
@@ -432,7 +442,8 @@ def flydsl_mla_pagesize64_fp8_fp8(
     if stream is None:
         stream = torch.cuda.current_stream(q.device)
     output_type = fx.BFloat16 if num_splits == 1 else fx.Float32
-    launch_mla_pagesize64_fp8_fp8(
+    _run_compiled(
+        launch_mla_pagesize64_fp8_fp8,
         ptr_arg(split_data, output_type),
         ptr_arg(split_lse, fx.Float32),
         ptr_arg(q, fx.Int8),
@@ -448,7 +459,8 @@ def flydsl_mla_pagesize64_fp8_fp8(
         batch,
         num_splits,
         int(num_splits == 1),
-        stream=stream,
+        stream,
+        specialization_key=int(num_splits == 1),
     )
 
 
@@ -475,7 +487,8 @@ def flydsl_mla_decode_reduce(
     if stream is None:
         stream = torch.cuda.current_stream(out.device)
     out_type = fx.BFloat16 if out_dtype == "bf16" else fx.Float16
-    launch(
+    _run_compiled(
+        launch,
         ptr_arg(split_data, fx.Float32),
         ptr_arg(split_lse, fx.Float32),
         ptr_arg(seqused_k, fx.Int32),
@@ -484,6 +497,6 @@ def flydsl_mla_decode_reduce(
         seqused_k.numel(),
         num_splits,
         num_tokens_per_seq,
-        stream=stream,
+        stream,
     )
     return out
