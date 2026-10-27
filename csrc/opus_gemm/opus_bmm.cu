@@ -20,7 +20,7 @@
 #include "opus_gemm_utils.cuh"  // bf16_t / fp32_t
 #include "aiter_stream.h"
 
-#include <unordered_map>
+#include <map>
 #include <utility>
 
 #ifdef OPUS_BUILD_HAS_GFX950
@@ -60,7 +60,6 @@ opus_bmm_a8w8_mxscale_exact_dispatch(const std::pair<int, int>& key)
               "the codegen maps; rebuild with AITER_REBUILD=1 after a codegen edit");
   return it->second;
 }
-#endif  // OPUS_BUILD_HAS_GFX950
 
 // (GROUP_N, GROUP_K) for a kid: 128 for the DSv4 block, 32 for the MX one.
 // Built from the same generated table as the dispatch, so a kid cannot be
