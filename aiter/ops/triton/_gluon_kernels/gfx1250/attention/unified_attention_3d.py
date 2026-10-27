@@ -1916,6 +1916,8 @@ unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
         "waves_per_eu",
         "num_stages",
         "ALL_DECODE",
+        "SPEC_DECODE",
+        "SEQLEN_Q",
         "SHUFFLED_KV_CACHE",
         "QUERY_DTYPE",
         "KV_CACHE_DTYPE",
@@ -1981,6 +1983,8 @@ def _unified_attention_gluon_kernel_3d(
     num_ctas: gl.constexpr = 1,  # int
     NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr = 1,  # int NUM_BLOCKS_GATHER_PER_TILE > 1 for TDM gather mode
     ALL_DECODE: gl.constexpr = False,  # bool
+    SPEC_DECODE: gl.constexpr = False,  # bool, every seq has SEQLEN_Q (> 1) queries
+    SEQLEN_Q: gl.constexpr = 1,  # int, the per-seq query count when SPEC_DECODE
     SHUFFLED_KV_CACHE: gl.constexpr = False,
     K_WIDTH: gl.constexpr = 0,  # int
     SCALE_K_WIDTH: gl.constexpr = 16,  # int
@@ -2035,6 +2039,19 @@ def _unified_attention_gluon_kernel_3d(
         q_block_local_idx: gl.int32 = 0
         cur_batch_query_len: gl.int32 = 1
         cur_batch_in_all_start_index: gl.int32 = q_block_global_idx
+    elif SPEC_DECODE:
+        # Every seq holds SEQLEN_Q queries, so the launch has exactly
+        # Q_BLOCKS_PER_SEQ blocks per seq and the program id alone locates the
+        # seq and the query block: no binary search, and no empty blocks.
+        Q_BLOCKS_PER_SEQ: gl.constexpr = (SEQLEN_Q + BLOCK_Q - 1) // BLOCK_Q
+        if Q_BLOCKS_PER_SEQ == 1:
+            seq_idx = q_block_global_idx
+            q_block_local_idx: gl.int32 = 0
+        else:
+            seq_idx = q_block_global_idx // Q_BLOCKS_PER_SEQ
+            q_block_local_idx = q_block_global_idx % Q_BLOCKS_PER_SEQ
+        cur_batch_query_len: gl.int32 = SEQLEN_Q
+        cur_batch_in_all_start_index = seq_idx * SEQLEN_Q
     else:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q, True

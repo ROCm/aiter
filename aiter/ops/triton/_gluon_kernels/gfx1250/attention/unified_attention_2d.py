@@ -1830,6 +1830,8 @@ unified_attention_gluon_kernel_2d_repr = make_kernel_repr(
         "HEAD_SIZE",
         "SLIDING_WINDOW",
         "ALL_DECODE",
+        "SPEC_DECODE",
+        "SEQLEN_Q",
         "SHUFFLED_KV_CACHE",
         "NUM_BUFFERS",
         "BLOCK_M",
@@ -1883,6 +1885,8 @@ def _unified_attention_gluon_kernel_2d(
     USE_LOAD_BUFFER_OP: gl.constexpr = False,
     USE_STORE_BUFFER_OP: gl.constexpr = False,
     ALL_DECODE: gl.constexpr = False,
+    SPEC_DECODE: gl.constexpr = False,  # every seq has SEQLEN_Q (> 1) queries
+    SEQLEN_Q: gl.constexpr = 1,  # the per-seq query count when SPEC_DECODE
     SHUFFLED_KV_CACHE: gl.constexpr = False,
     FP8_MIN: gl.constexpr = float8_info.min,
     FP8_MAX: gl.constexpr = float8_info.max,
@@ -1943,7 +1947,20 @@ def _unified_attention_gluon_kernel_2d(
         block_table_stride,
     )
 
-    if not ALL_DECODE:
+    if SPEC_DECODE:
+        # Every seq holds SEQLEN_Q queries, so the launch has exactly
+        # Q_BLOCKS_PER_SEQ blocks per seq and the program id alone locates the
+        # seq and the query block: no binary search, and no empty blocks.
+        Q_BLOCKS_PER_SEQ: gl.constexpr = (SEQLEN_Q + BLOCK_Q - 1) // BLOCK_Q
+        if Q_BLOCKS_PER_SEQ == 1:
+            seq_idx = q_block_global_idx
+            q_block_local_idx: gl.int32 = 0
+        else:
+            seq_idx = q_block_global_idx // Q_BLOCKS_PER_SEQ
+            q_block_local_idx = q_block_global_idx % Q_BLOCKS_PER_SEQ
+        cur_batch_query_len: gl.int32 = SEQLEN_Q
+        cur_batch_in_all_start_index = seq_idx * SEQLEN_Q
+    elif not ALL_DECODE:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
         )

@@ -307,8 +307,14 @@ def run_benchmark(custom, args):
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
                 shuffled_kv_cache=args.shuffled_kv_cache,
+                equal_seqlen_q=args.equal_seqlen_q,
                 backend=args.backend,
             )
+
+        if args.equal_seqlen_q:
+            assert (
+                seqlens_q == seqlens_q[0]
+            ).all(), "-equal_seqlen_q needs equal query lengths"
 
         ms = triton.testing.do_bench_cudagraph(fn)
 
@@ -438,6 +444,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Use equal sequence lengths (no varlen); default is random varlen",
+    )
+    parser.add_argument(
+        "-equal_seqlen_q",
+        action="store_true",
+        default=False,
+        help="Tell unified_attention every seq has the same query length "
+        "(spec-decode verify); needs -equal_seqlens",
     )
     parser.add_argument(
         "-fp8",
