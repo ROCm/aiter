@@ -21,7 +21,7 @@ from aiter.ops.triton.attention.pa_decode_sparse import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
-from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -185,10 +185,6 @@ def _mla_num_splits(
     if base_wg >= num_sms:
         return max(1, min(cta_cap, tiles // 16))
     return max(1, min(cta_cap, tiles, 8))
-
-
-# Output rows per CU above which SOFTMAX_FIX and PV_ORDER pay.
-_LOOP_BOUND_ROWS_PER_CU = 64
 
 
 class _Launch(NamedTuple):
@@ -911,16 +907,13 @@ def sparse_mla_fwd(
 
     # Gated on rows/CU, not prefill-vs-decode or workgroup count, so spec
     # decode clears the bar by row count alone.
+    # Output rows per CU above which DEFER_ROW_REDUCE and PV_ORDER pay.
+    _LOOP_BOUND_ROWS_PER_CU = 64
     rows_per_cu = num_queries * num_heads / max(1, get_num_sms())
-    softmax_fix = pv_order = rows_per_cu >= _LOOP_BOUND_ROWS_PER_CU
+    defer_row_reduce = pv_order = rows_per_cu >= _LOOP_BOUND_ROWS_PER_CU
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
-    # Decode keeps neighbouring rows on one XCD: a spec-decode request's rows read
-    # nearly the same KV rows and share its L2. Prefill rows gain nothing from it.
-    xcd_remap = (
-        get_num_xcds() if arch == "gfx950" and num_queries < _PREFILL_MIN_ROWS else 0
-    )
     grid = (num_queries, grid_splits, heads_blocks)
     _sparse_mla_gfx950[grid](
         q,
@@ -976,7 +969,6 @@ def sparse_mla_fwd(
         UNI_TILE=True,
         GRID_ORDER="qsh",
         Q_CACHE=q_cache,
-        XCD_REMAP=xcd_remap,
         main_num_splits=main_splits,
         ADAPTIVE_SPLITS=num_splits > 1,
         DEQ="none",
@@ -987,7 +979,7 @@ def sparse_mla_fwd(
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
         ASYNC_DBUF=async_dbuf,
-        SOFTMAX_FIX=softmax_fix,
+        DEFER_ROW_REDUCE=defer_row_reduce,
         PV_ORDER=pv_order,
         GATHER_CACHE="",
         KV_LDS_PAD=kv_lds_pad,

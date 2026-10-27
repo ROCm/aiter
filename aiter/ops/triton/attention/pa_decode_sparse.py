@@ -33,7 +33,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -823,18 +823,6 @@ def _pa_decode_sparse_gfx950_gluon(
         # Rows that share KV rows reuse them through the cache, so skip .cg.
         prefill_kw["GATHER_CACHE"] = ""
 
-    # One XCD (and L2) for programs that read the same KV rows: a row's head blocks,
-    # or neighbouring rows of bf16's 32/64-head programs without split-K. Not for
-    # SWA-only prefill or launches padded past the split count.
-    rows_share = heads_blocks > 1 or (staged_bf16 and BLOCK_M > 16 and num_splits == 1)
-    xcd_remap = (
-        get_num_xcds()
-        if rows_share and grid_splits == num_splits and (has_extra or not prefill)
-        else 0
-    )
-
-    # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
-    # workgroup id, so the axis order decides what shares an XCD's L2.
     grid = (num_queries, grid_splits, heads_blocks)
     _sparse_mla_gfx950[grid](
         q,
@@ -903,7 +891,6 @@ def _pa_decode_sparse_gfx950_gluon(
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
         UNPEEL=unpeel,
-        XCD_REMAP=xcd_remap,
         # Gather a tile ahead only for fp8_dsv4_mla's 32-head programs below prefill
         # size.
         DSV4_PREFETCH=packed_fp8 and BLOCK_M == 32 and not prefill,

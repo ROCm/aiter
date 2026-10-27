@@ -50,7 +50,6 @@ from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 from triton.language.target_info import is_hip_cdna4
 
-from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
@@ -384,7 +383,7 @@ class Cfg:
         IDX_CACHE="",
         ASYNC_LDS=False,
         ASYNC_DBUF=False,
-        SOFTMAX_FIX=False,
+        DEFER_ROW_REDUCE=False,
         PV_ORDER=False,
         RELAXED_LOAD=True,
         PAD_INTERVAL=1024,
@@ -423,8 +422,8 @@ class Cfg:
         self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
         self.ASYNC_DBUF = gl.constexpr(ASYNC_DBUF)
         self.PV_ORDER = gl.constexpr(PV_ORDER)
-        self.SUMDEFER = gl.constexpr(SOFTMAX_FIX)
-        self.LDSRED = gl.constexpr(SOFTMAX_FIX)
+        self.SUMDEFER = gl.constexpr(DEFER_ROW_REDUCE)
+        self.LDSRED = gl.constexpr(DEFER_ROW_REDUCE)
         self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
         self.SLOT_U32 = gl.constexpr(SLOT_U32)
         self.UNPEEL = gl.constexpr(UNPEEL)
@@ -2223,34 +2222,6 @@ def _epilogue_store(
     )
 
 
-@gluon.jit
-def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr, SPLIT_K: gl.constexpr):
-    """(query, split, head block) of this program, remapped with remap_xcd so
-    the programs that read the same KV rows share an XCD and its L2."""
-    n0 = gl.num_programs(0)
-    n1 = gl.num_programs(1)
-    n2 = gl.num_programs(2)
-    lid = gl.program_id(0) + n0 * (gl.program_id(1) + n1 * gl.program_id(2))
-    w = remap_xcd(lid, n0 * n1 * n2, NUM_XCDS)
-    nh = gl.num_programs(GRID_ORDER.index("h"))
-    ns = gl.num_programs(GRID_ORDER.index("s"))
-    if SPLIT_K:
-        # Rows in blocks of ceil(nq / NUM_XCDS), about one per XCD; split-major
-        # inside a block, head block fastest.
-        nq = gl.num_programs(GRID_ORDER.index("q"))
-        t = (nq + NUM_XCDS - 1) // NUM_XCDS
-        per = t * ns * nh
-        blk = w // per
-        i = w % per
-        rows = gl.minimum(t, nq - blk * t)
-        r = i % (rows * nh)
-        q, s, h = blk * t + r // nh, i // (rows * nh), r % nh
-    else:
-        # One split per row: row-major is the same order.
-        q, s, h = w // (nh * ns), (w // nh) % ns, w % nh
-    return q, s, h
-
-
 _sparse_mla_repr = make_kernel_repr(
     "_sparse_mla",
     ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "SPLIT_K", "MAIN_FMT", "ROPE_SEPARATE"],
@@ -2358,17 +2329,15 @@ def _sparse_mla(
     IDX_CACHE: gl.constexpr = _NO_CACHE,
     ASYNC_LDS: gl.constexpr = False,
     ASYNC_DBUF: gl.constexpr = False,
-    # SOFTMAX_FIX defers the row sum and reduces rows through LDS; both it and
-    # PV_ORDER only pay with enough rows in flight, so the launcher picks them.
-    SOFTMAX_FIX: gl.constexpr = False,
+    # DEFER_ROW_REDUCE defers the row sum and reduces rows through LDS; both it
+    # and PV_ORDER only pay with enough rows in flight, so the launcher picks them.
+    DEFER_ROW_REDUCE: gl.constexpr = False,
     PV_ORDER: gl.constexpr = False,
     RELAXED_LOAD: gl.constexpr = True,
     PAD_INTERVAL: gl.constexpr = 1024,
     SLOT_U32: gl.constexpr = False,
     KV_LDS_PAD: gl.constexpr = 0,
     UNPEEL: gl.constexpr = False,
-    # XCD count to remap program ids over (see _xcd_work); 0 keeps grid order.
-    XCD_REMAP: gl.constexpr = 0,
     # fp8_dsv4_mla walk: gather a tile ahead (see _dsv4_segment)
     DSV4_PREFETCH: gl.constexpr = False,
     # Output epilogue (no SPLIT_K; else the reduce's): INV_ROPE un-rotates the
@@ -2482,14 +2451,10 @@ def _sparse_mla(
     if CS0_ALIGN > 1:
         main_cs0 = gl.multiple_of(main_cs0, CS0_ALIGN)
         extra_cs0 = gl.multiple_of(extra_cs0, CS0_ALIGN)
-    # GRID_ORDER names the launch axes in grid-dim order; dim 0 varies fastest,
-    # which decides XCD/L2 sharing.
-    if XCD_REMAP > 0:
-        query_idx, split_id, pid_h = _xcd_work(GRID_ORDER, XCD_REMAP, SPLIT_K)
-    else:
-        query_idx = gl.program_id(GRID_ORDER.index("q"))
-        split_id = gl.program_id(GRID_ORDER.index("s"))
-        pid_h = gl.program_id(GRID_ORDER.index("h"))
+    # GRID_ORDER names the launch axes in grid-dim order.
+    query_idx = gl.program_id(GRID_ORDER.index("q"))
+    split_id = gl.program_id(GRID_ORDER.index("s"))
+    pid_h = gl.program_id(GRID_ORDER.index("h"))
 
     cfg = Cfg(
         BLOCK_M,
@@ -2507,7 +2472,7 @@ def _sparse_mla(
         IDX_CACHE,
         ASYNC_LDS,
         ASYNC_DBUF,
-        SOFTMAX_FIX,
+        DEFER_ROW_REDUCE,
         PV_ORDER,
         RELAXED_LOAD,
         PAD_INTERVAL,
