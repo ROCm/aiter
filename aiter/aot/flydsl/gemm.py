@@ -303,7 +303,7 @@ def _is_a4w4_row(row: dict) -> bool:
 
 
 def parse_csv(csv_path: str):
-    """Parse a GEMM tuned CSV and return its unique FlyDSL compile jobs.
+    """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs.
 
     Keeps only the GPU_ARCHS jobs, so setup.py's run_aot filters like main().
     """
