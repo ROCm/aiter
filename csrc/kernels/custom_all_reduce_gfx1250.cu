@@ -481,6 +481,37 @@ void all_reduce(fptr_t _fa,
 
 // ---- Fused allreduce + RMSNorm ----
 
+static void _validate_fused_allreduce_rmsnorm(const aiter_tensor_t& inp,
+                                              const aiter_tensor_t& res_inp,
+                                              const aiter_tensor_t& res_out,
+                                              const aiter_tensor_t& w)
+{
+    if(inp.dim() == 0 || res_inp.dim() == 0 || res_out.dim() == 0 ||
+       w.numel() == 0)
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires non-empty input and weight");
+    const size_t hidden = w.numel();
+    if(inp.numel() % hidden != 0 || inp.size(-1) != (int64_t)hidden ||
+       res_inp.numel() != inp.numel() || res_out.numel() != inp.numel() ||
+       res_inp.size(-1) != (int64_t)hidden || res_out.size(-1) != (int64_t)hidden)
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires matching dense input, residual, "
+            "output and weight shapes");
+    if(inp.dtype() != res_inp.dtype() || inp.dtype() != res_out.dtype() ||
+       inp.dtype() != w.dtype())
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires matching input, residual, "
+            "output and weight dtypes");
+    if(!inp.is_contiguous() || !res_inp.is_contiguous() || !res_out.is_contiguous() ||
+       !w.is_contiguous())
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires contiguous tensors");
+    if(inp.device_id != res_inp.device_id || inp.device_id != res_out.device_id ||
+       inp.device_id != w.device_id)
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires tensors on the same device");
+}
+
 static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      const aiter_tensor_t& inp,
                                      const aiter_tensor_t& res_inp,
@@ -492,17 +523,15 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      double eps,
                                      int64_t reg_ptr,
                                      int64_t reg_bytes,
-                                     bool gemma_norm)
+                                     bool gemma_norm,
+                                     bool use_1stage)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    _validate_fused_allreduce_rmsnorm(inp, res_inp, res_out, w);
     const int hidden   = (int)w.numel();
     const int tokens   = (int)(inp.numel() / hidden);
-    if((int)inp.size(-1) != hidden || (int)res_inp.size(-1) != hidden ||
-       (int)res_out.size(-1) != hidden)
-        throw std::runtime_error(
-            "gfx1250 fused allreduce rmsnorm requires input/residual width == weight width");
 
     void* actual_inp = inp.data_ptr();
     if(reg_ptr != 0)
@@ -524,7 +553,7 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                           reinterpret_cast<T*>(out),                      \
                                           reinterpret_cast<const T*>(w.data_ptr()),       \
                                           nullptr, nullptr, tokens, hidden, (float)eps,   \
-                                          gemma_norm);                                    \
+                                          gemma_norm, use_1stage);                         \
     else                                                                                  \
         fa->fused_allreduce_rmsnorm<T, opus::fp8_t>(                                      \
             stream,                                                                       \
@@ -534,7 +563,7 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             reinterpret_cast<opus::fp8_t*>(out),                                          \
             reinterpret_cast<const T*>(w.data_ptr()),                                     \
             scale_out, reinterpret_cast<T*>(bf16_out), tokens, hidden, (float)eps,        \
-            gemma_norm);                                                                  \
+            gemma_norm, use_1stage);                                                       \
     break
 
     switch(inp.dtype())
@@ -556,11 +585,16 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              double eps,
                              int64_t reg_ptr,
                              int64_t reg_bytes,
-                             bool /*use_1stage*/,
+                             bool use_1stage,
                              bool gemma_norm)
 {
+    if(out.numel() != inp.numel() || out.dtype() != inp.dtype() ||
+       !out.is_contiguous() || out.device_id != inp.device_id)
+        throw std::runtime_error(
+            "gfx1250 fused allreduce rmsnorm requires a matching contiguous output");
     _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out.data_ptr(), w,
-                             nullptr, nullptr, eps, reg_ptr, reg_bytes, gemma_norm);
+                             nullptr, nullptr, eps, reg_ptr, reg_bytes, gemma_norm,
+                             use_1stage);
 }
 
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
@@ -573,14 +607,23 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    double eps,
                                    int64_t reg_ptr,
                                    int64_t reg_bytes,
-                                   bool /*use_1stage*/,
+                                   bool use_1stage,
                                    bool gemma_norm,
                                    int64_t bf16_out_ptr)
 {
+    const size_t hidden = w.numel();
+    const size_t tokens = hidden == 0 ? 0 : inp.numel() / hidden;
+    if(out.numel() != inp.numel() || out.dtype() != AITER_DTYPE_fp8 ||
+       !out.is_contiguous() || out.device_id != inp.device_id ||
+       scale_out.numel() != tokens || scale_out.dtype() != AITER_DTYPE_fp32 ||
+       !scale_out.is_contiguous() || scale_out.device_id != inp.device_id)
+        throw std::runtime_error(
+            "gfx1250 fused quantized allreduce rmsnorm requires contiguous FP8 output "
+            "and one contiguous FP32 scale per token");
     _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out.data_ptr(), w,
                              reinterpret_cast<float*>(scale_out.data_ptr()),
                              reinterpret_cast<void*>(bf16_out_ptr), eps, reg_ptr, reg_bytes,
-                             gemma_norm);
+                             gemma_norm, use_1stage);
 }
 
 // ---- Sync latency measurement kernels ----

@@ -283,6 +283,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 "fused_allreduce_rmsnorm requires residual width == weight width, "
                 f"got residual_width={residual_n}, weight_width={n}"
             )
+        if input_.shape[:-1] != res_inp_.shape[:-1]:
+            raise RuntimeError(
+                "fused_allreduce_rmsnorm requires input and residual leading "
+                f"dimensions to match, got input_shape={tuple(input_.shape)}, "
+                f"residual_shape={tuple(res_inp_.shape)}"
+            )
         out_n = n
         if x_pad_to_multiple > 0:
             out_n = (n + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
@@ -475,8 +481,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_quant_no_prefill_max_bytes >= 0
             else 64 * 1024 * 1024
         )
+        ca_comm = self.ca_comm
         if (
-            (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and (
                 hidden_dim in [512, 1024, 2048, 4096]
                 or (
                     hidden_dim in [7168, 6144]
@@ -485,7 +494,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             and total_bytes <= fused_quant_bytes_limit
             and (prefill_support or total_bytes <= no_prefill_quant_bytes_limit)
-            and self.ca_comm.should_fuse_ar_rms(input_, hidden_dim, hidden_dim)
+            and ca_comm.should_fuse_ar_rms(input_, hidden_dim, hidden_dim)
+            and ca_comm.should_custom_ar(input_, prefill_support)
         ):
             total_bytes_limit = (
                 self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
@@ -495,12 +505,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 if self._ar_1stage_override is not None
                 else (total_bytes <= total_bytes_limit)
             )
-            result = self.ca_comm.custom_fused_ar_rms_quant(
+            result = ca_comm.custom_fused_ar_rms_quant(
                 input_,
                 res_inp_,
                 weight_,
                 eps,
                 use_1stage,
+                prefill_support=prefill_support,
                 gemma_norm=gemma_norm,
                 emit_bf16=emit_bf16,
             )

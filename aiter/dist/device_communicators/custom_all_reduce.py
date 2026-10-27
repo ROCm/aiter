@@ -352,10 +352,12 @@ except Exception as e:  # noqa: BLE001
 
 
 def is_weak_contiguous(inp: torch.Tensor):
-    return inp.is_contiguous() or (
-        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-        == inp.numel() * inp.element_size()
-    )
+    # The custom kernels flatten tensors and do not consume stride metadata.
+    # Merely occupying a contiguous storage span is not enough: a transpose of
+    # a full allocation has that property but a different logical element
+    # order. PyTorch's predicate still accepts contiguous views with a storage
+    # offset, which is the useful "weak" case this helper historically covered.
+    return inp.is_contiguous()
 
 
 def can_pack_2d_last_dim_slice(inp: torch.Tensor) -> bool:
@@ -1675,7 +1677,8 @@ class CustomAllreduce:
         # per 16 bytes of the row, at most 1024 threads.
         row_bytes = hidden_dim * inp.element_size()
         return (
-            is_weak_contiguous(inp)
+            inp.dtype in (torch.float16, torch.bfloat16)
+            and inp.is_contiguous()
             and inp.shape[-1] == hidden_dim == out_hidden_dim
             and row_bytes % 16 == 0
             and row_bytes // 16 <= 1024
@@ -2282,11 +2285,12 @@ class CustomAllreduce:
         weight: torch.Tensor,
         eps: float,
         use_1stage: bool,
+        prefill_support: bool = False,
         gemma_norm: bool = False,
         emit_bf16: bool = False,
     ):
         # when custom allreduce is disabled, this will be None
-        if self.disabled or not self.should_custom_ar(input):
+        if self.disabled or not self.should_custom_ar(input, prefill_support):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():

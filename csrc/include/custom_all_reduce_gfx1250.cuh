@@ -1676,7 +1676,8 @@ public:
                                  int tokens,
                                  int hidden,
                                  float eps,
-                                 bool gemma_norm)
+                                 bool gemma_norm,
+                                 bool use_1stage)
     {
         constexpr int pack_size = 16 / sizeof(T);
         if(hidden % pack_size != 0 || hidden / pack_size > 1024)
@@ -1692,7 +1693,7 @@ public:
         // Its three single-block barriers do not amortize at TP2 or narrow rows.
         // Each rank's reduced shard must fit its staging region.
         const bool two_stage =
-            world_size_ >= 4 && hidden >= kArRmsTwoStageMinHidden &&
+            !use_1stage && world_size_ >= 4 && hidden >= kArRmsTwoStageMinHidden &&
             hidden / pack_size % world_size_ == 0 &&
             bytes / world_size_ <= kArRmsShardBytes && bytes > kLLArMaxBytes;
 #define LAUNCH_AR_RMS(NG)                                                                   \
