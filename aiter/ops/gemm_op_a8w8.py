@@ -897,12 +897,16 @@ def _load_mxscale_bpreshuffle_tuned() -> dict:
     table for preshuffled weights."""
     path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
     df = with_mxscale_w_scale_block(pd.read_csv(path), path).drop_duplicates()
-    # A blank cell read as 128x128 can repeat a 128x128 row's shape.
+    # A blank cell read as 128x128 can repeat a 128x128 row's shape. Keep the
+    # fastest, as the merge does.
+    timed = "us" in df
+    if timed:
+        df = df.sort_values("us", kind="stable")
     repeated = df.duplicated(_MXSCALE_BPRESHUFFLE_KEYS)
     if repeated.any():
         logger.warning(
             f"{path}: {int(repeated.sum())} rows repeat a tuned shape; "
-            f"using the first row of each."
+            f"using the {'fastest' if timed else 'first'} row of each."
         )
         df = df[~repeated]
     return df.set_index(_MXSCALE_BPRESHUFFLE_KEYS).to_dict("index")

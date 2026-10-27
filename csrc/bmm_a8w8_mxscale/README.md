@@ -59,7 +59,8 @@ Compact OPUS kernels support `128x128` weight scales only; the existing
 OPUS families provide the `32x32` candidates.
 
 All dimensions must be positive integers. For `1x32`, N must be a multiple of
-16 and K a multiple of 128; other blocks require both multiples of 128.
+16 and K a multiple of 64 (OPUS needs 128; FlyDSL also runs K = 64 mod 128,
+e.g. 576); other blocks require both multiples of 128.
 Individual kernels impose additional tile, layout and split-K constraints;
 the tuner filters candidates for each shape. Weights use the `(16,16)`
 preshuffle layout, scales use ordinary E8M0 storage, and tuning uses BF16 output.

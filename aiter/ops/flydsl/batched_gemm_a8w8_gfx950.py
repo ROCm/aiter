@@ -31,6 +31,7 @@ import flydsl.expr as fx
 import torch
 from torch import Tensor
 
+from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.graph_alloc import persistent_alloc
 
@@ -256,6 +257,14 @@ def _require_config(name: str) -> MappingProxyType:
     return cfg
 
 
+@functools.cache
+def _warn_unrecognised(name: str) -> None:
+    logger.warning(
+        f"[FlyDSL gfx950 bmm] unrecognised kernelName {name!r}; "
+        "using the heuristic's pick"
+    )
+
+
 # The launcher's runtime parameters: seven pointers, M and the stream. Every
 # later one is a Constexpr, baked into the kernel it compiles.
 _RUNTIME_PARAMS = 9
@@ -333,8 +342,9 @@ def run_bmm_a8w8_mxfp8_gfx950(
     """``Out[m, b] = dequant(XQ[m, b]) @ dequant(WQ[b]).T``; writes into ``Out``
     and returns it. The e8m0 block edges (1x32 or 1x128 for ``x_scale``, 32x32
     or 128x128 for ``w_scale``) are read off the scale shapes. ``kernel_name``
-    is a tuned row's kernelName, else :func:`pick_bmm_kernel_name` chooses.
-    A ``w_scale`` block may also be a single row, 1x32 only.
+    is a tuned row's kernelName, else (or if it does not parse, with a
+    warning) :func:`pick_bmm_kernel_name` chooses. A ``w_scale`` block may
+    also be a single row, 1x32 only.
     x_scale_transposed (B = 1, 1x128 blocks) reads ``x_scale``'s bytes
     column-major, [K / 128, M], the blockscale convention, under its
     [M, 1, K / 128] shape; a single row takes the row-major kernel."""
@@ -381,6 +391,9 @@ def run_bmm_a8w8_mxfp8_gfx950(
     if m == 0:
         return Out
 
+    if kernel_name and _launch_config(kernel_name) is None:
+        _warn_unrecognised(kernel_name)
+        kernel_name = None
     name = kernel_name or pick_bmm_kernel_name(b, m, n, k, *scale_args)
     cfg = _require_config(name)
     stream = torch.cuda.current_stream(XQ.device)

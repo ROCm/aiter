@@ -600,17 +600,17 @@ def test_batched_untuned_1x32_matches_dequant(monkeypatch, m, k, backend):
 def test_mxscale_bpreshuffle_table_reads_blank_and_merged_cells(monkeypatch, tmp_path):
     """A blank w_scale_block cell, or the 0 a config merge fills a missing
     column with, reads as 128x128, in AOT and at runtime; a blank row that
-    repeats a 128x128 row's shape loads, and the first of the two is used."""
+    repeats a 128x128 row's shape loads, and the faster of the two is used."""
     from aiter.aot.flydsl import gemm as aot
     from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import make_mxfp8_8wave_kernel_name
 
     mxfp8 = make_mxfp8_8wave_kernel_name(2, 0)
     csv_path = tmp_path / "a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv"
     lines = [
-        "gfx,cu_num,M,N,K,w_scale_block,libtype,kernelId,kernelName",
-        f"gfx950,256,1,256,512,0,flydsl,mxfp8,{mxfp8}",
-        f"gfx950,256,1,512,512,,flydsl,mxfp8,{mxfp8}",
-        f"gfx950,256,1,512,512,128x128,flydsl,bmm,{BMM_ROW['kernelName']}",
+        "gfx,cu_num,M,N,K,w_scale_block,libtype,kernelId,us,kernelName",
+        f"gfx950,256,1,256,512,0,flydsl,mxfp8,5.0,{mxfp8}",
+        f"gfx950,256,1,512,512,,flydsl,mxfp8,5.0,{mxfp8}",
+        f"gfx950,256,1,512,512,128x128,flydsl,bmm,4.0,{BMM_ROW['kernelName']}",
     ]
     csv_path.write_text("\n".join(lines) + "\n")
     jobs = aot.parse_csv(str(csv_path))
@@ -630,9 +630,9 @@ def test_mxscale_bpreshuffle_table_reads_blank_and_merged_cells(monkeypatch, tmp
     for cache in caches:
         cache.cache_clear()
     try:
-        for n in (256, 512):
+        for n, kernel_id in ((256, "mxfp8"), (512, "bmm")):
             config = gemm_op_a8w8.get_mxscale_bpreshuffle_config(1, n, 512, "128x128")
-            assert config["kernelId"] == "mxfp8"
+            assert config["kernelId"] == kernel_id
     finally:
         for cache in caches:
             cache.cache_clear()
@@ -1012,6 +1012,41 @@ def test_bmm_rejects_wide_1_row_w_scale(monkeypatch):
             ws.view(1, *ws.shape),
             torch.empty((m, 1, w.shape[0]), dtype=torch.bfloat16),
         )
+
+
+def test_bmm_unrecognised_tuned_name_warns_and_runs_heuristic(
+    monkeypatch, tmp_path, capsys
+):
+    """A tuned kernelName that breaks a naming rule is skipped by AOT and runs
+    the heuristic's pick at runtime, with a warning on both sides."""
+    from aiter.aot.flydsl import gemm as aot
+    from aiter.ops.flydsl import batched_gemm_a8w8_gfx950 as gfx950
+
+    bad = "flydsl_bmm_mxfp8_mfma_t16x32x128_w1x2_nb4_sk2_xcd4"
+    assert gfx950.parse_bmm_kernel_name(bad) is None
+    csv_path = tmp_path / "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned.csv"
+    csv_path.write_text(
+        "gfx,b,m,n,k,w_scale_block,libtype,kernelId,kernelName\n"
+        f"gfx950,1,3,256,512,1x32,flydsl,0,{bad}\n"
+    )
+    assert aot.parse_csv(str(csv_path)) == []
+    assert f"Unknown FlyDSL BMM kernel name: {bad}" in capsys.readouterr().out
+
+    launched, warned = [], []
+    monkeypatch.setattr(gfx950, "_launch", lambda t, m, s, key: launched.append(key))
+    monkeypatch.setattr(gfx950.torch.cuda, "current_stream", lambda *a: None)
+    monkeypatch.setattr(gfx950, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(gfx950.logger, "warning", warned.append)
+    gfx950._warn_unrecognised.cache_clear()
+    x, w, xs, ws = _mxscale_operands(w_rows=1)
+    m, k = x.shape
+    operands = (x.view(m, 1, k), w.view(1, *w.shape), xs.view(m, 1, -1))
+    operands += (ws.view(1, *ws.shape),)
+    for name in (bad, None):
+        out = torch.empty((m, 1, w.shape[0]), dtype=torch.bfloat16)
+        gfx950.run_bmm_a8w8_mxfp8_gfx950(*operands, out, kernel_name=name)
+    assert launched[0] == launched[1]
+    assert len(warned) == 1 and bad in warned[0]
 
 
 def test_aot_bmm_rows_cover_their_dispatch(monkeypatch, tmp_path):

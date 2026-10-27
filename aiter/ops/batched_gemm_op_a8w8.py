@@ -441,12 +441,15 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
 
     * gfx950, 1x32: weight scales [G,N,K/32] and activation scales
       [M,G,K/32]. The tuned row's libtype, opus or flydsl; OPUS off the table
-      where one of its kids runs the shape (N a multiple of 16, K of 128, bf16
-      or fp32 out), else flydsl (bf16 out).
+      where one of its kids runs the shape (N a multiple of 16, K of 128),
+      else flydsl's heuristic.
     * gfx950, 32x32 or 128x128: the tuned row's libtype, opus or flydsl,
       whichever was faster at that shape; flydsl's heuristic off the table.
       DeepSeek-V4.1's original wo_a weight (32x32) and V4's (128x128) both run
       as is.
+    * gfx950, any block: flydsl writes bf16 only, so another output runs
+      OPUS (bf16 or fp32 out), even over a tuned flydsl row, and raises
+      NotImplementedError where no OPUS kid runs the shape.
     * gfx1250, 128x128: flydsl.
     * gfx1250, 32x32 or 1x32: flydsl's batched mxfp8_32 GEMM. A 32x32
       w_scale is read raw; a 1x32 one is [G, N, K/32] holding

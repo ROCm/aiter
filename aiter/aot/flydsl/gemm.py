@@ -229,6 +229,8 @@ def _bmm_mfma_job(
     layout serves every M bucket."""
     params = parse_bmm_kernel_name(kernel_name)
     if params is None:
+        # The runtime runs the heuristic's pick for such a row.
+        print(f"  [WARN] Unknown FlyDSL BMM kernel name: {kernel_name}, skipping")
         return None
     return {
         "kernel_name": kernel_name,
@@ -329,14 +331,13 @@ def parse_csv(csv_path: str):
             continue
 
         if row.get("b", "").strip():  # a batched row (may be in a mixed table)
-            job = None
-            if kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
-                job = _bmm_mfma_job(
-                    row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
-                )
-            if job is None:
+            if not kernel_name.startswith(f"{BMM_MFMA_NAME_PREFIX}_"):
                 batched_skipped.add(kernel_name)
-            elif job_identity(job) not in seen:
+                continue
+            job = _bmm_mfma_job(
+                row, kernel_name, int(row["b"]), int(row["n"]), int(row["k"])
+            )
+            if job is not None and job_identity(job) not in seen:
                 seen.add(job_identity(job))
                 jobs.append(job)
             continue
@@ -371,7 +372,9 @@ def parse_csv(csv_path: str):
             )
             for transposed in layouts:
                 job = _bmm_mfma_job(row, kernel_name, 1, n, k, transposed)
-                if job is not None and job_identity(job) not in seen:
+                if job is None:
+                    break
+                if job_identity(job) not in seen:
                     seen.add(job_identity(job))
                     jobs.append(job)
             continue
