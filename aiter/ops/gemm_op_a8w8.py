@@ -1162,6 +1162,14 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
+@functools.lru_cache(maxsize=1024)
+def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
+    logger.warning(
+        f"gemm_a8w8_blockscale_bpreshuffle N:{n}, K:{k} has asm-tuned rows, which "
+        f"only write bf16; {dtype} output uses the CK heuristic instead."
+    )
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
@@ -1192,6 +1200,19 @@ def gemm_a8w8_blockscale_bpreshuffle(
         Y = out
     else:
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    if (
+        x_scale.dtype == dtypes.fp8_e8m0
+        and w_scale.dtype == dtypes.fp8_e8m0
+        and tuple(x_scale.shape) == (m, k // 32)
+    ):
+        # group32 (1x32 row-major x_scale): the flydsl batched GEMM at B = 1
+        # when the running arch has a kernel for this w_scale block; flydsl
+        # picks it.
+        from .flydsl.batched_gemm_a8w8 import bmm_a8w8_mxfp8_supported
+
+        if bmm_a8w8_mxfp8_supported(mxscale_w_scale_block(tuple(w_scale.shape), n, k)):
+            return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y)
 
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         get_gfx() == "gfx1250"
@@ -1352,10 +1373,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
             )
         elif libtype == "asm":
-            splitK = config["splitK"]
-            return gemm_a8w8_blockscale_bpreshuffle_asm(
-                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
-            )
+            if dtype == dtypes.bf16:
+                splitK = config["splitK"]
+                return gemm_a8w8_blockscale_bpreshuffle_asm(
+                    XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+                )
+            _warn_blockscale_asm_row_not_bf16(n, k, dtype)
         elif libtype == "opus":
             kernelId = int(config["kernelId"])
             from aiter.ops.opus import opus_gemm

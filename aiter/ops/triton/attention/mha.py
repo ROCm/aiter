@@ -600,10 +600,11 @@ def _flash_attn_forward(
     # exp_scores [batch, num_q_heads, seqlen_q, seqlen_k]
     enable_dropout = dropout_p > 0.0
     if enable_dropout:
-        philox_seed = torch.randint(0, 0xFFFFFF, (1,))[
+        # Make the seeds on the CPU. A GPU tensor would sync the device in .item().
+        philox_seed = torch.randint(0, 0xFFFFFF, (1,), device="cpu")[
             0
         ].item()  # No specific reason to restrict range to 0xffffff
-        philox_offset = torch.randint(0, 0xFFFFFF, (1,))[
+        philox_offset = torch.randint(0, 0xFFFFFF, (1,), device="cpu")[
             0
         ].item()  # Pass in an int, not Tensor
     else:
