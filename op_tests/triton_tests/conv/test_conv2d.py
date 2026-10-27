@@ -622,9 +622,9 @@ def test_routed_padding_matches_reference(
     torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol)
     assert actual.dtype == dtype, "convolution output must preserve the input dtype"
     memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
-    assert actual.is_contiguous(memory_format=memory_format), (
-        f"expected contiguous {layout} output, got strides={actual.stride()}"
-    )
+    assert actual.is_contiguous(
+        memory_format=memory_format
+    ), f"expected contiguous {layout} output, got strides={actual.stride()}"
 
 
 def test_routed_padding_noop_preserves_zero_path(monkeypatch):
