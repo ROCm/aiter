@@ -235,6 +235,12 @@ def paged_attention_decode(
         if seq_partition_size != _SEQ_PARTITION_SIZE:
             use_v1 = False
             max_num_partitions = triton.cdiv(max_seq_len, seq_partition_size)
+    kv_blk_sz = key_cache.shape[2]
+    if kv_blk_sz & (kv_blk_sz - 1) or (not use_v1 and kv_blk_sz > _SEQ_PARTITION_SIZE):
+        raise ValueError(
+            f"KV block size {kv_blk_sz} is not supported: it must be a power of two, "
+            f"and at most {_SEQ_PARTITION_SIZE} when V2 is used"
+        )
     if k_scale.numel() > 1:
         if use_v1:
             paged_attn_decode_v1_per_token_quant(
