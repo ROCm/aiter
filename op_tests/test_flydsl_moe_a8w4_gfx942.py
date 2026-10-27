@@ -42,14 +42,21 @@ EXPERT, TOPK = 896, 16  # Kimi-K3 routed experts
 BETA, LINEAR_BETA = 4.0, 25.0  # Kimi-K3 SiTUv2
 
 
-def mxfp8_round(x):
-    """x rounded to MXFP8 E4M3FNUZ and back (exact in bf16): the a8w4 kernel's input."""
+def mxfp8_quant(x):
+    """x quantised to MXFP8 E4M3FNUZ in natural K order: ([M, K] fp8, [M, K / 32] e8m0),
+    the form a pre-quantised caller (e.g. an MXFP8 dispatch) passes as x + a1_scale."""
     M, K = x.shape
     q, e8m0 = mxfp8_quant_a8w4_gfx942_ref(x)
     # undo the a8w4 byte order (0,2,4,6,1,3,5,7) within each 8
     q = q.view(torch.float8_e4m3fnuz).view(M, K // 8, 2, 4).transpose(-1, -2)
-    scale = torch.exp2(e8m0.float() - 127).repeat_interleave(32, dim=1)
-    return (q.reshape(M, K).float() * scale).to(x.dtype)
+    return q.reshape(M, K).contiguous(), e8m0.view(dtypes.fp8_e8m0)
+
+
+def mxfp8_round(x):
+    """x rounded to MXFP8 E4M3FNUZ and back (exact in bf16): the a8w4 kernel's input."""
+    q, e8m0 = mxfp8_quant(x)
+    scale = torch.exp2(e8m0.view(torch.uint8).float() - 127).repeat_interleave(32, 1)
+    return (q.float() * scale).to(x.dtype)
 
 
 def run_torch(x, w1_qt, w2_qt, w1_scale, w2_scale, topk_weights, topk_ids, inter_dim):
@@ -120,7 +127,7 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
     w1_s8 = shuffle_weight_a8w4_gfx942(w1_s).view(w1_s.dtype)
     w1_sc8 = shuffle_scale_a8w4_gfx942(w1_sc).view(w1_sc.dtype)
 
-    def moe(a8w4):
+    def moe(a8w4, x=x, a1_scale=None):
         def f():
             # fused_moe reads the opt-in flag per call. Set it either way, so a flag
             # the caller already exported cannot turn the a16w4 candidate into a8w4,
@@ -142,6 +149,8 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
                     gate_mode=GateMode.SEPARATED.value,
                     beta=BETA,
                     linear_beta=LINEAR_BETA,
+                    a1_scale=a1_scale,
+                    dtype=dtype,
                 )
             finally:
                 if prev is None:
@@ -181,12 +190,54 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
         ret[f"{name} cos"] = cos_diff(ref, out)
+    # Pre-quantised x (MXFP8 + a1_scale, as from an MXFP8 dispatch): the moe_sort rows
+    # read it as is and must give the a8w4 output of bf16 x (up to the run-to-run
+    # order of the stage-2 sums, cos diff ~1e-5); the `_qi` rows (M <= 8) quantise x
+    # themselves and must refuse it instead of dropping its scales.
+    try:
+        out_q = moe(True, *mxfp8_quant(x))()
+    except ValueError as e:
+        assert "quantises x itself" in str(e), e
+        ret["a8w4 fp8 x"] = "refused"
+    else:
+        ret["a8w4 fp8 x"] = cos_diff(outs["a8w4"], out_q)
+        assert ret["a8w4 fp8 x"] < 1e-4, ret
     # the precision cost of the opt-in path: a8w4 vs the bf16-activation reference
     ret["a8w4 bf16 cos"] = cos_diff(ref_bf16, outs["a8w4"])
     assert ret["a16w4 cos"] < 1e-2, ret
     assert ret["a8w4 cos"] < 1e-3, ret
     assert ret["a8w4 bf16 cos"] < 1e-2, ret
     return ret
+
+
+def test_stage1_dispatch_by_name():
+    """Stage 1 runs the gfx942 a8w4 kernel only for the `_g942` names: any other
+    registered fp8 x fp4 stage-1 name (the gfx950 family is registered on every arch)
+    must raise on gfx942 instead of running this kernel on inputs meant for another."""
+    from aiter.fused_moe import _flydsl_stage1_wrapper
+    from aiter.ops.flydsl.moe_kernels import _KERNEL_PARAMS
+
+    name = next(
+        k
+        for k, v in _KERNEL_PARAMS.items()
+        if k.startswith("flydsl_moe1_")
+        and v.get("a_dtype") == "fp8"
+        and v.get("b_dtype") == "fp4"
+        and v.get("in_dtype") != "a8w4_gfx942"
+    )
+    E, model_dim, inter_dim = 4, 256, 128
+    x = torch.zeros((1, model_dim), dtype=dtypes.fp8)
+    w1 = torch.zeros((E, inter_dim * 2, model_dim // 2), dtype=torch.uint8)
+    ids = torch.zeros(32, dtype=torch.int32)
+    try:
+        _flydsl_stage1_wrapper(
+            x, w1, None, ids, ids[:2], ids[:1], None, TOPK, kernelName=name
+        )
+    except NotImplementedError as e:
+        assert "_g942" in str(e), e
+    else:
+        raise AssertionError(f"{name} ran the gfx942 a8w4 stage 1")
+    aiter.logger.info("non-_g942 fp8 x fp4 stage-1 name %s refused on gfx942", name)
 
 
 def main():
@@ -231,6 +282,8 @@ def main():
         help="model_dim,inter_dim (Kimi-K3 latent MoE; inter 512 = TP6, 384 = TP8)",
     )
     args = parser.parse_args()
+
+    test_stage1_dispatch_by_name()
 
     for dtype in args.dtype:
         df = [

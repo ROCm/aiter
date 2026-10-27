@@ -1547,6 +1547,8 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    in_dtype: str | None = None,
+    x_layout: str | None = None,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1655,22 +1657,35 @@ def _flydsl_moe_stage1_impl(
             w_layout="standard",
         )
         return inter_sorted
-    # gfx942 a8w4 (MXFP8 A x MXFP4 W). The gfx950 mixed_moe a8w4 kernels need the
-    # gfx950-only scaled f8f6f4 MFMA; on gfx942 this port decodes FP4 -> FP8 and runs
-    # the fp8 MFMA. `a` / `a1_scale` are fused_dynamic_mxfp8_quant_moe_sort's outputs
-    # (x_layout="moe_sort"), or, for the `_qi` names, the bf16 x with no scale, which
-    # the kernel quantises itself (x_layout="bf16"); w1 / w1_scale must be the a16w4
-    # preshuffle relaid by shuffle_{weight,scale}_a8w4_gfx942. Output is the a16w4 bf16
-    # intermediate [sorted_size, inter_dim] by sorted position, so stage 2 is the a16w4
-    # kernel.
-    if a_dtype == "fp8" and b_dtype == "fp4":
+    # gfx942 a8w4 (MXFP8 A x MXFP4 W), the `_g942` names (in_dtype="a8w4_gfx942"). The
+    # gfx950 mixed_moe a8w4 kernels need the gfx950-only scaled f8f6f4 MFMA; on gfx942
+    # this port decodes FP4 -> FP8 and runs the fp8 MFMA. `a` / `a1_scale` are
+    # fused_dynamic_mxfp8_quant_moe_sort's outputs (x_layout="moe_sort"), or, for the
+    # `_qi` names, the bf16 x with no scale, which the kernel quantises itself
+    # (x_layout="bf16"); w1 / w1_scale must be the a16w4 preshuffle relaid by
+    # shuffle_{weight,scale}_a8w4_gfx942. Output is the a16w4 bf16 intermediate
+    # [sorted_size, inter_dim] by sorted position, so stage 2 is the a16w4 kernel.
+    # The path is chosen by the kernel name, not by dtype and arch: any other fp8 x fp4
+    # name on gfx942 expects other weights and inputs, so it raises below.
+    if in_dtype == "a8w4_gfx942" or (a_dtype == "fp8" and b_dtype == "fp4"):
         from flydsl.runtime.device import get_rocm_arch
 
-        if str(get_rocm_arch()).startswith("gfx942"):
+        _gfx942 = str(get_rocm_arch()).startswith("gfx942")
+        if in_dtype != "a8w4_gfx942":
+            if _gfx942:
+                raise NotImplementedError(
+                    "fp8 x fp4 stage1 on gfx942 runs only the `_g942` kernels "
+                    "(in_dtype='a8w4_gfx942'), got a kernel for another arch"
+                )
+        else:
             from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
                 flydsl_a8w4_gemm1_gfx942,
             )
 
+            if not _gfx942:
+                raise NotImplementedError(
+                    f"gfx942 a8w4 stage1 runs on gfx942 only, got {get_rocm_arch()}"
+                )
             if not a8w4_gfx942_supported(dev):
                 raise NotImplementedError(
                     "gfx942 a8w4 stage1 is enabled on MI325X only: on MI300X it is "
@@ -1683,13 +1698,19 @@ def _flydsl_moe_stage1_impl(
                     f"no bias only (out_dtype={out_dtype}, k_batch={k_batch}, "
                     f"gate_mode={gate_mode}, bias={bias is not None})"
                 )
+            _x_dtype = {"bf16": torch.bfloat16, "moe_sort": dtypes.fp8}.get(x_layout)
+            if _x_dtype is None or a.dtype != _x_dtype:
+                raise ValueError(
+                    f"gfx942 a8w4 stage1 x_layout={x_layout!r} takes "
+                    f"{_x_dtype} x, got {a.dtype}"
+                )
             _act = "situv2" if act in ("situv2", "situ") else act
             sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
             _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
             inter_sorted = _alloc(
                 sorted_size, inter_dim, dtype=torch.bfloat16, device=dev
             )
-            _x_bf16 = a.dtype == torch.bfloat16
+            _x_bf16 = x_layout == "bf16"
             flydsl_a8w4_gemm1_gfx942(
                 a_fp8=a.contiguous(),
                 a_scale_u8=(
@@ -1716,7 +1737,7 @@ def _flydsl_moe_stage1_impl(
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
-                x_layout="bf16" if _x_bf16 else "moe_sort",
+                x_layout=x_layout,
             )
             return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
@@ -2075,6 +2096,8 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    in_dtype: str | None = None,
+    x_layout: str | None = None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -2132,6 +2155,8 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        in_dtype=in_dtype,
+        x_layout=x_layout,
     )
 
 

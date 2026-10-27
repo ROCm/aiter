@@ -2218,6 +2218,9 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        # select the gfx942 a8w4 kernel and its x input by name, not by dtype / arch
+        in_dtype=parsed.get("in_dtype"),
+        x_layout=parsed.get("x_layout"),
     )
 
 
@@ -4391,6 +4394,14 @@ def fused_moe_2stages(
         a1 = hidden_states
         a1_scale = None
     elif _is_a8w4_g942 and _s1_params.get("x_layout") == "bf16":
+        # The `_qi` stage 1 quantises x itself and has no input for x scales: a
+        # pre-quantised x (fp8 + a1_scale) cast to bf16 here would lose its scales.
+        if hidden_states.dtype not in (dtypes.bf16, dtypes.fp16):
+            raise ValueError(
+                "the gfx942 a8w4 stage 1 kernel "
+                f"{metadata.stage1.keywords.get('kernelName', '')} quantises x "
+                f"itself and takes bf16 / fp16 x, got {hidden_states.dtype}"
+            )
         a1 = hidden_states.to(dtypes.bf16)
         a1_scale = None
     elif (
