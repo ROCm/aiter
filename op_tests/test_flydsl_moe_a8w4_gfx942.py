@@ -19,6 +19,7 @@ Candidates (both through fused_moe):
 """
 
 import argparse
+import functools
 import itertools
 import os
 
@@ -295,10 +296,11 @@ def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
             num_experts_upper_bound=E,
         )
         a_scale = a_scale.view(torch.uint8)
-    out = torch.empty(
+    out = torch.zeros(
         (sorted_expert_ids.numel() * tile_m, inter_dim), dtype=dtypes.bf16
     )
-    flydsl_a8w4_gemm1_gfx942(
+    run = functools.partial(
+        flydsl_a8w4_gemm1_gfx942,
         a_fp8=a,
         a_scale_u8=a_scale,
         w1_u8=w1_s8.view(torch.uint8),
@@ -323,6 +325,17 @@ def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
         situ_linear_beta=LINEAR_BETA,
         x_layout=p["x_layout"],
     )
+    run()
+    # Decode runs under CUDA graphs, so the launch must be capturable (one compiled
+    # launcher per config: no module load / unload per call) and replay the same output.
+    eager = out.clone()
+    out.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager), (kernel_name, token, "graph replay differs")
     # the output is by sorted position: row i holds (token, slot) of sorted_ids[i]
     ids = sorted_ids[: int(num_valid_ids[0])].to(torch.int64)
     tok, slot = ids & 0xFFFFFF, ids >> 24
@@ -333,7 +346,10 @@ def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
     cos = cos_diff(ref, got)
     assert cos < 1e-3, (kernel_name, token, cos)
     aiter.logger.info(
-        "a8w4 gfx942 stage 1 %s M=%d vs torch: cos diff %.2e", kernel_name, token, cos
+        "a8w4 gfx942 stage 1 %s M=%d vs torch: cos diff %.2e (CUDA graph replay identical)",
+        kernel_name,
+        token,
+        cos,
     )
 
 

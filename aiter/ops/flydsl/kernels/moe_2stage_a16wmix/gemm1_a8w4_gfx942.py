@@ -780,7 +780,6 @@ def gemm1_a8w4_grid(BM, *, INTER, TILE_N, max_m_blocks):
 
 
 @functools.cache
-@functools.cache
 def _source_tag():
     """Hash of the sources this kernel's device code comes from, put in its name.
 
@@ -807,6 +806,7 @@ def _source_tag():
     return digest.hexdigest()[:12]
 
 
+@functools.cache
 def compile_gemm1_a8w4_gfx942(
     BM=16,
     *,
