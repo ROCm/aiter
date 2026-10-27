@@ -16,7 +16,7 @@ __device__ int32_t get_local_splits(int32_t seqlen_kv,
     int32_t ex_splits =
         seqlen_kv /
         196; // magic num 196. Experiments shows 196 per splits can get better performance.
-    return opus::min(opus::min(ex_splits, num_splits_per_cu), num_splits);
+    return opus::max(opus::min(opus::min(ex_splits, num_splits_per_cu), num_splits), 1);
 #endif
 }
 
