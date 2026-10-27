@@ -92,6 +92,33 @@ def test_legacy_topk_and_atom_candidates(monkeypatch, gfx, wave):
     assert len(support_calls) == (2 if gfx == "gfx950" else 0)
 
 
+@pytest.mark.parametrize("valid", [64, 41, 0])
+def test_route_skips_unrouted_pad_rows(valid):
+    """The router routes pad rows to expert -1, and a router-dropped HERD step
+    reaches the grouped MoE the same way: those routes take no grouped row."""
+    if get_gfx_runtime() not in ("gfx950", "gfx1250"):
+        pytest.skip("requires gfx950 or gfx1250")
+    from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_topids_to_rows
+
+    experts, topk, tokens = 256, 6, 64
+    max_m = tokens * topk
+    ids, _ = _candidates(tokens, experts, topk - 1)
+    ids[valid:] = -1
+    # The counter starts one element into its buffer, so a -1 route reaching
+    # the atomic lands in guard[0] instead of in someone else's memory.
+    guard = torch.zeros(experts + 1, device="cuda", dtype=torch.int32)
+    counts, rows = flydsl_moe_topids_to_rows(ids, experts, max_m, counter=guard[1:])
+    assert int(guard[0]) == 0, "a -1 route reached the per-expert counter"
+    hist = torch.bincount(ids[:valid].flatten().long(), minlength=experts)
+    torch.testing.assert_close(counts.long(), hist, rtol=0, atol=0)
+    assert (rows[valid:] == DROPPED_ROUTE_ROW).all()
+    expert = ids[:valid].long()
+    slot = rows[:valid].long() - expert * max_m
+    assert ((slot >= 0) & (slot < hist[expert])).all()
+    assert rows[:valid].unique().numel() == valid * topk
+
+
 @pytest.mark.parametrize("experts,topk", [(128, 4), (256, 6), (512, 16)])
 def test_grouped_route_psum_reuses_kernel_across_batches(experts, topk):
     if get_gfx_runtime() not in ("gfx950", "gfx1250"):
