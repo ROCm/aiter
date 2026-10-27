@@ -270,6 +270,35 @@ def test_asymmetric_schedule_window_contract(monkeypatch, kv_dtype, window, acce
             traits.PaDecodeSchedule.select(**kwargs)
 
 
+@pytest.mark.parametrize("heads", [1, 2, 4])
+@pytest.mark.parametrize(
+    "kv_dtype,scale_mode", [("bf16", "none"), ("fp8", "per-tensor")]
+)
+def test_asymmetric_tuning_cli_heads(heads, kv_dtype, scale_mode):
+    tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
+    args = tuning._parse_args(
+        [
+            "--head-dim",
+            "192",
+            "--value-dim",
+            "128",
+            "--query-length",
+            "8",
+            "--num-query-heads",
+            str(16 * heads),
+            "--num-kv-heads",
+            str(heads),
+            "--block-size",
+            "64",
+            "--kv-dtype",
+            kv_dtype,
+            "--scale-mode",
+            scale_mode,
+        ]
+    )
+    assert args.num_query_heads // args.num_kv_heads == 16
+
+
 @pytest.mark.parametrize("value_dim", [None, 128, 64])
 def test_gfx1250_value_width_dispatch(monkeypatch, value_dim):
     """The gfx1250 dispatcher must not silently ignore an asymmetric width."""
@@ -464,7 +493,22 @@ _ASYMMETRIC_WINDOW_CASES = [
     )
     for window in (1, 2, 4, 16, 17, 127, 257, 1024, 1025, 4097, 2**31 + 1)
 ]
+_ASYMMETRIC_MULTIHEAD_CASES = [
+    (
+        f"asymmetric-kv{heads}-w{window}",
+        {
+            **_ASYMMETRIC_WINDOW_CASES[0][1],
+            "kv_heads": heads,
+            "window": window,
+            "pattern": "varied",
+            "max_partitions": 4,
+            "lengths": (0, 1, 7, 8, 16, 17, 255, 257, 1027),
+        },
+    )
+    for heads, window in ((2, 0), (2, 4), (4, 128), (4, 2048))
+]
 _FP8_CASES = _COMMON_CASES + [
+    *_ASYMMETRIC_MULTIHEAD_CASES,
     *_ASYMMETRIC_WINDOW_CASES,
     (
         "asymmetric-large-window-grid",
@@ -592,6 +636,7 @@ _FP8_CASES = _COMMON_CASES + [
     ),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    *_ASYMMETRIC_MULTIHEAD_CASES,
     *_ASYMMETRIC_WINDOW_CASES,
     (
         "asymmetric-full",

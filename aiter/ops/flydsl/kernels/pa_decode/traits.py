@@ -188,7 +188,6 @@ class PaDecodeSchedule:
             and value_dim == 128
             and block_size == 64
             and query_group_size == 16
-            and num_kv_heads == 1
             and query_length == 8
             and trans_v
             and not per_token_kv

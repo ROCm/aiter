@@ -618,20 +618,17 @@ def pa_decode(
     if asymmetric_value and not (
         arch == "gfx950"
         and query.dtype == torch.bfloat16
-        and key_cache.dtype in (torch.float8_e4m3fn, torch.bfloat16)
         and query_length == 8
-        and sliding_window >= 0
         and head_dim == 192
         and value_dim == 128
         and block_size == 64
         and query_group_size == 16
-        and num_kv_heads == 1
         and trans_v
         and not per_token_kv
     ):
         raise NotImplementedError(
             "asymmetric value width requires gfx950 BF16 Q/O, scalar FP8 or "
-            "BF16 KV, Qlen8, GQA16, one KV head, page64, Q/K192-V128, "
+            "BF16 KV, Qlen8, GQA16, page64, Q/K192-V128, "
             "vectorized V, and full attention or a positive sliding window"
         )
     num_partitions = work_plan.max_partitions

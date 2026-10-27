@@ -485,16 +485,14 @@ def _parse_args(argv=None):
         and args.value_dim == 128
         and args.query_dtype == "bf16"
         and args.query_length == 8
-        and args.num_query_heads == 16
-        and args.num_kv_heads == 1
+        and args.num_query_heads // args.num_kv_heads == 16
         and args.block_size == 64
         and args.trans_v
         and args.scale_mode != "per-token"
-        and args.sliding_window >= 0
     ):
         parser.error(
-            "asymmetric dimensions require BF16 Q/O, Qlen8, GQA16 with one "
-            "KV head, page64, Q/K192-V128, --trans-v 1, scalar FP8 scales, "
+            "asymmetric dimensions require BF16 Q/O, Qlen8, GQA16, "
+            "page64, Q/K192-V128, --trans-v 1, scalar FP8 scales, "
             "and full attention or a positive sliding window"
         )
     if args.device < 0:
