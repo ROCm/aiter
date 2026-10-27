@@ -6,6 +6,7 @@
 
 AITER_CTYPES_ERROR_DEF
 
+// This producer has its own kernarg layout, separate from the shared fmoe ABI.
 // Performs gate/up projection, SiLU, in-register hidden MXFP4 quantization,
 // down projection and routing-weight multiplication. The compact contributions
 // are reduced separately in FP32 to produce the final output tensor.
@@ -14,18 +15,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     (aiter_tensor_t* out, aiter_tensor_t* partials, aiter_tensor_t* input,
      aiter_tensor_t* gate, aiter_tensor_t* down, aiter_tensor_t* sorted_ids,
      aiter_tensor_t* sorted_weights, aiter_tensor_t* sorted_experts,
-     aiter_tensor_t* counts, aiter_tensor_t* reverse_sorted,
+     aiter_tensor_t* counts,
      aiter_tensor_t* input_scale, aiter_tensor_t* gate_scale,
      aiter_tensor_t* down_scale, int topk, aiter_tensor_t* job_map, hipStream_t stream),
     (out, partials, input, gate, down, sorted_ids, sorted_weights,
-     sorted_experts, counts, reverse_sorted, input_scale, gate_scale,
+     sorted_experts, counts, input_scale, gate_scale,
      down_scale, topk, job_map, stream))
 {
     AITER_CHECK(input, "Q256 requires an input tensor");
     const HipDeviceGuard guard(input->device_id);
     AITER_CHECK(get_gpu_arch() == "gfx950", "Q256 requires gfx950");
     for(auto* tensor : {out, partials, input, gate, down, sorted_ids,
-                        sorted_weights, sorted_experts, counts, reverse_sorted,
+                        sorted_weights, sorted_experts, counts,
                         input_scale, gate_scale, down_scale})
         AITER_CHECK(tensor && tensor->is_contiguous() &&
                     tensor->device_id == input->device_id,
@@ -46,14 +47,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 input_scale->element_size() == 1 && gate_scale->element_size() == 1 &&
                 down_scale->element_size() == 1 && sorted_ids->dtype() == AITER_DTYPE_i32 &&
                 sorted_experts->dtype() == AITER_DTYPE_i32 && counts->dtype() == AITER_DTYPE_i32 &&
-                reverse_sorted->dtype() == AITER_DTYPE_i32 && sorted_weights->dtype() == AITER_DTYPE_fp32,
+                sorted_weights->dtype() == AITER_DTYPE_fp32,
                 "Unsupported Q256 tensor dtype");
     AITER_CHECK(input->size(0) == tokens && input->size(1) == model / 2 &&
                 gate->size(1) == 512 && gate->size(2) == model / 2 &&
                 down->size(0) == experts && down->size(1) == model && down->size(2) == 128 &&
                 partials->numel() == tokens * topk * model && sorted_weights->numel() == capacity &&
                 sorted_experts->numel() >= capacity / 256 && counts->numel() == 2 &&
-                reverse_sorted->numel() == tokens * topk &&
                 input_scale->numel() >= capacity * model / 32 &&
                 gate_scale->numel() == experts * 512 * model / 32 &&
                 down_scale->numel() == experts * model * 8,

@@ -747,7 +747,6 @@ def fmoe_q256_producer(
     sorted_weights: Tensor,
     sorted_experts: Tensor,
     counts: Tensor,
-    reverse_sorted: Tensor,
     input_scale: Tensor,
     gate_scale: Tensor,
     down_scale: Tensor,
@@ -772,7 +771,6 @@ def fmoe_q256(
     sorted_weights: Tensor,
     sorted_experts: Tensor,
     counts: Tensor,
-    reverse_sorted: Tensor,
     input_scale: Tensor,
     gate_scale: Tensor,
     down_scale: Tensor,
@@ -784,8 +782,13 @@ def fmoe_q256(
 
     The ASM producer writes BF16 contributions in token/top-k order. FlyDSL
     sums those contributions in FP32 and writes the final caller output.
-    Weighted scheduling adds a planner launch only for the exact 8192-token
-    geometry; adjacent counts in that tuning bucket use the compact producer.
+    The compact producer requires gfx950, separated shuffled MXFP4 weights,
+    intermediate width 256, model width >=512 divisible by 256, BF16 output
+    and 256-row sorting. Token IDs fit in 24 bits and top-k is at most 127.
+
+    Weighted scheduling additionally requires exactly 8192 tokens, model width
+    8192, 513 experts and top-k 11. It adds a planner launch; other token counts
+    in that tuning bucket use the compact producer.
     """
 
     tokens, model = out.shape
@@ -807,7 +810,6 @@ def fmoe_q256(
         sorted_weights,
         sorted_experts,
         counts,
-        reverse_sorted,
         input_scale,
         gate_scale,
         down_scale,
