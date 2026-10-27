@@ -36,6 +36,7 @@ from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_agent,
     load_i32_global_agent,
 )
+from aiter.ops.flydsl.kernels.kernels_common import set_slp_vectorize_once_used
 
 # Buffer-store cache policy SC1 (device scope): a fused split-K partial is
 # written through to the level every XCD shares, since a tile's splits run on
@@ -1790,3 +1791,12 @@ def launch_splitk_reduce(
     reduce_kernel(arg_tmp, arg_out, n_out_dw, slab_stride_dw).launch(
         grid=(gx, 1, 1), block=(_REDUCE_BLOCK, 1, 1), stream=stream
     )
+
+
+for _jit in (
+    _launch_gemm_impl,
+    launch_gemm,
+    launch_gemm_fused,
+    launch_splitk_reduce,
+):
+    set_slp_vectorize_once_used(_jit, False)
