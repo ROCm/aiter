@@ -564,6 +564,128 @@ def _mxfp4_inline_sort_unsupported(
     return ""
 
 
+# Internal benchmark/test hook (not a public switch): set True to keep the
+# separate sort launch so base-vs-head latency can be measured from one build.
+_mxfp4_sort_fold_disabled = False
+
+# (model_dim, inter_dim, experts, topk) the sort fold is validated and tuned
+# for: GLM-5.2 MXFP4 at TP8 (256 routed experts plus the fused shared expert).
+_MXFP4_SORT_FOLD_SHAPES = {(6144, 256, 257, 9)}
+# Token counts where the fold is measured faster. M 1-4 and 17-32 run other
+# tuned GEMM1 families; above 64 routes no longer fit the fold's LDS sort.
+_MXFP4_SORT_FOLD_M_RANGES = ((5, 16), (33, 64))
+
+
+def _mxfp4_sort_fold_row_supported(
+    model_dim, inter_dim, experts, topk, kernel_name1, kernel_name2
+):
+    """Whether a tuned row's kernels are the ones the sort fold reproduces:
+    the BM16 BN256 inline-quant NT GEMM1 and a layout-v2 BM16 GEMM2 with an
+    atomic or reduce epilogue."""
+    if (model_dim, inter_dim, experts, topk) not in _MXFP4_SORT_FOLD_SHAPES:
+        return False
+    try:
+        p1 = _parse_mxfp4_g1_kname(kernel_name1)
+    except (KeyError, TypeError, ValueError):
+        return False
+    p2 = parse_flydsl_v2_gemm2_kernel(kernel_name2)
+    return (
+        (p1["BM"], p1["BN"], p1["BK"]) == (16, 256, 256)
+        and p1["inline_quant"]
+        and p1["use_nt"]
+        and not p1["prefetch_hidden"]
+        and not p1["splitk"]
+        and p1["xcd_swizzle"] == 0
+        and p1["a_dtype"] == "fp4"
+        and p1["out_dtype"] == "fp4"
+        and p1["act"] == "silu"
+        and not p1["enable_bias"]
+        and p1["num_waves"] == 4
+        and p1["k_wave"] == 1
+        and p2 is not None
+        and p2["tile_m"] == 16
+        and p2["epilog"] in ("atomic", "reduce")
+    )
+
+
+def _use_mxfp4_sort_fold(
+    metadata,
+    hidden_states,
+    w1,
+    topk_ids,
+    topk_weight,
+    *,
+    model_dim,
+    inter_dim,
+    global_E,
+    output,
+    swiglu_limit,
+):
+    """Whether GEMM1 should build the BM16 aux sort itself (no sort launch).
+
+    Only called for a tuned inline-sort row that passed
+    :func:`_mxfp4_inline_sort_unsupported`, which already rules out EP,
+    num_local_tokens, activation scales, bias, padding and non-bf16 input.
+    """
+    if _mxfp4_sort_fold_disabled or _MOE_SORT_BACKEND in ("opus", "ck"):
+        return False
+    try:
+        if get_gfx_runtime() != "gfx950":
+            return False
+    except (KeyError, OSError, RuntimeError):
+        return False
+    M, topk = topk_ids.shape
+    if not any(lo <= M <= hi for lo, hi in _MXFP4_SORT_FOLD_M_RANGES):
+        return False
+    if global_E != w1.shape[0] or output is not None or swiglu_limit:
+        return False
+    if metadata.stage1.keywords.get("interleave", False):
+        return False
+    if not _mxfp4_sort_fold_row_supported(
+        model_dim,
+        inter_dim,
+        w1.shape[0],
+        topk,
+        metadata.stage1.keywords["kernelName1"],
+        metadata.stage2.keywords["kernelName2"],
+    ):
+        return False
+    return (
+        hidden_states.shape == (M, model_dim)
+        and topk_ids.dtype == dtypes.i32
+        and topk_weight.dtype == dtypes.fp32
+        and topk_weight.shape == topk_ids.shape
+        and topk_weight.is_contiguous()
+    )
+
+
+def _mxfp4_sort_fold_buffers(
+    topk_ids, num_experts, block_size, model_dim, dtype, accumulate
+):
+    """The buffers the BM16 aux sort returns, left for GEMM1 to fill."""
+    device = topk_ids.device
+    M, topk = topk_ids.shape
+    active = min(num_experts, M * topk)
+    max_sorted = (M * topk + active * (block_size - 1) + block_size - 1) // block_size
+    max_sorted *= block_size
+    moe_buf = (
+        torch.empty((M, model_dim), dtype=dtype, device=device)
+        if accumulate
+        else torch.empty((0, 0), dtype=dtype, device=device)
+    )
+    return (
+        torch.empty(max_sorted, dtype=dtypes.i32, device=device),
+        torch.empty(max_sorted, dtype=dtypes.fp32, device=device),
+        torch.empty(max_sorted // block_size, dtype=dtypes.i32, device=device),
+        torch.empty(2, dtype=dtypes.i32, device=device),
+        moe_buf,
+        # GEMM1 reads its rows from the in-kernel sort and the layout-v2
+        # stage 2 does not read these two; they only keep the aux contract.
+        torch.empty(max_sorted, dtype=dtypes.i32, device=device),
+        torch.empty(M * topk, dtype=dtypes.i32, device=device),
+    )
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -1831,22 +1953,49 @@ def _fused_moe_impl(
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        # BM16's adaptive sort already emits routes and zeroes the output without
-        # quantizing. Keep the Opus crossover for the configured aux pipeline.
-        sorting_ret = moe_sorting(
+        accumulate = _atomic and not runtime_stage2_reduce
+        if use_inline_sort and _use_mxfp4_sort_fold(
+            metadata,
+            hidden_states,
+            w1,
             topk_ids,
             topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            expert_mask,
-            num_local_tokens,
-            return_local_topk_ids=need_local_topk_ids,
-            accumulate=_atomic and not runtime_stage2_reduce,
-            output_aux=metadata.output_aux,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            global_E=global_E,
             output=output,
-        )
+            swiglu_limit=swiglu_limit,
+        ):
+            # GEMM1 sorts the routes and zeroes moe_buf in its own head
+            # (mxfp4_gemm1_sort_fold.py), so no sort kernel is launched.
+            sorting_ret = _mxfp4_sort_fold_buffers(
+                topk_ids, global_E, block_size_M, model_dim, dtype, accumulate
+            )
+            _stage1_extra_args = dict(_stage1_extra_args or {})
+            _stage1_extra_args["sort_fold"] = (
+                topk_ids,
+                topk_weight,
+                sorting_ret[1],
+                sorting_ret[4],
+            )
+        else:
+            # BM16's adaptive sort already emits routes and zeroes the output
+            # without quantizing. Keep the Opus crossover for the configured aux
+            # pipeline.
+            sorting_ret = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                return_local_topk_ids=need_local_topk_ids,
+                accumulate=accumulate,
+                output_aux=metadata.output_aux,
+                output=output,
+            )
         (
             sorted_ids,
             sorted_weights,
@@ -2593,6 +2742,7 @@ def _mxfp4_a4w4_stage1(
     k_wave=1,
     prefetch_hidden=False,
     prequantized=False,
+    sort_fold=None,
 ):
     if a_dtype == "fp8" and not inline_quant:
         if a_scale is None:
@@ -2669,6 +2819,30 @@ def _mxfp4_a4w4_stage1(
         device=device,
         dtype=inter_scale_dtype,
     )
+
+    if sort_fold is not None:
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1_sort_fold
+
+        topk_ids, topk_weights, sorted_weights, moe_buf = sort_fold
+        flydsl_mxfp4_gemm1_sort_fold(
+            w1_u8=w1,
+            w1_scale_u8=_mxfp4_scale_u8(w1_scale),
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            sorted_weights=sorted_weights,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum_tensor,
+            moe_buf=moe_buf,
+            inter_sorted_quant=inter_sorted_quant,
+            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+            NE=NE,
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            topk=topk,
+        )
+        return inter_sorted_quant, inter_sorted_shuffled_scale
 
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
@@ -2962,6 +3136,7 @@ def _mxfp4_a4w4_stage1_fw(
         k_wave=p1.get("k_wave", 1),
         prefetch_hidden=p1.get("prefetch_hidden", False),
         prequantized=prequantized,
+        sort_fold=_kwargs.get("sort_fold"),
     )
     return inter_sorted_quant, inter_sorted_scale
 
