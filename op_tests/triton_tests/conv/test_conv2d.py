@@ -26,6 +26,8 @@ scalar-parameter cases, 1 cache-clear case, and 2 inference-tensor cases.
 Convolution cases: 12 + 12 + 12 + 36 + 2 + 7 + 2 + 1 + 2 = 86.
 Padding preparation adds 20 focused cases for validation, boundary amounts,
 layout conversion, empty batches, no-op reuse, and delegation to F.pad.
+Routed padding integration adds 8 cases for numerical results across specialized
+routes and zero-padding bypass.
 
 The whole module is skipped without a supported GPU. Padding preparation itself
 does not require architecture-specific padding configurations.
@@ -53,7 +55,9 @@ from op_tests.triton_tests.conv._helpers import (
     CONV2D_WEIGHT_PACK_CACHE_NAMES,
     ORDERED_METHODS,
     TestSuite,
+    _winograd_tolerances,
     assert_weight_pack_cache_clear_is_scoped,
+    conv2d_padding_reference,
     dynamic_conv_tolerances,
     run_activations,
     run_cross_method,
@@ -488,3 +492,151 @@ def test_prepared_padding_handles_empty_batch():
     assert actual.dtype == source.dtype
     assert actual.device == source.device
     assert conv_padding == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "api,layout,route_name,filter_shape,stride,dilation,padding_mode,dtype",
+    [
+        (
+            "conv2d_nhwc",
+            "nhwc",
+            "ONE_X_ONE",
+            (1, 1),
+            (2, 1),
+            (1, 1),
+            "replicate",
+            torch.bfloat16,
+        ),
+        (
+            "conv2d_nchw",
+            "nchw",
+            "GENERAL",
+            (2, 3),
+            (1, 2),
+            (2, 1),
+            "circular",
+            torch.bfloat16,
+        ),
+        (
+            "conv2d",
+            "nchw",
+            "DIRECT_NCHW_3X3",
+            (3, 3),
+            (2, 1),
+            (1, 2),
+            "circular",
+            torch.float16,
+        ),
+        (
+            "conv2d_nchw",
+            "nchw",
+            "CBLOCKED_NCHW",
+            (3, 3),
+            (1, 2),
+            (2, 1),
+            "reflect",
+            torch.bfloat16,
+        ),
+        (
+            "conv2d",
+            "nhwc",
+            "NHWC_3X3",
+            (3, 3),
+            (2, 1),
+            (1, 2),
+            "replicate",
+            torch.float16,
+        ),
+        (
+            "conv2d",
+            "nchw",
+            "WF4X3_CBLOCKED",
+            (3, 3),
+            (1, 1),
+            (1, 1),
+            "replicate",
+            torch.bfloat16,
+        ),
+        ("conv2d", "nhwc", "WF4X3", (3, 3), (1, 1), (1, 1), "reflect", torch.bfloat16),
+    ],
+)
+def test_routed_padding_matches_reference(
+    monkeypatch,
+    api,
+    layout,
+    route_name,
+    filter_shape,
+    stride,
+    dilation,
+    padding_mode,
+    dtype,
+):
+    if route_name == "DIRECT_NCHW_3X3" and not conv2d_module.has_conv_config(
+        "CONV-3X3-NCHW"
+    ):
+        pytest.skip("direct NCHW 3x3 configuration is unavailable")
+    torch.manual_seed(0)
+    channels = 5 if route_name in ("GENERAL", "ONE_X_ONE") else 65
+    source = torch.randn(2, channels, 7, 9, device="cuda", dtype=dtype)
+    weight = torch.randn(17, channels, *filter_shape, device="cuda", dtype=dtype)
+    bias = torch.randn(17, device="cuda", dtype=dtype)
+    padding = (1, 2)
+    expected = conv2d_padding_reference(
+        source.float(),
+        weight.float(),
+        bias.float(),
+        stride,
+        padding,
+        dilation,
+        padding_mode,
+    ).relu()
+    method = {
+        "GENERAL": "general",
+        "WF4X3": "winograd_f4x3",
+        "WF4X3_CBLOCKED": "winograd_f4x3_cblocked",
+    }.get(route_name, "cblocked")
+    monkeypatch.setattr(conv2d_module, "_select_3x3_method", lambda *args: method)
+    monkeypatch.setattr(
+        conv2d_module,
+        "_nchw_direct_is_profitable",
+        lambda *args: route_name == "DIRECT_NCHW_3X3",
+    )
+    actual = getattr(conv2d_module, api)(
+        source,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        "relu",
+        layout if api == "conv2d" else 64,
+        padding_mode=padding_mode,
+    )
+
+    tolerances = (
+        _winograd_tolerances
+        if route_name.startswith("WF4X3")
+        else dynamic_conv_tolerances
+    )
+    rtol, atol = tolerances(dtype, channels * filter_shape[0] * filter_shape[1])
+    torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol)
+    assert actual.dtype == dtype, "convolution output must preserve the input dtype"
+    memory_format = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    assert actual.is_contiguous(memory_format=memory_format), (
+        f"expected contiguous {layout} output, got strides={actual.stride()}"
+    )
+
+
+def test_routed_padding_noop_preserves_zero_path(monkeypatch):
+    source = torch.randn(1, 64, 9, 11, device="cuda", dtype=torch.float16)
+    weight = torch.randn(17, 64, 3, 3, device="cuda", dtype=torch.float16)
+
+    def unexpected_pad(*args, **kwargs):
+        pytest.fail("zero-padding paths must not call F.pad")
+
+    monkeypatch.setattr(padding_ops.F, "pad", unexpected_pad)
+    baseline = conv2d_module.conv2d(source, weight, padding=0, layout="nhwc")
+    actual = conv2d_module.conv2d(
+        source, weight, padding=0, layout="nhwc", padding_mode="reflect"
+    )
+    torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
