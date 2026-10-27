@@ -2152,13 +2152,18 @@ def fused_moe_1stage(
             )
             return moe_buf
 
-        if is_q256_kernel(kernelName):
+        if isG1U1 and is_q256_kernel(kernelName):
             if a2_scale is not None:
                 raise ValueError("Q256 does not support caller-provided hidden scales")
-            from aiter.ops.moe_op import fmoe_q256
-
-            fmoe_q256(
-                moe_buf,
+            # The ASM stores one weighted BF16 row per token/topk slot.
+            # These partials are consumed once by the FP32 reduction.
+            partials = torch.empty(
+                (token_num, topk, model_dim),
+                dtype=dtypes.bf16,
+                device=moe_buf.device,
+            )
+            aiter.fmoe_g1u1(
+                partials.view(token_num, -1),
                 a1,
                 w1,
                 w2,
@@ -2166,11 +2171,16 @@ def fused_moe_1stage(
                 sorted_weights,
                 sorted_expert_ids,
                 num_valid_ids,
+                topk,
                 a1_scale,
                 w1_scale,
                 w2_scale,
-                topk,
-                kernelName=kernelName,
+                kernelName,
+                fc2_smooth_scale=None,
+                activation=activation,
+            )
+            _get_flydsl_moe_kernels()._run_moe_reduction(
+                partials, moe_buf, token_num, topk, model_dim, streaming_loads=True
             )
             return moe_buf
 
@@ -3778,7 +3788,14 @@ def get_2stage_cfgs(
 
     if cfg is not None and is_q256_kernel(kn1):
         q256_supported = (
-            q_dtype_a == dtypes.fp4x2
+            gfx == "gfx950"
+            and dtype == dtypes.bf16
+            and inter_dim == 256
+            and model_dim >= 512
+            and model_dim % 256 == 0
+            and 0 < topk <= min(127, expert)
+            and 0 < token < (1 << 24)
+            and q_dtype_a == dtypes.fp4x2
             and q_dtype_w == dtypes.fp4x2
             and q_type == QuantType.per_1x32
             and q_dtype_a2 in (None, dtypes.fp4x2)
