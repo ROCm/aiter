@@ -567,6 +567,8 @@ def test_mha_v4_rotated_fp8_quantization_rejects_noncontiguous_input():
         quantize_fp8_rotated(value)
 
 
+# The MX quantizers AITER_CHECK on gfx950, and that check aborts rather than raising.
+@skipif(get_gfx() != "gfx950", reason="gfx950 MX quantization")
 @parametrize(
     "quantize",
     [
@@ -771,9 +773,10 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe):
     )
 
 
+# LSE itself is gfx950-only, so the gfx942 arm of this pair never had a path to pass.
 @skipif(
-    get_gfx() not in ("gfx942", "gfx950"),
-    reason="gfx942/gfx950 FP8 recipe validation",
+    get_gfx() != "gfx950",
+    reason="gfx950 LSE",
 )
 @parametrize("recipe", ["fp8", "mxfp8", "mxfp4"])
 def test_mha_v4_lse_survives_k_common_mode(recipe):
@@ -1354,6 +1357,7 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
     assert spread < max_spread, f"per-chunk bias {biases} spans {spread:.4f} nats"
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
 def test_mha_v4_lse_is_gated_off_gfx950():
     """gfx942 carries the epilogue, but its exported value has never been measured.
 
@@ -2234,6 +2238,7 @@ def _launch_bf16_dense(q, out, seqlens_k=None, lse=None):
     )
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 per-batch key lengths")
 def test_mha_v4_launch_rejects_off_device_seqlens_k():
     """The launcher hands this pointer straight to the GPU, so it guards independently of Python."""
     q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
@@ -2243,6 +2248,7 @@ def test_mha_v4_launch_rejects_off_device_seqlens_k():
         _launch_bf16_dense(q, out, seqlens_k=torch.full((2,), 256, dtype=torch.int32))
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
 def test_mha_v4_launch_rejects_off_device_lse():
     """mha_v4_packed takes an LSE buffer from the caller and never checks where it lives."""
     q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)

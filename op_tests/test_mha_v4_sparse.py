@@ -1392,9 +1392,12 @@ mha_v4_packed(
 )
 """
     env = {**os.environ, "AITER_MHA_V4_VALIDATE_LUT": "1"}
+    # The probe imports op_tests, which lives beside this file. AITER_ROOT_DIR is the installed
+    # package under a wheel install and carries no op_tests at all.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     result = subprocess.run(
         [sys.executable, "-c", probe],
-        cwd=AITER_ROOT_DIR,
+        cwd=repo_root,
         env=env,
         text=True,
         capture_output=True,
