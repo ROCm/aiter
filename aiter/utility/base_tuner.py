@@ -626,9 +626,7 @@ class TunerCommon:
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
                 best_config = [
-                    TuneResult(
-                        (info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0
-                    )
+                    TuneResult((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)
                 ]
             bestConfigs.extend(best_config)
         resultdf = attach_power_columns(self.result_to_df(bestConfigs), bestConfigs)

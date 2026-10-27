@@ -272,7 +272,7 @@ def case_to_tuned_row(
             watts_f = float(watts)
         except (TypeError, ValueError):
             watts_f = float("nan")
-        if watts_f == watts_f:
+        if math.isfinite(watts_f):
             row["watts"] = round(watts_f, 3)
     return row
 
@@ -539,7 +539,9 @@ class K5BvTuner(TunerCommon):
         if not emitted:
             return []
         frame = pd.DataFrame(list(emitted.values()))
-        columns = [col for col in list(self.columns) + ["watts"] if col in frame.columns]
+        columns = [
+            col for col in list(self.columns) + ["watts"] if col in frame.columns
+        ]
         return frame.loc[:, columns].to_dict("records")
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
@@ -575,10 +577,8 @@ class K5BvTuner(TunerCommon):
                 results = results.drop(columns="_select_cost")
             else:
                 results = results.sort_values("us")
-            return (
-                results.drop_duplicates(subset=self.keys, keep="first").reset_index(
-                    drop=True
-                )
+            return results.drop_duplicates(subset=self.keys, keep="first").reset_index(
+                drop=True
             )
         return pd.DataFrame(columns=self.columns)
 

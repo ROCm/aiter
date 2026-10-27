@@ -19,7 +19,9 @@ def normalize_select(value) -> str:
 
 
 def power_selection_enabled(explicit=None) -> bool:
-    raw = explicit if explicit is not None else os.environ.get("AITER_SELECT", "latency")
+    raw = (
+        explicit if explicit is not None else os.environ.get("AITER_SELECT", "latency")
+    )
     return normalize_select(raw) == "power"
 
 
@@ -112,7 +114,12 @@ def attach_power_columns(df, results):
             except (TypeError, ValueError):
                 per_w.append(float("nan"))
                 continue
-            if math.isnan(tflops_f) or math.isnan(watts_v) or tflops_f <= 0 or watts_v <= 0:
+            if (
+                math.isnan(tflops_f)
+                or math.isnan(watts_v)
+                or tflops_f <= 0
+                or watts_v <= 0
+            ):
                 per_w.append(float("nan"))
             else:
                 per_w.append(round(tflops_f / watts_v, 6))

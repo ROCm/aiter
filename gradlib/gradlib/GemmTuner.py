@@ -813,7 +813,9 @@ class GemmTuner(GemmCommonTuner):
                 best_gtimedfs = pd.concat([best_gtimedfs, resultdf1], ignore_index=True)
 
             metric = "power" if power_selection_enabled() else "latency"
-            print(f"{key} >>> selected ({metric}) solution is \n {resultdf1}", flush=True)
+            print(
+                f"{key} >>> selected ({metric}) solution is \n {resultdf1}", flush=True
+            )
         return best_gtimedfs
 
     def save_profile(self, timedf, profile_file):

@@ -5654,7 +5654,9 @@ class FmoeTuner(TunerCommon):
                 .drop_duplicates(
                     ["stage", "block_m", "flat", "nt", "v2", "_is_fused"], keep="first"
                 )
-                .drop(columns=["_is_fused"] + (["_cost"] if sort_col == "_cost" else []))
+                .drop(
+                    columns=["_is_fused"] + (["_cost"] if sort_col == "_cost" else [])
+                )
             )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage", "flat"]
@@ -8532,7 +8534,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     watts_f = float("nan")
                 watt_text = (
                     f" watts={watts_f:.1f}"
-                    if watts_f == watts_f and watts_f > 0
+                    if math.isfinite(watts_f) and watts_f > 0
                     else ""
                 )
                 if not math.isfinite(float(us)) or us <= 0:
