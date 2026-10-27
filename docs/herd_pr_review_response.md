@@ -54,15 +54,17 @@ fused_moe(
 
 ## 3. bias 是否与融合量化错误绑定，是否有遗漏 epilogue
 
-已将 bias 加法统一放到 fp32 accumulator 准备阶段。所有输出分支直接使用已加 bias 的 fragments，避免合并时某个 epilogue 漏掉 bias helper 调用。
+保留 `5f88da51a4` 和 `e72fcd693d` 已有的 bias 实现。它们已经将 bias 与 fused requant 解耦，并让三个 epilogue 分支共用 `_biased_acc`。后续合并没有丢失这些修改；main 的 #6663 还补上了 bias 索引的 N tile 起点 `blk_n`。
 
-bias 原生读取 bf16/fp32/fp16，必要时转换为 fp32，再只加一次。索引包含 expert、N tile 起点 `blk_n`、wave 内 N 偏移和 fragment/lane 偏移。后续 `stage1_quant_out`、`stage1_act`、`ep_quant_bits` 都不控制 bias 是否添加：
+已撤回 `c704a7f8cd` 中额外的 accumulator 阶段 bias 前移重构。这项重构不是满足第 3 点 review 所必需的修复，新增测试、CI、路由门控及其他修改继续保留。
 
-| 输出分支 | 输入 accumulator |
+原实现按 bf16/fp32/fp16 原生读取 bias，必要时转为 fp32，并在三个分支分别调用同一 helper：
+
+| 输出分支 | bias 加法位置 |
 | --- | --- |
-| stage1 activation + fused requant | 已加 bias 的 fp32 fragments |
-| EP quantized scatter | 已加 bias 的 fp32 fragments，再进行 route weighting 和量化 |
-| bf16/fp16 activation 或普通 GEMM 输出 | 已加 bias 的 fp32 fragments |
+| stage1 activation + fused requant | activation 和 MX quantization 前 |
+| EP quantized scatter | route weighting 和量化前 |
+| bf16/fp16 activation 或普通 GEMM 输出 | activation 或输出 dtype 转换前 |
 
 新增 36 个 gfx1250 硬件组合：三种 bias dtype × requant 开/关 × SiLU/SwiGLU/SiTUv2 × stage 1/2。测试按专家和列生成不同 bias，将待验证 stage 的权重置零，使遗漏 bias 必须导致输出差异；PyTorch 参考使用同一 dtype 的逻辑 bias。测试同时覆盖多 N tile 的地址偏移。
 
