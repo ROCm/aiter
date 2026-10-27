@@ -275,7 +275,7 @@ static inline bool is_gfx1250_asm_a0_ok(const char* kernel_name)
     if(is_gfx1250_asm_supported() || is_gfx1250_asm_a0_ok(kernel_name))
         return;
     std::string msg = std::string(kernel_name ? kernel_name : "<unknown>") +
-                      " asm code object targets gfx1250 B0+; running device is gfx1250-strict/A0.";
+                      " asm code object targets gfx1250 B0+; running device is MI450 A0 (gfx1250-strict, or gfx1250 asicRevision 0).";
     std::cerr << "[AITER] " << msg << std::endl;
     throw std::runtime_error(std::move(msg));
 }

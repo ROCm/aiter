@@ -60,5 +60,5 @@ def require_gfx1250_asm(op_name: str) -> None:
         return
     raise RuntimeError(
         f"{op_name} asm is only supported on gfx1250 B0+ "
-        "(current device is gfx1250-strict/A0)."
+        "(current device is MI450 A0: gfx1250-strict, or gfx1250 asicRevision 0)."
     )
