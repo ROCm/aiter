@@ -37,16 +37,53 @@ from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 
 NK = 32  # decode key tile
 NO_WINDOW = 1 << 30
+_BUFFER_COPY = {
+    32: fx.rocdl.BufferCopy32b,
+    64: fx.rocdl.BufferCopy64b,
+    128: fx.rocdl.BufferCopy128b,
+}
+
+
+def _buffer_ptr(tensor, base):
+    """Buffer descriptor of `tensor` from element `base` on.
+
+    `base` must be wave-uniform; it is 64-bit, so a descriptor may start past
+    4 GiB of a cache, while offsets from it are 32-bit.
+    """
+    return fx.rocdl.make_buffer_ptr(fx.add_offset(fx.get_iter(tensor), base))
+
+
+def _rows(tensor, base):
+    """`_buffer_ptr(tensor, base)` as a view indexed by element; its extent is
+    nominal, as the descriptor spans 4 GiB."""
+    return fx.logical_divide(
+        fx.make_view(_buffer_ptr(tensor, base), fx.make_layout(1 << 30, 1)),
+        fx.make_layout(1, 1),
+    )
+
+
+def _buffer_load(rows, index, dtype, count):
+    """`count` values of `dtype` at element `index` of a `_rows` view."""
+    atom = fx.make_copy_atom(_BUFFER_COPY[count * dtype.width](), dtype)
+    reg = fx.make_rmem_tensor(count, dtype)
+    fx.copy(atom, fx.slice(rows, (None, fx.Int32(index))), reg)
+    return fx.Vector(reg.load())
+
+
+def _buffer_store(rows, index, values):
+    atom = fx.make_copy_atom(
+        _BUFFER_COPY[values.numel * values.dtype.width](), values.dtype
+    )
+    reg = fx.make_rmem_tensor(values.numel, values.dtype)
+    reg.store(values)
+    fx.copy(atom, reg, fx.slice(rows, (None, fx.Int32(index))))
 
 
 def _at(ptr, offset, alignment):
     """`ptr` moved by `offset` bytes, promising `alignment` bytes to LLVM.
 
-    Lanes load straight into MFMA operands in permuted orders, so offsets are
-    computed per lane instead of through layouts and copy atoms. Global
-    offsets are Int64 so caches above 4 GiB address correctly, and decode K/V
-    loads are non-temporal: UniversalCopy has no cache modifier, and
-    BufferCopy128b's 32-bit buffer offsets would truncate.
+    For LDS at XOR-swizzled offsets, and for decode K/V, whose loads must stay
+    non-temporal in decode-only launches.
     """
     byte = fx.add_offset(fx.recast_iter(fx.Int8, ptr), offset)
     return fx.recast_iter(
@@ -113,9 +150,9 @@ def _vt_offset(depth, key4, keys):
     return (depth // 32) * (32 * keys) + key4 * 128 + bank * 4
 
 
-def _sload(buf, index):
-    """One dword at a wave-uniform dword index, as an s_buffer_load."""
-    return fx.rocdl.s_buffer_load(buf, index)
+def _sload(buf, index, count=1):
+    """`count` dwords (1 or 4) at a wave-uniform dword index, as an s_buffer_load."""
+    return fx.rocdl.s_buffer_load(buf, index, count=count)
 
 
 def _transpose4(words):
@@ -322,8 +359,7 @@ def build_unified_attention_fp8_gfx942_module(
             )
             return log_scale, fx.Float32(fx.memref_load(VD, 0)) * (1.0 / 240.0)
 
-        qp, kp, vp, op = fx.get_iter(Q), fx.get_iter(K), fx.get_iter(V), fx.get_iter(O)
-        pp, btp = fx.get_iter(Part), fx.get_iter(BT)
+        kp, vp = fx.get_iter(K), fx.get_iter(V)
         splits = groups * waves
         sel_pair = (g % 2 == 0).select(fx.Int32(0x06020400), fx.Int32(0x03070105))
         sel_quad = (g < 2).select(fx.Int32(0x05040100), fx.Int32(0x03020706))
@@ -379,14 +415,19 @@ def build_unified_attention_fp8_gfx942_module(
                     pstart = (plow > 0).select(plow, fx.Int32(0)) // pn
                     pend = (plast_pos + pn) // pn
                     pqtok = ptile * tokens + wave * tpw + c // group
-                    psafe = (pqtok < pqlen).select(pqtok, fx.Int32(0))
                     pqpos = pqbase + pqtok
-                    phead = kvh * group + c % group
-                    pq_row = (fx.Int64(pq0) + fx.Int64(psafe)) * num_q_heads + fx.Int64(
-                        phead
-                    )
+                    # Q and O rows from the tile's first token at head
+                    # kvh * group; lane (c, g) adds its token and head.
+                    prow0 = (fx.Int64(pq0) + fx.Int64(ptile * tokens)) * num_q_heads
+                    prow0 = prow0 + fx.Int64(kvh * group)
+                    prow = (wave * tpw + c // group) * num_q_heads + c % group
+                    # A token past the sequence loads the tile's first token.
+                    psafe = (pqtok < pqlen).select(prow, c % group)
+                    pq_rows = _rows(Q, prow0 * dim)
                     pq_frag = [
-                        _load(qp, pq_row * dim + fx.Int64(ks * 32 + g * 8), fx.Int64, 8)
+                        _buffer_load(
+                            pq_rows, psafe * dim + ks * 32 + g * 8, fx.Int32, 2
+                        ).bitcast(fx.Int64)[0]
                         for ks in range(ksteps)
                     ]
 
@@ -401,6 +442,8 @@ def build_unified_attention_fp8_gfx942_module(
                     def p_clamp(block):
                         return fx.min(block, plast_blk)
 
+                    bt_rows = _rows(BT, fx.Int64(pseq) * fx.Int64(bt_stride))
+
                     def p_pages(block):
                         """Block-table entries of a tile's pages, clamped to the
                         last page. Uniform vector loads queue behind the K/V
@@ -408,20 +451,12 @@ def build_unified_attention_fp8_gfx942_module(
                         these."""
                         first = block * pn // page_size
                         return [
-                            _load(
-                                btp,
-                                (
-                                    fx.Int64(pseq) * fx.Int64(bt_stride)
-                                    + fx.Int64(
-                                        (first + h < plast_page).select(
-                                            first + h, plast_page
-                                        )
-                                    )
-                                )
-                                * 4,
+                            _buffer_load(
+                                bt_rows,
+                                (first + h < plast_page).select(first + h, plast_page),
                                 fx.Int32,
-                                4,
-                            )
+                                1,
+                            )[0]
                             for h in range(nslots)
                         ]
 
@@ -435,51 +470,43 @@ def build_unified_attention_fp8_gfx942_module(
                                 for p in pages
                             ]
 
-                        def src(base0, base, key, d, s_tok):
-                            # Past klen, reload the tile's first key: stale FNUZ
+                        def src(key, d, s_tok):
+                            # Past klen, reload the page's row at the tile start, a
+                            # valid key (pages clamp to the last one): stale FNUZ
                             # bytes can be NaN.
                             tok = base_tok + key
-                            ok = tok < pklen
-                            off = ok.select(tok, base_tok) & (page_size - 1)
-                            return (
-                                ok.select(base, base0)
-                                + fx.Int64(off) * s_tok
-                                + fx.Int64(d)
-                            )
+                            off = (tok < pklen).select(tok, base_tok) & (page_size - 1)
+                            return off * s_tok + d
 
                         kb, vb = bases(k_strides), bases(v_strides)
-                        vbase = (
-                            vb[0] if nslots == 1 else (vslot == 0).select(vb[0], vb[1])
+                        k_rows = [_rows(K, base) for base in kb]
+                        v_rows = _rows(
+                            V,
+                            vb[0] if nslots == 1 else (vslot == 0).select(vb[0], vb[1]),
                         )
                         kc = [
-                            _load(
-                                kp,
+                            _buffer_load(
+                                k_rows[kslot[i]],
                                 src(
-                                    kb[0],
-                                    kb[kslot[i]],
                                     (tid * 16 + i * 4096) // dim,
                                     (tid * 16 + i * 4096) % dim,
                                     k_strides[1],
                                 ),
                                 fx.Int32,
-                                16,
-                                count=4,
+                                4,
                             )
                             for i in range(k_loads)
                         ]
                         vc = [
-                            _load(
-                                vp,
+                            _buffer_load(
+                                v_rows,
                                 src(
-                                    vb[0],
-                                    vbase,
                                     (wave * (pn // 16) + idx // lpr) * 4 + g,
                                     c * (dim // 16) + idx % lpr * 16,
                                     v_strides[1],
                                 ),
                                 fx.Int32,
-                                16,
-                                count=4,
+                                4,
                             )
                             for idx in range(v_loads)
                         ]
@@ -675,47 +702,44 @@ def build_unified_attention_fp8_gfx942_module(
                             [p_m, p_denom] + p_next + p_ahead + p_pages_ahead
                         )
 
-                    p_orow = (fx.Int64(pq0) + fx.Int64(pqtok)) * num_q_heads + fx.Int64(
-                        phead
-                    )
                     if pqtok < pqlen:
                         if psplits == 1:
                             # A row that saw no key has l == 0 and writes zeros.
                             p_l = fx.Float32(presult[1])
                             p_norm = (p_l == 0.0).select(fx.Float32(0.0), vscale / p_l)
+                            po_rows = _rows(O, prow0 * dim)
                             for db in range_constexpr(dblocks):
                                 vals = fx.Vector(presult[db + 2])
-                                dest = (p_orow * dim + fx.Int64(db * 16 + g * 4)) * 2
-                                _store(
-                                    op,
-                                    dest,
+                                words = [
                                     _pack_bf16(vals[0] * p_norm, vals[1] * p_norm),
-                                    4,
-                                )
-                                _store(
-                                    op,
-                                    dest + 4,
                                     _pack_bf16(vals[2] * p_norm, vals[3] * p_norm),
-                                    4,
+                                ]
+                                _buffer_store(
+                                    po_rows,
+                                    prow * dim + db * 16 + g * 4,
+                                    fx.Vector.from_elements(words, fx.Int32),
                                 )
                         else:
                             # Partials in the decode layout, one row per token
                             # and head; an empty split leaves m at -1e30.
-                            pbase = (
-                                p_orow * fx.Int64(psplits) + fx.Int64(psplit)
-                            ) * stride
+                            pp_rows = _rows(
+                                Part,
+                                (prow0 * fx.Int64(psplits) + fx.Int64(psplit)) * stride,
+                            )
+                            plane = prow * psplits * stride
                             vs4 = fx.Vector.filled(4, vscale, fx.Float32)
                             for db in range_constexpr(dblocks):
-                                _store(
-                                    pp,
-                                    (pbase + fx.Int64(db * 16 + g * 4)) * 4,
+                                _buffer_store(
+                                    pp_rows,
+                                    plane + db * 16 + g * 4,
                                     fx.Vector(presult[db + 2]) * vs4,
-                                    16,
                                 )
                             if g == 0:
-                                _store(pp, (pbase + dim) * 4, fx.Float32(presult[0]), 4)
-                                _store(
-                                    pp, (pbase + dim + 1) * 4, fx.Float32(presult[1]), 4
+                                ml = [fx.Float32(presult[0]), fx.Float32(presult[1])]
+                                _buffer_store(
+                                    pp_rows,
+                                    plane + dim,
+                                    fx.Vector.from_elements(ml, fx.Float32),
                                 )
         if y >= tile_slots * psplits:
             # ---- decode role: one split per wave, 32-key tiles in registers ----
@@ -739,15 +763,18 @@ def build_unified_attention_fp8_gfx942_module(
                     dstart + (dtotal - 1 - dstart) // splits * splits,
                     fx.max(dtotal - 1, fx.Int32(0)),
                 )
-                # MFMA rows past the GQA group repeat its heads; only c < group store.
-                dhead = kvh * group + c % group
+                # Q and O rows from head kvh * group; lane c holds head
+                # c % group. MFMA rows past the group repeat its heads; only
+                # c < group store.
+                drow0 = (fx.Int64(dq0) * num_q_heads + fx.Int64(kvh * group)) * dim
+                drow = c % group * dim
                 # K and Q share a depth order: k-step 2j + h covers depths
                 # 64j + 16g + 8h .. +8, so each lane loads 16 contiguous bytes.
-                dq_row = (fx.Int64(dq0) * num_q_heads + fx.Int64(dhead)) * dim
+                dq_rows = _rows(Q, drow0)
                 dq_frag = []
                 for j in range_constexpr(kchunks):
-                    qv = _load(
-                        qp, dq_row + fx.Int64(j * 64 + g * 16), fx.Int32, 16, count=4
+                    qv = _buffer_load(
+                        dq_rows, drow + j * 64 + g * 16, fx.Int32, 4
                     ).bitcast(fx.Int64)
                     dq_frag += [qv[0], qv[1]]
 
@@ -958,24 +985,32 @@ def build_unified_attention_fp8_gfx942_module(
                     ]
 
                 def d_write_partials():
-                    pbase = (
-                        (fx.Int64(dseq) * num_q_heads + fx.Int64(dhead))
-                        * fx.Int64(splits)
-                        + fx.Int64(dsplit)
-                    ) * stride
+                    dp_rows = _rows(
+                        Part,
+                        (
+                            (fx.Int64(dseq) * num_q_heads + fx.Int64(kvh * group))
+                            * fx.Int64(splits)
+                            + fx.Int64(dsplit)
+                        )
+                        * stride,
+                    )
+                    dlane = c % group * splits * stride
                     for depth, vals in d_rows(vscale):
-                        _store(
-                            pp,
-                            (pbase + fx.Int64(depth)) * 4,
+                        _buffer_store(
+                            dp_rows,
+                            dlane + depth,
                             fx.Vector.from_elements(vals, fx.Float32),
-                            16,
                         )
                     if g == 0:
-                        _store(pp, (pbase + dim) * 4, fx.Float32(dresult[0]), 4)
-                        _store(pp, (pbase + dim + 1) * 4, fx.Float32(dresult[1]), 4)
+                        ml = [fx.Float32(dresult[0]), fx.Float32(dresult[1])]
+                        _buffer_store(
+                            dp_rows,
+                            dlane + dim,
+                            fx.Vector.from_elements(ml, fx.Float32),
+                        )
 
                 def d_write_out():
-                    orow = (fx.Int64(dq0) * num_q_heads + fx.Int64(dhead)) * dim
+                    do_rows = _rows(O, drow0)
                     # A sequence without keys has l == 0 and writes zeros.
                     d_l = fx.Float32(dresult[1])
                     norm = (d_l == 0.0).select(fx.Float32(0.0), vscale / d_l)
@@ -984,11 +1019,10 @@ def build_unified_attention_fp8_gfx942_module(
                             _pack_bf16(vals[0], vals[1]),
                             _pack_bf16(vals[2], vals[3]),
                         ]
-                        _store(
-                            op,
-                            (orow + fx.Int64(depth)) * 2,
+                        _buffer_store(
+                            do_rows,
+                            drow + depth,
                             fx.Vector.from_elements(words, fx.Int32),
-                            8,
                         )
 
                 if c < group:
@@ -1082,8 +1116,12 @@ def build_unified_attention_fp8_gfx942_combine_module(dim, num_q_heads, prefill=
                 == 1
             )
         trips = valid.select(num_splits, fx.Int32(0))
-        pp, op = fx.get_iter(Part), fx.get_iter(O)
-        row = (fx.Int64(y) * num_q_heads + fx.Int64(head)) * fx.Int64(num_splits)
+        part_base = (
+            (fx.Int64(y) * num_q_heads + fx.Int64(head)) * fx.Int64(num_splits) * stride
+        )
+        part_rows = _rows(Part, part_base)
+        # m and l are wave-uniform: scalar loads keep them off the vector queue.
+        part_ml = _buffer_ptr(Part, part_base)
         init = [fx.Float32(-1.0e30), fx.Float32(0.0)] + [
             fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(vecs)
         ]
@@ -1096,16 +1134,13 @@ def build_unified_attention_fp8_gfx942_combine_module(dim, num_q_heads, prefill=
             for u in range_constexpr(unroll):
                 # Past the last split, reload it; its max is masked to -inf below.
                 s = s0 + u
-                base = (row + fx.Int64((s < trips).select(s, trips - 1))) * stride
-                ml.append(_load(pp, (base + dim) * 4, fx.Float32, 8, count=2))
+                base = (s < trips).select(s, trips - 1) * stride
+                # m, l and the row's two pad floats.
+                ml.append(fx.Vector(_sload(part_ml, base + dim, 4)).bitcast(fx.Float32))
                 os_.append(
                     [
-                        _load(
-                            pp,
-                            (base + fx.Int64(lane * (4 * vecs) + 4 * i)) * 4,
-                            fx.Float32,
-                            16,
-                            count=4,
+                        _buffer_load(
+                            part_rows, base + lane * (4 * vecs) + 4 * i, fx.Float32, 4
                         )
                         for i in range(vecs)
                     ]
@@ -1144,10 +1179,10 @@ def build_unified_attention_fp8_gfx942_combine_module(dim, num_q_heads, prefill=
                     _pack_bf16(acc[0] * inv, acc[1] * inv),
                     _pack_bf16(acc[2] * inv, acc[3] * inv),
                 ]
-            dest = (
-                (q0 * num_q_heads + fx.Int64(head)) * dim + fx.Int64(lane * (4 * vecs))
-            ) * 2
-            _store(op, dest, fx.Vector.from_elements(words, fx.Int32), 8 * vecs)
+            o_rows = _rows(O, (q0 * num_q_heads + fx.Int64(head)) * dim)
+            _buffer_store(
+                o_rows, lane * (4 * vecs), fx.Vector.from_elements(words, fx.Int32)
+            )
 
     @flyc.jit
     def launch_combine(
