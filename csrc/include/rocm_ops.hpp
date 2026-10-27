@@ -1527,79 +1527,8 @@ namespace py = pybind11;
           py::arg("moe_buf"),                          \
           py::arg("activation_quant"),                 \
           py::arg("activation_scale_token"),           \
-          py::arg("num_experts"));
-
-#define MLA_V4_PREFILL_OPUS_PYBIND                  \
-    m.def("pa_sparse_prefill_gfx950_opus_fwd",      \
-          &opus_mla_v4_prefill_a16w16_gfx950_fwd,   \
-          py::arg("q"),                             \
-          py::arg("unified_kv"),                    \
-          py::arg("kv_indices_prefix"),             \
-          py::arg("kv_indptr_prefix"),              \
-          py::arg("kv"),                            \
-          py::arg("kv_indices_extend"),             \
-          py::arg("kv_indptr_extend"),              \
-          py::arg("attn_sink"),                     \
-          py::arg("out"),                           \
-          py::arg("softmax_scale"));                \
-    m.def("pa_sparse_prefill_gfx950_opus_split_fwd", \
-          &opus_mla_v4_prefill_a16w16_gfx950_split_fwd, \
-          py::arg("q"),                             \
-          py::arg("unified_kv"),                    \
-          py::arg("kv_indices_prefix"),             \
-          py::arg("kv_indptr_prefix"),              \
-          py::arg("kv"),                            \
-          py::arg("kv_indices_extend"),             \
-          py::arg("kv_indptr_extend"),              \
-          py::arg("attn_sink"),                     \
-          py::arg("partial_o"),                     \
-          py::arg("partial_max"),                   \
-          py::arg("partial_sum"),                   \
-          py::arg("out"),                           \
-          py::arg("softmax_scale"),                 \
-          py::arg("num_splits"));                   \
-    m.def("pa_sparse_prefill_gfx1250_opus_fwd",     \
-          &opus_mla_v4_prefill_a16w16_gfx1250_fwd,  \
-          py::arg("q"),                             \
-          py::arg("unified_kv"),                    \
-          py::arg("kv_indices_prefix"),             \
-          py::arg("kv_indptr_prefix"),              \
-          py::arg("kv"),                            \
-          py::arg("kv_indices_extend"),             \
-          py::arg("kv_indptr_extend"),              \
-          py::arg("attn_sink"),                     \
-          py::arg("out"),                           \
-          py::arg("softmax_scale"));                \
-    m.def("pa_sparse_prefill_fp8_gfx950_opus_fwd",  \
-          &opus_mla_v4_prefill_a8w8_gfx950_fwd,     \
-          py::arg("q_nope"),                        \
-          py::arg("q_rope"),                        \
-          py::arg("unified_kv_nope"),               \
-          py::arg("unified_kv_rope"),               \
-          py::arg("kv_indices_prefix"),             \
-          py::arg("kv_indptr_prefix"),              \
-          py::arg("kv_nope"),                       \
-          py::arg("kv_rope"),                       \
-          py::arg("kv_indices_extend"),             \
-          py::arg("kv_indptr_extend"),              \
-          py::arg("attn_sink"),                     \
-          py::arg("out"),                           \
-          py::arg("softmax_scale"));                \
-    m.def("pa_sparse_prefill_fp8_gfx1250_opus_fwd", \
-          &opus_mla_v4_prefill_a8w8_gfx1250_fwd,    \
-          py::arg("q_nope"),                        \
-          py::arg("q_rope"),                        \
-          py::arg("unified_kv_nope"),               \
-          py::arg("unified_kv_rope"),               \
-          py::arg("kv_indices_prefix"),             \
-          py::arg("kv_indptr_prefix"),              \
-          py::arg("kv_nope"),                       \
-          py::arg("kv_rope"),                       \
-          py::arg("kv_indices_extend"),             \
-          py::arg("kv_indptr_extend"),              \
-          py::arg("attn_sink"),                     \
-          py::arg("out"),                           \
-          py::arg("softmax_scale"));
+          py::arg("num_experts"),                      \
+          py::arg("num_local_tokens") = std::nullopt);
 
 #define PA_MQA_LOGITS_MXFP4_PYBIND                       \
     m.def("pa_mqa_logits_mxfp4_build_tiles",             \
@@ -2442,6 +2371,34 @@ namespace py = pybind11;
           py::arg("is_decode"));                 \
     m.def("topk_use_mulblocks", &topk_use_mulblocks, py::arg("numRows"), py::arg("stride0"));
 
+#define TOP_K_PER_ROW_SAMPLED_PYBIND             \
+    AITER_SET_STREAM_PYBIND;                      \
+    m.def("top_k_per_row_prefill_sampled",       \
+          &top_k_per_row_prefill_sampled,        \
+          py::arg("logits"),                     \
+          py::arg("rowStarts"),                  \
+          py::arg("rowEnds"),                    \
+          py::arg("indices"),                    \
+          py::arg("values"),                     \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt,   \
+          py::arg("ragged")    = true,           \
+          py::arg("nan_high")  = false);         \
+    m.def("topk_sampled_workspace_size",         \
+          &topk_sampled_workspace_size,          \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"));                         \
+    m.def("topk_sampled_supports",               \
+          &topk_sampled_supports,                \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"),                          \
+          py::arg("device_id") = -1);
+
 #define MLA_METADATA_PYBIND                              \
     AITER_SET_STREAM_PYBIND;                             \
     m.def("get_mla_decode_head_plan_v1",                 \
@@ -2587,11 +2544,30 @@ namespace py = pybind11;
           py::arg("rowEnds")   = std::nullopt,    \
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1,               \
-          py::arg("workspace") = std::nullopt);   \
+          py::arg("workspace") = std::nullopt,    \
+          py::arg("nan_high")  = false);          \
+    m.def("topk_plain_use_mulblocks",             \
+          &topk_plain_use_mulblocks,              \
+          py::arg("numRows"),                     \
+          py::arg("stride0"),                     \
+          py::arg("k"),                           \
+          py::arg("ragged"));                     \
     m.def("topk_plain_workspace_size",            \
           &topk_plain_workspace_size,             \
           py::arg("numRows"),                     \
           py::arg("stride0"),                     \
+          py::arg("k"));                          \
+    m.def("topk_plain_width",                     \
+          &topk_plain_width,                      \
+          py::arg("name"));                       \
+    m.def("topk_plain_uses_radix",                \
+          &topk_plain_uses_radix,                 \
+          py::arg("width"),                       \
+          py::arg("k"));                          \
+    m.def("topk_plain_reads_pitch",               \
+          &topk_plain_reads_pitch,                \
+          py::arg("numRows"),                     \
+          py::arg("width"),                       \
           py::arg("k"));
 
 #define RMSNORM_QUANT_PYBIND                 \
