@@ -643,9 +643,7 @@ void mqa_logits_mxfp4_build_schedule(aiter_tensor_t& query_start_loc,
 // The kernels stride every input by compile-time constants and read no runtime stride but the
 // table's and out's, so a padded or permuted input would be silently wrong: layouts are required.
 // Byte counts catch a wrong array, not a wrong permutation (the Python wrapper checks the ndim).
-void mqa_logits_mxfp4_launch(int instance,
-                             int mode,
-                             aiter_tensor_t& q,
+void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
                              aiter_tensor_t& q_scale,
                              aiter_tensor_t& kv_cache,
                              aiter_tensor_t& kv_scale,
@@ -656,6 +654,8 @@ void mqa_logits_mxfp4_launch(int instance,
                              aiter_tensor_t& cta_info,
                              aiter_tensor_t& out,
                              aiter_tensor_t& out_offsets,
+                             int instance,
+                             int mode,
                              float weight_scale,
                              int tpb_shift,
                              int cta_target,
@@ -721,7 +721,8 @@ void mqa_logits_mxfp4_launch(int instance,
     else
         AITER_CHECK(cta_target >= 1 && prefill_parts >= 1,
                     "cta_target / prefill_parts must be >= 1");
-    AITER_CHECK(grid >= 0 && tpb_shift >= 0 && tpb_shift < 16, "bad grid / tpb_shift");
+    AITER_CHECK(grid >= 0 && tpb_shift >= 0 && tpb_shift <= ol::MAX_TPB_SHIFT,
+                "bad grid / tpb_shift");
     if (rows == 0 || grid == 0) return;
 
     mqa_logits_mxfp4_kargs k{};

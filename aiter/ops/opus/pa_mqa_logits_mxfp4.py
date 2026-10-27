@@ -47,7 +47,8 @@ them apart -- checked here, as nothing on device can)::
 Only ``out[r, c]`` for ``c < row_ends[r]`` is written; rows past ``query_start_loc[-1]`` (CUDAGraph
 padding) are untouched. The caller owes what the kernel cannot check: ``row_ends`` does not
 decrease along a sequence, ``row_ends[r] <= max_seq_len`` and within the sequence's table, and a
-page id times ``page_size`` fits 32 bits.
+page's offset fits 32 bits -- on gfx950 its byte offset (page id x 4 KiB: a ``kv_cache`` of at most
+4 GiB), on gfx1250 its row (page id x ``page_size``).
 
 NaN: relu is IEEE ``maximum``. A logit is NaN exactly where a key's or the row's E8M0 scales hold
 0xFF, or a weight is NaN or Inf (the kernels compute relu as max_num and put the NaN back from the
@@ -129,10 +130,10 @@ def _build_schedule_raw(
 ) -> None: ...
 
 
+# The tensors lead: compile_ops gives an op whose first argument is not a tensor a dummy one,
+# allocated every call.
 @compile_ops(_MD_NAME, fc_name="mqa_logits_mxfp4_launch", develop=True)
 def _launch_raw(
-    instance: int,
-    mode: int,
     q: torch.Tensor,
     q_scale: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -144,6 +145,8 @@ def _launch_raw(
     cta_info: torch.Tensor,
     out: torch.Tensor,
     out_offsets: torch.Tensor,
+    instance: int,
+    mode: int,
     weight_scale: float,
     tpb_shift: int,
     cta_target: int,
@@ -673,6 +676,12 @@ def mqa_logits_mxfp4(
         out = torch.full(
             (rows, cfg.max_seq_len), float("-inf"), dtype=torch.float32, device=q.device
         )
+    elif out.dim() != 2 or out.shape[0] < rows or out.shape[1] < cfg.max_seq_len:
+        # The kernels bound a row's stores by its row_ends only.
+        raise ValueError(
+            f"out must be [>= {rows}, >= {cfg.max_seq_len}] (rows, cfg.max_seq_len), "
+            f"got {tuple(out.shape)}"
+        )
     if out.dtype != torch.float32:
         raise ValueError(f"out must be fp32, got {out.dtype}")
 
@@ -705,8 +714,6 @@ def mqa_logits_mxfp4(
         mode, cta_info, grid = TABLE, buf.cta_info, buf.num_ctas
 
     _launch_raw(
-        inst.id,
-        mode,
         q,
         q_scale,
         kv_cache,
@@ -718,6 +725,8 @@ def mqa_logits_mxfp4(
         cta_info,
         out,
         cfg._empty_i64 if out_offsets is None else out_offsets,
+        inst.id,
+        mode,
         float(weight_scale),
         cfg._tpb_shift,
         cta_target,

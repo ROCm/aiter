@@ -1617,8 +1617,6 @@ namespace py = pybind11;
           py::arg("cta_resident"));                      \
     m.def("mqa_logits_mxfp4_launch",                     \
           &mqa_logits_mxfp4_launch,                      \
-          py::arg("instance"),                           \
-          py::arg("mode"),                               \
           py::arg("q"),                                  \
           py::arg("q_scale"),                            \
           py::arg("kv_cache"),                           \
@@ -1630,6 +1628,8 @@ namespace py = pybind11;
           py::arg("cta_info"),                           \
           py::arg("out"),                                \
           py::arg("out_offsets"),                        \
+          py::arg("instance"),                           \
+          py::arg("mode"),                               \
           py::arg("weight_scale"),                       \
           py::arg("tpb_shift"),                          \
           py::arg("cta_target"),                         \

@@ -20,7 +20,8 @@
 //   1. row_ends does not decrease along a sequence's rows (a CTA runs its last row's window);
 //   2. row_ends[r] <= the logits width and <= what block_tables[b] covers;
 //   3. query_start_loc[-1] <= rows; rows past it are neither read nor written;
-//   4. page id x page rows fits 32 bits.
+//   4. a page's offset in the cache fits 32 bits: on gfx950 its byte offset (page id x 4 KiB, so
+//      the kv_cache a call reads is at most 4 GiB), on gfx1250 its plane row (page id x page rows).
 #pragma once
 #include "aiter_tensor.h"
 #include <hip/hip_runtime.h>
@@ -70,6 +71,9 @@ struct mqa_logits_mxfp4_kargs {
 static_assert(sizeof(mqa_logits_mxfp4_kargs) == 120);
 
 namespace opus_logits {
+
+// A table entry names at most 2^MAX_TPB_SHIFT 64-key tiles (kargs.tpb_shift).
+constexpr int MAX_TPB_SHIFT = 15;
 
 enum mqa_logits_mode : int {
     SCHED_TABLE   = 0,
@@ -152,9 +156,9 @@ void mqa_logits_mxfp4_build_schedule(aiter_tensor_t& query_start_loc,
                                      int num_ctas,
                                      int cta_resident);
 
-void mqa_logits_mxfp4_launch(int instance,
-                             int mode,
-                             aiter_tensor_t& q,
+// The tensors lead: compile_ops gives an op whose first argument is not a tensor a dummy one,
+// allocated every call.
+void mqa_logits_mxfp4_launch(aiter_tensor_t& q,
                              aiter_tensor_t& q_scale,
                              aiter_tensor_t& kv_cache,
                              aiter_tensor_t& kv_scale,
@@ -165,6 +169,8 @@ void mqa_logits_mxfp4_launch(int instance,
                              aiter_tensor_t& cta_info,
                              aiter_tensor_t& out,
                              aiter_tensor_t& out_offsets,
+                             int instance,
+                             int mode,
                              float weight_scale,
                              int tpb_shift,
                              int cta_target,

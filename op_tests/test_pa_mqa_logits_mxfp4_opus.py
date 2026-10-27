@@ -957,6 +957,7 @@ def check_errors(model):
             row_ends=torch.cat([ends, ends]),
         ),
         "int64 row_ends": call(row_ends=ends.long()),
+        "out narrower than cfg.max_seq_len": call(out=torch.empty(rows.rows, 1)),
         "table entries no instance reads": lambda: mqa_logits_mxfp4_config(
             torch.cuda.current_device(),
             heads=64,

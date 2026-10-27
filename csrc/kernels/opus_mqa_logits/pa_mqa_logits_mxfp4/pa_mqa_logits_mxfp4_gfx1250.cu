@@ -303,8 +303,8 @@ using h32_r4w2s2T  = h32_traits<4, 2, 2, 1, 0>;   // ... 7-8 rows; V4.1 full-lay
 using h32g_r1w1s4L = h32_traits<1, 1, 4, 0, 1>;   // V4.1 candidate-layer decode
 using h32g_r1w1s3L = h32_traits<1, 1, 3, 0, 1>;   // V4.1 candidate-layer prefill
 
-// A full-layer table entry may be any power-of-two run of 64-key tiles.
-constexpr int ENTRY_ANY_RUN = 1 << 30;
+// A full-layer table entry may be any power-of-two run of up to 2^MAX_TPB_SHIFT 64-key tiles.
+constexpr int ENTRY_MAX_RUN = 64 << MAX_TPB_SHIFT;
 
 template<class T, class K>
 constexpr mqa_logits_instance entry(int rows_per_wave, int gather, int entry_rows_min,
@@ -346,7 +346,7 @@ constexpr mqa_logits_instance h32_entry() {
     using K = instance_kernels<T::BLOCK_SIZE, h32_kernel<T, SCHED_TABLE>, h32_free_kernel<T>(),
                                h32_kernel<T, SCHED_PREFILL>>;
     return entry<T, K>(T::ROWS_PER_WAVE, T::GATHER, T::GATHER ? T::PAGE_ROWS : T::KV_TILE_SIZE,
-                       T::GATHER ? T::PAGE_ROWS : ENTRY_ANY_RUN, 1);
+                       T::GATHER ? T::PAGE_ROWS : ENTRY_MAX_RUN, 1);
 }
 
 }  // namespace
