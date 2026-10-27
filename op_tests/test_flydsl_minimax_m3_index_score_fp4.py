@@ -512,12 +512,14 @@ def fp4_prefill_case(batch, q_len, ctx_len, heads=1, seed=0):
     return dict(c, cache=as_fp8), kd, ks
 
 
-def run_prefill_fp4(c, kd, ks, **kw):
+def run_prefill_fp4(c, kd, ks, qdt="bf16", **kw):
+    """`qdt` picks the query handed to the scorer: the bf16 upcast or the e4m3 itself
+    (the case's query came from e4m3, so both are the same numbers)."""
     heads = c["q8"].shape[1]
     out = fp8_test.prefill_alloc_score(c["q8"].shape[0], heads, c["mb"], "cuda")
     out.fill_(SENTINEL)
     prefill_kernel.score_prefill_flydsl_fp4(
-        c["q_bf16"],
+        c["q_bf16"] if qdt == "bf16" else c["q8"],
         kd,
         ks,
         c["bt"],
@@ -537,10 +539,10 @@ def run_prefill_fp4(c, kd, ks, **kw):
 @pytest.mark.parametrize(
     "shape", fp8_test.PREFILL_SHAPES, ids=lambda s: f"b{s[0]}_q{s[1]}_ctx{s[2]}"
 )
-def test_prefill_matches_aiter_and_fp8_kernel(shape):
+def test_prefill_matches_aiter_and_fp8_kernel(shape, qdt):
     c, kd, ks = fp4_prefill_case(*shape)
     ref, live = fp8_test.aiter_scores(c)
-    got = run_prefill_fp4(c, kd, ks)
+    got = run_prefill_fp4(c, kd, ks, qdt)
     fp8_test.assert_matches_aiter(got, ref, live, f"{shape}")
     assert torch.equal(got[live], fp8_test.run_prefill(c)[live])
 
@@ -549,17 +551,19 @@ def test_prefill_matches_aiter_and_fp8_kernel(shape):
 @pytest.mark.parametrize(
     "shape", fp8_test.GEOM_SHAPES, ids=lambda s: f"b{s[0]}_q{s[1]}_ctx{s[2]}"
 )
-def test_prefill_every_geometry(shape):
+def test_prefill_every_geometry(shape, qdt):
     c, kd, ks = fp4_prefill_case(*shape)
     ref, live = fp8_test.aiter_scores(c)
-    fp8_test.assert_matches_aiter(run_prefill_fp4(c, kd, ks), ref, live, f"{shape}")
+    fp8_test.assert_matches_aiter(
+        run_prefill_fp4(c, kd, ks, qdt), ref, live, f"{shape}"
+    )
 
 
 @requires_gfx950
-def test_prefill_two_heads():
+def test_prefill_two_heads(qdt):
     c, kd, ks = fp4_prefill_case(2, 256, 3000, heads=2)
     ref, live = fp8_test.aiter_scores(c)
-    fp8_test.assert_matches_aiter(run_prefill_fp4(c, kd, ks), ref, live, "heads=2")
+    fp8_test.assert_matches_aiter(run_prefill_fp4(c, kd, ks, qdt), ref, live, "heads=2")
 
 
 @requires_gfx950
@@ -594,7 +598,7 @@ def test_staging_leaves_dead_pages_alone_and_scores_ignore_them():
 
 
 @requires_gfx950
-def test_prefill_mixed_query_lengths_and_trailing_empty_request():
+def test_prefill_mixed_query_lengths_and_trailing_empty_request(qdt):
     dev = "cuda"
     torch.manual_seed(0)
     q_a, ctx_a, ctx_b = 1024, 1024, 16384
@@ -620,7 +624,7 @@ def test_prefill_mixed_query_lengths_and_trailing_empty_request():
     out = fp8_test.prefill_alloc_score(q_a + 1, 1, mb, dev)
     out.fill_(SENTINEL)
     prefill_kernel.score_prefill_flydsl_fp4(
-        q8.float().bfloat16(),
+        q8.float().bfloat16() if qdt == "bf16" else q8,
         kd,
         ks,
         bt,
@@ -635,6 +639,48 @@ def test_prefill_mixed_query_lengths_and_trailing_empty_request():
     fp8_test.assert_matches_aiter(
         out.reshape(1, q_a + 1, mb), ref, live, "mixed lengths + trailing empty"
     )
+
+
+@requires_gfx950
+def test_prefill_e4m3_q_strided_and_scaled():
+    """An e4m3 query that is a strided view (rows and heads padded, as a packed qkv
+    output would hand it over) scores like its contiguous copy, bit for bit, and
+    `q_scale` multiplies the scores."""
+    c, kd, ks = fp4_prefill_case(2, 256, 3000, heads=2)
+    rows, heads = c["q8"].shape[:2]
+    wide = torch.zeros(rows, heads + 1, D + 64, dtype=dtypes.fp8, device="cuda")
+    view = wide[:, :heads, :D]  # head stride 192, row stride 576 (both 16 B multiples)
+    view.copy_(c["q8"])
+    assert view.stride() == ((heads + 1) * (D + 64), D + 64, 1)
+    plain = run_prefill_fp4(c, kd, ks, "e4m3")
+    strided = run_prefill_fp4(dict(c, q8=view), kd, ks, "e4m3")
+    assert torch.equal(plain, strided)
+    out = fp8_test.prefill_alloc_score(rows, heads, c["mb"], "cuda")
+    out.fill_(SENTINEL)
+    args = (c["cu"], c["seq"], c["prefix"], c["max_q"], c["max_seq"], 1.0 / LOG2E)
+    prefill_kernel.score_prefill_flydsl_fp4(
+        c["q8"], kd, ks, c["bt"], *args, out=out, q_scale=0.5
+    )
+    got = out.reshape(plain.shape)
+    live = plain != SENTINEL
+    assert torch.equal(got[live], plain[live] * 0.5)
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="q_scale"):
+            prefill_kernel.score_prefill_flydsl_fp4(
+                c["q8"], kd, ks, c["bt"], *args, q_scale=bad
+            )
+
+
+@requires_gfx950
+def test_prefill_e4m3_q_rejections():
+    c, kd, ks = fp4_prefill_case(1, 128, 1000)
+    args = (c["cu"], c["seq"], c["prefix"], c["max_q"], c["max_seq"], 1.0 / LOG2E)
+    f = prefill_kernel.score_prefill_flydsl_fp4
+    bad_rows = torch.zeros(128, 1, D + 8, dtype=dtypes.fp8, device="cuda")[:, :, :D]
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        f(bad_rows, kd, ks, c["bt"], *args)
+    with pytest.raises(ValueError):  # fp16 is neither bf16 nor e4m3
+        f(c["q_bf16"].half(), kd, ks, c["bt"], *args)
 
 
 @requires_gfx950

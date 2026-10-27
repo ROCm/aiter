@@ -36,6 +36,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     HEAD_DIM,
     PAGE,
     _validate_arch,
+    _validate_rows,
     _validate_tensor,
 )
 from aiter.ops.flydsl.kernels.minimax_m3_index_score_fp4 import _validate_cache
@@ -74,9 +75,18 @@ def _dequant_pages_kernel(
     stride_ks,
     stride_bt,
     max_block,
+    q_in,
+    q_out,
+    stride_qn,
+    stride_qh,
+    n_q_rows,
+    n_heads,
+    K_PROGRAMS,
     PAGE_C: tl.constexpr,
     TOKS: tl.constexpr,
     DIM: tl.constexpr,
+    HAS_Q: tl.constexpr,
+    Q_ROWS: tl.constexpr,
 ):
     """One program: TOKS tokens of one (request, logical page) -> fp8.
 
@@ -84,7 +94,21 @@ def _dequant_pages_kernel(
     arange. A page past the request's length is left alone, which is why the
     staging buffer is `empty`: the scorer never reads those pages' contents
     into a live score.
+
+    With HAS_Q the grid also carries programs past the K ones that widen an e4m3
+    query to bf16 (`Q_ROWS` rows each, row = token * heads + head): the scorer
+    takes a bf16 query and rounds it back to e4m3 itself, which is the identity
+    for a value that came from e4m3. Folding it into this launch costs no launch.
     """
+    if HAS_Q and tl.program_id(0) >= K_PROGRAMS:
+        qp = (tl.program_id(0) - K_PROGRAMS) * tl.num_programs(1) + tl.program_id(1)
+        row = qp.to(tl.int64) * Q_ROWS + tl.arange(0, Q_ROWS)[:, None]
+        col = tl.arange(0, DIM)[None, :]
+        ok = row < n_q_rows
+        src = (row // n_heads) * stride_qn + (row % n_heads) * stride_qh + col
+        x = tl.load(q_in + src, mask=ok, other=0.0).to(tl.float32)
+        tl.store(q_out + row * DIM + col, x.to(tl.bfloat16), mask=ok)
+        return
     p = tl.program_id(0) // (PAGE_C // TOKS)
     tile = tl.program_id(0) % (PAGE_C // TOKS)
     b = tl.program_id(1)
@@ -115,11 +139,19 @@ def _dequant_pages_kernel(
     tl.store(out + dst, v.to(out.dtype.element_ty))
 
 
-def dequant_pages_fp8(k_data, k_scale, block_table, seq_lens, max_block, out=None):
+Q_ROWS = 16  # query rows one widening program converts
+
+
+def dequant_pages_fp8(
+    k_data, k_scale, block_table, seq_lens, max_block, out=None, q=None, q_out=None
+):
     """Dequantize the pages `block_table` names into fp8 `[batch*max_block, 128, 128]`.
 
     Slot `b * max_block + p` holds request b's logical page p, for p below its
     page count; the rest is left uninitialised.
+
+    `q` (e4m3 `[rows, heads, 128]`) and `q_out` (contiguous bf16, same shape) ask
+    the same launch to widen the query as well.
     """
     batch = seq_lens.shape[0]
     shape = (batch * max_block, PAGE, HEAD_DIM)
@@ -135,8 +167,13 @@ def dequant_pages_fp8(k_data, k_scale, block_table, seq_lens, max_block, out=Non
         raise ValueError(
             f"workspace: expected contiguous fp8 [>= {shape[0]}, 128, 128]"
         )
+    k_programs = max_block * (PAGE // TOK_BLOCK)
+    has_q = q is not None
+    n_rows = q.shape[0] * q.shape[1] if has_q else 0
+    q_chunks = -(-n_rows // Q_ROWS)
+    q_programs = -(-q_chunks // batch)
     with torch.cuda.device(k_data.device):
-        _dequant_pages_kernel[(max_block * (PAGE // TOK_BLOCK), batch)](
+        _dequant_pages_kernel[(k_programs + q_programs, batch)](
             k_data,
             k_scale,
             block_table,
@@ -146,9 +183,18 @@ def dequant_pages_fp8(k_data, k_scale, block_table, seq_lens, max_block, out=Non
             k_scale.stride(0),
             block_table.stride(0),
             max_block,
+            q if has_q else out,
+            q_out if has_q else out,
+            q.stride(0) if has_q else 0,
+            q.stride(1) if has_q else 0,
+            n_rows,
+            q.shape[1] if has_q else 1,
+            k_programs,
             PAGE_C=PAGE,
             TOKS=TOK_BLOCK,
             DIM=HEAD_DIM,
+            HAS_Q=has_q,
+            Q_ROWS=Q_ROWS,
             num_warps=NUM_WARPS,
         )
     return out
@@ -181,6 +227,7 @@ def score_prefill_flydsl_fp4(
     sm_scale,
     out=None,
     workspace=None,
+    q_scale: float = 1.0,
 ):
     """Block scores for a ragged prefill batch over an MXFP4 index cache.
 
@@ -188,9 +235,25 @@ def score_prefill_flydsl_fp4(
     argument it shares keeps its contract. `workspace` optionally supplies the
     fp8 staging buffer (see `dequant_pages_fp8`); otherwise one is allocated.
     The staged pages are consumed by this call, not kept.
+
+    `idx_q` is bf16 (rounded to e4m3 inside the scorer, as for an fp8 cache) or
+    already e4m3 (`dtypes.fp8`, what the index-Q writer emits for q8kv4), in which
+    case it is widened to a bf16 staging query in the same launch that dequantizes
+    the pages -- exact, and the scorer's own rounding then gives back the same
+    bytes, so the scores are those of the e4m3 query as stored. `q_scale` (default
+    1.0, positive) multiplies the scores, folded into `sm_scale`.
     """
     dev = idx_q.device
     _validate_arch(dev)
+    q_fp8 = idx_q.dtype == dtypes.fp8
+    if q_fp8:
+        _validate_tensor(idx_q, "idx_q", (dtypes.fp8,), 3, dev, 16)
+        if idx_q.shape[2] != HEAD_DIM:
+            raise ValueError(f"index head_dim must be {HEAD_DIM}, got {idx_q.shape[2]}")
+        _validate_rows(idx_q, "idx_q")
+    scaled = sm_scale * q_scale
+    if not scaled > 0 or scaled == float("inf"):
+        raise ValueError("sm_scale * q_scale must be finite and positive")
     _validate_cache(k_data, k_scale, dev)
     _validate_tensor(block_table, "block_table", (torch.int32,), 2, dev)
     _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, dev)
@@ -209,11 +272,21 @@ def score_prefill_flydsl_fp4(
         raise ValueError(
             "block_table/seq_lens must cover every request and max_seq_len"
         )
+    q_wide = (
+        torch.empty(idx_q.shape, dtype=torch.bfloat16, device=dev) if q_fp8 else None
+    )
     staged = dequant_pages_fp8(
-        k_data, k_scale, block_table, seq_lens[:batch], max_block, workspace
+        k_data,
+        k_scale,
+        block_table,
+        seq_lens[:batch],
+        max_block,
+        workspace,
+        q=idx_q if q_fp8 else None,
+        q_out=q_wide,
     )
     return score_prefill_flydsl(
-        idx_q,
+        q_wide if q_fp8 else idx_q,
         staged,
         _identity_table(batch, max_block, dev),
         cu_seqlens_q,
@@ -221,6 +294,6 @@ def score_prefill_flydsl_fp4(
         prefix_lens,
         max_query_len,
         max_seq_len,
-        sm_scale,
+        scaled,
         out=out,
     )
