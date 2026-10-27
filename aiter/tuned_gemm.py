@@ -746,7 +746,10 @@ def triton_gemm(
         scale_a is None and scale_b is None and scale_c is None
     ), "Triton gemm_a16w16 does not support scaling yet"
     assert not bpreshuffle, "Triton gemm_a16w16 does not support bpreshuffle yet."
-    return gemm_a16w16(inp, weights, bias=bias, dtype=otype, y=out)
+    # The solMap entry runs inside the bodies of the gemm_a16w16 /
+    # gemm_a16w16_out custom ops above (via _gemm_a16w16), so the nested triton
+    # op runs its body directly (no second torch.ops dispatch).
+    return gemm_a16w16(inp, weights, bias=bias, dtype=otype, y=out, _in_custom_op=True)
 
 
 solMap = {

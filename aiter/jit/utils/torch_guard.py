@@ -359,6 +359,11 @@ def torch_compile_guard(
             aiter_lib.impl(f"{loadName}", custom_func, dispatch_key="CUDA")
             aiter_lib.impl(f"{loadName}", custom_func, dispatch_key="CPU")
             aiter_lib._register_fake(f"{loadName}", fake_func)
+            # The op dispatches to this very body, so a caller already running
+            # inside another aiter custom op may call it directly and skip the
+            # second torch.ops dispatch. Set only when this decorator registered
+            # the op: a pre-existing registration may run a different body.
+            wrapper_custom._eager_body = func
 
         return wrapper_custom
 

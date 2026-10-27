@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton
 
@@ -39,6 +41,27 @@ def _is_gluon_available():
         return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
     except Exception:  # noqa: BLE001
         return False
+
+
+@functools.cache
+def _gluon_layouts_cached(
+    create_wmma_layouts, create_shared_layouts, num_warps, *shared_args
+):
+    return create_wmma_layouts(num_warps), create_shared_layouts(*shared_args)
+
+
+def _gluon_layouts(create_wmma_layouts, create_shared_layouts, num_warps, *shared_args):
+    """(create_wmma_layouts(num_warps), create_shared_layouts(*shared_args)).
+
+    Both are pure functions of the tile config that build frozen (immutable,
+    hashable) gluon layout dataclasses, yet cost ~100 us of Python per launch, so
+    they are memoised per config. Unhashable arguments fall back to building."""
+    try:
+        return _gluon_layouts_cached(
+            create_wmma_layouts, create_shared_layouts, num_warps, *shared_args
+        )
+    except TypeError:
+        return create_wmma_layouts(num_warps), create_shared_layouts(*shared_args)
 
 
 def gemm_a16w16_fake_tensor(
@@ -436,9 +459,15 @@ def gemm_a16w16_(
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(
-            BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8
+        (wmma_layout, operand_a, operand_b), (shared_a, shared_b) = _gluon_layouts(
+            create_wmma_layouts,
+            create_shared_layouts,
+            num_warps,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            layout,
+            x.element_size() * 8,
         )
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
@@ -580,12 +609,17 @@ def gemm_a16w16(
     kernel_type: str = "bandwidth_bound",
     backend: str | None = None,
     persistent: bool = False,
+    *,
+    _in_custom_op: bool = False,
 ):
     """
     Computes 16 bit matrix multiplication Y = X @ W^T
 
     Uses the gluon backend automatically on supported architectures (gfx1250)
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
+    ``_in_custom_op`` (internal): the caller is itself the body of an aiter
+    custom op, so ``gemm_a16w16_``'s body runs directly instead of dispatching
+    its op a second time.
     See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
     here and is serialized before dispatch so the op is torch.compile-traceable.
     """
@@ -594,7 +628,12 @@ def gemm_a16w16(
     if not isinstance(dtype, torch.dtype):
         dtype = torch.bfloat16
     config_hashable = serialize_dict(config) if config else None
-    return gemm_a16w16_(
+    op = gemm_a16w16_
+    if _in_custom_op:
+        # Run the registered op's body (torch_compile_guard's _eager_body); a
+        # rebound (e.g. monkeypatched) plain gemm_a16w16_ is still called.
+        op = getattr(op, "_eager_body", op)
+    return op(
         x,
         w,
         bias,
