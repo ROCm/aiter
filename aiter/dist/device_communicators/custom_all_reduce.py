@@ -1955,8 +1955,8 @@ class CustomAllreduce:
 
     # Tensors one `all_gatherv` launch takes (kAllGatherVMax).
     _ALL_GATHERV_MAX: ClassVar[int] = 4
-    # Past this many bytes a rank per rank in the group, NCCL's grouped
-    # all-gather is the faster. Measured on MI355X gathering MoE routed rows
+    # Past this many bytes per rank, times the group size, NCCL's grouped
+    # all-gather is faster. Measured on MI355X gathering MoE routed rows
     # in a replayed graph: the two cross near 4.5 / 9 / 21 MB a rank at
     # 2 / 4 / 8 ranks.
     _ALL_GATHERV_BYTES_PER_RANK: ClassVar[int] = 2 << 20
