@@ -14,6 +14,7 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
+from ..tensor_shim import _run_compiled
 from .combine import (
     CHUNK_ELEMS as _COMBINE_CHUNK_ELEMS,
 )
@@ -1023,7 +1024,8 @@ class MegaMoEGfx1250:
         plan_stream = self._compact_plan_stream
         plan_stream.wait_stream(cur)
         with torch.cuda.stream(plan_stream):
-            self._compact_plan_for(self._compact_step_align_m, slot)(
+            _run_compiled(
+                self._compact_plan_for(self._compact_step_align_m, slot),
                 self._arena.handle,
                 topk_ids.data_ptr(),
                 bufs["tok_map"].data_ptr(),
@@ -1402,7 +1404,8 @@ class MegaMoEGfx1250:
                 inp_cur_tok,
                 stream,
             ):
-                kern(
+                _run_compiled(
+                    kern,
                     arena_handle,
                     addr_inp_tok,
                     addr_inp_idx,
@@ -1780,13 +1783,15 @@ class MegaMoEGfx1250:
         stream = fx.Stream(torch.cuda.current_stream())
         # 1-block cross-device barrier, then the barrier-free reduce on the same
         # stream; the kernel boundary gives the reduce its visibility.
-        self._combine_sync(
+        _run_compiled(
+            self._combine_sync,
             self._arena.handle,
             self._cross_device_flag.data_ptr(),
             self._config.rank,
             stream,
         )
-        self._combine_variants[combine_quant_bits](
+        _run_compiled(
+            self._combine_variants[combine_quant_bits],
             self._arena.local_ptr("comb_inp"),
             self._combine_output.data_ptr(),
             routing.token_count,
