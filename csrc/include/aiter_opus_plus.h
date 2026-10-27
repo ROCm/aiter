@@ -4,15 +4,9 @@
 
 #include "hip_reduce.h"
 #include "opus/opus.hpp"
-// todo: remove this to use aiterTensor dtype
-// c10 half/bfloat16 are only needed for the t2opus<c10::*> specializations
-// below. Torch-free translation units (which use hip2opus instead) can define
-// AITER_NO_TORCH_TYPES before including this header to drop the torch include.
-#ifndef AITER_NO_TORCH_TYPES
-#include <c10/util/BFloat16.h>
-#include <c10/util/Half.h>
-#endif
 #include <hip/hip_bf16.h>
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
 
 namespace aiter {
 using namespace opus;
@@ -79,6 +73,19 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
     auto hi = fp32_to_fp8_scaled_x2(fp32x2_t{s[2], s[3]}, inverted_scale);
     return fp8x4_t{lo[0], lo[1], hi[0], hi[1]};
 }
+
+// bf16x8 -> fp8x8 with scalef32 (gfx1250: v_cvt_scalef32_pk8_fp8_bf16, 1 instr)
+// Scale semantics: result[i] = bf16[i] / scale (hardware divides, with saturation to ±448).
+// The caller's inverted_scale = 1/row_scale, so we pass 1/inverted_scale = row_scale.
+#if defined(__gfx1250__)
+template <typename S, std::enable_if_t<std::is_same_v<S, bf16x8_t>, bool> = true>
+OPUS_D decltype(auto) bf16_to_fp8_scalef32_x8(const S& s, float scale)
+{
+    typedef int __attribute__((ext_vector_type(2))) i2;
+    i2 r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(s, scale);
+    return __builtin_bit_cast(vector_t<fp8_t, 8>, r);
+}
+#endif
 
 // fp32x2 -> bf8x2 with scale + saturation clamp (E5M2)
 // ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_cvt_pk_bf8_f32
@@ -586,6 +593,50 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
     return scaled_cast<D>(fp32_vec, inverted_scale);
 }
 
+// scaled_cast_div: same conversion, but `scale` is the DIVISOR (row scale) rather than
+// its reciprocal.
+//
+// CALLER CONTRACT: `scale` MUST be an exact power of two. On gfx1250 this lowers to
+// v_cvt_scalef32_pk8_fp8_bf16, whose scale operand is an MX E8M0 factor: the hardware
+// reads only the 8 exponent bits and DISCARDS the mantissa. Passing a general fp32 scale
+// silently quantizes it down to the enclosing power of two -- e.g. 0.006975 is applied as
+// 2^-8, a 1.79x error, which overflows the large codes to NaN. Only the e8m0 quant path
+// (where the row scale is ceil_pow2 by construction) may use this.
+#if defined(__gfx1250__)
+template <typename D,
+          typename S,
+          std::enable_if_t<is_vector_v<S> && std::is_same_v<get_value_t<S>, bf16_t> &&
+                               std::is_same_v<D, fp8_t> && (size<S>() % 8 == 0),
+                           bool> = true>
+OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
+{
+    constexpr index_t N = size<S>();
+    vector_t<fp8_t, N> out;
+    static_for<N / 8>([&](auto i) {
+        bf16x8_t chunk;
+        static_for<8>([&](auto j) { chunk[j.value] = s[i.value * 8 + j.value]; });
+        auto pk = bf16_to_fp8_scalef32_x8(chunk, scale);
+        static_for<8>([&](auto j) { out[i.value * 8 + j.value] = pk[j.value]; });
+    });
+    return out;
+}
+#endif
+
+// Fallback: no hardware divide-by-scale convert for this type/arch, so invert here.
+template <typename D,
+          typename S,
+#if defined(__gfx1250__)
+          std::enable_if_t<!(is_vector_v<S> && std::is_same_v<get_value_t<S>, bf16_t> &&
+                             std::is_same_v<D, fp8_t> && (size<S>() % 8 == 0)),
+                           bool> = true>
+#else
+          bool = true>
+#endif
+OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
+{
+    return scaled_cast<D>(s, 1.0f / scale);
+}
+
 // fp4 target: any fp32 vector size via x2 loop
 template <
     typename D,
@@ -751,7 +802,8 @@ template <typename T,
           int aux                    = 0,
           bool interleave            = false,
           int interleave_thread_size = WARP_SIZE,
-          typename T_R               = T>
+          typename T_R               = T,
+          bool scale_is_divisor      = false>
 __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                                     const opus::vector_t<DTYPE_I, vec_size>& vec,
                                     int row_offset,
@@ -799,7 +851,10 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
             else
             {
                 opus::vector_t<T_R, chunk_size_elements> chunk_convert;
-                chunk_convert           = scaled_cast<T_R>(*chunk_ptr, inverted_scale);
+                if constexpr(scale_is_divisor)
+                    chunk_convert = scaled_cast_div<T_R>(*chunk_ptr, inverted_scale);
+                else
+                    chunk_convert = scaled_cast<T_R>(*chunk_ptr, inverted_scale);
                 store_type& chunk_store = reinterpret_cast<store_type&>(chunk_convert);
                 store<store_chunk_size_elements>(
                     buffer, chunk_store, row_offset, chunk_offset_elements, opus::number<aux>{});
@@ -830,7 +885,8 @@ template <typename T,
           bool interleave            = false,
           int interleave_thread_size = WARP_SIZE,
           int num_repeat             = 1,
-          typename T_R               = T>
+          typename T_R               = T,
+          bool scale_is_divisor      = false>
 __device__ void store_vector(opus::gmem<T>& buffer,
                              const opus::vector_t<DTYPE_I, vec_size>& vec,
                              int row_offset,
@@ -840,17 +896,17 @@ __device__ void store_vector(opus::gmem<T>& buffer,
     static constexpr index_t store_bytes      = vec_size * opus::sizeof_bits<T_R>::value / 8;   // total output bytes (logical type T_R)
     if constexpr((store_bytes / num_store_repeat) % 16 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 16, aux, interleave, interleave_thread_size, T_R>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 16, aux, interleave, interleave_thread_size, T_R, scale_is_divisor>(
             buffer, vec, row_offset, inverted_scale);
     }
     else if constexpr((store_bytes / num_store_repeat) % 8 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 8, aux, interleave, interleave_thread_size, T_R>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 8, aux, interleave, interleave_thread_size, T_R, scale_is_divisor>(
             buffer, vec, row_offset, inverted_scale);
     }
     else if constexpr((store_bytes / num_store_repeat) % 4 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 4, aux, interleave, interleave_thread_size, T_R>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 4, aux, interleave, interleave_thread_size, T_R, scale_is_divisor>(
             buffer, vec, row_offset, inverted_scale);
     }
     else
@@ -896,37 +952,6 @@ OPUS_D void s_wait_all_dscnt(number<ds_cnt> = {})
 #endif
     }
 }
-
-// todo: edit this to use aiterTensor dtype
-template <typename T>
-struct t2opus;
-template <>
-struct t2opus<float>
-{
-    using type = float;
-};
-#ifndef AITER_NO_TORCH_TYPES
-template <>
-struct t2opus<c10::Half>
-{
-    using type = opus::fp16_t;
-};
-template <>
-struct t2opus<c10::BFloat16>
-{
-    using type = opus::bf16_t;
-};
-#endif
-template <>
-struct t2opus<int32_t>
-{
-    using type = int32_t;
-};
-template <>
-struct t2opus<int8_t>
-{
-    using type = opus::i8_t;
-};
 
 // HIP native type -> opus type mapping
 template <typename T> struct hip2opus;

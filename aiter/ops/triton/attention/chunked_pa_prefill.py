@@ -16,6 +16,14 @@ from aiter.ops.triton._triton_kernels.attention.chunked_pa_prefill import (
     _kernel_paged_attention_2d,
 )
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
+from aiter.ops.triton.utils._triton import arch_info
+
+# gfx942 and gfx1250 keep Triton's defaults
+# For gfx950: tuned launch for the decode kernel.
+tuned_decode = arch_info.get_arch() == "gfx950"
+decode_launch = (
+    {"num_warps": 1, "num_stages": 1, "waves_per_eu": 2} if tuned_decode else {}
+)
 
 
 def chunked_prefill_paged_decode(
@@ -134,4 +142,7 @@ def chunked_prefill_paged_decode(
         stride_v_cache_3=value_cache.stride(3),
         filter_by_query_len=True,
         query_start_len_ptr=query_start_loc,
+        # num_warps=1 measured strictly faster on all
+        # 34 decode shapes swept on gfx950/Triton 3.8
+        **decode_launch,
     )

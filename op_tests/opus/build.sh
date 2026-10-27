@@ -19,6 +19,12 @@ cd "$SCRIPT_DIR"
 HIPCC="${HIPCC:-hipcc}"
 CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -I${REPO_ROOT}/csrc/include"
 
+# Bare hipcc does not always bake an rpath for the HIP runtime (e.g. the ROCm
+# python-SDK layout in newer rocm/pytorch images), and ld.so.conf may not cover
+# it either -- link the runtime lib dir explicitly so the binaries start.
+ROCM_LIB="$(hipconfig --rocmpath 2>/dev/null || echo "${ROCM_PATH:-/opt/rocm}")/lib"
+LDFLAGS="-Wl,-rpath,${ROCM_LIB}"
+
 # test_opus_basic      : host-only container/proxy checks (runs without a GPU)
 # test_opus_fp4_device : on-device fp4 round-trip + packing (SKIPs cleanly without gfx950)
 TESTS=(test_opus_basic test_opus_fp4_device)
@@ -33,7 +39,7 @@ build() {
   echo "Using $HIPCC for compilation"
   for i in "${!TESTS[@]}"; do
     echo "Building ${TESTS[$i]}..."
-    "$HIPCC" $CXXFLAGS "${SOURCES[$i]}" -o "${TESTS[$i]}"
+    "$HIPCC" $CXXFLAGS "${SOURCES[$i]}" -o "${TESTS[$i]}" $LDFLAGS
   done
   echo "Build complete."
 }

@@ -1,18 +1,29 @@
 import torch
 import triton.language as tl
 
-from ._triton import arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 
 def get_dtype_max(dtype):
-    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
+    # Make this tensor on the CPU. It only checks the dtype.
+    if torch.is_floating_point(torch.tensor([], dtype=dtype, device="cpu")):
         return torch.finfo(dtype).max
     else:
         return torch.iinfo(dtype).max
 
 
 def get_fp8_dtypes():
-    if arch_info.get_arch() in ("gfx950", "gfx1250", "gfx1200", "gfx1201"):
+    if arch_info.get_arch() in (
+        "gfx950",
+        "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1150",
+        "gfx1151",
+        "gfx1200",
+        "gfx1201",
+        "gfx1250",
+    ):
         e5m2_dtype = torch.float8_e5m2
         e4m3_dtype = torch.float8_e4m3fn
     else:
@@ -23,11 +34,7 @@ def get_fp8_dtypes():
 
 
 def get_fp8_e4m3_dtype():
-    if arch_info.get_arch() in ("gfx950", "gfx1250", "gfx1200", "gfx1201"):
-        e4m3_dtype = torch.float8_e4m3fn
-    else:
-        e4m3_dtype = torch.float8_e4m3fnuz
-
+    _, e4m3_dtype = get_fp8_dtypes()
     return e4m3_dtype
 
 
@@ -69,6 +76,17 @@ torch_to_triton_dtype = {
     torch.int8: tl.int8,
     torch.uint8: tl.uint8,
 }
+
+
+def get_scaled_dot_format_string(dtype: tl.dtype):
+    mapping = {
+        tl.float16: "fp16",
+        tl.bfloat16: "bf16",
+        tl.uint8: "e2m1",
+        tl.float8e4nv: "e4m3",
+        tl.float8e5: "e5m2",
+    }
+    return mapping[dtype]
 
 
 def _is_fp8(x):

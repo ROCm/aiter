@@ -63,7 +63,9 @@ def _find_tuned_csvs(pattern):
 
 def _resolve_config_via_aiter(config_property):
     """Resolve config file through AITER_CONFIGS (same path as production).
-    Returns the resolved file path, or None if unavailable."""
+
+    Returns the resolved file path, or None if unavailable.
+    """
     try:
         from aiter.jit.core import AITER_CONFIGS
 
@@ -287,6 +289,24 @@ TUNER_FAMILIES = {
         "exclude_patterns": [],
         "config_property": "AITER_CONFIG_GEMM_A4W4_FILE",
     },
+    "a6w6_blockscale": {
+        "script": "csrc/gemm_a6w6/gemm_a6w6_tune.py",
+        "csv_pattern": "a6w6_blockscale_tuned_gemm",
+        "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_GEMM_A6W6_FILE",
+    },
+    "a6w4_asm": {
+        "script": "csrc/gemm_a6w4/gemm_a6w4_tune.py",
+        "csv_pattern": "a6w4_asm_tuned_gemm",
+        "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_GEMM_A6W4_ASM_FILE",
+    },
+    "a4w6_asm": {
+        "script": "csrc/gemm_a4w6/gemm_a4w6_tune.py",
+        "csv_pattern": "a4w6_asm_tuned_gemm",
+        "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_GEMM_A4W6_ASM_FILE",
+    },
     "batched_a8w8": {
         "script": "csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py",
         "csv_pattern": "a8w8_tuned_batched_gemm",
@@ -318,6 +338,13 @@ TUNER_FAMILIES = {
         "csv_pattern": "bf16_tuned_gemm",
         "exclude_patterns": ["batched"],
         "config_property": "AITER_CONFIG_GEMM_BF16_FILE",
+    },
+    "gdn_k5_opt": {
+        "script": "csrc/gdn_k5/chunk_gdn_h_opt_tune.py",
+        "csv_pattern": "chunk_gdn_h_opt_tuned",
+        "exclude_patterns": ["untuned"],
+        "timeout": 1800,
+        "config_property": "AITER_CONFIG_GDN_K5_OPT_FILE",
     },
 }
 
@@ -399,6 +426,15 @@ class TestRunConfig(unittest.TestCase):
     def test_a4w4_blockscale(self):
         self._test_family("a4w4_blockscale")
 
+    def test_a6w6_blockscale(self):
+        self._test_family("a6w6_blockscale")
+
+    def test_a6w4_asm(self):
+        self._test_family("a6w4_asm")
+
+    def test_a4w6_asm(self):
+        self._test_family("a4w6_asm")
+
     def test_batched_a8w8(self):
         self._test_family("batched_a8w8")
 
@@ -413,6 +449,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_csrc_bf16(self):
         self._test_family("csrc_bf16")
+
+    def test_gdn_k5_opt(self):
+        self._test_family("gdn_k5_opt")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

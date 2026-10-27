@@ -4,7 +4,7 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.triton._triton_kernels.activation import (
+from aiter.ops.triton._triton_kernels.common.activation import (
     _get_activation_from_str,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
@@ -173,6 +173,7 @@ def fused_rms_fp8_group_quant(
     res1=None,
     output_unquantized_inp1=False,
     transpose_scale=False,
+    is_x_scale_strided: bool = False,
 ):
     """
     This op contains several steps:
@@ -183,9 +184,16 @@ def fused_rms_fp8_group_quant(
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
-    - transpose_scale: If True, return scale with shape (M, cdiv(N1, group_size)) but stored in
-                      column-major (transposed) memory layout. Equivalent to:
-                      scale.transpose(0, 1).contiguous().view(*scale.shape)
+    - transpose_scale: If True, return scale with shape (M, cdiv(N1, group_size)) stored in
+                      column-major (transposed) memory. The scale buffer bytes are the same
+                      either way; is_x_scale_strided selects how those bytes are presented.
+    - is_x_scale_strided: Only used when transpose_scale=True. Selects the presentation of the
+                      column-major scale buffer for the CK bpreshuffle GEMM (see PR #4406, which
+                      detects the layout via is_x_scale_tranposed = x_scale.stride(0) != 1):
+                        False (default): contiguous view, shape (M, num_bs_cols), strides
+                          (num_bs_cols, 1). Equivalent to scale.transpose(0,1).contiguous().view(*scale.shape).
+                        True: strided column-major view, shape (M, num_bs_cols), strides (1, M).
+                          Equivalent to scale.transpose(0,1).contiguous().transpose(0,1).
 
     Returns:
     - out1_fp8: The output matrix with shape (M, N1).
@@ -341,10 +349,17 @@ def fused_rms_fp8_group_quant(
         ACTIVATION="silu",
         num_warps=num_warps,
     )
-    # When transpose_scale=True, view the transposed buffer back to original shape
-    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    # When transpose_scale=True, re-present the [num_bs_cols, M] column-major
+    # buffer the kernel wrote as (M, num_bs_cols). Both branches return the same
+    # bytes; they differ only in stride(0), which is how the CK bpreshuffle GEMM
+    # detects the layout (PR #4406: is_x_scale_tranposed = x_scale.stride(0) != 1).
     if transpose_scale:
-        out1_bs = out1_bs.view(M, num_bs_cols)
+        if is_x_scale_strided:
+            # Strided column-major view: strides (1, M), stride(0) == 1.
+            out1_bs = out1_bs.transpose(0, 1)
+        else:
+            # Default: contiguous view, strides (num_bs_cols, 1), stride(0) != 1.
+            out1_bs = out1_bs.view(M, num_bs_cols)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1
 
@@ -594,7 +609,7 @@ def fused_reduce_act_mul_fp8_group_quant(
     x2: torch.Tensor | None = None,
     group_size=128,
     dtype_quant=fp8_dtype,
-    dtype: float | None = torch.bfloat16,
+    dtype: torch.dtype | None = torch.bfloat16,
 ):
     """
     Apply reduction along the first dimension and apply the activation function + per-token group quantization.
@@ -608,7 +623,7 @@ def fused_reduce_act_mul_fp8_group_quant(
         if x is 2-dim,
             x: (M, 2*N1), dtype = fp16 or bf16.
             x2 must be None
-            the kernel is essentially identical to aiter.ops.triton.activation.act_mul_and_fp8_group_quant
+            the kernel is essentially identical to aiter.ops.triton.fusions.activation.act_mul_and_fp8_group_quant
 
         activation: activation function to apply before quantization.
             - It splits the features into two parts and applies the activation to the first part.
@@ -618,6 +633,8 @@ def fused_reduce_act_mul_fp8_group_quant(
                 - "gelu"
                 - "gelu_tanh"
 
+        dtype: dtype of y2. If None, y2 has the dtype of x2.
+
     Returns:
         tuple: (y, y_scale), y2
             y: (M, N1), dtype = dtype_quant
@@ -625,7 +642,9 @@ def fused_reduce_act_mul_fp8_group_quant(
             y2: (M, N2), dtype = dtype
     """
     _LOGGER.info(
-        f"FUSED_REDUCTION_ACT_MUL_FP8_GROUP_QUANT: x={tuple(x.shape)} activation={activation}"
+        "FUSED_REDUCTION_ACT_MUL_FP8_GROUP_QUANT: x=%s activation=%s",
+        tuple(x.shape),
+        activation,
     )
 
     assert (
@@ -645,7 +664,9 @@ def fused_reduce_act_mul_fp8_group_quant(
             x_num_splitk > 1
         ), "x.shape[0] should be larger then 1 in x.dim() == 3 cases"
         X_HAS_SPLITK = True
-        y2 = torch.empty((M, N2), dtype=dtype, device=x2.device)
+        y2 = torch.empty(
+            (M, N2), dtype=dtype if dtype is not None else x2.dtype, device=x2.device
+        )
     else:
         M, N1 = x.shape
         assert x2 is None, "x2 should be None in x.dim() == 2 cases"
@@ -729,6 +750,7 @@ def fused_reduce_rms_fp8_group_quant(
     output_unquantized_inp1=False,
     out3=None,
     transpose_scale=False,
+    is_x_scale_strided: bool = False,
 ):
     """
     This op contains several steps:
@@ -740,6 +762,16 @@ def fused_reduce_rms_fp8_group_quant(
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
+    - transpose_scale: If True, return scale with shape (M, cdiv(N1, group_size)) stored in
+                      column-major (transposed) memory. is_x_scale_strided selects how those
+                      bytes are presented.
+    - is_x_scale_strided: Only used when transpose_scale=True. Selects the presentation of the
+                      column-major scale buffer for the CK bpreshuffle GEMM (see PR #4406, which
+                      detects the layout via is_x_scale_tranposed = x_scale.stride(0) != 1):
+                        False (default): contiguous view, shape (M, num_bs_cols), strides
+                          (num_bs_cols, 1). Equivalent to scale.transpose(0,1).contiguous().view(*scale.shape).
+                        True: strided column-major view, shape (M, num_bs_cols), strides (1, M).
+                          Equivalent to scale.transpose(0,1).contiguous().transpose(0,1).
 
     Returns:
     - out1_fp8: The output matrix with shape (M, N1).
@@ -876,7 +908,10 @@ def fused_reduce_rms_fp8_group_quant(
     if max_BN <= 512:
         num_warps = 1
     elif max_BN <= 2048:
-        num_warps = 4
+        if M >= 1024:
+            num_warps = 1
+        else:
+            num_warps = 4
     elif max_BN <= 4096:
         num_warps = 8
     else:
@@ -946,10 +981,17 @@ def fused_reduce_rms_fp8_group_quant(
         NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
         num_warps=num_warps,
     )
-    # When transpose_scale=True, view the transposed buffer back to original shape
-    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    # When transpose_scale=True, re-present the [num_bs_cols, M] column-major
+    # buffer the kernel wrote as (M, num_bs_cols). Both branches return the same
+    # bytes; they differ only in stride(0), which is how the CK bpreshuffle GEMM
+    # detects the layout (PR #4406: is_x_scale_tranposed = x_scale.stride(0) != 1).
     if transpose_scale:
-        out1_bs = out1_bs.view(M, num_bs_cols)
+        if is_x_scale_strided:
+            # Strided column-major view: strides (1, M), stride(0) == 1.
+            out1_bs = out1_bs.transpose(0, 1)
+        else:
+            # Default: contiguous view, strides (num_bs_cols, 1), stride(0) != 1.
+            out1_bs = out1_bs.view(M, num_bs_cols)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1, out3
 

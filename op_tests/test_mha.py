@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import ast
+import inspect
 import itertools
 
 import pandas as pd
@@ -11,7 +13,8 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.mha import fmha_fwd_bf16_opus_fwd, fmha_fwd_bf16_opus_varlen_fwd
+from aiter.ops import mha as mha_ops
+from aiter.ops.mha import fmha_fwd_bf16_opus_fwd
 from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
@@ -19,6 +22,8 @@ from aiter.test_mha_common import (
     ck_randval_to_dropout_mask,
     convert_flash_attn_S_to_softmax,
     generate_qkv,
+    opus_check_lse,
+    opus_ref_lse,
 )
 
 
@@ -1101,112 +1106,50 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     )
 
 
-# OPUS gfx950 dense D=128 via flash_attn_func. Cases span the gate (sq==sk):
-# le2 (<=128), pipelined odd/even, partial last tile (n%64), large n; MHA/GQA/MQA.
-_OPUS_CASES = [
-    (2, 64, 8, 2),  # le2 1-tile, GQA
-    (2, 128, 16, 1),  # le2 2-tile, MQA
-    (2, 100, 8, 2),  # partial last tile, GQA
-    (2, 127, 8, 8),  # partial last tile, MHA
-    (2, 129, 32, 8),  # pipelined odd (3 tiles), GQA
-    (1, 200, 16, 16),  # pipelined, MHA
-    (2, 256, 8, 1),  # pipelined even, MQA
-    (2, 512, 8, 2),  # pipelined even, GQA
-    (1, 1000, 8, 8),  # partial large, MHA
-    (2, 1023, 16, 4),  # partial odd, GQA
-    (1, 4096, 8, 2),  # large, GQA
-    (4, 256, 8, 8),  # larger batch, MHA
+# OPUS gfx950 dense (batch) cases, shared by the D=128 and D_QK=192/D_V=128 tests.
+# Causal is bottom-right aligned, so seqlen_q > seqlen_kv gives O=0 / LSE=-inf rows.
+#   (batch, seqlen_q, seqlen_kv, nheads, nheads_k)
+_OPUS_BATCH_CASES = [
+    (2, 64, 64, 8, 2),  # 1 KV tile, GQA
+    (2, 128, 128, 16, 1),  # 2 KV tiles, MQA
+    (2, 100, 100, 8, 2),  # partial last KV tile, GQA
+    (2, 129, 129, 32, 8),  # pipelined odd tile count, GQA
+    (1, 256, 256, 16, 16),  # exactly one Q block, MHA
+    (2, 512, 512, 8, 1),  # multiple Q blocks, MQA
+    (2, 1023, 1023, 16, 4),  # partial odd, GQA
+    (1, 4096, 4096, 8, 2),  # large, GQA
+    (4, 256, 256, 8, 8),  # larger batch, MHA
+    (2, 128, 512, 8, 2),  # cross sq < sk, GQA
+    (2, 512, 128, 8, 2),  # cross sq > sk, GQA
+    (1, 300, 700, 4, 4),  # cross, partial both sides, MHA
+    (2, 256, 65, 16, 4),  # cross, sk under one KV tile, GQA
+    (2, 1, 1024, 8, 8),  # single query row, MHA
+    (2, 1024, 640, 64, 8),  # 4*64*2 = 512 -> causal head/tail merge
+    (2, 300, 0, 8, 2),  # no keys at all -> zero KV tiles, every row fully masked
+]
+
+_OPUS_BATCH_IDS = [
+    f"b{b}_sq{sq}_sk{sk}_h{h}_hkv{hk}" for (b, sq, sk, h, hk) in _OPUS_BATCH_CASES
 ]
 
 
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize(
-    "batch_size,seqlen,nheads,nheads_k",
-    _OPUS_CASES,
-    ids=[f"b{b}_s{s}_h{h}_hkv{hk}" for (b, s, h, hk) in _OPUS_CASES],
-)
-def test_flash_attn_func_opus(
-    batch_size, seqlen, nheads, nheads_k, causal, monkeypatch
+def _run_opus_batch_case(
+    batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, d_qk, d_v, causal
 ):
-    """Validate the OPUS D=128 kernel THROUGH flash_attn_func.
-
-    Opus engages only with AITER_ENABLE_FMHA_OPUS=1 + the gate (gfx950, bf16,
-    D=128, dense, sq==sk, inference/no-LSE). The env is monkeypatched scoped to
-    this test so the other cases keep exercising the default v3/CK dispatch.
-    """
-    if get_gfx() != "gfx950":
-        pytest.skip("opus D=128 kernel requires gfx950")
-    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
-
+    """Shared body: flash_attn_func with LSE, assert it routed to OPUS, check results."""
     torch.manual_seed(0)
-    d = 128
-    q = torch.randn(batch_size, seqlen, nheads, d, device="cuda", dtype=dtypes.bf16)
-    k = torch.randn(batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtypes.bf16)
-    v = torch.randn(batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtypes.bf16)
-
-    with torch.no_grad():
-        out = aiter.flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            softmax_scale=None,  # -> default 1/sqrt(d), matches attention_ref
-            causal=causal,
-            window_size=(-1, -1),
-            return_lse=False,
-            return_attn_probs=False,
-        )
-
-    out_ref, _ = run_torch(q, k, v, causal=causal)
-    out_pt, _ = run_torch(q, k, v, causal=causal, upcast=False, reorder_ops=True)
-    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
-    print(f"[opus] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}")
-    assert (out - out_ref).abs().max().item() <= out_tol
-
-    with torch.no_grad():
-        out_opus = fmha_fwd_bf16_opus_fwd(q, k, v, softmax_scale=d**-0.5, causal=causal)
-    assert torch.equal(
-        out, out_opus
-    ), "flash_attn_func did not route to the opus kernel (env/gate not engaged)"
-
-
-# OPUS gfx950 asymmetric D_QK=192 / D_V=128. Batch cases span partial/odd/large seqlen
-# and MHA/GQA/MQA. This kernel is enabled by DEFAULT (no env), so flash_attn_func should
-# route here for (192,128) bf16 on gfx950 without any monkeypatch.
-_OPUS_D192_CASES = [
-    (2, 64, 8, 2),  # tiny, GQA
-    (2, 100, 8, 2),  # partial last tile, GQA
-    (2, 127, 8, 8),  # partial last tile, MHA
-    (2, 129, 32, 8),  # pipelined odd, GQA
-    (1, 256, 16, 16),  # MHA
-    (2, 512, 8, 1),  # MQA
-    (1, 1023, 16, 4),  # partial odd, GQA
-    (1, 4096, 8, 2),  # large, GQA
-    (4, 256, 8, 8),  # larger batch, MHA
-]
-
-
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize(
-    "batch_size,seqlen,nheads,nheads_k",
-    _OPUS_D192_CASES,
-    ids=[f"b{b}_s{s}_h{h}_hkv{hk}" for (b, s, h, hk) in _OPUS_D192_CASES],
-)
-def test_flash_attn_func_opus_d192_v128(batch_size, seqlen, nheads, nheads_k, causal):
-    """Validate the OPUS D_QK=192/D_V=128 kernel THROUGH flash_attn_func (default-on)."""
-    if get_gfx() != "gfx950":
-        pytest.skip("opus D=192 kernel requires gfx950")
-
-    torch.manual_seed(0)
-    d_qk, d_v = 192, 128
-    q = torch.randn(batch_size, seqlen, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
-    k = torch.randn(
-        batch_size, seqlen, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d_qk, device="cuda", dtype=dtypes.bf16
     )
-    v = torch.randn(batch_size, seqlen, nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(
+        batch_size, seqlen_kv, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16
+    )
+    v = torch.randn(
+        batch_size, seqlen_kv, nheads_k, d_v, device="cuda", dtype=dtypes.bf16
+    )
 
     with torch.no_grad():
-        out = aiter.flash_attn_func(
+        out, lse = aiter.flash_attn_func(
             q,
             k,
             v,
@@ -1214,98 +1157,164 @@ def test_flash_attn_func_opus_d192_v128(batch_size, seqlen, nheads, nheads_k, ca
             softmax_scale=None,  # -> default 1/sqrt(d_qk), matches attention_ref
             causal=causal,
             window_size=(-1, -1),
-            return_lse=False,
+            return_lse=True,
             return_attn_probs=False,
         )
-
-    out_ref, _, _ = attention_ref(q, k, v, causal=causal)
-    out_pt, _, _ = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
-    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
-    print(
-        f"[opus-d192] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}"
-    )
-    assert (out - out_ref).abs().max().item() <= out_tol
-
-    with torch.no_grad():
+        # The dispatch chain tries several backends before OPUS; without this the
+        # checks below could be validating a different kernel.
         out_opus = fmha_fwd_bf16_opus_fwd(
             q, k, v, softmax_scale=d_qk**-0.5, causal=causal
         )
     assert torch.equal(
         out, out_opus
-    ), "flash_attn_func did not route to the opus D=192 kernel"
+    ), f"flash_attn_func did not route to the opus d{d_qk} kernel"
 
+    tag = f"opus-d{d_qk}"
+    out_ref, _, _ = attention_ref(q, k, v, causal=causal)
+    out_pt, _, _ = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+    out_diff = (out - out_ref).abs().max().item()
+    print(f"[{tag}] out max diff: {out_diff} tol={out_tol}")
+    assert out_diff <= out_tol
 
-# OPUS gfx950 group/varlen D_QK=192 / D_V=128. Validated through the direct wrapper
-# (packed THD; exercises the group-mode host launch + kernel via the shared pybind).
-_OPUS_D192_GROUP_CASES = [
-    (3, [64, 200, 500], 8, 2),  # varlen, GQA
-    (2, [128, 1000], 16, 16),  # varlen, MHA
-    (4, [300, 300, 300, 300], 8, 8),  # uniform, MHA
-    (2, [1023, 65], 16, 4),  # odd/partial, GQA
-]
+    lse_ref = opus_ref_lse(q, k, causal)
+    assert tuple(lse.shape) == (batch_size, nheads, seqlen_q), f"lse {tuple(lse.shape)}"
+    opus_check_lse(tag, lse, lse_ref)
+
+    dead = torch.isneginf(lse_ref)  # rows that see no keys -> O must be exactly 0
+    if dead.any():
+        dead_o = dead.permute(0, 2, 1).unsqueeze(-1).expand_as(out)
+        assert (out[dead_o] == 0).all(), f"{tag}: fully-masked rows must produce O=0"
+        print(f"[{tag}] fully-masked rows: {int(dead.sum())}")
 
 
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
-    "num_groups,seqlens,nheads,nheads_k",
-    _OPUS_D192_GROUP_CASES,
-    ids=[f"g{g}_h{h}_hkv{hk}" for (g, _sl, h, hk) in _OPUS_D192_GROUP_CASES],
+    "batch_size,seqlen_q,seqlen_kv,nheads,nheads_k",
+    _OPUS_BATCH_CASES,
+    ids=_OPUS_BATCH_IDS,
 )
-def test_fmha_fwd_bf16_opus_d192_v128_group(
-    num_groups, seqlens, nheads, nheads_k, causal
+def test_flash_attn_func_opus(
+    batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, causal, monkeypatch
 ):
-    """Validate the OPUS D=192 group/varlen path via the direct shared wrapper.
+    """OPUS gfx950 dense D=128 forward through flash_attn_func, with LSE.
 
-    Self-attention per group (seqlen_q == seqlen_kv); packed [total, H, D]; no KV
-    padding (physical == real cu_seqlens). Compares each group against attention_ref.
+    Env-gated (AITER_ENABLE_FMHA_OPUS=1); monkeypatched scoped to this test so the
+    other cases keep exercising the default v3/CK dispatch.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_batch_case(
+        batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, 128, 128, causal
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen_q,seqlen_kv,nheads,nheads_k",
+    _OPUS_BATCH_CASES,
+    ids=_OPUS_BATCH_IDS,
+)
+def test_flash_attn_func_opus_d192_v128(
+    batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, causal
+):
+    """OPUS gfx950 dense D_QK=192/D_V=128 forward through flash_attn_func, with LSE.
+
+    Enabled by default (no env), so no monkeypatch.
     """
     if get_gfx() != "gfx950":
         pytest.skip("opus D=192 kernel requires gfx950")
-    assert len(seqlens) == num_groups
+    _run_opus_batch_case(
+        batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, 192, 128, causal
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sink forward dispatch: the fmha_v3_fwd ASM kernels take no sink arguments,
+# so any call with sink_ptr or sink_size must route to CK (mha_fwd) instead.
+# ---------------------------------------------------------------------------
+
+
+def _sink_dispatch_param_names(fn_name):
+    """Parameter names of an op stub in aiter.ops.mha (compile_ops hides them)."""
+    for node in ast.parse(inspect.getsource(mha_ops)).body:
+        if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+            return [arg.arg for arg in node.args.args]
+    raise LookupError(fn_name)
+
+
+def _sink_dispatch_record(monkeypatch, asm_name, ck_name):
+    """Wrap the ASM and CK entry points; return the calls each receives."""
+    calls = {"asm": 0, "ck": []}
+    asm_fn = getattr(mha_ops, asm_name)
+    ck_fn = getattr(mha_ops, ck_name)
+    ck_params = _sink_dispatch_param_names(ck_name)
+
+    def asm_spy(*args, **kwargs):
+        calls["asm"] += 1
+        return asm_fn(*args, **kwargs)
+
+    def ck_spy(*args, **kwargs):
+        calls["ck"].append({**dict(zip(ck_params, args)), **kwargs})
+        return ck_fn(*args, **kwargs)
+
+    monkeypatch.setattr(mha_ops, asm_name, asm_spy)
+    monkeypatch.setattr(mha_ops, ck_name, ck_spy)
+    return calls
+
+
+_SINK_DISPATCH_CASES = [
+    ("none", "unbounded"),
+    ("none", "covers_seq"),
+    ("sink_ptr", "unbounded"),
+    ("sink_ptr", "covers_seq"),
+    ("sink_size", "covers_seq"),
+]
+
+
+@pytest.mark.parametrize("sink,window", _SINK_DISPATCH_CASES)
+def test_flash_attn_func_sink_bypasses_v3_asm(sink, window, monkeypatch):
+    """BF16 D128 calls that qualify for fmha_v3_fwd must go to CK with a sink.
+
+    `sink="none"` is the control proving the shape takes the ASM path. A window
+    covering the whole sequence is normalized to -1, so it is not SWA and does
+    not exclude ASM on its own.
+    """
+    if get_gfx() not in ("gfx942", "gfx950"):
+        pytest.skip("fmha_v3_fwd ASM kernels require gfx942/gfx950")
+    batch_size, seqlen, nheads, nheads_k, hdim = 2, 256, 8, 2, 128
+    sink_size = 4 if sink == "sink_size" else 0
+    left = -1 if window == "unbounded" else seqlen
+    window_size = (left, 0, sink_size)
 
     torch.manual_seed(0)
-    d_qk, d_v = 192, 128
-    total = sum(seqlens)
-    q = torch.randn(total, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
-    k = torch.randn(total, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16)
-    v = torch.randn(total, nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
-
-    cu = torch.tensor(
-        [0] + list(torch.tensor(seqlens).cumsum(0).tolist()),
-        dtype=torch.int32,
-        device="cuda",
+    q = torch.randn(batch_size, seqlen, nheads, hdim, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(
+        batch_size, seqlen, nheads_k, hdim, device="cuda", dtype=dtypes.bf16
     )
-    max_s = max(seqlens)
+    v = torch.randn_like(k)
+    sink_ptr = (
+        torch.randn(nheads, device="cuda", dtype=torch.float32)
+        if sink == "sink_ptr"
+        else None
+    )
 
-    with torch.no_grad():
-        out = fmha_fwd_bf16_opus_varlen_fwd(
-            q,
-            k,
-            v,
-            softmax_scale=d_qk**-0.5,
-            causal=causal,
-            seqstart_q=cu,
-            seqstart_k=cu,
-            max_seqlen_q=max_s,
-            max_seqlen_k=max_s,
-        )
+    calls = _sink_dispatch_record(monkeypatch, "fmha_v3_fwd", "mha_fwd")
+    out = aiter.flash_attn_func(
+        q, k, v, causal=True, window_size=window_size, sink_ptr=sink_ptr
+    )
+    assert torch.isfinite(out).all()
 
-    # Per-group fp32 reference.
-    max_diff = 0.0
-    starts = [0]
-    for s in seqlens:
-        starts.append(starts[-1] + s)
-    for g in range(num_groups):
-        lo, hi = starts[g], starts[g + 1]
-        qg = q[lo:hi].unsqueeze(0)
-        kg = k[lo:hi].unsqueeze(0)
-        vg = v[lo:hi].unsqueeze(0)
-        out_ref, _, _ = attention_ref(qg, kg, vg, causal=causal)
-        out_pt, _, _ = attention_ref(
-            qg, kg, vg, causal=causal, upcast=False, reorder_ops=True
-        )
-        tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
-        diff = (out[lo:hi].unsqueeze(0) - out_ref).abs().max().item()
-        max_diff = max(max_diff, diff)
-        assert diff <= tol, f"group {g} diff {diff} > tol {tol}"
-    print(f"[opus-d192-group] max diff across groups: {max_diff}")
+    if sink == "none":
+        assert calls["asm"] == 1 and not calls["ck"]
+        return
+    assert calls["asm"] == 0, "sink call was dispatched to fmha_v3_fwd ASM"
+    assert len(calls["ck"]) == 1
+    ck_args = calls["ck"][0]
+    assert ck_args["window_size_left"] == -1
+    assert ck_args["sink_size"] == sink_size
+    if sink_ptr is None:
+        assert ck_args["sink_ptr"] is None
+    else:
+        assert torch.equal(ck_args["sink_ptr"], sink_ptr)

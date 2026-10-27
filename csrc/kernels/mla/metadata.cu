@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "aiter_hip_common.h"
+#include "mla_decode_shape.h"
+#include "mla_metadata.h"
 #include "metadata/v1_0_device.cuh"
 #include "metadata/v1_1_device.cuh"
-#include "metadata/v1_1_host.cuh"
 #include "metadata/v1_2_device.cuh"
 #include "metadata/v1_2_pa_device.cuh"
 #include "metadata/v1_2_host.cuh"
+#include <cstdlib>
+#include <stdexcept>
 
 // ===================================================================================================================
 // MLA Metadata V1
@@ -38,59 +41,63 @@
 //                                               reduced.
 //
 void get_mla_metadata_v1(
-    const torch::Tensor&                seqlens_qo_indptr,     // [batch size + 1]
-    const torch::Tensor&                seqlens_kv_indptr,     // [batch size + 1]
-    const torch::Tensor&                kv_last_page_lens,     // [batch size]
-    const int32_t                       num_heads_per_head_k,
-    const int32_t                       num_heads_k,
-    const bool                          is_causal,
-    torch::Tensor&                      work_metadata_ptrs,
-    torch::Tensor&                      work_info_set,
-    torch::Tensor&                      work_indptr,
-    torch::Tensor&                      reduce_indptr,
-    torch::Tensor&                      reduce_final_map,
-    torch::Tensor&                      reduce_partial_map,
-    const int32_t                       page_size,
-    const int32_t                       kv_granularity,
-    const int32_t                       max_seqlen_qo,
-    const int32_t                       uni_seqlen_qo,
-    const bool                          fast_mode,
-    const int32_t                       topk,
-    const int32_t                       max_split_per_batch,
-    const bool                          intra_batch_mode,
-    const bool                          is_cp_round_robin,
-    const MlaVersion                    mla_version,
-    const std::optional<at::ScalarType> dtype_q_nope,
-    const std::optional<at::ScalarType> dtype_q_rope,
-    const std::optional<at::ScalarType> dtype_kv_nope,
-    const std::optional<at::ScalarType> dtype_kv_rope)
+    const aiter_tensor_t&              seqlens_qo_indptr,     // [batch size + 1]
+    const aiter_tensor_t&              seqlens_kv_indptr,     // [batch size + 1]
+    const aiter_tensor_t&              kv_last_page_lens,     // [batch size]
+    const int32_t                     num_heads_per_head_k,
+    const int32_t                     num_heads_k,
+    const bool                        is_causal,
+    aiter_tensor_t&                   work_metadata_ptrs,
+    aiter_tensor_t&                   work_info_set,
+    aiter_tensor_t&                   work_indptr,
+    aiter_tensor_t&                   reduce_indptr,
+    aiter_tensor_t&                   reduce_final_map,
+    aiter_tensor_t&                   reduce_partial_map,
+    const int32_t                     page_size,
+    const int32_t                     kv_granularity,
+    const int32_t                     max_seqlen_qo,
+    const int32_t                     uni_seqlen_qo,
+    const bool                        fast_mode,
+    const int32_t                     topk,
+    const int32_t                     max_split_per_batch,
+    const bool                        intra_batch_mode,
+    const bool                        is_cp_round_robin,
+    const int64_t                     mla_version,
+    const std::optional<int64_t>      dtype_q_nope,
+    const std::optional<int64_t>      dtype_q_rope,
+    const std::optional<int64_t>      dtype_kv_nope,
+    const std::optional<int64_t>      dtype_kv_rope)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
+    const HipDeviceGuard device_guard(seqlens_kv_indptr.device_id);
 
-    TORCH_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
+    AITER_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
                 __func__, ": kv_granularity Must be power of 2!");
-    TORCH_CHECK((page_size & (page_size - 1)) == 0,
+    AITER_CHECK((page_size & (page_size - 1)) == 0,
                 __func__, ": page_size Must be power of 2!");
-    TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
+    AITER_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
-    TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
+    AITER_CHECK(seqlens_qo_indptr.dtype() == AITER_DTYPE_i32,
                 __func__, ": seqlens_qo_indptr's element type should be int!");
-    TORCH_CHECK(seqlens_kv_indptr.stride(0) == 1,
+    AITER_CHECK(seqlens_kv_indptr.stride(0) == 1,
                 __func__, ": seqlens_kv_indptr should be continuous!");
-    TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
+    AITER_CHECK(seqlens_kv_indptr.dtype() == AITER_DTYPE_i32,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
-    TORCH_CHECK(kv_last_page_lens.stride(0) == 1,
+    AITER_CHECK(kv_last_page_lens.stride(0) == 1,
                 __func__, ": kv_last_page_lens should be continuous!");
-    TORCH_CHECK(kv_last_page_lens.scalar_type() == at::ScalarType::Int,
+    AITER_CHECK(kv_last_page_lens.dtype() == AITER_DTYPE_i32,
                 __func__, ": kv_last_page_lens's element type should be int!");
 
-    at::ScalarType q_nope_dtype =
-        dtype_q_nope.has_value() ? dtype_q_nope.value() : at::ScalarType::BFloat16;
-    at::ScalarType kv_nope_dtype =
-        dtype_kv_nope.has_value() ? dtype_kv_nope.value() : at::ScalarType::BFloat16;
+    const MlaVersion mla_version_enum = static_cast<MlaVersion>(mla_version);
+
+    AiterDtype q_nope_dtype =
+        dtype_q_nope.has_value() ? static_cast<AiterDtype>(dtype_q_nope.value()) : AITER_DTYPE_bf16;
+    AiterDtype kv_nope_dtype =
+        dtype_kv_nope.has_value() ? static_cast<AiterDtype>(dtype_kv_nope.value()) : AITER_DTYPE_bf16;
     // rope dtypes default to their corresponding nope dtype when unspecified.
-    at::ScalarType q_rope_dtype  = dtype_q_rope.has_value() ? dtype_q_rope.value() : q_nope_dtype;
-    at::ScalarType kv_rope_dtype = dtype_kv_rope.has_value() ? dtype_kv_rope.value() : kv_nope_dtype;
+    AiterDtype q_rope_dtype =
+        dtype_q_rope.has_value() ? static_cast<AiterDtype>(dtype_q_rope.value()) : q_nope_dtype;
+    AiterDtype kv_rope_dtype =
+        dtype_kv_rope.has_value() ? static_cast<AiterDtype>(dtype_kv_rope.value()) : kv_nope_dtype;
 
     if (fast_mode)
     {
@@ -112,7 +119,7 @@ void get_mla_metadata_v1(
             q_rope_dtype,
             kv_rope_dtype,
             is_cp_round_robin,
-            mla_version,
+            mla_version_enum,
             work_metadata_ptrs,
             work_info_set,
             work_indptr,
@@ -162,65 +169,157 @@ void get_mla_metadata_v1(
     }
 }
 
-std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(
-    const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
-    const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
-    const int32_t        num_heads_per_head_k,
-    const int32_t        num_heads_k,
-    const bool           is_causal,
-    const int32_t        kv_granularity)
+
+std::tuple<std::string,
+           bool,
+           bool,
+           int64_t,
+           int64_t,
+           bool,
+           int64_t,
+           int64_t,
+           int64_t,
+           int64_t,
+           bool,
+           int64_t>
+get_mla_decode_head_plan_v1(const int64_t num_heads_k,
+                            const int64_t num_heads_per_head_k,
+                            const int64_t max_seqlen_qo,
+                            const int64_t uni_seqlen_qo,
+                            const int64_t dtype_q_nope,
+                            const int64_t dtype_kv_nope,
+                            const bool fast_mode,
+                            const bool intra_batch_mode,
+                            const std::string& arch,
+                            const int64_t enable_experimental,
+                            const int64_t flydsl_ps1,
+                            const int64_t v_head_dim,
+                            const int64_t page_size,
+                            const int64_t cp_world_size,
+                            const bool cp_round_robin,
+                            const bool has_scales,
+                            const bool use_opus,
+                            const bool use_ps1_asm)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
+    if(num_heads_k < 1 || num_heads_per_head_k < 1)
+    {
+        throw std::invalid_argument("get_mla_decode_head_plan_v1: #heads must be >= 1");
+    }
+    if(max_seqlen_qo < 1)
+    {
+        throw std::invalid_argument("get_mla_decode_head_plan_v1: max_seqlen_qo must be >= 1");
+    }
 
-    // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and qo size from 1 to 4
-    // without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to prevent
-    // spliting in any case supported by it.
-    //                                PackedQoLenPerWg, MaxClusterSize
-    using Traits = MlaMetadataV11Traits<64,               1>;
+    auto env_flag = [](const char* name) {
+        return std::getenv(name) != nullptr && std::atoi(std::getenv(name)) != 0;
+    };
+    const std::string arch_id = arch.empty() ? get_gpu_arch() : arch;
+    const MlaPlannerFlags flags{
+        enable_experimental < 0 ? env_flag("AITER_ENABLE_EXPERIMENTAL") : enable_experimental != 0,
+        flydsl_ps1 < 0 ? env_flag("AITER_MLA_DECODE_PS1_FLYDSL") : flydsl_ps1 != 0};
+    const AiterDtype q_dtype  = static_cast<AiterDtype>(dtype_q_nope);
+    const AiterDtype kv_dtype = static_cast<AiterDtype>(dtype_kv_nope);
 
-    return get_mla_metadata_v1_1_host<Traits>(
-        seqlens_qo_indptr,
-        seqlens_kv_indptr,
-        num_heads_per_head_k,
-        num_heads_k,
-        is_causal,
-        kv_granularity,
-        true);
+    const MlaDecodeHeadPlan p = mla_decode_head_plan(arch_id,
+                                                     static_cast<int32_t>(num_heads_k),
+                                                     static_cast<int32_t>(num_heads_per_head_k),
+                                                     static_cast<int32_t>(max_seqlen_qo),
+                                                     static_cast<int32_t>(uni_seqlen_qo),
+                                                     q_dtype,
+                                                     kv_dtype,
+                                                     fast_mode,
+                                                     intra_batch_mode,
+                                                     flags);
+    const bool reduce_supported =
+        mla_reduce_v1_supports(p.kernel_num_heads, static_cast<int32_t>(v_head_dim));
+    const MlaBackendId backend =
+        mla_decode_backend(arch_id,
+                           static_cast<int32_t>(num_heads_k * num_heads_per_head_k),
+                           p.kernel_num_heads,
+                           static_cast<int32_t>(max_seqlen_qo),
+                           q_dtype,
+                           kv_dtype,
+                           static_cast<int32_t>(page_size),
+                           static_cast<int32_t>(cp_world_size),
+                           cp_round_robin,
+                           intra_batch_mode,
+                           has_scales,
+                           use_opus,
+                           use_ps1_asm,
+                           flags);
+
+    return {arch_id,
+            flags.enable_experimental,
+            flags.flydsl_ps1,
+            static_cast<int64_t>(p.planner),
+            static_cast<int64_t>(p.plan),
+            p.natively_supported,
+            p.qk_batch_ratio,
+            p.kernel_num_heads,
+            p.seqlen_fold,
+            p.packed_qo_len_per_wg,
+            reduce_supported,
+            static_cast<int64_t>(backend)};
 }
 
+int64_t mla_metadata_cluster_multiplier_v1(const std::string& arch,
+                                           const int64_t enable_experimental,
+                                           const int64_t num_heads,
+                                           const int64_t max_seqlen_qo,
+                                           const int64_t mla_version,
+                                           const int64_t dtype_q_nope,
+                                           const int64_t dtype_q_rope,
+                                           const int64_t dtype_kv_nope,
+                                           const int64_t dtype_kv_rope)
+{
+    const char* env           = std::getenv("AITER_ENABLE_EXPERIMENTAL");
+    const bool experimental   = enable_experimental < 0 ? (env != nullptr && std::atoi(env) != 0)
+                                                        : (enable_experimental != 0);
+    const std::string arch_id = arch.empty() ? get_gpu_arch() : arch;
+
+    return mla_metadata_cluster_multiplier(arch_id,
+                                           experimental,
+                                           static_cast<int32_t>(num_heads),
+                                           static_cast<int32_t>(max_seqlen_qo),
+                                           static_cast<MlaVersion>(mla_version),
+                                           static_cast<AiterDtype>(dtype_q_nope),
+                                           static_cast<AiterDtype>(dtype_q_rope),
+                                           static_cast<AiterDtype>(dtype_kv_nope),
+                                           static_cast<AiterDtype>(dtype_kv_rope));
+}
 
 void get_pa_metadata_v1(
-    const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
-    const torch::Tensor& pages_kv_indptr,       // [batch size + 1]
-    const torch::Tensor& context_lens,          // [batch size]
-    const int32_t        num_heads_per_head_k,
-    const int32_t        num_heads_k,
-    const bool           is_causal,
-    torch::Tensor&       work_metadata_ptrs,
-    torch::Tensor&       work_indptr,
-    torch::Tensor&       work_info_set,
-    torch::Tensor&       reduce_indptr,
-    torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map,
-    const int32_t        kv_granularity,
-    const int32_t        block_size,
-    const int32_t        max_seqlen_qo,
-    const int32_t        uni_seqlen_qo,
-    const bool           fast_mode,
-    const int32_t        topk,
-    const int32_t        max_split_per_batch)
+    const aiter_tensor_t& seqlens_qo_indptr,     // [batch size + 1]
+    const aiter_tensor_t& pages_kv_indptr,       // [batch size + 1]
+    const aiter_tensor_t& context_lens,          // [batch size]
+    const int32_t         num_heads_per_head_k,
+    const int32_t         num_heads_k,
+    const bool            is_causal,
+    aiter_tensor_t&       work_metadata_ptrs,
+    aiter_tensor_t&       work_indptr,
+    aiter_tensor_t&       work_info_set,
+    aiter_tensor_t&       reduce_indptr,
+    aiter_tensor_t&       reduce_final_map,
+    aiter_tensor_t&       reduce_partial_map,
+    const int32_t         kv_granularity,
+    const int32_t         block_size,
+    const int32_t         max_seqlen_qo,
+    const int32_t         uni_seqlen_qo,
+    const bool            fast_mode,
+    const int32_t         topk,
+    const int32_t         max_split_per_batch)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(pages_kv_indptr));
+    const HipDeviceGuard device_guard(pages_kv_indptr.device_id);
 
-    TORCH_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
+    AITER_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
                 __func__, ": kv_granularity Must be power of 2!");
-    TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
+    AITER_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
-    TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
+    AITER_CHECK(seqlens_qo_indptr.dtype() == AITER_DTYPE_i32,
                 __func__, ": seqlens_qo_indptr's element type should be int!");
-    TORCH_CHECK(pages_kv_indptr.stride(0) == 1,
+    AITER_CHECK(pages_kv_indptr.stride(0) == 1,
                 __func__, ": seqlens_kv_indptr should be continuous!");
-    TORCH_CHECK(pages_kv_indptr.scalar_type() == at::ScalarType::Int,
+    AITER_CHECK(pages_kv_indptr.dtype() == AITER_DTYPE_i32,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
 
     get_pa_metadata_v1_2_device(
@@ -247,34 +346,35 @@ void get_pa_metadata_v1(
 
 
 void get_ps_metadata_v1(
-    const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
-    const torch::Tensor& pages_kv_indptr,       // [batch size + 1]
-    const torch::Tensor& context_lens,          // [batch size]
-    const int32_t        gqa_ratio,
-    const int32_t        num_heads_k,
-    torch::Tensor&       work_metadata_ptrs,
-    torch::Tensor&       work_indptr,
-    torch::Tensor&       work_info,
-    torch::Tensor&       reduce_indptr,
-    torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map,
-    const int32_t        qhead_granularity,
-    const int32_t        qlen_granularity,
-    const int32_t        kvlen_granlarity,
-    const int32_t        block_size,
-    const bool           is_causal)
+    const aiter_tensor_t& seqlens_qo_indptr,     // [batch size + 1]
+    const aiter_tensor_t& pages_kv_indptr,       // [batch size + 1]
+    const aiter_tensor_t& context_lens,          // [batch size]
+    const int32_t         gqa_ratio,
+    const int32_t         num_heads_k,
+    aiter_tensor_t&       work_metadata_ptrs,
+    aiter_tensor_t&       work_indptr,
+    aiter_tensor_t&       work_info,
+    aiter_tensor_t&       reduce_indptr,
+    aiter_tensor_t&       reduce_final_map,
+    aiter_tensor_t&       reduce_partial_map,
+    const int32_t         qhead_granularity,
+    const int32_t         qlen_granularity,
+    const int32_t         kvlen_granlarity,
+    const int32_t         block_size,
+    const bool            is_causal,
+    const bool            need_lse)
 {
-    // const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(pages_kv_indptr));
+    // const HipDeviceGuard device_guard(pages_kv_indptr.device_id);
 
-    TORCH_CHECK((kvlen_granlarity & (kvlen_granlarity - 1)) == 0,
+    AITER_CHECK((kvlen_granlarity & (kvlen_granlarity - 1)) == 0,
                 __func__, ": kvlen_granlarity Must be power of 2!");
-    TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
+    AITER_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
-    TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
+    AITER_CHECK(seqlens_qo_indptr.dtype() == AITER_DTYPE_i32,
                 __func__, ": seqlens_qo_indptr's element type should be int!");
-    TORCH_CHECK(pages_kv_indptr.stride(0) == 1,
+    AITER_CHECK(pages_kv_indptr.stride(0) == 1,
                 __func__, ": seqlens_kv_indptr should be continuous!");
-    TORCH_CHECK(pages_kv_indptr.scalar_type() == at::ScalarType::Int,
+    AITER_CHECK(pages_kv_indptr.dtype() == AITER_DTYPE_i32,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
 
     get_ps_metadata_v1_2_host(
@@ -293,6 +393,7 @@ void get_ps_metadata_v1(
         qlen_granularity,
         kvlen_granlarity,
         block_size,
-        is_causal);
+        is_causal,
+        need_lse);
 
 }

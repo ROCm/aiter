@@ -5,16 +5,16 @@
 #include "../../opus_moe_common.cuh"
 #include "opus/opus.hpp"
 
-template<typename Contract = opus_moe::OpusMoeStage2A8W4DefaultContract,
-         int BlockM = opus_moe::kStage2A8W4DecodeDefaultBlockM,
+template<int BlockM = opus_moe::kStage2A8W4DecodeDefaultBlockM,
          int BlockN = opus_moe::kStage2A8W4DecodeDefaultBlockN,
-         int SortBlockM = BlockM,
          bool DirectAtomicOut = true,
          bool PaceRouteBlocksToPow2 = false,
          int BlockThreadsOverride = 0,
          int MinBlocksPerCuOverride = 0,
          int CachectlBOverride = 0,
-         int CachectlWScaleOverride = 0>
+         int CachectlWScaleOverride = 0,
+         int PairSlots = 1,
+         int SteadyPairSlots = PairSlots>
 struct OpusMoeStage2A8W4DecodeShape
 {
     // Atomic vs MXFP8 route-out is a structural compile-time choice.
@@ -43,33 +43,27 @@ struct OpusMoeStage2A8W4DecodeShape
     static constexpr int THREADS_K = opus::get_warp_size() / MMA_M;
     static constexpr int T_M = IS_BM32_BN256 ? 2 : 1;
 
-    static constexpr int DECODE_LOGICAL_INTER_DIM = Contract::DECODE_LOGICAL_INTER_DIM;
-    static constexpr int DECODE_INTER_DIM_PAD = Contract::DECODE_INTER_DIM_PAD;
-    static constexpr int DECODE_EFFECTIVE_INTER_DIM = Contract::DECODE_EFFECTIVE_INTER_DIM;
-    static constexpr int SORT_BLOCK_M = SortBlockM;
     static constexpr int ROUTE_M_STRIDE = B_M;
     // route_out XCD swizzle (gfx950=8 XCDs).
     static constexpr int NUM_XCD = DIRECT_ATOMIC_OUT ? 1 : 8;
     static constexpr int SWIZZLE_W = 2;
     static constexpr int SWIZZLE_C =
         (!DIRECT_ATOMIC_OUT && (IS_BM32_BN256 || IS_BM64_BN256))
-            ? (IS_BM64_BN256 && DECODE_EFFECTIVE_INTER_DIM / K_STEP_PACKED >= 4 ? 24 : 32)
+            ? (IS_BM64_BN256 && BlockThreadsOverride != 256 ? 24 : 32)
             : 0;
     static constexpr bool DECODE_PACE_ROUTE_BLOCKS_TO_POW2 = PaceRouteBlocksToPow2;
-    static constexpr int K_TILES = DECODE_EFFECTIVE_INTER_DIM / K_STEP_PACKED;
     static constexpr int DEFAULT_BLOCK_SIZE =
-        !DIRECT_ATOMIC_OUT && IS_BM64_BN256 && K_TILES >= 4
+        !DIRECT_ATOMIC_OUT && IS_BM64_BN256
             ? 128
             : opus_moe::kStage2A8W4DecodeDefaultCtaThreads;
     static constexpr int BLOCK_SIZE =
         BlockThreadsOverride > 0 ? BlockThreadsOverride : DEFAULT_BLOCK_SIZE;
     static constexpr int T_N = (BLOCK_SIZE / opus::get_warp_size()) / T_M;
-    // Route-out K>=4 BM64 variants need looser launch resources to avoid
-    // pressure from the wider decode mainloop; K3 keeps the tuned resources.
-    static constexpr int ROUTE_OUT_MAX_MIN_BLOCKS_PER_CU =
-        IS_BM64_BN256 && K_TILES >= 4 ? 2 : 4;
+    static constexpr int ROUTE_OUT_MAX_MIN_BLOCKS_PER_CU = 4;
     static constexpr int DEFAULT_ROUTE_OUT_MIN_BLOCKS_PER_CU =
-        ROUTE_OUT_MAX_MIN_BLOCKS_PER_CU;
+        (!DIRECT_ATOMIC_OUT && IS_BM64_BN256)
+            ? 2
+            : ROUTE_OUT_MAX_MIN_BLOCKS_PER_CU;
     static constexpr int DEFAULT_MIN_BLOCKS_PER_CU =
         !DIRECT_ATOMIC_OUT ? DEFAULT_ROUTE_OUT_MIN_BLOCKS_PER_CU : (IS_BM16 ? 4 : 2);
     static constexpr int REQUESTED_MIN_BLOCKS_PER_CU =
@@ -79,19 +73,15 @@ struct OpusMoeStage2A8W4DecodeShape
             ? ROUTE_OUT_MAX_MIN_BLOCKS_PER_CU
             : REQUESTED_MIN_BLOCKS_PER_CU;
     static constexpr int A_LDS_STAGE_ELEMS = B_M * K_STEP_PACKED;
-    static constexpr int A_LDS_FULL_BYTES =
-        K_TILES * A_LDS_STAGE_ELEMS * static_cast<int>(sizeof(D_A));
-    static constexpr int A_LDS_STREAM_STAGES = 2;
-    // Stream A through two LDS buffers above 64 KiB to preserve CTA residency.
-    static constexpr int A_LDS_STAGES =
-        A_LDS_FULL_BYTES <= 64 * 1024
-            ? K_TILES
-            : A_LDS_STREAM_STAGES;
-    static constexpr int SCALE_GROUP_LOGICAL_K = opus_moe::kStage2A8W4DecodeScaleGroupLogicalK;
-    static constexpr int DECODE_SCALE_GROUPS = DECODE_LOGICAL_INTER_DIM / SCALE_GROUP_LOGICAL_K;
-    static constexpr int SCALE_GROUPS_PER_ROW_PACK = (K_TILES + 1) / 2;
+    // PairSlots is a static resource setting independent of runtime K.
+    static constexpr int PAIR_SLOTS = PairSlots;
+    static constexpr int A_LDS_STAGES = 2 * PAIR_SLOTS;
+    // SteadyPairSlots is a static resource setting independent of runtime K.
+    static constexpr int STEADY_PAIR_SLOTS = SteadyPairSlots;
+    // The two-wave BM64 schedule may overlap unused A-ring stages with the first tile.
+    static constexpr bool OVERLAP_SHORT_A_STAGES =
+        IS_BM64_BN256 && BLOCK_SIZE == 128;
     static constexpr int SCALE_WORDS_PER_GROUP_PACK = opus_moe::kStage2A8W4DecodeScaleWordsPerGroupPack;
-    static constexpr int SCALE_WORDS_PER_ROW_PACK = SCALE_GROUPS_PER_ROW_PACK * SCALE_WORDS_PER_GROUP_PACK;
     static constexpr int SCALE_ROWS_PER_ROW_PACK = 2 * MMA_M;
     static constexpr int B_PAYLOAD_KLANE_STRIDE_BYTES = B_K_LOGICAL;
     static constexpr int B_PAYLOAD_K_STRIDE_BYTES = BYTES_PER_VEC / opus_moe::kStage2A8W4DecodeFp4ValuesPerByte;
@@ -100,7 +90,6 @@ struct OpusMoeStage2A8W4DecodeShape
     static constexpr int M_MFMA_PER_WAVE = B_M / (T_M * MMA_M);
     static constexpr int N_MFMA_PER_WAVE = B_N / (T_N * MMA_N);
     static constexpr int HALF_N_MFMA_PER_WAVE = N_MFMA_PER_WAVE / 2;
-    static constexpr int A_LDS_BUFFER_LOAD_INSTS = (K_TILES - 1) * M_MFMA_PER_WAVE;
     static constexpr int C_LDS_N = B_N, VEC_C = opus_moe::kStage2A8W4DecodeCVec;
     static constexpr int ELEM_PER_ATOMIC = opus_moe::kStage2A8W4DecodeCValuesPerAtomic;
 
@@ -113,17 +102,10 @@ struct OpusMoeStage2A8W4DecodeShape
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
     static_assert(THREADS_K == K_STEP_PACKED / (2 * VEC_A));
     static_assert(THREADS_K == K_STEP_PACKED / (2 * B_BYTES_PER_VEC));
-    static_assert(DECODE_LOGICAL_INTER_DIM % opus_moe::kStage2A8W4DecodeFp4ValuesPerByte == 0);
     static_assert((B_PAYLOAD_KLANE_STRIDE_BYTES & (B_PAYLOAD_KLANE_STRIDE_BYTES - 1)) == 0);
     static_assert((B_THREADGROUP_STRIDE_BYTES & (B_THREADGROUP_STRIDE_BYTES - 1)) == 0);
     static_assert(B_M % (T_M * MMA_M) == 0);
     static_assert(B_N % (T_N * MMA_N) == 0);
-    static_assert(SORT_BLOCK_M > 0);
-    static_assert(SORT_BLOCK_M % B_M == 0);
-    static_assert(DECODE_EFFECTIVE_INTER_DIM == K_TILES * K_STEP_PACKED);
-    static_assert(K_TILES > 0);
-    static_assert(DECODE_LOGICAL_INTER_DIM % SCALE_GROUP_LOGICAL_K == 0);
-    static_assert(DECODE_SCALE_GROUPS <=
-                  SCALE_GROUPS_PER_ROW_PACK *
-                      opus_moe::kStage2A8W4DecodeScaleGroupsPerRowPack);
+    static_assert(PAIR_SLOTS == 1 || PAIR_SLOTS == 2);
+    static_assert(STEADY_PAIR_SLOTS >= 1 && STEADY_PAIR_SLOTS <= PAIR_SLOTS);
 };

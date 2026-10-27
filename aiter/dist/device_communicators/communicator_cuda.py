@@ -12,9 +12,10 @@ from aiter.dist.parallel_state import is_global_first_rank
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
 
-from .base_device_communicator import DeviceCommunicatorBase
+from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
+_SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -34,15 +35,49 @@ class CudaCommunicator(DeviceCommunicatorBase):
         device: torch.device | None = None,
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
+        reuse_from: "CudaCommunicator | None" = None,
     ):
         self._all2all_manager = None
-        self._all2all_manager_created = False
+        self._active_all2all_backend = None
 
         super().__init__(cpu_group, device, device_group, unique_name)
         from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
         self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
         self.use_torch_symm_mem = False
+
+        # A reused communicator borrows the source's ca/qr comms; only the
+        # owner may dispose them in destroy(), or a borrowed handle is freed
+        # twice (double dispose / use-after-free).
+        self._owns_comms = reuse_from is None
+
+        if reuse_from is not None:
+            # Identical-rank group: share the source's allreduce communicators
+            # instead of allocating a second set. Keeps our own unique_name, so
+            # is_ep_communicator/use_all2all still apply to this group.
+            #
+            # reuse_from is a public kwarg: validate rather than trust the
+            # caller's dedup key, since a mismatch silently addresses the wrong
+            # peers instead of raising.
+            assert reuse_from.world_size == self.world_size, (
+                f"{unique_name}: reuse_from {reuse_from.unique_name} has "
+                f"world_size {reuse_from.world_size}, this group has "
+                f"{self.world_size}"
+            )
+            assert list(reuse_from.ranks) == list(self.ranks), (
+                f"{unique_name}: reuse_from {reuse_from.unique_name} spans "
+                f"{reuse_from.ranks}, this group spans {self.ranks}; reuse "
+                "requires an identical rank list in identical order"
+            )
+            assert reuse_from.device == self.device, (
+                f"{unique_name}: reuse_from {reuse_from.unique_name} is on "
+                f"{reuse_from.device}, this group is on {self.device}"
+            )
+            self.pynccl_comm = reuse_from.pynccl_comm
+            self.ca_comm = reuse_from.ca_comm
+            self.qr_comm = reuse_from.qr_comm
+            self.symm_mem_comm = reuse_from.symm_mem_comm
+            return
 
         # lazy import to avoid documentation build error
         from aiter.dist.device_communicators.custom_all_reduce import (
@@ -101,61 +136,76 @@ class CudaCommunicator(DeviceCommunicatorBase):
             #     # currently be an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
-    @property
-    def all2all_manager(self):
-        # Lazily create all2all_manager to avoid tp/dp/ep group haven't been created yet
-        if not self._all2all_manager_created and self.use_all2all:
-            self._all2all_manager_created = True
+    def _create_all2all_manager(self, backend: str) -> All2AllManagerBase:
+        if backend == "mori":
+            from .all2all import MoriAll2AllManager
 
-            if self.all2all_backend == "naive":
-                from .all2all import NaiveAll2AllManager
+            return MoriAll2AllManager(self.cpu_group)
+        if backend == "mori_v2":
+            from .all2all import MoriV2All2AllManager
 
-                self._all2all_manager = NaiveAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "allgather_reducescatter":
-                from .all2all import AgRsAll2AllManager
+            return MoriV2All2AllManager(self.cpu_group)
+        if backend == "flydsl":
+            from .all2all import FlyDSLAll2AllManager
 
-                self._all2all_manager = AgRsAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "pplx":
-                from .all2all import PPLXAll2AllManager
+            return FlyDSLAll2AllManager(self.cpu_group)
+        raise ValueError(
+            f"Unsupported all2all manager backend {backend!r}; "
+            f"expected one of {_SUPPORTED_ALL2ALL_MANAGER_BACKENDS}"
+        )
 
-                self._all2all_manager = PPLXAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "deepep_high_throughput":
-                from .all2all import DeepEPHTAll2AllManager
+    def get_or_create_all2all_manager(
+        self, backend: str | None = None
+    ) -> All2AllManagerBase:
+        """Return the requested all-to-all manager, creating it on demand.
 
-                self._all2all_manager = DeepEPHTAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "deepep_low_latency":
-                from .all2all import DeepEPLLAll2AllManager
+        Callers that require a particular transport should name it explicitly.
+        Constructing a manager also initializes all resources owned by that
+        backend; callers that use a different communication path should not call
+        this method.
+        """
+        if not self.use_all2all:
+            raise RuntimeError(
+                f"{self.unique_name} is not an expert-parallel communicator"
+            )
 
-                self._all2all_manager = DeepEPLLAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "mori":
-                from .all2all import MoriAll2AllManager
-
-                self._all2all_manager = MoriAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "flydsl":
-                from .all2all import FlyDSLAll2AllManager
-
-                self._all2all_manager = FlyDSLAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "flashinfer_all2allv":
-                from .all2all import FlashInferAllToAllManager
-
-                self._all2all_manager = FlashInferAllToAllManager(self.cpu_group)
-            else:
-                raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
-
-            if is_global_first_rank():
-                logger.info(
-                    "Using %s all2all manager.",
-                    self._all2all_manager.__class__.__name__,
+        manager = self._all2all_manager
+        if manager is not None:
+            if backend is not None and self._active_all2all_backend != backend:
+                raise RuntimeError(
+                    "all2all manager is already initialized with backend "
+                    f"{self._active_all2all_backend!r}; cannot switch to "
+                    f"{backend!r}"
                 )
-        # if self._all2all_manager is None:
-        #     raise ValueError(f"all2all_manager is None for {self.unique_name}")
-        return self._all2all_manager
+            return manager
+
+        requested_backend = backend or self.all2all_backend
+
+        # Assign only after construction succeeds. A failed collective/backend
+        # initialization must not leave the communicator permanently marked as
+        # initialized with a missing or partially constructed manager.
+        manager = self._create_all2all_manager(requested_backend)
+        self._all2all_manager = manager
+        self._active_all2all_backend = requested_backend
+
+        if is_global_first_rank():
+            logger.info("Using %s all2all manager.", manager.__class__.__name__)
+        return manager
+
+    @property
+    def all2all_manager(self) -> All2AllManagerBase | None:
+        # Backward-compatible accessor. New callers should explicitly request
+        # the backend they need through get_or_create_all2all_manager().
+        if not self.use_all2all:
+            return None
+        return self.get_or_create_all2all_manager()
 
     @all2all_manager.setter
-    def all2all_manager(self, value):
+    def all2all_manager(self, value: All2AllManagerBase | None):
         self._all2all_manager = value
-        if value is not None:
-            self._all2all_manager_created = True
+        self._active_all2all_backend = (
+            self.all2all_backend if value is not None else None
+        )
 
     def all_reduce(
         self,
@@ -379,10 +429,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "per_group"/"mxfp4") from the public API.
-        if gemma_norm and quant_type != "per_token":
-            raise NotImplementedError(
-                "gemma_norm fused quant currently supports per-token FP8 only"
-            )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
                 input_,
@@ -393,6 +439,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
                 transpose_scale=transpose_scale,
+                gemma_norm=gemma_norm,
             )
         if quant_type == "mxfp4":
             return self.fused_allreduce_rmsnorm_mxfp4_quant(
@@ -402,6 +449,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 eps,
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
+                gemma_norm=gemma_norm,
             )
         # emit_bf16 additionally returns the pre-quantization bf16/fp16 normed
         # output alongside the per-token FP8 result. Used by v32 DSA models
@@ -483,9 +531,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         prefill_support: bool = False,
         emit_bf16: bool = False,
         transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
         """Fused AR+RMSNorm+per-group FP8 quant, optionally also emitting the
         pre-quantization bf16/fp16 normed output.
+
+        ``gemma_norm`` normalizes with ``x * (1 + w)`` (Gemma / Qwen3.5 style)
+        from the raw ``weight_``; the ``+ 1`` happens in fp32 inside the kernel.
 
         When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
         When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
@@ -522,6 +574,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     use_1stage,
                     emit_bf16=emit_bf16,
                     transpose_scale=transpose_scale,
+                    gemma_norm=gemma_norm,
                 )
                 if result is not None:
                     if emit_bf16:
@@ -533,7 +586,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
+                input_, res_inp_, weight_, eps, prefill_support, gemma_norm=gemma_norm
             )
             hip_quant = get_hip_quant(QuantType.per_1x128)
             # The fused path and the registered op's fake return the per-group
@@ -612,6 +665,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
         """Fused AR+RMSNorm with an MXFP4 quantization epilogue when supported.
 
@@ -685,6 +739,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 eps,
                 use_1stage=can_1stage,
                 emit_bf16=emit_bf16,
+                gemma_norm=gemma_norm,
             )
             assert result is not None
             if emit_bf16:
@@ -693,7 +748,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 out_fp4, res_out, scale_out = result
         else:
             normed, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
+                input_, res_inp_, weight_, eps, prefill_support, gemma_norm=gemma_norm
             )
             from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
@@ -779,19 +834,30 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # Convert negative dim to positive.
                 dim += input_.dim()
 
-            # Note: This will produce an incorrect answer if we don't make
-            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-            input_tensor = input_.movedim(0, dim).contiguous()
+            # pynccl scatters axis 0, so bring the scattered axis there first.
+            # NOTE: this must be movedim(dim, 0) -- movedim(0, dim) moves the
+            # wrong axis for dim >= 2 (it only happens to coincide when dim == 1
+            # for a 3-D tensor). contiguous() is required or the collective reads
+            # a wrong layout.
+            input_tensor = input_.movedim(dim, 0).contiguous()
 
             assert input_tensor.shape[0] % world_size == 0
             chunk_size = input_tensor.shape[0] // world_size
-            output_shape = (chunk_size,) + input_tensor.shape[1:]
-            output_.reshape(output_shape)
+            tmp_shape = (chunk_size,) + input_tensor.shape[1:]
+            # pynccl writes the scattered result with the split axis at 0, so it
+            # needs its own [chunk, ...] buffer -- output_ has the caller's layout
+            # ([..., dim/world_size, ...]) and a different element order. Writing
+            # straight into output_ (as the old code's discarded reshape/movedim
+            # did) produced a transposed, garbage result.
+            tmp = torch.empty(
+                tmp_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
+            pynccl_comm.reduce_scatter(tmp, input_tensor)
 
-            pynccl_comm.reduce_scatter(output_, input_tensor)
-
-            # Reshape before returning
-            output_.movedim(0, dim).contiguous()
+            # Move the split axis back to `dim` and copy into the caller's
+            # pre-allocated output_ (element-wise copy handles the permuted,
+            # non-contiguous view).
+            output_.copy_(tmp.movedim(0, dim))
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
@@ -803,9 +869,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+        # Bring the scattered axis to 0 for the collective. Must be
+        # movedim(dim, 0), not movedim(0, dim) -- the latter moves the wrong axis
+        # for dim >= 2 (it only coincides at dim == 1 for a 3-D tensor).
+        # contiguous() is required or the collective reads a wrong layout.
+        input_tensor = input_.movedim(dim, 0).contiguous()
 
         if sizes is not None:
             assert len(sizes) == world_size
@@ -860,12 +928,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
         if self.qr_comm is not None:
+            if self._owns_comms:
+                self.qr_comm.close()
             self.qr_comm = None
         if self.ca_comm is not None:
+            if self._owns_comms:
+                self.ca_comm.close()
             self.ca_comm = None
         if self._all2all_manager is not None:
             self._all2all_manager.destroy()
             self._all2all_manager = None
+            self._active_all2all_backend = None
 
     def all_gatherv(
         self,
@@ -875,6 +948,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         if dim != 0:
             raise NotImplementedError("only dim 0 all-gatherv is supported")
+        ca_comm = self.ca_comm
+        if ca_comm is not None and not ca_comm.disabled:
+            single = isinstance(input_, torch.Tensor)
+            outs = ca_comm.custom_all_gatherv(
+                [input_] if single else list(input_), sizes
+            )
+            if outs is not None:
+                return outs[0] if single else outs
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None and not pynccl_comm.disabled
@@ -921,8 +1002,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert self.all2all_manager is not None
-        hidden_states, router_logits = self.all2all_manager.dispatch(
+        manager = self.get_or_create_all2all_manager()
+        hidden_states, router_logits = manager.dispatch(
             hidden_states, router_logits, is_sequence_parallel
         )
         return hidden_states, router_logits
@@ -930,8 +1011,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
-        assert self.all2all_manager is not None
-        hidden_states = self.all2all_manager.combine(
-            hidden_states, is_sequence_parallel
-        )
+        manager = self.get_or_create_all2all_manager()
+        hidden_states = manager.combine(hidden_states, is_sequence_parallel)
         return hidden_states

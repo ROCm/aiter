@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "mla_decode_shape.h"
 #include "v1_comm.cuh"
 
 __device__ int32_t get_local_splits(int32_t seqlen_kv,
@@ -163,8 +164,8 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     }
 }
 
-void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
-                                  const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
+void get_mla_metadata_v1_0_device(const aiter_tensor_t& seqlens_qo_indptr, // [batch size + 1]
+                                  const aiter_tensor_t& seqlens_kv_indptr, // [batch size + 1]
                                   const int32_t num_heads_per_head_k,
                                   const int32_t num_heads_k,
                                   const bool is_causal,
@@ -172,17 +173,17 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   const int32_t max_seqlen_qo,
                                   const int32_t ori_uni_seqlen_qo,
                                   const int32_t num_splits,
-                                  const at::ScalarType q_dtype,
-                                  torch::Tensor& work_metadata_ptrs,
-                                  torch::Tensor& work_info_set,
-                                  torch::Tensor& work_indptr,
-                                  torch::Tensor& reduce_indptr,
-                                  torch::Tensor& reduce_final_map,
-                                  torch::Tensor& reduce_partial_map)
+                                  const AiterDtype q_dtype,
+                                  aiter_tensor_t& work_metadata_ptrs,
+                                  aiter_tensor_t& work_info_set,
+                                  aiter_tensor_t& work_indptr,
+                                  aiter_tensor_t& reduce_indptr,
+                                  aiter_tensor_t& reduce_final_map,
+                                  aiter_tensor_t& reduce_partial_map)
 {
-    constexpr int32_t kPackedQoLenPerWg = 128;
+    constexpr int32_t kPackedQoLenPerWg = kMlaMetadataV10V11PackedQoLenPerWg;
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -196,39 +197,34 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     int32_t qk_batch_ratio = 1;
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
 
-    int32_t fixed_num_batches = reduce_indptr.size(0) - 1;
-    // In the following cases, we use #head=16 to simulate cases which is not natively supported by
-    // mla main kernel.
-    if((num_heads != 16) &&
-       (num_heads != 128) && // main kernel natively supports #head=16 or #head=128
-       (num_heads % 16 == 0) && (num_heads < 128))
-    {
-        qk_batch_ratio = num_heads / 16;
-        num_heads      = 16;
-        num_batches *= qk_batch_ratio;
-    }
+    int32_t fixed_num_batches         = reduce_indptr.size(0) - 1;
+    const MlaDecodeHeadPlan head_plan = mla_decode_head_plan_v1_0(num_heads, uni_seqlen_qo);
+
+    qk_batch_ratio = head_plan.qk_batch_ratio;
+    num_heads      = head_plan.kernel_num_heads;
+    num_batches *= qk_batch_ratio;
 
     if(num_heads == 128)
     {
-        qk_batch_ratio = uni_seqlen_qo;
+        qk_batch_ratio = head_plan.seqlen_fold;
         uni_seqlen_qo  = 1;
         num_batches *= qk_batch_ratio;
     }
 
-    TORCH_CHECK((num_heads == 16) || (num_heads == 128),
+    AITER_CHECK(head_plan.plan != MlaHeadPlan::Unsupported,
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
-                "N is in [2, 8).")
+                "N is in [2, 8).");
 
     MlaMetadataV1KernelParameter params = {};
-    params.p_work_metadata_ptrs         = work_metadata_ptrs.data_ptr<uint64_t>();
-    params.p_work_indptr                = work_indptr.data_ptr<int32_t>();
-    params.p_work_info_set_raw          = work_info_set.data_ptr<int32_t>();
-    params.p_reduce_indptr              = reduce_indptr.data_ptr<int32_t>();
-    params.p_reduce_final_map           = reduce_final_map.data_ptr<int32_t>();
-    params.p_reduce_partial_map         = reduce_partial_map.data_ptr<int32_t>();
-    params.p_seqlens_qo_indptr          = seqlens_qo_indptr.data_ptr<int32_t>();
-    params.p_seqlens_kv_indptr          = seqlens_kv_indptr.data_ptr<int32_t>();
+    params.p_work_metadata_ptrs         = static_cast<uint64_t*>(work_metadata_ptrs.data_ptr());
+    params.p_work_indptr                = static_cast<int32_t*>(work_indptr.data_ptr());
+    params.p_work_info_set_raw          = static_cast<int32_t*>(work_info_set.data_ptr());
+    params.p_reduce_indptr              = static_cast<int32_t*>(reduce_indptr.data_ptr());
+    params.p_reduce_final_map           = static_cast<int32_t*>(reduce_final_map.data_ptr());
+    params.p_reduce_partial_map         = static_cast<int32_t*>(reduce_partial_map.data_ptr());
+    params.p_seqlens_qo_indptr          = static_cast<int32_t*>(seqlens_qo_indptr.data_ptr());
+    params.p_seqlens_kv_indptr          = static_cast<int32_t*>(seqlens_kv_indptr.data_ptr());
     params.num_batches                  = num_batches;
     params.num_heads                    = num_heads_k * num_heads_per_head_k;
     params.num_cu                       = num_clusters;
@@ -244,7 +240,7 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);
-    if(num_heads == 128 && q_dtype != at::ScalarType::BFloat16)
+    if(num_heads == 128 && q_dtype != AITER_DTYPE_bf16)
     {
         kn_get_mla_metadata_v1_0<true>
             <<<grid, dev_prop.warpSize, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(

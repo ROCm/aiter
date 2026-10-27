@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "rocm_ops.hpp"
 #include "aiter_stream.h"
 #include "custom_all_reduce_gfx1250.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <torch/extension.h>
 
-namespace py = pybind11;
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     m.def("_set_current_hip_stream",
           [](int64_t stream_ptr) { aiter::setCurrentHIPStream((hipStream_t)stream_ptr); },
@@ -38,7 +34,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("unroll"), py::arg("threads"), py::arg("blocks"),
           py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
     m.def("dispose", &aiter::dispose, py::arg("_fa"));
-    m.def("meta_size", &aiter::meta_size);
+    // Default is the max world size, so callers that omit it get a buffer safe
+    // for every supported world size.
+    m.def("meta_size", &aiter::meta_size, py::arg("world_size") = 8);
     m.def("register_input_buffer", &aiter::register_input_buffer,
           py::arg("_fa"), py::arg("self_ptr"), py::arg("all_ptrs"));
     m.def("register_output_buffer", &aiter::register_output_buffer,

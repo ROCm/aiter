@@ -143,7 +143,7 @@ Requires LaTeX installation.
 
 ## Deployment
 
-Documentation is automatically deployed to `doc.aiter.amd.com` via GitHub Actions on every push to `main`.
+Documentation is automatically deployed to `https://rocm.github.io/aiter/` via GitHub Actions on every push to `main`.
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for details.
 

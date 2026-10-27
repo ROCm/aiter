@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import copy
 from typing import Any
 
 import pytest
@@ -111,8 +112,8 @@ def ref_compute(
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
     if use_rope:
-        q_input = torch.empty(B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype).to(
-            device
+        q_input = torch.empty(
+            B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype, device=device
         )
         q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
 
@@ -188,8 +189,8 @@ def ref_compute_full_fwd(
 
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
-    q_input = torch.empty(B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype).to(
-        device
+    q_input = torch.empty(
+        B, H, kv_lora_rank + qk_rope_head_dim, dtype=q.dtype, device=device
     )
     q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
 
@@ -245,7 +246,9 @@ def ref_compute_full_fwd(
 
 
 def get_config(dtype: torch.dtype):
-    config: dict[str, Any] = _get_config()
+    # _get_config() returns the shared cached dict and the launch helpers
+    # write derived fields into its sub-configs — work on a copy.
+    config: dict[str, Any] = copy.deepcopy(_get_config())
     base_config_key: str = "fwd_grouped_kernel_stage1_rope"
     fp32_config_key: str = f"{base_config_key}_fp32"
     config_key: str = (

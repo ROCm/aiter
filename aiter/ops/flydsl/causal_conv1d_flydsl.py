@@ -3,27 +3,20 @@
 """FlyDSL prefill causal-conv1d kernel with fused split q/k/v output."""
 
 import functools
+from collections.abc import Sequence
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
+from flydsl.expr.typing import Int32
 
-try:
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx
-    from flydsl.expr.typing import Int32, T
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E as _LOG2E
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_buf_tensor
 
-    from aiter.ops.flydsl.kernels import buffer_ops
-
-    _FLYDSL_AVAILABLE = True
-except Exception:  # pragma: no cover - flydsl optional  # noqa: BLE001
-    _FLYDSL_AVAILABLE = False
-
+from ..prefill_batch_metadata import CausalConvPrefillMetadata
+from .kernels.causal_conv1d_prefill import create_causal_conv1d_prefill_kernel
 
 PAD_SLOT_ID = -1
-_LOG2E = 1.4426950408889634
-
-
-def is_flydsl_available() -> bool:
-    return _FLYDSL_AVAILABLE
 
 
 def build_causal_conv1d_flydsl_module(
@@ -36,7 +29,6 @@ def build_causal_conv1d_flydsl_module(
     dtype_str: str = "bf16",
 ):
     """Build the FlyDSL causal conv1d kernel for the given config."""
-    assert _FLYDSL_AVAILABLE, "flydsl is not installed"
     assert width in (2, 3, 4)
     assert (
         tm == 64 and tn == 64 and block_threads == 256
@@ -94,25 +86,20 @@ def build_causal_conv1d_flydsl_module(
         vs0: Int32,
         vs1: Int32,
     ):
-        # dtype args for buffer_ops loads (MLIR types, not values)
-        i32 = T.i32
-        elem_dtype = T.bf16 if dtype_str == "bf16" else T.f16
-
-        def _rsrc(ptr):
-            return buffer_ops.create_buffer_resource(ptr, max_size=True)
-
-        x_r = _rsrc(x_ptr)
-        w_r = _rsrc(w_ptr)
-        b_r = _rsrc(bias_ptr)
-        cs_r = _rsrc(cs_ptr)
-        ci_r = _rsrc(cache_idx_ptr)
-        hi_r = _rsrc(has_init_ptr)
-        qsl_r = _rsrc(qsl_ptr)
-        batch_r = _rsrc(batch_ptr)
-        choff_r = _rsrc(chunk_off_ptr)
-        q_r = _rsrc(q_ptr)
-        k_r = _rsrc(k_ptr)
-        v_r = _rsrc(v_ptr)
+        # Every access here is one element wide, so each buffer gets a single
+        # view typed by its own element -- `t[i]` is the whole access.
+        x_r = ptr_buf_tensor(x_ptr, fx_elem_dtype)
+        w_r = ptr_buf_tensor(w_ptr, fx_elem_dtype)
+        b_r = ptr_buf_tensor(bias_ptr, fx_elem_dtype)
+        cs_r = ptr_buf_tensor(cs_ptr, fx_elem_dtype)
+        ci_r = ptr_buf_tensor(cache_idx_ptr, fx.Int32)
+        hi_r = ptr_buf_tensor(has_init_ptr, fx.Int8)
+        qsl_r = ptr_buf_tensor(qsl_ptr, fx.Int32)
+        batch_r = ptr_buf_tensor(batch_ptr, fx.Int32)
+        choff_r = ptr_buf_tensor(chunk_off_ptr, fx.Int32)
+        q_r = ptr_buf_tensor(q_ptr, fx_elem_dtype)
+        k_r = ptr_buf_tensor(k_ptr, fx_elem_dtype)
+        v_r = ptr_buf_tensor(v_ptr, fx_elem_dtype)
 
         lds_base = fx.SharedAllocator().allocate(SharedStorage).peek().lds.ptr
 
@@ -126,18 +113,10 @@ def build_causal_conv1d_flydsl_module(
         pid_x = fx.block_idx.x
         pid_y = fx.block_idx.y
 
-        seq_idx = fx.Int32(
-            buffer_ops.buffer_load(batch_r, pid_x, vec_width=1, dtype=i32)
-        )
-        chunk_idx = fx.Int32(
-            buffer_ops.buffer_load(choff_r, pid_x, vec_width=1, dtype=i32)
-        )
-        seq_start = fx.Int32(
-            buffer_ops.buffer_load(qsl_r, seq_idx, vec_width=1, dtype=i32)
-        )
-        seq_end = fx.Int32(
-            buffer_ops.buffer_load(qsl_r, seq_idx + 1, vec_width=1, dtype=i32)
-        )
+        seq_idx = fx.Int32(batch_r[pid_x])
+        chunk_idx = fx.Int32(choff_r[pid_x])
+        seq_start = fx.Int32(qsl_r[seq_idx])
+        seq_end = fx.Int32(qsl_r[seq_idx + 1])
         seqlen = seq_end - seq_start
 
         feat_start = pid_y * TN
@@ -154,20 +133,9 @@ def build_causal_conv1d_flydsl_module(
         w_base = gfeat * sw0
         w_taps = []
         for j in fx.range_constexpr(W):
-            w_taps.append(
-                fx.Float32(
-                    buffer_ops.buffer_load(
-                        w_r,
-                        w_base + j * sw1,
-                        vec_width=1,
-                        dtype=elem_dtype,
-                    )
-                )
-            )
+            w_taps.append(fx.Float32(w_r[w_base + j * sw1]))
         if fx.const_expr(HAS_BIAS):
-            bias_f = fx.Float32(
-                buffer_ops.buffer_load(b_r, gfeat, vec_width=1, dtype=elem_dtype)
-            )
+            bias_f = fx.Float32(b_r[gfeat])
         else:
             bias_f = fx.Float32(0.0)
 
@@ -190,18 +158,12 @@ def build_causal_conv1d_flydsl_module(
             fstep = FG * sx0
             raws = []
             for j in fx.range_constexpr(ELEMS):
-                raws.append(
-                    fx_elem_dtype(
-                        buffer_ops.buffer_load(x_r, cur, vec_width=1, dtype=elem_dtype)
-                    )
-                )
+                raws.append(fx_elem_dtype(x_r[cur]))
                 if fx.const_expr(j + 1 < ELEMS):
                     cur = cur + fstep
             do_halo = hc < (KW - 1)
             prefix_off = do_halo.select((feat_start + hf) * sx0 + (tok_gbase + hc), 0)
-            prefix_v = fx_elem_dtype(
-                buffer_ops.buffer_load(x_r, prefix_off, vec_width=1, dtype=elem_dtype)
-            )
+            prefix_v = fx_elem_dtype(x_r[prefix_off])
             lds_idx = f_base * LDS_PAD + (t_const + (KW - 1))
             for j in fx.range_constexpr(ELEMS):
                 cur_idx = lds_idx if j == 0 else lds_idx + (j * FG * LDS_PAD)
@@ -219,11 +181,7 @@ def build_causal_conv1d_flydsl_module(
                 gf = (feat_start + f_base) + (j * FG)
                 gf_ok = gf < dim
                 safe_gf = gf_ok.select(gf, 0)
-                raw = fx_elem_dtype(
-                    buffer_ops.buffer_load(
-                        x_r, safe_gf * sx0 + body_gt, vec_width=1, dtype=elem_dtype
-                    )
-                )
+                raw = fx_elem_dtype(x_r[safe_gf * sx0 + body_gt])
                 val = (body_ok & gf_ok).select(raw, zero_e)
                 lds_st(
                     val,
@@ -239,27 +197,17 @@ def build_causal_conv1d_flydsl_module(
                 both = wp_in & gf_ok
                 safe_xoff = both.select(gf * sx0 + (seq_start + wp), 0)
                 xv = both.select(
-                    fx_elem_dtype(
-                        buffer_ops.buffer_load(
-                            x_r, safe_xoff, vec_width=1, dtype=elem_dtype
-                        )
-                    ),
+                    fx_elem_dtype(x_r[safe_xoff]),
                     zero_e,
                 )
                 # pre-seq source: conv_state at chunk0
-                hi8 = fx.Int8(
-                    buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
-                )
+                hi8 = fx.Int8(hi_r[seq_idx])
                 hi_nz = hi8 != 0
                 need_cs = ((wp < 0) & is_chunk0) & (hi_nz & gf_ok)
-                in_coord = fx.Int32(
-                    buffer_ops.buffer_load(ci_r, seq_idx * sci, vec_width=1, dtype=i32)
-                )
+                in_coord = fx.Int32(ci_r[seq_idx * sci])
                 slot = (KW - 1) + wp
                 cs_off = need_cs.select((in_coord * scs0 + gf * scs1) + slot * scs2, 0)
-                csv = fx_elem_dtype(
-                    buffer_ops.buffer_load(cs_r, cs_off, vec_width=1, dtype=elem_dtype)
-                )
+                csv = fx_elem_dtype(cs_r[cs_off])
                 hv = need_cs.select(csv, xv)
                 lds_st(hv, hf * LDS_PAD + hc)
 
@@ -310,7 +258,7 @@ def build_causal_conv1d_flydsl_module(
                     cur = base_off
                     for e in fx.range_constexpr(EPT):
                         val = lds_ld((tg_ept + e) * STORE_PAD + sf)
-                        buffer_ops.buffer_store(val, res, cur)
+                        res[cur] = val
                         if fx.const_expr(e + 1 < EPT):
                             cur = cur + ts
 
@@ -327,7 +275,7 @@ def build_causal_conv1d_flydsl_module(
                     for e in fx.range_constexpr(EPT):
                         tok_ok = ((tok_start + tok_base) + e) < seqlen
                         if tok_ok:
-                            buffer_ops.buffer_store(acc[e].to(fx_elem_dtype), res, cur)
+                            res[cur] = acc[e].to(fx_elem_dtype)
                         if fx.const_expr(e + 1 < EPT):
                             cur = cur + ts
 
@@ -341,30 +289,22 @@ def build_causal_conv1d_flydsl_module(
             slot = tok_group
             should = (slot < (KW - 1)) & (gfeat < dim)
             if should:
-                in_coord = fx.Int32(
-                    buffer_ops.buffer_load(ci_r, seq_idx * sci, vec_width=1, dtype=i32)
-                )
+                in_coord = fx.Int32(ci_r[seq_idx * sci])
                 pos_x = (seqlen - (KW - 1)) + slot
                 x_in = pos_x >= 0
                 safe_x = x_in.select(gfeat * sx0 + (seq_start + pos_x), 0)
-                val_x = fx_elem_dtype(
-                    buffer_ops.buffer_load(x_r, safe_x, vec_width=1, dtype=elem_dtype)
-                )
-                hi8 = fx.Int8(
-                    buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
-                )
+                val_x = fx_elem_dtype(x_r[safe_x])
+                hi8 = fx.Int8(hi_r[seq_idx])
                 hi_nz = hi8 != 0
                 need_pr = (pos_x < 0) & hi_nz
                 src = slot + seqlen
                 safe_pr = need_pr.select(
                     (in_coord * scs0 + gfeat * scs1) + src * scs2, 0
                 )
-                val_pr = fx_elem_dtype(
-                    buffer_ops.buffer_load(cs_r, safe_pr, vec_width=1, dtype=elem_dtype)
-                )
+                val_pr = fx_elem_dtype(cs_r[safe_pr])
                 wb_val = x_in.select(val_x, need_pr.select(val_pr, zero_e))
                 cs_wr = (in_coord * scs0 + gfeat * scs1) + slot * scs2
-                buffer_ops.buffer_store(wb_val, cs_r, cs_wr)
+                cs_r[cs_wr] = wb_val
 
     @flyc.jit
     def launch(
@@ -498,7 +438,17 @@ def causal_conv1d_split_qkv_flydsl_fn(
         )
 
     # Reuse precomputed chunk schedule metadata when provided.
-    if (
+    if isinstance(metadata, CausalConvPrefillMetadata):
+        metadata.validate(
+            query_start_loc,
+            total_tokens=cu_seqlen,
+            num_sequences=query_start_loc.numel() - 1,
+        )
+        grid = metadata.get_chunk_grid(block_m)
+        tot = grid.total_chunks
+        batch_ptr = grid.sequence_ids
+        chunk_off_ptr = grid.chunk_ids
+    elif (
         metadata is not None
         and hasattr(metadata, "nums_dict")
         and block_m in metadata.nums_dict
@@ -578,3 +528,203 @@ def causal_conv1d_split_qkv_flydsl_fn(
     else:
         launcher(*launch_args)
     return query, key, value
+
+
+def causal_conv1d_prefill_flydsl_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: Sequence[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int | None = -1,
+    validate_data: bool = False,
+    *,
+    block: int = 128,
+    tokens: int = 16,
+    prefetch: int = 16,
+    channels_per_thread: int | None = None,
+) -> torch.Tensor:
+    """``causal_conv1d_fn`` contract: returns the output, updates ``conv_states``.
+
+    Active cache indices must be unique and in bounds. CPU lengths must match
+    GPU cumulative offsets. Padded-slot outputs are unspecified, like SGLang.
+    No host tensor reads occur unless validate_data=True (not graph safe).
+    prefetch is the number of token loads grouped before consumption. The default
+    channel mapping pairs adjacent BF16/FP16 channels for channel-contiguous inputs
+    with at least 8192 packed tokens; other inputs use one channel per thread.
+    """
+    if x.ndim != 2 or weight.ndim != 2:
+        raise ValueError("expected x [channels,total_tokens], weight [channels,width]")
+    dim, total = x.shape
+    width = weight.shape[1]
+    batch = len(seq_lens_cpu)
+    if weight.shape[0] != dim or width not in (2, 3, 4, 5):
+        raise ValueError("weight must have matching channels and width 2..5")
+    if activation not in (None, False, True, "silu", "swish"):
+        raise ValueError("activation must be None, silu, or swish")
+    if block not in (64, 128, 256) or not width - 1 <= tokens <= 64:
+        raise ValueError("block must be 64/128/256 and width-1 <= tokens <= 64")
+    if prefetch not in (1, 2, 4, 8, 16):
+        raise ValueError("prefetch must be 1/2/4/8/16")
+    if channels_per_thread not in (None, 1, 2):
+        raise ValueError("channels_per_thread must be None, 1, or 2")
+    if channels_per_thread == 2 and dim % 2:
+        raise ValueError("two channels per thread requires an even channel count")
+    if not x.is_cuda or x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError("expected a GPU BF16/FP16/FP32 tensor")
+    if 1 not in x.stride() or 1 not in weight.stride():
+        raise ValueError("input and weight need at least one unit-stride axis")
+    tensors = [
+        weight,
+        query_start_loc,
+        bias,
+        conv_states,
+        cache_indices,
+        has_initial_state,
+    ]
+    if any(t is not None and t.device != x.device for t in tensors):
+        raise ValueError("all tensors must be on the input device")
+    if weight.dtype != x.dtype or (
+        conv_states is not None and conv_states.dtype != x.dtype
+    ):
+        raise ValueError("input, weight, and state must have matching dtype")
+    if query_start_loc.shape != (batch + 1,) or not query_start_loc.is_contiguous():
+        raise ValueError("query_start_loc must be contiguous [batch+1]")
+    if query_start_loc.dtype not in (torch.int32, torch.int64):
+        raise ValueError("query_start_loc must contain integers")
+    for name, tensor in (
+        ("cache_indices", cache_indices),
+        ("has_initial_state", has_initial_state),
+    ):
+        if tensor is not None and (
+            tensor.shape != (batch,) or not tensor.is_contiguous()
+        ):
+            raise ValueError(f"{name} must be contiguous [batch]")
+    if cache_indices is not None and cache_indices.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("cache_indices must contain integers")
+    if bias is not None and (bias.shape != (dim,) or not bias.is_contiguous()):
+        raise ValueError("bias must be contiguous [channels]")
+    if conv_states is not None and (
+        conv_states.ndim != 3
+        or conv_states.shape[1] != dim
+        or conv_states.shape[2] < width - 1
+    ):
+        raise ValueError("state must be [slots,channels,at_least_width-1]")
+    if conv_states is not None and 1 not in conv_states.stride():
+        raise ValueError("state needs at least one unit-stride axis")
+    if (
+        conv_states is not None
+        and cache_indices is None
+        and conv_states.shape[0] < batch
+    ):
+        raise ValueError("state needs at least batch slots without cache_indices")
+    if has_initial_state is not None and conv_states is None:
+        raise ValueError("initial history requires conv_states")
+    if any(n < 0 for n in seq_lens_cpu) or sum(seq_lens_cpu) > total:
+        raise ValueError("invalid sequence lengths")
+    if validate_data:
+        starts = query_start_loc.cpu().tolist()
+        expected = [0]
+        for n in seq_lens_cpu:
+            expected.append(expected[-1] + n)
+        if starts != expected:
+            raise ValueError("GPU offsets do not match CPU sequence lengths")
+        if conv_states is not None:
+            slots = (
+                list(range(batch))
+                if cache_indices is None
+                else cache_indices.cpu().tolist()
+            )
+            active = [
+                s for s, n in zip(slots, seq_lens_cpu) if s != pad_slot_id and n > 0
+            ]
+            if len(set(active)) != len(active) or any(
+                s < 0 or s >= conv_states.shape[0] for s in active
+            ):
+                raise ValueError("active cache indices must be unique and in bounds")
+    out = torch.empty_like(x)
+    max_len = max(seq_lens_cpu, default=0)
+    if not max_len or not dim:
+        return out
+    lanes = channels_per_thread
+    if lanes is None:
+        lanes = (
+            2
+            if (
+                dim % 2 == 0
+                and x.stride(0) == 1
+                and x.dtype in (torch.bfloat16, torch.float16)
+                and total >= 8192
+            )
+            else 1
+        )
+    ss = conv_states.stride() if conv_states is not None else (0, 0, 0)
+
+    def span(t: torch.Tensor | None) -> int:
+        return (
+            1
+            if t is None
+            else 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+        )
+
+    # Weight and state strides are fixed per model and compiled in. x and out
+    # strides scale with the token count, so the kernel only bakes in which
+    # axis is unit-stride and receives the other stride at run time.
+    x_unit = x.stride().index(1)
+    out_unit = out.stride().index(1)
+    launch = create_causal_conv1d_prefill_kernel(
+        dim,
+        width,
+        x_unit,
+        weight.stride(),
+        ss,
+        out_unit,
+        bias is not None,
+        conv_states is not None,
+        cache_indices is not None,
+        has_initial_state is not None,
+        activation in (True, "silu", "swish"),
+        pad_slot_id,
+        block,
+        tokens,
+        x.dtype,
+        prefetch,
+        lanes,
+    )
+    # Absent optional pointers are never dereferenced by the specialized kernel.
+    args = (
+        x,
+        weight,
+        bias if bias is not None else x,
+        conv_states if conv_states is not None else x,
+        query_start_loc,
+        cache_indices if cache_indices is not None else query_start_loc,
+        has_initial_state if has_initial_state is not None else query_start_loc,
+        out,
+    )
+    runtime = (
+        batch,
+        max_len,
+        *(span(t) for t in (x, weight, conv_states, out)),
+        x.stride(1 - x_unit),
+        out.stride(1 - out_unit),
+    )
+    with torch.cuda.device(x.device):
+        stream = torch.cuda.current_stream(x.device)
+        # FlyDSL specializes tensors on dtype, rank, and the first unit-stride
+        # axis; sizes and the other strides stay dynamic.
+        key = (
+            x.device.index,
+            tuple((t.dtype, t.ndim, t.stride().index(1)) for t in args),
+        )
+        _run_compiled(
+            launch, *args, *runtime, fx.Stream(stream), specialization_key=key
+        )
+    return out

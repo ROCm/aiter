@@ -4,6 +4,7 @@
 """FlyDSL runtime support for fused heterogeneous MoE (FHMoE)."""
 
 import functools
+import math
 
 import torch
 
@@ -12,6 +13,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from .moe_kernels import (
     _flydsl_moe_stage1_impl,
     _flydsl_moe_stage2_impl,
+    runtime_swiglu_limit,
 )
 
 
@@ -28,8 +30,6 @@ def compile_flydsl_fhmoe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
     persist_m: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
@@ -42,14 +42,23 @@ def compile_flydsl_fhmoe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
     shared_expert_id: int = -1,
+    clamp_shared: bool = True,
 ):
     """Compile the heterogeneous stage1 kernel."""
     from .kernels.fhmoe import compile_mixed_fhmoe_gemm1
     from .moe_common import GateMode
 
-    if b_dtype != "fp4":
-        raise ValueError(f"FHMoE stage1 requires routed MXFP4 weights, got {b_dtype}")
+    if b_dtype not in ("fp4", "fp8"):
+        raise ValueError(
+            f"FHMoE stage1 requires routed MXFP4 or MXFP8 weights, got {b_dtype}"
+        )
+    normalized_gate_mode = GateMode(gate_mode)
+    if b_dtype == "fp8" and normalized_gate_mode != GateMode.INTERLEAVE:
+        raise ValueError(
+            "FHMoE MXFP8 routed weights require interleaved gate/up layout"
+        )
     return compile_mixed_fhmoe_gemm1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -63,21 +72,21 @@ def compile_flydsl_fhmoe_stage1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
         persist_m=persist_m,
         use_async_copy=use_async_copy,
         k_batch=k_batch,
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
-        gate_mode=GateMode(gate_mode),
+        gate_mode=normalized_gate_mode,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         enable_bias=enable_bias,
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
+        v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
+        clamp_shared=clamp_shared,
     )
 
 
@@ -105,12 +114,15 @@ def compile_flydsl_fhmoe_stage2(
     enable_bias: bool = False,
     xcd_swizzle: int = 0,
     shared_expert_id: int = -1,
+    use_global_a: bool = True,
 ):
     """Compile the heterogeneous stage2 kernel."""
     from .kernels.fhmoe import compile_mixed_fhmoe_gemm2
 
-    if b_dtype != "fp4":
-        raise ValueError(f"FHMoE stage2 requires routed MXFP4 weights, got {b_dtype}")
+    if b_dtype not in ("fp4", "fp8"):
+        raise ValueError(
+            f"FHMoE stage2 requires routed MXFP4 or MXFP8 weights, got {b_dtype}"
+        )
     return compile_mixed_fhmoe_gemm2(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -128,6 +140,7 @@ def compile_flydsl_fhmoe_stage2(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=use_global_a,
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
@@ -157,6 +170,8 @@ def _s1_args_fhmoe(
     bias=None,
     stream=None,
     swiglu_limit=float("inf"),
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     pass_swiglu_limit: bool = True,
     *,
     shared_w,
@@ -187,7 +202,16 @@ def _s1_args_fhmoe(
         size_expert_ids_in,
     )
     if pass_swiglu_limit:
-        return args + (float(swiglu_limit), stream)
+        beta = float(situ_beta)
+        linear_beta = float(situ_linear_beta)
+        return args + (
+            beta,
+            1.0 / beta,
+            linear_beta,
+            1.0 / linear_beta,
+            float(swiglu_limit),
+            stream,
+        )
     return args + (stream,)
 
 
@@ -202,6 +226,7 @@ def _s2_args_fhmoe(
     sorted_weights,
     num_valid_ids,
     token_num,
+    x_rows,
     n_in,
     k_in,
     blocks,
@@ -234,6 +259,7 @@ def _s2_args_fhmoe(
         ptr_arg(num_valid_ids),
         ptr_arg(kernel_bias),
         token_num,
+        x_rows,
         n_in,
         k_in,
         blocks,
@@ -274,14 +300,35 @@ def flydsl_fhmoe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
     shared_w1: torch.Tensor,
     shared_w1_scale: torch.Tensor,
     shared_expert_id: int,
+    clamp_shared: bool = True,
 ):
-    """Run stage1 with MXFP4 routed experts and one FP8 shared expert."""
+    """Run stage1 with MXFP4/MXFP8 routed and separately stored FP8 shared weights."""
+    if b_dtype == "fp8" and gate_mode != "interleave":
+        raise ValueError(
+            "FHMoE MXFP8 routed weights require interleaved gate/up layout"
+        )
+    if not clamp_shared and act != "silu":
+        raise ValueError("clamp_shared=False is supported only with act='silu'")
+    activation_limit = runtime_swiglu_limit(swiglu_limit, act)
+    if (
+        not clamp_shared
+        and k_batch > 1
+        and act == "silu"
+        and math.isfinite(activation_limit)
+    ):
+        raise NotImplementedError(
+            "Split-K FHMoE postprocessing cannot clamp routed SiLU while "
+            "leaving the shared expert unclamped; use k_batch=1 when "
+            "clamp_shared=False and swiglu_limit is finite"
+        )
     compile_kernel = functools.partial(
         compile_flydsl_fhmoe_stage1,
         shared_expert_id=shared_expert_id,
+        clamp_shared=clamp_shared,
     )
     build_mx_args = functools.partial(
         _s1_args_fhmoe,
@@ -320,6 +367,7 @@ def flydsl_fhmoe_stage1(
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
+        v2_output_layout=v2_output_layout,
         _compile_kernel=compile_kernel,
         _build_mx_args=build_mx_args,
     )
@@ -361,7 +409,7 @@ def flydsl_fhmoe_stage2(
     shared_w2_scale: torch.Tensor,
     shared_expert_id: int,
 ) -> torch.Tensor:
-    """Run stage2 with MXFP4 routed experts and one FP8 shared expert."""
+    """Run stage2 with MXFP4/MXFP8 routed and separately stored FP8 shared weights."""
     compile_kernel = functools.partial(
         compile_flydsl_fhmoe_stage2,
         shared_expert_id=shared_expert_id,

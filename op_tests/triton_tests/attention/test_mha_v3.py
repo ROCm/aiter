@@ -267,7 +267,7 @@ def test_flash_attn_kvcache(
     seqlen_new = (
         seqlen_q
         if seqlen_new_eq_seqlen_q
-        else torch.randint(1, seqlen_q + 1, (1,)).item()
+        else torch.randint(1, seqlen_q + 1, (1,), device=device).item()
     )
     if new_kv:
         k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
@@ -682,7 +682,7 @@ def test_flash_attn_kvcache_torch_compile(
         out_eager = out_eager[0]
     torch.cuda.synchronize()
 
-    compiled_fn = torch.compile(fn)
+    compiled_fn = torch.compile(fn, dynamic=False)
     k_cache_compiled = k_cache.clone()
     v_cache_compiled = v_cache.clone()
     out_compiled = compiled_fn(
@@ -896,6 +896,7 @@ def test_mha_fp8(
         pytest.skip(f"FP8 not supported on {_arch}")
 
     torch.cuda.empty_cache()
+    torch.manual_seed(20)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)

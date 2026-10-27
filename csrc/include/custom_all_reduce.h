@@ -64,6 +64,12 @@ void all_gather_unreg(fptr_t _fa,
                       const aiter_tensor_t& out,
                       int64_t reg_bytes,
                       int64_t dim);
+void all_gatherv(fptr_t _fa,
+                 std::vector<aiter_tensor_t> const& inps,
+                 std::vector<aiter_tensor_t> const& outs,
+                 std::vector<int64_t> const& sizes,
+                 int64_t reg_buffer,
+                 int64_t reg_bytes);
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& inp,
                              const aiter_tensor_t& res_inp,
@@ -112,7 +118,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t reg_bytes,
                                              bool use_1stage,
                                              int64_t bf16_out_ptr = 0,
-                                             bool transpose_scale = false);
+                                             bool transpose_scale = false,
+                                             bool gemma_norm      = false);
 void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          const aiter_tensor_t& inp,
                                          const aiter_tensor_t& res_inp,
@@ -124,7 +131,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          int64_t reg_ptr,
                                          int64_t reg_bytes,
                                          bool use_1stage,
-                                         int64_t bf16_out_ptr = 0);
+                                         int64_t bf16_out_ptr = 0,
+                                         bool gemma_norm      = false);
 void fused_qknorm_allreduce(fptr_t _fa,
                             const aiter_tensor_t& qkv_in,
                             const aiter_tensor_t& q_w,
@@ -168,6 +176,7 @@ void register_graph_buffers(fptr_t _fa,
                             const std::vector<int64_t>& offset_ptrs);
 #ifdef USE_ROCM
 int64_t allocate_meta_buffer(int64_t size);
+int64_t allocate_data_buffer(int64_t size);
 void free_meta_buffer(int64_t ptr);
 void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr);
 #endif

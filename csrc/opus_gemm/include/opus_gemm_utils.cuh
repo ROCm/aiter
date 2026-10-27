@@ -94,4 +94,22 @@ inline __device__ void scale_c_tile(
     });
 }
 
+// Replicate one e8m0 exponent byte into all four bytes of a packed scale word,
+// so that a caller passing any scale_op_sel gets that exponent.
+//
+// Not four block scales: scale_op_sel is a 2-bit selector and one MFMA consumes
+// exactly one of the four bytes, applying it to its whole wave_k. Callers that
+// have something distinct to put in the other three -- one K group each
+// (mxscale_pack::opsel) or one M subtile each (the bpreshuffle wave8 accum) --
+// build the word themselves and select with a nonzero op_sel; this is for the
+// ones that select byte 0, where the other three are never read.
+//
+// Shared by the a8w8_mxscale BMM pipeline and the flatmm split-K pipeline (both
+// #included in opus_bmm.cu), so it lives here once instead of a per-header copy.
+template<typename S>
+OPUS_D int pack_e8m0x4(S scale) {
+    const int e = static_cast<int>(scale);
+    return e * 0x01010101;
+}
+
 #endif // __HIP_DEVICE_COMPILE__
