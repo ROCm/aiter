@@ -115,8 +115,13 @@ def build_pa_decode_mxfp4(
     has_q_scale: bool,
     out_f16: bool,
     tile_depth: int = DEFAULT_TILE_DEPTH,
+    direct: bool = False,
 ):
     """Compile-time specialization of the task kernel and its launcher.
+
+    ``direct``: every planned task is a whole sequence (the plan has at most one
+    task per row), so the CTA writes the normalized output row itself and the
+    pmax/psum/pout partials and the reduce kernel are not used.
 
     ``stage_pages``: block-table entries staged in LDS per task (a multiple of
     256, at most ``MAX_STAGED_PAGES``); the caller bounds the pages one task can
@@ -148,7 +153,10 @@ def build_pa_decode_mxfp4(
         ty = fx.PointerType.get(elem_ty.ir_type, fx.AddressSpace.Global, align)
         return fx.recast_iter(ty, base)
 
-    name = f"pa_decode_mxfp4_g{G}_bs{BS}_{'qfp8' if q_fp8 else 'qbf16'}_d{DEPTH}"
+    name = (
+        f"pa_decode_mxfp4_g{G}_bs{BS}_{'qfp8' if q_fp8 else 'qbf16'}_d{DEPTH}"
+        f"{'_direct' if direct else ''}"
+    )
 
     @flyc.kernel(name=name, known_block_size=(BLOCK_THREADS, 1, 1))
     def pa_decode_mxfp4_kernel(
@@ -175,6 +183,9 @@ def build_pa_decode_mxfp4(
         vs_page: fx.Int32,
         vs_head: fx.Int32,
         softmax_scale: fx.Float32,
+        out_ptr: fx.Pointer,
+        out_row_stride: fx.Int32,  # elements
+        out_head_stride: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         warp = tid // WAVE
@@ -528,20 +539,32 @@ def build_pa_decode_mxfp4(
                     + [o_hi[i] * inv for i in range_constexpr(4)],
                     dtype=fx.Float32,
                 ).to(out_dtype)
-                pmax = _gptr(pmax_ptr, fx.Float32, 4)
-                psum = _gptr(psum_ptr, fx.Float32, 4)
-                pout = _gptr(pout_ptr, out_dtype, 16)
-                partial = fx.Int64(kvh) * fx.Int64(capacity) + fx.Int64(slot)
-                row = partial * G + fx.Int64(h)
-                fx.ptr_store(
-                    o_out, fx.add_offset(pout, row * HEAD_DIM + fx.Int64(c * 8))
-                )
-                if c == 0:
-                    # The shared reducer expects maxima in natural-log units.
+                if const_expr(direct):
+                    out = _gptr(out_ptr, out_dtype, 16)
                     fx.ptr_store(
-                        h_max * fx.Float32(1.0 / LOG2E), fx.add_offset(pmax, row)
+                        o_out,
+                        fx.add_offset(
+                            out,
+                            fx.Int64(seq) * fx.Int64(out_row_stride)
+                            + fx.Int64(kvh * G + h) * fx.Int64(out_head_stride)
+                            + fx.Int64(c * 8),
+                        ),
                     )
-                    fx.ptr_store(h_sum, fx.add_offset(psum, row))
+                else:
+                    pmax = _gptr(pmax_ptr, fx.Float32, 4)
+                    psum = _gptr(psum_ptr, fx.Float32, 4)
+                    pout = _gptr(pout_ptr, out_dtype, 16)
+                    partial = fx.Int64(kvh) * fx.Int64(capacity) + fx.Int64(slot)
+                    row = partial * G + fx.Int64(h)
+                    fx.ptr_store(
+                        o_out, fx.add_offset(pout, row * HEAD_DIM + fx.Int64(c * 8))
+                    )
+                    if c == 0:
+                        # The shared reducer expects maxima in natural-log units.
+                        fx.ptr_store(
+                            h_max * fx.Float32(1.0 / LOG2E), fx.add_offset(pmax, row)
+                        )
+                        fx.ptr_store(h_sum, fx.add_offset(psum, row))
 
     @flyc.jit
     def launch(
@@ -568,6 +591,9 @@ def build_pa_decode_mxfp4(
         vs_page: fx.Int32,
         vs_head: fx.Int32,
         softmax_scale: fx.Float32,
+        out_ptr: fx.Pointer,
+        out_row_stride: fx.Int32,
+        out_head_stride: fx.Int32,
         work_capacity: fx.Int32,
         num_kv_heads: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -597,6 +623,9 @@ def build_pa_decode_mxfp4(
                 vs_page,
                 vs_head,
                 softmax_scale,
+                out_ptr,
+                out_row_stride,
+                out_head_stride,
             ).launch(
                 grid=(work_capacity, num_kv_heads, 1),
                 block=(BLOCK_THREADS, 1, 1),

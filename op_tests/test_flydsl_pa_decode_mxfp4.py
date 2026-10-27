@@ -318,6 +318,126 @@ def test_pa_decode_mxfp4_default_depth_is_bitwise_depth4():
     assert torch.equal(a, b)
 
 
+@pytest.mark.parametrize("rows", [1, 8, 64, 512])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_pa_decode_mxfp4_direct_output_is_bitwise_split_plus_reduce(rows, out_dtype):
+    """One task per row (plan max_partitions == 1): the kernel writes the output
+    itself. It must equal the split + reduce path bit for bit: the reduce of a
+    single normalized partial only multiplies it by a weight within one f32 ulp of
+    1.0, which cannot move a value that is already a bf16/f16 number."""
+    _skip_unsupported()
+    ctx_lens = [(2048, 1, 129, 777, 1000, 17, 2048, 300)[i % 8] for i in range(rows)]
+    ctx, bt, k, v, q = make_case(ctx_lens, 16, 128, seed=rows)
+    _, kd, ks, k_deq = quantize_pages(k, 128)
+    _, vd, vs, v_deq = quantize_pages(v, 128)
+    q_in, q_ref = quantize_q_fp8(q)
+    plan = plan_pa_decode(ctx, 1, max_partitions=1)
+    assert plan.capacity == rows  # rows exactly equal to capacity
+    outs = []
+    for direct in (None, False, True):
+        out = torch.full(
+            (rows, 16, HEAD_DIM), float("nan"), dtype=out_dtype, device=q.device
+        )
+        pa_decode_mxfp4(
+            out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5,
+            work_plan=plan, direct_output=direct,
+        )  # fmt: skip
+        outs.append(out)
+    torch.cuda.synchronize()
+    assert torch.equal(outs[0], outs[2])  # None picks the direct path
+    assert torch.equal(outs[1], outs[2])
+    if rows <= 64:
+        ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
+        assert rel_l2(outs[2].float(), ref) < 3e-3
+
+
+def test_pa_decode_mxfp4_direct_output_plan_boundaries():
+    """capacity == rows only with max_partitions == 1 (or a budget that cannot
+    split); a plan that splits keeps the reduce path and refuses a forced direct."""
+    _skip_unsupported()
+    ctx_lens = [2048] * 4
+    ctx, bt, k, v, q = make_case(ctx_lens, 16, 128, seed=4)
+    _, kd, ks, _ = quantize_pages(k, 128)
+    _, vd, vs, _ = quantize_pages(v, 128)
+    q_in, _ = quantize_q_fp8(q)
+    out = torch.empty_like(q)
+    split_plan = plan_pa_decode(ctx, 1, max_partitions=4)
+    assert split_plan.capacity > len(ctx_lens)
+    with pytest.raises(ValueError, match="max_partitions == 1"):
+        pa_decode_mxfp4(
+            out, q_in, kd, ks, vd, vs, ctx, bt, 1.0,
+            work_plan=split_plan, direct_output=True,
+        )  # fmt: skip
+    # default capacity == rows when rows >= 2 * CU, yet max_partitions stays CU:
+    # not eligible for the direct path (an empty row could make a row split)
+    big = plan_pa_decode(ctx, 1)
+    a = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, HEAD_DIM**-0.5, plan=big)
+    b = run_mxfp4(
+        q_in, kd, ks, vd, vs, bt, ctx, HEAD_DIM**-0.5,
+        plan=plan_pa_decode(ctx, 1, max_partitions=1),
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    assert rel_l2(a.float(), b.float()) < 1e-2
+
+
+def test_pa_decode_mxfp4_direct_output_strided_and_empty_rows():
+    _skip_unsupported()
+    ctx_lens = [300, 0, 2048, 5]
+    ctx, bt, k, v, q = make_case([max(n, 1) for n in ctx_lens], 16, 128, seed=8)
+    ctx = torch.tensor(ctx_lens, dtype=torch.int32, device=q.device)
+    _, kd, ks, k_deq = quantize_pages(k, 128)
+    _, vd, vs, v_deq = quantize_pages(v, 128)
+    q_in, q_ref = quantize_q_fp8(q)
+    plan = plan_pa_decode(ctx, 1, max_partitions=1)
+    # output rows padded to 2x: a strided view
+    big = torch.full((4, 32, HEAD_DIM), 7.0, dtype=torch.bfloat16, device=q.device)
+    out = big[:, :16]
+    pa_decode_mxfp4(out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan)
+    torch.cuda.synchronize()
+    ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
+    for r in (0, 2, 3):
+        assert rel_l2(out[r].float(), ref[r]) < 3e-3
+    assert (big[:, 16:] == 7.0).all()  # nothing written outside the view
+    # a context-0 row has no task: the direct path leaves it alone (documented)
+    assert (out[1] == 7.0).all()
+    # the reduce path zero-fills it
+    out2 = torch.full_like(q, 7.0)
+    pa_decode_mxfp4(
+        out2, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5,
+        work_plan=plan, direct_output=False,
+    )  # fmt: skip
+    assert (out2[1] == 0).all()
+
+
+def test_pa_decode_mxfp4_direct_output_graph_replay():
+    _skip_unsupported()
+    ctx_lens = [2048] * 8
+    ctx, bt, k, v, q = make_case(ctx_lens, 16, 128, seed=12)
+    _, kd, ks, k_deq = quantize_pages(k, 128)
+    _, vd, vs, v_deq = quantize_pages(v, 128)
+    q_in, q_ref = quantize_q_fp8(q)
+    plan = plan_pa_decode(ctx, 1, max_partitions=1)
+    out = torch.empty_like(q)
+
+    def call():
+        pa_decode_mxfp4(
+            out, q_in, kd, ks, vd, vs, ctx, bt, HEAD_DIM**-0.5, work_plan=plan
+        )
+
+    call()  # compile outside capture
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+    first = out.clone()
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, first)
+    ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, HEAD_DIM**-0.5, 128)
+    assert rel_l2(out.float(), ref) < 3e-3
+
+
 def test_pa_decode_mxfp4_rejects_oversized_task():
     _skip_unsupported()
     ctx, bt, k, v, q = make_case([40000], 16, 16, seed=2, extra_pages=0)
