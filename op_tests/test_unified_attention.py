@@ -524,11 +524,13 @@ def cache_with_token_stride(dense, token_stride):
 
 
 @benchmark()
-def test_token_stride_overflow(shape):
-    """Decode key 16 with token stride 2**27. The product is 2**31."""
+def test_token_stride_overflow(shape, path):
+    """Token stride 2**27 at page 32. Decode key 16 sits 2**31 into the page,
+    and prefill's 32-bit offsets within the page reach 31 * 2**27, just under
+    the gate's 4 GiB page limit."""
     token_stride = 1 << 27
     assert 16 * token_stride == 1 << 31
-    query_lens, kv_lens = [1], [32]
+    query_lens, kv_lens = [1 if path == "decode" else 32], [32]
     case = make_case(query_lens, kv_lens, shape, page=32)
     want = reference(case, query_lens, kv_lens)
     dense_k, dense_v = case["k"], case["v"]
@@ -682,6 +684,18 @@ def check_routing():
         cache = cache.transpose(1, 2)
         return {"k": cache[..., :head_dim], "v": cache[..., head_dim:]}
 
+    def strided_kv(token_stride, page=32):
+        """Full-layer K and V with `token_stride` between tokens, on the meta
+        device: a page past 4 GiB needs no storage."""
+        head_dim, _, num_kv_heads, _ = SHAPES["full"]
+        cache = torch.empty_strided(
+            (4, page, num_kv_heads, head_dim),
+            (page * token_stride, token_stride, head_dim, 1),
+            dtype=torch.float8_e4m3fnuz,
+            device="meta",
+        )
+        return {"k": cache, "v": cache}
+
     cpu = router_case()
     assert not adapter._devices_ok(cpu["q"], cpu["k"]), "CPU tensors are served"
     triton = SimpleNamespace(unified_attention=stub("triton"))
@@ -699,6 +713,7 @@ def check_routing():
         "sinks": {"sinks": torch.zeros(32)},
         "8-byte aligned output": {"out": misaligned.view(2, 32, 512)},
         "empty block table": {"block_table": torch.zeros(2, 0, dtype=torch.int32)},
+        "page past 4 GiB": strided_kv(1 << 28),
     }
     with (
         mock.patch.dict(
@@ -724,6 +739,8 @@ def check_routing():
         for name, overrides in declined.items():
             assert routed(**overrides) == ["triton"], name
             assert raises(RuntimeError, backend="flydsl", **overrides), name
+        # Page 32 at token stride 2**27 spans just under 4 GiB.
+        assert routed(**strided_kv(1 << 27)) == ["flydsl"]
         # Run-only mode serves only the prebuilt layouts; a padded cache
         # (strides 67584, 2112, 528 at page 32) would miss the cache.
         padded = kv(page=32, pad=16)
@@ -843,7 +860,7 @@ def main():
         (
             "token stride overflow",
             test_token_stride_overflow,
-            itertools.product(args.shape),
+            itertools.product(args.shape, ["prefill", "decode"]),
         ),
     ]
     for name, fn, parameters in sweeps:

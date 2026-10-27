@@ -182,7 +182,8 @@ def _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
     """Contiguous Q and O. K and V may be strided views of one cache (vLLM)
     with a unit head-dim stride; their other strides are compiled in. The
     Q/K/V vector loads and the head-512 combine's output stores promise
-    16-byte alignment to LLVM."""
+    16-byte alignment to LLVM. Prefill K/V loads add a 32-bit offset within
+    the page to a 64-bit page base, so a page must span less than 4 GiB."""
     return (
         q.is_contiguous()
         and out.is_contiguous()
@@ -193,6 +194,7 @@ def _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
         and v.stride(3) == 1
         and all(stride % 16 == 0 for stride in k.stride()[:3])
         and all(stride % 16 == 0 for stride in v.stride()[:3])
+        and all((t.shape[1] - 1) * t.stride(1) + t.shape[3] < 1 << 32 for t in (k, v))
         and block_table.stride(1) == 1
         and all(t.data_ptr() % 16 == 0 for t in (q, k, v, out))
         and all(t.data_ptr() % 4 == 0 for t in (cu_seqlens_q, seqused_k, block_table))
