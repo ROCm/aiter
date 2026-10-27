@@ -93,6 +93,9 @@ def fused_qknorm_idxrqknorm(
     # (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k /
     # kv_cache_v are typically the key/value slices of a fused
     # [num_blocks, 2, block_size, num_kv_heads, head_dim] cache).
+    # index_cache_dtype: "auto" (qkv dtype), "fp8", or "mxfp4". "mxfp4" needs a contiguous
+    # uint8 index_cache of whole 8704 B pages, [128 tokens x 64 B e2m1][128 x 4 B e8m0],
+    # the layout minimax_m3_index_score_fp4 reads; it only changes the index-K write.
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
