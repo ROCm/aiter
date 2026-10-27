@@ -58,8 +58,8 @@ from aiter.ops.flydsl.kernels.moe_scatter_copy_preshuffle_scale import (
 from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
     build_moe_scatter_copy_token_module,
 )
+from aiter.ops.flydsl.kernels.rmsnorm_gfx1250 import rmsnorm_flydsl_out
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
-from aiter.ops.rmsnorm import rms_norm_opus
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -694,9 +694,12 @@ def test_mega_combine_post_rmsnorm(tokens, model_dim, topk):
     )
 
     eps = 1e-6
-    slots = (
-        torch.randn(tokens, topk, model_dim, dtype=torch.bfloat16) * 0.5
-    ).contiguous()
+    # MegaMoE's peer-addressable combine arena gives each BF16 route row a
+    # power-of-two pitch. Keep that padding here so the RMSNorm benchmark covers
+    # the strided input used by the real pipeline.
+    slot_stride = 1 << (model_dim - 1).bit_length()
+    slot_storage = torch.randn(tokens * topk, slot_stride, dtype=torch.bfloat16) * 0.5
+    slots = slot_storage[:, :model_dim].view(tokens, topk, model_dim)
     route_weights = torch.rand(tokens, topk, dtype=torch.float32)
     route_weights /= route_weights.sum(dim=1, keepdim=True)
     rms_weight = torch.linspace(
@@ -731,7 +734,7 @@ def test_mega_combine_post_rmsnorm(tokens, model_dim, topk):
     )
 
     def fn():
-        rms_norm_opus(
+        rmsnorm_flydsl_out(
             normalized,
             slots.view(tokens * topk, model_dim),
             rms_weight,

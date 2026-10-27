@@ -171,6 +171,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     from aiter.ops.flydsl.kernels.moe_route_maps import (
         build_moe_topids_to_rows_module,
     )
+    from aiter.ops.flydsl.kernels.rmsnorm_gfx1250 import build_rmsnorm_gfx1250
 
     dev = torch.device("cpu")
     i32 = torch.int32
@@ -382,6 +383,18 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             stream=0,
         )
+
+    # Optional post-GEMM2 RMSNorm.
+    rmsnorm = build_rmsnorm_gfx1250(model_dim)
+    rmsnorm(
+        0,
+        0,
+        0,
+        numel,
+        model_dim,
+        1e-6,
+        stream=0,
+    )
 
 
 def compile_one_config(**job):

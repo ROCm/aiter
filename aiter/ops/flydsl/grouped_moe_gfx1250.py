@@ -1357,10 +1357,10 @@ def _grouped_a8w4_tdm_moe(
 
     norm_out = grouped_out
     if post_gemm2_rms_weight is not None:
-        from aiter.ops.rmsnorm import rms_norm_opus
+        from aiter.ops.flydsl.kernels.rmsnorm_gfx1250 import rmsnorm_flydsl_out
 
         norm_out = torch.empty_like(grouped_out)
-        rms_norm_opus(
+        rmsnorm_flydsl_out(
             norm_out.view(-1, model_dim),
             grouped_out.view(-1, model_dim),
             post_gemm2_rms_weight,

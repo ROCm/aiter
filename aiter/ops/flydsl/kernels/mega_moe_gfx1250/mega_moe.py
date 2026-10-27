@@ -1868,7 +1868,7 @@ class MegaMoEGfx1250:
         combine_input = self._arena.local_ptr("comb_inp")
         route_weights = 0
         if self.post_gemm2_rmsnorm:
-            from aiter.ops.rmsnorm import rms_norm_opus
+            from aiter.ops.flydsl.kernels.rmsnorm_gfx1250 import rmsnorm_flydsl_out
 
             rows = routing.token_count * self._config.topk
             normalized = self._rms_slots[:rows]
@@ -1884,7 +1884,7 @@ class MegaMoEGfx1250:
                 (slot_capacity, self._config.hidden_dim),
                 (slot_stride, 1),
             )
-            rms_norm_opus(
+            rmsnorm_flydsl_out(
                 normalized,
                 strided_slots[:rows],
                 post_gemm2_rms_weight,
