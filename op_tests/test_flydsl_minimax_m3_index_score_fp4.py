@@ -27,6 +27,9 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels import minimax_m3_index_score as fp8_kernel
 from aiter.ops.flydsl.kernels import minimax_m3_index_score_fp4 as kernel
+from aiter.ops.flydsl.kernels import (
+    minimax_m3_index_score_prefill_fp4 as prefill_kernel,
+)
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -393,9 +396,189 @@ def test_exports_resolve():
     for name in (
         "minimax_m3_index_score_fp4_flydsl",
         "minimax_m3_index_score_fp4_flydsl_supported",
+        "minimax_m3_index_score_prefill_fp4_flydsl",
     ):
         assert name in F.__all__
         getattr(F, name)
+
+
+# ---------------------------------------------------------------------------
+# Prefill: dequantize to fp8 staging, then the unchanged fp8 prefill scorer
+#
+# Two independent judges on the SAME dequantized values: aiter's own
+# `pa_sparse_block_score_prefill` and the fp8 FlyDSL prefill scorer, both fed
+# `dequantize(K).to(fp8)` (exact for scales in e4m3's range, which the cases
+# keep to). The fp4 route must match both bit for bit.
+# ---------------------------------------------------------------------------
+SENTINEL = fp8_test.SENTINEL
+LOG2E = fp8_test.LOG2E
+
+
+def fp4_prefill_case(batch, q_len, ctx_len, heads=1, seed=0):
+    """A fp8 prefill case whose cache is re-quantized to MXFP4. Returns the
+    case (cache = the dequantized values as fp8, for the judges) and the two
+    MXFP4 views."""
+    c = fp8_test.make_prefill_case(batch, q_len, ctx_len, heads, seed)
+    kd, ks, deq = fp4_cache_of(c["cache"])
+    as_fp8 = deq.to(dtypes.fp8)
+    assert torch.equal(as_fp8.to(torch.bfloat16), deq), "left e4m3's exact range"
+    return dict(c, cache=as_fp8), kd, ks
+
+
+def run_prefill_fp4(c, kd, ks, **kw):
+    heads = c["q8"].shape[1]
+    out = fp8_test.prefill_alloc_score(c["q8"].shape[0], heads, c["mb"], "cuda")
+    out.fill_(SENTINEL)
+    prefill_kernel.score_prefill_flydsl_fp4(
+        c["q_bf16"],
+        kd,
+        ks,
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        c["prefix"],
+        c["max_q"],
+        c["max_seq"],
+        1.0 / LOG2E,
+        out=out,
+        **kw,
+    )
+    return out.reshape(heads, c["q8"].shape[0], c["mb"])
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "shape", fp8_test.PREFILL_SHAPES, ids=lambda s: f"b{s[0]}_q{s[1]}_ctx{s[2]}"
+)
+def test_prefill_matches_aiter_and_fp8_kernel(shape):
+    c, kd, ks = fp4_prefill_case(*shape)
+    ref, live = fp8_test.aiter_scores(c)
+    got = run_prefill_fp4(c, kd, ks)
+    fp8_test.assert_matches_aiter(got, ref, live, f"{shape}")
+    assert torch.equal(got[live], fp8_test.run_prefill(c)[live])
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "shape", fp8_test.GEOM_SHAPES, ids=lambda s: f"b{s[0]}_q{s[1]}_ctx{s[2]}"
+)
+def test_prefill_every_geometry(shape):
+    c, kd, ks = fp4_prefill_case(*shape)
+    ref, live = fp8_test.aiter_scores(c)
+    fp8_test.assert_matches_aiter(run_prefill_fp4(c, kd, ks), ref, live, f"{shape}")
+
+
+@requires_gfx950
+def test_prefill_two_heads():
+    c, kd, ks = fp4_prefill_case(2, 256, 3000, heads=2)
+    ref, live = fp8_test.aiter_scores(c)
+    fp8_test.assert_matches_aiter(run_prefill_fp4(c, kd, ks), ref, live, "heads=2")
+
+
+@requires_gfx950
+@pytest.mark.parametrize("ctx", [1, 127, 128, 129, 1000, 4097])
+def test_staging_is_the_fp8_cast_bitwise(ctx):
+    """Every staged page of every request equals `dequantize(K).to(fp8)` of the
+    page its block table names; lengths off a page boundary included."""
+    batch = 3
+    c, kd, ks = fp4_prefill_case(batch, min(ctx, 128), ctx)
+    mb = c["mb"]
+    staged = prefill_kernel.dequant_pages_fp8(kd, ks, c["bt"], c["seq"], mb)
+    want = c["cache"][c["bt"].long().reshape(-1)]  # [batch*mb, 128, 128]
+    assert torch.equal(staged.view(torch.uint8), want.view(torch.uint8))
+
+
+@requires_gfx950
+def test_staging_leaves_dead_pages_alone_and_scores_ignore_them():
+    """Pages past a request's length are not staged; poisoning the workspace
+    with NaN bytes must not change a live score."""
+    c, kd, ks = fp4_prefill_case(3, 128, 1500)
+    c["seq"] = torch.tensor([1500, 300, 700], dtype=torch.int32, device="cuda")
+    c["prefix"] = torch.tensor([1372, 172, 572], dtype=torch.int32, device="cuda")
+    base = run_prefill_fp4(c, kd, ks)
+    ws = torch.full((3 * c["mb"], P, D), 0xFF, dtype=torch.uint8, device="cuda").view(
+        dtypes.fp8
+    )
+    poisoned = run_prefill_fp4(c, kd, ks, workspace=ws)
+    live = base != SENTINEL
+    assert torch.equal(base[live], poisoned[live])
+    ref, ref_live = fp8_test.aiter_scores(c)
+    fp8_test.assert_matches_aiter(base, ref, ref_live, "ragged lengths")
+
+
+@requires_gfx950
+def test_prefill_mixed_query_lengths_and_trailing_empty_request():
+    dev = "cuda"
+    torch.manual_seed(0)
+    q_a, ctx_a, ctx_b = 1024, 1024, 16384
+    cu = torch.tensor([0, q_a, q_a + 1, q_a + 1], dtype=torch.int32, device=dev)
+    seq = torch.tensor([ctx_a, ctx_b, ctx_b], dtype=torch.int32, device=dev)
+    prefix = torch.tensor(
+        [ctx_a - q_a, ctx_b - 1, ctx_b], dtype=torch.int32, device=dev
+    )
+    mb = -(-ctx_b // P)
+    q8 = (torch.randn(q_a + 1, 1, D, device=dev) / 4).to(dtypes.fp8)
+    cache8 = (torch.randn(3 * mb, P, D, device=dev) / 4).to(dtypes.fp8)
+    kd, ks, deq = fp4_cache_of(cache8)
+    as_fp8 = deq.to(dtypes.fp8)
+    bt = torch.randperm(3 * mb, device=dev, dtype=torch.int32).view(3, mb).contiguous()
+    ref = torch.full((1, q_a + 1, mb), -float("inf"), device=dev)
+    # aiter sees the first two requests; the third is the trailing empty one.
+    from aiter.ops.msa_block_select import pa_sparse_block_score_prefill
+
+    pa_sparse_block_score_prefill(
+        q8, as_fp8, ref, bt[:2], cu[:3], seq[:2], max_query_len=q_a, max_seq_len=ctx_b
+    )
+    live = torch.isfinite(ref)
+    out = fp8_test.prefill_alloc_score(q_a + 1, 1, mb, dev)
+    out.fill_(SENTINEL)
+    prefill_kernel.score_prefill_flydsl_fp4(
+        q8.float().bfloat16(),
+        kd,
+        ks,
+        bt,
+        cu,
+        seq,
+        prefix,
+        q_a,
+        ctx_b,
+        1.0 / LOG2E,
+        out=out,
+    )
+    fp8_test.assert_matches_aiter(
+        out.reshape(1, q_a + 1, mb), ref, live, "mixed lengths + trailing empty"
+    )
+
+
+@requires_gfx950
+def test_prefill_rejections():
+    c, kd, ks = fp4_prefill_case(1, 128, 1000)
+    args = (c["cu"], c["seq"], c["prefix"], c["max_q"], c["max_seq"], 1.0 / LOG2E)
+    f = prefill_kernel.score_prefill_flydsl_fp4
+    with pytest.raises(ValueError):
+        f(c["q_bf16"], kd.view(torch.int8), ks, c["bt"], *args)
+    with pytest.raises(ValueError):
+        f(c["q_bf16"], kd, ks[:, :, :2], c["bt"], *args)
+    with pytest.raises(ValueError, match="block_table"):
+        f(c["q_bf16"], kd, ks, c["bt"][:, :2], *args)
+    with pytest.raises(ValueError, match="workspace"):
+        f(
+            c["q_bf16"],
+            kd,
+            ks,
+            c["bt"],
+            *args,
+            workspace=torch.empty(1, P, D, dtype=dtypes.fp8, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="workspace"):
+        f(
+            c["q_bf16"],
+            kd,
+            ks,
+            c["bt"],
+            *args,
+            workspace=torch.empty(c["mb"], P, D, dtype=torch.uint8, device="cuda"),
+        )
 
 
 # ---------------------------------------------------------------------------
