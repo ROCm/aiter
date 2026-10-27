@@ -230,7 +230,7 @@ def get_flydsl_a16w16_configs(
     split_k_candidates = [1]
     split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
     selections = {
-        "block_m": [16, 32, 48, 64, 80, 96, 128, 224, 256],
+        "block_m": [16, 32, 48, 64, 80, 96, 128, 192, 224, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
         "block_k": [64, 128, 256],
         "stages": list(range(2, 10)),

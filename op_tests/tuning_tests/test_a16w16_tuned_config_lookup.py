@@ -277,24 +277,25 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
                 policy, "make_gemm_a16w16_param_and_validate", lambda *args: object()
             ),
         ):
-            configs = policy.get_flydsl_a16w16_configs(
-                2079,
-                6288,
-                7168,
-                torch.bfloat16,
-                torch.bfloat16,
-                False,
-            )
-
-        assert any(
-            config["block_m"] == 224
-            and config["block_n"] == 256
-            and config["block_k"] == 64
-            and config["stages"] == 2
-            and config["m_waves"] == 2
-            and config["n_waves"] == 4
-            for config in configs
-        )
+            for shape, tile in (
+                ((2079, 6288, 7168), (224, 256, 2, 4)),
+                ((576, 20480, 7168), (192, 256, 4, 4)),
+            ):
+                configs = policy.get_flydsl_a16w16_configs(
+                    *shape,
+                    torch.bfloat16,
+                    torch.bfloat16,
+                    False,
+                )
+                assert any(
+                    config["block_m"] == tile[0]
+                    and config["block_n"] == tile[1]
+                    and config["block_k"] == 64
+                    and config["stages"] == 2
+                    and config["m_waves"] == tile[2]
+                    and config["n_waves"] == tile[3]
+                    for config in configs
+                )
 
 
 if __name__ == "__main__":
