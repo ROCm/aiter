@@ -1372,7 +1372,9 @@ class _MoriDispatch(_Dispatch):
             self._plans[spec] = plan
             plan.bind(rank=config.rank)
             if self._staging is not None:
-                plan.bind(staging_base=self._staging.data_ptr())
+                # The tensor, not its address: a mori with ROCm/mori#844 checks it
+                # against the plan's stagingBytes, an older one reads its address.
+                plan.bind(staging_base=self._staging)
         self._tok_off_peers = None if res.tokoff_ext is None else res.tokoff_ext.peers
         # Width in whatever recv_dtype counts: features for bf16/fp8, bytes for
         # fp4 -- see _DispatchWire.recv_dtype.
