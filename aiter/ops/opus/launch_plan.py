@@ -488,6 +488,13 @@ _A8W8_MXSCALE_BMM_PREFETCH_TAGS = _A8W8_MXSCALE_BMM_WORKSPACE_TAGS | frozenset(
         "a8w8_mxscale_bmm_mouter_tunable",
     }
 )
+# The 256x256 pipeline kernels step their main loop two K tiles at a time.
+_A8W8_MXSCALE_BMM_PAIRED_TAGS = frozenset(
+    {
+        "a8w8_mxscale_bmm_pipeline",
+        "a8w8_mxscale_bmm_pipeline_bpreshuffle",
+    }
+)
 _A8W8_FAMILY_BY_TAG = {
     "a8w8": _A8W8_FAMILY,
     "a8w8_scale": _A8W8_BLOCKSCALE_FAMILY,
@@ -667,7 +674,7 @@ def _build_a8w8_mxscale_bmm_plan(
             f"got {requested_split_k}"
         )
     abi_split_k = max(1, requested_split_k)
-    if tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+    if tag in ("a8w8_mxscale_bmm_bpreshuffle_compact", "a8w8_mxscale_bmm_compact"):
         if not (
             0 < M < 2048
             and 0 < batch <= 16
@@ -705,6 +712,10 @@ def _build_a8w8_mxscale_bmm_plan(
     if K % k_align:
         raise ValueError(
             f"OPUS BMM kid {resolved_kid} requires K % {k_align} == 0; got K={K}"
+        )
+    if tag in _A8W8_MXSCALE_BMM_PAIRED_TAGS and (K // k_align) % 2:
+        raise ValueError(
+            f"OPUS BMM kid {resolved_kid} requires an even K / {k_align}; got K={K}"
         )
     if instance.direct_only and abi_split_k != 1:
         raise ValueError(f"OPUS BMM kid {resolved_kid} requires split_k <= 1")

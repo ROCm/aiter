@@ -179,6 +179,12 @@ class OpusGemmInstance:
     skip_scale_wait: bool = False
     pack_scale_on_demand: bool = False
     preload_sf_lds: bool = False
+    # The A scale panel alone (pipeline family). For GROUP_N=1, whose B panel
+    # is B_N rows and does not fit beside the A panel.
+    preload_sfa_lds: bool = False
+    # Pipeline family: slide the B scale panel with the A window instead of
+    # holding the whole K, which lifts the preload K ceiling.
+    sf_long_k: bool = False
     name_root: str = "opus_gemm"
 
     # gfx1250 fused single-kernel split-K. SplitK and the N-direction cluster
@@ -320,8 +326,10 @@ class OpusGemmInstance:
                 parts.append("sfgmpack")
             if self.shuffle_scale:
                 parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
-        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
-            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_compact")
+        elif self.kernel_tag in _BMM_COMPACT_TAGS:
+            parts.insert(
+                tag_at, self.kernel_tag.replace("a8w8_mxscale_bmm_", "a8w8_mxscale_")
+            )
             parts.append(f"buf{self.num_slots}")
             if self.early_b:
                 parts.append("earlyb")
@@ -343,6 +351,10 @@ class OpusGemmInstance:
             parts.insert(tag_at, "a8w8_mxscale_pipeline")
             if self.preload_sf_lds:
                 parts.append("preload_sf")
+            elif self.preload_sfa_lds:
+                parts.append("preload_sfa")
+            if self.sf_long_k:
+                parts.append("longk")
         elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline_bpreshuffle":
             # opus_bmm_a8w8_mxscale_pipeline_bpreshuffle_<geom>[_preload_sf].
             # Without this branch the tag fell through to the bare default, so
@@ -559,6 +571,11 @@ def a8w8_mxscale_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     )
 
 
+_BMM_COMPACT_TAGS = (
+    "a8w8_mxscale_bmm_bpreshuffle_compact",
+    "a8w8_mxscale_bmm_compact",
+)
+
 _BMM_M_ALIGN_TILES = {
     "a8w8_mxscale_bmm_flatmm_splitk": 0,
     "a8w8_mxscale_bmm_bpreshuffle_bdirect": 0,
@@ -570,6 +587,7 @@ _BMM_M_ALIGN_TILES = {
     "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": 0,
     "a8w8_mxscale_bmm_bpreshuffle_wave1": 0,
     "a8w8_mxscale_bmm_bpreshuffle_compact": 0,
+    "a8w8_mxscale_bmm_compact": 0,
     "a8w8_mxscale_bmm_pipeline": 0,
     "a8w8_mxscale_bmm_pipeline_bpreshuffle": 0,
     "a8w8_mxscale_bmm_fused": 0,
@@ -698,13 +716,18 @@ def _a8w8_mxscale_bmm_flatmm_splitk(
     bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False,
     shuffle_scale=False,
     quant_block=128,
+    group_n=None,
 ):
     # quant_block is GROUP_N and GROUP_K together: A and B quantise on the same
     # block, either DSv4's 128 or MX's 32. GROUP_M stays 1 (per token) for both.
+    # group_n=1 overrides GROUP_N for per-row K32 weight scales.
     t_m, t_n = (1, 2) if bm == 16 else (2, 1)
+    group_n = quant_block if group_n is None else group_n
+    assert group_n == quant_block or (group_n == 1 and quant_block == 32)
+    assert group_n != 1 or not shuffle_scale, "shuffle_scale is per N block"
     inst = OpusGemmInstance(
         256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4,
-        1, quant_block, quant_block, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
+        1, group_n, quant_block, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
         wg_per_cu, splitk_workspace_dtype="fp32_t",
     )
     inst.name_root = "opus_bmm"
@@ -1547,6 +1570,24 @@ _bmm_flatmm_local.update({
     )
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
+# Per-row K32 (1x32) variants of every tile with a 32x32 twin, for the
+# row-major-weight entry. Local id 1800 + the mirror's last two digits, which
+# are distinct across the tiles, so global 9821 is kid 321 at 1x32.
+_MX1X32_KID_BASE = 1800
+_mx1x32_flatmm = {
+    _MX1X32_KID_BASE + kid % 100: _a8w8_mxscale_bmm_flatmm_splitk(
+        inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
+        direct_only=inst.direct_only, prefetch_scale=inst.prefetch_scale,
+        preload_sf=inst.preload_sf, quant_block=32, group_n=1,
+    )
+    for kid, inst in _bmm_flatmm_local.items()
+    if kid < MX32_KID_STRIDE and kid + MX32_KID_STRIDE in _bmm_flatmm_local
+}
+assert len(_mx1x32_flatmm) == sum(
+    1 for kid in _bmm_flatmm_local
+    if kid < MX32_KID_STRIDE and kid + MX32_KID_STRIDE in _bmm_flatmm_local
+), "1x32 flatmm kid ids collide"
+_bmm_flatmm_local.update(_mx1x32_flatmm)
 
 
 # ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this
@@ -1639,6 +1680,56 @@ _bmm_pipeline_bpre_local = {
     # kid196: kid158 (preload_sf_lds) with a preshuffled B.
     196: _a8w8_mxscale_bmm_pipeline_bpreshuffle(preload_sf_lds=True),
 }
+# MX twin for the pipeline family. This family is where the large-M wins live --
+# at g8/m32768 8158 measures 2122 TFLOPS and 8150 1493, against 1158 for the best
+# flatmm kid -- so with no twin here every large-M 32 shape fell back to the
+# flatmm 9325 and lost about half. The block size itself is not what costs that:
+# the same kernel at 32 gives up only ~13% (8325 1158 -> 9325 1004).
+#
+# 150 (no preload) comes first on purpose. The PRELOAD_SF_LDS variant's B-scale
+# panel is sized one byte per thread, and GROUP_N=32 multiplies that by 16, so
+# 158's twin needs the panel rebalanced as a separate step; 150 needs only the
+# lane-addressed scale the traits already describe.
+#
+# 150's twin is kept even though it loses to the flatmm 9325: at GROUP_N=32 the
+# half-tile spans four B scale groups, and those are rows of the scale matrix
+# rather than neighbouring bytes, so its steady-state B fetch is four loads where
+# the 128 kid needs one. Staging that panel in LDS is exactly what 158 does, so
+# the twin that wins is 9158 and 9150 is the substrate it is built on.
+_bmm_pipeline_local.update({
+    150 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(GROUP_N=32, GROUP_K=32),
+    158 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(
+        preload_sf_lds=True, GROUP_N=32, GROUP_K=32
+    ),
+})
+# 158 and its twin for K > 8192: both scale panels slide, so K is unbounded.
+# Separate kids so 158's tuned footprint at K <= 8192 stays as it is.
+_bmm_pipeline_local.update({
+    157: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True, sf_long_k=True),
+    157 + MX32_KID_STRIDE: _a8w8_mxscale_bmm_pipeline(
+        preload_sf_lds=True, sf_long_k=True, GROUP_N=32, GROUP_K=32
+    ),
+})
+# 1x32 twins, past the 18xx flatmm twins' kid % 100 range. A GROUP_N=1 B scale
+# is B_N rows, as large as the A one: 1891-1893 preload A only and read B per
+# lane from global; 1894-1896 slide a B panel along with the A window.
+_bmm_pipeline_local.update({
+    1890: _a8w8_mxscale_bmm_pipeline(GROUP_N=1, GROUP_K=32),
+    1891: _a8w8_mxscale_bmm_pipeline(preload_sfa_lds=True, GROUP_N=1, GROUP_K=32),
+    1892: _a8w8_mxscale_bmm_pipeline(
+        B_M=128, preload_sfa_lds=True, GROUP_N=1, GROUP_K=32
+    ),
+    1893: _a8w8_mxscale_bmm_pipeline(
+        B_N=128, preload_sfa_lds=True, GROUP_N=1, GROUP_K=32
+    ),
+    1894: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True, GROUP_N=1, GROUP_K=32),
+    1895: _a8w8_mxscale_bmm_pipeline(
+        B_M=128, preload_sf_lds=True, GROUP_N=1, GROUP_K=32
+    ),
+    1896: _a8w8_mxscale_bmm_pipeline(
+        B_N=128, preload_sf_lds=True, GROUP_N=1, GROUP_K=32
+    ),
+})
 _bmm_mouter_local = {
     131: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter", 128, 128, 128, 1),
     144: _a8w8_mxscale_bmm_spec(
@@ -1720,7 +1811,9 @@ a8w8_mxscale_bmm_wave4m2_selfload_kernels_list = _globalize_bmm_kids(
 )
 
 
-def _a8w8_mxscale_bmm_bpreshuffle_compact(bm, bn, bk, wm, wn, nb, nt, early_b):
+def _a8w8_mxscale_bmm_bpreshuffle_compact(
+    bm, bn, bk, wm, wn, nb, nt, early_b, row_b=False
+):
     return OpusGemmInstance(
         wm * wn * 64,
         bm,
@@ -1737,7 +1830,7 @@ def _a8w8_mxscale_bmm_bpreshuffle_compact(bm, bn, bk, wm, wn, nb, nt, early_b):
         1,
         128,
         128,
-        "a8w8_mxscale_bmm_bpreshuffle_compact",
+        "a8w8_mxscale_bmm_compact" if row_b else "a8w8_mxscale_bmm_bpreshuffle_compact",
         ["fp32_t"],
         WG_PER_CU=1,
         cachectl_a=0,
@@ -1751,33 +1844,50 @@ def _a8w8_mxscale_bmm_bpreshuffle_compact(bm, bn, bk, wm, wn, nb, nt, early_b):
 
 # Explicit local ids keep existing tuned CSVs stable when adding configurations.
 # Arguments: BM, BN, BK, WM, WN, LDS slots, non-temporal B, early B prefetch.
+_BMM_COMPACT_ARGS = {
+    470: (64, 64, 256, 2, 2, 4, True, False),
+    471: (96, 64, 256, 2, 2, 3, False, False),
+    472: (64, 64, 256, 4, 2, 4, True, False),
+    473: (192, 128, 128, 2, 4, 3, False, False),
+    474: (256, 128, 128, 4, 2, 3, True, False),
+    475: (192, 128, 128, 2, 4, 3, False, True),
+    476: (256, 128, 128, 4, 2, 3, True, True),
+    477: (16, 32, 512, 1, 2, 3, False, False),
+    478: (32, 32, 512, 2, 2, 2, False, False),
+    479: (16, 64, 512, 1, 4, 2, False, False),
+    480: (16, 64, 256, 1, 4, 3, False, False),
+    481: (32, 64, 256, 2, 2, 3, False, False),
+    482: (64, 32, 256, 2, 2, 3, False, False),
+    483: (64, 64, 128, 2, 2, 3, False, False),
+    484: (128, 128, 128, 2, 2, 2, False, False),
+}
 a8w8_mxscale_bmm_bpreshuffle_compact_kernels_list = _globalize_bmm_kids(
     {
-        470: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 256, 2, 2, 4, True, False),
-        471: _a8w8_mxscale_bmm_bpreshuffle_compact(96, 64, 256, 2, 2, 3, False, False),
-        472: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 256, 4, 2, 4, True, False),
-        473: _a8w8_mxscale_bmm_bpreshuffle_compact(
-            192, 128, 128, 2, 4, 3, False, False
-        ),
-        474: _a8w8_mxscale_bmm_bpreshuffle_compact(256, 128, 128, 4, 2, 3, True, False),
-        475: _a8w8_mxscale_bmm_bpreshuffle_compact(192, 128, 128, 2, 4, 3, False, True),
-        476: _a8w8_mxscale_bmm_bpreshuffle_compact(256, 128, 128, 4, 2, 3, True, True),
-        477: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 32, 512, 1, 2, 3, False, False),
-        478: _a8w8_mxscale_bmm_bpreshuffle_compact(32, 32, 512, 2, 2, 2, False, False),
-        479: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 64, 512, 1, 4, 2, False, False),
-        480: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 64, 256, 1, 4, 3, False, False),
-        481: _a8w8_mxscale_bmm_bpreshuffle_compact(32, 64, 256, 2, 2, 3, False, False),
-        482: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 32, 256, 2, 2, 3, False, False),
-        483: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 128, 2, 2, 3, False, False),
-        484: _a8w8_mxscale_bmm_bpreshuffle_compact(
-            128, 128, 128, 2, 2, 2, False, False
-        ),
+        kid: _a8w8_mxscale_bmm_bpreshuffle_compact(*args)
+        for kid, args in _BMM_COMPACT_ARGS.items()
+    }
+)
+
+
+# Row-major B twins of the compact tiles: same schedule, B staged through LDS
+# like A. Local ids 461-469 mirror 470-476, 483, 484.
+_BMM_COMPACT_ROW_B_TWINS = {
+    461: 470, 462: 471, 463: 472, 464: 473, 465: 474,
+    466: 475, 467: 476, 468: 483, 469: 484,
+}
+a8w8_mxscale_bmm_compact_kernels_list = _globalize_bmm_kids(
+    {
+        local: _a8w8_mxscale_bmm_bpreshuffle_compact(
+            *_BMM_COMPACT_ARGS[mirror], row_b=True
+        )
+        for local, mirror in _BMM_COMPACT_ROW_B_TWINS.items()
     }
 )
 
 
 a8w8_mxscale_bmm_kernel_lists = (
     a8w8_mxscale_bmm_bpreshuffle_compact_kernels_list,
+    a8w8_mxscale_bmm_compact_kernels_list,
     a8w8_mxscale_bmm_flatmm_splitk_kernels_list,
     a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list,
     a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen_kernels_list,
@@ -3154,6 +3264,7 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a8w8_mxscale_bmm_bpreshuffle_wave1",
                 "a8w8_mxscale_bmm_bpreshuffle_compact",
                 "a8w8_mxscale_bmm_pipeline_bpreshuffle",
+                "a8w8_mxscale_bmm_compact",
             }
         ),
         "a8w8_blockscale_bpreshuffle": frozenset(),

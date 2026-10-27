@@ -251,8 +251,11 @@ def _batched_gemm_a8w8_mxscale_impl(
         # The shape resolver already returns a final canonical global kid.
         # Enter the checked C++ launcher directly for the common no-workspace
         # path instead of repeating the unified public routing contract.  The
-        # C++ boundary still validates dtype, shape, device, stride, arch and
-        # exact kid.  Workspace cases retain the unified Python planner below.
+        # C++ boundary still validates dtype, shape, device, stride, arch,
+        # exact kid and the kid's own M/N/K tile alignment -- the last of these
+        # because an unaligned shape is silently wrong rather than rejected,
+        # and no launch plan is built here to catch it.  Workspace cases retain
+        # the unified Python planner below.
         raw_launch(
             x,
             wo_a,
@@ -301,9 +304,9 @@ def batched_gemm_a8w8_mxscale(
 ) -> Tensor:
     """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``.
 
-    The w_scale block (``[G, N/block, K/block]``, 128x128 or 32x32) picks the
-    tuned row and the kernel, since a kernel built for the other block reads the
-    scales at the wrong stride.
+    The w_scale block (``[G, N/block_n, K/block_k]``: 128x128, 32x32, or 1x32
+    per-row K32) picks the tuned row and the kernel, since a kernel built for
+    another block reads the scales at the wrong stride.
     """
     return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
 

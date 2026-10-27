@@ -322,12 +322,34 @@ _TUNE_POLICY.update(
         kid: [1]
         for kid, inst in _CODEGEN_BMM.items()
         if kid >= BMM_MXSCALE_KID_OFFSET
-        and inst.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact"
+        and inst.kernel_tag
+        in ("a8w8_mxscale_bmm_bpreshuffle_compact", "a8w8_mxscale_bmm_compact")
     }
 )
 _TUNE_POLICY = _globalise_policy(_TUNE_POLICY)
+
+# Families whose launcher honors splitK>1: they write fp32 partials to the
+# caller-owned workspace and carry the fused reduce tail (per-tile counter,
+# last arrival sums in split order). Everything else is splitK==1 only, so a
+# policy entry sweeping splitK>1 on another family is a bug -- fail at import
+# rather than silently benchmark a wrong result.
+_SPLITK_FAMILIES = frozenset(
+    {
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
+    }
+)
+
 _TUNE_POLICY.update(
-    {kid: [1, 2, 4, 8] for kid in _CODEGEN_BMM if _kid_block(kid) == "1x32"}
+    {
+        kid: (
+            [1, 2, 4, 8]
+            if inst.kernel_tag in _SPLITK_FAMILIES and not inst.direct_only
+            else [1]
+        )
+        for kid, inst in _CODEGEN_BMM.items()
+        if _kid_block(kid) == "1x32"
+    }
 )
 _SHUF_POLICY = _globalise_policy(_SHUF_POLICY)
 _CANDIDATE_KIDS = tuple(_TUNE_POLICY) + tuple(_SHUF_POLICY)
@@ -347,18 +369,6 @@ def _shuf_arm(inst):
 # and kid192 sat here that way. Fail at import instead.
 _dead = sorted(set(_TUNE_POLICY) - set(_CODEGEN_BMM))
 assert not _dead, f"_TUNE_POLICY lists kids the codegen does not emit: {_dead}"
-
-# Families whose launcher honors splitK>1: they write fp32 partials to the
-# caller-owned workspace and carry the fused reduce tail (per-tile counter,
-# last arrival sums in split order). Everything else is splitK==1 only, so a
-# policy entry sweeping splitK>1 on another family is a bug -- fail at import
-# rather than silently benchmark a wrong result.
-_SPLITK_FAMILIES = frozenset(
-    {
-        "a8w8_mxscale_bmm_flatmm_splitk",
-        "a8w8_mxscale_bmm_bpreshuffle_wave1",
-    }
-)
 
 for _kid, _sks in _TUNE_POLICY.items():
     if any(s > 1 for s in _sks):
@@ -561,7 +571,10 @@ def _applicable(kid, g, m, n, k, pool="all", *, split_ks=None):
             for s in (split_ks if split_ks is not None else _TUNE_POLICY[kid])
             if s >= 1 and tiles - (s - 1) * ((tiles + s - 1) // s) >= 1
         ]
-    if k_inst.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+    if k_inst.kernel_tag in (
+        "a8w8_mxscale_bmm_bpreshuffle_compact",
+        "a8w8_mxscale_bmm_compact",
+    ):
         if not (
             0 < m < 2048
             and 0 < g <= 16
@@ -1022,8 +1035,6 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         self.untunedf = self._normalize_rows(
             df, default_blocks=("32x32", "128x128"), blocks=args.w_scale_block
         )
-        if not self._bpreshuffle and self.untunedf["w_scale_block"].eq("1x32").any():
-            raise ValueError("1x32 tuning requires --bpreshuffle")
         self.untunedf = (
             self.untunedf[self.untunedf["gfx"] == gfx][self.keys]
             .drop_duplicates()
