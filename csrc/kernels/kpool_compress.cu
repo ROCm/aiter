@@ -254,7 +254,12 @@ __device__ __forceinline__ void load_rows(
 struct NoMid {
   __device__ __forceinline__ void operator()(float) const {}
 };
-template <int POOL, int LANES, typename Mid = NoMid>
+// ALL_LANE_STORE (decode, DPL == 2): branch-free store section, every lane
+// stores (lane pairs their shared dword, all lanes the scale). Insert keeps
+// the exec-masked single-lane stores: with many waves per CU the same-address
+// stores cost it ~7 % (mixed 11.3 -> 12.0 us), while a one-shot decode wave
+// loses more to the taken branches (instruction-cache misses).
+template <int POOL, int LANES, bool ALL_LANE_STORE = false, typename Mid = NoMid>
 __device__ __forceinline__ void compress_pool(
     const uint32_t (&gw)[POOL][HEAD_DIM / LANES / 2],
     const uint32_t (&kw)[POOL][HEAD_DIM / LANES / 2],
@@ -363,7 +368,7 @@ __device__ __forceinline__ void compress_pool(
 
   // --- store: a 32-bit lane offset on the page base, so a wave-uniform page
   // (decode) gives the saddr form (SGPR base + VGPR offset) ---
-  if constexpr (DPL == 2) {
+  if constexpr (DPL == 2 && ALL_LANE_STORE) {
     // Branch-free (every taken branch on this one-shot path costs an
     // instruction-cache miss, ~500 clocks on the ATT ledger): the layout is
     // a select, lane pairs (2k, 2k+1) hold dims 4k..4k+3 and both lanes
@@ -924,8 +929,8 @@ __device__ __forceinline__ void decode_request(
   auto write_pool = [&](const uint32_t (&gw)[POOL][1], const uint32_t (&kw)[POOL][1], int loc_i, auto mid) {
     int tok;
     const int page = page_of<int>(loc_i, page_size, page_shift, tok);
-    compress_pool<POOL, DEC_LANES>(gw, kw, apev, cache_g + (uint64_t)(uint32_t)page * page_bytes, tok,
-                                   (uint32_t)(page_size * HEAD_DIM + tok * 4), preshuffle, round_scale, sub, mid);
+    compress_pool<POOL, DEC_LANES, true>(gw, kw, apev, cache_g + (uint64_t)(uint32_t)page * page_bytes, tok,
+                                         (uint32_t)(page_size * HEAD_DIM + tok * 4), preshuffle, round_scale, sub, mid);
   };
 
   if constexpr (NMAX > 1) {
