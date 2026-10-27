@@ -151,25 +151,30 @@ def get_GEMM_A16W16_tuned_config(
         preferred = next((row for row in family if row[0] >= M), family[-1])
         candidates = [preferred] + [row for row in family if row is not preferred]
     else:
-        candidates = []
-        for gl in [None, 0, 1]:
-            padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-            config = cfg.get(
-                (
-                    gfx,
-                    cu_num,
-                    padded_M,
-                    N,
-                    K,
-                    bias,
-                    str(dtype),
-                    str(otype),
-                    scaleAB,
-                    bpreshuffle,
+        # An exact hit must not load the native padding helper.
+        padded_ms = (
+            M if gl is None else get_padded_m(M, N, K, gl) for gl in (None, 0, 1)
+        )
+        candidates = (
+            (
+                padded_m,
+                cfg.get(
+                    (
+                        gfx,
+                        cu_num,
+                        padded_m,
+                        N,
+                        K,
+                        bias,
+                        str(dtype),
+                        str(otype),
+                        scaleAB,
+                        bpreshuffle,
+                    )
                 ),
-                None,
             )
-            candidates.append((padded_M, config))
+            for padded_m in padded_ms
+        )
     for padded_M, config in candidates:
         if config is not None:
             if config["libtype"] == "flydsl":
@@ -649,6 +654,11 @@ def asm_gemm(
 ):
     kernelName = config.get("kernelName") if config else None
     splitK = config.get("splitK") if config else None
+    # The ASM ABI passes row strides only; K must be contiguous.
+    if inp.stride(-1) != 1:
+        inp = inp.contiguous()
+    if weights.stride(-1) != 1:
+        weights = weights.contiguous()
     result = _result_buffer(out, inp.shape[0], weights.shape[0], otype, inp.device)
     return gemm_a16w16_asm(inp, weights, result, bias, splitK, kernelName, bpreshuffle)
 

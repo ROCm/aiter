@@ -17,7 +17,14 @@ class TestBatchInvariantConfig(unittest.TestCase):
             patch = mock.patch.object(tuned, name, return_value=value)
             patch.start()
             self.addCleanup(patch.stop)
-        patch = mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: self.table)
+        patch = mock.patch.object(
+            tuned, "get_GEMM_A16W16_config_", return_value=self.table
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(
+            tuned, "get_padded_m", side_effect=lambda m, _n, _k, _gl: m
+        )
         patch.start()
         self.addCleanup(patch.stop)
         for fn in (
@@ -109,6 +116,19 @@ class TestBatchInvariantConfig(unittest.TestCase):
         catalog.get_flydsl_hgemm_kernel_params.return_value = None
         with mock.patch.object(tuned, "_get_flydsl_gemm_kernels", return_value=catalog):
             self.assertEqual(self.lookup(1)["_config_m"], 64)
+
+    def test_tuner_resets_reload_the_family(self):
+        from csrc.gemm_a16w16.gemm_a16w16_tune import GemmA16W16Tuner
+        from gradlib.gradlib.GemmTuner import GemmTuner
+
+        for tuner in (GemmA16W16Tuner, GemmTuner):
+            with self.subTest(tuner=tuner.__name__):
+                tuner._clear_op_caches(None)
+                self.row(64, kernelName="original")
+                self.assertEqual(self.lookup(1)["kernelName"], "original")
+                self.row(64, kernelName="retuned")
+                tuner._clear_op_caches(None)
+                self.assertEqual(self.lookup(1)["kernelName"], "retuned")
 
 
 if __name__ == "__main__":

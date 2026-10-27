@@ -93,7 +93,39 @@ def test_glm53_bf16_batch_invariance(n, k, seed, wide_exponents, monkeypatch):
     with torch.cuda.graph(graph):
         tgemm.mm(selected, w, out=out)
     for _ in range(2):
+        out.fill_(float("nan"))
         graph.replay()
         assert torch.equal(out, expected)
         assert (guarded[0] == -123).all() and (guarded[-1] == -123).all()
     tuned.get_GEMM_A16W16_config.cache_clear()
+
+
+@pytest.mark.parametrize("input_k_stride,weight_k_stride", ((2, 1), (1, 2), (2, 2)))
+def test_glm53_bf16_asm_k_strides(input_k_stride, weight_k_stride):
+    if not torch.cuda.is_available():
+        pytest.skip("Requires a GPU")
+    if get_gfx_runtime() != "gfx950" or get_cu_num() != 256:
+        pytest.skip("Requires gfx950 with 256 CUs")
+    m, n, k = 65, 32768, 512
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    x = torch.randn(
+        m, k * input_k_stride, device="cuda", dtype=torch.bfloat16, generator=generator
+    )[:, ::input_k_stride]
+    w = torch.randn(
+        n, k * weight_k_stride, device="cuda", dtype=torch.bfloat16, generator=generator
+    )[:, ::weight_k_stride]
+    config = tuned.get_GEMM_A16W16_config(m, n, k, False, str(x.dtype), str(w.dtype))
+    assert config["libtype"] == "asm"
+    expected = gemm_a16w16(x.contiguous(), w.contiguous())
+    torch.testing.assert_close(gemm_a16w16(x, w), expected, rtol=0, atol=0)
+    out = torch.empty_like(expected)
+    actual = tgemm.mm(x, w, out=out)
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        tgemm.mm(x, w, out=out)
+    for _ in range(2):
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)

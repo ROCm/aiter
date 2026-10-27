@@ -600,6 +600,7 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
         lambda message, *args: warnings.append(message % args),
     )
     tuned.get_GEMM_A16W16_config.cache_clear()
+    tuned.get_GEMM_A16W16_batch_invariant_configs_.cache_clear()
     try:
         config = tuned.get_GEMM_A16W16_config(
             32,
@@ -611,6 +612,7 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
         )
     finally:
         tuned.get_GEMM_A16W16_config.cache_clear()
+        tuned.get_GEMM_A16W16_batch_invariant_configs_.cache_clear()
 
     assert (config["libtype"], config["solidx"]) == ("torch", 0)
     stale_warnings = [
