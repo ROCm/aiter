@@ -62,14 +62,11 @@ _QUANT_CU_M64 = 80
 # agent-scope atomic counter instead of the static quant_slot stride, so the
 # CTAs that drain early take the tail (a static partition leaves a wide
 # first-to-last quant CTA spread at m128).  The counter lives in
-# the PREP_EPOCH_GATE slot (P, Q = capacity) and returns to 0 at the end of
-# every launch (the last grab subtracts the launch's total), so no host
-# memset is needed.  Invariant (not enforced by an assert today): no launch
-# at the same P may use Q == quant_cu_capacity, or that launch's epoch gate
-# would alias this counter.  The quant_dpp override raises Q to at most
-# quant_cu_capacity - 1 - P (216 for m128), and configs cap
-# prepare_quant_cu at 192, so Q < capacity on every shipped path.  Block ->
-# output mapping is unchanged, so the output stays bit-identical.
+# PREP_EPOCH_GATE slot (P = 0, Q = P): every launch asserts P >= 1, so row 0
+# is never an epoch gate and no (P, Q) launch can alias the counter.  It
+# returns to 0 at the end of every launch (the last grab subtracts the
+# launch's total), so no host memset is needed.  Block -> output mapping is
+# unchanged, so the output stays bit-identical.
 _QUANT_STEAL_ROUNDS = 2
 
 
@@ -2703,8 +2700,10 @@ def _emit_plan(
                   for group_block in range_constexpr(group_blocks)
               ]
 
+          # When the groups self-prefix they may still be reading the raw
+          # BLOCK_HIST counts after GROUP_DONE, so only PAIR_BASE is written.
           pending = None
-          if const_expr(not fused):
+          if const_expr((not fused) and (not groups_self_prefix)):
               pending = _load_block_counts(0)
           seg_carry = fx.Int32(0)
           for rnd in range_constexpr(seg_rounds):
@@ -2715,14 +2714,16 @@ def _emit_plan(
               source_prefix = seg_carry + seg_incl - seg_count
               seg_carry = seg_carry + fx.Int32(fx.rocdl.readlane(T.i32, seg_incl, 63))
               current = pending
-              if const_expr((not fused) and rnd + 1 < seg_rounds):
+              if const_expr(
+                  (not fused) and (not groups_self_prefix) and rnd + 1 < seg_rounds
+              ):
                   pending = _load_block_counts(rnd + 1)
               if valid_seg:
                   _wst(pair_base, seg, source_prefix, wt_owner=wt_owner)
                   if const_expr(fused):
                       # The fused fill reads its per-segment base from LDS.
                       fx.ptr_store(source_prefix, fused_scratch + fx.Int64(seg))
-                  else:
+                  elif const_expr(not groups_self_prefix):
                       block_prefix = source_prefix
                       for group_block in range_constexpr(group_blocks):
                           _wst(
@@ -5022,7 +5023,7 @@ def compile_mega_moe_prepare(
     quant_steal = (
         quant_dpp
         and _QUANT_STEAL_ROUNDS > 0
-        and quant_blocks < quant_cu_capacity
+        and prepare_blocks <= quant_cu_capacity
     )
 
     # Small-P buckets (decode / small prefill) run the single-CTA fused
@@ -5207,8 +5208,7 @@ def compile_mega_moe_prepare(
                         )
                         static_end = static_rounds * fx.Int32(quant_blocks)
                         steal_addr = disp_ptr(DispatchSlot.PREP_EPOCH_GATE) + fx.Int64(
-                            (prepare_blocks * (quant_cu_capacity + 1) + quant_cu_capacity)
-                            * 4
+                            prepare_blocks * 4
                         )
                         steal_count = num_full - static_end
                         last_grab = steal_count + fx.Int32(quant_blocks - 1)
