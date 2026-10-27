@@ -7032,7 +7032,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 tunedf[column] = pd.to_numeric(tunedf[column], errors="coerce").fillna(
                     0
                 )
-        tunedf = tunedf.drop(columns=list(self.input_metadata), errors="ignore")
+        # Input-only columns stay while an untuned row still carries a value.
+        untuned = tunedf[~self._names_kernel(tunedf)]
+        tunedf = tunedf.drop(
+            columns=[
+                column
+                for column in self.input_metadata
+                if column in untuned
+                and untuned[column].fillna("").astype(str).str.strip().eq("").all()
+            ]
+        )
         # Keep columns owned by other rows of shared files (nt, _tag, ...).
         return tunedf[
             self.columns + [column for column in tunedf if column not in self.columns]
@@ -8549,15 +8558,35 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def result_to_csv(self, results, file, concat=False):
         del concat
         old_tunedf = self.get_tuned_gemm_list(file, self.columns)
-        input_file = getattr(self, "_input_file", None)
-        if input_file and os.path.realpath(input_file) == os.path.realpath(file):
-            # Drop the untuned input rows of a same-file run.
-            old_tunedf = old_tunedf[self._names_kernel(old_tunedf)]
         times = pd.to_numeric(results["us"], errors="coerce")
         valid = results[(times > 0) & (times < self.INF_TIME)]
         invalid = results[~results.index.isin(valid.index)]
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
-        resultdf = self._normalize_tuned_csv(self.update_tunedf(old_tunedf, valid))
+        resultdf = self.update_tunedf(old_tunedf, valid)
+        input_file = getattr(self, "_input_file", None)
+        if input_file and os.path.realpath(input_file) == os.path.realpath(file):
+            # Same-file run: an untuned input row is done once its shape has a
+            # winner from this save or a configured row on this device; failed,
+            # pending and unsupported rows stay for a rerun.
+            shape = self._summary_shape_keys()
+            configured = self._names_kernel(resultdf)
+            here = (
+                configured
+                & resultdf["gfx"].astype(str).eq(str(self.get_gfx()))
+                & resultdf["cu_num"].eq(self.get_cu_num())
+            )
+            done = set(valid[shape].itertuples(index=False, name=None))
+            done |= set(resultdf.loc[here, shape].itertuples(index=False, name=None))
+            pending = pd.Series(
+                [
+                    key not in done
+                    for key in resultdf[shape].itertuples(index=False, name=None)
+                ],
+                index=resultdf.index,
+                dtype=bool,
+            )
+            resultdf = resultdf[configured | pending]
+        resultdf = self._normalize_tuned_csv(resultdf)
         # The updated row is the first per key; drop rows it made unreachable.
         self._drop_superseded_rows(resultdf, self.keys).to_csv(file, index=False)
         # Count winners only once saved; unsaved shapes report as untuned.
