@@ -73,10 +73,11 @@ SCALE_BYTES = HEAD_DIM // 32  # e8m0 bytes per token
 V_TILE_BYTES = (HEAD_DIM // 8) * TILE_TOKENS * 16
 PAGE_STAGE_ALIGN = BLOCK_THREADS
 MAX_STAGED_PAGES = 2048
-# K/V tiles kept in flight per wave. A tile is 2 x 1 KiB of data, so the same
-# reasoning as the MXFP4 index scorer applies: half the bytes of fp8 want more
-# tiles in flight.
-DEFAULT_TILE_DEPTH = 4
+# K/V tiles kept in flight per wave (a tile is 2 x 1 KiB of data). Measured on
+# gfx950 with independent blocks (2048 tokens per row, 16 q heads): depth 2 is
+# 0.2-2.2 us faster than 4 for 1-512 rows and equal at 4096, depth 3 is slower
+# than both (why is not measured; depth 4 uses 168 VGPRs).
+DEFAULT_TILE_DEPTH = 2
 
 
 def _round_up(x: int, align: int) -> int:

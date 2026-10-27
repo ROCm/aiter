@@ -304,6 +304,20 @@ def test_pa_decode_mxfp4_task_shapes(max_partitions, tile_depth):
     assert rel_l2(out.float(), ref) < 3e-3
 
 
+def test_pa_decode_mxfp4_default_depth_is_bitwise_depth4():
+    """The tile pipeline depth changes scheduling only, never the arithmetic."""
+    _skip_unsupported()
+    ctx, bt, k, v, q = make_case([1, 130, 777, 2048], 16, 128, seed=21)
+    _, kd, ks, _ = quantize_pages(k, 128)
+    _, vd, vs, _ = quantize_pages(v, 128)
+    q_in, _ = quantize_q_fp8(q)
+    scale = HEAD_DIM**-0.5
+    a = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale)
+    b = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale, tile_depth=4)
+    torch.cuda.synchronize()
+    assert torch.equal(a, b)
+
+
 def test_pa_decode_mxfp4_rejects_oversized_task():
     _skip_unsupported()
     ctx, bt, k, v, q = make_case([40000], 16, 16, seed=2, extra_pages=0)
