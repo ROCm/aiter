@@ -22,7 +22,6 @@ from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from ._buffer_utils import make_bounded_buffer_tensor
 from .tensor_shim import _run_compiled
 
 BLOCK_M = 128
@@ -117,16 +116,18 @@ def _build_launcher(
         pid_mn, _, raw_b = fx.block_idx
 
         if fx.const_expr(COMPACT):
+            # Scalar int32 record. The offset is an element index, so this stays
+            # on buffer_ops.
             tile_rsrc = buffer_ops.create_buffer_resource(TILE_MAP, max_size=True)
             if fx.const_expr(XCD_C > 1):
-                total_occ = fx.Int32(fx.grid_dim.x)
-                raw_xy = fx.Int32(raw_b) * total_occ + fx.Int32(pid_mn)
+                total_occ = fx.grid_dim.x
+                raw_xy = raw_b * total_occ + pid_mn
                 tile_row, n_col = _xcd_remap(raw_xy, total_occ, N_BLOCKS, XCD_C, XCD_W)
                 tile_row = fx.Int32(fx.rocdl.readfirstlane(T.i32, tile_row))
                 block_n_idx = fx.Int32(fx.rocdl.readfirstlane(T.i32, n_col))
             else:
-                tile_row = fx.Int32(pid_mn)
-                block_n_idx = fx.Int32(raw_b)
+                tile_row = pid_mn
+                block_n_idx = raw_b
             rec = fx.Vector(
                 buffer_ops.buffer_load(
                     tile_rsrc, tile_row * fx.Int32(4), vec_width=4, is_scalar=True
@@ -139,10 +140,10 @@ def _build_launcher(
         else:
             # Grid is (bm_tiles * N_BLOCKS, 1, n_groups). Recover both sizes
             # here so a new batch or max_seq_len does not rebuild the launcher.
-            grid_x = fx.Int32(fx.grid_dim.x)
+            grid_x = fx.grid_dim.x
             bm_tiles = fx.Int32(fx.Uint32(grid_x) // fx.Uint32(N_BLOCKS))
-            n_groups_rt = fx.Int32(fx.grid_dim.z)
-            raw_xy = fx.Int32(raw_b) * grid_x + fx.Int32(pid_mn)
+            n_groups_rt = fx.grid_dim.z
+            raw_xy = raw_b * grid_x + pid_mn
             row, col = _xcd_remap(
                 raw_xy, bm_tiles * n_groups_rt, N_BLOCKS, XCD_C, XCD_W
             )
@@ -153,19 +154,17 @@ def _build_launcher(
             block_m_idx = fx.Int32(fx.Uint32(row) % fx.Uint32(bm_tiles))
             block_n_idx = col
 
+            # Scalar int32 metadata. The offset is an element index, so this stays
+            # on buffer_ops.
             seq_rsrc = buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
             seq_start = fx.Int32(
-                buffer_ops.buffer_load(
-                    seq_rsrc, fx.Int32(off_b), vec_width=1, is_scalar=True
-                )
+                buffer_ops.buffer_load(seq_rsrc, off_b, vec_width=1, is_scalar=True)
             )
             seq_end = fx.Int32(
-                buffer_ops.buffer_load(
-                    seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, is_scalar=True
-                )
+                buffer_ops.buffer_load(seq_rsrc, off_b + 1, vec_width=1, is_scalar=True)
             )
         M_b = seq_end - seq_start
-        start_m = fx.Int32(block_m_idx) * fx.Int32(BLOCK_M)
+        start_m = block_m_idx * BLOCK_M
 
         if start_m < M_b:
             a_row_off = fx.Int64(seq_start) * fx.Int64(K)
@@ -184,9 +183,13 @@ def _build_launcher(
                 fx.get_layout(B),
             )
 
-            A_buf = make_bounded_buffer_tensor(A_g, fx.Int64(M_b * K * 2))
+            A_buf = fx.rocdl.make_buffer_tensor(
+                A_g, num_records_bytes=fx.Int64(M_b * K * 2)
+            )
             B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
-            C_buf = make_bounded_buffer_tensor(C_g, fx.Int64(M_b * N * 2))
+            C_buf = fx.rocdl.make_buffer_tensor(
+                C_g, num_records_bytes=fx.Int64(M_b * N * 2)
+            )
 
             gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[
                 None, None, block_m_idx, None
@@ -198,7 +201,7 @@ def _build_launcher(
                 None, None, block_m_idx, block_n_idx
             ]
 
-            bias_elem_off = fx.Int32(off_b) * fx.Int32(N)
+            bias_elem_off = off_b * N
             BIAS_g = fx.make_view(
                 fx.add_offset(fx.get_iter(BIAS), fx.make_int_tuple(bias_elem_off)),
                 fx.get_layout(BIAS),

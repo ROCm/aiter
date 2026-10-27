@@ -14,16 +14,24 @@ so a new batch does not rebuild the kernel.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
+
+from .tensor_shim import _run_compiled
 
 _THREADS = 256
 _CHUNK = 256
 _SCAN_SHIFTS = _CHUNK.bit_length() - 1
 
 _DEFAULT_STREAM = fx.Stream(None)
+
+
+@fx.struct
+class _ScanStorage:
+    tiles: fx.Array[fx.Int32, _CHUNK, 16]
+    scan: fx.Array[fx.Int32, _CHUNK, 16]
+    starts: fx.Array[fx.Int32, _CHUNK, 16]
 
 
 def upper_bound_tiles(total_rows: int, n_groups: int, block_m: int) -> int:
@@ -55,80 +63,82 @@ def _scan_kernel(
     bm_tiles: fx.Int32,
     upper_bound: fx.Int32,
 ):
-    tid = fx.Int32(gpu.thread_idx.x)
+    tid = fx.thread_idx.x
+    # Scalar int32 records. Offsets are element indices, so these stay on buffer_ops.
     seq_rsrc = buffer_ops.create_buffer_resource(seq_offsets, max_size=True)
     map_rsrc = buffer_ops.create_buffer_resource(tile_map, max_size=True)
-    storage = fx.SharedAllocator().allocate(fx.Array[fx.Int32, _CHUNK * 3, 16])
-    shared = storage.peek().view(fx.make_layout(_CHUNK * 3, 1))
-    tiles_base = fx.Int32(0)
-    scan_base = fx.Int32(_CHUNK)
-    start_base = fx.Int32(2 * _CHUNK)
+    lds = fx.SharedAllocator().allocate(_ScanStorage).peek()
+    tiles = lds.tiles.view(fx.make_layout(_CHUNK, 1))
+    scan = lds.scan.view(fx.make_layout(_CHUNK, 1))
+    starts = lds.starts.view(fx.make_layout(_CHUNK, 1))
+    chunk_width = fx.Int32(_CHUNK)
+    zero = fx.Int32(0)
+    one = fx.Int32(1)
 
-    steps = (upper_bound + fx.Int32(_THREADS - 1)) // fx.Int32(_THREADS)
-    for step in range(fx.Int32(0), steps, fx.Int32(1)):
-        row = step * fx.Int32(_THREADS) + tid
+    steps = fx.ceildiv(upper_bound, fx.Int32(_THREADS))
+    for step in range(zero, steps, one):
+        row = step * _THREADS + tid
         if row < upper_bound:
-            base = row * fx.Int32(4)
-            buffer_ops.buffer_store(fx.Int32(0), map_rsrc, base)
-            buffer_ops.buffer_store(bm_tiles, map_rsrc, base + fx.Int32(1))
-            buffer_ops.buffer_store(fx.Int32(0), map_rsrc, base + fx.Int32(2))
-            buffer_ops.buffer_store(fx.Int32(0), map_rsrc, base + fx.Int32(3))
-    gpu.barrier()
+            base = row * 4
+            buffer_ops.buffer_store(zero, map_rsrc, base)
+            buffer_ops.buffer_store(bm_tiles, map_rsrc, base + 1)
+            buffer_ops.buffer_store(zero, map_rsrc, base + 2)
+            buffer_ops.buffer_store(zero, map_rsrc, base + 3)
+    fx.gpu.barrier()
 
-    n_chunks = (n_groups + fx.Int32(_CHUNK - 1)) // fx.Int32(_CHUNK)
-    for chunk_i, state in range(fx.Int32(0), n_chunks, fx.Int32(1), init=[fx.Int32(0)]):
+    n_chunks = fx.ceildiv(n_groups, chunk_width)
+    for chunk_i, state in range(zero, n_chunks, one, init=[zero]):
         running = state[0]
-        chunk_base = fx.Int32(chunk_i) * fx.Int32(_CHUNK)
+        # The carried range yields an index. Narrow it before the i32 address math.
+        chunk_base = fx.Int32(chunk_i) * _CHUNK
         remain = n_groups - chunk_base
-        n_this = (remain < fx.Int32(_CHUNK)).select(remain, fx.Int32(_CHUNK))
+        n_this = (remain < chunk_width).select(remain, chunk_width)
 
-        shared[tiles_base + tid] = fx.Int32(0)
-        shared[start_base + tid] = fx.Int32(0)
-        gpu.barrier()
+        tiles[tid] = zero
+        starts[tid] = zero
+        fx.gpu.barrier()
         if tid < n_this:
             group = chunk_base + tid
-            seq_start = buffer_ops.buffer_load(
-                seq_rsrc, group, vec_width=1, dtype=T.i32
+            seq_start = fx.Int32(
+                buffer_ops.buffer_load(seq_rsrc, group, vec_width=1, dtype=T.i32)
             )
-            seq_end = buffer_ops.buffer_load(
-                seq_rsrc, group + fx.Int32(1), vec_width=1, dtype=T.i32
+            seq_end = fx.Int32(
+                buffer_ops.buffer_load(seq_rsrc, group + 1, vec_width=1, dtype=T.i32)
             )
-            length = fx.Int32(seq_end) - fx.Int32(seq_start)
-            shared[tiles_base + tid] = (length + block_m - fx.Int32(1)) // block_m
-            shared[start_base + tid] = fx.Int32(seq_start)
-        gpu.barrier()
+            tiles[tid] = fx.ceildiv(seq_end - seq_start, block_m)
+            starts[tid] = seq_start
+        fx.gpu.barrier()
 
-        shared[scan_base + tid] = shared[tiles_base + tid]
-        gpu.barrier()
-        for shift in range_constexpr(_SCAN_SHIFTS):
+        scan[tid] = tiles[tid]
+        fx.gpu.barrier()
+        for shift in fx.range_constexpr(_SCAN_SHIFTS):
             distance = fx.Int32(1 << shift)
             take = tid >= distance
             peer = take.select(tid - distance, tid)
-            added = take.select(shared[scan_base + peer], fx.Int32(0))
-            updated = shared[scan_base + tid] + added
-            gpu.barrier()
-            shared[scan_base + tid] = updated
-            gpu.barrier()
+            updated = scan[tid] + take.select(scan[peer], zero)
+            fx.gpu.barrier()
+            scan[tid] = updated
+            fx.gpu.barrier()
 
-        count = shared[tiles_base + tid]
-        seq_start = shared[start_base + tid]
-        inclusive = shared[scan_base + tid]
-        chunk_total = shared[scan_base + n_this - fx.Int32(1)]
-        gpu.barrier()
+        count = tiles[tid]
+        seq_start = starts[tid]
+        inclusive = scan[tid]
+        chunk_total = scan[n_this - 1]
+        fx.gpu.barrier()
 
         if tid < n_this:
             group = chunk_base + tid
-            seq_end = buffer_ops.buffer_load(
-                seq_rsrc, group + fx.Int32(1), vec_width=1, dtype=T.i32
+            seq_end = fx.Int32(
+                buffer_ops.buffer_load(seq_rsrc, group + 1, vec_width=1, dtype=T.i32)
             )
             row0 = running + inclusive - count
-            for local in range(fx.Int32(0), count, fx.Int32(1)):
-                base = (row0 + local) * fx.Int32(4)
+            for local in range(zero, count, one):
+                base = (row0 + local) * 4
                 buffer_ops.buffer_store(group, map_rsrc, base)
-                buffer_ops.buffer_store(local, map_rsrc, base + fx.Int32(1))
-                buffer_ops.buffer_store(seq_start, map_rsrc, base + fx.Int32(2))
-                buffer_ops.buffer_store(fx.Int32(seq_end), map_rsrc, base + fx.Int32(3))
-        gpu.barrier()
+                buffer_ops.buffer_store(local, map_rsrc, base + 1)
+                buffer_ops.buffer_store(seq_start, map_rsrc, base + 2)
+                buffer_ops.buffer_store(seq_end, map_rsrc, base + 3)
+        fx.gpu.barrier()
         _running = yield [running + chunk_total]
 
 
@@ -165,13 +175,14 @@ def build_tile_map_device_fused(
     st = _as_torch_stream(stream, seq_offsets.device)
     with torch.cuda.stream(st):
         tile_map = torch.empty((ub, 4), dtype=torch.int32, device=seq_offsets.device)
-        _launch_scan(
+        _run_compiled(
+            _launch_scan,
             seq_offsets,
             tile_map,
             n_groups,
             block_m,
             bm_tiles,
             ub,
-            stream=st,
+            st,
         )
     return tile_map, ub
