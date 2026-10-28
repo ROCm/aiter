@@ -16,12 +16,13 @@ f32 softmax state and accumulation. BF16 KV does not use quantization scales.
 gfx1250 uses wave32 WMMA with native FP8 Q/P conversion or BF16 operands.
 Its four waves process 64- or 128-token compute tiles within each 256-token
 plan tile. Packed FP8 D128/D256 full-attention paths use K128 WMMA; other
-FP8 paths use K64 and BF16 uses K32. Supported layouts use TDM K/V transfers,
-with two LDS buffers where capacity permits. One-partition plans can write
-final output directly. Plans with one task slot per sequence merge a
-sequence's few partitions in its last-arriving CTA, and plans whose sequences
-each fit one workgroup cluster merge within that cluster; other plans use the
-shared partition reducer.
+FP8 paths use K64 and BF16 uses K32. Four FP8 D128 query tiles over page128
+caches give each wave its own tile and keep P in registers. Supported layouts
+use TDM K/V transfers, with two LDS buffers where capacity permits.
+One-partition plans can write final output directly. Plans with one task slot
+per sequence merge a sequence's few partitions in its last-arriving CTA, and
+plans whose sequences each fit one workgroup cluster merge within that
+cluster; other plans use the shared partition reducer.
 BF16 transposed page128 caches at D64/D128/D256 use a packed-page pipeline
 with resident Q and fused PV accumulation; D256 is limited to 32 query rows.
 Page16 BF16 caches at these dimensions retain vector-8 packing in LDS while
@@ -65,7 +66,12 @@ from .pa_decode.op_merge import (
     MERGE_PARTITIONS,
     Gfx1250ClusterMerge,
 )
-from .pa_decode.pipeline import Gfx1250Bf16Pipeline, Gfx1250Pipeline, PaDecodePipeline
+from .pa_decode.pipeline import (
+    Gfx1250Bf16Pipeline,
+    Gfx1250Pipeline,
+    Gfx1250WavePipeline,
+    PaDecodePipeline,
+)
 from .pa_decode.traits import (
     FP8_PACK_K,
     KV_COMPUTE_BLOCK,
@@ -673,6 +679,8 @@ def compile_gfx1250_pa_decode(
                 ctx.output_ptr = output
             if const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()
+            elif const_expr(t.wave_query_tiles):
+                Gfx1250WavePipeline(ctx).run()
             else:
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
