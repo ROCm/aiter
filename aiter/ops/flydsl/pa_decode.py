@@ -9,6 +9,8 @@ MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
 K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -17,6 +19,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
 from .kernels.pa_decode_kernel import (
+    CLUSTER_PARTITIONS,
     KV_COMPUTE_BLOCK,
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
@@ -30,6 +33,10 @@ from .kernels.pa_decode_reduce import (
     compile_pa_decode_ps_reduce,
 )
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+
+# AITER_FLYDSL_PA_CLUSTER_MERGE=0 keeps the shared reducer for plans that
+# would otherwise merge partitions within workgroup clusters.
+_CLUSTER_MERGE = os.environ.get("AITER_FLYDSL_PA_CLUSTER_MERGE", "1") != "0"
 
 
 def _flydsl_pointer_dtype(dtype: torch.dtype):
@@ -239,7 +246,11 @@ def pa_decode(
     directly. So do plans with one task slot per sequence (capacity equal to
     the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
     that still own several tasks merge them in the tile kernel using the plan's
-    arrival counters. Other plans use packed scratch and the separate reducer.
+    arrival counters. Otherwise, when P = min(partition bound, max_partitions)
+    is in [2, 16] and P CTAs per sequence fit the plan capacity or two per CU
+    (head_dim <= 512), each sequence's tasks run as one cluster of P
+    workgroups that merges them on chip. Other plans use packed scratch and
+    the separate reducer.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -626,8 +637,9 @@ def pa_decode(
     # gfx1250 tile kernels write final output for one-partition plans and for
     # plans with one task slot per sequence: single tasks store directly, and
     # sequences given slots freed by empty ones merge in their last-arriving
-    # CTA. Merging costs two device-scope round trips (sparse decode 64 rows:
-    # 17.7 us vs 10.3 us for tile plus reducer), so wider plans keep the reducer.
+    # CTA. That merge costs two device-scope round trips (sparse decode 64
+    # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
+    # within workgroup clusters instead.
     direct_output = (
         arch == "gfx1250"
         and sinks is None
@@ -643,6 +655,26 @@ def pa_decode(
         )
     )
     one_partition_output = direct_output and num_partitions == 1
+    num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
+    # Other gfx1250 plans merge each sequence's tasks, at most P of them, in a
+    # cluster of P CTAs. Its idle CTAs wait at the cluster barrier, so the grid
+    # stays within the plan's or the default two-per-CU budget.
+    cluster_partitions = min(partition_bound, num_partitions)
+    cluster_merge = (
+        cluster_partitions
+        if (
+            _CLUSTER_MERGE
+            and arch == "gfx1250"
+            and not direct_output
+            and sinks is None
+            and output.stride() == query.stride()
+            and 2 <= cluster_partitions <= CLUSTER_PARTITIONS
+            and num_seqs * cluster_partitions
+            <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
+            and head_dim <= MERGE_HEAD_DIM
+        )
+        else 0
+    )
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -660,9 +692,7 @@ def pa_decode(
             block_size=int(block_size),
             num_seqs=num_seqs,
             num_kv_heads=num_kv_heads,
-            num_compute_units=torch.cuda.get_device_properties(
-                dev
-            ).multi_processor_count,
+            num_compute_units=num_compute_units,
             num_partitions=num_partitions,
             softmax_scale=softmax_scale,
             query_dtype=query_dtype,
@@ -677,6 +707,7 @@ def pa_decode(
             sliding_window=sliding_window,
             direct_output=direct_output,
             trans_k=trans_k,
+            cluster_merge=cluster_merge,
         )
 
     total_rows = query_length * query_group_size
@@ -784,7 +815,7 @@ def pa_decode(
             *merge_args,
             s,
         )
-        if direct_output:
+        if direct_output or cluster_merge:
             return
         output_5d = output.reshape(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
