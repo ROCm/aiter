@@ -125,8 +125,8 @@ trees"): the plan takes its keys from that tree's `DEFAULT.json`, the baseline i
 installed config, and the install writes into `configs/<arch>/<cu_num>cu/<backend>/gemm/<family>/`
 from the records timed on this device's CU count only. The tree must already have its own
 `DEFAULT.json`; the tuner never writes one. Pass `--cu-dir` only on a partition whose CU count is
-not the arch's default (gfx1250: 192); without it the default tree is used, whatever the device's
-CU count.
+not the one the plain folder was tuned on; without it the plain folder is used, whatever the
+device's CU count.
 Config reads are cached per process, so restart Python to pick up a new file.
 
 ## Adding a kernel or a key

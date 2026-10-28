@@ -61,9 +61,9 @@ Two config names must not give the same `<d_type>`: `GEMM-FOO-BAR` and
 
 ### CU trees
 
-The plain `<arch>/` folders hold the configs of the arch's default CU count.
-For gfx1250 that is 192 CUs. A family tuned on another CU count, for example
-a 96-CU partition, goes in its own tree under the arch, with its own
+The plain `<arch>/` folders hold the configs of the CU count the arch was
+tuned on. A family tuned on another CU count, for example a 96-CU
+partition, goes in its own tree under the arch, with its own
 `DEFAULT.json`. The tree has the layout of the plain folder:
 
 ```text
@@ -85,7 +85,8 @@ configs/gfx1250/96cu/gluon/moe/a8w4/DEFAULT.json
   a shape without a file in the CU tree gets the CU tree's `DEFAULT.json`,
   not the plain shape file. A `<cu_num>cu/` folder without `DEFAULT.json` is
   not a tree and is ignored.
-- Never make a tree for the default count, such as `gfx1250/192cu/`.
+- Never make a tree for the count the plain folder was tuned on. That
+  count reads the plain folder.
 - To start a tree, copy the family's `DEFAULT.json` into it, byte identical,
   and say so in the commit message. For a GEMM family, then tune with
   `sweep_configs.py --cu-dir` on a partition with that CU count; the install

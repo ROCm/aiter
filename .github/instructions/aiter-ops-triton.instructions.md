@@ -94,8 +94,8 @@ CU count other than the arch's default can have its own tree,
 
 - A config file outside this layout, for example in `configs/gemm/` or at the
   top of `configs/`.
-- A `<cu_num>cu/` tree for the arch's default CU count, for example
-  `gfx1250/192cu/`. The default count lives in the plain folder.
+- A `<cu_num>cu/` tree for the CU count the plain folder was tuned on. That
+  count reads the plain folder.
 - A `<cu_num>cu/` folder without `DEFAULT.json`. The loaders read a tree
   whole or not at all, and a folder without `DEFAULT.json` is not a tree.
 - An arch prefix in a file name in `configs/<arch>/...`. The default file must

@@ -147,8 +147,8 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 `<op>` is `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`
 or `normalization`.
 
-The plain `<arch>/` folder holds the configs of the arch's default CU count
-(gfx1250: 192 CUs). A family tuned on another CU count has its own tree,
+The plain `<arch>/` folder holds the configs of the CU count the arch was
+tuned on. A family tuned on another CU count has its own tree,
 `configs/<arch>/<cu_num>cu/<backend>/<op>/<d_type>/`, with its own
 `DEFAULT.json`. The loaders read that tree on a device with that CU count
 and the plain folder in every other case. See

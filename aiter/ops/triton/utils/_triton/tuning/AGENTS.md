@@ -125,7 +125,7 @@ Add it to `SEARCH_SPACE`; add an alias if a family spells it differently. Nothin
 - Put an arch prefix on an installed file, write to the current directory, write `DEFAULT.json`,
   or copy untuned buckets into a shape file.
 - Write into a `<cu_num>cu/` tree without `--cu-dir`, create that tree's `DEFAULT.json`, or make
-  a tree for the arch's default CU count. Without `--cu-dir` the default tree is used, whatever
-  the device's CU count.
+  a tree for the count the plain folder was tuned on. Without `--cu-dir` the plain folder is
+  used, whatever the device's CU count.
 - Add tuned values to Python; `SEARCH_SPACE` is a search space, not a tuned value.
 - Run two drivers on one GPU.
