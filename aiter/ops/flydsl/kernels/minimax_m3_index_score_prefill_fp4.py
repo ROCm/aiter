@@ -3,28 +3,19 @@
 
 """MiniMax-M3 lightning-indexer PREFILL block scores, MXFP4 index cache.
 
-The prefill scorer is bound by its score stores, not by reading K
-(`minimax_m3_index_score_prefill`), so halving the K bytes buys nothing there
-and a native MXFP4 kernel would mean reworking its LDS pipeline for no gain.
-This entry instead dequantizes the pages the batch references into a compact
-fp8 staging buffer and hands that to the fp8 prefill scorer unchanged. The
-scores are therefore bit for bit those of "dequantize to fp8, then score",
-which is also what the fp8 index cache's contract amounts to.
+Staged route (`staged=True`; the default is the native kernel,
+`minimax_m3_index_score_prefill_fp4_native`): a Triton kernel dequantizes the
+pages the batch references into a compact fp8 staging buffer and the fp8 prefill
+scorer runs on it unchanged, so scores are those of "dequantize to fp8, then score".
 
-Exactness. e2m1 x 2^e is exactly representable in e4m3 when the biased e8m0
-scale lies in [119, 133] (every element is then a multiple of 2^-9, the
-smallest e4m3 subnormal, and at most 6 * 2^6 = 384 <= 448). Outside that
-window the staged value saturates to +-448 or flushes towards zero; the fp8
-index cache, which casts unit-scale, has the same range limit, so this is not
-a new one. e8m0 bytes 0 and 255 are outside the contract, as in the decode
-scorer.
+Exactness: e2m1 x 2^e is exact in e4m3 when the biased e8m0 scale is in [119, 133]
+(multiples of 2^-9, at most 384 <= 448). Outside that window the staged value
+saturates or flushes; the fp8 index cache has the same range limit. e8m0 bytes 0
+and 255 are outside the contract, as in the decode scorer.
 
-Cost. Every page the batch scores is read once (8.5 KB) and written once
-(16 KB) per call, before the scorer runs; a serving caller pays it once per
-layer. The staging buffer is `batch * max_block` pages of 16 KB.
-
-Layout, dtypes and strides of `k_data`/`k_scale` are the decode scorer's; see
-`minimax_m3_index_score_fp4`.
+Cost: every referenced page is read once (8.5 KB) and written once (16 KB) per
+call, into a `batch * max_block` page staging buffer. Layout, dtypes and strides of
+`k_data`/`k_scale` are the decode scorer's (`minimax_m3_index_score_fp4`).
 """
 
 import torch
@@ -93,15 +84,12 @@ def _dequant_pages_kernel(
 ):
     """One program: TOKS tokens of one (request, logical page) -> fp8.
 
-    Output slot is `b * max_block + p`, so the staged block table is an
-    arange. A page past the request's length is left alone, which is why the
-    staging buffer is `empty`: the scorer never reads those pages' contents
-    into a live score.
+    Output slot is `b * max_block + p` (the staged block table is an arange); pages
+    past the request's length are left alone, so the staging buffer is `empty`.
 
     With HAS_Q the grid also carries programs past the K ones that widen an e4m3
     query to bf16 (`Q_ROWS` rows each, row = token * heads + head): the scorer
-    takes a bf16 query and rounds it back to e4m3 itself, which is the identity
-    for a value that came from e4m3. Folding it into this launch costs no launch.
+    rounds it back to e4m3, which is the identity for a value that came from e4m3.
     """
     if HAS_Q and tl.program_id(0) >= K_PROGRAMS:
         qp = (tl.program_id(0) - K_PROGRAMS) * tl.num_programs(1) + tl.program_id(1)
@@ -235,22 +223,15 @@ def score_prefill_flydsl_fp4(
 ):
     """Block scores for a ragged prefill batch over an MXFP4 index cache.
 
-    `score_prefill_flydsl` with the cache replaced by `k_data`/`k_scale`; every
-    argument it shares keeps its contract. By default the cache is read natively
-    (`minimax_m3_index_score_prefill_fp4_native`: fp4 pages straight into the scaled
-    MFMA, no staging, faster than the fp8 kernel). `staged=True` takes the older
-    route instead -- dequantize the referenced pages into an fp8 staging buffer and
-    run the fp8 kernel -- and `workspace` optionally supplies that buffer (see
-    `dequant_pages_fp8`); otherwise one is allocated. The staged pages are consumed
-    by this call, not kept. Both give the same scores wherever the staged path is
-    exact (e8m0 in [119, 133]).
+    `score_prefill_flydsl` with the cache replaced by `k_data`/`k_scale`; shared
+    arguments keep its contract. By default the cache is read natively; `staged=True`
+    dequantizes the referenced pages into an fp8 staging buffer and runs the fp8
+    kernel, and `workspace` optionally supplies that buffer (see `dequant_pages_fp8`).
+    Both give the same scores wherever the staged path is exact (e8m0 in [119, 133]).
 
-    `idx_q` is bf16 (rounded to e4m3 inside the scorer, as for an fp8 cache) or
-    already e4m3 (`dtypes.fp8`, what the index-Q writer emits for q8kv4), in which
-    case it is widened to a bf16 staging query in the same launch that dequantizes
-    the pages -- exact, and the scorer's own rounding then gives back the same
-    bytes, so the scores are those of the e4m3 query as stored. `q_scale` (default
-    1.0, positive) multiplies the scores, folded into `sm_scale`.
+    `idx_q` is bf16 or e4m3 (`dtypes.fp8`); on the staged route an e4m3 query is
+    widened to bf16 in the dequant launch (exact). `q_scale` (positive) multiplies
+    the scores, folded into `sm_scale`.
     """
     if not staged:
         if workspace is not None:
