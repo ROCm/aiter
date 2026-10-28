@@ -173,7 +173,10 @@ def _moe_reduction_body(
                     [vk[i] * wk for i in range_constexpr(V)], fx.Float32
                 )
             if const_expr(use_mask):
-                vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
+                idx = tk_ptr[k]
+                idx_valid = idx >= fx.Int32(0)
+                safe_idx = idx_valid.select(idx, fx.Int32(0))
+                vk = (idx_valid & (em_ptr[safe_idx] != fx.Int32(0))).select(
                     vk, fx.full(V, 0.0, fx.Float32)
                 )
             acc = acc + vk
