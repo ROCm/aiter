@@ -97,18 +97,14 @@ def fused_qknorm_idxrqknorm(
     # (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k /
     # kv_cache_v are typically the key/value slices of a fused
     # [num_blocks, 2, block_size, num_kv_heads, head_dim] cache).
-    # kv_cache_dtype="mxfp4" (sparse insert only: needs the index slots in qkv; pass
-    # skip_index_branch=True for a layer that reuses another layer's top-k) writes the main K
-    # and V rows as MXFP4 into uint8 [num_pages, num_kv_heads, 8704] caches, one 128-token
-    # page per (page, head): [128 x 64 B e2m1][128 x 4 B e8m0], the same page as the MXFP4
-    # index cache (block_size must be 128; the caches' own page/head strides are used; no
-    # k_scale/v_scale).
-    # q_fp8_out [T, num_heads * 128] float8_e4m3fn (insert mode): the post norm+RoPE main q as
-    # e4m3(bf16(q) / q_scale) with q_scale a [1] float32 device tensor (None = 1.0). With
-    # q_out None the bf16 row is not written back.
-    # index_cache_dtype: "auto" (qkv dtype), "fp8", or "mxfp4". "mxfp4" needs a contiguous
-    # uint8 index_cache of whole 8704 B pages, [128 tokens x 64 B e2m1][128 x 4 B e8m0],
-    # the layout an MXFP4 index-score kernel reads; it only changes the index-K write.
+    # MXFP4 pages are uint8, 8704 B per 128 tokens: [128 x 64 B e2m1][128 x 4 B e8m0].
+    # kv_cache_dtype="mxfp4": sparse insert only (pass skip_index_branch=True for a layer that
+    #   reuses another layer's top-k); K/V are [num_pages, num_kv_heads, 8704], block_size 128,
+    #   no k_scale/v_scale.
+    # index_cache_dtype="mxfp4": index_cache is whole contiguous pages; only the index-K write
+    #   changes.
+    # q_fp8_out [T, num_heads * 128] e4m3 (insert mode): e4m3(bf16(q) / q_scale), q_scale a
+    #   [1] float32 device tensor (None = 1.0); with q_out None the bf16 q is not written.
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
