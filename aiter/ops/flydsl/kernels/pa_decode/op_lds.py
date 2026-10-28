@@ -12,7 +12,7 @@ from flydsl.expr.typing import ReductionOp, T
 
 from .. import dpp_utils
 from ..kernels_common import create_llvm_ptr
-from ..tensor_shim import _to_raw, buf_base_i64, ptr_buf_tensor
+from ..tensor_shim import buf_base_i64, ptr_buf_tensor
 from ..utils import rcp_f32
 from .traits import MFMA_MNK
 
@@ -827,7 +827,7 @@ class Gfx1250Memory:
         # instruction converts eight FP32 values into two packed dwords.
         return fx.Vector(
             fx.rocdl.cvt_scalef32_pk8_fp8_f32(
-                T.i32x2, _to_raw(values), _to_raw(fx.Float32(1.0))
+                T.i32x2, fx.as_ir_value(values), fx.as_ir_value(fx.Float32(1.0))
             )
         )
 
@@ -867,39 +867,104 @@ class Gfx1250Memory:
         for size in reversed(shape):
             packed_strides.insert(0, stride)
             stride *= size
-        layout = fx.make_layout(shape, tuple(packed_strides))
         lds_strides = tuple(
             s // width * row_stride if s >= width else s for s in packed_strides
+        )
+        # The tile is the whole view on every unbounded mode; a runtime extent
+        # narrows the view and the tile clamps against it.
+        gshape = tuple(
+            shape[i] if extents[i] is None else extents[i] for i in range(len(shape))
         )
         src = fx.Tensor(
             fx.make_view(
                 fx.add_offset(fx.recast_iter(self.t.kv_dtype, ptr), offset),
-                layout,
+                fx.make_layout(gshape, tuple(strides)),
             )
         )
-        atom = fx.rocdl.make_tdm_atom(
+        atom, coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+            fx.rocdl.TensorLoad(),
             src,
-            extents,
-            strides=strides,
+            fx.make_layout(shape, lds_strides),
+            shape,
             num_warps=1,
-            pad_interval=width if row_stride != width else 0,
-            pad_amount=row_stride - width,
-            early_timeout=True,
         )
+        # early_timeout has no tiled-atom equivalent; it is a multicast GL1 bit
+        # and these loads are single-warp with no mask.
+        # Keep one rest mode so the global side stays nested like the LDS box.
+        rest = None if len(shape) == 1 else tuple(0 for _ in shape[:-1]) + (None,)
+        blk = fx.zipped_divide(coord, shape)[None, rest]
         dst = fx.Tensor(
             fx.make_view(
                 self.pointer(shared_offset, self.t.kv_dtype),
-                fx.make_layout(shape, lds_strides),
+                fx.make_layout((shape, 1), (lds_strides, stride)),
             )
         )
-        fx.copy_atom_call(atom, src, dst)
+        ts, tg = fx.rocdl.cdna5.tdm_partition(atom, 0, fx.make_layout(1, 1), dst, blk)
+        fx.copy(atom, tg[None, 0], ts[None, 0])
 
     @flyc.jit
     def stage_tdm(self, token_base, kv_off, full_tile=False, cached_page=None):
         if const_expr(self.t.packed_lds):
             self.stage_packed_tdm(token_base, kv_off, full_tile, cached_page)
+        elif const_expr(self.t.bf16_page16_packed):
+            self.stage_bf16_page16(token_base, kv_off, full_tile)
         else:
             self.stage_padded_tdm(token_base, kv_off, full_tile)
+
+    @flyc.jit
+    def stage_bf16_page16(self, token_base, kv_off, full_tile):
+        """Keep each wave's BF16 page packed and zero-fill invalid tokens."""
+        ctx, t = self.ctx, self.t
+        absolute = token_base + ctx.warp * 16
+        safe = (
+            absolute
+            if full_tile
+            else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+        )
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        page = fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 16])
+        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * 16
+        valid = fx.max(
+            fx.Int32(0), fx.min(fx.Int32(16), ctx.planned_context - absolute)
+        )
+        self.tdm_copy(
+            ctx.key_cache_ptr,
+            off,
+            kv_off + ctx.warp * t.head_dim * 32,
+            (t.head_dim // 8, 16, 8),
+            (128, 8, 1),
+            (None, None, None) if full_tile else (None, valid, None),
+            8,
+            8,
+        )
+        if const_expr(full_tile):
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 32,
+                (t.head_dim * 16,),
+                (1,),
+                (None,),
+                8,
+                8,
+            )
+        else:
+            # V packs eight tokens per dimension; mask inside each chunk.
+            for chunk in range_constexpr(2):
+                count = fx.max(fx.Int32(0), fx.min(fx.Int32(8), valid - chunk * 8))
+                self.tdm_copy(
+                    ctx.value_cache_ptr,
+                    off + chunk * t.head_dim * 8,
+                    kv_off
+                    + t.k_bytes
+                    + ctx.warp * t.head_dim * 32
+                    + chunk * t.head_dim * 16,
+                    (t.head_dim, 8),
+                    (8, 1),
+                    (None, count),
+                    8,
+                    8,
+                )
 
     @flyc.jit
     def stage_packed_tdm(self, token_base, kv_off, full_tile, cached_page=None):
@@ -916,12 +981,15 @@ class Gfx1250Memory:
             if full_tile
             else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
         )
-        page = fx.Int32(
-            table[
-                ctx.planned_seq * ctx.max_blocks_per_seq
-                + fx.Uint32(safe) // t.block_size
-            ]
-        )
+        if const_expr(cached_page is not None):
+            page = cached_page
+        else:
+            page = fx.Int32(
+                table[
+                    ctx.planned_seq * ctx.max_blocks_per_seq
+                    + fx.Uint32(safe) // t.block_size
+                ]
+            )
         off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
         pt = fx.Uint32(safe) % t.block_size
         wave_token = pt + (ctx.warp * 16 if t.block_size != 16 else 0)
@@ -939,16 +1007,29 @@ class Gfx1250Memory:
             16,
             16,
         )
-        self.tdm_copy(
-            ctx.value_cache_ptr,
-            off + (wave_token // 16) * t.head_dim * 16,
-            kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
-            (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
-            (1,) if full_tile else (16, 1),
-            (None,) if full_tile else (None, valid),
-            16,
-            16,
-        )
+        if const_expr(t.trans_v or t.block_size == 16):
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + (wave_token // 16) * t.head_dim * 16,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
+                (t.head_dim * 16,) if full_tile else (t.head_dim, 16),
+                (1,) if full_tile else (16, 1),
+                (None,) if full_tile else (None, valid),
+                16,
+                16,
+            )
+        else:
+            # Gather plain [D, page] rows into packed [D, 16] wave slices.
+            self.tdm_copy(
+                ctx.value_cache_ptr,
+                off + wave_token,
+                kv_off + t.k_bytes + ctx.warp * t.head_dim * 16,
+                (t.head_dim, 16),
+                (t.block_size, 1),
+                (None, None) if full_tile else (None, valid),
+                16,
+                16,
+            )
 
     @flyc.jit
     def stage_page_tdm(self, token_base, kv_off, full_tile, cached_page=None):
@@ -984,7 +1065,7 @@ class Gfx1250Memory:
             16,
             16,
         )
-        if const_expr(full_tile):
+        if const_expr(full_tile and t.trans_v):
             self.tdm_copy(
                 ctx.value_cache_ptr,
                 off + (pt // 16 + ctx.warp * 2) * t.head_dim * 16,
@@ -1004,17 +1085,38 @@ class Gfx1250Memory:
                 )
                 self.tdm_copy(
                     ctx.value_cache_ptr,
-                    off + (pt // 16 + ctx.warp * 2 + chunk) * t.head_dim * 16,
+                    (
+                        off + (pt // 16 + ctx.warp * 2 + chunk) * t.head_dim * 16
+                        if t.trans_v
+                        else off + pt + ctx.warp * 32 + chunk * 16
+                    ),
                     kv_off
                     + t.k_bytes
                     + ctx.warp * t.head_dim * 32
                     + chunk * t.head_dim * 16,
                     (t.head_dim, 16),
-                    (16, 1),
-                    (None, count),
+                    (16, 1) if t.trans_v else (t.block_size, 1),
+                    (None, None) if full_tile else (None, count),
                     16,
                     16,
                 )
+
+    def packed_k_operand(self, kv_off, token_tile, dim_tile):
+        ctx, t = self.ctx, self.t
+        if const_expr(t.TOKENS == 128):
+            return self.page_k_operand(
+                kv_off + dim_tile * 128 * 128,
+                ctx.warp * 32 + token_tile * 16,
+                ctx.lane16,
+                ctx.half,
+            )
+        return self.packed_operand(
+            kv_off + ctx.warp * t.head_dim * 16 + dim_tile * 128 * 16,
+            16,
+            128,
+            ctx.lane16,
+            ctx.half,
+        )
 
     def page_k_operand(self, offset, token, lane16, half):
         words = []
@@ -1025,12 +1127,28 @@ class Gfx1250Memory:
             words.extend([frag[i] for i in range_constexpr(4)])
         return fx.Vector.from_elements(words, dtype=fx.Int32)
 
+    def page_v_operands(self, kv_off):
+        ctx, t = self.ctx, self.t
+        return [
+            [
+                self.packed_operand(
+                    kv_off + t.k_bytes + (vh * 64 + ctx.warp * 16) * 16,
+                    t.head_dim,
+                    t.TOKENS,
+                    ctx.lane16,
+                    ctx.half,
+                )
+            ]
+            for vh in range_constexpr(t.head_dim // 64)
+        ]
+
     def bf16_k_operand(self, offset, token, dim, lane16, half):
         # Retain vector-8 cache packing: each half-wave reads alternate chunks.
         words = []
         for j in range_constexpr(2):
             frag = self.load(
-                offset + ((dim // 8 + half + 2 * j) * 128 + token + lane16) * 16,
+                offset
+                + ((dim // 8 + half + 2 * j) * self.t.block_size + token + lane16) * 16,
                 fx.Int32,
                 4,
             )
@@ -1184,8 +1302,8 @@ class Gfx1250Memory:
         key_base = buf_base_i64(ctx.key_cache_ptr)
         value_base = buf_base_i64(ctx.value_cache_ptr)
         # K cache has contiguous 16-byte head-dimension chunks.
-        for i in range_constexpr(t.TOKENS * t.head_dim // t.chunk // 128):
-            chunk = ctx.tid + i * 128
+        for i in range_constexpr(t.TOKENS * t.head_dim // t.chunk // t.BLOCK_THREADS):
+            chunk = ctx.tid + i * t.BLOCK_THREADS
             token = chunk // (t.head_dim // t.chunk)
             d = (chunk % (t.head_dim // t.chunk)) * t.chunk
             absolute = token_base + token
@@ -1208,8 +1326,8 @@ class Gfx1250Memory:
             )
 
         # Both supported V layouts have contiguous 16-byte token chunks.
-        for i in range_constexpr(t.head_dim * (t.TOKENS // t.chunk) // 128):
-            chunk = ctx.tid + i * 128
+        for i in range_constexpr(t.head_dim * (t.TOKENS // t.chunk) // t.BLOCK_THREADS):
+            chunk = ctx.tid + i * t.BLOCK_THREADS
             d = chunk // (t.TOKENS // t.chunk)
             token = (chunk % (t.TOKENS // t.chunk)) * t.chunk
             absolute = token_base + token
@@ -1247,18 +1365,24 @@ class Gfx1250Memory:
         kv_off = t.q_bytes + buffer * t.kv_stride
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         page = fx.Int32(0)
-        if const_expr(t.async_page):
+        if const_expr(t.async_page or t.page16_async_scales):
+            page_absolute = token_base + (ctx.warp * 16 if t.page16_async_scales else 0)
             safe = (
-                token_base
+                page_absolute
                 if full_tile
-                else (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
+                else (page_absolute < ctx.planned_context).select(
+                    page_absolute, fx.Int32(0)
+                )
             )
             page = fx.Int32(
                 table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // t.block_size]
             )
         if const_expr(t.use_tdm):
             self.stage_tdm(
-                token_base, kv_off, full_tile, page if t.async_page else None
+                token_base,
+                kv_off,
+                full_tile,
+                page if t.async_page or t.page16_async_scales else None,
             )
         else:
             self.stage_vector_dma(token_base, kv_off)
@@ -1278,6 +1402,20 @@ class Gfx1250Memory:
                     fx.Int64(fx.ptrtoint(ctx.value_scale_ptr)),
                     (index + ctx.tid * 4) * 4,
                     kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4 + ctx.tid * 16,
+                )
+        elif const_expr(t.page16_async_scales and full_tile):
+            index = fx.Int64(page) * ctx.stride_ks_block + ctx.kv_h * ctx.stride_ks_head
+            if ctx.lane < 4:
+                token = ctx.warp * 16 + ctx.lane * 4
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.key_scale_ptr)),
+                    (index + ctx.lane * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + token * 4,
+                )
+                self.async_copy(
+                    fx.Int64(fx.ptrtoint(ctx.value_scale_ptr)),
+                    (index + ctx.lane * 4) * 4,
+                    kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + token) * 4,
                 )
         else:
             if const_expr(t.per_token_kv):

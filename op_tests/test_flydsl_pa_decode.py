@@ -809,11 +809,14 @@ def _assert_contracts(pa, output, arguments, options, plan):
     ]:
         with pytest.raises(error, match="sinks"):
             call(sinks=invalid)
-    for value, error in [(-2, ValueError), (1.5, TypeError)]:
-        with pytest.raises(error, match="sliding_window"):
-            call(sliding_window=value)
-        with pytest.raises(error, match="sliding_window"):
-            pa.plan_pa_decode(context, key.shape[1], sliding_window=value)
+    for value in (-2, -1, 0):
+        disabled_plan = pa.plan_pa_decode(context, key.shape[1], sliding_window=value)
+        assert disabled_plan.sliding_window == 0
+        call(sliding_window=value, work_plan=disabled_plan)
+    with pytest.raises(TypeError, match="sliding_window"):
+        call(sliding_window=1.5)
+    with pytest.raises(TypeError, match="sliding_window"):
+        pa.plan_pa_decode(context, key.shape[1], sliding_window=1.5)
     for value, error in [(0, ValueError), (1.5, TypeError)]:
         with pytest.raises(error, match="query_length"):
             call(query_length=value)
