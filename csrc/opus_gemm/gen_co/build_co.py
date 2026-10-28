@@ -894,8 +894,7 @@ def main():
     if args.arch == "gfx950":
         # Local registry keys remain distinct when CO metadata is shared by aliases.
         instances = [
-            {**entry, "kid": kid}
-            for kid, entry in gfx950_co_kernels_declared.items()
+            {**entry, "kid": kid} for kid, entry in gfx950_co_kernels_declared.items()
         ]
         build = build_one_gfx950
         manifest_path = _GFX950_MANIFEST

@@ -970,9 +970,7 @@ def _ensure_kids_compiled(candidate_kids, *, family="a16w16", gfx=None, cu_num=N
             return False
         # Peer's expand didn't cover us (rare: peer's `required` set was
         # disjoint from ours). Re-enter to extend further.
-        return _ensure_kids_compiled(
-            candidate_kids, family=family, gfx=gfx, cu_num=cu
-        )
+        return _ensure_kids_compiled(candidate_kids, family=family, gfx=gfx, cu_num=cu)
 
     try:
         compiled = _read_sidecar(sidecar)

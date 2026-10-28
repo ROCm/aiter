@@ -2867,24 +2867,6 @@ a8w8_mxscale_bmm_kernels_list = {
 }
 
 
-def _bpreshuffle_geometry_name(pipeline, fields, *, co):
-    family = {
-        "pin_agpr": "4wave_pin_agpr_co",
-        "pingpong_lds": "m_repeat_co",
-        "prefetch_b_vgpr": "b_vgpr_co" if co else "prefetch_b_vgpr",
-        "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
-        "wave_interleave": "interleave_co",
-    }[pipeline]
-    return "_".join(
-        ("opus_gemm", "gfx950", family)
-        + tuple("x".join(map(str, values)) for values in fields)
-    )
-
-
-def a8w8_mxscale_bpreshuffle_kernel_name(instance):
-    return instance.name
-
-
 def _gfx950_co_image_path(path, entry):
     root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(path)
     return os.path.join(root, "gfx950", entry["image"])
@@ -2902,40 +2884,6 @@ def _load_gfx950_co_kernels(path, require_image=True):
                 list(map(int, shape.split(","))) for shape in entry["launches"]
             )
         entries[entry["kid"]] = entry
-    for group in document.get("pin_groups", []):
-        base = entries[group["base"]]
-        lds = base["pipeline"] == "pingpong_lds"
-        if base["pipeline"] not in ("prefetch_b_vgpr", "prefetch_b_vgpr_overlap", "pingpong_lds"):
-            raise ValueError(f"Pin variants are unsupported for {base['pipeline']}")
-        args = list(base["traits"]["args"])
-        if lds:
-            # Keep fragment representation identical, including the no-pin control.
-            args += ["false"] * max(0, 12 - len(args))
-            args[8] = "true"
-            positions = ((9, 1), (10, 2), (11, 4))
-        else:
-            args += ["false"] * max(0, 16 - len(args))
-            positions = ((14, 1), (15, 4))
-        for mask_text, kid in group["kids"].items():
-            mask = int(mask_text)
-            if mask not in (range(8) if lds else (0, 1, 4, 5)):
-                raise ValueError(f"Invalid pin mask {mask} for {base['pipeline']}")
-            variant_args = list(args)
-            for index, bit in positions:
-                variant_args[index] = str(bool(mask & bit)).lower()
-            if kid not in entries:
-                entries[kid] = {
-                    **base, "kid": kid, "pin_variant": True,
-                    "traits": {**base["traits"], "args": variant_args},
-                    "configKey": f"bpreshuffle_co_{base['pipeline']}_{kid}",
-                }
-            entry = entries[kid]
-            if (entry["traits"] != {**base["traits"], "args": variant_args}
-                    or entry["device_flags"] != base["device_flags"]):
-                raise ValueError(f"CO {kid} differs from pin group {group['base']} / mask {mask}")
-            if entry.get("pin_group", group["base"]) != group["base"]:
-                raise ValueError(f"CO {kid} belongs to two pin groups")
-            entry.update(pin_group=group["base"], pin_mask=mask)
     image_configs = {}
     for kid, entry in sorted(entries.items()):
         fields = (
@@ -2944,7 +2892,17 @@ def _load_gfx950_co_kernels(path, require_image=True):
             (16, 16, 128),
             (1, 128, 128),
         )
-        name = _bpreshuffle_geometry_name(entry["pipeline"], fields, co=True)
+        family = {
+            "pin_agpr": "4wave_pin_agpr_co",
+            "pingpong_lds": "m_repeat_co",
+            "prefetch_b_vgpr": "b_vgpr_co",
+            "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
+            "wave_interleave": "interleave_co",
+        }[entry["pipeline"]]
+        name = "_".join(
+            ("opus_gemm", "gfx950", family)
+            + tuple("x".join(map(str, values)) for values in fields)
+        )
         suffix = document["image_suffixes"][str(kid)]
         symbol = name + (f"_{suffix}" if suffix else "")
         image = symbol + ".co"
@@ -2974,36 +2932,6 @@ _BP_ROOT = "opus_gemm_blockscale_mxscale_bpreshuffle_"
 a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list = {}
 
 
-def _bpreshuffle_traits(name, *args):
-    values = (str(x).lower() if isinstance(x, bool) else str(x) for x in args)
-    return name + "<" + ", ".join(values) + ">"
-
-
-def _bpreshuffle_register(pipeline, kernel, traits, bm, bn, bk, wm, wn, *,
-                         kid, fixed_k=0, m_align=1, depth=1, output=0, ahead=0,
-                         wg_per_cu=1, cache_a=0, cache_b=0):
-    if kid in gfx950_co_kernels_declared or kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list:
-        raise ValueError(f"duplicate gfx950 bpreshuffle kernel ID {kid}")
-    config_name = (f"{pipeline}_{bm}x{bn}x{bk}_w{wm}x{wn}x1_p{depth}"
-                   f"_o{output}_ba{ahead}_sk1_wg{wg_per_cu}"
-                   f"_cA{cache_a}cB{cache_b}_k{fixed_k}_nt0")
-    header_pipeline = "b_vgpr" if pipeline == "prefetch_b_vgpr" else pipeline
-    entry = {"kid": kid, "pipeline": pipeline, "kernel": kernel, "traits": traits,
-             "config_name": config_name,
-             "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_" + header_pipeline + "_gfx950.cuh",),
-             "m_align": m_align}
-    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[kid] = OpusGemmInstance(
-        BLOCK_SIZE=64 * wm * wn, B_M=bm, B_N=bn, B_K=bk,
-        T_M=wm, T_N=wn, W_M=16, W_N=16, W_K=128,
-        VEC_A=16, VEC_B=16, VEC_C=4, GROUP_M=1, GROUP_N=128, GROUP_K=128,
-        WG_PER_CU=wg_per_cu, cachectl_a=cache_a, cachectl_b=cache_b,
-        kernel_tag=_TAG, output_dtypes=["bf16_t"], arch_prefix="gfx950",
-        direct_only=True,
-        pad_m=True, max_k=fixed_k or 16384,
-        max_tensor_bytes=2**63 - 1, bpreshuffle_fixed_k=fixed_k,
-        bpreshuffle_entry=entry)
-
-
 # Stable declarations: kid, BM, BN, WN, stages, ahead, WG/CU, A cache, B cache, output.
 # Future configurations append IDs starting at 56 without renumbering these entries.
 _BPRESHUFFLE_JIT_CONFIGS = (
@@ -3015,13 +2943,32 @@ _BPRESHUFFLE_JIT_CONFIGS = (
     (40, 64, 128, 4, 3, 1, 1, 1, 17, 2),
 )
 for _kid, _bm, _bn, _wn, _stages, _ahead, _wg, _ca, _cb, _output in _BPRESHUFFLE_JIT_CONFIGS:
+    if _kid in gfx950_co_kernels_declared or _kid in a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list:
+        raise ValueError(f"duplicate gfx950 bpreshuffle kernel ID {_kid}")
     _args = (_bm, _bn, _stages, _ahead, _cb, True, 7168, _wn, _wg, _ca)
     if _output:
         _args += (2, _output)
-    _traits = _bpreshuffle_traits(_BP_ROOT + "prefetch_b_vgpr_traits", *_args)
-    _bpreshuffle_register("prefetch_b_vgpr", _BP_ROOT + "prefetch_b_vgpr_bulk_panel_kernel", _traits,
-        _bm, _bn, 256, 1, _wn, kid=_kid, m_align=16, fixed_k=7168, depth=_stages,
-        ahead=_ahead, output=_output, wg_per_cu=_wg, cache_a=_ca, cache_b=_cb)
+    _traits = _BP_ROOT + "prefetch_b_vgpr_traits<" + ", ".join(
+        str(value).lower() if isinstance(value, bool) else str(value) for value in _args
+    ) + ">"
+    _entry = {
+        "kid": _kid, "pipeline": "prefetch_b_vgpr",
+        "kernel": _BP_ROOT + "prefetch_b_vgpr_bulk_panel_kernel", "traits": _traits,
+        "config_name": (f"prefetch_b_vgpr_{_bm}x{_bn}x256_w1x{_wn}x1_p{_stages}"
+                        f"_o{_output}_ba{_ahead}_sk1_wg{_wg}"
+                        f"_cA{_ca}cB{_cb}_k7168_nt0"),
+        "headers": ("gfx950/opus_gemm_pipeline_a8w8_blockscale_mxscale_bpreshuffle_b_vgpr_gfx950.cuh",),
+        "m_align": 16,
+    }
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list[_kid] = OpusGemmInstance(
+        BLOCK_SIZE=64 * _wn, B_M=_bm, B_N=_bn, B_K=256,
+        T_M=1, T_N=_wn, W_M=16, W_N=16, W_K=128,
+        VEC_A=16, VEC_B=16, VEC_C=4, GROUP_M=1, GROUP_N=128, GROUP_K=128,
+        WG_PER_CU=_wg, cachectl_a=_ca, cachectl_b=_cb,
+        kernel_tag=_TAG, output_dtypes=["bf16_t"], arch_prefix="gfx950",
+        direct_only=True, pad_m=True, max_k=7168,
+        max_tensor_bytes=2**63 - 1, bpreshuffle_fixed_k=7168,
+        bpreshuffle_entry=_entry)
 
 # Preserve route annotations for the builder; verified runtime image aliases
 # share canonical instance metadata for the complete name/config equality check.
@@ -3068,10 +3015,6 @@ def _m_repeat_generic_signature(instance):
     )
 
 
-# Fixed-K variants with measured benefit.
-GFX950_FIXED_K_TUNE_KIDS = frozenset()
-
-
 def a8w8_mxscale_bpreshuffle_tune_candidates(candidates, seed_kids=()):
     """Prefer an equivalent runtime-K candidate unless the fixed-K kid has evidence."""
     generic = {
@@ -3081,7 +3024,7 @@ def a8w8_mxscale_bpreshuffle_tune_candidates(candidates, seed_kids=()):
         and instance.bpreshuffle_co["pipeline"] == "pingpong_lds"
         and not instance.bpreshuffle_fixed_k
     }
-    preserved = set(seed_kids) | GFX950_FIXED_K_TUNE_KIDS
+    preserved = set(seed_kids)
     return [
         (kid, instance) for kid, instance in candidates
         if not instance.bpreshuffle_fixed_k
@@ -3226,7 +3169,9 @@ def get_registry(family: str, gfx: str, cu_num: int) -> dict[int, object]:
             kid: instance
             for kid, instance in records.items()
             if instance.bpreshuffle_co is None
-            or os.path.isfile(_gfx950_co_image_path(GFX950_CO_KERNELS_JSON, instance.bpreshuffle_co))
+            or os.path.isfile(
+                _gfx950_co_image_path(GFX950_CO_KERNELS_JSON, instance.bpreshuffle_co)
+            )
         }
     return records
 
@@ -3434,6 +3379,14 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         ),
         "a8w8": frozenset({"a8w8"}),
         "a8w8_blockscale": frozenset({"a8w8_scale"}),
+        # Keep in step with _A8W8_MXSCALE_BMM_TAGS in aiter/ops/opus/launch_plan.py.
+        # They are two hand-maintained copies of the same list and both are
+        # consulted, this one first: get_kernel_instance rejects a kid whose tag
+        # is missing here before the plan builder ever checks its own copy. A tag
+        # added to only one of them therefore looks like "no registered OPUS
+        # kernel", which reads as a missing kernel rather than a missing list
+        # entry -- that is exactly how all 133 preshuffled rows were dropped
+        # while the kids were present in kernels_list the whole time.
         "a8w8_mxscale_bmm": frozenset(
             {
                 "a8w8_mxscale_bmm_flatmm_splitk",
@@ -3444,6 +3397,9 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a8w8_mxscale_bmm_pipeline",
                 "a8w8_mxscale_bmm_wave8n2",
                 "a8w8_mxscale_bmm_wave4m2_selfload",
+                # The preshuffled-B families: unreachable upstream, where gfx950
+                # preshuffle is off, but every row of the preshuffled tuned table
+                # names one.
                 "a8w8_mxscale_bmm_bpreshuffle_bdirect",
                 "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
                 "a8w8_mxscale_bmm_bpreshuffle_blds",
@@ -3456,7 +3412,9 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a8w8_mxscale_bmm_pipeline_bpreshuffle",
             }
         ),
-        "a8w8_blockscale_bpreshuffle": frozenset({"a8w8_blockscale_mxscale_gemm_bpreshuffle"}),
+        "a8w8_blockscale_bpreshuffle": frozenset(
+            {"a8w8_blockscale_mxscale_gemm_bpreshuffle"}
+        ),
     },
     "gfx942": {
         "a16w16": frozenset(

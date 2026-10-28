@@ -979,7 +979,7 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     "bmm" the flydsl batched GEMM (flydsl.batched_gemm_a8w8) run with B = 1.
     Both are tuned with the x_scale block that goes with the w_scale's (1x128
     with 128x128, else 1x32); untuned shapes and other x_scale blocks run bmm
-    under its heuristic. OPUS rows use numeric kernel IDs."""
+    under its heuristic."""
     m, k = XQ.shape
     n = WQ.shape[0]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
@@ -1006,20 +1006,17 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
             and Y.dtype == dtypes.bf16
             and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
         ):
-            from .opus.gemm_op_a8w8 import _launch_a8w8_blockscale_bpreshuffle_gemm
+            from .opus import opus_gemm
 
-            # View column-major scale bytes as [M, K/128] without copying.
-            opus_scale = (
-                x_scale if x_scale.stride() == (1, m) else x_scale.view(k // 128, m).T
-            )
-            return _launch_a8w8_blockscale_bpreshuffle_gemm(
+            return opus_gemm(
                 XQ,
                 WQ,
-                opus_scale,
-                w_scale,
                 Y,
                 kid=kid,
-                instance=instance,
+                family="a8w8_blockscale_bpreshuffle",
+                layout="bpreshuffle",
+                x_scale=x_scale,
+                w_scale=w_scale,
             )
         # A padded-M lookup can select a kernel that does not support the original M.
         config = None
@@ -1356,8 +1353,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
             )
 
-    # E8M0 block scales use the tuned FlyDSL or OPUS kernel on raw scales;
-    # FP32 scales use CK / asm below.
+    # E8M0 block scales take the flydsl GEMMs on raw scales (bmm or
+    # gemm_a8w8_mxfp8, as the tuned row says), FP32 ones CK / asm below.
     if (
         get_gfx() == "gfx950"
         and x_scale.dtype == dtypes.fp8_e8m0
