@@ -881,7 +881,7 @@ def gemm_a16w16_gfx950_kernel(
                     frag_C,
                     traversal_order=fx.GemmTraversalOrder.KNM,
                 )
-            if const_expr(param.residual_m_tile):
+            if const_expr(param.residual_m_tile):  # noqa: SIM102
                 if tid < tail_threads:
                     fx.copy(
                         b_s2r_copy_atom,
@@ -908,7 +908,7 @@ def gemm_a16w16_gfx950_kernel(
                     k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
                     compute_k_chunk(k_iter)
         if const_expr(
-            block_n in (192, 224)
+            block_n in (192, 224, 256, 320)
             and block_k == 64
             and k_waves == 1
             and not is_split_k
@@ -997,7 +997,7 @@ def gemm_a16w16_gfx950_kernel(
         row = fx.get_scalar(thr_mma_cRow[i])
         col = fx.get_scalar(thr_mma_cCol[i])
         sC_write[row, col] = frag_C_out[i]
-    if const_expr(param.residual_m_tile):
+    if const_expr(param.residual_m_tile):  # noqa: SIM102
         if tid < tail_threads:
             for i in range_constexpr(fx.size(tail_frag_C_out.shape).unpack()):
                 row = fx.get_scalar(tail_c_row[i])
