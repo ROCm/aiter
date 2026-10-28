@@ -371,6 +371,15 @@ def _ladder(algorithm: str, world_size: int, link: str) -> tuple:
     return ring_st_ladder(world_size=world_size, link=link)
 
 
+def _ships(world_size: int, algorithm: str, link: str) -> bool:
+    """Whether production has a ladder for algorithm at world_size on this
+    host. A schedule without one is never built, so nothing that runs the 
+    shipped ladder sweeps it. The pinned-ladder transport cases still run its 
+    kernel."""
+    table = fly_policy.LADDERS[fly_policy.AllReduceAlgorithm(algorithm)]
+    return (ARCH, link, int(world_size)) in table
+
+
 def _expected_cfg(
     nbytes: int,
     *,
@@ -1791,6 +1800,7 @@ def _verify(args, tps, algos, dts, link) -> None:
     plans = {
         (tp, algorithm): _ship_payloads(tp, algorithm, link)
         for tp, algorithm in itertools.product(tps, algos)
+        if _ships(tp, algorithm, link)
     }
     # Engines exactly as production builds them: only these are checked for
     # kernel coverage.
@@ -1828,7 +1838,7 @@ def _verify(args, tps, algos, dts, link) -> None:
         knobs = [
             (tokens, hidden, tp, algorithm, None, block)
             for tp, algorithm, tokens, hidden, block in KNOB_CASES
-            if tp in tps and algorithm in algos
+            if (tp, algorithm) in plans
         ]
     if dts:
         for tokens, hidden, tp, algorithm, grid_cap, block in ship + knobs:
@@ -1842,12 +1852,12 @@ def _verify(args, tps, algos, dts, link) -> None:
     ]
     for tp, algorithm, tokens, hidden in run_ahead:
         _register(_ship_key(tp, algorithm, None), (tokens, hidden, "run_ahead", False))
-    edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
+    edge = [c for c in EDGE_CASES if (c[0], c[1]) in plans]
     for tp, algorithm, tokens, hidden, fill in edge:
         _register(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
     pinned = []
     if args.extended:
-        pinned = [c for c in PINNED_CODEC_CASES if c[0] in tps and "ring" in algos]
+        pinned = [c for c in PINNED_CODEC_CASES if (c[0], "ring") in plans]
     for tp, tokens, hidden, rs, ag in pinned:
         _register(
             _key(tp, algorithm="ring", rs_codec=rs, ag_codec=ag),
@@ -1975,22 +1985,25 @@ def _bench(args, tps, algos, link) -> None:
     algos = tuple(a for a in ALGORITHMS if a in algos)
     rows = []
     for tp in tps:
+        shipped = tuple(a for a in algos if _ships(tp, a, link))
+        if not shipped:
+            continue
         if args.mnk is not None:
             shapes = [(int(t), int(h)) for t, h in args.mnk]
         else:
-            payloads = {n for a in algos for n in _ship_payloads(tp, a, link)[0]}
+            payloads = {n for a in shipped for n in _ship_payloads(tp, a, link)[0]}
             shapes = [(n // _ROW_BYTES, HIDDEN) for n in sorted(payloads)]
         policy = fly_policy.resolve_family_policy(world_size=tp, link=link)
         for grid_cap, block in itertools.product(args.grid_cap, args.block):
             # Every case of a spawn is registered before its first result.
             for shape in shapes:
-                _register(_bench_key(tp, algos, grid_cap, block), shape)
+                _register(_bench_key(tp, shipped, grid_cap, block), shape)
             rows += [
                 bench_quick_allreduce_int4(
                     tokens,
                     hidden,
                     tp,
-                    algos,
+                    shipped,
                     route=_route(policy, tokens * hidden * 2),
                     grid_cap=grid_cap,
                     block=block,

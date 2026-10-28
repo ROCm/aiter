@@ -300,7 +300,8 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
 }
 
 # Ring, ``TwoShotRung``. The ring publishes ``2(N-1)`` times per super-tile, so
-# a larger payload wants a larger super-tile.
+# a larger payload wants a larger super-tile. Only the platforms whose policy
+# rings have a row: gfx950/xGMI and gfx950/PCIe at TP2 never use ring algorithm.
 RING_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (
@@ -316,31 +317,21 @@ RING_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
         TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=BLOCK),
         TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
     ),
-    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    # TODO: measured on gfx942; tune on gfx950.
-    ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
-    ),
-    ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
-    ),
-    ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
-    ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
-    ("gfx950", "pcie", 2): (
-        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=512),
-    ),
     ("gfx950", "pcie", 4): (
         TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),
     ),
     ("gfx950", "pcie", 8): (
         TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),
     ),
+}
+
+# The ladder table of each algorithm. A table has a row exactly where the
+# policy table gives its algorithm a window.
+LADDERS: dict[AllReduceAlgorithm, dict] = {
+    AllReduceAlgorithm.OneShot: ONESHOT_LADDER,
+    AllReduceAlgorithm.TwoShotMesh: MESH_ST_LADDER,
+    AllReduceAlgorithm.TwoShotRing: RING_ST_LADDER,
 }
 
 
@@ -449,7 +440,12 @@ def _override(window: Window | None, lo, hi) -> Window | None:
 
 
 def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
-    """*policy* with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` overrides."""
+    """*policy* with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` overrides.
+
+    An override can move a window and enable an algorithm, but only where 
+    the algorithm has a ladder for the platform. Elsewhere the override is 
+    ignored.
+    """
 
     bounds = {
         alg: (
@@ -458,12 +454,25 @@ def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
         )
         for alg, infix in _WINDOW_ENV.items()
     }
-    return dataclasses.replace(
-        policy,
-        oneshot=_override(policy.oneshot, *bounds[AllReduceAlgorithm.OneShot]),
-        mesh=_override(policy.mesh, *bounds[AllReduceAlgorithm.TwoShotMesh]),
-        ring=_override(policy.ring, *bounds[AllReduceAlgorithm.TwoShotRing]),
-    )
+    key = (policy.arch, policy.link, policy.world_size)
+    windows = {}
+    for alg, field in (
+        (AllReduceAlgorithm.OneShot, "oneshot"),
+        (AllReduceAlgorithm.TwoShotMesh, "mesh"),
+        (AllReduceAlgorithm.TwoShotRing, "ring"),
+    ):
+        window = _override(getattr(policy, field), *bounds[alg])
+        if window is not None and not window.is_empty and key not in LADDERS[alg]:
+            logger.warning(
+                "AITER_FLY_AR_%s_{MIN,MAX}_BYTES ignored: the %s has no tuned "
+                "configuration on %s/%s/TP%d.",
+                _WINDOW_ENV[alg],
+                alg.value,
+                *key,
+            )
+            window = getattr(policy, field)
+        windows[field] = window
+    return dataclasses.replace(policy, **windows)
 
 
 def enabled() -> bool:

@@ -129,7 +129,6 @@ levels:
    ladder for each arch, link type and world size: `ONESHOT_LADDER`,
    `MESH_ST_LADDER` and `RING_ST_LADDER`.
 
-
 ## Environment variables
 
 ### Enable the FlyDSL kernels
@@ -181,8 +180,7 @@ is not.
 * `none` or `inf` sets no upper limit. Only the `MAX` variables accept it.
 * A maximum of `0` disables the algorithm. A minimum that is equal to the
   maximum also disables it.
-* If an algorithm has no window in the table, a variable creates one. The
-  other bound is then `0` for the minimum, or no upper limit for the maximum.
+* A variable cannot enable an algorithm that has no window in the table.
 * If a value is not valid, the code logs a warning and uses the value from the
   table.
 * If the mesh and the ring windows overlap after the change, the code logs a
