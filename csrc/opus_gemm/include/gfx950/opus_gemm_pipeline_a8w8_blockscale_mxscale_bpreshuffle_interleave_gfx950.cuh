@@ -34,17 +34,10 @@ __device__ inline auto make_layout_ga(int lane_id, int wave_id, int stride_a) {
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
-    auto layout = opus::make_layout<16>(
+    return opus::make_layout<16>(
         ga_block_shape,
         opus::unfold_x_stride(ga_block_dim, ga_block_shape, opus::tuple{stride_a, 1_I}),
         opus::unfold_p_coord(ga_block_dim, opus::tuple{wave_id, lane_id / 8, lane_id % 8}));
-    opus::static_for<T::A_STEPS>([&](auto i) {
-        constexpr int step = decltype(i)::value;
-        const int row = lane_id / 8 + wave_id * 8 + step * (T::BLOCK_SIZE / 8);
-        const int col = lane_id % 8 * 16;
-        layout.offsets[step] += a_offset(row, col) % 128 - col;
-    });
-    return layout;
 }
 
 // LDS producer offsets exclude the lane offset supplied by async_load.
@@ -80,20 +73,11 @@ __device__ inline auto make_layout_ra(int lane_id, int wave_id_m) {
         opus::make_tuple(opus::p_dim{}),
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
 
-    auto layout = opus::make_layout<16>(
+    return opus::make_layout<16>(
         ra_block_shape,
         opus::unfold_x_stride(ra_block_dim, ra_block_shape,
             opus::tuple{2048_I, opus::number<T::E_M * 2048>{}, 128_I, 1_I}),
         opus::unfold_p_coord(ra_block_dim, opus::tuple{wave_id_m, lane_id % 16, lane_id / 16}));
-    opus::static_for<T::E_M>([&](auto m_i) {
-        constexpr int m = decltype(m_i)::value;
-        const int row = (wave_id_m * T::E_M + m) * 16 + lane_id % 16;
-        opus::static_for<2>([&](auto chunk_i) {
-            constexpr int chunk = decltype(chunk_i)::value;
-            layout.offsets[m * 2 + chunk] = a_offset(row, lane_id / 16 * 16 + chunk * 64);
-        });
-    });
-    return layout;
 }
 
 // B global-memory coordinates follow the N16/K64 preshuffle.
@@ -465,9 +449,23 @@ __device__ __forceinline__ void opus_gemm_bpreshuffle_wave_interleave_body(
         batch * kargs.stride_sfb_batch + (col / 128) * kargs.stride_sfb);
 
     // Matrix and scale layouts: global -> LDS -> register fragments.
-    const auto u_ga = make_layout_ga<T>(lane_id, wave_id, kargs.stride_a);
+    auto u_ga = make_layout_ga<T>(lane_id, wave_id, kargs.stride_a);
+    opus::static_for<T::A_STEPS>([&](auto i) {
+        constexpr int step = decltype(i)::value;
+        const int row = lane_id / 8 + wave_id * 8 + step * (T::BLOCK_SIZE / 8);
+        const int col = lane_id % 8 * 16;
+        u_ga.offsets[step] += a_offset(row, col) % 128 - col;
+    });
     const auto u_sa = make_layout_sa<T>(wave_id);
-    const auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
+    auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
+    opus::static_for<T::E_M>([&](auto m_i) {
+        constexpr int m = decltype(m_i)::value;
+        const int row = (wave_id_m * T::E_M + m) * 16 + lane_id % 16;
+        opus::static_for<2>([&](auto chunk_i) {
+            constexpr int chunk = decltype(chunk_i)::value;
+            u_ra.offsets[m * 2 + chunk] = a_offset(row, lane_id / 16 * 16 + chunk * 64);
+        });
+    });
     const auto u_gb = make_layout_gb<T>(lane_id, wave_id, kargs.stride_b);
     const auto u_sb = make_layout_sb<T>(wave_id);
     const auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
