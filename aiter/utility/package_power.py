@@ -231,5 +231,6 @@ def record_package_watts(fn, device_index: int | None = None) -> float:
             device_index = 0
     try:
         return float(measure_package_watts(fn, device_index=device_index))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("package power measurement failed: %s", exc)
         return float("nan")

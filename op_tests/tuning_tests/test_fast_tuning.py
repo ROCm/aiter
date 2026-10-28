@@ -1257,9 +1257,19 @@ class TestPowerTableSeparation(unittest.TestCase):
 
         from aiter.utility.base_tuner import TunerCommon
 
-        stub = SimpleNamespace(columns=["M", "us"])
+        def stamp_stub():
+            stub = SimpleNamespace(
+                columns=["M", "us"], POWER_WATT_COLUMNS=("watts",)
+            )
+            stub.power_metrics = lambda df: TunerCommon.power_metrics(stub, df)
+            stub._rows_with_finite_watts = (
+                lambda df: TunerCommon._rows_with_finite_watts(stub, df)
+            )
+            return stub
+
+        stub = stamp_stub()
         args = SimpleNamespace(select="power", mp=1)
-        frame = pd.DataFrame([{"M": 1, "us": 2.0}])
+        frame = pd.DataFrame([{"M": 1, "us": 2.0, "tflops": 800.0, "watts": 400.0}])
         conditions = {
             "perf_level": "auto",
             "power_cap_w": "1400",
@@ -1271,6 +1281,7 @@ class TestPowerTableSeparation(unittest.TestCase):
             stamped = TunerCommon._stamp_power_rows(stub, frame, args)
         self.assertEqual(stamped.iloc[0]["select"], "power")
         self.assertEqual(stamped.iloc[0]["power_cap_w"], "1400")
+        self.assertAlmostEqual(stamped.iloc[0]["tflops_per_w"], 2.0)
         self.assertEqual(
             stub.columns,
             [
@@ -1284,12 +1295,85 @@ class TestPowerTableSeparation(unittest.TestCase):
                 "sclk_max_mhz",
             ],
         )
+        unmeasured = TunerCommon._stamp_power_rows(
+            stamp_stub(),
+            pd.DataFrame([{"M": 1, "us": 2.0, "watts": float("nan")}]),
+            args,
+        )
+        self.assertNotIn("select", unmeasured.columns)
         latency = TunerCommon._stamp_power_rows(
-            SimpleNamespace(columns=["M", "us"]),
+            stamp_stub(),
             frame,
             SimpleNamespace(select="latency"),
         )
         self.assertNotIn("select", latency.columns)
+
+    def test_power_replay_uses_run_perftest_kwargs(self):
+        from aiter.utility.mp_tuner import replay_timed_call
+
+        def kernel(x):
+            raise AssertionError(f"kernel called directly with {x}")
+
+        with mock.patch("aiter.test_common.run_perftest", return_value=("out", 1.0)) as perftest:
+            replay_timed_call(kernel, (1,), {"num_warmup": 10, "num_iters": 101})
+        perftest.assert_called_once_with(kernel, 1, num_warmup=10, num_iters=101)
+
+    def test_select_power_requires_support_and_refuses_latency_gate(self):
+        from aiter.utility.base_tuner import TunerCommon
+
+        def error(message):
+            raise SystemExit(message)
+
+        stub = SimpleNamespace(
+            SUPPORTS_POWER_SELECT=False,
+            parser=SimpleNamespace(error=error),
+            get_out_file=lambda path: path,
+        )
+        previous = os.environ.get("AITER_SELECT")
+        try:
+            with self.assertRaises(SystemExit) as unsupported:
+                TunerCommon._apply_select(
+                    stub,
+                    SimpleNamespace(
+                        select="power", compare=False, update_improved=False
+                    ),
+                )
+            self.assertIn("not supported", str(unsupported.exception))
+            stub.SUPPORTS_POWER_SELECT = True
+            with self.assertRaises(SystemExit) as gated:
+                TunerCommon._apply_select(
+                    stub,
+                    SimpleNamespace(
+                        select="power",
+                        compare=True,
+                        update_improved=True,
+                        tune_file="/tmp/out.csv",
+                    ),
+                )
+            self.assertIn("latency", str(gated.exception))
+        finally:
+            if previous is None:
+                os.environ.pop("AITER_SELECT", None)
+            else:
+                os.environ["AITER_SELECT"] = previous
+
+    def test_moe_post_process_keeps_measured_watts(self):
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import (
+            GroupedFmoeTuner,
+            _frame_keeping_watts,
+        )
+
+        frame = _frame_keeping_watts(
+            ["token", "us"],
+            [{"token": 1, "us": 2.0, "watts": 400.0}],
+        )
+        self.assertEqual(float(frame.iloc[0]["watts"]), 400.0)
+        dropped = GroupedFmoeTuner.__new__(GroupedFmoeTuner)
+        dropped.columns = ["token", "us"]
+        kept = dropped.post_process(
+            [{"token": 1, "us": 2.0, "watts": 500.0}], None
+        )
+        self.assertEqual(float(kept.iloc[0]["watts"]), 500.0)
 
     def test_power_tune_of_shipped_table_writes_to_power_configs(self):
         import argparse
@@ -1314,6 +1398,14 @@ class TestPowerTableSeparation(unittest.TestCase):
                 chosen = SimpleNamespace(tune_file="/tmp/my_model_power.csv")
                 TunerCommon._redirect_power_output(stub, chosen)
                 self.assertEqual(chosen.tune_file, "/tmp/my_model_power.csv")
+                explicit = SimpleNamespace(
+                    tune_file=f"{root}/aiter/configs/model_configs/gptoss_tuned_fmoe.csv"
+                )
+                TunerCommon._redirect_power_output(stub, explicit)
+                self.assertEqual(
+                    explicit.tune_file,
+                    f"{root}/aiter/configs/power_configs/gptoss_tuned_fmoe.csv",
+                )
 
     def test_merge_refuses_power_and_latency_rows_for_one_shape(self):
         import pandas as pd

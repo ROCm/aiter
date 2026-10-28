@@ -94,6 +94,19 @@ def _merge_error_ratio(current, observed):
     return max(current, observed)
 
 
+def replay_timed_call(func, args, kwargs):
+    """Re-run the kernel the way the timer did.
+
+    ``kwargs`` are ``run_perftest`` arguments (``num_warmup``, ``num_iters``,
+    and the rest). Calling ``func(*args, **kwargs)`` forwards those into the
+    kernel, which raises ``TypeError``. ``record_package_watts`` would turn
+    that into NaN and the tune would keep a latency winner labeled as power.
+    """
+    from aiter.test_common import run_perftest
+
+    return run_perftest(func, *args, **kwargs)
+
+
 def worker(
     gpu_id,
     info,
@@ -232,10 +245,10 @@ def worker(
     if measure_power and us not in (-1, 0) and us != float("inf") and res is not None:
         from aiter.utility.package_power import record_package_watts
 
-        def _replay():
-            return func(*args, **kwargs)
-
-        watts = record_package_watts(_replay, device_index=gpu_id)
+        watts = record_package_watts(
+            lambda: replay_timed_call(func, args, kwargs),
+            device_index=gpu_id,
+        )
 
     return TuneResult(info, us, round(max_err_ratio, 4), watts)
 

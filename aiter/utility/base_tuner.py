@@ -74,6 +74,13 @@ class TunerCommon:
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
     }
+    # Opt in per tuner. A tuner that only ranks by latency must not stamp
+    # select=power, including ones whose post-pass keeps a kernel for its speed.
+    SUPPORTS_POWER_SELECT = False
+    # Columns that count as a real package-power measurement. MoE's tuned row
+    # uses ``watts`` (the stage-energy mean); stage columns stay on the profile.
+    POWER_WATT_COLUMNS = ("watts",)
+
     INVALID_TIME = -1  # op not support or error
 
     INF_TIME = float("inf")  # op time is too large
@@ -230,7 +237,7 @@ class TunerCommon:
             "--compare",
             action="store_true",
             required=False,
-            help="Run production-op benchmark before and after tuning, print compare results, and keep a compare candidate CSV.",
+            help="Run production-op benchmark before and after tuning, print compare results, and keep a compare candidate CSV. The report compares latency (e2e us) only.",
         )
         self.parser.add_argument(
             "--update_improved",
@@ -251,7 +258,7 @@ class TunerCommon:
             help="How to pick the winner among kernels that pass errRatio. "
             "'latency' (default) keeps the lowest us. "
             "'power' (experimental; aliases: efficiency, power_efficiency) "
-            "ranks by TFLOP/s per package watt, measured from the GPU PPT "
+            "ranks by package energy (us * PPT watts), measured from the GPU PPT "
             "sysfs node (power1_input) over AITER_POWER_WINDOW_S seconds "
             "(default 0.4) on the accurate pass only. It adds no latency "
             "bound, and the score is an isolated replay under the clock and "
@@ -280,6 +287,17 @@ class TunerCommon:
         args.select = select
         os.environ["AITER_SELECT"] = select
         if select == "power":
+            if not self.SUPPORTS_POWER_SELECT:
+                self.parser.error(
+                    f"--select power is not supported by {type(self).__name__}"
+                )
+            if getattr(args, "compare", False) and getattr(
+                args, "update_improved", False
+            ):
+                self.parser.error(
+                    "--compare --update_improved gates on latency only and "
+                    "cannot be combined with --select power"
+                )
             self._redirect_power_output(args)
         return select
 
@@ -287,14 +305,15 @@ class TunerCommon:
         """Send a power tune of a shipped table to aiter/configs/power_configs/.
 
         Writing power rows into a shipped latency table would make the
-        model_configs/ shape merge rank one against the other. A ``-o`` the
-        user chose outside the shipped tables is left alone.
+        model_configs/ shape merge rank one against the other. Any ``-o``
+        under ``aiter/configs/``, including an explicit ``model_configs/``
+        path, is redirected. A path outside that tree is left alone.
         """
         from aiter.jit.core import AITER_ROOT_DIR
         from aiter.utility.tune_result import POWER_CONFIG_DIRNAME
 
         tune_file = getattr(args, "tune_file", None)
-        if not tune_file or tune_file != self.parser.get_default("tune_file"):
+        if not tune_file:
             return
         first = os.path.abspath(self.get_out_file(tune_file))
         configs_dir = os.path.abspath(os.path.join(AITER_ROOT_DIR, "aiter", "configs"))
@@ -313,8 +332,69 @@ class TunerCommon:
             "AITER_CONFIG_* variable."
         )
 
+    def power_metrics(self, df):
+        """Add ``tflops_per_w`` when both inputs exist and the column is absent.
+
+        MoE writes the column from stage energy (``us1*watts1 + us2*watts2``)
+        before this runs. Recomputing ``tflops / watts`` there would replace
+        that pair formula, so an existing column is kept.
+        """
+        if (
+            not isinstance(df, pd.DataFrame)
+            or df.empty
+            or "tflops_per_w" in df.columns
+            or not {"tflops", "watts"} <= set(df.columns)
+        ):
+            return df
+        import math
+
+        def positive(value) -> float | None:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            if math.isfinite(number) and number > 0:
+                return number
+            return None
+
+        df = df.copy()
+        tflops = pd.to_numeric(df["tflops"], errors="coerce")
+        watts = pd.to_numeric(df["watts"], errors="coerce")
+        per_w = []
+        for tflops_f, watts_f in zip(tflops, watts):
+            tflops_n = positive(tflops_f)
+            watts_n = positive(watts_f)
+            if tflops_n is None or watts_n is None:
+                per_w.append(float("nan"))
+            else:
+                per_w.append(round(tflops_n / watts_n, 6))
+        df["tflops_per_w"] = per_w
+        return df
+
+    def _rows_with_finite_watts(self, df):
+        import math
+
+        def finite_positive(value) -> bool:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return False
+            return math.isfinite(number) and number > 0
+
+        measured = pd.Series(False, index=df.index)
+        for column in self.POWER_WATT_COLUMNS:
+            if column not in df.columns:
+                continue
+            values = pd.to_numeric(df[column], errors="coerce")
+            measured = measured | values.map(finite_positive)
+        return measured
+
     def _stamp_power_rows(self, results, args):
-        """Record the power-management state on every row a power tune writes."""
+        """Record the power-management state on rows that were actually measured.
+
+        A shape whose watts are missing was ranked by latency. Labeling it
+        ``select=power`` would publish that latency pick as a power result.
+        """
         from aiter.utility.tune_result import (
             POWER_ROW_COLUMNS,
             SELECT_COLUMN,
@@ -324,6 +404,14 @@ class TunerCommon:
         if not isinstance(results, pd.DataFrame) or not power_selection_enabled(
             getattr(args, "select", None)
         ):
+            return results
+        results = self.power_metrics(results)
+        measured = self._rows_with_finite_watts(results)
+        if not bool(measured.any()):
+            logger.warning(
+                "select=power: no finite package watts were recorded; "
+                "leaving this batch as a latency result"
+            )
             return results
         conditions = getattr(self, "_power_conditions", None)
         if conditions is None:
@@ -337,13 +425,17 @@ class TunerCommon:
             self._power_conditions = conditions
             logger.info(f"select=power: tune conditions {conditions}")
         results = results.copy()
-        results[SELECT_COLUMN] = "power"
+        results[SELECT_COLUMN] = pd.NA
+        results.loc[measured, SELECT_COLUMN] = "power"
         for name, value in conditions.items():
-            results[name] = value
+            results[name] = pd.NA
+            results.loc[measured, name] = value
         # watts / tflops_per_w are power-tune columns. They stay off the
         # latency CSV schema, which is the column list a latency tune writes.
         power_columns = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS
-        missing = [c for c in power_columns if c not in self.columns]
+        missing = [
+            c for c in power_columns if c in results.columns and c not in self.columns
+        ]
         if missing:
             self.columns = list(self.columns) + missing
         return results
@@ -657,8 +749,8 @@ class TunerCommon:
             if args.verbose:
                 logger.info(f"saving profile to {args.profile_file}")
             profile_rets = sorted(rets, key=itemgetter(0))
-            profiledf = attach_power_columns(
-                self.result_to_df(profile_rets), profile_rets
+            profiledf = self.power_metrics(
+                attach_power_columns(self.result_to_df(profile_rets), profile_rets)
             )
             if os.path.exists(args.profile_file):
                 old_df = _read_csv(args.profile_file)
@@ -1194,6 +1286,7 @@ class TunerCommon:
 
         lines = [
             "============= Compare Report =============",
+            "Comparison is latency only (pre_us / post_us).",
             (
                 f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
                 f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}"
@@ -1736,6 +1829,10 @@ class TunerCommon:
 
 
 class GemmCommonTuner(TunerCommon):
+    # The accurate pass goes through mp_tuner.worker, which replays via
+    # run_perftest. a6w6 and mixed MXFP override this: their gain guard
+    # keeps a kernel only when it is faster.
+    SUPPORTS_POWER_SELECT = True
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -1847,7 +1944,6 @@ class GemmCommonTuner(TunerCommon):
             if power_selection_enabled():
                 watts, tflops_per_w = power_columns(el, tflops)
                 metrics["watts"] = [watts]
-                metrics["tflops_per_w"] = [tflops_per_w]
                 watt_text = f", {watts=} W, {tflops_per_w=} TFLOPS/W"
             if len(results) == self.topk:
                 print(

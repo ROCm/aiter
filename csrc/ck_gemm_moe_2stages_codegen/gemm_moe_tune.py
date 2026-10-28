@@ -433,6 +433,24 @@ def _numeric_column(frame, name, default=float("nan")):
     return pd.to_numeric(frame[name], errors="coerce")
 
 
+def _frame_keeping_watts(columns, results):
+    """Build the tuned frame without dropping a power measurement.
+
+    ``DataFrame(..., columns=self.columns)`` keeps only the latency schema.
+    Grouped and MXFP4 winners carry ``watts`` on the dict, and dropping it
+    made the following stamp publish ``select=power`` with a null reading.
+    """
+    kept = list(columns)
+    if (
+        results
+        and isinstance(results[0], dict)
+        and "watts" in results[0]
+        and "watts" not in kept
+    ):
+        kept.append("watts")
+    return pd.DataFrame(results, columns=kept)
+
+
 def rank_moe_pairs(profile_df, select_power: bool):
     """Rank paired MoE candidates.
 
@@ -667,6 +685,7 @@ _GEN_DATA_1STAGE_KEYS = [
 
 class FmoeTuner(TunerCommon):
     SUPPORTS_FAST_SCAN = False
+    SUPPORTS_POWER_SELECT = True
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -6783,7 +6802,7 @@ class GroupedFmoeTuner(FmoeTuner):
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del args, topk, fast_mode
-        return pd.DataFrame(results, columns=self.columns)
+        return _frame_keeping_watts(self.columns, results)
 
     # What grouped_moe_gfx1250 (and the AOT parser, for split_k*) reads a blank
     # cell as: the value of another column of the same row, or a constant.
@@ -8756,7 +8775,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del args, topk, fast_mode
-        return pd.DataFrame(results, columns=self.columns)
+        return _frame_keeping_watts(self.columns, results)
 
     def result_to_csv(self, results, file, concat=False):
         del concat

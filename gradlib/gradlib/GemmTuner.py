@@ -734,10 +734,8 @@ class GemmTuner(GemmCommonTuner):
 
         select_power = power_selection_enabled()
         columns = list(self.columns)
-        if select_power:
-            for extra in ("watts", "tflops_per_w"):
-                if extra not in columns:
-                    columns.append(extra)
+        if select_power and "watts" not in columns:
+            columns.append("watts")
         results = []
         for el in rets:
             info, us, err_ratio = el
@@ -770,9 +768,8 @@ class GemmTuner(GemmCommonTuner):
             res_one.append(tflops)
             res_one.append(bw)
             if select_power:
-                watts, tflops_per_w = power_columns(el, tflops)
+                watts, _tflops_per_w = power_columns(el, tflops)
                 res_one.append(watts)
-                res_one.append(tflops_per_w)
 
             results.append(res_one)
         gtimedf = pd.DataFrame(results, columns=columns)
@@ -803,6 +800,7 @@ class GemmTuner(GemmCommonTuner):
                 gtimedf_dic.values(),
                 ignore_index=True,
             )
+            resultsdf = self.power_metrics(resultsdf)
         else:
             resultsdf = pd.DataFrame(self.columns)
         self.save_profile(resultsdf, args.profile_file)
