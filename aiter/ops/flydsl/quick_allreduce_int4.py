@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-import ctypes
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -15,6 +15,8 @@ from flydsl.expr.typing import Float32, Int32, Int64, Stream
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.quick_allreduce_int4 import (
+    ATOMS,
+    BLOCK,
     DEFAULT_DIVISOR,
     DEFAULT_GRID_CAP,
     SUPER_TILES,
@@ -89,10 +91,45 @@ def _validate_ipc_process_group(group, *, rank: int) -> None:
         )
 
 
+@dataclass(frozen=True)
+class EngineSpec:
+    """One extra ``super_tile=1`` build for the plain all-reduce.
+
+    ``max_bytes``: the largest payload sent to it. ``wgs_per_cu``: the
+    pinned residency; ``None`` with the default geometry reuses the
+    communicator's own ``super_tile=1`` engine.
+    """
+
+    max_bytes: int
+    threads: int = BLOCK
+    tile_atoms: int = ATOMS
+    wgs_per_cu: int | None = None
+
+    @property
+    def is_default_st1(self) -> bool:
+        return (self.threads, self.tile_atoms, self.wgs_per_cu) == (BLOCK, ATOMS, None)
+
+
+_MiB = 1 << 20
+# Plain all-reduce engine plans, by (arch, world_size). Beyond the last entry
+# the default super_tile rule applies.
+DEFAULT_ENGINE_PLANS: dict[tuple[str, int], tuple[EngineSpec, ...]] = {
+    ("gfx950", 2): (
+        EngineSpec(32 * _MiB, threads=512, tile_atoms=4, wgs_per_cu=3),
+        EngineSpec(512 * _MiB),
+    ),
+    ("gfx950", 4): (
+        EngineSpec(8 * _MiB, threads=256, tile_atoms=4, wgs_per_cu=2),
+        EngineSpec(256 * _MiB, threads=512, tile_atoms=8, wgs_per_cu=2),
+    ),
+    ("gfx950", 8): (EngineSpec(256 * _MiB),),
+}
+
+
 class _StEngine:
     """One compile-time SUPER inbox + launch."""
 
-    def __init__(self, *, spec, group, rank: int, world_size: int):
+    def __init__(self, *, spec, group, rank: int, world_size: int, device):
         self.spec = spec
         self.launch = spec["launch"]
         self._norm_launch = {}
@@ -106,7 +143,9 @@ class _StEngine:
         self.wire_tile_bytes = spec["wire_tile_bytes"]
         self._peer_bases = [None] * world_size
         self._buf_ptr = None
-        self._meta_ptr = None
+        self.peer_ptrs = [0] * world_size
+        # Only this GPU reads or writes the epochs, so they need not be uncached.
+        self.colors = torch.ones(self.grid, dtype=torch.int32, device=device)
         try:
             self._buf_ptr = UncachedIpcHeap.alloc_uncached(self.buf_bytes)
             my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
@@ -114,29 +153,14 @@ class _StEngine:
                 group, (my_handle, 0)
             )
 
-            peer_ptrs = [0] * world_size
             for r in range(world_size):
                 handle, off = all_meta[r]
                 if r == rank:
-                    peer_ptrs[r] = self._buf_ptr + off
+                    self.peer_ptrs[r] = self._buf_ptr + off
                 else:
                     base = int(UncachedIpcHeap.open_mem_handle(bytes(handle)))
                     self._peer_bases[r] = base
-                    peer_ptrs[r] = base + off
-
-            peer_bytes = world_size * 8
-            color_bytes = self.grid * 4
-            self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
-            UncachedIpcHeap.copy_host_to_device(
-                self._meta_ptr,
-                (ctypes.c_int64 * world_size)(*peer_ptrs),
-                peer_bytes,
-            )
-            UncachedIpcHeap.copy_host_to_device(
-                self._meta_ptr + peer_bytes,
-                (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
-                color_bytes,
-            )
+                    self.peer_ptrs[r] = base + off
         except Exception:
             self.close()
             raise
@@ -174,12 +198,7 @@ class _StEngine:
                 except RuntimeError:
                     pass
         self._peer_bases = []
-        if self._meta_ptr:
-            try:
-                UncachedIpcHeap.free_device_mem(self._meta_ptr)
-            except RuntimeError:
-                pass
-            self._meta_ptr = None
+        self.colors = None
         if self._buf_ptr:
             try:
                 UncachedIpcHeap.free_device_mem(self._buf_ptr)
@@ -203,7 +222,14 @@ class QuickAllReduceInt4:
         world_size: int = WORLD,
         super_tile: int = 8,
         grid_cap: int | None = None,
+        engine_plan: tuple[EngineSpec, ...] | None = None,
     ):
+        """``engine_plan``: extra builds for the plain all-reduce, tried in
+        order by payload size (``EngineSpec``). ``None`` takes
+        ``DEFAULT_ENGINE_PLANS`` for this arch and world size; ``()`` keeps
+        only the default ``super_tile`` engines. Every rank must pass the
+        same plan. The fused RMSNorm calls always use the default engines.
+        """
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -243,33 +269,67 @@ class QuickAllReduceInt4:
         )
         self._latency_max_tiles = latency_max_tiles(cu_count)
 
+        if engine_plan is None:
+            engine_plan = DEFAULT_ENGINE_PLANS.get((arch, self.world_size), ())
+        self.engine_plan = tuple(engine_plan)
+        for prev, cur in zip(self.engine_plan, self.engine_plan[1:]):
+            if cur.max_bytes < prev.max_bytes:
+                raise ValueError("engine_plan must list max_bytes in increasing order")
+
+        def _shared_grid(st, resident=None):
+            grid = clamp_grid_cap(
+                cap,
+                arch=arch,
+                world_size=self.world_size,
+                super_tile=st,
+                cu_count=cu_count,
+                resident=resident,
+            )
+            shared_grid = torch.tensor(grid, dtype=torch.int64)
+            dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
+            return int(shared_grid.item())
+
+        def _engine(st, **geometry):
+            spec = make_quick_allreduce_int4_kernel(
+                world_size=self.world_size,
+                super_tile=st,
+                grid=_shared_grid(st, geometry.get("resident_wgs_per_cu")),
+                **geometry,
+            )
+            return _StEngine(
+                spec=spec,
+                group=self.group,
+                rank=self.rank,
+                world_size=self.world_size,
+                device=self.device,
+            )
+
         sts = [1]
         if self.super_tile != 1:
             sts.append(self.super_tile)
         self._by_st = {}
+        self._extra = []
+        self._plan = []
         try:
             with torch.cuda.device(self._device_index):
                 for st in sts:
-                    grid = clamp_grid_cap(
-                        cap,
-                        arch=arch,
-                        world_size=self.world_size,
-                        super_tile=st,
-                        cu_count=cu_count,
-                    )
-                    shared_grid = torch.tensor(grid, dtype=torch.int64)
-                    dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
-                    spec = make_quick_allreduce_int4_kernel(
-                        world_size=self.world_size,
-                        super_tile=st,
-                        grid=int(shared_grid.item()),
-                    )
-                    self._by_st[st] = _StEngine(
-                        spec=spec,
-                        group=self.group,
-                        rank=self.rank,
-                        world_size=self.world_size,
-                    )
+                    self._by_st[st] = _engine(st)
+                extra = {}
+                for entry in self.engine_plan:
+                    if entry.is_default_st1:
+                        eng = self._by_st[1]
+                    else:
+                        key = (entry.threads, entry.tile_atoms, entry.wgs_per_cu)
+                        if key not in extra:
+                            extra[key] = _engine(
+                                1,
+                                threads=entry.threads,
+                                tile_atoms=entry.tile_atoms,
+                                resident_wgs_per_cu=entry.wgs_per_cu,
+                            )
+                            self._extra.append(extra[key])
+                        eng = extra[key]
+                    self._plan.append((int(entry.max_bytes), eng))
         except Exception:
             self.close()
             raise
@@ -289,6 +349,16 @@ class QuickAllReduceInt4:
         if st1 is not None and num_tiles <= st1.grid:
             return 1
         return self.super_tile
+
+    def _pick_engine(self, live_bytes: int) -> _StEngine:
+        for max_bytes, eng in self._plan:
+            if live_bytes <= max_bytes:
+                return eng
+        num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
+        return self._by_st[self._pick_st(num_tiles)]
+
+    def _engines(self):
+        return list(self._by_st.values()) + list(getattr(self, "_extra", []))
 
     def _check_payload(self, inp, out) -> int:
         if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
@@ -347,9 +417,9 @@ class QuickAllReduceInt4:
             Int32(num_tiles),
             Int64(int(inp.data_ptr())),
             Int64(int(out.data_ptr())),
-            Int64(int(eng._meta_ptr)),
-            Int64(int(eng._meta_ptr + self.world_size * 8)),
+            Int64(int(eng.colors.data_ptr())),
             *(Int64(p) for p in norm_ptrs),
+            *(Int64(p) for p in eng.peer_ptrs + [0] * (WORLD - self.world_size)),
             Int32(grid_x),
             Float32(divisor),
             stream,
@@ -367,7 +437,7 @@ class QuickAllReduceInt4:
         norm_ptrs: tuple[int, ...] = (0,) * 5,
         divisor: float = DEFAULT_DIVISOR,
     ) -> None:
-        num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
+        num_tiles = max(1, (live_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
         args = self._launch_args(
             eng,
             inp,
@@ -386,15 +456,15 @@ class QuickAllReduceInt4:
             _run_compiled(eng.launch if launch is None else launch, *args)
 
     def compile(self, inp, out, stream=None) -> None:
-        """Eager-JIT every ST binary of the plain all-reduce.
+        """Eager-JIT every binary of the plain all-reduce.
 
-        Default ST=8 also builds an ST=1 engine for small payloads.
-        Every rank must call this with the same ``inp``/``out`` shape.
-        ``out`` is overwritten. The fused RMSNorm builds are compiled by
-        ``compile_rmsnorm``.
+        Default ST=8 also builds an ST=1 engine for small payloads, and
+        the engine plan adds its own builds. Every rank must call this with
+        the same ``inp``/``out`` shape. ``out`` is overwritten. The fused
+        RMSNorm builds are compiled by ``compile_rmsnorm``.
         """
         live_bytes = self._check_payload(inp, out)
-        for eng in self._by_st.values():
+        for eng in self._engines():
             self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
 
     def compile_rmsnorm(
@@ -467,9 +537,11 @@ class QuickAllReduceInt4:
             if getattr(self, "_has_launched", False):
                 torch.cuda.synchronize(self._device_index)
                 self._has_launched = False
-            for eng in engines.values():
+            for eng in self._engines():
                 eng.close()
             engines.clear()
+            self._extra = []
+            self._plan = []
 
     def __del__(self):
         try:
@@ -490,9 +562,7 @@ class QuickAllReduceInt4:
         """
         divisor = _check_divisor(divisor)
         live_bytes = self._check_payload(inp, out)
-        num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
-        st = self._pick_st(num_tiles)
-        eng = self._by_st[st]
+        eng = self._pick_engine(live_bytes)
         self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes, divisor=divisor)
 
     @staticmethod
