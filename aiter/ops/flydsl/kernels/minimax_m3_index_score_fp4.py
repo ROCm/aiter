@@ -43,6 +43,7 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -607,8 +608,6 @@ def _get(S, H, geom, device, q_fp8=False):
 def _validate_cache(k_data, k_scale, device):
     """Shapes, dtypes and strides of the two views. Contents (block ids inside
     the pool, e8m0 not 0/255) are a caller contract."""
-    import torch
-
     _validate_tensor(k_data, "k_data", (torch.uint8,), 3, device, 16, False)
     _validate_tensor(k_scale, "k_scale", (torch.uint8,), 3, device, 4, False)
     if k_data.shape[1:] != (PAGE, DATA_BYTES) or k_data.shape[0] > 0x7FFFFFFF:
@@ -653,8 +652,6 @@ def _validate_metadata(
 ):
     """Metadata only: no device reads, synchronisation or allocations. The
     fp8 scorer's `_validate_metadata` with the cache check replaced."""
-    import torch
-
     if not isinstance(S, int) or not isinstance(H, int) or S < 1 or H < 1:
         raise ValueError("S and H must be positive integers")
     device = idx_q.device
@@ -762,8 +759,6 @@ def score_flydsl_fp4(
     produces, i.e. an unscaled q8kv4 query); `q_scale` must be positive and is
     folded into the score multiplier, like `sm_scale`.
     """
-    import torch
-
     batch, geom = _validate_metadata(
         idx_q,
         k_data,
