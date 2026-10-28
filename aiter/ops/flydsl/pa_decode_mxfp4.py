@@ -10,7 +10,6 @@ MiniMax-M3 sparse path produces is served: ``query_length == 1`` (every sparse
 query is its own row with its own block table) and head_dim 128.
 """
 
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
@@ -73,7 +72,6 @@ def pa_decode_mxfp4(
     block_tables: torch.Tensor,  # [num_seqs, max_blocks_per_seq] int32
     softmax_scale: float,
     *,
-    query_scale: torch.Tensor | None = None,
     exp_sums: torch.Tensor | None = None,
     max_logits: torch.Tensor | None = None,
     temporary_output: torch.Tensor | None = None,
@@ -85,11 +83,8 @@ def pa_decode_mxfp4(
 ) -> None:
     """Decode one query token per sequence over an MXFP4 paged K/V cache.
 
-    ``query`` is float8_e4m3fn, used as stored: ``query_scale`` (a [1] float32
-    device tensor, default 1.0) is the per-tensor factor the caller divided the
-    bf16 query by, and is multiplied into the logits. A bfloat16 query takes the
-    reference path that widens K to bf16 and never rounds Q; it takes no
-    ``query_scale``.
+    ``query`` is float8_e4m3fn, used as stored (scale 1). A bfloat16 query takes
+    the reference path that widens K to bf16 and never rounds Q.
 
     Each of the four views carries its own page and head stride (bytes); data
     strides must be multiples of 16. Pages outside ``[0, pages)`` are not
@@ -147,18 +142,6 @@ def pa_decode_mxfp4(
     elem = query.element_size()
     if (query.stride(0) * elem) % 16 or (query.stride(1) * elem) % 16:
         raise ValueError("query row and head strides must be multiples of 16 bytes")
-    if query_scale is not None:
-        if not q_fp8:
-            raise ValueError("query_scale applies to a float8_e4m3fn query")
-        if (
-            not isinstance(query_scale, torch.Tensor)
-            or query_scale.dtype != torch.float32
-            or query_scale.numel() != 1
-            or query_scale.device != dev
-        ):
-            raise ValueError(
-                "query_scale must be a [1] float32 tensor on the query device"
-            )
 
     num_seqs, num_q_heads, _ = query.shape
     if k_data.dim() != 4:
@@ -286,7 +269,6 @@ def pa_decode_mxfp4(
         block_size=block_size,
         stage_pages=stage_pages,
         q_fp8=q_fp8,
-        has_q_scale=query_scale is not None,
         out_f16=output.dtype == torch.float16,
         tile_depth=tile_depth,
         direct=direct_output,
@@ -310,11 +292,6 @@ def pa_decode_mxfp4(
             ptr_arg(v_data, fx.Uint8),
             ptr_arg(v_scale, fx.Uint8),
             ptr_arg(block_tables, fx.Int32),
-            (
-                ptr_arg(query_scale, fx.Float32)
-                if query_scale is not None
-                else flyc.from_c_void_p(fx.Float32, 0)
-            ),
             ptr_arg(
                 block_tables if work_plan is None else work_plan.work_info, fx.Int32
             ),

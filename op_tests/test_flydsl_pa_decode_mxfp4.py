@@ -129,12 +129,11 @@ def ref_attention(q_f32, k_deq, v_deq, bt, ctx, scale, block_size):
     return out
 
 
-def quantize_q_fp8(q_bf16, q_scale=1.0):
-    """The writer's contract: round to the model dtype, divide by the per-tensor
-    scale, RNE-saturate to e4m3. Returns (fp8, dequantized f32 incl. the scale)."""
-    x = q_bf16.to(torch.float32) / q_scale
-    q8 = x.clamp(-Q_MAX_FP8, Q_MAX_FP8).to(torch.float8_e4m3fn)
-    return q8, q8.to(torch.float32) * q_scale
+def quantize_q_fp8(q_bf16):
+    """The writer's contract: round to the model dtype, RNE-saturate to e4m3 (scale
+    1). Returns (fp8, dequantized f32)."""
+    q8 = q_bf16.to(torch.float32).clamp(-Q_MAX_FP8, Q_MAX_FP8).to(torch.float8_e4m3fn)
+    return q8, q8.to(torch.float32)
 
 
 def rel_l2(a, b):
@@ -151,7 +150,6 @@ def run_mxfp4(
     ctx,
     scale,
     *,
-    q_scale=None,
     plan=None,
     tile_depth=DEFAULT_TILE_DEPTH,
 ):
@@ -169,7 +167,6 @@ def run_mxfp4(
         ctx,
         bt,
         scale,
-        query_scale=q_scale,
         work_plan=plan,
         tile_depth=tile_depth,
     )
@@ -241,20 +238,6 @@ def test_pa_decode_mxfp4_garbage_tail(block_size):
     ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, block_size)
     torch.cuda.synchronize()
     assert torch.isfinite(out.float()).all()
-    assert rel_l2(out.float(), ref) < 3e-3
-
-
-def test_pa_decode_mxfp4_q_scale():
-    ctx, bt, k, v, q = make_case([300, 2048, 64], 16, 128, seed=5)
-    _, kd, ks, k_deq = quantize_pages(k, 128)
-    _, vd, vs, v_deq = quantize_pages(v, 128)
-    qs = 0.25
-    q_in, q_ref = quantize_q_fp8(q, qs)
-    q_scale = torch.tensor([qs], dtype=torch.float32, device=q.device)
-    scale = HEAD_DIM**-0.5
-    out = run_mxfp4(q_in, kd, ks, vd, vs, bt, ctx, scale, q_scale=q_scale)
-    ref = ref_attention(q_ref, k_deq, v_deq, bt, ctx, scale, 128)
-    torch.cuda.synchronize()
     assert rel_l2(out.float(), ref) < 3e-3
 
 
