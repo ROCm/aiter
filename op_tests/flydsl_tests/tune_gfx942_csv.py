@@ -475,9 +475,9 @@ def screen(
 ) -> float:
     """Single screen time of a config (inf if it fails), logged to the measurement CSV."""
     key = config_key(bench.m, bench.n, bench.k, cfg)
-    if args.resume and key in logged:
-        return logged[key]
     status, err, error = bench.check(cfg)
+    if args.resume and logged.get(key, float("inf")) < float("inf") and status == "ok":
+        return logged[key]
     fly_us = bench.time(bench.runner(cfg)) if status == "ok" else None
     log_measurement(args, regime, bench, source, cfg, status, err, error, fly_us)
     logged[key] = fly_us if fly_us is not None else float("inf")
@@ -538,14 +538,22 @@ def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
         (t, i, c) for i, (t, c) in enumerate(screened.values()) if t < float("inf")
     )
 
-    finalists = [incumbent]
+    incumbent_ok = screened[config_key(m, n, k, incumbent)][0] < float("inf")
+    fallback_ok = screened[config_key(m, n, k, fallback)][0] < float("inf")
+    finalists = [incumbent] if incumbent_ok else []
+    challengers = 0
     for _, _, cfg in ranked:
-        if len(finalists) > args.finalists:
+        if challengers >= args.finalists:
             break
         if cfg not in finalists:
             finalists.append(cfg)
-    if fallback not in finalists:
+            challengers += 1
+    if fallback_ok and fallback not in finalists:
         finalists.append(fallback)
+    if not finalists:
+        print("    no correct configurations; leave table unchanged", flush=True)
+        return
+
     medians, hipb_med = bench.interleaved(finalists, args.rounds)
     for cfg, med in sorted(zip(finalists, medians), key=lambda item: item[1]):
         tag = " (incumbent)" if cfg == incumbent else ""
@@ -555,16 +563,24 @@ def tune_shape(args, regime: str, m: int, n: int, k: int, table: dict) -> None:
         )
 
     best = min(range(len(finalists)), key=lambda i: medians[i])
-    inc_med = medians[0]
-    if best != 0 and medians[best] < inc_med * (1 - args.margin):
+    if not incumbent_ok:
         winner, win_med = finalists[best], medians[best]
         print(
-            f"    PROMOTE {describe(winner)}: {inc_med:.2f} -> {win_med:.2f}us",
+            f"    REPLACE failed incumbent with {describe(winner)} "
+            f"at {win_med:.2f}us",
             flush=True,
         )
     else:
-        winner, win_med = incumbent, inc_med
-        print(f"    keep incumbent ({inc_med:.2f}us)", flush=True)
+        inc_med = medians[0]
+        if best != 0 and medians[best] < inc_med * (1 - args.margin):
+            winner, win_med = finalists[best], medians[best]
+            print(
+                f"    PROMOTE {describe(winner)}: {inc_med:.2f} -> {win_med:.2f}us",
+                flush=True,
+            )
+        else:
+            winner, win_med = incumbent, inc_med
+            print(f"    keep incumbent ({inc_med:.2f}us)", flush=True)
     if not args.dry_run:
         table[key] = table_row(key, winner, win_med, hipb_med, "tuned")
         write_table(args.table, table)
