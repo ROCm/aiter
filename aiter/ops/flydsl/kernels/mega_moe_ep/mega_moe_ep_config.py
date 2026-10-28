@@ -187,6 +187,31 @@ XCDMAP = int(os.environ.get("EP_XCDMAP", "1"))
 # Off by default: the packed-remainder CTAs (all on the last XCD) lose the per-expert L2
 # reuse and, finishing last, serially combine_send all K of their echunks.
 BAL = int(os.environ.get("EP_BAL", "0")) and ESYNC
+# NW=8 flat GEMM split (needs EP_ESYNC): each pass's nch * N_TILES n-tiles are cut into
+# nblk contiguous, equal ranges (one per CTA, XCD-major) instead of whole echunks per CTA
+# -- no idle CTAs at nch < nblk and no partial last round at nch > nblk.  An echunk split
+# across CTAs syncs through the ECNT counters; the fused combine arrives per n-tile.
+# Off by default: CTAs no longer walk an expert's n-tiles in lockstep, so the XCD's L2
+# stops sharing its weight stream (GEMM time +35% despite the better balance).
+FLAT = int(os.environ.get("EP_FLAT", "0")) and ESYNC
+# NW=8 dispatch send on all 8 waves (vs wave 0 alone while the other 7 wait at the barrier).
+# Measured neutral: the send is xGMI-bandwidth-bound, not issue-bound.
+DISPW = int(os.environ.get("EP_DISPW", "1"))
+# NW=8 dynamic tile queue (needs EP_ESYNC): XCD x owns the echunks [x*nch/8, (x+1)*nch/8)
+# and its CTAs pull single n-tiles from an XCD-local atomic counter -- all GEMM1 tiles
+# (n-tile-major, so concurrent CTAs share each expert's W tile in L2), then all GEMM2
+# tiles (each waits its echunk's N_TILES GEMM1 tiles; the echunk's last GEMM2 tile
+# arrives the combine).  No idle CTAs, no partial rounds, no gbar between the GEMMs.
+# Wins where the whole-echunk walk idles many CTAs (bs3072 -13%, bs6144 -6%); near
+# neutral at bs2048/4096, where the GEMM is bandwidth-bound and the extra CTAs only
+# slow every tile down (a static round-robin deal of the same order measured the same).
+DYNQ = int(os.environ.get("EP_DYNQ", "1")) and ESYNC
+# EP_DYNQ tile sync scope: 0 = XCD-local (an echunk's producers and consumers share the
+# XCD's L2, so drained stores + the counter suffice; a CTA whose hardware XCC is not
+# bid % N_XCD reports ERR_COMPUTE), 1 = agent-scope release/acquire per tile.
+DQF = int(os.environ.get("EP_DQF", "0"))
+QCNT = 32  # [QCNT, QCNT + N_XCD): per-XCD tile-queue counters (self-resetting)
+assert QCNT + N_XCD <= ECNT1
 
 # LDS control slots (ints at ``L_CTL``; see schedule.py). The cbar generation barrier,
 # the dynamic plan's bookkeeping and the per-CTA unit list live here.
@@ -195,8 +220,7 @@ C_NACT, C_NCH, C_PLAN, C_DYNP = 2, 3, 4, 5  # #active experts, #units, plan-read
 C_UROWS, C_USEQ, C_GEXP, C_CNT = 6, 7, 8, 9  # current unit rows / seq / gather cache
 C_S1, C_K1, C_S2, C_K2 = 6, 7, 8, 9  # NW=4 pass split: shard size / packed remainders
 C_ELAST = 10  # EP_ESYNC: old value of this CTA's last echunk-counter add (tid0 -> waves)
-# slot 11 free (slots 10-11 were the comm-band overlap's C_GREADY/C_COMM, now that combine is
-# fused into the GEMM2 epilogue -- gemm2_combine -- at P==1).
+C_QIDX = 11  # EP_DYNQ: the tile index tid0 pulled from the XCD queue (tid0 -> waves)
 C_UNIT = 12  # [C_UNIT, C_UNIT+1): this CTA's unit range [lo, hi)
 C_UL = 16  # per-CTA unit list base (records of 4 ints: expert_chunk, i0, icnt, kind)
 UL_MAX = (128 - C_UL) // 4
@@ -399,6 +423,10 @@ def kernel_config(
         + ("" if ESYNC else "_noes")
         + ("" if XCDMAP else "_nx")
         + ("_bal" if BAL and NW == 4 else "")
+        + ("_fl" if FLAT and NW == 8 else "")
+        + ("_dw0" if not DISPW and NW == 8 else "")
+        + ("" if DYNQ or NW == 4 else "_nodq")
+        + ("_dqf" if DYNQ and DQF and NW == 8 else "")
         + (f"_lim{swiglu_limit:g}" if math.isfinite(swiglu_limit) else "")
     )
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"

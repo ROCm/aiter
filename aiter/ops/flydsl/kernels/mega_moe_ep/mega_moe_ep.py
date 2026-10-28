@@ -37,6 +37,10 @@ LDS_LIMIT = 160 * 1024
 # mega_moe/mega_moe_config.INDEXED_PAYLOAD_MIN_MTPR): the receive row = rank*mtpr +
 # token is bounded by npes*mtpr, overflow-proof under any cross-rank routing skew.
 INDEXED_PAYLOAD_MIN_MTPR = 32768
+# NW=8 picks mt=8 (RG=128: each W tile serves twice the rows) over mt=4 when the
+# expected rounds x rows-per-echunk cost is lower; mt=8's per-row GEMM cost relative to
+# mt=4 (8x MI355X: e2e -7% @4096, -10% @8192, +15% @6144 where it needs 2 vs 3 rounds).
+MT8_EFF = 0.9
 
 
 def _dequant_expert(weight, scale, rows, cols):
@@ -310,6 +314,18 @@ class MegaMoeEPEngine:
     def set_weights(self, w1, w1_scale, w2, w2_scale):
         self._bind_weights(w1, w1_scale, w2, w2_scale)
 
+    def _nw8_mt(self, m):
+        # Each CTA runs whole echunks (RG rows) in rounds of n_cta, so the critical path is
+        # ceil(nch / n_cta) echunks; nch from the uniform-routing rows per local expert.
+        rows = m * self.K / self.epr
+
+        def cost(mt):
+            rg = 16 * mt
+            nch = self.epr * (rows / rg + 0.5)
+            return -(-nch // self.n_cta) * rg * (MT8_EFF if mt == 8 else 1.0)
+
+        return 8 if cost(8) < cost(4) else 4
+
     def _fit_mt(self, m, nw):
         # The V2 pipelined GEMM1 packs rows in pairs (MfmaScaleGU / AScaleLoader use
         # m_repeat//2 scale groups), so the row tile mt (=m_repeat) must be EVEN.
@@ -318,11 +334,15 @@ class MegaMoeEPEngine:
         # NCHA LDS chunk table -- otherwise the chunk table overflows past L_EOFF into
         # L_CTL and corrupts the compute-wave cbar slots (a 2^24-chunk hang).
         # NW=8 inline-A GEMM stages A with all NT=512 threads (16 B/thread), so the A tile
-        # RG*A_K_STEP must be >= 512*16 = 8192 B, i.e. RG>=64 -> mt>=4.  Force mt=4 (the
-        # high-bs value anyway; low bs just pads to 64 rows, still correct).
-        mt = 4 if nw == 8 else (2 if m <= 512 else 4)
+        # RG*A_K_STEP must be >= 512*16 = 8192 B, i.e. RG>=64 -> mt>=4 (low bs just pads
+        # to 64 rows, still correct); mt=8 where _nw8_mt's round model favours it.
+        mt = self._nw8_mt(m) if nw == 8 else (2 if m <= 512 else 4)
         mt = int(os.environ.get("EP_MT", mt))
-        while mt > 2:
+        # NW=8 a4: the RG x 128 B A tile is staged as 512 threads x 16 B -> mt % 4 == 0
+        if nw == 8 and not self.a8 and mt % 4:
+            raise ValueError(f"NW=8 a4 needs mt % 4 == 0, got mt={mt}")
+        step = 4 if nw == 8 else 2
+        while mt > step:
             if (
                 mega_moe_ep_consts(
                     self.H, self.I, mt, self.epr, self.mtpr * self.world_size, self.a8, nw
@@ -330,7 +350,7 @@ class MegaMoeEPEngine:
                 <= LDS_LIMIT
             ):
                 break
-            mt -= 2
+            mt -= step
         return mt
 
     def config(self, m):

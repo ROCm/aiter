@@ -130,6 +130,9 @@ def build_communication(kc: KernelCtx) -> dict:
     PART_RB = H + H // 8  # combine ``part`` row bytes: H fp8-e4m3 then H/8 per-8 E8M0 scale
     SENTINEL = EPR  # recv_le empty-slot marker (masked by the planner: >= EPR)
     NW, NT, NTT = kc.get("NW NT NTT")  # per-launch warp-spec width (not the module globals)
+    # combine arrivals count GEMM2 n-tiles: a row is done once all H // TILE_N of its
+    # n-tiles landed (EP_FLAT splits one echunk's n-tiles across CTAs).
+    COMB_W = H // kc.get("TILE_N")[0]
 
     # --- arena addressing --------------------------------------------------------
     def ctrl_at(a, idx):
@@ -290,124 +293,140 @@ def build_communication(kc: KernelCtx) -> dict:
         # in-flight sentinel can land AFTER a peer's post-barrier dispatch write and clobber it.
         wait_vm(0)
 
-    @flyc.jit
-    def dispatch_send(L, lane, a):
-        """One wave: scatter each local (token, route) to its expert-owner rank's arena,
-        indexed by ``source_key = rank*mtpr + token`` (bounded by npes*mtpr,
-        overflow-proof). The top-k weights stay at the source (applied in combine_final).
+    def _make_dispatch_send(nwv):
+        """``nwv`` waves of a CTA share the send (wave w of CTA b is virtual sender
+        b*nwv + w of nblk*nwv); the CTA still arrives once per phase, after a block barrier
+        (nwv > 1 needs all NT threads to call it; nwv == 1 takes the wave's lane as tid)."""
 
-        Two phases so dispatch overlaps GEMM1: PASS A scatters only the tiny routing
-        (recv_le, 1 int/route) + signals ``dispatch_arrive_meta`` -- the owner then plans
-        (pre_pos / dyn_plan / gather, all routing-only) while PASS B's big payload a2a is
-        still in flight. PASS B scatters the activation + scale and signals the full
-        ``dispatch_arrive`` (payload ready) that GEMM1 waits on. Each phase is an
-        all-to-all barrier (npes*nblk arrivals per owner)."""
-        m, mtpr, rank, epr, npes = a["m"], a["mtpr"], a["rank"], a["epr"], a["npes"]
-        parity = a["epoch"] & i32(1)
-        nblk = i32(gpu.grid_dim.x)
-        rids = rsrc(a["ids"], m * i32(TOPK) * i32(4))
-        rx = rsrc(a["x"])
-        rxs = rsrc(a["xs"])
-        bid = i32(gpu.block_id("x"))
-        # PASS A -- routing only (recv_le, 1 int/route): one (token, route) per LANE, so a
-        # wave keeps 64 remote stores in flight per step.  The buffer resource must be
-        # wave-uniform (rsrc readfirstlanes the base), so each lane's store is issued under
-        # the static owner loop ``owner == p``.
-        r_recv = [peer_rs(a, i32(p), "off_recv") for p in range(MAX_NPES)]
-        for wk_ in range(bid * i32(64) + lane, m * i32(TOPK), nblk * i32(64)):
-            wk = i32(wk_)
-            t = wk // i32(TOPK)
-            r = wk - t * i32(TOPK)
-            e = fx.Int32(bld(rids, wk * i32(4), 0, T.i32, 0))
-            valid = (e >= i32(0)) & (e < i32(E))
-            owner = e // epr
-            slot = ((rank * mtpr + t) * i32(TOPK) + r) * i32(4)
-            for p in range_constexpr(MAX_NPES):
-                if valid & (owner == i32(p)):
-                    bst(e - owner * epr, r_recv[p], slot, 0, AUX_SYS)
-            if valid == fx.Boolean(False):
-                # dropped/invalid route: this rank is the source, so pre-count it into
-                # this rank's single combine counter now -- combine_send only arrives for
-                # valid routes later, and combine_wait expects m*TOPK total.
-                combine_arrive(a, rank, parity, i32(0), i32(1), m * i32(TOPK))
-        wait_vm(0)  # drain routing stores before signalling META-ready
-        if lane == i32(0):
-            for p in range_constexpr(MAX_NPES):
-                if i32(p) < npes:
-                    dispatch_arrive_meta(a, i32(p), parity, i32(0), i32(1), npes * nblk)
-        # PASS B -- the activation payload + E8M0 scale (the bulk of the a2a).  Iterate per
-        # TOKEN (not per token-route) and DEDUP owner ranks across the token's TOPK routes:
-        # the payload destination is source_key=rank*mtpr+t (per token, NOT per expert), so
-        # two routes to experts on the SAME owner would scatter the identical payload to the
-        # identical slot twice.  Sending once per (token, owner) cuts the payload a2a traffic
-        # ~45% (TOPK=6 routes -> ~3.3 unique owners @ world=4).  ``seen`` is a per-token
-        # npes-bit mask; it is updated UNCONDITIONALLY (bit=0 for invalid routes, so no
-        # pollution) to avoid a conditional-reassignment scf tangle.
-        #
-        # Load/store batching: gfx9's vmcnt counts loads AND stores in issue order, so a
-        # load issued after a remote (sc0 sc1) store waits for that store's xGMI round
-        # trip.  Each step therefore issues ALL loads of DISP_TB tokens (ids, payload row,
-        # scale; out-of-range tokens load a clamped row and skip the stores) up front,
-        # waits once, then issues the stores to every owner with no wait in between --
-        # one round-trip wait per step instead of one per 16-B chunk per owner.
-        NJ = (N_VEC + 63) // 64
-        NS = (SCALE_I32 + 63) // 64
-        for t0_ in range(bid, m, nblk * i32(DISP_TB)):
-            t0 = i32(t0_)
-            toks, ids, rows, scs = [], [], [], []
-            for k in range_constexpr(DISP_TB):
-                t = t0 + i32(k) * nblk
-                tc = fx.min(t, m - i32(1))
-                toks.append(t)
-                ids.append([
-                    fx.Int32(bld(rids, (tc * i32(TOPK) + i32(r)) * i32(4), 0, T.i32, 0))
-                    for r in range(TOPK)
-                ])
-                rows.append([
-                    bld(rx, tc * i32(ROW_BYTES)
-                        + fx.min(lane + i32(j * 64), i32(N_VEC - 1)) * i32(16), 0, V4I, 0)
-                    for j in range(NJ)
-                ])
-                scs.append([
-                    bld(rxs, (tc * i32(SCALE_I32)
-                              + fx.min(lane + i32(j * 64), i32(SCALE_I32 - 1))) * i32(4),
-                        0, T.i32, 0)
-                    for j in range(NS)
-                ])
-            # explicit drain: past the per-owner branches the waitcnt pass can't count the
-            # stores issued and would insert partial waits that block on remote stores.
+        @flyc.jit
+        def _dispatch_send(L, tid, a):
+            """Scatter each local (token, route) to its expert-owner rank's arena,
+            indexed by ``source_key = rank*mtpr + token`` (bounded by npes*mtpr,
+            overflow-proof). The top-k weights stay at the source (applied in combine_final).
+
+            Two phases so dispatch overlaps GEMM1: PASS A scatters only the tiny routing
+            (recv_le, 1 int/route) + signals ``dispatch_arrive_meta`` -- the owner then plans
+            (pre_pos / dyn_plan / gather, all routing-only) while PASS B's big payload a2a is
+            still in flight. PASS B scatters the activation + scale and signals the full
+            ``dispatch_arrive`` (payload ready) that GEMM1 waits on. Each phase is an
+            all-to-all barrier (npes*nblk arrivals per owner)."""
+            m, mtpr, rank, epr, npes = a["m"], a["mtpr"], a["rank"], a["epr"], a["npes"]
+            parity = a["epoch"] & i32(1)
+            nblk = i32(gpu.grid_dim.x)
+            rids = rsrc(a["ids"], m * i32(TOPK) * i32(4))
+            rx = rsrc(a["x"])
+            rxs = rsrc(a["xs"])
+            lane = tid % i32(64)
+            sid = i32(gpu.block_id("x")) * i32(nwv) + tid // i32(64)  # virtual sender
+            nsnd = nblk * i32(nwv)
+            # PASS A -- routing only (recv_le, 1 int/route): one (token, route) per LANE, so a
+            # wave keeps 64 remote stores in flight per step.  The buffer resource must be
+            # wave-uniform (rsrc readfirstlanes the base), so each lane's store is issued under
+            # the static owner loop ``owner == p``.
+            r_recv = [peer_rs(a, i32(p), "off_recv") for p in range(MAX_NPES)]
+            for wk_ in range(sid * i32(64) + lane, m * i32(TOPK), nsnd * i32(64)):
+                wk = i32(wk_)
+                t = wk // i32(TOPK)
+                r = wk - t * i32(TOPK)
+                e = fx.Int32(bld(rids, wk * i32(4), 0, T.i32, 0))
+                valid = (e >= i32(0)) & (e < i32(E))
+                owner = e // epr
+                slot = ((rank * mtpr + t) * i32(TOPK) + r) * i32(4)
+                for p in range_constexpr(MAX_NPES):
+                    if valid & (owner == i32(p)):
+                        bst(e - owner * epr, r_recv[p], slot, 0, AUX_SYS)
+                if valid == fx.Boolean(False):
+                    # dropped/invalid route: this rank is the source, so pre-count it into
+                    # this rank's single combine counter now -- combine_send only arrives for
+                    # valid routes later, and combine_wait expects m*TOPK total.
+                    combine_arrive(a, rank, parity, i32(0), i32(COMB_W), m * i32(TOPK * COMB_W))
+            wait_vm(0)  # drain routing stores before signalling META-ready
+            if const_expr(nwv > 1):
+                gpu.barrier()  # every wave's stores drained before the CTA arrives
+            if tid == i32(0):
+                for p in range_constexpr(MAX_NPES):
+                    if i32(p) < npes:
+                        dispatch_arrive_meta(a, i32(p), parity, i32(0), i32(1), npes * nblk)
+            # PASS B -- the activation payload + E8M0 scale (the bulk of the a2a).  Iterate per
+            # TOKEN (not per token-route) and DEDUP owner ranks across the token's TOPK routes:
+            # the payload destination is source_key=rank*mtpr+t (per token, NOT per expert), so
+            # two routes to experts on the SAME owner would scatter the identical payload to the
+            # identical slot twice.  Sending once per (token, owner) cuts the payload a2a traffic
+            # ~45% (TOPK=6 routes -> ~3.3 unique owners @ world=4).  ``seen`` is a per-token
+            # npes-bit mask; it is updated UNCONDITIONALLY (bit=0 for invalid routes, so no
+            # pollution) to avoid a conditional-reassignment scf tangle.
+            #
+            # Load/store batching: gfx9's vmcnt counts loads AND stores in issue order, so a
+            # load issued after a remote (sc0 sc1) store waits for that store's xGMI round
+            # trip.  Each step therefore issues ALL loads of DISP_TB tokens (ids, payload row,
+            # scale; out-of-range tokens load a clamped row and skip the stores) up front,
+            # waits once, then issues the stores to every owner with no wait in between --
+            # one round-trip wait per step instead of one per 16-B chunk per owner.
+            NJ = (N_VEC + 63) // 64
+            NS = (SCALE_I32 + 63) // 64
+            for t0_ in range(sid, m, nsnd * i32(DISP_TB)):
+                t0 = i32(t0_)
+                toks, ids, rows, scs = [], [], [], []
+                for k in range_constexpr(DISP_TB):
+                    t = t0 + i32(k) * nsnd
+                    tc = fx.min(t, m - i32(1))
+                    toks.append(t)
+                    ids.append([
+                        fx.Int32(bld(rids, (tc * i32(TOPK) + i32(r)) * i32(4), 0, T.i32, 0))
+                        for r in range(TOPK)
+                    ])
+                    rows.append([
+                        bld(rx, tc * i32(ROW_BYTES)
+                            + fx.min(lane + i32(j * 64), i32(N_VEC - 1)) * i32(16), 0, V4I, 0)
+                        for j in range(NJ)
+                    ])
+                    scs.append([
+                        bld(rxs, (tc * i32(SCALE_I32)
+                                  + fx.min(lane + i32(j * 64), i32(SCALE_I32 - 1))) * i32(4),
+                            0, T.i32, 0)
+                        for j in range(NS)
+                    ])
+                # explicit drain: past the per-owner branches the waitcnt pass can't count the
+                # stores issued and would insert partial waits that block on remote stores.
+                wait_vm(0)
+                for k in range_constexpr(DISP_TB):
+                    t = toks[k]
+                    if t < m:
+                        source_key = rank * mtpr + t
+                        seen = i32(0)
+                        for r in range_constexpr(TOPK):
+                            e = ids[k][r]
+                            valid = (e >= i32(0)) & (e < i32(E))
+                            owner = e // epr
+                            bit = valid.select(i32(1) << (owner & i32(7)), i32(0))  # &7: shift-safe
+                            do_send = valid & ((seen & bit) == i32(0))  # valid, owner not yet sent
+                            seen = seen | bit
+                            if do_send:
+                                dpay = peer_rs(a, owner, "off_payload")
+                                dsc = peer_rs(a, owner, "off_pscale")
+                                for j in range_constexpr(NJ):
+                                    u = lane + i32(j * 64)
+                                    if u < i32(N_VEC):
+                                        bst(rows[k][j], dpay,
+                                            source_key * i32(ROW_BYTES) + u * i32(16), 0, AUX_SYS)
+                                for j in range_constexpr(NS):
+                                    u = lane + i32(j * 64)
+                                    if u < i32(SCALE_I32):
+                                        bst(scs[k][j], dsc,
+                                            (source_key * i32(SCALE_I32) + u) * i32(4), 0, AUX_SYS)
             wait_vm(0)
-            for k in range_constexpr(DISP_TB):
-                t = toks[k]
-                if t < m:
-                    source_key = rank * mtpr + t
-                    seen = i32(0)
-                    for r in range_constexpr(TOPK):
-                        e = ids[k][r]
-                        valid = (e >= i32(0)) & (e < i32(E))
-                        owner = e // epr
-                        bit = valid.select(i32(1) << (owner & i32(7)), i32(0))  # &7: shift-safe
-                        do_send = valid & ((seen & bit) == i32(0))  # valid, owner not yet sent
-                        seen = seen | bit
-                        if do_send:
-                            dpay = peer_rs(a, owner, "off_payload")
-                            dsc = peer_rs(a, owner, "off_pscale")
-                            for j in range_constexpr(NJ):
-                                u = lane + i32(j * 64)
-                                if u < i32(N_VEC):
-                                    bst(rows[k][j], dpay,
-                                        source_key * i32(ROW_BYTES) + u * i32(16), 0, AUX_SYS)
-                            for j in range_constexpr(NS):
-                                u = lane + i32(j * 64)
-                                if u < i32(SCALE_I32):
-                                    bst(scs[k][j], dsc,
-                                        (source_key * i32(SCALE_I32) + u) * i32(4), 0, AUX_SYS)
-        wait_vm(0)
-        if lane == i32(0):
-            for p in range_constexpr(MAX_NPES):
-                if i32(p) < npes:
-                    # one arrival per (sender rank, CTA): owner stamps at npes*nblk.
-                    dispatch_arrive(a, i32(p), parity, i32(0), i32(1), npes * nblk)
+            if const_expr(nwv > 1):
+                gpu.barrier()
+            if tid == i32(0):
+                for p in range_constexpr(MAX_NPES):
+                    if i32(p) < npes:
+                        # one arrival per (sender rank, CTA): owner stamps at npes*nblk.
+                        dispatch_arrive(a, i32(p), parity, i32(0), i32(1), npes * nblk)
+
+        return _dispatch_send
+
+    dispatch_send = _make_dispatch_send(1)  # NW=4: the dispatch band's one wave
+    dispatch_send_all = _make_dispatch_send(NW)  # NW=8 (EP_DISPW): all waves of the CTA
 
     # --- combine (GEMM2 epilog scatter back to source + source-side weighted sum) --
     @flyc.jit
@@ -449,7 +468,7 @@ def build_communication(kc: KernelCtx) -> dict:
                 bst(fx.Int32(w1), dpart, prow + g * i32(8) + i32(4), 0, AUX_SYS)
                 bst(fx.Int32(e8m0).to(fx.Int8), dpart, prow + i32(H) + g, 0, AUX_SYS)
             if lane == i32(0):
-                combine_arrive(a, src_rank, parity, i32(0), i32(1), m * i32(TOPK))
+                combine_arrive(a, src_rank, parity, i32(0), i32(COMB_W), m * i32(TOPK * COMB_W))
         wait_vm(0)
 
     @flyc.jit

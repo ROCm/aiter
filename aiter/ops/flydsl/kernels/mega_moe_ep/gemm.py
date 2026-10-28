@@ -665,7 +665,7 @@ def build_gemm(kc: KernelCtx) -> dict:
 
     # ===================== NW=8 inline-A GEMM1 (serial-comm path) =================
     @flyc.jit
-    def gemm1_nw8(L, tid, a, expert, e, s, P):
+    def gemm1_nw8(L, tid, a, expert, e, nt_lo, nt_hi):
         """Inline-A GEMM1 for the all-8-waves (NW=8) path: with no dedicated A-loader wave,
         the compute waves stage each A K-tile into a 2-bank LDS double-buffer THEMSELVES
         (``ATileLoader`` with ``total_threads=NT=512``) and read it back via ``AS2RLoader``,
@@ -706,8 +706,6 @@ def build_gemm(kc: KernelCtx) -> dict:
         r_inters = rsrc(a["inters"])
         wave_id = tid // i32(64)
         tib = e * i32(RG)
-        nt_lo = s * i32(N_TILES) // P
-        nt_hi = (s + i32(1)) * i32(N_TILES) // P
         a_gather.for_tile(tib)
         gpu.barrier()
         a_scale.stage(a_scale_lds, tib)
@@ -1094,11 +1092,11 @@ def build_gemm(kc: KernelCtx) -> dict:
         wait_vm(0)  # drain the fused part stores before signalling the sources
         parity = a["epoch"] & i32(1)
         mt = a["mtpr"]
-        exp = a["m"] * i32(TOPK)
+        exp = a["m"] * i32(TOPK * N_TILES2)
         for k_ in range(tid, rows, i32(NT)):
             k = i32(k_)
             idx = fx.Int32(bld(rsrc(a["rowidx"]), (e * i32(RG) + k) * i32(4), 0, T.i32, 0))
-            combine_arrive(a, (idx // i32(TOPK)) // mt, parity, i32(0), i32(1), exp)
+            combine_arrive(a, (idx // i32(TOPK)) // mt, parity, i32(0), i32(N_TILES2), exp)
 
     @flyc.jit
     def _gemm2_naive(L, tid, a, expert, rows, src_out):
@@ -1216,10 +1214,8 @@ def build_gemm(kc: KernelCtx) -> dict:
         return _run_ntile
 
     @flyc.jit
-    def gemm2_pipe_nw8(L, tid, a, expert, e, s, P, src_out):
+    def gemm2_pipe_nw8(L, tid, a, expert, e, nt_lo, nt_hi, src_out):
         """NW=8 GEMM2 -> bf16 gout (P>1 n-tile shard).  Inline-A; gout epilogue."""
-        nt_lo = s * i32(N_TILES2) // P
-        nt_hi = (s + i32(1)) * i32(N_TILES2) // P
         run_ntile = _gemm2_core_nw8(
             L, tid, a, expert, e,
             lambda acc, nt, cptr: _epilogue_g2(L, tid, acc, nt, cptr, src_out, e),
@@ -1228,23 +1224,35 @@ def build_gemm(kc: KernelCtx) -> dict:
             run_ntile(i32(nt_))
 
     @flyc.jit
-    def gemm2_combine_nw8(L, tid, a, expert, e, rows):
-        """NW=8 GEMM2 (P==1) with fused combine: inline-A, scatter each row's bf16 output
-        straight to its source ``part`` (no gout), then drain + per-row combine_arrive."""
+    def gemm2_scatter_nw8(L, tid, a, expert, e, rows, nt_lo, nt_hi):
+        """NW=8 GEMM2 over n-tiles [nt_lo, nt_hi): inline-A, scatter each row's bf16
+        output slice straight to its source ``part`` (no gout), then drain the stores."""
         run_ntile = _gemm2_core_nw8(
             L, tid, a, expert, e,
             lambda acc, nt, cptr: _epilogue_g2_combine(L, tid, acc, nt, cptr, a, e, rows),
         )
-        for nt_ in range(i32(0), i32(N_TILES2), i32(1)):
+        for nt_ in range(nt_lo, nt_hi, i32(1)):
             run_ntile(i32(nt_))
-        wait_vm(0)  # drain the fused part stores before signalling the sources
+        wait_vm(0)
+
+    @flyc.jit
+    def comb_arrive_rows(tid, a, e, rows, ntiles):
+        """Signal each of echunk ``e``'s ``rows`` rows' source that ``ntiles`` n-tiles of
+        its part landed (the stores must already be drained)."""
         parity = a["epoch"] & i32(1)
         mt = a["mtpr"]
-        exp = a["m"] * i32(TOPK)
+        exp = a["m"] * i32(TOPK * N_TILES2)
         for k_ in range(tid, rows, i32(NT)):
             k = i32(k_)
             idx = fx.Int32(bld(rsrc(a["rowidx"]), (e * i32(RG) + k) * i32(4), 0, T.i32, 0))
-            combine_arrive(a, (idx // i32(TOPK)) // mt, parity, i32(0), i32(1), exp)
+            combine_arrive(a, (idx // i32(TOPK)) // mt, parity, i32(0), ntiles, exp)
+
+    @flyc.jit
+    def gemm2_combine_nw8(L, tid, a, expert, e, rows, nt_lo, nt_hi):
+        """NW=8 GEMM2 with fused combine over n-tiles [nt_lo, nt_hi): scatter, then the
+        per-row combine_arrive of the slice's n-tile count."""
+        gemm2_scatter_nw8(L, tid, a, expert, e, rows, nt_lo, nt_hi)
+        comb_arrive_rows(tid, a, e, rows, nt_hi - nt_lo)
 
     # Select the pipelined GEMM2 (the naive path is kept as a fallback for debugging).
     gemm2 = gemm2_pipe
