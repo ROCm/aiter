@@ -113,6 +113,10 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
 _FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
 _FUSED_DECODE_SORT_QUANT_MAX_M = 128
+# (num_experts, topk) pairs where the Triton single-launch sort was measured
+# faster than the Opus sort, up to _SMALL_SORT_MAX_M tokens (gfx950).
+_SMALL_SORT_ROUTES = {(128, 4)}
+_SMALL_SORT_MAX_M = 224
 
 # Internal benchmark/test hook (not a public switch): set True to force the
 # generic sort+quant path so base-vs-head latency can be measured from one
@@ -648,7 +652,35 @@ def _moe_sorting_impl(
         )
         aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
-    if use_opus:
+    if (
+        use_opus
+        and dispatch_policy == 0
+        and not output_aux
+        and not return_local_topk_ids
+        and expert_mask is None
+        and num_local_tokens is None
+        and 0 < M <= _SMALL_SORT_MAX_M
+        and (num_experts, topk) in _SMALL_SORT_ROUTES
+        and topk_ids.dtype == dtypes.i32
+        and topk_weights.dtype == dtypes.fp32
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and moe_buf.is_contiguous()
+    ):
+        from aiter.ops.triton.moe.moe_sort_small import moe_sort_small
+
+        moe_sort_small(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            int(block_size),
+        )
+    elif use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
             M, num_experts, topk, dispatch_policy, topk_ids.get_device()
         )
@@ -1417,6 +1449,14 @@ def fused_moe_(
     )
 
 
+def _uses_cktile_splitk(metadata) -> bool:
+    stage1 = metadata.stage1
+    return (
+        getattr(stage1, "func", None) is cktile_moe_stage1
+        and int(stage1.keywords.get("split_k", 1)) > 1
+    )
+
+
 def _fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1879,6 +1919,29 @@ def _fused_moe_impl(
         )
         local_topk_ids = None
     else:
+        sort_output = None if metadata.flat else output
+        moe_out_view = None
+        if (
+            sort_output is None
+            and not metadata.flat
+            and not runtime_stage2_reduce
+            and not _USE_CK_MOE_SORTING
+            and not _USE_FLYDSL_MOE_SORTING
+            and _uses_cktile_splitk(metadata)
+        ):
+            # One buffer holds the stage-2 output and the stage-1 split-k
+            # workspace, so the sort kernel zeroes both in a single pass.
+            n1 = w1.shape[1]
+            zero_buf = torch.empty(
+                (M, model_dim + topk * n1), dtype=dtype, device=topk_ids.device
+            )
+            flat_buf = zero_buf.view(-1)
+            sort_output = zero_buf
+            moe_out_view = flat_buf[: M * model_dim].view(M, model_dim)
+            _stage1_extra_args = {
+                **(_stage1_extra_args or {}),
+                "splitk_workspace": flat_buf[M * model_dim :].view(M * topk, n1),
+            }
         sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
@@ -1892,8 +1955,10 @@ def _fused_moe_impl(
             return_local_topk_ids=need_local_topk_ids,
             accumulate=not runtime_stage2_reduce,
             flat=metadata.flat,
-            output=None if metadata.flat else output,
+            output=sort_output,
         )
+        if moe_out_view is not None:
+            sorting_ret = (*sorting_ret[:4], moe_out_view, *sorting_ret[5:])
         if need_local_topk_ids:
             (
                 sorted_ids,
@@ -5567,6 +5632,7 @@ def cktile_moe_stage1(
     dtype=torch.bfloat16,
     kernel_name="",
     post_activation_layout="auto",
+    splitk_workspace=None,
 ):
     token_num = hidden_states.shape[0]
     _, _n1, k1 = w1.shape
@@ -5589,7 +5655,9 @@ def cktile_moe_stage1(
     # Split-k reduces into a token-topk workspace and applies activation after
     # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
     workspace_rows = token_num * topk
-    if needs_post_activation:
+    if needs_post_activation and splitk_workspace is not None:
+        tmp_out = splitk_workspace
+    elif needs_post_activation:
         tmp_out = torch.zeros(
             (workspace_rows, w1.shape[1]), dtype=dtype, device=out.device
         )
