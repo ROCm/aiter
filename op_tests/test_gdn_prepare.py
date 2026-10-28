@@ -413,6 +413,10 @@ def _check_prepare_outputs(name, ref, out, b, shape):
 @torch.no_grad()
 def test_gdn_prepare_merge_precision():
     """Correlated keys expose precision lost in off-diagonal inverse merges."""
+    if get_gfx() not in SUPPORTED_GFX:
+        import pytest
+
+        pytest.skip("FlyDSL GDN prepare requires gfx942 or gfx950")
     for hg, h in ((8, 24), (4, 12)):
         shape = GDNShape(t=BT, hg=hg, h=h)
         gen = torch.Generator(device="cuda").manual_seed(2026)
