@@ -1793,10 +1793,10 @@ def launch_splitk_reduce(
     )
 
 
+# launch_splitk_reduce is re-wrapped in _reduce_exe(); set the hint there.
 for _jit in (
     _launch_gemm_impl,
     launch_gemm,
     launch_gemm_fused,
-    launch_splitk_reduce,
 ):
     set_slp_vectorize_once_used(_jit, False)
