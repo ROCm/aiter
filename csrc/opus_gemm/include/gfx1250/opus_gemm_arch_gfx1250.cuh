@@ -42,30 +42,31 @@ namespace opus_gfx1250_detail
 {
 struct OpusA16W16KidEntry
 {
-    int kid;
+    std::pair<int, int> kid;
     OpusA16W16Kernel func;
 };
 
 struct OpusA16W16WorkspaceKidEntry
 {
-    int kid;
+    std::pair<int, int> kid;
     OpusA16W16WorkspaceKernel func;
 };
 
 template <typename Kernel>
 struct OpusA8W8KidEntry
 {
-    int kid;
+    std::pair<int, int> kid;
     Kernel func;
 };
 
 template <typename Entry, size_t Size>
 inline const Entry* find_kid(const std::array<Entry, Size>& entries, int kid)
 {
+    const auto key = std::make_pair(opus_get_arch_info().cu_num, kid);
     const auto it = std::lower_bound(
-        entries.begin(), entries.end(), kid,
-        [](const Entry& entry, int value) { return entry.kid < value; });
-    return it != entries.end() && it->kid == kid ? &*it : nullptr;
+        entries.begin(), entries.end(), key,
+        [](const Entry& entry, std::pair<int, int> value) { return entry.kid < value; });
+    return it != entries.end() && it->kid == key ? &*it : nullptr;
 }
 
 inline const OpusA16W16WorkspaceKidEntry* workspace_entry(int kid)
