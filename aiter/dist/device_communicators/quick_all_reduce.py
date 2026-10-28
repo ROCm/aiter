@@ -226,7 +226,7 @@ class QuickAllReduce:
         and compile the binaries the policy routes to them before any graph
         capture begins.
 
-        Every rank that gets here votes on its plan before any engine collective. 
+        Every rank that gets here votes on its plan before any engine collective.
         A rank that declines alone cannot leave its peers waiting."""
 
         plan = self._fly_backend_plan()
@@ -310,7 +310,7 @@ class QuickAllReduce:
     def _fly_backend_plan(self) -> dict | str:
         """This rank's inputs to the FlyDSL mesh/ring build, or why it declines.
 
-        Local to this rank: it reads the environment and the host, which may differ 
+        Local to this rank: it reads the environment and the host, which may differ
         between ranks.
         """
 

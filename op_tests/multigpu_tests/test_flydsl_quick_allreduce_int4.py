@@ -373,8 +373,8 @@ def _ladder(algorithm: str, world_size: int, link: str) -> tuple:
 
 def _ships(world_size: int, algorithm: str, link: str) -> bool:
     """Whether production has a ladder for algorithm at world_size on this
-    host. A schedule without one is never built, so nothing that runs the 
-    shipped ladder sweeps it. The pinned-ladder transport cases still run its 
+    host. A schedule without one is never built, so nothing that runs the
+    shipped ladder sweeps it. The pinned-ladder transport cases still run its
     kernel."""
     table = fly_policy.LADDERS[fly_policy.AllReduceAlgorithm(algorithm)]
     return (ARCH, link, int(world_size)) in table

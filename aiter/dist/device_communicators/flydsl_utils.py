@@ -73,7 +73,7 @@ def preload_fly_engines(engines) -> None:
     assigns only to payloads outside that range are left alone: they never run.
 
     Otherwise FlyDSL would compile a binary, JIT its host wrapper, and load its
-    HIP module on its first launch. The kernels take the payload size at runtime, 
+    HIP module on its first launch. The kernels take the payload size at runtime,
     so one preload per binary covers every size.
     """
 

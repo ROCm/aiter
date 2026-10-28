@@ -1235,7 +1235,7 @@ class CustomAllreduce:
         Not built at all when ``custom_all_reduce`` would not route any payload
         to it.
 
-        Every rank that gets here votes on its plan before any engine collective. 
+        Every rank that gets here votes on its plan before any engine collective.
         Hence, a rank that declines cannot leave its peers waiting."""
 
         if self.disabled:
@@ -1315,7 +1315,7 @@ class CustomAllreduce:
     def _fly_oneshot_plan(self) -> dict | str:
         """This rank's inputs to the FlyDSL one-shot build, or why it declines.
 
-        Local to this rank,: it reads the environment and the host, which may 
+        Local to this rank,: it reads the environment and the host, which may
         differ between ranks.
         """
 

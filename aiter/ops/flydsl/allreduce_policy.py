@@ -442,8 +442,8 @@ def _override(window: Window | None, lo, hi) -> Window | None:
 def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
     """*policy* with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` overrides.
 
-    An override can move a window and enable an algorithm, but only where 
-    the algorithm has a ladder for the platform. Elsewhere the override is 
+    An override can move a window and enable an algorithm, but only where
+    the algorithm has a ladder for the platform. Elsewhere the override is
     ignored.
     """
 
