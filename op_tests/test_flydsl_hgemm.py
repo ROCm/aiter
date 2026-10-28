@@ -39,6 +39,29 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 SEED = 0
 
+_GFX942_MNK = [
+    (1, 384, 10240),
+    (4, 384, 10240),
+    (512, 384, 10240),
+    (1024, 384, 10240),
+    (2048, 384, 10240),
+    (8192, 384, 10240),
+    (1, 10240, 320),
+    (4, 10240, 320),
+    (512, 10240, 320),
+    (2048, 10240, 320),
+    (8192, 10240, 320),
+    (1, 4096, 4096),
+    (4096, 4096, 4096),
+    (8192, 8192, 8192),
+    (100, 384, 10240),
+    (1000, 10240, 320),
+    (4095, 4096, 4096),
+    (1024, 336, 10240),
+    (4096, 336, 10240),
+    (1000, 336, 10240),
+]
+
 # (m, n, k, block_m, block_n, block_k, stages, split_k, m_waves, n_waves, k_waves,
 #  group_m, hti)
 _TUNED = [
@@ -261,27 +284,10 @@ def test_hgemm_gfx942_mainloop(pipeline, ks_begin):
     """Reusable gfx942 main loop in the fused scaled-A test kernel."""
     from flydsl_tests.gfx942_gemm_oracle import error_ratio
     from flydsl_tests.test_gemm_a16w16_gfx942_mainloop import (
-        PIPELINES,
-        _scaled_a_gemm,
-        make_gemm_a16w16_gfx942_param,
+        prepare_gfx942_mainloop_case,
     )
 
-    m, n, k = 200, 128, 1024
-    torch.manual_seed(SEED)
-    a = (torch.randn(m, k, device="cuda") * k**-0.5).to(torch.bfloat16)
-    w = (torch.randn(n, k, device="cuda") * k**-0.5).to(torch.bfloat16)
-    idx = torch.arange(m, device="cuda")[:, None] + torch.arange(k, device="cuda")
-    scale = torch.where(idx % 3 == 0, 2.0, 1.0)
-    ref = (a.float() * scale)[:, ks_begin:] @ w.float()[:, ks_begin:].t()
-    out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
-    param = make_gemm_a16w16_gfx942_param(
-        block_m=64, block_n=64, direct_store=True, **PIPELINES[pipeline]
-    )
-
-    def run_mainloop():
-        _scaled_a_gemm(out, a, w.t(), ks_begin, param)
-        return out
-
+    run_mainloop, ref, (m, n, k) = prepare_gfx942_mainloop_case(pipeline, ks_begin)
     y, us = run_perftest(run_mainloop)
     err = checkAllclose(
         ref,
@@ -295,11 +301,8 @@ def test_hgemm_gfx942_mainloop(pipeline, ks_begin):
         f"{strict_err:.2f}x the bf16 tolerance"
     )
     flops = 2 * m * n * (k - ks_begin)
-    nbytes = (
-        m * (k - ks_begin) * a.element_size()
-        + n * (k - ks_begin) * w.element_size()
-        + m * n * out.element_size()
-    )
+    element_size = torch.empty((), dtype=torch.bfloat16).element_size()
+    nbytes = (m * (k - ks_begin) + n * (k - ks_begin) + m * n) * element_size
     return {
         "gfx": get_gfx(),
         "M": m,
@@ -321,14 +324,13 @@ def summarize(title, rows):
 
 
 def run_gfx942_regressions():
-    """Run the detailed standalone and reusable-mainloop pytest suites in CI."""
+    """Run specialized gfx942 regressions after the standard benchmark sweep."""
     import pytest
 
     test_dir = Path(__file__).resolve().parent / "flydsl_tests"
     result = pytest.main(
         [
             str(test_dir / "test_gemm_a16w16_gfx942.py"),
-            str(test_dir / "test_gemm_a16w16_gfx942_mainloop.py"),
             "-q",
             "-p",
             "no:cacheprovider",
@@ -344,12 +346,7 @@ def main():
         aiter.logger.warning("flydsl hgemm unsupported on %s; skipping", gfx)
         return
 
-    if gfx == "gfx942":
-        from flydsl_tests.test_gemm_a16w16_gfx942 import SHAPES
-
-        default_mnk = [(m, n, k) for m, n, k, _regime in SHAPES]
-    else:
-        default_mnk = _default_mnk()
+    default_mnk = _GFX942_MNK if gfx == "gfx942" else _default_mnk()
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -371,31 +368,34 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=default_mnk,
+        default=None,
         help="""Shape of mnk.
         e.g.:   -s 128,4096,4096
                 --mnk 32,384,7168""",
     )
     args = parser.parse_args()
+    full_sweep = args.mnk is None
+    mnk = default_mnk if full_sweep else args.mnk
 
     if gfx == "gfx942":
         rows = [
             test_hgemm_gfx942(m, n, k, dtype)
-            for dtype, (m, n, k) in itertools.product(args.dtype, args.mnk)
+            for dtype, (m, n, k) in itertools.product(args.dtype, mnk)
         ]
         summarize("flydsl_hgemm gfx942", rows)
 
-        from flydsl_tests.test_gemm_a16w16_gfx942_mainloop import PIPELINES
+        if full_sweep:
+            from flydsl_tests.test_gemm_a16w16_gfx942_mainloop import PIPELINES
 
-        mainloop_rows = [
-            test_hgemm_gfx942_mainloop(pipeline, ks_begin)
-            for pipeline, ks_begin in itertools.product(PIPELINES, (0, 512))
-        ]
-        summarize("flydsl_hgemm gfx942 reusable mainloop", mainloop_rows)
-        run_gfx942_regressions()
+            mainloop_rows = [
+                test_hgemm_gfx942_mainloop(pipeline, ks_begin)
+                for pipeline, ks_begin in itertools.product(PIPELINES, (0, 512))
+            ]
+            summarize("flydsl_hgemm gfx942 reusable mainloop", mainloop_rows)
+            run_gfx942_regressions()
         return
 
-    wanted = set(args.mnk)
+    wanted = set(mnk)
 
     for dtype in args.dtype:
         rows = []

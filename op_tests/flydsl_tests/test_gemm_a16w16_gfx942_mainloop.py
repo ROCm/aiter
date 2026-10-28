@@ -1,28 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The gfx942 GEMM main loop as a building block of a fused kernel.
+"""The gfx942 GEMM main loop as a building block of a fused test kernel.
 
 A minimal fused kernel, written only against ``gemm_a16w16_gfx942_mainloop``,
 scales its A fragments in ``transform_a`` and stores the tile itself. It runs
-every pipeline against an f32 oracle, so a wrong transform placement, K
-column or element coordinate shows up as a wrong output.
+through the standard HGEMM harness against an f32 oracle.
 
-Skips unless running on real gfx942 hardware.
+The harness runs it only on gfx942 hardware.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import pytest
 import torch
 from flydsl.expr import const_expr, range_constexpr
 
-if __package__:
-    from .gfx942_gemm_oracle import error_ratio
-else:
-    from gfx942_gemm_oracle import error_ratio
-
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942_mainloop import (
     GemmA16W16Gfx942Param,
     gfx942_a_coords,
@@ -175,14 +167,8 @@ def _scaled_a_gemm(
     )
 
 
-# ks_begin > 0 checks that k_col is the absolute K column, as a fused split-K
-# consumer needs.
-@pytest.mark.parametrize("ks_begin", [0, 512])
-@pytest.mark.parametrize("pipeline", list(PIPELINES))
-def test_gfx942_mainloop_transform_a(pipeline, ks_begin):
-    if get_gfx() != "gfx942":
-        pytest.skip(f"requires gfx942, got {get_gfx()!r}")
-    # M is ragged; N stays a block_n multiple for the direct store.
+def prepare_gfx942_mainloop_case(pipeline, ks_begin):
+    """Return the launch, f32 oracle, and dimensions for one pipeline and K start."""
     m, n, k = 200, 128, 1024
     torch.manual_seed(0)
     x = (torch.randn(m, k, device="cuda") * k**-0.5).to(torch.bfloat16)
@@ -194,7 +180,9 @@ def test_gfx942_mainloop_transform_a(pipeline, ks_begin):
     param = make_gemm_a16w16_gfx942_param(
         block_m=64, block_n=64, direct_store=True, **PIPELINES[pipeline]
     )
-    _scaled_a_gemm(out, x, w.t(), ks_begin, param)
-    torch.cuda.synchronize()
-    worst = error_ratio(out, ref)
-    assert worst <= 1.0, f"{pipeline}: error is {worst:.2f}x the bf16 tolerance"
+
+    def run():
+        _scaled_a_gemm(out, x, w.t(), ks_begin, param)
+        return out
+
+    return run, ref, (m, n, k)

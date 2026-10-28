@@ -59,7 +59,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from gfx942_gemm_oracle import error_ratio
+
+if __package__:
+    from .gfx942_gemm_oracle import error_ratio
+else:
+    from gfx942_gemm_oracle import error_ratio
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx942 import (

@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Oracle-gated correctness tests for the native gfx942 (CDNA3) bf16 GEMM.
+"""Specialized correctness tests for the native gfx942 (CDNA3) bf16 GEMM.
 
 Compares the kernel against an f32 matmul oracle (bf16 inputs upcast to f32)
-to within one bf16 ulp, or f32 summation-order noise for fp32 output. Shapes
-cover down projections (large K, narrow N), up projections (short K, wide N),
-decode (tiny M), square compute-bound GEMMs and M/N boundary tiles, through
-both ``gemm_a16w16`` and the public ``flydsl_hgemm`` dispatch (per-shape
-default config). Explicit configs cover every main-loop pipeline, split-K mode
-and output dtype.
+to within one bf16 ulp, or f32 summation-order noise for fp32 output. The
+standard HGEMM harness covers representative shape dispatch; these tests cover
+explicit pipelines, split-K modes, boundary stores, streams, and invalid input.
 
 Skips unless running on real gfx942 hardware.
 """
@@ -53,60 +50,6 @@ OUT_DTYPE_IDS = ["bf16", "fp32"]
 def _guarded_out(m, n, dtype):
     """Output with NaN guard rows past M; the caller passes ``out[:m]``."""
     return torch.full((m + 64, n), float("nan"), dtype=dtype, device="cuda")
-
-
-# (M, N, K, regime)
-SHAPES = [
-    (1, 384, 10240, "down"),
-    (4, 384, 10240, "down"),
-    (512, 384, 10240, "down"),
-    (1024, 384, 10240, "down"),
-    (2048, 384, 10240, "down"),
-    (8192, 384, 10240, "down"),
-    (1, 10240, 320, "up"),
-    (4, 10240, 320, "up"),
-    (512, 10240, 320, "up"),
-    (2048, 10240, 320, "up"),
-    (8192, 10240, 320, "up"),
-    (1, 4096, 4096, "decode"),
-    (4096, 4096, 4096, "square"),
-    (8192, 8192, 8192, "square"),
-    # non-divisible-M boundary cases
-    (100, 384, 10240, "boundary-M"),
-    (1000, 10240, 320, "boundary-M"),
-    (4095, 4096, 4096, "boundary-M"),
-    # non-divisible-N: N=336 is not a multiple of 64
-    (1024, 336, 10240, "boundary-N"),
-    (4096, 336, 10240, "boundary-N"),
-    (1000, 336, 10240, "boundary-MN"),
-]
-
-
-@pytest.mark.parametrize(
-    "m,n,k,regime", SHAPES, ids=[f"{r}-M{m}" for m, n, k, r in SHAPES]
-)
-def test_gemm_a16w16_gfx942(m, n, k, regime):
-    """Direct kernel call vs f32 oracle (kernel's own default config)."""
-    _require_gfx942()
-    x, w, ref = _inputs(m, n, k)
-    y = gemm_a16w16(x, w.t(), layout="nt", out_dtype=torch.bfloat16)
-    torch.cuda.synchronize()
-    _assert_close(y, ref, f"{regime} M{m} N{n} K{k}")
-
-
-@pytest.mark.parametrize(
-    "m,n,k,regime", SHAPES, ids=[f"{r}-M{m}" for m, n, k, r in SHAPES]
-)
-def test_flydsl_hgemm_gfx942_autoconfig(m, n, k, regime):
-    """Public dispatch with the per-shape default config vs f32 oracle.
-
-    ``flydsl_hgemm`` takes AITER's B[N, K] convention directly (no transpose).
-    """
-    _require_gfx942()
-    x, w, ref = _inputs(m, n, k)
-    y = flydsl_hgemm(x, w, out_dtype=torch.bfloat16)
-    torch.cuda.synchronize()
-    _assert_close(y, ref, f"{regime} M{m} N{n} K{k} (dispatch)")
 
 
 @pytest.mark.parametrize(

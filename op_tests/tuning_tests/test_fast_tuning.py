@@ -855,5 +855,149 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
         self.assertNotIn("swiglu_limit", precompiled[2])
 
 
+class TestGfx942CsvTuner(unittest.TestCase):
+    @staticmethod
+    def _tuner():
+        from op_tests.flydsl_tests import tune_gfx942_csv
+
+        return tune_gfx942_csv
+
+    @staticmethod
+    def _config(tuner, group_m):
+        return tuner.normalized_config(
+            {
+                "block_m": 32,
+                "block_n": 32,
+                "block_k": 64,
+                "stages": 2,
+                "group_m": group_m,
+            }
+        )
+
+    def _run_tune(self, screen_times, table=None):
+        tuner = self._tuner()
+        incumbent = self._config(tuner, 0)
+        fallback = self._config(tuner, 4)
+        challenger = self._config(tuner, 8)
+        bench = SimpleNamespace(
+            hipb_us=10.0,
+            interleaved=mock.Mock(return_value=([4.0], 10.0)),
+        )
+        args = SimpleNamespace(
+            out_dtype="bf16",
+            csv=Path("unused.csv"),
+            limit=1,
+            refine=0,
+            finalists=5,
+            rounds=2,
+            margin=0.02,
+            dry_run=False,
+            table=Path("unused-table.csv"),
+        )
+        table = {} if table is None else table
+
+        def screen(_args, _regime, _bench, _source, cfg, _logged):
+            return screen_times[cfg["group_m"]]
+
+        with (
+            mock.patch.object(
+                tuner, "device_metadata", return_value=("gpu", "gfx942", 304)
+            ),
+            mock.patch.object(tuner, "ShapeBench", return_value=bench),
+            mock.patch.object(
+                tuner, "current_config", return_value=(incumbent, "table")
+            ),
+            mock.patch.object(tuner, "gfx942_fallback_config", return_value=fallback),
+            mock.patch.object(tuner, "grid_configs", return_value=[challenger]),
+            mock.patch.object(tuner, "async_configs", return_value=[]),
+            mock.patch.object(tuner, "refine_configs", return_value=[]),
+            mock.patch.object(tuner, "logged_screen_times", return_value={}),
+            mock.patch.object(tuner, "screen", side_effect=screen),
+            mock.patch.object(tuner, "write_table") as write_table,
+            mock.patch("builtins.print"),
+        ):
+            tuner.tune_shape(args, "test", 64, 64, 64, table)
+
+        return bench, table, write_table, challenger
+
+    def test_resume_rechecks_cached_config_before_reusing_timing(self):
+        tuner = self._tuner()
+        config = self._config(tuner, 0)
+        key = tuner.config_key(64, 64, 64, config)
+        logged = {key: 1.0}
+        bench = SimpleNamespace(
+            m=64,
+            n=64,
+            k=64,
+            check=mock.Mock(return_value=("incorrect", 2.0, "")),
+            runner=mock.Mock(),
+            time=mock.Mock(),
+        )
+        args = SimpleNamespace(resume=True, verbose=False)
+
+        with mock.patch.object(tuner, "log_measurement"):
+            result = tuner.screen(args, "test", bench, "resume", config, logged)
+
+        self.assertEqual(result, float("inf"))
+        self.assertEqual(logged[key], float("inf"))
+        bench.check.assert_called_once_with(config)
+        bench.time.assert_not_called()
+
+    def test_failed_incumbent_is_replaced_by_valid_challenger(self):
+        bench, table, write_table, challenger = self._run_tune(
+            {0: float("inf"), 4: float("inf"), 8: 5.0}
+        )
+
+        tuned_rows = [row for key, row in table.items() if isinstance(key, tuple)]
+        self.assertEqual(len(tuned_rows), 1)
+        self.assertEqual(tuned_rows[0]["group_m"], challenger["group_m"])
+        bench.interleaved.assert_called_once_with([challenger], 2)
+        write_table.assert_called_once()
+
+    def test_all_failed_configs_leave_table_unchanged(self):
+        table = {"sentinel": "unchanged"}
+        bench, result, write_table, _challenger = self._run_tune(
+            {0: float("inf"), 4: float("inf"), 8: float("inf")},
+            table,
+        )
+
+        self.assertIs(result, table)
+        self.assertEqual(table, {"sentinel": "unchanged"})
+        bench.interleaved.assert_not_called()
+        write_table.assert_not_called()
+
+    def test_report_only_does_not_query_gpu_architecture(self):
+        tuner = self._tuner()
+        argv = ["tune_gfx942_csv.py", "--report-only", "--table", "table.csv"]
+
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(tuner, "get_gfx") as get_gfx,
+            mock.patch.object(tuner, "print_table") as print_table,
+        ):
+            tuner.main()
+
+        get_gfx.assert_not_called()
+        print_table.assert_called_once_with(Path("table.csv"))
+
+    def test_non_gfx942_is_rejected_before_benchmark_construction(self):
+        tuner = self._tuner()
+        argv = ["tune_gfx942_csv.py", "--M", "64", "--N", "64", "--K", "64"]
+
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(tuner, "get_gfx", return_value="gfx950"),
+            mock.patch.object(
+                tuner,
+                "ShapeBench",
+                side_effect=AssertionError("benchmark constructed"),
+            ),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            tuner.main()
+
+        self.assertEqual(raised.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
