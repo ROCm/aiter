@@ -887,9 +887,11 @@ class Gfx1250WavePipeline:
         gpu.barrier()
         kv_off = t.q_bytes + buffer * t.kv_stride
         self._stage_next(token_base, end, buffer)
-        # K, then V per-token scales of this lane's half-wave tokens.
-        scales = kv_off + t.k_bytes + t.v_bytes + 64 * ctx.half
-        limit = upper - token_base
+        # K, then V per-token scales; piece s of this lane's 16-token chunks
+        # starts at token 16 half + 8 (s ^ half).
+        scales = kv_off + t.k_bytes + t.v_bytes
+        piece = [16 * ctx.half + 8 * (s ^ ctx.half) for s in range_constexpr(2)]
+        limit = [upper - token_base - 8 * (s ^ ctx.half) for s in range_constexpr(2)]
         if const_expr(t.per_token_kv):
             vscale = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
             vmax = fx.Float32(self.mem.load(vscale + ctx.lane * 4, fx.Float32)[0])
@@ -918,8 +920,10 @@ class Gfx1250WavePipeline:
             )
         units = []
         for i in range_constexpr(t.TOKENS // 16):
-            first = 32 * (i // 2) + 8 * (i % 2)
-            token = first + 16 * (ctx.lane16 // 8) + ctx.lane16 % 8
+            first, s = 32 * (i // 2), i % 2
+            # Rows 0-7 and 8-15 read opposite chunk halves: distinct LDS banks.
+            row_half = ctx.lane16 // 8
+            token = first + 16 * row_half + 8 * (s ^ row_half) + ctx.lane16 % 8
             words = []
             for j in range_constexpr(4):
                 frag = self.mem.load(
@@ -935,7 +939,7 @@ class Gfx1250WavePipeline:
                 128,
             )
             if const_expr(t.per_token_kv):
-                ks = self.mem.load(scales + first * 4, fx.Float32, 8)
+                ks = self.mem.load(scales + (first + piece[s]) * 4, fx.Float32, 8)
             for r in range_constexpr(8):
                 if const_expr(fused):
                     value = scores[r] * fx.Float32(ks[r])
@@ -945,7 +949,7 @@ class Gfx1250WavePipeline:
                         value = value * fx.Float32(ks[r])
                 if const_expr(masked):
                     # Rows never mix, and padded rows are never stored.
-                    value = (fx.Int32(first + r) < limit).select(
+                    value = (fx.Int32(first + r) < limit[s]).select(
                         value, fx.Float32(float("-inf"))
                     )
                 units.append(value)
@@ -1002,16 +1006,20 @@ class Gfx1250WavePipeline:
         tile_sum = tile_sum + tile_sum.shuffle_xor(16, t.WAVE)
         if const_expr(fused):
             tile_sum = tile_sum * fx.maxnumf(vfactor, fx.Float32(1e-20))
-        words = []
+        pieces = []
         for i in range_constexpr(t.TOKENS // 16):
-            first = 32 * (i // 2) + 8 * (i % 2)
+            first, s = 32 * (i // 2), i % 2
             if const_expr(fused):
-                vs = self.mem.load(scales + (t.TOKENS + first) * 4, fx.Float32, 8)
+                vs = self.mem.load(
+                    scales + (t.TOKENS + first + piece[s]) * 4, fx.Float32, 8
+                )
                 pvalues = [
                     probs[i * 8 + r] * fx.Float32(vs[r]) for r in range_constexpr(8)
                 ]
             elif const_expr(t.per_token_kv):
-                vs = self.mem.load(scales + (t.TOKENS + first) * 4, fx.Float32, 8)
+                vs = self.mem.load(
+                    scales + (t.TOKENS + first + piece[s]) * 4, fx.Float32, 8
+                )
                 pvalues = [
                     probs[i * 8 + r] * fx.Float32(vs[r]) * vnorm
                     for r in range_constexpr(8)
@@ -1020,8 +1028,17 @@ class Gfx1250WavePipeline:
                 pvalues = [
                     probs[i * 8 + r] * fx.Float32(t.FP8_MAX) for r in range_constexpr(8)
                 ]
-            p = self.mem.fp8(fx.Vector.from_elements(pvalues, dtype=fx.Float32))
-            words.extend([p[0], p[1]])
+            pieces.append(
+                self.mem.fp8(fx.Vector.from_elements(pvalues, dtype=fx.Float32))
+            )
+        # Half-wave 1 holds each chunk's upper piece in its even token tile.
+        lower = ctx.half == 0
+        words = []
+        for i in range_constexpr(0, t.TOKENS // 16, 2):
+            for w in range_constexpr(2):
+                words.append(lower.select(pieces[i][w], pieces[i + 1][w]))
+            for w in range_constexpr(2):
+                words.append(lower.select(pieces[i + 1][w], pieces[i][w]))
         p_operand = fx.Vector.from_elements(words, dtype=fx.Int32)
         # Outputs remain normalized by the previous V factor. Rescale
         # before WMMA to fuse its accumulation.
