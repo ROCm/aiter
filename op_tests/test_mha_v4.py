@@ -1989,6 +1989,33 @@ def test_mha_v4_raw_mxfp8_compile_parity():
     assert torch.isfinite(compiled).all()
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 MXFP4 validation")
+def test_mha_v4_mxfp4_hd256_compile_parity():
+    """The hd256 producers are custom ops so this path can be traced; only tracing it proves that.
+
+    hd256 reaches its quantizers through a separate trio rather than a head-dim argument, so the
+    hd128 parity checks say nothing about whether these ones still carry their schemas.
+    """
+    torch.manual_seed(45)
+    q = torch.randn((1, 257, 4, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 320, 4, 256), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    eager_out = torch.empty_like(q)
+    compiled_out = torch.empty_like(q)
+    formats = (AttentionFormat.MXFP4, AttentionFormat.MXFP4, AttentionFormat.MXFP4)
+
+    eager = mha_v4(q, k, v, *formats, out=eager_out)
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q, k, v, *formats, out=compiled_out
+    )
+    torch.cuda.synchronize()
+
+    assert eager.data_ptr() == eager_out.data_ptr()
+    assert compiled.data_ptr() == compiled_out.data_ptr()
+    assert torch.equal(eager, compiled)
+    assert torch.isfinite(compiled).all()
+
+
 @skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
 @parametrize("q_format", [AttentionFormat.MXFP4, AttentionFormat.MXFP6])
 def test_mha_v4_raw_mxfp4_v_supports_unaligned_sequence(q_format):
