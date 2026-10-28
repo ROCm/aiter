@@ -67,7 +67,8 @@ using SortOnlyZiFn = void (*)(
     int32_t*       m_indices,
     void*          bf16_zero_ptr,
     void*          bf16_zero_ws_ptr,
-    long long      workspace_bytes);
+    long long      workspace_bytes,
+    const int32_t* num_local_tokens);
 
 using SortOnlyFn = void (*)(
     hipStream_t stream,
@@ -79,7 +80,8 @@ using SortOnlyFn = void (*)(
     int32_t*       cumsum,
     int32_t*       reverse_sorted,
     float*         sorted_weights,
-    int32_t*       m_indices);
+    int32_t*       m_indices,
+    const int32_t* num_local_tokens);
 
 using QuantFn = void (*)(
     hipStream_t stream,
