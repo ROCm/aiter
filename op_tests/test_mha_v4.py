@@ -661,9 +661,7 @@ _STRIDED_QUANTIZER_CASES = [
 ]
 
 
-@skipif(
-    get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers"
-)
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 quantizers")
 @parametrize("quantizer,with_mean", _STRIDED_QUANTIZER_CASES)
 @parametrize("batch,sequence,heads", [(2, 1001, 5), (1, 129, 2)])
 def test_mha_v4_quantizers_read_strided_views_like_contiguous_input(
