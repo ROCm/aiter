@@ -10,7 +10,13 @@ import flydsl.expr as fx
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .tensor_shim import buf_base_i64, buf_copy_load, ptr_buf_tensor
+from .tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    buf_base_i64,
+    buf_copy_load,
+    ptr_buf_tensor,
+)
 from .utils import rcp_f32, udiv_const, urem_const
 
 _DTYPE_MAP = {
@@ -519,6 +525,13 @@ def compile_pa_decode_ps_reduce(
             stream=stream,
         )
 
+    if architecture == "gfx1250":
+        # All 108 argument bytes preload into user SGPRs, so the first load
+        # is reduce_info.
+        launch_pa_decode_ps_reduce_kernel.compile_hints["llvm_options"] = {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        }
     return {
         "launch": launch_pa_decode_ps_reduce_kernel,
         "kernel": pa_decode_reduce_kernel,
