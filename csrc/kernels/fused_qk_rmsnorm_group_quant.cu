@@ -996,21 +996,36 @@ void fused_qk_rmsnorm_group_quant(
     const hipStream_t stream = aiter::getCurrentHIPStream();
     (void)get_num_cu_func();
 
-    // MI455 uses wave32. Keep quantized and dual-input dispatch unchanged.
-    // No-quant does not execute the group-scale reduction, so RTS=1 is sufficient.
-    if(no_quant && !has_second_input && get_gpu_arch() == "gfx1250")
+    // No-quant dispatch is based on wave/vector capacity, not model widths.
+    // Keep quantized, dual-input and vector-tail dispatch on the existing paths.
+    // RTS=1 is sufficient because no-quant does not execute group-scale reduction.
+    if(no_quant && !has_second_input && n1 > 0 && n1 % 8 == 0 && get_gpu_arch() == "gfx1250")
     {
-        if(n1 == 128)
+        constexpr int wave_threads = 32;
+        constexpr int block_threads = 256;
+        if(n1 <= wave_threads * 4)
         {
-            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, 32, 4, 1);
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, wave_threads, 4, 1);
             return;
         }
-        // Preserve the low-latency decode dispatch; interleave wins once rows
-        // are numerous enough to benefit from the denser 256-thread blocks.
-        if(n1 == 6144 && m >= 256)
+        if(n1 <= wave_threads * 8)
         {
-            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_GFX1250_NO_QUANT_DISPATCH, 256, 24, 1);
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, wave_threads, 8, 1);
             return;
+        }
+        // Above 24 values/thread the interleaved kernel regresses on gfx1250;
+        // keep the original wider-row configuration rather than extrapolating it.
+        if(n1 > block_threads * 16 && n1 <= block_threads * 24)
+        {
+            int cu_count = 0;
+            HIP_CALL(hipDeviceGetAttribute(
+                &cu_count, hipDeviceAttributeMultiprocessorCount, inp1.device_id));
+            // Keep the decode dispatch while there are fewer rows than CUs.
+            if(m >= cu_count)
+            {
+                DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_GFX1250_NO_QUANT_DISPATCH, block_threads, 24, 1);
+                return;
+            }
         }
     }
 

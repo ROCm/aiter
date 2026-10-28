@@ -618,8 +618,12 @@ __global__ void add_rmsnorm_quant_kernel(
 
     
 #define ADD_RMSNORM_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
-    if (n == 128 && get_gpu_arch() == "gfx1250") { \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 32, 4, ADD_RESIDUAL, FUSE_QUANT); \
+    if (n > 0 && n <= 32 * 8 && n % 8 == 0 && get_gpu_arch() == "gfx1250") { \
+        if (n <= 32 * 4) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 32, 4, ADD_RESIDUAL, FUSE_QUANT); \
+        } else { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 32, 8, ADD_RESIDUAL, FUSE_QUANT); \
+        } \
     } else if (n <= 512) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 1024) { \
@@ -677,8 +681,12 @@ __global__ void add_rmsnorm_quant_kernel(
     }
 
 #define RMSNORM_KERNEL_DISPATCH(DTYPE_O, ADD_RESIDUAL, FUSE_QUANT) \
-    if (n == 128 && get_gpu_arch() == "gfx1250") { \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 32, 4, ADD_RESIDUAL, FUSE_QUANT); \
+    if (n > 0 && n <= 32 * 8 && n % 8 == 0 && get_gpu_arch() == "gfx1250") { \
+        if (n <= 32 * 4) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 32, 4, ADD_RESIDUAL, FUSE_QUANT); \
+        } else { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 32, 8, ADD_RESIDUAL, FUSE_QUANT); \
+        } \
     } else if (n <= 512) { \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 64, 8, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 1024) { \

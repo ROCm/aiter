@@ -366,6 +366,9 @@ def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("C++ RMSNorm unsupported on %s; skipping", get_gfx())
         return
+    cu_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="C++ no-quant RMSNorm correctness/performance shape sweep",
@@ -382,7 +385,20 @@ def main():
         "--m",
         type=int,
         nargs="*",
-        default=[1, 7, 128, 255, 256, 257, 1024, 4096, 16384, 32768],
+        default=sorted(
+            {
+                1,
+                7,
+                128,
+                1024,
+                4096,
+                16384,
+                32768,
+                max(1, cu_count - 1),
+                cu_count,
+                cu_count + 1,
+            }
+        ),
         help="Number of rows, not sequence/context length",
     )
     parser.add_argument(
@@ -390,8 +406,9 @@ def main():
         "--n",
         type=int,
         nargs="*",
-        default=[128, 6144],
-        help="Per-row normalization width",
+        # Capacity boundaries and adjacent vector-aligned widths, not just M3.
+        default=[64, 120, 128, 136, 248, 256, 264, 4096, 4104, 6136, 6144, 6152, 8192],
+        help="Per-row normalization width (last dimension contiguous)",
     )
     parser.add_argument(
         "-s",
