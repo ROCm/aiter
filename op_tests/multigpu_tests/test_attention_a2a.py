@@ -841,8 +841,16 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
         AttentionScaleMode,
         mha_v4,
         mha_v4_packed,
+        quantize_mxfp6_k,
+        quantize_mxfp6_q,
     )
-    from aiter.ops.mha_v4_quant import mxfp4_v_view, mxfp6_k_view, mxfp6_v_tiles
+    from aiter.ops.mha_v4_quant import (
+        mxfp4_v_view,
+        mxfp6_k_view,
+        mxfp6_v_tiles,
+        quantize_v_mxfp4_fp6_p,
+        quantize_v_mxfp6_fp6_p,
+    )
 
     e8 = AttentionScaleMode.E8M0_PER_1X32
     softmax_scale = 0.125
@@ -882,6 +890,32 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
     )
     payloads, scales = _submit_roles(op, inputs)
     torch.cuda.synchronize()
+    label = f"rank {rank} v4-consumer {codec}"
+    # Strict transport check before the consumer runs: the transported packed
+    # bytes must equal the canonical packers' output.
+    exp_q, exp_q_scale = quantize_mxfp6_q(full[0], softmax_scale * math.log2(math.e))
+    _exact(payloads[0], exp_q.view(torch.uint8).flatten(), f"{label} Q payload")
+    _exact(scales[0].view_as(exp_q_scale), exp_q_scale, f"{label} Q scales")
+    exp_k, exp_k_scale = quantize_mxfp6_k(full[1])
+    _, logical_k_scales = mxfp6_k_view(exp_k, exp_k_scale, 1, valid_kv_len, hl)
+    _exact(
+        scales[1][: logical_k_scales.numel()].view_as(logical_k_scales),
+        logical_k_scales,
+        f"{label} K scales",
+    )
+    _check_v4_fp6_k_bytes(payloads[1], exp_k, logical_k_scales, f"{label} K")
+    if codec == "mxfp6_p":
+        exp_v, exp_v_scale = quantize_v_mxfp6_fp6_p(full[2])
+        _exact(
+            payloads[2],
+            exp_v.as_strided(payloads[2].shape, (1,)),
+            f"{label} V payload",
+        )
+    else:
+        exp_v, exp_v_scale = quantize_v_mxfp4_fp6_p(full[2])
+        v_bytes = hl * (((valid_kv_len + 127) // 128) * 128) * 64
+        _exact(payloads[2][:v_bytes], exp_v[:v_bytes], f"{label} V payload")
+    _exact(scales[2].view_as(exp_v_scale), exp_v_scale, f"{label} V scales")
     q = payloads[0].view(1, seq_full, hl, 96)
     q_scale = scales[0].view(1, seq_full, hl, 4)
     k, k_scale = mxfp6_k_view(payloads[1], scales[1], 1, valid_kv_len, hl)
@@ -927,7 +961,6 @@ def _check_v4_consumer(rank, world_size, heads, sequence, device, op_cls, codec)
         softmax_scale=softmax_scale,
     )
     torch.cuda.synchronize()
-    label = f"rank {rank} v4-consumer {codec}"
     assert torch.equal(out, canonical), (
         f"{label}: fused != canonical, max abs "
         f"{(out.float() - canonical.float()).abs().max().item()}"
