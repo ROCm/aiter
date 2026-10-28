@@ -1045,8 +1045,7 @@ def launch_gemm_a8w4_tdm(
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
-        # Split each region's offset into a lane-varying base, which keepalive
-        # can pin, and a compile-time part that folds into ds_load's offset:.
+        # Keep stage/lane bases separate from the constant DS load offsets.
         lds_a_lane_off = (
             (wmb // 16) * 16 * A_ROW_B + lane16 * 16 + kgrp * 256
             if a_preshuffled
@@ -1068,22 +1067,51 @@ def launch_gemm_a8w4_tdm(
 
         LdsAddr = namedtuple("LdsAddr", "a b sa sb")
 
+        def payload_lds_base(addr):
+            # Hide the stage constant from address reassociation. Otherwise
+            # LLVM can fold it into every load and materialize many full VGPR
+            # addresses instead of one base plus DS offset immediates.
+            # Tied input/output: identity, no instruction or memory barrier.
+            return fx.Int32(
+                llvm_dialect.InlineAsmOp(
+                    res=T.i32,
+                    operands_=[_raw(fx.Int32(addr))],
+                    asm_string="",
+                    constraints="=v,0",
+                    has_side_effects=False,
+                    is_align_stack=False,
+                ).res
+            )
+
+        def calc_payload_bases(slot):
+            return (
+                payload_lds_base(
+                    stC_idx
+                    + A_LDS_OFF
+                    + fx.Index(slot) * A_LDS_STAGE
+                    + fx.index_cast(T.index, lds_a_lane_off)
+                ),
+                payload_lds_base(
+                    stC_idx
+                    + B_LDS_OFF
+                    + fx.Index(slot) * B_LDS_STAGE
+                    + fx.index_cast(T.index, lds_b_lane_off)
+                ),
+            )
+
+        # Reuse constant-stage bases across iterations of the unrolled ring.
+        payload_bases = [calc_payload_bases(s) for s in range_constexpr(num_buffers)]
+
         def calc_lds_addr(slot):
             """Calculate the lane-specific LDS bases for one stage buffer."""
             slot_idx = fx.Index(slot)
+            if const_expr(isinstance(slot, int)):
+                a_base, b_base = payload_bases[slot]
+            else:
+                a_base, b_base = calc_payload_bases(slot)
             return LdsAddr(
-                a=(
-                    stC_idx
-                    + A_LDS_OFF
-                    + slot_idx * A_LDS_STAGE
-                    + fx.index_cast(T.index, lds_a_lane_off)
-                ),
-                b=(
-                    stC_idx
-                    + B_LDS_OFF
-                    + slot_idx * B_LDS_STAGE
-                    + fx.index_cast(T.index, lds_b_lane_off)
-                ),
+                a=a_base,
+                b=b_base,
                 sa=(
                     stC_idx
                     + SA_LDS_OFF
@@ -1189,8 +1217,25 @@ def launch_gemm_a8w4_tdm(
                     register_class=fx.rocdl.VGPR,
                     start=512 + idx * WMMA_VECTOR_DWORDS,
                 )
-        for cf in c_frags:
-            cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
+
+        def init_accumulators():
+            # Cover prologue TDM latency before the first pipeline wait.
+            rocdl.sched_barrier(0)
+            for cf in c_frags:
+                # A tied identity emits no instruction, but its side effect
+                # keeps zero materialization from sinking past the wait.
+                zero = fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32))
+                cf.store(
+                    llvm_dialect.InlineAsmOp(
+                        res=T.vec(WMMA_VECTOR_DWORDS, T.f32),
+                        operands_=[zero],
+                        asm_string="",
+                        constraints="=v,0",
+                        has_side_effects=True,
+                        is_align_stack=False,
+                    ).res
+                )
+            rocdl.sched_barrier(0)
 
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
@@ -1205,8 +1250,7 @@ def launch_gemm_a8w4_tdm(
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
                 wm = wm_list[i]
-                for wn_raw in range_constexpr(wmma_n_rep):
-                    wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
+                for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
                     scale_a = sb_k[wn if a_is_fp4 else wn // 2]
                     scale_b = sa_k[wm // 2]
@@ -1223,6 +1267,8 @@ def launch_gemm_a8w4_tdm(
                                 scale_b,
                                 scaleAType=0,
                                 scaleBType=wm % 2,
+                                # Retain activation for the next WMMA in this row.
+                                reuseB=wn + 1 < wmma_n_rep,
                             )
                         )
                     else:
@@ -1438,9 +1484,11 @@ def launch_gemm_a8w4_tdm(
                 for i in range_constexpr(schedule_slots):
                     if const_expr(tdm_schedule[i] > 0):
                         rocdl.sched_vmem(tdm_schedule[i])
+                    # Compute with the current slot before refilling the other
+                    # slot, whose scales were just read by the previous k128.
+                    rocdl.sched_mfma(mma_groups[i])
                     if const_expr(i == 0 and first_ds > 0):
                         rocdl.sched_dsrd(first_ds)
-                    rocdl.sched_mfma(mma_groups[i])
                     remaining_ds = future_schedule[i] - (first_ds if i == 0 else 0)
                     if const_expr(remaining_ds > 0):
                         rocdl.sched_dsrd(remaining_ds)
@@ -1572,6 +1620,7 @@ def launch_gemm_a8w4_tdm(
                     # Post-compute issue: better for decode (small tile_m).
                     for i in range_constexpr(num_buffers):
                         issue(i, i)
+                    init_accumulators()
                     n_steady = K_TILES - num_buffers
                     if const_expr(next_stage_on):
                         # Every rolled iteration reads the carry, so prime it here --
@@ -1646,6 +1695,7 @@ def launch_gemm_a8w4_tdm(
                     PRE = num_buffers if next_stage_on else num_buffers - 1
                     for i in range_constexpr(PRE):
                         issue(i, i)
+                    init_accumulators()
                     n_steady = K_TILES - PRE
                     if const_expr(next_stage_on):
                         pipeline_fence(outstanding=TDM_PER * (PRE - 1))

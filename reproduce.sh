@@ -73,7 +73,7 @@ exec python3 -u op_tests/flydsl_tests/test_flydsl_grouped_gemm.py \
   --inter-dim 3072 \
   --act silu \
   --no-bias \
-  --iters 64 \
+  --iters 32 \
   --no-check-aot-cache \
   --data-init zero \
   --scale-init zero \
