@@ -660,6 +660,8 @@ def _unified_attention_3d_triton(
         block_table_stride=params.block_table.stride(0),
         query_stride_0=params.q.stride(0),
         query_stride_1=params.q.stride(1),
+        segm_output_stride_0=segm_output.stride(0),
+        segm_output_stride_1=segm_output.stride(1),
         qq_bias_stride_0=params.qq_bias.stride(0) if params.use_qq_bias else 0,
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,

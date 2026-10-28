@@ -75,6 +75,16 @@ def test_gfx950_mimo_verify_and_prefill_configs():
         }
     assert config("kv_split", **verify_60k) == {"NUM_SEGMENTS": 32, "TILE_SIZE": 32}
     assert config("kv_split", **verify_128k) == {"NUM_SEGMENTS": 64, "TILE_SIZE": 32}
+    # a page as long as the context leaves one segment, which is the 3D kernel's
+    # direct store into the output (test_triton_unified_attn_single_segment)
+    assert config(
+        "kv_split",
+        sliding_window=0,
+        max_seqlen_q=8,
+        max_seqlen_k=1024,
+        block_size=1024,
+        num_2d_prgms=11,
+    ) == {"NUM_SEGMENTS": 1, "TILE_SIZE": 32}
 
     # a 32k-token prefill chunk
     assert config("attn_2d", sliding_window=0, max_seqlen_q=32768) == {

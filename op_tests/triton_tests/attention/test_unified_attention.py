@@ -837,3 +837,27 @@ def test_triton_unified_attn_split_head(v_head_size, dtype, seq_lens, block_size
         backend="triton",
         v_head_size=v_head_size,
     )
+
+
+@pytest.mark.parametrize("v_head_size", [128, None])
+def test_triton_unified_attn_single_segment(v_head_size):
+    # pages as long as the context leave one KV segment on gfx950, so the 3D
+    # kernel stores straight into the output, whose rows are V wide, not padded
+    test_triton_unified_attn(
+        seq_lens=[(8, 1024), (1, 700)],
+        num_heads=(16, 1),
+        head_size=192,
+        sliding_window=None,
+        block_size=1024,
+        soft_cap=None,
+        num_blocks=16,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        use_q_descale=False,
+        use_kv_descale=False,
+        use_out_scale=False,
+        shuffled_kv_cache=False,
+        backend="triton",
+        v_head_size=v_head_size,
+    )

@@ -647,7 +647,8 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
 @triton.jit(repr=kernel_unified_attention_3d_repr)
 def kernel_unified_attention_3d(
     segm_output_ptr,
-    # [num_tokens, num_query_heads, num_segments, head_size]
+    # [num_tokens, num_query_heads, num_segments, head_size_v_padded], or the
+    # output itself, [num_tokens, num_query_heads, head_size_v], for one segment
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -669,6 +670,8 @@ def kernel_unified_attention_3d(
     block_table_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
+    segm_output_stride_0: tl.int64,  # int
+    segm_output_stride_1: tl.int64,  # int
     qq_bias_stride_0: tl.int64,  # int
     BLOCK_SIZE: tl.constexpr,  # int
     TILE_SIZE: tl.constexpr,  # int, must be power of 2
@@ -1061,9 +1064,8 @@ def kernel_unified_attention_3d(
         acc = acc * one_over_L
 
     segm_output_offset = (
-        query_offset_0[:, None].to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
-        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
+        query_offset_0[:, None].to(tl.int64) * segm_output_stride_0
+        + query_offset_1[:, None] * segm_output_stride_1
         + segm_idx * HEAD_SIZE_V_PADDED
         + tl.arange(0, HEAD_SIZE_V_PADDED)[None, :]
     )
