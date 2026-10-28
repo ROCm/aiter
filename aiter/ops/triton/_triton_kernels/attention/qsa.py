@@ -562,7 +562,7 @@ def _qsa_paged_mqa_logits_mfma_kernel(
     columns = col0 + tl.arange(0, BN)
     logical_page = columns // PAGE_SIZE
     page_offset = columns % PAGE_SIZE
-    page_ok = logical_page < PAGE_TABLE_WIDTH
+    page_ok = (logical_page < PAGE_TABLE_WIDTH) & (columns < num_columns)
     safe_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
     active = visible > 0
     req_lo = tl.min(tl.where(active, safe_request, num_requests), axis=0)
@@ -737,7 +737,7 @@ def _qsa_paged_mqa_logits_stacked_kernel(
         columns = tile * BN + tl.arange(0, BN)
         logical_page = columns // PAGE_SIZE
         page_offset = columns % PAGE_SIZE
-        page_ok = logical_page < PAGE_TABLE_WIDTH
+        page_ok = (logical_page < PAGE_TABLE_WIDTH) & (columns < num_columns)
         safe_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
         score = tl.zeros((BMT, BN), dtype=tl.float32)
         for req in range(req_lo, req_hi + 1):

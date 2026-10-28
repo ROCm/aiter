@@ -23,7 +23,8 @@ from aiter.ops.triton._triton_kernels.attention.qsa import (
 # Quantized cache rows: FP8 with one FP32 scale per row, or MXFP4 with one
 # E8M0 exponent for each FP4_GROUP dims (see the kernel module).
 FP8_DTYPE = dtypes.fp8
-FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
+# Without a visible GPU, aiter gives a uint8 placeholder that has no FP8 range.
+FP8_MAX = float(torch.finfo(FP8_DTYPE).max) if FP8_DTYPE.is_floating_point else None
 FP4_GROUP = 32
 _FMT_BF16, _FMT_FP8, _FMT_FP4 = 0, 1, 2
 QSA_CACHE_FORMATS = ("bf16", "fp8", "fp4")
@@ -38,6 +39,8 @@ def qsa_cache_row_layout(fmt: str, head_dim: int):
     if fmt == "bf16":
         return head_dim, torch.bfloat16, None, None
     if fmt == "fp8":
+        if FP8_MAX is None:
+            raise ValueError("FP8 QSA rows need a GPU with an FP8 dtype")
         return head_dim, FP8_DTYPE, (), torch.float32
     if fmt == "fp4":
         if head_dim % FP4_GROUP:
@@ -51,7 +54,7 @@ def _cache_format(cache: torch.Tensor, scale: torch.Tensor | None) -> int:
         return _FMT_BF16
     if scale is None:
         raise ValueError("a quantized QSA cache needs its scale plane")
-    if cache.dtype == FP8_DTYPE:
+    if FP8_MAX is not None and cache.dtype == FP8_DTYPE:
         return _FMT_FP8
     if cache.dtype == torch.uint8:
         return _FMT_FP4
@@ -79,10 +82,14 @@ def qsa_store_quantized_rows(
     if cache.ndim != 4 or values.ndim != 3:
         raise ValueError("cache must be [pages, page, heads, dim], values 3-D")
     rows, heads, head_dim = values.shape
+    _check_vector("slots", slots)
     if rows == 0:
         return
     if slots.shape[0] < rows or heads != cache.shape[2]:
         raise ValueError("slots or heads disagree with the cache")
+    _, _, tail, _ = qsa_cache_row_layout(QSA_CACHE_FORMATS[fmt], head_dim)
+    if scale.shape != (*cache.shape[:3], *tail):
+        raise ValueError("scale must be [pages, page, heads(, groups)] of the cache")
     if values.stride(-1) != 1 or cache.stride(-1) != 1:
         raise ValueError("quantized QSA rows must be contiguous in the head dim")
     flat = cache.view(cache.shape[0] * cache.shape[1], heads, cache.shape[3])
@@ -92,7 +99,13 @@ def qsa_store_quantized_rows(
             raise ValueError("values and FP8 cache disagree on head_dim")
         second = second_cache is not None
         if second and (
-            second_cache.stride() != cache.stride()
+            second_scale is None
+            or second_values is None
+            or second_cache.shape != cache.shape
+            or second_cache.dtype != cache.dtype
+            or second_scale.shape != scale.shape
+            or second_scale.dtype != scale.dtype
+            or second_cache.stride() != cache.stride()
             or second_scale.stride() != scale.stride()
             or second_values.shape != values.shape
             or second_values.stride(-1) != 1

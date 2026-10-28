@@ -284,6 +284,55 @@ def test_qsa_fp4_writer_is_exact_on_the_grid_and_close_off_it():
     assert per_row.mean() < 0.15
 
 
+def test_qsa_writer_rejects_bad_slots_and_planes():
+    from aiter.ops.qsa import FP8_DTYPE, qsa_cache_row_layout, qsa_store_quantized_rows
+
+    def planes(fmt, pages):
+        vdim, vdtype, tail, sdtype = qsa_cache_row_layout(fmt, 256)
+        cache = torch.zeros(pages, 4, 2, vdim, device="cuda", dtype=vdtype)
+        return cache, torch.zeros(pages, 4, 2, *tail, device="cuda", dtype=sdtype)
+
+    values = torch.randn(4, 2, 256, device="cuda").bfloat16()
+    backing = torch.arange(8, device="cuda")
+    # The writers read slots[row] without a stride.
+    for fmt in ("fp8", "fp4"):
+        cache, scale = planes(fmt, 2)
+        for slots in (backing[::2], backing[:4].float(), backing[:4].view(2, 2)):
+            with pytest.raises(ValueError):
+                qsa_store_quantized_rows(cache, scale, slots, values)
+
+    # Planes with fewer pages can have the same strides as the first cache.
+    cache, scale = planes("fp8", 2)
+    small_cache, small_scale = planes("fp8", 1)
+    assert small_cache.stride() == cache.stride()
+    assert small_scale.stride() == scale.stride()
+    slots = backing[:4] + 4
+    bad = [
+        (cache, small_scale, (cache.clone(), scale.clone())),
+        (cache, scale, (small_cache, scale.clone())),
+        (cache, scale, (cache.clone(), small_scale)),
+    ]
+    for first_cache, first_scale, (second_cache, second_scale) in bad:
+        with pytest.raises(ValueError):
+            qsa_store_quantized_rows(
+                first_cache,
+                first_scale,
+                slots,
+                values,
+                second_cache,
+                second_scale,
+                values,
+            )
+    second_cache, second_scale = planes("fp8", 2)
+    qsa_store_quantized_rows(
+        cache, scale, slots, values, second_cache, second_scale, values
+    )
+    assert cache.dtype == FP8_DTYPE
+    assert torch.equal(cache.view(torch.uint8), second_cache.view(torch.uint8))
+    assert torch.equal(scale, second_scale)
+    assert scale[1].all() and not scale[0].any()
+
+
 def _index_case(requests, context, rows_per_request, page_rows, seed=2):
     g = torch.Generator(device="cuda").manual_seed(seed)
     groups = context // 4
@@ -572,3 +621,62 @@ def test_qsa_stacked_scorer_respects_max_columns():
     torch.testing.assert_close(
         _seen(logits, visible), _seen(ref[:, :1000], visible), rtol=1e-4, atol=1e-4
     )
+
+
+@pytest.mark.parametrize("fmt", ["bf16", "fp8", "fp4"])
+@pytest.mark.parametrize("rows", [4, 300])
+def test_qsa_scorers_stay_inside_a_narrow_page_table(fmt, rows):
+    from aiter.ops.qsa import qsa_paged_mqa_logits
+
+    # A [1, 3] table with page size 4 rounds up to width 4. The last tile must
+    # not read table entry 3, which is outside the table.
+    g = torch.Generator(device="cuda").manual_seed(3)
+    keys = torch.randn(16, 1, _STACKED_DIM, generator=g, device="cuda").bfloat16()
+    cache, scale = _store(fmt, keys, 4)
+    restored = _dequant(fmt, cache, scale)
+    table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")[:, :3]
+    q = torch.randn(rows, _STACKED_HEADS, _STACKED_DIM, generator=g, device="cuda")
+    q = q.bfloat16()
+    token_to_request = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    positions = torch.full((rows,), 47, dtype=torch.int64, device="cuda")
+    lens = torch.tensor([48], dtype=torch.int32, device="cuda")
+    case = (q, cache, table, token_to_request, positions, lens)
+    ref, ref_visible = _stacked_reference(q, restored, *case[2:])
+    assert ref_visible.eq(12).all()
+    for stacked in (True, False):
+        logits, visible = qsa_paged_mqa_logits(
+            *case,
+            compress_ratio=_STACKED_RATIO,
+            compressed_k_scale=scale,
+            stacked_decode=stacked,
+        )
+        assert logits.shape == (rows, 12)
+        assert torch.equal(visible, ref_visible)
+        torch.testing.assert_close(logits, ref, rtol=1e-4, atol=1e-4)
+
+
+def test_qsa_imports_without_a_gpu():
+    import os
+    import subprocess
+    import sys
+
+    # Without a visible GPU, aiter.dtypes.fp8 is a uint8 placeholder.
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="")
+    env.pop("AITER_AOT_REPLAY", None)
+    code = (
+        "import torch\n"
+        "assert not torch.cuda.is_available()\n"
+        "import aiter.ops.qsa as qsa\n"
+        "import aiter.ops.triton.attention.qsa\n"
+        "assert qsa.FP8_MAX is None\n"
+        "assert qsa.qsa_cache_row_layout('fp4', 128)[0] == 64\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
