@@ -537,6 +537,9 @@ class AITER_CONFIG:
             keys.append("cu_num")
         if "gfx" in merge_df.columns and "gfx" not in keys:
             keys.append("gfx")
+        # gfx and cu_num cannot tell MI300X from MI325X.
+        if "gpu_model" in merge_df.columns and "gpu_model" not in keys:
+            keys.append("gpu_model")
         dedup_keys = keys + ["_tag"] if has_tag else keys
         # Only key on columns actually present in the merged frame. Most
         # families carry cu_num, but some (e.g. the mxscale batched-GEMM
