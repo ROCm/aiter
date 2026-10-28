@@ -19,6 +19,12 @@ import torch
 
 try:
     from aiter import ActivationType, QuantType
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (
+        arena,
+        mori_caps,
+        recipe,
+        transport,
+    )
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import mega_moe as MM
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.compact_plan import (
         compact_done_nbytes,
@@ -128,7 +134,7 @@ def _install_mori(monkeypatch, describe=True):
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
-    MM._mori_capabilities.cache_clear()
+    mori_caps._mori_capabilities.cache_clear()
 
 
 @pytest.fixture
@@ -136,8 +142,8 @@ def mori(monkeypatch):
     _install_mori(monkeypatch)
     monkeypatch.setenv("AITER_TDM_TILE_M", str(COMPACT_TILE))
     monkeypatch.delenv("AITER_TDM_TILE_M2", raising=False)
-    yield MM._mori_capabilities()
-    MM._mori_capabilities.cache_clear()
+    yield mori_caps._mori_capabilities()
+    mori_caps._mori_capabilities.cache_clear()
 
 
 # -- the layout, region by region, in the arena's order --------------------------
@@ -254,8 +260,10 @@ def _cases():
 def test_layout(mori):
     checked = 0
     for pairing, geometry, config in _cases():
-        got = MM._arena_layout(config, MM._capabilities_for(config.recipe))
-        want = MM._ArenaLayout.of(_reference_regions(config, COMPACT_TILE))
+        got = transport._arena_layout(
+            config, transport._capabilities_for(config.recipe)
+        )
+        want = arena._ArenaLayout.of(_reference_regions(config, COMPACT_TILE))
         assert got == want, (pairing, geometry)
         checked += 1
     assert checked > 500
@@ -265,8 +273,10 @@ def test_required_vmm_bytes(mori):
     for pairing, geometry, config in _cases():
         ws, hidden, topk, mtpr, epr = geometry
         need = MM.MegaMoEGfx1250.required_vmm_bytes(config.recipe, config.geometry)
-        layout = MM._arena_layout(config, MM._capabilities_for(config.recipe))
-        assert need == MM._cco_alloc_bytes(layout.total_bytes, 2 << 20)
+        layout = transport._arena_layout(
+            config, transport._capabilities_for(config.recipe)
+        )
+        assert need == arena._cco_alloc_bytes(layout.total_bytes, 2 << 20)
         assert need % (2 << 20) == 0 and need >= layout.total_bytes
         # The keyword form names neither the wires nor the combine.
         bound = MM.MegaMoEGfx1250.required_vmm_bytes(
@@ -298,18 +308,18 @@ def test_mori_without_describe_is_refused(monkeypatch):
     _install_mori(monkeypatch, describe=False)
     try:
         with pytest.raises(RuntimeError, match=r"ROCm/mori#844"):
-            MM._mori_capabilities()
+            mori_caps._mori_capabilities()
     finally:
-        MM._mori_capabilities.cache_clear()
+        mori_caps._mori_capabilities.cache_clear()
 
 
 def test_cco_rounding():
     g = 2 << 20
-    assert MM._cco_alloc_bytes(1, g) == g
-    assert MM._cco_alloc_bytes(g, g) == g
-    assert MM._cco_alloc_bytes(g + 1, g) == 2 * g
+    assert arena._cco_alloc_bytes(1, g) == g
+    assert arena._cco_alloc_bytes(g, g) == g
+    assert arena._cco_alloc_bytes(g + 1, g) == 2 * g
     big = (2 << 30) + 1
-    assert MM._cco_alloc_bytes(big, 1 << 20) == _align(big, 2 << 20)
+    assert arena._cco_alloc_bytes(big, 1 << 20) == _align(big, 2 << 20)
 
 
 # -- the recipe ------------------------------------------------------------------
@@ -467,8 +477,8 @@ def test_rejected_by_geometry(mori):
 )
 def test_recv_token_bound_out_of_range(mori, dispatch, wire):
     config = _config(dispatch, C.FUSED_SCATTER, wire, ("bf16",), 4, 7168, 8, 16, 8)
-    stage_cls = MM._stage_classes(config.recipe)[0]
-    stage = stage_cls(config, MM._capabilities_for(config.recipe))
+    stage_cls = recipe._stage_classes(config.recipe)[0]
+    stage = stage_cls(config, transport._capabilities_for(config.recipe))
     x = torch.zeros(4, 7168, dtype=torch.bfloat16)
     ids = torch.zeros(4, 8, dtype=torch.int32)
     wts = torch.zeros(4, 8, dtype=torch.float32)
