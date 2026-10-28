@@ -19,8 +19,7 @@ from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
-    _Q256_KERNEL,
-    _Q256_KERNELS,
+    _ASM_ROUTE_PARTIAL_KERNELS,
     _flydsl_route_output_nbytes,
     _is_flydsl_stage2,
     _stage2_runtime_uses_route_reduce,
@@ -68,6 +67,10 @@ from aiter.ops.shuffle import (
 )
 
 logger = logging.getLogger(__name__)
+
+_Q256_KERNEL = (
+    "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route"
+)
 
 
 @contextmanager
@@ -333,7 +336,10 @@ def _check_q256_dispatch_regressions(call_args, kwargs, reference_inputs):
     ):
         metadata = _q256_metadata(**metadata_overrides)
         assert not metadata.run_1stage and metadata.stage2 is not None
-        assert metadata.stage1.keywords.get("kernelName", "") not in _Q256_KERNELS
+        assert (
+            metadata.stage1.keywords.get("kernelName", "")
+            not in _ASM_ROUTE_PARTIAL_KERNELS
+        )
         if "quant_dtype_a2" in overrides:
             assert metadata.fuse_quant == "fp8"
             assert "_afp8_" in metadata.stage2.keywords["kernelName"]
@@ -860,7 +866,7 @@ def test_fmoe(
     # the 2-stage flydsl/torch path does via its bf16 a2 buffer).
     if ref_dtype == "fp32":
         stage1_ref_dtype = dtypes.fp32
-    if expected_kernel in _Q256_KERNELS:
+    if expected_kernel in _ASM_ROUTE_PARTIAL_KERNELS:
         # Q256 quantizes the FP32 SiLU*up result, without a BF16 round trip.
         stage1_ref_dtype = dtypes.fp32
 
@@ -913,7 +919,7 @@ def test_fmoe(
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
-    if expected_kernel in _Q256_KERNELS:
+    if expected_kernel in _ASM_ROUTE_PARTIAL_KERNELS:
         out2_ref = _torch_q256_stage2(out1_ref, w2_qt, w2_scale, topk_ids, topk_weights)
     else:
         out2_ref = torch_moe_stage2(
@@ -1038,7 +1044,7 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    if expected_kernel in _Q256_KERNELS:
+    if expected_kernel in _ASM_ROUTE_PARTIAL_KERNELS:
         ret = _check_q256_integration(
             (input, w1_qt_aiter, w2_qt_aiter, topk_weights, topk_ids),
             _fused_moe_kwargs,
@@ -1370,14 +1376,13 @@ def _iter_csv_cases():
             "flydsl_" not in kernel_name1
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
-            and kernel_name1 not in _Q256_KERNELS
             and not (
-                kernel_name1.startswith("_ZN5aiter")
+                kernel_name1.startswith(("_ZN5aiter", "fmoe_"))
                 and str(row.get("q_type", "")) == "QuantType.per_1x32"
             )
         ):
             continue
-        if kernel_name1 in _Q256_KERNELS and get_gfx() != "gfx950":
+        if kernel_name1 in _ASM_ROUTE_PARTIAL_KERNELS and get_gfx() != "gfx950":
             continue
         if args.csv_filter:
             _kn = kernel_name1 + " " + kernel_name2
@@ -1441,7 +1446,7 @@ def _iter_csv_cases():
             args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
         )
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
-        if kernel_name1 in _Q256_KERNELS:
+        if kernel_name1 in _ASM_ROUTE_PARTIAL_KERNELS:
             kwargs["expected_kernel"] = kernel_name1
             kwargs["shared_expert_id"] = 512
             kwargs["check_aot_cache"] = False
@@ -1984,13 +1989,13 @@ def test_q256_token_boundaries():
         return
     metadata = _q256_metadata()
     assert metadata.run_1stage and metadata.block_m == 256
-    assert metadata.stage1.keywords["kernelName"] in _Q256_KERNELS
+    assert metadata.stage1.keywords["kernelName"] in _ASM_ROUTE_PARTIAL_KERNELS
     for gate_up_interleave in (False, None):
         supported = _q256_metadata(
             opus_weights_shuffled=True, gate_up_interleave=gate_up_interleave
         )
         assert supported.run_1stage and supported.block_m == 256
-        assert supported.stage1.keywords["kernelName"] in _Q256_KERNELS
+        assert supported.stage1.keywords["kernelName"] in _ASM_ROUTE_PARTIAL_KERNELS
     for unsupported in (
         {"opus_weights_shuffled": False},
         {"is_shuffled": False},
@@ -2006,7 +2011,10 @@ def test_q256_token_boundaries():
     ):
         fallback = _q256_metadata(**unsupported)
         assert not fallback.run_1stage and fallback.stage2 is not None
-        assert fallback.stage1.keywords.get("kernelName", "") not in _Q256_KERNELS
+        assert (
+            fallback.stage1.keywords.get("kernelName", "")
+            not in _ASM_ROUTE_PARTIAL_KERNELS
+        )
     rows = []
     for token in (4096, 4097, 8191, 8192, 8193):
         case = _q256_case(token, 8192)
@@ -2404,7 +2412,7 @@ def main():
     q256_selected = False
     for kwargs, extras in case_iter:
         seen += 1
-        q256_selected |= kwargs.get("expected_kernel", "") in _Q256_KERNELS
+        q256_selected |= kwargs.get("expected_kernel", "") in _ASM_ROUTE_PARTIAL_KERNELS
         skip_reason = _moe_2stage_skip_reason(kwargs)
         if skip_reason is not None:
             aiter.logger.warning(

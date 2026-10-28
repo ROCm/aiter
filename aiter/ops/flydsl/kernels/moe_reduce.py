@@ -61,8 +61,7 @@ def _moe_reduction_body(
         row_stride = fp8_row_stride
         out_numeric = fx.Float16 if (out_dtype_str or "bf16") == "f16" else fx.BFloat16
         load_atom = fx.make_copy_atom(
-            fx.rocdl.BufferCopy64b(2) if streaming_loads else fx.rocdl.BufferCopy64b(),
-            fx.Int8,
+            fx.rocdl.BufferCopy64b(2 if streaming_loads else 0), fx.Int8
         )
     else:
         in_elem = (
@@ -74,12 +73,7 @@ def _moe_reduction_body(
         row_stride, out_numeric = model_dim, in_elem
         V = 128 // (8 * in_bytes)  # 4 (f32), 8 (16b)
         load_atom = fx.make_copy_atom(
-            (
-                fx.rocdl.BufferCopy128b(2)
-                if streaming_loads
-                else fx.rocdl.BufferCopy128b()
-            ),
-            in_elem,
+            fx.rocdl.BufferCopy128b(2 if streaming_loads else 0), in_elem
         )
     out_bytes = out_numeric.width // 8
     TILE = NTHREADS * V
