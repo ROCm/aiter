@@ -267,6 +267,12 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
 )
 
+# Exact hardware/problem keyed MHA forward runtime dispatch.
+AITER_CONFIG_MHA_FWD = os.getenv(
+    "AITER_CONFIG_MHA_FWD",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mha_fwd.csv",
+)
+
 
 def model_config_files(tuned_file_name: str) -> list[str]:
     """Per-model tuned CSVs merged with the default one when no env var is set."""
@@ -465,6 +471,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_MEGA_MOE_TP_BIGM",
             AITER_CONFIG_MEGA_MOE_TP_BIGM,
             "mega_moe_tp_bigm_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_MHA_FWD_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MHA_FWD",
+            AITER_CONFIG_MHA_FWD,
+            "tuned_mha_fwd",
         )
 
     @property
