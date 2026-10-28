@@ -1,0 +1,2 @@
+gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx1250,256,16384,16384,16384,flydsl,12268,1,0,flydsl_a4w4_bpreshuffle_compute_wmma_t256x256x256_mw2_nw2_nb4_sk1_cm4_cn4,0,0,0
