@@ -20,7 +20,7 @@ PY
 export AITER_USE_GROUPED_GEMM=1
 export AITER_GROUPED_DEBUG=0
 export ENABLE_CK=0
-export FLYDSL_DUMP_IR=1
+export FLYDSL_DUMP_IR=0
 export AITER_LOG_MORE=1
 export AITER_MOE_EXPERT_BALANCE=true
 
@@ -29,6 +29,7 @@ export AITER_CONFIG_GROUPED_FMOE="$script_dir/aiter/configs/benchmarks/a4w4_conc
 # Validated for this balanced workload, not a general cluster-sync default.
 export AITER_FLYDSL_TDM_EARLY_TIMEOUT=0
 export AITER_FLYDSL_DISABLE_CLUSTER_SYNC=1
+export AITER_FLYDSL_QUAD_PIPELINE=1
 
 # Keep A-preshuffled inputs, with GEMM1 producing a BF16 intermediate and
 # a separate quant/preshuffle kernel preparing GEMM2's input.
@@ -43,6 +44,7 @@ export AITER_FLYDSL_EXPLICIT_VGPR_PARTITION=1
 # export AITER_FLYDSL_INTERLEAVED_LDS_LOAD=1
 export AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
 export AITER_FLYDSL_DISABLE_GEMM1_ACT=1
+export AITER_FLYDSL_LDS_WAR_ORDER=1
 
 # Never start GPU work while another process is reported. The version check
 # above uses package metadata only and does not initialize the GPU.
@@ -75,4 +77,6 @@ exec python3 -u op_tests/flydsl_tests/test_flydsl_grouped_gemm.py \
   --no-bias \
   --iters 64 \
   --no-check-aot-cache \
+  --data-init zero \
+  --scale-init zero \
   "$@"

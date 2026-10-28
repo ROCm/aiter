@@ -92,8 +92,11 @@ if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 if PLANAR_LDS not in (0, 1):
     raise ValueError("AITER_FLYDSL_PLANAR_LDS must be 0 or 1")
+LDS_WAR_ORDER = int(os.environ.get("AITER_FLYDSL_LDS_WAR_ORDER", "1"))
 if INTERLEAVED_LDS_LOAD not in (0, 1):
     raise ValueError("AITER_FLYDSL_INTERLEAVED_LDS_LOAD must be 0 or 1")
+if LDS_WAR_ORDER not in (0, 1):
+    raise ValueError("AITER_FLYDSL_LDS_WAR_ORDER must be 0 or 1")
 if LDS_SOA_LOAD_INTERLEAVE not in (None, 0, 1):
     raise ValueError("LDS_SOA_LOAD_INTERLEAVE must be 0 or 1")
 if FORCE_1X4_CLUSTER not in (0, 1):
@@ -238,6 +241,9 @@ def launch_gemm_a8w4_tdm(
     interleaved_lds_load_on = int(
         bool(INTERLEAVED_LDS_LOAD or lds_soa_load_interleave_on)
     )
+    # Arithmetic, not `and`: the AST rewriter moves a boolean operand into a
+    # nested function, which hides the global from the JIT cache key.
+    war_order_on = interleaved_lds_load_on * LDS_WAR_ORDER
     WMMA_M = 16
     WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
@@ -303,6 +309,7 @@ def launch_gemm_a8w4_tdm(
         SUPPORT_EXPLICIT_VGPR_PARTITION,
         planar_lds_on,
         interleaved_lds_load_on,
+        war_order_on,
         row_major_ascale,
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
@@ -473,6 +480,8 @@ def launch_gemm_a8w4_tdm(
     _explicit_vgpr_partition = "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
+    if war_order_on:
+        _interleaved_lds_load += "_warorder"
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
@@ -1284,6 +1293,37 @@ def launch_gemm_a8w4_tdm(
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
         rmem_slots = [make_rmem_slot(i) for i in range_constexpr(2)]
 
+        def war_load_order():
+            """Interleaved A/B loads, B by its last read in the previous k128.
+
+            A slot is refilled right after the WMMAs that last read it, so a DS
+            load into a register one of the newest WMMAs still reads costs a
+            full s_wait_alu va_vdst(0) drain of the WMMA pipe. A and B keep
+            alternating between their planar LDS segments. Scales come last,
+            in index order so adjacent dwords still merge into ds_load_2addr.
+            """
+            last_b = {}
+            pos = 0
+            for wm in range_constexpr(wmma_m_rep):
+                for wn_raw in range_constexpr(wmma_n_rep):
+                    wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
+                    last_b[wn] = pos
+                    pos += 1
+            b_order = sorted(last_b, key=lambda wn: last_b[wn])
+            order = []
+            for i in range_constexpr(max(wmma_m_rep, wmma_n_rep)):
+                if const_expr(i < wmma_m_rep):
+                    order.append(("a", i))
+                if const_expr(i < wmma_n_rep):
+                    order.append(("b", b_order[i]))
+            return (
+                order
+                + [("sa", i) for i in range(sa_pairs)]
+                + [("sb", i) for i in range(sb_pairs)]
+            )
+
+        WAR_LOAD_ORDER = war_load_order()
+
         def load_lds_data(slot, lds_addr, ksl, kt, interleaved_lds_load=False):
             """Load one k128 from precomputed LDS bases into ``slot``."""
             if const_expr(not interleaved_lds_load):
@@ -1301,6 +1341,21 @@ def launch_gemm_a8w4_tdm(
                     slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
                 for wn in range_constexpr(wmma_n_rep):
                     slot.b[wn].store(load_b(lds_addr.b, wn, ksl))
+            elif const_expr(war_order_on):
+                loaded = {}
+                for kind, i in WAR_LOAD_ORDER:
+                    if const_expr(kind == "a"):
+                        slot.a[i].store(load_a(lds_addr.a, i, ksl))
+                    elif const_expr(kind == "b"):
+                        slot.b[i].store(load_b(lds_addr.b, i, ksl))
+                    elif const_expr(kind == "sa"):
+                        loaded[(kind, i)] = load_sa(lds_addr.sa, i, ksl, kt)
+                    else:
+                        loaded[(kind, i)] = load_sb(lds_addr.sb, i, ksl)
+                sa_v = [loaded[("sa", i)] for i in range_constexpr(sa_pairs)]
+                sb_v = [loaded[("sb", i)] for i in range_constexpr(sb_pairs)]
+                slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
+                slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             else:
                 # Planar LDS keeps all A stages and all B stages in disjoint
                 # contiguous regions. Alternate their reads so neither the
@@ -1520,7 +1575,9 @@ def launch_gemm_a8w4_tdm(
                 # unclaimed read is hoisted ahead of every group.
                 rocdl.sched_mfma(1)
                 rocdl.sched_dsrd(4)
-                rocdl.sched_mfma(9)
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(4)
+                rocdl.sched_mfma(8)
 
                 rocdl.sched_barrier(0)
                 next_fenced = (

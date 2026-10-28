@@ -434,6 +434,29 @@ def _run_grouped_via_fused_moe(
         bias2 = torch.zeros((experts, K))
     # Activations: bf16; fused_moe handles the dispatched quant internally.
     hidden = _init_hidden((tokens, K), data_format, data_init, generator)
+    xw_path = os.environ.get("AITER_GROUPED_LOAD_XW")
+    if xw_path:
+        # x/w dumped by op_tests/test_gemm_a4w4.py (AITER_GEMM_A4W4_DUMP):
+        # x becomes the hidden states, w the gemm1 weight of the single expert.
+        from aiter import get_hip_quant
+
+        xw = torch.load(xw_path)
+        x, w = xw["x"], xw["w"]
+        assert experts == 1, "a dumped dense GEMM has one expert"
+        assert tuple(x.shape) == (tokens, K), f"x {tuple(x.shape)} != {(tokens, K)}"
+        assert tuple(w.shape) == (2 * inter, K), f"w {tuple(w.shape)} != {(2 * inter, K)}"
+        hidden = x.to(device="cuda", dtype=torch.bfloat16)
+        wq, ws = get_hip_quant(QuantType.per_1x32)(
+            w.to(device="cuda", dtype=torch.bfloat16),
+            quant_dtype=dtypes.fp4x2,
+            shuffle=False,
+        )
+        w1_logical = wq.view(torch.uint8)[: 2 * inter, :K_pack].reshape(1, 2 * inter, K_pack)
+        w1_scale_raw = (
+            ws.view(torch.uint8)[: 2 * inter, : K // SCALE_BLOCK]
+            .reshape(1, 2 * inter, K // SCALE_BLOCK)
+            .contiguous()
+        )
 
     # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
     topk_id, topk_w = _make_topk(hidden, experts, topk)

@@ -128,6 +128,8 @@ def workgroup_barrier(use_cluster=False):
     if use_cluster:
         cluster.cluster_barrier()
     else:
+        # rocdl.s_barrier_signal(WGP_BARRIER_ID)
+        # rocdl.s_barrier_wait(WGP_BARRIER_ID)
         gpu.barrier()
 
 

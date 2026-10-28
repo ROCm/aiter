@@ -125,6 +125,11 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     quant = aiter.get_hip_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
     w = torch.randn((N, K), dtype=dtype)
+    dump_path = os.environ.get("AITER_GEMM_A4W4_DUMP")
+    if dump_path:
+        torch.save({"x": x.cpu(), "w": w.cpu()}, dump_path)
+    # x = torch.ones((M, K), dtype=dtype)
+    # w = torch.ones((N, K), dtype=dtype)
     # The row-major quant is the reference operand; every layout below holds these bytes.
     xq_raw, xs_raw = quant(x, quant_dtype=dtypes.fp4x2, shuffle=False)
     wq_raw, ws_raw = quant(w, quant_dtype=dtypes.fp4x2, shuffle=False)

@@ -97,6 +97,34 @@ def _select_num_waves_per_tensor_tdm(csv_num_waves: int) -> int:
     return num_waves
 
 
+def _use_moe_tuned(stage: int, *, plain: bool, **shape) -> bool:
+    """Whether to run the four-quadrant (gemm_a4w4_256x256) grouped kernel.
+
+    AITER_FLYDSL_MOE_TUNED{stage} overrides AITER_FLYDSL_MOE_TUNED. An enabled
+    switch silently falls back to the TDM kernel for unsupported launches.
+    """
+    value = os.environ.get(
+        f"AITER_FLYDSL_MOE_TUNED{stage}", os.environ.get("AITER_FLYDSL_MOE_TUNED", "0")
+    ).strip()
+    if value not in ("0", "1"):
+        raise ValueError("AITER_FLYDSL_MOE_TUNED must be 0 or 1")
+    if value == "0" or not plain:
+        return False
+    from .kernels.mxfp4_moe_gemm_tuned_gfx1250 import moe_tuned_supported
+
+    return moe_tuned_supported(**shape)
+
+
+def _aligned_ptr_arg(t: torch.Tensor):
+    """Pointer argument declaring the 16-byte alignment TDM and b128 copies rely on."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    if t.data_ptr() % 16:
+        raise ValueError("grouped MoE tuned GEMM operands must be 16-byte aligned")
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr(), assumed_align=16)
+
+
 def flydsl_grouped_gemm_a8w4_masked(
     out,
     a,
@@ -231,6 +259,57 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"{stage2_scatter.combine_quant_bits} needs N % {n_align} == 0 to "
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
+    if _use_moe_tuned(
+        stage,
+        K=K,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        num_buffers=num_buffers,
+        cluster_m=cluster_m,
+        cluster_n=cluster_n,
+        plain=all(
+            [
+                a_is_fp4,
+                a_preshuffled,
+                not stage1_act,
+                not stage1_quant_out,
+                not has_bias,
+                not enable_ep_scatter,
+                not row_major_ascale,
+                not a_row_stride_bytes,
+                not a_scale_row_stride_bytes,
+                not persistent_workers,
+            ]
+        ),
+    ):
+        from .kernels.mxfp4_moe_gemm_tuned_gfx1250 import launch_moe_gemm_a4w4_tuned
+
+        launch_moe_gemm_a4w4_tuned(
+            _aligned_ptr_arg(out),
+            _aligned_ptr_arg(a),
+            _aligned_ptr_arg(w),
+            _aligned_ptr_arg(a_scales),
+            _aligned_ptr_arg(w_scales),
+            ptr_arg(m_tile_map),
+            contiguous_m,
+            stream,
+            N,
+            K,
+            n_experts,
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            num_buffers,
+            out_is_f16,
+            cluster_m,
+            cluster_n,
+        )
+        return out
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
     launch_gemm_a8w4_tdm(
         out,
