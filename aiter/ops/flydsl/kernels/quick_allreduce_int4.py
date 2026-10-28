@@ -300,6 +300,7 @@ class PackNormStorage:
 DEFAULT_ATOMS = ATOMS
 WIDE_ATOMS = 12
 TILE_ATOMS = (DEFAULT_ATOMS, WIDE_ATOMS)
+SIGNED_SOFFSET_MAX = (1 << 31) - 1
 PACK_I32_WIDE = WIDE_ATOMS * (RANK_TILE_BYTES // 4)
 NORM_RED_F32_WIDE = (BLOCK // WAVE) * WIDE_ATOMS
 
@@ -340,6 +341,14 @@ def tile_atoms_for(hidden: int, world_size: int) -> int | None:
     if atoms_per_row == 3 and WIDE_ATOMS % int(world_size) == 0:
         return WIDE_ATOMS
     return None
+
+
+def max_payload_bytes(tile_atoms: int) -> int:
+    """Largest payload whose final atom has a nonnegative signed soffset."""
+    tile_bytes = int(tile_atoms) * (BLOCK * 16)
+    atom_bytes = BLOCK * 16
+    max_tiles = (SIGNED_SOFFSET_MAX - (tile_bytes - atom_bytes)) // tile_bytes + 1
+    return max_tiles * tile_bytes
 
 
 MXFP4_GROUP = 32

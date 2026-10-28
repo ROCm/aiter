@@ -44,7 +44,10 @@ from aiter.test_common import checkAllclose, run_perftest
 set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+    DEFAULT_ATOMS,
+    WIDE_ATOMS,
     WORLD,
+    max_payload_bytes,
     mxfp4_scale_shape,
     tile_atoms_for,
 )
@@ -56,6 +59,15 @@ except (KeyError, RuntimeError):
     ARCH = None
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 EPS = 1e-6
+
+
+def test_signed_soffset_payload_boundary():
+    assert max_payload_bytes(DEFAULT_ATOMS) == 1 << 31
+    assert max_payload_bytes(WIDE_ATOMS) == 2_147_450_880
+    assert 174_760 * 6144 * 2 == max_payload_bytes(WIDE_ATOMS)
+    assert 174_761 * 6144 * 2 > max_payload_bytes(WIDE_ATOMS)
+
+
 SQNR_MIN_DB = 18.0
 # vs unfused FlyDSL: differs only by bf16 rounding of the reduced sum.
 TIGHT_RTOL = 2e-2
@@ -166,6 +178,20 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
     fly = QuickAllReduceInt4(
         group=gloo, device=device, rank=rank, world_size=tp, grid_cap=grid_cap
     )
+    wide_atoms = tile_atoms_for(6144, tp)
+    if wide_atoms is not None and wide_atoms != DEFAULT_ATOMS:
+        is_capturing = torch.cuda.is_current_stream_capturing
+        try:
+            torch.cuda.is_current_stream_capturing = lambda: True
+            assert not fly.supports_rmsnorm(6144, 6144 * 2)
+        finally:
+            torch.cuda.is_current_stream_capturing = is_capturing
+        fly.prepare_rmsnorm(6144)
+        try:
+            torch.cuda.is_current_stream_capturing = lambda: True
+            assert fly.supports_rmsnorm(6144, 6144 * 2)
+        finally:
+            torch.cuda.is_current_stream_capturing = is_capturing
     rows = []
     # compile_rmsnorm must cover every fused build the cases pick: a case that
     # adds one to the cache compiled it on its first call.

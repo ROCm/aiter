@@ -28,6 +28,7 @@ from .kernels.quick_allreduce_int4 import (
     clamp_grid_cap,
     latency_max_tiles,
     make_quick_allreduce_int4_kernel,
+    max_payload_bytes,
     mxfp4_scale_shape,
     tile_atoms_for,
 )
@@ -563,7 +564,14 @@ class QuickAllReduceInt4:
 
         Hidden 6144 runs on a 48 KiB tile and needs world_size 2 or 4.
         """
-        return tile_atoms_for(hidden, self.world_size) is not None and nbytes < 1 << 31
+        tile_atoms = tile_atoms_for(hidden, self.world_size)
+        if tile_atoms is None or int(nbytes) > max_payload_bytes(tile_atoms):
+            return False
+        return not (
+            tile_atoms != DEFAULT_ATOMS
+            and tile_atoms not in self._by_atoms
+            and torch.cuda.is_current_stream_capturing()
+        )
 
     @staticmethod
     def mxfp4_scale_shape(rows: int, hidden: int) -> tuple[int, int]:
@@ -575,7 +583,7 @@ class QuickAllReduceInt4:
             # Atom byte offsets travel in the signed 32-bit soffset.
             raise ValueError(
                 "fused RMSNorm supports hidden in (2048, 4096, 8192, 16384), "
-                "and 6144 at world_size 2 or 4, with payloads under 2 GiB, "
+                "and 6144 at world_size 2 or 4, with signed-soffset-safe payloads, "
                 f"got hidden={hidden}, {live_bytes} bytes at "
                 f"world_size={self.world_size}"
             )
