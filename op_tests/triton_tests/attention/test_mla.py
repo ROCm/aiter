@@ -25,6 +25,90 @@ def uniform_random(shape, start=0, end=1, dtype=None, device=None):
     return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
 
 
+def input_helper(
+    batch_size: int,
+    ctx_lens: int,
+    decode_qlen: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_size: int,
+    num_blocks: int | None,
+    varlen: bool,
+    device: str = "cuda",
+):
+    """Generates the paged-KV shapes/tensors shared by the decode and prefill
+    tests. ``decode_qlen > 0`` fixes the query length (decode); ``0`` lets it
+    vary with ``varlen`` like the KV length (prefill).
+
+    ``num_blocks`` is the size of the block pool to draw (possibly repeated)
+    block indices from. Pass ``None`` to instead allocate exactly as many
+    blocks as needed and assign each sequence a unique set of blocks (e.g. for
+    benchmarking realistic KV cache footprint/bandwidth)."""
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
+    seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device=device)
+    seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device=device)
+    if varlen:
+        for i in range(batch_size):
+            seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
+    else:
+        seq_lens_kv.fill_(ctx_lens)
+    if decode_qlen > 0:
+        seq_lens_qo.fill_(decode_qlen)
+    else:
+        if varlen:
+            for i in range(batch_size):
+                seq_lens_qo[i] = max(
+                    min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
+                )
+        else:
+            seq_lens_qo.fill_(ctx_lens)
+
+    cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    total_num_query_tokens = cu_seqlens_q[-1].item()
+
+    max_seqlen_kv = seq_lens_kv.max().item()
+    max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
+    if num_blocks is None:
+        num_blocks = batch_size * max_num_blocks_per_seq
+        block_tables = torch.randperm(
+            num_blocks, dtype=torch.int32, device=device
+        ).reshape(batch_size, max_num_blocks_per_seq)
+    else:
+        block_tables = torch.randint(
+            0,
+            num_blocks,
+            (batch_size, max_num_blocks_per_seq),
+            dtype=torch.int32,
+            device=device,
+        )
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, num_kv_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    query = torch.randn(
+        (total_num_query_tokens, num_query_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+
+    return (
+        cu_seqlens_q,
+        seq_lens_kv,
+        max_seqlen_kv,
+        block_tables,
+        kv_buffer,
+        query,
+        sm_scale,
+        qk_head_dim,
+    )
+
+
 def shuffle_kv_buffer(
     kv_buffer: torch.Tensor,
     kv_lora_rank: int,
@@ -294,40 +378,30 @@ def test_mla_decode_fwd(
     random.seed(0)
     torch.manual_seed(0)
     num_query_heads, num_kv_heads = num_heads
-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
 
-    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
-    seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
-    seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device="cuda")
-    if varlen:
-        for i in range(batch_size):
-            seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
-    else:
-        seq_lens_kv.fill_(ctx_lens)
-    seq_lens_qo.fill_(decode_qlen)
-
-    cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    (
+        cu_seqlens_q,
+        seq_lens_kv,
+        max_seqlen_kv,
+        block_tables,
+        kv_buffer,
+        query,
+        sm_scale,
+        qk_head_dim,
+    ) = input_helper(
+        batch_size,
+        ctx_lens,
+        decode_qlen,
+        num_query_heads,
+        num_kv_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_size,
+        num_blocks,
+        varlen,
+    )
     total_num_query_tokens = cu_seqlens_q[-1].item()
 
-    max_seqlen_kv = seq_lens_kv.max().item()
-    max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0,
-        num_blocks,
-        (batch_size, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device="cuda",
-    )
-    kv_buffer = torch.randn(
-        (num_blocks, block_size, num_kv_heads, qk_head_dim),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    query = torch.randn(
-        (total_num_query_tokens, num_query_heads, qk_head_dim),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
     query_scales = None
     if q_dtype == torch.uint8:
         query = query / 10
@@ -343,8 +417,6 @@ def test_mla_decode_fwd(
     else:
         query = query.to(q_dtype)
         maybe_quant_query = query
-
-    sm_scale = 1.0 / (qk_head_dim**0.5)
 
     q_descale = None
     kv_descale = None
@@ -614,43 +686,31 @@ def test_mla_prefill_fwd(
     torch.manual_seed(0)
 
     num_query_heads, num_kv_heads = num_heads
-    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
-    seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
-    seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device="cuda")
-    if varlen:
-        for i in range(batch_size):
-            seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
-            seq_lens_qo[i] = max(
-                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
-            )
-    else:
-        seq_lens_kv.fill_(ctx_lens)
-        seq_lens_qo.fill_(ctx_lens)
 
-    cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
-    total_num_query_tokens = cu_seqlens_q[-1].item()
-
-    max_seqlen_kv = seq_lens_kv.max().item()
-    max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0,
+    (
+        cu_seqlens_q,
+        seq_lens_kv,
+        max_seqlen_kv,
+        block_tables,
+        kv_buffer,
+        q,
+        sm_scale,
+        _,
+    ) = input_helper(
+        batch_size,
+        ctx_lens,
+        0,  # decode_qlen=0 -> query length varies with varlen, like prefill
+        num_query_heads,
+        num_kv_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_size,
         num_blocks,
-        (batch_size, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device="cuda",
+        varlen,
     )
-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
-    kv_buffer = torch.randn(
-        (num_blocks, block_size, num_kv_heads, qk_head_dim),
-        dtype=torch.bfloat16,
-        device="cuda",
-    ).to(kv_dtype)
-    q = torch.randn(
-        (total_num_query_tokens, num_query_heads, qk_head_dim),
-        dtype=torch.bfloat16,
-        device="cuda",
-    ).to(q_dtype)
-    sm_scale = 1.0 / (qk_head_dim**0.5)
+    total_num_query_tokens = cu_seqlens_q[-1].item()
+    kv_buffer = kv_buffer.to(kv_dtype)
+    q = q.to(q_dtype)
 
     q_descale = None
     kv_descale = None

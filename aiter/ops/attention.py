@@ -32,6 +32,14 @@ from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from .opus.mla import opus_mla_decode_fwd, opus_mla_decode_mxfp8_fwd  # noqa: F401
 
 MD_NAME = "module_attention"
+_PA_FWD_ASM_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+
+@_functools.cache
+def pa_fwd_asm_supports_arch() -> bool:
+    """Whether the paged-attention ASM backend supports the current GPU."""
+    return get_gfx_runtime() in _PA_FWD_ASM_SUPPORTED_ARCHS
+
 
 direct_register_custom_op(
     "pa_decode_gluon",
