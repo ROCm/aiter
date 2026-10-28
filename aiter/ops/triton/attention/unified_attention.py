@@ -152,10 +152,11 @@ def _head_split(params: _UAParams):
 
     The Triton kernels then run Q.K as two dots, over 128 and 64 columns, instead
     of one dot over the head padded to 256. Enabled only where it has been measured:
-    BF16/FP16 query and KV cache, no sliding window, unshuffled KV cache.
+    gfx950, BF16/FP16 query and KV cache, no sliding window, unshuffled KV cache.
     """
     if (
-        params.head_size != 192
+        DEVICE_ARCH != "gfx950"
+        or params.head_size != 192
         or params.sliding_window > 0
         or params.shuffled_kv_cache
         or params.q_dtype not in (torch.bfloat16, torch.float16)

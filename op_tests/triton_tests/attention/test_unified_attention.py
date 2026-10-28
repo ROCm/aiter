@@ -764,23 +764,35 @@ def test_triton_unified_attn_asymmetric_qk_v(sliding_window):
 
 
 @pytest.mark.parametrize(
-    "head_size, sliding_window, shuffled_kv_cache, q_dtype, kv_dtype, split",
+    "arch, head_size, sliding_window, shuffled_kv_cache, q_dtype, kv_dtype, split",
     [
-        (192, 0, False, torch.bfloat16, torch.bfloat16, (128, 64)),
-        (192, 0, False, torch.float16, torch.float16, (128, 64)),
-        (128, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
-        (160, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
-        (96, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
-        (192, 128, False, torch.bfloat16, torch.bfloat16, (0, 0)),
-        (192, 0, True, torch.bfloat16, torch.bfloat16, (0, 0)),
-        (192, 0, False, torch.bfloat16, e4m3_dtype, (0, 0)),
-        (192, 0, False, e4m3_dtype, e4m3_dtype, (0, 0)),
-        (192, 0, False, torch.uint8, torch.uint8, (0, 0)),
+        ("gfx950", 192, 0, False, torch.bfloat16, torch.bfloat16, (128, 64)),
+        ("gfx950", 192, 0, False, torch.float16, torch.float16, (128, 64)),
+        ("gfx950", 128, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 160, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 96, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 192, 128, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 192, 0, True, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx950", 192, 0, False, torch.bfloat16, e4m3_dtype, (0, 0)),
+        ("gfx950", 192, 0, False, e4m3_dtype, e4m3_dtype, (0, 0)),
+        ("gfx950", 192, 0, False, torch.uint8, torch.uint8, (0, 0)),
+        ("gfx942", 192, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
+        ("gfx1250", 192, 0, False, torch.bfloat16, torch.bfloat16, (0, 0)),
     ],
 )
 def test_head_split(
-    head_size, sliding_window, shuffled_kv_cache, q_dtype, kv_dtype, split
+    monkeypatch,
+    arch,
+    head_size,
+    sliding_window,
+    shuffled_kv_cache,
+    q_dtype,
+    kv_dtype,
+    split,
 ):
+    monkeypatch.setattr(
+        "aiter.ops.triton.attention.unified_attention.DEVICE_ARCH", arch
+    )
     params = SimpleNamespace(
         head_size=head_size,
         sliding_window=sliding_window,
