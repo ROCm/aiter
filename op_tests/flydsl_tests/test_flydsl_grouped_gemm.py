@@ -366,8 +366,13 @@ def _run_grouped_via_fused_moe(
     iters: int = 101,
     data_init: str = "uniform",
     scale_init: str = "auto",
+    num_valid_tokens: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
+
+    ``num_valid_tokens``: rows at or past it are padding, routed as the router
+    leaves them under ``num_valid_rows`` (expert -1, weight 0) and passed as
+    ``num_local_tokens``. The reference covers the real rows and is 0 past them.
 
     Stage1 weights are always laid out GUGU (gate/up row-interleaved) paired
     with ``GateMode.INTERLEAVE``, which is the only layout the TDM grouped
@@ -438,6 +443,12 @@ def _run_grouped_via_fused_moe(
 
     # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
     topk_id, topk_w = _make_topk(hidden, experts, topk)
+    real = tokens if num_valid_tokens is None else num_valid_tokens
+    num_local_tokens = None
+    if num_valid_tokens is not None:
+        topk_id[real:] = -1
+        topk_w[real:] = 0
+        num_local_tokens = torch.tensor([real], dtype=torch.int32)
 
     # ---- prep grouped GEMM inputs ----
     # Stage1 weight/scale/bias are rearranged to the physical GUGU layout;
@@ -491,6 +502,7 @@ def _run_grouped_via_fused_moe(
             swiglu_limit=swiglu_limit,
             beta=situ_beta,
             linear_beta=situ_linear_beta,
+            num_local_tokens=num_local_tokens,
         )
 
     torch.cuda.synchronize()
@@ -533,16 +545,17 @@ def _run_grouped_via_fused_moe(
 
     # Reference always uses GGUU logical inputs (layouts are numerically
     # equivalent; only physical packing differs).
-    ref = _torch_moe_ref(
-        hidden,
+    ref = torch.zeros_like(out)
+    ref[:real] = _torch_moe_ref(
+        hidden[:real],
         w1_logical,
         w1_scale_raw,
         bias1,
         w2_logical,
         w2_scale_raw,
         bias2,
-        topk_w,
-        topk_id,
+        topk_w[:real],
+        topk_id[:real],
         data_format=data_format,
         activation=activation,
         swiglu_limit=swiglu_limit,
@@ -806,6 +819,74 @@ def test_grouped_a4w4_swiglu_matches_torch_ref():
         model_dim=512,
         inter_dim=512,
     )
+
+
+@pytest.mark.parametrize("valid", [64, 41, 0])
+def test_route_gives_minus_one_routes_no_row(valid):
+    """The TP route kernel indexes its per-expert counter through a raw
+    pointer: a route to expert -1 must not reach it, and takes
+    DROPPED_ROUTE_ROW."""
+    _require_gfx1250()
+    from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_topids_to_rows
+
+    experts, topk, tokens = 256, 6, 64
+    max_m = tokens * topk
+    ids = torch.rand(tokens, experts).topk(topk, dim=1).indices.to(torch.int32)
+    ids[valid:] = -1
+    # The counter starts one element into its buffer, so a -1 route reaching
+    # the atomic lands in guard[0] instead of in someone else's memory.
+    guard = torch.zeros(experts + 1, dtype=torch.int32)
+    counts, rows = flydsl_moe_topids_to_rows(ids, experts, max_m, counter=guard[1:])
+    assert int(guard[0]) == 0, "a -1 route reached the per-expert counter"
+    hist = torch.bincount(ids[:valid].flatten().long(), minlength=experts)
+    assert torch.equal(counts.long(), hist)
+    assert (rows[valid:] == DROPPED_ROUTE_ROW).all()
+    expert = ids[:valid].long()
+    slot = rows[:valid].long() - expert * max_m
+    assert ((slot >= 0) & (slot < hist[expert])).all()
+    assert rows[:valid].unique().numel() == valid * topk
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
+def test_grouped_skips_pad_rows_routed_to_minus_one(data_format, compact, monkeypatch):
+    """Rows past num_local_tokens arrive routed to expert -1, as the router
+    leaves them under num_valid_rows. The token-multidest quant (TP batches of
+    64+ tokens) must give them no grouped row: they come out 0, and the real
+    rows come out as they do when every row is real."""
+    _require_gfx1250()
+    from aiter.ops.flydsl import moe_kernels
+
+    getter = "_get_compiled_token_multidest_" + (
+        "compact_quant" if compact else "quant"
+    )
+    original = getattr(moe_kernels, getter)
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(moe_kernels, getter, counted)
+    if compact:
+        # The compact-scale variant otherwise starts at 1024+ tokens.
+        monkeypatch.setenv("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS", "64")
+    tokens, valid = 128, 77
+    shape = {
+        "experts": 64,
+        "tokens": tokens,
+        "topk": 6,
+        "model_dim": 512,
+        "inter_dim": 512,
+        "data_format": data_format,
+    }
+    full, _, _, _ = _run_grouped_via_fused_moe(**shape)
+    out, _, _, _ = _run_grouped_via_fused_moe(**shape, num_valid_tokens=valid)
+    assert calls, f"the quant did not take {getter}"
+    assert (out[valid:] == 0).all(), "pad rows are not zero"
+    ld = _logits_diff(out[:valid], full[:valid])
+    assert ld < 1e-6, f"real rows differ from the all-real run: logits_diff={ld:.4e}"
 
 
 def test_situv2_activation_matches_torch():
