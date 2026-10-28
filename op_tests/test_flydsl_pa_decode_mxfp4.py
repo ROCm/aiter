@@ -42,7 +42,6 @@ pytestmark = pytest.mark.skipif(
 
 HEAD_DIM = 128
 Q_MAX_FP8 = 448.0
-NUM_CUS = torch.cuda.get_device_properties(0).multi_processor_count
 
 
 # --------------------------------------------------------------------------
@@ -424,6 +423,10 @@ def test_pa_decode_mxfp4_direct_output_graph_replay():
     assert rel_l2(out.float(), ref) < 3e-3
 
 
+def num_cus():
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
 def run_free(q, kd, ks, vd, vs, bt, ctx, scale, out_dtype=torch.bfloat16, **kw):
     out = torch.full(q.shape, 7.0, dtype=out_dtype, device=q.device)
     pa_decode_mxfp4(out, q, kd, ks, vd, vs, ctx, bt, scale, work_plan=None, **kw)
@@ -469,7 +472,7 @@ def test_pa_decode_mxfp4_plan_free_is_bitwise_the_planned_path(rows):
         assert torch.equal(planned, free), f"rows {rows} max_partitions {mp}"
     # the default split is the planner's budget: 2 * CUs // rows, at most the 8 tiles
     default = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale)
-    want = min(8, max(1, 2 * NUM_CUS // rows))
+    want = min(8, max(1, 2 * num_cus() // rows))
     explicit = run_free(q_in, kd, ks, vd, vs, bt, ctx, scale, max_partitions=want)
     torch.cuda.synchronize()
     assert torch.equal(default, explicit)
@@ -497,11 +500,12 @@ def test_pa_decode_mxfp4_plan_free_empty_rows(max_partitions):
             assert (out[r] == 0).all(), f"row {r}"
 
 
-@pytest.mark.parametrize("rows", [NUM_CUS - 1, NUM_CUS, NUM_CUS + 1])
-def test_pa_decode_mxfp4_plan_free_default_split_boundaries(rows):
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_pa_decode_mxfp4_plan_free_default_split_boundaries(delta):
     """The default split is max(1, 2 * CUs // rows): 2 tasks at CUs - 1 and CUs rows,
     1 at CUs + 1. Both sides of the switch agree with each other and with the
     reference."""
+    rows = num_cus() + delta
     ctx, bt, k, v, q = make_case([600] * rows, 16, 128, seed=rows)
     _, kd, ks, k_deq = quantize_pages(k, 128)
     _, vd, vs, v_deq = quantize_pages(v, 128)
@@ -565,6 +569,20 @@ def test_pa_decode_mxfp4_plan_free_argument_checks():
     q_in, _ = quantize_q_fp8(q)
     with pytest.raises(NotImplementedError, match="max_partitions"):
         run_free(q_in, kd, ks, vd, vs, bt, ctx, 1.0, max_partitions=1)
+
+
+def test_pa_decode_mxfp4_output_device_and_empty_batch():
+    ctx, bt, k, v, q = make_case([16], 16, 16, seed=2)
+    _, kd, ks, _ = quantize_pages(k, 16)
+    _, vd, vs, _ = quantize_pages(v, 16)
+    q_in, _ = quantize_q_fp8(q)
+    with pytest.raises(ValueError, match="output must be on"):
+        pa_decode_mxfp4(q.cpu(), q_in, kd, ks, vd, vs, ctx, bt, 1.0, max_partitions=1)
+    # zero sequences: nothing to do, in particular no division by num_seqs
+    empty = torch.empty(0, 16, HEAD_DIM, dtype=torch.bfloat16)
+    pa_decode_mxfp4(
+        empty, q_in[:0], kd, ks, vd, vs, ctx[:0], bt[:0], 1.0, work_plan=None
+    )
 
 
 def test_pa_decode_mxfp4_rejects_oversized_task():

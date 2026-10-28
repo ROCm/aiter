@@ -193,11 +193,14 @@ def pa_decode_mxfp4(
     if not (context_lengths.is_contiguous() and block_tables.is_contiguous()):
         raise ValueError("context_lengths and block_tables must be contiguous")
     for name, t in (
+        ("output", output),
         ("context_lengths", context_lengths),
         ("block_tables", block_tables),
     ):
         if t.device != dev:
             raise ValueError(f"{name} must be on {dev}, got {t.device}")
+    if num_seqs == 0:
+        return
 
     max_blocks_per_seq = block_tables.shape[1]
     schedule_context = max_blocks_per_seq * block_size
