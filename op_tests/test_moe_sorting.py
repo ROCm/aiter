@@ -3,6 +3,9 @@
 
 import argparse
 import itertools
+import os
+import subprocess
+import sys
 
 import pandas as pd
 import torch
@@ -336,6 +339,105 @@ def test_moe_sorting_opus_local_ids_large_expert_auto(dtype, model_dim):
         assert torch.equal(
             topk_ids, local_topk_ids
         ), f"local_topk_ids mismatch at M={token}, E={E}"
+
+
+_TAIL_READ_CHILD = r"""
+import sys
+
+import torch
+
+import aiter.fused_moe as fm
+from aiter.fused_moe import moe_sorting
+
+fm._USE_CK_MOE_SORTING = False
+fm._USE_FLYDSL_MOE_SORTING = False
+dev = torch.device("cuda")
+
+
+def mapped(addr):
+    with open("/proc/self/maps") as f:
+        for line in f:
+            lo, hi = (int(x, 16) for x in line.split()[0].split("-"))
+            if lo <= addr < hi:
+                return True
+    return False
+
+
+# With the caching allocator off, each tensor is its own device allocation.
+# Find one that is directly followed by an unmapped page, so a read past its
+# end faults instead of silently hitting a neighbour.
+held, buf = [], None
+for _ in range(64):
+    cand = torch.empty((2 << 20) // 4, dtype=torch.int32, device=dev)
+    held.append(cand)
+    end = cand.data_ptr() + cand.numel() * 4
+    if mapped(cand.data_ptr()) and not mapped(end):
+        buf = cand
+        break
+if buf is None:
+    print("no device allocation followed by an unmapped page")
+    sys.exit(3)
+
+g = torch.Generator(device=dev).manual_seed(0)
+for E, topk in ((512, 10), (256, 8), (128, 6)):
+    for m in (1, 2, 3, 5, 7, 13, 31, 63, 127, 255, 257, 511, 513, 514, 1023, 2047, 4097):
+        perm = torch.rand(m, E, device=dev, generator=g).argsort(dim=1)
+        ids = buf[buf.numel() - m * topk :].view(m, topk)
+        ids.copy_(perm[:, :topk])
+        w = torch.rand(m, topk, device=dev, generator=g)
+        local = torch.tensor([m], dtype=torch.int32, device=dev)
+        # Same ids with spare padded rows behind them, as a reference.
+        ids_ref = torch.full((m + 4, topk), -1, dtype=torch.int32, device=dev)
+        ids_ref[:m] = ids
+        w_ref = torch.zeros(m + 4, topk, device=dev)
+        w_ref[:m] = w
+        for policy in (2, 0):
+            out = moe_sorting(ids, w, E, 4096, torch.bfloat16, 32, None, local, policy)
+            ref = moe_sorting(ids_ref, w_ref, E, 4096, torch.bfloat16, 32, None, local, policy)
+            torch.cuda.synchronize()
+            n = int(ref[3][0])
+            valid = ref[0][:n] != (topk << 24 | m)
+            used = ref[2][: n // 32] != -1
+            ok = (
+                int(out[3][0]) == n
+                and torch.equal(out[0][:n], ref[0][:n])
+                and torch.equal(out[1][:n][valid], ref[1][:n][valid])
+                and torch.equal(out[2][: n // 32][used], ref[2][: n // 32][used])
+            )
+            if not ok:
+                print(f"mismatch E={E} topk={topk} m={m} policy={policy}")
+                sys.exit(1)
+print("OK")
+"""
+
+
+def test_moe_sorting_local_tokens_tail_read():
+    # With num_local_tokens the multi-phase kernels round the row count up to
+    # the id vector width; they must not load topk_ids past [tokens, topk].
+    # A stray load only faults if topk_ids ends right before an unmapped page,
+    # which the child process arranges. Run it out of process: a GPU memory
+    # fault aborts the whole interpreter.
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("moe_sorting unsupported on %s; skipping", get_gfx())
+        return
+    env = dict(os.environ)
+    env["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+    env["PYTORCH_NO_HIP_MEMORY_CACHING"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _TAIL_READ_CHILD],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    tail = (proc.stdout + proc.stderr)[-4000:]
+    if proc.returncode == 3:
+        aiter.logger.warning("tail-read test skipped: %s", tail.strip())
+        return
+    assert (
+        proc.returncode == 0 and "OK" in proc.stdout
+    ), f"moe_sorting read past the end of topk_ids (rc={proc.returncode}):\n{tail}"
 
 
 def _build_moe_sorting_inputs(
@@ -913,6 +1015,7 @@ def main():
     test_moe_sorting_opus_host_dispatch_boundaries()
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
+    test_moe_sorting_local_tokens_tail_read()
     for dtype in args.dtype:
         test_moe_sorting_opus_aux_outputs(dtype, args.model_dim)
         test_moe_sorting_opus_local_ids_large_expert_auto(dtype, args.model_dim)
