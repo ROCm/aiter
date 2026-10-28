@@ -21,6 +21,7 @@
 #include "aiter_stream.h"
 #include "hip_reduce.h"
 #include "aiter_opus_plus.h"
+#include "topk_pad_rows.h"
 #include <hip/hip_runtime.h>
 #include <cfloat>
 #include <cstddef>
@@ -44,6 +45,7 @@ struct topk_gating_params
     int         num_shared_experts;
     int         topk;
     int         num_tokens;
+    const int*  num_valid_rows; // [1] real rows, on device; nullptr: all rows real
     float       routed_scaling_factor;
     bool        need_renorm;
     hipStream_t stream;
@@ -65,6 +67,29 @@ __device__ __forceinline__ void store_shared_expert_sigmoid(
         const float x = static_cast<float>(gating_row[num_routed + i]);
         weights_row[topk + i] = 1.0f / (1.0f + expf(-x));
     }
+}
+
+// Writes a pad row in full -- routed columns weight 0 and id -1, shared
+// columns as for any row -- and returns true, so a block holding one row can
+// return before selecting from a row nobody reads. Call it once the row's
+// loads are issued: checked first, the num_valid_rows read would serialize
+// ahead of them on every real row.
+template <typename DTYPE_I>
+__device__ __forceinline__ bool write_if_pad_row(const int* num_valid_rows,
+                                                 int row,
+                                                 const DTYPE_I* gating_row,
+                                                 float* weights_row,
+                                                 int* ids_row,
+                                                 int num_routed,
+                                                 int topk,
+                                                 int num_shared)
+{
+    if(!is_pad_row(num_valid_rows, row))
+        return false;
+    write_pad_row(weights_row, ids_row, topk, threadIdx.x, blockDim.x);
+    if(num_shared > 0 && threadIdx.x == 0)
+        store_shared_expert_sigmoid(gating_row, weights_row, num_routed, topk, num_shared);
+    return true;
 }
 
 // E=128 opt_n (TPW=4) wins on gfx942 but regresses on gfx950; gate to gfx942.
@@ -286,7 +311,8 @@ __global__ void topk_gating_kernel_opt(
     const int num_tokens,
     const float routed_scaling_factor,
     const int gating_stride,
-    const int num_shared_experts)
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static constexpr int EPT = NUM_EXPERTS / WARP_SIZE;
     static_assert(NUM_EXPERTS % WARP_SIZE == 0);
@@ -324,6 +350,12 @@ __global__ void topk_gating_kernel_opt(
         // does not use; if that changes, test the exponent/mantissa bits.
         vals[i] = fmaxf(vals[i], -INFINITY);
     }
+
+    if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                        topk_weights + token_idx * stride_tk,
+                        topk_ids + token_idx * stride_tk,
+                        NUM_EXPERTS, topk, num_shared_experts))
+        return;
 
     // Step 2: sort thread-local partition descending
     sort_network_desc<EPT>(vals, orig, idxs);
@@ -400,7 +432,8 @@ __global__ void topk_gating_kernel_opt_multiwave(
     const int num_tokens,
     const float routed_scaling_factor,
     const int gating_stride,
-    const int num_shared_experts)
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static_assert(WAVES_PER_TOKEN > 1);
     // This kernel is wave32-only (dispatched under get_warp_size_func()==32).
@@ -451,6 +484,12 @@ __global__ void topk_gating_kernel_opt_multiwave(
         // fmaxf: IEEE maxNum returns the non-NaN operand; see opt kernel.
         vals[i] = fmaxf(vals[i], -INFINITY);
     }
+
+    if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                        topk_weights + token_idx * stride_tk,
+                        topk_ids + token_idx * stride_tk,
+                        NUM_EXPERTS, topk, num_shared_experts))
+        return;
 
     sort_network_desc<EPT>(vals, orig, idxs);
 
@@ -603,7 +642,8 @@ __global__ void topk_gating_kernel_opt_n(
     const int num_tokens,
     const float routed_scaling_factor,
     const int gating_stride,
-    const int num_shared_experts)
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static constexpr int TOKENS_PER_WARP = TPW;
     static constexpr int THREADS_PER_ROW = WARP_SIZE / TOKENS_PER_WARP;
@@ -676,10 +716,11 @@ __global__ void topk_gating_kernel_opt_n(
     else
         sum = routed_scaling_factor;
 
+    const bool pad = is_pad_row(num_valid_rows, token_idx);
     if(lane_in_group < topk && valid)
     {
-        topk_weights[token_idx * stride_tk + lane_in_group] = topk_value * sum;
-        topk_ids[token_idx * stride_tk + lane_in_group]     = topk_indice;
+        topk_weights[token_idx * stride_tk + lane_in_group] = pad ? 0.0f : topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane_in_group]     = pad ? -1 : topk_indice;
     }
     if(num_shared_experts > 0 && valid && lane_in_group == 0)
     {
@@ -723,7 +764,8 @@ void topk_gating_kernel_prefill(
     const int num_tokens,
     const float routed_scaling_factor,
     const int gating_stride,
-    const int num_shared_experts)
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static constexpr int TOKENS_PER_WARP = TPW;
     static constexpr int THREADS_PER_ROW = WARP_SIZE / TOKENS_PER_WARP;
@@ -918,10 +960,11 @@ void topk_gating_kernel_prefill(
     else
         sum = routed_scaling_factor;
 
+    const bool pad = is_pad_row(num_valid_rows, token_idx);
     if(lane_in_group < topk && valid)
     {
-        topk_weights[token_idx * stride_tk + lane_in_group] = topk_value * sum;
-        topk_ids[token_idx * stride_tk + lane_in_group]     = topk_indice;
+        topk_weights[token_idx * stride_tk + lane_in_group] = pad ? 0.0f : topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane_in_group]     = pad ? -1 : topk_indice;
     }
     if(num_shared_experts > 0 && valid && lane_in_group == 0)
     {
@@ -949,7 +992,8 @@ __global__ void topk_gating_kernel(
     const int num_tokens,
     const float routed_scaling_factor,
     const int gating_stride,
-    const int num_shared_experts)
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     extern __shared__ char shared_mem[];
     const int token_idx = blockIdx.x;
@@ -960,6 +1004,10 @@ __global__ void topk_gating_kernel(
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
+    // Top-k scans whole vectors only, so a partial last vector would be skipped.
+    // topk_gating_launch picks f32vec so that vec_size divides num_experts.
+    if(num_experts % vec_size != 0)
+        __builtin_trap();
 
     // Step 1: load + score function
     // For softmax, bias is NOT added here -- it's added AFTER normalization
@@ -991,6 +1039,11 @@ __global__ void topk_gating_kernel(
         }
     }
     __syncthreads();
+    if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                        topk_weights + token_idx * stride_tk,
+                        topk_ids + token_idx * stride_tk,
+                        num_experts, topk, num_shared_experts))
+        return;
 
     // Softmax: normalize first, then add bias for topk selection.
     // scores[] after this block = softmax(x) + bias (biased for selection).
@@ -1119,7 +1172,8 @@ __global__ void topk_gating_kernel_smem_n(
     const int num_tokens,
     const float routed_scaling_factor,
     const int gating_stride,
-    const int num_shared_experts)
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static constexpr int ROWS_PER_WARP   = RPW;
     static constexpr int THREADS_PER_ROW = WARP_SIZE / ROWS_PER_WARP;
@@ -1143,6 +1197,8 @@ __global__ void topk_gating_kernel_smem_n(
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
+    if(num_experts % vec_size != 0)
+        __builtin_trap();
 
     // Guard: trailing tokens of the last block may be out of range.
     const bool valid      = token_idx < num_tokens;
@@ -1273,10 +1329,11 @@ __global__ void topk_gating_kernel_smem_n(
     else
         sum = routed_scaling_factor;
 
+    const bool pad = is_pad_row(num_valid_rows, token_idx);
     if(lane_in_row < topk && valid)
     {
-        topk_weights[token_idx * stride_tk + lane_in_row] = topk_value * sum;
-        topk_ids[token_idx * stride_tk + lane_in_row]     = topk_indice;
+        topk_weights[token_idx * stride_tk + lane_in_row] = pad ? 0.0f : topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane_in_row]     = pad ? -1 : topk_indice;
     }
     if(num_shared_experts > 0 && valid && lane_in_row == 0)
     {
@@ -1299,7 +1356,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights,                                       \
         p.ids,                                         \
-        stride_tk, num_experts, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts);
+        stride_tk, num_experts, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 #define LAUNCH_TOPK_KERNEL_OPT(NE, RENORM, SF)                                                  \
     hipLaunchKernelGGL(                                                                          \
@@ -1309,7 +1366,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights,                                       \
         p.ids,                                         \
-        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts);
+        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 #define LAUNCH_TOPK_KERNEL_OPT_MULTIWAVE(NE, WPT, RENORM, SF)                                   \
     hipLaunchKernelGGL(                                                                          \
@@ -1319,7 +1376,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights,                                       \
         p.ids,                                         \
-        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts);
+        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 // opt_n: register-only prefill kernel with TOKENS_PER_WARP=TPW.
 #define LAUNCH_TOPK_KERNEL_OPT_N(NE, RENORM, SF, TPW)                                           \
@@ -1329,7 +1386,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights, p.ids, \
-        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts);
+        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 // smem_n: ROWS_PER_WARP=RPW shared-memory kernel; smem = RPW * num_experts floats.
 #define LAUNCH_TOPK_KERNEL_SMEM_N(VEC_F, RENORM, SF, RPW)                                       \
@@ -1339,7 +1396,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights, p.ids, \
-        stride_tk, num_experts, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts);
+        stride_tk, num_experts, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 // prefill: vectorized-load scan+invalidate kernel, templatized TPW.
 #define LAUNCH_TOPK_KERNEL_PREFILL_N(NE, RENORM, SF, TPW)                                       \
@@ -1349,7 +1406,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights, p.ids, \
-        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts);
+        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 
 // ---------------------------------------------------------------------------
