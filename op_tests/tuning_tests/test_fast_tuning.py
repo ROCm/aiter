@@ -977,5 +977,214 @@ class TestFusedStage1QuantizedCompare(unittest.TestCase):
         self.assertTrue(torch.equal(ours[mapped], theirs.reshape(-1)[mapped]))
 
 
+class TestFusedStage1Fp8AndSplitKCompare(unittest.TestCase):
+    """The fused fp8 stage-1 reference quantizer, and the split-K check of
+    dequantized values against the fp32 reference."""
+
+    token_num, topk, inter = 37, 3, 256
+
+    @staticmethod
+    def _tune():
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        return gemm_moe_tune
+
+    def _routes(self):
+        import torch
+
+        routes = [
+            t | (s << 24) for t in range(self.token_num) for s in range(self.topk)
+        ]
+        routes = torch.tensor(routes, dtype=torch.int32)[torch.randperm(len(routes))]
+        sorted_ids = torch.full((192,), self.token_num, dtype=torch.int32)
+        sorted_ids[: routes.numel()] = routes
+        return sorted_ids, torch.tensor([routes.numel()], dtype=torch.int32)
+
+    def test_mxfp8_quant_uses_the_given_scale_rule(self):
+        import torch
+
+        from aiter.utility import fp4_utils
+
+        tune = self._tune()
+        x = (torch.randn(64, 256) * torch.rand(64, 1) * 10).view(64, 8, 32)
+        scales_by_rule = []
+        for rule in (fp4_utils.f32_to_fused_moe_mxfp8_scale, tune._roundup_mxfp8_scale):
+            codes, scales = tune._mxfp8_quant(x.view(64, 256), rule)
+            expected = rule(x.abs().amax(-1)).view(torch.uint8)
+            self.assertTrue(torch.equal(scales.view(torch.uint8), expected))
+            scale = fp4_utils.e8m0_to_f32(scales).unsqueeze(-1)
+            dequant = codes.float().view(64, 8, 32) * scale
+            # Round to nearest e4m3: half a step, 2^-4 relative or 2^-10 * scale
+            # for subnormals.
+            bound = torch.maximum(x.abs() * 2**-4, scale * 2**-10)
+            self.assertTrue(torch.all((dequant - x).abs() <= bound))
+            scales_by_rule.append(scales.view(torch.uint8))
+        # The two kernels' rules disagree on some blocks, so each check names its own.
+        self.assertFalse(torch.equal(*scales_by_rule))
+
+    def test_fp8_codes_compare(self):
+        import torch
+
+        from aiter.utility import fp4_utils
+
+        tune = self._tune()
+        rule = fp4_utils.f32_to_fused_moe_mxfp8_scale
+        x = torch.randn(64, 4, 256)
+        codes, _ = tune._mxfp8_quant(x, rule)
+        biased_codes, _ = tune._mxfp8_quant(x * 1.03, rule)
+        compare = tune.quantized_output_compare
+        self.assertEqual(compare(codes, codes.clone(), printLog=False), 0.0)
+        self.assertEqual(compare(codes, biased_codes, printLog=False), 1.0)
+
+    def test_scale_positions_invert_the_sorted_layout(self):
+        import torch
+
+        from aiter import dtypes
+
+        tune = self._tune()
+        sorted_ids, num_valid_ids = self._routes()
+        cols = self.inter // 32
+        scales = torch.randint(
+            0, 255, (self.token_num * self.topk, cols), dtype=torch.uint8
+        )
+        sorted_scales = tune._sorted_route_scales(
+            scales.view(dtypes.fp8_e8m0),
+            sorted_ids,
+            num_valid_ids,
+            self.token_num,
+            self.topk,
+        )
+        positions = tune._route_scale_positions(
+            sorted_ids, num_valid_ids, self.token_num, self.topk, cols
+        )
+        gathered = sorted_scales.view(torch.uint8)[positions]
+        self.assertTrue(torch.equal(gathered, scales))
+
+    def test_scale_positions_reject_an_unmapped_route(self):
+        tune = self._tune()
+        sorted_ids, num_valid_ids = self._routes()
+        sorted_ids[0] = self.token_num  # drop one route to padding
+        with self.assertRaises(ValueError):
+            tune._route_scale_positions(
+                sorted_ids, num_valid_ids, self.token_num, self.topk, 8
+            )
+
+    def _split_k(self, quant, scale_of=lambda x: x):
+        """A split-K-like output: the bf16-rounded result quantized by quant, its
+        scales in the sorted layout, and the reference the check reads."""
+        import torch
+
+        tune = self._tune()
+        sorted_ids, num_valid_ids = self._routes()
+        x = torch.randn(self.token_num, self.topk, self.inter)
+        codes, scales = quant(scale_of(x).bfloat16().float())
+        sorted_scales = tune._sorted_route_scales(
+            scales, sorted_ids, num_valid_ids, self.token_num, self.topk
+        )
+        positions = tune._route_scale_positions(
+            sorted_ids, num_valid_ids, self.token_num, self.topk, self.inter // 32
+        )
+        return (x, positions), (codes, sorted_scales)
+
+    def _quantizers(self):
+        from aiter import dtypes
+        from aiter.ops.quant import per_1x32_f4_quant
+        from aiter.utility import fp4_utils
+
+        tune = self._tune()
+        return {
+            "fp4": lambda x: per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2),
+            "fp8": lambda x: tune._mxfp8_quant(
+                x, fp4_utils.f32_to_fused_moe_mxfp8_scale
+            ),
+        }
+
+    def test_split_k_within_one_step_passes(self):
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, res = self._split_k(quant)
+                self.assertLessEqual(compare(ref, res, printLog=False), 1e-2)
+
+    def test_split_k_bias_fails(self):
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, res = self._split_k(quant, scale_of=lambda x: x * 1.03)
+                self.assertEqual(compare(ref, res, printLog=False), 1.0)
+
+    def test_split_k_misplaced_scales_fail(self):
+        import torch
+
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, (codes, scales) = self._split_k(quant)
+                flat = scales.view(torch.uint8)
+                permuted = flat[torch.randperm(flat.numel())].view(scales.dtype)
+                self.assertEqual(compare(ref, (codes, permuted), printLog=False), 1.0)
+
+    def test_split_k_scale_one_exponent_off_fails(self):
+        import torch
+
+        compare = self._tune().dequantized_output_compare
+        for name, quant in self._quantizers().items():
+            with self.subTest(name):
+                ref, (codes, scales) = self._split_k(quant)
+                smaller = (scales.view(torch.uint8) - 1).view(scales.dtype)
+                self.assertEqual(compare(ref, (codes, smaller), printLog=False), 1.0)
+
+
+class TestStage2RelativeL2Compare(unittest.TestCase):
+    """The stage-2 check: relative L2 and slope against the reference."""
+
+    @staticmethod
+    def _atomic(parts):
+        """Sum the top-k partials in bf16, one add at a time, as an atomic
+        stage 2 accumulates them."""
+        import torch
+
+        acc = torch.zeros(parts.shape[0], dtype=torch.bfloat16)
+        for k in range(parts.shape[1]):
+            acc = (acc.float() + parts[:, k].bfloat16().float()).bfloat16()
+        return acc
+
+    def _parts(self, topk=16):
+        import torch
+
+        torch.manual_seed(0)
+        return torch.randn(200000, topk) * 8
+
+    def _compare(self, ref, res):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        return gemm_moe_tune.relative_l2_compare(ref, res, printLog=False)
+
+    def test_atomic_bf16_accumulation_passes(self):
+        parts = self._parts()
+        ref = parts.sum(1).bfloat16()
+        err = self._compare(ref, self._atomic(parts))
+        self.assertGreater(err, 0.0)
+        self.assertLess(err, 1e-2)
+
+    def test_three_percent_bias_fails(self):
+        parts = self._parts()
+        ref = parts.sum(1).bfloat16()
+        self.assertEqual(self._compare(ref, self._atomic(parts * 1.03)), 1.0)
+
+    def test_noise_above_the_cap_fails(self):
+        import torch
+
+        ref = self._parts().sum(1)
+        noisy = ref + torch.randn_like(ref) * ref.std() * 0.02
+        self.assertEqual(self._compare(ref.bfloat16(), noisy.bfloat16()), 1.0)
+
+    def test_nan_output_fails(self):
+        ref = self._parts().sum(1).bfloat16()
+        res = ref.clone()
+        res[0] = float("nan")
+        self.assertEqual(self._compare(ref, res), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
