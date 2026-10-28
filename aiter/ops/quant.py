@@ -1109,6 +1109,23 @@ def quant_mxfp4_hip(
     return out_packed, out_scale
 
 
+def _normalize_mxfp4_moe_round_mode(mode):
+    """Validate the supported per-call MoE policies without loading the native enum."""
+    if mode is None:
+        return MX_DEFAULT_ROUND_MODE
+    try:
+        mode = int(mode)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Invalid MXFP4 MoE scale rounding mode") from exc
+    if mode not in (0, 1, 2, 3):
+        raise ValueError("Invalid MXFP4 MoE scale rounding mode")
+    if mode not in (MX_DEFAULT_ROUND_MODE, MxScaleRoundModeInt.Even):
+        raise NotImplementedError(
+            "MXFP4 MoE supports the default policy and explicit Even"
+        )
+    return mode
+
+
 def fused_dynamic_mx_quant_moe_sort(
     input: torch.Tensor,
     sorted_ids: torch.Tensor,
@@ -1121,6 +1138,7 @@ def fused_dynamic_mx_quant_moe_sort(
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
     num_experts_upper_bound: int | None = None,
+    round_mode: RoundModeLike | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unified fused dynamic MX quant + MoE-sort entry (MXFP4 / MXFP8).
 
@@ -1153,6 +1171,10 @@ def fused_dynamic_mx_quant_moe_sort(
     /``fused_dynamic_mxfp8_*`` entries are retained as thin wrappers for
     backward compatibility.
 
+    ``round_mode=None`` and the project default retain this dispatch. Explicit
+    Even uses the existing native MXFP4 quantizer followed by scale sorting;
+    it currently requires BF16, block 32 and full rows.
+
     ``num_experts_upper_bound`` caps the grid at a safe host-side bound without
     exceeding the legacy extent or reading a device count.
     """
@@ -1160,6 +1182,24 @@ def fused_dynamic_mx_quant_moe_sort(
         raise ValueError(
             f"fused_dynamic_mx_quant_moe_sort: unsupported quant_dtype "
             f"{quant_dtype}, expected one of (dtypes.fp4x2, dtypes.fp8)"
+        )
+
+    mode = _normalize_mxfp4_moe_round_mode(round_mode)
+    if mode != MX_DEFAULT_ROUND_MODE:
+        if quant_dtype != dtypes.fp4x2 or group_size != 32:
+            raise NotImplementedError(
+                "Explicit Even requires MXFP4 block-32 quantization"
+            )
+        if num_rows is not None:
+            raise NotImplementedError("Explicit Even does not support partial rows")
+        if input.dtype != dtypes.bf16:
+            raise NotImplementedError(
+                "Explicit Even MoE quantization requires BF16 input"
+            )
+        x = input.reshape(-1, input.shape[-1]).contiguous()
+        out, scale = quant_mxfp4_hip(x, round_mode=mode, e8m0_shuffle=False)
+        return out, mxfp4_moe_sort_fwd(
+            scale, sorted_ids, num_valid_ids, token_num, x.shape[-1]
         )
 
     token_num_quant_moe_sort_switch = [
@@ -1244,6 +1284,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
     num_experts_upper_bound: int | None = None,
+    round_mode: RoundModeLike | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1263,6 +1304,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         group_size=group_size,
         sorted_weights=sorted_weights,
         num_experts_upper_bound=num_experts_upper_bound,
+        round_mode=round_mode,
     )
 
 

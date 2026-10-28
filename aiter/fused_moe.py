@@ -60,6 +60,8 @@ from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
+from aiter.ops.quant import _normalize_mxfp4_moe_round_mode
+from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE
 
 
 @functools.lru_cache(maxsize=1)
@@ -1126,12 +1128,18 @@ def fused_moe(
     quant_dtype_a2: torch.dtype | None = None,
     # False explicitly selects unclamped shared-expert SiLU semantics.
     clamp_shared: bool = True,
+    mxfp4_scale_round_mode: int | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
     Supplying any shared tensor (or ``shared_expert_id``) requires all four
     shared weight/scale tensors and dispatches through the gfx950 FHMoE path.
     Inputs must satisfy the contracts documented in :mod:`aiter.fhmoe`.
+
+    ``mxfp4_scale_round_mode`` selects activation-scale rounding per call.
+    None or the project default preserves all existing dispatch. Explicit Even
+    requires raw BF16 A4W4 with external two-stage quantization; unsupported
+    fused/internal, shared-expert and partial-row paths raise rather than ignore it.
 
     ``clamp_shared`` is an FHMoE model-semantic input. The default ``True``
     applies the configured SiLU clamp to routed and shared experts. ``False``
@@ -1150,6 +1158,11 @@ def fused_moe(
     )
     if not clamp_shared and not has_shared_expert:
         raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
+    mode = _normalize_mxfp4_moe_round_mode(mxfp4_scale_round_mode)
+    if has_shared_expert and mode != MX_DEFAULT_ROUND_MODE:
+        raise NotImplementedError(
+            "Explicit Even does not support shared-expert dispatch"
+        )
     if has_shared_expert:
         routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
         unsupported = []
@@ -1268,6 +1281,7 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        mxfp4_scale_round_mode=mxfp4_scale_round_mode,
     )
 
 
@@ -1310,7 +1324,9 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    mxfp4_scale_round_mode: int | None = None,
 ) -> torch.Tensor:
+    _normalize_mxfp4_moe_round_mode(mxfp4_scale_round_mode)
     device = topk_ids.device
     M, _topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
@@ -1371,6 +1387,7 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    mxfp4_scale_round_mode: int | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1414,6 +1431,7 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        mxfp4_scale_round_mode=mxfp4_scale_round_mode,
     )
 
 
@@ -1448,6 +1466,7 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    mxfp4_scale_round_mode: int | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1521,6 +1540,20 @@ def _fused_moe_impl(
     elif _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
 
+    _check_mxfp4_scale_policy(
+        mxfp4_scale_round_mode,
+        quant_type,
+        q_dtype_a,
+        q_dtype_w,
+        hidden_states=hidden_states,
+        output_dtype=dtype,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        quant_dtype_a2=quant_dtype_a2,
+        gate_mode=gate_mode,
+        stage2_scatter=stage2_scatter,
+    )
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
 
@@ -1714,6 +1747,13 @@ def _fused_moe_impl(
             f"kernel block size {metadata.block_m}"
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    _check_mxfp4_scale_policy(
+        mxfp4_scale_round_mode,
+        quant_type,
+        q_dtype_a,
+        q_dtype_w,
+        metadata=metadata,
+    )
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
             FusedMoeRequest(
@@ -1813,6 +1853,12 @@ def _fused_moe_impl(
     # compact-scale variant not ported (its stage-1 change targets the
     # refactored mixed_moe_gemm_2stage_common); keep the fused sort+quant on
     # the expanded-scale path only.
+    if fused_sort_quant and (
+        _normalize_mxfp4_moe_round_mode(mxfp4_scale_round_mode) != MX_DEFAULT_ROUND_MODE
+    ):
+        raise NotImplementedError(
+            "Explicit Even does not support direct fused sort/quant"
+        )
     fused_compact_scale = False
     if metadata.output_aux:
         # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
@@ -1989,6 +2035,7 @@ def _fused_moe_impl(
             routing_num_experts=global_E,
             prequantized_a1=prequantized_a1,
             prequantized_a1_scale=prequantized_a1_scale,
+            mxfp4_scale_round_mode=mxfp4_scale_round_mode,
         )
         return _return_output(ret, output)
 
@@ -4676,6 +4723,7 @@ def fused_moe_2stages(
     routing_num_experts: int | None = None,
     prequantized_a1: torch.Tensor | None = None,
     prequantized_a1_scale: torch.Tensor | None = None,
+    mxfp4_scale_round_mode: int | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -4741,6 +4789,25 @@ def fused_moe_2stages(
         # Main's fused prequant already writes the E8M0 scale layout consumed by
         # replacement GEMM1 on the default Opus auxiliary path.
         metadata = replace(metadata, prequant=True)
+    _check_mxfp4_scale_policy(
+        mxfp4_scale_round_mode,
+        quant_type,
+        q_dtype_a,
+        q_dtype_w,
+        metadata=metadata,
+        hidden_states=hidden_states,
+        output_dtype=dtype,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        gate_mode=gate_mode,
+    )
+    if prequantized_a1 is not None and (
+        _normalize_mxfp4_moe_round_mode(mxfp4_scale_round_mode) != MX_DEFAULT_ROUND_MODE
+    ):
+        raise NotImplementedError(
+            "Explicit Even requires unquantized stage1 activations"
+        )
     if prequantized_a1 is not None:
         if quant_type != QuantType.per_1x32:
             raise ValueError(
@@ -4840,6 +4907,7 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
+                round_mode=mxfp4_scale_round_mode,
             )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
@@ -5051,6 +5119,7 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
             sorted_weights=sorted_weights,
             num_experts_upper_bound=routing_num_experts,
+            round_mode=mxfp4_scale_round_mode,
         )
         a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
@@ -5910,3 +5979,63 @@ def fused_topk(
     #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
+
+
+def _check_mxfp4_scale_policy(
+    mode,
+    quant_type,
+    activation_dtype,
+    weight_dtype,
+    *,
+    metadata=None,
+    hidden_states=None,
+    output_dtype=None,
+    a1_scale=None,
+    a2_scale=None,
+    num_local_tokens=None,
+    quant_dtype_a2=None,
+    gate_mode=GateMode.SEPARATED,
+    stage2_scatter=None,
+):
+    """Reject routes that cannot honor explicit activation-scale rounding."""
+    if _normalize_mxfp4_moe_round_mode(mode) == MX_DEFAULT_ROUND_MODE:
+        return
+    if (
+        quant_type != QuantType.per_1x32
+        or activation_dtype != dtypes.fp4x2
+        or weight_dtype != dtypes.fp4x2
+    ):
+        raise NotImplementedError("Explicit Even requires A4W4 per-1x32")
+    if output_dtype not in (None, dtypes.bf16):
+        raise NotImplementedError("Explicit Even requires BF16 MoE output")
+    if hidden_states is not None and hidden_states.dtype != dtypes.bf16:
+        raise NotImplementedError("Explicit Even requires raw BF16 activations")
+    if (
+        a1_scale is not None
+        or a2_scale is not None
+        or num_local_tokens is not None
+        or stage2_scatter is not None
+    ):
+        raise NotImplementedError(
+            "Explicit Even requires full rows without activation-scale overrides"
+        )
+    if (
+        quant_dtype_a2 not in (None, dtypes.fp4x2)
+        or GateMode(gate_mode) != GateMode.SEPARATED
+    ):
+        raise NotImplementedError(
+            "Explicit Even requires separated A4W4 at both stages"
+        )
+    if metadata is not None and (
+        metadata.full_impl is not None
+        or metadata.output_aux
+        or metadata.flat
+        or metadata.run_1stage
+        or not metadata.prequant
+        or metadata.fuse_quant
+        or metadata.skip_inter_quant
+        or metadata.ksplit > 1
+    ):
+        raise NotImplementedError(
+            "Explicit Even requires external two-stage activation quantization"
+        )
