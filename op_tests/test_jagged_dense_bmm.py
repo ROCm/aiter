@@ -138,6 +138,13 @@ def test_jdbba(B, D, Kout, Mi, regime, dtype):
     candidates = {
         "flydsl": lambda: _launch(d, out, B, Mi, uniform),
         "flydsl+transpose": _flydsl_with_transpose,
+        "flydsl bkn": lambda: _launch(
+            {**d, "dense_tall": d["dense"], "bias_flat": d["bias"]},
+            out,
+            B,
+            Mi,
+            uniform,
+        ),
     }
     if _HAS_TRITON:
         so64 = d["seq_offsets"].to(torch.int64)

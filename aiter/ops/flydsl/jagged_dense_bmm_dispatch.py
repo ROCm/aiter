@@ -230,5 +230,6 @@ def jagged_dense_bmm_dispatched(
         xcd_c=cfg["xcd_c"],
         xcd_w=cfg["xcd_w"],
         block_k=cfg["block_k"],
-        threads=cfg["threads"],
+        # Thread counts were tuned on the 2-D layout; 3-D is faster at the default.
+        threads=cfg["threads"] if B.dim() == 2 else None,
     )
