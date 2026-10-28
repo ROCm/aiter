@@ -699,6 +699,109 @@ def _dispatch_rank(rank: int, tp: int, init_method: str, skewed: bool = False) -
     return {"built": built, "probes": probes}
 
 
+def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
+    """One rank of the first-call-in-capture spawn.
+
+    Stands up the production ``CustomAllreduce`` with ``AITER_FLY_AR=1``, as
+    ``_dispatch_rank`` does, but makes no eager call. The first launch of every
+    rung the one-shot serves is inside one HIP graph capture.
+
+    It records the served rungs that were not loaded at init. That check does
+    not depend on whether HIP tolerates a module load during capture. It then
+    replays the graph and compares every output with the rank-order sum.
+    """
+    import torch.distributed as dist
+
+    from aiter.dist.parallel_state import graph_capture
+    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "NONE"
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(tp, 1)
+    tp_group = get_tp_group()
+    cpu_group = tp_group.cpu_group
+    comm = tp_group.device_communicator
+    ca = comm.ca_comm
+    eng = None if ca is None or ca.disabled else ca._fly_oneshot
+    res = {"built": eng is not None, "unloaded": [], "rows": []}
+
+    try:
+        if eng is not None:
+            lo, hi = ca._fly_oneshot_range(ca._fly_window)
+            res["unloaded"] = [
+                str(key)
+                for key in eng.cfgs_for(lo, hi)
+                if not launcher_loaded(eng._by_cfg[key][0].launch)
+            ]
+            # The smallest whole-row payload of every served rung.
+            first = {}
+            for nbytes in _production_payloads(tp, fly_policy.detect_link())[0]:
+                if lo <= nbytes <= hi:
+                    first.setdefault(eng._pick_cfg(nbytes), nbytes)
+            cases = []
+            for cfg, nbytes in first.items():
+                parts = _parts(nbytes // _ROW_BYTES, ROW, tp, 5151 + nbytes, device)
+                cases.append(
+                    (cfg, nbytes, parts[rank].contiguous(), _rank_order_sum(parts))
+                )
+
+            calls = [0]
+
+            def allreduce(*args, _run=eng.allreduce, **kw):
+                calls[0] += 1
+                return _run(*args, **kw)
+
+            eng.allreduce = allreduce
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            error = None
+            try:
+                with graph_capture() as gc, torch.cuda.graph(g, stream=gc.stream):
+                    outs = [comm.all_reduce(x) for _cfg, _nbytes, x, _exact in cases]
+            except Exception as e:  # noqa: BLE001
+                error = f"{type(e).__name__}: {e}"
+            res["capture_error"] = error
+            res["served"] = calls[0]
+            # Replay only if every rank captured: the graph launches peers'
+            # kernels that wait for each other.
+            vote = torch.tensor([error is None], dtype=torch.int32)
+            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=cpu_group)
+            if vote.item():
+                mismatches = [0] * len(cases)
+                for _ in range(GRAPH_REPLAYS):
+                    torch.cuda.synchronize()
+                    dist.barrier(group=cpu_group)
+                    for out in outs:
+                        out.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    dist.barrier(group=cpu_group)
+                    g.replay()
+                    torch.cuda.synchronize()
+                    for i, ((_cfg, _nbytes, _x, exact), out) in enumerate(
+                        zip(cases, outs)
+                    ):
+                        bad = int(
+                            (out.view(torch.int16) != exact.view(torch.int16)).sum()
+                        )
+                        mismatches[i] = max(mismatches[i], bad)
+                res["rows"] = [
+                    {"cfg": str(cfg), "nbytes": nbytes, "mismatches": bad}
+                    for (cfg, nbytes, _x, _exact), bad in zip(cases, mismatches)
+                ]
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    return res
+
+
 def _spawn(target, world_size: int, **kwds) -> list:
     """*target* on every rank of a new spawn, with *kwds* and the rendezvous."""
     if world_size not in SUPPORTED_WORLDS:
@@ -1049,6 +1152,47 @@ def test_one_shot_allreduce_dispatch_skewed_rank(tp):
     return {"gfx": ARCH, "built": [r["built"] for r in ranks]}
 
 
+@benchmark()
+def test_one_shot_allreduce_first_call_in_capture(tp):
+    """Production dispatch with ``AITER_FLY_AR=1`` and no eager call: every
+    served rung is loaded at init, and the graph whose capture holds the first
+    launch of each one replays bit-exact."""
+    ranks = _spawn(_capture_first_rank, tp)
+    fails = []
+    for rank, r in enumerate(ranks):
+        if not r["built"]:
+            fails.append(
+                f"rank {rank}: the FlyDSL one-shot was not built under AITER_FLY_AR=1"
+            )
+            continue
+        if r["unloaded"]:
+            fails.append(
+                f"rank {rank}: served rungs not loaded at init: {r['unloaded']}"
+            )
+        if r["capture_error"]:
+            fails.append(f"rank {rank}: capture failed: {r['capture_error']}")
+            continue
+        if r["served"] != len(r["rows"]):
+            fails.append(
+                f"rank {rank}: {r['served']} of {len(r['rows'])} captured calls "
+                "reached the one-shot"
+            )
+        for row in r["rows"]:
+            if row["mismatches"]:
+                fails.append(
+                    f"rank {rank}: rung {row['cfg']} at {row['nbytes']} B differs "
+                    f"from the rank-order sum in {row['mismatches']} lanes"
+                )
+    _check(f"tp={tp} first call in capture", fails)
+    rows0 = ranks[0]["rows"]
+    return {
+        "gfx": ARCH,
+        "rungs": [row["cfg"] for row in rows0],
+        "payloads": [row["nbytes"] for row in rows0],
+        "unloaded": sum(len(r["unloaded"]) for r in ranks),
+    }
+
+
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
         df = pd.DataFrame(rows).drop(columns=list(KNOBS), errors="ignore")
@@ -1118,6 +1262,10 @@ def _verify(args, tps, dts, configs, given, link) -> None:
         _summarize(
             "flydsl one-shot allreduce dispatch with one rank skewed",
             [test_one_shot_allreduce_dispatch_skewed_rank(tp) for tp in tps],
+        )
+        _summarize(
+            "flydsl one-shot allreduce first call in capture",
+            [test_one_shot_allreduce_first_call_in_capture(tp) for tp in tps],
         )
 
 

@@ -19,6 +19,7 @@ from .allreduce_host_shared import (
     check_world_size,
     kernel_symbol,
     payload_probes,
+    preload_launcher,
     require_arch,
 )
 from .allreduce_policy import oneshot_ladder, resolve_family_policy, resolve_link
@@ -30,7 +31,7 @@ from .kernels.comm.allreduce_shared import (
 from .kernels.comm.one_shot_allreduce import (
     make_one_shot_allreduce_kernel,
 )
-from .kernels.tensor_shim import _preload_compiled, _run_compiled
+from .kernels.tensor_shim import _run_compiled
 
 logger = logging.getLogger("aiter")
 
@@ -226,7 +227,8 @@ class OneShotAllReduce:
         return [key for key in self._by_cfg if key in picked]
 
     def preload(self, *, payload_range=None) -> None:
-        """JIT-compile rung binaries without launching any of them.
+        """JIT-compile rung binaries and load them onto the device, without
+        launching any of them.
 
         ``payload_range=(lo, hi)`` takes only the rungs ``allreduce`` would run
         for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every one.
@@ -234,14 +236,16 @@ class OneShotAllReduce:
         routes only its own window here, so the rest never run.
 
         Local to this rank, not a collective. ``CustomAllreduce`` calls it once
-        at init, via ``preload_fly_engines``, to keep each rung's JIT compile off
-        the first real all-reduce, which may be inside a CUDA graph capture.
+        at init, via ``preload_fly_engines``, to keep each rung's JIT compile and
+        module load off the first real all-reduce, which may be inside a HIP
+        graph capture.
         """
         keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
-        for key in keys:
-            eng, spec = self._by_cfg[key]
-            args = self._launch_args(eng, spec, 0, 0, None, live_bytes=0)
-            _preload_compiled(eng.launch, *args)
+        with torch.cuda.device(self._device_index):
+            for key in keys:
+                eng, spec = self._by_cfg[key]
+                args = self._launch_args(eng, spec, 0, 0, None, live_bytes=0)
+                preload_launcher(eng.launch, *args)
 
     def variant(self, nbytes: int) -> str:
         """Identity of the binary an *nbytes* payload would run."""

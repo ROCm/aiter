@@ -1087,6 +1087,115 @@ def _dispatch_rank(rank: int, tp: int, init_method: str, skewed: bool = False) -
     return {"built": built, "probes": probes}
 
 
+def _capture_first_rank(rank: int, tp: int, init_method: str) -> dict:
+    """One rank of the first-call-in-capture spawn.
+
+    Stands up the production ``QuickAllReduce`` with ``AITER_FLY_AR=1`` and
+    ``AITER_QUICK_REDUCE_QUANTIZATION=INT4``, as ``_dispatch_rank`` does, but
+    makes no eager call. The first launch of every kernel the mesh and the ring
+    serve is inside one HIP graph capture.
+
+    It records the served kernels that were not loaded at init. That check
+    does not depend on whether HIP tolerates a module load during capture. It
+    then replays the graph and checks every output against an fp32 reference.
+    """
+    import torch.distributed as dist
+
+    from aiter.dist.parallel_state import graph_capture
+    from aiter.ops.flydsl.allreduce_host_shared import launcher_loaded
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+    set_custom_all_reduce(False)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(tp, 1)
+    tp_group = get_tp_group()
+    gloo = tp_group.cpu_group
+    group = tp_group.device_group
+    comm = tp_group.device_communicator
+    qr = comm.qr_comm
+    built = qr is not None and qr._fly_policy is not None
+    res = {"built": built, "unloaded": [], "rows": []}
+
+    try:
+        if built:
+            link = fly_policy.detect_link()
+            cases = []
+            for alg, eng in qr._fly_engines.items():
+                lo, hi = qr._fly_policy.window(alg, quantized=True).inclusive_range()
+                res["unloaded"] += [
+                    f"{alg.value} {key}"
+                    for key in eng.cfgs_for(lo, hi)
+                    if not launcher_loaded(eng._by_cfg[key].launch)
+                ]
+                payloads = _kernel_payloads(
+                    tp, alg.value, link, lo, min(hi, TOP_PAYLOAD_BYTES)
+                )
+                for cfg, nbytes in sorted(payloads.items(), key=lambda kv: kv[1]):
+                    inp = _make_inp(
+                        nbytes // _ROW_BYTES, HIDDEN, "normal", rank=rank, device=device
+                    )
+                    ref = inp.to(torch.float32)
+                    dist.all_reduce(ref, group=group)
+                    cases.append((alg, cfg, nbytes, inp, ref))
+
+            ran = []
+            for alg, eng in qr._fly_engines.items():
+
+                def allreduce(*args, _run=eng.allreduce, _alg=alg, **kw):
+                    ran.append(_alg)
+                    return _run(*args, **kw)
+
+                eng.allreduce = allreduce
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            error = None
+            try:
+                with graph_capture() as gc, torch.cuda.graph(g, stream=gc.stream):
+                    outs = [comm.all_reduce(case[3]) for case in cases]
+            except Exception as e:  # noqa: BLE001
+                error = f"{type(e).__name__}: {e}"
+            res["capture_error"] = error
+            res["ran"] = [a.value for a in ran]
+            res["expected"] = [case[0].value for case in cases]
+            # Replay only if every rank captured: the graph launches peers'
+            # kernels that wait for each other.
+            vote = torch.tensor([error is None], dtype=torch.int32)
+            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=gloo)
+            if vote.item():
+                sqnr = [float("inf")] * len(cases)
+                for _ in range(GRAPH_REPLAYS):
+                    torch.cuda.synchronize()
+                    dist.barrier(group=gloo)
+                    for out in outs:
+                        out.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    dist.barrier(group=gloo)
+                    g.replay()
+                    torch.cuda.synchronize()
+                    for i, (case, out) in enumerate(zip(cases, outs)):
+                        sqnr[i] = min(sqnr[i], _sqnr_db(out.float(), case[4]))
+                res["rows"] = [
+                    {
+                        "algorithm": alg.value,
+                        "cfg": str(cfg),
+                        "nbytes": nbytes,
+                        "sqnr_db": s,
+                    }
+                    for (alg, cfg, nbytes, _inp, _ref), s in zip(cases, sqnr)
+                ]
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=gloo)
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    return res
+
+
 def _spawn(target, world_size: int, **kwds) -> list:
     """*target* on every rank of a new spawn, with *kwds* and the rendezvous."""
     if world_size not in SUPPORTED_WORLDS:
@@ -1626,6 +1735,48 @@ def test_quick_allreduce_dispatch_skewed_rank(tp):
     return {"gfx": ARCH, "built": [r["built"] for r in ranks]}
 
 
+@benchmark()
+def test_quick_allreduce_first_call_in_capture(tp):
+    """Production dispatch with ``AITER_FLY_AR=1`` and no eager call: every
+    served kernel is loaded at init, and the graph whose capture holds the
+    first launch of each one replays within the INT4 floor."""
+    ranks = _spawn(_capture_first_rank, tp)
+    fails = []
+    for rank, r in enumerate(ranks):
+        if not r["built"]:
+            fails.append(
+                f"rank {rank}: the FlyDSL backend was not built under AITER_FLY_AR=1"
+            )
+            continue
+        if r["unloaded"]:
+            fails.append(
+                f"rank {rank}: served kernels not loaded at init: {r['unloaded']}"
+            )
+        if r["capture_error"]:
+            fails.append(f"rank {rank}: capture failed: {r['capture_error']}")
+            continue
+        if r["ran"] != r["expected"]:
+            fails.append(
+                f"rank {rank}: captured calls ran {r['ran']}, expected {r['expected']}"
+            )
+        for row in r["rows"]:
+            if not row["sqnr_db"] >= SQNR_MIN_DB:
+                fails.append(
+                    f"rank {rank}: {row['algorithm']} {row['cfg']} at "
+                    f"{row['nbytes']} B SQNR {row['sqnr_db']:.2f} dB below the "
+                    f"{SQNR_MIN_DB} dB floor"
+                )
+    _check(f"tp={tp} first call in capture", fails)
+    rows0 = ranks[0]["rows"]
+    return {
+        "gfx": ARCH,
+        "kernels": [f"{row['algorithm']} {row['cfg']}" for row in rows0],
+        "payloads": [row["nbytes"] for row in rows0],
+        "unloaded": sum(len(r["unloaded"]) for r in ranks),
+        "min_sqnr_db": min((row["sqnr_db"] for row in rows0), default=float("nan")),
+    }
+
+
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
         aiter.logger.info(
@@ -1806,6 +1957,10 @@ def _verify(args, tps, algos, dts, link) -> None:
     _summarize(
         "flydsl quick allreduce dispatch with one rank skewed",
         [test_quick_allreduce_dispatch_skewed_rank(tp) for tp in tps],
+    )
+    _summarize(
+        "flydsl quick allreduce first call in capture",
+        [test_quick_allreduce_first_call_in_capture(tp) for tp in tps],
     )
 
 

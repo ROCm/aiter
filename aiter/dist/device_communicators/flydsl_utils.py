@@ -23,9 +23,9 @@ def all_ranks_agree(ok: bool, group) -> bool:
 def all_ranks_agree_on_plan(plan, group, *, owner: str) -> bool:
     """Whether every rank in the group holds the same FlyDSL plan.
 
-    plan is this rank's dict of every input to its engine build, or an str 
-    naming why this rank declines. It is computed locally, from the environment 
-    and the host. Hence, so ranks can disagree. One ``all_gather_object`` on the 
+    plan is this rank's dict of every input to its engine build, or an str
+    naming why this rank declines. It is computed locally, from the environment
+    and the host. Hence, ranks can disagree. One ``all_gather_object`` on the
     CPU group settles it before any engine is built.
 
     Every rank that reaches the FlyDSL init must call this, whatever its own
@@ -65,17 +65,16 @@ def _plan_differences(plans) -> str:
 
 
 def preload_fly_engines(engines) -> None:
-    """Compile the binaries each engine serves, without launching them.
+    """Compile the binaries each engine serves and load them onto the device,
+    without launching them.
 
     *engines* holds ``(engine, (lo, hi))`` pairs, ``lo..hi`` being the payload
     bytes (inclusive) the dispatcher routes to that engine. Binaries its ladder
     assigns only to payloads outside that range are left alone: they never run.
 
-    FlyDSL compiles a binary on its first launch, and if that happens inside an
-    active CUDA graph capture, the capture pays seconds of JIT. The kernels take
-    the payload size at runtime, so one preload per binary covers every size.
-
-    The HIP module load is left to the first launch.
+    Otherwise FlyDSL would compile a binary, JIT its host wrapper, and load its
+    HIP module on its first launch. The kernels take the payload size at runtime, 
+    so one preload per binary covers every size.
     """
 
     for engine, payload_range in engines:

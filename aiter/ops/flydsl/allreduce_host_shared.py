@@ -17,6 +17,7 @@ from .kernels.comm.allreduce_shared import (
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
 )
+from .kernels.tensor_shim import _preload_compiled
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
@@ -326,6 +327,40 @@ def kernel_symbol(launch) -> str:
     if not name:
         return "?"
     return name.removeprefix("launch_")
+
+
+def _launch_artifacts(launch) -> list:
+    """The compiled artifacts of a ``@flyc.jit`` launch in this process."""
+    cache = getattr(launch, "_mem_cache", None)
+    if not isinstance(cache, dict):
+        raise TypeError(
+            f"cannot reach the compiled artifacts of {kernel_symbol(launch)}: "
+            "this FlyDSL version has no JitFunction._mem_cache"
+        )
+    return list(cache.values())
+
+
+def preload_launcher(launch, *args) -> None:
+    """Compile launch for args and load it onto the current device,
+    without launching it.
+
+    The module loads into the current device, so the caller must make the
+    engine's device current.
+    """
+    _preload_compiled(launch, *args)
+    artifacts = _launch_artifacts(launch)
+    if not artifacts:
+        raise RuntimeError(f"FlyDSL compiled no artifact for {kernel_symbol(launch)}")
+    for artifact in artifacts:
+        # Builds the ExecutionEngine, which loads the module, on first use.
+        artifact._get_func_exe()
+
+
+def launcher_loaded(launch) -> bool:
+    """Whether every compiled artifact of *launch* is loaded, so that its
+    next launch does no JIT and no module load. False if none is compiled."""
+    artifacts = _launch_artifacts(launch)
+    return bool(artifacts) and all(a._engine is not None for a in artifacts)
 
 
 def payload_probes(floors, lo: int, hi: int) -> tuple[int, ...]:

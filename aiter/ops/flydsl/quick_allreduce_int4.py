@@ -39,6 +39,7 @@ from .allreduce_host_shared import (
     check_world_size,
     kernel_symbol,
     payload_probes,
+    preload_launcher,
     require_arch,
 )
 from .allreduce_policy import (
@@ -74,7 +75,7 @@ from .kernels.comm.quick_allreduce_int4_ring import (
     RS_CODECS,
     make_quick_allreduce_ring_kernel,
 )
-from .kernels.tensor_shim import _preload_compiled, _run_compiled
+from .kernels.tensor_shim import _run_compiled
 
 logger = logging.getLogger("aiter")
 
@@ -558,7 +559,8 @@ class QuickAllReduceInt4:
         return [key for key in self._by_cfg if key in picked]
 
     def preload(self, *, payload_range=None) -> None:
-        """JIT-compile engine binaries without launching any of them.
+        """JIT-compile engine binaries and load them onto the device, without
+        launching any of them.
 
         ``payload_range=(lo, hi)`` takes only the binaries ``allreduce`` would
         run for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes every
@@ -566,16 +568,15 @@ class QuickAllReduceInt4:
         dispatcher routes only its own window here, so the rest never run.
 
         Local to this rank, not a collective. ``QuickAllReduce`` calls it once
-        at init, via ``preload_fly_engines``, to keep JIT compiles out of CUDA
-        graph capture; the op tests call it before timing or correctness
-        checks begin. The HIP module load still happens on each binary's first
-        launch.
+        at init, via ``preload_fly_engines``, to keep JIT compiles and module
+        loads out of HIP graph capture.
         """
         keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
-        for key in keys:
-            eng = self._by_cfg[key]
-            args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
-            _preload_compiled(eng.launch, *args)
+        with torch.cuda.device(self._device_index):
+            for key in keys:
+                eng = self._by_cfg[key]
+                args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
+                preload_launcher(eng.launch, *args)
 
     def norm_launch(self, cfg, hidden, eps, gemma_norm, latency=False, mxfp4=False):
         """Fused add+RMSNorm variant of engine *cfg*; shares its inbox and colors."""
