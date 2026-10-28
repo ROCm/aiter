@@ -995,7 +995,7 @@ def _bench_rank(
     return rows
 
 
-def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
+def _dispatch_rank(rank: int, tp: int, init_method: str, skewed: bool = False) -> dict:
     """One rank of the production-dispatch spawn.
 
     Unlike every other spawn here, this one does not build its own engines: it
@@ -1010,12 +1010,16 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     ran (a wrapper on each engine's ``allreduce`` records it), and the accuracy of
     the all-reduce the top-level returned. Unbounded windows are cut at
     ``TOP_PAYLOAD_BYTES``, as everywhere else in this file.
+
+    *skewed* leaves FlyDSL off on the last rank alone. The init must then
+    return on every rank, with nothing built, instead of leaving the other
+    ranks waiting in the engines' collectives.
     """
     import torch.distributed as dist
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
-    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_FLY_AR"] = "0" if skewed and rank == tp - 1 else "1"
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
     # No candidate here uses custom all-reduce; only the quick-reduce slot.
     set_custom_all_reduce(False)
@@ -1032,7 +1036,7 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
 
     probes = []
     try:
-        if built:
+        if built and not skewed:
             ran = []
             for alg, eng in qr._fly_engines.items():
 
@@ -1123,9 +1127,10 @@ _CASES: dict[tuple, list[tuple]] = {}
 # checked, per spawn key.
 _WINDOWS: dict[tuple, tuple[int, int]] = {}
 _RESULTS: dict[tuple, dict[tuple, list[dict]]] = {}
-# Per-rank production-dispatch results, per world size. Keyed by tp alone: the
-# dispatch spawn builds the production communicator, not a knob-pinned engine.
-_DISPATCH: dict[int, list] = {}
+# Per-rank production-dispatch results, per ``(tp, skewed)``. Not keyed by
+# knobs: the dispatch spawn builds the production communicator, not a
+# knob-pinned engine.
+_DISPATCH: dict[tuple[int, bool], list] = {}
 _FAILURES: list[str] = []
 # ``(reps, rounds)`` for every timed graph; set by ``main()``.
 _TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
@@ -1170,10 +1175,10 @@ def _result(key: tuple, case: tuple) -> list[dict]:
     return _RESULTS[key][case]
 
 
-def _dispatch_ranks(tp: int) -> list[dict]:
-    if tp not in _DISPATCH:
-        _DISPATCH[tp] = _spawn(_dispatch_rank, tp)
-    return _DISPATCH[tp]
+def _dispatch_ranks(tp: int, skewed: bool = False) -> list[dict]:
+    if (tp, skewed) not in _DISPATCH:
+        _DISPATCH[tp, skewed] = _spawn(_dispatch_rank, tp, skewed=skewed)
+    return _DISPATCH[tp, skewed]
 
 
 def _check(label: str, fails: list[str]) -> bool:
@@ -1604,6 +1609,23 @@ def test_quick_allreduce_dispatch(tp):
     }
 
 
+@benchmark()
+def test_quick_allreduce_dispatch_skewed_rank(tp):
+    """``AITER_FLY_AR=1`` on every rank but the last: the init returns on every
+    rank (the spawn timeout catches a hang) and none builds the FlyDSL backend."""
+    ranks = _dispatch_ranks(tp, skewed=True)
+    _check(
+        f"tp={tp} dispatch with one rank skewed",
+        [
+            f"rank {rank}: built the FlyDSL backend while the last rank has "
+            "AITER_FLY_AR=0"
+            for rank, r in enumerate(ranks)
+            if r["built"]
+        ],
+    )
+    return {"gfx": ARCH, "built": [r["built"] for r in ranks]}
+
+
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
         aiter.logger.info(
@@ -1780,6 +1802,10 @@ def _verify(args, tps, algos, dts, link) -> None:
     _summarize(
         "flydsl quick allreduce production dispatch",
         [test_quick_allreduce_dispatch(tp) for tp in tps],
+    )
+    _summarize(
+        "flydsl quick allreduce dispatch with one rank skewed",
+        [test_quick_allreduce_dispatch_skewed_rank(tp) for tp in tps],
     )
 
 

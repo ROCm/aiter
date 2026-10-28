@@ -33,7 +33,11 @@ from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.dist.utils import env_flag
 from aiter.utility.dtypes import fp8
 
-from .flydsl_utils import all_ranks_agree, preload_fly_engines
+from .flydsl_utils import (
+    all_ranks_agree,
+    all_ranks_agree_on_plan,
+    preload_fly_engines,
+)
 from .rocm_version import get_rocm_version
 
 # Importing this pulls in flydsl, an optional dependency whose version is
@@ -1218,42 +1222,27 @@ class CustomAllreduce:
         """Build the FlyDSL exact one-shot that fronts small plain all-reduces,
         and compile the rungs it serves before any graph capture begins.
 
-        Not built at all when ``custom_all_reduce`` would route it no payload
-        (see ``_fly_oneshot_range``): its IPC inbox would go unused."""
+        Not built at all when ``custom_all_reduce`` would not route any payload
+        to it.
 
-        if self.disabled or not _FLY_IMPORT_OK or not fly_policy.enabled():
+        Every rank that gets here votes on its plan before any engine collective. 
+        Hence, a rank that declines cannot leave its peers waiting."""
+
+        if self.disabled:
             return
 
-        # CustomAllreduce supports world size 6; no FlyDSL schedule does.
-        if self.world_size not in fly_policy.SUPPORTED_WORLDS:
+        plan = self._fly_oneshot_plan()
+        if not all_ranks_agree_on_plan(plan, self.group, owner="FlyDSL one-shot"):
+            if isinstance(plan, str):
+                logger.debug("FlyDSL one-shot disabled: %s.", plan)
             return
 
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        arch = get_gfx_runtime()
-        if arch not in fly_policy.SUPPORTED_ARCHS:
-            logger.debug("FlyDSL one-shot disabled: unsupported arch %s.", arch)
-            return
-
-        try:
-            link = fly_policy.detect_link()
-            policy = fly_policy.resolve_family_policy(
-                world_size=self.world_size, arch=arch, link=link
-            )
-        except fly_policy.NoPolicyError as e:
-            logger.debug("FlyDSL one-shot disabled: %s", e)
-            return
-        except ValueError as e:
-            logger.warning("FlyDSL one-shot disabled: %s", e)
-            return
-
-        window = policy.window(fly_policy.AllReduceAlgorithm.OneShot, quantized=False)
-        if window is None:
-            logger.debug("FlyDSL one-shot disabled by the policy.")
-            return
-
+        window = plan["policy"].window(
+            fly_policy.AllReduceAlgorithm.OneShot, quantized=False
+        )
+        link = plan["link"]
         engine = None
-        payload_range = self._fly_oneshot_range(window)
+        payload_range = plan["payload_range"]
         ok = True
         try:
             # The range is identical on every rank, so all ranks skip together.
@@ -1312,6 +1301,49 @@ class CustomAllreduce:
             link,
             engine.inbox_bytes / 2**20,
         )
+
+    def _fly_oneshot_plan(self) -> dict | str:
+        """This rank's inputs to the FlyDSL one-shot build, or why it declines.
+
+        Local to this rank,: it reads the environment and the host, which may 
+        differ between ranks.
+        """
+
+        if not _FLY_IMPORT_OK:
+            return "flydsl is not importable"
+        if not fly_policy.enabled():
+            return "AITER_FLY_AR is not 1"
+        if self.world_size not in fly_policy.SUPPORTED_WORLDS:
+            return f"no schedule for world size {self.world_size}"
+
+        try:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+            from aiter.ops.flydsl import installed_flydsl_version
+
+            arch = get_gfx_runtime()
+            if arch not in fly_policy.SUPPORTED_ARCHS:
+                return f"unsupported arch {arch}"
+            link = fly_policy.detect_link()
+            policy = fly_policy.resolve_family_policy(
+                world_size=self.world_size, arch=arch, link=link
+            )
+        except fly_policy.NoPolicyError as e:
+            return str(e)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("FlyDSL one-shot disabled: %s", e)
+            return f"{type(e).__name__}: {e}"
+
+        window = policy.window(fly_policy.AllReduceAlgorithm.OneShot, quantized=False)
+        if window is None:
+            return "disabled by the policy"
+        return {
+            "flydsl": installed_flydsl_version,
+            "arch": arch,
+            "link": link,
+            "world_size": self.world_size,
+            "policy": policy,
+            "payload_range": self._fly_oneshot_range(window),
+        }
 
     def _fly_oneshot_range(self, window) -> tuple[int, int]:
         """Payload bytes (inclusive) ``custom_all_reduce`` routes to the

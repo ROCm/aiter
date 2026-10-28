@@ -610,7 +610,7 @@ def _bench_rank(
     return rows
 
 
-def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
+def _dispatch_rank(rank: int, tp: int, init_method: str, skewed: bool = False) -> dict:
     """One rank of the production-dispatch spawn.
 
     Unlike every other spawn here, this one does not build its own engine: it
@@ -620,6 +620,10 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     ``should_custom_ar`` gate run on the way in. ``_init_fly_oneshot`` is what
     builds the slot; ``_fly_oneshot_range`` is the byte range dispatch actually
     routes to it (the policy window intersected with ``AITER_CUSTOM_AR_*``).
+
+    *skewed* leaves FlyDSL off on the last rank alone. The init must then
+    return on every rank, with nothing built, instead of leaving the other
+    ranks waiting in the engine's collectives.
     """
     import torch.distributed as dist
 
@@ -628,7 +632,7 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     # Enable the FlyDSL dispatch, and leave quick reduce off: NONE disables
     # qr_comm, so the custom-AR slot is reached, which is also production's
     # default for a plain bf16 all-reduce.
-    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_FLY_AR"] = "0" if skewed and rank == tp - 1 else "1"
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "NONE"
     set_custom_all_reduce(True)
     init_distributed_environment(
@@ -645,7 +649,7 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
 
     probes = []
     try:
-        if built:
+        if built and not skewed:
             eng = ca._fly_oneshot
             calls = [0]
 
@@ -733,9 +737,10 @@ _CASES: dict[tuple, list[tuple]] = {}
 # checked, per spawn key.
 _WINDOWS: dict[tuple, tuple[int, int]] = {}
 _RESULTS: dict[tuple, list] = {}
-# Per-rank production-dispatch results, per world size. Keyed by tp alone: the
-# dispatch spawn builds the production communicator, not a knob-pinned engine.
-_DISPATCH: dict[int, list] = {}
+# Per-rank production-dispatch results, per ``(tp, skewed)``. Not keyed by
+# knobs: the dispatch spawn builds the production communicator, not a
+# knob-pinned engine.
+_DISPATCH: dict[tuple[int, bool], list] = {}
 _FAILURES: list[str] = []
 # ``(reps, rounds)`` for every timed graph; set by ``main()``.
 _TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
@@ -774,10 +779,10 @@ def _ranks(key: tuple) -> list[dict]:
     return _RESULTS[key]
 
 
-def _dispatch_ranks(tp: int) -> list[dict]:
-    if tp not in _DISPATCH:
-        _DISPATCH[tp] = _spawn(_dispatch_rank, tp)
-    return _DISPATCH[tp]
+def _dispatch_ranks(tp: int, skewed: bool = False) -> list[dict]:
+    if (tp, skewed) not in _DISPATCH:
+        _DISPATCH[tp, skewed] = _spawn(_dispatch_rank, tp, skewed=skewed)
+    return _DISPATCH[tp, skewed]
 
 
 def _bench_ranks(key: tuple) -> list[list[dict]]:
@@ -1027,6 +1032,23 @@ def test_one_shot_allreduce_dispatch(tp):
     }
 
 
+@benchmark()
+def test_one_shot_allreduce_dispatch_skewed_rank(tp):
+    """``AITER_FLY_AR=1`` on every rank but the last: the init returns on every
+    rank (the spawn timeout catches a hang) and none builds the one-shot."""
+    ranks = _dispatch_ranks(tp, skewed=True)
+    _check(
+        f"tp={tp} dispatch with one rank skewed",
+        [
+            f"rank {rank}: built the FlyDSL one-shot while the last rank has "
+            "AITER_FLY_AR=0"
+            for rank, r in enumerate(ranks)
+            if r["built"]
+        ],
+    )
+    return {"gfx": ARCH, "built": [r["built"] for r in ranks]}
+
+
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
         df = pd.DataFrame(rows).drop(columns=list(KNOBS), errors="ignore")
@@ -1092,6 +1114,10 @@ def _verify(args, tps, dts, configs, given, link) -> None:
         _summarize(
             "flydsl one-shot allreduce production dispatch",
             [test_one_shot_allreduce_dispatch(tp) for tp in tps],
+        )
+        _summarize(
+            "flydsl one-shot allreduce dispatch with one rank skewed",
+            [test_one_shot_allreduce_dispatch_skewed_rank(tp) for tp in tps],
         )
 
 

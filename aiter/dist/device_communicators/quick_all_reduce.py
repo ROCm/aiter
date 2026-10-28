@@ -13,7 +13,11 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 
 from ..parallel_state import in_the_same_node_as
-from .flydsl_utils import all_ranks_agree, preload_fly_engines
+from .flydsl_utils import (
+    all_ranks_agree,
+    all_ranks_agree_on_plan,
+    preload_fly_engines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -220,44 +224,25 @@ class QuickAllReduce:
     def _init_fly_backend(self):
         """Build the FlyDSL mesh/ring engines that will serve plain all-reduce,
         and compile the binaries the policy routes to them before any graph
-        capture begins."""
+        capture begins.
 
-        if not _FLY_IMPORT_OK or not fly_policy.enabled():
-            return
-        if getattr(self, "qr_quant_level", None) not in _FLY_REGIMES:
-            return
+        Every rank that gets here votes on its plan before any engine collective. 
+        A rank that declines alone cannot leave its peers waiting."""
 
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        arch = get_gfx_runtime()
-        if arch not in fly_policy.SUPPORTED_ARCHS:
-            logger.debug(
-                "FlyDSL quick-reduce backend disabled: unsupported arch %s.", arch
-            )
+        plan = self._fly_backend_plan()
+        if not all_ranks_agree_on_plan(
+            plan, self.group, owner="FlyDSL quick-reduce backend"
+        ):
+            if isinstance(plan, str):
+                logger.debug("FlyDSL quick-reduce backend disabled: %s.", plan)
             return
 
-        rs_codec, ag_codec = _FLY_REGIMES[self.qr_quant_level]
-        # The link and the policy are identical on every rank, so all ranks
-        # decline together.
-        try:
-            link = fly_policy.detect_link()
-            policy = fly_policy.resolve_family_policy(
-                world_size=self.world_size, arch=arch, link=link
-            )
-        except fly_policy.NoPolicyError as e:
-            logger.debug("FlyDSL quick-reduce backend disabled: %s", e)
-            return
-        except ValueError as e:
-            logger.warning("FlyDSL quick-reduce backend disabled: %s", e)
-            return
-        algorithms = [
-            alg
-            for alg in policy.algorithms(quantized=True)
-            if alg != fly_policy.AllReduceAlgorithm.OneShot
-        ]
+        policy = plan["policy"]
+        link = plan["link"]
+        rs_codec, ag_codec = plan["codecs"]
         ok = True
         try:
-            for alg in algorithms:
+            for alg in plan["algorithms"]:
                 self._fly_engines[alg] = QuickAllReduceInt4(
                     group=self.group,
                     device=self.device,
@@ -321,6 +306,54 @@ class QuickAllReduce:
             ),
             sum(e.inbox_bytes for e in self._fly_engines.values()) / 2**20,
         )
+
+    def _fly_backend_plan(self) -> dict | str:
+        """This rank's inputs to the FlyDSL mesh/ring build, or why it declines.
+
+        Local to this rank: it reads the environment and the host, which may differ 
+        between ranks.
+        """
+
+        if not _FLY_IMPORT_OK:
+            return "flydsl is not importable"
+        if not fly_policy.enabled():
+            return "AITER_FLY_AR is not 1"
+        regime = getattr(self, "qr_quant_level", None)
+        if regime not in _FLY_REGIMES:
+            name = "unset" if regime is None else regime.name
+            return f"no FlyDSL schedule for quick-reduce quantization {name}"
+
+        try:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+            from aiter.ops.flydsl import installed_flydsl_version
+
+            arch = get_gfx_runtime()
+            if arch not in fly_policy.SUPPORTED_ARCHS:
+                return f"unsupported arch {arch}"
+            link = fly_policy.detect_link()
+            policy = fly_policy.resolve_family_policy(
+                world_size=self.world_size, arch=arch, link=link
+            )
+        except fly_policy.NoPolicyError as e:
+            return str(e)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("FlyDSL quick-reduce backend disabled: %s", e)
+            return f"{type(e).__name__}: {e}"
+
+        return {
+            "flydsl": installed_flydsl_version,
+            "arch": arch,
+            "link": link,
+            "world_size": self.world_size,
+            "regime": regime.name,
+            "codecs": _FLY_REGIMES[regime],
+            "policy": policy,
+            "algorithms": tuple(
+                alg
+                for alg in policy.algorithms(quantized=True)
+                if alg != fly_policy.AllReduceAlgorithm.OneShot
+            ),
+        }
 
     def _close_fly_engines(self):
         for eng in getattr(self, "_fly_engines", {}).values():

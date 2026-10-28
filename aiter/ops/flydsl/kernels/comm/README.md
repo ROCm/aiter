@@ -292,6 +292,15 @@ A host class builds one engine for each different config in its ladder. Each
 engine exchanges IPC handles with all ranks. All ranks must build the same
 engines in the same order. If they do not, the processes deadlock.
 
+Each rank works out what to build on its own, from its environment
+(`AITER_FLY_AR*`, `AITER_CUSTOM_AR_{MIN,MAX}_SIZE`,
+`AITER_QUICK_REDUCE_QUANTIZATION`), its arch and its link, so ranks can
+disagree. Before any engine is built, `CustomAllreduce` and `QuickAllReduce`
+gather every rank's plan over the CPU group
+(`flydsl_utils.all_ranks_agree_on_plan`). They build only if all plans match,
+otherwise FlyDSL collectives are off on every rank. The vote runs even when 
+FlyDSL is off, because a rank that skipped it would leave its peers waiting.
+
 ### The mesh and the ring are persistent kernels
 
 All workgroups of a persistent kernel must be on the GPU at the same time.
