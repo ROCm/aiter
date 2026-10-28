@@ -1158,6 +1158,11 @@ def fused_moe(
     quant_dtype_a2: torch.dtype | None = None,
     # False explicitly selects unclamped shared-expert SiLU semantics.
     clamp_shared: bool = True,
+    # True makes `output` an addend: the MoE result is accumulated into it.
+    accumulate_output: bool = False,
+    # Event recorded after the addend's producer (e.g. on a side stream). Stage 2
+    # waits on it, so the producer can overlap sorting and stage 1. Eager only.
+    output_ready_event: torch.cuda.Event | None = None,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1182,6 +1187,10 @@ def fused_moe(
     )
     if not clamp_shared and not has_shared_expert:
         raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
+    if output_ready_event is not None and not accumulate_output:
+        raise ValueError("output_ready_event requires accumulate_output=True")
+    if accumulate_output and has_shared_expert:
+        raise NotImplementedError("FHMoE does not support accumulate_output")
     if has_shared_expert:
         routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
         unsupported = []
@@ -1253,9 +1262,7 @@ def fused_moe(
         )
     if not block_size_M:
         block_size_M = -1
-    enable_ep_scatter = stage2_scatter is not None
-    scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
-    return fused_moe_(
+    common_args = dict(
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -1281,6 +1288,23 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        output=output,
+        quant_type_a=None if quant_type_a is None else quant_type_a.value,
+        quant_dtype_a=quant_dtype_a,
+        quant_dtype_a2=quant_dtype_a2,
+        accumulate_output=accumulate_output,
+    )
+    if output_ready_event is not None:
+        # A CUDA event cannot cross the custom-op schema.
+        return _fused_moe_impl(
+            **common_args,
+            stage2_scatter=stage2_scatter,
+            _output_ready_event=output_ready_event,
+        )
+    enable_ep_scatter = stage2_scatter is not None
+    scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
+    return fused_moe_(
+        **common_args,
         ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
         ep_combine_input_offset=(
             stage2_scatter.combine_input_offset if enable_ep_scatter else 0
@@ -1296,10 +1320,6 @@ def fused_moe(
             int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
         ),
         ep_source_token_map=scatter_source_map,
-        output=output,
-        quant_type_a=None if quant_type_a is None else quant_type_a.value,
-        quant_dtype_a=quant_dtype_a,
-        quant_dtype_a2=quant_dtype_a2,
     )
 
 
@@ -1342,6 +1362,7 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    accumulate_output: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1403,6 +1424,7 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    accumulate_output: bool = False,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1446,6 +1468,7 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        accumulate_output=accumulate_output,
     )
 
 
@@ -1488,6 +1511,7 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    accumulate_output: bool = False,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1496,6 +1520,7 @@ def _fused_moe_impl(
     _stage2_extra_args: dict | None = None,
     _stage2_override: Callable | None = None,
     _enforce_metadata_block_size: bool = False,
+    _output_ready_event: torch.cuda.Event | None = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -1543,6 +1568,21 @@ def _fused_moe_impl(
         output, (M, model_dim), dtype, hidden_states.device
     )
     _validate_output_buffer_no_overlap(output, hidden_states)
+    if accumulate_output and output is None:
+        raise ValueError("accumulate_output=True requires output=")
+    addend = output if accumulate_output else None
+    if addend is not None:
+        output = None
+
+    def _finish(ret):
+        if addend is None:
+            return _return_output(ret, output)
+        if ret is addend:
+            return ret
+        if _output_ready_event is not None:
+            torch.cuda.current_stream().wait_event(_output_ready_event)
+        return addend.add_(ret)
+
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
@@ -1602,7 +1642,7 @@ def _fused_moe_impl(
         )
 
     if grouped_a8w4_out is not None:
-        return _return_output(grouped_a8w4_out, output)
+        return _finish(grouped_a8w4_out)
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
@@ -1788,7 +1828,7 @@ def _fused_moe_impl(
                 q_dtype_w=q_dtype_w,
             )
         )
-        return _return_output(full_output, output)
+        return _finish(full_output)
 
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
@@ -1856,6 +1896,7 @@ def _fused_moe_impl(
     # refactored mixed_moe_gemm_2stage_common); keep the fused sort+quant on
     # the expanded-scale path only.
     fused_compact_scale = False
+    stage2_wait_event = None
     if metadata.output_aux:
         # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
         # routes get reverse_sorted = -1). The MXMOE a4w4 port would silently
@@ -1921,27 +1962,42 @@ def _fused_moe_impl(
     else:
         sort_output = None if metadata.flat else output
         moe_out_view = None
-        if (
+        sort_zeroes_buffers = (
             sort_output is None
             and not metadata.flat
             and not runtime_stage2_reduce
             and not _USE_CK_MOE_SORTING
             and not _USE_FLYDSL_MOE_SORTING
-            and _uses_cktile_splitk(metadata)
-        ):
+        )
+        # An accumulating stage 2 adds into the addend in place of the zeroed
+        # buffer, so the sort leaves it alone.
+        fold_addend = (
+            addend is not None
+            and sort_zeroes_buffers
+            and not metadata.run_1stage
+            and stage2_scatter is None
+            and _stage2_override is None
+        )
+        out_cols = 0 if fold_addend else model_dim
+        if sort_zeroes_buffers and _uses_cktile_splitk(metadata):
             # One buffer holds the stage-2 output and the stage-1 split-k
             # workspace, so the sort kernel zeroes both in a single pass.
             n1 = w1.shape[1]
             zero_buf = torch.empty(
-                (M, model_dim + topk * n1), dtype=dtype, device=topk_ids.device
+                (M, out_cols + topk * n1), dtype=dtype, device=topk_ids.device
             )
             flat_buf = zero_buf.view(-1)
             sort_output = zero_buf
-            moe_out_view = flat_buf[: M * model_dim].view(M, model_dim)
+            moe_out_view = flat_buf[: M * out_cols].view(M, out_cols)
             _stage1_extra_args = {
                 **(_stage1_extra_args or {}),
-                "splitk_workspace": flat_buf[M * model_dim :].view(M * topk, n1),
+                "splitk_workspace": flat_buf[M * out_cols :].view(M * topk, n1),
             }
+        elif fold_addend:
+            sort_output = addend.new_empty((M, 0))
+        if fold_addend:
+            moe_out_view = addend
+            stage2_wait_event = _output_ready_event
         sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
@@ -2004,7 +2060,7 @@ def _fused_moe_impl(
         )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
-        return _return_output(_stage1_call(), output)
+        return _finish(_stage1_call())
     else:
         ret = fused_moe_2stages(
             hidden_states,
@@ -2055,8 +2111,9 @@ def _fused_moe_impl(
             routing_num_experts=global_E,
             prequantized_a1=prequantized_a1,
             prequantized_a1_scale=prequantized_a1_scale,
+            _stage2_wait_event=stage2_wait_event,
         )
-        return _return_output(ret, output)
+        return _finish(ret)
 
 
 def fused_moe_1stage(
@@ -4660,6 +4717,7 @@ def fused_moe_2stages(
     routing_num_experts: int | None = None,
     prequantized_a1: torch.Tensor | None = None,
     prequantized_a1_scale: torch.Tensor | None = None,
+    _stage2_wait_event: torch.cuda.Event | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -5096,6 +5154,8 @@ def fused_moe_2stages(
         )
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage2", _stage2_call))
+    if _stage2_wait_event is not None:
+        torch.cuda.current_stream().wait_event(_stage2_wait_event)
     stage2_output = _stage2_call()
     return moe_out if _stage2_override is None else stage2_output
 
