@@ -948,17 +948,12 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
-def get_pa_metadata_info_v1(
-    batch_size: int,
-    num_head_k: int = 1,
-    fast_mode: bool = True,
-    max_split_per_batch: int = -1,
-):
+def get_pa_metadata_info_v1(batch_size: int, num_head_k: int = 1):
     """
-    Pass the same fast_mode and max_split_per_batch to get_pa_metadata_v1.
-    fast_mode=False reserves the prefix-budget planner's packed task capacity.
-    With fast_mode=False, reduction capacity excludes unsplit work and is zero
-    when splitting is disabled.
+    Allocate PA v1_2 metadata. Batches from 513 to 32768 reserve an internal
+    work-info scratch tail for parallel planning when KV heads divide the CU
+    count. Existing smaller buffers remain usable through the serial fallback.
+    Only records before work_indptr[-1] are attention tasks.
 
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
@@ -977,27 +972,12 @@ def get_pa_metadata_info_v1(
     max_work = (tile_cnt + cu_num - 1) * num_head_k
     max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
 
-    if not fast_mode:
-        if not 1 <= batch_size <= 32768 or not 1 <= num_head_k <= cu_num:
-            raise ValueError(
-                "parallel PA planning requires 1 <= batch <= 32768 and 1 <= KV heads <= CUs"
-            )
-        if max_split_per_batch == 0 or max_split_per_batch < -1:
-            raise ValueError("max_split_per_batch must be -1 or positive")
-        max_partitions = (
-            cu_num if max_split_per_batch < 0 else min(cu_num, max_split_per_batch)
-        )
-        split_boundaries = cu_num // num_head_k - 1
-        capacity = min(
-            batch_size * max_partitions,
-            batch_size + split_boundaries,
-        )
-        max_work = capacity * num_head_k
-        if batch_size > 512:
-            max_work += batch_size + 2 * ((batch_size + 511) // 512)
-        max_split_tiles = (
-            0 if max_partitions == 1 else min(capacity, 2 * split_boundaries)
-        )
+    if (
+        512 < batch_size <= 32768
+        and 1 <= num_head_k <= cu_num
+        and cu_num % num_head_k == 0
+    ):
+        max_work += batch_size + 2 * ((batch_size + 511) // 512)
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs
@@ -1044,36 +1024,17 @@ def get_pa_metadata_v1(
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
-            fast_mode: True keeps the existing PA v1_2 planner. False selects the PA v1_1
-                       prefix-budget planner, not MLA's cost-sorted v1_1. Allocate buffers with
-                       get_pa_metadata_info_v1 using the same fast_mode/max_split_per_batch.
-                       v1_1 supports dense batches up to 32768 with positive Q lengths and
-                       max_seqlen_qo * num_heads_per_head_k <= 128 (one Q tile). KV granularity
-                       must be a multiple of block_size; no larger minimum tile is imposed.
-                       Inputs must provide consistent Q/page
-                       indptrs and valid context lengths. Empty contexts receive no work; callers
-                       remain responsible for their final output values.
-                       Batches up to 512 share a block-wide prefix scan, write tasks in parallel,
-                       and finalize work_indptr in the same launch. Larger batches use chunked
-                       planning and a same-stream finalizer. No GPU-to-CPU readback is needed.
-                       The work-info allocation includes an internal scratch tail for large batches;
-                       only records before work_indptr[-1] are attention tasks. Reallocate buffers
-                       with get_pa_metadata_info_v1 when updating from the previous planner.
-                       Prefix sums of KV units reproduce v1_2's worker budgets: the first
-                       remainder workers receive one extra unit. With the default split budget,
-                       nonempty dense inputs, page-sized KV granularity, and CU count divisible
-                       by the KV head count, the effective attention work layout matches v1_2.
-                       Positive Q lengths affect partial-output offsets, not partition weights.
-                       No length-dependent proportional scheduling strategy is selected.
-                       All KV heads share the partition and reduction layout; persistent workers
-                       may process multiple works. A restrictive max_split_per_batch limits
-                       partitions and can reduce load balance.
-                       Validate attention separately from metadata; planning-time savings do not
-                       establish a compute speedup. Restricted caps and unsupported v1_2 inputs
-                       retain v1_1's own safety and allocation semantics.
+            fast_mode: default=True. Uses parallel v1_2 generation for dense, single-Q-tile inputs
+                       with page-sized KV granularity, up to 32768 requests and the full CU
+                       worker budget. False, other configurations, or buffers without the extra
+                       scratch space (see get_pa_metadata_info_v1) use the original serial v1_2
+                       generator with identical metadata. Valid inputs require consistent
+                       indptrs, context lengths and positive Q lengths. Empty contexts have no
+                       attention work in the parallel path; callers own their outputs.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
-            max_split_per_batch: v1_1 caps partitions per request; -1 uses the device CU count.
-                       v1_2 retains its existing global split-budget behavior.
+            max_split_per_batch: Retains the v1_2 global worker budget:
+                       negative uses the CU count, otherwise min(CUs, batch * value).
+                       The budget must be positive and divisible by the KV-head count.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.

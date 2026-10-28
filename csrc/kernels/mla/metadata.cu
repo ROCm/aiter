@@ -6,7 +6,6 @@
 #include "metadata/v1_0_device.cuh"
 #include "metadata/v1_1_device.cuh"
 #include "metadata/v1_2_device.cuh"
-#include "metadata/v1_1_pa_device.cuh"
 #include "metadata/v1_2_pa_device.cuh"
 #include "metadata/v1_2_host.cuh"
 
@@ -202,9 +201,7 @@ void get_pa_metadata_v1(
     AITER_CHECK(pages_kv_indptr.dtype() == AITER_DTYPE_i32,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
 
-    const auto generate_metadata = fast_mode ? get_pa_metadata_v1_2_device
-                                             : get_pa_metadata_v1_1_device;
-    generate_metadata(
+    get_pa_metadata_v1_2_device(
         seqlens_qo_indptr,
         pages_kv_indptr,
         context_lens,
@@ -215,6 +212,7 @@ void get_pa_metadata_v1(
         block_size,
         max_seqlen_qo,
         uni_seqlen_qo,
+        fast_mode,
         topk,
         max_split_per_batch,
         work_metadata_ptrs,
