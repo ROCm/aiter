@@ -3,8 +3,8 @@
 
 """MiniMax-M3 lightning-indexer PREFILL block scores, MXFP4 index cache.
 
-Staged route (`staged=True`; the default is the native kernel,
-`minimax_m3_index_score_prefill_fp4_native`): a Triton kernel dequantizes the
+Staged route (`staged=True`; the default is the fp8 prefill kernel's native MXFP4
+path, `score_prefill_flydsl(..., k_scale=...)`): a Triton kernel dequantizes the
 pages the batch references into a compact fp8 staging buffer and the fp8 prefill
 scorer runs on it unchanged, so scores are those of "dequantize to fp8, then score".
 
@@ -34,9 +34,6 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score_fp4_cache import _validate_
 from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     alloc_score,
     score_prefill_flydsl,
-)
-from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill_fp4_native import (
-    score_prefill_flydsl_fp4_native,
 )
 
 __all__ = ["alloc_score", "dequant_pages_fp8", "score_prefill_flydsl_fp4"]
@@ -236,10 +233,9 @@ def score_prefill_flydsl_fp4(
     if not staged:
         if workspace is not None:
             raise ValueError("workspace is the staged path's buffer; pass staged=True")
-        return score_prefill_flydsl_fp4_native(
+        return score_prefill_flydsl(
             idx_q,
             k_data,
-            k_scale,
             block_table,
             cu_seqlens_q,
             seq_lens,
@@ -248,6 +244,7 @@ def score_prefill_flydsl_fp4(
             max_seq_len,
             sm_scale,
             out=out,
+            k_scale=k_scale,
             q_scale=q_scale,
         )
     dev = idx_q.device
