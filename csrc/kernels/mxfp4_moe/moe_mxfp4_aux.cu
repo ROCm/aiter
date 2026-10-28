@@ -153,7 +153,8 @@ void mxfp4_moe_sort_kernel(
     int64_t D_HIDDEN,
     int64_t D_INTER,
     int64_t MB,
-    int64_t prologue)
+    int64_t prologue,
+    std::optional<aiter_tensor_t> num_local_tokens)
 {
     (void)D_INTER;
     HipDeviceGuard guard(topk_ids.device_id);
@@ -168,6 +169,14 @@ void mxfp4_moe_sort_kernel(
         workspace_bytes  = static_cast<long long>(bf16_zero_workspace.numel())
                          * static_cast<long long>(bf16_zero_workspace.element_size());
     }
+
+    // [1] int32 on device; only the inline_quant (MB=16) sort reads it.
+    const int32_t* num_local_tokens_ptr =
+        num_local_tokens.has_value()
+            ? static_cast<const int32_t*>(num_local_tokens.value().data_ptr())
+            : nullptr;
+    AITER_CHECK(prologue == 0 || num_local_tokens_ptr == nullptr,
+                "mxfp4_moe_sort (threestage): num_local_tokens is unsupported");
 
     if (prologue == 1 /* threestage */) {
         // Caller-provided int32 scratch (was torch::empty here before de-torch):
@@ -203,7 +212,7 @@ void mxfp4_moe_sort_kernel(
             static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
             static_cast<float*>(sorted_weights.data_ptr()),
             static_cast<int32_t*>(m_indices.data_ptr()),
-            bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes);
+            bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes, num_local_tokens_ptr);
     } else {
         const std::string key = "aux_sortonly_NE" + std::to_string(NE)
             + "_TOPK" + std::to_string(TOPK) + "_MB" + std::to_string(MB)
@@ -214,7 +223,7 @@ void mxfp4_moe_sort_kernel(
             static_cast<int32_t*>(sorted_token_ids.data_ptr()), static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
             static_cast<int32_t*>(cumsum_tensor.data_ptr()), static_cast<int32_t*>(reverse_sorted.data_ptr()),
             static_cast<float*>(sorted_weights.data_ptr()),
-            static_cast<int32_t*>(m_indices.data_ptr()));
+            static_cast<int32_t*>(m_indices.data_ptr()), num_local_tokens_ptr);
     }
 }
 
