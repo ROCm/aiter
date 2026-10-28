@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -84,6 +85,59 @@ def test_head_padding_aot_cache_reuse() -> None:
                     ps=False,
                 )
                 assert result["err_gluon"] == 0
+
+
+@pytest.mark.parametrize(
+    "key_dim,value_dim,output_dim,trans_v",
+    [
+        (128, 192, 192, True),
+        (192, 128, 192, True),
+        (192, 128, 192, False),
+        (192, 192, 128, True),
+        (192, 128, 128, True),
+    ],
+)
+def test_aot_rejects_mismatched_head_widths(
+    monkeypatch, key_dim, value_dim, output_dim, trans_v
+) -> None:
+    """Reject incompatible physical storage before AOT compilation or launch."""
+    module = importlib.import_module("csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot")
+    monkeypatch.setattr(module, "get_cdna_version", lambda: 4)
+
+    def unexpected_compile(**kwargs):
+        pytest.fail("invalid head widths reached AOT compilation")
+
+    monkeypatch.setattr(module, "compile", unexpected_compile)
+    query = torch.empty((8, 4, 192), dtype=torch.bfloat16, device="meta")
+    key = query.new_empty((34, 1, key_dim // 8, 64, 8))
+    value = query.new_empty(
+        (34, 1, 8, value_dim, 8) if trans_v else (34, 1, value_dim, 64)
+    )
+    output = query.new_empty((8, 4, output_dim))
+    lengths = torch.empty(2, dtype=torch.int32, device="meta")
+    tables = lengths.new_empty((2, 17))
+    stats = query.new_empty((2, 1, 5, 16), dtype=torch.float32)
+    scratch = query.new_empty((2, 1, 5, 16, 192))
+    with pytest.raises(ValueError, match="physical Q/K, V and output head dimensions"):
+        pa_decode_gluon_aot(
+            output,
+            query,
+            key,
+            value,
+            lengths,
+            tables,
+            192**-0.5,
+            4,
+            5,
+            256,
+            torch.bfloat16,
+            None,
+            None,
+            None,
+            stats,
+            stats,
+            scratch,
+        )
 
 
 def run_normal_performance_aot() -> None:

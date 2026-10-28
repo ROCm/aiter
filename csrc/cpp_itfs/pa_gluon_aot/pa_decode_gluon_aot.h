@@ -113,6 +113,9 @@ inline std::string pa_decode_cache_key(
         std::to_string(cdna_version);
 }
 
+// Non-persistent full-attention AOT with optional sinks and matching physical
+// Q/K, V and output widths. Use pa_decode_gluon JIT for native Q/K192-V128,
+// persistent PS/one-shot dispatch and sliding-window attention.
 void pa_decode_gluon_aot(
     torch::Tensor& output,
     torch::Tensor& query,

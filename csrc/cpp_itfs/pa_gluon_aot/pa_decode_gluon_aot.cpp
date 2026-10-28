@@ -222,6 +222,15 @@ void pa_decode_gluon_aot(
     const bool value_transposed = (value_cache.dim() == 5);
     const bool use_sinks_flag   = sinks.defined();
 
+    const auto key_head_size = key_cache.size(2) * key_cache.size(4);
+    const auto value_head_size = value_cache.size(value_transposed ? 3 : 2);
+    TORCH_CHECK(head_size == key_head_size && head_size == value_head_size &&
+                head_size == output.size(-1),
+        "pa_decode_gluon_aot: physical Q/K, V and output head dimensions must match; got Q=",
+        head_size, ", K=", key_head_size, ", V=", value_head_size,
+        ", output=", output.size(-1),
+        ". Use pa_decode_gluon JIT for supported asymmetric configurations.");
+
     // ==================== QUANTIZATION MODE CONFIGURATION ====================
     int query_quant_mode = -1;
     int kv_quant_mode    = -1;

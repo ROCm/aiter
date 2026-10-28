@@ -39,8 +39,11 @@ static void test_head_padding_cache_reuse() {
         "csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot_warmup");
     py::object original_warmup = warmup_mod.attr("warmup_pa_decode");
     std::vector<int> warmup_heads;
+    bool checking_invalid_widths = false;
     warmup_mod.attr("warmup_pa_decode") = py::cpp_function(
-        [&warmup_heads, original_warmup](py::args args) {
+        [&warmup_heads, &checking_invalid_widths, original_warmup](py::args args) {
+            TORCH_CHECK(!checking_invalid_widths,
+                "Invalid head widths reached native AOT warmup");
             warmup_heads.push_back(args[3].cast<int>());
             return original_warmup(*args);
         });
@@ -70,6 +73,40 @@ static void test_head_padding_cache_reuse() {
             auto temporary_output = torch::zeros(
                 {num_seqs, num_kv_heads, num_parts, eq_query_group_size, head_size},
                 bf16);
+
+            if (head_size == 192) {
+                // D192 is not cached yet; prevent a launch if validation regresses.
+                checking_invalid_widths = true;
+                auto check_width_error = [&](torch::Tensor bad_key,
+                                             torch::Tensor bad_value,
+                                             torch::Tensor bad_output) {
+                    bool rejected = false;
+                    try {
+                        aiter::pa_decode_gluon_aot(
+                            bad_output, query, bad_key, bad_value, lengths, tables,
+                            1.0f / std::sqrt(static_cast<float>(head_size)),
+                            query_length, num_parts, partition_size,
+                            at::ScalarType::BFloat16, {}, no_scale, no_scale,
+                            exp_sums, max_logits, temporary_output);
+                    } catch (const c10::Error& error) {
+                        TORCH_CHECK(std::string(error.what_without_backtrace()).find(
+                            "physical Q/K, V and output head dimensions must match")
+                            != std::string::npos,
+                            "Unexpected validation error: ", error.what_without_backtrace());
+                        rejected = true;
+                    }
+                    TORCH_CHECK(rejected, "AOT accepted mismatched physical head widths");
+                };
+                check_width_error(key.narrow(2, 0, 128 / vec), value, output);
+                check_width_error(key, value.narrow(3, 0, 128), output);
+                check_width_error(key,
+                    torch::empty({num_blocks, num_kv_heads, 128, page_size}, bf16), output);
+                check_width_error(key, value, output.narrow(2, 0, 128));
+                check_width_error(key, value.narrow(3, 0, 128), output.narrow(2, 0, 128));
+                checking_invalid_widths = false;
+                std::cout << "[PASS] Five head-width mismatches rejected before native warmup"
+                          << std::endl;
+            }
 
             aiter::pa_decode_gluon_aot(
                 output, query, key, value, lengths, tables,
