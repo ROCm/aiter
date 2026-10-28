@@ -4,7 +4,7 @@
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
@@ -67,7 +67,7 @@ def fused_gemm_a16w16_quant_x(
         When skip_reduce=True and NUM_KSPLIT > 1, Y has shape (NUM_KSPLIT, M, N).
     """
 
-    _LOGGER.info(f"FUSED_GEMM_A16W16_QUANT_X: x={tuple(x.shape)} w={tuple(w.shape)}")
+    _LOGGER.info("FUSED_GEMM_A16W16_QUANT_X: x=%s w=%s", tuple(x.shape), tuple(w.shape))
     # Shape checks
     assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
     assert (

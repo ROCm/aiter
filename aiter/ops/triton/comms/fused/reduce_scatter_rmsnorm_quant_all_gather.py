@@ -264,7 +264,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         >>> with IrisCommContext() as ctx:
         >>>     # Input must be in Iris shared memory for reduce-scatter
         >>>     input_tensor = ctx.iris_ctx.ones((8192, 7168), dtype=torch.float32)
-        >>>     gamma = torch.ones(7168, device="cuda")
+        >>>     gamma = torch.ones(7168, dtype=torch.float32, device=input_tensor.device)
         >>>     norm, quant, gathered = reduce_scatter_rmsnorm_quant_all_gather(
         >>>         input_tensor, gamma, ctx=ctx, quant_mode="fp8_per_token"
         >>>     )
@@ -300,7 +300,12 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         raise ValueError(f"M ({M}) must be divisible by world_size ({world_size})")
 
     logger.info(
-        f"Rank {cur_rank}/{world_size}: Fused pipeline M={M}, N={N} -> M_shard={M_shard}"
+        "Rank %d/%d: Fused pipeline M=%d, N=%d -> M_shard=%d",
+        cur_rank,
+        world_size,
+        M,
+        N,
+        M_shard,
     )
 
     # Allocate or reuse buffers
@@ -405,7 +410,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
     # Synchronize
     ctx.iris_ctx.barrier()
 
-    logger.info(f"Rank {cur_rank}: Fused pipeline complete")
+    logger.info("Rank %d: Fused pipeline complete", cur_rank)
 
     # Return results based on configuration
     # Note: norm_buffer is in float32 for numerical accuracy during RMSNorm

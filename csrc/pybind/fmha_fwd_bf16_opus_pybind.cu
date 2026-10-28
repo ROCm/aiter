@@ -3,7 +3,7 @@
 #include "rocm_ops.hpp"
 #include "torch/fmha_fwd_bf16_opus.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     FMHA_FWD_BF16_OPUS_PYBIND;
 }

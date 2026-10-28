@@ -65,6 +65,18 @@ def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
     return out.view(x_type)
 
 
+def shuffle_blockscale_to_mxfp8_scale(scale: torch.Tensor, n: int) -> torch.Tensor:
+    """128x128 e8m0 block scale [ceil(n/128), K/128] -> shuffled 1x32 [pad32(n), K/32].
+
+    Lossless (each 1x32 block repeats its 128x128 block's exponent): the n32k4
+    B-scale of the 1x32 MXFP8 GEMM, built once at weight load.
+    """
+    s = scale.view(torch.uint8).repeat_interleave(128, dim=0)[:n]
+    return shuffle_mxfp8fp4_scale(s.repeat_interleave(4, dim=1).contiguous()).view(
+        scale.dtype
+    )
+
+
 def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
     """
     Preshuffle weights for gfx1250 WMMA.
@@ -176,6 +188,7 @@ def shuffle_weight(
             x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
         x_ = x_.view(*x.shape).contiguous().view(x_type)
         x_.is_shuffled = True
+        x_.gate_up_interleave = gate_up
         return x_
 
     IN, IK = layout
@@ -347,7 +360,14 @@ def shuffle_scale(
             dtype=src.dtype,
             device=src.device,
         )
-
+        # Initialise the pad. torch.empty leaves it undefined, and kernels that
+        # read whole 8-group tiles then consume garbage (E8M0 0xFF is NaN), so
+        # the result depends on stale device memory. 0x7F is E8M0 1.0, matching
+        # the is_guinterleave branch below.
+        if scale_padded.element_size() == 1:
+            scale_padded.view(torch.uint8).fill_(0x7F)
+        else:
+            scale_padded.fill_(1.0)
         scale_padded[:m, :n] = src
         scale = scale_padded
         sm, sn = scale.shape

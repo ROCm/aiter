@@ -14,8 +14,6 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 from ..mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from ..mxfp4_gemm_common import (
     flat_buffer_view,
@@ -27,6 +25,7 @@ from ..mxfp4_gemm_common import (
     lds_swizzle_mask_f8,
     lds_vec_load,
 )
+from ..tensor_shim import buf_copy_load, ptr_buf_tensor
 
 
 def scale_view(
@@ -38,7 +37,7 @@ def scale_view(
         T.i32, address_space=fx.AddressSpace.Global, alignment=4
     )
     off_i64 = fx.Int64(base_dw)
-    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_scale) + off_i64 * fx.Int64(4))
+    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_scale) + off_i64 * 4)
     shape = (4, 16, K_TILES_TOTAL, 1)
     stride = (16, 1, k0_stride_dw, 1)
     view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, stride)))
@@ -183,9 +182,16 @@ def gemm2_compute_v2(
     SBM=None,
     g2_bhoist=True,
     g2_ascale_pf=True,
+    g2_b2stage=False,
+    g2_deep_a_pipeline=False,
     expert_offset=0,
+    explicit_m_row=None,
+    explicit_n_block=None,
+    explicit_expert=None,
 ):
-    """Run the GEMM2 K-loop and return accumulators for the selected epilogue."""
+    """Run GEMM2, optionally using an explicitly selected expert row/tile."""
+    assert aStages == (4 if g2_deep_a_pipeline else kStages + 1)
+    assert not g2_deep_a_pipeline or g2_b2stage
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
     if SBM is None:
         SBM = BM
@@ -205,36 +211,42 @@ def gemm2_compute_v2(
     # Contraction K = inter_dim runtime (i32_inter); INTER_MAX caps compile-time view/fragment bounds.
     K_rt = fx.Int32(i32_inter)
     K_BYTES = K_rt // fx.Int32(a_pack)  # A row stride bytes (runtime)
-    kc_rt = K_rt // fx.Int32(256)  # (K//32)//4//2
+    kc_rt = K_rt // 256  # (K//32)//4//2
     K_TILES_RT = K_rt // fx.Int32(BK)  # runtime K-tile trip count
-    kAS_per_chunk_dw = kc_rt * fx.Int32(64)
-    kBS_stride_n0_dw = kc_rt * fx.Int32(64)
+    kAS_per_chunk_dw = kc_rt * 64
+    kBS_stride_n0_dw = kc_rt * 64
     # N_OUT = model_dim/hidden is the gemm2 output N dim; runtime via i32_hidden (no K-loop dependency).
     N_OUT_rt = fx.Int32(i32_hidden)
-    kbs_per_expert_dw = (
-        N_OUT_rt // fx.Int32(32)
-    ) * kBS_stride_n0_dw  # (N_OUT//16//2)*stride
+    kbs_per_expert_dw = (N_OUT_rt // 32) * kBS_stride_n0_dw  # (N_OUT//16//2)*stride
     num_n_blocks = N_OUT_rt // fx.Int32(BN)
-    KH4 = K_rt // fx.Int32(8)  # i32 col stride (= K_HALF//4)
+    KH4 = K_rt // 8  # i32 col stride (= K_HALF//4)
     K_SCALE_CHUNKS_MAX = INTER_MAX // 256
+    kFenceEvery = (aStages - kStages) if g2_deep_a_pipeline else 1
+    assert kFenceEvery >= 1
 
     # Padded shapes mask weight tiles beyond the real K/N extents.
     N_real = None
     if const_expr(has_pad):
         K_real = K_rt - fx.Int32(i32_kpad)
-        halves_real = (K_real + fx.Int32(127)) // fx.Int32(128)
+        halves_real = (K_real + 127) // 128
         N_real = N_OUT_rt - fx.Int32(i32_npad)
 
     # Map each compute block to its SBM-padded expert metadata row.
-    m_block_idx = bx_i32 // num_n_blocks
-    n_block_idx = bx_i32 - m_block_idx * num_n_blocks
-    eids_ptr = global_typed_ptr(arg_eids, T.i32)
-    if const_expr(SBM == BM):
-        e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
-        m_row = m_block_idx * BM
+    if const_expr(explicit_m_row is not None):
+        m_row = fx.Int32(explicit_m_row)
+        m_block_idx = m_row // fx.Int32(BM)
+        n_block_idx = fx.Int32(explicit_n_block)
+        e = fx.Int32(explicit_expert)
     else:
-        m_row = m_block_idx * BM
-        e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
+        m_block_idx = bx_i32 // num_n_blocks
+        n_block_idx = bx_i32 - m_block_idx * num_n_blocks
+        eids_ptr = global_typed_ptr(arg_eids, T.i32)
+        if const_expr(SBM == BM):
+            e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
+            m_row = m_block_idx * BM
+        else:
+            m_row = m_block_idx * BM
+            e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
     if const_expr(expert_offset != 0):
         e = e - fx.Int32(expert_offset)
 
@@ -314,13 +326,13 @@ def gemm2_compute_v2(
     # The shared e8m0 scale layout bounds each A-scale view to its remaining bytes.
     sc_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 32)
 
-    asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * fx.Int32(4)
+    asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * 4
     asc_num = fx.Int64(i32_max_m_blocks) * fx.Int64(asc_per_mb)
     scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
 
     def make_ascale_view(sub):
         base_dw = (scale_chunk0 + fx.Int32(sub)) * kAS_per_chunk_dw
-        nrec = asc_num - fx.Int64(base_dw) * fx.Int64(4)
+        nrec = asc_num - fx.Int64(base_dw) * 4
         return scale_view(
             arg_ascale,
             base_dw,
@@ -351,7 +363,7 @@ def gemm2_compute_v2(
         return out
 
     # Stream B weights and scales through registers so use_nt reaches the ISA cache policy.
-    bq_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_bq)
+    bq_buffer = ptr_buf_tensor(arg_bq, fx.Int32, unit_elems=4)
 
     bq_base_dw = [
         rocdl.readfirstlane(
@@ -392,13 +404,28 @@ def gemm2_compute_v2(
                     load_mask = (col < N_real) & (
                         kt_rt * fx.Int32(kHalves) + fx.Int32(half) < halves_real
                     )
-                bq_vec = buffer_ops.buffer_load(
-                    bq_rsrc,
-                    bq_off_dw,
-                    vec_width=4,
-                    dtype=T.i32,
-                    mask=load_mask,
+                safe_bq_off_dw = (
+                    load_mask.select(bq_off_dw, fx.Int32(0))
+                    if load_mask is not None
+                    else bq_off_dw
+                )
+                loaded_bq = buf_copy_load(
+                    bq_buffer,
+                    safe_bq_off_dw // fx.Int32(4),
+                    fx.Int32,
+                    unit_elems=4,
                     cache_modifier=2 if use_nt else 0,
+                )
+                bq_vec = (
+                    fx.Vector.from_elements(
+                        [
+                            load_mask.select(loaded_bq[i], fx.Int32(0))
+                            for i in range_constexpr(4)
+                        ],
+                        fx.Int32,
+                    )
+                    if load_mask is not None
+                    else loaded_bq
                 )
                 bqf[j][half].store(Vec(bq_vec))
         chunk_kt = (
@@ -473,7 +500,7 @@ def gemm2_compute_v2(
                 )
 
     # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
-    zero4 = Vec.filled(4, 0.0, Float32)
+    zero4 = fx.full(4, 0.0, Float32)
     c_frags = [
         [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
         for _ in range_constexpr(kMChunks)
@@ -493,7 +520,7 @@ def gemm2_compute_v2(
                 n += 1
         return n
 
-    if const_expr(BM == 64 and BN == 256):
+    if const_expr(BM == 64 and BN == 256 and not g2_b2stage):
         # BM64/BN256 uses the 1-stage B path unconditionally.
         for kt_iv, state in range(
             fx.Int32(0),
@@ -582,7 +609,7 @@ def gemm2_compute_v2(
             # A-scale vmem load(s) for K-tile kt_rt into the given (per-stage) fragment(s).
             sa = load_a_scale_tile(kt_rt)
             for sub in range_constexpr(kScaleSubBlocks):
-                saf[sub].store(Vec.filled(1, sa[sub], Int32))
+                saf[sub].store(fx.full(1, sa[sub], Int32))
 
         def load_carry():
             return load_c_carry() + load_b_carry()
@@ -627,9 +654,13 @@ def gemm2_compute_v2(
             kt_rt = fx.Int32(kt_iv)
             if const_expr(g2_bhoist):
                 prefetch_next_b(kt_rt)
-            gpu.barrier()
-            issue_a_ds_read(kt_rt % fx.Int32(aStages))
+            if const_expr(g2_deep_a_pipeline):
+                if (kt_rt % fx.Int32(kFenceEvery)) == 0:
+                    gpu.barrier()
+            else:
+                gpu.barrier()
             nxt_a = kt_rt + fx.Int32(kStages)
+            issue_a_ds_read(kt_rt % fx.Int32(aStages))
             if nxt_a < K_TILES_RT:
                 issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
             # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.
