@@ -1387,7 +1387,15 @@ class TunerCommon:
         # --run_config: only run benchmark and exit (no tuning)
         if args.run_config:
             if self.untunedf.empty:
-                logger.info("No shapes to benchmark, nothing to run")
+                if run_config_file:
+                    # Exits 0 like any run_config; the warning is what says
+                    # nothing was checked.
+                    logger.warning(
+                        f"run_config: no tuned rows for {self.get_gfx()}/"
+                        f"cu{self.get_cu_num()}, nothing was benchmarked"
+                    )
+                else:
+                    logger.info("No shapes to benchmark, nothing to run")
                 return pd.DataFrame()
             if run_config_file:
                 defaults = self.get_arg_defaults()

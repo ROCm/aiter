@@ -839,5 +839,38 @@ class TestGroupedFmoeResultToCsv(unittest.TestCase):
         self.assertEqual({k: tuner._csv_text(k) for k in cases}, cases)
 
 
+class TestRunConfigNoDeviceRows(unittest.TestCase):
+    """--run_config with a tuned file holding no rows for the live device."""
+
+    def _run(self, rows):
+        from unittest import mock
+
+        tuner = _StubTuner.get()
+        tuned = pd.DataFrame(rows, columns=["gfx", "cu_num", "M", "N", "K", "us"])
+        args = argparse.Namespace(
+            run_config="tuned.csv", tune_file="out.csv", verbose=False
+        )
+
+        def pre_process(_args):
+            tuner.untunedf = pd.DataFrame(columns=tuner.keys)
+
+        with (
+            mock.patch.object(tuner, "pre_process", side_effect=pre_process),
+            mock.patch.object(tuner, "get_tuned_gemm_list", return_value=tuned),
+            mock.patch.object(tuner, "get_gfx", return_value="gfx950"),
+            mock.patch.object(tuner, "get_cu_num", return_value=128),
+            self.assertLogs("aiter", level="INFO") as logs,
+        ):
+            result = tuner.run(args)
+        self.assertTrue(result.empty)
+        return logs.records
+
+    def test_no_rows_for_device_warns(self):
+        records = self._run([["gfx950", 256, 1, 1, 1, 1.0]])
+        warnings = [r for r in records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("gfx950/cu128", warnings[0].getMessage())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
