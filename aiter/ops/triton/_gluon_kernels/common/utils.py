@@ -32,6 +32,28 @@ def sigmoid(x):
 
 
 @gluon.jit
+def sigmoid_log2(z):
+    """sigmoid(x) given ``z = -x * log2(e)``."""
+    return gl.extra.libdevice.fast_dividef(1.0, 1.0 + gl.exp2(z))
+
+
+@gluon.jit
+def fast_sigmoid(x):
+    return sigmoid_log2(x.to(gl.float32) * -math.log2(math.e))
+
+
+@gluon.jit
+def sum_combine(a, b):
+    return a + b
+
+
+@gluon.jit
+def l2norm(x):
+    f = x.to(gl.float32)
+    return f * gl.rsqrt(gl.sum(f * f, axis=1) + 1e-6)[:, None]
+
+
+@gluon.jit
 def mx_e8m0_scale(amax, EXP_OFFSET: gl.constexpr):
     """Biased e8m0 scale byte from fp32 block amax; EXP_OFFSET is 2 for e2m1, 8 for e4m3."""
     amax = amax.to(gl.int32, bitcast=True)

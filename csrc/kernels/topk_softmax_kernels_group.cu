@@ -21,6 +21,7 @@
 #include "aiter_stream.h"
 #include "hip_reduce.h"
 #include "moe_op.h"
+#include "topk_pad_rows.h"
 #include "warp_sort.h"
 #include <cfloat>
 #include <climits>
@@ -453,7 +454,8 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                     const int topk,
                     const int topk_group,
                     const int num_tokens,
-                    const float routed_scaling_factor)
+                    const float routed_scaling_factor,
+                    const int* __restrict__ num_valid_rows)
 {
     static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
     static constexpr int THREAD_PER_GRP = (WARP_SIZE + NUM_GRP - 1) / NUM_GRP;
@@ -461,6 +463,15 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     const int experts_per_group = num_experts / NUM_GRP;
     extern __shared__ char shared_mem[];
     const int token_idx = blockIdx.x;
+    if(is_pad_row(num_valid_rows, token_idx))
+    {
+        write_pad_row(topk_weights + token_idx * stride_tk,
+                      topk_ids + token_idx * stride_tk,
+                      topk,
+                      threadIdx.x,
+                      blockDim.x);
+        return;
+    }
 
     char* ptr     = shared_mem;
     float* scores = reinterpret_cast<float*>(ptr);
@@ -760,7 +771,8 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
                                        const int topk,
                                        const int num_tokens,
                                        const float routed_scaling_factor,
-                                       const bool need_renorm)
+                                       const bool need_renorm,
+                                       const int* __restrict__ num_valid_rows)
 {
     static constexpr int NVEC     = EXPERTS_PER_LANE / 2;
     static constexpr bool HAS_TAIL = (EXPERTS_PER_LANE % 2) != 0;
@@ -777,6 +789,15 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
     const int lane      = threadIdx.x;
     const int token_idx = blockIdx.x;
     float* sig_scores   = reinterpret_cast<float*>(shared_mem);
+    if(is_pad_row(num_valid_rows, token_idx))
+    {
+        write_pad_row(topk_weights + token_idx * stride_tk,
+                      topk_ids + token_idx * stride_tk,
+                      topk,
+                      lane,
+                      blockDim.x);
+        return;
+    }
 
     auto const* input_ptr = gating_output + token_idx * stride_gating;
 
@@ -1051,7 +1072,8 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                              const int topk,
                              const int topk_group,
                              const int num_tokens,
-                             const float routed_scaling_factor)
+                             const float routed_scaling_factor,
+                             const int* __restrict__ num_valid_rows)
 {
     static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
     // number of lanes responsible for a expert group
@@ -1060,6 +1082,15 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     const int experts_per_group = num_experts / NUM_GRP;
     extern __shared__ char shared_mem[];
     const int token_idx = blockIdx.x;
+    if(is_pad_row(num_valid_rows, token_idx))
+    {
+        write_pad_row(topk_weights + token_idx * stride_tk,
+                      topk_ids + token_idx * stride_tk,
+                      topk,
+                      threadIdx.x,
+                      blockDim.x);
+        return;
+    }
 
     char* ptr     = shared_mem; // (char *)(((size_t)shared_mem + 255) & ~255);
     float* scores = reinterpret_cast<float*>(ptr);
@@ -1547,7 +1578,8 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
                                const int topk_group,
                                const bool need_renorm,
                                const float routed_scaling_factor,
-                               const int num_tokens)
+                               const int num_tokens,
+                               const int* __restrict__ num_valid_rows)
 {
 #if !defined(__GFX9__) // wave64 there; the host launches this only at wave32
     constexpr int W = 32;
@@ -1558,6 +1590,11 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
         static_cast<int64_t>(blockIdx.x) * TPB + __builtin_amdgcn_readfirstlane(threadIdx.x / W);
     if(token >= num_tokens)
         return;
+    if(is_pad_row(num_valid_rows, token))
+    {
+        write_pad_row(topk_weights + token * stride_tk, topk_ids + token * stride_tk, topk, lane, W);
+        return;
+    }
 
     // Ties follow grouped_topk_kernel at wave32. Its float4 layout puts expert
     // e in lane (e / 4) % 32 at local slot (e / 128) * 4 + e % 4, and its DPP
@@ -1927,7 +1964,8 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
             topk,                                                                                  \
             topk_grp,                                                                              \
             num_tokens,                                                                            \
-            routed_scaling_factor);                                                                \
+            routed_scaling_factor,                                                                 \
+            aiter::num_valid_rows_ptr(num_valid_rows));                                            \
     });
 
 #define LAUNCHER_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)             \
@@ -1949,7 +1987,8 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
             topk,                                                                                  \
             topk_grp,                                                                              \
             num_tokens,                                                                            \
-            routed_scaling_factor);                                                                \
+            routed_scaling_factor,                                                                 \
+            aiter::num_valid_rows_ptr(num_valid_rows));                                            \
     });
 
 #define LAUNCHER_biased_grouped_topk_opt_sort_kernel(                             \
@@ -1976,7 +2015,8 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
                                topk,                                              \
                                topk_grp,                                          \
                                num_tokens,                                        \
-                               routed_scaling_factor);                            \
+                               routed_scaling_factor,                             \
+                               aiter::num_valid_rows_ptr(num_valid_rows));        \
         });
 
 #define LAUNCHER_topk_reg_kernel(EPL, isBiased, isSoftmax)                            \
@@ -2011,7 +2051,8 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
                            topk,                                                                   \
                            num_tokens,                                                             \
                            routed_scaling_factor,                                                  \
-                           need_renorm);                                                            \
+                           need_renorm,                                                            \
+                           aiter::num_valid_rows_ptr(num_valid_rows));                             \
     });
 
 void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, num_experts]
@@ -2021,7 +2062,8 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
                          int num_expert_group,
                          int topk_grp,
                          bool need_renorm,
-                         const float routed_scaling_factor)
+                         const float routed_scaling_factor,
+                         std::optional<aiter_tensor_t> num_valid_rows)
 {
     const bool isBiased = true;
     bool isSoftmax      = false;
@@ -2080,7 +2122,8 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
                     topk_grp,
                     need_renorm,
                     routed_scaling_factor,
-                    num_tokens);
+                    num_tokens,
+                    aiter::num_valid_rows_ptr(num_valid_rows));
             });
         };
         auto launch_ng = [&](auto ng) {
@@ -2129,7 +2172,8 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
                   int topk_grp,
                   bool need_renorm,
                   bool is_softmax,
-                  const float routed_scaling_factor)
+                  const float routed_scaling_factor,
+                  std::optional<aiter_tensor_t> num_valid_rows)
 {
     const bool isBiased  = false;
     bool isSoftmax       = is_softmax;
