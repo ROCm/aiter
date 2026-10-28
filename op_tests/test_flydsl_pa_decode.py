@@ -213,7 +213,8 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
 
     Register-only CTAs (24 and 32 partition bounds) and the register branch of
     dual-mode CTAs reduce the same packed partials with one group and with
-    split groups. Slots past the live tasks hold NaN.
+    split groups; sequences above 32 partitions take the LDS branch and match
+    a float64 reference. Slots past the live tasks hold NaN.
     """
     if get_gfx_runtime() != "gfx1250":
         pytest.skip("gfx1250 splits register rungs across partition groups")
@@ -228,7 +229,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     )
 
     kv_heads, rows = 2, 16
-    counts = (17, 0, 32, 1, 24, 16, 31, 20)
+    counts = (17, 0, 32, 1, 24, 16, 31, 20, 40, 256, 100)
     first = [sum(counts[:i]) for i in range(len(counts))]
     capacity = sum(counts) + 8
     torch.manual_seed(0)
@@ -315,11 +316,14 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
         reference[seq] = (
             (weights[..., None] * logits[:, f : f + c].double()).sum(1).float()
         )
-    for partitions, split in ((32, 4), (24, 4), (32, 2), (64, 16), (256, 16)):
+    for partitions, split in ((32, 4), (24, 4), (32, 2), (64, 16), (256, 4), (256, 16)):
         if split * head_size // (2 if pairs_for(partitions) else 1) // 32 > 32:
             continue
         single, grouped = run(partitions, 1), run(partitions, split)
-        assert torch.equal(single.view(torch.int16), grouped.view(torch.int16))
+        register = [seq for seq, c in enumerate(counts) if c <= min(partitions, 32)]
+        assert torch.equal(
+            single[register].view(torch.int16), grouped[register].view(torch.int16)
+        )
         # Plans keep every count within the partition bound.
         bounded = [seq for seq, c in enumerate(counts) if c <= partitions]
         torch.testing.assert_close(
