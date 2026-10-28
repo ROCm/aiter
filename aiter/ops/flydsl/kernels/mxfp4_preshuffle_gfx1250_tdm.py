@@ -1308,6 +1308,8 @@ def launch_gemm_a8w4_tdm(
                 fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
                 for _ in range_constexpr(wmma_n_rep)
             ]
+            sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
+            sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
             if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
                 slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
                 assert slot_width <= 128
@@ -1319,11 +1321,19 @@ def launch_gemm_a8w4_tdm(
                     fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
                     reg += WMMA_VECTOR_DWORDS
                 assert reg <= 256 + (slot_idx + 1) * 128
+                # WMMA scales use v0-v255. Keep the two scale slots disjoint
+                # from one another and from the pinned payload/accumulators.
+                scale_reg = 64 + slot_idx * (SA_WIDTH + SB_WIDTH)
+                assert scale_reg + SA_WIDTH + SB_WIDTH <= 256
+                fx.set_register(sa, register_class=fx.rocdl.VGPR, start=scale_reg)
+                fx.set_register(
+                    sb, register_class=fx.rocdl.VGPR, start=scale_reg + SA_WIDTH
+                )
             return RmemSlot(
                 a=a,
                 b=b,
-                sa=fx.make_rmem_tensor(SA_WIDTH, fx.Int32),
-                sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
+                sa=sa,
+                sb=sb,
             )
 
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
