@@ -27,7 +27,7 @@ Per tile and wave (lane ``l``: ``g = l // 16``, ``s = l % 16``):
   ``32g..32g+31`` (one 16 B load = one e8m0 group) and that group's scale byte in
   scaleA. The fp8 B operand is NOT contiguous per lane: lane (g, s) holds Q head
   ``s``'s elements ``16g..16g+15`` in bytes 0..15 and ``64+16g..64+16g+15`` in
-  bytes 16..31 (measured on gfx950, see op_tests/test_flydsl_pa_decode_mxfp4.py).
+  bytes 16..31 (measured on gfx950).
   scaleB is 1.0, so Q is used as stored; ``query_scale`` multiplies the logits.
 * QK, bf16 Q (reference path): the same K tile widened with
   ``v_cvt_scalef32_pk_bf16_fp4`` (the scale rides in the instruction) and four
@@ -57,6 +57,8 @@ from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from .kernels_common import ceildiv
+from .pa_decode.traits import KV_COMPUTE_BLOCK, LOG2E
 from .tensor_shim import _to_raw
 from .utils import rcp_f32
 
@@ -65,23 +67,15 @@ WAVE = 64
 NUM_WAVES = 4
 BLOCK_THREADS = WAVE * NUM_WAVES
 TILE_TOKENS = 16
-PLAN_TILE = 256  # tokens per PADecodePlan tile
-LOG2E = 1.4426950408889634
 DATA_BYTES = HEAD_DIM // 2  # packed e2m1 bytes per token
 SCALE_BYTES = HEAD_DIM // 32  # e8m0 bytes per token
 # [16 chunks of 8 dims][16 tokens][16 B] bf16, one tile per wave.
 V_TILE_BYTES = (HEAD_DIM // 8) * TILE_TOKENS * 16
 PAGE_STAGE_ALIGN = BLOCK_THREADS
 MAX_STAGED_PAGES = 2048
-# K/V tiles kept in flight per wave (a tile is 2 x 1 KiB of data). Measured on
-# gfx950 with independent blocks (2048 tokens per row, 16 q heads): depth 2 is
-# 0.2-2.2 us faster than 4 for 1-512 rows and equal at 4096, depth 3 is slower
-# than both (why is not measured; depth 4 uses 168 VGPRs).
+# K/V tiles in flight per wave: depth 2 is 0.2-2.2 us faster than 4 at 1-512 rows
+# (2048 tokens, 16 q heads), equal at 4096; 3 is slower than both.
 DEFAULT_TILE_DEPTH = 2
-
-
-def _round_up(x: int, align: int) -> int:
-    return (x + align - 1) // align * align
 
 
 def _e8m0_to_f32(byte_i32):
@@ -138,27 +132,23 @@ def build_pa_decode_mxfp4(
     256, at most ``MAX_STAGED_PAGES``); the caller bounds the pages one task can
     own by it.
     """
-    assert 1 <= group_size <= 16, group_size
-    assert block_size in (16, 64, 128), block_size
-    assert stage_pages % PAGE_STAGE_ALIGN == 0 and 0 < stage_pages <= MAX_STAGED_PAGES
     assert tile_depth >= 1
     PLAN_FREE = tiles_per_task > 0
     TASK_TILES = tiles_per_task
     PARTS = parts
-    assert not PLAN_FREE or (PARTS >= 1 and (not direct or PARTS == 1))
     G = group_size
     BS = block_size
     DEPTH = tile_depth
     out_dtype = fx.Float16 if out_f16 else fx.BFloat16
 
     page_off = 0
-    v_off = _round_up(stage_pages * 4, 16)
+    v_off = ceildiv(stage_pages * 4, 16) * 16
     # The raw [wave][head][dim] f32 partial O has its own region: a wave that
     # finishes early must not overwrite a V tile another wave is still reading.
     o_off = v_off + NUM_WAVES * V_TILE_BYTES
     m_off = o_off + NUM_WAVES * G * HEAD_DIM * 4
     l_off = m_off + NUM_WAVES * 16 * 4
-    total_bytes = _round_up(l_off + NUM_WAVES * 16 * 4, 16)
+    total_bytes = ceildiv(l_off + NUM_WAVES * 16 * 4, 16) * 16
 
     @fx.struct
     class SharedStorage:
@@ -295,14 +285,14 @@ def build_pa_decode_mxfp4(
             # loads here keeps them issued ahead of the wait for the context.
             for idx, ok, raw in _stage_loads(
                 seq,
-                part * (TASK_TILES * PLAN_TILE // BS),
-                TASK_TILES * PLAN_TILE // BS,
+                part * (TASK_TILES * KV_COMPUTE_BLOCK // BS),
+                TASK_TILES * KV_COMPUTE_BLOCK // BS,
                 max_blocks_per_seq,
             ):
                 _lds_store(page_off + idx * 4, fx.Int32, ok.select(raw, zero_i32))
             pre = _load_q(seq)
             ctx = fx.max(ctx_raw, zero_i32)
-            tiles = (ctx + (PLAN_TILE - 1)) // PLAN_TILE
+            tiles = (ctx + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
             end = fx.min(start + TASK_TILES, tiles)
             if const_expr(not direct):  # noqa: SIM102
                 if (tid == 0) & (part == 0):
@@ -326,8 +316,8 @@ def build_pa_decode_mxfp4(
         # Padding tasks of the plan have start == end: nothing to do, no barrier
         # below is reached by only part of the CTA.
         if start < end:
-            tok_begin = start * PLAN_TILE
-            tok_end = fx.min(end * PLAN_TILE, ctx)
+            tok_begin = start * KV_COMPUTE_BLOCK
+            tok_end = fx.min(end * KV_COMPUTE_BLOCK, ctx)
             n_tokens = tok_end - tok_begin
             n_tiles = (n_tokens + (TILE_TOKENS - 1)) // TILE_TOKENS
             n_iters = (n_tiles - warp + (NUM_WAVES - 1)) // NUM_WAVES

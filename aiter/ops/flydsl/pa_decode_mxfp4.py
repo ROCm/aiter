@@ -16,8 +16,8 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .kernels.pa_decode.traits import max_tiles_per_task
-from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK
+from .kernels.kernels_common import ceildiv
+from .kernels.pa_decode.traits import KV_COMPUTE_BLOCK, max_tiles_per_task
 from .kernels.pa_decode_mxfp4_kernel import (
     DATA_BYTES,
     DEFAULT_TILE_DEPTH,
@@ -37,7 +37,7 @@ _BLOCK_SIZES = (16, 64, 128)
 _MAX_GROUP_SIZE = 16
 
 
-def _check_view(name, t, device, tail, block_size):
+def _check_view(name, t, device, tail, block_size, kv_heads):
     if not isinstance(t, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor, got {type(t).__name__}")
     if t.dtype != torch.uint8:
@@ -49,11 +49,17 @@ def _check_view(name, t, device, tail, block_size):
             f"{name} must be [pages, kv_heads, {block_size}, {tail}], "
             f"got {tuple(t.shape)}"
         )
+    if t.shape[1] != kv_heads:
+        raise ValueError(f"{name} kv heads {t.shape[1]} != {kv_heads}")
     if t.stride(3) != 1 or t.stride(2) != tail:
         raise ValueError(
             f"{name} must be token-major (stride(2) == {tail}, stride(3) == 1), "
             f"got strides {t.stride()}"
         )
+    if tail == DATA_BYTES and (t.stride(0) % 16 or t.stride(1) % 16):
+        raise ValueError(f"{name} page and head strides must be multiples of 16")
+    if max(t.stride(0), t.stride(1)) >= 2**31:
+        raise ValueError(f"{name} strides must fit int32")
 
 
 def pa_decode_mxfp4(
@@ -157,10 +163,10 @@ def pa_decode_mxfp4(
     num_seqs, num_q_heads, _ = query.shape
     if k_data.dim() != 4:
         raise ValueError(f"k_data must be 4D, got {tuple(k_data.shape)}")
-    block_size = int(k_data.shape[2])
+    block_size = k_data.shape[2]
     if block_size not in _BLOCK_SIZES:
         raise ValueError(f"block_size must be one of {_BLOCK_SIZES}, got {block_size}")
-    num_kv_heads = int(k_data.shape[1])
+    num_kv_heads = k_data.shape[1]
     if num_kv_heads < 1 or num_q_heads % num_kv_heads:
         raise ValueError(
             f"num_q_heads ({num_q_heads}) must be a multiple of kv heads ({num_kv_heads})"
@@ -170,24 +176,13 @@ def pa_decode_mxfp4(
         raise NotImplementedError(
             f"group_size {group_size} > {_MAX_GROUP_SIZE}: one M-tile per CTA"
         )
-    _check_view("k_data", k_data, dev, DATA_BYTES, block_size)
-    _check_view("v_data", v_data, dev, DATA_BYTES, block_size)
-    _check_view("k_scale", k_scale, dev, SCALE_BYTES, block_size)
-    _check_view("v_scale", v_scale, dev, SCALE_BYTES, block_size)
-    for name, t in (("v_data", v_data), ("k_scale", k_scale), ("v_scale", v_scale)):
-        if t.shape[1] != num_kv_heads:
-            raise ValueError(f"{name} kv heads {t.shape[1]} != {num_kv_heads}")
-    for name, t in (("k_data", k_data), ("v_data", v_data)):
-        if t.stride(0) % 16 or t.stride(1) % 16:
-            raise ValueError(f"{name} page and head strides must be multiples of 16")
-    for name, t in (
-        ("k_data", k_data),
-        ("v_data", v_data),
-        ("k_scale", k_scale),
-        ("v_scale", v_scale),
+    for name, t, tail in (
+        ("k_data", k_data, DATA_BYTES),
+        ("v_data", v_data, DATA_BYTES),
+        ("k_scale", k_scale, SCALE_BYTES),
+        ("v_scale", v_scale, SCALE_BYTES),
     ):
-        if max(t.stride(0), t.stride(1)) * 1 >= 2**31:
-            raise ValueError(f"{name} strides must fit int32")
+        _check_view(name, t, dev, tail, block_size, num_kv_heads)
 
     if context_lengths.dtype != torch.int32 or block_tables.dtype != torch.int32:
         raise TypeError("context_lengths and block_tables must be int32")
@@ -204,7 +199,7 @@ def pa_decode_mxfp4(
         if t.device != dev:
             raise ValueError(f"{name} must be on {dev}, got {t.device}")
 
-    max_blocks_per_seq = int(block_tables.shape[1])
+    max_blocks_per_seq = block_tables.shape[1]
     schedule_context = max_blocks_per_seq * block_size
     if max_context_length is not None:
         if (
@@ -216,9 +211,7 @@ def pa_decode_mxfp4(
                 "max_context_length must be a nonnegative host integer within "
                 "block-table capacity"
             )
-        schedule_context = (
-            (max_context_length + block_size - 1) // block_size * block_size
-        )
+        schedule_context = ceildiv(max_context_length, block_size) * block_size
     if work_plan is not None:
         work_plan.validate(num_seqs, num_kv_heads, dev)
         if work_plan.sliding_window != 0:
@@ -230,15 +223,15 @@ def pa_decode_mxfp4(
         )
         task_tiles = 0
     else:
-        max_tiles = max(1, -(-schedule_context // KV_COMPUTE_BLOCK))
+        max_tiles = max(1, ceildiv(schedule_context, KV_COMPUTE_BLOCK))
         if max_partitions is None:
             cus = torch.cuda.get_device_properties(dev).multi_processor_count
             max_partitions = max(1, (2 * cus) // num_seqs)
-        if not 1 <= max_partitions:
+        if max_partitions < 1:
             raise ValueError("max_partitions must be positive")
         max_partitions = min(max_partitions, max_tiles)
-        task_tiles = -(-max_tiles // max_partitions)
-        parts = -(-max_tiles // task_tiles)
+        task_tiles = ceildiv(max_tiles, max_partitions)
+        parts = ceildiv(max_tiles, task_tiles)
         capacity = num_seqs * parts
         tile_bound = task_tiles
     if direct_output is None:
@@ -257,7 +250,7 @@ def pa_decode_mxfp4(
     # Pages one task can own, staged in LDS in 256-entry units.
     pages = max(tile_bound * (KV_COMPUTE_BLOCK // block_size), 1)
     stage_pages = max(
-        PAGE_STAGE_ALIGN, -(-pages // PAGE_STAGE_ALIGN) * PAGE_STAGE_ALIGN
+        PAGE_STAGE_ALIGN, ceildiv(pages, PAGE_STAGE_ALIGN) * PAGE_STAGE_ALIGN
     )
     if stage_pages > MAX_STAGED_PAGES:
         raise NotImplementedError(
@@ -265,8 +258,7 @@ def pa_decode_mxfp4(
             f"most {MAX_STAGED_PAGES} (block_size {block_size})"
         )
 
-    rows = group_size
-    expected = (num_kv_heads, capacity, rows)
+    expected = (num_kv_heads, capacity, group_size)
     if not direct_output:  # the direct path has no partials, hence no scratch
         if max_logits is None:
             max_logits = torch.empty(*expected, dtype=torch.float32, device=dev)
@@ -324,20 +316,20 @@ def pa_decode_mxfp4(
                 block_tables if work_plan is None else work_plan.work_info, fx.Int32
             ),
             max_blocks_per_seq,
-            int(query.stride(0)),
-            int(query.stride(1)),
+            query.stride(0),
+            query.stride(1),
             k_data.stride(0) // 4,
             k_data.stride(1) // 4,
-            int(k_scale.stride(0)),
-            int(k_scale.stride(1)),
+            k_scale.stride(0),
+            k_scale.stride(1),
             v_data.stride(0) // 4,
             v_data.stride(1) // 4,
-            int(v_scale.stride(0)),
-            int(v_scale.stride(1)),
+            v_scale.stride(0),
+            v_scale.stride(1),
             float(softmax_scale),
             ptr_arg(output, out_dt),
-            int(output.stride(0)),
-            int(output.stride(1)),
+            output.stride(0),
+            output.stride(1),
             ptr_arg(context_lengths, fx.Int32),
             ptr_arg(block_tables if reduce_info is None else reduce_info, fx.Int32),
             capacity,
@@ -349,7 +341,7 @@ def pa_decode_mxfp4(
         output_5d = output.reshape(num_seqs, 1, num_kv_heads, group_size, HEAD_DIM)
         partition_bound = min(
             capacity if work_plan is not None else parts,
-            max(1, -(-schedule_context // KV_COMPUTE_BLOCK)),
+            max(1, ceildiv(schedule_context, KV_COMPUTE_BLOCK)),
         )
         launch_pa_decode_ps_reduce(
             output_5d,
