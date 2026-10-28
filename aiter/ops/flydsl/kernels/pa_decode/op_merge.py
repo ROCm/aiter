@@ -183,7 +183,7 @@ class Gfx1250PartitionMerge:
         psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
         pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
         output = fx.recast_iter(t.q_dtype, ctx.output_ptr)
-        first = ctx.kv_h * fx.Int32(gpu.grid_dim.x) + ctx.first_task
+        first = ctx.kv_h * ctx.capacity + ctx.first_task
         count = ctx.task_count
         live = ctx.lane < count
         stats_slot = fx.Int64(first + live.select(ctx.lane, fx.Int32(0)))

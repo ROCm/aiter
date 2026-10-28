@@ -94,6 +94,109 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
 
 
+@pytest.mark.parametrize("max_partitions", [None, 1])
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+def test_pa_decode_graph_plan_refresh(device, kv_dtype, max_partitions):
+    """Graph replays decode new lengths through a plan refreshed in the graph.
+
+    Dense page128 decode as ATOM runs it: a capture-sized block table and no
+    max_context_length, with poisoned output and scratch on every replay.
+    One-partition plans write output directly; default plans feed the reducer,
+    including its LDS branch at more than 32 partitions.
+    """
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    kv_heads, group, dim, page = 2, 16, 128, 128
+    replays = [
+        (16384, 1, 300, 0),
+        (129, 8192, 0, 4100),
+        (0, 0, 0, 0),
+        (257, 256, 16384, 2049),
+    ]
+    torch.manual_seed(0)
+    query, key, value, table, context = _make_inputs(
+        1,
+        kv_heads,
+        group,
+        dim,
+        page,
+        torch.bfloat16,
+        "varied",
+        device,
+        (16384,) * len(replays[0]),
+        table_width=2048,
+    )
+    compute_type, key_scale, value_scale, vector = torch.bfloat16, None, None, 8
+    if kv_dtype == "fp8":
+        compute_type = (
+            torch.float8_e4m3fn
+            if get_gfx_runtime() in ("gfx950", "gfx1250")
+            else torch.float8_e4m3fnuz
+        )
+        key, key_scale = pertoken_quant(key, quant_dtype=compute_type)
+        value, value_scale = pertoken_quant(value, quant_dtype=compute_type)
+        vector = 16
+    logical_key = key.float() * (1.0 if key_scale is None else key_scale)
+    logical_value = value.float() * (1.0 if value_scale is None else value_scale)
+    pages = key.shape[0]
+    key_cache = (
+        key.reshape(pages, kv_heads, page, dim // vector, vector)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.reshape(pages, kv_heads, page // vector, vector, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    plan = pa.plan_pa_decode(context, kv_heads, max_partitions=max_partitions)
+    scalar_shape = (kv_heads, plan.capacity, group)
+    workspace = {
+        "exp_sums": torch.empty(scalar_shape, dtype=torch.float32, device=device),
+        "max_logits": torch.empty(scalar_shape, dtype=torch.float32, device=device),
+        "temporary_output": torch.empty(
+            (*scalar_shape, dim), dtype=query.dtype, device=device
+        ),
+    }
+    output = torch.empty_like(query)
+
+    def step():
+        pa.plan_pa_decode(context, kv_heads, plan=plan)
+        pa.pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context,
+            table,
+            dim**-0.5,
+            1,
+            compute_type=compute_type,
+            key_scale=key_scale,
+            value_scale=value_scale,
+            work_plan=plan,
+            **workspace,
+        )
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        step()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        step()
+    for lengths in replays:
+        context.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+        output.fill_(float("nan"))
+        for tensor in workspace.values():
+            tensor.fill_(float("nan"))
+        graph.replay()
+        reference = _reference(
+            query, logical_key, logical_value, table, context, 1, 0, None
+        )
+        _check_output(output, reference)
+
+
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()

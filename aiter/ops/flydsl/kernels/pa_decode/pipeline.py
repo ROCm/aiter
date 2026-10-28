@@ -634,7 +634,6 @@ class Gfx1250Bf16Pipeline:
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
-        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
         self.mem.allocate()
         query = fx.recast_iter(t.q_dtype, ctx.query_ptr)
         q_operands = []
@@ -677,6 +676,8 @@ class Gfx1250Bf16Pipeline:
             ctx.planned_start * KV_COMPUTE_BLOCK,
             ctx.planned_end * KV_COMPUTE_BLOCK,
         )
+        # Keep the Q loads ahead of the first page's table lookup.
+        fx.rocdl.sched_barrier(0)
         self.mem.stage_bf16_page(begin, fx.Int32(0))
         for token_i, state in range(begin, end, 128, init=initial):
             token_base = fx.Int32(token_i)
@@ -1023,7 +1024,6 @@ class Gfx1250Bf16WavePipeline:
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
-        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
         self.mem.allocate()
         begin, end = (
             ctx.planned_start * KV_COMPUTE_BLOCK,
@@ -1436,7 +1436,6 @@ class Gfx1250WavePipeline:
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
-        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
         self.mem.allocate()
         begin, end = (
             ctx.planned_start * KV_COMPUTE_BLOCK,
@@ -1560,7 +1559,6 @@ class Gfx1250Pipeline:
         ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
             t.query_length // t.query_splits
         )
-        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
         self.mem.allocate()
         begin, end = (
             ctx.planned_start * KV_COMPUTE_BLOCK,
