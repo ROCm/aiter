@@ -652,13 +652,13 @@ def test_fused_gdn_decode_supported_rejects_cpu_optional_operands():
         )
     ]
     vh, vd = ops["num_v_heads"], ops["head_v_dim"]
-    qsl = torch.arange(batch + 1, dtype=torch.int32)
-    out = torch.empty(batch, vh, vd, dtype=torch.bfloat16)
+    qsl = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    out = torch.empty(batch, vh, vd, dtype=torch.bfloat16, device=device)
 
     assert fused_gdn_decode_qkvz_supported(
-        *args, qkvz_layout="flat", query_start_loc=qsl.to(device), out=out.to(device)
+        *args, qkvz_layout="flat", query_start_loc=qsl, out=out
     ) == (True, "")
-    for kwargs in ({"query_start_loc": qsl}, {"out": out}):
+    for kwargs in ({"query_start_loc": qsl.cpu()}, {"out": out.cpu()}):
         ok, reason = fused_gdn_decode_qkvz_supported(
             *args, qkvz_layout="flat", **kwargs
         )
