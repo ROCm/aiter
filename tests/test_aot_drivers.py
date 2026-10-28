@@ -241,32 +241,27 @@ class FlyDSLMoeDeploymentTest(unittest.TestCase):
                 schema_version=1,
                 fused_moe=[
                     dict(base, tp=[8, 4], shared_expert_mode="fused"),
-                    dict(base, tp=8, pad_align=256),
-                    dict(base, pad_align=128),
+                    dict(base),
                 ],
             )
 
         by_id = {d.id: d for d in self._load_edited(edit).fused_moe}
-        # A shared expert fused under TP takes a column but no sentinel, and
-        # padding grows the split intermediate dim.
+        # A shared expert fused under TP takes a column but no sentinel.
         expected = {
             "deepseek-v4-pro/gfx950/a8w4/tp8-fused": (385, 7, 0, 384, -1),
             "deepseek-v4-pro/gfx950/a8w4/tp4-fused": (385, 7, 0, 768, -1),
-            "deepseek-v4-pro/gfx950/a8w4/tp8-pad256": (384, 6, 0, 512, -1),
             "deepseek-v4-pro/gfx950/a8w4/tp1": (384, 6, 0, 3072, -1),
         }
         self.assertEqual(set(by_id), set(expected))
         for name, shape in expected.items():
             with self.subTest(name):
                 self.assertEqual(self._rank_call(by_id[name]), shape)
-        row = moe.deployment_row(by_id["deepseek-v4-pro/gfx950/a8w4/tp8-pad256"])
+        row = moe.deployment_row(by_id["deepseek-v4-pro/gfx950/a8w4/tp4-fused"])
         self.assertEqual(
-            (row["model_dim"], row["inter_dim"], row["hidden_pad"]),
-            ("7168", "512", ""),
+            (row["model_dim"], row["inter_dim"], row["expert"], row["topk"]),
+            ("7168", "768", "385", "7"),
         )
-        self.assertEqual(
-            (row["intermediate_pad"], row["expert_mask_size"]), ("128", "")
-        )
+        self.assertEqual((row["expert_mask_size"], row["intermediate_pad"]), ("", ""))
 
     def test_default_mega_moe_jobs(self):
         from aiter.aot.flydsl import mega_moe

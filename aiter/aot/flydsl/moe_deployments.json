@@ -71,7 +71,6 @@
       "cu_num": 256,
       "quant": "a8w4",
       "tp": 8,
-      "pad_align": 128,
       "max_tokens": 131072,
       "source": "ATOM recipes/DeepSeek-V4.md (-tp 8, ATOM_MOE_GU_ITLV=1); ATOM models/deepseek_v4 (pad_align=128; the block-FP8 shared expert does not fuse into the MXFP4 routed experts)",
       "note": "max_tokens follows model_configs/dsv4_fp8fp4_tuned_fmoe.csv (expert 384, topk 6, inter 384)"

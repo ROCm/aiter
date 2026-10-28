@@ -32,7 +32,7 @@ the deployment (global experts, EPLB replicas, fused shared experts), which no
 tuned row records, so these callers come from the ``fused_moe`` deployments of
 ``moe_deployments.json`` (see :mod:`aiter.aot.flydsl.deployments`): what one
 rank passes ``fused_moe`` and the largest M it passes. The file also lists
-tensor-parallel deployments, whose rank passes no mask but the padded, split
+tensor-parallel deployments, whose rank passes no mask but the split
 intermediate dim and the shared-expert handling its framework uses (FHMoE
 among them). Each deployment is replayed at every bucket's smallest and largest
 M up to that M, bisected as above, and reads the tuned tables serving reads; it
@@ -322,7 +322,7 @@ def deployment_row(call: FusedMoECall) -> dict:
         deployment=call.id,
         gfx=call.gfx,
         cu_num=str(call.cu_num),
-        model_dim=str(call.hidden_dim),
+        model_dim=str(call.model.model_dim),
         inter_dim=str(call.inter_dim),
         expert=str(call.local_experts),
         topk=str(call.topk_cols),
@@ -330,8 +330,6 @@ def deployment_row(call: FusedMoECall) -> dict:
         shared_expert_id=(
             str(call.shared_expert_id) if call.shared_expert_id >= 0 else ""
         ),
-        hidden_pad=str(call.hidden_pad or ""),
-        intermediate_pad=str(call.intermediate_pad or ""),
         act_type=f"ActivationType.{call.model.activation}",
         dtype="torch.bfloat16",
         q_dtype_a=q_dtype_a,

@@ -5,8 +5,8 @@
 
 ``moe_deployments.json`` records each MoE model's architecture once, and each
 deployment of it by its knobs: TP or EP size, EPLB redundant experts,
-shared-expert handling, weight padding, quant recipe and token range. What one
-rank hands the runtime is derived here, with the convention ATOM and vLLM share:
+shared-expert handling, quant recipe and token range. What one rank hands the
+runtime is derived here, with the convention ATOM and vLLM share:
 
 - ``fused_moe``: one rank's ``fused_moe`` call, behind an EP dispatch or on a
   tensor-parallel slice of every expert, which ``moe.py`` replays and
@@ -60,13 +60,9 @@ _SITU_PARAMS = ("situ_beta", "situ_linear_beta")
 _DEPLOYMENT_REQUIRED = {"model", "gfx", "cu_num", "quant", "source"}
 _DEPLOYMENT_OPTIONAL = {"redundant_experts", "note"}
 _SECTION_KEYS = {
-    "fused_moe": ({"max_tokens"}, {"ep", "tp", "pad_align", "shared_expert_mode"}),
+    "fused_moe": ({"max_tokens"}, {"ep", "tp", "shared_expert_mode"}),
     "mega_moe": ({"ep", "max_tokens_per_rank"}, set()),
 }
-
-
-def _round_up(value: int, align: int) -> int:
-    return (value + align - 1) // align * align
 
 
 @dataclass(frozen=True)
@@ -111,7 +107,6 @@ class FusedMoECall(_Deployment):
     tensor-parallel slice of every expert."""
 
     tp: int
-    pad_align: int
     shared_expert_mode: str
     max_tokens: int
 
@@ -158,23 +153,9 @@ class FusedMoECall(_Deployment):
         return self.model.routed_experts
 
     @property
-    def hidden_dim(self) -> int:
-        """``hidden_states.shape[1]``: the model dim padded to ``pad_align``."""
-        return _round_up(self.model.model_dim, self.pad_align)
-
-    @property
     def inter_dim(self) -> int:
-        """The rank's expert intermediate dim: the model's split over TP and
-        padded to ``pad_align``, as ATOM's FusedMoE pads MXFP4 weights."""
-        return _round_up(self.model.inter_dim // self.tp, self.pad_align)
-
-    @property
-    def hidden_pad(self) -> int:
-        return self.hidden_dim - self.model.model_dim
-
-    @property
-    def intermediate_pad(self) -> int:
-        return self.inter_dim - self.model.inter_dim // self.tp
+        """The rank's expert intermediate dim: the model's split over TP."""
+        return self.model.inter_dim // self.tp
 
 
 @dataclass(frozen=True)
@@ -316,7 +297,6 @@ def _expand(section: str, where: str, path: str, entry, models: dict) -> list:
         if mode == "fhmoe" and model.shared_experts != 1:
             _fail(where, "FHMoE runs exactly one shared expert")
         common["shared_expert_mode"] = mode
-        common["pad_align"] = _int(where, "pad_align", entry.get("pad_align", 1))
         common["max_tokens"] = _int(where, "max_tokens", entry["max_tokens"])
     else:
         common["max_tokens_per_rank"] = tuple(
@@ -358,12 +338,6 @@ def _expand(section: str, where: str, path: str, entry, models: dict) -> list:
             continue
         if mode == "fhmoe" and ep > 1:
             _fail(where, "FHMoE runs without EP")
-        align = common["pad_align"]
-        if (
-            _round_up(model.model_dim, align) != model.model_dim
-            or _round_up(model.inter_dim // tp, align) != model.inter_dim // tp
-        ):
-            name += f"-pad{align}"
         name += "" if mode == "separate" else f"-{mode}"
         deployments.append(
             FusedMoECall(
