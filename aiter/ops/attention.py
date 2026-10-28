@@ -950,7 +950,7 @@ def mla_prefill_asm_fwd(
 
 def get_pa_metadata_info_v1(batch_size: int, num_head_k: int = 1):
     """
-    Allocate PA v1_2 metadata. Batches from 513 to 32768 reserve an internal
+    Allocate PA metadata buffers. Batches from 513 to 32768 reserve an internal
     work-info scratch tail for parallel planning when KV heads divide the CU
     count. Existing smaller buffers remain usable through the serial fallback.
     Only records before work_indptr[-1] are attention tasks.
@@ -1024,15 +1024,15 @@ def get_pa_metadata_v1(
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
-            fast_mode: default=True. Uses parallel v1_2 generation for dense, single-Q-tile inputs
+            fast_mode: default=True. Uses parallel generation for dense, single-Q-tile inputs
                        with page-sized KV granularity, up to 32768 requests and the full CU
                        worker budget. False, other configurations, or buffers without the extra
-                       scratch space (see get_pa_metadata_info_v1) use the original serial v1_2
-                       generator with identical metadata. Valid inputs require consistent
+                       scratch space (see get_pa_metadata_info_v1) use the serial generator
+                       with identical metadata. Valid inputs require consistent
                        indptrs, context lengths and positive Q lengths. Empty contexts have no
                        attention work in the parallel path; callers own their outputs.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
-            max_split_per_batch: Retains the v1_2 global worker budget:
+            max_split_per_batch: Global worker budget:
                        negative uses the CU count, otherwise min(CUs, batch * value).
                        The budget must be positive and divisible by the KV-head count.
     Outputs:
