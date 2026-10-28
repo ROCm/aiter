@@ -196,6 +196,19 @@ def test_block_attn_mask_to_ragged_lut_metadata_dtype():
     )
 
 
+def test_tiebreak_keeps_its_own_reference_bound():
+    """A tie resolved differently moves a whole output row, so `tiebreak` needs a looser bound.
+
+    Reusing a neighbouring distribution's bound here would report breakage on the property the
+    generator is built to create.
+    """
+    bound = fp8_max_diff_percentage("tiebreak")
+    others = [
+        fp8_max_diff_percentage(name) for name in ("normal", "diffusion", "peaked")
+    ]
+    assert bound > max(others), f"tiebreak {bound} vs {others}"
+
+
 def compare_accuracy(current, reference):
     """Print quick statistics comparing FP8 and SageAttn tensors."""
     current_f = current.float()
