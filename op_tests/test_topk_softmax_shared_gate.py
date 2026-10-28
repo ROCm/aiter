@@ -110,12 +110,15 @@ def _check(wbuf, ibuf, topk, ref, score, name):
         atol=2e-2,
         msg=f"{name} shared weights",
     )
+    # One invalid row must print failed!. The default tol_err_ratio=0.05 only
+    # does that for T < 20, and at T=16384 it still warns with 819 bad rows.
     invalid = invalid_id_rows(got_ri, score.shape[-1]).to(dtypes.fp32)
     e_valid = checkAllclose(
         invalid,
         torch.zeros_like(invalid),
         rtol=0,
         atol=0,
+        tol_err_ratio=0,
         msg=f"{name} routed ids unique and in range",
     )
     kth = score.gather(-1, ref_ri.long()).min(dim=-1, keepdim=True).values
