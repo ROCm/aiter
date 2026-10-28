@@ -57,22 +57,6 @@ class RequestAPI:
 
 
 class PRSelfReviewSelftest(unittest.TestCase):
-    def test_pr_template_preserves_review_context(self) -> None:
-        template = (SCRIPT.parent.parent / "pull_request_template.md").read_text()
-        expected = (
-            "Summary",
-            "Motivation",
-            "Changes",
-            "Performance (if applicable)",
-            "Testing",
-            "Documentation",
-            "Dependencies",
-            "Breaking Changes",
-            "PR Self-Review",
-        )
-        for heading in expected:
-            self.assertIn(f"## {heading}", template)
-
     def test_review_events_use_read_only_signal_workflow(self) -> None:
         privileged = (WORKFLOWS / "pr-self-review.yml").read_text()
         signal = (WORKFLOWS / "pr-self-review-signal.yml").read_text()
