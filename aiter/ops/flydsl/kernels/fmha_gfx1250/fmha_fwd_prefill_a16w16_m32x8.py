@@ -2377,7 +2377,13 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             ) * 4
 
             # An empty batch must not enter the core: kv_len==0 would write O/0 = NaN.
-            if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
+            # Nor a tile past this batch's queries: grid.x is sized by max_seqlen_q, so a
+            # shorter sequence's trailing tiles own no packed row. They would stream the
+            # whole KV band with every row masked and store nothing. The condition is
+            # uniform across the workgroup's waves, so they skip together.
+            first_row = _m_tile_idx() * fx.Int32(_block_m(NUM_Q_TILES))
+            tile_has_rows = first_row < q_len * fx.Int32(GQA_RATIO)
+            if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)) & tile_has_rows:
                 _core_kwargs = {
                     "qk_hdim": QK_HDIM,
                     "v_hdim": V_HDIM,
