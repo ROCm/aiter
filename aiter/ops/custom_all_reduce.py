@@ -70,6 +70,17 @@ def all_gather_unreg(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def all_gatherv(
+    _fa: int,
+    inps: list[torch.Tensor],
+    outs: list[torch.Tensor],
+    sizes: list[int],
+    reg_buffer: int,
+    reg_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm(
     _fa: int,
     inp: torch.Tensor,
@@ -153,6 +164,7 @@ def fused_allreduce_rmsnorm_mxfp4_quant(
     reg_bytes: int,
     use_1stage: bool,
     bf16_out_ptr: int = 0,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -288,6 +300,40 @@ def all_gather_gfx1250(
     dim: int,
     reg_inp_ptr: int,
     reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm", develop=True)
+def fused_allreduce_rmsnorm_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+    gemma_norm: bool = False,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="fused_allreduce_rmsnorm_quant", develop=True)
+def fused_allreduce_rmsnorm_quant_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+    gemma_norm: bool = False,
+    bf16_out_ptr: int = 0,
 ) -> None: ...
 
 

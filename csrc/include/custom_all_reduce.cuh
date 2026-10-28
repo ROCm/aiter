@@ -21,6 +21,8 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -339,7 +341,8 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
     for(int i = 0; i < ngpus; i++)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i]    = (const P*)_input_dp->ptrs[i];
         tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
@@ -511,7 +514,8 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     for(int i = 0; i < ngpus; i++)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i]    = (const P*)_input_dp->ptrs[i];
         tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
@@ -761,6 +765,66 @@ __global__ void __launch_bounds__(512, 1) allgather_vec(
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// Up to this many tensors gathered by one allgatherv launch.
+constexpr int kAllGatherVMax = 4;
+
+// One launch, one rank barrier, for the first-dim all-gather of several
+// tensors whose row counts may differ per rank. Rank w holds `rows[w]` rows of
+// every tensor; tensor t's rows are `row_bytes[t]` bytes, read at `in_off[t]`
+// past rank w's `dp[t]` pointer and written to the contiguous `out[t]` from
+// row `row_start[w]`.
+struct AllGatherVArgs
+{
+    const RankData* dp[kAllGatherVMax];
+    int64_t in_off[kAllGatherVMax];
+    uint8_t* out[kAllGatherVMax];
+    int64_t row_bytes[kAllGatherVMax];
+    int64_t rows[8];
+    int64_t row_start[8];
+    int n;
+};
+
+template <int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    allgatherv(AllGatherVArgs args, RankSignals sg, Signal* self_sg, int rank)
+{
+    using P                = opus::vector_t<uint32_t, 4>;
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    int warp_id            = threadIdx.x / tnum_gpu;
+    int lane_id            = threadIdx.x % tnum_gpu;
+    int tid                = blockIdx.x * tnum_gpu + lane_id;
+    int stride             = gridDim.x * tnum_gpu;
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for(int t = 0; t < args.n; ++t)
+    {
+        const int64_t row_bytes = args.row_bytes[t];
+        // Under 2 GiB a rank (checked on the host), so 32-bit indices.
+        const int bytes = static_cast<int>(args.rows[warp_id] * row_bytes);
+        const uint8_t* src =
+            static_cast<const uint8_t*>(args.dp[t]->ptrs[warp_id]) + args.in_off[t];
+        uint8_t* dst = args.out[t] + args.row_start[warp_id] * row_bytes;
+        // 16-byte units when every rank's slice stays 16-byte aligned in the
+        // output, 4-byte words otherwise.
+        if(row_bytes % 16 == 0)
+        {
+            for(int idx = tid; idx < bytes / 16; idx += stride)
+            {
+                reinterpret_cast<P*>(dst)[idx] = reinterpret_cast<const P*>(src)[idx];
+            }
+        }
+        else
+        {
+            for(int idx = tid; idx < bytes / 4; idx += stride)
+            {
+                reinterpret_cast<uint32_t*>(dst)[idx] =
+                    reinterpret_cast<const uint32_t*>(src)[idx];
+            }
+        }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
                                                             RankSignals sg,
@@ -825,8 +889,8 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
 #pragma unroll
     for(int i = 0; i < ngpus; i++)
     {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
@@ -858,8 +922,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const T*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const T*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -898,8 +962,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const P*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -929,8 +993,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const T*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const T*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -970,8 +1034,8 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim(
 #pragma unroll
   for (int i = 0; i < ngpus; ++i)
   {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Keep the sum order independent of the reduce-scatter owner.
+    ptrs[i] = (const P*)_dp->ptrs[i];
   }
   start_sync<ngpus>(sg, self_sg, rank);
   for (int i = index; i < size; i += blockDim.x * gridDim.x)
@@ -1222,7 +1286,8 @@ __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
     for(int i = 0; i < ngpus; i++)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const inp_pack*)_dp->ptrs[target];
+        // Keep the sum order independent of the reduce-scatter owner.
+        ptrs[i]    = (const inp_pack*)_dp->ptrs[i];
         tmps[i]    = get_tmp_buf<fp8_pack>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
@@ -1757,7 +1822,7 @@ __device__ __forceinline__ float ar_mxfp4_quant_scale(uint8_t scale_e8m0)
     return v.f;
 }
 
-template <typename P, typename A, typename T, int PACK_SIZE>
+template <typename P, typename A, typename T, int PACK_SIZE, bool GEMMA_NORM = false>
 __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     A& in,
     P& weight,
@@ -1775,7 +1840,7 @@ __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     constexpr int MXFP4_GROUP_SIZE = 32;
     A out;
 
-    ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE>(
+    ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE, 32, GEMMA_NORM>(
         out, in, weight, eps, hidden_dim, block_size);
 
     if(bf16_output != nullptr && active)
@@ -2221,7 +2286,7 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
     per_group_launch_flags(launch, transpose_scale, gemma_norm);
 }
 
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool GEMMA_NORM = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_1stage_mxfp4(RankData* _dp,
                                          RankSignals sg,
@@ -2291,14 +2356,14 @@ __global__ void __launch_bounds__(1024, 1)
             weight_p = *reinterpret_cast<P*>(weight + access_id_in_token);
         }
         int padded_block_size = (int)blockDim.x;
-        ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
+        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-template <typename T, int NGPUS>
+template <typename T, int NGPUS, bool GEMMA_NORM = false>
 void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, uint8_t* output, T* weight,
@@ -2311,7 +2376,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     int m           = size / hidden_dim;
     dim3 block(padded_size);
     dim3 grid(std::min(m, kMaxBlocks));
-    allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS>
+    allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS, GEMMA_NORM>
         <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank,
                                      residual_inp, residual_out,
                                      output, weight, scale_out,
@@ -2330,7 +2395,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
 //   * keeps the stage-1 numerics identical to the per-group 2-stage kernel
 //     (sum in fp32, downcast to T before storing in tmp), which matches the
 //     unfused (allreduce -> RMSNorm -> dynamic_mxfp4_quant) reference.
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool GEMMA_NORM = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_2stage_mxfp4(RankData* _dp,
                                          RankSignals sg,
@@ -2427,13 +2492,13 @@ __global__ void __launch_bounds__(1024, 1)
             for(int v = 0; v < pack_size; ++v)
                 acc[v] = upcast_s(vec[v]);
         }
-        ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
+        ar_fusion_epilogue_mxfp4<P, A, T, pack_size, GEMMA_NORM>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
 }
 
-template <typename T, int NGPUS>
+template <typename T, int NGPUS, bool GEMMA_NORM = false>
 void allreduce_fusion_kernel_2stage_mxfp4_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, uint8_t* output, T* weight,
@@ -2453,7 +2518,7 @@ void allreduce_fusion_kernel_2stage_mxfp4_launcher(
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = padded_block_size * sizeof(typename opus::vector_t<T, PACK_SIZE>);
-    allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS>
+    allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS, GEMMA_NORM>
         <<<numBlocks, threadsPerBlock, smem_size, stream>>>(
             _dp, sg, self_sg, rank,
             residual_inp, residual_out, output, weight, scale_out,
@@ -2665,22 +2730,22 @@ __global__ void __launch_bounds__(1024, 1)
 
             float sum2 = 0.0f;
             if (is_q_t0) {
-                sum2 = *reinterpret_cast<float*>(&tmps[rank][tidx * 2 + 0]);
+                // Sum in rank order so every rank gets the same denominator.
+                sum2 = *reinterpret_cast<float*>(&tmps[0][tidx * 2 + 0]);
 #pragma unroll
                 for(int r = 1; r < ngpus; ++r)
                 {
-                    int target = (rank + r) % ngpus;
-                    auto peer_vec = tmps[target][tidx * 2 + 0];
+                    auto peer_vec = tmps[r][tidx * 2 + 0];
                     sum2 += *reinterpret_cast<float*>(&peer_vec);
                 }
                 smem[0] = sum2;
             } else if (is_k_t0) {
-                sum2 = *reinterpret_cast<float*>(&tmps[rank][tidx * 2 + 1]);
+                // Sum in rank order so every rank gets the same denominator.
+                sum2 = *reinterpret_cast<float*>(&tmps[0][tidx * 2 + 1]);
 #pragma unroll
                 for(int r = 1; r < ngpus; ++r)
                 {
-                    int target = (rank + r) % ngpus;
-                    auto peer_vec = tmps[target][tidx * 2 + 1];
+                    auto peer_vec = tmps[r][tidx * 2 + 1];
                     sum2 += *reinterpret_cast<float*>(&peer_vec);
                 }
                 smem[1] = sum2;
@@ -3568,7 +3633,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
 #pragma unroll
         for (int i = 1; i < ngpus; ++i)
         {
-          int peer = (rank + i) % ngpus;
+          int peer = (i - 1) + (i - 1 >= rank);
           src[i - 1] = myBase + (size_t)peer * slot;
         }
         bool still_loop;
@@ -3598,7 +3663,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
 #pragma unroll
           for (int j = 0; j < LP; ++j)
           {
-            acc[j] += upcast_s(pv[j]);
+            // Insert the local value at its rank, not before all peers.
+            if(i == 0 && rank != 0)
+                acc[j] = upcast_s(pv[j]);
+            else
+                acc[j] += upcast_s(pv[j]);
+            if(i + 1 == rank)
+                acc[j] += upcast_s(selfv[j]);
           }
         }
 
@@ -3624,6 +3695,9 @@ constexpr int    kLL128LineElems = 16;
 constexpr int    kLL128DataElems = 15;
 constexpr int    kLL128FlagElem  = 15;
 constexpr int    kLL128Lanes     = 16;
+// Per-rank slot stride in uint32 words, sized for kLL128PocCapBytes so that
+// consecutive calls of different sizes never overlap a peer's unread slots.
+constexpr int    kLL128SlotStride = (int)((kLL128PocCapBytes + 239) / 240) * 128 * 2 / 4;
 
 struct LLLine128
 {
@@ -3821,7 +3895,7 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 
   __shared__ uint32_t s_flag;
   const uint32_t flag = ll128EpochBegin(graph_safe_flag, blockIdx.x, s_flag);
-  int bank_offset = (flag & 1u) * ngpus * (total_group * 128 * 2 / 4);
+  int bank_offset = (flag & 1u) * ngpus * kLL128SlotStride;
 
   for (int idx = g_index; idx < total_group; idx += stride)
   {
@@ -3833,7 +3907,7 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
       int peer = (self_rank + i) % ngpus;
       uint32_t* scratch_dst = reinterpret_cast<uint32_t*>(peer_scratch[peer])
                               + bank_offset
-                              + self_rank * (total_group * 128 * 2 / 4)
+                              + self_rank * kLL128SlotStride
                               + idx * 8 * 2 * 4 + lane_id * 4;
       ll128_store_b128<T>(inp_reg[0], scratch_dst);
       ll128_store_b128<T>(inp_reg[1], scratch_dst + 8 * 4);
@@ -3857,7 +3931,8 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 #pragma unroll
     for (int i = 1; i < ngpus; ++i)
     {
-      scratch_base[i - 1] = self_scratch + ((self_rank + i) % ngpus) * (total_group * 128 * 2 / 4) + idx * 8 * 2 * 4;
+      int peer = (i - 1) + (i - 1 >= self_rank);
+      scratch_base[i - 1] = self_scratch + peer * kLL128SlotStride + idx * 8 * 2 * 4;
       scratch_flag_addr[0][i - 1] = scratch_base[i - 1] + 7 * 4;
       scratch_flag_addr[1][i - 1] = scratch_flag_addr[0][i - 1] + 8 * 4;
     }
@@ -3886,7 +3961,12 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 #pragma unroll
       for (int j = 0; j < pack_size; ++j)
       {
-        reduce_rslt_f32[0][j] += upcast_s(reduce_elem[i][j]);
+        if(i == 0 && self_rank != 0)
+            reduce_rslt_f32[0][j] = upcast_s(reduce_elem[i][j]);
+        else
+            reduce_rslt_f32[0][j] += upcast_s(reduce_elem[i][j]);
+        if(i + 1 == self_rank)
+            reduce_rslt_f32[0][j] += upcast_s(inp_reg[0][j]);
       }
     }
 
@@ -3912,7 +3992,12 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 #pragma unroll
       for (int j = 0; j < pack_size; ++j)
       {
-        reduce_rslt_f32[1][j] += upcast_s(reduce_elem[i][j]);
+        if(i == 0 && self_rank != 0)
+            reduce_rslt_f32[1][j] = upcast_s(reduce_elem[i][j]);
+        else
+            reduce_rslt_f32[1][j] += upcast_s(reduce_elem[i][j]);
+        if(i + 1 == self_rank)
+            reduce_rslt_f32[1][j] += upcast_s(inp_reg[1][j]);
       }
     }
 
@@ -4288,7 +4373,6 @@ class CustomAllreduce
                     rd.ptrs[j] = self_ptr;
                 }
             }
-            output_buffers_[self_ptr] = d_rank_data_end_ - 1 - i;
         }
 
         if(num_input_buffers > 0)
@@ -4444,8 +4528,8 @@ class CustomAllreduce
     }
 
     // LL128 unroll2 1-shot all-reduce. 2-byte dtype only (fp16 / bf16). The
-    // kernel sizes its scratch from the message internally (per total_group);
-    // the cap bounds it to the LL128 sub-region of the reused tmp buffer.
+    // scratch uses a fixed per-rank stride sized for kLL128PocCapBytes, so it
+    // spans 2 * ngpus * kLL128SlotStride words of the reused tmp buffer.
     template <typename T>
     void allreduce_ll128_unroll2(hipStream_t stream, const T* input, T* output,
                                  int numel, int threads_per_block = 512)
@@ -4539,7 +4623,7 @@ class CustomAllreduce
     // scratch reuses the meta buffer's post-Signal region (see
     // allreduce_ll_poc / allreduce_ll128_unroll2), which assumes the tmp region
     // (2 * max_size) comfortably exceeds the fast-path scratch (worst case
-    // ~18 MiB at tp2); true for the default max_size (1 GiB).
+    // ~38 MiB at tp4); true for the default max_size (1 GiB).
     //
     // `size` here is still the element count (numel); it is divided down to
     // 16-byte packs only after this block. Thresholds were measured on bf16, so
@@ -4925,6 +5009,57 @@ void dispatchAllGather(
             break;
         default: printf("allgather world_size error\n");
         }
+    }
+}
+
+// First-dim all-gather of `n` tensors in one launch, rank w contributing
+// `rows[w]` rows of each: tensor i's rows are `row_bytes[i]` bytes (a multiple
+// of 4), read at `in_off[i]` past `inputs[i]` -- a buffer resolved like any
+// other collective input (registered, or bound in capture) -- and written to
+// `outputs[i]` in rank order.
+void dispatchAllGatherV(hipStream_t stream,
+                        int n,
+                        void* const* inputs,
+                        const int64_t* in_off,
+                        void* const* outputs,
+                        const int64_t* row_bytes,
+                        const int64_t* rows)
+{
+    AllGatherVArgs args{};
+    args.n           = n;
+    int64_t max_rows = 0, start = 0;
+    for(int w = 0; w < world_size_; ++w)
+    {
+        args.rows[w]      = rows[w];
+        args.row_start[w] = start;
+        start += rows[w];
+        max_rows = std::max(max_rows, rows[w]);
+    }
+    int64_t units = 0;
+    for(int i = 0; i < n; ++i)
+    {
+        const int64_t bytes = max_rows * row_bytes[i];
+        // The kernel walks a rank's slice with 32-bit indices.
+        AITER_CHECK(row_bytes[i] % 4 == 0 && bytes <= INT32_MAX,
+                    "allgatherv needs rows of a multiple of 4 bytes, under 2 GiB a rank");
+        args.dp[i]        = get_buffer_RD(stream, inputs[i]);
+        args.in_off[i]    = in_off[i];
+        args.out[i]       = static_cast<uint8_t*>(outputs[i]);
+        args.row_bytes[i] = row_bytes[i];
+        units             = std::max(units, row_bytes[i] % 16 == 0 ? bytes / 16 : bytes / 4);
+    }
+    // Sized by every rank's row counts, so all ranks launch the same grid:
+    // the barrier flags are kept per block, kMaxBlocks of them.
+    int tnum_per_block = 512 / world_size_;
+    int64_t block_num  = (units + tnum_per_block - 1) / tnum_per_block;
+    dim3 grid(static_cast<int>(std::clamp<int64_t>(block_num, 1, kMaxBlocks)));
+    dim3 block(512);
+    switch(world_size_)
+    {
+    case 8: allgatherv<8><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
+    case 4: allgatherv<4><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
+    case 2: allgatherv<2><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
+    default: throw std::runtime_error("allgatherv world_size error");
     }
 }
 
@@ -5493,7 +5628,8 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
                                              int m,
                                              int n,
                                              bool use_1stage,
-                                             T* bf16_output = nullptr)
+                                             T* bf16_output = nullptr,
+                                             bool gemma_norm = false)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -5529,20 +5665,30 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
             "size*sizeof(T) <= 512 KiB)");
     }
 
-#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                              \
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, GEMMA)                                  \
     if(can_1stage)                                                                           \
     {                                                                                        \
-        allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS>(                             \
+        allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS, GEMMA>(                      \
             ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
             scale_out, size, n, eps, stream, bf16_output);                                    \
         return;                                                                              \
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        allreduce_fusion_kernel_2stage_mxfp4_launcher<T, NGPUS>(                             \
+        allreduce_fusion_kernel_2stage_mxfp4_launcher<T, NGPUS, GEMMA>(                      \
             ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
             scale_out, size, n, eps, stream, bf16_output);                                    \
         return;                                                                              \
+    }
+
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                              \
+    if(gemma_norm)                                                                           \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, true)                                    \
+    }                                                                                        \
+    else                                                                                     \
+    {                                                                                        \
+        DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL(NGPUS, false)                                   \
     }
 
     switch(world_size_)
@@ -5556,6 +5702,7 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
             std::to_string(world_size_));
     }
 #undef DISPATCH_AR_FUSION_MXFP4_KERNEL
+#undef DISPATCH_AR_FUSION_MXFP4_KERNEL_IMPL
 }
 
 template <typename T, bool FUSE_ROPE>
