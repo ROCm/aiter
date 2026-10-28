@@ -447,7 +447,6 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
         MHA_V4_KV_TILE_ROWS,
         MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
         MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
-        MHA_V4_QUERY_TILE_ROWS,
         _mxfp4_v_buffers,
         _quantize_v_mxfp4_hip,
         quantize_v_mxfp4_fp6_p,
@@ -528,14 +527,7 @@ def _check_packed(rank, world_size, heads, sequence, device, op_cls, name):
         label = f"{name} {'QK'[role]}"
         codec = codecs[role]
         if role == 0 and codec.startswith("mxfp"):
-            padded_rows = (
-                (seq_full + MHA_V4_QUERY_TILE_ROWS - 1) // MHA_V4_QUERY_TILE_ROWS
-            ) * MHA_V4_QUERY_TILE_ROWS - seq_full
-            _assert_scale_backing(
-                scales[role],
-                expected_scales.numel() + padded_rows * heads_local * 4,
-                label,
-            )
+            _assert_scale_backing(scales[role], expected_scales.numel(), label)
         if role == 1 and codec == "mxfp6":
             _, logical_scales = mxfp6_k_view(
                 expected_payload,
