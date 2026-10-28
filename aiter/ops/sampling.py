@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 
 from csrc.cpp_itfs.sampling.top_k_renorm_probs import (
@@ -78,6 +80,10 @@ direct_register_custom_op(
 # measure-zero floating-point ties at the boundary.
 # ---------------------------------------------------------------------------
 _TOPK_FIRST_FAST_MAX_K = 256
+# AITER_TOPK_FIRST_SMALL_K_TOPP=1: the fast path samples k <= 64 survivors with
+# the Triton kernel in aiter/ops/triton/top_p_small_k.py.
+_SMALL_K_TOPP = os.environ.get("AITER_TOPK_FIRST_SMALL_K_TOPP", "0") == "1"
+_SMALL_K_TOPP_MAX_K = 64
 _TOPK_FIRST_FAST_MIN_VOCAB = 65536
 
 
@@ -152,13 +158,20 @@ def _topk_first_fast_path(
     else:
         top_p_eff = (torch.full_like(s, float(top_p_val)) / s).clamp_(max=1.0)
     # 4. top-p sampling over the k-element distribution -> local index in [0, k).
-    local = top_p_sampling_from_probs_core(
-        probs_k,
-        None,
-        top_p_eff,
-        0.0,
-        deterministic,
-    )
+    #    A short row runs one register-resident program a row: the generic
+    #    kernel spills to scratch (see aiter/ops/triton/top_p_small_k.py).
+    if _SMALL_K_TOPP and top_k_val <= _SMALL_K_TOPP_MAX_K:
+        from aiter.ops.triton.top_p_small_k import top_p_sampling_small_k
+
+        local = top_p_sampling_small_k(probs_k, top_p_eff)
+    else:
+        local = top_p_sampling_from_probs_core(
+            probs_k,
+            None,
+            top_p_eff,
+            0.0,
+            deterministic,
+        )
     # 5. map the local choice back to the global vocab index. The gathered
     #    indices are always valid in [0, vocab), so the output is in-range even
     #    on degenerate rows.
