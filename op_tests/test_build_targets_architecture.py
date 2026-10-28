@@ -181,7 +181,10 @@ class TestRuntimeArchitecture(unittest.TestCase):
     def tearDown(self):
         self.chip_info.get_gfx_runtime.cache_clear()
 
-    def test_native_detection_preserves_strict_variant(self):
+    def test_native_detection_normalizes_strict_variant(self):
+        # _detect_native folds gfx1250-strict (A0) to the gfx1250 kernel family
+        # for runtime dispatch; A0/B0 safety lives in the asicRevision asm gate
+        # and the Opus mach-id check, not in the dispatch name.
         self.chip_info._detect_native.cache_clear()
         try:
             with mock.patch.object(
@@ -189,7 +192,7 @@ class TestRuntimeArchitecture(unittest.TestCase):
                 "_gpu_info_output",
                 return_value="  Name: gfx1250-strict\n",
             ):
-                self.assertEqual(self.chip_info._detect_native(), ["gfx1250-strict"])
+                self.assertEqual(self.chip_info._detect_native(), ["gfx1250"])
         finally:
             self.chip_info._detect_native.cache_clear()
 

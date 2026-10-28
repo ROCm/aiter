@@ -26,7 +26,15 @@ def load_chip_parsers(output):
     tree.body = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in wanted
+        if (isinstance(node, ast.FunctionDef) and node.name in wanted)
+        # keep module-level constants the parsers reference (e.g. _GFX_ARCH_PATTERN)
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "_GFX_ARCH_PATTERN"
+                for t in node.targets
+            )
+        )
     ]
     namespace = {
         "functools": functools,
@@ -111,7 +119,12 @@ Agent 3
         from codegen import gen_instances_gfx1250 as gen
         from opus_gemm_common import gfx1250_4wave_co_kernels_declared
 
-        k = gfx1250_4wave_co_kernels_declared[21016]
+        # Any declared 4wave_co kernel exercises the launcher codegen; pick the
+        # first by local kid (robust to the global->local kid renumbering in
+        # #6937) instead of a hard-coded global kid that no longer exists.
+        k = gfx1250_4wave_co_kernels_declared[
+            min(gfx1250_4wave_co_kernels_declared)
+        ]
         cg = SimpleNamespace(
             impl_path="unused", _host_instantiations=[], _device_instantiations=[]
         )

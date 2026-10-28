@@ -46,6 +46,17 @@ from opus_gemm_common import (
 )
 
 
+def _registry_arch(gfx: str) -> str:
+    """Kernel-family key for KERNEL_REGISTRY lookups.
+
+    gfx1250-strict (MI450 A0) shares the gfx1250 kernel family, so registry
+    lookups normalize to gfx1250 -- mirroring chip_info._detect_native. The
+    returned build target keeps the gfx1250-strict spelling, so hipcc still
+    compiles for gfx1250-strict (mach 0xeb); only the registry key is folded.
+    """
+    return "gfx1250" if gfx == "gfx1250-strict" else gfx
+
+
 def _build_targets_standalone(explicit_targets=()):
     if explicit_targets:
         targets = []
@@ -64,7 +75,7 @@ def _build_targets_standalone(explicit_targets=()):
                 (gfx, cu)
                 for gfx in explicit_arches
                 for arches in KERNEL_REGISTRY.values()
-                for cu in arches.get(gfx, {})
+                for cu in arches.get(_registry_arch(gfx), {})
             }
         )
     import importlib.util
@@ -87,7 +98,7 @@ def _build_targets_standalone(explicit_targets=()):
         targets.update(
             (gfx, cu)
             for arches in KERNEL_REGISTRY.values()
-            for cu in arches.get(gfx, {})
+            for cu in arches.get(_registry_arch(gfx), {})
         )
     return sorted(targets)
 
