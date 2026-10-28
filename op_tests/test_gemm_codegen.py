@@ -966,6 +966,44 @@ def test_build_tune_dict_strict_unknown_kernel():
 
 
 # ---------------------------------------------------------------------------
+# Section 8: filter_tune_df refuses per-model rows
+# ---------------------------------------------------------------------------
+
+
+def test_filter_tune_df_refuses_gpu_model():
+    _section("8. filter_tune_df — compiled tables cannot hold gpu_model rows")
+
+    row = {"gfx": "gfx942", "cu_num": 304, "M": 128, "N": 4096, "K": 4096}
+    tagged = pd.DataFrame(
+        [
+            {**row, "gpu_model": "mi300x", "kernelId": 1},
+            {**row, "gpu_model": "mi325x", "kernelId": 2},
+        ]
+    )
+    raised = None
+    try:
+        filter_tune_df(tagged, [TARGET_A])
+    except RuntimeError as e:
+        raised = e
+    _check(
+        "rows naming a gpu_model raise RuntimeError",
+        raised is not None and "gpu_model" in str(raised),
+        f"err={raised}",
+    )
+
+    blank = pd.DataFrame(
+        [
+            {**row, "gpu_model": float("nan"), "kernelId": 1},
+            {**row, "gpu_model": " ", "kernelId": 2},
+        ]
+    )
+    _check(
+        "blank gpu_model cells pass through",
+        len(filter_tune_df(blank, [TARGET_A])) == 2,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -988,6 +1026,7 @@ if __name__ == "__main__":
     test_runtime_dispatch_key()
     test_blockscale_kernel_name_forwarding()
     test_build_tune_dict_strict_unknown_kernel()
+    test_filter_tune_df_refuses_gpu_model()
 
     print(f"\n{'='*60}")
     print(f"  Results: {_passed} passed, {_failed} failed")
