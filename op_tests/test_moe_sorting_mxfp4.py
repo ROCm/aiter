@@ -18,6 +18,7 @@ Covers two operations, dispatched by ``--quant-dtype``:
 
 import argparse
 import itertools
+import os
 
 import pandas as pd
 import torch
@@ -947,15 +948,16 @@ if _running_on_gfx950():
         _check_fused_num_local_tokens(E, topk, 32)
 
 
-def _aux_sort_routes(topk_ids, topk_weights, num_local_tokens=None):
-    """BM16 aux sort (the tuned inline-sort path's sort) at the kimi-k3 shape."""
+def _aux_sort_routes(topk_ids, topk_weights, num_local_tokens=None, bm=16):
+    """Aux sort at the kimi-k3 shape: BM16 is the tuned inline-sort path's sort,
+    BM >= 32 the three-stage sort."""
     sorted_ids, sorted_weights, sorted_experts, num_valid, moe_buf, _, rev = (
         fused_moe._adaptive_moe_sort(
             topk_ids,
             topk_weights,
             896,
             topk_ids.shape[1],
-            16,
+            bm,
             3584,
             atomic=True,
             emit_aux=True,
@@ -964,8 +966,8 @@ def _aux_sort_routes(topk_ids, topk_weights, num_local_tokens=None):
     )
     tokens, topk = topk_ids.shape
     entries = []
-    for block, expert in enumerate(sorted_experts[: int(num_valid[0]) // 16].tolist()):
-        for row in range(block * 16, block * 16 + 16):
+    for block, expert in enumerate(sorted_experts[: int(num_valid[0]) // bm].tolist()):
+        for row in range(block * bm, block * bm + bm):
             packed = int(sorted_ids[row])
             if packed & 0x00FFFFFF != tokens:  # padding slot
                 entries.append(
@@ -1006,52 +1008,103 @@ def _check_aux_sort_pad_rows_and_num_local_tokens(tokens=32, valid=29, topk=16):
         assert (moe_buf == 0).all()
 
 
-def _check_inline_sort_accepts_num_local_tokens():
-    """num_local_tokens is not a reason to discard a tuned inline-sort row."""
-    from types import SimpleNamespace
+def _check_three_stage_sort_pad_rows(bm, tokens=32, valid=29, topk=16):
+    """The three-stage sort (BM >= 32) treats ids routed to -1 as no route: the
+    sort equals one over the valid rows alone."""
+    torch.manual_seed(valid + bm)
+    topk_ids = torch.stack(
+        [torch.randperm(896, dtype=torch.int32)[:topk] for _ in range(tokens)]
+    )
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32)
+    ref, ref_valid, _, _ = _aux_sort_routes(
+        topk_ids[:valid].contiguous(), topk_weights[:valid].contiguous(), bm=bm
+    )
+    pad_ids = topk_ids.clone()
+    pad_ids[valid:] = -1
+    got, got_valid, moe_buf, rev = _aux_sort_routes(pad_ids, topk_weights, bm=bm)
+    assert got == ref
+    assert got_valid[0] == ref_valid[0]
+    assert (rev[valid * topk :] == -1).all()
+    assert (moe_buf == 0).all()
 
-    kn2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_nt_sbm16"
-    metadata = SimpleNamespace(
-        block_m=16,
-        has_bias=False,
-        stage2_has_bias=False,
-        stage2=SimpleNamespace(keywords={"kernelName2": kn2}),
-    )
+
+def _check_fused_moe_inline_sort_pad_rows(tokens=32, valid=29):
+    """fused_moe on Kimi-K3's tuned inline-sort row with pad rows routed to -1
+    and num_local_tokens, as ATOM passes them: the tuned row is kept, real rows
+    match a call on the valid rows alone and pad rows come out zero."""
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility import fp4_utils
+
     experts, hidden, inter, topk = 896, 3584, 384, 16
-    w1 = torch.empty((experts, 2 * inter, hidden // 2), dtype=torch.uint8)
-    w2 = torch.empty((experts, hidden, inter // 2), dtype=torch.uint8)
-    w1.is_shuffled = w2.is_shuffled = True
-    w1_scale = torch.empty(
-        experts * 2 * inter * fused_moe._padded_scale_cols(hidden),
-        dtype=dtypes.fp8_e8m0,
-    )
-    w2_scale = torch.empty(
-        experts * hidden * fused_moe._padded_scale_cols(inter), dtype=dtypes.fp8_e8m0
-    )
-    reason = fused_moe._mxfp4_inline_sort_unsupported(
-        metadata,
-        torch.empty((4, hidden), dtype=dtypes.bf16),
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        torch.empty((4, topk), dtype=torch.int32),
-        gate_mode=fused_moe.GateMode.SEPARATED,
-        expert_mask=None,
-        bias1=None,
-        bias2=None,
-        a1_scale=None,
-        a2_scale=None,
-        stage2_scatter=None,
-        block_size_M=None,
-        hidden_pad=0,
-        intermediate_pad=0,
-    )
-    assert reason == "", reason
+
+    def fp4_weight(n, k):
+        w = torch.randint(0, 256, (experts, n, k // 2), dtype=torch.uint8)
+        s = torch.randint(118, 124, (experts * n, k // 32), dtype=torch.uint8)
+        w = shuffle_weight(w.cuda().view(dtypes.fp4x2), layout=(16, 16))
+        w.is_shuffled = True
+        return w, fp4_utils.e8m0_shuffle(s.cuda().view(dtypes.fp8_e8m0))
+
+    torch.manual_seed(tokens)
+    w1, w1_scale = fp4_weight(2 * inter, hidden)
+    w2, w2_scale = fp4_weight(hidden, inter)
+    x = torch.randn((tokens, hidden), dtype=dtypes.bf16, device="cuda")
+    topk_ids = torch.stack(
+        [torch.randperm(experts, dtype=torch.int32)[:topk] for _ in range(tokens)]
+    ).cuda()
+    topk_weights = torch.softmax(torch.randn((tokens, topk), device="cuda"), dim=1)
+    pad_ids = topk_ids.clone()
+    pad_ids[valid:] = -1
+    count = torch.tensor([valid], dtype=torch.int32, device="cuda")
+
+    reasons = []
+    unsupported = fused_moe._mxfp4_inline_sort_unsupported
+
+    def record(*a, **kw):
+        reasons.append(unsupported(*a, **kw))
+        return reasons[-1]
+
+    env = {"AITER_SITUV2_A4W4": "1", "AITER_FLYDSL_STAGE2_FP8": "1"}
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    fused_moe._mxfp4_inline_sort_unsupported = record
+    try:
+
+        def run(ids, rows, nlt=None):
+            return fused_moe.fused_moe(
+                x[:rows],
+                w1,
+                w2,
+                topk_weights[:rows],
+                ids[:rows],
+                activation=aiter.ActivationType.Situv2,
+                quant_type=aiter.QuantType.per_1x32,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                num_local_tokens=nlt,
+            )
+
+        out = run(pad_ids, tokens, count)
+        ref = run(topk_ids, valid)
+    finally:
+        fused_moe._mxfp4_inline_sort_unsupported = unsupported
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    assert reasons and all(r == "" for r in reasons), reasons
+    real = out[:valid].float()
+    rel = ((real - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 0.02, rel  # atomic stage2 order only (~0.5%)
+    assert (out[valid:] == 0).all()
 
 
 if _running_on_gfx950():
     _check_aux_sort_pad_rows_and_num_local_tokens()
     _check_aux_sort_pad_rows_and_num_local_tokens(tokens=4, valid=3)
-    _check_inline_sort_accepts_num_local_tokens()
+    for bm in (32, 64):
+        _check_three_stage_sort_pad_rows(bm)
+    _check_fused_moe_inline_sort_pad_rows()
+    _check_fused_moe_inline_sort_pad_rows(tokens=4, valid=3)
     aiter.logger.info("aux sort pad-row / num_local_tokens checks passed")
