@@ -35,6 +35,7 @@ python bench_flash_kda.py -o
 """
 
 import functools
+import inspect
 import itertools
 import math
 import os
@@ -225,6 +226,16 @@ def _seg_label(chunks_per_seg):
     return "1seg" if chunks_per_seg <= 0 else str(chunks_per_seg)
 
 
+def _varlen_call(t, m, cu_sets, with_host):
+    """One call on the next bounds, in a new device tensor as a serving engine builds."""
+    cpu = next(cu_sets)
+    host = {"cu_seqlens_cpu": cpu} if with_host else {}
+    cu = cpu.to(DEVICE, non_blocking=True)
+    return flash_kda_fwd(
+        **t, lower_bound=LOWER_BOUND, chunks_per_seg=m, cu_seqlens=cu, **host
+    )
+
+
 def run_benchmark(args):
     if args.k3_tp8:
         x_vals_list = [
@@ -240,9 +251,27 @@ def run_benchmark(args):
     else:
         x_vals_list = DEFAULT_SHAPES
 
+    lens = args.varlen
+    if lens:
+        if len(lens) < 2 or lens[-1] <= 128:
+            raise SystemExit("--varlen needs 2+ lengths, the last above 128")
+        params = inspect.signature(flash_kda_fwd).parameters
+        if args.seqlens == "host" and "cu_seqlens_cpu" not in params:
+            raise SystemExit("--seqlens host: this flash_kda_fwd has no cu_seqlens_cpu")
+        x_vals_list = list(dict.fromkeys((1, sum(lens), *s[2:]) for s in x_vals_list))
+        # 128 sets, 1..128 tokens moved between the last two sequences: more bounds
+        # than the 64 the metadata caches hold, so every call misses, as in serving.
+        cu_sets = []
+        for d in range(1, 129):
+            cu = torch.tensor([0, *lens]).cumsum(0).int()
+            cu[-2] += d
+            cu_sets.append(cu.pin_memory())
+
     header = f"{'B':>4} {'T':>6} {'H':>4} {'K':>4} {'V':>4}  {'Time(ms)':>10}  {'TFLOPS':>8}  {'BW(GB/s)':>10}"
     if args.seg_sweep:
         header += f"  {'seg':>6}"
+    if lens:
+        header += f"  {'bounds':>6}"
     if args.k3_tp8:
         header += "  seqlens"
     print(header)
@@ -270,6 +299,10 @@ def run_benchmark(args):
                     flash_kda_fwd, **t, lower_bound=LOWER_BOUND, chunks_per_seg=m
                 )
 
+            if lens:
+                sets = itertools.cycle(cu_sets)
+                fn = functools.partial(_varlen_call, t, m, sets, args.seqlens == "host")
+
             # Time-based warmup: run until WARMUP_MS elapsed so JIT/autotune completes.
             _elapsed = 0.0
             while _elapsed < args.warmup_ms:
@@ -290,6 +323,9 @@ def run_benchmark(args):
             if args.seg_sweep:
                 line += f"  {_seg_label(m):>6}"
                 row.append(_seg_label(m))
+            if lens:
+                line += f"  {args.seqlens:>6}"
+                row.append(args.seqlens)
             if args.k3_tp8:
                 seqlens = "+".join(map(str, K3_TP8_STEPS[i][0]))
                 line += f"  {seqlens}"
@@ -304,6 +340,8 @@ def run_benchmark(args):
         cols = ["B", "T", "H", "K", "V", "Time_ms", "TFLOPS", "BW_GBs"]
         if args.seg_sweep:
             cols.append("seg")
+        if lens:
+            cols.append("bounds")
         if args.k3_tp8:
             cols.append("seqlens")
         with open(fname, "w", newline="") as f:
@@ -355,6 +393,19 @@ def parse_args(args=None):
         "count, or the hardware.",
     )
     parser.add_argument(
+        "--varlen",
+        type=lambda s: [int(x) for x in s.split(",")],
+        metavar="LENS",
+        help="Time one varlen call over these comma-separated lengths: B=1, T=their "
+        "sum, H from the shapes. Each call gets new bounds in a new cu_seqlens.",
+    )
+    parser.add_argument(
+        "--seqlens",
+        choices=("device", "host"),
+        default="device",
+        help="With --varlen: host also passes the bounds as cu_seqlens_cpu.",
+    )
+    parser.add_argument(
         "-o",
         action="store_true",
         help="Write results to a CSV file in the current directory.",
@@ -374,6 +425,8 @@ def parse_args(args=None):
     args = parser.parse_args(args=args)
     if args.seg_sweep and args.impl != "flash_kda":
         parser.error("--seg-sweep pins FlashKDA segment lengths; use --impl flash_kda")
+    if args.varlen and (args.k3_tp8 or args.impl != "flash_kda"):
+        parser.error("--varlen times FlashKDA on its own bounds; drop --k3-tp8/--impl")
     return args
 
 
