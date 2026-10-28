@@ -160,8 +160,9 @@ def resolve_installed(spec, shape, backend, cu_num=_DEVICE_CU):
 
 def seed_table(spec, backend, shape_nk, cu_num=None):
     """(path, table) to install into: this shape's own file (the <cu_num>cu/ one first when
-    cu_num is given), else a new DEFAULT_FALLBACK table with the M_BOUNDS of the
-    DEFAULT.json the loader reads."""
+    cu_num is given), else a new DEFAULT_FALLBACK table. A DEFAULT_FALLBACK table without
+    M_BOUNDS gets the M_BOUNDS of the DEFAULT.json the loader reads, as the loader merges it.
+    """
     from space import find_default
 
     from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
@@ -175,12 +176,19 @@ def seed_table(spec, backend, shape_nk, cu_num=None):
                 "gemm", spec.config_name, backend=backend, cu_num=cu_num
             ),
         )
+    default_path, default = find_default(spec, backend, cu_num)
     for seed_dir in seed_dirs:
         path = f"{seed_dir}/{specialized_filename(spec.config_name, shape_nk)}"
         table = load_config_json(path, required=False)
         if table is not None:
+            if (
+                table.get("DEFAULT_FALLBACK")
+                and "M_BOUNDS" not in table
+                and default is not None
+                and "M_BOUNDS" in default
+            ):
+                table = {**table, "M_BOUNDS": default["M_BOUNDS"]}
             return path, table
-    default_path, default = find_default(spec, backend, cu_num)
     if default is None:
         raise SystemExit(f"Required config file doesn't exist: {default_path}")
     return default_path, {

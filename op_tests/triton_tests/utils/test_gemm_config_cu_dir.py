@@ -245,3 +245,19 @@ def test_family_bounds_cu_first(tree, tuning):
     shape = {"N": 1024, "K": 256}
     assert kernels.family_bounds(spec, "gluon", shape, cu_num=96) == (16, 64)
     assert kernels.family_bounds(spec, "gluon", shape) != (16, 64)
+
+
+def test_fallback_seed_takes_default_m_bounds(tree, tuning, monkeypatch):
+    kernels, _, _, _ = tuning
+    base = "gfx1250/gluon/gemm/gemm_a16w16"
+    tree(f"{base}/DEFAULT.json", {"M_BOUNDS": [16, 64], "any": _bucket(1)})
+    tree(
+        f"{base}/{NAME}-N=1024-K=256.json",
+        {"DEFAULT_FALLBACK": True, "M_LEQ_64": _bucket(6)},
+    )
+    spec = kernels.get_spec("gemm_a16w16")
+    shape = {"N": 1024, "K": 256}
+    _, seed = kernels.seed_table(spec, "gluon", shape)
+    assert seed["M_BOUNDS"] == [16, 64]
+    assert kernels.family_bounds(spec, "gluon", shape) == (16, 64)
+    assert _get(monkeypatch, None, 32, 1024, 256) == (_bucket(6), True)
